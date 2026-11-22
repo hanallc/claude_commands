@@ -102,6 +102,9 @@ class LoadedSources:
     A tree update between two calls leaves old modules in sys.modules while a lazy
     import reads a new file, and the two versions need not fit. A changed source
     drops every tracked module, so the next call imports one consistent tree.
+    A namespace package has no source file, so it stays loaded; the drop also
+    removes each dropped module from its parent, or `from package import module`
+    returns the old module.
     """
 
     def __init__(self) -> None:
@@ -129,6 +132,12 @@ class LoadedSources:
         for name, module in list(sys.modules.items()):
             if name != "__main__" and module_source_path(module) in self.stamps:
                 del sys.modules[name]
+                parent, _, child = name.rpartition(".")
+                package = sys.modules.get(parent)
+                if isinstance(package, ModuleType):
+                    attributes = cast(dict[str, object], object.__getattribute__(package, "__dict__"))
+                    if attributes.get(child) is module:
+                        del attributes[child]
         programs.clear()
         self.stamps.clear()
         importlib.invalidate_caches()

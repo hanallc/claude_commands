@@ -145,6 +145,34 @@ def main():
                 status, output, errors = self.request(process, "second", "", "newer")
                 self.assertEqual((status, output, errors), (0, dict(value="new"), ""))
 
+    def test_a_tree_update_reloads_a_module_imported_from_a_namespace_package(self) -> None:
+        # scripts/ and its folders have no __init__.py. 2026-11-22: after an install, a new
+        # mac_test got the old eligibility through `from scripts.mac_test import eligibility`.
+        tree = self.root / "namespace-tree"
+        package = tree / "nsfixture"
+        package.mkdir(parents=True)
+        _ = (package / "base.py").write_text("OLD = 'old'\n")
+        self.program = tree / "namespace_program.py"
+        _ = self.program.write_text('''import json, sys
+def main():
+    if sys.argv[1:] == ["newer"]:
+        from nsfixture import newer
+        value = newer.VALUE
+    else:
+        from nsfixture import base
+        value = base.OLD
+    print(json.dumps(dict(value=value)))
+    return 0
+''')
+        process = self.start_helper()
+        status, output, errors = self.request(process, "first", "", "base")
+        self.assertEqual((status, output, errors), (0, dict(value="old"), ""))
+        _ = (package / "base.py.new").write_text("OLD = 'old'\nNEW = 'new'\n")
+        os.replace(package / "base.py.new", package / "base.py")
+        _ = (package / "newer.py").write_text("from nsfixture import base\nVALUE = base.NEW\n")
+        status, output, errors = self.request(process, "second", "", "newer")
+        self.assertEqual((status, output, errors), (0, dict(value="new"), ""))
+
     def test_two_requests_in_one_write_each_get_a_reply(self) -> None:
         process = self.start_helper()
         assert process.stdin is not None
