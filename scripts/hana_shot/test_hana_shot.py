@@ -30,6 +30,7 @@ import zlib
 from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.buildlog import store
 from scripts.hana_shot import hana_shot
+from scripts.hana_shot.hana_shot_test_support import SHOT_LAUNCH_SETTINGS
 from scripts.lib import conf, process_group
 from scripts.lib import scratch as scratch_folders
 from scripts.lib.git_test_support import fixture_git_environment
@@ -41,6 +42,51 @@ from scripts.production.staff_test_support import fixture_member, fixture_runtim
 
 
 LAUNCH_RECORDING_PURPOSE = "launch recovery"
+
+SHOT_CAPTURE_SETTINGS = """\
+# range: 0..
+capture_timeout_seconds=1
+# range: 0..
+copy_timeout_seconds=10
+# range: 0..
+settle_seconds=5
+# whole: 1..
+unchanged_frames=3
+# whole: 1..
+window_frames=2
+# range: 0..
+resend_seconds=2
+# range: 0..
+setup_seconds=5
+# range: 0..
+black_maximum=0.02
+# range: 0..
+max_margin=0.45
+# whole: 1..
+shot_directory_bytes=16777216
+# whole: 1..
+max_age_seconds=86400
+# whole: 1..
+workers=4
+# whole: 1..
+remote_awake_seconds=60
+# whole: 1..
+local_awake_seconds=10
+# range: 0..
+minimum_frame_seconds=0.005
+# range: 0..
+default_frame_ms=16
+# range: 0..
+margin_probe=0.05
+# whole: 1..
+selector_suggestions=5
+# whole: 3..
+locate_grid=9
+# whole: 1..
+fit_iterations=12
+# range: 0..
+default_margin=0.1
+"""
 
 SCRIPT = Path(__file__).with_name("hana_shot.py")
 CAMERA_ENTITY = 5
@@ -384,10 +430,10 @@ class BuildLogIsolatedTest(unittest.TestCase):
         super().setUp()
         self.scratch = Path(tempfile.mkdtemp(prefix="hana-shot-fixture-")).resolve()
         self.addCleanup(shutil.rmtree, self.scratch)
-        settings = "capture_timeout_seconds=1\nhost=127.0.0.1\ndirty_path_limit=10\n"
-        if self._testMethodName == "test_screenshot_busy_past_the_resend_limit_fails":
-            settings += "resend_seconds=0.05\n"
-        _ = write_config_fixture(self.scratch / "config/hana_shot.conf", settings)
+        overrides = ("resend_seconds=0.05\n"
+                     if self._testMethodName == "test_screenshot_busy_past_the_resend_limit_fails" else "")
+        _ = write_config_fixture(self.scratch / "config/hana_shot.conf", overrides,
+                                 defaults=SHOT_LAUNCH_SETTINGS + SHOT_CAPTURE_SETTINGS)
         environment = fixture_git_environment(self.scratch)
         for name in ("BASH_ENV", "STAFF_CONFIG"):
             _ = environment.pop(name, None)
@@ -532,6 +578,9 @@ import scripts.buildlog.record
         environment = {key: value for key, value in os.environ.items() if key != "PYTHONPATH"}
         root = Path(tempfile.mkdtemp(prefix="hana-shot-import-fixture-")).resolve()
         self.addCleanup(shutil.rmtree, root)
+        environment.update(config_environment(root / "config", fixtures={
+            "hana_shot.conf": SHOT_LAUNCH_SETTINGS + SHOT_CAPTURE_SETTINGS,
+        }))
         with tempfile.TemporaryDirectory(dir=root) as folder:
             result = subprocess.run([sys.executable, "-c", source, str(SCRIPT.resolve())],
                                     cwd=folder, env=environment, capture_output=True, text=True,
@@ -1534,7 +1583,7 @@ class PortGuardTests(HanaShotTest):
         self.assertEqual(self.fake.calls, [])
 
     def test_user_port_is_refused_by_every_command(self) -> None:
-        _ = write_config_fixture(self.scratch / "config/hana_shot.conf", "refused_port=15702\n")
+        _ = write_config_fixture(self.scratch / "config/hana_shot.conf", "refused_port=15702\n", defaults="")
         for argv in (
             ["shot", "--port", "15702", "--mode", "home"],
             ["pose", "get", "--port", "15702"],
@@ -2205,7 +2254,7 @@ class FailureGuidanceTests(HanaShotTest):
         return error
 
     def test_settle_timeout_names_retry_then_pose_recovery(self) -> None:
-        _ = write_config_fixture(self.scratch / "config/hana_shot.conf", "capture_timeout_seconds=1\nsettle_seconds=0.01\n")
+        _ = write_config_fixture(self.scratch / "config/hana_shot.conf", "capture_timeout_seconds=1\nsettle_seconds=0.01\n", defaults="")
         result = self.in_process_shot("--target", "name:Log", "--mode", "fit", "--settle", "1000000")
 
         self.assertNotEqual(result.returncode, 0, result.stderr)
@@ -2226,7 +2275,7 @@ class FailureGuidanceTests(HanaShotTest):
         ]
         for selector, expected in (("name:Panle", "Panel"), ("tool:Grayscal", "Grayscale")):
             with self.subTest(selector=selector):
-                _ = write_config_fixture(self.scratch / "config/hana_shot.conf", "capture_timeout_seconds=1\nsetup_seconds=0.01\n")
+                _ = write_config_fixture(self.scratch / "config/hana_shot.conf", "capture_timeout_seconds=1\nsetup_seconds=0.01\n", defaults="")
                 result = self.in_process_shot("--target", selector, "--mode", "hana-frame",
                                               "--setup", "scene::spawn")
 
@@ -2396,7 +2445,7 @@ class ViewsTests(HanaShotTest):
 
 class ShotTests(HanaShotTest):
     def test_both_window_operations_use_the_configured_frame_count(self) -> None:
-        _ = write_config_fixture(self.scratch / "config/hana_shot.conf", "window_frames=7\n")
+        _ = write_config_fixture(self.scratch / "config/hana_shot.conf", "window_frames=7\n", defaults="")
         session = hana_shot.Session(hana_shot.Brp(self.port))
         _ = session.start()
         with mock.patch.object(session, "wait_frames") as frames, mock.patch.object(shutil, "which", return_value=None):
@@ -2418,7 +2467,7 @@ class ShotTests(HanaShotTest):
         self.assertEqual(number.call_args_list, [mock.call("call_timeout_seconds")])
 
     def test_readiness_and_shutdown_read_poll_settings_once_per_call(self) -> None:
-        _ = write_config_fixture(self.scratch / "config/hana_shot.conf", "poll_seconds=0.001\nwarm_frame_ms=20\n")
+        _ = write_config_fixture(self.scratch / "config/hana_shot.conf", "poll_seconds=0.001\nwarm_frame_ms=20\n", defaults="")
         log = self.scratch / "startup.log"
         _ = log.write_text("")
         process = cast(subprocess.Popen[bytes], mock.Mock())

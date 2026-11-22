@@ -52,9 +52,14 @@ class StateBackupTests(unittest.TestCase):
         programs.mkdir()
         config = self.root / "config"
         config.mkdir()
-        template = (ROOT / "config/state_backup.conf").read_text(encoding="utf-8")
         _ = (config / "state_backup.conf").write_text(
-            template.replace("mac.folder = ~/backups/natedev/aws-state", "mac.folder = ~/backup folder/aws-state"),
+            "source.folder = ~/.local/state/build-targets/aws\n"
+            + "include.patterns = cost-ledger.json charges/*.json gate-trial-*.txt affinity/** "
+            + "release-evidence/** hana/executions/** paired-trials/**\n"
+            + "exclude.patterns = paired-trials/*/*/launch.json hana/executions/*.json hana/provider/** "
+            + "**/*.lock *.lock **/*.log *.log up gate-up unreachable_until\n"
+            + "# whole: 1..\ninterval_minutes = 60\n"
+            + "mac.folder = ~/backup folder/aws-state\n",
             encoding="utf-8",
         )
         _ = (config / "build_targets.conf").write_text("""\

@@ -13,6 +13,7 @@ import unittest
 from typing import final, override
 
 
+from scripts.mac_test.config_test_support import MAC_OFFLOAD_SETTINGS
 from scripts.lint.memory_test_support import write_config_fixture
 
 SCRIPT = Path(__file__).with_name("audit.py")
@@ -138,7 +139,7 @@ edition = "2021"
         self.write_file(member / "src/lib.rs", "pub fn member() {}\n")
 
     def write_config(self, packages: str) -> None:
-        _ = write_config_fixture(self.config_path, f"linux_only.{self.workspace.name}={packages}\n", template="mac_test")
+        _ = write_config_fixture(self.config_path, f"linux_only.{self.workspace.name}={packages}\n", defaults=MAC_OFFLOAD_SETTINGS)
 
     def write_command_stands(self) -> None:
         stand = self.bin_directory / "command-stand"

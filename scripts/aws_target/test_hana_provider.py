@@ -17,6 +17,7 @@ from urllib.parse import urlsplit
 from scripts.aws_target import hana_protocol
 from scripts.aws_target import aws_target, hana_box as box, hana_guest, hana_provider as provider, hana_receiver, deploy, ledger, remote
 from scripts.aws_target.control_test_support import TestClock
+from scripts.aws_target.hana_image_test_support import guest_digest_fixture
 from scripts.aws_target.ledger_test_support import CostFixture
 from scripts.aws_target.test_hana_box import record_lifecycle_image, write_lifecycle_configuration
 from scripts.lib import conf
@@ -119,6 +120,7 @@ class HanaProviderTests(CostFixture):
     @override
     def setUp(self) -> None:
         super().setUp()
+        self.enterContext(guest_digest_fixture(self.root))
         self.clock = TestClock()
         self.workload = self.root / 'hana_aws.conf'
         write_lifecycle_configuration(self.workload)

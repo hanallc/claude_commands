@@ -1,7 +1,7 @@
 """Quota alerts: delivery."""
 
 from __future__ import annotations
-from scripts.lint.memory_test_support import write_config_fixture
+from scripts.lint.memory_test_support import seed_config_fixture_folder, write_config_fixture
 
 import io
 import os
@@ -19,6 +19,7 @@ from scripts.lib.test_models_registry import write_registry
 from scripts.accounts import role_map
 from scripts.accounts.home_test_support import scratch_accounts_config
 from scripts.message import send_budget
+from scripts.message.session_send_test_support import SEND_TIMING_FIXTURES
 from scripts.agents import remote
 from scripts.whoami import quota_alert_test_support as support
 from scripts.whoami import quota_alert
@@ -108,8 +109,7 @@ class QuotaAlertTests(support.SeededQuotaReminderFixture):
 
     def test_relay_reads_the_current_account_timeout(self) -> None:
         config = self.enterContext(scratch_accounts_config()) / "accounts.conf"
-        for name in ("send", "postmaster", "codex_daemon"):
-            _ = write_config_fixture(config.with_name(f'{name}.conf'))
+        seed_config_fixture_folder(config.parent, SEND_TIMING_FIXTURES)
         done = subprocess.CompletedProcess([], 0, "SENT: fixture", "")
         for limit in (40, 55):
             _ = write_config_fixture(config, f"quota_relay_timeout_seconds={limit}\n")

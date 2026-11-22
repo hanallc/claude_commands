@@ -44,7 +44,7 @@ class PageDataTests(ChartFixture):
         return Path(os.environ["CONF_DIR"]) / "buildlog.conf"
 
     def configure(self, key: str, value: str) -> None:
-        _ = write_config_fixture(self.config_file, key + "=" + value)
+        _ = write_config_fixture(self.config_file, f"# whole: 1..\n{key}={value}\n", defaults="")
 
     def rows(self, n: int = 3) -> tuple[charts.TopCost, ...]:
         result = charts.page_data(7, n)

@@ -12,6 +12,7 @@ from scripts.whoami.note_file import note_name
 
 from scripts.production import staff_sources, staff, staff_test_support
 from scripts.message import session_records
+from scripts.message.session_send_test_support import SEND_TIMING_FIXTURES
 from scripts.message import sessions as status_sessions
 import io
 import fcntl
@@ -19,7 +20,6 @@ import itertools
 import json
 import os
 import socket
-import shutil
 import subprocess
 import tempfile
 import unittest
@@ -36,12 +36,12 @@ from unittest.mock import ANY, Mock, call, patch
 from scripts.lib import conf, transcripts
 from scripts.lib.transcript_test_support import compressed_copy
 from scripts.accounts.home_test_support import scratch_account_home
-from scripts.lint.memory_test_support import write_config_fixture
+from scripts.lint.memory_test_support import seed_config_fixture_folder, write_config_fixture
 from scripts.accounts import accounts, moves, next_moves, refusal_watch, refusals, role_map
 from scripts.accounts.move_test_support import FakeSessionMoves, MoveCall, write_claude_move_credentials
 from scripts.agents import stop_resume
 from scripts.herdr import herdr, pane_launch
-from scripts.agents.test_support import write_machine_config
+from scripts.agents.test_support import SHUTDOWN_SETTINGS, write_machine_config
 from scripts.message import send as message_send
 from scripts.whoami import run_out
 from scripts.whoami import account
@@ -138,9 +138,8 @@ class RefusalWatchTests(unittest.TestCase):
             "NOTIFIER_SESSIONS_DIR": str(self.home / "sessions"), "USER_ZONE": "America/New_York",
         }, clear=True)))
         write_machine_config(Path(os.environ["CONF_DIR"]))
-        for name in ("send", "postmaster", "codex_daemon"):
-            _ = shutil.copy2(Path(__file__).resolve().parents[2] / "config" / f"{name}.conf",
-                             Path(os.environ["CONF_DIR"]) / f"{name}.conf")
+        configuration = Path(os.environ["CONF_DIR"])
+        seed_config_fixture_folder(configuration, SEND_TIMING_FIXTURES)
         (self.home / "notes").mkdir()
         _ = self.enterContext(patch.object(socket, "gethostname", return_value="natedev"))
         _ = self.enterContext(patch.object(role_map, "is_role_map_host", return_value=True))
@@ -2756,7 +2755,7 @@ class RefusalWatchTests(unittest.TestCase):
         self.assertTrue(all("weekly limit" in command.why for command in self.moves.calls))
 
     def test_deferred_build_move_keeps_its_destination_until_a_later_check(self) -> None:
-        _ = write_config_fixture(Path(os.environ["CONF_DIR"]) / "shutdown.conf", "MOVE_BUILD_WAIT_MINUTES=30\n")
+        _ = write_config_fixture(Path(os.environ["CONF_DIR"]) / "shutdown.conf", defaults=SHUTDOWN_SETTINGS)
         _ = self.groups()
         _ = self.owner("unit", host="unit")
         _ = accounts.set_group_account("units", "claude3", why="auto: build", now=NOW, origin=accounts.AutoOrigin())

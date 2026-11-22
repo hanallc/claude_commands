@@ -567,7 +567,7 @@ class MemoryMomentTests(unittest.TestCase):
             memory_fixtures.journal_entry(at + timedelta(minutes=3),
                 memory_fixtures.earlyoom_message(108, adj=200, cmdline=f"{target}/debug/test")),
         ], kernel=[])
-        config = write_lint_config(self.journal.base, 650)
+        _ = write_lint_config(Path(os.environ["CONF_DIR"]), 650)
         with closing(self.fixture.connection()):
             pass
         program = '''
@@ -586,7 +586,7 @@ with index.read_only() as connection:
 '''
         result = subprocess.run(
             [str(Path(__file__).resolve().parents[1] / "lib/py"), "-c", program], capture_output=True, text=True, check=False,
-            timeout=60, env={**os.environ, "LINT_CONFIG_FILE": str(config), "CONF_DIR": str(Path(config).parent),
+            timeout=60, env={**os.environ,
                              "PYTHONPATH": str(Path(report.__file__).resolve().parents[1] / "lib/python_startup")},
         )
         self.assertEqual(result.returncode, 0, result.stderr)

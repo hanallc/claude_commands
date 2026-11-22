@@ -28,6 +28,10 @@ from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.fork_test_support import ForkChild, ForkChildren
 
 
+def setUpModule() -> None:
+    unittest.enterModuleContext(patch.dict(os.environ, {"USER_ZONE": "America/Los_Angeles"}))
+
+
 # Script completion deadlines only bound hangs; startup can be slow under load.
 SCRIPT = Path(__file__).with_name("ci_points.py")
 LIFECYCLE = SCRIPT.with_name("production_lifecycle.py")

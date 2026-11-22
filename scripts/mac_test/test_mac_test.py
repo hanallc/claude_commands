@@ -31,6 +31,8 @@ from scripts.lib import process_start as process_identity
 from unittest import mock
 from zoneinfo import ZoneInfo
 
+from scripts.build_targets.target_test_support import mac_target_settings
+from scripts.mac_test.config_test_support import MAC_RUN_SETTINGS
 from scripts.lint.memory_test_support import write_config_fixture, commit_config_fixture, config_environment
 
 from scripts.production import staff
@@ -372,6 +374,7 @@ class MacTestCommandTests(NotificationGuardedTestCase):
         self.write_executable(send_stub, SEND_STUB)
         self.write_executable(sessions_stub, SESSIONS_STUB)
         self.write_config()
+        _ = write_config_fixture(self.root / "build_targets.conf", defaults=mac_target_settings())
         self.sync_gh()
         self.environment = {
             **{
@@ -450,7 +453,7 @@ class MacTestCommandTests(NotificationGuardedTestCase):
                 _ = values.pop(name, None)
             else:
                 values[name] = value
-        _ = write_config_fixture(self.config_path, "".join(f"{name}={value}\n" for name, value in values.items()), template="mac_test")
+        _ = write_config_fixture(self.config_path, "".join(f"{name}={value}\n" for name, value in values.items()), defaults=MAC_RUN_SETTINGS)
         removed = {key for key, value in changes.items() if value is None}
         if removed:
             _ = self.config_path.write_text("\n".join(line for line in self.config_path.read_text().splitlines()
@@ -1218,7 +1221,7 @@ finally:
         (self.state_directory / "block.json").unlink()
 
         settings = self.root / "off.conf"
-        _ = write_config_fixture(settings, "offload=off\n", template="mac_test")
+        _ = write_config_fixture(settings, "offload=off\n", defaults=MAC_RUN_SETTINGS)
         self.assert_command(self.command("free-now", "--settings", str(settings)), 1, "off\n")
         self.assert_command(self.command("free-now"), 0, "free\n")
         self.assertEqual(self.logged_arguments("gh"), [])
@@ -3042,8 +3045,8 @@ class MacActivityScriptTests(NotificationGuardedTestCase):
     def setUp(self) -> None:
         super().setUp()
         folder = Path(self.enterContext(tempfile.TemporaryDirectory()))
-        environment = config_environment(folder)
-        _ = write_config_fixture(folder / "build_targets.conf", "platform.mac=macos\n")
+        environment = config_environment(folder, fixtures={"mac_test.conf": MAC_RUN_SETTINGS})
+        _ = write_config_fixture(folder / "build_targets.conf", defaults=mac_target_settings())
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, environment)))
 
     def test_app_is_active_without_work_but_deps_and_compilers_are_work(self) -> None:
@@ -3077,8 +3080,8 @@ class ClaimWatchTests(NotificationGuardedTestCase):
         self.paths = mac_test.StatePaths(self.root / "state")
         self.paths.directory.mkdir()
         config = self.root / "mac_test.conf"
-        _ = write_config_fixture(self.root / "build_targets.conf", "platform.mac=macos\n")
-        _ = write_config_fixture(config, "host=config-mac\nclaim_idle_minutes=15\nclaim_poll_seconds=60\n")
+        _ = write_config_fixture(self.root / "build_targets.conf", defaults=mac_target_settings())
+        _ = write_config_fixture(config, "host=config-mac\nclaim_idle_minutes=15\nclaim_poll_seconds=60\n", defaults=MAC_RUN_SETTINGS)
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
             "HOME": str(self.root), "MAC_TEST_STATE_DIR": str(self.paths.directory),
             **config_environment(self.root),
@@ -3101,7 +3104,7 @@ class ClaimWatchTests(NotificationGuardedTestCase):
 
     def test_complete_idle_config_is_read_once_by_mac_test(self) -> None:
         selected = Path(os.environ["MAC_TEST_CONFIG"])
-        _ = write_config_fixture(selected)
+        _ = write_config_fixture(selected, defaults=MAC_RUN_SETTINGS)
         with mock.patch.object(Path, "read_text", autospec=True, side_effect=Path.read_text) as opened:
             _ = mac_test.read_config()
         self.assertEqual([call.args[0] for call in opened.call_args_list], [selected])
@@ -3608,7 +3611,7 @@ class ClaimWatchTests(NotificationGuardedTestCase):
         path = self.root / "mac_test.conf"
         for target in ("", "mac"):
             with self.subTest(target=target):
-                _ = write_config_fixture(path)
+                _ = write_config_fixture(path, defaults=MAC_RUN_SETTINGS)
                 self.assertEqual(mac_test.read_config(target).host, conf.read(path).text("host"))
                 _ = path.write_text("\n".join(
                     line for line in path.read_text().splitlines() if not line.startswith("alert_seconds=")
@@ -3619,7 +3622,7 @@ class ClaimWatchTests(NotificationGuardedTestCase):
 
     def test_claim_idle_settings_read_configured_values(self) -> None:
         path = self.root / "mac_test.conf"
-        _ = write_config_fixture(path)
+        _ = write_config_fixture(path, defaults=MAC_RUN_SETTINGS)
         config = mac_test.read_config()
         self.assertEqual((config.claim_idle_minutes, config.claim_poll_seconds), (15, 60))
         _ = write_config_fixture(path, "host=other-mac\nclaim_idle_minutes=0.5\nclaim_poll_seconds=2\n")

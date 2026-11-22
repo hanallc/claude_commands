@@ -35,18 +35,26 @@ from scripts.lint import sweep, tmp_sweep
 from scripts.lib import cargo_target_config
 from scripts.lib import file_lock
 from scripts.message import send_budget, session_send
-from scripts.message.session_send_test_support import forbid_real_sender
+from scripts.message.session_send_test_support import SEND_TIMING_FIXTURES, forbid_real_sender
 from scripts.lib import build_folders, conf, copy_record, removal_guard
 from scripts.lib.cargo_output import CargoOutputRoots
 from scripts.lib.cargo_output_test_support import fake_cargo_output_roots
 from scripts.lib.process_start import Gone, ProcessStart, Started, proc_table_start
 from scripts.mac_test import floor_claims
-from scripts.lint.test_memory_admit import HISTORY_APPEND_STOPS, stop_history_append
-from scripts.lint.memory_test_support import config_environment, write_config_fixture
+from scripts.lint.config_test_support import SWEEP_SCAN_SETTINGS, SWEEP_FLOOR_SETTINGS, TMP_SWEEP_SETTINGS, FOLDER_AUDIT_SETTINGS
+from scripts.build_targets.target_test_support import mac_target_settings
+from scripts.mac_test.config_test_support import MAC_RUN_SETTINGS, MAC_SWEEP_SETTINGS
+from scripts.lint.memory_test_support import (
+    config_environment, fixture_feed_code_settings, seed_config_fixture_folder, write_config_fixture,
+)
 from scripts.buildlog.step_outputs_test_support import create_step_index, record_root_attempt
 from scripts.buildlog import index as build_index
 from scripts.buildlog import repository
 from scripts.copies.copies_test_support import copies_environment
+
+with fixture_feed_code_settings():
+    from scripts.lint.test_memory_admit import HISTORY_APPEND_STOPS, stop_history_append
+
 if TYPE_CHECKING:
     from scripts.copies import copies
     from scripts.production.cli_fixture import ImmutableGitSeed
@@ -163,6 +171,11 @@ def setUpModule() -> None:
     forbid_real_sender()
     root = Path(unittest.enterModuleContext(tempfile.TemporaryDirectory()))
     _ = unittest.enterModuleContext(fake_cargo_output_roots())
+    _ = write_config_fixture(root / "lint.conf", defaults=SWEEP_SCAN_SETTINGS + SWEEP_FLOOR_SETTINGS
+                             + TMP_SWEEP_SETTINGS + FOLDER_AUDIT_SETTINGS)
+    notify_settings = root / "notify.conf"
+    _ = write_config_fixture(notify_settings, defaults="REVIEW_TIMEOUT_SECONDS=60\n")
+    _ = cast(object, unittest.enterModuleContext(mock.patch.object(review, "NOTIFY_CONFIG", notify_settings)))
     unittest.enterModuleContext(mock.patch.dict(os.environ, {
         **config_environment(root), "HOME": str(root), "USER_ZONE": "America/Los_Angeles",
     }))
@@ -278,6 +291,8 @@ class SweepCase(unittest.TestCase):
         })))
         # A run inside a build slot carries that slot's Cargo cache; a test gate must lease its own.
         _ = os.environ.pop("CARGO_BUILD_BUILD_DIR", None)
+        _ = write_config_fixture(conf.path("lint"), defaults=SWEEP_SCAN_SETTINGS + SWEEP_FLOOR_SETTINGS
+                                 + TMP_SWEEP_SETTINGS + FOLDER_AUDIT_SETTINGS)
         skip_host_ci_targets(state)
         self.declare_output_root(self.output_root)
 
@@ -634,6 +649,8 @@ class RebuildTests(SweepCase):
     def setUp(self) -> None:
         super().setUp()
         _ = write_config_fixture(conf.path("lint"), "sweep_cold_crates=50\n")
+        _ = conf.path("build_targets").write_text(
+            "targets=natedev\nkind.natedev=local\nplatform.natedev=linux\nsync.hosts.natedev=natedev\n")
         _ = self.enterContext(mock.patch.object(store, "host_name", side_effect=lambda: record.local_step_identity().hosts[0]))
 
     def test_rebuild_report_fails_when_an_enumerated_month_disappears(self) -> None:
@@ -896,7 +913,7 @@ class TargetDirTests(SweepCase):
         target = self.target()
         output = io.StringIO()
         config = target.root.parent / "lint.conf"
-        _ = write_config_fixture(config)
+        _ = write_config_fixture(config, defaults=SWEEP_SCAN_SETTINGS + SWEEP_FLOOR_SETTINGS)
         environ = {sweep.BUDGET_ENV: "1024", "CONF_DIR": str(config.parent)}
         # The machine's real disk floor is not this test's subject; its scan reads every real root.
         with (mock.patch.dict(os.environ, environ), redirect_stdout(output),
@@ -914,7 +931,7 @@ class TargetDirTests(SweepCase):
         self.addCleanup(worker.kill)
         output = io.StringIO()
         config = target.root.parent / "lint.conf"
-        _ = write_config_fixture(config)
+        _ = write_config_fixture(config, defaults=SWEEP_SCAN_SETTINGS + SWEEP_FLOOR_SETTINGS)
         environ = {**config_environment(config.parent), sweep.BUDGET_ENV: "0"}
         # The machine's real disk floor is not this test's subject; below it, main would page.
         with (mock.patch.dict(os.environ, environ), redirect_stdout(output),
@@ -1200,6 +1217,11 @@ class ProcessUseTests(SweepCase):
 
 
 class ReclamationTests(SweepCase):
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        _ = write_config_fixture(conf.path("mac_test"), defaults=MAC_RUN_SETTINGS)
+
     def guard(self, root: Path) -> removal_guard.RemovalGuard:
         self.declare_output_root(root)
         return removal_guard.read(build_top=root, mount_reader=lambda: (Path("/"), root),
@@ -1696,6 +1718,7 @@ class FloorTests(SweepCase):
     @override
     def setUp(self) -> None:
         super().setUp()
+        seed_config_fixture_folder(conf.directory(), SEND_TIMING_FIXTURES)
         _ = write_config_fixture(conf.path("lint"),
             FLOOR_TEST_SETTINGS + "sweep_floor_roots=~/rust ~/.local/state ~/.cache /tmp\n")
 
@@ -3772,13 +3795,16 @@ class FloorTests(SweepCase):
             "BUILD_HOLD_DIR": str(base / "build-hold"),
         }))
         self.declare_output_root(base)
+        seed_config_fixture_folder(conf.directory(), SEND_TIMING_FIXTURES)
         create_step_index(build_index.index_path())
         _ = self.enterContext(mock.patch.object(sweep, "output_device", return_value=base.stat().st_dev))
         _ = self.enterContext(mock.patch.object(sessions, "live_sessions", return_value=[]))
         _ = self.enterContext(mock.patch.object(sweep, "process_uses", return_value={}))
         _ = write_config_fixture(conf.path("lint"),
                                  FLOOR_TEST_SETTINGS + f"sweep_ci_targets={base / 'ci-1'} {base / 'ci-2'}\n"
-                                 + f"sweep_floor_roots={base}\nsweep_phone_floor_gib=0\n")
+                                 + f"sweep_floor_roots={base}\nsweep_phone_floor_gib=0\n",
+                                 defaults=SWEEP_SCAN_SETTINGS + SWEEP_FLOOR_SETTINGS
+                                 + TMP_SWEEP_SETTINGS + FOLDER_AUDIT_SETTINGS)
         _ = self.enterContext(mock.patch.object(
             sweep, "send_floor_alert", side_effect=AssertionError("unexpected floor alert send")))
         _ = self.enterContext(mock.patch.object(
@@ -7477,9 +7503,9 @@ raise SystemExit(int(os.environ[variable]))
 
 
     def test_floor_only_skips_the_workspace_and_holds_the_configured_floor(self) -> None:
-        config = self.base() / "lint.conf"
-        with (mock.patch.dict(os.environ, {"CONF_DIR": str(config.parent)}),
-              mock.patch.object(socket, "gethostname", return_value="testhost"),
+        _ = self.base()
+        config = conf.path("lint")
+        with (mock.patch.object(socket, "gethostname", return_value="testhost"),
               mock.patch.object(sweep, "sweep_workspace") as workspace,
               mock.patch.object(tmp_sweep, "run_if_due",
                                 return_value=tmp_sweep.SkippedSweepAssessment()) as scratch,
@@ -7496,9 +7522,9 @@ raise SystemExit(int(os.environ[variable]))
                     floor.assert_called_once_with(7 * GIB, False, lint_settings=lint_settings)
 
     def test_malformed_floor_is_an_error(self) -> None:
-        config = self.base() / "lint.conf"
-        _ = write_config_fixture(config, "sweep_free_floor_gib=lots\nsweep_free_floor_gib.natedev=lots\n")
-        with mock.patch.dict(os.environ, {"CONF_DIR": str(Path(config).parent)}), redirect_stderr(io.StringIO()):
+        _ = self.base()
+        _ = write_config_fixture(conf.path("lint"), "sweep_free_floor_gib=lots\nsweep_free_floor_gib.natedev=lots\n")
+        with redirect_stderr(io.StringIO()):
             self.assertEqual(sweep.main([sweep.FLOOR_ONLY_FLAG]), 2)
 
 
@@ -7534,6 +7560,11 @@ NO_MAC_CLAIMS: frozenset[str] = frozenset()
 
 
 class MacFloorTests(SweepCase):
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        _ = write_config_fixture(conf.path("mac_test"), defaults=MAC_RUN_SETTINGS)
+
     def policy(self, base: Path, claims: frozenset[str] = NO_MAC_CLAIMS) -> sweep.MacFloor:
         return sweep.MacFloor((str(base),), floor_claims.ClaimSnapshot(claims), base / "mirror")
 
@@ -7572,6 +7603,8 @@ class MacFloorTests(SweepCase):
             with self.subTest(claim_after_scan=after_scan):
                 isolated = self.output_fixture()
                 with local_remote_transport(isolated), warm_claim_servers():
+                    _ = write_config_fixture(conf.path("lint"), defaults=SWEEP_SCAN_SETTINGS + SWEEP_FLOOR_SETTINGS)
+                    _ = write_config_fixture(conf.path("mac_test"), defaults=MAC_RUN_SETTINGS)
                     skip_host_ci_targets(isolated)
                     late_tree, late_payload = cargo_target(isolated, "unleased", APP, time.time() - DAY)
                     _ = (late_tree.parent / sweep.USE_STAMP).write_text("")
@@ -7699,7 +7732,7 @@ class MacFloorTests(SweepCase):
 
     def test_mac_missing_or_lower_floor_refuses_with_one_line(self) -> None:
         config = Path(os.environ["CONF_DIR"]) / "mac_test.conf"
-        _ = write_config_fixture(config, "free_floor_gib=100\nsweep_floor_gib=150\n")
+        _ = write_config_fixture(config, "free_floor_gib=100\nsweep_floor_gib=150\n", defaults=MAC_RUN_SETTINGS + MAC_SWEEP_SETTINGS)
         original = config.read_text()
         for changed in (original.replace("sweep_floor_gib=150", "sweep_floor_gib=99"),
                         original.replace("sweep_floor_gib=150", "")):
@@ -7714,10 +7747,11 @@ class MacFloorTests(SweepCase):
 
     def test_mac_entry_uses_mac_floor_and_skips_the_tmp_sweep(self) -> None:
         config = Path(os.environ["CONF_DIR"]) / "mac_test.conf"
-        _ = write_config_fixture(conf.path("build_targets"), "platform.mac=macos\n")
+        _ = write_config_fixture(conf.path("build_targets"), defaults=mac_target_settings())
         _ = write_config_fixture(config,
             "free_floor_gib=100\nsweep_floor_gib=101\nmirror_root=~/.local/state/mac-test/test-mirror\n"
-            + "sweep_floor_roots=/tmp ~/rust ~/.local/state/mac-test/test-mirror\n")
+            + "sweep_floor_roots=/tmp ~/rust ~/.local/state/mac-test/test-mirror\n",
+            defaults=MAC_RUN_SETTINGS + MAC_SWEEP_SETTINGS)
         claims = floor_claims.ClaimSnapshot(frozenset())
         with (mock.patch.object(floor_claims, "read_claims", return_value=claims),
               mock.patch.object(sweep, "hold_floor", return_value=0) as take,
@@ -7900,12 +7934,14 @@ class BudgetTests(unittest.TestCase):
         _ = budget_path.write_text("# range: 0..\nsweep_budget_gib=17\n")
         target = root / "target"
         target.mkdir()
-        repository = Path(__file__).resolve().parents[2] / "config" / "lint.conf"
-        doc_budget = int(conf.read(repository).number("sweep_doc_index_mib") * sweep.MIB)
+        settings = root / "repository" / "lint.conf"
+        _ = write_config_fixture(settings, defaults=SWEEP_SCAN_SETTINGS + SWEEP_FLOOR_SETTINGS)
+        doc_budget = int(conf.read(settings).number("sweep_doc_index_mib") * sweep.MIB)
         environment = {key: value for key, value in os.environ.items() if key != "CONF_DIR"}
         environment.update({sweep.BUDGET_ENV: "", sweep.DOC_INDEX_ENV: ""})
         with (mock.patch.dict(os.environ, environment, clear=True),
               mock.patch.object(conf, "directory", return_value=root),
+              mock.patch.object(conf, "_repository_path", return_value=settings),
               mock.patch.object(sweep, "process_uses", return_value={}),
               mock.patch.object(sweep, "_build_trees", return_value=[]),
               mock.patch.object(sweep, "prune_doc_index", return_value=0) as prune,
@@ -8002,10 +8038,13 @@ class RunnerTargetDirTests(SweepCase):
     @override
     def setUp(self) -> None:
         super().setUp()
-        # A runner home has no ~/.claude: conf recovers lint.conf from the repository copy.
+        # Give the runner an empty home and a private source for the fallback settings.
+        configuration = conf.directory()
         home = Path(self.enterContext(tempfile.TemporaryDirectory()))
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {sweep.BUDGET_ENV: "1024", "HOME": str(home)})))
         _ = os.environ.pop("CONF_DIR", None)
+        _ = cast(object, self.enterContext(
+            mock.patch.object(conf, "_repository_config_directory", return_value=configuration)))
 
     def test_a_target_dir_run_holds_no_floor_reads_no_index_and_sends_no_notice(self) -> None:
         target = self.target()

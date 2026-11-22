@@ -24,7 +24,9 @@ use_test_log()
 from scripts.buildlog import record, store
 from scripts.test_times import gate_record
 from scripts.test_times.gate_record import TYPE_CHECK_JOB, GateRun, ModuleRun
-from scripts.test_times.gate_record_test_support import fixture_executions, gate_run, remove_run_measurements
+from scripts.test_times.gate_record_test_support import (
+    fixture_executions, gate_run, gate_timing_settings, remove_run_measurements,
+)
 from scripts.lint.memory_test_support import write_config_fixture
 
 EPOCH = 1_793_700_000.0
@@ -84,8 +86,9 @@ class GateIndexTests(unittest.TestCase):
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory())) / "buildlog"
         point_root_at(self, self.root)
+        self.enterContext(mock.patch.dict(os.environ, {"USER_ZONE": "America/New_York"}))
         config = configure_cleanup(self, self.root)
-        _ = write_config_fixture(config / "test_times.conf")
+        _ = write_config_fixture(config / "test_times.conf", defaults=gate_timing_settings())
 
     def write_run(self, identifier: str, run: GateRun, host: str = "fixture-host") -> str:
         with mock.patch.object(record, "new_id", return_value=identifier), \
@@ -170,7 +173,6 @@ class GateIndexTests(unittest.TestCase):
         self.assertEqual(path.read_bytes(), original)
 
     def test_query_recovers_failure_log_paths_after_an_index_rebuild(self) -> None:
-        _ = write_config_fixture(Path(os.environ["CONF_DIR"]) / "test_times.conf")
         output = "Traceback (most recent call last):\nAssertionError: retained failure\n"
         executions = [gate_record.Execution("scripts", "test_failure.py", 1.0, 0.5, 10.0, 1, "",
                                              gate_record.NoModuleTimes("runner stopped"), output)]

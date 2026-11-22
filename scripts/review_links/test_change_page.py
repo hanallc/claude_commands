@@ -1,7 +1,10 @@
 """Test page publication, HTTP forms, verdict calls and checkpoint routing."""
 from __future__ import annotations
 
-from scripts.production.change_review_test_support import fixture_image, fixture_row_image, pictured_changes, registered_fixture_image
+from scripts.production.change_review_test_support import (
+    REVIEW_DELIVERY_SETTINGS, REVIEW_DISPLAY_SETTINGS, REVIEW_SERVER_SETTINGS,
+    fixture_image, fixture_row_image, pictured_changes, registered_fixture_image, write_change_review_settings,
+)
 
 import fcntl
 import hashlib
@@ -33,10 +36,12 @@ from unittest.mock import patch
 from urllib.parse import parse_qs, urlencode, urljoin, urlsplit
 from uuid import uuid4
 
-from scripts.review_links.test_page_frame import assert_status_states
+from scripts.review_links.test_page_frame import assert_status_states, console_settings
 from scripts.review_links.test_staff_names import without_role_colors
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib import atomic_file, conf, scratch, urgency
+from scripts.lib.scratch_test_support import write_scratch_settings
+from scripts.lib.nix_env_test_support import nix_fixture_settings
 from scripts.message import send_result
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.lib.py_floor_test_support import seed_interpreter_cache
@@ -677,12 +682,12 @@ class ChangePageTests(unittest.TestCase):
         for index, (publish, manifest) in enumerate(publications):
             first = self.temporary / f"first-{index}"
             second = self.temporary / f"second-{index}"
-            _ = write_config_fixture(settings, f"review_links_directory={first}\n")
+            _ = write_config_fixture(settings, f"review_links_directory={first}\n", defaults="")
 
             def write(path: Path, content: bytes, *, mode: int = 0o600) -> None:
                 real_write(path, content, mode=mode)
                 if path.name == change_page.PAGE_NAME:
-                    _ = write_config_fixture(settings, f"review_links_directory={second}\n")
+                    _ = write_config_fixture(settings, f"review_links_directory={second}\n", defaults="")
 
             with (self.subTest(manifest=manifest), patch.dict(os.environ),
                   patch.object(atomic_file, "write_bytes_atomic", side_effect=write)):
@@ -696,9 +701,6 @@ class ChangePageTests(unittest.TestCase):
 
     def test_bare_command_prints_the_console_link_with_changes_selected(self) -> None:
         configuration = self.temporary / "config"
-        _ = write_config_fixture(configuration / "console.conf",
-            "page.review.title=Review\npage.review.url=python:scripts.review_links.review_page:page_url\n"
-            + "rebuilds.url=python:scripts.review_links.change_page:rebuilds_url\n")
         _ = (configuration / "memory_feed.conf").write_text(f"output_folder={self.root / 'builds'}\n")
         result = self.command(change_page, change_page.main, [])
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -752,8 +754,10 @@ class ChangePageTests(unittest.TestCase):
         self.root = self.temporary / "snapshots"
         configuration = self.temporary / "config"
         configuration.mkdir()
-        for stem in ("change_review", "nix_env"):
-            _ = write_config_fixture(configuration / f'{stem}.conf')
+        _ = write_config_fixture(configuration / "console.conf", defaults=console_settings())
+        write_change_review_settings(configuration, self.temporary)
+        write_scratch_settings(configuration, self.temporary)
+        _ = write_config_fixture(configuration / "nix_env.conf", defaults=nix_fixture_settings())
         self.write_delivery_config()
         _ = self.enterContext(patch.object(unrouted_alert, "send_message"))
         self.enterContext(patch.dict(os.environ, {"CONF_DIR": str(configuration)}))
@@ -847,8 +851,8 @@ class ChangePageTests(unittest.TestCase):
 
     def write_delivery_config(self, tries: int = 3, pause: int = 0) -> None:
         _ = write_config_fixture(self.temporary / "config/review_links.conf",
-                                 f"delivery_tries={tries}\ndelivery_pause_seconds={pause}\nfeedback_rows=5\n"
-                                 + "changes_first_root=natedev\nunrouted_alert_retry_seconds=60\npage_refresh_seconds=15\n")
+                                 f"delivery_tries={tries}\ndelivery_pause_seconds={pause}\n",
+                                 defaults=REVIEW_SERVER_SETTINGS + REVIEW_DISPLAY_SETTINGS + REVIEW_DELIVERY_SETTINGS)
 
     def fail_all_but_alerts(self, calls: list[str]) -> Callable[[str, str, str], None]:
         def send(recipient: str, sender: str, message: str, **_options: str) -> None:

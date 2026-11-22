@@ -22,6 +22,7 @@ from scripts.production.unit_lookup import Place
 from scripts.hooks import hook_dispatch, review_hold_delivery
 from scripts.lib import script_prompts, test_hang_guard
 from scripts.lib.script_envelope import script_prompt
+from scripts.lib.test_script_prompts import write_script_prompt_fixture
 from scripts.hooks.conversation_pause_test_support import (
     ASK_AGAIN, IDLE_NOTICE, NO_CONTEXT, NOW, OTHER_ANSWER_CONTEXT, PAUSE_CONTEXT,
     QUESTION, RETURN_SCHEDULE, SESSION, SETTINGS, ConversationPauseFixture,
@@ -391,7 +392,9 @@ class ConversationPauseTests(ConversationPauseFixture):
     def test_wrapped_recorded_script_consumes_its_inner_text_evidence_once(self) -> None:
         self.record_activity()
         _ = self.create_instance(self.showrunner_timer("demo"))
-        with patch.dict(os.environ, self.environment, clear=True):
+        configuration = self.root / "prompt-config"
+        write_script_prompt_fixture(configuration)
+        with patch.dict(os.environ, {**self.environment, "CONF_DIR": str(configuration)}, clear=True):
             script_prompts.record(f"session:{SESSION}", "/resume")
         prompt = '<pasted_content id="one">\n/resume\n</pasted_content id="one">'
         first = self.run_prompt(prompt)

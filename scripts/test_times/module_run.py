@@ -16,8 +16,9 @@ import ctypes
 import json
 import os
 import fcntl
-from collections.abc import Callable, Generator, Sequence
+from collections.abc import Callable, Generator, Mapping, Sequence
 from contextlib import ExitStack, contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from functools import wraps
 from inspect import currentframe
@@ -41,6 +42,9 @@ if TYPE_CHECKING:
 
 ExceptionInfo = tuple[type[BaseException], BaseException, TracebackType] | tuple[None, None, None]
 
+# Python may omit the native constant.
+_AT_FDCWD = cast(int, getattr(os, "AT_FDCWD", -2 if sys.platform == "darwin" else -100))
+
 _OUTCOME_PRIORITY: dict[TestStatus, int] = {
     "pass": 0, "skip": 1, "expected_failure": 2,
     "unexpected_success": 3, "fail": 4, "error": 5,
@@ -62,19 +66,26 @@ class NoConfigReadLog:
     """The isolated project has no config reader to record its reads."""
 
 
+class RepositoryConfigRead(RuntimeError):
+    """A test tried to read the checkout's tunable config."""
+
+
 @final
 class RepositoryReadAudit:
     """Record repository listings and file reads in this process."""
 
-    def __init__(self, root: Path, folders: set[str], contents: set[str]) -> None:
+    def __init__(self, root: Path, folders: set[str], contents: set[str], forbidden_config_paths: set[str]) -> None:
         self.roots = tuple(dict.fromkeys((os.path.realpath(root), os.path.abspath(root))))
         self.folders = folders
         self.contents = contents
+        self.forbidden_config_paths = forbidden_config_paths
+        self.active = True
         self.process_id = os.getpid()
         self.current_process = os.getpid
         self.decode = os.fsdecode
         self.current_directory = os.getcwd
         self.normalize = os.path.normpath
+        self.resolve = os.path.realpath
         self.read_link = os.readlink
         self.get_descriptor_path = fcntl.fcntl
         self.descriptor_path_command = cast(int, getattr(fcntl, "F_GETPATH", 50))
@@ -82,25 +93,57 @@ class RepositoryReadAudit:
         self.current_frame = currentframe
         self.file_status = os.stat
         self.is_regular = stat.S_ISREG
+        self.open_directory: ContextVar[int | None] = ContextVar("open_directory", default=None)
         self.write_flags = os.O_WRONLY | os.O_RDWR | os.O_APPEND | os.O_CREAT | os.O_TRUNC | os.O_EXCL
+
+    def install(self, cleanup: ExitStack) -> None:
+        """Record opens relative to a directory descriptor."""
+        native_open = os.open
+
+        def open_at(path: str | bytes | os.PathLike[str] | os.PathLike[bytes], flags: int,
+                    mode: int = 0o777, *, dir_fd: int | None = None) -> int:
+            if dir_fd is None:
+                return native_open(path, flags, mode)
+            token = self.open_directory.set(dir_fd)
+            try:
+                return native_open(path, flags, mode, dir_fd=dir_fd)
+            finally:
+                self.open_directory.reset(token)
+
+        def restore_open() -> None:
+            os.open = native_open
+
+        os.open = open_at
+        sys.addaudithook(self)
+        _ = cleanup.callback(restore_open)
+        _ = cleanup.callback(self.stop)
+
+    def stop(self) -> None:
+        """Stop the audit when the test module ends."""
+        self.active = False
 
     def absolute_path(self, path: str, cwd: str) -> str:
         return self.normalize(path if path.startswith("/") else cwd + "/" + path)
 
-    def listed_folder(self, value: object, cwd: str) -> set[str]:
+    def descriptor_path(self, descriptor: int) -> str:
+        if self.platform == "darwin":
+            return self.decode(self.get_descriptor_path(
+                descriptor, self.descriptor_path_command, bytes(1024)).split(b"\0", 1)[0])
+        return self.read_link(f"/proc/self/fd/{descriptor}")
+
+    def listed_folder(self, value: object, cwd: str, *, resolve: bool = False) -> set[str]:
         if value is None:
             value = cwd
         if isinstance(value, int):
             try:
-                if self.platform == "darwin":
-                    value = self.get_descriptor_path(value, self.descriptor_path_command, bytes(1024)).split(b"\0", 1)[0]
-                else:
-                    value = self.read_link(f"/proc/self/fd/{value}")
+                value = self.descriptor_path(value)
             except (OSError, ValueError):
                 return {"/"}
         if not isinstance(value, (str, bytes, os.PathLike)):
             return set()
-        absolute = self.absolute_path(self.decode(value), cwd)
+        path = self.decode(value)
+        absolute = (self.resolve(path if path.startswith("/") else cwd + "/" + path)
+                    if resolve else self.absolute_path(path, cwd))
         for root in self.roots:
             if absolute == root:
                 return {"."}
@@ -108,55 +151,102 @@ class RepositoryReadAudit:
                 return {absolute[len(root) + 1:]}
         return set()
 
-    def git_folders(self, arguments: tuple[object, ...]) -> set[str]:
-        command = arguments[1]
+    def forbid_config_reads(self, paths: set[str]) -> None:
+        config = {path for path in paths if path.startswith("config/") and path.endswith(".conf")}
+        if config:
+            self.forbidden_config_paths.update(config)
+            raise RepositoryConfigRead(f"Use a fixed test config for {', '.join(sorted(config))}.")
+
+    def git_checkout_matches(self, cwd: str, git_dir: str) -> bool:
+        from scripts.lib import git_files
+
+        if git_dir:
+            actual = self.resolve(self.absolute_path(git_dir, cwd))
+            return actual == str(git_files.at(Path(self.roots[0])).git_dir)
+        return (bool(self.listed_folder(cwd, self.roots[0]))
+                and str(git_files.locate(Path(cwd)).toplevel) in self.roots)
+
+    def child_folders(self, arguments: tuple[object, ...]) -> set[str]:
+        executable, command, directory, environment = arguments
+        if not isinstance(executable, (str, bytes, os.PathLike)) or self.decode(executable).rsplit("/", 1)[-1] != "git":
+            return set()
         if not isinstance(command, (list, tuple)):
             return set()
         values = cast(Sequence[object], command)
         if not values or not all(isinstance(value, (str, bytes, os.PathLike)) for value in values):
             return set()
         argv = [self.decode(cast(str | bytes | os.PathLike[str] | os.PathLike[bytes], value)) for value in values]
-        if argv[0].rsplit("/", 1)[-1] != "git":
-            return set()
         current_directory = self.current_directory()
-        cwd = current_directory if arguments[2] is None else self.decode(
-            cast(str | bytes | os.PathLike[str] | os.PathLike[bytes], arguments[2]))
+        cwd = current_directory if directory is None else self.decode(cast(str | bytes | os.PathLike[str], directory))
         cwd = self.absolute_path(cwd, current_directory)
+        git_dir = os.environ.get("GIT_DIR", "")
+        if environment is not None:
+            env = cast(Mapping[str | bytes, str | bytes], environment)
+            git_dir = self.decode(env.get("GIT_DIR", env.get(b"GIT_DIR", "")))
         index = 1
         while index < len(argv):
             option = argv[index]
+            key, _, value = option.partition("=")
             if option == "-C" and index + 1 < len(argv):
-                cwd = self.absolute_path(argv[index + 1], cwd)
+                if argv[index + 1]:
+                    cwd = self.absolute_path(argv[index + 1], cwd)
                 index += 2
-            elif option.startswith("-C"):
-                cwd = self.absolute_path(option[2:], cwd)
+            elif key in {"--git-dir", "--work-tree"}:
+                if not value and index + 1 < len(argv):
+                    index += 1
+                    value = argv[index]
+                if key == "--git-dir":
+                    git_dir = value
                 index += 1
-            elif option in {"-c", "--git-dir", "--work-tree", "--namespace"}:
+            elif option in {"-c", "--namespace", "--config-env"}:
                 index += 2
             elif option.startswith("-"):
                 index += 1
             else:
                 break
-        if index == len(argv) or argv[index] != "ls-files" or not self.listed_folder(cwd, current_directory):
+        if index == len(argv):
             return set()
+        verb = argv[index]
+        if verb not in {"show", "cat-file", "ls-files"}:
+            return set()
+        cwd = self.resolve(cwd)
+        operands = argv[index + 1:]
+        if verb in {"show", "cat-file"}:
+            for operand in operands:
+                if operand == "--" and verb == "show":
+                    break
+                revision, separator, path = operand.partition(":")
+                if not revision and separator:
+                    stage, stage_separator, staged_path = path.partition(":")
+                    if stage_separator and stage in {"0", "1", "2", "3"}:
+                        path = staged_path
+                if separator and path.endswith(".conf") and not operand.startswith("-"):
+                    base = cwd if path.startswith(("./", "../")) else self.roots[0]
+                    config = self.listed_folder(path, base)
+                    if config and self.git_checkout_matches(cwd, git_dir):
+                        self.forbid_config_reads(config)
+            return set()
+        if git_dir and not self.git_checkout_matches(cwd, git_dir):
+            return set()
+        if not self.listed_folder(cwd, self.roots[0]):
+            return {"/"} if git_dir else set()
         pathspecs: list[str] = []
-        index += 1
-        while index < len(argv):
-            option = argv[index]
-            if option == "--":
-                pathspecs.extend(argv[index + 1:])
+        skip_value = False
+        for offset, option in enumerate(operands):
+            if skip_value:
+                skip_value = False
+            elif option == "--":
+                pathspecs.extend(operands[offset + 1:])
                 break
-            if option in {"-x", "--exclude", "-X", "--exclude-from", "--exclude-per-directory", "--format"}:
-                index += 2
-                continue
-            if not option.startswith("-"):
+            elif option.startswith("-"):
+                skip_value = option in {"-x", "--exclude", "-X", "--exclude-from", "--exclude-per-directory", "--format"}
+            else:
                 pathspecs.append(option)
-            index += 1
         if not pathspecs:
             return {"/"}
         folders: set[str] = set()
         for pathspec in pathspecs:
-            # Complex Git pathspecs conservatively cover the repository.
+            # Complex Git pathspecs cover a wider area than the named folder.
             if pathspec.startswith(":") or any(mark in pathspec for mark in ("*", "?", "[")):
                 folders.add("/")
                 continue
@@ -165,7 +255,7 @@ class RepositoryReadAudit:
         return folders
 
     def __call__(self, event: str, arguments: tuple[object, ...]) -> None:
-        if event not in {"os.scandir", "os.listdir", "subprocess.Popen", "open"}:
+        if not self.active or event not in {"os.scandir", "os.listdir", "subprocess.Popen", "open"}:
             return
         if self.current_process() != self.process_id:
             return
@@ -173,22 +263,31 @@ class RepositoryReadAudit:
             target = self.folders
             if event == "open":
                 mode, flags = arguments[1:3]
-                if (not isinstance(flags, int) or flags & self.write_flags
-                        or isinstance(mode, str) and (not mode.startswith("r") or "+" in mode)):
+                if not isinstance(flags, int):
                     return
-                paths = self.listed_folder(arguments[0], self.current_directory())
-                paths = {path for path in paths if path not in {".", "/"}
-                         and not path.startswith("config/") and "__pycache__" not in path.split("/")}
+                directory = self.open_directory.get()
+                if directory == _AT_FDCWD:
+                    directory = None
+                cwd = self.current_directory() if directory is None else self.descriptor_path(directory)
+                paths = self.listed_folder(arguments[0], cwd)
+                self.forbid_config_reads(self.listed_folder(arguments[0], cwd, resolve=True))
+                if flags & self.write_flags or isinstance(mode, str) and (not mode.startswith("r") or "+" in mode):
+                    return
+                paths = {path for path in paths if path not in {".", "/", ".git"}
+                         and not path.startswith(".git/") and "__pycache__" not in path.split("/")}
                 if not paths:
                     return
                 # Use the original spelling for the existing-file check.
-                if not self.is_regular(self.file_status(cast(str | bytes | os.PathLike[str] | os.PathLike[bytes] | int,
-                                                            arguments[0])).st_mode):
+                path = cast(str | bytes | os.PathLike[str] | os.PathLike[bytes] | int, arguments[0])
+                status = self.file_status(path) if directory is None else self.file_status(path, dir_fd=directory)
+                if not self.is_regular(status.st_mode):
                     return
                 target = self.contents
+            elif event == "subprocess.Popen":
+                paths = self.child_folders(arguments)
             else:
-                paths = (self.git_folders(arguments) if event == "subprocess.Popen"
-                         else self.listed_folder(arguments[0], self.current_directory()))
+                cwd = self.current_directory()
+                paths = self.listed_folder(arguments[0], cwd)
             if not paths:
                 return
             frame: FrameType | None = self.current_frame()
@@ -201,7 +300,7 @@ class RepositoryReadAudit:
                 del frame
             target.update(paths)
         except (OSError, ValueError):
-            # Observation cannot change a test's result.
+            # An observation error does not change the test result.
             return
 
 
@@ -542,6 +641,7 @@ def run_module(config_log: Path | NoConfigReadLog) -> None:
     start_dir, pattern = sys.argv[1:]
     output = os.environ.pop("TEST_TIMES_OUT", None)
     TimedRunner.destination = NoTimesOutput() if output is None else TimesOutput(Path(output), config_log)
+    forbidden_config_paths: set[str] = set()
     try:
         names: list[str] = []
         for path in sorted(Path(start_dir).resolve().glob(pattern)):
@@ -553,15 +653,32 @@ def run_module(config_log: Path | NoConfigReadLog) -> None:
                     if all(part.isidentifier() for part in parts):
                         candidates.append(parts)
             names.append(".".join(max(candidates, key=len, default=(path.stem,))))
-        if isinstance(TimedRunner.destination, TimesOutput):
+        checkout = Path(__file__).absolute().parents[2]
+        for module, file in (("scripts.accounts.test_accounts", "accounts.conf"),
+                             ("scripts.copies.test_copy_guard_sources", "copies.conf"),
+                             ("scripts.copies.test_remote_copies", "copies.conf"),
+                             ("scripts.issue_score.test_config", "issue_score.conf"),
+                             ("scripts.lib.test_nix_env", "nix_env.conf"),
+                             ("scripts.lib.test_conf", "hana_aws.conf"),
+                             ("scripts.review_links.test_page_frame", "console.conf")):
+            if module in names:
+                from scripts.lib import conf
+
+                _ = conf.shipped_keys(checkout.resolve() / "config" / file)
+        with ExitStack() as cleanup:
             TimedRunner.scanned_folders = set()
             TimedRunner.read_contents = set()
-            sys.addaudithook(RepositoryReadAudit(Path(__file__).absolute().parents[2], TimedRunner.scanned_folders,
-                                                TimedRunner.read_contents))
-        suite = unittest.defaultTestLoader.loadTestsFromNames(names)
-        result = TimedRunner(warnings=None if cast(list[str], sys.warnoptions) else "default").run(suite)
+            audit = RepositoryReadAudit(checkout, TimedRunner.scanned_folders,
+                                        TimedRunner.read_contents, forbidden_config_paths)
+            audit.install(cleanup)
+            suite = unittest.defaultTestLoader.loadTestsFromNames(names)
+            result = TimedRunner(warnings=None if cast(list[str], sys.warnoptions) else "default").run(suite)
         sys.exit(1 if not result.wasSuccessful() else 5 if result.testsRun == 0 and not result.skipped else 0)
     except SystemExit:
+        if forbidden_config_paths:
+            paths = ", ".join(sorted(forbidden_config_paths))
+            print(f"{pattern}: use fixed test configs instead of reading {paths}", file=sys.stderr)
+            sys.exit(1)
         if "scripts.message.session_send_test_support" in sys.modules:
             from scripts.message import session_send_test_support
 

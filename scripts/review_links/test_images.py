@@ -13,6 +13,7 @@ from contextlib import redirect_stderr, redirect_stdout
 from datetime import UTC, datetime, timedelta
 from http.client import HTTPConnection
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from importlib import import_module
 from io import StringIO
 from itertools import permutations
 from pathlib import Path
@@ -20,17 +21,26 @@ from typing import ClassVar, cast, override
 from unittest.mock import call, patch
 from urllib.parse import parse_qs, urlencode
 
-from scripts.review_links.test_page_frame import assert_status_states
+from scripts.review_links.test_page_frame import assert_status_states, console_settings
 from scripts.review_links.test_staff_names import without_role_colors
 from scripts.lib import atomic_file, conf, file_lock, process_start
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
-from scripts.lint.memory_test_support import write_config_fixture
+from scripts.lint.memory_test_support import fixture_feed_code_settings, write_config_fixture
 from scripts.message import send_result
 from scripts.production import delivery_state, staff, unrouted_alert
+from scripts.production.change_review_test_support import (
+    REVIEW_DELIVERY_SETTINGS, REVIEW_DISPLAY_SETTINGS, REVIEW_SERVER_SETTINGS, ROLE_COLOR_CONFIG,
+    write_change_review_settings,
+)
+from scripts.production.config_test_support import QUESTION_TITLE_SETTINGS
 from scripts.review_links.test_page_question import FakeQuestionTransport, question_outcome
 from scripts.production.staff_test_support import fixture_member
 from scripts.review_links import change_page, console, image_store, images, list_page, page_frame, serve
 from scripts.review_links import question_record
+
+with fixture_feed_code_settings():
+    _ = import_module("scripts.build_queue.memory_feed")
+
 
 SEND_MESSAGE = change_page.send_message
 PNG = bytes.fromhex('89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c4890000000d49444154789c63606060f80f00010401005fe5c34b0000000049454e44ae426082')
@@ -49,13 +59,16 @@ class ImagesFixture(unittest.TestCase):
         self.temporary = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="images-test-")))
         configuration = self.temporary / "config"
         configuration.mkdir()
-        _ = write_config_fixture(configuration / "change_review.conf")
-        _ = write_config_fixture(configuration / "console.conf",
-            "page.images.url=python:scripts.review_links.images:page_url\n"
-            + "page.images.items=python:scripts.review_links.images:waiting_images\n")
+        write_change_review_settings(configuration, self.temporary)
+        _ = write_config_fixture(configuration / "console.conf", defaults=console_settings())
+        _ = write_config_fixture(configuration / "production.conf", defaults=QUESTION_TITLE_SETTINGS)
         settings = configuration / "review_links.conf"
-        _ = write_config_fixture(settings, "delivery_pause_seconds=0\ndelivery_tries=3\nserver_port=8765\n")
+        _ = write_config_fixture(settings, "delivery_pause_seconds=0\n",
+                                 defaults=REVIEW_SERVER_SETTINGS + REVIEW_DISPLAY_SETTINGS + REVIEW_DELIVERY_SETTINGS)
         self.root = self.temporary / "snapshots"
+        _ = write_config_fixture(configuration / "statusline.conf", defaults=ROLE_COLOR_CONFIG)
+        _ = write_config_fixture(configuration / "memory_feed.conf",
+                                 defaults=f"output_folder={self.root / 'builds'}\n")
         self.status = change_page.DeliveryStatus(self.root)
         _ = cast(object, self.enterContext(patch.dict(os.environ, {
             "CONF_DIR": str(configuration), "REVIEW_LINKS_ROOT": str(self.root), "REVIEW_LINKS_HOST": "127.0.0.1",

@@ -33,6 +33,7 @@ from scripts.buildlog import record, store, treekey
 from scripts.copies import copies
 from scripts.direct import runner_result
 from scripts.lib import conf, process_start
+from scripts.lib.build_slots_test_support import copy_fixture_settings
 from scripts.lib.helper_tree_test_support import verify_test_environment
 from scripts.lib.shell_test_support import refusing_bash_startup
 from scripts.lint.memory_test_support import config_environment
@@ -60,7 +61,10 @@ class HanaOffloadTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
-        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, config_environment(self.root))))
+        configuration = config_environment(self.root, fixtures={"copies.conf": copy_fixture_settings(self.root)})
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
+            **configuration, "COPIES_CONFIG": str(self.root / "copies.conf"),
+        })))
         self.transport = hana.HanaControlTransport(self.root / 'hana.conf', 'fixture-host')
         _ = self.transport.settings.write_text("""\
 execution_transport=hana-control

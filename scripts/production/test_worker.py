@@ -25,6 +25,7 @@ from unittest.mock import call, patch
 from uuid import UUID
 
 from scripts.agents import detached_run_process, detached_runs, worker_lifecycle
+from scripts.agents.detached_runs_test_support import DETACHED_RUN_SETTINGS
 from scripts.agents import pane_record
 from scripts.herdr import herdr_types, pane_launch
 from scripts.accounts import accounts
@@ -444,10 +445,7 @@ class WorkerCommandTests(unittest.TestCase):
 
     def start_orphaned_worker_run(self) -> tuple[worker_panes.OpenWorker, Path, detached_runs.RunRecord]:
         config = self.fixture.root / "conf"
-        atomic_file.write_text_atomic(config / "detached_runs.conf",
-            "# whole: 1..\nPROCESS_CHECK_SECONDS=5\n"
-            + "# whole: 1..\nRESULT_LINE_CHARS=300\n"
-            + "# whole: 1..\nRESULT_TEXT_CHARS=2000\n")
+        _ = write_config_fixture(config / "detached_runs.conf", defaults=DETACHED_RUN_SETTINGS)
         atomic_file.write_text_atomic(config / "postmaster.conf",
             "# range: 0.001..\nwait_seconds=1\n"
             + "# range: 0.001..\nclaim_grace_seconds=1\n")

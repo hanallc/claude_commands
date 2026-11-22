@@ -25,6 +25,7 @@ from scripts.direct.verify_mac_offload_test_support import (
 from scripts.lib.shell_test_support import shell_functions
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.build_folders_test_support import tool_folders
+from scripts.mac_test.config_test_support import MAC_RUN_SETTINGS
 from scripts.lint.memory_test_support import write_config_fixture
 
 
@@ -39,18 +40,6 @@ class VerifyMacOnlyTests(VerifyMacOffloadFixture):
         # The class owns the bytecode cache. Each test restores source at the same path.
         self.environment["PYTHONPYCACHEPREFIX"] = str(self.root.parent / "bytecode")
         _ = self.environment.pop("PYTHONDONTWRITEBYTECODE", None)
-        _ = (self.root / "direct.conf").write_text(
-            "# whole: 1..\nVERIFY_TOKEN_HOLD_SECONDS=3600\n"
-            + "# whole: 1..\nVERIFY_TOKEN_RENEW_SECONDS=60\n"
-            + "# whole: 1..\nTOKEN_GUARD_ATTEMPTS=200\n"
-            + "# whole: 1..\nTOKEN_GUARD_DELAY_MS=50\n"
-            + "VERIFY_RESULT_ENV_NAMES=NO_COLOR CLICOLOR CLICOLOR_FORCE FORCE_COLOR CI TZ LANG "
-            + "LC_ALL LC_COLLATE LC_CTYPE LC_MESSAGES LC_MONETARY LC_NUMERIC LC_TIME LC_ADDRESS "
-            + "LC_IDENTIFICATION LC_MEASUREMENT LC_NAME LC_PAPER LC_TELEPHONE\n"
-            + "VERIFY_RESULT_ENV_PREFIXES=HANA_ WGPU_ BEVY_ INSTA_ TRACE_\n"
-            + "VERIFY_TEST_FIXED_ENV=TERM=xterm-256color COLORTERM=truecolor TERM_PROGRAM=verify COLUMNS=80 LINES=24\n",
-            encoding="utf-8",
-        )
         mac_settings = (
             "offload=on\nhost=mac\n"
             + "# range: 5e-324..\nconnect_timeout_s=6\n"
@@ -63,7 +52,7 @@ class VerifyMacOnlyTests(VerifyMacOffloadFixture):
             + f"mac_budget_gib=24\nlinux_only.{self.root.name}=\n"
         )
         for path in (self.root / "mac_test.conf", Path(self.environment["MAC_TEST_CONFIG"])):
-            _ = write_config_fixture(path, mac_settings, template="mac_test")
+            _ = write_config_fixture(path, mac_settings, defaults=MAC_RUN_SETTINGS)
         _ = write_config_fixture(self.root / "build_folders.conf",
                                  "# range: 0.001..60\nlocks.probe_wait_seconds=0.25\n"
                                  + "# range: 0.001..1\nlocks.probe_retry_seconds=0.005\n")

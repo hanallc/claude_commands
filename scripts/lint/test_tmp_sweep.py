@@ -30,6 +30,7 @@ from unittest import mock
 
 from scripts.lint import tmp_sweep
 from scripts.mac_test import nextest_log
+from scripts.mac_test.offload_test_support import write_nextest_settings
 from scripts.direct import recorder_state
 from scripts.copies.copies_test_support import copies_environment
 from scripts.lib import build_folders, copy_record, removal_guard, scratch, test_hang_guard, time_limit
@@ -42,7 +43,9 @@ from scripts.herdr import worker_panes
 from scripts.herdr.test_worker_panes import PaneWorld
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.herdr import herdr
+from scripts.lib.build_folders_test_support import BUILD_PREFIX_SETTINGS
 from scripts.lib.cargo_output_test_support import fake_cargo_output_roots
+from scripts.lint.config_test_support import FOLDER_AUDIT_SETTINGS, SWEEP_SCAN_SETTINGS, TMP_SWEEP_SETTINGS
 from scripts.lint.memory_test_support import write_config_fixture
 
 DAY = 86_400
@@ -54,7 +57,7 @@ PROJECT = "-home-natepiano-rust-hana"
 
 def setUpModule() -> None:
     home = unittest.enterModuleContext(tempfile.TemporaryDirectory())
-    unittest.enterModuleContext(mock.patch.dict(os.environ, {"HOME": home}))
+    unittest.enterModuleContext(mock.patch.dict(os.environ, {"HOME": home, "USER_ZONE": "America/New_York"}))
     _ = unittest.enterModuleContext(fake_cargo_output_roots())
 
 
@@ -142,6 +145,8 @@ class TmpSweepCase(unittest.TestCase):
         registry = base / "sessions"
         registry.mkdir()
         environment = copies_environment(base)
+        _ = write_config_fixture(Path(environment["CONF_DIR"]) / "lint.conf",
+                                 defaults=FOLDER_AUDIT_SETTINGS + SWEEP_SCAN_SETTINGS + TMP_SWEEP_SETTINGS)
         _ = write_config_fixture(Path(environment["CONF_DIR"]) / "build_folders.conf",
             "patterns.legacy-stable={purpose}\nprefixes.verify-copy=verify-copy.{owner}.\n"
             + "prefixes.verify-hold=verify-hold.{owner}.\nnames.suffix_length=8\n"
@@ -703,6 +708,13 @@ class IdleTests(TmpSweepCase):
 
 
 class NextestLogRetentionTests(TmpSweepCase):
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        defaults = write_nextest_settings(self.tmp.parent / "nextest-defaults.conf")
+        _ = write_config_fixture(conf.path("mac_test"), defaults="")
+        _ = cast(object, self.enterContext(mock.patch.object(nextest_log, "DEFAULT_SETTINGS", defaults)))
+
     def test_mac_sweep_keeps_recent_open_and_unrelated_logs(self) -> None:
         logs = Path.home() / nextest_log.DIRECTORY
         expired = write(logs / "nextest.00000001")
@@ -739,7 +751,6 @@ class NextestLogRetentionTests(TmpSweepCase):
         expired = write(logs / "nextest.00000001")
         old = self.now - 8 * DAY
         os.utime(expired, (old, old))
-        _ = write_config_fixture(conf.path("mac_test"))
         self.plan: removal_guard.RemovalList = removal_guard.RemovalList(removal_guard.Tool.TEMPORARY)
         result = tmp_sweep.Sweep()
         with ExitStack() as readers:
@@ -762,7 +773,6 @@ class NextestLogRetentionTests(TmpSweepCase):
         expired = write(logs / "nextest.00000001")
         old = self.now - 8 * DAY
         os.utime(expired, (old, old))
-        _ = write_config_fixture(conf.path("mac_test"))
         incomplete = subprocess.CompletedProcess(tmp_sweep.LSOF, 1, "p41\nf4\nn/other\n", "")
         result = tmp_sweep.Sweep()
         with mock.patch.object(subprocess, "run", return_value=incomplete):
@@ -1209,7 +1219,7 @@ class TempFolderTests(TmpSweepCase):
         _ = write(folder / "content")
         with mock.patch.dict(os.environ, {"CONF_DIR": str(config)}), os.scandir(self.tmp) as entries:
             entry = next(entry for entry in entries if entry.name == name)
-            _ = write_config_fixture(config / "build_folders.conf", "prefixes.verify-hold=verify-hold.{owner}.\n")
+            _ = write_config_fixture(config / "build_folders.conf", defaults=BUILD_PREFIX_SETTINGS)
             roots = self.roots()
             self.assertFalse(roots.judged_temp(str(self.tmp), entry))
             _ = write_config_fixture(config / "build_folders.conf", "prefixes.verify-hold=changed-hold.{owner}.\n")

@@ -14,10 +14,12 @@ from unittest.mock import patch
 
 from scripts.accounts import accounts
 from scripts.agents import pane_record, remote, shutdown_record, stop_resume, test_stop_resume, worker_lifecycle
+from scripts.agents.test_support import SHUTDOWN_SETTINGS
 from scripts.maintenance import herdr_upkeep as job
 from scripts.herdr import herdr, detection_rules, herdr_types
 from scripts.lib import operation_deadline
 from scripts.lib.test_models_registry import write_registry
+from scripts.lint.memory_test_support import config_environment
 from scripts.message import sessions
 from scripts.production import staff
 from scripts.production.staff_test_support import fixture_member, isolated_staff_file
@@ -51,6 +53,9 @@ class UpkeepTests(unittest.TestCase):
             "GATE_STATE_DIR": str(self.root / "merge-gate"),
             "SHUTDOWN_STATE_DIR": str(self.root / "shutdown"),
             "HERDR_UPKEEP_CONFIG": str(self.root / "config.toml")}))
+        self.enterContext(patch.dict(os.environ, config_environment(self.root / "settings", fixtures={
+            "shutdown.conf": SHUTDOWN_SETTINGS,
+        })))
         _ = (self.root / "config.toml").write_text("[job]\ninterval_seconds=120\ntimeout_seconds=0.2\n")
 
     def test_runtime_interval_skips_completed_work_without_changing_state(self) -> None:

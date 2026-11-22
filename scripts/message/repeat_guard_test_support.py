@@ -5,7 +5,6 @@ from __future__ import annotations
 import io
 import os
 import select
-import shutil
 import socket
 import subprocess
 import sys
@@ -20,6 +19,7 @@ from types import SimpleNamespace
 from threading import Thread
 from unittest.mock import patch
 
+from scripts.lint.memory_test_support import write_config_fixture
 from scripts.message import repeat_guard
 from scripts.message.process_test_support import OwnedTestProcesses
 from scripts.lib.test_hang_guard import LauncherHangGuard, TEST_HANG_GUARD_SECS
@@ -34,6 +34,18 @@ repeat_guard.GUARD_IO_CEILING_SECONDS = {budget}
 startup['finish_startup'](__file__, sys.argv)
 '''
 
+REPEAT_GUARD_FIXTURE = """\
+window_seconds=1800
+repeat_count=3
+receiver_rate_count=100
+max_senders=4096
+max_keys=256
+preview_characters=240
+notice_timeout_seconds=60
+drain_timeout_seconds=90
+notice_max_age_seconds=86400
+"""
+
 
 def install_guard_test_budget() -> None:
     """Give this module and its child interpreters the shared test hang limit."""
@@ -41,13 +53,15 @@ def install_guard_test_budget() -> None:
     _ = unittest.enterModuleContext(cast(AbstractContextManager[object], patch.object(
         repeat_guard, "GUARD_IO_CEILING_SECONDS", TEST_HANG_GUARD_SECS)))
     folder = Path(unittest.enterModuleContext(tempfile.TemporaryDirectory()))
+    settings = folder / "send_repeat_guard.conf"
+    _ = write_config_fixture(settings, defaults=REPEAT_GUARD_FIXTURE)
     _ = (folder / "sitecustomize.py").write_text(CHILD_TEST_SETUP.format(
         budget=TEST_HANG_GUARD_SECS, startup=str(root / "scripts/lib/python_startup/sitecustomize.py")))
     from scripts.lib.python_startup.sitecustomize import inherited_paths
 
     paths = [str(folder), *inherited_paths(os.environ.get("PYTHONPATH", ""))]
     _ = unittest.enterModuleContext(cast(AbstractContextManager[object], patch.dict(
-        os.environ, {"PYTHONPATH": os.pathsep.join(paths)})))
+        os.environ, {"PYTHONPATH": os.pathsep.join(paths), "SEND_REPEAT_CONFIG": str(settings)})))
 
 
 def run_guard_in_process() -> None:
@@ -72,9 +86,14 @@ def guard_worker_in_process(command: list[str], request: str, _budget: float) ->
 def install_notice_test_config(home: Path) -> Path:
     """Give notice fixtures real settings without repository recovery."""
     config = home / ".claude/config"
-    config.mkdir(parents=True, exist_ok=True)
-    source = Path(__file__).resolve().parents[2] / "config/send.conf"
-    _ = shutil.copyfile(source, config / "send.conf")
+    _ = write_config_fixture(config / "send.conf", defaults="""\
+# range: 0.001..
+delivery_timeout=40
+# range: 0.001..
+kill_grace=10
+# one of: on, off
+review_hold=off
+""")
     return config
 
 

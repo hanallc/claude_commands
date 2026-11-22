@@ -15,6 +15,7 @@ from typing import Protocol, cast, override
 from scripts.build_queue.queue_fixture import NOW, QueueFixture, write_memory_config
 from scripts.buildlog.mac_idle_test_support import NotificationGuardedTestCase
 from scripts.lint import memory_admit
+from scripts.lint.memory_test_support import fixture_feed_code_settings
 from scripts.message import unit_labels
 from scripts.message.unit_labels import UnitLabels
 
@@ -42,7 +43,8 @@ class QueueTests(NotificationGuardedTestCase):
         _ = self.enterContext(mock.patch.object(os, "cpu_count", return_value=17))
 
     def test_bare_bump_prints_usage_and_the_builds_page_link(self) -> None:
-        from scripts.build_queue import memory_feed
+        with fixture_feed_code_settings():
+            from scripts.build_queue import memory_feed
 
         for arguments in ((), ("--help",)):
             with self.subTest(arguments=arguments), mock.patch("sys.argv", ["build_queue.py", *arguments]), \

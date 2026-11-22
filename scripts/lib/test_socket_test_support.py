@@ -12,7 +12,8 @@ from pathlib import Path
 from unittest.mock import patch
 
 from scripts.lib import build_folders
-from scripts.lib.socket_test_support import PARENT, short_socket_directory
+from scripts.lib.build_folders_test_support import temporary_folder_settings
+from scripts.lib.socket_test_support import PARENT, SYSTEM_SOCKET_ROOT, short_socket_directory
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
 
 
@@ -26,7 +27,7 @@ class ShortSocketDirectoryTests(unittest.TestCase):
                 for name in ("first", "second"):
                     parent = root / name
                     parent.mkdir()
-                    _ = write_config_fixture(config, f"roots.system={parent}\n")
+                    _ = write_config_fixture(config, f"roots.system={parent}\n", defaults=temporary_folder_settings(root))
                     with short_socket_directory() as socket_directory:
                         path = Path(socket_directory)
                         self.assertEqual(path.parent, parent / PARENT)
@@ -41,13 +42,14 @@ class ShortSocketDirectoryTests(unittest.TestCase):
             self.assertGreater(len(os.fsencode(long_tmpdir)), 108)
             configuration = Path(root) / "config"
             _ = config_environment(configuration)
-            _ = write_config_fixture(configuration / "build_folders.conf", "roots.system=/tmp\n")
+            _ = write_config_fixture(configuration / "build_folders.conf",
+                                     defaults=temporary_folder_settings(long_tmpdir))
             with (patch.dict(os.environ, {"TMPDIR": str(long_tmpdir), "CONF_DIR": str(configuration)}),
                   patch.object(tempfile, "tempdir", None)):
                 self.assertEqual(tempfile.gettempdir(), str(long_tmpdir))
-                with short_socket_directory() as directory:
+                with short_socket_directory(system_root=SYSTEM_SOCKET_ROOT) as directory:
                     folder = Path(directory)
-                    self.assertEqual(folder.parent, Path("/tmp") / PARENT)
+                    self.assertEqual(folder.parent, SYSTEM_SOCKET_ROOT / PARENT)
                     self.assertEqual(stat.S_IMODE(folder.stat().st_mode), 0o700)
                     path = folder / "s"
                     self.assertLess(len(os.fsencode(path)), 108)
@@ -61,7 +63,7 @@ class ShortSocketDirectoryTests(unittest.TestCase):
             root = Path(directory)
             config = root / "build_folders.conf"
             _ = config_environment(root)
-            _ = write_config_fixture(config, f"roots.system={root}\n")
+            _ = write_config_fixture(config, defaults=temporary_folder_settings(root))
             killed = ("from scripts.lib.socket_test_support import short_socket_directory\n"
                       "import os\nfolder = short_socket_directory()\nprint(folder.name, flush=True)\nos._exit(0)\n")
             with patch.dict(os.environ, {"CONF_DIR": str(root)}):
@@ -79,7 +81,7 @@ class ShortSocketDirectoryTests(unittest.TestCase):
             root = Path(directory)
             config = root / "build_folders.conf"
             _ = config_environment(root)
-            _ = write_config_fixture(config, f"roots.system={root}\n")
+            _ = write_config_fixture(config, defaults=temporary_folder_settings(root))
             with (patch.dict(os.environ, {"CONF_DIR": str(root)}),
                   patch.object(build_folders, "sweep_temporary_build_folders") as sweep):
                 for _ in range(3):

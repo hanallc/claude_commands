@@ -50,6 +50,8 @@ SCRIPTS = Path(__file__).parents[1]
 
 from scripts.message import codex_daemon
 from scripts.message.codex_test_support import FakeDaemon, receive_frame, reply, write_codex_account
+from scripts.message.session_send_test_support import SEND_TIMING_FIXTURES
+from scripts.lint.memory_test_support import seed_config_fixture_folder
 from scripts.message import process_table
 from scripts.message import roster
 from scripts.accounts import role_map
@@ -153,6 +155,7 @@ class RosterTests(unittest.TestCase):
         transport_config = self.root / "config"
         transport_config.mkdir()
         write_text_atomic(transport_config / "direct.conf", "# Worker settings.\n")
+        seed_config_fixture_folder(transport_config, SEND_TIMING_FIXTURES)
         write_machine_config(transport_config)
         config = self.root / "showrunners.json"
         _ = config.write_text(json.dumps({

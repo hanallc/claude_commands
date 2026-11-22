@@ -30,7 +30,8 @@ from scripts.build_hold.override_guard import require_checkout
 require_checkout(Path(__file__))
 
 from scripts.lib.socket_test_support import short_socket_directory
-from scripts.lint.memory_test_support import fake_memory_readings
+from scripts.build_targets.target_test_support import HOLD_TARGET_SETTINGS
+from scripts.lint.memory_test_support import fake_memory_readings, write_config_fixture
 from scripts.production.cli_fixture import process_boundary_for_case
 
 _finish_writers: ContextVar[Callable[[], None] | None] = ContextVar("finish_hold_writers", default=None)
@@ -133,6 +134,7 @@ class IsolatedBuildHoldTest(unittest.TestCase):
         _ = shutil.copytree(self.seed, self.scratch)
         self.addCleanup(shutil.rmtree, self.scratch)
         self.socket_dir = Path(self.enterContext(short_socket_directory()))
+        _ = write_config_fixture(self.scratch / "build_targets.conf", defaults=HOLD_TARGET_SETTINGS)
         proc = self.scratch / "proc"
         _ = self.enterContext(mock.patch.object(build_hold, "PROC_ROOT", proc))
         lifetime = self.scratch / "child-lifetime"

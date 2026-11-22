@@ -28,7 +28,7 @@ from scripts.lib.atomic_file import write_text_atomic
 from scripts.message.sessions_test_support import copy_session_modules
 from scripts.production import staff
 from scripts.production.staff_test_support import (
-    fixture_member, isolated_staff_file, showrunner_relationship, unit_membership,
+    fixture_member, isolated_staff_file, showrunner_relationship, unit_membership, write_staff_settings,
 )
 from scripts.production.unit_status import StatusBlock, status_blocks
 from scripts.production import fake_unit_host
@@ -152,8 +152,8 @@ class UnitStatusFixture(unittest.TestCase):
         copy_session_modules(message)
         _ = shutil.copy2(SCRIPT.parents[1] / "message/process_table.py", message / "process_table.py")
         (root / "config").mkdir()
-        _ = shutil.copy2(SCRIPT.parents[2] / "config/session_retries.toml", root / "config/session_retries.toml")
-        _ = shutil.copy2(SCRIPT.parents[2] / "config/staff.conf", root / "config/staff.conf")
+        _ = (root / "config/session_retries.toml").write_text("registry_reads = 4\nregistry_delay_seconds = 0.1\n")
+        _ = write_staff_settings(root / "config/staff.conf", producers=root / "producers")
         _write_executable(message / "notifier.sh", 'print -r -- "$*" >> "$NOTIFIER_CALL_LOG"\nprint -r -- "$NOTIFIER_HEALTH_TEXT"\nexit "$NOTIFIER_HEALTH_EXIT"\n')
         hooks = root / "scripts/hooks"
         hooks.mkdir()

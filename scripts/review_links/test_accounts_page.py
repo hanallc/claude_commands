@@ -1,6 +1,6 @@
 """The console Accounts page draws the accounts board table."""
 from __future__ import annotations
-from scripts.lint.memory_test_support import copy_config_fixture, write_config_fixture
+from scripts.lint.memory_test_support import write_config_fixture
 
 from collections import Counter
 from dataclasses import replace
@@ -21,22 +21,19 @@ from typing import cast, override
 from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
-from scripts.review_links.test_page_frame import assert_status_states
+from scripts.review_links.test_page_frame import assert_status_states, page_status_settings
 from scripts.accounts import accounts, next_moves, role_map
-from scripts.accounts.home_test_support import scratch_account_home
+from scripts.accounts.home_test_support import ACCOUNT_STATUS_SETTINGS, scratch_account_home
 from scripts.agents.test_support import write_machine_config
 from scripts.lib import conf
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.production.change_review_test_support import REVIEW_ACCOUNT_SETTINGS, REVIEW_REFRESH_SETTINGS
 from scripts.review_links import accounts_page, console_theme, page_frame, serve
 from scripts.whoami import agent_accounts, run_out, usage_store
 from scripts.whoami.account_test_support import create_claude_account, stored_room
 
 AT = datetime(2026, 11, 15, 15, tzinfo=timezone.utc)
-ACCOUNT_SETTINGS = "next_move_percent=1\nusage_stale_minutes=10\n"
-PAGE_STATUS_SETTINGS = (
-    "status.round_trip_limit_seconds=1\nstatus.render_limit_seconds=1\n"
-    + "status.reading_delay_seconds=1\nstatus.accounts.age_limit_seconds=45\n"
-)
+ACCOUNT_PAGE_SETTINGS = REVIEW_REFRESH_SETTINGS + REVIEW_ACCOUNT_SETTINGS
 
 
 def status_row(label: str) -> accounts.StatusRow:
@@ -80,8 +77,8 @@ class ProducerRoleColorTests(unittest.TestCase):
     def test_the_producer_role_uses_its_color_and_account_names_keep_account_colors(self) -> None:
         configuration = Path(self.enterContext(tempfile.TemporaryDirectory()))
         use_fixture_history(self, configuration)
-        _ = write_config_fixture(configuration / "accounts.conf", ACCOUNT_SETTINGS)
-        _ = write_config_fixture(configuration / "statusline.conf", "role.producer=pink\n")
+        _ = write_config_fixture(configuration / "accounts.conf", defaults=ACCOUNT_STATUS_SETTINGS)
+        _ = write_config_fixture(configuration / "statusline.conf", defaults="role.producer=pink\n")
         _ = cast(object, self.enterContext(patch.dict(os.environ, {"CONF_DIR": str(configuration)})))
         reading = accounts.StatusReading((replace(status_row("plain-account"), roles=("producers",)),), (), (),
                                          timezone.utc, AT)
@@ -239,16 +236,17 @@ class AccountsPageTests(unittest.TestCase):
         configuration = scratch / "config"
         self.review_root = scratch / "review"
         _ = self.enterContext(patch.object(usage_store, "store_file", return_value=scratch / "home" / "usage.json"))
-        _ = copy_config_fixture(Path(__file__).resolve().parents[2] / "config", configuration)
-        _ = write_config_fixture(configuration / "accounts.conf", ACCOUNT_SETTINGS)
-        _ = write_config_fixture(configuration / "console.conf", PAGE_STATUS_SETTINGS)
-        _ = write_config_fixture(configuration / "review_links.conf", "page_refresh_seconds=15\naccounts_page_seconds=30\n")
+        _ = write_config_fixture(configuration / "accounts.conf", defaults=ACCOUNT_STATUS_SETTINGS)
+        _ = write_config_fixture(configuration / "console.conf", defaults=page_status_settings())
+        _ = write_config_fixture(configuration / "review_links.conf", defaults=ACCOUNT_PAGE_SETTINGS)
+        write_machine_config(configuration)
         _ = (configuration / "statusline.conf").write_text(
             "account.claude1=#af875f\naccount.claude2=#b294bb\naccount.codex2=#123456\nrole.unit-director=#d7af00\n"
             + "model.claude-opus-5-5=#e08a5c\n",
             encoding="utf-8")
         _ = cast(object, self.enterContext(patch.dict(os.environ, {
             "CONF_DIR": str(configuration), "REVIEW_LINKS_ROOT": str(self.review_root),
+            "USER_ZONE": "America/New_York",
         })))
 
     def test_page_reads_quota_clear_state_from_the_fixture_root(self) -> None:
@@ -406,7 +404,7 @@ window.fetch=(url,options)=>options?.method==='POST'
 
     def test_board_draws_the_table_and_problems_without_the_upcoming_list(self) -> None:
         config = Path(self.enterContext(tempfile.TemporaryDirectory(prefix='accounts-board-config-')))
-        _ = write_config_fixture(config / "accounts.conf", ACCOUNT_SETTINGS)
+        _ = write_config_fixture(config / "accounts.conf", defaults=ACCOUNT_STATUS_SETTINGS)
         _ = (config / 'statusline.conf').write_text('account.claude1=brown\nrole.unit-director=yellow\nrole.worker=#c0c0c0\n')
         _ = cast(object, self.enterContext(patch.dict(os.environ, {'CONF_DIR': str(config)})))
         reading = accounts.StatusReading((status_row("claude1"),), ("* <stale>",), (), timezone.utc, AT,
@@ -1049,7 +1047,7 @@ realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
         reading = accounts.StatusReading((status_row("claude1"),), (), (), timezone.utc, AT)
         with tempfile.TemporaryDirectory() as temporary:
             config = Path(temporary) / "statusline.conf"
-            _ = write_config_fixture(config.parent / "accounts.conf", ACCOUNT_SETTINGS)
+            _ = write_config_fixture(config.parent / "accounts.conf", defaults=ACCOUNT_STATUS_SETTINGS)
             for value, expected in (("brown", "#af875f"), ("magenta", "#800080"),
                                     ("#A0522D", "#A0522D"), ("#af875f", "#af875f"), ("", ""),
                                     ('red;position:fixed', ""), ('\"><script>alert(1)</script>', "")):
@@ -1073,8 +1071,13 @@ realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
                                          "\x1b[38;2;175;135;95mclaude1\x1b[0m")
 
     def test_color_save_validates_the_request_and_uses_this_checkouts_tune(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary, patch.dict(os.environ, {"CONF_DIR": temporary}):
-            _ = (Path(temporary) / "statusline.conf").write_text(
+        with tempfile.TemporaryDirectory() as temporary, patch.dict(os.environ):
+            config = Path(temporary)
+            models = config / "models.conf"
+            _ = models.write_text("[codex.agents]\ngpt-6.2-sol=high\n")
+            os.environ.update(CONF_DIR=temporary, MODELS_CONFIG_FILE=str(models))
+            write_machine_config(config)
+            _ = (config / "statusline.conf").write_text(
                 "account.claude1=brown\nrole.units=teal\nrole.worker=white\nlevel.ok=green\nmodel.claude-opus-5-5=#e08a5c\n")
             for key, value in (("account.unknown", "#af875f"), ("claude1", "#af875f"), ("role.units", "#af875f"),
                                ("role.showrunner", "#af875f"), ("level.ok", "#af875f"), ("account.claude1", "brown"),
@@ -1287,11 +1290,12 @@ realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
         reading = accounts.StatusReading((), (), (), timezone.utc, AT)
         with tempfile.TemporaryDirectory() as temporary:
             settings = Path(temporary) / "review_links.conf"
-            _ = write_config_fixture(Path(temporary) / "accounts.conf", ACCOUNT_SETTINGS)
-            _ = write_config_fixture(Path(temporary) / "console.conf", PAGE_STATUS_SETTINGS)
+            _ = write_config_fixture(Path(temporary) / "accounts.conf", defaults=ACCOUNT_STATUS_SETTINGS)
+            _ = write_config_fixture(Path(temporary) / "console.conf", defaults=page_status_settings())
+            _ = write_config_fixture(Path(temporary) / "statusline.conf")
             for seconds in (15, 37):
                 with self.subTest(refresh_seconds=seconds):
-                    _ = write_config_fixture(settings, f"page_refresh_seconds={seconds}\n")
+                    _ = write_config_fixture(settings, f"page_refresh_seconds={seconds}\n", defaults=ACCOUNT_PAGE_SETTINGS)
                     with (patch.object(accounts, "read_status", return_value=reading) as status,
                           patch.dict(os.environ, {"CONF_DIR": temporary})):
                         page = accounts_page.page().decode()
@@ -1322,11 +1326,12 @@ realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
         reading = accounts.StatusReading((), (), (), timezone.utc, AT)
         with tempfile.TemporaryDirectory() as temporary:
             settings = Path(temporary) / "review_links.conf"
-            _ = write_config_fixture(Path(temporary) / "accounts.conf", ACCOUNT_SETTINGS)
-            _ = write_config_fixture(Path(temporary) / "console.conf", PAGE_STATUS_SETTINGS)
+            _ = write_config_fixture(Path(temporary) / "accounts.conf", defaults=ACCOUNT_STATUS_SETTINGS)
+            _ = write_config_fixture(Path(temporary) / "console.conf", defaults=page_status_settings())
+            _ = write_config_fixture(Path(temporary) / "statusline.conf")
             for seconds in (15, 37):
                 with self.subTest(refresh_seconds=seconds):
-                    _ = write_config_fixture(settings, f"page_refresh_seconds={seconds}\n")
+                    _ = write_config_fixture(settings, f"page_refresh_seconds={seconds}\n", defaults=ACCOUNT_PAGE_SETTINGS)
                     with (patch.object(accounts, "read_status", return_value=reading),
                           patch.dict(os.environ, {"CONF_DIR": temporary})):
                         page = accounts_page.page().decode()

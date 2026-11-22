@@ -41,7 +41,11 @@ from typing import BinaryIO, Literal, Self, TextIO, TypedDict, cast, final, over
 from unittest.mock import ANY, AsyncMock, MagicMock, call, patch
 from zoneinfo import ZoneInfo
 
-from scripts.accounts.home_test_support import clear_notes_directory_cache, scratch_account_home, set_config_credits, write_account_settings
+from scripts.accounts.home_test_support import (
+    ACCOUNT_HOME_SETTINGS, ACCOUNT_LOGIN_SITTING_SETTINGS, ACCOUNT_MODEL_SETTINGS,
+    ACCOUNT_STATUS_SETTINGS, ACCOUNT_WORKER_MODE_SETTINGS, clear_notes_directory_cache,
+    scratch_account_home, set_config_credits, write_account_settings,
+)
 from scripts.accounts.move_test_support import write_claude_move_credentials
 from scripts.accounts import accounts, next_moves, refusal_watch, refusals, role_map, session_state
 from scripts.accounts.nix_env_fake import FakeShellRefusal, fake_nix_loader, imports_with_nix_loader, installed_program
@@ -52,7 +56,7 @@ from scripts.production import showrunners, staff
 from scripts.production.staff_test_support import StaffTestCase, fixture_member, fixture_worker
 from scripts.agents import stop_resume
 from scripts.agents import remote, stop_results
-from scripts.agents.test_support import write_machine_config
+from scripts.agents.test_support import SHUTDOWN_SETTINGS, write_machine_config
 from scripts.accounts import pane_moves
 from scripts.message import sessions
 from scripts.herdr import herdr, worker_panes
@@ -141,7 +145,8 @@ class AccountsConfigurationTests(unittest.TestCase):
         root = Path(__file__).resolve().parents[2]
         with tempfile.TemporaryDirectory() as temporary:
             config = Path(temporary) / "accounts.conf"
-            _ = config.write_bytes((root / "config/accounts.conf").read_bytes())
+            _ = write_config_fixture(config, defaults=(ACCOUNT_HOME_SETTINGS + ACCOUNT_STATUS_SETTINGS
+                + ACCOUNT_MODEL_SETTINGS + ACCOUNT_LOGIN_SITTING_SETTINGS + ACCOUNT_WORKER_MODE_SETTINGS))
             with patch.dict(os.environ, {"CONF_DIR": temporary}):
                 account_config = conf.read("accounts")
                 configured = account_config.values()
@@ -152,6 +157,7 @@ class AccountsConfigurationTests(unittest.TestCase):
                         continue
                     for key, kinds in accounts_reader_calls(source.read_text()).items():
                         readers.setdefault(key, set()).update(kinds)
+                self.assertEqual(conf.shipped_keys(root / "config/accounts.conf"), set(readers))
                 self.assertEqual(set(configured), set(readers))
                 for key, kinds in readers.items():
                     with self.subTest(key=key):
@@ -163,6 +169,7 @@ class AccountsConfigurationTests(unittest.TestCase):
                         elif kind == "number":
                             self.assertEqual(account_config.number(key), float(configured[key]))
                         else:
+                            self.assertTrue(configured[key].strip(), key)
                             self.assertEqual(account_config.text(key), configured[key])
 
     def test_accounts_reader_scan_exposes_a_wrong_usage_age_method(self) -> None:
@@ -188,7 +195,7 @@ class AccountsConfigurationTests(unittest.TestCase):
     def test_usage_age_changes_without_a_module_reload(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             config = Path(temporary) / "accounts.conf"
-            _ = write_config_fixture(config, "usage_stale_minutes=10\n")
+            _ = write_config_fixture(config, defaults=ACCOUNT_STATUS_SETTINGS)
             contents = config.read_text()
             with patch.dict(os.environ, {"CONF_DIR": temporary}):
                 now = datetime(2026, 11, 2, tzinfo=timezone.utc)
@@ -328,6 +335,7 @@ class AccountsTests(unittest.TestCase):
         )
         del environment_context
         write_machine_config(Path(os.environ["CONF_DIR"]))
+        _ = write_config_fixture(Path(os.environ["CONF_DIR"]) / "statusline.conf")
         _ = self.enterContext(patch.object(unit_runs, "ASTRA_RUN_ROOT", self.root / "astra-runs"))
         counts_cache = session_counts_cache()
         counts_cache.parent.mkdir(parents=True, exist_ok=True)
@@ -8361,8 +8369,7 @@ class PaneWorkerMoveTests(unittest.TestCase):
         self.world.add(self.owner, "w1:p0")
         config = self.root / "conf"
         config.mkdir()
-        _ = (config / "accounts.conf").write_text(
-            (Path(__file__).resolve().parents[2] / "config/accounts.conf").read_text())
+        _ = write_config_fixture(config / "accounts.conf", defaults=ACCOUNT_HOME_SETTINGS + ACCOUNT_STATUS_SETTINGS)
         _ = (config / "direct.conf").write_text("# range: 0.1..0.9\nWORKER_SPLIT_RATIO=0.667\n"
                                                + "# whole: 1..\nUNIT_COMPACT_ABOVE_TOKENS=43000\n"
                                                + "# range: 1..1800\nWORKER_COMPACT_SECONDS=300\n"
@@ -8907,8 +8914,7 @@ class PaneWorkerMoveTests(unittest.TestCase):
 
         row = self.worker("w74", live=False)
         self.dispatch(row)
-        atomic_file.write_text_atomic(self.root / "conf/shutdown.conf",
-            (Path(__file__).resolve().parents[2] / "config/shutdown.conf").read_text())
+        atomic_file.write_text_atomic(self.root / "conf/shutdown.conf", SHUTDOWN_SETTINGS)
         pane_record.write(self.world.session, pane_record.launch("w1:p1", str(row.current_session), str(self.root),
             {"CLAUDE_CONFIG_DIR": str(self.root / ".claude1")}, ["claude", "-n", row.name]))
         result_path = self.run_dir / f"detached_runs/{row.name}.json"
@@ -10126,7 +10132,7 @@ class SessionModelReaderTests(unittest.TestCase):
     def setUp(self) -> None:
         self.home = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.settings = self.home / "config/accounts.conf"
-        _ = write_config_fixture(self.settings)
+        _ = write_config_fixture(self.settings, defaults=ACCOUNT_MODEL_SETTINGS)
         self.claude = self.home / "projects/fixture/session.jsonl"
         self.claude.parent.mkdir(parents=True)
         _ = cast(object, self.enterContext(patch.dict(os.environ, {
@@ -10419,7 +10425,7 @@ class StoredWeeklyQuotaTests(unittest.TestCase):
         home = Path("/fixture/.codex")
         codex = [accounts.CodexStatus("~/.codex", home, True, True, "codex1", "fixture-codex", "workers", (), ())]
         configuration = Path(self.enterContext(tempfile.TemporaryDirectory()))
-        _ = write_config_fixture(configuration / "accounts.conf", "usage_stale_minutes=10\n")
+        _ = write_config_fixture(configuration / "accounts.conf", defaults=ACCOUNT_STATUS_SETTINGS)
         with (patch.dict(os.environ, {"CONF_DIR": str(configuration)}),
               patch.object(accounts, "_status_workers_account", return_value=accounts.CodexWorkersAccount("codex1", home)),
               patch.object(accounts, "account_statuses", return_value=claude),
@@ -10438,7 +10444,8 @@ class SharedStatusDocumentTests(unittest.TestCase):
         super().setUp()
         folder = Path(self.enterContext(tempfile.TemporaryDirectory()))
         environment = config_environment(folder)
-        _ = write_config_fixture(folder / "accounts.conf", "usage_stale_minutes=10\n")
+        _ = write_config_fixture(folder / "accounts.conf", defaults=ACCOUNT_STATUS_SETTINGS)
+        _ = write_config_fixture(folder / "statusline.conf")
         _ = cast(object, self.enterContext(patch.dict(os.environ, environment)))
 
 
@@ -10472,8 +10479,7 @@ class SharedStatusDocumentTests(unittest.TestCase):
     def test_account_colors_share_config_with_json_board_and_terminal_labels(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             config = Path(temporary) / "statusline.conf"
-            _ = (config.parent / "accounts.conf").write_bytes(
-                (Path(__file__).resolve().parents[2] / "config/accounts.conf").read_bytes())
+            _ = write_config_fixture(config.parent / "accounts.conf", defaults=ACCOUNT_STATUS_SETTINGS)
             for setting, css, escape in (
                 ("brown", "#af875f", "\x1b[38;5;137m"),
                 ("magenta", "#800080", "\x1b[35m"),
@@ -10639,6 +10645,7 @@ class StatusProblemCauseTests(unittest.TestCase):
             "CODEX_HOME": str(self.home / ".codex"), "USER_ZONE": "UTC",
         }, clear=True)))
         write_machine_config(Path(os.environ["CONF_DIR"]))
+        _ = write_config_fixture(Path(os.environ["CONF_DIR"]) / "statusline.conf")
         cache = session_counts_cache()
         cache.parent.mkdir(parents=True, exist_ok=True)
         _ = cache.write_text(json.dumps({"machine": remote.other_machine(),

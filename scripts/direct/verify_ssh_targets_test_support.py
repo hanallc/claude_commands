@@ -16,6 +16,7 @@ from typing import Callable, TypedDict, cast, override
 from scripts.build_queue.admission_test_support import AdmissionFixture, caller_admission, caller_provider_controls
 from scripts.build_queue import admission_protocol as wire, admission_service as service, placement
 from scripts.direct.verify_mac_offload_test_support import VerifyMacOffloadFixture, GIT_STUB, install_fixed_cargo
+from scripts.mac_test.config_test_support import MAC_RUN_SETTINGS
 from scripts.lint.memory_test_support import fake_memory_readings, write_config_fixture
 
 
@@ -121,8 +122,10 @@ from unittest import mock
 
 source = Path(os.environ["TEST_SOURCE_REPO"])
 with open(source / "scripts/lib/package_root.py") as package_root: exec(package_root.read(), {"__file__": package_root.name})
-from scripts.mac_test import eligibility, offload, mac_test, claim_state
+from scripts.mac_test import eligibility, offload, mac_test, claim_state, nextest_log
 from scripts.build_queue import admission_protocol as queue_wire, execution_identity, placement
+
+nextest_log.DEFAULT_SETTINGS = Path.home() / ".claude/config/mac_test.conf"
 
 args = offload.parser().parse_args(namespace=offload.CliArguments())
 request = offload.request_from_arguments(args)
@@ -397,14 +400,14 @@ source() {
             + "kind.natedev=local\nplatform.natedev=linux\n"
             + "kind.linux=ssh\nplatform.linux=linux\nsettings.linux=linux_target.conf\n"
             + "kind.spare=ssh\nplatform.spare=linux\nsettings.spare=spare.conf\n")
-        _ = write_config_fixture(self.root / "mac_test.conf", "offload=off\n")
+        _ = write_config_fixture(self.root / "mac_test.conf", "offload=off\n", defaults=MAC_RUN_SETTINGS)
         for name in ("linux_target", "spare"):
             _ = write_config_fixture(self.root / f"{name}.conf",
                 "offload=on\nhost=fake-linux\nci_repo=\nkinds=test,check,doc\nslots=1\nslots.hana=1\n"
                 + "devshell=default\nshell_cache=fixture-shells\nshell_timeout_s=2\n"
                 + "build_budget_gib=32\ntarget_budget_gib=24\nversion_pin_file=nixos hosts/linux-build.nix\n"
                 + "parity.rustc=rustc fixture\nparity.nextest=nextest fixture\n"
-                + "parity.mend=mend fixture\nparity.scripts_commit=fixture-commit\n", template="mac_test")
+                + "parity.mend=mend fixture\nparity.scripts_commit=fixture-commit\n", defaults=MAC_RUN_SETTINGS)
         for target in ("linux", "spare"):
             self.target_state(target).mkdir(parents=True, exist_ok=True)
 
@@ -420,7 +423,7 @@ source() {
         return sorted(rows, key=lambda row: cast(str, row["at"]))
 
     def enable_mac(self) -> None:
-        _ = write_config_fixture(self.root / "mac_test.conf", "offload=on\nlinux_only.hana=\nlinux_only.case=\n")
+        _ = write_config_fixture(self.root / "mac_test.conf", "offload=on\nlinux_only.hana=\nlinux_only.case=\n", defaults=MAC_RUN_SETTINGS)
 
     def release_memory_after_hook(self, observe: Callable[[CompletedMemoryHook], bool] | ReleaseMemoryAtWait = RELEASE_MEMORY_AT_WAIT,
                                   *, after_attempts: int = 0) -> None:

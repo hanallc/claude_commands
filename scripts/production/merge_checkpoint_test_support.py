@@ -12,7 +12,9 @@ from scripts.agents import remote
 from scripts.production.fake_unit_host import labeled as labeled_host
 
 from scripts.copies.copies_test_support import copies_environment
-from scripts.lint.memory_test_support import config_environment
+from scripts.lib.scratch_test_support import write_scratch_settings
+from scripts.lint.memory_test_support import config_environment, write_config_fixture
+from scripts.lib.main_push_lock_test_support import write_push_lock_settings
 from collections.abc import Generator, Mapping, Sequence
 from contextlib import closing, contextmanager
 import fcntl
@@ -240,12 +242,20 @@ class BumpGateObservation(NamedTuple):
     stdin_closed: bool
 
 
+def checkpoint_pull_settings(tries: int = 3) -> str:
+    return f"# whole: 1..\nMAC_PULL_TRIES={tries}\n# range: 0..\nMAC_PULL_RETRY_SECONDS=0\n"
+
+
 def configure_test_environment() -> None:
     """Use Pacific time and private scratch and registry folders for each module."""
     folder = tempfile.TemporaryDirectory()
     unittest.addModuleCleanup(folder.cleanup)
+    config = Path(folder.name) / "config"
+    write_push_lock_settings(config)
+    write_scratch_settings(config, Path(folder.name))
+    _ = write_config_fixture(config / "merge_checkpoint.conf", defaults=checkpoint_pull_settings())
     unittest.enterModuleContext(mock.patch.dict(os.environ, {
-        **config_environment(Path(folder.name) / "config"),
+        **config_environment(config),
         "USER_ZONE": "America/Los_Angeles", "SCRATCH_ROOT": f"{folder.name}/scratch",
         "SCRATCH_VISIBLE_ROOT": f"{folder.name}/repro"}))
     _ = unittest.enterModuleContext(isolated_staff_file(Path(folder.name) / "staff.json", {}))
@@ -341,6 +351,9 @@ class MergeCheckpointFixture(unittest.TestCase):
     def build_fixture(self) -> None:
         self.root.mkdir(exist_ok=True)
         _ = config_environment(self.root)
+        write_scratch_settings(self.root, self.root)
+        write_push_lock_settings(self.root)
+        _ = write_config_fixture(self.root / "merge_checkpoint.conf", defaults=checkpoint_pull_settings())
         self.bin.mkdir()
         self.state.mkdir()
         self.checkout.mkdir()

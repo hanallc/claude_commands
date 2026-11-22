@@ -27,6 +27,7 @@ from scripts.buildlog.test_index import use_test_log
 
 from scripts.lib import test_hang_guard
 from scripts.lint.memory_test_support import config_environment, write_config_fixture, write_config_fault
+from scripts.test_times.gate_record_test_support import nextest_timing_settings
 
 use_test_log()
 
@@ -61,8 +62,8 @@ def facts(step: str, name: str) -> parse.LogFacts:
 
 def setUpModule() -> None:
     root = Path(unittest.enterModuleContext(tempfile.TemporaryDirectory()))
-    _ = cast(object, unittest.enterModuleContext(mock.patch.dict(os.environ, config_environment(root))))
-    _ = write_config_fixture(root / "test_times.conf", "NEXTEST_SLOW_TEST_S=1.0")
+    environment = config_environment(root, fixtures={"test_times.conf": nextest_timing_settings()})
+    _ = cast(object, unittest.enterModuleContext(mock.patch.dict(os.environ, environment)))
 
 
 class ArgvTests(unittest.TestCase):
@@ -389,7 +390,7 @@ class NextestFormTests(unittest.TestCase):
     def test_logs_without_test_results_do_not_require_the_nextest_threshold(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             config = Path(temporary)
-            _ = write_config_fixture(config / "test_times.conf")
+            _ = write_config_fixture(config / "test_times.conf", defaults=nextest_timing_settings())
             _ = write_config_fault(config / "test_times.conf", "NEXTEST_SLOW_TEST_S=unusable")
             with mock.patch.dict(os.environ, {"CONF_DIR": str(config)}):
                 result = parse.test_results(["    Checking hana v0.1.0", "    Finished in 0.10s"])

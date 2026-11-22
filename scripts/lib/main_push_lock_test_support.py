@@ -15,6 +15,11 @@ import unittest
 from scripts.direct.wait_for_test_state import wait_until
 from scripts.lib import main_push_lock
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.lint.memory_test_support import write_config_fixture
+
+
+def write_push_lock_settings(directory: Path) -> None:
+    _ = write_config_fixture(directory / "main_push_lock.conf", defaults="# whole: 1..\nrecord_days=14\n")
 
 
 def lock_attempt_environment(root: Path, environment: Mapping[str, str]) -> dict[str, str]:

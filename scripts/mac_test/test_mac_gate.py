@@ -23,17 +23,27 @@ from scripts.copies import copies
 from scripts.copies.copies_test_support import copies_environment
 from scripts.direct.wait_for_test_state import wait_until
 from scripts.lint import folder_audit, tmp_sweep
-from scripts.lint.memory_test_support import write_config_fixture
+from scripts.lint.memory_test_support import gate_isolation_environment, install_admission_fixture, write_config_fixture
 from scripts.lib import scratch
 from scripts.lib.checkout_test_support import write_stdlib_tool
 from scripts.lib.git_test_support import commit_repository, fixture_git_environment
 from scripts.lib.process_start import Started, Unreadable, process_start
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.mac_test import mac_gate
+from scripts.mac_test.offload_test_support import mac_queue_settings
 from scripts.mac_test.test_mac_queue_run import queue_fixture
 from scripts.production import gate
 from scripts.production.gate_modules import GateRefused
 from scripts.test_times import gate_record
+
+
+def stop_environment(root: Path) -> dict[str, str]:
+    """Use private copy roots and a fixed stop timeout."""
+    environment = copies_environment(root)
+    configuration = Path(environment["CONF_DIR"])
+    install_admission_fixture(configuration)
+    _ = write_config_fixture(configuration / "mac_gate.conf", defaults=mac_queue_settings(("false",)))
+    return environment
 
 FAKE_QUEUE = """\
 import json, os, sys, time
@@ -257,6 +267,14 @@ class MacGateTests(unittest.TestCase):
             os.environ, {'GATE_STATE_DIR': str(self.root / 'gate-state')})))
         self.repo = self.root / 'repo'
         self.repo.mkdir()
+        configuration = self.root / 'controller-config'
+        self.write_cloud_settings(configuration)
+        _ = write_config_fixture(configuration / 'mac_gate.conf', defaults=mac_queue_settings(('false',)))
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
+            **gate_isolation_environment(configuration),
+            'HOME': str(self.root), 'BUILDLOG_DIR': str(self.root / 'buildlog'),
+            'MERGE_GATE_STATE_DIR': str(self.root / 'gate-state'),
+        })))
         _ = gate.checked_git(self.repo, 'init', '-q')
         self.add_module(module_job('one'))
         (self.repo / 'config').mkdir()
@@ -265,6 +283,15 @@ class MacGateTests(unittest.TestCase):
         _ = gate.checked_git(self.repo, 'update-ref', 'refs/remotes/origin/main', head)
         _ = gate.checked_git(self.repo, 'remote', 'add', 'origin', str(self.repo))
         self.tree = gate.checked_git(self.repo, 'rev-parse', 'HEAD^{tree}')
+
+    def write_cloud_settings(self, configuration: Path) -> None:
+        _ = write_config_fixture(configuration / 'cloud_gate.conf', defaults=f"""\
+clone_url={self.repo}
+# whole: 1..
+lifetime_minutes=60
+# range: 0.001..
+module_time_limit_s=30
+""")
 
     def add_module(self, job: gate.GateJobResult) -> None:
         path = self.repo / module_path(job)
@@ -591,7 +618,7 @@ print(json.dumps([os.environ["PYTHONPATH"], *sys.argv[1:]]))
         folder = self.root / mac_gate.REMOTE_ROOT / 'mac-gate-fixture'
         folder.mkdir(parents=True)
         task = mac_gate.checkout_task(folder)
-        with mock.patch.dict(os.environ, copies_environment(self.root)):
+        with mock.patch.dict(os.environ, stop_environment(self.root)):
             checkout = scratch.new(task, 'checkout')
             cloud_gate.save(folder / 'checkout.json', {'path': str(checkout)})
             mirror = copies.RemoteMirror('fixture', copies.SelectedRepository('fixture'),
@@ -627,7 +654,7 @@ print(json.dumps([os.environ["PYTHONPATH"], *sys.argv[1:]]))
         kept.mkdir()
         cloud_gate.save(folder / 'checkout.json', {'path': str(removed)})
         result = LegacyTaskCleanup(removed, scratch.KeptFolder(kept, 'fixture hold'))
-        with (mock.patch.dict(os.environ, copies_environment(self.root)),
+        with (mock.patch.dict(os.environ, stop_environment(self.root)),
               mock.patch.object(scratch, 'end', return_value=result) as end,
               mock.patch.object(copies, 'unregister_remote') as unregister,
               redirect_stderr(StringIO()) as notices):
@@ -687,7 +714,7 @@ print(json.dumps([os.environ["PYTHONPATH"], *sys.argv[1:]]))
                 status = mac_gate.main()
             return subprocess.CompletedProcess(command, status, output.getvalue(), '')
 
-        with (mock.patch.dict(os.environ, {**copies_environment(home), 'MAC_QUEUE_HOST': 'fixture-mac'}),
+        with (mock.patch.dict(os.environ, {**stop_environment(home), 'MAC_QUEUE_HOST': 'fixture-mac'}),
               mock.patch.object(subprocess, 'run', side_effect=ssh),
               mock.patch.object(scratch, 'end', return_value=[]) as end,
               mock.patch.object(copies, 'unregister_remote') as unregister):
@@ -715,7 +742,7 @@ print(json.dumps([os.environ["PYTHONPATH"], *sys.argv[1:]]))
         pid = 21815
         identity = Started('old test')
         in_use = tmp_sweep.ProcessUsesKnown([(str(repo / 'target/test'), pid, 'test')])
-        with (mock.patch.dict(os.environ, copies_environment(self.root)),
+        with (mock.patch.dict(os.environ, stop_environment(self.root)),
               mock.patch.object(scratch, 'end', return_value=[]) as end,
               mock.patch.object(folder_audit, 'process_uses', return_value=in_use) as scan,
               mock.patch.object(mac_gate, 'process_start', side_effect=[identity, Started('reused')]),
@@ -726,7 +753,7 @@ print(json.dumps([os.environ["PYTHONPATH"], *sys.argv[1:]]))
             end.assert_not_called()
             self.assertTrue(repo.is_dir())
             scan.assert_called_with([repo])
-        with (mock.patch.dict(os.environ, copies_environment(self.root)),
+        with (mock.patch.dict(os.environ, stop_environment(self.root)),
               mock.patch.object(scratch, 'end', return_value=[]),
               mock.patch.object(folder_audit, 'process_uses',
                                 side_effect=[in_use, in_use, tmp_sweep.ProcessUsesKnown([])]),
@@ -739,7 +766,7 @@ print(json.dumps([os.environ["PYTHONPATH"], *sys.argv[1:]]))
     def test_installed_stop_accepts_old_attempts_without_a_journal_or_script(self) -> None:
         checkout = self.root / 'retained checkout'
         checkout.mkdir()
-        with (mock.patch.dict(os.environ, copies_environment(self.root)),
+        with (mock.patch.dict(os.environ, stop_environment(self.root)),
               mock.patch.object(scratch, 'end', return_value=[]),
               mock.patch.object(copies, 'unregister_remote') as unregister):
             for has_receipt in (False, True):
@@ -827,10 +854,13 @@ print(json.dumps([os.environ["PYTHONPATH"], *sys.argv[1:]]))
 
     def cancel_route(self, root: Path, *, explicit: bool, cleanup_refused: bool = False,
                      prepare_bundle: bool = False, force_signal_to_sender: bool = False) -> None:
+        configuration = root / 'config'
         environment = {**queue_fixture(root, LOCAL_MAC_SSH),
                        **copies_environment(root),
+                       **gate_isolation_environment(configuration),
                        'PATH': os.pathsep.join((str(root), os.defpath)),
                        'MAC_GATE_FIXTURE_ROOT': str(Path(__file__).resolve().parents[2])}
+        self.write_cloud_settings(configuration)
         gate_root = root / 'gate-root'
         gate_root.mkdir()
         _ = write_config_fixture(root / 'config/build_folders.conf', f'roots.gate={gate_root}\n')

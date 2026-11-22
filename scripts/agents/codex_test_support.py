@@ -31,7 +31,7 @@ from scripts.lib import models_registry
 from scripts.message import process_table
 from scripts.message.repeat_guard_test_support import install_guard_test_budget
 from scripts.production import staff, showrunners
-from scripts.production.staff_test_support import fixture_runtime_id, fixture_session, source_environment
+from scripts.production.staff_test_support import fixture_runtime_id, fixture_session, source_environment, write_staff_settings
 from scripts.whoami import agent_accounts
 
 REAL_HOME = Path(pwd.getpwuid(os.getuid()).pw_dir).resolve()
@@ -272,7 +272,8 @@ def setUpModule() -> None:
     private_staff = Path(home.name) / "staff.json"
     _ = private_staff.write_text(json.dumps({"schema": 2, "rows": []}))
     unittest.addModuleCleanup(set_environment("STAFF_FILE", str(private_staff)))
-    unittest.addModuleCleanup(set_environment("STAFF_CONFIG", str(Path(__file__).resolve().parents[2] / "config/staff.conf")))
+    config = write_staff_settings(Path(home.name) / "staff.conf", producers=Path(home.name) / "producers")
+    unittest.addModuleCleanup(set_environment("STAFF_CONFIG", str(config)))
     unittest.addModuleCleanup(set_environment("XDG_STATE_HOME", str(Path(home.name) / "state")))
     # Account-change notices resolve the user zone through discovery, whose paths
     # were cached at import before HOME changed. Isolate both it and child processes.

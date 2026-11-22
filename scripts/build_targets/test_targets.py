@@ -16,6 +16,8 @@ from typing import Literal, TypedDict, cast, override
 from unittest import mock
 
 from scripts.build_hold.owning_session import OwningSession
+from scripts.build_targets.target_test_support import mac_target_settings
+from scripts.mac_test.config_test_support import MAC_RUN_SETTINGS
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
 
 from scripts.build_targets import build_targets, target_config, targets
@@ -96,9 +98,10 @@ class IsolatedTargetTest(unittest.TestCase):
         _ = write_config_fixture(self.root / "build_targets.conf",
                                  "targets=mac,natedev\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n"
                                  + "kind.natedev=local\nplatform.natedev=linux\n")
-        _ = write_config_fixture(self.settings, "host=test-mac\n", template="mac_test")
+        _ = write_config_fixture(self.settings, "host=test-mac\n", defaults=MAC_RUN_SETTINGS)
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
             "HOME": str(self.root),
+            "CONF_DIR": str(self.root),
             "BUILD_HOLD_DIR": str(self.holders),
             "BUILDLOG_DIR": str(self.root / "buildlog"),
             "MAC_TEST_STATE_DIR": str(self.mac_state),
@@ -113,6 +116,7 @@ class IsolatedTargetTest(unittest.TestCase):
         home_config = self.root / ".claude/config"
         home_config.mkdir(parents=True)
         _ = config_environment(home_config)
+        _ = write_config_fixture(home_config / "build_targets.conf", defaults=mac_target_settings())
         _ = (home_config / "mac_test.conf").write_text(self.settings.read_text())
         _ = self.enterContext(mock.patch.object(Path, "home", return_value=self.root))
         _ = self.enterContext(mock.patch(
@@ -271,7 +275,7 @@ class ConfigurationTests(IsolatedTargetTest):
         folder = self.root / "configuration"
         folder.mkdir()
         settings = folder / "remote.conf"
-        _ = write_config_fixture(settings, "host=test-mac\n", template="mac_test")
+        _ = write_config_fixture(settings, "host=test-mac\n", defaults=MAC_RUN_SETTINGS)
         config = folder / "targets.conf"
         _ = config.write_text(
             "targets=mac\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=remote.conf\n",
@@ -312,7 +316,7 @@ class EligibilityTests(IsolatedTargetTest):
             ("", targets.LocalRequired("Linux sockets required"), targets.ExcludedTarget(mac, "Linux sockets required")),
         ):
             with self.subTest(settings=settings, routing=routing):
-                _ = write_config_fixture(self.settings, settings, template="mac_test")
+                _ = write_config_fixture(self.settings, settings, defaults=MAC_RUN_SETTINGS)
                 if "linux_only.other=" in settings:
                     _ = self.settings.write_text("\n".join(line for line in self.settings.read_text().splitlines()
                         if not line.startswith("linux_only.hana=")) + "\n")
@@ -325,7 +329,7 @@ class EligibilityTests(IsolatedTargetTest):
             (self.root / name).mkdir()
             _ = (self.root / name / "Cargo.toml").write_text("[package]\n" + manifest)
         _ = (self.root / "Cargo.toml").write_text('[workspace]\nmembers=["portable", "linux-part"]\n')
-        _ = write_config_fixture(self.settings, "linux_only.hana=linux-part\n", template="mac_test")
+        _ = write_config_fixture(self.settings, "linux_only.hana=linux-part\n", defaults=MAC_RUN_SETTINGS)
         mac = targets.SshTarget("mac", "macos", self.settings)
         for package, expected in (("portable", targets.EligibleTarget(mac)),
                                   ("linux-part", targets.ExcludedTarget(mac, "linux_only")),
@@ -344,7 +348,7 @@ class EligibilityTests(IsolatedTargetTest):
 
     def test_reversed_order_and_alternate_settings_decide_eligibility(self) -> None:
         alternate = self.root / "alternate.conf"
-        _ = write_config_fixture(alternate, "linux_only.hana=hana\n", template="mac_test")
+        _ = write_config_fixture(alternate, "linux_only.hana=hana\n", defaults=MAC_RUN_SETTINGS)
         config = self.write_config(
             "targets=natedev,mac\nkind.natedev=local\nplatform.natedev=linux\n"
             + "kind.mac=ssh\nplatform.mac=macos\nsettings.mac=alternate.conf\n"
@@ -709,7 +713,7 @@ class ReservationTests(IsolatedTargetTest):
     def test_takeover_retry_publishes_its_session_after_an_interrupted_publication(self) -> None:
         _ = self.write_config(
             "targets=mac\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n")
-        _ = write_config_fixture(self.settings, "offload=on\nhost=test-mac\nlinux_only.hana=\n", template="mac_test")
+        _ = write_config_fixture(self.settings, "offload=on\nhost=test-mac\nlinux_only.hana=\n", defaults=MAC_RUN_SETTINGS)
         args = build_targets.CliArguments()
         args.target, args.kind, args.package = "mac", "test", "sample"
         args.repo_root, args.pid = str(self.root), os.getpid()

@@ -22,6 +22,7 @@ from scripts.build_queue import execution_identity
 from scripts.aws_target import hana_box as box, hana_placement as hana, hana_placement_adapter as adapter, hana_spend, ledger, remote
 from scripts.aws_target.control_test_support import TestClock
 from scripts.aws_target.controller_lock import HanaCommandAccess, hana_command_lock
+from scripts.aws_target.hana_image_test_support import guest_digest_fixture
 from scripts.aws_target.ledger_test_support import CostFixture, git_only, install_hana_spending_settings, text_setting
 from scripts.aws_target.test_hana_box import FakeProvider, IDENTITY, record_lifecycle_image
 from scripts.build_targets import build_targets, target_config
@@ -58,6 +59,7 @@ class HanaPlacementTests(CostFixture):
     @override
     def setUp(self) -> None:
         super().setUp()
+        self.enterContext(guest_digest_fixture(self.root))
         _ = self.enterContext(mock.patch.object(subprocess, 'run', side_effect=git_only))
         self.workload = self.root / 'hana_aws.conf'
         install_hana_spending_settings(self.workload)

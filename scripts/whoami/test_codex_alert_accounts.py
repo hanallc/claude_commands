@@ -32,6 +32,7 @@ from scripts.lib import models_registry
 from scripts.production import showrunners, staff
 from scripts.production.staff_test_support import fixture_member, fixture_worker
 from scripts.agents import stop_resume
+from scripts.agents.test_support import write_machine_config
 from scripts.whoami import usage_store
 from scripts.notify.push_texts import RenderedPush, catalog, render_entry
 from scripts.notify.user_action import ActionRequired
@@ -67,6 +68,7 @@ class CodexAccountAlertTests(unittest.TestCase):
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         settings = self.enterContext(scratch_accounts_config()) / "accounts.conf"
         _ = config_environment(settings.parent)
+        write_machine_config(settings.parent)
         _ = write_config_fixture(settings, "usage_stale_minutes=10\n")
         self.credits = hold_credit_accounts(self)
         self.now = datetime.now(timezone.utc).replace(microsecond=0)

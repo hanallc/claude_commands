@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from scripts.message.test_send_budget import write_configs
 from scripts.lint.memory_test_support import write_config_fixture
+from scripts.production.config_test_support import UNIT_ANOMALY_SETTINGS
 
 from scripts.lib.checkout_test_support import python_tool_source
 
@@ -54,7 +55,7 @@ from scripts.message.roster import roster as read_roster
 from scripts.message import repeat_guard
 from scripts.message.relay_identity import publish_relay_identity, relay_session_name
 from scripts.message.relay_test_support import write_relay_record
-from scripts.lib import conf, names, process_start, models_registry
+from scripts.lib import conf, names, process_start, models_registry, user_zone as user_zone_settings
 from scripts.production import fake_unit_host, session_staff, staff, stall_watch, unit_lookup
 from scripts.message import send_result
 from scripts.message.unit_labels import StaffRowAnomaly
@@ -69,7 +70,7 @@ from scripts.message import postmaster
 from scripts.notify import silence
 from scripts.message.test_postmaster import MOD_FIXTURE_VERSION, FakeClock, fake_receipt
 from scripts.message import codex_daemon
-from scripts.message.codex_test_support import FakeDaemon, daemon_session_row, receive_frame, reply, write_codex_account
+from scripts.message.codex_test_support import CODEX_DAEMON_SETTINGS, FakeDaemon, daemon_session_row, receive_frame, reply, write_codex_account
 from scripts.message import roster
 from scripts.message import sessions, session_records
 from scripts.accounts import accounts
@@ -77,7 +78,7 @@ from scripts.agents.test_support import ShutdownTestCase, write_machine_config
 from scripts.lib.user_zone import user_zone
 from scripts.notify.user_action import REFUSED_BEFORE_SENDING, ActionRequired, NoActionRequired
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
-from scripts.message.repeat_guard_test_support import install_guard_test_budget, run_guard_in_process
+from scripts.message.repeat_guard_test_support import REPEAT_GUARD_FIXTURE, install_guard_test_budget, run_guard_in_process
 from scripts.accounts.home_test_support import scratch_accounts_config
 from scripts.production.staff_test_support import fixture_member, fixture_worker, fixture_runtime_id, fixture_session
 
@@ -86,6 +87,13 @@ def setUpModule() -> None:
     install_signal_pid_guard()
     install_guard_test_budget()
     run_guard_in_process()
+    configuration = Path(unittest.enterModuleContext(tempfile.TemporaryDirectory()))
+    settings = configuration / "notify.conf"
+    _ = write_config_fixture(settings, defaults="REVIEW_TIMEOUT_SECONDS=60\n")
+    _ = unittest.enterModuleContext(mock.patch.object(review, "NOTIFY_CONFIG", settings))
+    zone = configuration / "user_zone.conf"
+    _ = write_config_fixture(zone, defaults="zone=America/New_York\n")
+    _ = unittest.enterModuleContext(mock.patch.object(user_zone_settings, "CONF", str(zone)))
     notice_sender = mock.patch.object(failed_lookup, "send_notice")
     _ = notice_sender.start()
     unittest.addModuleCleanup(notice_sender.stop)
@@ -141,8 +149,10 @@ REAL_CURRENT_CLAUDE_RECORD = unit_lookup.current_claude_record
 
 def write_send_config(path: Path, values: str) -> int:
     """Keep timing settings when a test writes its own send settings."""
-    for name in ("postmaster", "codex_daemon", "send_repeat_guard", "rca", "machines", "production"):
-        _ = write_config_fixture(path.parent / f"{name}.conf")
+    _ = write_config_fixture(path.parent / "rca.conf", defaults="")
+    _ = write_config_fixture(path.parent / "production.conf", defaults=UNIT_ANOMALY_SETTINGS)
+    write_machine_config(path.parent)
+    _ = write_config_fixture(path.with_name("send_repeat_guard.conf"), defaults=REPEAT_GUARD_FIXTURE)
     write_configs(path.parent)
     return write_config_fixture(path, values)
 
@@ -581,6 +591,7 @@ send._bound_relay(message, 2, [], {}, attempt)
             base = Path(directory)
             selected, other, home = (base / name for name in ("selected", "other", "home"))
             home.mkdir()
+            _ = write_send_config(base / "send.conf", "")
             record = base / "relay-import.json"
             observer = ("\nimport scripts\n"
                         + "with open(os.environ['RELAY_IMPORT_RECORD'], 'w') as output:\n"
@@ -598,6 +609,7 @@ send._bound_relay(message, 2, [], {}, attempt)
             fake.chmod(0o755)
             with (mock.patch.dict(os.environ, {
                     "HOME": str(home), "PYTHONPATH": str(other), "RELAY_IMPORT_RECORD": str(record),
+                    "CONF_DIR": str(base),
                     "XDG_CACHE_HOME": str(base / "cache"),
                   }),
                   mock.patch.object(send, "__file__", str(selected / "scripts/message/send.py")),
@@ -1130,7 +1142,7 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
             _ = self.enterContext(mock.patch.object(staff, reader, side_effect=read_membership))
         for identity in ("absent", "gone", "id-1", "id-2", "restarted", "remote-thread", "missing", "recipient"):
             self.staff_member(identity, identity)
-        directory = short_socket_directory()
+        directory = short_socket_directory(system_root=Path("/tmp"))
         self.addCleanup(directory.cleanup)
         self.root = Path(directory.name)
         # No test opens a real rca.py case: it would write the machine's cases and message its owner.
@@ -7440,6 +7452,8 @@ class PeerSendTests(RecipientStaffFixture, ShutdownTestCase):
         (self.root / "config").mkdir()
         write_machine_config(self.root / "config")
         _ = write_send_config(self.root / "config/send.conf", "")
+        guard = self.root / "config/send_repeat_guard.conf"
+        _ = write_config_fixture(guard, defaults=REPEAT_GUARD_FIXTURE)
         binaries = self.root / "bin"
         binaries.mkdir()
         (self.root / "sessions").mkdir()
@@ -7461,6 +7475,7 @@ class PeerSendTests(RecipientStaffFixture, ShutdownTestCase):
             "HOME": str(self.root), "PATH": f"{binaries}{os.pathsep}{os.environ.get('PATH', '')}",
             "CONF_DIR": str(self.root / "config"),
             "CLAUDE_CODE_SESSION_ID": "", "CODEX_THREAD_ID": "",
+            "SEND_REPEAT_CONFIG": str(guard),
             "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions"),
             "SSH_RECORD": str(self.ssh_log),
             "SSH_SNAPSHOT": roster.RosterSnapshot(self.recipient_roster([], [])).encode(),
@@ -8050,7 +8065,7 @@ class AccountDaemonRoutingTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
-        self.root = Path(self.enterContext(short_socket_directory()))
+        self.root = Path(self.enterContext(short_socket_directory(system_root=Path("/tmp"))))
         self.homes = (self.root / ".codex", self.root / ".codex2")
         notes = self.root / "agents"
         self.queue_contents, self.queued = {}, []
@@ -8069,8 +8084,13 @@ class AccountDaemonRoutingTests(unittest.TestCase):
         (self.root / "claude-sessions").mkdir()
         (self.root / "config").mkdir()
         _ = write_send_config(self.root / "config/send.conf", "")
+        write_machine_config(self.root / "config")
+        _ = write_config_fixture(self.root / "config/codex_daemon.conf", defaults=CODEX_DAEMON_SETTINGS)
         binaries = self.root / "bin"
         binaries.mkdir()
+        herdr = binaries / "herdr"
+        _ = herdr.write_text("#!/bin/sh\nprintf '%s\\n' '{\"sessions\":[]}'\n")
+        herdr.chmod(0o755)
         ps = binaries / "ps"
         _ = ps.write_text("#!/bin/sh\nexit 0\n")
         ps.chmod(0o755)
@@ -8086,6 +8106,7 @@ class AccountDaemonRoutingTests(unittest.TestCase):
             **interpreter_cache_environment(self.root / "cache"),
             "HOME": str(self.root), "PATH": str(binaries), "AGENT_NOTES_DIR": str(notes),
             "CONF_DIR": str(self.root / "config"),
+            "USER_ZONE": "America/New_York",
             "PROCESS_TABLE_PS": str(ps), "XDG_STATE_HOME": str(self.root / "state"),
             "NOTIFIER_SESSIONS_DIR": str(self.root / "claude-sessions"),
             "NOTIFIER_STATE_DIR": str(self.root / "notifier"),

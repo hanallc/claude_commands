@@ -35,7 +35,11 @@ class LiveRootsGuardTests(unittest.TestCase):
     def test_copy_operations_and_cleanup_use_only_private_roots(self) -> None:
         caller_environment = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
         _ = cast(object, self.enterContext(patch.dict(os.environ, caller_environment, clear=True)))
-        caller_roots = live_roots()
+        caller = private_slot_config(Path(self.enterContext(tempfile.TemporaryDirectory())), repository="origin")
+        with patch.dict(os.environ, caller.environment):
+            caller_roots = live_roots()
+        self.assertIn(caller.slots.resolve(), caller_roots)
+        self.assertIn(Path(caller.environment["SESSION_TEMP_ROOT"]).resolve(), caller_roots)
         candidates = (Path("/var/tmp"), Path("/tmp"), Path("/dev/shm"), Path.home())
         parents = [parent for parent in map(Path.resolve, candidates)
                    if parent.is_dir() and os.access(parent, os.W_OK | os.X_OK)

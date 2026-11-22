@@ -40,6 +40,7 @@ from scripts.lib.atomic_file import write_text_atomic
 def setUpModule() -> None:
     # Session fixtures have no panes unless a test supplies pane evidence.
     _ = unittest.enterModuleContext(mock.patch.object(herdr.Herdr, "panes", return_value=[]))
+    unittest.enterModuleContext(mock.patch.dict(os.environ, {"USER_ZONE": "America/New_York"}))
 
 
 class AddUnitResumeFolderTests(AddUnitTestCase):
@@ -1044,7 +1045,8 @@ class UnitFolderMoveTests(FolderRenameFixture):
         world = PaneWorld()
         world.setup(self)
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(self.home / ".claude")})))
-        write_text_atomic(self.root / "conf/production.conf", self.configuration.read_text())
+        for name in ("production.conf", "build_folders.conf"):
+            write_text_atomic(self.root / "conf" / name, (self.root / name).read_text())
         idle = fixture_worker("idle", self.owner.id)
         world.add(self.owner, "w1:p0")
         world.add(idle, "w1:p1")

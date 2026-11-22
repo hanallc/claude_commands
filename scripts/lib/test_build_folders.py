@@ -24,7 +24,9 @@ from unittest import mock
 from contextlib import AbstractContextManager, contextmanager, nullcontext, redirect_stdout
 
 from scripts.lib import build_folder_lock, build_folders as folders, conf, copy_record, git_files, scratch, unit_runs, process_group
-from scripts.lint.memory_test_support import ADMISSION_CONFIG_FIXTURE, config_environment, write_config_fixture
+from scripts.lib.scratch_test_support import write_scratch_settings
+from scripts.lib.build_folders_test_support import workspace_folder_settings
+from scripts.lint.memory_test_support import config_environment, write_config_fixture
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.git_test_support import commit_repository, fixture_git_environment
 
@@ -311,10 +313,10 @@ class FolderFormTests(unittest.TestCase):
             _ = os.environ.pop(copy_record.ROOT_ENV)
             self.assertEqual(copy_record.root(), self.root / "legacy-scratch")
 
-    def test_report_is_the_default_folder_check(self) -> None:
+    def test_report_folder_check_uses_the_configured_value(self) -> None:
         config = self.root / "defaults/build_folders.conf"
         config.parent.mkdir()
-        _ = write_config_fixture(config)
+        _ = write_config_fixture(config, defaults="# one of: off, report, enforce\nfolders.check=report\n")
         self.assertEqual(conf.read(config).text("folders.check"), "report")
 
     def test_mark_folder_use_stamps_main_and_worktree_output(self) -> None:
@@ -552,23 +554,19 @@ class BuildFolderTests(unittest.TestCase):
         config = Path(self.enterContext(tempfile.TemporaryDirectory(dir=private)))
         environment = fixture_git_environment(private)
         _ = environment.pop("STAFF_CONFIG", None)
+        _ = write_config_fixture(config / "build_folders.conf", defaults=workspace_folder_settings(self.root))
+        copies_settings = config / "copies.conf"
+        _ = write_config_fixture(copies_settings, defaults=f"# range: 5e-324..\ngit_timeout_seconds={TEST_HANG_GUARD_SECS}\n")
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
             **environment,
             **config_environment(config), "TMPDIR": str(self.root), copy_record.ROOT_ENV: str(self.root / "scratch"),
+            "COPIES_CONFIG": str(copies_settings),
             copy_record.COPIES_ENV: str(self.root / "copies"),
             scratch.HOLDS_ENV: str(self.root / "holds.json"),
             "STAFF_FILE": str(self.root / "staff.json"),
             "CODEX_THREAD_ID": "", "CLAUDE_CODE_SESSION_ID": "",
         }, clear=True)))
-        _ = write_config_fixture(config / "build_folders.conf",
-            "patterns.temporary={repository}/{owner}-{purpose}-{suffix}\npatterns.gate={purpose}-{suffix}\n"
-            + "patterns.standing={repository}/{owner}-gate{suffix}\n"
-            + "patterns.target={purpose}\n"
-            + "patterns.scratch={purpose}-{suffix}\npatterns.legacy-unique={purpose}{suffix}\n"
-            + "patterns.legacy-stable={purpose}\nnames.repository_key_length=8\n"
-            + "patterns.tool={purpose}{suffix}\npatterns.named={showrunner}-{unit}/{work}-{purpose}\n"
-            + "prefixes.verify-hold=verify-hold.{owner}.\nprefixes.admit-test=admit-test-\n")
-        _ = write_config_fixture(config / "scratch.conf", "suffix_length=6\n")
+        write_scratch_settings(config, self.root)
 
     def command(self, *arguments: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run([sys.executable, str(Path(folders.__file__)), *arguments],
@@ -839,12 +837,8 @@ os.execv(os.environ['EDITABLE_REAL_GIT'], [os.environ['EDITABLE_REAL_GIT'], *arg
 
     def test_configured_scratch_root_reads_a_changed_file_at_use(self) -> None:
         settings = Path(os.environ["CONF_DIR"]) / "build_folders.conf"
-        lines = [line for line in settings.read_text(encoding="utf-8").splitlines()
-                 if not line.startswith("roots.scratch")]
-
         def configure(root: Path) -> None:
-            text = "\n".join(f"{line}\nroots.scratch={root}" if line == "[roots]" else line for line in lines)
-            _ = settings.write_text(text + "\n", encoding="utf-8")
+            _ = write_config_fixture(settings, f"roots.scratch={root}\n")
 
         with mock.patch.dict(os.environ):
             del os.environ[copy_record.ROOT_ENV]
@@ -2249,28 +2243,29 @@ assert not loaded, loaded
 
     def test_configuration_helper_supplies_missing_files_and_preserves_overrides(self) -> None:
         copied = self.root / "copied-config"
-        _ = config_environment(copied)
+        system = self.root / "system"
+        system.mkdir()
+        source = (f"roots.system={system}\nroots.build={self.root / 'build'}\n"
+                  + "prefixes.admit-test=admit-test-\npatterns.legacy-unique={purpose}{suffix}\n"
+                  + "# whole: 1..\nnames.suffix_length=4\nnames.suffix_characters=abc012\n"
+                  + "# range: 0..\nlocks.probe_wait_seconds=1\n# range: 0.001..\nlocks.probe_retry_seconds=0.01\n")
+        fixtures = {"build_folders.conf": source}
+        _ = config_environment(copied, fixtures=fixtures)
         config = copied / "build_folders.conf"
         config.unlink()
-        environment = config_environment(config.parent)
+        environment = config_environment(config.parent, fixtures=fixtures)
         self.assertEqual(environment, {"CONF_DIR": str(config.parent),
                                        "BUILD_TARGETS_CONFIG": str(config.parent / "build_targets.conf")})
-        sources = Path(__file__).resolve().parents[2] / "config"
-        admission = config.parent / ADMISSION_CONFIG_FIXTURE.name
-        self.assertEqual(conf.read(admission).values(), conf.read(ADMISSION_CONFIG_FIXTURE).values())
-        for source in sources.glob("*.conf"):
-            if source.name != ADMISSION_CONFIG_FIXTURE.name:
-                self.assertEqual((config.parent / source.name).read_bytes(), source.read_bytes())
-        _ = write_config_fixture(config, "prefixes.admit-test=admit-test-\nroots.system=/tmp\n")
-        original = config.read_text()
+        self.assertEqual(list(copied.iterdir()), [config])
+        self.assertEqual(config.read_text(), source)
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, environment)))
         self.assertEqual(folders.FOLDER_PREFIXES["admit-test"], "admit-test-")
         with folders.temporary_build_folder(folders.UniqueBuildFolder("probe-", folders.SystemTemporaryParent())) as path:
-            self.assertEqual(path.parent, Path("/tmp"))
+            self.assertEqual(path.parent, system)
             self.assertTrue(path.is_dir())
         self.assertFalse(path.exists())
-        _ = config.write_text(original.replace("prefixes.admit-test=admit-test-", "prefixes.admit-test=private-"))
-        _ = config_environment(config.parent)
+        _ = write_config_fixture(config, "prefixes.admit-test=private-\n", defaults="")
+        _ = config_environment(config.parent, fixtures=fixtures)
         self.assertEqual(folders.FOLDER_PREFIXES["admit-test"], "private-")
 
     def test_repository_key_keeps_the_fixed_path_name(self) -> None:
@@ -2292,7 +2287,7 @@ assert not loaded, loaded
         config = Path(os.environ["CONF_DIR"]) / "build_folders.conf"
         original = config.read_text()
         fallback = self.root / "fallback/build_folders.conf"
-        _ = write_config_fixture(fallback, "prefixes.verify-hold=verify-hold.{owner}.\n", template="build_folders")
+        _ = write_config_fixture(fallback, defaults=workspace_folder_settings(self.root))
         config.unlink()
         original_path = cast(Callable[[str], Path], getattr(conf, "_repository_path"))
 
@@ -2310,7 +2305,9 @@ assert not loaded, loaded
         self.assertEqual(folders.FOLDER_PREFIXES["verify-hold"], "private.{owner}.")
 
     def test_folder_rules_keep_the_live_config_reader_without_a_private_override(self) -> None:
-        settings = conf.read(Path(__file__).resolve().parents[2] / "config" / "build_folders.conf")
+        private = self.root / "build_folders.conf"
+        _ = write_config_fixture(private, "prefixes.verify-hold=verify-hold.{owner}.\n", defaults="")
+        settings = conf.read(private)
         with mock.patch.dict(os.environ):
             _ = os.environ.pop("CONF_DIR", None)
             with mock.patch.object(conf, "read", return_value=settings) as read:

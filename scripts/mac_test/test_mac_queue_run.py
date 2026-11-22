@@ -26,6 +26,8 @@ from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.build_hold import override_guard
 from scripts.build_hold.test_override_guard import installed_script
 from scripts.mac_test import mac_queue_run, mac_test
+from scripts.mac_test.config_test_support import MAC_RUN_SETTINGS
+from scripts.mac_test.offload_test_support import mac_queue_settings
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
 from scripts.production import staff
 from scripts.production.staff_test_support import fixture_runtime_id
@@ -130,9 +132,10 @@ def queue_fixture(root: Path, ssh_source: str = SSH) -> dict[str, str]:
     ssh.chmod(0o755)
     environment = {**os.environ, **config_environment(root / "config"), "FAKE_QUEUE_STATE": str(root),
                    "PATH": str(root) + os.pathsep + os.environ["PATH"], "HOME": str(root),
-                   "MAC_TEST_STATE_DIR": str(root / "mac-test"), "STAFF_FILE": str(root / "staff.json")}
-    _ = write_config_fixture(root / "config/mac_gate.conf", "admission_client_command="
-                             + shlex.join([sys.executable, str(queue)]) + "\n")
+                   "MAC_TEST_STATE_DIR": str(root / "mac-test"), "STAFF_FILE": str(root / "staff.json"),
+                   "USER_ZONE": "America/New_York"}
+    _ = write_config_fixture(root / "config/mac_gate.conf", defaults=mac_queue_settings([sys.executable, str(queue)]))
+    _ = write_config_fixture(root / "config/mac_test.conf", defaults=MAC_RUN_SETTINGS)
     return environment
 
 
@@ -689,8 +692,9 @@ else:
                 work = (f"{setsid} -f sh -c 'echo $$ > {root}/app.new; mv {root}/app.new {root}/app; exec sleep 60' </dev/null >/dev/null 2>&1; "
                         + f"while [[ ! -s {root}/app ]]; do sleep 0.05; done; echo started $$; "
                         + ("exec sleep 60" if closes else "exit 7"))
-                on_close = (f"kill -0 $(<{root}/work) 2>/dev/null && print alive > {root}/order"
-                            + f" || print ended > {root}/order; kill -TERM $(<{root}/app)")
+                on_close = (f"state=$(ps -o state= -p $(<{root}/work)); "
+                            + f"print -r -- \"${{state:-absent}}\" > {root}/work-state; "
+                            + f"kill -TERM $(<{root}/app)")
                 wrapper = mac_queue_run.remote_wrapper(work, on_close, 20).replace("/bin/zsh", zsh)
                 # Its own session stands in for the SSH session on the Mac.
                 with subprocess.Popen([zsh, "-c", wrapper], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
@@ -711,13 +715,13 @@ else:
                                 self.assertEqual(select.select([end], [], [], TEST_HANG_GUARD_SECS)[0], [end])
                             self.assertEqual(process.wait(timeout=TEST_HANG_GUARD_SECS), -signal.SIGTERM)
                             # The group ends first; then the close step stops the app.
-                            self.assertEqual((root / "order").read_text(), "ended\n")
+                            self.assertIn((root / "work-state").read_text().strip(), ("absent", "Z", "X"))
                         else:
                             output = cast(str, process.stdout.read())
                             self.assertEqual(process.wait(timeout=TEST_HANG_GUARD_SECS), 0)
                             self.assertEqual(output.splitlines()[-1], "mac_exit=7")
                             # A run that ends by itself leaves the close step to its own cleanup.
-                            self.assertFalse((root / "order").exists())
+                            self.assertFalse((root / "work-state").exists())
                             os.kill(int((root / "app").read_text()), signal.SIGTERM)
                     finally:
                         if process.poll() is None:

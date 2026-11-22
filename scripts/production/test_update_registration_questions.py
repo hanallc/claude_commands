@@ -18,6 +18,7 @@ from unittest import mock
 
 from scripts.production import proposal_issue, proposals_folder, staff
 from scripts.review_links import new_item_dialog
+from scripts.production.config_test_support import QUESTION_TITLE_SETTINGS
 from scripts.production.issues import Issue, frontmatter
 from scripts.production.production_doc import read_production
 from scripts.production.cli_fixture import invoke_cli
@@ -33,7 +34,7 @@ class RegistrationTests(RegistrationFixture):
         super().setUp()
         config = self.root / "title-config"
         config.mkdir()
-        _ = (config / "production.conf").write_text("# whole: 20..\nquestion_title_max_chars=100\n")
+        _ = (config / "production.conf").write_text(QUESTION_TITLE_SETTINGS)
         self.env["CONF_DIR"] = str(config)
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"CONF_DIR": str(config)})))
 

@@ -6,9 +6,11 @@ from __future__ import annotations
 from scripts.buildlog import repository
 from scripts.lib import test_phase
 
-from scripts.build_queue import admission_records, memory_feed, placement, snapshot_codec as codec, step_estimator
+from scripts.build_queue import admission_records, placement, snapshot_codec as codec, step_estimator
 
-from scripts.lint.memory_test_support import admission_configuration_fixture, admission_policy_fixture
+from scripts.lint.memory_test_support import (
+    admission_configuration_fixture, admission_policy_fixture, fixture_feed_code_settings,
+)
 
 import fcntl
 import io
@@ -57,6 +59,9 @@ from scripts.buildlog import record as buildlog_record
 from scripts.buildlog import index as file_marks
 from scripts.lib import test_hang_guard
 from scripts.message.roster import UnitLabels
+
+with fixture_feed_code_settings():
+    from scripts.build_queue import memory_feed
 
 READY_FOR_ADMISSION = admission_records.ReadyForAdmission()
 
@@ -238,7 +243,7 @@ def stop_history_append(history_store: object, tail: HistoryAppendStop
 def setUpModule() -> None:
     root = Path(unittest.enterModuleContext(tempfile.TemporaryDirectory()))
     _ = unittest.enterModuleContext(fake_cargo_output_roots())
-    _ = write_config_fixture(root / "build_admission.conf", "build_budget_gib=21")
+    write_memory_config(root / "build_admission.conf", build_budget_gib="21")
     _ = (root / "meminfo").write_text("MemTotal: 67108864 kB\nMemAvailable: 67108864 kB\n")
     _ = (root / "pressure").write_text(
         "some avg10=0.00 avg60=0.00 avg300=0.00 total=0\n"
@@ -280,7 +285,7 @@ class BuildBudgetTests(unittest.TestCase):
     def setUp(self) -> None:
         self.config = Path(self.enterContext(tempfile.TemporaryDirectory())) / "build_admission.conf"
         _ = cast(object, self.enterContext(patch.dict(os.environ, {"LINT_CONFIG_FILE": str(self.config.with_name("lint.conf")), "CONF_DIR": str(Path(self.config).parent)})))
-        _ = write_config_fixture(self.config, "build_budget_gib=21")
+        write_memory_config(self.config, build_budget_gib="21")
         commit_config_fixture(self.config)
 
 
@@ -1601,7 +1606,8 @@ class FreshTestPromiseTests(unittest.TestCase):
         path = self.root / self.host / f"{NOW:%Y-%m}.jsonl"
         for seconds, ending_source, expected_fresh in ((30, "same-source", True), (20, "edited-source", False)):
             with self.subTest(source=ending_source), patch.dict(os.environ, {
-                    "BUILDLOG_TREE_START": "same-source", "BUILDLOG_TEST_BUILD_KEY": "current-key"}), \
+                    "BUILDLOG_TREE_START": "same-source", "BUILDLOG_TEST_BUILD_KEY": "current-key",
+                    "BUILDLOG_DIR": str(self.root), "BUILDLOG_TARGET": self.host}), \
                     patch.object(buildlog_record, "git_directory", return_value=str(self.worktree)), \
                     patch.object(buildlog_record, "git_facts", return_value={"worktree": str(self.worktree)}), \
                     patch("scripts.buildlog.treekey.tree_key", return_value=ending_source), \
@@ -4148,7 +4154,9 @@ class LiveMemoryTripwireTests(MemoryQueueFixture):
                     os.environ["BUILDLOG_LIVE_MEMORY_TRIPWIRE"] = setting
                 # Keep the default-path contract without reading host memory.
                 with patch.object(Path, "read_bytes", return_value=b"full avg10=0 total=0\n"):
-                    self.assertIsInstance(gate.read_pressure(policy=admission_policy_fixture()), admission_records.Pressure)
+                    self.assertIsInstance(gate.read_pressure(policy=admission_policy_fixture()),
+                        (admission_records.NoPressureHold, admission_records.MemoryPressure,
+                         admission_records.PressureUnavailable))
 
     def test_shell_refuses_live_meminfo_or_pressure_and_records_one_reading(self) -> None:
         for reading in ("/proc/meminfo", "/proc/pressure/memory"):
@@ -5253,7 +5261,8 @@ class ShellTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
-        _ = cast(object, self.enterContext(patch.dict(os.environ, verify_test_environment(), clear=True)))
+        environment = {**verify_test_environment(), "CONF_DIR": os.environ["CONF_DIR"]}
+        _ = cast(object, self.enterContext(patch.dict(os.environ, environment, clear=True)))
         self.admission = self.enterContext(AdmissionFixture())
         self.admission.clock.epoch = time.time()
         _ = self.enterContext(self.admission.serving())

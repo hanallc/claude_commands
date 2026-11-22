@@ -16,14 +16,16 @@ from unittest.mock import patch
 
 from scripts.agents import pane_record, producer_creation, producer_lifecycle, remote, restart, restart_support, shutdown, shutdown_record, stop_resume
 from scripts.agents.test_stop_resume import ProducerAdmissionWorld, producer_first_fixture
+from scripts.agents.test_support import write_machine_config
 from scripts.herdr import herdr, pane_launch
 from scripts.lib import models_registry
 from scripts.lib.script_envelope import script_prompt
 from scripts.lib.test_models_registry import write_registry
-from scripts.lint.memory_test_support import config_environment, write_config_fixture
+from scripts.lint.memory_test_support import config_environment
+from scripts.message.codex_test_support import CODEX_DAEMON_SETTINGS
 from scripts.message import roster, sessions
 from scripts.production import staff, the_list, update_registration
-from scripts.production.staff_test_support import fixture_member, fixture_runtime_id
+from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, write_staff_settings
 
 SUBMIT_OPENING = herdr.Herdr.submit_opening_prompt
 OPENING_TEXT = script_prompt("Read ~/rust/hanadocs/dwight/README.md, then run /producer:produce.")
@@ -325,7 +327,9 @@ class ProducerLifecycleTests(unittest.TestCase):
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.config = self.root / "configuration"
-        _ = write_config_fixture(self.config / "staff.conf", f"PRODUCER_FOLDER_ROOT={self.root / 'documents'}\n")
+        write_machine_config(self.config)
+        _ = write_staff_settings(self.config / "staff.conf", producers=self.root / "documents")
+        _ = (self.config / "codex_daemon.conf").write_text(CODEX_DAEMON_SETTINGS)
         self.registry = self.config / "models.conf"
         _ = write_registry(self.registry, {"producer_defaults": {"model": "claude:sonnet:high"},
                                           "producers": {"morty": "claude:opus:high", "dwight": "claude:sonnet:high"}})

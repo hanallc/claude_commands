@@ -18,6 +18,7 @@ from scripts.build_queue.test_placement import (
 from scripts.mac_test.claim_state import RepositoryScope, WholeMacScope
 from scripts.direct.verify_mac_memory_retry_test_support import VerifyMacMemoryRetryFixture
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.mac_test.config_test_support import MAC_RUN_SETTINGS
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.lint import memory_admit
 from scripts.message.unit_labels import UnitLabels
@@ -56,7 +57,7 @@ runpy.run_path(os.environ["TEST_REAL_TARGETS"], run_name="__main__")
         config = self.root / "build_targets.conf"
         _ = config.write_text(config.read_text().replace("targets=mac,natedev", "targets=mac,natedev,linux")
                               + "kind.linux=ssh\nplatform.linux=linux\nsettings.linux=linux.conf\n")
-        _ = write_config_fixture(self.root / "linux.conf", "offload=off\nkinds=test\n", template="mac_test")
+        _ = write_config_fixture(self.root / "linux.conf", "offload=off\nkinds=test\n", defaults=MAC_RUN_SETTINGS)
         self.assert_disk_decline_leaves_for_mac(disabled_linux=True)
 
     def assert_disk_decline_leaves_for_mac(self, *, disabled_linux: bool = False) -> None:
@@ -210,7 +211,7 @@ class StepRetryPermissionTests(unittest.TestCase):
                             configuration += f"settings.{name}={name}.conf\n"
                             _ = write_config_fixture(fixture.root / f"{name}.conf",
                                 "offload=on\nlinux_only.hana=\nslots=1\nkinds=test,check,lint,doc,build,example\n",
-                                template="mac_test")
+                                defaults=MAC_RUN_SETTINGS)
                         configuration += "kind.natedev=local\nplatform.natedev=linux\n"
                         _ = (fixture.root / "build_targets.conf").write_text(configuration)
                         request = placement_request(fixture)

@@ -109,6 +109,7 @@ class StandingCheckpointTests(unittest.TestCase):
             **os.environ, **private, **interpreter_cache_environment(self.root / "cache"), "HOME": str(self.root / "home"),
             "STYLE_LEDGER_STATE_DIR": str(self.root / "state"),
             "STYLE_HISTORY_NATE_STYLE_DIR": str(self.catalog.parent),
+            "USER_ZONE": "America/New_York",
             "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull,
             "PATH": str(self.bin) + os.pathsep + os.environ.get("PATH", ""),
             fake_fmt.STATE: str(self.root / "fmt"),

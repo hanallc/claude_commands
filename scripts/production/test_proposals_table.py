@@ -264,8 +264,14 @@ class ProposalsTableTests(StaffTestCase):
             rows = proposals_table.unit_add_on_rows("footer", plan)
         self.assertEqual(sorted(row.proposal for row in rows), ["Former-folder add-on", "New-folder add-on"])
 
+    def configure_widths(self, title: int, state: int) -> Path:
+        path = self.root / "config/proposals_table.conf"
+        _ = write_config_fixture(path, f"# whole: 1..\ntitle_width={title}\n# whole: 1..\nstate_width={state}\n",
+                                 defaults="")
+        return path
+
     def test_the_table_keeps_one_line_per_row_and_cuts_a_long_title(self) -> None:
-        _ = write_config_fixture(self.root / "config/proposals_table.conf", "title_width=60\nstate_width=80\n")
+        _ = self.configure_widths(60, 80)
         long_title = "word " * 40
         text = proposals_table.table([Row("unit | one", "first\nsecond", "2026-10-12", REVIEW_STATE),
                                       Row("unit", long_title, "2026-10-12", long_title)])
@@ -279,7 +285,7 @@ class ProposalsTableTests(StaffTestCase):
         self.assertLessEqual(len(cells[3]), settings.whole("state_width"))
 
     def test_config_widths_change_where_the_table_cuts_cells(self) -> None:
-        config = self.write("config/proposals_table.conf", "# whole: 1..\ntitle_width=10\n# whole: 1..\nstate_width=15\n")
+        config = self.configure_widths(10, 15)
         with mock.patch.dict(os.environ, {"CONF_DIR": str(config.parent)}):
             text = proposals_table.table([Row("word " * 40, "word " * 40, "2026-10-12", "word " * 40)])
         self.assertEqual(text.splitlines()[2], "| word word… | word word… | 2026-10-12 | word word word… |")
@@ -296,7 +302,7 @@ class ProposalsTableTests(StaffTestCase):
         return code, out.getvalue(), err.getvalue()
 
     def test_main_prints_the_three_sources_in_order(self) -> None:
-        _ = write_config_fixture(self.root / "config/proposals_table.conf", "title_width=60\nstate_width=80\n")
+        _ = self.configure_widths(60, 80)
         doc = self.write("trunk/docs/plans/report-settings.md", "# Production\n\n- **Proposals:** `issues`\n"
                          + f"- **Improvement queue:** {self.root / 'backlog' / 'ledger.md'}\n")
         _ = recorded_showrunner("footers", doc)

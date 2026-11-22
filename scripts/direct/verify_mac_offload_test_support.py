@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
-from scripts.lib.helper_tree_test_support import VERIFY_HELPERS, copy_helpers, verify_test_environment
+from scripts.build_targets.target_test_support import mac_target_settings
+from scripts.lib.helper_tree_test_support import (
+    VERIFY_HELPERS, VERIFY_RESULT_SETTINGS, VERIFY_TOKEN_SETTINGS, copy_helpers, verify_test_environment,
+)
 
 from scripts.build_queue.admission_test_support import (
     PrivateHostEvidence, caller_admission, caller_provider_controls, private_provider_evidence,
@@ -14,7 +17,12 @@ from scripts.lib.checkout_test_support import python_tool_source, write_python_t
 from scripts.lib.py_floor_test_support import seed_interpreter_cache
 
 from scripts.copies.copies_test_support import copies_environment
-from scripts.lint.memory_test_support import config_environment, write_config_fixture, write_pressure_reading
+from scripts.mac_test.config_test_support import MAC_RUN_SETTINGS
+from scripts.mac_test.offload_test_support import nextest_settings
+from scripts.lint.config_test_support import LINT_TOOL_SETTINGS
+from scripts.lint.memory_test_support import (
+    config_environment, install_admission_fixture, write_config_fixture, write_pressure_reading,
+)
 from scripts.lib.build_folders_test_support import tool_folders
 
 import json
@@ -1171,7 +1179,9 @@ class VerifyMacOffloadFixture(unittest.TestCase):
         scripts = claude / "scripts"
         scripts.mkdir(parents=True)
         _ = copy_helpers(self.home, *VERIFY_HELPERS)
-        _ = shutil.copytree(VERIFY.parent.parent.parent / "config", claude / "config")
+        _ = write_config_fixture(claude / "config/build_steps.conf", defaults="names.test=test\n")
+        _ = write_config_fixture(claude / "config/mac_test.conf",
+                                 defaults=MAC_RUN_SETTINGS + nextest_settings())
         log = scripts / "buildlog"
         # Keep the recorder's import interface while the command records fixture observations.
         record_source = (VERIFY.parent.parent / "buildlog/record.py").read_text()
@@ -1219,13 +1229,13 @@ class VerifyMacOffloadFixture(unittest.TestCase):
         # Admission must use this test's memory state, including pressure.
         pressure = self.root / "memory-pressure"
         write_pressure_reading(pressure)
-        _ = write_config_fixture(self.root / "lint.conf")
-        _ = write_config_fixture(self.root / "mac_test.conf")
+        install_admission_fixture(self.root)
+        _ = write_config_fixture(self.root / "lint.conf", defaults=LINT_TOOL_SETTINGS)
+        _ = write_config_fixture(self.root / "mac_test.conf", defaults=MAC_RUN_SETTINGS)
         settings = self.root / "mac settings.conf"
-        _ = write_config_fixture(settings, f"offload=on\nlinux_only.{self.root.name}=\n", template="mac_test")
+        _ = write_config_fixture(settings, f"offload=on\nlinux_only.{self.root.name}=\n", defaults=MAC_RUN_SETTINGS)
         config = self.root / "build_targets.conf"
-        _ = config.write_text("targets=mac,natedev\nkind.mac=ssh\nplatform.mac=macos\n"
-                              + f"settings.mac={settings.name}\nkind.natedev=local\nplatform.natedev=linux\n")
+        _ = write_config_fixture(config, defaults=mac_target_settings(settings.name))
         metadata: CargoMetadata = {
             "workspace_root": str(self.root),
             "workspace_members": ["sample-id"],
@@ -1247,6 +1257,8 @@ class VerifyMacOffloadFixture(unittest.TestCase):
                 }
             ],
         }
+        _ = write_config_fixture(self.root / "direct.conf",
+                                 defaults=VERIFY_TOKEN_SETTINGS + VERIFY_RESULT_SETTINGS)
         self.environment = {
             **verify_test_environment(),
             **config_environment(self.root),

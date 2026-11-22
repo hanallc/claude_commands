@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import cast, override
 from unittest import mock
 from zipfile import ZipFile, Path as ZipPath
+from scripts.aws_target.ledger_test_support import install_cost_settings
 from scripts.buildlog.mac_natedev_test_support import mac_natedev_environment
 from scripts.buildlog.cli_probe_test_support import measure_cli_work
 
@@ -70,7 +71,9 @@ class ReportSpeedTests(unittest.TestCase):
         _ = isolated_journal(self)
         temporary = Path(self.enterContext(tempfile.TemporaryDirectory()))
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {name: str(temporary / name) for name in COORDINATION_VARIABLES})))
-        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, mac_natedev_environment(temporary / "config"))))
+        configuration = temporary / "config"
+        install_cost_settings(configuration / "aws_target.conf")
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, mac_natedev_environment(configuration))))
 
     def test_report_command_from_a_temporary_log_shows_lead_and_targets(self) -> None:
         with tempfile.TemporaryDirectory(prefix="buildlog-report-output-") as temporary:
@@ -209,6 +212,7 @@ class ReportTests(unittest.TestCase):
         point_root_at(self, self.root)
         for host in ("natedev", "Mac"):
             _ = refresh_machine_health(self, host, self.root, self.root)
+        install_cost_settings(Path(temporary) / "aws_target.conf")
         self.enterContext(mock.patch.dict(os.environ, {"HOME": temporary, **mac_natedev_environment(Path(temporary))}))
         _ = self.enterContext(mock.patch.object(subprocess, "run"))
         _ = self.enterContext(mock.patch.object(ci, "gh_get"))

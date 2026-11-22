@@ -131,6 +131,8 @@ class ReviewLauncherFixture(LauncherFixture):
         )
         _ = write_config_fixture(self.config_file, self.config_file.read_text(encoding="utf-8"))
         _ = config_environment(self.root)
+        _ = write_config_fixture(self.root / "fast_track.conf",
+                                 defaults="# whole: 1..\nfetch_lock_attempts=3\n# range: 0..\nfetch_lock_wait_seconds=0\n")
         _ = write_config_fixture(self.root / "lint.conf", "style_review=on\n")
         reviewed = self.working_dir / "reviewed.txt"
         _ = reviewed.write_text("original\n", encoding="utf-8")
@@ -177,7 +179,6 @@ class ReviewLauncherFixture(LauncherFixture):
                          self.root / "scripts/production/fast_track.py")
         config = self.root / "config"
         config.mkdir(exist_ok=True)
-        _ = shutil.copy2(DIRECT_DIR.parents[1] / "config/fast_track.conf", config / "fast_track.conf")
         for name in ("review.sh", "tag_inventory.py"):
             _ = shutil.copy2(DIRECT_DIR / name, direct_dir / name)
         configure_launcher_fixture(direct_dir / "review.sh")
@@ -193,7 +194,20 @@ class ReviewLauncherFixture(LauncherFixture):
             _ = shutil.copy2(DIRECT_DIR.parent / "message" / name, message / name)
         review_config = self.root / "config/review"
         review_config.mkdir(parents=True, exist_ok=True)
-        _ = shutil.copy2(DIRECT_DIR.parents[1] / "config/review/style.md", review_config / "style.md")
+        _ = (review_config / "style.md").write_text("""\
+## Phase style review
+
+Make no edits.
+
+- Range: $range
+- Diff file: $diff
+- Additions: $additions
+- Rust change: $rust
+
+Put the result between these markers.
+$begin
+$end
+""")
         stub = agents / "agent_exec.sh"
         _ = stub.write_text(STUB_AGENT_EXEC, encoding="utf-8")
         stub.chmod(0o755)

@@ -9,6 +9,7 @@ from scripts.build_queue import snapshot_codec as codec
 from scripts.build_queue.admission_protocol_v1_fixture import parse_reply as decode_legacy
 from scripts.build_queue.scope_activity import LiveBuildRun, NoLiveBuildRun, ScopeActivityReader
 
+from scripts.mac_test.config_test_support import MAC_RUN_SETTINGS
 from scripts.lint.memory_test_support import admission_configuration_fixture, admission_policy_fixture, fake_memory_readings, write_pressure_reading
 
 from collections.abc import Callable, Generator
@@ -35,7 +36,7 @@ import unittest
 from typing import cast, override
 from unittest import mock
 
-from scripts.lint.memory_test_support import write_config_fixture, commit_config_fixture
+from scripts.lint.memory_test_support import write_config_fixture, commit_config_fixture, seed_config_fixture_folder
 from scripts.lint import memory_admit as gate
 from scripts.accounts import outage_alerts
 
@@ -48,9 +49,9 @@ from scripts.lib import inotify, test_hang_guard
 from scripts.build_queue.admission_jobs import GateJobNotRecorded, StepJob
 from scripts.lib.user_zone import user_zone
 from scripts.lib.atomic_file import write_text_atomic
-from scripts.message import session_send
+from scripts.message import roster, session_send
 from scripts.production import staff
-from scripts.message.session_send_test_support import forbid_real_sender
+from scripts.message.session_send_test_support import SEND_TIMING_FIXTURES, forbid_real_sender
 from scripts.message.roster import UnitLabels
 from scripts.lint.build_shape import build_shape
 from scripts.build_queue import admission_client as client, admission_protocol as wire, admission_service as service
@@ -64,6 +65,7 @@ from scripts.build_queue.admission_test_support import AdmissionFixture, GIB, In
 
 def setUpModule() -> None:
     forbid_real_sender()
+    _ = cast(object, unittest.enterModuleContext(mock.patch.dict(os.environ, {"USER_ZONE": "UTC"})))
 
 
 class PlacementStatusTests(unittest.TestCase):
@@ -979,9 +981,9 @@ class LocalHoldPlacementTests(unittest.TestCase):
 
     def test_an_empty_probe_schedule_reuses_its_live_worker_for_a_new_request(self) -> None:
         from scripts.build_queue import placement
-        from scripts.build_queue.test_placement import placement_request
+        from scripts.build_queue.test_placement import PlacementFixture, placement_request
 
-        with AdmissionFixture() as fixture:
+        with PlacementFixture() as fixture:
             entered, release, empty_wait, published = (threading.Event() for _ in range(4))
             delays: list[float | None] = []
 
@@ -1095,7 +1097,7 @@ class LocalHoldPlacementTests(unittest.TestCase):
 
         with AdmissionFixture() as fixture:
             settings = fixture.root / "linux.conf"
-            _ = write_config_fixture(settings, "probe_timeout_s=1\n", template="mac_test")
+            _ = write_config_fixture(settings, "probe_timeout_s=1\n", defaults=MAC_RUN_SETTINGS)
             _ = (fixture.root / "build_targets.conf").write_text(
                 "targets=linux\nkind.linux=ssh\nplatform.linux=linux\nsettings.linux=linux.conf\n")
             request = placement_request(fixture)
@@ -1120,7 +1122,7 @@ class LocalHoldPlacementTests(unittest.TestCase):
                 for index in range(12):
                     extra = replace(request, episode=f"extra-{index}")
                     fixture.server.placement_requests[extra.episode] = extra
-                _ = write_config_fixture(settings, "probe_timeout_s=4\n", template="mac_test")
+                _ = write_config_fixture(settings, "probe_timeout_s=4\n", defaults=MAC_RUN_SETTINGS)
                 io_open.reset_mock()
                 builtin_open.reset_mock()
                 read_transport.reset_mock()
@@ -1151,7 +1153,7 @@ class LocalHoldPlacementTests(unittest.TestCase):
             try:
                 for name, timeout in (("long", 10), ("short", 1)):
                     path = fixture.root / (name + ".conf")
-                    _ = write_config_fixture(path, f"probe_timeout_s={timeout}\n", template="mac_test")
+                    _ = write_config_fixture(path, f"probe_timeout_s={timeout}\n", defaults=MAC_RUN_SETTINGS)
                     request = placement_request(fixture)
                     candidate = request.constraints.candidates[0]
                     request = replace(request, episode=name, constraints=replace(request.constraints,
@@ -1185,7 +1187,7 @@ class LocalHoldPlacementTests(unittest.TestCase):
                         subprocess.CompletedProcess(["ssh"], 255, "", "unreachable")):
             with self.subTest(failure=failure), AdmissionFixture() as fixture:
                 settings = fixture.root / "linux.conf"
-                _ = write_config_fixture(settings, "probe_timeout_s=1\nunreachable_backoff_s=30\n", template="mac_test")
+                _ = write_config_fixture(settings, "probe_timeout_s=1\nunreachable_backoff_s=30\n", defaults=MAC_RUN_SETTINGS)
                 target = target_config.SshTarget("linux", "linux", settings)
                 request = placement_request(fixture)
                 destination = replace(request.constraints.candidates[0].destination,
@@ -1197,7 +1199,8 @@ class LocalHoldPlacementTests(unittest.TestCase):
                     "submitting_session": "", "pid": request.owner.pid, "proc_start": request.owner.start_time,
                     "remote_host": destination.host, "what": "busy claim", "worktree": str(fixture.root), "since": "private"}
                 held = claim_state.HeldClaim(destination.scope, paths.run, record)
-                with mock.patch.object(target_config, "read_targets", return_value=(target,)), \
+                with mock.patch.dict(os.environ, {"BUILD_TARGETS_STATE_DIR": str(fixture.root / "targets")}), \
+                     mock.patch.object(target_config, "read_targets", return_value=(target,)), \
                      mock.patch.object(build_targets, "ssh_target_eligibility", return_value=target_config.ExcludedTarget(target, "busy")), \
                      mock.patch.object(claim_state, "state_paths", return_value=paths), \
                      mock.patch.object(claim_state, "read_claims", return_value=(held,)), \
@@ -1223,12 +1226,12 @@ class LocalHoldPlacementTests(unittest.TestCase):
                     self.assertIsInstance(eligibility.read_backoff(time.time(), "linux"), eligibility.ActiveBackoff)
 
     def test_busy_diagnostic_skips_an_older_kept_claim_and_names_the_live_holder(self) -> None:
-        from scripts.build_queue.test_placement import placement_request
+        from scripts.build_queue.test_placement import PlacementFixture, placement_request
         from scripts.build_targets import build_targets, target_config
         from scripts.lib import process_start as process_identity
         from scripts.mac_test import claim_state, mac_test
 
-        with AdmissionFixture() as fixture:
+        with PlacementFixture() as fixture:
             target = target_config.SshTarget("mac", "macos", fixture.root / "mac_test.conf")
             request = placement_request(fixture)
             destination = request.constraints.candidates[0].destination
@@ -1273,12 +1276,12 @@ class LocalHoldPlacementTests(unittest.TestCase):
 
     def test_a_busy_mac_is_a_busy_exclusion_and_a_free_mac_is_allowed(self) -> None:
         from scripts.build_queue import placement
-        from scripts.build_queue.test_placement import placement_request
+        from scripts.build_queue.test_placement import PlacementFixture, placement_request
         from scripts.build_targets import build_targets, target_config
         from scripts.mac_test import claim_state, mac_test
 
         for answer, expected in (("busy", placement.TemporaryExclusion("busy")), ("free", placement.AllowedHost())):
-            with self.subTest(answer=answer), AdmissionFixture() as fixture:
+            with self.subTest(answer=answer), PlacementFixture() as fixture:
                 target = target_config.SshTarget("mac", "macos", fixture.root / "mac_test.conf")
                 request = placement_request(fixture)
                 destination = request.constraints.candidates[0].destination
@@ -1296,10 +1299,10 @@ class LocalHoldPlacementTests(unittest.TestCase):
 
     def test_hanging_or_failing_target_readers_do_not_delay_a_view(self) -> None:
         from scripts.build_queue import placement
-        from scripts.build_queue.test_placement import placement_request, local_candidate
+        from scripts.build_queue.test_placement import PlacementFixture, placement_request, local_candidate
 
         for fails in (False, True):
-            with self.subTest(fails=fails), AdmissionFixture() as fixture:
+            with self.subTest(fails=fails), PlacementFixture() as fixture:
                 entered = {name: threading.Event() for name in ("mac", "natedev")}
                 release = threading.Event()
                 fixture.server.background_local_evidence = True
@@ -3266,6 +3269,7 @@ class ReadingAlertTests(unittest.TestCase):
 
     def test_one_message_per_unreadable_stretch_and_another_after_recovery(self) -> None:
         with AdmissionFixture() as fixture:
+            seed_config_fixture_folder(fixture.root, SEND_TIMING_FIXTURES)
             fixture.clock.epoch = time.time()
             fixture.configure(reading_alert_seconds=10)
             request = fixture.request()
@@ -3309,6 +3313,7 @@ class ReadingAlertTests(unittest.TestCase):
 
     def test_failed_delivery_releases_the_claim_for_retry(self) -> None:
         with AdmissionFixture() as fixture:
+            seed_config_fixture_folder(fixture.root, SEND_TIMING_FIXTURES)
             fixture.configure(reading_alert_seconds=1)
             request = fixture.request()
             (fixture.root / "pressure").unlink()
@@ -3335,6 +3340,7 @@ class ReadingAlertTests(unittest.TestCase):
 
     def test_admission_pass_does_not_wait_for_the_sender(self) -> None:
         with AdmissionFixture() as fixture:
+            seed_config_fixture_folder(fixture.root, SEND_TIMING_FIXTURES)
             fixture.configure(reading_alert_seconds=1)
             request = fixture.request()
             (fixture.root / "pressure").unlink()
@@ -4853,8 +4859,11 @@ class ServiceTests(unittest.TestCase):
                                     current_session=staff.StaffId(f"session-{name}"),
                                     unit_type=staff.UnitDetails("direct")) for name in ("a", "b"))
         members = staff.StaffSnapshot((runner, *units))
-        with AdmissionFixture() as fixture, mock.patch.object(staff, "local_snapshot", return_value=members), \
-                mock.patch.object(staff, "snapshot", return_value=members):
+        with (AdmissionFixture() as fixture,
+              mock.patch.object(staff, "local_snapshot", return_value=members),
+              mock.patch.object(staff, "snapshot", return_value=members),
+              mock.patch.object(roster, "roster", return_value=roster.Roster([], [])),
+              mock.patch.object(roster, "unit_labels_for", return_value={})):
             fixture.free(0)
             fixture.hold_starts()
             older = fixture.request(since=fixture.clock.now() - 1)
@@ -4880,8 +4889,11 @@ class ServiceTests(unittest.TestCase):
         unit = staff.StaffRow(staff.StaffId("unit-id"), "unit", "research", staff.ReportsTo(production.id),
                               current_session=staff.StaffId("unit-session"), unit_type=staff.UnitDetails("direct"))
         members = staff.StaffSnapshot((production, unit))
-        with AdmissionFixture() as fixture, mock.patch.object(staff, "local_snapshot", return_value=members), \
-                mock.patch.object(staff, "snapshot", return_value=members):
+        with (AdmissionFixture() as fixture,
+              mock.patch.object(staff, "local_snapshot", return_value=members),
+              mock.patch.object(staff, "snapshot", return_value=members),
+              mock.patch.object(roster, "roster", return_value=roster.Roster([], [])),
+              mock.patch.object(roster, "unit_labels_for", return_value={})):
             fixture.free(0)
             fixture.hold_starts()
             owners: list[int] = []

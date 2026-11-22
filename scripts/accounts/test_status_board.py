@@ -16,7 +16,7 @@ from uuid import UUID, uuid4
 from zoneinfo import ZoneInfo
 
 from scripts.accounts import accounts, next_moves, role_map, session_state
-from scripts.accounts.home_test_support import scratch_account_home
+from scripts.accounts.home_test_support import ACCOUNT_MODEL_SETTINGS, ACCOUNT_STATUS_SETTINGS, scratch_account_home
 from scripts.agents import remote
 from scripts.herdr import herdr, pane_launch, worker_panes
 from scripts.lib import conf, models_registry, transcripts
@@ -70,8 +70,9 @@ class StatusBoardTests(unittest.TestCase):
     def setUp(self) -> None:
         configuration = Path(self.enterContext(tempfile.TemporaryDirectory()))
         _ = write_config_fixture(configuration / "accounts.conf",
-                                 "next_move_percent=1\nusage_stale_minutes=10\nsession_model_cache_entries=2\n")
-        _ = write_config_fixture(configuration / "statusline.conf")
+                                 "session_model_cache_entries=2\n",
+                                 defaults=ACCOUNT_STATUS_SETTINGS + ACCOUNT_MODEL_SETTINGS)
+        _ = write_config_fixture(configuration / "statusline.conf", defaults="")
         _ = cast(object, self.enterContext(patch.dict(os.environ, {"CONF_DIR": str(configuration)})))
 
     def test_the_table_matches_the_plugin_columns_lines_and_totals(self) -> None:

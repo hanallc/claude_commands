@@ -21,6 +21,7 @@ from collections.abc import Generator
 from contextlib import ExitStack, contextmanager, redirect_stderr, redirect_stdout, suppress
 from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
+from functools import partial
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
@@ -33,18 +34,25 @@ from xml.etree import ElementTree
 from scripts.accounts import accounts
 from scripts.agents.remote import local_machine
 from scripts.lib import conf, file_lock
+from scripts.lib.build_folders_test_support import workspace_folder_settings
 from scripts.lib.process_group import send_process_group
+from scripts.lib.scratch_test_support import write_scratch_settings
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.user_zone import user_zone
 from scripts.message import send_result
 from scripts.review_links.test_page_question import FakeQuestionTransport, question_outcome
 from scripts.production import change_review, change_routing, delivery_state, investigation, session_staff, showrunners, staff, the_list
+from scripts.production.config_test_support import QUESTION_TITLE_SETTINGS
 from scripts.production.update_registration import QuestionStaff
-from scripts.review_links import console, list_page, page_frame, serve, staff_names
+from scripts.review_links import console, for_you, list_page, page_frame, serve, staff_names
 from scripts.review_links import change_browser, change_page, new_item_dialog, page_question, question_record
 from scripts.review_links import review_items, review_page
 from scripts.review_links.test_change_page import BrowserForms
-from scripts.review_links.test_page_frame import assert_status_states
+from scripts.review_links.test_page_frame import assert_status_states, page_status_settings
+from scripts.production.change_review_test_support import (
+    REVIEW_DELIVERY_SETTINGS, REVIEW_DISPLAY_SETTINGS, REVIEW_SERVER_SETTINGS, ROLE_COLOR_CONFIG,
+)
+from scripts.lint.memory_test_support import write_config_fixture
 from scripts.review_links.test_record_table import save_notice_failures
 from scripts.review_links.test_staff_names import without_role_colors
 from scripts.statusline import counts_row, rebuild_row
@@ -348,37 +356,15 @@ class ListPageTests(unittest.TestCase):
         cls._firefox = None
         config = cls.browser_root / "config"
         config.mkdir()
-        _ = (config / "production.conf").write_text("# whole: 20..\nquestion_title_max_chars=100\n")
-        _ = (config / "statusline.conf").write_text(
-            "role.showrunner=#a379fd\nrole.unit-director=#ffaf02\n"
-            + "role.producer=#90fe42\nrole.worker=#ff0404\n")
-        _ = (config / "review_links.conf").write_text(
-            "# whole: 1..20\ndelivery_tries=3\n# range: 0..300\ndelivery_pause_seconds=0\n"
-            + "# whole: 1..20\nfeedback_rows=5\n# whole: 1..20\nreview_words_rows=4\n"
-            + "# whole: 1..1440\nlater_soon_minutes=60\n"
-            + "later_evening=18:00\nlater_evening_until=17:00\nlater_morning=09:00\n"
-            + "later_week_day=Monday\nlater_week_time=09:00\n"
-            + "# range: 5..300\npage_refresh_seconds=15\n# whole: 1..80\nlist_log_max_height_rem=16\n"
-            + "# whole: 1..300\npage_request_timeout_seconds=15\n"
-            + "# whole: 1..5000\ncard_fade_out_ms=450\n# whole: 1..5000\ncard_fade_in_ms=600\n"
-            + "# range: 0.5..60\nframe_retry_seconds=2\n"
-            + "# range: 0.001..\ntailscale_check_seconds=60\n"
-            + "# range: 0.001..\nsnapshot_sweep_seconds=3600\n"
-            + "# range: 0..\nsnapshot_retention_seconds=604800\n"
-            + "# range: 0..365\nchange_image_unclaimed_days=14\n"
-            + "# range: 1..600\nstaff_snapshot_seconds=60\n"
-            + "# range: 0.001..\ncode_check_seconds=5\n"
-            + "# whole: 1..65535\nserver_port=8765\n"
-            + "changes_first_root=natedev\nreview_attachments_root=review-attachments\n")
+        _ = (config / "production.conf").write_text(QUESTION_TITLE_SETTINGS)
+        _ = (config / "statusline.conf").write_text(ROLE_COLOR_CONFIG)
+        _ = write_config_fixture(config / "review_links.conf", "delivery_pause_seconds=0\n",
+                                 defaults=REVIEW_SERVER_SETTINGS + REVIEW_DISPLAY_SETTINGS + REVIEW_DELIVERY_SETTINGS)
         _ = (config / "console.conf").write_text(
             "page.list.label=List\npage.list.icon=list-checks\npage.list.title=The List\n"
             + "page.list.url=python:scripts.review_links.list_page:page_url\n"
             + "page.list.items=python:scripts.review_links.list_page:waiting_updates\n"
-            + "# range: 0.001..86400\nstatus.round_trip_limit_seconds=1\n"
-            + "# range: 0.001..86400\nstatus.render_limit_seconds=1\n"
-            + "# range: 0.001..86400\nstatus.reading_delay_seconds=1\n"
-            + "# range: 0.001..86400\nstatus.list.age_limit_seconds=45\n"
-            + "# range: 0.001..86400\nstatus.review.age_limit_seconds=45\n")
+            + page_status_settings())
 
     @classmethod
     def chrome(cls) -> _Chrome:
@@ -1111,11 +1097,7 @@ if(shot){const image=new Image();image.hidden=true;image.src='/complete';documen
 </script>'''.replace('WAITING_KEY', json.dumps(waiting_key))
         shell = shell.replace('</body>', probe + '</body>')
         proof = os.environ.get("LIST_OVERLAY_SCREENSHOT")
-        _ = (self.root / "config/scratch.conf").write_text(
-            f"visible_root={self.root / 'scratch'}\nholds_file={self.root / 'holds.json'}\n"
-            + "# whole: 1..\ndefault_life_seconds=86400\n# whole: 1..\nrepo_depth=3\n"
-            + "# whole: 1..\nsuffix_length=6\nrepo_skip=target node_modules .git\n"
-            + "# whole: 1..\nrecord_lock_attempts=3\n# whole: 1..\nremoval_remote_timeout_seconds=30\n")
+        write_scratch_settings(self.root / "config", self.root, visible_root=self.root / "scratch")
         for size in ("1440,1000", "600,900", "430,900", *(("screenshot",) if proof else ())):
             with self.subTest(size=size):
                 _ = listing.write_text(original)
@@ -1899,6 +1881,7 @@ document.body.append(result);
         config = self.root / "config"
         changes = self.root / "change-reviews"
         _ = shutil.copytree(self.browser_root / "config", config)
+        _ = write_config_fixture(config / "build_folders.conf", defaults=workspace_folder_settings(self.root))
         _ = (config / "change_review.conf").write_text(
             f"lists_directory={changes}\nreview_links_directory={self.root / 'reviews'}\n")
         environment = {name: value for name, value in os.environ.items() if not name.startswith("GIT_")}
@@ -1911,6 +1894,8 @@ document.body.append(result);
         _ = self.enterContext(patch.object(the_list, "now", return_value=NOW))
         _ = self.enterContext(patch.object(time, "time", return_value=NOW.timestamp()))
         _ = self.enterContext(patch.object(rebuild_row, "read", return_value=rebuild_row.RebuildAnswer((), False)))
+        _ = self.enterContext(patch.object(for_you, "read",
+                                           side_effect=partial(for_you.read, config / "statusline.conf")))
         _ = change_page.console_folder(self.root / "reviews")
 
     def add(self, title: str, state: the_list.ItemState = the_list.ItemState.WORKING, *,

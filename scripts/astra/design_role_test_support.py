@@ -19,6 +19,7 @@ from scripts.production.staff_test_support import fixture_worker, unit_membershi
 from scripts.astra import design_roles
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.direct.recorder_fixture import invoke_recorder
+from scripts.lint.memory_test_support import write_config_fixture
 
 _NOT_OPENED = design_roles.RoleNotOpened()
 
@@ -74,7 +75,7 @@ class HeldRolePaneFixture:
         self.router.recorder_commands = self.recorder_commands
         write_text_atomic(self.root / "design.md", "# Private design\n")
         config = Path(os.environ["CONF_DIR"]) / "design_roles.conf"
-        write_text_atomic(config, "[ownership]\nhost=natedev\n\n[roles]\nnew_open=true\n")
+        _ = write_config_fixture(config, defaults="[ownership]\nhost=natedev\n\n[roles]\nnew_open=true\n")
         _ = cast(object, case.enterContext(patch.dict(os.environ, {
             "DESIGN_ROLES_STATE": str(self.root / "designs"),
             "DESIGN_OWNERSHIP_STATE": str(self.root / "ownership"),

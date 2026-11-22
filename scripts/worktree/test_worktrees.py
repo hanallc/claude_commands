@@ -31,8 +31,12 @@ from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.buildlog.store import host_name
 from scripts.agents import remote
 from scripts.lib import build_folders, build_slots, cargo_output, conf, git_exclude, git_files, scratch
-from scripts.lint import folder_audit, sweep, tmp_sweep
+from scripts.lib.build_folders_test_support import workspace_folder_settings
+from scripts.agents.test_support import MACHINE_SETTINGS
+from scripts.lib.scratch_test_support import write_scratch_settings
+from scripts.lint.config_test_support import SWEEP_SCAN_SETTINGS
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
+from scripts.lint import folder_audit, sweep, tmp_sweep
 from scripts.production import staff
 from scripts.worktree import worktree_links, worktrees
 
@@ -125,6 +129,7 @@ class EndResult(TypedDict):
 
 
 class WorktreeLifecycleTests(unittest.TestCase):
+    maxDiff: int | None = None
     root: Path = Path()
     home: Path = Path()
     origin: Path = Path()
@@ -145,7 +150,7 @@ class WorktreeLifecycleTests(unittest.TestCase):
         _ = self.enterContext(patch.object(tmp_sweep, "PROC_DIR", str(self.proc)))
         self.home = self.root / "home"
         self.home.mkdir()
-        _ = copy_helpers(self.home, *COPY_HELPERS, "scripts/worktree", "config")
+        _ = copy_helpers(self.home, *COPY_HELPERS, "scripts/worktree")
         self.origin = self.root / "origin.git"
         self.repository = self.root / "clone"
         self.merge_tree = self.root / "integration"
@@ -156,8 +161,13 @@ class WorktreeLifecycleTests(unittest.TestCase):
         _ = config.write_text("# range: 0.001..\nOPERATION_LOCK_SECONDS=5\n"
                               + "# range: 0.001..\nREMOTE_SECONDS=5\n")
         staff_file = self.root / "staff.json"
+        write_scratch_settings(self.root / "settings", self.root)
         self.environment = {
-            **config_environment(self.root / "settings"),
+            **config_environment(self.root / "settings", fixtures={
+                "build_folders.conf": workspace_folder_settings(self.root),
+                "machines.conf": MACHINE_SETTINGS,
+                "lint.conf": SWEEP_SCAN_SETTINGS,
+            }),
             "HOME": str(self.home), "XDG_CONFIG_HOME": str(self.home / ".config"), "PATH": os.environ.get("PATH", os.defpath),
             "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8",
             "WORKTREES_STATE_DIR": str(self.state),

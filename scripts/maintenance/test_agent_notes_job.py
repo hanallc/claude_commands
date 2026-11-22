@@ -22,6 +22,29 @@ from scripts.maintenance.settings import Part, Schedule, settings
 from scripts.production.staff_test_support import isolated_staff_file, unit_membership
 
 
+def job_fixture_settings() -> str:
+    parts: list[str] = []
+    for part in Part:
+        timeout = 60 if part is Part.NOTES else 45
+        parts.append(f"[parts.{part.value}]\ninterval_seconds = 120\ntimeout_seconds = {timeout}\n")
+    return """\
+[job]
+interval_seconds = 120
+timeout_seconds = 90
+
+[vault]
+git_seconds = 10
+named_paths = 3
+
+[watchdog]
+dispatch_seconds = 2
+recovery_seconds = 30
+pass_dispatch_seconds = 12
+result_seconds = 60
+
+""" + "\n".join(parts)
+
+
 class JobTests(unittest.TestCase):
     root: Path = Path()
     config: Path = Path()
@@ -33,7 +56,7 @@ class JobTests(unittest.TestCase):
         self.root = Path(temporary.name)
         self.config = self.root / "job.toml"
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
-        _ = self.config.write_text((job.ROOT / "config/agent_notes.toml").read_text())
+        _ = self.config.write_text(job_fixture_settings())
         self.enterContext(patch.dict(os.environ, {
             "XDG_STATE_HOME": str(self.root), "AGENT_NOTES_JOB_CONFIG": str(self.config)}))
 

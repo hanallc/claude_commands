@@ -14,9 +14,11 @@ from pathlib import Path
 from scripts.lib.transcript_test_support import compressed_copy
 from typing import cast, override
 
+from scripts.aws_target.ledger_test_support import install_cost_settings, write_gate_config
 from scripts.buildlog import launches
 from scripts.buildlog.test_index import Record, point_root_at
 from scripts.lib import test_hang_guard
+from scripts.lint.memory_test_support import write_config_fixture
 
 CLI = Path(__file__).with_name("cli.py")
 ENDED = "2026-10-02T16:40:18+00:00"
@@ -61,6 +63,16 @@ def result_line(session: str, target: str, worktree: Path, *, duration_ms: int =
     return json.dumps(line, separators=(",", ":")) + "\n"
 
 
+def launch_report_settings(root: Path) -> dict[str, str]:
+    config = root / "config"
+    account = config / "aws_target.conf"
+    install_cost_settings(account)
+    write_gate_config(config / "cloud_gate.conf")
+    _ = write_config_fixture(config / "build_targets.conf", defaults=(
+        "targets=natedev\nkind.natedev=local\nplatform.natedev=linux\nsync.hosts.natedev=natedev\n"))
+    return {"AWS_TARGET_CONFIG": str(account), "BUILD_TARGETS_STATE_DIR": str(root / "targets")}
+
+
 class LaunchTests(unittest.TestCase):
     root: Path  # pyright: ignore[reportUninitializedInstanceVariable]
     transcript: Path  # pyright: ignore[reportUninitializedInstanceVariable]
@@ -71,6 +83,7 @@ class LaunchTests(unittest.TestCase):
     def setUp(self) -> None:
         base = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.root = base / "buildlog"
+        settings = launch_report_settings(base)
         point_root_at(self, self.root)
         transcripts = base / "transcripts"
         previous_transcripts = os.environ.get("BUILDLOG_TRANSCRIPTS")
@@ -99,6 +112,7 @@ class LaunchTests(unittest.TestCase):
         (self.worktree / "crates" / "app").mkdir(parents=True)
         self.environment = {
             **os.environ,
+            **settings,
             "BUILDLOG_DIR": str(self.root),
             "BUILDLOG_TRANSCRIPTS": str(transcripts),
         }

@@ -21,8 +21,9 @@ from scripts.lib import models_registry
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.message import sessions
 from scripts.production.staff_test_support import (
-    build_fixture_sessions, fixture_runtime_id, isolated_staff_file, source_environment, unit_membership,
+    build_fixture_sessions, fixture_runtime_id, isolated_staff_file, source_environment, unit_membership, write_staff_settings,
 )
+from scripts.lint.memory_test_support import config_environment, write_config_fixture
 from scripts.accounts import accounts
 from scripts.lib.nix_env_test_support import NixFixture
 from scripts.whoami.account_test_support import create_claude_account, write_codex_auth
@@ -169,10 +170,11 @@ class ClaudeLauncherTests(unittest.TestCase):
         self.home = Path(self.enterContext(tempfile.TemporaryDirectory()))
         notes = self.home / "notes"
         notes.mkdir()
+        config = write_staff_settings(self.home / "staff.conf", producers=self.home / "producers")
         _ = cast(object, self.enterContext(patch.dict(os.environ, {"HOME": str(self.home), "PATH": os.environ.get("PATH", os.defpath),
             "AGENT_NOTES_DIR": str(notes), "STAFF_FILE": str(self.home / "staff.json"),
-            "STAFF_CONFIG": str(SCRIPTS.parent / "config/staff.conf"),
-            "CONF_DIR": str(SCRIPTS.parent / "config"),
+            **config_environment(self.home / "config"),
+            "STAFF_CONFIG": str(config),
             **source_environment(self.home / "sources")}, clear=True)))
         _ = copy_helpers(self.home)
         _ = (self.home / ".claude.json").write_text("{}")
@@ -308,6 +310,8 @@ class ClaudeLauncherTests(unittest.TestCase):
                 self.assertEqual(json.loads(output.splitlines()[0]), {"config": "", "memory": "", "token": ""})
 
     def test_background_agent_selects_the_caller_or_showrunners_before_launching(self) -> None:
+        _ = write_config_fixture(Path(self.environment["CONF_DIR"]) / "direct.conf",
+                                 defaults="# whole: 1..300\nCLAUDE_WORKER_REGISTER_WAIT_SECS=30\n")
         prompt = self.home / "background-prompt"
         _ = prompt.write_text("fixture task")
         captured = self.home / "background-environment.json"
@@ -328,7 +332,7 @@ class ClaudeLauncherTests(unittest.TestCase):
                 owner = unit_membership("fixture", "account-selection")
                 registry = Path(private_env["NOTIFIER_SESSIONS_DIR"])
                 environment = {**self.environment, **private_env, "BACKGROUND_LAUNCH_FILE": str(captured),
-                               "CODEX_THREAD_ID": owner.id, "NOTIFIER_SESSIONS_DIR": str(registry),
+                               "CODEX_THREAD_ID": owner.current_session, "NOTIFIER_SESSIONS_DIR": str(registry),
                                "FIXTURE_REGISTRY_PATH": str(registry / f"{os.getpid()}.json"),
                                "FIXTURE_REGISTRY_RECORD": json.dumps(record), "FIXTURE_NATIVE_ID": native,
                                "CLAUDE_WORKER_SEND_SCRIPT": str(sender)}
@@ -337,8 +341,9 @@ class ClaudeLauncherTests(unittest.TestCase):
                     environment["CLAUDE_CONFIG_DIR"] = str(accounts.account_dir(caller))
                 command = test_claude_worker.worker_command("fixture-worker", private / "run", self.home, prompt,
                                          self.home / "summary", self.home / "log")
-                _ = subprocess.run(command, capture_output=True, text=True, check=True,
-                                   env=environment, cwd=self.home)
+                result = subprocess.run(command, capture_output=True, text=True, check=False,
+                                        env=environment, cwd=self.home)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertEqual(json.loads(captured.read_text()), {
                     "CLAUDE_CONFIG_DIR": str(accounts.account_dir(expected)),
                     "CLAUDE_CODE_REMOTE_MEMORY_DIR": str(self.home / ".claude")})

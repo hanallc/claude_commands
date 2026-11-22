@@ -13,10 +13,13 @@ import tempfile
 import unittest
 from unittest import mock
 
+from scripts.agents import remote
 from scripts.copies import copies
 from scripts.lib import scratch
 from scripts.lint import sweep as folder_sweep
 from scripts.lib.build_slots_test_support import private_slot_config
+from scripts.lint.memory_test_support import seed_config_fixture_folder
+from scripts.message.session_send_test_support import SEND_TIMING_FIXTURES
 from scripts.production import gate, staff
 from scripts.production.gate_modules import GateRefused
 
@@ -37,8 +40,11 @@ class NightlySlotSweepTests(unittest.TestCase):
             production = staff.StaffId("20b0427d-945b-4c40-bb24-a6bec83dd648")
             merge = staff.StaffId("11111111-0000-4000-8000-111111111111")
             other_merge = staff.StaffId("22222222-0000-4000-8000-222222222222")
+            document = Path(checkout) / "production.md"
+            _ = document.write_text("# Fixture production\n")
             owner = staff.StaffRow(production, "showrunner", "sdlc", staff.StaffRoot(),
-                                   current_session=production)
+                                   current_session=production,
+                                   doc=staff.LiveDoc(remote.local_machine(), document))
             direct = staff.StaffRow(staff.StaffId("direct"), "unit", "fixture-direct", staff.ReportsTo(production),
                                     current_session=staff.StaffId("direct"), unit_type=staff.UnitDetails("direct"))
             unit = staff.StaffRow(merge, "unit", "fixture-merge", staff.ReportsTo(production),
@@ -77,6 +83,7 @@ class NightlySlotSweepTests(unittest.TestCase):
         for status in (0, 1, 75):
             with self.subTest(status=status), tempfile.TemporaryDirectory() as temporary:
                 config = private_slot_config(Path(temporary), repository="fixture")
+                seed_config_fixture_folder(config.settings.parent, SEND_TIMING_FIXTURES)
                 events: list[str] = []
                 notices: list[str] = []
 
@@ -124,6 +131,7 @@ class NightlySlotSweepTests(unittest.TestCase):
         for status in (0, 1, 75):
             with self.subTest(status=status), tempfile.TemporaryDirectory() as temporary:
                 config = private_slot_config(Path(temporary), repository="fixture")
+                seed_config_fixture_folder(config.settings.parent, SEND_TIMING_FIXTURES)
                 notices: list[str] = []
 
                 def run(argv: Sequence[str], **options: object) -> subprocess.CompletedProcess[str]:
@@ -153,6 +161,7 @@ class NightlySlotSweepTests(unittest.TestCase):
     def test_gate_failure_still_sweeps_both_pools(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             config = private_slot_config(Path(temporary), repository="fixture")
+            seed_config_fixture_folder(config.settings.parent, SEND_TIMING_FIXTURES)
             events: list[str] = []
 
             def nightly(args: gate.GateArguments) -> int:

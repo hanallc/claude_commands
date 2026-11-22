@@ -12,6 +12,7 @@ from typing import cast, override
 from unittest import mock
 
 from scripts.accounts import accounts, login_sittings as sittings
+from scripts.accounts.home_test_support import ACCOUNT_LOGIN_SITTING_SETTINGS
 from scripts.lib import conf
 from scripts.maintenance.schedule import ScheduleBusy, locked_history
 from scripts.notify import push_texts, review
@@ -38,13 +39,7 @@ class LoginSittingsTests(unittest.TestCase):
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
             "HOME": str(self.root), "USER_ZONE": "America/New_York"})))
         self.config = self.root / "accounts.conf"
-        _ = self.config.write_text(
-            "login_sitting_machine=natedev\nlogin_sitting_first=2026-11-17T10:00:00-05:00\n"
-            + "# whole: 1..\nlogin_sitting_interval_days=7\n"
-            + "# whole: 1..\nlogin_sitting_window_days=10\n"
-            + "# whole: 1..\nlogin_safety_margin_days=3\n"
-            + "# whole: 1..\nlogin_peer_read_minutes=60\n"
-            + "# whole: 1..\nlogin_peer_read_timeout_seconds=30\n", encoding="utf-8")
+        _ = self.config.write_text(ACCOUNT_LOGIN_SITTING_SETTINGS, encoding="utf-8")
 
     def end(self, label: str, days: int, machine: str = "natedev") -> sittings.LoginEnd:
         return sittings.LoginEnd(machine, label, self.now + timedelta(days=days))

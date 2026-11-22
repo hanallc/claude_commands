@@ -22,6 +22,7 @@ from scripts.accounts.move_test_support import write_claude_move_credentials
 from scripts.accounts import accounts, next_moves, refusal_watch, refusals, role_map
 from scripts.accounts.nix_env_fake import fake_nix_loader, imports_with_nix_loader
 from scripts.agents.test_support import write_machine_config
+from scripts.lint.memory_test_support import write_config_fixture
 from scripts.whoami import agent_accounts
 
 send_role_map_command = role_map.ssh_role_map
@@ -60,6 +61,7 @@ class RoleMapTests(unittest.TestCase):
             "USER_ZONE": "America/New_York", "PATH": os.defpath,
         }, clear=True)))
         write_machine_config(Path(os.environ["CONF_DIR"]))
+        _ = write_config_fixture(Path(os.environ["CONF_DIR"]) / "statusline.conf")
         _ = self.enterContext(patch.object(role_map, "ROLE_MAP_HOST", "natedev"))
         _ = self.enterContext(patch.object(socket, "gethostname", return_value="macbook"))
         _ = self.enterContext(patch.object(role_map, "_login_home", return_value=role_map.LoginHome(self.home)))

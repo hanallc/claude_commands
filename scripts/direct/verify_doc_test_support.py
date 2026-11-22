@@ -1,7 +1,9 @@
 """Judge real Git trees with fake Cargo, without changing the caller's index."""
 from __future__ import annotations
 
-from scripts.lib.helper_tree_test_support import VERIFY_HELPERS, copy_helpers, verify_test_environment
+from scripts.lib.helper_tree_test_support import (
+    VERIFY_HELPERS, VERIFY_RESULT_SETTINGS, VERIFY_TOKEN_SETTINGS, copy_helpers, verify_test_environment,
+)
 
 from scripts.build_queue.admission_test_support import caller_admission, caller_provider_controls, private_caller_provider
 from scripts.build_queue import placement
@@ -12,6 +14,10 @@ from scripts.lib import conf
 from scripts.lib.build_slots_test_support import private_slot_config
 from unittest import mock
 
+from scripts.mac_test.config_test_support import MAC_RUN_SETTINGS
+from scripts.agents.test_support import write_machine_config
+from scripts.lib.checkout_test_support import seed_test_configuration
+from scripts.lint.config_test_support import LINT_TOOL_SETTINGS
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
 
 import json
@@ -139,10 +145,12 @@ class VerifyDocFixture(unittest.TestCase):
         self.repo.mkdir()
         home = self.root / "home"
         _ = copy_helpers(home, *VERIFY_HELPERS)
+        seed_test_configuration(home / ".claude", {"build_steps.conf": "doc=doc\n"})
+        write_machine_config(self.root)
         self.records = home / ".local/state/verify/doc_pass"
         self.events = self.root / "cargo-events.jsonl"
         self.config = self.root / "lint.conf"
-        _ = write_config_fixture(self.config, "doc=on\nsweep=off\n")
+        _ = write_config_fixture(self.config, "doc=on\nsweep=off\n", defaults=LINT_TOOL_SETTINGS)
         tools = self.root / "bin"
         tools.mkdir()
         self.executable(tools / "cargo", CARGO_STUB)
@@ -172,6 +180,8 @@ class VerifyDocFixture(unittest.TestCase):
                              "manifest_path": str(member / "Cargo.toml"),
                              "targets": [{"name": name, "kind": ["lib"], "test": True,
                                           "src_path": str(source), "required-features": []}]})
+        _ = write_config_fixture(self.root / "direct.conf",
+                                 defaults=VERIFY_TOKEN_SETTINGS + VERIFY_RESULT_SETTINGS)
         self.environment = verify_test_environment()
         _ = self.environment.pop("PYTHONDONTWRITEBYTECODE", None)
         self.environment.update({
@@ -240,11 +250,11 @@ class VerifyDocFixture(unittest.TestCase):
         holders = Path(self.environment["BUILD_HOLD_DIR"])
         holders.mkdir()
         _ = (holders / "other").write_text("private hold")
-        settings = self.root / "mac.conf"
-        _ = write_config_fixture(settings, f"offload=on\nlinux_only.{self.repo.name}=\n", template="mac_test")
+        settings = self.root / "mac_test.conf"
+        _ = write_config_fixture(settings, f"offload=on\nlinux_only.{self.repo.name}=\n", defaults=MAC_RUN_SETTINGS)
         _ = (self.root / "build_targets.conf").write_text(
             "targets=natedev,mac\nkind.natedev=local\nplatform.natedev=linux\n"
-            + "kind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac.conf\n")
+            + "kind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n")
         self.environment["MAC_TEST_CONFIG"] = str(settings)
         self.environment["CONF_DIR"] = str(Path(settings).parent)
         self.environment["MAC_IDLE_STATE_DIR"] = str(self.root / "mac-idle")

@@ -92,7 +92,9 @@ with open(os.environ["TEST_SENT"], "a") as handle:
 from scripts.production.staff_test_support import fixture_member, StaffTestCase
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.git_test_support import write_fixture_git_config
-from scripts.lint.memory_test_support import config_environment
+from scripts.lint.memory_test_support import config_environment, write_config_fixture
+from scripts.lib.main_push_lock_test_support import write_push_lock_settings
+from scripts.production.merge_checkpoint_test_support import checkpoint_pull_settings
 
 class LifecycleFixture(unittest.TestCase):
     staff: StaffTestCase = StaffTestCase()
@@ -203,6 +205,8 @@ class LifecycleFixture(unittest.TestCase):
                     "SHOWRUNNERS_SEND": str(self.root / "send.py"), "TEST_SENT": str(self.state / "sent.jsonl")}
         self.env.update(fake_unit_host.environment(self.root))
         self.env.update(config_environment(self.root / "config"))
+        write_push_lock_settings(self.root / "config")
+        _ = write_config_fixture(self.root / "config/merge_checkpoint.conf", defaults=checkpoint_pull_settings())
         self.write(self.root / "send.py", SEND)
         self.checkout.mkdir()
         _ = self.git("init", "--bare", str(self.origin), cwd=self.root)

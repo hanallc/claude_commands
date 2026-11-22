@@ -17,7 +17,7 @@ from scripts.buildlog.store import host_name
 from scripts.copies import copies
 from scripts.lib import build_folders, build_slots, conf, copy_record, nix_env, scratch
 from scripts.lib.build_slots_test_support import private_slot_config
-from scripts.lib.nix_env_test_support import HELPER, ROOT, NixFixture
+from scripts.lib.nix_env_test_support import HELPER, ROOT, NIX_NUMBER_SETTINGS, NIX_TEXT_SETTINGS, NixFixture
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lint.memory_test_support import write_config_fixture
 
@@ -139,7 +139,7 @@ class EnsureTests(NixFixture):
         _ = self.envrc(self.work)
         timeout = 7
         settings = Path(self.env["CONF_DIR"]) / "nix_env.conf"
-        _ = write_config_fixture(settings, f"command_timeout_seconds={timeout}\n")
+        _ = write_config_fixture(settings, f"command_timeout_seconds={timeout}\n", defaults="")
         with patch.object(subprocess, "run", side_effect=subprocess.TimeoutExpired(
             "direnv", timeout, stderr=b"progress\ntimed out detail\n"
         )) as run:
@@ -647,7 +647,7 @@ class NixConfigTests(NixFixture):
         _ = self.envrc(self.work)
         settings = Path(self.env["CONF_DIR"]) / "nix_env.conf"
         for timeout in (9, 2):
-            _ = write_config_fixture(settings, f"command_timeout_seconds={timeout}\n")
+            _ = write_config_fixture(settings, f"command_timeout_seconds={timeout}\n", defaults="")
             with self.subTest(timeout=timeout), patch.object(
                 subprocess, "run", side_effect=subprocess.TimeoutExpired("direnv", timeout)
             ) as run:
@@ -655,14 +655,13 @@ class NixConfigTests(NixFixture):
                                  nix_env.Refused(f"nix_env: {self.work}: direnv timed out after {timeout} s"))
                 self.assertEqual(run.call_args.kwargs["timeout"], timeout)
 
-    def test_shipped_config_supplies_the_settings_used_by_nix_and_heal(self) -> None:
-        path = ROOT / "config/nix_env.conf"
-        settings = conf.read(path)
-        values = settings.values()
-        for key in ("trusted_home_folders", "trusted_home_prefix", "heal_state_directory", "session_directory_glob"):
+    def test_fixed_config_supplies_the_settings_used_by_nix_and_heal(self) -> None:
+        self.assertEqual(NIX_TEXT_SETTINGS.keys() | NIX_NUMBER_SETTINGS.keys(),
+                         conf.shipped_keys(ROOT / "config/nix_env.conf"))
+        settings = conf.read("nix_env")
+        for key, value in NIX_TEXT_SETTINGS.items():
             with self.subTest(key=key):
-                self.assertEqual(settings.text(key), values[key])
-        for key in ("command_timeout_seconds", "restart_interval_seconds", "relaunch_launch_seconds",
-                    "relaunch_confirmation_seconds", "alert_timeout_seconds"):
+                self.assertEqual(settings.text(key), value)
+        for key, (value, _limit) in NIX_NUMBER_SETTINGS.items():
             with self.subTest(key=key):
-                self.assertEqual(settings.number(key), float(values[key]))
+                self.assertEqual(settings.number(key), value)

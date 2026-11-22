@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 from scripts.build_queue import execution_identity
-from scripts.lib.checkout_test_support import copy_runtime, write_python_tool
+from scripts.lib.checkout_test_support import copy_runtime, seed_test_configuration, write_python_tool
+from scripts.lib.helper_tree_test_support import VERIFY_RESULT_SETTINGS
 
 from collections.abc import Callable, Sequence
 from datetime import datetime, timezone
@@ -19,15 +20,18 @@ import unittest
 import uuid
 from pathlib import Path
 from typing import ClassVar, Literal, NotRequired, TypedDict, cast, override
+from unittest import mock
 
 from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.lib import process_start as process_identity
 from scripts.copies.copies_test_support import copies_environment
 
 
+from scripts.build_targets.target_test_support import mac_target_settings
+from scripts.mac_test.config_test_support import MAC_RUN_SETTINGS
 from scripts.lint.memory_test_support import write_config_fixture, config_environment
 
-from scripts.mac_test import eligibility, offload, mac_test
+from scripts.mac_test import eligibility, offload, mac_test, nextest_log
 from scripts.buildlog import treekey
 from scripts.buildlog import sync as buildlog_sync
 from scripts.mac_test.offload_test_commands import COMMAND_STUB, write_shell
@@ -48,14 +52,41 @@ FILTER = "package(hana) & (test(a) | test(b))"
 WORKING_TREE_SOURCE = offload.RepositoryWorkingTree()
 
 
+def mac_queue_settings(command: Sequence[str]) -> str:
+    """Set the fixture command and the time allowed to stop it."""
+    return f"admission_client_command={shlex.join(command)}\n# range: 5e-324..\nterminate_grace_seconds=3\n"
+
+
+def nextest_settings(tail_bytes: str = "65536", summary_bytes: str = "1024") -> str:
+    return f"""\
+# whole: 1..
+{nextest_log.TAIL_BYTES}={tail_bytes}
+# whole: 1..1024
+{nextest_log.SUMMARY_BYTES}={summary_bytes}
+# whole: 1..
+{nextest_log.RETENTION_DAYS}=7
+"""
+
+
+def write_nextest_settings(path: Path) -> Path:
+    _ = write_config_fixture(path, defaults=nextest_settings())
+    return path
+
+
+OFFLOAD_ENTRY = """\
+import sys
+from pathlib import Path
+from runpy import run_path
+from scripts.mac_test import nextest_log
+
+nextest_log.DEFAULT_SETTINGS = Path(sys.argv.pop(1))
+script = sys.argv.pop(1)
+run_path(script, run_name="__main__")
+"""
+
+
 def write_mac_target_registry(directory: Path, settings_name: str) -> None:
-    _ = (directory / "build_targets.conf").write_text(
-        "targets=mac\n"
-        + "kind.mac=ssh\n"
-        + "platform.mac=macos\n"
-        + f"settings.mac={settings_name}\n",
-        encoding="utf-8",
-    )
+    _ = (directory / "build_targets.conf").write_text(mac_target_settings(settings_name, local=False), encoding="utf-8")
 
 
 def assigned_adapter_main() -> int:
@@ -271,6 +302,7 @@ class OffloadCommandFixture(unittest.TestCase):
         self.stub_directory: Path = Path()
         self.bin_directory: Path = Path()
         self.config_path: Path = Path()
+        self.nextest_defaults: Path = Path()
         self.result_path: Path = Path()
         self.environment: dict[str, str] = {}
         self.config: dict[str, str] = {}
@@ -300,6 +332,7 @@ class OffloadCommandFixture(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.use_nextest_settings()
         self.repository = self.root / "hana"
         self.unknown_directory = self.root / "not-a-repository"
         self.state_directory = self.root / "state"
@@ -374,9 +407,9 @@ class OffloadCommandFixture(unittest.TestCase):
             descriptor = os.open(gate, os.O_RDWR | os.O_NONBLOCK)
             self.addCleanup(os.close, descriptor)
         self.sync_config()
+        _ = write_config_fixture(self.root / "direct.conf", defaults=VERIFY_RESULT_SETTINGS)
         self.sync_fixture()
         write_mac_target_registry(self.root, self.config_path.name)
-        _ = write_config_fixture(self.root / "config/copies.conf", "owner.verify=verify\n")
         self.environment = {
             **os.environ, **interpreter_cache_environment(self.root / "cache"),
             **config_environment(self.root),
@@ -397,6 +430,10 @@ class OffloadCommandFixture(unittest.TestCase):
         }
         _ = self.environment.pop("PYTHONDONTWRITEBYTECODE", None)
         self.start_admission()
+
+    def use_nextest_settings(self) -> None:
+        self.nextest_defaults = write_nextest_settings(self.root / "nextest-defaults.conf")
+        _ = cast(object, self.enterContext(mock.patch.object(nextest_log, "DEFAULT_SETTINGS", self.nextest_defaults)))
 
     def start_admission(self) -> None:
         admission = caller_admission(self, self.root, self.environment)
@@ -461,7 +498,7 @@ class OffloadCommandFixture(unittest.TestCase):
 
     def sync_config(self) -> None:
         ready = self.config_path.with_suffix(".ready")
-        _ = write_config_fixture(ready, "".join(f"{name}={value}\n" for name, value in self.config.items()), template="mac_test")
+        _ = write_config_fixture(ready, "".join(f"{name}={value}\n" for name, value in self.config.items()), defaults=MAC_RUN_SETTINGS)
         lines = ready.read_text().splitlines()
         _ = ready.write_text("\n".join(line for line in lines
             if not line.startswith("linux_only.") or line.partition("=")[0] in self.config) + "\n")
@@ -535,11 +572,14 @@ class OffloadCommandFixture(unittest.TestCase):
                                   environment_lock=caller_admission(self, self.root, self.environment).loop_access)
             entry = self.root / "assigned-adapter.py"
             _ = entry.write_text(
-                f"import sys\nsys.path.insert(0, {str(SCRIPT.resolve().parents[2])!r})\n"
+                "from pathlib import Path\nfrom scripts.mac_test import nextest_log\n"
                 + "from scripts.mac_test.offload_test_support import assigned_adapter_main\n"
+                + f"nextest_log.DEFAULT_SETTINGS = Path({str(self.nextest_defaults)!r})\n"
                 + "raise SystemExit(assigned_adapter_main())\n")
             arguments[1] = str(entry)
         if subprocess_cli:
+            if not assigned_adapter:
+                arguments[1:1] = ["-c", OFFLOAD_ENTRY, str(self.nextest_defaults)]
             return subprocess.run(arguments, cwd=self.root, env=self.environment, stdout=subprocess.PIPE,
                                   stderr=subprocess.PIPE if separate_stderr else subprocess.STDOUT,
                                   text=True, check=False, timeout=timeout)
@@ -561,7 +601,10 @@ class OffloadCommandFixture(unittest.TestCase):
         program = r'''
 import subprocess
 import sys
-from scripts.mac_test import eligibility, offload
+from pathlib import Path
+from scripts.mac_test import eligibility, nextest_log, offload
+
+nextest_log.DEFAULT_SETTINGS = Path(sys.argv.pop(1))
 
 clock = [100.0]
 offload.time.monotonic = lambda: clock[0]
@@ -600,7 +643,7 @@ subprocess.run = run
 raise SystemExit(offload.main())
 '''
         return subprocess.run(
-            [str(SCRIPT.resolve().parents[1] / "lib/py"), "-c", program, "run",
+            [str(SCRIPT.resolve().parents[1] / "lib/py"), "-c", program, str(self.nextest_defaults), "run",
              "--repo-root", str(self.repository), "--package", "hana",
              "--call-id", "call-17", "--result", str(self.result_path), "--"],
             cwd=Path(__file__).resolve().parents[2], env=self.environment, stdout=subprocess.PIPE,
@@ -637,6 +680,8 @@ raise SystemExit(offload.main())
             "--",
             *nextest_arguments,
         ]
+        if script == SCRIPT:
+            arguments[1:1] = ["-c", OFFLOAD_ENTRY, str(self.nextest_defaults)]
         if ignore_interrupt:
             arguments = [
                 "/bin/sh",
@@ -663,6 +708,7 @@ raise SystemExit(offload.main())
             with tempfile.TemporaryDirectory(prefix="claim-runner-", dir=tools) as directory:
                 staging = Path(directory) / "checkout"
                 copy_runtime(staging)
+                seed_test_configuration(staging, {"mac_test.conf": nextest_settings()})
                 self.write_executable(staging / "scripts/mac_test/mac_test.py", CLAIM_STUB)
                 _ = staging.rename(checkout)
         return checkout / "scripts/mac_test/offload.py"

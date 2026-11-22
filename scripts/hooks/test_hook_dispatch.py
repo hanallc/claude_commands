@@ -11,6 +11,8 @@ import textwrap
 import unittest
 from collections.abc import Sequence
 from pathlib import Path
+from scripts.hooks.test_stop_context_deferral import CONTEXT_DEFERRAL_FIXTURE
+from scripts.lint.memory_test_support import write_config_fixture
 from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.production import staff
 from scripts.production.staff_test_support import fixture_runtime_id
@@ -165,8 +167,7 @@ class IsolatedHookTests(unittest.TestCase):
 class RealHookEquivalenceTests(IsolatedHookTests):
     def test_context_deferral_block_reaches_the_caller(self) -> None:
         config = self.root / "config"
-        config.mkdir()
-        _ = (config / "context_deferral.conf").write_bytes((ROOT / "config/context_deferral.conf").read_bytes())
+        _ = write_config_fixture(config / "context_deferral.conf", defaults=CONTEXT_DEFERRAL_FIXTURE)
         self.environment["CONF_DIR"] = str(config)
         result = self.run_python([str(DISPATCH), "stop"], {
             "last_assistant_message": "I will do it after the context reset.",

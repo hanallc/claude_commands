@@ -13,6 +13,7 @@ import unittest
 from unittest import mock
 
 from scripts.buildlog import index
+from scripts.buildlog.index_test_support import BUILDLOG_INDEX_SETTINGS
 from scripts.buildlog import report
 from scripts.buildlog.test_index import Record, STAMP, call, encode, local_day, point_root_at, step
 
@@ -26,7 +27,7 @@ class TargetReportTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory())) / "buildlog"
-        _ = write_config_fixture(self.root.parent / "buildlog.conf")
+        _ = write_config_fixture(self.root.parent / "buildlog.conf", defaults=BUILDLOG_INDEX_SETTINGS)
         self.registry = self.root.parent / "build_targets.conf"
         _ = self.registry.write_text(
             "targets=mac,natedev\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac.conf\n"

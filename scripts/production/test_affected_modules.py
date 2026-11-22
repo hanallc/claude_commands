@@ -14,6 +14,8 @@ from typing import cast, override
 from unittest import mock
 
 from scripts.production import affected_modules as affected
+from scripts.buildlog.index_test_support import BUILDLOG_INDEX_SETTINGS
+from scripts.lint.memory_test_support import write_config_fixture
 from scripts.test_times.gate_record_test_support import gate_run
 
 
@@ -34,7 +36,8 @@ class AffectedModulesTests(unittest.TestCase):
         self.write(".git/test-config/gate.conf", "# text:\nlanding_branches=main builds natedev sdlc\n"
                    + "# text:\nscan_roots=\n")
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"CONF_DIR": str(self.repo / ".git/test-config")})))
-        self.write(".git/test-config/buildlog.conf", (Path(__file__).resolve().parents[2] / "config/buildlog.conf").read_text())
+        _ = write_config_fixture(self.repo / ".git/test-config/buildlog.conf",
+                                 "INDEX_SPILL_PAGES=128\n", defaults=BUILDLOG_INDEX_SETTINGS)
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"BUILDLOG_DIR": str(self.repo / ".git/buildlog")})))
         self.write(".gitignore", "__pycache__/\n")
         # Ten unrelated modules distinguish direct selection from a full selection.

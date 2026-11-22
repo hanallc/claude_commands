@@ -18,19 +18,19 @@ from types import FrameType
 from typing import cast, override
 from unittest import mock
 
-from scripts.aws_target.ledger_test_support import install_cost_settings, write_gate_config
 from scripts.buildlog import index
 from scripts.buildlog import launches
 from scripts.buildlog import record
 from scripts.buildlog import report
 from scripts.buildlog import store
 from scripts.buildlog.test_index import Record, encode, point_root_at, step
-from scripts.buildlog.test_launches import CLI, result_line
+from scripts.buildlog.test_launches import CLI, launch_report_settings, result_line
 from scripts.lib import scratch as scratch_folders
 from scripts.lib import test_hang_guard
-from scripts.lint.memory_test_support import config_environment
+from scripts.lint.memory_test_support import config_environment, write_config_fixture
 
 from scripts.hana_shot import hana_shot
+from scripts.hana_shot.hana_shot_test_support import SHOT_LAUNCH_SETTINGS
 from scripts.hana_shot.test_hana_shot import LAUNCH_RECORDING_PURPOSE
 
 
@@ -65,14 +65,12 @@ class LaunchRecordingTests(unittest.TestCase):
             ["git", "init", "--quiet", "--initial-branch=main", str(self.worktree)],
             check=True, capture_output=True,
         )
-        aws_settings = base / 'config/aws_target.conf'
-        install_cost_settings(aws_settings)
-        write_gate_config(base / 'config/cloud_gate.conf')
+        settings = launch_report_settings(base)
+        _ = write_config_fixture(base / "config/hana_shot.conf", defaults=SHOT_LAUNCH_SETTINGS)
         point_root_at(self, self.root)
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
             **config_environment(base / "config"),
-            "AWS_TARGET_CONFIG": str(aws_settings),
-            "BUILD_TARGETS_STATE_DIR": str(base / "targets"),
+            **settings,
             "XDG_CACHE_HOME": str(self.cache),
             "BUILDLOG_LAUNCH_STATES": str(self.cache / "hana-shot" / "launches"),
             "BUILDLOG_TRANSCRIPTS": str(base / "transcripts"),

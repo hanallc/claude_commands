@@ -6,7 +6,6 @@ from scripts.agents import remote
 import json
 import os
 import sqlite3
-import shutil
 import tempfile
 import unittest
 from contextlib import closing
@@ -29,6 +28,8 @@ from scripts.production import unit_lookup
 from scripts.herdr.herdr import HerdrPlace
 from scripts.direct import plan_history
 from scripts.production import staff
+from scripts.build_targets.target_test_support import LOCAL_TARGET_SETTINGS
+from scripts.production.config_test_support import UNIT_TABLE_SETTINGS
 from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, isolated_staff_file, unit_membership
 
 
@@ -55,8 +56,8 @@ class StyleUnitsTests(unittest.TestCase):
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         config = self.root / "table-conf"
-        _ = cast(object, shutil.copytree(Path(__file__).resolve().parents[2] / "config", config))
-        _ = write_config_fixture(config / "production.conf", "units_table_columns=170\n")
+        _ = write_config_fixture(config / "production.conf", defaults=UNIT_TABLE_SETTINGS)
+        _ = write_config_fixture(config / "build_targets.conf", defaults=LOCAL_TARGET_SETTINGS)
         _ = cast(object, self.enterContext(patch.dict(os.environ, {"CONF_DIR": str(config)})))
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
         self.database = self.root / "ledger.sqlite"

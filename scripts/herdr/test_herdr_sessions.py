@@ -31,6 +31,7 @@ from scripts.production import showrunners
 from scripts.accounts import accounts
 from scripts.accounts.home_test_support import scratch_accounts_config
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.lib.test_script_prompts import write_script_prompt_fixture
 from scripts.production import staff, fake_unit_host
 from scripts.message import sessions as runtime_sessions
 from scripts.production.staff_test_support import isolated_staff_file, showrunner_relationship, unit_membership
@@ -776,8 +777,7 @@ class StandaloneLaunchTests(unittest.TestCase):
         _ = self.enterContext(fake_unit_host.private_process_registry())
         _ = self.enterContext(patch.object(herdr.Herdr, "run_in_pane"))
         configuration = self.enterContext(scratch_accounts_config())
-        _ = (configuration / "script_prompts.conf").write_text(
-            (Path(__file__).resolve().parents[2] / "config/script_prompts.conf").read_text())
+        write_script_prompt_fixture(configuration)
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {"CLAUDE_CONFIG_DIR": ""}))
         self.responses = {"default": {"stdout": json.dumps({"result": {
             "workspaces": [], "workspace": {"workspace_id": "w1"}, "root_pane": {"pane_id": "w1:p1"}, "tab": {"tab_id": "w1:t1"}, "tabs": [], "panes": [],

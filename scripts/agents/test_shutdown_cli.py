@@ -29,6 +29,7 @@ from scripts.accounts import accounts
 from scripts.lib.state_home_test_support import isolate_state_home
 from scripts.herdr import herdr_types
 from scripts.agents import test_stop_resume, worker_lifecycle
+from scripts.agents.test_support import MACHINE_SETTINGS, SHUTDOWN_SETTINGS
 from scripts.direct import progress_history
 from scripts.copies import copies
 from scripts.copies import remote_test_support
@@ -40,17 +41,22 @@ from scripts.herdr.herdr import HerdrPlace
 from scripts.herdr.test_worker_panes import PaneWorld
 from scripts.lib import (
     atomic_file, build_folder_lock, build_folders, build_slots, build_slots_test_support, conf, git_files, process_group, process_start,
-    socket_test_support, unit_runs,
+    unit_runs,
 )
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.cargo_output_test_support import fake_cargo_output_roots
 from scripts.lib.conf import UseConfiguredValue
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.lib.test_script_prompts import script_prompt_settings
 from scripts.lib.unit_runs_test_support import bind_private_run_roots
 from scripts.message import session_records, sessions, session_send
+from scripts.message.codex_test_support import CODEX_DAEMON_SETTINGS
+from scripts.message.session_send_test_support import POSTMASTER_SETTINGS, SEND_SETTINGS
 from scripts.message.sessions import SessionRecord
+from scripts.lint.memory_test_support import write_config_fixture
+from scripts.production.config_test_support import RENAME_SETTINGS, RETIRE_SETTINGS, UNIT_PORT_SETTINGS, UNIT_TABLE_SETTINGS
 from scripts.production import (
-    unit_lookup, unit_move, staff, staff_test_support, unit_config, add_unit, completion_receipt, worker,
+    unit_lookup, unit_move, staff, unit_config, add_unit, completion_receipt, worker,
     rename_unit_test_support,
 )
 from scripts.production.production_doc import Production, read_production
@@ -64,6 +70,7 @@ from scripts.production.staff_test_support import (
     fixture_runtime_id,
     CHECKOUT,
     unit_membership,
+    write_staff_settings,
 )
 from scripts.agents import shutdown, remote, stop_resume, restart, pane_record as staff_pane_record, pane_record, producer_transfer
 from scripts.agents.stop_results import StopResult
@@ -187,58 +194,8 @@ SEAT = "22222222-2222-2222-2222-222222222222"
 STOP_SESSION = stop_resume.stop
 
 SHUTDOWN_FIXTURE_SETTINGS = {
-    "staff": """\
-# range: 0.001..
-OPERATION_LOCK_SECONDS=30
-# range: 0.001..
-REMOTE_SECONDS=20
-PRODUCER_WORKSPACE=producers
-PRODUCER_FOLDER_ROOT=~/rust/hanadocs
-""",
-    "shutdown": """\
-# whole: 1..300
-STOP_GRACE_SECONDS=2
-# whole: 1..300
-KILL_GRACE_SECONDS=5
-# whole: 1..300
-MOVE_STOP_MARGIN_SECONDS=3
-# range: 5e-324..
-START_SECONDS=20
-# range: 5e-324..
-OPENING_PROMPT_SECONDS=90
-# range: 5e-324..
-STAY_SECONDS=10
-# range: 0..300
-OWN_PANE_SHELL_SECONDS=30
-# range: 0..3600
-RESUME_CHECK_SECONDS=180
-# range: 5e-324..300
-RESUME_CHECK_INTERVAL_SECONDS=5
-""",
-    "production": """\
-# range: 5e-324..
-RETIRE_POLL_SECONDS=0.2
-# range: 5e-324..
-RETIRE_TERM_WAIT_SECONDS=10
-# range: 5e-324..
-RETIRE_COMMAND_TIMEOUT_SECONDS=900
-# range: 5e-324..
-RENAME_LIVE_WAIT_SECONDS=180
-# range: 5e-324..
-RENAME_RUN_STOP_WAIT_SECONDS=120
-# range: 5e-324..
-RENAME_POLL_SECONDS=1
-# range: 5e-324..
-RENAME_COMMAND_TIMEOUT_SECONDS=900
-# whole: 1..
-unit_port_first=15720
-# whole: 1..
-unit_port_last=15789
-# whole: 1..
-smoke_port=15790
-# whole: 1..
-mac_run_port=15710
-""",
+    "shutdown": SHUTDOWN_SETTINGS,
+    "production": RETIRE_SETTINGS + RENAME_SETTINGS + UNIT_PORT_SETTINGS,
     "direct": """\
 # range: 0.1..0.9
 WORKER_SPLIT_RATIO=0.667
@@ -301,15 +258,7 @@ guard_timeout_seconds=10
 guard_choice_limit=32
 owner.verify=verify
 """,
-    "machines": """\
-aliases=natedev mac
-# one of: linux, darwin
-natedev.platform=linux
-natedev.hosts=natedev
-# one of: linux, darwin
-mac.platform=darwin
-mac.hosts=Nates-MacBook-Pro-2023
-""",
+    "machines": MACHINE_SETTINGS,
     "scratch": """\
 visible_root=~/rust/repro
 holds_file=~/.local/state/scratch/holds.json
@@ -325,39 +274,9 @@ record_lock_attempts=3
 # whole: 1..
 removal_remote_timeout_seconds=30
 """,
-    "codex_daemon": """\
-# range: 0.001..
-timeout_seconds=5.0
-# range: 0.001..
-queue_timeout_seconds=30
-agents_slice=app-agents.slice
-""",
-    "postmaster": """\
-# range: 0.001..
-wait_seconds=3.0
-# range: 0.001..
-claim_grace_seconds=15.0
-# range: 0.001..
-heartbeat_max_age_seconds=2.0
-# range: 0.001..
-poll_seconds=0.05
-""",
-    "send": """\
-# range: 0.001..
-waits_review_seconds=30
-# range: 0.001..
-delivery_timeout=40
-# range: 0.001..
-kill_grace=10
-# range: 0.001..
-user_cancel_timeout=30
-# range: 0.001..
-check_timeout=20
-# range: 0.001..
-caller_margin_seconds=15
-# range: 0.001..
-remote_transport_seconds=30
-""",
+    "codex_daemon": CODEX_DAEMON_SETTINGS,
+    "postmaster": POSTMASTER_SETTINGS,
+    "send": SEND_SETTINGS,
     "build_steps": """\
 names.test-affected=test affected
 names.gate=gate
@@ -378,21 +297,20 @@ repeat_minutes=30
 # range: 0..
 stall_minutes=5
 """,
-    "script_prompts": """\
-# whole: 1..
-max_records=4096
-""",
+    "script_prompts": script_prompt_settings(),
 }
 
 
 def shutdown_fixture_configuration(root: Path) -> dict[str, str]:
     """Supply fixed settings to the shared repository fixtures."""
     root.mkdir(parents=True, exist_ok=True)
+    if not (root / "staff.conf").exists():
+        _ = write_staff_settings(root / "staff.conf", producers=root / "producers")
+    if not (root / "copies.conf").exists():
+        _ = (root / "copies.conf").write_text(build_slots_test_support.copy_fixture_settings(root, git_timeout_seconds=10))
     for stem, content in SHUTDOWN_FIXTURE_SETTINGS.items():
         destination = root / f"{stem}.conf"
         if not destination.exists():
-            if stem == "copies":
-                content = content.replace("~/remote-mirrors", str(root / "remote-mirrors"))
             _ = destination.write_text(content, encoding="utf-8")
     return {"CONF_DIR": str(root), "COPIES_CONFIG": str(root / "copies.conf"),
             "BUILD_TARGETS_CONFIG": str(root / "build_targets.conf")}
@@ -403,20 +321,9 @@ def retirement_copies_environment(root: Path) -> dict[str, str]:
     return {**private.environment, "HOME": str(root), "SCRATCH_COPIES_ROOT": str(root / "copies")}
 
 
-def write_pinned_fixture_setting(path: Path, overrides: str = "") -> int:
+def write_pinned_fixture_setting(path: Path, overrides: str = "", *, defaults: str = "") -> int:
     """Write only settings that the shutdown fixtures use."""
-    content = SHUTDOWN_FIXTURE_SETTINGS.get(path.stem, "")
-    if not content:
-        if overrides:
-            raise AssertionError(f"Unexpected fixture settings for {path}")
-        return 0
-    lines = content.splitlines()
-    for assignment in overrides.splitlines():
-        key, _, _ = assignment.partition("=")
-        index = next(index for index, line in enumerate(lines) if line.startswith(key + "="))
-        lines[index] = assignment
-    path.parent.mkdir(parents=True, exist_ok=True)
-    return path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return write_config_fixture(path, overrides, defaults=defaults or SHUTDOWN_FIXTURE_SETTINGS.get(path.stem, ""))
 
 
 def fixture_git_environment() -> dict[str, str]:
@@ -447,11 +354,9 @@ def setUpModule() -> None:
     ShutdownStaffFixture.owner_server = SharedStaffOwner(root)
     unittest.addModuleCleanup(ShutdownStaffFixture.owner_server.close)
     unittest.enterModuleContext(mock.patch.dict(os.environ, environment, clear=True))
-    _ = unittest.enterModuleContext(mock.patch.object(staff_test_support, "write_config_fixture", write_pinned_fixture_setting))
     _ = unittest.enterModuleContext(mock.patch.object(build_slots_test_support, "config_environment", shutdown_fixture_configuration))
     _ = unittest.enterModuleContext(mock.patch.object(rename_unit_test_support, "config_environment", shutdown_fixture_configuration))
     _ = unittest.enterModuleContext(mock.patch.object(remote_test_support, "copies_environment", retirement_copies_environment))
-    _ = unittest.enterModuleContext(mock.patch.object(socket_test_support, "config_environment", shutdown_fixture_configuration))
     _ = unittest.enterModuleContext(mock.patch.object(PaneWorld, "setup", setup_pinned_panes))
 
 def git(where: Path, *arguments: str) -> str:
@@ -527,6 +432,7 @@ def pinned_fixture_settings(*stems: str) -> Generator[None]:
 def setup_pinned_panes(world: PaneWorld, test: StaffTestCase) -> None:
     with pinned_fixture_settings("codex_daemon", "script_prompts"):
         SETUP_PANES(world, test)
+    _ = write_pinned_fixture_setting(test.root / "conf/build_folders.conf")
 
 
 class ShutdownStaffFixture(StaffTestCase):
@@ -722,12 +628,9 @@ class RetireUnitTests(ShutdownRepositoryFixture):
 
     def limits(self, *, poll: str = "0.2", wait: str = "10", command: str = "900") -> Path:
         path = self.root / "production.conf"
-        _ = path.write_text(f"# range: 5e-324..\nRETIRE_POLL_SECONDS={poll}\n# range: 5e-324..\nRETIRE_TERM_WAIT_SECONDS={wait}\n"
-                            + f"# range: 5e-324..\nRETIRE_COMMAND_TIMEOUT_SECONDS={command}\n"
-                            + "# whole: 40..\nunits_table_columns=170\n"
-                            + "# whole: 40..\nunits_table_floor_columns=120\n"
-                            + "# whole: 1..4\nunits_table_cell_lines=4\n"
-                            + "# whole: 2..\nunits_table_break_columns=30\n")
+        _ = write_config_fixture(path, f"RETIRE_POLL_SECONDS={poll}\nRETIRE_TERM_WAIT_SECONDS={wait}\n"
+                                 + f"RETIRE_COMMAND_TIMEOUT_SECONDS={command}\n",
+                                 defaults=RETIRE_SETTINGS + UNIT_TABLE_SETTINGS)
         return path
 
 
@@ -1074,7 +977,8 @@ class RetireUnitTests(ShutdownRepositoryFixture):
         config = shutdown_fixture_configuration(self.root)
         _ = self.limits()
         environment = retirement_copies_environment(self.root)
-        _ = (Path(environment["CONF_DIR"]) / "build_folders.conf").replace(self.root / "build_folders.conf")
+        private_folders = Path(environment["CONF_DIR"]) / "build_folders.conf"
+        _ = write_pinned_fixture_setting(self.root / "build_folders.conf", private_folders.read_text())
         self.enterContext(mock.patch.dict(os.environ, {**config, **environment, "CONF_DIR": str(self.root)}))
         runs = self.root / "runs"
         self.run_folder = runs / "run-1"
@@ -1920,6 +1824,7 @@ class RetireUnitTests(ShutdownRepositoryFixture):
         mirror = copies.RemoteMirror(str(self.unit_staff_id), copies.SelectedRepository("hana"), "mac",
                                      str(self.root / "mirrors/alpha"), "alpha-session")
         with local_remote_transport(self.root):
+            _ = write_pinned_fixture_setting(Path(os.environ["CONF_DIR"]) / "build_folders.conf")
             self.assertEqual(publish_mirror(mirror), 0)
             code, output = self.retire()
         self.assertEqual(code, 0, output)

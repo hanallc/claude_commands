@@ -16,11 +16,32 @@ from unittest.mock import patch
 
 from scripts.production.cli_fixture import invoke_cli, process_boundary_for_case
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
-from scripts.lint.memory_test_support import write_config_fixture
 
-# Only the fsync test calls a function directly; never initialize it from live config.
-with patch.dict(os.environ, {"CONF_DIR": str(Path(Path(__file__).resolve().parents[2] / "config/direct.conf").parent)}):
-    from scripts.direct import findings as findings
+from scripts.direct import findings as findings
+
+STANDARD_CONFIG = """\
+# whole: 1..
+MIN_REPAIR_BUDGET=3
+# range: 5e-324..
+REPAIR_ROUNDS_PER_FINDING=0.5
+# whole: 1..
+RUNAWAY_ROUNDS=5
+# whole: 1..
+MAX_FIX_ATTEMPTS=2
+# whole: 1..
+MAX_REOPENS=2
+# whole: 2..
+STALLED_ROUNDS=2
+# whole: 1..
+MAX_CONSECUTIVE_SAME_KIND_PASSES=3
+# whole: 0..
+MAX_REVIEW_CANCELLATIONS=1
+# whole: 1..
+ROUTING_FROM_ROUND=4
+# whole: 1..
+ASTRA_AFTER_FAILED_FIXES=2
+"""
+
 
 SCRIPT = Path(__file__).with_name("findings.py")
 FINDINGS_CODE = compile(SCRIPT.read_text(encoding="utf-8"), str(SCRIPT), "exec")
@@ -37,21 +58,6 @@ def invoke_findings(arguments: list[str], environment: dict[str, str], cwd: Path
         return 0
 
     return invoke_cli(module, main, arguments, environment, cwd)
-
-
-def standard_configuration() -> str:
-    """Copy the config and set the limits that these ledger tests assert."""
-    with tempfile.TemporaryDirectory() as directory:
-        path = Path(directory) / "direct.conf"
-        _ = write_config_fixture(path,
-            "MIN_REPAIR_BUDGET=3\nREPAIR_ROUNDS_PER_FINDING=0.5\nRUNAWAY_ROUNDS=5\n"
-            + "MAX_FIX_ATTEMPTS=2\nMAX_REOPENS=2\nSTALLED_ROUNDS=2\n"
-            + "MAX_CONSECUTIVE_SAME_KIND_PASSES=3\nMAX_REVIEW_CANCELLATIONS=1\n"
-            + "ROUTING_FROM_ROUND=4\nASTRA_AFTER_FAILED_FIXES=2\n")
-        return path.read_text(encoding="utf-8")
-
-
-STANDARD_CONFIG = standard_configuration()
 
 
 class FindingsLedgerFixture(unittest.TestCase):

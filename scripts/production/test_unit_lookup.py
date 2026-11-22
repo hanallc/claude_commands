@@ -20,7 +20,10 @@ from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
-from scripts.lib.socket_test_support import short_socket_directory
+from scripts.lib.build_folders_test_support import temporary_folder_settings
+from scripts.lib.socket_test_support import SYSTEM_SOCKET_ROOT, short_socket_directory
+from scripts.lint.memory_test_support import config_environment
+from scripts.production.config_test_support import UNIT_TABLE_SETTINGS
 from scripts.production import fake_unit_host
 from scripts.production import showrunners
 from scripts.production import unit_lookup
@@ -34,6 +37,10 @@ from scripts.agents import remote
 from scripts.production.staff_test_support import fixture_member, isolated_staff_file, unit_membership, showrunner_relationship, fixture_runtime_id, fixture_worker, recorded_showrunner, StaffTestCase
 
 SCRIPT = Path(__file__).with_name("unit_lookup.py")
+
+
+def setUpModule() -> None:
+    unittest.enterModuleContext(mock.patch.dict(os.environ, {"USER_ZONE": "America/New_York"}))
 
 
 class UnitReferenceTests(StaffTestCase):
@@ -214,7 +221,12 @@ class UnitLookupTests(unittest.TestCase):
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.records = self.root / "sessions"
         self.records.mkdir()
+        configuration = config_environment(self.root / "settings", fixtures={
+            "build_folders.conf": temporary_folder_settings(self.root, system_root=SYSTEM_SOCKET_ROOT),
+            "production.conf": UNIT_TABLE_SETTINGS,
+        })
         self.environment = {**os.environ,
+                            **configuration,
                             "HOME": str(self.root / "home"),
                             "NOTIFIER_STATE_DIR": str(self.root / "notifier"),
                             "NOTIFIER_SESSIONS_DIR": str(self.records),

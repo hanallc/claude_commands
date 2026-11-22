@@ -19,7 +19,9 @@ from scripts.build_queue import admission_records as records, head_stall
 from scripts.build_queue.queue_fixture import fixture_reservation
 from scripts.build_queue.queue_snapshot import QueueSnapshot, write_queue_snapshot
 from scripts.buildlog import cli, mac_idle, sample
+from scripts.lint.config_test_support import LINT_SENDER_SETTINGS
 from scripts.lint.memory_test_support import admission_policy_fixture, config_environment
+from scripts.message.session_send_test_support import SEND_TIMING_FIXTURES
 
 GIB = records.GIB
 NOW = 1_800_000_000.0
@@ -242,7 +244,10 @@ class WatchTests(unittest.TestCase):
         folder = self.enterContext(tempfile.TemporaryDirectory())
         self.paths = head_stall.StallPaths(Path(folder) / "admission", Path(folder) / "head_stall.json")
         self.paths.admission.mkdir()
-        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, config_environment(Path(folder) / "config"))))
+        configuration = Path(folder) / "config"
+        environment = config_environment(configuration, fixtures={**SEND_TIMING_FIXTURES,
+            "lint.conf": LINT_SENDER_SETTINGS})
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {**environment, "USER_ZONE": "UTC"})))
         _ = self.enterContext(mock.patch.object(head_stall, "configured_limits", return_value=(LIMIT, 120.0)))
         self.sent = []
 

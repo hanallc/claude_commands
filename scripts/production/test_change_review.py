@@ -30,19 +30,25 @@ from unittest import mock
 from scripts.production import change_review
 from scripts.lib import conf, copy_record, file_lock, session_folder
 from scripts.lib.atomic_file import write_text_atomic
+from scripts.lib.build_folders_test_support import workspace_folder_settings
 from scripts.lib.checkout_test_support import write_python_tool
 from scripts.lib.git_test_support import fixture_git_environment
-from scripts.lint.memory_test_support import config_environment
 from scripts.production import (
     showrunners, staff, change_routing, merge_checkpoint, session_staff, production_doc, unit_config, unit_lookup,
 )
 from scripts.agents import remote
+from scripts.agents.test_support import write_machine_config
+from scripts.lib.scratch_test_support import write_scratch_settings
+from scripts.lint.memory_test_support import config_environment, write_config_fixture
 from scripts.production.production_doc import Production
 from zoneinfo import ZoneInfo
-from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, recorded_showrunner, recorded_unit
+from scripts.production.staff_test_support import (
+    fixture_member, fixture_runtime_id, recorded_showrunner, recorded_unit, write_staff_settings,
+)
 from scripts.production import showrunner_tree
 from scripts.production.change_review import Invisible, Malformed, Visible
 from scripts.production.change_review_test_support import (
+    REVIEW_DELIVERY_SETTINGS, REVIEW_DISPLAY_SETTINGS, REVIEW_ENDPOINT_SETTINGS,
     fixture_image, fixture_row_image, pictured_changes, pictured_publication, pictured_review_lines,
 )
 from scripts.review_links import image_store, review_events
@@ -90,6 +96,13 @@ def setUpModule() -> None:
     unittest.enterModuleContext(foreign_hostname())
     folder = Path(tempfile.mkdtemp(prefix="change-review-fixture-")).resolve()
     unittest.addModuleCleanup(shutil.rmtree, folder)
+    configuration = folder / "config"
+    write_machine_config(configuration)
+    _ = write_staff_settings(configuration / "staff.conf", producers=folder / "producers")
+    _ = write_config_fixture(configuration / "review_links.conf",
+                             defaults=REVIEW_ENDPOINT_SETTINGS + REVIEW_DISPLAY_SETTINGS + REVIEW_DELIVERY_SETTINGS)
+    _ = write_config_fixture(configuration / "build_folders.conf", defaults=workspace_folder_settings(folder))
+    write_scratch_settings(configuration, folder)
     home = folder / "home"
     home.mkdir()
     environment = staff.child_environment(fixture_git_environment(folder))
@@ -98,8 +111,8 @@ def setUpModule() -> None:
         _ = environment.pop(key, None)
     unittest.enterModuleContext(mock.patch.dict(os.environ, {
         **environment,
-        **config_environment(folder / "config"),
-        "HOME": str(home), "XDG_CONFIG_HOME": str(home / ".config"),
+        **config_environment(configuration),
+        "HOME": str(home), "XDG_CONFIG_HOME": str(home / ".config"), "USER_ZONE": "America/New_York",
         "NOTIFIER_SESSIONS_DIR": str(folder / "session-records"), session_folder.ROOT_ENV: str(folder / "sessions"),
         "STAFF_FILE": str(folder / "staff.json"), "NEXT_STATE_DIR": str(folder),
         "REVIEW_LINKS_ROOT": str(folder / "links"), "CHANGE_REVIEW_DIR": str(folder),
@@ -182,7 +195,10 @@ class ProducerFixture(unittest.TestCase):
         self.repo.mkdir()
         self.doc = self.root / "top.md"
         self.listing = self.root / "change-review - top.md"
+        settings = write_staff_settings(self.root / "staff.conf", producers=self.root / "producers")
         self.enterContext(mock.patch.dict(os.environ, {"STAFF_FILE": str(self.root / "staff.json"),
+            "STAFF_CONFIG": str(settings),
+            "USER_ZONE": "America/New_York",
             "CHANGE_REVIEW_DIR": str(self.root), "REVIEW_LINKS_ROOT": str(self.root / "links"),
             "NEXT_STATE_DIR": str(self.root / "next"), "UNIT_HISTORY_DIR": str(self.root / "history"),
             "GIT_AUTHOR_DATE": "2026-11-13T12:00:00Z", "GIT_COMMITTER_DATE": "2026-11-13T12:00:00Z"}))

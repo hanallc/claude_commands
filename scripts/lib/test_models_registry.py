@@ -20,6 +20,8 @@ from typing import TextIO, cast, final, override
 from unittest.mock import patch
 
 from scripts.lib import land_main, live_settings, main_push_lock, models_registry, registry_rows, waiting_rows
+from scripts.lib.live_settings_test_support import write_live_settings_fixture
+from scripts.lib.main_push_lock_test_support import write_push_lock_settings
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.checkout_test_support import write_python_tool
 from scripts.lib.rerun_test_support import ScriptRepositoryTestCase
@@ -164,9 +166,18 @@ def claude_catalog_environment(directory: Path, targets: Mapping[str, str]) -> d
 
 
 class RegistryPublicationTests(ScriptRepositoryTestCase):
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        configuration = self.root / "config"
+        write_push_lock_settings(configuration)
+        self.environment["CONF_DIR"] = str(configuration)
+
     def _save_during_registry_move(self, *values: str) -> tuple[str, list[str]]:
         registry = self.write(self.repo / "config/models.conf", "[fixture]\nmodel=old\n")
         colors = self.write(self.repo / "config/statusline.conf", "account.claude1=brown\n")
+        write_push_lock_settings(colors.parent)
+        write_live_settings_fixture(colors.parent)
         self.seed()
         base = self.git("rev-parse", "HEAD").stdout.strip()
         _ = self.write(colors, "account.claude1=#445566\n")

@@ -54,6 +54,7 @@ class AccountMoveTests(ShutdownTestCase):
         notes.mkdir()
         context = cast(object, self.enterContext(patch.dict(os.environ, {
             "HOME": str(self.root), "AGENT_NOTES_DIR": str(notes),
+            "USER_ZONE": "UTC",
             "SHUTDOWN_STATE_DIR": str(self.root / "shutdown"),
             "NOTIFIER_SESSIONS_DIR": str(self.root / "registry"),
         })))
