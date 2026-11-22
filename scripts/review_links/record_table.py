@@ -944,16 +944,16 @@ function applyRows(write,{animate=false,dismissMissingItem=false,normalizeOwner=
  if(revealedLinkedItem!==linkedItem) revealedLinkedItem='';
  const previousOwner=owner,previousShow=show,previousFilters={...filters};
  owner=options.resolveOwner?.(owner) ?? owner;
- const search=query.trim().toLowerCase();
- if(normalizeOwner) owner=options.selectOwner?.({owner,type,query:search,keys}) ?? owner;
+ // Use one clock read for the rows, the owner selection, and the counts.
+ const now=Date.now();
+ if(normalizeOwner) owner=options.selectOwner?.(rows,currentSelection({now})) ?? owner;
  owner=filterSelection('owner').set(owner);
  if(previousOwner && !owner) sourceOwner='';
  show=filterSelection('show').set(show);
  if(!sharedWords()) words().value=query;
  for(const name of filterNames)
   filters[name]=filterSelection(name).set(filters[name]);
- // One clock read per pass, so rows and counts agree when a time passes mid-pass.
- const active={...currentSelection(),now:Date.now()};
+ const active=currentSelection({now});
  const counts=options.filterValues ? Object.fromEntries(['show','owner',...filterNames].map(name=>[name,Object.create(null)])) : undefined;
  const column=columns.indexOf(sort);
  const windowMotions=options.mount && rowMotion.size ? motionsByKey() : null;
@@ -1053,7 +1053,7 @@ function applyRows(write,{animate=false,dismissMissingItem=false,normalizeOwner=
  const countLine=content.querySelector('[data-list-count]');
  if(countLine) countLine.textContent=options.counts(selection,count,{show,keys,counts});
  if(!options.mount) showHiddenActionResults(items);
- options.applied?.(selection,active);
+ options.applied?.(selection,active,{rows,matches,count});
  if(write || location.hash===placeHash &&
   (revealedLinkedItem!==previousReveal || owner!==previousOwner || show!==previousShow ||
    filterNames.some(name=>filters[name]!==previousFilters[name])))
@@ -1191,11 +1191,12 @@ function bind(){
   apply(true,{animate:true});
  });
  content.querySelectorAll('[data-type-chip]').forEach(button=>button.addEventListener('click',()=>{
+  if(type===button.dataset.typeChip) return;
   type=button.dataset.typeChip;changeFilter();
  }));
 }
 return {place,apply,bind,opened,openCard,closeCard,restorePlace,drawWindow,updateItemDetail,queueItemUpdate,presentItemRevision,
- startItemRequest,currentItemRequest,startDeliveryWindow,deliveryRequest,finishDeliveryWindow,installOwnItemResult,savedItemError,itemError,itemUpdateRequired,setDialogTitle,showDraftCopy,suspendItemDialog,get dialogItem(){return dialogItem;},followItemLink,retryItemLink,itemLinkKey,saveDeparturePlace,ownerChipSelection,get linkedItem(){return linkedItem;},
+ startItemRequest,currentItemRequest,startDeliveryWindow,deliveryRequest,finishDeliveryWindow,installOwnItemResult,savedItemError,itemError,itemUpdateRequired,setDialogTitle,showDraftCopy,suspendItemDialog,get dialogItem(){return dialogItem;},followItemLink,retryItemLink,itemLinkKey,saveDeparturePlace,get linkedItem(){return linkedItem;},
  canSubmit(form,key){
   return dialog?.open && location.hash===placeHash && dialogItem?.dataset.key===key &&
    opened.has(key) && dialogMissing.hidden && dialogDetail.contains(form) &&

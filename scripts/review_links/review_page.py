@@ -1836,23 +1836,81 @@ let focusAfterLoad=null,firstRequest=firstReviewCard;
 let deferredLink=null,revealCreated=null,newItemRefresh;
 function allEntries(){return [...index.values()];}
 function isInvestigation(entry){return entry.type==='investigation' || entry.type==='bug';}
-function matchesOwner(entry,owner){return !owner || entry.owner===owner || isInvestigation(entry) && entry.sourceOwner===owner;}
-function matches(entry,{owner='',show='all',query='',type='',sourceOwner='',keys,now=Date.now()}){
+function rowOwners(entry){
+ return isInvestigation(entry) && entry.sourceOwner!==entry.owner ? [entry.owner,entry.sourceOwner] : [entry.owner];
+}
+function rowTypes(entry){return isInvestigation(entry) ? ['',entry.type,'investigations'] : ['',entry.type];}
+function rowShow(entry){return entry.actionStatus==='withdrawn' ? '' : entry.state==='Open' ? 'open' : entry.state;}
+function typeChipShow(show,type){
+ return type==='for-you' || type==='response' && show==='Validating' ? 'open' : show;
+}
+function availableForFilters(entry,{query,keys,now=Date.now()}){
  const linked=keys?.has(entry.key);
  return (!keys?.size || linked) && (linked || view.linkedItem===entry.key || entry.hiddenUntil<=now) &&
-  matchesOwner(entry,owner) &&
-  (!type || (type==='investigations' ? isInvestigation(entry) : entry.type===type)) &&
-  (!sourceOwner || entry.sourceOwner===sourceOwner) &&
-  (!query || entry.id.toLowerCase().includes(query) || entry.title.toLowerCase().includes(query)) &&
-  (show==='all' || (entry.state===(show==='open' ? 'Open' : show) && entry.actionStatus!=='withdrawn'));
+  (!query || entry.id.toLowerCase().includes(query) || entry.title.toLowerCase().includes(query));
+}
+function ownerHasType(entry,{owner,type}){
+ return rowOwners(entry).includes(owner) && rowTypes(entry).includes(type);
 }
 function isListed(entry,filters){
+ const {owner,show,type,sourceOwner}=filters;
  const key=entry.key,departure=saved.get(key);
  if(pendingSaves.get(key)?.departing) return false;
  if(departure?.handed && departure.awaitingSnapshot && view.linkedItem===key) return false;
- return (!departure || entry.type==='for-you' || departure.handed && entry.state!=='Open') && matches(entry,filters);
+ return (!departure || entry.type==='for-you' || departure.handed && entry.state!=='Open') &&
+  availableForFilters(entry,filters) && (!owner || rowOwners(entry).includes(owner)) &&
+  rowTypes(entry).includes(type) && (!sourceOwner || entry.sourceOwner===sourceOwner) &&
+  (show==='all' || show===rowShow(entry));
 }
-function matching(filters){return allEntries().filter(entry=>isListed(entry,filters));}
+function updateReviewChips(rows,filters,matches,shown){
+ const {owner,show,type}=filters;
+ const allOwners={...filters,owner:'',sourceOwner:''};
+ const allShows={...filters,show:'all'},allTypeShows={...allShows,type:''};
+ const anyOwnerShows={...allOwners,show:'all'},anyOwnerTypeShows={...anyOwnerShows,type:''};
+ const owners=new Map(),types=new Map(),shows=new Map();
+ const anyOwnerTypeCounts=new Map(),anyOwnerShowCounts=new Map();
+ const eligibleOwners=new Set(),ownerTypes=new Set();
+ const add=(counts,choices)=>{
+  for(const value of choices) counts.set(value,(counts.get(value) ?? 0)+1);
+ };
+ for(const item of rows){
+  const row=item.dataset,ownersForRow=rowOwners(row),typesForRow=rowTypes(row),state=rowShow(row);
+  const showsForRow=state ? ['all',state] : ['all'];
+  const typesForClick=typesForRow.filter(kind=>showsForRow.includes(typeChipShow(show,kind)));
+  if(availableForFilters(row,filters)){
+   if(typesForRow.includes(type)) for(const id of ownersForRow) eligibleOwners.add(id);
+   if(ownersForRow.includes(owner)) for(const kind of typesForRow) ownerTypes.add(kind);
+  }
+  if(matches(item,allOwners)) add(owners,['',...ownersForRow.filter(Boolean)]);
+  if(matches(item,allTypeShows)) add(types,typesForClick);
+  if(matches(item,allShows)) add(shows,showsForRow);
+  if(owner && matches(item,anyOwnerTypeShows)) add(anyOwnerTypeCounts,typesForClick);
+  if(owner && matches(item,anyOwnerShows)) add(anyOwnerShowCounts,showsForRow);
+ }
+ content.querySelectorAll('[data-owner-chip]').forEach(button=>{
+  const id=button.dataset.ownerChip;
+  button.hidden=Boolean(id) && id!==owner && !eligibleOwners.has(id);
+  button.querySelector('b').textContent=id===owner ? shown : owners.get(id) ?? 0;
+ });
+ const showCounts=owner && !ownerTypes.has(type) ? anyOwnerShowCounts : shows;
+ content.querySelectorAll('[data-show-chip]').forEach(button=>{
+  const value=button.dataset.showChip;
+  button.hidden=['response','for-you'].includes(type) && value==='Validating';
+  const count=value===show ? shown : showCounts.get(value) ?? 0;
+  button.querySelector('b').textContent=count;
+  button.toggleAttribute('data-empty-count',count===0);
+ });
+ content.querySelectorAll('[data-type-chip]').forEach(button=>{
+  const kind=button.dataset.typeChip;
+  if(kind==='investigations') button.hidden=type!=='investigations';
+  button.setAttribute('aria-pressed',String(kind===type));
+  // A State reset checks the current Type before the new Type applies.
+  const resetsState=typeChipShow(show,kind)!==show;
+  const resetsOwner=owner && (!ownerTypes.has(kind) || resetsState && !ownerTypes.has(type));
+  const counts=resetsOwner ? anyOwnerTypeCounts : types;
+  button.querySelector('b').textContent=kind===type ? shown : counts.get(kind) ?? 0;
+ });
+}
 function savedEntry(key,result){
  const entry=index.get(key);if(!entry) return;
  if(result.state==='Done' && entry.type!=='for-you'){index.delete(key);return;}
@@ -1897,19 +1955,21 @@ const view=createRecordTable({content:()=>content,
    button.dataset.ownerChip===owner || button.dataset.ownerName===owner);
   return button ? button.dataset.ownerChip : owner;
  },
- selectOwner:({owner,type,query,keys})=>!owner || allEntries().some(entry=>matches(entry,{owner,type,query,keys})) ? owner : '',
+ selectOwner:(rows,filters)=>!filters.owner || rows.some(({dataset:entry})=>
+  availableForFilters(entry,filters) && ownerHasType(entry,filters)) ? filters.owner : '',
  resolveItem:value=>resolveShownRecordId(index,value),
  hasKey:key=>index.has(key),
  shows:showValues,
  visible:isListed,
  sortValues:data=>data.sortValues===undefined ? entrySortValues(data) : undefined,
- applied:(items,filters)=>{
-  const {type,show,owner,query,keys,now}=filters;
+ applied:(items,filters,{rows,matches,count})=>{
+  const {type,show}=filters;
   content.querySelector('table').pageData=()=>({
    columns:['Id','Type','Owner','Source','Item','State','Filed'],
    rows:(function*(){
-    for(const {dataset:entry} of items){
-     if(!isListed(entry,filters)) continue;
+    for(const item of items){
+     if(!index.has(item.dataset.key) || !matches(item,filters)) continue;
+     const entry=item.dataset;
      yield [entry.id,entry.type,entry.ownerName,entry.sourceName,entry.title,entry.state,
       new Date(entry.filed*1000).toISOString()];
     }
@@ -1918,28 +1978,7 @@ const view=createRecordTable({content:()=>content,
   content.dataset.show=show;loadBodies();
   const actionNotices=content.querySelector('[data-for-you-notices]');
   actionNotices.hidden=type!=='for-you' || !actionNotices.children.length;
-  const eligibleOwners=allEntries().filter(entry=>matches(entry,{type,query,keys,now}));
-  content.querySelectorAll('[data-owner-chip]').forEach(button=>{
-   const id=button.dataset.ownerChip;
-   button.hidden=Boolean(id) && id!==owner && !eligibleOwners.some(entry=>matchesOwner(entry,id));
-   button.querySelector('b').textContent=matching(view.ownerChipSelection(filters,id)).length;
-  });
-  const eligible=matching({...filters,show:'all'});
-  const stateCounts=new Map();
-  for(const {state,actionStatus} of eligible)
-   if(actionStatus!=='withdrawn') stateCounts.set(state,(stateCounts.get(state) ?? 0)+1);
-  content.querySelectorAll('[data-show-chip]').forEach(button=>{
-   const show=button.dataset.showChip;
-   button.hidden=['response','for-you'].includes(type) && show==='Validating';
-   const count=show==='all' ? eligible.length : stateCounts.get(show==='open' ? 'Open' : show) ?? 0;
-   button.querySelector('b').textContent=count;
-   button.toggleAttribute('data-empty-count',count===0);
-  });
-  content.querySelectorAll('[data-type-chip]').forEach(button=>{
-   if(button.dataset.typeChip==='investigations') button.hidden=type!=='investigations';
-   button.setAttribute('aria-pressed',String(button.dataset.typeChip===type));
-   button.querySelector('b').textContent=matching({...filters,type:button.dataset.typeChip}).length;
-  });
+  updateReviewChips(rows,filters,matches,count);
  }
 });
 async function afterRowAnimations(run,current=()=>true){
@@ -2215,8 +2254,9 @@ function bindForm(row){
 }
 function bind(){view.replace(false);}
 content.addEventListener('click',event=>{
- if((content.dataset.show==='Validating' && event.target.closest('[data-type-chip="response"]')) ||
-    (content.dataset.show!=='open' && event.target.closest('[data-type-chip="for-you"][aria-pressed="false"]')))
+ const chip=event.target.closest('[data-type-chip][aria-pressed="false"]');
+ const show=content.dataset.show;
+ if(chip && typeChipShow(show,chip.dataset.typeChip)!==show)
   document.getElementById('review-show-open').click();
 },true);
 function revealNewItem(){
