@@ -1869,7 +1869,6 @@ const view=createRecordTable({content:()=>content,
   if(show) params.set('show',['response','for-you'].includes(params.get('type')) && show==='Validating' ? 'open' : show);
  },
  persistLinkedTarget:true,
- keepItemOnMissingLink:true,
  missingItem:()=> 'This review is no longer on the Review page.',
  resolveOwner:owner=>{
   const button=[...content.querySelectorAll('[data-owner-chip]')].find(button=>

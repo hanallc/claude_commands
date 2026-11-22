@@ -1038,7 +1038,7 @@ function applyRows(write,{animate=false,dismissMissingItem=false,normalizeOwner=
  const missingItem=content.querySelector('[data-missing-item]');
  if(missingItem){
   const message=linkedItem && missingLinkedItem && dialogItem?.dataset.key!==linkedItem ? options.missingItem(linkedItem) : '';
-  const inside=options.keepItemOnMissingLink && dialogItem && message;
+  const inside=dialogItem && message;
   missingItem.textContent=inside ? '' : message;
   missingItem.hidden=!message || Boolean(inside);
   if(dialogLinkNotice){
@@ -1092,7 +1092,8 @@ function saveDeparturePlace(){
   writePlace(false,scrollY);
  }else history.replaceState(placeState(scrollY),'');
 }
-function jump(key,{pushPlace=true,focusTarget=true,keepMatchingFilters=false,preserveFilters=false,unresolved=false}={}){
+function jump(key,{pushPlace=true,focusTarget=true,keepMatchingFilters=false,preserveFilters=false,unresolved=false,
+ keepItemOnMissing=options.keepItemOnMissingLink}={}){
  if(pushPlace) saveDeparturePlace();
  const target=itemWithKey(key);
  linkedItem=options.missingItem ? key : '';
@@ -1113,7 +1114,7 @@ function jump(key,{pushPlace=true,focusTarget=true,keepMatchingFilters=false,pre
    if(sharedWords()) filterControl.setWords(words(),query);
   }
  }
- if(dialog && !target && !options.keepItemOnMissingLink) opened.clear();
+ if(dialog && !target && !keepItemOnMissing) opened.clear();
  if(options.mount && target) revealKey=key;
  apply(true,{pushPlace,normalizeOwner:!preserveFilters});
  const mountedTarget=options.mount ? mounted.get(key) : target;
@@ -1142,8 +1143,8 @@ function openCard(key){
 }
 function closeCard(key,write=true){
  const wasOpen=opened.delete(key);
- if(linkedItem===key || (wasOpen && options.keepItemOnMissingLink)){linkedItem='';revealedLinkedItem='';}
- else if(!wasOpen) return;
+ if(!wasOpen && linkedItem!==key) return;
+ linkedItem='';revealedLinkedItem='';
  if(write && location.hash===placeHash) writePlace();
 }
 function ownerChipSelection(selection,nextOwner){
@@ -1155,7 +1156,7 @@ function followRecordLink(event){
  const key=new URLSearchParams(link.hash.slice(1)).get('item');
  if(!key) return;
  event.preventDefault();
- jump(key);
+ jump(key,{keepItemOnMissing:true});
 }
 dialogDetail?.addEventListener('click',followRecordLink);
 function bind(){
