@@ -837,6 +837,53 @@ def _file() -> Path:
     return Path(_file_override() or _default_file()).expanduser()
 
 
+def _record_lock_path(record: Path) -> Path:
+    return record.with_name(record.name + ".lock")
+
+
+def _operation_lock_path(record: Path) -> Path:
+    return record.with_name("operation.lock")
+
+
+@dataclass(frozen=True)
+class StaffWorktreeWriteAvailable:
+    """No held lock prevents the staff worktree write."""
+
+
+@dataclass(frozen=True)
+class StaffWorktreeWriteLockHeld:
+    lock: Path
+
+
+def _probe_worktree_write(*, check_operation: bool) -> StaffWorktreeWriteAvailable | StaffWorktreeWriteLockHeld:
+    from scripts.lib import file_lock
+
+    record = _file()
+    locks = (_record_lock_path(record),)
+    if check_operation:
+        locks = (_operation_lock_path(record), *locks)
+    for lock in locks:
+        try:
+            if file_lock.probe_existing_exclusive(lock) is file_lock.LockAvailability.HELD:
+                return StaffWorktreeWriteLockHeld(lock.absolute())
+        except OSError as error:
+            raise StaffUnreadable(f"cannot check staff lock {lock}: {error}") from error
+    return StaffWorktreeWriteAvailable()
+
+
+def worktree_write_lock_status() -> StaffWorktreeWriteAvailable | StaffWorktreeWriteLockHeld:
+    """Check the staff locks on the machine that writes the record."""
+    if is_owner():
+        return _probe_worktree_write(check_operation=False)
+    match _remote(["worktree-write-lock-status"]):
+        case {"state": "available"}:
+            return StaffWorktreeWriteAvailable()
+        case {"state": "held", "lock": str() as lock} if Path(lock).is_absolute():
+            return StaffWorktreeWriteLockHeld(Path(lock))
+        case _:
+            raise StaffUnreadable("invalid worktree write lock status from the staff owner")
+
+
 def is_owner() -> bool:
     """An explicit STAFF_FILE is local state owned by this process."""
     from scripts.agents import remote
@@ -1068,7 +1115,7 @@ def operation() -> AbstractContextManager[None]:
 
     @contextmanager
     def locked() -> Generator[None]:
-        path = _file().parent / "operation.lock"
+        path = _operation_lock_path(_file())
         if _joined_operation(path):
             yield
             return
@@ -1490,7 +1537,7 @@ def wait_for_writes() -> None:
 
     path = _file()
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.with_name(path.name + ".lock").open("a", encoding="utf-8") as lock:
+    with _record_lock_path(path).open("a", encoding="utf-8") as lock:
         worker_lifecycle.acquire_flock(lock, mode=fcntl.LOCK_SH)
 
 
@@ -1656,7 +1703,7 @@ def _record_transaction(edit: Callable[[list[StaffRow], set[StaffId]], _Result])
     path = _file()
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        with path.with_name(path.name + ".lock").open("a", encoding="utf-8") as lock:
+        with _record_lock_path(path).open("a", encoding="utf-8") as lock:
             worker_lifecycle.acquire_flock(lock)
             for temporary in path.parent.glob(f".{path.name}.*"):
                 temporary.unlink()
@@ -2439,6 +2486,8 @@ def _parser() -> argparse.ArgumentParser:
 
     parser = argparse.ArgumentParser(description=__doc__)
     verbs = parser.add_subparsers(dest="verb", required=True)
+    lock_status = verbs.add_parser("worktree-write-lock-status", help=argparse.SUPPRESS)
+    _ = lock_status.add_argument("--json", action="store_true")
     for command in ("set-worker-role", "set-home"):
         fact = verbs.add_parser(command, help=argparse.SUPPRESS)
         _ = fact.add_argument("target")
@@ -2636,6 +2685,14 @@ def _mutate(arguments: _Arguments, seed_text: str) -> StaffRow | StaffSnapshot |
 
 
 def _main(arguments: _Arguments) -> int:
+    if arguments.verb == "worktree-write-lock-status":
+        if not is_owner():
+            raise StaffRefused("the staff owner must check the worktree write lock")
+        status = _probe_worktree_write(check_operation=True)
+        lock_result = ({"state": "held", "lock": str(status.lock)} if isinstance(status, StaffWorktreeWriteLockHeld)
+                       else {"state": "available"})
+        print(json.dumps(lock_result))
+        return 0
     if arguments.verb == "producer-creation":
         action = arguments.creation_action
         creation = producer_creation_registry("read" if action == "read-named" else action,

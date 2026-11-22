@@ -11,6 +11,7 @@ import io
 import fcntl
 import json
 import os
+from errno import EACCES
 import select
 import signal
 import socket
@@ -83,6 +84,17 @@ def fake_process(proc: Path, pid: int, *, cwd: str = "/", fds: tuple[str, ...] =
     for number, target in enumerate(fds):
         (entry / "fd" / str(number)).symlink_to(target)
     _ = (entry / "maps").write_text(maps)
+
+
+def fake_process_status(process: Path, state: str, *, capabilities: int = 0, threads: int = 1) -> None:
+    uid = os.geteuid()
+    _ = (process / "status").write_text(
+        f"State:\t{state}\nUid:\t{uid}\t{uid}\t{uid}\t{uid}\n"
+        + f"CapPrm:\t{capabilities:016x}\nThreads:\t{threads}\n")
+
+
+def fake_caller_capabilities(proc: Path, capabilities: int = 0) -> None:
+    _ = write(proc / "self" / "status", f"CapPrm:\t{capabilities:016x}\n")
 
 
 BOOT = 1000
@@ -892,6 +904,137 @@ class ProcessUseTests(TmpSweepCase):
         used = tmp_sweep.process_paths(str(self.proc), str(self.tmp) + os.sep)
         assert isinstance(used, tmp_sweep.ProcessUsesKnown)
         self.assertEqual(used.paths, [(str(self.tmp / "used"), 17, "works in it")])
+
+    def test_process_scan_can_include_root_and_executable(self) -> None:
+        fake_caller_capabilities(self.proc)
+        root = self.tmp / "root"
+        executable = self.tmp / "bin/tool"
+        fake_process(self.proc, 17)
+        process = self.proc / "17"
+        fake_process_status(process, "S")
+        (process / "root").symlink_to(root)
+        (process / "exe").symlink_to(executable)
+        used = tmp_sweep.process_paths(str(self.proc), str(self.tmp), require_readable_user_processes=True)
+        self.assertIsInstance(used, tmp_sweep.ProcessUsesKnown)
+        assert isinstance(used, tmp_sweep.ProcessUsesKnown)
+        self.assertEqual(used.paths, [(str(root), 17, tmp_sweep.WORKS_IN), (str(executable), 17, tmp_sweep.MAPS_FILE)])
+        self.assertEqual(used.unreadable_process_pids, ())
+
+    def test_process_scan_skips_a_zombie(self) -> None:
+        fake_caller_capabilities(self.proc)
+        fake_process(self.proc, 17, cwd=str(self.tmp))
+        process = self.proc / "17"
+        fake_process_status(process, "Z")
+        leader = process / "task/17"
+        leader.mkdir(parents=True)
+        fake_process_status(leader, "Z")
+        with mock.patch.object(os, "readlink", side_effect=AssertionError("read a zombie path")):
+            used = tmp_sweep.process_paths(str(self.proc), str(self.tmp), require_readable_user_processes=True)
+        self.assertEqual(used, tmp_sweep.ProcessUsesKnown([]))
+
+    def test_process_scan_reads_the_working_directories_of_live_threads(self) -> None:
+        fake_caller_capabilities(self.proc)
+        process = self.proc / "17"
+        process.mkdir()
+        targets = [self.tmp / "worker-18", self.tmp / "worker-19"]
+        for tid, state, cwd in ((17, "Z", self.tmp / "leader"), (18, "S", targets[0]), (19, "R", targets[1])):
+            task = process / "task" / str(tid)
+            task.mkdir(parents=True)
+            fake_process_status(task, state)
+            (task / "cwd").symlink_to(cwd)
+        for leader_state in ("Z", "S"):
+            with self.subTest(leader_state=leader_state):
+                fake_process_status(process, leader_state, threads=3)
+                used = tmp_sweep.process_paths(str(self.proc), str(self.tmp), require_readable_user_processes=True)
+                assert isinstance(used, tmp_sweep.ProcessUsesKnown)
+                self.assertEqual(sorted(used.paths), [(str(cwd), 17, tmp_sweep.WORKS_IN) for cwd in targets])
+                self.assertEqual(used.unreadable_process_pids, ())
+
+    def test_process_scan_reports_a_cwd_link_owned_by_another_user(self) -> None:
+        fake_caller_capabilities(self.proc)
+        fake_process(self.proc, 17, cwd=str(self.tmp))
+        process = self.proc / "17"
+        fake_process_status(process, "S")
+        _ = (process / "comm").write_text("fixture-monitor\n")
+        with (mock.patch.object(os, "lstat", return_value=mock.Mock(st_uid=os.geteuid() + 1)) as ownership,
+              mock.patch.object(os, "readlink", side_effect=PermissionError(EACCES, "denied"))):
+            used = tmp_sweep.process_paths(str(self.proc), str(self.tmp), require_readable_user_processes=True)
+        ownership.assert_called_once_with(str(process / "cwd"))
+        self.assertEqual(used, tmp_sweep.ProcessUsesKnown(
+            [], unreadable_cwd_pids=(17,), kernel_hidden=(tmp_sweep.KernelHiddenProcess(17, "fixture-monitor"),)))
+        self.assertEqual(tmp_sweep.process_paths(str(self.proc), str(self.tmp)),
+                         tmp_sweep.ProcessUsesKnown([(str(self.tmp), 17, tmp_sweep.WORKS_IN)]))
+
+    def test_process_scan_checks_readable_paths_of_a_non_dumpable_process(self) -> None:
+        fake_caller_capabilities(self.proc)
+        fake_process(self.proc, 17, cwd=str(self.tmp))
+        fake_process_status(self.proc / "17", "S")
+        with mock.patch.object(os, "lstat", return_value=mock.Mock(st_uid=os.geteuid() + 1)) as ownership:
+            used = tmp_sweep.process_paths(str(self.proc), str(self.tmp), require_readable_user_processes=True)
+        ownership.assert_not_called()
+        self.assertEqual(used, tmp_sweep.ProcessUsesKnown([(str(self.tmp), 17, tmp_sweep.WORKS_IN)]))
+
+    def test_process_scan_preserves_readable_paths_when_the_kernel_hides_other_paths(self) -> None:
+        fake_caller_capabilities(self.proc)
+        mapped = self.tmp / "mapped"
+        fake_process(self.proc, 17, cwd=str(self.tmp), maps=f"00-01 r--p 0 00:1 1 {mapped}\n")
+        process = self.proc / "17"
+        fake_process_status(process, "S")
+        _ = (process / "comm").write_text("fixture-monitor\n")
+        with (mock.patch.object(os, "lstat", return_value=mock.Mock(st_uid=os.geteuid() + 1)),
+              mock.patch.object(os, "readlink", side_effect=PermissionError(EACCES, "denied"))):
+            used = tmp_sweep.process_paths(str(self.proc), str(self.tmp), require_readable_user_processes=True)
+        self.assertEqual(used, tmp_sweep.ProcessUsesKnown(
+            [(str(mapped), 17, tmp_sweep.MAPS_FILE)], unreadable_cwd_pids=(17,),
+            kernel_hidden=(tmp_sweep.KernelHiddenProcess(17, "fixture-monitor"),)))
+
+    def test_process_scan_reports_a_process_with_an_extra_permitted_capability(self) -> None:
+        fake_caller_capabilities(self.proc, 0b1010)
+        fake_process(self.proc, 17, cwd=str(self.tmp))
+        process = self.proc / "17"
+        fake_process_status(process, "S", capabilities=0b0011)
+        _ = (process / "comm").write_text("fixture-capable\n")
+        with mock.patch.object(os, "readlink", side_effect=PermissionError(EACCES, "denied")):
+            used = tmp_sweep.process_paths(str(self.proc), str(self.tmp), require_readable_user_processes=True)
+        self.assertEqual(used, tmp_sweep.ProcessUsesKnown(
+            [], unreadable_cwd_pids=(17,), kernel_hidden=(tmp_sweep.KernelHiddenProcess(17, "fixture-capable"),)))
+
+    def test_process_scan_distinguishes_denied_paths_from_vanished_paths(self) -> None:
+        fake_caller_capabilities(self.proc, 0b1010)
+        fake_process(self.proc, 17)
+        process = self.proc / "17"
+        fake_process_status(process, "S", capabilities=0b0010)
+        for failure, unreadable in ((PermissionError(EACCES, "denied"), (17,)), (FileNotFoundError("gone"), ())):
+            with self.subTest(failure=failure), mock.patch.object(os, "readlink", side_effect=failure):
+                used = tmp_sweep.process_paths(str(self.proc), str(self.tmp), require_readable_user_processes=True)
+            self.assertIsInstance(used, tmp_sweep.ProcessUsesKnown)
+            assert isinstance(used, tmp_sweep.ProcessUsesKnown)
+            self.assertEqual(used.unreadable_process_pids, unreadable)
+            self.assertEqual(used.kernel_hidden, ())
+        (process / "maps").unlink()
+        (process / "maps").mkdir()
+        used = tmp_sweep.process_paths(str(self.proc), str(self.tmp), require_readable_user_processes=True)
+        self.assertIsInstance(used, tmp_sweep.ProcessUsesKnown)
+        assert isinstance(used, tmp_sweep.ProcessUsesKnown)
+        self.assertEqual(used.unreadable_process_pids, (17,))
+
+    def test_failed_proc_scan_and_partial_lsof_keep_every_entry(self) -> None:
+        self.now = time.time() + 8 * DAY
+        idle = write(self.tmp / "idle" / "a")
+        used = write(self.tmp / "used" / "a")
+        with mock.patch.object(os, "scandir", side_effect=PermissionError("proc scan failed")):
+            incomplete = tmp_sweep.process_paths(str(self.proc), str(self.tmp))
+        self.assertIsInstance(incomplete, tmp_sweep.ProcessUsesIncomplete)
+        with (mock.patch.object(tmp_sweep, "process_paths", return_value=incomplete),
+              mock.patch.object(tmp_sweep, "lsof_paths", side_effect=AssertionError("unexpected fallback"))):
+            unavailable = self.sweep()
+        self.assertIn(str(idle.parent), unavailable.kept[tmp_sweep.NO_PROC])
+        self.assertIn(str(used.parent), unavailable.kept[tmp_sweep.NO_PROC])
+        self.proc.rmdir()
+        with mock.patch.object(tmp_sweep, "LSOF", ("sh", "-c", "printf 'p42\\nfcwd\\nn/elsewhere\\n'; exit 1")):
+            partial = self.sweep()
+        self.assertIn(str(idle.parent), partial.kept[tmp_sweep.NO_PROC])
+        self.assertIn(str(used.parent), partial.kept[tmp_sweep.NO_PROC])
 
     def test_lsof_scan_has_explicit_known_and_unavailable_results(self) -> None:
         for output in ("p17\nfcwd\nn/tmp/used\n", "p17\nfcwd\nn/elsewhere\n"):
