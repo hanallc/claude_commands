@@ -77,9 +77,9 @@ class MacReturnTests(OffloadCommandFixture):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assert_wire("passed", "")
 
-    # The service retains the claim when its probe finds no process.
-    @unittest.expectedFailure
-    def test_service_observation_after_reboot_clears_the_kept_claim_without_a_new_run(self) -> None:
+    # The probe finds no process and keeps the claim for the next run (F1a).
+    # A kept claim holds no work, so the Mac stays free and allowed.
+    def test_service_observation_after_reboot_keeps_the_claim_and_leaves_the_mac_free(self) -> None:
         kept = self.lose_mac_run()
         self.reboot_fixture_mac()
         admission = caller_admission(self, self.root, self.environment)
@@ -96,16 +96,28 @@ class MacReturnTests(OffloadCommandFixture):
             remaining = claim_state.read_claims(paths)
             free = mac_test.free_now(paths, self.config_path, self.repository)
 
-        self.assertIsInstance(evidence, placement.FreshHostEvidence)
         assert isinstance(evidence, placement.FreshHostEvidence)
-        self.assertEqual(evidence.eligibility, placement.AllowedHost())
         (reference, observation), = evidence.executions
-        self.assertEqual(reference.claim_id, kept["claim_id"])
-        self.assertIsInstance(observation, execution_identity.ExecutionEvidenceUnavailable)
-        self.assertEqual((self.stub_directory / "selector-answer").read_text(), "")
-        self.assertEqual(self.events_for("rsync"), [])
-        self.assertEqual(free, "free")
-        self.assertEqual(remaining, ())
+        self.assertEqual({
+            "eligibility": evidence.eligibility,
+            "observed claim": reference.claim_id,
+            "observation": type(observation),
+            "selector answer": (self.stub_directory / "selector-answer").read_text(),
+            "rsync calls": self.events_for("rsync"),
+            "free": free,
+            "kept claims": [claim.record["claim_id"] for claim in remaining],
+            "claims holding work": [claim.record["claim_id"] for claim in remaining
+                                    if mac_test.run_holds_work(claim.record)],
+        }, {
+            "eligibility": placement.AllowedHost(),
+            "observed claim": kept["claim_id"],
+            "observation": execution_identity.ExecutionEvidenceUnavailable,
+            "selector answer": "",
+            "rsync calls": [],
+            "free": "free",
+            "kept claims": [kept["claim_id"]],
+            "claims holding work": [],
+        })
 
     def test_placement_uses_natedev_when_the_mac_probe_fails(self) -> None:
         self.fixture.update(probe_status=255, probe_lines=[], probe_error="fixture Mac is off")
