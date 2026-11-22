@@ -251,11 +251,11 @@ h3 { margin: 12px 0 4px; font-size: 0.88rem; font-weight: 600; }
 .queue-grip svg { width: 19px; height: 19px; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; }
 .queue-grip[aria-pressed="true"] { cursor: grabbing; color: var(--ink); }
 body:has(.queue-lift) #tip { visibility: hidden; }
-.wrow.queue-lift { z-index: 2; outline: 1px solid #4f8ff0; border-radius: 6px;
-  background: var(--card); box-shadow: 0 6px 18px #0005; transform: translate(3px, -2px); }
-.queue-lift > td, .queue-lift > th, .queue-highlight, .queue-highlight > td, .queue-highlight > th {
-  background: color-mix(in srgb, #4f8ff0 14%, transparent); }
-.queue-highlight { border-radius: 6px; }
+.queue-lift { transform: translateY(-2px); }
+.walk-chart, .walk.beside .walk-table { z-index: 1; }
+.queue-emphasis { position: absolute; inset-inline: 0; border-radius: 6px; pointer-events: none;
+  background: color-mix(in srgb, #4f8ff0 14%, var(--card)); }
+.queue-emphasis.lift { outline: 1px solid #4f8ff0; box-shadow: 0 6px 18px #0005; transform: translateY(-2px); }
 .queue-feedback { display: inline-flex; align-items: baseline; gap: 12px; margin: 8px 0 0; padding: 6px 12px;
   border-radius: 7px; background: var(--ink); color: var(--card); font-size: 0.88rem; }
 .queue-feedback[hidden] { display: none; }
@@ -1389,8 +1389,8 @@ function queueMessage(text, action = null) {
   queueAction = action;
 }
 
-function queueGrip(row) {
-  if (!queueAccess?.token || !row.move || row.kind === "cloud") return "";
+function queueGrip(row, ready) {
+  if (!ready || !queueAccess?.token || !row.move || row.kind === "cloud") return "";
   const active = row.move.row_id === queueDrag?.row.move.row_id;
   const title = active && queueDrag.blocked ? queueBumpTip : queueGripTip;
   return `<button type="button" class="queue-grip" data-move-id="${esc(row.move.row_id)}"
@@ -1399,7 +1399,8 @@ function queueGrip(row) {
 }
 
 function queueReading(d) {
-  if (!queueReply || d.move_revision !== queueReply.previous) {
+  if (!queueReply || !d.move_revision) return d;
+  if (d.move_revision !== queueReply.previous) {
     queueReply = null;
     return d;
   }
@@ -1408,6 +1409,8 @@ function queueReading(d) {
     const row = rows.get(member.row_id);
     return row ? [{...row, move:member}] : [];
   });
+  if (ordered.length !== rows.size || ordered.length !== queueReply.line.members.length)
+    return {...d, queueReady:false};
   let index = 0;
   return {...d, move_revision:queueReply.line.revision,
     waiters:d.waiters.flatMap(row => row.move ? ordered.slice(index, ++index) : [row])};
@@ -1425,6 +1428,7 @@ function showQueue(d) {
 function beginQueueDrag(id, pointer) {
   if (!latest || queueSending || !queueAccess?.token) return false;
   const reading = queueReading(latest);
+  if (!reading.move_revision || reading.queueReady === false) return false;
   const row = reading.waiters.find(item => item.move?.row_id === id);
   if (!row) return false;
   queueDrag = {reading, rows:reading.waiters, row, pointer, destination:null, blocked:false};
@@ -1492,11 +1496,12 @@ async function sendQueueMove(row, revision, destination, id = queueRequestId()) 
         queueHighlight = "";
         if (latest) showQueue(latest);
       }, queueAccess.highlight_seconds * 1000);
-      const label = [rowUnit(row), row.name].filter(Boolean).join(" · ");
+      const {unit, step} = row.title ?? olderStepTitle(row);
+      const label = [ownerText(unit), publicText(step)].filter(Boolean).join(" · ");
       queueMessage(`${label} moved from ${result.old_place} to ${result.new_place}`,
         undo ? null : {label:"Undo", run:() => {
           const current = queueReading(latest);
-          if (!current.move_revision || !current.waiters.some(item => item.move?.row_id === row.move.row_id)) {
+          if (current.queueReady === false || !current.move_revision || !current.waiters.some(item => item.move?.row_id === row.move.row_id)) {
             queueMessage("Undo not available");
             return;
           }
@@ -1526,16 +1531,18 @@ $("walk").addEventListener("pointerdown", event => {
   $("walk").setPointerCapture(event.pointerId);
   renderWalk(queueDrag.reading);
 });
+function queueRowAt(event) {
+  const row = document.elementFromPoint(event.clientX, event.clientY)?.closest(".wait[data-tip]");
+  return queueDrag.rows.find(item => item.move && row?.dataset.tip === `wait:${item.key}`);
+}
+
 $("walk").addEventListener("pointermove", event => {
   if (queueDrag?.pointer !== event.pointerId) return;
-  const button = document.elementFromPoint(event.clientX, event.clientY)?.closest(".wrow")?.querySelector(".queue-grip");
-  const neighbor = queueDrag.rows.find(row => button && row.move?.row_id === button.dataset.moveId);
-  previewQueueMove(neighbor);
+  previewQueueMove(queueRowAt(event));
 });
 $("walk").addEventListener("pointerup", event => {
   if (queueDrag?.pointer !== event.pointerId) return;
-  const button = document.elementFromPoint(event.clientX, event.clientY)?.closest(".wrow.wait")?.querySelector(".queue-grip");
-  const neighbor = queueDrag.rows.find(row => button && row.move?.row_id === button.dataset.moveId);
+  const neighbor = queueRowAt(event);
   if (neighbor && neighbor.move.group !== queueDrag.row.move.group) queueDrag.blocked = true;
   finishQueueDrag(Boolean(neighbor));
 });
@@ -1616,7 +1623,7 @@ function renderWalk(d) {
     const rowClass = `wait${i === 0 ? " wait-first" : ""}${state}`;
     cells(place, w.name, ago(w.since, d.read_at), rowUnit(w), w.pid, w.machine ? [w.machine] : w.targets || [], null, tip, w.verify?.verb, rowClass);
     const note = ["build space", "the build in the same Cargo folder"].includes(w.why) ? w.reason : "";
-    rows.push(`<div class="wrow ${rowClass}${w.kind === "cloud" ? " cloud-work" : ""}" data-tip="${tip}">${queueGrip(w)}${rowLabel(w.name, rowOwner(w, true), note)}` +
+    rows.push(`<div class="wrow ${rowClass}${w.kind === "cloud" ? " cloud-work" : ""}" data-tip="${tip}">${queueGrip(w, d.move_revision && d.queueReady !== false)}${rowLabel(w.name, rowOwner(w, true), note)}` +
       (w.kind === "cloud" ? cloudStatus(w, tip) : rowMemory(tip)) +
       `</div>`);
   });
@@ -1780,6 +1787,14 @@ function fitWalkDetails() {
     const height = Math.ceil(Math.max(row.getBoundingClientRect().height, metadata.getBoundingClientRect().height));
     row.style.minHeight = `${height}px`;
     metadata.style.height = `${height}px`;
+  }
+  walk.querySelectorAll(".queue-emphasis").forEach(node => node.remove());
+  for (const row of walk.querySelectorAll(".wrow.queue-lift, .wrow.queue-highlight")) {
+    const field = document.createElement("div");
+    field.className = row.classList.contains("queue-lift") ? "queue-emphasis lift" : "queue-emphasis";
+    field.style.top = `${row.offsetTop}px`;
+    field.style.height = `${row.offsetHeight}px`;
+    walk.append(field);
   }
   const queueRow = table.querySelector("tr.queue-head");
   const queueSpacer = walk.querySelector(".walk-chart .queue-head");

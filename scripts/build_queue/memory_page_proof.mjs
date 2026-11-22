@@ -452,7 +452,8 @@ try {
         const template = readings.spacing.waiters.find(row => row.kind !== 'cloud');
         const units = ['admin-console', 'unit-board', 'aws', 'postmaster', 'typesafe'];
         queueFixture = {...structuredClone(readings.spacing), move_revision:'fixture',
-          waiters:units.map((unit, index) => ({...template, unit, detail:unit, name:'test affected',
+          waiters:units.map((unit, index) => ({...template, key:unit, unit, detail:unit,
+            name:queueDragProof ? 'test affected' : `${unit} test affected`, title:{unit, step:'test affected'},
             showrunner:['sdlc','sdlc','builds','natedev','natedev'][index],
             since:fixtureTime - (14 - index * 3) * 60, pid:500 + index,
             need:1.2 + index / 10, machine:'natedev', place:index + 1,
@@ -480,18 +481,28 @@ try {
           action:document.querySelector('#queue-action').hidden ? '' : document.querySelector('#queue-action').textContent
         })`);
         await evaluate("document.querySelector('#walk .queue-title').scrollIntoView({block:'center'}); true");
-        const point = unit => evaluate(`(() => {
-          const box = document.querySelector('[data-move-id="' + ${JSON.stringify(unit)} + '"]').getBoundingClientRect();
+        const point = selector => evaluate(`(() => {
+          const box = document.querySelector(${JSON.stringify(selector)}).getBoundingClientRect();
           return {x:box.left+box.width/2, y:box.top+box.height/2};
         })()`);
-        const start = await point('typesafe');
-        const target = await point('unit-board');
+        const grip = unit => point(`.queue-grip[data-move-id="${unit}"]`);
+        const cell = (unit, name) => point(`tr[data-tip="wait:${unit}"] .${name}`);
+        const start = await grip('typesafe');
+        const target = await cell('unit-board', 'place');
         await call('Input.dispatchMouseEvent',{type:'mousePressed', ...start, button:'left', buttons:1, clickCount:1});
         await call('Input.dispatchMouseEvent',{type:'mouseMoved', ...target, button:'left', buttons:1});
         const preview = await snapshot();
         if (!queueDragProof) {
           assert.deepEqual(preview.handles,['admin-console','typesafe','unit-board','aws','postmaster']);
           assert.equal(preview.lifted,'typesafe');
+          assert.ok(await evaluate(`(() => {
+            const bounds = selector => document.querySelector(selector).getBoundingClientRect();
+            const emphasis = bounds('.queue-emphasis.lift');
+            const chart = bounds('.wrow.queue-lift');
+            const table = bounds('tr.queue-lift');
+            return emphasis.left === chart.left && emphasis.right >= table.right &&
+              emphasis.top === chart.top && Math.abs(emphasis.top - table.top) < 1;
+          })()`));
           assert.deepEqual(preview.places,['1','2','3','4','5','cloud']);
           await evaluate('renderReading({...latest, read_at:latest.read_at+1}); true');
           assert.deepEqual(await snapshot(),preview);
@@ -537,6 +548,28 @@ try {
         })()`);
         await waitForLine('unit-board · test affected moved from 2 to 3');
         assert.deepEqual((await snapshot()).handles, ['admin-console', 'aws', 'unit-board', 'postmaster', 'typesafe']);
+        const moveStart = await grip('typesafe');
+        const moveTarget = await cell('aws', 'machine');
+        await call('Input.dispatchMouseEvent',{type:'mousePressed', ...moveStart, button:'left', buttons:1, clickCount:1});
+        await call('Input.dispatchMouseEvent',{type:'mouseMoved', ...moveTarget, button:'left', buttons:1});
+        queueFixture = structuredClone(queueFixture);
+        queueFixture.move_revision += 'joined';
+        queueFixture.waiters.splice(1, 0, {...template, key:'new-unit', unit:'new-unit', pid:650,
+          title:{unit:'new-unit', step:'test affected'}, move:{row_id:'new-unit', group:''}});
+        await call('Input.dispatchMouseEvent',{type:'mouseReleased', ...moveTarget, button:'left', buttons:0, clickCount:1});
+        await waitForLine('The queue changed.');
+        assert.deepEqual((await snapshot()).handles, []);
+        assert.ok(await evaluate('queueReading(latest).move_revision !== ' + JSON.stringify(queueFixture.move_revision)));
+        servedReading = queueFixture;
+        await evaluate('pageRefresh.refresh(true)');
+        assert.deepEqual((await snapshot()).handles, ['admin-console', 'new-unit', 'aws', 'unit-board', 'postmaster', 'typesafe']);
+        const retryStart = await grip('typesafe');
+        const retryTarget = await cell('new-unit', 'machine');
+        await call('Input.dispatchMouseEvent',{type:'mousePressed', ...retryStart, button:'left', buttons:1, clickCount:1});
+        await call('Input.dispatchMouseEvent',{type:'mouseMoved', ...retryTarget, button:'left', buttons:1});
+        await call('Input.dispatchMouseEvent',{type:'mouseReleased', ...retryTarget, button:'left', buttons:0, clickCount:1});
+        await waitForLine('typesafe · test affected moved from 6 to 2');
+        assert.deepEqual((await snapshot()).handles, ['admin-console', 'typesafe', 'new-unit', 'aws', 'unit-board', 'postmaster']);
         queueFixture = null;
         servedReading = base;
       }

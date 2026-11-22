@@ -4206,21 +4206,40 @@ class ReviewLinksServerTests(unittest.TestCase):
         configuration = self.root / "queue-move-conf"
         configuration.mkdir()
         _ = write_config_fixture(configuration / "build_queue.conf",
-            "move_owner_login=nate@example.invalid\nmove_timeout_seconds=3\n"
-            + "move_request_bytes=512\nmove_highlight_seconds=2\n")
+            "move_timeout_seconds=3\nmove_request_bytes=512\nmove_highlight_seconds=2\n")
+        _ = write_config_fixture(configuration / "review_links.conf", "kill_operator_login=local-node-owner\n")
         origin = f"http://127.0.0.1:{self.port}"
         request = admission.QueueMoveRequest("1" * 32, "2" * 32, "3" * 32, admission.QueueDrop("4" * 32, "before"))
         line = records.QueueMoveLine("5" * 32, (records.QueueMoveMember(request.row_id, ""),))
         content = cast(dict[str, object], json.loads(admission.encode_record(request)))
         del content["kind"], content["code_version"]
         headers = {"Content-Type": "application/json"}
+        remote_node: dict[str, object] = {}
+        remote_user = {"ID": 8}
+        self_node: dict[str, object] = {"UserID": 7}
+
+        def tailscale(args: list[str], **_options: object) -> subprocess.CompletedProcess[str]:
+            if args == ["tailscale", "status", "--json"]:
+                output = {"Self": self_node}
+            else:
+                self.assertEqual(args[:-1], ["tailscale", "whois", "--json", "--proto=tcp"])
+                self.assertRegex(args[-1], r"^127\.0\.0\.1:[1-9][0-9]*$")
+                output = {"Node": remote_node, "UserProfile": remote_user}
+            return subprocess.CompletedProcess(args, 0, json.dumps(output), "")
+
         with (patch.dict(os.environ, {"CONF_DIR": str(configuration)}),
               patch.object(serve, "tailscale_ip", return_value="127.0.0.1"),
-              patch.object(serve, "queue_move_owner", return_value=False) as owner,
+              patch.object(serve, "subprocess", Mock(wraps=subprocess, run=tailscale)),
               patch.object(admission_client, "move_queue",
                            return_value=admission.QueueMoveConflict(line, "The queue changed.")) as move):
             self.assertEqual(self.request(serve.QUEUE_MOVE_PATH).status, 403)
-            owner.return_value = True
+            remote_user["ID"] = 7
+            remote_node["Tags"] = ["tag:fixture"]
+            self.assertEqual(self.request(serve.QUEUE_MOVE_PATH).status, 403)
+            del remote_node["Tags"]
+            self_node["Tags"] = ["tag:fixture"]
+            self.assertEqual(self.request(serve.QUEUE_MOVE_PATH).status, 403)
+            del self_node["Tags"]
             token = self.request(serve.QUEUE_MOVE_PATH)
             self.assertEqual(token.status, 200)
             content["token"] = self.server.new_item_token

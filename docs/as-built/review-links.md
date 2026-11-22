@@ -2017,8 +2017,9 @@ One document listener also handles code blocks from page updates.
 ### Builds queue moves
 
 The Builds page requests a token with `GET /console/builds/queue-move`.
-Set `move_owner_login` in `build_queue.conf` to Nate's exact Tailscale login to enable the control.
-The console checks the connection's Tailscale login on each request.
+Each request uses the Kill control's `kill_operator(peer)` check.
+The check uses the TCP peer and rejects tagged nodes.
+By default, the operator is the owner of the untagged local Tailscale node.
 The console also checks the Tailscale address and Host.
 The JSON POST requires the same Origin and a console token.
 The console limits the request size and time with `build_queue.conf`.

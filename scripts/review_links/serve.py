@@ -57,21 +57,6 @@ QUEUE_MOVE_PATH = "/console/builds/queue-move"
 ATTACHMENT_MEDIA = {f"image.{extension}": media for media, extension in new_item_dialog.IMAGE_FORMATS.items()}
 
 
-def queue_move_owner(peer: str, login: str, timeout: float) -> bool:
-    """Check the connection's Tailscale user against the configured login."""
-    if not login:
-        return False
-    try:
-        address = str(ipaddress.ip_address(peer))
-        result = subprocess.run(["tailscale", "whois", "--json", address],
-            capture_output=True, text=True, check=True, timeout=timeout)
-        lookup = cast(dict[str, object], json.loads(result.stdout))
-        profile = lookup["UserProfile"]
-        return isinstance(profile, dict) and cast(dict[str, object], profile).get("LoginName") == login
-    except (OSError, subprocess.SubprocessError, ValueError, TypeError, KeyError):
-        return False
-
-
 def published_console_page(root: Path, path: str) -> str:
     """Recognize the decoded path of a published console page."""
     leaf = path.rsplit("/", 1)[-1]
@@ -531,6 +516,35 @@ def accepts_gzip(header: str, *, allow_wildcard: bool = False) -> bool:
             return accepted
         wildcard = accepted
     return wildcard
+
+
+def kill_operator(peer: tuple[str, int]) -> bool:
+    """Authenticate the TCP peer through Tailscale."""
+    def read(timeout: float, *args: str) -> dict[str, object]:
+        result = subprocess.run(["tailscale", *args], capture_output=True, text=True,
+                                timeout=timeout, check=True)
+        return cast(dict[str, object], json.loads(result.stdout))
+
+    try:
+        settings = conf.read_or_repository("review_links")
+        timeout = settings.number("tailscale_timeout_seconds")
+        login = settings.text("kill_operator_login")
+        if not login:
+            return False
+        address, port = peer
+        source = f"[{address}]:{port}" if ":" in address else f"{address}:{port}"
+        identity = read(timeout, "whois", "--json", "--proto=tcp", source)
+        node = cast(dict[str, object], identity["Node"])
+        user = cast(dict[str, object], identity["UserProfile"])
+        if node.get("Tags"):
+            return False
+        if login != "local-node-owner":
+            return user.get("LoginName") == login
+        local = cast(dict[str, object], read(timeout, "status", "--json")["Self"])
+        owner = local.get("UserID")
+        return not local.get("Tags") and type(owner) is int and owner > 0 and user.get("ID") == owner
+    except (OSError, KeyError, TypeError, AttributeError, ValueError, subprocess.SubprocessError):
+        return False
 
 
 class ReviewLinksHandler(SimpleHTTPRequestHandler):
@@ -1349,11 +1363,11 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                     print(f"review-links review delivery release: {error}", file=sys.stderr)
                 server.review_cache.invalidate()
 
-    def queue_move_allowed(self, settings: conf.ConfigRead, *, origin_required: bool) -> bool:
+    def queue_move_allowed(self, *, origin_required: bool) -> bool:
         if self.tailscale_refusal() or not self.same_origin(required=origin_required):
             return False
-        login = settings.value("move_owner_login", str, allow_blank=True)
-        return queue_move_owner(self.client_address[0], login, settings.number("move_timeout_seconds"))
+        server = cast(ReviewLinksServer, self.server)
+        return server.mode is ServerMode.LIVE and kill_operator(self.client_address)
 
     def queue_move_token(self, query: str) -> None:
         if self.command != "GET" or query:
@@ -1361,13 +1375,13 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             return
         settings = conf.read_or_repository("build_queue")
         try:
-            allowed = self.queue_move_allowed(settings, origin_required=False)
+            allowed = self.queue_move_allowed(origin_required=False)
             highlight = settings.number("move_highlight_seconds") if allowed else 0
         except ValueError:
             allowed = False
             highlight = 0
         if not allowed:
-            self.json_response(403, {"reason": "Queue moves require the configured Tailscale account."})
+            self.json_response(403, {"reason": "Queue moves require the operator's Tailscale account."})
             return
         server = cast(ReviewLinksServer, self.server)
         self.json_response(200, {"token": server.new_item_token, "highlight_seconds": highlight})
@@ -1375,8 +1389,8 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
     def queue_move_post(self, query: str) -> None:
         settings = conf.read_or_repository("build_queue")
         try:
-            if not self.queue_move_allowed(settings, origin_required=True):
-                self.json_response(403, {"reason": "Queue moves require the configured Tailscale account."})
+            if not self.queue_move_allowed(origin_required=True):
+                self.json_response(403, {"reason": "Queue moves require the operator's Tailscale account."})
                 return
             if query or self.headers.get_content_type() != "application/json":
                 raise ValueError("Send a queue move as JSON.")

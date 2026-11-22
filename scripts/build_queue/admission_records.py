@@ -641,7 +641,7 @@ class Waiter(TypedDict):
     since: float
     order_since: NotRequired[float]
     move_id: NotRequired[str]
-    move_position: NotRequired[int]
+    move_order: NotRequired[tuple[float, int]]
     label: NotRequired[str]
     session_id: NotRequired[str]
     session_name: NotRequired[str]

@@ -3201,7 +3201,8 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
         "report_version": report_version,
         "swap_rows": configuration.swap_rows, "leftovers": leftovers,
     }
-    if move_members and isinstance(move_line, admission_records.QueueMoveLine):
+    shown_move_ids = {row["move"].row_id for row in waiting_rows if "move" in row}
+    if shown_move_ids and shown_move_ids == move_members.keys() and isinstance(move_line, admission_records.QueueMoveLine):
         page["move_revision"] = move_line.revision
     page["render_seconds"] = time.perf_counter() - started
     return page

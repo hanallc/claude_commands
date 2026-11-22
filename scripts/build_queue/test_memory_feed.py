@@ -3848,6 +3848,12 @@ process.stdout.write(JSON.stringify({
         self.assertEqual(rows[0].get("move"), member)
         self.assertEqual(rows[0]["pid"], 900)
 
+        incomplete = replace(line, members=(*line.members, admission_records.QueueMoveMember("new-wait", "")))
+        with mock.patch.object(admission_client, "view",
+                               return_value=replace(reading, view=replace(reading.view, move_line=incomplete))):
+            stale = memory_feed.reading()
+        self.assertNotIn("move_revision", stale)
+
     def test_the_json_boundary_preserves_named_missing_states(self) -> None:
         with mock.patch.object(admission_client, "view", return_value=captured_reading()):
             payload = memory_feed.reading()

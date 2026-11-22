@@ -2365,10 +2365,14 @@ A refresh keeps the ID.
 A grant or cancellation ends the move.
 The service saves the manual order apart from the bump list in `state.json`.
 The bumped units still have priority.
-New waits join the end of a group with manual order.
+New natedev waits join the end of a group with manual order.
+The manual order applies to local admission, including grants for routed steps.
+Remote assignments use submission order within each priority group.
+The local capacity check for remote assignments uses that same order.
 Use `/build:bump` to change priority between groups.
 
 The service checks the current order revision before it commits a move.
 Its replay ledger records the reply with the new order.
 Undo restores the row between its old neighbors if they still define the destination.
 A conflict supplies the current order.
+The page requires the details of every wait in that order before it enables another move.

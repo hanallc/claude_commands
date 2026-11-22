@@ -1904,19 +1904,18 @@ class AdmissionServer:
     def _apply_move_order(self, rows: list[tuple[Path, records.RankedWaiter]]) -> list[tuple[Path, records.RankedWaiter]]:
         if not self.queue_moves.groups:
             return rows
-        arrivals: dict[str, list[str]] = {}
+        active = self._movable_wait_ids()
+        groups: dict[str, dict[str, records.RankedWaiter]] = {}
         for _, row in rows:
             member = self._move_member(row)
-            if member.row_id and member.group in self.queue_moves.groups:
-                arrivals.setdefault(member.group, []).append(member.row_id)
-        for group, arrived in arrivals.items():
-            self.queue_moves = self.queue_moves.include(group, arrived)
-        positions = {group: {row_id: index for index, row_id in enumerate(ids)}
-                     for group, ids in self.queue_moves.groups.items()}
-        for _, row in rows:
-            member = self._move_member(row)
-            if (index := positions.get(member.group, {}).get(member.row_id)) is not None:
-                row["move_position"] = index
+            if member.row_id in active and member.group in self.queue_moves.groups:
+                groups.setdefault(member.group, {})[member.row_id] = row
+        for group, waiters in groups.items():
+            self.queue_moves = self.queue_moves.include(group, waiters)
+            places = [gate.waiter_order(row)[1:] for row in waiters.values()]
+            reordered = (waiters[row_id] for row_id in self.queue_moves.groups[group] if row_id in waiters)
+            for row, place in zip(reordered, places, strict=True):
+                row["move_order"] = place
         return sorted(rows, key=lambda item: gate.waiter_order(item[1]))
 
     def _current_move_line(self, rows: list[tuple[Path, records.RankedWaiter]]) -> records.QueueMoveLine:
@@ -1925,15 +1924,18 @@ class AdmissionServer:
             self.move_line = records.QueueMoveLine(uuid.uuid4().hex, members)
         return self.move_line
 
-    def _queue_move_rows(self, *, check_owners: bool = False) -> list[tuple[Path, records.RankedWaiter]]:
-        rows, _priority = self._queue_order()
-        active = {waiting.row.get("move_id", "") for episode, waiting in self.waiters.items()
-            if waiting.row.get("move_id") and (not check_owners or
+    def _movable_wait_ids(self, *, check_owners: bool = False) -> set[str]:
+        return {waiting.row.get("move_id", "") for episode, waiting in self.waiters.items()
+            if episode not in self.current_assignments and waiting.row.get("move_id") and (not check_owners or
                 self.proc.owner_start(waiting.request.owner.pid) == LiveOwnerIdentity(waiting.request.owner.start_time))
             and ((request := self.placement_requests.get(episode)) is None
                  or (request.owner.host == self.host
                      and isinstance(self._local_placement_eligibility(request),
                                     (placement.AllowedHost, placement.EvidenceNeeded))))}
+
+    def _queue_move_rows(self, *, check_owners: bool = False) -> list[tuple[Path, records.RankedWaiter]]:
+        rows, _priority = self._queue_order()
+        active = self._movable_wait_ids(check_owners=check_owners)
         return [(path, row) for path, row in rows if row.get("move_id", "") in active]
 
     def _prune_runs(self) -> None:
@@ -2921,7 +2923,7 @@ class AdmissionServer:
         cloud = isinstance(request.place, wire.CloudPlace)
         queue_waiter = records.stored_waiter(waiting.row)
         _ = queue_waiter.pop("move_id", None)
-        _ = queue_waiter.pop("move_position", None)
+        _ = queue_waiter.pop("move_order", None)
         record = ReservationRecord(request.episode, str(stem), request.owner, 0 if cloud else profile.peak.bytes,
             profile.repo, profile.step, profile.worktree, store.utc_iso(now), request.sidecar,
             request.test_width, request.call, stem.name, queue_waiter,
@@ -3962,17 +3964,21 @@ done
             request = owners.get(records.waiter_owner(row))
             prerequisite = (self.prerequisites.get(request.episode) if request is not None
                             else placement.TokenNotRequired())
-            if (isinstance(prerequisite, placement.TokenRequired)
-                    and isinstance(prerequisite.readiness, placement.TokenReadinessUnchecked)):
+            unchecked = (isinstance(prerequisite, placement.TokenRequired)
+                         and isinstance(prerequisite.readiness, placement.TokenReadinessUnchecked))
+            if "move_order" in row or unchecked:
                 row = row.copy()
-                if "token_left_at" in row:
-                    del row["token_left_at"]
-                if "token_back_at" in row:
-                    del row["token_back_at"]
+                _ = row.pop("move_order", None)
+                if unchecked:
+                    _ = row.pop("token_left_at", None)
+                    _ = row.pop("token_back_at", None)
             preview_ordered.append((path, row))
         preview = gate.admission_pass(replace(inputs, ordered=preview_ordered), inputs.now, policy)
         local_starts = {row.owner for row in preview.rows if isinstance(row.admission, gate.ProposedAdmission)}
         ordered, _priority = self._queue_order()
+        # Remote destinations use submission order within each priority group.
+        remote_order = (sorted(ordered, key=lambda item: gate.waiter_order(item[1], allow_moves=False))
+                        if self.queue_moves.groups else ordered)
         copies = tuple(request for request in owners.values() if isinstance(request.purpose, placement.SpeculativeCopy))
         held_copy_destinations = [saved.assignment.destination
             for episode, key in self.current_assignments.items()
@@ -3987,7 +3993,7 @@ done
         taken: list[placement.PlacementDestination] = []
         holds: dict[tuple[str, placement.PlacementDestination], float] = {}
         answers: dict[tuple[str, placement.PlacementDestination], float] = {}
-        for _, row in ordered:
+        for _, row in remote_order:
             owner = records.waiter_owner(row)
             request = owners.get(owner)
             if request is None:

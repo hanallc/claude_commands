@@ -2,14 +2,19 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import json
+import os
+from typing import cast
 import unittest
 from unittest.mock import patch
 
 from scripts.build_queue import admission_protocol as wire
-from scripts.build_queue import admission_records as records
+from scripts.build_queue import admission_records as records, placement
 from scripts.build_queue.admission_test_support import AdmissionFixture, GIB
+from scripts.build_queue.test_placement import PlacementFixture, assignment_for, local_candidate, placement_request, publish_candidate
 from scripts.lint import memory_admit as gate
 from scripts.lint.memory_test_support import write_pressure_reading
+from scripts.production import land_runs
 
 
 def move_line(fixture: AdmissionFixture) -> records.QueueMoveLine:
@@ -109,21 +114,75 @@ class QueueMoveTests(unittest.TestCase):
                 "missing-neighbor", second, current.revision, wire.QueueUndo("move-again")))
             self.assertEqual(reply, wire.QueueMoveConflict(current, "Undo not available"))
 
-    def test_move_does_not_bypass_a_hold(self) -> None:
-        with AdmissionFixture() as fixture:
-            first = fixture.service_request(job="test")
-            second = fixture.service_request(job="test")
-            reasons = {request.episode: records.NatedevHeld("fixture", "Wait for landing")
-                       for request in (first, second)}
-            with patch.object(fixture.server, "_ci_hold_reasons", return_value=reasons):
-                for request in (first, second):
-                    reply, = fixture.server.handle_request(request)
-                    self.assertIsInstance(reply, wire.Wait)
+    def test_the_local_order_leaves_mac_competition_in_submission_order(self) -> None:
+        for open_local in (False, True):
+            with self.subTest(open_local=open_local), PlacementFixture() as fixture:
+                fixture.free(0)
+                fixture.hold_starts()
+                mac, first, second = [placement_request(fixture, since=fixture.clock.now() + index)
+                                     for index in range(3)]
+                mac = replace(mac, constraints=replace(mac.constraints, selection=placement.MacOnlyHost()))
+                first, second = [replace(request, prerequisite=placement.TokenNotRequired(),
+                    constraints=replace(request.constraints, candidates=(*request.constraints.candidates,
+                                                                         local_candidate(fixture))))
+                    for request in (first, second)]
+                _ = publish_candidate(fixture, mac, placement.TemporaryExclusion("busy"))
+                for request in (mac, first, second):
+                    self.assertIsInstance(fixture.server.handle_request(request)[0], wire.PlacementWait)
                 line = move_line(fixture)
                 before, after = ids(line)
                 moved, = fixture.server.handle_request(wire.QueueMoveRequest(
-                    "held-test", after, line.revision, wire.QueueDrop(before, "before")))
+                    "move", after, line.revision, wire.QueueDrop(before, "before")))
                 assert isinstance(moved, wire.QueueMoved)
                 _ = fixture.run_pass()
-                self.assertEqual(ids(move_line(fixture)), [after, before])
-                self.assertFalse(fixture.server.reservations)
+                self.assertEqual(move_line(fixture), moved.line)
+                inputs = fixture.server.last_inputs
+                assert isinstance(inputs, records.QueueInputs)
+                self.assertEqual([row["pid"] for _, row in gate.ranked_queue_waiters(inputs)],
+                                 [second.owner.pid, first.owner.pid])
+                mac_reply, = fixture.server.handle_request(mac)
+                assert isinstance(mac_reply, wire.PlacementWait)
+                self.assertEqual(mac_reply.position, 1)
+                moved_reply, = fixture.server.handle_request(second)
+                assert isinstance(moved_reply, wire.PlacementWait)
+                self.assertEqual(moved_reply.position, 2)
+                if open_local:
+                    fixture.free(60 * GIB)
+                    write_pressure_reading(fixture.root / "pressure")
+                    fixture.allow_next_start()
+                    _ = fixture.run_pass()
+                    self.assertEqual(set(fixture.server.reservations), {second.episode})
+                    self.assertIsInstance(fixture.server.handle_request(second)[0], wire.LocalPlacementGranted)
+                else:
+                    _ = publish_candidate(fixture, mac)
+                    self.assertEqual(assignment_for(fixture, mac).destination.provider, "mac")
+                    self.assertNotIn(first.episode, fixture.server.current_assignments)
+                    self.assertNotIn(second.episode, fixture.server.current_assignments)
+
+    @unittest.skipUnless(hasattr(wire, "LandingRepositoryKey"), "requires the 44eb landing protection")
+    def test_move_preserves_the_landing_test_hold(self) -> None:
+        with (AdmissionFixture(skip_idle_spacing=True) as fixture,
+              patch.dict(os.environ, {"GATE_STATE_DIR": str(fixture.root / "gate-state")}),
+              land_runs.landing(["a" * 40])):
+            for _index in range(2):
+                request = fixture.request()
+                identity = cast(dict[str, object], json.loads(wire.encode_record(request.identity)))
+                identity["landing_repository"] = {
+                    "kind": "LandingRepositoryKey", "key": "https://github.com/natepiano/claude_commands",
+                }
+                request = replace(request, identity=wire.parse_record(json.dumps(identity), wire.Identity))
+                reply, = fixture.server.handle_request(request)
+                assert isinstance(reply, wire.Wait)
+                self.assertEqual(reply.text, "waits for the landing queue")
+            line = move_line(fixture)
+            first, second = ids(line)
+            moved, = fixture.server.handle_request(wire.QueueMoveRequest(
+                "move-held-test", second, line.revision, wire.QueueDrop(first, "before")))
+            assert isinstance(moved, wire.QueueMoved)
+            _ = fixture.run_pass()
+            self.assertEqual(ids(move_line(fixture)), [second, first])
+            view, = fixture.server.handle_request(wire.ViewRequest())
+            assert isinstance(view, wire.ViewReply)
+            self.assertEqual([records.reason_phrase(wait.reason, ()) for wait in view.reading.view.waiting],
+                             ["waits for the landing queue"] * 2)
+            self.assertFalse(fixture.server.reservations)
