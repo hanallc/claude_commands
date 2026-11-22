@@ -726,21 +726,22 @@ If `env` uses another option, the guard refuses the start when a later argument 
 To limit memory, use `systemd-run --user --scope --collect -q -p MemoryMax=<cap> -- <command>`.
 The record saves the command's process group as `command_group`.
 
-1. Save the accepted stop request in the run record.
-2. Send TERM through pidfds to processes that still belong to the run slice.
-3. Give the processes the stop grace to exit.
-4. Write `1` to the slice's `cgroup.kill` if the slice is still populated.
-5. Confirm that the slice's `cgroup.events` reports `populated 0` or that the kernel removed the empty slice.
+1. Save the stop request under the record lock.
+2. Take the stop lock.
+3. Send TERM through pidfds to processes that still belong to the run slice.
+4. Give the processes the stop grace to exit.
+5. Write `1` to the slice's `cgroup.kill` if the slice is still populated.
+6. Confirm that `cgroup.events` reports `populated 0` or that the kernel removed the empty slice.
 
 An unreadable slice, a replacement directory, or a slice that stays populated after KILL produces an error.
 The record stays running until the supervisor or recovery can confirm that the slice is empty.
 The supervisor saves the exit code and cleanup intent before it releases the watcher.
 The run record saves `finished_at` when it records the confirmed end of the slice.
-Startup recovery resumes a saved stop even if the supervisor still runs.
-It resumes pending cleanup if the supervisor is gone.
-A failed hold stop retracts the request it added. A saved error cannot authorize recovery to stop the slice.
-The supervisor-loss watcher's request stays saved if a slice read fails. Recovery resumes that request.
-An empty slice with no earlier stop request keeps its normal result. Delivery sees only committed pane cancellation requests.
+The record keeps a set of stop requests separate from the result. A caller can add a request while another caller holds the stop lock.
+Only the holder retracts its own request after a failed hold stop. Recovery can still act on requests from other callers.
+Recovery resumes saved requests even if the supervisor still runs. It resumes pending cleanup if the supervisor is gone.
+A successful TERM or a write to `cgroup.kill` commits the stop result. A read error before that point leaves the result unchanged.
+If multiple requests are pending, a pane cancellation takes priority, followed by a self-stop, a watcher stop, and a hold stop.
 A run without a saved slice can receive a legacy group TERM, which reports an unconfirmed stop.
 The stop requires Linux pidfd support.
 After a normal command exit, the supervisor gives the slice members the stop grace to exit.
