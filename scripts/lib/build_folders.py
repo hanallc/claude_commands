@@ -24,6 +24,7 @@ from enum import Enum
 from pathlib import Path
 import sys
 import tempfile
+from threading import Lock
 import time
 from typing import TYPE_CHECKING, Literal, cast, final, override
 
@@ -31,6 +32,7 @@ from urllib.parse import urlsplit
 
 from scripts.lib import build_folder_lock, git_files, process_start
 from scripts.lib.boot_identity import boot_identity
+from scripts.lib.conf import UseConfiguredValue
 
 if TYPE_CHECKING:
     from scripts.lib.conf import ConfigRead
@@ -338,6 +340,8 @@ ParsedFolder = FolderForm | OutsideFolderLayout | InvalidFolderComponents | Unve
 _DECIMAL_NAME = re.compile(r"[0-9]+")
 _METADATA = re.compile(r"(.+)\.(?:lock|lease\.json(?:\.[0-9a-f]{16}\.tmp)?)")
 _UNIT_LOCKS = ".unit-locks"
+_unit_lock_claims: set[tuple[int, Path]] = set()
+_unit_lock_claims_guard = Lock()
 
 
 def metadata_folder_name(name: str) -> str:
@@ -385,9 +389,11 @@ def _parse_number(name: str) -> int:
     return int(name)
 
 
-def build_root() -> Path:
+def build_root(*, settings: ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT) -> Path:
     """Return the configured root for the local build folders."""
-    return Path(_settings().text("roots.build")).expanduser()
+    if isinstance(settings, UseConfiguredValue):
+        settings = _settings()
+    return Path(settings.text("roots.build")).expanduser()
 
 
 def repo_word(repository: Path) -> str:
@@ -435,9 +441,10 @@ def copy_path(repo: str, unit: str, number: int) -> Path:
     return unit_folder(repo, unit) / _folder_number(number)
 
 
-def unit_folder(repo: str, unit: str) -> Path:
+def unit_folder(repo: str, unit: str, *, root: Path | UseConfiguredValue = UseConfiguredValue.CURRENT) -> Path:
     """Return the parent of the unit's build outputs and copies."""
-    return build_root() / _form_name(repo) / _unit_name(unit)
+    base = root if isinstance(root, Path) else build_root()
+    return base / _form_name(repo) / _unit_name(unit)
 
 
 @contextmanager
@@ -445,19 +452,29 @@ def unit_allocation_lock(folder: Path, *, exclusive: bool) -> Generator[None]:
     """Reserve the unit name after its output folder moves or is removed."""
     root = build_root()
     lock = root / _UNIT_LOCKS / folder.relative_to(root)
-    with build_folder_lock.folder_parent(lock, root, create=True) as parent:
-        descriptor = build_folder_lock.open_lock(lock, parent, create=True)
-        try:
-            mode = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
+    claim = (os.getpid(), root.resolve() / lock.relative_to(root))
+    blocked = f"{folder}: the unit allocation lock is held. Rerun when idle"
+    with _unit_lock_claims_guard:
+        if claim in _unit_lock_claims:
+            raise BlockingIOError(blocked)
+        _unit_lock_claims.add(claim)
+    try:
+        with build_folder_lock.folder_parent(lock, root, create=True) as parent:
+            descriptor = build_folder_lock.open_lock(lock, parent, create=True)
             try:
-                fcntl.flock(descriptor, mode | fcntl.LOCK_NB)
-            except BlockingIOError as error:
-                raise BlockingIOError(f"{folder}: the unit allocation lock is held. Rerun when idle") from error
-            if not build_folder_lock.lock_current(lock, parent, descriptor):
-                raise ValueError(f"{folder}: the unit lock changed. Rerun when idle")
-            yield
-        finally:
-            os.close(descriptor)
+                mode = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
+                try:
+                    fcntl.flock(descriptor, mode | fcntl.LOCK_NB)
+                except BlockingIOError as error:
+                    raise BlockingIOError(blocked) from error
+                if not build_folder_lock.lock_current(lock, parent, descriptor):
+                    raise ValueError(f"{folder}: the unit lock changed. Rerun when idle")
+                yield
+            finally:
+                os.close(descriptor)
+    finally:
+        with _unit_lock_claims_guard:
+            _unit_lock_claims.remove(claim)
 
 
 def _resolve_form_path(path: Path) -> Path:
@@ -480,10 +497,15 @@ def parse_form(path: Path) -> ParsedFolder:
         return UnverifiedFolderPath(error)
     except RuntimeError as error:
         return UnverifiedFolderPath(OSError(errno.ELOOP, str(error), str(path)))
-    if not resolved.is_relative_to(base):
+    return parse_resolved_form(resolved, base)
+
+
+def parse_resolved_form(path: Path, build_root: Path) -> ParsedFolder:
+    """Read the folder form from a resolved path and build root."""
+    if not path.is_relative_to(build_root):
         return OutsideFolderLayout()
     try:
-        match resolved.relative_to(base).parts:
+        match path.relative_to(build_root).parts:
             case (repo, "main"):
                 return MainOutput(_form_name(repo))
             case (repo, "ci", number):
@@ -1589,6 +1611,11 @@ class RefusedRemovalLease:
 
 
 @dataclass(frozen=True)
+class RemovalLockHeld(RefusedRemovalLease):
+    lock: Path
+
+
+@dataclass(frozen=True)
 class UnreservedRemovalFolder:
     """The folder has no lock file to hold."""
 
@@ -1671,15 +1698,19 @@ def _hold_free_lease(path: Path, directory: int, stack: ExitStack, *, wait: bool
     except FileNotFoundError:
         return UnreservedRemovalFolder()
     _ = stack.callback(os.close, descriptor)
-    if not _take_lock(descriptor, fcntl.LOCK_EX, wait=wait) or not build_folder_lock.lock_current(path, directory, descriptor):
+    acquired = _take_lock(descriptor, fcntl.LOCK_EX, wait=wait)
+    if not build_folder_lock.lock_current(path, directory, descriptor):
         return RefusedRemovalLease()
+    if not acquired:
+        return RemovalLockHeld(path.with_name(path.name + ".lock"))
     _ = stack.callback(_locks.pop, descriptor, None)
     _locks[descriptor] = path
     return HeldFolderRemovalLease(path, directory, descriptor)
 
 
-def _hold_child_leases(path: Path, stack: ExitStack, *, wait: bool = True) -> bool:
-    """Hold every lease lock below path without following links. False when an owner holds one."""
+def _hold_child_leases(path: Path, stack: ExitStack, *, wait: bool = True,
+                       probe_fds: list[int] | None = None) -> RefusedRemovalLease | None:
+    """Hold every lease lock below the path. Return a refusal if a lock prevents removal."""
     def unreadable(error: OSError) -> None:
         if not isinstance(error, FileNotFoundError):
             raise error
@@ -1688,14 +1719,18 @@ def _hold_child_leases(path: Path, stack: ExitStack, *, wait: bool = True) -> bo
         for name in files:
             stem = name.removesuffix(".lock")
             if stem != name and (stem in folders or stem + ".lease.json" in files):
-                if isinstance(_hold_free_lease(Path(top) / stem, directory, stack, wait=wait), RefusedRemovalLease):
-                    return False
-    return True
+                lease = _hold_free_lease(Path(top) / stem, directory, stack, wait=wait)
+                if isinstance(lease, RefusedRemovalLease):
+                    return lease
+                if probe_fds is not None and isinstance(lease, HeldFolderRemovalLease):
+                    probe_fds.append(lease.descriptor)
+    return None
 
 
 @contextmanager
 def folder_removal_lease(path: Path, *, children: bool = False, wait: bool = True,
-                         create: bool = False, root: Path | None = None) -> Generator[FolderRemovalLease]:
+                         create: bool = False, root: Path | None = None,
+                         probe_fds: list[int] | None = None) -> Generator[FolderRemovalLease]:
     """Hold the collector's locks and return the reservation for a folder."""
     metadata = _METADATA.fullmatch(path.name)
     folder = path.with_name(metadata[1]) if metadata else path
@@ -1703,13 +1738,18 @@ def folder_removal_lease(path: Path, *, children: bool = False, wait: bool = Tru
         try:
             directory = stack.enter_context(build_folder_lock.folder_parent(folder, root or folder.parent, create=False))
             lease = _hold_free_lease(folder, directory, stack, wait=wait, create=create)
+            if probe_fds is not None:
+                probe_fds.append(directory)
+                if isinstance(lease, HeldFolderRemovalLease):
+                    probe_fds.append(lease.descriptor)
             if not isinstance(lease, RefusedRemovalLease):
                 if metadata is not None:
                     lease = UnreservedRemovalFolder()
                 elif children:
                     with suppress(FileNotFoundError):
-                        if not _hold_child_leases(folder, stack):
-                            lease = RefusedRemovalLease()
+                        refusal = _hold_child_leases(folder, stack, wait=wait, probe_fds=probe_fds)
+                        if refusal is not None:
+                            lease = refusal
         except FileNotFoundError:
             lease = UnreservedRemovalFolder()
         except (OSError, ValueError):
@@ -1890,7 +1930,7 @@ def _remove_free(path: Path, directory: int, *, wait: bool) -> bool:
         with ExitStack() as children:
             # A held lease below a free folder, or an unreadable folder below it, keeps the folder.
             try:
-                if not _hold_child_leases(path, children, wait=wait):
+                if _hold_child_leases(path, children, wait=wait) is not None:
                     return False
             except OSError:
                 return False

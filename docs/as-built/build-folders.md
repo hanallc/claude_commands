@@ -20,6 +20,8 @@ The unit word names the unit. Use a unit word for only one active unit. A new un
 
 A short name is one nonempty path component. It must contain a character other than an ASCII digit. The tool refuses `.`, `..`, slashes, and NUL characters. A short name must be free within its repo and unit. A copy number is a positive decimal integer without leading zeroes.
 
+A new unit or style production uses `worktree` as its main short name. The branch is `<unit>-worktree`.
+
 ## Worktree commands
 
 - `worktrees.py make <repo word> <unit> <short-name>` creates the source, the output link, and the worktree record.
@@ -45,6 +47,22 @@ Without a list row, migration uses a known unit word in the old folder name firs
 Migration derives the short name by removing known repo, checkout, machine, production, and unit words from the old folder name. It uses `worktree` if the result is empty. For a result made of digits, it tries the branch name with the same words removed. It adds `p` if the name still contains only digits. It keeps checkouts with no proved unit or with conflicting destinations.
 
 Migration keeps the showrunner checkouts until Nate answers question 4. This includes the Hana merge checkout and showrunner checkouts recorded in archived production documents. It keeps the user's `~/worktrees/nate_style-message-clarity` checkout. Tool-owned checkouts, such as Claude Code worktrees and temporary gate checkouts, stay with their tools.
+
+Migration keeps build unit folders, numbered copies, CI runner folders, and main outputs. It keeps checkouts that contain the build root or a build repository folder. A legacy scratch clone stays with its linked worktrees if migration must keep one of them.
+
+Both modes plan again when a saved move still has its original source. Only execution removes that saved record. Execution lists any staged copy for manual review and keeps the copy on disk. A previously published copy stays with its record for review. A move with an unverified source identity also stays with its record.
+
+A clone stays if its current linked checkouts differ from the planned set. A move on one filesystem relocates its source to the destination. A move across filesystems relocates its source to the backup. After relocation, recovery continues with publication and repair. Recovery repairs nested linked checkouts at their paths under the verified destination. Both modes plan from the Git registrations that recovery would produce. Execution writes the repair.
+
+Migration keeps a source if a process uses it as its working directory, root, or executable. It also keeps a source if a process opens or maps a file in it. Both modes check the locks without waiting. A held lock keeps the source and adds the reason `kept: <lock> held`.
+
+Migration scans the sources together and checks each source again before source relocation. The scan cannot stop a process that enters the source after the scan. The pass ends with `moved N, kept in use M, kept K`. The dry run uses `would move`. Run the same command again later to move kept folders.
+
+Linux migration checks the working directory of each live thread. It checks for live threads when the thread leader is a zombie. After `EACCES`, it checks whom the working directory link in `/proc` belongs to. It also checks whether the process has a permitted capability the caller lacks. Either cause can account for the missing paths. Migration prints `not checked (hidden by the kernel): <pid> <comm>` once per hidden process. Other read errors for processes of the current user keep every candidate. An incomplete process scan keeps every candidate on either host.
+
+Migration holds busy claims and copy leases through source relocation. A copy request waits for another process to release the unit allocation lock. A second request from the same process fails immediately.
+
+A move across filesystems holds the claims and leases during the copy and until the source reaches its backup. Migration compares source entries before and after the copy. A change makes migration discard the staged copy and keep the source.
 
 ## Cargo
 
