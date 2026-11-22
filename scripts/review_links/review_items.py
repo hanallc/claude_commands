@@ -30,7 +30,8 @@ from scripts.production.issues import Issue, PROPOSAL_TAG, source_paths
 from scripts.production.proposal_issue import DeclinedDecision, InProgress, decision_answer, proposal_progress
 from scripts.production.proposal_issue import REVIEW_MARK_FIELD, review_log, review_mark
 from scripts.production.production_doc import production_field, Refusal
-from scripts.review_links import efficiency_reviews, new_item_dialog, review_events, review_later, review_submissions
+from scripts.for_you.action import ActionStore
+from scripts.review_links import efficiency_reviews, for_you, new_item_dialog, review_events, review_later, review_submissions
 from scripts.review_links.review_events import ReviewLog as ReviewLog, ReviewMark
 
 
@@ -125,6 +126,7 @@ class ReviewType(StrEnum):
     EFFICIENCY = 'efficiency'
     BUG = 'bug'
     RESPONSE = 'response'
+    FOR_YOU = 'for-you'
 
 
 class ReviewState(StrEnum):
@@ -134,7 +136,7 @@ class ReviewState(StrEnum):
     DONE = 'Done'
 
 
-REVIEW_TYPES = tuple(ReviewType)
+REVIEW_TYPES = tuple(kind for kind in ReviewType if kind != ReviewType.FOR_YOU)
 QUESTION_TYPES = (ReviewType.QUESTION, ReviewType.RESPONSE)
 INVESTIGATION_TYPES = (ReviewType.INVESTIGATION, ReviewType.BUG)
 REVIEW_STATES = tuple(ReviewState)
@@ -272,8 +274,13 @@ class EfficiencySource:
     line: str
 
 
+@dataclass(frozen=True)
+class ForYouSource:
+    row: for_you.ForYouRow
+
+
 type ReviewSource = (ChangeSource | QuestionSource | UnownedQuestionSource | InvestigationSource
-                     | ProposalSource | ProposalLedgerSource | EfficiencySource)
+                     | ProposalSource | ProposalLedgerSource | EfficiencySource | ForYouSource)
 
 
 @dataclass(frozen=True)
@@ -312,6 +319,8 @@ def source_path(item: ReviewItem) -> Path:
     source = item.source
     if isinstance(source, (ProposalSource, QuestionSource, UnownedQuestionSource)):
         return source.record.path
+    if isinstance(source, ForYouSource):
+        return ActionStore().folder
     return source.path
 
 
@@ -386,6 +395,21 @@ def owner_for(identity: staff.StaffId, members: staff.StaffSnapshot) -> staff.St
 def name(identity: staff.StaffId, members: staff.StaffSnapshot) -> str:
     member = members.by_id(identity)
     return member.name if member is not None else str(identity)
+
+
+def for_you_item(row: for_you.ForYouRow, members: staff.StaffSnapshot) -> ReviewItem:
+    """Place one action in the shared Review table."""
+    requester = row.requester_reference or row.requested_by
+    member = members.by_member_reference(requester) if requester else None
+    owner = member.id if member is not None else staff.StaffId(row.requested_by or 'Not recorded')
+    state = {'open': ReviewState.OPEN, 'done': ReviewState.DONE,
+             'withdrawn': ReviewState.DONE, 'unknown': ReviewState.WAITING}[row.status]
+    filed = moment(row.created_at) if row.created_at else datetime.fromtimestamp(0, user_zone())
+    updated = moment(row.updated_at) if row.updated_at else filed
+    actions = ('done',) if row.status == 'open' and row.completion == 'manual' else ()
+    identity = row.key[:15] if row.kind == 'action' else row.key
+    return ReviewItem(row.key, identity, ReviewType.FOR_YOU, owner, owner, row.title, state,
+                      ReviewTimes(filed, updated), (), actions, ForYouSource(row))
 
 
 def change_state(row: dict[str, str], slots: delivery_state.DeliverySlots) -> ReviewState:
@@ -580,7 +604,7 @@ def change_items(root: Path, members: staff.StaffSnapshot, *, document: Path | N
 
 
 def question_item(record: update_registration.QuestionRecord, members: staff.StaffSnapshot, *,
-                  unowned: bool = False, assign_ids: bool = False) -> ReviewItem:
+                  unowned: bool = False) -> ReviewItem:
     owner, fields, path = record.owner, record.item, record.path
     parsed = update_registration.parse_outstanding_entries([fields], path)[0]
     filed = moment(fields['since'])
@@ -607,12 +631,6 @@ def question_item(record: update_registration.QuestionRecord, members: staff.Sta
     source = UnownedQuestionSource(record) if unowned else QuestionSource(record)
     key = 'question/'+owner+'/'+path.name
     review_id = fields.get('review_id', path.stem)
-    if assign_ids:
-        try:
-            review_id = update_registration.question_review_id(record)
-            fields['review_id'] = review_id
-        except (OSError, ValueError, staff.StaffRefused, update_registration.RegistrationFailure):
-            review_id = ''
     identity = name(owner, members)+'/'+review_id if review_id else ''
     opened = update_registration.OpenItem(name(owner, members), parsed, name(asker, members) if asker else '')
     kind = ReviewType.QUESTION if response is None else ReviewType.RESPONSE
@@ -645,7 +663,7 @@ def snapshot_store_paths(folder: Path, sources: ReviewSourceStamps) -> Iterator[
 
 def question_items(members: staff.StaffSnapshot, documents: tuple[Path, ...], *,
                    owners: tuple[staff.StaffRow, ...] = (), sources: list[Path] | None = None,
-                   include_unowned: bool = True, assign_ids: bool = False,
+                   include_unowned: bool = True,
                    states: tuple[ReviewState, ...] = REVIEW_STATES,
                    kinds: tuple[ReviewType, ...] = QUESTION_TYPES,
                    owner_options: dict[staff.StaffId, str] | None = None,
@@ -669,8 +687,7 @@ def question_items(members: staff.StaffSnapshot, documents: tuple[Path, ...], *,
         if question_state(record) not in states or not selection.includes(
                 record.path, 'question/'+record.owner+'/'+record.path.name):
             return
-        item = (question_item(record, members, unowned=unowned, assign_ids=True) if assign_ids
-                else question_item(record, members, unowned=unowned))
+        item = question_item(record, members, unowned=unowned)
         if item.type in kinds:
             found.append(item)
 
@@ -1145,6 +1162,16 @@ class ReviewRecordMissing(ReviewRecordChanged):
 def read_current(root: Path, item: ReviewItem, members: staff.StaffSnapshot) -> ReviewItem:
     """Reread the exact record. Use the snapshot owner for an Efficiency ledger."""
     source = item.source
+    if isinstance(source, ForYouSource):
+        if source.row.kind == 'action':
+            record = ActionStore().get(item.key)
+            requester = next((member.name for member in members.rows
+                              if record.requested_by in (member.id, member.current_session)), record.requested_by)
+            return for_you_item(for_you.action_row(record, requester), members)
+        for row in for_you.read(members=members).rows:
+            if row.key == item.key:
+                return for_you_item(row, members)
+        raise ReviewRecordMissing('This item is no longer on the list.')
     prerequisite = Path(item.queue_after) if isinstance(source, ProposalSource) and item.queue_after else None
     selection = ExactReviewRecord(source_path(item), item.key, item.owner, prerequisite)
     if isinstance(source, ProposalSource) and 'review_submission' in source.record.fields:
@@ -1238,15 +1265,15 @@ def ordered(items: list[ReviewItem], sources: list[Path] | None = None) -> list[
 def read(root: Path, *, members: staff.StaffSnapshot | None = None,
          kinds: tuple[ReviewType, ...] = REVIEW_TYPES, show: str = 'all',
          owner_options: dict[staff.StaffId, str] | None = None,
-         sources: list[Path] | None = None, assign_ids: bool = True) -> list[ReviewItem]:
+         sources: list[Path] | None = None) -> list[ReviewItem]:
     """Read each record from its existing store without another stored copy."""
     members = staff.snapshot() if members is None else members
-    return project(root, members, kinds, selected_states(show), owner_options, sources, ALL_RECORDS, assign_ids=assign_ids)
+    return project(root, members, kinds, selected_states(show), owner_options, sources, ALL_RECORDS)
 
 
 def project(root: Path, members: staff.StaffSnapshot, kinds: tuple[ReviewType, ...], states: tuple[ReviewState, ...],
             owner_options: dict[staff.StaffId, str] | None, sources: list[Path] | None,
-            selection: ReviewSelection, *, assign_ids: bool = False) -> list[ReviewItem]:
+            selection: ReviewSelection) -> list[ReviewItem]:
     """Select the requested records and apply the shared projection."""
     documents = tuple(dict.fromkeys(doc for member in members.rows if isinstance(member.doc, staff.LiveDoc)
                                     if (doc := record_store.local_document(member)) is not None))
@@ -1254,7 +1281,7 @@ def project(root: Path, members: staff.StaffSnapshot, kinds: tuple[ReviewType, .
     question_kinds = tuple(kind for kind in kinds if kind in QUESTION_TYPES)
     if question_kinds:
         items.extend(question_items(members,documents,states=states,kinds=question_kinds,owner_options=owner_options,
-                                   sources=sources,selection=selection,assign_ids=assign_ids))
+                                   sources=sources,selection=selection))
     if ReviewType.CHANGE in kinds:
         items.extend(change_items(root,members,states=states,owner_options=owner_options,sources=sources,selection=selection))
     reports = tuple(kind for kind in kinds if kind in INVESTIGATION_TYPES)

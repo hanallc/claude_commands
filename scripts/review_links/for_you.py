@@ -12,7 +12,7 @@ from ipaddress import IPv4Address
 from pathlib import Path
 from typing import Literal, cast
 
-from scripts.for_you.action import ActionStore
+from scripts.for_you.action import ActionStore, UserAction
 from scripts.direct import recorder_state
 from scripts.lib import conf
 from scripts.production import staff
@@ -51,6 +51,8 @@ class ForYouRow:
     completion: Literal["manual", "automatic"]
     evidence: str
     requests: tuple[RebuildRequest, ...] = ()
+    updated_at: str = ""
+    requester_reference: str = ""
 
 
 @dataclass(frozen=True)
@@ -124,6 +126,28 @@ def _completed_requests(names: Mapping[str, str], waiting_work: Callable[[str], 
     return tuple(records)
 
 
+def action_row(record: UserAction, requester: str) -> ForYouRow:
+    """Project one stored action for Review and the notifier."""
+    return ForYouRow(record.key, "action", record.title, record.command, record.machine, record.cwd,
+                     requester, record.reason, record.waits, record.created_at, record.status, record.completion,
+                     record.evidence or record.withdraw_reason, updated_at=record.updated_at,
+                     requester_reference=record.requested_by)
+
+
+def rebuild_config() -> Path:
+    return conf.path("statusline") if "CONF_DIR" in os.environ else rebuild_row.DEFAULT_CONFIG
+
+
+def source_paths() -> tuple[Path, ...]:
+    """Watch the native action sources and the rebuild comparison."""
+    config = rebuild_config()
+    paths = (ActionStore().folder, need.needs_folder(), need.needs_folder() / "done", config)
+    try:
+        return (*paths, rebuild_row.cache_path(config))
+    except (OSError, ValueError, KeyError):
+        return paths
+
+
 def _comparison_reason(machine: str, changes: Mapping[str, rebuild_row.ComparedChanges], configured: str) -> str:
     change = changes.get(machine)
     reason = "The running system differs from the configured system."
@@ -139,14 +163,16 @@ def _comparison_reason(machine: str, changes: Mapping[str, rebuild_row.ComparedC
     return reason
 
 
-def read(config: Path = rebuild_row.DEFAULT_CONFIG, *,
-         rebuild: rebuild_row.RebuildAnswer | None = None, include_comparison_reason: bool = True) -> ForYouSnapshot:
+def read(config: Path | None = None, *,
+         rebuild: rebuild_row.RebuildAnswer | None = None, members: staff.StaffSnapshot | None = None,
+         include_comparison_reason: bool = True) -> ForYouSnapshot:
     """Project both stores and the comparison cache without running a rebuild or a refresh."""
+    config = rebuild_config() if config is None else config
     unavailable: list[UnavailableSource] = []
     names: dict[str, str] = {}
     members_by_reference: dict[str, staff.StaffRow] = {}
     try:
-        members = staff.snapshot()
+        members = staff.snapshot() if members is None else members
         for member in members.rows:
             names[str(member.id)] = member.name
             members_by_reference[str(member.id)] = member
@@ -180,10 +206,7 @@ def read(config: Path = rebuild_row.DEFAULT_CONFIG, *,
     rows: list[ForYouRow] = []
     try:
         for record in ActionStore().list():
-            rows.append(ForYouRow(record.key, "action", record.title, record.command, record.machine, record.cwd,
-                                  names.get(record.requested_by, record.requested_by), record.reason, record.waits,
-                                  record.created_at, record.status, record.completion,
-                                  record.evidence or record.withdraw_reason))
+            rows.append(action_row(record, names.get(record.requested_by, record.requested_by)))
     except (OSError, ValueError) as error:
         unavailable.append(UnavailableSource("actions", str(error)))
 

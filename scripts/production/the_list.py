@@ -1592,11 +1592,18 @@ def unread_answer_ids(item: ListItem) -> frozenset[str]:
 def mark_read(keeper: staff.StaffId, identity: str, *, source: str,
               update: UnreadUpdate | NoUnreadUpdate | ReadCurrentUpdate = ReadCurrentUpdate.CURRENT,
               page_request: PageRequest | NoPageRequest = NoPageRequest.ABSENT) -> ListItem:
+    return mark_read_edit(keeper, identity, source=source, update=update, page_request=page_request).item
+
+
+def mark_read_edit(keeper: staff.StaffId, identity: str, *, source: str,
+                   update: UnreadUpdate | NoUnreadUpdate | ReadCurrentUpdate,
+                   page_request: PageRequest | NoPageRequest) -> ListEdit:
+    """Return the result and the item read under the write lock."""
     def edit(item: ListItem, _: datetime) -> ListItem:
         if update is not ReadCurrentUpdate.CURRENT and unread_update(item) != update:
             return item
         return replace(item, unread_since=NoTimestamp.UNSET)
-    return _change(keeper, identity, edit, MarkedRead(), source, unread=False, page_action=page_request).item
+    return _change(keeper, identity, edit, MarkedRead(), source, unread=False, page_action=page_request)
 
 
 def is_page_request_receipt(entry: ItemChange) -> bool:
