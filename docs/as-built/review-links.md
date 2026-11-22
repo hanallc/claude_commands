@@ -161,7 +161,7 @@ Selected-row links with `--production NAME C27` still open their own signed `cha
 The console sends `Cache-Control: no-store`, a same-origin content policy, and permits same-origin framing.
 Its title is **Hana console**, followed by the selected page title.
 
-The left navigation has icons and labels for Accounts, AWS, AWS Machines, Builds, Disks, Images, List and Review.
+The left navigation has icons and labels for Accounts, AWS, AWS Machines, Builds, Disks, Images, List, Review and Placement disk POC.
 The desktop has no top bar: each page shows its title once, as its own heading.
 Every page uses `page_frame.STYLE`.
 Each page centers its main column in the console frame, with a maximum width of 1124px.
@@ -401,10 +401,11 @@ Each poll reads the change lists once, about 0.1 seconds of server time.
 The Changes and Questions items functions share that read through `NewsRequest.shared`.
 
 The console vendors SVGs from `lucide-static` **0.468.0** under `scripts/review_links/lucide/`.
-They are `list-checks`, `message-circle-question`, `hammer`, `cloud`, `image`, `refresh-cw`, `sparkle`, `x`, `panel-left-close`, `panel-left-open`, and `menu`.
-The Accounts page also uses `chevron-down` and `minus` from the same set.
-That folder includes the version, source, and ISC license.
-The console inlines the icons and makes no CDN, font, script, or stylesheet request.
+`torus.svg` comes from `lucide-static` **1.77.0**, because 0.468.0 has no torus icon.
+The console navigation can use only the names in `console.ICON_NAMES`.
+Other pages use more icons from the same folder.
+That folder includes the versions, the sources, and the ISC license.
+The console shell inlines the icons and makes no CDN, font, script, or stylesheet request.
 
 ### Review page
 
@@ -1549,6 +1550,16 @@ An agent deletes an image with this command:
 ~/.claude/scripts/lib/py ~/.claude/scripts/review_links/images.py delete --id ID
 ```
 
+### Placement disk POC page
+
+`/console/placement-disk.html` shows the placement disk proof of concept from Hanadocs.
+It is the last navigation entry, with the label `Placement disk POC` and the `torus` icon.
+The server reads the HTML file named by `placement_disk.file` in `config/console.conf` on each request.
+It does not copy the file, so an edit to the file shows after a page refresh.
+The server adds the page owner control at the first `<h1>` after `<main>`.
+When the file is missing or unreadable, the server returns 503 with `The Placement disk POC page is not available.`
+The page loads three.js from cdnjs. Served page documents send no Content-Security-Policy, so the load works in the console frame.
+
 ### Rebuilds page
 
 `/console/rebuilds.html` lists machines that require a rebuild and shows commit details.
@@ -2168,6 +2179,9 @@ The status line watches `change_review.conf` and `review_links.conf` so folder a
 The alert guard uses only the configured folder.
 `REVIEW_LINKS_ROOT` overrides the delivery folder.
 The page, the footer and `/next` use these same folder readers.
+
+The server reads `placement_disk.file` in `config/console.conf` on each Placement disk POC request.
+A `~` at the start of the path expands to the home folder.
 
 
 Legacy Changes and Questions forms and the Images page share one motion helper.
