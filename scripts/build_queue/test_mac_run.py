@@ -1843,9 +1843,10 @@ with patch.object(Path, "unlink", interrupt_unlink), patch.object(Path, "replace
 
         run_process = subprocess.CompletedProcess(["fixture-admission"], 0, stdout="")
         with mock.patch.object(Path, "home", return_value=self.root), \
+                mock.patch.object(mac_queue_run, "owning_session", return_value=NoOwningSession()), \
                 mock.patch.object(mac_queue_run, "admission_command", return_value=["fixture-admission"]), \
                 mock.patch.object(mac_queue_run, "capture_command",
-                                  return_value=(0, "a\tb\tfixture-mac\td\tepisode\tattempt")), \
+                                  return_value=(0, "a\tb\tfixture-mac\td\tepisode\tattempt", "")), \
                 mock.patch.object(mac_queue_run, "run_callback", side_effect=callback) as lifecycle, \
                 mock.patch.object(mac_queue_run, "stream_remote") as run, \
                 mock.patch.object(subprocess, "run", return_value=run_process):

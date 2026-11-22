@@ -563,6 +563,7 @@ def _paused_resume_needs_message(row: staff.StaffRow) -> bool:
 def _lifecycle(options: CommandLine) -> int:
     from scripts.production import session_staff
 
+    why = options.why
     try:
         record = staff.initial_snapshot()
     except (OSError, ValueError, staff.StaffRefused) as error:
@@ -579,7 +580,7 @@ def _lifecycle(options: CommandLine) -> int:
         rows = [row] if row is not None else []
         if not rows:
             if options.command == "resume":
-                return _result_code(stop_resume.resume(options.session, why=options.why, to=options.to))
+                return _result_code(stop_resume.resume(options.session, why=why, to=options.to))
             raise staff.StaffNotFound(staff.StaffId(options.session))
     code = 0
     for row in rows:
@@ -606,17 +607,28 @@ def _lifecycle(options: CommandLine) -> int:
                     try:
                         if isinstance(row.paused, staff.Paused):
                             _ = staff.resume(str(row.id))
-                        result = stop_resume.resume(str(row.id), why=options.why, to=options.to)
+                        result = stop_resume.resume(str(row.id), why=why, to=options.to)
                         started = isinstance(result, stop_resume.ClaudeUp)
-                        if started and isinstance(row.exited, staff.Exited):
+                        if started and row.kind != "producer" and isinstance(row.exited, staff.Exited):
                             _ = staff.resume(str(row.id))
                         code = max(code, _result_code(result))
                     finally:
                         if not started and isinstance(row.paused, staff.Paused):
                             _ = staff.set_hold(str(row.id), row.paused)
             continue
+        if options.command == "exit" and row.kind == "producer":
+            if _worktree_is_remote(row):
+                outcome = unit_remote_command("exit-producer", row, record, why=why)
+                stopped = outcome["code"]
+            else:
+                result = stop_resume.stop_producer(row.id, why, deadline=worker_lifecycle.effective_deadline())
+                stopped = 0 if isinstance(result, (stop_resume.Stopped, stop_resume.NotRunning)) else _result_code(result)
+            if not stopped:
+                print(f"{row.name}: exited")
+            code = max(code, stopped)
+            continue
         already_exited = options.command == "exit" and isinstance(row.exited, staff.Exited)
-        held = row if already_exited else staff.pause(str(row.id), options.why)
+        held = row if already_exited else staff.pause(str(row.id), why)
         remote_exit = options.command == "exit" and _worktree_is_remote(row)
         if options.finish_step and not remote_exit:
             _finish_tasks(row, record)
@@ -633,7 +645,7 @@ def _lifecycle(options: CommandLine) -> int:
             if stopped:
                 continue
             if not already_exited:
-                held = staff.exit(str(row.id), options.why)
+                held = staff.exit(str(row.id), why)
         else:
             _ = _message(row, "Finish your current turn. Hold at the prompt. Do not start new work. Wait for agents resume.")
         print(f"{row.name}: {'exited' if isinstance(held.exited, staff.Exited) else 'paused'}")
@@ -856,9 +868,10 @@ def main(argv: list[str] | None = None) -> int:
         if options.command in ("pause", "exit", "resume"):
             return _lifecycle(options)
         record = staff.initial_snapshot()
-        row = record.by_member_reference(options.session) or record.by_path(options.session)
+        member = record.by_member_reference(options.session)
         matches = [member for member in record.rows if member.name == options.session]
-        row = row or (matches[0] if len(matches) == 1 else None)
+        named = matches[0] if len(matches) == 1 else None
+        row = member or record.by_path(options.session) or named
         if options.dry_run:
             target = stop_resume.stop_target(options.session)
             if isinstance(target, (stop_resume.SessionNotFound, stop_resume.StopFailed)):
@@ -869,7 +882,10 @@ def main(argv: list[str] | None = None) -> int:
             print(f"{row.name if row is not None else options.session}: would stop")
             return 0
         unresolved = stop_resume.stop_unit_workers(row.id, record) if row is not None and row.kind in ("unit", "showrunner") else []
-        result = stop_resume.stop(options.session, deadline=worker_lifecycle.effective_deadline())
+        deadline = worker_lifecycle.effective_deadline()
+        target = member or named
+        result = (stop_resume.stop_producer(target.id, "agents stop ran", deadline=deadline)
+                  if target is not None and target.kind == "producer" else stop_resume.stop(options.session, deadline=deadline))
         return max(_result_code(result), int(bool(unresolved)))
     except staff.StaffRefused as error:
         print(f"shutdown: StaffRefused: {error}", file=sys.stderr)
@@ -1380,7 +1396,8 @@ def retirement_journal(row: staff.StaffRow) -> Path:
 
 
 def unit_remote_command(action: str, row: staff.StaffRow, record: staff.StaffSnapshot,
-                        *, merge_branch: str = "", zone: str = "UTC", finish_step: bool = False) -> LocalUnitOutcome:
+                        *, merge_branch: str = "", zone: str = "UTC", finish_step: bool = False,
+                        why: str | None = None) -> LocalUnitOutcome:
     """Run machine-bound work and require an attributed remote answer."""
     location = row.worktree
     assert not isinstance(location, staff.WorktreeUnfilled)
@@ -1391,6 +1408,8 @@ def unit_remote_command(action: str, row: staff.StaffRow, record: staff.StaffSna
             raise ValueError(f"worktree belongs to this machine: {location.machine}")
         payload = {"action": action, "identity": str(row.id), "merge_branch": merge_branch, "zone": zone, "finish_step": finish_step,
                    "rows": [member.to_json() for member in record.rows]}
+        if why is not None:
+            payload["why"] = why
         status, output = run_remote(["_unit-local"], stdin=json.dumps(payload), limit=remote.WhileLinkAlive(kind="while link alive"))
         if status == 255:
             raise ValueError("remote command is unreachable or has no status")
@@ -1433,7 +1452,15 @@ def unit_local_command() -> int:
         try:
             if not unit_machine_is_local(location.machine):
                 raise ValueError(f"worktree belongs to {location.machine}")
-            if fields["action"] == "stop":
+            if fields["action"] == "exit-producer" and row.kind == "producer":
+                with staff.row_operation(str(row.id)):
+                    current = staff.initial_snapshot().rows_by_id.get(row.id)
+                    if current is None or current.current_session != row.current_session or current.worktree != location:
+                        raise ValueError("the producer changed before the stop")
+                    stopped = stop_resume.stop_producer(row.id, str(fields["why"]),
+                        deadline=worker_lifecycle.effective_deadline(), save_exit_after_stop=True)
+                result["code"] = int(bool(_result_code(stopped)))
+            elif fields["action"] == "stop":
                 if fields.get("finish_step"):
                     _finish_tasks(row, record)
                 reasons = stop_resume.stop_unit_workers(row.id, record)
@@ -1515,7 +1542,8 @@ def unit_local_command() -> int:
                     _ = unit_config.write_parked(row.id, replace(config, retired=facts))
             else:
                 raise ValueError("unknown remote lifecycle action")
-        except (OSError, ValueError, herdr_types.HerdrFailure, unit_config.ConfigRefused, conf.Unusable, subprocess.SubprocessError) as error:
+        except (OSError, ValueError, staff.StaffRefused, staff.StaffNotFound,
+                herdr_types.HerdrFailure, unit_config.ConfigRefused, conf.Unusable, subprocess.SubprocessError) as error:
             result["code"] = 1
             print(f"anomaly: {row.name}: {' '.join(str(error).splitlines())}")
     result["output"] = output.getvalue()
