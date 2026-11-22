@@ -282,7 +282,7 @@ class FastTrackTests(MergeCheckpointFixture):
             "scripts/sample/test_item.py": DIRECT_TEST,
             "scripts/sample/test_item_extra.py": DIRECT_TEST,
             "scripts/sample/test_unrelated.py": "raise AssertionError('full suite ran')\n",
-            "scripts/production/merge_gate.py": "raise AssertionError('gate ran')\n",
+            "scripts/production/gate.py": "raise AssertionError('gate ran')\n",
         }.items():
             self.write(self.checkout, path, content)
         copy_startup(self.checkout)
@@ -312,17 +312,17 @@ class FastTrackTests(MergeCheckpointFixture):
         bounded_git = self.bin / "bounded-git"
         self.env["FAST_TRACK_BOUND_GIT"] = str(bounded_git)
         self.env.update({
-            "MERGE_GATE_BASEDPYRIGHT": "basedpyright",
+            "GATE_BASEDPYRIGHT": "basedpyright",
             "FAST_TRACK_STATE_DIR": str(self.records_dir),
             "FAST_TRACK_TEST_EVENTS": str(self.events_path), "FAST_TRACK_TEST_CONTROL": str(self.control),
             "FAST_TRACK_TEST_LOCK": str(self.common_directory / "main-push.lock"),
-            "MERGE_GATE_BASEDPYRIGHT": str(self.bin / "basedpyright"),
+            "GATE_BASEDPYRIGHT": str(self.bin / "basedpyright"),
         })
         _ = self.env.pop("FAST_TRACK_TEST_RECORD_GIT", None)
         self.settings = {
             "max_changed_lines": 100, "max_files": 10, "check_time_limit_seconds": 30,
             "max_push_attempts": 2, "fetch_lock_attempts": 3, "fetch_lock_wait_seconds": 0,
-            "refused_paths": ["scripts/production/add_unit.py", "scripts/agents/*.py",
+            "refused_paths": ["scripts/production/add_unit.py", "scripts/production/gate.py", "scripts/agents/*.py",
                               "private-hooks/", "**/staff.json"],
         }
         self.save_config()
@@ -1231,10 +1231,13 @@ owner.verify=verify
         self.assert_refused(self.fast_track(str(outside)))
 
     def test_sensitive_paths_are_refused_before_any_check(self) -> None:
-        for path in ("scripts/production/add_unit.py", "scripts/agents/fixture.py",
-                     "private-hooks/nested/check.py", "state/private/staff.json"):
+        paths = (
+            "scripts/production/add_unit.py", "scripts/production/gate.py",
+            "scripts/agents/fixture.py", "private-hooks/nested/check.py", "state/private/staff.json",
+        )
+        for path in paths:
             with self.subTest(path=path):
-                self.write(self.unit, path, "refused edit\n")
+                self.write(self.unit, path, "VALUE = 1\n")
                 self.assert_refused(self.fast_track(path), f"refused path: {path}")
         self.assertEqual(self.observations("types"), [])
 
