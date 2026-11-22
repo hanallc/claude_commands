@@ -145,8 +145,10 @@ def _context(session_id: str, now: float, limit: Limits) -> str:
     _write(session_id, {**record, "updated_at": now})
     if updated is None:
         return head + ("Your text to nate this turn is one short update: what you last had on deck with him, "
-                       "in a few words, and the question whether he is willing to look at it. "
+                       "what it is about and what he decides, in one or two sentences, "
+                       "and the question whether he is willing to look at it. "
                        f"Show it in full only after he says yes. With nothing on deck, {NO_TEXT}. Rule: {RULE}.")
-    return head + ("Your text to nate this turn is one short update with only the news since your last update, "
-                   "and the question whether he is willing to look at what you have on deck. "
+    return head + ("Your text to nate this turn is one short update with only the news since your last update. "
+                   "Each news point says what the thing is in his words, then the news, then the cause. "
+                   "End with the question whether he is willing to look at what you have on deck. "
                    f"With no news, {NO_TEXT}. Rule: {RULE}.")

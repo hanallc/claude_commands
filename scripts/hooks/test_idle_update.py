@@ -38,6 +38,7 @@ class IdleUpdateContextTests(unittest.TestCase):
         text = idle_update.context("fixture", 1300, LIMITS)
         self.assertIn("for 5 min", text)
         self.assertIn("what you last had on deck with him", text)
+        self.assertIn("what it is about and what he decides", text)
         self.assertIn("only after he says yes", text)
 
     def test_turns_before_the_renewal_end_with_a_dash_alone(self) -> None:
@@ -54,6 +55,7 @@ class IdleUpdateContextTests(unittest.TestCase):
         _ = idle_update.context("fixture", 1300, LIMITS)
         text = idle_update.context("fixture", 1950, LIMITS)
         self.assertIn("only the news since your last update", text)
+        self.assertIn("what the thing is in his words, then the news, then the cause", text)
         self.assertIn("This turn has no text for nate", idle_update.context("fixture", 1960, LIMITS))
 
     def test_a_typed_prompt_ends_the_mode(self) -> None:
