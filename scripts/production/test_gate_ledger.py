@@ -184,8 +184,6 @@ roots.workspace={root / 'workspaces'}
 roots.session={root / 'session'}
 roots.copies={root / 'copies'}
 roots.scratch={root / 'scratch'}
-roots.mirror={root / 'mirrors'}
-roots.shell={root / 'shells'}
 # whole: 1..
 folders.unused_days=2
 # whole: 1..

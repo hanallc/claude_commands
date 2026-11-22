@@ -49,6 +49,9 @@ Run these steps in order for each completed loop or verbose phase:
    Retain pane workers and their native conversations under <LongLivedWorkers/>.
    Then run <RecordPhaseCompletion/>, including `finish-phase` and deletion of the
    inactive reservation state file before the next phase writes its own.
+   When the phase used its own model worktree, after the checkpoint reaches origin, run `~/.claude/scripts/lib/py ~/.claude/scripts/worktree/worktrees.py remove <path>`.
+   Send the reported checkout and output paths to the showrunner as a removal list.
+   Use a distinct short name `p<phase id>` for each phase.
 6. **Next launch.** In loop mode or an active auto window with a next phase,
    run <NextPhase/> through that phase's <LaunchImplementation/>. The review has
    settled its Work Order; the phase's workers do not edit the plan doc.

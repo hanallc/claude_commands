@@ -4,7 +4,8 @@ argument-hint: "<showrunner name> [check] [--pilot <unit>[=<crate>,...]]"
 ---
 
 Run from the repository's main showrunner checkout, once per repository.
-This creates the style branch, the excluded production document and the configured standing plans.
+A new style production uses the `worktree` short name and branch `<repo>-style-worktree`.
+The command creates the excluded production document and the configured standing plans.
 It starts the style showrunner through the configured showrunners account.
 An existing style production attaches to yours. A second branch point is refused.
 Pass your model id and effort level; `check` prints the steps without acting.

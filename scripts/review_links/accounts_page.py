@@ -363,8 +363,8 @@ SortValue = str | float | None
 SortValues = dict[str, SortValue]
 ACCOUNT_COLUMNS = (
     ("", "left"), ("account", "left"), ("", "left"), ("left", "right"),
-    ("used / hour", "right"), ("empty at", "left"), ("resets", "right"),
-    ("credits", "right"), ("enabled", "left"),
+    ("roles", "left"), ("used / hour", "right"), ("empty at", "left"),
+    ("resets", "right"), ("credits", "right"), ("enabled", "left"),
 )
 ROLE_COLUMNS = (("role", "left"), ("", "left"), ("account", "left"), ("next", "left"),
                 *((key, "right") for key in accounts.COUNT_COLUMNS))
@@ -408,7 +408,7 @@ def _forecast_dash(reason: str) -> str:
 
 
 def _accounts_table(reading: accounts.StatusReading, details: dict[str, accounts.BoardRow],
-                    alerts: Mapping[str, QuotaAlert]) -> str:
+                    roles_by_account: dict[str, list[accounts.BoardSpan]], alerts: Mapping[str, QuotaAlert]) -> str:
     histories = run_out.read_readings(run_out.READINGS_LOG)
     rows: list[str] = []
     values: list[SortValues] = []
@@ -436,9 +436,14 @@ def _accounts_table(reading: accounts.StatusReading, details: dict[str, accounts
             empty_text = _forecast_dash("The weekly reset time is unavailable.")
         else:
             empty_text = _forecast_dash("The estimated run-out time has passed.")
+        roles = roles_by_account.get(label, [])
+        role_text = ", ".join(span["text"] for span in roles)
+        role_title = f' title="{html.escape(role_text, quote=True)}"' if role_text else ""
+        role_content = ", ".join(_spans([span]) for span in roles)
         rows.append("<tr>" + _cell(f'<span title="{dot}" aria-label="{dot}">{_spans(cells["dot"])}</span>')
                     + f'<td class="left" data-account-name>{_spans(cells["label"])}</td>'
                     + _cell(_swatch(cells["label"])) + _cell(left, "right")
+                    + f'<td class="left account-roles"{role_title}>{role_content}</td>'
                     + _cell(f"{rate:.1f}%" if rate is not None else no_rate, "right") + _cell(empty_text)
                     + _cell(_spans(cells["resets"]), "right") + _cell(_spans(cells["credits"]), "right")
                     + _cell(_spans(cells["enabled"])) + "</tr>")
@@ -447,7 +452,7 @@ def _accounts_table(reading: accounts.StatusReading, details: dict[str, accounts
                        "used / hour": rate, "empty at": _timestamp(empty), "resets": _timestamp(reset),
                        "credits": float("inf") if row.credits == "unlimited" else
                        row.credits if isinstance(row.credits, (int, float)) else None,
-                       "enabled": 1 if row.use_credits else None})
+                       "enabled": 1 if row.use_credits else None, "roles": role_text.casefold() or None})
     problems = "".join(f"<li>{html.escape(note.removeprefix('* '))}</li>" for note in reading.notes)
     return _split_card("Accounts", "accounts", "account", ACCOUNT_COLUMNS, rows, values,
                        descending=("credits", "enabled"),
@@ -465,14 +470,18 @@ def _role_count(assignments: list[tuple[str, accounts.BoardRow]], key: str) -> t
     return _role_lines([_spans(cell) for cell in spans]), total
 
 
+def _ordered_role_assignments(role: str, lines: list[tuple[str, accounts.BoardRow]],
+                              selected: dict[str, tuple[str, ...]]) -> list[tuple[str, accounts.BoardRow]]:
+    """Put selected accounts first. The first selected account supplies the default."""
+    return sorted(lines, key=lambda item: role not in selected[item[0]])
+
+
 def _roles_table(reading: accounts.StatusReading, groups: dict[str, list[tuple[str, accounts.BoardRow]]],
                  details: dict[str, accounts.BoardRow], total: accounts.BoardRow | None) -> str:
     labels = {label: line["cells"]["label"][0] for label, line in details.items()}
-    selected = {row.label: row.selected_roles for row in reading.rows}
     rows: list[str] = []
     values: list[SortValues] = []
-    for role, lines in sorted(groups.items()):
-        assignments = sorted(lines, key=lambda item: role not in selected[item[0]])
+    for role, assignments in groups.items():
         first_label, first = assignments[0]
         role_span = first["cells"]["roles"][:1]
         move = accounts.account_board_next_move(first, reading.first_next_moves)
@@ -525,8 +534,16 @@ def board(reading: accounts.StatusReading, alerts: Mapping[str, QuotaAlert] | No
             details[label] = line
         if role := cells["roles"][0]["text"]:
             groups.setdefault(role, []).append((label, line))
-    return (_accounts_table(reading, details, alerts or {})
-            + _roles_table(reading, groups, details, lines[-1] if lines else None))
+    selected = {row.label: row.selected_roles for row in reading.rows}
+    ordered_groups = {role: _ordered_role_assignments(role, members, selected)
+                      for role, members in sorted(groups.items())}
+    roles_by_account: dict[str, list[accounts.BoardSpan]] = {}
+    for role, assignments in ordered_groups.items():
+        default, line = assignments[0]
+        if role in selected[default]:
+            roles_by_account.setdefault(default, []).append(line["cells"]["roles"][0])
+    return (_accounts_table(reading, details, roles_by_account, alerts or {})
+            + _roles_table(reading, ordered_groups, details, lines[-1] if lines else None))
 
 
 def _model_cell(row: accounts.ModelsBoardRow, column: accounts.BoardColumn) -> str:
@@ -619,6 +636,7 @@ table{border-collapse:collapse;font-size:var(--table-font-size);font-variant-num
 /* Let the last sort arrow use the right padding of the card. */
 .card .scroll{margin-right:calc(-1 * var(--column-gap));padding-right:var(--column-gap)}
 th,td{padding:5px 0 5px var(--column-gap);white-space:nowrap}th:first-child,td:first-child{padding-left:0}
+.account-roles{max-width:32ch;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 th{color:var(--ink-2);font-weight:600;border-bottom:1px solid var(--line)}
 th[aria-sort]{cursor:pointer}
 th[aria-sort]:focus-visible{outline:2px solid var(--accent);outline-offset:-2px}

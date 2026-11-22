@@ -434,7 +434,7 @@ class MacTestCommandTests(NotificationGuardedTestCase):
 
     def write_config(self, **changes: str | None) -> None:
         values: dict[str, str] = {
-            "ci_repo": "natepiano/hana",
+            "ci_repo": "hanallc/hana",
             "ci_variable": "MACOS_CI",
             "ci_workflow": "ci.yml",
             "ci_job": CI_JOB,
@@ -771,7 +771,7 @@ class MacTestCommandTests(NotificationGuardedTestCase):
                 errors = io.StringIO()
                 with mock.patch.dict(os.environ, self.environment), redirect_stderr(errors):
                     config = mac_test.read_config()
-                self.assertEqual(config.ci_repo, "natepiano/hana")
+                self.assertEqual(config.ci_repo, "hanallc/hana")
                 self.assertIn("warning:", errors.getvalue())
                 self.assertIn(str(self.config_path), errors.getvalue())
         empty = self.root / "no-history"
@@ -1430,6 +1430,14 @@ finally:
         self.state_directory.mkdir(exist_ok=True)
         _ = (self.state_directory / "run.json").write_text(json.dumps(record), encoding="utf-8")
         return record
+
+    def test_read_claims_keeps_whole_mac_scope_for_relative_legacy_worktree(self) -> None:
+        record = self.write_machine_wide_record(os.getpid(), Path("repositories/hana"))
+        paths = mac_test.StatePaths(self.state_directory)
+
+        claim, = mac_test.read_claims(paths)
+
+        self.assertEqual((claim.scope, claim.path, claim.record), (mac_test.WHOLE_MAC, paths.run, record))
 
     def test_machine_wide_record_holds_the_repository_its_worktree_is_in(self) -> None:
         hana, liner = self.repository("hana"), self.repository("cargo-liner")
@@ -2383,7 +2391,7 @@ for arguments in (
             + "  alpha: 2 runs, newest 222222222\n"
             + "  zeta: 1 runs, newest 333333333\n"
             + "Run CI again on each branch's newest commit to make up its macOS check: "
-            + "gh workflow run ci.yml --repo natepiano/hana --ref <branch>\n",
+            + "gh workflow run ci.yml --repo hanallc/hana --ref <branch>\n",
         )
 
     def test_skipped_run_report_handles_none_failure_and_two_hundred(self) -> None:
