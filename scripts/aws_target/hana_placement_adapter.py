@@ -379,16 +379,6 @@ def configured_route(configuration: conf.ConfigRead, repository: str, kind: str)
     return settings
 
 
-def hana_capacity(policy: EnabledHanaRoute, snapshot: box.HanaLifecycleEvidence,
-                  held: list[claim_state.HeldClaim]) -> placement.HanaCapacity:
-    """Count each claim once across the target and lifecycle records."""
-    from scripts.build_queue import placement
-
-    ids = frozenset(claim.execution for claim in snapshot.claims)
-    return placement.HanaCapacity(policy.repository_key, policy.max_steps,
-                                  ids.union(claim.record['claim_id'] for claim in held))
-
-
 def read_evidence(key: placement.HostEvidenceKey, request: HanaEvidenceRequest, *,
                   transport: HanaControlTransport, workload: conf.ConfigRead) -> placement.HostEvidence:
     """Read Hana evidence and release claims for ended local holders when safe."""
@@ -460,9 +450,8 @@ def read_evidence(key: placement.HostEvidenceKey, request: HanaEvidenceRequest, 
                             snapshot = refreshed
                         continue
             held.append(claim)
-        capacity = hana_capacity(policy, snapshot, held)
         if resources_held:
-            return placement.FreshHostEvidence(key, now, '', placement.TemporaryExclusion('busy'), hana=capacity)
+            return placement.FreshHostEvidence(key, now, '', placement.TemporaryExclusion('busy'))
         block = mac_test.blocking_claim_block(paths, key.session)
     adopted: list[placement.AdoptedProviderClaim] = []
     cleanup: list[placement.RetainedCleanupClaim] = []
@@ -491,8 +480,7 @@ def read_evidence(key: placement.HostEvidenceKey, request: HanaEvidenceRequest, 
                 transport.host, generation))
         executions.append((reference, read_claim_execution(controller.directory, reference)))
     if any(not any(row.record['claim_id'] == claim.execution for row in held) for claim in snapshot.claims):
-        return placement.HostEvidenceUnavailable(key, snapshot.observed_at, 'A lifecycle claim has no readable target claim',
-                                                 hana=capacity)
+        return placement.HostEvidenceUnavailable(key, snapshot.observed_at, 'A lifecycle claim has no readable target claim')
     eligibility: placement.HostEligibility = placement.AllowedHost()
     if not controller.image_is_current(snapshot.deployment, workload=workload):
         eligibility = placement.FixedExclusion(placement.HANA_IMAGE_STALE)
@@ -514,7 +502,7 @@ def read_evidence(key: placement.HostEvidenceKey, request: HanaEvidenceRequest, 
         if isinstance(preview, hana_spend.PermitRefused):
             eligibility = placement.TemporaryExclusion(preview.reason)
     return placement.FreshHostEvidence(key, snapshot.observed_at, generation, eligibility,
-        tuple(adopted), tuple(cleanup), tuple(executions), holder, diagnostic, hana=capacity)
+        tuple(adopted), tuple(cleanup), tuple(executions), holder, diagnostic)
 
 
 GPU_SETUP_REQUIRED = 'Hana GPU setup is required. On natedev, run deploy.py up --workload merge-gates --approve-resources'

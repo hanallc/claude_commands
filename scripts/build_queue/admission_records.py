@@ -1012,10 +1012,6 @@ class BehindHead:
     head_session_id: str
 
 
-def behind_queue_text(name: str) -> str:
-    return f"Behind {name} in the queue"
-
-
 @dataclass(frozen=True)
 class ReadyForAdmission:
     """The step is ready for the next admission check."""
@@ -1358,52 +1354,6 @@ class QueueRead:
     explanation: QueueExplanation
     ordered: list[tuple[Path, RankedWaiter]]
     diagnostics: tuple[ConfigurationDiagnostic, ...] = ()
-
-
-LIMITS_SNAPSHOT = "build-limits.json"
-
-
-@dataclass(frozen=True)
-class PlacementBlock:
-    provider: placement.PlacementProvider
-    target: str
-    reason: str
-
-
-@dataclass(frozen=True)
-class LimitsWait:
-    step: WaitingStep
-    position: int
-    repository: RepositoryIdentity
-    blocks: tuple[PlacementBlock, ...] = ()
-    pending: bool = False
-
-
-@dataclass(frozen=True)
-class LimitsCloud:
-    pid: int
-    start_time: str
-    origin: str
-    reason: str
-
-
-@dataclass(frozen=True)
-class LimitsHana:
-    evidence: placement.HanaCapacity
-    runs: tuple[str, ...]
-
-
-@dataclass(frozen=True)
-class LimitsFacts:
-    observed_at: float
-    waits: tuple[LimitsWait, ...]
-    cloud: tuple[LimitsCloud, ...]
-    cloud_slots: int | None
-    disk_floor: int | None
-    disk_free: int | None
-    aws_targets: frozenset[str]
-    mac_targets: frozenset[str]
-    hana: tuple[LimitsHana, ...] = ()
 
 
 @dataclass(frozen=True)

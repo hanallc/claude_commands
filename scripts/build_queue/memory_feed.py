@@ -45,7 +45,7 @@ from scripts.build_queue import admission_code
 # Preserve the schema check across the imports below.
 ADMISSION_VERSION_AT_IMPORT = admission_code.admission_code_version(installed.code_root / "scripts")
 
-from scripts.buildlog import charts, cost_actions, mac_idle_alert, parse, store
+from scripts.buildlog import charts, cost_actions, mac_idle_alert, parse
 from scripts.buildlog.store import host_name
 from scripts.build_queue import progress_profile as progress
 from scripts.build_queue import snapshot_codec as codec
@@ -2716,8 +2716,7 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
     if not isinstance(captured, admission_records.MemoryRoom) or not isinstance(host, admission_records.HostMemory):
         raise RuntimeError("recorded room unavailable")
     snapshots = target_availability.read_snapshots()
-    folder_settings = conf.read_or_repository("build_folders")
-    slot_roots = folder_settings.values()
+    slot_roots = conf.read_or_repository("build_folders").values()
     mac_reading = queue_view.read_mac_builds()
     mac_machine = conf.read_or_repository("machines").words("mac.hosts")[0]
     machine = host_name()
@@ -3196,12 +3195,8 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
         "swap_rows": configuration.swap_rows, "leftovers": leftovers,
     }
     if limit_background is not None:
-        limit_names = limits_view.QueueNames(visible_waits,
-            limit_cloud_names, {session: identity.owner_text for session, identity in labels.items()})
-        page["build_limits"] = limits_view.build_limits(parsed, snapshots, limit_names,
-            limits_view.Metric("Memory for builds", gib(captured.cap_use),
-                               gib(captured.cap) if isinstance(captured.cap, int) else None, "GiB"),
-            limits_view.read_facts(store.root() / "admission", explanation.now), limit_background, zone)
+        page["build_limits"] = limits_view.build_limits(parsed, snapshots, visible_waits, limit_cloud_names,
+            {session: identity.owner_text for session, identity in labels.items()}, limit_background, zone)
     page["render_seconds"] = time.perf_counter() - started
     return page
 
@@ -3247,22 +3242,17 @@ class LimitsRefresh:
             try:
                 current = self.pending.result()
                 previous = self.saved
-                if (isinstance(current.history, charts.IndexUnavailable) and previous is not None
-                        and isinstance(previous.history, limits_view.RecentRepositories)):
-                    current.origins.aliases.update(previous.history.origins.aliases)
-                    for folder, origin in previous.history.origins.folders.items():
-                        _ = current.origins.folders.setdefault(folder, origin)
-                    current = replace(current, history=previous.history,
-                                      history_stale=True)
+                if isinstance(current.history, charts.IndexUnavailable) and previous is not None and isinstance(previous.history, dict):
+                    current = replace(current, history=previous.history, history_stale=True)
                 self.saved = current
             except (OSError, ValueError, KeyError, RuntimeError) as error:
                 print(f"Build limits refresh failed: {error}", file=sys.stderr)
-                if self.saved is not None and isinstance(self.saved.history, limits_view.RecentRepositories):
+                if self.saved is not None:
                     self.saved = replace(self.saved, history_stale=True)
             self.pending = None
         if self.pending is None and now >= self.next_at:
             self.pending = Future()
-            folders = tuple(self.saved.origins.active_folders) if self.saved is not None else ()
+            folders = tuple(self.saved.origins.pending) if self.saved is not None else ()
             Thread(target=refresh_limits, args=(self.pending, time.time(), folders),
                    name="build-limits-refresh", daemon=True).start()
             self.next_at = now + interval
@@ -3296,9 +3286,9 @@ def main(argv: Sequence[str]) -> int:
                 write_text_atomic(configuration.output_folder / REPORT_NAME, report.text, new_file_mode=0o644)
                 report_version = report.version
             next_report_at = now + configuration.report_refresh_seconds
-        limit_background = (limits_view.background(time.time()) if args.once else
-                            limit_refresh.current(now, configuration.report_refresh_seconds))
         try:
+            limit_background = (limits_view.background(time.time()) if args.once else
+                                limit_refresh.current(now, configuration.report_refresh_seconds))
             if now >= next_mac_at:
                 queue_view.refresh_mac_builds()
                 if not args.once:
