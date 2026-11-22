@@ -2529,7 +2529,8 @@ class AdmissionServer:
         try:
             with target_config.command_configuration():
                 result = self._pass(configuration)
-                self._answer_parked_placements()
+                if not self.stopped:
+                    self._answer_parked_placements()
                 return result
         finally:
             _PASS_PROVIDER_CONFIGURATION.reset(token)
@@ -2549,6 +2550,8 @@ class AdmissionServer:
         self.configuration = configuration
         self.pass_stale = False
         if isinstance(self.configuration, gate.UnusableAdmissionConfiguration):
+            if self._reload_if_sources_changed():
+                return self.configuration
             self._advance_verify_run_waiters(self.configuration)
             self.local_hold_holders.clear()
             self.reading_hold = NoReadingHold()
@@ -4496,6 +4499,8 @@ done
                 self.next_pass = min(self.next_pass, self.clock.monotonic())
                 return []
             _ = self.run_pass()
+            if self.stopped:
+                return []
             return [self._placement_reply(request,
                 self.local_hold_holders.get(request.episode, placement.ResourceHolderUnknown()))]
         assignment = request.assignment
@@ -4696,6 +4701,8 @@ done
             self._prune_verify_run_slots()
             configuration = (self._read_configuration() if isinstance(self.pending_configuration, NoPass)
                              else self.pending_configuration)
+            if isinstance(configuration, gate.UnusableAdmissionConfiguration) and self._reload_if_sources_changed():
+                return []
             self._advance_verify_run_waiters(configuration)
             reply = self._verify_run_slot(request, configuration)
             if isinstance(reply, wire.VerifyRunSlotWaiting) and isinstance(connection, Connection):
@@ -4721,7 +4728,7 @@ done
             configuration = self._take_configuration()
             if isinstance(configuration, gate.UnusableAdmissionConfiguration):
                 _ = self._run_pass(configuration)
-                return [wire.Refused(configuration.reason)]
+                return [] if self.stopped else [wire.Refused(configuration.reason)]
             request = self._service_estimate(request, configuration)
             self.pending_configuration = configuration
         if isinstance(request, (wire.AdmitRequest, wire.LaunchRequest)) and request.code_version:
@@ -4737,6 +4744,8 @@ done
                     self.last_result = gate.admission_pass(self.last_inputs, self.last_inputs.now, self.last_policy)
                 self.pass_stale = False
                 self._publish_replies()
+            if self.stopped:
+                return []
             if isinstance(self.configuration, gate.UnusableAdmissionConfiguration):
                 return [wire.Refused(self.configuration.reason)]
             if (not isinstance(self.last_inputs, records.QueueInputs)
@@ -5177,33 +5186,51 @@ done
         except FileNotFoundError:
             return SourceMissing()
 
-    def _check_sources(self) -> None:
-        configuration = self.last_usable_configuration
+    def _record_source_changes(self) -> bool:
         if len(sys.modules) != self.source_module_count:
-            # A function-level import loads its module after start. Watch it from the first check after it loads.
+            # Watch modules from the first check after they load.
             self.source_module_count = len(sys.modules)
             for path in self._source_paths() - self.sources.keys():
                 self.sources[path] = self._stamp(path)
         current = {path: self._stamp(path) for path in self.sources}
+        changed_paths = sorted(path for path, stamp in current.items() if self.sources[path] != stamp)
+        if not changed_paths:
+            return False
+        self.changed_sources.update(changed_paths)
+        changed = ", ".join(map(str, changed_paths))
         now = self.clock.monotonic()
-        if current != self.sources:
-            changed_paths = sorted(path for path, stamp in current.items() if self.sources[path] != stamp)
-            self.changed_sources.update(changed_paths)
-            changed = ", ".join(map(str, changed_paths))
-            print(f"memory admission: source watch detected changes at monotonic {now:.3f} in {changed}",
-                  file=sys.stderr)
-            self.sources = current
-            self.source_change_at = now
-        elif (isinstance(configuration, records.MemoryConfig)
-              and not isinstance(self.source_change_at, SourcesUnchanged)
-              and now - self.source_change_at >= configuration.source_settle_seconds):
-            self.persist()
-            self.replace_in_place = self.inherited_listener
-            action = "reload" if self.replace_in_place else "stop"
-            print(f"memory admission: source watch will {action} after the changes settled", file=sys.stderr)
-            _notify(f"RELOADING=1\nMONOTONIC_USEC={time.monotonic_ns() // 1000}" if self.replace_in_place
-                    else "STOPPING=1")
-            self.stopped = True
+        print(f"memory admission: source watch detected changes at monotonic {now:.3f} in {changed}",
+              file=sys.stderr)
+        self.sources = current
+        self.source_change_at = now
+        return True
+
+    def _stop_for_source_change(self, *, configuration_unusable: bool = False) -> None:
+        self.persist()
+        self.replace_in_place = self.inherited_listener
+        action = "reload" if self.replace_in_place else "stop"
+        timing = ("without waiting for changes to settle because the configuration is unusable"
+                  if configuration_unusable else "after the changes settled")
+        print(f"memory admission: source watch will {action} {timing}", file=sys.stderr)
+        _notify(f"RELOADING=1\nMONOTONIC_USEC={time.monotonic_ns() // 1000}" if self.replace_in_place
+                else "STOPPING=1")
+        self.stopped = True
+
+    def _reload_if_sources_changed(self) -> bool:
+        _ = self._record_source_changes()
+        if not self.changed_sources:
+            return False
+        self._stop_for_source_change(configuration_unusable=True)
+        return True
+
+    def _check_sources(self) -> None:
+        configuration = self.last_usable_configuration
+        changed = self._record_source_changes()
+        now = self.clock.monotonic()
+        if (not changed and isinstance(configuration, records.MemoryConfig)
+                and not isinstance(self.source_change_at, SourcesUnchanged)
+                and now - self.source_change_at >= configuration.source_settle_seconds):
+            self._stop_for_source_change()
         self.next_source_check = (now + configuration.source_check_seconds
                                   if isinstance(configuration, records.MemoryConfig) else float("inf"))
 
@@ -5296,6 +5323,8 @@ done
                     for reply in self.handle_request(pending.request, connection):
                         if not connection.sending:
                             self._send(connection, reply)
+                    if self.stopped:
+                        return
         configuration_changed = (any(descriptor == self.config_events for descriptor, _events in ready)
                                  and self._configuration_changed())
         if self.clock.monotonic() >= self.next_config_watch_retry:
@@ -5313,11 +5342,15 @@ done
             self._receive_requests(connections, listener_ready)
         finally:
             self.receiving_requests = False
+        if self.stopped:
+            return
         for descriptor, events in ready:
             connection_ready = connections.get(descriptor)
             watch = watches.get(descriptor)
             if connection_ready is not None and self.connections.get(descriptor) is connection_ready.connection:
                 self._connection_event(connection_ready.connection, events & ~select.EPOLLIN)
+                if self.stopped:
+                    return
             elif watch is not None and self.watchers.get(descriptor) is watch:
                 if isinstance(watch, ScopeWatch):
                     try:
@@ -5338,8 +5371,10 @@ done
                 self._prune_watches()
                 self.next_pass = self.clock.monotonic()
         self._finish_priority_roster()
-        if self.clock.monotonic() >= self.next_pass and self._pass_gap_open():
+        if not self.stopped and self.clock.monotonic() >= self.next_pass and self._pass_gap_open():
             _ = self.run_pass()
+        if self.stopped:
+            return
         if self.clock.monotonic() >= self.next_source_check:
             self._check_sources()
         self._check_outage_alert()
@@ -5364,6 +5399,8 @@ done
         for descriptor, connection in readable:
             if self.connections.get(descriptor) is connection and not connection.finished:
                 self._connection_event(connection, select.EPOLLIN)
+                if self.stopped:
+                    return
 
     def start_reader(self) -> None:
         """Start the reader when a usable configuration exists."""

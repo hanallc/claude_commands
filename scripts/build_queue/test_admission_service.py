@@ -6480,6 +6480,62 @@ class ServiceTests(unittest.TestCase):
             self.assertIn("memory admission: source watch will stop after the changes settled", entries)
             self.assertEqual(entries[-1], f"memory admission: ready with git revision {revision}")
 
+    def test_unusable_configuration_reloads_changed_source_without_refusing_waiter(self) -> None:
+        for already_detected in (False, True):
+            with self.subTest(already_detected=already_detected), AdmissionFixture() as fixture:
+                server = fixture.server
+                fixture.hold_starts()
+                request = fixture.request()
+                peer = fixture.connect(request)
+                waiting, = peer.replies()
+                self.assertIsInstance(waiting, wire.Wait)
+                connection = server.waiters[request.episode].connection
+                assert isinstance(connection, service.Connection)
+                source = fixture.root / "loaded.py"
+                _ = source.write_text("old")
+                stamp = source.stat()
+                server.sources = {source: (stamp.st_ino, stamp.st_mtime_ns)}
+                source.unlink()
+                if already_detected:
+                    fixture.clock.advance(1)
+                    server.run_once()
+                    self.assertEqual(server.changed_sources, {source})
+                    self.assertFalse(server.stopped)
+
+                write_memory_config(fixture.root / "build_admission.conf", estimate_refresh_seconds="invalid")
+                server.inherited_listener = True
+                notices: list[str] = []
+                with (mock.patch.object(service, "_notify", side_effect=notices.append),
+                      redirect_stderr(io.StringIO()) as journal):
+                    server.run_once()
+                self.assertIsInstance(server.configuration, gate.UnusableAdmissionConfiguration)
+                self.assertTrue(server.stopped)
+                self.assertTrue(server.replace_in_place)
+                self.assertEqual(server.changed_sources, {source})
+                self.assertIn(request.episode, server.waiters)
+                self.assertFalse(connection.finished)
+                self.assertEqual(connection.sending, b"")
+                self.assertFalse(select.select([peer.socket], [], [], 0)[0])
+                self.assertIn("source watch will reload without waiting for changes to settle because the configuration is unusable",
+                              journal.getvalue())
+                reload_notice, = [notice for notice in notices if notice.startswith("RELOADING=")]
+                self.assertRegex(reload_notice, r"^RELOADING=1\nMONOTONIC_USEC=\d+$")
+
+    def test_unusable_configuration_refuses_waiter_when_sources_are_unchanged(self) -> None:
+        with AdmissionFixture() as fixture:
+            fixture.hold_starts()
+            peer = fixture.connect(fixture.request())
+            waiting, = peer.replies()
+            self.assertIsInstance(waiting, wire.Wait)
+            config = fixture.root / "build_admission.conf"
+            write_memory_config(config, estimate_refresh_seconds="invalid")
+            refused, = peer.replies()
+            assert isinstance(refused, wire.Refused)
+            self.assertIn(str(config), refused.reason)
+            self.assertIn("estimate_refresh_seconds", refused.reason)
+            self.assertFalse(fixture.server.waiters)
+            self.assertFalse(fixture.server.stopped)
+
     def test_source_watch_stops_during_repeated_unusable_configuration_passes(self) -> None:
         with AdmissionFixture() as fixture:
             check_seconds = 1

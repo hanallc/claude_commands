@@ -424,7 +424,8 @@ Every pass reads one `MemoryConfig` from `[memory]` in `config/build_admission.c
 It collects recovery diagnostics and emits them only after a successful read.
 Estimates receive the cargo peak and history factors from that configuration.
 A recovered setting remains usable and produces one warning per process.
-An unavailable setting stops grants and returns a refusal that names the file and key.
+An unavailable setting stops grants.
+If no source change is pending, the service returns a refusal that names the file and key.
 The service listens during a refusal and watches the nearest existing configuration directory.
 `scripts.lib.inotify` reports directory replacement, permission repairs, completed writes, and overflow events.
 Each relevant event re-arms the watch before a configuration read; no stamp filter discards repairs.
@@ -1024,9 +1025,13 @@ It sends `READY=1` after listener setup.
 The main loop clears the outage claim once after `silence_seconds` of continuous operation.
 It uses the last usable configuration and retries a failed clear on a later loop.
 A shorter service start preserves the claim.
-Source checks start after the first usable configuration read.
-An unusable configuration keeps the last usable source timing, and repeated passes preserve the pending check time.
-Source changes stop the service after the settle interval. A missing source also counts as a change.
+Scheduled source checks start after the first usable configuration read.
+Each pass with an unusable configuration checks the watched sources before it refuses waiters.
+If a source change is pending, the service saves its state and reloads immediately without refusing waiters.
+The journal gives the unusable configuration as the reason for skipping the settle interval.
+If no source change is pending, the pass preserves the next scheduled check time.
+With a usable configuration, the service waits for the settle interval before it reloads.
+A missing source also counts as a change.
 Under systemd, the service then runs the new code in the same process with `execv`, and keeps the inherited socket.
 It sends `RELOADING=1` before `execv` and `READY=1` when the new listener is ready, so the systemd restart delay does not apply.
 The service logs the changed source paths before `execv`.
