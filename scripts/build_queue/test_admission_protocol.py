@@ -7,7 +7,7 @@ from scripts.lib import test_phase
 from scripts.build_queue import snapshot_codec as codec
 from scripts.build_queue.admission_protocol_v1_fixture import parse_request as decode_legacy
 
-from scripts.lint.memory_test_support import admission_policy_fixture
+from scripts.lint.memory_test_support import admission_policy_fixture, memory_gate_shell_environment
 
 from contextlib import redirect_stderr
 from dataclasses import replace
@@ -430,7 +430,8 @@ class ProtocolTests(unittest.TestCase):
                 _ = target.write_bytes((source / relative).read_bytes())
                 target.chmod((source / relative).stat().st_mode)
             before = wire.admission_code_version(scripts)
-            environment = {key: value for key, value in os.environ.items() if key != "BUILDLOG_ADMISSION_CODE_VERSION"}
+            environment = memory_gate_shell_environment()
+            _ = environment.pop("BUILDLOG_ADMISSION_CODE_VERSION", None)
             command = '''BUILDLOG_ADMISSION_CODE_VERSION="$("$4" "$3" code-version)" || exit 2
 export BUILDLOG_ADMISSION_CODE_VERSION
 source "$1"

@@ -108,7 +108,9 @@ from scripts.lib import scratch  # noqa: E402
 from scripts.test_times import gate_record
 from scripts.build_queue import admission_records  # noqa: E402
 from scripts.build_queue import progress_profile
-from scripts.build_queue.admission_client import AdmissionHoldCheck  # noqa: E402
+from scripts.build_queue.admission_client import (  # noqa: E402
+    AdmissionHoldCheck, OuterReservation, cpu_pool_path, outer_reservation,
+)
 from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, GateJobNotRecorded, StepJob
 from scripts.build_queue.queue_place import (  # noqa: E402
     QueuePlace, QueuePlaceRefused, queue_place, suite_scope_prefix,
@@ -203,6 +205,12 @@ class WholeMachine:
 
 
 SHARED_MACHINE = SharedMachine()
+
+
+@dataclass(frozen=True)
+class NamedModules:
+    """Run only the paths that the caller names for a diagnostic check."""
+    paths: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -374,7 +382,7 @@ class SharedCPUPool:
 
 @contextmanager
 def shared_cpu_pool() -> Generator[SharedCPUPool | NoSharedCPU]:
-    path = Path(os.environ.get("BUILDLOG_JOBSERVER_FIFO", "/dev/steve"))
+    path = cpu_pool_path()
     try:
         descriptor = os.open(path, os.O_RDWR | os.O_NONBLOCK | os.O_CLOEXEC)
     except FileNotFoundError:
@@ -1472,9 +1480,14 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
                source: Literal["tests-only", "checkpoint"] = "tests-only", full: bool = False,
                mode: SuiteMode = SuiteMode.GATE,
                machine: SharedMachine | WholeMachine = SHARED_MACHINE,
-               selected: AllModules | SelectedModules = ALL_MODULES,
+               selected: AllModules | SelectedModules | NamedModules = ALL_MODULES,
                time_limit: gate_record.GateTimeLimit | gate_record.NoGateTimeLimit | gate_record.ReadGateTimeLimit = gate_record.READ_GATE_TIME_LIMIT) -> GateRun:
     shared = isinstance(machine, SharedMachine)
+    named = isinstance(selected, NamedModules)
+    under_parent = shared and named and isinstance(outer_reservation(match_cpu_pool=True), OuterReservation)
+    owns_place = shared and not under_parent
+    if under_parent:
+        max_running_jobs = 1
     if shared:
         recover_gate_runs(repo)
     governor_gib = merge_gate_governor_gib() if shared else 0.0
@@ -1484,7 +1497,9 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
         raise GateRefused(str(error)) from error
     if isinstance(machine, WholeMachine):
         max_running_jobs = os.cpu_count() or 1
-    if module_time_limit_s <= 0:
+    if named:
+        module_time_limit_s = math.inf
+    elif module_time_limit_s <= 0:
         raise GateRefused("module time limit must be positive")
     if max_running_jobs <= 0:
         raise GateRefused("running job limit must be positive")
@@ -1495,7 +1510,7 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
     if not modules:
         raise GateRefused("the test list is empty")
     module_count = len(modules)
-    if isinstance(selected, SelectedModules):
+    if isinstance(selected, (SelectedModules, NamedModules)):
         paths = set(selected.paths)
         discovered = {str(path.relative_to(repo)) for _, path in modules}
         if not paths <= discovered:
@@ -1506,16 +1521,16 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
     if not tmpfs.is_dir() or not os.access(tmpfs, os.W_OK):
         raise GateRefused(f"the test runner requires a writable gate folder at {tmpfs}")
     report_retained_gate_test_folders(tmpfs)
-    hold = BuildHoldWait() if shared else None
+    hold = BuildHoldWait() if owns_place else None
     if hold is not None:
         hold.wait_until_free()
     suites = sorted({suite for suite, _ in modules})
     ledger: PassedTreeLedger | None = None
     required: FullSuite | NoFullRunRequired = NoFullRunRequired()
     reused = False
-    selection: AffectedSelection | FullSuite | SelectedModules = (
-        selected if isinstance(selected, SelectedModules) else FullSuite("whole machine"))
-    if shared:
+    selection: AffectedSelection | FullSuite | SelectedModules | NamedModules = (
+        selected if isinstance(selected, (SelectedModules, NamedModules)) else FullSuite("whole machine"))
+    if shared and not named:
         try:
             tested_tree = clean_test_tree(repo)
         except (GateRefused, OSError) as error:
@@ -1542,6 +1557,7 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
                 if isinstance(selection, AffectedSelection):
                     selected_paths = set(selection.modules)
                     modules = [(suite, path) for suite, path in modules if path in selected_paths]
+    if shared:
         print(f"Runner: {len(modules)} modules, memory governor {governor_gib:g} GiB", flush=True)
     else:
         print(f"Runner: {len(modules)} modules, whole machine, {max_running_jobs} CPUs", flush=True)
@@ -1554,7 +1570,7 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
             raise GateRefused(str(error)) from error
     if isinstance(time_limit, gate_record.NoGateTimeLimit):
         print(f"Gate time limit disabled: {time_limit.reason}", flush=True)
-    scope_prefix = suite_scope_prefix() if shared else []
+    scope_prefix = suite_scope_prefix() if owns_place else []
     state_directory = gate_state_dir() if shared else tmpfs
     timings_path = state_directory / "module_seconds.json"
     timings = read_measures(timings_path) if isinstance(machine, SharedMachine) else machine.module_seconds.copy()
@@ -1596,7 +1612,7 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
                 and memory_reruns.get((result.suite, result.module), 0) < memory_stop_reruns)
 
     def record(status: int, aborted: bool) -> None:
-        if ledger is None or hold is None or admission is None:
+        if ledger is None or hold is None or admission is None or isinstance(selection, NamedModules):
             return
         waited = hold.waited_s()
         wall_s = time.monotonic() - began - (waited - initial_hold_seconds) if aborted else elapsed
@@ -1620,13 +1636,15 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
           gate_temporary(recovery, folder_tool, tmpfs) as temporary,
           ExitStack() as module_folders,
           (gate_reservation(repo, temporary, hold, type_dirs=type_dirs, mode=mode) if hold is not None else nullcontext(None)) as reservation,
-          (shared_cpu_pool() if shared else nullcontext(NoSharedCPU())) as cpu_pool):
+          (shared_cpu_pool() if owns_place else nullcontext(NoSharedCPU())) as cpu_pool):
         # The wall time and the time limit start here, after the queue admits the gate.
         began = time.monotonic()
         started_at = datetime.now(UTC).timestamp()
         deadline = began + time_limit.seconds if isinstance(time_limit, gate_record.GateTimeLimit) else float("inf")
         initial_hold_seconds = hold.seconds if hold is not None else 0.0
         environment = {**os.environ, "TMPDIR": str(temporary), "BUILDLOG_CALLER": mode.value}
+        if reservation is not None:
+            environment = reservation.child_environment(environment)
         _ = environment.pop("PYTHONPATH", None)
         types_python = typecheck_python() if type_dirs else ""
         types_suite, types_module = gate_record.TYPE_CHECK_JOB
@@ -1804,7 +1822,8 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
                         _ = suite_started.setdefault(suite, job.started)
                     if admission is not None:
                         admission.reserve(job.process.pid, recorded_peaks.reservation_mib(request))
-                if not time_limit_report and (shared or isinstance(selected, SelectedModules)) and not pending and not running:
+                if (not time_limit_report and (shared or isinstance(selected, (SelectedModules, NamedModules)))
+                        and not pending and not running):
                     failed = [] if rerunning else [result for result in results
                               if result.kind is GateJobKind.TEST_MODULE and result.returncode and not result.killed_for
                               and not result.tripwire_tripped]
@@ -1832,7 +1851,7 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
                     job.output.close()
                     if isinstance(job.cpu_slot, SharedCPUSlot):
                         job.cpu_slot.release()
-            if shared:
+            if shared and not named:
                 save_measures(timings_path, timings)
                 save_measures(cpu_path, cpu_measures)
                 save_measures(types_peaks_path, types_peaks)
@@ -1885,7 +1904,7 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
     cpu_jobs = ", ".join(f"{run_cpu[key]:.2f} s {key}" for key in most_cpu) or "(none)"
     print(f"Most CPU: {cpu_jobs}; total {sum(run_cpu.values()):.2f} s", flush=True)
     print(f"One-minute load: start={starting_load:.2f} max={maximum_load:.2f} end={ending_load:.2f}", flush=True)
-    if run.passed and not reused and ledger is not None and not isinstance(selection, SelectedModules):
+    if run.passed and not reused and ledger is not None and isinstance(selection, (AffectedSelection, FullSuite)):
         ledger.record_pass(selection)
         if isinstance(required, FullSuite):
             (gate_state_dir() / "full-required").unlink(missing_ok=True)
@@ -2901,10 +2920,10 @@ def nightly(args: GateArguments) -> int:
 def add_suite_arguments(parser: argparse.ArgumentParser) -> None:
     _ = parser.add_argument("--repo", "--checkout", default=str(Path.cwd()))
     _ = parser.add_argument("--module-time-limit-s", type=float, default=DEFAULT_MODULE_TIME_LIMIT_S,
-                            help="kill a module still running after this many seconds (default: 1800); slowest measured: 387 s at load 152")
+                            help="stop a module after this many seconds (default: 1800). Runs with --module have no time limit.")
     _ = parser.add_argument("--full", action="store_true", help="run all test modules even with a certified base")
     _ = parser.add_argument("--module", action="append", default=[], dest="modules",
-                            help="run only this module, named as the gate prints it (suite/module), with no gate record")
+                            help="run only this suite/module with shared admission or the parent's reservation")
 
 
 def combine_gate_runs(first: GateRun, second: GateRun, *, seconds: float) -> GateRun:
@@ -3058,13 +3077,10 @@ def tell_time_limit(owner: str, repo: Path, run: GateRun) -> None:
         print(f"Gate time limit notice could not be sent: {error}", flush=True)
 
 
-def run_named_modules(repo: Path, names: Sequence[str], module_time_limit_s: float, mode: SuiteMode) -> GateRun:
-    """Run only the named modules, as a merge red's check on its base.
-
-    The run takes no admission, hold, time limit, ledger entry or gate record, so it never certifies the tree.
-    """
-    return run_suites(repo, [], module_time_limit_s, machine=WholeMachine(), mode=mode,
-                      selected=SelectedModules(tuple(f"scripts/{name}" for name in names)),
+def run_named_modules(repo: Path, names: Sequence[str], mode: SuiteMode) -> GateRun:
+    """Run the named modules through shared admission for a diagnostic check."""
+    return run_suites(repo, mode=mode, machine=SHARED_MACHINE,
+                      selected=NamedModules(tuple(f"scripts/{name}" for name in names)),
                       time_limit=gate_record.NoGateTimeLimit("named modules"))
 
 
@@ -3097,7 +3113,7 @@ def run_tests_only(args: GateArguments, mode: SuiteMode) -> int:
         with scratch.copy_lock(Path(args.repo).expanduser().resolve()):
             repo = Path(args.repo).resolve()
             with gate_recovery(repo):
-                run = (run_named_modules(repo, args.modules, args.module_time_limit_s, mode) if args.modules else
+                run = (run_named_modules(repo, args.modules, mode) if args.modules else
                        run_gate_suites(repo, module_time_limit_s=args.module_time_limit_s, full=args.full,
                                        mode=mode, gate_job=args.gate_job))
             if run.time_limit_report:
