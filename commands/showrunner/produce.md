@@ -13,7 +13,7 @@ Send each design question on a List item assigned to a producer other than morty
 The producer answers from the agreed design or files the question for nate.
 The showrunner keeps the order of merges.
 
-The no-capacity broadcast turns on no-worker mode until the workers-back notice arrives.
+The no-capacity broadcast turns on self-actualize mode until the workers-back notice arrives.
 It also stops every Codex worker and ends their open passes as canceled; each affected director gets one stop report.
 A real `hit your usage limit` worker failure turns it on for the unit's current phase.
 Send no worker work to a unit in this mode; treat its direct work as normal phase work.

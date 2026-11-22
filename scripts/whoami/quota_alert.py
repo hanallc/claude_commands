@@ -1,7 +1,7 @@
 #!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Claude gets one phone reminder when a low account lacks an account-move entry.
 
-Codex refusal broadcasts no-worker mode when no account has capacity.
+Codex refusal broadcasts self-actualize mode when no account has capacity.
 Failed phone delivery stays due until the next timer pass. Claude recovery closes
 its episode silently; /quota_refresh still refreshes readings.
 """
@@ -735,14 +735,14 @@ def _broadcast_worker_mode(active: bool) -> None:
         text = _worker_mode_text(active)
         return ["--from", NO_WORKER_MODE_SENDER, "--showrunners", text, "--units", text]
 
-    _start_detached("no-worker mode broadcast", "production/broadcast.py", notice)
+    _start_detached("self-actualize mode broadcast", "production/broadcast.py", notice)
     try:
         producers = conf.read("accounts").text("no_worker_mode_fyi").split()
     except conf.Unusable as error:
-        print(f"quota-alert: no-worker mode FYI failed: {' '.join(str(error).split())}")
+        print(f"quota-alert: self-actualize mode FYI failed: {' '.join(str(error).split())}")
         producers = []
     for producer in producers:
-        _start_detached(f"no-worker mode FYI to {producer}", "message/send.py", _fyi(producer, active))
+        _start_detached(f"self-actualize mode FYI to {producer}", "message/send.py", _fyi(producer, active))
     if active:
         _start_detached("Codex worker stop", "production/worker_capacity.py", lambda: ["stop"])
 
@@ -2416,7 +2416,7 @@ class WorkersWaitForReset:
 
 @dataclass(frozen=True)
 class NoWorkerModeStarted:
-    """No account had room, so this host turned on no-worker mode."""
+    """No account had room, so this host turned on self-actualize mode."""
 
 
 @dataclass(frozen=True)
@@ -2438,7 +2438,7 @@ class RoutedRefusal:
 def stopped_worker_relay(worker: str, outcome: RefusalOutcome) -> str:
     """The director's notice for a worker whose pass a quota refusal stopped."""
     if isinstance(outcome, NoWorkerModeStarted):
-        return (f"Codex refused worker {worker} for quota. No-worker mode started. "
+        return (f"Codex refused worker {worker} for quota. Self-actualize mode started. "
                 + "The stop of the Codex workers ends its pass as canceled. Do not rerun its assign command.")
     happened = (f"Workers moved to {outcome.account}, and the move resumes the pass. "
                 if isinstance(outcome, WorkersMoved) else

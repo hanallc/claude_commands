@@ -1,4 +1,4 @@
-"""The quota state file and the no-worker mode it records.
+"""The quota state file and the self-actualize mode it records.
 
 A leaf module: restart, resume and worker code read the mode here, so they never
 import quota_alert and its account, message and pane modules.
@@ -13,8 +13,8 @@ from typing import TypedDict, cast
 from scripts.lib import conf
 
 
-# Each command that starts a worker refuses with this text while no-worker mode is on.
-NO_WORKER_START = "no-worker mode is on, so no worker starts; do the work directly"
+# Each command that starts a worker refuses with this text while self-actualize mode is on.
+NO_WORKER_START = "self-actualize mode is on, so no worker starts; do the work directly"
 
 
 class _SavedMode(TypedDict, total=False):
@@ -39,5 +39,5 @@ def no_worker_mode() -> bool:
 
 
 def no_worker_notice() -> str:
-    """The notice that starts no-worker mode."""
+    """The notice that starts self-actualize mode."""
     return conf.read("accounts").text("no_worker_mode_on")

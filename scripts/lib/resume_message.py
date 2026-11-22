@@ -87,7 +87,7 @@ class ResumeWorkers(NamedTuple):
 
 @dataclass(frozen=True)
 class WorkersHeld:
-    """No-worker mode keeps every Codex worker stopped; the director does the work alone."""
+    """Self-actualize mode keeps every Codex worker stopped; the director does the work alone."""
 
     notice: str
 
@@ -98,7 +98,7 @@ NO_OWN_PASS = NoOwnPass()
 
 
 def worker_mode() -> ResumeWorkers | WorkersHeld:
-    """`WorkersHeld` with the notice in no-worker mode; otherwise no worker lines."""
+    """`WorkersHeld` with the notice in self-actualize mode; otherwise no worker lines."""
     return WorkersHeld(quota_state.no_worker_notice()) if quota_state.no_worker_mode() else NO_WORKERS
 
 

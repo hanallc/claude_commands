@@ -1842,7 +1842,7 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
                     pass
         mode = worker_mode() if row is not None else NO_WORKERS
         if isinstance(mode, WorkersHeld) and row is not None and row.kind == "worker" and kind == "codex":
-            return ResumeFailed(identity, "no-worker mode keeps Codex workers stopped")
+            return ResumeFailed(identity, "self-actualize mode keeps Codex workers stopped")
         if entry is None:
             if row is None:
                 return SessionNotFound(session)

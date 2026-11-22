@@ -132,8 +132,8 @@ def fixture_configuration(root: Path) -> dict[str, str]:
     environment = config_environment(configuration)
     _ = write_config_fixture(configuration / "accounts.conf",
         "no_worker_mode_on=Codex workers have no capacity. Send no assign. Do your current work yourself: "
-        + "write the code, run the tests and do the reviews directly. Keep to this rule until the workers-back notice arrives.\n"
-        + "no_worker_mode_off=Codex workers are up again. Use workers again. This notice ends no-worker mode.\n"
+        + "write the code, run the tests and do the reviews directly. This notice starts self-actualize mode. Keep to this rule until the workers-back notice arrives.\n"
+        + "no_worker_mode_off=Codex workers are up again. Use workers again. This notice ends self-actualize mode.\n"
         + "no_worker_mode_fyi=morty dwight\nusage_stale_minutes=10\nrefusal_reset_wait_minutes=20\n"
         + "half_point_pace_minutes=30\nhold_default_minutes=40\n")
     return environment

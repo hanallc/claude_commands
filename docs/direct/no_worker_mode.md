@@ -1,9 +1,9 @@
-# Work without workers
+# Self-actualize mode
 
 Launchers run `check-launch`, `start-pass`, and `finish-pass` through `scripts/direct/pass_record.py`.
 
 <NoWorkerMode>
-Complete the current work without workers.
+In self-actualize mode, complete the current work without workers.
 This exception covers implementation, repairs, code review, style review, and phase review.
 Keep the normal scope, authorization, reservation, verification, findings, and checkpoint gates.
 Use the existing run.

@@ -721,7 +721,7 @@ class MessageTests(unittest.TestCase):
         done = self.run_script("clear", "--from", "natedev")
         self.assertEqual(done.returncode, 0, done.stderr)
         log = (self.root / "log").read_text(encoding="utf-8")
-        self.assertIn("the wind-down is over and the Codex count has stopped. No-worker mode is still on", log)
+        self.assertIn("the wind-down is over and the Codex count has stopped. Self-actualize mode is still on", log)
         self.assertIn("so launch no Codex agent", log)
         self.assertNotIn("Start using Codex again", log)
         self.assertNotIn("we are back with Codex", log)

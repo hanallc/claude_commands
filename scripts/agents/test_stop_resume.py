@@ -5085,11 +5085,11 @@ class StopResumeTests(unittest.TestCase):
                 result = stop_resume.resume(str(row.id), why="maintenance")
                 if kind == "codex" and held:
                     self.assertEqual(result, stop_resume.ResumeFailed(self.entry["session_id"],
-                                                                      "no-worker mode keeps Codex workers stopped"))
+                                                                      "self-actualize mode keeps Codex workers stopped"))
                     self.assertEqual(self.launched, set())
                 else:
                     self.assertNotEqual(result, stop_resume.ResumeFailed(self.entry["session_id"],
-                                                                         "no-worker mode keeps Codex workers stopped"))
+                                                                         "self-actualize mode keeps Codex workers stopped"))
 
     def test_empty_resume_message_adds_no_argument_in_the_current_pane(self) -> None:
         tab = herdr.TabSession("w1:p2", "alpha", "w1", self.entry["session_id"])

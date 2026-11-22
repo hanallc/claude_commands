@@ -42,8 +42,8 @@ The launcher reads the transcript before another submission.
 
 The refusal sends one relay to the director of the stopped worker after the refusal is routed.
 The relay names the outcome when it is known and tells the director not to rerun the assign command.
-The pass stays open, except when no-worker mode started: then the stop of the Codex workers ends it as canceled.
-The outcome is one of these: workers moved to an account, workers wait for a reset time, or no-worker mode started.
+The pass stays open, except when self-actualize mode started: then the stop of the Codex workers ends it as canceled.
+The outcome is one of these: workers moved to an account, workers wait for a reset time, or self-actualize mode started.
 The caller supplies `--stopped <session id> <worker>`.
 Unknown directors receive no message; a waiting follow keeps its continuation.
 
@@ -61,7 +61,7 @@ Without an account move entry, low quota above zero switches nothing.
 At weekly zero, credits on moves workers to included Codex usage before paid credits.
 With credits off, workers may also move to another account using its own credits.
 A quota refusal requests a move only when the workers account cannot use its allowance or permitted credits.
-Login faults and refusals from other homes never route workers to Claude or start no-worker mode.
+Login faults and refusals from other homes never route workers to Claude or start self-actualize mode.
 Their existing notices stay unchanged.
 The launcher reports the serving account, refusal time and known window through `agent_notes.py blocked --window weekly|five_hour|unknown --refused-at <aware ISO time>`.
 A later reading identifies the window only when exactly one window is at zero.
@@ -144,7 +144,7 @@ Old saved notices are rebuilt from the current account reading.
 Both notices give the action to remove the account from `codex_credit_accounts`.
 An episode rereads this setting on every pass.
 The first on-to-off change requests the credits-off move once, stops forecasts and repeats no opening alert.
-No-worker mode starts only when the workers account is exhausted and `accounts.pick` finds no other account with allowance or permitted credits.
+Self-actualize mode starts only when the workers account is exhausted and `accounts.pick` finds no other account with allowance or permitted credits.
 Unknown capacity cannot confirm exhaustion.
 A failed move alone does not start the mode.
 Starting the mode sends the no-capacity notice and stops the Codex workers once.

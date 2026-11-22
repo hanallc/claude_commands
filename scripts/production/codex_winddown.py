@@ -152,11 +152,11 @@ UNIT_CLEAR = (
 )
 ALL_CLEAR_HELD = (
     "All clear, from the user (/codex_winddown clear in {sender}, {time}): the wind-down is over and the"
-    " Codex count has stopped. No-worker mode is still on: Codex stays off until the workers-back notice"
+    " Codex count has stopped. Self-actualize mode is still on: Codex stays off until the workers-back notice"
     " arrives."
 )
 UNIT_CLEAR_HELD = (
-    "All clear, from the user (/codex_winddown clear in {sender}, {time}): the wind-down is over. No-worker"
+    "All clear, from the user (/codex_winddown clear in {sender}, {time}): the wind-down is over. Self-actualize"
     " mode is still on, so launch no Codex agent. Do your work yourself and keep your resume list until"
     " the workers-back notice arrives. It is okay to let a running Claude agent finish up."
 )

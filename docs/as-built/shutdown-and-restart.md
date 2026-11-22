@@ -562,8 +562,8 @@ Closed idle workers stay closed until their next assignment.
 `quota_state.no_worker_mode()` reads the quota state at each call, from the current `XDG_STATE_HOME`.
 `scripts/whoami/quota_state.py` is a leaf module, so restart, resume and worker code never import `quota_alert`.
 A missing or unreadable state reads as off.
-In no-worker mode, `worker.restore` prints `<worker>: not resumed: no-worker mode` for each Codex worker it would start or resume, and leaves it stopped.
-In no-worker mode, no command starts new worker work. Each refuses with exit 2 and the `quota_state.NO_WORKER_START` text:
+In self-actualize mode, `worker.restore` prints `<worker>: not resumed: self-actualize mode` for each Codex worker it would start or resume, and leaves it stopped.
+In self-actualize mode, no command starts new worker work. Each refuses with exit 2 and the `quota_state.NO_WORKER_START` text:
 - `assign.sh`, before it writes run state;
 - `worker.py add` and `worker.py assign`;
 - `worker_panes.py start-or-resume`.
@@ -571,8 +571,8 @@ In the mode, `style_plan.py next-phase --session-dir` restores the run and phase
 `worker.restore` and account moves keep work that started before the mode, so a Claude worker with an open pass resumes.
 `agents restart`, the restart of a director, `agents resume` and unit recovery all restore workers through `worker.restore`.
 A skipped worker leaves the restart record. The next assignment resumes it.
-`stop_resume` refuses a Codex worker row with `no-worker mode keeps Codex workers stopped`, before it opens a pane.
-`resume_message.worker_mode()` gives `WorkersHeld` in no-worker mode.
+`stop_resume` refuses a Codex worker row with `self-actualize mode keeps Codex workers stopped`, before it opens a pane.
+`resume_message.worker_mode()` gives `WorkersHeld` in self-actualize mode.
 The resume, restart and relaunch messages of a director then carry the `no_worker_mode_on` text from `config/accounts.conf` and no worker lines.
 A paused director gets `Continue where you stopped.` and the same text.
 Pane worker resume uses the dispatch record and transcript to select one step.
@@ -829,7 +829,7 @@ Both commands change nothing.
 The record stores no session facts, progress, claims, recovery states, or pane positions.
 The record holds only rows that a restart starts:
 - `stop --all` and scoped `held-sessions` save no worker that `worker.restore` would not start.
-- `worker.not_restored` names that worker: a Codex worker in no-worker mode, or a worker with no active dispatch and no detached run.
+- `worker.not_restored` names that worker: a Codex worker in self-actualize mode, or a worker with no active dispatch and no detached run.
 - `restart` removes a saved id with no staff row or a saved worker that `worker.not_restored` names.
 - The report names the removed entry and gives the reason.
 - `restart --dry-run` prints the same line with `would leave the restart record` and changes nothing.

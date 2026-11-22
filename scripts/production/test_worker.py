@@ -783,7 +783,7 @@ class WorkerCommandTests(unittest.TestCase):
         launches = len(self.fixture.world.launches)
         with (patch.object(quota_state, "no_worker_mode", return_value=True),
               patch.object(worker, "_resume_launcher", return_value=worker.ExitCode.OK) as resume):
-            self.assertEqual(self.command("restore"), (0, f"{busy.row.name}: not resumed: no-worker mode\n"
+            self.assertEqual(self.command("restore"), (0, f"{busy.row.name}: not resumed: self-actualize mode\n"
                                                        + f"{self.fixture.parent.name}: workers unchanged\n", ""))
         resume.assert_not_called()
         self.assertEqual(len(self.fixture.world.launches), launches)

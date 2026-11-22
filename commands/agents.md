@@ -100,9 +100,9 @@ When resume selects a running conversation, it prints `unchanged` and returns st
 A closed tab uses the existing restore path.
 An empty current pane can resume its own saved session.
 Resume restores retained workers with their native conversations.
-In no-worker mode, resume brings back the director alone and keeps every Codex worker stopped.
-The director's resume message then carries the no-worker notice and no worker lines.
-Resume of a Codex worker row is refused in no-worker mode.
+In self-actualize mode, resume brings back the director alone and keeps every Codex worker stopped.
+The director's resume message then carries the self-actualize mode notice and no worker lines.
+Resume of a Codex worker row is refused in self-actualize mode.
 The short form `resume NAME [--retired] [--why TEXT] [--to ACCOUNT]` stays available from any directory.
 
 Use a staff id, a staff path, or a unique name for rename.

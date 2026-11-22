@@ -198,7 +198,7 @@ Other prompts carry the Three Gods and Type Design Contract under <WritePromptCo
 </CoreContract>
 
 <NoWorkerMode>
-A no-capacity broadcast turns this mode on until the workers-back notice arrives.
+A no-capacity broadcast turns self-actualize mode on until the workers-back notice arrives.
 A real worker launch or turn failure containing `hit your usage limit` also turns this mode on.
 That self-on mode lasts through the current phase; try a normal assign at the next phase start.
 A broadcast-on mode keeps its longer lifetime if both triggers occur.

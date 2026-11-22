@@ -25,7 +25,7 @@ This document describes the implementation and its constraints.
 | `scripts/accounts/outage_alerts.py` | Durable alert claims for retained record-driven restart paths. |
 | `scripts/whoami/agent_accounts.py` | Account identity, Codex homes, worker selection, and credit policy. |
 | `scripts/whoami/note_file.py` | Numbered account notes and the shared notes-folder resolver. |
-| `scripts/whoami/quota_state.py` | The quota state file, the no-worker mode read, and the `NO_WORKER_START` refusal text. It is a leaf module. |
+| `scripts/whoami/quota_state.py` | The quota state file, the self-actualize mode read, and the `NO_WORKER_START` refusal text. It is a leaf module. |
 | `scripts/settings/settings_local_keys.sh` | Settings classification, local snapshots, and Git filter transformations. |
 | `scripts/settings/local_key_notices.py` | Deferred notices for new machine-local keys. |
 | `scripts/lib/conf.py` | Validated configuration reads and recovery. |
@@ -410,14 +410,14 @@ Worker assignment fallback to Claude remains separate from the selected Codex ac
 Routing returns only when the selected Codex account can work and its refusal has resolved.
 An owned workers refusal checks `codex_can_work` before it selects another account or routes work to Claude.
 Remaining allowance or a positive balance with credits on keeps the current account working.
-Login faults and refusals from other homes never route workers to Claude or start no-worker mode.
+Login faults and refusals from other homes never route workers to Claude or start self-actualize mode.
 The existing login fault notice stays unchanged.
-No-worker mode requires exhaustion on the workers account and no alternate account from `accounts.pick`.
+Self-actualize mode requires exhaustion on the workers account and no alternate account from `accounts.pick`.
 Unknown capacity cannot confirm exhaustion.
 The flag starts only on the workers-role host, `role_map.ROLE_MAP_HOST`.
 The refusal handler sets this flag independently of the first `NoRoomMove` entry and the Claude assignment switch.
 The credits-off path uses the same capacity rule.
-A failed move does not start no-worker mode while another account has allowance or permitted credits.
+A failed move does not start self-actualize mode while another account has allowance or permitted credits.
 The saved flag triggers one broadcast to showrunners and unit directors on both machines.
 `config/accounts.conf` supplies `no_worker_mode_on` and `no_worker_mode_off`; `quota-alert` identifies the sender.
 Each producer that `no_worker_mode_fyi` names (`morty dwight`) gets one copy of each notice through `send.py`.

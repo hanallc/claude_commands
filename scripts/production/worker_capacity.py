@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Stop every Codex worker on this machine when Codex capacity ends.
 
-quota_alert.py starts `stop` when no-worker mode goes on. Each Codex worker
+quota_alert.py starts `stop` when self-actualize mode goes on. Each Codex worker
 stops with proof, each open pass of a stopped worker ends as canceled, and each
 affected unit director gets one report. Claude workers are not touched.
 

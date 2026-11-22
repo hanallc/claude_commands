@@ -2550,7 +2550,7 @@ class UnitPhasesTests(unittest.TestCase):
         from scripts.whoami import quota_state
         with patch.object(quota_state, "no_worker_mode", return_value=True):
             rendered = self.blocks([member], {})
-        self.assertIn(("Also", "Not recorded", "Workers cannot start because no-worker mode is on"), detail_rows(rendered, "holds"))
+        self.assertIn(("Also", "Not recorded", "Workers cannot start because self-actualize mode is on"), detail_rows(rendered, "holds"))
 
     def test_queue_read_failure_keeps_other_units_and_names_the_missing_fact(self) -> None:
         member, other = self.member("unreadable"), self.member("other")

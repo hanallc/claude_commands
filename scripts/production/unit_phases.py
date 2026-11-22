@@ -1348,7 +1348,7 @@ def unit_block(state: UnitBoardState, *, columns: int | None) -> str:
     if state.workers_unavailable:
         current.append(WorkItem("Not recorded", "Workers unavailable; who runs cannot be determined"))
     if state.no_workers:
-        current.append(WorkItem("Not recorded", "Workers cannot start because no-worker mode is on"))
+        current.append(WorkItem("Not recorded", "Workers cannot start because self-actualize mode is on"))
     rows = item_rows("Now", current[:1])
     rows.extend(item_rows("Also", current[1:]))
     if pending:

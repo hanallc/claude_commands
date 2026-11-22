@@ -1593,10 +1593,10 @@ def restore(parent: StaffId, *, record: staff.StaffSnapshot | None = None,
                     if (workers_held and not isinstance(state, worker_panes.OpenWorker)
                             and isinstance(staff.backend(state.row), staff.CodexBackend)):
                         if report is None and not plan.detached:
-                            print(f"{name}: not resumed: no-worker mode")
+                            print(f"{name}: not resumed: self-actualize mode")
                         else:
-                            failed(state.row, "No-worker mode keeps this worker stopped",
-                                   notice=f"{name}: not resumed: no-worker mode")
+                            failed(state.row, "Self-actualize mode keeps this worker stopped",
+                                   notice=f"{name}: not resumed: self-actualize mode")
                         continue
                     resume = _resume_launcher
                     if not isinstance(state, worker_panes.OpenWorker):

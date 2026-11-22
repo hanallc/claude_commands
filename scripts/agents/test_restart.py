@@ -4685,14 +4685,14 @@ runpy.run_module('scripts.agents.restart', run_name='__main__', alter_sys=True)
         for dry_run, saved, action in ((True, [str(child.id)], "would leave"), (False, [], "removed from")):
             with (self.subTest(dry_run=dry_run),
                   patch.object(staff, "initial_snapshot", return_value=record),
-                  patch.object(worker, "not_restored", return_value=worker.NotRestored("Codex worker in no-worker mode")),
+                  patch.object(worker, "not_restored", return_value=worker.NotRestored("Codex worker in self-actualize mode")),
                   patch.object(restart, "live_rows", return_value=restart.CompleteLiveRows([])),
                   patch.object(restart, "start_row") as start,
                   redirect_stderr(io.StringIO()) as errors):
                 self.assertEqual(restart.restart(dry_run=dry_run), 0)
                 self.assertEqual(shutdown_record.read(), saved)
                 start.assert_not_called()
-                self.assertIn(f"{child.name}: restart anomaly: Codex worker in no-worker mode; {action} the restart record\n",
+                self.assertIn(f"{child.name}: restart anomaly: Codex worker in self-actualize mode; {action} the restart record\n",
                               errors.getvalue())
 
     def test_stop_all_saves_each_row_before_stop_and_starts_nothing(self) -> None:

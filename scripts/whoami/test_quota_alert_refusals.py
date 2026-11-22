@@ -95,9 +95,9 @@ class QuotaAlertTests(support.SeededQuotaReminderFixture):
                 with redirect_stdout(output), mock.patch("scripts.whoami.quota_alert.subprocess.run", side_effect=fail_start) as start:
                     log = self.block(notes, self.now)
                     _ = self.block(notes, self.now + timedelta(minutes=1))
-                self.assertEqual(output.getvalue().splitlines(), [f"quota-alert: no-worker mode broadcast failed: {detail}",
-                                                                  f"quota-alert: no-worker mode FYI to morty failed: {detail}",
-                                                                  f"quota-alert: no-worker mode FYI to dwight failed: {detail}",
+                self.assertEqual(output.getvalue().splitlines(), [f"quota-alert: self-actualize mode broadcast failed: {detail}",
+                                                                  f"quota-alert: self-actualize mode FYI to morty failed: {detail}",
+                                                                  f"quota-alert: self-actualize mode FYI to dwight failed: {detail}",
                                                                   f"quota-alert: Codex worker stop failed: {detail}"])
                 self.assertEqual(start.call_count, 4)
                 self.assertIn("quota status codex1: Codex refused work on codex1. No credit balance is reported for codex1. "
