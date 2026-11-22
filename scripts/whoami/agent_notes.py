@@ -41,6 +41,7 @@ from typing import NotRequired, TypedDict, cast
 
 from scripts.whoami import codex_pacer
 from scripts.whoami import five_hour
+from scripts.whoami import mac_fallback_token
 from scripts.whoami import note_file
 from scripts.whoami import session_table
 from scripts.whoami.session_table import SessionsSection, KeepSections, KEEP_SECTIONS
@@ -396,6 +397,14 @@ def refresh_usage(selection: ClaudeAccountsInUse, workers_home: Path | NoWorkers
     return RefreshedUsage(reports, observed_at, tuple(messages))
 
 
+def _publish_mac_token() -> list[str]:
+    try:
+        mac_fallback_token.publish_metadata()
+    except (OSError, ValueError):
+        return ["Mac fallback token: could not publish metadata"]
+    return []
+
+
 def timer_usage_signature(selection: ClaudeAccountsInUse, workers_home: Path | NoWorkersHome) -> str:
     """Invalidate reuse when a login, directory, or account selection changes."""
     identities = sorted((str(home), codex_email_on_disk(home)) for home in codex_homes(workers_home))
@@ -452,6 +461,7 @@ def update_alert_pass(selection: ClaudeAccountsInUse, workers_home: Path | NoWor
 
     accounts.sweep_claude_temp_files(datetime.now(timezone.utc))
     messages = rename_legacy_notes(note_file.notes_dir())
+    messages.extend(_publish_mac_token())
     if isinstance(workers_home, NoWorkersHome):
         messages.append(workers_home.reason)
     notes = note_file.read_notes()
@@ -580,6 +590,9 @@ def positive_poll_seconds(value: str) -> float:
 def usage_only(*, poll_seconds: float = 0) -> None:
     """Read each due account, then start renewal without waiting for a probe."""
     from scripts.accounts import accounts, refusal_watch
+
+    for line in _publish_mac_token():
+        print(line)
 
     intervals = usage_only_intervals()
     claude_interval = intervals.claude_seconds - poll_seconds / 2
