@@ -34,35 +34,16 @@ As built (checkpoint 17febddac8, merge 59a6145a0b, repair fd71e67a79):
 - No total deadline: the showrunner dropped it (11-21 10:16 EST) because its caller, the build-hold enforcer, no longer exists. `config/send.conf` and `roster.py` are unchanged.
 - Tests: rows in `scripts/message/test_send.py` and `scripts/message/test_roster.py`. As-built: `docs/as-built/session-roster.md`.
 
-### Phase 2 — Pushes the user asks for skip review  · status: todo
+### Phase 2 — Pushes the user asks for skip review  · status: done
 
-List item 163. The code is on branch `natedev-postmaster-pushask` (worktree `~/worktrees/claude-natedev-postmaster-pushask`, from origin/main 94e07d22c4), so its hash merges apart from phase 1.
+As built (List item 163; checkpoint 776c986720 on `natedev-postmaster-pushask`, tip 3101dabe4e, merged to main as b1784d7bbe):
 
-#### Work Order
-
-**Goal:** A push the user asks for with `/nate adhoc` goes out as the agent wrote it, with no live review, hold or rewrite. Silence rules still apply. Every other push keeps its review.
-
-**Spec:**
-
-The user, 2026-11-21 (typed "go" in the postmaster pane): "go" for the pushes that i ask for explicitly without review. Earlier user rule, 2026-11-13: "if i asked for it it always should sent, it just needs to honor the silence rules".
-
-1. **Flag.** Add `--user-asked` to `scripts/message/send.py` for `--to user`. It passes through to `scripts/notify/pushover.py`, also on every path that forwards or delays send arguments (the same paths that carry `--through-silence`, for example `send.py` near lines 4352 and 4494, and `send_later.py` if it rebuilds arguments). `send.py` refuses `--user-asked` without `--to user`, the same way it refuses `--through-silence`.
-2. **Accept only with nate.adhoc.** `pushover.py` accepts `--user-asked` only with `--text-id nate.adhoc`. With any other text id it refuses with exit 2 and a clear reason. Read the text id from the catalog name, not a literal spread in several places.
-3. **No review.** With `--user-asked`, `pushover.send` runs no live review, no hold claim and no rewrite. It sends the draft as written. It records the push as unreviewed with the detail `user asked`, through the same `review.Unreviewed` and `log_review` path that `review: off` uses. Silence policy, priority and `--through-silence` stay as they are.
-4. **Agent notes keep review.** `nate.adhoc` without `--user-asked` keeps the current review path unchanged.
-5. **Docs.**
-   - `commands/nate.md` adhoc: add `--user-asked` to the send arguments, including delayed arguments. Replace "Review still runs" and the reviewed-push paragraph: the push goes out as written; silence still keeps it unless `through silence`.
-   - `commands/message.md`: one line: never pass `--user-asked` unless the user asked for this push in this session.
-   - The usage text and module docstrings of `send.py` and `pushover.py` that list `--through-silence`.
-   - `scripts/notify/reviewer_prompt.md` only if it states that every adhoc push is reviewed.
-6. **Nothing else.** Add no other guard, check or config key.
-7. **Tests.** Add rows to the existing tests:
-   - `scripts/notify/test_pushover.py`: `nate.adhoc` with `--user-asked` posts the draft unchanged and calls no review; the same push during silence without `--through-silence` stays kept; `--user-asked` with another text id is refused.
-   - `scripts/message/test_send.py`: `--user-asked` reaches the pushover command line; `--user-asked` without `--to user` is refused.
-
-**Files:** `scripts/notify/pushover.py`, `scripts/notify/test_pushover.py`, `scripts/message/send.py`, `scripts/message/test_send.py`, `scripts/message/send_later.py` (only if it rebuilds arguments), `commands/nate.md`, `commands/message.md`, `scripts/notify/reviewer_prompt.md` (only if needed).
-
-**State:** none
+- `scripts/message/send.py` takes `--user-asked` only with `--to user`. It passes the flag to `scripts/notify/pushover.py` on the local path and on the forwarded path (`remote`). A `--user-asked` push skips the `wrong_template` hold.
+- `pushover.py` refuses `--user-asked` with exit 2 unless the text id is `push_catalog.NATE_ADHOC_TEXT_ID` (`nate.adhoc`).
+- With `--user-asked`, `pushover.send` claims no hold and runs no live review. It posts the draft as written and logs `review.Unreviewed("user asked")`. Silence, priority and `--through-silence` are unchanged.
+- `nate.adhoc` without `--user-asked` keeps its review.
+- Docs: `commands/nate.md` adhoc sends with `--user-asked`; `commands/message.md` says to pass it only when the user asked for this push in this session.
+- Tests: rows in `scripts/notify/test_pushover.py` and `scripts/message/test_send.py`.
 
 ### Phase 3 — A push text that nate approves in words passes review  · status: todo
 
