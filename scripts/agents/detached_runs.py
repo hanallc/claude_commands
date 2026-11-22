@@ -749,12 +749,13 @@ def _replay_completion(path: Path, record: RunRecord) -> CompletionReplay:
 
 
 def _settle_completion_diagnostics(path: Path, record: RunRecord) -> CompletionReplay:
-    from scripts.herdr.worker_panes import StoppedDiagnosticRecovery
+    if record.get("pane_dispatch_id") != "":
+        from scripts.herdr.worker_panes import StoppedDiagnosticRecovery
 
-    retry = cast(Callable[[Path, staff.StaffId], StoppedDiagnosticRecovery],
-                 import_module("scripts.herdr.turn_end").retry_stopped_diagnostics)
-    if retry(Path(record["session_dir"]), staff.StaffId(record["staff_id"])) is not StoppedDiagnosticRecovery.SETTLED:
-        return CompletionReplay.RETRY
+        retry = cast(Callable[[Path, staff.StaffId], StoppedDiagnosticRecovery],
+                     import_module("scripts.herdr.turn_end").retry_stopped_diagnostics)
+        if retry(Path(record["session_dir"]), staff.StaffId(record["staff_id"])) is not StoppedDiagnosticRecovery.SETTLED:
+            return CompletionReplay.RETRY
     _clear_completion_pending(path)
     return CompletionReplay.HANDLED
 

@@ -2378,6 +2378,43 @@ class PaneRunDeliveryTests(unittest.TestCase):
         self.assertIn(f"Detached run: {record['run_id']}", text)
         self.assertIn("Private land completed.", text)
 
+    def test_director_completions_can_be_pruned_with_an_unreadable_stopped_receipt(self) -> None:
+        director = self.fixture.parent
+        state = unit_runs.read_run_fields(self.run_dir)
+        state["stopped_pass_notices"] = {"bad": "unreadable receipt"}
+        write_text_atomic(self.run_dir / unit_runs.STATE_FILE, json.dumps(state))
+        paths: set[Path] = set()
+        for stopped in (False, True):
+            with (self.subTest(stopped=stopped),
+                  patch.dict(os.environ, {"CODEX_THREAD_ID": "", "CLAUDE_CODE_SESSION_ID": director.current_session}),
+                  patch.object(treekey, "tree_key", return_value="private-tree"),
+                  patch.object(subprocess, "Popen", return_value=SimpleNamespace(pid=0)),
+                  contextlib.redirect_stdout(io.StringIO())):
+                self.assertEqual(detached_runs.main(["start", "--session-dir", str(self.run_dir), "--",
+                                                     "private-command", str(stopped)]), 0)
+                runs = self.run_dir / detached_runs.DETACHED_RUNS_DIR
+                path, = set(runs.glob("*.json")) - paths
+                paths.add(path)
+                saved = worker_lifecycle.read_json_object(path)
+                self.assertEqual(saved["pane_dispatch_id"], "")
+                saved.update(status="finished", exit_code=143 if stopped else 0, pid=DEAD_PID,
+                             delivery=detached_runs.ORPHAN_RESULT_PENDING, completion_pending=True)
+                if stopped:
+                    saved.update(stop_pass_requested=True, stop_reason="Private stop.")
+                write_text_atomic(path, json.dumps(saved))
+                self.assertEqual(detached_runs.reap_orphans(str(self.run_dir)), [])
+                result = worker_lifecycle.read_json_object(path)
+                self.assertIs(result["completion_pending"], False)
+                self.assertTrue(str(result["delivery"]).startswith("sent:"))
+        self.assertEqual(len(self.notices), 2)
+        self.assertIn("Result: PASS (exit 0)", self.notices[0][1])
+        self.assertIn("Result: STOPPED (exit 143)", self.notices[1][1])
+        _ = self.record(director, "later")
+        remaining = {path.stem for path in paths if path.exists()}
+        self.assertTrue(remaining)
+        self.assertEqual(set(detached_runs.prune_finished(self.run_dir / detached_runs.DETACHED_RUNS_DIR)), remaining)
+        self.assertTrue(all(not path.exists() for path in paths))
+
     def test_a_showrunner_starts_a_new_session_and_hears_its_result_with_a_shared_name(self) -> None:
         showrunner, = staff.snapshot().find(kind="showrunner")
         unit = fixture_member("unit", name=showrunner.name, parent=showrunner.id)
@@ -3294,6 +3331,41 @@ class PaneRunDeliveryTests(unittest.TestCase):
         self.assertIs(worker_lifecycle.read_json_object(case.detached_record)["completion_pending"], False)
         self.assertIs(worker_lifecycle.read_json_object(case.diagnostics)[message], True)
         self.assertEqual(case.agent.notices.count(message), 1)
+
+    def test_ordinary_completion_keeps_diagnostics_from_the_stopped_pass(self) -> None:
+        case = self.stopped_diagnostic_fixture(end_worker=True)
+        record = self.record(case.row, "ordinary-result")
+        record.update(status="finished", exit_code=0, pid=DEAD_PID, completion_pending=True,
+                      pane_dispatch_id=case.dispatch, delivery=f"sent: worker {case.row.name} at {case.pane}")
+        path = Path(record["log"]).with_suffix(".json")
+        write_text_atomic(path, json.dumps(record))
+        path.with_suffix(".record.lock").touch()
+        case.agent.append(case.pane, "user", "Detached run: ordinary-result")
+        case.agent.append(case.pane, "assistant", f"The check passed.\nDONE {case.dispatch}")
+        message = "detached run cleanup failed for impl: private cleanup failure"
+        deliver = send.send
+
+        def unavailable(options: send.Options) -> send.Result:
+            if send.body_text(options) == message:
+                return send.Result("failed", "private diagnostic send failed")
+            return deliver(options)
+
+        with (patch.object(send, "send", side_effect=unavailable),
+              patch.object(detached_runs, "prune_finished", side_effect=OSError("private cleanup failure")),
+              contextlib.redirect_stderr(io.StringIO()) as errors):
+            self.assertEqual(detached_runs.reap_orphans(str(self.run_dir)), [])
+
+        self.assertIsNone(staff.by_id(case.row.id), errors.getvalue())
+        self.assertEqual(worker_lifecycle.read_json_object(case.diagnostics), {message: False})
+        self.assertIs(worker_lifecycle.read_json_object(path)["completion_pending"], True)
+        _ = detached_runs.prune_finished(path.parent)
+        self.assertTrue(path.is_file())
+
+        self.assertEqual(worker.restore(self.fixture.parent.id), worker.ExitCode.OK)
+
+        self.assertIs(worker_lifecycle.read_json_object(path)["completion_pending"], False)
+        self.assertEqual(worker_lifecycle.read_json_object(case.diagnostics), {message: True})
+        self.assertEqual(case.agent.notices[1:], [message])
 
     def test_finished_stop_preserves_an_unreadable_diagnostic_for_restore(self) -> None:
         case = self.stopped_diagnostic_fixture(end_worker=True)
