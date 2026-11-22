@@ -441,6 +441,11 @@ def stop_verified_scope(target: KillTarget, reason: str, *, on_term: Callable[[i
     return True
 
 
+def detached_run_finished(path: Path) -> bool:
+    record = worker_lifecycle.read_json_object(path)
+    return record.get("run_id") == path.stem and record.get("status") == "finished"
+
+
 @dataclass(frozen=True)
 class RetryNotice:
     """The sender did not give a final delivery result."""
@@ -542,11 +547,13 @@ class KillActions:
     def _advance(self, action: SavedKillAction, retention: float) -> SavedKillAction:
         """Resume the stop or send the notice from the saved stage."""
         if isinstance(action.stage, StopRequested):
-            return self._finish(action, {**action.result, "stop": StopState.NOT_SENT}, retention)
+            ended = isinstance(action.route, Path) and detached_run_finished(action.route)
+            result = StopState.ALREADY_ENDED if ended else StopState.NOT_SENT
+            return self._finish(action, {**action.result, "stop": result}, retention)
         if isinstance(action.stage, TermSent):
             if isinstance(action.route, Path):
                 reason = action.message.partition("\n")[0]
-                if not detached_runs.stop_command(action.route, reason):
+                if not detached_run_finished(action.route) and not detached_runs.stop_command(action.route, reason):
                     return action
             else:
                 resume_cargo_stop(action.route)

@@ -729,9 +729,6 @@ class KillActionTests(unittest.TestCase):
                 send.assert_called_once()
             else:
                 send.assert_not_called()
-            if not count and detached:
-                self.assertNotIn("stop_reason", record.read_text())
-                self.assertNotIn("stop_pass_requested", record.read_text())
             if scenario == "error":
                 _ = events.write_text("populated 0\n")
             targets.return_value = {}
@@ -766,6 +763,64 @@ class KillActionTests(unittest.TestCase):
                                  [record] * detached_stop.call_count)
             else:
                 detached_stop.assert_not_called()
+
+    def test_finished_detached_record_completes_pending_kill(self) -> None:
+        for count in (0, 2):
+            with self.subTest(term_count=count):
+                root = self.root / str(count)
+                folder = root / "builds-detached.slice" / "detached-fixture.scope"
+                folder.mkdir(parents=True)
+                scope = self.scope_identity(folder)
+                record = root / "fixture.json"
+                run_record: dict[str, object] = {"run_id": "fixture", "status": "running"}
+                _ = record.write_text(json.dumps(run_record))
+                run = kill_action.KillCandidate(17, "123", 17, "123", "session", "check", "at", "")
+                route = kill_action.DetachedCommand(record, 17, "123", 16, "122", scope)
+                target = kill_action.KillTarget(run, route, staff.StaffId("worker-id"), "impl2", "impl2", "worker")
+                actions = kill_action.KillActions(root)
+
+                class Restart(BaseException):
+                    pass
+
+                def interrupt(_target: kill_action.KillTarget, reason: str, *, on_term: Callable[[int], None]) -> bool:
+                    run_record.update(stop_reason=reason, stop_pass_requested=True)
+                    _ = record.write_text(json.dumps(run_record))
+                    if count:
+                        on_term(count)
+                    raise Restart
+
+                with (patch.object(kill_action, "live_targets", return_value={run.reference: target}),
+                      patch.object(kill_action, "stop_verified_scope", new=interrupt),
+                      self.assertRaises(Restart)):
+                    _ = actions.stop(run.reference, actions.handle(target), "")
+
+                run_record["status"] = "finished"
+                _ = record.write_text(json.dumps(run_record))
+                workers: list[threading.Thread] = []
+                start = threading.Thread.start
+
+                def record_thread(thread: threading.Thread) -> None:
+                    workers.append(thread)
+                    start(thread)
+
+                with (patch.object(kill_action, "live_targets", return_value={}),
+                      patch.object(detached_runs, "stop_command", side_effect=FileNotFoundError) as stop,
+                      patch.object(kill_action, "deliver", return_value=kill_action.DeliveryState.SENT) as send,
+                      patch.object(threading.Thread, "start", new=record_thread)):
+                    kill_action.KillActions(root).resume()
+                    (worker,) = workers
+                    worker.join(TEST_HANG_GUARD_SECS)
+                    self.assertFalse(worker.is_alive())
+                    resumed = kill_action.KillActions(root)
+                    resumed.resume()
+                    self.assertEqual(workers, [worker])
+                    _, (result,) = resumed.options()
+                stop.assert_not_called()
+                self.assertEqual(send.call_count, int(count > 0))
+                expected = kill_action.StopState.STOPPED if count else kill_action.StopState.ALREADY_ENDED
+                self.assertEqual(result["stop"], expected)
+                delivery = kill_action.DeliveryState.SENT if count else kill_action.DeliveryState.PENDING
+                self.assertEqual(result["delivery"], delivery)
 
 
 if __name__ == "__main__":
