@@ -209,9 +209,11 @@ def run_callback(script: str, phase: str, argv_file: Path, arguments: list[str],
 
 
 MAC_BUSY_STATUS = 78
+MAC_RUN_REFUSED_STATUS = 9
 RUNS = ".local/state/mac-queue/runs"
 RECEIPTS = ".local/state/mac-queue/receipts"
 MAC_GATE_SCRIPT = Path("scripts/mac_test/mac_gate.py")
+MAC_RUN_SCRIPT = Path("scripts/production/mac_run.sh")
 
 
 class SavedRun(TypedDict):
@@ -281,8 +283,8 @@ def ended_run_callback(saved_script: str) -> tuple[Path, str]:
     name = Path(saved_script).name
     if name == MAC_GATE_SCRIPT.name:
         return installed / MAC_GATE_SCRIPT, "cleanup-ended"
-    if name == "mac_run.sh":
-        return installed / "scripts/production/mac_run.sh", "cleanup"
+    if name == MAC_RUN_SCRIPT.name:
+        return installed / MAC_RUN_SCRIPT, "cleanup"
     return Path(saved_script), "cleanup"
 
 
@@ -299,10 +301,22 @@ class Arguments(argparse.Namespace):
     argv: list[str] = []
 
 
-def blocking_run(args: Arguments, owner: OwningSession | NoOwningSession) -> claim_state.MacBlockState:
-    if args.kind == "run":
-        return mac_test.blocking_claim_block(claim_state.state_paths(), owner)
-    return mac_test.NO_MAC_BLOCK
+def blocking_run(
+    args: Arguments, owner: OwningSession | NoOwningSession,
+) -> claim_state.MacBlockState | mac_test.ClaimFinished:
+    if args.kind != "run":
+        return mac_test.NO_MAC_BLOCK
+    paths = claim_state.state_paths()
+    is_mac_run = Path(args.lifecycle_script).name == MAC_RUN_SCRIPT.name
+    try:
+        block = mac_test.blocking_claim_block(paths, owner)
+    except (OSError, claim_state.StateReadError):
+        if is_mac_run:
+            return mac_test.unreadable_claim(paths.block)
+        raise
+    if is_mac_run and not isinstance(block, claim_state.NoMacBlock):
+        return mac_test.blocked_claim(block)
+    return block
 
 
 def wait_to_retry() -> None:
@@ -329,6 +343,8 @@ def run(args: Arguments) -> int:
                 if isinstance(result, int):
                     return result
                 block = result
+            if isinstance(block, mac_test.ClaimFinished):
+                return MAC_RUN_REFUSED_STATUS
             block = mac_test.lift_expired_claim_block(claim_state.state_paths(), owner, block)
             if isinstance(block, claim_state.NoMacBlock):
                 continue
@@ -356,7 +372,7 @@ def run_attempt(
     command = args.argv[1:] if args.argv[:1] == ["--"] else args.argv
     original_command = command.copy()
     status = 1
-    block: claim_state.MacBlockState = mac_test.NO_MAC_BLOCK
+    block: claim_state.MacBlockState | mac_test.ClaimFinished = mac_test.NO_MAC_BLOCK
     remote = RemoteRun()
     prepared = False
     placement = MacPlacement("", episode, "")
@@ -384,7 +400,7 @@ def run_attempt(
                 status = 0
             elif code:
                 print(output, end="", flush=True)
-                status = 9 if args.lifecycle_script and code in (10, 11, 12) else code
+                status = MAC_RUN_REFUSED_STATUS if args.lifecycle_script and code in (10, 11, 12) else code
             else:
                 placement = parse_placement(output)
                 callback_environment["MAC_QUEUE_HOST"] = placement.host
@@ -417,6 +433,8 @@ def run_attempt(
                             raise ValueError("the run needs a close hook")
                         status = stream_remote(remote_command(placement, args.cwd, command, on_close,
                                                               owned_close=args.owned_close), remote, ssh)
+            if isinstance(block, mac_test.ClaimFinished):
+                status = MAC_RUN_REFUSED_STATUS
         except (OSError, ValueError) as error:
             print(f"mac queue: {error}", file=sys.stderr)
             status = 2
@@ -468,7 +486,7 @@ def run_attempt(
             if not released:
                 print("mac queue: the placement was not returned; the queue ends it when this run ends", file=sys.stderr)
                 status = status or 1
-    if status == 0 and not isinstance(block, claim_state.NoMacBlock):
+    if status == 0 and isinstance(block, (claim_state.PendingMacBlock, claim_state.ActiveMacBlock)):
         return block
     return status
 

@@ -273,6 +273,38 @@ if sys.argv[1] == "prepare":
                 "Mac output", "mac_exit=0",
             ])
 
+    def test_mac_run_refuses_blocked_or_unreadable_state_after_placement(self) -> None:
+        for unreadable in (False, True):
+            with self.subTest(unreadable=unreadable), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                environment = {**queue_fixture(root), "CODEX_THREAD_ID": "other-session",
+                               "FAKE_QUEUE_SIDECARS": "1"}
+                block = Path(environment["MAC_TEST_STATE_DIR"]) / "block.json"
+                block.parent.mkdir()
+                pending = root / "block-on-placement.json"
+                if unreadable:
+                    _ = pending.write_text("damaged\n")
+                    expected = f"state unreadable: {block}\n"
+                else:
+                    self.write_block(pending)
+                    expected = "blocked by fixture-holder: fixture work\nneeds the Mac\n"
+
+                callback = root / mac_queue_run.MAC_RUN_SCRIPT.name
+                with (mock.patch.dict(os.environ, environment, clear=True),
+                      mock.patch.object(mac_queue_run, "run_callback") as lifecycle,
+                      mock.patch.object(mac_queue_run, "wait_to_retry") as wait,
+                      redirect_stdout(io.StringIO()) as output):
+                    status = mac_queue_run.main(["--lifecycle-script", str(callback), *self.command(root, "run")[3:]])
+
+                self.assertEqual(status, 9)
+                self.assertEqual(output.getvalue(), expected)
+                lifecycle.assert_not_called()
+                wait.assert_not_called()
+                self.assertTrue(block.is_file())
+                self.assertFalse((root / "remote").exists())
+                self.assertEqual([event[0] for event in self.events(root)], ["place-step", "cancel-placement"])
+                self.assertEqual(list((root / mac_queue_run.RECEIPTS).iterdir()), [])
+
     def test_expired_block_lifts_without_the_watcher_and_preserves_a_failed_ci_restore(self) -> None:
         for restore_fails in (False, True):
             with self.subTest(restore_fails=restore_fails), tempfile.TemporaryDirectory() as temporary:

@@ -562,6 +562,11 @@ def blocked_claim(block: PendingMacBlock | ActiveMacBlock) -> ClaimFinished:
     return ClaimFinished(10)
 
 
+def unreadable_claim(path: Path) -> ClaimFinished:
+    print(f"state unreadable: {path}")
+    return ClaimFinished(12)
+
+
 def timestamp(value: datetime) -> str:
     return value.isoformat()
 
@@ -1861,15 +1866,13 @@ def claim_once(args: CliArguments, paths: StatePaths, scope: ClaimScope,
     try:
         claims = live_claims(paths)
     except ClaimStateUnreadable as error:
-        print(f"state unreadable: {error.path}")
-        return ClaimFinished(12)
+        return unreadable_claim(error.path)
     overlapping = tuple(claim for claim in claims if scopes_overlap(claim.scope, scope))
     identity = claim_state.ClaimIdentity(args.claim_id, args.episode, args.attempt)
     try:
         block = blocking_claim_block(paths, session)
     except (OSError, StateReadError):
-        print(f"state unreadable: {paths.block}")
-        return ClaimFinished(12)
+        return unreadable_claim(paths.block)
     for claim in overlapping:
         record = claim.record
         if ("remote_host" in record and record.get("cleanup_pending")
@@ -2013,8 +2016,7 @@ def adopt_wait_claim(args: CliArguments, paths: StatePaths, scope: ClaimScope,
         try:
             block = blocking_claim_block(paths, session)
         except (OSError, StateReadError):
-            print(f"state unreadable: {paths.block}")
-            return ClaimFinished(12)
+            return unreadable_claim(paths.block)
         if not isinstance(block, NoMacBlock):
             return blocked_claim(block)
     record: RemoteJobClaim
