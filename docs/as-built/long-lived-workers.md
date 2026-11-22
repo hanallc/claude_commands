@@ -694,6 +694,7 @@ The supervisor records the command exit before it starts delivery.
 After the first delivery attempt, it marks the run finished and keeps the latest delivery outcome.
 A failed push saves the send error as pending delivery.
 The finished run leaves the live-run limit and keeps its record and log.
+The start lock serializes orphan scans.
 The reaper saves an ended orphan as finished before it makes one delivery attempt.
 The reaper alerts the director if a finished run still has a failed push and its supervisor is gone.
 Before the reaper alerts for an unconfirmed push, it checks for a receipt.
@@ -716,9 +717,34 @@ If `env` uses another option, the guard refuses the start when a later argument 
 To limit memory, use `systemd-run --user --scope --collect -q -p MemoryMax=<cap> -- <command>`.
 The record saves the command's process group as `command_group`.
 The supervisor installs no signal handler.
-`detached_runs.py stop` and a build hold stop send TERM to the command group.
-Each checks the supervisor and the command leader identity before it signals the group.
-Each stages the stop reason before it sends TERM.
+The launcher records the verified scope before it execs the command.
+The launcher uses one process for scope publication and command startup.
+On natedev, five samples of the former helper took 179–294 ms elapsed and 161–183 ms CPU.
+Five samples of the replacement guard took 63–131 ms elapsed and 52–65 ms CPU.
+The samples used private records outside the expected scope and measured the launch check.
+`detached_runs.py stop` freezes the saved scopes with `cgroup.freeze`.
+It checks for more scopes after the kernel confirms the freeze.
+It freezes each scope it finds and repeats the check until the set stops growing.
+It saves the fixed set, the stop reason and any pass cancellation request before it sends TERM.
+It sends TERM through pidfds to the verified members of the frozen scope trees.
+The optional callback receives one count of the members that received TERM.
+The stop thaws every frozen scope before it waits for exit.
+It also attempts to thaw every frozen scope if an error occurs.
+After the stop grace, it uses `cgroup.kill` on each scope that stays populated.
+It saves completion only when every scope in the fixed set is empty or removed.
+A retry freezes the full set of saved scopes again.
+If the callback raises, the stop saves the cleanup result before it raises the error.
+If cleanup also fails, the cleanup error includes the callback error as its cause.
+A failed scope kill reports a stop error if the scope stays populated.
+A replacement directory with a different identity reports an error.
+A legacy group TERM without a verified scope reports an unconfirmed stop.
+A separate session in the saved scope receives the same stop signals.
+After a normal exit, the supervisor gives scope members the stop grace to exit.
+It uses the same freeze and discovery steps to check for remaining members before it records completion.
+The supervisor stops any remaining scope members and includes their scope and PIDs in the result.
+An unreadable scope produces a cleanup error result.
+The explicit stop requires Linux pidfd support.
+A build hold records a detached run as stopped after the same scope stop confirms the end.
 The supervisor stays alive to record the exit status and deliver the result.
 A run with a saved stop reason reports `STOPPED` and includes the reason.
 The result includes the command's exit status.
