@@ -3,11 +3,20 @@
 Launchers run `check-launch`, `start-pass`, and `finish-pass` through `scripts/direct/pass_record.py`.
 
 <NoWorkerMode>
-Complete the current work directly.
+Complete the current work without workers.
 This exception covers implementation, repairs, code review, style review, and phase review.
-Keep the normal scope, authorization, reservation, verification, and checkpoint gates.
+Keep the normal scope, authorization, reservation, verification, findings, and checkpoint gates.
 Use the existing run.
 Apply <PrepareSession/> when no run remains.
+
+You may give implementation, repairs, search and reviews to Claude subagents (the Agent tool):
+- Run at most `no_worker_max_subagents` (`config/direct.conf`) at a time. Read it with `~/.claude/scripts/lib/py ~/.claude/scripts/lib/conf.py get direct no_worker_max_subagents`.
+- Give each subagent the Work Order, the authorized paths and the verification commands.
+- A subagent writes only in your worktree and only in the authorized paths. Two subagents never edit the same file.
+- A subagent does not commit, push, merge or message a peer.
+- Read each result, run the verification yourself, then stop the subagent.
+- Give each review in the steps below to a fresh subagent that did not write the code. Record it as a director review activity.
+- A subagent spends your Claude account. When the account is low or the key is 0, do the work yourself.
 
 The no-capacity broadcast stops every Codex worker on the machine; you stop none yourself.
 `worker_capacity.py` sends you one stop report when it changed a worker of yours.
@@ -40,14 +49,14 @@ Run them from `${WORKING_DIR}` with the normal phase ID and paths.
    "$PY" "$DIRECT/progress_history.py" start-activity --session-dir "${SESSION_DIR}" --label "Direct implementation" --activity "Implement phase <id> without workers"
    ```
 
-   Write the code and run the Work Order's verification under <VerificationContract/>.
+   Write the code, or give it to a subagent, and run the Work Order's verification under <VerificationContract/>.
    Finish the activity with `progress_history.py finish-activity --session-dir "${SESSION_DIR}" --status completed --result "<actual result>"`.
    Use `error` for a failed activity.
    Never call `start-pass` or `finish-pass` to represent direct work.
    Those commands require a launcher; direct activity does not create a worker pass.
 3. Prepare the normal <ReviewPromptContract/> inputs from the phase baseline and current tree.
    Read `config/review/code.md` and the original Work Specification.
-   Apply the `adversary` and `contract` lenses yourself in separate reads.
+   Apply the `adversary` and `contract` lenses in separate reviews.
    Include the `rerun` lens when <DualReview/> requires it.
    Save each review result under `${PHASE_DIR}` and record review activities with `start-activity` and `finish-activity`.
    These are director reviews, with no claim of independent worker review.
@@ -61,7 +70,7 @@ Run them from `${WORKING_DIR}` with the normal phase ID and paths.
    Use `dispatch` only for the gate's repair batch.
    This command records the batch without launching a worker.
    Keep its existing routing, Astra, and accepted-check requirements.
-   Repair the batch yourself, then record `findings.py landed --session-dir "${SESSION_DIR}" --phase "<id>"`.
+   Repair the batch, then record `findings.py landed --session-dir "${SESSION_DIR}" --phase "<id>"`.
    Perform closure review before `findings.py verdict --session-dir "${SESSION_DIR}" --phase "<id>" --id "<finding>" --state accepted --evidence "<repair and checks>"`.
    Repeat the gate until it reports `converged`.
    The gate accepts zero worker passes.
@@ -71,13 +80,13 @@ Run them from `${WORKING_DIR}` with the normal phase ID and paths.
    "$PY" ~/.claude/scripts/lint/style_review.py prepare --working-dir "${WORKING_DIR}" --since "<phase_baseline>" --phase-dir "${PHASE_DIR}" --prompt "<empty prompt outside the repository>" --directory-file "${PHASE_DIR}/style-input-directory"
    ```
 
-   Read the returned input directory's `prompt.md` and apply its assignment yourself.
+   Carry out the assignment in the returned input directory's `prompt.md`.
    Save the marked result outside the repository.
    Capture it with `style_review.py finish --input-dir "<returned directory>" --result "<saved result>" --dispatch-code 0`.
    Preparation records `Off` and `No changes to review` itself.
    This command accepts a director process and needs no worker pass.
 6. Complete smoke, UX, phase review, and shrink under their existing contracts.
-   Perform reviews directly where those contracts normally dispatch.
+   Do each review as a director review where those contracts normally dispatch.
    Apply <CheckpointCommit/> after the required checks and converged findings.
    Run `phase_reservation.py record-active --session-dir "${SESSION_DIR}" --phase "<id>"` before its reservation checks.
    Stage the final tree and run `verify.sh doc` immediately before each Cargo checkpoint.

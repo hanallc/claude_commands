@@ -206,6 +206,7 @@ The no-capacity broadcast also stops every Codex worker and ends each of their o
 A stop report names your stopped workers, your canceled passes, and each worker that is not proved stopped.
 Send no assign while this mode is on.
 Read `~/.claude/docs/direct/no_worker_mode.md` in full when this mode turns on.
+Claude subagents may do the work, under the limits in that file.
 </NoWorkerMode>
 
 <ProductionUnit>

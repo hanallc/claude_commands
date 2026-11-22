@@ -18,6 +18,7 @@ It also stops every Codex worker and ends their open passes as canceled; each af
 A real `hit your usage limit` worker failure turns it on for the unit's current phase.
 Send no worker work to a unit in this mode; treat its direct work as normal phase work.
 The director writes the code, runs the tests, and does the reviews directly.
+It may give that work to Claude subagents under the limits in `docs/direct/no_worker_mode.md`.
 Follow <NoWorkerMode/> in `commands/unit/direct.md` for the phase gates and the next-phase assign rule.
 Merge unit directors follow `commands/unit/merge.md`; they wait for workers when capacity is absent.
 
