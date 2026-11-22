@@ -105,9 +105,7 @@ class CargoWrapperTest(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
-        self.root = Path(self.enterContext(tempfile.TemporaryDirectory(
-            prefix="cargo-test-", dir="/tmp",
-        )))
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="cargo-test-")))
         self.wrapper = self.root / "scripts" / "cargo"
         self.wrapper.parent.mkdir()
         _ = shutil.copy2(SCRIPTS / "cargo", self.wrapper)

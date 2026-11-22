@@ -219,7 +219,7 @@ class RunEvidenceTests(unittest.TestCase):
 
 class FixtureHomeSafetyTests(unittest.TestCase):
     def test_worker_selection_refuses_real_home_descendants_and_symlinks(self) -> None:
-        root = Path(self.enterContext(tempfile.TemporaryDirectory(dir="/tmp")))
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         real = root / "real"
         real.mkdir()
         alias = root / "alias"
@@ -234,7 +234,7 @@ class FixtureHomeSafetyTests(unittest.TestCase):
     def test_base_setup_rejects_unsafe_environment_before_creating_files(self) -> None:
         from scripts.agents.codex_test_support import CodexFixtureCase
 
-        root = Path(self.enterContext(tempfile.TemporaryDirectory(dir="/tmp")))
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         real = root / "real"
         real.mkdir()
         for name in ("HOME", "CODEX_HOME", "AGENT_NOTES_DIR", "MODELS_CONFIG_FILE"):
@@ -253,7 +253,7 @@ class FixtureHomeSafetyTests(unittest.TestCase):
 
     def test_metadata_guard_catches_a_bypassed_refusal_in_an_absent_or_existing_tree(self) -> None:
         for existing in (False, True):
-            with self.subTest(existing=existing), tempfile.TemporaryDirectory(dir="/tmp") as directory:
+            with self.subTest(existing=existing), tempfile.TemporaryDirectory() as directory:
                 real = Path(directory)
                 auth = real / ".codex/auth.json"
                 if existing:
@@ -289,7 +289,7 @@ class FixtureHomeSafetyTests(unittest.TestCase):
                         self.assertIn(str(real / name), str(changed.exception))
         # Check an account directory created after import.
         for name in (".codex22/auth.json",):
-            with self.subTest(path=name), tempfile.TemporaryDirectory(dir="/tmp") as directory:
+            with self.subTest(path=name), tempfile.TemporaryDirectory() as directory:
                 real = Path(directory)
                 path = real / name
                 before = fixture_support.fixture_write_metadata(real)

@@ -44,9 +44,7 @@ class ScratchGuardTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
-        base = Path(os.path.realpath(self.enterContext(tempfile.TemporaryDirectory(
-            prefix="scratch-guard-test-", dir="/tmp",
-        ))))
+        base = Path(os.path.realpath(self.enterContext(tempfile.TemporaryDirectory(prefix="scratch-guard-test-"))))
         self.home, self.temp = base / "home", base / "temp"
         self.build = base / "build"
         config = base / "config"

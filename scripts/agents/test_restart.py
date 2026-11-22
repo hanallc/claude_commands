@@ -768,7 +768,7 @@ class MixedRestartTests(ShutdownTestCase):
         from scripts.herdr import worker_panes
         from scripts.herdr.test_worker_panes import PaneWorld
 
-        root = Path(fixture.enter_context(tempfile.TemporaryDirectory(prefix="mixed-", dir="/tmp")))
+        root = Path(fixture.enter_context(tempfile.TemporaryDirectory(prefix="mixed-")))
         write_text_atomic(root / "staff.json", '{"schema": 2, "rows": []}\n')
         environment = {"HOME": str(root), "STAFF_FILE": str(root / "staff.json"), "XDG_CONFIG_HOME": str(root / "config"),
             "XDG_STATE_HOME": str(root / "state"), "SHUTDOWN_STATE_DIR": str(root / "shutdown"),

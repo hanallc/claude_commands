@@ -57,7 +57,7 @@ def write_guest_config(root: Path, *, slow_test_s: float = 1.0) -> None:
 class GuestTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
-        root = Path(self.enterContext(tempfile.TemporaryDirectory(dir='/tmp')))
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         install_aws_fixture_settings(root)
         write_guest_config(root)
         _ = (root / 'gate.conf').write_text('# range: 1..\nGATE_TIME_LIMIT_FACTOR=1.5\n')
