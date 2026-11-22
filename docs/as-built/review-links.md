@@ -890,10 +890,10 @@ A failed render keeps the last good page and writes one line to stderr.
 Failed renders add no render time.
 A cached Accounts response carries its render failure to the status line.
 
-The table has two swatch columns without a heading.
+The Accounts table has two swatch columns without a heading.
 The account swatch column is between **account** and **left**.
 The role swatch column is between **role** and **next**.
-All named headers sort on click or Enter.
+Select a named header or press Enter to sort.
 The dot and swatch headers have no sort control.
 The arrow sits before a right-aligned label and after a left-aligned label.
 The arrow uses the column gap without adding to the table width.
