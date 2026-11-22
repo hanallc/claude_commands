@@ -1205,3 +1205,17 @@ Ordered after the red main repair and the guard repair (builds). It does not mov
 - **Files:** `scripts/production/gate.py`; `scripts/lib/testing_folders.py`; `scripts/lib/build_folders.py` (only if the name is made there); their tests; the as-built doc that names the folder layout.
 - **Workers:** 1 writer.
 - **Acceptance gate:** the failing modules named above pass in one tests-only gate; the budget test passes; basedpyright zero errors and warnings on changed files; one blind review.
+
+### Phase 425 — a failed recovery of another checkout's gate record does not stop every gate  · status: todo
+**Depends on:** none
+
+#### Work Order
+- **Goal:** one bad dead-gate record no longer refuses every gate on the host. builds approved at 21:20: "A failed recovery of another repo's record reports and continues; only the gate's own repo refuses."
+- **Spec:**
+  1. Every gate start recovers the records of all checkouts (`recover_gate_runs`, `scripts/production/gate.py:774-783`, called at `:839` and `:1437`). A recovery that raises `GateRefused` (`:666`, `:702`, `:741`, `:799`) now stops every gate on the host.
+  2. For a record in another checkout's directory, catch `GateRefused`, print one stderr line with the record path and reason, keep the record, and continue with the next record and directory.
+  3. For the gate's own checkout directory, keep the current refusal.
+  4. Change no other recovery step; no config key changes; no check goes away.
+- **Files:** `scripts/production/gate.py`; `scripts/production/test_gate.py` (or the test module that holds the recovery tests); `docs/as-built/merge-gate-and-test-speed.md` if it describes recovery.
+- **Workers:** 1 writer.
+- **Acceptance gate:** fixtures: a refusing record in another checkout is reported and kept while the gate runs; a refusing record in the own checkout still refuses; the recovery test module passes in one tests-only gate; basedpyright zero on changed files; one blind review.
