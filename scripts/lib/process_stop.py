@@ -1,7 +1,7 @@
 """Stop an exact Linux process lifetime or its dedicated command tree."""
 from __future__ import annotations
 
-from collections.abc import Generator
+from collections.abc import Callable, Generator
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 import fcntl
@@ -347,16 +347,22 @@ def scope_member_pids(scope: ScopeIdentity) -> list[int]:
     return []
 
 
-def stop_scope(scope: ScopeIdentity, grace: float, kill_grace: float) -> ScopeStopReceipt:
-    """Send TERM, then use cgroup.kill if the scope stays populated."""
+def stop_scope(
+    scope: ScopeIdentity, grace: float, kill_grace: float, *,
+    on_term: Callable[[int], None] | None = None,
+) -> ScopeStopReceipt:
+    """Report the TERM count before the exit wait."""
     deadline = time.monotonic() + grace
-    reached = 0
+    reached: int | None = None
     with suppress(_ScopeRemoved), _scope_events(scope) as (directory, events):
-        if _scope_is_empty(scope, events):
-            return ScopeStopReceipt(0)
-        reached = _term_scope(directory, scope, deadline)
-        if _scope_ends_on(scope, events, deadline):
+        empty = _scope_is_empty(scope, events)
+        reached = 0 if empty else _term_scope(directory, scope, deadline)
+        if on_term is not None:
+            on_term(reached)
+        if empty or _scope_ends_on(scope, events, deadline):
             return ScopeStopReceipt(reached)
+        if not reached and on_term is not None:
+            raise ScopeStopFailed("no TERM signal reached a member of the populated scope")
         try:
             descriptor = os.open("cgroup.kill", os.O_WRONLY | os.O_NOFOLLOW, dir_fd=directory)
             try:
@@ -370,7 +376,11 @@ def stop_scope(scope: ScopeIdentity, grace: float, kill_grace: float) -> ScopeSt
             raise ScopeStopFailed(f"{detail}cgroup.kill failed: {error}") from error
         if not _scope_ends_on(scope, events, time.monotonic() + kill_grace):
             raise ScopeStopFailed("the scope remains populated after KILL")
-    return ScopeStopReceipt(reached)
+    if reached is not None:
+        return ScopeStopReceipt(reached)
+    if on_term is not None:
+        on_term(0)
+    return ScopeStopReceipt(0)
 
 
 def stop_group(leader: ProcessLifetime, number: int) -> None:

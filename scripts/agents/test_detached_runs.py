@@ -1389,6 +1389,69 @@ sys.exit(1)
                 self.assertEqual(terms, expected_terms.get(outcome, ["22"]))
                 self.assertEqual(kill.read_text(), "1\n" if outcome in ("KILL", "still populated") else "0\n")
 
+    @unittest.skipUnless(process_stop.supported(), "pidfd stop needs Linux")
+    def test_stop_reports_term_before_the_scope_exit_wait(self) -> None:
+        for route in ("scope", "detached"):
+            for outcome in ("ends", "empty", "removed", "wait fails"):
+                with self.subTest(route=route, outcome=outcome):
+                    path = self.record(["fixture command"])
+                    cgroups = self.root / f"cgroups-{route}-{outcome}"
+                    relative = "/builds.slice/fixture.scope"
+                    scope = cgroups / relative.lstrip("/")
+                    scope.mkdir(parents=True)
+                    stat = scope.stat()
+                    identity: process_stop.ScopeIdentity = {"unit": scope.name, "path": relative,
+                                                           "device": stat.st_dev, "inode": stat.st_ino}
+                    events = scope / "cgroup.events"
+                    if outcome == "removed":
+                        scope.rmdir()
+                    else:
+                        _ = events.write_text("populated 0\n" if outcome == "empty" else "populated 1\n")
+                    self.update_record(path, command_scope=identity)
+                    original = path.read_bytes()
+                    order: list[tuple[str, int]] = []
+
+                    def term(_directory: int, _scope: process_stop.ScopeIdentity, _deadline: float) -> int:
+                        self.assertEqual(path.read_bytes(), original)
+                        order.append(("TERM", 2))
+                        return 2
+
+                    def on_term(count: int) -> None:
+                        order.append(("receipt", count))
+
+                    def exit_wait(_descriptor: int, _seconds: float) -> None:
+                        order.append(("wait", 0))
+                        if route == "detached":
+                            self.assertEqual(worker_lifecycle.read_json_object(path)["stop_reason"], "fixture stop")
+                        if outcome == "wait fails":
+                            raise process_stop.ScopeStopFailed("fixture wait failed")
+                        _ = events.write_text("populated 0\n")
+
+                    def stop() -> None:
+                        if route == "scope":
+                            receipt = process_stop.stop_scope(identity, 2, 2, on_term=on_term)
+                            self.assertEqual(receipt.term_reached, 0 if outcome in ("empty", "removed") else 2)
+                        else:
+                            self.assertTrue(detached_runs.stop_command(path, "fixture stop", on_term=on_term))
+
+                    with (patch.object(process_stop, "CGROUP_ROOT", cgroups),
+                          patch.object(process_stop, "_term_scope", side_effect=term),
+                          patch.object(process_stop, "_wait_scope_event", side_effect=exit_wait)):
+                        if outcome == "wait fails":
+                            with self.assertRaisesRegex(process_stop.ScopeStopFailed, "fixture wait failed"):
+                                stop()
+                        else:
+                            stop()
+
+                    if outcome in ("empty", "removed"):
+                        self.assertEqual(order, [("receipt", 0)])
+                        self.assertEqual(path.read_bytes(), original)
+                    else:
+                        self.assertEqual(order, [("TERM", 2), ("receipt", 2), ("wait", 0)])
+                        if route == "detached":
+                            saved = worker_lifecycle.read_json_object(path)
+                            self.assertEqual(saved.get("scope_end_proved"), True if outcome == "ends" else None)
+
     def test_start_rejects_an_unknown_kind(self) -> None:
         with contextlib.redirect_stderr(io.StringIO()) as error, self.assertRaises(SystemExit) as raised:
             _ = detached_runs.main(["start", "--kind", "unknown", "--", "true"])
