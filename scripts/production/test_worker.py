@@ -19,6 +19,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from collections.abc import Callable, Generator, Iterator
 from dataclasses import replace
 from contextlib import ExitStack, contextmanager, redirect_stderr, redirect_stdout
+from types import SimpleNamespace
 from typing import Literal, TextIO, cast, final, override
 import unittest
 from unittest.mock import call, patch
@@ -46,6 +47,24 @@ from scripts.message import send, sessions
 from scripts.usage import agents_log
 
 from scripts.herdr import herdr
+
+
+DETACHED_FIXTURE_DEAD_PID = 2 ** 22 + 12345
+
+
+@contextmanager
+def detached_fixture_processes() -> Generator[None]:
+    """Report the synthetic supervisor as absent without asking the host."""
+    read = detached_run_process.process_args
+
+    def process_args(pid: int) -> (
+        list[str] | detached_run_process.ProcessCommandText
+        | detached_run_process.ProcessArgumentsUnavailable | detached_run_process.ProcessAbsent
+    ):
+        return detached_run_process.ProcessAbsent() if pid == DETACHED_FIXTURE_DEAD_PID else read(pid)
+
+    with patch.object(detached_run_process, "process_args", side_effect=process_args):
+        yield
 
 
 @final
@@ -334,6 +353,8 @@ class WorkerCommandTests(unittest.TestCase):
         self.fixture = pane_fixtures.WorkerPaneTests("runTest")
         self.fixture.setUp()
         _ = write_config_fixture(self.fixture.root / "conf/shutdown.conf")
+        _ = write_config_fixture(self.fixture.root / "conf/detached_runs.conf")
+        _ = self.enterContext(detached_fixture_processes())
         _ = (self.fixture.root / "conf/build_targets.conf").write_text("targets=natedev,mac\nkind.natedev=local\nkind.mac=ssh\n")
         self.fixture.world.binary = "/nonexistent/herdr"
         self.addCleanup(self.fixture.doCleanups)
@@ -445,10 +466,6 @@ class WorkerCommandTests(unittest.TestCase):
 
     def start_orphaned_worker_run(self) -> tuple[worker_panes.OpenWorker, Path, detached_runs.RunRecord]:
         config = self.fixture.root / "conf"
-        atomic_file.write_text_atomic(config / "detached_runs.conf",
-            "# whole: 1..\nPROCESS_CHECK_SECONDS=5\n"
-            + "# whole: 1..\nRESULT_LINE_CHARS=300\n"
-            + "# whole: 1..\nRESULT_TEXT_CHARS=2000\n")
         atomic_file.write_text_atomic(config / "postmaster.conf",
             "# range: 0.001..\nwait_seconds=1\n"
             + "# range: 0.001..\nclaim_grace_seconds=1\n")
@@ -463,7 +480,7 @@ class WorkerCommandTests(unittest.TestCase):
             "run_id": "orphan", "status": "running", "session_dir": str(self.run_dir),
             "worker": opened.row.name, "staff_id": opened.row.id, "label": "fixture gate",
             "command": ["true"], "log": str(folder / "orphan.log"), "started_at": 1,
-            "pid": 2 ** 22 + 12345, "director_dir": str(self.run_dir), "done_message_file": "",
+            "pid": DETACHED_FIXTURE_DEAD_PID, "director_dir": str(self.run_dir), "done_message_file": "",
         }
         atomic_file.write_text_atomic(path, json.dumps(run))
         return opened, path, run
@@ -885,7 +902,10 @@ class WorkerCommandTests(unittest.TestCase):
             atomic_file.write_text_atomic(self.run_dir / f"impl_worker_{row.name}.json", json.dumps({
                 "staff_id": row.id, "slot": row.name, "launcher_pid": 0}))
         atomic_file.write_text_atomic(self.run_dir / "impl_status_native-child", "implementing")
-        with patch.dict(os.environ, {"USAGE_STATE_DIR": str(self.fixture.root / "usage")}):
+        darwin_launcher = SimpleNamespace(
+            pid=os.getpid(), parent=1, arguments=herdr.ReadProcessArguments(tuple(command)))
+        with (patch.dict(os.environ, {"USAGE_STATE_DIR": str(self.fixture.root / "usage")}),
+              patch.object(herdr, "_darwin_processes", return_value=[darwin_launcher])):
             dispatch = progress_history.begin_dispatch(self.run_dir, slot="native-child", phase="8", role="impl",
                 worker_name=native.name, worker_id=native.id, launcher_command=["assign.sh"], prompt=self.prompt,
                 kind="impl", lens="")
