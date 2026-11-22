@@ -4182,14 +4182,19 @@ release_token() {
     # A killed acquisition can still hold the token, so release that token too.
     if [[ -n "${TOKEN_WAIT_FILE:-}" && -e "${TOKEN_WAIT_FILE}.given_back" ]]; then
         if [[ "${TOKEN_HELD}" -eq 1 ]]; then
-            bash "${BOARD_HELPER}" release "${BOARD_DIR}" "${BOARD_SLOT}" cargo --pid $$ >/dev/null 2>&1 || true
+            (
+                [[ -z "${VERIFY_EXIT_STDERR_FD:-}" ]] || close_verify_exit_stderr
+                exec bash "${BOARD_HELPER}" release "${BOARD_DIR}" "${BOARD_SLOT}" cargo --pid $$
+            ) >/dev/null 2>&1 || true
         fi
         TOKEN_HELD=0
     fi
     [[ "${TOKEN_HELD}" -eq 1 ]] || return 0
     local release_status=0
-    bash "${BOARD_HELPER}" release "${BOARD_DIR}" "${BOARD_SLOT}" cargo --pid $$ >/dev/null \
-        || release_status=$?
+    (
+        [[ -z "${VERIFY_EXIT_STDERR_FD:-}" ]] || close_verify_exit_stderr
+        exec bash "${BOARD_HELPER}" release "${BOARD_DIR}" "${BOARD_SLOT}" cargo --pid $$
+    ) >/dev/null || release_status=$?
     # An ownership identity change permits reclaim. Preserve the original step result.
     (( release_status == 0 || release_status == 3 )) || return "$release_status"
     TOKEN_HELD=0
