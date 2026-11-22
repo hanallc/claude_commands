@@ -4260,7 +4260,8 @@ run_log_tee() {
 start_run_log() {
     exec > >(run_log_tee)
     RUN_LOG_PIDS+=("$!")
-    exec {RUN_LOG_STDERR}>&2
+    exec 80>&2
+    RUN_LOG_STDERR=80
     exec 2> >(run_log_tee >&2)
     RUN_LOG_PIDS+=("$!")
 }
@@ -4376,7 +4377,8 @@ verify_exit() {
     if (( EXIT_STATUS == 0 )) && [[ "$2" != exit && "$2" != "exit "* ]]; then
         EXIT_STATUS=128
         outcome=interrupted
-        trap '' PIPE
+        # The run-log reader can stop before cleanup releases the token.
+        exec 80>&"${RUN_LOG_STDERR:-2}" 2>/dev/null
         interrupt_hold_wait
     elif (( EXIT_STATUS == 0 )); then
         outcome=completed
@@ -4387,7 +4389,7 @@ verify_exit() {
         # A full stderr pipe must not delay release of the source snapshot lease.
         VERIFY_PY_HELPER=VERIFY_EXIT_DIAGNOSTIC "$PY" "$VERIFY_START_DIR/../lib/time_limit.py" 1 0 \
             printf 'verify.sh: interrupted before %s completed (status %s).\n' "$CMD" "$EXIT_STATUS" \
-            >&"${RUN_LOG_STDERR:-2}" 2>/dev/null
+            >&80 2>/dev/null || true
     fi
     exit "$EXIT_STATUS"
 }
