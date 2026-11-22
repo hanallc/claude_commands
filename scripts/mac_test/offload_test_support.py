@@ -947,22 +947,23 @@ raise SystemExit(offload.main())
         self.assertEqual(self.events_for("ssh"), [])
         self.assertFalse((self.stub_directory / "cleanup-called").exists())
 
-    def assert_takeover_signal_checks_reply_host(self, outcome: str) -> None:
-        self.set_leftover_answer(outcome)
-        output = self.interrupt_held_claim(takeover=True)
-        ssh = self.events_for("ssh")
-        self.assertEqual(len(ssh), 1, output)
-        self.assertEqual(ssh[0]["args"][-2], "reply-mac", output)
-        self.assertTrue((self.stub_directory / "cleanup-called").exists())
-        state_events = (self.stub_directory / "state-events").read_text().splitlines()
-        if outcome == "clean":
-            self.assertEqual(state_events, ["claim", "release"])
-            self.assertFalse(self.claim_file.exists())
-            self.assertEqual(output, "")
-        else:
-            self.assertEqual(state_events, ["claim"])
-            self.assert_claim_is_kept("previous-mac")
-            self.assert_leftover_diagnostic(output, outcome)
+    def assert_takeover_signal_keeps_claim_for_leased_cleanup(self, reply_host: str) -> None:
+        # The run holds mirror leases here. A later run checks leftovers under the cleanup lease.
+        self.set_leftover_answer("clean")
+        output = self.interrupt_held_claim(takeover=True, reply_host=reply_host)
+        self.assertEqual((self.stub_directory / "state-events").read_text().splitlines(), ["claim"], output)
+        self.assert_claim_is_kept("previous-mac")
+        self.assertEqual(self.events_for("ssh"), [], output)
+        self.assertFalse((self.stub_directory / "cleanup-called").exists())
+        self.assertNotIn("Traceback", output)
+
+    def remove_tree_key(self) -> None:
+        # The origin keeps the history key that a Mac claim needs; no HEAD means no tree key.
+        git = ["git", "-C", str(self.repository)]
+        _ = subprocess.run([*git, "remote", "add", "origin", "https://example.invalid/fixture/hana.git"], check=True)
+        _ = subprocess.run([*git, "update-ref", "-d", "HEAD"], check=True)
+        self.claim_file = claim_state.StatePaths(self.state_directory, "mac").claims / self.mac_repository().claim_file
+        self.environment["MAC_TEST_FIXTURE_CLAIM_FILE"] = str(self.claim_file)
 
     def commit_sent_tree(self) -> str:
         environment = {

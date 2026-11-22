@@ -530,14 +530,13 @@ sys.exit(71)
         for checkout in (linked, peer):
             self.assertEqual(eligibility.mac_step_eligibility(config, checkout, "hana", "nextest", "mac"),
                              eligibility.IneligibleMacStep("repo"))
+        # A checkout without a Mac mirror has no repository claim, so the Mac refuses it.
         linked_claim = self.native_claim(linked)
-        with mac_run.held(separate, "mac", SuiteMode.GATE, GATE_JOB_NOT_RECORDED):
-            self.assertEqual(mac_test.command_claim(linked_claim, self.paths, watch_claim=False), 11)
-        self.assertEqual(mac_test.command_claim(linked_claim, self.paths, watch_claim=False), 0)
-        self.addCleanup(mac_test.command_release, linked_claim, self.paths)
-        with self.assertRaisesRegex(mac_run.MacRunRefused, "busy with native Mac run"):
-            with mac_run.held(self.repo, "mac", SuiteMode.GATE, GATE_JOB_NOT_RECORDED):
-                self.fail("The origin repository bypassed the whole-Mac claim")
+        output = StringIO()
+        with redirect_stdout(output):
+            self.assertEqual(mac_test.command_claim(linked_claim, self.paths, watch_claim=False), 15)
+        self.assertEqual(output.getvalue().strip(), "history_key_unavailable")
+        self.assertEqual(claim_state.read_claims(self.paths), ())
 
     def test_mac_origin_takes_precedence_over_borrowed_objects(self) -> None:
         other = self.root / "other"
@@ -1075,8 +1074,10 @@ with patch.object(Path, "unlink", interrupt_unlink), patch.object(Path, "replace
                     waiting.episode, waiting.attempt = "episode", "attempt"
                     waiting.claim_id = execution_identity.assigned_claim_id(waiting.episode, waiting.attempt)
                 reservation = saved if recovery == "unlink-error" else claim_state.WHOLE_MAC
-                self.assertEqual(mac_test.command_claim(waiting, self.paths, watch_claim=False,
-                                                       mac_repository=reservation), 0)
+                # A client from before history keys wrote whole-Mac reservations for a checkout.
+                with mock.patch.object(claim_state, "has_mac_worktree", return_value=False):
+                    self.assertEqual(mac_test.command_claim(waiting, self.paths, watch_claim=False,
+                                                           mac_repository=reservation), 0)
                 reserved, = claim_state.read_claims(self.paths)
                 old_path = reserved.path
                 if recovery == "unlink-error":
