@@ -19,6 +19,7 @@ from scripts.production.staff_test_support import StaffTestCase, fixture_member
 from scripts.agents import remote
 
 copy_to_mac = cast(Callable[..., None], getattr(staff, "_copy_to_mac"))
+start_process = subprocess.Popen
 
 
 @dataclass
@@ -101,7 +102,7 @@ class MacCopyTests(StaffTestCase):
         self.runner = CopyRunner()
         _ = self.enterContext(cast(AbstractContextManager[object],
             mock.patch.dict(os.environ, {"HERDR_BIN": "/nonexistent/herdr"})))
-        # Every process boundary is fake, even when a test removes STAFF_FILE.
+        # Stub the copy process and SSH even when a test removes STAFF_FILE.
         _ = self.enterContext(cast(AbstractContextManager[object],
             mock.patch.object(subprocess, "Popen", self.runner.launch)))
         _ = self.enterContext(cast(AbstractContextManager[object],
@@ -139,6 +140,9 @@ class MacCopyTests(StaffTestCase):
         self.assertEqual(self.runner.sends, [])
 
     def test_mac_write_forwards_and_never_launches_a_copy(self) -> None:
+        # Start the private owner through its real launcher before the copy mock applies.
+        with mock.patch.object(subprocess, "Popen", start_process):
+            _ = self.shared_owner.port
         with self.machine("mac"):
             with mock.patch.object(staff, "_remote_row") as forward:
                 _ = staff.ensure("showrunner", name="forward", runtime_id="unused")

@@ -29,7 +29,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 from scripts.disks import disks_page, measure
-from scripts.lib import conf, conf_reads
+from scripts.lib import build_folders, conf, conf_reads, process_group
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lint.memory_test_support import config_environment
 from scripts.production import change_routing, console_browser, console_check, console_server, console_settings
@@ -324,7 +324,8 @@ if (location.search === '?view=saved' && location.hash === '#saved-row' &&
         self.append_to_accounts_page(self.candidate,
             "from scripts.production.test_console_fixtures import wait_for_checker_exit\n    wait_for_checker_exit()", "b''")
         # Chrome needs short paths for its Unix sockets.
-        scratch = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="console-kill-", dir="/tmp"))).resolve()
+        scratch = self.enterContext(build_folders.temporary_build_folder(
+            build_folders.UniqueBuildFolder("console-kill-", build_folders.SystemTemporaryParent())))
 
         def processes() -> list[list[str]]:
             result = subprocess.run(["ps", "-axww", "-o", "pid=,ppid=,pgid=,stat=,command="],
@@ -405,7 +406,7 @@ with patch.object(signal, "signal", side_effect=AssertionError("The checker inst
                             checker.kill()
                         for group in groups:
                             with suppress(ProcessLookupError):
-                                os.killpg(int(group), signal.SIGKILL)
+                                process_group.send_process_group(int(group), signal.SIGKILL)
 
     def page_function(self, key: str, reference: str, tree: Path) -> None:
         settings = tree / "config/console.conf"
@@ -1358,8 +1359,8 @@ class _PersistentModelScans:
             disks = tree / "config/disks.conf"
             _ = disks.write_text(disks.read_text().replace(str(self.store / "disks"), str(self.store / f"{tree.name}-disks")))
             for stem, content in (("aws_page", f"output_folder={tree.name}-aws"),
-                                  ("production", (REPOSITORY / "config/production.conf").read_text()
-                                   .replace("mac_run_log=/tmp/mac_run_hana.log", f"mac_run_log={tree.name}-log")),
+                                  ("production", re.sub(r"(?m)^mac_run_log=.*$", f"mac_run_log={tree.name}-log",
+                                                        (REPOSITORY / "config/production.conf").read_text())),
                                   ("cloud_gate", f"regions={tree.name}"),
                                   ("memory_feed", f"output_folder={tree.name}-builds")):
                 _ = (tree / f"config/{stem}.conf").write_text(content + "\n")

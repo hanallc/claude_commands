@@ -6471,12 +6471,16 @@ def _read_plain_model_turn(path: Path, family: Literal["claude", "codex"], scan_
     return scanned.result(scan_bytes)
 
 
+def _runs_on_macos() -> bool:
+    return sys.platform == "darwin"
+
+
 def _model_process_options(pid: int) -> SessionModelOptions:
     """Keep only the model and effort options from a live process."""
     if not pid:
         return SessionModelOptions()
     try:
-        if os.uname().sysname == "Darwin":
+        if _runs_on_macos():
             argv = account.procargs2_parts(account.kern_procargs2(pid), lambda name: False).arguments
         else:
             argv = tuple(os.fsdecode(word) for word in Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0"))
@@ -6656,7 +6660,7 @@ def _local_codex_processes() -> dict[str, CodexRoleProcess]:
 
 def _session_config_dir(pid: int) -> account.ConfiguredClaudeFolder | account.NoAccountSetting | account.ProcessEnvironmentUnread:
     """Read the account setting without a subprocess for each Mac member."""
-    if os.uname().sysname != "Darwin":
+    if not _runs_on_macos():
         return account.process_config_dir(pid)
     try:
         parts = account.procargs2_parts(account.kern_procargs2(pid), lambda name: name == "CLAUDE_CONFIG_DIR")

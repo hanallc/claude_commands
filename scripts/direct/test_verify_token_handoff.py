@@ -8,7 +8,7 @@ import unittest
 from scripts.direct.verify_token_wait_test_support import VerifyTokenWaitFixture, VERIFY, private_verify_hold_state
 from scripts.lib.process_supervisor import ManagedProcess, launch
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
-from scripts.production.staff_test_support import build_fixture_sessions, fixture_runtime_id
+from scripts.production.staff_test_support import fixture_runtime_id
 
 
 class VerifyTokenHandoffTests(VerifyTokenWaitFixture):
@@ -30,8 +30,9 @@ class VerifyTokenHandoffTests(VerifyTokenWaitFixture):
             self.assertFalse(lock.exists(), "the hold wait kept the token")
             peer_holds = self.root / "peer-holds"
             peer_holds.mkdir()
+            peer_identity = fixture_runtime_id("fixture-hold-owner")
             peer_environment = {**environment, "BUILD_HOLD_DIR": str(peer_holds), "TEST_BLOCK": "1",
-                                **build_fixture_sessions(fixture_runtime_id("fixture-hold-owner"))}
+                                "CLAUDE_CODE_SESSION_ID": peer_identity, "CODEX_THREAD_ID": peer_identity}
             self.assert_private_hold_state(peer_environment)
             peer = self.enterContext(launch(["bash", str(VERIFY), "check", "sample", "--no-cache"],
                                     cwd=self.root, env=peer_environment,

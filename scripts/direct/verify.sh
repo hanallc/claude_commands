@@ -920,6 +920,7 @@ run_step() {
         release_wait_claim
     fi
     local attempt status started ended step_log monitor=0 LINT_REPAIR_REUSED_GRANT=0
+    local -x VERIFY_STEP_OWNER_LOG=""
     local STEP_WRITES_TREE=0
     local VERIFY_SLOT_SOURCE="" VERIFY_SLOT_TREE="" VERIFY_SLOT_HEAD=""
     if [[ "${PLACEMENT_OUTCOME:-}" == unresolved ]] && buildlog_step_compiles "$@"; then
@@ -949,6 +950,7 @@ run_step() {
     fi
     RUN_LAST_ATTEMPT_KILLED=0
     step_log="$(mktemp "${HOLD_WAIT_DIR:-${TMPDIR:-/tmp}}/step-output.XXXXXX")"
+    if [[ -n "${VERIFY_STEP_INFO_FILE:-}" ]]; then VERIFY_STEP_OWNER_LOG="$step_log"; fi
     if buildlog_step_compiles "$@"; then
         if [[ "${CMD:-}" == doc && -n "${DOC_REPO_TOP:-}" && "${BUILDLOG_PREPARED_COPY:-}" != "$DOC_REPO_TOP" ]]; then
             VERIFY_SLOT_SOURCE=$DOC_REPO_TOP
@@ -1011,6 +1013,10 @@ run_step() {
             status=$?
         fi
         RUN_STEP_PID=""
+        if [[ -n "$VERIFY_STEP_OWNER_LOG" && -e "$VERIFY_STEP_INFO_FILE.stopped" ]]; then
+            # Wait for the owner to forward the stop and finish guardian cleanup.
+            ( lock_file_descriptor 9 ) 9<>"$step_log"
+        fi
         if [[ -n "$VERIFY_SLOT_SOURCE" && "${CMD:-}" != doc ]]; then
             VERIFY_SLOT_EXECUTED_TREE=$VERIFY_SLOT_TREE
         fi
@@ -3964,19 +3970,29 @@ fi
 # The guardian ends the step when the owner pipe closes.
 # The workload records its group leader under the token guard before it starts the command.
 STEP_OWNER_PY='
+from contextlib import suppress
 import fcntl
 import json
 import os
 from pathlib import Path
+import select
+import signal
+import socket
 import subprocess
 import sys
+import threading
+import time
 
 def shell_status(status: int) -> int:
     return status if status >= 0 else 128 - status
 
 with open(Path(os.environ["VERIFY_PROCESS_GROUP_LIB"]) / "package_root.py") as package_root: exec(package_root.read(), {"__file__": package_root.name})
 from scripts.lib import process_supervisor
+from scripts.lib.process_group import send_process_group
 from scripts.lib.process_start import Started, process_start, process_start_format
+
+stop_signals = {signal.SIGINT, signal.SIGTERM, signal.SIGHUP}
+step_log = os.environ.get("VERIFY_STEP_OWNER_LOG", "")
 
 def identity(pid):
     result = process_start(pid)
@@ -3985,6 +4001,8 @@ def identity(pid):
     return result.start
 
 if sys.argv[1] == "--workload":
+    if step_log:
+        signal.pthread_sigmask(signal.SIG_UNBLOCK, stop_signals)
     lock = Path(sys.argv[2])
     holder = sys.argv[3]
     command = sys.argv[4:]
@@ -4006,9 +4024,39 @@ if sys.argv[1] == "--workload":
         fcntl.flock(guard, fcntl.LOCK_UN)
     sys.exit(shell_status(subprocess.call(command)))
 
+def wait_for_step(workload):
+    signal.pthread_sigmask(signal.SIG_BLOCK, stop_signals)
+    reader, writer = socket.socketpair()
+    with reader, writer:
+        def receive_stop():
+            number = signal.sigwait(stop_signals)
+            with suppress(OSError):
+                writer.sendall(bytes([number]))
+
+        threading.Thread(target=receive_stop, daemon=True).start()
+        ready, _, _ = select.select([reader, workload.status_descriptor], [], [])
+        if reader not in ready:
+            return workload.wait()
+        number = reader.recv(1)[0]
+    workload.send_group_signal(number)
+    # Give group members time to handle the signal before the guardian kills survivors.
+    deadline = time.monotonic() + 2
+    with suppress(ProcessLookupError):
+        while time.monotonic() < deadline:
+            send_process_group(workload.pid, 0)
+            time.sleep(0.02)
+    return -number
+
+if step_log:
+    signal.pthread_sigmask(signal.SIG_BLOCK, stop_signals)
+    step_log_lock = os.open(step_log, os.O_RDWR)
+    fcntl.flock(step_log_lock, fcntl.LOCK_EX)
 with process_supervisor.launch([sys.executable, "-I", "-S", "-c", os.environ["VERIFY_STEP_OWNER_SOURCE"],
                                 "--workload", *sys.argv[1:]]) as workload:
-    sys.exit(shell_status(workload.wait()))
+    status = wait_for_step(workload)
+if step_log:
+    os.close(step_log_lock)
+sys.exit(shell_status(status))
 '
 
 # Preserve the shared invocation policy (including systemd scopes and its
