@@ -11,6 +11,7 @@ import io
 import os
 import re
 from collections import Counter
+from collections.abc import Iterator
 from contextlib import redirect_stdout
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
@@ -43,7 +44,6 @@ from scripts.build_queue.scope_activity import (RunningServiceJob, IdleService, 
 from scripts.lint import test_memory_admit as memory_tests
 from scripts.lib import atomic_file, build_folders, conf, test_hang_guard
 from scripts.lib.build_slots_test_support import write_private_slot_roots
-from scripts.lib.proc_text import read_proc_text
 from scripts.review_links import console_theme, page_frame, review_link, test_serve
 from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, GateJobNotRecorded, StepJob
 from scripts.lib.build_steps import OTHER_COMMAND, RECORDED_STEP_NAMES, RECORDED_VERBS, StepNames, command_job, read_step_names
@@ -3798,38 +3798,15 @@ process.stdout.write(JSON.stringify({
             for pid, scope_gib in zip(helper_pids, (1, 2), strict=True):
                 write_scope(run_slice / f"helper-{pid}.scope", members=(pid,),
                             current=scope_gib * gib, anonymous=scope_gib * gib)
-            config = fixture.server.last_usable_configuration
-            assert isinstance(config, admission_records.MemoryConfig)
-            plan = admission_service.SystemReadingPlan(config, tuple(fixture.server.reservations.values()),
-                                                       tuple(fixture.server.run_places.values()), False)
-            tracked_pids = {root.pid, *helper_pids}
-            status_reads: Counter[int] = Counter()
-
-            def read_status(path: Path) -> str:
-                if path.name == "status" and path.parent.parent == proc:
-                    pid = int(path.parent.name)
-                    if pid in tracked_pids:
-                        status_reads[pid] += 1
-                return read_proc_text(path)
-
-            with mock.patch.object(gate, "_read_proc_text", side_effect=read_status):
-                _ = admission_service.read_system(plan, fixture.readings, fixture.proc, fixture.clock)
-            self.assertEqual(status_reads, dict.fromkeys(tracked_pids, 1))
             after, reading = page()
             matching = {str(run_slice / f"helper-{pid}.scope") for pid in helper_pids}
-            self.assertEqual({step.measured.cgroup for step in reading.view.running
-                              if isinstance(step.measured, admission_records.UnownedSliceMemory)
-                              and isinstance(step.run, LiveBuildRun) and step.run.pid == root.pid
-                              and step.measured.cgroup}, matching)
+            self.assertTrue(matching.isdisjoint(step.measured.cgroup for step in reading.view.running
+                                               if isinstance(step.measured, admission_records.UnownedSliceMemory)))
             shown, = (row for row in after["walk"] if row["pid"] == root.pid)
             self.assertEqual(shown, original)
             self.assertEqual(after["walk"], before["walk"])
             self.assertEqual(reading.explanation.totals, baseline.explanation.totals)
             self.assertEqual(reading.explanation.totals.measured, 7 * gib // 2)
-            tool_indices = frozenset(index for index, step in enumerate(reading.explanation.decided_from.running)
-                                     if gate.detached_tool_memory(step.measured, builds))
-            self.assertEqual(len(tool_indices), 2)
-            self.assertEqual(gate.released_resident_bytes(reading.explanation.decided_from.running, tool_indices), 0)
             ram = after["ram"]
             self.assertEqual((ram["queued_builds_bytes"], ram["build_tools_bytes"], ram["other_build_tools_bytes"]),
                              (2 * gib, 3 * gib, 3 * gib))
@@ -3858,42 +3835,79 @@ process.stdout.write(JSON.stringify({
             self.assertEqual(owned["ram"]["queued_builds_bytes"], 5 * gib)
             self.assertEqual(owned["ram"]["build_tools_bytes"], 0)
 
-    def test_system_read_reuses_detached_scope_membership(self) -> None:
+    def test_system_read_matches_main_for_nested_detached_scopes(self) -> None:
         gib = admission_records.GIB
         with AdmissionFixture() as fixture:
+            proc = fixture.proc.path
+            root = fixture.fixture_owner(700001, "100")
+            run = wire.RunIdentity(root.pid, root.start_time)
+            helpers = (700002, 700003)
+            write_process(proc, root.pid, gib, start=root.start_time)
+            _ = (proc / str(root.pid) / "cmdline").write_bytes(b"bash\0/fixture/verify.sh\0test\0")
+            for pid in helpers:
+                write_process(proc, pid, gib // 4, parent=root.pid)
+            first = fixture.fixture_owner(700004, "200")
+            _ = fixture.finish_step(fixture.request(owner=first, run=run))
+            fixture.allow_next_start()
+
             builds = Path(os.environ["BUILDLOG_BUILDS_CGROUP"])
-            run = builds / "builds-detached.slice/builds-detached-r1.slice"
-            helper = run / "helper.scope"
+            helper = builds / "builds-detached.slice/builds-detached-r1.slice/helper.scope"
             child = helper / "cargo.scope"
-            helper_owner = fixture.fixture_owner(700001, "100")
-            cargo_owner = fixture.fixture_owner(700002, "200")
-            write_scope(helper, members=(helper_owner.pid,), current=2 * gib, anonymous=2 * gib)
-            sidecar = fixture.scope(cargo_owner, folder=str(child.relative_to(fixture.root)), current=gib, anonymous=gib)
+            write_scope(helper, members=helpers, current=5 * gib, anonymous=5 * gib)
+            cargo_owner = fixture.fixture_owner(700005, "300")
+            for pid in (root.pid, *helpers, cargo_owner.pid):
+                (proc / str(pid) / "cwd").symlink_to(fixture.root)
+            sidecar = fixture.scope(cargo_owner, folder=str(child.relative_to(fixture.root)),
+                                    current=2 * gib, anonymous=2 * gib)
             request = replace(fixture.request(owner=cargo_owner), sidecar=str(sidecar))
             _ = only_admitted(fixture.server.handle_request(request))
             record = fixture.server.reservations[request.episode]
             config = fixture.server.last_usable_configuration
             assert isinstance(config, admission_records.MemoryConfig)
-            plan = admission_service.SystemReadingPlan(config, (record,), (), False)
+            plan = admission_service.SystemReadingPlan(replace(config, ci_memory_slice=""), (record,),
+                                                       tuple(fixture.server.run_places.values()), False)
+            reads: Counter[str] = Counter()
+            read_bytes = Path.read_bytes
             read_text = Path.read_text
-            reads: Counter[Path] = Counter()
+            readlink = Path.readlink
+            iterdir = Path.iterdir
 
-            def read_members(path: Path, encoding: str | None = None, errors: str | None = None) -> str:
-                if path.name == "cgroup.procs" and path.is_relative_to(run):
-                    reads[path.parent] += 1
+            def read_process(path: Path) -> bytes:
+                if path.parent.parent == proc and path.name in ("status", "cmdline", "environ"):
+                    reads[path.name] += 1
+                return read_bytes(path)
+
+            def read_group(path: Path, encoding: str | None = None, errors: str | None = None) -> str:
+                if path.is_relative_to(builds):
+                    if path.name == "cgroup.procs":
+                        reads["cgroup.procs"] += 1
+                    elif path == builds / "sccache.service/memory.current":
+                        reads["compiler probe"] += 1
+                    elif path.name in ("memory.current", "memory.stat", "memory.swap.current"):
+                        reads["memory counters"] += 1
                 return read_text(path, encoding=encoding, errors=errors)
 
-            # The real lifetime check reads the reserved scope's direct members.
-            with (mock.patch.object(fixture.proc, "lifetime", return_value=gate.PopulatedStepScope(child)),
-                  mock.patch.object(Path, "read_text", autospec=True, side_effect=read_members)):
-                first = admission_service.read_system(plan, fixture.readings, fixture.proc, fixture.clock)
-                self.assertEqual(reads, {helper: 1, child: 2})
-                _ = (helper / "cgroup.procs").write_text("")
-                second = admission_service.read_system(plan, fixture.readings, fixture.proc, fixture.clock)
-                self.assertEqual(reads, {helper: 2, child: 4})
-            self.assertEqual(first.scope_members[str(helper)], {helper_owner.pid, cargo_owner.pid})
-            self.assertEqual(second.scope_members[str(helper)], {cargo_owner.pid})
-            memory = first.reservations[request.episode].memory
+            def read_folder(path: Path) -> Path:
+                if path.parent.parent == proc and path.name == "cwd":
+                    reads["cwd"] += 1
+                return readlink(path)
+
+            def list_groups(path: Path) -> Iterator[Path]:
+                if path.is_relative_to(builds):
+                    reads["cgroup listings"] += 1
+                return iterdir(path)
+
+            with (mock.patch.object(Path, "read_bytes", read_process), mock.patch.object(Path, "read_text", read_group),
+                  mock.patch.object(Path, "readlink", read_folder), mock.patch.object(Path, "iterdir", list_groups)):
+                evidence = admission_service.read_system(plan, fixture.readings, fixture.proc, fixture.clock)
+            self.assertEqual(dict(reads), {"status": 3, "cmdline": 1, "environ": 1, "cwd": 1,
+                                           "cgroup.procs": 2, "cgroup listings": 2, "memory counters": 3,
+                                           "compiler probe": 1})
+            self.assertEqual(evidence.unowned, ())
+            tracked, = evidence.between
+            assert isinstance(tracked.measured, admission_records.MeasuredMemory)
+            self.assertEqual(tracked.measured.bytes, 3 * gib // 2)
+            memory = evidence.reservations[request.episode].memory
             assert isinstance(memory, admission_records.MeasuredMemory)
             self.assertEqual(memory.anonymous_source, admission_records.ScopeSource(child, frozenset({cargo_owner.pid})))
 

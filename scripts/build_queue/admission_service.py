@@ -666,7 +666,7 @@ def raw_reservation_memory(record: ReservationRecord, row: records.Reservation,
         return records.GoneMemory()
     if isinstance(lifetime, gate.PopulatedStepScope):
         try:
-            return gate.process_memory(lifetime, proc)
+            return gate.scope_memory(lifetime.directory, gate.ScopeMembershipPass())
         except FileNotFoundError:
             identity = processes.get(row["pid"])
             if identity is None or identity.start != row["start_time"]:
@@ -798,10 +798,8 @@ def read_system(plan: SystemReadingPlan, readings: Readings, proc: Proc, clock: 
     scope_process_memory = {pid: gate.process_memory({pid}, proc.path)
                             for pid in {member for group in members.values() for member in group}}
     between: list[records.RunningStep] = []
-    builds = gate.builds_slice_cgroup()
     represented = {(row.activity.run.pid, row.activity.run.start_time) for row in unowned
-                   if isinstance(row.activity, ScopeProcesses) and isinstance(row.activity.run, LiveBuildRun)
-                   and not gate.detached_tool_memory(row, builds)}
+                   if isinstance(row.activity, ScopeProcesses) and isinstance(row.activity.run, LiveBuildRun)}
     represented.update((record.run.pid, record.run.start_time) for record in plan.reservations
                        if isinstance(record.run, wire.RunIdentity))
     for place in plan.runs:
@@ -2164,9 +2162,8 @@ class AdmissionServer:
         inputs = gate.build_queue_inputs(local_rows, memories, readings, now, priority, unowned)
         inputs = replace(inputs, pending_remote_starts=pending_remote_starts & local_owners, local_waits=local_waits,
                          local_machine=self.host, run_limit_exempt_owners=exempt)
-        builds = gate.builds_slice_cgroup()
         represented = {(step.run.pid, step.run.start_time) for step in inputs.running
-                       if isinstance(step.run, LiveBuildRun) and not gate.detached_tool_memory(step.measured, builds)}
+                       if isinstance(step.run, LiveBuildRun)}
         between = tuple(step for step in evidence.between
                         if isinstance(step.run, LiveBuildRun) and (step.run.pid, step.run.start_time) not in represented)
         if between:

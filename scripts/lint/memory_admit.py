@@ -914,37 +914,59 @@ class LiveOwnerProcess:
     pass
 
 
+@dataclass(frozen=True)
+class ScopeDirectoryMembers:
+    """Keep a scope's own PIDs and child directories."""
+
+    pids: set[int]
+    children: tuple[Path, ...]
+
+
 class ScopeMembershipPass:
-    """Read each scope once for a memory reading, including nested scopes."""
+    """Read each scope once within one membership sample."""
 
     def __init__(self) -> None:
-        self.members: dict[Path, frozenset[int] | OSError | ValueError] = {}
+        self.direct: dict[Path, ScopeDirectoryMembers | OSError | ValueError] = {}
+        self.members: dict[Path, frozenset[int]] = {}
 
     def read(self, directory: Path) -> frozenset[int]:
         if directory not in self.members:
-            try:
-                self.members[directory] = self._read(directory)
-            except (OSError, ValueError) as error:
-                self.members[directory] = error
-        members = self.members[directory]
-        if isinstance(members, (OSError, ValueError)):
-            raise members
-        return members
+            members: set[int] = set()
+            pending = [directory]
+            while pending:
+                scope = pending.pop()
+                if scope in self.members:
+                    members.update(self.members[scope])
+                    continue
+                sample = self.read_directory(scope)
+                members.update(sample.pids)
+                pending.extend(sample.children)
+            self.members[directory] = frozenset(members)
+        return self.members[directory]
 
-    def _read(self, directory: Path) -> frozenset[int]:
+    def read_directory(self, directory: Path) -> ScopeDirectoryMembers:
+        if directory not in self.direct:
+            try:
+                self.direct[directory] = self._read(directory)
+            except (OSError, ValueError) as error:
+                self.direct[directory] = error
+        sample = self.direct[directory]
+        if isinstance(sample, (OSError, ValueError)):
+            raise sample
+        return sample
+
+    def _read(self, directory: Path) -> ScopeDirectoryMembers:
         members: set[int] = set()
         try:
             path = directory / "cgroup.procs"
             check_memory_reading(path)
             members.update(int(pid) for pid in path.read_text().split())
-            children = [child for child in directory.iterdir() if child.is_dir()]
+            children = tuple(child for child in directory.iterdir() if child.is_dir())
         except OSError as error:
             if error.errno not in (errno.ENOENT, errno.ESRCH, errno.ENODEV):
                 raise
-            return frozenset(members)
-        for child in children:
-            members.update(self.read(child))
-        return frozenset(members)
+            children = ()
+        return ScopeDirectoryMembers(members, children)
 
 
 def scope_members(directory: Path) -> set[int]:
@@ -952,17 +974,19 @@ def scope_members(directory: Path) -> set[int]:
     return set(ScopeMembershipPass().read(directory))
 
 
-def process_memory(source: set[int] | PopulatedStepScope, proc: Path = PROC, *,
-                   membership: ScopeMembershipPass | None = None) -> MeasuredMemory:
-    """Read swap-backed use from the scope or processes; retain resident bytes and swap."""
-    if isinstance(source, PopulatedStepScope):
-        reading = slice_working_set(source.directory)
-        try:
-            members = (membership or ScopeMembershipPass()).read(source.directory)
-        except (OSError, ValueError) as error:
-            return replace(reading, anonymous=RunUseUnavailable(f"{source.directory}: {error}"),
-                           anonymous_source=ScopeSource(source.directory, frozenset()))
-        return replace(reading, anonymous_source=ScopeSource(source.directory, members))
+def scope_memory(directory: Path, membership: ScopeMembershipPass) -> MeasuredMemory:
+    """Read a scope's memory counters and use the caller's membership sample."""
+    reading = slice_working_set(directory)
+    try:
+        members = membership.read(directory)
+    except (OSError, ValueError) as error:
+        return replace(reading, anonymous=RunUseUnavailable(f"{directory}: {error}"),
+                       anonymous_source=ScopeSource(directory, frozenset()))
+    return replace(reading, anonymous_source=ScopeSource(directory, members))
+
+
+def process_memory(source: set[int], proc: Path = PROC) -> MeasuredMemory:
+    """Read resident bytes, swap-backed use, and swap from processes."""
     used, swapped = 0, 0
     process_uses: list[ProcessAnonymousUse] = []
     for child in sorted(source):
@@ -1073,7 +1097,7 @@ def step_memory(row: Reservation, processes: dict[int, ProcessIdentity],
         return GoneMemory()
     if isinstance(lifetime, PopulatedStepScope):
         try:
-            reading = process_memory(lifetime, proc)
+            reading = scope_memory(lifetime.directory, ScopeMembershipPass())
         except FileNotFoundError:
             if not owner_live:
                 return GoneMemory()
@@ -3004,25 +3028,9 @@ def service_job_state(workers: Iterable[int], processes: dict[int, ProcessIdenti
     return UnmatchedServiceJob(started_at)
 
 
-def build_scope_charge_groups(directory: Path) -> Iterable[Path]:
-    """Read through detached slice containers to the scopes that use memory."""
-    try:
-        children = list(directory.iterdir())
-    except OSError:
-        return
-    for child in children:
-        if (child.name == "builds-detached.slice"
-                or (directory.name == "builds-detached.slice" and child.name.startswith("builds-detached-")
-                    and child.suffix == ".slice")):
-            yield from build_scope_charge_groups(child)
-        else:
-            yield child
-
-
 def unowned_slice_memory(rows: list[Reservation], processes: dict[int, ProcessIdentity], proc: Path,
-                         *, activity_reader: ScopeActivityReader | None = None,
-                         ci_memory_slice: str = "", waiters: Sequence[Waiter] = (),
-                         membership: ScopeMembershipPass | None = None) -> tuple[UnownedSliceMemory, ...]:
+                         *, membership: ScopeMembershipPass, activity_reader: ScopeActivityReader | None = None,
+                         ci_memory_slice: str = "", waiters: Sequence[Waiter] = ()) -> tuple[UnownedSliceMemory, ...]:
     """Count child scopes that no reservation owns, without duplicate process charges."""
     directory = builds_slice_cgroup()
     owned: set[Path] = set()
@@ -3038,8 +3046,10 @@ def unowned_slice_memory(rows: list[Reservation], processes: dict[int, ProcessId
             tree_pids.update(process_tree({row["pid"]: row["start_time"]}, processes))
     result: list[UnownedSliceMemory] = []
     activity_reader = activity_reader or ScopeActivityReader(processes, proc)
-    membership = membership or ScopeMembershipPass()
-    children = list(build_scope_charge_groups(directory))
+    try:
+        children = list(directory.iterdir())
+    except OSError:
+        children = []
     ci_group = ci_slice_cgroup(ci_memory_slice) if ci_memory_slice else ReadingUnavailable("CI slice not configured")
     ci_groups = (ci_group,) if isinstance(ci_group, Path) else ()
     if ci_memory_slice and isinstance(ci_group, ReadingUnavailable):
@@ -3047,14 +3057,16 @@ def unowned_slice_memory(rows: list[Reservation], processes: dict[int, ProcessId
     children.extend(group for group in ci_groups if group not in children)
     for child in children:
         required = child in ci_groups
-        if not required and (child in owned or child.name == "sccache.service" or not child.is_dir()):
+        # The Builds feed reads detached tool use from the host tool budget.
+        if not required and (child in owned or child.name in ("builds-detached.slice", "sccache.service")
+                             or not child.is_dir()):
             continue
         try:
             working_set = slice_working_set(child)
             amount = working_set.bytes
             swapped = working_set.swap_bytes
             members = membership.read(child)
-            scoped = [process_memory(PopulatedStepScope(scope), proc, membership=membership)
+            scoped = [scope_memory(scope, membership)
                       for scope in owned_scope_roots(owned, child)] if required else []
             scoped_pids = {pid for memory in scoped if isinstance(memory.anonymous_source, ScopeSource)
                            for pid in memory.anonymous_source.members}
