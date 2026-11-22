@@ -46,6 +46,7 @@ from scripts.herdr.worker_panes import worker_run
 from scripts.herdr import test_worker_panes as pane_support
 from scripts.message import roster, send, send_later, sessions
 from scripts.lib.test_hang_guard import LauncherHangGuard, TEST_HANG_GUARD_SECS
+from scripts.lib.python_startup.sitecustomize import startup_pythonpath
 from scripts.lib.fork_test_support import ForkChild, ForkChildren
 from scripts.lib.socket_test_support import short_socket_directory
 from scripts.message.repeat_guard_test_support import install_guard_test_budget
@@ -2492,7 +2493,8 @@ sys.exit(status)
             record = self.supervise(path)
         self.assertEqual(record.get("exit_code"), 0, Path(record["log"]).read_text())
         self.assertEqual(json.loads(Path(record["log"]).read_text()),
-                         [str(selected / "scripts/value.py"), str(startup), "loaded"])
+                         [str(selected / "scripts/value.py"),
+                          startup_pythonpath(str(startup)), "loaded"])
 
     def test_repeat_budget_hook_selects_the_test_copy_without_exporting_it(self) -> None:
         result = subprocess.run(

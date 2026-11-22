@@ -49,6 +49,7 @@ from scripts.agents import detached_run_process, worker_lifecycle
 from scripts.buildlog import treekey
 from scripts.lib import atomic_file, conf, process_group, process_start, process_stop, unit_runs
 from scripts.lib.atomic_file import write_text_atomic
+from scripts.lib.python_startup.sitecustomize import startup_pythonpath
 from scripts.lib.cancellation import CANCELLATION_SIGNALS
 from scripts.message import send_budget
 from scripts.production import staff, worker_admission
@@ -2247,13 +2248,7 @@ def command_supervise(args: argparse.Namespace) -> int:
             record = _write_record(record_path, record)
     environment = dict(os.environ)
     _ = environment.pop(process_stop.DETACHED_SLICE_ENV, None)
-    from scripts.lib.python_startup.sitecustomize import inherited_paths
-
-    paths = inherited_paths(environment.get("PYTHONPATH", ""))
-    if paths:
-        environment["PYTHONPATH"] = os.pathsep.join(paths)
-    else:
-        _ = environment.pop("PYTHONPATH", None)
+    environment["PYTHONPATH"] = startup_pythonpath(environment.get("PYTHONPATH", ""))
     environment.update({
         "UNIT_DETACHED_RUN": "1",
         "UNIT_RUN_DIR": record["session_dir"],
