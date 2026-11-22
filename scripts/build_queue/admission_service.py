@@ -1309,6 +1309,11 @@ def read_priority_roster(result: Future[Mapping[str, gate.UnitMembership]], wake
         os.close(wake)
 
 
+@dataclass(frozen=True)
+class NoContinuationClaim:
+    """This waiter has not claimed a continuation slot."""
+
+
 class WaiterClaimDisposition(Enum):
     RELEASE = auto()
     RETURN = auto()
@@ -1325,7 +1330,7 @@ class WaitingAdmission:
     connection: Connection | NoConnection
     last_reply: wire.Wait | NoWaitReply = NoWaitReply()
     last_sent: float = float("-inf")
-    continuation_claim: records.ContinuationSlot | records.NoContinuationClaim = records.NO_CONTINUATION_CLAIM
+    continuation_claim: records.ContinuationSlot | NoContinuationClaim = NoContinuationClaim()
 
 
 @dataclass(frozen=True)
@@ -1994,7 +1999,7 @@ class AdmissionServer:
     def _claim_slots(self, ordered: list[tuple[Path, records.RankedWaiter]]) -> None:
         claimed = {slot.owner for slot in self.slots.values() if isinstance(slot, records.ContinuationSlot)}
         waiters = {records.waiter_owner(item.row): item for item in self.waiters.values()}
-        for position, (_, row) in enumerate(ordered):
+        for _, row in ordered:
             owner = records.waiter_owner(row)
             waiting = waiters.get(owner)
             if waiting is None or not gate.can_use_natedev(row):
@@ -2017,8 +2022,7 @@ class AdmissionServer:
             if not candidates:
                 continue
             key, slot = min(candidates, key=lambda item: (item[1].expires_at, item[0]))
-            ahead = frozenset(records.queue_row_id(waiter) for _, waiter in ordered[:position])
-            claim = records.ContinuationSlot(slot, owner, waiters_ahead_at_grant=ahead)
+            claim = records.ContinuationSlot(slot, owner)
             self.slots[key] = claim
             waiting.continuation_claim = claim
             claimed.add(owner)
@@ -3886,7 +3890,7 @@ done
             if isinstance(admission, wire.AdmitRequest):
                 prepared.add(request.episode)
                 previous = self.waiters.get(request.episode)
-                claim = previous.continuation_claim if previous is not None else records.NO_CONTINUATION_CLAIM
+                claim = previous.continuation_claim if previous is not None else NoContinuationClaim()
                 if previous is not None and isinstance(previous.connection, Connection):
                     self._remove_waiter(previous, claim_disposition=WaiterClaimDisposition.TRANSFER)
                 waiting = WaitingAdmission(admission, row, NO_CONNECTION, continuation_claim=claim)
@@ -4169,24 +4173,9 @@ done
         self.placement_holds = holds
         self.placement_hold_answers = answers
         local_order = (inputs.waiter_orders.keys() | pending_remote_starts) - removed
-        parallel_starts: dict[str, frozenset[str]] = {}
-        new_holds = pending_remote_starts - inputs.pending_remote_starts
-        if new_holds and local_starts and self.queue_pins:
-            start_rows = [(index, row) for index, (_, row) in enumerate(ordered)
-                          if records.waiter_owner(row) in local_starts]
-            for index, (_, row) in enumerate(ordered):
-                owner = records.waiter_owner(row)
-                if owner not in new_holds or not gate.can_use_natedev(row):
-                    continue
-                natural = gate.waiter_order(row)
-                starts = frozenset(records.waiter_owner(start) for position, start in start_rows
-                    if index < position and gate.waiter_order(start) < natural)
-                if starts:
-                    parallel_starts[owner] = starts
         return replace(inputs, ordered=[(path, row) for path, row in ordered
             if records.waiter_owner(row) in local_order], slots=tuple(self.slots.values()), cargo_folders=cargo_folders,
-            pending_remote_starts=frozenset(pending_remote_starts),
-            parallel_remote_starts=parallel_starts)
+            pending_remote_starts=frozenset(pending_remote_starts))
 
     def _placement_hold(self, request: wire.PlacementRequest, candidate: placement.CandidateEligibility,
                         answers: dict[tuple[str, placement.PlacementDestination], float]) -> PlacementHold | None:
@@ -4819,7 +4808,7 @@ done
             place = waiter_place(row, key)
             self._run_place(request, place)
             previous = self.waiters.get(key)
-            claim = previous.continuation_claim if previous is not None else records.NO_CONTINUATION_CLAIM
+            claim = previous.continuation_claim if previous is not None else NoContinuationClaim()
             if previous is not None and previous.connection is not connection:
                 self._remove_waiter(previous, claim_disposition=WaiterClaimDisposition.TRANSFER)
             self.waiters[key] = WaitingAdmission(request, row, connection, continuation_claim=claim)

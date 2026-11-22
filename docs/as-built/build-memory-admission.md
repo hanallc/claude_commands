@@ -2363,6 +2363,8 @@ See [Synchronous verify helpers](build-targets.md#synchronous-verify-helpers) fo
 
 ### Move a waiting step
 
+A drag acts like a bump: main's claim rules run on the shared order.
+
 Use the three-line handle on the Builds page to move a natedev wait to any place in the list.
 To use the keyboard, press Space on the handle, press an arrow key, then press Enter.
 Press Escape to cancel.
@@ -2383,18 +2385,14 @@ Placement, memory admission, and continuation claims filter the same queue order
 The page, client replies, and the head-stall snapshot also filter that order.
 When run times tie, the earlier step arrival comes first. PID breaks a tie in step arrival.
 A confirmed move or Undo changes queue order only.
-A slot assigned at release stays with its row. The moved row can claim the next free local slot in queue order.
-Each claim records the IDs of the rows ahead when the service assigns the claim.
-Those rows can still block the claim under the ordinary admission rules.
-After a drag, a row that already holds a slot can start before a row that the drag put ahead of it.
+A drag can return a waiting row's unstarted slot claim, as a bump does.
 A request that starts or ends removes one place from pins behind it in the full order.
 The full order includes absent requests and applies their pins.
 An absent step keeps its run identity to recover the run's saved queue time.
 The service keeps a pin while a request is temporarily absent.
 A request that starts or ends loses its own pin.
 Both hosts use the visible order for normal steps.
-A local start can pass a new remote startup hold if a pin put the hold ahead of that start.
-The local preview must select the start before the remote hold begins.
+A remote startup hold keeps its place in the local order until the hold ends.
 The table includes remote-only waits in queue order.
 The table identifies waits that a build hold blocks.
 Speculative Mac copy rows show the newest-first rule.

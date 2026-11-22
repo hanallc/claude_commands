@@ -2011,17 +2011,6 @@ def inputs_room(inputs: QueueInputs, policy: AdmissionPolicy) -> MemoryRoom | Re
     return memory_room(inputs.host, run_memories(inputs), policy, ci_use=ci_use)
 
 
-def blocks_claim(waiter: Waiter, claim: ContinuationSlot | records.NoContinuationClaim) -> bool:
-    """Apply an order hold if the waiter preceded the claim at grant time."""
-    if isinstance(claim, records.NoContinuationClaim) or isinstance(claim.waiters_ahead_at_grant, records.ClaimOrderNotRecorded):
-        return True
-    return records.queue_row_id(waiter) in claim.waiters_ahead_at_grant
-
-
-def first_blocker(waiters: Iterable[Waiter], claim: ContinuationSlot | records.NoContinuationClaim) -> Waiter | NoWaiter:
-    return next((waiter for waiter in waiters if blocks_claim(waiter, claim)), NoWaiter())
-
-
 def head_policy(inputs: QueueInputs, now: float, policy: AdmissionPolicy, next_start: NextStartAt) -> HeadPolicy:
     ordered = ranked_queue_waiters(inputs)
     candidate = first_queued_waiter((row for _, row in ordered), inputs.pending_remote_starts)
@@ -2031,20 +2020,18 @@ def head_policy(inputs: QueueInputs, now: float, policy: AdmissionPolicy, next_s
     while True:
         room = inputs_room(inputs, policy)
         kept, used = (room.kept, room.used) if isinstance(room, MemoryRoom) else (0, 0)
-        claims = {slot.owner: slot for slot in inputs.slots if isinstance(slot, ContinuationSlot)}
-        admissions = admission_walk(inputs, ordered, room, now, policy, kept, used, safety, next_start, claims)
-        if not claims:
+        admissions = admission_walk(inputs, ordered, room, now, policy, kept, used, safety, next_start)
+        if not inputs.slots:
             break
-        blocked_claims = {claim.slot.reservation for entry in admissions
-                          if isinstance(hold := entry.decision.order_hold, HeldBehindHead)
-                          and (claim := claims.get(records.waiter_owner(entry.waiter))) is not None
-                          and blocks_claim(hold.waiter, claim)}
-        if not blocked_claims:
+        held_owners = {records.waiter_owner(entry.waiter) for entry in admissions
+                       if entry.decision.reused_slot and isinstance(entry.decision.order_hold, HeldBehindHead)}
+        if not held_owners:
             break
         # Return the claim before checking the earlier row's room again.
-        returned_claims.update(blocked_claims)
+        returned_claims.update(slot.slot.reservation for slot in inputs.slots
+                               if isinstance(slot, ContinuationSlot) and slot.owner in held_owners)
         inputs = replace(inputs, slots=tuple(slot for slot in inputs.slots
-            if between_steps(slot).reservation not in blocked_claims))
+            if not isinstance(slot, ContinuationSlot) or slot.owner not in held_owners))
     clear = (isinstance(room, MemoryRoom) and isinstance(inputs.pressure, NoPressureHold)
              and isinstance(inputs.build_space, records.NoBuildSpaceHold))
     totals = AdmissionDecision("admit" if clear else "hold",
@@ -2099,18 +2086,18 @@ def can_use_natedev(row: Waiter) -> bool:
 def admission_walk(inputs: QueueInputs, ordered: list[tuple[Path, RankedWaiter]],
                    room: MemoryRoom | ReadingUnavailable,
                    now: float, policy: AdmissionPolicy, kept: int, used: int, safety: int,
-                   next_start: NextStartAt, claims: Mapping[str, ContinuationSlot]) -> list[WaiterAdmission]:
+                   next_start: NextStartAt) -> list[WaiterAdmission]:
     """Admit local steps in order and name the first local step that waits."""
     if isinstance(room, MemoryRoom):
         remaining, readable = room.signed_room, True
     else:
         remaining, readable = 0, False
+    claims = {slot.owner: slot for slot in inputs.slots if isinstance(slot, ContinuationSlot)}
     decisions: list[WaiterAdmission] = []
     clear = isinstance(inputs.pressure, NoPressureHold)
     disk_allows_start = isinstance(inputs.build_space, records.NoBuildSpaceHold)
     due = not isinstance(inputs.spacing, NextStartAt) or now >= inputs.spacing.at
-    local_head = first_queued_waiter((row for _, row in ordered if can_use_natedev(row)
-        and records.waiter_owner(row) not in inputs.parallel_remote_starts), inputs.pending_remote_starts)
+    local_head = first_queued_waiter((row for _, row in ordered if can_use_natedev(row)), inputs.pending_remote_starts)
     head_owner = records.waiter_owner(local_head.waiter) if isinstance(local_head, QueuedWaiter) else ""
     head_can_start_alone = not inputs.reservations and all(
         not slot_in_force(slot, inputs.now)
@@ -2123,35 +2110,30 @@ def admission_walk(inputs: QueueInputs, ordered: list[tuple[Path, RankedWaiter]]
     limits = policy.repository_runs
     repository_runs = reserved_repository_runs(inputs, limits)
     run_limit_waiters: dict[str, str] = {}
-    held_by_run_limit: dict[str, list[Waiter]] = {}
-    waiters_for_folder: dict[placement.CargoFolder, list[Waiter]] = {}
-    starts_for_folder: dict[placement.CargoFolder, Waiter] = {}
+    first_held_by_run_limit: dict[str, RankedWaiter] = {}
+    first_for_folder: dict[placement.CargoFolder, Waiter] = {}
     folder_slot_bytes: dict[placement.CargoFolder, int] = {}
     for owner, claim in claims.items():
         folder = inputs.cargo_folders.get(owner)
         if folder is not None:
             folder_slot_bytes[folder] = folder_slot_bytes.get(folder, 0) + claim.slot.bytes
-    waiters_with_busy_folders: list[Waiter] = []
-    held_waiters: list[Waiter] = []
-    held_other_than_gpu: list[Waiter] = []
-    parallel_holds: list[tuple[RankedWaiter, frozenset[str]]] = []
-    positions = ({records.waiter_owner(row): index for index, (_, row) in enumerate(ordered)}
-                 if inputs.parallel_remote_starts or limits.by_machine_and_repository else {})
+    first_folder_wait: Waiter | NoWaiter = NoWaiter()
+    first_held: RankedWaiter | NoWaiter = NoWaiter()
+    first_held_other_than_gpu: RankedWaiter | NoWaiter = NoWaiter()
+    positions = ({records.waiter_owner(row): position for position, (_, row) in enumerate(ordered)}
+                 if limits.by_machine_and_repository else {})
     for _, row in ordered:
         owner = records.waiter_owner(row)
-        claim = claims.get(owner, records.NO_CONTINUATION_CLAIM)
-        held = claim.slot.bytes if isinstance(claim, ContinuationSlot) else 0
+        claim = claims.get(owner)
+        held = claim.slot.bytes if claim is not None else 0
         need = row["need"]
         extra = max(0, need - held)
-        reused = isinstance(claim, ContinuationSlot)
+        reused = claim is not None
         within = reused and need <= held
         remote_start_pending = owner in inputs.pending_remote_starts
         state = QueuedWaiter(row) if remote_start_pending else waiter_state(row)
         fresh = not estimate_expired(row, now, policy)
-        can_pass_hold = inputs.parallel_remote_starts.get(owner)
-        if can_pass_hold is not None:
-            parallel_holds.append((row, can_pass_hold))
-        local_route = can_use_natedev(row) and can_pass_hold is None
+        local_route = can_use_natedev(row)
         local = local_route and isinstance(state, QueuedWaiter)
         repository = row.get("repository_name", "")
         limit = (limits.for_step(inputs.local_machine, repository, row.get("step", ""))
@@ -2161,14 +2143,11 @@ def admission_walk(inputs: QueueInputs, ordered: list[tuple[Path, RankedWaiter]]
         follows_run_limit = bool(limit and not exempt)
         folder = inputs.cargo_folders.get(owner) if local_route else None
         folder_busy = folder in inputs.occupied_cargo_folders
-        earlier: Waiter | NoWaiter = NoWaiter()
-        if folder is not None:
-            # A proposed start already holds the folder for this pass.
-            earlier = starts_for_folder.get(folder, NoWaiter())
-            if isinstance(earlier, NoWaiter):
-                earlier = first_blocker((waiter for waiter in waiters_for_folder.get(folder, ())
-                    if (earlier_limit := run_limit_waiters.get(records.waiter_owner(waiter))) is None
-                    or follows_run_limit and earlier_limit == repository), claim)
+        earlier = first_for_folder.get(folder, NoWaiter()) if folder is not None else NoWaiter()
+        if not isinstance(earlier, NoWaiter):
+            earlier_limit = run_limit_waiters.get(records.waiter_owner(earlier))
+            if earlier_limit is not None and (not follows_run_limit or earlier_limit != repository):
+                earlier = NoWaiter()
         # A grant returns the other continuation claims for this folder.
         released = (folder_slot_bytes.get(folder, 0) - held
                     if folder is not None and not folder_busy and isinstance(earlier, NoWaiter) else 0)
@@ -2192,26 +2171,19 @@ def admission_walk(inputs: QueueInputs, ordered: list[tuple[Path, RankedWaiter]]
             if not exempt and run_owner not in runs and len(runs) >= limit:
                 run_wait = records.RunLimitWait(len(runs), limit, repository, inputs.local_machine)
         order_hold: NoOrderHold | HeldBehindHead = NoOrderHold()
-        ahead = first_blocker(held_other_than_gpu if GPU_WAIT_MAY_PASS and not gpu_step else held_waiters, claim)
-        if follows_run_limit:
-            limited = first_blocker(held_by_run_limit.get(repository, ()), claim)
-            if not isinstance(limited, NoWaiter) and (isinstance(ahead, NoWaiter)
-                    or positions[records.waiter_owner(limited)] < positions[records.waiter_owner(ahead)]):
+        ahead = first_held_other_than_gpu if GPU_WAIT_MAY_PASS and not gpu_step else first_held
+        if follows_run_limit and (limited := first_held_by_run_limit.get(repository)) is not None:
+            if isinstance(ahead, NoWaiter) or positions[records.waiter_owner(limited)] < positions[records.waiter_owner(ahead)]:
                 ahead = limited
-        for hold, allowed in parallel_holds:
-            if (not isinstance(ahead, NoWaiter)
-                    and positions[records.waiter_owner(ahead)] < positions[records.waiter_owner(hold)]):
-                break
-            if owner not in allowed and blocks_claim(hold, claim):
-                ahead = hold
-                break
         may_pass = (ZERO_NEED_MAY_PASS and need == 0) or (CONTINUATION_MAY_PASS and within)
         if local and not may_pass and not isinstance(ahead, NoWaiter):
             order_hold = HeldBehindHead(records.stored_waiter(ahead))
-        elif local and not isinstance(folder_wait := first_blocker(waiters_with_busy_folders, claim), NoWaiter):
-            order_hold = HeldBehindHead(records.stored_waiter(folder_wait))
+        elif local and not isinstance(first_folder_wait, NoWaiter):
+            order_hold = HeldBehindHead(first_folder_wait)
         elif ready and not isinstance(earlier, NoWaiter):
-            order_hold = HeldBehindHead(records.stored_waiter(earlier))
+            order_hold = HeldBehindHead(earlier)
+        if folder is not None and isinstance(earlier, NoWaiter):
+            first_for_folder[folder] = records.stored_waiter(row)
         can_start = (ready and not folder_busy and isinstance(gpu_wait, GpuSlotFree)
                      and isinstance(run_wait, records.RunLimitFree)
                      and isinstance(order_hold, NoOrderHold))
@@ -2224,11 +2196,7 @@ def admission_walk(inputs: QueueInputs, ordered: list[tuple[Path, RankedWaiter]]
             gpu=gpu_wait, run_limit=run_wait)
         cargo_folder = placement.CargoFolderWait() if folder_busy else placement.CargoFolderFree()
         decisions.append(WaiterAdmission(row, decision, state, cargo_folder))
-        if folder is not None and not can_start:
-            waiters_for_folder.setdefault(folder, []).append(row)
         if can_start:
-            if folder is not None:
-                starts_for_folder[folder] = row
             remaining += held + released - need
             gpu_used += gpu_step
             if limit:
@@ -2236,18 +2204,20 @@ def admission_walk(inputs: QueueInputs, ordered: list[tuple[Path, RankedWaiter]]
             if not reused:
                 new_started = True
         elif local or folder_busy:
-            if folder_busy:
-                waiters_with_busy_folders.append(row)
+            if folder_busy and isinstance(first_folder_wait, NoWaiter):
+                first_folder_wait = records.stored_waiter(row)
             # A hold that comes only from a run limit applies to that repository.
             if ready and not folder_busy and isinstance(gpu_wait, GpuSlotFree) and (
                     records.waiter_owner(order_hold.waiter) in run_limit_waiters
                     if isinstance(order_hold, HeldBehindHead) else isinstance(run_wait, records.RunLimitWait)):
                 run_limit_waiters[owner] = repository
-                held_by_run_limit.setdefault(repository, []).append(row)
+                _ = first_held_by_run_limit.setdefault(repository, row)
             else:
-                held_waiters.append(row)
-                if GPU_WAIT_MAY_PASS and not (ready and not folder_busy and isinstance(gpu_wait, GpuSlotWait)):
-                    held_other_than_gpu.append(row)
+                if isinstance(first_held, NoWaiter):
+                    first_held = row
+                if GPU_WAIT_MAY_PASS and isinstance(first_held_other_than_gpu, NoWaiter) and not (
+                        ready and not folder_busy and isinstance(gpu_wait, GpuSlotWait)):
+                    first_held_other_than_gpu = row
     return decisions
 
 

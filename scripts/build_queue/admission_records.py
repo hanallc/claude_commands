@@ -824,24 +824,10 @@ class BetweenStepsSlot:
 
 
 @dataclass(frozen=True)
-class NoContinuationClaim:
-    """This waiter has not claimed a continuation slot."""
-
-
-NO_CONTINUATION_CLAIM = NoContinuationClaim()
-
-
-@dataclass(frozen=True)
-class ClaimOrderNotRecorded:
-    """The claim predates the record of earlier waiters."""
-
-
-@dataclass(frozen=True)
 class ContinuationSlot:
     """The owner continues within a memory slot retained between steps."""
     slot: BetweenStepsSlot
     owner: str
-    waiters_ahead_at_grant: frozenset[str] | ClaimOrderNotRecorded = field(default=ClaimOrderNotRecorded(), kw_only=True)
 
 RunSlot = BetweenStepsSlot | ContinuationSlot
 
@@ -1374,8 +1360,6 @@ class QueueInputs:
     cargo_folders: dict[str, placement.CargoFolder] = field(default_factory=dict, kw_only=True)
     occupied_cargo_folders: frozenset[placement.CargoFolder] = field(default=frozenset(), kw_only=True)
     pending_remote_starts: frozenset[str] = field(default=frozenset(), kw_only=True)
-    # Each new hold lists the local preview starts that can pass it.
-    parallel_remote_starts: dict[str, frozenset[str]] = field(default_factory=dict, kw_only=True)
     local_waits: dict[str, placement.EvidenceNeeded] = field(default_factory=dict, kw_only=True)
     build_space: BuildSpaceHold | NoBuildSpaceHold = field(default=NoBuildSpaceHold(), kw_only=True)
     local_machine: str = field(default="natedev", kw_only=True)
@@ -1754,11 +1738,6 @@ class WaiterIdentity(TypedDict):
 
 def waiter_owner(row: Waiter) -> str:
     return run_owner(row["pid"], row["start_time"])
-
-
-def queue_row_id(row: Waiter) -> str:
-    """Identify the step even if its position changes."""
-    return row.get("move_id") or waiter_owner(row)
 
 
 def run_owner(pid: int, start_time: str) -> str:
