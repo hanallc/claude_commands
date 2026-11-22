@@ -8,6 +8,7 @@ import math
 import multiprocessing
 import os
 import re
+import shlex
 import signal
 import shutil
 import subprocess
@@ -1569,18 +1570,32 @@ class RetireUnitTests(ShutdownRepositoryFixture):
             ("content missing", True),
             ("cherry-picked then reverted", True),
             ("conflict", True),
+            ("missing merge ref after rev-list", True),
+            ("stale local, published revert", True),
+            ("custom driver", True),
         ):
             with self.subTest(branch_state=branch_state):
                 case = RetireUnitTests()
                 case.setUp()
                 try:
+                    if branch_state == "custom driver":
+                        _ = git(case.checkout, "config", "merge.keepours.driver", "true")
+                        write_text_atomic(case.worktree / ".gitattributes", "work.txt merge=keepours\n")
+                        _ = git(case.worktree, "add", ".gitattributes")
+                        _ = git(case.worktree, "commit", "-qm", "Select the custom driver")
+                        _ = git(case.checkout, "merge", "--no-ff", "-qm", "Merge the attributes", "alpha-branch")
                     write_text_atomic(case.worktree / "work.txt", "unit change\n")
                     _ = git(case.worktree, "commit", "-qam", "Change the unit file")
                     commit = git(case.worktree, "rev-parse", "HEAD")
-                    if branch_state in ("cherry-picked", "cherry-picked then reverted"):
+                    if branch_state in ("cherry-picked", "cherry-picked then reverted", "stale local, published revert"):
                         _ = git(case.checkout, "cherry-pick", "-x", commit)
                         if branch_state == "cherry-picked then reverted":
                             _ = git(case.checkout, "revert", "--no-edit", "HEAD")
+                        if branch_state == "stale local, published revert":
+                            _ = git(case.checkout, "switch", "--detach")
+                            _ = git(case.checkout, "revert", "--no-edit", "HEAD")
+                            _ = git(case.checkout, "push", "-q", "origin", "HEAD:refs/heads/main")
+                            _ = git(case.checkout, "switch", "main")
                     elif branch_state == "content through another merge, later file change":
                         _ = git(case.checkout, "switch", "-c", "integration")
                         _ = git(case.checkout, "merge", "--no-ff", "-m", "Merge the unit change", "alpha-branch")
@@ -1589,11 +1604,32 @@ class RetireUnitTests(ShutdownRepositoryFixture):
                         _ = git(case.worktree, "commit", "--amend", "-qm", "Describe the unit change")
                         write_text_atomic(case.checkout / "Cargo.toml", "[workspace]\nresolver = \"2\"\n")
                         _ = git(case.checkout, "commit", "-qam", "Set the workspace resolver")
-                    elif branch_state == "conflict":
+                    elif branch_state in ("conflict", "custom driver"):
                         write_text_atomic(case.checkout / "work.txt", "main change\n")
                         _ = git(case.checkout, "commit", "-qam", "Change the same file on main")
                     unit = shutdown.retirement_find_unit("alpha", "alpha")
-                    refusals = shutdown.retirement_refusals(unit, settings=conf.read("production"))
+                    settings = conf.read("production")
+                    if branch_state == "missing merge ref after rev-list":
+                        _ = git(case.root / "origin.git", "update-ref", "-d", "refs/heads/main")
+                        _ = git(case.checkout, "switch", "--detach")
+                        real_git = shutil.which("git")
+                        assert real_git is not None
+                        shim = case.root / "git"
+                        write_text_atomic(shim, f"""#!/bin/sh
+git={shlex.quote(real_git)}
+"$git" "$@" || exit $?
+if [ "$3" = rev-list ]; then
+    "$git" "$1" "$2" update-ref -d refs/heads/main
+fi
+""")
+                        shim.chmod(0o755)
+                        with (mock.patch.dict(os.environ, {"PATH": f"{case.root}{os.pathsep}{os.environ['PATH']}"}),
+                              case.assertRaisesRegex(OSError, "refs/heads/main")):
+                            _ = shutdown.retirement_refusals(unit, settings=settings)
+                        continue
+                    if branch_state != "stale local, published revert":
+                        _ = git(case.checkout, "push", "-q", "origin", "main")
+                    refusals = shutdown.retirement_refusals(unit, settings=settings)
                     case.assertEqual(refusals, [f"unmerged commits on alpha-branch: {commit}"] if expect_refusal else [])
                 finally:
                     case.doCleanups()

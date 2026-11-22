@@ -1288,18 +1288,34 @@ def retirement_rebase(unit: RetiringUnit, *, settings: conf.ConfigRead) -> Path 
     return None
 
 
-def _branch_content_already_on_merge_ref(unit: RetiringUnit, ref: str, merge_ref: str,
-                                         *, settings: conf.ConfigRead) -> bool:
+def _merge_leaves_target_tree_unchanged(unit: RetiringUnit, ref: str, merge_ref: str,
+                                        *, settings: conf.ConfigRead) -> bool:
     """Check that a merge of the branch leaves the merge tree unchanged."""
-    merged = retirement_git(unit, "merge-tree", "--write-tree", merge_ref, ref, settings=settings)
-    if merged.returncode == 1:
+    branch = retirement_git(unit, "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}", settings=settings)
+    if branch.returncode:
+        raise OSError(f"cannot resolve commit {ref}: {retirement_failure(branch)}")
+    target = retirement_git(unit, "rev-parse", "--verify", "--quiet", f"{merge_ref}^{{commit}}", settings=settings)
+    if target.returncode:
+        raise OSError(f"cannot resolve commit {merge_ref}: {retirement_failure(target)}")
+    drivers = retirement_git(unit, "config", "--get-regexp", r"^merge\..+\.driver$", settings=settings)
+    if drivers.returncode == 0:
         return False
+    if drivers.returncode != 1:
+        raise OSError(retirement_failure(drivers))
+
+    target_commit = target.stdout.strip()
+    merged = retirement_git(unit, "merge-tree", "--write-tree", target_commit, branch.stdout.strip(), settings=settings)
+    merged_tree = merged.stdout.partition("\n")[0]
     if merged.returncode:
+        if merged.returncode == 1 and merged_tree:
+            conflict_tree = retirement_git(unit, "rev-parse", "--verify", "--quiet", "--end-of-options",
+                                           f"{merged_tree}^{{tree}}", settings=settings)
+            if conflict_tree.returncode == 0 and conflict_tree.stdout.strip() == merged_tree:
+                return False
         raise OSError(retirement_failure(merged))
-    current = retirement_git(unit, "rev-parse", f"{merge_ref}^{{tree}}", settings=settings)
+    current = retirement_git(unit, "rev-parse", f"{target_commit}^{{tree}}", settings=settings)
     if current.returncode:
         raise OSError(retirement_failure(current))
-    merged_tree = merged.stdout.partition("\n")[0]
     return bool(merged_tree) and merged_tree == current.stdout.strip()
 
 
@@ -1324,14 +1340,13 @@ def retirement_refusals(unit: RetiringUnit, *, settings: conf.ConfigRead, check_
     merge_refs = retirement_branch_commits(unit, unit.production.merge_branch, settings=settings)
     if not merge_refs:
         raise OSError(f"merge branch {unit.production.merge_branch} is absent from origin and this clone")
+    # The fetched origin commit comes last when origin has the branch.
+    merge_target = merge_refs[-1]
     for ref in refs:
         commits = retirement_git(unit, "rev-list", "--no-merges", ref, "--not", *merge_refs, settings=settings)
         if commits.returncode:
             raise OSError(retirement_failure(commits))
-        if commits.stdout.strip() and not any(
-            _branch_content_already_on_merge_ref(unit, ref, merge_ref, settings=settings)
-            for merge_ref in merge_refs
-        ):
+        if commits.stdout.strip() and not _merge_leaves_target_tree_unchanged(unit, ref, merge_target, settings=settings):
             found.append(f"unmerged commits on {unit.branch or ref}: {commits.stdout.splitlines()[0]}")
             break
     return found
