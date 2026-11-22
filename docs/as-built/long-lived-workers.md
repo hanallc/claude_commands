@@ -744,7 +744,11 @@ The caller saves the stop commit before it sends a signal. The stop commit is fi
 A read error before the commit leaves the run record unchanged.
 After supervisor loss, the watcher retries slice reads within the stop grace.
 The hold enforcer checks the active holder set again after it acquires the stop lock.
-Builds Kill recovery uses the same locked route check for a first commit. It can finish a commit that belongs to its action.
+If pruning removes the run during the lock wait, the stop returns a refusal.
+Builds Kill recovery uses the same locked route check for a first commit.
+It can finish the commit for its action.
+The stop commit saves the notice ID in the run record.
+Pruning keeps that record until Builds saves the pending notice and acknowledges the notice ID.
 A run that ends by itself just after the stop commit reports as stopped.
 Recovery finishes committed stops and the pending cleanup of runs without a supervisor.
 A run without a saved slice can receive a legacy group TERM, which reports an unconfirmed stop.

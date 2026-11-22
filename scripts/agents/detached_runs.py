@@ -130,6 +130,7 @@ class RunRecord(StopFields):
     command_group: NotRequired[int]
     command_started: NotRequired[str]
     command_slice: NotRequired[process_stop.RunSliceIdentity]
+    stop_notice_id: NotRequired[str]
     slice_cleanup_pending: NotRequired[Literal[True]]
     slice_leftovers: NotRequired[Literal[True]]
     director_dir: str
@@ -239,7 +240,7 @@ def _write_record(path: Path, record: RunRecord) -> RunRecord:
             fields["delivery"] = delivery
         stop_fields = ("stop_reason", "stop_pass_requested", "self_stop")
         if _has_saved_cgroup(current):
-            stop_fields += ("scope_error", "slice_leftovers", "slice_cleanup_pending")
+            stop_fields += ("scope_error", "slice_leftovers", "slice_cleanup_pending", "stop_notice_id")
         saved = cast(Mapping[str, object], current)
         for key in stop_fields:
             if key in saved:
@@ -280,7 +281,7 @@ def _is_run_record(raw: dict[str, object]) -> TypeGuard[RunRecord]:
                             for key in ("command_pid", "command_group", "exit_code", "push_retries"))
                     and all(key not in raw or isinstance(raw[key], str)
                             for key in ("supervisor_started", "command_started", "tree_key", "finished_at",
-                                        "delivery", "ended", "stop_reason", "scope_error"))
+                                        "delivery", "ended", "stop_reason", "scope_error", "stop_notice_id"))
                     and ("delivered_at" not in raw or type(raw["delivered_at"]) in (int, float))
                     and ("completion_pending" not in raw or isinstance(raw["completion_pending"], bool))
                     and ("command_slice" not in raw or process_stop.is_slice_identity(raw["command_slice"]))
@@ -312,14 +313,23 @@ def _read_stop_fields(path: Path, run_id: object) -> StopFields:
     return fields
 
 
-def _read_record(path: Path) -> RunRecord:
+def _read_record_if_present(path: Path) -> RunRecord | None:
     raw = worker_lifecycle.read_json_object(path)
+    if not raw and not path.exists():
+        return None
     if not _is_run_record(raw):
         raise SystemExit(f"detached_runs: {path} is not a run record")
     if path.name != f"{raw['run_id']}.json":
         raise SystemExit(f"detached_runs: {path} does not match run ID {raw['run_id']}")
     confirmed = _read_stop_fields(path.with_suffix(CONFIRMED_STOP_SUFFIX), raw["run_id"])
     return {**raw, **confirmed} if confirmed else raw
+
+
+def _read_record(path: Path) -> RunRecord:
+    record = _read_record_if_present(path)
+    if record is None:
+        raise SystemExit(f"detached_runs: {path} is not a run record")
+    return record
 
 
 def _recover_staged_pane_stop(path: Path, record: RunRecord) -> RunRecord:
@@ -495,22 +505,24 @@ def _read_slice_end(run_slice: process_stop.RunSliceIdentity, *, retry_seconds: 
 
 def _stop_slice_command(
     path: Path, run_slice: process_stop.RunSliceIdentity, reason: str, *,
-    check: Callable[[], bool], retry_slice_read: bool,
+    check: Callable[[], bool], retry_slice_read: bool, stop_notice_id: str,
 ) -> bool:
     grace, kill_grace = _scope_stop_graces()
     with _scope_stop_lock(path, blocking=True):
-        record = _read_record(path)
-        if record.get("command_slice") != run_slice or record["status"] != "running" or not reason:
+        record = _read_record_if_present(path)
+        if record is None or record.get("command_slice") != run_slice or record["status"] != "running" or not reason:
             return False
         ended = _read_slice_end(run_slice, retry_seconds=grace if retry_slice_read else 0.0)
         with record_lock(path):
-            record = _read_record(path)
-            if record.get("command_slice") != run_slice or record["status"] != "running" or not check():
+            record = _read_record_if_present(path)
+            if record is None or record.get("command_slice") != run_slice or record["status"] != "running" or not check():
                 return False
             if not record.get("stop_pass_requested"):
                 if ended:
                     return False
                 record.update(stop_reason=reason, stop_pass_requested=True)
+                if stop_notice_id:
+                    record["stop_notice_id"] = stop_notice_id
                 write_text_atomic(path, json.dumps(record, indent=2, sort_keys=True))
         _finish_slice_stop(path, run_slice, ended=ended, grace=grace, kill_grace=kill_grace)
     return True
@@ -519,7 +531,7 @@ def _stop_slice_command(
 def stop_command(
     path: Path, reason: str, *, check: Callable[[], bool] = lambda: True,
     stop_pass: bool = True, signal_group: Callable[[int, int], None] | None = None,
-    retry_slice_read: bool = False,
+    retry_slice_read: bool = False, stop_notice_id: str = "",
 ) -> bool:
     """Request a stop and confirm that the run slice has ended."""
     if not process_stop.supported():
@@ -530,7 +542,10 @@ def stop_command(
         run_slice = record["command_slice"]
         if not process_stop.is_slice_identity(run_slice):
             raise process_stop.SliceStopFailed("the saved run slice is invalid")
-        return _stop_slice_command(path, run_slice, reason, check=check, retry_slice_read=retry_slice_read)
+        return _stop_slice_command(path, run_slice, reason, check=check, retry_slice_read=retry_slice_read,
+                                   stop_notice_id=stop_notice_id)
+    if stop_notice_id:
+        return False
     starting_command = _recorded_group(record)
     if starting_command is None or record.get("status") != "running":
         return False
@@ -561,6 +576,17 @@ def stop_command(
         return False
     except (ProcessLookupError, PermissionError):
         return False
+
+
+def acknowledge_stop_notice(path: Path, notice_id: str) -> None:
+    """Release a finished record after the caller saves its pending notice."""
+    if not notice_id or worker_lifecycle.read_json_object(path).get("stop_notice_id") != notice_id:
+        return
+    with record_lock(path):
+        record = _read_record_if_present(path)
+        if record is not None and record["status"] == "finished" and record.get("stop_notice_id") == notice_id:
+            del record["stop_notice_id"]
+            write_text_atomic(path, json.dumps(record, indent=2, sort_keys=True))
 
 
 def seat_name(session_dir: str, name: str) -> str:
@@ -953,6 +979,7 @@ def _prune_finished_locked(runs: Path) -> list[str]:
     for path, raw in records:
         run_id = raw.get("run_id")
         if (raw.get("status") != "finished" or raw.get("completion_pending")
+                or raw.get("stop_notice_id")
                 or _worker_result_pending(str(raw.get("delivery", "")))
                 or not isinstance(run_id, str) or path.name != f"{run_id}.json"):
             continue
@@ -978,7 +1005,8 @@ def _prune_finished_locked(runs: Path) -> list[str]:
         with record_lock(path):
             current = worker_lifecycle.read_json_object(path)
             if (current.get("run_id") != run_id or current.get("status") != "finished"
-                    or current.get("completion_pending") or _worker_result_pending(str(current.get("delivery", "")))
+                    or current.get("completion_pending") or current.get("stop_notice_id")
+                    or _worker_result_pending(str(current.get("delivery", "")))
                     or (_has_saved_cgroup(current) and not _command_has_ended(current, _integer(current.get("pid"))))):
                 continue
             for name in _RUN_FILES:

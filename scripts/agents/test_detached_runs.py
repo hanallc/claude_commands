@@ -1456,6 +1456,30 @@ sys.exit(1)
         return path, cgroups, events
 
     @unittest.skipUnless(process_stop.supported(), "pidfd stop needs Linux")
+    def test_stop_refuses_when_prune_removes_the_run_during_a_lock_wait(self) -> None:
+        path, cgroups, events = self.record_populated_slice()
+        original = path.read_bytes()
+        for suffix in (".scope-stop.lock", ".record.lock"):
+            with self.subTest(lock=suffix):
+                _ = path.write_bytes(original)
+                lock_path = path.with_suffix(suffix)
+                flock = fcntl.flock
+
+                def prune_before_lock(descriptor: int | IO[str], operation: int) -> None:
+                    fd = descriptor if isinstance(descriptor, int) else descriptor.fileno()
+                    if lock_path.exists() and os.path.samestat(os.fstat(fd), lock_path.stat()):
+                        path.unlink()
+                    flock(descriptor, operation)
+
+                with (patch.object(fcntl, "flock", side_effect=prune_before_lock),
+                      patch.object(process_stop, "CGROUP_ROOT", cgroups),
+                      patch.object(process_stop, "stop_slice") as stop):
+                    self.assertFalse(detached_runs.stop_command(path, "fixture stop"))
+                self.assertFalse(path.exists())
+                self.assertEqual(events.read_text(), "populated 1\n")
+                stop.assert_not_called()
+
+    @unittest.skipUnless(process_stop.supported(), "pidfd stop needs Linux")
     def test_changed_kill_route_saves_no_stop(self) -> None:
         path, cgroups, events = self.record_populated_slice()
         original = path.read_bytes()

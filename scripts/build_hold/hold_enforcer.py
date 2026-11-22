@@ -418,8 +418,9 @@ def stop_waiting_run(
     process = run.process
     identity = process.identity
     holder_directory = build_hold.holder_directory()
-    active_holders = build_hold.natedev_holds(holder_directory).in_force
-    holders = (holder, *active_holders)
+    holders = build_hold.natedev_holds(holder_directory).in_force
+    if holder not in holders:
+        return RunIdentityChanged(run)
 
     def kept(candidate: build_hold.AuditProcess) -> bool:
         lineage = build_hold.audit_ancestors(candidate, processes)
@@ -451,8 +452,7 @@ def stop_waiting_run(
         return build_hold.process_start_time(identity.pid, proc_root) == identity.start_time
 
     def verify_gate(run: DetachedRun) -> bool:
-        current_holders = build_hold.natedev_holds(holder_directory).in_force
-        if holder not in current_holders or current_holders != active_holders:
+        if build_hold.natedev_holds(holder_directory).in_force != holders:
             return False
         if not gate_is_current() or not supervisor_is_current(run) or kept(process) or kept(run.supervisor):
             return False
