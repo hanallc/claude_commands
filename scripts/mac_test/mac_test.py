@@ -1978,7 +1978,7 @@ def finished_claim(args: CliArguments, record: RunRecord, path: Path, *, adopted
 
 
 def take_over_kept_claim(args: CliArguments, claim: HeldClaim, kept: RemoteJobClaim,
-                         *, session: SubmittingSession) -> ClaimAttempt:
+                         *, session: SubmittingSession, cleanup_request_id: str = "") -> ClaimAttempt:
     """Transfer cleanup ownership without granting permission to run."""
     if "replaced_reservation" in kept:
         return ClaimBusy(kept)
@@ -1989,6 +1989,11 @@ def take_over_kept_claim(args: CliArguments, claim: HeldClaim, kept: RemoteJobCl
     kept["proc_start"] = proc_start.start
     kept["submitting_session"] = claim_state.session_id(session)
     kept["cleanup_pending"] = True
+    # Match the cleanup request while keeping the identity of the remote work.
+    if cleanup_request_id:
+        kept["cleanup_request_id"] = cleanup_request_id
+    else:
+        _ = kept.pop("cleanup_request_id", None)
     worktree = kept["worktree"]
     if Path(worktree).is_absolute():
         kept["worktree"] = str(claim_worktree_path(worktree))
@@ -2080,7 +2085,9 @@ def claim_once(args: CliArguments, paths: StatePaths, scope: ClaimScope,
         for claim in overlapping:
             record = claim.record
             if cleanup_claim_matches(paths, claim, scope) and recoverable_kept_claim(record):
-                return take_over_kept_claim(args, claim, record, session=session)
+                request_id = (args.claim_id if paths.platform == "macos"
+                              and not isinstance(assignment, UnassignedClaim) else "")
+                return take_over_kept_claim(args, claim, record, session=session, cleanup_request_id=request_id)
     if not isinstance(block, NoMacBlock):
         return blocked_claim(block)
     owner = session
@@ -2269,6 +2276,7 @@ def adopt_wait_claim(args: CliArguments, paths: StatePaths, scope: ClaimScope,
             record["mac_repository"] = saved.for_remote_claim().record()
     record["pid"] = args.pid
     record["proc_start"] = start.start
+    _ = record.pop("cleanup_request_id", None)
     cleanup_only = record.get("cleanup_pending") is True
     if not cleanup_only:
         record["worktree"] = str(claim_worktree_path(record["worktree"]))

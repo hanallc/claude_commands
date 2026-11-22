@@ -137,9 +137,13 @@ def _relative_origin_directory(directory: str) -> str:
     from scripts.lib.build_slots import SlotGitFailure, source_checkout
 
     try:
-        return str(source_checkout(checkout.toplevel))
+        source = git_files.at(source_checkout(checkout.toplevel))
     except SlotGitFailure as error:
         raise ValueError(str(error)) from error
+    # Git can report the separate metadata directory when it lacks the main checkout path.
+    if source.git_dir != checkout.common_dir or source.common_dir != checkout.common_dir:
+        raise ValueError(f"{directory}: Git does not identify the source checkout")
+    return str(source.toplevel)
 
 
 def _mac_origin(directory: str) -> str:

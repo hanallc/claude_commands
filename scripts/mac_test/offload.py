@@ -1051,8 +1051,9 @@ class ProcessController:
                 attempt.answer = read_claim_answer(answer, expected=expected,
                     assigned_slot=self.placement.assignment.destination.slot
                         if isinstance(self.placement, AssignedOffloadRequest) else 0)
-                if answer.status in (0, 13):
-                    self.claim_identity = claim_state.reply_claim_identity(stdout)
+                identity = claim_state.reply_claim_identity(stdout)
+                if answer.status in (0, 13) and isinstance(identity, claim_state.ClaimIdentity):
+                    self.claim_identity = identity
                     for line in stdout.splitlines():
                         if line.startswith("claim_fence="):
                             self.claim_scope_key = line.removeprefix("claim_fence=")
@@ -1085,27 +1086,33 @@ class ProcessController:
             claims, _ = claim_state.sweep_mac_replacements(paths, claim_state.read_claims(paths))
             for held in claims:
                 record = held.record
+                if "remote_host" not in record or "replaced_reservation" in record:
+                    continue
+                identity = claim_state.claim_identity(record)
+                cleanup = record.get("cleanup_pending") is True
+                if identity != expected and not (cleanup and record.get("cleanup_request_id") == expected.claim_id):
+                    continue
                 scope = assigned.destination.scope
                 matches = (held.matches_mac_assignment_scope(scope) if paths.platform == "macos" else held.scope == scope)
-                if paths.platform == "macos" and record.get("cleanup_pending") and not record.get("repo_key"):
+                if paths.platform == "macos" and cleanup and not record.get("repo_key"):
                     matches = True
-                if ("replaced_reservation" in record or claim_state.claim_identity(record) != expected or not matches
-                        or record["pid"] != os.getpid()
+                if (not matches or record["pid"] != os.getpid()
                         or record["submitting_session"] != claim_state.session_id(assigned.session)):
                     continue
                 start = process_identity.process_start(os.getpid())
                 if not isinstance(start, process_identity.Started) or start.start != record["proc_start"]:
                     continue
-                if (paths.platform == "macos" and not record.get("cleanup_pending")
+                if (paths.platform == "macos" and not cleanup
                         and claim_state.claim_pending_start(paths, held.path, record).exists()):
                     continue
-                self.claim_identity = expected
+                self.claim_identity = identity
                 self.claim_scope_key = claim_state.claim_fence_scope_key(held.path, record)
                 self.mac_repository = claim_state.saved_mac_repository(record)
-                if "remote_host" in record and record.get("cleanup_pending"):
-                    attempt.answer = TakenOverMacClaim(record["remote_host"], record.get("slot", 1))
-                elif "remote_host" in record:
-                    attempt.answer = FreshMacClaim(record.get("slot", 1))
+                slot = record.get("slot", 1)
+                if cleanup:
+                    attempt.answer = TakenOverMacClaim(record["remote_host"], slot)
+                else:
+                    attempt.answer = FreshMacClaim(slot)
                 return
 
     def capture(

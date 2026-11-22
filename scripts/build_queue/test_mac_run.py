@@ -236,6 +236,57 @@ class MacRunTests(unittest.TestCase):
         self.assertEqual(check.call_args.args[2], eligibility.KnownRepository(".claude", REPOSITORY_KEY))
         self.assertEqual(claim_state.read_claims(self.paths), ())
 
+    def test_lost_takeover_reply_recovers_the_saved_claim_identity(self) -> None:
+        original = self.native_claim(self.repo)
+        original.remote = "original-mac"
+        self.assertEqual(mac_test.command_claim(original, self.paths, watch_claim=False), 0)
+        retained, = claim_state.read_claims(self.paths)
+        mac_test.write_json(retained.path, {**retained.record, "proc_start": "ended"})
+        start = process_identity.process_start(os.getpid())
+        assert isinstance(start, process_identity.Started)
+        assignment = placement.PlacementAssignment("new-episode", "new-attempt",
+            placement.PlacementDestination("mac", "mac", "fixture-mac", retained.scope),
+            execution_identity.SourceKeyUnavailable("The fixture has no source key"),
+            placement.SubmittingOwner("fixture-host", os.getpid(), start.start), NoOwningSession(), 0)
+        request = offload.OffloadRequest(self.checkout, "hana", "test", offload.NO_RESULT_FILE, (),
+            "verify", "", target="mac", placement=offload.AssignedOffloadRequest(assignment))
+        saved = claim_state.saved_mac_repository(retained.record)
+        assert isinstance(saved, claim_state.MacRepositoryIdentity)
+        config = eligibility.OffloadConfig(True, eligibility.SshConnectionSettings("fixture-mac", 1, 1),
+                                           1, 1, 1, "1", {"linux_only.checkout": ""})
+        script = """
+from contextlib import redirect_stdout
+from io import StringIO
+import sys
+from scripts.mac_test import mac_test
+
+args = mac_test.parser().parse_args(sys.argv[1:], namespace=mac_test.CliArguments())
+with redirect_stdout(StringIO()):
+    status = mac_test.command_claim(args, mac_test.state_paths("mac"), watch_claim=False, session=args.session)
+assert status == 13, status
+sys.exit(71)
+"""
+        command = offload.claim_arguments(request, config, mac_repository=saved)
+        controller = offload.ProcessController()
+        with mock.patch.object(offload, "claim_arguments", return_value=[sys.executable, "-c", script, *command[2:]]):
+            result = offload.claim_for_run(controller, config, request,
+                                           eligibility.KnownRepository(saved.mirror_name, saved.key),
+                                           mac_repository=saved)
+        current, = claim_state.read_claims(self.paths)
+        self.assertEqual(current.record["pid"], os.getpid())
+        self.assertEqual(result, offload.TakenOverMacClaim("original-mac", 1))
+        self.assertEqual(controller.claim_identity, claim_state.claim_identity(retained.record))
+        self.assertEqual(controller.claim_scope_key, claim_state.claim_fence_scope_key(retained.path, retained.record))
+        self.assertEqual(controller.mac_repository, saved)
+        unrelated = replace(assignment, attempt="other-attempt")
+        controller = offload.ProcessController()
+        controller.placement = offload.AssignedOffloadRequest(unrelated)
+        inspection = offload.LocalClaimAttempt()
+        controller.inspect_claim(inspection, claim_state.ClaimIdentity(
+            execution_identity.assigned_claim_id(unrelated.episode, unrelated.attempt),
+            unrelated.episode, unrelated.attempt))
+        self.assertIsInstance(inspection.answer, offload.MacClaimNotConfirmed)
+
     def test_refused_claim_cleanup_uses_the_mirror_that_ran(self) -> None:
         config = self.root / "mac_test.conf"
         mirror_root = ".local/state/mac-test/test-mirror"
@@ -375,6 +426,14 @@ class MacRunTests(unittest.TestCase):
                 with self.assertRaisesRegex(mac_run.MacRunRefused, "busy with native Mac run"):
                     with mac_run.held(checkout, "mac", SuiteMode.GATE, GATE_JOB_NOT_RECORDED):
                         self.fail("The guest took the native run's place")
+
+        _ = subprocess.run(["git", "-C", str(separate), "config", "--unset", "core.worktree"], check=True)
+        self.assertEqual(claim_state.target_claim_scope(self.paths, str(separate)),
+                         claim_state.RepositoryScope(".claude", REPOSITORY_KEY))
+        self.assertEqual(claim_state.target_claim_scope(self.paths, str(linked)), claim_state.WHOLE_MAC)
+        with self.assertRaises(mac_run.MacRunRefused), mac_run.held(
+                linked, "mac", SuiteMode.GATE, GATE_JOB_NOT_RECORDED):
+            self.fail("The linked checkout acquired a slot without a source checkout")
 
     def test_mac_origin_takes_precedence_over_borrowed_objects(self) -> None:
         other = self.root / "other"
@@ -635,6 +694,9 @@ class MacRunTests(unittest.TestCase):
     def test_interrupted_replacement_retires_both_records_and_retries(self) -> None:
         self.exercise_interrupted_replacement(("retry", "inspect"))
 
+    def test_lost_replacement_reply_recovers_the_completed_claim(self) -> None:
+        self.exercise_interrupted_replacement(("lost-reply",))
+
     def test_status_and_sweep_retire_an_interrupted_replacement(self) -> None:
         self.exercise_interrupted_replacement(("status", "sweep"))
 
@@ -653,6 +715,8 @@ class MacRunTests(unittest.TestCase):
     def exercise_interrupted_replacement(self, recoveries: tuple[str, ...]) -> None:
         script = """
 import os
+from contextlib import redirect_stdout
+from io import StringIO
 from pathlib import Path
 import sys
 from unittest.mock import patch
@@ -678,6 +742,9 @@ def interrupt_write(path, record):
     return write_json(path, record)
 
 with patch.object(Path, "unlink", interrupt_unlink), patch.object(mac_test, "write_json", interrupt_write):
+    if checkpoint == "lost-reply":
+        with redirect_stdout(StringIO()):
+            sys.exit(mac_test.command_claim(args, paths, watch_claim=False, session=args.session))
     sys.exit(mac_test.command_claim(args, paths, watch_claim=False, session=args.session))
 """
         resolved = claim_state.mac_repository_identity(str(self.checkout))
@@ -745,7 +812,8 @@ with patch.object(Path, "unlink", interrupt_unlink), patch.object(mac_test, "wri
                     self.assertEqual(child.returncode, 72, child.stdout + child.stderr)
                 if recovery in ("status", "sweep", "inspect", "second-interruption"):
                     self.assertEqual(claim_state.read_claims(self.paths), ())
-                self.check_replacement_retry(request, config, old_path, abandoned, script, recovery == "settled-fence")
+                self.check_replacement_retry(request, config, old_path, abandoned, script,
+                                             settle=recovery == "settled-fence", lose_reply=recovery == "lost-reply")
 
     def check_legacy_pending_replacement(self, reserved: claim_state.HeldClaim,
                                          replacement: claim_state.HeldClaim) -> None:
@@ -774,7 +842,8 @@ with patch.object(Path, "unlink", interrupt_unlink), patch.object(mac_test, "wri
         self.assertTrue(pending.exists())
 
     def check_replacement_retry(self, request: offload.OffloadRequest, config: eligibility.OffloadConfig,
-                                old_path: Path, abandoned: claim_state.HeldClaim, script: str, settle: bool) -> None:
+                                old_path: Path, abandoned: claim_state.HeldClaim, script: str, *,
+                                settle: bool, lose_reply: bool) -> None:
         old_identity = claim_state.claim_identity(abandoned.record)
         old_scope = claim_state.claim_fence_scope_key(abandoned.path, abandoned.record)
         old_fence = self.root / offload.start_fence_relative(old_identity, "mac", scope_key=old_scope).with_suffix(".lock")
@@ -789,7 +858,7 @@ with patch.object(Path, "unlink", interrupt_unlink), patch.object(mac_test, "wri
         def private_claim(*args: object, **kwargs: object) -> list[str]:
             make_arguments = cast(Callable[..., list[str]], original_arguments)
             command = make_arguments(*args, **kwargs)
-            return [sys.executable, "-c", script, "none", str(old_path), *command[2:]]
+            return [sys.executable, "-c", script, "lost-reply" if lose_reply else "none", str(old_path), *command[2:]]
 
         with (
             mock.patch.object(offload, "claim_arguments", side_effect=private_claim),

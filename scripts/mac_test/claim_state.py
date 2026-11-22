@@ -275,6 +275,7 @@ class RemoteJobClaim(ClaimOwnerRecord):
 
     remote_host: str
     cleanup_pending: NotRequired[bool]
+    cleanup_request_id: NotRequired[str]
     instance_generation: NotRequired[str]
     replaced_reservation: NotRequired[ReplacedMacReservation]
 
@@ -687,6 +688,11 @@ def read_run(path: Path) -> RunState:
         if values["cleanup_pending"] is not True:
             raise StateReadError(f"{path} has an invalid cleanup_pending")
         remote["cleanup_pending"] = True
+        if "cleanup_request_id" in values:
+            request_id = required_string(values, "cleanup_request_id", path)
+            if not request_id:
+                raise StateReadError(f"{path} has an invalid cleanup_request_id")
+            remote["cleanup_request_id"] = request_id
     return remote
 
 
