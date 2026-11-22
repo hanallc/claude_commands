@@ -1496,7 +1496,7 @@ Each card shows, in this order:
 2. The details, with aligned labels: `Owner:`, `For  :` and `Added:`.
 3. The image link. A pair shows its two images side by side, under **Before** and **After** labels.
 4. The **Feedback** field, with `feedback_rows` rows from `config/review_links.conf`.
-5. The answer buttons: **Approved**, **Not Approved** and **Send Feedback**.
+5. The answer buttons: **Approved** and **Send Feedback**.
 
 A plain click on a single image or either pair image opens the shared image zoom.
 The zoom centers the full image over a dark backdrop within the page view.
@@ -1533,7 +1533,8 @@ An older script does not bind the new card forms, so a form would post outside t
 
 Each answer button posts the image id, the button's answer, the feedback text and a token signed with the console browser token.
 The server checks the token.
-**Approved** and **Not Approved** need no text. **Send Feedback** refuses empty text with **Enter feedback first.** and keeps the card.
+**Approved** needs no text. **Send Feedback** refuses empty text with **Enter feedback first.** and keeps the card.
+Feedback always means that the image is not approved, so the page has no separate **Not Approved** button.
 Otherwise the card leaves the page at once, and the request runs in the background.
 The page skips its refresh while a send runs.
 An image leaves the page while each open question has a live sender or confirmed acceptance.
@@ -1542,7 +1543,7 @@ A failed or uncertain delivery returns the card with a delivery notice.
 When the owner answers the last open question, the card returns and the console shows a new update.
 The server sends one message to the owner's staff id, resolved to its current session at each try.
 It uses `delivery_tries` and `delivery_pause_seconds` from `config/review_links.conf`.
-The first line names the answer: `From the user (via the Images page): ` and then `your image is approved.`, `your image is not approved.` or `feedback on your image.`
+The first line names the answer: `From the user (via the Images page): ` and then `your image is approved.` or `your image is not approved. The feedback follows.`
 A `Feedback:` line follows when the user wrote text.
 Then come the image link (a `Before:` and an `After:` link for a pair), the caption, the For line and the delete command for the owner to run after it acts.
 After a send, the record gets `feedback_at` and the page hides the image; the image file stays until the owner deletes it.

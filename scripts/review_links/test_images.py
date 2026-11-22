@@ -337,7 +337,7 @@ class ImagesTests(ImagesFixture):
  check(!zoom.open, 'a backdrop click closes the zoom');
  link.click();zoom.dispatchEvent(new Event('cancel', {cancelable:true}));
  check(!zoom.open, 'the native cancel event closes the zoom');
- const actions = [['approved', ''], ['not approved', ''], ['feedback', 'Too dark.'],
+ const actions = [['approved', ''], ['feedback', 'Too dark.'],
                   ['question', 'Which check passed?'], ['feedback', 'Please retry.']];
  for (const [action, words] of actions) {
   const previous = list();
@@ -500,9 +500,9 @@ class ImagesTests(ImagesFixture):
                 server.shutdown()
                 thread.join(TEST_HANG_GUARD_SECS)
         self.assertEqual(results, [[]], "The browser must complete every check without a failure.")
-        self.assertEqual(len(gets), 13, "Load, update, reload, update, one refresh per POST, and the later update.")
+        self.assertEqual(len(gets), 12, "Load, update, reload, update, one refresh per POST, and the later update.")
         self.assertEqual([(post["action"], post["feedback"]) for post in posts], [
-            (["approved"], [""]), (["not approved"], [""]), (["feedback"], ["Too dark."]),
+            (["approved"], [""]), (["feedback"], ["Too dark."]),
             (["question"], ["Which check passed?"]), (["feedback"], ["Please retry."]),
             (["feedback"], ["Retry after refresh fails."]), (["feedback"], ["Keep until next feedback."]),
             (["feedback"], ["Routine feedback."]),
@@ -529,7 +529,6 @@ class ImagesTests(ImagesFixture):
             + f'<textarea id="feedback-{record['id']}" name="feedback" rows="3"></textarea>'
             + '<div class="review-actions"><div class="review-action-group"><span>Closes the item</span><div>'
             + '<button type="submit" name="action" value="approved">Approved</button>'
-            + '<button type="submit" name="action" value="not approved">Not Approved</button>'
             + '<button type="submit" name="action" value="feedback">Send Feedback</button>'
             + '</div></div><div class="review-action-group"><span>The item returns to you</span><div>'
             + '<button type="submit" name="action" value="question">Ask question</button></div></div></div>'
@@ -575,10 +574,12 @@ class ImagesTests(ImagesFixture):
         token = images.request_token(images.console_token(self.root), record["id"])
         return urlencode({"image": record["id"], "token": token, "feedback": feedback, "action": action})
 
-    def test_approved_and_not_approved_send_the_answer_with_feedback_only_when_written(self) -> None:
+    def test_approved_and_feedback_send_the_answer_with_feedback_only_when_written(self) -> None:
         for action, first, feedback, lines in (
                 ("approved", "your image is approved.", "", ()),
-                ("not approved", "your image is not approved.", "  The counts are wrong. ", ("Feedback: The counts are wrong.",))):
+                ("approved", "your image is approved.", "  The counts are right. ", ("Feedback: The counts are right.",)),
+                ("feedback", "your image is not approved. The feedback follows.", "  The counts are wrong. ",
+                 ("Feedback: The counts are wrong.",))):
             with self.subTest(action=action):
                 self.sent.clear()
                 record = self.register("After: the panel.")
@@ -600,7 +601,7 @@ class ImagesTests(ImagesFixture):
         recipient, sender, message = self.sent[0]
         self.assertEqual((recipient, sender), (f"session:{self.owner.current_session}", "images"))
         self.assertEqual(message, "\n".join((
-            "From the user (via the Images page): feedback on your image.",
+            "From the user (via the Images page): your image is not approved. The feedback follows.",
             "Feedback: The counts are wrong.",
             f"Image: http://127.0.0.1:8765/images/{record['id']}/image.png",
             "Caption: After: the panel. Look at the counts.",
@@ -640,7 +641,7 @@ class ImageQuestionTests(ImagesFixture):
             'action': 'question', 'feedback': words}))
 
     def test_feedback_completion_keeps_an_answer_received_during_delivery_visible_and_new(self) -> None:
-        for action in ('feedback', 'approved', 'not approved'):
+        for action in ('feedback', 'approved'):
             with self.subTest(action=action):
                 record = self.register()
                 pages = tuple(page for page in console.read_pages() if page.identity == 'images')
@@ -842,8 +843,9 @@ class ImageQuestionTests(ImagesFixture):
         self.assertIn('Which check passed?', card)
         self.assertIn('&lt;Passed&gt; &amp; checked', card)
         self.assertNotIn('waiting for an answer', card)
-        for action in ('approved', 'not approved', 'feedback', 'question'):
+        for action in ('approved', 'feedback', 'question'):
             self.assertIn(f'name="action" value="{action}"', card)
+        self.assertNotIn('value="not approved"', card)
         self.assertEqual(images.waiting_images(console.NewsRequest(self.root)), frozenset((record['id']+':Q1',)))
         self.assertEqual(console.news(self.root, pages, 'changes'), ('images',))
         self.assertEqual(console.news(self.root, pages, 'images'), ())
@@ -1201,7 +1203,7 @@ async (find, whenPageShows, check) => {
  check(card().querySelector('img') !== null, 'The image returns with the answer.');
  check(!card().querySelector('[data-question] [role="status"]'), 'The answer has no delivery notice.');
  const actions = [...card().querySelectorAll('button[name="action"]:enabled')].map(button => button.value);
- check(actions.join() === 'approved,not approved,feedback,question', 'All four answer buttons return.');
+ check(actions.join() === 'approved,feedback,question', 'All three answer buttons return.');
  check(count() === '2', 'The owner count includes the returned card.');
  card().querySelector('form').elements.feedback.value = 'Which check failed?';
  card().querySelector('form').requestSubmit(ask());

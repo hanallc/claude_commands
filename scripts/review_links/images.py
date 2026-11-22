@@ -31,8 +31,8 @@ PAGE_PATH = f"/{change_page.CONSOLE_FOLDER}/{PAGE_NAME}"
 LOCK = image_store.LOCK
 SENDER = Path(__file__).stem
 # Each answer button and the first line of the message that it sends to the owner.
-ANSWERS = {"approved": "your image is approved.", "not approved": "your image is not approved.",
-           "feedback": "feedback on your image."}
+# Feedback always means the image is not approved.
+ANSWERS = {"approved": "your image is approved.", "feedback": "your image is not approved. The feedback follows."}
 # A page loaded before the answer buttons existed can still post delete.
 ACTIONS = frozenset(("delete", "question", *ANSWERS))
 
@@ -200,7 +200,6 @@ def card(record: image_store.ImageRecord, token: str, members: staff.StaffSnapsh
                        key=lambda question: (question.answer is not None, int(question.question_id[1:])))
     round_id = feedback_round(answered_question_ids(record))
     closing_buttons = ('<button type="submit" name="action" value="approved">Approved</button>'
-                       '<button type="submit" name="action" value="not approved">Not Approved</button>'
                        '<button type="submit" name="action" value="feedback">Send Feedback</button>')
     returning_buttons = '<button type="submit" name="action" value="question">Ask question</button>'
     return (f'<article id="image-{record["id"]}"{' class="pair"' if pair else ''} data-image="{record["id"]}" '
