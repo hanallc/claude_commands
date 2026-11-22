@@ -1431,6 +1431,14 @@ finally:
         _ = (self.state_directory / "run.json").write_text(json.dumps(record), encoding="utf-8")
         return record
 
+    def test_read_claims_keeps_whole_mac_scope_for_relative_legacy_worktree(self) -> None:
+        record = self.write_machine_wide_record(os.getpid(), Path("repositories/hana"))
+        paths = mac_test.StatePaths(self.state_directory)
+
+        claim, = mac_test.read_claims(paths)
+
+        self.assertEqual((claim.scope, claim.path, claim.record), (mac_test.WHOLE_MAC, paths.run, record))
+
     def test_machine_wide_record_holds_the_repository_its_worktree_is_in(self) -> None:
         hana, liner = self.repository("hana"), self.repository("cargo-liner")
         self.write_config(offload="on")
