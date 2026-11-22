@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 import os
 from pathlib import Path
 import subprocess
@@ -20,6 +21,15 @@ def output(args: list[str], cwd: str, timeout: float) -> str | None:
     except (OSError, subprocess.SubprocessError):
         return None
     return result.stdout if result.returncode == 0 else None
+
+
+def git_origin(directory: str, *, git_dir: str = "") -> str | None:
+    """Read the first origin URL with Git's configuration rules."""
+    command = ["git", "-C", directory]
+    if git_dir:
+        command.append(f"--git-dir={git_dir}")
+    remote = output([*command, "remote", "get-url", "origin"], directory, GIT_TIMEOUT_S)
+    return remote.strip() if remote and remote.strip() else None
 
 
 def remote_identity(remote: str, directory: str) -> str:
@@ -59,9 +69,9 @@ def repository_key(directory: str) -> str:
             manifest = parent / "Cargo.toml"
             if manifest.is_file():
                 return MANIFEST_IDENTITY_PREFIX + str(manifest.resolve())
-    remote = output(["git", "-C", directory, "remote", "get-url", "origin"], directory, GIT_TIMEOUT_S)
-    if remote and remote.strip():
-        return remote_identity(remote.strip(), directory)
+    remote = git_origin(directory)
+    if remote is not None:
+        return remote_identity(remote, directory)
     roots = output(["git", "-C", directory, "rev-list", "--max-parents=0", "--reverse", "HEAD"],
                    directory, GIT_TIMEOUT_S)
     return "git-root:" + roots.strip().splitlines()[0] if roots and roots.strip() else store.UNKNOWN_IDENTITY
@@ -91,19 +101,31 @@ def git_common_dir(directory: str) -> str | None:
         return None
 
 
-def source_git_dir(common: str) -> str:
-    """Follow local clone sources to the original Git folder.
+def _git_dir_origin(common: str) -> str | None:
+    return git_origin(os.path.dirname(common), git_dir=common)
 
-    A shared clone records borrowed objects in alternates. A local clone records a local origin.
-    Return the current folder when neither source exists.
-    """
+
+def source_repository(common: str, *, read_origin: Callable[[str], str | None] = _git_dir_origin) -> tuple[str, str | None]:
+    """Read the source Git folder and its origin through local clone links."""
     seen = {common}
     while True:
-        source = borrowed_git_dir(common) or local_origin_git_dir(common)
+        borrowed = borrowed_git_dir(common)
+        if borrowed is not None and borrowed not in seen:
+            common = borrowed
+            seen.add(common)
+            continue
+        origin = read_origin(common)
+        source = local_origin_git_dir(origin) if origin else None
         if source is None or source in seen:
-            return common
+            return common, origin
         seen.add(source)
         common = source
+
+
+def source_git_dir(common: str) -> str:
+    """Follow local clone sources without a Git command."""
+    source, _ = source_repository(common, read_origin=_stored_origin_url)
+    return source
 
 
 def borrowed_git_dir(common: str) -> str | None:
@@ -117,16 +139,13 @@ def borrowed_git_dir(common: str) -> str | None:
     return os.path.dirname(os.path.normpath(os.path.join(common, "objects", objects)))
 
 
-def local_origin_git_dir(common: str) -> str | None:
+def local_origin_git_dir(origin: str) -> str | None:
     """Return the shared Git folder when origin names a local directory."""
-    origin = origin_url(common)
-    if origin is None:
-        return None
     url = origin.removeprefix("file://")
     return git_common_dir(url) if os.path.isabs(url) and os.path.isdir(url) else None
 
 
-def origin_url(common: str) -> str | None:
+def _stored_origin_url(common: str) -> str | None:
     """Read origin from the repository configuration without a Git command."""
     try:
         with open(os.path.join(common, "config"), encoding="utf-8") as handle:

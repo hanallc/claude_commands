@@ -11,7 +11,7 @@ import unittest
 from unittest import mock
 
 from scripts.build_hold.owning_session import NoOwningSession
-from scripts.build_queue import mac_run
+from scripts.build_queue import execution_identity, mac_run, placement
 from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, StepJob
 from scripts.mac_test import claim_state, mac_test
 from scripts.production.gate_routes import SuiteMode
@@ -91,7 +91,8 @@ class MacRunTests(unittest.TestCase):
                 self.assertEqual(claim_state.read_claims(self.paths), (claim,))
                 guest.close()
 
-            with mock.patch.object(time, "sleep", side_effect=release_guest) as waited:
+            waited = mock.Mock(side_effect=release_guest)
+            with mock.patch.object(mac_test, "time", mock.Mock(wraps=time, sleep=waited)):
                 self.assertEqual(mac_test.command_claim(native, self.paths, watch_claim=False), 0)
             waited.assert_called_once()
 
@@ -100,6 +101,92 @@ class MacRunTests(unittest.TestCase):
                 self.fail("The guest took the native run's place")
         self.assertEqual(mac_test.command_release(native, self.paths), 0)
         self.assertEqual(claim_state.read_claims(self.paths), ())
+
+    def test_quoted_origin_uses_the_shared_repository_scope(self) -> None:
+        config = self.checkout / ".git/config"
+        origin = "https://github.com/hanallc/claude_commands.git"
+        _ = config.write_text(config.read_text().replace(f"url = {origin}", f'url = "{origin}"'))
+        self.assertIn(f'url = "{origin}"', config.read_text())
+        native = self.native_claim(self.repo)
+        self.assertEqual(mac_test.command_claim(native, self.paths, watch_claim=False), 0)
+        self.addCleanup(mac_test.command_release, native, self.paths)
+
+        self.assertEqual(claim_state.target_claim_scope(self.paths, str(self.checkout)),
+                         claim_state.RepositoryScope(".claude"))
+        settings = self.root / "mac_test.conf"
+        self.assertEqual(mac_test.free_now(self.paths, settings, self.checkout, mac_kind=mac_test.MacClaimKind.GUEST),
+                         "busy")
+        with self.assertRaisesRegex(mac_run.MacRunRefused, "busy with native Mac run"):
+            with mac_run.held(self.checkout, "mac", SuiteMode.GATE, GATE_JOB_NOT_RECORDED):
+                self.fail("The quoted origin bypassed the native claim")
+
+    def test_saved_checkout_claim_blocks_new_native_and_guest_claims(self) -> None:
+        old = self.native_claim(self.checkout)
+        with mac_test.locked(self.paths.lock):
+            result = mac_test.claim_once(old, self.paths, claim_state.RepositoryScope("checkout"),
+                                         session=NoOwningSession(), reserve_wait=True)
+        self.assertEqual(result, mac_test.ClaimFinished(0, ("claimed",)))
+        self.addCleanup(mac_test.command_release, old, self.paths)
+        claim, = claim_state.read_claims(self.paths)
+        self.assertEqual(claim.scope, claim_state.RepositoryScope("checkout"))
+        self.assertEqual(claim.capacity_scope, claim_state.RepositoryScope(".claude"))
+        self.assertEqual(claim.path.name, "checkout.json")
+        saved = claim.path.read_bytes()
+
+        native = self.native_claim(self.repo)
+        settings = self.root / "mac_test.conf"
+        self.assertEqual(mac_test.free_now(self.paths, settings, self.repo), "busy")
+        self.assertEqual(mac_test.command_claim(native, self.paths, watch_claim=False), 11)
+        self.assertEqual(mac_test.free_now(self.paths, settings, self.checkout, mac_kind=mac_test.MacClaimKind.GUEST),
+                         "busy")
+        with self.assertRaisesRegex(mac_run.MacRunRefused, "busy with native Mac run"):
+            with mac_run.held(self.checkout, "mac", SuiteMode.GATE, GATE_JOB_NOT_RECORDED):
+                self.fail("The guest bypassed the saved claim")
+        self.assertEqual(claim.path.read_bytes(), saved)
+        self.assertEqual(mac_test.command_release(old, self.paths), 0)
+        self.assertEqual(claim_state.read_claims(self.paths), ())
+        assignment = placement.PlacementAssignment("saved-episode", "saved-attempt",
+            placement.PlacementDestination("mac", "mac", "fixture-mac", claim.scope),
+            execution_identity.SourceKeyUnavailable("The fixture has no source key"),
+            placement.SubmittingOwner("fixture-host", old.pid, claim.record["proc_start"]), NoOwningSession(), 0)
+        waiting = self.native_claim(self.checkout)
+        with mac_run.held(self.checkout, "mac", SuiteMode.GATE, GATE_JOB_NOT_RECORDED):
+            fresh, = claim_state.read_claims(self.paths)
+            self.assertEqual(fresh.scope, claim_state.RepositoryScope(".claude", slot=1))
+            self.assertEqual(mac_test.command_claim(waiting, self.paths, watch_claim=False, assignment=assignment), 11)
+
+        self.assertEqual(mac_test.command_claim(waiting, self.paths, watch_claim=False, assignment=assignment), 0)
+        self.addCleanup(mac_test.command_release, waiting, self.paths)
+        reserved, = claim_state.read_claims(self.paths)
+        self.assertEqual(reserved.scope, assignment.destination.scope)
+        self.assertEqual(reserved.capacity_scope, claim_state.RepositoryScope(".claude"))
+
+    def test_guest_probe_and_claim_share_the_scope_without_an_origin(self) -> None:
+        _ = subprocess.run(["git", "-C", str(self.checkout), "remote", "remove", "origin"], check=True)
+        settings = self.root / "mac_test.conf"
+        native = self.native_claim(self.repo)
+        self.assertEqual(mac_test.command_claim(native, self.paths, watch_claim=False), 0)
+        self.addCleanup(mac_test.command_release, native, self.paths)
+
+        self.assertEqual(mac_test.free_now(self.paths, settings, self.checkout, mac_kind=mac_test.MacClaimKind.GUEST),
+                         "free")
+        with mac_run.held(self.checkout, "mac", SuiteMode.GATE, GATE_JOB_NOT_RECORDED):
+            self.assertEqual({claim.scope for claim in claim_state.read_claims(self.paths)},
+                             {claim_state.RepositoryScope(".claude"), claim_state.RepositoryScope("checkout", slot=1)})
+            self.assertEqual(mac_test.free_now(self.paths, settings, self.checkout, mac_kind=mac_test.MacClaimKind.GUEST),
+                             "busy")
+            with self.assertRaises(mac_run.MacRunRefused):
+                with mac_run.held(self.checkout, "mac", SuiteMode.GATE, GATE_JOB_NOT_RECORDED):
+                    self.fail("The guest exceeded the checkout's limit")
+
+    def test_guest_probe_checks_failed_mac_probe(self) -> None:
+        settings = self.root / "mac_test.conf"
+        self.paths.directory.mkdir()
+        self.assertEqual(mac_test.free_now(self.paths, settings, self.checkout, mac_kind=mac_test.MacClaimKind.GUEST),
+                         "free")
+        (self.paths.directory / "failed_probe").touch()
+        self.assertEqual(mac_test.free_now(self.paths, settings, self.checkout, mac_kind=mac_test.MacClaimKind.GUEST),
+                         "bad")
 
     def test_claim_count_uses_the_repository_limit_and_host_default(self) -> None:
         self.configure_limit(2)
@@ -166,7 +253,7 @@ class MacRunTests(unittest.TestCase):
         original, = claim_state.read_claims(self.paths)
         original_data = original.path.read_bytes()
 
-        with mac_run.held(self.checkout, "mac", SuiteMode.GATE, GATE_JOB_NOT_RECORDED, repository="hana"):
+        with mac_run.held(self.repository("hana"), "mac", SuiteMode.GATE, GATE_JOB_NOT_RECORDED):
             claims = {claim.scope: claim for claim in claim_state.read_claims(self.paths)}
             numbered = claims[claim_state.RepositoryScope("hana", slot=2)]
             self.assertEqual(claims[claim_state.RepositoryScope("hana.slot-2")], original)
@@ -178,7 +265,7 @@ class MacRunTests(unittest.TestCase):
         with (self.root / "build_folders.conf").open("a") as settings:
             _ = settings.write("# whole: 1..\nslots.fixture-mac.hana.max=2\n")
         other = self.native_claim(self.repository("hana.slot-2"))
-        with mac_run.held(self.checkout, "mac", SuiteMode.GATE, GATE_JOB_NOT_RECORDED, repository="hana"):
+        with mac_run.held(self.repository("hana"), "mac", SuiteMode.GATE, GATE_JOB_NOT_RECORDED):
             claim, = claim_state.read_claims(self.paths)
             legacy = claim.path.with_name("hana.slot-2.json")
             _ = claim.path.rename(legacy)

@@ -17,7 +17,7 @@ class MacRunRefused(Exception):
 
 @contextmanager
 def held(repo: Path, target: str, work: SuiteMode | StepJob,
-         gate_job: StepJob | GateJobNotRecorded, *, repository: str = "claude_commands") -> Generator[None]:
+         gate_job: StepJob | GateJobNotRecorded) -> Generator[None]:
     """Hold the Mac repository claim until the guest run ends."""
     try:
         paths = claim_state.state_paths(target)
@@ -25,10 +25,10 @@ def held(repo: Path, target: str, work: SuiteMode | StepJob,
         raise MacRunRefused(str(error)) from error
     if paths.platform != "macos":
         raise MacRunRefused(f"{target} is not a Mac claim target")
-    if not repository.strip():
-        raise MacRunRefused("a Mac repository claim needs a repository name")
-    scope = claim_state.mac_repository_scope(repository)
     worktree = str(repo.resolve())
+    scope = claim_state.target_claim_scope(paths, worktree)
+    if not isinstance(scope, claim_state.RepositoryScope):
+        raise MacRunRefused(f"{repo} has no repository for the Mac claim")
     if isinstance(work, StepJob):
         step = work.step
     else:

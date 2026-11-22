@@ -494,7 +494,7 @@ class MacTestCommandTests(NotificationGuardedTestCase):
                 real_record(event)
 
         def run(command: list[str], *, capture_output: bool = False, text: bool = False,
-                check: bool, timeout: float | None = None,
+                check: bool = False, timeout: float | None = None, cwd: str | Path | None = None,
                 stdin: int | None = None, stdout: int | None = None,
                 stderr: int | None = None) -> subprocess.CompletedProcess[str]:
             script = self.bin_directory / command[0]
@@ -518,7 +518,7 @@ class MacTestCommandTests(NotificationGuardedTestCase):
 
                 return invoke_cli(module, main, stub_arguments, dict(os.environ), self.root)
             return real_run(command, capture_output=capture_output, text=text, check=check,
-                            timeout=timeout, stdin=stdin, stdout=stdout, stderr=stderr)
+                            timeout=timeout, cwd=cwd, stdin=stdin, stdout=stdout, stderr=stderr)
 
         with (mock.patch.object(subprocess, "run", side_effect=run),
               mock.patch.object(mac_test, "start_hold_recorder", side_effect=record)):
