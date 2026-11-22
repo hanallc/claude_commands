@@ -21,6 +21,7 @@ from scripts.build_hold.override_guard import require_checkout
 from scripts.lib.process_group import send_process_group
 from scripts.lib.process_start import Started, process_start
 from scripts.lint import nextest_tokens as tokens
+from scripts.lint.memory_test_support import memory_gate_shell_environment
 
 require_checkout(Path(__file__))
 
@@ -126,7 +127,8 @@ class PoolCase(unittest.TestCase):
         configuration.mkdir()
         self.configure_nested_tokens(0)
         self.calls = self.root / "calls"
-        self.environment = {**os.environ, "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
+        self.environment = {**memory_gate_shell_environment(),
+                            "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
                             "CARGO_CALLS": str(self.calls), "CONF_DIR": str(configuration),
                             "FAKE_SELECTION": fake_selection(16), "FAKE_TOKEN_POOL": str(self.pool),
                             "TMPDIR": str(self.root)}
