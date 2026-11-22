@@ -1,13 +1,13 @@
 """An interrupted publication keeps the last complete text available."""
+from pathlib import Path
+from contextlib import ExitStack
 import errno
 import os
 import stat
 import tempfile
 import unittest
-from contextlib import ExitStack
-from pathlib import Path
-from typing import BinaryIO, TextIO, cast
 from unittest.mock import MagicMock, patch
+from typing import BinaryIO, TextIO, cast
 
 from scripts.lib import atomic_file
 from scripts.lib.atomic_file import write_text_atomic
