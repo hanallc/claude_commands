@@ -1655,7 +1655,7 @@ def _restart(pane_evidence: ExitStack, *, stop_all: bool, dry_run: bool, only: t
     try:
         record = staff.initial_snapshot()
         if stop_all and not dry_run:
-            deadline = time.monotonic() + conf.read("shutdown").number("UPKEEP_ROW_WAIT_SECONDS")
+            deadline = time.monotonic() + conf.read("shutdown").number("upkeep_row_wait_seconds")
             only = tuple(str(row.id) if (row := record.by_member_reference(reference)) is not None else reference
                          for reference in only)
             for row in record.find(kind="producer"):
@@ -1822,7 +1822,7 @@ def _restart(pane_evidence: ExitStack, *, stop_all: bool, dry_run: bool, only: t
     callers = {os.environ.get("CLAUDE_CODE_SESSION_ID"), os.environ.get("CODEX_THREAD_ID")} - {None, ""}
     if stop_all and any(row.current_session in callers for row in selected):
         return _detach_stop(command, selected, record)
-    lock_wait = conf.read("shutdown").number("UPKEEP_ROW_WAIT_SECONDS") if holders else 0
+    lock_wait = conf.read("shutdown").number("upkeep_row_wait_seconds") if holders else 0
     from scripts.herdr.worker_panes import (
         CheckedRolePolicy, StartRefused, checked_role_policy, dispatch_role, use_checked_resume_policies,
     )

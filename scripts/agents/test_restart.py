@@ -1686,7 +1686,7 @@ class RestartTests(RestartTestCase):
         for release in (True, False):
             with self.subTest(release=release):
                 config = Path(os.environ["CONF_DIR"]) / "shutdown.conf"
-                text = config.read_text().replace("UPKEEP_ROW_WAIT_SECONDS=5", "UPKEEP_ROW_WAIT_SECONDS=0.04")
+                text = config.read_text().replace("upkeep_row_wait_seconds=5", "upkeep_row_wait_seconds=0.04")
                 write_text_atomic(config, text)
                 shutdown_record.save([str(row.id)])
                 with path.open("w+") as lock:
@@ -2291,7 +2291,7 @@ runpy.run_module('scripts.agents.restart', run_name='__main__', alter_sys=True)
         record_lock = shutdown_record.record_path().with_suffix(".lock")
         if step == "busy lock":
             config = Path(os.environ["CONF_DIR"]) / "shutdown.conf"
-            _ = write_config_fixture(config, "RESTART_RECORD_LOCK_SECONDS=0.05\n")
+            _ = write_config_fixture(config, "restart_record_lock_seconds=0.05\n")
         read_fd, ready_fd = os.pipe()
         lock_context = record_lock.open("a") if step == "busy lock" else nullcontext()
         with lock_context as lock, os.fdopen(read_fd, "rb"), os.fdopen(ready_fd, "wb"), path.open("ab") as log:
@@ -2932,7 +2932,7 @@ runpy.run_module('scripts.agents.restart', run_name='__main__', alter_sys=True)
                     fixture.setUp()
                     _ = scope.callback(fixture.doCleanups)
                     config = Path(os.environ["CONF_DIR"]) / "shutdown.conf"
-                    _ = write_config_fixture(config, "UPKEEP_ROW_WAIT_SECONDS=0\n")
+                    _ = write_config_fixture(config, "upkeep_row_wait_seconds=0\n")
                     owner = staff.rename(fixture.parent.id, "TEST-selected-owner")
                     other = fixture_member("unit", name="TEST-other-owner", parent=owner.parent)
                     selected = fixture.worker("TEST-selected")

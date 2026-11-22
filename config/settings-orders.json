@@ -6,8 +6,8 @@
     "head_stall_alert_minutes": 9
   },
   "build_folders": {
-    "slots.Nates-MacBook-Pro-2023.cargo-liner.max": 14,
-    "slots.Nates-MacBook-Pro-2023.hana.max": 13
+    "slots.nates-macbook-pro-2023.cargo-liner.max": 14,
+    "slots.nates-macbook-pro-2023.hana.max": 13
   },
   "cloud_gate": {
     "hana_gpu_route_enabled": 3
