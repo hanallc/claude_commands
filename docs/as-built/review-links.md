@@ -176,7 +176,8 @@ The timed park action saves to the item's store.
 Every page uses the shared background and text colors.
 The status line has the same background as the page.
 The frame reserves scrollbar space, so short and long pages keep the same column position.
-A successful action updates the page and shows no confirmation line.
+A successful action updates the page without a confirmation line by default.
+List **Unpark** and Review **Done** show confirmation lines.
 An action that fails uses the shared action failure notice.
 Branches shows the remaining branches after deletion.
 The page uses the shared notice for deletion or delivery failures.
@@ -1397,7 +1398,8 @@ The page shows “Parking time already expired” for an expired time.
 It shows “No active parking time to clear” when the time is absent.
 Both results preserve the parking draft.
 A replay of a successful Unpark reports the original result and any newer active parking time.
-When Unpark clears parking and removes the row from Parked, the page shows “Item #N unparked.”
+If the dialog stays open after Unpark clears parking, it shows “Unparked”.
+If clearing parking removes the row from Parked, the page shows “Item #N unparked.”
 The page shows confirmations for hidden rows next to the Show filter.
 It keeps one confirmation per hidden row after overlapping Unpark requests.
 Focus moves from **Unpark** to the Parked filter and brings the filter and confirmation into view.

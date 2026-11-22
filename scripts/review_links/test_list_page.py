@@ -3418,6 +3418,7 @@ window.fetch=async(_path,options={})=>{
  const status=document.querySelector('[data-hidden-action-status]');
  check(!dialog.open && status.hidden && !form.querySelector('[data-send-status]').textContent &&
   dialog.querySelector('[data-record-missing]').hidden,'Park closes the dialog without a status message.');
+ check(document.activeElement===row.querySelector('.list-toggle'),'All returns focus to the visible row.');
  show('working');
  check(row.hidden,'Working hides the item until delivery');
  check(status.hidden && !status.textContent,'The hidden parked row leaves no action status.');
@@ -3434,6 +3435,14 @@ window.fetch=async(_path,options={})=>{
  check(!row.hidden,'Unpark returns the item to Working');
  show('all');
  check(row.nextElementSibling?.dataset.number==='2','All restores the default order after Unpark.');
+ show('working');
+ row.querySelector('.list-toggle').click();
+ toggle.click();preset.focus();preset.click();
+ finishPost({item_state:'Working',parked:'true',parked_until:'delivered'});
+ await flush();
+ check(row.hidden && !dialog.open,'Until delivered closes the dialog and hides the row in Working.');
+ check(document.activeElement===document.getElementById('filter-show-working'),
+  'Until delivered moves focus to the selected Show chip when the row is hidden.');
 """, reduced_motion=True)
         self.browser_waiting_parking_refresh(unpark=False)
 

@@ -485,7 +485,7 @@ const dialogUpdates=dialog?.querySelector('[data-record-updates]');
 const showUpdates=dialog?.querySelector('[data-show-record-updates]');
 const dialogLinkNotice=dialog?.querySelector('[data-record-link-notice]');
 const closeDialogButton=dialog?.querySelector('[data-close]');
-let dialogItem=null,dialogNeedsRecord=false,dialogSuspended=false;
+let dialogItem=null,dialogNeedsRecord=false,dialogSuspended=false,focusShowOnClose=false;
 let shownRevision,statusError='',savedDisplayFailed=false;
 let itemRequest=null;
 const pendingDetail=new Map();
@@ -713,6 +713,7 @@ function returnItemDetail(){
  recordDetails(dialogItem).replaceChildren(...dialogDetail.childNodes);
  delete dialogDetail.recordItem;
  dialogItem=null;
+ focusShowOnClose=false;
 }
 function syncItemDialog(){
  if(!dialog) return;
@@ -721,10 +722,12 @@ function syncItemDialog(){
   if(!dialogItem) return;
   const previous=dialogItem.dataset.key;
   const restoreFocus=!dialogSuspended && options.ownsFocus?.()!==false;
+  const showChip=focusShowOnClose && chipRow('show')?.querySelector('[aria-pressed="true"]');
   returnItemDetail();dialog.close();
   if(restoreFocus){
    const row=options.mount ? mounted.get(previous) : itemWithKey(previous);
-   (row && !row.hidden ? row.querySelector('.list-toggle') : words()).focus({preventScroll:true});
+   const target=row && !row.hidden ? row.querySelector('.list-toggle') : showChip || words();
+   target.focus({preventScroll:true});
   }
   return;
  }
@@ -788,7 +791,7 @@ function suspendItemDialog(){
 }
 if(dialog) bindConsoleDialog(dialog,()=>{
  if(!dialog.open) return;
- closeCard(dialogItem.dataset.key,false);
+ closeCard(dialogItem.dataset.key,{write:false});
  apply(true);
 });
 function mount(data){
@@ -1264,8 +1267,9 @@ function openCard(key){
  opened.add(key);
  if(linkedItem!==key){linkedItem='';revealedLinkedItem='';}
 }
-function closeCard(key,write=true){
+function closeCard(key,{write=true,focusShow=false}={}){
  const wasOpen=opened.delete(key);
+ if(dialogItem?.dataset.key===key) focusShowOnClose=focusShow;
  if(!wasOpen && linkedItem!==key) return;
  linkedItem='';revealedLinkedItem='';
  if(write && location.hash===placeHash) writePlace();
@@ -1311,7 +1315,7 @@ function bind(){
   const item=event.target.closest('.list-row')?.closest('[data-list-item]');if(!item) return;
   if(event.target.closest('a') || (event.target.closest('button') && !event.target.closest('.list-toggle'))) return;
   const key=item.dataset.key,expanded=!opened.has(key);
-  if(expanded) openCard(key);else closeCard(key,false);
+  if(expanded) openCard(key);else closeCard(key,{write:false});
   apply(true,{animate:true});
  });
 }

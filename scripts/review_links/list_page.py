@@ -1828,6 +1828,7 @@ function bindFeedbackForm(form){
    if(item!==current){item=current;confirmed=confirmation();}
    const submitter=event.submitter,action=submitter?.value || 'tell';
    const parkForDelivery=action==='park-until-delivered',parks=action==='park' || parkForDelivery || Boolean(submitter?.dataset.laterPreset);
+   const closeSavedCard=()=>tableView.closeCard(key,{focusShow:parkForDelivery});
    const changesParking=parks || action==='unpark';
    const focusUnpark=action==='unpark' && document.activeElement===unpark;
    const usesWords=action==='tell' || action==='question';
@@ -1910,7 +1911,7 @@ function bindFeedbackForm(form){
     const closes=parks || action==='remove' || result.detail_closed;
     if(closes){
      nextForm=applySavedState(result,{keepDetailFocus:changesParking,hasDetail:true});
-     tableView.closeCard(key);
+     closeSavedCard();
      tableView.applyAction();
      if(result.detail_unavailable)
       tableView.showActionResult(item,submission,'Item '+item.dataset.number,
@@ -1955,7 +1956,7 @@ function bindFeedbackForm(form){
      if(stale) return;
      if(parks || action==='remove'){
       if(action==='remove') closedKeys.add(key);
-      tableView.closeCard(key);
+      closeSavedCard();
       tableView.showActionResult(item,submission,'Item '+item.dataset.number,
        {kind:'failure',message:'Saved; the item could not refresh.'});
      }else tableView.savedItemError(request);
@@ -1978,7 +1979,7 @@ function bindFeedbackForm(form){
       confirmedByReadback=confirmed.state==='Closed' || current.park_request_saved===true;
       if(confirmedByReadback){
        saved=true;
-       if(!stale) tableView.closeCard(key);
+       if(!stale) closeSavedCard();
        tableView.applyAction();
       }else if(!stale) presentListDetail(item,current);
      }catch(_){
