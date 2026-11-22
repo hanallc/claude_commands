@@ -273,6 +273,34 @@ h3 { margin: 12px 0 4px; font-size: 0.88rem; font-weight: 600; }
 .walk-table tr.queue-head th { color: var(--ink-2); font-weight: 600; vertical-align: bottom; }
 .walk-table .duration { width: var(--duration); min-width: var(--duration); }
 .walk-table .machine { width: var(--machine); min-width: var(--machine); }
+.kill-run { display: inline-flex; vertical-align: middle; align-items: center; justify-content: center;
+  width: 26px; height: 26px; margin-left: 4px; padding: 0; border: 0; border-radius: 6px;
+  color: var(--ink-3); background: transparent; cursor: pointer; }
+.kill-run svg { width: 17px; height: 17px; fill: none; stroke: currentColor; stroke-width: 2;
+  stroke-linecap: round; stroke-linejoin: round; }
+.kill-run:hover, .kill-run:focus-visible { color: #e5675c; background: var(--track); }
+.kill-run[aria-expanded="true"] { color: white; background: #8f2a21; }
+.kill-state, #kill-results { color: var(--ink-2); font-size: .82rem; }
+.kill-state { display: block; white-space: nowrap; }
+#kill-results:empty { display: none; }
+#kill-results { margin: 8px 0; white-space: pre-line; }
+#kill-dialog { position: fixed; inset: auto; margin: 0; width: min(470px, calc(100vw - 24px));
+  max-height: calc(100dvh - 24px); padding: 17px 20px 16px; border: 0; border-radius: 12px;
+  box-shadow: 0 10px 30px #0008; background: #efeeea; color: #1b1b1a; font-size: .95rem; }
+#kill-dialog::backdrop { background: transparent; }
+#kill-dialog h2 { margin: 0 0 8px; font-size: 1.12rem; }
+#kill-dialog dl { display: grid; grid-template-columns: max-content 1fr; gap: 4px 12px; margin: 0 0 12px; }
+#kill-dialog dt, #kill-dialog label { color: #64635d; }
+#kill-dialog dd { margin: 0; overflow-wrap: anywhere; }
+#kill-dialog p { margin: 0 0 12px; }
+#kill-message { padding: 9px 11px; background: #dedcd5; border-radius: 8px; overflow-wrap: anywhere; }
+#kill-dialog textarea { display: block; width: 100%; box-sizing: border-box; min-height: 4em;
+  margin: 5px 0 14px; padding: 8px 10px; resize: vertical; border: 1px solid #9c9a92;
+  border-radius: 8px; font: inherit; color: #1b1b1a; background: #fff; }
+.kill-buttons { display: flex; gap: 10px; justify-content: flex-end; }
+.kill-buttons button { padding: 7px 14px; border: 1px solid #9c9a92; border-radius: 8px;
+  background: transparent; color: inherit; font: inherit; font-weight: 600; cursor: pointer; }
+.kill-buttons [type=submit] { background: #b83126; border-color: #b83126; color: white; }
 .walk-table .duration, .walk-table .pid, .walk-table .vcpus, .walk-table .slot, .walk-table .tokens { font-variant-numeric: tabular-nums; }
 .walk-table .duration, .walk-table .pid, .walk-table .vcpus, .walk-table .slot, .walk-table .tokens { text-align: right; }
 .walk-table .done { text-align: right; font-variant-numeric: tabular-nums; }
@@ -445,6 +473,7 @@ body.queue-unavailable .card { display: none; }
   </section>
 
   <section class="card">
+    <div id="kill-results" role="status" aria-live="polite"></div>
     <div class="walk-head"><span class="section-head" id="walk-title" data-tip="walkhead">Running, in start order</span><span class="walk-sum num" id="walk-sum" data-tip="walksum"></span><div class="walk-tokens num" data-tip="tokens"><span>Tokens</span><dl id="walk-tokens"></dl></div></div>
     <div class="walk-scroll"><div class="walk" id="walk"></div></div>
     <p class="pressure-reason" id="cap-reason"></p>
@@ -481,6 +510,25 @@ body.queue-unavailable .card { display: none; }
   </section>
 </main>
 <div id="tip" role="tooltip"></div>
+<dialog id="kill-dialog" aria-labelledby="kill-heading">
+  <form id="kill-form">
+    <h2 id="kill-heading">Kill this run?</h2>
+    <dl>
+      <dt>Run</dt><dd id="kill-name"></dd>
+      <dt>PID</dt><dd id="kill-pid"></dd>
+      <dt>Progress</dt><dd id="kill-progress"></dd>
+      <dt>Started by</dt><dd id="kill-starter"></dd>
+    </dl>
+    <p>The work in this run will be lost. This message goes to <span id="kill-recipient"></span>:</p>
+    <p id="kill-message"></p>
+    <label for="kill-words">Your own words (optional)</label>
+    <textarea id="kill-words" name="words" rows="2"></textarea>
+    <div class="kill-buttons">
+      <button id="kill-cancel" type="button" autofocus>Cancel</button>
+      <button id="kill-submit" type="submit">Kill the run</button>
+    </div>
+  </form>
+</dialog>
 <script>
 let latest = null;
 // shared:step-tip:start — the step tooltip rows and their HTML; the Disks page uses this code too (disks_page.shared_step_tip).
@@ -1064,12 +1112,12 @@ function hoverTips(tip, content) {
   };
   const hide = () => { shown = null; tip.classList.remove("on"); };
   document.addEventListener("pointermove", (e) => {
-    const el = e.target.closest("[data-tip]");
+    const el = e.target.closest(".kill-run, #kill-dialog") ? null : e.target.closest("[data-tip]");
     if (e.pointerType !== "mouse") return;
     if (el) show(el.dataset.tip, e.clientX, e.clientY); else if (shown) hide();
   });
   document.addEventListener("click", (e) => {
-    const el = e.target.closest("[data-tip]");
+    const el = e.target.closest(".kill-run, #kill-dialog") ? null : e.target.closest("[data-tip]");
     if (el && shown !== el.dataset.tip) show(el.dataset.tip, e.clientX, e.clientY); else hide();
   });
   return {show, hide, key: () => shown};
@@ -1217,6 +1265,7 @@ function render(d) {
   setTimeout(fitLabels, 650);
 
   renderWalk(d);
+  showKillResults();
   renderSwap(d);
   renderLeftovers(d);
   restoreReportView(view);
@@ -1346,6 +1395,142 @@ function placeLimitLabels() {
 }
 window.addEventListener("resize", placeLimitLabels);
 
+const KILL_PATH = "/console/build-kill";
+const KILL_ICON = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7.86 2h8.28L22 7.86v8.28L16.14 22H7.86L2 16.14V7.86zM15 9l-6 6m0-6 6 6"/></svg>';
+let killInfo = {token: "", offers: {}, results: []};
+let killRequest = 0;
+let killRead = false;
+let killConfirmation = null;
+const pendingKills = new Map();
+const KILL_RETRY = "Kill not sent; try again";
+
+function showKillResults() {
+  const visible = new Set();
+  const statuses = new Map(killInfo.results.map(result => [result.reference, result]));
+  for (const [reference, result] of pendingKills) {
+    if (!statuses.has(reference) || statuses.get(reference).stop === KILL_RETRY) statuses.set(reference, result);
+  }
+  const statusText = result => {
+    if (result.stop !== "Stopped") return result.stop;
+    const delivery = result.delivery === "Message sent" ? `${result.recipient_role} ${result.recipient_name} informed`
+      : result.delivery === "Message queued" ? `Message queued for ${result.recipient_role} ${result.recipient_name}`
+      : `Message failed for ${result.recipient_role} ${result.recipient_name}`;
+    return `Killed by you at ${result.time} · ${delivery}`;
+  };
+  for (const cell of document.querySelectorAll("td.pid[data-kill-ref]")) {
+    const reference = cell.dataset.killRef;
+    const offer = killInfo.offers[reference], status = statuses.get(reference);
+    visible.add(reference);
+    const oldControl = cell.querySelector("button");
+    const available = offer && (!status || status.stop === KILL_RETRY);
+    cell.querySelector(".kill-state")?.remove();
+    if (!available) {
+      oldControl?.remove();
+    } else if (!oldControl) {
+      const control = document.createElement("button");
+      control.className = "kill-run";
+      control.type = "button";
+      control.title = "Kill this run";
+      control.setAttribute("aria-label", control.title);
+      control.setAttribute("aria-haspopup", "dialog");
+      control.setAttribute("aria-expanded", String(reference === killConfirmation?.reference));
+      control.innerHTML = KILL_ICON;
+      cell.append(control);
+    }
+    if (status) {
+      const label = document.createElement("span");
+      label.className = "kill-state";
+      label.textContent = statusText(status);
+      cell.append(label);
+    }
+    cell.title = offer || status ? "" : "Kill is not available for this run yet";
+  }
+  const strip = $("kill-results");
+  const text = [...statuses.values()].filter(result => !visible.has(result.reference))
+    .map(result => `${result.step} (pid ${result.pid}) · ${statusText(result)}`).join("\n");
+  if (strip && strip.textContent !== text) strip.textContent = text;
+}
+
+async function refreshKill() {
+  const request = ++killRequest;
+  try {
+    const response = await fetch(KILL_PATH, {cache: "no-store"});
+    const info = response.ok ? await response.json() : null;
+    if (request !== killRequest) return;
+    killRead = true;
+    killInfo = info?.offers && Array.isArray(info.results) ? info : {token: "", offers: {}, results: []};
+  } catch {
+    if (request !== killRequest) return;
+    killInfo = {token: "", offers: {}, results: []};
+  }
+  showKillResults();
+  fitLabels();
+}
+
+function placeKillDialog(anchor) {
+  const dialog = $("kill-dialog"), bounds = anchor.getBoundingClientRect();
+  const width = dialog.offsetWidth, height = dialog.offsetHeight;
+  const left = Math.max(12, Math.min(window.innerWidth - width - 12, bounds.right - width));
+  const top = Math.max(12, Math.min(window.innerHeight - height - 12, bounds.bottom + 8));
+  dialog.style.left = `${left}px`;
+  dialog.style.top = `${top}px`;
+}
+
+document.addEventListener("click", event => {
+  const control = event.target.closest?.(".kill-run");
+  if (!control) return;
+  const reference = control.closest("td").dataset.killRef;
+  const offer = killInfo.offers[reference], row = latest?.walk.find(item => item.kill_ref === reference);
+  if (!offer || !row || killConfirmation) return;
+  const duration = row.started_at ? ago(row.started_at, latest.read_at) : "";
+  const done = doneText(row);
+  $("kill-name").textContent = [rowUnit(row), offer.step].filter(Boolean).join(" · ");
+  $("kill-pid").textContent = `${offer.pid} and its child processes`;
+  $("kill-progress").textContent = done !== "—"
+    ? `${done} done${duration ? ` after ${duration}` : ""}`
+    : duration ? `Running for ${duration}` : "Progress unavailable";
+  $("kill-starter").textContent = offer.started_by;
+  $("kill-recipient").textContent = offer.recipient_name;
+  $("kill-message").textContent = offer.message;
+  $("kill-words").value = "";
+  killConfirmation = {reference, offer, token: killInfo.token, step: row.name};
+  control.setAttribute("aria-expanded", "true");
+  hideTip();
+  $("kill-dialog").showModal();
+  placeKillDialog(control);
+});
+$("kill-cancel").addEventListener("click", () => $("kill-dialog").close());
+$("kill-dialog").addEventListener("close", () => {
+  const reference = killConfirmation?.reference;
+  killConfirmation = null;
+  const button = [...document.querySelectorAll("td[data-kill-ref]")].find(cell => cell.dataset.killRef === reference)?.querySelector("button");
+  button?.setAttribute("aria-expanded", "false");
+  button?.focus({preventScroll: true});
+});
+$("kill-form").addEventListener("submit", async event => {
+  event.preventDefault();
+  if (!killConfirmation || pendingKills.has(killConfirmation.reference)) return;
+  const {reference, offer, token, step} = killConfirmation;
+  const body = new URLSearchParams({reference, token, handle: offer.handle, words: $("kill-words").value});
+  const stopping = {reference, pid: offer.pid, step, stop: "Stopping", delivery: ""};
+  pendingKills.set(reference, stopping);
+  $("kill-dialog").close();
+  showKillResults();
+  try {
+    const response = await fetch(KILL_PATH, {method: "POST", body});
+    const payload = await response.json();
+    const result = response.ok && payload.result ? payload.result : {...stopping, stop: "Stop unconfirmed"};
+    killInfo.results = [...killInfo.results.filter(row => row.reference !== reference), result];
+  } catch {
+    killInfo.results = [...killInfo.results.filter(row => row.reference !== reference), {...stopping, stop: "Stop unconfirmed"}];
+  } finally {
+    ++killRequest;
+    delete killInfo.offers[reference];
+    pendingKills.delete(reference);
+    showKillResults();
+  }
+});
+
 function renderWalk(d) {
   const scale = d.total;
   const pct = (v) => `${v / scale * 100}%`;
@@ -1353,9 +1538,9 @@ function renderWalk(d) {
   const columns = (place, duration, running = false) => `<th scope="col" class="place">${place}</th><th scope="col" class="done">Done</th><th scope="col" class="step">Step</th><th scope="col" class="duration">${duration}</th>` +
     `<th scope="col" class="verify">Verify</th><th scope="col" class="unit">Unit</th><th scope="col" class="pid">Pid</th><th scope="col" class="machine">${STEP_TABLE_HEADERS.target}</th><th scope="col" class="vcpus">vCPU</th>` +
     (running ? '<th scope="col" class="slot">Slot</th><th scope="col" class="tokens">Tokens</th>' : "");
-  const cells = (place, name, duration, unit, pid, machine, vcpus, tip, verify = "", className = "", done = "—", slot = "—", tokens = "—") => {
+  const cells = (place, name, duration, unit, pid, machine, vcpus, tip, verify = "", className = "", done = "—", slot = "—", tokens = "—", killRef = "") => {
     tableRows.push(`<tr class="${className}" data-tip="${tip}" tabindex="0"><td class="place">${esc(place)}</td><td class="done">${esc(done)}</td><th scope="row" class="step"><span class="cell-text">${esc(name)}</span></th>` +
-      `<td class="duration">${esc(duration || "—")}</td><td class="verify">${esc(verify)}</td><td class="unit"><span class="cell-text">${roleName(unit === "—" ? unit : publicText(unit || ""))}</span></td><td class="pid">${typeof pid === "number" ? pid : "—"}</td>` +
+      `<td class="duration">${esc(duration || "—")}</td><td class="verify">${esc(verify)}</td><td class="unit"><span class="cell-text">${roleName(unit === "—" ? unit : publicText(unit || ""))}</span></td><td class="pid"${killRef ? ` data-kill-ref="${esc(killRef)}"` : ""} title="Kill is not available for this run yet">${typeof pid === "number" ? pid : "—"}</td>` +
       (Array.isArray(machine)
         // A waiting step lists the machines that can take it, each in its machine color.
         ? `<td class="machine" data-machine="${esc(machine.join(" or "))}"><span class="wait-target">${machine.map(target => `<span class="machine" data-machine="${esc(target)}">${esc(target)}</span>`).join(" or ") || "—"}</span></td>`
@@ -1374,7 +1559,7 @@ function renderWalk(d) {
   rows.push(...ordered.map(r => {
     const idleCI = r.ci && visibleDetail(r) === "idle";
     cells(stageText(r),
-      r.name, idleCI ? "" : r.started_at ? ago(r.started_at, d.read_at) : r.state || "", idleCI ? "" : rowUnit(r), r.pid, r.machine, r.vcpus, `row:${r.key}`, r.verify?.verb, "", doneText(r), r.slot, r.tokens);
+      r.name, idleCI ? "" : r.started_at ? ago(r.started_at, d.read_at) : r.state || "", idleCI ? "" : rowUnit(r), r.pid, r.machine, r.vcpus, `row:${r.key}`, r.verify?.verb, "", doneText(r), r.slot, r.tokens, r.kill_ref);
     return `<div class="wrow${r.kind === "cloud" ? " cloud-work" : ""}" data-tip="row:${r.key}" data-run="${r.key}">${rowLabel(r.name, rowOwner(r))}` +
       (r.kind === "cloud" ? cloudStatus(r, `row:${r.key}`) : rowMemory(`row:${r.key}`)) + `</div>`;
   }));
@@ -1775,6 +1960,7 @@ async function tick(supersede=false,current=()=>true) {
   if (!current() || paused) return;
   if (!d.ok || d.error) throw new Error(d.error || "The queue did not answer.");
   render(d);
+  if (!killRead || d.walk.some(row => row.kill_ref) || killInfo.results.length || pendingKills.size) void refreshKill();
   if (d.report_version !== reportVersion) await loadReport(d.report_version,current);
   if (!current() || paused) return;
   const lv=level(latest);

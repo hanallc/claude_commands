@@ -13,6 +13,7 @@
 // Use --verify-call as the third argument for the Verify column proof.
 // Use --headcount to compare the Running and Queued headers.
 // Use --build-tools as the third argument for the Build tools proof.
+// Use --kill-shot or --kill-control as the third argument for the Kill fixture.
 // Set SWAP_BEFORE_PAGE to compare the swap tooltip with the previous page.
 import assert from 'node:assert/strict';
 import {accessSync, constants, statSync} from 'node:fs';
@@ -51,7 +52,10 @@ if (gateMode) args.shift();
 const [callerFolder, previousPage, comparison] = args;
 const verifyCallProof = previousPage === '--verify-call';
 const buildToolsProof = previousPage === '--build-tools';
-const focusedProof = verifyCallProof || buildToolsProof;
+const killShot = previousPage === '--kill-shot';
+const killControlProof = previousPage === '--kill-control';
+const killProof = killShot || killControlProof;
+const focusedProof = verifyCallProof || buildToolsProof || killProof;
 const themes = gateMode ? ['dark'] : ['light','dark'];
 const widths = gateMode ? [1400] : [1400,900,390];
 const runningHeaders = ['Stage','Done','Step','Dur','Verify','Unit','Pid','Target','vCPU','Slot','Tokens'];
@@ -153,7 +157,44 @@ try {
 
   let servedReading = base;
   let currentFixture = base;
+  const killPath = '/console/build-kill';
+  const killRef = 'a'.repeat(64);
+  const killOffer = {handle:'b'.repeat(64),pid:2712994,started_by:'impl3, a worker of unit-board',
+    recipient_name:'impl3',step:'check',
+    message:'nate killed your run "check" (pid 2712994) from the Builds page at 19:41 EST'};
+  const killedResult = {reference:killRef,step:'check',pid:killOffer.pid,stop:'Stopped',delivery:'Message sent',
+    time:'19:41 EST',recipient_role:'worker',recipient_name:'impl3'};
+  const killToken = 'fixture-token';
+  let killPost;
+  let killPostReply;
+  let killResults = [];
   const server = createServer((req, res) => {
+    if (req.url === killPath) {
+      res.setHeader('Content-Type','application/json');
+      if (!killProof) {
+        res.writeHead(403).end('{}');
+      } else if (req.method === 'POST') {
+        if (killShot) {
+          res.writeHead(405).end('{}');
+          return;
+        }
+        const fields = [];
+        req.setEncoding('utf8');
+        req.on('data', part => fields.push(part));
+        req.on('end', () => {
+          killPost = Object.fromEntries(new URLSearchParams(fields.join('')));
+          killPostReply = () => {
+            killResults = [killedResult];
+            res.end(JSON.stringify({result:killedResult}));
+          };
+          server.emit('kill-post');
+        });
+      } else {
+        const canTry = !killResults.length || killResults[0].stop === 'Kill not sent; try again';
+        res.end(JSON.stringify({token:killToken,offers:canTry ? {[killRef]:killOffer} : {},results:killResults}));
+      }
+      return;
+    }
     const isData = req.url.startsWith('/memory.json'), isReport = req.url.startsWith('/report.json');
     res.writeHead(200, {'Content-Type':isData || isReport ? 'application/json' : 'text/html; charset=utf-8'});
     res.end(isData ? JSON.stringify(servedReading) : isReport ? JSON.stringify(base.report)
@@ -259,6 +300,89 @@ try {
           fitLabels();
           })()`);
         };
+        if (killProof) {
+          const source = structuredClone(base.walk.find(row => row.queued && !row.ci));
+          source.progress = {kind:'RowProgress',phase:'testing',done:13,total:200,percent:6.5,unit:'tests'};
+          const local = {...source,key:'kill-fixture',machine:'natedev',pid:killOffer.pid,
+            name:'unit-board check',unit:'unit-board',kill_ref:killRef,started_at:fixtureTime - 660};
+          const other = {...source,key:'unavailable-fixture',machine:'natedev',pid:2637799,
+            name:'research nextest',unit:'research',started_at:fixtureTime - 1200};
+          servedReading = {...base, walk:[other,local], waiters:[], queued_priority_units:[]};
+          await call('Emulation.setDeviceMetricsOverride',{width:1600,height:1200,deviceScaleFactor:1,mobile:false});
+          await navigate('memory_live.html');
+          const confirmation = await evaluate(`(async () => {
+            document.querySelector('.legend-box').open = false;
+            for (const section of document.querySelectorAll('#leftovers, #swap, #report-charts')) section.hidden = true;
+            document.body.style.paddingBottom = '520px';
+            await refreshKill();
+            document.querySelector('#walk-title').scrollIntoView({block:'start'});
+            const control = document.querySelector('.kill-run');
+            control.click();
+            document.querySelector('#kill-words').value = 'Start it again after 21:50.';
+            const rect = document.querySelector('#walk').getBoundingClientRect();
+            const top = document.querySelector('#walk-title').getBoundingClientRect();
+            const dialog = document.querySelector('#kill-dialog');
+            const pop = dialog.getBoundingClientRect();
+            return {
+              icons:document.querySelectorAll('.kill-run').length,
+              unavailable:document.querySelector('tr[data-tip="row:unavailable-fixture"] .pid').title,
+              fields:[...dialog.querySelectorAll('dd')].map(field => field.textContent),
+              preview:document.querySelector('#kill-message').textContent,
+              recipient:document.querySelector('#kill-recipient').textContent,
+              clip:{x:Math.max(0,rect.left-8)+scrollX,y:Math.max(0,Math.min(top.top,pop.top)-8)+scrollY,
+                width:Math.min(innerWidth,rect.right+8)-Math.max(0,rect.left-8),
+                height:Math.max(rect.bottom,pop.bottom)+8-Math.max(0,Math.min(top.top,pop.top)-8),scale:1}
+            };
+          })()`);
+          if (killShot) {
+            const shot = await call('Page.captureScreenshot',{format:'png',captureBeyondViewport:true,clip:confirmation.clip});
+            await writeFile(join(folder,'kill-dark.png'),Buffer.from(shot.data,'base64'));
+            killResults = [killedResult];
+            const killedClip = await evaluate(`(async () => {
+              document.querySelector('#kill-dialog').close();
+              await refreshKill();
+              const walk = document.querySelector('#walk').getBoundingClientRect();
+              const heading = document.querySelector('#walk-title').getBoundingClientRect();
+              const left = Math.max(0,walk.left-8), top = Math.max(0,heading.top-8);
+              return {x:left+scrollX,y:top+scrollY,width:Math.min(innerWidth,walk.right+8)-left,
+                height:walk.bottom+8-top,scale:1};
+            })()`);
+            const killed = await call('Page.captureScreenshot',{format:'png',captureBeyondViewport:true,clip:killedClip});
+            await writeFile(join(folder,'killed-row-dark.png'),Buffer.from(killed.data,'base64'));
+            console.log(join(folder,'kill-dark.png'));
+            console.log(join(folder,'killed-row-dark.png'));
+          } else {
+            assert.equal(confirmation.icons,1);
+            assert.equal(confirmation.unavailable,'Kill is not available for this run yet');
+            assert.deepEqual(confirmation.fields,
+              ['unit-board · check','2712994 and its child processes','6.5% done after 11 min','impl3, a worker of unit-board']);
+            assert.equal(confirmation.preview,killOffer.message);
+            assert.equal(confirmation.recipient,killOffer.recipient_name);
+            killResults = [{...killedResult,stop:'Kill not sent; try again',delivery:''}];
+            assert.deepEqual(await evaluate(`(async () => {
+              await refreshKill();
+              return [document.querySelector('.kill-state').textContent, document.querySelectorAll('.kill-run').length];
+            })()`),['Kill not sent; try again',1]);
+            await evaluate(`document.querySelector('#kill-submit').click()`);
+            assert.equal(await evaluate(`document.querySelector('.kill-state').textContent`),'Stopping');
+            // Remove the fixture row while the action is pending.
+            await evaluate(`renderReading({...latest,walk:latest.walk.filter(row => !row.kill_ref)})`);
+            assert.match(await evaluate(`document.querySelector('#kill-results').textContent`),/Stopping/);
+            const received = await new Promise(resolve => {
+              if (killPostReply) resolve(killPost);
+              else server.once('kill-post', () => resolve(killPost));
+            });
+            assert.deepEqual(received,{reference:killRef,token:killToken,handle:killOffer.handle,
+              words:'Start it again after 21:50.'});
+            killPostReply();
+            assert.equal(await evaluate(`(async () => {
+              await refreshKill();
+              return document.querySelector('#kill-results').textContent;
+            })()`),'check (pid 2712994) · Killed by you at 19:41 EST · worker impl3 informed');
+            console.log(JSON.stringify({pass:true,proof:'Kill control'}));
+          }
+          break browserProof;
+        }
         if (buildToolsProof) {
           const ram = JSON.parse(await readFile(join(folder, 'legend_ram.json'), 'utf8'));
           const gib = 1024**3;
@@ -410,8 +534,12 @@ try {
           await checkPage(navigate, evaluate, call);
         }
       } finally {
-        if(ws) ws.close();
-        chrome.kill('SIGTERM');
+        if (killProof && ws?.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({id:0,method:'Browser.close'}));
+        } else {
+          if (ws) ws.close();
+          chrome.kill('SIGTERM');
+        }
         await exited;
       }
 

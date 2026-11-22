@@ -1815,6 +1815,48 @@ After all violations, the call exits 2 with no Cargo call except `metadata`.
 `verify.sh example-test` exits 2 before any work.
 It prints `verify.sh: example-test is removed: examples carry no tests (user, 2026-10-04).`.
 
+### Stop a Builds run
+
+The Running table offers **Kill this run** beside a verified natedev Cargo PID.
+The confirmation shows the row, process tree, progress, and recorded caller.
+The server determines the caller from the reservation's session ID and the current staff record.
+
+1. The feed publishes an opaque reference for each eligible reservation.
+2. The console supplies a handle when it can verify the current PID, start identity, staff recipient, and stop route.
+3. The server reads the reservation and process evidence again when the operator confirms.
+4. The server saves the notice and the verified stop route before it requests the stop.
+5. The server calls the stop helper for the verified route.
+6. The helper reports the TERM count before it waits for the scope to end.
+7. The server confirms that the run ended.
+8. The server sends the notice when it has saved a positive TERM count and confirmed exit.
+
+Cargo Kill uses the scope identity that the shared stop helper reads from the Cargo process.
+Detached Kill passes the record path and reason to the detached stop helper.
+The detached helper stages the reason and the pass cancellation before TERM.
+Both routes show **Run already ended** when the scope ends with a TERM count of zero.
+A zero count leaves the notice unsent.
+Verify only creates scopes per step, so the console leaves Kill off for Verify.
+The server offers Cargo Kill only when the verified scope contains the known Cargo descendants.
+A restart before the server saves a TERM count shows **Kill not sent; try again** for a Cargo scope.
+The same result applies when the detached record is unfinished or missing.
+The server saves the helper’s confirmation before it sends the notice.
+After a restart, the server resumes a stop that has a TERM receipt and needs exit confirmation.
+Cargo recovery uses the saved scope identity.
+Detached recovery uses the run record to stop its scopes and cancel its pass.
+A finished detached record confirms that the run ended.
+With a saved TERM count, the server sends the notice once.
+Without a saved TERM count, the server shows **Run already ended** and sends no notice.
+The server retries pending actions every `kill_pending_check_seconds`.
+It retries an unclear delivery result with the saved key.
+A queued or kept message appears as **Message queued**.
+The server supplies the first line of the notice.
+The operator can add words in the confirmation.
+The row shows **Stopping**, **Stopped**, or **Stop unconfirmed**.
+**Message sent**, **Message queued**, and **Message failed** describe the delivery result.
+The console keeps the result visible for `kill_result_seconds` after the row leaves the table.
+Gate, merge, remote, CI, service, and unowned rows show the unavailable tip on the PID.
+The targeted gate cleanup reaps module leaders and has no confirmation for all descendants.
+
 ## Invariants
 
 - Every compiling step and every BRP launch passes the memory gate before it starts. Sweep, `cargo fmt` and `taplo` steps never wait on it, so the disk floor is never held by memory.
