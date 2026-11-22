@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
 import fcntl
+import hashlib
 import json
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, NotRequired, TypedDict, cast
@@ -252,6 +253,7 @@ class MacClaimBoot(TypedDict):
 
     boot_id: str
     boot_at_us: int
+    hardware_uuid: NotRequired[str]
 
 
 class MacBootNotRecorded:
@@ -272,9 +274,15 @@ def decode_mac_claim_boot(value: object, path: Path) -> MacClaimBoot:
     if isinstance(value, dict):
         fields = cast(dict[str, object], value)
         boot_id, boot_at_us = fields.get("boot_id"), fields.get("boot_at_us")
+        hardware = fields.get("hardware_uuid")
         if isinstance(boot_id, str) and type(boot_at_us) is int and boot_at_us > 0:
             try:
-                return {"boot_id": str(UUID(boot_id)), "boot_at_us": boot_at_us}
+                boot: MacClaimBoot = {"boot_id": str(UUID(boot_id)), "boot_at_us": boot_at_us}
+                if "hardware_uuid" in fields:
+                    if not isinstance(hardware, str) or not (machine := UUID(hardware)).int:
+                        raise ValueError("invalid hardware UUID")
+                    boot["hardware_uuid"] = str(machine)
+                return boot
             except ValueError:
                 pass
     raise StateReadError(f"{path} has an invalid mac_boot")
@@ -288,6 +296,7 @@ class RemoteJobClaim(ClaimOwnerRecord):
     instance_generation: NotRequired[str]
     mac_boot: NotRequired[MacClaimBoot]
     mac_command_fence: NotRequired[MacCommandFence]
+    mac_watcher_release_pending: NotRequired[Literal[True]]
 
 
 RunRecord = ProcessBoundClaim | RemoteJobClaim
@@ -298,6 +307,32 @@ def claim_fence_identity(record: RunRecord) -> ClaimIdentity:
         command = record["mac_command_fence"]
         return ClaimIdentity(record["claim_id"], command["episode"], command["attempt"])
     return claim_identity(record)
+
+
+def has_mac_watcher_fence(record: RunRecord) -> bool:
+    return ("remote_host" in record and "mac_command_fence" in record and "mac_boot" in record
+            and "hardware_uuid" in record["mac_boot"])
+
+
+class MacClaimReleaseReceipt(TypedDict):
+    """The exact claim and command released by the Mac watcher."""
+
+    claim_id: str
+    episode: str
+    attempt: str
+    scope: str
+    pid: int
+    proc_start: str
+    since: str
+    remote_host: str
+    mac_boot: MacClaimBoot
+    command_episode: str
+    command_attempt: str
+
+
+def mac_release_receipt_path(paths: StatePaths, scope_key: str, identity: ClaimIdentity) -> Path:
+    key = hashlib.sha256(json.dumps([scope_key, identity.claim_id, identity.episode, identity.attempt]).encode()).hexdigest()
+    return paths.directory / "release-receipts" / f"{key}.json"
 
 
 @dataclass(frozen=True)
@@ -465,6 +500,11 @@ def read_run(path: Path) -> RunState:
         if not isinstance(episode, str) or not episode or not isinstance(attempt, str) or not attempt:
             raise StateReadError(f"{path} has an invalid mac_command_fence")
         remote["mac_command_fence"] = {"episode": episode, "attempt": attempt}
+    if "mac_watcher_release_pending" in values:
+        if (values["mac_watcher_release_pending"] is not True or "mac_command_fence" not in remote
+                or "mac_boot" not in remote or "hardware_uuid" not in remote["mac_boot"]):
+            raise StateReadError(f"{path} has an invalid mac_watcher_release_pending")
+        remote["mac_watcher_release_pending"] = True
     if 'instance_generation' in values:
         generation = required_string(values, 'instance_generation', path)
         if not generation:

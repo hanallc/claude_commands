@@ -540,10 +540,16 @@ def start_fence_relative(identity: claim_state.ClaimIdentity, target: str, *, sc
     return state / "dispatch-fences" / scope_key / pending_start_key(identity)
 
 
-MAC_BOOT_READER = r'''import json, re, subprocess
+MAC_BOOT_READER = r'''import json, plistlib, re, subprocess
 from uuid import UUID
 
 def mac_boot():
+    devices = plistlib.loads(subprocess.check_output(["ioreg", "-rd1", "-c", "IOPlatformExpertDevice", "-a"]))
+    if not isinstance(devices, list) or len(devices) != 1 or not isinstance(devices[0], dict):
+        raise ValueError("Invalid Mac hardware identity")
+    hardware = UUID(devices[0]["IOPlatformUUID"])
+    if not hardware.int:
+        raise ValueError("Invalid Mac hardware UUID")
     boot_id = str(UUID(subprocess.check_output(["sysctl", "-n", "kern.bootsessionuuid"], text=True).strip()))
     value = subprocess.check_output(["sysctl", "-n", "kern.boottime"], text=True)
     match = re.match(r"\{\s*sec\s*=\s*([0-9]+),\s*usec\s*=\s*([0-9]+)\s*\}", value)
@@ -552,7 +558,62 @@ def mac_boot():
     seconds, micros = map(int, match.groups())
     if seconds <= 0 or not 0 <= micros < 1000000:
         raise ValueError("Invalid Mac boot time")
-    return {"boot_id": boot_id, "boot_at_us": seconds * 1000000 + micros}
+    return {"hardware_uuid": str(hardware), "boot_id": boot_id, "boot_at_us": seconds * 1000000 + micros}
+'''
+
+
+MAC_FENCE_RECORDS = '''import json, os, tempfile
+
+def sync_directory(directory):
+    fd = os.open(directory, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+def ensure_fence_directory(directory):
+    if directory.is_dir():
+        return
+    ensure_fence_directory(directory.parent)
+    directory.mkdir(exist_ok=True)
+    sync_directory(directory.parent)
+
+def save_fence_record(path, record, *, create=False):
+    ensure_fence_directory(path.parent)
+    with tempfile.NamedTemporaryFile("w", dir=path.parent, delete=False) as stream:
+        temporary = path.with_name(os.path.basename(stream.name))
+        try:
+            json.dump(record, stream)
+            stream.flush()
+            os.fsync(stream.fileno())
+            if create:
+                os.link(temporary, path)
+            else:
+                os.replace(temporary, path)
+            sync_directory(path.parent)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+def read_fence_record(fence):
+    for suffix in (".revoked", ".group", ".lock"):
+        try:
+            contents = fence.with_suffix(suffix).read_text()
+        except FileNotFoundError:
+            continue
+        if not contents and suffix == ".lock":
+            return None
+        record = json.loads(contents)
+        if not isinstance(record, dict):
+            raise ValueError("Invalid Mac fence record")
+        if suffix == ".group" and "state" not in record:
+            record["state"] = "started"
+        return record
+    return None
+
+def revoke_fence(fence, record):
+    save_fence_record(fence.with_suffix(".revoked"), record)
+    fence.with_suffix(".lock").unlink(missing_ok=True)
+    fence.with_suffix(".group").unlink(missing_ok=True)
 '''
 
 
@@ -566,7 +627,7 @@ class MacClaimEndProbe:
 
 def mac_claim_end_command(probes: tuple[MacClaimEndProbe, ...]) -> str:
     """Read one process table after locking the fences that can settle."""
-    program = MAC_BOOT_READER + '''import fcntl, os, pathlib, sys
+    program = MAC_BOOT_READER + MAC_FENCE_RECORDS + '''import fcntl, pathlib, sys
 from contextlib import ExitStack
 
 current_boot = mac_boot()
@@ -574,6 +635,8 @@ ended = []
 with ExitStack() as locks:
     candidates = []
     for name, boot in json.loads(sys.argv[1]):
+        if boot.get("hardware_uuid") != current_boot["hardware_uuid"]:
+            continue
         fence = pathlib.Path.home() / name
         path = fence.with_suffix(".lock")
         try:
@@ -587,41 +650,34 @@ with ExitStack() as locks:
                 continue
         if current_boot == boot:
             try:
-                launch = json.loads(fence.with_suffix(".group").read_text())
-            except FileNotFoundError:
-                if lock is not None or fence.with_suffix(".revoked").is_file():
-                    candidates.append((name, path, lock, 0, True))
-                continue
+                launch = read_fence_record(fence)
             except (OSError, ValueError):
                 continue
             if not isinstance(launch, dict) or launch.get("boot") != boot:
                 continue
-            group = launch.get("group")
-            if type(group) is int and group > 1:
-                candidates.append((name, path, lock, group, False))
+            state, group = launch.get("state"), launch.get("group")
+            if state in ("unused", "ended"):
+                candidates.append((name, boot, fence, lock, 0))
+            elif state == "started" and type(group) is int and group > 1:
+                candidates.append((name, boot, fence, lock, group))
         elif current_boot["boot_id"] != boot["boot_id"] and current_boot["boot_at_us"] > boot["boot_at_us"]:
-            candidates.append((name, path, lock, 0, False))
+            candidates.append((name, boot, fence, lock, 0))
     groups = set()
-    if any(group for _, _, _, group, _ in candidates):
+    if any(group for _, _, _, _, group in candidates):
         groups = set(subprocess.check_output(["ps", "-axo", "pgid="], text=True).split())
         if not groups or not all(group.isascii() and group.isdecimal() for group in groups):
             raise ValueError("Invalid Mac process groups")
-    for name, path, lock, group, unused in candidates:
+    for name, boot, fence, lock, group in candidates:
         if group and str(group) in groups:
             continue
         try:
-            current = path.stat()
+            current = fence.with_suffix(".lock").stat()
         except FileNotFoundError:
-            if unused and not path.with_suffix(".revoked").is_file():
-                continue
+            pass
         else:
             if lock is None or not os.path.samestat(current, os.fstat(lock.fileno())):
                 continue
-            if unused:
-                # Keep the proof if SSH loses the reply after revocation.
-                path.replace(path.with_suffix(".revoked"))
-            else:
-                path.unlink()
+        revoke_fence(fence, {"state": "ended", "boot": boot})
         ended.append(name)
 print(json.dumps(ended))
 '''
@@ -642,26 +698,39 @@ for path in base.parent.glob("*.lock"):
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
                 continue
+            if lock.read() or path.with_suffix(".group").exists() or path.with_suffix(".revoked").exists():
+                continue
             path.unlink(missing_ok=True)
     except FileNotFoundError:
         continue
-for group in base.parent.glob("*.group"):
-    if group != base.with_suffix(".group") and not group.with_suffix(".lock").exists():
-        group.unlink(missing_ok=True)
 '''
     return shlex.join(["python3", "-c", program, encoded])
 
 
-def prepare_start_fence_command(identity: claim_state.ClaimIdentity, target: str, *, scope_key: str = "run") -> str:
+def prepare_start_fence_command(
+    identity: claim_state.ClaimIdentity, target: str, *, scope_key: str = "run", read_mac_boot: bool = False,
+) -> str:
     """Create the start identity before the probe acknowledges preparation."""
     encoded = str(start_fence_relative(identity, target, scope_key=scope_key)).encode().hex()
-    program = '''import pathlib, sys
+    program = (MAC_BOOT_READER + MAC_FENCE_RECORDS if read_mac_boot else "") + '''import pathlib, sys
 base = pathlib.Path.home() / bytes.fromhex(sys.argv[1]).decode()
-base.parent.mkdir(parents=True, exist_ok=True)
 if base.with_suffix(".revoked").exists():
     sys.exit(75)
-base.with_suffix(".lock").touch()
 '''
+    if read_mac_boot:
+        program += '''boot = mac_boot()
+prepared = {"boot": boot, "state": "unused"}
+try:
+    save_fence_record(base.with_suffix(".lock"), prepared, create=True)
+except FileExistsError:
+    if read_fence_record(base) != prepared:
+        sys.exit(75)
+if base.with_suffix(".revoked").exists():
+    sys.exit(75)
+print("mac_boot=" + json.dumps(boot))
+'''
+    else:
+        program += 'base.parent.mkdir(parents=True, exist_ok=True)\nbase.with_suffix(".lock").touch()\n'
     return shlex.join(["python3", "-c", program, encoded])
 
 
@@ -672,7 +741,7 @@ def start_fence_command(identity: claim_state.ClaimIdentity, target: str, *, set
     relative = str(start_fence_relative(identity, target, scope_key=scope_key))
     encoded = relative.encode().hex()
     if settle:
-        program = '''import fcntl, pathlib, sys
+        program = MAC_FENCE_RECORDS + '''import fcntl, pathlib, sys
 base = pathlib.Path.home() / bytes.fromhex(sys.argv[1]).decode()
 path = base.with_suffix(".lock")
 try:
@@ -686,7 +755,11 @@ with lock:
     except BlockingIOError:
         print("dispatch_start_pending=" + sys.argv[2], flush=True)
         sys.exit(0)
-    path.unlink(missing_ok=True)
+    record = read_fence_record(base)
+    if record is None:
+        path.unlink(missing_ok=True)
+    else:
+        revoke_fence(base, record)
     print("dispatch_start_settled=" + sys.argv[2], flush=True)
 '''
         return shlex.join(["python3", "-c", program, encoded, key])
@@ -717,14 +790,15 @@ def fenced_start_command(
     """Remove the prepared identity after the existing remote command ends."""
     record_group = ""
     if not isinstance(mac_boot, claim_state.MacBootNotRecorded):
-        program = MAC_BOOT_READER + '''import os, pathlib, sys
+        program = MAC_BOOT_READER + MAC_FENCE_RECORDS + '''import pathlib, sys
 boot = mac_boot()
 group = os.getpgrp()
 if boot != json.loads(sys.argv[2]) or group <= 1:
     sys.exit(75)
-marker = (pathlib.Path.home() / sys.argv[1]).with_suffix(".group")
-with marker.open("x") as saved:
-    json.dump({"boot": boot, "group": group}, saved)
+fence = pathlib.Path.home() / sys.argv[1]
+if read_fence_record(fence) != {"boot": boot, "state": "unused"}:
+    sys.exit(75)
+save_fence_record(fence.with_suffix(".group"), {"boot": boot, "state": "started", "group": group}, create=True)
 '''
         path = start_fence_relative(identity, target, scope_key=scope_key)
         record_group = shlex.join(["python3", "-c", program, str(path), json.dumps(mac_boot)]) + " || exit 75\n"
@@ -1942,34 +2016,63 @@ def record_reachable(target: str = "mac") -> None:
             print(f"mac_test: the {label} is reachable again", file=sys.stderr, flush=True)
 
 
+def mac_claim_for_holder(
+    paths: claim_state.StatePaths, controller: ProcessController, identity: claim_state.ClaimIdentity, host: str,
+) -> tuple[Path, claim_state.RemoteJobClaim] | claim_state.NoRun:
+    start = process_identity.process_start(os.getpid())
+    for path in claim_state.claim_files(paths):
+        if path.stem != controller.claim_scope_key:
+            continue
+        record = claim_state.read_run(path)
+        if (not isinstance(record, claim_state.NoRun) and "remote_host" in record
+                and record["remote_host"] == host and record["pid"] == os.getpid()
+                and start == process_identity.Started(record["proc_start"])
+                and claim_state.claim_identity(record) == identity):
+            return path, record
+    return claim_state.NO_RUN
+
+
 def record_mac_claim_boot(controller: ProcessController, identity: claim_state.ClaimIdentity,
                           target: str, host: str, boot: claim_state.MacClaimBoot) -> None:
     """Save the exact command fence and boot before the caller requests permission."""
     paths = claim_state.state_paths(target)
-    start = process_identity.process_start(os.getpid())
     fence = controller.command_identity(identity)
     with claim_state.locked(paths.lock):
-        for path in claim_state.claim_files(paths):
-            if path.stem != controller.claim_scope_key:
-                continue
-            record = claim_state.read_run(path)
-            if (isinstance(record, claim_state.NoRun) or "remote_host" not in record
-                    or record["remote_host"] != host or record["pid"] != os.getpid()
-                    or start != process_identity.Started(record["proc_start"])
-                    or claim_state.claim_identity(record) != identity):
-                continue
-            if "mac_boot" in record and record["mac_boot"] != boot:
-                raise claim_state.StateReadError("the Mac rebooted while the claim was preparing")
-            previous = claim_state.claim_fence_identity(record)
-            if previous != fence and pending_start_path(target, previous).exists():
-                raise claim_state.StateReadError("the previous Mac command fence is still pending")
-            record["mac_boot"] = boot
-            record["mac_command_fence"] = {"episode": fence.episode, "attempt": fence.attempt}
-            write_text_atomic(path, json.dumps(record) + "\n")
-            controller.mac_boot = boot
-            controller.mac_command_fence = fence
-            return
-    raise claim_state.StateReadError("the exact Mac claim changed during the probe")
+        held = mac_claim_for_holder(paths, controller, identity, host)
+        if isinstance(held, claim_state.NoRun):
+            raise claim_state.StateReadError("the exact Mac claim changed during the probe")
+        path, record = held
+        if record.get("mac_watcher_release_pending") is True:
+            raise claim_state.StateReadError("the Mac claim requires watcher proof")
+        if "mac_boot" in record and record["mac_boot"] != boot:
+            raise claim_state.StateReadError("the Mac rebooted or changed while the claim was preparing")
+        previous = claim_state.claim_fence_identity(record)
+        if previous != fence and pending_start_path(target, previous).exists():
+            raise claim_state.StateReadError("the previous Mac command fence is still pending")
+        record["mac_boot"] = boot
+        record["mac_command_fence"] = {"episode": fence.episode, "attempt": fence.attempt}
+        write_text_atomic(path, json.dumps(record) + "\n")
+        controller.mac_boot = boot
+        controller.mac_command_fence = fence
+
+
+def retain_mac_claim_for_watcher(controller: ProcessController, target: str, host: str) -> None:
+    """Transfer release authority before the holder exits with unresolved cleanup."""
+    claim, fence, boot = controller.claim_identity, controller.mac_command_fence, controller.mac_boot
+    if (isinstance(claim, claim_state.NoClaimIdentity) or isinstance(fence, claim_state.NoClaimIdentity)
+            or isinstance(boot, claim_state.MacBootNotRecorded) or "hardware_uuid" not in boot):
+        return
+    paths = claim_state.state_paths(target)
+    try:
+        with claim_state.locked(paths.lock):
+            held = mac_claim_for_holder(paths, controller, claim, host)
+            if not isinstance(held, claim_state.NoRun):
+                path, record = held
+                if record.get("mac_boot") == boot and claim_state.claim_fence_identity(record) == fence:
+                    record["mac_watcher_release_pending"] = True
+                    write_text_atomic(path, json.dumps(record) + "\n")
+    except (OSError, claim_state.StateReadError) as error:
+        print(f"mac_test: could not save the Mac watcher handoff: {error}", file=sys.stderr)
 
 
 def probe_mac(
@@ -2014,12 +2117,10 @@ def probe_mac(
         path = pending_start_path(target, fence)
         path.parent.mkdir(parents=True, exist_ok=True)
         write_text_atomic(path, pending_start_key(fence))
-        boot = "" if linux else shlex.join(
-            ["python3", "-c", MAC_BOOT_READER + 'print("mac_boot=" + json.dumps(mac_boot()))']) + " || exit 1\n"
+        prepare = prepare_start_fence_command(fence, target, scope_key=controller.claim_scope_key, read_mac_boot=not linux)
         script = ("(\n" + script + "\n)\nprobe_status=$?\n"
                   + "if [ \"$probe_status\" -eq 0 ]; then\n"
-                  + boot
-                  + prepare_start_fence_command(fence, target, scope_key=controller.claim_scope_key) + " || exit 1\nfi\n"
+                  + prepare + " || exit 1\nfi\n"
                   + 'exit "$probe_status"')
     result = controller.capture(
         [*ssh_prefix(config), script],
@@ -3034,12 +3135,16 @@ def claimed_run(
         if release_allowed:
             evidence.unresolved_count = 0
         if release_allowed and isinstance(controller.pending, SettledDispatchOperations):
-            _ = release_claim(controller, request.target)
+            released = release_claim(controller, request.target)
+            if isinstance(released, ClaimReleaseUnconfirmed):
+                retain_mac_claim_for_watcher(controller, request.target, config.host)
             if sync_after_release:
                 from scripts.buildlog import sync as buildlog_sync
 
                 with transfer_bytes.measure_transfers(evidence.traffic):
                     buildlog_sync.sync_target(request.target)
+        else:
+            retain_mac_claim_for_watcher(controller, request.target, config.host)
 
 
 def hana_source_key(source_root: Path) -> execution_identity.SourceIdentity:

@@ -87,6 +87,7 @@ from scripts.mac_test.claim_state import (
     coordination_depth as coordination_depth,
 )
 from scripts.lib import conf
+from scripts.lib.atomic_file import sync_folder, write_text_atomic
 from scripts.buildlog import transfer_bytes
 from scripts.lib.user_zone import user_zone
 
@@ -697,12 +698,19 @@ def run_holds_work(run: RunRecord) -> bool:
     return run_is_live(run) and not run_is_kept(run)
 
 
+def mac_watcher_owns_release(run: RunRecord) -> bool:
+    """Keep a handed off claim or a lost holder's exact fence for the watcher."""
+    return (claim_state.has_mac_watcher_fence(run)
+            and (run.get("mac_watcher_release_pending") is True or run_is_kept(run)))
+
+
 def copy_gives_way(run: RunRecord) -> bool:
     """A live test copy whose process still runs, so a new step can stop it.
 
     A kept copy claim holds leftovers like any other kept claim and never gives way.
     """
-    return run.get("copy") is True and process_identity.process_start(run["pid"]) == process_identity.Started(run["proc_start"])
+    return (run.get("copy") is True and not mac_watcher_owns_release(run)
+            and process_identity.process_start(run["pid"]) == process_identity.Started(run["proc_start"]))
 
 
 def claim_scope(worktree: str) -> ClaimScope:
@@ -1523,7 +1531,8 @@ def claim_watch_pass(paths: StatePaths, config: MacTestConfig) -> bool:
     probes_by_host: dict[str, list[offload.MacClaimEndProbe]] = {}
     for claim in claims:
         record = claim.record
-        if "remote_host" in record and "mac_boot" in record and claim_holder_ended(record):
+        if ("remote_host" in record and "mac_boot" in record and "hardware_uuid" in record["mac_boot"]
+                and claim_holder_ended(record)):
             fence = offload.start_fence_relative(
                 claim_state.claim_fence_identity(record), paths.target, scope_key=claim.path.stem)
             probes_by_host.setdefault(record["remote_host"], []).append(offload.MacClaimEndProbe(fence, record["mac_boot"]))
@@ -1544,6 +1553,31 @@ def claim_watch_pass(paths: StatePaths, config: MacTestConfig) -> bool:
             if watch_claim(paths, config, claim, activity[host], now):
                 watched = True
     return watched
+
+
+def record_watcher_release(paths: StatePaths, path: Path, record: RemoteJobClaim, boot: claim_state.MacClaimBoot,
+                           *, confirmed: bool) -> bool:
+    """Save proof before claim removal and reuse it after an interrupted removal."""
+    identity = claim_state.claim_identity(record)
+    command = claim_state.claim_fence_identity(record)
+    receipt = claim_state.mac_release_receipt_path(paths, path.stem, identity)
+    row: claim_state.MacClaimReleaseReceipt = {
+        "claim_id": identity.claim_id, "episode": identity.episode, "attempt": identity.attempt, "scope": path.stem,
+        "pid": record["pid"], "proc_start": record["proc_start"], "since": record["since"],
+        "remote_host": record["remote_host"],
+        "mac_boot": boot, "command_episode": command.episode, "command_attempt": command.attempt,
+    }
+    if not confirmed:
+        try:
+            if claim_state.read_json_object(receipt) != row:
+                return False
+        except StateReadError as error:
+            print(f"Mac claim receipt unreadable: {error}", flush=True)
+            return False
+    receipt.parent.mkdir(exist_ok=True)
+    sync_folder(paths.directory)
+    write_text_atomic(receipt, json.dumps(row) + "\n", new_file_mode=0o600)
+    return True
 
 
 def watch_claim(
@@ -1576,19 +1610,21 @@ def watch_claim(
             current["transfers"] = [*current.get("transfers", []), *ledger.transfers]
             ledger.transfers.clear()
             changed = True
-        if isinstance(activity, ActivityCheckFailed):
-            if changed:
-                write_json(claim.path, current)
-            print(f"Mac claim activity check failed: {activity.reason}", flush=True)
-            return True
         boot_recorded = "remote_host" in current and "mac_boot" in current
         identity = claim_state.claim_identity(current)
         fence_identity = claim_state.claim_fence_identity(current)
         fence = offload.start_fence_relative(fence_identity, paths.target, scope_key=claim.path.stem)
-        if boot_recorded and str(fence) in ended and claim_holder_ended(current):
+        if ("remote_host" in current and "mac_boot" in current and "hardware_uuid" in current["mac_boot"]
+                and claim_holder_ended(current) and record_watcher_release(
+                    paths, claim.path, current, current["mac_boot"], confirmed=str(fence) in ended)):
             remove_settled_claim(claim.path, offload.pending_start_path(paths.target, fence_identity))
             block_present = not isinstance(read_block(paths.block), NoMacBlock)
             proof = True
+        elif isinstance(activity, ActivityCheckFailed):
+            if changed:
+                write_json(claim.path, current)
+            print(f"Mac claim activity check failed: {activity.reason}", flush=True)
+            return True
         elif keep_watching_for_idle(claim.path, current, activity, config, now, changed) or boot_recorded:
             return True
     if proof:
@@ -1907,6 +1943,8 @@ def print_claim_identity(args: CliArguments, record: RunRecord) -> None:
 def take_over_kept_claim(args: CliArguments, claim: HeldClaim, kept: RemoteJobClaim,
                          *, session: SubmittingSession) -> ClaimAttempt:
     """Transfer cleanup ownership without granting permission to run."""
+    if mac_watcher_owns_release(kept):
+        return ClaimBusy(kept)
     proc_start = process_identity.process_start(args.pid)
     if not isinstance(proc_start, process_identity.Started):
         print(f"cannot claim: process {args.pid} is not running", file=sys.stderr)
@@ -1946,7 +1984,7 @@ def claim_once(args: CliArguments, paths: StatePaths, scope: ClaimScope,
         return unreadable_claim(paths.block)
     for claim in overlapping:
         record = claim.record
-        if ("remote_host" in record and record.get("cleanup_pending")
+        if ("remote_host" in record and record.get("cleanup_pending") and not mac_watcher_owns_release(record)
                 and record["pid"] == args.pid and claim_state.claim_identity(record) == identity
                 and not run_is_kept(record)
                 and (not args.leased_slots or record.get("slot", 1) in args.leased_slots)):
@@ -2084,7 +2122,8 @@ def adopt_wait_claim(args: CliArguments, paths: StatePaths, scope: ClaimScope,
             if claim.record.get("cleanup_pending") is True else scopes_overlap(claim.scope, scope)),
         (WaitClaimCheck.PID, lambda claim: claim.record["pid"] == args.from_pid),
         (WaitClaimCheck.SESSION, lambda claim: claim.record["submitting_session"] == claim_state.session_id(session)),
-        (WaitClaimCheck.REMOTE_HOST, lambda claim: "remote_host" not in claim.record or claim.record.get("cleanup_pending") is True),
+        (WaitClaimCheck.REMOTE_HOST, lambda claim: "remote_host" not in claim.record
+            or claim.record.get("cleanup_pending") is True and not mac_watcher_owns_release(claim.record)),
         (WaitClaimCheck.OWNER_START, lambda claim:
             process_identity.process_start(args.from_pid) == process_identity.Started(claim.record["proc_start"])),
         (WaitClaimCheck.WORKTREE, lambda claim: claim.record.get("cleanup_pending") is True
@@ -2267,6 +2306,8 @@ def release_exact_claims(
             except StateReadError:
                 continue
             if isinstance(record, dict) and record["pid"] == pid and claim_state.claim_identity(record) == identity:
+                if mac_watcher_owns_release(record):
+                    return ClaimReleaseRefused("the Mac claim requires watcher proof")
                 owned.append((path, record))
     transfers: list[transfer_bytes.TransferBytes] = []
     for path, record in owned:
@@ -2288,8 +2329,12 @@ def release_exact_claims(
             # The claim watcher rewrites its own fields during the settle; only a new owner refuses.
             current = read_run(path)
             if (isinstance(current, NoRun) or claim_owner(current) != claim_owner(record)
+                    or current.get("remote_host") != record.get("remote_host")
+                    or current.get("mac_boot") != record.get("mac_boot")
                     or claim_state.claim_fence_identity(current) != fence_identity):
                 return ClaimReleaseRefused("the exact claim changed during cleanup")
+            if mac_watcher_owns_release(current):
+                return ClaimReleaseRefused("the Mac claim requires watcher proof")
             transfers.extend(current.get("transfers", []))
             remove_settled_claim(path, pending)
     with nullcontext() if provider_lock_held else locked(paths.lock):
@@ -2322,8 +2367,8 @@ def free_now(
     not read, since a claim does not consult it; the claim itself still decides
     under its lock. Another repository's claim leaves the answer free. A copy
     claim gives way to a new test, so it holds the scope only for another copy
-    (`copy`). A kept claim leaves the answer free: its holder is gone, and the
-    next claim takes it over and cleans its leftovers.
+    (`copy`). A legacy claim kept for cleanup leaves the answer free for takeover.
+    A claim that requires watcher proof still holds its place.
     """
     from scripts.mac_test import eligibility
     from scripts.buildlog import repository
@@ -2362,8 +2407,8 @@ def free_now(
                 raise
             return "state"
     held = all(any(
-        scopes_overlap(claim.scope, candidate) and run_holds_work(claim.record)
-        and (copy or not copy_gives_way(claim.record)) for claim in claims
+        scopes_overlap(claim.scope, candidate) and (mac_watcher_owns_release(claim.record)
+        or run_holds_work(claim.record) and (copy or not copy_gives_way(claim.record))) for claim in claims
     ) for candidate in scopes)
     if held:
         return "busy"

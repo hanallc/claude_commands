@@ -10,6 +10,7 @@ import io
 import json
 import os
 from pathlib import Path
+import plistlib
 from contextlib import redirect_stdout
 import sys
 import subprocess
@@ -27,12 +28,85 @@ from scripts.lib import test_hang_guard
 from scripts.lib import process_start as process_identity
 
 
+def write_hardware_uuid(path: Path, value: str) -> None:
+    _ = path.write_bytes(plistlib.dumps([{"IOPlatformUUID": value}]))
+
+
+def install_hardware_fixture(root: Path, value: str) -> Path:
+    ioreg = root / "ioreg"
+    _ = ioreg.write_text("#!/bin/sh\ncat \"$HOME/hardware.xml\"\n")
+    ioreg.chmod(0o700)
+    hardware = root / "hardware.xml"
+    write_hardware_uuid(hardware, value)
+    return hardware
+
+
 class PendingDispatchTests(unittest.TestCase):
+    def test_used_mac_fence_is_revoked_before_a_late_prepare(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            identity = claim_state.ClaimIdentity("claim", "nextest", "attempt")
+            fence = root / offload.start_fence_relative(identity, "mac")
+            boot: claim_state.MacClaimBoot = {
+                "hardware_uuid": "f1c0117c-365d-4df4-be2a-04b0fafff9c7",
+                "boot_id": "b75adc32-d178-493b-b7cd-88f740989f65", "boot_at_us": 100_000_000,
+            }
+            environment = {**os.environ, "HOME": str(root)}
+
+            def shell(command: str) -> subprocess.CompletedProcess[str]:
+                return subprocess.run(["bash", "-c", command], cwd=root, env=environment,
+                    capture_output=True, text=True, check=False, timeout=5)
+
+            prepare = offload.prepare_start_fence_command(identity, "mac")
+            self.assertEqual(shell(prepare).returncode, 0)
+            _ = fence.with_suffix(".group").write_text(json.dumps({"boot": boot, "group": 42}))
+            settled = shell(offload.start_fence_command(identity, "mac", settle=True))
+            self.assertEqual(settled.returncode, 0, settled.stderr)
+            self.assertFalse(fence.with_suffix(".lock").exists())
+            self.assertEqual(shell(prepare).returncode, 75)
+            self.assertTrue(fence.with_suffix(".revoked").is_file())
+            late = shell(offload.fenced_start_command(identity, "mac", "printf 'started\\n'"))
+            self.assertEqual(late.returncode, 75, late.stderr)
+            self.assertNotIn("started", late.stdout)
+
+    def test_replacement_mac_with_later_boot_cannot_revoke_the_fence(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            identity = claim_state.ClaimIdentity("claim", "nextest", "attempt")
+            fence = offload.start_fence_relative(identity, "mac")
+            hardware_uuid = "f1c0117c-365d-4df4-be2a-04b0fafff9c7"
+            boot: claim_state.MacClaimBoot = {
+                "hardware_uuid": hardware_uuid, "boot_id": "b75adc32-d178-493b-b7cd-88f740989f65",
+                "boot_at_us": 100_000_000,
+            }
+            sysctl = root / "sysctl"
+            _ = sysctl.write_text("#!/bin/sh\ncase \"$2\" in\n"
+                + "kern.bootsessionuuid) echo da89a87b-2fc2-4f08-a3e0-34938b3383b3 ;;\n"
+                + "kern.boottime) echo '{ sec = 120, usec = 0 }' ;;\n"
+                + "*) exit 1 ;;\nesac\n")
+            sysctl.chmod(0o700)
+            hardware = install_hardware_fixture(root, "287558c9-a05b-48ab-aca7-d895bbb2cf72")
+            environment = {**os.environ, "HOME": str(root), "PATH": str(root) + ":" + os.environ["PATH"]}
+
+            def shell(command: str) -> subprocess.CompletedProcess[str]:
+                return subprocess.run(["bash", "-c", command], cwd=root, env=environment,
+                    capture_output=True, text=True, check=False, timeout=5)
+
+            self.assertEqual(shell(offload.prepare_start_fence_command(identity, "mac")).returncode, 0)
+            probe = offload.mac_claim_end_command((offload.MacClaimEndProbe(fence, boot),))
+            self.assertEqual(json.loads(shell(probe).stdout), [])
+            self.assertTrue((root / fence).with_suffix(".lock").exists())
+            write_hardware_uuid(hardware, hardware_uuid)
+            self.assertEqual(json.loads(shell(probe).stdout), [str(fence)])
+            self.assertTrue((root / fence).with_suffix(".revoked").is_file())
+
     def test_mac_start_evidence_survives_a_lost_launch_reply(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
+            hardware = "f1c0117c-365d-4df4-be2a-04b0fafff9c7"
             boot: claim_state.MacClaimBoot = {
-                "boot_id": "b75adc32-d178-493b-b7cd-88f740989f65", "boot_at_us": 100_000_000,
+                "hardware_uuid": hardware, "boot_id": "b75adc32-d178-493b-b7cd-88f740989f65",
+                "boot_at_us": 100_000_000,
             }
             identity = claim_state.ClaimIdentity("claim", "episode", "attempt")
             fence = offload.start_fence_relative(identity, "mac")
@@ -44,6 +118,7 @@ class PendingDispatchTests(unittest.TestCase):
             sysctl.chmod(0o700)
             _ = (root / "boot-id").write_text(boot["boot_id"] + "\n")
             _ = (root / "boot-time").write_text("{ sec = 100, usec = 0 } Thu Jan 1\n")
+            _ = install_hardware_fixture(root, hardware)
             ps = root / "ps"
             _ = ps.write_text("#!/bin/sh\ncat \"$HOME/groups\"\n")
             ps.chmod(0o700)
@@ -55,7 +130,8 @@ class PendingDispatchTests(unittest.TestCase):
                 return subprocess.run(["bash", "-c", command], cwd=root, env=environment,
                     capture_output=True, text=True, check=False, timeout=5)
 
-            self.assertEqual(shell(offload.prepare_start_fence_command(identity, "mac")).returncode, 0)
+            prepare = offload.prepare_start_fence_command(identity, "mac", read_mac_boot=True)
+            self.assertEqual(shell(prepare).returncode, 0)
             launch = offload.fenced_start_command(identity, "mac", "exit 0", mac_boot=boot)
             _ = shell(launch)
             probe = offload.mac_claim_end_command((offload.MacClaimEndProbe(fence, boot),))
@@ -64,12 +140,17 @@ class PendingDispatchTests(unittest.TestCase):
             self.assertEqual(json.loads(shell(probe).stdout), [str(fence)])
             self.assertEqual(json.loads(shell(probe).stdout), [str(fence)])
             self.assertNotEqual(shell(launch).returncode, 0)
+            self.assertEqual(shell(prepare).returncode, 75)
 
-            self.assertEqual(shell(offload.prepare_start_fence_command(identity, "mac")).returncode, 0)
+            reboot = claim_state.ClaimIdentity("claim", "episode", "reboot")
+            self.assertEqual(shell(offload.prepare_start_fence_command(reboot, "mac", read_mac_boot=True)).returncode, 0)
             _ = (root / "boot-id").write_text("da89a87b-2fc2-4f08-a3e0-34938b3383b3\n")
             _ = (root / "boot-time").write_text("{ sec = 120, usec = 0 } Thu Jan 1\n")
-            self.assertNotEqual(shell(launch).returncode, 0)
-            self.assertEqual(json.loads(shell(probe).stdout), [str(fence)])
+            late = offload.fenced_start_command(reboot, "mac", "printf 'started\\n'", mac_boot=boot)
+            self.assertEqual(shell(late).returncode, 75)
+            reboot_fence = offload.start_fence_relative(reboot, "mac")
+            reboot_probe = offload.mac_claim_end_command((offload.MacClaimEndProbe(reboot_fence, boot),))
+            self.assertEqual(json.loads(shell(reboot_probe).stdout), [str(reboot_fence)])
 
     def test_a_pending_claim_or_start_cannot_release_capacity_before_its_child_settles(self) -> None:
         for operation in ("claim", "start-acknowledged", "start-uncertain"):

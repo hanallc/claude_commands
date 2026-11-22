@@ -3395,7 +3395,7 @@ class AdmissionServer:
                 record["claim_id"], record["episode"], record["attempt"])
             session_id = record["submitting_session"]
             session = OwningSession(session_id) if session_id else NoOwningSession()
-            if record.get("cleanup_pending", False):
+            if record.get("cleanup_pending", False) or mac_test.mac_watcher_owns_release(record):
                 cleanup.append(placement.RetainedCleanupClaim(reference, "provider cleanup remains unresolved"))
                 executions.append((reference, execution_identity.ExecutionEvidenceUnavailable("provider cleanup remains unresolved", self.clock.now())))
                 continue

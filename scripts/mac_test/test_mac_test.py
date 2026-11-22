@@ -12,6 +12,7 @@ import json
 import fcntl
 import socket
 import os
+import plistlib
 import runpy
 import select
 import subprocess
@@ -3516,6 +3517,7 @@ class ClaimWatchTests(NotificationGuardedTestCase):
         from scripts.mac_test import offload
 
         boot: claim_state.MacClaimBoot = {
+            "hardware_uuid": "f1c0117c-365d-4df4-be2a-04b0fafff9c7",
             "boot_id": "b75adc32-d178-493b-b7cd-88f740989f65", "boot_at_us": 100_000_000,
         }
         record = self.write_claim()
@@ -3528,7 +3530,8 @@ class ClaimWatchTests(NotificationGuardedTestCase):
         with self.assertRaisesRegex(mac_test.StateReadError, "rebooted"):
             offload.record_mac_claim_boot(controller, identity, "mac", "claim-mac",
                                           {**boot, "boot_at_us": 200_000_000})
-        for damaged in ({**boot, "boot_id": "invalid"}, {**boot, "boot_at_us": True}):
+        for damaged in ({**boot, "boot_id": "invalid"}, {**boot, "boot_at_us": True},
+                        {**boot, "hardware_uuid": "invalid"}):
             with self.subTest(boot=damaged):
                 _ = self.write_claim(mac_boot=damaged)
                 with self.assertRaises(mac_test.StateReadError):
@@ -3537,13 +3540,15 @@ class ClaimWatchTests(NotificationGuardedTestCase):
     def test_mac_claim_releases_only_for_its_own_confirmed_end(self) -> None:
         from scripts.mac_test import offload
 
-        identity = claim_state.ClaimIdentity("fixture-claim", "fixture-episode", "fixture-attempt")
-        pending = offload.pending_start_path("mac", identity)
-        pending.parent.mkdir(parents=True)
-        key = str(offload.start_fence_relative(identity, "mac"))
         for ended, holder_dead in ((True, True), (False, True), (True, False)):
             with self.subTest(ended=ended, holder_dead=holder_dead):
-                record = self.write_claim(mac_boot={
+                attempt = f"attempt-{ended}-{holder_dead}"
+                identity = claim_state.ClaimIdentity("fixture-claim", "fixture-episode", attempt)
+                pending = offload.pending_start_path("mac", identity)
+                pending.parent.mkdir(parents=True, exist_ok=True)
+                key = str(offload.start_fence_relative(identity, "mac"))
+                record = self.write_claim(attempt=attempt, mac_boot={
+                    "hardware_uuid": "f1c0117c-365d-4df4-be2a-04b0fafff9c7",
                     "boot_id": "b75adc32-d178-493b-b7cd-88f740989f65", "boot_at_us": 100_000_000,
                 }, idle_since=mac_test.timestamp(self.now - timedelta(hours=1)))
                 pending.touch()
@@ -3582,8 +3587,10 @@ class ClaimWatchTests(NotificationGuardedTestCase):
         controller = offload.ProcessController()
         controller.claim_identity = claim
         controller.placement = request.placement
+        hardware = "f1c0117c-365d-4df4-be2a-04b0fafff9c7"
         boot: claim_state.MacClaimBoot = {
-            "boot_id": "b75adc32-d178-493b-b7cd-88f740989f65", "boot_at_us": 100_000_000,
+            "hardware_uuid": hardware, "boot_id": "b75adc32-d178-493b-b7cd-88f740989f65",
+            "boot_at_us": 100_000_000,
         }
         pending = offload.pending_start_path("mac", command)
         fence = self.root / offload.start_fence_relative(command, "mac")
@@ -3594,9 +3601,16 @@ class ClaimWatchTests(NotificationGuardedTestCase):
             + "kern.boottime) echo '{ sec = 100, usec = 0 }' ;;\n"
             + "*) exit 1 ;;\nesac\n")
         sysctl.chmod(0o700)
+        ioreg = self.root / "ioreg"
+        _ = ioreg.write_text("#!/bin/sh\ncat \"$HOME/hardware.xml\"\n")
+        ioreg.chmod(0o700)
+        _ = (self.root / "hardware.xml").write_bytes(plistlib.dumps([{"IOPlatformUUID": hardware}]))
+        search_path = {"PATH": str(self.root) + os.pathsep + os.environ["PATH"]}
 
         def prepare(*_arguments: object) -> offload.ProbeSnapshot:
-            result = self.run_private_shell(offload.prepare_start_fence_command(command, "mac"), self.root)
+            with mock.patch.dict(os.environ, search_path):
+                result = self.run_private_shell(
+                    offload.prepare_start_fence_command(command, "mac", read_mac_boot=True), self.root)
             self.assertEqual(result.returncode, 0, result.stderr)
             pending.touch()
             offload.record_mac_claim_boot(controller, claim, "mac", "claim-mac", boot)
@@ -3624,12 +3638,13 @@ class ClaimWatchTests(NotificationGuardedTestCase):
         stream.assert_not_called()
         self.assertFalse(fence.with_suffix(".group").exists())
         self.assertTrue(self.paths.run.exists())
+        self.assertIs(self.read_claim().get("mac_watcher_release_pending"), True)
 
         def private_ssh(arguments: list[str], **_options: object) -> subprocess.CompletedProcess[str]:
             self.assertEqual((arguments[0], arguments[-2]), ("ssh", "claim-mac"))
             return self.run_private_shell(arguments[-1], self.root)
 
-        with (mock.patch.dict(os.environ, {"PATH": str(self.root) + os.pathsep + os.environ["PATH"]}),
+        with (mock.patch.dict(os.environ, search_path),
               mock.patch.object(subprocess, "run", side_effect=private_ssh),
               mock.patch.object(process_identity, "process_start", return_value=process_identity.Gone()),
               mock.patch.object(mac_test, "mac_activity_script", return_value="printf 'active=1\\nwork=1\\nrc=0\\n'\n"),
@@ -3641,7 +3656,7 @@ class ClaimWatchTests(NotificationGuardedTestCase):
         self.assertTrue(fence.with_suffix(".revoked").is_file())
         send.assert_called_once()
         self.assertEqual(seen[0].get("mac_command_fence"), {"episode": command.episode, "attempt": command.attempt})
-        with mock.patch.dict(os.environ, {"PATH": str(self.root) + os.pathsep + os.environ["PATH"]}):
+        with mock.patch.dict(os.environ, search_path):
             remote = offload.start_fence_relative(command, "mac")
             probe = offload.mac_claim_end_command((offload.MacClaimEndProbe(remote, boot),))
             self.assertEqual(json.loads(self.run_private_shell(probe, self.root).stdout), [str(remote)])
@@ -3650,6 +3665,56 @@ class ClaimWatchTests(NotificationGuardedTestCase):
         late = self.run_private_shell(offload.fenced_start_command(command, "mac", "printf 'started\\n'"), self.root)
         self.assertEqual(late.returncode, 75, late.stderr)
         self.assertNotIn("started", late.stdout)
+
+    def test_watcher_owned_claim_requires_proof_and_a_durable_release_receipt(self) -> None:
+        from scripts.mac_test import offload
+
+        boot = {"hardware_uuid": "f1c0117c-365d-4df4-be2a-04b0fafff9c7",
+                "boot_id": "b75adc32-d178-493b-b7cd-88f740989f65", "boot_at_us": 100_000_000}
+        identity = claim_state.ClaimIdentity("fixture-claim", "fixture-episode", "fixture-attempt")
+        command = claim_state.ClaimIdentity(identity.claim_id, "nextest", "command-attempt")
+        _ = self.write_claim(mac_boot=boot, mac_command_fence={"episode": command.episode, "attempt": command.attempt})
+        with mock.patch.object(process_identity, "process_start", return_value=process_identity.Gone()):
+            self.assertIsInstance(mac_test.release_exact_claims(self.paths, os.getpid(), identity, ""),
+                                  mac_test.ClaimReleaseRefused)
+        self.assertTrue(self.paths.run.is_file())
+        _ = self.write_claim(mac_boot=boot, mac_command_fence={"episode": command.episode, "attempt": command.attempt},
+                             mac_watcher_release_pending=True)
+        self.assertIsInstance(mac_test.release_exact_claims(self.paths, os.getpid(), identity, ""),
+                              mac_test.ClaimReleaseRefused)
+
+        receipt = claim_state.mac_release_receipt_path(self.paths, "run", identity)
+        probe = mac_test.MacClaimActivity(mac_test.MacIdle(),
+            frozenset({str(offload.start_fence_relative(command, "mac"))}))
+        config = mac_test.read_config()
+        remove = mac_test.remove_settled_claim
+
+        def check_receipt_before_removal(path: Path, pending: Path) -> None:
+            self.assertTrue(path.is_file())
+            saved = claim_state.read_json_object(receipt)
+            assert saved is not None
+            self.assertEqual(saved["mac_boot"], boot)
+            self.assertEqual(saved["command_attempt"], command.attempt)
+            self.assertEqual(saved["claim_id"], identity.claim_id)
+            remove(path, pending)
+
+        with (mock.patch.object(process_identity, "process_start", return_value=process_identity.Gone()),
+              mock.patch.object(mac_test, "check_mac_activity", return_value=probe),
+              mock.patch.object(mac_test, "send_message", return_value=True)):
+            with mock.patch.object(mac_test, "write_text_atomic", side_effect=OSError("receipt sync failed")):
+                with self.assertRaisesRegex(OSError, "receipt sync failed"):
+                    _ = mac_test.claim_watch_pass(self.paths, config)
+            self.assertTrue(self.paths.run.is_file())
+            with mock.patch.object(mac_test, "remove_settled_claim", side_effect=OSError("claim removal interrupted")):
+                with self.assertRaisesRegex(OSError, "claim removal interrupted"):
+                    _ = mac_test.claim_watch_pass(self.paths, config)
+            self.assertTrue(receipt.is_file())
+            self.assertTrue(self.paths.run.is_file())
+            with (mock.patch.object(mac_test, "check_mac_activity", return_value=mac_test.ActivityCheckFailed("offline")),
+                  mock.patch.object(mac_test, "remove_settled_claim", side_effect=check_receipt_before_removal)):
+                self.assertFalse(mac_test.claim_watch_pass(self.paths, config))
+        self.assertTrue(receipt.is_file())
+        self.assertFalse(self.paths.run.exists())
 
     def test_pass_does_not_modify_claim_changed_during_activity_check(self) -> None:
         for field, value in (("pid", 1234), ("proc_start", "new-start"), ("since", "2026-10-13T12:01:00+00:00")):
