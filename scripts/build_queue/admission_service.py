@@ -2963,7 +2963,7 @@ class AdmissionServer:
         running: list[records.RunningStep] = []
         explained: list[records.ExplainedRunningStep] = []
         for step, entry in zip(reading.view.running, reading.explanation.running, strict=True):
-            named = candidates.get(next(reservations)["reservation_id"], ()) if gate.running_has_reservation(step) else ()
+            named = candidates.get(next(reservations).get("reservation_id", ""), ()) if gate.running_has_reservation(step) else ()
             running.append(replace(step, placement_candidates=named) if named else step)
             explained.append(replace(entry, step=replace(entry.step, placement_candidates=named)) if named else entry)
         return replace(reading, view=replace(reading.view, running=tuple(running)),
