@@ -61,6 +61,8 @@ An unproved Codex prompt returns uncertain when this bound passes or the process
 A recorded prompt remains submitted after a process exit.
 Claude can record the prompt later.
 A failed delivery command returns an error.
+The launcher copies captured worker output to stderr on a nonzero exit.
+Assignment recovery prints the reason if pending pane cleanup prevents submission.
 The transcript prevents replay.
 A matching final transcript reply proves completion.
 A matching dispatch prompt also permits completion from the hook's own DONE reply before the final transcript record appears.
@@ -101,21 +103,25 @@ With an active pass, changed content returns busy and names that pass without pr
 This refusal applies when the launcher arguments change.
 The recorder repeats the content check under its lock before it changes the pass.
 The intentional second review stage keeps its existing pass across its separate prompt path.
-An identical rerun of a completed dispatch sends one completion message through the hook's notice code.
+An identical rerun of a completed dispatch uses the saved pass notice.
 It saves the reply without typing another prompt.
 This rule also applies to a completed managed Astra review.
 The saved completion includes the reason and pane for a close anomaly.
-A successful completed rerun sets its status file to `done` after it sends the notice.
-Native duplicate hook events still send no second message.
+A completed rerun sets its status file to `done` before it checks the notice.
+A replay of a settled hook event sends no second message.
+This includes a legacy status replay that arrives after a different status.
 Each completion notice ends its first line with `; pass <dispatch instance id>`.
-An explicit rerun repeats the saved completion text with the same pass id.
+An explicit rerun can retry a pending notice with its original delivery key.
+An explicit rerun leaves settled notices alone.
 Each notice uses the worker's native identity and name, including a notice from the director's rerun.
 The saved completion supplies the sender identity for a retired managed Astra reviewer.
 The sender identity remains the same after a session change and retirement.
-Turn and run events send no notice when the outcome, reply, and run ids match the last notice.
-A changed waiting outcome, reply, or run ID sends one notice.
-The completion notice records delivery separately from the reply text.
-After delivery, recovery can replace the saved reply without sending another completion notice.
+Each status transition gets a sequence ID and a delivery key.
+A repeated native turn ID uses its existing event.
+Without a native turn ID, an unchanged status uses the current event.
+A transition back to an earlier status gets a new event.
+The pass keeps notices separately from the saved reply.
+Recovery can replace the saved reply after the notice settles.
 Waiting notices add `; runs <run ids>` to the first line.
 The run ids include received results that still await a worker reply.
 An empty turn reply writes no reply file and adds no `; reply <path>` text.
@@ -208,6 +214,9 @@ If the reply ends with a different DONE ID, the no DONE notice names both IDs.
 The pass stays active and the pane stays open until the reply contains the matching DONE.
 A saved stage ID controls pane closure and reuse.
 The reply on disk must match the completed receipt.
+If the report path resolves to the reply path, the hook keeps the raw reply there.
+If the caller requests a distinct report path, the hook writes the report there.
+The report includes the heading when the assignment has a summary.
 The completion hook saves the reply and records the pending notice for the exact pass.
 Live detached work delays normal and late DONE notices.
 Restart restores a selected live worker before it removes the worker from the restart record.
@@ -231,8 +240,25 @@ Completion removes the entry after it saves the final result.
 Restore reports incomplete recovery if pane closure fails.
 Restore reports the worker name and reason when completion recovery keeps its pane.
 The next restore retries closure without sending the completion notice again.
-The hook records closure diagnostic delivery separately from the diagnostic text.
-A later recovery retries an undelivered diagnostic with the same delivery key.
+Each pass keeps an append-only notice record in its run directory.
+The record holds each event ID, notice, route, and settlement.
+The record retains event IDs so a retry can recognize a duplicate.
+The first notice for a pass with a legacy stamp imports the stamp as one settled event.
+The record keeps the stamp for that status even if a different status arrives first.
+The progress recorder keeps the stopped pass receipt for late reply recovery.
+The hook saves pending diagnostics in the completion checkpoint before it writes the notice record.
+The hook sets `recording_done` after all pending diagnostics are durable in the notice record.
+If the notice write fails, the next hook publishes the saved diagnostics.
+A new assignment can use an open, stopped, or closed idle worker while the old notice remains pending.
+The new assignment still requires valid completion evidence and safe pane reuse.
+A new assignment can append notices without reading the notice record or taking a message lock.
+A later hook or reap retries the pending notices with their original delivery keys.
+The stopped pass can retry its diagnostics while it waits for a matching DONE.
+The retry checks for a director receipt with the same delivery key.
+A matching receipt settles the notice without a send.
+A receipt lookup failure leaves the notice pending.
+A repeat-guard hold settles the notice after the guard queues a notice for the owner.
+Peer delivery preserves the repeat-guard hold reason. Other holds leave the notice pending.
 The hook ends `scratch.worker_task(row.id)` before it closes the pane.
 This removes the worker's `scratch.py new --worker` folders and keeps other workers' folders.
 A failed cleanup adds a diagnostic to the director notice and permits pane closure.

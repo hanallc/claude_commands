@@ -2319,10 +2319,12 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
 
     def test_repeat_guard_holds_the_third_delivery_and_logs_each_held_copy(self) -> None:
         with mock.patch.object(repeat_guard, "check", wraps=repeat_guard.check) as guard:
-            outcomes = [self.send("--text", "Morty stopped at 02:00 EDT, pid 100").outcome
-                        for _ in range(5)]
+            results = [self.send("--text", "Morty stopped at 02:00 EDT, pid 100") for _ in range(5)]
+        outcomes = [result.outcome for result in results]
         self.assertEqual([cast(repeat_guard.Attempt, call.args[1]).receiver for call in guard.call_args_list], ["staff:bogus"] * 5)
         self.assertEqual(outcomes, ["sent", "sent", "held", "held", "held"])
+        for result in results[2:]:
+            self.assertIsInstance(result, send.RepeatGuardHeld)
         self.assertEqual(len(self.relayed), 2)
         self.assertEqual([row["outcome"] for row in self.log()], outcomes)
         self.assertEqual(self.send("--text", "Morty recovered").outcome, "sent")
@@ -7264,6 +7266,18 @@ runpy.run_path(sys.argv[0], run_name="__main__")
                 result = send.remote(message, "natedev", options)
             self.assertEqual(result, send.Result(outcome, "on natedev: detail\nSENT: quoted payload",
                                                  send.NO_FAILED_PUSH, "session:fixture"))
+
+    def test_peer_preserves_the_repeat_guard_hold_reason(self) -> None:
+        detail = "repeat guard: copy 5 held; owner notice queued"
+        with (mock.patch.object(send, "send", return_value=send.RepeatGuardHeld("held", detail)),
+              redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors):
+            code = send.main(["--to", "session:fixture", "--from", "worker", "--text", "Done.", "--report-recipient"])
+        options = send.parse(["--to", "session:fixture", "--from", "worker", "--text", "Done.", "--machine", "natedev"])
+        message = send.Message("session:fixture", "worker", "", "Done.", None)
+        with mock.patch.object(send, "run", return_value=(code, output.getvalue(), errors.getvalue())):
+            result = send.remote(message, "natedev", options)
+        self.assertIsInstance(result, send.RepeatGuardHeld)
+        self.assertEqual(result.detail, f"on natedev: {detail}")
 
     def test_remote_requires_a_matching_exit_and_preserves_failure_metadata(self) -> None:
         options = send.parse(self.user_arguments("--machine", "natedev"))
