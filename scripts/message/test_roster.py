@@ -9,6 +9,7 @@ from scripts.herdr import herdr_types
 from scripts.lib import names
 from scripts.lib.test_names import fixture_names
 from scripts.agents.test_support import write_machine_config
+from scripts.lint.memory_test_support import config_environment
 
 import io
 import json
@@ -154,6 +155,7 @@ class RosterTests(unittest.TestCase):
         transport_config.mkdir()
         write_text_atomic(transport_config / "direct.conf", "# Worker settings.\n")
         write_machine_config(transport_config)
+        _ = config_environment(transport_config)
         config = self.root / "showrunners.json"
         _ = config.write_text(json.dumps({
             "threshold_percent": 2,
