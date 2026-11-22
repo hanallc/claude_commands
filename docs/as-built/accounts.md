@@ -587,12 +587,11 @@ After the weekly reset, a low reading in the new window can show an alert again.
 If a reading has no reset time, Clear keeps the last reset time in the account's clear record.
 The server keeps the clear records in `console/.accounts-quota-cleared.json` under the review root.
 If the file is malformed, the table shows the problem, the sidebar hides the icon and Clear refuses to write.
-The Accounts table has one row per account.
-It shows the weekly quota, reading status, reset, and credits.
-The roles column lists the roles that select the account as their default.
-It shows the role names in role order, with commas between them.
-The list stays on one line and ends with an ellipsis if it is too long.
-The tooltip shows the full list.
+The Accounts table shows the account, weekly quota, hourly rate, run-out time, role, next move, reset, and credits.
+Each role on an account has a row with its color swatch.
+When rows for one account are next to each other, the first row shows the account details.
+When sorting separates those rows, the account details appear at the start of each group.
+An account without a role has an empty role cell.
 The page and the Claude expiry push use `quota_alert.weekly_forecast` with the same usage history.
 The page starts its forecast from the displayed weekly reading.
 It excludes history before the current weekly window or the last refill.
@@ -602,9 +601,16 @@ If the quota lasts until the reset, the run-out cell shows a dash with that expl
 The page shows forecast times in the user's time zone.
 
 The Roles table has one row per role.
-It lists each account under its role and places selected accounts first.
-Each account keeps its own next move and counts.
-The total row stays last.
+It shows the selected account for each role.
+Each role has a color swatch.
+Each count column shows the total for the role across all accounts.
+The count tooltip lists counts by account when any observed sessions run outside the selected account.
+The tooltip also lists accounts outside the selected account when their counts are unknown.
+If the role has no selected account, the tooltip lists the count for each observed account.
+If a role has no selected account, the account cell shows muted `no account` text.
+The next column shows the next move of the selected account as text.
+Only the Accounts table has the control that changes the next move.
+The total row stays last, including when the account list is empty.
 
 The Models table groups session counts by model ID and effort.
 
@@ -613,9 +619,9 @@ The Accounts table starts in account order. The Roles table starts in role order
 The quota, rate, run-out time, and reset sort from the smallest or earliest value.
 Credits sort from the largest balance. An unlimited balance comes first.
 Enabled accounts come first when you sort by the credits setting.
-The roles column sorts by the full list without regard to letter case.
-Accounts without selected roles sort last in both directions.
-The next column sorts by target account.
+The role column sorts by role name without regard to letter case.
+The next column sorts by its text without regard to letter case.
+`auto`, `none` and `unavailable` sort as words. Rows with no next move stay last.
 Role counts sort by the sum for the role, largest first.
 Missing values stay last in both directions.
 Select the active header again to reverse the order.
@@ -629,7 +635,7 @@ The shipped value of `role.producer` is `pink`.
 `staff_role_color` maps a staff row through those keys and `account_color`.
 Unknown or invalid colors use the normal text color.
 The value accepts a color name or a six-digit hex color.
-A board span with a valid configured color carries its key as `color_key`; the role check mark is a separate span.
+A board span with a valid configured color carries its key as `color_key`.
 Configured accounts and role groups have a color swatch on the console Accounts page.
 The swatch opens a color chooser with Try, Save, and Cancel.
 Try changes every label and swatch of that key locally without a request.
@@ -650,11 +656,11 @@ A peer commit with the saved value and no order still needs a commit that record
 A host added later whose name matches a model ID suffix makes that model's color key a host override.
 The page pauses refresh while the chooser is open.
 A board line of a selected Claude group carries its account and group.
-The Roles table shows each next move beside its account.
-Sorting moves the whole role row with its next moves.
+The Accounts table shows each next move beside its role.
+Sorting keeps each next move with its role.
 A selected Claude group shows its first target, or `none`, and an arrow button opens its move menu.
 A selected Codex workers line shows its first target, or `auto`, without a button.
-Other assignments show a minus icon. The total cell stays empty.
+Other assignments show a minus icon.
 `StatusReading.first_next_moves` distinguishes first targets from an unavailable read with its reason.
 One queue read supplies the first targets for the Accounts page and the upcoming list for the text and JSON status output.
 Off the role-map host, first targets are unavailable.
