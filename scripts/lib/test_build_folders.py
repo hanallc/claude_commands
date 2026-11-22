@@ -344,17 +344,17 @@ class FolderFormTests(unittest.TestCase):
                 self.assertTrue(reader.pass_fds)
             self.assertFalse(build_slots.remove_copy(record))
             envrc = copy.path / ".envrc"
-            self.assertEqual(build_slots.numbered_copy_envrc(envrc, trusted_source=lambda source: source == self.root),
-                             build_slots.NumberedCopyEnvrc.TRUSTED)
-            self.assertEqual(build_slots.numbered_copy_envrc(envrc, trusted_source=lambda _: False),
-                             build_slots.NumberedCopyEnvrc.NEEDS_APPROVAL)
+            self.assertEqual(folders.numbered_copy_envrc(envrc, trusted_source=lambda source: source == self.root),
+                             folders.NumberedCopyEnvrc.TRUSTED)
+            self.assertEqual(folders.numbered_copy_envrc(envrc, trusted_source=lambda _: False),
+                             folders.NumberedCopyEnvrc.NEEDS_APPROVAL)
             _ = envrc.write_text("export FIXTURE=changed\n")
-            self.assertEqual(build_slots.numbered_copy_envrc(envrc, trusted_source=lambda _: True),
-                             build_slots.NumberedCopyEnvrc.NEEDS_APPROVAL)
+            self.assertEqual(folders.numbered_copy_envrc(envrc, trusted_source=lambda _: True),
+                             folders.NumberedCopyEnvrc.NEEDS_APPROVAL)
             envrc.unlink()
             envrc.symlink_to(self.root / ".envrc")
-            self.assertEqual(build_slots.numbered_copy_envrc(envrc, trusted_source=lambda _: True),
-                             build_slots.NumberedCopyEnvrc.NEEDS_APPROVAL)
+            self.assertEqual(folders.numbered_copy_envrc(envrc, trusted_source=lambda _: True),
+                             folders.NumberedCopyEnvrc.NEEDS_APPROVAL)
         _ = copy.path.rename(copy.path.with_name("old"))
         copy.path.mkdir()
         self.assertIsInstance(folders.numbered_copy_record(copy.path), folders.UnreadableNumberedCopySource)

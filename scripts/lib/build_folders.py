@@ -20,7 +20,7 @@ import shutil
 import signal
 import stat
 import subprocess
-from enum import Enum
+from enum import Enum, auto
 from pathlib import Path
 import sys
 import tempfile
@@ -942,6 +942,64 @@ def numbered_copy_record(path: Path) -> NumberedCopyRecord:
         return UnreadableNumberedCopySource(path, str(error))
     except (OSError, ValueError, RuntimeError) as error:
         return UnreadableNumberedCopySource(path, str(error))
+
+
+class NumberedCopyEnvrc(Enum):
+    """The numbered copy requires byte proof for its envrc."""
+
+    OUTSIDE_COPY = auto()
+    TRUSTED = auto()
+    NEEDS_APPROVAL = auto()
+
+
+def numbered_copy_envrc(envrc: Path, *, trusted_source: Callable[[Path], bool]) -> NumberedCopyEnvrc:
+    """Compare an envrc with the recorded commit in a trusted source checkout."""
+    try:
+        root = build_root()
+        candidate = Path(os.path.abspath(envrc))
+        physical_root = root.resolve()
+        for directory, base in ((candidate.parent, root.absolute()),
+                                (candidate.parent.resolve(), physical_root)):
+            if not directory.is_relative_to(base):
+                continue
+            parts = directory.relative_to(base).parts
+            if len(parts) >= 3 and parts[1] not in ("main", "ci") and re.fullmatch(r"[0-9]+", parts[2]):
+                parent = root.joinpath(*parts[:3])
+                break
+        else:
+            return NumberedCopyEnvrc.OUTSIDE_COPY
+        exact = physical_root / parent.relative_to(root)
+        if (candidate.name != ".envrc" or candidate.parent.resolve() != exact
+                or len(parts) != 3):
+            return NumberedCopyEnvrc.NEEDS_APPROVAL
+        record = numbered_copy_record(parent)
+        if not isinstance(record, NumberedCopySource) or not trusted_source(record.source):
+            return NumberedCopyEnvrc.NEEDS_APPROVAL
+        descriptor = os.open(candidate, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(descriptor, "rb") as stream:
+            identity = os.fstat(stream.fileno())
+            if not stat.S_ISREG(identity.st_mode):
+                return NumberedCopyEnvrc.NEEDS_APPROVAL
+            command = ["git", "--git-dir", str(record.common_directory)]
+            environment = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+            timeout = repository_git_timeout()
+            entry = subprocess.run([*command, "ls-tree", record.commit, "--", ".envrc"],
+                cwd=record.source, env=environment, capture_output=True, check=True, timeout=timeout)
+            if not entry.stdout.startswith((b"100644 blob ", b"100755 blob ")):
+                return NumberedCopyEnvrc.NEEDS_APPROVAL
+            expected = subprocess.run(
+                [*command, "cat-file", "blob", f"{record.commit}:.envrc"],
+                cwd=record.source, env=environment, capture_output=True, check=True, timeout=timeout)
+            if stream.read(len(expected.stdout) + 1) != expected.stdout:
+                return NumberedCopyEnvrc.NEEDS_APPROVAL
+            current = candidate.lstat()
+            if (not os.path.samestat(identity, current) or identity.st_ctime_ns != current.st_ctime_ns
+                    or identity.st_mtime_ns != current.st_mtime_ns
+                    or record != numbered_copy_record(parent)):
+                return NumberedCopyEnvrc.NEEDS_APPROVAL
+        return NumberedCopyEnvrc.TRUSTED
+    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError):
+        return NumberedCopyEnvrc.NEEDS_APPROVAL
 
 
 def _copy_creation_fields(path: Path, info: os.stat_result, source: Path, fields: dict[str, object]) -> None:
