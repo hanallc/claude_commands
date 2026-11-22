@@ -2011,6 +2011,8 @@ A `sweep_floor_gib` below `free_floor_gib` stops the take.
 The take works only while free space is below `sweep_floor_gib`, and takes only the shortfall, oldest first.
 It removes only known Cargo output, through `removal_guard` and a private staging folder.
 `mac-floor-take <repository>` names the repository of the run that just ended. The take removes a whole `target` folder only when it belongs to another repository and holds only known Cargo output. From other targets it removes only old Cargo units.
+`--floor-only` names no repository. When exactly one repository holds a claim, the take uses that repository. Otherwise it can remove any whole `target` folder that holds only known Cargo output.
+In both commands, the take skips each target that a claim or a live process holds.
 An error prints `Mac floor take stopped.` with the reason and exits 1.
 Off macOS, `--host mac` accepts only `--dry-run`.
 The selection rules, the recovery rule and the two named costs are in [build-targets.md](build-targets.md).
