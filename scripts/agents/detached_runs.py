@@ -260,8 +260,11 @@ def _write_record(path: Path, record: RunRecord) -> RunRecord:
         if not _is_run_record(fields):
             raise SystemExit(f"detached_runs: {path} update is not a run record")
         write_text_atomic(path, json.dumps(fields, indent=2, sort_keys=True))
-        if fields["status"] == "finished" and fields.get("stop_pass_requested"):
-            path.with_suffix(PENDING_STOP_SUFFIX).unlink(missing_ok=True)
+        if fields["status"] == "finished":
+            if fields.get("stop_pass_requested"):
+                path.with_suffix(PENDING_STOP_SUFFIX).unlink(missing_ok=True)
+            if _has_saved_cgroup(current):
+                path.with_suffix(process_stop.RUN_SLICE_RECORD_SUFFIX).unlink(missing_ok=True)
         return fields
 
 
@@ -951,7 +954,7 @@ def _complete_worker_dispatch(record: RunRecord) -> CompletionReplay:
 # Keep the record lock at its path until the record is gone.
 _RUN_FILES = ("{}.log", "{}.completion.lock", ".{}.delivery.lock", "{}.stop-staged",
               "{}" + CONFIRMED_STOP_SUFFIX, "{}" + PENDING_STOP_SUFFIX,
-              "{}.json", "{}.record.lock", "{}.scope-stop.lock")
+              "{}" + process_stop.RUN_SLICE_RECORD_SUFFIX, "{}.json", "{}.record.lock", "{}.scope-stop.lock")
 
 
 def prune_finished(runs: Path) -> list[str]:
@@ -1029,6 +1032,16 @@ def _run_record_paths(runs: Path) -> list[Path]:
             return sorted(runs / entry.name for entry in entries if entry.name.endswith(".json"))
     except FileNotFoundError:
         return []
+
+
+def _indexed_run_paths(runs: Path) -> set[Path]:
+    """Find records for runs that can stay active after the supervisor exits."""
+    suffixes = (PENDING_STOP_SUFFIX, process_stop.RUN_SLICE_RECORD_SUFFIX)
+    try:
+        with os.scandir(runs) as entries:
+            return {Path(entry.path).with_suffix(".json") for entry in entries if entry.name.endswith(suffixes)}
+    except FileNotFoundError:
+        return set()
 
 
 def live_twin(runs: Path, worker: str, command: list[str], tree_key: str) -> RunRecord | None:
@@ -1202,7 +1215,10 @@ def live_run_evidence_in_folders(folders: Mapping[Path, frozenset[staff.StaffId]
     for folder, identities in folders.items():
         directory = folder / DETACHED_RUNS_DIR
         try:
-            paths = set(_run_record_paths(directory)) | named.get(folder, set())
+            if isinstance(supervisors, detached_run_process.ProcessTableUnavailable):
+                paths = set(_run_record_paths(directory))
+            else:
+                paths = named.get(folder, set()) | _indexed_run_paths(directory)
             evidence = _read_live_runs(
                 sorted(paths), lambda raw: isinstance(identity := raw.get("staff_id"), str) and identity in identities,
                 detached_run_process.supervises if isinstance(supervisors, detached_run_process.ProcessTableUnavailable)

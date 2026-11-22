@@ -1485,6 +1485,29 @@ sys.exit(1)
         _ = events.write_text("populated 1\n")
         return path, cgroups, events
 
+    def test_live_run_index_keeps_a_slice_after_its_supervisor_exits(self) -> None:
+        path, cgroups, events = self.record_populated_slice()
+        saved_slice = worker_lifecycle.read_json_object(path)["command_slice"]
+        assert process_stop.is_slice_identity(saved_slice)
+        scope = process_stop.ScopeUnit(saved_slice["unit"], "fixture.scope")
+        identities = {self.session: frozenset({self.worker_id})}
+        index = path.with_suffix(process_stop.RUN_SLICE_RECORD_SUFFIX)
+
+        with (patch.object(process_stop, "command_slice", return_value=saved_slice),
+              patch.object(process_stop, "CGROUP_ROOT", cgroups),
+              patch.object(detached_run_process, "supervisor_records", return_value={}),
+              patch.object(detached_run_process, "supervises", return_value=False)):
+            process_stop.publish_run_slice(path, scope)
+            self.assertTrue(index.is_file())
+            run, = detached_runs.live_runs_in_folders(identities)
+            self.assertEqual(run["run_id"], path.stem)
+            self.assertEqual(run.get("command_slice"), saved_slice)
+
+            _ = events.write_text("populated 0\n")
+            self.assertEqual(detached_runs.reap_orphans(str(self.session)), [path.stem])
+            self.assertFalse(index.exists())
+            self.assertEqual(detached_runs.live_runs_in_folders(identities), [])
+
     @unittest.skipUnless(process_stop.supported(), "pidfd stop needs Linux")
     def test_empty_stop_reason_refuses_before_configuration_or_lock(self) -> None:
         path, cgroups, _ = self.record_populated_slice()

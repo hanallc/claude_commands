@@ -2546,6 +2546,14 @@ def split_tool_groups(builds: Path, outside: set[Path], excluded: set[Path], cha
     return result
 
 
+def detached_tool_memory(memory: object, builds: Path) -> bool:
+    """Use the tool breakdown for unowned memory in detached scopes."""
+    return (isinstance(memory, admission_records.UnownedSliceMemory)
+            and not memory.diagnostic and bool(memory.cgroup)
+            and isinstance(admission_records.recorded_service_state(memory), NotServiceSlice)
+            and Path(memory.cgroup).is_relative_to(builds / "builds-detached.slice"))
+
+
 def build_tool_ram(running: Sequence[admission_records.ExplainedRunningStep], queued_use: int,
                    waiters: Sequence[admission_records.RankedWaiter] = ()) -> BuildToolRam:
     """Split the existing tool budget after the queue and service charges."""
@@ -2565,7 +2573,8 @@ def build_tool_ram(running: Sequence[admission_records.ExplainedRunningStep], qu
                 charged.update(item.pid for item in source.processes)
         if isinstance(memory, admission_records.CompilerServiceMemory):
             path = builds / "sccache.service"
-        elif isinstance(memory, admission_records.UnownedSliceMemory) and memory.cgroup and not memory.diagnostic:
+        elif (isinstance(memory, admission_records.UnownedSliceMemory) and memory.cgroup
+              and not memory.diagnostic and not detached_tool_memory(memory, builds)):
             path = Path(memory.cgroup)
         else:
             continue
@@ -2761,8 +2770,11 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
                     break
         return call_notes(step.verify, step.step, call)
 
+    builds = gate.builds_slice_cgroup()
     leftovers: list[LeftoverScope] = []
     for step, memory, activity in queue_view.leftover_processes(parsed.view.running):
+        if detached_tool_memory(memory, builds):
+            continue
         identity = labels.get(activity.session_id)
         label = public_owner_name(identity.session, activity.session_id) if identity is not None else ""
         owner = label or recorded_caller_name(activity.session_id, activity.session_name, activity.folder)
@@ -2857,8 +2869,9 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
     for entry in explanation.running:
         step = entry.step
         memory = step.measured
-        if not isinstance(memory, (admission_records.RemoteMemoryUnavailable, admission_records.UnownedSliceMemory,
-                                   admission_records.CompilerServiceMemory)):
+        if (not isinstance(memory, (admission_records.RemoteMemoryUnavailable, admission_records.UnownedSliceMemory,
+                                    admission_records.CompilerServiceMemory))
+                or detached_tool_memory(memory, builds)):
             continue
         owner = step_page_owner(step, labels, ci_runners, members, machine, ci_label=recorded_ci_label(step, ci_runners))
         identity = owner.labels

@@ -715,7 +715,11 @@ The slice name uses the run ID without dashes.
 Each run slice is under `builds-detached.slice`, which is under `builds.slice`.
 The limits and anonymous memory totals of `builds.slice` include the nested scopes.
 The queue charges each unowned scope inside a run slice.
-The launcher saves the run slice identity and exports `DETACHED_RUN_SLICE` before it starts the command.
+The launcher indexes the run record and saves the slice identity before it starts the command.
+It exports `DETACHED_RUN_SLICE` to the command.
+The index lets the live-run reader find the slice after its supervisor exits.
+The reader also checks records named by live supervisors and legacy stop markers.
+The supervisor or reaper removes the slice index after it saves the finished record.
 The scope launchers use the run slice when the variable is set.
 Transient services keep their usual placement.
 `detached_runs.py start` requires `systemd-run --scope` or `systemd-run --user --scope` when the program is `systemd-run`.

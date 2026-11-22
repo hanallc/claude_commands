@@ -123,6 +123,7 @@ def _read_cgroup_file(directory: int, name: str) -> bytes:
 
 
 DETACHED_SLICE_ENV = "DETACHED_RUN_SLICE"
+RUN_SLICE_RECORD_SUFFIX = ".run-slice"
 
 
 def scope_slice_args(default: str = "", *, environment: Mapping[str, str] = os.environ) -> list[str]:
@@ -166,6 +167,8 @@ def publish_run_slice(record: Path, scope: ScopeUnit) -> None:
         if fields.get("run_id") != record.stem or fields.get("status") != "running" or fields.get("stop_reason"):
             raise ValueError("the run is no longer starting")
         fields["command_slice"] = command_slice(os.getpid(), scope)
+        # Index the record before the command can start.
+        _ = atomic_file.create_text_atomic(record.with_suffix(RUN_SLICE_RECORD_SUFFIX), "")
         atomic_file.write_text_atomic(record, json.dumps(fields, indent=2, sort_keys=True))
 
 
