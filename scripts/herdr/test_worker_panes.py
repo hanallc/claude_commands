@@ -942,10 +942,12 @@ class WorkerPaneTests(StaffTestCase):
         state = run / "progress_history_state.json"
         if not state.exists():
             run.mkdir(exist_ok=True)
+            history = run / "history.jsonl"
+            history.touch(exist_ok=True)
             write_text_atomic(state, json.dumps({"owner_staff_id": self.parent.id, "working_dir": str(self.root),
                 "open_phases": [{"id": "earlier", "title": "Earlier", "instance_id": "earlier-phase", "started_at": 1,
                                  "status": "active"}], "pass": {}, "events": [],
-                "history_file": str(run / "history.jsonl"),
+                "history_file": str(history),
                 "main_agent": {"session_id": self.parent.current_session, "family": "claude",
                                "model": "fixture", "effort": "high"}}))
         return run
