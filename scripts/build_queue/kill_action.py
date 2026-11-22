@@ -15,6 +15,7 @@ import os
 from pathlib import Path
 import re
 import secrets
+import stat
 import subprocess
 import sys
 import threading
@@ -22,7 +23,7 @@ import time
 from typing import Literal, TypedDict, cast
 
 from scripts.agents import detached_run_process, detached_runs, worker_lifecycle
-from scripts.build_queue import admission_client, admission_records, admission_wire, execution_identity, snapshot_codec
+from scripts.build_queue import admission_client, admission_records, admission_wire, execution_identity
 from scripts.build_queue.admission_jobs import StepJob
 from scripts.build_queue.scope_activity import LiveBuildRun
 from scripts.buildlog import store
@@ -97,11 +98,6 @@ class ProgramScope:
     scope: process_stop.ScopeIdentity
     anchor_pid: int
     anchor_start: str
-
-
-@dataclass(frozen=True)
-class NoLaunchScope:
-    """The record has no verified launch scope."""
 
 
 @dataclass(frozen=True)
@@ -197,7 +193,7 @@ def program_scope(run: KillCandidate, processes: dict[int, memory_admit.ProcessI
     return NoStopRoute()
 
 
-def detached_launch_scope(value: object) -> process_stop.ScopeIdentity | NoLaunchScope:
+def detached_launch_scope(value: object) -> process_stop.ScopeIdentity | None:
     """Decode the scope that the detached launcher saved at startup."""
     match value:
         case {"unit": str(unit), "path": str(name), "device": int(device), "inode": int(inode)}:
@@ -209,7 +205,7 @@ def detached_launch_scope(value: object) -> process_stop.ScopeIdentity | NoLaunc
                 return {"unit": unit, "path": name, "device": device, "inode": inode}
         case _:
             pass
-    return NoLaunchScope()
+    return None
 
 
 def detached_command(run: KillCandidate, recipient: staff.StaffId,
@@ -233,7 +229,7 @@ def detached_command(run: KillCandidate, recipient: staff.StaffId,
             except (OSError, ValueError):
                 return NoStopRoute()
             scope = detached_launch_scope(raw.get("command_scope"))
-            if (not isinstance(scope, NoLaunchScope)
+            if (scope is not None
                     and group is not None and group.group == pid and group.started == processes[pid].start
                     and raw.get("command_pid") == pid and raw.get("staff_id") == recipient
                     and isinstance(supervisor := raw.get("pid"), int) and supervisor == parent
@@ -403,7 +399,7 @@ class SavedKillAction:
     recipient: staff.StaffId
     message: str
     stage: StopRequested | TermSent | SendingNotice | FinishedStop
-    scope: process_stop.ScopeIdentity | NoLaunchScope = NoLaunchScope()
+    route: process_stop.ScopeIdentity | Path
 
 
 def notification(run: KillCandidate, at: datetime) -> str:
@@ -414,6 +410,21 @@ def stop_saved_scope(scope: process_stop.ScopeIdentity, *, on_term: Callable[[in
     settings = conf.read_or_repository("shutdown")
     _ = process_stop.stop_scope(scope, settings.whole("STOP_GRACE_SECONDS"),
                                 settings.whole("KILL_GRACE_SECONDS"), on_term=on_term)
+
+
+def resume_cargo_stop(scope: process_stop.ScopeIdentity) -> None:
+    try:
+        stop_saved_scope(scope)
+    except process_stop.ScopeStopFailed:
+        path = Path(scope["path"])
+        if not path.is_absolute() or ".." in path.parts or path.name != scope["unit"] or path.suffix != ".scope":
+            raise
+        try:
+            current = (process_stop.CGROUP_ROOT / path.relative_to("/")).lstat()
+        except FileNotFoundError:
+            return
+        if not stat.S_ISDIR(current.st_mode) or (current.st_dev, current.st_ino) == (scope["device"], scope["inode"]):
+            raise
 
 
 def stop_verified_scope(target: KillTarget, reason: str, *, on_term: Callable[[int], None]) -> bool:
@@ -477,21 +488,7 @@ class KillActions:
 
     def _read(self, reference: str) -> SavedKillAction:
         text = (self._folder / f"{reference}.json").read_text()
-        raw = cast(object, json.loads(text))
-        if not isinstance(raw, dict):
-            raise ValueError("invalid Builds stop record")
-        record = cast(dict[str, object], raw)
-        match record.get("stage"):
-            case {"kind": "TermSent", "term_reached": int()} | {
-                "kind": "SendingNotice", "term": {"kind": "TermSent", "term_reached": int()}
-            }:
-                if "scope" not in record:
-                    record["stage"] = {"kind": "StopRequested"}
-            case {"kind": "WatchingStop" | "TermSent" | "SendingNotice"}:
-                record["stage"] = {"kind": "StopRequested"}
-            case _:
-                pass
-        action = cast(SavedKillAction, snapshot_codec.parse_snapshot_value(record, SavedKillAction))
+        action = admission_wire.parse_record(text, SavedKillAction)
         if action.result["reference"] != reference or action.run.reference != reference:
             raise ValueError("the Builds stop record has a different run")
         return action
@@ -546,8 +543,13 @@ class KillActions:
         """Resume the stop or send the notice from the saved stage."""
         if isinstance(action.stage, StopRequested):
             return self._finish(action, {**action.result, "stop": StopState.NOT_SENT}, retention)
-        if isinstance(action.stage, TermSent) and not isinstance(action.scope, NoLaunchScope):
-            stop_saved_scope(action.scope)
+        if isinstance(action.stage, TermSent):
+            if isinstance(action.route, Path):
+                reason = action.message.partition("\n")[0]
+                if not detached_runs.stop_command(action.route, reason):
+                    return action
+            else:
+                resume_cargo_stop(action.route)
             action = self._confirm_stop(action, action.stage)
         if isinstance(action.stage, SendingNotice):
             try:
@@ -607,7 +609,8 @@ class KillActions:
                               "time": at.strftime("%H:%M %Z"), "recipient_name": target.recipient_name,
                               "recipient_role": target.recipient_role}
         body = f"{message}\n{words}" if words else message
-        action = SavedKillAction(identity, run, result, target.recipient, body, StopRequested(), target.route.scope)
+        route = target.route.record if isinstance(target.route, DetachedCommand) else target.route.scope
+        action = SavedKillAction(identity, run, result, target.recipient, body, StopRequested(), route)
 
         def save_term(count: int) -> None:
             if count != 0:

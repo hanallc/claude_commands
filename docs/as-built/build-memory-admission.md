@@ -1828,7 +1828,9 @@ Verify only creates scopes per step, so the console leaves Kill off for Verify.
 The server offers Cargo Kill only when the verified scope contains the known Cargo descendants.
 A restart before the server saves a TERM count shows **Kill not sent; try again**.
 The server saves the helper’s confirmation before it sends the notice.
-After a restart, an action with a TERM receipt and no confirmation uses the shared stop helper on the saved scope identity.
+After a restart, the server resumes a stop that has a TERM receipt and needs exit confirmation.
+Cargo recovery uses the saved scope identity.
+Detached recovery uses the run record to stop its scopes and cancel its pass.
 The server retries pending actions every `kill_pending_check_seconds`.
 It retries an unclear delivery result with the saved key.
 A queued or kept message appears as **Message queued**.
