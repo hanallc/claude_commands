@@ -99,7 +99,8 @@ class CreateProducerTests(unittest.TestCase):
             environment = fixture_git_environment(world.case.root)
             _ = subprocess.run(["git", "-C", str(root), "init", "-q"], env=environment, check=True)
             registry = world.case.root / "configuration/models.conf"
-            _ = write_registry(registry, {"producers": {"dwight": None}}, update=True)
+            _ = write_registry(registry, {"producer_defaults": {"model": "claude:fable:high"},
+                                          "producers": {"dwight": None}}, update=True)
             ignore = world.folder / ".gitignore"
             _ = ignore.write_bytes(b"# Keep this user rule.\r\nprivate.md\r\n")
             with (patch.object(roster, "roster", return_value=roster.Roster([], [])),
