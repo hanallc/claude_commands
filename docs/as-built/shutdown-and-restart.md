@@ -965,11 +965,16 @@ If session move returns an error, the plan reports that it is incomplete and omi
 
 The reboot holds the Herdr upkeep job lock across the four steps and releases it on failure.
 The reboot also holds `agents/reboot/lock` exclusively under the user state folder across the four steps.
-`agents resume`, `agents restart`, `agents add-producer`, `agents transfer`, and `agents move` take a shared lock without waiting.
-The `herdr_sessions.py start` and `resume` commands take the same shared lock.
-These commands report a single refusal line while the reboot holds its lock.
-Detached restarts take the shared lock when they enter the command again. Account moves take it when they call resume.
-The reboot calls the restart code directly with its exclusive lock held.
+The common Herdr launcher takes a shared lock before it creates a pane.
+The direct Herdr start for a producer reservation takes the same lock.
+A lock refusal reports that a reboot is running.
+Nested starts in one process use the same open lock file, including starts in the reboot's restart step.
+The standalone Herdr commands take a separate shared lock when they restore the server.
+The `agents resume` command holds the lock while it changes staff or recovery records.
+The direct resume API also holds the lock for starts in an existing pane.
+The `agents restart` and `agents move` commands hold the lock while they save restart or move records.
+The `agents add-producer` and `agents transfer` commands hold the lock while they change producer state.
+Dry runs can read state during a reboot.
 The Nix healer takes the shared lock before it saves a launch reservation.
 If reboot holds the lock, the healer keeps the stop record and resumes the session on its next available sweep.
 A failed stop, server stop, or restart leaves the next step in `agents/reboot/reboot.json` under the user state folder.

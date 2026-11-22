@@ -765,8 +765,8 @@ def main(argv: list[str] | None = None) -> int:
             return set_model.report_error(error)
     locks = ExitStack()
     try:
-        if options.command in ("resume", "restart", "add-producer", "transfer", "move"):
-            locks.enter_context(stop_resume.reboot_lock())
+        if options.command in ("resume", "restart", "add-producer", "transfer", "move") and not options.dry_run:
+            locks.enter_context(herdr.reboot_lock())
         if options.command == "resume" and options.resend_opening_prompt:
             if options.production or options.retired:
                 raise ValueError("--resend-opening-prompt needs one producer name and an active pane")
@@ -897,7 +897,7 @@ def main(argv: list[str] | None = None) -> int:
         result = (stop_resume.stop_producer(target.id, "agents stop ran", deadline=deadline)
                   if target is not None and target.kind == "producer" else stop_resume.stop(options.session, deadline=deadline))
         return max(_result_code(result), int(bool(unresolved)))
-    except stop_resume.RebootLockBusy as error:
+    except herdr.RebootLockBusy as error:
         print(error, file=sys.stderr)
         return 1
     except staff.StaffRefused as error:

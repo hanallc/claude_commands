@@ -20,6 +20,7 @@ except FileNotFoundError:
     pass
 
 import base64
+import fcntl
 import secrets
 import struct
 import json
@@ -39,7 +40,7 @@ import time
 from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor
 from contextvars import ContextVar
-from threading import RLock
+from threading import Lock, RLock
 from functools import cache, cached_property
 from importlib import import_module
 from dataclasses import dataclass, field, replace
@@ -47,7 +48,7 @@ from enum import Enum, StrEnum
 from datetime import datetime, timezone
 from pathlib import Path
 from collections.abc import Callable, Generator, Iterable, Mapping, Sequence, Set
-from typing import BinaryIO, ClassVar, TYPE_CHECKING, Literal, NamedTuple, Never, NotRequired, TypedDict, Protocol, cast, final, override
+from typing import BinaryIO, ClassVar, TYPE_CHECKING, Literal, NamedTuple, Never, NotRequired, TextIO, TypedDict, Protocol, cast, final, override
 
 
 from scripts.herdr import pane_launch
@@ -77,6 +78,61 @@ START_RETRY_MAX_SECONDS = 1.0
 _PLATFORM = sys.platform
 NO_ENVIRONMENT_REMOVALS: frozenset[str] = frozenset()
 SHARED_SESSION = "agents"
+
+
+class RebootLockBusy(HerdrFailure):
+    def __init__(self) -> None:
+        super().__init__("A reboot is running; wait for it to end.", "reboot_in_progress")
+
+
+@dataclass
+class _HeldRebootLock:
+    handle: TextIO
+    exclusive: bool
+    users: int = 1
+
+
+_reboot_locks: dict[tuple[int, Path], _HeldRebootLock] = {}
+_reboot_locks_guard = Lock()
+
+
+def reboot_state_directory() -> Path:
+    state = Path(os.environ.get("XDG_STATE_HOME", str(Path.home() / ".local/state")))
+    return state / "agents" / "reboot"
+
+
+@contextmanager
+def reboot_lock(*, exclusive: bool = False) -> Generator[None]:
+    """Hold the lock without waiting. Share the descriptor within the process."""
+    path = reboot_state_directory() / "lock"
+    key = os.getpid(), path
+    with _reboot_locks_guard:
+        held = _reboot_locks.get(key)
+        if held is None:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            handle = path.open("a")
+            try:
+                mode = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
+                fcntl.flock(handle, mode | fcntl.LOCK_NB)
+            except BaseException as error:
+                handle.close()
+                if isinstance(error, BlockingIOError):
+                    raise RebootLockBusy() from error
+                raise
+            held = _HeldRebootLock(handle, exclusive)
+            _reboot_locks[key] = held
+        else:
+            if exclusive and not held.exclusive:
+                raise RebootLockBusy()
+            held.users += 1
+    try:
+        yield
+    finally:
+        with _reboot_locks_guard:
+            held.users -= 1
+            if not held.users:
+                del _reboot_locks[key]
+                held.handle.close()
 
 
 @dataclass(frozen=True)
@@ -2738,6 +2794,11 @@ class Herdr:
     def start_agent(self, name: str, pane: str, kind: str, agent_arguments: list[str],
                     opening: OpeningPrompt | NoOpeningPrompt, timeout_ms: int) -> PromptSubmitOutcome | PromptSubmissionNotRequired:
         """Start once, then prove the opening prompt arrived as this session's user turn."""
+        with reboot_lock():
+            return self._start_agent(name, pane, kind, agent_arguments, opening, timeout_ms)
+
+    def _start_agent(self, name: str, pane: str, kind: str, agent_arguments: list[str],
+                     opening: OpeningPrompt | NoOpeningPrompt, timeout_ms: int) -> PromptSubmitOutcome | PromptSubmissionNotRequired:
         forget_pane_evidence(self.session, pane)
         _check_agent_arguments(kind, agent_arguments)
         _timeout(timeout_ms)
@@ -6837,6 +6898,17 @@ def launch_prepared_agent(name: str, destination: NewTab | SplitPane | ExistingP
                           codex: CodexConversations | CodexLaunchRead = CodexLaunchRead.CURRENT,
                           client: Herdr | LaunchClientSource = LaunchClientSource.NEW) -> AgentLaunched:
     """Launch the prepared environment. Use agent for staff lookup and agent_name for the server name."""
+    with reboot_lock():
+        return _launch_prepared_agent(name, destination, prepared, kind, agent_arguments, opening, timeout_ms,
+                                      agent=agent, reported_unknown=reported_unknown, agent_name=agent_name,
+                                      codex=codex, client=client)
+
+
+def _launch_prepared_agent(name: str, destination: NewTab | SplitPane | ExistingPane, prepared: PreparedAgentEnvironment,
+                           kind: str, agent_arguments: list[str], opening: OpeningPrompt | NoOpeningPrompt,
+                           timeout_ms: int, *, agent: str, reported_unknown: str,
+                           agent_name: str | AgentNameSource, codex: CodexConversations | CodexLaunchRead,
+                           client: Herdr | LaunchClientSource) -> AgentLaunched:
     launched_at = datetime.now(timezone.utc)
     _check_agent_arguments(kind, agent_arguments)
     if kind == "claude":

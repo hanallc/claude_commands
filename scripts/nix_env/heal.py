@@ -32,7 +32,7 @@ from typing import TYPE_CHECKING, Literal, NotRequired, TypedDict, cast
 
 SCRIPTS = Path(__file__).resolve().parents[1]
 from scripts.lib import atomic_file, conf, nix_env
-from scripts.herdr import pane_launch
+from scripts.herdr import herdr, pane_launch
 from scripts.production import staff
 from scripts.message import send_result, session_records, sessions
 from scripts.message import send_budget
@@ -471,8 +471,8 @@ def resume_pending(directory: Path, limits: HealLimits, session: HealSession, pe
 
     with ExitStack() as start:
         try:
-            start.enter_context(stop_resume.reboot_lock())
-        except stop_resume.RebootLockBusy as error:
+            start.enter_context(herdr.reboot_lock())
+        except herdr.RebootLockBusy as error:
             log(directory, session, history, "pending", str(error))
             return
         # Save the launch reservation before the command can start a session.

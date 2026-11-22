@@ -245,13 +245,14 @@ else:
                         ["resume", "alpha", "--retired"], ["resume", "alpha", "--resend-opening-prompt"],
                         ["restart"], ["restart", "--all"], ["restart", "--only", "alpha"],
                         ["add-producer", "alpha"], ["transfer", "alpha"], ["move", "alpha", "claude2"])
-            for arguments in commands:
-                with (self.subTest(arguments=arguments), redirect_stdout(io.StringIO()) as output,
-                      redirect_stderr(io.StringIO()) as errors):
-                    self.assertEqual(shutdown.main(arguments), 1)
-                    self.assertEqual(output.getvalue(), "")
-                    self.assertEqual(errors.getvalue().splitlines(), [refusal])
-            self.assertEqual(stop_resume.resume("alpha"), stop_resume.ResumeFailed("alpha", refusal))
+            with patch.object(os, "getpid", return_value=os.getpid() + 1):
+                for arguments in commands:
+                    with (self.subTest(arguments=arguments), redirect_stdout(io.StringIO()) as output,
+                          redirect_stderr(io.StringIO()) as errors):
+                        self.assertEqual(shutdown.main(arguments), 1)
+                        self.assertEqual(output.getvalue(), "")
+                        self.assertEqual(errors.getvalue().splitlines(), [refusal])
+                self.assertEqual(stop_resume.resume("alpha"), stop_resume.ResumeFailed("alpha", refusal))
             stop_server(log)
 
         with (patch.object(reboot, "stop_server", side_effect=server),
@@ -289,7 +290,7 @@ else:
             self.assertTrue((self.directory / "reboot.json").is_file())
             self.assertFalse((old_logs / "reboot.json").exists())
             _ = config.write_text("REBOOT_LOG_FOLDER=new-logs\n# range: 0.001..10\nREBOOT_SPINNER_SECONDS=0.1\n")
-            with redirect_stderr(io.StringIO()) as errors:
+            with patch.object(os, "getpid", return_value=os.getpid() + 1), redirect_stderr(io.StringIO()) as errors:
                 self.assertEqual(shutdown.main(["resume", "alpha"]), 1)
             self.assertEqual(errors.getvalue(), "A reboot is running; wait for it to end.\n")
             stop_server(log)
@@ -307,6 +308,33 @@ else:
         code, lines = self.invoke("--dry-run")
         self.assertEqual(code, 0)
         self.assertEqual(Path(lines[0]).parent, new_logs)
+
+    def test_reboot_start_launches_under_its_exclusive_lock(self) -> None:
+        self.directory.mkdir(parents=True)
+        reboot.Checkpoint(reboot.Step.START).save(self.directory / "reboot.json")
+        shutdown_record.save(["alpha"])
+        client = herdr.Herdr(herdr.SHARED_SESSION)
+
+        def start_agent(*_args: object, **_kwargs: object) -> herdr.PromptSubmissionNotRequired:
+            with (self.directory / "lock").open("a") as external, self.assertRaises(BlockingIOError):
+                fcntl.flock(external, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            return herdr.PromptSubmissionNotRequired()
+
+        def restore() -> int:
+            launched = herdr.launch_prepared_agent(client.session, herdr.NewTab("units", "alpha"),
+                herdr.PreparedAgentEnvironment(self.root, {}), "codex", [], herdr.NoOpeningPrompt(),
+                1000, agent="alpha", client=client)
+            self.assertEqual(launched.pane, "fixture-pane")
+            return self.start()
+
+        with (patch.object(client, "open_tab", return_value="fixture-pane"),
+              patch.object(client, "run_in_pane"),
+              patch.object(herdr.Herdr, "_start_agent", side_effect=start_agent) as start,
+              patch.object(restart, "restart", side_effect=restore)):
+            self.assertEqual(self.invoke()[0], 0)
+        start.assert_called_once()
+        self.assertEqual(self.events, ["start"])
+        self.assertEqual(shutdown_record.read(), [])
 
     def test_concurrent_workers_use_the_report_count_and_total(self) -> None:
         terminal = io.StringIO()

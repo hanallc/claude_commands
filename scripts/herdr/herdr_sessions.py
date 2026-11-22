@@ -20,7 +20,6 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from scripts.herdr import herdr, pane_launch
-from scripts.agents import stop_resume
 from scripts.message import sessions as native_sessions
 from scripts.herdr import herdr_types
 
@@ -132,14 +131,7 @@ def _launch(verb: str, arguments: list[str]) -> int:
         _ = parser.add_argument("--attach", action="store_true")
     separator = arguments.index("--") if "--" in arguments else len(arguments)
     options = parser.parse_args(arguments[:separator], namespace=LaunchOptions())
-    with stop_resume.reboot_lock():
-        pane = _start(verb, options, arguments[separator + 1:])
-    if verb == "start" or options.attach:
-        _attach(pane)
-    return 0
-
-
-def _start(verb: str, options: LaunchOptions, claude_arguments: list[str]) -> str:
+    claude_arguments = arguments[separator + 1:]
     session_kind = herdr.security_session()
     folder = Path(options.cwd).expanduser().resolve(strict=True)
     if not folder.is_dir():
@@ -164,7 +156,8 @@ def _start(verb: str, options: LaunchOptions, claude_arguments: list[str]) -> st
         except OSError as error:
             print(f"herdr_sessions: {options.name}: prompt file is unreadable: {error}", file=sys.stderr)
     shared = herdr.shared_session()
-    _ = herdr.restore_server(shared, 90_000, session_kind=session_kind)
+    with herdr.reboot_lock():
+        _ = herdr.restore_server(shared, 90_000, session_kind=session_kind)
     panes = herdr.Herdr(shared).panes()
     record = staff.initial_snapshot()
     entries = pane_launch.read(pane_launch.record_directory() / f"{shared}.json")
@@ -188,7 +181,9 @@ def _start(verb: str, options: LaunchOptions, claude_arguments: list[str]) -> st
     if isinstance(opening, herdr.OpeningPrompt) and not isinstance(outcome, herdr.PromptSubmitted):
         reason = outcome.reason if isinstance(outcome, herdr.PromptNotSubmitted) else "launcher supplied no submit proof"
         print(f"herdr_sessions: {name}: opening prompt not submitted: {reason}", file=sys.stderr)
-    return pane
+    if verb == "start" or options.attach:
+        _attach(pane)
+    return 0
 
 
 def _claude_name(owner: pane_launch.ProvedPaneConversation) -> str:
@@ -253,6 +248,9 @@ def _main(argv: list[str]) -> int:
     if len(argv) > 1 and argv[1] in ("start", "resume"):
         try:
             return _launch(argv[1], argv[2:])
+        except herdr.RebootLockBusy as error:
+            print(error, file=sys.stderr)
+            return 1
         except (herdr_types.HerdrFailure, OSError, ValueError) as error:
             print(f"herdr_sessions: {error}", file=sys.stderr)
             return 1
@@ -264,7 +262,7 @@ def _main(argv: list[str]) -> int:
         if not any(session["name"] == shared for session in herdr.live_sessions()):
             if argv[1] == "list":
                 return 0
-            with stop_resume.reboot_lock():
+            with herdr.reboot_lock():
                 _ = herdr.restore_server(shared, 90_000, session_kind=herdr.security_session())
         if argv[1] == "sort-tabs":
             for label in herdr.Herdr(shared).sort_tabs().labels:
@@ -287,6 +285,9 @@ def _main(argv: list[str]) -> int:
         with herdr.observation_snapshot():
             _list_panes(herdr.Herdr(shared), staff.initial_snapshot())
         return 0
+    except herdr.RebootLockBusy as error:
+        print(error, file=sys.stderr)
+        return 1
     except (herdr_types.HerdrFailure, OSError) as error:
         print(f"herdr_sessions: {error}", file=sys.stderr)
         return 3
@@ -295,9 +296,6 @@ def _main(argv: list[str]) -> int:
 def main(argv: list[str]) -> int:
     try:
         return _main(argv)
-    except stop_resume.RebootLockBusy as error:
-        print(error, file=sys.stderr)
-        return 1
     except KeyboardInterrupt:
         print("herdr_sessions: stopped", file=sys.stderr)
         return 130

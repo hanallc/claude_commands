@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 
+import fcntl
 import json
 from importlib import import_module
 import io
 import ctypes
 from contextlib import contextmanager, nullcontext, redirect_stderr, redirect_stdout
 from collections.abc import Callable, Generator, Iterable, Mapping
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 import os
 import select
@@ -3245,9 +3247,48 @@ class LaunchDestinationTests(StaffTestCase):
         super().setUp()
         proc = self.root / "proc"
         proc.mkdir()
-        _ = cast(object, self.enterContext(patch.dict(os.environ, {"HERDR_PROC": str(proc), "HERDR_BIN": "/nonexistent/herdr"})))
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {
+            "HERDR_PROC": str(proc), "HERDR_BIN": "/nonexistent/herdr", "XDG_STATE_HOME": str(self.root / "state"),
+        })))
         _ = self.enterContext(patch.object(herdr, "_PLATFORM", "linux"))
         _ = self.enterContext(patch.object(herdr, "_startup_processes", return_value=herdr.PaneAtShell()))
+
+    def test_worker_launch_refuses_before_creating_a_pane_during_reboot(self) -> None:
+        from scripts.herdr import test_worker_panes, worker_panes
+
+        launch = herdr.launch_prepared_agent
+        case = test_worker_panes.WorkerPaneTests()
+        case.setUp()
+        self.addCleanup(case.doCleanups)
+        directory = herdr.reboot_state_directory()
+        directory.mkdir(parents=True, exist_ok=True)
+        with ((directory / "lock").open("a") as external,
+              patch.object(herdr, "launch_prepared_agent", side_effect=launch) as attempted,
+              patch.object(herdr, "start_agent", side_effect=AssertionError("Started during reboot")) as started):
+            fcntl.flock(external, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            result = case.start()
+        attempted.assert_called_once()
+        started.assert_not_called()
+        self.assertIsInstance(result, worker_panes.UncertainWorker)
+        assert isinstance(result, worker_panes.UncertainWorker)
+        self.assertTrue(result.reason.endswith("A reboot is running; wait for it to end."), result.reason)
+        self.assertEqual(case.world.commands, [])
+        self.assertEqual(staff.snapshot().find(kind="worker", parent=case.parent_id), [])
+
+    def test_nested_shared_lock_reuses_the_process_descriptor(self) -> None:
+        def nested() -> None:
+            with herdr.reboot_lock():
+                pass
+
+        with patch.object(fcntl, "flock", wraps=fcntl.flock) as flock:
+            with herdr.reboot_lock(), ThreadPoolExecutor(max_workers=1) as pool:
+                nested()
+                pool.submit(nested).result(timeout=5)
+                with self.assertRaises(herdr.RebootLockBusy), herdr.reboot_lock(exclusive=True):
+                    self.fail("A shared lock must not become exclusive")
+            flock.assert_called_once()
+        with herdr.reboot_lock(exclusive=True):
+            pass
 
     def test_declined_resume_explains_manual_prompt_recovery(self) -> None:
         prepared = herdr.PreparedAgentEnvironment(self.root, {})

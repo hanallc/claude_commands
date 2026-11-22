@@ -19,7 +19,7 @@ from threading import Event, Lock, Thread, get_ident
 from typing import TextIO, cast, final, override
 from uuid import uuid4
 
-from scripts.agents import restart, shutdown_record, stop_resume
+from scripts.agents import restart, shutdown_record
 from scripts.herdr import herdr, herdr_types
 from scripts.lib import conf
 from scripts.lib.atomic_file import write_text_atomic
@@ -381,7 +381,7 @@ def run(*, dry_run: bool = False) -> int:
     folder = settings.value("REBOOT_LOG_FOLDER", str, default="reboot")
     if folder in ("", ".", "..") or Path(folder).name != folder:
         raise ValueError("REBOOT_LOG_FOLDER must be one folder name")
-    state = stop_resume.reboot_state_directory()
+    state = herdr.reboot_state_directory()
     directory = state.with_name(folder)
     interval = settings.number("REBOOT_SPINNER_SECONDS")
     if not math.isfinite(interval) or interval <= 0:
@@ -402,7 +402,7 @@ def run(*, dry_run: bool = False) -> int:
                 latest.unlink(missing_ok=True)
             if dry_run:
                 return int(not show_plan(terminal, log))
-            with stop_resume.reboot_lock(exclusive=True):
+            with herdr.reboot_lock(exclusive=True):
                 if herdr.shared_session() != herdr.SHARED_SESSION:
                     raise ValueError("The shared Herdr session must be named agents")
                 checkpoint = state / "reboot.json"
@@ -413,7 +413,7 @@ def run(*, dry_run: bool = False) -> int:
                     except FileNotFoundError:
                         Checkpoint().save(checkpoint)
                 failed, issues = run_steps(checkpoint, path, terminal, log, interval)
-        except stop_resume.RebootLockBusy:
+        except herdr.RebootLockBusy:
             failed = True
             issues.append(restart.FollowUp("agents reboot", "A reboot or session start holds the lock", RETRY, operator=True))
         except (KeyboardInterrupt, *FAILURES) as error:

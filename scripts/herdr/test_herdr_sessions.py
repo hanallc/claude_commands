@@ -5,6 +5,7 @@ from __future__ import annotations
 from scripts.production.staff_test_support import fixture_member, fixture_runtime_id
 from scripts.herdr import herdr_types
 
+import fcntl
 import io
 import json
 import os
@@ -30,7 +31,6 @@ from scripts.message.sessions import SessionRecord, UnreadableSessionRecord, rea
 from scripts.production import showrunners
 from scripts.accounts import accounts
 from scripts.accounts.home_test_support import scratch_accounts_config
-from scripts.agents import stop_resume
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.production import staff, fake_unit_host
 from scripts.message import sessions as runtime_sessions
@@ -859,7 +859,10 @@ class StandaloneLaunchTests(unittest.TestCase):
 
 
     def test_start_and_resume_refuse_before_herdr_when_reboot_holds_the_lock(self) -> None:
-        with stop_resume.reboot_lock(exclusive=True):
+        directory = herdr.reboot_state_directory()
+        directory.mkdir(parents=True)
+        with (directory / "lock").open("a") as external:
+            fcntl.flock(external, fcntl.LOCK_EX | fcntl.LOCK_NB)
             for arguments in (("start", "--name", "solo"), ("resume", "solo", "--session-id", "saved")):
                 with self.subTest(arguments=arguments):
                     self.assertEqual(self.call(*arguments, "--cwd", str(self.root)),

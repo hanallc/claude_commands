@@ -22,6 +22,7 @@ from scripts.lib.nix_env_test_support import NixFixture
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.nix_env import heal
 from scripts.agents import stop_resume
+from scripts.herdr import herdr
 from scripts.notify import push_texts
 from scripts.message import sessions
 from scripts.whoami import account
@@ -530,11 +531,14 @@ class HealTests(NixFixture):
     def test_reboot_after_stop_preserves_the_next_sweep_relaunch(self) -> None:
         _held, _ensure, run = self.install_sweep([self.session])
         command = cast(Callable[..., subprocess.CompletedProcess[str]], run.side_effect)
+        directory = herdr.reboot_state_directory()
+        directory.mkdir(parents=True)
         with ExitStack() as reboot:
             def stop_before_reboot(arguments: list[str], **options: object) -> subprocess.CompletedProcess[str]:
                 self.assertEqual(arguments[2], "stop")
                 result = command(arguments, **options)
-                reboot.enter_context(stop_resume.reboot_lock(exclusive=True))
+                external = reboot.enter_context((directory / "lock").open("a"))
+                fcntl.flock(external, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 return result
 
             run.side_effect = stop_before_reboot

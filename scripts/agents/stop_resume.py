@@ -6,7 +6,6 @@ try:
 except FileNotFoundError:
     pass
 
-import fcntl
 import math
 import os
 import argparse
@@ -1572,38 +1571,15 @@ def _nearby_resume_names(reference: str, names: LaunchNames) -> list[str]:
                    and reference.casefold() in row.name.casefold()})[:5]
 
 
-class RebootLockBusy(Exception):
-    pass
-
-
-def reboot_state_directory() -> Path:
-    state = Path(os.environ.get("XDG_STATE_HOME", str(Path.home() / ".local/state")))
-    return state / "agents" / "reboot"
-
-
-@contextmanager
-def reboot_lock(*, exclusive: bool = False) -> Generator[None]:
-    """Hold a launch or reboot lock without waiting."""
-    directory = reboot_state_directory()
-    directory.mkdir(parents=True, exist_ok=True)
-    with (directory / "lock").open("a") as lock:
-        try:
-            mode = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
-            fcntl.flock(lock, mode | fcntl.LOCK_NB)
-        except BlockingIOError as error:
-            raise RebootLockBusy("A reboot is running; wait for it to end.") from error
-        yield
-
-
 def resume(session: str, *, why: str = "resumed by name", to: str | None = None, requester: str = "",
            client: herdr.Herdr | herdr.LaunchClientSource = herdr.LaunchClientSource.NEW) -> ResumeResult:
     with ExitStack() as locks:
         try:
-            locks.enter_context(reboot_lock())
+            locks.enter_context(herdr.reboot_lock())
             settings = conf.read("shutdown")
             for key in ("START_SECONDS", "STAY_SECONDS"):
                 _ = settings.number(key)
-        except (conf.Unusable, RebootLockBusy) as error:
+        except (conf.Unusable, herdr.RebootLockBusy) as error:
             return ResumeFailed(session, str(error))
         with staff.row_operation(session):
             return _resume(session, why=why, to=to, requester=requester, client=client)
