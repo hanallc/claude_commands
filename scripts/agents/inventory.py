@@ -592,15 +592,27 @@ def _git(cwd: str, *arguments: str) -> subprocess.CompletedProcess[str] | None:
         return None
 
 
-def _checkout(cwd: str) -> CheckoutState:
-    if not cwd:
-        return {"kind": "not a checkout"}
-    root = _git(cwd, "rev-parse", "--show-toplevel")
+@dataclass(frozen=True)
+class _CheckoutIdentity:
+    work_tree: str
+    git_dir: str
+
+
+def _checkout_identity(cwd: str) -> _CheckoutIdentity | NotACheckout:
+    if cwd:
+        result = _git(cwd, "rev-parse", "--show-toplevel", "--absolute-git-dir")
+        if result is not None and result.returncode == 0:
+            work_tree, separator, git_dir = result.stdout.removesuffix("\n").partition("\n/")
+            if separator and work_tree:
+                return _CheckoutIdentity(work_tree, "/" + git_dir)
+    return {"kind": "not a checkout"}
+
+
+def _checkout(cwd: str, identity: _CheckoutIdentity) -> CheckoutState:
     branch = _git(cwd, "branch", "--show-current")
     head = _git(cwd, "rev-parse", "HEAD")
-    if any(result is None or result.returncode != 0 for result in (root, branch, head)):
+    if branch is None or branch.returncode or head is None or head.returncode:
         return {"kind": "not a checkout"}
-    assert root is not None and branch is not None and head is not None
     ahead_result = _git(cwd, "rev-list", "--count", "@{u}..HEAD")
     upstream: Upstream = {"kind": "no upstream"}
     if ahead_result is not None and ahead_result.returncode == 0:
@@ -616,7 +628,7 @@ def _checkout(cwd: str) -> CheckoutState:
     ]
     return {
         "kind": "git",
-        "path": root.stdout.strip(),
+        "path": identity.work_tree,
         "head": (
             {"kind": "branch", "name": branch.stdout.strip()}
             if branch.stdout.strip()
@@ -625,6 +637,30 @@ def _checkout(cwd: str) -> CheckoutState:
         "upstream": upstream,
         "dirty": dirty,
     }
+
+
+def _checkouts(folders: Sequence[str]) -> dict[str, CheckoutState]:
+    if not folders:
+        return {}
+    from_session_folder = any(name in os.environ for name in (
+        "GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_SHALLOW_FILE", "GIT_GRAFT_FILE",
+    ))
+    if len(folders) == 1:
+        folder = folders[0]
+        identity = _checkout_identity(folder)
+        return {folder: _checkout(folder if from_session_folder else identity.work_tree, identity)
+                if isinstance(identity, _CheckoutIdentity) else identity}
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        identities = dict(zip(folders, pool.map(_checkout_identity, folders), strict=True))
+        read_folders: dict[_CheckoutIdentity, str] = {}
+        for folder, identity in identities.items():
+            if isinstance(identity, _CheckoutIdentity):
+                _ = read_folders.setdefault(identity, folder if from_session_folder else identity.work_tree)
+        checkouts = dict(zip(read_folders, pool.map(_checkout, read_folders.values(), read_folders), strict=True))
+    return {folder: checkouts[identity] if isinstance(identity, _CheckoutIdentity) else identity
+            for folder, identity in identities.items()}
 
 
 _LAST_STEP_BYTES = 262_144
@@ -906,12 +942,8 @@ def inventory(
             host=_host(record, units.get(session_id), plans), timers=_timers(session_id),
             environment=_process_environment(entry.pid), worker_owner=DirectorOwner(kind="director", session_id=worker_owners[session_id]) if session_id in worker_owners else NoDirector(kind="no director")))
 
-    folders = dict.fromkeys(session["cwd"] for session in found if isinstance(session["cwd"], str))
-    if len(folders) > 1:
-        with ThreadPoolExecutor(max_workers=4) as pool:
-            checkouts = dict(zip(folders, pool.map(_checkout, folders), strict=True))
-    else:
-        checkouts = {folder: _checkout(folder) for folder in folders}
+    folders = list(dict.fromkeys(session["cwd"] for session in found if isinstance(session["cwd"], str)))
+    checkouts = _checkouts(folders)
     for session in found:
         folder = session["cwd"]
         if isinstance(folder, str):
