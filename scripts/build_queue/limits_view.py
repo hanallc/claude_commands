@@ -33,8 +33,8 @@ WORDS: Mapping[str | type[object], str] = {
     "count": "{used} of {limit}",
     "limit": "Limit {limit}",
     "no_limit": "No limit",
-    "does_not_run": "Does not run here",
     "running": "{count} running",
+    "occupied": "{count} in use",
     "other_running": "{count} other running",
     "merge_above": "A merge run above the limit",
     "policy_key": "{name} run limit",
@@ -142,15 +142,24 @@ class BuildLimits:
 
 
 @dataclass(frozen=True)
+class MacClaim:
+    scope: claim_state.ClaimScope
+    limit: int
+    key: str
+    folder: str
+    working_session: str
+
+
+@dataclass(frozen=True)
 class MacReading:
-    paths: claim_state.StatePaths
-    state: targets.TargetState
-    claims: tuple[claim_state.RunRecord, ...]
-    settings: conf.ConfigRead
+    target: str
+    state: targets.TargetState | None
+    claims: tuple[MacClaim, ...] = ()
+    limits: Mapping[str, int] = field(default_factory=dict[str, int])
 
 
-def read_mac(snapshots: target_availability.Snapshots) -> MacReading | None:
-    """Read live claims and the settings for the Mac target."""
+def read_mac(snapshots: target_availability.Snapshots, names: Iterable[str]) -> MacReading | None:
+    """Resolve Mac claims and repository limits before the feed uses them."""
     if isinstance(snapshots, target_availability.SnapshotsUnreadable):
         return None
     for snapshot in snapshots:
@@ -159,36 +168,34 @@ def read_mac(snapshots: target_availability.Snapshots) -> MacReading | None:
             break
     else:
         return None
-    claims: dict[claim_state.ClaimIdentity, claim_state.RunRecord] = {}
+    state = snapshot.states[0]
+    if isinstance(state, targets.StateUnreadable):
+        return MacReading(target.name, state)
     paths = claim_state.StatePaths(target_config.ssh_target_state_directory(target.name), target.name,
                                   registry_selected=True, platform=target.platform)
+    claims: dict[claim_state.ClaimIdentity, MacClaim] = {}
     for claim in snapshot.claims:
         record = claim.record
-        if mac_test.run_is_live(record):
-            claims[claim_state.claim_identity(record)] = record
-    return MacReading(paths, snapshot.states[0], tuple(claims.values()), conf.read(target.settings))
-
-
-def apply_mac_policy(mac: MacReading, origin: str, names: set[str], cell: Cell) -> None:
-    if not names:
-        return
-    try:
+        identity = claim_state.claim_identity(record)
+        if identity in claims or not mac_test.run_is_live(record):
+            continue
+        # The legacy Mac admits a checkout with a name-only scope.
+        scope = (claim_state.RepositoryScope(claim.scope.name)
+                 if isinstance(claim.scope, claim_state.RepositoryScope) else claim.scope)
+        session = record["submitting_session"] if mac_test.run_holds_work(record) else ""
+        claims[identity] = MacClaim(scope, mac_test.slot_capacity(paths, scope),
+                                    record.get("repo_key", ""), record["worktree"], session)
+    settings = conf.read(target.settings)
+    limits: dict[str, int] = {}
+    for name in names:
         # A check reads the repository rule without testing workspace packages.
-        allowed: list[eligibility.KnownRepository] = []
-        for name in names:
-            policy = eligibility.linux_only_policy(
-                mac.settings, eligibility.KnownRepository(name, origin), Path(), "", "check")
+        try:
+            policy = eligibility.linux_only_policy(settings, eligibility.KnownRepository(name), Path(), "", "check")
             if isinstance(policy, eligibility.KnownRepository):
-                allowed.append(policy)
-        if not allowed:
-            cell.note = WORDS["does_not_run"]
-        elif len(allowed) == 1:
-            policy, = allowed
-            cell.limit = mac_test.slot_capacity(
-                mac.paths, claim_state.RepositoryScope(policy.name, policy.key), configuration=mac.settings)
-            cell.used = cell.used or 0
-    except conf.Unusable:
-        return
+                limits[name] = mac_test.slot_capacity(paths, claim_state.RepositoryScope(name), configuration=settings)
+        except conf.Unusable:
+            continue
+    return MacReading(target.name, state, tuple(claims.values()), limits)
 
 
 def recorded_origin(identity: str) -> str:
@@ -397,21 +404,20 @@ def visible_waits(model: queue_view.QueueModel, local_names: Mapping[int, str],
     waits: list[VisibleWait] = []
     for entry in queue_view.waiting_builds(model):
         if isinstance(entry, queue_view.WaitingBuild):
-            name = local_names.get(entry.position)
+            name = local_names.get(entry.position, "")
         elif isinstance(entry, wire.CloudRow):
-            name = cloud_names.get(entry.owner)
+            name = cloud_names.get(entry.owner, "")
         else:
             continue
-        if name is not None:
-            waits.append(VisibleWait(entry, name))
+        waits.append(VisibleWait(entry, name))
     return tuple(waits)
 
 
-def wait_text(reason: records.WaitReason | wire.CloudSlotWait, *, machine: str = "") -> str:
+def wait_text(reason: records.WaitReason | wire.CloudSlotWait) -> str:
     if isinstance(reason, records.HeadAdmissionStatus):
         reason = reason.cause
     if isinstance(reason, records.RunLimitWait):
-        return WORDS[records.RunLimitWait].format(repository=reason.repository, machine=machine or reason.machine)
+        return WORDS[records.RunLimitWait].format(repository=reason.repository, machine=reason.machine)
     if isinstance(reason, records.BehindHead) and reason.head_name == "remote startup":
         return WORDS["remote_start"]
     if isinstance(reason, wire.CloudSlotWait) and isinstance(reason.state, ReservedCloudSlot):
@@ -454,6 +460,33 @@ def mac_state(mac: MacReading | None, snapshots: target_availability.Snapshots, 
     return WORDS["on"] if isinstance(state, (targets.Free, targets.Running)) else ""
 
 
+def place_mac_counts(mac: MacReading, rows: Sequence[tuple[str, RepositoryRow]],
+                     claims: Mapping[claim_state.ClaimScope, Sequence[tuple[str, MacClaim]]],
+                     origins: Origins, names: Mapping[str, str]) -> None:
+    positions = {origin: index for index, (origin, _) in enumerate(rows)}
+    for group in claims.values():
+        known_claims = [(origin, claim) for origin, claim in group if origin]
+        if not known_claims:
+            continue
+        owner = min((origin for origin, _ in known_claims), key=positions.__getitem__)
+        cell = rows[positions[owner]][1].mac
+        cell.used = (cell.used or 0) + len(known_claims)
+        cell.limit = (cell.limit or 0) + known_claims[0][1].limit
+        cell.runs.extend(name for _, claim in known_claims
+                         if claim.working_session and (name := names.get(claim.working_session)))
+
+    used_scopes = {scope.name for scope in claims if isinstance(scope, claim_state.RepositoryScope)}
+    for origin, row in rows:
+        if row.mac.used:
+            continue
+        configured = origins.names.get(origin, set()) & mac.limits.keys()
+        if len(configured) == 1:
+            name, = configured
+            if name not in used_scopes:
+                row.mac.used, row.mac.limit = 0, mac.limits[name]
+                used_scopes.add(name)
+
+
 def build_limits(reading: records.QueueRead, snapshots: target_availability.Snapshots,
                  waits: Sequence[VisibleWait], cloud_names: Mapping[wire.Owner, str],
                  names: Mapping[str, str], saved: Background, zone: tzinfo, *,
@@ -472,7 +505,7 @@ def build_limits(reading: records.QueueRead, snapshots: target_availability.Snap
     metric_waits: dict[str, dict[str, list[str]]] = {}
     policy_rows: dict[str, set[str]] = {}
     unbound_waits: dict[str, dict[str, list[str]]] = {}
-    mac_names: dict[str, set[str]] = {}
+    mac_claims: dict[claim_state.ClaimScope, list[tuple[str, MacClaim]]] = {}
 
     def row(origin: str) -> RepositoryRow:
         if origin not in rows:
@@ -483,17 +516,13 @@ def build_limits(reading: records.QueueRead, snapshots: target_availability.Snap
         _ = row(origin)
     mac_unattributed = 0
     if mac is not None:
-        for record in mac.claims:
-            origin = origins.resolve(record.get("repo_key", ""), record["worktree"])
-            if not origin:
+        for claim in mac.claims:
+            origin = origins.resolve(claim.key, claim.folder)
+            mac_claims.setdefault(claim.scope, []).append((origin, claim))
+            if origin:
+                _ = row(origin)
+            else:
                 mac_unattributed += 1
-                continue
-            cell = row(origin).mac
-            cell.used = (cell.used or 0) + 1
-            if name := record.get("repo_name"):
-                mac_names.setdefault(origin, set()).add(name)
-            if name := names.get(record["submitting_session"]):
-                cell.runs.append(name)
     prefix = local + "."
     seen: set[str] = set()
     unattributed = 0
@@ -539,8 +568,11 @@ def build_limits(reading: records.QueueRead, snapshots: target_availability.Snap
             continue
         step = entry.step
         reason = step.reason.cause if isinstance(step.reason, records.HeadAdmissionStatus) else step.reason
-        machine_name = ""
-        if isinstance(reason, records.RunLimitWait) and reason.machine == local:
+        if (isinstance(step.route, target_config.MacOnly)
+                or mac is not None and isinstance(step.route, target_config.PinnedTarget)
+                and step.route.target == mac.target):
+            destination = mac_waits
+        elif isinstance(reason, records.RunLimitWait) and reason.machine == local:
             waiter = ordered.get((step.pid, step.since))
             key = origins.resolve(waiter.get("repo_identity", "") if waiter is not None else "", step.folder)
             if key:
@@ -550,21 +582,9 @@ def build_limits(reading: records.QueueRead, snapshots: target_availability.Snap
                 destination = cell.waits
             else:
                 destination = unbound_waits.setdefault(reason.repository, {})
-        elif mac is not None and (
-                isinstance(step.route, target_config.MacOnly)
-                or isinstance(step.route, target_config.PinnedTarget) and step.route.target == mac.paths.target
-                or isinstance(reason, records.RunLimitWait) and reason.machine == mac.paths.target):
-            destination = mac_waits
-            if isinstance(reason, records.RunLimitWait) and reason.machine == mac.paths.target:
-                machine_name = WORDS["mac"]
-                waiter = ordered.get((step.pid, step.since))
-                if origin := origins.resolve(waiter.get("repo_identity", "") if waiter is not None else "", step.folder):
-                    mac_names.setdefault(origin, set()).add(reason.repository)
-                    destination = row(origin).mac.waits
         elif isinstance(step.route, target_config.PinnedTarget) and step.route.target in saved.aws_targets:
             destination = aws_waits
-        elif (isinstance(step.route, target_config.MacOnly)
-              or isinstance(step.route, target_config.PinnedTarget) and step.route.target != local):
+        elif isinstance(step.route, target_config.PinnedTarget) and step.route.target != local:
             destination = unplaced
         elif isinstance(reason, (records.BuildSpaceLow, records.BuildSpaceUnreadable)):
             destination = metric_waits.setdefault("disk", {})
@@ -574,7 +594,7 @@ def build_limits(reading: records.QueueRead, snapshots: target_availability.Snap
             destination = metric_waits.setdefault("memory", {})
         else:
             destination = local_waits
-        destination.setdefault(wait_text(reason, machine=machine_name), []).append(visible.name)
+        destination.setdefault(wait_text(reason), []).append(visible.name)
 
     occupancy = reserved_repository_runs(inputs, policy)
     ambiguous = Counter(origin for bound in policy_rows.values() for origin in bound)
@@ -637,19 +657,26 @@ def build_limits(reading: records.QueueRead, snapshots: target_availability.Snap
 
     counts = Counter(item.name for item in rows.values())
     for origin, item in rows.items():
-        if mac is not None:
-            apply_mac_policy(mac, origin, origins.names.get(origin, set()) | mac_names.get(origin, set()), item.mac)
         if counts[item.name] > 1:
             namespace = urlsplit(origin).path.strip("/").split("/")[:-1]
             item.owner = "/".join(namespace)
-        for cell in (item.natedev, item.mac, item.aws):
+        for cell in (item.natedev, item.aws):
             if cell.limit is None:
                 cell.runs.extend(cell.other)
                 cell.used = (cell.used or 0) + cell.other_used
                 cell.other.clear()
                 cell.other_used = 0
                 cell.merge_above.clear()
-            if cell.used or (cell is not item.mac and cell.limit is not None) or cell.waits or cell.runs or cell.other_used:
+            if cell.used or cell.limit is not None or cell.waits or cell.runs or cell.other_used:
+                item.quiet = False
+
+    def page_order(item: RepositoryRow) -> tuple[bool, str, str]:
+        return item.quiet, item.name.casefold(), item.owner.casefold()
+
+    if mac is not None and mac.state is not None and not isinstance(mac.state, targets.StateUnreadable):
+        place_mac_counts(mac, sorted(rows.items(), key=lambda pair: page_order(pair[1])), mac_claims, origins, names)
+        for item in rows.values():
+            if item.mac.used:
                 item.quiet = False
 
     room = explanation.room
@@ -672,5 +699,5 @@ def build_limits(reading: records.QueueRead, snapshots: target_availability.Snap
                                     (*limits, *unbound), local_waits, unattributed),
                        MachineLimits(mac_state(mac, snapshots, zone), (), mac_waits, mac_unattributed),
                        MachineLimits(aws_state, (cloud, saved.aws_money), aws_waits, len(aws_unattributed)),
-                       tuple(sorted(rows.values(), key=lambda item: (item.quiet, item.name.casefold(), item.owner.casefold()))),
+                       tuple(sorted(rows.values(), key=page_order)),
                        isinstance(saved.history, charts.IndexUnavailable), saved.history_stale, unplaced)

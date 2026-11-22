@@ -1310,14 +1310,14 @@ function limitWaits(waits, words) {
     <div class="build-limit-count"><span class="build-limit-marks">${limitMarks("wait", names.length)}</span>
       <span>${esc(limitWords(words, "waiting", {count: names.length}))}</span></div>${limitNames(names)}</div>`).join("");
 }
-function limitCell(cell, words, showNoLimit) {
+function limitCell(cell, words, isMac) {
   const {limit, used, runs, merge_above, other, other_used, waits, note} = cell;
   let count = "";
   if (limit != null) {
     count = limitWords(words, used == null ? "limit" : "count", {used, limit});
   } else if (used || runs.length || Object.keys(waits).length) {
-    count = used ? limitWords(words, "running", {count: used}) : "";
-    if (showNoLimit && !cell.has_limit_key) count += count ? ` · ${words.no_limit}` : words.no_limit;
+    count = used ? limitWords(words, isMac ? "occupied" : "running", {count: used}) : "";
+    if (!isMac && !cell.has_limit_key) count += count ? ` · ${words.no_limit}` : words.no_limit;
   }
   const marks = limitPlaces(used, limit, Math.max(0, (used ?? 0) - merge_above.length));
   let contents = count ? `<div class="build-limit-count num">${marks}
@@ -1331,11 +1331,11 @@ function limitCell(cell, words, showNoLimit) {
 }
 let lastBuildLimitsHtml = "";
 function renderBuildLimits(limits) {
-  if (!limits) return;
   const section = $("build-limits");
+  section.hidden = !limits;
+  if (!limits) return;
   const words = limits.words;
   section.querySelector("summary .name").textContent = words.title;
-  section.hidden = false;
   if (!section.open) return;
   const container = $("build-limits-content");
   const machines = [["natedev", words.local], ["mac", words.mac], ["aws", words.aws]].filter(([key]) => limits[key]);
@@ -1343,13 +1343,16 @@ function renderBuildLimits(limits) {
     const data = limits[key];
     return `<th scope="col">${esc(name)}
     ${data.state ? `<span class="build-limit-state">${esc(data.state)}</span>` : ""}
-    ${data.unattributed ? `<div class="build-limit-note">${esc(limitWords(words, "other_running", {count: data.unattributed}))}</div>` : ""}
+    ${!data.unattributed ? "" : key === "mac"
+      ? `<div class="build-limit-count"><span class="build-limit-marks">${limitMarks("run", data.unattributed)}</span>
+        <span>${esc(limitWords(words, "occupied", {count: data.unattributed}))}</span></div>`
+      : `<div class="build-limit-note">${esc(limitWords(words, "other_running", {count: data.unattributed}))}</div>`}
     ${data.shared.map(metric => limitMetric(metric, words)).join("")}
     ${limitWaits(data.waits, words)}</th>`;
   }).join("");
   const rows = limits.repositories.map(row =>
     `<tr${row.quiet ? ' class="quiet"' : ""}><th scope="row">${esc(row.name)}${row.owner ? `<small>${esc(row.owner)}</small>` : ""}</th>
-      ${machines.map(([key]) => `<td>${limitCell(row[key], words, key !== "mac")}</td>`).join("")}</tr>`).join("");
+      ${machines.map(([key]) => `<td>${limitCell(row[key], words, key === "mac")}</td>`).join("")}</tr>`).join("");
   const legend = [["run", "legend_run"], ["free", "legend_free"], ["line", "legend_line"],
     ["merge", "merge_above"], ["wait", "legend_wait"]];
   const html = `<div class="build-limits-scroll"><table class="build-limits-table" aria-label="${esc(words.table)}">

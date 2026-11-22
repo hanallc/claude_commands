@@ -2705,10 +2705,17 @@ class TargetReading:
     snapshots: target_availability.Snapshots
     mac: limits_view.MacReading | None = None
 
+    def without_mac_facts(self) -> TargetReading:
+        snapshots = self.snapshots
+        if isinstance(snapshots, tuple):
+            snapshots = tuple(snapshot for snapshot in snapshots if snapshot.target.platform != "macos")
+        return TargetReading(snapshots, limits_view.MacReading(self.mac.target, None) if self.mac else None)
 
-def read_targets() -> TargetReading:
+
+def read_targets(background: limits_view.Background | None = None) -> TargetReading:
     snapshots = target_availability.read_snapshots()
-    return TargetReading(snapshots, limits_view.read_mac(snapshots))
+    names = {name for names in background.origins.names.values() for name in names} if background else ()
+    return TargetReading(snapshots, limits_view.read_mac(snapshots, names))
 
 
 def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.UseConfiguredValue.CURRENT,
@@ -2728,10 +2735,10 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
     if not isinstance(captured, admission_records.MemoryRoom) or not isinstance(host, admission_records.HostMemory):
         raise RuntimeError("recorded room unavailable")
     if target_reading is None:
-        target_reading = read_targets() if limit_background is not None else TargetReading(target_availability.read_snapshots())
+        target_reading = TargetReading(target_availability.read_snapshots())
     snapshots = target_reading.snapshots
     mac = target_reading.mac
-    mac_sessions = [claim["submitting_session"] for claim in mac.claims if claim["submitting_session"]] if mac else []
+    mac_sessions = [claim.working_session for claim in mac.claims if claim.working_session] if mac else []
     slot_roots = conf.read_or_repository("build_folders").values()
     mac_reading = queue_view.read_mac_builds()
     mac_machine = conf.read_or_repository("machines").words("mac.hosts")[0]
@@ -3131,9 +3138,12 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
         work_rows.sort(key=lambda row: row["started_at"])
     visible_waits = limits_view.visible_waits(model, {place: row["name"] for place, row in waiters.items()},
                                               {owner: row["name"] for owner, row in cloud_waiters.items()})
-    waiting_rows: list[WaitRow | CloudWaitRow] = [
-        cloud_waiters[entry.owner] if isinstance(entry := visible.source, wire.CloudRow) else waiters[entry.position]
-        for visible in visible_waits]
+    waiting_rows: list[WaitRow | CloudWaitRow] = []
+    for visible in visible_waits:
+        entry = visible.source
+        wait_row = cloud_waiters.get(entry.owner) if isinstance(entry, wire.CloudRow) else waiters.get(entry.position)
+        if wait_row is not None:
+            waiting_rows.append(wait_row)
     unmatched_priority_text = ""
     unmatched_priority_entries: list[admission_records.PriorityEntry] = []
     queued_priority_units: list[str] = []
@@ -3276,29 +3286,36 @@ class LimitsRefresh:
         return self.saved
 
 
-def refresh_targets(result: Future[TargetReading]) -> None:
+def refresh_targets(result: Future[tuple[float, TargetReading]], started: float,
+                    background: limits_view.Background | None) -> None:
     try:
-        result.set_result(read_targets())
+        result.set_result((started, read_targets(background)))
     except (OSError, ValueError, KeyError, RuntimeError) as error:
         result.set_exception(error)
 
 
 class TargetRefresh:
     def __init__(self) -> None:
-        self.saved: TargetReading = TargetReading(())
-        self.pending: Future[TargetReading] | None = None
+        self.saved: tuple[float, TargetReading] | None = None
+        self.pending: Future[tuple[float, TargetReading]] | None = None
+        self.next_at: float = 0.0
 
-    def current(self) -> TargetReading:
+    def current(self, now: float, interval: float, background: limits_view.Background | None) -> TargetReading:
         if self.pending is not None and self.pending.done():
             try:
                 self.saved = self.pending.result()
             except (OSError, ValueError, KeyError, RuntimeError) as error:
                 print(f"Target refresh failed: {error}", file=sys.stderr)
             self.pending = None
-        if self.pending is None:
+        if self.pending is None and now >= self.next_at:
             self.pending = Future()
-            Thread(target=refresh_targets, args=(self.pending,), name="build-target-refresh", daemon=True).start()
-        return self.saved
+            self.next_at = now + interval
+            Thread(target=refresh_targets, args=(self.pending, now, background),
+                   name="build-target-refresh", daemon=True).start()
+        if self.saved is None:
+            return TargetReading(())
+        started, reading = self.saved
+        return reading if now - started < 2 * interval else reading.without_mac_facts()
 
 
 def main(argv: Sequence[str]) -> int:
@@ -3346,14 +3363,17 @@ def main(argv: Sequence[str]) -> int:
                     holders = TokenHoldersUnknown(refused)
                 # Count from after the request, so slow reads before it never shorten the interval.
                 next_tokens_at = time.monotonic() + configuration.token_dump_seconds
+            target_reading = (read_targets(limit_background) if args.once else
+                              target_refresh.current(time.monotonic(), configuration.interval_seconds, limit_background))
             payload: MemoryPage | RetainedReading | PageUnavailable = reading(configuration, report_version, holders,
-                limit_background=limit_background, target_reading=read_targets() if args.once else target_refresh.current())
+                limit_background=limit_background, target_reading=target_reading)
             last_good = payload
         except (OSError, ValueError, KeyError, RuntimeError) as error:
             if isinstance(last_good, NoGoodReading):
                 payload = {"ok": False, "error": str(error), "read_at": time.time()}
             else:
                 payload = {**last_good, "read_error": str(error), "error_at": time.time()}
+                _ = payload.pop("build_limits", None)
         write_text_atomic(target, page_json(payload), new_file_mode=0o644)
         if args.once:
             return 0

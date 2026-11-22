@@ -6,6 +6,7 @@ import sqlite3
 import subprocess
 import tempfile
 import unittest
+from concurrent.futures import Future
 from contextlib import closing
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
@@ -13,7 +14,7 @@ from pathlib import Path
 from unittest import mock
 
 from scripts.aws_target import hana_box, hana_placement
-from scripts.build_queue import admission_protocol as wire, admission_records as records, limits_view, queue_view
+from scripts.build_queue import admission_protocol as wire, admission_records as records, limits_view, memory_feed, queue_view
 from scripts.build_queue.admission_wire import ReservedCloudSlot
 from scripts.build_queue.cloud_progress import NoCloudProgress
 from scripts.build_queue.progress_profile import NoCounter
@@ -21,6 +22,7 @@ from scripts.build_queue.queue_fixture import fixture_reservation, head_reading
 from scripts.build_targets import target_config, targets
 from scripts.build_targets.execution_transport import HanaControlTransport
 from scripts.buildlog import repository, store
+from scripts.lib import conf, process_start
 from scripts.lib.git_test_support import commit_repository, fixture_git_environment
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.mac_test import claim_state, mac_test
@@ -31,6 +33,7 @@ class BuildLimitsTests(unittest.TestCase):
         reading = head_reading()
         now = reading.explanation.now
         primary = "https://example.invalid/team/project"
+        secondary = "https://example.invalid/other/project"
         hana = "https://example.invalid/team/hana"
         with tempfile.TemporaryDirectory() as directory, closing(sqlite3.connect(":memory:")) as index:
             root = Path(directory)
@@ -53,10 +56,14 @@ class BuildLimitsTests(unittest.TestCase):
             for folder, name in ((allowed, "quiet"), (alias, "quiet"), (denied, "denied")):
                 git(root, "init", "-q", str(folder))
                 git(folder, "remote", "add", "origin", f"https://example.invalid/team/{name}.git")
+            other_project = root / "other" / "project"
+            other_project.parent.mkdir()
+            git(root, "init", "-q", str(other_project))
+            git(other_project, "remote", "add", "origin", secondary)
             _ = index.execute("CREATE TABLE steps (repo_identity TEXT, repo_path TEXT, started_at TEXT)")
             _ = index.executemany("INSERT INTO steps VALUES (?, ?, ?)", [
                 (primary, "", store.utc_iso(now)),
-                ("https://example.invalid/other/project", "", store.utc_iso(now)),
+                (secondary, str(other_project), store.utc_iso(now)),
                 ("https://example.invalid/team/quiet", str(allowed), store.utc_iso(now - 29 * 86400)),
                 ("https://example.invalid/team/quiet", str(alias), store.utc_iso(now - 29 * 86400)),
                 ("https://example.invalid/team/denied", str(denied), store.utc_iso(now - 29 * 86400)),
@@ -68,11 +75,13 @@ class BuildLimitsTests(unittest.TestCase):
             origins = limits_view.Origins()
             with mock.patch.object(repository, "output", wraps=repository.output) as git_read:
                 history = limits_view.recent_steps(index, now, origins)
-                self.assertEqual(git_read.call_count, 4)
+                self.assertEqual(git_read.call_count, 5)
             self.assertEqual(origins.folders[str(scratch)], primary)
-            mac_snapshot = self.read_mac_fixture(root, scratch)
-            mac = limits_view.read_mac((mac_snapshot,))
-            self.assertIsNotNone(mac)
+            mac_snapshot, corrupt_snapshot = self.read_mac_fixture(root, scratch)
+            mac_names = {name for names in origins.names.values() for name in names}
+            mac = limits_view.read_mac((mac_snapshot,), mac_names)
+            corrupt_mac = limits_view.read_mac((corrupt_snapshot,), mac_names)
+            assert mac is not None
         policy = records.RepositoryRunLimits({"natedev.project": 1, "natedev.other": 2}, "merge-owner")
         reservations = (
             {**fixture_reservation(101, 0, step="gate"), "repo": "project", "repo_identity": primary, "unit": "regular"},
@@ -89,8 +98,9 @@ class BuildLimitsTests(unittest.TestCase):
             records.WaitingStep(3, "", "", "test", "", now, 0, records.NeedsMemory()),
             records.WaitingStep(4, "", "", "check", "", now, 0, records.ReadingUnavailable(),
                                 route=target_config.PinnedTarget("fixture-aws")),
-            records.WaitingStep(5, "", "", "check", "", now, 0, records.ReadingUnavailable(), route=target_config.MAC_ONLY),
-            records.WaitingStep(8, "", "", "test", str(scratch), now, 0, records.RunLimitWait(9, 9, "project", "mac"),
+            records.WaitingStep(5, "", "", "check", "", now, 0, records.BehindHead("remote startup", now, ""),
+                                route=target_config.MAC_ONLY),
+            records.WaitingStep(8, "", "", "test", str(scratch), now, 0, records.BehindHead("remote startup", now, ""),
                                 route=target_config.PinnedTarget("mac")),
             records.WaitingStep(9, "", "", "test", "", now, 0, records.ReadyForAdmission(),
                                 route=target_config.PinnedTarget("other-mac")),
@@ -105,21 +115,22 @@ class BuildLimitsTests(unittest.TestCase):
         queue = wire.CloudQueueRead(replace(reading.view, waiting=waiting), explanation, [(Path("one"), ranked)],
                                     cloud=cloud, cloud_slots=4, cloud_gate_stale_pushes=1)
         names = {1: "Run limit", 2: "Disk wait", 3: "Memory wait", 4: "AWS target wait",
-                 5: "Mac wait", 6: "Mac run limit", 7: "Unplaced wait"}
+                 5: "Mac wait", 7: "Unplaced wait"}
         cloud_names = {cloud[0].owner: "Cloud wait", cloud[1].owner: "Starting wait"}
         waits = limits_view.visible_waits(queue_view.QueueModel(queue, {}), names, cloud_names)
         saved = limits_view.Background(history, limits_view.Metric("money", 2, 5, "USD", "estimate"),
             cloud_slots=9, hana=(limits_view.HanaCapacity(hana, "fixture-host", 1, None),),
             aws_targets=frozenset({"fixture-aws"}), origins=origins)
 
-        with mock.patch.object(repository, "output", side_effect=AssertionError("Git read in the feed tick")):
+        with (mock.patch.object(repository, "output", side_effect=AssertionError("Git read in the feed tick")),
+              mock.patch.object(conf, "read", side_effect=AssertionError("Config read in the feed tick"))):
             shown = limits_view.build_limits(queue, (mac_snapshot,), waits, cloud_names,
-                                             {"session": "Mac build"}, saved, UTC, mac=mac)
+                                             {"session": "Mac build", "cleanup": "Old name"}, saved, UTC, mac=mac)
         self.assertEqual([(row.name, row.owner, row.quiet) for row in shown.repositories], [
-            ("hana", "", False), ("project", "team", False), ("denied", "", True),
+            ("cleanup", "", False), ("hana", "", False), ("project", "team", False), ("denied", "", True),
             ("project", "other", True), ("quiet", "", True),
         ])
-        hana_row, project_row, denied_row, spare_project, quiet = shown.repositories
+        cleanup, hana_row, project_row, denied_row, spare_project, quiet = shown.repositories
         cell = project_row.natedev
         self.assertEqual((cell.used, cell.limit, cell.runs, cell.merge_above), (2, 1, ["regular"], ["merge-owner"]))
         self.assertEqual(cell.waits, {"The run limit for project on natedev is full.": ["Run limit"]})
@@ -132,13 +143,12 @@ class BuildLimitsTests(unittest.TestCase):
         self.assertEqual(shown.mac.state, "Held until 13:00 UTC")
         self.assertEqual(shown.mac.shared, ())
         self.assertEqual(shown.mac.unattributed, 1)
-        self.assertEqual(shown.mac.waits, {"The queue cannot check whether this run can start.": ["Mac wait"]})
+        self.assertEqual(shown.mac.waits, {"This run waits while a step starts on another machine.": ["Mac wait", ""]})
         self.assertEqual((project_row.mac.used, project_row.mac.limit, project_row.mac.runs), (1, 1, ["Mac build"]))
-        self.assertEqual(project_row.mac.waits, {"The run limit for project on Mac is full.": ["Mac run limit"]})
+        self.assertEqual((cleanup.mac.used, cleanup.mac.limit, cleanup.mac.runs), (1, 1, []))
         self.assertEqual((quiet.mac.used, quiet.mac.limit, quiet.mac.note), (0, 1, ""))
-        self.assertEqual((denied_row.mac.limit, denied_row.mac.note), (None, "Does not run here"))
-        self.assertIsNone(spare_project.mac.limit)
-        self.assertEqual(spare_project.mac.note, "")
+        self.assertEqual(denied_row.mac, limits_view.Cell())
+        self.assertEqual(spare_project.mac, limits_view.Cell())
         self.assertEqual(next(metric for metric in shown.natedev.shared if metric.label == "disk").waits,
                          {"The build disk has less free space than the queue requires.": ["Disk wait"]})
         self.assertEqual(shown.natedev.shared[0].waits, {"This run needs more free memory to start.": ["Memory wait"]})
@@ -153,6 +163,14 @@ class BuildLimitsTests(unittest.TestCase):
         self.assertEqual((idle.aws.shared[0].used, idle.aws.shared[0].limit), (0, 9))
         self.assertEqual(idle.aws.state, "")
         self.assertIsNone(next(metric for metric in idle.natedev.shared if metric.label == "disk").used)
+        idle_mac = limits_view.build_limits(reading, (mac_snapshot,), (), {}, {}, saved, UTC, mac=replace(mac, claims=()))
+        self.assertEqual([(row.owner, row.mac.used, row.mac.limit) for row in idle_mac.repositories if row.name == "project"],
+                         [("other", 0, 1), ("team", None, None)])
+        corrupt = limits_view.build_limits(queue, (corrupt_snapshot,), waits, cloud_names, {}, saved, UTC, mac=corrupt_mac)
+        self.assertEqual(corrupt.mac.state, "Not available")
+        self.assertEqual(corrupt.mac.waits, shown.mac.waits)
+        self.assertTrue(all(row.mac == limits_view.Cell() for row in corrupt.repositories))
+        self.check_mac_expiry(mac_snapshot, mac, saved)
         within_limit = replace(queue, explanation=replace(explanation,
             policy=replace(explanation.policy, repository_runs=records.RepositoryRunLimits({"natedev.project": 2}, "merge-owner"))))
         within = limits_view.build_limits(within_limit, (), waits, cloud_names, {}, saved, UTC)
@@ -161,7 +179,23 @@ class BuildLimitsTests(unittest.TestCase):
         self.assertEqual(merge_cell.runs, ["regular", "merge-owner"])
         self.check_hana_claim(hana)
 
-    def read_mac_fixture(self, root: Path, scratch: Path) -> targets.TargetSnapshot:
+    def check_mac_expiry(self, snapshot: targets.TargetSnapshot, mac: limits_view.MacReading,
+                         saved: limits_view.Background) -> None:
+        refresher = memory_feed.TargetRefresh()
+        local = targets.TargetSnapshot(target_config.LocalTarget("natedev", "linux"), (targets.Free(),),
+                                       (), snapshot.backoff)
+        reading = memory_feed.TargetReading((local, snapshot), mac)
+        refresher.saved = (10.0, reading)
+        pending: Future[tuple[float, memory_feed.TargetReading]] = Future()
+        refresher.pending = pending
+        self.assertIs(refresher.current(13.9, 2.0, saved), reading)
+        expired = refresher.current(14.0, 2.0, saved)
+        self.assertEqual(expired, memory_feed.TargetReading((local,), limits_view.MacReading("mac", None)))
+        pending.set_result((14.0, reading))
+        refresher.next_at = 16.0
+        self.assertIs(refresher.current(14.1, 2.0, saved), reading)
+
+    def read_mac_fixture(self, root: Path, scratch: Path) -> tuple[targets.TargetSnapshot, targets.TargetSnapshot]:
         settings = root / "mac.conf"
         _ = settings.write_text(
             "# range: 1..1000\nfree_floor_gib=47\nlinux_only.project=linux_package\nlinux_only.mac-quiet=\n",
@@ -176,11 +210,17 @@ class BuildLimitsTests(unittest.TestCase):
             claim_state.HolderQueue("holder"), claim_state.NoShowrunner(), "not_configured",
             claim_state.FreeMessageNotNeeded())
         mac_test.write_block(state / "block.json", block)
+        started = process_start.process_start(os.getpid())
+        assert isinstance(started, process_start.Started)
         saved: claim_state.RemoteJobClaim = {"claim_id": "project-claim", "episode": "episode", "attempt": "attempt",
-            "submitting_session": "session", "pid": 9, "proc_start": "", "what": "test", "worktree": str(scratch),
+            "submitting_session": "session", "pid": os.getpid(), "proc_start": started.start, "what": "test",
+            "worktree": str(scratch),
             "since": since.isoformat(), "repo_name": "project", "repo_key": "", "remote_host": "fixture-host"}
         mac_test.write_json(claims / "e5870be3.json", saved)
         mac_test.write_json(claims / "copied-record.json", saved)
+        cleanup: claim_state.RemoteJobClaim = {**saved, "claim_id": "cleanup", "pid": 2**30,
+            "submitting_session": "cleanup", "repo_name": "cleanup", "repo_key": "https://example.invalid/team/cleanup"}
+        mac_test.write_json(claims / "cleanup.json", cleanup)
         other: claim_state.RemoteJobClaim = {**saved, "claim_id": "whole-claim", "worktree": "private relative folder"}
         del other["repo_name"], other["repo_key"]
         mac_test.write_json(state / "run.json", other)
@@ -191,9 +231,13 @@ class BuildLimitsTests(unittest.TestCase):
         with (mock.patch.dict(os.environ, {"CONF_DIR": str(root), "MAC_TEST_STATE_DIR": str(state)}),
               mock.patch.object(mac_test, "holder_name", return_value="holder"),
               mock.patch.object(targets, "utc_now", return_value=since)):
-            snapshot = targets.ssh_target_snapshot(target_config.configured_ssh_target("mac"))
+            target = target_config.configured_ssh_target("mac")
+            snapshot = targets.ssh_target_snapshot(target)
+            _ = (claims / "corrupt.json").write_text("{", encoding="utf-8")
+            corrupt = targets.ssh_target_snapshot(target)
         self.assertIsInstance(snapshot.states[0], targets.Held, str(snapshot.states[0]))
-        return snapshot
+        self.assertIsInstance(corrupt.states[0], targets.StateUnreadable)
+        return snapshot, corrupt
 
     def check_hana_claim(self, origin: str) -> None:
         transport = HanaControlTransport(Path("private-hana.conf"), "fixture-host")
