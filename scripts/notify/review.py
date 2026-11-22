@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""Review phone drafts; keep one owner for delivery of a held push."""
+"""Review phone drafts and manage delivery of held pushes.
+
+Use `texts --ask --id ID` to show every example and request approval in the current herdr pane.
+"""
 from __future__ import annotations
 try:
     with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
@@ -30,9 +33,7 @@ from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, NotRequired, Protocol, TypedDict, cast
 
-from scripts.notify import reply_asks
-from scripts.notify import push_texts
-from scripts.notify import push_reference
+from scripts.notify import push_reference, push_texts, reply_asks, text_asks
 
 from scripts.lib.user_zone import user_zone, user_zone_name, zone_label  # noqa: E402
 from scripts.lib import conf_reads, models_registry, nix_env
@@ -1484,7 +1485,7 @@ def texts(ids: list[str], approve: bool = False, *, runner: ProcessRunner = run_
     if approve and push_texts.REVIEWED_FILE.exists():
         approvals = text_approvals(cast(object, json.loads(push_texts.REVIEWED_FILE.read_text(encoding="utf-8"))))
     failed = False
-    timeout_seconds = review_timeout_seconds()
+    timeout_seconds: float | None = None
     for entry in entries:
         if ids and entry.id not in ids:
             continue
@@ -1493,10 +1494,21 @@ def texts(ids: list[str], approve: bool = False, *, runner: ProcessRunner = run_
             approvals[entry.id] = {name: approval for name, approval in approvals[entry.id].items()
                                    if name in current_examples}
         digest = push_texts.fingerprint(entry)
+        if approve and isinstance(authority, ReviewerApprovalRequired):
+            response = text_asks.approval_for(entry.id, digest)
+            if isinstance(response, text_asks.Approved):
+                approval = TextApproval(
+                    sha256=digest, time=response.time, objections=[],
+                    reviewer=f"user-prompt: {response.words} ({response.session}, {response.time})")
+                approvals[entry.id] = {example.name: approval for example in entry.examples}
+                print(f"{entry.id} approved with the words {response.words!r}.")
+                continue
         for example in entry.examples:
             rendered = push_texts.render_entry(entry, example.values)
             draft = Draft(rendered.sender, {"note": "0", "decision": "1", "blocked": "2"}[rendered.need],
                           rendered.title, rendered.action, rendered.body, False, rendered.session)
+            if timeout_seconds is None:
+                timeout_seconds = review_timeout_seconds()
             outcome = _review(draft, False, runner, timeout_seconds=timeout_seconds, check_template_fit=False)
             print_review(draft, outcome, f"{entry.id}/{example.name}")
             log_review(draft, outcome, dry=True, text_id=entry.id)
@@ -1516,6 +1528,27 @@ def texts(ids: list[str], approve: bool = False, *, runner: ProcessRunner = run_
         _ = scratch.write_text(json.dumps(approvals, indent=2, sort_keys=True) + "\n", encoding="utf-8")
         _ = scratch.replace(push_texts.REVIEWED_FILE)
     return int(failed)
+
+
+def ask_text(text_id: str) -> int:
+    pane = os.environ.get("HERDR_PANE_ID")
+    session = os.environ.get("CLAUDE_CODE_SESSION_ID")
+    if not pane or not session:
+        print("review: --ask requires a herdr pane and a Claude session ID.", file=sys.stderr)
+        return 2
+    entry = next((entry for entry in push_texts.catalog() if entry.id == text_id), None)
+    if entry is None:
+        print(f"review: unknown push text ID {text_id}.", file=sys.stderr)
+        return 2
+    examples = [(example.name, push_texts.render_entry(entry, example.values)) for example in entry.examples]
+    try:
+        text_asks.open_ask(entry.id, push_texts.fingerprint(entry), session, pane, datetime.now().astimezone())
+    except OSError as error:
+        print(f"review: cannot save the ask. {error}", file=sys.stderr)
+        return 2
+    for name, rendered in examples:
+        print(f"{entry.id}/{name}\n{rendered.title}\n{rendered.message}")
+    return 0
 
 
 def list_texts() -> int:
@@ -1552,7 +1585,10 @@ def main(argv: list[str]) -> int:
     _ = commands.add_parser("due")
     text_parser = commands.add_parser("texts")
     _ = text_parser.add_argument("--id", action="append", default=[])
-    _ = text_parser.add_argument("--approve", action="store_true")
+    text_mode = text_parser.add_mutually_exclusive_group()
+    _ = text_mode.add_argument("--approve", action="store_true")
+    _ = text_mode.add_argument("--ask", action="store_true",
+                               help="print the examples and request approval in the current herdr pane")
     _ = text_parser.add_argument("--user-spec", metavar="SOURCE")
     _ = commands.add_parser("list", help="one line per phone text: its id and purpose")
     show_parser = commands.add_parser("show", help="one phone text's template and its first example")
@@ -1579,12 +1615,17 @@ def main(argv: list[str]) -> int:
     command = cast(str, arguments.command)
     if command == "texts":
         source = cast(str | None, arguments.user_spec)
+        ids = cast(list[str], arguments.id)
+        if cast(bool, arguments.ask):
+            if len(ids) != 1 or source is not None:
+                parser.error("--ask requires one --id and cannot use --user-spec")
+            return ask_text(ids[0])
         authority: TextApprovalAuthority = REVIEWER_APPROVAL_REQUIRED
         if source is not None:
             if not cast(bool, arguments.approve) or not source.strip():
                 parser.error("--user-spec requires --approve and a nonempty source")
             authority = UserSpecifiedText(source)
-        return texts(cast(list[str], arguments.id), cast(bool, arguments.approve), authority=authority)
+        return texts(ids, cast(bool, arguments.approve), authority=authority)
     if command == "list":
         return list_texts()
     if command == "show":
