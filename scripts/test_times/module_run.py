@@ -33,7 +33,8 @@ from typing import TYPE_CHECKING, ClassVar, Literal, Protocol, TypedDict, cast, 
 import unittest
 import unittest.case as unittest_case
 
-from scripts.lib.python_startup.sitecustomize import gate_parent_pid
+from scripts.lib import build_folders, git_files
+from scripts.lib.python_startup.sitecustomize import checkout_root, gate_parent_pid, verified_gate
 
 if TYPE_CHECKING:
     from scripts.test_times.gate_record import TestStatus, TestTime
@@ -515,7 +516,7 @@ class TimedRunner(unittest.TextTestRunner):
         return result
 
 
-def main() -> None:
+def run_module_with_config_log(start_dir: Path, pattern: str, parent: Path) -> None:
     try:
         from scripts.lib import conf_reads
     except ImportError:
@@ -523,28 +524,23 @@ def main() -> None:
 
         if find_spec("scripts.lib.conf_reads") is not None:
             raise
-        run_module(NoConfigReadLog())
+        run_module(start_dir, pattern, NoConfigReadLog())
         return
 
-    from scripts.lib import build_folders
-
-    with build_folders.tool_folder("config-reads") as temporary:
-        log = Path(temporary) / "reads"
+    request = build_folders.UniqueBuildFolder("config-reads-", build_folders.ExplicitBuildParent(parent))
+    with build_folders.temporary_build_folder(request) as temporary:
+        log = temporary / "reads"
         log.touch()
         with conf_reads.record_reads(log):
-            run_module(log)
+            run_module(start_dir, pattern, log)
 
 
-def run_module(config_log: Path | NoConfigReadLog) -> None:
-    if len(sys.argv) != 3:
-        print("usage: module_run.py <start_dir> <pattern>", file=sys.stderr)
-        sys.exit(2)
-    start_dir, pattern = sys.argv[1:]
+def run_module(start_dir: Path, pattern: str, config_log: Path | NoConfigReadLog) -> None:
     output = os.environ.pop("TEST_TIMES_OUT", None)
     TimedRunner.destination = NoTimesOutput() if output is None else TimesOutput(Path(output), config_log)
     try:
         names: list[str] = []
-        for path in sorted(Path(start_dir).resolve().glob(pattern)):
+        for path in sorted(start_dir.glob(pattern)):
             candidates: list[tuple[str, ...]] = []
             for entry in sys.path:
                 base = Path(entry).resolve()
@@ -572,14 +568,13 @@ def run_module(config_log: Path | NoConfigReadLog) -> None:
 
 
 @contextmanager
-def private_run_roots() -> Generator[Callable[[], None]]:
+def private_run_roots(parent: Path) -> Generator[Callable[[], None]]:
     """Keep imported run roots and child processes under one private folder."""
-    from scripts.lib import build_folders
-
     names = ("SCRATCH_ROOT", "ASTRA_REVIEW_DIR")
     previous = {name: os.environ[name] for name in names if name in os.environ}
+    request = build_folders.UniqueBuildFolder("test-run-roots-", build_folders.ExplicitBuildParent(parent))
     with ExitStack() as cleanup:
-        root = cleanup.enter_context(build_folders.tool_folder("test-run-roots"))
+        root = cleanup.enter_context(build_folders.temporary_build_folder(request))
         try:
             os.environ.update(SCRATCH_ROOT=str(root / "scratch"), ASTRA_REVIEW_DIR=str(root / "astra"))
             yield cleanup.close
@@ -589,13 +584,13 @@ def private_run_roots() -> Generator[Callable[[], None]]:
             os.environ.update(previous)
 
 
-def run_with_descendant_cleanup(cleanup_run_roots: Callable[[], None]) -> None:
+def run_with_descendant_cleanup(run: Callable[[], None], cleanup_run_roots: Callable[[], None]) -> None:
     """Use kernel events while the supervisor reaps every adopted descendant."""
     global startup_cpu_s
     from scripts.lib.descendants import adopt_descendants
 
     if not adopt_descendants():
-        main()
+        run()
         return
     libc = ctypes.CDLL(None, use_errno=True)
     watched = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP, signal.SIGCHLD)
@@ -628,7 +623,7 @@ def run_with_descendant_cleanup(cleanup_run_roots: Callable[[], None]) -> None:
         startup_cpu_s = usage.ru_utime + usage.ru_stime
         _ = signal.signal(signal.SIGCHLD, previous_sigchld)
         _ = signal.pthread_sigmask(signal.SIG_SETMASK, blocked)
-        main()
+        run()
         return
     status = 0
     received = 0
@@ -683,6 +678,25 @@ def run_with_descendant_cleanup(cleanup_run_roots: Callable[[], None]) -> None:
     sys.exit(exit_code)
 
 
+def main() -> None:
+    if len(sys.argv) != 3:
+        print("usage: module_run.py <start_dir> <pattern>", file=sys.stderr)
+        sys.exit(2)
+    start_dir = Path(sys.argv[1]).resolve()
+    pattern = sys.argv[2]
+    if verified_gate():
+        parent = build_folders.inherited_temporary_parent()
+    else:
+        try:
+            checkout = git_files.locate(start_dir).toplevel
+        except git_files.GitFilesError:
+            checkout = Path(checkout_root(str(start_dir)) or start_dir)
+        parent = build_folders.test_runs_parent(checkout)
+        parent.mkdir(parents=True, exist_ok=True)
+        build_folders.sweep_temporary_build_folders(parent, wait=False)
+    with private_run_roots(parent) as cleanup_run_roots:
+        run_with_descendant_cleanup(lambda: run_module_with_config_log(start_dir, pattern, parent), cleanup_run_roots)
+
+
 if __name__ == "__main__":
-    with private_run_roots() as cleanup_run_roots:
-        run_with_descendant_cleanup(cleanup_run_roots)
+    main()

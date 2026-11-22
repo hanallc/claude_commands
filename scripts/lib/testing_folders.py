@@ -12,7 +12,7 @@ from scripts.lib import build_folders
 from scripts.lib.session_folder import ROOT_ENV as SESSION_ROOT_ENV
 
 
-RUN_FOLDER_ENV = "DEVTOOLS_TEST_RUN_FOLDER"
+RUN_FOLDER_ENV = build_folders.TEST_RUN_FOLDER_ENV
 BUILDLOG_ENV = "BUILDLOG_DIR"
 
 
@@ -25,11 +25,9 @@ def test_run_folder() -> Generator[Path]:
     """
     previous = {name: os.environ.get(name) for name in ("TMPDIR", RUN_FOLDER_ENV, BUILDLOG_ENV, SESSION_ROOT_ENV)}
     old_tempdir = tempfile.tempdir
-    inherited = build_folders.inherited_temporary_parent().resolve()
-    parent = (inherited.parent if str(inherited) == previous[RUN_FOLDER_ENV]
-              else inherited / "test-runs")
+    parent = build_folders.test_runs_parent(Path(__file__).resolve().parents[2])
     parent.mkdir(parents=True, exist_ok=True)
-    build_folders.sweep_temporary_build_folders(parent)
+    build_folders.sweep_temporary_build_folders(parent, wait=False)
     request = build_folders.UniqueBuildFolder("test-run-", build_folders.ExplicitBuildParent(parent))
     with build_folders.temporary_build_folder(request) as path:
         os.environ["TMPDIR"] = str(path)

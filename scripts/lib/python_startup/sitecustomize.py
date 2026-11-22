@@ -397,7 +397,7 @@ def _install_unittest_boundary() -> None:
         sys.meta_path.insert(0, UnittestBoundary())
 
 
-def _verified_gate() -> bool:
+def verified_gate() -> bool:
     """Check the parent proof that the module supervisor can pass through a fork."""
     import select
 
@@ -413,7 +413,9 @@ def _verified_gate() -> bool:
 
 
 def _begin_direct_test() -> None:
-    if _verified_gate():
+    sys.dont_write_bytecode = True
+    os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
+    if verified_gate():
         return
     from contextlib import AbstractContextManager, nullcontext
     from pathlib import Path
