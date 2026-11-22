@@ -3041,8 +3041,11 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
             "read_at": mac_reading.read_at, "used": queue_view.MacMemoryUnavailable(),
             "stage": queue_view.MacStageUnavailable(), "vcpus": queue_view.MacJobsUnavailable(), "status": mac_status})
     else:
+        mac_claims = next((snapshot.claims for snapshot in snapshots
+                           if snapshot.target.name == (mac_reading.target or "mac")
+                           and snapshot.target.platform == "macos"), ()) if isinstance(snapshots, tuple) else ()
         with staff.supplied_snapshot(staff_display.members):
-            mac_units = mac_build_units(mac_reading.builds, target_availability.mac_claims(snapshots))
+            mac_units = mac_build_units(mac_reading.builds, mac_claims)
         mac_steps = {step.mac_placement: step for step in parsed.view.running if step.mac_placement}
         for build in mac_reading.builds:
             current = members.labels_for(build.session, mac_machine, Path(build.folder))
@@ -3216,7 +3219,7 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
             limits_view.Metric("Memory for builds", gib(captured.cap_use),
                                gib(captured.cap) if isinstance(captured.cap, int) else None, "GiB"),
             folder_settings, limit_background, zone, mac_runs,
-            gib(mac_disk_bytes) if mac_disk_bytes is not None else None)
+            gib(mac_disk_bytes) if mac_disk_bytes is not None else None, mac_activity_target=mac_reading.target)
     page["render_seconds"] = time.perf_counter() - started
     return page
 

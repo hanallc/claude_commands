@@ -1,7 +1,7 @@
 """Read build activity and prepare rows for the Builds page."""
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field as dataclass_field
 from functools import cached_property
 from enum import Enum
@@ -24,6 +24,7 @@ from scripts.build_queue.admission_records import (reason_phrase as reason_phras
 from scripts.build_queue.queue_evidence import step_labels as step_labels
 from scripts.build_queue.queue_lines import Line, Span
 from scripts.buildlog.parse import cargo_subcommand
+from scripts.build_targets import target_config
 from scripts.lib import cargo_target_config, conf
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.build_steps import RECORDED_STEP_NAMES, StepNames, command_script, read_step_names
@@ -131,6 +132,14 @@ class MacBuildReading:
     unplaced_runs: tuple[UnplacedMacRun, ...] = ()
     home: str = ""
     disk_free_bytes: int | None = None
+    target: str = ""
+
+
+def selected_mac_target(configured: Iterable[target_config.Target]) -> target_config.SshTarget | None:
+    """Select the same Mac for the cached reading and the page."""
+    macs = tuple(target for target in configured
+                 if isinstance(target, target_config.SshTarget) and target.platform == "macos")
+    return next((target for target in macs if target.name == "mac"), macs[0] if macs else None)
 
 
 def mac_reading_path() -> Path:
@@ -244,7 +253,7 @@ def read_mac_builds() -> MacBuildReading:
         return MacBuildReading(float(cast(float, data["read_at"])), tuple(mac_build_from_record(row) for row in rows),
                                str(data.get("error", "")), tuple(unplaced_run_from_record(row)
                                    for row in cast(list[dict[str, object]], data.get("unplaced_runs", []))),
-                               str(data.get("home", "")), mac_disk_free(data))
+                               str(data.get("home", "")), mac_disk_free(data), str(data.get("target", "")))
     except (OSError, ValueError, TypeError, KeyError) as error:
         logging.getLogger(__name__).warning("Mac reading unavailable: %s", error)
         return MacBuildReading(0, (), "Mac reading unavailable")
@@ -682,7 +691,10 @@ def refresh_mac_builds() -> None:
     now = time.time()
     previous = read_mac_builds()
     try:
-        settings = conf.read("mac_test")
+        target = selected_mac_target(target_config.read_targets())
+        if target is None:
+            raise ValueError("No Mac target is configured")
+        settings = conf.read(target.settings)
         result = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o",
             f"ConnectTimeout={settings.number('connect_timeout_s'):g}", settings.text("host"), mac_build_script()],
             stdin=subprocess.DEVNULL, capture_output=True, text=True, check=False, timeout=10)
@@ -699,15 +711,16 @@ def refresh_mac_builds() -> None:
                               if isinstance(counter, progress_profile.ProgressCounter) else {})
             builds.append(mac_build_from_record(row))
         reading = MacBuildReading(now, tuple(sorted(builds, key=lambda build: build.started_at)),
-                                  unplaced_runs=unplaced, home=str(data.get("home", "")), disk_free_bytes=mac_disk_free(data))
+                                  unplaced_runs=unplaced, home=str(data.get("home", "")),
+                                  disk_free_bytes=mac_disk_free(data), target=target.name)
     except (OSError, ValueError, UnicodeError, subprocess.TimeoutExpired) as error:
         logging.getLogger(__name__).warning("Mac reading unavailable: %s", error)
         reading = MacBuildReading(previous.read_at, previous.builds, "Mac reading unavailable",
-                                  previous.unplaced_runs, previous.home, previous.disk_free_bytes)
+                                  previous.unplaced_runs, previous.home, previous.disk_free_bytes, previous.target)
     write_text_atomic(mac_reading_path(), json.dumps({"read_at": reading.read_at, "error": reading.error,
         "builds": [mac_build_record(build) for build in reading.builds],
         "unplaced_runs": [unplaced_run_record(run) for run in reading.unplaced_runs],
-        "home": reading.home, "disk_free_bytes": reading.disk_free_bytes}), new_file_mode=0o644)
+        "home": reading.home, "disk_free_bytes": reading.disk_free_bytes, "target": reading.target}), new_file_mode=0o644)
 
 def step_counter(step: admission_records.RunningStep) -> progress_profile.ProgressCounter | progress_profile.NoCounter:
     """Read the counter from the local memory reading."""

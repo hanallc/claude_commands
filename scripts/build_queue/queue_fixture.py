@@ -230,6 +230,8 @@ class QueueFixture(ExitStack):
         self.enter_context(mock.patch.dict(os.environ, environment))
         config = self.root / "build_admission.conf"
         write_memory_config(config)
+        _ = (self.root / "build_targets.conf").write_text(
+            "targets=mac\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n")
         self.enter_context(mock.patch.dict(os.environ, {"CONF_DIR": str(config.parent)}))
         self.labels: dict[str, UnitLabels] = {}
         _ = self.enter_context(mock.patch.object(gate, "priority_labels", return_value=self.labels))

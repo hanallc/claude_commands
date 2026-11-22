@@ -37,6 +37,7 @@ from scripts.build_queue import snapshot_codec as codec
 from scripts.build_queue import admission_wire as status_wire
 from scripts.lib import conf, inotify
 from scripts.lib.boot_identity import boot_identity
+from scripts.mac_test.claim_state import MacBlocker
 from scripts.lib.proc_text import read_proc_text
 from scripts.build_queue import admission_code
 from scripts.build_queue import admission_protocol as wire
@@ -2726,7 +2727,8 @@ class AdmissionServer:
                     continue
                 if saved is not None and saved.assignment.destination.provider != "local":
                     destination = saved.assignment.destination
-                    decision = records.PlacementBlock(destination.provider, destination.target, "starting", episode)
+                    decision = records.PlacementBlock(destination.provider, destination.target, "starting", episode,
+                                                      destination.mac_decision("starting"))
                 else:
                     decision = self._placement_wait_decision(request, step.reason)
                 step = replace(step, placement_block=decision if isinstance(decision, records.PlacementBlock) else None,
@@ -2801,7 +2803,8 @@ class AdmissionServer:
             candidate = possible[0]
         if candidate is not None and isinstance(candidate.eligibility, placement.TemporaryExclusion):
             destination = candidate.destination
-            return records.PlacementBlock(destination.provider, destination.target, candidate.eligibility.reason, request.episode)
+            return records.PlacementBlock(destination.provider, destination.target, candidate.eligibility.reason,
+                                          request.episode, candidate.mac_decision)
         return wire.PlacementEvidenceWait()
 
     def _placement_reading(self, reading: records.QueueRead) -> records.QueueRead:
@@ -2837,7 +2840,10 @@ class AdmissionServer:
                 unit=identity.unit, project=gate.step_project(request.profile.repo), execution=evidence,
                 assignment_host=assignment.destination.host, verify=identity.verify,
                 mac_placement=f"{assignment.episode}/{assignment.attempt}"
-                    if assignment.destination.provider == "mac" else ""))
+                    if assignment.destination.provider == "mac" else "",
+                mac_startup=assignment.destination.mac_decision("starting")
+                    if isinstance(saved.state, placement.CurrentAssignment) and not retained
+                    and isinstance(saved.permission, placement.PermissionAvailable) else None))
         if not remote:
             return reading
         explained = tuple(records.ExplainedRunningStep(step, records.AdmissionTimeNotRecorded(), 0, 0, 0,
@@ -3288,11 +3294,18 @@ class AdmissionServer:
         sent = request.constraints.command_kind
         kind = recorded_step_kind(request.profile.step) if isinstance(sent, placement.CommandKindNotSent) else sent
         eligibility: placement.HostEligibility
+        mac_blocker: MacBlocker | None = None
+
+        def note_mac_busy(blocker: MacBlocker) -> None:
+            nonlocal mac_blocker
+            mac_blocker = blocker
+
         if build_targets.mac_run_bypasses_repository_policy(target, kind):
             eligibility = placement.AllowedHost()
         elif kind not in placement.STEP_COMMAND_KINDS:
             # The target can never run this command, so a pinned step refuses at once.
-            return placement.FreshHostEvidence(key, self.clock.now(), "", placement.FixedExclusion("command"))
+            return placement.FreshHostEvidence(key, self.clock.now(), "", placement.FixedExclusion("command"),
+                                               mac_blocker="ineligible" if destination.provider == "mac" else None)
         else:
             if isinstance(target, target_config.SshTarget):
                 answer = build_targets.ssh_target_eligibility(target, Path(request.constraints.repository),
@@ -3304,13 +3317,25 @@ class AdmissionServer:
                     configuration=configuration)
             eligibility = (placement.TemporaryExclusion(answer.reason)
                 if isinstance(answer, target_config.ExcludedTarget) else placement.AllowedHost())
+            if destination.provider == "mac" and isinstance(answer, target_config.ExcludedTarget):
+                match answer.reason:
+                    case "busy":
+                        mac_blocker = "starting"
+                    case "blocked":
+                        mac_blocker = "machine-held"
+                    case "disk":
+                        mac_blocker = "disk-floor"
+                    case "repo" | "off" | "linux_only" | "no_tests" | "command" | "local_flag" | "offload_exclude":
+                        mac_blocker = "ineligible"
+                    case _:
+                        pass
         paths = claim_state.state_paths(destination.target)
         # Routing keeps a busy Mac eligible so a step can wait for it. Placement must wait too,
         # or each pass makes a new attempt that the Mac refuses as busy.
         if (isinstance(eligibility, placement.AllowedHost) and isinstance(target, target_config.SshTarget)
                 and target.platform == "macos"
                 and mac_test.free_now(paths, target.settings, Path(request.constraints.repository),
-                                      session=key.session, configuration=configuration) == "busy"):
+                                      session=key.session, configuration=configuration, note_busy=note_mac_busy) == "busy"):
             eligibility = placement.TemporaryExclusion("busy")
         adopted: list[placement.AdoptedProviderClaim] = []
         cleanup: list[placement.RetainedCleanupClaim] = []
@@ -3346,7 +3371,8 @@ class AdmissionServer:
                 session, record["remote_host"], record.get("instance_generation", "")))
             executions.append((reference, self._observe_provider_execution(request, destination, reference,
                 record["remote_host"], record.get("instance_generation", ""), configuration)))
-        return placement.FreshHostEvidence(key, self.clock.now(), generation, eligibility, tuple(adopted), tuple(cleanup), tuple(executions), holder, diagnostic)
+        return placement.FreshHostEvidence(key, self.clock.now(), generation, eligibility, tuple(adopted),
+                                           tuple(cleanup), tuple(executions), holder, diagnostic, mac_blocker)
 
     def _observe_provider_execution(self, request: wire.PlacementRequest, destination: placement.PlacementDestination,
                                     reference: placement.ProviderClaimReference, host: str, generation: str,
@@ -3661,6 +3687,7 @@ done
         for candidate in request.constraints.candidates:
             destination = candidate.destination
             permitted: placement.HostEligibility = candidate.eligibility
+            mac_blocker: MacBlocker | None = None
             selection = request.constraints.selection
             retry = self._target_retry(request, destination, keys)
             if isinstance(selection, placement.PinnedHost) and selection.target != destination.target:
@@ -3679,6 +3706,8 @@ done
                     local_holder = evidence.holder
                 permitted = (evidence.eligibility if isinstance(evidence, placement.FreshHostEvidence)
                              else placement.EvidenceNeeded(evidence.reason))
+                if isinstance(evidence, placement.FreshHostEvidence):
+                    mac_blocker = evidence.mac_blocker
                 if isinstance(evidence, placement.FreshHostEvidence) and isinstance(permitted, placement.AllowedHost):
                     from scripts.mac_test.mac_test import scopes_overlap
 
@@ -3695,9 +3724,12 @@ done
                                  or any(claim.reference == item[0] for item in retained))
                             for claim in (*evidence.cleanup_claims, *evidence.claims)):
                         permitted = placement.TemporaryExclusion("busy")
+                        mac_blocker = "cleanup"
                     elif evidence.observed_at < max((item[1] for item in retained), default=float("-inf")):
                         permitted = placement.EvidenceNeeded("provider evidence predates the retained claim report")
-            result.append(placement.CandidateEligibility(destination, permitted))
+            if isinstance(permitted, placement.FixedExclusion):
+                mac_blocker = "ineligible"
+            result.append(placement.CandidateEligibility(destination, permitted, destination.mac_decision(mac_blocker)))
         return tuple(result), local_holder
 
     def _local_placement_eligibility(self, request: wire.PlacementRequest) -> placement.HostEligibility:
@@ -3956,6 +3988,10 @@ done
                 holder = (evidence.holder if isinstance(evidence, placement.FreshHostEvidence)
                           else placement.ResourceHolderUnknown())
             wait = wire.PlacementResourceWait(decision.target, decision.reason, holder)
+            if (mac := decision.mac_decision) is not None:
+                candidates = tuple(replace(candidate, mac_decision=mac)
+                    if candidate.destination.target == mac.target and candidate.destination.scope == mac.scope
+                    else candidate for candidate in candidates)
         elif isinstance(decision, wire.PlacementEvidenceWait):
             wait = decision
         else:
@@ -4038,7 +4074,7 @@ done
                     continue
                 if isinstance(request.purpose, placement.SpeculativeCopy):
                     if candidate.destination in held_copy_destinations:
-                        self._record_placement_block(request, destination, "busy")
+                        self._record_placement_block(request, destination, "busy", "starting")
                         continue
                     competing = [copy for copy in copies if any(
                         choice.destination == candidate.destination and isinstance(choice.eligibility, placement.AllowedHost)
@@ -4046,7 +4082,7 @@ done
                     newest = max(competing, key=lambda copy: placement.copy_order(
                         cast(placement.SpeculativeCopy, copy.purpose), copy.episode))
                     if newest.episode != request.episode:
-                        self._record_placement_block(request, destination, placement_order_reason(newest))
+                        self._record_placement_block(request, destination, placement_order_reason(newest), "older-request")
                         continue
                 if destination.provider == "local":
                     if owner in local_starts:
@@ -4055,11 +4091,11 @@ done
                 if destination.provider == "scaler":
                     continue
                 if any(same_remote_resource(other, destination) for other in taken):
-                    self._record_placement_block(request, destination, "busy")
+                    self._record_placement_block(request, destination, "busy", "starting")
                     continue
                 older = self._held_for_older(request, destination, held, holds)
                 if older is not None:
-                    self._record_placement_block(request, destination, placement_order_reason(older))
+                    self._record_placement_block(request, destination, placement_order_reason(older), "older-request")
                     continue
                 assignment = self._new_assignment(request, destination, remote_start_hold_seconds)
                 taken.append(destination)
@@ -4093,9 +4129,11 @@ done
             pending_remote_starts=frozenset(pending_remote_starts))
 
     def _record_placement_block(self, request: wire.PlacementRequest,
-                                destination: placement.PlacementDestination, reason: str) -> None:
+                                destination: placement.PlacementDestination, reason: str,
+                                mac_blocker: MacBlocker) -> None:
         _ = self.placement_resource_waits.setdefault(request.episode,
-            records.PlacementBlock(destination.provider, destination.target, reason, request.episode))
+            records.PlacementBlock(destination.provider, destination.target, reason, request.episode,
+                                   destination.mac_decision(mac_blocker)))
 
     def _placement_hold(self, request: wire.PlacementRequest, candidate: placement.CandidateEligibility,
                         answers: dict[tuple[str, placement.PlacementDestination], float]) -> PlacementHold | None:

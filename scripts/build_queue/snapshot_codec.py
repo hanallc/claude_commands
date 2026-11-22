@@ -92,8 +92,10 @@ def wire_record(schema: type, record: dict[str, object], *, writing: bool) -> di
         return {**record, "source_key": source}
     if writing and record.get("verify") == {"kind": "NotVerifyCall"}:
         del record["verify"]
-    if writing and "placement_block" in record and record["placement_block"] is None:
-        del record["placement_block"]
+    if writing:
+        for key in ("placement_block", "mac_decision", "mac_startup"):
+            if key in record and record[key] is None:
+                del record[key]
     if writing and schema.__name__ == "WaitingStep":
         for key in ("placement_pending", "placement_episode", "caller_start"):
             if key in record and not record[key]:

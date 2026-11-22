@@ -244,6 +244,7 @@ class ClaimOwnerRecord(TypedDict):
     repo_key: NotRequired[str]
     repo_name: NotRequired[str]
     slot: NotRequired[int]
+    whole_mac: NotRequired[bool]
     transfers: NotRequired[list[TransferBytes]]
 
 
@@ -289,6 +290,13 @@ class HeldClaim:
     scope: ClaimScope
     path: Path
     record: RunRecord
+    scope_recorded: bool = True
+
+    @property
+    def recorded_scope(self) -> ClaimScope | None:
+        if self.record.get("whole_mac") is True:
+            return WHOLE_MAC
+        return self.scope if self.scope_recorded else None
 
 
 class NoRun:
@@ -411,6 +419,8 @@ def read_run(path: Path) -> RunState:
         if type(slot) is not int or slot < 1:
             raise StateReadError(f"{path} has an invalid slot")
         record["slot"] = slot
+    if values.get("whole_mac") is True:
+        record["whole_mac"] = True
     if "remote_host" not in values:
         return record
     host = values["remote_host"]
@@ -479,6 +489,17 @@ def claim_files(paths: StatePaths) -> tuple[Path, ...]:
     return (paths.run, *repository_files)
 
 
+MacBlocker = Literal["limit-full", "whole-mac-full", "mirror-backoff", "starting", "ineligible",
+                     "machine-held", "disk-floor", "cleanup", "copy-yield", "older-request"]
+
+
+@dataclass(frozen=True)
+class MacDecision:
+    target: str
+    scope: ClaimScope
+    blocker: MacBlocker | None = None
+
+
 @dataclass(frozen=True)
 class ClaimWait:
     caller: int
@@ -489,11 +510,13 @@ class ClaimWait:
     episode: str
     reason: Literal["busy"]
     since: float
+    decision: MacDecision | None = None
 
 
 @contextmanager
 def record_claim_wait(paths: StatePaths, caller: int, folder: str, name: str,
-                      session: SubmittingSession, episode: str) -> Generator[None, None, None]:
+                      session: SubmittingSession, episode: str, *,
+                      decision: MacDecision | None = None) -> Generator[None, None, None]:
     """Keep one record for the life of this claim wait."""
     pid = os.getpid()
     owner = process_start.process_start(pid)
@@ -502,11 +525,15 @@ def record_claim_wait(paths: StatePaths, caller: int, folder: str, name: str,
         yield
         return
     path = paths.claim_waits / f"{pid}-{uuid4().hex}.json"
+    scope = decision.scope if decision is not None else None
+    facts = ({"target": decision.target, "blocker": decision.blocker,
+              "scope": {"name": scope.name, "key": scope.key, "slot": scope.slot}
+              if isinstance(scope, RepositoryScope) else "whole"} if decision is not None else {})
     try:
         paths.claim_waits.mkdir(parents=True, exist_ok=True)
         write_text_atomic(path, json.dumps({"pid": pid, "start": owner.start, "caller": caller, "caller_start": caller_identity.start,
             "folder": folder, "name": name, "session": session_id(session), "episode": episode,
-            "reason": "busy", "since": time.time()}, separators=(",", ":")))
+            "reason": "busy", "since": time.time(), **facts}, separators=(",", ":")))
     except OSError:
         yield
         return
@@ -517,6 +544,21 @@ def record_claim_wait(paths: StatePaths, caller: int, folder: str, name: str,
             path.unlink(missing_ok=True)
         except OSError:
             pass
+
+
+def claim_wait_decision(row: dict[str, object], target: str) -> MacDecision | None:
+    blocker = row.get("blocker")
+    if row.get("target") != target or blocker not in ("limit-full", "whole-mac-full", "copy-yield"):
+        return None
+    scope = row.get("scope")
+    if scope == "whole":
+        return MacDecision(target, WHOLE_MAC, cast(MacBlocker, blocker))
+    if isinstance(scope, dict):
+        fields = cast(dict[str, object], scope)
+        name, key, slot = fields.get("name"), fields.get("key"), fields.get("slot")
+        if isinstance(name, str) and isinstance(key, str) and type(slot) is int:
+            return MacDecision(target, RepositoryScope(name, key, slot), cast(MacBlocker, blocker))
+    return None
 
 
 def read_claim_waits(paths: StatePaths) -> tuple[ClaimWait, ...]:
@@ -546,7 +588,8 @@ def read_claim_waits(paths: StatePaths) -> tuple[ClaimWait, ...]:
             if (isinstance(since, (int, float))
                     and isinstance(folder, str) and isinstance(name, str) and isinstance(session, str)
                     and isinstance(episode, str) and row.get("reason") == "busy"):
-                waits.append(ClaimWait(caller, caller_start, folder, name, session, episode, "busy", since))
+                waits.append(ClaimWait(caller, caller_start, folder, name, session, episode, "busy", since,
+                                       claim_wait_decision(row, paths.target)))
         except (StateReadError, OSError):
             continue
     return tuple(sorted(waits, key=lambda wait: wait.since))
@@ -575,7 +618,7 @@ def read_claims(paths: StatePaths) -> tuple[HeldClaim, ...]:
             scope = target_claim_scope(paths, worktree) if Path(worktree).is_absolute() else WHOLE_MAC
         else:
             scope = RepositoryScope(path.stem)
-        held.append(HeldClaim(scope, path, record))
+        held.append(HeldClaim(scope, path, record, "repo_name" in record))
     return tuple(sorted(held, key=lambda claim: datetime.fromisoformat(claim.record["since"])))
 
 

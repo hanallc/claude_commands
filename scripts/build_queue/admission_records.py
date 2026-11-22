@@ -30,6 +30,7 @@ from scripts.build_targets.target_config import LocalRequired, StepRoute
 from scripts.buildlog import parse
 from scripts.lib import conf
 from scripts.lib.proc_text import read_proc_text
+from scripts.mac_test.claim_state import MacDecision
 from scripts.production import staff
 from scripts.production.staff import StaffId
 from scripts.lib.test_phase import (CallRecord as CallRecord, NoCallRecord as NoCallRecord,
@@ -1113,6 +1114,7 @@ class PlacementBlock:
     target: str
     reason: str
     episode: str = ""
+    mac_decision: MacDecision | None = None
 
 
 @dataclass(frozen=True)
@@ -1161,6 +1163,7 @@ class RunningStep:
     execution: execution_identity.ExecutionEvidence = execution_identity.ExecutionNotStarted()
     assignment_host: str = ""
     mac_placement: str = field(default="", kw_only=True)
+    mac_startup: MacDecision | None = field(default=None, kw_only=True)
     package: str | PackageNotRecorded = field(default=PackageNotRecorded(), kw_only=True)
     route: StepRoute = field(default=DIRECT_CARGO, kw_only=True)
     verify: VerifyStep = field(default=NotVerifyCall(), kw_only=True)

@@ -115,6 +115,7 @@ class ClaimBusy:
     """A claim attempt refused by a live claim whose scope overlaps."""
 
     holder: RunRecord
+    blocker: claim_state.MacBlocker = "limit-full"
 
 
 @dataclass(frozen=True)
@@ -709,6 +710,15 @@ def slot_capacity(paths: StatePaths, scope: ClaimScope, *,
     missing = (target_config.MissingSlotCapacity.REQUIRE_CONFIGURED if scope.key
                else target_config.MissingSlotCapacity.SINGLE_SLOT)
     return target_config.slot_capacity(settings, scope.name, missing=missing)
+
+
+def standard_mac_builds_enabled(config: eligibility.OffloadConfig, scope: RepositoryScope) -> bool:
+    """Read standard build eligibility without a package restriction."""
+    from scripts.mac_test import eligibility
+
+    return config.enabled and isinstance(
+        eligibility.linux_only_policy(config, eligibility.KnownRepository(scope.name), Path(), "", "check"),
+        eligibility.KnownRepository)
 
 
 def affinity_path(paths: StatePaths, scope: RepositoryScope) -> Path:
@@ -1897,7 +1907,8 @@ def claim_once(args: CliArguments, paths: StatePaths, scope: ClaimScope,
         # A test copy gives way to any new step; a copy never replaces a copy.
         if not args.copy and all(copy_gives_way(claim.record) for claim in overlapping):
             return ClaimHeldByCopy(tuple(claim.record for claim in overlapping))
-        return ClaimBusy(overlapping[0].record)
+        return ClaimBusy(overlapping[0].record, "whole-mac-full"
+                         if any(isinstance(claim.scope, WholeMacScope) for claim in overlapping) else "limit-full")
     proc_start = process_identity.process_start(args.pid)
     if not isinstance(proc_start, process_identity.Started):
         print(f"cannot claim: process {args.pid} is not running", file=sys.stderr)
@@ -1925,6 +1936,8 @@ def claim_once(args: CliArguments, paths: StatePaths, scope: ClaimScope,
         claimed["repo_key"] = scope.key
         if scope.slot:
             claimed["slot"] = scope.slot
+    else:
+        claimed["whole_mac"] = True
     path = claim_path(paths, scope)
     path.parent.mkdir(parents=True, exist_ok=True)
     write_json(path, claimed)
@@ -2072,14 +2085,16 @@ def command_claim(args: CliArguments, paths: StatePaths, *, watch_claim: bool = 
     yield_deadline = 0.0
     stopped: set[tuple[int, str]] = set()
     with ExitStack() as wait_record:
-        recorded = False
+        recorded: claim_state.MacBlocker | None = None
 
-        def show_wait() -> None:
+        def show_wait(blocker: claim_state.MacBlocker) -> None:
             nonlocal recorded
-            if not recorded and paths.platform == "macos":
+            if recorded != blocker and paths.platform == "macos":
+                wait_record.close()
                 wait_record.enter_context(claim_state.record_claim_wait(
-                    paths, args.pid, args.worktree, args.what, session, args.episode))
-                recorded = True
+                    paths, args.pid, args.worktree, args.what, session, args.episode,
+                    decision=claim_state.MacDecision(paths.target, scope, blocker)))
+                recorded = blocker
 
         while True:
             with locked(paths.lock):
@@ -2099,7 +2114,7 @@ def command_claim(args: CliArguments, paths: StatePaths, *, watch_claim: bool = 
                         stopped.add((holder["pid"], holder["proc_start"]))
                         stop_copy(holder)
                 if time.monotonic() < yield_deadline:
-                    show_wait()
+                    show_wait("copy-yield")
                     time.sleep(0.1)
                     continue
                 busy_run = attempt.holders[0]
@@ -2117,7 +2132,7 @@ def command_claim(args: CliArguments, paths: StatePaths, *, watch_claim: bool = 
                     + f"{local_time(busy_run['since'], include_zone=False)}"
                 )
                 return 11
-            show_wait()
+            show_wait(attempt.blocker)
             time.sleep(min(2.0, remaining))
 
 
@@ -2213,6 +2228,7 @@ def free_now(
     paths: StatePaths, settings: Path | eligibility.DefaultMacSettings, repo_root: Path, copy: bool = False,
     *, session: SubmittingSession | claim_state.CallingSession = claim_state.CALLING_SESSION,
     configuration: conf.ConfigRead | conf.UseConfiguredValue = conf.UseConfiguredValue.CURRENT,
+    note_busy: Callable[[claim_state.MacBlocker], None] | None = None,
 ) -> FreeNowAnswer:
     """Whether a claim for repo_root's repository made now could start a Mac run.
 
@@ -2250,6 +2266,8 @@ def free_now(
     repository_name = repository.repo_name(str(repo_root))
     if repository_name is not None and isinstance(
             eligibility.read_mirror_busy(time.time(), repository_name, paths.target), eligibility.ActiveBackoff):
+        if note_busy is not None:
+            note_busy("mirror-backoff")
         return "busy"
     scopes: tuple[ClaimScope, ...] = (scope,)
     if not target_config.uses_legacy_mac_layout(paths.platform) and isinstance(scope, RepositoryScope):
@@ -2260,11 +2278,19 @@ def free_now(
             if isinstance(error, conf.Unusable) and isinstance(configuration, conf.ConfigRead):
                 raise
             return "state"
-    held = all(any(
-        scopes_overlap(claim.scope, candidate) and run_holds_work(claim.record)
-        and (copy or not copy_gives_way(claim.record)) for claim in claims
-    ) for candidate in scopes)
-    if held:
+    whole_mac_busy = False
+
+    def holds_scope(claim: HeldClaim, candidate: ClaimScope) -> bool:
+        nonlocal whole_mac_busy
+        if (scopes_overlap(claim.scope, candidate) and run_holds_work(claim.record)
+                and (copy or not copy_gives_way(claim.record))):
+            whole_mac_busy |= isinstance(claim.scope, WholeMacScope)
+            return True
+        return False
+
+    if all(any(holds_scope(claim, candidate) for claim in claims) for candidate in scopes):
+        if note_busy is not None:
+            note_busy("whole-mac-full" if whole_mac_busy else "limit-full")
         return "busy"
     if isinstance(eligibility.read_failed_probe(paths.target), eligibility.FailedProbe):
         return "bad"

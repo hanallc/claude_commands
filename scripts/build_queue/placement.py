@@ -1,13 +1,13 @@
 """Placement decisions keep submitting owners separate from remote executions."""
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
 from scripts.build_queue import execution_identity
 from scripts.build_hold.owning_session import NoOwningSession, OwningSession
-from scripts.mac_test.claim_state import ClaimScope
+from scripts.mac_test.claim_state import ClaimScope, MacBlocker, MacDecision
 
 SubmittingSession = OwningSession | NoOwningSession
 
@@ -234,6 +234,9 @@ class PlacementDestination:
     host: str
     scope: ClaimScope
     slot: int = 0
+
+    def mac_decision(self, blocker: MacBlocker | None = None) -> MacDecision | None:
+        return MacDecision(self.target, self.scope, blocker) if self.provider == "mac" else None
 
 
 @dataclass(frozen=True)
@@ -468,6 +471,7 @@ class FreshHostEvidence:
     executions: tuple[tuple[ProviderClaimReference, execution_identity.ExecutionEvidence], ...] = ()
     holder: ResourceHolder = ResourceHolderUnknown()
     provider_diagnostic: BusyProviderDiagnostic | NoProviderDiagnostic = NO_PROVIDER_DIAGNOSTIC
+    mac_blocker: MacBlocker | None = None
 
 
 @dataclass(frozen=True)
@@ -494,6 +498,7 @@ class CandidateEligibility:
     """The result pairs a placement destination with its eligibility."""
     destination: PlacementDestination
     eligibility: HostEligibility
+    mac_decision: MacDecision | None = field(default=None, compare=False)
 
 
 @dataclass(frozen=True)

@@ -1301,10 +1301,15 @@ function limitWaits(waits) {
     <div class="build-limit-count"><span class="build-limit-marks">${limitMarks("wait", names.length)}</span>
       <span>${names.length} waiting · ${esc(reason)}</span></div>${limitNames(names)}</div>`).join("");
 }
-function limitCell(cell) {
-  const {available, limit, used, runs, exempt, other, other_note, waits, budgets, note} = cell;
+function limitStartup(names) {
+  if (!names?.length) return "";
+  const label = names.length === 1 ? "1 reserved for startup" : `${names.length} reserved for startup`;
+  return `<div class="build-limit-note">${label}</div>${limitNames(names.filter(Boolean))}`;
+}
+function limitCell(cell, mac = false) {
+  const {available, limit, used, runs, exempt, other, other_note, waits, budgets, note, starting} = cell;
   let contents;
-  if (available === false) contents = '<span class="build-limit-note">Does not run here</span>';
+  if (available === false) contents = `<span class="build-limit-note">${mac ? "No standard Mac builds" : "Does not run here"}</span>`;
   else if (available == null) contents = '<span class="build-limit-note">State unavailable</span>';
   else {
     const marks = limitPlaces(used, limit, Math.min(runs.length, used ?? runs.length), exempt.length);
@@ -1315,6 +1320,10 @@ function limitCell(cell) {
   if (exempt.length) contents += `<div class="build-limit-note">Merge runs above the limit</div>${limitNames(exempt)}`;
   if (other.length) contents += `<div class="build-limit-note">${esc(other_note || `${other.length} other running`)}</div>${limitNames(other)}`;
   if (note) contents += `<div class="build-limit-note">${esc(note)}</div>`;
+  if (mac && available && cell.standard_mac_builds === false) {
+    contents += '<div class="build-limit-note">No standard Mac builds</div>';
+  }
+  contents += limitStartup(starting);
   return `${contents}${budgets.map(metric => limitMetric(metric, metric.qualifier === "maximum")).join("")}${limitWaits(waits)}`;
 }
 let lastBuildLimitsHtml = "";
@@ -1326,16 +1335,19 @@ function renderBuildLimits(limits) {
     <span class="build-limit-state">${esc(data.state)}</span>
     ${data.shared.map(metric => limitMetric(metric)).join("")}
     ${data.claims ? `<div class="build-limit-note">${data.claims} ${data.claims === 1 ? "claim" : "claims"}</div>` : ""}
+    ${data.target && data.target !== "mac" ? `<div class="build-limit-note">${esc(data.target)}</div>` : ""}
     ${limitNames(data.runs ?? [])}
+    ${data.cleanup ? '<div class="build-limit-note">Claim held for cleanup</div>' : ""}
+    ${limitStartup(data.startup)}
     ${data.other?.length ? `<div class="build-limit-note">${esc(data.other_note)}</div>${limitNames(data.other)}` : ""}
     ${limitWaits(data.waits)}</th>`).join("");
   const rows = limits.repositories.map(row => {
     const slots = row.mac_slots ?? [];
     const cells = [row.natedev, row.mac, row.aws, ...slots.map(slot => slot.cell)];
     const pending = limitWaits(row.unplaced);
-    const quiet = cells.every(cell => !cell.runs.length && !cell.exempt.length && !cell.other.length);
+    const quiet = cells.every(cell => !cell.runs.length && !cell.exempt.length && !cell.other.length && !cell.starting?.length);
     const mac = slots.length ? slots.map(slot => `<div class="build-limit-slot">
-      <strong>${esc(slot.name)}</strong>${limitCell(slot.cell)}</div>`).join("") : limitCell(row.mac);
+      <strong>${esc(slot.name)}</strong>${limitCell(slot.cell, true)}</div>`).join("") : limitCell(row.mac, true);
     return `<tr${quiet ? ' class="quiet"' : ""}><th scope="row">${esc(row.name)}${pending}</th>
       <td>${limitCell(row.natedev)}</td><td>${mac}</td><td>${limitCell(row.aws)}</td></tr>`;
   }).join("");
