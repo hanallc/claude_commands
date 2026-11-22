@@ -318,9 +318,11 @@ If the registry cannot prove liveness because the process start is unreadable, b
 Both commands name each file with a decode error and continue with valid files.
 Legacy reports supply display data only.
 Both commands show a fresh batch command for an off-target legacy member.
+The command uses `--group` when the legacy report names a group.
 `retry` starts a new move for each saved request that still needs a move.
 It uses the current selection for a saved group.
 A workers swap also selects eligible Codex producers.
+Their move requests record group scope and retain the selected account for retry.
 A producers group move selects only eligible Claude producers.
 `eligible_producers` requires active, local, unpaused staff rows with valid settings for the requested family.
 `producer_settings` returns `LaunchSettings` or `InvalidProducerSettings`.
@@ -337,8 +339,12 @@ The group command prints moved, pending, and failed members by staff name.
 A retry of the selected destination reuses the group transition ID.
 The refusal watcher skips members whose staff rows are busy.
 The watcher uses one read of the move journal for all members.
-It skips a member when the latest request was by hand, names a different account, and is newer than the group selection.
-A selection without a time is older than any move by hand.
+The watcher keeps a member on a different account when its latest individual move was by hand and newer than the group selection.
+Each new move request records a `scope` of `group` or `session`.
+Worker group requests and requests for their worker panes use `group`.
+The watcher treats legacy requests without `scope` as individual moves.
+A group request keeps the member eligible for completion.
+A selection without a time is older than any individual move by hand.
 A later group selection lets the watcher complete the move for that member.
 A pending refusal stays eligible until its move completes or a detached batch accepts it.
 An in-progress result from another move keeps the refusal pending.

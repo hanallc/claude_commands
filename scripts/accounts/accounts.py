@@ -3181,7 +3181,8 @@ def _move_worker_row(pane_moves: PaneMoves, row: staff.StaffRow, record: staff.S
     try:
         if row.kind == "producer":
             batch = cast(SessionBatchMove, import_module("scripts.agents.stop_resume").move_sessions)
-            result = batch([str(row.current_session)], target, why=why, cause="by hand", source_accounts={})[0]
+            result = batch([str(row.current_session)], target, why=why, cause="by hand", source_accounts={},
+                           intent=moves.ExplicitMoveTarget.GROUP_ACCOUNT)[0]
             if isinstance(result, stop_results.SessionNotFound):
                 return SessionMoveRefused(row.current_session, "no saved session was found")
             if isinstance(result, (stop_results.ClaudeUp, stop_results.MoveHandedOff, stop_results.ResumePending, moves.MoveWaitingForRow)):
@@ -3667,8 +3668,8 @@ def _workers_move_lock(purpose: Literal["run", "schedule"]) -> Generator[None]:
 
 def _pending_workers_requests(
     journal: Sequence[moves.MoveEntry] | moves.ReadCurrentMoveJournal = moves.READ_CURRENT_MOVE_JOURNAL,
-) -> dict[str, moves.RequestedMove]:
-    pending: dict[str, moves.RequestedMove] = {}
+) -> dict[str, moves.RecordedMoveRequest]:
+    pending: dict[str, moves.RecordedMoveRequest] = {}
     entries = moves.read_moves() if isinstance(journal, moves.ReadCurrentMoveJournal) else journal
     for entry in entries:
         if entry["subject"] != "workers":
