@@ -94,7 +94,7 @@ class RegistryFixture(unittest.TestCase):
                             "MODELS_CONFIG_FILE": str(self.registry),
                             "CONF_DIR": str(self.registry.parent), "ZONE_SSH": str(ssh),
                             "PATH": str(binaries) + os.pathsep + os.environ.get("PATH", os.defpath),
-                            "MERGE_GATE_STATE_DIR": str(self.root / "land-state"),
+                            "GATE_STATE_DIR": str(self.root / "land-state"),
                             "XDG_STATE_HOME": str(self.root / "publication-state"), "TMPDIR": str(self.root),
                             "MODELS_CONFIG_PUBLISH": "1" if publishing else "0",
                             "MODELS_CONFIG_TIER_ONLY": "1", "CODEX_CONFIG_FILE": str(self.root / "codex.toml"),
@@ -424,7 +424,7 @@ class RegistryPublishingTests(RegistryFixture):
             program = ("from scripts.lib import models_registry; "
                        "p=models_registry.registry_path(); before=p.read_text(); "
                        "models_registry.store_registry(p,before,before.replace('review=gpt-a:high','review=gpt-b:max'),'row edit')")
-            state = Path(self.environment["MERGE_GATE_STATE_DIR"])
+            state = Path(self.environment["GATE_STATE_DIR"])
             state.mkdir(exist_ok=True)
             with (state / "settings-gap.lock").open("a") as gap:
                 fcntl.flock(gap, fcntl.LOCK_EX)

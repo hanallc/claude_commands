@@ -329,12 +329,8 @@ def _fast_forward(repo: Path, path: Path, target: str, *,
 
 
 def _reconcile_shared(registry: SharedRegistry, path: Path, target: str, expected_head: str, published: str) -> bool:
-    repo = registry.repository
     try:
-        with waiting_rows.locked_checkout(repo):
-            _fast_forward(repo, path, target, expected_head=expected_head, published_registry=published)
-            head = _git(repo, "show", f"HEAD:{REGISTRY_PATH}") + "\n"
-            _ = _registry_for_publication(registry, path, head)
+        _fast_forward(registry.repository, path, target, expected_head=expected_head, published_registry=published)
     except OSError as error:
         raise OSError(f"{path} is shared, but local reconciliation failed: {error}") from error
     return True
@@ -350,66 +346,6 @@ def _registry_commit(repo: Path, parent: str, contents: str, description: str) -
                  environment=environment)
         tree = _git(repo, "write-tree", environment=environment)
         return _git(repo, "commit-tree", tree, "-p", parent, "-m", main_publish.REGISTRY_SUBJECT + ' '.join(description.splitlines()))
-
-
-type PendingProducerAdditions = dict[str, str]
-
-
-def _producer_additions_path(registry: SharedRegistry) -> Path:
-    return registry.git_directory / "models-config.producer-additions.json"
-
-
-def _producer_additions(registry: SharedRegistry) -> PendingProducerAdditions:
-    text = waiting_rows.live_text(_producer_additions_path(registry))
-    return {} if text is None else cast(PendingProducerAdditions, json.loads(text))
-
-
-def _write_producer_additions(registry: SharedRegistry, additions: PendingProducerAdditions) -> None:
-    path = _producer_additions_path(registry)
-    if additions:
-        write_text_atomic(path, json.dumps(additions) + "\n")
-    else:
-        path.unlink(missing_ok=True)
-
-
-def _record_producer_edits(registry: SharedRegistry, before: str, after: str, *, preserve: bool) -> None:
-    edits = [row for row in registry_rows.changes(before, after) if row.section == "producers"]
-    if not edits:
-        return
-    additions = _producer_additions(registry)
-    previous = additions.copy()
-    if preserve:
-        values = registry_rows.values(after)
-        additions.update((row.key, values[row.section, row.key]) for row in edits)
-    else:
-        for row in edits:
-            _ = additions.pop(row.key, None)
-    if additions != previous:
-        _write_producer_additions(registry, additions)
-
-
-def _keep_published_producers(additions: PendingProducerAdditions, local: str, published: str) -> str:
-    local_values = registry_rows.values(local)
-    published_rows = registry_rows.rows(published)
-    edits = [registry_rows.RowChange("producers", key, published_rows[address].line)
-             for key, value in additions.items() if (address := ("producers", key)) in published_rows
-             and local_values.get(address) == value != published_rows[address].value]
-    return registry_rows.replay(local, edits, False) if edits else local
-
-
-def _registry_for_publication(registry: SharedRegistry, path: Path, published: str) -> tuple[str, PendingProducerAdditions]:
-    with file_lock.exclusive(waiting_rows.registry_writer_lock(registry.git_directory)):
-        local = registry_text(path)
-        additions = _producer_additions(registry)
-        contents = _keep_published_producers(additions, local, published)
-        if contents != local:
-            write_text_atomic(path, contents)
-        current, committed = registry_rows.values(contents), registry_rows.values(published)
-        pending = {key: value for key, value in additions.items()
-                   if (address := ("producers", key)) not in committed and current.get(address) == value}
-        if pending != additions:
-            _write_producer_additions(registry, pending)
-        return contents, pending
 
 
 def _publish(registry: SharedRegistry, path: Path, description: str) -> bool:
@@ -438,7 +374,11 @@ def _publish(registry: SharedRegistry, path: Path, description: str) -> bool:
             waiting_rows.restore_checkout(repo, "HEAD")
             base = _git(repo, "rev-parse", "HEAD")
             previous = _git(repo, "show", f"{base}:{REGISTRY_PATH}") + "\n"
-            contents, additions = _registry_for_publication(registry, path, previous)
+            with file_lock.exclusive(waiting_rows.registry_writer_lock(registry.git_directory)):
+                local = registry_text(path)
+                contents = waiting_rows.registry_publication_text(registry.git_directory, local, previous)
+                if contents != local:
+                    write_text_atomic(path, contents)
         if not registry_rows.changes(previous, contents):
             return False
         commit = _registry_commit(repo, base, contents, description)
@@ -450,9 +390,8 @@ def _publish(registry: SharedRegistry, path: Path, description: str) -> bool:
                 remote = _fetch(repo, branch)
                 ancestor = _git(repo, "merge-base", commit, remote)
                 remote_text = _git(repo, "show", f"{remote}:{REGISTRY_PATH}") + "\n"
-                pending = _keep_published_producers(additions, contents, remote_text)
                 shared = ancestor == commit or (ancestor == base and not registry_rows.changes(
-                    remote_text, waiting_rows.replay_registry_rows(repo, previous, pending, remote_text)))
+                    remote_text, waiting_rows.replay_registry_rows(repo, previous, contents, remote_text)))
             except OSError as retry_error:
                 last_error = str(retry_error)
                 break
@@ -573,10 +512,16 @@ def save_registry(registry: Path, before: str, after: str, description: str, *,
         changed = registry_rows.values(latest) != registry_rows.values(result)
         if changed:
             result = after if latest == before and not additive_catalog else result
-            if shared and isinstance(target, SharedRegistry):
-                waiting_rows.record_registry_edit(target.git_directory, latest, result, additive_catalog)
-                _record_producer_edits(target, latest, result, preserve=preserve_producer_rows)
+            mode = waiting_rows.RegistryEditMode.ORDINARY
+            if additive_catalog:
+                mode = waiting_rows.RegistryEditMode.ADDITIVE_CATALOG
+            elif preserve_producer_rows:
+                mode = waiting_rows.RegistryEditMode.PROTECTED_PRODUCER
+            if shared and isinstance(target, SharedRegistry) and mode != waiting_rows.RegistryEditMode.ORDINARY:
+                waiting_rows.record_registry_edit(target.git_directory, latest, result, mode)
             write_text_atomic(path, result)
+            if shared and isinstance(target, SharedRegistry) and mode == waiting_rows.RegistryEditMode.ORDINARY:
+                waiting_rows.record_registry_edit(target.git_directory, latest, result, mode)
     publish = os.environ.get("MODELS_CONFIG_PUBLISH")
     if not shared or not isinstance(target, SharedRegistry) or publish == "0":
         return SavedRegistry(result, changed, RegistryPublication.LOCAL_ONLY)

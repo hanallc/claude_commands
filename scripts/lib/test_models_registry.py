@@ -169,7 +169,7 @@ class RegistryPublicationTests(ScriptRepositoryTestCase):
         self.environment.update({
             "CONF_DIR": str(self.repo / "config"),
             "MODELS_CONFIG_FILE": str(self.repo / "config/models.conf"),
-            "MERGE_GATE_STATE_DIR": str(self.root / "land-state"),
+            "GATE_STATE_DIR": str(self.root / "land-state"),
             "XDG_STATE_HOME": str(self.root / "state"),
         })
 
@@ -367,6 +367,69 @@ class RegistryPublicationTests(ScriptRepositoryTestCase):
                 self.assertFalse(models_registry.publish_pending(registry))
         self.assertEqual(registry.read_text(), newest)
         self.assertEqual(self.git("show", "origin/main:config/models.conf").stdout, newest)
+
+    def _producer_conflict(self) -> tuple[Path, str, str, str]:
+        before = "[fixture]\nmodel=old\n[producers]\n"
+        registry = self.write(self.repo / "config/models.conf", before)
+        self.seed()
+        remote = before + "example=codex:gpt-6.3-sol:high\n"
+        _ = self.write(registry, remote)
+        _ = self.git("commit", "-qam", "Publish a producer row")
+        _ = self.git("push", "-q", "origin", "main")
+        _ = self.git("reset", "--hard", "HEAD^")
+        local = before + "example=codex:gpt-6.2-sol:low\n"
+        return registry, before, local, remote
+
+    def test_failed_ordinary_write_keeps_deferred_producer_protection(self) -> None:
+        registry, before, local, remote = self._producer_conflict()
+        environment = {**self.environment, "MODELS_CONFIG_PUBLISH": "later", "TMPDIR": str(self.root)}
+        with patch.dict(os.environ, environment, clear=True), patch.object(models_registry, "DEFAULT_PATH", registry):
+            saved = models_registry.save_registry(registry, before, local, "add producer", preserve_producer_rows=True)
+            self.assertEqual(saved.publication, models_registry.RegistryPublication.DEFERRED)
+            with patch.object(models_registry, "write_text_atomic", side_effect=OSError("registry write failed")):
+                with self.assertRaisesRegex(OSError, "registry write failed"):
+                    _ = models_registry.save_registry(registry, local, local.replace(":low", ":high"), "edit producer")
+            self.assertEqual(registry.read_text(), local)
+            with main_push_lock.settings_push(self.repo) as gap:
+                self.assertIsInstance(gap, land_queue.SettingsGap)
+                self.assertFalse(models_registry.publish_pending(registry))
+        self.assertEqual(registry.read_text(), remote)
+        self.assertEqual(self.git("show", "origin/main:config/models.conf").stdout, remote)
+
+    def test_checkout_move_keeps_deferred_producer_protection(self) -> None:
+        registry, before, local, remote = self._producer_conflict()
+        environment = {**self.environment, "MODELS_CONFIG_PUBLISH": "later", "TMPDIR": str(self.root)}
+        with patch.dict(os.environ, environment, clear=True), patch.object(models_registry, "DEFAULT_PATH", registry):
+            _ = models_registry.save_registry(registry, before, local, "add producer", preserve_producer_rows=True)
+            _ = models_registry.save_registry(registry, local, local.replace("model=old", "model=new"), "edit model")
+        expected = remote.replace("model=old", "model=new")
+        with patch.dict(os.environ, environment, clear=True), patch.object(models_registry, "DEFAULT_PATH", registry):
+            waiting_rows.move_to(self.repo, "origin/main", fast_forward=True)
+            self.assertEqual(registry.read_text(), expected)
+            with main_push_lock.settings_push(self.repo) as gap:
+                self.assertIsInstance(gap, land_queue.SettingsGap)
+                self.assertTrue(models_registry.publish_pending(registry))
+        self.assertEqual(self.git("show", "origin/main:config/models.conf").stdout, expected)
+
+    def test_successful_ordinary_producer_edit_clears_protection_after_write(self) -> None:
+        registry, before, local, _ = self._producer_conflict()
+        intent = self.repo / ".git/models-config.additive.json"
+        environment = {**self.environment, "MODELS_CONFIG_PUBLISH": "later", "TMPDIR": str(self.root)}
+        edited = local.replace(":low", ":high")
+
+        def write_with_protection(path: Path, text: str) -> None:
+            self.assertTrue(intent.is_file())
+            write_text_atomic(path, text)
+
+        with patch.dict(os.environ, environment, clear=True), patch.object(models_registry, "DEFAULT_PATH", registry):
+            _ = models_registry.save_registry(registry, before, local, "add producer", preserve_producer_rows=True)
+            with patch.object(models_registry, "write_text_atomic", write_with_protection):
+                _ = models_registry.save_registry(registry, local, edited, "edit producer")
+            self.assertFalse(intent.exists())
+            with main_push_lock.settings_push(self.repo) as gap:
+                self.assertIsInstance(gap, land_queue.SettingsGap)
+                self.assertTrue(models_registry.publish_pending(registry))
+        self.assertEqual(self.git("show", "origin/main:config/models.conf").stdout, edited)
 
     def test_a_deferred_registry_write_returns_during_move_preflight(self) -> None:
         before = "[fixture]\nmodel=old\nsecond=old\n"

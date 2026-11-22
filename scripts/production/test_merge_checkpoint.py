@@ -48,6 +48,7 @@ def setUpModule() -> None:
         _ = environment.pop(key, None)
     environment["ZONE_STATE"] = str(state)
     environment["XDG_STATE_HOME"] = str(state / "state")
+    environment["GATE_STATE_DIR"] = str(state / "land-state")
     unittest.enterModuleContext(mock.patch.dict(os.environ, environment, clear=True))
     configure_test_environment()
 

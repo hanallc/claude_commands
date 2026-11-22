@@ -330,7 +330,7 @@ class MergeCheckpointFixture(unittest.TestCase):
                     "PATH": str(self.bin) + os.pathsep + os.environ.get("PATH", ""),
                     "CHECKPOINT_TEST_STATE": str(self.state),
                     "MERGE_CHECKPOINT_SCRATCH": str(self.state),
-                    "MERGE_GATE_STATE_DIR": str(self.root / "land-state"),
+                    "GATE_STATE_DIR": str(self.root / "land-state"),
                     "XDG_STATE_HOME": str(self.root / "publication-state"),
                     "NOTIFIER_STATE_DIR": str(self.root / "notifier"),
                     "SHOWRUNNER_STATE_DIR": str(self.root / "showrunners"),

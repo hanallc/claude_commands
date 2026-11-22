@@ -10,6 +10,7 @@ from collections.abc import Generator, Iterable, Mapping
 from contextlib import ExitStack, contextmanager
 from contextvars import ContextVar
 from dataclasses import asdict, dataclass, replace
+from enum import Enum, auto
 import fcntl
 import json
 import os
@@ -331,37 +332,48 @@ def pending_files(checkout: Path, journal: LockedJournal) -> dict[str, dict[str,
             if any(isinstance(save, AcceptedSave) for save in keys.values())}
 
 
-type AdditiveCatalogRows = dict[tuple[str, str], str]
+class RegistryEditMode(Enum):
+    ORDINARY = auto()
+    ADDITIVE_CATALOG = auto()
+    PROTECTED_PRODUCER = auto()
+
+
+# Catalog rows store the replacement line. Producer rows store the protected value.
+type PendingRegistryReplay = dict[tuple[str, str], str]
 
 
 def registry_writer_lock(git_directory: Path) -> Path:
     return git_directory / "models-config.publish.lock"
 
 
-def _catalog_modes_path(git_directory: Path) -> Path:
+def _registry_replay_path(git_directory: Path) -> Path:
     return git_directory / "models-config.additive.json"
 
 
-def _catalog_modes(git_directory: Path) -> AdditiveCatalogRows:
-    source = live_text(_catalog_modes_path(git_directory))
+def _registry_replay_intent(git_directory: Path) -> PendingRegistryReplay:
+    source = live_text(_registry_replay_path(git_directory))
     rows = cast(list[tuple[str, str, str]], json.loads(source)) if source is not None else []
     return {(section, key): line for section, key, line in rows}
 
 
-def record_registry_edit(git_directory: Path, before: str, after: str, additive: bool) -> None:
-    """Keep the replay mode for each pending catalog row."""
-    modes = _catalog_modes(git_directory)
-    previous = modes.copy()
+def record_registry_edit(git_directory: Path, before: str, after: str, mode: RegistryEditMode) -> None:
+    """Keep the replay intent for pending registry rows."""
+    intent = _registry_replay_intent(git_directory)
+    previous = intent.copy()
+    producer_values = registry_rows.values(after) if mode == RegistryEditMode.PROTECTED_PRODUCER else {}
     for row in registry_rows.changes(before, after):
         address = row.section, row.key
-        if additive:
-            modes[address] = row.replacement
-        else:
-            _ = modes.pop(address, None)
-    if modes != previous:
-        path = _catalog_modes_path(git_directory)
-        if modes:
-            write_text_atomic(path, json.dumps([(*key, line) for key, line in modes.items()]) + "\n")
+        match mode:
+            case RegistryEditMode.ADDITIVE_CATALOG:
+                intent[address] = row.replacement
+            case RegistryEditMode.PROTECTED_PRODUCER:
+                intent[address] = producer_values[address]
+            case RegistryEditMode.ORDINARY:
+                _ = intent.pop(address, None)
+    if intent != previous:
+        path = _registry_replay_path(git_directory)
+        if intent:
+            write_text_atomic(path, json.dumps([(*address, value) for address, value in intent.items()]) + "\n")
         else:
             path.unlink(missing_ok=True)
 
@@ -370,13 +382,32 @@ def _registry_git_directory(checkout: Path) -> Path:
     return Path(git(checkout, "rev-parse", "--absolute-git-dir").strip())
 
 
+def _protected_producer_conflicts(intent: PendingRegistryReplay, local: str, target: str) -> dict[str, str]:
+    local_values = registry_rows.values(local)
+    return {key: row.line for (section, key), row in registry_rows.rows(target).items()
+            if section == "producers" and (value := intent.get((section, key))) is not None
+            and local_values.get((section, key)) == value != row.value}
+
+
+def registry_publication_text(git_directory: Path, local: str, committed: str) -> str:
+    conflicts = _protected_producer_conflicts(_registry_replay_intent(git_directory), local, committed)
+    edits = [registry_rows.RowChange("producers", key, line) for key, line in conflicts.items()]
+    return registry_rows.replay(local, edits, False) if edits else local
+
+
 def _replay_registry(git_directory: Path, base: str, local: str, target: str) -> str:
-    modes = _catalog_modes(git_directory)
+    intent = _registry_replay_intent(git_directory)
+    conflicts = _protected_producer_conflicts(intent, local, target)
     ordinary: list[registry_rows.RowChange] = []
     catalog: list[registry_rows.RowChange] = []
     for row in registry_rows.changes(base, local):
-        edits = catalog if modes.get((row.section, row.key)) == row.replacement else ordinary
-        edits.append(row)
+        if row.section == "producers":
+            if row.key not in conflicts:
+                ordinary.append(row)
+        elif intent.get((row.section, row.key)) == row.replacement:
+            catalog.append(row)
+        else:
+            ordinary.append(row)
     text = registry_rows.replay(target, ordinary, False) if ordinary else target
     return registry_rows.replay(text, catalog, True) if catalog else text
 
