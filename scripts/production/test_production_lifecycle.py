@@ -1539,13 +1539,13 @@ fi
                             original_git = merge_checkpoint.git
 
                             def move_integration_after_check(checkout: Path, *args: str) -> subprocess.CompletedProcess[str]:
-                                if checkout == destination and args == (
+                                if checkout == self.checkout and args == (
                                         "fetch", "origin", "+refs/heads/production:refs/remotes/origin/production"):
                                     _ = self.git("update-ref", "refs/heads/production", later, verified)
                                     _ = self.git("push", "origin", "production")
                                 return original_git(checkout, *args)
 
-                            with mock.patch.object(merge_checkpoint, "git", side_effect=move_integration_after_check):
+                            with mock.patch.object(production_lifecycle, "git", side_effect=move_integration_after_check):
                                 result = self.run_lifecycle("wrap", "--ci-green", verified, "--smoke-passed", verified)
                             self.assert_step(result, "held")
                             self.assertIn("integration tip changed", result.stdout)
