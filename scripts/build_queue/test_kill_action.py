@@ -1,7 +1,7 @@
 """Use private process trees and message delivery for Builds stop actions."""
 from __future__ import annotations
 
-from collections.abc import Generator
+from collections.abc import Callable, Generator
 from contextlib import contextmanager, nullcontext
 from dataclasses import replace
 from datetime import datetime
@@ -20,6 +20,7 @@ from zoneinfo import ZoneInfo
 
 from scripts.build_queue import admission_client, admission_records as records, admission_wire, kill_action
 from scripts.build_queue.admission_jobs import VerifyCall
+from scripts.build_queue.kill_action import ScopeStopReceipt
 from scripts.build_queue.test_memory_feed import reservation_reading
 from scripts.buildlog import store
 from scripts.lib import process_start
@@ -158,27 +159,48 @@ class KillActionTests(unittest.TestCase):
                 self.assertIsInstance(kill_action.candidate(current, reservation, machine, ci=ci),
                                       kill_action.NoKillCandidate)
 
-    def test_both_routes_recheck_the_exact_saved_scope_before_stop(self) -> None:
-        cargo = self.program_scope(42)
-        folder = self.root / "builds-detached.slice" / "detached-fixture.scope"
-        folder.mkdir(parents=True)
-        detached = kill_action.DetachedCommand(self.root / "fixture.json", 17, "123", 16, "122",
-                                               self.scope_identity(folder))
+    def test_cargo_stop_requires_term_or_an_ended_scope(self) -> None:
+        route = self.program_scope(42)
         run = kill_action.KillCandidate(17, "123", 17, "123", "session", "check", "at", "")
+        target = kill_action.KillTarget(run, route, staff.StaffId("worker-id"), "impl3", "impl3", "worker")
         _ = write_config_fixture(self.root / "shutdown.conf", "STOP_GRACE_SECONDS=2\nKILL_GRACE_SECONDS=5")
-        for route in (cargo, detached):
-            with self.subTest(route=route):
-                stop = Mock(return_value=True)
-                api = Mock(stop_scope=stop)
-                target = kill_action.KillTarget(run, route, staff.StaffId("worker-id"), "impl3", "impl3", "worker")
+        for count, ended, accepted in ((1, False, True), (0, True, True), (0, False, False)):
+            with self.subTest(count=count, ended=ended):
+                stop = Mock(return_value=Mock(term_reached=count))
+                api = Mock(stop_scope=stop, scope_has_ended=Mock(return_value=ended))
                 with (patch.object(kill_action, "process_stop_api", return_value=api),
                       patch.object(memory_admit, "process_table", return_value={}),
                       patch.object(kill_action, "stop_route", return_value=route)):
                     moved = replace(route, scope={**route.scope, "inode": route.scope["inode"] + 1})
-                    self.assertFalse(kill_action.stop_verified_scope(replace(target, route=moved)))
+                    self.assertFalse(kill_action.stop_verified_scope(replace(target, route=moved), "Fixture reason"))
                     stop.assert_not_called()
-                    self.assertTrue(kill_action.stop_verified_scope(target))
+                    self.assertEqual(kill_action.stop_verified_scope(target, "Fixture reason"), accepted)
                     stop.assert_called_once_with(route.scope, 2.0, 5.0)
+
+    def test_detached_stop_uses_the_public_api_with_the_saved_route_check(self) -> None:
+        folder = self.root / "builds-detached.slice" / "detached-fixture.scope"
+        folder.mkdir(parents=True)
+        route = kill_action.DetachedCommand(self.root / "fixture.json", 17, "123", 16, "122",
+                                            self.scope_identity(folder))
+        run = kill_action.KillCandidate(17, "123", 17, "123", "session", "check", "at", "")
+        target = kill_action.KillTarget(run, route, staff.StaffId("worker-id"), "impl3", "impl3", "worker")
+        reason = "Stopped from the Builds page."
+        moved = replace(route, scope={**route.scope, "inode": route.scope["inode"] + 1})
+        stop_scope = Mock()
+
+        def stop_detached(_record: Path, _reason: str, *, check: Callable[[], bool]) -> bool:
+            return check()
+
+        verified = Mock(side_effect=stop_detached)
+        with (patch.object(kill_action, "process_stop_api", return_value=Mock(stop_scope=stop_scope)),
+              patch.object(kill_action, "detached_stop_api", return_value=verified),
+              patch.object(memory_admit, "process_table", return_value={}),
+              patch.object(kill_action, "stop_route") as read_route):
+            read_route.side_effect = [route, route, route, moved]
+            self.assertTrue(kill_action.stop_verified_scope(target, reason))
+            self.assertFalse(kill_action.stop_verified_scope(target, reason))
+        self.assertEqual([call.args for call in verified.call_args_list], [(route.record, reason)] * 2)
+        stop_scope.assert_not_called()
 
     def test_a_cargo_child_outside_the_scope_makes_kill_unavailable(self) -> None:
         scope = self.root / "builds.slice" / "run-fixture.scope"
@@ -224,6 +246,19 @@ class KillActionTests(unittest.TestCase):
 
         helper = Mock(supported=Mock(return_value=True), stop_scope=legacy_stop)
         with patch.object(kill_action, "import_module", return_value=helper):
+            self.assertIsInstance(kill_action.process_stop_api(), kill_action.NoStopRoute)
+
+    def test_legacy_detached_helper_leaves_both_routes_unavailable(self) -> None:
+        def stop_command(_record: Path, _reason: str) -> bool:
+            self.fail("the legacy helper must not stop a detached command")
+
+        def stop_scope(_scope: kill_action.ScopeIdentity, _grace: float,
+                       _kill_grace: float) -> ScopeStopReceipt:
+            self.fail("Cargo Kill requires the complete shared API")
+
+        process_api = Mock(supported=Mock(return_value=True), stop_scope=stop_scope, ScopeStopReceipt=ScopeStopReceipt)
+        detached_api = Mock(stop_command=stop_command)
+        with patch.object(kill_action, "import_module", side_effect=[process_api, detached_api]):
             self.assertIsInstance(kill_action.process_stop_api(), kill_action.NoStopRoute)
 
     def test_detached_route_uses_the_scope_saved_by_the_supervisor(self) -> None:

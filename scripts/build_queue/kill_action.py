@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from collections import Counter
-from collections.abc import Generator
+from collections.abc import Callable, Generator
 from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass, replace
 from datetime import datetime
@@ -11,6 +11,7 @@ import fcntl
 from hashlib import sha256
 import hmac
 from importlib import import_module
+from inspect import signature
 import json
 import os
 from pathlib import Path
@@ -152,6 +153,11 @@ def program(pid: int, processes: dict[int, memory_admit.ProcessIdentity]) -> str
     return command_program(args) if isinstance(args, list) else ""
 
 
+class ScopeStopReceipt(Protocol):
+    @property
+    def term_reached(self) -> int: ...
+
+
 class ProcessStopApi(Protocol):
     """The shared stop API becomes available when phase 44fh reaches main."""
 
@@ -160,8 +166,20 @@ class ProcessStopApi(Protocol):
     def ScopeUnit(self, slice_name: str, scope_name: str, /) -> object: ...
     def pin_process(self, process: object, /) -> AbstractContextManager[int]: ...
     def command_scope(self, pid: int, scope: object, /) -> ScopeIdentity: ...
-    def stop_scope(self, scope: ScopeIdentity, grace: float, kill_grace: float, /) -> bool: ...
+    def stop_scope(self, scope: ScopeIdentity, grace: float, kill_grace: float, /) -> ScopeStopReceipt: ...
     def scope_has_ended(self, scope: ScopeIdentity, /) -> bool: ...
+
+
+class DetachedStop(Protocol):
+    def __call__(self, record: Path, reason: str, /, *, check: Callable[[], bool]) -> bool: ...
+
+
+def detached_stop_api() -> DetachedStop | NoStopRoute:
+    module = import_module("scripts.agents.detached_runs")
+    stop = getattr(module, "stop_command", None)
+    if not callable(stop) or "check" not in signature(stop).parameters:
+        return NoStopRoute()
+    return cast(DetachedStop, stop)
 
 
 def process_stop_api() -> ProcessStopApi | NoStopRoute:
@@ -171,12 +189,15 @@ def process_stop_api() -> ProcessStopApi | NoStopRoute:
         if error.name != "scripts.lib.process_stop":
             raise
         return NoStopRoute()
-    required = ("command_scope", "stop_scope", "scope_has_ended")
+    required = ("supported", "ProcessLifetime", "ScopeUnit", "pin_process",
+                "command_scope", "stop_scope", "scope_has_ended")
     if not all(callable(getattr(module, name, None)) for name in required) or not module.supported():
         return NoStopRoute()
     annotations = cast(dict[str, object], getattr(module.stop_scope, "__annotations__", {}))
-    # The older helper can return without sending TERM. It does not provide a receipt.
-    return module if annotations.get("return") in (bool, "bool") else NoStopRoute()
+    receipt = cast(object, getattr(module, "ScopeStopReceipt", None))
+    if receipt is None or annotations.get("return") not in (receipt, "ScopeStopReceipt"):
+        return NoStopRoute()
+    return NoStopRoute() if isinstance(detached_stop_api(), NoStopRoute) else module
 
 
 def read_scope_file(directory: int, name: str) -> bytes:
@@ -408,7 +429,7 @@ class StopRequested:
 
 @dataclass(frozen=True)
 class TermSent:
-    """The stop route returned after it sent TERM."""
+    """The stop route confirms TERM or an ended scope."""
 
 
 @dataclass(frozen=True)
@@ -445,17 +466,25 @@ def stop_complete(action: SavedKillAction) -> bool:
     return not isinstance(action.scope, NoLaunchScope) and not isinstance(api, NoStopRoute) and api.scope_has_ended(action.scope)
 
 
-def stop_verified_scope(target: KillTarget) -> bool:
+def stop_verified_scope(target: KillTarget, reason: str) -> bool:
     """Recheck the route before asking the shared helper to stop the saved scope."""
     api = process_stop_api()
     if isinstance(api, NoStopRoute):
         return False
-    route = stop_route(target.candidate, target.recipient, memory_admit.process_table(PROC))
-    if route != target.route:
+
+    def route_matches() -> bool:
+        return stop_route(target.candidate, target.recipient, memory_admit.process_table(PROC)) == target.route
+
+    if not route_matches():
         return False
+    route = target.route
+    if isinstance(route, DetachedCommand):
+        stop = detached_stop_api()
+        return not isinstance(stop, NoStopRoute) and stop(route.record, reason, check=route_matches)
     settings = conf.read_or_repository("shutdown")
-    return api.stop_scope(target.route.scope, settings.number("STOP_GRACE_SECONDS"),
-                          settings.number("KILL_GRACE_SECONDS")) is True
+    receipt = api.stop_scope(route.scope, settings.whole("STOP_GRACE_SECONDS"),
+                             settings.whole("KILL_GRACE_SECONDS"))
+    return receipt.term_reached > 0 or api.scope_has_ended(route.scope)
 
 
 @dataclass(frozen=True)
@@ -638,7 +667,7 @@ class KillActions:
                     return NoStopRoute()
             self._save(action)
             try:
-                started = stop_verified_scope(target)
+                started = stop_verified_scope(target, message)
             except (OSError, ValueError, subprocess.SubprocessError) as error:
                 print(f"review-links build kill {reference}: {error}", file=sys.stderr)
                 started = False

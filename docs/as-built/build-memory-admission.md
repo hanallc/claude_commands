@@ -1814,17 +1814,19 @@ The server determines the caller from the reservation's session ID and the curre
 2. The console supplies a handle when it can verify the current PID, start identity, staff recipient, and stop route.
 3. The server reads the reservation and process evidence again when the operator confirms.
 4. The server saves the notice and the verified scope identity before it requests the stop.
-5. The shared stop helper signals the saved scope.
-6. The server saves a TERM receipt when the helper confirms that it sent TERM.
+5. The server calls the stop helper for the verified route.
+6. The server saves the result when the helper confirms TERM or scope completion.
 7. The server confirms the scope tree is empty through the shared stop helper.
 8. The server sends the notice after it saves both confirmations.
 
 Cargo Kill uses the scope identity that the shared stop helper reads from the Cargo process.
-Detached Kill uses the scope identity that the supervisor records at launch.
-Both routes require a shared helper that returns an explicit TERM receipt.
+It accepts a positive TERM count or an ended scope.
+Detached Kill passes the record path and reason to the detached stop helper.
+That helper records the reason for the supervisor and confirms completion of the saved scope.
+Both routes require the shared stop API with a TERM count and a detached stop that checks the saved route.
 Verify only creates scopes per step, so the console leaves Kill off for Verify.
 The server offers Cargo Kill only when the verified scope contains the known Cargo descendants.
-A restart before the TERM receipt shows **Kill not sent; try again**.
+A restart before the server saves the stop result shows **Kill not sent; try again**.
 The action record keeps the notice after the confirmation deadline or a console restart.
 The server checks the saved target every `kill_pending_check_seconds`.
 It retries an unclear delivery result with the saved key.
