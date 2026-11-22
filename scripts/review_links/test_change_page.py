@@ -4391,7 +4391,7 @@ class ChangePageTests(unittest.TestCase):
         self.assertFalse((feature_log.state_dir() / "proposals").exists())
 
     def test_the_hana_list_uses_a_bare_review_id(self) -> None:
-        _ = self.git("remote", "add", "origin", "https://github.com/natepiano/hana.git")
+        _ = self.git("remote", "add", "origin", "https://github.com/hanallc/hana.git")
         review_list = self.review_list.with_name("change-review - hana.md")
         _ = self.review_list.rename(review_list)
         path = urlsplit(change_page.publish(self.production, review_list, ["C1"])).path

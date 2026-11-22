@@ -1040,15 +1040,15 @@ class FeatureLogTests(unittest.TestCase):
         )
 
     def test_exact_repeat_is_unchanged_and_changed_repeat_requires_amend(self) -> None:
-        former_link = f"https://github.com/natepiano/hana/commit/{sha_one}"
-        arguments = self.add_arguments(title="Repeatable Result", link=former_link)
+        commit_link = f"https://github.com/hanallc/hana/commit/{sha_one}"
+        arguments = self.add_arguments(title="Repeatable Result", link=commit_link)
         first = self.cli(arguments)
         path = self.note("hana", "repeatable result")
         original = path.read_bytes()
 
         relative = "feature-log/hana/repeatable result.md"
         self.assertEqual(first.stdout, f"added: {relative}\n")
-        for retry_link in (former_link, sha_one.upper()):
+        for retry_link in (commit_link, sha_one.upper()):
             with self.subTest(link=retry_link):
                 repeated = self.cli(self.add_arguments(title="Repeatable Result", link=retry_link))
                 self.assertEqual(repeated, CliResult(0, f"unchanged: {relative}\n", ""))
@@ -1104,9 +1104,9 @@ class FeatureLogTests(unittest.TestCase):
         )
 
     def test_same_link_needs_separate_result_for_another_title(self) -> None:
-        former_link = f"https://github.com/natepiano/hana/commit/{sha_one}"
-        self.assertEqual(self.cli(self.add_arguments(title="First Result", link=former_link)).status, 0)
-        for link in (former_link, sha_one):
+        commit_link = f"https://github.com/hanallc/hana/commit/{sha_one}"
+        self.assertEqual(self.cli(self.add_arguments(title="First Result", link=commit_link)).status, 0)
+        for link in (commit_link, sha_one):
             with self.subTest(link=link):
                 self.assert_rejected(
                     self.add_arguments(title="Second Result", link=link), "separate-result"
@@ -1548,14 +1548,13 @@ class FeatureLogTests(unittest.TestCase):
 
     def test_amend_duplicate_live_link_needs_separate_result(self) -> None:
         self.assertEqual(self.cli(self.add_arguments(title="Correction target")).status, 0)
-        former_link = f"https://github.com/natepiano/hana/commit/{sha_two}"
+        shared_link = f"https://github.com/hanallc/hana/commit/{sha_two}"
         self.assertEqual(
-            self.cli(self.add_arguments(title="Other live result", link=former_link)).status,
+            self.cli(self.add_arguments(title="Other live result", link=shared_link)).status,
             0,
         )
         other_path = self.note("hana", "other live result")
         other_contents = other_path.read_bytes()
-        shared_link = f"https://github.com/hanallc/hana/commit/{sha_two}"
         prefix = [
             "amend", "--project", "hana", "--title", "Correction target",
             "--backfill", "--link", shared_link,
@@ -1584,8 +1583,8 @@ class FeatureLogTests(unittest.TestCase):
         self.assertEqual(len(list(other_path.parent.glob("*.md"))), 2)
 
     def test_amend_same_note_link_allows_a_corrected_date(self) -> None:
-        former_link = f"https://github.com/natepiano/hana/commit/{sha_one}"
-        added = self.cli(self.add_arguments(title="Same accepting merge", link=former_link))
+        commit_link = f"https://github.com/hanallc/hana/commit/{sha_one}"
+        added = self.cli(self.add_arguments(title="Same accepting merge", link=commit_link))
         self.assertEqual(added.status, 0, added.stderr)
         path = self.note("hana", "same accepting merge")
         original_contents = path.read_bytes()
@@ -1595,24 +1594,24 @@ class FeatureLogTests(unittest.TestCase):
             "--backfill", "--link", sha_one,
         ]
 
-        owner_only = self.cli(prefix + ["--completed", original["completed_date"]])
+        same_date = self.cli(prefix + ["--completed", original["completed_date"]])
 
         self.assertEqual(
-            owner_only, CliResult(0, "unchanged: feature-log/hana/same accepting merge.md\n", "")
+            same_date, CliResult(0, "unchanged: feature-log/hana/same accepting merge.md\n", "")
         )
         self.assertEqual(path.read_bytes(), original_contents)
         event = self.events()[-1]
         if event["verb"] != "amend" or "old_link" not in event:
             self.fail("Expected an amend event with the stored link.")
-        self.assertEqual(event["old_link"], former_link)
-        self.assertEqual(event["new_link"], former_link)
+        self.assertEqual(event["old_link"], commit_link)
+        self.assertEqual(event["new_link"], commit_link)
         self.assertEqual(event["old_completed"], event["new_completed"])
 
         result = self.cli(prefix + ["--completed", "2026-10-01"])
 
         self.assertEqual(result.status, 0, result.stderr)
         updated = feature_log.parse_note(path)
-        self.assertEqual(updated["link"], former_link)
+        self.assertEqual(updated["link"], commit_link)
         self.assertEqual(updated["completed_date"], "2026-10-01")
 
     def test_amend_link_held_only_by_a_superseded_note_is_allowed(self) -> None:
@@ -2437,7 +2436,7 @@ class FeatureLogTests(unittest.TestCase):
         self.assertEqual(self.cli(["check"]), CliResult(0, "ok: 1 notes\n", ""))
 
     def test_check_accepts_single_quoted_scalars_and_inline_lists(self) -> None:
-        link = f"https://github.com/natepiano/hana/commit/{sha_one}"
+        link = f"https://github.com/hanallc/hana/commit/{sha_one}"
         self.assertEqual(self.cli(self.add_arguments(title="Linter Forms", link=link)).status, 0)
         path = self.note("hana", "linter forms")
         self.assertEqual(feature_log.parse_note(path)["link"], link)

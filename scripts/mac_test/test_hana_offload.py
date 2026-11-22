@@ -133,7 +133,7 @@ source_forbidden_paths=*.key
 
     def run_claimed(self) -> offload.MacOffloadResult:
         return offload.claimed_run(self.controller, self.transport, self.request,
-                                  eligibility.KnownRepository('hana', 'github.com/natepiano/hana'), time.monotonic())
+                                  eligibility.KnownRepository('hana', 'github.com/hanallc/hana'), time.monotonic())
 
     def test_accepted_compiler_result_uses_the_existing_result_adapter_after_settlement(self) -> None:
         root = self.root
@@ -624,7 +624,7 @@ route_test
         cause = 'IgnoredInput: remove the ignored path'
         reason = 'The Hana payload could not be prepared: ' + cause
         assigned = replace(self.request, result=offload.ResultFile(self.root / 'result'))
-        repository = eligibility.KnownRepository('hana', 'github.com/natepiano/hana')
+        repository = eligibility.KnownRepository('hana', 'github.com/hanallc/hana')
 
         def run(runner: offload.ProcessController, transport: hana.HanaControlTransport,
                 placed: offload.OffloadRequest, started: float) -> offload.MacOffloadResult:
@@ -686,7 +686,7 @@ route_test
             hana_transport.check_inputs(checkout, conf.read(self.transport.settings))
         reason = 'The Hana payload could not be prepared: ' + str(refusal.exception)
         assigned = replace(self.request, repo_root=checkout, result=offload.ResultFile(self.root / 'result'))
-        repository = eligibility.KnownRepository('hana', 'github.com/natepiano/hana')
+        repository = eligibility.KnownRepository('hana', 'github.com/hanallc/hana')
 
         def run(runner: offload.ProcessController, transport: hana.HanaControlTransport,
                 placed: offload.OffloadRequest, started: float) -> offload.MacOffloadResult:
@@ -1004,7 +1004,7 @@ route_test
         self.assertIsInstance(sent.outcome, placement.AttemptCancelled)
 
     def test_disabled_and_repair_requests_never_reach_claims_or_ssh(self) -> None:
-        repository = eligibility.KnownRepository('hana', 'github.com/natepiano/hana')
+        repository = eligibility.KnownRepository('hana', 'github.com/hanallc/hana')
         with mock.patch.object(eligibility, 'repository_identity', return_value=repository), \
                 mock.patch.object(hana, 'fixed_policy', return_value=hana.HanaStepRefused('off')), \
                 mock.patch.object(hana, 'claim_assigned') as claim, \
@@ -1015,7 +1015,7 @@ route_test
         ssh.assert_not_called()
 
     def test_policy_reads_the_worktree_path(self) -> None:
-        repository = eligibility.KnownRepository('hana', 'github.com/natepiano/hana')
+        repository = eligibility.KnownRepository('hana', 'github.com/hanallc/hana')
         with mock.patch.object(eligibility, 'repository_identity', return_value=repository), \
                 mock.patch.object(hana, 'fixed_policy', return_value=hana.HanaStepRefused('off')) as policy:
             _ = offload.run_offload(self.controller, self.transport, self.request, time.monotonic())
@@ -1024,7 +1024,7 @@ route_test
     def test_disabled_unbound_assignment_reports_claim_failure_without_retaining_dispatch(self) -> None:
         from scripts.build_queue import admission_client
 
-        repository = eligibility.KnownRepository('hana', 'github.com/natepiano/hana')
+        repository = eligibility.KnownRepository('hana', 'github.com/hanallc/hana')
         with mock.patch.object(eligibility, 'repository_identity', return_value=repository), \
                 mock.patch.object(hana, 'fixed_policy', return_value=hana.HanaStepRefused('off')), \
                 mock.patch.object(hana, 'claim_assigned') as claim, \
@@ -1243,7 +1243,7 @@ route_test
             loss.assert_not_called()
 
     def test_repair_flags_and_mend_profiles_never_claim_the_hana_target(self) -> None:
-        repository = eligibility.KnownRepository('hana', 'github.com/natepiano/hana')
+        repository = eligibility.KnownRepository('hana', 'github.com/hanallc/hana')
         policy = hana.EnabledHanaRoute(repository.key, ('check', 'lint'), 1, 30)
         for request in (replace(self.request, verb='clippy', kind='lint', nextest_words=('--fix',)),
                         replace(self.request, verb='mend-check', kind='lint'),
