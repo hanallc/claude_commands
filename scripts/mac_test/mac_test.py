@@ -880,14 +880,19 @@ def live_claims(paths: StatePaths) -> tuple[HeldClaim, ...]:
 
     claims = read_claims(paths)
     retired: set[Path] = set()
+    retained: set[Path] = set()
     if paths.platform == "macos":
         for claim in claims:
-            retired.update(claim_state.retire_replaced_reservation(paths, claim.path, claim.record))
+            try:
+                retired.update(claim_state.retire_replaced_reservation(paths, claim.path, claim.record))
+            except claim_state.ReservationRetirementError as error:
+                print(str(error), file=sys.stderr)
+                retained.add(error.path)
     live: list[HeldClaim] = []
     for claim in claims:
         if claim.path in retired:
             continue
-        if run_is_live(claim.record):
+        if claim.path in retained or run_is_live(claim.record):
             live.append(claim)
         elif offload.pending_start_path(paths.target, claim_state.ClaimIdentity(
                 claim.record["claim_id"], claim.record["episode"], claim.record["attempt"])).exists():
@@ -2081,13 +2086,10 @@ def claim_once(args: CliArguments, paths: StatePaths, scope: ClaimScope,
     if (not target_config.uses_legacy_mac_layout(paths.platform) and isinstance(scope, RepositoryScope)
             and args.leased_slots and scope.slot not in args.leased_slots):
         return ClaimDenied(11, "the assigned claim slot is unavailable")
-    if isinstance(args.remote, str) or reserve_wait:
+    if isinstance(replaces, _KeepOtherReservations) and (isinstance(args.remote, str) or reserve_wait):
         for claim in overlapping:
             record = claim.record
-            if (cleanup_claim_matches(paths, claim, scope) and recoverable_kept_claim(record)
-                    and (isinstance(replaces, _KeepOtherReservations)
-                         or record.get("replaced_reservation")
-                         == claim_state.replaced_reservation(replaces.record, replaces.path, paths))):
+            if cleanup_claim_matches(paths, claim, scope) and recoverable_kept_claim(record):
                 return take_over_kept_claim(args, claim, record, session=session)
     if not isinstance(block, NoMacBlock):
         return blocked_claim(block)
@@ -2140,12 +2142,12 @@ def claim_once(args: CliArguments, paths: StatePaths, scope: ClaimScope,
     path.parent.mkdir(parents=True, exist_ok=True)
     # Keep the old reservation until the replacement is visible.
     write_json(path, claimed)
-    if isinstance(replaces, _VerifiedMacReservation) and replaces.path != path:
+    if isinstance(replaces, _VerifiedMacReservation):
         try:
-            replaces.path.unlink(missing_ok=True)
-        except OSError:
+            _ = claim_state.retire_replaced_reservation(paths, path, claimed)
+        except claim_state.ReservationRetirementError as error:
             path.unlink()
-            raise
+            return ClaimDenied(12, str(error), to_stderr=True)
     if paths.platform == "linux" and isinstance(scope, RepositoryScope) and scope.slot:
         remember_slot(paths, scope, claimed)
     return finished_claim(args, claimed, path)
@@ -2173,6 +2175,33 @@ def refuse_wait_claim(check: WaitClaimCheck, *, status: Literal[11, 12] = 12) ->
     return ClaimDenied(status, check.diagnostic, to_stderr=True)
 
 
+def recover_wait_replacement(
+    args: CliArguments, paths: StatePaths, scope: ClaimScope, claim: HeldClaim,
+    assignment: placement.PlacementAssignment | UnassignedClaim, session: SubmittingSession,
+    start: process_identity.Started,
+) -> ClaimAttempt:
+    """Transfer only cleanup ownership of the exact replacement."""
+    record = claim.record
+    assert "remote_host" in record and "replaced_reservation" in record
+    old = record["replaced_reservation"]
+    if process_identity.process_start(args.from_pid) != process_identity.Started(old["proc_start"]):
+        return refuse_wait_claim(WaitClaimCheck.OWNER_START)
+    if not isinstance(assignment, UnassignedClaim):
+        expected = claim_state.ClaimIdentity(execution_identity.assigned_claim_id(assignment.episode, assignment.attempt),
+                                             assignment.episode, assignment.attempt)
+        if claim_state.claim_identity(record) != expected or not claim.matches_mac_assignment_scope(scope):
+            return refuse_wait_claim(WaitClaimCheck.SCOPE)
+    try:
+        _ = claim_state.retire_replaced_reservation(paths, claim.path, record)
+    except claim_state.ReservationRetirementError as error:
+        return ClaimDenied(12, str(error), to_stderr=True)
+    if recoverable_kept_claim(record):
+        return take_over_kept_claim(args, claim, record, session=session)
+    if record.get("cleanup_pending") and record["pid"] == args.pid and record["proc_start"] == start.start:
+        return finished_claim(args, record, claim.path, adopted=True)
+    return ClaimBusy(record)
+
+
 def adopt_wait_claim(args: CliArguments, paths: StatePaths, scope: ClaimScope,
                      *, session: SubmittingSession,
                      assignment: placement.PlacementAssignment | UnassignedClaim = UNASSIGNED_CLAIM,
@@ -2189,6 +2218,12 @@ def adopt_wait_claim(args: CliArguments, paths: StatePaths, scope: ClaimScope,
         return refuse_wait_claim(WaitClaimCheck.NO_RESERVATION)
     identity = claim_state.ClaimIdentity(args.claim_id, args.episode, args.attempt)
     worktree = claim_worktree_path(args.worktree)
+    if paths.platform == "macos":
+        replacements = claim_state.mac_wait_replacements(owners, identity, args.from_pid, session, worktree)
+        if len(replacements) == 1:
+            return recover_wait_replacement(args, paths, scope, replacements[0], assignment, session, start)
+        if replacements:
+            return refuse_wait_claim(WaitClaimCheck.RESERVATION_COUNT)
     checks: tuple[tuple[WaitClaimCheck, Callable[[HeldClaim], bool]], ...] = (
         (WaitClaimCheck.IDENTITY, lambda claim: claim_state.claim_identity(claim.record) == identity),
         (WaitClaimCheck.SCOPE, lambda claim: wait_claim_matches(paths, claim, scope, worktree)
@@ -2481,7 +2516,10 @@ def release_exact_claims(
                 current = read_run(path)
                 if isinstance(current, NoRun) or claim_owner(current) != claim_owner(record):
                     return ClaimReleaseRefused("the exact claim changed during cleanup")
-                retired.update(claim_state.retire_replaced_reservation(paths, path, current))
+                try:
+                    retired.update(claim_state.retire_replaced_reservation(paths, path, current))
+                except claim_state.ReservationRetirementError as error:
+                    return ClaimReleaseRefused(str(error))
                 transfers.extend(current.get("transfers", []))
                 pending.unlink(missing_ok=True)
                 path.unlink(missing_ok=True)

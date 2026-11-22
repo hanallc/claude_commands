@@ -606,6 +606,15 @@ class MacRunTests(unittest.TestCase):
         self.assertEqual(mac_test.command_release(runner, self.paths), 0)
 
     def test_interrupted_replacement_retires_the_wait_reservation(self) -> None:
+        self.exercise_interrupted_replacement(("inspect", "retry", "release"))
+
+    def test_status_keeps_an_interrupted_replacement_available_to_the_wait_owner(self) -> None:
+        self.exercise_interrupted_replacement(("status-direct", "status-assigned"))
+
+    def test_failed_retirement_keeps_the_reservation_and_allows_an_unrelated_claim(self) -> None:
+        self.exercise_interrupted_replacement(("unlink-error",))
+
+    def exercise_interrupted_replacement(self, recoveries: tuple[str, ...]) -> None:
         script = """
 import os
 from pathlib import Path
@@ -616,7 +625,7 @@ from scripts.mac_test import mac_test
 
 path = Path(sys.argv[1])
 args = mac_test.parser().parse_args(sys.argv[3:], namespace=mac_test.CliArguments())
-if sys.argv[2] == "retry":
+if sys.argv[2] == "ended-owner":
     args.pid = os.getpid()
 unlink = Path.unlink
 
@@ -626,26 +635,35 @@ def interrupt(self, *args, **kwargs):
     return unlink(self, *args, **kwargs)
 
 with patch.object(Path, "unlink", interrupt):
-    sys.exit(mac_test.command_claim(args, mac_test.state_paths("mac"), watch_claim=False))
+    sys.exit(mac_test.command_claim(args, mac_test.state_paths("mac"), watch_claim=False, session=args.session))
 """
         resolved = claim_state.mac_repository_identity(str(self.checkout))
         assert isinstance(resolved, claim_state.ResolvedMacMirror)
         saved = resolved.claim_repository()
         assert isinstance(saved, claim_state.MacRepositoryIdentity)
+        with (self.root / "mac_test.conf").open("a") as settings:
+            _ = settings.write("mirror_root=~/.local/state/mac-test/mirror\n")
         config = eligibility.OffloadConfig(True, eligibility.SshConnectionSettings("fixture-mac", 1, 1),
-                                           1, 1, 1, "1", {})
-        for recovery in ("inspect", "retry", "release"):
+                                           1, 1, 1, "1", {"linux_only.checkout": ""})
+        for recovery in recoveries:
             with self.subTest(recovery=recovery):
                 waiting = self.native_claim(self.checkout)
                 if recovery == "release":
                     waiting.episode, waiting.attempt = "episode", "attempt"
                     waiting.claim_id = execution_identity.assigned_claim_id(waiting.episode, waiting.attempt)
+                reservation = saved if recovery == "unlink-error" else claim_state.WHOLE_MAC
                 self.assertEqual(mac_test.command_claim(waiting, self.paths, watch_claim=False,
-                                                       mac_repository=claim_state.WHOLE_MAC), 0)
-                old_path = self.paths.run
+                                                       mac_repository=reservation), 0)
+                reserved, = claim_state.read_claims(self.paths)
+                old_path = reserved.path
                 if recovery == "release":
                     self.paths.claims.mkdir(exist_ok=True)
                     old_path = old_path.rename(self.paths.claims / "zz-legacy.json")
+                elif recovery == "unlink-error":
+                    old_path = old_path.rename(self.paths.claims / "legacy.json")
+                    incomplete = reserved.record.copy()
+                    del incomplete["mac_repository"]
+                    mac_test.write_json(old_path, incomplete)
                 reserved, = claim_state.read_claims(self.paths)
                 self.assertEqual(reserved.path, old_path)
                 identity = claim_state.claim_identity(reserved.record)
@@ -655,14 +673,23 @@ with patch.object(Path, "unlink", interrupt):
                     execution_identity.SourceKeyUnavailable("The fixture has no source key"),
                     placement.SubmittingOwner("fixture-host", waiting.pid, reserved.record["proc_start"]),
                     NoOwningSession(), 0)
+                route = (offload.DirectOffloadRequest() if recovery == "status-direct"
+                         else offload.AssignedOffloadRequest(assigned))
                 request = offload.OffloadRequest(self.checkout, "hana", "test", offload.NO_RESULT_FILE, (),
-                    "verify", "", target="mac", placement=offload.AssignedOffloadRequest(assigned),
+                    "verify", "", target="mac", placement=route,
                     admission=offload.MacClaimFromWait(waiting.pid, identity, NoOwningSession()))
                 command = offload.claim_arguments(request, config, retire_wait=True, mac_repository=saved)
-                child = subprocess.run([sys.executable, "-c", script, str(reserved.path), recovery, *command[2:]],
+                owner = "current-owner" if recovery in ("inspect", "release") else "ended-owner"
+                child = subprocess.run([sys.executable, "-c", script, str(reserved.path), owner, *command[2:]],
                                        capture_output=True, text=True, timeout=5)
                 self.assertEqual(child.returncode, 71, child.stdout + child.stderr)
                 self.assertEqual(len(claim_state.read_claims(self.paths)), 2)
+                if recovery.startswith("status-"):
+                    self.check_replacement_after_status(request, config, reserved.path, script)
+                    continue
+                if recovery == "unlink-error":
+                    self.check_unrelated_acquisition_after_failed_retirement(reserved.path)
+                    continue
                 expected = claim_state.ClaimIdentity(execution_identity.assigned_claim_id(assigned.episode, assigned.attempt),
                                                      assigned.episode, assigned.attempt)
                 if recovery == "inspect":
@@ -689,6 +716,64 @@ with patch.object(Path, "unlink", interrupt):
                     self.assertTrue(kept.record.get("cleanup_pending"))
                     self.assertEqual(kept.record["pid"], os.getpid())
                 self.assertEqual(mac_test.command_release(release, self.paths), 0)
+
+    def check_replacement_after_status(self, request: offload.OffloadRequest, config: eligibility.OffloadConfig,
+                                       old_path: Path, script: str) -> None:
+        before = next(claim for claim in claim_state.read_claims(self.paths) if claim.path != old_path)
+        status_config = mac_test.MacTestConfig("", "", "", "", 1, 0, 1, 1, 1)
+        self.assertEqual(mac_test.command_status(self.paths, status_config), 0)
+        self.assertFalse(old_path.exists())
+        self.assertEqual(claim_state.read_claims(self.paths), (before,))
+        controller = offload.ProcessController()
+        original_arguments = offload.claim_arguments
+
+        def private_claim(*args: object, **kwargs: object) -> list[str]:
+            make_arguments = cast(Callable[..., list[str]], original_arguments)
+            command = make_arguments(*args, **kwargs)
+            return [sys.executable, "-c", script, "", "current-owner", *command[2:]]
+
+        def release(command: list[str]) -> offload.CommandOutput:
+            args = mac_test.parser().parse_args(command[2:], namespace=mac_test.CliArguments())
+            return offload.CommandOutput(mac_test.command_release(args, self.paths), "", "")
+
+        def run(_controller: offload.ProcessController, *_args: object) -> offload.PassedOnMac:
+            check.assert_called_once()
+            claim, = claim_state.read_claims(self.paths)
+            self.assertFalse(claim.record.get("cleanup_pending"))
+            self.assertEqual(claim.record["pid"], os.getpid())
+            return offload.PassedOnMac(1)
+
+        with mock.patch.object(offload, "claim_arguments", side_effect=private_claim), \
+                mock.patch.object(controller, "capture", side_effect=release), \
+                mock.patch.object(offload, "check_current_leftovers", return_value=offload.LeftoversEnded()) as check, \
+                mock.patch.object(offload, "claimed_run", side_effect=run) as launched:
+            result = offload.run_offload(controller, config, request, time.monotonic())
+        self.assertIsInstance(result, offload.PassedOnMac)
+        check.assert_called_once()
+        launched.assert_called_once()
+        identity = controller.claim_identity
+        assert isinstance(identity, claim_state.ClaimIdentity)
+        args = mac_test.CliArguments()
+        args.pid = os.getpid()
+        args.claim_id, args.episode, args.attempt = identity.claim_id, identity.episode, identity.attempt
+        self.assertEqual(mac_test.command_release(args, self.paths), 0)
+
+    def check_unrelated_acquisition_after_failed_retirement(self, old_path: Path) -> None:
+        before = old_path.read_bytes()
+        unrelated = self.native_claim(self.repository("unrelated", origin=HANA_ORIGIN))
+        real_unlink = Path.unlink
+
+        def fail_retirement(path: Path, missing_ok: bool = False) -> None:
+            if path == old_path:
+                raise PermissionError("fixture cannot remove the reservation")
+            real_unlink(path, missing_ok=missing_ok)
+
+        diagnostic = StringIO()
+        with mock.patch.object(Path, "unlink", autospec=True, side_effect=fail_retirement), redirect_stderr(diagnostic):
+            self.assertEqual(mac_test.command_claim(unrelated, self.paths, watch_claim=False), 0)
+        self.assertIn(str(old_path), diagnostic.getvalue())
+        self.assertEqual(old_path.read_bytes(), before)
+        self.assertEqual(len(claim_state.read_claims(self.paths)), 3)
 
     def test_cleanup_handoff_holds_the_mirror_lease_and_retries_direct_claim(self) -> None:
         with (self.root / "mac_test.conf").open("a") as settings:

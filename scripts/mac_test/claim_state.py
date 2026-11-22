@@ -440,6 +440,27 @@ class HeldClaim:
         return False
 
 
+def mac_wait_replacements(
+    claims: tuple[HeldClaim, ...], identity: ClaimIdentity, pid: int, session: SubmittingSession, worktree: Path,
+) -> tuple[HeldClaim, ...]:
+    """Find replacements that record the original wait owner and checkout."""
+    return tuple(claim for claim in claims
+                 if "remote_host" in claim.record
+                 and (old := claim.record.get("replaced_reservation")) is not None
+                 and ClaimIdentity(old["claim_id"], old["episode"], old["attempt"]) == identity and old["pid"] == pid
+                 and claim.record["submitting_session"] == session_id(session)
+                 and recorded_worktree_matches(claim.record["worktree"], worktree)
+                 and isinstance(saved_mac_repository(claim.record), MacRepositoryIdentity))
+
+
+class ReservationRetirementError(OSError):
+    """The original reservation could not be removed."""
+
+    def __init__(self, path: Path, error: OSError) -> None:
+        super().__init__(f"cannot retire Mac reservation {path}: {error}")
+        self.path: Path = path
+
+
 def retire_replaced_reservation(paths: StatePaths, replacement: Path, record: RunRecord) -> tuple[Path, ...]:
     """Remove the exact local reservation under the provider lock."""
     if (paths.platform != "macos" or "remote_host" not in record or "replaced_reservation" not in record
@@ -454,7 +475,10 @@ def retire_replaced_reservation(paths: StatePaths, replacement: Path, record: Ru
             or isinstance(saved_mac_repository(old), MacRepositoryIdentity)
             or replaced_reservation(old, path, paths) != replaced):
         return ()
-    path.unlink(missing_ok=True)
+    try:
+        path.unlink(missing_ok=True)
+    except OSError as error:
+        raise ReservationRetirementError(path, error) from error
     return (path,)
 
 
