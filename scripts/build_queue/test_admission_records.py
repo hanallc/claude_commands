@@ -87,6 +87,37 @@ class RunRecordCodecTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     _ = wire.parse_record(wire.encode_record(raw), wire.MacWatcherSettlementPending)
 
+    def test_mac_watcher_handoff_rejects_invalid_boot_identity(self) -> None:
+        scope = RepositoryScope("fixture", "fixture-key", 2)
+        claim = placement.RunProviderClaimReference("mac", "mac", scope, "run-claim", "run-a", "placement-a")
+        command = wire.RunCommandAttempt("nextest-step", "nextest-attempt")
+        binding = placement.RunCommandBinding(claim, "nextest-fence")
+        for hardware_id, boot_id, boot_at_us in (
+            ("", "mac-boot-id", 100_000_000),
+            (" ", "mac-boot-id", 100_000_000),
+            ("mac-hardware-id", "", 100_000_000),
+            ("mac-hardware-id", " ", 100_000_000),
+            ("mac-hardware-id", "mac-boot-id", 0),
+            ("mac-hardware-id", "mac-boot-id", -1),
+            ("mac-hardware-id", "mac-boot-id", True),
+        ):
+            with self.subTest(hardware_id=hardware_id, boot_id=boot_id, boot_at_us=boot_at_us):
+                with self.subTest(source="constructor"), self.assertRaises(ValueError):
+                    _ = wire.MacBootIdentity(hardware_id, boot_id, boot_at_us)
+
+                saved = {
+                    "kind": "MacWatcherSettlementPending",
+                    "fence": {
+                        "kind": "MacRunWatcherFence",
+                        "command": command,
+                        "binding": binding,
+                        "boot": {"kind": "MacBootIdentity", "hardware_id": hardware_id,
+                                 "boot_id": boot_id, "boot_at_us": boot_at_us},
+                    },
+                }
+                with self.subTest(source="snapshot"), self.assertRaises(ValueError):
+                    _ = wire.parse_record(wire.encode_record(saved), wire.MacWatcherSettlementPending)
+
     def test_legacy_mac_watcher_handoff_keeps_the_claim_without_release_authority(self) -> None:
         scope = RepositoryScope("fixture", "fixture-key", 2)
         claim = placement.RunProviderClaimReference("mac", "mac", scope, "run-claim", "run-a", "placement-a")

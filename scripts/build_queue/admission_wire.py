@@ -123,6 +123,12 @@ class MacBootIdentity:
     boot_id: str
     boot_at_us: int
 
+    def __post_init__(self) -> None:
+        if not self.hardware_id.strip() or not self.boot_id.strip():
+            raise ValueError("a Mac boot needs a hardware ID and a boot ID")
+        if type(self.boot_at_us) is not int or self.boot_at_us <= 0:
+            raise ValueError("a Mac boot needs a positive boot time in microseconds")
+
 
 @dataclass(frozen=True)
 class MacRunWatcherFence:
