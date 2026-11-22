@@ -3,13 +3,11 @@ from __future__ import annotations
 
 from collections.abc import Callable, Generator
 from contextlib import contextmanager, redirect_stderr
-from dataclasses import replace
 import fcntl
 from io import StringIO
 import os
 from pathlib import Path
 import pwd
-import re
 import select
 import shlex
 import subprocess
@@ -18,7 +16,7 @@ import tempfile
 import time
 from typing import cast, override
 import unittest
-from unittest.mock import patch
+from unittest.mock import call, patch
 
 from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, GateJobNotRecorded, StepJob
 from scripts.build_targets import mac_linux
@@ -34,7 +32,6 @@ import shlex
 import signal
 import subprocess
 import sys
-import time
 
 host, command = sys.argv[-2:]
 if host == 'fixture-mac':
@@ -57,24 +54,19 @@ if os.environ['FIXTURE_GUEST_RESULT'] == 'offline':
 environment = dict(os.environ, HOME=str(home))
 scenario = os.environ['FIXTURE_GUEST_RESULT']
 if arm:
-    trace_path.with_name('arm-hop-started').write_text(str(time.monotonic()))
-    time.sleep(float(os.environ.get('FIXTURE_ARM_LAUNCH_DELAY', '0')))
     reply = subprocess.check_output(['bash', '-c', shell], stdin=subprocess.DEVNULL, env=environment)
     if scenario != 'missing-arm-ack':
-        trace_path.with_name('arm-emitted').write_text(str(time.monotonic()))
         sys.stdout.buffer.write(reply)
         sys.stdout.buffer.flush()
-    time.sleep(float(os.environ.get('FIXTURE_ARM_EXIT_DELAY', '0')))
-    trace_path.with_name('arm-ssh-ended').write_text(str(time.monotonic()))
     sys.exit(0)
 if cleanup:
     if scenario in ('disconnect-before-copy', 'interrupted-before-copy'):
         lock = home / '.claude/.git/mac-linux-run.lock'
-        if trace_path.read_text().splitlines().count('cleanup') == 1:
+        proof_attempt = trace_path.read_text().splitlines().count('cleanup')
+        if proof_attempt == 1:
             assert subprocess.call(['flock', '-x', '-n', lock, 'true']) == 1
             assert not (home / 'build').exists()
-        failure = os.environ.get('FIXTURE_CLEANUP_FAILURE')
-        if failure == 'always' or (failure == 'once' and trace_path.read_text().splitlines().count('cleanup') == 1):
+        if proof_attempt <= int(os.environ.get('FIXTURE_OFFLINE_PROOFS', '0')):
             print('fixture cleanup SSH refused the connection', file=sys.stderr)
             sys.exit(255)
     sys.exit(subprocess.call(['bash', '-c', shell], stdin=subprocess.DEVNULL, env=environment))
@@ -104,7 +96,6 @@ if scenario == 'disconnect':
 if scenario in ('disconnect-before-copy', 'interrupted-before-copy'):
     import selectors
 
-    time.sleep(float(os.environ.get('FIXTURE_SSH_LAUNCH_DELAY', '0')))
     guest = subprocess.Popen(['bash', '-c', shell], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
                              stderr=subprocess.PIPE, env=environment, start_new_session=True)
     guest.stdin.write(payload)
@@ -116,7 +107,6 @@ if scenario in ('disconnect-before-copy', 'interrupted-before-copy'):
     if scenario == 'interrupted-before-copy':
         print('fixture local SSH is still active', file=sys.stderr, flush=True)
         signal.pause()
-    trace_path.with_name('ssh-ended').write_text(str(time.monotonic()))
     os._exit(255)
 sys.exit(subprocess.run(['bash', '-c', shell], input=payload, env=environment,
                         start_new_session=True).returncode)
@@ -395,7 +385,7 @@ fi
         settings = mac_linux.read_settings(conf.read(self.registry))
         armed = mac_linux.arm_guest(settings, 'delayed-fixture')
         proof = mac_linux.prove_guest_end(settings, armed)
-        self.assertIs(proof.status, mac_linux.GuestEndStatus.ENDED)
+        self.assertIsInstance(proof, mac_linux.GuestEndProven)
         cancel = git / f'{mac_linux.CANCEL_RECORD_PREFIX}.{armed.boot_id}.{armed.deadline_ns}.{armed.attempt}'
         self.assertTrue(cancel.is_file())
         self.assertFalse(old_record.is_symlink())
@@ -430,11 +420,11 @@ fi
     def test_cleanup_keeps_cancel_records_until_their_armed_deadline(self) -> None:
         settings = mac_linux.read_settings(conf.read(self.registry))
         armed = mac_linux.arm_guest(settings, 'first-cancel-fixture')
-        self.assertIs(mac_linux.prove_guest_end(settings, armed).status, mac_linux.GuestEndStatus.ENDED)
+        self.assertIsInstance(mac_linux.prove_guest_end(settings, armed), mac_linux.GuestEndProven)
         cancel = self.run_lock().parent / (
             f'{mac_linux.CANCEL_RECORD_PREFIX}.{armed.boot_id}.{armed.deadline_ns}.{armed.attempt}')
         next_armed = mac_linux.arm_guest(settings, 'second-cancel-fixture')
-        self.assertIs(mac_linux.prove_guest_end(settings, next_armed).status, mac_linux.GuestEndStatus.ENDED)
+        self.assertIsInstance(mac_linux.prove_guest_end(settings, next_armed), mac_linux.GuestEndProven)
         self.assertLess(time.clock_gettime_ns(time.CLOCK_BOOTTIME), armed.deadline_ns)
         self.assertTrue(cancel.is_file())
 
@@ -452,27 +442,46 @@ fi
         self.assertFalse((self.guest_home / 'build').exists())
         self.assertEqual(self.trace.read_text().splitlines(), ['probe', 'arm', 'run', 'cleanup'])
 
-    def test_cleanup_ssh_failure_keeps_the_reservation_through_the_second_proof(self) -> None:
-        launch_window = 4
+    def test_unreachable_guest_keeps_the_claim_until_proof(self) -> None:
+        events: list[str] = []
+        prove_guest_end = mac_linux.prove_guest_end
 
         @contextmanager
         def reservation(*_args: object) -> Generator[None]:
-            started = time.monotonic()
+            events.append('reserved')
             try:
                 yield
             finally:
-                self.assertGreaterEqual(time.monotonic() - started, launch_window + 4 + mac_linux.GUEST_KILL_GRACE_SECONDS)
-                self.assertEqual(self.trace.read_text().splitlines(), ['probe', 'arm', 'run', 'cleanup', 'cleanup'])
-                self.assertEqual(subprocess.call(['flock', '-x', '-n', self.run_lock(), 'true']), 0)
+                events.append('released')
 
-        configuration = self.registry.with_name('mac_linux.conf')
-        _ = configuration.write_text(configuration.read_text().replace('seconds=7', 'seconds=4'))
-        with (patch.dict(os.environ, {'FIXTURE_CLEANUP_FAILURE': 'once', 'FIXTURE_RUN_SECONDS': '4'}),
-              patch.object(mac_linux, 'SSH_CONNECT_TIMEOUT_SECONDS', launch_window),
-              patch.object(mac_linux, 'mac_linux_reservation', reservation)):
+        def prove(settings: mac_linux.GuestSettings,
+                  armed: mac_linux.ArmedGuestAttempt) -> mac_linux.GuestEndProven | mac_linux.GuestEndPending:
+            self.assertNotIn('released', events)
+            cancel = self.run_lock().parent / (
+                f'{mac_linux.CANCEL_RECORD_PREFIX}.{armed.boot_id}.{armed.deadline_ns}.{armed.attempt}')
+            self.assertFalse(cancel.exists())
+            proof = prove_guest_end(settings, armed)
+            if isinstance(proof, mac_linux.GuestEndPending):
+                self.assertIn('fixture cleanup SSH refused the connection', proof.detail)
+                self.assertFalse(cancel.exists())
+                events.append('unreachable')
+            else:
+                self.assertTrue(cancel.is_file())
+                self.assertEqual(subprocess.call(['flock', '-x', '-n', self.run_lock(), 'true']), 0)
+                events.append('ended')
+            return proof
+
+        with (patch.dict(os.environ, {'FIXTURE_OFFLINE_PROOFS': '2'}),
+              patch.object(mac_linux, 'mac_linux_reservation', reservation),
+              patch.object(mac_linux, 'prove_guest_end', prove),
+              patch.object(mac_linux, 'sleep') as retry_delay,
+              redirect_stderr(StringIO()) as log):
             result = self.route('disconnect-before-copy')
-        self.assertIn('fixture cleanup SSH refused the connection', str(result))
-        self.assertIn('Guest cleanup: ended', str(result))
+        self.assertIn('Guest cleanup: ended after fixture cleanup SSH refused the connection', str(result))
+        self.assertEqual(log.getvalue().splitlines(), ['Mac Linux guest run not proven ended; the Mac claim stays held'])
+        self.assertEqual(events, ['reserved', 'unreachable', 'unreachable', 'ended', 'released'])
+        self.assertEqual(retry_delay.call_args_list, [call(mac_linux.GUEST_PROOF_RETRY_SECONDS)] * 2)
+        self.assertEqual(self.trace.read_text().splitlines(), ['probe', 'arm', 'run', 'cleanup', 'cleanup', 'cleanup'])
 
     def test_cleanup_refuses_an_invalid_group_with_the_lock_held(self) -> None:
         lock = self.run_lock()
@@ -485,91 +494,38 @@ fi
             _ = held.write('-1 invalid-group-fixture\n')
             held.flush()
             proof = mac_linux.prove_guest_end(settings, armed)
-        self.assertIs(proof.status, mac_linux.GuestEndStatus.PENDING)
+        self.assertIsInstance(proof, mac_linux.GuestEndPending)
+        assert isinstance(proof, mac_linux.GuestEndPending)
         self.assertIn('process group ID is invalid', proof.detail)
         self.assertIn('run lock is still held', proof.detail)
 
-    def test_late_second_hop_uses_the_bound_from_the_arm_acknowledgement(self) -> None:
-        duration = 3
-        launch_window = 4
-        arm_guest = mac_linux.arm_guest
-        acknowledgements: list[mac_linux.ArmedGuestAttempt] = []
-
-        def receive_arm(settings: mac_linux.GuestSettings, attempt: str) -> mac_linux.ArmedGuestAttempt:
-            armed = arm_guest(settings, attempt)
-            acknowledgements.append(armed)
-            return armed
-
-        @contextmanager
-        def reservation(*_args: object) -> Generator[None]:
-            try:
-                yield
-            finally:
-                self.assertGreaterEqual(time.monotonic() - acknowledgements[0].acknowledged_at,
-                                        launch_window + duration + mac_linux.GUEST_KILL_GRACE_SECONDS)
-                self.assertEqual(self.trace.read_text().splitlines(), ['probe', 'arm', 'run', 'cleanup', 'cleanup'])
-
-        configuration = self.registry.with_name('mac_linux.conf')
-        _ = configuration.write_text(configuration.read_text().replace('seconds=7', f'seconds={duration}'))
-        with (patch.dict(os.environ, {'FIXTURE_CLEANUP_FAILURE': 'always', 'FIXTURE_RUN_SECONDS': str(duration),
-                                     'FIXTURE_ARM_LAUNCH_DELAY': '1', 'FIXTURE_ARM_EXIT_DELAY': '0.8',
-                                     'FIXTURE_SSH_LAUNCH_DELAY': '0.4'}),
-              patch.object(mac_linux, 'SSH_CONNECT_TIMEOUT_SECONDS', launch_window),
-              patch.object(mac_linux, 'arm_guest', receive_arm),
-              patch.object(mac_linux, 'mac_linux_reservation', reservation)):
-            reason = self.route('disconnect-before-copy')
-        self.assertIn('fixture cleanup SSH refused the connection', str(reason))
-        bound = re.search(r'guest unreachable; its own timeout bound passed at (\d+\.\d+)', str(reason))
-        assert bound is not None, reason
-        receipt = acknowledgements[0].acknowledged_at
-        started = float(self.trace.with_name('arm-hop-started').read_text())
-        emitted = float(self.trace.with_name('arm-emitted').read_text())
-        arm_exited = float(self.trace.with_name('arm-ssh-ended').read_text())
-        run_exited = float(self.trace.with_name('ssh-ended').read_text())
-        self.assertGreaterEqual(emitted - started, 1)
-        self.assertLessEqual(emitted, receipt)
-        self.assertLess(receipt, arm_exited)
-        self.assertLess(arm_exited, run_exited)
-        self.assertAlmostEqual(float(bound[1]), receipt + launch_window + duration + mac_linux.GUEST_KILL_GRACE_SECONDS,
-                               delta=0.001)
-
-    def test_reachable_guest_with_a_held_lock_retries_after_the_bound(self) -> None:
-        reservation_active = False
-        statuses: list[mac_linux.GuestEndStatus] = []
+    def test_reachable_guest_with_a_held_lock_retries(self) -> None:
+        proofs: list[mac_linux.GuestEndProven | mac_linux.GuestEndPending] = []
         prove_guest_end = mac_linux.prove_guest_end
-        finish_guest_run = mac_linux.finish_guest_run
 
         @contextmanager
         def reservation(*_args: object) -> Generator[None]:
-            nonlocal reservation_active
-            reservation_active = True
             try:
                 yield
             finally:
-                self.assertEqual(statuses, [mac_linux.GuestEndStatus.PENDING, mac_linux.GuestEndStatus.PENDING,
-                                            mac_linux.GuestEndStatus.ENDED])
-                reservation_active = False
+                self.assertEqual([type(proof) for proof in proofs],
+                                 [mac_linux.GuestEndPending, mac_linux.GuestEndPending, mac_linux.GuestEndProven])
 
         lock = self.run_lock()
         lock.parent.mkdir(parents=True)
         with lock.open('w') as held, redirect_stderr(StringIO()) as log:
             fcntl.flock(held, fcntl.LOCK_EX)
 
-            def prove(settings: mac_linux.GuestSettings, armed: mac_linux.ArmedGuestAttempt) -> mac_linux.GuestEndProof:
-                self.assertTrue(reservation_active)
+            def prove(settings: mac_linux.GuestSettings,
+                      armed: mac_linux.ArmedGuestAttempt) -> mac_linux.GuestEndProven | mac_linux.GuestEndPending:
                 proof = prove_guest_end(settings, armed)
-                statuses.append(proof.status)
-                if len(statuses) == 2:
+                proofs.append(proof)
+                if len(proofs) == 2:
                     fcntl.flock(held, fcntl.LOCK_UN)
                 return proof
 
-            def after_bound(settings: mac_linux.GuestSettings, armed: mac_linux.ArmedGuestAttempt) -> mac_linux.GuestEndProof:
-                before_bound = time.monotonic() - settings.run_time_limit_seconds - mac_linux.SSH_CONNECT_TIMEOUT_SECONDS
-                return finish_guest_run(settings, replace(armed, acknowledged_at=before_bound - 1))
-
             with (patch.object(mac_linux, 'mac_linux_reservation', reservation),
                   patch.object(mac_linux, 'prove_guest_end', prove),
-                  patch.object(mac_linux, 'finish_guest_run', after_bound),
                   patch.object(mac_linux, 'GUEST_KILL_GRACE_SECONDS', 0)):
                 result = self.route()
         self.assertIn('Guest cleanup: ended', str(result))
@@ -586,12 +542,12 @@ fi
                 events.append('stderr failed')
                 raise BrokenPipeError(message)
 
-        def prove(settings: mac_linux.GuestSettings, armed: mac_linux.ArmedGuestAttempt) -> mac_linux.GuestEndProof:
+        def prove(settings: mac_linux.GuestSettings, armed: mac_linux.ArmedGuestAttempt) -> mac_linux.GuestEndProven | mac_linux.GuestEndPending:
             if events == ['reserved']:
                 events.append('pending')
-                return mac_linux.GuestEndProof(mac_linux.GuestEndStatus.PENDING, 'fixture cleanup pending')
+                return mac_linux.GuestEndPending('fixture cleanup pending')
             proof = prove_guest_end(settings, armed)
-            events.append(proof.status.value)
+            events.append('ended' if isinstance(proof, mac_linux.GuestEndProven) else 'pending')
             return proof
 
         @contextmanager
@@ -608,14 +564,17 @@ fi
         self.assertIsInstance(result, GateRun)
         self.assertEqual(events, ['reserved', 'pending', 'stderr failed', 'ended', 'released'])
 
-    def test_reachable_cleanup_error_or_unexpected_reply_is_pending(self) -> None:
+    def test_cleanup_error_timeout_or_unexpected_reply_is_pending(self) -> None:
         settings = mac_linux.read_settings(conf.read(self.registry))
         armed = mac_linux.arm_guest(settings, 'reachable-fixture')
         for status, output in ((1, ''), (0, 'unexpected')):
             with (self.subTest(status=status),
                   patch.object(subprocess, 'run', return_value=subprocess.CompletedProcess([], status, output, ''))):
                 proof = mac_linux.prove_guest_end(settings, armed)
-                self.assertIs(proof.status, mac_linux.GuestEndStatus.PENDING)
+                self.assertIsInstance(proof, mac_linux.GuestEndPending)
+
+        with patch.object(subprocess, 'run', side_effect=subprocess.TimeoutExpired('ssh', 1)):
+            self.assertIsInstance(mac_linux.prove_guest_end(settings, armed), mac_linux.GuestEndPending)
 
     def test_keyboard_interrupt_proves_the_end_before_release(self) -> None:
         communicate = cast(Callable[[subprocess.Popen[bytes], bytes | None, float | None], tuple[bytes, bytes]],
@@ -660,7 +619,8 @@ fi
         self.assertNotEqual(run.returncode, 0)
         self.assertIn('run lock must not be a symlink', run.stderr)
         proof = mac_linux.prove_guest_end(settings, armed)
-        self.assertIs(proof.status, mac_linux.GuestEndStatus.PENDING)
+        self.assertIsInstance(proof, mac_linux.GuestEndPending)
+        assert isinstance(proof, mac_linux.GuestEndPending)
         self.assertIn('run lock must not be a symlink', proof.detail)
         self.assertEqual(outside.read_text(), 'keep this file\n')
 

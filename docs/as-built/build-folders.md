@@ -7,6 +7,8 @@ Editable source lives under `~/worktrees`. Cargo output lives under the configur
 The build root is `/build` on natedev and `~/build` on the Mac. The table uses `/build` for the build root.
 
 The Mac Linux guest uses the default build root `~/build` and the main checkout `~/.claude` for the `gate-runner` user.
+After a run starts, the route releases the Mac claim only when the guest confirms it wrote the cancel record under the run lock.
+If the guest is unreachable, the route holds the claim and retries until the guest proves the run ended.
 
 | Form | Path | Cargo output |
 | --- | --- | --- |

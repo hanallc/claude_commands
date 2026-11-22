@@ -1,6 +1,8 @@
 """Run the gate in the Mac's Linux guest.
 
-If the gate parent and module supervisor die, an escaped descendant can retain the lock and keep the claim held (GUEST_END_PENDING_MESSAGE).
+Release the claim after the guest confirms that it wrote the cancel record under the run lock.
+If the guest is unreachable, hold the claim and retry until the guest can prove the run ended.
+If the gate parent and module supervisor die, a descendant can keep the lock and prevent proof.
 """
 from __future__ import annotations
 
@@ -14,14 +16,13 @@ import math
 from pathlib import Path
 import os
 import re
-import select
 import shlex
 import shutil
 import signal
 import subprocess
 import sys
 import tarfile
-import time
+from time import sleep
 from typing import Literal, TypedDict, cast
 from urllib.parse import urlsplit
 from uuid import uuid4
@@ -237,12 +238,11 @@ fi'''
 
 @dataclass(frozen=True)
 class ArmedGuestAttempt:
-    """Keep the guest deadline and the caller's receipt time."""
+    """Identify the run and its deadline on the guest."""
 
     attempt: str
     boot_id: str
     deadline_ns: int
-    acknowledged_at: float
 
 
 ARM_ATTEMPT = '''\
@@ -283,28 +283,17 @@ def arm_guest(settings: GuestSettings, attempt: str) -> ArmedGuestAttempt:
     with subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                           stderr=subprocess.PIPE, start_new_session=True) as process:
         try:
-            assert process.stdout is not None
-            expires = time.monotonic() + GUEST_REF_TIMEOUT_SECONDS
-            line = b''
-            while b'\n' not in line and len(line) < 128:
-                if not select.select([process.stdout], [], [], max(0, expires - time.monotonic()))[0]:
-                    raise subprocess.TimeoutExpired(command, GUEST_REF_TIMEOUT_SECONDS)
-                chunk = os.read(process.stdout.fileno(), 128)
-                if not chunk:
-                    break
-                line += chunk
-            acknowledged_at = time.monotonic()
-            trailing, errors = process.communicate(timeout=max(0, expires - acknowledged_at))
+            output, errors = process.communicate(timeout=GUEST_REF_TIMEOUT_SECONDS)
         except BaseException:
             stop_ssh_process(process)
             raise
     if process.returncode:
         diagnostic = errors.decode(errors='replace').strip() or 'no diagnostic'
         raise GuestUnavailable(f'guest arm exited {process.returncode}: {diagnostic}')
-    reply = re.fullmatch(rb'armed ([0-9a-f-]{36}) ([0-9]{1,20})\n', line + trailing)
+    reply = re.fullmatch(rb'armed ([0-9a-f-]{36}) ([0-9]{1,20})\n', output)
     if reply is None:
         raise GuestUnavailable('the guest did not acknowledge the armed deadline')
-    return ArmedGuestAttempt(attempt, reply[1].decode('ascii'), int(reply[2]), acknowledged_at)
+    return ArmedGuestAttempt(attempt, reply[1].decode('ascii'), int(reply[2]))
 
 
 OPEN_RUN_LOCK = '''\
@@ -504,59 +493,50 @@ exit {GUEST_END_PENDING_STATUS}'''
     return guest_checkout_shell(settings) + f'\nexec {open_run_lock_command(8, cleanup)}'
 
 
-class GuestEndStatus(StrEnum):
-    ENDED = 'ended'
-    PENDING = 'pending'
-    UNREACHABLE = 'unreachable'
+@dataclass(frozen=True)
+class GuestEndProven:
+    """The guest wrote the cancel record under the run lock."""
 
 
 @dataclass(frozen=True)
-class GuestEndProof:
-    status: GuestEndStatus
-    detail: str = ''
+class GuestEndPending:
+    detail: str
 
 
-def prove_guest_end(settings: GuestSettings, armed: ArmedGuestAttempt) -> GuestEndProof:
+def prove_guest_end(settings: GuestSettings, armed: ArmedGuestAttempt) -> GuestEndProven | GuestEndPending:
     try:
         reply = subprocess.run(settings.command(cleanup_shell(settings, armed)), stdin=subprocess.DEVNULL,
                                capture_output=True, text=True, errors='replace',
                                timeout=GUEST_CLEANUP_TIMEOUT_SECONDS, check=False)
     except (OSError, subprocess.TimeoutExpired) as error:
-        return GuestEndProof(GuestEndStatus.PENDING, str(error))
+        return GuestEndPending(str(error) or type(error).__name__)
     if reply.returncode == 0 and reply.stdout.strip() == 'ended':
-        return GuestEndProof(GuestEndStatus.ENDED)
-    # OpenSSH reports a connection timeout with status 255.
-    status = GuestEndStatus.UNREACHABLE if reply.returncode == 255 else GuestEndStatus.PENDING
+        return GuestEndProven()
     reason = reply.stderr.strip() or f'cleanup SSH exited {reply.returncode}'
-    return GuestEndProof(status, reason)
+    return GuestEndPending(reason)
 
 
-def finish_guest_run(settings: GuestSettings, armed: ArmedGuestAttempt) -> GuestEndProof:
-    bound = armed.acknowledged_at + SSH_CONNECT_TIMEOUT_SECONDS + settings.run_time_limit_seconds + GUEST_KILL_GRACE_SECONDS
+def finish_guest_run(settings: GuestSettings, armed: ArmedGuestAttempt) -> str:
+    """Wait for proof and return a cleanup diagnostic."""
     first_failure = ''
     interruption: KeyboardInterrupt | None = None
     while True:
         try:
             proof = prove_guest_end(settings, armed)
-            if proof.status is GuestEndStatus.ENDED:
-                detail = 'Guest cleanup: ended' + (f' after {first_failure}' if first_failure else '')
-                break
-            remaining = bound - time.monotonic()
-            if proof.status is GuestEndStatus.UNREACHABLE and remaining <= 0:
-                detail = (f'Guest cleanup: {proof.detail}. guest unreachable; '
-                          + f'its own timeout bound passed at {bound:.3f} on the caller monotonic clock')
+            if isinstance(proof, GuestEndProven):
                 break
             if not first_failure:
                 first_failure = proof.detail
                 with suppress(OSError, ValueError):
                     print(GUEST_END_PENDING_MESSAGE, file=sys.stderr, flush=True)
-            time.sleep(remaining if proof.status is GuestEndStatus.UNREACHABLE else GUEST_PROOF_RETRY_SECONDS)
+            sleep(GUEST_PROOF_RETRY_SECONDS)
         except KeyboardInterrupt as error:
             interruption = error
+    detail = 'Guest cleanup: ended' + (f' after {first_failure}' if first_failure else '')
     if interruption is not None:
         interruption.add_note(detail)
         raise interruption
-    return GuestEndProof(proof.status, detail)
+    return detail
 
 
 class BundleForm(StrEnum):
@@ -673,21 +653,18 @@ def run_remote(repo: Path, settings: GuestSettings, source: CandidateSource, req
         stream_error = error
         raise
     finally:
-        proof = finish_guest_run(settings, armed)
+        cleanup_detail = finish_guest_run(settings, armed)
         if isinstance(stream_error, subprocess.TimeoutExpired):
-            raise GuestUnavailable(f'SSH or guest run exceeded {timeout} seconds. {proof.detail}') from stream_error
+            raise GuestUnavailable(f'SSH or guest run exceeded {timeout} seconds. {cleanup_detail}') from stream_error
         if stream_error is not None:
-            stream_error.add_note(proof.detail)
+            stream_error.add_note(cleanup_detail)
     if stream.returncode:
         diagnostics = errors.decode(errors='replace')
-        if (proof.status is GuestEndStatus.ENDED and stream.returncode == MISSING_PREREQUISITE_STATUS
-                and MISSING_PREREQUISITE_MESSAGE in diagnostics):
+        if stream.returncode == MISSING_PREREQUISITE_STATUS and MISSING_PREREQUISITE_MESSAGE in diagnostics:
             raise GuestMissingPrerequisite(diagnostics.strip())
         detail = ' '.join(diagnostics.split())[-1200:]
         raise GuestUnavailable(f'SSH or source stream exited {stream.returncode}: {detail or "no diagnostic"}. '
-                               + proof.detail)
-    if proof.status is GuestEndStatus.UNREACHABLE:
-        raise GuestUnavailable(proof.detail)
+                               + cleanup_detail)
     result, _, count = output.rstrip().rpartition(b'\n')
     return GuestReply(result.decode('utf-8'), int(count) - len(bootstrap), form, reason)
 
