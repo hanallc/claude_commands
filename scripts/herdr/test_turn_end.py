@@ -3044,16 +3044,16 @@ class TurnEndTests(unittest.TestCase):
                     event = replace(event, reply=hook_reply)
                     if partial:
                         self.case.agent.append(current.pane, "assistant", partial)
-                    log = self.case.fixture.root / "state/herdr/turn-end-ignored.jsonl"
-                    previous = len(log.read_text().splitlines()) if log.is_file() else 0
-                    self.assertEqual(turn_end.handle(event), turn_end.TurnOutcome.IGNORED)
-                    entries = [cast(dict[str, object], json.loads(line)) for line in log.read_text().splitlines()]
-                    self.assertEqual(len(entries), previous + 1)
-                    entry = entries[-1]
-                    self.assertEqual((entry["thread_id"], entry["worker_name"]), (current.row.current_session, name))
-                    reason = ("the transcript reply differs from the turn reply" if partial
-                              else "the submitted dispatch has no final reply")
-                    self.assertEqual(entry["reason"], reason)
+                    notices = len(self.case.agent.notices)
+                    expected = turn_end.TurnOutcome.NO_DONE if partial else turn_end.TurnOutcome.RETRY_EVIDENCE
+                    self.assertEqual(turn_end.handle(event), expected)
+                    self.assertTrue(worker.pending_done_path(self.case.run_dir, current.row.id).is_file())
+                    if partial:
+                        notice, = self.case.agent.notices[notices:]
+                        self.assertIn(partial, notice)
+                        self.assertNotIn(hook_reply, notice)
+                    else:
+                        self.assertEqual(len(self.case.agent.notices), notices)
                     self.assertEqual(progress_history.active_dispatch(current.row.id, self.case.run_dir), active)
                     self.assertIn(current.pane, self.case.fixture.world.locations)
                     self.assertEqual(staff.by_id(current.row.id), current.row)

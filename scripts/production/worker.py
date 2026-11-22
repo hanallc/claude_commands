@@ -2572,17 +2572,14 @@ def restore(parent: StaffId, *, record: staff.StaffSnapshot | None = None,
                             _ = progress_history.record_worker_park(run, state.row.id, park.instance, park.stage,
                                                                    launch=progress_history.ClearWorkerPark.MARKER)
                         continue
-                    if recovery is CompletionRecovery.WAITING_ON_REPLY and isinstance(state, worker_panes.ClosedWorker):
-                        # Reap can resume a worker after the first pane read.
-                        current = worker_panes.observe_worker(parent, state.row, staff.snapshot())
-                        if isinstance(current, worker_panes.OpenWorker) and not current.status.idle:
-                            changed = True
+                    if recovery is CompletionRecovery.WAITING_ON_REPLY:
+                        if (isinstance(state, worker_panes.OpenWorker)
+                                and state.pane == reaped_panes.get(state.row.id)
+                                and state.status == herdr.AgentStatus.WORKING):
                             continue
-                    if (recovery is CompletionRecovery.WAITING_ON_REPLY
-                            and isinstance(state, (worker_panes.OpenWorker, worker_panes.StoppedWorker))
-                            and passed.get("status") == "canceled"):
-                        allowed = worker_panes.can_close(state, run=worker_panes.DispatchRun(run), lock=hold)
-                        if isinstance(allowed, worker_panes.CloseAllowed):
+                        if passed.get("status") == "canceled":
+                            if isinstance(state, worker_panes.ClosedWorker):
+                                continue
                             closed = worker_panes.close(parent, WorkerName.parse(state.row.name), lock=hold)
                             if isinstance(closed, worker_panes.Closed):
                                 changed = True
