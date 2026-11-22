@@ -58,21 +58,31 @@ class TheListTests(unittest.TestCase):
         _ = (config / "change_review.conf").write_text(
             f"review_links_directory={self.root / 'reviews'}\nlists_directory={lists}\n")
         _ = (config / "review_links.conf").write_text(
-            "delivery_tries=1\ndelivery_pause_seconds=0\nfeedback_rows=3\n"
-            + "page_refresh_seconds=10\npage_request_timeout_seconds=5\n"
-            + "card_fade_out_ms=150\ncard_fade_in_ms=200\nlater_morning=08:00\n"
-            + f"list_log_max_height_rem=12\nunrouted_alert_recipient={RUNNER.name}\n")
+            "# whole: 1..20\ndelivery_tries=1\n"
+            + "# range: 0..300\ndelivery_pause_seconds=0\n"
+            + "# whole: 1..20\nfeedback_rows=3\n"
+            + "# range: 5..300\npage_refresh_seconds=10\n"
+            + "# whole: 1..300\npage_request_timeout_seconds=5\n"
+            + "# whole: 1..5000\ncard_fade_out_ms=150\n"
+            + "# whole: 1..5000\ncard_fade_in_ms=200\n"
+            + "# whole: 1..80\nlist_log_max_height_rem=12\n"
+            + f"later_morning=08:00\nunrouted_alert_recipient={RUNNER.name}\n")
         _ = (config / "console.conf").write_text(
             f"page.list.owner={KEEPER.id}\n"
-            + "status.round_trip_limit_seconds=2\nstatus.render_limit_seconds=2\n"
-            + "status.reading_delay_seconds=1\nstatus.list.age_limit_seconds=30\n")
+            + "# range: 0.001..86400\nstatus.round_trip_limit_seconds=2\n"
+            + "# range: 0.001..86400\nstatus.render_limit_seconds=2\n"
+            + "# range: 0.001..86400\nstatus.reading_delay_seconds=1\n"
+            + "# range: 0.001..86400\nstatus.list.age_limit_seconds=30\n")
+        _ = (config / "statusline.conf").write_text(
+            "role.showrunner=#a379fd\nrole.unit-director=#ffaf02\n"
+            + "role.producer=#90fe42\nrole.worker=#ff0404\n")
         _ = (config / "staff.conf").write_text(f"list_requester_producer_id={OTHER.id}\n")
         staff_file = self.root / "staff.json"
         rows = [row.to_json() for row in (KEEPER, RUNNER, OWNER, OTHER, EDITOR)]
         _ = staff_file.write_text(json.dumps({"schema": 1, "rows": rows}))
         self.enterContext(patch.dict(os.environ, {"HOME": str(self.root), "STAFF_FILE": str(staff_file), "CONF_DIR": str(config),
             "SHOWRUNNER_STATE_DIR": str(self.root / "state"), "CODEX_THREAD_ID": "",
-            "CLAUDE_CODE_SESSION_ID": KEEPER.current_session}))
+            "CLAUDE_CODE_SESSION_ID": KEEPER.current_session, "USER_ZONE": "America/New_York"}))
         _ = os.environ.pop("CHANGE_REVIEW_DIR", None)
         _ = os.environ.pop("REVIEW_LINKS_ROOT", None)
         _ = self.enterContext(patch.object(the_list, "now", return_value=START))
