@@ -280,6 +280,23 @@ class BuildLimitsTests(unittest.TestCase):
                         self.assertEqual(mac_cell.runs, ["matching run"])
                         self.assertEqual(mac_cell.other, ["other attempt"])
                         self.assertEqual(mac_cell.note, note)
+                unknown_folder = str(root / "unknown-mac-checkout")
+                unknown_run = replace(build, folder=unknown_folder)
+                unknown_claim: claim_state.RemoteJobClaim = {**kept, "worktree": unknown_folder}
+                same_name = "https://example.invalid/other-team/workspace"
+                duplicate = replace(saved, history=replace(history, machines={**history.machines, same_name: {"mac"}}))
+                for background in (saved, duplicate):
+                    for scope in (claim_state.RepositoryScope("workspace"), claim_state.WHOLE_MAC):
+                        with self.subTest(scope=scope, duplicate=background is duplicate):
+                            retained = replace(mac, claims=(replace(held, scope=scope, record=unknown_claim),))
+                            shared_limits = limits_view.build_limits(current, (retained, hana), names, memory,
+                                folders, background, UTC, ((unknown_run, "unknown origin"),))
+                            self.assertEqual(shared_limits.mac.claims, 1)
+                            self.assertEqual(shared_limits.mac.runs, ("unknown origin",))
+                            self.assertEqual(len(shared_limits.repositories), 5 if background is duplicate else 4)
+                            self.assertTrue(all(not row.mac.runs for row in shared_limits.repositories))
+                            if isinstance(scope, claim_state.RepositoryScope):
+                                self.assertTrue(all(row.mac.used == 0 for row in shared_limits.repositories))
                 unreadable = replace(mac, states=(targets.StateUnreadable("Cannot read fixture claims"),), claims=())
                 claim_status = limits_view.build_limits(current, (unreadable, hana), names, memory,
                                                        folders, saved, UTC, mac_runs)

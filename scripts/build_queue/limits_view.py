@@ -44,6 +44,8 @@ class MachineLimits:
     state: str
     shared: tuple[Metric, ...] = ()
     waits: dict[str, list[str]] = field(default_factory=dict[str, list[str]])
+    claims: int = 0
+    runs: tuple[str, ...] = ()
 
 
 @dataclass
@@ -592,6 +594,8 @@ def build_limits(reading: records.QueueRead, snapshots: target_availability.Snap
     mac_claims_unavailable = mac is None or any(isinstance(state, targets.StateUnreadable)
                                                 for state in mac.states)
     whole_mac = False
+    shared_mac_claims = 0
+    shared_mac_runs: list[str] = []
     claimed: set[str] = set()
     repositories_with_claims: set[str] = set()
     cloud_repositories: set[str] = set()
@@ -599,7 +603,7 @@ def build_limits(reading: records.QueueRead, snapshots: target_availability.Snap
 
     def row(origin: str) -> RepositoryRow:
         if origin not in rows:
-            rows[origin] = RepositoryRow(origin_name(origin) or "Repository not recorded")
+            rows[origin] = RepositoryRow(origin_name(origin))
         return rows[origin]
 
     def known_origin(name: str) -> str:
@@ -656,15 +660,20 @@ def build_limits(reading: records.QueueRead, snapshots: target_availability.Snap
         matching = mac_placements.get(key, ())
         if isinstance(claim.scope, claim_state.WholeMacScope):
             whole_mac = True
+            shared_mac_claims += 1
             for build, label in matching:
-                project = origins.resolve("", build.folder) or known_origin(build.repository)
-                row(project).mac.runs.append(label)
-                repositories_with_claims.add(project)
+                if project := origins.resolve("", build.folder):
+                    row(project).mac.runs.append(label)
+                    repositories_with_claims.add(project)
+                else:
+                    shared_mac_runs.append(label)
             continue
         project = origins.resolve(claim.scope.key, record["worktree"])
-        if not project and matching:
-            project = known_origin(claim.scope.name)
-        if not project and not matching:
+        if not project:
+            shared_mac_claims += 1
+            shared_mac_runs.extend(label for _, label in matching)
+            if not matching and not kept:
+                shared_mac_runs.append(claim_name(record, names))
             continue
         cell = row(project).mac
         cell.used = (cell.used or 0) + 1
@@ -785,7 +794,8 @@ def build_limits(reading: records.QueueRead, snapshots: target_availability.Snap
         except conf.Unusable:
             pass
     return BuildLimits(MachineLimits(target_state(local, zone), local_limits(reading, memory, folders), shared["natedev"]),
-                       MachineLimits(target_state(mac, zone), mac_shared, shared["mac"]),
+                       MachineLimits(target_state(mac, zone), mac_shared, shared["mac"], shared_mac_claims,
+                                     tuple(shared_mac_runs)),
                        MachineLimits(aws_state, (Metric("Cloud gates", cloud_used, cloud_limit), saved.aws_money),
                                      shared["aws"]),
                        ordered, isinstance(saved.history, charts.IndexUnavailable), unplaced, saved.history_stale)

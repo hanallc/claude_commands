@@ -1322,7 +1322,9 @@ function renderBuildLimits(limits) {
   const machines = [["natedev", limits.natedev], ["Mac", limits.mac], ["AWS", limits.aws]];
   const headings = machines.map(([name, data]) => `<th scope="col">${name}
     <span class="build-limit-state">${esc(data.state)}</span>
-    ${data.shared.map(metric => limitMetric(metric)).join("")}${limitWaits(data.waits)}</th>`).join("");
+    ${data.shared.map(metric => limitMetric(metric)).join("")}
+    ${data.claims ? `<div class="build-limit-note">${data.claims} ${data.claims === 1 ? "claim" : "claims"}</div>` : ""}
+    ${limitNames(data.runs ?? [])}${limitWaits(data.waits)}</th>`).join("");
   const rows = limits.repositories.map(row => {
     const cells = [row.natedev, row.mac, row.aws];
     const pending = limitWaits(row.unplaced);
