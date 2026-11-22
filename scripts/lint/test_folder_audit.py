@@ -16,7 +16,7 @@ import time
 import tempfile
 import unittest
 from collections.abc import Generator, Iterator
-from contextlib import AbstractContextManager, contextmanager, redirect_stderr, redirect_stdout
+from contextlib import AbstractContextManager, chdir, contextmanager, redirect_stderr, redirect_stdout
 from pathlib import Path
 from scripts.lib.transcript_test_support import compressed_copy
 from typing import cast, override
@@ -27,7 +27,6 @@ import unittest.mock
 from scripts.copies import copies
 from scripts.copies.copies_test_support import copies_environment
 from scripts.production.cli_fixture import ImmutableGitSeed
-from scripts.lib.socket_test_support import short_socket_directory
 from scripts.lint import tmp_sweep, folder_audit, sweep
 from scripts.lib import build_folders, cargo_output, conf, copy_record, scratch, session_folder
 from scripts.lib import removal_guard
@@ -77,13 +76,14 @@ class FolderAuditTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
-        configuration = Path(self.enterContext(tempfile.TemporaryDirectory(dir="/tmp")))
+        fixture = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        configuration = fixture / "policy"
         environment = config_environment(configuration)
-        _ = write_config_fixture(configuration / "build_folders.conf", "roots.system=/tmp\n"
+        _ = write_config_fixture(configuration / "build_folders.conf", f"roots.system={fixture}\n"
             + f"roots.build={configuration / 'build'}\nroots.build.natedev={configuration / 'build'}\n"
             + f"roots.workspace={configuration / 'worktrees'}\n")
         _ = cast(object, self.enterContext(unittest.mock.patch.dict(os.environ, environment)))
-        self.root = Path(self.enterContext(short_socket_directory())).resolve()
+        self.root = fixture / "audit"
         self.home = self.root / "home"
         self.rust = self.home / "rust"
         self.temp = self.root / "tmp"
@@ -752,7 +752,8 @@ class FolderAuditTests(unittest.TestCase):
         _ = scratch.hold(held, "gate:keep-clone", "test")
         server = socket.socket(socket.AF_UNIX)
         self.addCleanup(server.close)
-        server.bind(str(listening / "socket"))
+        with chdir(listening):
+            server.bind("socket")
         _ = (self.root / "unix").write_text(
             f"Num RefCount Protocol Flags Type St Inode Path\n0: 2 0 10000 1 1 7 {listening / 'socket'}\n")
         with (busy / scratch.BUSY).open("a") as lock:
@@ -1072,7 +1073,8 @@ class FolderAuditTests(unittest.TestCase):
         listening = folder(self.rust / "listening", 8)
         server = socket.socket(socket.AF_UNIX)
         self.addCleanup(server.close)
-        server.bind(str(listening / "s"))
+        with chdir(listening):
+            server.bind("s")
         stamp(listening / "s", time.time() - 8 * DAY)
         age(listening, 8)
         table = self.root / "unix"
