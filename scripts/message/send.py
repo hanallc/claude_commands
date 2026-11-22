@@ -8,7 +8,7 @@ every message follows are /message (~/.claude/commands/message.md).
           [--from NAME] [--summary TEXT] [--key KEY [--repeat-minutes N]]
           [--here | --machine HOST] [--timeout SECONDS]
           (--text TEXT | --file PATH | stdin)
-  send.py --to user --text-id ID --value KEY=VALUE ... [--through-silence]
+  send.py --to user --text-id ID --value KEY=VALUE ... [--through-silence] [--user-asked]
                           a registered push; --help lists the templates
   send.py ack KEY       later sends with KEY are skipped
   send.py reopen KEY    forget KEY: acknowledgement and repeat window
@@ -57,6 +57,7 @@ message kept for later delivery holds the window, so a retry cannot deliver a
 queued copy twice. While the user's silence is on, a
 kept push with the same key from the same sender replaces the older kept one.
 `--through-silence` sends a user push during silence. Review and priority stay the same.
+`--user-asked` sends a requested `nate.adhoc` push as written. Silence rules still apply.
 A normal push does not repeat or need acknowledgement.
 
 One event sends one emergency push. An emergency push (`--to user --need blocked`)
@@ -304,12 +305,26 @@ def is_acknowledged_skip(reason: str) -> bool:
     """Distinguish an acknowledged skip from a repeat-window skip."""
     return _ACKNOWLEDGED_AT in reason
 
+
 LogEntry = TypedDict("LogEntry", {"time": str, "machine": str, "from": str, "to": str, "key": str | None,
                                   "summary": str, "text": str, "outcome": Outcome, "detail": str,
                                   "via": NotRequired[Literal["postmaster", "relay", "queue"]],
                                   "postmaster": NotRequired[postmaster.PostmasterStatus],
                                   "seconds": NotRequired[float], "human": NotRequired[bool], "receiver": NotRequired[str],
                                   "sender_native_id": NotRequired[str]})
+
+
+class RelayTextDifference(TypedDict):
+    first_difference: int
+    approved_window: str
+    sent_window: str | None
+
+
+class RelayMismatch(TypedDict):
+    time: str
+    to: str | None
+    to_truncated: bool
+    text_difference: NotRequired[RelayTextDifference]
 
 
 class SocketRecoveryAttempt(TypedDict):
@@ -1065,6 +1080,7 @@ class Options(NamedTuple):
     review_delivery: bool = False
     urgent: bool = False
     skip_closed: bool = False
+    user_asked: bool = False
 
     @property
     def to(self) -> str:
@@ -1642,7 +1658,7 @@ def clear_check(timeout: float | ConfiguredCheckTimeout = ConfiguredCheckTimeout
         return code, lines
 
 
-def append_record(path: Path, entry: LogEntry | SocketRecoveryAttempt, *, durable: bool = False) -> None:
+def append_record(path: Path, entry: LogEntry | SocketRecoveryAttempt | RelayMismatch, *, durable: bool = False) -> None:
     """Append under the state lock; recovery records must survive a stopped drain."""
     with locked():
         repeat_guard.append_jsonl(path, entry, durable=durable)
@@ -3492,20 +3508,42 @@ class RelayRecipientWrite:
         default_factory=RelayRequestNotForwarded)
 
 
+def _log_relay_mismatch(target: object, sent: object, approved: str) -> None:
+    target_limit = 256
+    record = RelayMismatch(time=now().isoformat(), to=target[:target_limit] if isinstance(target, str) else None,
+                           to_truncated=len(as_str(target)) > target_limit)
+    if sent != approved:
+        sent_text = as_str(sent)
+        first = next((index for index, (before, after) in enumerate(zip(approved, sent_text)) if before != after),
+                     min(len(approved), len(sent_text)))
+        window = slice(max(0, first - 32), first + 32)
+        record["text_difference"] = RelayTextDifference(first_difference=first, approved_window=approved[window],
+                                                        sent_window=sent_text[window] if isinstance(sent, str) else None)
+    try:
+        append_record(STATE / "relay_mismatches.jsonl", record)
+    except OSError as error:
+        print(f"message relay mismatch log: {error}", file=sys.stderr)
+
+
 def read_relay(observed: RelayTransportResponse, text: str, *,
                review_delivery: bool = False) -> CheckedRelayAcceptance | Result:
     """Check the approved call, its result, and the proxy forward together."""
+    events = [as_dict(loads(line)) for line in observed.stdout.splitlines()]
+    sends = [part for event in events if event.get("type") == "assistant"
+             for value in as_list(as_dict(event.get("message")).get("content"))
+             if (part := as_dict(value)).get("type") == "tool_use" and part.get("name") == "SendMessage"]
+    for call in sends:
+        inputs = as_dict(call.get("input"))
+        target, sent = inputs.get("to"), inputs.get("message")
+        if target != observed.target or sent != text:
+            _log_relay_mismatch(target, sent, text)
     forward = observed.forward
     if isinstance(forward, RefusedRelayRequest):
         return forward
     if isinstance(forward, RelayRequestInterrupted):
         return _unaccepted_relay(forward, forward.reason)
-    events = [as_dict(loads(line)) for line in observed.stdout.splitlines()]
     mode = next((as_str(event.get("permissionMode")) for event in events
                  if event.get("type") == "system" and event.get("subtype") == "init"), "unknown")
-    sends = [part for event in events if event.get("type") == "assistant"
-             for value in as_list(as_dict(event.get("message")).get("content"))
-             if (part := as_dict(value)).get("type") == "tool_use" and part.get("name") == "SendMessage"]
     if not sends:
         said = next((as_str(event.get("result")) for event in reversed(events) if event.get("type") == "result"), "")
         return _unaccepted_relay(forward, f"the relay made no SendMessage call: {one_line(said) or 'no output'}",
@@ -4337,7 +4375,10 @@ def reviewed_failure(stdout: str, original: FailedPush, *,
     return original
 
 
-def user(message: Message, need: Need, action: UserAction, timeout: float, *, answerable: bool = False, text_id: str = "", values: tuple[str, ...] = (), due: str = "", reference: push_reference.PushReference = push_reference.NO_REFERENCE, remote_forward: bool = False, silence_policy: silence.SilencePolicy = silence.SilencePolicy.KEEP_DURING_SILENCE) -> Result:
+def user(message: Message, need: Need, action: UserAction, timeout: float, *, answerable: bool = False,
+         text_id: str = "", values: tuple[str, ...] = (), due: str = "",
+         reference: push_reference.PushReference = push_reference.NO_REFERENCE, remote_forward: bool = False,
+         silence_policy: silence.SilencePolicy = silence.SilencePolicy.KEEP_DURING_SILENCE, user_asked: bool = False) -> Result:
     """Reach the user. The channel is this function's business alone."""
     key = ["--key", message.key] if message.key else []
     selected_priority = decision_priority.priority(need, due)
@@ -4350,6 +4391,8 @@ def user(message: Message, need: Need, action: UserAction, timeout: float, *, an
             command.extend(["--value", value])
     if silence_policy == silence.SilencePolicy.SEND_THROUGH_SILENCE:
         command[2:2] = ["--through-silence"]
+    if user_asked:
+        command[2:2] = ["--user-asked"]
     if due:
         command[2:2] = ["--due", due]
     if reference["kind"] != "none":
@@ -4492,6 +4535,8 @@ def remote(message: Message, host: str, options: Options) -> Result:
         forwarded += ["--need", options.need]
         if options.silence_policy == silence.SilencePolicy.SEND_THROUGH_SILENCE:
             forwarded += ["--through-silence"]
+        if options.user_asked:
+            forwarded += ["--user-asked"]
         if options.reference["kind"] != "none":
             forwarded += ["--push-reference", json.dumps(options.reference)]
         if options.due:
@@ -4683,7 +4728,7 @@ def refusal_report(options: Options) -> rca.Report:
 
 def wrong_template(options: Options, shown: str) -> str | None:
     """The hold detail when a user push tells in free text what a registered template carries, else None."""
-    if options.to != USER:
+    if options.to != USER or options.user_asked:
         return None
     registered_text = bool(options.text_id) and not push_texts.agent_written(options.text_id)
     if options.text_id != AUTO_MODE_TEXT and options.text_id not in RCA_TEXTS and reports_auto_mode_refusal(shown):
@@ -4735,6 +4780,7 @@ def parse(argv: list[str]) -> Options:
     _ = parser.add_argument("--value", action="append", default=[], help="registry template key=value")
     _ = parser.add_argument("--answerable", action="store_true", help=argparse.SUPPRESS)
     _ = parser.add_argument("--through-silence", action="store_true", help="to `user`: send during silence with the same review and priority")
+    _ = parser.add_argument("--user-asked", action="store_true", help="Send a requested nate.adhoc push as written.")
     _ = parser.add_argument("--from", dest="sender", help="the sender name the recipient sees")
     _ = parser.add_argument("--human", action="store_true", help="the message was written by a person, including a verbatim human relay")
     _ = parser.add_argument("--no-accounting", action="store_true", help=argparse.SUPPRESS)
@@ -4852,6 +4898,8 @@ def parse(argv: list[str]) -> Options:
     if to != USER:
         if attr(args, "through_silence") is True:
             parser.error("--through-silence must go with --to user")
+        if attr(args, "user_asked") is True:
+            parser.error("--user-asked must go with --to user")
         if attr(args, "answerable") is True:
             parser.error("--answerable goes with --to user")
         if action_text is not None or no_action:
@@ -4905,7 +4953,7 @@ def parse(argv: list[str]) -> Options:
                                       else silence.SilencePolicy.KEEP_DURING_SILENCE),
                       recipient_identity=LogicalRecipientIdentity(recipient_key) if recipient_key else TransportRecipientIdentity(),
                       review_delivery=get["review_delivery"] is True, urgent=get["urgent"] is True,
-                      skip_closed=get["skip_closed"] is True)
+                      skip_closed=get["skip_closed"] is True, user_asked=get["user_asked"] is True)
     if options.skip_closed and (not to.startswith("codex:") or not isinstance(selection, RosterLookup)):
         parser.error("--skip-closed needs a codex: thread address")
     if options.to == USER and options.summary is None:
@@ -5474,7 +5522,10 @@ def _send_with_review(options: Options, membership: staff.StaffSnapshot, review_
         elif isinstance(route, UserDelivery):
             if isinstance(options.action, NoUserRecipient):
                 raise AssertionError("a user message must state its action")
-            result = user(message, options.need, options.action, options.timeout, answerable=options.answerable, text_id=options.text_id, values=options.values, due=options.due, reference=options.reference, remote_forward=isinstance(options.sender_origin, ForwardedSender), silence_policy=options.silence_policy)
+            result = user(message, options.need, options.action, options.timeout, answerable=options.answerable,
+                          text_id=options.text_id, values=options.values, due=options.due, reference=options.reference,
+                          remote_forward=isinstance(options.sender_origin, ForwardedSender),
+                          silence_policy=options.silence_policy, user_asked=options.user_asked)
             if options.text_id == AUTO_MODE_TEXT and result.outcome in ("sent", "kept"):
                 _ = rca.open_case(refusal_report(options), defer_owner=True)
         elif isinstance(route, (CodexSessionRecipient, CodexPaneRecipient)):

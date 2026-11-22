@@ -262,7 +262,16 @@ It reads the retained finding's kind to select the duplicate kind.
 ### Bootstrap: `add_style.py` and the production format
 
 - `add_style.py --production <showrunner name> --model <m> --effort <e> [--pilot <unit>[=<crate>,...]]... [--check]`, run by the repo's main showrunner (`commands/showrunner/add_style.md`).
-- `_request` derives everything from the parent doc: main checkout through `--git-common-dir` on `**Repository:**`; showrunner name `<repo>-style`; branch point = parent merge branch; style merge branch `style/<branch point with / as ->`; checkout `<repo parent>/<repo>-style`; doc `docs/<repo>-style-production.md`. A missing `**Proposals:**` refuses.
+- `_request` reads the repository, branch point, and Proposals field from the parent document.
+  It finds the main checkout with `--git-common-dir`.
+  A new style production uses `~/worktrees/<repo>/<repo>-style/worktree` and branch `<repo>-style-worktree`.
+  Its document is `docs/<repo>-style-production.md` in that checkout.
+  An existing style production keeps the branch in its document.
+  A retry can finish a checkout that still uses the old `production` short name.
+  A retry refuses a different branch point before it changes the checkout.
+  Before it creates a checkout, bootstrap saves the branch point in the Git branch description.
+  For an older checkout without a document, bootstrap reads the branch point from the `style/` branch name.
+  A missing Proposals field causes a refusal.
 - `standing_style_production(repo_dir)` returns `StandingStyleProduction` or `NoStyleProduction`.
   The record holds `checkout`, `doc`, `name` and `branch_point`.
   It finds style showrunner documents and parent documents with configured direct units.
@@ -726,6 +735,7 @@ It skips both the ledger command and the acknowledgment.
 Use `/showrunner:units` for each unit's ticket, step, ETA, and finding counts.
 
 - `coverage_report.py --repo R [--rule <id or unique stem> | --crate <dir or package>]` (`/showrunner:style_report [rule|crate]` runs it for each style production at or below the caller). Header from `summary_of(repo rows)`: `<showrunner name> — synced <branch point> <tip> at HH:MM <zone>, <n> files (+<d> since yesterday)`; `Rules done: <d> of <t> (<n> by lint) · cells current <p>% · open · stale · awaiting merge · held`; the unclassified line; `Waiting to merge back: ...`; table `| Rule | Tier | Current | Stale | Open | Awaiting merge | Held | Done |` (classified tier A-D only; `#uncovered` folded in; stem, or full id when two rules share a stem); `Since last report: ...`. `rule_counts(WholeRepository())` runs once, plus `rule_counts(CrateCoverage(crate))` under `--crate`. `--rule` adds open tickets; `--crate` adds the oldest open ticket.
+  Without a staff registration, the report skips both style branch names when it finds the branch point.
 - Snapshot `ReportSnapshot(rules, proposals, files_by_day)` is written atomically to `ledger.database.parent / "last_report.json"`; `previous_report -> FirstReport | PreviousReport`.
 
 ### Style decisions (proposals)
