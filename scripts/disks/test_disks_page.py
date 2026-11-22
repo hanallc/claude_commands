@@ -1,22 +1,30 @@
 from __future__ import annotations
 
 import html
+import io
 import json
 import math
 import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
+import threading
 import unittest
+from contextlib import redirect_stderr
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import cast
+from xml.etree import ElementTree
+from typing import cast, override
 from unittest import mock
 
 from scripts.build_queue import memory_files
 from scripts.build_queue.test_memory_hover import RAM_FIXTURE, SWAP_FIXTURE
 from scripts.review_links.test_page_frame import assert_status_states
-from scripts.disks import disks_page
+from scripts.disks import disks_page, slots
+from scripts.production import staff
+from scripts.review_links import staff_names
 from scripts.lib import file_lock, test_hang_guard
 from scripts.review_links import page_frame, test_page_frame
 
@@ -41,14 +49,14 @@ TREE = folder("/build", 100 * GIB, [
 
 
 NOW = 1000 * 86400
-SLOTS: dict[str, object] = {"root": "/build/slot", "groups": [
-    {"repository": "hana", "maximum": 8, "slots": [
-        {"name": "hana-slot1", "number": 1, "size": 70 * GIB, "last_used": NOW, "deleted_tonight": False,
+SLOTS: slots.SlotReport = {"root": "/build", "machine": "natedev", "unused_days": 2, "groups": [
+    {"repository": "hana/report", "maximum": None, "slots": [
+        {"name": "1", "key": "hana/report/1", "number": 1, "size": 70 * GIB, "last_used": NOW, "needs_review": False,
          "used_by": {"name": "report integrate", "showrunner": "builds"}},
-        {"name": "hana-slot2", "number": 2, "size": 0, "last_used": NOW - 9 * 86400, "used_by": None,
-         "deleted_tonight": True}]},
-    {"repository": "<b>", "maximum": None, "slots": [
-        {"name": "x-slot1", "number": 1, "size": None, "last_used": None, "used_by": None, "deleted_tonight": False}]}]}
+        {"name": "2", "key": "hana/report/2", "number": 2, "size": 0, "last_used": NOW - 9 * 86400, "used_by": None,
+         "needs_review": True}]},
+    {"repository": "<b>/other", "maximum": None, "slots": [
+        {"name": "1", "key": "<b>/other/1", "number": 1, "size": None, "last_used": None, "used_by": None, "needs_review": False}]}]}
 
 
 def session(name: str, size: int | None, state: str, held: list[dict[str, object]] | None = None) -> dict[str, object]:
@@ -58,14 +66,108 @@ def session(name: str, size: int | None, state: str, held: list[dict[str, object
 SESSIONS: dict[str, object] = {"root": "/session", "sessions": [
     session("fps", 28 * GIB, "running", [{"name": "run", "task": "phase:fps/3", "ended": False},
                                          {"name": "center-shot", "task": "phase:fps/3", "ended": True}]),
-    session("lfo", 7 * GIB, "ended"), session("demo", GIB, "running"), session("<b>", 0, "unknown"), session("sdlc", None, "running")]}
+    session("lfo", 7 * GIB, "ended"),
+    session("demo", GIB, "running", [{"name": "<scratch>", "task": "phase:demo/1", "ended": False}]),
+    session("<b>", 0, "unknown"), session("sdlc", None, "running")]}
 
 
 class DisksPageTests(unittest.TestCase):
+    @override
+    def setUp(self) -> None:
+        configuration = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        _ = (configuration / "disks.conf").write_text("# whole: 1..\ncache_seconds=600\n")
+        # The page reads staff names, and staff reads the machine list.
+        _ = shutil.copy(Path(__file__).parents[2] / "config" / "machines.conf", configuration)
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"CONF_DIR": str(configuration)})))
+
+    def test_current_builds_keep_staff_parts_in_slot_names(self) -> None:
+        member = staff.StaffRow(staff.StaffId("builder"), "unit", "builder", staff.StaffRoot(),
+                                current_session=staff.StaffId("builder"))
+        setup = "globalThis.window=globalThis;" + staff_names.script(
+            staff_names.StaffNames(staff.StaffSnapshot((member,))).registry())[8:-9]
+        for waiting in (False, True):
+            with self.subTest(waiting=waiting):
+                row = {"key": "current", "name": "builder check", "slot_folder": "hana/report/1",
+                    "slot_machine": "natedev", "name_parts": [{"kind": "staff", "text": "builder"},
+                                                               {"kind": "text", "text": " check"}]}
+                result = str(self.run_drive(setup + """
+                    Date.now = () => input.now * 1000;
+                    slotReport = input.slots;
+                    builds = input.builds;
+                    result = slotsHtml(slotReport, KEEP, input.now, new Set(['hana/report']), slotStep);
+                """, extra={"slots": SLOTS, "now": NOW,
+                            "builds": {"read_at": NOW, "walk": [] if waiting else [row],
+                                       "waiters": [row] if waiting else []}}))
+                self.assertEqual(re.findall(r'<span class="staff-name"[^>]*>([^<]*)</span>', result),
+                                 ["builder", "builder"])
+                self.assertEqual(result.count('</span> check</span>'), 2)
+
+    def test_slot_work_parts_color_only_the_recorded_staff_reference(self) -> None:
+        members = staff.StaffSnapshot(tuple(staff.StaffRow(staff.StaffId(name), "unit", name,
+            staff.StaffRoot(), current_session=staff.StaffId(name)) for name in ("builder", "helper")))
+        setup = "globalThis.window=globalThis;" + staff_names.script(staff_names.StaffNames(members).registry())[8:-9]
+        report = {"root": "/build", "groups": [{"repository": "repo/unit", "maximum": None, "slots": [
+            {"name": "1", "key": "repo/unit/1", "number": 1, "size": 0, "last_used": NOW, "needs_review": False,
+             "used_by": {"name": "builder helper", "showrunner": "", "name_parts": [
+                 {"kind": "staff", "text": "builder"}, {"kind": "text", "text": " helper"}]}}]}]}
+        body = str(self.run_page("(()=>{" + setup + "return slotsHtml(" + json.dumps(report)
+            + ",0," + str(NOW) + ",new Set(['repo/unit']),()=>null);})()"))
+        self.assertEqual(re.findall(r'<span class="staff-name"[^>]*>([^<]*)</span>', body), ["builder", "builder"])
+        plain = str(self.run_page("(()=>{const report=" + json.dumps(report)
+            + ";delete report.groups[0].slots[0].used_by.name_parts;return slotsHtml(report,0,"
+            + str(NOW) + ",new Set(['repo/unit']),()=>null);})()"))
+        self.assertEqual(re.sub(r'<[^>]+>', '', body), re.sub(r'<[^>]+>', '', plain))
+        current = str(self.run_page("(()=>{" + setup + "return slotsHtml(" + json.dumps(report)
+            + ",0," + str(NOW) + ",new Set(['repo/unit']),()=>({name:'Current work'}));})()"))
+        self.assertEqual(current.count('>Current work</span>'), 2)
+        self.assertNotIn('class="staff-name"', current)
+
+    def test_slot_staff_names_have_role_colors_and_task_names_stay_plain(self) -> None:
+        runner = staff.StaffRow(staff.StaffId("builds"), "showrunner", "builds", staff.StaffRoot(), current_session=staff.StaffId("builds"))
+        names = staff_names.StaffNames(staff.StaffSnapshot((runner,)))
+        setup = "globalThis.window=globalThis;" + staff_names.script(names.registry())[8:-9]
+        body = str(self.run_page("(()=>{" + setup + "return slotsHtml(" + json.dumps(SLOTS)
+                                + ", 0, " + str(NOW) + ", new Set(['hana/report']), ()=>null);})()"))
+        self.assertRegex(body, r'data-color-text="role.showrunner"[^>]*>builds</span>')
+        self.assertIn('>report integrate</span>', body)
+        self.assertNotRegex(body, r'class="staff-name"[^>]*>report integrate</span>')
+
+    def test_tooltip_keeps_task_and_repository_text_plain_when_it_matches_staff(self) -> None:
+        runner = staff.StaffRow(staff.StaffId("builds"), "showrunner", "builds", staff.StaffRoot(),
+                                current_session=staff.StaffId("builds"))
+        names = staff_names.StaffNames(staff.StaffSnapshot((runner,)))
+        page = self.page_html()
+        functions = page[page.index("function slotTip("):page.index("function smallerTip(")]
+        setup = "globalThis.window=globalThis;" + staff_names.script(names.registry())[8:-9] + functions
+        body = str(self.run_page("(()=>{" + setup + "return stepTip.tipRowsHtml(slotTip("
+            + "{name:'builds',size:0,last_used:0,used_by:{name:'builds',showrunner:'builds'}},"
+            + "{repository:'builds'},0,100,30));})()"))
+        grid = ElementTree.fromstring(body)
+        self.assertEqual(grid[0].text, "builds")
+        self.assertEqual(list(grid[0]), [])
+        for label in ("Repository", "Used by"):
+            value = next(grid[index + 1] for index, cell in enumerate(grid) if cell.text == label)
+            self.assertEqual(value.text, "builds")
+            self.assertEqual(list(value), [])
+        value = next(grid[index + 1] for index, cell in enumerate(grid) if cell.text == "Showrunner")
+        self.assertEqual(value.findtext("span"), "builds")
+        session_body = str(self.run_page("(()=>{" + setup
+            + "return stepTip.tipRowsHtml(sessionTip({name:'builds',state:'running',size:0,"
+            + "held:[{name:'builds',task:'builds'}]},0));})()"))
+        session_grid = ElementTree.fromstring(session_body)
+        self.assertEqual(session_grid[0].findtext("span"), "builds")
+        folder = next(cell for cell in session_grid if cell.tag == "dt" and cell.text == "builds")
+        self.assertEqual(list(folder), [])
+
     def test_publish_writes_the_frame_style_and_settings_into_the_page(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             page = disks_page.publish(Path(directory) / "page", SETTINGS).read_text()
         self.assertIn(page_frame.STYLE, page)
+        button = re.search(r'<button type="button" id="measure-now"[^>]*>.*?</button>', page, re.DOTALL)
+        assert button is not None
+        self.assertIn('aria-label="Measure now" title="Measure now"', button[0])
+        self.assertIn(page_frame.icon_svg("refresh-cw"), button[0])
+        self.assertIn('<span class="page-status-state">' + button[0], page)
         self.assertIn('</h1><p class="page-status"', page)
         self.assertIn('data-status-age hidden></span><span data-status-trip hidden></span>', page)
         self.assertIn('data-status-render hidden></span><span data-status-reason hidden></span>', page)
@@ -139,17 +241,17 @@ class DisksPageTests(unittest.TestCase):
         self.assertIn(page_frame.REFRESH_SCRIPT, page)
         self.assertIn("createPageRefresh(loadDisks,()=>settings.poll_seconds)", page)
         self.assertIn('readAt:data.measured_at,renderSeconds:data.render_seconds', page)
-        self.assertIn('throw new Error("The measure did not finish.")', page)
+        self.assertIn('setMeasuring(null,"The measure did not finish.")', page)
         scenario = r"""
 const failures=[],check=(ok,label)=>{if(!ok) failures.push(label);};
-let fileAt=now/1000-4200,measureState='current',stalled=false,failedReads=false;
+let generation=0,fileAt=now/1000-4200,measureState='current',stalled=false,failedReads=false;
 const pendingReads=[];
 const release=()=>pendingReads.splice(0).forEach(resolve=>resolve({ok:true,json:async()=>payload()}));
 function render(){}
 function renderCards(){}
-const payload=()=>({measured_at:fileAt,render_seconds:.03,drives:[]});
+const payload=()=>({generation,measured_at:fileAt,render_seconds:.03,drives:[]});
 const fetch=async(url)=>{
- if(url==='measure') return {ok:true,json:async()=>({state:measureState})};
+ if(url==='measure') return {ok:true,json:async()=>({state:measureState,target:generation+(measureState==='current' ? 0 : 1)})};
  if(failedReads) return {ok:false,status:502};
  if(stalled) return new Promise(resolve=>pendingReads.push(resolve));
  return {ok:true,json:async()=>payload()};
@@ -166,12 +268,12 @@ START
  now+=180000;await pageRefresh.refresh();
  check(line.dataset.state==='Paused' && parts.reason.textContent==='Measuring…',
   'Measuring must remain visible during a three-minute measure.');
- fileAt=now/1000;measureState='current';await pageRefresh.refresh();pageRefresh.changed();
+ generation++;fileAt=now/1000;measureState='current';await pageRefresh.refresh();pageRefresh.changed();
  await Promise.resolve();await Promise.resolve();
  check(line.dataset.state==='Live' && parts.age.textContent==='0 s ago',
   'A completed measure must return to Live with its new age.');
  measureState='started';await pageRefresh.refresh();
- now+=(settings.wait_seconds+1)*1000;await pageRefresh.refresh();pageRefresh.changed();
+ advanceTime((settings.wait_seconds+1)*1000);pageRefresh.changed();
  await Promise.resolve();await Promise.resolve();
  check(line.dataset.state==='Failed' && parts.reason.textContent==='The measure did not finish.',
   'A measure timeout must keep its failure after the age clock runs.');
@@ -183,7 +285,7 @@ START
  check(line.dataset.state==='Failed' && parts.reason.textContent==='HTTP 502',
   'A failed read during a measure must show Failed and HTTP 502.');
  check(measuring!==null,'A failed read before the wait limit must retain the measure start.');
- now+=(settings.wait_seconds+1)*1000;await pageRefresh.refresh();pageRefresh.changed();
+ advanceTime((settings.wait_seconds+1)*1000);await pageRefresh.refresh();pageRefresh.changed();
  await Promise.resolve();await Promise.resolve();
  check(measuring===null,'Failed reads after the wait limit must clear measuring.');
  check(line.dataset.state==='Failed' && parts.reason.textContent==='HTTP 502',
@@ -220,7 +322,7 @@ let stalled=false;
 function render(){}
 function renderCards(){}
 const fetch=async(url)=>{
- if(url==='measure') return {ok:true,json:async()=>({state:'started'})};
+ if(url==='measure') return {ok:true,json:async()=>({state:'started',target:1})};
  if(stalled) return new Promise(resolve=>pendingReads.push(resolve));
  return {ok:true,json:async()=>({measured_at:fileAt,render_seconds:.03,drives:[]})};
 };
@@ -244,6 +346,244 @@ START
 })().catch(error=>{console.error(error);process.exitCode=1;});
 """)
 
+    def test_the_refresh_button_forces_a_measure_and_recovers_after_completion_timeout_or_failure(self) -> None:
+        self.assert_status_scenario(r"""
+const failures=[],check=(ok,label)=>{if(!ok) failures.push(label);};
+let generation=0,fileAt=now/1000,failed=false;
+const posts=[];
+function render(){}
+function renderCards(){}
+const fetch=async(url,options)=>{
+ if(url==='measure'){
+  posts.push(options.body);
+  if(options.body==='force=1' && failed) return {ok:false,status:503,json:async()=>({reason:'Launch failed.'})};
+  return {ok:true,json:async()=>({state:options.body==='force=1' ? 'started' : 'current',target:generation+(options.body==='force=1' ? 1 : 0)})};
+ }
+ return {ok:true,json:async()=>({generation,measured_at:fileAt,render_seconds:.03,drives:[]})};
+};
+START
+(async()=>{
+ await pageRefresh.refresh();
+ check(!measureButton.disabled && line.dataset.state==='Live','Current data enables the button.');
+ const press=measureButton.press();
+ check(measureButton.disabled,'A press disables the button before the request ends.');
+ await press;
+ check(posts.filter(body=>body==='force=1').length===1,'A press sends force=1 with current data.');
+ check(line.dataset.state==='Paused' && parts.reason.textContent==='Measuring…','A press shows Measuring.');
+ await measureButton.press();
+ check(posts.filter(body=>body==='force=1').length===1,'A disabled button sends no second request.');
+ now+=1000;generation++;fileAt=now/1000;await pageRefresh.refresh();
+ check(!measureButton.disabled && line.dataset.state==='Live','New data enables the button.');
+ failed=true;await measureButton.press();
+ check(!measureButton.disabled && line.dataset.state==='Failed' && parts.reason.textContent==='Launch failed.',
+  'A failed press shows its reason and enables the button.');
+ failed=false;await measureButton.press();
+ advanceTime((settings.wait_seconds+1)*1000);
+ check(!measureButton.disabled && line.dataset.state==='Failed' && parts.reason.textContent==='The measure did not finish.',
+  'The wait limit enables the button and shows the failure.');
+ if(failures.length) throw new Error(failures.join('\n'));
+ console.log('PASS');
+})().catch(error=>{console.error(error);process.exitCode=1;});
+""")
+
+    def test_a_press_owns_its_request_and_its_deadline_despite_stalled_or_older_reads(self) -> None:
+        self.assert_status_scenario(r"""
+const failures=[],check=(ok,label)=>{if(!ok) failures.push(label);};
+let generation=0,fileAt=now/1000,stallBuilds=false,stallData=false,missing=false,stallPost=false;
+const pendingBuilds=[],pendingData=[],pendingPosts=[],posts=[];
+const flush=async()=>{for(let i=0;i<20;i++) await Promise.resolve();};
+const payload=()=>({generation,measured_at:fileAt,render_seconds:.03,drives:[]});
+const dataReply=()=>({ok:true,json:async()=>payload()});
+const postReply=()=>({ok:true,json:async()=>({state:'started',target:generation+1})});
+function render(){}
+function renderCards(){}
+const fetch=async(url,options)=>{
+ if(url==='measure'){
+  posts.push(options.body);
+  if(options.body==='force=1'){
+   check(measuring!==null && measureButton.disabled && line.dataset.state==='Paused'
+    && parts.reason.textContent==='Measuring…','The press must set its state before the POST.');
+   if(stallPost) return new Promise(resolve=>pendingPosts.push(resolve));
+   return postReply();
+  }
+  return {ok:true,json:async()=>({state:'current',target:generation})};
+ }
+ if(url.startsWith(settings.builds_data)){
+  if(stallBuilds) return new Promise(resolve=>pendingBuilds.push(resolve));
+  return dataReply();
+ }
+ if(missing) return {ok:false,status:404};
+ if(stallData) return new Promise(resolve=>pendingData.push(resolve));
+ return dataReply();
+};
+const forced=()=>posts.filter(body=>body==='force=1').length;
+START
+(async()=>{
+ await pageRefresh.refresh();
+ stallBuilds=true;const older=pageRefresh.refresh();
+ check(pendingBuilds.length===1,'The older refresh must wait for Builds.');
+ stallPost=true;const press=measureButton.press();
+ check(forced()===1 && pendingPosts.length===1,'The press must POST before the Builds read ends.');
+ check(measuring.since===now/1000 && measuring.target===null,'The press must record its start before the target arrives.');
+ pendingBuilds.shift()(dataReply());await older;
+ check(measureButton.disabled && measuring!==null,'The older refresh must not enable the button.');
+ await measureButton.press();
+ check(forced()===1,'A second press must not send another POST.');
+ stallBuilds=false;stallPost=false;pendingPosts.shift()(postReply());await press;
+ now+=1000;generation++;fileAt=now/1000;await pageRefresh.refresh();
+ check(!measureButton.disabled && measuring===null,'New data must end the measure state.');
+
+ missing=true;await pageRefresh.refresh();
+ check(line.dataset.state==='Failed' && parts.reason.textContent==='HTTP 404','The data read must fail after earlier data.');
+ const after404=measureButton.press();
+ check(forced()===2 && line.dataset.state==='Paused','A missing data file must not stop the forced POST.');
+ await after404;
+ missing=false;now+=1000;generation++;fileAt=now/1000;await pageRefresh.refresh();
+ check(!measureButton.disabled,'New data must recover from the missing file.');
+
+ stallData=true;const timedPress=measureButton.press();await flush();
+ check(forced()===3 && pendingData.length===1,'The next read must remain pending after the forced POST.');
+ advanceTime(settings.wait_seconds*1000);
+ check(measuring===null && !measureButton.disabled,'The timer must end the measure state at the wait limit.');
+ check(line.dataset.state==='Failed' && parts.reason.textContent==='The measure did not finish.',
+  'The timer must show the failure before the stalled read ends.');
+ stallData=false;pendingData.shift()(dataReply());await timedPress;
+ check(!measureButton.disabled && line.dataset.state==='Failed','The abandoned read must not replace the timeout failure.');
+ if(failures.length) throw new Error(failures.join('\n'));
+ console.log('PASS');
+})().catch(error=>{console.error(error);process.exitCode=1;});
+""")
+
+    def test_polls_keep_a_pending_press_and_only_newer_data_ends_an_answered_press(self) -> None:
+        self.assert_status_scenario(r"""
+const failures=[],check=(ok,label)=>{if(!ok) failures.push(label);};
+let generation=0,fileAt=now/1000;
+const pendingPosts=[],posts=[];
+function render(){}
+function renderCards(){}
+const fetch=async(url,options)=>{
+ if(url==='measure'){
+  posts.push(options.body);
+  if(options.body==='force=1') return new Promise(resolve=>pendingPosts.push(resolve));
+  return {ok:true,json:async()=>({state:'current',target:generation})};
+ }
+ return {ok:true,json:async()=>({generation,measured_at:fileAt,render_seconds:.03,drives:[]})};
+};
+START
+(async()=>{
+ await pageRefresh.refresh();
+ const failedPress=measureButton.press(),pending=measuring;
+ fileAt+=1;await pageRefresh.refresh();
+ check(data.measured_at===fileAt,'A poll may show data during a pending POST.');
+ check(measuring===pending && measureButton.disabled,'A poll must retain the pending press and disabled button.');
+ check(line.dataset.state==='Paused' && parts.reason.textContent==='Measuring…',
+  'A poll must retain Measuring during the pending POST.');
+ await measureButton.press();
+ check(posts.filter(body=>body==='force=1').length===1,'A poll must not permit another press.');
+ pendingPosts.shift()({ok:false,status:503,json:async()=>({reason:'Forced launch failed.'})});
+ await failedPress;
+ check(measuring===null && !measureButton.disabled,'A failed POST must clear the press after a poll.');
+ check(line.dataset.state==='Failed' && parts.reason.textContent==='Forced launch failed.',
+  'The failed POST must show its reason after a poll.');
+
+ const answeredPress=measureButton.press(),before=fileAt;
+ fileAt=before-1;
+ pendingPosts.shift()({ok:true,json:async()=>({state:'started',target:1})});
+ await answeredPress;
+ check(measuring!==null && measureButton.disabled && line.dataset.state==='Paused',
+  'Older data must not end an answered press.');
+ fileAt=before;await pageRefresh.refresh();
+ check(measuring!==null && measureButton.disabled && parts.reason.textContent==='Measuring…',
+  'Data at the prior measure time must not end an answered press.');
+ generation=1;fileAt=before+1;await pageRefresh.refresh();
+ check(measuring===null && !measureButton.disabled && line.dataset.state==='Live',
+  'Newer data must end an answered press.');
+
+ generation=1;fileAt=100;await pageRefresh.refresh();
+ const polledPress=measureButton.press();
+ generation=2;fileAt=150;await pageRefresh.refresh();
+ pendingPosts.shift()({ok:true,json:async()=>({state:'started',target:3})});
+ await polledPress;
+ await pageRefresh.refresh();
+ check(measuring!==null && measureButton.disabled && line.dataset.state==='Paused'
+  && parts.reason.textContent==='Measuring…',
+  'Data below the target must not end the press after the reply.');
+ generation=3;fileAt=200;await pageRefresh.refresh();
+ check(measuring===null && !measureButton.disabled && line.dataset.state==='Live',
+  'Data at the target generation must end the press.');
+ if(failures.length) throw new Error(failures.join('\n'));
+ console.log('PASS');
+})().catch(error=>{console.error(error);process.exitCode=1;});
+""")
+
+    def test_the_target_ends_a_press_at_the_reply_or_data_arrival_without_waiting_for_builds(self) -> None:
+        self.assert_status_scenario(r"""
+const failures=[],check=(ok,label)=>{if(!ok) failures.push(label);};
+let generation=0,stallBuilds=false,omitGeneration=true;
+const pendingPosts=[],pendingBuilds=[];
+const flush=async()=>{for(let i=0;i<20;i++) await Promise.resolve();};
+const payload=()=>({...(omitGeneration ? {} : {generation}),measured_at:100-generation,render_seconds:.03,drives:[]});
+const reply=()=>({ok:true,json:async()=>payload()});
+function render(){}
+function renderCards(){}
+const fetch=async(url,options)=>{
+ if(url==='measure'){
+  if(options.body==='force=1') return new Promise(resolve=>pendingPosts.push(resolve));
+  return {ok:true,json:async()=>({state:'current',target:generation})};
+ }
+ if(url.startsWith(settings.builds_data) && stallBuilds)
+  return new Promise(resolve=>pendingBuilds.push(resolve));
+ return reply();
+};
+START
+(async()=>{
+ await pageRefresh.refresh();
+ const delayed=measureButton.press();
+ await pageRefresh.refresh();
+ check(measuring!==null && measureButton.disabled,'Legacy data must count as generation zero during a press.');
+ omitGeneration=false;generation=1;await pageRefresh.refresh();
+ check(measuring!==null && measureButton.disabled,'Target data must wait for the POST target.');
+ pendingPosts.shift()({ok:true,json:async()=>({state:'started',target:1})});
+ await delayed;
+ check(measuring===null && !measureButton.disabled && line.dataset.state==='Live',
+  'Target data received before the reply must end the press at the reply.');
+
+ const press=measureButton.press();
+ pendingPosts.shift()({ok:true,json:async()=>({state:'running',target:2})});
+ await press;
+ generation=1;stallBuilds=true;const older=pageRefresh.refresh();await flush();
+ check(measuring!==null && measureButton.disabled,'Older data received after the reply must retain the press.');
+ generation=3;const newer=pageRefresh.refresh(true);await flush();
+ check(pendingBuilds.length===2,'Both Builds reads must remain pending.');
+ check(measuring===null && !measureButton.disabled && line.dataset.state==='Live',
+  'A later generation must end the press before the Builds read ends.');
+ stallBuilds=false;pendingBuilds.splice(0).forEach(resolve=>resolve(reply()));
+ await Promise.all([older,newer]);
+ if(failures.length) throw new Error(failures.join('\n'));
+ console.log('PASS');
+})().catch(error=>{console.error(error);process.exitCode=1;});
+""")
+
+    def test_the_wait_timer_reports_failure_without_earlier_data(self) -> None:
+        self.assert_status_scenario(r"""
+const failures=[],check=(ok,label)=>{if(!ok) failures.push(label);};
+function render(){}
+function renderCards(){}
+const fetch=async(url)=>url==='measure'
+ ? {ok:true,json:async()=>({state:'started',target:1})} : {ok:false,status:404};
+START
+(async()=>{
+ await pageRefresh.refresh();
+ check(data===null && measuring!==null && measureButton.disabled,'The first measure must start without earlier data.');
+ advanceTime(settings.wait_seconds*1000);
+ check(measuring===null && !measureButton.disabled,'The timer must clear the first measure at the wait limit.');
+ check(line.dataset.state==='Failed' && parts.reason.textContent==='The measure did not finish.',
+  'The timer must report failure without earlier data.');
+ if(failures.length) throw new Error(failures.join('\n'));
+ console.log('PASS');
+})().catch(error=>{console.error(error);process.exitCode=1;});
+""")
+
     def assert_status_scenario(self, scenario: str) -> None:
         with tempfile.TemporaryDirectory() as directory:
             page = disks_page.publish(Path(directory), SETTINGS).read_text()
@@ -251,11 +591,14 @@ START
         assert match is not None
         environment = test_page_frame.PageStatusTests.environment(html.unescape(match[1])) + """
 const settingsText=SETTINGS;
-document.getElementById=()=>({textContent:JSON.stringify(settingsText)});
+const measureButton={disabled:false,addEventListener:(key,run)=>{
+ measureButton.press=()=>measureButton.disabled ? undefined : run({currentTarget:measureButton});
+}};
+document.getElementById=key=>key==='measure-now' ? measureButton : {textContent:JSON.stringify(settingsText)};
 const localStorage={getItem:()=>null};
 """.replace("SETTINGS", json.dumps(SETTINGS))
         functions = page[page.index("const GIB ="):page.index("const updateSessions =")]
-        start = re.search(r'const pageRefresh=createPageRefresh[^\n]+', page)
+        start = re.search(r'const pageRefresh=createPageRefresh.*?(?=void pageRefresh.refresh\(\);)', page, re.DOTALL)
         assert start is not None
         scenario = scenario.replace("START", start[0])
         node = shutil.which("node") or str(next(Path("/nix/store").glob("*nodejs*/bin/node")))
@@ -281,36 +624,195 @@ const localStorage={getItem:()=>null};
             rows = cast(list[str], re.findall(r"<tr[^>]*>(.*?)</tr>", re.sub(r'<div class="narrow">.*?</div>', "", html)))
             return html, ["|".join(part for part in re.split(r"<[^>]+>", row) if part) for row in rows[1:]]
 
-        # The card starts with one band per repository; an open band lists its slots.
-        self.assertEqual(cells([])[1], ["hana|2 of 8 slots · 70 GiB", "&lt;b&gt;|1 slot · —"])
-        html, shown = cells(["hana", "<b>"])
-        self.assertEqual(shown, ["hana|2 of 8 slots · 70 GiB", "hana-slot1|70 GiB|now|report integrate|builds",
-                                 "hana-slot2|&lt; 256 MiB|9 days ago|deleted tonight", "&lt;b&gt;|1 slot · —",
-                                 "x-slot1|—|—|—"])
-        self.assertEqual(re.findall(r'aria-expanded="(\w+)" data-group="([^"]*)"', cells(["hana"])[0]),
-                         [("true", "hana"), ("false", "&lt;b&gt;")])
+        # An open group lists the numbered copies for that repository and unit.
+        self.assertEqual(cells([])[1], ["hana/report|2 slots · 70 GiB", "&lt;b&gt;/other|1 slot · —"])
+        html, shown = cells(["hana/report", "<b>/other"])
+        self.assertEqual(shown, ["hana/report|2 slots · 70 GiB", "1|70 GiB|now|report integrate|builds",
+                                 "2|&lt; 256 MiB|9 days ago|review", "&lt;b&gt;/other|1 slot · —",
+                                 "1|—|—|—"])
+        self.assertEqual(re.findall(r'aria-expanded="(\w+)" data-group="([^"]*)"', cells(["hana/report"])[0]),
+                         [("true", "hana/report"), ("false", "&lt;b&gt;/other")])
         self.assertEqual(re.findall(r'<div class="narrow">(.*?)</div>', html), [
-            '<span class="tag run">report integrate</span><span class="dim">builds</span>', '<span class="tag go">deleted tonight</span>'])
+            '<span class="tag run">report integrate</span><span class="dim">builds</span>', '<span class="tag go">review</span>'])
         empty = cast(str, self.run_page(f"slotsHtml({json.dumps({'root': '/s', 'groups': []})}, {KEEP}, {now}, new Set())"))
         self.assertIn("No slots yet.", empty)
 
     def test_the_sessions_card_shows_every_session_and_a_size_filter_joins_the_smaller_ones(self) -> None:
         # The user, 11-16: "sessions should show all sessions and have a filter that limits the minimum size - like disks".
+        self.assertRegex(self.page_html(), r'id="cards">\s*<section[^>]+id="slots"[^>]*></section>\s*'
+                         + r'<section[^>]+id="sessions"[^>]*></section>')
+
         def cells(limit: int) -> list[str]:
             html = cast(str, self.run_page(f"sessionRows({json.dumps(SESSIONS)}, {KEEP}, {limit})"))
             rows = cast(list[str], re.findall(r"<tr[^>]*>(.*?)</tr>", html))
             return ["|".join(part for part in re.split(r"<[^>]+>", row) if part.strip()) for row in rows]
 
-        self.assertEqual(cells(0), ["fps|28 GiB|run, center-shot |(unsaved work)|running", "lfo|7.0 GiB|—|ended",
-                                    "demo|1.0 GiB|—|running", "&lt;b&gt;|&lt; 256 MiB|—|—", "sdlc|—|—|running"])
-        self.assertEqual(cells(5 * GIB), ["fps|28 GiB|run, center-shot |(unsaved work)|running", "lfo|7.0 GiB|—|ended",
-                                          "3 smaller|1.0 GiB"])
+        self.assertEqual(cells(0), ["fps|28 GiB|run, center-shot |(unsaved work)|2 folders|running", "lfo|7.0 GiB|—|ended",
+                                    "demo|1.0 GiB|&lt;scratch&gt;|running", "&lt;b&gt;|&lt; 256 MiB|—|—", "sdlc|—|—|running"])
+        self.assertEqual(cells(5 * GIB), ["fps|28 GiB|run, center-shot |(unsaved work)|2 folders|running",
+                                          "lfo|7.0 GiB|—|ended", "3 smaller|1.0 GiB"])
         html = cast(str, self.run_page(f"sessionRows({json.dumps(SESSIONS)}, {KEEP}, 0)"))
+        self.assertEqual(re.findall(r'<td class="held">(.*?)</td>', html), [
+            '<div class="line"><span class="names">run, center-shot <span class="dim">(unsaved work)</span></span>'
+            + '<span class="count">2 folders</span></div>',
+            '<span class="dim">—</span>',
+            '<div class="line"><span class="names">&lt;scratch&gt;</span></div>',
+            '<span class="dim">—</span>',
+            '<span class="dim">—</span>',
+        ])
         self.assertEqual(re.findall(r'<i style="width:([0-9.]+)%">', html), ["100.0", "25.0", "3.6"])
         self.assertEqual(re.findall(r'data-tip="([^"]*)"', cast(str, self.run_page(f"sessionRows({json.dumps(SESSIONS)}, {KEEP}, {5 * GIB})"))),
                          ["session:fps", "session:lfo", "smaller:sessions"])
         self.assertEqual(self.run_page(f"[sessionRange({json.dumps(SESSIONS)}, {KEEP}), sessionLimitAt(0, {{min: 1, max: 2}})]"),
                          [{"min": KEEP, "max": 28 * GIB}, 0])
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
+    def test_session_rows_and_the_full_tooltip_fit_in_the_browser(self) -> None:
+        held: list[dict[str, object]] = [
+            {"name": f"scratch/phase-review-{index:02d}/long-folder-name-for-the-layout-check",
+             "task": "phase:disksdesign/1", "ended": index % 2 == 0} for index in range(40)]
+        measure = json.dumps({"state": "current", "slots": SLOTS, "sessions": {"root": "/session", "sessions": [
+            session("report", 28 * GIB, "running", held), session("other", 9 * GIB, "ended")]}}).encode()
+        reading = json.dumps({"measured_at": NOW, "render_seconds": 0.01, "keep_bytes": KEEP, "drives": []}).encode()
+        probe = """
+async function checkSessionLayout() {
+  const failures = [];
+  const check = (passed, detail) => { if (!passed) failures.push(detail); };
+  const bounds = element => element.getBoundingClientRect();
+  const close = (first, second) => Math.abs(first - second) < 1;
+  try {
+    check(matchMedia('(prefers-color-scheme: dark)').matches, 'Firefox uses the dark color scheme.');
+    const rows = [...document.querySelectorAll('.sessions tbody tr')];
+    check(rows.length === 2, 'The Sessions card shows both rows.');
+    const cell = rows[0].querySelector('.held');
+    if (innerWidth === 1440) {
+      const cards = bounds(document.querySelector('#cards'));
+      const slots = bounds(document.querySelector('#slots'));
+      const sessions = bounds(document.querySelector('#sessions'));
+      check(slots.height > 0 && slots.bottom <= sessions.top, 'Slots is above Sessions.');
+      check([slots, sessions].every(card => close(card.left, cards.left) && close(card.right, cards.right)),
+            'Both cards use the full width.');
+      for (const row of rows) {
+        const height = Math.max(...[...row.cells].map(cell => {
+          const style = getComputedStyle(cell);
+          return parseFloat(style.lineHeight) + parseFloat(style.paddingTop) + parseFloat(style.paddingBottom)
+            + parseFloat(style.borderBottomWidth);
+        }));
+        check(bounds(row).height <= height + 1, 'The session row uses one line.');
+      }
+      const count = rows[0].querySelector('.count');
+      const names = rows[0].querySelector('.names');
+      check(count.textContent === '40 folders' && close(bounds(count).right, bounds(cell).right),
+            'The count is at the right edge of the cell.');
+      check(names.scrollWidth > names.clientWidth && getComputedStyle(names).textOverflow === 'ellipsis',
+            'The cell shortens the list with an ellipsis.');
+    }
+    rows[0].scrollIntoView({block: 'center'});
+    rows[0].dispatchEvent(new PointerEvent('pointermove', {
+      bubbles: true, pointerType: 'mouse', clientX: bounds(cell).left, clientY: bounds(cell).top + 8
+    }));
+    const tip = document.querySelector('#tip.on');
+    const folders = [...tip.querySelectorAll('dt')].slice(2);
+    const box = bounds(tip);
+    check(innerHeight === 900 && box.top >= 0 && box.bottom <= innerHeight,
+          'The tooltip fits in the 900 px window. Bounds: ' + JSON.stringify(box));
+    check(box.left >= 0 && box.right <= innerWidth, 'The tooltip fits the window width.');
+    check(folders.every((folder, index) => {
+      const details = folder.nextElementSibling;
+      const state = index % 2 === 0 ? 'unsaved work' : 'held';
+      const number = String(index).padStart(2, '0');
+      return folder.textContent === 'scratch/phase-review-' + number + '/long-folder-name-for-the-layout-check'
+        && details.textContent === state + ' · Task phase:disksdesign/1'
+        && folder.scrollWidth <= folder.clientWidth && details.scrollWidth <= details.clientWidth
+        && Number(getComputedStyle(details).opacity) < 1;
+    }), 'Every displayed folder name and its dim details are visible in full.');
+    const summary = tip.querySelector('dl').lastElementChild;
+    check(summary.textContent === '+' + (40 - folders.length) + ' more folders'
+      && Number(getComputedStyle(summary).opacity) < 1, 'A dim last line gives the number of omitted folders.');
+    const textLines = element => {
+      const range = document.createRange();
+      range.selectNodeContents(element);
+      return range.getClientRects().length;
+    };
+    if (innerWidth === 1440) {
+      check(folders.length === 30 && folders.every(folder =>
+        textLines(folder) === 1 && textLines(folder.nextElementSibling) === 1
+        && close(bounds(folder).top, bounds(folder.nextElementSibling).top)),
+        'The tooltip shows the first 30 folders on one line each.');
+    } else {
+      check(folders.length > 0 && folders.length <= 30 && textLines(folders[0]) > 1,
+            'Long folder names wrap at phone width.');
+      const root = document.documentElement;
+      check(root.scrollWidth <= root.clientWidth, 'The phone page has no horizontal scroll.');
+    }
+  } catch (error) {
+    failures.push(String(error));
+  }
+  await fetch('/results', {method: 'POST', body: JSON.stringify({width: innerWidth, failures})});
+}
+"""
+        page = self.page_html().replace("void pageRefresh.refresh();",
+            "void pageRefresh.refresh().then(checkSessionLayout);" + probe)
+        page_bytes = page.replace("</body>", '<img hidden src="/complete"></body>').encode()
+        results: list[object] = []
+        complete = threading.Event()
+
+        class LayoutProbe(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:
+                if self.path == "/":
+                    body, mime = page_bytes, "text/html; charset=utf-8"
+                elif self.path.startswith("/disks.json?"):
+                    body, mime = reading, "application/json"
+                elif self.path == "/complete":
+                    _ = complete.wait(test_hang_guard.TEST_HANG_GUARD_SECS)
+                    self.send_error(404)
+                    return
+                else:
+                    self.send_error(404)
+                    return
+                self.send_response(200)
+                self.send_header("Content-Type", mime)
+                self.end_headers()
+                _ = self.wfile.write(body)
+
+            def do_POST(self) -> None:
+                body = self.rfile.read(int(self.headers["Content-Length"]))
+                if self.path == "/results":
+                    results.append(cast(object, json.loads(body)))
+                    self.send_response(204)
+                    self.end_headers()
+                    complete.set()
+                else:
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    _ = self.wfile.write(measure)
+
+            @override
+            def log_message(self, format: str, *args: object) -> None:
+                pass
+
+        with tempfile.TemporaryDirectory() as directory, ThreadingHTTPServer(("127.0.0.1", 0), LayoutProbe) as server:
+            thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": .01}, daemon=True)
+            thread.start()
+            try:
+                for width in (1440, 390):
+                    with self.subTest(width=width):
+                        results.clear()
+                        complete.clear()
+                        profile = Path(directory) / f"profile-{width}"
+                        profile.mkdir()
+                        _ = (profile / "user.js").write_text('user_pref("ui.systemUsesDarkTheme", 1);\n')
+                        done = subprocess.run(
+                            ["firefox", "--headless", "--no-remote", "--profile", str(profile),
+                             "--window-size", f"{width},900", "--screenshot", str(profile / "disks.png"),
+                             f"http://127.0.0.1:{server.server_port}/"],
+                            capture_output=True, text=True, timeout=45, check=False)
+                        self.assertEqual(done.returncode, 0, done.stderr)
+                        self.assertEqual(results, [{"width": width, "failures": []}])
+            finally:
+                server.shutdown()
+                thread.join(test_hang_guard.TEST_HANG_GUARD_SECS)
 
     def test_the_sessions_filter_keeps_its_card_and_limit_across_new_data(self) -> None:
         result = cast(dict[str, object], self.run_drive("""
@@ -334,15 +836,28 @@ const localStorage={getItem:()=>null};
         self.assertEqual(result, {"writes": 1, "sameSlider": True, "all": [5, "any size"], "top": [2, "28 GiB"],
                                   "after": [2, "7.0 GiB"], "small": [2, "any size", True], "empty": True})
 
+    def test_a_slot_shows_the_builds_tooltip_without_a_title_field(self) -> None:
+        row = {"name": "report integrate", "unit": "report", "showrunner": "builds", "started_at": NOW - 60,
+               "key": "run", "used": 2.0, "slot": 1, "slot_folder": "hana/report/1", "slot_machine": "natedev",
+               "pid": 4242, "progress": {"kind": "NoProgress", "reason": "none"}}
+        builds = {"read_at": NOW, "walk": [row], "waiters": [], "ram": RAM_FIXTURE, "swap": SWAP_FIXTURE}
+        body = cast(str, self.run_drive("""
+            Date.now = () => input.now * 1000;
+            slotReport = input.slots;
+            builds = input.builds;
+            result = tipFor("slot:hana/report/1");
+        """, extra={"slots": SLOTS, "now": NOW, "builds": builds}))
+        self.assertIn("report · integrate", body)
+
     def test_each_row_and_card_title_has_a_tooltip_and_a_slot_in_use_shows_its_builds_step(self) -> None:
         # The user, 11-16: "every row should contain a tooltip that for slots should be the same tooltip that is shown in
         # the build queue so they share code and data".
         now = NOW
         step = {"name": "report integrate", "unit": "report", "showrunner": "builds", "started_at": now - 600, "used": 2.0,
-                "slot": 1, "slot_folder": "hana-slot1", "pid": 4242, "progress": {"kind": "NoProgress", "reason": "none"}}
+                "slot": 1, "slot_folder": "hana/report/1", "pid": 4242, "progress": {"kind": "NoProgress", "reason": "none"}}
         builds = {"read_at": now, "waiters": [], "swap_by": [], "ram": RAM_FIXTURE, "swap": SWAP_FIXTURE,
                   "walk": [{**step, "key": "mac-run", "slot_machine": "mac"}, {**step, "key": "run", "slot_machine": "natedev"},
-                           {**step, "key": "free-run", "slot_folder": "hana-slot2", "slot_machine": "natedev"}]}
+                           {**step, "key": "free-run", "slot_folder": "hana/report/2", "slot_machine": "natedev"}]}
         result = cast(dict[str, str], self.run_drive("""
             Date.now = () => input.now * 1000;
             data = {keep_bytes: KEEP};
@@ -351,24 +866,25 @@ const localStorage={getItem:()=>null};
             builds = input.builds;
             sessionLimit = 5 * GIB;
             const text = html => html.replace(/<[/](dt|dd)>/g, "|").replace(/<[^>]+>/g, "");
-            result = {run: tipFor("slot:hana-slot1"), shared: stepTip.tooltipHtml("row:run", builds),
-                      free: text(tipFor("slot:hana-slot2")), group: text(tipFor("group:hana")), slots: text(tipFor("about:slots")),
+            result = {run: tipFor("slot:hana/report/1"), shared: stepTip.tooltipHtml("row:run", builds),
+                      review: text(tipFor("slot:hana/report/2")), group: text(tipFor("group:hana/report")),
+                      slots: text(tipFor("about:slots")),
                       sessions: text(tipFor("about:sessions")), session: text(tipFor("session:fps")),
                       smaller: text(tipFor("smaller:sessions")), gone: tipFor("slot:gone")};
-            const usedBy = () => slotsHtml(slotReport, KEEP, input.now, new Set(["hana"]), slotStep).match(/<td class="use wide">(.*?)<[/]td>/)[1];
+            const usedBy = () => slotsHtml(slotReport, KEEP, input.now, new Set(["hana/report"]), slotStep).match(/<td class="use wide">(.*?)<[/]td>/)[1];
             result.runName = usedBy();
             // A step that waits in a held slot names the slot and gives its tooltip, as the Builds page waiting row does.
             builds.walk = builds.walk.filter(row => row.key !== "run");
-            builds.waiters = [{...input.wait, key: "wait", slot_folder: "hana-slot1", slot_machine: "natedev"}];
-            result.wait = [tipFor("slot:hana-slot1") === stepTip.tooltipHtml("wait:wait", builds), usedBy()];
+            builds.waiters = [{...input.wait, key: "wait", slot_folder: "hana/report/1", slot_machine: "natedev"}];
+            result.wait = [tipFor("slot:hana/report/1") === stepTip.tooltipHtml("wait:wait", builds), usedBy()];
             // Builds data older than the configured age gives the Disks rows and the lease's name.
             builds.read_at = input.now - 31;
-            result.stale = text(tipFor("slot:hana-slot1"));
+            result.stale = text(tipFor("slot:hana/report/1"));
             result.staleName = usedBy();
             // Builds data with no read time is not current.
             delete builds.read_at;
             result.noTime = usedBy();
-        """, extra={"slots": {**SLOTS, "machine": "natedev", "unused_days": 7}, "sessions": SESSIONS, "builds": builds,
+        """, extra={"slots": SLOTS, "sessions": SESSIONS, "builds": builds,
                     "now": now, "wait": {"name": "report test named", "unit": "report", "showrunner": "builds", "pid": 4343,
                                          "since": now - 60, "need": 3.0, "reason": "its turn", "fits": False, "why": "turn",
                                          "place": 1}}))
@@ -378,15 +894,17 @@ const localStorage={getItem:()=>null};
         self.assertEqual(result["runName"], '<span class="tag run">report integrate</span><span class="dim">builds</span>')
         self.assertEqual(result["wait"], [True, '<span class="tag run">report test named</span><span class="dim">builds</span>'])
         self.assertIn("report · integrate", result["run"])
-        self.assertEqual(result["free"], "|".join(["hana-slot2", "deleted tonight", "Repository", "hana", "Size", "&lt; 256 MiB",
-                                                   "Last used", "9 days ago", "No run used it for 7 days, so the nightly sweep deletes it.", ""]))
-        self.assertEqual(result["group"], "hana|2 slots|Size|70 GiB|In use|1 of 2|Limit|8 slots|")
-        self.assertIn("The nightly sweep deletes a free slot unused for 7 days.", result["slots"])
+        self.assertEqual(result["review"], "|".join([
+            "2", "review", "Repository", "hana/report", "Size", "&lt; 256 MiB", "Last used", "9 days ago",
+            "The nightly sweep lists this folder after 2 days without use.", "",
+        ]))
+        self.assertEqual(result["group"], "hana/report|2 slots|Size|70 GiB|In use|1 of 2|Limit|not set|")
+        self.assertIn("The nightly sweep lists a free copy for review after 2 days without use.", result["slots"])
         self.assertIn("A session folder holds the temporary files of one Claude session", result["sessions"])
-        self.assertEqual(result["session"], "fps|running|Size|28 GiB|run|held|Task phase:fps/3|center-shot|unsaved work|Task phase:fps/3|")
+        self.assertEqual(result["session"], "fps|running|Size|28 GiB|run|held · Task phase:fps/3|center-shot|unsaved work · Task phase:fps/3|")
         self.assertEqual(result["smaller"], "3 smaller sessions|1.0 GiB|Each is below 5.0 GiB. Move the size filter to the left to show them.|")
         self.assertEqual(result["gone"], "")
-        self.assertTrue(result["stale"].startswith("hana-slot1|in use|Repository|hana|"), result["stale"])
+        self.assertTrue(result["stale"].startswith("1|in use|Repository|hana/report|"), result["stale"])
         self.assertEqual(result["staleName"], result["runName"])
         self.assertEqual(result["noTime"], result["runName"])
 
@@ -394,15 +912,196 @@ const localStorage={getItem:()=>null};
         launches: list[str] = []
         with tempfile.TemporaryDirectory() as directory, mock.patch.object(disks_page, "output_folder", return_value=Path(directory)):
             folder = Path(directory)
-            self.assertIs(disks_page.start_measure(1000, lambda: launches.append("missing")), disks_page.MeasureStart.STARTED)
+            self.assertIs(disks_page.start_measure(1000, lambda _generation, _lock: launches.append("missing")).state, disks_page.MeasureStart.STARTED)
             _ = (folder / disks_page.DATA_FILE).write_text(json.dumps({"measured_at": 900}))
-            self.assertIs(disks_page.start_measure(1000, lambda: launches.append("current")), disks_page.MeasureStart.CURRENT)
+            self.assertIs(disks_page.start_measure(1000, lambda _generation, _lock: launches.append("current")).state, disks_page.MeasureStart.CURRENT)
+            _ = (folder / disks_page.ACTIVE_FILE).write_text("1\n")
             with file_lock.exclusive(folder / disks_page.LOCK_FILE, wait=False):
-                self.assertIs(disks_page.start_measure(5000, lambda: launches.append("running")), disks_page.MeasureStart.RUNNING)
-            self.assertIs(disks_page.start_measure(5000, lambda: launches.append("old")), disks_page.MeasureStart.STARTED)
+                self.assertIs(disks_page.start_measure(5000, lambda _generation, _lock: launches.append("running")).state, disks_page.MeasureStart.RUNNING)
+            self.assertIs(disks_page.start_measure(5000, lambda _generation, _lock: launches.append("old")).state, disks_page.MeasureStart.STARTED)
             _ = (folder / disks_page.DATA_FILE).write_text("[]")
             self.assertIsNone(disks_page.measured_at(folder))
         self.assertEqual(launches, ["missing", "old"])
+
+    def test_a_forced_measure_starts_with_current_data_but_keeps_the_running_lock(self) -> None:
+        launches: list[str] = []
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(disks_page, "output_folder", return_value=Path(directory)):
+            folder = Path(directory)
+            _ = (folder / disks_page.DATA_FILE).write_text(json.dumps({"measured_at": 900}))
+            self.assertIs(disks_page.start_measure(1000, lambda _generation, _lock: launches.append("forced"), force=True).state,
+                          disks_page.MeasureStart.STARTED)
+            _ = (folder / disks_page.ACTIVE_FILE).write_text("1\n")
+            with file_lock.exclusive(folder / disks_page.LOCK_FILE, wait=False):
+                self.assertIs(disks_page.start_measure(1000, lambda _generation, _lock: launches.append("running"), force=True).state,
+                              disks_page.MeasureStart.RUNNING)
+        self.assertEqual(launches, ["forced"])
+
+    def test_a_measure_request_selects_the_published_or_active_generation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(disks_page, "output_folder", return_value=Path(directory)):
+            folder = Path(directory)
+            published = folder / disks_page.DATA_FILE
+            _ = published.write_text(json.dumps({"measured_at": 900, "generation": 7}))
+            launch = mock.Mock()
+            self.assertEqual(disks_page.start_measure(1000, launch),
+                             disks_page.MeasureRequest(disks_page.MeasureStart.CURRENT, 7))
+            with file_lock.exclusive(folder / disks_page.LOCK_FILE, wait=False):
+                _ = (folder / disks_page.ACTIVE_FILE).write_text("8\n")
+                self.assertEqual(disks_page.start_measure(1000, launch, force=True),
+                                 disks_page.MeasureRequest(disks_page.MeasureStart.RUNNING, 8))
+            launch.assert_not_called()
+
+    def test_a_started_request_passes_its_lock_and_target_to_the_child(self) -> None:
+        child_code = """
+import json
+import subprocess
+import sys
+from pathlib import Path
+from scripts.disks import measure
+from scripts.disks.test_measure import settings, no_floors
+from scripts.lib import file_lock
+folder, generation, descriptor = Path(sys.argv[1]), int(sys.argv[2]), int(sys.argv[3])
+assert sys.stdin.read(1) == 'x'
+reservation = measure.MeasureReservation(generation, file_lock.ExclusiveLock(descriptor))
+raise SystemExit(measure.measure(settings(folder, str(folder)), floors=no_floors,
+    runner=lambda argv, timeout: subprocess.CompletedProcess(argv, 0, json.dumps({"name": str(folder), "size": "1B", "children": []}), ''),
+    reservation=reservation))
+"""
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(disks_page, "output_folder", return_value=Path(directory)):
+            folder = Path(directory)
+            _ = (folder / disks_page.DATA_FILE).write_text('{"generation":7}')
+            children: list[subprocess.Popen[str]] = []
+
+            def launch(generation: int, lock: file_lock.ExclusiveLock) -> None:
+                self.assertEqual(generation, 8)
+                self.assertEqual((folder / disks_page.ACTIVE_FILE).read_text(), "8\n")
+                with file_lock.exclusive(folder / disks_page.COORD_FILE, wait=False) as coordination:
+                    self.assertIs(coordination, file_lock.LockResult.BUSY)
+                children.append(subprocess.Popen(
+                    [sys.executable, "-c", child_code, str(folder), str(generation), str(lock.descriptor)],
+                    pass_fds=(lock.descriptor,), stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    text=True))
+
+            try:
+                first = disks_page.start_measure(1000, launch, force=True)
+                self.assertEqual(first, disks_page.MeasureRequest(disks_page.MeasureStart.STARTED, 8))
+                self.assertEqual(json.loads((folder / disks_page.DATA_FILE).read_text()), {"generation": 7})
+                with file_lock.exclusive(folder / disks_page.LOCK_FILE, wait=False) as held:
+                    self.assertIs(held, file_lock.LockResult.BUSY)
+                second = disks_page.start_measure(1000, launch, force=True)
+                self.assertEqual(second, disks_page.MeasureRequest(disks_page.MeasureStart.RUNNING, 8))
+                self.assertEqual(len(children), 1)
+            finally:
+                for child in children:
+                    output, error = child.communicate("x", timeout=10)
+                    self.assertEqual(child.returncode, 0, output + error)
+            self.assertEqual(json.loads((folder / disks_page.DATA_FILE).read_text())["generation"], 8)
+            self.assertFalse((folder / disks_page.ACTIVE_FILE).exists())
+            with file_lock.exclusive(folder / disks_page.LOCK_FILE, wait=False) as released:
+                self.assertIs(released, file_lock.LockResult.ACQUIRED)
+
+    def test_a_stale_active_file_does_not_change_the_next_target(self) -> None:
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(disks_page, "output_folder", return_value=Path(directory)):
+            folder = Path(directory)
+            _ = (folder / disks_page.DATA_FILE).write_text('{"generation":7}')
+            _ = (folder / disks_page.ACTIVE_FILE).write_text("99\n")
+
+            def launch(generation: int, lock: file_lock.ExclusiveLock) -> None:
+                self.assertEqual(generation, 8)
+                self.assertEqual((folder / disks_page.ACTIVE_FILE).read_text(), "8\n")
+                with file_lock.exclusive(folder / disks_page.LOCK_FILE, wait=False) as held:
+                    self.assertIs(held, file_lock.LockResult.BUSY)
+                self.assertGreaterEqual(lock.descriptor, 0)
+
+            self.assertEqual(disks_page.start_measure(1000, launch, force=True),
+                             disks_page.MeasureRequest(disks_page.MeasureStart.STARTED, 8))
+
+    def test_a_reaper_failure_keeps_the_child_lock_and_target(self) -> None:
+        child_code = """
+import sys
+from pathlib import Path
+from scripts.disks import disks_page, slots
+from scripts.lib import file_lock
+folder, descriptor = Path(sys.argv[1]), int(sys.argv[2])
+assert sys.stdin.buffer.read(1) == b'x'
+with file_lock.exclusive(folder / disks_page.COORD_FILE):
+    (folder / disks_page.ACTIVE_FILE).unlink()
+    file_lock.ExclusiveLock(descriptor).release()
+"""
+        for failure in ("construct", "start"):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as directory, \
+                    mock.patch.object(disks_page, "output_folder", return_value=Path(directory)):
+                folder = Path(directory)
+                _ = (folder / disks_page.DATA_FILE).write_text('{"generation":7}')
+                children: list[subprocess.Popen[bytes]] = []
+
+                def launch(_generation: int, lock: file_lock.ExclusiveLock) -> None:
+                    child = subprocess.Popen(
+                        [sys.executable, "-c", child_code, str(folder), str(lock.descriptor)],
+                        pass_fds=(lock.descriptor,), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE)
+                    children.append(child)
+                    disks_page.reap_measure(child)
+
+                start_reaper = mock.Mock(side_effect=RuntimeError("cannot start reaper"))
+                reaper = mock.Mock(start=start_reaper)
+                make_reaper = mock.Mock(return_value=reaper)
+                if failure == "construct":
+                    make_reaper.side_effect = RuntimeError("cannot construct reaper")
+                errors = io.StringIO()
+                try:
+                    with mock.patch("scripts.disks.disks_page.threading.Thread", make_reaper), redirect_stderr(errors):
+                        first = disks_page.start_measure(1000, launch, force=True)
+                    self.assertEqual(first, disks_page.MeasureRequest(disks_page.MeasureStart.STARTED, 8))
+                    self.assertIn(f"review-links disks reaper: cannot {failure} reaper", errors.getvalue())
+                    self.assertEqual((folder / disks_page.ACTIVE_FILE).read_text(), "8\n")
+                    with file_lock.exclusive(folder / disks_page.LOCK_FILE, wait=False) as held:
+                        self.assertIs(held, file_lock.LockResult.BUSY)
+                    second = disks_page.start_measure(1000, launch, force=True)
+                    self.assertEqual(second, disks_page.MeasureRequest(disks_page.MeasureStart.RUNNING, 8))
+                    self.assertEqual(len(children), 1)
+                finally:
+                    for child in children:
+                        output, error = child.communicate(b"x", timeout=10)
+                        self.assertEqual(child.returncode, 0, (output + error).decode())
+                self.assertFalse((folder / disks_page.ACTIVE_FILE).exists())
+                with file_lock.exclusive(folder / disks_page.LOCK_FILE, wait=False) as released:
+                    self.assertIs(released, file_lock.LockResult.ACQUIRED)
+
+    def test_a_launch_failure_keeps_a_stale_active_file_and_releases_the_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(disks_page, "output_folder", return_value=Path(directory)):
+            folder = Path(directory)
+            with mock.patch.object(disks_page, "REPOSITORY", folder / "missing"), self.assertRaises(FileNotFoundError):
+                _ = disks_page.start_measure(1000, force=True)
+            self.assertEqual((folder / disks_page.ACTIVE_FILE).read_text(), "1\n")
+            self.assertFalse((folder / disks_page.DATA_FILE).exists())
+            with file_lock.exclusive(folder / disks_page.LOCK_FILE, wait=False) as held:
+                self.assertIs(held, file_lock.LockResult.ACQUIRED)
+            launch = mock.Mock()
+            self.assertEqual(disks_page.start_measure(1000, launch, force=True),
+                             disks_page.MeasureRequest(disks_page.MeasureStart.STARTED, 1))
+            launch.assert_called_once_with(1, mock.ANY)
+
+    def test_the_launcher_passes_the_reserved_descriptor_and_generation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            lock = file_lock.take_exclusive(Path(directory) / disks_page.LOCK_FILE)
+            assert isinstance(lock, file_lock.ExclusiveLock)
+            collect_exit = mock.Mock()
+            start_collector = mock.Mock()
+            process = mock.Mock(wait=collect_exit)
+            collector = mock.Mock(start=start_collector)
+            try:
+                with mock.patch("scripts.disks.disks_page.subprocess.Popen", return_value=process) as launch, \
+                        mock.patch("scripts.disks.disks_page.threading.Thread", return_value=collector) as thread:
+                    disks_page.launch_measure(8, lock)
+                    launch.assert_called_once_with(
+                        [sys.executable, "-m", "scripts.disks.measure", "--generation", "8",
+                         "--lock-fd", str(lock.descriptor)], cwd=disks_page.REPOSITORY, stdin=subprocess.DEVNULL,
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True,
+                        pass_fds=(lock.descriptor,))
+                    thread.assert_called_once_with(target=collect_exit, name="disks-measure", daemon=True)
+                    start_collector.assert_called_once_with()
+            finally:
+                lock.release()
 
     def test_a_slider_step_a_toggle_and_new_data_keep_the_card_so_a_drag_goes_on(self) -> None:
         # The browser ends a drag when the slider it moves leaves the page.

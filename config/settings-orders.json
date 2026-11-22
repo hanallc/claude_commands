@@ -1,0 +1,28 @@
+{
+  "aws_target": {
+    "accounting_zone": 8
+  },
+  "build_admission": {
+    "head_stall_alert_minutes": 9
+  },
+  "cloud_gate": {
+    "hana_gpu_route_enabled": 3
+  },
+  "console": {
+    "page.accounts.owner": 7,
+    "page.aws.owner": 10
+  },
+  "hana_aws": {
+    "source_allowed_ignored": 1
+  },
+  "lint": {
+    "sweep": 11,
+    "sweep_build_floor_gib.natedev": 6
+  },
+  "merge_gate": {
+    "GATE_TIME_LIMIT_FACTOR": 5
+  },
+  "statusline": {
+    "role.worker": 12
+  }
+}

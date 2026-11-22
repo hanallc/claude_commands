@@ -19,6 +19,8 @@ from typing import cast, override
 import unittest
 from unittest import mock
 
+from scripts.lib.helper_tree_test_support import COPY_HELPERS, copy_helpers, verify_test_environment
+
 from scripts.build_hold.owning_session import NoOwningSession
 from scripts.aws_target import ledger
 from scripts.build_queue import admission_protocol as wire, admission_service as service
@@ -39,6 +41,7 @@ class FailedProbeTests(OffloadCommandFixture):
 
     @override
     def setUp(self) -> None:
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, verify_test_environment(), clear=True)))
         super().setUp()
         self.linux_settings = self.root / "box.conf"
         _ = write_config_fixture(self.linux_settings,
@@ -590,9 +593,7 @@ fi
         _ = write_config_fixture(self.linux_settings,
             "shell_cache=.local/state/probe-shells\ndevshell=default\n", template="mac_test")
         home = Path(self.environment["HOME"])
-        claude = home / ".claude"
-        claude.mkdir(parents=True)
-        (claude / "scripts").symlink_to(Path(__file__).resolve().parents[1], target_is_directory=True)
+        _ = copy_helpers(home, *COPY_HELPERS)
         for name, program in {
             "nix": '#!/bin/sh\nprintf "export IN_NIX_SHELL=1\\n"\n',
             "cargo-nextest": '#!/bin/sh\nprintf "fixture\\n"\n',
@@ -741,7 +742,7 @@ raise SystemExit(255)
 ''')
         self.write_config(clippy="on")
         self.environment["BUILD_TARGETS_SCRIPT"] = str(Path(build_targets.__file__))
-        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, self.environment)))
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, self.environment, clear=True)))
         admission = caller_admission(self, self.root, self.environment)
         admission.server.host_probe = admission.server.read_provider_evidence
         result = self.verify("lint", "sample")

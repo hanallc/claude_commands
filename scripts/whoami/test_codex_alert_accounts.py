@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.lint.memory_test_support import config_environment, write_config_fixture
+
 import base64
 import io
 import json
@@ -63,6 +65,9 @@ class CodexAccountAlertTests(unittest.TestCase):
         _ = self.enterContext(worker_mode_broadcasts())
         _ = self.enterContext(patch.object(accounts, "_launch_worker_moves", return_value=None))
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        settings = self.enterContext(scratch_accounts_config()) / "accounts.conf"
+        _ = config_environment(settings.parent)
+        _ = write_config_fixture(settings, "usage_stale_minutes=10\n")
         self.credits = hold_credit_accounts(self)
         self.now = datetime.now(timezone.utc).replace(microsecond=0)
         self.sent = []
@@ -84,8 +89,6 @@ class CodexAccountAlertTests(unittest.TestCase):
         config = self.root / "showrunners.conf"
         _ = config.write_text(("""# range: 0..
 threshold_percent=1
-# range: 0..
-repeat_minutes=30
 # range: 0..
 stall_minutes=5
 faults_to=director

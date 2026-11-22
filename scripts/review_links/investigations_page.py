@@ -14,6 +14,8 @@ from scripts.lib import conf
 from scripts.lib.user_zone import user_zone
 from scripts.production import investigation, staff
 from scripts.review_links import change_browser, change_page, console, page_frame, review_link
+from scripts.review_links import question_record
+from scripts.review_links import staff_names
 
 PAGE_PATH = f"/{change_page.CONSOLE_FOLDER}/investigations.html"
 
@@ -62,7 +64,9 @@ def request_token(root: Path, owner: str, identity: str) -> str:
     return hmac.new(token.encode(), f"investigation:{owner}:{identity}".encode(), hashlib.sha256).hexdigest()
 
 
-def card(item: investigation.Investigation, root: Path, members: staff.StaffSnapshot) -> str:
+def card(item: investigation.Investigation, root: Path, members: staff.StaffSnapshot,
+         names: staff_names.StaffNames | staff_names.NameReading = staff_names.NameReading.CURRENT) -> str:
+    names = staff_names.for_page(names, members)
     filed = datetime.fromisoformat(item.filed).astimezone(user_zone())
     name = change_page.source_name(members, item.owner)
     details = (("source", name), ("date", filed.strftime("%Y-%m-%d")), ("time", filed.strftime("%H:%M")))
@@ -80,16 +84,18 @@ def card(item: investigation.Investigation, root: Path, members: staff.StaffSnap
     elif item.state == investigation.InvestigationState.OPEN:
         content += '<p>Waiting for an answer</p>'
     content += '<dl class="change-details">' + ''.join(
-        f'<dt>{label}:</dt><dd>{html.escape(value)}</dd>' for label, value in details) + '</dl></article>'
+        f'<dt>{label}:</dt><dd>{names.source(item.owner) if label == "source" else html.escape(value)}</dd>'
+        for label, value in details) + '</dl></article>'
     return content
 
 
 def render(root: Path) -> bytes:
     started, read_at = time.perf_counter(), time.time()
     members = staff.snapshot()
+    names = staff_names.StaffNames(members)
     items = records()
     owners = {item.owner: owner_name(members, item.owner) for item in items}
-    options = ''.join(f'<option value="{html.escape(owner, quote=True)}">{html.escape(name)}</option>'
+    options = ''.join(f'<option value="{html.escape(owner, quote=True)}"{names.style(owner)}>{html.escape(name)}</option>'
                       for owner, name in sorted(owners.items(), key=lambda pair: (pair[1].casefold(), pair[0])))
     seconds = conf.read("review_links").number("page_refresh_seconds")
     content = (STYLE + page_frame.title("Investigations", "review")
@@ -99,7 +105,7 @@ def render(root: Path) -> bytes:
                + '<label for="investigation-show">Show:</label><select id="investigation-show">'
                + '<option value="not-read">Not read</option><option value="answer ready">Answer ready</option>'
                + '<option value="open">Waiting</option><option value="read">Read</option><option value="all">All</option>'
-               + '</select></div><div data-cards>' + ''.join(card(item, root, members) for item in items)
+               + '</select></div><div data-cards>' + ''.join(card(item, root, members, names) for item in items)
                + '</div><p data-empty hidden>No investigations in this view.</p></div>'
                + '<script>' + SCRIPT + '</script>')
     return page_frame.rendered(change_page.document(content, "Investigations"), started, read_at)
@@ -109,11 +115,11 @@ def submit(root: Path, body: str) -> None:
     """Mark the record named by a signed form as read."""
     fields = parse_qs(body, keep_blank_values=True, strict_parsing=True)
     if set(fields) != {"owner", "id", "token"} or any(len(value) != 1 for value in fields.values()):
-        raise change_page.AnswerRefused("use the form on this page")
+        raise question_record.AnswerRefused("use the form on this page")
     owner, identity = fields["owner"][0], fields["id"][0]
     expected = request_token(root, owner, identity)
     if not secrets.compare_digest(fields["token"][0].encode(), expected.encode()):
-        raise change_page.AnswerRefused("the investigation token does not match this page")
+        raise question_record.AnswerRefused("the investigation token does not match this page")
     _ = investigation.mark_read(staff.StaffId(owner), identity)
 
 

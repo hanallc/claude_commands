@@ -14,6 +14,7 @@ import re
 import shutil
 import signal
 import sqlite3
+import stat
 import subprocess
 import sys
 from collections.abc import Callable, Generator, Mapping
@@ -94,13 +95,14 @@ class NoDirectRoute:
 
 def sync_productions(repo: Path) -> tuple[ConfiguredStyleProduction, ...]:
     """Find style configurations in this repository's worktrees."""
-    trees = tuple(Path(line.removeprefix("worktree ")) for line in
+    trees = tuple(Path(line.removeprefix("worktree ")).resolve() for line in
                   git(repo, "worktree", "list", "--porcelain").splitlines() if line.startswith("worktree "))
     productions: list[ConfiguredStyleProduction] = []
     for row in staff.snapshot().find(kind="showrunner"):
         if not isinstance(row.doc, (staff.LiveDoc, staff.WrappedDoc)) or not row.doc.path.is_file():
             continue
-        if not any(row.doc.path.is_relative_to(tree) for tree in trees):
+        document = row.doc.path.resolve()
+        if not any(document.is_relative_to(tree) for tree in trees):
             continue
         lines = row.doc.path.read_text().splitlines()
         if not style_config.has_style_units(lines):
@@ -140,7 +142,7 @@ def direct_route(repo: Path, unit: str = "") -> DirectUnitSync | NoDirectRoute:
 def sync_notice(address: str, target: str, branch: str, tip: str) -> None:
     caller = showrunners.own_name() or "style_sync"
     sent = subprocess.run(session_send.send_argv("--to", address, "--from", caller,
-        "--text", f"From {caller}: branch point {branch} moved to {tip[:7]}; sync.",
+        "--text", f"branch point {branch} moved to {tip[:7]}; sync.",
         "--key", f"style-sync:{target}",
         "--timeout", str(SEND_SECONDS), python_interpreter=PYTHON,
     ), capture_output=True, text=True, check=False, timeout=send_budget.seconds(SEND_SECONDS))
@@ -232,19 +234,20 @@ def own_handoff(repo: Path, tip: str, style_branch: str, unit: str = "") -> int:
     comparison_branch = sync.branch.name if isinstance(sync, DirectUnitSync) else style_branch
     if isinstance(sync, DirectUnitSync):
         style_branch = sync.route.receiving_branch
-        with style_ledger.publication_lock(sync.worktree), style_ledger.open_ledger(repo) as ledger:
-            _ = style_plan.recover_publication(sync.worktree, ledger)
+        worktree = sync.worktree.resolve()
+        with style_ledger.publication_lock(worktree), style_ledger.open_ledger(repo) as ledger:
+            _ = style_plan.recover_publication(worktree, ledger)
             opened = ledger.ticket_open(str(sync.unit))
-            if any(ticket["state"] == "assigned" for ticket in opened) or changed_files(sync.worktree):
+            if any(ticket["state"] == "assigned" for ticket in opened) or changed_files(worktree):
                 ledger.wait_for_sync(str(sync.unit))
                 return 4
-            _ = git(sync.worktree, "merge", "--no-edit", tip)
+            _ = git(worktree, "merge", "--no-edit", tip)
             for ticket in opened:
                 ledger.check_ticket_pipeline(ticket["id"])
-            pending = style_ledger.publication_path(sync.worktree, "pending-sync")
+            pending = style_ledger.publication_path(worktree, "pending-sync")
             if pending.exists():
                 target = pending.read_text().strip()
-                if subprocess.run(["git", "-C", str(sync.worktree), "merge-base", "--is-ancestor", target, "HEAD"],
+                if subprocess.run(["git", "-C", str(worktree), "merge-base", "--is-ancestor", target, "HEAD"],
                                   capture_output=True, check=False).returncode == 0:
                     pending.unlink()
             ledger.clear_sync_wait(str(sync.unit))
@@ -363,11 +366,11 @@ def verifier_command(directory: Path, owner: int) -> list[str]:
             "bash", str(VERIFY), "lint", "--check", "--no-cache"]
 
 
-def verify_lint(directory: Path) -> tuple[int, str]:
-    # Held from Popen until the child stop below is in force; start_new_session makes `$$` the group id.
+def verify_lint(directory: Path, checkout: Path) -> tuple[int, str]:
+    environment = {**os.environ, "UNIT_DETACHED_RUN": "1"}
+    # Hold signals from Popen until the child cleanup is active.
     with signal_mask(signal.SIG_BLOCK), subprocess.Popen(
-        verifier_command(directory, os.getpid()), cwd=directory / "checkout", env={**os.environ, "UNIT_DETACHED_RUN": "1",
-            "CARGO_BUILD_BUILD_DIR": str((directory / "checkout/target").resolve() / "intermediates")},
+        verifier_command(directory, os.getpid()), cwd=checkout, env=environment,
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
         start_new_session=True, preexec_fn=unblock_held_signals, pass_fds=copies.COMMAND_LOCKS.get()) as child:
         try:
@@ -458,11 +461,19 @@ def gate_owner(repo: Path) -> str:
     return str(row.id) if row is not None else copies.fallback_owner("style")
 
 
+def target_identity(path: Path) -> tuple[int, int]:
+    """Identify a real target directory by device and inode."""
+    status = path.lstat()
+    if not stat.S_ISDIR(status.st_mode):
+        raise Refusal(f"{path}: expected a real target directory")
+    return status.st_dev, status.st_ino
+
+
 def lint(repo: Path, checkout: Path, tip: str) -> int:
     """Judge the requested commit, never a style branch with additional fixes."""
     tip = git(checkout, "rev-parse", "--verify", f"{tip}^{{commit}}")
-    common_dir = git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir")
-    if common_dir != git(checkout, "rev-parse", "--path-format=absolute", "--git-common-dir"):
+    common_dir = Path(git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir")).resolve()
+    if common_dir != Path(git(checkout, "rev-parse", "--path-format=absolute", "--git-common-dir")).resolve():
         raise Refusal("--repo and --checkout must belong to the same repository")
     sweep_stale_lint_dirs()
     # Signals stay held outside the work, so the dir never exists without its record and its cleanup path.
@@ -471,23 +482,18 @@ def lint(repo: Path, checkout: Path, tip: str) -> int:
           signal_mask(signal.SIG_BLOCK),
           build_folders.temporary_build_folder(build_folders.UniqueBuildFolder(
               lint_prefix(), build_folders.ExplicitBuildParent(lint_temp_parent()))) as directory):
-        OwnerRecord(os.getpid(), Path(common_dir)).write(directory)
+        OwnerRecord(os.getpid(), common_dir).write(directory)
         with signal_mask(signal.SIG_UNBLOCK):
+            target = snapshot / "target"
+            retained_identity = target_identity(target)
             (directory / "checkout").symlink_to(snapshot, target_is_directory=True)
-            intermediates = snapshot / "target/intermediates"
-            retained_target = (snapshot / "target").resolve()
-            scratch.mark_cargo_cache(intermediates)
-            saved = subprocess.run(
-                [str(PYTHON), str(Path(scratch.__file__)), "cargo-save", str(snapshot)],
-                env={**os.environ, "CARGO_BUILD_BUILD_DIR": str(intermediates)},
-                capture_output=True, text=True, check=False, pass_fds=copies.COMMAND_LOCKS.get())
-            if saved.returncode:
-                raise Refusal(saved.stderr.strip() or "cannot save Cargo output roots")
-            returncode, output = verify_lint(directory)
+            returncode, output = verify_lint(directory, snapshot)
             print(output, end="")
-            # Build outputs are retained; only source changes invalidate coverage.
             rewritten = bool(git(snapshot, "status", "--porcelain", "--", ".", ":(exclude)target"))
-            rewritten = rewritten or (snapshot / "target").resolve() != retained_target
+            try:
+                rewritten |= target_identity(target) != retained_identity
+            except (OSError, Refusal):
+                rewritten = True
             records = lint_records(output, snapshot)
             if records:
                 with style_ledger.open_ledger(repo) as ledger:
@@ -515,7 +521,7 @@ def handoff_notice(name: str, parent: str, checkpoint: str) -> HandoffDelivery:
     if not address:
         raise Refusal(f"no address for {parent}")
     result = subprocess.run(session_send.send_argv("--to", address, "--from", name,
-        "--text", f"From the showrunner of {name}: hand-off {checkpoint}",
+        "--text", f"hand-off {checkpoint}",
         "--timeout", str(SEND_SECONDS), python_interpreter=PYTHON,
     ), capture_output=True, text=True, check=False, timeout=send_budget.seconds(SEND_SECONDS))
     outcome = send_result.send_outcome(result.returncode, result.stdout)
@@ -601,7 +607,7 @@ def wake_waiters(repo: Path, ticket_id: str) -> None:
                 name = next(production.name for production in productions
                             if unit in {assignment.unit for assignment in production.config.assignments})
                 result = subprocess.run(session_send.send_argv("--to", address, "--from", name,
-                    "--text", f"From the showrunner of {name}: ticket {ticket_id} merged; refill.",
+                    "--text", f"ticket {ticket_id} merged; refill.",
                     "--timeout", str(SEND_SECONDS), python_interpreter=PYTHON,
                 ), capture_output=True, text=True, check=False, timeout=send_budget.seconds(SEND_SECONDS))
                 if result.returncode:

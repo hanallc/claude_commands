@@ -26,7 +26,7 @@ from pathlib import Path
 from scripts.astra import astra_work, design_roles  # noqa: E402
 from scripts.lib import unit_runs
 from scripts.production import staff, worker
-from scripts.direct import progress_history
+from scripts.direct import progress_history, recorder_state
 from scripts.lib.atomic_file import write_text_atomic
 
 MODEL = "gpt-6-astra"
@@ -116,11 +116,12 @@ submitted_review = design_roles.submitted_review
 
 
 def read_review(reply: Path, run: Path) -> int:
-    """Read a completed pass after the caller receives its hook message."""
-    if not progress_history.reply_completed(run, reply):
+    """Read a saved review reply with a matching DONE."""
+    result = progress_history.read_completed_reply(run, reply)
+    if isinstance(result, progress_history.NoValidatedDispatchReply):
         print("astra_review: the review pass is not completed", file=sys.stderr)
         return 1
-    print(reply.read_text(encoding="utf-8").strip())
+    print(result.text.strip())
     print(f"\nSaved: {reply}")
     return 0
 
@@ -138,11 +139,16 @@ def held_review(design: design_roles.HeldDesign, focus: str, work: astra_work.Ph
             return 1
     folder = design_roles.design_directory(design.placement.design_id)
     request = folder / f"review-request-{os.getpid()}-{time.time_ns()}.txt"
-    write_text_atomic(request, f"Review {design.document}.\nFocus: {focus}\n")
     try:
+        if isinstance(work, astra_work.StandaloneWork) and isinstance(design.binding, design_roles.DesignBoundToPhase):
+            _ = astra_work.phase_work(design.binding.run_directory, design.binding.phase)
+        write_text_atomic(request, f"Review {design.document}.\nFocus: {focus}\n")
         submitted = design_roles.resume(design.placement.design_id + "/reviewer", request)
         submitted_review(submitted.reply, submitted.run)
         return 0
+    except recorder_state.OldRecorderState as error:
+        print(error, file=sys.stderr)
+        return 1
     except (OSError, ValueError) as error:
         print(f"astra_review: held reviewer busy or unavailable: {str(error).replace(chr(10), ' ')}", file=sys.stderr)
         return 1
@@ -174,6 +180,9 @@ def main(arguments: list[str]) -> int:
         return 2
     try:
         work = astra_work.phase_work(options["--run-directory"], options["--phase"]) if options else astra_work.StandaloneWork()
+    except recorder_state.OldRecorderState as error:
+        print(error, file=sys.stderr)
+        return 1
     except ValueError as error:
         print(f"astra_review: {str(error).replace(chr(10), ' ')}", file=sys.stderr)
         return 2

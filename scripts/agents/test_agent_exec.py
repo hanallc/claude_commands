@@ -1,6 +1,8 @@
 """Shell launchers select the caller's Claude account or the mapped Codex workers home."""
 from __future__ import annotations
 
+from scripts.lib.helper_tree_test_support import copy_helpers
+
 from scripts.lib.test_models_registry import RegistryReadProbe, write_registry
 from scripts.direct.assign_launcher_test_support import backend_fixture_command
 from scripts.direct import test_claude_worker
@@ -18,7 +20,9 @@ from unittest.mock import patch
 from scripts.lib import models_registry
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.message import sessions
-from scripts.production.staff_test_support import isolated_staff_file, unit_membership, fixture_runtime_id, source_environment
+from scripts.production.staff_test_support import (
+    build_fixture_sessions, fixture_runtime_id, isolated_staff_file, source_environment, unit_membership,
+)
 from scripts.accounts import accounts
 from scripts.lib.nix_env_test_support import NixFixture
 from scripts.whoami.account_test_support import create_claude_account, write_codex_auth
@@ -170,9 +174,7 @@ class ClaudeLauncherTests(unittest.TestCase):
             "STAFF_CONFIG": str(SCRIPTS.parent / "config/staff.conf"),
             "CONF_DIR": str(SCRIPTS.parent / "config"),
             **source_environment(self.home / "sources")}, clear=True)))
-        shim = self.home / ".claude/scripts/lib/py"
-        shim.parent.mkdir(parents=True)
-        shim.symlink_to(SCRIPTS / "lib/py")
+        _ = copy_helpers(self.home)
         _ = (self.home / ".claude.json").write_text("{}")
         for label in ("claude1", "claude3"):
             create_claude_account(label, f"{label}@example.invalid")
@@ -351,8 +353,8 @@ class ClaudeLauncherTests(unittest.TestCase):
         environment = {**self.environment, "UNIT_RUN_DIR": str(parent),
             "PLAN_DELEGATE_BOARD_DIR": str(parent), "UNIT_RUN_ROOT": str(parent),
             "STAFF_FILE": str(paths[1]), "STAFF_ID": "parent-worker",
-            "WORKER_STAFF_ID": "parent-worker", "CODEX_THREAD_ID": "parent-thread",
-            "CLAUDE_CODE_SESSION_ID": "parent-session", "ROSTER_RUN_ROOT": str(parent),
+            "WORKER_STAFF_ID": "parent-worker", **build_fixture_sessions("parent-session"),
+            "ROSTER_RUN_ROOT": str(parent),
             "NOTIFIER_SESSIONS_DIR": str(parent), "UNIT_WORKERS_STATE": str(parent)}
         result = subprocess.run(["bash", str(SCRIPTS / "agents/test_agent_exec.sh")],
                                 env=environment, cwd=self.home, capture_output=True, text=True, check=False)

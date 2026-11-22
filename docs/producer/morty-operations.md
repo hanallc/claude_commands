@@ -1,8 +1,11 @@
 # Local operations
 
 State root: `~/rust/hanadocs/morty`.
-`current.md` holds items. `checkins.json` holds the current schedule, outstanding inquiries, and the active timer.
-Keep only the latest state in both files.
+Write List items through `the_list.py`.
+The assigned producer writes the latest status, next step, and ETA.
+Morty keeps add, close, park, and reassign for all items.
+Read status for items assigned to another producer from The List.
+`checkins.json` holds the current schedule, outstanding inquiries, and the active timer. Keep only its latest state.
 
 ## Records
 
@@ -10,7 +13,6 @@ Read `~/.local/state/staff/staff.json` for showrunner names, parents, and produc
 Query each showrunner with `~/.claude/scripts/lib/py ~/.claude/scripts/production/update_registration.py questions-table --production <showrunner name>`.
 Use the production document from its staff row. Count the returned question rows, including deferred questions.
 The old `outstanding/<showrunner name>.json` files now hold reminders. Never use them to count questions.
-Save the table, count, source and read time in `open-questions.json`.
 Report a failed query as unavailable, never as zero.
 Do not restart the old question-message rotation.
 
@@ -22,6 +24,15 @@ For relevant production queues, use the existing next skill and command:
 
 Resolve root documents from staff. Compare results with the tracking list; they do not replace its priority.
 Route decisions to the owning showrunner, which records its answer.
+
+Read nate's answers before an item says `Waiting for nate`:
+
+```sh
+~/.claude/scripts/lib/py ~/.claude/scripts/production/next_item.py show --id <owner>/C<n> --production <owner>
+~/.claude/scripts/lib/py ~/.claude/scripts/production/next_item.py show --kind question --production <owner>
+```
+
+The first prints a change row's verdict. The second prints the open question; none means nate answered.
 
 ## Messaging
 
@@ -46,7 +57,7 @@ Send at most one pending inquiry per item. Save the expected reply time before s
 Use `send_later.py` to wake morty, not to send an automatic demand to a showrunner.
 
 ```sh
-~/.claude/scripts/lib/py ~/.claude/scripts/message/send_later.py --at 'YYYY-MM-DD HH:MM' -- --to morty --from morty --text 'Read ~/.claude/commands/producer/morty.md. Read current.md and checkins.json. Handle due items from fresh evidence first. Group missing status requests by showrunner. Schedule the next wake.'
+~/.claude/scripts/lib/py ~/.claude/scripts/message/send_later.py --at 'YYYY-MM-DD HH:MM' -- --to morty --from morty --text 'Load /producer:produce, then /producer:morty. Read The List records and checkins.json. Handle due items from fresh evidence first. Group missing status requests by showrunner. Schedule the next wake.'
 ```
 
 Read back the timer with `systemctl --user show <timer> -p NextElapseUSecRealtime`.

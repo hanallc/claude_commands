@@ -12,6 +12,8 @@ import sys
 from typing import cast
 from unittest import mock
 
+from scripts.lib.helper_tree_test_support import verify_test_environment
+from scripts.build_queue import execution_identity
 from scripts.build_targets import test_ssh_eligibility as eligibility_support
 from scripts.build_queue import admission_protocol as wire, placement
 from scripts.build_queue.admission_test_support import caller_provider_controls
@@ -30,36 +32,45 @@ mac_test = eligibility_support.mac_test
 class VerifySshRetainedTests(VerifySshTargetsFixture):
     def test_verify_exit_before_first_memory_hook_fails(self) -> None:
         self.release_memory_after_hook()
-        with subprocess.Popen(["true"], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE) as process, \
+        with subprocess.Popen(["true"],
+                             env=verify_test_environment(), text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE) as process, \
              mock.patch.object(self, "start_verify", return_value=process), \
              self.assertRaisesRegex(self.failureException, "verify exited"):
             _ = self.verify("test", "sample", "--no-cache")
 
-    def test_verify_drains_output_after_memory_hook_settles(self) -> None:
+    def verify_with_memory_hook(
+        self, event: support.CompletedMemoryHook, *, output_size: int = 0,
+    ) -> subprocess.CompletedProcess[str]:
+        """Publish a complete hook event before the fixture can read it."""
         self.release_memory_after_hook()
         command = '''
-printf '%s\\n' '{"left": false, "clock": "", "attempts": 0}' > memory-hook-1
-head -c 8 memory-hook-ack > /dev/null
-exec "$1" -c 'import sys; sys.stdout.write("x" * (128 * 1024))'
+from pathlib import Path
+import sys
+
+from scripts.lib.atomic_file import write_text_atomic
+
+write_text_atomic(Path("memory-hook-1"), sys.argv[1])
+output_size = int(sys.argv[2])
+if output_size:
+    with Path("memory-hook-ack").open() as acknowledgment:
+        assert acknowledgment.read(len("continue")) == "continue"
+    sys.stdout.write("x" * output_size)
 '''
-        with subprocess.Popen(["sh", "-c", command, "memory-hook-output", sys.executable],
+        with subprocess.Popen([sys.executable, "-c", command, json.dumps(event), str(output_size)],
                               cwd=self.runner_state, text=True,
+                              env={**self.environment, "PYTHONPATH": str(support.REPOSITORY)},
                               stdout=subprocess.PIPE, stderr=subprocess.PIPE) as process, \
              mock.patch.object(self, "start_verify", return_value=process):
-            result = self.verify("test", "sample", "--no-cache")
+            return self.verify("test", "sample", "--no-cache")
+
+    def test_verify_drains_output_after_memory_hook_settles(self) -> None:
+        output_size = 128 * 1024
+        result = self.verify_with_memory_hook({"left": False, "clock": "", "attempts": 0}, output_size=output_size)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout, "x" * (128 * 1024))
+        self.assertEqual(result.stdout, "x" * output_size)
 
     def test_verify_returns_when_settled_hook_skips_acknowledgment(self) -> None:
-        self.release_memory_after_hook()
-        command = '''
-printf '%s\\n' '{"left": true, "clock": "", "attempts": 0}' > memory-hook-1
-exit 0
-'''
-        with subprocess.Popen(["sh", "-c", command], cwd=self.runner_state, text=True,
-                              stdout=subprocess.PIPE, stderr=subprocess.PIPE) as process, \
-             mock.patch.object(self, "start_verify", return_value=process):
-            result = self.verify("test", "sample", "--no-cache")
+        result = self.verify_with_memory_hook({"left": True, "clock": "", "attempts": 0})
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def retain_slots(self, old_capacity: int = 2) -> list[Path]:
@@ -179,7 +190,7 @@ steps_path.write_text(json.dumps(steps))
         assert isinstance(refusal.claim, placement.ProviderClaimReference)
         self.assertEqual(refusal.claim.claim_id, first["adopted_claim_ids"][0])
         self.assertNotEqual(refusal.claim.episode, refusal.assignment.episode)
-        saved = self.admission.server.assignments[placement.attempt_key(
+        saved = self.admission.server.assignments[execution_identity.attempt_key(
             refusal.assignment.episode, refusal.assignment.attempt)]
         self.assertEqual(saved.provider, refusal.claim)
         self.assertIsInstance(saved.state, placement.ClosedAssignment)
@@ -280,7 +291,7 @@ raise SystemExit(status)
                 self.assertEqual(self.local_runs(), [])
                 self.assertEqual(meminfo.read_text(), "MemAvailable: 0 kB\n")
                 with self.admission.loop_turn():
-                    saved = self.admission.server.assignments[placement.attempt_key(episode, assignment.attempt)]
+                    saved = self.admission.server.assignments[execution_identity.attempt_key(episode, assignment.attempt)]
                     self.assertIsInstance(saved.permission, placement.PermissionAvailable)
                     self.assertEqual(self.admission.server.placement_requests[episode].since, original_since)
                     peer = self.admission.connect(submitted)

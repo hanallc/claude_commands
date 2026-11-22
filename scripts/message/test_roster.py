@@ -19,7 +19,7 @@ import sys
 import tempfile
 import time
 import unittest
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import AbstractContextManager, ExitStack, redirect_stderr, redirect_stdout
 from dataclasses import FrozenInstanceError, replace
 from datetime import UTC, datetime
@@ -157,7 +157,6 @@ class RosterTests(unittest.TestCase):
         config = self.root / "showrunners.json"
         _ = config.write_text(json.dumps({
             "threshold_percent": 2,
-            "repeat_minutes": 30,
             "stall_minutes": 5,
             "faults_to": "runner",
             "always": [],
@@ -364,7 +363,8 @@ class RosterTests(unittest.TestCase):
         self._write_session(
             "worker", "claude-worker", WORKER_SESSION_ID, worker_cwd, status="idle"
         )
-        _ = fixture_worker("alpha-test", unit.id, runtime_id=WORKER_SESSION_ID)
+        worker = fixture_worker("alpha-test", unit.id, runtime_id=WORKER_SESSION_ID)
+        self.pane_world.add(worker, "w1:p1")
         self._write_session("solo", "solo-director", "22135b22-7da2-5f04-8840-738da7f248ba", solo_cwd, status="waiting")
         self._write_session("free-old", "old-free-name", "abd1a227-f410-5c76-bc96-a0c77c0f3ef0", free_cwd, updated=1)
         self._write_session("free-new", "free-claude", "abd1a227-f410-5c76-bc96-a0c77c0f3ef0", free_cwd, status="ready", updated=2)
@@ -535,7 +535,7 @@ class RosterTests(unittest.TestCase):
             peer.assert_called_once()
             deliver.assert_called_once()
             message = cast(send.Message, deliver.call_args.args[0])
-            self.assertEqual((message.to, message.text), (f"session:{owner.current_session}", "fixture text"))
+            self.assertEqual((message.to, message.text), (f"staff:{owner.id}", "fixture text"))
             with self.assertRaises(SystemExit) as refused:
                 _ = send.send(send.parse(["--to", "bad", "--from", "fixture-reviewer", "--text", "fixture text"]))
             self.assertEqual(refused.exception.code, 2)
@@ -666,7 +666,7 @@ class RosterTests(unittest.TestCase):
         for target in targets:
             registry = mock.Mock(wraps=sessions.read_registry)
             with self.subTest(target=target):
-                previous = f"staff:{owner.id}" if target == owner.name else target
+                previous = f"staff:{owner.id}" if target == owner.name else f"session:{identity}"
                 _ = (state / "keys.json").write_text(json.dumps({"notice": {"last": {previous: started.isoformat()}}}))
                 options = send.parse(["--here", "--to", target, "--from", "fixture", "--text", "Notice",
                                       "--key", "notice", "--repeat-minutes", "30"])
@@ -1112,7 +1112,8 @@ class RosterTests(unittest.TestCase):
             _ = ledger.write(f"{native}\tlate-impl\n")
         modified = previous.read_bytes(), previous.stat().st_mtime_ns
         self.assertEqual(self._entries()[f"session:{native}"].role, "freestanding")
-        _ = fixture_worker("late-impl", unit_membership("alpha", "unit-one").id, runtime_id=native)
+        late = fixture_worker("late-impl", unit_membership("alpha", "unit-one").id, runtime_id=native)
+        self.pane_world.add(late, "w1:p2")
         late_worker = self._entries()["late-impl"]
         self.assertEqual(late_worker.role, "worker")
         self.assertEqual(late_worker.assignment, roster.WorkerAssignment("impl", str(self.director_run), roster.AssignmentUnrecorded(), "impl"))
@@ -1128,6 +1129,8 @@ class RosterTests(unittest.TestCase):
         child = staff.ensure_worker(native, "switched", unit.id)
         native = child.current_session
         self._write_session("switched", "switched-claude", native, self.home / "switched")
+        with mock.patch("scripts.herdr.test_worker_panes.fixture_session"):
+            self.pane_world.add(child, "w1:p2")
         self.assertEqual(sessions.transcript_locations(native), [])
         for transcript in (False, True):
             with self.subTest(transcript=transcript):
@@ -1147,7 +1150,9 @@ class RosterTests(unittest.TestCase):
                 self.assertEqual(recipient.reach, roster.Messageable(f"session:{native}"))
                 route = send.resolve_recipient(f"session:{native}", send.LocalOnly(), observed,
                                                membership=membership)
-                self.assertEqual(route, send.PaneWorkerRecipient(child))
+                self.assertEqual(route, send.ClaudeRecipient(f"session:{native}"))
+                self.assertEqual(send.resolve_recipient(child.name, send.LocalOnly(), observed,
+                                                        membership=membership), send.PaneWorkerRecipient(child))
                 self.assertTrue(broadcast.selects(broadcast.Workers(), recipient))
                 self.assertTrue(broadcast.selects(broadcast.WorkersOfUnit(
                     "session:17e44ec4-3e24-5ae1-b10d-5cf30de9455b", unit.name, recipient.machine), recipient))
@@ -1237,15 +1242,29 @@ class RosterTests(unittest.TestCase):
         self.assertEqual((entry.cwd, entry.status), (solo.get("cwd"), "waiting"))
 
     def test_a_send_by_name_stops_when_the_session_folder_cannot_be_listed(self) -> None:
-        missing = self.root / "no-session-folder"
         membership = staff.snapshot()
-        with mock.patch.dict(os.environ, {"NOTIFIER_SESSIONS_DIR": str(missing)}):
+        iterdir = Path.iterdir
+
+        def list_folder(path: Path) -> Iterator[Path]:
+            if path == self.sessions:
+                raise PermissionError(path)
+            return iterdir(path)
+
+        with mock.patch.object(Path, "iterdir", list_folder):
             result = roster.roster(os.environ, roster.ThisMachine())
-        self.assertIn(f"Claude session records: cannot list {missing}", result.problems)
+        self.assertIn(f"Claude session records: cannot list {self.sessions}", result.problems)
         with mock.patch.object(roster, "peer_roster") as peer:
             found = send.matching_recipients("peer-only", send.LocalThenPeer(), result, membership=membership)
         self.assertIsInstance(found, send.LocalRosterIncomplete)
         peer.assert_not_called()
+
+    def test_roster_reports_every_unreadable_session_record(self) -> None:
+        unreadable = [self.sessions / filename for filename in ("first.json", "second.json")]
+        for path in unreadable:
+            _ = path.write_text("{")
+        result = roster.roster(os.environ, roster.ThisMachine())
+        for path in unreadable:
+            self.assertIn(f"Claude session records: cannot read {path}", result.problems)
 
     def test_a_run_with_an_unreadable_owner_is_a_problem_for_that_run_only(self) -> None:
         run = self.runs / "lost-owner-run"
@@ -1494,7 +1513,7 @@ class RosterTests(unittest.TestCase):
         self.assertEqual(errors.getvalue(), "")
         self.assertEqual(deliver.call_count, 1)
         forwarded = cast(send.Message, deliver.call_args.args[0])
-        self.assertEqual(forwarded.to, 'session:peer-session')
+        self.assertEqual(forwarded.to, 'staff:peer-session')
         self.assertEqual(forwarded.text, 'owner update')
 
     def test_durable_warnings_survive_snapshots_and_do_not_change_roster_exit_status(self) -> None:
@@ -2151,8 +2170,42 @@ class RosterTests(unittest.TestCase):
         self.assertEqual(director.showrunner, roster.UnderShowrunner("alpha", "alpha", "session:acd50bad-5afa-5d3d-b155-3766b7d113e0"))
         self.assertEqual(director.reach, roster.CannotReceiveMessages("no messaging socket"))
 
+    def test_reported_codex_roster_entry_requires_the_proved_owner(self) -> None:
+        from scripts.herdr import worker_panes
+        from scripts.herdr.test_herdr import codex_foreground_cases
+
+        identity = fixture_runtime_id("roster-foreground")
+        home = self.account_note(1)
+        pane = "w1:p1"
+        agent = {"pane_id": pane, "agent": "codex", "agent_status": "working",
+                 "agent_session": herdr.ReportedAgentSession(identity)}
+        with (codex_foreground_cases(self.root) as cases,
+              mock.patch.object(herdr, "live_sessions", return_value=[{"name": "native"}]),
+              mock.patch.object(worker_panes, "agent_inventory", return_value=[agent]),
+              mock.patch.object(herdr, "herdr_processes", return_value=[]),
+              mock.patch.object(herdr.Herdr, "result") as read,
+              mock.patch.object(herdr, "native_process", return_value=herdr.NativeAgentProcess(
+                  herdr.PaneSessionReport(identity), "1", {"CODEX_HOME": str(home)}))):
+            for case in cases:
+                with self.subTest(case=case.name):
+                    read.return_value = {"process_info": case.info}
+                    found = roster._herdr_codex_panes("fixture")  # pyright: ignore[reportPrivateUsage]
+                    self.assertEqual(len(found.entries), 1)
+                    entry = found.entries[0]
+                    if case.owner_proved:
+                        self.assertEqual(entry.thread, roster.CodexThread(identity))
+                        self.assertEqual(entry.reach, roster.Messageable(f"codex:{identity}"))
+                        self.assertEqual(entry.cwd, str(self.root))
+                        self.assertEqual(entry.account, roster.AccountLabel("codex1"))
+                        without = roster._herdr_codex_panes("fixture", worker_threads=[identity])  # pyright: ignore[reportPrivateUsage]
+                        self.assertEqual(without.entries, [])
+                    else:
+                        self.assertEqual(entry.thread, roster.NoCodexThread())
+                        self.assertIsInstance(entry.reach, roster.CannotReceiveMessages)
+                        self.assertEqual(entry.status, "unknown")
+
     def test_interactive_codex_panes_are_appended_without_messaging_addresses(self) -> None:
-        old, current = self.account_note(1), self.account_note(2)
+        old = self.account_note(1)
         responses = self._herdr_sessions()
         responses["--session native agent list"]["stdout"] = json.dumps({"ok": True, "result": {"agents": [
             {"pane_id": "w1:p1", "agent": "codex", "agent_status": "working"},
@@ -2165,16 +2218,41 @@ class RosterTests(unittest.TestCase):
         self._herdr_process(991001, 991000, ["codex"], HERDR_PANE_ID="w1:p1")
         self._herdr_process(991002, 991000, ["zsh"], HERDR_PANE_ID="w1:p1")
         self._herdr_process(991003, 991000, ["zsh"], HERDR_PANE_ID="w1:p3")
+        responses["--session native pane process-info --pane w1:p1"] = {"code": 0, "stdout": json.dumps({
+            "result": {"process_info": {"foreground_processes": [
+                {"pid": 991001, "argv": ["codex"], "cwd": str(self.home)}]}}})}
+        responses["--session native pane process-info --pane w1:p3"] = {"code": 0, "stdout": json.dumps({
+            "result": {"process_info": {"foreground_processes": [{"pid": 991003, "argv": ["zsh"]}]}}})}
+        responses["--session native pane list"] = {"code": 0, "stdout": json.dumps({"result": {"panes": [
+            {"pane_id": "w1:p1", "workspace_id": "w1"}, {"pane_id": "w1:p3", "workspace_id": "w1"}]}})}
+
+        native_process = herdr.native_process
+
+        def read_native(pid: int, kind: str, reported: str = "") -> herdr.NativeAgentProcess:
+            if pid != 991001:
+                return native_process(pid, kind, reported)
+            self.assertEqual(kind, "codex")
+            if not reported:
+                raise ValueError("fixture: no thread report")
+            return herdr.NativeAgentProcess(herdr.PaneSessionReport(reported), "1", {"CODEX_HOME": str(old)})
+
         def process_home(pid: int) -> account.ProcessCodexHome:
             return account.ProcessCodexHome(old if pid == 991001 else current)
+
+        current = self.account_note(2)
         binary = self._herdr_fixture(responses)
-        with mock.patch.object(herdr, "herdr_binary", return_value=binary), \
-             mock.patch.object(account, "process_codex_home", side_effect=process_home) as read_home:
+        with (mock.patch.object(herdr, "herdr_binary", return_value=binary),
+              mock.patch.object(account, "process_codex_home", side_effect=process_home) as read_home,
+              mock.patch.object(herdr, "native_process", side_effect=read_native)):
             entries = self._entries()
             worker = entries["alpha-impl"].thread
             assert isinstance(worker, roster.CodexThread)
-            environment = Path(os.environ["HERDR_PROC"]) / "991001" / "environ"
-            _ = environment.write_bytes(environment.read_bytes() + f"\0CODEX_THREAD_ID={worker.thread_id}".encode())
+            response = herdr.decode_object(responses["--session native agent list"]["stdout"], "fixture agent reply")
+            agents = herdr.json_object(response["result"], "fixture agents")
+            records = herdr.json_items(agents["agents"], "fixture agent list")
+            herdr.json_object(records[0], "fixture agent")["agent_session"] = {"kind": "id", "value": worker.thread_id}
+            responses["--session native agent list"]["stdout"] = json.dumps(response)
+            _ = self._herdr_fixture(responses)
             without_worker = self._entries()
         pane = entries["herdr native:w1:p1"]
         self.assertEqual((pane.kind, pane.role, pane.status, pane.cwd), ("codex", "freestanding", "working", str(self.home)))
@@ -2182,16 +2260,16 @@ class RosterTests(unittest.TestCase):
         self.assertEqual((pane.showrunner, pane.director, pane.assignment),
                          (roster.NoShowrunner(), roster.NoDirector(), roster.NotAWorker()))
         self.assertEqual(pane.account, roster.AccountLabel("codex1"))
-        self.assertIsInstance(entries["herdr native:w1:p3"].account, roster.AccountUnread)
-        reported = entries["herdr native:w1:p3"]
-        self.assertEqual(reported.thread, roster.CodexThread("private-pane-thread"))
-        self.assertEqual(reported.reach, roster.Messageable("codex:private-pane-thread"))
-        self.assertEqual(reported.pane, herdr.HerdrPlace("native", "w1:p3"))
-        self.assertIsInstance(reported.daemon, roster.NotDaemonSession)
         self.assertIn(mock.call(991001), read_home.call_args_list)
         self.assertNotIn(mock.call(991002), read_home.call_args_list)
         self.assertNotIn(mock.call(991003), read_home.call_args_list)
-        self.assertEqual(entries["herdr native:w1:p3"].cwd, str(self.home))
+        self.assertIsInstance(entries["herdr native:w1:p3"].account, roster.AccountUnread)
+        reported = entries["herdr native:w1:p3"]
+        self.assertEqual(reported.thread, roster.NoCodexThread())
+        self.assertEqual(reported.reach, roster.CannotReceiveMessages("interactive Codex in a herdr pane"))
+        self.assertEqual(reported.pane, herdr.HerdrPlace("native", "w1:p3"))
+        self.assertIsInstance(reported.daemon, roster.NotDaemonSession)
+        self.assertEqual((reported.status, reported.cwd), ("unknown", ""))
         self.assertNotIn("herdr native:w1:p2", entries)
         self.assertNotIn("herdr native:w1:p1", without_worker)
         self.assertIn("herdr native:w1:p3", without_worker)
@@ -2231,10 +2309,11 @@ class RosterTests(unittest.TestCase):
                     self.assertIsInstance(pane.thread, roster.NoCodexThread)
                     self.assertEqual(pane.reach, roster.CannotReceiveMessages("interactive Codex in a herdr pane"))
                 self.assertEqual(pane.pane, herdr.HerdrPlace("native", "w1:p5"))
-                self.assertEqual(reported.thread, roster.CodexThread("reported-thread"))
-                self.assertEqual(reported.reach, roster.Messageable("codex:reported-thread"))
+                self.assertEqual(reported.thread, roster.NoCodexThread())
+                self.assertEqual(reported.reach, roster.CannotReceiveMessages("interactive Codex in a herdr pane"))
+                self.assertEqual(reported.status, "unknown")
         commands = [cast(list[str], json.loads(line)) for line in (self.root / "herdr.jsonl").read_text().splitlines()]
-        self.assertNotIn(["--session", "native", "pane", "process-info", "--pane", "w1:p6"], commands)
+        self.assertIn(["--session", "native", "pane", "process-info", "--pane", "w1:p6"], commands)
 
     @process_boundary
     def test_a_herdr_failure_is_a_problem_and_keeps_the_other_roster_rows(self) -> None:
@@ -2803,6 +2882,34 @@ class RosterTests(unittest.TestCase):
 
 
 class PaneRosterTests(StaffTestCase):
+    def test_worker_with_an_unreadable_pane_list_cannot_use_its_registry_route(self) -> None:
+        fixture = self.row_production()
+        worker = fixture_worker("unproved", fixture.unit.id, backend=staff.ClaudeBackend())
+        _ = self.session_record(worker.current_session, "registry-copy")
+        world = PaneWorld()
+        world.add(fixture.unit, "w1:p0")
+        config = self.root / "config"
+        config.mkdir()
+        write_text_atomic(config / "direct.conf", "# Worker settings.\n")
+        write_machine_config(config)
+        with (mock.patch.dict(os.environ, {"CONF_DIR": str(config)}),
+              mock.patch.object(worker_panes, "_client", return_value=world),
+              mock.patch.object(worker_panes, "observe_parents", return_value={
+                  fixture.unit.id: [worker_panes.UncertainWorker(worker, "cannot list panes")],
+                  fixture.runner.id: [],
+              }) as observe,
+              mock.patch.object(herdr, "live_sessions", return_value=[]),
+              mock.patch.object(codex_daemon, "read_daemons", return_value=[])):
+            for failure in ("cannot list panes", "cannot open herdr"):
+                with self.subTest(failure=failure):
+                    if failure == "cannot open herdr":
+                        observe.side_effect = herdr_types.HerdrMissing(failure)
+                    result = roster.roster(os.environ, roster.ThisMachine())
+                    entry, = [entry for entry in result.entries if entry.role == "worker"
+                              and entry.session == roster.ClaudeSession(worker.current_session)]
+                    self.assertIn(failure, entry.status)
+                    self.assertIsInstance(entry.reach, roster.CannotReceiveMessages)
+
     def test_missing_herdr_keeps_session_entries_and_reports_pane_workers(self) -> None:
         fixture = self.row_production()
         _ = self.session_record(fixture.unit.current_session, "director")
@@ -2834,6 +2941,7 @@ class PaneRosterTests(StaffTestCase):
         world.add(rows[3], "w1:p4")
         world.locations["w1:p1"]["agent_status"] = "working"
         _ = self.session_record(rows[0].current_session, "registry-copy")
+        _ = self.session_record(rows[3].current_session, "unproved-registry-copy")
         config = self.root / "config"
         config.mkdir()
         write_text_atomic(config / "direct.conf", "# Worker settings.\n")

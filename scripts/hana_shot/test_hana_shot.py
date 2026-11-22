@@ -32,6 +32,7 @@ from scripts.buildlog import store
 from scripts.hana_shot import hana_shot
 from scripts.lib import conf, process_group
 from scripts.lib import scratch as scratch_folders
+from scripts.lib.git_test_support import fixture_git_environment
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
 from scripts.production import staff
@@ -355,15 +356,24 @@ class BuildLogIsolatedTest(unittest.TestCase):
     @override
     def setUp(self) -> None:
         super().setUp()
-        self.scratch = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
-        settings = "capture_timeout_seconds=1\n"
+        self.scratch = Path(tempfile.mkdtemp(prefix="hana-shot-fixture-")).resolve()
+        self.addCleanup(shutil.rmtree, self.scratch)
+        settings = "capture_timeout_seconds=1\nhost=127.0.0.1\ndirty_path_limit=10\n"
         if self._testMethodName == "test_screenshot_busy_past_the_resend_limit_fails":
             settings += "resend_seconds=0.05\n"
         _ = write_config_fixture(self.scratch / "config/hana_shot.conf", settings)
+        environment = fixture_git_environment(self.scratch)
+        for name in ("BASH_ENV", "STAFF_CONFIG"):
+            _ = environment.pop(name, None)
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
+            **environment,
             **config_environment(self.scratch / "config"),
             "BUILDLOG_DIR": str(self.scratch / "buildlog"),
-        })))
+            "HOME": str(self.scratch / "home"),
+            "XDG_CACHE_HOME": str(self.scratch / "cache"),
+            "SCRATCH_ROOT": str(self.scratch / "scratch-root"),
+            "SESSION_TEMP_ROOT": str(self.scratch / "session-root"),
+        }, clear=True)))
 
 
 class FixtureServer(ThreadingHTTPServer):
@@ -503,7 +513,9 @@ except SystemExit as error:
 import scripts.buildlog.record
 """
         environment = {key: value for key, value in os.environ.items() if key != "PYTHONPATH"}
-        with tempfile.TemporaryDirectory() as folder:
+        root = Path(tempfile.mkdtemp(prefix="hana-shot-import-fixture-")).resolve()
+        self.addCleanup(shutil.rmtree, root)
+        with tempfile.TemporaryDirectory(dir=root) as folder:
             result = subprocess.run([sys.executable, "-c", source, str(SCRIPT.resolve())],
                                     cwd=folder, env=environment, capture_output=True, text=True,
                                     check=False, timeout=TEST_HANG_GUARD_SECS)
@@ -945,7 +957,7 @@ class LaunchBuildWarningTests(BuildLogIsolatedTest):
         ])
 
     def test_non_git_root_does_not_block_launch_check(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory(dir=self.scratch) as directory:
             self.assertEqual(hana_shot.uncommitted_build_paths(Path(directory), self.executable), [])
 
     def test_git_timeout_or_unavailable_git_does_not_block_launch_check(self) -> None:
@@ -986,8 +998,8 @@ class LaunchBuildWarningTests(BuildLogIsolatedTest):
             self.assertEqual(word, "hana-shot-15797")
             # Git status has already run; replace only the subsequent Hana start.
             _ = self.enterContext(mock.patch.object(subprocess, "Popen", side_effect=start_stub))
-            scratch = self.root / "scratch"
-            scratch.mkdir()
+            scratch = Path(os.environ["SCRATCH_ROOT"]) / word
+            scratch.mkdir(parents=True)
             return scratch
 
         with (
@@ -1030,8 +1042,8 @@ class LaunchRecordRecoveryTests(HanaShotTest):
         _ = self.executable.write_bytes(b"fixture binary; never execute")
 
     def launch_without_starting_hana(self, *, owner: str = "") -> hana_shot.LaunchState:
-        launch_scratch = self.scratch / "new-launch-scratch"
-        launch_scratch.mkdir()
+        launch_scratch = Path(os.environ["SCRATCH_ROOT"]) / f"hana-shot-{self.port}"
+        launch_scratch.mkdir(parents=True)
         process = cast(subprocess.Popen[bytes], mock.Mock(pid=424242))
 
         def start(command: list[str], **kwargs: object) -> subprocess.Popen[bytes]:
@@ -1119,7 +1131,7 @@ class LaunchRecordRecoveryTests(HanaShotTest):
         self.assertFalse(default_root.exists())
         self.assertEqual(exit_code, 0, diagnostics)
         self.assertFalse(self.state_path.exists())
-        self.assertFalse(Path(state["scratch"]).exists())
+        self.assertTrue(Path(state["scratch"]).is_dir())
         rows = list((isolated_root / store.host_name()).glob("*.jsonl"))
         if rows:
             self.assertIn(str(self.executable), "".join(path.read_text() for path in rows))
@@ -1183,6 +1195,7 @@ class LaunchRecordRecoveryTests(HanaShotTest):
             ):
                 _ = self.launch_without_starting_hana()
 
+        self.assertFalse((Path(os.environ["SCRATCH_ROOT"]) / f"hana-shot-{self.port}").exists())
         self.assertEqual(list(self.state_path.parent.iterdir()), [])
         self.restart_fake_listener()
         exit_code, diagnostics = self.shutdown_command()
@@ -1205,7 +1218,104 @@ class LaunchRecordRecoveryTests(HanaShotTest):
         self.assertTrue(other_port.exists())
         self.assertTrue(unrelated.exists())
 
-    def test_whole_launch_record_still_waits_for_pid_and_removes_scratch(self) -> None:
+    def test_shutdown_archives_other_temporary_records_and_never_signals_their_pid(self) -> None:
+        current = self.scratch / "current-launch"
+        different = self.scratch / "different-launch"
+        current.mkdir()
+        different.mkdir()
+        state: hana_shot.LaunchState = {
+            "pid": 424242, "binary": str(self.executable), "log": str(current / "hana.log"),
+            "scratch": str(current), "port": self.port, "started": "2026-10-29T00:00:00+00:00",
+        }
+        _ = self.state_path.write_text(json.dumps(state))
+        same = self.state_path.with_name(f".{self.state_path.name}.same.tmp")
+        _ = same.write_text(json.dumps(state))
+        incomplete = self.state_path.with_name(f".{self.state_path.name}.incomplete.tmp")
+        _ = incomplete.write_text('{"pid": 1, "po')
+        other_state = json.dumps({**state, "pid": 111111, "scratch": str(different),
+                                   "log": str(different / "hana.log")})
+        kept = [self.state_path.with_name(f".{self.state_path.name}.{suffix}.tmp") for suffix in ("one", "two")]
+        for path in kept:
+            _ = path.write_text(other_state)
+
+        with mock.patch.object(hana_shot, "process_alive", return_value=False) as alive:
+            exit_code, diagnostics = self.shutdown_command()
+
+        self.assertEqual(exit_code, 0, diagnostics)
+        alive.assert_called_once_with(state["pid"])
+        self.assertFalse(self.state_path.exists())
+        self.assertFalse(same.exists())
+        self.assertFalse(incomplete.exists())
+        self.assertTrue(current.is_dir())
+        self.assertTrue(different.is_dir())
+        for path in kept:
+            self.assertFalse(path.exists())
+        retained = self.state_path.parent / "retained"
+        records = [path.read_text() for path in retained.glob("*.json")]
+        self.assertCountEqual(records, [json.dumps(state), other_state, other_state])
+        notice = f"kept for a manual removal list: {different} (hana_shot, temporary launch record kept)"
+        self.assertEqual(diagnostics.splitlines().count(notice), 1)
+
+        with (
+            mock.patch.object(hana_shot.Brp, "call", side_effect=hana_shot.Failure("no listener")),
+            mock.patch.object(hana_shot, "port_answers", return_value=False),
+            mock.patch.object(hana_shot, "process_alive", return_value=True) as live,
+            mock.patch.object(hana_shot, "same_binary", return_value=True) as identity,
+            mock.patch.object(process_group, "send_process_group") as send,
+            mock.patch.object(time, "monotonic", side_effect=[0.0, 0.0, 21.0]),
+            mock.patch.object(time, "sleep"),
+        ):
+            exit_code, diagnostics = self.shutdown_command()
+
+        self.assertEqual(exit_code, 0, diagnostics)
+        self.assertIn(f"no Hana answered on port {self.port}", diagnostics)
+        live.assert_not_called()
+        identity.assert_not_called()
+        send.assert_not_called()
+        self.assertCountEqual([path.read_text() for path in retained.glob("*.json")], records)
+
+    def test_instance_removes_the_folder_of_its_own_launch(self) -> None:
+        self.stop_fake_listener()
+        state = self.launch_without_starting_hana(owner="fixture")
+        folder = Path(state["scratch"])
+        process = cast(subprocess.Popen[bytes], mock.Mock(pid=state["pid"], poll=mock.Mock(return_value=0)))
+        with (mock.patch.object(hana_shot, "launch", return_value=(state, process)),
+              mock.patch.object(hana_shot.Brp, "call", return_value={}),
+              redirect_stderr(io.StringIO())):
+            with hana_shot.instance(self.port, True, True, str(self.root), str(self.executable)):
+                self.assertTrue(folder.is_dir())
+        self.assertFalse(folder.exists())
+        self.assertEqual(list(self.state_path.parent.iterdir()), [])
+
+    def test_shutdown_keeps_canaries_and_each_launch_record(self) -> None:
+        home = Path.home()
+        owned = Path(os.environ["SCRATCH_ROOT"]) / f"hana-shot-{self.port}"
+        for parent in (home, home / "rust", home / "worktrees", home / ".claude", owned.parent):
+            with self.subTest(parent=parent):
+                folder = parent / owned.name
+                folder.mkdir(parents=True)
+                note = folder / "keep"
+                _ = note.write_text("fixture data")
+                _ = self.state_path.write_text(json.dumps({
+                    "pid": 424242, "binary": str(self.executable), "log": str(folder / "hana.log"),
+                    "scratch": str(folder),
+                }))
+                with (mock.patch.object(hana_shot.Brp, "call", return_value={}),
+                      mock.patch.object(hana_shot, "process_alive", return_value=False),
+                      redirect_stderr(io.StringIO()) as error):
+                    hana_shot.shutdown(self.port)
+                lines = [line for line in error.getvalue().splitlines()
+                         if line.startswith("kept for a manual removal list:")]
+                self.assertEqual(lines, [f"kept for a manual removal list: {folder} (hana_shot, Hana shut down)"])
+                self.assertEqual(note.read_text(), "fixture data")
+                self.assertFalse(self.state_path.exists())
+        retained = self.state_path.parent / "retained"
+        records = [cast(dict[str, object], json.loads(path.read_text())) for path in retained.glob("*.json")]
+        self.assertCountEqual([record["scratch"] for record in records],
+                              [str(parent / owned.name) for parent in
+                               (home, home / "rust", home / "worktrees", home / ".claude", owned.parent)])
+
+    def test_whole_launch_record_waits_for_pid_and_keeps_scratch(self) -> None:
         self.stop_fake_listener()
         state = self.launch_without_starting_hana()
         self.restart_fake_listener()
@@ -1228,14 +1338,14 @@ class LaunchRecordRecoveryTests(HanaShotTest):
 
         self.assertEqual(exit_code, 0, diagnostics)
         self.assertEqual(pid_checks, [state["pid"], state["pid"]])
-        self.assertFalse(scratch.exists())
+        self.assertTrue(scratch.is_dir())
         self.assertFalse(self.state_path.exists())
         self.assertIn("fixture panic: preserved diagnostic", diagnostics)
         self.assertNotIn("unreadable", diagnostics)
 
     def test_shutdown_recovers_newest_whole_temporary_record_and_checks_binary_before_killing(self) -> None:
-        scratch = self.scratch / "interrupted-launch"
-        scratch.mkdir()
+        scratch = Path(os.environ["SCRATCH_ROOT"]) / f"hana-shot-{self.port}"
+        scratch.mkdir(parents=True)
         log = scratch / "hana.log"
         _ = log.write_text("temporary launch panic: kept diagnostic\n")
         state: hana_shot.LaunchState = {
@@ -1275,8 +1385,8 @@ class LaunchRecordRecoveryTests(HanaShotTest):
         self.assertEqual(self.fake.methods("brp_extras/shutdown"), [{}])
         alive.assert_called_once_with(state["pid"])
         self.assertEqual(signals, [(state["pid"], signal.SIGTERM), (state["pid"], signal.SIGKILL)])
-        self.assertFalse(scratch.exists())
-        self.assertEqual(list(self.state_path.parent.iterdir()), [])
+        self.assertTrue(scratch.is_dir())
+        self.assertEqual(list(self.state_path.parent.iterdir()), [self.state_path.parent / "retained"])
         self.assertIn("temporary launch panic: kept diagnostic", diagnostics)
 
     def test_parent_that_exits_on_sigterm_still_gets_sigkill_for_its_group(self) -> None:
@@ -1303,8 +1413,8 @@ class LaunchRecordRecoveryTests(HanaShotTest):
 
     def test_shutdown_never_kills_recovered_pid_when_binary_identity_changed(self) -> None:
         self.stop_fake_listener()
-        scratch = self.scratch / "reused-pid-scratch"
-        scratch.mkdir()
+        scratch = Path(os.environ["SCRATCH_ROOT"]) / f"hana-shot-{self.port}"
+        scratch.mkdir(parents=True)
         temporary = self.state_path.with_name(f".{self.state_path.name}.whole.tmp")
         _ = temporary.write_text(json.dumps({
             "pid": 424242, "binary": str(self.executable),
@@ -1322,7 +1432,7 @@ class LaunchRecordRecoveryTests(HanaShotTest):
         self.assertEqual(exit_code, 0, diagnostics)
         identity.assert_called_once_with(424242, str(self.executable))
         self.assertFalse(temporary.exists())
-        self.assertFalse(scratch.exists())
+        self.assertTrue(scratch.is_dir())
         self.assertIn(f"Hana on port {self.port} shut down", diagnostics)
 
         sleep_binary = shutil.which("sleep")
@@ -1396,7 +1506,7 @@ class PortGuardTests(HanaShotTest):
         environment = self.script_environment()
         _ = environment.pop("PYTHONPATH", None)
         result = subprocess.run(
-            [str(SCRIPT.resolve().parents[1] / "lib/py"), "--isolated", str(SCRIPT.resolve()), "targets", "--port", str(self.port)],
+            [str(SCRIPT.resolve().parents[1] / "lib/py"), "--isolated", "-B", str(SCRIPT.resolve()), "targets", "--port", str(self.port)],
             cwd=self.scratch, env=environment, capture_output=True, text=True,
             timeout=TEST_HANG_GUARD_SECS, check=False,
         )

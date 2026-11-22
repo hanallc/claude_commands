@@ -34,6 +34,11 @@ class PendingDispatchTests(unittest.TestCase):
                 root = Path(directory)
                 paths = mac_test.StatePaths(root / "provider")
                 paths.directory.mkdir()
+                (root / "mac_test.conf").touch()
+                _ = (root / "build_targets.conf").write_text(
+                    "targets=mac\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n",
+                    encoding="utf-8",
+                )
                 owner = process_identity.process_start(os.getpid())
                 if not isinstance(owner, process_identity.Started):
                     self.fail("The test process has no checked start identity")
@@ -90,7 +95,8 @@ class PendingDispatchTests(unittest.TestCase):
                     self.assertTrue(select.select([ready_fd], [], [], test_hang_guard.TEST_HANG_GUARD_SECS)[0])
                     self.assertEqual(os.read(ready_fd, 5), b"ready")
                     before = paths.run.read_bytes()
-                    with mock.patch.object(controller, "capture", side_effect=release) as provider_release:
+                    with mock.patch.dict(os.environ, {"CONF_DIR": str(root), "MAC_TEST_STATE_DIR": str(paths.directory)}), \
+                         mock.patch.object(controller, "capture", side_effect=release) as provider_release:
                         result = offload.release_claim(controller)
                         self.assertIsInstance(result, offload.ClaimReleaseUnconfirmed)
                         self.assertEqual(paths.run.read_bytes(), before)

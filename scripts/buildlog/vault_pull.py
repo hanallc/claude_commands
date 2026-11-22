@@ -68,8 +68,21 @@ class MacUnreachable:
 
 
 @dataclass(frozen=True)
+class IndexLockIdentity:
+    """The device, inode and birth time of the Mac index lock."""
+
+    value: str
+
+
+@dataclass(frozen=True)
+class UnidentifiedIndexLock:
+    """The remote command could not identify the lock file."""
+
+
+@dataclass(frozen=True)
 class VaultLocked:
     detail: str
+    identity: IndexLockIdentity | UnidentifiedIndexLock = UnidentifiedIndexLock()
 
 
 @dataclass(frozen=True)
@@ -95,11 +108,23 @@ class NeverPulled:
 
 
 @dataclass(frozen=True)
+class ObservedIndexLock:
+    identity: IndexLockIdentity | UnidentifiedIndexLock
+    first_seen: float
+
+
+@dataclass(frozen=True)
+class NoIndexLockObservation:
+    """The outage has no current lock observation."""
+
+
+@dataclass(frozen=True)
 class OpenOutage:
     cause: StopCause
     since: float
     asked: bool
     detail: str
+    index_lock: ObservedIndexLock | NoIndexLockObservation = NoIndexLockObservation()
 
 
 @dataclass(frozen=True)
@@ -117,6 +142,12 @@ class VaultState:
 REMOTE_PULL = """export LC_ALL=C
 outcome() { printf 'VAULT_OUTCOME=%s\\n' "$1"; exit 0; }
 g() { git -C rust/hanadocs "$@"; }
+report_index_lock() {
+  index_path=$(g rev-parse --path-format=absolute --git-path index 2>/dev/null) || return
+  identity=$(stat -f '%d:%i:%FB' "$index_path.lock" 2>/dev/null) ||
+    identity=$(stat -c '%d:%i:%W' "$index_path.lock" 2>/dev/null) || return
+  printf 'VAULT_INDEX_LOCK=%s\\n' "$identity"
+}
 retry_git() {
   retries_left=${vault_lock_retries:-0}
   while :; do
@@ -127,6 +158,7 @@ retry_git() {
       *"index.lock"*"File exists"*|*"File exists"*"index.lock"*)
         if [ "$retries_left" -le 0 ]; then
           printf '%s\\n' "$output" >&2
+          report_index_lock
           outcome locked
         fi
         retries_left=$((retries_left - 1))
@@ -216,6 +248,12 @@ def marked(stdout: str, prefix: str) -> tuple[str, ...]:
     return tuple(line.removeprefix(prefix) for line in stdout.splitlines() if line.startswith(prefix))
 
 
+def index_lock_identity(value: object) -> IndexLockIdentity | UnidentifiedIndexLock:
+    if isinstance(value, str) and re.fullmatch(r"[0-9]+:[0-9]+:[1-9][0-9]*(?:\.[0-9]+)?", value):
+        return IndexLockIdentity(value)
+    return UnidentifiedIndexLock()
+
+
 def remote_outcome(result: subprocess.CompletedProcess[str]) -> MacMerged | PullStop:
     markers = marked(result.stdout, "VAULT_OUTCOME=")
     if len(markers) == 1:
@@ -223,7 +261,9 @@ def remote_outcome(result: subprocess.CompletedProcess[str]) -> MacMerged | Pull
         if value == "branch":
             return NotOnMain()
         if value == "locked":
-            return VaultLocked(result.stderr.strip())
+            identities = marked(result.stdout, "VAULT_INDEX_LOCK=")
+            identity = index_lock_identity(identities[0]) if len(identities) == 1 else UnidentifiedIndexLock()
+            return VaultLocked(result.stderr.strip(), identity)
         if value == "conflict":
             return VaultConflict(marked(result.stdout, "VAULT_CONFLICT="))
         merged = re.fullmatch(r"merged:([0-9]+):([0-9a-f]{40}|[0-9a-f]{64})", value)
@@ -300,10 +340,27 @@ def state_path() -> Path:
     return store.root() / STATE_NAME
 
 
-def timestamp(value: object) -> float | NeverPulled:
+@dataclass(frozen=True)
+class NoSavedTimestamp:
+    """The saved value has no valid time."""
+
+
+def timestamp(value: object) -> float | NoSavedTimestamp:
     if isinstance(value, (float, int)) and not isinstance(value, bool) and math.isfinite(value) and value >= 0:
         return float(value)
-    return NeverPulled()
+    return NoSavedTimestamp()
+
+
+def read_index_lock(value: object) -> ObservedIndexLock | NoIndexLockObservation:
+    if isinstance(value, dict):
+        fields = cast(dict[str, object], value)
+        first_seen = timestamp(fields.get("first_seen"))
+        if isinstance(first_seen, float) and "identity" in fields:
+            raw_identity = fields["identity"]
+            identity = index_lock_identity(raw_identity)
+            if raw_identity is None or isinstance(identity, IndexLockIdentity):
+                return ObservedIndexLock(identity, first_seen)
+    return NoIndexLockObservation()
 
 
 def read_state() -> VaultState:
@@ -315,7 +372,7 @@ def read_state() -> VaultState:
         return VaultState(NeverPulled(), NoOutage())
     fields = cast(dict[str, object], value)
     good = timestamp(fields.get("last_good"))
-    last_good = good if isinstance(good, NeverPulled) else LastGoodPull(good)
+    last_good = NeverPulled() if isinstance(good, NoSavedTimestamp) else LastGoodPull(good)
     raw_outage = fields.get("outage")
     if isinstance(raw_outage, dict):
         outage = cast(dict[str, object], raw_outage)
@@ -325,7 +382,8 @@ def read_state() -> VaultState:
             detail = outage.get("detail", "")
             return VaultState(last_good, OpenOutage(
                 cause if isinstance(cause, str) and cause in STOP_CAUSES else "command_failed",
-                since, outage.get("asked") is True, detail if isinstance(detail, str) else ""))
+                since, outage.get("asked") is True, detail if isinstance(detail, str) else "",
+                read_index_lock(outage.get("index_lock"))))
     return VaultState(last_good, NoOutage())
 
 
@@ -333,10 +391,16 @@ def write_state(state: VaultState) -> None:
     path = state_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     outage = state.outage
+    stored_outage: dict[str, object] | None = None
+    if isinstance(outage, OpenOutage):
+        stored_outage = {"cause": outage.cause, "since": outage.since, "asked": outage.asked, "detail": outage.detail}
+        if isinstance(outage.index_lock, ObservedIndexLock):
+            identity = outage.index_lock.identity
+            stored_outage["index_lock"] = {"identity": identity.value if isinstance(identity, IndexLockIdentity) else None,
+                                           "first_seen": outage.index_lock.first_seen}
     data = {
         "last_good": state.last_good.at if isinstance(state.last_good, LastGoodPull) else None,
-        "outage": {"cause": outage.cause, "since": outage.since, "asked": outage.asked, "detail": outage.detail}
-        if isinstance(outage, OpenOutage) else None,
+        "outage": stored_outage,
     }
     write_text_atomic(path, json.dumps(data) + "\n")
 
@@ -425,6 +489,15 @@ def vault() -> int:
         return _vault_locked()
 
 
+def observe_index_lock(outcome: PullStop, previous: ObservedIndexLock | NoIndexLockObservation,
+                       now: float) -> ObservedIndexLock | NoIndexLockObservation:
+    if not isinstance(outcome, VaultLocked):
+        return NoIndexLockObservation()
+    if isinstance(previous, ObservedIndexLock) and previous.identity == outcome.identity:
+        return previous
+    return ObservedIndexLock(outcome.identity, now)
+
+
 def _vault_locked() -> int:
     path = state_path()
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -433,7 +506,10 @@ def _vault_locked() -> int:
         outcome = pull()
         now = time.time()
         if isinstance(outcome, DeferredSync):
-            write_state(replace(state, last_good=LastGoodPull(now)))
+            outage = state.outage
+            if isinstance(outage, OpenOutage):
+                outage = replace(outage, index_lock=NoIndexLockObservation())
+            write_state(VaultState(LastGoodPull(now), outage))
             print("buildlog vault: " + outcome.reason)
             return 0
         if isinstance(outcome, (Pulled, Current)):
@@ -446,9 +522,13 @@ def _vault_locked() -> int:
         cause, reason, question = stop_details(outcome)
         previous = state.outage
         outage = replace(previous, cause=cause, detail=reason) if isinstance(previous, OpenOutage) else OpenOutage(cause, now, False, reason)
+        index_lock = observe_index_lock(outcome, outage.index_lock, now)
+        outage = replace(outage, index_lock=index_lock)
         last_good = state.last_good.at if isinstance(state.last_good, LastGoodPull) else outage.since
         sleeping = isinstance(outcome, MacUnreachable) and now - last_good < UNREACHABLE_GRACE_S
-        if isinstance(previous, OpenOutage) and not outage.asked and not sleeping:
+        retrying_lock = isinstance(index_lock, ObservedIndexLock) and (
+            now - index_lock.first_seen < conf.read("build_targets").number("vault.lock_question_age_s"))
+        if isinstance(previous, OpenOutage) and not outage.asked and not sleeping and not retrying_lock:
             outage = replace(outage, asked=True)
             write_state(replace(state, outage=outage))
             if not ask_question(reason, question, outage.since):
@@ -457,6 +537,8 @@ def _vault_locked() -> int:
         else:
             write_state(replace(state, outage=outage))
         description = "Mac unreachable; the next hour retries" if sleeping else " ".join(reason.splitlines())
+        if retrying_lock:
+            description += "; the next hour retries"
         print("buildlog vault: stopped: " + description)
-        return 0 if sleeping or (not isinstance(outcome, VaultCommandFailed)
+        return 0 if sleeping or retrying_lock or (not isinstance(outcome, VaultCommandFailed)
                                  and (outage.asked or isinstance(previous, NoOutage))) else 1

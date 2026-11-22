@@ -100,7 +100,8 @@ The showrunner staff row gives its path. The row's `name` is the production name
 - **Showrunner checkout:** <path, on the merge branch>
 - **Log:** <repo-relative path> — git-excluded; one line per event
 - **Merge tests:** <backticked commands for the showrunner checkout on every merge,
-  in addition to the changed packages' tests.
+  in addition to the changed packages' tests. The nightly run checks types.
+  Exclude type checks from Merge tests.
   Use `bash ~/.claude/scripts/direct/verify.sh test app`, for example.
   Text after the first unbackticked `(` is commentary>; `—` if none. Each command runs with no shell;
   `~` and `$VAR` expand. Its first word must be on PATH or an executable file in the
@@ -272,7 +273,7 @@ A run that stopped, failed, or waits on a decision has no finish in its record, 
    `<YYYY-MM-DDTHH:MM>`. State the time the recorder printed.
 
    ```
-   From <unit>: phase <N> checkpoint <hash> — <title>. Shots: <paths | none, no visible change>. Phase <next> ETA: <HH:MM zone>
+   phase <N> checkpoint <hash> — <title>. Shots: <paths | none, no visible change>. Phase <next> ETA: <HH:MM zone>
    review trial: ux <N> findings, code <N> findings, review-worker minutes <M>, ux check minutes <U>, ux repair minutes <R>
    design check: <pass | N defects, each moved to <phase>> — fresh check on exactly these shots, built from <hash>
    ```
@@ -285,7 +286,7 @@ A run that stopped, failed, or waits on a decision has no finish in its record, 
    The shrink notice has this form:
 
    ```
-   From <unit>: phase <N> shrink <hash> — plan doc only.
+   phase <N> shrink <hash> — plan doc only.
    ```
 
    When the commit also carries the approved next-items file, the notice ends

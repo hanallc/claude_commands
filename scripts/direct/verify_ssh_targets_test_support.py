@@ -76,8 +76,8 @@ def main(arguments):
     root = Path(os.environ["TEST_RUNNER_STATE"])
     request_placement = admission_client.request_placement
 
-    def observe(request):
-        reply = request_placement(request)
+    def observe(request, **options):
+        reply = request_placement(request, **options)
         events = root / "ssh-events.jsonl"
         attempts = len(events.read_text().splitlines()) if events.exists() else 0
         if attempts < int(os.environ.get("TEST_OBSERVE_AFTER_ATTEMPTS", "0")):
@@ -122,7 +122,7 @@ from unittest import mock
 source = Path(os.environ["TEST_SOURCE_REPO"])
 with open(source / "scripts/lib/package_root.py") as package_root: exec(package_root.read(), {"__file__": package_root.name})
 from scripts.mac_test import eligibility, offload, mac_test, claim_state
-from scripts.build_queue import admission_protocol as queue_wire, placement
+from scripts.build_queue import admission_protocol as queue_wire, execution_identity, placement
 
 args = offload.parser().parse_args(namespace=offload.CliArguments())
 request = offload.request_from_arguments(args)
@@ -201,7 +201,7 @@ def copy_source(*arguments):
     actions.append("source-copy")
     if isinstance(request.placement, offload.AssignedOffloadRequest):
         source = request.placement.assignment.source_key
-        return offload.CopiedTree(offload.KnownTreeKey(source.key) if isinstance(source, placement.SourceKeyKnown)
+        return offload.CopiedTree(offload.KnownTreeKey(source.key) if isinstance(source, execution_identity.SourceKeyKnown)
                                   else offload.UNAVAILABLE_TREE_KEY)
     return offload.CopiedTree(offload.KnownTreeKey("sent-tree"))
 

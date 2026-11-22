@@ -31,6 +31,7 @@ from unittest import mock
 SCRIPTS = Path(__file__).resolve().parents[1]
 
 from scripts.mac_test import eligibility, claim_state, mac_test, offload
+from scripts.mac_test.offload_test_support import split_mac_run_command
 from scripts.build_hold import owning_session as session_owner
 from scripts.build_targets import targets
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
@@ -105,6 +106,7 @@ class RepositorySlotTests(unittest.TestCase):
         self.dead = set()
         settings = (
             "offload=on\nci_repo=\nblock_hours=4\nblock_max_hours=48\n"
+            "mirror_root=~/.local/state/mac-test/test-mirror\n"
             "block_warn_minutes=15\ngh_timeout_s=1\nclaim_idle_minutes=15\n"
             "claim_poll_seconds=60\nconnect_timeout_s=1\nprobe_timeout_s=1\n"
             "unreachable_backoff_s=30\nslots=2\nslots.hana=4\n"
@@ -113,7 +115,7 @@ class RepositorySlotTests(unittest.TestCase):
         for name in ("mac", "linux"):
             _ = write_config_fixture(self.root / f"{name}.conf", f"host=fake-{name}\n" + settings,
                                      template="mac_test")
-        _ = write_config_fixture(self.root / "mac_test.conf", "ci_repo=", template="mac_test")
+        _ = write_config_fixture(self.root / "mac_test.conf", "ci_repo=\nmirror_root=~/.local/state/mac-test/test-mirror\n")
         registry = self.root / "build_targets.conf"
         _ = registry.write_text(
             "targets=mac,linux,natedev\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac.conf\n"
@@ -122,6 +124,8 @@ class RepositorySlotTests(unittest.TestCase):
         )
         private = copies_environment(self.root)
         _ = shutil.copy2(Path(private["CONF_DIR"]) / "build_folders.conf", self.root / "build_folders.conf")
+        _ = write_config_fixture(self.root / "build_folders.conf",
+            "names.repository_key_length=8\npatterns.mirror={repository}/{owner}-s{slot}\n")
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
             **config_environment(self.root),
             **private,
@@ -451,7 +455,7 @@ class RepositorySlotTests(unittest.TestCase):
             self.assertEqual(len(path.parts), 6)
             self.assertEqual(path.name, f"linux-s{slot}")
             self.assertNotIn("..", path.parts)
-        self.assertEqual(offload.remote_mirror(first_id), ".local/state/mac-test/mirror/project")
+        self.assertEqual(offload.remote_mirror(first_id), ".local/state/mac-test/test-mirror/project")
         config = eligibility.read_config(self.root / "linux.conf")
         request = offload.OffloadRequest(first, "project", "call", offload.NO_RESULT_FILE, (), owner="verify", target="linux", slot=2, holder_session="fixture-session")
 
@@ -478,7 +482,7 @@ class RepositorySlotTests(unittest.TestCase):
             self.fail("The repository must have a known identity")
         self.assertEqual(identity.name, ".claude")
         self.assertEqual(identity.key, "https://github.com/nate/claude_commands")
-        self.assertEqual(offload.remote_mirror(identity), ".local/state/mac-test/mirror/.claude")
+        self.assertEqual(offload.remote_mirror(identity), ".local/state/mac-test/test-mirror/.claude")
         paths = mac_test.state_paths("mac")
         path = paths.claims / ".claude.json"
         path.parent.mkdir(parents=True)
@@ -555,7 +559,7 @@ class RepositorySlotTests(unittest.TestCase):
         identity = eligibility.repository_identity(root)
         if not isinstance(identity, eligibility.KnownRepository):
             self.fail("The repository must have a known identity")
-        self.assertEqual(offload.remote_mirror(identity, "darwin"), ".local/state/mac-test/mirror/project")
+        self.assertEqual(offload.remote_mirror(identity, "darwin"), ".local/state/mac-test/test-mirror/project")
         self.assertEqual(self.claim("darwin", root, 101)[0], 0)
         self.assertEqual(self.claim("darwin", root, 102)[0], 11)
         self.assertTrue((mac_test.state_paths("darwin").claims / "project.json").exists())
@@ -613,7 +617,7 @@ class RepositorySlotTests(unittest.TestCase):
 
                 command = offload.remote_test_command(eligibility.read_config(settings), request, identity)
 
-                invocation = shlex.split(command.rpartition("; echo mac_exit=$?")[0])
+                invocation, _ = split_mac_run_command(command)
                 start = invocation.index("~/.claude/scripts/lint/lint") + 1
                 self.assertEqual(invocation[start:], ["nextest", *expected])
 

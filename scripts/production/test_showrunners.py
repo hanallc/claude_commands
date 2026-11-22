@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.lint.memory_test_support import write_config_fixture
+
 from scripts.production.staff_test_support import unit_membership, fixture_member, fixture_runtime_id
 
 import json
@@ -790,21 +792,28 @@ class ShowrunnerRegistryTests(ShowrunnerFixture):
         self.assertEqual((self.root / "herdr-responses.json").read_bytes(), before)
 
     def test_settings_read_each_file_change(self) -> None:
-        source = Path(__file__).parents[2] / "config/showrunners.conf"
-        text = source.read_text()
-        _ = self.config.write_text(text)
+        _ = write_config_fixture(self.config, "stall_minutes=5\n")
         self.assertEqual(showrunners.load_settings_from(self.config)["stall_minutes"], 5)
-        _ = self.config.write_text(text.replace("stall_minutes=5", "stall_minutes=9"))
+        _ = write_config_fixture(self.config, "stall_minutes=9\n")
         self.assertEqual(showrunners.load_settings_from(self.config)["stall_minutes"], 9)
 
     def test_settings_read_exact_staff_recipient_ids(self) -> None:
         row = fixture_member("showrunner", name="director")
         _ = self.config.write_text("# range: 0..100\nthreshold_percent=2\n"
-                                   + "# range: 0..\nrepeat_minutes=30\n# range: 0..\nstall_minutes=5\n"
+                                   + "# range: 0..\nstall_minutes=5\n"
                                    + f"faults_to={row.id}\nalways={row.id}\n")
         settings = showrunners.load_settings_from(self.config)
         self.assertEqual(settings["always"], [str(row.id)])
         self.assertEqual(settings["faults_to"], str(row.id))
+
+    def test_settings_ignore_the_removed_repeat_interval(self) -> None:
+        settings = ("# range: 0..100\nthreshold_percent=2\n"
+                    + "# range: 0..\nstall_minutes=5\nfaults_to=fixture\nalways=\n")
+        expected = showrunners.ShowrunnerSettings(threshold_percent=2, stall_minutes=5, faults_to="fixture", always=[])
+        for extra in ("", "# range: 0..\nrepeat_minutes=30\n", "# range: 0..\nrepeat_minutes=invalid\n"):
+            with self.subTest(extra=extra):
+                _ = self.config.write_text(settings + extra)
+                self.assertEqual(showrunners.load_settings_from(self.config), expected)
 
     def test_an_absent_or_invalid_settings_file_names_the_file(self) -> None:
         for contents in (None, "invalid configuration", "always=wrong"):

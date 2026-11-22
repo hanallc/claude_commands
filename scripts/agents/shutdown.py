@@ -23,7 +23,9 @@ from pathlib import Path
 from typing import Literal, TypedDict, NamedTuple, NotRequired, cast
 
 from scripts.accounts import accounts
+from scripts.build_hold import override_guard
 from scripts.herdr import herdr_types
+from scripts.agents import set_model
 from scripts.agents import worker_lifecycle
 from scripts.copies import copies
 from scripts.direct import progress_history
@@ -45,7 +47,9 @@ from scripts.production import (
 from scripts.production.production_doc import Production, Refusal, read_production
 from scripts.production.unit_move import RenameRefused, read_json, write_json
 from scripts.lib.atomic_file import sync_folder, write_text_atomic
+from scripts.worktree import worktrees
 from scripts.agents import (
+    producer_lifecycle,
     producer_transfer,
     restart,
     restart_support,
@@ -77,6 +81,7 @@ from scripts.whoami.account import (
 
 
 class CommandLine(argparse.Namespace):
+    role: str = ""
     command: str = ""
     session: str = ""
     account: str | None = None
@@ -94,6 +99,7 @@ class CommandLine(argparse.Namespace):
     excluded: list[str] = []
     finish_step: bool = False
     retired: bool = False
+    resend_opening_prompt: bool = False
     old: str = ""
     new: str = ""
     to_doc: str = ""
@@ -102,6 +108,7 @@ class CommandLine(argparse.Namespace):
     producer: str = ""
     model: str = ""
     effort: str = ""
+    job: str = ""
 
 
 class UnreachableMachine(TypedDict):
@@ -233,21 +240,24 @@ def wait_for_workers(record: staff.StaffSnapshot) -> None:
         time.sleep(1)
 
 
-USAGE = """usage: agents COMMAND
+USAGE = f"""usage: agents COMMAND
   agents help
   agents status [ACCOUNT] [--json] [--here]
   agents pause NAME [--finish-step] --why TEXT
   agents exit NAME [--finish-step] --why TEXT
   agents pause --production SHOWRUNNER [--except UNIT ...] [--finish-step] --why TEXT
   agents resume NAME [--retired] [--why TEXT] [--to ACCOUNT]
+  agents resume PRODUCER --resend-opening-prompt
   agents resume --production SHOWRUNNER
-  agents retire NAME
+  agents retire NAME [--to PRODUCER]
   agents rename OLD NEW [--to-doc PATH] [--to-branch NAME]
   agents move SESSION_OR_GROUP ACCOUNT [--dry-run] [--why TEXT]
   agents restart [ACCOUNT] [--all] [--dry-run] [--only ID[,ID...]] [--here]
   agents stop SESSION [--dry-run] | --all [--dry-run] [--only ID[,ID...]] [--account ACCOUNT]
   agents remove-stray NAME SESSION
   agents transfer NAME [--model MODEL --effort EFFORT]
+  agents add-producer NAME [--model MODEL] [--effort EFFORT] [--job TEXT]
+  agents {set_model.COMMAND} {set_model.ARGUMENTS}   (example: agents {set_model.COMMAND} producers fable high)
 """
 
 
@@ -383,7 +393,8 @@ def finish_producer_cleanup(path: Path, cleanup: PendingProducerCleanup, admissi
     transcripts = tuple(sorted(set(cleanup.transcripts) | set(sessions.transcript_locations(cleanup.session))))
     cleanup = replace(cleanup, step=ProducerCleanupStep.ADMISSION, transcripts=transcripts)
     save_producer_cleanup(path, cleanup)
-    if cleanup.admission_matches and admission.exists():
+    admission_identity = cleanup.admission.get("session_id", "")
+    if cleanup.admission_matches and admission_identity in ("", cleanup.session) and admission.exists():
         saved = herdr.json_object(cast(object, json.loads(admission.read_text())), "producer admission")
         if saved == cleanup.admission:
             admission.unlink()
@@ -396,7 +407,7 @@ def finish_producer_cleanup(path: Path, cleanup: PendingProducerCleanup, admissi
             continue
         if current.get("tab_id") != pane.tab:
             raise ValueError(f"{pane.pane}: stray tab identity changed")
-        _ = client.close_retained_pane(pane.pane, terminal=pane.terminal)
+        _ = client.close_retained_pane(pane.pane, terminal=pane.terminal, target=cleanup.session)
         if not isinstance(client.pane_row(pane.pane), herdr.NoPane):
             raise ValueError(f"{pane.pane}: stray pane closure is incomplete")
     cleanup = replace(cleanup, step=ProducerCleanupStep.TRANSCRIPTS)
@@ -434,26 +445,17 @@ def stray_producer_panes(client: herdr.Herdr, identity: str) -> list[StrayProduc
             continue
         info = herdr.json_object(client.result("pane", "process-info", "--pane", pane["pane_id"]).get("process_info"),
                                  "stray pane process info")
-        proved = False
-        for value in herdr.json_items(info.get("foreground_processes"), "stray pane foreground processes"):
-            process = herdr.json_object(value, "stray pane process")
-            pid = process.get("pid")
-            if not isinstance(observed, herdr.LiveConversation) or pid not in observed.pids:
-                continue
-            if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
-                raise ValueError("stray pane process has no valid pid")
-            arguments = process.get("argv")
-            if not isinstance(arguments, list):
-                raise ValueError("stray pane process has no arguments")
-            argv = [herdr.json_text(argument, "stray process argument") for argument in cast(list[object], arguments)]
-            matches = herdr.is_claude_process(argv) if observed.kind == "claude" else herdr.is_codex_process(argv)
-            if not matches:
-                raise ValueError(f"{pid}: selected process no longer runs {observed.kind}")
-            native = herdr.native_process(pid, observed.kind)
-            proved = proved or native.current_identity == identity
-        idle_retained = (retained_identity == identity
-                         and isinstance(client.pane_activity(pane["pane_id"]), herdr.PaneAtShell))
-        if proved or idle_retained:
+        foreground = herdr.foreground_pane_owner(info)
+        if isinstance(foreground, herdr.UnprovedForegroundOwner):
+            continue
+        if isinstance(foreground, herdr.NoForegroundAgent):
+            matches = (retained_identity == identity
+                       and isinstance(client.pane_activity(pane["pane_id"]), herdr.PaneAtShell))
+        else:
+            matches = (isinstance(observed, herdr.LiveConversation)
+                       and foreground.pid in observed.pids and foreground.kind == observed.kind
+                       and herdr.read_foreground_pane_owner(foreground, pane).current_identity == identity)
+        if matches:
             selected.append(StrayProducerPane(pane["pane_id"], herdr.json_text(pane.get("terminal_id"), "stray terminal")))
     return selected
 
@@ -478,15 +480,22 @@ def remove_stray_producer(name: str, session: str) -> int:
         if admission.exists():
             saved = herdr.json_object(cast(object, json.loads(admission.read_text())), "producer admission")
         retained = pane_record.read_strict(client.session)
-        admission_matches = saved.get("session_id") == identity
-        for pane in panes:
-            if saved.get("pane") == pane.pane and saved.get("terminal") == pane.terminal:
-                admission_matches = True
-            entry = retained.get(pane.pane)
-            if entry is not None and saved.get("pane") == pane.pane:
-                owner = record.by_member_reference(pane_launch.reference_id(entry))
-                retained_identity = owner.current_session if owner is not None else pane_launch.reference_id(entry)
-                admission_matches = admission_matches or retained_identity == identity
+        admission_identity = saved.get("session_id", "")
+        admission_matches = admission_identity == identity
+        if admission_identity == "":
+            for pane in panes:
+                if saved.get("pane") != pane.pane:
+                    continue
+                if saved.get("terminal") == pane.terminal:
+                    admission_matches = True
+                    break
+                entry = retained.get(pane.pane)
+                if entry is not None:
+                    owner = record.by_member_reference(pane_launch.reference_id(entry))
+                    retained_identity = owner.current_session if owner is not None else pane_launch.reference_id(entry)
+                    if retained_identity == identity:
+                        admission_matches = True
+                        break
         observed = herdr.read_conversation(identity)
         if isinstance(observed, herdr.UnknownConversation):
             raise ValueError(observed.reason)
@@ -650,6 +659,12 @@ def main(argv: list[str] | None = None) -> int:
     if not arguments or arguments in (["help"], ["--help"], ["-h"]):
         print(USAGE, end="")
         return 0
+    if arguments[0] == set_model.LOCAL_COMMAND:
+        try:
+            return set_model.on_remote(arguments[1:])
+        except (OSError, ValueError, conf.Unusable) as error:
+            print(error)
+            return 2
     if arguments == ["_unit-local"]:
         return unit_local_command()
     parser = argparse.ArgumentParser(prog="agents", usage=USAGE.removeprefix("usage: ").rstrip())
@@ -668,6 +683,15 @@ def main(argv: list[str] | None = None) -> int:
     _ = command.add_argument("producer", metavar="NAME")
     _ = command.add_argument("--model", default="")
     _ = command.add_argument("--effort", default="")
+    command = commands.add_parser("add-producer")
+    _ = command.add_argument("producer", metavar="NAME")
+    _ = command.add_argument("--model", default="")
+    _ = command.add_argument("--effort", default="")
+    _ = command.add_argument("--job", default="")
+    command = commands.add_parser(set_model.COMMAND)
+    _ = command.add_argument("role", metavar="ROLE")
+    _ = command.add_argument("model", metavar="MODEL")
+    _ = command.add_argument("effort", metavar="EFFORT", nargs="?", default="")
     for verb in ("pause", "exit", "resume"):
         command = commands.add_parser(verb)
         selection = command.add_mutually_exclusive_group(required=True)
@@ -675,6 +699,7 @@ def main(argv: list[str] | None = None) -> int:
         _ = selection.add_argument("--production", default="")
         if verb == "resume":
             _ = command.add_argument("--retired", action="store_true")
+            _ = command.add_argument("--resend-opening-prompt", action="store_true")
             _ = command.add_argument("--to")
             _ = command.add_argument("--why", default="resumed by name")
         else:
@@ -683,6 +708,7 @@ def main(argv: list[str] | None = None) -> int:
             _ = command.add_argument("--except", dest="excluded", action="append", default=[])
     command = commands.add_parser("retire")
     _ = command.add_argument("session")
+    _ = command.add_argument("--to")
     command = commands.add_parser("rename")
     _ = command.add_argument("old")
     _ = command.add_argument("new")
@@ -717,11 +743,22 @@ def main(argv: list[str] | None = None) -> int:
     _ = command.add_argument("--who", required=True)
     _ = command.add_argument("--session", dest="account", required=True)
     options = parser.parse_args(arguments, namespace=CommandLine())
+    if options.command == set_model.COMMAND:
+        try:
+            return set_model.run(options.role, options.model, options.effort)
+        except (OSError, ValueError, conf.Unusable, staff.StaffRefused) as error:
+            return set_model.report_error(error)
     try:
+        if options.command == "resume" and options.resend_opening_prompt:
+            if options.production or options.retired:
+                raise ValueError("--resend-opening-prompt needs one producer name and an active pane")
+            return _result_code(stop_resume.resend_producer_opening(options.session, to=options.to or ""))
         if options.command == "remove-stray":
             return remove_stray_producer(options.producer, options.session)
         if options.command == "transfer":
             return producer_transfer.transfer(options.producer, model=options.model, effort=options.effort)
+        if options.command == "add-producer":
+            return producer_lifecycle.add(options.producer, model=options.model, effort=options.effort, job=options.job)
         if options.command == "stop" and options.all:
             return restart.stop_all(dry_run=options.dry_run,
                                     only=tuple(item for item in options.only.split(",") if item),
@@ -793,10 +830,23 @@ def main(argv: list[str] | None = None) -> int:
                         print(f"{report['machine']}: unavailable (rc {report['rc']})")
             return 0
         if options.command == "rename":
+            if (producer_lifecycle.pending_rename(options.old)
+                    or producer_lifecycle.pending_admission(options.old)
+                    or producer_lifecycle.lookup(options.old, staff.initial_snapshot()) is not None):
+                if options.to_doc or options.to_branch:
+                    raise ValueError("producer rename keeps the document folder and has no branch option")
+                return producer_lifecycle.rename(options.old, options.new, rename_repair_displays)
             return rename_named_member(options.old, options.new, to_doc=options.to_doc, to_branch=options.to_branch)
         if options.command == "retire":
+            if (producer_lifecycle.pending_admission(options.session)
+                    or producer_lifecycle.lookup(options.session, staff.initial_snapshot()) is not None):
+                return producer_lifecycle.retire(options.session, to=options.to)
+            if options.to:
+                raise ValueError("--to is only for producer retirement")
             return retire_named_unit(options.session)
         if options.command == "resume" and options.retired:
+            if producer_lifecycle.lookup(options.session, staff.initial_snapshot()) is not None:
+                return _result_code(producer_lifecycle.restore(options.session, to=options.to, why=options.why))
             recovery_account = (accounts.NamedAccount(options.to, accounts.account_dir(options.to))
                                 if options.to else accounts.CURRENT_ACCOUNT_SETTINGS)
             return recover_named_unit(options.session, account=recovery_account)
@@ -830,8 +880,6 @@ def main(argv: list[str] | None = None) -> int:
 SCRIPTS = Path(__file__).resolve().parent.parent
 
 DETACHED_RUNS = "detached_runs"
-
-BUILD_HOLD = SCRIPTS / "build_hold" / "build_hold.py"
 
 MAC_CLAIMS = Path.home() / ".local/state/mac-test/claims"
 
@@ -1172,7 +1220,7 @@ def retirement_find_unit(production_name: str, given: str, *,
         raise ValueError(f"{member.name}: staff worktree is unfilled")
     branch = location.branch.value if isinstance(location, staff.RemovedWorktree) and isinstance(location.branch, staff.ParkedBranch) else ""
     if unit_machine_is_local(location.machine) and location.path.is_dir():
-        branch = retirement_branch(location.path)
+        branch = retirement_branch(location.path) or branch
     return RetiringUnit(production, member.name, location.path, branch, member)
 
 def retirement_last_session(unit: RetiringUnit) -> str:
@@ -1196,9 +1244,52 @@ def retirement_branch_commits(unit: RetiringUnit, branch: str, *, settings: conf
         commits.append(remote.stdout.split()[0])
     return commits
 
+def retirement_rebase(unit: RetiringUnit, *, settings: conf.ConfigRead) -> Path | None:
+    """Find a checkout that is rebasing the unit branch."""
+    listed = retirement_git(unit, "worktree", "list", "--porcelain", "-z", settings=settings)
+    if listed.returncode:
+        raise OSError(f"cannot list Git worktrees: {retirement_failure(listed)}")
+    checkouts: list[Path | None] = []
+    for section in listed.stdout.split("\0\0"):
+        entry, *fields = section.split("\0")
+        if entry.startswith("worktree "):
+            checkouts.append(None if "bare" in fields else Path(entry.removeprefix("worktree ")))
+    if not checkouts:
+        return None
+    primary, *linked = checkouts
+    resolved = retirement_git(unit, "rev-parse", "--path-format=absolute", "--git-common-dir", settings=settings)
+    if resolved.returncode:
+        raise OSError(f"cannot read the common Git folder: {retirement_failure(resolved)}")
+    common = Path(resolved.stdout.removesuffix("\n"))
+    try:
+        entries = tuple((common / "worktrees").iterdir())
+    except FileNotFoundError:
+        entries = ()
+    expected = f"refs/heads/{unit.branch}"
+    for git_dir in (common, *entries):
+        if git_dir == common and primary is None:
+            continue
+        for operation in ("rebase-merge", "rebase-apply"):
+            try:
+                branch = (git_dir / operation / "head-name").read_text(encoding="utf-8").removesuffix("\n")
+            except FileNotFoundError:
+                continue
+            if branch != expected:
+                continue
+            if git_dir == common:
+                return primary
+            pointer = (git_dir / "gitdir").read_text(encoding="utf-8", errors="surrogateescape").removesuffix("\n")
+            checkout = Path(os.path.abspath(git_dir / pointer)).parent
+            if checkout in linked:
+                return checkout
+    return None
+
+
 def retirement_refusals(unit: RetiringUnit, *, settings: conf.ConfigRead, check_absent_branch: bool = False) -> list[str]:
     """Keep uncommitted work and commits outside the merge branch."""
     present = unit.worktree.is_dir()
+    if unit.branch and (rebasing := retirement_rebase(unit, settings=settings)) is not None:
+        return [f"branch {unit.branch} is rebasing in {rebasing}"]
     if not present and (not check_absent_branch or not unit.branch):
         return []
     found: list[str] = []
@@ -1229,16 +1320,27 @@ def retirement_members(unit: RetiringUnit, record: staff.StaffSnapshot) -> list[
 
 def retirement_remove(unit: RetiringUnit, *, settings: conf.ConfigRead) -> list[str]:
     failed: list[str] = []
-    if unit.worktree.exists():
-        result = retirement_git(unit, "worktree", "remove", "--force", str(unit.worktree), settings=settings)
-        if result.returncode:
-            return [retirement_failure(result)]
-        print(f"removed: worktree {unit.worktree}")
+    if not unit.branch and not os.path.lexists(unit.worktree):
+        return failed
+    try:
+        layout = worktrees.worktree_output(unit.worktree)
+        worktrees.remove_git_checkout(unit.worktree, unit.production.checkout, force=True, retain_record=True)
+        if isinstance(layout, worktrees.RecordedWorktreeOutput) or worktrees.enforce_build_folders():
+            worktrees.retire(unit.name)
+    except (OSError, ValueError, worktrees.Refused) as error:
+        return [str(error)]
+    if os.path.lexists(unit.worktree):
+        return failed
     if unit.branch:
-        if retirement_git(unit, "show-ref", "--verify", "--quiet", f"refs/heads/{unit.branch}", settings=settings).returncode == 0:
+        if (rebasing := retirement_rebase(unit, settings=settings)) is not None:
+            return [f"branch {unit.branch} is rebasing in {rebasing}"]
+        local = retirement_git(unit, "show-ref", "--verify", "--quiet", f"refs/heads/{unit.branch}", settings=settings)
+        if local.returncode not in (0, 1):
+            return [retirement_failure(local)]
+        if local.returncode == 0:
             result = retirement_git(unit, "branch", "-D", unit.branch, settings=settings)
             if result.returncode:
-                failed.append(retirement_failure(result))
+                return [retirement_failure(result)]
         observed = retirement_git(unit, "ls-remote", "--exit-code", "--heads", "origin", unit.branch, settings=settings)
         if observed.returncode not in (0, 2):
             return [retirement_failure(observed)]
@@ -1532,7 +1634,8 @@ def retirement_clear_worktree(unit: RetiringUnit, *, settings: conf.ConfigRead, 
     row = unit.staff_member
     owned = retirement_members(unit, record)
     for key in retirement_holds({member.id for member in owned}):
-        result = retirement_run([sys.executable, str(BUILD_HOLD), "release", "--holder", key], settings=settings)
+        hold_script = override_guard.helper_root(Path(__file__)) / "build_hold/build_hold.py"
+        result = retirement_run([sys.executable, str(hold_script), "release", "--holder", key], settings=settings)
         if result.returncode:
             print(f"anomaly: {retirement_failure(result)}")
     retirement_release_reservations(unit, settings=settings)
@@ -1703,7 +1806,9 @@ def recovery_find_unit(production_name: str, given: str, *, record: staff.StaffS
     pair = unit_config.place(member.row.id, worktree, cleanup=False)
     if isinstance(pair, unit_config.Both) and not pair.same:
         raise RecoveryRefused(f"{pair.worktree} and {pair.parked}: configurations differ; no file was changed")
-    return RetiredUnitRecovery(production, name, worktree, member.row.name, saved.plan, member.row.current_session)
+    branch = (location.branch.value if isinstance(location, staff.RemovedWorktree)
+              and isinstance(location.branch, staff.ParkedBranch) else member.row.name)
+    return RetiredUnitRecovery(production, name, worktree, branch, saved.plan, member.row.current_session)
 
 def recovery_resume_record(production: Production, name: str) -> Path:
     try:
@@ -1739,35 +1844,40 @@ def recovery_refusals(unit: RetiredUnitRecovery) -> list[str]:
             refused.append(f"{unit.name}: no account has the transcript of session {unit.session_id}")
     except (RetirementRefused, OSError) as error:
         refused.append(f"{unit.name}: {error}")
-    if unit.worktree.exists() and not recovery_has_worktree(unit):
+    pending = worktrees.pending_checkout(unit.worktree, unit.production.checkout, unit.branch)
+    if os.path.lexists(unit.worktree) and not (pending or recovery_has_worktree(unit)):
         refused.append(f"{unit.worktree} exists and is not {unit.name}'s worktree on {unit.branch}")
-    elif not unit.worktree.exists():
-        if recovery_git(unit, "branch", "--list", unit.branch):
+    elif pending or not unit.worktree.exists():
+        if not pending and recovery_git(unit, "branch", "--list", unit.branch):
             refused.append(f"branch {unit.branch} still exists; retire did not finish")
         if recovery_git(unit, "ls-remote", "--heads", "origin", unit.branch):
             refused.append(f"origin {unit.branch} still exists; retire did not finish")
     return refused
 
 def recovery_launch_command(unit: RetiredUnitRecovery) -> list[str]:
-    # The row name is both the branch and the add_unit name.
-    arguments = [sys.executable, str(ADD_UNIT), "--production", unit.production.name, unit.branch,
+    arguments = [sys.executable, str(ADD_UNIT), "--production", unit.production.name, unit.name,
                  "--resume", unit.session_id, "--cwd", str(unit.worktree), *unit_config.plan_arguments(unit.plan)]
     if isinstance(unit.account, accounts.NamedAccount):
         arguments.extend(["--account", unit.account.label])
     return arguments
 
 def recovery_make_worktree(unit: RetiredUnitRecovery) -> None:
-    if recovery_has_worktree(unit):
-        return
+    had_checkout = recovery_has_worktree(unit)
     branch = (build_folders.ExistingWorktreeBranch(unit.branch)
               if recovery_git(unit, "branch", "--list", unit.branch)
               else build_folders.NewWorktreeBranch(unit.branch, unit.production.merge_branch))
     try:
-        _ = build_folders.create_build_folder(build_folders.LinkedEditableRepository(
-            unit.worktree, unit.production.checkout, branch))
-    except (OSError, ValueError) as error:
+        record = worktrees.checkout_record(unit.worktree)
+        layout = (record.layout if record is not None and record.stage is worktrees.MakeStage.MAKING
+                  else worktrees.unit_checkout_output(
+                      unit.worktree, build_folders.repo_word(unit.production.checkout), unit.name))
+        _ = worktrees.create_checkout(unit.worktree, unit.production.checkout, branch,
+                                      layout, owner=unit.name, merge_branch=unit.production.merge_branch,
+                                      allow_existing=True)
+    except (OSError, ValueError, worktrees.Refused) as error:
         raise RecoveryRefused(f"worktree {unit.worktree}: {error}") from error
-    print(f"made: worktree {unit.worktree} on {unit.branch}, from {unit.production.merge_branch}")
+    if not had_checkout:
+        print(f"made: worktree {unit.worktree} on {unit.branch}, from {unit.production.merge_branch}")
 
 def recovery_launch(unit: RetiredUnitRecovery) -> None:
     if recovery_is_running(unit) and not add_unit.pending_opening(unit.production, unit.name, unit.session_id):
@@ -1788,6 +1898,7 @@ def recovery_resumed_session_proven(production_name: str, name: str, session_id:
             and entry.get("staff_id") == row.id and session_id == row.current_session)
 
 def recovery_resume(unit: RetiredUnitRecovery, record: staff.StaffSnapshot) -> int:
+    staff.validate_unit_name_for_write(unit.name)
     refused = recovery_refusals(unit)
     if refused:
         print("\n".join(f"refused: {reason}" for reason in refused))
@@ -1968,7 +2079,9 @@ def rename_plan(old: str, new: str, *, to_doc: str = "", to_branch: str = "") ->
     if row.kind == "unit":
         if to_doc:
             raise RenameRefused("--to-doc is only for showrunners; the staff row is a unit, not a showrunner")
-        name = unit_names.name(new)
+        name = row.name if new == row.name + "-unit" else unit_names.name(new)
+        if name != row.name:
+            staff.validate_unit_name_for_write(name)
         staff.validate_name(row.kind, name)
         if any(other.id != row.id and other.name == name and other.parent == row.parent
                for other in record.find(kind="unit")):
@@ -1977,7 +2090,8 @@ def rename_plan(old: str, new: str, *, to_doc: str = "", to_branch: str = "") ->
                 and row.worktree.machine != remote.local_machine()):
             raise ValueError(f"{old}: run rename on {row.worktree.machine}")
         pending = unit_move.pending_rename(row.id)
-        if pending is not None and (pending.name != name or to_branch and pending.branch != to_branch):
+        if (pending is not None and (pending.name != name or to_branch and pending.branch != to_branch)
+                and not unit_move.rename_unstarted(record, row, pending)):
             raise RenameRefused(f"{row.name}: finish the pending rename to {pending.name}")
         if to_branch:
             if isinstance(row.worktree, staff.WorktreeUnfilled):
@@ -2082,6 +2196,8 @@ def rename_move_branch(move: DocBranchMove) -> bool:
 def rename_qualified_workers(owner: staff.StaffRow) -> bool:
     """Migrate one owner's old worker names without removing retained work."""
     changed = False
+    unchanged = 0
+    # Staff rows retain no former names. Session formerNames are process-specific.
     client = herdr.Herdr(herdr.shared_session())
     for row in staff.snapshot().find(kind="worker", parent=owner.id):
         prefix, separator, bare = row.name.rpartition("-")
@@ -2091,10 +2207,9 @@ def rename_qualified_workers(owner: staff.StaffRow) -> bool:
                 bare = role + row.name[len(stem):]
                 prefix = row.name[:-len(bare)].removesuffix("-")
                 break
-        if not prefix or not separator:
-            continue
-        if prefix != owner.name and not prefix.endswith("-" + owner.name):
-            print(f"{row.name}: kept; prefix does not end with {owner.name}; run /agents rename {row.id} {bare}", file=sys.stderr)
+        if (not prefix or not separator
+                or prefix != owner.name and not prefix.endswith("-" + owner.name)):
+            unchanged += 1
             continue
         name = staff.WorkerName.parse(row.name)
         with worker_panes.worker_lock(owner.id, name, blocking=True) as hold:
@@ -2150,6 +2265,9 @@ def rename_qualified_workers(owner: staff.StaffRow) -> bool:
                         print(pair + "worker end is incomplete", file=sys.stderr)
                 except staff.StaffRefused as error:
                     print(pair + " ".join(str(error).splitlines()), file=sys.stderr)
+    if unchanged:
+        worker_names = "worker name" if unchanged == 1 else "worker names"
+        print(f"{unchanged} {worker_names} unchanged: no qualified prefix for {owner.name}", file=sys.stderr)
     return changed
 
 
@@ -2182,6 +2300,13 @@ def rename_repair_displays(row: staff.StaffRow) -> bool:
         write_text_atomic(path, json.dumps(raw, indent=2) + "\n")
         changed = True
     client = herdr.Herdr(herdr.shared_session())
+    if row.kind == "producer":
+        panes = restart.read_row_panes([row], client)
+        if isinstance(panes, restart.RowPanesUnreadable):
+            raise ValueError(f"{row.name}: cannot read producer panes: {panes.reason}")
+        for _, pane in panes:
+            changed = client.retitle(pane, row.name) or changed
+        return changed
     spaces: set[str] = set()
     for pane in client.panes():
         native_sessions: set[str] = set()
@@ -2239,17 +2364,30 @@ def rename_apply(old: str, new: str, *, to_doc: str = "", to_branch: str = "") -
         return request
 
 
+def _unit_rename_target(value: str, old_name: str, new_name: str) -> str | None:
+    """Replace a matching old suffix or keep a matching new suffix."""
+    return (unit_names.swap_stem(value, old_name, new_name)
+            or unit_names.swap_stem(value, new_name, new_name))
+
+
 def rename_apply_unit(request: RenamePlan) -> RenamePlan:
     with staff.row_operation(str(request.member.id)):
         record = staff.snapshot()
         if (row := record.by_id(request.member.id)) is None:
             raise ValueError(f"{request.member.id}: no unit staff row")
         changed = row.name != request.name
+        if changed:
+            staff.validate_unit_name_for_write(request.name)
+        replaced_pending = False
         pending = unit_move.pending_rename(row.id)
-        if pending is not None:
-            if (pending.name != request.name or isinstance(request.move, UnitBranchMove)
-                    and request.move.branch != pending.branch):
+        if pending is not None and (pending.name != request.name or isinstance(request.move, UnitBranchMove)
+                                    and request.move.branch != pending.branch):
+            if not unit_move.rename_unstarted(record, row, pending):
                 raise RenameRefused(f"{row.name}: finish the pending rename to {pending.name}")
+            unit_move.rename_move_path(row.id).unlink()
+            pending = None
+            replaced_pending = True
+        if pending is not None:
             _ = unit_move.rename_observation(record, row, pending)
         elif changed or (isinstance(request.move, UnitBranchMove) and request.move.old_branch != request.move.branch):
             if isinstance(row.worktree, staff.WorktreeUnfilled):
@@ -2258,14 +2396,17 @@ def rename_apply_unit(request: RenamePlan) -> RenamePlan:
                 if row.worktree.machine != remote.local_machine():
                     raise ValueError(f"{row.name}: run rename on {row.worktree.machine}")
                 folder = row.worktree.path.expanduser().resolve()
-                target = unit_names.swap_stem(folder.name, row.name, request.name) if changed else folder.name
-                destination = folder.with_name(target) if target is not None else folder
+                layout_destination = worktrees.unit_rename_destination(folder, row.name, request.name)
+                target = _unit_rename_target(folder.name, row.name, request.name) if changed else folder.name
+                destination = layout_destination or (folder.with_name(target) if target is not None else folder)
                 unit_move.require_move_destination(record, row, destination)
                 checkout = unit_move.move_checkout(record, row)
                 branch = unit_move.checked_out_branch(checkout) if checkout.exists() else ""
                 renamed_branch = (request.move.branch if isinstance(request.move, UnitBranchMove) else
-                                  unit_names.swap_stem(branch, row.name, request.name))
-                if changed and target is None:
+                                  _unit_rename_target(branch, row.name, request.name))
+                if layout_destination is not None and not isinstance(request.move, UnitBranchMove):
+                    renamed_branch = request.name + "-" + folder.name if branch == row.name + "-" + folder.name else branch
+                if changed and target is None and layout_destination is None:
                     print(f"anomaly: folder {folder} does not end with -{row.name}", file=sys.stderr)
                 if changed and renamed_branch is None:
                     print(f"anomaly: branch {branch} does not end with -{row.name}", file=sys.stderr)
@@ -2286,21 +2427,14 @@ def rename_apply_unit(request: RenamePlan) -> RenamePlan:
             if not isinstance(row.worktree, staff.WorktreeUnfilled):
                 changed = unit_move.move_idle_folder(row.id, row.worktree.path, branch=request.move.branch) or changed
         if pending is not None:
-            if not unit_move.rename_complete(staff.snapshot(), row, pending):
-                changed = unit_move.move_idle_folder(row.id, pending.destination, branch=pending.branch) or changed
-                record = staff.snapshot()
-                if (current := record.by_id(row.id)) is None:
-                    raise RenameRefused(f"{row.id}: the staff row is unavailable after the rename")
-                row = current
-            if unit_move.finish_rename(row, pending):
-                pending = None
-                changed = True
+            changed = unit_move.continue_rename(row, pending) or changed
+            pending = unit_move.pending_rename(row.id)
         notice = rename_notice_path(row.id)
         if notice.exists() and pending is None:
             fields = unit_move.json_object(read_json(notice))
             if not fields.get("pending"):
                 notice.unlink()
-        print("done" if changed or worker_names_changed else "unchanged")
+        print("done" if changed or worker_names_changed or replaced_pending else "unchanged")
         return request
 
 
@@ -2374,7 +2508,7 @@ def rename_named_member(old: str, new: str, *, to_doc: str = "", to_branch: str 
         except subprocess.TimeoutExpired as error:
             print(f"rename: error: {str(error).splitlines()[0]}", file=sys.stderr)
             return 1
-        except (ValueError, OSError, UnicodeError, RenameRefused, herdr_types.HerdrFailure) as error:
+        except (ValueError, OSError, UnicodeError, RenameRefused, herdr_types.HerdrFailure, worktrees.Refused) as error:
             print(f"rename: {error}", file=sys.stderr)
             return 1
         return 0

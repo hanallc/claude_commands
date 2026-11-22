@@ -8,12 +8,20 @@ from dataclasses import MISSING, fields, is_dataclass
 from enum import Enum, auto
 from functools import lru_cache
 import math
+import re
 from pathlib import Path
+from string import Formatter
 from types import UnionType
-from typing import Callable, Literal, NotRequired, cast, get_args, get_origin, get_type_hints, is_typeddict
+from typing import TYPE_CHECKING, Callable, Literal, NewType, NotRequired, cast, get_args, get_origin, get_type_hints, is_typeddict, override
+
+if TYPE_CHECKING:
+    from scripts.production.staff import StaffId, StaffSnapshot
 
 # Literal unions use typing.Union on Python 3.13.
 LITERAL_UNION_ORIGIN = get_origin(Literal[0] | Literal[1])
+UNKNOWN_CALLER = "unregistered session"
+RAW_ID = re.compile(r"(?<![0-9a-f])(?:[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}|[0-9a-f]{32})(?![0-9a-f])",
+                    re.IGNORECASE)
 
 
 class SnapshotReadPolicy(Enum):
@@ -22,6 +30,17 @@ class SnapshotReadPolicy(Enum):
 
 
 _READ_POLICY = ContextVar("snapshot_read_policy", default=SnapshotReadPolicy.ALL_FIELDS)
+_READ_STAFF: ContextVar[StaffSnapshot | None] = ContextVar("snapshot_staff", default=None)
+
+
+@contextmanager
+def snapshot_staff(members: StaffSnapshot) -> Generator[None]:
+    """Supply staff for older holds during this read."""
+    token = _READ_STAFF.set(members)
+    try:
+        yield
+    finally:
+        _READ_STAFF.reset(token)
 
 
 @contextmanager
@@ -54,6 +73,8 @@ def record_field_names(schema: type) -> tuple[str, ...]:
 
 def wire_record(schema: type, record: dict[str, object], *, writing: bool) -> dict[str, object]:
     """Keep existing wire fields compatible with the pinned client."""
+    if writing and "job" in record and record["job"] == {"kind": "GateJobNotRecorded"}:
+        del record["job"]
     if (schema.__module__ == "scripts.build_queue.placement"
             and schema.__name__ in ("PlacementAssignment", "PlacementConstraints")):
         source = record.get("source_identity", record.get("source_key"))
@@ -69,10 +90,16 @@ def wire_record(schema: type, record: dict[str, object], *, writing: bool) -> di
             source = ({"kind": "SourceKeyKnown", "key": source} if source else
                       {"kind": "SourceKeyUnavailable", "reason": "older request has no source key"})
         return {**record, "source_key": source}
-    if (writing and schema.__module__ == "scripts.build_queue.admission_records"
-            and schema.__name__ == "QueueInputs"):
-        # Pinned clients require this inactive field in the wire record.
-        record = {**record, "override": {"kind": "NoHeadAdmissionOverride"}}
+    if writing and record.get("verify") == {"kind": "NotVerifyCall"}:
+        del record["verify"]
+    if schema.__module__ == "scripts.build_queue.admission_records":
+        if writing and schema.__name__ == "QueueInputs":
+            # Pinned clients require this inactive field in the wire record.
+            record = {**record, "override": {"kind": "NoHeadAdmissionOverride"}}
+        elif not writing and schema.__name__ == "QueueInputs":
+            record = recover_slot_callers(record)
+        elif not writing and schema.__name__ == "BetweenStepsSlot":
+            record = {**record, "identity": ended_step_facts(record.get("identity", {"kind": "HoldPredatesStepFacts"}))}
     if schema.__module__ == "scripts.build_queue.admission_records" and "running" in record:
         if writing:
             running = record["running"]
@@ -84,6 +111,124 @@ def wire_record(schema: type, record: dict[str, object], *, writing: bool) -> di
         elif "running_with_remote" in record:
             return {**record, "running": record["running_with_remote"]}
     return record
+
+
+def ended_step_facts(value: object) -> object:
+    """Recover the facts that an older name record retained."""
+    if not isinstance(value, dict):
+        return value
+    identity = cast(dict[str, object], value)
+    if identity.get("kind") != "EndedStepIdentity":
+        return identity
+    name, source = identity["name"], identity["source"]
+    absent = {"kind": "EndedStepFactNotRecorded"}
+    return {"kind": "EndedStepFacts", "step": name if source in ("step", "script") else absent,
+            "package": {"kind": "PackageNotRecorded"}, "project": name if source == "repository" else absent,
+            "folder": absent, "staff_id": identity["staff_id"],
+            **({"caller_name": identity["caller_name"]} if "caller_name" in identity else {})}
+
+
+def public_queue_text(value: object) -> str:
+    """Return a usable queue name."""
+    if not isinstance(value, str):
+        return ""
+    text = " ".join(value.split())
+    if text in ("", "-", "–", "—", "owner not recorded", UNKNOWN_CALLER) or "$" in text:
+        return ""
+    return "" if RAW_ID.search(text) else text
+
+
+class QueueNameFormatter(Formatter):
+    """Read only usable named fields in a queue name template."""
+
+    @override
+    def get_field(self, field_name: str, args: Sequence[object],
+                  kwargs: Mapping[str, object]) -> tuple[str, str]:
+        name = public_queue_text(kwargs.get(field_name))
+        if not name:
+            raise ValueError(f"unusable queue name field {field_name}")
+        return name, field_name
+
+
+_QUEUE_NAME_FORMATTER = QueueNameFormatter()
+
+
+def format_queue_name(template: str, **fields: str) -> str:
+    """Return a usable label when every referenced field is usable."""
+    try:
+        return public_queue_text(_QUEUE_NAME_FORMATTER.vformat(template, (), fields))
+    except (ValueError, KeyError, IndexError):
+        return ""
+
+
+def select_queue_name(*candidates: object) -> str:
+    """Use the first usable name or return the fallback label."""
+    return next((name for value in candidates if (name := public_queue_text(value))), UNKNOWN_CALLER)
+
+
+def wait_line_name(unit: str, caller: str, folder: str, step: str, *, fallback_name: str = "") -> str:
+    """Name a waiting step in queue order."""
+    owner = select_queue_name(unit, caller, Path(folder).name, fallback_name)
+    shown_step = public_queue_text(step)
+    return f"{owner} · {shown_step}" if shown_step else owner
+
+
+def ci_label(template: str, runner: str, job: str) -> str:
+    """Use the complete CI label or the generic CI name."""
+    return select_queue_name(format_queue_name(template, runner=runner, job=job), "hana CI")
+
+
+def resolve_queue_caller(*, stored_caller: object, reservation_caller: object = "", staff_caller: object = "") -> str:
+    """Select the recorded caller, the reservation caller, or the staff member."""
+    return select_queue_name(stored_caller, reservation_caller, staff_caller)
+
+
+def recover_slot_callers(record: dict[str, object]) -> dict[str, object]:
+    """Recover names from reservations or fixed staff IDs."""
+    slots, reservations = record.get("slots"), record.get("reservations")
+    if not isinstance(slots, list) or not slots:
+        return record
+    members = _READ_STAFF.get()
+    callers: dict[str, str] = {}
+    if isinstance(reservations, list):
+        for value in cast(list[object], reservations):
+            if not isinstance(value, dict):
+                continue
+            reservation = cast(dict[str, object], value)
+            key = reservation.get("reservation_id")
+            identity = reservation.get("queue_waiter", reservation)
+            if isinstance(key, str) and isinstance(identity, dict):
+                name = public_queue_text(cast(dict[str, object], identity).get("session_name"))
+                if name:
+                    callers[key] = name
+
+    def recover(value: object) -> object:
+        if not isinstance(value, dict):
+            return value
+        slot = cast(dict[str, object], value)
+        if slot.get("kind") == "ContinuationSlot":
+            return {**slot, "slot": recover(slot["slot"])}
+        if slot.get("kind") != "BetweenStepsSlot":
+            return slot
+        identity = ended_step_facts(slot.get("identity"))
+        if not isinstance(identity, dict):
+            return slot
+        facts = cast(dict[str, object], identity)
+        if facts.get("kind") != "EndedStepFacts":
+            return slot
+        stored = public_queue_text(facts.get("caller_name"))
+        key = slot.get("reservation")
+        name = callers.get(key, "") if isinstance(key, str) else ""
+        staff_id = facts.get("staff_id")
+        member = (members.by_id(cast("StaffId", staff_id))
+                  if not (stored or name) and members is not None and isinstance(staff_id, str) else None)
+        if members is None and not (stored or name):
+            return slot
+        caller = resolve_queue_caller(stored_caller=stored, reservation_caller=name,
+                                      staff_caller=member.name if member is not None else "")
+        return slot if caller == facts.get("caller_name") else {**slot, "identity": {**facts, "caller_name": caller}}
+
+    return {**record, "slots": [recover(slot) for slot in cast(list[object], slots)]}
 
 
 def remote_memory_row(value: object) -> bool:
@@ -110,7 +255,9 @@ def legacy_pressure_shape(record: dict[str, object]) -> dict[str, object]:
 
 GPU_SLOT_SUFFIX = "_gpu_slot"
 NATEDEV_HOLD_SUFFIX = "_natedev_hold"
-LEGACY_WAIT_SUFFIXES = (GPU_SLOT_SUFFIX, NATEDEV_HOLD_SUFFIX)
+CARGO_FOLDER_SUFFIX = "_cargo_folder"
+BUILD_SPACE_SUFFIX = "_build_space"
+LEGACY_WAIT_SUFFIXES = (GPU_SLOT_SUFFIX, NATEDEV_HOLD_SUFFIX, CARGO_FOLDER_SUFFIX, BUILD_SPACE_SUFFIX)
 
 
 @lru_cache(maxsize=None)
@@ -136,6 +283,10 @@ def legacy_wait_shape(schema: type, record: dict[str, object]) -> dict[str, obje
             head, suffix = f"the GPU test slot ({wait['used']} of {wait['slots']} in use)", GPU_SLOT_SUFFIX
         elif wait.get("kind") == "NatedevHeld":
             head, suffix = f"the natedev hold by {wait['holder']} for {wait['purpose']}", NATEDEV_HOLD_SUFFIX
+        elif wait.get("kind") == "CargoFolderWait":
+            head, suffix = "the build in the same Cargo folder", CARGO_FOLDER_SUFFIX
+        elif wait.get("kind") in ("BuildSpaceLow", "BuildSpaceUnreadable"):
+            head, suffix = "the build space floor", BUILD_SPACE_SUFFIX
         else:
             continue
         shaped[key] = {"kind": "BehindHead", "head_name": head, "joined_at": 0.0, "head_session_id": ""}
@@ -212,6 +363,8 @@ def parse_snapshot_value(value: object, schema: object) -> object:
     if schema is str or schema is int or schema is float or schema is bool:
         # Profile records hold millions of scalars; this check comes before the typing lookups.
         return parse_scalar(value, schema)
+    if isinstance(schema, NewType):
+        return parse_snapshot_value(value, schema.__supertype__)
     origin, args = get_origin(schema), cast(tuple[object, ...], get_args(schema))
     if schema is object:
         return value

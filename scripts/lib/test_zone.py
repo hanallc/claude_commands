@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """zone.py: resolve a place to a zone, write it live on both machines, tell every session, then publish it."""
 from __future__ import annotations
+from scripts.lint.memory_test_support import write_config_fixture
 
 import io
 import json
 import os
 import platform
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -17,11 +19,12 @@ from pathlib import Path
 from typing import cast, override
 from unittest import mock
 
-from scripts.lib import live_settings, zone, user_zone
+from scripts.lib import live_settings, main_publish, zone, user_zone
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 SCRIPT = Path(__file__).with_name("zone.py")
-CONF_TEXT = "# The zone every time shown to the user is written in.\nzone=America/New_York\n"
+INITIAL_ZONE = "America/Chicago"
+CONF_TEXT = f"# Test zone\nzone={INITIAL_ZONE}\n"
 # Each fake logs its arguments as one JSON line; the fake ssh is offline while its OFFLINE file exists.
 FAKE_SSH = """import json, pathlib, sys
 here = pathlib.Path(__file__).parent
@@ -62,6 +65,13 @@ class ResolveTests(unittest.TestCase):
         with self.assertRaises(zone.Refusal) as refused:
             _ = zone.resolve("Seattle", self.NOW)
         self.assertIn("no zone is named 'Seattle'; give the IANA zone of the place", str(refused.exception))
+
+
+    def test_notice_tells_agents_to_let_the_tools_add_the_present_time(self) -> None:
+        text = zone.notice("America/Curacao", INITIAL_ZONE)
+        self.assertIn("Write no present time. Write only future times, such as an ETA. The tools add the present time.",
+                      text)
+        self.assertNotIn("Read the clock", text)
 
 
 class StoredZoneTests(unittest.TestCase):
@@ -111,8 +121,10 @@ class SetTests(unittest.TestCase):
             _ = self.git(self.checkout, *arguments)
         (self.checkout / "config").mkdir()
         _ = (self.checkout / "config/user_zone.conf").write_text(CONF_TEXT, encoding="utf-8")
+        _ = write_config_fixture(self.checkout / "config/live_settings.conf",
+            "fetch_seconds=10\nmac_pull_seconds=20\nmac_write_seconds=10\npush_seconds=10\n")
         _ = (self.checkout / "other.txt").write_text("work in progress\n", encoding="utf-8")
-        _ = self.git(self.checkout, "add", "config/user_zone.conf")
+        _ = self.git(self.checkout, "add", "config/user_zone.conf", "config/live_settings.conf")
         _ = self.git(self.checkout, "commit", "-q", "-m", "start")
         _ = self.git(self.checkout, "push", "-q", "origin", "main")
 
@@ -136,13 +148,13 @@ class SetTests(unittest.TestCase):
         result = self.run_zone("set", "Curacao")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("zone: America/Curacao (AST, UTC-04:00); now ", result.stdout)
-        self.assertIn("was: America/New_York", result.stdout)
+        self.assertIn(f"was: {INITIAL_ZONE}", result.stdout)
         self.assertIn("live now: zone=America/Curacao", result.stdout)
         self.assertIn("mac: live now: zone=America/Curacao", result.stdout)
         self.assertIn("mac: pulled", result.stdout)
         self.assertIn("broadcast: 2 sent", result.stdout)
         conf = (self.checkout / "config/user_zone.conf").read_text(encoding="utf-8")
-        self.assertEqual(conf, CONF_TEXT.replace("America/New_York", "America/Curacao"))
+        self.assertEqual(conf, CONF_TEXT.replace(INITIAL_ZONE, "America/Curacao"))
         self.assertEqual(self.git(self.checkout, "log", "-1", "--format=%s", "origin/main").strip(),
                          "zone(America/Curacao): set with /zone (AST)")
         self.assertEqual(self.git(self.checkout, "status", "--short").strip(), "?? other.txt")
@@ -151,8 +163,44 @@ class SetTests(unittest.TestCase):
         self.assertIn(f"git fetch -q --no-write-fetch-head natedev:{self.checkout} main", pull[-1])
         (sent,) = self.log("broadcast.log")
         self.assertEqual(sent[:4], ["--from", "zone", "--all", sent[3]])
-        self.assertIn("now America/Curacao (AST, UTC-04:00); it was America/New_York", sent[3])
+        self.assertRegex(
+            sent[3],
+            r"^The user's time zone is now America/Curacao \(AST, UTC-04:00\) as of [0-9]{2}:[0-9]{2} AST; "
+            + rf"it was {INITIAL_ZONE}\. ",
+        )
         self.assertFalse(self.queued().exists())
+
+    def test_a_superseded_mac_write_sends_no_zone_notice(self) -> None:
+        mac = self.root / "mac"
+        _ = self.git(self.root, "clone", "--quiet", str(self.checkout), str(mac))
+        mac_env = {**self.env, "HOME": str(mac), "CONF_DIR": str(mac / "config"),
+                   "XDG_STATE_HOME": str(mac / "state")}
+        receiver = str(SCRIPT.with_name("live_settings.py"))
+        saved = subprocess.run([sys.executable, receiver, "user_zone", "zone", "Europe/Paris"],
+                               env={**mac_env, "LIVE_SETTINGS_SAVE_ORDER": "2"}, capture_output=True,
+                               text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
+        self.assertEqual(saved.returncode, 0, saved.stderr)
+        ssh = main_publish.ssh
+
+        def send(command: str, *, ssh_program: str, time_limit: main_publish.CommandTimeLimit,
+                 host: str = "mac") -> subprocess.CompletedProcess[str] | str:
+            if "live_settings.py" not in command:
+                return ssh(command, ssh_program=ssh_program, time_limit=time_limit, host=host)
+            order, _, _, *arguments = shlex.split(command)
+            self.assertEqual(order, "LIVE_SETTINGS_SAVE_ORDER=1")
+            return subprocess.run([sys.executable, receiver, *arguments],
+                                  env={**mac_env, "LIVE_SETTINGS_SAVE_ORDER": order.split("=", 1)[1]},
+                                  capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
+
+        with mock.patch.dict(os.environ, self.env, clear=True), \
+                mock.patch.object(user_zone, "CONF", self.checkout / "config/user_zone.conf"), \
+                mock.patch.object(main_publish, "ssh", side_effect=send), redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(zone.set_zone("Curacao"), 0)
+        self.assertIn("mac: a newer Save is already live", output.getvalue())
+        self.assertNotIn("mac: live now:", output.getvalue())
+        self.assertEqual(self.log("broadcast.log"), [])
+        self.assertFalse(self.queued().exists())
+        self.assertEqual((mac / "config/user_zone.conf").read_text(), CONF_TEXT.replace(INITIAL_ZONE, "Europe/Paris"))
 
     def test_an_offline_mac_is_queued_and_a_bare_zone_sends_it_later(self) -> None:
         _ = (self.fakes / "OFFLINE").write_text("", encoding="utf-8")
@@ -181,7 +229,8 @@ class SetTests(unittest.TestCase):
             self.assertEqual(shown.returncode, 0, shown.stderr)
             self.assertIn("mac: took the legacy change", shown.stdout)
             command = self.log("ssh.log")[-1][-1]
-            self.assertIn('cd "$HOME"/.claude && tip=$(git ls-remote', command)
+            self.assertIn('cd "$HOME"/.claude && { [ ! -f scripts/lib/waiting_rows.py ] || '
+                          + "scripts/lib/py scripts/lib/waiting_rows.py fast-forward HEAD; } && tip=$(git ls-remote", command)
             self.assertIn(f"natedev:{self.checkout} main", command)
             self.assertFalse(self.queued().exists())
 
@@ -243,14 +292,14 @@ class SetTests(unittest.TestCase):
         self.assertIn("was: the same; nothing to change", retried.stdout)
         self.assertIn("mac: pulled", retried.stdout)
         self.assertEqual(self.git(self.checkout, "show", "origin/main:config/user_zone.conf"),
-                         CONF_TEXT.replace("America/New_York", "America/Curacao"))
+                         CONF_TEXT.replace(INITIAL_ZONE, "America/Curacao"))
         self.assertEqual(self.git(self.checkout, "log", "-1", "--format=%s").strip(),
                          "zone(America/Curacao): set with /zone (AST)")
         self.assertNotIn("config/user_zone.conf", self.git(self.checkout, "status", "--short"))
 
     def test_the_same_zone_again_makes_no_commit(self) -> None:
         head = self.git(self.checkout, "rev-parse", "HEAD")
-        result = self.run_zone("set", "New York")
+        result = self.run_zone("set", INITIAL_ZONE)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("was: the same; nothing to change", result.stdout)
         self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), head)
@@ -302,6 +351,7 @@ class SetTests(unittest.TestCase):
             status = zone.set_zone("Curacao")
         self.assertEqual(status, 0)
         self.assertEqual(observed, {"fetch": [10, 10], "push": [10], "ssh": [10, 20]})
+        self.assertIn("LIVE_SETTINGS_SAVE_ORDER=1 ", self.log("ssh.log")[0][-1])
 
     def test_a_checkout_off_main_is_refused(self) -> None:
         _ = self.git(self.checkout, "switch", "-q", "-c", "work")

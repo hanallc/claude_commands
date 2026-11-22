@@ -16,6 +16,7 @@ from unittest.mock import call, patch
 
 from scripts.agents import pane_record, shutdown, stop_resume, test_stop_resume
 from scripts.herdr import herdr, pane_launch
+from scripts.herdr.test_herdr import codex_foreground_cases
 from scripts.lib import atomic_file
 from scripts.message import sessions
 from scripts.production import staff
@@ -158,9 +159,49 @@ class ProducerCommandsTests(unittest.TestCase):
                              shutdown.RetiringPane("agents", "w1:p7", "terminal-w1:p7"))
 
 
+    def test_stray_cleanup_uses_the_proved_owner_and_keeps_a_codex_parents_pane(self) -> None:
+        world = self.world()
+        client = world.client
+        codex = fixture_runtime_id("stray-codex-parent")
+        claude = world.entry["session_id"]
+        pane = "w1:p2"
+        terminal = "w1:p2-terminal"
+        receipt = world.root / "panes/.producer-admission-alpha"
+        _ = receipt.write_text(json.dumps({"pane": pane, "terminal": terminal}))
+        native = {456: herdr.NativeAgentProcess(herdr.PaneSessionReport(codex), "start-codex", {}),
+                  457: herdr.NativeAgentProcess(herdr.EnvironmentThread(claude), "start-claude", {})}
+        observed = {codex: herdr.LiveConversation("codex", (456,)),
+                    claude: herdr.LiveConversation("claude", (457,))}
+        def read_native(pid: int, *_args: object) -> herdr.NativeAgentProcess:
+            return native[pid]
+
+        read = client.result
+        with (codex_foreground_cases(world.root) as cases,
+              patch.object(client, "pane_activity", return_value=herdr.PaneRunning(("codex", "claude"))),
+              patch.object(herdr, "read_conversation", side_effect=observed.__getitem__),
+              patch.object(herdr, "native_process", side_effect=read_native),
+              patch.object(stop_resume, "producer_conflicts", return_value=[(claude, "")]),
+              patch.object(shutdown, "save_producer_cleanup")):
+            for case in cases:
+                def result(*args: str, deadline: float = math.inf) -> dict[str, object]:
+                    if args == ("pane", "process-info", "--pane", pane):
+                        return {"process_info": case.info}
+                    return read(*args, deadline=deadline)
+
+                with (self.subTest(case=case.name), patch.object(client, "result", side_effect=result),
+                      patch.object(shutdown, "finish_producer_cleanup", return_value=0) as finish):
+                    self.assertEqual(shutdown.stray_producer_panes(client, codex),
+                                     [shutdown.StrayProducerPane(pane, terminal)] if case.owner_proved else [])
+                    self.assertEqual(shutdown.remove_stray_producer("alpha", claude), 0)
+                    cleanup = cast(shutdown.PendingProducerCleanup, finish.call_args.args[1])
+                    self.assertEqual(cleanup.panes, ())
+                    self.assertFalse(cleanup.admission_matches)
+        self.assertEqual(client.closed, [])
+
     def test_remove_stray_preserves_the_real_producer_and_completes_a_rerun(self) -> None:
         for target, failure_step in (("stray", ""), ("current", ""), ("split", ""), ("pane-admission", ""),
-                ("other-admission", ""), ("no-row", ""), ("unrelated-unproved", ""), ("unretained-admission", ""),
+                ("other-admission", ""), ("foreign-session-on-pane", ""), ("no-row", ""), ("unrelated-unproved", ""),
+                ("unretained-admission", ""),
                 ("transcript-failure", "transcript"), ("pane-failure", "pane"),
                 ("stop-progress-failure", "stop-progress"), ("transcripts-only", "")):
             with self.subTest(target=target):
@@ -184,7 +225,10 @@ class ProducerCommandsTests(unittest.TestCase):
                          if target == "unretained-admission" or failure_step else
                          {"pane": "w1:p2"} if target == "pane-admission" else
                          {"session_id": fixture_runtime_id("other-admission"), "pane": "w1:p8"}
-                         if target == "other-admission" else {"session_id": identity, "pane": "w1:p2"})
+                         if target == "other-admission" else
+                         {"session_id": fixture_runtime_id("other-admission"), "pane": "w1:p2",
+                          "terminal": "w1:p2-terminal"} if target == "foreign-session-on-pane" else
+                         {"session_id": identity, "pane": "w1:p2"})
                 _ = receipt.write_text(json.dumps(saved))
                 transcripts: list[Path] = []
                 for account in (".claude3", ".claude4"):
@@ -255,7 +299,7 @@ class ProducerCommandsTests(unittest.TestCase):
                     self.assertEqual(case.kill.call_args_list, [call(123, signal.SIGTERM)])
                     self.assertEqual(case.client.closed, ["w1:p2"])
                     self.assertEqual(sessions.transcript_locations(identity), [])
-                    if target == "other-admission":
+                    if target in ("other-admission", "foreign-session-on-pane"):
                         self.assertEqual(json.loads(receipt.read_text()), saved)
                     else:
                         self.assertEqual(list(receipt.parent.glob(receipt.name)), [])

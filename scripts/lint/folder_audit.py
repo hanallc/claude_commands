@@ -1,7 +1,6 @@
 #!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
-"""Find loose folders in ~/rust, ~/rust/scratch, /tmp, /tmp/claude, $TMPDIR and the folder that holds the
-scratch and copies roots (/build/claude on natedev) once a day, remove the idle ones whose removal loses
-no work, and tell their makers.
+"""Find loose folders in ~/rust, ~/rust/scratch, /tmp, /tmp/claude and $TMPDIR once a day.
+Remove idle folders that hold no unsaved work. Tell their makers.
 
 The scratch guard refuses most loose folders before they exist, and the hourly tmp sweep removes the
 temp leftovers that cannot hold work (tempfile folders, folders that hold only folders, verify.sh run folders, invoke.sh logs). This audit is
@@ -10,7 +9,7 @@ the backstop for the rest: folders that can hold work. A folder is loose when it
   * in ~/rust: a name in config/rust_roots.txt (one per line, `#` starts a comment), or a scratch
     root (~/rust/repro, ~/rust/scratch);
   * in ~/rust/scratch: nothing; every folder there is loose, since scratch.py never makes one there;
-  * in /tmp, /tmp/claude, $TMPDIR and the roots' folder: a name the system or a tool owns (KEPT_NAMES, KEPT_PREFIXES),
+  * in /tmp, /tmp/claude and $TMPDIR: a name the system or a tool owns (KEPT_NAMES, KEPT_PREFIXES),
     a session scratchpad (/tmp/claude-<uid>), a run folder root, a scratch root, a folder that holds
     only folders, a verify.sh run folder or a tempfile folder, which the sweep judges.
 
@@ -19,7 +18,8 @@ folder mtimes and each git repo's HEAD, index and HEAD log, so a commit counts. 
 change-time scan also checks mtime and ctime throughout the tree, so copying files with preserved
 mtimes starts a new idle period. Removal uses lint.conf folder_remove_after_seconds.
 
-A loose clone uses clone_max_hours from hana_instances.conf. Other folders use folder_remove_after_seconds from lint.conf.
+A registered test clone uses clone_max_hours from hana_instances.conf.
+Other folders use folder_remove_after_seconds from lint.conf.
 On the Mac, free_floor_gib from mac_test.conf can select younger idle clones too, oldest first.
 Under that floor, unsaved clones lose only target. These rules share all of the following keeps:
 
@@ -59,7 +59,7 @@ import shutil
 import subprocess
 import sys
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -69,12 +69,13 @@ from typing import Protocol, cast
 from scripts.lint import sweep, tmp_sweep
 from scripts.message import session_send
 from scripts.lint.tmp_sweep import SYSTEM_TEMP_NAMES, SYSTEM_TEMP_PREFIXES, TEMPFILE_NAME
-from scripts.lib import cargo_output, conf, copy_record, scratch, unit_runs
+from scripts.lib import build_folders, cargo_output, conf, copy_record, scratch, unit_runs
 from scripts.lib.conf import UseConfiguredValue
 from scripts.lint.tmp_sweep import ProcessUsesUnavailable as ProcessUsesUnavailable
 
 RUST_ROOTS_FILE = Path(__file__).resolve().parents[2] / "config" / "rust_roots.txt"
 RUST_SCRATCH_NAME = "scratch"
+TEMP_SCAN_ROOTS = (Path("/tmp"), Path("/tmp/claude"))
 KEPT_NAMES = SYSTEM_TEMP_NAMES | {
     unit_runs.RUN_ROOT.name, unit_runs.FORMER_RUN_ROOT.name, copy_record.root().name,
     copy_record.copies_root().name, Path(tmp_sweep.SESSION_TEMP_ROOT).name, "repro",
@@ -96,6 +97,7 @@ HELD = "a hold keeps it"
 TOO_LARGE = "too many entries to read"
 LIVE_SOCKET = "a live process binds a socket in it"
 TARGET_REMOVED = "removed target; kept unsaved source"
+NO_SPACE_FREED = "no space freed. Unsaved source stays"
 WOULD_REMOVE_TARGET = "would remove target; keep unsaved source"
 
 
@@ -120,32 +122,10 @@ def clone_policy() -> ClonePolicy:
 
 
 def is_clone(path: Path, *, scratch_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT) -> bool:
-    """A registered test clone (also when partial), or a loose independent Git clone."""
+    """Use the clone maker's record to identify a test clone, including a partial clone."""
     record = scratch.task_of(path, scratch_settings=scratch_settings)
-    if isinstance(record, copy_record.Registered) and record.fields.get("test_hana_clone") is True:
-        return True
-    return (path / ".git").is_dir() and not (path / ".git").is_symlink()
-
-
-def test_clones(roots: list[Path], *,
-    scratch_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
-) -> list[Path]:
-    """Only registered test clones under protected scratch roots belong to this audit."""
-    if isinstance(scratch_settings, UseConfiguredValue):
-        scratch_settings = conf.read("scratch")
-    found: list[Path] = []
-    for root in roots:
-        try:
-            entries = sorted(root.iterdir())
-        except OSError:
-            continue
-        for entry in entries:
-            if entry.is_symlink() or not entry.is_dir():
-                continue
-            record = scratch.task_of(entry, scratch_settings=scratch_settings)
-            if isinstance(record, copy_record.Registered) and record.fields.get("test_hana_clone") is True:
-                found.append(entry)
-    return found
+    return (isinstance(record, copy_record.Registered) and record.fields.get("test_hana_clone") is True
+            and record.fields.get("clone_path") == str(path.resolve()))
 
 
 def free_bytes(path: Path) -> int:
@@ -172,7 +152,7 @@ def remove_clone_targets(path: Path, removing: bool, *,
         scratch.cargo_removal_mark(path.resolve()).unlink(missing_ok=True)
     except OSError as error:
         return f"target removal failed: {error}"
-    return TARGET_REMOVED
+    return TARGET_REMOVED if targets else NO_SPACE_FREED
 
 
 @dataclass(frozen=True)
@@ -200,11 +180,47 @@ def kept_in_temp(entry: Path, verify_name: re.Pattern[str]) -> bool:
     return tmp_sweep.holds_no_file(str(entry)) or verify_name.fullmatch(name) is not None
 
 
+@dataclass(frozen=True)
+class DirectoryIdentity:
+    device: int
+    inode: int
+
+
+def directory_identity(info: os.stat_result) -> DirectoryIdentity:
+    return DirectoryIdentity(info.st_dev, info.st_ino)
+
+
+def checked_scan_roots(roots: Iterable[Path]) -> dict[Path, tuple[Path, DirectoryIdentity]]:
+    """Resolve all roots and refuse the home directory and its ancestors by identity."""
+    home = Path.home().resolve()
+    protected = {directory_identity(path.stat()) for path in (home, *home.parents)}
+    checked: dict[Path, tuple[Path, DirectoryIdentity]] = {}
+    for root in dict.fromkeys(roots):
+        resolved = root.resolve()
+        try:
+            info = resolved.stat()
+        except (FileNotFoundError, NotADirectoryError):
+            continue
+        identity = directory_identity(info)
+        if identity in protected:
+            raise ValueError(f"unsafe scan root {root} (resolves to {resolved}): contains the home directory")
+        if stat.S_ISDIR(info.st_mode):
+            checked[root] = (resolved, identity)
+    return checked
+
+
+@dataclass(frozen=True)
+class DiscoveredFolder:
+    path: Path
+    scan_root: Path
+
+
 def candidates(rust: Path, temps: list[Path], expected: frozenset[str] | None, *,
+    clone_roots: Sequence[Path] = (),
     scratch_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
-) -> list[Path]:
+) -> list[DiscoveredFolder]:
     """Every loose folder this user owns, before the age rule."""
-    visible_root = scratch.visible_root(scratch_settings=scratch_settings)
+    visible_root = scratch.visible_root(scratch_settings=scratch_settings).resolve()
 
     def kept_in_rust(entry: Path) -> bool:
         return expected is None or entry == visible_root or entry.name in expected or entry.name in KEPT_NAMES
@@ -212,9 +228,16 @@ def candidates(rust: Path, temps: list[Path], expected: frozenset[str] | None, *
     verify_name = tmp_sweep.verify_temp_name()
     roots: list[tuple[Path, Callable[[Path], bool]]] = [
         (rust, kept_in_rust), (rust / RUST_SCRATCH_NAME, lambda _entry: False),
-        *((temp, lambda entry: kept_in_temp(entry, verify_name)) for temp in temps)]
-    found: list[Path] = []
+        *((temp, lambda entry: kept_in_temp(entry, verify_name)) for temp in temps),
+        *((root, lambda entry: not is_clone(entry, scratch_settings=scratch_settings)) for root in clone_roots)]
+    checked = checked_scan_roots(root for root, _ in roots)
+    scans: dict[DirectoryIdentity, tuple[Path, list[Callable[[Path], bool]]]] = {}
     for root, keep in roots:
+        if root in checked:
+            resolved, identity = checked[root]
+            scans.setdefault(identity, (resolved, []))[1].append(keep)
+    found: list[DiscoveredFolder] = []
+    for root, keep_checks in scans.values():
         try:
             entries = sorted(root.iterdir())
         except OSError:
@@ -225,8 +248,8 @@ def candidates(rust: Path, temps: list[Path], expected: frozenset[str] | None, *
                     continue
             except OSError:
                 continue
-            if not keep(entry):
-                found.append(entry)
+            if not all(keep(entry) for keep in keep_checks):
+                found.append(DiscoveredFolder(entry, root))
     return found
 
 
@@ -289,7 +312,7 @@ def _last_change(path: Path, limits: FolderScanLimits, *,
     for repo in scratch.repos(path, scratch_settings=scratch_settings):
         git = scratch.git_directory(repo)
         if isinstance(git, scratch.GitDirectory):
-            newest = max([newest, *(_mtime(git.path / name) for name in GIT_TIME_FILES)])
+            newest = max([newest, *(_mtime(git.checkout.git_dir / name) for name in GIT_TIME_FILES)])
     return float(newest)
 
 
@@ -400,9 +423,9 @@ def resume_pending_prunes(*, lint_settings: conf.ConfigRead | UseConfiguredValue
         for record in directory.glob("*.prune"):
             try:
                 pending = read_pending_prune(record)
-                # A partial delete must pass the normal removal checks again.
                 if not os.path.lexists(pending.removed_path):
-                    scratch.remove_marked(pending.removed_path)
+                    # The remover checks Cargo output before it deletes the source.
+                    scratch.finish_removal(pending.removed_path, cargo_cleaned=True)
                     finish_pending_prune(record, pending)
             except (OSError, ValueError, scratch.ScratchError, subprocess.SubprocessError) as error:
                 print(f"folder audit: pending prune {record}: {error}", file=sys.stderr)
@@ -639,16 +662,23 @@ def audit(rust: Path, temps: list[Path], expected: frozenset[str] | None, now: f
         lint_settings = conf.read("lint")
     if isinstance(scratch_settings, UseConfiguredValue):
         scratch_settings = conf.read("scratch")
+    discovered = candidates(rust, temps, expected, clone_roots=[copy_record.root()] if clone_roots is None else clone_roots,
+                            scratch_settings=scratch_settings)
     if removing:
         resume_pending_prunes(lint_settings=lint_settings)
     changes: dict[Path, float | str] = {}
     limits = folder_scan_limits(lint_settings=lint_settings, scratch_settings=scratch_settings)
     listed_outcome = listed(lint_settings=lint_settings)
     minimum_folder_age = lint_settings.whole("folder_min_age_seconds")
-    discovered = candidates(rust, temps, expected, scratch_settings=scratch_settings) + test_clones([copy_record.root()] if clone_roots is None else clone_roots, scratch_settings=scratch_settings)
-    # macOS reports /private/tmp in lsof even when discovery started through /tmp.
-    # Resolve once at discovery, before age, hold, process, socket and lock checks.
-    for entry in dict.fromkeys(entry.resolve() for entry in discovered):
+    # Resolve aliases before the age and live-use checks.
+    for candidate in discovered:
+        entry = candidate.path.resolve()
+        if entry == candidate.scan_root or not entry.is_relative_to(candidate.scan_root):
+            print(f"folder audit: skipped {candidate.path}: resolves outside its scan root {candidate.scan_root}",
+                  file=sys.stderr)
+            continue
+        if entry in changes:
+            continue
         when = _last_change(entry, limits, scratch_settings=scratch_settings)
         if isinstance(when, float):
             minimum_age = 0 if is_clone(entry, scratch_settings=scratch_settings) else minimum_folder_age
@@ -678,15 +708,44 @@ def message(folders: list[Loose], *,
             + "`scratch.py new`.")
 
 
+def check_cargo_output_location(path: Path) -> None:
+    """Keep output in the home directory outside the configured build root."""
+    resolved = path.resolve()
+    parents = {directory_identity(parent.stat()) for parent in resolved.parents}
+    home = Path.home().resolve()
+    home_identity = directory_identity(home.stat())
+    if home_identity not in parents:
+        return
+    settings = conf.read("build_folders")
+    configured = settings.value("roots.build", str, default="", recover_invalid=False)
+    # Older configurations name the cargo directory inside the build root.
+    if configured:
+        build = Path(configured).expanduser().resolve()
+    else:
+        slot_cargo = Path(os.path.expandvars(settings.text("roots.slot_cargo"))).expanduser()
+        build = slot_cargo.parent.resolve()
+    protected = {directory_identity(parent.stat()) for parent in (home, *home.parents)}
+    try:
+        build_identity = directory_identity(build.stat())
+    except FileNotFoundError:
+        pass
+    else:
+        if build_identity in parents and build_identity not in protected:
+            return
+    raise ValueError(f"unsafe Cargo output root {path}: outside the configured build root {build}")
+
+
 def clean_checkout_cargo_output(path: Path) -> None:
-    """Remove external output only after ownership, use stamps, locks and processes permit removal."""
+    """Report external output after checking ownership, use stamps, locks and processes."""
     attempt_started = time.time()
     saved = scratch.save_cargo_outputs(path)
-    if not any(not output.roots.build_directory.is_relative_to(path)
-               and output.roots.build_directory.exists()
-               and not output.borrows_build_directory()
-               for output in saved):
+    outputs = [output for output in saved if not output.roots.build_directory.is_relative_to(path)
+               and output.roots.build_directory.exists() and not output.borrows_build_directory()]
+    if not outputs:
         return
+    _ = checked_scan_roots(output.roots.build_directory for output in outputs)
+    for output in outputs:
+        check_cargo_output_location(output.roots.build_directory)
     index = sweep.saved_cargo_output_roots()
     if not index.workspaces:
         raise OSError("the saved mapping index is empty or unreadable")
@@ -703,14 +762,12 @@ def clean_checkout_cargo_output(path: Path) -> None:
                 print(f"skip unreadable checkout {peer}: {mapping.reason}", file=sys.stderr)
                 continue
             known.append(mapping)
-    for output in saved:
+    for output in outputs:
         root = output.roots.build_directory
-        if root.is_relative_to(path) or not root.exists():
+        if not root.exists():
             continue
         if path.is_relative_to(root) or root == output.roots.workspace_root:
             raise OSError(f"unsafe Cargo output root: {root}")
-        if output.borrows_build_directory():
-            continue
         shared = any(other.workspace_root != output.roots.workspace_root
                      and not other.workspace_root.is_relative_to(path)
                      and (root.is_relative_to(other.target_directory)
@@ -719,39 +776,41 @@ def clean_checkout_cargo_output(path: Path) -> None:
                           or other.build_directory.is_relative_to(root)) for other in known)
         if shared:
             continue
-        trees = list(dict.fromkeys([str(root), *sweep.build_trees(str(root))]))
-        locked = sweep.lock_trees(trees)
-        if isinstance(locked, sweep.TargetLockBusy):
-            raise OSError(f"Cargo output is locked: {locked.path}")
-        try:
-            uses = process_uses([root])
-            if isinstance(uses, ProcessUsesUnavailable) or any(
-                    pid != os.getpid() and Path(used).resolve().is_relative_to(root) for used, pid, _ in uses.paths):
-                raise OSError(f"Cargo output is busy or unreadable: {root}")
-            stamp = root / scratch.USE_STAMP
-            if stamp.exists() and stamp.stat().st_mtime > attempt_started:
-                raise OSError(f"Cargo output was used after cleanup started: {root}")
-            shutil.rmtree(root)
-            remove_empty_mirror_parents(root, output.roots.workspace_root, path)
-        finally:
-            sweep.release(locked.held)
+        if not build_folders.may_remove_build_path(root):
+            raise OSError(f"Cargo output is protected: {root}")
+        with build_folders.folder_removal_lease(root, wait=False, create=False) as lease:
+            if isinstance(lease, build_folders.RefusedRemovalLease):
+                raise OSError(f"Cargo output is locked: {root}")
+            remove_locked_cargo_output(root, attempt_started)
 
+
+def remove_locked_cargo_output(root: Path, attempt_started: float) -> None:
+    """Report this Cargo output while its folder lock is held."""
+    trees = list(dict.fromkeys([str(root), *sweep.build_trees(str(root))]))
+    locked = sweep.lock_trees(trees)
+    if isinstance(locked, sweep.TargetLockBusy):
+        raise OSError(f"Cargo output is locked: {locked.path}")
+    try:
+        uses = process_uses([root])
+        if isinstance(uses, ProcessUsesUnavailable) or any(
+                pid != os.getpid() and Path(used).resolve().is_relative_to(root) for used, pid, _ in uses.paths):
+            raise OSError(f"Cargo output is busy or unreadable: {root}")
+        stamp = root / scratch.USE_STAMP
+        if stamp.exists() and stamp.stat().st_mtime > attempt_started:
+            raise OSError(f"Cargo output was used after cleanup started: {root}")
+        if not build_folders.may_remove_folder_tree(root):
+            raise OSError(f"Cargo output is mounted or could not be verified: {root}")
+        print(f"kept for a manual removal list: {root} (folder_audit, checkout Cargo output)", file=sys.stderr)
+    finally:
+        sweep.release(locked.held)
 
 def remove_empty_mirror_parents(root: Path, workspace: Path, path: Path) -> None:
-    """Remove the empty folders above a build-dir that mirror the removal tree, so no empty gate folder stays."""
+    """Report the former mirror parent without removing it."""
     tail = workspace.parts[1:]
-    if not tail or root.parts[-len(tail):] != tail:
-        return
-    top = Path(*root.parts[:-len(tail)]).joinpath(*path.parts[1:])
-    if path.is_relative_to(top):
-        return
-    folder = root.parent
-    while folder.is_relative_to(top):
-        try:
-            folder.rmdir()
-        except OSError:
-            return
-        folder = folder.parent
+    if tail and root.parts[-len(tail):] == tail:
+        top = Path(*root.parts[:-len(tail)]).joinpath(*path.parts[1:])
+        if not path.is_relative_to(top) and top.is_dir():
+            print(f"kept for a manual removal list: {top} (folder_audit, former mirror parent)", file=sys.stderr)
 
 
 def main(argv: list[str]) -> int:
@@ -784,13 +843,13 @@ def main(argv: list[str]) -> int:
     expected = expected_rust_names()
     if expected is None:
         print(f"folder audit: {RUST_ROOTS_FILE} cannot be read; ~/rust is not judged")
-    temps = list(dict.fromkeys(Path(os.path.realpath(path)) for path in
-                               ("/tmp", "/tmp/claude", os.environ.get("TMPDIR", ""),
-                                str(copy_record.root().parent), str(copy_record.copies_root().parent)) if path))
+    temps = list(TEMP_SCAN_ROOTS)
+    if temporary := os.environ.get("TMPDIR"):
+        temps.append(Path(temporary))
     now = time.time()
     removing = armed(lint_settings=lint_settings)
     try:
-        loose = audit(Path(os.path.realpath(Path.home() / "rust")), temps, expected, now, removing=removing, lint_settings=lint_settings, scratch_settings=scratch_settings)
+        loose = audit(Path.home() / "rust", temps, expected, now, removing=removing, lint_settings=lint_settings, scratch_settings=scratch_settings)
     except (OSError, UnicodeError, ValueError) as error:
         print(f"folder audit: {error}", file=sys.stderr)
         return 2

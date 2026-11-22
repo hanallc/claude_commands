@@ -20,9 +20,14 @@ from typing import Literal, NamedTuple, TypedDict, cast, override
 import unittest
 from unittest import mock
 
+from scripts.lib import process_stat, removal_guard
+from scripts.lib.helper_tree_test_support import COPY_HELPERS, copy_helpers
+
 from scripts.lib.py_floor_test_support import interpreter_cache_environment
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.copies.copies_test_support import copies_environment
 from scripts.mac_test import eligibility, claim_state, linux_runner, mac_test, offload, test_target_slots
+from scripts.mac_test.offload_test_commands import WORKSPACE_SWEEP_SETTINGS, WorkspaceSweepFixture
 from scripts.mac_test.offload_test_support import mirror_use_payload
 from scripts.lint.memory_test_support import write_config_fixture
 
@@ -136,6 +141,7 @@ rustup)
     ;;
 cargo|cargo-nextest|cargo-mend)
     if [[ $tool == cargo && "$*" == "metadata --format-version 1 --no-deps" && $# == 4 ]]; then
+        [[ -f Cargo.toml ]] || exit 101
         if [[ -n ${FAKE_CARGO_NEEDS_TOOLCHAIN-} && -z ${RUSTUP_TOOLCHAIN-} \
               && ! -f rust-toolchain && ! -f rust-toolchain.toml ]]; then
             echo "error: rustup could not choose a version of cargo to run" >&2
@@ -200,7 +206,8 @@ class LinuxShellTests(unittest.TestCase):
             + "free_floor_gib=10\nbuild_budget_gib=32\ntarget_budget_gib=24\n"
             + "target_budget_gib.hana=31\ntarget_budget_gib.phase-copy=2\n"
             + "devshell.hana=ci\ndevshell.phase-copy=wrong\nskip.hana=test(gpu)\n"
-            + "devshell=default\nshell_cache=.local/state/build-target/shells\nshell_timeout_s=2\n",
+            + "devshell=default\nshell_cache=.local/state/build-target/shells\n"
+            + f"shell_timeout_s={TEST_HANG_GUARD_SECS}\n",
             template="mac_test",
         )
         registry = self.root / "build_targets.conf"
@@ -209,9 +216,10 @@ class LinuxShellTests(unittest.TestCase):
             + "kind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac.conf\n"
         )
         _ = (self.root / "mac.conf").write_text("offload=on\nhost=fake-mac\nlinux_only.phase-copy=\n")
-        _ = write_config_fixture(self.root / "lint.conf", "recent_minutes=60\n")
+        _ = (self.root / "lint.conf").write_text(WORKSPACE_SWEEP_SETTINGS)
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
-            "HOME": str(self.root), "BUILD_TARGETS_CONFIG": str(registry), "CONF_DIR": str(self.root),
+            "HOME": str(self.root), "XDG_CONFIG_HOME": str(self.root / ".config"),
+            "BUILD_TARGETS_CONFIG": str(registry), "CONF_DIR": str(self.root),
         })))
         _ = self.enterContext(mock.patch.object(Path, "home", return_value=self.root))
         self.mirror = self.root / offload.remote_mirror(self.identity, "linux", 2)
@@ -225,19 +233,18 @@ class LinuxShellTests(unittest.TestCase):
         self.event_path = self.root / "events.jsonl"
         tools = self.root / "bin"
         tools.mkdir()
-        for tool in ("nix", "df", "rm", "rustup", "cargo-nextest", "cargo-mend"):
+        for tool in ("nix", "df", "rm", "rustup", "cargo", "cargo-nextest", "cargo-mend"):
             self.write_tool(tools / tool)
         self.write_tool(self.root / ".claude/scripts/lint/lint")
-        for folder in ("lib", "copies"):
-            (self.root / ".claude/scripts" / folder).symlink_to(
-                Path(__file__).resolve().parents[1] / folder, target_is_directory=True)
+        _ = copy_helpers(self.root, *COPY_HELPERS)
         _ = self.enterContext(mock.patch.object(linux_runner, "boot_identity", return_value="fixture-boot"))
         real_rm = shutil.which("rm")
         if real_rm is None:
             self.fail("The fixture needs the rm executable")
         self.environment = {
             **interpreter_cache_environment(self.root / "cache"),
-            "HOME": str(self.root), "PATH": f"{tools}:/run/current-system/sw/bin:/usr/bin:/bin",
+            "HOME": str(self.root), "XDG_CONFIG_HOME": str(self.root / ".config"),
+            "PATH": f"{tools}:/run/current-system/sw/bin:/usr/bin:/bin",
             "TEST_REAL_RM": real_rm,
             "TOOL_EVENTS": str(self.event_path), "BUILD_TARGETS_CONFIG": str(registry),
             "CONF_DIR": str(self.root),
@@ -288,11 +295,15 @@ class LinuxShellTests(unittest.TestCase):
         free = int(self.environment.get("FAKE_FREE_GIB", "100")) * 1024 ** 3
         real_run = subprocess.run
         def child(argv: list[str], *, cwd: Path | str = "", check: bool = False,
-                  capture_output: bool = False, text: bool = False, timeout: float = 5,
+                  capture_output: bool = False, text: bool = False, timeout: float = TEST_HANG_GUARD_SECS,
                   env: dict[str, str] | None = None, pass_fds: tuple[int, ...] = ()) -> subprocess.CompletedProcess[str]:
             _ = text
-            if len(argv) > 2 and argv[1] == "-c" and "sweep.sweep_workspace" in argv[2] and not self.use_real_sweep:
-                return subprocess.CompletedProcess(argv, 0, "", "")
+            if len(argv) > 2 and argv[1] == "-c" and "sweep.sweep_workspace" in argv[2]:
+                if not self.use_real_sweep:
+                    return subprocess.CompletedProcess(argv, 0, "", "")
+                proc = self.root / "proc"
+                proc.mkdir(exist_ok=True)
+                argv = [*argv[:2], WorkspaceSweepFixture(proc).python_prefix() + argv[2], *argv[3:]]
             completed = real_run(argv, cwd=cwd or self.root, check=check, capture_output=True,
                                  text=True, timeout=timeout, env=env, pass_fds=pass_fds)
             if not capture_output:
@@ -610,7 +621,16 @@ class LinuxShellTests(unittest.TestCase):
         self.assertNotIn("BUILDLOG_BUILD_BUDGET_GIB", event["environment"])
         self.assertEqual(event["environment"]["LINT_SWEEP_BUDGET_GIB"], "35")
 
-    def test_slot_budget_removes_only_the_selected_build_folder(self) -> None:
+    def assert_budget_review(self, result: subprocess.CompletedProcess[str], target: Path) -> None:
+        plans = [Path(line.removeprefix("removal list: ")) for line in result.stdout.splitlines()
+                 if line.startswith("removal list: ")]
+        self.assertEqual(len(plans), 1, result.stdout + result.stderr)
+        [plan] = plans
+        self.assertEqual(plan.parent, self.root / removal_guard.LIST_DIRECTORY)
+        rows = [removal_guard.ListedEntry.parse(line) for line in plan.read_text().splitlines()]
+        self.assertEqual([(row.path, row.fingerprint) for row in rows], [(target, "")])
+
+    def test_slot_budget_lists_only_the_selected_build_folder(self) -> None:
         self.use_real_sweep = True
         _ = self.settings.write_text(self.settings.read_text().replace("target_budget_gib.hana=31", "target_budget_gib.hana=0.0001"))
         old = self.build_output("target", "old", 1, 196608)
@@ -623,12 +643,13 @@ class LinuxShellTests(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("mac_cleanup=kept", result.stdout)
-        self.assertFalse(old.exists())
+        self.assert_budget_review(result, self.mirror / "target")
+        self.assertTrue(old.exists())
         self.assertTrue(recent.exists())
         self.assertEqual((self.mirror / "target/warm-proof").read_text(), "warm\n")
         self.assertEqual(other.read_text(), "another slot\n")
 
-    def test_budget_trims_old_output_and_keeps_recent_output_until_the_disk_floor(self) -> None:
+    def test_budget_lists_output_and_keeps_it_until_the_disk_floor(self) -> None:
         self.use_real_sweep = True
         _ = self.settings.write_text(self.settings.read_text().replace(
             "target_budget_gib.hana=31", "target_budget_gib.hana=0.0001"))
@@ -641,11 +662,12 @@ class LinuxShellTests(unittest.TestCase):
         result = self.execute(self.request())
 
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertFalse(old.exists())
+        self.assert_budget_review(result, self.mirror / "target")
+        self.assertTrue(old.exists())
         self.assertTrue(recent.exists())
         self.assertEqual((self.mirror / "target/warm-proof").read_text(), "warm\n")
         used = sum(path.stat().st_size for path in (self.mirror / "target").rglob("*") if path.is_file())
-        self.assertLessEqual(used, 0.0001 * 1024 ** 3)
+        self.assertGreater(used, 0.0001 * 1024 ** 3)
         self.assertEqual(neighbor.read_text(), "another slot\n")
 
         self.environment["FAKE_FREE_GIB"] = "1"
@@ -666,7 +688,8 @@ class LinuxShellTests(unittest.TestCase):
         result = self.execute(self.request(words=("--target-dir", "custom-build")))
 
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertFalse(old.exists())
+        self.assert_budget_review(result, self.mirror / "custom-build")
+        self.assertTrue(old.exists())
         self.assertTrue(recent.exists())
         self.assertEqual((self.mirror / "custom-build/warm-proof").read_text(), "warm\n")
         self.assertEqual((self.mirror / "target/retained").read_text(), "default folder\n")
@@ -808,7 +831,7 @@ class LinuxShellTests(unittest.TestCase):
         real_run = subprocess.run
 
         def capture(argv: list[str], *, cwd: Path | str = "", check: bool = False,
-                    capture_output: bool = False, text: bool = False, timeout: float = 5,
+                    capture_output: bool = False, text: bool = False, timeout: float = TEST_HANG_GUARD_SECS,
                     pass_fds: tuple[int, ...] = ()) -> subprocess.CompletedProcess[str]:
             _ = text
             result = real_run(argv, cwd=cwd or self.root, check=check, capture_output=True,
@@ -1036,7 +1059,7 @@ class LinuxShellTests(unittest.TestCase):
         real_run = subprocess.run
 
         def capture(argv: list[str], *, cwd: Path | str = "", check: bool = False,
-                    capture_output: bool = False, text: bool = False, timeout: float = 5,
+                    capture_output: bool = False, text: bool = False, timeout: float = TEST_HANG_GUARD_SECS,
                     env: Mapping[str, str] | None = None, pass_fds: tuple[int, ...] = ()) -> subprocess.CompletedProcess[str]:
             _ = text
             reply = real_run(argv, cwd=cwd or self.root, check=check, capture_output=True, text=True,
@@ -1164,7 +1187,7 @@ class LinuxProcessTests(unittest.TestCase):
         _ = self.enterContext(mock.patch.object(Path, "resolve", resolve_path))
 
     def use_private_processes(self) -> None:
-        fields = linux_runner.process_fields
+        fields = process_stat.process_fields
         processes = linux_runner.slot_processes
 
         def private_fields(pid: int, proc_root: Path = linux_runner.PROC_ROOT) -> list[str]:
@@ -1176,7 +1199,7 @@ class LinuxProcessTests(unittest.TestCase):
             _ = proc_root
             return processes(mirror, self.proc, require_boot_identity=require_boot_identity)
 
-        _ = self.enterContext(mock.patch.object(linux_runner, "process_fields", side_effect=private_fields))
+        _ = self.enterContext(mock.patch.object(process_stat, "process_fields", side_effect=private_fields))
         _ = self.enterContext(mock.patch.object(linux_runner, "slot_processes", side_effect=private_processes))
 
     def selector_output(self) -> subprocess.CompletedProcess[str]:
@@ -1639,7 +1662,7 @@ class LinuxProcessTests(unittest.TestCase):
 
         self.assertEqual(set(selected), {100, 101, 103})
         self.assertTrue(marker.exists())
-        fields = linux_runner.process_fields(100, proc_root=self.proc)
+        fields = process_stat.process_fields(100, proc_root=self.proc)
         self.assertEqual((fields[0], fields[2], fields[19]), ("S", "100", "123"))
 
     def test_runner_before_marker_publication_selects_only_its_exact_slot(self) -> None:
@@ -1699,7 +1722,7 @@ class LinuxProcessTests(unittest.TestCase):
             raise ValueError("fixture shell failure")
 
         values = {"shell_cache": "cache", "devshell": "ci", "shell_timeout_s": "2", "kinds": "test,check,doc"}
-        with mock.patch.object(linux_runner, "process_fields", return_value=fields), \
+        with mock.patch.object(process_stat, "process_fields", return_value=fields), \
                 mock.patch.object(linux_runner, "slot_processes", return_value=()), \
                 mock.patch.object(linux_runner, "prepare_shell", side_effect=fail_shell):
             with self.assertRaisesRegex(ValueError, "fixture shell failure"):
@@ -1709,7 +1732,7 @@ class LinuxProcessTests(unittest.TestCase):
     def test_detached_children_keep_the_marker_and_emit_uncertain_cleanup(self) -> None:
         fields = ["S", "1", "900", *(["0"] * 16), "123"]
         output = io.StringIO()
-        with mock.patch.object(linux_runner, "process_fields", return_value=fields), \
+        with mock.patch.object(process_stat, "process_fields", return_value=fields), \
                 mock.patch.object(linux_runner, "slot_processes", return_value=(101,)), redirect_stdout(output):
             with linux_runner.slot_run(self.mirror):
                 self.assertTrue((self.mirror / ".linux-run.json").exists())
@@ -1784,7 +1807,7 @@ class LinuxCopyTests(unittest.TestCase):
         _ = self.write_source("src/lib.rs", "first source\n")
         remote_home = self.root / "remote-home"
         remote_home.mkdir()
-        (remote_home / ".claude").symlink_to(Path(__file__).resolve().parents[2], target_is_directory=True)
+        _ = copy_helpers(remote_home, *COPY_HELPERS, "config")
         ssh = self.root / "ssh"
         _ = ssh.write_text('#!/bin/bash\nwhile [[ $1 == -o ]]; do shift 2; done\n'
                            + '[[ $1 == natedev ]] && exit 255\n'
@@ -2181,7 +2204,7 @@ class LinuxDispatchTests(unittest.TestCase):
         mirror.mkdir(parents=True)
         fields = ["S", "1", "100", *(["0"] * 16), "123"]
         wire = io.StringIO()
-        with mock.patch.object(linux_runner, "process_fields", return_value=fields), \
+        with mock.patch.object(process_stat, "process_fields", return_value=fields), \
                 mock.patch.object(linux_runner, "slot_processes", return_value=(101,)), redirect_stdout(wire):
             with linux_runner.slot_run(mirror):
                 print("mac_exit=0\nmac_cleanup=kept")

@@ -48,7 +48,7 @@ class UpkeepTests(unittest.TestCase):
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name)
         self.enterContext(patch.dict(os.environ, {"XDG_STATE_HOME": str(self.root),
-            "MERGE_GATE_STATE_DIR": str(self.root / "merge-gate"),
+            "GATE_STATE_DIR": str(self.root / "merge-gate"),
             "HERDR_UPKEEP_CONFIG": str(self.root / "config.toml")}))
         _ = (self.root / "config.toml").write_text("[job]\ninterval_seconds=120\ntimeout_seconds=0.2\n")
 
@@ -190,7 +190,10 @@ class UpkeepTests(unittest.TestCase):
                     else accounts.NamedAccount("claude3", case.root / ".claude3"))
 
         def live(identity: str) -> sessions.LiveSessionProcess | sessions.SessionNotLive:
-            return sessions.LiveSessionProcess(456) if identity in launches else sessions.SessionNotLive()
+            launch = launches.get(identity)
+            if launch is not None and launch[0] == "claude":
+                return sessions.LiveSessionProcess(456)
+            return sessions.SessionNotLive()
 
         with (patch.object(job, "time", clock),
               patch.object(operation_deadline, "time", clock),
@@ -200,6 +203,7 @@ class UpkeepTests(unittest.TestCase):
               patch.object(herdr, "prepare_session_environment", side_effect=prepare),
               patch.object(herdr, "launch_prepared_agent", side_effect=launch),
               patch.object(herdr, "read_conversation", side_effect=conversation),
+              patch.object(pane_record, "save", test_stop_resume.SAVE_PANE_RECORD),
               patch.object(accounts, "role_account", side_effect=select),
               patch.object(account, "process_codex_home", return_value=account.ProcessCodexHome(case.root / ".codex1")),
               patch.object(accounts, "codex_home_label", return_value="codex1"),
@@ -210,7 +214,8 @@ class UpkeepTests(unittest.TestCase):
             self.assertEqual(set(launches), {rows[name].current_session for name in ("alpha", "own-codex")})
             self.assertEqual(attempts.count("failed"), 1)
             self.assertEqual(errors.getvalue().count("fixture start failed"), 1)
-            self.assertEqual(errors.getvalue().count("invalid:"), 1)
+            self.assertEqual([line.startswith("accounts: anomaly: invalid: ")
+                              for line in errors.getvalue().splitlines() if "invalid:" in line], [True])
             self.assertEqual(launches[rows["alpha"].current_session][2]["CLAUDE_CONFIG_DIR"], str(case.root / ".claude3"))
             self.assertEqual(launches[rows["own-codex"].current_session][2]["CODEX_HOME"], str(case.root / ".codex1"))
             before = dict(launches)
@@ -222,7 +227,8 @@ class UpkeepTests(unittest.TestCase):
             self.assertEqual(attempts.count("alpha"), 1)
             self.assertEqual(attempts.count("own-codex"), 1)
             self.assertEqual(set(launches), {*before, rows["failed"].current_session})
-            self.assertEqual(errors.getvalue().count("invalid:"), 1)
+            self.assertEqual([line.startswith("accounts: anomaly: invalid: ")
+                              for line in errors.getvalue().splitlines() if "invalid:" in line], [True])
             _ = errors.truncate(0)
             _ = errors.seek(0)
             with patch.object(account, "process_codex_home", return_value=account.ProcessEnvironmentUnread("fixture account is unreadable")):

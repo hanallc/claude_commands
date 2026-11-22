@@ -53,7 +53,7 @@ class VerifyMacSignalBoundariesTests(VerifyMacOffloadFixture):
             self.environment["TEST_METADATA"] = json.dumps(metadata)
         marker = self.runner_state / "before-runner"
         pid_boundary = self.runner_state / "pid-boundary"
-        for name in ("before-runner", "pid-boundary", "signal-forwarded", "continue-parent", "continue-runner", "release-tee"):
+        for name in ("before-runner", "pid-boundary", "continue-parent", "continue-runner", "release-tee"):
             (self.runner_state / name).unlink(missing_ok=True)
         gate = self.root / "debug-gate.sh"
         tee_gate = '''tee() {
@@ -64,15 +64,7 @@ class VerifyMacSignalBoundariesTests(VerifyMacOffloadFixture):
         _ = gate.write_text(
             "set -T\n"
             + tee_gate
-            + r'''kill() {
-    local status=0
-    builtin kill "$@" || status=$?
-    if [[ "${1:-}" == -s ]]; then
-        printf 'forwarded\n' > "$TEST_SIGNAL_FORWARDED"
-    fi
-    return "$status"
-}
-before_mac_runner() {
+            + r'''before_mac_runner() {
     if [[ "$BASHPID" == "$$" ]]; then
         if [[ "$TEST_SIGNAL_BEFORE_PID" == 1 && "$BASH_COMMAND" == 'MAC_RUNNER_PID=$!' ]]; then
             trap - DEBUG
@@ -83,7 +75,7 @@ before_mac_runner() {
             printf 'after:%s\n' "$MAC_RUNNER_PID" > "$TEST_PID_BOUNDARY"
         fi
     fi
-    if [[ "$BASH_COMMAND" == *'"$MAC_RUNNER"'* && "$BASH_COMMAND" == *'"${runner_args[@]}"'* ]]; then
+    if [[ "$BASH_COMMAND" == *'"$runner"'* && "$BASH_COMMAND" == *'"${runner_args[@]}"'* ]]; then
         trap - DEBUG
         printf '%s\n' "$MAC_LOG_FILE" > "$TEST_BEFORE_RUNNER_MARKER"
         "$TEST_REAL_PYTHON" "$TEST_WAIT_HELPER" "$TEST_CONTINUE_RUNNER"
@@ -106,7 +98,6 @@ trap before_mac_runner DEBUG
                 "TEST_SIGNAL_BEFORE_PID": "1" if before_pid else "0",
                 "TEST_PID_BOUNDARY": str(pid_boundary),
                 "TEST_CONTINUE_PARENT": str(self.runner_state / "continue-parent"),
-                "TEST_SIGNAL_FORWARDED": str(self.runner_state / "signal-forwarded"),
             },
         )
         try:
@@ -121,10 +112,7 @@ trap before_mac_runner DEBUG
             process.send_signal(signal_number)
             if before_pid:
                 (self.runner_state / "continue-parent").touch()
-            if signal_number == signal.SIGINT:
-                self.wait_for_path(self.runner_state / "signal-forwarded", (process,))
-                (self.runner_state / "continue-runner").touch()
-            # Log removal proves that the parent completed signal cleanup.
+            # The parent removes the log after it stops the runner.
             log = Path(marker.read_text().strip())
             self.wait_until(lambda: not log.exists(), "the Mac log removal", directory=log.parent)
             (self.runner_state / "continue-runner").touch()

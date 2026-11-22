@@ -1747,7 +1747,7 @@ Files: a new `scripts/disks/` folder (report owns it) and `config/disks.conf`. T
 
 - `scripts/disks/disks.html`:
   - The page shows the old data at once. It posts to `measure` beside it when `disks.json` is missing or older than `cache_seconds`.
-  - The answer `current` reads the data again. Any other answer shows "Measuring…" and reads the data again every `page.poll_seconds` until `measured_at` changes.
+  - The answer `current` reads the data again. Any other answer shows "Measuring…" and reads the data again every `page.poll_seconds` until the data's `generation` reaches the measure's target. (Phase 45 of `docs/plans/sdlc-phases.md` changed the end test from a `measured_at` change and added the refresh button.)
   - After the wait limit (`measure.timeout_seconds` for each drive), the line adds "The measure did not finish."
   - With no data, the line reads "Measuring the drives. The first measure takes some minutes."
   - With current data, the line adds "The page measures again when you open it and the sizes are more than N minutes old."
@@ -1956,7 +1956,7 @@ As built:
 
 - `build_steps.command_job` finds the script after a python or shell interpreter, then reads its arguments. `merge_gate.py` gives integrate, test all, test modules, test nightly or promote; `--tests-only` tests every module. `targeted_test.py` gives test affected, test all with `--full` or test modules with `--module`. `verify.sh [--session-dir <dir>] <step>` gives that step. `--promote` gives integrate. Any other command is `OtherCommand`.
 - `config/build_steps.conf` holds the step names, the `[about]` sentences and the `[changes]` text. `StepNames.about` and `StepNames.changes` fill them. An unknown unit gives no sentence.
-- The feed reads `/proc/<pid>/cmdline` for a merge-gate or targeted-test row (`memory_feed.step_job`). The result is a job or a named state: not a gate step, pid not recorded, command unreadable, or another command. The row name and the tooltip title use the job step; the row carries `about` and `changes`. The queue is unchanged.
+- The feed reads `/proc/<pid>/cmdline` for a gate or test-affected row (`memory_feed.step_job`). The result is a job or a named state: not a gate step, pid not recorded, command unreadable, or another command. The row name and the tooltip title use the job step; the row carries `about` and `changes`. The queue is unchanged.
 - The tooltip shows the description as a caption under the title, then a Changes row, then the rows it showed before.
 - Slot lease: `copies.standing` takes a `step` key. It writes `work=<step>` and `purpose=<shown step name>`. `copies.run` passes the job of its command, else the program name. Every other caller names its work: `merge_gate.py --nightly` test-nightly, `bump_gate.py` integrate, `fast_track.py` promote and fast-track, `ci_points` ci, `waiting.scratch_test` test, `rust_release` toolchain-trial, the style checks style, lint or test, and `copies.py hold` hold. Only test fixtures use the default step run. `gate_purpose` and the base commit subject are gone.
 - Disks Used by: `slots.slot_use` names the staff id from the staff record and builds "`<unit>` `<step>`" with the same owner template as the Builds page, then shows the showrunner.

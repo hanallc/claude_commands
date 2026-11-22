@@ -3,7 +3,11 @@ from __future__ import annotations
 
 import unittest
 import subprocess
+import shlex
+import shutil
+import sys
 import json
+from pathlib import Path
 from typing import cast, final
 from scripts.direct.verify_mac_offload_test_support import VerifyMacOffloadFixture, VERIFY as VERIFY
 import os
@@ -11,8 +15,12 @@ import signal
 from scripts.direct.verify_mac_offload_test_support import processes_carrying, invoke_mac_claim, wait_for_marker_exit
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.build_queue.admission_test_support import caller_admission
-from scripts.direct.wait_for_test_state import wait_for_pid
+from scripts.direct.wait_for_test_state import wait_for_pid, wait_until
+from scripts.lib import build_folders
 from scripts.lib.build_folders_test_support import tool_folders
+from scripts.production import staff
+from scripts.production.staff_test_support import build_fixture_sessions, fixture_member, isolated_staff_file
+from unittest import mock
 
 
 @final
@@ -41,15 +49,69 @@ class VerifyMacCopyOwnershipTests(VerifyMacOffloadFixture):
         self.assertEqual(processes_carrying(self.child_marker()), set())
 
     def test_natedev_finishing_first_stops_the_copy_and_its_result_stands(self) -> None:
-        process, _ = self.start_copy_call(copy={"TEST_COPY_WAIT": "1"})
-        _ = (self.runner_state / "cargo-release").write_text("release\n")
+        with self.subTest(launch="direct"):
+            self.check_natedev_copy_result(self)
+        with self.subTest(launch="copies"):
+            fixture = VerifyMacOffloadFixture()
+            fixture.setUp()
+            self.addCleanup(fixture.doCleanups)
+            real_git = shutil.which("git")
+            assert real_git is not None
+            shutil.rmtree(fixture.root / ".git")
+            git = fixture.bin_directory / "git"
+            git.unlink()
+            git.symlink_to(real_git)
+            origin = fixture.root / "origin.git"
+            for arguments in (("init", "--bare", "-qb", "main", str(origin)),
+                              ("init", "-qb", "main"), ("add", "Cargo.toml", "src"),
+                              ("-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
+                               "commit", "-qm", "Prepare the watcher fixture"),
+                              ("remote", "add", "origin", str(origin)), ("push", "origin", "main")):
+                _ = subprocess.run([real_git, *arguments], cwd=fixture.root, env=fixture.environment,
+                                   capture_output=True, check=True, timeout=TEST_HANG_GUARD_SECS)
+            launcher = fixture.root / "verify-copy.sh"
+            copy_cli = VERIFY.parents[1] / "copies/copies.py"
+            command = shlex.join((sys.executable, str(copy_cli), "run", "--repo", str(fixture.root),
+                                  "--commit", "HEAD", "--", "bash", str(fixture.verify_script)))
+            fixture.write_executable(launcher, '#!/bin/bash\nexec ' + command + ' "$@"\n')
+            fixture.verify_script = launcher
+            runner = staff.caller_identity()
+            with mock.patch.dict(os.environ, fixture.environment), isolated_staff_file(fixture.root / "staff.json", {}):
+                parent = fixture_member("showrunner", name="builds")
+                worker = fixture_member("unit", name="mac-copy-test", parent=parent.id, runtime_id=runner)
+            fixture.environment.update(build_fixture_sessions(worker.current_session))
+            self.check_natedev_copy_result(fixture, with_slot=True)
+
+    def check_natedev_copy_result(self, fixture: VerifyMacOffloadFixture, *, with_slot: bool = False) -> None:
+        process, copy = fixture.start_copy_call(copy={"TEST_COPY_WAIT": "1"})
+        release = fixture.runner_state / "cargo-release"
+        if with_slot:
+            cargo = wait_for_pid(fixture.runner_state / "cargo-compiling", processes=(process,))
+            folder = (Path("/proc") / str(cargo) / "cwd").resolve(strict=True)
+            self.assertEqual(build_folders.build_folder_state(folder), "held")
+            status = (Path("/proc") / str(copy) / "status").read_text().splitlines()
+            watcher = int(next(line.split()[1] for line in status if line.startswith("PPid:")))
+            self.assertIn(watcher, processes_carrying(fixture.child_marker()))
+            state, = Path(fixture.environment["VERIFY_STEPS_DIR"]).glob("*.state")
+            os.kill(watcher, signal.SIGSTOP)
+            try:
+                _ = release.write_text("release\n")
+                wait_until(lambda: state.read_text().strip() == "local_noncompiling", state.parent,
+                           timeout=30, processes=(process,))
+                self.assertIn(watcher, processes_carrying(fixture.child_marker()))
+                self.assertEqual(build_folders.build_folder_state(folder), "free",
+                                 "the live Mac watcher keeps the completed step's folder")
+            finally:
+                os.kill(watcher, signal.SIGCONT)
+        else:
+            _ = release.write_text("release\n")
         output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(process.returncode, 0, output + errors)
-        self.assertEqual((self.runner_state / "copy-signal").read_text(), str(signal.SIGTERM))
-        self.assertFalse((self.runner_state / "cargo-stopped").exists())
-        self.assertEqual(len(self.saved_results()), 1)
-        self.assert_copy_record("natedev_won", "natedev")
-        record = self.last_call()
+        self.assertEqual((fixture.runner_state / "copy-signal").read_text(), str(signal.SIGTERM))
+        self.assertFalse((fixture.runner_state / "cargo-stopped").exists())
+        self.assertEqual(len(fixture.saved_results()), 1)
+        fixture.assert_copy_record("natedev_won", "natedev")
+        record = fixture.last_call()
         self.assertEqual((record["status"], record["mac"], record["mac_reason"]), (0, "declined", "busy"))
 
     def test_new_test_claim_makes_the_copy_give_way_and_natedev_continues(self) -> None:

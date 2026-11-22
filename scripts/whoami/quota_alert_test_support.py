@@ -20,6 +20,7 @@ from typing import ClassVar, cast, override
 from unittest import mock
 
 from scripts.lib.py_floor_test_support import interpreter_cache_environment
+from scripts.lint.memory_test_support import config_environment, write_config_fixture
 from scripts.message import session_send
 from scripts.lib.test_models_registry import ExactRows, registry_text, write_registry
 from scripts.whoami.credit_accounts_test_support import hold_credit_accounts, set_credits
@@ -125,8 +126,22 @@ def setUpModule() -> None:
     _ = unittest.enterModuleContext(mock.patch.object(showrunners, "NOTIFIER_STATE_DIR", root))
 
 
+def fixture_configuration(root: Path) -> dict[str, str]:
+    """Copy the config and set the worker-mode messages that these tests assert."""
+    configuration = root / "config"
+    environment = config_environment(configuration)
+    _ = write_config_fixture(configuration / "accounts.conf",
+        "no_worker_mode_on=Codex workers have no capacity. Send no assign. Do your current work yourself: "
+        + "write the code, run the tests and do the reviews directly. Keep to this rule until the workers-back notice arrives.\n"
+        + "no_worker_mode_off=Codex workers are up again. Use workers again. This notice ends no-worker mode.\n"
+        + "no_worker_mode_fyi=morty dwight\nusage_stale_minutes=10\nrefusal_reset_wait_minutes=20\n"
+        + "half_point_pace_minutes=30\nhold_default_minutes=40\n")
+    return environment
+
+
 def select_fixture_registry(test: unittest.TestCase, root: Path) -> Path:
     """Select the fixture registry for both Python and shell readers."""
+    _ = cast(object, test.enterContext(mock.patch.dict(os.environ, fixture_configuration(root))))
     registry = root / "models.conf"
     _ = cast(object, test.enterContext(mock.patch.dict(os.environ, {"MODELS_CONFIG_FILE": str(registry)})))
     return registry
@@ -199,8 +214,6 @@ class QuotaReminderFixture(unittest.TestCase):
         _ = (codex_home / "auth.json").write_text(json.dumps({"tokens": {"id_token": f"header.{claims}.signature"}}))
         _ = (self.root / "showrunners.conf").write_text(("""# range: 0..
 threshold_percent=1
-# range: 0..
-repeat_minutes=30
 # range: 0..
 stall_minutes=5
 faults_to=natedev
@@ -373,6 +386,7 @@ class SeededQuotaReminderFixture(QuotaReminderFixture):
         root = Path(directory.name).resolve()
         cls.seed, cls.case = root / "seed", root / "case"
         cls.seed.mkdir()
+        _ = fixture_configuration(cls.seed)
         builder = cls()
         builder.root = cls.seed
         QuotaReminderFixture.prepare_files(builder)
@@ -433,8 +447,6 @@ class CodexZeroEpisodeFixture(unittest.TestCase):
         config = self.root / "showrunners.conf"
         _ = config.write_text(("""# range: 0..
 threshold_percent=1
-# range: 0..
-repeat_minutes=30
 # range: 0..
 stall_minutes=5
 faults_to=director

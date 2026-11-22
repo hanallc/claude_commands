@@ -20,13 +20,14 @@ import subprocess
 import sys
 import tomllib
 import uuid
-from collections import Counter
+from collections import Counter, defaultdict, deque
 from collections.abc import Callable, Generator, Iterable, Iterator, Mapping, Sequence
 from contextlib import closing, contextmanager
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 from enum import StrEnum
-from functools import lru_cache, wraps
+from functools import cached_property, lru_cache, wraps
+from importlib import import_module
 from itertools import groupby
 from pathlib import Path, PurePosixPath
 from types import TracebackType
@@ -305,6 +306,11 @@ TicketKind = Literal["read", "listed", "structure", "proposal"]
 TicketState = Literal["queued", "assigned", "checkpointed", "merged", "dropped"]
 # A ticket in one of these states never changes again.
 FINAL_TICKET_STATES: frozenset[TicketState] = frozenset({"merged", "dropped"})
+
+
+@dataclass(frozen=True)
+class NoIssuedTicket:
+    """The unit has no issued ticket."""
 
 
 @dataclass(frozen=True)
@@ -707,6 +713,110 @@ class HeldFinding:
     waive_provenance: WaiveProvenance
     waive_actor: WaiveActor | NoRecordedWaiveActor
     rename_disposition: OuterBindingBlocked | OuterBindingUnproved | NoOuterBindingBlock = NoOuterBindingBlock()
+
+
+@dataclass(frozen=True)
+class RefusedReservation:
+    reason: str
+
+
+def ticket_file_renames(findings: Iterable[HeldFinding]) -> dict[str, tuple[FileRename, ...]] | RefusedReservation:
+    """Read each finding's moves and require unique source and destination paths across the ticket."""
+    plans: dict[str, tuple[FileRename, ...]] = {}
+    for finding in findings:
+        if finding.kind != "rename":
+            continue
+        intent = approved_renames.classify_rename(finding.path, finding.before, finding.after)
+        if isinstance(intent, approved_renames.UnparsedFileRenames):
+            return RefusedReservation(f"{finding.finding_id}: cannot parse all file renames in {finding.path}")
+        if isinstance(intent, approved_renames.FileRenamePlan):
+            plans[finding.finding_id] = intent.moves
+    reused = approved_renames.reused_file_rename_paths(move for moves in plans.values() for move in moves)
+    if reused:
+        return RefusedReservation("paths used in more than one file rename: " + ", ".join(sorted(reused)))
+    return plans
+
+
+class ReservationRole(StrEnum):
+    SOURCE = "source"
+    EXISTING_DESTINATION = "existing destination"
+    NEW_DESTINATION = "new destination"
+    REFERENCE_UPDATE = "reference update"
+    NEED = "recorded need"
+    WIDENED = "widened path"
+    CHECKPOINT_EDIT = "checkpoint edit"
+
+
+@dataclass(frozen=True)
+class ReservedPath:
+    path: str
+    role: ReservationRole
+
+
+@dataclass(frozen=True)
+class TicketReservation:
+    """The paths and edit permissions saved for a ticket."""
+
+    entries: frozenset[ReservedPath]
+    base: str = ""
+    moves: tuple[FileRename, ...] = ()
+    reference_names: frozenset[str] = frozenset()
+    scan_path_attributes: bool = False
+    crate_roots: frozenset[str] = frozenset()
+
+    @cached_property
+    def paths(self) -> frozenset[str]:
+        return frozenset(entry.path for entry in self.entries)
+
+    @property
+    def editable_paths(self) -> frozenset[str]:
+        return frozenset(entry.path for entry in self.entries
+                         if entry.role not in (ReservationRole.REFERENCE_UPDATE, ReservationRole.CHECKPOINT_EDIT))
+
+    def covers_crate_path(self, path: str) -> bool:
+        return any(_under(path, root) for root in self.crate_roots)
+
+    def blocks(self, path: str) -> bool:
+        return path in self.paths or self.covers_crate_path(path)
+
+    def crate_overlap(self, other: TicketReservation, own_paths: frozenset[str],
+                      other_paths: frozenset[str]) -> frozenset[str]:
+        return (frozenset(path for path in own_paths | self.crate_roots if other.covers_crate_path(path))
+                | frozenset(path for path in other_paths | other.crate_roots if self.covers_crate_path(path)))
+
+    def overlap(self, other: TicketReservation) -> frozenset[str]:
+        return (self.paths & other.paths) | self.crate_overlap(other, self.paths, other.paths)
+
+
+@dataclass(frozen=True)
+class PendingPublication:
+    ticket: str
+    branch: str
+    parent: str
+    commit: str
+    paths: tuple[str, ...]
+    session_dir: str
+    phase: str
+
+
+@dataclass(frozen=True)
+class NoPendingPublication:
+    pass
+
+
+_NO_CHECKPOINT_EDITS = frozenset[str]()
+
+
+@dataclass(frozen=True)
+class DestinationPaths:
+    """Paths that a proposal creates or edits, classified at its base."""
+
+    new: tuple[str, ...] = ()
+    existing: tuple[str, ...] = ()
+
+    @property
+    def paths(self) -> tuple[str, ...]:
+        return (*self.new, *self.existing)
 
 
 @dataclass(frozen=True)
@@ -1682,6 +1792,11 @@ class TicketBatchMismatch(LedgerError):
         super().__init__(f"{ticket}: kept unchanged; ledger records {description}")
 
 
+class TicketPathOverlap(LedgerError):
+    def __init__(self, paths: frozenset[str], holder: str) -> None:
+        super().__init__(f"overlap: {', '.join(sorted(paths))} held by ticket {holder}")
+
+
 class TicketRecord(TypedDict):
     id: str
     unit: str
@@ -1738,6 +1853,14 @@ class FindingYield:
 
     freed: tuple[str, ...]
     read_commit: str
+
+
+@dataclass(frozen=True)
+class YieldedFinding:
+    """An ID yield releases this finding for the stated reason."""
+
+    finding_id: str
+    reason: str
 
 
 def _code_words(content: bytes | Folder | MissingFile) -> tuple[str, ...] | UnreadableCode:
@@ -2373,6 +2496,28 @@ def _finding_version_triggers() -> str:
         ("ticket_predecessors", ("ticket", "predecessor")), ("ticket_yields", ("ticket", "path")),
         ("ticket_widened_paths", ("ticket", "path")), ("ticket_batch_owners", ("ticket",)),
     )
+    statements = [_finding_row_version_triggers(sources)]
+    for table, column in (("judgments", "rule"), ("rule_generations", "rule"),
+                          ("invalidated_held_judgments", "judgment_id"), ("held_cell_corrections", "judgment_id")):
+        for event, references in (("INSERT", ("NEW",)), ("UPDATE", ("OLD", "NEW")), ("DELETE", ("OLD",))):
+            body: list[str] = []
+            for reference in references:
+                rule = f"{reference}.{column}" if column == "rule" else f"(SELECT rule FROM judgments WHERE id={reference}.{column})"
+                body.append("UPDATE refill_findings SET dirty_version=dirty_version+1 WHERE consumer_key IN "
+                            + "(SELECT consumer_key FROM refill_dependencies WHERE +consumer_table='refill_findings' "
+                            + f"AND source_kind='judgment_rule' AND source_key={rule});")
+            statements.append(f"CREATE TRIGGER IF NOT EXISTS refill_finding_{table}_{event.lower()} AFTER {event} ON {table} BEGIN "
+                              + " ".join(body) + " END;")
+    statements.append(
+        "CREATE TRIGGER IF NOT EXISTS refill_built_endpoint_dirty AFTER UPDATE OF dirty_version ON refill_findings "
+        + "WHEN NEW.view='built' AND NEW.dirty_version<>OLD.dirty_version BEGIN "
+        + "UPDATE refill_findings SET dirty_version=dirty_version+1 WHERE catalog=NEW.catalog AND consumer_key IN "
+        + "(SELECT consumer_key FROM refill_dependencies WHERE +consumer_table='refill_findings' "
+        + "AND source_kind='built_membership'); END;")
+    return "\n".join(statements)
+
+
+def _finding_row_version_triggers(sources: Iterable[tuple[str, tuple[str, ...]]]) -> str:
     statements: list[str] = []
     for table, columns in sources:
         statements.append(f"INSERT OR IGNORE INTO refill_tables VALUES ('{table}',0,0);")
@@ -2391,30 +2536,13 @@ def _finding_version_triggers() -> str:
                     match += f" OR (source_kind='tickets' AND source_key={reference}.ticket)"
                 if "finding_id" in columns:
                     match += f" OR (source_kind='held_findings' AND source_key={reference}.finding_id)"
-                if table == "finding_needs":
+                if table in ("finding_needs", "blocked_finding_needs"):
                     match += f" OR (source_kind='finding_needs_membership' AND source_key={reference}.finding_id)"
                 body.append("UPDATE refill_findings SET dirty_version=dirty_version+1 WHERE consumer_key IN "
                             + "(SELECT consumer_key FROM refill_dependencies WHERE +consumer_table='refill_findings' AND ("
                             + match + "));")
             statements.append(f"CREATE TRIGGER IF NOT EXISTS refill_{table}_{event.lower()} AFTER {event} ON {table} BEGIN "
                               + " ".join(body) + " END;")
-    for table, column in (("judgments", "rule"), ("rule_generations", "rule"),
-                          ("invalidated_held_judgments", "judgment_id"), ("held_cell_corrections", "judgment_id")):
-        for event, references in (("INSERT", ("NEW",)), ("UPDATE", ("OLD", "NEW")), ("DELETE", ("OLD",))):
-            body: list[str] = []
-            for reference in references:
-                rule = f"{reference}.{column}" if column == "rule" else f"(SELECT rule FROM judgments WHERE id={reference}.{column})"
-                body.append("UPDATE refill_findings SET dirty_version=dirty_version+1 WHERE consumer_key IN "
-                            + "(SELECT consumer_key FROM refill_dependencies WHERE +consumer_table='refill_findings' "
-                            + f"AND source_kind='judgment_rule' AND source_key={rule});")
-            statements.append(f"CREATE TRIGGER IF NOT EXISTS refill_finding_{table}_{event.lower()} AFTER {event} ON {table} BEGIN "
-                              + " ".join(body) + " END;")
-    statements.append(
-        "CREATE TRIGGER IF NOT EXISTS refill_built_endpoint_dirty AFTER UPDATE OF dirty_version ON refill_findings "
-        + "WHEN NEW.view='built' AND NEW.dirty_version<>OLD.dirty_version BEGIN "
-        + "UPDATE refill_findings SET dirty_version=dirty_version+1 WHERE catalog=NEW.catalog AND consumer_key IN "
-        + "(SELECT consumer_key FROM refill_dependencies WHERE +consumer_table='refill_findings' "
-        + "AND source_kind='built_membership'); END;")
     return "\n".join(statements)
 
 
@@ -2766,6 +2894,38 @@ MIGRATIONS = {
     """ + _replaced_triggers(_judgment_version_triggers()),
     # Module ownership now keeps declarations without token indexes or inline module positions.
     47: "DELETE FROM refill_inputs WHERE input_kind='footprint_modules';",
+    48: """
+        CREATE TABLE IF NOT EXISTS ticket_finding_yields (
+            ticket TEXT NOT NULL, finding_id TEXT NOT NULL, reason TEXT NOT NULL, recorded_at TEXT NOT NULL,
+            PRIMARY KEY(ticket, finding_id)
+        );
+        DELETE FROM refill_dependencies WHERE consumer_table='refill_findings' AND consumer_key IN
+            (SELECT consumer_key FROM refill_findings WHERE view LIKE 'footprint:%');
+        DELETE FROM refill_findings WHERE view LIKE 'footprint:%';
+    """,
+    49: """
+        CREATE TABLE IF NOT EXISTS ticket_reservations (
+            ticket TEXT PRIMARY KEY, plan TEXT NOT NULL
+        );
+    """,
+    50: """
+        CREATE TABLE IF NOT EXISTS blocked_finding_needs (
+            finding_id TEXT NOT NULL REFERENCES held_findings(finding_id) ON DELETE CASCADE,
+            path TEXT NOT NULL,
+            PRIMARY KEY(finding_id, path)
+        );
+    """ + _finding_row_version_triggers((("blocked_finding_needs", ("finding_id", "path")),)),
+    51: """
+        CREATE TABLE IF NOT EXISTS ticket_publications (
+            ticket TEXT PRIMARY KEY REFERENCES ticket_reservations(ticket), branch TEXT NOT NULL UNIQUE,
+            parent TEXT NOT NULL, candidate TEXT NOT NULL, index_paths TEXT NOT NULL,
+            session_dir TEXT NOT NULL, phase TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS rename_gate_refusals (
+            ticket TEXT NOT NULL, finding_id TEXT NOT NULL, reason TEXT NOT NULL,
+            PRIMARY KEY(ticket, finding_id)
+        );
+    """,
 }
 
 
@@ -2903,10 +3063,19 @@ class HeldFindingReads:
     footprints_prepared: bool = False
 
 
+@dataclass(frozen=True)
+class UnresolvedGitCommonDirectory:
+    """The ledger must resolve the checkout's Git common directory."""
+
+
+_UNRESOLVED_GIT_COMMON_DIRECTORY = UnresolvedGitCommonDirectory()
+
+
 class Ledger:
     def __init__(self, repo: Path, database: Path, *, git_cache: GitReadCache | NoGitReadCache = _NO_GIT_READ_CACHE,
                  access: LedgerAccess = LedgerAccess.READ_WRITE,
-                 resolver: session_staff.RowResolver | None = None) -> None:
+                 resolver: session_staff.RowResolver | None = None,
+                 common_directory: Path | UnresolvedGitCommonDirectory = _UNRESOLVED_GIT_COMMON_DIRECTORY) -> None:
         self.repo: Path = repo
         self._reader_source: style_config.ReaderSource = style_config.refill_reader()
         self._reader_word_class: style_reader.NameWordClass = style_reader.names_word_class(self._search_locale())
@@ -2933,7 +3102,9 @@ class Ledger:
         self._judgment_read_failures: int = 0
         self._finding_reads: list[HeldFindingReads] = []
         self._refill_changes: int = 0
-        self._refill_object_store: str = ""
+        self._git_common_directories: dict[Path, Path] = {}
+        if isinstance(common_directory, Path):
+            self._git_common_directories[repo.resolve()] = common_directory
         self._listed_site_observation: ListedSiteObservation | UnobservedListedSites = UnobservedListedSites()
         self._refill_available_blobs: set[str] = set()
         self._git_operation_depth: int = 0
@@ -3192,12 +3363,19 @@ class Ledger:
             self._inputs[key] = _inputs(tip, scope, path)
         return self._inputs[key]
 
+    def git_common_directory(self, directory: Path) -> Path:
+        """Resolve each Git directory once per ledger command."""
+        directory = directory.resolve()
+        if directory not in self._git_common_directories:
+            self._git_common_directories[directory] = Path(_git(directory, "rev-parse", "--path-format=absolute",
+                                                                "--git-common-dir"))
+        return self._git_common_directories[directory]
+
     def _judgment_facts(self) -> RefillFacts:
-        if not self._refill_object_store:
-            self._refill_object_store = _git(self.repo, "rev-parse", "--path-format=absolute", "--git-common-dir")
-        objects = Path(self._refill_object_store) / "objects"
+        common = self.git_common_directory(self.repo)
+        objects = common / "objects"
         status = objects.stat()
-        store = input_identity((self._refill_object_store, status.st_dev, status.st_ino))
+        store = input_identity((str(common), status.st_dev, status.st_ino))
         writes = self._refill_write_batches[-1] if self._refill_write_batches else ImmediateRefillWrites()
         return RefillFacts(self._connection, store, "", on_derived_write=self._note_refill_changes, writes=writes)
 
@@ -3513,6 +3691,11 @@ class Ledger:
                 "INSERT INTO sync(id,tip,style_branch,synced_at) VALUES (1,?,?,?) ON CONFLICT(id) DO UPDATE SET tip=excluded.tip,style_branch=COALESCE(?,sync.style_branch),synced_at=excluded.synced_at",
                 (commit, style_branch or "", _now(), style_branch),
             )
+            for ticket in self.open_tickets():
+                previous = self.open_ticket_reservation(ticket)
+                updated = self._reserve_references(previous, frozenset({commit}))
+                if updated != previous:
+                    self._store_reservation_update(ticket, previous, updated)
             self._check_ticket_pipelines()
 
     def ensure_synced_tip(self, tip: str, style_branch: str) -> None:
@@ -3720,6 +3903,18 @@ class Ledger:
         ).fetchall())
         return tuple(self._ticket(row[0]) for row in rows)
 
+    def last_issued_ticket_kind(self, unit: str) -> TicketKind | NoIssuedTicket:
+        """Read the kind of the last ticket assigned to the unit."""
+        unit = str(self.unit_row(unit).id)
+        # A predecessor can merge after its successor starts. Read the predecessors in one pass.
+        rows = cast(list[tuple[TicketKind]], self._connection.execute(
+            "SELECT kind FROM tickets WHERE unit=? AND branch!='' AND id NOT IN ("
+            + "SELECT p.predecessor FROM ticket_predecessors p JOIN tickets s ON s.id=p.ticket "
+            + "WHERE s.unit=? AND s.branch!='') "
+            + "ORDER BY updated_at DESC, CAST(id AS INTEGER) DESC LIMIT 1", (unit, unit),
+        ).fetchall())
+        return rows[0][0] if rows else NoIssuedTicket()
+
     def staff_resolver(self) -> session_staff.RowResolver:
         """Share one staff snapshot across the ledger command."""
         if self._staff_resolver is None:
@@ -3736,7 +3931,7 @@ class Ledger:
         from scripts.agents import remote
 
         resolver = self.staff_resolver()
-        common = _git(self.repo, "rev-parse", "--path-format=absolute", "--git-common-dir")
+        common = self.git_common_directory(self.repo)
         holders: list[staff.StaffRow] = []
         for row in resolver.record.find(kind="showrunner"):
             if not isinstance(row.doc, staff.LiveDoc) or row.doc.machine != remote.local_machine():
@@ -3748,7 +3943,7 @@ class Ledger:
                 kind = production_field(document.path.read_text().splitlines(), "Kind")
             except Refusal:
                 continue
-            if kind == "style" and _git(document.path.parent, "rev-parse", "--path-format=absolute", "--git-common-dir") == common:
+            if kind == "style" and self.git_common_directory(document.path.parent) == common:
                 holders.append(row)
         if len(holders) != 1:
             raise LedgerError("the style production's showrunner ownership is unavailable or ambiguous")
@@ -3975,22 +4170,57 @@ class Ledger:
                 unjudged.append(UnjudgedTicketCell(rule, path))
         return tuple(unjudged)
 
-    def finding_needs(self, finding_id: str) -> tuple[str, ...]:
-        """Return the recorded edit paths that the finding needs."""
-        rows = cast(list[tuple[str]], self._connection.execute(
-            "SELECT path FROM finding_needs WHERE finding_id=? ORDER BY path", (finding_id,),
-        ).fetchall())
+    def finding_needs(self, finding_id: str, *, acquired_only: bool = False) -> tuple[str, ...]:
+        """Return paths the finding needs for selection and yield, or the paths it holds for edits."""
+        query = "SELECT path FROM finding_needs WHERE finding_id=:id"
+        if not acquired_only:
+            query += " UNION SELECT path FROM blocked_finding_needs WHERE finding_id=:id"
+        rows = cast(list[tuple[str]], self._connection.execute(query + " ORDER BY path", {"id": finding_id}).fetchall())
         return tuple(path for path, in rows)
 
     def finding_need(self, finding_id: str, path: str) -> None:
-        """Record an edit path for any finding in the ledger."""
+        """Record an edit path and acquire it if the finding's assigned ticket can hold it."""
         path = self._path(path)
         with self._connection:
             _ = self._connection.execute("BEGIN IMMEDIATE")
-            _ = self._held(finding_id)
+            finding = self._held(finding_id)
+            ticket = self._ticket(finding.build_ticket.ticket) if isinstance(finding.build_ticket, BuildTicket) else NoBuildTicket()
+            if not isinstance(ticket, NoBuildTicket):
+                self._check_publication_mutation(ticket["id"])
+            entry = ReservedPath(path, ReservationRole.NEED)
+            try:
+                self._check_reservation_overlap(ticket, TicketReservation(frozenset({entry})), include_same_unit=True)
+            except TicketPathOverlap:
+                _ = self._connection.execute("DELETE FROM finding_needs WHERE finding_id=? AND path=?", (finding_id, path))
+                _ = self._connection.execute("INSERT OR IGNORE INTO blocked_finding_needs VALUES (?,?)", (finding_id, path))
+                return
+            if path in self.finding_needs(finding_id, acquired_only=True):
+                return
+            if not isinstance(ticket, NoBuildTicket) and ticket["state"] in ("assigned", "checkpointed"):
+                plan = self.open_ticket_reservation(ticket)
+                self._save_reservation(ticket["id"], replace(plan, entries=plan.entries | {entry}))
+            _ = self._connection.execute("DELETE FROM blocked_finding_needs WHERE finding_id=? AND path=?",
+                                         (finding_id, path))
             _ = self._connection.execute(
                 "INSERT OR IGNORE INTO finding_needs VALUES (?,?,?)", (finding_id, path, _now()),
             )
+            if not isinstance(ticket, NoBuildTicket):
+                self._check_ticket_pipelines(ticket["unit"])
+
+    def check_blocked_needs(self, ticket: TicketRecord) -> None:
+        rows = cast(list[tuple[str]], self._connection.execute(
+            "SELECT DISTINCT path FROM blocked_finding_needs WHERE finding_id IN "
+            + "(SELECT value FROM json_each(?)) ORDER BY path", (json.dumps(ticket["finding_ids"]),),
+        ).fetchall())
+        if rows:
+            raise LedgerError(f"{ticket['id']}: blocked need: " + ", ".join(path for path, in rows))
+
+    def _acquire_blocked_needs(self, ticket: TicketRecord) -> None:
+        ids = json.dumps(ticket["finding_ids"])
+        members = "finding_id IN (SELECT value FROM json_each(?))"
+        _ = self._connection.execute("INSERT INTO finding_needs SELECT finding_id,path,? FROM blocked_finding_needs WHERE "
+                                     + members, (_now(), ids))
+        _ = self._connection.execute("DELETE FROM blocked_finding_needs WHERE " + members, (ids,))
 
     @_ticket_operation("yield")
     def ticket_yield(self, id: str, path: str) -> tuple[str, ...]:
@@ -4015,6 +4245,7 @@ class Ledger:
 
         def attempt() -> tuple[str, ...]:
             ticket = self._ticket(id)
+            self._check_publication_mutation(id)
             if recorded(ticket):
                 return ()
             findings = tuple(self._held(finding_id) for finding_id in ticket["finding_ids"])
@@ -4023,6 +4254,7 @@ class Ledger:
             with self._connection:
                 _ = self._connection.execute("BEGIN IMMEDIATE")
                 current = self._ticket(id)
+                self._check_publication_mutation(id)
                 if recorded(current):
                     return ()
                 if current != ticket or tuple(self._held(finding_id) for finding_id in current["finding_ids"]) != findings:
@@ -4035,18 +4267,118 @@ class Ledger:
                     "DELETE FROM held_findings WHERE ticket=? AND path=? AND state='unfiled'", (id, path),
                 )
                 if freed:
-                    _ = self._connection.executemany(
-                        "UPDATE held_findings SET build_ticket='',updated_at=? WHERE finding_id=?",
-                        [(now, finding_id) for finding_id in freed],
-                    )
-                    _ = self._connection.execute(
-                        "UPDATE tickets SET finding_ids=?,updated_at=? WHERE id=?",
-                        (json.dumps([finding_id for finding_id in ticket["finding_ids"] if finding_id not in freed]), now, id),
-                    )
+                    self._release_yielded_findings(ticket, frozenset(freed), now)
                 _ = self._connection.execute("INSERT INTO ticket_yields VALUES (?,?,?)", (id, path, now))
+                self._refresh_reservation(self._ticket(id), self.open_ticket_reservation(ticket), release=True)
             return freed
 
         return retry_on_change(attempt)
+
+    @_ticket_operation("yield")
+    def ticket_yield_findings(self, id: str, identities: Sequence[str]) -> tuple[YieldedFinding, ...]:
+        """Release named findings and all findings that share their edit paths."""
+        if not identities:
+            raise LedgerError(f"{id}: name at least one finding to yield")
+
+        def pending(ticket: TicketRecord) -> tuple[str, ...]:
+            recorded = {identity for identity, in cast(list[tuple[str]], self._connection.execute(
+                "SELECT finding_id FROM ticket_finding_yields WHERE ticket=?", (id,),
+            ).fetchall())}
+            named = tuple(identity for identity in dict.fromkeys(identities) if identity not in recorded)
+            if not named:
+                return ()
+            if ticket["state"] != "assigned" or ticket["kind"] != "proposal":
+                raise LedgerError(f"{id}: yielding findings requires an assigned proposal ticket")
+            for identity in named:
+                if identity not in ticket["finding_ids"]:
+                    raise LedgerError(f"{identity}: finding does not belong to ticket {id}")
+            return named
+
+        def attempt() -> tuple[YieldedFinding, ...]:
+            ticket = self._ticket(id)
+            self._check_publication_mutation(id)
+            named = pending(ticket)
+            if not named:
+                return ()
+            tip = self.synced_commit()
+            _ = _git(self.repo, "cat-file", "-e", f"{tip}^{{tree}}")
+            findings = tuple(self._held(identity) for identity in ticket["finding_ids"])
+            needs = tuple(self.finding_needs(finding.finding_id) for finding in findings)
+            yielded = self._finding_yield_closure(ticket["base"], tip, named, findings)
+            with self._connection:
+                _ = self._connection.execute("BEGIN IMMEDIATE")
+                current = self._ticket(id)
+                self._check_publication_mutation(id)
+                if not pending(current):
+                    return ()
+                if (current != ticket or self.synced_commit() != tip
+                        or tuple(self._held(identity) for identity in current["finding_ids"]) != findings
+                        or tuple(self.finding_needs(finding.finding_id) for finding in findings) != needs):
+                    raise ChangedBeforeLock(f"{id}: the ticket or its edit paths changed during yield; rerun")
+                if len(yielded) == len(findings):
+                    raise LedgerError(f"{id}: the yield frees every finding; drop the ticket with style_ledger.py ticket drop")
+                now = _now()
+                freed = frozenset(item.finding_id for item in yielded)
+                self._release_yielded_findings(ticket, freed, now)
+                kept = tuple(finding for finding in findings if finding.finding_id not in freed)
+                kept_issues = {str(finding.state.proposal) for finding in kept if isinstance(finding.state, Filed)}
+                self._keep_yield_decisions(ticket, kept_issues)
+                kept_rules = {finding.rule for finding in kept}
+                _ = self._connection.execute(
+                    "UPDATE tickets SET rules=?,rule_blobs=? WHERE id=?",
+                    (json.dumps([rule for rule in ticket["rules"] if rule in kept_rules]),
+                     json.dumps({rule: blob for rule, blob in ticket["rule_blobs"].items() if rule in kept_rules}), id),
+                )
+                _ = self._connection.executemany(
+                    "INSERT INTO ticket_finding_yields VALUES (?,?,?,?)",
+                    [(id, item.finding_id, item.reason, now) for item in yielded],
+                )
+                self._refresh_reservation(self._ticket(id), self.open_ticket_reservation(ticket), release=True)
+            return yielded
+
+        return retry_on_change(attempt)
+
+    def _release_yielded_findings(self, ticket: TicketRecord, freed: frozenset[str], now: str) -> None:
+        _ = self._connection.executemany(
+            "UPDATE held_findings SET build_ticket='',updated_at=? WHERE finding_id=?",
+            [(now, identity) for identity in sorted(freed)],
+        )
+        kept = [identity for identity in ticket["finding_ids"] if identity not in freed]
+        _ = self._connection.execute(
+            "UPDATE tickets SET finding_ids=?,updated_at=? WHERE id=?", (json.dumps(kept), now, ticket["id"]),
+        )
+
+    def _keep_yield_decisions(self, ticket: TicketRecord, kept: set[str]) -> None:
+        """Keep the decision links that still have work in the ticket."""
+        removed = tuple(str(issue) for issue in self.ticket_proposals(ticket["id"]) if str(issue) not in kept)
+        if not removed:
+            return
+        _ = self._connection.executemany(
+            "DELETE FROM ticket_proposals WHERE ticket=? AND proposal=?", [(ticket["id"], issue) for issue in removed],
+        )
+        if ticket["proposal"] in removed:
+            _ = self._connection.execute("UPDATE tickets SET proposal=? WHERE id=?", (min(kept), ticket["id"]))
+
+    def _finding_yield_closure(self, base: str, tip: str, named: tuple[str, ...],
+                               findings: tuple[HeldFinding, ...]) -> tuple[YieldedFinding, ...]:
+        # Load the planner here because its footprint reader depends on the ledger.
+        planner = import_module("scripts.style.style_plan")
+        edit_paths = cast(Callable[[Ledger, str, str, tuple[HeldFinding, ...]], dict[str, tuple[str, ...]]],
+                          planner.finding_edit_paths)
+        paths = edit_paths(self, base, tip, findings)
+        by_path: dict[str, list[str]] = defaultdict(list)
+        for identity, footprint in paths.items():
+            for path in footprint:
+                by_path[path].append(identity)
+        reasons = dict.fromkeys(named, "named")
+        pending = deque(named)
+        while pending:
+            for path in paths[pending.popleft()]:
+                for identity in by_path.pop(path, ()):
+                    if identity not in reasons:
+                        reasons[identity] = f"coupled through {path}"
+                        pending.append(identity)
+        return tuple(YieldedFinding(identity, reason) for identity, reason in reasons.items())
 
     def bulk_ticket(self, id: str) -> TicketRecord:
         """The assigned proposal ticket a bulk batch may edit."""
@@ -4160,6 +4492,7 @@ class Ledger:
             ticket = self._ticket(id)
             if ticket["kind"] != "proposal" or ticket["state"] not in ("assigned", "checkpointed"):
                 raise LedgerError(f"{id}: refusal requires an assigned or checkpointed proposal ticket")
+            self._check_publication_mutation(id)
             recorded = self.bulk_refusals(id)
             known = {row.finding_id for row in recorded}
             pending = {identity: reason for identity, reason in messages.items() if identity not in known}
@@ -4357,9 +4690,14 @@ class Ledger:
         if not by:
             raise LedgerError(f"{id}: widen requires --by")
         normalized = tuple(dict.fromkeys(self._path(path) for path in paths))
+        root = self.repo.resolve()
+        for path in normalized:
+            if any(mark in path for mark in ("\n", "\r")) or not (root / path).resolve().is_relative_to(root):
+                raise LedgerError(f"{id}: invalid authorized path: {path!r}")
         with self._connection:
             _ = self._connection.execute("BEGIN IMMEDIATE")
             ticket = self._ticket(id)
+            self._check_publication_mutation(id)
             if ticket["kind"] != "proposal":
                 raise LedgerError(f"{id}: only a proposal ticket widens; this is a {ticket['kind']} ticket")
             if ticket["state"] in FINAL_TICKET_STATES:
@@ -4368,21 +4706,139 @@ class Ledger:
             for path in normalized:
                 if path in previous and previous[path] != reason:
                     raise LedgerError(f"{id}: {path} is already widened for another reason: {previous[path]}")
-            if all(path in previous for path in normalized):
-                return ticket["widened"]
-            allowed = approved()
-            for path in normalized:
+            added = tuple(path for path in normalized if path not in previous)
+            allowed = approved() if added else frozenset[str]()
+            for path in added:
                 if path in allowed:
                     raise LedgerError(f"{id}: {path} is already allowed by the approved findings")
-                if path in previous and previous[path] != reason:
-                    raise LedgerError(f"{id}: {path} is already widened for another reason: {previous[path]}")
+            if not added:
+                return ticket["widened"]
+            self._check_widen_overlap(id, frozenset(added))
             now = _now()
             _ = self._connection.executemany(
                 "INSERT INTO ticket_widened_paths VALUES (?,?,?,?,?)",
-                [(id, path, reason, by, now) for path in normalized if path not in previous],
+                [(id, path, reason, by, now) for path in added],
             )
+            if ticket["state"] in ("assigned", "checkpointed"):
+                plan = self.open_ticket_reservation(ticket)
+                self._save_reservation(id, replace(plan, entries=plan.entries | self._widened_entries(self._ticket(id))))
             self._check_ticket_pipelines(ticket["unit"])
             return self._ticket(id)["widened"]
+
+    def _check_widen_overlap(self, id: str, paths: frozenset[str]) -> None:
+        """Refuse a path that another queued, assigned or checkpointed ticket holds."""
+        added = TicketReservation(frozenset(ReservedPath(path, ReservationRole.WIDENED) for path in paths))
+        self._check_reservation_overlap(self._ticket(id), added, include_queued=True)
+
+    def _check_reservation_overlap(self, ticket: TicketRecord | NoBuildTicket, plan: TicketReservation, *,
+                                   include_queued: bool = False, include_same_unit: bool = False) -> None:
+        for other in self.open_tickets(include_queued=include_queued):
+            if not isinstance(ticket, NoBuildTicket) and (other["id"] == ticket["id"]
+                    or (not (include_queued or include_same_unit) and other["unit"] == ticket["unit"])):
+                continue
+            held = self.open_ticket_reservation(other)
+            if other["state"] == "queued":
+                held = replace(held, entries=frozenset(entry for entry in held.entries if entry.role != ReservationRole.NEED))
+            overlap = plan.overlap(held)
+            if overlap:
+                raise TicketPathOverlap(overlap, other["id"])
+
+    def _reservation_commits(self, ticket: TicketRecord, base: str) -> frozenset[str]:
+        row = cast(tuple[str] | None, self._connection.execute("SELECT tip FROM sync WHERE id=1").fetchone())
+        return frozenset(filter(None, (base, ticket["checkpoint"], row[0] if row else "")))
+
+    def _reservation_base(self, ticket: TicketRecord, branch: str = "") -> str:
+        if ticket["base"]:
+            return ticket["base"]
+        branch = branch or ticket["branch"]
+        if branch:
+            result = _git_bytes(self.repo, "rev-parse", "--verify", "--quiet", f"{branch}^{{commit}}",
+                                answers=GitExitAnswers(frozenset({0, 1})))
+            if result.returncode == 0:
+                return result.stdout.decode().strip()
+        return _git(self.repo, "rev-parse", "--verify", "HEAD^{commit}")
+
+    def check_assignment_paths(self, ticket: TicketRecord, branch: str = "") -> TicketReservation:
+        """Build the candidate plan and compare all its paths with active reservations."""
+        plan = self._plan_assignment(ticket, self._reservation_base(ticket, branch))
+        self._check_reservation_overlap(ticket, plan)
+        needs = frozenset(entry for entry in plan.entries if entry.role == ReservationRole.NEED)
+        if needs:
+            self._check_reservation_overlap(ticket, TicketReservation(needs), include_same_unit=True)
+        return plan
+
+    def _plan_assignment(self, ticket: TicketRecord, base: str) -> TicketReservation:
+        plan = self.reservation_plan(ticket, base, self._reservation_commits(ticket, base))
+        if isinstance(plan, RefusedReservation):
+            raise LedgerError(plan.reason)
+        return plan
+
+    def _save_reservation(self, ticket: str, plan: TicketReservation) -> None:
+        data = json.dumps({
+            "base": plan.base,
+            "paths": sorted((entry.path, entry.role) for entry in plan.entries),
+            "moves": [(move.old, move.new) for move in plan.moves],
+            "names": sorted(plan.reference_names),
+            "attributes": plan.scan_path_attributes,
+            "roots": sorted(plan.crate_roots),
+        })
+        _ = self._connection.execute(
+            "INSERT INTO ticket_reservations VALUES (?,?) ON CONFLICT(ticket) DO UPDATE SET plan=excluded.plan",
+            (ticket, data),
+        )
+
+    def _store_reservation_update(self, ticket: TicketRecord, previous: TicketReservation,
+                                  updated: TicketReservation) -> None:
+        added = frozenset(entry for entry in updated.entries if not previous.blocks(entry.path))
+        if added:
+            self._check_reservation_overlap(ticket, TicketReservation(added))
+        self._save_reservation(ticket["id"], updated)
+
+    def _refresh_reservation(self, ticket: TicketRecord, previous: TicketReservation, *,
+                             release: bool = False, actual: frozenset[str] = _NO_CHECKPOINT_EDITS) -> None:
+        base = ticket["base"] or previous.base
+        commits = self._reservation_commits(ticket, base)
+        plan = self.reservation_plan(ticket, base, commits, extra_paths=actual)
+        if isinstance(plan, RefusedReservation):
+            raise LedgerError(plan.reason)
+        if not release:
+            retained = frozenset(entry for entry in previous.entries
+                                 if entry.role in (ReservationRole.REFERENCE_UPDATE, ReservationRole.CHECKPOINT_EDIT))
+            plan = replace(plan, entries=plan.entries | retained)
+        self._store_reservation_update(ticket, previous, plan)
+
+    def open_ticket_reservation(self, ticket: TicketRecord, *, base: str = "") -> TicketReservation:
+        """Plan queued work and require a saved plan for work that reached assignment."""
+        if ticket["state"] == "queued":
+            return self._plan_assignment(ticket, base or self._reservation_base(ticket))
+        row = cast(tuple[str] | None, self._connection.execute(
+            "SELECT plan FROM ticket_reservations WHERE ticket=?", (ticket["id"],),
+        ).fetchone())
+        if not row:
+            raise LedgerError(f"{ticket['id']}: missing saved reservation")
+        encoded = cast(dict[str, object], json.loads(row[0]))
+        return TicketReservation(
+            frozenset(ReservedPath(path, ReservationRole(role))
+                      for path, role in cast(list[tuple[str, str]], encoded["paths"])),
+            cast(str, encoded["base"]),
+            tuple(FileRename(old, new) for old, new in cast(list[tuple[str, str]], encoded["moves"])),
+            frozenset(cast(list[str], encoded["names"])),
+            cast(bool, encoded["attributes"]),
+            frozenset(cast(list[str], encoded["roots"])),
+        )
+
+    def held_findings_for_reservation(self, ticket: TicketRecord) -> tuple[HeldFinding, ...]:
+        findings: list[HeldFinding] = []
+        for identity in ticket["finding_ids"]:
+            try:
+                findings.append(self._held(identity))
+            except LedgerError:
+                continue
+        return tuple(findings)
+
+    @staticmethod
+    def _widened_entries(ticket: TicketRecord) -> frozenset[ReservedPath]:
+        return frozenset(ReservedPath(entry["path"], ReservationRole.WIDENED) for entry in ticket["widened"])
 
     def _check_ticket_pipelines(self, unit: str = "") -> None:
         """Check each peer pair with an open ticket under the caller's write lock."""
@@ -4404,41 +4860,92 @@ class Ledger:
             ticket = self._ticket(id)
             if ticket["state"] in FINAL_TICKET_STATES:
                 raise LedgerError(f"{id}: cannot resume or gate from {ticket['state']}")
+            if ticket["state"] != "queued":
+                _ = self.open_ticket_reservation(ticket)
             self._check_ticket_pipelines(ticket["unit"])
 
-    def pipeline_footprint(self, ticket: TicketRecord, commits: frozenset[str]) -> frozenset[str]:
-        """Conservative edit paths at every relevant immutable tree, including current finding rows.
+    def reservation_plan(self, ticket: TicketRecord, base: str, commits: frozenset[str], *,
+                         extra_paths: frozenset[str] = _NO_CHECKPOINT_EDITS) -> TicketReservation | RefusedReservation:
+        """Classify edit paths and collect references at the requested trees."""
+        entries = set(self._widened_entries(ticket))
+        entries.update(ReservedPath(path, ReservationRole.CHECKPOINT_EDIT) for path in extra_paths)
+        if ticket["kind"] != "proposal":
+            yielded = {entry["path"] for entry in ticket["yielded"]}
+            entries.update(ReservedPath(path, ReservationRole.SOURCE) for path in ticket["files"] if path not in yielded)
+            roots = frozenset({ticket["crate"]}) if ticket["kind"] == "structure" and not ticket["files"] else frozenset[str]()
+            if not ticket["files"] and not entries and not roots:
+                return RefusedReservation(f"{ticket['id']}: empty pipeline footprint")
+            return TicketReservation(frozenset(entries), base, crate_roots=roots)
+        findings = self.held_findings_for_reservation(ticket)
+        if not findings or len(findings) != len(ticket["finding_ids"]):
+            return RefusedReservation(f"{ticket['id']}: findings cannot be read")
+        plans = ticket_file_renames(findings)
+        if isinstance(plans, RefusedReservation):
+            return plans
+        names: set[str] = set()
+        scan_attributes = False
+        moves = tuple(move for plan in plans.values() for move in plan)
+        for finding in findings:
+            entries.add(ReservedPath(finding.path, ReservationRole.SOURCE))
+            needs = self.finding_needs(finding.finding_id, acquired_only=ticket["state"] != "queued")
+            entries.update(ReservedPath(path, ReservationRole.NEED) for path in needs)
+            file_moves = plans.get(finding.finding_id, ())
+            entries.update(ReservedPath(move.old, ReservationRole.SOURCE) for move in file_moves)
+            destinations = self._classify_destinations(
+                (*approved_renames.stated_split_destinations(finding.kind, finding.path, finding.after),
+                 *(move.new for move in file_moves)), base)
+            entries.update(ReservedPath(path, ReservationRole.NEW_DESTINATION) for path in destinations.new)
+            entries.update(ReservedPath(path, ReservationRole.EXISTING_DESTINATION) for path in destinations.existing)
+            pair = approved_rename(finding.kind, finding.before, finding.after)
+            if file_moves:
+                names.update(move.old_stem for move in file_moves)
+                scan_attributes = True
+            elif approved_renames.edits_module_owners(finding.kind, finding.path, finding.after):
+                path = PurePosixPath(finding.path)
+                names.add(path.parent.name if path.name == "mod.rs" else path.stem)
+                scan_attributes = True
+            elif isinstance(pair, ApprovedRename):
+                names.add(pair.old)
+        plan = TicketReservation(frozenset(entries), base, moves, frozenset(names), scan_attributes)
+        return self._reserve_references(plan, commits)
 
-        Selection can parse exact module references. This mutation guard includes every mention of a module name
-        and every possible path-attribute owner instead: a false overlap waits, never silently drops a reference.
-        """
-        files = {*ticket["files"], *(widened["path"] for widened in ticket["widened"])}
-        if ticket["kind"] == "proposal":
-            if not ticket["finding_ids"]:
-                raise LedgerError(f"{ticket['id']}: findings cannot be read")
-            for finding in self.named_held(ticket["finding_ids"]):
-                files.add(finding.path)
-                files.update(self.finding_needs(finding.finding_id))
-                moved = file_rename(finding.kind, finding.path, finding.after)
-                pair = approved_rename(finding.kind, finding.before, finding.after)
-                owners = approved_renames.edits_module_owners(finding.kind, finding.path, finding.after)
-                if isinstance(moved, FileRename):
-                    files.add(moved.new)
-                    name = moved.old_stem
-                elif owners:
-                    path = PurePosixPath(finding.path)
-                    name = path.parent.name if path.name == "mod.rs" else path.stem
-                elif isinstance(pair, ApprovedRename):
-                    name = pair.old
-                else:
-                    continue
-                for commit in commits:
-                    files.update(self.files_naming(commit, name, ("*.rs", "*.md")))
-                    if isinstance(moved, FileRename) or finding.kind == "restructure" or owners:
-                        files.update(self.files_naming(commit, "path"))
-        if not files:
-            raise LedgerError(f"{ticket['id']}: empty pipeline footprint")
-        return frozenset(files)
+    def _reserve_references(self, plan: TicketReservation, commits: frozenset[str]) -> TicketReservation:
+        entries = set(plan.entries)
+        for commit in sorted(commits):
+            for name in sorted(plan.reference_names):
+                entries.update(ReservedPath(path, ReservationRole.REFERENCE_UPDATE)
+                               for path in self.files_naming(commit, name, ("*.rs", "*.md")))
+            if plan.scan_path_attributes:
+                entries.update(ReservedPath(path, ReservationRole.REFERENCE_UPDATE)
+                               for path in self.files_naming(commit, "path"))
+        return replace(plan, entries=frozenset(entries))
+
+    def pipeline_footprint(self, ticket: TicketRecord, commits: frozenset[str]) -> frozenset[str]:
+        """Return the explicit paths in the ticket plan and its references at the requested commits."""
+        if ticket["state"] != "queued":
+            return self._reserve_references(self.open_ticket_reservation(ticket), commits).paths
+        result = self.reservation_plan(ticket, ticket["base"], commits)
+        if isinstance(result, RefusedReservation):
+            raise LedgerError(result.reason)
+        return result.paths
+
+    def split_destinations(self, finding: HeldFinding, base: str) -> DestinationPaths:
+        """Classify the split destinations that the finding names."""
+        return self._classify_destinations(
+            approved_renames.stated_split_destinations(finding.kind, finding.path, finding.after), base)
+
+    def _classify_destinations(self, paths: Iterable[str], base: str) -> DestinationPaths:
+        """Use the ticket base to distinguish new files from ordinary edits."""
+        paths = tuple(paths)
+        if not paths:
+            return DestinationPaths()
+        tip = self._tip(base or "HEAD")
+        new: list[str] = []
+        existing: list[str] = []
+        for path in paths:
+            group = new if isinstance(_file_blob(tip, path), MissingFile) else existing
+            group.append(path)
+        return DestinationPaths(tuple(new), tuple(existing))
 
     def ticket_changed_paths(self, ticket: TicketRecord, end: str) -> frozenset[str]:
         """Paths touched by this ticket's own non-merge commits, excluding imported style work.
@@ -4481,7 +4988,7 @@ class Ledger:
                     commits.add(ticket["checkpoint"])
             ends: list[str] = []
             for ticket in (predecessor, successor):
-                paths = self.pipeline_footprint(ticket, frozenset(commits))
+                paths = self._reserve_references(self.open_ticket_reservation(ticket), frozenset(commits)).paths
                 end = ticket["checkpoint"] or live[ticket["branch"]]
                 if ticket["state"] == "assigned":
                     from scripts.agents import remote
@@ -4494,14 +5001,13 @@ class Ledger:
                 ends.append(end)
             trees = frozenset((*commits, *ends))
             crates = tuple(sorted({crate for commit in trees for crate in self._tip(commit).crate_dirs}, key=len, reverse=True))
-            footprints: list[frozenset[str]] = []
-            for ticket, end in zip((predecessor, successor), ends, strict=True):
-                paths = self.pipeline_footprint(ticket, trees)
-                actual = self.ticket_changed_paths(ticket, end)
-                footprints.append(paths | actual)
-            waiting, selected = footprints
+            prior, current = (self._reserve_references(self.open_ticket_reservation(ticket), trees)
+                              for ticket in (predecessor, successor))
+            waiting = prior.paths | self.ticket_changed_paths(predecessor, ends[0])
+            selected = current.paths | self.ticket_changed_paths(successor, ends[1])
             overlap = ((waiting & protected_ticket_files(selected, crates))
-                       | (selected & protected_ticket_files(waiting, crates)))
+                       | (selected & protected_ticket_files(waiting, crates))
+                       | prior.crate_overlap(current, waiting, selected))
             if overlap:
                 raise LedgerError("overlap: " + ", ".join(sorted(overlap)))
             if any(_git(self.repo, "rev-parse", "--verify", f"{branch}^{{commit}}") != commit
@@ -4632,6 +5138,18 @@ class Ledger:
         with self._connection:
             self._record_rename_block(finding_id, block)
 
+    def record_gate_rename_refusals(self, ticket: str, refusals: Sequence[tuple[str, str]]) -> None:
+        """Keep applied proof failures for the gate without changing binding admission."""
+        with self._connection:
+            _ = self._connection.execute(
+                "DELETE FROM rename_gate_refusals WHERE ticket=? AND finding_id NOT IN (SELECT value FROM json_each(?))",
+                (ticket, json.dumps([finding for finding, _ in refusals])),
+            )
+            _ = self._connection.executemany(
+                "INSERT INTO rename_gate_refusals VALUES (?,?,?) ON CONFLICT(ticket,finding_id) DO UPDATE SET reason=excluded.reason "
+                + "WHERE reason!=excluded.reason", [(ticket, finding, reason) for finding, reason in refusals],
+            )
+
     def _file_at(self, commit: str, path: str) -> bytes | Folder | MissingFile:
         """Read file bytes or identify a folder or missing path. Raise Git errors."""
         if self._maintaining_findings:
@@ -4721,11 +5239,23 @@ class Ledger:
         def arrived(ticket: TicketRecord) -> bool:
             """Whether the ticket is already at target; refuses a move its state does not allow."""
             nonlocal assignment_tip
+            if target in ("dropped", "merged"):
+                self._check_publication_mutation(id)
+            if target == "checkpointed":
+                publication = self.pending_publication(ticket["branch"])
+                if (isinstance(publication, PendingPublication) and publication.ticket == id
+                        and (commit, *reservation) != (publication.commit, publication.session_dir, publication.phase)):
+                    self._check_publication_mutation(id)
             if isinstance(required_owner, BatchOwner):
                 owner = self.ticket_batch_owner(id)
                 if owner != required_owner:
                     raise TicketBatchMismatch(id, owner)
-            if self._ticket_arrived(ticket, target, commit, branch, reservation):
+            already = self._ticket_arrived(ticket, target, commit, branch, reservation)
+            if target == "checkpointed" or (already and target == "assigned"):
+                _ = self.open_ticket_reservation(ticket)
+            if target == "checkpointed":
+                self.check_blocked_needs(ticket)
+            if already:
                 return True
             if target == "checkpointed":
                 if ticket["state"] == "checkpointed" and ticket["checkpoint"] != commit:
@@ -4734,9 +5264,7 @@ class Ledger:
                     branch_tip = _git(self.repo, "rev-parse", "--verify", f"{ticket['branch']}^{{commit}}")
                     if not self._is_ancestor(commit, branch_tip):
                         raise LedgerError(f"{id}: checkpoint {commit[:7]} is not on {ticket['branch']}")
-                missing = self.unjudged_ticket_cells(id, commit, lambda path: not isinstance(self._file_at(commit, path), MissingFile))
-                if missing:
-                    raise LedgerError(f"{id}: unjudged cells: " + ", ".join(f"{cell.rule} {cell.path}" for cell in missing))
+                self._check_checkpoint_cells(id, commit)
             if target == "assigned":
                 try:
                     _check_ref_format(self.repo, branch)
@@ -4767,6 +5295,12 @@ class Ledger:
                     raise LedgerError(f"{id}: checkpoint {ticket['checkpoint'][:7]} is not on {style_branch or 'the style branch'}")
             checkpoint = commit if target == "checkpointed" else ticket["checkpoint"]
             restamps = self.checkpoint_restamps(ticket, checkpoint) if target in ("checkpointed", "merged") else NoRestamps()
+            actual = _NO_CHECKPOINT_EDITS
+            if target == "checkpointed":
+                plan = self.open_ticket_reservation(ticket)
+                base = ticket["base"] or plan.base
+                if checkpoint != base:
+                    actual = self.ticket_changed_paths({**ticket, "base": base}, checkpoint)
             building = target == "merged" and ticket["kind"] == "proposal"
             findings = self.filed_build_findings(id) if building else ()
             checks = tuple((finding.finding_id, self._built_check(finding, checkpoint)) for finding in findings)
@@ -4809,6 +5343,9 @@ class Ledger:
                         (_now(), id),
                     )
                 if target == "assigned":
+                    plan = self.check_assignment_paths(ticket, branch)
+                    self._save_reservation(id, plan)
+                    self._acquire_blocked_needs(ticket)
                     active = self._assignment_predecessors(ticket)
                     if active:
                         _ = self._connection.executemany("INSERT INTO ticket_predecessors VALUES (?,?)",
@@ -4827,6 +5364,8 @@ class Ledger:
                     (target, branch if target == "assigned" else ticket["branch"],
                      commit if target == "checkpointed" else ticket["checkpoint"], _now(), id),
                 )
+                if target == "checkpointed":
+                    self._refresh_reservation(self._ticket(id), self.open_ticket_reservation(ticket), actual=actual)
                 self._check_ticket_pipelines(ticket["unit"])
                 if target == "checkpointed" and reservation[0]:
                     _ = self._connection.execute("UPDATE tickets SET reservation_session_dir=?,reservation_phase=? WHERE id=?",
@@ -4857,7 +5396,9 @@ class Ledger:
                 return ticket["base"]
             if ticket["state"] != "assigned":
                 raise LedgerError(f"{id}: cannot record start commit in state {ticket['state']}")
+            self._check_publication_mutation(id)
             _ = self._connection.execute("UPDATE tickets SET base=?,updated_at=? WHERE id=?", (base, _now(), id))
+            self._refresh_reservation(self._ticket(id), self.open_ticket_reservation(ticket))
             self._check_ticket_pipelines(ticket["unit"])
             return base
 
@@ -4869,6 +5410,8 @@ class Ledger:
         # A reference may need resolving, but the stored hash and reservation prove an exact repeat without Git.
         previous = ticket["checkpoint"] if ticket["state"] == "checkpointed" else commit
         if self._ticket_arrived(ticket, "checkpointed", previous, reservation=reservation) and commit == previous:
+            _ = self.open_ticket_reservation(ticket)
+            self.check_blocked_needs(ticket)
             return
         if not ticket["checkpoint"] or commit != ticket["checkpoint"]:
             commit = _git(self.repo, "rev-parse", "--verify", f"{commit}^{{commit}}")
@@ -5069,37 +5612,11 @@ class Ledger:
         with self._connection:
             _ = self._connection.execute("BEGIN IMMEDIATE")
             ticket = self._ticket(id)
-            if ticket["state"] != "dropped":
-                raise LedgerError(f"{id}: restore requires a dropped ticket")
-            if not ticket["checkpoint"]:
-                raise LedgerError(f"{id}: no recorded checkpoint to restore")
-            if ticket["kind"] != "proposal" or not ticket["finding_ids"]:
-                raise LedgerError(f"{id}: restore requires proposal findings")
+            self._check_restorable_checkpoint(ticket)
             if self._connection.execute("SELECT 1 FROM tickets WHERE unit=? AND state IN ('queued','assigned','checkpointed') LIMIT 1",
                                         (ticket["unit"],)).fetchone():
                 raise LedgerError(f"{id}: cannot restore while its unit has open tickets")
-            decisions = self.ticket_proposals(id)
-            withdrawn = False
-            for finding_id in ticket["finding_ids"]:
-                finding = self._held(finding_id)
-                if finding.rule not in ticket["rules"] or finding.path not in ticket["files"]:
-                    raise LedgerError(f"{finding.finding_id}: not in the ticket's recorded files and rules")
-                if (not isinstance(finding.state, Filed | Withdrawn)
-                        or isinstance(finding.build_ticket, BuildTicket)):
-                    raise LedgerError(f"{finding.finding_id}: not released by the ticket's withdrawal")
-                if finding.state.proposal not in decisions:
-                    raise LedgerError(f"{finding.finding_id}: not in the ticket's recorded decisions")
-                stamp, judgment, duplicate, gone, built = cast(tuple[str, int, str, str, str], self._connection.execute(
-                    "SELECT updated_at,withdrawn_by,duplicate_of,declaration_gone_at,built_at FROM held_findings WHERE finding_id=?",
-                    (finding.finding_id,)).fetchone())
-                if stamp != ticket["updated_at"] or judgment or duplicate or gone or built:
-                    raise LedgerError(f"{finding.finding_id}: withdrawal does not match the ticket's cancellation")
-                if isinstance(finding.state, Withdrawn):
-                    if not isinstance(finding.state.by, RuleBodyChanged):
-                        raise LedgerError(f"{finding.finding_id}: no rule-body withdrawal proof")
-                    withdrawn = True
-            if not withdrawn:
-                raise LedgerError(f"{id}: no findings prove rule-body withdrawal")
+            self._check_reservation_overlap(ticket, self.open_ticket_reservation(ticket))
             now = _now()
             _ = self._connection.executemany(
                 "UPDATE held_findings SET state='filed',build_ticket=?,updated_at=? WHERE finding_id=?",
@@ -5107,11 +5624,89 @@ class Ledger:
             _ = self._connection.execute("UPDATE tickets SET state='checkpointed',updated_at=? WHERE id=?", (now, id))
             self._check_ticket_pipelines(ticket["unit"])
 
+    def _check_restorable_checkpoint(self, ticket: TicketRecord) -> None:
+        """Check the retained ticket and its rule withdrawal evidence."""
+        id = ticket["id"]
+        if ticket["state"] != "dropped":
+            raise LedgerError(f"{id}: restore requires a dropped ticket")
+        if not ticket["checkpoint"]:
+            raise LedgerError(f"{id}: no recorded checkpoint to restore")
+        if ticket["kind"] != "proposal" or not ticket["finding_ids"]:
+            raise LedgerError(f"{id}: restore requires proposal findings")
+        decisions = self.ticket_proposals(id)
+        withdrawn = False
+        for finding_id in ticket["finding_ids"]:
+            finding = self._held(finding_id)
+            if finding.rule not in ticket["rules"] or finding.path not in ticket["files"]:
+                raise LedgerError(f"{finding.finding_id}: not in the ticket's recorded files and rules")
+            if (not isinstance(finding.state, Filed | Withdrawn)
+                    or isinstance(finding.build_ticket, BuildTicket)):
+                raise LedgerError(f"{finding.finding_id}: not released by the ticket's withdrawal")
+            if finding.state.proposal not in decisions:
+                raise LedgerError(f"{finding.finding_id}: not in the ticket's recorded decisions")
+            stamp, judgment, duplicate, gone, built = cast(tuple[str, int, str, str, str], self._connection.execute(
+                "SELECT updated_at,withdrawn_by,duplicate_of,declaration_gone_at,built_at FROM held_findings WHERE finding_id=?",
+                (finding.finding_id,)).fetchone())
+            if stamp != ticket["updated_at"] or judgment or duplicate or gone or built:
+                raise LedgerError(f"{finding.finding_id}: withdrawal does not match the ticket's cancellation")
+            if isinstance(finding.state, Withdrawn):
+                if not isinstance(finding.state.by, RuleBodyChanged):
+                    raise LedgerError(f"{finding.finding_id}: no rule-body withdrawal proof")
+                withdrawn = True
+        if not withdrawn:
+            raise LedgerError(f"{id}: no findings prove rule-body withdrawal")
+
     def _style_branch_tip(self) -> tuple[str, str]:
         """The style branch the ledger syncs with and the full id of its tip; both empty when it names none."""
         rows = cast(list[tuple[str]], self._connection.execute("SELECT style_branch FROM sync WHERE id=1").fetchall())
         branch = rows[0][0] if rows else ""
         return branch, _git(self.repo, "rev-parse", "--verify", f"{branch}^{{commit}}") if branch else ""
+
+    def pending_publication(self, branch: str) -> PendingPublication | NoPendingPublication:
+        row = cast(tuple[str, str, str, str, str, str, str] | None, self._connection.execute(
+            "SELECT ticket,branch,parent,candidate,index_paths,session_dir,phase FROM ticket_publications WHERE branch=?",
+            (branch,),
+        ).fetchone())
+        if row is None:
+            return NoPendingPublication()
+        ticket, branch, parent, commit, paths, session_dir, phase = row
+        return PendingPublication(ticket, branch, parent, commit, tuple(cast(list[str], json.loads(paths))),
+                                  session_dir, phase)
+
+    def _check_publication_mutation(self, ticket: str) -> None:
+        if self._connection.execute("SELECT 1 FROM ticket_publications WHERE ticket=?", (ticket,)).fetchone():
+            raise LedgerError(f"{ticket}: publication is pending")
+
+    def _check_checkpoint_cells(self, ticket: str, commit: str) -> None:
+        missing = self.unjudged_ticket_cells(ticket, commit, lambda path: not isinstance(self._file_at(commit, path), MissingFile))
+        if missing:
+            raise LedgerError(f"{ticket}: unjudged cells: " + ", ".join(f"{cell.rule} {cell.path}" for cell in missing))
+
+    @_ticket_operation("prepare publication")
+    def prepare_publication(self, id: str, publication: PendingPublication, checked: TicketRecord,
+                            checked_plan: TicketReservation) -> None:
+        """Save the candidate and its complete reservation before the branch moves."""
+        with self._connection:
+            _ = self._connection.execute("BEGIN IMMEDIATE")
+            ticket = self._ticket(id)
+            self._check_publication_mutation(id)
+            self.check_blocked_needs(ticket)
+            if (ticket != checked or ticket["state"] != "assigned" or ticket["branch"] != publication.branch
+                    or self.open_ticket_reservation(ticket) != checked_plan):
+                raise LedgerError(f"{id}: ticket changed during verification; repeat checkpoint")
+            self._check_checkpoint_cells(id, publication.commit)
+            actual = self.ticket_changed_paths({**ticket, "base": ticket["base"] or checked_plan.base}, publication.commit)
+            self._refresh_reservation({**ticket, "checkpoint": publication.commit}, checked_plan, actual=actual)
+            self._check_ticket_pipelines(ticket["unit"])
+            _ = self._connection.execute("INSERT INTO ticket_publications VALUES (?,?,?,?,?,?,?)",
+                                         (id, publication.branch, publication.parent, publication.commit,
+                                          json.dumps(publication.paths), publication.session_dir, publication.phase))
+
+    def finish_publication(self, publication: PendingPublication) -> None:
+        """Remove the publication record once the caller releases its reservation."""
+        with self._connection:
+            _ = self._connection.execute("DELETE FROM ticket_publications WHERE ticket=? AND candidate=?",
+                                         (publication.ticket, publication.commit))
 
     def _ticket_reservation(self, id: str) -> tuple[str, str]:
         """The run folder and phase of the reservation record the ticket's checkpoint kept."""
@@ -5224,10 +5819,11 @@ class Ledger:
             return
         _ = self._ticket_transition(id, "dropped", required_owner=owner)
 
-    def open_tickets(self) -> tuple[TicketRecord, ...]:
+    def open_tickets(self, *, include_queued: bool = False) -> tuple[TicketRecord, ...]:
         """Read all assigned and checkpointed tickets without requiring an owner filter."""
         rows = cast(list[tuple[str]], self._connection.execute(
-            "SELECT id FROM tickets WHERE state IN ('assigned','checkpointed') ORDER BY created_at,id",
+            "SELECT id FROM tickets WHERE state IN ('assigned','checkpointed') OR (? AND state='queued') "
+            + "ORDER BY created_at,id", (include_queued,),
         ).fetchall())
         return tuple(self._ticket(row[0]) for row in rows)
 
@@ -5512,8 +6108,18 @@ class Ledger:
         """Judging-ticket completion for merge checks; use finding_anchor to read source coordinates."""
         return self._judged_from(self._judging_ticket(finding.ticket))
 
+    def _finding_history(self, finding: HeldFinding) -> FindingSourceHistory:
+        """Reload a history when another finding's read clears the site rows."""
+        identity = finding.finding_id
+        if identity not in self._finding_histories:
+            self._load_site_rows((finding,))
+        try:
+            return self._finding_histories[identity]
+        except KeyError:
+            raise LedgerError(f"unknown held finding {identity}") from None
+
     def _anchor_candidates(self, finding: HeldFinding) -> tuple[str, ...]:
-        history = self._finding_histories[finding.finding_id]
+        history = self._finding_history(finding)
         candidates = ((finding.follow.commit,) if isinstance(finding.follow, FollowedDeclaration)
                       else (history.anchor_commit,) if history.anchor_commit else history.judging[0] if history.judging else ())
         return tuple(dict.fromkeys(resolved.commit for candidate in candidates if candidate
@@ -5527,7 +6133,7 @@ class Ledger:
         return self._finding_anchors[finding]
 
     def _prove_finding_anchor(self, finding: HeldFinding) -> FindingAnchor | NeedsJudgment:
-        history = self._finding_histories[finding.finding_id]
+        history = self._finding_history(finding)
         candidates = self._anchor_candidates(finding)
         if isinstance(finding.follow, FollowedDeclaration) or history.anchor_commit:
             if not candidates:
@@ -5609,9 +6215,7 @@ class Ledger:
             return {}
         tip = self._tip(commit)
         blobs = {path: tip.blobs[path] for path in paths if path in tip.blobs}
-        if not self._refill_object_store:
-            self._refill_object_store = _git(self.repo, "rev-parse", "--path-format=absolute", "--git-common-dir")
-        store = self._refill_object_store
+        store = str(self.git_common_directory(self.repo))
         counts: dict[str, int] = {}
         unread: dict[str, str] = {}
         for blob in dict.fromkeys(blobs.values()):
@@ -6231,6 +6835,8 @@ class Ledger:
                         or self._rule_generation_changes(definitions) != generations):
                     raise ChangedBeforeLock("the findings or tickets changed while they were withdrawn; rerun")
                 now = _now()
+                for ticket in cancelled:
+                    self._check_publication_mutation(ticket["id"])
                 # Drop obsolete tickets before withdrawing their findings in the same transaction.
                 _ = self._connection.executemany("UPDATE tickets SET state='dropped',updated_at=? WHERE id=?",
                                                  [(now, ticket["id"]) for ticket in cancelled])
@@ -7292,7 +7898,7 @@ class Ledger:
             # Collect both legacy candidates before proving any anchor, so all source reads share one batch.
             candidates = self._anchor_candidates(finding)
             trees = (*(self._tip(commit) for commit in candidates), tip)
-            untracked = not candidates and not self._finding_histories[finding.finding_id].judging
+            untracked = not candidates and not self._finding_history(finding).judging
             for tree in trees:
                 blob = tree.blobs.get(finding.path, "")
                 if blob:
@@ -7436,7 +8042,7 @@ class Ledger:
         # this legacy finding has no matching cell row.
         site_row = Judgment(finding.rule_blob, "", read, "held", CellInputScope.FILE, DeclaredInputScope.FILE)
         eligible = self._rows_after_removals((site_row, *rows), tip.commit)
-        history = self._finding_histories[finding.finding_id]
+        history = self._finding_history(finding)
         # Following changes the coordinate, never the original judgment's ancestry or removal barrier.
         original_anchor = history.anchor_commit or (anchor.commit if isinstance(finding.follow, NotFollowed) else "")
         original = self._judged_from(((original_anchor, ""),)) if original_anchor else self._judged_from(history.judging)
@@ -7490,7 +8096,7 @@ class Ledger:
         self._load_site_rows((finding,))
         fields = (finding.rule, finding.rule_blob, finding.path, finding.line, finding.text,
                   finding.kind, finding.before, finding.after, finding.ticket,
-                  asdict(finding.follow), asdict(self._finding_histories[finding.finding_id]))
+                  asdict(finding.follow), asdict(self._finding_history(finding)))
         return hashlib.sha256(json.dumps(fields, sort_keys=True).encode()).hexdigest()
 
     def rename_judgment_site(self, finding: HeldFinding, at: str) -> RenameJudgmentSite | NeedsJudgment:
@@ -7948,7 +8554,7 @@ class Ledger:
             read = JudgedCommit(finding.follow.commit) if isinstance(finding.follow, FollowedDeclaration) else judged
             before_path = finding.follow.from_path if isinstance(finding.follow, FollowedDeclaration) else finding.path
             before_line = finding.follow.from_line if isinstance(finding.follow, FollowedDeclaration) else finding.line
-            history = self._finding_histories[finding.finding_id]
+            history = self._finding_history(finding)
             # The preceding coordinate belongs to the preceding follow, not the first judgment.
             previous = (history.previous_site_commit or judged.commit) if isinstance(finding.follow, FollowedDeclaration) else history.anchor_commit or judged.commit
             anchor = FindingAnchor(previous, before_path, before_line)
@@ -8141,7 +8747,7 @@ class Ledger:
                                             if isinstance(anchor, FindingAnchor) else anchor)
                             elif isinstance(outcome, DeclarationRemoved):
                                 evidence = NeedsJudgment("no source site after proved declaration removal")
-                            elif isinstance(outcome, DeclarationNotRead) and not self._finding_histories[finding.finding_id].judging:
+                            elif isinstance(outcome, DeclarationNotRead) and not self._finding_history(finding).judging:
                                 # Existing untracked findings remain eligible for filing without historical carry.
                                 evidence = FilingEligibleWithoutHistory(finding.path, finding.line)
                             elif isinstance(outcome, (DeclarationInPlace, DeclarationNotRead)):
@@ -8203,6 +8809,11 @@ class Ledger:
                     raise moved_tip()
                 if self._declaration_reading(ids, tip, approved) != plan:
                     raise ChangedBeforeLock("the findings or their decisions changed while their declarations were read; rerun")
+                affected = {finding.build_ticket.ticket
+                            for finding in (*(item.finding for item in moves), *(finding for finding, _ in follows))
+                            if isinstance(finding.build_ticket, BuildTicket)}
+                reservations = {id: self.open_ticket_reservation(ticket) for id in sorted(affected)
+                                if (ticket := self._ticket(id))["state"] in ("assigned", "checkpointed")}
                 now = _now()
                 _ = self._connection.executemany(
                     "UPDATE held_findings SET path=?,line=?,followed_from=?,followed_from_line=?,followed_from_commit=?,followed_at=?,updated_at=? WHERE finding_id=?",
@@ -8222,6 +8833,9 @@ class Ledger:
                     "UPDATE held_findings SET state='withdrawn',declaration_gone_at=?,updated_at=? WHERE finding_id=?",
                     [(tip.commit, now, item.finding.finding_id) for item in removals],
                 )
+                for id, previous in reservations.items():
+                    self._check_publication_mutation(id)
+                    self._refresh_reservation(self._ticket(id), previous)
                 self._check_ticket_pipelines()
             return plan
 
@@ -8638,9 +9252,7 @@ class Ledger:
 
         # Pre-filter rules share the Rust and generator path universe.
         sites: set[ListedSite] = set()
-        if not self._refill_object_store:
-            self._refill_object_store = _git(self.repo, "rev-parse", "--path-format=absolute", "--git-common-dir")
-        facts = RefillFacts(self._connection, self._refill_object_store, catalog)
+        facts = RefillFacts(self._connection, str(self.git_common_directory(self.repo)), catalog)
         with self._connection:
             inputs = RefillInputs(self.repo, tip.tree, facts, reader_source=self.reader_source)
             ignored: list[str] = []
@@ -9387,6 +9999,7 @@ class Ledger:
 class LedgerLocation:
     repo: Path
     database: Path
+    common_directory: Path | UnresolvedGitCommonDirectory = field(default=_UNRESOLVED_GIT_COMMON_DIRECTORY, compare=False)
 
 
 def ledger_location(repo: Path) -> LedgerLocation:
@@ -9396,13 +10009,14 @@ def ledger_location(repo: Path) -> LedgerLocation:
     repo, common = Path(root), Path(common_directory)
     main_repo = common.parent
     state = Path(os.environ.get("STYLE_LEDGER_STATE_DIR", str(Path.home() / ".local/state/style"))).expanduser()
-    return LedgerLocation(repo, state / main_repo.name / "ledger.sqlite")
+    return LedgerLocation(repo, state / main_repo.name / "ledger.sqlite", common)
 
 
 def open_ledger(repo: Path, *, access: LedgerAccess = LedgerAccess.READ_WRITE,
                 resolver: session_staff.RowResolver | None = None) -> Ledger:
     location = ledger_location(repo)
-    return Ledger(location.repo, location.database, access=access, resolver=resolver)
+    return Ledger(location.repo, location.database, access=access, resolver=resolver,
+                  common_directory=location.common_directory)
 
 
 def record_refill(repo: Path, unit: str, outcome: str) -> None:
@@ -9493,7 +10107,7 @@ def preview_ledger(repo: Path, *, git_cache: GitReadCache | NoGitReadCache = _NO
                                           timeout=BUSY_TIMEOUT_SECONDS)) as source,
                   closing(sqlite3.connect(database, timeout=BUSY_TIMEOUT_SECONDS)) as destination):
                 source.backup(destination)
-        with Ledger(location.repo, database, git_cache=git_cache) as ledger:
+        with Ledger(location.repo, database, git_cache=git_cache, common_directory=location.common_directory) as ledger:
             yield ledger
 
 
@@ -9700,7 +10314,9 @@ def main() -> None:
                     _ = command.add_argument("--session-dir", default="")
                     _ = command.add_argument("--phase", default="")
                 elif action == "yield":
-                    _ = command.add_argument("--path", required=True)
+                    target = command.add_mutually_exclusive_group(required=True)
+                    _ = target.add_argument("--path")
+                    _ = target.add_argument("--finding", action="append")
                 elif action == "refuse":
                     _ = command.add_argument("--finding", action="append", required=True)
                     _ = command.add_argument("--by", required=True)
@@ -9823,8 +10439,12 @@ def main() -> None:
                 elif args.action == "drop":
                     ledger.ticket_drop(args.id)
                 elif args.action == "yield":
-                    for finding_id in ledger.ticket_yield(args.id, args.path):
-                        print(f"yielded {finding_id}: it stays filed for a later ticket")
+                    if args.finding:
+                        for item in ledger.ticket_yield_findings(args.id, args.finding):
+                            print(f"yielded {item.finding_id}: {item.reason}")
+                    else:
+                        for finding_id in ledger.ticket_yield(args.id, args.path):
+                            print(f"yielded {finding_id}: it stays filed for a later ticket")
                 elif args.action == "refuse":
                     _ = ledger.ticket_refuse(args.id, args.finding, args.by or "", args.reason)
                     print(f"{args.id}: named findings refused; remaining findings kept")

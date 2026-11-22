@@ -40,19 +40,17 @@ Stored references keep the staff id and resolve current staff facts when used.
 
 ## Producer rows and commands
 
-Each producer runs its own named job.
-The producer kind supplies shared management.
-Each producer keeps its own role contract.
+Each producer loads the common command and reads its job and current work from its README.
 
 | Staff name | Kind | Command | Job contract |
 |---|---|---|---|
-| `morty` | `producer` | `/producer:morty` | Tracks the user's items and coordinates their showrunners. |
-| `brain` | `producer` | `/producer:brain` | Its command defines management only. |
-| `dwight` | `producer` | `/producer:dwight` | Strategist; its command defines management only. |
+| `morty` | `producer` | `/producer:produce`, then `/producer:morty` | Tracks the user's items and coordinates their showrunners. |
+| `brain` | `producer` | `/producer:produce` | Does the Obsidian operations in the user's personal vault and in the hanadocs vault, and produces its List items for vault, security and accounts work. |
+| `dwight` | `producer` | `/producer:produce` | Manages its assigned productions. |
 
 The commands live in `commands/producer/`.
 Morty's operations document is `docs/producer/morty-operations.md`.
-The Codex command sync names Morty's skill `producer-morty`.
+The Codex command sync names the common skill `producer-produce` and the List skill `producer-morty`.
 `PRODUCER_FOLDER_ROOT` in `config/staff.conf` selects the document root, with default `~/rust/hanadocs`.
 Each producer uses `<root>/<name>/README.md`.
 The [shared resume path](shutdown-and-restart.md#producer-launch-and-admission) admits a first conversation through `staff.ensure`.
@@ -108,6 +106,10 @@ Its [admission boundary](long-lived-workers.md#staff-identity-and-admission) pub
 `set_worktree` compares an expected `PresentWorktree`, `RemovedWorktree`, or `WorktreeUnfilled` under the staff lock.
 The comparison includes the machine and path when present.
 A row lock protects one member during a worker change.
+The process that takes the lock records its PID and command in the lock file.
+The process clears its record before it releases the lock.
+A joined child leaves that record intact.
+The busy-row error includes the PID and command when it can read the record.
 `staff.child_environment` removes inherited row-lock proofs and the staff ID before an agent starts.
 It also removes the [operation configuration](agent-registry.md#agent-environment-boundary).
 Staff lock and remote waits read `OPERATION_LOCK_SECONDS` and `REMOTE_SECONDS` from `config/staff.conf` at use.
@@ -150,6 +152,7 @@ The shared pane launch builder uses `set_home`.
 | `docs/as-built/session-notifier.md` | write | staff.py clear-run (documented shell command) |
 | `docs/production_format.md` | read | staff.py get (shell) |
 | `scripts/accounts/accounts.py` | read | local_snapshot |
+| `scripts/accounts/move_test_support.py` | read | StaffId (fixture type) |
 | `scripts/accounts/pane_moves.py` | read | local_snapshot, WorkerName.parse |
 | `scripts/accounts/refusal_watch.py` | read | initial_snapshot |
 | `scripts/accounts/session_state.py` | read | StaffRow, Exited, Paused |
@@ -172,12 +175,16 @@ The shared pane launch builder uses `set_home`.
 | `scripts/build_queue/build_queue.py` | read | caller_identity |
 | `scripts/build_queue/admission_records.py` | read | caller_identity |
 | `scripts/build_queue/admission_client.py` | read | snapshot, by_id, StaffId; resolve BUILDLOG_OWNER_STAFF_ID only when the caller has no session identity |
+| `scripts/build_queue/admission_service.py` | read | local_snapshot, by_member_reference, unit_by_worktree, by_worktree |
+| `scripts/build_queue/memory_feed.py` | read | supplied_snapshot, StaffId, by_member_reference, by_id, unit_by_worktree, by_worktree |
+| `scripts/build_queue/snapshot_codec.py` | read | StaffSnapshot, StaffId, by_id; resolves a stored caller staff id to its current name from the snapshot a reader supplies |
 | `scripts/direct/assign.py` | read | runtime_id |
 | `scripts/direct/assign_claude.py` | read | local_snapshot |
 | `scripts/direct/assign_claude_test_support.py` | read | staff.json path |
 | `scripts/direct/assign_launcher_test_support.py` | write | by_id, local_snapshot, rename, set_worktree |
 | `scripts/direct/claude_worker.py` | read | runtime_id |
 | `scripts/direct/end_session.sh` | write | clear-run (shell); reads the current pointer through unit_runs.open_run |
+| `scripts/direct/pass_record.py` | read | StaffRow, StaffSnapshot, StaffId, SessionHome, WorktreeUnfilled, ReportsTo, initial_snapshot, by_id |
 | `scripts/direct/phase_reservation.py` | read | snapshot, WorktreeUnfilled |
 | `scripts/direct/phase_reviewers.py` | read | local_snapshot, find; clear_phase_review.sh runs it |
 | `scripts/direct/phase_table.py` | read | active, snapshot |
@@ -189,6 +196,8 @@ The shared pane launch builder uses `set_home`.
 | `scripts/direct/remove_workers.py` | read | local_snapshot, runtime_id |
 | `scripts/direct/review.sh` | read | local_snapshot, StaffRow |
 | `scripts/direct/review_launcher_test_support.py` | write | local_snapshot, native_id, update_current_session |
+| `scripts/direct/verify_hold_wait_test_support.py` | read | caller_identity; fixture child runs keep the runner's session |
+| `scripts/direct/verify_token_wait_test_support.py` | read | caller_identity; fixture child runs keep the runner's session |
 | `scripts/direct/worker_state.py` | read | StaffRow |
 | `scripts/direct/workers.py` | read | initial_snapshot, local_snapshot |
 | `scripts/disks/slots.py` | read | local_snapshot, by_id, StaffId, StaffUnreadable; `staff_names` names slot lease owners for the Disks page |
@@ -210,8 +219,10 @@ The shared pane launch builder uses `set_home`.
 | `scripts/hooks/stop-direct-continue.py` | read | local_by_current_session, unit_command, local_snapshot; active_dispatch reads the worker's fixed staff ID |
 | `scripts/hooks/user-prompt-submit-conversation-pause.py` | read | StaffSnapshot (type); conversation_pause.session_staff reads the row |
 | `scripts/lib/relaunch.py` | read | snapshot, by_current_session |
+| `scripts/lib/removal_guard.py` | read | snapshot, all_rows, StaffRefused, PresentWorktree, RemovedWorktree; known_names reads unit and repository names |
 | `scripts/lib/resume_message.py` | read | StaffId |
 | `scripts/lib/scratch.py` | read | by_current_session, runtime_id, snapshot |
+| `scripts/lib/session_move.py` | read | local_snapshot, by_current_session, by_member_reference, StaffSnapshot, StaffAbsent; finds the staff member that owns a moved session |
 | `scripts/lib/session_folder.py` | read | local_snapshot, by_current_session, by_id, StaffRow and StaffSnapshot (types), ReportsTo; member_of names the folder of a staff session |
 | `scripts/lib/unit_runs.py` | read | local_snapshot, local_by_current_session, record_path, OpenRun |
 | `scripts/lint/memory_admit.py` | read | snapshot; queue priority takes waiter units from recorded staff rows |
@@ -247,6 +258,7 @@ The shared pane launch builder uses `set_home`.
 | `scripts/production/fake_unit_host.py` | read | by_path |
 | `scripts/production/footer_counts.py` | read | snapshot |
 | `scripts/production/investigation.py` | read | snapshot, by_current_session and by_id find the caller and the owner of an investigation |
+| `scripts/production/waiting_why.py` | read | snapshot supplies the filer name for missing Waiting reasons |
 | `scripts/production/live_units.py` | read | snapshot |
 | `scripts/production/log_backup.py` | read | none (StaffRefused, StaffUnreadable exceptions) |
 | `scripts/production/checkpoint_gate.py` | read | snapshot |
@@ -256,8 +268,9 @@ The shared pane launch builder uses `set_home`.
 | `scripts/production/ci_points.py` | read | Production.owner.id |
 | `scripts/production/fast_track.py` | read | copies.source_owner |
 | `scripts/production/waiting.py` | read | Production.owner.id |
+| `scripts/production/gate.py` | read | snapshot, initial_snapshot, doc_owner |
 | `scripts/production/merge_gate.py` | read | snapshot, initial_snapshot, doc_owner |
-| `scripts/production/merge_gate_test_support.py` | write | LiveDoc; fixture_member calls ensure |
+| `scripts/production/gate_test_support.py` | write | LiveDoc; fixture_member calls ensure |
 | `scripts/production/next_item.py` | read | snapshot |
 | `scripts/production/production_doc.py` | read | StaffRow, StaffSnapshot, LiveDoc, WrappedDoc |
 | `scripts/production/production_lifecycle.py` | write | defer_retire, operation, retire_pending, set_doc, set_worktree, snapshot |
@@ -271,6 +284,7 @@ The shared pane launch builder uses `set_home`.
 | `scripts/production/rename_test_support.py` | write | find, native_id, operation, set_worktree, update_current_session |
 | `scripts/production/rename_unit_test_support.py` | read | snapshot |
 | `scripts/agents/shutdown.py` | write | by_id, cli_result, initial_snapshot, operation, operation_fds, rename, restore_unit, row_operation, set_doc, set_worktree, snapshot |
+| `scripts/agents/producer_lifecycle.py` | read | initial_snapshot, slot_operation, validate_name; StaffRow, StaffSnapshot, LiveDoc and PresentWorktree types; add-producer checks the name and the free row before first start |
 | `scripts/production/session_labels.py` | read | snapshot |
 | `scripts/production/session_staff.py` | read | active, snapshot |
 | `scripts/production/showrunner_parent.py` | write | cli_result, move, operation, snapshot |
@@ -306,10 +320,17 @@ The shared pane launch builder uses `set_home`.
 | `scripts/review_links/branch_page.py` | read | snapshot, worktree_machine, by_id, by_current_session, caller_identity; session_staff.RowResolver reads branches and production docs |
 | `scripts/review_links/change_browser.py` | read | QuestionStaff.read resolves question answer recipients; the shared routing record supplies question owners |
 | `scripts/review_links/change_page.py` | read | snapshot resolves Review owners; QuestionStaff.read resolves saved questions during delivery recovery and owner answers; source_name names each source |
+| `scripts/review_links/for_you.py` | read | snapshot names each For you action owner and finds the open run of a waiting worker's unit |
 | `scripts/review_links/images.py` | read | snapshot().by_id checks each image owner at register and names the owner on the Images page |
+| `scripts/review_links/new_item_dialog.py` | read | StaffId (type) identifies the selected recipient and the recipient in the scoped reply key. |
+| `scripts/review_links/page_frame.py` | read | StaffRow and StaffSnapshot (types) carry the page owner and the staff rows that name it in the owner control. |
+| `scripts/review_links/page_question.py` | read | StaffId (type) identifies the question recipient. |
 | `scripts/review_links/review_items.py` | read | snapshot, by_id and parent_of resolve the Review owner and source unit |
 | `scripts/review_links/review_actions.py` | read | snapshot names the owner showrunner in a proposal or efficiency Approve outcome |
 | `scripts/review_links/review_page.py` | read | snapshot resolves the Review owner and source unit for the table and actions |
+| `scripts/review_links/review_submissions.py` | read | snapshot and by_id find the active recipient and locate the saved record for retries and replies. |
+| `scripts/review_links/serve.py` | read | snapshot supplies the recipients for the New item dialog. |
+| `scripts/review_links/staff_names.py` | read | snapshot gives the staff rows; StaffRow kind and name pick each staff name's role color for the console pages |
 | `scripts/review_links/investigations_page.py` | read | snapshot and by_id resolve legacy investigation submissions |
 | `scripts/review_links/list_page.py` | read | snapshot, by_id, and parent_of name List owners, validate morty, resolve the alert showrunner, and supply identities to the shared count readers |
 | `scripts/agents/inventory.py` | read | local_snapshot |
@@ -317,10 +338,12 @@ The shared pane launch builder uses `set_home`.
 | `scripts/agents/member_account.py` | write | StaffRow, SessionHome, set_home; repairs the home from live process evidence |
 | `scripts/agents/pane_record.py` | read | initial_snapshot |
 | `scripts/agents/pane_restore.py` | read | row_operation |
+| `scripts/agents/producer_creation.py` | read | authority_snapshot, is_owner, slot_operation, validate_name, producer_creation_registry; the staff owner reads and updates the creation marker |
 | `scripts/agents/producer_transfer.py` | write | initial_snapshot, runtime_id, native_id, slot_operation, row_operation, transfer_producer |
 | `scripts/agents/remote_control.py` | read | initial_snapshot |
 | `scripts/agents/restart.py` | write | initial_snapshot, row_operation, set_home |
 | `scripts/agents/session_types.py` | read | snapshot |
+| `scripts/agents/set_model.py` | read | initial_snapshot and active select members by role. by_id checks each member's current conversation on the peer. |
 | `scripts/agents/shutdown.py` | write | initial_snapshot, pause, exit, resume, set_hold |
 | `scripts/agents/shutdown_record.py` | read | snapshot |
 | `scripts/agents/stop_results.py` | read | StaffRow and backend types (type check only) |
@@ -331,6 +354,7 @@ The shared pane launch builder uses `set_home`.
 | `scripts/statusline/statusline.sh` | read | staff.json (shell) |
 | `scripts/style/add_style.py` | read | snapshot, LiveDoc, WrappedDoc |
 | `scripts/style/coverage_report.py` | read | snapshot |
+| `scripts/style/crate_run.py` | read | local_snapshot, owner_of; worktree_names names the unit of a crate run |
 | `scripts/style/ledger_test_support.py` | write | apply_seed, initial_snapshot, set_doc |
 | `scripts/style/selection_capture.py` | read | record_path copies staff.json into a capture |
 | `scripts/style/style_config.py` | read | StaffRow, StaffSnapshot.find, StaffSnapshot.parent_of, LiveDoc, WrappedDoc |
@@ -350,7 +374,7 @@ The shared pane launch builder uses `set_home`.
 | `scripts/worktree/worktrees.py` | read | snapshot, StaffSnapshot, StaffAbsent, StaffRefused |
 | `~/rust/cargo-liner-handler/crates/cargo-handler/src/census/hierarchy.rs` | read | StaffFileReader reads staff.json (Rust, direct) |
 
-191 accessor rows: 40 write, 150 read, 1 owner.
+222 accessor rows: 41 write, 180 read, 1 owner.
 
 ## Approved copies
 

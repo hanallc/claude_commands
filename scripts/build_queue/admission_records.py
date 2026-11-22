@@ -15,14 +15,23 @@ import sys
 from pathlib import Path
 
 
+from scripts.build_queue import execution_identity
 from scripts.build_queue import progress_profile as progress
 from scripts.build_queue import placement
+from scripts.build_queue.admission_jobs import (GATE_JOB_NOT_RECORDED, VERIFY_VERBS as VERIFY_VERBS,
+    GateJobNotRecorded, NotVerifyCall as NotVerifyCall, StepJob, VerifyCall as VerifyCall,
+    VerifyStep as VerifyStep, VerifyVerb as VerifyVerb)
+from scripts.build_queue.snapshot_codec import public_queue_text, select_queue_name
 from scripts.build_queue.scope_activity import (EmptyBuildScope, IdleService, LiveBuildRun, NoLiveBuildRun,
     NotServiceSlice, RunningServiceJob, ScopeProcesses, ServiceJobState)
 
+from scripts.build_targets import target_config
 from scripts.build_targets.target_config import LocalRequired, StepRoute
 from scripts.buildlog import parse
 from scripts.lib import conf
+from scripts.lib.proc_text import read_proc_text
+from scripts.production import staff
+from scripts.production.staff import StaffId
 from scripts.lib.test_phase import (CallRecord as CallRecord, NoCallRecord as NoCallRecord,
                                    TestPhaseChargeUse as TestPhaseChargeUse)
 
@@ -31,8 +40,58 @@ DIRECT_CARGO = LocalRequired("a direct cargo command runs where it starts")
 
 
 @dataclass(frozen=True)
+class UnregisteredTarget:
+    """The target name has no registration."""
+
+
+def effective_target(name: str, settings: placement.ProviderSettings, *,
+                     configuration: conf.ConfigRead | conf.UseConfiguredValue = conf.UseConfiguredValue.CURRENT
+                     ) -> target_config.Target | UnregisteredTarget:
+    """Select the registered target with the settings supplied by the request."""
+    for target in target_config.read_targets(selected=name, purpose=target_config.RegistryRead.PLACEMENT,
+                                              configuration=configuration):
+        return ssh_target_settings(target, settings) if isinstance(target, target_config.SshTarget) else target
+    return UnregisteredTarget()
+
+
+def ssh_target_settings(target: target_config.SshTarget, settings: placement.ProviderSettings) -> target_config.SshTarget:
+    """Apply the settings supplied by the request to an SSH target."""
+    if isinstance(settings, placement.ExplicitProviderSettings):
+        return replace(target, settings=settings.path)
+    return target
+
+
+@dataclass(frozen=True)
+class RefusalSettings:
+    """The digest identifies the settings read immediately before a prelaunch refusal."""
+    digest: str
+
+
+@dataclass(frozen=True)
+class NoRefusalSettings:
+    """The report supplies no settings digest."""
+
+
+@dataclass(frozen=True)
+class RemoteStartHoldUnrecorded:
+    """The assignment has no recorded hold for a remote start."""
+
+
+@dataclass(frozen=True)
+class RemoteStartHold:
+    """Keep the local place until this deadline while a remote start is pending."""
+
+    deadline: float
+
+
+@dataclass(frozen=True)
+class RemoteStartHoldEnded:
+    """The remote assignment no longer keeps a place on natedev."""
+
+
+@dataclass(frozen=True)
 class SavedPlacementAssignment:
-    """The saved assignment holds its permission, claim, retry decision, and final report."""
+    """The saved assignment holds its settings generation and dispatch state."""
     assignment: placement.PlacementAssignment
     state: placement.AssignmentState = placement.CurrentAssignment()
     permission: placement.LaunchPermission = placement.PermissionAvailable()
@@ -40,6 +99,10 @@ class SavedPlacementAssignment:
     holder: placement.ClaimHolderIdentity | placement.ClaimHolderUnconfirmed = placement.ClaimHolderUnconfirmed("not consumed")
     retry: placement.RetryDecision = placement.DoNotRetry("attempt is not settled")
     terminal_report: placement.TerminalAttemptReport | placement.NoTerminalReport = placement.NoTerminalReport()
+    assigned_settings_generation: placement.AssignedSettingsGeneration | placement.UnknownAssignedSettingsGeneration = (
+        placement.UnknownAssignedSettingsGeneration())
+    refusal_settings: RefusalSettings | NoRefusalSettings = NoRefusalSettings()
+    remote_start_hold: RemoteStartHold | RemoteStartHoldUnrecorded | RemoteStartHoldEnded = RemoteStartHoldUnrecorded()
 
 # Historical multiplier for saved dev bases from the Phase 24 replay.
 DEV_HEADROOM = 4.2034275337646125
@@ -87,7 +150,7 @@ class GpuTestSlots:
 
 
 # These steps run test binaries; a GPU repository's tests open render apps.
-GPU_TEST_STEPS = frozenset({"nextest", "test", "t", "targeted-test", "merge-gate"})
+GPU_TEST_STEPS = frozenset({"nextest", "test", "t", "test-affected", "gate"})
 NO_GPU_TESTS = GpuTestSlots(1, frozenset())
 
 
@@ -320,6 +383,8 @@ class Reservation(TypedDict):
     test_phase_charge_use: NotRequired[TestPhaseChargeUse]
     build_run: NotRequired[LiveBuildRun | NoLiveBuildRun]
     run_origin: NotRequired[CallerRun | FoundRun]
+    slot_staff: NotRequired[StaffId | NoEndedStepStaff]
+    job: NotRequired[StepJob]
 
 
 @dataclass(frozen=True)
@@ -579,6 +644,7 @@ class Waiter(TypedDict):
     session_id: NotRequired[str]
     session_name: NotRequired[str]
     unit: NotRequired[str]
+    ci_runner: NotRequired[str]
     step: NotRequired[str]
     folder: NotRequired[str]
     token_left_at: NotRequired[float]
@@ -599,6 +665,8 @@ class Waiter(TypedDict):
     test_threads: NotRequired[int | None]
     # Requests can record a route. Direct commands without a reason use DIRECT_CARGO.
     route: NotRequired[StepRoute]
+    verify: NotRequired[VerifyCall]
+    job: NotRequired[StepJob]
 
 
 @dataclass(frozen=True)
@@ -699,12 +767,41 @@ class RunUseUnavailable:
 
 
 @dataclass(frozen=True)
+class NoEndedStepStaff:
+    """The ended step has no recorded staff owner."""
+
+
+@dataclass(frozen=True)
+class EndedStepFactNotRecorded:
+    """The reservation did not record this fact about the ended step."""
+
+
+@dataclass(frozen=True)
+class EndedStepFacts:
+    """The reservation's caller, work, and staff facts survive until the hold ends."""
+
+    step: str | EndedStepFactNotRecorded
+    package: str | PackageNotRecorded
+    project: str | EndedStepFactNotRecorded
+    folder: str | EndedStepFactNotRecorded
+    staff_id: StaffId | NoEndedStepStaff
+    job: StepJob | GateJobNotRecorded = GATE_JOB_NOT_RECORDED
+    caller_name: str | EndedStepFactNotRecorded = field(default_factory=EndedStepFactNotRecorded, kw_only=True)
+
+
+@dataclass(frozen=True)
+class HoldPredatesStepFacts:
+    """The saved hold records its memory but has no facts about the ended step."""
+
+
+@dataclass(frozen=True)
 class BetweenStepsSlot:
     """The run retains memory between steps until the slot expires."""
     run: LiveBuildRun
     reservation: str
     bytes: int
     expires_at: float
+    identity: EndedStepFacts | HoldPredatesStepFacts
 
 
 @dataclass(frozen=True)
@@ -846,6 +943,25 @@ class StartSpacingWait:
 
 
 @dataclass(frozen=True)
+class BuildSpaceLow:
+    free_gib: int
+    floor_gib: int
+
+
+@dataclass(frozen=True)
+class BuildSpaceUnreadable:
+    error: str
+
+
+BuildSpaceHold = BuildSpaceLow | BuildSpaceUnreadable
+
+
+@dataclass(frozen=True)
+class NoBuildSpaceHold:
+    """The pass has no disk space hold."""
+
+
+@dataclass(frozen=True)
 class NeedsMemory:
     """The memory wait holds the need, free bytes, threshold, growth, and reserve."""
     need: int = 0
@@ -887,7 +1003,7 @@ class NatedevHeld:
     purpose: str
 
 HeadCause = (MemoryPressure | PressureUnavailable | ReadingUnavailable | StartSpacingWait | NeedsMemory | EstimateExpired
-             | BehindHead | GpuSlotWait | ReadyForAdmission)
+             | BehindHead | GpuSlotWait | ReadyForAdmission | BuildSpaceHold | placement.CargoFolderWait)
 
 
 @dataclass(frozen=True)
@@ -900,11 +1016,17 @@ class HeadAdmissionStatus:
 
 WaitReason = (StartSpacingWait | PressureUnavailable | EstimateExpired | NeedsMemory | BehindHead | GpuSlotWait
               | HeadAdmissionStatus | ReadyForAdmission | ReadingUnavailable | MemoryPressure | TokenWaitingWaiter
-              | NatedevHeld)
+              | NatedevHeld | BuildSpaceHold | placement.CargoFolderWait)
 
 
 def held_text(wait: NatedevHeld) -> str:
     return f"natedev is held by {wait.holder} for {wait.purpose}; waiting for release"
+
+
+def build_space_text(wait: BuildSpaceHold) -> str:
+    if isinstance(wait, BuildSpaceUnreadable):
+        return f"cannot read /build free space: {wait.error}"
+    return f"/build has {wait.free_gib} GiB free, below the {wait.floor_gib} GiB floor"
 
 
 def gpu_slot_text(wait: GpuSlotWait) -> str:
@@ -917,16 +1039,20 @@ def head_wait_text(reason: HeadAdmissionStatus, zone: ZoneInfo) -> str:
         return "head: " + cause.reason
     if isinstance(cause, MemoryPressure):
         return "head: " + pressure_text(cause)
+    if isinstance(cause, BuildSpaceHold):
+        return "head: " + build_space_text(cause)
     if isinstance(cause, StartSpacingWait):
         return "head: next start at " + datetime.fromtimestamp(cause.at, zone).strftime("%H:%M:%S")
     if isinstance(cause, EstimateExpired):
         return "head: estimate expired"
     if isinstance(cause, BehindHead):
-        return "head: behind " + cause.head_name
+        return "head: behind " + select_queue_name(cause.head_name)
     if isinstance(cause, GpuSlotWait):
         return "head: " + gpu_slot_text(cause)
     if isinstance(cause, ReadyForAdmission):
         return "head: ready for admission"
+    if isinstance(cause, placement.CargoFolderWait):
+        return "head: " + placement.CARGO_FOLDER_WAIT_REASON
     return f"head: needs {reason.need / GIB:.1f} GiB; room {max(0, reason.decision.room.room) / GIB:.1f} GiB"
 
 
@@ -951,6 +1077,9 @@ class WaitingStep:
     run: LiveBuildRun | NoLiveBuildRun = field(default=NoLiveBuildRun(), kw_only=True)
     package: str | PackageNotRecorded = field(default=PackageNotRecorded(), kw_only=True)
     route: StepRoute = field(default=DIRECT_CARGO, kw_only=True)
+    verify: VerifyStep = field(default=NotVerifyCall(), kw_only=True)
+    job: StepJob | GateJobNotRecorded = field(default=GATE_JOB_NOT_RECORDED, kw_only=True)
+    ci_runner: str = field(default="", kw_only=True)
 
 
 @dataclass(frozen=True)
@@ -967,25 +1096,29 @@ class RunningStep:
     started_at: float = 0.0
     unit: str = ""
     project: str = ""
-    execution: placement.ExecutionEvidence = placement.ExecutionNotStarted()
+    execution: execution_identity.ExecutionEvidence = execution_identity.ExecutionNotStarted()
     assignment_host: str = ""
+    mac_placement: str = field(default="", kw_only=True)
     package: str | PackageNotRecorded = field(default=PackageNotRecorded(), kw_only=True)
     route: StepRoute = field(default=DIRECT_CARGO, kw_only=True)
+    verify: VerifyStep = field(default=NotVerifyCall(), kw_only=True)
+    job: StepJob | GateJobNotRecorded = field(default=GATE_JOB_NOT_RECORDED, kw_only=True)
+    ci_runner: str = field(default="", kw_only=True)
 
 
 def execution_host(step: RunningStep, local_host: str) -> str:
     evidence = step.execution
-    if isinstance(evidence, placement.ObservedExecution):
+    if isinstance(evidence, execution_identity.ObservedExecution):
         identity = evidence.identity
-        return identity.host if isinstance(identity, placement.ProcessExecution) else identity.target
+        return identity.host if isinstance(identity, execution_identity.ProcessExecution) else identity.target
     return step.assignment_host or local_host
 
 
 def execution_group(step: RunningStep, fallback: str) -> str:
     evidence = step.execution
-    if isinstance(evidence, placement.ObservedExecution):
+    if isinstance(evidence, execution_identity.ObservedExecution):
         identity = evidence.identity
-        if isinstance(identity, placement.ProcessExecution):
+        if isinstance(identity, execution_identity.ProcessExecution):
             return repr((identity.host, identity.generation, identity.pid, identity.start_time))
         return repr((identity.target, identity.generation, identity.instance, identity.attempt))
     if step.assignment_host:
@@ -1159,6 +1292,11 @@ class QueueInputs:
     blockers_for: frozenset[str] = frozenset()
     waiter_orders: dict[str, PriorityUnit | NormalOrder] = field(default_factory=dict, kw_only=True)
     slots: tuple[RunSlot, ...] = field(default=(), kw_only=True)
+    cargo_folders: dict[str, placement.CargoFolder] = field(default_factory=dict, kw_only=True)
+    occupied_cargo_folders: frozenset[placement.CargoFolder] = field(default=frozenset(), kw_only=True)
+    pending_remote_starts: frozenset[str] = field(default=frozenset(), kw_only=True)
+    local_waits: dict[str, placement.EvidenceNeeded] = field(default_factory=dict, kw_only=True)
+    build_space: BuildSpaceHold | NoBuildSpaceHold = field(default=NoBuildSpaceHold(), kw_only=True)
 
     def __post_init__(self) -> None:
         orders = {waiter_owner(row): (waiter_priority(row) if isinstance(row.get("order"), (PriorityUnit, NormalOrder))
@@ -1306,6 +1444,7 @@ class MemoryConfig:
     program_sample_seconds: float
     program_stop_seconds: float
     peak_wave_seconds: float
+    free_floor_gib: int | None = field(default=None, kw_only=True)
     diagnostics: tuple[ConfigurationDiagnostic, ...] = field(default=(), compare=False)
 
 
@@ -1405,7 +1544,9 @@ def read_memory_config(*, report: bool = True) -> MemoryConfig:
                 source_settle_seconds=number("source_settle_seconds"),
                 request_max_bytes=whole("request_max_bytes"), program_first_peaks=first_peaks,
                 program_sample_seconds=number("program_sample_seconds"), program_stop_seconds=number("program_stop_seconds"),
-                peak_wave_seconds=number("peak_wave_seconds"))
+                peak_wave_seconds=number("peak_wave_seconds"),
+                free_floor_gib=whole("free_floor_gib")
+                    if settings_read.effective_key("free_floor_gib") in values else None)
         finally:
             diagnostics = configuration_diagnostics(messages)
     config = replace(config, diagnostics=diagnostics)
@@ -1418,7 +1559,7 @@ test_threads = parse.test_threads
 
 def process_start_time(pid: int) -> str | None:
     try:
-        stat = (Path("/proc") / str(pid) / "stat").read_text()
+        stat = read_proc_text(Path("/proc") / str(pid) / "stat")
         fields = stat.rsplit(") ", 1)[1].split()
         return fields[19] if fields[0] not in ("Z", "X") else None
     except (OSError, IndexError):
@@ -1463,14 +1604,56 @@ class FreshTest:
 BUILDLOG_UNIT = "BUILDLOG_UNIT"
 
 
-def waiter_identity(step: str, worktree: str) -> WaiterIdentity:
-    from scripts.production import staff
+@dataclass(frozen=True)
+class QueueCaller:
+    session_id: str
+    name: str
+    unit: str
 
+
+@dataclass(frozen=True)
+class StaffLookupSkipped:
+    """The caller has no staff reference to resolve."""
+
+
+NO_STAFF_LOOKUP = StaffLookupSkipped()
+type QueueStaff = staff.StaffSnapshot | staff.StaffUnreadable | StaffLookupSkipped
+
+
+def queue_staff() -> QueueStaff:
+    try:
+        return staff.local_snapshot()
+    except staff.StaffUnreadable as error:
+        return error
+
+
+def queue_caller(session_id: str, staff_id: str, exported_name: str, session_folder: str,
+                 worktree: str, *, members: QueueStaff = NO_STAFF_LOOKUP, unit: str = "") -> QueueCaller:
+    """Resolve the caller name and its unit for queue priority."""
+    reference = session_id or staff_id
+    staff_name = ""
+    if isinstance(members, staff.StaffSnapshot) and reference and (member := members.by_member_reference(reference)):
+        if not unit:
+            owner = members.parent_of(member) if member.kind == "worker" else member
+            unit = owner.name if owner is not None and owner.kind == "unit" else ""
+        session_id = session_id or member.current_session
+        staff_name = member.name
+    folder = public_queue_text(Path(worktree).name) if not reference else ""
+    name = select_queue_name(staff_name, exported_name, Path(session_folder).name,
+                             f"terminal · {folder}" if folder else "")
+    return QueueCaller(session_id, name, unit)
+
+
+def waiter_identity(step: str, worktree: str) -> WaiterIdentity:
     session = staff.caller_identity()
-    identity: WaiterIdentity = {"session_id": session, "session_name": os.environ.get("CLAUDE_SESSION_NAME", ""),
-                                "step": step, "folder": os.getcwd() if worktree else ""}
-    if unit := os.environ.get(BUILDLOG_UNIT):
-        identity["unit"] = unit
+    reference = os.environ.get("BUILDLOG_OWNER_STAFF_ID", "")
+    caller = queue_caller(session, reference, os.environ.get("CLAUDE_SESSION_NAME", ""),
+        os.environ.get("CLAUDE_SESSION_FOLDER", ""), worktree or os.getcwd(),
+        members=queue_staff() if session or reference else NO_STAFF_LOOKUP, unit=os.environ.get(BUILDLOG_UNIT, ""))
+    identity: WaiterIdentity = {"session_id": caller.session_id, "session_name": caller.name,
+        "step": step, "folder": os.getcwd() if worktree else ""}
+    if caller.unit:
+        identity["unit"] = caller.unit
     return identity
 
 
@@ -1557,8 +1740,12 @@ def reason_phrase(reason: WaitReason, waiting: Sequence[WaitingStep]) -> str:
             return reason.reason
         case StartSpacingWait():
             return "another step just started; the queue waits a few seconds between starts"
+        case BuildSpaceLow() | BuildSpaceUnreadable():
+            return build_space_text(reason)
         case NeedsMemory():
             return "free memory"
+        case placement.CargoFolderWait():
+            return placement.CARGO_FOLDER_WAIT_REASON
         case GpuSlotWait():
             return "GPU test slot"
         case BehindHead():

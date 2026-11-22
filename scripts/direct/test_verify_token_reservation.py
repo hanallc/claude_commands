@@ -1,6 +1,8 @@
 """Real verify.sh token reservation behavior."""
 from __future__ import annotations
 
+from scripts.lib.helper_tree_test_support import VERIFY_HELPERS, copy_helpers, verify_test_environment
+
 from scripts.build_queue import admission_records
 
 from scripts.build_queue.admission_test_support import AdmissionFixture, caller_admission
@@ -145,11 +147,12 @@ class VerifyTokenReservationTests(VerifyTokenWaitFixture):
         real_sleep = shutil.which("sleep")
         if real_sleep is None:
             self.fail("the token wait test needs sleep on PATH")
-        peer = subprocess.Popen([real_sleep, "600"], start_new_session=True)
+        peer = subprocess.Popen([real_sleep, "600"], env=verify_test_environment(), start_new_session=True)
         self.started_groups.add(peer.pid)
         self.addCleanup(peer.wait, TEST_HANG_GUARD_SECS)
         taken = subprocess.run(["bash", str(BOARD), "acquire", str(board), "peer", "cargo", "--pid", str(peer.pid),
                                 "--hold", "3600", "--wait", "0"],
+                               env=verify_test_environment(),
                                capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(taken.returncode, 0, taken.stderr)
         shell = self.root / "local-attempt.sh"
@@ -182,12 +185,7 @@ trap probe_local_attempt DEBUG
         home = self.root / "busy-home"
         delegate = home / ".claude/scripts/direct"
         delegate.mkdir(parents=True)
-        for source in VERIFY.parent.parent.iterdir():
-            if source.name != "direct":
-                (delegate.parent / source.name).symlink_to(source, target_is_directory=source.is_dir())
-        for source in VERIFY.parent.iterdir():
-            if source.name != "board.sh":
-                (delegate / source.name).symlink_to(source, target_is_directory=source.is_dir())
+        _ = copy_helpers(home, *VERIFY_HELPERS)
         _ = (delegate / "board.sh").write_text(
             '#!/bin/bash\n'
             + 'if [[ "$1" == acquire ]]; then printf "token\\n" >> "$TEST_SLEEP_LOG"; fi\n'
@@ -235,6 +233,8 @@ python3 "$TEST_WAIT_HELPER" "$TEST_OLD_RELEASE"
 buildlog_memory_python "$BUILDLOG_MEM_ADMIT_SCRIPT" token-wait "$BUILDLOG_MEM_RESERVATION"
 BUILDLOG_MEM_RESERVATION=""
 : > "$TEST_OLD_GAP"
+# Wait for the new client to take the token after the memory refund.
+python3 "$TEST_WAIT_HELPER" "$TEST_RUNNING"
 bash "$TEST_BOARD" acquire "$TEST_BOARD_DIR" old cargo --pid $$ --hold 3600 --wait 30
 trap 'bash "$TEST_BOARD" release "$TEST_BOARD_DIR" old cargo --pid $$' EXIT
 BUILDLOG_MEM_TOKEN_BACK_AT=$(python3 -c 'import time; print(time.time())')

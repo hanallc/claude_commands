@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.lib.helper_tree_test_support import VERIFY_HELPERS, copy_helpers
+
 from scripts.lib.checkout_test_support import fixture_shim_source
 
 from scripts.lint.memory_test_support import write_pressure_reading
@@ -31,11 +33,13 @@ from unittest import mock
 
 from scripts.build_hold import build_hold
 from scripts.direct.recorder_fixture import invoke_recorder, record_wait_workers
+from scripts.production import staff
 from scripts.production.staff_test_support import fixture_runtime_id
 from scripts.direct.verify_mac_offload_test_support import (
     VerifyMacOffloadFixture, CallRecord, CARGO_STUB, hold_recorder_exits, install_fixed_cargo, wait_for_marker_exit,
 )
-from scripts.direct.local_release_wait import RELEASE_CHANGES, LocalReleaseEvents, local_release_waiter
+from scripts.direct.local_release_wait import RELEASE_CHANGES, LocalReleaseEvents, episode_is_assigned, local_release_waiter
+from scripts.direct.wait_for_test_state import wait_for_file, wait_until
 from scripts.lib import inotify
 from scripts.lib.build_folders_test_support import tool_folders
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -74,6 +78,56 @@ class CallWithHoldWait(CallRecord):
 
 def read_cycle_file(path: Path) -> build_hold.HoldCycle:
     return cast(build_hold.HoldCycle, json.loads(path.read_text()))
+
+
+def wait_rows(session: Path) -> list[dict[str, object]]:
+    """Read the recorder's wait events from its private history."""
+    state = cast(dict[str, object], json.loads((session / "progress_history_state.json").read_text()))
+    return [row for line in Path(cast(str, state["history_file"])).read_text().splitlines(keepends=True)
+            if line.endswith("\n")
+            and str((row := cast(dict[str, object], json.loads(line)))["event_type"]).startswith("wait_")]
+
+
+def recorded_holders(rows: list[dict[str, object]]) -> list[object]:
+    return [row["holder"] for row in rows if row["event_type"] in ("wait_started", "wait_holder_seen")]
+
+
+def wait_for_verify_state(ready: Callable[[], bool], directory: Path, process: subprocess.Popen[str],
+                          what: str) -> None:
+    """Wait for the fixture state or the caller's exit."""
+    wait_until(lambda: ready() or process.poll() is not None, directory, processes=(process,))
+    if not ready():
+        raise AssertionError(f"verify exited {process.returncode} before {what}")
+
+
+def wait_for_target_holder(episode: str) -> None:
+    """Pause when the recorder writes a new holder entry."""
+    root = Path(os.environ["PACKAGE_ROOT"])
+    session = Path(os.environ["UNIT_RUN_DIR"])
+    pauses = int(os.environ["TEST_TARGET_PAUSES"])
+    admission = Path(os.environ["TEST_TARGET_ADMISSION"])
+    snapshot = admission / "queue.json"
+    state = admission / "state.json"
+
+    def snapshot_version() -> tuple[int, int] | None:
+        try:
+            status = snapshot.stat()
+        except FileNotFoundError:
+            return None
+        return status.st_ino, status.st_mtime_ns
+
+    previous = snapshot_version()
+    for number in range(1, pauses + 1):
+        resume = root / f"target-resume-{number}"
+        if resume.exists():
+            continue
+        if len(recorded_holders(wait_rows(session))) >= number:
+            (root / f"target-holder-{number}").touch()
+            wait_for_file(resume)
+            return
+        break
+    # The next pass can publish new provider evidence.
+    wait_until(lambda: snapshot_version() != previous or episode_is_assigned(state, episode), admission)
 
 
 @contextmanager
@@ -115,7 +169,7 @@ def change_cycle(path: Path, change: Callable[[build_hold.HoldCycle], None]) -> 
         "STAFF_FILE": str(release.parent / "staff.json"),
     }), build_hold.release_lock():
         cycle = build_hold.read_cycle()
-        assert cycle is not None
+        assert not isinstance(cycle, build_hold.NoCycle)
         change(cycle)
         build_hold.save_cycle(cycle)
 
@@ -190,25 +244,21 @@ class VerifyHoldTools(VerifyMacOffloadFixture):
 
     @classmethod
     @override
-    def setUpClass(cls) -> None:
+    def setUpClass(cls, *, fixture_parent: Path | None = None) -> None:
         # Copy files before starting the admission server for each test.
         builder = VerifyMacOffloadFixture()
         cls.addClassCleanup(builder.doCleanups)
-        builder.root = Path(builder.enterContext(tempfile.TemporaryDirectory(prefix="verify-hold-tools-")))
+        builder.root = Path(builder.enterContext(tempfile.TemporaryDirectory(prefix="verify-hold-tools-", dir=fixture_parent)))
         builder.build_fixture()
+        _ = copy_helpers(builder.home, "scripts/astra", "scripts/accounts")
         cls.fixture_root = builder.root
-        seed_directory = cls.enterClassContext(tempfile.TemporaryDirectory(prefix="verify-hold-seed-"))
+        seed_directory = cls.enterClassContext(tempfile.TemporaryDirectory(prefix="verify-hold-seed-", dir=fixture_parent))
         cls.fixture_seed = Path(seed_directory) / "seed"
         # These tests select a known interpreter, including recorder observers.
         # Version discovery is the lib/py suite's boundary. Preserve every
         # requested script and its real process, without a probe before each.
         library = builder.home / ".claude/scripts/lib"
-        source = library.resolve()
-        library.unlink()
-        library.mkdir()
-        for entry in source.iterdir():
-            if entry.name != "py":
-                (library / entry.name).symlink_to(entry, target_is_directory=entry.is_dir())
+        _ = copy_helpers(builder.home, *VERIFY_HELPERS)
         builder.write_executable(library / "py", fixture_shim_source())
         (builder.root / "unit").mkdir()
         cls.fixture_environment = {
@@ -230,6 +280,7 @@ class VerifyHoldTools(VerifyMacOffloadFixture):
         _ = shutil.copytree(self.fixture_seed, self.root, symlinks=True)
         self.addCleanup(self.assert_nothing_outlives)
         self.home: Path = self.root / "home"
+        self.verify_script: Path = self.home / ".claude/scripts/direct/verify.sh"
         self.bin_directory: Path = self.root / "bin"
         self.board: Path = self.root / "board"
         self.runner: Path = self.root / "runner.py"
@@ -257,12 +308,11 @@ class VerifyHoldTools(VerifyMacOffloadFixture):
 
     @override
     def stop_verify(self, process: subprocess.Popen[str]) -> None:
-        # Completed calls are drained here; the unchanged final marker scan
-        # still observes and reaps detached children before restoring the seed.
-        if process.poll() is None:
+        # Stop owned processes before draining pipes that a descendant can hold open.
+        if process.poll() is None or any(
+            stream is not None and not stream.closed for stream in (process.stdout, process.stderr)
+        ):
             super().stop_verify(process)
-        else:
-            _ = process.communicate(timeout=TEST_HANG_GUARD_SECS)
 
 
 class VerifyHoldWaitFixture(unittest.TestCase):
@@ -279,9 +329,9 @@ class VerifyHoldWaitFixture(unittest.TestCase):
 
     @classmethod
     @override
-    def setUpClass(cls) -> None:
+    def setUpClass(cls, *, fixture_parent: Path | None = None) -> None:
         cls.addClassCleanup(VerifyHoldTools.doClassCleanups)
-        VerifyHoldTools.setUpClass()
+        VerifyHoldTools.setUpClass(fixture_parent=fixture_parent)
 
     @override
     def setUp(self) -> None:
@@ -371,10 +421,7 @@ exit "$status"
             _ = admission.occupy_host()
             admission.free(0)
         _ = Path(self.fixture.environment["LINT_CONFIG_READER"]).write_text(
-            'lint_config_enabled() {\n'
-            + '    [[ "$1" == clippy ]] || return 1\n'
-            + '    exec {trace_fd}>&2; BASH_XTRACEFD=$trace_fd; set -x\n'
-            + '}\n'
+            'lint_config_enabled() { [[ "$1" == clippy ]]; }\n'
             + 'lint_config_skip_notice() { :; }\n')
         self.fixture.environment.update({
             "UNIT_RUN_DIR": str(self.fixture.board), "BUILDLOG_SYNC": "1",
@@ -439,10 +486,16 @@ exit "$status"
         self.fixture.environment["BUILD_TARGETS_SCRIPT"] = str(TARGETS)
 
     def record_phase(self) -> Path:
+        return self.record_phase_for_worker("fixture-impl")
+
+    def record_phase_for_worker(self, runner_worker: str) -> Path:
         session = self.fixture.root / "unit-run"
-        record_wait_workers(self.fixture.root, session, self.fixture.environment, {"fixture-impl": "thread-impl"})
+        runner = staff.caller_identity()
+        impl = (runner if runner_worker == "fixture-impl" else "") or fixture_runtime_id("thread-impl")
+        record_wait_workers(self.fixture.root, session, self.fixture.environment, {"fixture-impl": "thread-impl"},
+                            runtime_ids={"fixture-impl": impl})
         self.fixture.environment.update({"UNIT_RUN_DIR": str(session), "UNIT_PHASE_ID": "closed-server-phase",
-                                         "UNIT_TEAM_ROLE": "impl", "CODEX_THREAD_ID": fixture_runtime_id("thread-impl"),
+                                         "UNIT_TEAM_ROLE": "impl", "CODEX_THREAD_ID": impl,
                                          "UNIT_PASS_OWNER": "launcher",
                                          "UNIT_HISTORY_DIR": str(self.fixture.root / "history"),
                                          "UNIT_SYNC_WRITES": "0", "CLAUDE_PROBE_SESSION": ""})
@@ -460,10 +513,11 @@ exit "$status"
         return self.fixture.root / "history" / "runs" / f"{session.name}.jsonl"
 
     def assert_wait_follows_worker_thread(self, worker_name: str) -> None:
-        history = self.record_phase()
+        history = self.record_phase_for_worker(worker_name)
         session = Path(self.fixture.environment["UNIT_RUN_DIR"])
+        runner = staff.caller_identity() or fixture_runtime_id("thread-test")
         record_wait_workers(self.fixture.root, session, self.fixture.environment,
-                            {"fixture-impl": "thread-impl", worker_name: "thread-test"})
+                            {worker_name: "thread-test"}, runtime_ids={worker_name: runner})
         for arguments in (
             ["start-phase", "--session-dir", str(session), "--phase-id", "7", "--phase-title", "Test"],
             ["start-pass", "--session-dir", str(session), "--phase-id", "7", "--pass-kind", "test",
@@ -472,7 +526,7 @@ exit "$status"
         ):
             result = invoke_recorder(arguments, {**self.fixture.environment, "UNIT_TEAM_ROLE": "test"}, self.fixture.root)
             self.assertEqual(result.returncode, 0, result.stderr)
-        self.fixture.environment["CODEX_THREAD_ID"] = fixture_runtime_id("thread-test")
+        self.fixture.environment["CODEX_THREAD_ID"] = runner
         self.hold()
         process = self.start("test", "sample", "--local", "worker attribution", "--filter", "smoke")
         self.wait_for_call(process)
@@ -486,7 +540,7 @@ exit "$status"
         for wait in (started, finished):
             self.assertEqual((wait["phase_id"], wait["phase_instance_id"], wait["pass_instance_id"],
                               wait["worker_name"], wait["owner_session"]),
-                             ("7", worker_pass["phase_instance_id"], worker_pass["pass_instance_id"], worker_name, fixture_runtime_id("thread-test")))
+                             ("7", worker_pass["phase_instance_id"], worker_pass["pass_instance_id"], worker_name, runner))
 
     def count_python_starts(self) -> Path:
         starts = self.fixture.root / "python-starts"

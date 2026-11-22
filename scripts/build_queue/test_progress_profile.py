@@ -238,6 +238,17 @@ class ProgressCounterTests(unittest.TestCase):
 
 
 class ProgressCaptureTests(unittest.TestCase):
+    def test_process_status_with_invalid_name_keeps_rss_anon(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            proc = Path(temporary)
+            directory = proc / "123"
+            directory.mkdir()
+            _ = (directory / "cmdline").write_bytes(b"verify\0")
+            _ = (directory / "status").write_bytes(b"Name:\tverify\xff\nRssAnon:\t42 kB\n")
+
+            self.assertEqual(progress.read_processes((123,), proc),
+                             (progress.ProfileProcess(123, ("verify",), 42 * 1024),))
+
     def test_a_counter_split_between_log_reads_is_complete_after_the_next_read(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "cargo.log"
@@ -333,7 +344,7 @@ class ProgressWindowTests(unittest.TestCase):
     def test_legacy_gate_records_are_not_anonymous_progress_profiles(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "gate.json"
-            _ = path.write_text('{"step":"merge-gate","anon_peak_bytes":99999999999,"at":100}')
+            _ = path.write_text('{"step":"gate","anon_peak_bytes":99999999999,"at":100}')
             self.assertIsInstance(progress.read_profile(path, cutoff=99), progress.NoMatchingProfile)
             self.assertIsInstance(progress.read_profile(path.with_name("missing.json"), cutoff=99), progress.NoMatchingProfile)
 

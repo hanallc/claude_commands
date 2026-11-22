@@ -11,13 +11,14 @@ import time
 import unittest
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import cast
+from typing import cast, override
 from unittest import mock
 
+from scripts.lib.helper_tree_test_support import verify_test_environment
 from scripts.lib.shell_test_support import shell_functions
 from scripts.lib.process_group import send_process_group
 from scripts.direct.verify_token_wait_test_support import VERIFY
-from scripts.direct.wait_for_test_state import wait_for_file
+from scripts.direct.wait_for_test_state import wait_for_file, wait_for_pid
 from scripts.direct.verify_hold_wait_test_support import (
     VerifyHoldWaitFixture,
     WaitObservation,
@@ -25,7 +26,17 @@ from scripts.direct.verify_hold_wait_test_support import (
 )
 
 
+SIGNAL_EXIT_SECONDS = 5
+_SIGNAL_FIXTURE_PARENT = Path("/dev/shm") if Path("/dev/shm").is_dir() else None
+
+
 class VerifyHoldWaitTests(VerifyHoldWaitFixture):
+    @classmethod
+    @override
+    def setUpClass(cls, *, fixture_parent: Path | None = _SIGNAL_FIXTURE_PARENT) -> None:
+        # Keep fixture copies and cleanup writes off the disk shared by other tests.
+        super().setUpClass(fixture_parent=fixture_parent)
+
     def assert_group_stop_clears_memory_wait(self, signum: signal.Signals) -> None:
         process = self.start_memory_queued_lint()
         queued = self.memory_queue_pids()
@@ -34,18 +45,18 @@ class VerifyHoldWaitTests(VerifyHoldWaitFixture):
                          "the coordinator waits at admission before any step starts")
         started = time.monotonic()
         send_process_group(process.pid, signum)
-        survivors = self.wait_for_owned_exit(5)
-        code = process.poll()
+        # Drain the log pipes while the coordinator records the interrupted call.
+        code, output = self.finish(process)
+        survivors = self.wait_for_owned_exit(max(0, started + SIGNAL_EXIT_SECONDS - time.monotonic()))
+        elapsed = time.monotonic() - started
         remaining = self.memory_queue_pids()
-        output = ""
-        if not survivors:
-            _, output = self.finish(process)
-        diagnostic = (f"{signum.name}: exit={code}, elapsed={time.monotonic() - started:.3f}s, "
+        diagnostic = (f"{signum.name}: exit={code}, elapsed={elapsed:.3f}s, "
                       + f"queued={sorted(queued)}, remaining={sorted(remaining)}, survivors={sorted(survivors)}\n"
                       + "\n".join(output.splitlines()[-80:]))
         self.assertEqual(survivors, set(), diagnostic)
         self.assertTrue(queued.isdisjoint(remaining), diagnostic)
         self.assertEqual(code, 128 + signum, diagnostic)
+        self.assertLessEqual(elapsed, SIGNAL_EXIT_SECONDS, diagnostic)
         self.assertEqual(self.fixture.last_call()["outcome"], "interrupted", output)
         self.assertEqual(self.fixture.saved_results(), [], output)
 
@@ -56,6 +67,76 @@ class VerifyHoldWaitTests(VerifyHoldWaitFixture):
                     self.assertTrue(self.doCleanups(), "the preceding signal fixture did not stop")
                     self.setUp()
                 self.assert_group_stop_clears_memory_wait(signum)
+
+    def test_sigint_before_placement_pid_is_saved_reaps_the_waiter(self) -> None:
+        hold = self.fixture.runner_state
+        os.mkfifo(hold / "placement-ready")
+        interrupted = shell_functions(VERIFY, "verify_interrupted")
+        after_handler = VERIFY.read_text().split(interrupted, 1)[1]
+        # Use the signal bindings from Verify with its handler.
+        signal_bindings = after_handler.split("\nif ", 1)[0]
+        harness = (
+            shell_functions(VERIFY, "placement_once", "interrupt_hold_wait")
+            + interrupted + signal_bindings + "\n"
+            + r'''
+set -eu
+HOLD_WAIT_DIR=$TEST_RUNNER_STATE
+DOC_REPO_TOP=$PWD STEP_RECORD_SCRIPT=$1
+CMD=test PKG=sample BUILDLOG_PEAK="" BUILDLOG_MEM_ADMIT_SCRIPT=placement-fixture
+PLACEMENT_EPISODE=fixture PLACEMENT_SINCE=0 PLACEMENT_SOURCE_KEY=fixture PLACEMENT_SESSION=fixture
+PLACEMENT_ASSIGNMENT_FILE=$HOLD_WAIT_DIR/assignment PLACEMENT_GRANT_FILE=$HOLD_WAIT_DIR/grant
+PLACEMENT_COMMAND=()
+HOLD_WAITER_PID="" RUN_STEP_PID="" BUILDLOG_HOLD_WAITER_FILE=""
+unset BUILDLOG_FIRST_STEP_REQUEST BUILDLOG_FIRST_STEP_ASSIGNMENT
+exec 7<&0 8<>"$HOLD_WAIT_DIR/placement-ready"
+
+verify_helper() {
+    [[ "$2" == place-step ]]
+    exec 9>"$HOLD_WAIT_DIR/placement-lock"
+    flock -x 9
+    printf 'locked\n' >&8
+    read -r -u 7 unused
+}
+verify_cleanup() {
+    flock -x "$HOLD_WAIT_DIR/placement-lock" true
+    wait "$placement_pid" 2>/dev/null || true
+}
+finish_verify_run() { :; }
+stop_interrupted_run_log() { :; }
+
+before_placement_pid() {
+    if [[ "$BASHPID" == "$$" && "$BASH_COMMAND" == 'HOLD_WAITER_PID=$!' ]]; then
+        trap - DEBUG
+        [[ -z "$HOLD_WAITER_PID" ]]
+        placement_pid=$!
+        read -r -u 8 ready
+        [[ "$ready" == locked ]]
+        printf '%s\n' "$placement_pid" > "$HOLD_WAIT_DIR/placement-pid"
+        read -r -u 7 unused
+    fi
+}
+set -T
+trap before_placement_pid DEBUG
+placement_once
+'''
+        )
+        step_record = self.fixture.verify_script.with_name("step_record.py")
+        process = subprocess.Popen(
+            ["bash", "-c", harness, "verify-placement", str(step_record)],
+            cwd=self.fixture.root, env=self.fixture.environment,
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, start_new_session=True,
+        )
+        self.addCleanup(self.stop_process, process)
+        placement_pid = wait_for_pid(hold / "placement-pid", processes=(process,))
+        process.send_signal(signal.SIGINT)
+        # Keep stdin open until Bash exits so the fixture cannot release the lock.
+        try:
+            status = process.wait(timeout=SIGNAL_EXIT_SECONDS)
+        except subprocess.TimeoutExpired:
+            self.fail(f"Verify did not exit after SIGINT while placement PID {placement_pid} held the lock")
+        self.assertEqual(status, 130)
+        self.assertFalse(Path(f"/proc/{placement_pid}").exists())
 
     def test_hup_reaps_log_readers_when_the_output_pipe_is_full(self) -> None:
         # Fill the consumer's pipe before starting verify's real log helpers.
@@ -76,7 +157,7 @@ printf '%s\n' "${RUN_LOG_PIDS[*]}" >&3
 read -r command
 '''
             with subprocess.Popen(["bash", "-c", harness, "test", str(log)],
-                                  stdin=subprocess.PIPE, stdout=write_fd,
+                                  env=verify_test_environment(), stdin=subprocess.PIPE, stdout=write_fd,
                                   stderr=subprocess.PIPE, start_new_session=True, text=True) as process:
                 try:
                     assert process.stderr is not None

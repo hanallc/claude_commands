@@ -101,7 +101,13 @@ Other options include `--permanent`, `--account`, `--model`, `--port`, `--resume
   A failed trust write prints one anomaly and prevents the start.
 
 - **Steps**, each skipped when already done: the brief stub beside the production doc at `<its directory>/<branch>.md` (`## Source`, a zone stamp and the user's words); the unit staff row and its `.unit.toml`; commit `production(<showrunner name>): add unit <unit> (<plan|brief|standby|permanent>)` on the merge branch for a brief stub or a brief-to-plan switch, which is not pushed here and goes out with the next merge push (user, 2026-10-08); `git worktree add` from the local merge branch, with no push of the unit branch (the unit's first checkpoint push sets its upstream), plus `branch.<branch>.cargoBerthTarget` when the repo has `.claude/config/berth.toml`; the herdr session (Launch below); the wait for `/remote-control is active` (default 90 s, last 15 pane lines on timeout); one LOG line `added <unit> (<mode>), worktree <path>`. It prints `<unit> started: herdr session attach <name>`. Shutdown restart resumes the staff session directly.
- New units select the configured units account through `accounts.account_for_group_launch("unit", ...)`. Resumes use the pane launch’s account when available, else the configured units account. `--source-fallback` must name the pane launch’s account. Resume model selection uses explicit `--model`, then the pane launch, then the last assistant model from the unit session (`transcript_model`); otherwise it uses the director model.
+ New units use the configured units account through `accounts.account_for_group_launch("unit", ...)`.
+ Resumes use the pane launch's account when available and the configured units account otherwise.
+ `--source-fallback` must name the pane launch's account.
+ A resume uses the model and effort from the latest real assistant turn across the Claude homes.
+ An explicit `--model` overrides the turn's model.
+ If no turn supplies a model, the pane launch supplies the fallback model.
+ The director settings supply any model or effort that remains unset.
 
 - **Launch.** `launch_session` starts the shared herdr server and opens the unit's tab in its production workspace.
   The tab title uses the unit name. The agent name uses the production and unit names.
@@ -136,6 +142,7 @@ A `#` starts a comment only at the line start or after whitespace.
 The first key wins, and `key.<host>` overrides `key`.
 The comment immediately above a key defines its whole-number range, numeric range, or allowed words.
 An invalid setting warns on stderr and uses the newest usable committed value under that revision's limits.
+Recovery prefers a value that also passes the current setting's limit.
 No usable value raises `conf.Unusable` with the source, key, and reason.
 `ConfigRead.origin` returns live, recovered, or unavailable evidence without printing a warning.
 The [accounts configuration section](accounts.md#runtime-configuration-and-constraints) defines repository defaults and explicit-folder behavior.
@@ -203,14 +210,18 @@ The queue survives a unit rename because its key is the fixed staff id.
 - `[assignments]` has `production=claude`; `[production.claude]` has `director=opus:xhigh`. There is no `[production.codex]`: unit directors launch only on Claude, and the showrunner is whichever session runs `/showrunner:produce`. The header Consumers list names `production unit directors (add_unit.py)`.
 - `director_agent(request) -> DirectorAgent(model, effort: DefaultEffort | Effort(value))` runs `bash -c 'source "$1" && agents_resolve production.director && printf …'` with the `models_config.sh` from the script's own checkout (`Path(__file__).resolve().parents[1] / "agents/models_config.sh"`); `MODELS_CONFIG_FILE` comes from the caller (default `~/.claude/config/models.conf`). A resolver failure is exit 2 with its first `ERROR:` line; a family other than `claude` is exit 2 with `unit directors launch only on claude; production.director resolves to <family> (<model>)`. Both happen in `preflight`, so `--check` refuses too. `--effort` is passed only for `Effort(value)`.
 - **One-family pinning** (`scripts/agents/models_config.sh`): a function with exactly one family set is pinned to it (`_agents_pinned_family`). Every-function switches (`agents_set_all_assignments <family>`, `agents_set_model <agent>` with no function) leave it as it is and add it to `AGENT_KEPT_FUNCTIONS`; `default_models.sh` prints `# kept production on claude: its only set`. A switch aimed at it (`agents_set_assignment production codex`, `agents_set_model <codex agent> production`, `agents_set_row production.director <codex agent>`) prints `ERROR: 'production' runs only on claude: [production.claude] is its only set.`, returns 1 and leaves the file untouched. `/default_models production.director <model>:<effort>` changes the row.
-- **Resume** in `<LaunchUnits/>` uses add_unit’s live session and pane launch checks. Its Claude arguments come from `models_config.sh`, `agents_resolve production.director` and `agents_claude_args`, then `--resume <session-id> --remote-control <session> -n <session>`. No shutdown hold is read.
+- **Resume** in `<LaunchUnits/>` uses `add_unit.py` and checks the live session and pane launch.
+  It uses the model and effort from the latest real assistant turn.
+  An explicit `--model` overrides the turn's model.
+  The pane launch supplies the fallback model.
+  The director role supplies any missing model or effort.
 
 ### Phase end on the unit side
 
 `docs/direct/phase_end.md` defines `<PhaseEnd/>`, the one order a loop or verbose phase ends in: (1) code commit (`<CheckpointCommit/>`, with the phase `status: done` and its Work Order still in place); (2) the code-ready notice, whose hash is mergeable now; (3) the plan review, where a defect in the committed phase becomes a follow-up phase run next; (4) the add-on check; (5) worker cleanup and `finish-phase`; (6) the next phase's launch; (7) the shrink beside the next phase's workers, its commit and the shrink notice. With no phase left, step 7 runs, then `<FinalGate/>`. A due `<PeriodicCI/>` point outside a production runs step 7 before step 6, so CI sees a clean tree. The other phase-end docs point to it in one line.
 
 - `<ShrinkCommit/>` (`commands/unit/checkpoint.md`) stages only the plan doc and an approved next-items file, refuses any other staged path, commits `shrink(<plan-slug>): phase N — <title>`, runs `<PushCheckpoint/>` and owns no reservation.
-- The shrink notice is `From <unit>: phase <N> shrink <hash> — plan doc only.` or `… — plan doc and <next-items path>.`
+- The shrink notice is `phase <N> shrink <hash> — plan doc only.` or `… — plan doc and <next-items path>.`
 - A failed shrink blocks only `<ShrinkCommit/>`; the next `<CheckpointCommit/>` refuses while an earlier `done` phase still has a Work Order.
 - **Closing work in the recorder** (`scripts/direct/progress_history.py`). `start-activity` succeeds whenever the run is active and a phase has been started in it, still active or already closed by `finish-phase`, so work after step 5 with no next phase started (the last phase's `shrink` activity) keeps its row. On a closed phase `activity_started` and `activity_finished` carry that phase's `phase_instance_id`, and the phase's status, `finished_at` and elapsed time stay as `finish-phase` left them; `finish-activity` records status, result and elapsed seconds as it does inside a phase. `start-activity` exits 1 with `Start a phase before starting an activity` when the run has no phase, and with `Cannot start an activity: the run is finished` after `finish-run`.
 - **An activity left open.** `start-phase` and `finish-run` close an activity still open, inside a phase or on a closed one, as `interrupted`. A repeated `finish-phase` does nothing: `_finish_phase` returns before any cleanup when the phase in state is not active, so an activity opened after the phase closed keeps running.
@@ -224,7 +235,10 @@ The queue survives a unit rename because its key is the fixed staff id.
 - `--trailer <line>` (repeatable), `--regime after|trial`, `--holds K`, and `--merge-defects D`.
 - `--excluded "<why>"`, `--cancel-prior`, `--bump`, and `--scratch <dir>`.
 
-`produce.md` `<MergeCheckpoint/>` runs the command in the background after the showrunner's judgments.
+`produce.md` `<MergeCheckpoint/>` sends the command to a merge unit when one serves the production.
+Otherwise, the showrunner starts single and batch merges with `detached_runs.py start --session-dir "<STATE_DIR>"`.
+The showrunner also uses this start command for child handoffs.
+The run continues across an account move. Stop the run with `detached_runs.py stop --reason "<why>" <record>`.
 `--as-built` merges a unit's closing documentation commit without tests or a review-ledger row.
 It requires an earlier code checkpoint merge for that phase.
 It accepts only `.md` paths and requires a change to or deletion of the unit's plan.
@@ -276,7 +290,7 @@ Each local Promote checkout must exist before the command pushes.
   [Review regime records](review-regime-trial.md) define the counts, times, types, and checkpoint parser.
 - **Held simplify items.** The checkpoint notice carries each held item and its ledger reference.
   The [simplify lens](simplify-lens.md#findings-and-decisions) defines which items require user questions and which items the director settles.
-- **Merge tests** are the backticked spans before the first unquoted `(`. A missing field is refused. An empty field means no commands.
+- **Merge tests** are the backticked spans before the first unquoted `(`. A missing field is refused. An empty field means no commands. The nightly run checks types.
 - **Steps:**
   1. *ancestry*: the checkpoint exists on an origin branch. Git ancestry identifies a checkpoint that already reached the merge branch. An already merged hash skips steps 2–7.
   2. *scope*: nothing staged in the merge checkout. Code paths have no responsibility filter.
@@ -343,8 +357,9 @@ Each local Promote checkout must exist before the command pushes.
      An unreachable Mac queues its target and source through `main_publish` and permits the merge to finish.
      An answering Mac whose pull fails still fails promotion.
   10. Record the code checkpoint's review ledger row and production log line.
-     `review_regime.py add` uses the configured plan, unit, phase, merge time, review numbers, and optional exclusion.
-     The ledger key includes unit, plan, and phase.
+     The merge command passes the checkpoint commit as the required `--checkpoint` argument to `review_regime.py add`.
+     It also passes the configured plan, unit, phase, merge time, review numbers, and any exclusion.
+     The review ledger matches rows by unit, plan, phase and checkpoint.
      The LOG line identifies the checkpoint, merge, tests, push, and promotion.
      An existing matching log line skips the write.
 - **Merge report.** Step 9 prints `into: <path> (<branch>) — <why>; unblocks: <what>` as it reaches each place: the merge-branch checkout (`the merge branch collects every unit's checkpoints`; unblocks `<gate id>: <Waiting cell>` for each Gates row whose **Waits on** is `<unit> phase <N>`, else `no gate`), then each Promote checkout and the Mac (`sessions on <machine> run the installed commands from it`; unblocks `the live gate of <unit> phase <N>`). Only a code checkpoint's first merge names a gate.
@@ -371,10 +386,24 @@ Each local Promote checkout must exist before the command pushes.
   It scans first-parent merges on the production's merge branch from 2026-11-06.
   Older merges add no rows.
   It excludes foreign history through origin merge refs and `_publication_exclusions`.
+  A descendant with a separate review list has its own scan scope.
+  An unreadable descendant document remains in scope and shares the parent's list.
+  The scan reads staff parents to identify descendants, including grandchildren.
+  It excludes a descendant's first-parent merges only when the scanning branch does not share them.
+  For other outside productions, it excludes their complete first-parent merge chains.
+  The parent scan retains its merges before a descendant's fork.
+  The child scan excludes its parent's merges and its siblings' merges.
   A local gate branch remains eligible when its name differs from the production merge branch.
   `review_commits` keeps every checkpoint and other commits without a descendant checkpoint in that merge range.
   The count includes only selected commits with review lines that parse.
   The row writer uses the same selection and reads its visible lines.
+  `list-ready` reports each commit with an invalid supplied `Change-Review` line on stderr.
+  Each message names the short merge hash, short commit hash, subject, and reason from `problem()`.
+  Invalid lines include malformed forms and missing required images.
+  A passing commit's `Change-Review-Covers` line silences the covered commit, as in `missing()`.
+  A commit without a review line prints no message here.
+  Invalid commits add no rows and do not change the exit code.
+  Valid lines on non-checkpoint subjects remain eligible.
   `checkpoint_producers` reads recorded owners through `progress_history.load_events`, using the held staff snapshot.
   Legacy records use `StaffSnapshot.unit_by_worktree`.
   Merge writers record the known producer when they make the merge.
@@ -437,11 +466,30 @@ Each local Promote checkout must exist before the command pushes.
   A failed commit prints `written but not committed`; the next write commits the complete list.
   The vault's Templater must exclude the change-review folder to prevent concurrent changes to new lists.
 
-  `add` records ready changes that have no checkpoint line.
+  Every new or edited visible row requires a registered image.
+  Metadata changes and verdicts can update existing imageless rows; the image rule applies only to new rows and visible content edits.
+  This write rule has no date exception; `problem()` retains its date rule for commit checks.
+  `add` requires `--image` or `--output` and records ready changes that have no checkpoint line.
+  `--image` accepts a PNG path or a registered image id.
+  `batch` checks all edits before any list write and names every row without an image.
+  `edit` keeps an existing image and requires an image when the row has none.
+  Edit and verdict cleanup remove an image only when no row in any known review list names it.
+  An image reference lock protects the reference scan and image removal.
+  Row writers hold the same lock from the image check through the list write.
+  Writers take the directory lock before the image reference lock.
+  Image rendering and Git commits run outside the image reference lock.
+  Unknown image ids produce refusals and never produce empty image cells.
+  `list-ready` and `live` report imageless visible lines and add no rows, including for historical commits.
+  Register an image with `change_review.py image --image <png>` or `--output <text file>`.
+  Then pass the returned id with `--image`.
+  Invisible `Change-Review: none — <reason>` lines need no image.
   `edit` retains the row id, merge, other cells and position.
   `show` displays the next row only when the user asks.
   `verdict` moves a row to Reviewed; `works` or `fine` accepts it.
   Other verdicts return the change to its unit.
+  A showrunner check requires `verdict --validation <id>` with the validation ID from its request message.
+  The single verdict command returns a check problem to For you.
+  A batch verdict uses the same ID in its `validation` field.
   `list-path` and `showrunner` resolve the list and its root owner.
   `backfill-production [--list L] [--write]` retains its older owner-cell repair.
   It traces an empty cell through the merge's checkpoint, production ownership, then first-parent history.
@@ -455,7 +503,7 @@ Each local Promote checkout must exist before the command pushes.
   It uses the shared runner with affected-module selection.
 - **The `~/.claude` repo's own gate.** `scripts/production/merge_gate.py` checks ancestry and checkout changes before it merges a checkpoint with `--no-ff`.
   The gate runs all test modules under a memory governor.
-  Basedpyright runs only with `--nightly` or an explicit `--type-dirs`.
+  Basedpyright runs only with `--nightly`.
   Recursive discovery sorts module paths and uses the first folder under `scripts/` as the suite.
   Test modules use `builds.slice` scopes when available.
   After the parallel pass, up to eight failed test modules run once more, alone.
@@ -495,12 +543,14 @@ The [launch receipt contract](build-followups-fn-length-hook.md#production-launc
 
 ### The List: `the_list.py`
 
-The List keeps one Markdown record at `<SHOWRUNNER_STATE_DIR>/<producer staff id>/list/L<n>.md`.
+The List keeps one Markdown record at `<SHOWRUNNER_STATE_DIR>/<morty staff id>/list/L<n>.md`.
 The default root is `~/.local/state/showrunner`.
-The command requires the current `morty` producer row; its fixed staff ID selects the producer folder.
+The CLI requires a producer staff row for the current session.
+Morty's fixed staff ID selects the folder for every caller.
 The item's `owner` field names its showrunner.
 `nate` and `Not recorded` identify items without an assigned showrunner.
-The store context selects the producer folder; records do not repeat the producer ID.
+The item's `producer` field stores the assigned producer's fixed staff ID.
+Old records without the field default to morty.
 `record_store.NumberedRecords` supplies the folder, number allocation, frontmatter, file lock, and atomic replacement for both stores.
 Both stores use `file_lock.exclusive` and the shared `record_store.state_root` function.
 `update_registration` also uses this root function.
@@ -515,27 +565,70 @@ The Added line preserves initial field values, including state, ETA, next step, 
 Quoted log values preserve line endings as JSON escapes.
 
 States are `New`, `Working`, `Blocked`, `Waiting for nate`, `Delivered`, `Done`, `Paused`, and `Closed`.
-Parking sets a time without changing the state.
-ETA accepts an offset ISO time, two such times separated by `/`, or `Not asked`, `Pending`, `Paused`, or `Delivered`.
-ETA also accepts a text description when a time or status cannot express the estimate.
+Parking stores a time or a delivery condition and keeps the current item state.
+The List ends a delivery park automatically when the producer sets the item state to Delivered.
+Linked changes supply review information on the List.
+The List hides an item with unanswered questions while each send is pending or successful.
+If a question send fails, the item shows Question not delivered.
+The `the_list.py list` command still shows the item.
+The producer uses `the_list.py answer` to save an answer and mark the item unread.
+Add and update accept `Mon D`, `Mon D HH:MM ZONE`, `No time yet`, `Waiting for nate`, `Paused`, and `Delivered` as an ETA.
+The command selects the date nearest to today in the user's time zone.
+The record and log store a date-only ETA as an ISO date, such as `2026-11-20`, with kind `time or status`.
+A date-only ETA becomes late at the start of the next day in the user's time zone.
+A time becomes late at that time.
+A range becomes late at its end.
+A status or text description never becomes late.
+Put the reason in `--latest-status`.
+The store still reads ISO times, ranges, text descriptions, `Not asked`, and `Pending` from existing records.
 The `eta_kind` field marks text descriptions as `text` and other estimates as `time or status`.
 The store validates text descriptions as one nonempty line and never parses them as times or ranges.
 Next check accepts a time or a text condition.
 Unknown opened and updated times remain empty.
-Time fields accept offset ISO times; a date alone uses midnight in the user's configured time zone.
+Other time fields accept offset ISO times and read a date as local midnight.
 An empty optional time removes that time.
 
 1. Add an item with `the_list.py add --owner <showrunner staff id> --title <text> --source <source>`.
 2. Preserve an existing item number with `add --number <n>`.
 3. Change fields with `update --id L<n> --source <source>` and the corresponding field options.
-4. Park or unpark an item with `park --id L<n> --until <time-or-empty> --source <source>`.
+4. Park or unpark an item with `park --id L<n> --until <condition> --source <source>`.
+   Use a time or `delivered` to park. Use an empty condition to unpark.
 5. Close an item with `close --id L<n> --words <closing words> --source <source>`.
 6. Restore a Closed item as New with `reopen --id L<n> --source <source>`.
 7. Clear its unread time with `mark-read --id L<n> --source <source>`.
-8. Print the table with `list`; include parked items with `--include-parked`, or all records with `--all`.
+8. Print the table with `list`.
+
+Use `--include-parked` to include parked items or `--all` to include parked and closed items.
+Use `--latest-status` to show the latest status column.
+The List page and the command show the saved update time beside the latest status in the user's time zone.
+They include the date for updates from another day.
+The page shows the time of each log entry beside its source.
+The command refuses a `--source` that ends with a clock time.
+Morty can use every command.
+Other producers can list only their own items, including with `--all`.
+If the directory or a record is unreadable, the producer's list reports an incomplete result and exits nonzero.
+The command shows any readable items in scope and omits details of the read error.
+They can use `--latest-status`, `--next-step`, `--eta`, `--state`, `--next-check`, `--evidence`, and `--add-evidence` on those items.
+Only morty can close an item.
+Their updates use the caller's staff name as the log source.
+
+Morty uses `--producer <name or staff id>` on add or update to assign an item.
+New items default to morty.
+Changing the producer to someone other than morty sends two notices after the save.
+The producer gets the title, showrunner, and List commands.
+The current showrunner gets the title, producer, and where to send design questions.
+The sender checks the fixed staff ID, required role, and current session before each delivery attempt.
+If the recipient is offline, the notice fails and stays unsent.
+If the producer retires before the staff refresh, the CLI reports the failed producer notice.
+The showrunner gets a notice that the saved assignment needs a new producer.
+When the Owner has no current showrunner row, the CLI reports a failed showrunner notice.
+When the staff refresh fails, the CLI reports the saved item ID and both unsent notices.
+The CLI exits nonzero if a notice fails. The saved assignment stays in place.
+An unchanged producer or an assignment to morty sends no notice.
 
 Add and update accept `--unit`, `--state`, `--next-check`, `--eta`, and `--requested-by nate|dwight`.
-They also accept `--next-step`, `--latest-status`, `--evidence`, and `--done-when`.
+They also accept `--next-step`, `--latest-status`, `--evidence`, `--add-evidence`, and `--done-when`.
+`--evidence` replaces the evidence text. `--add-evidence` appends one line.
 `--blocked-by L<n>:<condition> ...` records dependencies; `--related-to L<n> ...` records related items.
 Either option with no values clears its field.
 References use numbers in the same producer folder.
@@ -548,12 +641,16 @@ Closed records remain on disk with their time and closing words.
 Automatic numbering includes invalid records and Closed records.
 An explicit number must name an unused path.
 Exact repeated operations change nothing.
-Other updates append a log line and mark the item unread; mark-read clears the unread time without sending a message.
+An update appends a log line and marks the item unread if it is not Closed.
+Closing clears the unread time.
+Loading a Closed record clears its unread time in memory.
+Reopening creates a new unread update.
+Mark-read clears the unread time without sending a message.
 Update and park refuse Closed items until reopen restores them.
-The table uses `# | Owner | Item | State | Next step | ETA | Update`.
+The table uses `# | Owner | Producer | Item | State | Next step | ETA | Update`; Producer shows the producer's name.
 It sorts Waiting for nate first, unread items second, and next check times third.
 State cells include the check time and identify overdue checks.
-Future parked items and Closed items remain hidden by default.
+Items with active parks and Closed items remain hidden by default.
 
 `load`, `records`, `table`, and the write functions share this store with future console callers.
 `records` watches the folder and record paths, reports invalid records, and preserves their files.
@@ -589,18 +686,21 @@ The states are `open`, `answer ready` and `read`.
 Review maps them to Waiting, For you and Done.
 Ask question returns an answered investigation to Waiting and preserves its previous answer in the log.
 Send feedback finishes it with the result **feedback sent**.
-The owner answers a Review question with `change_page.py answer-question --item investigation/<staff id>/I<n> --text "<answer>"`.
+The owner answers a Review question with `change_page.py answer-question --item investigation/<staff id>/I<n> --question <id> --text "<answer>"`.
+The request message supplies the question ID.
 The answer returns the record to For you.
 An exact repeat of an answer-ready or read operation changes nothing.
 Other state changes receive one refusal line.
 
-1. File an investigation with `investigation.py file --title "<one line>" --question "<full question>"`.
+1. File an investigation with `investigation.py file --title "<one line>" --question "<full question>" --waiting-why "<reason>"`.
 2. Save its answer with `investigation.py answer --id I<n> --text "<answer>"`.
 3. Mark its answer read with `investigation.py read --id I<n>`.
 4. List waiting investigations with `investigation.py list`.
 5. Include read investigations with `investigation.py list --all`.
 
 Answer and read commands accept `--owner <staff id>` to select another owner's record.
+The native answer command accepts an initial investigation answer without a Review exchange.
+An open Review exchange requires the shared answer command and its current question ID.
 `records`, `load`, and `mark_read` provide the same store operations for console callers.
 `records` skips invalid records, reports each path and cause on stderr, and watches those paths for cache refresh.
 Invalid UTF-8 receives the same refusal as invalid record fields.
@@ -653,7 +753,8 @@ A missing folder uses its nearest existing parent until the folder appears.
   Its status count, `/next question`, and Review page filter read those records.
   Answers, Send feedback and Ask question use the existing retry, alert and recovery paths.
   Send feedback closes the question; Ask question waits for the owner's answer.
-  The owner runs `change_page.py answer-question --item <Review key> --text "<answer>"` to return it to For you.
+  The owner runs `change_page.py answer-question --item <Review key> --question <id> --text "<answer>"` to return it to For you.
+  The request message supplies the question ID.
   The canonical question log keeps the user's words after the 48-hour replay archive expires.
   A missing showrunner owner gives `QuestionOwnerUnavailable`.
   A unit rename rewrites no question record.
@@ -665,10 +766,12 @@ A missing folder uses its nearest existing parent until the folder appears.
   More or fewer than one match exits 2.
   It prints `relay: to <unit>`, `relay: to the showrunner of <showrunner name>, for <unit>`, or `relay: none; …`.
   It then prints `answer: ok — <showrunner name>: <text>`.
-- `reply --item <text> --text <reply>` remains the compatibility API behind the shared Review answer command.
+- `reply --item <text> --text <reply>` answers a native followup without a tracked Review exchange.
+  An open Review exchange requires the shared answer command and its question ID from the request message.
   A question with a follow-up that waits for its reply is not due: `open` lists it as `waiting for the asker's reply since <time>`, and `/next` and the page leave it out.
   `reply` finds the one question with exactly that text and a waiting follow-up, in this production or a production below it.
   It keeps the follow-up and the reply in `followups`, and the question is due again with both shown.
+  The Python `followup` API requires `waiting_why`; the Review action uses the user's question text automatically.
   It prints `reply: ok — <showrunner name>: <text>: back on the open-questions list with the reply`.
 - `withdraw --item <text>` removes one open item with exactly that text from this production or a production below it.
   Use `update_registration.py withdraw --item <text>` when the cause of a filed item is gone.
@@ -786,10 +889,21 @@ Pane labels do not identify a consultation.
 `ci_points.py due | ci start [--cancel-prior] | ci collect | watch | notice clear <gate> | notice lift <gate> --log <path>`, each with `--production`; `due`, `ci`, `watch` take `--state-dir`; `due` and `ci` take `--no-ci`.
 
 - `due` counts distinct recorded unit checkpoints that reached the merge branch. Five checkpoints after the last CI point produce `CiDue`. A collected point saves the count and tip in `ci_points.json`. Shrink commits and child hand-offs have no unit checkpoint record.
-- `ci start`: `bash validate_and_push.sh --to <merge branch> --fix-commit "ci(<showrunner name>): validation fixes after <unit> phase <N>|production wrap" [--cancel-prior]`; reads `repo`, `sha` and `run_id` from the `=== CI HANDOFF TO AGENT ===` block (`run_id: none` fails); the sha must be the merge-branch tip; writes `ci_run.json` (`repo`, `run_id`, `tip`), the only handoff to `collect`.
+- `ci start`: validates the merge-branch tip with `validate_and_push.sh`, publishes it with `push_direct.sh --publish-only`, follows the CI run with `push_direct.sh --follow-published`, and writes `ci_run.json` (`repo`, `run_id`, `tip`), the only handoff to `collect`. The run's repository and head commit must match the push remote and the published commit.
+  - Trigger: before validation it reads every workflow file at the tip and keeps the ones that run the `Test Suite` job. It reads all workflow registrations of the push repository (`gh api …/actions/workflows`).
+    1. Exactly one such workflow has a push trigger that covers the merge branch (no `paths` or `paths-ignore` filter), and its registration is active or absent: CI starts on push.
+    2. None covers the branch, and exactly one has `workflow_dispatch` and an active registration: `ci start` dispatches it after the push.
+    3. Otherwise it refuses before validation with one line: no trigger, a disabled registration, or several candidates.
+  - Validation reuse: `ci_validation.json` holds `input_tip` and `validated_commit`. A rerun whose tip equals either one skips validation.
+  - Dispatch: under the merge lock, `push_direct.sh --dispatch-published` checks that origin's branch tip is the published commit. It lists `workflow_dispatch` runs of the workflow on that branch and commit (`--repo`, at most 100). It follows the newest unfinished run, reuses the newest completed run when it succeeded, and otherwise dispatches once. The follow step polls outside the lock with the same selection and never dispatches. A run list that lags can let a later retry start a second run on the same commit.
+  - A failed run still runs the `--cancel-prior` step before `ci start` exits with the failure.
+  - An `ssh.github.com` (SSH over 443) remote uses `github.com` for GitHub API calls and run links.
 - `ci collect`: takes the tip and its code-merge count before `gh run watch --exit-status`, then `gh run view --json headSha,status,conclusion,jobs`. It passes only when `headSha` equals the validated tip and the current tip, the run is `completed` and concluded `success`, job `Test Suite` succeeded, and every other job succeeded or was skipped. Then it records `{count, tip}` and prints `--ci-green <tip>` as the last line, which `promote-main` and `wrap` take as is. Anything else is `ci collect: failed — rerun <check> on <tip>: …`, with no flag; a missing or empty `headSha` is never a pass.
 - `watch` / `review_watch(production, state_dir) -> WatchFirstAlert(line, table) | WatchRepeat(line) | WatchBelowThreshold(line)`: runs `review_regime.py watch` under `fcntl.flock` on `review_watch.lock`. On the first exit 3 with no `review_watch.json`, it takes `review_regime.py report --since 2026-09-28`, appends `- HH:MM <zone>: review watch: <line>` and the table to `LOG`, then writes `review_watch.json`. It sends no phone push: a status note that asks nothing goes to the log (`docs/as-built/message-clarity.md`). The shared state prevents repeated first alerts.
-- `notice clear <gate>` drafts `send <waiting unit>: From the showrunner: <gate> clear — <unit> phase <N> is on <merge branch> as <merge hash>. Merge <merge branch> and continue.` (refused until that code merge exists); `notice lift <gate> --log <path>` drafts `… <gate> lifted — your tests pass without <unit> phase <N> (<log>). Continue.` Gates rows read `| <id> | <waiting unit> phase <N> | <unit> phase <N> | … |`.
+- `notice clear <gate>` requires the code merge.
+  It drafts `send <waiting unit>: <gate> clear — <unit> phase <N> is on <merge branch> as <merge hash>. Merge <merge branch> and continue.`
+  `notice lift <gate> --log <path>` drafts `send <waiting unit>: <gate> lifted — your tests pass without <unit> phase <N> (<log>). Continue.`
+  Each gate row has the form `| <id> | <waiting unit> phase <N> | <unit> phase <N> | … |`.
 - Overrides for tests: `CI_POINTS_VALIDATE_SCRIPT`, `CI_POINTS_REVIEW_REGIME`, `CI_POINTS_REVIEW_REGIME`.
 
 ### Unit configuration formatting
@@ -907,6 +1021,19 @@ An unstaffed session requires an explicit native id and an explicit unit name.
     Each current task has one row with no equal states; `state_sentence` joins its actors' states with semicolons.
     No task row has an empty Work cell; a cell longer than the line limit continues on the next row.
     A busy session does not prove that the director works on a phase.
+    The board shows census shell commands when the conversation, machine, PID, and process start match the checked director.
+    It compares the start from the owner proof in the format from `scripts/lib/process_start.py`.
+    A matching empty shell list confirms no shell work when the checked director reports no shell activity.
+    When the checked director reports shell activity, an empty list leaves shell work unverified.
+    If no row matches the checked director, a census row for the conversation leaves shell work unverified.
+    This includes empty shell lists and older rows with no process identity.
+    A shell name that contains only whitespace appears as `Unnamed background command`.
+    A missing machine field gives `CensusMachineUnreported` on a legacy row.
+    A reported process identity requires a PID, a process start, and a nonempty machine name.
+    An unreadable census leaves shell work unverified for a checked live owner, including a paused unit.
+    If the census cannot reach the local machine, the board cannot verify shell work for its units.
+    A remote machine timeout leaves the local census evidence usable.
+    Unverified shell work prevents an idle result.
     With readable sources and no current task, open phase, pending merge, hold, or next work, the unit is idle.
     The director's busy status does not change this result.
     Its only current row is `Now | Nothing to do | The plan is complete and the queue is empty` for a complete readable plan.
@@ -1222,7 +1349,7 @@ An unreadable registry preserves `ClaudeUnknown(reason)`.
 A registered Claude without its messaging socket also remains unknown.
 
 Units launch in herdr and restore through `add_unit.py --host-session`.
-Resume models come from transcripts.
+Resumes use the latest assistant turn's settings with the overrides and fallbacks described above.
 Native runtime ids select staff rows.
 New launches carry no copied staff identity.
 Promotion waits for Claude to exit before it starts the replacement.

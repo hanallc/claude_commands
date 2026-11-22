@@ -125,6 +125,12 @@ __PAGE_FRAME_STYLE__
 .tip .sum { font-weight: 700; }
 .tip .long { grid-column: 1 / -1; padding-left: 0; text-align: left; white-space: normal; opacity: 0.7; }
 #tip > .tip { max-width: min(24rem, calc(100vw - 16px)); }
+.tip:has(dd.call) { grid-template-columns: fit-content(44%) minmax(0, 1fr); }
+.tip:has(dd.call) :is(dt, dd):not(.call) { white-space: normal; overflow-wrap: anywhere; }
+.tip dd.call > div { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2;
+  overflow: hidden; white-space: normal; }
+.tip dd.call span { display: inline-block; width: max-content; max-width: 100%;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; vertical-align: bottom; }
 /* shared:step-tip:end */
 .seg-remote { background: var(--remote-memory); }
 .machine[data-machine="natedev"] { color: var(--machine-natedev); }
@@ -138,7 +144,6 @@ __PAGE_FRAME_STYLE__
 details { border-radius: 6px; }
 summary { list-style: none; cursor: pointer; display: flex; gap: 8px; align-items: center; padding: 5px 0; border-radius: 6px; }
 summary::-webkit-details-marker { display: none; }
-summary:hover { background: var(--free); }
 summary .chev { flex: none; width: 14px; color: var(--ink-3); transition: transform 0.15s ease; font-size: 0.75rem; }
 details[open] > summary .chev { transform: rotate(90deg); }
 summary .name { font-weight: 600; }
@@ -239,6 +244,7 @@ h3 { margin: 12px 0 4px; font-size: 0.88rem; font-weight: 600; }
 .row-label .owner { overflow-wrap: anywhere; color: var(--ink-2); }
 .wrow.wait .row-label .name { white-space: normal; }
 .row-label .owner, .cloud-status .amounts { font-size: 0.75rem; }
+.row-label .wait-note { font-size: 0.75rem; color: var(--ink-2); }
 .row-memory { min-width: 0; }
 .cloud-status .cap { color: var(--cap); }
 .amounts { position: relative; height: 16px; margin-top: 2px; color: var(--ink-2); font-size: 0.7rem; line-height: 14px; font-variant-numeric: tabular-nums; }
@@ -251,7 +257,9 @@ h3 { margin: 12px 0 4px; font-size: 0.88rem; font-weight: 600; }
 .wrow.wait .row-memory { align-self: start; margin-top: 6px; }
 .wrow.room::after { content: ""; position: absolute; bottom: 0; left: 0; width: 100%; border-top: 1px solid var(--line); pointer-events: none; }
 .walk-chart .queue-head { display: flex; align-items: flex-end; padding-bottom: 3px; box-sizing: border-box; }
-.queue-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.queue-title { display: flex; min-width: 0; white-space: nowrap; }
+.queue-title > :first-child { overflow: hidden; text-overflow: ellipsis; }
+.queue-title > :last-child { flex: none; white-space: pre; }
 .wrow.room::before { content: ""; position: absolute; top: var(--divider-top, 0px); left: 0; width: 100%; border-top: 1px solid var(--line); pointer-events: none; }
 .walk-table tr.wait { color: var(--ink-2); }
 .walk-table { min-width: 0; width: max-content; max-width: 100%; }
@@ -437,7 +445,7 @@ body.queue-unavailable .card { display: none; }
   </section>
 
   <section class="card">
-    <div class="walk-head"><span class="section-head" data-tip="walkhead">Running, in start order</span><span class="walk-sum num" id="walk-sum" data-tip="walksum"></span><div class="walk-tokens num" data-tip="tokens"><span>Tokens</span><dl id="walk-tokens"></dl></div></div>
+    <div class="walk-head"><span class="section-head" id="walk-title" data-tip="walkhead">Running, in start order</span><span class="walk-sum num" id="walk-sum" data-tip="walksum"></span><div class="walk-tokens num" data-tip="tokens"><span>Tokens</span><dl id="walk-tokens"></dl></div></div>
     <div class="walk-scroll"><div class="walk" id="walk"></div></div>
     <p class="pressure-reason" id="cap-reason"></p>
     <div class="walk-key">
@@ -479,6 +487,22 @@ let latest = null;
 function field(label, value, kind = 'field', group = false) {
   return {kind, label, value: String(value ?? ''), group};
 }
+function staffField(label, names) {
+  return {...field(label, names.join(', ')), valueStaffNames: names};
+}
+function staffTitle(name, value, suffix = '') {
+  return {...field(name + suffix, value, 'title'), labelStaffName: name, labelSuffix: suffix};
+}
+function staffName(text) {
+  return globalThis.staffNames?.html(text) ?? esc(text);
+}
+function roleName(text) {
+  return globalThis.staffNames?.parts(text) ?? esc(text);
+}
+function nameParts(parts) {
+  return parts.map(part => part.kind === 'staff' ? staffName(part.text) : esc(part.text)).join('');
+}
+function partsText(parts) { return parts.map(part => part.text).join(''); }
 function groupRows(rows) {
   return rows.filter(row => row.value !== '').map((row, index) => ({...row, group: index === 0}));
 }
@@ -500,8 +524,25 @@ function shownReading(data) {
   const ram = Object.fromEntries(Object.entries(source).map(([key, value]) =>
     [key, key.endsWith('_bytes') && !totals.has(key) ? leaf(value) : value]));
   ram.programs = (source.programs || []).map(program => ({...program, bytes:leaf(program.bytes)}));
+  const splitTools = recorded(source.python_tests_bytes) && recorded(source.waiting_runs_bytes);
+  const otherTools = splitTools
+    ? leaf(source.python_tests_bytes + source.waiting_runs_bytes + source.other_build_tools_bytes)
+    : ram.other_build_tools_bytes;
   ram.build_tools_bytes = recorded(source.build_tools_bytes)
-    ? sum([ram.rust_analyzer_bytes,ram.sccache_bytes,ram.other_build_tools_bytes]) : source.build_tools_bytes;
+    ? sum([ram.rust_analyzer_bytes,ram.sccache_bytes,otherTools]) : source.build_tools_bytes;
+  ram.build_tool_parts = [['rust-analyzer', ram.rust_analyzer_bytes, source.rust_analyzer_bytes],
+    ['+ sccache', ram.sccache_bytes, source.sccache_bytes]];
+  if (splitTools) {
+    // Round cumulative amounts so the split keeps the previous displayed total.
+    const tests = leaf(source.python_tests_bytes);
+    const testsAndWaiting = leaf(source.python_tests_bytes + source.waiting_runs_bytes);
+    ram.build_tool_parts.push(['+ Python tests', tests, source.python_tests_bytes],
+      ['+ Waiting runs', testsAndWaiting - tests, source.waiting_runs_bytes]);
+    if (source.other_build_tools_bytes > 0)
+      ram.build_tool_parts.push(['+ Other build tools', otherTools - testsAndWaiting, source.other_build_tools_bytes]);
+  } else {
+    ram.build_tool_parts.push(['+ Other build tools', otherTools, source.other_build_tools_bytes]);
+  }
   ram.other_programs_bytes = recorded(source.other_programs_bytes)
     ? sum([...ram.programs.map(program => program.bytes),ram.smaller_programs_bytes]) : source.other_programs_bytes;
   ram.kernel_bytes = recorded(source.kernel_bytes)
@@ -536,7 +577,7 @@ function shownReading(data) {
   return shown;
 }
 function memoryRows(parts) {
-  return parts.map(([label, bytes]) => field(label, ramAmount(bytes)));
+  return parts.map(([label, bytes, measuredBytes]) => field(label, ramAmount(bytes, measuredBytes)));
 }
 function queueCapMemory(d) {
   return {builds:legendBytes(d.ram,'builds'),reserved:d.ram.build_covered_bytes,free:d.ram.room_bytes};
@@ -551,8 +592,7 @@ function legendTip(name, bytes, caption, parts = []) {
 const TIPS = {
   'g-builds': d => legendTip('Builds', queueCapMemory(d).builds, 'RAM that builds use now', memoryRows([
     ['Build tools', d.ram.build_tools_bytes], ['+ Queued builds', d.ram.queued_builds_bytes], ['+ hana CI', d.ram.ci_bytes]])),
-  tools: d => legendTip('Build tools', d.ram.build_tools_bytes, 'RAM that build tools use now', memoryRows([
-    ['rust-analyzer', d.ram.rust_analyzer_bytes], ['+ sccache', d.ram.sccache_bytes], ['+ Other build tools', d.ram.other_build_tools_bytes]])),
+  tools: d => legendTip('Build tools', d.ram.build_tools_bytes, 'RAM that build tools use now', memoryRows(d.ram.build_tool_parts)),
   queued: d => legendTip('Queued builds', d.ram.queued_builds_bytes, 'RAM of builds the queue started'),
   ci: d => legendTip('hana CI', d.ram.ci_bytes, 'RAM of hana CI programs'),
   'g-free': d => legendTip('Free RAM', d.ram.available_bytes, 'RAM that no program holds', memoryRows([
@@ -664,9 +704,10 @@ function tokenPoolRows(pool) {
   return pool?.kind === 'TokenPool' ? [field('Total', pool.total), field('Available', pool.free)]
     : [field('Status', 'unavailable')];
 }
-function ramAmount(bytes) {
+function ramAmount(bytes, measuredBytes = bytes) {
   if (!recorded(bytes)) return "unavailable";
-  return `${Object.is(bytes,-0) ? "-0.0" : f1(bytes / GIB)} GiB`;
+  const rounded = Object.is(bytes,-0) ? "-0.0" : f1(bytes / GIB);
+  return rounded === "0.0" && measuredBytes > 0 ? "<0.1 GiB" : `${rounded} GiB`;
 }
 function statusLine(d) {
   const status = d.memory_status, room = ramAmount(d.ram.room_bytes);
@@ -693,7 +734,8 @@ function signedSwap(bytes) { return `${bytes < 0 ? "−" : "+"}${swapAmount(Math
 function swapTip(row) {
   const captions = {total:'Swap across this machine', difference:'Group readings above the host total',
     unattributed:'Swap without a matching group', ungrouped:'Swap without a program name', smaller:'Swap of the smaller named groups'};
-  return [field(row.name, row.kind === 'difference' ? signedSwap(row.bytes) : swapAmount(row.bytes), 'title'),
+  const amount = row.kind === 'difference' ? signedSwap(row.bytes) : swapAmount(row.bytes);
+  return [row.title_kind === 'staff' ? staffTitle(row.name, amount) : field(row.name, amount, 'title'),
     field('', captions[row.kind] || 'Swap charged to this program', 'caption'),
     ...(row.owner_count === 1 ? groupRows(ownerFields(row)) : [])];
 }
@@ -729,7 +771,8 @@ function ciRow(row) { return row.ci || !!row.ci_label; }
 const STEP_TABLE_HEADERS = {target: "Target", duration: "Dur", waiting: "Waiting"};
 function ownerText(text) {
   const shown = publicText(text || '');
-  return /not recorded/.test(shown) || shown === '—' ? '' : shown;
+  return /not recorded/.test(shown) || /^(?:session:)?[a-f0-9]{8}(?:-?[a-f0-9]{4}){3}-?[a-f0-9]{12}$/i.test(shown)
+    ? '' : shown;
 }
 function stageText(row) {
   if (macRow(row)) return ["MacTesting", "MacTestingCounter"].includes(row.stage?.kind) ? "testing" : row.stage?.kind === "MacBuilding" ? "building" : "—";
@@ -744,24 +787,30 @@ function doneText(row) {
   return recorded(percent) ? formatPercent(percent, progress.done === progress.total) : "—";
 }
 function ownerFields(row) {
-  const fields = [field('Showrunner', ownerText(row.showrunner))];
-  if (row.runner === 'worker') fields.push(field('Worker', ownerText(row.worker)));
+  const fields = [staffField('Showrunner', [ownerText(row.showrunner)])];
+  if (row.runner === 'worker') fields.push(staffField('Worker', [ownerText(row.worker)]));
+  if (row.caller) fields.push(field('Caller', row.caller));
   return fields.filter(row => row.value);
 }
-function rowTitle(row) {
-  if (ciRow(row)) return row.ci_label || `hana CI · ${row.detail || row.name}`;
+function olderStepTitle(row) {
+  if (ciRow(row)) return {unit: '', step: row.ci_label || `hana CI · ${row.detail || row.name}`};
   const unit = ownerText(row.unit);
   const name = publicText(row.name || '');
-  return unit && !name.startsWith(unit+' ') && !name.startsWith(unit+' · ') ? `${unit} · ${name}`
-    : unit && name.startsWith(unit+' ') ? `${unit} · ${name.slice(unit.length+1)}` : name;
+  const step = unit && name.startsWith(unit + ' ') ? name.slice(unit.length).replace(/^\s*·\s*|^\s+/, '') : name;
+  return {unit, step};
 }
-function becauseRows(reason) {
+function stepTitle(row, value) {
+  const {unit, step} = row.title ?? olderStepTitle(row);
+  return unit ? staffTitle(unit, value, ' · ' + step) : field(step, value, 'title');
+}
+function becauseRows(reason, parts) {
   if (!reason) return [];
-  return reason.length <= 30 ? [field('Because', reason)] : [field('Because', ''), field('', reason, 'long')];
+  return reason.length <= 30 ? [{...field('Because', reason), valueParts:parts}]
+    : [field('Because', ''), {...field('', reason, 'long'), valueParts:parts}];
 }
 function routeFields(row) {
   return [field('Runs on', row.kind === 'cloud' ? 'AWS' : row.runs_on || ''),
-    ...(row.runs_on === 'natedev or Mac' ? [] : becauseRows(row.because || ''))];
+    ...(row.runs_on === 'natedev or Mac' ? [] : becauseRows(row.because || '', row.because_parts))];
 }
 function progressRows(row) {
   const progress = row.progress;
@@ -778,22 +827,33 @@ function stepTooltip(key, data) {
   const waiting = key.startsWith('wait:');
   const duration = tipDuration(key, row, data);
   const state = waiting ? 'waiting' : row.between_steps ? 'between steps' : 'running';
-  if (row.kind === 'mac-unavailable' || (!waiting && row.used && !recorded(row.used)))
-    return [field(rowTitle(row), 'unavailable', 'title')];
-  const rows = [field(rowTitle(row), [state, duration].filter(Boolean).join(' '), 'title')];
-  // A gate job says what it does and what it changes (#109).
-  if (row.about) rows.push(field('', row.about, 'caption'), field('Changes', row.changes));
-  if (row.group) return [field(row.name, ramAmount(row.used * GIB), 'title'), field('Started by', 'not the queue'),
-    ...groupRows(memoryRows((row.parts || []).map(part => [[part.who, recorded(part.pid) ? part.pid : '',
-      part.started_at > 0 ? ago(part.started_at, data.read_at) : ''].filter(Boolean).join(' · '), part.gib * GIB])))];
-  rows.push(...ownerFields(row));
-  if (row.priority_entries?.length) rows.push(field('Priority', row.priority_entries.map(entry => entry.unit).join(', ')));
+  const verify = row.verify;
+  const stepFields = verify ? [field('Step', verify.total > 1
+    ? `${verify.step} (${verify.position} of ${verify.total})` : verify.step)] : [];
+  const call = verify?.call || row.call;
+  const callFields = call ? [field('Call', call, 'call', true)] : [];
+  const unavailable = row.kind === 'mac-unavailable' || (!waiting && row.used && !recorded(row.used))
+    || (waiting && row.kind !== 'cloud' && row.head_room?.unavailable);
+  const title = row.group ? field(row.name, ramAmount(row.used * GIB), 'title')
+    : stepTitle(row, unavailable ? 'unavailable' : [state, duration].filter(Boolean).join(' '));
+  const rows = [title];
+  if (row.about) rows.push({...field('', row.about, 'caption'), valueParts:row.about_parts});
+  if (row.changes) rows.push(field('Changes', row.changes));
+  if (unavailable) return [...rows, ...stepFields, ...callFields];
+  if (row.group) return [...rows, field('Started by', 'not the queue'),
+    ...groupRows((row.parts || []).map(part => {
+      const suffix = [recorded(part.pid) ? part.pid : '', part.started_at > 0 ? ago(part.started_at, data.read_at) : '']
+        .filter(Boolean).join(' · ');
+      const parts = [...(part.who_parts || [{kind:'text',text:part.who}]), ...(suffix ? [{kind:'text',text:' · '+suffix}] : [])];
+      return {...field(partsText(parts), ramAmount(part.gib * GIB)), labelParts:parts};
+    }))];
+  rows.push(...ownerFields(row), ...stepFields);
+  if (row.priority_entries?.length) rows.push(staffField('Priority', row.priority_entries.map(entry => entry.unit)));
   if (waiting) {
     if (row.place) rows.push(field('Place in line', row.place));
-    rows.push(field('Waits for', row.kind === 'cloud' ? 'AWS slot' :
-      row.kind === 'repository-slot' ? 'build slot' : row.why || 'its turn'), ...routeFields(row));
-    if (!['cloud', 'repository-slot'].includes(row.kind)) {
-      if (row.head_room?.unavailable) return [field(rowTitle(row), 'unavailable', 'title')];
+    rows.push(field('Waits for', row.kind === 'cloud' ? 'AWS slot' : row.why || 'its turn'), ...routeFields(row));
+    if (row.why === 'build space') rows.push(field('Reason', row.reason));
+    if (row.kind !== 'cloud') {
       let free = row.free ?? queueCapMemory(data).free / GIB;
       if (row.head_room?.rows?.length) {
         const terms = row.head_room.rows, result = terms.at(-1);
@@ -842,6 +902,7 @@ function stepTooltip(key, data) {
     }
     rows.push(...progressRows(row));
   }
+  rows.push(...callFields);
   return rows.filter(row => row.kind === 'title' || row.kind === 'long' || row.value || row.label === 'Because');
 }
 function stepRow(key, data) {
@@ -861,7 +922,7 @@ function tooltipRows(key, data) {
   if (kind === 'swap-pool') return poolTip(index, data);
   const rows = TIPS[key](data);
   if (key === 'walkhead' && data.unmatched_priority_entries?.length)
-    rows.push(field('Priority', data.unmatched_priority_entries.map(entry => entry.unit).join(', ')));
+    rows.push(staffField('Priority', data.unmatched_priority_entries.map(entry => entry.unit)));
   return rows;
 }
 function tooltipHtml(key, data) {
@@ -871,8 +932,11 @@ function tipRowsHtml(rows) {
   return '<dl class="tip">'+rows.map(row => {
     const classes=[row.kind === 'field' ? '' : row.kind, row.group ? 'group' : ''].filter(Boolean).join(' ');
     const attr=classes ? ` class="${classes}"` : '';
-    return ['caption','long'].includes(row.kind) ? `<dd${attr}>${esc(row.value)}</dd>`
-      : `<dt${attr}>${esc(row.label)}</dt><dd${attr}>${esc(row.value)}</dd>`;
+    const value = row.kind === 'call' ? `<div>${esc(row.value).replace(/\S+/g, '<span>$&</span>')}</div>`
+      : row.valueParts ? nameParts(row.valueParts) : row.valueStaffNames ? row.valueStaffNames.map(staffName).join(', ') : esc(row.value);
+    const cell = `<dd${attr}>${value}</dd>`;
+    return ['caption','long'].includes(row.kind) ? cell
+      : `<dt${attr}>${row.labelParts ? nameParts(row.labelParts) : row.labelStaffName ? staffName(row.labelStaffName) + esc(row.labelSuffix) : esc(row.label)}</dt>` + cell;
   }).join('')+'</dl>';
 }
 function tipText(key, data) {
@@ -882,20 +946,21 @@ function tipText(key, data) {
 }
 function sentence(text) { return text ? text[0].toUpperCase() + text.slice(1) : ""; }
 function targetOwner(row) {
-  return [["Unit", row.unit], ["Showrunner", row.showrunner]]
-    .filter(([, name]) => name && name !== "—").map(([label, name]) => `${label} ${publicText(name)}`).join(" · ");
+  const roles = [["Unit", ownerText(row.unit)], ["Showrunner", ownerText(row.showrunner)]].filter(([, name]) => name);
+  if (roles.length) return roles.map(([label, name]) => label + ' ' + staffName(name)).join(' · ');
+  const holder = ownerText(row.holder);
+  return holder ? 'Holder ' + staffName(holder) : '';
 }
 function renderTargets(rows) {
   const box = $("targets");
   box.hidden = !rows.length;
   box.innerHTML = !rows.length ? "" : `<div class="section-head">Target availability</div>` + rows.map(row => {
-    const owner = row.state === "Unavailable" ? "" :
-      targetOwner(row) || (row.holder ? `Holder ${publicText(row.holder)}` : "Owner not recorded");
+    const owner = row.state === "Unavailable" ? "" : targetOwner(row);
     return `<div class="target-row"><div class="target-head"><span class="machine" data-machine="${esc(row.target)}">${esc(row.target)}</span>` +
       `<span class="target-state ${esc(row.state.toLowerCase())}">${esc(row.state)}</span></div>` +
       `<div class="target-until">${esc(sentence(row.until))}</div>` +
       `<div class="target-reason">${esc(row.reason || "No reason recorded")}</div>` +
-      `<div class="target-owner">${esc(owner)}</div><div class="target-since">${esc(sentence(row.since))}</div></div>`;
+      `<div class="target-owner">${owner}</div><div class="target-since">${esc(sentence(row.since))}</div></div>`;
   }).join("");
 }
 function recorded(value) { return typeof value === "number"; }
@@ -915,12 +980,31 @@ function visibleDetail(row) {
   return publicText(row.detail || "");
 }
 function publicText(text) {
-  return memoryText(text.split(" · ").filter(part => part.trim() && part.trim() !== "—" && !/\.(slice|service)\b/.test(part)).join(" · "));
+  return memoryText(text.split(" · ").filter(part => part.trim() && part.trim() !== "—"
+    && part.trim() !== "owner not recorded" && !/\.(slice|service)\b/.test(part)).join(" · "));
+}
+function publicParts(parts) {
+  const shown = [];
+  let start = 0;
+  for (const segment of partsText(parts).split(' · ')) {
+    if (publicText(segment)) {
+      if (shown.length) shown.push({kind:'text', text:' · '});
+      let offset = 0;
+      for (const part of parts) {
+        const from = Math.max(0, start - offset), to = Math.min(part.text.length, start + segment.length - offset);
+        if (to > from) shown.push({...part, text:memoryText(part.text.slice(from, to))});
+        offset += part.text.length;
+      }
+    }
+    start += segment.length + 3;
+  }
+  return shown;
 }
 function rowUnit(row) {
-  return ciRow(row) ? "CI" : /\.(slice|service)\b/.test(row.unit || "") ? row.name : row.unit || "";
+  return ciRow(row) ? "CI" : row.unit;
 }
 function rowOwner(row, waiting = false) {
+  if (row.caller) return row.caller;
   if (ciRow(row)) return (row.ci_label || "").split(" · ")[0];
   if (macRow(row)) return publicText(row.showrunner || "");
   if (row.kind !== "cloud" && !waiting && (!row.queued || row.between_steps)) {
@@ -929,9 +1013,10 @@ function rowOwner(row, waiting = false) {
   const owner = publicText(row.showrunner || "");
   return owner;
 }
-function rowLabel(name, owner = "") {
+function rowLabel(name, owner = "", note = "") {
   return `<span class="row-label"><span class="row-heading"><span class="name">${esc(name)}</span></span>` +
-    `<span class="owner">${esc(owner)}</span></span>`;
+    `<span class="owner">${roleName(owner)}</span>` +
+    (note ? `<span class="wait-note">${esc(note)}</span>` : "") + '</span>';
 }
 function rowMemory(tip, bars = "") {
   return `<div class="row-memory" data-tip="${tip}"><div class="track" data-tip="${tip}">${bars}</div>` +
@@ -1043,6 +1128,7 @@ function restoreReportView(view) {
   }
 }
 function render(d) {
+  if (d.staff_names) globalThis.staffNames?.set(d.staff_names);
   if (d.error || !d.ok) {
     throw new Error("The queue did not answer.");
   }
@@ -1163,9 +1249,11 @@ function renderSwap(d) {
   $("gf-swap").style.width = `${Math.min(100, swap).toFixed(2)}%`;
   $("gv-swap").textContent = formatPercent(swap);
   placeLimitLabels();
+  const titleHtml = row => row.title_kind === "staff" ? staffName(row.name) : esc(row.name);
+  const detailHtml = row => row.detail_parts ? nameParts(publicParts(row.detail_parts)) : esc(visibleDetail(row));
   const rowHtml = ({row, index}) => `<div class="row ${row.kind}" data-tip="swap:${index}" data-pool="${row.pool}" data-bytes="${row.bytes}"><span class="name">${row.kind === "smaller"
-    ? `<details data-owner-key="smaller:${esc(row.pool)}"><summary><span class="chev">▶</span>${esc(row.name)}</summary><div class="swap-members">${row.members.map(member => `<div>${esc(member.name)}: ${swapAmount(member.bytes)}</div>`).join("")}</div></details>`
-    : esc(row.name)}</span><span class="v">${row.kind === "difference" ? signedSwap(row.bytes) : swapAmount(row.bytes)}</span><small>${row.kind === "owner" && visibleDetail(row) !== row.name ? esc(visibleDetail(row)) : ""}</small></div>`;
+    ? `<details data-owner-key="smaller:${esc(row.pool)}"><summary><span class="chev">▶</span>${esc(row.name)}</summary><div class="swap-members">${row.members.map(member => `<div>${titleHtml(member)}: ${swapAmount(member.bytes)}</div>`).join("")}</div></details>`
+    : titleHtml(row)}</span><span class="v">${row.kind === "difference" ? signedSwap(row.bytes) : swapAmount(row.bytes)}</span><small>${row.kind === "owner" && visibleDetail(row) !== row.name ? detailHtml(row) : ""}</small></div>`;
   const indexed = d.swap_by.map((row, index) => ({row, index}));
   const pools = [["outside", "Outside builds and CI", d.swap.outside_bytes], ["builds_ci", "Builds and CI", d.swap.builds_ci_bytes]];
   $("swaprows").innerHTML = pools.map(([pool, name, bytes]) => {
@@ -1187,7 +1275,7 @@ document.addEventListener("click", (e) => {
 
 function renderLeftovers(d) {
   const rows = (d.leftovers || []).flatMap(scope => scope.members.map((member, index) =>
-    `<div class="leftover-row"><span class="detail">${esc(scope.owner)} · ${esc(member.program)}${typeof member.pid === "number" ? ` · pid ${member.pid}` : ""}</span><span class="age">${index === 0 ? esc(scope.age) : ""}</span><span class="num">${index === 0 ? memoryAmount(scope.used) : ""}</span></div>`));
+    `<div class="leftover-row"><span class="detail">${roleName(scope.owner)} · ${esc(member.program)}${typeof member.pid === "number" ? ` · pid ${member.pid}` : ""}</span><span class="age">${index === 0 ? esc(scope.age) : ""}</span><span class="num">${index === 0 ? memoryAmount(scope.used) : ""}</span></div>`));
   $("leftovers").hidden = rows.length === 0;
   $("leftover-rows").innerHTML = rows.join("");
 }
@@ -1263,11 +1351,11 @@ function renderWalk(d) {
   const pct = (v) => `${v / scale * 100}%`;
   const tableRows = [];
   const columns = (place, duration, running = false) => `<th scope="col" class="place">${place}</th><th scope="col" class="done">Done</th><th scope="col" class="step">Step</th><th scope="col" class="duration">${duration}</th>` +
-    `<th scope="col" class="unit">Unit</th><th scope="col" class="pid">Pid</th><th scope="col" class="machine">${STEP_TABLE_HEADERS.target}</th><th scope="col" class="vcpus">vCPU</th>` +
+    `<th scope="col" class="verify">Verify</th><th scope="col" class="unit">Unit</th><th scope="col" class="pid">Pid</th><th scope="col" class="machine">${STEP_TABLE_HEADERS.target}</th><th scope="col" class="vcpus">vCPU</th>` +
     (running ? '<th scope="col" class="slot">Slot</th><th scope="col" class="tokens">Tokens</th>' : "");
-  const cells = (place, name, duration, unit, pid, machine, vcpus, tip, className = "", done = "—", slot = "—", tokens = "—") => {
+  const cells = (place, name, duration, unit, pid, machine, vcpus, tip, verify = "", className = "", done = "—", slot = "—", tokens = "—") => {
     tableRows.push(`<tr class="${className}" data-tip="${tip}" tabindex="0"><td class="place">${esc(place)}</td><td class="done">${esc(done)}</td><th scope="row" class="step"><span class="cell-text">${esc(name)}</span></th>` +
-      `<td class="duration">${esc(duration || "—")}</td><td class="unit"><span class="cell-text">${esc(unit === "—" ? unit : publicText(unit || ""))}</span></td><td class="pid">${typeof pid === "number" ? pid : "—"}</td>` +
+      `<td class="duration">${esc(duration || "—")}</td><td class="verify">${esc(verify)}</td><td class="unit"><span class="cell-text">${roleName(unit === "—" ? unit : publicText(unit || ""))}</span></td><td class="pid">${typeof pid === "number" ? pid : "—"}</td>` +
       (Array.isArray(machine)
         // A waiting step lists the machines that can take it, each in its machine color.
         ? `<td class="machine" data-machine="${esc(machine.join(" or "))}"><span class="wait-target">${machine.map(target => `<span class="machine" data-machine="${esc(target)}">${esc(target)}</span>`).join(" or ") || "—"}</span></td>`
@@ -1276,36 +1364,41 @@ function renderWalk(d) {
         `<td class="tokens">${Number.isInteger(tokens) ? tokens : "—"}</td>`) + '</tr>');
   };
   const ordered = [...d.walk.filter(row => row.kind === "cloud" || macRow(row) || row.queued && !row.ci), ...d.walk.filter(row => row.ci && row.admitted)];
+  const runningCount = ordered.filter(row => row.kind !== "mac-unavailable").length;
+  $("walk-title").textContent = `Running, in start order (${runningCount})`;
   const rows = [];
   if (d.ram.build_tools_bytes > 0) {
-    cells("", "Build tools", "", "", null, "", null, "tools", "tools");
+    cells("", "Build tools", "", "", null, "", null, "tools", "", "tools");
     rows.push(`<div class="wrow tools" data-tip="tools">${rowLabel("Build tools")}` + rowMemory("tools") + `</div>`);
   }
   rows.push(...ordered.map(r => {
     const idleCI = r.ci && visibleDetail(r) === "idle";
     cells(stageText(r),
-      r.name, idleCI ? "" : r.started_at ? ago(r.started_at, d.read_at) : r.state || "", idleCI ? "" : rowUnit(r), r.pid, r.machine, r.vcpus, `row:${r.key}`, "", doneText(r), r.slot, r.tokens);
+      r.name, idleCI ? "" : r.started_at ? ago(r.started_at, d.read_at) : r.state || "", idleCI ? "" : rowUnit(r), r.pid, r.machine, r.vcpus, `row:${r.key}`, r.verify?.verb, "", doneText(r), r.slot, r.tokens);
     return `<div class="wrow${r.kind === "cloud" ? " cloud-work" : ""}" data-tip="row:${r.key}" data-run="${r.key}">${rowLabel(r.name, rowOwner(r))}` +
       (r.kind === "cloud" ? cloudStatus(r, `row:${r.key}`) : rowMemory(`row:${r.key}`)) + `</div>`;
   }));
   // The table row only holds the place of the chart room row beside it; its value shows in the chart.
-  const columnClasses = ["place", "done", "step", "duration", "unit", "pid", "machine", "vcpus", "slot", "tokens"];
+  const columnClasses = ["place", "done", "step", "duration", "verify", "unit", "pid", "machine", "vcpus", "slot", "tokens"];
   tableRows.push(`<tr class="room" data-tip="room">${columnClasses.map(column => `<td class="${column}"></td>`).join("")}</tr>`);
   rows.push(`<div class="wrow room">${rowLabel("Free")}` + rowMemory("room") + `</div>`);
-  if (d.waiters.length) {
-    const units = d.queued_priority_units || [];
-    const title = !units.length ? "Queued, in order of submission"
-      : units.length === 1 ? `Queued, ${units[0]} first, then in submission order`
-      : `Queued, ${units.join(" followed by ")} and then in submission order`;
-    tableRows.push(`<tr class="queue-head">${columns("#", STEP_TABLE_HEADERS.waiting)}</tr>`);
-    rows.push(`<div class="walk-chart-head queue-head"><span class="queue-title section-head" title="${esc(title)}">${esc(title)}</span></div>`);
-  }
+  const waitingCount = d.waiters.length;
+  if (waitingCount) tableRows.push(`<tr class="queue-head">${columns("#", STEP_TABLE_HEADERS.waiting)}</tr>`);
+  const units = waitingCount ? d.queued_priority_units || [] : [];
+  const title = !units.length ? "Queued, in order of submission"
+    : units.length === 1 ? `Queued, ${units[0]} first, then in submission order`
+    : `Queued, ${units.join(" followed by ")} and then in submission order`;
+  const titleHtml = !units.length ? esc(title) : units.length === 1 ? `Queued, ${roleName(units[0])} first, then in submission order`
+    : `Queued, ${units.map(unit=>roleName(unit)).join(' followed by ')} and then in submission order`;
+  rows.push(`<div class="walk-chart-head queue-head"><span class="queue-title section-head" title="${esc(title)}"><span>${titleHtml}</span><span> (${waitingCount})</span></span></div>`);
   let localPosition = 0;
   d.waiters.forEach((w, i) => {
     const place = w.kind === "cloud" ? "cloud" : String(++localPosition);
-    cells(place, w.name, ago(w.since, d.read_at), ciRow(w) ? rowUnit(w) : w.detail, w.pid, w.machine ? [w.machine] : w.targets || [], null, `wait:${w.key}`, `wait${i === 0 ? " wait-first" : ""}`);
-    rows.push(`<div class="wrow wait${i === 0 ? " wait-first" : ""}${w.kind === "cloud" ? " cloud-work" : ""}" data-tip="wait:${w.key}">${rowLabel(w.name, rowOwner(w, true))}` +
-      (w.kind === "cloud" ? cloudStatus(w, `wait:${w.key}`) : rowMemory(`wait:${w.key}`)) +
+    const tip = `wait:${w.key}`;
+    cells(place, w.name, ago(w.since, d.read_at), rowUnit(w), w.pid, w.machine ? [w.machine] : w.targets || [], null, tip, w.verify?.verb, `wait${i === 0 ? " wait-first" : ""}`);
+    const note = ["build space", "the build in the same Cargo folder"].includes(w.why) ? w.reason : "";
+    rows.push(`<div class="wrow wait${i === 0 ? " wait-first" : ""}${w.kind === "cloud" ? " cloud-work" : ""}" data-tip="${tip}">${rowLabel(w.name, rowOwner(w, true), note)}` +
+      (w.kind === "cloud" ? cloudStatus(w, tip) : rowMemory(tip)) +
       `</div>`);
   });
   if (hasCap(d)) rows.push(`<div class="walk-bud" style="left:calc(var(--amt) + var(--gap) + (100% - var(--amt) - var(--gap)) * ${capEnd(d)})"></div>`);
@@ -1497,7 +1590,7 @@ function placeMemoryBars(d) {
   const box = (left, size, className, tip = "") => size > 0
     ? `<div class="b ${className}" ${tip ? `data-tip="${tip}"` : ""} style="left:${left}px;width:${size}px"></div>` : "";
   // A local bar stops at the cap line; a bar that the cap cuts shows a cap-colored end.
-  const chartEdge = !hasCap(d) ? width : progressEnd;
+  const chartEdge = hasCap(d) ? width * capEnd(d) : width;
   const capBox = (left, size, className) => {
     const drawn = Math.min(size, chartEdge - left);
     return box(left, drawn, drawn < size ? `${className} over-cap` : className);
@@ -1676,7 +1769,7 @@ addEventListener("keydown", event => {
 });
 async function tick(supersede=false,current=()=>true) {
   if (consoleHidden() || paused) return;
-  const r = await fetch(`memory.json?t=${Date.now()}`, { cache: "no-store" });
+  const r = await fetch("memory.json", { cache: "no-cache" });
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
   const d = await r.json();
   if (!current() || paused) return;

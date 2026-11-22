@@ -62,6 +62,7 @@ PROJECTS_DIR = Path(os.environ.get("STALL_WATCH_PROJECTS_DIR") or Path.home() / 
 SESSIONS = Path(os.environ.get("STALL_WATCH_SESSIONS") or Path(__file__).resolve().parent.parent / "message/sessions.py")
 SEND = Path(os.environ.get("STALL_WATCH_SEND") or session_send.SEND_SCRIPT)
 PS = os.environ.get("STALL_WATCH_PS") or "ps"
+WATCH_DEFAULTS = Path(__file__).resolve().parents[2] / "config/stall_watch.conf"
 WAITING_KINDS = ("done", "blocked", "gate", "decision")
 COMPACTION_WAKE_KIND = "blocked"
 HOLDING_KIND = "holding"
@@ -136,6 +137,7 @@ class PaneInspection(NamedTuple):
     peers: tuple[str, ...]
     name: str
     unit: unit_lookup.LabeledSession
+    claude: unit_lookup.LiveClaude | unit_lookup.ClaudeNotRunning
     row: staff.StaffRow
 
 
@@ -330,7 +332,8 @@ def process_session(pid: int) -> str:
             environment = Path(f"/proc/{pid}/environ").read_bytes().split(b"\0")
         except OSError:
             return ""
-        values = dict(item.decode(errors="replace").split("=", 1) for item in environment if b"=" in item)
+        values = dict(item.decode(errors="replace").split("=", 1) for item in environment
+                      if item.startswith((b"CODEX_THREAD_ID=", b"CLAUDE_CODE_SESSION_ID=")))
     return values.get("CODEX_THREAD_ID", "") or values.get("CLAUDE_CODE_SESSION_ID", "")
 
 
@@ -645,7 +648,7 @@ def prompt_alert_seconds() -> float:
 
 def watch_config(*, status_defaults: bool = False, packaged_only: bool = False) -> dict[str, str]:
     """Read person-edited settings at use, without an import-time cache."""
-    defaults = Path(__file__).resolve().parents[2] / "config/stall_watch.conf"
+    defaults = WATCH_DEFAULTS
     path = defaults if packaged_only else Path(os.environ.get("STALL_WATCH_CONFIG") or defaults)
     paths = (defaults, path) if status_defaults and path != defaults else (path,)
     fields: dict[str, str] = {}
@@ -1361,8 +1364,20 @@ def watch_pass(now: float, *, deadline: float, read_panes: Callable[[str], list[
                 continue
             try:
                 production_name = configured["name"]
-                marked = sessions.status_units(production_name)
-                for name, unit in marked.items():
+                for name in sessions.status_units(production_name):
+                    match sessions.checked_unit(production_name, name):
+                        case unit_lookup.UnknownUnit(reason=reason):
+                            print(f"stall-watch: {name}: {reason}", file=sys.stderr)
+                            continue
+                        case unit_lookup.ProvedLiveUnit(owner=unit_lookup.LabeledSession(
+                                claude=unit_lookup.LiveClaude() as claude) as unit):
+                            pass
+                        case unit_lookup.ProvedAbsentUnit(pane=unit_lookup.LabeledSession(
+                                claude=unit_lookup.ClaudeNotRunning() as claude,
+                                empty=herdr.ObservedEmpty()) as unit):
+                            pass
+                        case _:
+                            continue
                     if isinstance(unit.identity, session_staff.NoSession):
                         raise staff.StaffUnreadable(f"{name}: native runtime identity is unavailable")
                     row = unit_lookup.unit_row(name, record, reference=unit.identity)
@@ -1374,7 +1389,7 @@ def watch_pass(now: float, *, deadline: float, read_panes: Callable[[str], list[
                     peers = (*showrunner_names,
                              *(sibling_name for sibling_id, sibling_name in sibling_names_by_parent[row.parent].items()
                                if sibling_id != row.id), configured["session"], production_name)
-                    work.append(PaneInspection(production_name, configured, zone, peers, name, unit, row))
+                    work.append(PaneInspection(production_name, configured, zone, peers, name, unit, claude, row))
             except (OSError, UnicodeError, ValueError) as error:
                 print(f"stall-watch: {configured['name']}: its units are not watched: {error}", file=sys.stderr)
                 continue
@@ -1383,7 +1398,7 @@ def watch_pass(now: float, *, deadline: float, read_panes: Callable[[str], list[
     busy_pane_workers: PaneWorkersUnread | BusyPaneWorkerParents = PaneWorkersUnread()
     inspection_started = False
     labels_by_session: dict[str, dict[str, str]] = {}
-    for production_name, configured, zone, peers, name, unit, row in inspection_order(work):
+    for production_name, configured, zone, peers, name, unit, claude, row in inspection_order(work):
         if isinstance(rows, ProcessSnapshotFailure):
             continue
         showrunner_socket = configured["socket"]
@@ -1403,12 +1418,8 @@ def watch_pass(now: float, *, deadline: float, read_panes: Callable[[str], list[
             if (retire := forget(watch)) is not None:
                 pending.append(retire)
             continue
-        claude = unit.claude
         if not isinstance(claude, unit_lookup.LiveClaude):
-            if isinstance(claude, unit_lookup.ClaudeUnknown):
-                print(f"stall-watch: {name}: {claude.reason}", file=sys.stderr)
-            # A prompt is not on screen without its Claude.
-            elif (retire := end_prompt(watch)) is not None:
+            if (retire := end_prompt(watch)) is not None:
                 pending.append(retire)
             continue
         observed_at = time.time()
@@ -1549,12 +1560,12 @@ def watch_pass(now: float, *, deadline: float, read_panes: Callable[[str], list[
                 stretch["reported_status"] = last
                 save_stretch(path, stretch)
             report.decision = "holding" if holding else "idle already bumped"
-            if not holding and not stretch["bump_sent"]:
+            if not holding and socket and not stretch["bump_sent"]:
                 report.decision = "idle bump requested"
                 text = (f"stall-watch: you have been idle since {since_text} with nothing running. "
                         "Continue your run; if you are waiting on someone, say on whom in one line.")
                 pending.append(delivery(path, "bump", socket, f"{key}:bump", text))
-            if not holding and not stretch["tell_sent"] and showrunner_socket:
+            if not holding and socket and not stretch["tell_sent"] and showrunner_socket:
                 text = f"{name} idle since {since_text}, nothing running; bumped. Last status: {last}"
                 pending.append(delivery(path, "tell", showrunner_socket, f"{key}:tell", text))
     send_all(pending, now, deadline=deadline, limits=sender.limits)

@@ -8,14 +8,16 @@ import io
 import sqlite3
 import shutil
 import os
+import socket
 import sys
 import tempfile
+import unittest
 from dataclasses import replace
 from contextlib import closing, redirect_stderr
 from collections.abc import Callable, Sequence
 from functools import cached_property
 from pathlib import Path
-from typing import ClassVar, cast, override
+from typing import ClassVar, NoReturn, cast, override
 from unittest import mock
 
 
@@ -26,17 +28,44 @@ from scripts.style import crate_run as crates
 from scripts.style import coverage_report
 from scripts.style import rules
 from scripts.style import style_ledger as ledger_api
+from scripts.style import style_sync as owner_resolver
 from scripts.style.approved_renames import BindingRename
 from scripts.style.ledger_test_support import machine_rename_fixture
 from scripts.style.test_bulk_rename import ScriptedServer, word_edits, CargoProjectTests
 from scripts.style.style_child_test_support import StyleQueueFake, install_refusal_tools, unqueued_style_children
-from scripts.build_queue import queue_place
+from scripts.build_queue import admission_protocol as wire, queue_place
+from scripts.build_queue import first_step
+from scripts.buildlog.store import host_name
 from scripts.copies import copies
-from scripts.copies.copies_test_support import copies_environment
+from scripts.copies.copies_test_support import AdmissionWaitReached
+from scripts.copies.workspace_test_support import registered_workspace
 from scripts.lib import build_folders, copy_record, scratch
+from scripts.worktree import worktrees
+from scripts.lib.cargo_output import CargoOutputRoots
+from scripts.lib.cargo_output_test_support import fake_cargo_output_roots
+from scripts.lib.git_test_support import write_fixture_git_config
+from scripts.production import staff
 from scripts.production.staff_test_support import fixture_member, isolated_staff_file
 
 from scripts.style.style_reader_test_support import oracle_reader
+
+
+class StyleQueueIsolationTests(unittest.TestCase):
+    def test_the_style_fixture_replaces_an_inherited_admission_socket(self) -> None:
+        directory = Path(tempfile.mkdtemp(prefix="style-socket-"))
+        self.addCleanup(shutil.rmtree, directory)
+        with socket.socket(socket.AF_UNIX) as outside:
+            inherited = directory / "outside.sock"
+            outside.bind(str(inherited))
+            outside.listen(1)
+            with mock.patch.dict(os.environ, {"ADMISSION_SOCKET": str(inherited)}):
+                with unqueued_style_children():
+                    private = wire.admission_socket_path()
+                    self.assertNotEqual(private, inherited)
+                    self.assertTrue(private.parent.is_dir())
+                    with socket.socket(socket.AF_UNIX) as connection, self.assertRaises(FileNotFoundError):
+                        connection.connect(str(private))
+                self.assertEqual(wire.admission_socket_path(), inherited)
 
 
 class Commands:
@@ -98,10 +127,75 @@ def available(_repo: Path, _path: str) -> None:
     pass
 
 
+def _configuration(root: Path) -> dict[str, str]:
+    config = root / "config"
+    config.mkdir()
+    machine = host_name()
+    _ = (config / "build_folders.conf").write_text("\n".join((
+        "# whole: 1..64",
+        "names.repository_key_length=8",
+        f"roots.build={root / 'build'}",
+        f"roots.build.{machine}={root / 'build'}",
+        f"roots.workspace={root / 'worktrees'}",
+        f"roots.session={root / 'session'}",
+        f"roots.slots={root / 'slots'}",
+        f"roots.slot_cargo={root / 'cargo'}",
+        "# whole: 1..",
+        f"slots.{machine}.default_max=2",
+        "# range: 0.001..",
+        "slots.wait_seconds=30",
+        "patterns.editable={repository}-{owner}/{purpose}",
+        "patterns.tool={purpose}{suffix}",
+        "# range: 0.001..60",
+        "locks.probe_wait_seconds=0.25",
+        "# range: 0.001..1",
+        "locks.probe_retry_seconds=0.005",
+        "",
+    )))
+    _ = (config / "copies.conf").write_text("\n".join((
+        f"remote_registry={root / 'remote-mirrors'}",
+        "# range: 0.001..",
+        "git_timeout_seconds=10",
+        "# range: 0.001..",
+        "guard_timeout_seconds=10",
+        "owner.style=style",
+        "owner.verify=verify",
+        "",
+    )))
+    _ = (config / "scratch.conf").write_text(
+        f"visible_root={root / 'visible'}\n"
+        + f"holds_file={root / 'holds.json'}\n"
+        + "# whole: 1..\ndefault_life_seconds=86400\n# whole: 1..\nrepo_depth=3\n"
+        + "repo_skip=target node_modules .git\n# whole: 1..\nrecord_lock_attempts=3\n"
+    )
+    _ = (config / "build_steps.conf").write_text("names.style=style\nnames.test=test\n")
+    temporary = root / "temporary"
+    temporary.mkdir()
+    return {
+        "HOME": str(root / "gate-home"),
+        "WORKTREES_STATE_DIR": str(root / "worktree-state"),
+        "TMPDIR": str(temporary),
+        "CONF_DIR": str(config),
+        "COPIES_CONFIG": str(config / "copies.conf"),
+        "SCRATCH_ROOT": str(root / "scratch"),
+        "SCRATCH_COPIES_ROOT": str(root / "copies"),
+        "SCRATCH_HOLDS": str(root / "holds.json"),
+        "SESSION_TEMP_ROOT": str(root / "session"),
+        "SESSION_FORMER_ROOT": str(root / "former-session"),
+        "CODEX_THREAD_ID": "",
+        "CLAUDE_CODE_SESSION_ID": "",
+        "CLAUDE_SESSION_FOLDER": "",
+        "GIT_CONFIG_GLOBAL": str(write_fixture_git_config(root)),
+        "GIT_CONFIG_NOSYSTEM": "1",
+    }
+
+
 class CrateRunTests(CargoProjectTests):
     fixture_root: ClassVar[Path]
     fixture_seed: ClassVar[Path]
     fixture_environment: ClassVar[dict[str, str]]
+    fixture_base: ClassVar[str]
+    fixture_tree: ClassVar[str]
     frozen_seed: ClassVar[Path]
     single_file_frozen_seed: ClassVar[Path]
     single_file_frozen_tests: ClassVar[frozenset[str]] = frozenset({
@@ -121,7 +215,6 @@ class CrateRunTests(CargoProjectTests):
     })
     frozen_tests: ClassVar[frozenset[str]] = frozenset({
         "test_worker_names_separate_run_and_package_at_the_last_dot",
-        "test_crate_trees_keep_ownership_and_use_two_standing_caches",
         "test_one_crate_has_canonical_branch_before_assignment_and_preserves_checkpoint_ancestry",
         "test_two_crates_integrate_serially_without_reselecting",
         "test_empty_selection_names_holding_tickets_and_finding_count_per_crate",
@@ -159,8 +252,12 @@ class CrateRunTests(CargoProjectTests):
     @classmethod
     @override
     def setUpClass(cls) -> None:
+        clean_environment = {name: value for name, value in os.environ.items()
+                             if not name.startswith("GIT_") and name not in ("BASH_ENV", "STAFF_CONFIG")}
+        _ = cast(object, cls.enterClassContext(mock.patch.dict(os.environ, clean_environment, clear=True)))
         # Build the complete class seed without the base class seed.
-        seeds = Path(cls.enterClassContext(tempfile.TemporaryDirectory(prefix="crate-run-seed-")))
+        seeds = Path(tempfile.mkdtemp(prefix="crate-run-seed-")).resolve()
+        cls.addClassCleanup(shutil.rmtree, seeds)
         cls.fixture_seed = seeds / "initial"
         cls.frozen_seed = seeds / "frozen"
         cls.single_file_frozen_seed = seeds / "single-file-frozen"
@@ -169,6 +266,8 @@ class CrateRunTests(CargoProjectTests):
         try:
             fixture.prepare_fixture()
             cls.fixture_root = fixture.root
+            cls.fixture_base = fixture.base
+            cls.fixture_tree = fixture.tree
             cls.fixture_environment = {key: value for key, value in os.environ.items()
                                        if environment.get(key) != value}
             fixture.authority.close()
@@ -189,6 +288,7 @@ class CrateRunTests(CargoProjectTests):
 
     @override
     def set_up_project(self) -> None:
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, _configuration(self.root))))
         self.create_project()
 
     @override
@@ -206,26 +306,25 @@ class CrateRunTests(CargoProjectTests):
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, self.fixture_environment)))
         _ = self.enterContext(oracle_reader())
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
+        _ = self.enterContext(fake_cargo_output_roots())
         self.queue: StyleQueueFake = self.enterContext(unqueued_style_children())
         # Each test has fixed copies settings and keeps its own settings dictionary.
         _ = self.enterContext(mock.patch.object(copies, "config_settings", return_value=copies.config_settings()))
-        _ = self.base
+        self.base, self.tree = self.fixture_base, self.fixture_tree
         _ = self.authority
 
     def prepare_fixture(self) -> None:
         """Build the complete initial state through the real fixture writers."""
         super().setUp()
+        origin = self.root / "remotes" / self.repo.name
+        _ = self.git("init", "--bare", str(origin))
+        _ = self.git("remote", "add", "origin", str(origin))
+        _ = self.git("push", "-u", "origin", "main")
         # Finish Git maintenance before the fixture removes its repositories.
         _ = self.git("config", "maintenance.autoDetach", "false")
         _ = self.git("config", "gc.autoDetach", "false")
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
         _ = fixture_member("showrunner", name="style-fixture")
-        self.enterContext(mock.patch.dict(os.environ, {
-            **copies_environment(self.root),
-            "HOME": str(self.root / "gate-home"),
-            "SCRATCH_COPIES_ROOT": str(self.root / "copies"),
-            "SCRATCH_HOLDS": str(self.root / "holds.json"),
-        }))
         _ = (self.repo / "Cargo.toml").write_text((self.repo / "Cargo.toml").read_text()
                                                  + '\n[workspace]\nmembers=[".", "beta"]\n')
         (self.repo / "beta/src").mkdir(parents=True)
@@ -287,6 +386,241 @@ class CrateRunTests(CargoProjectTests):
     def advance(self, package: str) -> crates.Manifest:
         return self.batch.advance(package, renamed, self.commands, available, fixture_execute)
 
+    def test_new_crate_worker_uses_the_managed_worktree_tool(self) -> None:
+        self.freeze(paths=("src/lib.rs",))
+        source = worktrees.FrozenWorktreeSource(self.repo, self.base)
+        with (mock.patch.object(worktrees, "make", wraps=worktrees.make) as make,
+              mock.patch.object(worktrees, "remove_git_checkout", wraps=worktrees.remove_git_checkout) as remove):
+            manifest = self.advance("bulk_sample")
+        record = manifest["crates"]["bulk_sample"]
+        repo, unit, short = self.batch.worktree_names("bulk_sample")
+        checkout = build_folders.worktree_path(repo, unit, short)
+        output = build_folders.output_path(repo, unit, short)
+        make.assert_called_once_with(repo, unit, short, source)
+        remove.assert_called_once_with(checkout, self.repo, before_report=mock.ANY)
+        self.assertEqual(record["stage"], crates.CrateStage.INTEGRATED)
+        self.assertEqual(Path(record["checkout"]), checkout)
+        self.assertEqual((checkout / "target").resolve(), output)
+
+    def test_crate_resume_uses_the_worktree_record_after_unit_rename(self) -> None:
+        parent = fixture_member("showrunner", name="style-fixture")
+        unit = fixture_member("unit", name="crate-owner", parent=parent.id)
+        with mock.patch.object(owner_resolver, "gate_owner", return_value=str(unit.id)):
+            self.freeze(paths=("src/lib.rs",))
+            with (mock.patch.object(self.batch, "import_result", side_effect=SystemExit("worker tested")),
+                  self.assertRaisesRegex(SystemExit, "worker tested")):
+                _ = self.advance("bulk_sample")
+            before = self.batch.read()["crates"]["bulk_sample"]
+            self.assertEqual(before["stage"], crates.CrateStage.TESTED)
+            checkout = Path(before["checkout"])
+            renamed_unit = staff.rename(unit.id, "renamed-owner")
+            moved = checkout.parent.with_name(renamed_unit.name) / checkout.name
+            transaction = worktrees.unit_folder_rename(checkout, moved)
+            assert transaction is not None
+            with transaction.hold_copy_allocations(), transaction.hold_outputs():
+                transaction.finish()
+            self.assertFalse(checkout.exists())
+            self.assertEqual(self.batch.read()["crates"]["bulk_sample"]["checkout"], str(checkout))
+            with mock.patch.object(worktrees, "make", side_effect=AssertionError("worker recreated")):
+                resumed = crates.CrateRun(self.authority, self.batch.run_id)
+                result = resumed.advance("bulk_sample", renamed, self.commands, available, fixture_execute)
+            self.assertEqual(result["crates"]["bulk_sample"]["stage"], crates.CrateStage.INTEGRATED)
+            self.assertEqual(result["crates"]["bulk_sample"]["checkout"], str(moved))
+            self.assertEqual(self.batch.read(), result)
+
+    def test_crate_resume_refreshes_the_worktree_owner_and_output(self) -> None:
+        self.freeze(paths=("src/lib.rs",))
+        with (mock.patch.object(self.batch, "import_result", side_effect=SystemExit("worker tested")),
+              self.assertRaisesRegex(SystemExit, "worker tested")):
+            _ = self.advance("bulk_sample")
+        checkout = Path(self.batch.read()["crates"]["bulk_sample"]["checkout"])
+        path = worktrees.record_file(checkout)
+        current = worktrees.read_record(path)
+        worktrees.write_record(replace(current, owner="old-owner", layout=worktrees.UnassignedOutput()))
+
+        result = self.advance("bulk_sample")
+
+        self.assertEqual(result["crates"]["bulk_sample"]["stage"], crates.CrateStage.INTEGRATED)
+        self.assertEqual(worktrees.read_record(path), current)
+
+    def test_crate_make_resumes_after_the_checkout_exists(self) -> None:
+        self.freeze(paths=("src/lib.rs",))
+        checkout = Path(self.batch.read()["crates"]["bulk_sample"]["checkout"])
+        write_record = worktrees.write_record
+
+        def interrupt_completion(record: worktrees.WorktreeRecord) -> None:
+            if record.stage is worktrees.MakeStage.DONE:
+                raise OSError("completion write failed")
+            write_record(record)
+
+        with (mock.patch.object(worktrees, "write_record", side_effect=interrupt_completion),
+              self.assertRaisesRegex(OSError, "completion write failed")):
+            _ = self.advance("bulk_sample")
+        record_path = worktrees.record_file(checkout)
+        pending = worktrees.read_record(record_path)
+        self.assertEqual(pending.stage, worktrees.MakeStage.MAKING)
+        inode = checkout.stat().st_ino
+        result = self.advance("bulk_sample")
+        self.assertEqual(result["crates"]["bulk_sample"]["stage"], crates.CrateStage.INTEGRATED)
+        self.assertEqual(worktrees.read_record(record_path), replace(pending, stage=worktrees.MakeStage.DONE))
+        self.assertEqual(checkout.stat().st_ino, inode)
+
+    def test_crate_advances_report_manual_removal_once(self) -> None:
+        self.freeze(paths=("src/lib.rs",))
+        checkout = self.batch.read()["crates"]["bulk_sample"]["checkout"]
+        notice = f"kept for a manual removal list: {checkout} "
+        first, second = io.StringIO(), io.StringIO()
+        report = worktrees.report_retained_folder
+
+        def report_after_save(path: Path, reason: str) -> None:
+            if reason == "the checkout is selected for removal":
+                self.assertTrue(self.batch.read()["crates"]["bulk_sample"].get("removal_reported"))
+            report(path, reason)
+
+        with (redirect_stderr(first),
+              mock.patch.object(worktrees, "report_retained_folder", side_effect=report_after_save)):
+            _ = self.advance("bulk_sample")
+        resumed = crates.CrateRun(self.authority, self.batch.run_id)
+        with redirect_stderr(second):
+            result = resumed.advance("bulk_sample", renamed, self.commands, available, fixture_execute)
+        self.assertEqual(first.getvalue().count(notice), 1)
+        self.assertNotIn(notice, second.getvalue())
+        self.assertTrue(result["crates"]["bulk_sample"].get("removal_reported"))
+        self.assertTrue(Path(checkout).is_dir())
+
+    def test_refused_removal_check_leaves_the_notice_pending(self) -> None:
+        self.freeze(paths=("src/lib.rs",))
+        checkout = self.batch.read()["crates"]["bulk_sample"]["checkout"]
+        notice = f"kept for a manual removal list: {checkout} "
+        refused, retried = io.StringIO(), io.StringIO()
+        checked_output = worktrees.checked_output
+
+        def refuse_terminal_output(layout: worktrees.RecordedWorktreeOutput) -> Path:
+            record = self.batch.read()["crates"]["bulk_sample"]
+            if record["stage"] == crates.CrateStage.INTEGRATED:
+                raise ValueError("invalid worktree output")
+            return checked_output(layout)
+
+        with (redirect_stderr(refused),
+              mock.patch.object(worktrees, "checked_output", side_effect=refuse_terminal_output)):
+            _ = self.advance("bulk_sample")
+
+        saved = self.batch.read()["crates"]["bulk_sample"]
+        self.assertEqual(saved["stage"], crates.CrateStage.INTEGRATED)
+        self.assertNotIn("removal_reported", saved)
+        self.assertIn(f"bulk_run: cannot report removal for {checkout!r}: invalid worktree output",
+                      refused.getvalue().splitlines())
+        self.assertNotIn("the checkout is selected for removal", refused.getvalue())
+        with redirect_stderr(retried):
+            _ = self.advance("bulk_sample")
+            _ = self.advance("bulk_sample")
+        self.assertTrue(self.batch.read()["crates"]["bulk_sample"].get("removal_reported"))
+        self.assertEqual(retried.getvalue().count(notice), 1)
+
+    def test_refused_removal_check_allows_the_next_crate_notice(self) -> None:
+        self.freeze()
+        records = self.batch.read()["crates"]
+        first, second = records
+        first_checkout = Path(records[first]["checkout"])
+        second_checkout = Path(records[second]["checkout"])
+        checked_output = worktrees.checked_output
+
+        def refuse_first_output(layout: worktrees.RecordedWorktreeOutput) -> Path:
+            record = self.batch.read()["crates"][first]
+            if layout.short_name == first_checkout.name and record["stage"] == crates.CrateStage.INTEGRATED:
+                raise worktrees.Refused(1, "invalid worktree output\ninvalid layout")
+            return checked_output(layout)
+
+        output = io.StringIO()
+        with (redirect_stderr(output),
+              mock.patch.object(worktrees, "checked_output", side_effect=refuse_first_output)):
+            _ = self.advance(first)
+            _ = self.advance(second)
+            result = self.advance(second)
+
+        saved = result["crates"]
+        self.assertEqual([saved[package]["stage"] for package in (first, second)], [crates.CrateStage.INTEGRATED] * 2)
+        self.assertNotIn("removal_reported", saved[first])
+        self.assertTrue(saved[second].get("removal_reported"))
+        self.assertEqual(result, self.batch.read())
+        notices = output.getvalue()
+        self.assertEqual(notices.splitlines().count(
+            f"bulk_run: cannot report removal for {str(first_checkout)!r}: invalid worktree output invalid layout"), 3)
+        self.assertNotIn(f"kept for a manual removal list: {first_checkout} ", notices)
+        self.assertEqual(notices.count(f"kept for a manual removal list: {second_checkout} "), 1)
+
+    def test_record_damage_and_permission_error_allow_the_next_crate_notice(self) -> None:
+        self.freeze()
+        first, second = self.batch.read()["crates"]
+        with mock.patch.object(worktrees, "remove_git_checkout"):
+            _ = self.advance(first)
+            terminal = self.advance(second)
+        first_checkout = Path(terminal["crates"][first]["checkout"])
+        second_checkout = Path(terminal["crates"][second]["checkout"])
+        first_notice = f"kept for a manual removal list: {first_checkout} "
+        second_notice = f"kept for a manual removal list: {second_checkout} "
+        record_path = worktrees.record_file(first_checkout)
+        original = record_path.read_text()
+        fields = cast(dict[str, object], json.loads(original))
+        missing_branch = fields.copy()
+        _ = missing_branch.pop("branch")
+        cases = (
+            ("missing branch", missing_branch, f"{record_path}: worktree record field 'branch' must be text"),
+            ("wrong version", {**fields, "version": True}, f"{record_path}: worktree record field 'version' must be an integer"),
+            ("permission denied", fields, "fixture checkout permission denied"),
+        )
+        path_exists = Path.exists
+
+        for failure, damaged, reason in cases:
+            def checked_exists(path: Path) -> bool:
+                if failure == "permission denied" and path == first_checkout:
+                    raise PermissionError(reason)
+                return path_exists(path)
+
+            with self.subTest(failure=failure):
+                self.batch.save(terminal)
+                _ = record_path.write_text(json.dumps(damaged))
+                refused, retried = io.StringIO(), io.StringIO()
+                with redirect_stderr(refused), mock.patch.object(Path, "exists", new=checked_exists):
+                    _ = self.advance(second)
+                    _ = self.advance(second)
+                saved = self.batch.read()["crates"]
+                self.assertNotIn("removal_reported", saved[first])
+                self.assertTrue(saved[second].get("removal_reported"))
+                refusals = refused.getvalue()
+                line = f"bulk_run: cannot report removal for {str(first_checkout)!r}: {reason}"
+                self.assertEqual(refusals.splitlines().count(line), 2)
+                self.assertNotIn(first_notice, refusals)
+                self.assertEqual(refusals.count(second_notice), 1)
+
+                _ = record_path.write_text(original)
+                with redirect_stderr(retried):
+                    _ = self.advance(second)
+                self.assertTrue(self.batch.read()["crates"][first].get("removal_reported"))
+                self.assertEqual(retried.getvalue().count(first_notice), 1)
+                self.assertNotIn(second_notice, retried.getvalue())
+
+    def test_worker_validation_waits_before_it_takes_a_validation_slot(self) -> None:
+        self.freeze(paths=("src/lib.rs",))
+
+        def pending(command: Sequence[str], source: Path) -> NoReturn:
+            self.assertEqual(command[-1], "final")
+            checkout = Path(self.batch.read()["crates"]["bulk_sample"]["checkout"])
+            self.assertNotEqual(source, checkout)
+            self.assertEqual(copies.commit_at(source, "HEAD"), copies.commit_at(checkout, "HEAD"))
+            self.assertEqual(copies.origin_url(source), copies.origin_url(checkout))
+            self.assertEqual(copies.slot_source(source), copies.slot_source(checkout))
+            leases = list(copies.gates_root().glob("*/*/*.lease.json"))
+            self.assertEqual(len(leases), 1, "validation took a slot before its admission wait")
+            planning = leases[0].with_name(leases[0].name.removesuffix(".lease.json"))
+            self.assertEqual(build_folders.build_folder_state(planning), "held")
+            self.assertEqual(copies.commit_at(planning, "HEAD"), self.base)
+            raise AdmissionWaitReached("the validation wait holds only its existing rule reader")
+
+        with (mock.patch.object(first_step, "admitted_run", new=pending),
+              self.assertRaises(AdmissionWaitReached)):
+            _ = self.advance("bulk_sample")
+
     def test_legacy_manifest_adopts_existing_worker_and_creates_missing_worker(self) -> None:
         for existing in (True, False):
             with self.subTest(existing=existing):
@@ -295,6 +629,7 @@ class CrateRunTests(CargoProjectTests):
                 manifest = batch.read()
                 record = manifest["crates"]["bulk_sample"]
                 legacy = batch.folder / "workers/bulk_sample"
+                _ = record.pop("worktree_branch", "")
                 record["checkout"] = str(legacy)
                 record["intent"] = str(legacy / ".git/style-batch-intent.json")
                 batch.save(manifest)
@@ -318,17 +653,32 @@ class CrateRunTests(CargoProjectTests):
                     self.assertEqual(scratch.holds()[str(worker)]["task"], batch.task)
                 else:
                     self.assertNotEqual(worker, legacy)
-                    self.assertIn(worker, list(scratch.copy_paths()))
+                    repo, unit, short = batch.worktree_names("bulk_sample")
+                    self.assertEqual(worker, build_folders.worktree_path(repo, unit, short))
+                    self.assertEqual(worktrees.worktree_output(worker), worktrees.output_record(repo, unit, short))
 
     def legacy_worker(self) -> Path:
         self.freeze(paths=("src/lib.rs",))
         manifest = self.batch.read()
         record = manifest["crates"]["bulk_sample"]
         worker = self.batch.folder / "workers/bulk_sample"
+        _ = record.pop("worktree_branch", "")
         record["checkout"] = str(worker)
         record["intent"] = str(worker / ".git/style-batch-intent.json")
         self.batch.save(manifest)
         self.initialize_legacy_worker(worker)
+        return worker
+
+    def registered_legacy_worker(self, batch: crates.CrateRun, package: str = "bulk_sample") -> Path:
+        manifest = batch.read()
+        record = manifest["crates"][package]
+        name = Path(record["checkout"]).name
+        with registered_workspace(batch.owner, self.repo, manifest["base"], name=name, branch=record["branch"],
+                                  task=batch.task, run_manifest=batch.path) as worker:
+            _ = record.pop("worktree_branch", "")
+            record["checkout"] = str(worker)
+            record["intent"] = str(worker / ".git/style-batch-intent.json")
+            batch.save(manifest)
         return worker
 
     def initialize_legacy_worker(self, worker: Path) -> None:
@@ -357,12 +707,16 @@ class CrateRunTests(CargoProjectTests):
                 worker = Path(record["checkout"])
                 if kind == "adopted":
                     worker = batch.folder / "workers/bulk_sample"
+                    _ = record.pop("worktree_branch", "")
                     record["checkout"] = str(worker)
                     record["intent"] = str(worker / ".git/style-batch-intent.json")
                     batch.save(manifest)
                     worker.mkdir(parents=True)
                     copies.initialize_git(worker, self.repo)
                     _ = run.git(worker, "checkout", "-q", "-B", record["branch"].removeprefix("refs/heads/"), self.base)
+                else:
+                    worker = self.registered_legacy_worker(batch)
+                    manifest = batch.read()
                 with mock.patch.object(run, "WorkspaceIntent", side_effect=RuntimeError("after registration")):
                     with self.assertRaisesRegex(RuntimeError, "after registration"):
                         _ = batch.advance("bulk_sample", renamed, self.commands, available, fixture_execute)
@@ -405,6 +759,7 @@ class CrateRunTests(CargoProjectTests):
         self.assertIn(str(worker), scratch.holds())
 
     def test_owner_removal_requires_readable_run_evidence_after_git_or_folder_deletion(self) -> None:
+        _ = self.registered_legacy_worker(self.batch)
         with mock.patch.object(run, "WorkspaceIntent", side_effect=RuntimeError("after registration")):
             with self.assertRaisesRegex(RuntimeError, "after registration"):
                 _ = self.advance("bulk_sample")
@@ -436,6 +791,7 @@ class CrateRunTests(CargoProjectTests):
         self.assertEqual(self.batch.path.read_text(), manifest)
 
     def test_owner_removal_removes_only_workers_with_terminal_run_evidence(self) -> None:
+        _ = self.registered_legacy_worker(self.batch)
         with mock.patch.object(copies, "end_workspaces"):
             manifest = self.finish_run()
         worker = Path(manifest["crates"]["bulk_sample"]["checkout"])
@@ -445,60 +801,59 @@ class CrateRunTests(CargoProjectTests):
         self.assertEqual(self.batch.read(), manifest)
         self.assertTrue(Path(manifest["crates"]["bulk_sample"]["result_path"]).exists())
 
-    def test_terminal_run_removes_adopted_worker_and_keeps_result_evidence(self) -> None:
+    def test_terminal_run_keeps_adopted_worker_and_result_evidence(self) -> None:
         worker = self.legacy_worker()
         manifest = self.finish_run()
-        self.assertFalse(worker.exists())
-        self.assertNotIn(str(worker), scratch.holds())
+        self.assertTrue(worker.is_dir())
+        self.assertGreater(scratch.holds()[str(worker)]["ended"], 0)
         self.assertEqual(self.batch.read(), manifest)
         result = Path(manifest["crates"]["bulk_sample"]["result_path"])
         self.assertTrue(result.is_file())
         self.assertFalse(scratch.removal_mark(worker).exists())
 
-    def test_terminal_recovery_finishes_each_adopted_worker_removal_boundary(self) -> None:
-        worker = self.legacy_worker()
-        original_remove = scratch.remove
-        original_release = scratch.release
-        original_end = copies.end_workspaces
-        for boundary in ("before cleanup", "after git deletion", "after folder deletion", "before hold release"):
-            with self.subTest(boundary=boundary):
-                # Restore only the legacy worker between terminal recovery attempts.
-                if not worker.exists():
-                    self.initialize_legacy_worker(worker)
-                with copies.workspace(self.batch.owner, self.repo, self.base, name=worker.name,
-                                      branch=self.batch.read()["crates"]["bulk_sample"]["branch"],
-                                      task=self.batch.task, path=worker):
-                    pass
-                def remove(path: Path) -> None:
-                    if path == worker and boundary == "after git deletion":
-                        import shutil
-                        shutil.rmtree(path / ".git")
-                        raise RuntimeError(boundary)
-                    original_remove(path)
-                    if path == worker and boundary == "after folder deletion":
-                        raise RuntimeError(boundary)
-                def release(path: Path) -> bool:
-                    if path == worker and boundary == "before hold release":
-                        raise RuntimeError(boundary)
-                    return original_release(path)
-                def end(task: str, paths: list[Path], *,
-                        run_lock: copies.CrateRunRemovalLock = copies.ACQUIRE_CRATE_RUN_LOCK) -> None:
-                    if boundary == "before cleanup":
-                        raise RuntimeError(boundary)
-                    original_end(task, paths, run_lock=run_lock)
-                with (mock.patch.object(scratch, "remove", side_effect=remove),
-                      mock.patch.object(scratch, "release", side_effect=release),
-                      mock.patch.object(copies, "end_workspaces", side_effect=end)):
-                    with self.assertRaisesRegex(RuntimeError, boundary):
-                        _ = self.finish_run()
-                self.assertIn(str(worker), scratch.holds())
-                _ = self.finish_run()
-                self.assertFalse(worker.exists())
-                self.assertNotIn(str(worker), scratch.holds())
-                self.assertFalse(scratch.removal_mark(worker).exists())
-                self.assertTrue(Path(self.batch.read()["crates"]["bulk_sample"]["result_path"]).is_file())
+    def test_terminal_run_keeps_external_cargo_output(self) -> None:
+        self.freeze(paths=("src/lib.rs",))
+        worker = Path(self.batch.read()["crates"]["bulk_sample"]["checkout"])
+        target = self.root / "external-target"
+        build = self.root / "external-build"
+        for folder in (target, build):
+            folder.mkdir()
+            _ = (folder / "keep").write_text("earlier output")
 
-    def test_terminal_cleanup_keeps_locked_adopted_workers_then_removes_unsaved_work(self) -> None:
+        with (fake_cargo_output_roots(CargoOutputRoots(worker, target, build)),
+              mock.patch.object(scratch, "clean_cargo_outputs") as clean,
+              redirect_stderr(io.StringIO()) as report):
+            manifest = self.advance("bulk_sample")
+
+        self.assertEqual(Path(manifest["crates"]["bulk_sample"]["checkout"]), worker)
+        self.assertTrue(worker.is_dir())
+        self.assertFalse(scratch.cargo_removal_mark(worker).exists())
+        clean.assert_not_called()
+        notices = [line for line in report.getvalue().splitlines()
+                   if line.startswith("kept for a manual removal list:")]
+        self.assertCountEqual(notices, [
+            f"kept for a manual removal list: {folder} (worktrees, the checkout is selected for removal)"
+            for folder in ((worker / "target").resolve(), worker)
+        ])
+        for folder in (target, build):
+            self.assertEqual((folder / "keep").read_text(), "earlier output")
+
+    def test_terminal_recovery_retries_a_failed_end_record_write(self) -> None:
+        worker = self.legacy_worker()
+        with mock.patch.object(scratch, "record_task_end", side_effect=OSError("record write failed")):
+            with self.assertRaisesRegex(OSError, "record write failed"):
+                _ = self.finish_run()
+        self.assertTrue(worker.is_dir())
+        _ = self.finish_run()
+        record = scratch.task_of(worker)
+        assert isinstance(record, copy_record.Registered)
+        self.assertTrue(scratch.task_has_end_evidence(record))
+        self.assertTrue(worker.is_dir())
+        self.assertGreater(scratch.holds()[str(worker)]["ended"], 0)
+        self.assertFalse(scratch.removal_mark(worker).exists())
+        self.assertTrue(Path(self.batch.read()["crates"]["bulk_sample"]["result_path"]).is_file())
+
+    def test_terminal_completion_keeps_locked_workers_and_unsaved_work(self) -> None:
         worker = self.legacy_worker()
         with mock.patch.object(copies, "end_workspaces"):
             manifest = self.finish_run()
@@ -510,16 +865,17 @@ class CrateRunTests(CargoProjectTests):
             self.assertIn(str(worker), scratch.holds())
         _ = (worker / "pending.txt").write_text("keep unsaved work\n")
         _ = self.finish_run()
-        self.assertFalse(worker.exists())
-        self.assertNotIn(str(worker), scratch.holds())
+        self.assertEqual((worker / "pending.txt").read_text(), "keep unsaved work\n")
+        self.assertGreater(scratch.holds()[str(worker)]["ended"], 0)
         self.assertEqual(self.batch.read(), manifest)
         with (self.subTest(resume="without frozen checkout"),
               mock.patch.object(self.batch, "frozen_checkout",
                                 side_effect=AssertionError("terminal resume builds the frozen checkout"))):
             _ = self.finish_run()
-        self.assertFalse(worker.exists())
+        self.assertTrue(worker.is_dir())
 
     def test_pending_run_survives_expiry_and_terminal_resume_ends_its_task(self) -> None:
+        _ = self.registered_legacy_worker(self.batch)
         with mock.patch.object(berth_board, "read_board", return_value=berth_board.Board((self.other_writer,))):
             manifest = self.reservation_advance()
         worker = Path(manifest["crates"]["bulk_sample"]["checkout"])
@@ -540,12 +896,12 @@ class CrateRunTests(CargoProjectTests):
                 _ = self.advance("beta")
         self.assertTrue(worker.exists())
         _ = self.advance("beta")
-        self.assertIsInstance(scratch.task_of(worker), copy_record.NotRegistered)
-        self.assertNotIn(worker, scratch.end(self.batch.task))
-        self.assertFalse(worker.exists())
+        recorded = scratch.task_of(worker)
+        assert isinstance(recorded, copy_record.Registered)
+        self.assertTrue(scratch.task_has_end_evidence(recorded))
+        self.assertTrue(worker.is_dir())
 
     def test_nested_proof_keeps_the_canonical_owner_with_the_real_resolver(self) -> None:
-        from scripts.style import style_sync as owner_resolver
         self.freeze(paths=("src/lib.rs",))
         observed: set[Path] = set()
         observed_caches: set[Path] = set()
@@ -558,10 +914,12 @@ class CrateRunTests(CargoProjectTests):
                 return self.commands(repo, arguments)
             _ = batch.advance("bulk_sample", renamed, commands, available, fixture_execute)
         self.assertEqual([call.args for call in calls.call_args_list], [(self.repo,)])
-        gates = [path for path in copies.gates_root().glob(f"{self.repo.name}-slot*") if path.is_dir()]
-        self.assertEqual({path.name for path in gates}, {f"{self.repo.name}-slot1", f"{self.repo.name}-slot2"})
+        gates = [path for path, _ in build_folders.copy_folders(copies.gates_root())]
+        self.assertEqual({path.name for path in gates}, {"1", "2"})
         self.assertTrue(any(path in observed_caches for path in gates))
-        self.assertTrue(any(not path.exists() for path in observed))
+        worker = Path(batch.read()["crates"]["bulk_sample"]["checkout"])
+        self.assertIn(worker, observed)
+        self.assertTrue(worker.is_dir())
 
     def test_worker_names_separate_run_and_package_at_the_last_dot(self) -> None:
         # Reuse the real package metadata with only its validated package name changed.
@@ -578,6 +936,7 @@ class CrateRunTests(CargoProjectTests):
         self.assertEqual([Path(path).name for path in paths], ["crate-first-beta.gamma", "crate-first.beta-gamma"])
 
     def test_crate_trees_keep_ownership_and_use_two_standing_caches(self) -> None:
+        self.freeze()
         original = self.git("rev-parse", "HEAD")
         manifest = self.batch.read()
         with self.batch.frozen_checkout(manifest) as frozen:
@@ -586,6 +945,7 @@ class CrateRunTests(CargoProjectTests):
             self.assertEqual(copies.main_checkout(frozen), self.repo)
             self.assertEqual(build_folders.build_folder_state(frozen), "held")
         observed: set[Path] = set()
+        workers: set[Path] = set()
 
         def registered(repo: Path, arguments: Sequence[str]) -> run.CommandResult:
             observed.add(repo)
@@ -594,11 +954,10 @@ class CrateRunTests(CargoProjectTests):
                 self.assertEqual(lease["unit"], frozen_owner)
                 self.assertEqual(build_folders.build_folder_state(repo), "held")
             else:
-                self.assertIn(repo, list(scratch.copy_paths()))
-                record = scratch.task_of(repo)
-                self.assertIsInstance(record, copy_record.Registered)
-                assert isinstance(record, copy_record.Registered)
-                self.assertEqual(record.fields["source_path"], str(self.repo))
+                record = worktrees.read_record(worktrees.record_file(repo))
+                self.assertEqual(Path(record.repo), self.repo)
+                assert isinstance(record.layout, worktrees.RecordedWorktreeOutput)
+                self.assertEqual((repo / "target").resolve(), worktrees.checked_output(record.layout))
                 with scratch.busy_locks(repo, create=False) as idle:
                     self.assertFalse(idle)
             return self.commands(repo, arguments)
@@ -608,13 +967,14 @@ class CrateRunTests(CargoProjectTests):
             worker = Path(result["crates"][package]["checkout"])
             self.assertNotIn(worker, list(scratch.copy_paths()))
             self.assertIsInstance(scratch.task_of(worker), copy_record.NotRegistered)
-            self.assertFalse(worker.exists())
-        gates = [path for path in copies.gates_root().glob(f"{self.repo.name}-slot*") if path.is_dir()]
-        self.assertEqual({tree.name for tree in gates}, {f"{self.repo.name}-slot1", f"{self.repo.name}-slot2"})
+            self.assertTrue(worker.is_dir())
+            workers.add(worker)
+        gates = [path for path, _ in build_folders.copy_folders(copies.gates_root())]
+        self.assertEqual({tree.name for tree in gates}, {"1", "2"})
         self.assertTrue(all((tree / "target").is_dir() for tree in gates))
         self.assertTrue(frozen.exists())
         self.assertEqual(build_folders.build_folder_state(frozen), "free")
-        self.assertTrue(any(not path.exists() for path in observed))
+        self.assertTrue(workers.issubset(observed))
         self.assertEqual(self.git("rev-parse", "HEAD"), original)
 
     @property
@@ -1640,22 +2000,22 @@ class CrateRunTests(CargoProjectTests):
         _ = self.git("update-ref", self.destination, self.base)
         self.authority.set_tip(self.base)
         self.freeze(paths=("src/lib.rs",))
-        end_workspaces = copies.end_workspaces
+        remove = worktrees.remove_git_checkout
 
-        def unchanged_before_removal(task: str, paths: list[Path], *,
-                                     run_lock: copies.CrateRunRemovalLock = copies.ACQUIRE_CRATE_RUN_LOCK) -> None:
+        def unchanged_before_task_end(checkout: Path, repository: Path, *, before_report: Callable[[], None]) -> None:
             record = self.batch.read()["crates"]["bulk_sample"]
             self.assertEqual((Path(record["checkout"]) / "src/lib.rs").read_bytes(),
                              (self.repo / "src/lib.rs").read_bytes())
-            end_workspaces(task, paths, run_lock=run_lock)
+            remove(checkout, repository, before_report=before_report)
 
-        with mock.patch.object(copies, "end_workspaces", side_effect=unchanged_before_removal):
+        with mock.patch.object(worktrees, "remove_git_checkout", side_effect=unchanged_before_task_end) as end:
             result = self.advance("bulk_sample")
         record = result["crates"]["bulk_sample"]
         self.assertEqual(record["stage"], crates.CrateStage.ABANDONED)
         self.assertIn("shared or cross-crate", record.get("error", ""))
         self.assertEqual(self.commands.calls, [])
-        self.assertFalse(Path(record["checkout"]).exists())
+        end.assert_called_once_with(Path(record["checkout"]), self.repo, before_report=mock.ANY)
+        self.assertTrue(Path(record["checkout"]).is_dir())
 
     def test_partial_refusal_publication_resumes_without_releasing_checkpointed_ticket(self) -> None:
         _ = (self.repo / "src/second.rs").write_bytes((self.repo / "src/lib.rs").read_bytes())
@@ -2159,6 +2519,8 @@ class CrateRunTests(CargoProjectTests):
         assert "integration" in record
         self.assertEqual(record["integration"]["stage"], crates.IntegrationStage.PREPARED)
         worker = Path(record["checkout"])
+        assert "worktree_branch" in record
+        worker_branch = f"refs/heads/{record['worktree_branch']}"
         source = worker / "src/lib.rs"
         original = source.read_text()
         commit = self.batch.result(record)["commit"]
@@ -2174,7 +2536,7 @@ class CrateRunTests(CargoProjectTests):
                 else:
                     moved = run.git(worker, "commit-tree", self.batch.result(record)["tree"],
                                     "-p", commit, "-m", "private worker commit")
-                    _ = run.git(worker, "update-ref", record["branch"], moved, commit)
+                    _ = run.git(worker, "update-ref", worker_branch, moved, commit)
                 with mock.patch.object(run, "test_tree", side_effect=failed):
                     with self.assertRaisesRegex(bulk.BulkRenameError, "combined-tree proof failed"):
                         _ = self.advance("bulk_sample")
@@ -2184,7 +2546,7 @@ class CrateRunTests(CargoProjectTests):
                     _ = source.write_text(original)
                 else:
                     self.assertEqual(run.git(worker, "rev-parse", "HEAD"), moved)
-                    _ = run.git(worker, "update-ref", record["branch"], commit, moved)
+                    _ = run.git(worker, "update-ref", worker_branch, commit, moved)
         self.assertEqual(self.advance("bulk_sample")["crates"]["bulk_sample"]["stage"], crates.CrateStage.INTEGRATED)
 
     def test_exact_union_mismatch_retains_pending_claims_and_refs(self) -> None:

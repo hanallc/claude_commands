@@ -9,6 +9,7 @@ import unittest
 from typing import final
 from unittest import mock
 
+from scripts.lib.helper_tree_test_support import verify_test_environment
 from scripts.direct import step_record
 from scripts.build_queue import admission_protocol as wire, admission_records as records, placement
 from scripts.build_queue.test_placement import (
@@ -171,6 +172,7 @@ class QueueDiskRecoveryTests(unittest.TestCase):
                     result = subprocess.run([sys.executable, "-c",
                         "from pathlib import Path; import sys; "
                         + "Path(sys.argv[1]).open('a').write('mac\\n')", str(remote_commands)],
+                        env=verify_test_environment(),
                         capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
                     self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 duplicate, = fixture.connect(replace(consume, request_id="disk-ready-repeated")).replies()
@@ -199,7 +201,8 @@ class StepRetryPermissionTests(unittest.TestCase):
                         fixture.free(0)
                         fixture.hold_starts()
                         repository = fixture.root / "hana"
-                        _ = subprocess.run(["git", "init", "-q", str(repository)], check=True,
+                        _ = subprocess.run(["git", "init", "-q", str(repository)],
+                                          env=verify_test_environment(), check=True,
                             capture_output=True, timeout=TEST_HANG_GUARD_SECS)
                         configuration = "targets=" + ",".join(name for name, _ in ordered) + ",natedev\n"
                         for name in dict(ordered):

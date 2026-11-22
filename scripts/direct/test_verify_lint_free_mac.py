@@ -9,7 +9,7 @@ from typing import override
 from scripts.build_queue.admission_test_support import caller_admission, caller_provider_controls
 from scripts.build_queue import admission_protocol as wire, placement
 from scripts.direct.verify_hold_wait_test_support import VerifyHoldTools
-from scripts.direct.verify_lint_scope_test_support import CARGO_STUB, SCRIPTS, TAPLO_STUB
+from scripts.direct.verify_lint_scope_test_support import CARGO_STUB, SCRIPTS, TAPLO_STUB, write_fixture_cargo_mend
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lint.memory_test_support import write_config_fixture
 
@@ -18,7 +18,9 @@ class VerifyLintFreeMacTests(VerifyHoldTools):
     @override
     def setUp(self) -> None:
         super().setUp()
+        caller_admission(self, self.root, self.environment).configure(waiting_pass_seconds=0.25)
         self.write_executable(self.bin_directory / "cargo", CARGO_STUB)
+        write_fixture_cargo_mend(self.bin_directory / "cargo-mend")
         self.write_executable(self.bin_directory / "taplo", TAPLO_STUB)
         config = self.root / "lint.conf"
         _ = write_config_fixture(config, "mend=on\nfmt=on\nclippy=on\n")
@@ -60,8 +62,7 @@ class VerifyLintFreeMacTests(VerifyHoldTools):
             admission.free(64 * 1024**3)
 
     def local_mend(self) -> list[list[str]]:
-        return [row["args"] for row in self.cargo_events()
-                if row["args"][:1] == ["mend"] and "--version" not in row["args"]]
+        return [row["args"] for row in self.cargo_events() if row["args"][:1] == ["mend"]]
 
     def mac_verbs(self) -> list[str]:
         words = [row["args"] for row in self.runner_events()]
@@ -79,6 +80,20 @@ class VerifyLintFreeMacTests(VerifyHoldTools):
         self.assertTrue(any("fmt" in arguments and "--all" in arguments for arguments in local), local)
         self.assertFalse(any(arguments[:1] == ["clippy"] for arguments in local), local)
         self.assertEqual(list(Path(self.environment["TMPDIR"]).glob("tmp.*")), [])
+        cache = self.board / "verify_cache"
+        self.assertTrue(cache.is_dir())
+        self.assertEqual(list(cache.glob("*.pass")), [])
+
+    def test_mac_clippy_failure_after_remote_mend_is_not_cached(self) -> None:
+        self.set_verb_answer("clippy", "failed", 1)
+        process = self.queued_lint()
+        output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
+        self.assertEqual(process.returncode, 1, output + errors)
+        self.assertEqual(self.mac_verbs(), ["mend-check", "clippy"])
+        self.assertEqual(self.local_mend(), [])
+        cache = self.board / "verify_cache"
+        self.assertTrue(cache.is_dir())
+        self.assertEqual(list(cache.glob("*.fail")), [])
 
     def test_mac_finding_returns_to_memory_and_repairs_on_natedev(self) -> None:
         self.environment.update({"TEST_RUNNER_MAC": "failed", "TEST_RUNNER_STATUS": "101"})
@@ -125,6 +140,29 @@ class VerifyLintFreeMacTests(VerifyHoldTools):
         self.assertEqual(self.mac_verbs(), ["mend-check", "mend-fix", "clippy", "clippy"])
         self.assertEqual(self.local_mend(), [["mend", "--all-targets", "--workspace", "--fix"]])
 
+    def test_refused_mac_fix_does_not_cache_failed_lint(self) -> None:
+        self.set_verb_answer("mend-check", "failed", 1)
+        self.set_verb_answer("mend-fix", "passed", 0, "refused")
+        # Make the local repair fail before it changes the tree.
+        self.write_executable(self.bin_directory / "cargo", CARGO_STUB + '''
+if arguments[:1] == ["mend"]:
+    raise SystemExit(1)
+''')
+        process = self.queued_lint()
+        self.wait_until(lambda: len(self.runner_events()) == 3, "the Mac judgments and fix pass", (process,),
+                        directory=self.runner_state)
+        self.wait_for_memory_wait(process)
+        self.release_memory()
+        output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
+
+        self.assertEqual(process.returncode, 1, output + errors)
+        self.assertIn("the Mac fix pass did not finish", output)
+        self.assertEqual(self.mac_verbs(), ["mend-check", "mend-fix", "clippy"])
+        self.assertEqual(self.local_mend(), [["mend", "--all-targets", "--workspace", "--fix"]])
+        cache = self.board / "verify_cache"
+        self.assertTrue(cache.is_dir())
+        self.assertEqual(list(cache.glob("*.fail")), [])
+
     def test_busy_mac_keeps_the_lint_in_the_local_memory_queue(self) -> None:
         self.environment["TEST_RUNNER_BUSY_UNTIL"] = str(self.runner_state / "mac-free")
         process = self.queued_lint()
@@ -137,6 +175,20 @@ class VerifyLintFreeMacTests(VerifyHoldTools):
         self.assertEqual(sum(row["args"][:1] == ["clippy"] and "--fix" not in row["args"]
                              for row in self.cargo_events()), 1)
         self.assertEqual(self.local_mend(), [["mend", "--all-targets", "--workspace", "--fix"]])
+
+    def test_mend_installed_during_the_memory_wait_prevents_cache_publication(self) -> None:
+        self.environment["TEST_RUNNER_BUSY_UNTIL"] = str(self.runner_state / "mac-free")
+        process = self.queued_lint()
+        self.wait_for_memory_wait(process)
+        write_fixture_cargo_mend(self.bin_directory / "cargo-mend", "replacement")
+        self.release_memory()
+
+        _ = self.finish_lint(process)
+        self.assertEqual(self.runner_events(), [])
+        self.assertEqual(self.local_mend(), [["mend", "--all-targets", "--workspace", "--fix"]])
+        cache = self.board / "verify_cache"
+        self.assertTrue(cache.is_dir())
+        self.assertEqual(list(cache.glob("*.pass")), [])
 
     def test_linux_only_workspace_lint_leaves_memory_for_the_mac(self) -> None:
         # Only the Mac compiles macOS code, so a lint ignores linux_only and the Mac judges the whole workspace.

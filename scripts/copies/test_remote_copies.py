@@ -4,11 +4,13 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 from collections.abc import Generator
 from contextlib import ExitStack, contextmanager, redirect_stderr, redirect_stdout
+from dataclasses import replace
 import fcntl
 import io
 import json
 import os
 import select
+import shlex
 import shutil
 from pathlib import Path
 import signal
@@ -20,15 +22,17 @@ from typing import cast, final, override
 import unittest
 from unittest import mock
 
+from scripts.lib.helper_tree_test_support import COPY_HELPERS, copy_helpers
+
 from scripts.buildlog.store import host_name
 from scripts.copies import copies
 from scripts.lib.build_slots_test_support import private_slot_config
 from scripts.copies.copies_test_support import copies_environment, fake_remote_removal, publish_mirror
 from scripts.copies.remote_test_support import local_remote_transport, warm_claim_servers
-from scripts.lib import conf, file_lock
+from scripts.lib import conf, file_lock, scratch
 from scripts.lib.py_floor_test_support import seed_interpreter_cache
 from scripts.lib.atomic_file import write_text_atomic
-from scripts.mac_test import floor_claims
+from scripts.mac_test import floor_claims, mac_gate
 from scripts.lint import tmp_sweep
 from scripts.production.cli_fixture import ImmutableGitSeed
 from scripts.production import staff
@@ -81,6 +85,110 @@ class RemoteCopiesTests(unittest.TestCase):
         owner = fixture_member("unit", name="mirror-owner", parent=parent.id)
         holder = fixture_worker("live-holder", owner.id)
         return owner, holder
+
+    def test_mac_gate_reconciles_only_selected_mirrors_without_removal_markers(self) -> None:
+        shim = Path.home() / ".claude/scripts/lib/py"
+        shim.parent.mkdir(parents=True)
+        shim.symlink_to(sys.executable)
+        def gate_path(label: str) -> str:
+            return f"gate-mac-gate-{label}-mac-gate-ab12"
+
+        present = gate_path("present")
+        (self.root / present).mkdir()
+        dangling = self.root / gate_path("dangling")
+        dangling.symlink_to(self.root / "missing link target")
+        dangling_path = str(dangling) + "/"
+        gone = str(self.root / gate_path("gone"))
+        custom_gone = str(self.root / "checkout from a custom scratch pattern")
+        held, deferred, replacement, late_held, other_host, authority, removal, cargo = (
+            gate_path(label) for label in ("held", "deferred", "replacement", "late_held", "other_host",
+                                            "authority", "removal", "cargo"))
+        ordinary = "gate-ordinary-mac-gate-ab12"
+        taskless = gate_path("unrelated")
+        names = (present, dangling_path, gone, held, deferred, replacement, late_held, other_host,
+                 authority, removal, cargo, custom_gone, ordinary, taskless)
+        mirrors = {name: replace(self.remote(path=name), task="gate:mac-gate-fixture") for name in names}
+        for name in (ordinary, taskless):
+            mirrors[name] = self.remote(path=name)
+        mirrors[other_host] = replace(mirrors[other_host], host="another-host")
+        for marker in (floor_claims.removal_authority_path(self.root / authority),
+                       scratch.removal_mark(self.root / removal),
+                       scratch.cargo_removal_mark(self.root / cargo)):
+            marker.touch()
+        records = {name: copies.remote_record_path(mirror) for name, mirror in mirrors.items()}
+        with mock.patch.object(copies, "remove_deferred_mirrors"):
+            for mirror in mirrors.values():
+                copies.register_remote(mirror)
+        fields = cast(dict[str, object], json.loads(records[deferred].read_text()))
+        fields["removal"] = "deferred"
+        write_text_atomic(records[deferred], json.dumps(fields))
+        self.assertNotIn("task", cast(dict[str, object], json.loads(records[taskless].read_text())))
+
+        run = subprocess.run
+        current = gate_path("current")
+        (self.root / current).mkdir()
+        trigger = replace(self.remote(path=current), task="gate:mac-gate-current")
+        probed = (current, present, dangling_path, gone, replacement, late_held, authority, removal, cargo, custom_gone)
+        mirrors[current] = trigger
+        with ExitStack() as locks, mock.patch.object(copies, "remove_deferred_mirrors") as remove_deferred:
+            def ssh(command: list[str], *, capture_output: bool, text: bool,
+                    timeout: float) -> subprocess.CompletedProcess[str]:
+                self.assertEqual(command[0], "ssh")
+                self.assertEqual(command[-2], trigger.host)
+                self.assertTrue(text and capture_output)
+                self.assertEqual(timeout, 5)
+                remove_deferred.assert_called_once_with(trigger.host)
+                self.assertEqual(set(shlex.split(command[-1])[3:]), set(probed))
+                for name in probed:
+                    lease = copies.remote_lease_path(mirrors[name])
+                    with file_lock.exclusive(lease, wait=False) as state:
+                        self.assertIs(state, file_lock.LockResult.ACQUIRED)
+                fields = cast(dict[str, object], json.loads(records[replacement].read_text()))
+                fields["last_use"] = 2
+                write_text_atomic(records[replacement], json.dumps(fields))
+                late_lease = copies.remote_lease_path(mirrors[late_held])
+                self.assertIs(locks.enter_context(file_lock.exclusive(late_lease, wait=False)),
+                              file_lock.LockResult.ACQUIRED)
+                return run(["/bin/sh", "-c", command[-1]], capture_output=capture_output, text=True, timeout=timeout)
+
+            held_lock = copies.remote_lease_path(mirrors[held])
+            self.assertIs(locks.enter_context(file_lock.exclusive(held_lock, wait=False)),
+                          file_lock.LockResult.ACQUIRED)
+            with mock.patch.object(subprocess, "run", side_effect=ssh) as probe:
+                copies.register_remote(trigger)
+                probe.assert_not_called()
+                copies.reconcile_remote_mirrors(trigger.host, mac_gate.is_mac_gate_checkout)
+                probe.assert_called_once()
+        for name, record in records.items():
+            self.assertEqual(record.exists(), name not in (gone, custom_gone), name)
+        self.assertTrue(copies.remote_record_path(trigger).exists())
+        self.assertTrue((self.root / present).is_dir())
+        self.assertTrue(dangling.is_symlink())
+
+        for failure in (subprocess.CompletedProcess(["ssh"], 255, "", "fixture disconnect"),
+                        subprocess.TimeoutExpired("ssh", 5)):
+            def failed_ssh(command: list[str], **_: object) -> subprocess.CompletedProcess[str]:
+                self.assertNotIn(ordinary, shlex.split(command[-1])[3:])
+                self.assertNotIn(taskless, shlex.split(command[-1])[3:])
+                if isinstance(failure, subprocess.TimeoutExpired):
+                    raise failure
+                return failure
+
+            with (self.subTest(failure=failure), redirect_stderr(io.StringIO()) as errors,
+                  mock.patch.object(subprocess, "run", side_effect=failed_ssh) as probe):
+                copies.reconcile_remote_mirrors(trigger.host, mac_gate.is_mac_gate_checkout)
+                probe.assert_called_once()
+                lines = errors.getvalue().splitlines()
+                self.assertEqual(len(lines), 1, lines)
+                self.assertTrue(lines[0].startswith("anomaly:"))
+                self.assertTrue(all(record.exists() for name, record in records.items() if name not in (gone, custom_gone)))
+                self.assertTrue(copies.remote_record_path(trigger).exists())
+
+    def test_remote_mirror_record_rejects_non_string_task(self) -> None:
+        row = {"kind": "remote-mirror", "owner": "alpha", "repo": "repository",
+               "host": "host", "path": "mirror/repository", "session": "holder-session", "task": 1}
+        with self.assertRaisesRegex(ValueError, "invalid remote mirror task"):
+            _ = copies.decode_remote_mirror(json.dumps(row))
 
     def test_list_reports_remote_only_held_idle_and_missing_lease_records(self) -> None:
         owner, holder = self.list_members()
@@ -685,9 +793,7 @@ class RemoteCopiesTests(unittest.TestCase):
             self.assertEqual(scan.call_count, 1)
 
     def probe_command(self) -> subprocess.CompletedProcess[str]:
-        scripts = self.root / ".claude/scripts"
-        scripts.parent.mkdir(exist_ok=True)
-        scripts.symlink_to(Path(__file__).resolve().parents[1], target_is_directory=True)
+        _ = copy_helpers(self.root, *COPY_HELPERS)
         tools = self.root / "probe-tools"
         tools.mkdir()
         log = self.root / "probe-calls"

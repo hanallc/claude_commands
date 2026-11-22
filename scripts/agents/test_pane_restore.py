@@ -1,4 +1,6 @@
 from __future__ import annotations
+from scripts.agents.test_support import write_machine_config
+from scripts.lint.memory_test_support import write_config_fixture
 
 import io
 import json
@@ -23,7 +25,8 @@ from scripts.production.cli_fixture import invoke_cli
 from scripts.lib.state_home_test_support import isolate_state_home
 from scripts.accounts import accounts
 from scripts.whoami import agent_accounts
-from scripts.agents import restart
+from scripts.agents import member_account, restart, stop_resume
+from scripts.agents.launch_names import LaunchNames
 from scripts.production import staff, session_staff
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib import unit_runs
@@ -252,7 +255,9 @@ class PaneRestoreTests(unittest.TestCase):
         configuration = self.root / "configuration"
         configuration.mkdir()
         for source in (Path(__file__).resolve().parents[2] / "config").glob("*.conf"):
-            write_text_atomic(configuration / source.name, source.read_text())
+            _ = write_config_fixture(configuration / source.name)
+        write_machine_config(configuration)
+        _ = write_config_fixture(configuration / "staff.conf", "PRODUCER_WORKSPACE=producers\n")
         registry = write_registry(configuration / "models.conf", {"producers": {"alpha": "claude:opus:max"}})
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"MODELS_CONFIG_FILE": str(registry)})))
         for pid in (123, 4242):
@@ -465,6 +470,61 @@ class PaneRestoreTests(unittest.TestCase):
                 self.assertEqual(list(pane_record.read("agents")), ["w1:p2", "w1:p3"])
                 self.assertIn("w1:p2", [row["pane_id"] for row in client.rows])
 
+    def test_account_resume_checks_only_a_different_source_pane(self) -> None:
+        identity = fixture_runtime_id("resume-retained-source")
+        source = "w1:p1"
+        home = self.root / ".claude4"
+        names = LaunchNames(staff.StaffSnapshot(()))
+        for same_pane, source_busy in ((True, True), (False, False), (False, True)):
+            with self.subTest(same_pane=same_pane, source_busy=source_busy):
+                destination = source if same_pane else "w1:p2"
+                client = FakeClient([{"pane_id": pane, "label": "", "workspace_id": "w1"}
+                                     for pane in dict.fromkeys((source, destination))])
+                source_home = self.config if same_pane else home
+                original = pane_record.launch(source, identity, str(self.root),
+                    {"CLAUDE_CONFIG_DIR": str(source_home)}, ["claude", "--resume", identity])
+                original["ended"] = same_pane
+                pane_record.save("agents", {source: original})
+                tab = herdr.TabSession(destination, "", "w1", identity)
+                activity = herdr.PaneRunning(("claude",)) if source_busy else herdr.PaneAtShell()
+
+                def start(selected: herdr.TabSession, entry: pane_launch.CurrentLaunch, label: str,
+                          _message: str) -> sessions.LiveSessionProcess:
+                    self.assertEqual((selected, label), (tab, "claude4"))
+                    if not same_pane:
+                        pane_record.save("agents", {source: original, destination: {**entry, "pane_id": destination}})
+                    return sessions.LiveSessionProcess(123)
+
+                with (mock.patch.dict(os.environ, {"HERDR_PANE_ID": ""}),
+                      client.empty_shell(998042, self.root),
+                      mock.patch.object(client, "pane_activity", return_value=activity) as read_activity,
+                      mock.patch.object(stop_resume, "_tab_of", return_value=tab),
+                      mock.patch.object(stop_resume, "_start_session", side_effect=start),
+                      mock.patch.object(stop_resume, "_watch_resume"),
+                      mock.patch.object(member_account, "resume_account",
+                                        return_value=accounts.NamedAccount("claude4", home)),
+                      redirect_stderr(io.StringIO()) as errors):
+                    result = stop_resume._resume_once(identity, why="account move", to="claude4", names=names,  # pyright: ignore[reportPrivateUsage]
+                                                     client=client)
+                self.assertEqual(result, stop_resume.ClaudeUp(identity, destination, "claude4"))
+                entries = pane_record.read("agents")
+                self.assertFalse(entries[destination].get("ended", False))
+                self.assertEqual(entries[destination].get("config_dir"), str(home))
+                if same_pane:
+                    read_activity.assert_not_called()
+                    self.assertEqual(client.closed, [])
+                    self.assertNotIn("pane close anomaly:", errors.getvalue())
+                elif source_busy:
+                    read_activity.assert_called_once_with(source)
+                    self.assertEqual(client.closed, [])
+                    self.assertEqual(entries[source], original)
+                    self.assertIn(f"{source}: pane close anomaly: pane holds other work; kept open", errors.getvalue())
+                else:
+                    read_activity.assert_called_once_with(source)
+                    self.assertEqual(client.closed, [source])
+                    self.assertNotIn(source, entries)
+                    self.assertNotIn("pane close anomaly:", errors.getvalue())
+
     def test_unknown_staff_home_reports_once_and_keeps_normal_account_selection(self) -> None:
         self.entry()
         self.row = replace(self.row, home=staff.HomeUnknown())
@@ -617,7 +677,7 @@ class RestoreStaffNamesTests(StaffTestCase):
         unit = staff.set_worktree(unit.id, staff.PresentWorktree(machine, self.root), expected=unit.worktree)
         configuration = self.root / "configuration"
         for config_source in (Path(__file__).resolve().parents[2] / "config").glob("*.conf"):
-            write_text_atomic(configuration / config_source.name, config_source.read_text())
+            _ = write_config_fixture(configuration / config_source.name)
         (self.root / "run").mkdir()
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
             "CONF_DIR": str(configuration), "UNIT_RUN_DIR": str(self.root / "run"),
@@ -887,7 +947,7 @@ class CodexPaneRestoreTests(FolderMoveFixture):
         configuration = self.root / "configuration"
         configuration.mkdir()
         for source in (Path(__file__).resolve().parents[2] / "config").glob("*.conf"):
-            write_text_atomic(configuration / source.name, source.read_text())
+            _ = write_config_fixture(configuration / source.name)
         registry = write_registry(configuration / "models.conf")
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
             "CONF_DIR": str(configuration), "MODELS_CONFIG_FILE": str(registry), "MODELS_CONFIG_PUBLISH": "0",
@@ -1155,6 +1215,7 @@ class CodexPaneRestoreTests(FolderMoveFixture):
 
             with (mock.patch.object(accounts, "group_accounts", return_value=accounts.GroupAccounts(units="claude4")),
                   mock.patch.object(accounts, "claude_account_dir", return_value=backend.config),
+                  mock.patch.object(herdr, "live_sessions", return_value=[{"name": "agents"}]),
                   mock.patch.object(herdr, "Herdr", return_value=client),
                   mock.patch.object(client, "open_tab", side_effect=open_tab),
                   mock.patch.object(stop_resume, "_tab_of", return_value=stop_resume.SessionNotFound(self.owner.current_session)),

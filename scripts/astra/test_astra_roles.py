@@ -164,6 +164,27 @@ class AstraRolesTests(StaffTestCase):
         self.assertIn(held.reason, errors.getvalue())
         self.assertEqual(list(self.state.glob("*.json")), [])
 
+    def test_hold_cli_reports_a_role_write_refusal_on_one_line(self) -> None:
+        identity = staff.StaffId("5048811c-26db-50f1-bf82-b3c52202e7ff")
+        arguments = ["hold", "designer", "--staff-id", identity, "--pid", str(os.getpid())]
+        retained = self.staff_file.read_text(encoding="utf-8")
+        defaults = {key: value for key, value in self.environment.items() if key != "STAFF_FILE"}
+        with self.subTest(authority="refused"), mock.patch.dict(os.environ, defaults, clear=True):
+            write_text_atomic(staff.record_path(), retained)
+            with contextlib.redirect_stderr(io.StringIO()) as errors:
+                self.assertEqual(astra_roles.main(arguments), 2)
+            self.assertEqual(errors.getvalue().splitlines(),
+                             ["astra_roles: fixture runtime id cannot enter the real staff record"])
+            self.assertEqual(staff.record_path().read_text(encoding="utf-8"), retained)
+
+        _ = staff.retire(identity)
+        with self.subTest(authority="missing"), mock.patch.dict(os.environ, defaults, clear=True), self.machine("mac"):
+            write_text_atomic(staff.record_path(), retained)
+            with contextlib.redirect_stderr(io.StringIO()) as errors:
+                self.assertEqual(astra_roles.main(arguments), 2)
+            self.assertEqual(errors.getvalue().splitlines(), [f"astra_roles: staff member not found: {identity}"])
+        self.assertEqual(list(self.state.glob("*.json")), [])
+
 
 
     def test_malformed_records_are_reported_once_and_keep_valid_roles(self) -> None:

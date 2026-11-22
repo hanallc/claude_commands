@@ -1,21 +1,20 @@
 ## Phase style review
 
-Edit nothing. Skip every write step; read only these prepared inputs instead
-of running the input preparation in <StyleReview/>:
+Read only the prepared inputs from <StyleReview/>.
+Make no edits.
+
 - Range: $range
-- Diff (with source locations): $diff
-- Additions (reading aid): $additions
+- Diff with source locations: $diff
+- Additions: $additions
 - Rust change: $rust
 
-If Rust changed, load the guide once for this phase, reusing a completed load
-in this thread on a retry: `zsh "$scripts/rust_style/load-rust-style.sh"`.
-Confirm its summary and walk every numbered checklist rule against the
-additions. Otherwise skip the Rust checklist with reason `no Rust change`.
-Run `"$scripts/lib/py" "$scripts/hooks/banned_words_lib.py" --diff < "$diff"`.
-This mode scans additions without updating counters. Exit 0 is Pass, 1 is a
-violation; any other exit is Error. Do not recreate the scanner or rule list.
+If Rust changed, load the guide with `zsh "$scripts/rust_style/load-rust-style.sh"`.
+Use the completed guide load again if you retry in the same conversation.
+Confirm the guide summary.
+Check each numbered rule against the additions.
 
-Return the report inside these exact markers in your normal review result:
+Return the report in your review result between the exact markers below.
+
 $begin
 | # | Rule | Result |
 | --- | --- | --- |
@@ -23,9 +22,14 @@ $begin
 Style review: Pass
 $end
 
-Replace the sample row with every applicable checklist row and the scanner
-result. End with exactly one `Style review: Pass` or `Style review: Findings`;
-use `Style review: Error` if a required read, guide load or scan fails. Include
-the violation count. Include every violation as a numbered finding with
-severity, title and file:line in your normal summary for <Synthesize/>. The
-runner saves the marked report; do not write the report or findings ledger.
+For Rust changes, replace the sample row with one row for each numbered rule.
+For changes without Rust, replace it with `| — | Rust checklist | Skip (no Rust change) |`.
+End the report with exactly one status line.
+
+- Use `Style review: Pass` if the review finds no violations.
+- Use `Style review: Findings` if the review finds violations.
+- Use `Style review: Error` if a required read or guide load fails.
+
+Include the violation count in your summary for <Synthesize/>.
+List each violation as a numbered finding with its severity, title, and path:line.
+The runner saves the marked report.

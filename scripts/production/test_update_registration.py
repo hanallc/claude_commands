@@ -1,6 +1,7 @@
 """Registration behavior against a private seeded fixture."""
 
 from __future__ import annotations
+from scripts.lint.memory_test_support import config_environment, copy_config_fixture
 
 import json
 import io
@@ -32,6 +33,7 @@ from scripts.production.staff_test_support import fixture_runtime_id
 from scripts.review_links import change_browser, change_page
 from scripts.statusline import counts_row
 from scripts.lib import urgency
+from scripts.lint.memory_test_support import write_config_fixture
 
 
 class ProducerQuestionTests(RegistrationFixture):
@@ -44,9 +46,9 @@ class ProducerQuestionTests(RegistrationFixture):
         listing = self.root / "reviews/change-review - example.md"
         _ = self.doc.write_text(self.doc.read_text() + f"- **Change review:** `{listing}`\n")
         config = self.root / "config"
-        _ = shutil.copytree(Path(__file__).parents[2] / "config", config)
+        _ = copy_config_fixture(Path(__file__).parents[2] / 'config', config)
         settings = config / "review_links.conf"
-        _ = settings.write_text(settings.read_text().replace("delivery_pause_seconds=5", "delivery_pause_seconds=0"))
+        _ = write_config_fixture(settings, "delivery_pause_seconds=0\ndelivery_tries=3\n")
         self.env.update({"CLAUDE_CODE_SESSION_ID": self.producer.current_session, "CODEX_THREAD_ID": "",
                          "CHANGE_REVIEW_DIR": str(self.root / "reviews"), "REVIEW_LINKS_ROOT": str(self.root / "links"),
                          "CONF_DIR": str(config)})
@@ -104,7 +106,7 @@ class ProducerQuestionTests(RegistrationFixture):
         self.assertNotIn("No showrunner owns this question.", body)
         instance = self.state / "notifier" / f"showrunner-{self.producer.id}"
         sources: list[Path] = []
-        self.assertEqual(counts_row.row(instance, sources, require_complete=True), ("For you: 1 question", ""))
+        self.assertEqual(counts_row.row(instance, sources, require_complete=True), ("Review: 1 question", ""))
         question = prepared.questions[0].record
         self.assertIn(question.path, sources)
         self.assertIn("Choose the next project?", next_item.show("question", urgency.URGENT, None))
@@ -127,9 +129,11 @@ class ProducerQuestionTests(RegistrationFixture):
                 _ = staff.update_current_session(current.current_session, replacement)
                 self.env["CLAUDE_CODE_SESSION_ID"] = replacement
                 calls: list[tuple[str, str]] = []
+                delivery_key = change_page.review_delivery_key(delivery.page.review_list, delivery.row, delivery.attempt)
 
-                def sender(recipient: str, name: str, message: str) -> None:
+                def sender(recipient: str, name: str, message: str, *, key: str, recipient_key: str) -> None:
                     del name
+                    self.assertEqual((key, recipient_key), (delivery_key, self.producer.id))
                     calls.append((recipient, message))
                     if len(calls) == 1:
                         raise RuntimeError("fixture sender unavailable")
@@ -145,24 +149,34 @@ class ProducerQuestionTests(RegistrationFixture):
                 self.assertEqual(registration.question_records_for_document(self.producer, registration.QuestionStaff.read())[-1].status,
                                  "closed")
 
-    def test_producer_delivery_exhaustion_uses_the_existing_alert(self) -> None:
+    def test_producer_delivery_exhaustion_alerts_the_configured_showrunner(self) -> None:
+        runner = staff.snapshot().by_id(self.owner_id)
+        assert runner is not None
+        settings = self.root / "config" / "review_links.conf"
+        _ = write_config_fixture(settings, f"unrouted_alert_recipient={runner.name}\n")
         self.file_question()
         status = change_page.DeliveryStatus(self.root / "links")
         browser = change_page.ReviewBrowser("producer-test", kind="questions")
         question = change_browser.prepare(browser, status).questions[0]
         delivery, _ = change_browser.submit_question(question, "answer", "Choose the first project.", status)
         calls: list[str] = []
+        keys: list[str] = []
 
-        def sender(recipient: str, name: str, message: str) -> None:
+        def sender(recipient: str, name: str, message: str, *, key: str, recipient_key: str) -> None:
             del name
-            self.assertEqual(recipient, f"session:{self.producer.current_session}")
+            alert = "delivery needs attention" in message
+            target = runner if alert else self.producer
+            self.assertEqual((recipient, recipient_key), (f"session:{target.current_session}", target.id))
             calls.append(message)
-            if "delivery needs attention" not in message:
+            keys.append(key)
+            if not alert:
                 raise RuntimeError("fixture sender unavailable")
 
         with mock.patch.object(change_page, "send_message", side_effect=sender):
             change_page.deliver(delivery, status)
         self.assertEqual(len(calls), 4)
+        self.assertEqual(len(set(keys[:3])), 1)
+        self.assertNotEqual(keys[0], keys[-1])
         self.assertIn("Tries: 3", calls[-1])
         self.assertIn("Choose the first project.", calls[-1])
 
@@ -317,6 +331,8 @@ class QuestionIdentityTests(RegistrationFixture):
     @override
     def setUp(self) -> None:
         super().setUp()
+        self.env.update(config_environment(self.root / "fixture-config"))
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, self.env)))
         self.issues = self.root / "issues"
         self.issues.mkdir(exist_ok=True)
         self.timer("example")
@@ -404,7 +420,7 @@ class QuestionIdentityTests(RegistrationFixture):
                                                 questions=len(registration.read_open_items(self.outstanding())))
             sources = footer_counts.sources(self.doc)
         self.assertEqual(counts.questions, 1)
-        self.assertEqual(footer_counts.counts_line(counts), "For you: 1 question")
+        self.assertEqual(footer_counts.counts_line(counts), "Review: 1 question")
         for record in self.issues.glob("*.md"):
             self.assertIn(record, sources)
 

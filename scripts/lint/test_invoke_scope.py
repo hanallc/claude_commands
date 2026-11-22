@@ -17,7 +17,10 @@ from typing import cast
 from unittest.mock import patch
 from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.lib.nix_env_test_support import NixFixture
+from scripts.lint.memory_test_support import config_environment, write_config_fixture
 from scripts.lib import test_hang_guard
+from scripts.copies import copies
+from scripts.style import bulk_run
 
 from scripts.buildlog.cgroup_test_support import write_cgroup
 from scripts.buildlog.test_memory_window import write_lint_config
@@ -30,6 +33,8 @@ OOM_SCORE_ADJ = "/proc/self/oom_score_adj"
 
 class VerifyTemporaryParentTests(NixFixture):
     def test_verify_creates_missing_tmpdir_before_environment_loading(self) -> None:
+        _ = write_config_fixture(Path(self.env["CONF_DIR"]) / "build_folders.conf",
+            "patterns.legacy-stable={purpose}\n")
         _ = (self.work / "Cargo.toml").write_text("[workspace]\n")
         missing = self.root / "session with spaces" / "tmp"
         _ = self.envrc(self.work)
@@ -506,6 +511,47 @@ SWEEP_STAND_IN = ('invoke_sweep() { printf "started\\n" >&"$SWEEP_TEST_FD"; read
 
 
 class SweepStartupTests(unittest.TestCase):
+    def test_background_sweep_closes_planning_and_validation_leases(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime = root / "runtime"
+            (runtime / "lint-sweep").mkdir(parents=True)
+            configuration = config_environment(root / "config")
+            ready = root / "ready"
+            os.mkfifo(ready)
+            read_fd = os.open(ready, os.O_RDWR)
+            self.addCleanup(os.close, read_fd)
+            command = """
+source "$1"
+planning_fd=$2
+validation_fd=$3
+[[ /dev/fd/$planning_fd -ef planning && /dev/fd/$validation_fd -ef validation ]] || exit 3
+NUMBERED_COPY_LOCK_FD=$validation_fd
+invoke_sweep() {
+    if [[ /dev/fd/$planning_fd -ef planning || /dev/fd/$validation_fd -ef validation ]]; then
+        printf 'inherited\n' > ready
+    else
+        printf 'closed\n' > ready
+    fi
+}
+sweep_after_step test-step
+"""
+            with ((root / "planning").open("w") as planning, (root / "validation").open("w") as validation,
+                  patch.dict(os.environ, {**configuration, "HOME": directory, "TMPDIR": directory,
+                                         "XDG_RUNTIME_DIR": str(runtime), "BUILD_HOLD_DIR": str(root / "hold"),
+                                         "LINT_INVOKE_SOURCED": "", "LINT_SKIP_SWEEP": ""})):
+                leases = (planning.fileno(), validation.fileno())
+                token = copies.COMMAND_LOCKS.set(leases)
+                try:
+                    result = bulk_run.run_command(root, ("bash", "-c", command, "sweep-test", str(INVOKE),
+                                                         *map(str, leases)))
+                finally:
+                    copies.COMMAND_LOCKS.reset(token)
+            self.assertEqual(result.code, 0, result.stdout + result.stderr)
+            readable, _, _ = select.select([read_fd], [], [], test_hang_guard.TEST_HANG_GUARD_SECS)
+            self.assertTrue(readable, "the sweep did not report its descriptors")
+            self.assertEqual(os.read(read_fd, 4096), b"closed\n")
+
     def sweep_run(self, switch: str, systemd_cat: str = JOURNAL_WRITER) -> SweepRun:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -517,12 +563,16 @@ class SweepStartupTests(unittest.TestCase):
             tool.chmod(0o755)
             release = root / "release"
             os.mkfifo(release)
+            configuration = root / "config"
+            environment = config_environment(configuration)
+            _ = write_config_fixture(configuration / "build_folders.conf", "patterns.legacy-stable={purpose}\n")
             reader, writer = os.pipe()
             process = subprocess.Popen(
                 ["bash", "-c", f'source "$1"; {SWEEP_STAND_IN}; sweep_after_step test-step', "sweep-test", str(INVOKE)],
                 cwd=root, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                 pass_fds=(writer,),
-                env={**os.environ, "HOME": directory, "TMPDIR": directory,
+                env={**os.environ, **environment, "HOME": directory, "TMPDIR": directory,
+                     "BUILD_HOLD_DIR": str(root / "holders"),
                      "PATH": f"{tools}{os.pathsep}{os.environ['PATH']}",
                      "XDG_RUNTIME_DIR": str(root / "runtime"), "LINT_INVOKE_SOURCED": "",
                      "LINT_CONFIG_READER": str(root / "missing-config"), "LINT_SKIP_SWEEP": switch,

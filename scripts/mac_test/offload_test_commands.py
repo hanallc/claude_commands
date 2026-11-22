@@ -1,8 +1,10 @@
 """Shell stand-ins keep argument records without starting Python per command."""
 
+from dataclasses import dataclass
+import shlex
 from pathlib import Path
 
-from scripts.lib.checkout_test_support import python_tool_source
+from scripts.lib.checkout_test_support import fixture_shim_source, python_tool_source
 
 
 JSON_SHELL = r'''
@@ -40,6 +42,85 @@ def write_shell(path: Path, source: str) -> None:
     """Bash builtins handle JSON escaping and timed FIFO reads on Linux and macOS."""
     _ = path.write_text("#!/bin/bash\n" + JSON_SHELL + source)
     path.chmod(0o755)
+
+
+WORKSPACE_SWEEP_SETTINGS = """\
+# range: 0..
+recent_minutes=60
+# range: 0..
+sweep_budget_gib=24
+sweep_budget_gib.hana=96
+# range: 0..
+sweep_doc_index_mib=250
+# whole: 1..
+sweep_max_tree_depth=3
+# whole: 1..
+sweep_floor_search_depth=8
+sweep_floor_skip=.git node_modules
+# whole: 1..
+sweep_discovery_workers=4
+# whole: 1..
+sweep_dep_info_head_bytes=4096
+# whole: 1..
+sweep_proc_locks_reads=3
+# range: 0..
+sweep_holder_lookback_seconds=180
+# range: 0..
+sweep_delete_stamp_grace_seconds=2
+# range: 0..
+sweep_phone_floor_gib=0
+# range: 0..
+sweep_phone_rearm_gib=5
+# range: 0..
+sweep_phone_rearm_minutes=60
+# range: 0..
+sweep_alert_interval_seconds=3600
+# whole: 1..
+sweep_message_limit=1024
+# range: 3..5
+sweep_alert_folder_count=3
+# range: 0..
+sweep_crossing_repeat_minutes=525600
+# whole: 1..
+sweep_push_text_limit=500
+# range: 0..
+sweep_sender_timeout_seconds=30
+"""
+
+
+@dataclass(frozen=True)
+class WorkspaceSweepFixture:
+    proc: Path
+
+    def python_prefix(self) -> str:
+        """Use the fixture process table in the child sweep."""
+        return ('from functools import partial; from scripts.lint import sweep; '
+                + f'sweep.sweep_workspace = partial(sweep.sweep_workspace, proc={str(self.proc)!r}); ')
+
+
+def configure_nextest_trim(shim: Path, trim: int | WorkspaceSweepFixture) -> None:
+    """Keep the log writer active while the fixture controls the trim."""
+    original = Path(__file__).resolve().with_name("nextest_log.py")
+    interpreter, _, body = fixture_shim_source().partition("\n")
+    trim_command = (f"exit {trim}" if isinstance(trim, int) else
+                    '[ "$#" -eq 4 ] && [ "$1" = -B ] && [ "$2" = -c ] || exit 99\n'
+                    + f'set -- "$1" "$2" {shlex.quote(trim.python_prefix())}"$3" "$4"')
+    source = (interpreter + '\nif [ "${2##*/}" = nextest_log.py ]; then\n'
+              + f'    shift 2\n    set -- -B {shlex.quote(str(original))} "$@"\n'
+              + f'else\n    {trim_command}\nfi\n' + body)
+    _ = shim.write_text(source)
+    shim.chmod(0o755)
+
+
+def install_nextest_log_writer(home: Path) -> Path:
+    """Make the checkout's log writer available in a private home."""
+    script = home / ".claude/scripts/mac_test/nextest_log.py"
+    script.parent.mkdir(parents=True, exist_ok=True)
+    script.symlink_to(Path(__file__).resolve().with_name("nextest_log.py"))
+    shim = home / ".claude/scripts/lib/py"
+    shim.parent.mkdir(parents=True, exist_ok=True)
+    configure_nextest_trim(shim, 0)
+    return shim
 
 
 COMMAND_STUB = r'''
@@ -130,10 +211,8 @@ if [[ $remote == *'select_leftovers()'* && $remote == *lsof* ]]; then
         await_release continue-cleanup
     fi
     if [[ -n $selector_shell ]]; then
-        export PATH="$root/selectors:$PATH"
-        checks=''
+        printf -v checks 'export PATH=%q:"$PATH"\n' "$root/selectors"
         for name in pgrep lsof sleep; do
-            [[ $(command -v "$name") == "$root/selectors/$name" ]] || exit 99
             printf -v check '[ "$(command -v %s)" = %q ] || exit 99\n' "$name" "$root/selectors/$name"
             checks+=$check
         done

@@ -18,12 +18,17 @@ import tempfile
 from typing import Literal, TypedDict, cast
 
 from scripts.lib import conf
+from scripts.lib.atomic_file import write_text_atomic
 from scripts.production import production_doc, staff
-from scripts.style import refill_inputs, refill_measure, style_config, style_ledger, style_rules
+from scripts.style import refill_inputs, refill_measure, style_config, style_ledger, style_reader, style_rules
 from scripts.style.unit_files import unit_worktrees
 from scripts.style.unit_plans import unit_plan_path
 
 OBSERVATION_VARIABLES = ("LC_ALL", "LC_CTYPE", "LANG", "XDG_CONFIG_HOME", "RIPGREP_CONFIG_PATH", "STAFF_CONFIG")
+
+
+class UnsupportedCaptureFormat(ValueError):
+    """The capture uses a format that this reader cannot read."""
 
 
 class CapturedFile(TypedDict):
@@ -47,7 +52,7 @@ class SourceProjection(TypedDict):
 
 
 class CaptureManifest(TypedDict):
-    format: int
+    format: Literal[2]
     repo: str
     unit: str
     files: list[CapturedFile]
@@ -76,9 +81,15 @@ class ReplayReport(TypedDict):
     run: dict[str, object]
 
 
+def git_environment() -> dict[str, str]:
+    """Run Git in the specified checkout."""
+    return {key: value for key, value in os.environ.items()
+            if key not in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE")}
+
+
 def git(repo: Path, *arguments: str, input: bytes = b"") -> str:
     """Read Git without changing the repository."""
-    return subprocess.run(["git", "-C", str(repo), *arguments], input=input,
+    return subprocess.run(["git", "-C", str(repo), *arguments], input=input, env=git_environment(),
                           capture_output=True, check=True).stdout.decode("utf-8")
 
 
@@ -105,21 +116,46 @@ def repository_files(repo: Path) -> Iterator[Path]:
 
 def board_text(repo: Path) -> str:
     """Read the board through its existing command."""
-    result = subprocess.run(["cargo-berth", "board", "--json"], cwd=repo,
+    result = subprocess.run(["cargo-berth", "board", "--json"], cwd=repo, env=git_environment(),
                             capture_output=True, text=True, check=False)
     return json.dumps(cast(object, json.loads(result.stdout)), sort_keys=True, separators=(",", ":"))
 
 
+class CaptureOutputExists(ValueError):
+    """An existing path prevents publication of the capture."""
+
+
+def capture_output_parent() -> Path:
+    return Path.home() / ".local/state/selection-captures"
+
+
 def capture(repo: Path, ledger: Path, unit: str, folder: Path) -> CaptureManifest:
-    """Copy selection inputs without writing the source ledger or repository."""
-    folder = folder.resolve()
-    folder.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix=folder.name + "-", dir=folder.parent) as temporary:
-        sibling = Path(temporary)
-        manifest = capture_inputs(repo, ledger, unit, sibling)
-        if folder.exists():
+    """Reserve a new output folder before staging the capture."""
+    try:
+        folder.mkdir(mode=0o700, parents=True)
+    except FileExistsError:
+        raise CaptureOutputExists(f"{folder} exists. Pick a new path or remove the old path by hand.") from None
+    try:
+        parent = capture_output_parent()
+        parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix=".capture-", dir=parent) as temporary:
+            staged = Path(temporary)
+            manifest = capture_inputs(repo, ledger, unit, staged)
+            for entry in staged.iterdir():
+                if entry.name == "manifest.json":
+                    continue
+                if entry.is_dir():
+                    _ = shutil.copytree(entry, folder / entry.name)
+                else:
+                    _ = shutil.copyfile(entry, folder / entry.name)
+            manifest_text = (staged / "manifest.json").read_text()
+        write_text_atomic(folder / "manifest.json", manifest_text)
+    except BaseException as error:
+        try:
             shutil.rmtree(folder)
-        _ = sibling.rename(folder)
+        except OSError as cleanup_error:
+            error.add_note(f"Cannot remove the partial capture at {folder}. {cleanup_error}")
+        raise
     return manifest
 
 
@@ -180,7 +216,7 @@ def capture_inputs(repo: Path, ledger: Path, unit: str, folder: Path) -> Capture
     save(Path.home() / ".gitconfig", "git_configuration")
     xdg = Path(os.environ.get("XDG_CONFIG_HOME", str(Path.home() / ".config")))
     save(xdg / "git/config", "git_configuration", "XDG_CONFIG_HOME", "xdg/git/config")
-    excludes = subprocess.run(["git", "-C", str(repo), "config", "--path", "--get", "core.excludesfile"], capture_output=True, text=True)
+    excludes = subprocess.run(["git", "-C", str(repo), "config", "--path", "--get", "core.excludesfile"], env=git_environment(), capture_output=True, text=True)
     if excludes.returncode == 0:
         save(Path(excludes.stdout.strip()).expanduser(), "ignore")
     regex = refill_inputs.regex_configuration()
@@ -215,7 +251,7 @@ def capture_inputs(repo: Path, ledger: Path, unit: str, folder: Path) -> Capture
             for label, reference in ((f"unit:{row.unit}", row.branch), (f"main:{row.unit}", row.merge_branch),
                                      (f"pushed:{row.unit}", "refs/remotes/origin/" + row.branch)):
                 references[label] = reference
-                resolved = subprocess.run(["git", "-C", str(repo), "rev-parse", "--verify", reference],
+                resolved = subprocess.run(["git", "-C", str(repo), "rev-parse", "--verify", reference], env=git_environment(),
                                           capture_output=True, text=True)
                 revisions[label] = resolved.stdout.strip() if resolved.returncode == 0 else "absent"
         revisions["main"] = git(repo, "rev-parse", config.route.branch_point).strip()
@@ -245,13 +281,11 @@ def capture_inputs(repo: Path, ledger: Path, unit: str, folder: Path) -> Capture
     _ = (folder / "board.json").write_text(board)
     files.append({"source": "cargo-berth board --json", "copy": "board.json", "sha256": fingerprint(folder / "board.json"),
                   "kind": "board", "replay": "compare"})
-    stamp = style_config.reader_install_folder() / "current/stamp"
-    save(stamp, "reader_stamp")
     save(xdg / "cargo-mend/config.toml", "lint_configuration", "XDG_CONFIG_HOME", "xdg/cargo-mend/config.toml")
     rg = subprocess.run(["rg", "--version"], capture_output=True, text=True, check=True).stdout
     # Ledger migration can change the private backup, so hash it after admission.
     files[0]["sha256"] = fingerprint(database)
-    manifest: CaptureManifest = {"format": 1, "repo": str(repo), "unit": unit, "files": files, "schema": schema,
+    manifest: CaptureManifest = {"format": 2, "repo": str(repo), "unit": unit, "files": files, "schema": schema,
         "schema_version": schema_version, "versions": versions, "source_projection": projections,
         "revisions": revisions, "objects": availability,
         "environment": {key: os.environ[key] for key in OBSERVATION_VARIABLES if key in os.environ},
@@ -260,7 +294,7 @@ def capture_inputs(repo: Path, ledger: Path, unit: str, folder: Path) -> Capture
                   "implementation_diff": hashlib.sha256(git(checkout, "diff", "--", "scripts/style").encode()).hexdigest(),
                   "selection_sources": hashlib.sha256("\n".join(
                       path.name + ":" + fingerprint(path) for path in sorted((checkout / "scripts/style").glob("*.py"))).encode()).hexdigest(),
-                  "reader_source": git(checkout, "rev-parse", "HEAD:rust/style_reader").strip()},
+                  "cargo_style": style_reader.reader_version_line()},
         "board": "board.json", "directories": directories, "absent_inputs": absent_inputs, "references": references,
         "worktree_status": worktree_status, "git_configuration": git(repo, "config", "--list", "-z")}
     _ = (folder / "manifest.json").write_text(json.dumps(manifest, sort_keys=True, indent=2) + "\n")
@@ -269,12 +303,23 @@ def capture_inputs(repo: Path, ledger: Path, unit: str, folder: Path) -> Capture
 
 def read_manifest(folder: Path) -> CaptureManifest:
     """Read the versioned capture manifest."""
-    return cast(CaptureManifest, json.loads((folder / "manifest.json").read_text()))
+    manifest = cast(object, json.loads((folder / "manifest.json").read_text()))
+    version = cast(dict[str, object], manifest)["format"]
+    if version != 2:
+        raise UnsupportedCaptureFormat(f"capture format {version} is not supported; capture again")
+    return cast(CaptureManifest, manifest)
 
 
 def external_changes(folder: Path, manifest: CaptureManifest) -> list[ExternalChange]:
     """Report changed unconfigured inputs without refusing a replay."""
     changes: list[ExternalChange] = []
+    try:
+        version = style_reader.observe_reader_version_line()
+    except style_reader.ReaderError as error:
+        version = str(error)
+    expected_version = manifest["tools"]["cargo_style"]
+    if version != expected_version:
+        changes.append({"source": "cargo-style --version", "expected": expected_version, "actual": version})
     for entry in manifest["files"]:
         if entry["replay"] != "backup" and entry["sha256"] != fingerprint(folder / entry["copy"]):
             changes.append({"source": str(folder / entry["copy"]), "expected": entry["sha256"], "actual": fingerprint(folder / entry["copy"])})
@@ -293,7 +338,7 @@ def external_changes(folder: Path, manifest: CaptureManifest) -> list[ExternalCh
             changes.append({"source": "git:status:" + worktree, "expected": hashlib.sha256(expected.encode()).hexdigest(),
                             "actual": hashlib.sha256(actual.encode()).hexdigest()})
     for label, reference in manifest["references"].items():
-        result = subprocess.run(["git", "-C", str(repo), "rev-parse", "--verify", reference], capture_output=True, text=True)
+        result = subprocess.run(["git", "-C", str(repo), "rev-parse", "--verify", reference], env=git_environment(), capture_output=True, text=True)
         actual = result.stdout.strip() if result.returncode == 0 else "absent"
         if actual != manifest["revisions"][label]:
             changes.append({"source": "git:" + reference, "expected": manifest["revisions"][label], "actual": actual})
@@ -317,7 +362,7 @@ def replay_environment(folder: Path, reader: style_config.ReaderSource, private:
     config = private / "config"
     _ = shutil.copytree(folder / "config", config)
     refill_measure.select_reader(config, reader)
-    environment = {key: value for key, value in os.environ.items() if key not in OBSERVATION_VARIABLES}
+    environment = {key: value for key, value in git_environment().items() if key not in OBSERVATION_VARIABLES}
     environment.update(manifest["environment"])
     environment.update(CONF_DIR=str(config), STAFF_FILE=str(folder / "staff.json"),
                        STYLE_HISTORY_NATE_STYLE_DIR=str(folder / "rules"), STYLE_LEDGER_STATE_DIR=str(private / "state"),
@@ -401,14 +446,17 @@ def main() -> int:
         _ = child.add_argument("--reader", type=style_config.ReaderSource, choices=list(style_config.ReaderSource), required=True)
         _ = child.add_argument("--stages", action="store_true")
     args = parser.parse_args(namespace=CaptureArguments())
-    if args.command == "capture":
-        manifest = capture(args.repo, args.ledger, args.unit, args.folder)
-        result: object = {"folder": str(args.folder), "files": len(manifest["files"]),
-                          "schema_version": manifest["schema_version"], "objects": len(manifest["objects"])}
-    elif args.command == "replay":
-        result = replay(args.folder, args.reader, args.workspace, stages=args.stages)
-    else:
-        result = measure_capture(args.folder, args.reader, args.workspace, stages=args.stages)
+    try:
+        if args.command == "capture":
+            manifest = capture(args.repo, args.ledger, args.unit, args.folder)
+            result: object = {"folder": str(args.folder), "files": len(manifest["files"]),
+                              "schema_version": manifest["schema_version"], "objects": len(manifest["objects"])}
+        elif args.command == "replay":
+            result = replay(args.folder, args.reader, args.workspace, stages=args.stages)
+        else:
+            result = measure_capture(args.folder, args.reader, args.workspace, stages=args.stages)
+    except (UnsupportedCaptureFormat, CaptureOutputExists) as error:
+        parser.exit(2, f"{parser.prog}: {error}\n")
     print(json.dumps(result, sort_keys=True))
     return 0
 

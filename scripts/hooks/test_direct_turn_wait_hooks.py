@@ -23,6 +23,7 @@ from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.socket_test_support import short_socket_directory
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.hooks.conversation_pause_test_support import ConversationPauseFixture, retain_children
+from scripts.message import send
 from scripts.production import staff
 from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, fixture_worker, isolated_staff_file, recorded_unit
 
@@ -92,8 +93,8 @@ def director_wait_fixture(*, execution: Literal["direct", "process"] = "direct")
         phase: dict[str, object] = {"id": "6", "instance_id": "original-six", "title": "Wait hooks",
                                     "status": "active", "started_at": 1000}
         state: dict[str, object] = {"run_id": "run", "history_file": str(history), "working_dir": str(root),
-                                    "worktree": "fixture-unit", "phase": phase,
-                                    "main_agent": {"session_id": SESSION}, "pass": {}, "open_phases": [],
+                                    "worktree": "fixture-unit", "open_phases": [phase],
+                                    "main_agent": {"session_id": SESSION}, "pass": {},
                                     "unit": "fixture-unit", "project_plan_doc": "plan.md"}
         _ = (root / "plan.md").write_text('> **Production: wait-production** — unit `fixture-unit`; production doc `production.md`\n')
         _ = (run / "progress_history_state.json").write_text(json.dumps(state))
@@ -233,10 +234,24 @@ class DirectorTurnWaitHookTests(unittest.TestCase):
             self.assertEqual(fixture.wait_events()[-1]["event_type"], "wait_finished")
 
     def test_only_expected_showrunner_can_relay_the_users_decision(self) -> None:
-        for prefix in ("", "Message from expected-showrunner via postmaster: Decision [abcdef12]\n\n"):
-            with self.subTest(prefix=prefix), director_wait_fixture() as fixture:
+        relay = "From the user (via the showrunner): Approved."
+        multiline = send.Message(SESSION, "expected-showrunner\nProduction", "Decision\n\nTag: 01234567", relay, None,
+                                 shown_sender="expected-showrunner · showrunner\nProduction",
+                                 sent_header="\nSent: 01:12 EST")
+        delivery = send.delivered_text(multiline, "abcdef12")
+        self.assertEqual(delivery, "expected-showrunner Production: Decision  Tag: 01234567\n"
+                         + "Sender native id: unavailable\nShown sender: expected-showrunner · showrunner Production\n"
+                         + "Sent: 01:12 EST\nTag: abcdef12\n\n" + relay)
+        for text in (
+            relay,
+            "expected-showrunner: Decision\nSender native id: unavailable\nTag: abcdef12\n\n" + relay,
+            "expected-showrunner: Decision\nSender native id: session:showrunner\n"
+            + "Shown sender: expected-showrunner · showrunner\nTag: abcdef12\n\n" + relay,
+            "expected-showrunner: Decision\nSender native id: unavailable\nSent: 01:12 EST\nTag: abcdef12\n\n" + relay,
+            delivery,
+        ):
+            with self.subTest(text=text), director_wait_fixture() as fixture:
                 fixture.call(STOP, {"last_assistant_message": "decision: approve?"}, 1010)
-                text = prefix + "From the user (via the showrunner): Approved."
                 fixture.call(PROMPT, {"prompt": fixture.message(text, address="uds:/another/socket", name="expected-showrunner")}, 1020)
                 self.assertEqual(len(fixture.wait_events()), 1)
                 fixture.call(PROMPT, {"prompt": fixture.message(text)}, 1040)
@@ -260,7 +275,7 @@ class DirectorTurnWaitHookTests(unittest.TestCase):
                     fixture.call(STOP, {"last_assistant_message": declaration}, 1010)
                     started, = fixture.wait_events()
                     reply = "From the user (via the showrunner): Approved."
-                    text = "Message from renamed-showrunner (their answer to director, passed on by postmaster) [1020000-1]:\n\n" + reply
+                    text = f"renamed-showrunner (answer to director): {reply}\n\nTag: 1020000-1"
                     postmaster = fixture.root / "state/message/postmaster"
                     (postmaster / "replies").mkdir(parents=True)
                     _ = (postmaster / "heartbeat.json").write_text(json.dumps({"session_id": "peer-4"}))
@@ -280,7 +295,7 @@ class DirectorTurnWaitHookTests(unittest.TestCase):
         self, *, finishes: bool, forward: str = "pending",
         record_count: int = 1, transport_newlines: bool = False,
         sender_index: int = 4, declaration: str = "blocked: waiting on the showrunner",
-        reply: str = "The checkpoint is merged.", **record_changes: object,
+        reply: str = "The checkpoint is merged.", first_sender: str = "another-director", **record_changes: object,
     ) -> None:
         with director_wait_fixture() as fixture:
             supplier_socket = str(fixture.root / "socket-0")
@@ -293,7 +308,7 @@ class DirectorTurnWaitHookTests(unittest.TestCase):
             record: dict[str, object] = {
                 "at_ms": 1020000, "socket": "uds:" + supplier_socket,
                 "name": "renamed-showrunner", "session_id": SHOWRUNNER_SESSION,
-                "senders": ["another-director", "director"], "body": reply,
+                "senders": [first_sender, "director"], "body": reply,
                 # This director is the second intended recipient. The reply's
                 # filename counter and each forward's suffix are independent.
                 "targets": ["another-director", SESSION],
@@ -301,8 +316,7 @@ class DirectorTurnWaitHookTests(unittest.TestCase):
             }
             for index in range(record_count):
                 _ = (replies / f"1020000-{index + 1}.json").write_text(json.dumps(record))
-            text = ("Message from renamed-showrunner (their answer to one of another-director, director, "
-                    + "passed on by postmaster) [1020000-7]:\n\n" + reply)
+            text = f"renamed-showrunner (answer to one of {first_sender}, director): {reply}\n\nTag: 1020000-7"
             if transport_newlines:
                 text = "\n" + text + "\n"
             message = fixture.message(text, address="uds:" + str(fixture.root / f"socket-{sender_index}"),
@@ -332,7 +346,9 @@ class DirectorTurnWaitHookTests(unittest.TestCase):
                 self.assertFalse((fixture.run / "turn_wait.json").exists())
 
     def test_pending_postmaster_record_ends_supplier_wait_before_forward_confirmation(self) -> None:
-        self.assert_forwarded_reply_wait_outcome(finishes=True)
+        for first_sender in ("another-director", "Planning (EU): primary"):
+            with self.subTest(first_sender=first_sender):
+                self.assert_forwarded_reply_wait_outcome(finishes=True, first_sender=first_sender)
 
     def test_pending_forward_with_transport_newlines_preserves_original_body_newlines(self) -> None:
         self.assert_forwarded_reply_wait_outcome(
@@ -421,7 +437,7 @@ class DirectorTurnWaitHookTests(unittest.TestCase):
             fixture.call(STOP, {"last_assistant_message": "decision: approve?"}, 1010)
             path = fixture.run / "progress_history_state.json"
             state = cast(dict[str, object], json.loads(path.read_text()))
-            state["phase"] = {"id": "7", "instance_id": "new-seven", "status": "active"}
+            state["open_phases"] = [{"id": "7", "instance_id": "new-seven", "status": "active"}]
             _ = path.write_text(json.dumps(state))
             # Even a marker older than active_run's liveness window retains
             # the exact wait to close when the user finally answers.

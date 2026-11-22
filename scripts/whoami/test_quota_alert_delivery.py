@@ -1,20 +1,22 @@
 """Quota alerts: delivery."""
 
 from __future__ import annotations
+from scripts.lint.memory_test_support import write_config_fixture
 
 import io
+import os
+from pathlib import Path
 import json
-import shutil
 import subprocess
 import sys
 import unittest
-from pathlib import Path
 from contextlib import redirect_stdout
 from datetime import timedelta
 from typing import cast, override
 from unittest import mock
 
 from scripts.lib.test_models_registry import write_registry
+from scripts.accounts import role_map
 from scripts.accounts.home_test_support import scratch_accounts_config
 from scripts.message import send_budget
 from scripts.agents import remote
@@ -62,15 +64,17 @@ class QuotaAlertTests(support.SeededQuotaReminderFixture):
         claude = self.note("claude2.md", "active", "0", limit_reset_count="3")
         codex = self.note("codex1.md", "active", "0")
         spare = self.note("claude1.md", "inactive", "80", login="spare@example.invalid")
-        sends = self.user_sends(lambda: self.alert([claude, codex, spare], self.now))
-        sends |= self.user_sends(lambda: self.block([codex], self.now))
+        with mock.patch("socket.gethostname", return_value=role_map.ROLE_MAP_HOST):
+            sends = self.user_sends(lambda: self.alert([claude, codex, spare], self.now))
+            sends |= self.user_sends(lambda: self.block([codex], self.now))
         notes = [title for title, (need, _action) in sends.items() if need == "note"]
         self.assertEqual(len(notes), 1)
         for title in notes:
             _ = sends.pop(title)
         self.assertEqual(sends, {
             "quota_alert: codex1 now uses paid credits": ("decision", ActionRequired(
-                f"To stop it, remove codex1 from codex_credit_accounts in ~/.claude/config/accounts.conf on {remote.local_machine()}")),
+                "To stop it, remove codex1 from codex_credit_accounts in ~/.claude/config/accounts.conf on "
+                + role_map.ROLE_MAP_HOST)),
             "Codex work stopped for lack of usage": ("decision", ActionRequired(REFUSAL_ACTION)),
         })
 
@@ -85,6 +89,8 @@ class QuotaAlertTests(support.SeededQuotaReminderFixture):
             self.assertEqual(REAL_TELL_USER(push), quota_alert.PushFailed("sender unavailable"))
 
     def test_user_send_uses_configured_review_limit_without_shortening_agent_relays(self) -> None:
+        settings = Path(os.environ["CONF_DIR"]) / "accounts.conf"
+        _ = write_config_fixture(settings, "quota_relay_timeout_seconds=40\n")
         config = self.root / "notify.conf"
         _ = config.write_text("REVIEW_TIMEOUT_SECONDS=90\n")
         done = subprocess.CompletedProcess(["send.py"], 0, "SENT: to the user", "")
@@ -103,11 +109,10 @@ class QuotaAlertTests(support.SeededQuotaReminderFixture):
     def test_relay_reads_the_current_account_timeout(self) -> None:
         config = self.enterContext(scratch_accounts_config()) / "accounts.conf"
         for name in ("send", "postmaster", "codex_daemon"):
-            _ = shutil.copyfile(Path(__file__).resolve().parents[2] / "config" / f"{name}.conf", config.with_name(f"{name}.conf"))
-        original = config.read_text()
+            _ = write_config_fixture(config.with_name(f'{name}.conf'))
         done = subprocess.CompletedProcess([], 0, "SENT: fixture", "")
         for limit in (40, 55):
-            _ = config.write_text(original.replace("quota_relay_timeout_seconds=40", f"quota_relay_timeout_seconds={limit}"))
+            _ = write_config_fixture(config, f"quota_relay_timeout_seconds={limit}\n")
             with self.subTest(limit=limit), mock.patch.object(subprocess, "run", return_value=done) as run:
                 self.assertIsNone(REAL_RELAY("fixture", "message", None))
                 command = cast(list[str], run.call_args.args[0])
