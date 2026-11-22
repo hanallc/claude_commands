@@ -155,7 +155,13 @@ A script never writes a literal phone text. It renders a catalog entry from `scr
 - A bare yes or no is consumed only while it can still answer the return question.
 - The answer window begins when the question reaches the session. A failed delivery still reaches automatic return five minutes after the question became due.
 - A pause restores only what it changed.
-- Both hooks have a five-second budget, print at most one error line, and exit 0 so a prompt or reply cannot fail because the pause failed.
+- Both hooks use the five-second default budget from `scripts/hooks/hook_budget.py`.
+  Set `CONVERSATION_PAUSE_HOOK_BUDGET` to change it.
+  The executable starts the budget before it imports the pause library. Direct calls to `main()` run in the caller's process.
+  A supervisor ends the worker group at the deadline or when the hook closes the owner pipe.
+  The supervisor removes the worker's scheduled-prompt temporary files after cancellation.
+  When the budget expires, the supervisor prints the budget error and the hook exits 0.
+  The hooks install no signal handler. The process tests check cancellation, deadlines, output, and exit status.
 - `unit_lookup.read_run_states().state(worktree)`, not prose in a production row, is authoritative for whether the stall watch monitors a unit.
 - Correcting an as-built doc that contradicts the code is always allowed; cross-unit notice rules still apply.
 - Every scripted phone alert enters `scripts/message/send.py --to user`, with a catalog `--text-id`; channel choice stays inside `send.py`.
