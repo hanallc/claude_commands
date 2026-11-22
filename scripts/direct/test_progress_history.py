@@ -71,11 +71,11 @@ def recorder_parser() -> argparse.ArgumentParser:
     return cast(Callable[[], argparse.ArgumentParser], builder)()
 
 
-def recorder_handler(name: str) -> Callable[[argparse.Namespace], None]:
+def recorder_handler(name: str) -> Callable[[argparse.Namespace], progress_history.InterruptedWorkerPasses | None]:
     handler = vars(progress_history).get(name)
     if not callable(handler):
         raise AssertionError(f"progress recorder handler is unavailable: {name}")
-    return cast(Callable[[argparse.Namespace], None], handler)
+    return cast(Callable[[argparse.Namespace], progress_history.InterruptedWorkerPasses | None], handler)
 
 
 class ProgressHistoryTests(unittest.TestCase):
@@ -502,11 +502,11 @@ print('two homes isolated; recorder lock retained; caller restored')
 
     def invoke_handler(
         self,
-        handler: Callable[[argparse.Namespace], None],
+        handler: Callable[[argparse.Namespace], progress_history.InterruptedWorkerPasses | None],
         arguments: argparse.Namespace,
         at: int,
         refresh_result: subprocess.CompletedProcess[str] | BaseException,
-    ) -> tuple[None, str, str]:
+    ) -> tuple[progress_history.InterruptedWorkerPasses | None, str, str]:
         environment = os.environ.copy()
         environment["UNIT_HISTORY_DIR"] = str(self.history_dir)
         environment["CONF_DIR"] = str(Path(self.config_file).parent)
@@ -2392,7 +2392,7 @@ print('two homes isolated; recorder lock retained; caller restored')
         name = "stopped-phase-publication"
         session = self.start_run(name, 1000)
         arguments = ["start-phase", "--session-dir", str(session), "--phase-id", "13", "--phase-title", "Rerun"]
-        with stop_once(pass_recorder, "append_event", when="before",
+        with stop_once(progress_history, "_append_event", when="before",
                        argument=1, matches=lambda value: isinstance(value, dict)
                        and cast(dict[str, object], value).get("event_type") == "phase_started"):
             with self.assertRaises(InjectedStop):
@@ -2766,15 +2766,14 @@ print('two homes isolated; recorder lock retained; caller restored')
         finish_program = '''import sys
 from unittest.mock import patch
 from scripts.direct import progress_history as recorder
-from scripts.direct import pass_record as pass_recorder
-append = pass_recorder.append_event
+append = recorder._append_event
 def publication(state, event):
     if event.get("event_type") == "phase_finished":
         print("publishing", flush=True)
         sys.stdin.readline()
     append(state, event)
 sys.argv = ["progress_history.py", *sys.argv[1:]]
-with patch.object(pass_recorder, "append_event", publication):
+with patch.object(recorder, "_append_event", publication):
     recorder.main()
 '''
         start_program = '''import fcntl, sys
@@ -3745,8 +3744,17 @@ with patch.object(fcntl, "flock", admission):
                 assert isinstance(owner, staff.StaffRow)
                 if failure == "stale-pointer":
                     _ = staff.set_run(owner.id, staff.OpenRun(session_dir))
+                    before = self.read_state(session_dir)
+                    refused = self.run_failing_command(
+                        "start-phase", "--session-dir", str(session_dir),
+                        "--phase-id", "4", "--phase-title", "Resume the unit", at=20_025)
+                    self.assertNotEqual(refused.returncode, 0)
+                    self.assertIn("complete the pending run end before reopening it", refused.stderr)
+                    self.assertEqual(self.read_state(session_dir), before)
+                    _ = self.run_command("finish-run", "--session-dir", str(session_dir),
+                                         "--status", status, at=20_026)
                 if failure == "state-write":
-                    with patch.object(pass_recorder, "write_state", side_effect=OSError("state write failed")):
+                    with patch.object(progress_history, "_write_state", side_effect=OSError("state write failed")):
                         with self.assertRaisesRegex(OSError, "state write failed"):
                             _ = self.run_command(
                                 "start-phase", "--session-dir", str(session_dir),
@@ -7924,7 +7932,7 @@ with patch.object(fcntl, "flock", admission):
         def prepare(
             command: str,
             name: str,
-        ) -> tuple[Callable[[argparse.Namespace], None], argparse.Namespace]:
+        ) -> tuple[Callable[[argparse.Namespace], progress_history.InterruptedWorkerPasses | None], argparse.Namespace]:
             session_dir = self.start_run(name, started_at)
             if command != "start-phase":
                 self.start_phase_and_pass(session_dir, started_at)
@@ -8014,7 +8022,13 @@ with patch.object(fcntl, "flock", admission):
                     refresh_result=refusal,
                 )
 
-                self.assertEqual(refused[:2], successful[:2])
+                self.assertEqual(refused[1], successful[1])
+                if command == "finish-phase":
+                    for returned, arguments in ((successful[0], success_arguments), (refused[0], failure_arguments)):
+                        self.assertEqual(returned,
+                            progress_history.InterruptedWorkerPasses(Path(cast(str, arguments.session_dir))))
+                else:
+                    self.assertEqual(refused[0], successful[0])
                 self.assertEqual(successful[2], "")
                 self.assertEqual(
                     refused[2],
@@ -8595,7 +8609,7 @@ with patch.object(fcntl, "flock", admission):
         self.start_slot_pass(session_dir, "impl", "impl", started_at + 140, "gpt-called", 0,
                              "--worker-id", worker.id, worker_name=worker.name)
         self.team_slot = ""
-        append = pass_recorder.append_event
+        append = cast(Callable[[dict[str, object], dict[str, object]], None], vars(progress_history)["_append_event"])
 
         def fail_drop(state: dict[str, object], event: dict[str, object]) -> None:
             if event.get("event_type") == "phase_dropped":
@@ -8608,7 +8622,7 @@ with patch.object(fcntl, "flock", admission):
                 fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
             self.assertEqual(passes.worker_ids, (worker.id,))
 
-        with (patch.object(pass_recorder, "append_event", side_effect=fail_drop),
+        with (patch.object(progress_history, "_append_event", side_effect=fail_drop),
               patch.object(progress_history, "_close_interrupted_workers", side_effect=close_workers) as cleanup):
             with self.assertRaisesRegex(OSError, "The drop append failed"):
                 _ = self.run_command("drop-phase", "--session-dir", str(session_dir), "--phase-id", "9",
