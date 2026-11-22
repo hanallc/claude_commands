@@ -1573,14 +1573,16 @@ def _nearby_resume_names(reference: str, names: LaunchNames) -> list[str]:
 
 def resume(session: str, *, why: str = "resumed by name", to: str | None = None, requester: str = "",
            client: herdr.Herdr | herdr.LaunchClientSource = herdr.LaunchClientSource.NEW) -> ResumeResult:
-    try:
-        settings = conf.read("shutdown")
-        for key in ("START_SECONDS", "STAY_SECONDS"):
-            _ = settings.number(key)
-    except conf.Unusable as error:
-        return ResumeFailed(session, str(error))
-    with staff.row_operation(session):
-        return _resume(session, why=why, to=to, requester=requester, client=client)
+    with ExitStack() as locks:
+        try:
+            locks.enter_context(herdr.reboot_lock())
+            settings = conf.read("shutdown")
+            for key in ("START_SECONDS", "STAY_SECONDS"):
+                _ = settings.number(key)
+        except (conf.Unusable, herdr.RebootLockBusy) as error:
+            return ResumeFailed(session, str(error))
+        with staff.row_operation(session):
+            return _resume(session, why=why, to=to, requester=requester, client=client)
 
 
 @dataclass(frozen=True)

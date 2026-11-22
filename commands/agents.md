@@ -1,6 +1,6 @@
 ---
-description: Show, pause, exit, retire, rename, move, resume, stop, or restart sessions.
-argument-hint: 'move SESSION_OR_GROUP ACCOUNT [--dry-run] [--why TEXT] | rename OLD NEW [--to-doc PATH] [--to-branch NAME] | retire NAME | pause NAME --why TEXT | exit NAME --why TEXT | help | status [ACCOUNT] [--json] [--here] | resume NAME [--retired] [--why TEXT] [--to ACCOUNT] | restart [ACCOUNT] [--all] [--dry-run] [--only ID[,ID...]] [--here] | stop SESSION [--dry-run] | stop --all [--dry-run] | remove-stray NAME SESSION | transfer NAME [--model MODEL --effort EFFORT]'
+description: Show, pause, exit, retire, rename, move, resume, stop, restart, or reboot sessions.
+argument-hint: 'move SESSION_OR_GROUP ACCOUNT [--dry-run] [--why TEXT] | rename OLD NEW [--to-doc PATH] [--to-branch NAME] | retire NAME | pause NAME --why TEXT | exit NAME --why TEXT | help | status [ACCOUNT] [--json] [--here] | resume NAME [--retired] [--why TEXT] [--to ACCOUNT] | reboot [--dry-run] | restart [ACCOUNT] [--all] [--dry-run] [--only ID[,ID...]] [--here] | stop SESSION [--dry-run] | stop --all [--dry-run] | remove-stray NAME SESSION | transfer NAME [--model MODEL --effort EFFORT]'
 ---
 
 Use the `agents` program.
@@ -18,6 +18,7 @@ Use the `agents` program.
 - `agents retire NAME`: remove the unit worktree and branch. Keep its retired staff row and conversations.
 - `agents resume NAME --retired`: restore a retired unit and its retained workers.
 - Before running `--retired`, ask the user yes or no. Run it only after yes.
+- Run `agents reboot [--dry-run]` from a terminal outside Herdr. See Reboot below.
 - `agents restart [ACCOUNT] [--all] [--dry-run] [--only ID[,ID...]] [--here]`: restore saved rows or restart local live rows with `--all`.
 - `agents stop SESSION [--dry-run]`: stop the session and its workers. Keep their rows, conversations, and panes at the shell.
 - `agents stop --all [--dry-run]`: save the live local staff rows, then stop them without a restart.
@@ -175,3 +176,10 @@ A row without a saved tab says so on the same line.
 One anomaly does not prevent unrelated work.
 Stop uses the limits in `config/shutdown.conf`.
 See `docs/as-built/shutdown-and-restart.md` and `docs/accounts.md`.
+
+## Reboot
+
+`agents reboot` saves and stops the sessions, stops the Herdr server, moves session folders, and restarts the saved sessions.
+Run the same command to continue after a failed step.
+`agents reboot --dry-run` sizes idle folders and counts live folders that need a size check after the stop.
+Read the run logs in `~/.local/state/agents/reboot/`. `latest.log` points to the most recent run.
