@@ -220,6 +220,11 @@ class WorktreeAttributionTests(unittest.TestCase):
         errors = self.assert_claim_refused("1", self.session)
         self.assertIn(f"phase_reservation: {self.session}: run owner is unavailable", errors)
 
+    def test_claim_refuses_a_git_read_failure_inside_the_home(self) -> None:
+        with mock.patch.object(phase_reservation, "repository_root", return_value=None):
+            errors = self.assert_claim_refused("1", self.first)
+        self.assertIn(f"{self.first}: Git cannot read this path inside the unit home checkout", errors)
+
     def test_claim_uses_the_model_home_without_a_phase_worktree_file(self) -> None:
         directory = phase_reservation.phase_directory(self.session, "1")
         self.assertEqual(self.claim("1", self.first), (0, ""))

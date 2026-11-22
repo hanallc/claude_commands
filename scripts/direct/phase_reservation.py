@@ -992,6 +992,8 @@ def _claim_command(args: argparse.Namespace) -> int:
         elif (directory / BASELINE_FILE).is_file() and home.root.is_dir():
             requested = home.root
         root = repository_root(requested)
+        if root is None and requested.resolve().is_relative_to(home.root.resolve()):
+            raise StateRefused(f"{requested}: Git cannot read this path inside the unit home checkout")
         if root is None:
             print("phase reservation: no repository or no files to claim; still awaiting first touch")
             return 0
