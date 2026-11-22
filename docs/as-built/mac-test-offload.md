@@ -424,6 +424,8 @@ An interrupted run stops and reaps both log readers after recording its result. 
 
 - Routing reads configured targets through `targets.py`. `verify.sh` waits on held natedev, or tries the Mac while natedev is held; it never falls back to a held target. While both are unavailable it prints `verify.sh: natedev is held by <holder> for <reason>.` and `verify.sh: waiting for the Mac (<reason>) or natedev's release.`, once and again only on change. A local run prints `verify.sh: running on natedev`. Calls carry `mac`, `mac_reason`, `local_reason`, `mac_s`, `mac_holder`, `target` and `hold_wait_s`; `BUILDLOG_MAC_HOLDER` carries the busy holder, is never exported, and is cleared when a later answer is no longer busy. An interrupted retry keeps the earlier decline and holder.
 
+Use `mac_gate.py run <repo> <output> --module <path>` to run a named module on the Mac. Repeat `--module` for each repository-relative path.
+
 ### Mac gate cleanup
 
 An active Mac gate uses the lifecycle script that started the run.

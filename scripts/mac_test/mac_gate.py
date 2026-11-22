@@ -603,6 +603,7 @@ class Arguments(argparse.Namespace):
     argv_file: Path = Path()
     repo: Path = Path()
     output: Path = Path()
+    module: list[str] | None = None
     mac_result: Path = Path()
     natedev_record: Path = Path()
     owner: str = ''
@@ -613,9 +614,11 @@ class Arguments(argparse.Namespace):
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest='action', required=True)
-    manual = commands.add_parser('run', help='run all modules on the Mac and save the result')
+    manual = commands.add_parser('run', help='run test modules on the Mac and save the result')
     _ = manual.add_argument('repo', type=Path)
     _ = manual.add_argument('output', type=Path)
+    _ = manual.add_argument('--module', action='append', default=None, metavar='PATH',
+                            help='run only the named modules. Repeat for each repository-relative path')
     writer = commands.add_parser('write-list', help='write exclusions from a Mac result and a natedev gate log')
     _ = writer.add_argument('repo', type=Path)
     _ = writer.add_argument('mac_result', type=Path)
@@ -653,8 +656,13 @@ def main() -> int:
         elif args.action == 'write-list':
             write_modules(args.repo.resolve(), args.mac_result, args.natedev_record)
         else:
-            result = run_remote(args.repo.resolve(), mode=gate.SuiteMode.GATE, full=True,
-                                module_time_limit_s=gate.DEFAULT_MODULE_TIME_LIMIT_S, selected=gate.ALL_MODULES,
+            repo = args.repo.resolve()
+            selected: gate.AllModules | gate.TreeSelection = gate.ALL_MODULES
+            if args.module:
+                tree, _dirty = cloud_gate.working_tree(repo)
+                selected = gate.TreeSelection(tuple(args.module), tree)
+            result = run_remote(repo, mode=gate.SuiteMode.GATE, full=True,
+                                module_time_limit_s=gate.DEFAULT_MODULE_TIME_LIMIT_S, selected=selected,
                                 cancellation=USE_CALLER_PROCESS_LIFETIME)
             if isinstance(result, str):
                 raise GateRefused(result)
