@@ -1183,7 +1183,6 @@ def _wait_for_admission_reply(sockets: AcquisitionSockets, initial_request: Admi
         retry.unreachable_deadline = last_valid + configuration.unreachable_limit_seconds
     had_wait = estimate_pending = False
     reconnect = ReconnectNotice()
-    replacement_peer: socket.socket | None = None
     waiting_callback: tuple[socket.socket, wire.Wait] | None = None
     refreshing: EstimateRefresh | None = None
     refreshed_write: tuple[socket.socket, AdmissionRequest] | None = None
@@ -1229,14 +1228,6 @@ def _wait_for_admission_reply(sockets: AcquisitionSockets, initial_request: Admi
         checker_due = False
         if sockets.terminal() is None:
             sockets.drain(request)
-        if replacement_peer is not None and replacement_peer is sockets.owner:
-            owner_stream = sockets.streams.get(replacement_peer)
-            if owner_stream is not None:
-                for answer in owner_stream.replies:
-                    if isinstance(answer, (wire.Wait, wire.Admitted, wire.LaunchAdmitted, wire.Refused)):
-                        reconnect.reached(answer)
-                        replacement_peer = None
-                        break
         if refreshed_write is not None:
             written_peer, written_request = cast(tuple[socket.socket, AdmissionRequest], refreshed_write)
             stream = sockets.streams[written_peer]
@@ -1251,7 +1242,11 @@ def _wait_for_admission_reply(sockets: AcquisitionSockets, initial_request: Admi
                 refreshing = None
                 refreshed_write = None
 
-        if sockets.terminal() is not None:
+        if (answer := sockets.terminal()) is not None:
+            # A wait that arrived in the same read as the answer is the first answer after a reconnect.
+            owner_stream = sockets.streams.get(sockets.owner) if sockets.owner is not None else None
+            replies = owner_stream.replies if owner_stream is not None else ()
+            reconnect.reached(next((reply for reply in replies if isinstance(reply, wire.Wait)), answer))
             return request, None
         if retry.launch_without_wait and any(stream.error is not None for stream in sockets.streams.values()):
             return request, AcquisitionDeadline.LAUNCH
@@ -1268,6 +1263,7 @@ def _wait_for_admission_reply(sockets: AcquisitionSockets, initial_request: Admi
         message = sockets.next_reply()
         if message is not None and message[0] is sockets.owner and isinstance(message[1], wire.Wait):
             wait = message[1]
+            reconnect.reached(wait)
             last_valid = last_notice = now
             if refreshing is None or sockets.streams[message[0]].history_lookup is None:
                 reconnect_at = math.inf
@@ -1323,8 +1319,6 @@ def _wait_for_admission_reply(sockets: AcquisitionSockets, initial_request: Admi
                         transport_failed(error)
                         reconnect_at = now + interval
                     else:
-                        if reconnect.pending:
-                            replacement_peer = sockets.owner
                         reconnect_at = math.inf
                         if len(sockets.streams) == 1:
                             last_notice = now
