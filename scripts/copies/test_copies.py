@@ -2742,6 +2742,59 @@ with patch.object(subprocess, 'run', pause_clone):
                 copies.remove_trees(self.owner_id)
                 self.assertFalse(active.exists())
 
+    def test_owner_removal_preserves_a_crate_copy_without_terminal_evidence(self) -> None:
+        name = "crate-recovery"
+        tree = copies.workspace_path(self.owner_id, self.source, name)
+        manifest_path = self.base / "crate-recovery.json"
+        manifest = json.dumps({
+            "version": 2, "canonical": str(self.source), "base": self.head,
+            "crates": {"sample": {"checkout": str(tree), "stage": "selected"}},
+        })
+        _ = manifest_path.write_text(manifest)
+        with registered_workspace(self.owner_id, self.source, self.head, name=name, branch="worker",
+                                  run_manifest=manifest_path) as worker:
+            self.assertEqual(worker, tree)
+        _ = scratch.hold(tree, f"gate:{name}", copies.LEGACY_WORKER_HOLD_REASON)
+        scratch.hand_over(tree, self.owner_id, "gate:changed-task")
+        record = scratch.task_of(tree)
+        assert isinstance(record, copy_record.Registered)
+
+        with self.subTest(evidence="blank run link"):
+            _ = scratch.update_record(tree, lambda _: {**record.fields, "crate_run": ""})
+            with self.assertRaisesRegex(copies.CopyError, "repair crate run link"):
+                copies.remove_trees(self.owner_id)
+            self.assertTrue(tree.is_dir())
+            self.assertEqual(manifest_path.read_text(), manifest)
+            self.assertIn(str(tree), scratch.holds())
+        _ = scratch.update_record(tree, lambda _: record.fields.copy())
+
+        for evidence in ("missing", "corrupt"):
+            with self.subTest(evidence=evidence):
+                if evidence == "missing":
+                    manifest_path.unlink()
+                else:
+                    _ = manifest_path.write_text("{invalid")
+                with self.assertRaisesRegex(copies.CopyError, "repair crate run") as refused:
+                    copies.remove_trees(self.owner_id)
+                self.assertIn(str(manifest_path), str(refused.exception))
+                self.assertTrue(tree.is_dir())
+            _ = manifest_path.write_text(manifest)
+
+        with mock.patch.object(scratch, "remove", side_effect=OSError("interrupted removal")):
+            with self.assertRaisesRegex(OSError, "interrupted removal"):
+                scratch.remove_marked(tree)
+        marker = scratch.removal_mark(tree)
+        saved = marker.read_bytes()
+        for missing in (tree / ".git", tree):
+            with self.subTest(missing=missing.name):
+                shutil.rmtree(missing)
+                with self.assertRaisesRegex(copies.CopyError, "not terminal") as refused:
+                    copies.remove_trees(self.owner_id)
+                self.assertIn(str(manifest_path), str(refused.exception))
+                self.assertEqual(marker.read_bytes(), saved)
+                self.assertEqual(manifest_path.read_text(), manifest)
+                self.assertEqual(tree.exists(), missing != tree)
+
     def test_owner_removal_preserves_a_source_with_an_adopted_borrower(self) -> None:
         with registered_workspace(self.owner_id, self.source, self.head, name="parent", branch="worker") as parent:
             pass
