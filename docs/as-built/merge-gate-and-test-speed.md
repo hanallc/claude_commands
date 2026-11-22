@@ -296,6 +296,14 @@ The completion case retains its strict socket send.
 
 ## How it works
 
+### Mac gate journal cleanup
+
+Each Mac gate attempt stores its process groups in `~/.local/state/mac-gate/<attempt>/run.json` on the Mac.
+When a task has an end receipt, cleanup checks each live recorded group against its saved process start.
+Cleanup stops the confirmed groups and removes the journal, even when the temporary build folder is gone.
+The receipt stays with a retained checkout.
+See [Mac gate cleanup](mac-test-offload.md#mac-gate-cleanup) for the queue callbacks.
+
 ### Targeted tests: `scripts/production/targeted_test.py`
 
 The entry has its own parser and description.

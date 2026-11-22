@@ -140,24 +140,25 @@ def stop_inline_checkout(repo: Path) -> None:
         raise GateRefused('Test processes still use the Mac checkout')
 
 
-def stop_guest(folder: Path, deadline: float) -> None:
-    """Interrupt a live guest. Recover recorded resources after it exits."""
-    journal = folder / 'run.json'
-    if not journal.exists():
+def stop_guest(journal: Path, deadline: float, *, task_ended: bool = False) -> None:
+    """Recover the guest's recorded resources or check the groups after task cleanup."""
+    try:
+        record = cloud_gate.read(journal)
+    except FileNotFoundError:
         return
-    record = cloud_gate.read(journal)
-    pid, start = ledger.instant(record, 'pid'), ledger.text(record, 'start')
-    if pid <= 1 or pid == os.getpid():
-        raise GateRefused('Invalid Mac gate owner')
-    if running_owner(pid, start):
-        with suppress(ProcessLookupError):
-            os.kill(pid, signal.SIGINT)
-        while running_owner(pid, start):
-            if time.monotonic() >= deadline:
-                raise GateRefused('The Mac gate guest did not exit')
-            time.sleep(0.05)
+    if not task_ended:
+        pid, start = ledger.instant(record, 'pid'), ledger.text(record, 'start')
+        if pid <= 1 or pid == os.getpid():
+            raise GateRefused('Invalid Mac gate owner')
+        if running_owner(pid, start):
+            with suppress(ProcessLookupError):
+                os.kill(pid, signal.SIGINT)
+            while running_owner(pid, start):
+                if time.monotonic() >= deadline:
+                    raise GateRefused('The Mac gate guest did not exit')
+                time.sleep(0.05)
+        record = cloud_gate.read(journal)
 
-    record = cloud_gate.read(journal)
     groups = {int(group): stamp for group, stamp in ledger.mapping(record['groups']).items()}
     for pgid in live_groups(set(groups)):
         owner = process_start(pgid)
@@ -170,6 +171,8 @@ def stop_guest(folder: Path, deadline: float) -> None:
         if time.monotonic() >= deadline:
             raise GateRefused('The Mac gate job groups did not exit')
         time.sleep(0.05)
+    if task_ended:
+        return
     folders = record['folders']
     if not isinstance(folders, list):
         raise GateRefused('The Mac gate journal has no folder list')
@@ -229,11 +232,12 @@ def stop_checkout(folder: Path, saved_checkout: Path | None = None) -> CheckoutC
         stop_inline_checkout(folder.resolve() / 'repo')
         checkout_file = folder / 'checkout.json'
         receipt = folder / 'task-ended.json'
+        journal = folder / 'run.json'
         cleanup_paths: dict[str, object]
         try:
             cleanup_paths = cloud_gate.read(receipt)
         except FileNotFoundError:
-            stop_guest(folder, deadline)
+            stop_guest(journal, deadline)
             # Until Mac promotion, scratch.end can return removed paths and a separate kept list.
             ended = cast(Sequence[Path | scratch.KeptFolder], scratch.end(checkout_task(folder)))
             legacy_kept = cast(Sequence[scratch.KeptFolder], getattr(ended, 'kept', ()))
@@ -257,6 +261,9 @@ def stop_checkout(folder: Path, saved_checkout: Path | None = None) -> CheckoutC
                 else:
                     cleanup_paths[str(path)] = 'the folder is still present'
             cloud_gate.save(receipt, cleanup_paths)
+        else:
+            stop_guest(journal, deadline, task_ended=True)
+        journal.unlink(missing_ok=True)
         paths: set[Path] = {read_checkout(folder)} if checkout_file.exists() else set()
         paths.update(Path(name) for name in cleanup_paths)
         outcome = CheckoutCleanup.REMOVED
