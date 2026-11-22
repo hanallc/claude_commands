@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import cast
 
 
-LOCK_PATH = Path("/tmp/hanadocs-prioritize/writer.lock")
+DEFAULT_WRITER_LOCK_PATH = Path("/tmp/hanadocs-prioritize/writer.lock")
 
 
 class WriterLockError(RuntimeError):
@@ -23,7 +23,7 @@ class WriterLockError(RuntimeError):
 
 @contextmanager
 def acquire_writer_lock(
-    path: Path = LOCK_PATH,
+    path: Path = DEFAULT_WRITER_LOCK_PATH,
     *,
     timeout_seconds: float = 30.0,
 ) -> Generator[None]:
@@ -58,7 +58,7 @@ def acquire_writer_lock(
             _ = os.close(descriptor)
 
 
-def lock_is_held(path: Path = LOCK_PATH) -> bool:
+def lock_is_held(path: Path = DEFAULT_WRITER_LOCK_PATH) -> bool:
     """Return whether another process currently owns the writer lock."""
 
     path.parent.mkdir(parents=True, exist_ok=True)

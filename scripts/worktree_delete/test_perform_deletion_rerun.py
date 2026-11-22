@@ -43,7 +43,7 @@ class DeletionRerunTests(unittest.TestCase):
             **fixture_git_environment(self.root),
             **interpreter_cache_environment(self.root / "cache"),
             "CONF_DIR": str(settings), "WORKTREES_STATE_DIR": str(self.root / "state"),
-            "GIT_ALLOW_PROTOCOL": "file",
+            "GIT_ALLOW_PROTOCOL": "file", "WT_CONFIRM_DIR": str(self.root / "confirmations"),
         }
         remote = self.root / "repo.git"
         _ = self.git("init", "-q", "--bare", str(remote))
@@ -104,9 +104,11 @@ class DeletionRerunTests(unittest.TestCase):
         lock.touch()
         _ = lease.write_text("{}\n")
         _ = self.script("record_confirmation.sh", caller, relative, check=True)
+        nonce, = (self.root / "confirmations").iterdir()
 
         result = self.script("perform_deletion.sh", caller, relative)
 
+        self.assertFalse(nonce.exists())
         self.assert_retained(result, tip)
         self.assertEqual((self.worktree / "code.txt").read_text(), "topic work\n")
         self.assertTrue(lock.is_file())

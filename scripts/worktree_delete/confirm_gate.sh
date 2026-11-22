@@ -8,7 +8,7 @@
 # refused. The file is keyed by the target worktree path, so deletions of
 # different worktrees never read each other's nonce.
 
-WT_CONFIRM_DIR="/tmp/claude/worktree_delete"
+WT_CONFIRM_DIR="${WT_CONFIRM_DIR:-/tmp/claude/worktree_delete}"
 WT_CONFIRM_TTL_SECONDS=600
 
 # Stable key for a worktree path (strip trailing slash, hash to a filesystem-
