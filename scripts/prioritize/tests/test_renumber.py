@@ -8,6 +8,7 @@ import sys
 import tempfile
 import unittest
 from datetime import datetime
+from functools import partial
 from pathlib import Path
 from typing import NamedTuple, final, override
 from unittest import mock
@@ -653,10 +654,12 @@ class RenumberTests(unittest.TestCase):
     def test_check_reports_whether_changes_are_needed(self) -> None:
         _ = self.fixture.add("issue.md", issue_text())
         output = io.StringIO()
+        lock_path = self.fixture.vault / "locks" / "writer.lock"
+        acquire_lock = partial(writer_lock.acquire_writer_lock, lock_path)
 
         with (
             mock.patch.object(renumber, "PRODUCTION_SCOPE", self.fixture.scope),
-            mock.patch.dict(os.environ, {"PRIORITIZE_WRITER_LOCK_ROOT": str(self.fixture.vault / "locks")}),
+            mock.patch.object(writer_lock, "acquire_writer_lock", acquire_lock),
         ):
             with contextlib.redirect_stdout(output):
                 self.assertEqual(renumber.main(["--check"]), 1)
@@ -664,6 +667,8 @@ class RenumberTests(unittest.TestCase):
                 self.assertEqual(renumber.main(["--apply"]), 0)
             with contextlib.redirect_stdout(io.StringIO()):
                 self.assertEqual(renumber.main(["--check"]), 0)
+
+        self.assertTrue(lock_path.is_file())
 
     def test_require_complete_fails_only_for_unassessed_open_issues(self) -> None:
         missing_values = dict(DEFAULT_VALUES)
