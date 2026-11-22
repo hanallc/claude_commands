@@ -765,6 +765,7 @@ class NoGateRecovery:
 
 ACTIVE_GATE_RECOVERY: ContextVar[GateRecovery | NoGateRecovery] = ContextVar(
     "merge_gate_recovery", default=NoGateRecovery())
+_reported_foreign_gate_refusals: set[tuple[int, Path]] = set()
 
 
 def gate_run_directory(repo: Path) -> Path:
@@ -776,46 +777,61 @@ def recover_gate_runs(repo: Path) -> None:
     current = ACTIVE_GATE_RECOVERY.get()
     if isinstance(current, GateRecovery) and current.repo == str(repo.resolve()) and current.pid == os.getpid():
         return
-    root = gate_state_dir() / "active-runs"
+    own_directory = gate_run_directory(repo)
+    root = own_directory.parent
     if not root.exists():
         return
     for directory in sorted(root.iterdir()):
         if directory.is_dir():
-            recover_gate_directory(directory)
+            recover_gate_directory(directory, own_directory=own_directory)
 
 
-def recover_gate_directory(directory: Path) -> None:
+def recover_gate_directory(directory: Path, *, own_directory: Path) -> None:
     """Recover dead owners while holding the directory lock."""
     descriptor = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
     try:
         fcntl.flock(descriptor, fcntl.LOCK_EX)
         for path in sorted(directory.glob("*.json")):
-            data = cast(dict[str, object], json.loads(path.read_text()))
-            if data.get("finished") is True:
-                continue
-            pid, start = cast(int, data["pid"]), cast(str, data["start"])
-            owner = process_start(pid)
-            if isinstance(owner, Unreadable):
-                raise GateRefused(f"cannot recover gate {pid}: {owner.reason}")
-            if isinstance(owner, Started) and owner.start == start:
-                continue
-            groups = cast(dict[str, str], data["groups"])
-            tokens = [HeldGateToken(cast(str, token["path"]), cast(int, token["device"]),
-                                    cast(int, token["inode"]), cast(str, token["value"]))
-                      for token in cast(list[dict[str, object]], data["tokens"])]
-            folders = [entry if isinstance(entry, str) else cast(dict[str, str], entry)["path"]
-                       for entry in cast(list[object], data["folders"])]
-            recovery = GateRecovery(path, cast(str, data["repo"]), pid, start,
-                                    {int(group): identity for group, identity in groups.items()},
-                                    folders, tokens, cast(str, data["rollback"]),
-                                    cast(str, data["rollback_head"]), cast(str, data["rollback_source"]))
-            active = ACTIVE_GATE_RECOVERY.set(recovery)
             try:
-                recovery.recover()
-            finally:
-                ACTIVE_GATE_RECOVERY.reset(active)
+                recover_gate_record(path)
+            except GateRefused as error:
+                if directory == own_directory:
+                    raise
+                report_key = (os.getpid(), path)
+                if report_key not in _reported_foreign_gate_refusals:
+                    reason = " ".join(str(error).splitlines())
+                    print(f"Gate recovery kept {str(path)!r}: {reason}", file=sys.stderr)
+                    _reported_foreign_gate_refusals.add(report_key)
     finally:
         os.close(descriptor)
+
+
+def recover_gate_record(path: Path) -> None:
+    """Recover one record under its directory lock."""
+    data = cast(dict[str, object], json.loads(path.read_text()))
+    if data.get("finished") is True:
+        return
+    pid, start = cast(int, data["pid"]), cast(str, data["start"])
+    owner = process_start(pid)
+    if isinstance(owner, Unreadable):
+        raise GateRefused(f"cannot recover gate {pid}: {owner.reason}")
+    if isinstance(owner, Started) and owner.start == start:
+        return
+    groups = cast(dict[str, str], data["groups"])
+    tokens = [HeldGateToken(cast(str, token["path"]), cast(int, token["device"]),
+                            cast(int, token["inode"]), cast(str, token["value"]))
+              for token in cast(list[dict[str, object]], data["tokens"])]
+    folders = [entry if isinstance(entry, str) else cast(dict[str, str], entry)["path"]
+               for entry in cast(list[object], data["folders"])]
+    recovery = GateRecovery(path, cast(str, data["repo"]), pid, start,
+                            {int(group): identity for group, identity in groups.items()},
+                            folders, tokens, cast(str, data["rollback"]),
+                            cast(str, data["rollback_head"]), cast(str, data["rollback_source"]))
+    active = ACTIVE_GATE_RECOVERY.set(recovery)
+    try:
+        recovery.recover()
+    finally:
+        ACTIVE_GATE_RECOVERY.reset(active)
 
 
 @contextmanager
