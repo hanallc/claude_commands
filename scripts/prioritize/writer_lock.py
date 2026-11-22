@@ -11,24 +11,33 @@ import time
 from collections.abc import Generator, Sequence
 from contextlib import contextmanager
 from pathlib import Path
-from typing import cast
+from typing import Literal, cast
 
 
-LOCK_PATH = Path("/tmp/hanadocs-prioritize/writer.lock")
+DEFAULT_WRITER_LOCK_ROOT = Path("/tmp/hanadocs-prioritize")
 
 
 class WriterLockError(RuntimeError):
     """The shared writer lock could not be acquired safely."""
 
 
+def _lock_file(path: Path | Literal["shared"]) -> Path:
+    if isinstance(path, Path):
+        return path
+    override = os.environ.get("PRIORITIZE_WRITER_LOCK_ROOT")
+    root = Path(override) if override else DEFAULT_WRITER_LOCK_ROOT
+    return root / "writer.lock"
+
+
 @contextmanager
 def acquire_writer_lock(
-    path: Path = LOCK_PATH,
+    path: Path | Literal["shared"] = "shared",
     *,
     timeout_seconds: float = 30.0,
 ) -> Generator[None]:
     """Acquire an OS-released exclusive lock, waiting for a bounded interval."""
 
+    path = _lock_file(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     descriptor = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
     os.fchmod(descriptor, 0o600)
@@ -58,9 +67,10 @@ def acquire_writer_lock(
             _ = os.close(descriptor)
 
 
-def lock_is_held(path: Path = LOCK_PATH) -> bool:
+def lock_is_held(path: Path | Literal["shared"] = "shared") -> bool:
     """Return whether another process currently owns the writer lock."""
 
+    path = _lock_file(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     descriptor = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
     try:

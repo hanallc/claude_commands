@@ -654,7 +654,10 @@ class RenumberTests(unittest.TestCase):
         _ = self.fixture.add("issue.md", issue_text())
         output = io.StringIO()
 
-        with mock.patch.object(renumber, "PRODUCTION_SCOPE", self.fixture.scope):
+        with (
+            mock.patch.object(renumber, "PRODUCTION_SCOPE", self.fixture.scope),
+            mock.patch.dict(os.environ, {"PRIORITIZE_WRITER_LOCK_ROOT": str(self.fixture.vault / "locks")}),
+        ):
             with contextlib.redirect_stdout(output):
                 self.assertEqual(renumber.main(["--check"]), 1)
             with contextlib.redirect_stdout(io.StringIO()):

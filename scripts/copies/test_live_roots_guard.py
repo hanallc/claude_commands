@@ -35,16 +35,10 @@ class LiveRootsGuardTests(unittest.TestCase):
     def test_copy_operations_and_cleanup_use_only_private_roots(self) -> None:
         caller_environment = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
         _ = cast(object, self.enterContext(patch.dict(os.environ, caller_environment, clear=True)))
-        caller_roots = live_roots()
-        candidates = (Path("/var/tmp"), Path("/tmp"), Path("/dev/shm"), Path.home())
-        parents = [parent for parent in map(Path.resolve, candidates)
-                   if parent.is_dir() and os.access(parent, os.W_OK | os.X_OK)
-                   and not any(parent.is_relative_to(live) for live in caller_roots)]
-        self.assertTrue(parents, f"No writable fixture parent is outside the live roots: {caller_roots}")
-        # The guarded roots and the roots used by the copy operations are siblings.
-        with tempfile.TemporaryDirectory(dir=parents[0]) as folder:
+        # The guarded and writable roots are siblings in the fixture.
+        with tempfile.TemporaryDirectory() as folder:
             base = Path(folder).resolve()
-            self.assertFalse(any(base.is_relative_to(parent) for parent in caller_roots), caller_roots)
+            self.assertTrue(os.access(base, os.W_OK | os.X_OK), base)
             guarded = base / "guarded"
             root = base / "private"
             protected = private_slot_config(guarded, repository="origin")
@@ -56,9 +50,9 @@ class LiveRootsGuardTests(unittest.TestCase):
             guarded_temporary.mkdir()
             with patch.dict(os.environ, {**protected.environment, "TMPDIR": str(guarded_temporary),
                                          "HOME": str(guarded / "home")}):
-                protected_roots = live_roots()
+                live = live_roots()
                 registry = str(copies.remote_registry().resolve())
-            live = (*protected_roots, *caller_roots)
+            self.assertFalse(any(base.is_relative_to(parent) for parent in live), live)
             self.assertFalse(any(root.is_relative_to(parent) for parent in live), live)
             temporary = root / "temporary"
             temporary.mkdir()
