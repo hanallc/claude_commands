@@ -23,14 +23,6 @@ def output(args: list[str], cwd: str, timeout: float) -> str | None:
     return result.stdout if result.returncode == 0 else None
 
 
-def repository_key_case(key: str) -> str:
-    """Fold the path of a GitHub repository key."""
-    prefix, separator, path = key.removeprefix("https://").partition("/")
-    if key.startswith("https://") and prefix.partition(":")[0] == "github.com":
-        return f"https://{prefix}{separator}{path.lower()}"
-    return key
-
-
 def remote_identity(remote: str, directory: str) -> str:
     """Normalize a remote URL or path to the repository key."""
     if "://" not in remote and ":" in remote and not remote.startswith(("/", ".")):
@@ -39,7 +31,7 @@ def remote_identity(remote: str, directory: str) -> str:
         if (hostname and (host == hostname or host == f"git@{hostname}")
                 and hostname.isascii() and all(letter.isalnum() or letter in ".-" for letter in hostname)
                 and not any(letter in path for letter in "?#\r\n\t")):
-            return repository_key_case(f"https://{hostname.lower()}{('/' + path).rstrip('/').removesuffix('.git')}")
+            return f"https://{hostname.lower()}{('/' + path).rstrip('/').removesuffix('.git')}"
         remote = f"ssh://{host}/{path}"
     from urllib.parse import urlsplit, urlunsplit
 
@@ -47,7 +39,7 @@ def remote_identity(remote: str, directory: str) -> str:
     if parsed.hostname:
         path = parsed.path.rstrip("/").removesuffix(".git")
         port = f":{parsed.port}" if parsed.port and parsed.port not in (22, 443) else ""
-        return repository_key_case(urlunsplit(("https", parsed.hostname.lower() + port, path, "", "")))
+        return urlunsplit(("https", parsed.hostname.lower() + port, path, "", ""))
     path = Path(parsed.path if parsed.scheme == "file" else remote).expanduser()
     if not path.is_absolute():
         path = Path(directory) / path

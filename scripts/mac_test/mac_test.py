@@ -97,7 +97,6 @@ from scripts.lib import process_start as process_identity
 from scripts.build_targets import target_config
 from scripts.build_targets.target_config import ConfigError
 from scripts.buildlog.mac_idle_alert import MacIdleConfigError, idle_config as idle_config
-from scripts.buildlog.repository import repository_key_case
 
 if TYPE_CHECKING:
     from scripts.build_queue.placement import SubmittingSession
@@ -746,7 +745,7 @@ def claim_scope_matches(paths: StatePaths, claim: HeldClaim, scope: ClaimScope) 
     if paths.platform == "linux":
         return scopes_overlap(claim.scope, scope)
     if isinstance(claim.scope, RepositoryScope) and isinstance(scope, RepositoryScope):
-        return bool(scope.key) and repository_key_case(claim.scope.key) == repository_key_case(scope.key)
+        return bool(scope.key) and claim_state.mac_claim_key(claim.scope.key) == claim_state.mac_claim_key(scope.key)
     return isinstance(scope, WholeMacScope) and claim.path == paths.run and claim.scope == scope
 
 
@@ -778,7 +777,7 @@ def wait_claim_matches(paths: StatePaths, claim: HeldClaim, scope: ClaimScope, w
 
 def claim_blocks_scope(paths: StatePaths, claim: HeldClaim, scope: ClaimScope) -> bool:
     """Match a claim by scope or by the native mirror it holds."""
-    return scopes_overlap(claim.scope, scope) or (
+    return scopes_overlap(claim.scope, scope, mac=paths.platform == "macos") or (
         paths.platform == "macos" and isinstance(claim.scope, RepositoryScope) and not claim.scope.slot
         and isinstance(scope, RepositoryScope) and scope.name == claim.scope.name)
 
@@ -823,7 +822,7 @@ def mac_claim_slot(paths: StatePaths, scope: RepositoryScope, claims: tuple[Held
                    *, kind: MacClaimKind, mirror_name: str = "") -> RepositoryScope | MacClaimSlotsBusy:
     """Select a claim file within the shared repository limit."""
     repository = RepositoryScope(scope.name, scope.key)
-    overlapping = tuple(claim for claim in claims if scopes_overlap(claim.scope, repository))
+    overlapping = tuple(claim for claim in claims if scopes_overlap(claim.scope, repository, mac=True))
     whole_mac = tuple(claim for claim in overlapping if isinstance(claim.scope, WholeMacScope))
     if whole_mac:
         return MacClaimSlotsBusy(whole_mac)
@@ -2025,7 +2024,7 @@ def claim_once(args: CliArguments, paths: StatePaths, scope: ClaimScope,
         return ClaimDenied(12, f"state unreadable: {error.path}")
     if isinstance(replaces, _VerifiedMacReservation):
         claims = tuple(claim for claim in claims if claim.path != replaces.path)
-    overlapping = tuple(claim for claim in claims if scopes_overlap(claim.scope, scope))
+    overlapping = tuple(claim for claim in claims if scopes_overlap(claim.scope, scope, mac=paths.platform == "macos"))
     identity = claim_state.ClaimIdentity(args.claim_id, args.episode, args.attempt)
     try:
         block = blocking_claim_block(paths, session)
@@ -2203,7 +2202,7 @@ def replace_incomplete_wait_claim(
     proof = claim_state.retired_mac_reservation_path(paths, identity)
     if isinstance(assignment, UnassignedClaim):
         scope = RepositoryScope(repository.mirror_name, repository.key)
-    elif not isinstance(scope, RepositoryScope) or repository_key_case(scope.key) != repository_key_case(repository.key):
+    elif not isinstance(scope, RepositoryScope) or claim_state.mac_claim_key(scope.key) != claim_state.mac_claim_key(repository.key):
         if isinstance(replaces, _VerifiedMacReservation):
             replaces.path.unlink()
         proof.unlink(missing_ok=True)
@@ -2382,7 +2381,7 @@ def command_claim(args: CliArguments, paths: StatePaths, *, watch_claim: bool = 
             return 12
         if paths.platform == "macos" and isinstance(scope, RepositoryScope) and not args.from_pid:
             if (not isinstance(mac_repository, claim_state.MacMirrorIdentity)
-                    or (scope.key and repository_key_case(scope.key) != repository_key_case(mac_repository.key))):
+                    or (scope.key and claim_state.mac_claim_key(scope.key) != claim_state.mac_claim_key(mac_repository.key))):
                 print("the assigned Mac repository has changed", file=sys.stderr)
                 return 12
             # Keep the mirror file name for an assignment from an older client.
@@ -2484,6 +2483,7 @@ def same_cleanup_claim(current: RunRecord, record: RunRecord) -> bool:
 def release_exact_claims(
     paths: StatePaths, pid: int, identity: claim_state.ClaimIdentity, settings: str, *,
     provider_lock_held: bool = False, remote_work: EndStoppedWork | KeepRemoteWork = KEEP_REMOTE_WORK,
+    finish_wait: bool = False,
 ) -> ClaimsReleased | ClaimReleaseRefused:
     """Release the claims that pid holds under identity, after their remote start fence settles."""
     from scripts.mac_test import eligibility, offload
@@ -2561,7 +2561,10 @@ def release_exact_claims(
                     return ClaimReleaseRefused(str(error))
                 transfers.extend(current.get("transfers", []))
                 pending.unlink(missing_ok=True)
-                path.unlink(missing_ok=True)
+                if finish_wait and "remote_host" not in current:
+                    claim_state.record_wait_removal(paths, identity, path)
+                else:
+                    path.unlink(missing_ok=True)
     with nullcontext() if provider_lock_held else locked(paths.lock):
         block_present = not isinstance(read_block(paths.block), NoMacBlock)
     if block_present:
@@ -2569,9 +2572,10 @@ def release_exact_claims(
     return ClaimsReleased(len(owned), tuple(transfers))
 
 
-def command_release(args: CliArguments, paths: StatePaths, *, provider_lock_held: bool = False) -> int:
+def command_release(args: CliArguments, paths: StatePaths, *, provider_lock_held: bool = False,
+                    finish_wait: bool = False) -> int:
     released = release_exact_claims(paths, args.pid, claim_state.ClaimIdentity(args.claim_id, args.episode, args.attempt),
-                                    args.settings, provider_lock_held=provider_lock_held)
+                                    args.settings, provider_lock_held=provider_lock_held, finish_wait=finish_wait)
     if isinstance(released, ClaimReleaseRefused):
         print(f"cannot release: {released.reason}", file=sys.stderr)
         return 12

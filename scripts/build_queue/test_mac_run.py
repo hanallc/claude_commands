@@ -465,11 +465,12 @@ sys.exit(71)
             config = self.root / scope
             _ = config.write_text(f'[url "git@github.com:"]\n insteadOf = {scope.lower()}:\n')
             self.enterContext(mock.patch.dict(os.environ, {f"GIT_CONFIG_{scope}": str(config)}))
-        upstream = self.repository("hana", origin="https://github.com/team/hana")
+        upstream = self.repository("hana", origin="https://github.com/Team/Hana")
         native = self.native_claim(upstream)
         self.assertEqual(mac_test.command_claim(native, self.paths, watch_claim=False), 0)
         self.addCleanup(mac_test.command_release, native, self.paths)
         for name, origin in (
+            ("case-only", "https://github.com/team/hana"),
             ("global-alias", "global:team/hana.git"),
             ("worktree-global-alias", "global:team/hana.git"),
             ("worktree-system-alias", "system:team/hana.git"),
@@ -819,11 +820,14 @@ sys.exit(71)
     def test_release_wait_reports_its_damaged_reservation_without_a_proof(self) -> None:
         self.exercise_interrupted_replacement(("release-damaged-before-permission",))
 
-    def test_release_wait_reports_damage_on_mac_and_linux(self) -> None:
+    def add_linux_release_target(self) -> None:
         targets = self.root / "build_targets.conf"
         _ = targets.write_text(targets.read_text().replace("targets=natedev,mac", "targets=natedev,mac,linux")
                                + "kind.linux=ssh\nplatform.linux=linux\nsettings.linux=linux.conf\n")
         _ = (self.root / "linux.conf").write_text("offload=on\nslots.claude_commands=1\n")
+
+    def test_release_wait_reports_damage_on_mac_and_linux(self) -> None:
+        self.add_linux_release_target()
         with mock.patch.dict(os.environ, {"BUILD_TARGETS_STATE_DIR": str(self.root / "target-state")}):
             for target in ("mac", "linux"):
                 with self.subTest(target=target):
@@ -848,6 +852,50 @@ sys.exit(71)
                     if target == "mac":
                         _ = paths.run.write_bytes(b"{")
 
+    def test_release_wait_names_the_invalid_mac_repository_file(self) -> None:
+        waiter = self.native_claim(self.checkout)
+        self.assertEqual(mac_test.command_claim(waiter, self.paths, watch_claim=False), 0)
+        claim, = claim_state.read_claims(self.paths)
+        damaged = json.dumps({**claim.record, "mac_repository": None}).encode()
+        _ = claim.path.write_bytes(damaged)
+        identity = claim_state.claim_identity(claim.record)
+        with redirect_stderr(StringIO()) as diagnostic:
+            self.assertEqual(build_targets.command_release_wait(waiter.pid, identity=identity), 1)
+        self.assertIn(f"{claim.path}: invalid Mac repository identity", diagnostic.getvalue())
+        self.assertEqual(claim.path.read_bytes(), damaged)
+
+    def test_repeated_release_wait_skips_a_reused_slot_on_mac_and_linux(self) -> None:
+        self.add_linux_release_target()
+        with mock.patch.dict(os.environ, {"BUILD_TARGETS_STATE_DIR": str(self.root / "target-state")}):
+            for target in ("mac", "linux"):
+                with self.subTest(target=target):
+                    paths = claim_state.state_paths(target)
+                    waiter = self.native_claim(self.checkout)
+                    waiter.target, waiter.claim_id = target, f"{target}-first"
+                    self.assertEqual(mac_test.command_claim(waiter, paths, watch_claim=False), 0)
+                    first, = claim_state.read_claims(paths)
+                    identity = claim_state.claim_identity(first.record)
+                    pending = claim_state.claim_pending_start(paths, first.path, first.record)
+                    if target == "linux":
+                        pending.parent.mkdir(parents=True, exist_ok=True)
+                        pending.touch()
+                    self.assertEqual(build_targets.command_release_wait(waiter.pid, identity=identity), 0)
+                    self.assertFalse(first.path.exists())
+                    self.assertFalse(pending.exists())
+                    later = self.native_claim(self.checkout)
+                    later.target, later.claim_id = target, f"{target}-later"
+                    self.assertEqual(mac_test.command_claim(later, paths, watch_claim=False), 0)
+                    second, = claim_state.read_claims(paths)
+                    self.assertEqual(second.path, first.path)
+                    original = second.path.read_bytes()
+                    _ = second.path.write_bytes(b"{")
+                    with redirect_stderr(StringIO()) as diagnostic:
+                        self.assertEqual(build_targets.command_release_wait(waiter.pid, identity=identity), 0)
+                    self.assertEqual(diagnostic.getvalue(), "")
+                    self.assertEqual(second.path.read_bytes(), b"{")
+                    _ = second.path.write_bytes(original)
+                    self.assertEqual(mac_test.command_release(later, paths), 0)
+
     def test_repeated_release_wait_skips_unrelated_damage(self) -> None:
         waiter = self.native_claim(self.checkout)
         self.assertEqual(mac_test.command_claim(waiter, self.paths, watch_claim=False), 0)
@@ -864,6 +912,9 @@ sys.exit(71)
 
     def test_release_wait_revokes_a_retry_with_an_unrelated_damaged_claim(self) -> None:
         self.exercise_interrupted_replacement(("release-with-damaged-claim",))
+
+    def test_release_wait_uses_the_proof_before_a_damaged_location(self) -> None:
+        self.exercise_interrupted_replacement(("release-with-damaged-location",))
 
     def test_sweep_removes_a_retry_proof_when_the_waiter_ends(self) -> None:
         self.exercise_interrupted_replacement(("waiter-ended",))
@@ -903,16 +954,20 @@ if checkpoint in ("committed", "legacy-launched"):
     args.pid = os.getpid()
 paths = mac_test.state_paths("mac")
 unlink = Path.unlink
+replace = Path.replace
 write_json = mac_test.write_json
 
 def interrupt_unlink(self, *args, **kwargs):
     if checkpoint in ("retire", "legacy-launched") and self == old:
         os._exit(71)
-    if checkpoint == "release-before-claim-removal" and self == old:
-        os._exit(75)
     if checkpoint == "release-before-proof-removal" and self.parent == paths.retired_reservations:
         os._exit(75)
     return unlink(self, *args, **kwargs)
+
+def interrupt_replace(self, *args, **kwargs):
+    if checkpoint == "release-before-claim-removal" and self == old:
+        os._exit(75)
+    return replace(self, *args, **kwargs)
 
 def interrupt_write(path, record):
     if checkpoint == "fresh-write" and "remote_host" in record:
@@ -924,7 +979,8 @@ def interrupt_write(path, record):
     if checkpoint == "committed" and "remote_host" in record and "replaced_reservation" not in record:
         os._exit(73)
 
-with patch.object(Path, "unlink", interrupt_unlink), patch.object(mac_test, "write_json", interrupt_write):
+with patch.object(Path, "unlink", interrupt_unlink), patch.object(Path, "replace", interrupt_replace), \
+        patch.object(mac_test, "write_json", interrupt_write):
     if checkpoint in ("release-before-proof-removal", "release-before-claim-removal"):
         identity = claim_state.ClaimIdentity(args.claim_id, args.episode, args.attempt)
         sys.exit(build_targets.command_release_wait(args.from_pid, identity=identity, session=NoOwningSession()))
@@ -1077,10 +1133,10 @@ with patch.object(Path, "unlink", interrupt_unlink), patch.object(mac_test, "wri
                         self.assertEqual(proof.exists(), isinstance(start, process_identity.Unreadable))
                     continue
                 if recovery in ("release-wait", "release-unreadable", "release-before-unlink",
-                                "release-with-damaged-claim"):
+                                "release-with-damaged-claim", "release-with-damaged-location"):
                     proof = claim_state.retired_mac_reservation_path(self.paths, identity)
                     self.assertTrue(proof.exists())
-                    self.assertEqual(old_path.exists(), recovery in ("release-before-unlink", "release-with-damaged-claim"))
+                    self.assertEqual(old_path.exists(), recovery not in ("release-wait", "release-unreadable"))
                     if recovery == "release-unreadable":
                         saved_proof = cast(dict[str, object], json.loads(proof.read_text()))
                         _ = saved_proof.pop("reservation_file")
@@ -1095,14 +1151,17 @@ with patch.object(Path, "unlink", interrupt_unlink), patch.object(mac_test, "wri
                     if recovery == "release-with-damaged-claim":
                         _ = damaged.write_text("{")
                         location.unlink()
+                    if recovery == "release-with-damaged-location":
+                        _ = location.write_text("{")
                     with (mock.patch.object(process_identity, "process_start", return_value=start),
                           mock.patch.object(claim_state, "read_json_object", wraps=claim_state.read_json_object) as reads):
                         self.assertEqual(build_targets.command_release_wait(waiting.pid, identity=identity), 0)
                     self.assertIsInstance(claim_state.read_retired_mac_reservation(self.paths, identity),
                                           claim_state.NoSavedRetryPermission)
-                    if recovery == "release-with-damaged-claim":
-                        self.assertEqual(reads.call_args_list, [mock.call(proof), mock.call(location), mock.call(old_path)])
+                    if recovery in ("release-with-damaged-claim", "release-with-damaged-location"):
+                        self.assertEqual(reads.call_args_list, [mock.call(proof), mock.call(old_path)])
                         self.assertEqual(build_targets.command_release_wait(waiting.pid, identity=identity), 0)
+                    if recovery == "release-with-damaged-claim":
                         self.assertEqual(damaged.read_text(), "{")
                         damaged.unlink()
                     child = subprocess.run([sys.executable, "-c", script, "none", str(old_path), *command[2:]],

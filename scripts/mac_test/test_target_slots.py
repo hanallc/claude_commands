@@ -20,6 +20,7 @@ from types import FrameType
 from typing import cast, override
 
 from scripts.build_hold.owning_session import NoOwningSession
+from scripts.buildlog import repository
 from scripts.lib import process_start as process_identity
 from scripts.lib.git_test_support import commit_repository
 from scripts.lib.process_start_test_support import process_reader
@@ -50,12 +51,16 @@ class RepositoryKeyTests(unittest.TestCase):
                               capture_output=True, text=True).stdout.strip()
 
     def test_real_origin_forms_keep_the_normalized_repository_key(self) -> None:
-        expected = eligibility.KnownRepository("project", "https://github.com/nate/project")
-        for remote in ("git@GitHub.com:Nate/Project.git", "https://github.com/NATE/Project.git",
-                       "ssh://git@github.com:22/nate/PROJECT.git"):
+        expected = eligibility.KnownRepository("project", "https://github.com/Nate/Project")
+        for remote in ("git@GitHub.com:Nate/Project.git", "https://github.com/Nate/Project.git",
+                       "ssh://git@github.com:22/Nate/Project.git"):
             with self.subTest(remote=remote):
                 _ = self.git("config", "remote.origin.url", remote)
                 self.assertEqual(eligibility.repository_identity(self.root), expected)
+
+    def test_repository_key_keeps_github_path_case(self) -> None:
+        _ = self.git("config", "remote.origin.url", "https://github.com/Team/Hana.git")
+        self.assertEqual(repository.repository_key(str(self.root)), "https://github.com/Team/Hana")
 
     def test_other_hosts_keep_repository_case(self) -> None:
         for remote in ("git@fixture.invalid:Team/Project.git", "https://fixture.invalid/Team/Project.git"):
@@ -263,7 +268,8 @@ class RepositorySlotTests(unittest.TestCase):
 
         known = [identity for identity in identities if isinstance(identity, eligibility.KnownRepository)]
         self.assertEqual(len(known), 3)
-        self.assertEqual(len({identity.key for identity in known}), 1)
+        self.assertEqual([identity.key for identity in known],
+                         ["https://github.com/Nate/Hana", "https://github.com/nate/hana", "https://github.com/Nate/Hana"])
         self.assertEqual([identity.name for identity in known], ["hana", "phase-copy", "hana"])
         self.assertIsInstance(identities[0], eligibility.KnownRepository)
         self.assertEqual(cast(eligibility.KnownRepository, identities[0]).name, "hana")
@@ -287,7 +293,7 @@ class RepositorySlotTests(unittest.TestCase):
     def test_saved_github_key_in_mixed_case_still_holds_capacity(self) -> None:
         first = self.repository("first/hana", "https://github.com/Nate/Hana.git")
         second = self.repository("second/clone", "https://github.com/nate/hana.git")
-        with mock.patch("scripts.buildlog.repository.repository_key_case", side_effect=str):
+        with mock.patch.object(claim_state, "mac_claim_key", side_effect=str):
             self.assertEqual(self.claim("mac", first, 101)[0], 0)
         paths = mac_test.state_paths("mac")
         saved, = mac_test.read_claims(paths)

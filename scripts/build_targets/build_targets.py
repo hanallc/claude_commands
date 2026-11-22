@@ -1262,6 +1262,7 @@ def command_release_wait(pid: int, *,
             permission: claim_state.RetiredMacReservation | claim_state.NoSavedRetryPermission
             permission = claim_state.NO_SAVED_RETRY_PERMISSION
             reservation: Path | claim_state.UnrecordedReservationPath = claim_state.UnrecordedReservationPath()
+            matched = False
             try:
                 if paths.platform == "macos":
                     retired = claim_state.read_retired_mac_reservation(paths, identity)
@@ -1273,19 +1274,19 @@ def command_release_wait(pid: int, *,
                         release_start = retired.proc_start
                         reservation = retired.reservation
                 if release_start is not None or (paths.platform == "macos" and isinstance(start, process_identity.Unreadable)):
-                    location = claim_state.read_wait_location(paths, identity)
+                    if isinstance(reservation, claim_state.UnrecordedReservationPath):
+                        location = claim_state.read_wait_location(paths, identity)
+                        if isinstance(location, claim_state.ReleasedWaitReservation):
+                            located = True
+                            continue
+                        if isinstance(location, claim_state.WaitReservationLocation):
+                            if (location.pid != pid or location.submitting_session != session_id
+                                    or (release_start is not None and location.proc_start != release_start)):
+                                located = True
+                                continue
+                            reservation = location.path
                     if isinstance(reservation, Path):
                         located = True
-                        assert release_start is not None
-                        proven = claim_state.WaitReservationLocation(reservation, pid, release_start, session_id)
-                        if location != proven:
-                            claim_state.save_wait_location(paths, identity, proven)
-                    elif isinstance(location, claim_state.WaitReservationLocation):
-                        located = True
-                        if (location.pid != pid or location.submitting_session != session_id
-                                or (release_start is not None and location.proc_start != release_start)):
-                            continue
-                        reservation = location.path
                     for saved in claim_state.read_wait_reservations(paths, identity, reservation):
                         path, record = saved.path, saved.record
                         if record["pid"] != pid or record["submitting_session"] != session_id:
@@ -1293,7 +1294,9 @@ def command_release_wait(pid: int, *,
                         if release_start is not None and record["proc_start"] != release_start:
                             continue
                         located = True
-                        if isinstance(reservation, claim_state.UnrecordedReservationPath):
+                        matched = True
+                        if (isinstance(reservation, claim_state.UnrecordedReservationPath)
+                                or isinstance(permission, claim_state.RetiredMacReservation)):
                             claim_state.save_wait_location(paths, identity, claim_state.WaitReservationLocation.for_claim(path, record))
                         # A sweep must not restore permission after release removes it.
                         if ((release_start is None or isinstance(permission, claim_state.RetiredMacReservation))
@@ -1306,9 +1309,12 @@ def command_release_wait(pid: int, *,
                         else:
                             removable.append(path)
                 if isinstance(permission, claim_state.RetiredMacReservation):
-                    permission.path.unlink(missing_ok=True)
+                    if matched:
+                        permission.path.unlink(missing_ok=True)
+                    else:
+                        claim_state.record_wait_removal(paths, identity, permission.path)
                 for path in removable:
-                    path.unlink(missing_ok=True)
+                    claim_state.record_wait_removal(paths, identity, path)
             except claim_state.UnlocatedWaitReservation as error:
                 if unreadable is None:
                     unreadable = error
@@ -1322,7 +1328,7 @@ def command_release_wait(pid: int, *,
             release.pid, release.target, release.settings = pid, target.name, str(target.settings)
             release.claim_id = record["claim_id"]
             release.episode, release.attempt = record["episode"], record["attempt"]
-            status = mac_test.command_release(release, paths)
+            status = mac_test.command_release(release, paths, finish_wait=True)
             if status != 0:
                 return status
     if not located and unreadable is not None:
