@@ -25,6 +25,7 @@ from scripts.production.staff_test_support import (
     fixture_member, fixture_runtime_id, isolated_source_readers, isolated_staff_file, source_environment,
 )
 from scripts.production import investigation, staff, tidy_wrapped, update_registration
+from scripts.production.production_doc import production_backup_root
 from scripts.production.cli_fixture import ImmutableGitSeed, invoke_cli
 from scripts.copies import copies
 from scripts.copies.workspace_test_support import registered_workspace
@@ -302,7 +303,10 @@ class TidyWrappedTests(unittest.TestCase):
                                           "cleanup@example.invalid", {"Cargo.toml": "[workspace]\n", "file.txt": "content"}).checkout
         doc = self.doc("done", "wrapped")
         state = self.state_files("done")
-        with registered_workspace(str(self.owner("done").id), source, "HEAD", name="damaged", branch="worker") as tree:
+        owner = self.owner("done").id
+        legacy_log = state[-1].read_bytes()
+        backup = production_backup_root() / owner / "log-backups" / "log-1.md"
+        with registered_workspace(str(owner), source, "HEAD", name="damaged", branch="worker") as tree:
             pass
         record = tree / copy_record.RECORD
         original = record.read_text()
@@ -310,11 +314,13 @@ class TidyWrappedTests(unittest.TestCase):
         refused = self.run_tidy(doc)
         self.assertEqual(refused.returncode, 1, refused.stderr)
         self.assertIn(str(record), refused.stderr)
-        self.assertTrue(all(path.exists() for path in state))
+        self.assertTrue(all(path.exists() for path in state[:-1]))
+        self.assertEqual(backup.read_bytes(), legacy_log)
         _ = record.write_text(original)
         self.assertEqual(self.run_tidy(doc).returncode, 0)
         self.assertFalse(tree.exists())
         self.assertFalse(any(path.exists() for path in state))
+        self.assertEqual(backup.read_bytes(), legacy_log)
 
     def test_wrap_accepts_production_and_unit_names_that_cannot_own_copies(self) -> None:
         doc = self.doc("Done_Name", "wrapped")
