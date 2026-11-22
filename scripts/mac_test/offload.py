@@ -1411,6 +1411,11 @@ def write_result(
         if (not isinstance(result, HanaGuestEndedRun) or not isinstance(destination, ResultFile)
                 or os.environ.get('BUILDLOG_PINNED_TARGET') != target):
             print(f"mac_test: the {label} {result.detail}; local fallback requires admission")
+    elif isinstance(result, DeclinedMacRun) and result.reason == claim_state.MAC_HISTORY_KEY_UNAVAILABLE:
+        mac = "prelaunch_failed"
+        reason = result.reason
+        status = claim_state.MAC_HISTORY_KEY_UNAVAILABLE_STATUS
+        print(f"mac_test: {reason} (the checkout has no readable history key)", file=sys.stderr)
     else:
         mac = "declined"
         reason = result.detail if isinstance(result, DeclinedMacRun) and result.detail else result.reason
@@ -1680,6 +1685,8 @@ def read_claim_answer(result: CapturedCommandResult, *,
         return MacClaimNotConfirmed("state", "", "")
     if result.status == claim_state.LEGACY_WAIT_CLAIM_RELEASED:
         return LegacyWaitClaimReleased()
+    if result.status == claim_state.MAC_HISTORY_KEY_UNAVAILABLE_STATUS:
+        return MacClaimNotConfirmed(claim_state.MAC_HISTORY_KEY_UNAVAILABLE, result.stdout, result.stderr)
     slots = [line.removeprefix("slot: ") for line in result.stdout.splitlines() if line.startswith("slot: ")]
     if slots and (len(slots) != 1 or not slots[0].isascii() or not slots[0].isdecimal() or int(slots[0]) < 1):
         return MacClaimNotConfirmed("state", result.stdout, result.stderr)
@@ -3410,7 +3417,7 @@ def run_offload(
                 return declined("repo" if config.enabled else "off", started)
             executable = resolved.claim_repository(history_key=claim_state.mac_history_key(history_key))
             if not isinstance(executable, claim_state.MacRepositoryIdentity):
-                return declined("repo" if config.enabled else "off", started)
+                return declined(claim_state.MAC_HISTORY_KEY_UNAVAILABLE if config.enabled else "off", started)
             mac_repository = policy_repository = executable
     decision = eligibility.mac_step_eligibility(config, request.repo_root, request.package, request.verb,
                                                request.target, kind=request.kind, mac_repository=policy_repository)
@@ -3520,6 +3527,8 @@ def adopt_wait_for_cleanup(controller: ProcessController, config: OffloadConfig,
 
 def claim_refusal(controller: ProcessController, request: OffloadRequest, claim: MacClaimNotConfirmed,
                   started: float, *, claim_from_wait: bool) -> BusyMacDecline | DeclinedMacRun:
+    if claim.reason == claim_state.MAC_HISTORY_KEY_UNAVAILABLE:
+        return declined(claim.reason, started)
     if claim.reason in ("busy", "blocked"):
         controller.attempt_evidence.provider = placement.NoProviderClaim()
     if not decline_already_shown(claim.reason, request.last_decline):
@@ -3822,6 +3831,9 @@ def report_placement_result(controller: ProcessController, request: OffloadReque
     if not isinstance(request.placement, AssignedOffloadRequest):
         return
     assigned = request.placement.assignment
+    if isinstance(result, DeclinedMacRun) and result.reason == claim_state.MAC_HISTORY_KEY_UNAVAILABLE:
+        _ = admission_client.cancel_placement(wire.CancelPlacement(uuid.uuid4().hex, assigned.episode, assigned.owner, result.reason))
+        return
     evidence = controller.attempt_evidence
     provider = evidence.provider
     if (isinstance(provider, placement.ProviderClaimReference)

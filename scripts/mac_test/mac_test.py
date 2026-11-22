@@ -2247,6 +2247,8 @@ def replace_incomplete_wait_claim(
     replaces: _VerifiedMacReservation | _KeepOtherReservations,
 ) -> ClaimAttempt:
     """Acquire a Mac claim under the execution lease."""
+    if isinstance(repository, claim_state.CleanupOnlyMacRepository):
+        return ClaimDenied(claim_state.MAC_HISTORY_KEY_UNAVAILABLE_STATUS, claim_state.MAC_HISTORY_KEY_UNAVAILABLE)
     if not isinstance(repository, claim_state.MacRepositoryIdentity):
         return ClaimDenied(12, "the replacement Mac claim needs a repository and history key")
     identity = claim_state.ClaimIdentity(args.claim_id, args.episode, args.attempt)
@@ -2355,6 +2357,8 @@ def adopt_wait_claim(args: CliArguments, paths: StatePaths, scope: ClaimScope,
             return blocked_claim(block)
         if paths.platform == "macos" and not isinstance(saved, claim_state.MacRepositoryIdentity):
             if not args.retire_wait:
+                if isinstance(saved, claim_state.CleanupOnlyMacRepository):
+                    return ClaimDenied(claim_state.MAC_HISTORY_KEY_UNAVAILABLE_STATUS, claim_state.MAC_HISTORY_KEY_UNAVAILABLE)
                 return ClaimDenied(12, "the Mac reservation needs retirement under the execution lease")
             return replace_incomplete_wait_claim(args, paths, scope, assignment, session, mac_repository,
                                                  _VerifiedMacReservation(claim.path, claim.record))

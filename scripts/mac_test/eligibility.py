@@ -32,6 +32,7 @@ def step_kind(verb: str) -> str:
 NonBusyMacDeclineReason = Literal[
     "off",
     "repo",
+    "history_key_unavailable",
     "linux_only",
     "backoff",
     "blocked",
