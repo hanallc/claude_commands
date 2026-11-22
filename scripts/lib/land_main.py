@@ -85,6 +85,7 @@ class NoTimeLimit:
 
 
 UNLIMITED_GIT = NoTimeLimit()
+ALLOWED_GIT_SETTINGS = frozenset({"core.fsync"})
 
 
 def _git_quote(value: str) -> str:
@@ -99,6 +100,9 @@ def _git_config_environment(git_config: Sequence[str]) -> dict[str, str] | None:
     parameters = [environment.get("GIT_CONFIG_PARAMETERS", "")]
     for setting in git_config:
         key, separator, value = setting.partition("=")
+        if key.lower() not in ALLOWED_GIT_SETTINGS:
+            allowed = ", ".join(sorted(ALLOWED_GIT_SETTINGS))
+            raise LandError(f"Git setting {key!r} is forbidden. Allowed settings are {allowed}.")
         quoted_value = _git_quote(value) if separator else ""
         parameters.append(f"{_git_quote(key)}={quoted_value}")
     environment["GIT_CONFIG_PARAMETERS"] = " ".join(filter(None, parameters))

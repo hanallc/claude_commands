@@ -75,8 +75,8 @@ if [ -f "$TEST_HOOK_FAIL" ]; then exit 9; fi
 
     def test_landing_git_commands_use_only_the_requested_config(self) -> None:
         inherited = "'core.fsync'='none'"
-        settings = ("core.fsync=committed", "fixture.message=Let's land! key=value", "fixture.flag")
-        appended = r"'core.fsync'='committed' 'fixture.message'='Let'\''s land'\!' key=value' 'fixture.flag'="
+        settings = ("Core.Fsync=committed",)
+        appended = "'Core.Fsync'='committed'"
         for use_config in (True, False):
             with self.subTest(use_config=use_config), mock.patch.dict(os.environ, {"GIT_CONFIG_PARAMETERS": inherited}):
                 commit = self.next_commit(f"Config {use_config}\n")
@@ -94,6 +94,15 @@ if [ -f "$TEST_HOOK_FAIL" ]; then exit 9; fi
                     commands.assert_any_call(command, capture_output=True, text=True, check=False,
                                              timeout=None, env=expected_environment)
                 self.assertEqual(os.environ["GIT_CONFIG_PARAMETERS"], inherited)
+
+    def test_landing_refuses_hook_settings_before_running_git(self) -> None:
+        for key in ("core.hooksPath", "hook.secret-check.event"):
+            with self.subTest(key=key), mock.patch.object(subprocess, "run") as commands:
+                with self.assertRaises(land_main.LandError) as error:
+                    _ = land_main.land(self.repo, "HEAD", git_config=(f"{key}=invalid",))
+                self.assertIn(key, str(error.exception))
+                self.assertIn("core.fsync", str(error.exception))
+                commands.assert_not_called()
 
     def test_a_failed_hook_keeps_the_cli_successful_and_retries_on_the_same_tip(self) -> None:
         self.install_hook()
