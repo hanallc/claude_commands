@@ -1219,3 +1219,18 @@ Ordered after the red main repair and the guard repair (builds). It does not mov
 - **Files:** `scripts/production/gate.py`; `scripts/production/test_gate.py` (or the test module that holds the recovery tests); `docs/as-built/merge-gate-and-test-speed.md` if it describes recovery.
 - **Workers:** 1 writer.
 - **Acceptance gate:** fixtures: a refusing record in another checkout is reported and kept while the gate runs; a refusing record in the own checkout still refuses; the recovery test module passes in one tests-only gate; basedpyright zero on changed files; one blind review.
+
+### Phase 426 — an ended Mac gate attempt with a receipt clears its journal  · status: todo
+**Depends on:** none
+**Blocked by:** nate's 22:35 session restart (builds 22:13: start after the restart)
+
+#### Work Order
+- **Goal:** a Mac gate attempt that ended with a receipt and a kept checkout no longer leaves process groups in its journal. builds 22:13 (anomaly from sdlc and devtools): the nosiggate run that stopped on EPERM at about 21:45 EST still lists four process groups; the gate folder is gone.
+- **Spec:**
+  1. `scripts/mac_test/mac_gate.py:234` reads `cleanup_paths = cloud_gate.read(receipt)` and calls `stop_guest(folder, deadline)` only when the receipt is missing (`FileNotFoundError`). An attempt with a receipt never clears its journal rows.
+  2. For an ended attempt with a receipt, also check each journal process group (pid plus start), stop the live ones as `stop_guest` does, then remove the journal row. Reuse `stop_guest`'s group step; copy no code.
+  3. The same when the gate folder is already absent (`folder.exists()` false at `:227`): the journal rows of that attempt are still cleared.
+  4. No config key changes; no check goes away.
+- **Files:** `scripts/mac_test/mac_gate.py`; its test module; the as-built doc that describes Mac gate cleanup.
+- **Workers:** 1 writer.
+- **Acceptance gate:** fixtures: an attempt with a receipt and a kept checkout clears its journal and stops a live recorded group; an attempt whose folder is gone clears its journal; the Mac gate test module passes in one tests-only gate (Mac part through the queue); basedpyright zero on changed files; one blind review.
