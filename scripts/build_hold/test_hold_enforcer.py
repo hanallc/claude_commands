@@ -1059,7 +1059,8 @@ class HoldEnforcerTests(unittest.TestCase):
         entry = build_hold.new_entry(address, worker.name)
         failure = build_hold.ReleaseSendFailed("delivery was not confirmed")
         with mock.patch.object(build_hold, "send_release_to", return_value=failure) as send:
-            result = build_hold.send_stopped_run_release(entry, (run,), "released", staff.initial_snapshot())
+            entry["run"] = run
+            result = build_hold.send_stopped_run_release((entry,), "released", staff.initial_snapshot())
         self.assertEqual(result, failure)
         send.assert_called_once_with(entry, address, "released Restart the stopped run checks for worker. Run ID checks.")
 
@@ -1076,21 +1077,37 @@ class HoldEnforcerTests(unittest.TestCase):
         self.assertEqual([[entry["session_id"] for entry in batch] for batch in batches],
                          [["codex:gone-0", "codex:gone-1"], ["codex:gone-2"]])
         first, second = batches
-        runs = [run for entry in first if (run := entry.get("run")) is not None]
         with (mock.patch.object(build_hold, "send_release_to", return_value=build_hold.ReleaseDelivered()) as send,
               mock.patch("scripts.production.worker_admission.parent", return_value=director)):
-            self.assertEqual(build_hold.send_stopped_run_release(first[0], runs, "released", membership),
+            self.assertEqual(build_hold.send_stopped_run_release(first, "released", membership),
                              build_hold.ReleaseDelivered())
         call, = send.call_args_list
         self.assertEqual(call.args[1], str(director.id))
-        listed = "cargo test (Run ID process:0); cargo test (Run ID process:1)"
-        self.assertIn(f"Restart the stopped runs for codex:gone-0: {listed}.", cast(str, call.args[2]))
-        orphan = second[0].get("run")
-        assert orphan is not None
+        listed = "cargo test for codex:gone-0 (Run ID process:0); cargo test for codex:gone-1 (Run ID process:1)"
+        self.assertIn(f"Restart the stopped runs: {listed}.", cast(str, call.args[2]))
         with mock.patch.object(build_hold, "send_release_to") as send:
-            self.assertEqual(build_hold.send_stopped_run_release(second[0], (orphan,), "released", membership),
+            self.assertEqual(build_hold.send_stopped_run_release(second, "released", membership),
                              build_hold.RecipientGone())
         send.assert_not_called()
+
+    def test_release_routes_a_claude_worker_by_its_backend_not_the_session_prefix(self) -> None:
+        self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
+        director = fixture_member("showrunner", name="director")
+        worker = fixture_member("worker", name="worker", parent=director.id)
+        membership = staff.initial_snapshot()
+        batch: list[build_hold.ReleaseEntry] = []
+        for session in ("codex:old-thread", str(worker.current_session)):
+            entry = build_hold.new_entry(session, worker.name)
+            entry["run"] = {"id": session, "label": "cargo test", "staff_id": str(worker.id), "director_dir": ""}
+            batch.append(entry)
+        backends = {worker.id: staff.ClaudeBackend()}
+        with (mock.patch.object(type(membership), "backends", new_callable=mock.PropertyMock, return_value=backends),
+              mock.patch.object(build_hold, "send_release_to", return_value=build_hold.ReleaseDelivered()) as send):
+            self.assertEqual([len(item) for item in build_hold.notice_batches(batch, membership)], [2])
+            self.assertEqual(build_hold.send_stopped_run_release(batch, "released", membership),
+                             build_hold.ReleaseDelivered())
+        call, = send.call_args_list
+        self.assertEqual(call.args[1], str(worker.id))
 
     def test_release_does_not_name_a_run_if_enforcer_exits_before_signaling(self) -> None:
         holder, = build_hold.natedev_holds(self.holders).in_force

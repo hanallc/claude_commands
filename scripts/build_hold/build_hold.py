@@ -1859,13 +1859,18 @@ def send_session_release(entry: ReleaseEntry, notice: str) -> ReleaseNoticeResul
     return recipient if isinstance(recipient, RecipientGone) else ReleaseSendFailed(recipient.reason)
 
 
-def stopped_runs_text(name: str, runs: Sequence[StoppedRun]) -> str:
-    """Name each stopped run of one recipient once."""
-    if len(runs) == 1:
-        run, = runs
+def stopped_runs_text(owners: Sequence[tuple[str, StoppedRun]]) -> str:
+    """Name each stopped run of one notice once, with its owner."""
+    if len(owners) == 1:
+        (name, run), = owners
         return f" Restart the stopped run {run['label']} for {name}. Run ID {run['id']}."
-    listed = "; ".join(f"{run['label']} (Run ID {run['id']})" for run in runs)
-    return f" Restart the stopped runs for {name}: {listed}."
+    names = {name for name, _ in owners}
+    if len(names) == 1:
+        name, = names
+        listed = "; ".join(f"{run['label']} (Run ID {run['id']})" for _, run in owners)
+        return f" Restart the stopped runs for {name}: {listed}."
+    listed = "; ".join(f"{run['label']} for {name} (Run ID {run['id']})" for name, run in owners)
+    return f" Restart the stopped runs: {listed}."
 
 
 def run_worker(entry: ReleaseEntry, run: StoppedRun, membership: staff.StaffSnapshot | None) -> staff.StaffRow | None:
@@ -1874,24 +1879,44 @@ def run_worker(entry: ReleaseEntry, run: StoppedRun, membership: staff.StaffSnap
     return membership.by_member_reference(reference) if membership is not None else None
 
 
-def send_stopped_run_release(entry: ReleaseEntry, runs: Sequence[StoppedRun], notice: str,
+def codex_route(worker: staff.StaffRow, batch: Sequence[ReleaseEntry], membership: staff.StaffSnapshot) -> bool:
+    """Send to the worker's Codex thread only when the batch or its backend proves that thread.
+
+    A batch can join an old codex: session with the worker's current Claude session.
+    """
+    from scripts.production import staff
+
+    if any(entry["session_id"] == f"codex:{worker.current_session}" for entry in batch):
+        return True
+    backend = membership.backends.get(worker.id)
+    if isinstance(backend, (staff.CodexBackend, staff.ClaudeBackend)):
+        return isinstance(backend, staff.CodexBackend)
+    return all(entry["session_id"].startswith("codex:") for entry in batch)
+
+
+def send_stopped_run_release(batch: Sequence[ReleaseEntry], notice: str,
                              membership: staff.StaffSnapshot | None) -> ReleaseNoticeResult:
-    """Send one notice for runs that share the entry's session, staff member and director folder."""
+    """Send one notice for the stopped runs of one notice_batches batch.
+
+    The batch shares one staff member, one director folder for Codex threads without a
+    staff row, or one session.
+    """
     from scripts.production import staff, worker_admission
 
-    run = runs[0]
+    entry = batch[0]
+    run = entry.get("run")
+    if run is None:
+        raise ValueError(f"release entry {entry['session_id']} has no stopped run")
     worker = run_worker(entry, run, membership)
-    name = worker.name if worker is not None else entry["name"]
-    notice += stopped_runs_text(name, runs)
+    owners = [(worker.name if worker is not None else item["name"], item_run)
+              for item in batch if (item_run := item.get("run")) is not None]
+    notice += stopped_runs_text(owners)
     if worker is None and membership is not None and entry["session_id"].startswith("codex:"):
         # A Codex thread without a staff row has no session; a send would only fail its lookup.
         result: ReleaseNoticeResult = RecipientGone()
     elif worker is None:
         result = send_session_release(entry, notice)
-    elif worker.kind == "worker" and (
-        entry["session_id"].startswith("codex:")
-        or membership is not None and isinstance(membership.backends.get(worker.id), staff.CodexBackend)
-    ):
+    elif membership is not None and worker.kind == "worker" and codex_route(worker, batch, membership):
         result = send_release_to(entry, f"codex:{worker.current_session}", notice)
     else:
         result = send_release_to(entry, str(worker.id), notice)
@@ -1981,7 +2006,7 @@ def send_cycle_notices(cycle: HoldCycle, entries: Sequence[ReleaseEntry]) -> str
         first = batch[0]
         notice = release_notice(cycle["holders"])
         runs = [run for entry in batch if (run := entry.get("run")) is not None]
-        result = (send_stopped_run_release(first, runs, notice, membership) if runs
+        result = (send_stopped_run_release(batch, notice, membership) if runs
                   else send_session_release(first, notice))
         for entry in batch:
             record_release_outcome(cycle, entry, result, without_staff)
