@@ -657,6 +657,9 @@ def main(argv: list[str] | None = None) -> int:
                 return 1
             with closing(open_read_only_index(path)) as connection:
                 connection.execute("BEGIN").close()
+                if not index.has_numeric_update_time(connection):
+                    print("recent gate times not seeded: the opened index has no completed refresh", file=sys.stderr)
+                    return 1
                 keys = recent_gate_times.seed(connection)
         except (OSError, sqlite3.Error, conf.Unusable) as error:
             print(f"recent gate times not seeded: {error}", file=sys.stderr)

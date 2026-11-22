@@ -189,6 +189,27 @@ class GateRecordTests(unittest.TestCase):
                          "recent gate times not seeded: no complete index has compatible gate tables\n")
         self.assertFalse(self.recent_path.exists())
 
+    def test_seed_rejects_an_index_replaced_after_selection(self) -> None:
+        with closing(self.fixture_index()) as original:
+            original.execute("INSERT INTO meta (key, value) VALUES ('updated_at', '100')").close()
+            original.commit()
+        open_index = show.open_read_only_index
+
+        def replace_then_open(path: Path) -> sqlite3.Connection:
+            self.assertEqual(path, index.index_path())
+            path.unlink()
+            with closing(self.fixture_index()) as replacement:
+                replacement.commit()
+            return open_index(path)
+
+        stderr = io.StringIO()
+        with (mock.patch.object(show, "open_read_only_index", side_effect=replace_then_open),
+              mock.patch.object(recent_gate_times, "seed", side_effect=AssertionError("seed queried an incomplete index")),
+              redirect_stderr(stderr)):
+            self.assertEqual(show.main(["seed-gate-times"]), 1)
+        self.assertEqual(stderr.getvalue(), "recent gate times not seeded: the opened index has no completed refresh\n")
+        self.assertFalse(self.recent_path.exists())
+
     def test_missing_and_corrupt_times_disable_the_limit(self) -> None:
         path = self.recent_path
         path.parent.mkdir()
