@@ -150,6 +150,8 @@ class WorktreeAttributionTests(unittest.TestCase):
                 first_status = "?? first-launch.txt\n"
                 _ = baseline.write_text(first_commit)
                 _ = status.write_text(first_status)
+                if phase == "3":
+                    _ = phase_reservation.enroll(directory, phase, "board_ready")
 
                 self.assertEqual(self.claim(phase, self.second), (0, ""))
                 self.assertEqual((directory / phase_reservation.WORKTREE_FILE).read_text(), str(self.second) + "\n")
@@ -169,13 +171,44 @@ class WorktreeAttributionTests(unittest.TestCase):
         self.record_clone("2", clone)
         directory = phase_reservation.phase_directory(self.session, "2")
         foreign = make_fixture_worktree(self.first, "other-unit", "p3")
-        for requested in (self.first, foreign):
+        for requested, reason in ((clone, f"{str(clone)!r} is not in the subpath of"),
+                                  (self.first, f"{str(self.first)!r} is not in the subpath of"),
+                                  (foreign, "the checkout is for unit 'other-unit'")):
             with self.subTest(requested=requested):
                 code, errors = self.claim("2", requested)
                 self.assertEqual(code, 2)
-                self.assertIn(f"{clone}: {str(clone)!r} is not in the subpath of", errors)
+                self.assertIn(f"{requested}: {reason}", errors)
                 self.assertEqual((directory / phase_reservation.WORKTREE_FILE).read_text(), str(clone) + "\n")
                 self.assertFalse((directory / phase_reservation.BASELINE_FILE).exists())
+
+    def test_claim_refuses_to_move_a_phase_with_a_reservation(self) -> None:
+        clone = self.session.parent / "phase-2-clone"
+        self.record_clone("2", clone)
+        directory = phase_reservation.phase_directory(self.session, "2")
+        head = phase_reservation.commit_id(clone, "HEAD")
+        _ = phase_reservation.enroll(directory, "2", "board_ready")
+        self.assertTrue(phase_reservation.record_active(directory, phase_reservation.Acquisition("r1", "c1", head)))
+
+        code, errors = self.claim("2", self.second)
+
+        self.assertEqual(code, 2)
+        self.assertIn(f"state {phase_reservation.ACTIVE!r}", errors)
+        self.assertIn("Release the phase reservation, then claim again.", errors)
+        self.assertEqual((directory / phase_reservation.WORKTREE_FILE).read_text(), str(clone) + "\n")
+
+    def test_claim_refuses_a_foreign_replacement_for_the_legacy_home(self) -> None:
+        legacy = self.session.parent / "worktrees" / "legacy-home"
+        self.record_clone("2", legacy)
+        directory = phase_reservation.phase_directory(self.session, "2")
+        row = next(row for row in staff.snapshot().rows if row.kind == "unit")
+        _ = staff.set_worktree(row.id, staff.PresentWorktree("natedev", legacy), expected=row.worktree)
+        foreign = make_fixture_worktree(self.first, "other-unit", "p3")
+
+        code, errors = self.claim("2", foreign)
+
+        self.assertEqual(code, 2)
+        self.assertIn(f"{foreign}: the checkout is for unit 'other-unit', and the run belongs to 'reservation'", errors)
+        self.assertEqual((directory / phase_reservation.WORKTREE_FILE).read_text(), str(legacy) + "\n")
 
     def test_claim_uses_the_unit_word_from_completed_records(self) -> None:
         main = self.session.parent / ".claude"

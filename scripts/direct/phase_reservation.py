@@ -474,23 +474,35 @@ def _has_recorded_checkout(directory: Path) -> bool:
     return (directory / WORKTREE_FILE).is_file() or (directory / BASELINE_FILE).is_file()
 
 
+def _require_checkout_move(directory: Path) -> None:
+    """Check the reservation state while the caller holds the phase lock."""
+    state = read_state(directory)
+    if not state and not (directory / STATE_FILE).exists():
+        state = read_state(directory.parent.parent)
+        if phase_directory_name(_state_phase(state)) != directory.name:
+            return
+    kind = _string(state.get("kind")) or "unreadable"
+    if kind != AWAITING_FIRST_TOUCH:
+        raise StateRefused(f"phase {directory.name} has reservation state {kind!r}. "
+                           + "Release the phase reservation, then claim again.")
+
+
 def _record_claim_checkout(directory: Path, requested: Path | None) -> Path | None:
     """Select and record the checkout while the caller holds the phase lock."""
     root = requested
     if _has_recorded_checkout(directory):
-        recorded = phase_worktree(directory).root
-        if recorded.is_dir():
-            recorded = recorded.resolve()
-            if (requested is not None and requested != recorded
-                    and isinstance(_model_worktree_path(recorded), ValueError)):
-                try:
-                    _require_model_worktree(requested, _phase_run_home(directory).unit)
-                except StateRefused:
-                    pass
-                else:
-                    _record_baselines(directory, requested)
-                    _record_worktree(directory, requested)
-                    return requested
+        recorded = phase_worktree(directory).root.resolve()
+        recorded_exists = recorded.is_dir()
+        if requested is not None and requested != recorded:
+            if isinstance(_model_worktree_path(recorded), ValueError):
+                _require_model_worktree(requested, _phase_run_home(directory).unit)
+                _require_checkout_move(directory)
+                _record_baselines(directory, requested)
+                _record_worktree(directory, requested)
+                return requested
+            if not recorded_exists:
+                _require_checkout_move(directory)
+        if recorded_exists:
             root = repository_root(recorded)
     if root is not None:
         root = root.resolve()
