@@ -13,6 +13,7 @@ except FileNotFoundError:
 
 import argparse
 from collections.abc import Callable, Generator
+import errno
 import fcntl
 import hashlib
 import json
@@ -23,7 +24,7 @@ import shutil
 import stat
 import subprocess
 import tempfile
-from contextlib import AbstractContextManager, ExitStack, contextmanager
+from contextlib import AbstractContextManager, ExitStack, contextmanager, redirect_stdout
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 from enum import Enum
@@ -241,8 +242,11 @@ def _target_matches(target: Path, output: Path) -> bool:
 
 def ensure_target_link(checkout: Path, output: Path, *, save_existing: bool = True) -> None:
     """Create the output and repair the checkout's target link."""
-    ensure_output_folder(output)
     target = checkout / "target"
+    if save_existing and not target.is_symlink() and target.exists():
+        _link_with_previous_target(checkout, output, target)
+        return
+    ensure_output_folder(output)
     if _target_matches(target, output):
         return
     git_exclude.ensure_excluded(checkout, "/target")
@@ -257,9 +261,47 @@ def ensure_target_link(checkout: Path, output: Path, *, save_existing: bool = Tr
     if not target.exists():
         target.symlink_to(output, target_is_directory=True)
         return
-    if not save_existing:
-        raise ValueError(f"{target}: expected a link to {output}; retain the existing path")
-    saved = Path(tempfile.mkdtemp(prefix=".saved-target-", dir=checkout.parent)) / "target"
+    raise ValueError(f"{target}: expected a link to {output}; retain the existing path")
+
+
+_EARLIER_CARGO_TARGET = "the checkout's earlier Cargo target"
+
+
+def _link_with_previous_target(checkout: Path, output: Path, previous: Path) -> None:
+    """Use or retain the previous target while holding the output lock."""
+    target = checkout / "target"
+    git_exclude.ensure_excluded(checkout, "/target")
+    with build_folder_lock.folder_parent(output, build_folders.build_root(), create=True) as parent, ExitStack() as locks:
+        try:
+            descriptor = build_folders.build_folder_lock_fd(output)
+        except StopIteration:
+            descriptor = build_folder_lock.open_lock(output, parent, create=True)
+            _ = locks.callback(os.close, descriptor)
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as error:
+                raise ValueError(f"{output}: the build folder lock is held. Rerun when idle") from error
+        if not build_folder_lock.lock_current(output, parent, descriptor):
+            raise ValueError(f"{output}: the build folder lock changed. Rerun when idle")
+        _ensure_output_directory(output, parent)
+        if stat.S_ISDIR(previous.lstat().st_mode):
+            try:
+                os.rename(previous, output.name, dst_dir_fd=parent)
+            except OSError as error:
+                if error.errno not in (errno.EXDEV, errno.EEXIST, errno.ENOTEMPTY, errno.EBUSY):
+                    raise
+            else:
+                target.symlink_to(output, target_is_directory=True)
+                return
+        if previous == target:
+            _save_target_and_link(target, output)
+        else:
+            report_retained_folder(previous, _EARLIER_CARGO_TARGET)
+            target.symlink_to(output, target_is_directory=True)
+
+
+def _save_target_and_link(target: Path, output: Path) -> None:
+    saved = Path(tempfile.mkdtemp(prefix=".saved-target-", dir=target.parent.parent)) / "target"
     try:
         _ = target.rename(saved)
     except OSError:
@@ -272,20 +314,24 @@ def ensure_target_link(checkout: Path, output: Path, *, save_existing: bool = Tr
             _ = saved.rename(target)
             report_retained_folder(saved.parent, "target link creation failed")
         else:
-            print(f"worktrees: saved {target} in {saved}", file=sys.stderr)
+            report_retained_folder(saved.parent, _EARLIER_CARGO_TARGET)
         raise
-    print(f"worktrees: saved {target} in {saved}", file=sys.stderr)
+    report_retained_folder(saved.parent, _EARLIER_CARGO_TARGET)
 
 
 def ensure_output_folder(output: Path) -> None:
     """Create the output without following links below the build root."""
     with build_folder_lock.folder_parent(output, build_folders.build_root(), create=True) as parent:
-        try:
-            os.mkdir(output.name, dir_fd=parent)
-        except FileExistsError:
-            mode = os.stat(output.name, dir_fd=parent, follow_symlinks=False).st_mode
-            if not stat.S_ISDIR(mode):
-                raise ValueError(f"{output}: expected a real output folder") from None
+        _ensure_output_directory(output, parent)
+
+
+def _ensure_output_directory(output: Path, parent: int) -> None:
+    try:
+        os.mkdir(output.name, dir_fd=parent)
+    except FileExistsError:
+        mode = os.stat(output.name, dir_fd=parent, follow_symlinks=False).st_mode
+        if not stat.S_ISDIR(mode):
+            raise ValueError(f"{output}: expected a real output folder") from None
 
 
 def worktree_output(path: Path) -> RecordedWorktreeOutput | UnassignedOutput:
@@ -425,15 +471,17 @@ def landed(record: WorktreeRecord) -> Landed | NotLanded:
     return Landed()
 
 
-def worktree_branches(repo: Path) -> dict[Path, str]:
-    trees: dict[Path, str] = {}
+def _registered_worktree_branches(repo: Path) -> Generator[tuple[Path, str]]:
     path = repo
     for field in git(repo, "worktree", "list", "--porcelain", "-z").stdout.split("\0"):
         if field.startswith("worktree "):
-            path = Path(field.removeprefix("worktree ")).resolve()
+            path = Path(field.removeprefix("worktree "))
         elif field.startswith("branch refs/heads/"):
-            trees[path] = field.removeprefix("branch refs/heads/")
-    return trees
+            yield path, field.removeprefix("branch refs/heads/")
+
+
+def worktree_branches(repo: Path) -> dict[Path, str]:
+    return {path.resolve(): branch for path, branch in _registered_worktree_branches(repo)}
 
 
 def main_checkout(repo: Path) -> Path:
@@ -495,6 +543,13 @@ def cleanup(path: Path) -> CleanupReady | Kept:
     try:
         record = read_record(record_file(path))
     except FileNotFoundError:
+        record = None
+    if record is not None:
+        if Path(record.repo).resolve() != repo or Path(record.path).resolve() != path or record.branch != branch:
+            return Kept(path, "the worktree does not match its record")
+        if record.stage is MakeStage.MAKING:
+            return Kept(path, "worktree creation is incomplete")
+    if record is None or not record.merge_branch:
         default = git(repo, "symbolic-ref", "--quiet", "refs/remotes/origin/HEAD", check=False)
         if default.returncode == 1:
             raise Refused(1, "origin default branch is missing")
@@ -503,10 +558,6 @@ def cleanup(path: Path) -> CleanupReady | Kept:
         target = default.stdout.strip()
         base = git(repo, "merge-base", f"refs/heads/{branch}", target).stdout.strip()
         record = new_record(path, branch, repo, base, "", target.removeprefix("refs/remotes/origin/"))
-    if Path(record.repo).resolve() != repo or Path(record.path).resolve() != path or record.branch != branch:
-        return Kept(path, "the worktree does not match its record")
-    if record.stage is MakeStage.MAKING:
-        return Kept(path, "worktree creation is incomplete")
     result = landed(record)
     if isinstance(result, NotLanded):
         return Kept(path, "work has not landed: " + " ".join((*result.commits, *result.paths)))
@@ -590,7 +641,14 @@ def end_record(record: WorktreeRecord, snapshot: staff.StaffSnapshot) -> Ended |
         return origin
     if local_branch_tip(repo, record.branch) != local:
         return Kept(path, "the local branch changed after the cleanup check")
-    if os.path.lexists(path) or path in worktree_branches(repo):
+    checkout_present = os.path.lexists(path)
+    if not checkout_present:
+        for registered, branch in _registered_worktree_branches(repo):
+            if registered.resolve() == path:
+                checkout_present = True
+            elif branch == record.branch:
+                return Kept(path, f"Git registers branch {branch} at {registered}")
+    if checkout_present:
         if isinstance(record.layout, RecordedWorktreeOutput):
             report_retained_folder(checked_output(record.layout), "the checkout landed")
         else:
@@ -664,6 +722,9 @@ def create_checkout(path: Path, source: Path,
         record = checkout_record(path)
         exists = os.path.lexists(path)
         if record is not None:
+            if (exists and isinstance(record.layout, UnassignedOutput) and isinstance(layout, RecordedWorktreeOutput)
+                    and _unfinished_move_at(path.resolve())):
+                raise FileExistsError(f"{path}: editable repository destination is occupied")
             if Path(record.repo).resolve() != repo or (
                     isinstance(record.layout, RecordedWorktreeOutput) and isinstance(layout, RecordedWorktreeOutput)
                     and (record.layout.unit, record.layout.short_name) != (layout.unit, layout.short_name)):
@@ -1246,6 +1307,14 @@ def _existing_move(path: Path) -> MoveJournal | None:
         return None
 
 
+def _unfinished_move_at(path: Path) -> bool:
+    for file in move_folder().glob("*.json"):
+        journal = read_move(file)
+        if journal.stage is not MoveStage.FINISHED and journal.move.new == path:
+            return True
+    return False
+
+
 def _move_destination(repo: str, unit: str, short_name: str) -> Path:
     destination = build_folders.worktree_path(repo, unit, short_name)
     for parent in (destination.parent, destination.parent.parent):
@@ -1282,6 +1351,20 @@ def _linked_move_options(entry: Path) -> tuple[str, ...]:
     return ("--force", "--force")
 
 
+def _worktree_copy_required(source: Path, destination: Path) -> bool:
+    """Check the mounts of the source and the nearest existing destination parent."""
+    from scripts.lib.session_move import mount_identity
+
+    ancestor = next(folder for folder in destination.parents if folder.is_dir())
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    with ExitStack() as directories:
+        old = os.open(source, flags)
+        _ = directories.callback(os.close, old)
+        new = os.open(ancestor, flags)
+        _ = directories.callback(os.close, new)
+        return os.fstat(old).st_dev != os.fstat(new).st_dev or mount_identity(old) != mount_identity(new)
+
+
 def _open_move(move: WorktreeMove, *, clone_members: tuple[Path, ...] = ()) -> MoveJournal:
     if move.new == move.old or move.new.is_relative_to(move.old) or move.old.is_relative_to(move.new):
         raise ValueError(f"{move.old}: invalid move destination {move.new}")
@@ -1290,21 +1373,18 @@ def _open_move(move: WorktreeMove, *, clone_members: tuple[Path, ...] = ()) -> M
     before = FolderIdentity.read(move.old)
     entry = git_files.at(move.old)
     _ = _git_move_options(entry)
-    ancestor = next(folder for folder in move.new.parents if folder.is_dir())
-    copy_required = before.device != ancestor.stat().st_dev
-    if copy_required and move.old.parent != _scratch_root():
-        raise ValueError(f"{move.old}: the worktree and its destination must use the same filesystem")
-    journal = MoveJournal(move, before, before, uuid4().hex if copy_required else "",
+    copy_tag = uuid4().hex if _worktree_copy_required(move.old, move.new) else ""
+    journal = MoveJournal(move, before, before, copy_tag,
                           entry.git_dir if entry.git_dir != entry.common_dir else Path(".git"), clone_members)
     write_move(journal)
     return journal
 
 
-type RenameGuard = Callable[[Path], AbstractContextManager[Callable[[], None]]]
+type RenameGuard = Callable[[Path, MoveJournal], AbstractContextManager[Callable[[], None]]]
 
 
 @contextmanager
-def _unguarded_rename(_path: Path) -> Generator[Callable[[], None]]:
+def _unguarded_rename(_path: Path, _journal: MoveJournal) -> Generator[Callable[[], None]]:
     yield lambda: None
 
 
@@ -1335,6 +1415,56 @@ def _discard_changed_stage(journal: MoveJournal) -> None:
         report_retained_folder(stage, "cannot discard the stage after the source changed")
 
 
+def _is_real_target(target: Path) -> bool:
+    return not target.is_symlink() and target.is_dir()
+
+
+def _tracked_target_paths(checkout: Path) -> frozenset[Path]:
+    result = subprocess.run(["git", "-C", str(checkout), "ls-files", "-z", "--", "target"],
+                            capture_output=True, check=True)
+    return frozenset(Path(os.fsdecode(name)) for name in result.stdout.split(b"\0") if name)
+
+
+def _copy_worktree_source(source: Path, stage: Path) -> None:
+    """Copy the checkout and leave untracked Cargo artifacts at the source."""
+    if not _is_real_target(source / "target"):
+        if sys.platform == "linux":
+            _ = subprocess.run(["cp", "-a", "--reflink=auto", "--", str(source), str(stage)], check=True)
+        else:
+            _ = shutil.copytree(source, stage, symlinks=True)
+        return
+
+    tracked = _tracked_target_paths(source)
+    entries = tracked.union(parent for path in tracked for parent in path.parents if parent != Path("."))
+    if sys.platform == "linux":
+        def include_pattern(entry: Path) -> bytes:
+            name = entry.as_posix()
+            if any(character in name for character in "*?["):
+                name = re.sub(r"([\\*?\[])", r"\\\1", name)
+            return b"/" + os.fsencode(name) + b"\0"
+
+        includes = b"".join(map(include_pattern, entries))
+        _ = subprocess.run(["rsync", "-aHAXS", "--from0", "--include-from=-", "--exclude=/target/***", "--",
+                            f"{source}/", str(stage)], input=includes, check=True)
+        return
+
+    def ignore(folder: str, names: list[str]) -> set[str]:
+        relative = Path(folder).relative_to(source)
+        return {name for name in names if (entry := relative / name).is_relative_to("target") and entry not in entries}
+
+    _ = shutil.copytree(source, stage, symlinks=True, ignore=ignore)
+
+
+def _rename_copy_directory(source: Path, destination: Path) -> None:
+    from scripts.lib.session_move import open_directory, rename_exclusive
+
+    with open_directory(destination.parent) as parent:
+        try:
+            rename_exclusive(parent, source.name, parent, destination.name)
+        except FileExistsError:
+            raise FileExistsError(f"{destination}: worktree destination already exists") from None
+
+
 def _copy_across_filesystems(journal: MoveJournal, protect: RenameGuard) -> MoveJournal:
     old, new = journal.move.old, journal.move.new
     stage = journal.staging
@@ -1342,6 +1472,8 @@ def _copy_across_filesystems(journal: MoveJournal, protect: RenameGuard) -> Move
     source_present = journal.source.matches(old)
     if not source_present and not journal.source.matches(journal.backup):
         raise ValueError(f"{old}: source identity changed during the move")
+    if published and not journal.destination.matches(new):
+        raise FileExistsError(f"{new}: worktree destination already exists")
     if source_present:
         entry = git_files.at(old)
         _ = _git_move_options(entry)
@@ -1349,28 +1481,27 @@ def _copy_across_filesystems(journal: MoveJournal, protect: RenameGuard) -> Move
             raise ValueError(f"{old}: the Git worktree entry changed")
         if published:
             # An older journal can publish the copy before renaming the source.
-            if not journal.destination.matches(new) or os.path.lexists(stage):
+            if os.path.lexists(stage):
                 raise ValueError(f"{new}: cannot verify the prior move destination")
-            with protect(new) as final_check:
+            with protect(new, journal) as final_check:
                 final_check()
-                _ = new.rename(stage)
+                if not journal.destination.matches(new):
+                    raise ValueError(f"{new}: cannot verify the prior move destination")
+                _rename_copy_directory(new, stage)
             published = False
         if os.path.lexists(stage):
             if journal.destination == journal.source or not journal.destination.matches(stage):
-                report_retained_folder(stage, "a prior move left an unverified stage")
-                raise ValueError(f"{stage}: review the prior move stage before retrying")
-            # The source can change while kept. Prepare a fresh copy.
-            report_retained_folder(stage, "the prior stage can differ from the current source")
+                reason = "a prior move left an unverified stage"
+            else:
+                reason = "the prior stage can differ from the current source"
+            report_retained_folder(stage, reason)
             journal = replace(journal, destination=journal.source, copy_tag=uuid4().hex)
             write_move(journal)
             stage = journal.staging
-        with protect(old) as final_check:
+        with protect(old, journal) as final_check:
             final_check()
             original = _source_signature(old)
-            if sys.platform == "linux":
-                _ = subprocess.run(["cp", "-a", "--reflink=auto", "--", str(old), str(stage)], check=True)
-            else:
-                _ = shutil.copytree(old, stage, symlinks=True)
+            _copy_worktree_source(old, stage)
             journal = replace(journal, destination=FolderIdentity.read(stage))
             write_move(journal)
             if os.path.lexists(journal.backup):
@@ -1388,12 +1519,14 @@ def _copy_across_filesystems(journal: MoveJournal, protect: RenameGuard) -> Move
             if not journal.destination.matches(stage):
                 raise MigrationInUse("cannot verify the staged copy")
             _check_planned_clone_members(journal)
+            if os.path.lexists(new):
+                raise FileExistsError(f"{new}: worktree destination already exists")
             _ = old.rename(journal.backup)
     prepared = new if published else stage
     if not journal.destination.matches(prepared):
         raise ValueError(f"{prepared}: prepared worktree identity changed")
     if not published:
-        _ = stage.rename(new)
+        _rename_copy_directory(stage, new)
     return journal
 
 
@@ -1403,17 +1536,22 @@ def _relocated_clone_member(move: WorktreeMove, member: Path) -> Path:
     return member
 
 
-def _publish_move_source(journal: MoveJournal, protect: RenameGuard) -> MoveJournal:
+def _publish_move_source(journal: MoveJournal, protect: RenameGuard) -> tuple[MoveJournal, WorktreeRecord]:
     old, new = journal.move.old, journal.move.new
     new.parent.mkdir(parents=True, exist_ok=True)
+    destination_exists = os.path.lexists(new)
+    if not journal.copy_tag and not destination_exists:
+        if not journal.source.matches(old):
+            raise ValueError(f"{old}: source identity changed during the move")
+        if _worktree_copy_required(old, new):
+            journal = replace(journal, copy_tag=uuid4().hex)
+            write_move(journal)
     with ExitStack() as relocation:
         if journal.copy_tag:
             journal = _copy_across_filesystems(journal, protect)
-        elif not os.path.lexists(new):
-            if not journal.source.matches(old):
-                raise ValueError(f"{old}: source identity changed during the move")
+        elif not destination_exists:
             if journal.git_entry == Path(".git"):
-                final_check = relocation.enter_context(protect(old))
+                final_check = relocation.enter_context(protect(old, journal))
                 final_check()
                 _check_planned_clone_members(journal)
                 _ = old.rename(new)
@@ -1425,13 +1563,17 @@ def _publish_move_source(journal: MoveJournal, protect: RenameGuard) -> MoveJour
                 if any(tree.path == new for tree in linked_trees(main)):
                     raise FileExistsError(f"{new}: Git already registers the move destination")
                 options = _git_move_options(entry)
-                final_check = relocation.enter_context(protect(old))
+                final_check = relocation.enter_context(protect(old, journal))
                 final_check()
                 _ = git(main, "worktree", "move", *options, str(old), str(new))
         if not journal.destination.matches(new):
             raise ValueError(f"{new}: destination identity changed during the move")
         members = tuple(_relocated_clone_member(journal.move, member) for member in journal.clone_members)
-        _ = git(new, "worktree", "repair", *map(str, members))
+        if journal.copy_tag and journal.git_entry != Path(".git"):
+            # Start from the saved Git entry because the copied pointer can be relative.
+            _ = git(journal.git_entry, "worktree", "repair", str(new))
+        else:
+            _ = git(new, "worktree", "repair", *map(str, members))
         checkout = git_files.at(new)
         if checkout.git_dir != (new / ".git" if journal.git_entry == Path(".git") else journal.git_entry):
             raise ValueError(f"{new}: the move changed the Git worktree entry")
@@ -1447,9 +1589,10 @@ def _publish_move_source(journal: MoveJournal, protect: RenameGuard) -> MoveJour
                 raise ValueError(f"{old}: the former path does not point to {new}") from None
     worktree_links.link_transcripts(old, new)
     _ = _update_worktree_staff(old, new)
+    record = _relocate_worktree_records(journal)
     journal = replace(journal, stage=MoveStage.LINKED)
     write_move(journal)
-    return journal
+    return journal, record
 
 
 def _update_worktree_staff(old: Path, new: Path) -> str:
@@ -1470,35 +1613,22 @@ def _update_worktree_staff(old: Path, new: Path) -> str:
     return owner
 
 
-def _finish_worktree_move(journal: MoveJournal, *, protect: RenameGuard = _unguarded_rename) -> MoveJournal:
-    if journal.stage is MoveStage.FINISHED:
-        return journal
-    if journal.stage is MoveStage.PLANNED:
-        journal = _publish_move_source(journal, protect)
+def _relocate_worktree_records(journal: MoveJournal) -> WorktreeRecord:
     move = journal.move
-    if not journal.destination.matches(move.new):
-        raise ValueError(f"{move.new}: destination identity changed during the move")
     repo = main_checkout(move.new)
-    if journal.copy_tag and journal.source.matches(journal.backup):
-        report_retained_folder(journal.backup, "the worktree moved to a new filesystem")
-    if move.output is MoveOutput.LIVE_UNIT:
-        if move.repo == "claude" and _legacy_claude_present():
-            print(f"defer output {move.new}: archive the old build root first")
-            return journal
-        layout: RecordedWorktreeOutput | UnassignedOutput = output_record(move.repo, move.unit, move.short_name)
-        ensure_target_link(move.new, checked_output(layout))
+    at_destination = checkout_record(move.new)
+    previous = checkout_record(move.old)
+    if previous is not None:
+        record = replace(previous, path=str(move.new), repo=str(repo), layout=UnassignedOutput())
+    elif at_destination is not None:
+        record = replace(at_destination, repo=str(repo))
     else:
-        layout = UnassignedOutput()
-        if (move.new / "target").is_symlink():
-            git_exclude.require_untracked(move.new, "target")
-            (move.new / "target").unlink()
-    previous = checkout_record(move.old) or checkout_record(move.new)
-    if previous is None:
         branch = git_files.head(git_files.at(move.new))
         head = branch.name if isinstance(branch, git_files.OnBranch) else ""
-        previous = new_record(move.new, head, repo, git(move.new, "rev-parse", "HEAD").stdout.strip(),
-                              _update_worktree_staff(move.old, move.new), "")
-    write_record(replace(previous, path=str(move.new), repo=str(repo), layout=layout))
+        record = new_record(move.new, head, repo, git(move.new, "rev-parse", "HEAD").stdout.strip(),
+                            _update_worktree_staff(move.old, move.new), "")
+    if record != at_destination:
+        write_record(record)
     for member in journal.clone_members:
         relocated = _relocated_clone_member(move, member)
         recorded = checkout_record(member) or checkout_record(relocated)
@@ -1508,35 +1638,89 @@ def _finish_worktree_move(journal: MoveJournal, *, protect: RenameGuard = _ungua
         if member != relocated:
             record_file(member).unlink(missing_ok=True)
     record_file(move.old).unlink(missing_ok=True)
+    return record
+
+
+def _finish_worktree_move(journal: MoveJournal, *, protect: RenameGuard) -> MoveJournal:
+    if journal.stage is MoveStage.FINISHED:
+        return journal
+    move = journal.move
+    if journal.stage is MoveStage.PLANNED:
+        journal, record = _publish_move_source(journal, protect)
+    elif journal.destination.matches(move.new):
+        # An older journal can record LINKED before it moves the checkout record.
+        record = _relocate_worktree_records(journal)
+    else:
+        raise ValueError(f"{move.new}: destination identity changed during the move")
+    retained_copy = bool(journal.copy_tag) and journal.source.matches(journal.backup)
+    if retained_copy:
+        report_retained_folder(journal.backup, "the worktree moved to a new filesystem")
+    if move.output is MoveOutput.LIVE_UNIT and move.repo == "claude" and _legacy_claude_present():
+        print(f"defer output {move.new}: archive the old build root first")
+        return journal
+
+    backup_target = journal.backup / "target"
+    target = move.new / "target"
+    has_backup_target = retained_copy and _is_real_target(backup_target)
+    tracked_target = bool(_tracked_target_paths(move.new))
+    layout: RecordedWorktreeOutput | UnassignedOutput = UnassignedOutput()
+    if tracked_target:
+        if has_backup_target:
+            report_retained_folder(backup_target, _EARLIER_CARGO_TARGET)
+        if os.path.lexists(target):
+            report_retained_folder(target, "Git tracks the checkout's target")
+    elif move.output is MoveOutput.LIVE_UNIT:
+        layout = output_record(move.repo, move.unit, move.short_name)
+        output = checked_output(layout)
+        if has_backup_target and not os.path.lexists(target):
+            _link_with_previous_target(move.new, output, backup_target)
+        else:
+            ensure_target_link(move.new, output)
+    else:
+        if has_backup_target:
+            report_retained_folder(backup_target, _EARLIER_CARGO_TARGET)
+        if target.is_symlink():
+            git_exclude.require_untracked(move.new, "target")
+            target.unlink()
+    if record.layout != layout:
+        write_record(replace(record, layout=layout))
     journal = replace(journal, stage=MoveStage.FINISHED)
     write_move(journal)
     return journal
 
 
-def move_worktree(old: Path, repo: str, unit: str, short_name: str) -> Path:
+class MoveRepository(Enum):
+    FROM_ORIGIN = "read the checkout's repository word"
+
+
+def move_worktree(old: Path, repo: str | MoveRepository, unit: str, short_name: str) -> Path:
     """Move a linked checkout and resume any interrupted publication."""
     old = _move_source(old)
-    new = _move_destination(repo, unit, short_name)
+    if _is_numbered_build_copy(old, build_folders.build_root().resolve()):
+        raise ValueError(f"{old}: cannot move numbered build copy")
     with move_lock():
         journal = _existing_move(old)
-        if journal is not None:
-            request = journal.move
-            if (request.new, request.repo, request.unit, request.short_name) != (new, repo, unit, short_name):
-                raise ValueError(f"{old}: this request differs from the saved move")
-            if journal.stage is MoveStage.FINISHED:
-                if not journal.destination.matches(new):
-                    raise ValueError(f"{new}: the recorded destination has changed")
-                return new
-        if repo == "claude" and _legacy_claude_present():
-            raise ValueError(f"{old}: archive the legacy build root before moving this worktree")
         if journal is None:
             checkout = git_files.at(old)
             if checkout.git_dir == checkout.common_dir:
                 raise ValueError(f"{old}: expected a linked Git worktree")
-            if build_folders.repo_word(main_checkout(old)) != repo:
+            origin_repo = build_folders.repo_word(main_checkout(old))
+            if isinstance(repo, str) and origin_repo != repo:
                 raise ValueError(f"{old}: the repo word differs from origin")
-            journal = _open_move(WorktreeMove(old, new, repo, unit, short_name, MoveOutput.LIVE_UNIT))
-        _ = _finish_worktree_move(journal)
+            new = _move_destination(origin_repo, unit, short_name)
+            journal = _open_move(WorktreeMove(old, new, origin_repo, unit, short_name, MoveOutput.LIVE_UNIT))
+        else:
+            request = journal.move
+            repo = request.repo if isinstance(repo, MoveRepository) else repo
+            new = _move_destination(repo, unit, short_name)
+            if (request.new, request.repo, request.unit, request.short_name) != (new, repo, unit, short_name):
+                raise ValueError(f"{old}: this request differs from the saved move")
+            if journal.stage is MoveStage.FINISHED and not journal.destination.matches(new):
+                raise ValueError(f"{new}: the recorded destination has changed")
+        try:
+            _ = _finish_worktree_move(journal, protect=_direct_move_guard)
+        except (MigrationInUse, MigrationPlanChanged) as error:
+            raise Refused(1, f"{old}: {error}") from error
     return new
 
 
@@ -1626,12 +1810,81 @@ def linked_trees(repo: Path) -> tuple[RegisteredTree, ...]:
 
 
 @dataclass(frozen=True)
+class StaffUnitName:
+    name: str
+
+
+@dataclass(frozen=True)
+class NoStaffUnitOwner:
+    """Staff and the worktree record name no owning unit."""
+
+
+def _staff_unit_owner(snapshot: staff.StaffSnapshot, machine: str, path: Path,
+                      record: WorktreeRecord | None) -> StaffUnitName | NoStaffUnitOwner:
+    row = snapshot.unit_by_worktree(machine, path)
+    if row is not None:
+        return StaffUnitName(row.name)
+    if record is not None and record.owner:
+        owner = snapshot.by_member_reference(record.owner)
+        if owner is None:
+            owner = next((row for row in snapshot.rows if row.kind == "unit" and row.name == record.owner), None)
+        elif owner.kind != "unit":
+            owner = snapshot.parent_of(owner)
+        if owner is not None and owner.kind == "unit":
+            return StaffUnitName(owner.name)
+    return NoStaffUnitOwner()
+
+
+@dataclass(frozen=True)
+class UnrecognizedUnitName:
+    entered: str
+
+
+def _resolve_migration_unit(entered: str, staff_names: frozenset[str], *,
+                            prefixes: frozenset[str]) -> StaffUnitName | UnrecognizedUnitName:
+    if entered in staff_names:
+        return StaffUnitName(entered)
+    words = sorted(filter(None, prefixes), key=lambda name: (-len(name), name))
+    name = entered
+    while name not in staff_names:
+        for word in words:
+            match = re.match(rf"{re.escape(word)}[-/]", name, re.IGNORECASE)
+            if match is not None:
+                name = name[match.end():]
+                break
+        else:
+            return UnrecognizedUnitName(entered)
+    return StaffUnitName(name)
+
+
+@dataclass(frozen=True)
 class ListedWorktree:
-    unit: str
+    unit: StaffUnitName
     short_name: str
 
 
-def listed_worktrees(path: Path) -> dict[Path, ListedWorktree]:
+class MigrationScope(Enum):
+    LISTED = "listed worktrees"
+    ALL = "all worktrees"
+
+
+@dataclass(frozen=True)
+class MigrationSelection:
+    scope: MigrationScope
+    listed: dict[Path, ListedWorktree]
+
+    def includes(self, path: Path) -> bool:
+        return self.scope is MigrationScope.ALL or path in self.listed
+
+    def includes_journal(self, journal: MoveJournal) -> bool:
+        return any(self.includes(path) for path in (journal.move.old, journal.move.new, journal.source_key))
+
+
+def listed_worktrees(path: Path, folders: MigrationFolders, snapshot: staff.StaffSnapshot) -> dict[Path, ListedWorktree]:
+    from scripts.agents.remote import local_machine
+
+    machine = local_machine()
+    staff_names = frozenset(row.name for row in snapshot.rows if row.kind == "unit")
     listed: dict[Path, ListedWorktree] = {}
     for line_number, line in enumerate(path.read_text().splitlines(), 1):
         fields = shlex.split(line, comments=True)
@@ -1642,7 +1895,22 @@ def listed_worktrees(path: Path) -> dict[Path, ListedWorktree]:
         old = _move_source(Path(fields[0]))
         if old in listed:
             raise ValueError(f"{path}:{line_number}: duplicate path {old}")
-        listed[old] = ListedWorktree(fields[1], fields[2])
+        if _is_numbered_build_copy(old, folders.build_root):
+            raise ValueError(f"{path}:{line_number}: cannot migrate numbered build copy {old}")
+        saved = checkout_record(old)
+        if saved is None and old.is_symlink():
+            saved = checkout_record(old.resolve())
+        owner = _staff_unit_owner(snapshot, machine, old, saved)
+        unit = _resolve_migration_unit(fields[1], staff_names, prefixes=frozenset())
+        if isinstance(unit, UnrecognizedUnitName):
+            suggested = owner.name if isinstance(owner, StaffUnitName) else max(
+                (name for name in staff_names if unit.entered.endswith((f"-{name}", f"/{name}"))),
+                key=len, default="")
+            action = f"use {suggested}" if suggested else "use the exact unit name from staff"
+            raise ValueError(f"{path}:{line_number}: {unit.entered} is not a staff unit; {action}")
+        if isinstance(owner, StaffUnitName) and unit != owner:
+            raise ValueError(f"{path}:{line_number}: {old} belongs to staff unit {owner.name}; use {owner.name}")
+        listed[old] = ListedWorktree(unit, fields[2])
     return listed
 
 
@@ -1668,18 +1936,6 @@ def checkout_record(path: Path) -> WorktreeRecord | None:
 
 
 @dataclass(frozen=True)
-class UnitFact:
-    unit: str
-    source: str
-    production: str = ""
-
-
-def _member_unit(row: staff.StaffRow, snapshot: staff.StaffSnapshot, source: str) -> UnitFact:
-    parent = snapshot.parent_of(row)
-    return UnitFact(row.name, source, parent.name if parent is not None else "")
-
-
-@dataclass(frozen=True)
 class RepositoryNames:
     word: str
     origin: str
@@ -1691,8 +1947,8 @@ class MigrationShortNames:
     productions: frozenset[str]
     checkouts: dict[str, set[str]]
 
-    def unit_from_subject(self, slug: str, repo: RepositoryNames) -> str:
-        return _strip_unit_prefixes(slug, self.productions | {repo.word, repo.origin})
+    def unit_prefixes(self, repo: RepositoryNames) -> frozenset[str]:
+        return self.machines | self.productions | {repo.word, repo.origin}
 
     def for_tree(self, tree: RegisteredTree, repo: RepositoryNames, unit: str) -> str:
         checkout_words = self.checkouts.get(repo.word, set()) | {repo.word, repo.origin}
@@ -1722,18 +1978,6 @@ class MigrationShortNames:
 class ShowrunnerCheckout:
     path: Path
     reason: str
-
-
-def _strip_unit_prefixes(slug: str, prefixes: frozenset[str] | set[str]) -> str:
-    words = sorted(filter(None, prefixes), key=lambda name: (-len(name), name))
-    while True:
-        for word in words:
-            match = re.match(rf"{re.escape(word)}[-/]", slug, re.IGNORECASE)
-            if match is not None:
-                slug = slug[match.end():]
-                break
-        else:
-            return slug
 
 
 def _production_checkout(lines: list[str]) -> Path:
@@ -1844,6 +2088,21 @@ class MigrationFolders:
         return cls(root, _migration_maker_roots(root / _LEGACY_SCRATCH, settings))
 
 
+def _worktree_build_form(path: Path, build_root: Path) -> build_folders.ParsedFolder:
+    # Numbered names in legacy scratch can name worktrees.
+    if path.is_relative_to(build_root / _LEGACY_SCRATCH):
+        return build_folders.OutsideFolderLayout()
+    return build_folders.parse_resolved_form(path, build_root)
+
+
+def _is_numbered_build_copy(path: Path, build_root: Path) -> bool:
+    return (isinstance(_worktree_build_form(path, build_root), build_folders.BuildCopy)
+            or isinstance(_worktree_build_form(path.resolve(), build_root), build_folders.BuildCopy))
+
+
+_NUMBERED_BUILD_COPY = "a numbered build copy; the build folder model owns it"
+
+
 def _migration_build_keep(path: Path, folders: MigrationFolders) -> str:
     try:
         try:
@@ -1854,22 +2113,20 @@ def _migration_build_keep(path: Path, folders: MigrationFolders) -> str:
         return f"cannot verify the checkout path ({error})"
     if folders.build_root.is_relative_to(resolved) or resolved.parent == folders.build_root:
         return "contains the build root or a build repository folder"
-    # The model has no scratch unit here. Numbered names in legacy scratch still move.
-    if not resolved.is_relative_to(folders.scratch):
-        form = build_folders.parse_resolved_form(resolved, folders.build_root)
-        if isinstance(form, build_folders.BuildCopy):
-            return "a numbered build copy; the build folder model owns it"
-        if isinstance(form, build_folders.CiOutput):
-            return "a CI runner folder; the build folder model owns it"
-        if isinstance(form, build_folders.MainOutput):
-            return "a main output; the build folder model owns it"
-        if resolved.parent.parent == folders.build_root:
-            try:
-                _ = build_folders.unit_folder(resolved.parent.name, resolved.name, root=folders.build_root)
-            except build_folders.InvalidFolderForm:
-                pass
-            else:
-                return "a build unit folder; the build folder model owns it"
+    form = _worktree_build_form(resolved, folders.build_root)
+    if isinstance(form, build_folders.BuildCopy):
+        return _NUMBERED_BUILD_COPY
+    if isinstance(form, build_folders.CiOutput):
+        return "a CI runner folder; the build folder model owns it"
+    if isinstance(form, build_folders.MainOutput):
+        return "a main output; the build folder model owns it"
+    if resolved != folders.scratch and resolved.parent.parent == folders.build_root:
+        try:
+            _ = build_folders.unit_folder(resolved.parent.name, resolved.name, root=folders.build_root)
+        except build_folders.InvalidFolderForm:
+            pass
+        else:
+            return "a build unit folder; the build folder model owns it"
     return ""
 
 
@@ -2026,13 +2283,14 @@ def _live_migration_repos(units: list[staff.StaffRow], repos: dict[Path, Reposit
     return confirmed
 
 
-def plan_worktree_migration(listed: dict[Path, ListedWorktree], snapshot: staff.StaffSnapshot,
+def plan_worktree_migration(selection: MigrationSelection, snapshot: staff.StaffSnapshot,
                             folders: MigrationFolders, journals: MigrationJournalView,
                             locations: MigrationLocations) -> WorktreeMigration:
     """Read Git, staff, and the supplied list without changing them."""
     from scripts.agents.remote import local_machine
     from scripts.production import staff
 
+    listed = selection.listed
     machine = local_machine()
     scratch_root = folders.scratch
     mains = _migration_main_checkouts(Path.home())
@@ -2083,7 +2341,8 @@ def plan_worktree_migration(listed: dict[Path, ListedWorktree], snapshot: staff.
         if repo in mains:
             primary = _main_checkout_path(names.word)
             if not primary.is_symlink() and repo == primary.resolve():
-                main_plans.append(MainOutputPlan(repo, names.word))
+                if selection.scope is MigrationScope.ALL:
+                    main_plans.append(MainOutputPlan(repo, names.word))
             else:
                 skipped[repo] = f"keeps its current output; {primary} is the main checkout for {names.word}"
 
@@ -2099,6 +2358,8 @@ def plan_worktree_migration(listed: dict[Path, ListedWorktree], snapshot: staff.
     validated: list[RegisteredTree] = []
     for tree in trees:
         path = tree.path
+        if not selection.includes(path) and (tree.store not in clones or not selection.includes(tree.store)):
+            continue
         if reason := showrunners.get(path):
             skipped[path] = reason
             continue
@@ -2170,10 +2431,11 @@ def plan_worktree_migration(listed: dict[Path, ListedWorktree], snapshot: staff.
         if path in placed_destinations:
             already_placed.add(path)
             skipped[path] = "already moved"
-        else:
+        elif selection.includes(path):
             candidates.append(tree)
 
     units = [row for row in snapshot.rows if row.kind == "unit"]
+    staff_names = frozenset(row.name for row in units)
     relocated_repos = {path: journal.move.repo for journal in journals.relocated
                        if journal.stage is not MoveStage.FINISHED
                        for path in (journal.move.old, journal.move.new, journal.source_key)}
@@ -2181,19 +2443,19 @@ def plan_worktree_migration(listed: dict[Path, ListedWorktree], snapshot: staff.
     live_names = {row.name for row in units if isinstance(row.worktree, staff.PresentWorktree)}
     live = {(live_repos[row.id], row.name) for row in units if row.id in live_repos}
     retired = {row.name for row in units if isinstance(row.worktree, staff.RemovedWorktree)}
-    known_by_repo: dict[str, dict[str, UnitFact]] = {repo.word: {} for repo in repos.values()}
+    known_by_repo: dict[str, dict[str, str]] = {repo.word: {} for repo in repos.values()}
     for row in units:
-        fact = _member_unit(row, snapshot, "folder name")
+        parent = snapshot.parent_of(row)
         for repo, known in known_by_repo.items():
             if isinstance(row.worktree, staff.PresentWorktree) and live_repos.get(row.id) != repo:
                 continue
-            known[fact.unit] = fact
-            if fact.production:
-                _ = known.setdefault(f"{fact.production}-{fact.unit}", fact)
+            known[row.name] = row.name
+            if parent is not None:
+                _ = known.setdefault(f"{parent.name}-{row.name}", row.name)
     for tree in candidates:
         supplied = listed.get(tree.path)
         if supplied is not None:
-            known_by_repo[repos[tree.store].word][supplied.unit] = UnitFact(supplied.unit, "folder name")
+            known_by_repo[repos[tree.store].word][supplied.unit.name] = supplied.unit.name
     unit_words = {repo: sorted(known, key=lambda word: (-len(word), word))
                   for repo, known in known_by_repo.items()}
     moves: list[PlannedWorktree] = []
@@ -2203,39 +2465,36 @@ def plan_worktree_migration(listed: dict[Path, ListedWorktree], snapshot: staff.
         path, repo = tree.path, repos[tree.store]
         supplied = listed.get(path)
         if supplied is not None:
-            fact = UnitFact(supplied.unit, "list")
+            resolved, source = supplied.unit, "list"
         else:
-            row = snapshot.unit_by_worktree(machine, path)
             saved = checkout_record(path)
-            if row is None and saved is not None and saved.owner:
-                owner = snapshot.by_member_reference(saved.owner)
-                if owner is None:
-                    owner = next((member for member in units if member.name == saved.owner), None)
-                if owner is not None:
-                    row = owner if owner.kind == "unit" else snapshot.parent_of(owner)
+            owner = _staff_unit_owner(snapshot, machine, path, saved)
             word = next((name for name in unit_words[repo.word] if _without_name(path.name, name) != path.name), "")
-            if row is not None and row.kind == "unit":
-                fact = _member_unit(row, snapshot, "staff row")
+            if isinstance(owner, StaffUnitName):
+                name, source = owner.name, "staff row"
             elif word:
-                fact = known_by_repo[repo.word][word]
+                name, source = known_by_repo[repo.word][word], "folder name"
             elif saved is not None and isinstance(saved.layout, RecordedWorktreeOutput):
-                fact = UnitFact(saved.layout.unit, "worktree record")
+                name, source = saved.layout.unit, "worktree record"
             else:
+                name, source = "", ""
+            prefixes = short_names.unit_prefixes(repo)
+            resolved = _resolve_migration_unit(name, staff_names, prefixes=prefixes)
+            if isinstance(resolved, UnrecognizedUnitName):
                 try:
-                    slug = _subject_unit(path)
+                    name = _subject_unit(path)
                 except (Refused, git_files.GitFilesError, OSError, UnicodeError) as error:
                     if tree.store not in clones:
                         raise
                     skipped[path] = f"cannot read the Git commit subject ({error})"
                     continue
-                derived = short_names.unit_from_subject(slug, repo)
-                if derived.casefold() in (repo.word.casefold(), repo.origin.casefold()):
-                    derived = ""
-                if derived in live_names and (repo.word, derived) not in live:
-                    derived = ""
-                fact = UnitFact(derived, "commit subject")
-        unit = fact.unit
-        if not unit:
+                resolved, source = _resolve_migration_unit(name, staff_names, prefixes=prefixes), "commit subject"
+        if isinstance(resolved, UnrecognizedUnitName):
+            skipped[path] = "unit unknown"
+            continue
+        unit = resolved.name
+        if source == "commit subject" and (unit.casefold() in (repo.word.casefold(), repo.origin.casefold())
+                                           or (unit in live_names and (repo.word, unit) not in live)):
             skipped[path] = "unit unknown"
             continue
         short_name = supplied.short_name if supplied is not None else short_names.for_tree(tree, repo, unit)
@@ -2257,10 +2516,10 @@ def plan_worktree_migration(listed: dict[Path, ListedWorktree], snapshot: staff.
         if prior != path:
             collisions.add(new)
         live_output = (repo.word, unit) in live or (
-            supplied is not None and fact.unit not in retired and fact.unit not in live_names)
+            supplied is not None and unit not in retired and unit not in live_names)
         output = MoveOutput.LIVE_UNIT if live_output else MoveOutput.RETIRED_UNIT
         move = WorktreeMove(path, new, repo.word, unit, short_name, output)
-        moves.append(PlannedWorktree(tree, move, fact.source))
+        moves.append(PlannedWorktree(tree, move, source))
 
     selected = {plan.tree.path: plan for plan in moves if plan.move.new not in collisions}
     clone_members: dict[Path, tuple[Path, ...]] = {}
@@ -2286,23 +2545,63 @@ def plan_worktree_migration(listed: dict[Path, ListedWorktree], snapshot: staff.
     for path in listed.keys() - registered_paths - skipped.keys() - former:
         skipped[path] = "no registered worktree at this path"
     ordered = tuple(sorted(selected.values(), key=lambda plan: (plan.tree.path in clones, plan.tree.path)))
-    return WorktreeMigration(ordered, tuple(stale), tuple(main_plans), clone_members, skipped)
+    return WorktreeMigration(ordered, tuple(tree for tree in stale if selection.includes(tree.path)),
+                             tuple(main_plans), clone_members,
+                             {path: reason for path, reason in skipped.items() if selection.includes(path)})
 
 
 _NO_PROBE_FDS: frozenset[int] = frozenset()
+
+
+def _linux_checkout_spellings(paths: tuple[Path, ...]) -> dict[Path, tuple[str, ...]]:
+    from scripts.lib.session_move import mount_identity, open_directory
+
+    mounts = {mount.mount_id: mount for mount in build_folders.linux_mounts()}
+    spellings: dict[Path, tuple[str, ...]] = {}
+    for path in paths:
+        with open_directory(path) as fd:
+            mount = mounts[mount_identity(fd)]
+        source = mount.root / path.relative_to(mount.point)
+        aliases = {path}
+        for other in mounts.values():
+            if other.device != mount.device:
+                continue
+            if source.is_relative_to(other.root):
+                aliases.add(other.point / source.relative_to(other.root))
+            elif other.root.is_relative_to(source):
+                # The bind mount exposes only part of the checkout.
+                aliases.add(other.point)
+        spellings[path] = tuple(map(str, sorted(aliases)))
+    return spellings
 
 
 def _migration_processes(paths: tuple[Path, ...], *, ignored_fds: frozenset[int] = _NO_PROBE_FDS
                          ) -> tmp_sweep.ProcessUsesKnown | tmp_sweep.ProcessUsesUnavailable:
     from scripts.lint import tmp_sweep
 
-    prefixes = tuple(map(str, paths))
-    if sys.platform == "linux":
-        return tmp_sweep.process_paths(tmp_sweep.PROC_DIR, prefixes, require_readable_user_processes=True,
-                                       ignored_self_fds=ignored_fds)
     if not paths:
         return tmp_sweep.ProcessUsesKnown([])
-    return tmp_sweep.lsof_paths(prefixes, require_complete=True, ignored_self_fds=ignored_fds, same_user_only=True)
+    if sys.platform == "linux":
+        try:
+            spellings = _linux_checkout_spellings(paths)
+        except (OSError, ValueError, KeyError):
+            return tmp_sweep.ProcessUsesIncomplete()
+        prefixes = tuple(dict.fromkeys(chain.from_iterable(spellings.values())))
+        uses = tmp_sweep.process_paths(tmp_sweep.PROC_DIR, prefixes, require_readable_user_processes=True,
+                                      ignored_self_fds=ignored_fds)
+    else:
+        spellings = {path: (str(path),) for path in paths}
+        uses = tmp_sweep.lsof_paths(tuple(map(str, paths)), require_complete=True, ignored_self_fds=ignored_fds,
+                                   same_user_only=True)
+    if isinstance(uses, tmp_sweep.ProcessUsesUnavailable):
+        return uses
+    paths_in_use: set[tuple[str, int, str]] = set()
+    for name, pid, how in uses.paths:
+        live_name = name.removesuffix(tmp_sweep.DELETED_SUFFIX)
+        for path, aliases in spellings.items():
+            if any(alias in (name, live_name) or name.startswith(alias + os.sep) for alias in aliases):
+                paths_in_use.add((str(path), pid, how))
+    return replace(uses, paths=sorted(paths_in_use))
 
 
 def _migration_process_use(path: Path, uses: tmp_sweep.ProcessUsesKnown | tmp_sweep.ProcessUsesUnavailable) -> str:
@@ -2313,9 +2612,7 @@ def _migration_process_use(path: Path, uses: tmp_sweep.ProcessUsesKnown | tmp_sw
     if uses.unreadable_process_pids:
         return f"unreadable process {min(uses.unreadable_process_pids)}"
     root = str(path)
-    prefix = root + os.sep
-    pids = {pid for name, pid, _ in uses.paths
-            if name.startswith(prefix) or name.removesuffix(tmp_sweep.DELETED_SUFFIX) == root}
+    pids = {pid for name, pid, _ in uses.paths if name == root}
     if pids:
         return "pids " + ", ".join(map(str, sorted(pids)))
     return ""
@@ -2452,9 +2749,10 @@ class MigrationPublication:
 
 
 @contextmanager
-def _hold_migration_relocation(path: Path, journal: MoveJournal,
-                               locations: MigrationLocations, folders: MigrationFolders, progress: MigrationProgress
-                               ) -> Generator[Callable[[], None]]:
+def _hold_worktree_relocation(
+    path: Path, journal: MoveJournal, locations: MigrationLocations, folders: MigrationFolders, *,
+    record_process_scan: Callable[[tmp_sweep.ProcessUsesKnown | tmp_sweep.ProcessUsesUnavailable], None] = lambda _: None,
+) -> Generator[Callable[[], None]]:
     _check_planned_clone_members(journal)
     try:
         current = {member: locations.current(member) for member in dict.fromkeys((path, *journal.clone_members))}
@@ -2476,7 +2774,7 @@ def _hold_migration_relocation(path: Path, journal: MoveJournal,
         def final_check() -> None:
             # A process can enter the source between this scan and the rename.
             uses = _migration_processes(paths, ignored_fds=frozenset(fds))
-            progress.record_process_scan(uses)
+            record_process_scan(uses)
             for member, source in current.items():
                 if reason := _migration_process_use(source, uses):
                     if member != path and not reason.startswith("unreadable process "):
@@ -2484,6 +2782,12 @@ def _hold_migration_relocation(path: Path, journal: MoveJournal,
                     raise MigrationInUse(reason)
 
         yield final_check
+
+
+def _direct_move_guard(path: Path, journal: MoveJournal) -> AbstractContextManager[Callable[[], None]]:
+    if journal.copy_tag:
+        return _hold_worktree_relocation(path, journal, MigrationLocations({}), MigrationFolders.configured())
+    return _unguarded_rename(path, journal)
 
 
 @dataclass
@@ -2533,6 +2837,8 @@ def _migration_journal_state(journal: MoveJournal) -> MigrationJournalState:
             return MigrationJournalState.RELOCATED
         return MigrationJournalState.UNVERIFIED
     if journal.copy_tag and journal.source.matches(journal.backup):
+        if os.path.lexists(journal.move.new) and not journal.destination.matches(journal.move.new):
+            return MigrationJournalState.OCCUPIED_COPY_DESTINATION
         return MigrationJournalState.RELOCATED
     if journal.source.matches(journal.move.old):
         if journal.copy_tag and os.path.lexists(journal.move.new):
@@ -2545,7 +2851,7 @@ def _migration_journal_state(journal: MoveJournal) -> MigrationJournalState:
     return MigrationJournalState.UNVERIFIED
 
 
-def _migration_journals(*, dry_run: bool) -> MigrationJournalView:
+def _migration_journals(selection: MigrationSelection, folders: MigrationFolders, *, dry_run: bool) -> MigrationJournalView:
     relocated: list[MoveJournal] = []
     kept: dict[Path, str] = {}
     for path in sorted(move_folder().glob("*.json")):
@@ -2558,9 +2864,12 @@ def _migration_journals(*, dry_run: bool) -> MigrationJournalView:
             continue
         match state:
             case MigrationJournalState.RELOCATED:
-                relocated.append(journal)
+                if isinstance(_worktree_build_form(move.old, folders.build_root), build_folders.BuildCopy):
+                    kept[move.old] = kept[move.new] = _NUMBERED_BUILD_COPY
+                else:
+                    relocated.append(journal)
             case MigrationJournalState.UNMOVED:
-                if not dry_run:
+                if not dry_run and selection.includes(move.old):
                     if journal.copy_tag and os.path.lexists(journal.staging):
                         report_retained_folder(journal.staging, "a discarded move left a staged copy")
                     path.unlink()
@@ -2581,10 +2890,10 @@ def _print_migration_resume(journal: MoveJournal) -> None:
 
 
 def _migration_recovery_locks(journals: MigrationJournalView, publication: MigrationPublication,
-                              locations: MigrationLocations) -> MigrationJournalView:
+                              locations: MigrationLocations, selection: MigrationSelection) -> MigrationJournalView:
     kept = journals.kept.copy()
     for journal in journals.relocated:
-        if journal.stage is MoveStage.FINISHED:
+        if journal.stage is MoveStage.FINISHED or not selection.includes_journal(journal):
             continue
         try:
             checkout = locations.current(journal.move.new)
@@ -2607,23 +2916,45 @@ def _migration_clone_keep(plan: WorktreeMigration, progress: MigrationProgress,
     return ""
 
 
-def migrate_worktrees(list_file: Path, *, dry_run: bool) -> int:
-    listed = listed_worktrees(list_file)
+def _scratch_backups_needing_recovery(scratch: Path) -> Generator[Path]:
+    for path in sorted(move_folder().glob("*.json")):
+        journal = read_move(path)
+        if not journal.copy_tag or journal.stage is MoveStage.FINISHED:
+            continue
+        backup = journal.backup
+        if not backup.is_relative_to(scratch) or not journal.source.matches(backup):
+            continue
+        if journal.stage is MoveStage.LINKED and journal.destination.matches(journal.move.new):
+            continue
+        yield backup
+
+
+def migrate_worktrees(list_file: Path | None, *, dry_run: bool, scope: MigrationScope = MigrationScope.LISTED) -> int:
     try:
         with ExitStack() as locks:
             if dry_run:
                 _ = locks.enter_context(conf_reads.record_reads(""))
+            folders = MigrationFolders.configured()
+            snapshot = staff_record()
+            listed = listed_worktrees(list_file, folders, snapshot) if list_file is not None else {}
+            selection = MigrationSelection(scope, listed)
             _ = locks.enter_context(move_lock(create=not dry_run))
-            return _apply_migration(listed, staff_record(), dry_run=dry_run)
+            try:
+                status = _apply_migration(selection, snapshot, folders, dry_run=dry_run)
+            finally:
+                backups = tuple(_scratch_backups_needing_recovery(folders.scratch)) if not dry_run and scope is MigrationScope.ALL else ()
+                for backup in backups:
+                    print(f"{backup}: keep the old build root until the move can resume from this backup", file=sys.stderr)
+            return 1 if backups else status
     except WorktreeMoveLockHeld as error:
         print(f"kept: {error.lock} held")
         return error.code
 
 
-def _apply_migration(listed: dict[Path, ListedWorktree], snapshot: staff.StaffSnapshot, *, dry_run: bool) -> int:
-    folders = MigrationFolders.configured()
+def _apply_migration(selection: MigrationSelection, snapshot: staff.StaffSnapshot,
+                     folders: MigrationFolders, *, dry_run: bool) -> int:
     publication = MigrationPublication.read(snapshot, folders)
-    journals = _migration_journals(dry_run=dry_run)
+    journals = _migration_journals(selection, folders, dry_run=dry_run)
     active_journals: dict[Path, MoveJournal] = {}
     for journal in journals.relocated:
         if journal.stage is MoveStage.FINISHED:
@@ -2633,9 +2964,14 @@ def _apply_migration(listed: dict[Path, ListedWorktree], snapshot: staff.StaffSn
             raise ValueError(f"{destination}: multiple unfinished move journals")
         active_journals[destination] = journal
     locations = MigrationLocations(active_journals)
-    journals = _migration_recovery_locks(journals, publication, locations)
+    journals = _migration_recovery_locks(journals, publication, locations, selection)
     progress = MigrationProgress({}, {}, {})
-    plan = plan_worktree_migration(listed, snapshot, folders, journals, locations)
+
+    def protect(path: Path, journal: MoveJournal) -> AbstractContextManager[Callable[[], None]]:
+        return _hold_worktree_relocation(path, journal, locations, folders,
+                                         record_process_scan=progress.record_process_scan)
+
+    plan = plan_worktree_migration(selection, snapshot, folders, journals, locations)
     progress.kept.update(plan.skipped)
     sources = {move.move.new: move.move.old for move in plan.moves}
     groups = {clone: (clone, *(sources.get(member, member) for member in members))
@@ -2680,9 +3016,10 @@ def _apply_migration(listed: dict[Path, ListedWorktree], snapshot: staff.StaffSn
                     progress.kept[path] = f"{clone}: {busy} stays in use ({busy_paths[busy]})"
 
     for journal in journals.relocated:
-        if journal.stage is not MoveStage.FINISHED and journal.move.new not in journals.kept:
+        if (journal.stage is not MoveStage.FINISHED and selection.includes_journal(journal)
+                and journal.move.new not in journals.kept):
             if not dry_run:
-                locations.record_publication(_finish_worktree_move(journal))
+                locations.record_publication(_finish_worktree_move(journal, protect=protect))
             _print_migration_resume(journal)
     for tree in plan.missing:
         print(f"review {tree.path}: missing registration path")
@@ -2699,8 +3036,7 @@ def _apply_migration(listed: dict[Path, ListedWorktree], snapshot: staff.StaffSn
         if not dry_run:
             journal = _open_move(layout, clone_members=plan.clone_members.get(source, ()))
             try:
-                completed = _finish_worktree_move(
-                    journal, protect=lambda path: _hold_migration_relocation(path, journal, locations, folders, progress))
+                completed = _finish_worktree_move(journal, protect=protect)
             except MigrationPlanChanged as error:
                 progress.kept[source] = str(error)
                 continue
@@ -2724,7 +3060,8 @@ def _apply_migration(listed: dict[Path, ListedWorktree], snapshot: staff.StaffSn
         if not dry_run and places_output:
             ensure_target_link(main.checkout, output)
     progress.print_keeps(dry_run=dry_run)
-    if not dry_run and any(progress.kept.get(path) not in (_UNVERIFIED_SCRATCH, _ARCHIVED_SCRATCH)
+    if not dry_run and any(selection.includes(path)
+                           and progress.kept.get(path) not in (_UNVERIFIED_SCRATCH, _ARCHIVED_SCRATCH)
                            for path in _scratch_checkouts(folders.scratch)):
         print("keep the old build root until all remaining scratch checkouts have a confirmed location", file=sys.stderr)
         return 1
@@ -2740,13 +3077,19 @@ def main() -> int:
     _ = create.add_argument("repo")
     _ = create.add_argument("unit")
     _ = create.add_argument("short_name", metavar="short-name")
+    move = commands.add_parser("move")
+    _ = move.add_argument("path", type=Path)
+    _ = move.add_argument("unit")
+    _ = move.add_argument("short_name", metavar="short-name")
     remove = commands.add_parser("remove")
     _ = remove.add_argument("path", type=Path)
     _ = remove.add_argument("--force", action="store_true")
     retire_unit = commands.add_parser("retire")
     _ = retire_unit.add_argument("unit")
     migration = commands.add_parser("migrate")
-    _ = migration.add_argument("--list", required=True, type=Path)
+    _ = migration.add_argument("--all", dest="scope", action="store_const", const=MigrationScope.ALL,
+                               default=MigrationScope.LISTED, help="select all worktrees")
+    _ = migration.add_argument("--list", type=Path, help="select worktrees or supply names for --all")
     _ = migration.add_argument("--dry-run", action="store_true")
     links = commands.add_parser("old-links")
     _ = links.add_argument("--remove-unused", action="store_true")
@@ -2777,7 +3120,11 @@ def main() -> int:
     try:
         match cast(str, arguments.command):
             case "migrate":
-                return migrate_worktrees(cast(Path, arguments.list), dry_run=cast(bool, arguments.dry_run))
+                scope = cast(MigrationScope, arguments.scope)
+                list_file = cast(Path | None, arguments.list)
+                if scope is MigrationScope.LISTED and list_file is None:
+                    migration.error("specify --list FILE or --all")
+                return migrate_worktrees(list_file, scope=scope, dry_run=cast(bool, arguments.dry_run))
             case "old-links":
                 for link in old_worktree_links(remove_unused=cast(bool, arguments.remove_unused)):
                     users = ", ".join(session.identity for session in link.sessions) or "no known sessions"
@@ -2792,6 +3139,11 @@ def main() -> int:
             case "make":
                 path = make(cast(str, arguments.repo), cast(str, arguments.unit),
                             cast(str, arguments.short_name), staff_record())
+                print(path)
+            case "move":
+                with redirect_stdout(sys.stderr):
+                    path = move_worktree(cast(Path, arguments.path), MoveRepository.FROM_ORIGIN,
+                                         cast(str, arguments.unit), cast(str, arguments.short_name))
                 print(path)
             case _:
                 raise AssertionError("unknown worktree command")
