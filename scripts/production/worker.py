@@ -1372,13 +1372,13 @@ def _detached_resume_context(row: staff.StaffRow, directories: Iterable[Path]) -
 
 
 def _resume_needed(state: worker_panes.OpenWorker | worker_panes.StoppedWorker | worker_panes.ClosedWorker,
-                   directories: Iterable[Path], record: staff.StaffSnapshot
-                   ) -> WorkerResume | DispatchEvidenceUnknown | None:
+                   directories: Iterable[Path]) -> WorkerResume | DispatchEvidenceUnknown | None:
     """Decide from the recorded dispatches, transcript, pane and live runs."""
     directories = tuple(dict.fromkeys(directories))
     detached = _detached_resume_context(state.row, directories)
     active: dict[str, progress_history.ActiveDispatch] = {}
-    with staff.supplied_snapshot(record):
+    # Read the current staff binding under the worker lock and share it across the runs.
+    with staff.supplied_snapshot(staff.snapshot()):
         for directory in directories:
             dispatch = progress_history.active_dispatch(state.row.id, directory)
             if isinstance(dispatch, progress_history.ActiveDispatchUnavailable):
@@ -1560,7 +1560,7 @@ def restore(parent: StaffId, *, record: staff.StaffSnapshot | None = None,
                         failed(state.row, hold.blocker, ExitCode.REFUSED)
                         continue
                     run = worker_panes.worker_run(state.row, record=record, scanned=runs)
-                    plan = _resume_needed(state, (run, *held_runs), record)
+                    plan = _resume_needed(state, (run, *held_runs))
                     if isinstance(plan, DispatchEvidenceUnknown):
                         failed(state.row, plan.reason, notice=f"anomaly: {name}: {plan.reason}")
                         continue
@@ -1581,11 +1581,11 @@ def restore(parent: StaffId, *, record: staff.StaffSnapshot | None = None,
                         if isinstance(state, (worker_panes.OpenWorker, worker_panes.StoppedWorker)):
                             allowed = worker_panes.can_close(state, run=worker_panes.DispatchRun(run), lock=hold)
                             if isinstance(allowed, worker_panes.Kept):
-                                if isinstance(state, worker_panes.OpenWorker) and allowed.blocker == worker_panes.NO_FINAL_REPLY:
-                                    if report is not None:
+                                if report is not None:
+                                    if isinstance(state, worker_panes.OpenWorker) and allowed.blocker == worker_panes.NO_FINAL_REPLY:
                                         report.restored.add(state.row.id)
-                                else:
-                                    failed(state.row, allowed.blocker, notice=f"{name}: {allowed.blocker}")
+                                    else:
+                                        failed(state.row, allowed.blocker)
                                 continue
                             closed = worker_panes.close(parent, WorkerName.parse(name), lock=hold)
                             if not isinstance(closed, worker_panes.Closed):

@@ -2499,7 +2499,8 @@ runpy.run_module('scripts.agents.restart', run_name='__main__', alter_sys=True)
         current, previous = self.root / "current", self.root / "previous"
         for run in (current, previous):
             write_text_atomic(run / unit_runs.STATE_FILE, json.dumps({unit_runs.OWNER_FIELD: owner.id,
-                "open_phases": [{"id": "46", "instance_id": "open-phase", "status": "active"}], "pass": {}}))
+                "open_phases": [{"id": "46", "instance_id": "open-phase", "status": "active"}],
+                "history_file": str(run / "history.jsonl"), "pass": {}}))
         prompt = previous / "prompt.md"
         write_text_atomic(prompt, "Read the report.\n")
         state = worker_panes.OpenWorker(child, "w1:p1", "terminal", herdr.AgentStatus.WORKING)
@@ -2570,7 +2571,8 @@ runpy.run_module('scripts.agents.restart', run_name='__main__', alter_sys=True)
         record = staff.StaffSnapshot((owner, child))
         run = self.root / "active-worker"
         write_text_atomic(run / unit_runs.STATE_FILE, json.dumps({unit_runs.OWNER_FIELD: owner.id,
-            "open_phases": [{"id": "46", "instance_id": "open-phase", "status": "active"}], "pass": {}}))
+            "open_phases": [{"id": "46", "instance_id": "open-phase", "status": "active"}],
+            "history_file": str(run / "history.jsonl"), "pass": {}}))
         prompt = run / "prompt.md"
         write_text_atomic(prompt, "Read the report.\n")
         source = run / "transcript.jsonl"
@@ -2621,7 +2623,8 @@ runpy.run_module('scripts.agents.restart', run_name='__main__', alter_sys=True)
         record = staff.StaffSnapshot((owner, child))
         run = self.root / "active-worker"
         write_text_atomic(run / unit_runs.STATE_FILE, json.dumps({unit_runs.OWNER_FIELD: owner.id,
-            "open_phases": [{"id": "46", "instance_id": "open-phase", "status": "active"}], "pass": {}}))
+            "open_phases": [{"id": "46", "instance_id": "open-phase", "status": "active"}],
+            "history_file": str(run / "history.jsonl"), "pass": {}}))
         prompt = run / "prompt.md"
         write_text_atomic(prompt, "Read the report.\n")
         source, reply_path = run / "transcript.jsonl", run / "reply.md"
@@ -2927,8 +2930,7 @@ runpy.run_module('scripts.agents.restart', run_name='__main__', alter_sys=True)
                     fixture.setUp()
                     _ = scope.callback(fixture.doCleanups)
                     config = Path(os.environ["CONF_DIR"]) / "shutdown.conf"
-                    write_text_atomic(config, config.read_text()
-                        + "\n# range: 0..300\nUPKEEP_ROW_WAIT_SECONDS=0\n")
+                    _ = write_config_fixture(config, "UPKEEP_ROW_WAIT_SECONDS=0\n")
                     owner = staff.rename(fixture.parent.id, "TEST-selected-owner")
                     other = fixture_member("unit", name="TEST-other-owner", parent=owner.parent)
                     selected = fixture.worker("TEST-selected")
@@ -4477,18 +4479,21 @@ runpy.run_module('scripts.agents.restart', run_name='__main__', alter_sys=True)
         acquire_flock = worker_lifecycle.acquire_flock
         with path.open("a") as held:
             fcntl.flock(held, fcntl.LOCK_EX)
+            contend = True
 
             def release_after_timeout(handle: int | worker_lifecycle.LockFileDescriptor, *,
                                       mode: int = fcntl.LOCK_EX, deadline: float = math.inf) -> None:
-                try:
+                nonlocal contend
+                if not contend or getattr(handle, "name", None) != str(path):
                     acquire_flock(handle, mode=mode, deadline=deadline)
-                except worker_lifecycle.OperationDeadlineExpired:
-                    if getattr(handle, "name", None) == str(path):
-                        fcntl.flock(held, fcntl.LOCK_UN)
-                    raise
+                    return
+                contend = False
+                try:
+                    acquire_flock(handle, mode=mode, deadline=min(deadline, time.monotonic() + 0.05))
+                finally:
+                    fcntl.flock(held, fcntl.LOCK_UN)
 
-            with (patch.object(worker_lifecycle, "acquire_flock", side_effect=release_after_timeout),
-                  patch.object(shutdown_record, "record_lock_seconds", return_value=0.05)):
+            with patch.object(worker_lifecycle, "acquire_flock", side_effect=release_after_timeout):
                 yield
 
     def test_restart_keeps_a_deleted_id_when_its_record_lock_times_out(self) -> None:
@@ -4499,9 +4504,9 @@ runpy.run_module('scripts.agents.restart', run_name='__main__', alter_sys=True)
         with self.hold_restart_record_until_timeout(), redirect_stdout(io.StringIO()) as output:
             self.assertEqual(shutdown.main(["restart"]), 0)
 
-        self.assertCountEqual([name for name, _ in self.launches], [row.name for row in rows])
-        self.assertEqual(shutdown_record.read(), [missing])
         report = output.getvalue()
+        self.assertCountEqual([name for name, _ in self.launches], [row.name for row in rows], report)
+        self.assertEqual(shutdown_record.read(), [missing])
         self.assertEqual(Path(report.splitlines()[0]).read_text(), report)
         self.assertIn("agents restart: 2 of 2 sessions back.", report)
         self.assertIn(f"{missing}: could not remove {missing} from the restart record: the record is busy.", report)

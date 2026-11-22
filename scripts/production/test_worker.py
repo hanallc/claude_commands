@@ -41,6 +41,7 @@ from scripts.lib.transcripts import open_transcript
 from scripts.lib.script_envelope import script_prompt
 from scripts.lib.test_models_registry import claude_catalog_environment, write_registry
 from scripts.lib.test_hang_guard import LauncherHangGuard
+from scripts.lint.memory_test_support import write_config_fixture
 from scripts.message import send, sessions
 from scripts.usage import agents_log
 
@@ -332,6 +333,7 @@ class WorkerCommandTests(unittest.TestCase):
     def setUp(self) -> None:
         self.fixture = pane_fixtures.WorkerPaneTests("runTest")
         self.fixture.setUp()
+        _ = write_config_fixture(self.fixture.root / "conf/shutdown.conf")
         _ = (self.fixture.root / "conf/build_targets.conf").write_text("targets=natedev,mac\nkind.natedev=local\nkind.mac=ssh\n")
         self.fixture.world.binary = "/nonexistent/herdr"
         self.addCleanup(self.fixture.doCleanups)
@@ -2986,9 +2988,10 @@ class WorkerCommandTests(unittest.TestCase):
                     check = cast(Callable[..., bool], herdr.check_target)
                     def target(*arguments: object, **options: object) -> bool:
                         return False if refused and options.get("action") == "keys" else check(*arguments, **options)
-                    step = (worker.UnsubmittedAssignment("TEST-pass", ("assign.sh",)) if refused else
+                    opens_pane = incomplete or refused
+                    step = (worker.UnsubmittedAssignment("TEST-pass", ("assign.sh",)) if opens_pane else
                             worker.DispatchEvidenceUnknown("TEST resume read failed"))
-                    with (patch.object(worker_panes, "start_or_resume", side_effect=launch),
+                    with (patch.object(worker_panes, "start_or_resume", side_effect=launch) as start_worker,
                           patch.object(worker, "resume_step", return_value=step),
                           patch.object(herdr, "check_target", side_effect=target),
                           patch.object(case.fixture.world, "tab_sessions", return_value=[director]),
@@ -2997,12 +3000,9 @@ class WorkerCommandTests(unittest.TestCase):
                     case.assertEqual(code, worker.ExitCode.UNCERTAIN)
                     case.assertIn("would send keys to an unproved target" if refused else "TEST resume read failed", errors.getvalue())
                     case.assertEqual(case.agent.submitted, [])
-                    if existing:
-                        case.assertEqual(staff.by_id(opened.row.id), opened.row)
-                        case.assertEqual(len(case.fixture.world.closed), closed)
-                    else:
-                        case.assertEqual(staff.by_id(opened.row.id), opened.row)
-                        case.assertEqual(len(case.fixture.world.closed), closed + 1)
+                    case.assertEqual(start_worker.call_count, int(opens_pane))
+                    case.assertEqual(staff.by_id(opened.row.id), opened.row)
+                    case.assertEqual(len(case.fixture.world.closed), closed + int(opens_pane))
                 finally:
                     case.doCleanups()
 

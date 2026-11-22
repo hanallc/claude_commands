@@ -30,7 +30,7 @@ def upkeep() -> None:
     from scripts.accounts import accounts
     from scripts.agents import shutdown_record, stop_resume
     from scripts.herdr import detection_rules, herdr
-    from scripts.production import gate, staff
+    from scripts.production import gate
     from scripts.production.gate_modules import GateRefused
 
     try:
@@ -62,11 +62,10 @@ def upkeep() -> None:
                 print("herdr-upkeep: producer budget ended; retry remaining producers next run", file=sys.stderr)
                 break
             try:
-                with (operation_deadline.within(min(deadline, time.monotonic() + start_seconds)),
-                      staff.row_operation(str(row.id))):
-                    if shutdown_record.active():
-                        break
-                    result = stop_resume.resume(str(row.id))
+                with operation_deadline.within(min(deadline, time.monotonic() + start_seconds)):
+                    result = stop_resume.resume_for_upkeep(str(row.id))
+                if result is None:
+                    break
                 if isinstance(result, stop_resume.ResumeFailed):
                     print(f"herdr-upkeep: {row.name}: {result.reason}", file=sys.stderr)
                 elif isinstance(result, stop_resume.SessionNotFound):

@@ -1534,6 +1534,14 @@ def resume(session: str, *, why: str = "resumed by name", to: str | None = None,
         return _resume(session, why=why, to=to, requester=requester, client=client)
 
 
+def resume_for_upkeep(session: str) -> ResumeResult | None:
+    """Check for a restart while holding the row lock."""
+    with staff.row_operation(session):
+        if shutdown_record.active():
+            return None
+        return resume(session)
+
+
 def resend_producer_opening(name: str, *, to: str = "") -> ResumeResult:
     """Try one explicit resend to the producer's existing reserved pane."""
     return _locked_first_producer_resume(ProducerFirstStart(name, producer_folder(name)), to=to, resend_opening=True)
