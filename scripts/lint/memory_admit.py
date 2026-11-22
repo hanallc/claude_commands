@@ -2059,7 +2059,7 @@ def reserved_repository_runs(inputs: QueueInputs, limits: records.RepositoryRunL
     for row in inputs.reservations:
         waiter = row.get("queue_waiter")
         repository = waiter.get("repository_name", row["repo"]) if waiter is not None else row["repo"]
-        if limits.for_step(inputs.local_machine, repository, row["step"]):
+        if isinstance(limits.for_step(inputs.local_machine, repository, row["step"]), records.RepositoryRunLimit):
             runs.setdefault(repository, set()).add(repository_run_owner(row))
     return runs
 
@@ -2131,10 +2131,11 @@ def admission_walk(inputs: QueueInputs, ordered: list[tuple[Path, RankedWaiter]]
         local = local_route and isinstance(state, QueuedWaiter)
         repository = row.get("repository_name", "")
         limit = (limits.for_step(inputs.local_machine, repository, row.get("step", ""))
-                 if local and not remote_start_pending else 0)
-        exempt = bool(limit and limits.exempt_unit and
+                 if local and not remote_start_pending else records.NoRepositoryRunLimit())
+        has_run_limit = isinstance(limit, records.RepositoryRunLimit)
+        exempt = bool(has_run_limit and limits.exempt_unit and
                       (row.get("unit") == limits.exempt_unit or owner in inputs.run_limit_exempt_owners))
-        follows_run_limit = bool(limit and not exempt)
+        follows_run_limit = has_run_limit and not exempt
         folder = inputs.cargo_folders.get(owner) if local_route else None
         folder_busy = folder in inputs.occupied_cargo_folders
         earlier = first_for_folder.get(folder, NoWaiter()) if folder is not None else NoWaiter()
@@ -2159,11 +2160,12 @@ def admission_walk(inputs: QueueInputs, ordered: list[tuple[Path, RankedWaiter]]
         gpu_step = gpu.holds(row.get("repository_name", ""), row.get("step", ""))
         gpu_wait = GpuSlotWait(gpu_used, gpu.slots) if gpu_step and gpu_used >= gpu.slots else GpuSlotFree()
         run_wait: records.RunLimitFree | records.RunLimitWait = records.RunLimitFree()
-        if limit:
+        if isinstance(limit, records.RepositoryRunLimit):
             runs = repository_runs.setdefault(repository, set())
             run_owner = repository_run_owner(row)
-            if not exempt and run_owner not in runs and len(runs) >= limit:
-                run_wait = records.RunLimitWait(len(runs), limit, repository, inputs.local_machine)
+            used_runs = len(runs) + inputs.verify_run_counts.get(repository, 0)
+            if not exempt and run_owner not in runs and used_runs >= limit.maximum:
+                run_wait = records.RunLimitWait(used_runs, limit.maximum, repository, inputs.local_machine)
         order_hold: NoOrderHold | HeldBehindHead = NoOrderHold()
         ahead = first_held_other_than_gpu if GPU_WAIT_MAY_PASS and not gpu_step else first_held
         if follows_run_limit and (limited := first_held_by_run_limit.get(repository)) is not None:
@@ -2193,7 +2195,7 @@ def admission_walk(inputs: QueueInputs, ordered: list[tuple[Path, RankedWaiter]]
         if can_start:
             remaining += held + released - need
             gpu_used += gpu_step
-            if limit:
+            if has_run_limit:
                 repository_runs[repository].add(repository_run_owner(row))
             if not reused:
                 new_started = True
