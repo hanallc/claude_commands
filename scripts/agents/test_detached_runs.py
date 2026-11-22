@@ -1282,22 +1282,15 @@ with (patch.object(subprocess.Popen, 'wait', checked_wait), patch.object(subproc
             # It reports after its reap finishes, so the test reads the finished record.
             watcher = self.root / "watcher.py"
             _ = watcher.write_text(f"""import json, os, socket, sys
-from contextlib import ExitStack
 sys.path.insert(0, {str(Path(__file__).resolve().parents[2])!r})
 from unittest.mock import patch
 from scripts.agents import detached_runs
-from scripts.message.repeat_guard_test_support import wait_for_notice_exit
 texts = []
 def deliver(record, result):
     texts.append(detached_runs.result_text(record, result))
     return 'fixture delivery'
-with ExitStack() as scope:
-    scope.enter_context(patch.object(detached_runs, 'deliver', deliver))
-    scope.enter_context(patch.object(detached_runs, '_complete_worker_dispatch', lambda record: None))
-    if sys.platform == 'darwin':
-        # The product's leader wait uses Linux pidfds.
-        scope.enter_context(patch.object(detached_runs, '_wait_for_leader',
-                                         lambda command: wait_for_notice_exit(command.group)))
+with (patch.object(detached_runs, 'deliver', deliver),
+      patch.object(detached_runs, '_complete_worker_dispatch', lambda record: None)):
     status = detached_runs.main(sys.argv[1:])
 with socket.socket(socket.AF_UNIX) as connection:
     connection.connect(os.environ['TEST_STOP_SOCKET'])
