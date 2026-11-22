@@ -1248,3 +1248,17 @@ Ordered after the red main repair and the guard repair (builds). It does not mov
 - **Files:** `scripts/mac_test/mac_queue_run.py`; its test module; the as-built doc that describes Mac queue runs.
 - **Workers:** 1 writer.
 - **Acceptance gate:** fixtures: a run under another holder's block waits (or refuses) with one line and starts no remote command; a holder's run starts; no block starts as before; the changed test modules pass in one tests-only gate (Mac part through the queue); basedpyright zero on changed files; one blind review.
+
+### Phase 428 — a stopped test run leaves no active-runs record  · status: todo
+**Depends on:** Phase 425
+
+#### Work Order
+- **Goal:** a test run stopped by SIGTERM closes or removes its record in `~/.local/state/gate/active-runs/<repo>/`, and a later run drops a record whose pid is dead. builds 23:10: three records from stopped efficiency phase 46 test runs (pids 3022152 about 21:18, 3306214 at 22:56, 646641 at 23:10 with finished false), all exit 143; a dead record makes the next gate fail.
+- **Spec:**
+  1. Find why a SIGTERM stop skips the record close (`scripts/production/gate.py`; `GateRecovery.finish` :748-754 keeps a record that names folders; `recover_gate_directory` :786-819 skips finished records at :794 and checks pid plus start at :796-800). Name the path with file:line, and why a dead record fails the next gate after 425.
+  2. On SIGTERM, the test run closes or removes its record through the existing finish path. Copy no code.
+  3. A later run drops a record whose pid plus start is dead, and recovers its named folders, as `recover_gate_directory` does for other records. A failure stays isolated to that record (425).
+  4. No config key changes; no check goes away.
+- **Files:** `scripts/production/gate.py`; its test module; the as-built doc that describes gate recovery.
+- **Workers:** 1 writer.
+- **Acceptance gate:** fixtures: a SIGTERM stop leaves no open record; a dead-pid record with finished false is dropped by the next run and that run passes; the changed test modules pass in one tests-only gate; basedpyright zero on changed files; one blind review.
