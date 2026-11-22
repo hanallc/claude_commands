@@ -49,6 +49,7 @@ from scripts.production import gate
 from scripts.production.gate_modules import GateRefused
 from scripts.direct.wait_for_test_state import wait_until
 from scripts.lib import conf
+from scripts.lib.git_test_support import commit_repository
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.process_group import send_process_group
@@ -2233,21 +2234,31 @@ with (mock.patch.object(cloud_gate, 'AwsCli', return_value=api),
         rows = [ledger.mapping(cast(object, json.loads(line))) for line in destination.read_bytes().splitlines()]
         self.assertEqual([row['id'] for row in rows], ['older-record', 'gate-attempt'])
 
+    def gate_checkout(self) -> Path:
+        repo = self.root / 'repo'
+        repo.mkdir()
+        _ = gate.checked_git(repo, 'init', '-q')
+        _ = commit_repository(repo, 'Fixture checkout', allow_empty=True)
+        return repo
+
     def test_remote_red_never_calls_the_local_runner(self) -> None:
+        repo = self.gate_checkout()
         remote = gate.GateRun((gate.GateJobResult('fixture', 'test_ok.py', 1, 1, ''),), 1, 1)
         for mode, full in ((gate.SuiteMode.GATE, False), (gate.SuiteMode.TARGETED, True)):
             with (self.subTest(mode=mode, full=full),
                   mock.patch.object(cloud_gate, 'run', return_value=cloud_gate.CloudCompleted(remote)) as run,
                   mock.patch.object(gate, 'select_affected', side_effect=AssertionError('The full suite needs no selection')),
                   mock.patch.object(gate, 'run_suites') as local):
-                self.assertEqual(gate.run_gate_suites(self.root, mode=mode, full=full), remote)
-            local.assert_not_called()
-            self.assertIsInstance(cast(object, run.call_args.kwargs['selected']), gate.AllModules)
+                self.assertEqual(gate.run_gate_suites(repo, mode=mode, full=full), remote)
+                local.assert_not_called()
+                run.assert_called_once()
+                self.assertIsInstance(cast(object, run.call_args.kwargs['selected']), gate.AllModules)
 
     def test_allowed_fallback_calls_the_original_local_runner(self) -> None:
+        repo = self.gate_checkout()
         with (mock.patch.object(cloud_gate, 'run', return_value=cloud_gate.LocalFallback('AWS is down')),
               mock.patch.object(gate, 'run_suites') as local, redirect_stdout(StringIO())):
-            _ = gate.run_gate_suites(self.root, full=True, mode=gate.SuiteMode.TARGETED)
+            _ = gate.run_gate_suites(repo, full=True, mode=gate.SuiteMode.TARGETED)
         self.assertTrue(local.call_args.kwargs['full'])
         self.assertEqual(local.call_args.kwargs['mode'], gate.SuiteMode.TARGETED)
 
