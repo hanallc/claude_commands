@@ -1334,9 +1334,12 @@ function limitWaitFields(waits) {
     return count ? groupRows([staffField("Waiting", names.filter(Boolean)), field("Because", heading)]) : [];
   });
 }
+function limitGpuCount(gpu, words) {
+  return gpu?.used != null && gpu.limit != null ? limitWords(words, "count", gpu) : "";
+}
 function limitCell(cell, words, machine) {
   const {limit, used, other_used, merge_above, waits, note, policy, show_marks = true} = cell;
-  const gpu = machine === "natedev" ? cell.gpu : null;
+  const gpu = machine === "natedev" ? limitGpuCount(cell.gpu, words) : "";
   const noLimit = limit == null && policy === "no_limit";
   const onlyOther = limit == null && used == null;
   const waiting = limitWaitCount(waits);
@@ -1351,7 +1354,7 @@ function limitCell(cell, words, machine) {
     ${marks ? `<span class="build-limit-marks">${marks}</span>` : ""}
     ${count !== "" ? `<span>${esc(count)}</span>` : ""}
     ${gpu ? `<span class="build-limit-chip build-limit-gpu" aria-label="${esc(words.gpu)}">
-      ${limitMarks("gpu")}<span>${esc(limitWords(words, "count", gpu))}</span></span>` : ""}
+      ${limitMarks("gpu")}<span>${esc(gpu)}</span></span>` : ""}
     ${waiting ? limitWaitChip(waiting) : ""}
     ${detail ? '<span class="build-limit-note">ⓘ</span>' : ""}</span>`;
 }
@@ -1380,7 +1383,7 @@ function limitTooltipRows(key, limits) {
     : policy === "no_limit" ? words.no_limit : policy === "configured" ? words.limit_set : "";
   const rows = [field("Limit", policyText), field(machine === "mac" ? "In use" : "Run count", limit == null ? used || "" : ""),
     field("Verify runs", verify_used || ""),
-    ...(gpu ? [field(words.gpu, limitWords(words, "count", gpu)), field("GPU limit", words.gpu_limit)] : []),
+    ...(gpu ? [field(words.gpu, limitGpuCount(gpu, words)), field("GPU limit", words.gpu_limit)] : []),
     staffField("Running", runs.filter(Boolean)),
     staffField("Merge above limit", merge_above.filter(Boolean)),
     field("Other running", other_used || ""), staffField("Other names", other.filter(Boolean)), field("Status", note),

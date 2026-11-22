@@ -1,6 +1,7 @@
 """Check the Build limits section with published records and private fixture settings."""
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 import subprocess
@@ -24,7 +25,7 @@ from scripts.build_queue.admission_test_support import AdmissionFixture, only_ad
 from scripts.build_queue.admission_wire import ReservedCloudSlot
 from scripts.build_queue.cloud_progress import NoCloudProgress
 from scripts.build_queue.progress_profile import NoCounter
-from scripts.build_queue.queue_fixture import fixture_reservation, head_reading, write_memory_config
+from scripts.build_queue.queue_fixture import fixture_reservation, head_reading, write_memory_config, write_process
 from scripts.build_queue.scope_activity import LiveBuildRun
 from scripts.build_targets import target_config, targets
 from scripts.build_targets.execution_transport import HanaControlTransport
@@ -32,7 +33,6 @@ from scripts.buildlog import repository, store
 from scripts.lib import conf, process_start
 from scripts.lib.git_test_support import commit_repository, fixture_git_environment
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
-from scripts.lint.memory_admit import queue_read_from
 from scripts.mac_test import claim_state, mac_test
 
 
@@ -41,55 +41,46 @@ def wait_names(groups: Mapping[str, limits_view.WaitGroup]) -> dict[str, list[st
 
 
 class BuildLimitsTests(unittest.TestCase):
-    def test_counts_include_starts_granted_in_the_published_pass(self) -> None:
-        origin = "https://example.invalid/team/hana"
-        with AdmissionFixture() as fixture:
-            base = head_reading(now=fixture.clock.now())
-            request = fixture.request(need=0, step="gate", since=fixture.clock.now() - 2)
-            request = replace(request, profile=replace(request.profile, repo="hana",
-                repository=records.RepositoryIdentity(origin, "hana")))
-            _ = only_admitted(fixture.server.handle_request(request))
-            self.check_published_pass_counts(base, request, origin)
+    hana_origin: str = "https://example.invalid/team/hana"
 
-    def check_published_pass_counts(self, base: records.QueueRead, request: wire.AdmitRequest, origin: str) -> None:
-        inputs = base.explanation.decided_from
-        first: records.Waiter = {"pid": request.owner.pid, "start_time": request.owner.start_time,
-            "since": request.since, "need": 0,
-            "repository_name": "hana", "repo_identity": origin, "step": "gate"}
-        second: records.Waiter = {**first, "pid": 2, "start_time": "2", "since": inputs.now - 1}
-        existing: records.Reservation = {**fixture_reservation(3, 0, step="test"), "repo": "hana", "repo_identity": origin}
-        running = records.RunningStep("", "", "test", existing["worktree"], 0, records.PromisedMemory(0), pid=3)
-        policy = replace(base.explanation.policy,
-            repository_runs=records.RepositoryRunLimits({"natedev.hana": 2}),
-            gpu_tests=records.GpuTestSlots(2, frozenset({"hana"})))
-        reading = queue_read_from(replace(inputs, ordered=[(Path("first"), first), (Path("second"), second)],
-            running=(running,), reservations=(existing,), slots=(), verify_run_counts={"hana": 1}), policy)
-        reply = wire.parse_reply(wire.encode_reply(wire.ViewReply(reading)))
-        assert isinstance(reply, wire.ViewReply)
-        reading = reply.reading
-        head = reading.explanation.head
-        assert isinstance(head, records.HeadExplanation)
-        self.assertEqual(head.decision.state, "admit")
-        next_waiter, = reading.explanation.line.steps
-        self.assertEqual(next_waiter.decision.run_limit, records.RunLimitWait(2, 2, "hana", "natedev"))
-        self.assertEqual(next_waiter.decision.gpu, records.GpuSlotWait(2, 2))
-        saved = limits_view.Background(frozenset({origin}), limits_view.Metric("money", None, None))
+    def configure_hana(self, fixture: AdmissionFixture) -> None:
+        config = fixture.root / "build_admission.conf"
+        write_memory_config(config, gpu_test_repositories="hana", gpu_test_slots="2")
+        _ = config.write_text(config.read_text() +
+            f"\nmax_runs.{fixture.server.host}.hana=2\nmax_runs.exempt_unit=natemerge\n")
+
+    def hana_request(self, fixture: AdmissionFixture, step: str = "gate") -> wire.AdmitRequest:
+        request = fixture.request(need=0, step=step)
+        return replace(request, profile=replace(request.profile, repo="hana",
+            repository=records.RepositoryIdentity(self.hana_origin, "hana")))
+
+    def hana_cell(self, reading: records.QueueRead) -> limits_view.Cell:
+        saved = limits_view.Background(frozenset({self.hana_origin}), limits_view.Metric("money", None, None))
         shown = limits_view.build_limits(reading, (), (), {}, {}, saved, UTC)
-        cell = shown.repositories[0].natedev
-        self.assertEqual((cell.used, cell.limit, cell.verify_used), (2, 2, 1))
-        self.assertEqual(cell.gpu, limits_view.Metric("gpu", 2, 2))
+        return next(row.natedev for row in shown.repositories if row.name == "hana")
+
+    def test_counts_include_starts_granted_in_the_published_pass(self) -> None:
+        with AdmissionFixture() as fixture:
+            self.configure_hana(fixture)
+            verify = fixture.proc.spawn()
+            self.assertEqual(fixture.server.handle_request(wire.VerifyRunSlotRequest(verify, "hana", "")), [wire.Ok()])
+            _ = only_admitted(fixture.server.handle_request(self.hana_request(fixture, "test")))
+            fixture.allow_next_start()
+            grant = only_admitted(fixture.server.handle_request(self.hana_request(fixture)))
+            reply, = fixture.server.handle_request(wire.ViewRequest())
+            assert isinstance(reply, wire.ViewReply)
+            reply = wire.parse_reply(wire.encode_reply(reply))
+            assert isinstance(reply, wire.ViewReply)
+            self.assertNotIn(grant.reservation,
+                [row.get("reservation_id") for row in reply.reading.explanation.decided_from.reservations])
+            cell = self.hana_cell(reply.reading)
+            self.assertEqual((cell.used, cell.limit, cell.verify_used), (2, 2, 1))
+            self.assertEqual(cell.gpu, limits_view.Metric("gpu", 2, 2))
 
     def test_release_refresh_does_not_count_a_recomputed_start(self) -> None:
-        origin = "https://example.invalid/team/hana"
-        saved = limits_view.Background(frozenset({origin}), limits_view.Metric("money", None, None))
         with AdmissionFixture() as fixture:
-            config = fixture.root / "build_admission.conf"
-            write_memory_config(config, gpu_test_repositories="hana", gpu_test_slots="2")
-            _ = config.write_text(config.read_text() +
-                f"\nmax_runs.{fixture.server.host}.hana=2\nmax_runs.exempt_unit=natemerge\n")
-            request = fixture.request(need=0, step="gate")
-            request = replace(request, profile=replace(request.profile, repo="hana",
-                repository=records.RepositoryIdentity(origin, "hana")))
+            self.configure_hana(fixture)
+            request = self.hana_request(fixture)
             grant = only_admitted(fixture.server.handle_request(request))
             fixture.release(grant)
             reply, = fixture.server.handle_request(wire.ViewRequest())
@@ -99,15 +90,81 @@ class BuildLimitsTests(unittest.TestCase):
             assert isinstance(head, records.HeadExplanation)
             self.assertEqual(head.decision.state, "admit")
             self.assertEqual(reading.explanation.decided_from.reservations, ())
-            shown = limits_view.build_limits(reading, (), (), {}, {}, saved, UTC)
-            cell = shown.repositories[0].natedev
+            cell = self.hana_cell(reading)
             self.assertEqual((cell.used, cell.limit), (0, 2))
             self.assertEqual(cell.gpu, limits_view.Metric("gpu", 0, 2))
-            with mock.patch.dict(os.environ, {"BUILDLOG_DIR": str(fixture.temporary)}):
-                unavailable = limits_view.build_limits(reading, (), (), {}, {}, saved, UTC)
-            cell = unavailable.repositories[0].natedev
-            self.assertEqual((cell.used, cell.limit), (None, 2))
-            self.assertEqual(cell.gpu, limits_view.Metric("gpu", None, 2))
+
+    def test_counts_stay_with_the_reply_after_release_and_replacement(self) -> None:
+        with AdmissionFixture() as fixture:
+            self.configure_hana(fixture)
+            released = only_admitted(fixture.server.handle_request(self.hana_request(fixture)))
+            fixture.allow_next_start()
+            retained = only_admitted(fixture.server.handle_request(self.hana_request(fixture)))
+            third = self.hana_request(fixture)
+            wait, = fixture.server.handle_request(third)
+            self.assertIsInstance(wait, wire.Wait)
+            before, = fixture.server.handle_request(wire.ViewRequest())
+            assert isinstance(before, wire.ViewReply)
+            fixture.release(released)
+            fixture.allow_next_start()
+            _ = fixture.run_pass()
+            after, = fixture.server.handle_request(wire.ViewRequest())
+            assert isinstance(after, wire.ViewReply)
+            replacement = fixture.server.reservations[third.episode].reservation_id
+            for reply, expected in ((before, released.reservation), (after, replacement)):
+                occupancy = reply.reading.explanation.local_occupancy
+                assert occupancy is not None
+                self.assertEqual({row.get("reservation_id") for row in occupancy.reservations},
+                                 {expected, retained.reservation})
+                cell = self.hana_cell(reply.reading)
+                self.assertEqual((cell.used, cell.limit), (2, 2))
+                self.assertEqual(cell.gpu, limits_view.Metric("gpu", 2, 2))
+
+    def test_two_gate_steps_share_the_build_owner_from_admission(self) -> None:
+        with AdmissionFixture() as fixture:
+            self.configure_hana(fixture)
+            run = fixture.run_owner()
+            _ = (fixture.proc.path / str(run.pid) / "environ").write_bytes(
+                f"BUILDLOG_RUN={run.pid}:{run.start_time}\0".encode())
+            for step in ("gate", "test-affected"):
+                request = self.hana_request(fixture, step)
+                write_process(fixture.proc.path, request.owner.pid, parent=run.pid, start=request.owner.start_time)
+                _ = only_admitted(fixture.server.handle_request(request))
+                fixture.allow_next_start()
+            reply, = fixture.server.handle_request(wire.ViewRequest())
+            assert isinstance(reply, wire.ViewReply)
+            cell = self.hana_cell(reply.reading)
+            self.assertEqual((cell.used, cell.limit), (1, 2))
+            self.assertEqual(cell.gpu, limits_view.Metric("gpu", 2, 2))
+
+    def test_old_reply_shows_restart_note_without_a_count_or_null(self) -> None:
+        with AdmissionFixture() as fixture:
+            self.configure_hana(fixture)
+            _ = only_admitted(fixture.server.handle_request(self.hana_request(fixture)))
+            reply, = fixture.server.handle_request(wire.ViewRequest())
+            assert isinstance(reply, wire.ViewReply)
+        message = cast(dict[str, object], json.loads(wire.encode_reply(reply)))
+        data = cast(dict[str, object], message["data"])
+        reading = cast(dict[str, object], data["reading"])
+        explanation = cast(dict[str, object], reading["explanation"])
+        del explanation["local_occupancy"]
+        old = wire.parse_reply(json.dumps(message))
+        assert isinstance(old, wire.ViewReply)
+        cell = self.hana_cell(old.reading)
+        self.assertIsNone(cell.used)
+        self.assertEqual(cell.gpu, limits_view.Metric("gpu", None, 2))
+        empty = limits_view.MachineLimits("", (), {})
+        section = limits_view.BuildLimits(empty, empty, empty,
+            (limits_view.RepositoryRow("hana", natedev=cell),), False, {})
+        rendered, tooltip = cast(list[str], test_memory_hover.MemoryHoverTests().page_expression("""(() => {
+            renderBuildLimits(data.build_limits);
+            return [$('build-limits-content').innerHTML, pageTooltipHtml('limit:cell:natedev:hana', data)];
+        })()""", {"build_limits": snapshot_codec.snapshot_value(section)}, limits=True))
+        self.assertIn("The admission service needs a restart.", tooltip)
+        for output in (rendered, tooltip):
+            self.assertNotIn("null", output)
+            self.assertNotIn("0 of 2", output)
+        self.assertNotIn("build-limit-gpu", rendered)
 
     def test_mac_only_verify_wait_uses_the_machine_that_holds_the_run(self) -> None:
         base = head_reading()
@@ -240,7 +297,8 @@ class BuildLimitsTests(unittest.TestCase):
         }
         explanation = replace(reading.explanation,
             policy=replace(reading.explanation.policy, repository_runs=policy),
-            decided_from=replace(reading.explanation.decided_from, reservations=reservations, build_space=records.BuildSpaceLow(20, 31)))
+            decided_from=replace(reading.explanation.decided_from, build_space=records.BuildSpaceLow(20, 31)),
+            local_occupancy=records.LocalAdmissionOccupancy(reservations, {}))
         full = records.RunLimitWait(2, 1, "project", "natedev")
         waiting = (
             records.WaitingStep(1, "", "", "gate", str(copied), now, 0, full),
@@ -307,12 +365,12 @@ class BuildLimitsTests(unittest.TestCase):
                 "repo_identity": "https://example.invalid/team/quiet", "unit": "quiet-check",
             }
             running = show(replace(queue, explanation=replace(explanation,
-                decided_from=replace(explanation.decided_from, reservations=(*reservations, check_quiet)))))
+                local_occupancy=records.LocalAdmissionOccupancy((*reservations, check_quiet), {}))))
             self.assertEqual(running.natedev.unattributed, 1)
             self.assertEqual(next(row.natedev for row in running.repositories if row.name == "quiet"), quiet.natedev)
         unbound = show(replace(queue, view=replace(queue.view, waiting=unbound_waits),
             explanation=replace(explanation,
-                decided_from=replace(explanation.decided_from, reservations=(*reservations, unbound_reservation)))))
+                local_occupancy=records.LocalAdmissionOccupancy((*reservations, unbound_reservation), {}))))
         meters = {metric.label: (metric.used, metric.limit) for metric in unbound.natedev.shared}
         self.assertEqual(meters["Repository run limit"], (1, 2))
         self.assertEqual(meters["unmatched run limit"], (0, 1))
@@ -344,7 +402,7 @@ class BuildLimitsTests(unittest.TestCase):
         copy_only = replace(queue,
             view=replace(queue.view, waiting=(replace(waiting[0], reason=replace(full, used=1)), *waiting[1:])),
             explanation=replace(explanation,
-            decided_from=replace(explanation.decided_from, reservations=reservations[1:2])))
+                local_occupancy=records.LocalAdmissionOccupancy(reservations[1:2], {})))
         copy_limits = show(copy_only)
         copy_cell = next(row.natedev for row in copy_limits.repositories if row.name == "project")
         self.assertEqual((copy_cell.used, copy_cell.limit, copy_cell.runs), (1, 1, ["merge-owner"]))
@@ -356,7 +414,7 @@ class BuildLimitsTests(unittest.TestCase):
         within_limit = replace(queue,
             view=replace(queue.view, waiting=(replace(waiting[0], reason=matching), *waiting[1:])),
             explanation=replace(explanation,
-                decided_from=replace(explanation.decided_from, reservations=(*reservations, check)),
+                local_occupancy=records.LocalAdmissionOccupancy((*reservations, check), {}),
                 policy=replace(explanation.policy,
                     repository_runs=records.RepositoryRunLimits({"natedev.project": 2}, "merge-owner"))))
         within = show(within_limit)
@@ -380,8 +438,7 @@ class BuildLimitsTests(unittest.TestCase):
             explanation=replace(within_limit.explanation,
                 policy=replace(within_limit.explanation.policy, gpu_tests=gpu,
                     repository_runs=records.RepositoryRunLimits({"natedev.hana": 2})),
-                decided_from=replace(within_limit.explanation.decided_from, reservations=gpu_runs,
-                    verify_run_counts={"hana": 2})))
+                local_occupancy=records.LocalAdmissionOccupancy(gpu_runs, {"hana": 2})))
         wait_limits = show(with_verify)
         wait_cell = next(row.natedev for row in wait_limits.repositories if row.name == "hana")
         self.assertEqual((wait_cell.used, wait_cell.limit, wait_cell.verify_used), (2, 2, 2))
@@ -514,7 +571,7 @@ class BuildLimitsTests(unittest.TestCase):
                  ordered: list[tuple[Path, records.RankedWaiter]] = queue.ordered) -> limits_view.BuildLimits:
             reading = replace(queue, ordered=ordered, explanation=replace(queue.explanation,
                 policy=replace(queue.explanation.policy, repository_runs=run_limits),
-                decided_from=replace(queue.explanation.decided_from, reservations=reservations)))
+                local_occupancy=records.LocalAdmissionOccupancy(reservations, {})))
             return limits_view.build_limits(reading, (), waits, {}, {}, replace(saved, origins=origins, history=history), UTC)
 
         def project(shown: limits_view.BuildLimits) -> limits_view.Cell:

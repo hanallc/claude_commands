@@ -1,7 +1,6 @@
 """Read the published records for the Build limits section."""
 from __future__ import annotations
 
-import json
 import sqlite3
 from collections import Counter
 from collections.abc import Callable, Iterable, Mapping, Sequence
@@ -16,7 +15,7 @@ from urllib.parse import urlsplit
 
 from scripts.aws_target import config as aws_config, hana_box, hana_placement, spend
 from scripts.build_queue import admission_protocol as wire, admission_records as records
-from scripts.build_queue import admission_service, placement, queue_view, snapshot_codec, target_availability
+from scripts.build_queue import placement, queue_view, target_availability
 from scripts.build_queue.admission_wire import ReservedCloudSlot
 from scripts.build_queue.slot_wait import public_queue_text
 from scripts.build_targets import target_config, targets
@@ -54,6 +53,7 @@ WORDS: Mapping[str | type[object], str | WaitWords] = {
     "memory": "Memory for builds",
     "gpu": "GPU tests",
     "gpu_limit": "The GPU limit applies to tests for this repository on natedev.",
+    "admission_restart": "The admission service needs a restart.",
     "disk": "Free disk",
     "cloud": "Places",
     "money": "Money today",
@@ -302,11 +302,12 @@ def waiting_cause(step: records.WaitingStep) -> records.WaitReason:
 
 
 def active_checkouts(reading: records.QueueRead) -> frozenset[CheckoutUse | WaitingCheckout]:
-    inputs = reading.explanation.decided_from
+    occupancy = reading.explanation.local_occupancy
+    reservations = occupancy.reservations if occupancy is not None else reading.explanation.decided_from.reservations
     checkouts: set[CheckoutUse | WaitingCheckout] = {
         CheckoutUse(item["worktree"], wire.Owner(item["pid"], item["start_time"]),
                     item.get("reservation_id", item["admitted_at"]))
-        for item in inputs.reservations if item["worktree"]
+        for item in reservations if item["worktree"]
     }
     checkouts.update(WaitingCheckout(step.folder, step.pid, step.since,
                          isinstance(step.route, (target_config.MacOnly, target_config.PinnedTarget)))
@@ -826,31 +827,16 @@ def place_mac_counts(mac: MacReading, rows: dict[str, RepositoryRow], names: Map
     return unattributed, "A Mac claim has no repository name that this page can show." if missing_scope else ""
 
 
-def committed_starts(waiters: Sequence[records.RankedWaiter],
-                     reservations: Sequence[records.Reservation]) -> tuple[records.Reservation, ...] | ReadingState:
-    """Read reservations that admission saves before it sends a grant."""
-    if not waiters:
-        return ()
-    # The view can still show the queue from before admission saved the reservations.
-    waiting = {(row["pid"], row["start_time"], row["since"], row.get("step", "")) for row in waiters}
-    captured = {row.get("reservation_id") for row in reservations}
-    try:
-        state = cast(dict[str, object], json.loads((store.root() / "admission" / "state.json").read_text(encoding="utf-8")))
-        saved = cast(dict[str, admission_service.ReservationRecord], snapshot_codec.parse_snapshot_value(
-            state["reservations"], dict[str, admission_service.ReservationRecord]))
-        return tuple(admission_service.reservation_row(row) for row in saved.values()
-            if isinstance(row.place, wire.LocalPlace) and row.reservation_id not in captured
-            and (row.owner.pid, row.owner.start_time, row.queue_waiter["since"], row.step) in waiting)
-    except (OSError, ValueError, KeyError, TypeError, RecursionError, OverflowError):
-        return ReadingState.UNAVAILABLE
-
-
 def build_limits(reading: records.QueueRead, snapshots: target_availability.Snapshots,
                  waits: Sequence[VisibleWait], cloud_names: Mapping[wire.Owner, str],
                  names: Mapping[str, str], saved: Background, zone: tzinfo, *,
                  mac: MacReading | None = None) -> BuildLimits:
     explanation = reading.explanation
-    inputs = explanation.decided_from
+    occupancy = explanation.local_occupancy
+    inputs = replace(explanation.decided_from,
+        reservations=occupancy.reservations if occupancy is not None else (),
+        verify_run_counts=occupancy.verify_run_counts if occupancy is not None else {})
+    local_note = PAGE_WORDS["admission_restart"] if occupancy is None else ""
     policy = explanation.policy.repository_runs
     local = inputs.local_machine
     prefix = local + "."
@@ -868,24 +854,7 @@ def build_limits(reading: records.QueueRead, snapshots: target_availability.Snap
     unresolved_policy = False
     run_labels: dict[tuple[str, str], tuple[str, str]] = {}
     gpu = explanation.policy.gpu_tests
-    run_waiters: set[str] = set()
-    gpu_waiters = False
-    metered_waiters: list[records.RankedWaiter] = []
-    for waiter in explanation.ordered:
-        key, step = waiter.get("repository_name", ""), waiter.get("step", "")
-        run_metered = isinstance(policy.for_step(local, key, step), records.RepositoryRunLimit)
-        gpu_metered = gpu.holds(key, step)
-        if run_metered:
-            run_waiters.add(key)
-        gpu_waiters |= gpu_metered
-        if run_metered or gpu_metered:
-            metered_waiters.append(waiter)
-    starts = committed_starts(metered_waiters, inputs.reservations)
-    starts_unreadable = isinstance(starts, ReadingState)
-    if isinstance(starts, tuple) and starts:
-        inputs = replace(inputs, reservations=(*inputs.reservations, *starts))
-    gpu_used = (None if starts_unreadable and gpu_waiters else
-                sum(gpu_test_reservation(item, gpu) for item in inputs.reservations))
+    gpu_used = sum(gpu_test_reservation(item, gpu) for item in inputs.reservations)
     mac_targets = {"mac"}
     if isinstance(snapshots, tuple):
         mac_targets.update(snapshot.target.name for snapshot in snapshots if snapshot.target.platform == "macos")
@@ -922,8 +891,8 @@ def build_limits(reading: records.QueueRead, snapshots: target_availability.Snap
     for origin in history:
         _ = observe_local(origin)
 
-    occupancy = reserved_repository_runs(inputs, policy)
-    seen = {owner for owners in occupancy.values() for owner in owners}
+    repository_runs = reserved_repository_runs(inputs, policy)
+    seen = {owner for owners in repository_runs.values() for owner in owners}
     limited_owners = frozenset(seen)
     unattributed = 0
     for reservation in inputs.reservations:
@@ -1076,10 +1045,10 @@ def build_limits(reading: records.QueueRead, snapshots: target_availability.Snap
 
     shared: list[Metric] = []
     for repository_key, limit in local_limits.items():
-        owners = occupancy.get(repository_key, set[str]())
+        owners = repository_runs.get(repository_key, set[str]())
         verify_used = inputs.verify_run_counts.get(repository_key, 0)
         used = len(owners) + verify_used
-        count = None if starts_unreadable and repository_key in run_waiters else used
+        count = None if occupancy is None else used
         runs: list[str] = []
         merge_above: list[str] = []
         for owner in sorted(owners):
@@ -1101,7 +1070,7 @@ def build_limits(reading: records.QueueRead, snapshots: target_availability.Snap
 
     for key in sorted(gpu.repositories):
         if name := bound_rows.get(key) or short_name(recorded_origin(key)) or policy_label(key):
-            row(name).natedev.gpu = Metric("gpu", gpu_used, gpu.slots)
+            row(name).natedev.gpu = Metric("gpu", gpu_used if occupancy is not None else None, gpu.slots)
 
     for name, item in rows.items():
         if name in keys_by_row and not unresolved_policy:
@@ -1121,6 +1090,9 @@ def build_limits(reading: records.QueueRead, snapshots: target_availability.Snap
         if unattributed and item.natedev.policy is CellPolicy.NO_LIMIT:
             item.natedev.used = None
             item.natedev.runs.clear()
+        if local_note:
+            item.natedev.used = None
+            item.natedev.note = local_note
         if cloud_origin_missing:
             item.aws.used = None
             item.aws.runs.clear()
@@ -1148,7 +1120,7 @@ def build_limits(reading: records.QueueRead, snapshots: target_availability.Snap
                    unreadable=cloud_slots is ReadingState.UNAVAILABLE, reserved_waiting=cloud_waiting)
     first_rows = {"claude_commands": 0, "hana": 1}
     return BuildLimits(MachineLimits(local_state(snapshots, local, bool(inputs.reservations), zone),
-                                    (*limits, *shared), local_waits, unattributed),
+                                    (*limits, *shared), local_waits, unattributed, local_note),
                        MachineLimits(mac_state(snapshots, zone), (), mac_waits, mac_unattributed, mac_note),
                        MachineLimits(aws_state, (cloud, saved.aws_money), aws_waits),
                        tuple(sorted(rows.values(), key=lambda item: (first_rows.get(item.name, len(first_rows)),
