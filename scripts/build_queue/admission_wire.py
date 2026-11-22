@@ -218,6 +218,24 @@ class RepositorySlotExpired:
 
 
 @dataclass(frozen=True)
+class VerifyRunSlotRequest(CallerCode):
+    """Request one slot for the lifetime of the Verify process."""
+    owner: Owner
+    repository: str
+    session_id: str
+    unit: str = ""
+    worktree: str = field(default="", kw_only=True)
+    verify: VerifyStep = field(default=NotVerifyCall(), kw_only=True)
+    placement_episode: str = field(default="", kw_only=True)
+
+
+@dataclass(frozen=True)
+class VerifyRunSlotWaiting:
+    """The repository has no free slot for a new Verify run."""
+    reason: records.RunLimitWait
+
+
+@dataclass(frozen=True)
 class ServiceEstimateRequest(CallerCode):
     """Ask the service to estimate a cargo call from its own history."""
     episode: str
@@ -672,18 +690,21 @@ class DispatchStatus:
     retry: placement.RetryDecision = field(default_factory=lambda: placement.DoNotRetry("attempt is not settled"))
 
 
-Request = (RepositorySlotRequest | ServiceEstimateRequest | AdmitRequest | LaunchRequest | ReleaseRequest | WidthRequest | ViewRequest
+Request = (RepositorySlotRequest | VerifyRunSlotRequest | ServiceEstimateRequest | AdmitRequest | LaunchRequest
+           | ReleaseRequest | WidthRequest | ViewRequest
            | BuildHistoryRequest | ExplainRequest | MineRequest | PrioritySetRequest | PriorityClearRequest
            | QueueMoveRequest | QueueUndoRequest | TokenWaitRequest
            | PlacementRequest | PlacementStatusRequest | ClaimFailure | ConsumePermission | ExecutionReport | PrerequisiteReport | CancelPlacement)
 
-Reply = (RepositorySlotWaiting | RepositorySlotReady | RepositorySlotExpired | Wait | RunnerAdmitted | Admitted | LaunchAdmitted | Refused | Ok | BuildHistoryReply
+Reply = (RepositorySlotWaiting | RepositorySlotReady | RepositorySlotExpired | VerifyRunSlotWaiting
+         | Wait | RunnerAdmitted | Admitted | LaunchAdmitted | Refused | Ok | BuildHistoryReply
          | PlacementWait | Assignment | LocalPlacementGranted | FirstAuthorization | DispatchStatus | PlacementStatusReply
          | QueueMoved | QueueMoveConflict)
 
 _GROUPED_CLOUD_ADMIT = "cloud_group_admit"
 _REQUESTS: dict[str, type] = {
     "repository_slot": RepositorySlotRequest,
+    "verify_run_slot": VerifyRunSlotRequest,
     "service_estimate": ServiceEstimateRequest, "admit": AdmitRequest, "launch": LaunchRequest, "release": ReleaseRequest,
     "width": WidthRequest, "view": ViewRequest, "explain": ExplainRequest,
     "build_history": BuildHistoryRequest, "mine": MineRequest,
@@ -697,6 +718,7 @@ _REQUESTS: dict[str, type] = {
 REPLY_TYPES: dict[str, type] = {
     "repository_slot_waiting": RepositorySlotWaiting, "repository_slot_ready": RepositorySlotReady,
     "repository_slot_expired": RepositorySlotExpired,
+    "verify_run_slot_waiting": VerifyRunSlotWaiting,
     "wait": Wait, "runner_admitted": RunnerAdmitted, "admitted": Admitted, "launch_admitted": LaunchAdmitted,
     "queue_moved": QueueMoved, "queue_move_conflict": QueueMoveConflict,
     "build_history": BuildHistoryReply, "refused": Refused, "ok": Ok,

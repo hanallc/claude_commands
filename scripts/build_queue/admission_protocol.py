@@ -50,6 +50,8 @@ from scripts.build_queue.admission_wire import (
     RepositorySlotWaiting as RepositorySlotWaiting,
     RepositorySlotReady as RepositorySlotReady,
     RepositorySlotExpired as RepositorySlotExpired,
+    VerifyRunSlotRequest as VerifyRunSlotRequest,
+    VerifyRunSlotWaiting as VerifyRunSlotWaiting,
     LaunchRequest as LaunchRequest,
     ReleaseRequest as ReleaseRequest,
     WidthRequest as WidthRequest,

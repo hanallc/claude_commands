@@ -977,6 +977,34 @@ def _stop_staff_row(record: StaffSnapshot, reference: str) -> StaffRow | None:
     return matches[0] if len(matches) == 1 else None
 
 
+def stop_producer(identity: StaffId, why: str, *, deadline: float,
+                  save_exit_after_stop: bool = False) -> StopResult:
+    """Protect an intentional producer stop with a hold under the row lock."""
+    with staff.row_operation(identity):
+        row = staff.initial_snapshot().rows_by_id.get(identity)
+        if row is None or row.kind != "producer":
+            return SessionNotFound(identity)
+        machine = member_machine(row)
+        if machine and machine != remote.local_machine() and machine != remote.this_machine():
+            return StopFailed(str(row.current_session), f"session is on {machine}")
+        new_hold = not isinstance(row.exited, staff.Exited)
+        if new_hold:
+            if save_exit_after_stop:
+                _ = staff.pause(identity, why)
+            else:
+                _ = staff.exit(identity, why)
+        result = stop(identity, deadline=deadline)
+        if isinstance(result, (Stopped, NotRunning)) and result.session_id != row.current_session:
+            result = StopFailed(str(row.current_session), "the producer conversation changed before the stop")
+        if isinstance(result, (Stopped, NotRunning)):
+            shutdown_record.update(started=[], pending=[identity])
+            if new_hold and save_exit_after_stop:
+                _ = staff.exit(identity, why)
+        elif new_hold:
+            _ = staff.set_hold(identity, row.paused)
+        return result
+
+
 def _stop_recorded(session: str, kind: str = "", *,
                    codex: herdr.CodexConversations | None = None) -> StopResult:
     """Stop on purpose; retain its launch for an explicit resume, not crash recovery."""
@@ -1555,12 +1583,22 @@ def resume(session: str, *, why: str = "resumed by name", to: str | None = None,
         return _resume(session, why=why, to=to, requester=requester, client=client)
 
 
-def resume_for_upkeep(session: str) -> ResumeResult | None:
-    """Check for a restart while holding the row lock."""
-    with staff.row_operation(session):
+@dataclass(frozen=True)
+class StoppedOnPurpose:
+    name: str
+
+
+def resume_for_upkeep(identity: StaffId) -> ResumeResult | StoppedOnPurpose | None:
+    """Check for a restart or an exit hold under the row lock."""
+    with staff.row_operation(identity):
         if shutdown_record.active():
             return None
-        return resume(session)
+        row = staff.initial_snapshot().rows_by_id.get(identity)
+        if row is None or row.kind != "producer":
+            return SessionNotFound(identity)
+        if isinstance(row.exited, staff.Exited) or isinstance(row.paused, staff.Paused):
+            return StoppedOnPurpose(row.name)
+        return resume(identity)
 
 
 def resend_producer_opening(name: str, *, to: str = "") -> ResumeResult:
@@ -1603,8 +1641,11 @@ def _resume(session: str, *, why: str = "resumed by name", to: str | None = None
         members = [row for row in names.tab_record.rows
                    if row.current_session == result.session_id or row.id == session or row.name == session]
         if len(members) == 1:
-            with staff.row_operation(str(members[0].id)):
-                shutdown_record.remove_started([str(members[0].id)])
+            member = members[0]
+            with staff.row_operation(str(member.id)):
+                if member.kind == "producer" and isinstance(member.exited, staff.Exited):
+                    _ = staff.resume(str(member.id))
+                shutdown_record.remove_started([str(member.id)])
     return result
 
 

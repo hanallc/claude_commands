@@ -8,6 +8,30 @@ from dataclasses import dataclass
 from urllib.parse import quote
 
 from scripts.lib import conf
+from scripts.review_links import page_frame
+
+
+DIALOG_ID = 'record-item-dialog'
+DELIVERY_WINDOW_SECONDS = 30
+
+
+def delivery_window_seconds(settings: conf.ConfigRead) -> int:
+    """Read the limit for immediate refreshes after a save."""
+    return settings.value('page_delivery_window_seconds', conf.positive_whole, default=DELIVERY_WINDOW_SECONDS)
+
+
+def render_dialog() -> str:
+    """Render the dialog that Review and The List use for open records."""
+    return page_frame.console_dialog(
+        DIALOG_ID, 'record-item-title', 'Item',
+        '<div data-record-dialog-detail></div>',
+        before_body=('<div class="record-dialog-status">'
+                     '<span data-record-missing role="status" hidden>This item is no longer in the list.</span>'
+                     '<span data-record-updates role="status" hidden>Updates available</span>'
+                     '<button type="button" data-show-record-updates hidden>Show updates</button></div>'),
+        footer=('<footer><div data-record-error role="status" hidden></div>'
+                '<div data-record-link-notice role="status" hidden></div></footer>'),
+    )
 
 
 @dataclass(frozen=True)
@@ -151,6 +175,21 @@ border:1px solid var(--line);border-radius:8px;padding:8px;min-width:0;max-width
 .list-counts{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-top:20px;color:var(--ink-2);font-size:13px}
 .list-count-chip{border:1px solid var(--line);border-radius:999px;background:var(--card);padding:5px 12px}
 [data-window-before],[data-window-after],[data-window-gap]{border:0!important;margin:0!important;border-radius:0!important}
+#record-item-dialog{margin:16px auto auto}
+#record-item-dialog .console-dialog-frame{grid-template-rows:auto auto minmax(0,1fr) 70px}
+#record-item-dialog .console-dialog-body{scrollbar-gutter:stable}
+#record-item-dialog .console-dialog-frame>footer{overflow-y:auto;overscroll-behavior:contain}
+.record-dialog-status{height:52px;box-sizing:border-box;padding-inline:24px;display:flex;align-items:center;gap:8px}
+.record-dialog-status [data-show-record-updates]{flex:none;margin:0;font:inherit;min-height:44px;padding:6px 14px;
+border:1px solid var(--ink-3);border-radius:8px;background:var(--card);color:var(--ink)}
+.record-dialog-status [data-show-record-updates]:focus-visible{outline:2px solid currentColor;outline-offset:2px}
+@media(max-width:480px){.record-dialog-status{padding-inline:16px}}
+:is([data-record-missing],[data-record-error],[data-record-link-notice]){color:var(--warning)}
+:is([data-record-error],[data-record-link-notice]){padding-block:12px;border-top:1px solid var(--line);overflow-wrap:anywhere}
+:is([data-record-dialog-detail],[data-review-card]) button[aria-disabled="true"]{opacity:.5;cursor:default}
+[data-record-dialog-detail] :is(.list-panel,.review-panel){grid-template-columns:minmax(0,1fr);padding:0;border:0}
+[data-record-dialog-detail] .review-actions{display:grid;gap:16px}
+[data-record-dialog-detail] .review-action-group+.review-action-group{padding:0;border:0}
 [data-empty],[data-missing-keys]{padding:16px;margin:0;color:var(--ink-2)}
 [data-missing-keys]{white-space:pre-line}
 [data-missing-item]{color:var(--ink-2);scroll-margin-top:16px}
@@ -213,7 +252,16 @@ border:1px solid var(--line);border-radius:8px;background:var(--bg);color:var(--
 </style>'''
 
 
-SCRIPT = r'''const filterControl={
+DETAIL_SCRIPT = r'''
+function recordDetails(item){return item?.dialogDetails ?? item?.querySelector('[data-detail]>td');}
+function recordIsOpen(item){return item?.querySelector('.list-toggle')?.getAttribute('aria-expanded')==='true';}
+function recordFromDetail(element){
+ return element?.closest('[data-record-dialog-detail]')?.recordItem ?? element?.closest('[data-list-item]');
+}
+'''
+
+
+SCRIPT = DETAIL_SCRIPT + r'''const filterControl={
  wordValues:new WeakMap(),
  getWords(control){return this.wordValues.get(control) ?? '';},
  setWords(control,value){
@@ -269,9 +317,9 @@ SCRIPT = r'''const filterControl={
   }
  }
 };
-function recordPlaceParams(){
- const params=new URLSearchParams(location.search);
- const fragment=new URLSearchParams(location.hash.slice(1));
+function recordPlaceParams(target=location){
+ const params=new URLSearchParams(target.search);
+ const fragment=new URLSearchParams(target.hash.slice(1));
  for(const key of new Set(fragment.keys())) params.delete(key);
  for(const [key,value] of fragment) params.append(key,value);
  return params;
@@ -306,6 +354,18 @@ let latestSubmission=0,latestActionFailure=null;
 const boundRoots=new WeakSet();
 const collator=new Intl.Collator(undefined,{numeric:true,sensitivity:'base'});
 let windowEntries=[],pendingFrame=0,revealKey='';
+const dialog=document.getElementById('record-item-dialog'),dialogBody=dialog?.querySelector('.console-dialog-body');
+const dialogDetail=dialog?.querySelector('[data-record-dialog-detail]');
+const dialogTitle=dialog?.querySelector('h2'),dialogMissing=dialog?.querySelector('[data-record-missing]');
+const dialogError=dialog?.querySelector('[data-record-error]');
+const dialogUpdates=dialog?.querySelector('[data-record-updates]');
+const showUpdates=dialog?.querySelector('[data-show-record-updates]');
+const dialogLinkNotice=dialog?.querySelector('[data-record-link-notice]');
+const closeDialogButton=dialog?.querySelector('[data-close]');
+let dialogItem=null,dialogNeedsRecord=false,dialogSuspended=false;
+let shownRevision,statusError='',savedDisplayFailed=false;
+let itemRequest=null;
+const pendingDetail=new Map();
 const measured=new Map(),mounted=new Map(),windowGaps=[];
 const resize=typeof ResizeObserver==='function' ? new ResizeObserver(()=>scheduleWindow()) : null;
 function scheduleWindow(){if(options.mount && !pendingFrame) pendingFrame=requestAnimationFrame(()=>{pendingFrame=0;drawWindow();});}
@@ -347,10 +407,14 @@ function drawWindow(){
  }
  const start=Math.max(0,locate(prefix,scrollY-origin)-8);
  const end=Math.min(entries.length,start+90,Math.max(start+18,locate(prefix,scrollY-origin+innerHeight)+9));
- const focused=document.activeElement?.closest('[data-list-item]')?.dataset.key || options.focusKey?.();
- const focusAt=focused ? entries.findIndex(({data})=>data.key===focused) : -1;
+ const focusedRow=document.activeElement?.closest('[data-list-item]');
+ const focused=focusedRow?.dataset.key || options.focusKey?.();
  const ranges=[[start,end],...motionRanges];
- if(focusAt>=0) ranges.push([Math.max(0,focusAt-1),Math.min(entries.length,focusAt+2)]);
+ for(const key of new Set([focused,opened.values().next().value,dialogItem?.dataset.key])){
+  if(!key || options.pinOpenRow?.(key)===false) continue;
+  const at=entries.findIndex(({data})=>data.key===key);
+  if(at>=0) ranges.push([Math.max(0,at-1),Math.min(entries.length,at+2)]);
+ }
  const windows=mergeRanges(ranges);
  const keys=new Set(windows.flatMap(([from,to])=>entries.slice(from,to)
   .filter(entry=>entry.visible).map(({data})=>data.key)));
@@ -358,41 +422,272 @@ function drawWindow(){
  for(const gap of windowGaps.splice(windows.length-1)) gap.remove();
  spacer(before,prefix[windows[0][0]]);
  spacer(after,prefix.at(-1)-prefix[windows.at(-1)[1]]);
- let cursor=before;
- const placeNode=node=>{
-  if(cursor.nextElementSibling!==node) cursor.after(node);
-  cursor=node;
- };
+ const nodes=[];
  for(const [position,[from,to]] of windows.entries()){
   if(position){
    const gap=windowGaps[position-1] ??= document.createElement('tbody');
    gap.setAttribute('data-window-gap','');
    spacer(gap,prefix[from]-prefix[windows[position-1][1]]);
-   placeNode(gap);
+   nodes.push(gap);
   }
   for(const {data,visible} of entries.slice(from,to)){
-   if(visible) placeNode(mount(data));
+   if(visible) nodes.push(mount(data));
    const motion=motions.get(data.key);
-   if(motion) placeNode(motion.spacer);
+   if(motion) nodes.push(motion.spacer);
   }
  }
+ // Move the rows around the focused row to keep its focus.
+ const anchor=nodes.indexOf(focusedRow);
+ let next=focusedRow;
+ for(let i=anchor-1;i>=0;i--){
+  const node=nodes[i];
+  if(next.previousElementSibling!==node) next.before(node);
+  next=node;
+ }
+ let cursor=anchor<0 ? before : focusedRow;
+ for(let i=anchor+1;i<nodes.length;i++){
+  const node=nodes[i];
+  if(cursor.nextElementSibling!==node) cursor.after(node);
+  cursor=node;
+ }
+ syncItemDialog();
  showHiddenActionResults([...mounted.values()]);
  options.mounted?.();
 }
+function updateItemDetail(item,update){
+ const detail=recordDetails(item);
+ if(detail!==dialogDetail || !dialog.open){update(detail);return;}
+ const top=dialogBody.scrollTop,field=document.activeElement;
+ const selector=detail.contains(field) && (field.id ? '#'+CSS.escape(field.id) :
+  field.localName+['name','value','href'].map(name=>field.hasAttribute(name) ?
+   '['+name+'="'+CSS.escape(field.getAttribute(name))+'"]' : '').join(''));
+ const at=selector ? [...detail.querySelectorAll(selector)].indexOf(field) : -1;
+ const start=field?.selectionStart,end=field?.selectionEnd,direction=field?.selectionDirection;
+ update(detail);
+ if(at>=0 && !field.isConnected){
+  const next=detail.querySelectorAll(selector)[at];
+  (next ?? closeDialogButton).focus({preventScroll:true});
+  if(typeof start==='number' && next?.setSelectionRange) next.setSelectionRange(start,end,direction);
+ }
+ dialogBody.scrollTop=top;
+}
+function drawDetailStatus(){
+ if(!dialog) return;
+ const error=savedDisplayFailed ? 'Saved; the item could not refresh.' : statusError;
+ dialogError.hidden=!error || !dialogMissing.hidden;
+ dialogError.textContent=error;
+ showUpdates.hidden=dialogUpdates.hidden=!pendingDetail.size || !dialogMissing.hidden;
+ const blocked=itemUpdateRequired();
+ for(const button of dialogDetail.querySelectorAll('form button:is([type="submit"],:not([type]))')){
+  if(blocked) button.setAttribute('aria-disabled','true');
+  else button.removeAttribute('aria-disabled');
+ }
+}
+function itemUpdateRequired(){return [...pendingDetail.values()].some(update=>update.blocks);}
+function itemError(message){statusError=message;drawDetailStatus();}
+function queueItemUpdate(item,slot,update,blocks=true){
+ if(item!==dialogItem){update?.(item,recordDetails(item));return;}
+ if(deliveryRequest()){
+  pendingDetail.delete(slot);
+  if(update){
+   options.rememberItem?.(item);
+   updateItemDetail(item,detail=>update(item,detail));
+  }
+  drawDetailStatus();
+  return;
+ }
+ if(update) pendingDetail.set(slot,{update,blocks});else pendingDetail.delete(slot);
+ drawDetailStatus();
+}
+function installItemRevision(revision,render){
+ return (row,detail)=>{
+  render(row,detail);
+  shownRevision=revision;
+  savedDisplayFailed=false;
+ };
+}
+function presentItemRevision(item,revision,render,{initial=false,force=false}={}){
+ const install=installItemRevision(revision,render);
+ if(initial){
+  updateItemDetail(item,detail=>install(item,detail));
+  drawDetailStatus();
+  return;
+ }
+ queueItemUpdate(item,'body',force || revision!==shownRevision ? install : null);
+}
+function installOwnItemResult(request,revision,render){
+ if(!currentItemRequest(request)) return;
+ const item=dialogItem;
+ options.rememberItem?.(item);
+ pendingDetail.clear();
+ const install=installItemRevision(revision,render);
+ updateItemDetail(item,detail=>install(item,detail));
+ drawDetailStatus();
+}
+function startItemRequest(key){
+ const request={key,delivery:'',until:0};
+ itemRequest=request;
+ savedDisplayFailed=false;
+ drawDetailStatus();
+ return request;
+}
+function startDeliveryWindow(request,result){
+ if(!result.delivery_pending || !result.delivery || !currentItemRequest(request)) return;
+ request.delivery=result.delivery;
+ request.until=performance.now()+Number(content.dataset.deliveryWindowSeconds)*1000;
+}
+function deliveryRequest(){
+ return performance.now()<itemRequest?.until && currentItemRequest(itemRequest) ? itemRequest : null;
+}
+function finishDeliveryWindow(request){
+ if(currentItemRequest(request)) request.until=0;
+}
+function currentItemRequest(request){
+ return Boolean(request) && itemRequest===request && dialogItem?.dataset.key===request.key && opened.has(request.key);
+}
+function savedItemError(request){
+ if(!currentItemRequest(request)) return;
+ savedDisplayFailed=true;
+ drawDetailStatus();
+}
+function showDraftCopy(words,editable){
+ if(!words || editable || dialogDetail.querySelector('[data-review-draft]')) return;
+ const label=document.createElement('label'),field=document.createElement('textarea');
+ label.textContent='Your unsaved words';
+ field.value=words;field.readOnly=true;field.dataset.reviewDraft='';
+ label.append(field);dialogDetail.append(label);
+}
+function applyItemUpdates(){
+ const item=dialogItem;
+ if(!item || !pendingDetail.size) return;
+ options.rememberItem?.(item);
+ const full=pendingDetail.get('body');
+ const updates=[...pendingDetail.values()].filter(update=>update!==full);
+ pendingDetail.clear();
+ updateItemDetail(item,detail=>{
+  full?.update(item,detail);
+  for(const {update} of updates) update(item,detail);
+ });
+ drawDetailStatus();
+ return true;
+}
+showUpdates?.addEventListener('click',()=>{
+ const focused=document.activeElement===showUpdates;
+ applyItemUpdates();
+ if(focused) closeDialogButton.focus({preventScroll:true});
+});
+function setDialogTitle(item){
+ dialogTitle.textContent=options.itemTitle?.(item) ?? item.querySelector('.list-toggle').textContent.replace(/^›/,'').trim();
+}
+function returnItemDetail(){
+ if(!dialogItem) return;
+ if(!dialogMissing.hidden || !applyItemUpdates()) options.rememberItem?.(dialogItem);
+ pendingDetail.clear();
+ itemRequest=null;
+ savedDisplayFailed=false;
+ statusError='';
+ delete dialogItem.dialogDetails;
+ recordDetails(dialogItem).replaceChildren(...dialogDetail.childNodes);
+ delete dialogDetail.recordItem;
+ dialogItem=null;
+}
+function syncItemDialog(){
+ if(!dialog) return;
+ const key=opened.values().next().value;
+ if(!key){
+  if(!dialogItem) return;
+  const previous=dialogItem.dataset.key;
+  const restoreFocus=!dialogSuspended && options.ownsFocus?.()!==false;
+  returnItemDetail();dialog.close();
+  if(restoreFocus){
+   const row=options.mount ? mounted.get(previous) : itemWithKey(previous);
+   (row && !row.hidden ? row.querySelector('.list-toggle') : words()).focus({preventScroll:true});
+  }
+  return;
+ }
+ const sameItem=dialogItem?.dataset.key===key;
+ let item=options.mount ? mounted.get(key) ?? (sameItem && !dialogNeedsRecord ? dialogItem : null) : itemWithKey(key);
+ if(options.mount && !item && options.hasKey(key)){
+  item=options.mount(itemWithKey(key).dataset);
+  item.hidden=true;setExpanded(item,true);
+ }
+ if(!item || (options.hasKey && !options.hasKey(key))){
+  if(sameItem){
+   dialogMissing.hidden=false;
+   pendingDetail.clear();drawDetailStatus();
+   dialogDetail.querySelectorAll('form button').forEach(control=>control.disabled=true);
+  }
+  return;
+ }
+ dialogNeedsRecord=false;
+ if(item===dialogItem) return;
+ const wasMissing=!dialogMissing.hidden;
+ const keepBody=sameItem && !dialogDetail.querySelector('[data-record-loading]');
+ const incoming=recordDetails(item);
+ if(keepBody) delete dialogItem.dialogDetails;
+ else{
+  if(dialogItem) returnItemDetail();
+  dialogDetail.replaceChildren(...incoming.childNodes);
+  shownRevision=options.itemRevision?.(item);
+  setDialogTitle(item);
+ }
+ dialogItem=item;dialogDetail.recordItem=item;item.dialogDetails=dialogDetail;
+ dialogMissing.hidden=true;
+ if(options.itemRevision && keepBody){
+  const revision=options.itemRevision(item);
+  presentItemRevision(item,revision,(row,detail)=>{
+   const slot=options.retainedDetailSlot;
+   const retained=slot && detail.querySelector(slot);
+   if(retained) incoming.querySelector(slot)?.replaceWith(retained.cloneNode(true));
+   detail.replaceChildren(...incoming.childNodes);
+   setDialogTitle(row);
+   options.detailInstalled?.(row);
+  },{force:wasMissing});
+ }else if(!keepBody) options.detailInstalled?.(item);
+ drawDetailStatus();
+ if(!dialog.open && !dialogSuspended) dialog.showModal();
+ if(!sameItem && !dialogSuspended){
+  closeDialogButton.focus({preventScroll:true});
+  dialogBody.scrollTop=0;
+ }
+}
+function suspendItemDialog(){
+ if(!dialog?.open) return;
+ const top=dialogBody.scrollTop;
+ dialogSuspended=true;
+ dialog.close();
+ return ()=>{
+  dialogSuspended=false;
+  if(!dialogItem) return;
+  dialog.showModal();
+  dialogBody.scrollTop=top;
+ };
+}
+if(dialog) bindConsoleDialog(dialog,()=>{
+ if(!dialog.open) return;
+ closeCard(dialogItem.dataset.key,false);
+ apply(true);
+});
 function mount(data){
  const key=data.key;
  let node=mounted.get(key);
- if(!node){node=options.mount(data);mounted.set(key,node);resize?.observe(node);}
+ if(!node){
+  node=!dialogNeedsRecord && options.pinOpenRow?.(key)!==false && dialogItem?.dataset.key===key
+   ? dialogItem : options.mount(data);
+  mounted.set(key,node);resize?.observe(node);
+ }
  node.hidden=false;
  const expanded=!node.hasAttribute('data-validating-change') && opened.has(key);
- node.querySelector('[data-detail]').hidden=!expanded;
- node.querySelector('.list-toggle').setAttribute('aria-expanded',String(expanded));
- node.querySelector('.list-row').classList.toggle('open',expanded);
+ setExpanded(node,expanded);
  return node;
 }
 if(options.mount){
  addEventListener('scroll',scheduleWindow,{passive:true});
  addEventListener('resize',()=>{measured.clear();scheduleWindow();});
+ content.addEventListener('focusin',event=>{
+  const row=event.target.closest('[data-list-item]');
+  if(row && !row.contains(event.relatedTarget)) drawWindow();
+ });
  content.addEventListener('focusout',scheduleWindow);
 }
 
@@ -458,19 +753,20 @@ function readPlace(params,followingItemLink=false){
  for(const name of filterNames) filters[name]=params.get(name) || '';
  if(!options.shows.includes(show)) show=defaultShow;
  if(!columns.includes(sort)) sort='';
- const item=params.get('item');if(item && !followingItemLink){
+ const item=params.get('item');
+ const saved=followingItemLink ? null : history.state?.recordTable;
+ if(saved){
+  opened.clear();
+  const key=saved.opened.includes(item) ? item : saved.opened[0];
+  if(key) openCard(key);
+ }else if(!followingItemLink && item){
   if(keys.size) keys.add(item);
   if(!['owner','showrunner','show','q','sort','dir','type','source-owner',...filterNames].some(key=>params.has(key))){
    owner='';show='all';
    query='';type='';for(const name of filterNames) filters[name]='';}
-  if(options.hasKey?.(item) ?? itemWithKey(item)){openCard(item);revealKey=item;}
- }
- const saved=followingItemLink ? null : history.state?.recordTable;
- if(saved && (!options.mount || saved.top!==undefined)){
-  opened.clear();
-  const key=saved.opened.includes(item) ? item : saved.opened[0];
-  if(key) openCard(key);
- }
+  if(itemWithKey(item)){openCard(item);revealKey=item;}
+  else if(dialog && !options.keepItemOnMissingLink) opened.clear();
+ }else if(dialog && !followingItemLink) opened.clear();
  linkedItem=options.missingItem ? saved?.linkedItem ?? (
   !options.persistLinkedTarget || params.get('linked')==='1' ? item ?? '' : '') : '';
  pendingItem=Boolean(options.resolveItem && linkedItem && saved?.pendingItem);
@@ -528,9 +824,11 @@ function stopMotion(item){
  item.classList.remove('record-motion-source');
 }
 function setExpanded(item,expanded){
- const detail=item.querySelector('[data-detail]'),changed=detail.hidden===expanded;
- detail.hidden=!expanded;
- item.querySelector('.list-toggle').setAttribute('aria-expanded',String(expanded));
+ const detail=item.querySelector('[data-detail]'),toggle=item.querySelector('.list-toggle');
+ const changed=recordIsOpen(item)!==expanded;
+ detail.hidden=true;
+ toggle.setAttribute('aria-expanded',String(expanded));
+ if(dialog){toggle.setAttribute('aria-controls',dialog.id);toggle.setAttribute('aria-haspopup','dialog');}
  item.querySelector('.list-row').classList.toggle('open',expanded);
  return changed;
 }
@@ -543,7 +841,7 @@ function animateRow(table,item,showRow,previousItem=item){
  if(!height) return;
  // A copy can fade and shrink while the record leaves the view at once.
  const spacer=document.createElement('tbody');
- spacer.dataset.recordMotion='';spacer.inert=true;spacer.setAttribute('aria-hidden','true');
+ spacer.dataset.recordMotion='';spacer.dataset.recordMotionKey=item.dataset.key;spacer.inert=true;spacer.setAttribute('aria-hidden','true');
  const cell=spacer.insertRow().insertCell();
  const columns=table.querySelector(':scope > colgroup');
  cell.colSpan=columns.children.length;cell.className='record-motion-cell';
@@ -573,7 +871,8 @@ function showHiddenActionResults(items){
  if(!status) return;
  const hidden=key=>{
   const item=items.find(item=>item.dataset.key===key);
-  return !item || item.hidden || item.querySelector('[data-detail]').hidden || !item.querySelector('[data-send-status]');
+  return !item || item.hidden || dialogItem!==item ||
+   !recordDetails(item)?.querySelector('[data-send-status]');
  };
  const messages=[];
  for(const [key,{hiddenMessage}] of actionNotices)
@@ -588,11 +887,11 @@ function showActionResult(item,submission,label,{kind,message,hiddenMessage}){
  const key=item.dataset.key;
  actionNotices.set(key,{message,hiddenMessage});
  if(kind==='failure' && submission===latestSubmission) latestActionFailure={key,message:label+': '+message};
- const status=item.querySelector('[data-send-status]');
+ const status=recordDetails(item)?.querySelector('[data-send-status]');
  if(status) status.textContent=message;
  apply(false,{animate:true});
  const restored=mounted.get(key);
- if(kind==='failure' && restored && restored!==item && !matchMedia('(prefers-reduced-motion: reduce)').matches){
+ if(kind==='failure' && restored && rowMotion.has(item)){
   animateRow(content.querySelector('table'),restored,true,item);
  }
 }
@@ -635,7 +934,7 @@ function applyRows(write,{animate=false,dismissMissingItem=false,normalizeOwner=
  const missingLinkedItem=linkedItem!=='' && !hasKey(linkedItem);
  if(missingLinkedItem){
   keys.delete(linkedItem);
-  opened.delete(linkedItem);
+  if(dialogItem?.dataset.key!==linkedItem) opened.delete(linkedItem);
   if(dismissMissingItem) linkedItem='';
  }
  if(dismissMissingItem && rows.some(item=>item.dataset.key===linkedItem && canRevealLinked(item,currentSelection()))){
@@ -735,11 +1034,17 @@ function applyRows(write,{animate=false,dismissMissingItem=false,normalizeOwner=
   notice.hidden=!missing.length;
  }
  empty.hidden=count>0 || missing.length>0;
+ if(!options.mount) syncItemDialog();
  const missingItem=content.querySelector('[data-missing-item]');
  if(missingItem){
-  const message=linkedItem && missingLinkedItem ? options.missingItem(linkedItem) : '';
-  missingItem.textContent=message;
-  missingItem.hidden=!message;
+  const message=linkedItem && missingLinkedItem && dialogItem?.dataset.key!==linkedItem ? options.missingItem(linkedItem) : '';
+  const inside=dialogItem && message;
+  missingItem.textContent=inside ? '' : message;
+  missingItem.hidden=!message || Boolean(inside);
+  if(dialogLinkNotice){
+   dialogLinkNotice.textContent=inside || '';
+   dialogLinkNotice.hidden=!inside;
+  }
  }
  const group=content.querySelector('[data-clear-linked-reviews]');
  if(group) group.hidden=!keys.size;
@@ -777,6 +1082,8 @@ function restorePlace(event){
  const top=place();
  if(retryItemLink()) return;
  apply(false,{top,normalizeOwner:!history.state?.recordTable});
+ if(options.keepItemOnMissingLink && !history.state?.recordTable && linkedItem && !itemWithKey(linkedItem))
+  history.replaceState(placeState(scrollY),'');
  if(Number.isFinite(top)) scrollTo({top,behavior:'instant'});
 }
 function saveDeparturePlace(){
@@ -785,7 +1092,8 @@ function saveDeparturePlace(){
   writePlace(false,scrollY);
  }else history.replaceState(placeState(scrollY),'');
 }
-function jump(key,{pushPlace=true,focusTarget=true,keepMatchingFilters=false,preserveFilters=false,unresolved=false}={}){
+function jump(key,{pushPlace=true,focusTarget=true,keepMatchingFilters=false,preserveFilters=false,unresolved=false,
+ keepItemOnMissing=options.keepItemOnMissingLink}={}){
  if(pushPlace) saveDeparturePlace();
  const target=itemWithKey(key);
  linkedItem=options.missingItem ? key : '';
@@ -806,58 +1114,61 @@ function jump(key,{pushPlace=true,focusTarget=true,keepMatchingFilters=false,pre
    if(sharedWords()) filterControl.setWords(words(),query);
   }
  }
+ if(dialog && !target && !keepItemOnMissing) opened.clear();
  if(options.mount && target) revealKey=key;
  apply(true,{pushPlace,normalizeOwner:!preserveFilters});
  const mountedTarget=options.mount ? mounted.get(key) : target;
  if(!mountedTarget){
-  content.querySelector('[data-missing-item]')?.scrollIntoView({block:'nearest',behavior:'instant'});
+  if(!dialog?.open) content.querySelector('[data-missing-item]')?.scrollIntoView({block:'nearest',behavior:'instant'});
   return;
  }
  const row=mountedTarget.querySelector('.list-row');
- if(mountedTarget.hidden || !focusTarget) return;
+ if(mountedTarget.hidden) return;
+ if(!focusTarget) return;
  highlightedRow?.removeAttribute('data-record-highlight');
  clearTimeout(highlightTimer);
  const banner=document.querySelector('[data-page-status]');
  const bannerHeight=banner && getComputedStyle(banner).position==='sticky' ? banner.getBoundingClientRect().height : 0;
  row.style.scrollMarginTop=(bannerHeight+16)+'px';
- row.querySelector('.list-toggle').focus({preventScroll:true});
+ if(!dialog) row.querySelector('.list-toggle').focus({preventScroll:true});
  row.scrollIntoView({block:'start',behavior:'instant'});
  row.dataset.recordHighlight='';
  highlightedRow=row;
  highlightTimer=setTimeout(()=>row.removeAttribute('data-record-highlight'),1200);
 }
 function openCard(key){
- for(const previous of opened) measured.delete(previous);
  opened.clear();
  opened.add(key);
- measured.delete(key);
  if(linkedItem!==key){linkedItem='';revealedLinkedItem='';}
 }
 function closeCard(key,write=true){
  const wasOpen=opened.delete(key);
- if(linkedItem===key){linkedItem='';revealedLinkedItem='';}
- else if(!wasOpen) return;
- measured.delete(key);
+ if(!wasOpen && linkedItem!==key) return;
+ linkedItem='';revealedLinkedItem='';
  if(write && location.hash===placeHash) writePlace();
 }
 function ownerChipSelection(selection,nextOwner){
  return nextOwner===selection.owner ? selection : {...selection,owner:nextOwner,sourceOwner:''};
 }
+function followRecordLink(event){
+ const link=event.target.closest('a[data-record-jump]');
+ if(!link || event.defaultPrevented || event.button!==0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+ const key=new URLSearchParams(link.hash.slice(1)).get('item');
+ if(!key) return;
+ event.preventDefault();
+ jump(key,{keepItemOnMissing:true});
+}
+dialogDetail?.addEventListener('click',followRecordLink);
 function bind(){
  if(boundRoots.has(content)) return;boundRoots.add(content);
- const changePlace=(normalizeOwner=false)=>apply(true,{dismissMissingItem:true,normalizeOwner});
+ const changePlace=(normalizeOwner=false)=>{
+   apply(true,{dismissMissingItem:true,normalizeOwner});
+ };
  const changeFilter=()=>{if(sharedWords()) query=currentWords();changePlace(true);};
  content.querySelector('[data-clear-linked-reviews]')?.addEventListener('click',()=>{
   keys.clear();changeFilter();words().focus({preventScroll:true});
  });
- content.addEventListener('click',event=>{
-  const link=event.target.closest('a[data-record-jump]');
-  if(!link || event.defaultPrevented || event.button!==0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
-  const key=new URLSearchParams(link.hash.slice(1)).get('item');
-  if(!key) return;
-  event.preventDefault();
-  jump(key);
- });
+ content.addEventListener('click',followRecordLink);
  filterSelection('owner').bind(value=>{
   const current=currentSelection(),next=ownerChipSelection(current,value);
   if(next===current) return;
@@ -883,7 +1194,13 @@ function bind(){
   type=button.dataset.typeChip;changeFilter();
  }));
 }
-return {place,apply,bind,opened,openCard,closeCard,restorePlace,drawWindow,followItemLink,retryItemLink,itemLinkKey,saveDeparturePlace,ownerChipSelection,get linkedItem(){return linkedItem;},
+return {place,apply,bind,opened,openCard,closeCard,restorePlace,drawWindow,updateItemDetail,queueItemUpdate,presentItemRevision,
+ startItemRequest,currentItemRequest,startDeliveryWindow,deliveryRequest,finishDeliveryWindow,installOwnItemResult,savedItemError,itemError,itemUpdateRequired,setDialogTitle,showDraftCopy,suspendItemDialog,get dialogItem(){return dialogItem;},followItemLink,retryItemLink,itemLinkKey,saveDeparturePlace,ownerChipSelection,get linkedItem(){return linkedItem;},
+ canSubmit(form,key){
+  return dialog?.open && location.hash===placeHash && dialogItem?.dataset.key===key &&
+   opened.has(key) && dialogMissing.hidden && dialogDetail.contains(form) &&
+   !itemUpdateRequired();
+ },
  revealMatchingItem(key){
   const target=itemWithKey(key);
   const selection=currentSelection({query:currentWords().trim().toLowerCase()});
@@ -920,6 +1237,7 @@ return {place,apply,bind,opened,openCard,closeCard,restorePlace,drawWindow,follo
  settled(){return Promise.all([...rowMotion.values()].map(motion=>motion.finished));},
  replace(draw=true){
   const previous=currentWords(),previousQuery=query;
+  dialogNeedsRecord=Boolean(dialogItem && options.mount);
   for(const gap of windowGaps.splice(0)) gap.remove();
   for(const node of mounted.values()){resize?.unobserve(node);options.unmount?.(node);node.remove();}
   mounted.clear();measured.clear();content=contentProxy();
