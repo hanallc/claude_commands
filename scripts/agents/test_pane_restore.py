@@ -29,7 +29,7 @@ from scripts.agents import member_account, restart, stop_resume
 from scripts.agents.launch_names import LaunchNames
 from scripts.production import staff, session_staff
 from scripts.lib.atomic_file import write_text_atomic
-from scripts.lib import unit_runs
+from scripts.lib import transcripts, unit_runs
 from scripts.lib.test_models_registry import write_registry
 from scripts.lib.transcripts import claude_project_key
 from scripts.agents import pane_record as restart_records
@@ -229,7 +229,7 @@ class FakeClient(herdr.Herdr):
 
 @final
 class PaneRestoreTests(unittest.TestCase):
-    row = staff.StaffRow(staff.StaffId("restore-row"), "producer", "alpha", staff.StaffRoot(),
+    row = staff.StaffRow(staff.native_id(fixture_runtime_id("restore-row")), "producer", "alpha", staff.StaffRoot(),
         current_session=staff.StaffId("019b3a40-4250-7000-8000-000000000102"),
         worktree=staff.PresentWorktree("natedev", Path("/work/alpha")))
 
@@ -294,8 +294,10 @@ class PaneRestoreTests(unittest.TestCase):
         process({"HERDR_PROC": str(self.root / "proc")}, 998042, 1, ["zsh"], {})
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"HERDR_PROC": str(self.root / "proc")})))
         _ = self.enterContext(mock.patch.object(herdr, "_PLATFORM", "linux"))
-        (self.config / "projects/work").mkdir(parents=True)
-        _ = (self.config / "projects/work/019b3a40-4250-7000-8000-000000000102.jsonl").write_text("{}\n")
+        assert isinstance(self.row.worktree, staff.PresentWorktree)
+        project = self.config / "projects" / transcripts.claude_project_key(self.row.worktree.path)
+        project.mkdir(parents=True)
+        _ = (project / f"{self.row.current_session}.jsonl").write_text("{}\n")
         def no_envrc(directory: Path, environment: Mapping[str, str]) -> herdr.nix_env.NoEnvrc:
             _ = directory
             return herdr.nix_env.NoEnvrc(dict(environment))

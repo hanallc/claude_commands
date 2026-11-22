@@ -739,10 +739,10 @@ def _broadcast_worker_mode(active: bool) -> None:
 
     _start_detached("no-worker mode broadcast", "production/broadcast.py", notice)
     try:
-        producer_ids = conf.read("accounts").value("no_worker_mode_fyi_staff_ids", str.split, allow_blank=True)
+        producer_ids = conf.read("accounts").words("no_worker_mode_fyi_staff_ids", allow_blank=True)
     except conf.Unusable as error:
         print(f"quota-alert: no-worker mode FYI failed: {' '.join(str(error).split())}")
-        producer_ids = []
+        producer_ids = ()
     for producer_id in dict.fromkeys(producer_ids):
         try:
             recipient = f"staff:{staff.native_id(producer_id)}"

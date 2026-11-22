@@ -350,6 +350,7 @@ The shared pane launch builder uses `set_home`.
 | `scripts/agents/stop_results.py` | read | StaffRow and backend types (type check only) |
 | `scripts/agents/stop_resume.py` | write | initial_snapshot, row_operation, slot_operation, ensure, native_id, set_home, resume, set_hold, child_environment |
 | `scripts/agents/unit_staff_test_support.py` | read | staff.json path |
+| `scripts/aws_target/config.py` | read | `native_id` validates the Cost Explorer recipient and returns a `StaffId`. |
 | `scripts/statusline/assignment.py` | read | StaffRow.from_json, StaffSnapshot |
 | `scripts/statusline/counts_row.py` | read | record_path, by_id, parent_of, StaffId (StaffRefused exception) |
 | `scripts/statusline/statusline.sh` | read | staff.json (shell) |
@@ -375,7 +376,7 @@ The shared pane launch builder uses `set_home`.
 | `scripts/worktree/worktrees.py` | read | snapshot, StaffSnapshot, StaffAbsent, StaffRefused |
 | `~/rust/cargo-liner-handler/crates/cargo-handler/src/census/hierarchy.rs` | read | StaffFileReader reads staff.json (Rust, direct) |
 
-231 accessor rows: 42 write, 188 read, 1 owner.
+232 accessor rows: 42 write, 189 read, 1 owner.
 
 ## Approved copies
 

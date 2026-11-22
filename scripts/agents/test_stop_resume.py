@@ -482,6 +482,20 @@ class StopResumeTests(unittest.TestCase):
                         with self.assertRaisesRegex(ValueError, "no unique native foreground process"):
                             _ = stop_resume.producer_adoption_launch(world.identity, world.pane, client)
 
+    def test_producer_admission_binds_codex_before_herdr_reports_the_thread(self) -> None:
+        with (producer_first_fixture("codex") as world,
+              patch.object(pane_launch, "current_kind",
+                           side_effect=ValueError("fixture cannot find the current backend")) as lookup):
+            result = stop_resume.resume("fixture-planner")
+            self.assertIsInstance(result, stop_resume.ClaudeUp, result)
+            self.assertEqual(herdr.pane_session(world.case.client.rows[-1]), "")
+            row = staff.initial_snapshot().by_current_session(world.identity)
+            assert row is not None
+            binding = pane_record.read("agents")[world.pane]
+            self.assertEqual(binding.get("staff_id"), row.id)
+            self.assertTrue(binding.get("producer_binding", False))
+            lookup.assert_not_called()
+
     def test_producer_admission_refuses_an_incomplete_registry_before_reserving_a_pane(self) -> None:
         for missing in ("session registry", "creation record"):
             with self.subTest(missing=missing), producer_first_fixture("claude") as world:
@@ -1111,13 +1125,19 @@ class StopResumeTests(unittest.TestCase):
         row = staff.StaffRow(staff.StaffId(fixture_runtime_id("fixed-agent")), "producer", "alpha", staff.StaffRoot(),
                              current_session=staff.StaffId(identity),
                              home=staff.SessionHome(self.root / ".claude3"))
+        codex_home = self.root / ".codex"
+        rollout = codex_home / "sessions" / f"rollout-{identity}.jsonl"
+        rollout.parent.mkdir(parents=True, exist_ok=True)
         for kind in ("claude", "codex"):
+            if kind == "codex":
+                rollout.touch()
             entry = self.entry.copy()
             entry.update(session_id=str(row.id), kind=kind, ended=True)
             pane_record.write("agents", entry)
             unknown = ("accounts (Codex thread unknown)",) if kind == "claude" else ()
             with (self.subTest(kind=kind),
                   patch.object(staff, "initial_snapshot", return_value=staff.StaffSnapshot((row,))),
+                  patch.dict(os.environ, {"CODEX_HOME": str(codex_home)}),
                   patch.object(runtime_sessions, "session_liveness", return_value=runtime_sessions.SessionNotLive()),
                   patch.object(herdr, "codex_conversations", return_value=herdr.CodexConversations({}, unknown)),
                   patch.object(herdr, "read_conversation", wraps=herdr.read_conversation) as read):

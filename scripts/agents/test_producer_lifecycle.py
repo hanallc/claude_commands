@@ -314,6 +314,36 @@ class CreateProducerTests(unittest.TestCase):
                 self.assertTrue(pane_record.read("agents")[world.pane].get("producer_binding", False))
                 self.assertEqual(sent, [opening_text(world)])
 
+    def test_create_adopts_the_pane_after_the_reservation_disappears(self) -> None:
+        with producer_first_fixture("claude", pending_start=False) as world:
+            name = "fixture-planner"
+            profile = "claude:fable:high"
+            registry = world.case.root / "configuration/models.conf"
+            _ = write_registry(registry, {"producer_defaults": {"model": profile}}, update=True)
+            sent: list[str] = []
+            with (patch.object(roster, "roster", return_value=roster.Roster([], [])),
+                  opening_transcript(world, sent)):
+                with patch.object(producer_creation, "publish_profile", side_effect=OSError("fixture profile write failed")):
+                    self.assertIn("fixture profile write failed", command("add-producer", name)[2])
+                row = staff.initial_snapshot().by_current_session(world.identity)
+                assert row is not None
+                receipt = producer_creation.read_record(producer_creation.record_path(name))
+                self.assertEqual(receipt.get("opening_confirmed"), world.identity)
+                self.assertNotIn(row.id, models_registry.parse_registry(registry.read_text()).get("producers", {}))
+                reservation = stop_resume.producer_admission_record(name)
+                reservation.unlink()
+                with patch.object(stop_resume, "producer_conflicts", return_value=[(world.identity, world.pane)]):
+                    code, output, errors = command("add-producer", name)
+                self.assertEqual(code, 0, errors)
+                self.assertIn(f"staff {row.id}, account claude3, tab {world.pane}", output)
+                self.assertEqual(models_registry.producer_profile(row.id).value(), profile)
+                binding = pane_record.read("agents")[world.pane]
+                self.assertEqual(binding.get("staff_id"), row.id)
+                self.assertTrue(binding.get("producer_binding", False))
+                self.assertEqual(world.started_panes, [world.pane])
+                self.assertEqual(sent, [opening_text(world)])
+                self.assertFalse(reservation.exists())
+
     def test_create_retry_sends_the_missing_prompt_to_an_admitted_producer(self) -> None:
         with producer_first_fixture("claude", pending_start=False) as world:
             registry = world.case.root / "configuration/models.conf"

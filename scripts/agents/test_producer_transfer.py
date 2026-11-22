@@ -18,7 +18,7 @@ from scripts.herdr import herdr, pane_launch
 from scripts.lib import models_registry
 from scripts.lib.test_models_registry import write_registry
 from scripts.production import staff
-from scripts.production.staff_test_support import fixture_member, fixture_runtime_id
+from scripts.production.staff_test_support import fixture_member, fixture_rename_producer, fixture_runtime_id
 
 OLD_PANE = "w1:p7"
 OLD_SESSION = staff.native_id(fixture_runtime_id("previous-cedar"))
@@ -193,7 +193,7 @@ class ProducerTransferTests(unittest.TestCase):
     def test_transfer_refuses_the_reserved_suffix_before_stopping_the_producer(self) -> None:
         with transfer_fixture("claude", "codex:gpt-test:high") as fixture:
             name = "cedar-unit"
-            _ = staff.rename(fixture.producer().id, name)
+            _ = fixture_rename_producer(fixture.producer(), name)
             before = fixture.state()
             with redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as error:
                 code = shutdown.main(["transfer", name, "--model", "opus", "--effort", "high"])

@@ -157,11 +157,13 @@ class AccountsConfigurationTests(unittest.TestCase):
                     with self.subTest(key=key):
                         self.assertEqual(len(kinds), 1)
                         kind = next(iter(kinds))
-                        self.assertIn(kind, ("whole", "number", "text"))
+                        self.assertIn(kind, ("whole", "number", "text", "words"))
                         if kind == "whole":
                             self.assertEqual(account_config.whole(key), int(configured[key]))
                         elif kind == "number":
                             self.assertEqual(account_config.number(key), float(configured[key]))
+                        elif kind == "words":
+                            self.assertEqual(account_config.words(key, allow_blank=True), tuple(configured[key].split()))
                         else:
                             self.assertEqual(account_config.text(key), configured[key])
 

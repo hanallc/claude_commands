@@ -4191,7 +4191,7 @@ class ReviewLinksServerTests(unittest.TestCase):
 
     def test_accounts_color_rejects_an_unpublished_host_before_tune(self) -> None:
         configuration = self.root.parent / "config"
-        configuration.mkdir()
+        configuration.mkdir(exist_ok=True)
         _ = (configuration / "statusline.conf").write_text(ROLE_COLOR_CONFIG, encoding="utf-8")
         tune = Mock(return_value=subprocess.CompletedProcess((), 0, "", ""))
         body = "key=role.worker&value=%23af875f"

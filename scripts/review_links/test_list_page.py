@@ -1978,7 +1978,7 @@ document.body.append(result);
         self.assertEqual(re.findall(chip, owners),
                          [('all', 'All', '5'), (f'staff:{OTHER.id}', 'builds', '1'), (f'staff:{OWNER.id}', 'sdlc', '4')])
         self.assertEqual(re.findall(chip, producers),
-                         [('all', 'All', '5'), (f'staff:{REQUESTER.id}', 'requester', '2'), (f'staff:{KEEPER.id}', 'keeper', '3')])
+                         [('all', 'All', '5'), (f'staff:{KEEPER.id}', 'keeper', '3'), (f'staff:{REQUESTER.id}', 'requester', '2')])
         self.assertEqual(body.count('<td data-label="Producer">requester</td>'), 2)
         self.assertEqual(body.count('<td data-label="Producer">keeper</td>'), 3)
         self.assertIn(f'data-producer="{REQUESTER.id}"', body)

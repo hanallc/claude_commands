@@ -261,8 +261,8 @@ class ConfigRead:
     def whole(self, key: str) -> int:
         return self.value(key, _whole)
 
-    def words(self, key: str) -> tuple[str, ...]:
-        return self.value(key, lambda value: tuple(value.split()))
+    def words(self, key: str, *, allow_blank: bool = False) -> tuple[str, ...]:
+        return self.value(key, lambda value: tuple(value.split()), allow_blank=allow_blank)
 
     def values(self, *keys: str, host_only_prefix: str = "") -> dict[str, str]:
         """Return all values when no keys are given. Add base keys for host overrides that match the prefix."""

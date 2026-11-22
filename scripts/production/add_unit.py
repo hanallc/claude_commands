@@ -1389,7 +1389,7 @@ def _main(argv: list[str]) -> int:
     staff.validate_unit_name_for_write(cast(str, args.name))
     try:
         request = launch_request(args)
-        staff.require_no_producer_rename(request.unit)
+        staff.require_no_producer_rename(request.unit_id)
         with staff.row_operation(request.session.session_id if isinstance(request.session, ResumedSession)
                                  else request.unit_id):
             identity_record = staff.initial_snapshot()

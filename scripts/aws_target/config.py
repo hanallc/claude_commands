@@ -120,7 +120,7 @@ def cost_explorer_change_recipient_id(settings: conf.ConfigRead) -> staff.StaffI
     try:
         return staff.native_id(value)
     except staff.StaffRefused as error:
-        raise ValueError(f'{key}: {error}') from error
+        raise ValueError(f'{key}: expected a canonical UUID') from error
 
 
 def read_settings(path: Path | conf.ConfigRead) -> SpendingSettings:

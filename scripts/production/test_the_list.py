@@ -53,7 +53,19 @@ class TheListTests(unittest.TestCase):
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         config = self.root / "config"
         config.mkdir()
-        _ = (config / "console.conf").write_text(f"page.list.owner={KEEPER.id}\n")
+        lists = self.root / "change-lists"
+        lists.mkdir()
+        _ = (config / "change_review.conf").write_text(
+            f"review_links_directory={self.root / 'reviews'}\nlists_directory={lists}\n")
+        _ = (config / "review_links.conf").write_text(
+            "delivery_tries=1\ndelivery_pause_seconds=0\nfeedback_rows=3\n"
+            + "page_refresh_seconds=10\npage_request_timeout_seconds=5\n"
+            + "card_fade_out_ms=150\ncard_fade_in_ms=200\nlater_morning=08:00\n"
+            + f"list_log_max_height_rem=12\nunrouted_alert_recipient={RUNNER.name}\n")
+        _ = (config / "console.conf").write_text(
+            f"page.list.owner={KEEPER.id}\n"
+            + "status.round_trip_limit_seconds=2\nstatus.render_limit_seconds=2\n"
+            + "status.reading_delay_seconds=1\nstatus.list.age_limit_seconds=30\n")
         _ = (config / "staff.conf").write_text(f"list_requester_producer_id={OTHER.id}\n")
         staff_file = self.root / "staff.json"
         rows = [row.to_json() for row in (KEEPER, RUNNER, OWNER, OTHER, EDITOR)]
@@ -61,6 +73,8 @@ class TheListTests(unittest.TestCase):
         self.enterContext(patch.dict(os.environ, {"HOME": str(self.root), "STAFF_FILE": str(staff_file), "CONF_DIR": str(config),
             "SHOWRUNNER_STATE_DIR": str(self.root / "state"), "CODEX_THREAD_ID": "",
             "CLAUDE_CODE_SESSION_ID": KEEPER.current_session}))
+        _ = os.environ.pop("CHANGE_REVIEW_DIR", None)
+        _ = os.environ.pop("REVIEW_LINKS_ROOT", None)
         _ = self.enterContext(patch.object(the_list, "now", return_value=START))
         _ = self.send_patch.start()
         self.addCleanup(self.send_patch.stop)
@@ -805,7 +819,7 @@ class TheListTests(unittest.TestCase):
                 cleaned = the_list.load(KEEPER.id, original.id)
                 self.assertEqual(cleaned.evidence, expected)
                 if original.evidence != expected:
-                    entry = the_list.ItemChange(moment, the_list.EvidenceCopyRemoved("checkins.json"), "keeper")
+                    entry = the_list.ItemChange(moment, the_list.EvidenceCopyRemoved("checkins.json"), KEEPER.id)
                     self.assertEqual(cleaned, replace(original, evidence=expected, updated=moment, log=(*original.log, entry)))
                 else:
                     self.assertEqual(cleaned, original)
@@ -846,9 +860,9 @@ class TheListTests(unittest.TestCase):
         for original, expected, json_entries, row_entries in originals:
             with self.subTest(item=original.id):
                 entries = (
-                    (the_list.ItemChange(moment, the_list.EvidenceCopyRemoved("checkins.json"), "keeper"),)
+                    (the_list.ItemChange(moment, the_list.EvidenceCopyRemoved("checkins.json"), KEEPER.id),)
                     * json_entries
-                    + (the_list.ItemChange(moment, the_list.EvidenceCopyRemoved("the List row"), "keeper"),)
+                    + (the_list.ItemChange(moment, the_list.EvidenceCopyRemoved("the List row"), KEEPER.id),)
                     * row_entries
                 )
                 cleaned = the_list.load(KEEPER.id, original.id)
@@ -882,8 +896,7 @@ class TheListTests(unittest.TestCase):
         keys = tuple(f"investigation/{OWNER.id}/{review.id}" for review in (first, second))
         item = self.add()
         path = the_list.folder(KEEPER.id) / f"{item.id}.md"
-        with patch.dict(os.environ, {"REVIEW_LINKS_ROOT": str(self.root / "reviews")}), patch.object(
-                review_items, "read", wraps=review_items.read) as read:
+        with patch.object(review_items, "read", wraps=review_items.read) as read:
             self.assertEqual(self.command("link", item.id, "--review", identities[1], "--review", identities[0],
                                           "--review", identities[1], "--source", "keeper"), (0, "", ""))
         read.assert_called_once()
@@ -891,7 +904,7 @@ class TheListTests(unittest.TestCase):
         self.assertEqual(linked.reviews, keys[::-1])
         self.assertEqual(linked.log[:-1], item.log)
         self.assertEqual(linked.log[-1],
-                         the_list.ItemChange(START, the_list.ReviewLinksChanged("Linked reviews", keys[::-1]), "keeper"))
+                         the_list.ItemChange(START, the_list.ReviewLinksChanged("Linked reviews", keys[::-1]), KEEPER.id))
         self.assertEqual(replace(linked, reviews=item.reviews, log=item.log), item)
         before = path.read_bytes(), path.stat().st_mtime_ns
         with patch.object(review_items, "read", return_value=[]) as read:

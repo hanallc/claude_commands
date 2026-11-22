@@ -15,7 +15,9 @@ ALLOW_LIST: dict[tuple[str, str], str] = {
     ("scripts/direct/pass_record.py", "_main_identity_from_claude"):
         "Reads the current CLAUDE_CODE_SESSION_ID session.",
     ("scripts/accounts/refusal_watch.py", "session_refusals"):
-        "Lists project folders; transcript_paths finds the transcript files.",
+        "Lists project folders. transcript_paths finds the transcript files.",
+    ("scripts/agents/producer_lifecycle.py", "_claude_moves"):
+        "Finds symlinks to move and preserves both plain and compressed files.",
 }
 ADVICE = ("Use scripts.lib.transcripts (transcript_paths and open_transcript), "
           "or add an allow-list entry with the reason.")

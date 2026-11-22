@@ -1299,10 +1299,7 @@ class RestartTests(RestartTestCase):
             current_session=staff.StaffId(f"conversation-{n}"),
             worktree=staff.PresentWorktree(remote.local_machine(), self.root),
             home=staff.SessionHome(config), unit_type=staff.UnitDetails("direct")) for n in range(3))
-        from scripts.production.staff_test_support import fixture_session
-
         for row in self.rows:
-            fixture_session(str(row.current_session), staff.ClaudeBackend())
             for home in (config, self.root / ".claude3"):
                 transcript = home / "projects" / transcripts.claude_project_key(self.root) / f"{row.current_session}.jsonl"
                 write_text_atomic(transcript, "")
@@ -2720,7 +2717,7 @@ class RestartTests(RestartTestCase):
         self.running.clear()
         home = self.root / ".claude2"
         requested = herdr.SessionTranscript(home, str(row.current_session))
-        original = home / "projects/fixture" / f"{row.current_session}.jsonl"
+        original = home / "projects" / transcripts.claude_project_key(self.root) / f"{row.current_session}.jsonl"
         history = json.dumps({"timestamp": "2020-01-01T00:00:00+00:00", "type": "assistant",
                               "message": {"role": "assistant", "content": "prelaunch-only-history"}}) + "\n"
         for native_identity_changes in (False, True):
@@ -3612,8 +3609,9 @@ class RestartTests(RestartTestCase):
 
     def test_socketless_running_sessions_restart_or_print_and_unassigned_sessions_print_once(self) -> None:
         for row in self.rows:
-            assert isinstance(row.home, staff.SessionHome)
-            (row.home.path / "projects/fixture" / f"{row.current_session}.jsonl").unlink()
+            for home in (self.root / ".claude2", self.root / ".claude3"):
+                project = home / "projects" / transcripts.claude_project_key(self.root)
+                (project / f"{row.current_session}.jsonl").unlink()
         for dry_run in (True, False):
             with self.subTest(dry_run=dry_run):
                 records = self.records_for(self.running | {"orphan"})

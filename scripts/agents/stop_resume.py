@@ -342,11 +342,30 @@ def producer_adoption_launch(identity: str, pane: str, client: herdr.Herdr) -> p
     raise ValueError("producer has no proved live native conversation")
 
 
+def _publish_producer_admission(row: staff.StaffRow, profile: models_registry.ProducerProfile | None,
+                                client: herdr.Herdr, entry: pane_launch.CurrentLaunch, home: staff.SessionHome,
+                                *, kind: Literal["claude", "codex"], recover_profile: bool) -> staff.StaffRow:
+    """Publish the profile before binding the native pane to the staff row."""
+    if profile is not None:
+        producer_creation.publish_profile(row, profile)
+    if not entry["pane_id"]:
+        return staff.set_home(row.id, home)
+    expectation = pane_launch.ProducerLaunchRequest(row.id, row.current_session, kind, Path(entry["cwd"]), home.path)
+    with pane_launch.producer_launch_request(expectation):
+        if not recover_profile:
+            return pane_launch.staff_admitted(row)
+        if row.home != home:
+            row = staff.set_home(row.id, home)
+        pane_record.write(client.session, entry)
+    return row
+
+
 def adopt_named_producer(request: ProducerFirstStart, identity: str, pane: str, client: herdr.Herdr, *,
                          profile: models_registry.ProducerProfile | None) -> ClaudeUp:
     """Admit one proved live conversation without a launch."""
     try:
-        if not any(row.name == request.name for row in staff.initial_snapshot().find(kind="producer")):
+        admitted = any(row.name == request.name for row in staff.initial_snapshot().find(kind="producer"))
+        if not admitted:
             staff.validate_producer_name(request.name)
         staff.require_no_producer_rename(request.name)
         entry = producer_adoption_launch(identity, pane, client)
@@ -355,27 +374,22 @@ def adopt_named_producer(request: ProducerFirstStart, identity: str, pane: str, 
         if not isinstance(home, staff.SessionHome):
             raise ValueError("producer account is unavailable")
         folder = Path(entry["cwd"])
-        kind = pane_launch.agent_kind(entry)
+        kind = pane_launch.saved_kind(entry)
         if profile is not None and profile.family != kind:
             raise ValueError(f"the saved profile uses {profile.family}, the live conversation uses {kind}")
         entry["name"] = request.name
-        if entry["pane_id"]:
+        recover_profile = admitted and profile is not None
+        if entry["pane_id"] and not recover_profile:
             pane_record.write(client.session, entry)
         row = staff.ensure("producer", name=request.name, runtime_id=native,
             worktree=staff.PresentWorktree(remote.local_machine(), folder),
             doc=staff.LiveDoc(remote.local_machine(), request.folder))
-        if profile is not None:
-            producer_creation.publish_profile(row, profile)
+        row = _publish_producer_admission(row, profile, client, entry, home, kind=kind, recover_profile=recover_profile)
         if entry["pane_id"]:
-            expectation = pane_launch.ProducerLaunchRequest(row.id, native, kind, folder, home.path)
-            with pane_launch.producer_launch_request(expectation):
-                row = pane_launch.staff_admitted(row)
             binding = pane_record.read_strict(client.session).get(entry["pane_id"])
             if binding is None or binding.get("staff_id") != row.id or not binding.get("producer_binding", False):
                 raise ValueError("producer adoption needs pane publication; retain its native conversation")
             client.remember_row_tab(str(row.id), entry["pane_id"])
-        else:
-            row = staff.set_home(row.id, home)
         label = accounts.claude_config_label(home.path) if kind == "claude" else agent_accounts.codex_home_role_label(home.path)
         return ClaudeUp(str(row.current_session), entry["pane_id"], label, start_state=ClaudeStartState.ALREADY_RUNNING)
     except (OSError, ValueError, herdr_types.HerdrFailure) as error:
@@ -687,7 +701,9 @@ def _first_producer_resume(request: ProducerFirstStart, *, opening: PendingProdu
                 and identity != member.current_session):
             raise ValueError("the opening prompt belongs to another conversation")
         entry["name"] = request.name
-        pane_record.write(client.session, entry)
+        recover_profile = isinstance(member, staff.StaffRow) and creation_profile is not None
+        if not recover_profile:
+            pane_record.write(client.session, entry)
         if isinstance(opening, PendingProducerOpening):
             _confirm_producer_opening(request, opening, pending, identity, client, resend=resend_opening)
         folder = staff.PresentWorktree(remote.local_machine(), request.folder)
@@ -698,11 +714,7 @@ def _first_producer_resume(request: ProducerFirstStart, *, opening: PendingProdu
             if not isinstance(member.doc, staff.DocUnfilled):
                 document = member.doc
         row = staff.ensure("producer", name=request.name, runtime_id=identity, worktree=folder, doc=document)
-        if profile is not None:
-            producer_creation.publish_profile(row, profile)
-        expectation = pane_launch.ProducerLaunchRequest(row.id, identity, kind, request.folder, pending.home)
-        with pane_launch.producer_launch_request(expectation):
-            row = pane_launch.staff_admitted(row)
+        row = _publish_producer_admission(row, profile, client, entry, home, kind=kind, recover_profile=recover_profile)
         publication = pane_record.read_strict(client.session).get(pending.pane)
         if publication is None or not publication.get("producer_binding", False):
             raise ValueError("producer admission needs pane publication; retain its native conversation")

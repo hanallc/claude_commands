@@ -22,7 +22,7 @@ class TargetHoldTests(IsolatedTargetState):
         super().setUp()
         _ = self.config.write_text(self.config.read_text() + "sync.hosts.aws=aws-build\n")
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
-        for name in ("alice", "fixture_builder"):
+        for name in ("alice", "fixture-builder"):
             _ = fixture_member("producer", name=name)
         _ = self.enterContext(mock.patch.object(subprocess, "run", side_effect=self.target_command))
 
