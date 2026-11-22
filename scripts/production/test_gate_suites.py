@@ -811,8 +811,9 @@ class MergeGateSuitesTests(GateSuitesFixture):
         self.write(checkout / "scripts/hooks/test_first.py", SUITE_MODULE
                    + "\n\nclass Red(unittest.TestCase):\n    def test_red(self):\n        self.fail('red')\n")
         repository = "claude_commands"
+        machine = "nixos"
         _ = self.git(checkout, "remote", "set-url", "origin", str(self.root / f"{repository}.git"))
-        self.configure_gate(f"# whole: 1..\nmax_runs.natedev.{repository}=2\nmax_runs.exempt_unit=natemerge\n")
+        self.configure_gate(f"# whole: 1..\nmax_runs.{machine}.{repository}=2\nmax_runs.exempt_unit=natemerge\n")
         holder = Path(self.environment["BUILD_HOLD_DIR"]) / "fixture-holder"
         self.write(holder, "Fixture build hold\n")
 
@@ -844,6 +845,7 @@ class MergeGateSuitesTests(GateSuitesFixture):
 
         output = io.StringIO()
         with (mock.patch.dict(os.environ, self.environment),
+              mock.patch.object(self.admission.server, "host", machine),
               mock.patch.object(self.admission.server, "reply_filter", observe),
               mock.patch.object(gate, "local_release_waiter", side_effect=release_fixture_hold),
               mock.patch.object(gate, "run_gate_suites", side_effect=AssertionError("run_gate_suites")),
@@ -874,7 +876,7 @@ class MergeGateSuitesTests(GateSuitesFixture):
                 for grant in occupied:
                     self.admission.release(grant)
         self.assertEqual(code, 1, output.getvalue())
-        self.assertEqual(events, ["admitted", "hold", admission_records.RunLimitWait(2, 2, repository, "natedev"),
+        self.assertEqual(events, ["admitted", "hold", admission_records.RunLimitWait(2, 2, repository, machine),
                                   "admitted"])
         self.assertEqual(grants, [("test-affected", repository, 3), ("gate", repository, 2)])
         self.assert_gate_released()

@@ -14,7 +14,8 @@ from typing import cast, override
 from unittest import mock
 
 from scripts.lib import build_folders, testing_folders
-from scripts.lib.checkout_test_support import direct_test_fixture_environment, run_gate_test_fixture
+from scripts.lib.checkout_test_support import (STANDALONE_TEST_STARTUP, direct_test_fixture_environment,
+                                              run_gate_test_fixture, without_user_test_manager)
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
@@ -38,6 +39,10 @@ class Fixture(unittest.TestCase):
 """
 REPO = Path(__file__).resolve().parents[2]
 MODULE_RUN = REPO / "scripts/test_times/module_run.py"
+DISCOVER_STANDALONE = STANDALONE_TEST_STARTUP + """
+import runpy
+runpy.run_module("unittest", run_name="__main__", alter_sys=True)
+"""
 
 
 class TestRunFolderTests(unittest.TestCase):
@@ -54,9 +59,10 @@ class TestRunFolderTests(unittest.TestCase):
         return self.fixture_environment.copy()
 
     def start(self, *options: str) -> tuple[subprocess.Popen[str], Path, Path, int]:
-        process = subprocess.Popen([str(SHIM), *options, "-B", "-m", "unittest", "discover", "-s", str(self.root),
+        environment = without_user_test_manager(self.root, self.environment())
+        process = subprocess.Popen([str(SHIM), *options, "-B", "-c", DISCOVER_STANDALONE, "discover", "-s", str(self.root),
                                     "-p", "test_fixture.py"],
-                                   cwd=self.root, env=self.environment(), text=True,
+                                   cwd=self.root, env=environment, text=True,
                                    stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         self.addCleanup(self.stop, process)
         assert process.stdout is not None

@@ -14,6 +14,10 @@ from scripts.lib.python_startup.sitecustomize import STARTUP_FILES, TEST_RUNNER_
 
 
 SOURCE = Path(__file__).resolve().parents[2]
+# Child fixtures can model a direct launch inside an outer gate module.
+STANDALONE_TEST_STARTUP = """import sys
+sys.modules["_devtools_python_startup"]._descends_from_gate_module = lambda: False
+"""
 
 
 @cache
@@ -126,11 +130,18 @@ def direct_test_fixture_environment(root: Path, *, seconds: int | None = None) -
     if seconds is not None:
         _ = write_config_fixture(config / "test_times.conf",
                                  f"# whole: 1..\ndirect_test.time_limit_seconds={seconds}\n")
-    environment = {**os.environ, "TMPDIR": str(root), "CONF_DIR": str(config)}
+    environment = {**os.environ, "TMPDIR": str(root), "CONF_DIR": str(config),
+                   "XDG_CACHE_HOME": str(root / "cache"), "CLAUDE_PYTHON": sys.executable}
     for name in ("GATE_PARENT_PID", "MERGE_GATE_PARENT_PID", "DEVTOOLS_GATE_PARENT_SOURCE_FD",
                  "TEST_TIMES_OUT", RUN_FOLDER_ENV):
         _ = environment.pop(name, None)
     return environment
+
+
+def without_user_test_manager(root: Path, environment: dict[str, str]) -> dict[str, str]:
+    """Give the child a user bus address that has no listener."""
+    return {**environment, "DBUS_SESSION_BUS_ADDRESS": f"unix:path={root / 'absent-bus'}",
+            "XDG_RUNTIME_DIR": str(root / "absent-runtime")}
 
 
 def run_gate_test_fixture(case: Path, arguments: list[str], environment: dict[str, str]) -> subprocess.CompletedProcess[str]:

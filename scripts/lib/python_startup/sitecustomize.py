@@ -546,7 +546,7 @@ def _begin_direct_test() -> None:
 
     try:
         with without_recording():
-            if linux:
+            if linux and _user_test_manager_available():
                 settings = conf.read("test_times")
                 limit = settings.origin(_DIRECT_TEST_LIMIT_KEY, conf.positive_whole)
                 if isinstance(limit, conf.UnavailableValue):
@@ -575,6 +575,20 @@ def _direct_test_unit(cgroup: str) -> str:
 
     unit = os.path.basename(cgroup)
     return unit if re.fullmatch(_DIRECT_TEST_UNIT_PREFIX + r"[0-9a-f]{32}\.scope", unit) else ""
+
+
+def _user_test_manager_available() -> bool:
+    """Check for a user systemd manager without starting one."""
+    import subprocess
+
+    try:
+        result = subprocess.run(
+            ["busctl", "--user", "--timeout=5s", "call", "org.freedesktop.DBus", "/org/freedesktop/DBus",
+             "org.freedesktop.DBus", "NameHasOwner", "s", _SYSTEMD_SERVICE],
+            capture_output=True, text=True, check=False)
+    except FileNotFoundError:
+        return False
+    return result.returncode == 0 and result.stdout.strip() == "b true"
 
 
 def _direct_test_scope_enforces_deadline(unit: str) -> bool:

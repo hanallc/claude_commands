@@ -615,6 +615,7 @@ The admission, scheduling caches, and rerun rules below apply to `SharedMachine`
   If neither check proves a gate launch, it reads the cgroup name once.
   For a matching direct test scope, one systemd query checks for a finite runtime limit and SIGKILL.
   A process with an existing limit keeps its current folder and reads no test limit configuration.
+  A Linux process without a user systemd manager uses a private folder and runs without a direct test deadline.
   Herdr adds the startup path to every agent pane because the server can launch it outside the client's test limit.
   The bootstrap gives a new direct test run a maker folder.
   A later `package_root.py` run inside an import selects the checkout only and starts no folder.
