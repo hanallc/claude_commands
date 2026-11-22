@@ -1313,6 +1313,7 @@ Repository run limits use `max_runs.<machine>.<repository>` in `build_admission.
 An absent key sets no repository run limit.
 A value of zero holds new runs on that machine.
 `max_runs.natedev.hana` permits two concurrent Hana Verify runs on natedev.
+`max_runs.natedev.cargo-liner` permits one cargo-liner Verify run at a time on natedev.
 Verify requests a repository slot for its first compiling Cargo step.
 The request follows detachment, the cache checks, and lint step selection.
 In Mac-only mode Verify checks the cache after it gets an assignment.
