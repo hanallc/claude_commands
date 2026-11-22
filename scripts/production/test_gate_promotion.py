@@ -1,4 +1,4 @@
-"""Merge gate promotion contracts."""
+"""Gate promotion contracts."""
 
 from __future__ import annotations
 

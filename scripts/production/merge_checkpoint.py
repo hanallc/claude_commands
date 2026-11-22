@@ -184,8 +184,7 @@ def end_pushed_worktrees(production: ProductionDocument) -> None:
 
 @contextmanager
 def merge_lock(checkout: Path, name: str) -> Generator[None]:
-    """Held for a whole merge gate. A unit rename takes it before it writes the merge branch, so
-    neither lands a commit inside the other's run."""
+    """Hold the lock for checkpoint integration and unit renames."""
     common = git(checkout, "rev-parse", "--path-format=absolute", "--git-common-dir")
     if common.returncode:
         raise OSError(f"{checkout}: no git directory for the merge lock: {common.stderr.strip()}")
@@ -193,7 +192,7 @@ def merge_lock(checkout: Path, name: str) -> Generator[None]:
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
-            print(f"merge lock: waiting — a merge gate or a unit rename is writing {name}'s merge branch", flush=True)
+            print(f"merge lock: waiting — another operation holds {name}'s checkpoint lock", flush=True)
             fcntl.flock(lock, fcntl.LOCK_EX)
         yield
 
@@ -1351,7 +1350,7 @@ def _external_merge_wait(arguments: list[str]) -> Generator[None, None, None]:
                 finished = subprocess.run([*recorder, "finish-external-wait", "--wait-id", wait_id],
                                           capture_output=True, text=True, check=False)
                 if finished.returncode:
-                    checkpoint_gate.report("wait", "NotRecorded", finished.stderr.strip() or "cannot close merge gate wait")
+                    checkpoint_gate.report("wait", "NotRecorded", finished.stderr.strip() or "cannot close the gate wait")
             except OSError as error:
                 checkpoint_gate.report("wait", "NotRecorded", str(error))
 

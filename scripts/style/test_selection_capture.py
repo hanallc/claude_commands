@@ -301,7 +301,7 @@ class SelectionCaptureTests(StylePlanFixture):
             _ = git_config.write_text("[include]\n    path = extra.conf\n")
             _ = extra.write_text("[observation]\n    marker = captured\n")
             with patch.dict(os.environ, {"XDG_CONFIG_HOME": str(xdg)}):
-                # GIT_CONFIG_GLOBAL makes Git skip the XDG file; the merge gate sets it.
+                # GIT_CONFIG_GLOBAL makes Git skip the XDG file; the gate sets it.
                 _ = os.environ.pop("GIT_CONFIG_GLOBAL", None)
                 captured = self.root / "include-capture"
                 _ = selection_capture.capture(self.repo, self.database, "names", captured)

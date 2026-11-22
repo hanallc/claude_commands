@@ -1,6 +1,6 @@
 """Bulk local renames on a temporary Cargo project with private Rust tool stubs.
 
-Real LSP and compiler tests use BULK_RENAME_REAL_TOOLS=1; the merge gate never sets it.
+Real LSP and compiler tests use BULK_RENAME_REAL_TOOLS=1; the gate never sets it.
 """
 from __future__ import annotations
 
