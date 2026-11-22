@@ -144,7 +144,7 @@ Local placements release their reader subscriptions when their reservations end.
 `AdmitRequest.place` defaults to `LocalPlace()`.
 This tree supplies the queue API and the cloud progress file.
 The aws route integration belongs to a separate tree.
-That route calls this API with `CloudPlace("aws")` for a `merge-gate` or `targeted-test` step.
+That route calls this API with `CloudPlace("aws")` for a `gate` or `test-affected` step.
 The route process owns the reservation.
 The service releases the cloud slot when that process ends.
 An explicit release also ends the reservation.
@@ -558,7 +558,7 @@ Queue views continue to use the service.
 ### Queue lifecycle and calibration
 
 The service records queue events in `admission/queue_times.jsonl` through `append_queue_time`.
-The same record holds Cargo, `targeted-test`, and `merge-gate` steps.
+The same record holds Cargo, `test-affected`, and `gate` steps.
 The append function locks the file and removes incomplete rows before an append.
 At 8 MiB, it retains the newest events from the last 14 days in less than 6 MiB.
 
@@ -632,7 +632,7 @@ The existing unreachable limit still applies until a valid reply arrives.
 
 A fresh nextest estimate expires after one running-pass interval. Other history estimates expire after `estimate_refresh_seconds`.
 A program uses its history estimate and refreshes it under the normal estimate policy.
-The merge gate reads `program_first_peak_gib.merge-gate` at use; its first need is 4 GiB.
+The merge gate reads `program_first_peak_gib.gate` at use; its first need is 4 GiB.
 Legacy gate peak records do not size that need. A matching anonymous progress profile supplies the first pass's look-ahead window.
 The gate removes its progress counter before reruns, which keep the full need.
 The merge-gate progress profile key includes `shape` (`tests` or `types`).
@@ -644,7 +644,7 @@ The gate reports its first need as a fallback and explains any matching anonymou
 The queue model reads the step names once from `config/build_steps.conf`.
 Renderers use its `StepNames` value without file reads.
 Other sentences read the step names when they need the text.
-The Builds page uses the configured step name, including `targeted test` for `targeted-test`.
+The Builds page uses the configured step name, including `test affected` for `test-affected`.
 `step_promise` gives every admitted step a `LifetimePromise` until it ends.
 The run calculation uses the accepted need before tests start.
 For nextest, an observed test phase can select the frozen test-phase need instead.
@@ -1309,6 +1309,36 @@ Only an unreadable hold state gives `ReadingUnavailable`, which the client refus
 The CI client that nixos pins (bbc8803f4) does not know `NatedevHeld`.
 `snapshot_codec` writes it as `BehindHead` with a `_natedev_hold` field, and current readers restore it.
 GPU slot waits use the same shape with a `_gpu_slot` field.
+Repository run limits use `max_runs.<machine>.<repository>` in `build_admission.conf`.
+An absent key sets no repository run limit.
+A value of zero holds new runs on that machine.
+`max_runs.natedev.hana` permits two concurrent Hana Verify runs on natedev.
+`max_runs.natedev.cargo-liner` permits one cargo-liner Verify run at a time on natedev.
+Verify requests a repository slot for its first compiling Cargo step.
+The request follows detachment, the cache checks, and lint step selection.
+In Mac-only mode Verify checks the cache after it gets an assignment.
+On a cache miss, Verify requests its slot before it claims the Mac.
+The slot belongs to the Verify process and ends when that process exits.
+The service saves grants and restores the owner watches after restart.
+A child Verify uses a live ancestor Verify's slot for the same repository.
+The service verifies each process in that chain by PID, start time, and parent PID.
+Separate Verify calls under the same copy preparation process each request their own slot.
+A run keeps its natedev slot while its steps run on the Mac or AWS.
+The run wait occurs before Cargo memory admission.
+Cargo steps use the existing rules for memory claims and start spacing.
+Copy preparation and commands that only format or read cached results take no run slot.
+Copy preparation can retain its memory during the configured gap before Verify takes a slot.
+The gap is about ten seconds with the current configuration.
+Local `gate` and `test-affected` runs count while they hold a reservation.
+`max_runs.natedev.claude_commands` permits two concurrent runs and applies this rule to the repository's `gate` and `test-affected` steps.
+The admission service uses the Git repository name when a gate profile supplies an absolute path.
+The unit in `max_runs.exempt_unit` can start above the limit. Its runs use slots.
+Verify prints the count, limit, repository, and machine while it waits.
+The slot request uses the Verify Python helper, including when detached output goes to a file.
+The slot wait ignores the queue leave hooks.
+Slot request failures do not enter the lint cache.
+The Builds page shows these details for Verify runs and gate reservations.
+The snapshot codec writes the gate wait as `BehindHead` with a `_run_limit` field, and current readers restore it.
 An existing CI reservation continues when the enforcer cannot stop its account.
 No process permission changes support these checks.
 **Clear.** `build_hold.py clear --for '<why>' --release-eta HH:MM --zone IANA` stops existing queued gates and running work outside the hold's allow rules.
@@ -2174,7 +2204,7 @@ No adaptive controller, fixed admission limit, order window, CI growth promise, 
 ### Progress memory profiles
 
 Merge gates start with a ranked peak from their host's recorded peaks from the last 14 days, as other programs do.
-Without history, they use `program_first_peak_gib.merge-gate` from `config/build_admission.conf`.
+Without history, they use `program_first_peak_gib.gate` from `config/build_admission.conf`.
 Matching progress profiles still determine the running need.
 
 Cargo build, check, clippy, mend, nextest, and merge gates record attributed swap-backed use in five-percent phase bins.

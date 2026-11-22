@@ -5,16 +5,36 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from pathlib import Path
-from typing import Literal, Protocol
+from typing import Literal, Protocol, override
 
-from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, GateJobNotRecorded, StepJob
+from scripts.build_queue.admission_jobs import GateJobNotRecorded, StepJob
 from scripts.test_times import gate_record
 
 
 class SuiteMode(Enum):
     """Choose the step and whether the runner selects affected modules."""
-    MERGE_GATE = "merge-gate"
-    TARGETED_TEST = "targeted-test"
+    # Callers outside scripts/production use the old names; chunk 6 removes these aliases.
+    GATE = "gate"
+    MERGE_GATE = "gate"
+    TARGETED = "test-affected"
+    TARGETED_TEST = "test-affected"
+
+    @classmethod
+    @override
+    def _missing_(cls, value: object) -> SuiteMode | None:
+        # Box requests and older checkouts name the steps merge-gate and targeted-test.
+        return {"merge-gate": cls.GATE, "targeted-test": cls.TARGETED}.get(str(value))
+
+    @property
+    def wire(self) -> str:
+        """Name the step on a box request with the value that old and new box code both read."""
+        return "merge-gate" if self is SuiteMode.GATE else "targeted-test"
+
+    @classmethod
+    def step(cls, value: str) -> str:
+        """Name a recorded step by its new value; a step that is not a suite mode keeps its name."""
+        mode = cls._missing_(value)
+        return mode.value if mode is not None else value
 
 
 class GateJobKind(Enum):
@@ -86,11 +106,17 @@ class GateRun:
                 and not self.time_limit_report and all(job.returncode == 0 for job in self.jobs))
 
 
-class CloudGateRoute(Protocol):
-    """Run AWS tests and identify the checked-out tree."""
+class WholeGateRoute(Protocol):
+    """Run the whole test selection on one remote machine."""
+
     def route(self, repo: Path, *, mode: SuiteMode, full: bool,
-              module_time_limit_s: float, selected: AllModules | TreeSelection = ALL_MODULES,
-              gate_job: StepJob | GateJobNotRecorded = GATE_JOB_NOT_RECORDED) -> GateRun | str: ...
+              module_time_limit_s: float, selected: AllModules | TreeSelection,
+              gate_job: StepJob | GateJobNotRecorded) -> GateRun | str: ...
+
+
+class CloudGateRoute(WholeGateRoute, Protocol):
+    """Run AWS tests and identify the checked-out tree."""
+
     def working_tree(self, repo: Path) -> tuple[str, set[str]]: ...
 
 

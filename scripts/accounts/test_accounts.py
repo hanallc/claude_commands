@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from scripts.direct import pass_record as pass_recorder
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
 
 import sys
@@ -2779,7 +2780,7 @@ class AccountsTests(unittest.TestCase):
                                        accounts.AccountRoleBurn("claude2", (), 10, 1),
                                        accounts.AccountRoleBurn("claude3", (), 10, 1)])
 
-    def test_single_session_move_reads_the_inventory_listing_once(self) -> None:
+    def test_single_session_move_rechecks_inventory_for_the_same_account(self) -> None:
         from scripts.agents.inventory import (
             AttributedSessionConfiguration, ListedSession, ShowrunnerRegistration, ShowrunnerRegistrations,
         )
@@ -2809,7 +2810,7 @@ class AccountsTests(unittest.TestCase):
                   patch.object(stop_resume, "move_sessions") as moved):
                 result = self.run_cli("move", owner.name, "claude1", *(["--dry-run"] if dry_run else []))
                 self.assertEqual(result, (0, "fixture session: already on claude1\n", ""))
-                listing.assert_called_once_with()
+                self.assertEqual(listing.call_count, 1 if dry_run else 2)
                 checked.assert_not_called()
                 moved.assert_not_called()
 
@@ -8465,7 +8466,7 @@ class PaneWorkerMoveTests(unittest.TestCase):
                     f"End your final reply with this line alone: DONE {instance}\n"
                     "A reply that waits on a detached run is not final.")
             progress_history.save_dispatch_delivery(self.run_dir, instance,
-                progress_history.DispatchDelivery(line, instance, str(self.root / "reply.md")))
+                pass_recorder.DispatchDelivery(line, instance, str(self.root / "reply.md")))
             backend = staff.backend(row)
             assert isinstance(backend, (staff.ClaudeBackend, staff.CodexBackend))
             entry = ({"type": "event_msg", "payload": {"type": "user_message", "message": line}}

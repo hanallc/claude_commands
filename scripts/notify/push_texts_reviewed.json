@@ -793,6 +793,31 @@
       "time": "2026-10-25T13:38:16.508441-04:00"
     }
   },
+  "quota.mac_token_login": {
+    "refused": {
+      "objections": [
+        {
+          "quote": "Read the Accounts page.",
+          "rule": "what-happened-why-what-you-do"
+        },
+        {
+          "quote": "Read the Accounts page.",
+          "rule": "say-where-to-act"
+        },
+        {
+          "quote": "Mac token login failed Sat 11-21 10:07 EST",
+          "rule": "title-names-the-stake"
+        },
+        {
+          "quote": "Read the Accounts page.",
+          "rule": "push-only-what-the-user-must-do"
+        }
+      ],
+      "reviewer": "user-spec: nate typed 'record quota.token_expiry and quota.mac_token_login' in the accounts session, 2026-11-22; reviewer: claude-opus-5-5",
+      "sha256": "642e0e25d02d4faf40934e4b4e546f1fc877d40cb0273767ea7d7608c306c1fb",
+      "time": "2026-11-22T10:01:54.575715-05:00"
+    }
+  },
   "quota.paid_credits": {
     "from_session": {
       "objections": [
@@ -868,6 +893,31 @@
       "reviewer": "user-spec: user 2026-11-13: the credits setting moves to the accounts config; only the action line changed; reviewer: claude-opus-5-5",
       "sha256": "e30d61127cd3bf1485f8c1ac674604c5c0b5f424067f08fa58abb0012e712bc6",
       "time": "2026-11-13T16:42:20.376803-05:00"
+    }
+  },
+  "quota.token_expiry": {
+    "expiry": {
+      "objections": [
+        {
+          "quote": "hana-macos-runner-query expires 2027-11-22",
+          "rule": "push-only-what-the-user-must-do"
+        },
+        {
+          "quote": "hana-macos-runner-query",
+          "rule": "reader-starts-cold"
+        },
+        {
+          "quote": "Read the Accounts page.",
+          "rule": "what-happened-why-what-you-do"
+        },
+        {
+          "quote": "Read the Accounts page.",
+          "rule": "say-where-to-act"
+        }
+      ],
+      "reviewer": "user-spec: nate typed 'record quota.token_expiry and quota.mac_token_login' in the accounts session, 2026-11-22; reviewer: claude-opus-5-5",
+      "sha256": "802553bbb3b07f8c8370eb42a24b06b5ecb96c78465e9bd135078877905f0ed9",
+      "time": "2026-11-22T10:01:43.412457-05:00"
     }
   },
   "review_watch.acknowledge": {

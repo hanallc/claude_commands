@@ -395,7 +395,7 @@ class ClientTests(unittest.TestCase):
     def test_cloud_admit_uses_the_private_service_and_releases_its_slot(self) -> None:
         with AdmissionFixture() as fixture:
             fixture.free(0)
-            request = replace(fixture.request(step="merge-gate"), place=wire.CloudPlace("aws"))
+            request = replace(fixture.request(step="gate"), place=wire.CloudPlace("aws"))
             with fixture.serving():
                 result = client.admit(request, lambda _wait: None, lambda: request)
                 assert isinstance(result, wire.Admitted)
@@ -405,7 +405,7 @@ class ClientTests(unittest.TestCase):
 
     def test_cloud_place_survives_client_reconnect_and_estimate_refresh(self) -> None:
         with AdmissionFixture() as fixture:
-            request = replace(fixture.request(step="merge-gate"), place=wire.CloudPlace("aws"))
+            request = replace(fixture.request(step="gate"), place=wire.CloudPlace("aws"))
             transport = self.use_transport(fixture,
                 Exchange(reply_bytes(EXPIRED), TimedChunk(0.1, b"")),
                 Exchange(reply_bytes(GRANTED)))
@@ -1223,14 +1223,14 @@ class ClientTests(unittest.TestCase):
         with AdmissionFixture() as fixture:
             original = fixture.request()
             checkout = str(fixture.root / "other-checkout")
-            profile = records.ProgramProfile("merge-gate", "repo", checkout, records.HistoryPeakSizing(6 * GIB, records.FirstProgramPeak(6 * GIB), fixture.clock.now()))
+            profile = records.ProgramProfile("gate", "repo", checkout, records.HistoryPeakSizing(6 * GIB, records.FirstProgramPeak(6 * GIB), fixture.clock.now()))
             with mock.patch.object(step_estimator, "git_identity", side_effect=AssertionError("program inferred cargo")), \
                  mock.patch.object(client, "CLOCK", fixture.clock):
                 request = client.step_request([], str(fixture.root), original.owner, original.since,
                                               "", original.episode, profile)
             self.assertEqual(request.identity.folder, checkout)
             self.assertEqual(request.profile, profile)
-            self.assertEqual(request.identity.step, "merge-gate")
+            self.assertEqual(request.identity.step, "gate")
             self.assertEqual(request.profile.peak, records.ExpectedPeak(6 * GIB, "fallback", 0))
 
     def test_failed_grant_file_write_releases_the_reservation_before_refusing(self) -> None:
@@ -1488,6 +1488,22 @@ class ClientTests(unittest.TestCase):
                 self.assertEqual([item for item in transport.requests if isinstance(item, wire.AdmitRequest)],
                                  [request, request])
                 self.doCleanups()
+
+    def test_verify_run_slot_ignores_inherited_leave_hooks(self) -> None:
+        with AdmissionFixture() as fixture:
+            owner = fixture.run_owner()
+            reply = wire.VerifyRunSlotWaiting(records.RunLimitWait(1, 1, "fixture", fixture.server.host))
+            grant_after = wire.PROTOCOL_ACQUISITION_TIMING.reconnect_seconds + 1
+            transport = self.use_transport(fixture, Exchange(reply_bytes(reply), TimedChunk(grant_after, reply_bytes(wire.Ok()))))
+            with mock.patch.dict(os.environ, {"LINT_QUEUE_LEAVE_HOOK": "test-leave", "BUILDLOG_MAC_IDLE_HOOK": "test-idle"}), \
+                    mock.patch.object(client, "_leave_queue", return_value=True) as hook, \
+                    redirect_stderr(io.StringIO()) as errors:
+                status = client.main(["verify-run-slot", "--pid", str(owner.pid)])
+            self.assertEqual(status, 0, errors.getvalue())
+            hook.assert_not_called()
+            self.assertEqual(fixture.clock.monotonic(), grant_after)
+            self.assertEqual(len(transport.requests), 1)
+            self.assertIn(records.run_limit_text(reply.reason), errors.getvalue())
 
     def test_generation_outage_after_expiry_keeps_the_leave_hook_time_and_cli_status(self) -> None:
         for failure in (b"", b"invalid generation reply\n"):

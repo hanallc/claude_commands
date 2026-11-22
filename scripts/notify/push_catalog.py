@@ -13,6 +13,7 @@ def waiting_tests(count: int) -> str:
     return "1 test waits" if count == 1 else f"{count} tests wait"
 
 
+NATE_ADHOC_TEXT_ID = "nate.adhoc"
 ENTRIES = (
     PushText("accounts.login_sitting", "accounts", "note", "Claude logins will expire", NoActionNeeded(),
         "You asked for early login reminders.\nWithout renewal, Claude work stops at these login end dates:\n{accounts}\nFor each account:\n"
@@ -181,6 +182,16 @@ ENTRIES = (
         "",
         (PushExample("forecast", {"account": "claude3", "empty_at": "Sun 11-22 07:00 EST"}),),
         purpose="A Claude account is expected to run out soon and has no scheduled move."),
+    PushText("quota.token_expiry", "quota_alert", "note", "{token} expires {date}",
+        ActionTemplate("Read the Accounts page."),
+        "",
+        (PushExample("expiry", {"token": "hana-macos-runner-query", "date": "2027-11-22"}),),
+        purpose="A token is near its end date."),
+    PushText("quota.mac_token_login", "quota_alert", "note", "Mac token login failed {time}",
+        ActionTemplate("Read the Accounts page."),
+        "",
+        (PushExample("refused", {"time": "Sat 11-21 10:07 EST"}),),
+        purpose="A Mac relay reports that Claude rejected its fallback token."),
     PushText("quota.codex_next_move", "quota_alert", "note", "{account} has {remaining} left; {outcome_title}",
         NoActionNeeded(),
         "",
@@ -365,7 +376,7 @@ ENTRIES = (
     # /nate adhoc: an agent writes the values at send time; review them like free text (user, 2026-10-28).
     # The user asked that the template name close each push; pushover.py's "Template:" line does that
     # for every push (user, 2026-10-27).
-    PushText("nate.adhoc", "{sender}", "note", "{sender} {title}", NoActionNeeded(),
+    PushText(NATE_ADHOC_TEXT_ID, "{sender}", "note", "{sender} {title}", NoActionNeeded(),
         "{description}",
         (PushExample("typical", {"sender": "natedev", "title": "the /nate skill is ready",
                                  "description": "You asked to be told when the /nate skill is ready. It is ready now: "

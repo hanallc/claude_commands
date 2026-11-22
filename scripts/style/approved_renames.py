@@ -21,15 +21,12 @@ import tomllib
 from collections.abc import Callable, Iterable, Mapping
 from enum import Enum
 from dataclasses import dataclass
-from functools import cache
 from typing import cast
 from pathlib import Path, PurePosixPath
 
 from scripts.style import finding_sites
 from scripts.style import style_footprint
-from scripts.style.candidate_generators import snake_case
 from scripts.style.declarations import ITEM_KEYWORDS, type_path
-from scripts.lib.git_blob import git_blob_id
 
 def module_name(file: str) -> str:
     """Return the folder name for mod.rs, or the file stem for another module file."""
@@ -732,77 +729,6 @@ def admit_anchored_rename(authority: AnchoredRenameSource | RenameAnchorUnavaila
         return OuterBindingUnproved("anchored local target has no proved current declaration", rename.line, rename.text)
     return AdmittedLocalRename(version, rename, authority, admitted.item_identity, admitted.anchor_position, path,
                                hashlib.sha256(source.encode()).hexdigest(), admitted.tokens)
-
-
-TYPE_NAMED_PARAMETER_RULE = (
-    "---\ntier: C\nfamily: names\ninput_scope: file\n---\n"
-    "# Type-named parameters\n\n"
-    "Name a function parameter with an explicit direct named type after the snake_case form of that type's final path component.\n"
-    "References, optional lifetimes and mutability do not change that name.\n"
-    "Do not rename inferred or compound types, fields or other bindings under this contract.\n"
-)
-
-
-@dataclass(frozen=True)
-class TypeNamedParameterRule:
-    """The complete rule is the direct named-type parameter contract checked below."""
-
-
-@dataclass(frozen=True)
-class NoMachineRenameRule:
-    reason: str = "rule has no recognized machine-checkable contract"
-
-
-@cache
-def _type_named_parameter_rule_blob() -> str:
-    return git_blob_id(TYPE_NAMED_PARAMETER_RULE.encode())
-
-
-def machine_rename_rule(rule_blob: str) -> TypeNamedParameterRule | NoMachineRenameRule:
-    # Match the entire pinned rule, including metadata. A filename, a matching
-    # paragraph or an extra restriction is insufficient authority to judge code.
-    return TypeNamedParameterRule() if rule_blob == _type_named_parameter_rule_blob() else NoMachineRenameRule()
-
-
-def type_named_parameter(source: str, rename: BindingRename) -> RenameDeclaration | NoBindingScope:
-    """Machine-check the direct named-type parameter subset of the type-named rule.
-
-    Inferred types, generic/compound types, fields and semantic role names still need a person.
-    Reference identity, capture, visibility and documentation remain the rename executor's proof.
-    """
-    declaration = rename_declaration(source, rename)
-    if isinstance(declaration, NoBindingScope):
-        return declaration
-    if declaration.scope.kind != "fn parameter":
-        return NoBindingScope("rule applicability is not machine-checkable for this declaration")
-    scan = _BindingScan(source)
-    index = declaration.scope.declaration
-    words = scan.words
-    if words[index + 1:index + 2] != (":",):
-        return NoBindingScope("parameter type is not explicit")
-    cursor = index + 2
-    if words[cursor:cursor + 1] == ("&",):
-        cursor += 1
-        if words[cursor:cursor + 1] == ("'",):
-            cursor += 2
-        if words[cursor:cursor + 1] == ("mut",):
-            cursor += 1
-    if cursor >= len(words) or not style_footprint.IDENTIFIER.fullmatch(words[cursor]):
-        return NoBindingScope("parameter type is not a direct named type")
-    name = words[cursor]
-    cursor += 1
-    while words[cursor:cursor + 1] == ("::",):
-        cursor += 1
-        if cursor >= len(words) or not style_footprint.IDENTIFIER.fullmatch(words[cursor]):
-            return NoBindingScope("parameter type path is unreadable")
-        name = words[cursor]
-        cursor += 1
-    if words[cursor:cursor + 1] not in {(",",), (")",)}:
-        return NoBindingScope("compound parameter type requires judgment")
-    expected = snake_case(name)
-    if rename.new.removeprefix("r#") != expected or rename.old.removeprefix("r#") == expected:
-        return NoBindingScope("current parameter does not prove the proposed type-named rule")
-    return declaration
 
 
 @dataclass(frozen=True)

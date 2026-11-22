@@ -8,7 +8,7 @@ every message follows are /message (~/.claude/commands/message.md).
           [--from NAME] [--summary TEXT] [--key KEY [--repeat-minutes N]]
           [--here | --machine HOST] [--timeout SECONDS]
           (--text TEXT | --file PATH | stdin)
-  send.py --to user --text-id ID --value KEY=VALUE ... [--through-silence]
+  send.py --to user --text-id ID --value KEY=VALUE ... [--through-silence] [--user-asked]
                           a registered push; --help lists the templates
   send.py ack KEY       later sends with KEY are skipped
   send.py reopen KEY    forget KEY: acknowledgement and repeat window
@@ -28,8 +28,8 @@ The relay can forward one SendMessage call. It runs sonnet in auto mode (haiku c
 with hooks, MCP and slash commands off and the caller's CLAUDE_* variables
 removed, so it never passes for the session that ran this. Its relay
 name is separate from the sender, who is named in the message. Delivery is read from the
-SendMessage tool result in the relay's stream, never from what the model says;
-the last stream per recipient stays in STATE/relay/<to>.jsonl.
+SendMessage tool result in the relay's stream, never from what the model says.
+Relays without the fallback token save the last stream in STATE/relay/<to>.jsonl.
 Staff `worker:` paths deliver through observed panes or their holders.
 Other `codex:` addresses use a reported herdr pane or the shared Codex daemon.
 An absent staff recipient keeps its queue without selecting a session family.
@@ -57,6 +57,7 @@ message kept for later delivery holds the window, so a retry cannot deliver a
 queued copy twice. While the user's silence is on, a
 kept push with the same key from the same sender replaces the older kept one.
 `--through-silence` sends a user push during silence. Review and priority stay the same.
+`--user-asked` sends a requested `nate.adhoc` push as written. Silence rules still apply.
 A normal push does not repeat or need acknowledgement.
 
 One event sends one emergency push. An emergency push (`--to user --need blocked`)
@@ -176,6 +177,7 @@ if TYPE_CHECKING:
     from scripts.whoami.account import named_account_environment
 from scripts.notify import push_texts  # noqa: E402
 from scripts.notify import push_reference
+from scripts.whoami import mac_fallback_token, token_expiry
 from scripts.message import rca  # noqa: E402
 from scripts.message import repeat_guard  # noqa: E402
 from scripts.notify import review  # noqa: E402
@@ -304,12 +306,27 @@ def is_acknowledged_skip(reason: str) -> bool:
     """Distinguish an acknowledged skip from a repeat-window skip."""
     return _ACKNOWLEDGED_AT in reason
 
+
 LogEntry = TypedDict("LogEntry", {"time": str, "machine": str, "from": str, "to": str, "key": str | None,
                                   "summary": str, "text": str, "outcome": Outcome, "detail": str,
                                   "via": NotRequired[Literal["postmaster", "relay", "queue"]],
                                   "postmaster": NotRequired[postmaster.PostmasterStatus],
                                   "seconds": NotRequired[float], "human": NotRequired[bool], "receiver": NotRequired[str],
                                   "sender_native_id": NotRequired[str]})
+
+
+class RelayTextDifference(TypedDict):
+    first_difference: int
+    approved_window: str
+    sent_window: str | None
+
+
+class RelayMismatch(TypedDict):
+    time: str
+    to: str | None
+    to_truncated: bool
+    text_difference: NotRequired[RelayTextDifference]
+    summary_changed: NotRequired[bool]
 
 
 class SocketRecoveryAttempt(TypedDict):
@@ -1065,6 +1082,7 @@ class Options(NamedTuple):
     review_delivery: bool = False
     urgent: bool = False
     skip_closed: bool = False
+    user_asked: bool = False
 
     @property
     def to(self) -> str:
@@ -1642,7 +1660,7 @@ def clear_check(timeout: float | ConfiguredCheckTimeout = ConfiguredCheckTimeout
         return code, lines
 
 
-def append_record(path: Path, entry: LogEntry | SocketRecoveryAttempt, *, durable: bool = False) -> None:
+def append_record(path: Path, entry: LogEntry | SocketRecoveryAttempt | RelayMismatch, *, durable: bool = False) -> None:
     """Append under the state lock; recovery records must survive a stopped drain."""
     with locked():
         repeat_guard.append_jsonl(path, entry, durable=durable)
@@ -3261,6 +3279,14 @@ def matching_recipients(
     return resolved(matches or local, NamedMachine(roster.remote.other_machine()), observed, peer)
 
 
+def _local_worker(member: staff.StaffRow, membership: staff.StaffSnapshot) -> bool:
+    if member.kind != "worker":
+        return False
+    holder = membership.parent_of(member)
+    return holder is not None and (isinstance(holder.worktree, staff.WorktreeUnfilled)
+                                   or holder.worktree.machine == machine_routes.local_machine())
+
+
 def resolve_recipient(
     target: str | FixedStaffLookup, scope: RecipientResolutionScope, observed: roster.Roster, *,
     membership: staff.StaffSnapshot | None = None, records: list[sessions.SessionRecord] | None = None,
@@ -3290,11 +3316,8 @@ def resolve_recipient(
         if isinstance(member, RecipientLookupFailed):
             usage_error(member.reason)
         if (not check_closed and not isinstance(scope, NamedMachine)
-                and isinstance(member, staff.StaffRow) and member.kind == "worker"):
-            holder = membership.parent_of(member)
-            if holder is not None and (isinstance(holder.worktree, staff.WorktreeUnfilled)
-                                       or holder.worktree.machine == roster.remote.local_machine()):
-                return PaneWorkerRecipient(member)
+                and isinstance(member, staff.StaffRow) and _local_worker(member, membership)):
+            return PaneWorkerRecipient(member)
         if isinstance(member, staff.StaffRow):
             for anomaly in observed.row_anomalies:
                 if anomaly.row.id == member.id:
@@ -3309,6 +3332,12 @@ def resolve_recipient(
             thread_id = to.removeprefix("codex:")
             if not thread_id:
                 usage_error("codex: needs a thread id")
+        if isinstance(member, NoStaffRecipient) and not native:
+            fallback = resolve_staff_recipient(to, membership, observed=observed.entries)
+            if isinstance(fallback, RecipientLookupFailed):
+                usage_error(fallback.reason)
+            if isinstance(fallback, staff.StaffRow):
+                return resolve_recipient(str(fallback.id), scope, observed, membership=membership, records=records)
         resolution_scope = LocalOnly() if native and sessions.addressed(to, records or []) is not None else scope
         result = matching_recipients(to, resolution_scope, observed, membership=membership, skip_closed=check_closed)
         if isinstance(result, (RecipientClosed, RecipientAbsent)):
@@ -3328,12 +3357,6 @@ def resolve_recipient(
                     and isinstance(member, staff.StaffRow)):
                 return RemoteDelivery(route.host, staff_queue_key(member.id))
             return route
-        if isinstance(member, NoStaffRecipient) and not native:
-            fallback = resolve_staff_recipient(to, membership, observed=observed.entries)
-            if isinstance(fallback, RecipientLookupFailed):
-                usage_error(fallback.reason)
-            if isinstance(fallback, staff.StaffRow):
-                return resolve_recipient(str(fallback.id), scope, observed, membership=membership, records=records)
         if isinstance(result, LocalRosterIncomplete):
             usage_error(f"absence of {to} here is not proven; use an address or --machine")
         if isinstance(result, RecipientSearchFailed):
@@ -3487,20 +3510,45 @@ class RelayRecipientWrite:
         default_factory=RelayRequestNotForwarded)
 
 
-def read_relay(observed: RelayTransportResponse, text: str, *,
+def _log_relay_mismatch(target: object, sent: object, approved: str, *, summary_changed: bool) -> None:
+    target_limit = 256
+    record = RelayMismatch(time=now().isoformat(), to=target[:target_limit] if isinstance(target, str) else None,
+                           to_truncated=len(as_str(target)) > target_limit)
+    if summary_changed:
+        record["summary_changed"] = True
+    if sent != approved:
+        sent_text = as_str(sent)
+        first = next((index for index, (before, after) in enumerate(zip(approved, sent_text)) if before != after),
+                     min(len(approved), len(sent_text)))
+        window = slice(max(0, first - 32), first + 32)
+        record["text_difference"] = RelayTextDifference(first_difference=first, approved_window=approved[window],
+                                                        sent_window=sent_text[window] if isinstance(sent, str) else None)
+    try:
+        append_record(STATE / "relay_mismatches.jsonl", record)
+    except OSError as error:
+        print(f"message relay mismatch log: {error}", file=sys.stderr)
+
+
+def read_relay(observed: RelayTransportResponse, text: str, *, summary: str | None = None,
                review_delivery: bool = False) -> CheckedRelayAcceptance | Result:
-    """Check the approved call, its result, and the proxy forward together."""
+    """Check the proxy write and the result for the approved tool ID."""
+    events = [as_dict(loads(line)) for line in observed.stdout.splitlines()]
+    sends = [part for event in events if event.get("type") == "assistant"
+             for value in as_list(as_dict(event.get("message")).get("content"))
+             if (part := as_dict(value)).get("type") == "tool_use" and part.get("name") == "SendMessage"]
+    for call in sends:
+        inputs = as_dict(call.get("input"))
+        target, sent = inputs.get("to"), inputs.get("message")
+        summary_changed = summary is not None and inputs.get("summary") != summary
+        if target != observed.target or sent != text or summary_changed:
+            _log_relay_mismatch(target, sent, text, summary_changed=summary_changed)
     forward = observed.forward
     if isinstance(forward, RefusedRelayRequest):
         return forward
     if isinstance(forward, RelayRequestInterrupted):
         return _unaccepted_relay(forward, forward.reason)
-    events = [as_dict(loads(line)) for line in observed.stdout.splitlines()]
     mode = next((as_str(event.get("permissionMode")) for event in events
                  if event.get("type") == "system" and event.get("subtype") == "init"), "unknown")
-    sends = [part for event in events if event.get("type") == "assistant"
-             for value in as_list(as_dict(event.get("message")).get("content"))
-             if (part := as_dict(value)).get("type") == "tool_use" and part.get("name") == "SendMessage"]
     if not sends:
         said = next((as_str(event.get("result")) for event in reversed(events) if event.get("type") == "result"), "")
         return _unaccepted_relay(forward, f"the relay made no SendMessage call: {one_line(said) or 'no output'}",
@@ -3514,12 +3562,15 @@ def read_relay(observed: RelayTransportResponse, text: str, *,
             return _unaccepted_relay(forward, f"{len(sends)} SendMessage calls")
         call = forwarded_calls[0]
     inputs = as_dict(call.get("input"))
-    if inputs.get("to") != observed.target or inputs.get("message") != text:
+    changed = (inputs.get("to") != observed.target or inputs.get("message") != text
+               or (summary is not None and inputs.get("summary") != summary))
+    tool_id = as_str(call.get("id"))
+    approved_forward = forward == RelayRequestForwarded(tool_id, text)
+    if changed and not approved_forward:
         reason = "SendMessage used a different target or payload"
         if isinstance(forward, RelayRequestNotForwarded):
             return RefusedRelayRequest("refused", reason)
         return _unaccepted_relay(forward, reason)
-    tool_id = as_str(call.get("id"))
     results = [part for event in events if event.get("type") == "user"
                for value in as_list(as_dict(event.get("message")).get("content"))
                if (part := as_dict(value)).get("type") == "tool_result" and part.get("tool_use_id") == tool_id]
@@ -3528,15 +3579,17 @@ def read_relay(observed: RelayTransportResponse, text: str, *,
     result = results[0]
     answer = result_text(result.get("content"))
     success = as_dict(loads(answer)).get("success")
-    if review_delivery and success is False and forward == RelayRequestForwarded(tool_id, text):
+    if review_delivery and success is False and approved_forward:
         return Result("failed", describe(answer) or "SendMessage rejected the message")
     if result.get("is_error") is True or success is not True:
         rejected = result.get("is_error") is True or success is False
         return _unaccepted_relay(forward, describe(answer) or "SendMessage did not confirm success",
                                  queue_if_unsent=rejected)
-    if forward != RelayRequestForwarded(tool_id, text):
+    if not approved_forward:
         return _unaccepted_relay(forward, "SendMessage has no matching completed proxy forward")
     detail = f"mode {mode}; verbatim; {describe(answer)}"
+    if changed:
+        detail += "; guard set the approved input"
     if len(sends) > 1:
         detail += f"; forwarded 1 of {len(sends)} SendMessage calls"
     return CheckedRelayAcceptance(tool_id, detail)
@@ -3580,11 +3633,16 @@ try:
     event = json.load(sys.stdin)
     inputs = event["tool_input"]
     tool_id = event["tool_use_id"]
-    if (event["tool_name"] != "SendMessage" or not isinstance(tool_id, str) or not tool_id
-            or any(inputs.get(key) != value for key, value in required.items())):
+    if event["tool_name"] != "SendMessage" or not isinstance(tool_id, str) or not tool_id:
         raise ValueError("unexpected SendMessage input")
+    output = json.dumps({"hookSpecificOutput": {
+        "hookEventName": "PreToolUse",
+        "permissionDecision": "allow",
+        "updatedInput": {**inputs, **required},
+    }})
     with Path(sys.argv[2]).open("x") as approval:
         approval.write(tool_id)
+    print(output)
 except Exception:
     sys.exit(2)
 """
@@ -4134,6 +4192,23 @@ def _bound_relay(message: Message, timeout: float, command: list[str], env: dict
         return _unaccepted_relay(write.state, f"cannot relay through the checked socket: {error}")
 
 
+def _relay_token_login(observed: RelayTransportResponse) -> mac_fallback_token.RelayLogin:
+    from scripts.whoami.mac_fallback_token import RelayLogin
+
+    events = [as_dict(loads(line)) for line in observed.stdout.splitlines()]
+    for event in events:
+        if event.get("type") == "assistant" and event.get("error") == "authentication_failed":
+            return RelayLogin.FAILED
+        if event.get("type") == "result" and event.get("is_error") is True:
+            message = as_str(event.get("result")).casefold()
+            if message.startswith(("login expired", "login reached its time limit", "api error: 401")):
+                return RelayLogin.FAILED
+    if any(event.get("type") == "assistant" and not event.get("error")
+           and as_list(as_dict(event.get("message")).get("content")) for event in events):
+        return RelayLogin.GOOD
+    return RelayLogin.UNCONFIRMED
+
+
 def relay(message: Message, timeout: float) -> Result:
     attempt = message.claude_attempt
     if not isinstance(attempt, ClaudeDeliveryAttempt):
@@ -4163,15 +4238,11 @@ def relay(message: Message, timeout: float) -> Result:
                "-n", relay_session_name(message.sender), "--output-format", "stream-json", "--verbose"]
     # A Mac keeps Claude's login in its keychain, which ssh cannot open; the user's
     # `claude setup-token` token, encrypted behind gpg-agent, stands in for it.
-    token_file = Path.home() / ".config" / "claude" / "oauth-token.gpg"
     try:
-        if token_file.exists():
-            token = subprocess.run(["gpg", "--pinentry-mode", "error", "--quiet", "--decrypt", str(token_file)],
-                                   capture_output=True, text=True, timeout=10, check=False)
-            if token.returncode != 0:
-                return Result("queued", f"gpg-agent is cold on {machine()}: run github-warmup there")
-            env["CLAUDE_CODE_OAUTH_TOKEN"] = token.stdout.strip()
+        token_made = mac_fallback_token.prepare_child(env)
         relay_env = models_registry.agent_environment(env)
+    except mac_fallback_token.TokenDecryptFailed:
+        return Result("queued", f"gpg-agent is cold on {machine()}: run github-warmup there")
     except (OSError, ValueError, subprocess.SubprocessError) as error:
         return Result("failed", f"cannot prepare the relay: {error}")
     command = [str(Path(__file__).resolve().parents[1] / "lib/py"), "-c", RELAY_EXEC, str(STATE / "relay_senders"), message.sender, *command]
@@ -4183,19 +4254,32 @@ def relay(message: Message, timeout: float) -> Result:
     if isinstance(observed, Result):
         return observed
     code, out, err = observed.code, observed.stdout, observed.stderr
-    try:
-        raw = STATE / "relay" / f"{file_name(message.to)}.jsonl"
-        raw.parent.mkdir(parents=True, exist_ok=True)
-        write_atomic(raw, out + err)
-    except OSError as error:
-        print(f"message relay log: {error}", file=sys.stderr)
-    result = read_relay(observed, agent_text(message, via_relay=True), review_delivery=message.review_delivery)
+    if isinstance(token_made, datetime):
+        login = _relay_token_login(observed)
+        try:
+            mac_fallback_token.record_relay(token_made, login, datetime.now(timezone.utc))
+        except (OSError, ValueError):
+            print("message relay: could not save the Mac token result", file=sys.stderr)
+    else:
+        try:
+            raw = STATE / "relay" / f"{file_name(message.to)}.jsonl"
+            raw.parent.mkdir(parents=True, exist_ok=True)
+            write_atomic(raw, out + err)
+        except OSError as error:
+            print(f"message relay log: {error}", file=sys.stderr)
+    result = read_relay(observed, agent_text(message, via_relay=True), summary=quote_sender_lines(message.summary),
+                        review_delivery=message.review_delivery)
     if isinstance(result, CheckedRelayAcceptance):
+        if isinstance(token_made, datetime):
+            return Result("sent", "the relay confirmed delivery")
         return Result("sent", result.detail)
     if code is None:
         if isinstance(observed.forward, RelayRequestForwarded) and not isinstance(result, UncertainRelayDelivery):
-            return result
+            return (result._replace(detail="the relay did not confirm delivery")
+                    if isinstance(token_made, datetime) else result)
         return _unaccepted_relay(observed.forward, f"relay timed out after {timeout:g} s")
+    if isinstance(token_made, datetime):
+        return result._replace(detail="the relay did not confirm delivery")
     if result.outcome == "queued" and code != 0:
         return Result("queued", f"relay exit {code}: {result.detail}; {one_line(err, 200)}")
     return result
@@ -4332,8 +4416,13 @@ def reviewed_failure(stdout: str, original: FailedPush, *,
     return original
 
 
-def user(message: Message, need: Need, action: UserAction, timeout: float, *, answerable: bool = False, text_id: str = "", values: tuple[str, ...] = (), due: str = "", reference: push_reference.PushReference = push_reference.NO_REFERENCE, remote_forward: bool = False, silence_policy: silence.SilencePolicy = silence.SilencePolicy.KEEP_DURING_SILENCE) -> Result:
+def user(message: Message, need: Need, action: UserAction, timeout: float, *, answerable: bool = False,
+         text_id: str = "", values: tuple[str, ...] = (), due: str = "",
+         reference: push_reference.PushReference = push_reference.NO_REFERENCE, remote_forward: bool = False,
+         silence_policy: silence.SilencePolicy = silence.SilencePolicy.KEEP_DURING_SILENCE, user_asked: bool = False) -> Result:
     """Reach the user. The channel is this function's business alone."""
+    if text_id in token_expiry.ALERT_IDS and not push_texts.approval_date(text_id):
+        return Result("refused", "the token alert template needs current approval")
     key = ["--key", message.key] if message.key else []
     selected_priority = decision_priority.priority(need, due)
     command = [sys.executable, str(USER_CHANNEL), "--priority", selected_priority, "--source", message.sender, *key,
@@ -4345,6 +4434,8 @@ def user(message: Message, need: Need, action: UserAction, timeout: float, *, an
             command.extend(["--value", value])
     if silence_policy == silence.SilencePolicy.SEND_THROUGH_SILENCE:
         command[2:2] = ["--through-silence"]
+    if user_asked:
+        command[2:2] = ["--user-asked"]
     if due:
         command[2:2] = ["--due", due]
     if reference["kind"] != "none":
@@ -4487,6 +4578,8 @@ def remote(message: Message, host: str, options: Options) -> Result:
         forwarded += ["--need", options.need]
         if options.silence_policy == silence.SilencePolicy.SEND_THROUGH_SILENCE:
             forwarded += ["--through-silence"]
+        if options.user_asked:
+            forwarded += ["--user-asked"]
         if options.reference["kind"] != "none":
             forwarded += ["--push-reference", json.dumps(options.reference)]
         if options.due:
@@ -4678,7 +4771,7 @@ def refusal_report(options: Options) -> rca.Report:
 
 def wrong_template(options: Options, shown: str) -> str | None:
     """The hold detail when a user push tells in free text what a registered template carries, else None."""
-    if options.to != USER:
+    if options.to != USER or options.user_asked:
         return None
     registered_text = bool(options.text_id) and not push_texts.agent_written(options.text_id)
     if options.text_id != AUTO_MODE_TEXT and options.text_id not in RCA_TEXTS and reports_auto_mode_refusal(shown):
@@ -4730,6 +4823,7 @@ def parse(argv: list[str]) -> Options:
     _ = parser.add_argument("--value", action="append", default=[], help="registry template key=value")
     _ = parser.add_argument("--answerable", action="store_true", help=argparse.SUPPRESS)
     _ = parser.add_argument("--through-silence", action="store_true", help="to `user`: send during silence with the same review and priority")
+    _ = parser.add_argument("--user-asked", action="store_true", help="Send a requested nate.adhoc push as written.")
     _ = parser.add_argument("--from", dest="sender", help="the sender name the recipient sees")
     _ = parser.add_argument("--human", action="store_true", help="the message was written by a person, including a verbatim human relay")
     _ = parser.add_argument("--no-accounting", action="store_true", help=argparse.SUPPRESS)
@@ -4847,6 +4941,8 @@ def parse(argv: list[str]) -> Options:
     if to != USER:
         if attr(args, "through_silence") is True:
             parser.error("--through-silence must go with --to user")
+        if attr(args, "user_asked") is True:
+            parser.error("--user-asked must go with --to user")
         if attr(args, "answerable") is True:
             parser.error("--answerable goes with --to user")
         if action_text is not None or no_action:
@@ -4900,7 +4996,7 @@ def parse(argv: list[str]) -> Options:
                                       else silence.SilencePolicy.KEEP_DURING_SILENCE),
                       recipient_identity=LogicalRecipientIdentity(recipient_key) if recipient_key else TransportRecipientIdentity(),
                       review_delivery=get["review_delivery"] is True, urgent=get["urgent"] is True,
-                      skip_closed=get["skip_closed"] is True)
+                      skip_closed=get["skip_closed"] is True, user_asked=get["user_asked"] is True)
     if options.skip_closed and (not to.startswith("codex:") or not isinstance(selection, RosterLookup)):
         parser.error("--skip-closed needs a codex: thread address")
     if options.to == USER and options.summary is None:
@@ -5238,22 +5334,34 @@ def _send_with_review(options: Options, membership: staff.StaffSnapshot, review_
         membership = replace(membership, running_sessions=frozenset(record["sessionId"] for record in running))
     records = [record for record in running if sessions.messaging_socket_exists(record)]
     stamp = (options.sender_origin.stamp if isinstance(options.sender_origin, ForwardedSender) else sender_stamp())
+    fixed = isinstance(options.selection, FixedStaffLookup)
+    native = not fixed and target.startswith("session:")
+    local_recipient = ""
+    if needs_recipient_roster:
+        if native:
+            local = sessions.addressed(target, records)
+            if local is not None:
+                local_recipient = local["sessionId"]
+        elif not fixed and target.startswith("codex:"):
+            local_member = _staff_recipient_match(target, membership)
+            if isinstance(local_member, staff.StaffRow) and _local_worker(local_member, membership):
+                local_recipient = str(local_member.current_session)
+        elif not target.startswith(("session:", "worker:", "codex:")):
+            local_member = resolve_staff_recipient(target, membership, records=records)
+            if (isinstance(local_member, staff.StaffRow) and local_member.kind != "worker"
+                    and sessions.addressed(f"session:{local_member.current_session}", records) is not None):
+                local_recipient = str(local_member.current_session)
     participants: roster.AllRosterSessions | roster.MessageParticipants = roster.AllRosterSessions()
-    if needs_recipient_roster and not target.startswith(("session:", "worker:", "codex:")):
-        local_member = resolve_staff_recipient(target, membership, records=records)
-        if (isinstance(local_member, staff.StaffRow) and local_member.kind != "worker"
-                and sessions.addressed(f"session:{local_member.current_session}", records, membership=membership) is not None):
-            identities = {str(local_member.current_session)}
-            if isinstance(stamp, ClaudeSender):
-                identities.add(stamp.session_id)
-            elif isinstance(stamp, CodexSender):
-                identities.add(stamp.thread_id)
-            participants = roster.MessageParticipants(frozenset(identities))
+    if local_recipient and not options.skip_closed:
+        identities = {local_recipient}
+        if isinstance(stamp, ClaudeSender):
+            identities.add(stamp.session_id)
+        elif isinstance(stamp, CodexSender):
+            identities.add(stamp.thread_id)
+        participants = roster.MessageParticipants(frozenset(identities))
     observed = (roster.roster(os.environ, roster.ThisMachine(), membership=membership, registry=registry,
                              participants=participants) if needs_recipient_roster or needs_sender_roster
                 else roster.Roster([], []))
-    fixed = isinstance(options.selection, FixedStaffLookup)
-    native = not fixed and target.startswith("session:")
     raw_socket = not fixed and target.startswith("uds:")
     if isinstance(options.selection, FixedStaffLookup):
         member = options.selection.member(membership)
@@ -5457,7 +5565,10 @@ def _send_with_review(options: Options, membership: staff.StaffSnapshot, review_
         elif isinstance(route, UserDelivery):
             if isinstance(options.action, NoUserRecipient):
                 raise AssertionError("a user message must state its action")
-            result = user(message, options.need, options.action, options.timeout, answerable=options.answerable, text_id=options.text_id, values=options.values, due=options.due, reference=options.reference, remote_forward=isinstance(options.sender_origin, ForwardedSender), silence_policy=options.silence_policy)
+            result = user(message, options.need, options.action, options.timeout, answerable=options.answerable,
+                          text_id=options.text_id, values=options.values, due=options.due, reference=options.reference,
+                          remote_forward=isinstance(options.sender_origin, ForwardedSender),
+                          silence_policy=options.silence_policy, user_asked=options.user_asked)
             if options.text_id == AUTO_MODE_TEXT and result.outcome in ("sent", "kept"):
                 _ = rca.open_case(refusal_report(options), defer_owner=True)
         elif isinstance(route, (CodexSessionRecipient, CodexPaneRecipient)):

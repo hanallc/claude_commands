@@ -19,6 +19,16 @@ from importlib.machinery import ModuleSpec, PathFinder
 from importlib.util import module_from_spec
 from types import CodeType, ModuleType
 
+# Keep typing out of interpreter startup.
+TYPE_CHECKING = False
+if TYPE_CHECKING:
+    from typing import Literal, Protocol
+
+    class _CheckoutStartupAttributes(Protocol):
+        def __contains__(self, key: Literal["ready"], /) -> bool: ...
+        def pop(self, key: Literal["ready"], /) -> Callable[[], None]: ...
+        def setdefault(self, key: Literal["startup_hooks"], default: list[ModuleType], /) -> list[ModuleType]: ...
+
 
 STARTUP_FILES = ("scripts/lib/py", "scripts/lib/package_root.py", "scripts/lib/python_startup/sitecustomize.py")
 TEST_RUNNER_FILES = (*STARTUP_FILES, "scripts/test_times/module_run.py", "scripts/lib/descendants.py",
@@ -218,9 +228,19 @@ def start_process(arguments: list[str]) -> str:
     return selected
 
 
+def gate_parent_pid(consume: bool = False) -> str:
+    """Read the gate parent and optionally clear both names before tests start."""
+    # Chunk 6 removes the old parent variable read.
+    parent = os.environ.get("GATE_PARENT_PID") or os.environ.get("MERGE_GATE_PARENT_PID", "")
+    if consume:
+        _ = os.environ.pop("GATE_PARENT_PID", None)
+        _ = os.environ.pop("MERGE_GATE_PARENT_PID", None)
+    return parent
+
+
 def _start_test_run(selected: str, arguments: list[str]) -> None:
-    # Decide before any import; module_run.py removes the gate variable later.
-    if os.environ.get("MERGE_GATE_PARENT_PID"):
+    # Decide before any import; module_run.py removes the gate variables later.
+    if gate_parent_pid():
         return
     original = sys.orig_argv
     unittest_module = ("-munittest" in original
@@ -260,11 +280,13 @@ def finish_startup(filename: str, arguments: list[str]) -> None:
     state = sys.modules["_devtools_checkout"]
     # Python adds its automatic path after this hook returns.
     state.__dict__["completed_selection"] = (selected, _selection_inputs(automatic_paths))
-    if "ready" in state.__dict__:
-        from typing import cast
+    attributes: _CheckoutStartupAttributes = state.__dict__
+    if "ready" in attributes:
+        attributes.pop("ready")()
 
-        ready = cast(Callable[[], None], state.__dict__.pop("ready"))
-        ready()
+
+def _retained_startup_hooks(attributes: _CheckoutStartupAttributes) -> list[ModuleType]:
+    return attributes.setdefault("startup_hooks", [])
 
 
 def next_sitecustomize(filename: str, search: list[str] | None = None) -> None:
@@ -280,11 +302,9 @@ def next_sitecustomize(filename: str, search: list[str] | None = None) -> None:
             remaining.append(entry)
     spec = PathFinder.find_spec("sitecustomize", remaining)
     if spec is not None and spec.loader is not None:
-        from typing import cast
-
         module = module_from_spec(spec)
         # Keep hook contexts active for the process lifetime.
-        hooks = cast(list[ModuleType], sys.modules["_devtools_checkout"].__dict__.setdefault("startup_hooks", []))
+        hooks = _retained_startup_hooks(sys.modules["_devtools_checkout"].__dict__)
         spec.loader.exec_module(module)
         hooks.append(module)
 

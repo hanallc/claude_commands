@@ -65,7 +65,7 @@ class PushAloneTests(unittest.TestCase):
     def test_a_push_alone_passes(self) -> None:
         for command in (
             "git push -q origin HEAD:refs/heads/x",
-            "git -C /tmp/repo push -q git@github.com:natepiano/claude_commands HEAD:refs/heads/x",
+            "git -C /tmp/repo push -q git@github.com:hanallc/claude_commands HEAD:refs/heads/x",
             "GIT_SSH_COMMAND=ssh git push origin x 2>&1  # push the branch",
         ):
             with self.subTest(command=command):

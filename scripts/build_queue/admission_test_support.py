@@ -274,6 +274,9 @@ class TestProcesses:
         start = self.fixture_owners[pid] if pid in self.fixture_owners else records.process_start_time(pid)
         return service.OwnerProcessGone() if start is None else service.LiveOwnerIdentity(start)
 
+    def owner_process(self, pid: int) -> service.OwnerProcessReading:
+        return service.linux_owner_process(pid, Path("/proc"))
+
     def pidfd(self, pid: int) -> int:
         return os.pidfd_open(os.getpid() if pid in self.fixture_owners else pid)
 
@@ -724,7 +727,8 @@ class AdmissionFixture(ExitStack):
             capture_output=True, timeout=3, check=False)
         if probe.returncode:
             raise unittest.SkipTest("real transient scope needs a user systemd manager")
-        child: subprocess.Popen[bytes] = subprocess.Popen(["systemd-run", "--user", "--scope", "--quiet", "--expand-environment=no", f"--unit={unit}",
+        child: subprocess.Popen[bytes] = subprocess.Popen([
+            "systemd-run", "--user", "--scope", "--quiet", "--collect", "--expand-environment=no", f"--unit={unit}",
             "sh", "-c", "echo $$; sleep 300 & wait"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
         def stop() -> None:
             _ = subprocess.run(["systemctl", "--user", "stop", unit], capture_output=True,

@@ -89,7 +89,7 @@ class BroadcastTests(unittest.TestCase):
         (self.root / "peer-log").mkdir()
         peer_driver = binaries / "ssh"
         _ = peer_driver.write_text(
-            f"#!{Path(__file__).resolve().parents[1] / 'lib/py'}\n"
+            f"#!/usr/bin/env {Path(__file__).resolve().parents[1] / 'lib/py'}\n"
             + "import json, os, shlex, sys\n"
             + "from pathlib import Path\n"
             + "with open(os.environ['SSH_RECORD'], 'a') as log: log.write(json.dumps(sys.argv[1:]) + '\\n')\n"

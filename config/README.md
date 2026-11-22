@@ -79,7 +79,9 @@ The per-call message uses `context_usage.conf`.
 `agents_slice` selects the systemd slice for agent panes and Codex app-server processes.
 Both callers read the value when they use it.
 
-## merge_gate.conf
+## gate.conf
+
+`merge_gate.conf` links to `gate.conf` for running gates; chunk 6 removes the link.
 
 `nightly_result_push=on` sends the nightly result or the reason that the checks did not run.
 `off` disables both pushes. The user can remove this push later.
@@ -679,9 +681,8 @@ file named.
 - `/zone <place>` changes it on both machines and tells every session; a bare
   `/zone` shows it. The status line reads the file in `statusline.sh`.
 
-A production document's old `User zone` line is ignored. A time stored without an offset keeps the zone it was
-recorded in: `scripts/model_study/turns.py` names Pacific for the model study's
-roster.
+The zone reader ignores a production document's old `User zone` line.
+A time stored without an offset keeps its original zone.
 
 ## statusline.conf
 
@@ -751,14 +752,6 @@ Cleanup ignores zombies and retains ownership when it cannot inspect a live proc
 Remaining children report `mac_cleanup=unconfirmed`. The sender confirms their termination before it releases the claim.
 Disk cleanup failures retain the separate `mac_cleanup=1` result.
 `leftover_timeout_s` bounds cleanup confirmation. Failed confirmation retains the claim.
-
-`loopback.*` settings control the manual Tailscale SSH proof on natedev.
-`loopback.port` selects the SSH port. An empty value uses the SSH default.
-`loopback.known_hosts` selects the known_hosts file. An empty value uses the user's normal known_hosts file.
-A selected known_hosts file requires strict host key checking for SSH and rsync.
-The proof creates a managed scratch home and a tiny Rust fixture.
-It uses private memory files and executes test, check, and staged doc in one warm slot.
-It removes the scratch home when the proof ends. Automated tests never execute this proof.
 
 ## dev_shell.conf
 
@@ -880,3 +873,10 @@ All boxes use signed links to the home bucket.
 The command includes configured types and the r7a.8xlarge, m8a.8xlarge, and c8a.8xlarge candidates.
 `down` removes regional stacks and copied images.
 `remove-images` changes the home image and keeps regional stacks and copied images.
+
+The gate uses `gate` and `test-affected` as step names.
+`gate.py --affected` runs the affected modules.
+`build_steps.conf` defines `names.gate`, `names.test-affected`, and `prose.gate`.
+Its owner keys are `owned.gate`, `owned.test-affected`, and `owned.showrunner-gate`.
+`build_admission.conf` defines `program_first_peak_gib.gate` and `program_first_peak_gib.test-affected`.
+It also defines `peak_hold_seconds.gate` and `peak_hold_seconds.test-affected`.

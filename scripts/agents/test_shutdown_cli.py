@@ -28,7 +28,7 @@ from unittest import mock
 from scripts.accounts import accounts
 from scripts.lib.state_home_test_support import isolate_state_home
 from scripts.herdr import herdr_types
-from scripts.agents import test_stop_resume, worker_lifecycle
+from scripts.agents import set_model, status_entry, test_stop_resume, worker_lifecycle
 from scripts.direct import progress_history
 from scripts.copies import copies
 from scripts.copies import remote_test_support
@@ -103,7 +103,7 @@ class AgentsUsageTests(unittest.TestCase):
         assert row is not None and isinstance(row.worktree, staff.PresentWorktree)
         _ = staff.set_worktree(row.id, staff.RemovedWorktree(row.worktree.machine, row.worktree.path),
                                expected=row.worktree)
-        with mock.patch.object(shutdown, "_selected_account", return_value=Account("claude", TARGET_LOGIN, "claude2")):
+        with mock.patch.object(status_entry, "_selected_account", return_value=Account("claude", TARGET_LOGIN, "claude2")):
             code, output, errors = self.invoke(["status", "--here", "--json"])
             self.assertEqual(code, 0, errors)
             report = cast(dict[str, object], json.loads(output))
@@ -138,13 +138,14 @@ class AgentsUsageTests(unittest.TestCase):
         self.assertEqual(errors, "")
         self.assertEqual([line.split()[1] for line in output.splitlines()[1:]],
                          ["help", "status", "pause", "exit", "pause", "resume", "resume", "resume", "retire", "rename", "move",
-                          "restart", "stop", "remove-stray", "transfer", "add-producer", "set-model"])
+                          "reboot", "restart", "stop", "remove-stray", "transfer", "add-producer", "set-model"])
         self.assertIn("resume NAME", output)
         self.assertIn("resume PRODUCER --resend-opening-prompt", output)
         self.assertIn("transfer NAME [--model MODEL --effort EFFORT]", output)
         self.assertIn("add-producer NAME [--model MODEL] [--effort EFFORT] [--job TEXT]", output)
         self.assertIn("set-model ROLE MODEL [EFFORT]", output)
         self.assertIn("retire NAME [--to PRODUCER]", output)
+        self.assertIn("reboot [--dry-run]", output)
         self.assertIn("stop SESSION", output)
         self.assertIn("remove-stray NAME SESSION", output)
         self.assertIn("[ACCOUNT]", output)
@@ -168,6 +169,32 @@ class AgentsUsageTests(unittest.TestCase):
         self.assertEqual(option[0], 0)
         self.assertTrue(option[1].startswith("usage: agents"))
         self.assertEqual(option, self.invoke(["help"]))
+
+        root = Path(__file__).resolve().parents[2]
+        status_help = subprocess.run(
+            [str(root / "scripts/lib/py"), "-c", """
+import runpy
+import sys
+
+sys.modules["scripts.agents.producer_lifecycle"] = None
+sys.argv = [sys.argv[1], "status", "--help"]
+runpy.run_path(sys.argv[0], run_name="__main__")
+""", str(root / "scripts/agents/shutdown.py")],
+            cwd=root, capture_output=True, text=True, check=False, timeout=30,
+        )
+        code, output, errors = self.invoke(["status", "--help"])
+        self.assertEqual((status_help.returncode, status_help.stdout, status_help.stderr),
+                         (code, output, errors))
+        self.assertEqual(code, 0)
+        self.assertIn("positional arguments:\n  account", output)
+
+        with (mock.patch.object(set_model, "COMMAND", "select-model"),
+              mock.patch.object(set_model, "ARGUMENTS", "TARGET MODEL")):
+            for arguments in (["--help"], ["status", "--help"]):
+                with self.subTest(arguments=arguments):
+                    code, output, errors = self.invoke(arguments)
+                    self.assertEqual((code, errors), (0, ""))
+                    self.assertIn("agents select-model TARGET MODEL", output)
 
     def test_unknown_command_prints_usage_and_exits_two(self) -> None:
         status, output, errors = self.invoke(["unknown-command"])
@@ -359,12 +386,12 @@ caller_margin_seconds=15
 remote_transport_seconds=30
 """,
     "build_steps": """\
-names.targeted-test=targeted test
-names.merge-gate=gate
+names.test-affected=test affected
+names.gate=gate
 names.integrate=integrate
 names.test-all=test all
 names.test-modules=test named
-prose.merge-gate=the gate
+prose.gate=the gate
 prose.build=release build
 owned.default={unit} {step}
 owned.showrunner-default=showrunner {step}
@@ -2162,7 +2189,8 @@ class ResumeUnitTests(ShutdownRepositoryFixture):
     def assert_resumed(self, code: int, output: str) -> None:
         self.assertEqual(code, 0, output)
         self.assertEqual(self.calls[-1], ["add_unit.py", "--production", "alpha", "alpha", "--resume", DIRECTOR,
-                                          "--cwd", str(self.worktree), "--plan", "docs/plans/alpha.md"])
+                                          "--cwd", str(self.worktree), "--join-recovery-locks",
+                                          "--plan", "docs/plans/alpha.md"])
         self.assertEqual(git(self.worktree, "branch", "--show-current"), "alpha")
         self.assertEqual(git(self.worktree, "rev-parse", "HEAD"), git(self.checkout, "rev-parse", "main"))
         self.assertIn("alpha resumed", output)
@@ -2319,20 +2347,43 @@ class ResumeUnitTests(ShutdownRepositoryFixture):
         row = unit_membership("alpha", "alpha")
         _ = staff.set_worktree(row.id, staff.RemovedWorktree(remote.local_machine(), self.worktree), expected=row.worktree)
         wrapper = self.root / "resume-launch.py"
-        # The inner launcher boundary supplies no live pane. Its public main and
-        # staff step are real, including the inherited operation lock.
+        # Run the add_unit entry point with a fixture pane and the real lock checks.
         write_text_atomic(wrapper, "\n".join([
-            "import sys", "from unittest.mock import patch",
-            "from pathlib import Path",
+            "import os, subprocess, sys", "from unittest.mock import patch",
+            "from datetime import datetime, timezone", "from pathlib import Path",
             f'with open(Path({str(CHECKOUT)!r}) / "scripts/lib/package_root.py") as package_root: exec(package_root.read(), {{"__file__": package_root.name}})',
-            "from scripts.production import add_unit", "from scripts.production.production_doc import read_production",
-            "def launch(arguments):",
-            "    name = arguments[arguments.index('--production') + 1]",
-            "    row = add_unit.ensure_staff_unit(read_production(name), arguments[2])",
-            "    from scripts.agents import pane_record",
+            "from scripts.production import add_unit", "from scripts.herdr import herdr", "from scripts.accounts import accounts",
+            "from scripts.agents import pane_record, remote",
+            "def preflight(request, selected, *, record):",
+            "    launch = add_unit.UnitLaunch(production=request.production, branch=request.branch, worktree=request.session.cwd,",
+            "        plan=request.plan, port=request.port, session=request.session, timeout=request.timeout,",
+            "        identity=add_unit.UnitIdentity(request.unit, request.requested_name))",
+            "    return add_unit.ReadyToLaunch(launch, add_unit.NoUnitRow(), add_unit.DirectorAgent('sonnet', add_unit.DefaultEffort()))",
+            "def publish(ready, *, record):",
+            "    launch = ready.launch",
+            "    return add_unit.ensure_staff_unit(launch.production, launch.unit_id,",
+            "                                      runtime_id=launch.session.session_id, record=record)",
+            "def launch(*args, **kwargs):",
+            "    competing = [arg for arg in sys.argv[1:] if arg != '--join-recovery-locks']",
+            "    competing[competing.index('--resume')] = '--attach'",
+            "    env = {key: val for key, val in os.environ.items() if not key.startswith('STAFF_ROW_FD_')}",
+            "    result = subprocess.run([sys.executable, __file__, *competing], text=True, capture_output=True,",
+            "        env=env, pass_fds=(int(env['STAFF_OPERATION_FD']),), timeout=10, check=False)",
+            "    assert result.returncode == 2 and 'another operation holds this row' in result.stderr, result.stderr",
             f"    pane_record.write('agents', pane_record.launch('w1:p1', {DIRECTOR!r}, {str(self.worktree)!r}, {{}}, ['claude']))",
-            "    print(row.id)", "    return 0",
-            "with patch.object(add_unit, '_main', side_effect=launch):",
+            "    return herdr.PromptSubmitted(datetime.now(timezone.utc))",
+            "with (patch.object(accounts, 'check', return_value=[]),",
+            f"      patch.object(remote, 'local_machine', return_value={remote.local_machine()!r}),",
+            "      patch.object(add_unit, 'account_for_launch', return_value=accounts.NamedAccount('claude3', Path.home() / '.claude3')),",
+            "      patch.object(add_unit, 'model_for_resume', return_value=''),",
+            "      patch.object(add_unit, 'autocompact_for_resume', return_value=''),",
+            "      patch.object(add_unit, 'preflight', side_effect=preflight),",
+            "      patch.object(add_unit, 'publish_unit', side_effect=publish),",
+            "      patch.object(add_unit, 'launched_unit', return_value=add_unit.NoLabeledSession()),",
+            "      patch.object(add_unit, 'prompt_for', return_value='Fixture opening.'),",
+            "      patch.object(add_unit, 'launch_session', side_effect=launch),",
+            "      patch.object(add_unit, 'wait_for_remote_control'), patch.object(add_unit, 'record'),",
+            "      patch.object(add_unit, 'attach_hint', return_value='fixture pane')):",
             "    raise SystemExit(add_unit.main(sys.argv[1:]))", "",
         ]))
         context = multiprocessing.get_context("fork")
@@ -2435,7 +2486,8 @@ class ResumeUnitTests(ShutdownRepositoryFixture):
 
         self.assertEqual(code, 0, output)
         self.assertEqual(self.calls, [["add_unit.py", "--production", "alpha", "alpha",
-                                      "--resume", DIRECTOR, "--cwd", str(self.worktree), "--plan", plan]])
+                                      "--resume", DIRECTOR, "--cwd", str(self.worktree), "--join-recovery-locks",
+                                      "--plan", plan]])
 
     def test_a_transcript_under_another_account_resumes(self) -> None:
         # The units account moved since the retire: the transcript is under the other config dir.

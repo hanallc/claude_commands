@@ -28,7 +28,7 @@ from scripts.notify import push_reference
 from scripts.production import review_regime
 from scripts.notify import silence
 from scripts.notify.test_review import FakeReviewer, verdict, with_footer
-from scripts.notify.user_action import (FIX, ActionAllowed, ActionRefused, ActionRequired, ActionUnstated,
+from scripts.notify.user_action import (FIX, REFUSED_BEFORE_SENDING, ActionAllowed, ActionRefused, ActionRequired, ActionUnstated,
                          NoActionRequired, SessionLine, NO_SESSION_LINE, split_session, first_line, parse_user_action, refused_at)
 
 REAL_REVIEW = review.review
@@ -240,14 +240,19 @@ class PushoverTests(unittest.TestCase):
             read.assert_not_called()
             claim.assert_not_called()
 
-    def test_unknown_template_is_refused_before_credentials_or_posting(self) -> None:
-        with (redirect_stderr(io.StringIO()), mock.patch.object(pushover, "read_keys") as keys,
-              mock.patch.object(review, "review") as read):
-            code = pushover.send(["--text-id", "unknown"], self.keys,
-                                 mock.Mock(side_effect=AssertionError("posted")))
-        self.assertEqual(code, 2)
-        keys.assert_not_called()
-        read.assert_not_called()
+    def test_ineligible_template_is_refused_before_credentials_or_posting(self) -> None:
+        for argv, error in (
+            (["--text-id", "unknown"], pushover.USAGE),
+            (["--user-asked", "--text-id", "nixos.ups_battery", "--value", "charge=80", "--value", "minutes=20"],
+             f"pushover: {REFUSED_BEFORE_SENDING}: --user-asked requires --text-id nate.adhoc\n"),
+        ):
+            with (self.subTest(argv=argv), redirect_stderr(io.StringIO()) as errors,
+                  mock.patch.object(pushover, "read_keys") as keys, mock.patch.object(review, "review") as read):
+                code = pushover.send(argv, self.keys, mock.Mock(side_effect=AssertionError("posted")))
+            self.assertEqual(code, 2)
+            self.assertIn(error, errors.getvalue())
+            keys.assert_not_called()
+            read.assert_not_called()
 
     def test_kept_questions_drop_closed_and_reopened_but_post_open_or_unreadable_records(self) -> None:
         for status in ("closed", "reopened", "open", "missing", "unreadable"):
@@ -546,9 +551,11 @@ class PushoverTests(unittest.TestCase):
 
     def test_missing_keys_send_nothing(self) -> None:
         _ = self.keys.write_text("PUSHOVER_USER=u123\nPUSHOVER_TOKEN=\n")
-        code, form = self.run_send(["--no-action", "t", "m"])
+        with redirect_stderr(io.StringIO()) as errors:
+            code, form = self.run_send(["--no-action", "t", "m"])
         self.assertEqual((code, form), (2, {}))
-        self.assert_log("0", "t", footed("No action needed.\nm"), "keys missing")
+        self.assertIn("pushover: refused before sending: keys missing", errors.getvalue())
+        self.assert_log("0", "t", footed("No action needed.\nm"), "refused before sending: keys missing")
 
     def test_bad_usage_sends_nothing(self) -> None:
         for argv in (["--priority", "3", "t", "m"], ["only title"], ["t", " "]):
@@ -953,19 +960,31 @@ class PushoverTests(unittest.TestCase):
         draft = review.Draft("natedev", "0", "natedev the /nate skill is ready", NoActionRequired(), description, False)
         return draft, argv
 
-    def test_approved_nate_adhoc_runs_live_review_and_keeps_its_template_footer(self) -> None:
+    def test_nate_adhoc_posts_the_draft_with_its_template_footer(self) -> None:
         draft, argv = self.adhoc()
         self.assertRegex(push_texts.approval_date("nate.adhoc"), r"^\d{4}-\d{2}-\d{2}$")
-        with (mock.patch.object(review, "review", side_effect=approve) as read,
-              redirect_stdout(io.StringIO()) as output):
-            code, form = self.run_send(argv)
-        read.assert_called_once_with(draft, revision=False)
-        self.assertEqual(code, 0)
-        self.assertEqual(form["title"], [draft.title])
-        self.assertEqual(form["message"], [footed(draft.body, draft.source, "nate.adhoc")])
-        self.assertIn('"text_id": "nate.adhoc"', output.getvalue())
-        self.assertEqual(self.reviews()[0]["text_id"], "nate.adhoc")
-        self.assertEqual(self.reviews()[0]["verdict"], "send")
+        cases = ((), "send"), (("--user-asked",), "unreviewed: user asked")
+        for record_count, (extra, verdict) in enumerate(cases, start=1):
+            with (self.subTest(extra=extra), mock.patch.object(review, "review", side_effect=approve) as read,
+                  mock.patch.object(review, "held_for", wraps=review.held_for) as lookup,
+                  redirect_stdout(io.StringIO()) as output):
+                code, form = self.run_send([*argv, *extra])
+            records = self.reviews()
+            self.assertEqual(len(records), record_count)
+            record = records[-1]
+            if extra:
+                read.assert_not_called()
+                lookup.assert_not_called()
+                self.assertIn('"reviewed": false', output.getvalue())
+                self.assertEqual(record["detail"], "user asked")
+            else:
+                read.assert_called_once_with(draft, revision=False)
+            self.assertEqual(code, 0)
+            self.assertEqual(form["title"], [draft.title])
+            self.assertEqual(form["message"], [footed(draft.body, draft.source, "nate.adhoc")])
+            self.assertIn('"text_id": "nate.adhoc"', output.getvalue())
+            self.assertEqual(record["text_id"], "nate.adhoc")
+            self.assertEqual(record["verdict"], verdict)
 
     def test_failed_nate_adhoc_is_held_and_records_its_text_id(self) -> None:
         draft, argv = self.adhoc()
@@ -1154,21 +1173,27 @@ class PushoverTests(unittest.TestCase):
             self.assertEqual(silence.on(None, lambda _argv: 1), 0)
 
     def test_silence_keeps_a_push_and_exits_zero_without_posting(self) -> None:
-        self.silence_on()
         arguments = ["--text-id", "nate.adhoc", "--value", "sender=Build", "--value", "title=done",
                      "--value", "description=You asked to be told when the build passed. The build passed."]
-        with redirect_stdout(io.StringIO()) as output:
-            code, form = self.run_send(arguments)
-        self.assertEqual((code, form), (0, {}))
-        self.assertIn("pushover: kept: silence until off\n", output.getvalue())
-        self.assertEqual([push["title"] for push in silence.read_kept()], ["Build done"])
-        self.assertEqual(self.log_lines()[-1]["outcome"], "kept: silence until off")
-        with redirect_stdout(io.StringIO()):
-            code, form = self.run_send(["--through-silence", *arguments])
-        self.assertEqual(code, 0)
-        self.assertEqual(form["priority"], ["0"])
-        self.assertTrue({"retry", "expire", "tags"}.isdisjoint(form))
-        self.assertEqual([push["title"] for push in silence.read_kept()], ["Build done"])
+        for extra, outcome in (
+            ([], "kept: silence until off"),
+            (["--user-asked"], "kept: silence until off, user asked"),
+        ):
+            state = self.keys.parent / ("user-asked" if extra else "agent-note")
+            with self.subTest(extra=extra), mock.patch.dict(os.environ, {"NOTIFY_STATE_DIR": str(state)}):
+                self.silence_on()
+                with redirect_stdout(io.StringIO()) as output:
+                    code, form = self.run_send([*arguments, *extra])
+                self.assertEqual((code, form), (0, {}))
+                self.assertIn("pushover: kept: silence until off\n", output.getvalue())
+                self.assertEqual([push["title"] for push in silence.read_kept()], ["Build done"])
+                self.assertEqual(self.log_lines()[-1]["outcome"], outcome)
+                with redirect_stdout(io.StringIO()):
+                    code, form = self.run_send(["--through-silence", *arguments, *extra])
+                self.assertEqual(code, 0)
+                self.assertEqual(form["priority"], ["0"])
+                self.assertTrue({"retry", "expire", "tags"}.isdisjoint(form))
+                self.assertEqual([push["title"] for push in silence.read_kept()], ["Build done"])
 
     def test_natedev_delivery_command_keeps_or_posts_the_reviewed_push(self) -> None:
         for silent, priority, policy in (

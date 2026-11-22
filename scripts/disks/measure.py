@@ -82,7 +82,7 @@ def read_mounts(table: Path = MOUNT_TABLE) -> tuple[Mount, ...]:
 
 def drive_path(path: PurePath, mounts: Sequence[Mount]) -> PurePath:
     """Where the measure finds a path. A path under a mount of a subfolder, such as /session on natedev,
-    is measured under the mount of its whole file system, such as /build/session."""
+    is measured under the mount of its whole file system, such as /home/natepiano/session."""
     # The last mount at a point covers the earlier ones.
     holding = max(((len(mount.point.parts), index, mount) for index, mount in enumerate(mounts)
                    if mount.point == path or mount.point in path.parents), default=None)
@@ -153,7 +153,7 @@ def run_command(argv: Sequence[str], timeout_seconds: int) -> subprocess.Complet
 
 def dust_command(mount: str, settings: MeasureSettings) -> list[str]:
     """Walk one filesystem with dust under a memory cap at the lowest CPU priority."""
-    return ["systemd-run", "--user", "--scope", "--quiet", "-p", f"MemoryMax={settings.memory_max}", "--",
+    return ["systemd-run", "--user", "--scope", "--quiet", "--collect", "-p", f"MemoryMax={settings.memory_max}", "--",
             "nice", "-n", "19", "dust", "-x", "-D", "-j", "-P", "-o", "b",
             "-z", str(settings.keep_bytes - 1),  # Dust keeps sizes above this value, so include the floor.
             "-d", str(settings.max_depth), "-n", str(settings.max_lines),

@@ -8,6 +8,7 @@ import json
 import math
 import os
 from pathlib import Path
+from stat import S_ISREG
 from scripts.build_queue import execution_identity
 from scripts.build_hold.shared_state_defaults import DEFAULT_ADMISSION_SOCKET as DEFAULT_ADMISSION_SOCKET
 from typing import TYPE_CHECKING, TypeVar, cast
@@ -42,6 +43,7 @@ else:
     placement = _DeferredPlacement()
 
 VERSION = 3
+ASSIGNMENT_MAX_BYTES = 1024 * 1024
 
 
 def _no_test_width() -> records.NoTestWidth:
@@ -215,6 +217,24 @@ class RepositorySlotReady:
 class RepositorySlotExpired:
     """The repository slot wait ended before capacity became available."""
     reason: str
+
+
+@dataclass(frozen=True)
+class VerifyRunSlotRequest(CallerCode):
+    """Request one slot for the lifetime of the Verify process."""
+    owner: Owner
+    repository: str
+    session_id: str
+    unit: str = ""
+    worktree: str = field(default="", kw_only=True)
+    verify: VerifyStep = field(default=NotVerifyCall(), kw_only=True)
+    placement_episode: str = field(default="", kw_only=True)
+
+
+@dataclass(frozen=True)
+class VerifyRunSlotWaiting:
+    """The repository has no free slot for a new Verify run."""
+    reason: records.RunLimitWait
 
 
 @dataclass(frozen=True)
@@ -631,16 +651,17 @@ class DispatchStatus:
     retry: placement.RetryDecision = field(default_factory=lambda: placement.DoNotRetry("attempt is not settled"))
 
 
-Request = (RepositorySlotRequest | ServiceEstimateRequest | AdmitRequest | LaunchRequest | ReleaseRequest | WidthRequest | ViewRequest
+Request = (RepositorySlotRequest | VerifyRunSlotRequest | ServiceEstimateRequest | AdmitRequest | LaunchRequest | ReleaseRequest | WidthRequest | ViewRequest
            | BuildHistoryRequest | ExplainRequest | MineRequest | PrioritySetRequest | PriorityClearRequest | TokenWaitRequest
            | PlacementRequest | PlacementStatusRequest | ClaimFailure | ConsumePermission | ExecutionReport | PrerequisiteReport | CancelPlacement)
 
-Reply = (RepositorySlotWaiting | RepositorySlotReady | RepositorySlotExpired | Wait | RunnerAdmitted | Admitted | LaunchAdmitted | Refused | Ok | BuildHistoryReply
+Reply = (RepositorySlotWaiting | RepositorySlotReady | RepositorySlotExpired | VerifyRunSlotWaiting | Wait | RunnerAdmitted | Admitted | LaunchAdmitted | Refused | Ok | BuildHistoryReply
          | PlacementWait | Assignment | LocalPlacementGranted | FirstAuthorization | DispatchStatus | PlacementStatusReply)
 
 _GROUPED_CLOUD_ADMIT = "cloud_group_admit"
 _REQUESTS: dict[str, type] = {
     "repository_slot": RepositorySlotRequest,
+    "verify_run_slot": VerifyRunSlotRequest,
     "service_estimate": ServiceEstimateRequest, "admit": AdmitRequest, "launch": LaunchRequest, "release": ReleaseRequest,
     "width": WidthRequest, "view": ViewRequest, "explain": ExplainRequest,
     "build_history": BuildHistoryRequest, "mine": MineRequest,
@@ -653,6 +674,7 @@ _REQUESTS: dict[str, type] = {
 REPLY_TYPES: dict[str, type] = {
     "repository_slot_waiting": RepositorySlotWaiting, "repository_slot_ready": RepositorySlotReady,
     "repository_slot_expired": RepositorySlotExpired,
+    "verify_run_slot_waiting": VerifyRunSlotWaiting,
     "wait": Wait, "runner_admitted": RunnerAdmitted, "admitted": Admitted, "launch_admitted": LaunchAdmitted,
     "build_history": BuildHistoryReply, "refused": Refused, "ok": Ok,
     "placement_wait": PlacementWait, "assignment": Assignment,
@@ -752,7 +774,7 @@ def parse_envelope(line: str | bytes, variants: dict[str, type]) -> tuple[int, o
         if version < 3 and variants[name] in _PLACEMENT_TYPES:
             raise ValueError("placement requires version 3")
         return version, cast(object, _parse_value(data, variants[name]))
-    except (ArithmeticError, KeyError, TypeError, UnicodeError) as error:
+    except (ArithmeticError, KeyError, RecursionError, TypeError, UnicodeError) as error:
         raise ValueError("invalid admission message") from error
 
 
@@ -824,7 +846,16 @@ def encode_reply(reply: Reply, *, version: int = VERSION) -> str:
 
 
 def read_assignment(path: Path) -> Assignment | LocalPlacementGranted:
-    reply = parse_reply(path.read_text())
+    def open_assignment(name: str, flags: int) -> int:
+        return os.open(name, flags | os.O_NONBLOCK)
+
+    with open(path, "rb", opener=open_assignment) as stream:
+        if not S_ISREG(os.fstat(stream.fileno()).st_mode):
+            raise AdmissionUnavailable("the assignment file must be a regular file")
+        data = stream.read(ASSIGNMENT_MAX_BYTES + 1)
+    if len(data) > ASSIGNMENT_MAX_BYTES:
+        raise AdmissionUnavailable("the assignment file exceeds its size limit")
+    reply = parse_reply(data.decode("utf-8"))
     if isinstance(reply, (Assignment, LocalPlacementGranted)):
         return reply
     raise AdmissionUnavailable("file contains no assigned attempt")

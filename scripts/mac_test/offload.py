@@ -39,6 +39,7 @@ from scripts.build_queue import execution_identity
 from scripts.aws_target import hana_protocol
 from scripts.build_hold.owning_session import NoOwningSession, OwningSession
 from scripts.mac_test import claim_state
+from scripts.mac_test.claim_state import WAIT_CLAIM_CHECK_PREFIX, WaitClaimCheck, claim_worktree_path
 if TYPE_CHECKING:
     from scripts.build_queue import admission_records as records, placement
 else:
@@ -242,6 +243,14 @@ class DeclinedMacRun:
     seconds: float
     detail: str = ""
     refusal_settings: records.RefusalSettings | records.NoRefusalSettings = field(default_factory=_no_refusal_settings)
+
+
+@dataclass(frozen=True)
+class WaitClaimAdoptionDeclined(DeclinedMacRun):
+    """The claim child declined adoption and supplied a diagnostic."""
+
+    reason: Literal["state"] = field(default="state", init=False)
+    diagnostic: str = field(kw_only=True)
 
 
 @dataclass(frozen=True)
@@ -727,6 +736,17 @@ class MacClaimNotConfirmed:
     reason: MacDeclineReason
     stdout: str
     stderr: str
+
+
+class NoWaitClaimCheck:
+    """The claim child reported no known adoption check."""
+
+
+@dataclass(frozen=True)
+class MacClaimChildRefusal(MacClaimNotConfirmed):
+    reason: Literal["state", "busy"]
+    status: int
+    check: WaitClaimCheck | NoWaitClaimCheck
 
 
 MacClaimAnswer = FreshMacClaim | TakenOverMacClaim | TakeoverHostUnreadable | MacClaimNotConfirmed
@@ -1362,7 +1382,9 @@ def write_result(
         reason = result.detail if isinstance(result, DeclinedMacRun) and result.detail else result.reason
         status = 75
         description = reason
-        if isinstance(result, DeclinedMacRun) and result.reason == "disk":
+        if isinstance(result, WaitClaimAdoptionDeclined):
+            description = result.diagnostic
+        elif isinstance(result, DeclinedMacRun) and result.reason == "disk":
             reason = "disk"
             description = f"disk: {result.detail}" if result.detail else reason
         elif isinstance(result, DeclinedMacRun) and result.reason in ("source_changed", "runner"):
@@ -1592,6 +1614,22 @@ def assigned_claim_arguments(request: OffloadRequest) -> list[str]:
     return ["--assignment", wire.encode_reply(wire.Assignment(request.placement.assignment)).strip()]
 
 
+def read_claim_refusal(result: CommandOutput) -> MacClaimChildRefusal:
+    check: WaitClaimCheck | NoWaitClaimCheck = NoWaitClaimCheck()
+    error_lines = result.stderr.splitlines(keepends=True)
+    for index, line in enumerate(error_lines):
+        if not line.startswith(WAIT_CLAIM_CHECK_PREFIX):
+            continue
+        try:
+            check = WaitClaimCheck(line.removeprefix(WAIT_CLAIM_CHECK_PREFIX).rstrip("\r\n"))
+        except ValueError:
+            continue
+        del error_lines[index]
+        break
+    reason = "busy" if result.status == 11 else "state"
+    return MacClaimChildRefusal(reason, result.stdout, "".join(error_lines), result.status, check)
+
+
 def read_claim_answer(result: CapturedCommandResult, *,
                       expected: claim_state.ClaimIdentity | claim_state.NoClaimIdentity = claim_state.NO_CLAIM_IDENTITY,
                       assigned_slot: int = 0) -> MacClaimAnswer:
@@ -1615,10 +1653,9 @@ def read_claim_answer(result: CapturedCommandResult, *,
         if len(hosts) == 1 and hosts[0]:
             return TakenOverMacClaim(hosts[0], slot)
         return TakeoverHostUnreadable()
-    reason: MacDeclineReason = (
-        "blocked" if result.status == 10 else "busy" if result.status == 11 else "state"
-    )
-    return MacClaimNotConfirmed(reason, result.stdout, result.stderr)
+    if result.status == 10:
+        return MacClaimNotConfirmed("blocked", result.stdout, result.stderr)
+    return read_claim_refusal(result)
 
 
 def probe_reachability(
@@ -1868,6 +1905,21 @@ class MacDiskReady:
 
 
 @dataclass(frozen=True)
+class MacDiskShort:
+    """The probe reports less free space than the floor."""
+
+    free_gib: float
+    floor_gib: float
+
+
+def check_mac_disk_floor(probe: ProbeSnapshot, free_floor_gib: float) -> MacDiskReady | MacDiskShort:
+    """Compare the probe reading with the floor."""
+    if probe.free_gib >= free_floor_gib:
+        return MacDiskReady(probe.free_gib)
+    return MacDiskShort(probe.free_gib, free_floor_gib)
+
+
+@dataclass(frozen=True)
 class SweepShort:
     """The Mac remains below the disk minimum after the sweep."""
 
@@ -1888,8 +1940,9 @@ def ensure_mac_disk_floor(
     """Run one shared floor sweep, then read the Mac disk space again."""
     floor = (config.free_floor_gib if isinstance(config, OffloadConfig)
              else config.configuration.number("free_floor_gib"))
-    if probe.free_gib >= floor:
-        return MacDiskReady(probe.free_gib)
+    disk = check_mac_disk_floor(probe, floor)
+    if isinstance(disk, MacDiskReady):
+        return disk
     try:
         directory = eligibility.state_directory()
         directory.mkdir(parents=True, exist_ok=True)
@@ -1935,9 +1988,10 @@ def ensure_mac_disk_floor(
                 return SweepFailed(cause or "floor sweep result missing")
             if not isinstance(after, ProbeSnapshot):
                 return SweepFailed("Mac disk reading failed after the floor sweep")
-            if after.free_gib < floor:
-                return SweepShort(after.free_gib)
-            return MacDiskReady(after.free_gib)
+            disk = check_mac_disk_floor(after, floor)
+            if isinstance(disk, MacDiskShort):
+                return SweepShort(disk.free_gib)
+            return disk
     except (OSError, ValueError) as error:
         if isinstance(error, conf.Unusable) and isinstance(config, eligibility.SshProbeSettings):
             raise
@@ -2639,7 +2693,7 @@ def claimed_run(
                     return DeclinedMacRun("state", elapsed_seconds(started), probe.detail)
                 write_backoff(time.time() + config.unreachable_backoff_s, request.target)
                 return declined("unreachable", started)
-            if probe.free_gib < config.free_floor_gib:
+            if isinstance(check_mac_disk_floor(probe, config.free_floor_gib), MacDiskShort):
                 checked = check_current_leftovers(config, config.host, repository, request.target, request.slot)
                 release_allowed = isinstance(checked, LeftoversEnded)
                 observe_cleanup(evidence, checked)
@@ -3291,6 +3345,7 @@ def leased_offload(controller: ProcessController, config: OffloadConfig, request
         write_mirror_busy(config, repository.name, request.target)
         return BusyMacDecline(LostRunLeftovers(), elapsed_seconds(started))
     claim = claim_for_run(controller, config, request, repository, tuple(leases))
+    claim_from_wait = isinstance(request.admission, MacClaimFromWait)
     # A transferred reservation can be adopted only once.
     request = replace(request, admission=UnclaimedMacRun())
     if isinstance(claim, (TakenOverMacClaim, TakeoverHostUnreadable)):
@@ -3309,6 +3364,7 @@ def leased_offload(controller: ProcessController, config: OffloadConfig, request
         _ = release_claim(controller, request.target)
         if isinstance(request.placement, AssignedOffloadRequest):
             return BusyMacDecline(LostRunLeftovers(), elapsed_seconds(started))
+        claim_from_wait = False
         claim = claim_for_run(controller, config, request, repository, tuple(leases))
         if isinstance(claim, (TakenOverMacClaim, TakeoverHostUnreadable)):
             return BusyMacDecline(LostRunLeftovers(), elapsed_seconds(started))
@@ -3320,8 +3376,16 @@ def leased_offload(controller: ProcessController, config: OffloadConfig, request
                 print(claim.stdout, end="" if claim.stdout.endswith("\n") else "\n", file=sys.stderr, flush=True)
             if claim.stderr:
                 print(claim.stderr, end="" if claim.stderr.endswith("\n") else "\n", file=sys.stderr, flush=True)
+            if (isinstance(claim, MacClaimChildRefusal) and not isinstance(claim.check, NoWaitClaimCheck)
+                    and (claim.reason == "busy" or not claim_from_wait)):
+                print(claim.check.diagnostic, file=sys.stderr, flush=True)
         if claim.reason == "busy":
             return BusyMacDecline(claim_holder(claim.stdout), elapsed_seconds(started))
+        if claim_from_wait and isinstance(claim, MacClaimChildRefusal):
+            diagnostic = f"state: claim child exited {claim.status}"
+            if not isinstance(claim.check, NoWaitClaimCheck):
+                diagnostic += f": {claim.check.diagnostic}"
+            return WaitClaimAdoptionDeclined(elapsed_seconds(started), diagnostic=diagnostic)
         return declined(claim.reason, started)
     if claim.slot not in leases:
         _ = release_claim(controller, request.target)
@@ -3424,7 +3488,7 @@ def request_from_arguments(arguments: CliArguments) -> OffloadRequest:
             arguments.target = saved.assignment.destination.target
     return OffloadRequest(
         placement=assigned,
-        repo_root=Path(arguments.repo_root).resolve(),
+        repo_root=claim_worktree_path(arguments.repo_root),
         source=StagedDocSnapshot(Path(arguments.source_root).resolve()) if arguments.source_root else RepositoryWorkingTree(),
         owner=copies.source_owner(Path(arguments.repo_root)),
         holder_session=holder_session(),

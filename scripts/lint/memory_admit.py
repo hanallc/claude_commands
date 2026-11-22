@@ -189,13 +189,13 @@ from scripts.build_queue.step_estimator import (
     OutcomeNotRecorded,
 )
 
-MERGE_GATE_TESTS = "tests"
-MERGE_GATE_TYPES = "types"
+GATE_TESTS = "tests"
+GATE_TYPES = "types"
 
 
 def merge_gate_shape(argv: Sequence[str]) -> str:
     """Separate type-check profiles from test-only profiles."""
-    return MERGE_GATE_TYPES if "--type-dirs" in argv else MERGE_GATE_TESTS
+    return GATE_TYPES if "--type-dirs" in argv else GATE_TESTS
 
 
 PROC = Path("/proc")
@@ -529,7 +529,8 @@ class HeadStartsAt:
 @dataclass(frozen=True)
 class HeadStillHeld:
     decision: AdmissionDecision
-    causes: tuple[Literal["free memory", "GPU test slot", "pressure", "queue order", "start spacing", "build space"], ...]
+    causes: tuple[Literal["free memory", "GPU test slot", "pressure", "queue order", "start spacing", "build space",
+                          "repository run limit"], ...]
 
 
 HeadRelease = HeadAdmitsAfterEnd | HeadStartsAt
@@ -1737,6 +1738,8 @@ def queue_wait_reason(decision: AdmissionDecision, need: int, available: int,
         return decision.pressure
     if isinstance(decision.gpu, GpuSlotWait):
         return decision.gpu
+    if isinstance(decision.run_limit, records.RunLimitWait):
+        return decision.run_limit
     if decision.starts_at:
         return StartSpacingWait(decision.starts_at)
     if not decision.free_passes:
@@ -1929,13 +1932,13 @@ def run_memories(inputs: QueueInputs) -> tuple[RunMemory, ...]:
     return tuple(groups.values())
 
 
-PROGRESS_STEPS = ("build", "check", "clippy", "mend", "nextest", "test", "t", "merge-gate", "targeted-test", "cargo")
+PROGRESS_STEPS = ("build", "check", "clippy", "mend", "nextest", "test", "t", "gate", "test-affected", "cargo")
 
 
 def reservation_profile_key(row: Reservation, host: str) -> str:
     """Use the history identity for each step rather than its run owner."""
-    if row["step"] == "merge-gate":
-        return progress.profile_key((host, row["step"], row.get("shape", MERGE_GATE_TESTS)))
+    if row["step"] == "gate":
+        return progress.profile_key((host, row["step"], row.get("shape", GATE_TESTS)))
     width = row["test_threads"].threads if isinstance(row["test_threads"], RequestedTestWidth) else "unknown"
     return progress.profile_key((host, row.get("repo_identity", row["repo"]), row["step"],
         row.get("shape", ""), row.get("test_scope", "full"), row.get("package", ""),
@@ -2043,6 +2046,24 @@ def gpu_test_reservation(row: Reservation, gpu: GpuTestSlots) -> bool:
     return gpu.holds(repository, row["step"])
 
 
+def repository_run_owner(row: Reservation | Waiter) -> str:
+    run = row.get("build_run")
+    if isinstance(run, LiveBuildRun):
+        return records.run_owner(run.pid, run.start_time)
+    return records.run_owner(row["pid"], row["start_time"])
+
+
+def reserved_repository_runs(inputs: QueueInputs, limits: records.RepositoryRunLimits) -> dict[str, set[str]]:
+    """Count distinct runs from the local admission reservations."""
+    runs: dict[str, set[str]] = {}
+    for row in inputs.reservations:
+        waiter = row.get("queue_waiter")
+        repository = waiter.get("repository_name", row["repo"]) if waiter is not None else row["repo"]
+        if isinstance(limits.for_step(inputs.local_machine, repository, row["step"]), records.RepositoryRunLimit):
+            runs.setdefault(repository, set()).add(repository_run_owner(row))
+    return runs
+
+
 # A. A zero-need step can pass earlier rows when this switch is on.
 ZERO_NEED_MAY_PASS = False
 
@@ -2082,6 +2103,10 @@ def admission_walk(inputs: QueueInputs, ordered: list[tuple[Path, RankedWaiter]]
     gpu = policy.gpu_tests
     # The reservation is the slot: it ends at release or when its owner exits.
     gpu_used = sum(gpu_test_reservation(row, gpu) for row in inputs.reservations)
+    limits = policy.repository_runs
+    repository_runs = reserved_repository_runs(inputs, limits)
+    run_limit_waiters: dict[str, str] = {}
+    first_held_by_run_limit: dict[str, RankedWaiter] = {}
     first_for_folder: dict[placement.CargoFolder, Waiter] = {}
     folder_slot_bytes: dict[placement.CargoFolder, int] = {}
     for owner, claim in claims.items():
@@ -2089,8 +2114,8 @@ def admission_walk(inputs: QueueInputs, ordered: list[tuple[Path, RankedWaiter]]
         if folder is not None:
             folder_slot_bytes[folder] = folder_slot_bytes.get(folder, 0) + claim.slot.bytes
     first_folder_wait: Waiter | NoWaiter = NoWaiter()
-    first_held: Waiter | NoWaiter = NoWaiter()
-    first_held_other_than_gpu: Waiter | NoWaiter = NoWaiter()
+    first_held: RankedWaiter | NoWaiter = NoWaiter()
+    first_held_other_than_gpu: RankedWaiter | NoWaiter = NoWaiter()
     for _, row in ordered:
         owner = records.waiter_owner(row)
         claim = claims.get(owner)
@@ -2104,9 +2129,20 @@ def admission_walk(inputs: QueueInputs, ordered: list[tuple[Path, RankedWaiter]]
         fresh = not estimate_expired(row, now, policy)
         local_route = can_use_natedev(row)
         local = local_route and isinstance(state, QueuedWaiter)
+        repository = row.get("repository_name", "")
+        limit = (limits.for_step(inputs.local_machine, repository, row.get("step", ""))
+                 if local and not remote_start_pending else records.NoRepositoryRunLimit())
+        has_run_limit = isinstance(limit, records.RepositoryRunLimit)
+        exempt = bool(has_run_limit and limits.exempt_unit and
+                      (row.get("unit") == limits.exempt_unit or owner in inputs.run_limit_exempt_owners))
+        follows_run_limit = has_run_limit and not exempt
         folder = inputs.cargo_folders.get(owner) if local_route else None
         folder_busy = folder in inputs.occupied_cargo_folders
         earlier = first_for_folder.get(folder, NoWaiter()) if folder is not None else NoWaiter()
+        if not isinstance(earlier, NoWaiter):
+            earlier_limit = run_limit_waiters.get(records.waiter_owner(earlier))
+            if earlier_limit is not None and (not follows_run_limit or earlier_limit != repository):
+                earlier = NoWaiter()
         # A grant returns the other continuation claims for this folder.
         released = (folder_slot_bytes.get(folder, 0) - held
                     if folder is not None and not folder_busy and isinstance(earlier, NoWaiter) else 0)
@@ -2123,11 +2159,21 @@ def admission_walk(inputs: QueueInputs, ordered: list[tuple[Path, RankedWaiter]]
                  and (within or readable and clear and room_passes) and (reused or not spacing))
         gpu_step = gpu.holds(row.get("repository_name", ""), row.get("step", ""))
         gpu_wait = GpuSlotWait(gpu_used, gpu.slots) if gpu_step and gpu_used >= gpu.slots else GpuSlotFree()
+        run_wait: records.RunLimitFree | records.RunLimitWait = records.RunLimitFree()
+        if isinstance(limit, records.RepositoryRunLimit):
+            runs = repository_runs.setdefault(repository, set())
+            run_owner = repository_run_owner(row)
+            used_runs = len(runs) + inputs.verify_run_counts.get(repository, 0)
+            if not exempt and run_owner not in runs and used_runs >= limit.maximum:
+                run_wait = records.RunLimitWait(used_runs, limit.maximum, repository, inputs.local_machine)
         order_hold: NoOrderHold | HeldBehindHead = NoOrderHold()
         ahead = first_held_other_than_gpu if GPU_WAIT_MAY_PASS and not gpu_step else first_held
+        if follows_run_limit and (limited := first_held_by_run_limit.get(repository)) is not None:
+            if isinstance(ahead, NoWaiter) or waiter_order(limited) < waiter_order(ahead):
+                ahead = limited
         may_pass = (ZERO_NEED_MAY_PASS and need == 0) or (CONTINUATION_MAY_PASS and within)
         if local and not may_pass and not isinstance(ahead, NoWaiter):
-            order_hold = HeldBehindHead(ahead)
+            order_hold = HeldBehindHead(records.stored_waiter(ahead))
         elif local and not isinstance(first_folder_wait, NoWaiter):
             order_hold = HeldBehindHead(first_folder_wait)
         elif ready and not isinstance(earlier, NoWaiter):
@@ -2135,28 +2181,39 @@ def admission_walk(inputs: QueueInputs, ordered: list[tuple[Path, RankedWaiter]]
         if folder is not None and isinstance(earlier, NoWaiter):
             first_for_folder[folder] = records.stored_waiter(row)
         can_start = (ready and not folder_busy and isinstance(gpu_wait, GpuSlotFree)
+                     and isinstance(run_wait, records.RunLimitFree)
                      and isinstance(order_hold, NoOrderHold))
         decision = AdmissionDecision("admit" if can_start else "hold",
             extra + kept + safety, kept, safety, used,
             NO_PRESSURE_HOLD if within else inputs.pressure,
             used + kept,
             room_passes, order_hold, 0.0 if reused else spacing,
-            reused_slot=reused, room=RoomCheck(extra, checked_room, room_passes, basis=basis), gpu=gpu_wait)
+            reused_slot=reused, room=RoomCheck(extra, checked_room, room_passes, basis=basis),
+            gpu=gpu_wait, run_limit=run_wait)
         cargo_folder = placement.CargoFolderWait() if folder_busy else placement.CargoFolderFree()
         decisions.append(WaiterAdmission(row, decision, state, cargo_folder))
         if can_start:
             remaining += held + released - need
             gpu_used += gpu_step
+            if has_run_limit:
+                repository_runs[repository].add(repository_run_owner(row))
             if not reused:
                 new_started = True
         elif local or folder_busy:
             if folder_busy and isinstance(first_folder_wait, NoWaiter):
                 first_folder_wait = records.stored_waiter(row)
-            if isinstance(first_held, NoWaiter):
-                first_held = records.stored_waiter(row)
-            if GPU_WAIT_MAY_PASS and isinstance(first_held_other_than_gpu, NoWaiter) and not (
-                    ready and not folder_busy and isinstance(gpu_wait, GpuSlotWait)):
-                first_held_other_than_gpu = records.stored_waiter(row)
+            # A hold that comes only from a run limit applies to that repository.
+            if ready and not folder_busy and isinstance(gpu_wait, GpuSlotFree) and (
+                    records.waiter_owner(order_hold.waiter) in run_limit_waiters
+                    if isinstance(order_hold, HeldBehindHead) else isinstance(run_wait, records.RunLimitWait)):
+                run_limit_waiters[owner] = repository
+                _ = first_held_by_run_limit.setdefault(repository, row)
+            else:
+                if isinstance(first_held, NoWaiter):
+                    first_held = row
+                if GPU_WAIT_MAY_PASS and isinstance(first_held_other_than_gpu, NoWaiter) and not (
+                        ready and not folder_busy and isinstance(gpu_wait, GpuSlotWait)):
+                    first_held_other_than_gpu = row
     return decisions
 
 
@@ -2232,7 +2289,8 @@ def admission_pass(inputs: QueueInputs, now: float, policy: AdmissionPolicy) -> 
                 if (decision.starts_at and spacing_waits.get(ahead) == decision.starts_at
                         and folder is not None and folder == inputs.cargo_folders.get(ahead)
                         and isinstance(decision.pressure, NoPressureHold)
-                        and isinstance(decision.gpu, GpuSlotFree) and not expired):
+                        and isinstance(decision.gpu, GpuSlotFree)
+                        and isinstance(decision.run_limit, records.RunLimitFree) and not expired):
                     cause = StartSpacingWait(decision.starts_at)
                 else:
                     cause = queue_order_reason(decision, RecordedQueueIdentities())
@@ -2503,6 +2561,8 @@ def head_after_steps_end(explanation: QueueExplanation, ended: tuple[int, ...]) 
         return HeadStillHeld(decision, ("build space",))
     if isinstance(cause, GpuSlotWait):
         return HeadStillHeld(decision, ("GPU test slot",))
+    if isinstance(cause, records.RunLimitWait):
+        return HeadStillHeld(decision, ("repository run limit",))
     if isinstance(cause, (MemoryPressure, PressureUnavailable)):
         return HeadStillHeld(decision, ("pressure",))
     return HeadStillHeld(decision, ("queue order",))

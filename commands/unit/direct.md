@@ -169,12 +169,12 @@ Other prompts carry the Three Gods and Type Design Contract under <WritePromptCo
 </LongLivedWorkers>
 
 <CoreContract>
-- Never modify unrelated files. The unit director may make a worktree, and its branch, for its own workers, with `scripts/worktree/make_worktree.sh`.
-  The unit's staff row keeps its one home worktree;
-  where a worker works stays in its run record, not in staff. The director
-  removes each worktree it made when that work ends. In the home worktree, the
-  only branch the run may create is the remote branch <PushCheckpoint/> pushes;
-  never switch to an existing branch.
+- Never modify unrelated files. The unit director creates a separate worktree with `worktrees.py make <repo word> <unit> <short-name>`.
+  The unit's staff row keeps its home worktree. The run record keeps the worker's checkout.
+  When the work ends, run `~/.claude/scripts/lib/py ~/.claude/scripts/worktree/worktrees.py remove <path>`.
+  Send the reported paths to the showrunner as a removal list.
+  In the home worktree, create only the branch that <PushCheckpoint/> pushes.
+  Never switch to an existing branch.
 - The unit director does not write implementation code unless the user explicitly asks.
   Exceptions: <FastTrack/>, <NoWorkerMode/>, and agreed doc-only/trivial post-review fixes.
 - `single` never commits. Loop and verbose modes create one
@@ -334,7 +334,7 @@ For Python test runs, pass `--kind python-tests` before `--`.
 To limit memory for the detached command, use this scope form.
 
 ```sh
-systemd-run --user --scope -q -p MemoryMax=<cap> -- <command>
+systemd-run --user --scope --collect -q -p MemoryMax=<cap> -- <command>
 ```
 
 `start` checks for a live twin before it applies `config/detached_runs.conf` `LIVE_RUN_LIMIT` to that worker.

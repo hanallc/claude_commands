@@ -269,7 +269,8 @@ def records(owner: staff.StaffId, *, include_read: bool = False,
 
 
 def _save(store: Investigations, item: Investigation, path: Path,
-          numbers: record_store.LockedRecordNumbers | None = None, *, new_record: bool = False) -> Investigation:
+          numbers: record_store.LockedRecordNumbers | None = None, *, new_record: bool = False,
+          before_write: Callable[[], None] = lambda: None) -> Investigation:
     fields = {"id": item.id, "owner": item.owner, "title": item.title, "state": item.state,
               "filed": item.filed, "answered": item.answered, "read": item.read,
               "question_length": str(len(item.question)), "review_log": review_events.encode(item.log),
@@ -278,7 +279,8 @@ def _save(store: Investigations, item: Investigation, path: Path,
         fields["review_submission"] = json.dumps(new_item_dialog.stored_submission(item.submission))
     body = f"{item.question}{ANSWER_SECTION}{item.answer}"
     with investigation_numbers() if numbers is None else nullcontext(numbers) as sequence:
-        with sequence.write(path, item.id, store.owner, folder=store.folder(), new_record=new_record):
+        with sequence.write(path, item.id, store.owner, folder=store.folder(), new_record=new_record,
+                            before_write=before_write):
             try:
                 store.write(item.id, fields, body, path=path, new_record=new_record)
             except record_store.ReusedReviewRecord:
@@ -310,9 +312,9 @@ def file(owner: staff.StaffId, title: str, question: str, *, waiting_why: str = 
             item = Investigation(identity, owner, title, InvestigationState.OPEN, _now(), "", "", question, "",
                                  log, reason, kind, submission)
             path = record_store.free_record_path(store.path(identity), names)
-            before_write(identity, path)
             try:
-                saved = _save(store, item, path, numbers, new_record=True)
+                saved = _save(store, item, path, numbers, new_record=True,
+                              before_write=lambda: before_write(identity, path))
             except record_store.OccupiedRecordPath:
                 names.add(path.name)
                 identity = numbers.next_id_after_collision(identity, path)

@@ -13,7 +13,7 @@ import subprocess
 import sys
 from collections.abc import Callable, Generator, Iterator, Sequence
 from contextlib import ExitStack, closing, contextmanager, nullcontext
-from dataclasses import astuple, dataclass, replace
+from dataclasses import astuple, dataclass, field, replace
 from enum import Enum
 from pathlib import Path
 from typing import cast
@@ -76,6 +76,8 @@ class MoveSummary:
 
     def keep_live(self, source: Path, reason: LiveSource, *, journaled: bool) -> None:
         kept(source, reason)
+        if journaled:
+            print(f"session_move: live copy pending at {source}", file=sys.stderr, flush=True)
         self.kept_live += 1
         self.live_copy_pending |= journaled
 
@@ -454,6 +456,9 @@ class TreeEntry:
     metadata: PreservedMetadata
     sha256: str = ""
 
+    def same_content(self, other: TreeEntry) -> bool:
+        return (self.kind, self.size_bytes, self.sha256) == (other.kind, other.size_bytes, other.sha256)
+
     def with_source_xattrs(self, names: frozenset[str]) -> TreeEntry:
         attributes = tuple(pair for pair in self.metadata.xattrs if pair[0] in names)
         if attributes == self.metadata.xattrs:
@@ -678,45 +683,164 @@ def copy_tree(source: int, staged: int, existing: TreeManifest, expected: TreeMa
     os.fsync(staged)
 
 
+class VacantDestination(Enum):
+    ENTRY = "vacant destination entry"
+
+
+@dataclass(frozen=True)
+class MoveEntry:
+    parent_path: Path
+    parent: int
+    name: str
+    expected: os.stat_result | VacantDestination
+
+    def require_current(self) -> None:
+        current = stat_at(self.parent, self.name)
+        if isinstance(self.expected, VacantDestination):
+            unchanged = current is None
+        else:
+            unchanged = current is not None and entry_stamp(current) == entry_stamp(self.expected)
+        if not unchanged:
+            raise MoveRefused(f"{self.parent_path / self.name}: entry changed before the move operation")
+
+
+def require_final_move(session_id: str, origin: MoveEntry, destination: MoveEntry) -> None:
+    require_session_stopped(session_id, session_records.read_registry())
+    require_parent_path(origin.parent_path, origin.parent)
+    require_parent_path(destination.parent_path, destination.parent)
+    origin.require_current()
+    destination.require_current()
+
+
+@dataclass(frozen=True)
+class SyncedRetainedFile:
+    path: Path
+    info: os.stat_result
+
+
+@dataclass(frozen=True)
+class VerifiedPublication:
+    move: PlannedCopy
+    folder: int
+    identities: EntryIdentities
+    contents: TreeManifest
+    synced_files: dict[tuple[int, int], SyncedRetainedFile] = field(default_factory=dict)
+
+    @contextmanager
+    def checked_entry(self, path: Path, *, exact_metadata: bool = False) -> Generator[tuple[int, os.stat_result]]:
+        name = path.name or "."
+        with destination_parent(self.folder, TREE_ROOT, path, create=False) as parent:
+            target = stat_at(parent, name)
+            verified = self.identities.get(path)
+            if target is None or verified is None or not os.path.samestat(target, verified):
+                raise MoveRefused(f"{path}: destination entry changed before deletion")
+            actual = read_entry(parent, path, target, entry_type(target, str(path)), mount_identity(parent))
+            expected = self.contents[path]
+            if not (expected == actual if exact_metadata else expected.matches_copy(actual)):
+                raise MoveRefused(f"{path}: destination entry changed before deletion")
+            yield parent, target
+
+    def sync_retained_file(self, path: Path, parent: int, info: os.stat_result) -> None:
+        with regular_file(parent, path.name, info, mount_identity(parent)) as file:
+            os.fsync(file)
+        self.synced_files[info.st_dev, info.st_ino] = SyncedRetainedFile(path, info)
+
+    def resync_after_unlink(self, saved: SyncedRetainedFile) -> None:
+        with self.checked_entry(saved.path, exact_metadata=True) as (parent, current):
+            # Unlink can change the last stamp field, the inode change time.
+            if (current.st_nlink != saved.info.st_nlink - 1
+                    or entry_stamp(current)[:-1] != entry_stamp(saved.info)[:-1]):
+                raise MoveRefused(f"{saved.path}: retained file changed during source unlink")
+            self.sync_retained_file(saved.path, parent, current)
+
+
 @dataclass(frozen=True)
 class CopyDeletion:
+    root: Path
     source: EntryIdentities
-    destination: EntryIdentities
     contents: TreeManifest
-    folder: int
+    source_targets: dict[Path, Path]
+    destination: VerifiedPublication
+    before_remove: Callable[[], None] = lambda: None
 
-    def check(self, source: int, path: Path, info: os.stat_result, mount: int) -> None:
-        name = path.name or "."
+    def check_source(self, source: int, name: str, path: Path, info: os.stat_result, mount: int) -> Path:
         expected = self.contents.get(path)
         original = self.source.get(path)
         if (expected is None or original is None or not os.path.samestat(info, original)
-                or read_entry(source, path, info, entry_type(info, str(path)), mount) != expected):
+                or read_entry(source, Path(name), info, entry_type(info, str(path)), mount) != expected):
             raise MoveRefused(f"{path}: source entry changed before deletion")
-        with destination_parent(self.folder, TREE_ROOT, path, create=False) as parent:
-            target = stat_at(parent, name)
-            verified = self.destination.get(path)
-            if (target is None or verified is None or not os.path.samestat(target, verified)
-                    or not expected.matches_copy(read_entry(parent, path, target, entry_type(target, str(path)),
-                                                            mount_identity(parent)))):
-                raise MoveRefused(f"{path}: destination entry changed before deletion")
-            if entry_stamp(os.stat(name, dir_fd=parent, follow_symlinks=False)) != entry_stamp(target):
-                raise MoveRefused(f"{path}: destination entry changed during the deletion check")
-        if entry_stamp(os.stat(name, dir_fd=source, follow_symlinks=False)) != entry_stamp(info):
-            raise MoveRefused(f"{path}: source entry changed during the deletion check")
+        return self.source_targets.get(path, path)
 
     def check_parent_metadata(self, fd: int, path: Path) -> None:
         if preserved_metadata(fd, ".", os.fstat(fd)) != self.contents[path].metadata:
             raise MoveRefused(f"{path}: source directory metadata changed before deletion")
 
 
-def remove_tree(parent: int, name: str, fd: int, mount: int, proof: CopyDeletion | None = None,
+@dataclass(frozen=True)
+class MergeStageDeletion:
+    root: Path
+    entries: dict[Path, MovedSourceEntry | RetainedStageEntry]
+    destination: VerifiedPublication
+    before_remove: Callable[[], None]
+
+    def check_entry(self, path: Path, entry: TreeEntry) -> None:
+        saved = self.entries.get(path)
+        if not isinstance(saved, RetainedStageEntry) or saved.stage_sha256 != manifest_digest({path: entry}):
+            raise MoveRefused(f"{path}: stage entry differs from the merge journal")
+
+    def check_source(self, source: int, name: str, path: Path, info: os.stat_result, mount: int) -> Path:
+        self.check_entry(path, read_entry(source, Path(name), info, entry_type(info, str(path)), mount))
+        return path
+
+    def check_parent_metadata(self, fd: int, path: Path) -> None:
+        entry = read_entry(fd, TREE_ROOT, os.fstat(fd), HashedEntry.DIRECTORY, mount_identity(fd))
+        self.check_entry(path, entry)
+
+
+@contextmanager
+def verified_removal(proof: CopyDeletion | MergeStageDeletion, parent: int, name: str,
+                     path: Path, info: os.stat_result, mount: int) -> Generator[tuple[MoveEntry, MoveEntry]]:
+    target = proof.check_source(parent, name, path, info, mount)
+    origin = MoveEntry((proof.root / path).parent, parent, name, info)
+    publication = proof.destination
+    with publication.checked_entry(target) as (target_parent, target_info):
+        synced = publication.synced_files.get((target_info.st_dev, target_info.st_ino))
+        expected = synced.info if synced is not None else target_info
+        destination = MoveEntry(publication.move.target / target.parent, target_parent, target.name or ".", expected)
+        yield origin, destination
+
+
+@contextmanager
+def checked_removal(proof: CopyDeletion | MergeStageDeletion | None, parent: int, name: str,
+                    path: Path, info: os.stat_result, mount: int) -> Generator[None]:
+    if proof is None:
+        yield
+        return
+    proof.before_remove()
+    if path != TREE_ROOT:
+        proof.check_parent_metadata(parent, path.parent)
+    publication = proof.destination
+    with verified_removal(proof, parent, name, path, info, mount) as (origin, destination):
+        synced = publication.synced_files.get((info.st_dev, info.st_ino)) if isinstance(proof, CopyDeletion) else None
+        if synced is not None and (info.st_nlink != synced.info.st_nlink
+                                   or entry_stamp(info) != entry_stamp(synced.info)):
+            raise MoveRefused(f"{path}: entry changed before the move operation")
+        require_final_move(publication.move.session_id, origin, destination)
+        yield
+        if synced is not None:
+            publication.resync_after_unlink(synced)
+
+
+def remove_tree(parent: int, name: str, fd: int, mount: int,
+                proof: CopyDeletion | MergeStageDeletion | None = None,
                 relative: Path = TREE_ROOT) -> None:
     if not os.path.samestat(os.fstat(fd), os.stat(name, dir_fd=parent, follow_symlinks=False)):
         raise MoveRefused(f"{name}: directory changed before deletion")
     if proof is None:
         os.fchmod(fd, 0o700)
     else:
-        proof.check(fd if relative == TREE_ROOT else parent, relative, os.fstat(fd), mount)
+        with verified_removal(proof, parent, name, relative, os.fstat(fd), mount):
+            pass
     for entry in tree_names(fd):
         info = os.stat(entry, dir_fd=fd, follow_symlinks=False)
         path = relative / entry
@@ -726,17 +850,10 @@ def remove_tree(parent: int, name: str, fd: int, mount: int, proof: CopyDeletion
                     raise MoveRefused(f"{path}: directory changed before deletion")
                 remove_tree(fd, entry, child, mount, proof, path)
         else:
-            if proof is not None:
-                proof.check(fd, path, info, mount)
-                proof.check_parent_metadata(fd, relative)
-            os.unlink(entry, dir_fd=fd)
-    if proof is not None:
-        proof.check(fd if relative == TREE_ROOT else parent, relative, os.fstat(fd), mount)
-        if relative != TREE_ROOT:
-            proof.check_parent_metadata(parent, relative.parent)
-        if not os.path.samestat(os.fstat(fd), os.stat(name, dir_fd=parent, follow_symlinks=False)):
-            raise MoveRefused(f"{name}: directory changed before deletion")
-    os.rmdir(name, dir_fd=parent)
+            with checked_removal(proof, fd, entry, path, info, mount):
+                os.unlink(entry, dir_fd=fd)
+    with checked_removal(proof, parent, name, relative, os.fstat(fd), mount):
+        os.rmdir(name, dir_fd=parent)
     os.fsync(parent)
 
 
@@ -887,10 +1004,65 @@ class VerifiedCopy:
 
 
 @dataclass(frozen=True)
+class VerifiedStage(VerifiedCopy):
+    """The checked stage manifest and identities for publication in this run."""
+
+    contents: TreeManifest
+    identities: EntryIdentities
+
+
+class NewSessionLeaf(Enum):
+    ABSENT = "new session leaf"
+
+
+@dataclass(frozen=True)
+class ExistingSessionLeaf:
+    folder: FolderIdentity
+
+
+class MergeOrigin(Enum):
+    STAGE = "stage"
+    DESTINATION = "destination"
+
+
+@dataclass(frozen=True)
+class MergeRename:
+    origin: MergeOrigin
+    path: Path
+    target: Path
+    inode: int
+
+
+@dataclass(frozen=True)
+class MovedSourceEntry:
+    target: Path
+    source_sha256: str
+
+
+@dataclass(frozen=True)
+class RetainedStageEntry:
+    source_sha256: str
+    stage_sha256: str
+
+
+@dataclass(frozen=True)
+class MergePlan:
+    """The verified stage and the expected result of its journaled renames."""
+
+    folder: FolderIdentity
+    stage: FolderIdentity
+    sha256: str
+    source_bytes: int
+    renames: tuple[MergeRename, ...]
+    source_entries: dict[Path, MovedSourceEntry | RetainedStageEntry]
+
+
+@dataclass(frozen=True)
 class MoveJournal:
     move: PlannedCopy
     source: FolderIdentity
-    state: CopyInProgress | VerifiedCopy
+    state: CopyInProgress | VerifiedCopy | MergePlan
+    destination: NewSessionLeaf | ExistingSessionLeaf = NewSessionLeaf.ABSENT
 
     def save(self, journal: int) -> None:
         move = self.move
@@ -898,6 +1070,8 @@ class MoveJournal:
             "source": str(move.source), "target": str(move.target), "kind": "copy",
             "rule": move.rule.value, "session": move.session_id, "source_id": [self.source.device, self.source.inode],
         }
+        if isinstance(self.destination, ExistingSessionLeaf):
+            fields["merge_target_id"] = astuple(self.destination.folder)
         if isinstance(self.state, VerifiedCopy):
             fields["verified_id"] = [self.state.folder.device, self.state.folder.inode]
             fields["sha256"] = self.state.sha256
@@ -905,6 +1079,20 @@ class MoveJournal:
                 fields["source_xattrs"] = {
                     str(path): sorted(names) for path, names in self.state.attributes.entries.items()
                 }
+        elif isinstance(self.state, MergePlan):
+            fields["merge"] = {
+                "stage_id": astuple(self.state.stage),
+                "sha256": self.state.sha256,
+                "source_bytes": self.state.source_bytes,
+                "renames": [[step.origin.value, str(step.path), str(step.target), step.inode]
+                            for step in self.state.renames],
+                "source_entries": {
+                    str(path): (["moved", str(entry.target), entry.source_sha256]
+                                if isinstance(entry, MovedSourceEntry)
+                                else ["retained", entry.source_sha256, entry.stage_sha256])
+                    for path, entry in self.state.source_entries.items()
+                },
+            }
         write_record_at(journal, MOVE_RECORD, fields)
 
 
@@ -933,6 +1121,59 @@ def checked_source_xattrs(value: object) -> SourceAttributeNames:
             raise MoveRefused("invalid source attributes in the move journal")
         entries[Path(path)] = frozenset(cast(list[str], names))
     return SourceAttributeNames(entries)
+
+
+def journal_tree_path(value: object) -> Path:
+    if isinstance(value, str):
+        path = Path(value)
+        if value == str(path) and not path.is_absolute() and ".." not in path.parts and "\0" not in value:
+            return path
+    raise MoveRefused("invalid relative path in the merge journal")
+
+
+def journal_digest(value: object) -> str:
+    if isinstance(value, str) and re.fullmatch("[0-9a-f]{64}", value):
+        return value
+    raise MoveRefused("invalid content check in the merge journal")
+
+
+def read_merge_plan(value: object, destination: ExistingSessionLeaf) -> MergePlan:
+    if not isinstance(value, dict):
+        raise MoveRefused("invalid merge in the move journal")
+    fields = cast(dict[str, object], value)
+    renames, entries, size = (fields.get(key) for key in ("renames", "source_entries", "source_bytes"))
+    if not isinstance(renames, list) or not isinstance(entries, dict) or not isinstance(size, int) or size < 0:
+        raise MoveRefused("invalid merge entries in the move journal")
+    steps: list[MergeRename] = []
+    for row in cast(list[object], renames):
+        if not isinstance(row, list):
+            raise MoveRefused("invalid rename in the merge journal")
+        parts = cast(list[object], row)
+        if len(parts) != 4 or not isinstance(parts[0], str) or not isinstance(parts[3], int):
+            raise MoveRefused("invalid rename in the merge journal")
+        path, target = journal_tree_path(parts[1]), journal_tree_path(parts[2])
+        if path == TREE_ROOT or target == TREE_ROOT or path.parent != target.parent:
+            raise MoveRefused("invalid paths in the merge rename")
+        steps.append(MergeRename(MergeOrigin(parts[0]), path, target, parts[3]))
+    contents: dict[Path, MovedSourceEntry | RetainedStageEntry] = {}
+    for path, row in cast(dict[object, object], entries).items():
+        if not isinstance(row, list):
+            raise MoveRefused("invalid source entry in the merge journal")
+        parts = cast(list[object], row)
+        if len(parts) != 3:
+            raise MoveRefused("invalid source entry in the merge journal")
+        state, first, second = parts
+        source_path = journal_tree_path(path)
+        if state == "moved":
+            contents[source_path] = MovedSourceEntry(journal_tree_path(first), journal_digest(second))
+        elif state == "retained":
+            contents[source_path] = RetainedStageEntry(journal_digest(first), journal_digest(second))
+        else:
+            raise MoveRefused("invalid source entry state in the merge journal")
+    if not isinstance(contents.get(TREE_ROOT), RetainedStageEntry):
+        raise MoveRefused("missing stage root proof in the merge journal")
+    return MergePlan(destination.folder, checked_identity(fields.get("stage_id")),
+                     journal_digest(fields.get("sha256")), size, tuple(steps), contents)
 
 
 def read_journal(journal: int, roots: MoveRoots) -> MoveJournal | NoPendingMove:
@@ -967,15 +1208,21 @@ def read_journal(journal: int, roots: MoveRoots) -> MoveJournal | NoPendingMove:
             or not (move.source.parent.parent.parent == roots.former_temp
                     or move.source.parent.parent.parent.parent == roots.former_sessions)):
         raise MoveRefused("invalid scratchpad in the move journal")
+    destination = (ExistingSessionLeaf(checked_identity(fields["merge_target_id"]))
+                   if "merge_target_id" in fields else NewSessionLeaf.ABSENT)
     digest = fields.get("sha256")
-    if isinstance(digest, str) and re.fullmatch("[0-9a-f]{64}", digest):
+    if "merge" in fields:
+        if not isinstance(destination, ExistingSessionLeaf) or fields.keys() & {"sha256", "verified_id", "source_xattrs"}:
+            raise MoveRefused("invalid merge state in the move journal")
+        state = read_merge_plan(fields["merge"], destination)
+    elif isinstance(digest, str) and re.fullmatch("[0-9a-f]{64}", digest):
         attributes = checked_source_xattrs(fields["source_xattrs"]) if "source_xattrs" in fields else AllCopyAttributes()
         state = VerifiedCopy(checked_identity(fields.get("verified_id")), digest, attributes)
     elif not fields.keys() & {"sha256", "verified_id", "source_xattrs"}:
         state = CopyInProgress()
     else:
         raise MoveRefused("invalid copy check in the move journal")
-    return MoveJournal(move, checked_identity(fields.get("source_id")), state)
+    return MoveJournal(move, checked_identity(fields.get("source_id")), state, destination)
 
 
 def clear_journal(journal: int) -> None:
@@ -1003,6 +1250,22 @@ def check_copy_idle(source: Path, session_pids: frozenset[int]) -> None:
     check_source_idle(source, session_records.read_registry(), lambda: process_uses((source,), session_pids))
 
 
+@dataclass(frozen=True)
+class MergeIdleCheck:
+    move: PlannedCopy
+    sessions: Path
+    session_pids: frozenset[int]
+
+    def __call__(self) -> None:
+        require_session_stopped(self.move.session_id, session_records.read_registry())
+        paths = (self.move.source, self.move.target, self.sessions / JOURNAL / STAGED)
+        # The mover keeps read descriptors open while it checks paths.
+        uses = tuple(use for use in process_uses(paths, self.session_pids)
+                     if (use[1], use[2]) != (os.getpid(), tmp_sweep.HOLDS_FILE))
+        for path in paths:
+            require_idle(path, uses)
+
+
 @contextmanager
 def source_parent(roots: MoveRoots, move: PlannedCopy) -> Generator[int]:
     boundary = roots.former_sessions if move.source.is_relative_to(roots.former_sessions) else roots.former_temp
@@ -1018,7 +1281,7 @@ def require_parent_path(path: Path, expected: int) -> None:
             raise MoveRefused(f"{path}: parent changed during the move")
 
 
-def prepare_copy(job: MoveJournal, journal: int, source: int, session_pids: frozenset[int]) -> VerifiedCopy:
+def prepare_copy(job: MoveJournal, journal: int, source: int, session_pids: frozenset[int]) -> VerifiedStage:
     move = job.move
     check_copy_idle(move.source, session_pids)
     with (child_directory(source, move.source.name, mount=mount_identity(source)) as original,
@@ -1035,69 +1298,292 @@ def prepare_copy(job: MoveJournal, journal: int, source: int, session_pids: froz
                 path: frozenset(name for name, _ in entry.metadata.xattrs)
                 for path, entry in expected.items() if entry.metadata.xattrs
             })
-            if attributes.in_copy(read_manifest(staged)) != expected:
+            identities: EntryIdentities = {}
+            copied = read_manifest(staged, identities)
+            if attributes.in_copy(copied) != expected:
                 raise MoveRefused("copy check failed (entries, bytes, SHA-256 or metadata)")
         except (OSError, ValueError):
-            discard_stage(journal, staged)
+            if job.destination is NewSessionLeaf.ABSENT:
+                discard_stage(journal, staged)
             raise
-        verified = VerifiedCopy(FolderIdentity.of(os.fstat(staged)), manifest_digest(expected), attributes)
+        verified = VerifiedStage(FolderIdentity.of(os.fstat(staged)), manifest_digest(expected),
+                                 attributes, copied, identities)
         replace(job, state=verified).save(journal)
         return verified
+
+
+def merge_suffix(path: Path, reserved: set[Path], name_limit: int) -> Path:
+    for number in range(1, len(reserved) + 2):
+        suffix = f".session-move.{number}"
+        if 0 < name_limit <= len(suffix):
+            break
+        stem = path.name
+        if name_limit > 0:
+            stem = os.fsdecode(os.fsencode(stem)[:name_limit - len(suffix)])
+        candidate = path.with_name(stem + suffix)
+        if candidate not in reserved:
+            reserved.add(candidate)
+            return candidate
+    raise MoveRefused(f"{path}: no name fits the merge suffix")
+
+
+def plan_merge(verified: VerifiedStage, published: int) -> MergePlan:
+    stage_ids = verified.identities
+    stage_manifest = verified.contents
+    original = verified.source_manifest(stage_manifest)
+    target_ids: EntryIdentities = {}
+    destination = read_manifest(published, target_ids)
+    reserved = set(original) | set(destination)
+    limit = os.fpathconf(published, "PC_NAME_MAX")
+    target_renames: dict[Path, Path] = {}
+    incoming: TreeManifest = {}
+    contents: dict[Path, MovedSourceEntry | RetainedStageEntry] = {}
+    renames: list[MergeRename] = []
+    for path, entry in sorted(original.items()):
+        digest = manifest_digest({path: entry})
+        if path == TREE_ROOT:
+            contents[path] = RetainedStageEntry(digest, manifest_digest({path: stage_manifest[path]}))
+            continue
+        parent = contents[path.parent]
+        if isinstance(parent, MovedSourceEntry):
+            placed = parent.target / path.name
+        else:
+            placed = path
+            current = destination.get(path)
+            if current is not None:
+                if current.same_content(entry):
+                    contents[path] = RetainedStageEntry(digest, manifest_digest({path: stage_manifest[path]}))
+                    continue
+                suffix = merge_suffix(path, reserved, limit)
+                if stage_ids[path].st_mtime_ns <= target_ids[path].st_mtime_ns:
+                    placed = suffix
+                else:
+                    target_renames[path] = suffix
+                    renames.append(MergeRename(MergeOrigin.DESTINATION, path, suffix, target_ids[path].st_ino))
+            renames.append(MergeRename(MergeOrigin.STAGE, path, placed, stage_ids[path].st_ino))
+        contents[path] = MovedSourceEntry(placed, digest)
+        incoming[placed] = stage_manifest[path]
+
+    target_paths = {TREE_ROOT: TREE_ROOT}
+    result = {TREE_ROOT: destination[TREE_ROOT]}
+    for path, entry in sorted(destination.items()):
+        if path != TREE_ROOT:
+            placed = target_renames.get(path, target_paths[path.parent] / path.name)
+            target_paths[path] = placed
+            result[placed] = entry
+    result.update(incoming)
+    size = sum(entry.size_bytes for entry in original.values())
+    return MergePlan(FolderIdentity.of(os.fstat(published)), verified.folder, manifest_digest(result),
+                     size, tuple(renames), contents)
+
+
+@contextmanager
+def merge_rename_parents(step: MergeRename, staged: int, published: int,
+                         target_path: Path) -> Generator[tuple[int, int]]:
+    origin = staged if step.origin is MergeOrigin.STAGE else published
+    with (destination_parent(origin, TREE_ROOT, step.path, create=False, check_write=True) as before,
+          destination_parent(published, TREE_ROOT, step.target, create=False, check_write=True) as after):
+        if before < 0 or after < 0:
+            raise MoveRefused(f"{target_path / step.target}: merge rename parent is missing")
+        if mount_identity(before) != mount_identity(after):
+            raise MoveRefused(f"{target_path / step.target}: merge rename crosses a mount")
+        require_parent_path(target_path / step.target.parent, after)
+        yield before, after
+
+
+@dataclass(frozen=True)
+class PendingMergeRename:
+    origin: os.stat_result
+
+
+class CompletedMergeRename(Enum):
+    PUBLISHED = "merge entry is published"
+
+
+def merge_rename_state(step: MergeRename, entry: os.stat_result | None, current: os.stat_result | None,
+                       device: int, target_path: Path) -> PendingMergeRename | CompletedMergeRename:
+    identity = (device, step.inode)
+    if entry is not None and (entry.st_dev, entry.st_ino) == identity:
+        if current is None:
+            return PendingMergeRename(entry)
+    # A later rename can fill a name that an earlier rename vacated.
+    elif (current is not None and (current.st_dev, current.st_ino) == identity
+          and (entry is None or step.origin is MergeOrigin.DESTINATION)):
+        return CompletedMergeRename.PUBLISHED
+    raise MoveRefused(f"{target_path / step.target}: merge entry changed before publication")
+
+
+def preflight_merge_renames(plan: MergePlan, staged: int, published: int, target_path: Path) -> None:
+    device = os.fstat(published).st_dev
+    simulated: dict[tuple[MergeOrigin, Path], os.stat_result | None] = {}
+    for step in plan.renames:
+        with merge_rename_parents(step, staged, published, target_path) as (before, after):
+            origin = (step.origin, step.path)
+            target = (MergeOrigin.DESTINATION, step.target)
+            entry = simulated[origin] if origin in simulated else stat_at(before, step.path.name)
+            current = simulated[target] if target in simulated else stat_at(after, step.target.name)
+            state = merge_rename_state(step, entry, current, device, target_path)
+            if isinstance(state, PendingMergeRename):
+                require_removable(os.fstat(before), state.origin, target_path / step.path)
+                simulated[origin] = None
+                simulated[target] = state.origin
+
+
+def publish_merge_renames(plan: MergePlan, staged: int, published: int, check_idle: MergeIdleCheck) -> None:
+    target_path = check_idle.move.target
+    stage_path = check_idle.sessions / JOURNAL / STAGED
+    device = os.fstat(published).st_dev
+    for step in plan.renames:
+        with merge_rename_parents(step, staged, published, target_path) as (before, after):
+            check_idle()
+            entry = stat_at(before, step.path.name)
+            current = stat_at(after, step.target.name)
+            state = merge_rename_state(step, entry, current, device, target_path)
+            if isinstance(state, PendingMergeRename):
+                origin_root = stage_path if step.origin is MergeOrigin.STAGE else target_path
+                origin = MoveEntry(origin_root / step.path.parent, before, step.path.name, state.origin)
+                destination = MoveEntry(target_path / step.target.parent, after, step.target.name,
+                                        VacantDestination.ENTRY)
+                require_final_move(check_idle.move.session_id, origin, destination)
+                rename_exclusive(before, step.path.name, after, step.target.name)
+            else:
+                os.fsync(after)
+                os.fsync(before)
+
+
+def verify_before_publication(job: MoveJournal, verified: VerifiedCopy, source: int, journal: int) -> VerifiedStage:
+    with (child_directory(source, job.move.source.name, mount=mount_identity(source)) as original,
+          child_directory(journal, STAGED, mount=mount_identity(journal)) as staged):
+        if not job.source.matches(os.fstat(original)):
+            raise MoveRefused("source changed before publication")
+        if not verified.folder.matches(os.fstat(staged)):
+            raise MoveRefused("verified stage changed before publication")
+        try:
+            identities: EntryIdentities = {}
+            copied = read_manifest(staged, identities)
+            if (manifest_digest(read_manifest(original)) != verified.sha256
+                    or manifest_digest(verified.source_manifest(copied)) != verified.sha256):
+                raise MoveRefused("verified copy or source changed before publication")
+        except (OSError, ValueError):
+            if job.destination is NewSessionLeaf.ABSENT:
+                replace(job, state=CopyInProgress()).save(journal)
+                discard_stage(journal, staged)
+            raise
+        return VerifiedStage(verified.folder, verified.sha256, verified.attributes, copied, identities)
+
+
+def publish_verified_merge(job: MoveJournal, state: VerifiedStage | MergePlan, destination: ExistingSessionLeaf,
+                           target: int, journal: int, check_idle: MergeIdleCheck) -> MergePlan:
+    move = job.move
+    check_idle()
+    with (child_directory(target, move.target.name, mount=mount_identity(target)) as published,
+          child_directory(journal, STAGED, mount=mount_identity(journal)) as staged):
+        if not destination.folder.matches(os.fstat(published)):
+            raise MoveRefused(f"destination conflict at {move.target}")
+        stage = state.stage if isinstance(state, MergePlan) else state.folder
+        if not stage.matches(os.fstat(staged)):
+            raise MoveRefused("the verified merge stage changed")
+        plan = plan_merge(state, published) if isinstance(state, VerifiedStage) else state
+        preflight_merge_renames(plan, staged, published, move.target)
+        if isinstance(state, VerifiedStage):
+            replace(job, state=plan).save(journal)
+        try:
+            publish_merge_renames(plan, staged, published, check_idle)
+        except LiveSource:
+            raise
+        except (OSError, MoveRefused) as error:
+            raise MoveRefused(f"{error}. Correct the error and rerun session_move to resume the saved merge.") from error
+    return plan
 
 
 def resume_copy(job: MoveJournal, journal: int, roots: MoveRoots, root_fd: int,
                 session_pids: frozenset[int]) -> int:
     move = job.move
+    check_merge_idle = MergeIdleCheck(move, roots.sessions, session_pids)
     with source_parent(roots, move) as source:
         old = stat_at(source, move.source.name)
         if old is not None and not job.source.matches(old):
             raise MoveRefused("source is no longer the journaled directory")
         with destination_parent(root_fd, roots.sessions, move.target, create=False) as target:
             new = stat_at(target, move.target.name)
-        if isinstance(job.state, CopyInProgress):
-            if new is not None:
+        destination = job.destination
+        if isinstance(destination, ExistingSessionLeaf):
+            require_merge_owner(root_fd, roots.sessions, move, NamingRule.INDEX)
+            if not destination.folder.matches(new):
                 raise MoveRefused(f"destination conflict at {move.target}")
+        elif isinstance(job.state, CopyInProgress) and new is not None:
+            raise MoveRefused(f"destination conflict at {move.target}")
+
+        state = job.state
+        if isinstance(state, CopyInProgress):
             if old is None:
                 raise MoveRefused("source is missing before copy verification")
-            verified = prepare_copy(job, journal, source, session_pids)
-        else:
-            verified = job.state
+            state = prepare_copy(job, journal, source, session_pids)
+
+        if isinstance(state, VerifiedCopy) and (new is None or isinstance(destination, ExistingSessionLeaf)):
+            if old is None or not state.folder.matches(stat_at(journal, STAGED)):
+                raise MoveRefused("a verified copy or its source is missing")
+            if isinstance(job.state, VerifiedCopy):
+                state = verify_before_publication(job, state, source, journal)
 
         with destination_parent(root_fd, roots.sessions, move.target, create=new is None) as target:
-            if new is None:
-                if old is None or not verified.folder.matches(stat_at(journal, STAGED)):
-                    raise MoveRefused("a verified copy or its source is missing")
-                if isinstance(job.state, VerifiedCopy):
-                    with (child_directory(source, move.source.name, mount=mount_identity(source)) as original,
-                          child_directory(journal, STAGED, mount=mount_identity(journal)) as staged):
-                        if not job.source.matches(os.fstat(original)):
-                            raise MoveRefused("source changed before publication")
-                        try:
-                            if (manifest_digest(read_manifest(original)) != verified.sha256
-                                    or manifest_digest(verified.source_manifest(read_manifest(staged))) != verified.sha256):
-                                raise MoveRefused("verified copy or source changed before publication")
-                        except (OSError, ValueError):
-                            replace(job, state=CopyInProgress()).save(journal)
-                            discard_stage(journal, staged)
-                            raise
-                check_copy_idle(move.source, session_pids)
-                require_parent_path(move.target.parent, target)
-                rename_exclusive(journal, STAGED, target, move.target.name)
-            elif not verified.folder.matches(new) or stat_at(journal, STAGED) is not None:
-                raise MoveRefused(f"destination conflict at {move.target}")
+            if isinstance(destination, ExistingSessionLeaf):
+                if old is not None:
+                    if not isinstance(state, (VerifiedStage, MergePlan)):
+                        raise MoveRefused("the merge stage has not been verified")
+                    state = publish_verified_merge(job, state, destination, target, journal, check_merge_idle)
+            elif isinstance(state, VerifiedCopy):
+                if new is None:
+                    check_copy_idle(move.source, session_pids)
+                    staged = stat_at(journal, STAGED)
+                    if staged is None or not state.folder.matches(staged):
+                        raise MoveRefused("the verified stage changed before publication")
+                    origin = MoveEntry(roots.sessions / JOURNAL, journal, STAGED, staged)
+                    destination_entry = MoveEntry(move.target.parent, target, move.target.name, VacantDestination.ENTRY)
+                    require_final_move(move.session_id, origin, destination_entry)
+                    rename_exclusive(journal, STAGED, target, move.target.name)
+                elif not state.folder.matches(new) or stat_at(journal, STAGED) is not None:
+                    raise MoveRefused(f"destination conflict at {move.target}")
+                else:
+                    os.fsync(target)
+                    os.fsync(journal)
             else:
-                os.fsync(target)
-                os.fsync(journal)
-
+                raise MoveRefused("merge has no journaled destination")
             require_parent_path(move.target.parent, target)
-            size = finish_copy(job, verified, source, target, session_pids)
+            size = finish_copy(job, state, source, target, journal, check_merge_idle)
+
         clear_journal(journal)
         return size
 
 
-def finish_copy(job: MoveJournal, verified: VerifiedCopy, source: int, target: int,
-                session_pids: frozenset[int]) -> int:
+def sync_merge_destination(verified: MergePlan, published: VerifiedPublication,
+                           target: Path, sessions: Path) -> None:
+    # Sync descendants before their containing directories.
+    for path, entry in sorted(verified.source_entries.items(), reverse=True):
+        if not isinstance(entry, RetainedStageEntry):
+            continue
+        info = published.identities[path]
+        with destination_parent(published.folder, TREE_ROOT, path, create=False) as parent:
+            if parent < 0:
+                raise MoveRefused(f"{target / path}: parent changed before sync")
+            if published.contents[path].kind is HashedEntry.FILE:
+                published.sync_retained_file(path, parent, info)
+            elif published.contents[path].kind is HashedEntry.DIRECTORY:
+                with child_directory(parent, path.name or ".", mount=mount_identity(parent)) as folder:
+                    if not os.path.samestat(os.fstat(folder), info):
+                        raise MoveRefused(f"{target / path}: directory changed before sync")
+                    os.fsync(folder)
+    for parent_path in target.parents:
+        with open_directory(parent_path) as parent:
+            os.fsync(parent)
+        if parent_path == sessions:
+            break
+
+
+def finish_copy(job: MoveJournal, verified: VerifiedCopy | MergePlan, source: int, target: int, journal: int,
+                check_merge_idle: MergeIdleCheck) -> int:
     move = job.move
+    session_pids = check_merge_idle.session_pids
     require_parent_path(move.source.parent, source)
     remaining: TreeManifest = {}
     source_identities: EntryIdentities = {}
@@ -1114,17 +1600,31 @@ def finish_copy(job: MoveJournal, verified: VerifiedCopy, source: int, target: i
     with child_directory(target, move.target.name, mount=mount_identity(target)) as published:
         if not verified.folder.matches(os.fstat(published)):
             raise MoveRefused("published copy changed")
-        expected = verified.source_manifest(read_manifest(published, destination_identities))
+        manifest = read_manifest(published, destination_identities)
+        expected = verified.source_manifest(manifest) if isinstance(verified, VerifiedCopy) else manifest
         if manifest_digest(expected) != verified.sha256:
             raise MoveRefused("published copy no longer matches the journal")
-        if any(expected.get(path) != entry for path, entry in remaining.items()):
+        publication = VerifiedPublication(move, published, destination_identities, expected)
+        source_targets: dict[Path, Path] = {}
+        if isinstance(verified, MergePlan):
+            for path, entry in remaining.items():
+                saved = verified.source_entries.get(path)
+                placed = saved.target if isinstance(saved, MovedSourceEntry) else path
+                if (saved is None or manifest_digest({path: entry}) != saved.source_sha256
+                        or placed not in expected or not entry.same_content(expected[placed])):
+                    raise MoveRefused(f"{path}: source contains data outside the verified merge")
+                source_targets[path] = placed
+            sync_merge_destination(verified, publication, move.target, check_merge_idle.sessions)
+        elif any(expected.get(path) != entry for path, entry in remaining.items()):
             raise MoveRefused("source contains data outside the verified copy")
         if source_present:
             require_parent_path(move.source.parent, source)
             require_parent_path(move.target.parent, target)
             if not verified.folder.matches(stat_at(target, move.target.name)):
                 raise MoveRefused("published copy changed before source deletion")
-            proof = CopyDeletion(source_identities, destination_identities, expected, published)
+            proof = CopyDeletion(move.source, source_identities, remaining, source_targets, publication)
+            if isinstance(verified, MergePlan):
+                proof = replace(proof, before_remove=check_merge_idle)
             # Close the source scan before checking for open files.
             check_copy_idle(move.source, session_pids)
             with child_directory(source, move.source.name, mount=source_mount) as original:
@@ -1133,15 +1633,57 @@ def finish_copy(job: MoveJournal, verified: VerifiedCopy, source: int, target: i
                 remove_tree(source, move.source.name, original, source_mount, proof)
         else:
             os.fsync(source)
+        if isinstance(verified, MergePlan):
+            require_parent_path(move.target.parent, target)
+            if not verified.folder.matches(stat_at(target, move.target.name)):
+                raise MoveRefused("published merge changed before stage cleanup")
+            if stat_at(journal, STAGED) is not None:
+                with child_directory(journal, STAGED, mount=mount_identity(journal)) as staged:
+                    if not verified.stage.matches(os.fstat(staged)):
+                        raise MoveRefused("the verified merge stage changed before cleanup")
+                    stage_path = check_merge_idle.sessions / JOURNAL / STAGED
+                    stage_proof = MergeStageDeletion(stage_path, verified.source_entries, publication, check_merge_idle)
+                    remove_tree(journal, STAGED, staged, mount_identity(journal), stage_proof)
+            return verified.source_bytes
         return sum(entry.size_bytes for entry in expected.values())
 
 
+def require_merge_owner(root_fd: int, root: Path, move: PlannedCopy, rule: NamingRule) -> None:
+    folder = root / move.target.relative_to(root).parts[0]
+    mount = mount_identity(root_fd)
+    with child_directory(root_fd, folder.name, mount=mount) as owner_folder:
+        info = stat_at(owner_folder, session_folder.RECORD)
+        if info is not None and not stat.S_ISREG(info.st_mode):
+            raise MoveRefused(f"destination conflict at {move.target}: invalid session owner record")
+        record = session_folder.read_record(folder)
+        if info is not None and record is None:
+            raise MoveRefused(f"destination conflict at {move.target}: cannot read the session owner record")
+    if record is not None and record["session_id"]:
+        if record["session_id"] != move.session_id:
+            raise MoveRefused(f"destination conflict at {move.target}: folder belongs to session {record['session_id']}")
+    elif rule is not NamingRule.INDEX:
+        raise MoveRefused(f"destination conflict at {move.target}: folder has no session owner")
+    if rule is NamingRule.INDEX:
+        with child_directory(root_fd, session_folder.INDEX, mount=mount) as index:
+            check_index_link(index, move.session_id, folder)
+
+
 def check_destination(root_fd: int, root: Path, move: PlannedCopy, name: SessionDestination,
-                      destinations: set[Path]) -> None:
+                      mounts: Sequence[measure.Mount]) -> NewSessionLeaf | ExistingSessionLeaf:
     target = move.target
+    destination: NewSessionLeaf | ExistingSessionLeaf = NewSessionLeaf.ABSENT
     with destination_parent(root_fd, root, target, create=False, check_write=True) as parent:
-        if target in destinations or stat_at(parent, target.name) is not None:
-            raise MoveRefused(f"destination conflict at {target}")
+        info = stat_at(parent, target.name)
+        if info is not None:
+            if not stat.S_ISDIR(info.st_mode):
+                raise MoveRefused(f"destination conflict at {target}")
+            require_merge_owner(root_fd, root, move, name.rule)
+            check_source_mounts(target, mounts)
+            with child_directory(parent, target.name, mount=mount_identity(parent)) as folder:
+                require_writable_directory(folder, target)
+                if not os.path.samestat(info, os.fstat(folder)):
+                    raise MoveRefused(f"destination changed at {target}")
+                destination = ExistingSessionLeaf(FolderIdentity.of(info))
     with destination_parent(root_fd, root, root / JOURNAL / MOVE_RECORD, create=False, check_write=True) as journal:
         check_record_writes(journal, root / JOURNAL, MOVE_RECORD)
     if name.rule is not NamingRule.INDEX:
@@ -1151,6 +1693,7 @@ def check_destination(root_fd: int, root: Path, move: PlannedCopy, name: Session
         with destination_parent(root_fd, root, name.folder / session_folder.RECORD,
                                 create=False, check_write=True) as folder:
             check_record_writes(folder, name.folder, session_folder.RECORD)
+    return destination
 
 
 def check_record_writes(parent: int, folder: Path, record: str) -> None:
@@ -1177,6 +1720,7 @@ class ValidatedCopy:
     destination: SessionDestination
     source_identity: FolderIdentity
     source_manifest: TreeManifest
+    destination_leaf: NewSessionLeaf | ExistingSessionLeaf
 
     @property
     def size_bytes(self) -> int:
@@ -1184,7 +1728,7 @@ class ValidatedCopy:
 
 
 def validate_copy(leaf: ScratchpadLeaf, roots: MoveRoots, root_fd: int, names: DestinationNames,
-                  destinations: set[Path], mounts: Sequence[measure.Mount], uses: SourceProcessUses) -> ValidatedCopy:
+                  mounts: Sequence[measure.Mount], uses: SourceProcessUses) -> ValidatedCopy:
     if leaf.source.is_relative_to(roots.sessions):
         raise MoveRefused("source is inside the destination root")
     check_source_idle(leaf.source, names.registry, lambda: uses)
@@ -1195,15 +1739,16 @@ def validate_copy(leaf: ScratchpadLeaf, roots: MoveRoots, root_fd: int, names: D
             identity = FolderIdentity.of(os.fstat(original))
             check_source_mounts(move.source, mounts)
             manifest = read_manifest(original, removal=SourceRemoval(source, move.source))
-    check_destination(root_fd, roots.sessions, move, name, destinations)
-    return ValidatedCopy(move, name, identity, manifest)
+    destination = check_destination(root_fd, roots.sessions, move, name, mounts)
+    return ValidatedCopy(move, name, identity, manifest, destination)
 
 
 def start_copy(validated: ValidatedCopy, names: DestinationNames,
                roots: MoveRoots, root_fd: int, session_pids: frozenset[int]) -> int:
     mount = mount_identity(root_fd)
     move = validated.move
-    job = MoveJournal(move, validated.source_identity, CopyFromValidatedSource(validated.source_manifest))
+    job = MoveJournal(move, validated.source_identity, CopyFromValidatedSource(validated.source_manifest),
+                      validated.destination_leaf)
     writes = CopyWriteState()
     try:
         names.remember(validated.destination, root_fd, mount, writes)
@@ -1276,6 +1821,9 @@ def move_candidates(roots: MoveRoots, root_fd: int, names: DestinationNames, hol
             except LiveSource as error:
                 summary.keep_live(pending.move.source, error, journaled=True)
                 return
+            except (MoveRefused, OSError):
+                print(f"session_move: saved copy failed at {pending.move.source}", file=sys.stderr, flush=True)
+                raise
             sources.discard(pending.move.source)
 
     eligible = sources - blocked
@@ -1286,15 +1834,13 @@ def move_candidates(roots: MoveRoots, root_fd: int, names: DestinationNames, hol
             summary.refused_other += int(entry.blocks_cutover)
 
     uses = process_uses(tuple(leaf.source for leaf in leaves), session_pids)
-    destinations: set[Path] = set()
     for leaf in leaves:
         try:
-            validated = validate_copy(leaf, roots, root_fd, names, destinations, mounts, uses)
+            validated = validate_copy(leaf, roots, root_fd, names, mounts, uses)
             size = validated.size_bytes
             show_copy(validated.move, size)
             if not dry_run:
                 size = start_copy(validated, names, roots, root_fd, session_pids)
-            destinations.add(validated.move.target)
             summary.record_move(size)
         except (MoveRefused, OSError, CopyWriteFailed) as error:
             if isinstance(error, LiveSource):
@@ -1302,6 +1848,8 @@ def move_candidates(roots: MoveRoots, root_fd: int, names: DestinationNames, hol
             else:
                 kept(leaf.source, error)
                 summary.refused_other += 1
+            if isinstance(error, CopyWriteFailed):
+                print(f"session_move: copy write failed at {leaf.source}", file=sys.stderr, flush=True)
             if isinstance(error, (JournaledLiveSource, CopyWriteFailed)):
                 return
 

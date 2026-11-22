@@ -2240,7 +2240,7 @@ Each Mac run without `--target-dir` trims the mirror target to `mac_budget_gib.<
 - A missing, malformed or zone-less `createdAt` gives `CiUnknown`.
 - `config/mac_test.conf` has `ci_jobless_queued_minutes=60`. `read_config()` reads the key only when `ci_repo` is set, so the Linux and aws target configs need no new key.
 - No new `gh` call, flag, cancel call or state file.
-- Measured before the fix: run 43096016385 (natepiano/hana `ci.yml`) was queued from 2026-11-11 20:25 UTC with no jobs, and `gh run cancel` refused it as "completed". It held hana trunk's Mac block `pending` from 2026-11-12 20:04 EST.
+- Measured before the fix: run 43096016385 (hanallc/hana `ci.yml`) was queued from 2026-11-11 20:25 UTC with no jobs, and `gh run cancel` refused it as "completed". It held hana trunk's Mac block `pending` from 2026-11-12 20:04 EST.
 
 **Files:**
 - `scripts/mac_test/mac_test.py` — `CiRun`, `ci_activity()`, `MacTestConfig.ci_jobless_queued_minutes`
@@ -2782,7 +2782,7 @@ Held by builds 2026-11-18 01:2x EST: about 1% of the wait. Tonight 16 Hana nexte
 
 #### As-built
 
-- Cause: `test_real_cargo_reuses_a_registry_unit_and_rebuilds_local_inputs` in `scripts/lib/test_cargo_seed.py` started real rustup and Cargo. The merge gate puts tripwire `cargo`, `rustc`, `rustdoc`, `rustup` and `cargo-nextest` first on PATH (`merge_gate.py` `test_module_environment`), so the warmseed row failed its merge test.
+- Cause: `test_real_cargo_reuses_a_registry_unit_and_rebuilds_local_inputs` in `scripts/lib/test_cargo_seed.py` started real rustup and Cargo. The merge gate puts tripwire `cargo`, `rustc`, `rustdoc`, `rustup` and `cargo-nextest` first on PATH (`gate.py` `test_module_environment`), so the warmseed row failed its merge test.
 - The test and the helpers only it used (`fixture_cargo`, `write_crate`, `build_crate`) are removed. The copy, lock, stage and recovery tests stay. The Phase 144 Hana measurement keeps the real-Cargo evidence.
 - 13 tests pass with the tripwires first on PATH, with 0 tripwire calls.
 - Rows on main `9eff6f1ee`: row 144 `7f9f08a71`, row 144 shrink `85affe59a` (56 tests pass under the tripwires).
@@ -2899,7 +2899,7 @@ Held by builds 2026-11-18 01:2x EST: about 1% of the wait. Tonight 16 Hana nexte
 
 #### As-built
 - Cause: the natest gate-rename chain (`origin/natest-gatechain`, phase 320 `cf4ac06c4`) renames stored step names (merge-gate to gate, targeted-test to test-affected). Its gate trials wrote 93 launch rows with `test-affected` into the live ledger (11-16 20:26 to 11-17 11:54 EST). When the 11-17 bill arrived (11-18 14:29 EST), `run_cost.billed_allocations` divided by 0 and the hourly AWS page publish failed.
-- `run_cost` reads every row mode through one alias table: gate reads as merge-gate, test-affected as targeted-test. Other modes keep their names.
+- `run_cost` converts the old row modes through one alias table. It reads `merge-gate` as `gate` and `targeted-test` as `test-affected`. Other modes keep their names.
 - `billed_allocations` splits a day's bill of a type and region over every run of that day, and skips a day with zero box time.
 - natest was told to turn the alias table around when its chain merges.
 - Fast-track refused it (`run_cost.py` imports `scripts/production/staff.py` through other modules), so it went as a row.

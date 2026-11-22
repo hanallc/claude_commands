@@ -1799,7 +1799,7 @@ Builds asked for verify's folder layout phase 4 (10c25b033) in this branch befor
 - `scripts/disks/sessions.py`:
   - `session_report` reads the root from `session_folder.session_root`. Until that folder exists, it returns nothing and the page shows no card.
   - `read_sessions` lists each folder under the root, largest first. Dot folders, links and files are not sessions.
-  - Size: `measure.tree_size` of the folder at `measure.drive_path`. On natedev `/session` is a mount of `/build/session`, so the size comes from the build drive's tree.
+  - Size: `measure.tree_size` of the folder at `measure.drive_path`. On natedev `/session` is a bind of `/home/natepiano/session`, so the size comes from the system disk tree.
   - Held folders: each `scratch.holds()` path inside the folder, by its path in the folder. A hold that ended with unsaved work shows "(unsaved work)".
   - State: `session_records.session_liveness` of the session id in `.session.json`: running, ended, or unknown ("—").
   - No code deletes a session folder yet, so the card shows no delete time (condition 5). The held folders go when their task ends (`scratch.end`); the task name is the tooltip of each held folder.
@@ -1956,7 +1956,7 @@ As built:
 
 - `build_steps.command_job` finds the script after a python or shell interpreter, then reads its arguments. `merge_gate.py` gives integrate, test all, test modules, test nightly or promote; `--tests-only` tests every module. `targeted_test.py` gives test affected, test all with `--full` or test modules with `--module`. `verify.sh [--session-dir <dir>] <step>` gives that step. `--promote` gives integrate. Any other command is `OtherCommand`.
 - `config/build_steps.conf` holds the step names, the `[about]` sentences and the `[changes]` text. `StepNames.about` and `StepNames.changes` fill them. An unknown unit gives no sentence.
-- The feed reads `/proc/<pid>/cmdline` for a merge-gate or targeted-test row (`memory_feed.step_job`). The result is a job or a named state: not a gate step, pid not recorded, command unreadable, or another command. The row name and the tooltip title use the job step; the row carries `about` and `changes`. The queue is unchanged.
+- The feed reads `/proc/<pid>/cmdline` for a gate or test-affected row (`memory_feed.step_job`). The result is a job or a named state: not a gate step, pid not recorded, command unreadable, or another command. The row name and the tooltip title use the job step; the row carries `about` and `changes`. The queue is unchanged.
 - The tooltip shows the description as a caption under the title, then a Changes row, then the rows it showed before.
 - Slot lease: `copies.standing` takes a `step` key. It writes `work=<step>` and `purpose=<shown step name>`. `copies.run` passes the job of its command, else the program name. Every other caller names its work: `merge_gate.py --nightly` test-nightly, `bump_gate.py` integrate, `fast_track.py` promote and fast-track, `ci_points` ci, `waiting.scratch_test` test, `rust_release` toolchain-trial, the style checks style, lint or test, and `copies.py hold` hold. Only test fixtures use the default step run. `gate_purpose` and the base commit subject are gone.
 - Disks Used by: `slots.slot_use` names the staff id from the staff record and builds "`<unit>` `<step>`" with the same owner template as the Builds page, then shows the showrunner.

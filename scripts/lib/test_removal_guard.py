@@ -189,6 +189,22 @@ class RemovalGuardTests(unittest.TestCase):
             _ = self.guard()
         self.assertEqual(result.exception.reason, removal_guard.RefusalReason.UNAVAILABLE_ROOTS)
 
+    def test_saved_gate_removal_list_keeps_the_folder_for_review(self) -> None:
+        path = self.fixture / "gate_folders_delete-saved.jsonl"
+        data = (json.dumps({
+            "tool": "gate_folders_delete", "path": str(self.target), "anchor": str(self.target),
+            "bytes": 0, "reason": "idle gate folder", "fingerprint": "", "assessed_ns": 1,
+        }) + "\n").encode()
+        _ = path.write_bytes(data)
+        console = io.StringIO()
+        errors = io.StringIO()
+        with (mock.patch.object(removal_guard, "read", return_value=self.guard()),
+              redirect_stdout(console), redirect_stderr(errors)):
+            self.assertEqual(removal_guard.remove_list(path, hashlib.sha256(data).hexdigest()), 0)
+        self.assertEqual(console.getvalue().splitlines(), [f"kept {str(self.target)!r}: the row is for review only"])
+        self.assertEqual(errors.getvalue(), "")
+        self.assertTrue(self.target.is_dir())
+
     def test_unreadable_staff_authority_refuses_the_list(self) -> None:
         plan = removal_guard.RemovalList(removal_guard.Tool.BUILD)
         with self.guard().check(self.target) as checked:

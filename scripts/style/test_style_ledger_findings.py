@@ -25,6 +25,71 @@ from scripts.style.ledger_test_support import (remove_generation_schema, LedgerT
 
 @final
 class StyleLedgerFindingsTests(LedgerTestCase):
+    def release_ticket(self) -> tuple[style_ledger.Ledger, str, str]:
+        source = "fn run() {\n    let old = 1;\n    let missing = old + 1;\n}\n"
+        ledger, issue, _ = self.binding_ticket(source, ((2, "old", "number"), (3, "missing", "replacement")))
+        by_line = {finding.line: finding.finding_id for finding in ledger.proposal_findings(issue)}
+        return ledger, by_line[2], by_line[3]
+
+    def test_migration_and_per_finding_release_are_atomic_idempotent_and_leave_decisions_filed(self) -> None:
+        ledger, kept, refused = self.release_ticket()
+        _ = ledger.bulk_release("1", {refused: "not located"})
+        self.assertEqual(ledger.ticket_get("1")["finding_ids"], [kept])
+        finding, = ledger.named_held((refused,))
+        self.assertIsInstance(finding.state, style_ledger.Filed)
+        self.assertIsInstance(finding.build_ticket, style_ledger.NoBuildTicket)
+        rows = ledger.bulk_refusals("1")
+        self.assertEqual((rows[0].finding_id, rows[0].ticket, rows[0].reason), (refused, "1", "not located"))
+        self.assertTrue(rows[0].at)
+        ticket_before = ledger.ticket_get("1")
+        self.assertEqual(ledger.bulk_release("1", {refused: "different"}), rows)
+        self.assertEqual(ledger.ticket_get("1"), ticket_before)
+        with self.assertRaises(style_ledger.LedgerError):
+            _ = ledger.bulk_release("1", {kept: "would release", "unknown": "not owned"})
+        self.assertEqual(ledger.ticket_get("1"), ticket_before)
+        remaining, = ledger.named_held((kept,))
+        self.assertIsInstance(remaining.state, style_ledger.Filed)
+        self.assertEqual(remaining.build_ticket, style_ledger.BuildTicket("1"))
+        self.assertEqual(ledger.bulk_refusals("1"), rows)
+        _ = ledger.bulk_release("1", {kept: "all refused"})
+        self.assertEqual(ledger.ticket_get("1")["finding_ids"], [])
+        released, = ledger.named_held((kept,))
+        self.assertIsInstance(released.state, style_ledger.Filed)
+        self.assertIsInstance(released.build_ticket, style_ledger.NoBuildTicket)
+        with closing(sqlite3.connect(ledger.database)) as connection:
+            self.assertEqual(connection.execute("SELECT MAX(version) FROM schema_version").fetchone()[0],
+                             max(style_ledger.MIGRATIONS))
+
+    def test_release_requires_assigned_proposal_and_nonempty_reason(self) -> None:
+        ledger, kept, _ = self.release_ticket()
+        with self.assertRaises(style_ledger.LedgerError):
+            _ = ledger.bulk_release("1", {kept: " "})
+        ledger.ticket_drop("1")
+        with self.assertRaises(style_ledger.LedgerError):
+            _ = ledger.bulk_release("1", {kept: "stale"})
+        self.assertEqual(ledger.bulk_refusals("1"), ())
+
+    def test_existing_database_gets_the_refusal_migration(self) -> None:
+        ledger = self.ledger()
+        with closing(sqlite3.connect(ledger.database)) as connection:
+            _ = connection.execute("DROP TABLE bulk_refusals")
+            _ = connection.execute("DROP TABLE refill_results")
+            _ = connection.execute("ALTER TABLE held_findings DROP COLUMN built_at")
+            remove_generation_schema(connection)
+            _ = connection.execute("UPDATE schema_version SET version=23")
+            connection.commit()
+        with style_ledger.Ledger(self.repo, ledger.database) as upgraded:
+            self.assertEqual(upgraded.bulk_refusals("1"), ())
+        # The refusal migration also accepts an existing refusal table.
+        with closing(sqlite3.connect(ledger.database)) as connection:
+            _ = connection.execute("DROP TABLE refill_results")
+            _ = connection.execute("ALTER TABLE held_findings DROP COLUMN built_at")
+            remove_generation_schema(connection)
+            _ = connection.execute("UPDATE schema_version SET version=23")
+            connection.commit()
+        with style_ledger.Ledger(self.repo, ledger.database) as replayed:
+            self.assertEqual(replayed.bulk_refusals("1"), ())
+
     def test_current_parameters_control_every_ledger_built_boundary(self) -> None:
         from scripts.style.test_approved_renames import PARAMETER_CHANGES
         for label, source, current, blocked in PARAMETER_CHANGES:

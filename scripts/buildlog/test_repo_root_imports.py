@@ -29,7 +29,6 @@ class RepoRootImportTests(unittest.TestCase):
             ("step_context.py", (), [], 2),
             ("health.py", health_prefix, [], 0),
             ("port_lint.py", (), [], 2),
-            ("width_trial.py", (), ["--help"], 0),
         )
         with tempfile.TemporaryDirectory() as temporary:
             folder = Path(temporary)

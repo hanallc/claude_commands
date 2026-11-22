@@ -121,6 +121,17 @@ class RemoveRunScratchTests(unittest.TestCase):
         self.assertTrue(task_mark.is_file())
         self.assertTrue(cargo_mark.is_file())
 
+    def test_run_omits_a_folder_that_disappeared_after_the_scan(self) -> None:
+        run, _ = self.make_run()
+        missing = run / "missing"
+        retained = run / "verify_cache"
+        with (mock.patch.object(remove_run_scratch, "scratch_folders", return_value=[missing, retained]),
+              mock.patch.object(sys, "argv", [str(SCRIPT), str(run)]),
+              redirect_stderr(io.StringIO()) as report):
+            self.assertEqual(remove_run_scratch.main(), 0)
+        self.assertNotIn(str(missing), report.getvalue())
+        self.assertIn(str(retained), report.getvalue())
+
     def test_cleanup_keeps_the_checkout_holding_a_paused_workers_live_command(self) -> None:
         run, _ = self.make_run()
         checkout = run / "phases" / "p4" / "gate"
