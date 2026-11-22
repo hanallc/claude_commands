@@ -99,7 +99,7 @@ from scripts.buildlog.mac_idle_alert import MacIdleConfigError, idle_config as i
 if TYPE_CHECKING:
     from scripts.build_queue.placement import SubmittingSession
     from scripts.build_queue import placement
-    from scripts.mac_test import eligibility
+    from scripts.mac_test import eligibility, offload
 
 MESSAGE_TIMEOUT_S = 30.0
 
@@ -332,6 +332,7 @@ class CliArguments(argparse.Namespace):
         self.hours: str = ""
         self.showrunner: str = ""
         self.settings: str = ""
+        self.deadline_monotonic: float | None = None
         self.repo_root: str = ""
         self.copy: bool = False
         self.target: str = ""
@@ -2177,6 +2178,7 @@ class ClaimReleaseRefused:
 def release_exact_claims(
     paths: StatePaths, pid: int, identity: claim_state.ClaimIdentity, settings: str, *,
     provider_lock_held: bool = False, remote_work: EndStoppedWork | KeepRemoteWork = KEEP_REMOTE_WORK,
+    release_deadline: offload.ClaimReleaseDeadline | conf.UseConfiguredValue = conf.UseConfiguredValue.CURRENT,
 ) -> ClaimsReleased | ClaimReleaseRefused:
     """Release the claims that pid holds under identity, after their remote start fence settles."""
     from scripts.mac_test import eligibility, offload
@@ -2202,12 +2204,15 @@ def release_exact_claims(
             command = (offload.leftover_check_script(remote_work.repository, paths.target, record.get("slot", 0) or 1)
                        + "\n" + fence + "\n" if isinstance(remote_work, EndStoppedWork)
                        else fence + "\nprintf 'leftovers=0\\nrc=0\\n'\n")
-            observed = offload.read_leftovers(connection, record["remote_host"], command, paths.target)
+            observed = offload.read_leftovers(connection, record["remote_host"], command, paths.target,
+                                              release_deadline=release_deadline)
             if not isinstance(observed.result, offload.LeftoversEnded):
                 return ClaimReleaseRefused("the remote work of the claim has not ended")
             if "dispatch_start_settled=" + offload.pending_start_key(identity) not in observed.output.splitlines():
                 return ClaimReleaseRefused("the remote start fence remains unconfirmed")
         with nullcontext() if provider_lock_held else locked(paths.lock):
+            if isinstance(release_deadline, offload.ClaimReleaseDeadline) and release_deadline.remaining() <= 0:
+                return ClaimReleaseRefused("the claim release deadline expired")
             # The claim watcher rewrites its own fields during the settle; only a new owner refuses.
             current = read_run(path)
             if isinstance(current, NoRun) or claim_owner(current) != claim_owner(record):
@@ -2223,8 +2228,15 @@ def release_exact_claims(
 
 
 def command_release(args: CliArguments, paths: StatePaths, *, provider_lock_held: bool = False) -> int:
+    from scripts.mac_test import offload
+
+    deadline = args.deadline_monotonic
+    if deadline is not None and not math.isfinite(deadline):
+        raise ValueError("the claim release deadline must be finite")
+    release_deadline = (offload.ClaimReleaseDeadline(deadline) if deadline is not None
+                        else conf.UseConfiguredValue.CURRENT)
     released = release_exact_claims(paths, args.pid, claim_state.ClaimIdentity(args.claim_id, args.episode, args.attempt),
-                                    args.settings, provider_lock_held=provider_lock_held)
+                                    args.settings, provider_lock_held=provider_lock_held, release_deadline=release_deadline)
     if isinstance(released, ClaimReleaseRefused):
         print(f"cannot release: {released.reason}", file=sys.stderr)
         return 12
@@ -2665,6 +2677,7 @@ def parser() -> argparse.ArgumentParser:
     release = commands.add_parser("release")
     _ = release.add_argument("--pid", type=int, required=True)
     _ = release.add_argument("--settings", default="")
+    _ = release.add_argument("--deadline-monotonic", type=float, help=argparse.SUPPRESS)
     for command in (claim, wait_claim, release):
         for field in ("claim-id", "episode", "attempt"):
             _ = command.add_argument("--" + field, required=command is release, default="")

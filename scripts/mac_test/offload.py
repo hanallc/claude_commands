@@ -32,7 +32,7 @@ import time
 import traceback
 import uuid
 from types import FrameType
-from typing import TYPE_CHECKING, BinaryIO, Callable, Literal, Protocol, TextIO, TypedDict, assert_never, cast, final
+from typing import TYPE_CHECKING, BinaryIO, Callable, Literal, Protocol, TextIO, TypedDict, assert_never, cast, final, override
 from urllib.parse import quote
 
 
@@ -51,6 +51,7 @@ else:
             return cast(object, getattr(import_module("scripts.build_queue.placement"), name))
 
     placement = _DeferredPlacement()
+from scripts.lib import process_group
 from scripts.lib import process_start as process_identity
 from scripts.mac_test.abandoned_sessions import removal_script
 from scripts.mac_test import fix_return
@@ -773,11 +774,21 @@ class CommandTimeLimit:
     seconds: float
 
 
+@dataclass(frozen=True)
+class ClaimReleaseDeadline:
+    """The monotonic deadline for the release helper and its SSH work."""
+
+    expires_at: float
+
+    def remaining(self) -> float:
+        return max(0.0, self.expires_at - time.monotonic())
+
+
 class NoCommandTimeLimit:
     """A child command allowed to run until it completes."""
 
 
-CommandDeadline = CommandTimeLimit | NoCommandTimeLimit
+CommandDeadline = CommandTimeLimit | ClaimReleaseDeadline | NoCommandTimeLimit
 NO_COMMAND_TIME_LIMIT = NoCommandTimeLimit()
 
 
@@ -790,6 +801,18 @@ class RunningProcess:
     """The child process currently owned by the runner."""
 
     process: subprocess.Popen[str] | subprocess.Popen[bytes]
+
+    def kill(self) -> None:
+        self.process.kill()
+
+
+class RunningReleaseGroup(RunningProcess):
+    """The release helper leads a process group that includes its SSH child."""
+
+    @override
+    def kill(self) -> None:
+        with suppress(ProcessLookupError):
+            process_group.send_process_group(self.process.pid, signal.SIGKILL)
 
 
 class NoClaimInterrupt:
@@ -859,7 +882,18 @@ class CleanupUnconfirmed:
     """The remote command did not report a usable cleanup status."""
 
 
-CleanupOutcome = CleanupDone | CleanupRemovedWithoutFacts | CleanupFailed | CleanupSkipped | CleanupKept | CleanupUnconfirmed
+@dataclass(frozen=True)
+class CleanupStreamTimedOut:
+    """The SSH stream remained open past the cleanup deadline."""
+
+    seconds: float
+
+    def detail(self) -> str:
+        return f"cleanup timed out after {self.seconds:g} s"
+
+
+CleanupOutcome = (CleanupDone | CleanupRemovedWithoutFacts | CleanupFailed | CleanupSkipped | CleanupKept
+                  | CleanupUnconfirmed | CleanupStreamTimedOut)
 
 
 @dataclass(frozen=True)
@@ -889,6 +923,7 @@ class MissingMacStatus:
     """The remote command ended without a usable test status."""
 
     detail: str = 'runner sent no final status'
+    cleanup: CleanupUnconfirmed | CleanupStreamTimedOut = CleanupUnconfirmed()
 
 
 @dataclass(frozen=True)
@@ -909,13 +944,6 @@ class UnresolvedSlotStartup:
 
 
 @dataclass(frozen=True)
-class CleanupStreamTimedOut:
-    """The SSH stream remained open past the cleanup deadline."""
-
-    seconds: float
-
-
-@dataclass(frozen=True)
 class CleanupAfterVerdict:
     """Start the cleanup deadline when the test sends its verdict."""
 
@@ -930,7 +958,7 @@ class CleanupOnly:
 
 
 RemoteRunStatus = (ReportedMacStatus | MacNextestSetupFailed | MissingMacStatus
-                   | UnresolvedSlotStartup | ToolVersionMismatch | MirrorBusyRefusal | CleanupStreamTimedOut)
+                   | UnresolvedSlotStartup | ToolVersionMismatch | MirrorBusyRefusal)
 MISSING_MAC_STATUS = MissingMacStatus()
 
 
@@ -1049,17 +1077,16 @@ class ProcessController:
         if not isinstance(active, RunningProcess):
             return
         process = active.process
-        if process.poll() is not None:
-            self.active = IDLE_PROCESS
-            if not isinstance(self.pending, (PendingStartOperation, PendingHanaOperation)):
-                self.pending = SettledDispatchOperations()
-            return
-        process.terminate()
-        try:
-            _ = process.wait(timeout=2)
-        except subprocess.TimeoutExpired:
-            process.kill()
+        if isinstance(active, RunningReleaseGroup):
+            active.kill()
             _ = process.wait()
+        elif process.poll() is None:
+            process.terminate()
+            try:
+                _ = process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                _ = process.wait()
         self.active = IDLE_PROCESS
         if not isinstance(self.pending, (PendingStartOperation, PendingHanaOperation)):
             self.pending = SettledDispatchOperations()
@@ -1141,25 +1168,26 @@ class ProcessController:
     ) -> CapturedCommandResult:
         if arguments[0] == "rsync":
             arguments = [*arguments[:2], "--stats", *arguments[2:]]
+        if isinstance(deadline, ClaimReleaseDeadline) and deadline.remaining() <= 0:
+            return COMMAND_TIMED_OUT
         try:
             process = subprocess.Popen(
                 arguments,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
+                start_new_session=isinstance(deadline, ClaimReleaseDeadline),
             )
         except OSError:
             return COMMAND_COULD_NOT_START
-        self.active = RunningProcess(process)
+        active = RunningReleaseGroup(process) if isinstance(deadline, ClaimReleaseDeadline) else RunningProcess(process)
+        self.active = active
         try:
             try:
-                timeout = (
-                    deadline.seconds
-                    if isinstance(deadline, CommandTimeLimit)
-                    else None
-                )
+                timeout = (deadline.remaining() if isinstance(deadline, ClaimReleaseDeadline)
+                           else deadline.seconds if isinstance(deadline, CommandTimeLimit) else None)
                 stdout, stderr = process.communicate(timeout=timeout)
             except subprocess.TimeoutExpired as error:
-                process.kill()
+                active.kill()
                 # A descendant may still hold a pipe open after the command ends.
                 for pipe in (process.stdout, process.stderr):
                     if pipe is not None:
@@ -1320,7 +1348,7 @@ class ProcessController:
             with suppress(ProcessLookupError):
                 process.kill()
             _ = process.wait()
-            status = CleanupStreamTimedOut(cleanup_limit.seconds)
+            cleanup = CleanupStreamTimedOut(cleanup_limit.seconds)
         finally:
             if process.poll() is None:
                 self.stop()
@@ -1336,8 +1364,8 @@ class ProcessController:
                 self.attempt_evidence.traffic.transfers.append({"operation": "ssh_run",
                     "sent_bytes": len(arguments[-1].encode("utf-8")),
                     "received_bytes": received_bytes, "complete": finished_output})
-        if isinstance(status, CleanupStreamTimedOut):
-            return status
+        if isinstance(cleanup, CleanupStreamTimedOut) and not isinstance(status, (ReportedMacStatus, MacNextestSetupFailed)):
+            return MissingMacStatus(cleanup.detail(), cleanup)
         if mismatch and not isinstance(status, (ReportedMacStatus, MacNextestSetupFailed)):
             return ToolVersionMismatch(mismatch)
         if isinstance(status, ReportedMacStatus):
@@ -1385,6 +1413,8 @@ def report_cleanup(cleanup: CleanupOutcome, target: str, *, path: str, free_floo
         print(f"{label} build output kept: the run used another target dir", flush=True)
     elif isinstance(cleanup, CleanupUnconfirmed):
         print(f"{label} build output cleanup unconfirmed", flush=True)
+    elif isinstance(cleanup, CleanupStreamTimedOut):
+        print(f"{label} build output {cleanup.detail()}", flush=True)
 
 
 def result_destination(path: str | None) -> ResultDestination:
@@ -1649,13 +1679,16 @@ def claim_arguments(request: OffloadRequest, config: OffloadConfig, leased_slots
 
 
 def release_claim(
-    controller: ProcessController, target: str = "", *, deadline: CommandDeadline = NO_COMMAND_TIME_LIMIT,
+    controller: ProcessController, target: str = "", *,
+    deadline: CommandTimeLimit | NoCommandTimeLimit = NO_COMMAND_TIME_LIMIT,
 ) -> ClaimReleaseConfirmed | ClaimReleaseUnconfirmed:
     if not isinstance(controller.pending, SettledDispatchOperations):
         return ClaimReleaseUnconfirmed("a claim or start operation remains pending")
     identity = controller.claim_identity
     if isinstance(identity, claim_state.NoClaimIdentity):
         return ClaimReleaseUnconfirmed("the exact claim identity is unavailable")
+    release_deadline = (ClaimReleaseDeadline(time.monotonic() + deadline.seconds)
+                        if isinstance(deadline, CommandTimeLimit) else deadline)
     result = controller.capture(
         [
             str(Path(__file__).resolve().parents[1] / "lib/py"),
@@ -1668,8 +1701,10 @@ def release_claim(
             "--attempt", identity.attempt,
             *(["--settings", str(controller.claim_settings)] if isinstance(controller.claim_settings, Path) else []),
             *(["--target", target] if target else []),
+            *(["--deadline-monotonic", str(release_deadline.expires_at)]
+              if isinstance(release_deadline, ClaimReleaseDeadline) else []),
         ],
-        deadline,
+        release_deadline,
     )
     if isinstance(result, CommandOutput):
         if result.status == 0:
@@ -2572,8 +2607,14 @@ class LeftoverObservation:
 
 
 def read_leftovers(config: SshConnectionSettings, host: str, script: str,
-                   target: str) -> LeftoverObservation:
+                   target: str, *,
+                   release_deadline: ClaimReleaseDeadline | conf.UseConfiguredValue = conf.UseConfiguredValue.CURRENT,
+                   ) -> LeftoverObservation:
     """End and count one mirror's work without exposing the check to a second signal."""
+    timeout = (release_deadline.remaining() if isinstance(release_deadline, ClaimReleaseDeadline)
+               else config.leftover_timeout_s)
+    if timeout <= 0:
+        return LeftoverObservation(LeftoverCheckFailed("the claim release deadline expired before SSH"), "")
     try:
         arguments = ["ssh", *ssh_options(config), host, script]
         result = subprocess.run(
@@ -2583,12 +2624,12 @@ def read_leftovers(config: SshConnectionSettings, host: str, script: str,
             stderr=subprocess.PIPE,
             text=True,
             check=False,
-            timeout=config.leftover_timeout_s,
+            timeout=timeout,
         )
     except subprocess.TimeoutExpired:
-        return LeftoverObservation(LeftoverCheckFailed(f"SSH leftover check timed out after {config.leftover_timeout_s:g} s"), "")
+        return LeftoverObservation(LeftoverCheckFailed(f"SSH leftover check timed out after {timeout:g} s"), "")
     except OSError:
-        return LeftoverObservation(LeftoverCheckFailed(f"SSH leftover check could not start (time limit {config.leftover_timeout_s:g} s)"), "")
+        return LeftoverObservation(LeftoverCheckFailed(f"SSH leftover check could not start (time limit {timeout:g} s)"), "")
     ledger = transfer_bytes.active_transfers.get()
     if isinstance(ledger, transfer_bytes.TransferLedger):
         ledger.observe("ssh_cleanup", arguments, result.stdout, result.stderr)
@@ -2876,9 +2917,8 @@ def claimed_run(
         arguments = [*ssh_prefix(config), command]
         remote_status = (controller.stream_mac_run(arguments, CleanupAfterVerdict(config.leftover_timeout_s))
                          if routed_mac_test else controller.stream_mac_run(arguments))
-        if isinstance(remote_status, CleanupStreamTimedOut):
-            return MacCleanupUnconfirmed(elapsed_seconds(started),
-                                         f"cleanup timed out after {remote_status.seconds:g} s")
+        if isinstance(remote_status, MissingMacStatus) and isinstance(remote_status.cleanup, CleanupStreamTimedOut):
+            return MacCleanupUnconfirmed(elapsed_seconds(started), remote_status.detail)
         if isinstance(remote_status, MirrorBusyRefusal):
             release_allowed = True
             write_mirror_busy(config, repository.name, request.target)
@@ -2912,16 +2952,15 @@ def claimed_run(
                         or (linux and remote_status.status == os.EX_TEMPFAIL))
         fetched = (fetch_folder(controller, config, request, repository)
                    if not setup_failed and isinstance(request.fetch, FetchFolder) else FetchNotRun())
-        if not linux and isinstance(remote_status, ReportedMacStatus) and isinstance(request.fetch, FetchFolder):
+        if (not linux and isinstance(remote_status, ReportedMacStatus) and isinstance(request.fetch, FetchFolder)
+                and not isinstance(remote_status.cleanup, CleanupStreamTimedOut)):
             arguments = [*ssh_prefix(config),
                 copies.remote_use_command(request_mirror(config, request, repository),
                     f"echo mac_exit={remote_status.status}; " + remote_cleanup_command(config, request, repository))]
             cleanup = (controller.stream_mac_run(arguments, CleanupOnly(config.leftover_timeout_s))
                        if routed_mac_test else controller.stream_mac_run(arguments))
-            if isinstance(cleanup, CleanupStreamTimedOut):
-                return MacCleanupUnconfirmed(elapsed_seconds(started), f"cleanup timed out after {cleanup.seconds:g} s")
-            remote_status = replace(remote_status, cleanup=(cleanup.cleanup if isinstance(cleanup, ReportedMacStatus)
-                                                          else CleanupUnconfirmed()))
+            remote_status = replace(remote_status, cleanup=(
+                cleanup.cleanup if isinstance(cleanup, (ReportedMacStatus, MissingMacStatus)) else CleanupUnconfirmed()))
         evidence.completion = "confirmed"
         report_cleanup(remote_status.cleanup, request.target,
                        path=f"~/{mirror_target(repository, request.target, request.slot)}",
@@ -2931,7 +2970,7 @@ def claimed_run(
             release_allowed = isinstance(checked, LeftoversEnded)
             observe_cleanup(evidence, checked)
             report_leftover_check(checked, request)
-        else:
+        elif not isinstance(remote_status.cleanup, CleanupStreamTimedOut):
             release_allowed = True
         sync_after_release = linux
         seconds = elapsed_seconds(started)

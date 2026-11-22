@@ -345,8 +345,19 @@ The remote claim stays available for recovery until the runner confirms cleanup.
   The reader holds a shared lock until the copy ends.
   The sweep holds an exclusive lock during removal and also checks for open files with `lsof`.
   If the log writer cannot start nextest, the runner reports a setup failure.
-- **Markers.** `stream_mac_run` holds a `mac_exit=<n>` line (n at most 255) as the result only while every later line is a `mac_cleanup=` marker; any other later line prints the held line and makes the result `MISSING_MAC_STATUS`. The held line proves a finished run whatever ssh returned. `parse_cleanup` reads the marker into `CleanupOutcome = CleanupDone | CleanupFailed(rc) | CleanupSkipped | CleanupKept | CleanupUnconfirmed`; a missing, malformed or out-of-range marker is `CleanupUnconfirmed`. `ReportedMacStatus(status, cleanup)` carries both, and the test result always comes from `status`.
-- `report_cleanup` prints `Mac build output not removed: <rc>`, `Mac build output kept: the run used another target dir` or `Mac build output cleanup unconfirmed`, and nothing for `CleanupDone` or `CleanupKept`. On `CleanupUnconfirmed`, `claimed_run` runs `check_leftovers` and releases the claim only on `LeftoversEnded`; every other outcome releases it.
+- `stream_mac_run` holds a `mac_exit=<n>` marker with a status from 0 to 255.
+  Later ordinary output invalidates the held marker.
+  A held marker supplies the test verdict even if SSH ends with an error.
+  `parse_cleanup` records a missing, malformed, or out-of-range cleanup marker as `CleanupUnconfirmed`.
+  `ReportedMacStatus` holds the verdict and the cleanup state.
+- A cleanup timeout preserves the verdict and records unconfirmed cleanup.
+  This applies to the test stream and the cleanup stream after a fetch.
+  A timeout retains the claim for recovery.
+  If a stream ends without a usable cleanup marker, `claimed_run` checks for leftovers.
+  In that case, it releases the claim only after `LeftoversEnded`.
+- When launch authorization has no confirmed reply, one deadline covers the exact release.
+  The release helper gives SSH the remaining time.
+  At the deadline, the runner stops the release helper and its local SSH process as a group.
 - SIGINT, SIGTERM, and SIGHUP stop the SSH child.
   The runner checks remote leftovers and releases its claim only after it confirms their end.
   The exit status is 128 plus the signal number.

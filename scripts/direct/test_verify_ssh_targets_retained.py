@@ -40,10 +40,13 @@ class VerifySshRetainedTests(VerifySshTargetsFixture):
     def test_lost_mac_authorization_reply_releases_the_verify_place(self) -> None:
         self.check_lost_mac("lost-authorization-reply")
 
-    def test_mac_cleanup_stream_timeout_releases_the_verify_place(self) -> None:
-        self.check_lost_mac("cleanup-stream-timeout")
+    def test_mac_cleanup_stream_timeout_preserves_the_failed_verdict(self) -> None:
+        self.check_lost_mac("cleanup-stream-timeout", status=42)
 
-    def check_lost_mac(self, mode: str) -> None:
+    def test_mac_post_fetch_cleanup_timeout_preserves_the_failed_verdict(self) -> None:
+        self.check_lost_mac("post-fetch-cleanup-timeout", status=42)
+
+    def check_lost_mac(self, mode: str, *, status: int = 2) -> None:
         self.configure("natedev,mac")
         self.enable_mac()
         settings = self.root / "mac_test.conf"
@@ -72,20 +75,29 @@ class VerifySshRetainedTests(VerifySshTargetsFixture):
                 if process.poll() is None:
                     self.stop_verify(process)
 
-        self.assertEqual(process.returncode, 2, output + errors)
-        self.assertIn("the Mac does not answer; stop and submit again", errors)
+        self.assertEqual(process.returncode, status, output + errors)
+        if status == 2:
+            self.assertIn("the Mac does not answer; stop and submit again", errors)
+        else:
+            self.assertIn("cleanup timed out after 1 s", output)
+            self.assertNotIn("the Mac does not answer; stop and submit again", errors)
         self.assertEqual(slots_during_authorization, [process.pid])
         self.assertEqual(self.local_runs(), [])
         if mode == "missing-result-after-authorization":
             self.assertEqual(self.attempts(), [])
         else:
             attempt, = self.attempts()
-            self.assertEqual((attempt["outcome"], attempt["cleanup"]), ("lost", "unconfirmed"))
+            expected = ("lost", "missing") if status == 2 else ("failed", "confirmed")
+            self.assertEqual((attempt["outcome"], attempt["completion"]), expected)
+            self.assertEqual(attempt["cleanup"], "unconfirmed")
+        if mode == "post-fetch-cleanup-timeout":
+            event, = self.ssh_events()
+            self.assertEqual(event["actions"][-3:], ["run", "fetch", "run"])
         controls = caller_provider_controls(self, self.admission)
         claim, = controls.claims("mac")
         identity = claim_state.claim_identity(claim.record)
         journal = controls.claim_paths("mac").directory / "pending-starts" / offload.pending_start_key(identity)
-        self.assertTrue(journal.is_file())
+        self.assertEqual(journal.is_file(), mode != "post-fetch-cleanup-timeout")
 
         _ = self.admission.run_pass()
         with self.admission.loop_turn():

@@ -369,6 +369,56 @@ class RunnerCompletionTests(unittest.TestCase):
             process.wait.assert_called_once_with()
             self.assertFalse(controller.attempt_evidence.traffic.transfers[0]["complete"])
 
+    def test_release_deadline_stops_the_helpers_ssh_child(self) -> None:
+        ssh = """
+import socket
+import sys
+
+with socket.socket(fileno=int(sys.argv[1])) as peer:
+    peer.sendall(b"+")
+    peer.recv(1)
+"""
+        helper = """
+import subprocess
+import sys
+
+fd = int(sys.argv[1])
+subprocess.run([sys.executable, "-I", "-S", "-c", sys.argv[2], str(fd)], pass_fds=(fd,), check=True)
+"""
+        controller = offload.ProcessController()
+        identity = claim_state.ClaimIdentity("fixture-claim", "fixture-episode", "fixture-attempt")
+        controller.claim_identity = identity
+        reader, sender = socket.socketpair()
+        with reader, sender:
+            reader.settimeout(TEST_HANG_GUARD_SECS)
+
+            def start(arguments: Sequence[str], *, stdout: int, stderr: int,
+                      start_new_session: bool = False) -> subprocess.Popen[bytes]:
+                self.assertEqual(arguments[2], "release")
+                descriptor = sender.fileno()
+                process = START_SUBPROCESS([sys.executable, "-I", "-S", "-c", helper, str(descriptor), ssh],
+                                            stdout=stdout, stderr=stderr, pass_fds=(descriptor,),
+                                            start_new_session=start_new_session)
+                sender.close()
+                try:
+                    self.assertEqual(reader.recv(1), b"+")
+                except BaseException:
+                    process.kill()
+                    _ = process.wait()
+                    raise
+                return process
+
+            with mock.patch.object(subprocess, "Popen", side_effect=start):
+                result = offload.release_claim(controller, deadline=offload.CommandTimeLimit(1))
+
+            self.assertIsInstance(result, offload.ClaimReleaseUnconfirmed)
+            self.assertEqual(controller.claim_identity, identity)
+            reader.settimeout(1)
+            try:
+                self.assertEqual(reader.recv(1), b"")
+            except TimeoutError:
+                self.fail("The SSH child survived the claim release deadline")
+
     def test_split_utf8_tail_preserves_status_and_counts_raw_bytes(self) -> None:
         wire = b"mac_test: tail fragment: \xa9\nmac_exit=42\nmac_cleanup=kept\n"
         process = mock.Mock(stdout=io.BytesIO(wire), wait=mock.Mock(return_value=0))
