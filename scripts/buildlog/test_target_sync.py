@@ -362,6 +362,11 @@ class TargetSyncTests(unittest.TestCase):
 
     def test_vault_transport_selects_connect_timeout_by_destination_host(self) -> None:
         commands: list[list[str]] = []
+        vault = self.registry.parent / "vault"
+        common_dir = vault / ".git"
+        common_dir.mkdir(parents=True)
+        lookup_command = ["git", "-C", str(vault), "rev-parse", "--path-format=absolute", "--git-common-dir"]
+        lookup_result = subprocess.CompletedProcess(lookup_command, 0, f"{common_dir}\n", "")
 
         def reply(argv: list[str], timeout: float) -> subprocess.CompletedProcess[str]:
             self.assertEqual(timeout, vault_pull.COMMAND_TIMEOUT_S)
@@ -376,8 +381,12 @@ class TargetSyncTests(unittest.TestCase):
                 commands.clear()
                 _ = self.registry.write_text(settings.replace(
                     "sync.connect_timeout_s=3", f"sync.connect_timeout_s={timeout}"))
-                with mock.patch.object(vault_pull, "run", side_effect=reply), mock.patch.object(ci, "warm", return_value=True):
+                with (mock.patch.object(vault_pull, "LOCAL_VAULT", vault),
+                      mock.patch.object(subprocess, "run", return_value=lookup_result) as lookup,
+                      mock.patch.object(vault_pull, "run", side_effect=reply),
+                      mock.patch.object(ci, "warm", return_value=True)):
                     self.assertIsInstance(vault_pull.pull(), vault_pull.Current)
+                lookup.assert_called_once_with(lookup_command, capture_output=True, text=True, check=False)
                 self.assertEqual([argv[0] for argv in commands], ["git", "ssh", "git"])
                 for argv in commands:
                     if host == "spare-build":

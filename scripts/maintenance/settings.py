@@ -18,13 +18,20 @@ class Part(str, Enum):
     WATCHDOG = "watchdog"
     LOGINS = "logins"
     PRUNE = "prune"
+    FOLDER_SIZE = "folder_size"
     VAULT = "vault"
+    VAULT_SAVE = "vault_save"
 
 
 @dataclass(frozen=True)
 class Schedule:
     interval_seconds: float
     timeout_seconds: float
+
+
+@dataclass(frozen=True)
+class InvalidPartSchedule:
+    reason: str
 
 
 @dataclass(frozen=True)
@@ -36,7 +43,7 @@ class UsageIntervals:
 @dataclass(frozen=True)
 class Settings:
     job: Schedule
-    parts: dict[Part, Schedule]
+    parts: dict[Part, Schedule | InvalidPartSchedule]
     vault_git_seconds: float
     vault_named_paths: int
     dispatch_seconds: float
@@ -63,6 +70,16 @@ def schedule(value: object) -> Schedule:
     return Schedule(positive(values, "interval_seconds"), positive(values, "timeout_seconds"))
 
 
+def part_schedule(part: Part, value: object) -> Schedule | InvalidPartSchedule:
+    try:
+        cadence = schedule(value)
+        if part is Part.VAULT_SAVE and not 60 <= cadence.interval_seconds <= 3600:
+            raise ValueError("parts.vault_save.interval_seconds must be from 60 through 3600")
+        return cadence
+    except (ValueError, OverflowError) as error:
+        return InvalidPartSchedule(f"Invalid [parts.{part.value}] schedule. {error}")
+
+
 def configuration_path() -> Path:
     return Path(os.environ.get("AGENT_NOTES_JOB_CONFIG", str(Path(__file__).resolve().parents[2] / "config/agent_notes.toml")))
 
@@ -85,12 +102,12 @@ def usage_only_intervals() -> UsageIntervals:
 
 def settings() -> Settings:
     values = configuration()
-    parts = table(values.get("parts"))
+    parts = table(values.get("parts", {}))
     vault = table(values.get("vault"))
     named = vault.get("named_paths")
     if isinstance(named, bool) or not isinstance(named, int) or named <= 0:
         raise ValueError("agent-notes config: named_paths must be a positive integer")
-    return Settings(schedule(values.get("job")), {part: schedule(parts.get(part.value)) for part in Part},
+    return Settings(schedule(values.get("job")), {part: part_schedule(part, parts.get(part.value)) for part in Part},
                     positive(vault, "git_seconds"), named, positive(table(values.get("watchdog")), "dispatch_seconds"),
                     positive(table(values.get("watchdog")), "recovery_seconds"),
                     positive(table(values.get("watchdog")), "pass_dispatch_seconds"),

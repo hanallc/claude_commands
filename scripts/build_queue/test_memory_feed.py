@@ -2509,6 +2509,40 @@ process.stdout.write(JSON.stringify({
                 self.assertEqual(row.get("mac_text"), "")
                 self.assertEqual(row.get("because"), reason.removeprefix("it ") if reason else "direct cargo command")
 
+    def test_verify_wait_at_the_natedev_limit_keeps_its_mac_route(self) -> None:
+        from scripts.build_queue.test_placement import PlacementFixture, local_candidate, placement_request, publish_candidate
+        from scripts.mac_test import eligibility
+
+        with PlacementFixture() as fixture:
+            fixture.configure(slot_gap_seconds=60)
+            config = fixture.root / "build_admission.conf"
+            _ = config.write_text(config.read_text() + f"\nmax_runs.{fixture.server.host}.fixture=0\nmax_runs.exempt_unit=natemerge\n")
+            _ = fixture.run_pass()
+            fixture.clock.advance(1)
+            step = placement_request(fixture)
+            _ = publish_candidate(fixture, step, placement.TemporaryExclusion("busy"))
+            request = replace(step,
+                identity=replace(step.identity, verify=admission_records.VerifyCall("test", "verify test", 1, 1)),
+                constraints=replace(step.constraints, candidates=(local_candidate(fixture), *step.constraints.candidates)))
+            reply, = fixture.connect(request).replies()
+            assert isinstance(reply, wire.PlacementWait) and isinstance(reply.wait, wire.Wait), reply
+            reason = reply.wait.reason
+            self.assertEqual(reason.cause if isinstance(reason, admission_records.HeadAdmissionStatus) else reason,
+                             admission_records.RunLimitWait(0, 0, "fixture", fixture.server.host))
+            view, = fixture.connect(wire.ViewRequest()).replies()
+            assert isinstance(view, wire.ViewReply)
+            job = targets.RunningJob("nextest fixture", datetime.now(UTC), targets.NotSeenIdle())
+            snapshots = (snapshot(MAC, targets.Running((job,))), snapshot(NATEDEV, targets.Free()))
+            with (mock.patch.object(admission_client, "view", return_value=view.reading),
+                  mock.patch.object(target_availability, "read_snapshots", return_value=snapshots),
+                  mock.patch.object(build_targets, "step_policy",
+                                    return_value=eligibility.KnownRepository("fixture", str(fixture.root)))):
+                page = memory_feed.reading()
+            row, = page["waiters"]
+            self.assertEqual(row["pid"], request.owner.pid)
+            self.assertEqual(row.get("runs_on"), "natedev or Mac")
+            self.assertEqual(row.get("targets"), ["natedev", "mac"])
+
     def verify_call_page(self) -> memory_feed.MemoryPage:
         """Read the verify facts from admissions through the private service socket."""
         with AdmissionFixture() as fixture:
@@ -4259,6 +4293,43 @@ process.stdout.write(JSON.stringify({
             text = memory_feed.report_file(memory_feed.report_reading(7)).text
         self.assertIn("2026-11-05", text)
         self.assertIn("2026-11-08", text)
+
+    def test_move_identity_uses_the_wait_owner_and_keeps_the_service_revision(self) -> None:
+        base = with_wait_reason(captured_reading(), admission_records.NeedsMemory())
+        step, = base.view.waiting
+        step = replace(step, run=LiveBuildRun(900, "run-start", 1))
+        member = admission_records.QueueMoveMember("fixture-wait")
+        line = admission_records.QueueMoveLine("fixture-revision", (member,))
+        row = gate.rank_waiter({"pid": step.pid, "since": step.since, "start_time": "wait-start",
+                               "need": step.need, "move_id": member.row_id}, admission_records.NormalOrder())
+        reading = replace(base, view=replace(base.view, waiting=(step,), move_line=line),
+                          ordered=[(self.root / "fixture", row)])
+        with mock.patch.object(admission_client, "view", return_value=reading):
+            payload = memory_feed.reading()
+        rows = cast(list[dict[str, object]], payload["waiters"])
+        self.assertEqual(payload.get("move_revision"), line.revision)
+        self.assertEqual(rows[0].get("move"), member)
+        self.assertEqual(rows[0]["pid"], 900)
+
+        unnamed = replace(step, pid=201, step="", folder="", project="", run=NoLiveBuildRun())
+        unnamed_member = admission_records.QueueMoveMember("unnamed-wait")
+        unnamed_row = gate.rank_waiter({"pid": 201, "since": unnamed.since, "start_time": "unnamed-start",
+            "need": unnamed.need, "move_id": unnamed_member.row_id}, admission_records.NormalOrder())
+        complete = replace(line, members=(unnamed_member, *line.members))
+        with mock.patch.object(admission_client, "view", return_value=replace(reading,
+                               view=replace(reading.view, waiting=(unnamed, step), move_line=complete),
+                               ordered=[(self.root / "unnamed", unnamed_row), *reading.ordered])):
+            named = memory_feed.reading()
+        self.assertEqual(named.get("move_revision"), line.revision)
+        shown, = named["waiters"]
+        self.assertEqual(shown["name"], rows[0]["name"])
+        self.assertEqual(shown.get("move"), member)
+
+        incomplete = replace(line, members=(*line.members, admission_records.QueueMoveMember("new-wait")))
+        with mock.patch.object(admission_client, "view",
+                               return_value=replace(reading, view=replace(reading.view, move_line=incomplete))):
+            stale = memory_feed.reading()
+        self.assertNotIn("move_revision", stale)
 
     def test_the_json_boundary_preserves_named_missing_states(self) -> None:
         with mock.patch.object(admission_client, "view", return_value=captured_reading()):

@@ -23,7 +23,7 @@ from scripts.build_queue import admission_client, admission_records, admission_w
 from scripts.build_queue import queue_place
 from scripts.build_queue import test_placement as placement_fixture
 from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, GateJobNotRecorded, StepJob
-from scripts.build_targets import mac_linux
+from scripts.build_targets import mac_linux, target_config
 from scripts.buildlog.store import host_name
 from scripts.direct.wait_for_test_state import wait_for_file, wait_until
 from scripts.lib import conf, process_group
@@ -459,7 +459,7 @@ class MacGateSuitesTests(GateSuitesFixture):
         self.set_placement_status(assignment, placement.CurrentAssignment())
         for reason in ("mac-linux: fixture guest unavailable",
                        "mac-linux: guest unreachable: fixture-guest did not confirm the run ended "
-                       + f"within 2 seconds ({mac_linux.UNREACHABLE_WAIT_KEY})"):
+                       + f"within 2 seconds ({target_config.UNREACHABLE_WAIT_KEY})"):
             with (self.subTest(reason=reason), mock.patch.dict(os.environ, {"BUILDLOG_PLACEMENT_FILE": str(path)}),
                   mock.patch.object(mac_linux, "route", return_value=reason) as guest,
                   mock.patch.object(gate, "run_suites") as local, redirect_stderr(io.StringIO()) as errors):
