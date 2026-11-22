@@ -673,7 +673,7 @@ The admission, scheduling caches, and rerun rules below apply to `SharedMachine`
   `config/gate.conf` sets the factor to 5.0 and the floor to 120 seconds.
   A module without passing history uses the default limit of 1800 seconds.
   The merge gate uses this limit for module reruns, and an explicit `--full` run keeps the default.
-  Initial jobs and nightly runs use the default module limit.
+  Initial jobs of a full, affected or nightly run use the default module limit; a named module run uses the measured limit from its first job.
   An explicit `--module-time-limit-s` applies to every attempt.
   The stop message gives the limit and its source.
   A pass replaces the first failure and prints `Rerun alone: <suite>/<module> passed (first run exit N, X s)`.

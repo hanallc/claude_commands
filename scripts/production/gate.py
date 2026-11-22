@@ -3015,7 +3015,7 @@ def nightly(args: GateArguments) -> int:
 def add_suite_arguments(parser: argparse.ArgumentParser) -> None:
     _ = parser.add_argument("--repo", "--checkout", default=str(Path.cwd()))
     _ = parser.add_argument("--module-time-limit-s", type=float, default=None,
-                            help="set the time limit in seconds for every module (default for the first run: 1800)")
+                            help="set the time limit in seconds for every module (default: 1800 for a first run, measured for a --module run)")
     _ = parser.add_argument("--full", action="store_true", help="run all test modules even with a certified base")
     _ = parser.add_argument("--module", action="append", default=[], dest="modules",
                             help="run only this suite/module with shared admission or the parent's reservation")
