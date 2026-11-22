@@ -270,6 +270,9 @@ def submit(root: Path, body: str, status: change_page.DeliveryStatus
     if not secrets.compare_digest(fields["token"][0].encode(), expected.encode()):
         raise question_record.AnswerRefused("the image token does not match this page")
     action = fields.get("action", ["delete"])[0]
+    if action == "not approved":
+        # A card loaded before I21 can still show the removed button.
+        raise question_record.AnswerRefused("Not Approved was removed. Use Send Feedback.")
     if action not in ACTIONS:
         raise question_record.AnswerRefused("use the form on this page")
     if action == 'question':

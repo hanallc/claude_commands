@@ -33,7 +33,7 @@ Check the light mode and phone width yourself when the change needs them.
 
 The page shows the oldest image first, and a new image goes to the end.
 The user answers on an image or pair with **Approved** or **Send Feedback**, and both can carry feedback.
-**Send Feedback** means the image is not approved; its message starts with `your image is not approved.`
+**Send Feedback** means the image is not approved; the first line of its message ends with `your image is not approved. The feedback follows.`
 The answer arrives as a message that starts `From the user (via the Images page):`.
 Act on it as on the user's words. Then delete the image with the command in the message.
 Answer **Ask question** with `~/.claude/scripts/lib/py ~/.claude/scripts/review_links/images.py answer --id <image> --question Q<n> --text "<answer>"`; keep the image for the user.

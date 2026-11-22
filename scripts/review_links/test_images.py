@@ -580,7 +580,7 @@ class ImagesTests(ImagesFixture):
                 ("approved", "your image is approved.", "  The counts are right. ", ("Feedback: The counts are right.",)),
                 ("feedback", "your image is not approved. The feedback follows.", "  The counts are wrong. ",
                  ("Feedback: The counts are wrong.",))):
-            with self.subTest(action=action):
+            with self.subTest(action=action, feedback=feedback):
                 self.sent.clear()
                 record = self.register("After: the panel.")
                 self.submit(self.feedback_body(record, feedback, action))
@@ -592,6 +592,13 @@ class ImagesTests(ImagesFixture):
                     + f"~/.claude/scripts/lib/py ~/.claude/scripts/review_links/images.py delete --id {record['id']}"))])
                 self.assertIn("feedback_at", image_store.read_record(self.root / image_store.IMAGES_FOLDER / record["id"]))
                 self.assertNotIn(record["id"], images.render(self.status).decode())
+
+    def test_a_card_from_before_i21_that_posts_not_approved_gets_a_clear_refusal(self) -> None:
+        record = self.register()
+        with self.assertRaisesRegex(question_record.AnswerRefused, "^Not Approved was removed. Use Send Feedback.$"):
+            self.submit(self.feedback_body(record, "", "not approved"))
+        self.assertEqual(self.sent, [])
+        self.assertIn(record["id"], images.render(self.status).decode())
 
     def test_feedback_goes_to_the_owner_session_and_hides_the_image_but_keeps_it(self) -> None:
         record = self.register("After: the panel. Look at the counts.")
