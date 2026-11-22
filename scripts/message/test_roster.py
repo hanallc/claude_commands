@@ -1150,7 +1150,7 @@ class RosterTests(unittest.TestCase):
                 self.assertEqual(recipient.reach, roster.Messageable(f"session:{native}"))
                 route = send.resolve_recipient(f"session:{native}", send.LocalOnly(), observed,
                                                membership=membership)
-                self.assertEqual(route, send.ClaudeRecipient(f"session:{native}"))
+                self.assertEqual(route, send.PaneWorkerRecipient(child))
                 self.assertEqual(send.resolve_recipient(child.name, send.LocalOnly(), observed,
                                                         membership=membership), send.PaneWorkerRecipient(child))
                 self.assertTrue(broadcast.selects(broadcast.Workers(), recipient))

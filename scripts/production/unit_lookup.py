@@ -628,9 +628,12 @@ def _unproved_pane(place: HerdrPlace, processes: list[herdr.HerdrProcess], claud
     if registry_problem and agent is not None:
         _ = session_staff.collect_anomaly(f"pid {agent.pid} in {place_text(place)}: {registry_problem}",
                                           pid=agent.pid, check_identity=False)
+    exited_pid = herdr.exited_process_pid(reason)
+    process_exit = (session_staff.NoPaneProcessExit() if exited_pid is None
+                    else session_staff.PaneProcessExited(exited_pid))
     return LabeledSession("", ClaudeUnknown(registry_problem or reason), place, process,
                           session_staff.UnprovedPaneIdentity(frozenset(candidates)),
-                          exited_pid=herdr.exited_process_pid(reason))
+                          process_exit=process_exit)
 
 
 @dataclass(frozen=True)
@@ -874,9 +877,13 @@ class ClaudeArgvUnavailable(UnknownUnit):
     place: HerdrPlace
 
 
+class NoRegistryRefresh(Enum):
+    UNCHANGED = "the lookup did not refresh the registry"
+
+
 class ConversationLookup(NamedTuple):
     owner: UnitOwner
-    refreshed_registry: sessions.RegistryRead | None = None
+    refreshed_registry: sessions.RegistryRead | NoRegistryRefresh = NoRegistryRefresh.UNCHANGED
 
 
 def checked_conversation(identity: str, *, record: staff.StaffSnapshot | None = None,
@@ -896,12 +903,12 @@ def lookup_conversation(identity: str, *, record: staff.StaffSnapshot | None = N
                 return observed_session_labels(record=record)
             return observed_session_labels(record=record, registry=snapshot, probe_address=probe_address)
 
-    refreshed = None
+    refreshed: sessions.RegistryRead | NoRegistryRefresh = NoRegistryRefresh.UNCHANGED
     try:
         observed = observe(registry)
         checked = observed.checked_conversation(identity)
         if not isinstance(checked, ProvedLiveUnit) and any(
-                pane.exited_pid is not None for pane in observed.labels):
+                isinstance(pane.process_exit, session_staff.PaneProcessExited) for pane in observed.labels):
             refreshed = sessions.read_registry()
             observed = observe(refreshed)
             checked = observed.checked_conversation(identity)

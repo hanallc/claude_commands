@@ -224,6 +224,11 @@ def reply_ends_dispatch(reply: str, dispatch_id: str) -> bool:
     return bool(lines and lines[-1] in (marker, marker + "."))
 
 
+def transcript_user_lines(entry: str) -> list[str]:
+    """Read whole lines from a user entry."""
+    return entry.removeprefix("user:\n").splitlines() if entry.startswith("user:\n") else []
+
+
 def transcript_entry(fields: dict[str, object], changed: set[str]) -> str:
     if isinstance(fields.get("message"), dict) and fields.get("type") not in ("user", "assistant"):
         return ""

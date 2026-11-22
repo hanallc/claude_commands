@@ -44,14 +44,15 @@ class UnitReferenceTests(StaffTestCase):
         for reason, count in ((herdr.process_exit_reason(42), 2), ("pid 42: process start is unavailable", 1)):
             pane = unit_lookup.LabeledSession("", ClaudeUnknown(reason), place,
                 identity=session_staff.UnprovedPaneIdentity(frozenset({"recipient"})),
-                exited_pid=42 if count == 2 else None)
+                process_exit=session_staff.PaneProcessExited(42) if count == 2 else session_staff.NoPaneProcessExit())
             observed = session_staff.SessionLabelObservations((pane,))
             with (self.subTest(reason=reason),
                   mock.patch.object(unit_lookup, "observed_session_labels", return_value=observed) as observe,
                   mock.patch.object(sessions, "read_registry", return_value=fresh) as refresh):
                 result = unit_lookup.lookup_conversation("recipient", registry=first, probe_address=False)
                 self.assertEqual(result.owner, unit_lookup.UnknownUnit(reason))
-                self.assertIs(result.refreshed_registry, fresh if count == 2 else None)
+                self.assertIs(result.refreshed_registry,
+                              fresh if count == 2 else unit_lookup.NoRegistryRefresh.UNCHANGED)
                 self.assertEqual(observe.call_count, count)
                 self.assertEqual(refresh.call_count, count - 1)
                 used = cast(sessions.RegistryRead, observe.call_args.kwargs["registry"])

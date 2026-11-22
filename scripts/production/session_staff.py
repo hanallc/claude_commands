@@ -817,6 +817,16 @@ type OwnerGeneration = ProvedProcessGeneration | NoProvedProcessGeneration
 
 
 @dataclass(frozen=True)
+class PaneProcessExited:
+    pid: int
+
+
+@dataclass(frozen=True)
+class NoPaneProcessExit:
+    """The pane observation carries no confirmed process exit."""
+
+
+@dataclass(frozen=True)
 class LabeledSession:
     unit: str
     claude: Claude
@@ -825,7 +835,7 @@ class LabeledSession:
     identity: LiveSession | StoredReference | NoSession | UnprovedPaneIdentity = NO_SESSION
     empty: herdr.ObservedEmpty | ShellNotObserved = ShellNotObserved()
     generation: OwnerGeneration = field(default=NoProvedProcessGeneration(), compare=False, repr=False)
-    exited_pid: int | None = field(default=None, compare=False, repr=False)
+    process_exit: PaneProcessExited | NoPaneProcessExit = field(default=NoPaneProcessExit(), compare=False, repr=False)
 
 
 def place_text(place: Place) -> str:

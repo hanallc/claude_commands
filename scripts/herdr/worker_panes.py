@@ -22,7 +22,7 @@ import sys
 import time
 from threading import Event
 from collections.abc import Callable, Generator, Mapping, Sequence
-from contextlib import ExitStack, contextmanager, redirect_stderr
+from contextlib import AbstractContextManager, ExitStack, contextmanager, redirect_stderr
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from enum import Enum, IntEnum
@@ -558,18 +558,65 @@ class WorkerNotObserved(Enum):
     CURRENT = "the worker has no observation"
 
 
-def observe_selected(parent: StaffId, record: staff.StaffSnapshot, names: Sequence[WorkerName]) -> list[WorkerPane]:
+class SharedServer(Enum):
+    CONFIGURED = "use the configured shared Herdr server"
+
+
+@dataclass(frozen=True)
+class ObservedServer:
+    client: herdr.Herdr
+
+
+@dataclass(frozen=True)
+class WorkerAnswerRefused:
+    reason: str
+    code: ExitCode = ExitCode.REFUSED
+
+    def detail(self, name: str) -> str:
+        return f"{name}: {self.reason}. Use assign.sh for new work."
+
+
+@dataclass(frozen=True)
+class WorkerAnswer:
+    worker: OpenWorker
+    backend: staff.ClaudeBackend | staff.CodexBackend
+    text: str
+
+
+@dataclass(frozen=True)
+class ExpectedWorker:
+    row: staff.StaffRow
+
+
+class WorkerAnswerService(Protocol):
+    def worker_answer(self, parent: StaffId, name: WorkerName, text: str, *,
+                      identity: ExpectedWorker, server: SharedServer | ObservedServer
+                      ) -> AbstractContextManager[WorkerAnswer | WorkerAnswerRefused]: ...
+
+
+def answer_for_message(parent: StaffId, row: staff.StaffRow, text: str, *,
+                       server: SharedServer | ObservedServer
+                       ) -> AbstractContextManager[WorkerAnswer | WorkerAnswerRefused]:
+    """Check the worker's active pass before sending a message."""
+    service = cast(WorkerAnswerService, cast(object, import_module("scripts.production.worker")))
+    return service.worker_answer(parent, WorkerName.parse(row.name), text, identity=ExpectedWorker(row), server=server)
+
+
+def observe_selected(parent: StaffId, record: staff.StaffSnapshot, names: Sequence[WorkerName], *,
+                     server: SharedServer | ObservedServer = SharedServer.CONFIGURED) -> list[WorkerPane]:
     """Judge the requested rows from one complete identity scan."""
     selection = SelectedWorkers(frozenset(name.value for name in names))
-    return _evidence(parent, record, _client(), selection=selection).states
+    client = server.client if isinstance(server, ObservedServer) else _client()
+    return _evidence(parent, record, client, selection=selection).states
 
 
-def observe_worker(parent: StaffId, row: staff.StaffRow, record: staff.StaffSnapshot) -> WorkerPane | WorkerNotObserved:
+def observe_worker(parent: StaffId, row: staff.StaffRow, record: staff.StaffSnapshot, *,
+                   server: SharedServer | ObservedServer = SharedServer.CONFIGURED) -> WorkerPane | WorkerNotObserved:
     """Read all pane identities and judge the selected worker."""
     current = record.by_id(row.id)
     if current is None:
         return WorkerNotObserved.CURRENT
-    states = observe_selected(parent, record, [WorkerName.parse(current.name)])
+    states = observe_selected(parent, record, [WorkerName.parse(current.name)], server=server)
     return next((state for state in states if state.row.id == current.id), WorkerNotObserved.CURRENT)
 
 
