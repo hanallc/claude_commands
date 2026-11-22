@@ -7,6 +7,7 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime
+from enum import StrEnum
 import fcntl
 import json
 from pathlib import Path
@@ -473,8 +474,8 @@ def read_claims(paths: StatePaths) -> tuple[HeldClaim, ...]:
 
     Each claims/<repo>.json file holds one repository claim.
     The run.json file holds a claim without a repository name or an older claim.
-    An older claim uses its worktree to select its repository scope.
-    A worktree outside a repository gives the claim the whole Mac scope.
+    An older claim uses its absolute worktree to select its repository scope.
+    A relative worktree or a worktree outside a repository gives the claim the whole Mac scope.
     """
     held: list[HeldClaim] = []
     for path in claim_files(paths):
@@ -486,8 +487,11 @@ def read_claims(paths: StatePaths) -> tuple[HeldClaim, ...]:
             continue
         if "repo_name" in record:
             scope: ClaimScope = RepositoryScope(record["repo_name"], record.get("repo_key", ""), record.get("slot", 0))
+        elif path == paths.run:
+            worktree = record["worktree"]
+            scope = target_claim_scope(paths, worktree) if Path(worktree).is_absolute() else WHOLE_MAC
         else:
-            scope = target_claim_scope(paths, record["worktree"]) if path == paths.run else RepositoryScope(path.stem)
+            scope = RepositoryScope(path.stem)
         held.append(HeldClaim(scope, path, record))
     return tuple(sorted(held, key=lambda claim: datetime.fromisoformat(claim.record["since"])))
 
@@ -515,3 +519,36 @@ pending_hold_events: ContextVar[tuple[MacBlockEvent, ...]] = ContextVar("pending
 
 
 coordination_depth: ContextVar[int] = ContextVar("coordination_depth", default=0)
+
+
+def claim_worktree_path(worktree: str) -> Path:
+    """Resolve a worktree path supplied by a claim caller."""
+    return Path(worktree).resolve()
+
+
+def recorded_worktree_matches(saved: str, worktree: Path) -> bool:
+    """Compare an absolute saved path with a resolved caller path."""
+    return Path(saved).is_absolute() and claim_worktree_path(saved) == worktree
+
+
+WAIT_CLAIM_CHECK_PREFIX = "cannot adopt the Mac claim: "
+
+
+class WaitClaimCheck(StrEnum):
+    RUNNER_START = "runner pid start"
+    NO_RESERVATION = "no reservation"
+    RESERVATION_COUNT = "reservation count"
+    SCOPE = "scope"
+    PID = "pid"
+    IDENTITY = "identity"
+    SESSION = "submitting session"
+    REMOTE_HOST = "remote host"
+    OWNER_START = "proc_start"
+    WORKTREE = "worktree"
+    REMOTE_MISSING = "remote missing"
+    BLOCK_STATE = "block state"
+    LEASED_SLOT = "leased slot"
+
+    @property
+    def diagnostic(self) -> str:
+        return WAIT_CLAIM_CHECK_PREFIX + self.value

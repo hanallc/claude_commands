@@ -8,7 +8,7 @@ except FileNotFoundError:
     pass
 
 import argparse
-from collections.abc import Generator
+from collections.abc import Callable, Generator
 from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -33,6 +33,9 @@ from scripts.build_hold.owning_session import NoOwningSession, OwningSession
 from scripts.build_hold import override_guard
 from scripts.mac_test import claim_state
 from scripts.mac_test.claim_state import (
+    WaitClaimCheck,
+    claim_worktree_path,
+    recorded_worktree_matches,
     CiSwitch as CiSwitch,
     NoMacBlock as NoMacBlock,
     RecordedSession as RecordedSession,
@@ -739,16 +742,16 @@ def preferred_slots(paths: StatePaths, scope: RepositoryScope, worktree: str, ca
     affinity = read_json_object(affinity_path(paths, scope)) or {}
     if any(type(slot) is not int or slot < 1 for slot in affinity.values()):
         raise StateReadError("invalid repository slot affinity")
-    preferred = affinity.get(str(Path(worktree).resolve()))
+    preferred = affinity.get(str(claim_worktree_path(worktree)))
     slots = tuple(range(1, capacity + 1))
     return (cast(int, preferred), *(slot for slot in slots if slot != preferred)) if preferred in slots else slots
 
 
 def remember_slot(paths: StatePaths, scope: RepositoryScope, record: RunRecord) -> None:
     path = affinity_path(paths, scope)
-    affinity = {worktree: slot for worktree, slot in (read_json_object(path) or {}).items()
-                if Path(worktree).exists()}
-    affinity[str(Path(record["worktree"]).resolve())] = scope.slot
+    affinity = {str(claim_worktree_path(worktree)): slot for worktree, slot in (read_json_object(path) or {}).items()
+                if Path(worktree).is_absolute() and Path(worktree).exists()}
+    affinity[str(claim_worktree_path(record["worktree"]))] = scope.slot
     path.parent.mkdir(parents=True, exist_ok=True)
     write_json(path, affinity)
 
@@ -1839,6 +1842,7 @@ def print_claim_identity(args: CliArguments, record: RunRecord) -> None:
 
 def take_over_kept_claim(args: CliArguments, claim: HeldClaim, kept: RemoteJobClaim,
                          *, session: SubmittingSession) -> ClaimAttempt:
+    """Transfer cleanup ownership without granting permission to run."""
     proc_start = process_identity.process_start(args.pid)
     if not isinstance(proc_start, process_identity.Started):
         print(f"cannot claim: process {args.pid} is not running", file=sys.stderr)
@@ -1847,6 +1851,9 @@ def take_over_kept_claim(args: CliArguments, claim: HeldClaim, kept: RemoteJobCl
     kept["proc_start"] = proc_start.start
     kept["submitting_session"] = claim_state.session_id(session)
     kept["cleanup_pending"] = True
+    worktree = kept["worktree"]
+    if Path(worktree).is_absolute():
+        kept["worktree"] = str(claim_worktree_path(worktree))
     if args.copy:
         kept["copy"] = True
     else:
@@ -1895,7 +1902,7 @@ def claim_once(args: CliArguments, paths: StatePaths, scope: ClaimScope,
             print(f"state unreadable: {error}")
             return ClaimFinished(12)
         for claim in overlapping:
-            if (claim.record["pid"] == args.pid and claim.record["worktree"] == args.worktree
+            if (claim.record["pid"] == args.pid and recorded_worktree_matches(claim.record["worktree"], Path(args.worktree))
                     and claim_state.claim_identity(claim.record) == identity
                     and not run_is_kept(claim.record) and "slot" in claim.record
                     and (not args.leased_slots or claim.record["slot"] in args.leased_slots)
@@ -1989,34 +1996,52 @@ def stop_copy(holder: RunRecord) -> None:
         pass
 
 
+def refuse_wait_claim(check: WaitClaimCheck, *, status: Literal[11, 12] = 12) -> ClaimFinished:
+    print(check.diagnostic, file=sys.stderr)
+    return ClaimFinished(status)
+
+
 def adopt_wait_claim(args: CliArguments, paths: StatePaths, scope: ClaimScope,
                      *, session: SubmittingSession) -> ClaimAttempt:
     """Transfer a live reservation under the target lock without releasing capacity."""
     start = process_identity.process_start(args.pid)
     if not isinstance(start, process_identity.Started):
-        return ClaimFinished(12)
-    claims = read_claims(paths)
-    owners = [claim for claim in claims if scopes_overlap(claim.scope, scope)
-              and claim.record["pid"] == args.from_pid
-              and claim_state.claim_identity(claim.record) == claim_state.ClaimIdentity(
-                  args.claim_id, args.episode, args.attempt)
-              and claim.record["submitting_session"] == claim_state.session_id(session)
-              and ("remote_host" not in claim.record or claim.record.get("cleanup_pending"))
-              and process_identity.process_start(args.from_pid) == process_identity.Started(claim.record["proc_start"])
-              and (claim.record["worktree"] == args.worktree or claim.record.get("cleanup_pending"))]
-    if len(owners) != 1 or not isinstance(args.remote, str):
-        return ClaimFinished(12)
+        return refuse_wait_claim(WaitClaimCheck.RUNNER_START)
+    if not isinstance(args.remote, str):
+        return refuse_wait_claim(WaitClaimCheck.REMOTE_MISSING)
+    owners = read_claims(paths)
+    if not owners:
+        return refuse_wait_claim(WaitClaimCheck.NO_RESERVATION)
+    identity = claim_state.ClaimIdentity(args.claim_id, args.episode, args.attempt)
+    worktree = claim_worktree_path(args.worktree)
+    checks: tuple[tuple[WaitClaimCheck, Callable[[HeldClaim], bool]], ...] = (
+        (WaitClaimCheck.IDENTITY, lambda claim: claim_state.claim_identity(claim.record) == identity),
+        (WaitClaimCheck.SCOPE, lambda claim: scopes_overlap(claim.scope, scope)),
+        (WaitClaimCheck.PID, lambda claim: claim.record["pid"] == args.from_pid),
+        (WaitClaimCheck.SESSION, lambda claim: claim.record["submitting_session"] == claim_state.session_id(session)),
+        (WaitClaimCheck.REMOTE_HOST, lambda claim: "remote_host" not in claim.record or claim.record.get("cleanup_pending") is True),
+        (WaitClaimCheck.OWNER_START, lambda claim:
+            process_identity.process_start(args.from_pid) == process_identity.Started(claim.record["proc_start"])),
+        (WaitClaimCheck.WORKTREE, lambda claim: claim.record.get("cleanup_pending") is True
+            or recorded_worktree_matches(claim.record["worktree"], worktree)),
+    )
+    for check, matches in checks:
+        owners = tuple(claim for claim in owners if matches(claim))
+        if not owners:
+            return refuse_wait_claim(check)
+    if len(owners) != 1:
+        return refuse_wait_claim(WaitClaimCheck.RESERVATION_COUNT)
     claim = owners[0]
     if (not target_config.uses_legacy_mac_layout(paths.platform) and isinstance(claim.scope, RepositoryScope)
             and args.leased_slots and claim.scope.slot not in args.leased_slots):
-        return ClaimFinished(11)
+        return refuse_wait_claim(WaitClaimCheck.LEASED_SLOT, status=11)
     # A reservation grants capacity. A later block still prevents new work.
     # Retained remote work keeps its cleanup path.
     if "remote_host" not in claim.record:
         try:
             block = blocking_claim_block(paths, session)
         except (OSError, StateReadError):
-            return unreadable_claim(paths.block)
+            return refuse_wait_claim(WaitClaimCheck.BLOCK_STATE)
         if not isinstance(block, NoMacBlock):
             return blocked_claim(block)
     record: RemoteJobClaim
@@ -2026,12 +2051,16 @@ def adopt_wait_claim(args: CliArguments, paths: StatePaths, scope: ClaimScope,
         record = {**claim.record, "remote_host": args.remote}
     record["pid"] = args.pid
     record["proc_start"] = start.start
+    cleanup_only = record.get("cleanup_pending") is True
+    if not cleanup_only:
+        record["worktree"] = str(claim_worktree_path(record["worktree"]))
     write_json(claim.path, record)
     print_claim_identity(args, record)
     if isinstance(claim.scope, RepositoryScope) and claim.scope.slot:
-        remember_slot(paths, claim.scope, record)
+        if not cleanup_only:
+            remember_slot(paths, claim.scope, record)
         print(f"slot: {claim.scope.slot}")
-    if record.get("cleanup_pending"):
+    if cleanup_only:
         print(f"leftovers: {record['remote_host']}")
         return ClaimFinished(13)
     print("claimed")
@@ -2043,13 +2072,13 @@ def command_claim_wait(args: CliArguments, paths: StatePaths, *, kind: str = "",
                        assignment: placement.PlacementAssignment | UnassignedClaim = UNASSIGNED_CLAIM) -> int:
     """Reserve a slot for a live local wait without starting remote work."""
     from scripts.mac_test import eligibility
-
     settings = Path(args.settings) if args.settings else config_path(args.target)
     config = eligibility.read_config(settings)
-    if isinstance(eligibility.mac_step_eligibility(config, Path(args.repo_root), args.package,
+    worktree = claim_worktree_path(args.repo_root)
+    if isinstance(eligibility.mac_step_eligibility(config, worktree, args.package,
                                              args.verb, args.target, kind=kind), eligibility.IneligibleMacStep):
         return 1
-    args.worktree = args.repo_root
+    args.worktree = str(worktree)
     args.what = f"{args.verb} {args.package or 'workspace'}"
     return command_claim(args, paths, watch_claim=False, session=session, assignment=assignment)
 
@@ -2057,6 +2086,7 @@ def command_claim_wait(args: CliArguments, paths: StatePaths, *, kind: str = "",
 def command_claim(args: CliArguments, paths: StatePaths, *, watch_claim: bool = True,
                   session: SubmittingSession | claim_state.CallingSession = claim_state.CALLING_SESSION,
                   assignment: placement.PlacementAssignment | UnassignedClaim = UNASSIGNED_CLAIM) -> int:
+    args.worktree = str(claim_worktree_path(args.worktree))
     if (args.assignment_file or args.assignment) and isinstance(assignment, UnassignedClaim):
         from scripts.build_queue import admission_wire as wire
 
