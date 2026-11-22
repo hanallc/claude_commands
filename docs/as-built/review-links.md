@@ -1474,7 +1474,7 @@ A showrunner or unit registers each image, or a before and after pair, with one 
 ~/.claude/scripts/lib/py ~/.claude/scripts/review_links/images.py register (--image PATH | --before PATH --after PATH) --caption "TEXT" --owner STAFF_ID (--change ID | --phase ID)
 ```
 
-- The caption says what changed and what to look at.
+- The caption is the change in the fewest plain words that stay accurate. It adds a Look for part only when the change is hard to find.
 - `scripts/review_links/reply_shot.py <markdown> <columns> <png>` renders a Markdown reply in the Claude Code terminal.
   It resumes a placeholder transcript in Xvfb and xterm, so no model call happens.
   It cuts the shot at the first blank band of `reply_shot_gap_rows` pixel rows, so the page shows readable text.
@@ -1502,7 +1502,9 @@ A plain click on a single image or either pair image opens the shared image zoom
 The zoom centers the full image over a dark backdrop within the page view.
 It fits the view with a 16px margin and never exceeds the image's natural size.
 Escape or a click on the backdrop or image closes it.
-The page keeps its scroll position and returns focus to the image link.
+In a pair zoom, a label above the image says Before or After.
+The left arrow key shows the before image and the right arrow key shows the after image.
+The page keeps its scroll position and returns focus to the link of the image shown last.
 Shift, Ctrl, Meta and Alt clicks retain the browser's link action.
 Middle clicks and the right-click menu retain the browser's link action.
 `page_frame.ZOOM_STYLE` and `ZOOM_SCRIPT` supply one zoom through `change_page.document`.

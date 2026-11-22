@@ -1630,10 +1630,12 @@ class ImagePairTests(ImagesFixture):
         before, after = (f"/images/{record['id']}/before.png", f"/images/{record['id']}/after.webp")
         self.assertTrue(card.startswith(f'<article id="image-{record['id']}" class="pair" data-image='))
         self.assertIn(
-            '<div class="image-pair">'
-            + f'<figure><figcaption>Before</figcaption><a data-image-zoom href="{before}" target="_blank" rel="noopener">'
+            '<div class="image-pair" data-image-zoom-group>'
+            + '<figure><figcaption>Before</figcaption>'
+            + f'<a data-image-zoom data-image-zoom-label="Before" href="{before}" target="_blank" rel="noopener">'
             + f'<img src="{before}" alt="Before: Look at &lt;the&gt; counts" loading="lazy"></a></figure>'
-            + f'<figure><figcaption>After</figcaption><a data-image-zoom href="{after}" target="_blank" rel="noopener">'
+            + '<figure><figcaption>After</figcaption>'
+            + f'<a data-image-zoom data-image-zoom-label="After" href="{after}" target="_blank" rel="noopener">'
             + f'<img src="{after}" alt="After: Look at &lt;the&gt; counts" loading="lazy"></a></figure></div>'
             + '<form method="post" data-image-form>', card)
         self.assertEqual((card.count("<form"), card.count('value="approved"'), card.count('value="feedback"'),
@@ -1653,6 +1655,91 @@ class ImagePairTests(ImagesFixture):
         page = images.render(self.status).decode()
         self.assertLess(page.index(before), page.index(after))
         self.assertIn("The counts now match.", page)
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser behavior")
+    def test_the_arrow_keys_show_the_before_and_after_pictures_in_the_large_view(self) -> None:
+        _ = self.register_pair()
+        _ = self.register()
+        probe = """<script>
+(async () => {
+ const failures = [], check = (ok, text) => { if (!ok) failures.push(text); };
+ const zoom = document.querySelector('[data-image-zoom-dialog]');
+ const label = zoom.querySelector('[data-image-zoom-label]');
+ const [before, after] = document.querySelectorAll('[data-image-zoom-group] a[data-image-zoom]');
+ const single = document.querySelector('article:not(.pair) a[data-image-zoom]');
+ const press = key => zoom.dispatchEvent(new KeyboardEvent('keydown', {key, bubbles:true, cancelable:true}));
+ const shows = (link, text, step) => {
+  check(zoom.open && zoom.querySelector('img').src === link.href, step + ' shows the ' + text + ' picture');
+  check(!label.hidden && label.textContent === text, step + ' labels the picture ' + text);
+  check(zoom.getAttribute('aria-label') === link.querySelector('img').alt, step + ' names the zoom ' + text);
+ };
+ after.click();
+ shows(after, 'After', 'A click on After');
+ press('ArrowRight');
+ shows(after, 'After', 'The right arrow on the last picture');
+ press('ArrowLeft');
+ shows(before, 'Before', 'The left arrow');
+ press('ArrowLeft');
+ shows(before, 'Before', 'The left arrow on the first picture');
+ press('ArrowRight');
+ shows(after, 'After', 'The right arrow');
+ press('Escape');
+ check(!zoom.open && document.activeElement === after, 'Escape returns focus to the shown picture');
+ single.click();
+ check(zoom.open && label.hidden && label.textContent === '', 'A single image has no label');
+ press('ArrowLeft');
+ check(zoom.querySelector('img').src === single.href, 'The arrows keep a single image');
+ press('Escape');
+ await fetch('/results', {method:'POST', body:JSON.stringify(failures)});
+})().catch(error => fetch('/results', {method:'POST', body:JSON.stringify([String(error)])}));
+</script><img src="/probe-complete" alt="" hidden>"""
+        page = images.render(self.status).decode().replace("</body>", probe + "</body>").encode()
+        results: list[list[str]] = []
+        complete = threading.Event()
+
+        class Probe(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:
+                if self.path == "/probe-complete":
+                    # Keep Firefox alive until the checks report their result.
+                    if not complete.wait(20):
+                        self.send_error(504, "The browser checks did not complete.")
+                        return
+                    self.send_response(204)
+                    self.end_headers()
+                    return
+                body, kind = (page, "text/html; charset=utf-8") if self.path == "/" else (PNG, "image/png")
+                self.send_response(200)
+                self.send_header("Content-Type", kind)
+                self.end_headers()
+                _ = self.wfile.write(body)
+
+            def do_POST(self) -> None:
+                payload = self.rfile.read(int(self.headers["Content-Length"])).decode()
+                results.append(cast(list[str], json.loads(payload)))
+                complete.set()
+                self.send_response(204)
+                self.end_headers()
+
+            @override
+            def log_message(self, format: str, *args: object) -> None:
+                pass
+
+        with ThreadingHTTPServer(("127.0.0.1", 0), Probe) as server:
+            thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
+            thread.start()
+            try:
+                profile = self.temporary / "pair-zoom-profile"
+                profile.mkdir()
+                run = subprocess.run(["firefox", "--headless", "--no-remote", "--profile", str(profile),
+                                      "--window-size", "1200,900", "--screenshot", str(self.temporary / "pair-zoom.png"),
+                                      f"http://127.0.0.1:{server.server_port}/"],
+                                     capture_output=True, text=True, timeout=45)
+                self.assertEqual(run.returncode, 0, run.stderr)
+            finally:
+                complete.set()
+                server.shutdown()
+                thread.join(TEST_HANG_GUARD_SECS)
+        self.assertEqual(results, [[]], "The browser must complete every check without a failure.")
 
     def test_pair_feedback_names_the_before_and_after_images(self) -> None:
         record = self.register_pair()
