@@ -1715,6 +1715,7 @@ class ReplyPublicationTests(unittest.TestCase):
             assert isinstance(result, gate.PassResult)
             assert isinstance(policy, records.AdmissionPolicy)
             reading = replace(gate.queue_read_from_pass(inputs, policy, result), diagnostics=server.last_diagnostics)
+            reading = replace(reading, view=replace(reading.view, move_line=server.move_line))
             view_reading = replace(reading, explanation=replace(reading.explanation,
                 local_occupancy=records.LocalAdmissionOccupancy((), {})))
             expected_view = wire.encode_reply(wire.ViewReply(view_reading)).encode()
@@ -5830,8 +5831,15 @@ class ServiceTests(unittest.TestCase):
                 assert occupancy is not None
                 self.assertEqual([row.get("reservation_id") for row in occupancy.reservations],
                                  [record.reservation_id for record in committed])
-                self.assertEqual(replace(viewed.reading, explanation=replace(viewed.reading.explanation,
-                    local_occupancy=None)), expected)
+                line = viewed.reading.view.move_line
+                assert isinstance(line, records.QueueMoveLine)
+                started = {row.owner for row in starts}
+                self.assertEqual(line.members, tuple(
+                    records.QueueMoveMember(row.get("move_id", ""), movable=records.waiter_owner(row) not in started)
+                    for _, row in expected.ordered))
+                self.assertTrue(line.revision)
+                self.assertEqual(viewed, wire.ViewReply(replace(expected, view=replace(expected.view, move_line=line),
+                    explanation=replace(expected.explanation, local_occupancy=occupancy))))
                 explained = fixture.server.handle_request(wire.ExplainRequest())[0]
                 assert isinstance(explained, wire.ExplainReply)
                 self.assertEqual(explained.explanation.decided_from, inputs)
@@ -5851,13 +5859,18 @@ class ServiceTests(unittest.TestCase):
             projected = gate.queue_read_from_pass(inputs, policy, result)
             self.assertEqual(projected, gate.queue_read_from(inputs, policy))
             with mock.patch.object(gate, "admission_pass", wraps=gate.admission_pass) as walk:
-                viewed = fixture.server.handle_request(wire.ViewRequest())
+                viewed, = fixture.server.handle_request(wire.ViewRequest())
                 explained = fixture.server.handle_request(wire.ExplainRequest())
                 mine = fixture.server.handle_request(wire.MineRequest(request.identity.session_id))
             walk.assert_not_called()
-            expected_view = replace(projected, explanation=replace(projected.explanation,
-                local_occupancy=records.LocalAdmissionOccupancy((), {})))
-            self.assertEqual(viewed, [wire.ViewReply(expected_view)])
+            assert isinstance(viewed, wire.ViewReply)
+            line = viewed.reading.view.move_line
+            assert isinstance(line, records.QueueMoveLine)
+            self.assertEqual(line.members, (records.QueueMoveMember(fixture.server.waiters[request.episode].row.get("move_id", "")),))
+            self.assertTrue(line.revision)
+            expected_view = replace(projected, view=replace(projected.view, move_line=line), explanation=replace(
+                projected.explanation, local_occupancy=records.LocalAdmissionOccupancy((), {})))
+            self.assertEqual(viewed, wire.ViewReply(expected_view))
             self.assertEqual(explained, [wire.ExplainReply(projected.explanation)])
             own = mine[0]
             assert isinstance(own, wire.MineReply)
@@ -6177,14 +6190,14 @@ class ServiceTests(unittest.TestCase):
             for forbidden in ('"head_since"', '"head_state"', '"bump_until"', '"bump_ends_at"'):
                 self.assertNotIn(forbidden, fixture.state_text())
 
-    def test_snapshot_ranking_keeps_priority_then_run_place_then_pid_order(self) -> None:
+    def test_snapshot_ranking_uses_priority_then_run_place_then_step_arrival_then_pid(self) -> None:
         with AdmissionFixture() as fixture:
             fixture.free(0)
             fixture.hold_starts()
             joined = fixture.clock.now() - 600
-            first = fixture.request(since=joined)
-            tied = fixture.request(since=joined)
-            younger = fixture.request(since=joined + 1)
+            first = fixture.request(since=joined, owner=fixture.fixture_owner(700002, "4000"))
+            tied = fixture.request(since=joined, owner=fixture.fixture_owner(700003, "4000"))
+            younger = fixture.request(since=joined + 1, owner=fixture.fixture_owner(700001, "4000"))
             for request in (younger, tied, first):
                 _ = fixture.server.handle_request(request)
             inputs = fixture.server.last_inputs
@@ -6204,6 +6217,8 @@ class ServiceTests(unittest.TestCase):
             moved = records.stored_waiter({**rows[first.owner.pid], "order_since": younger.since + 1})
             self.assertEqual(moved.get("order_since"), younger.since + 1)
             self.assertGreater(gate.waiter_order(moved), gate.waiter_order(rows[younger.owner.pid]))
+            same_run_time = records.stored_waiter({**moved, "order_since": younger.since})
+            self.assertLess(gate.waiter_order(same_run_time), gate.waiter_order(rows[younger.owner.pid]))
 
     def test_two_episodes_of_one_step_reuse_its_first_place(self) -> None:
         with AdmissionFixture() as fixture:

@@ -102,9 +102,7 @@ class BuildLimitsTests(unittest.TestCase):
             reply, = fixture.server.handle_request(wire.ViewRequest())
             assert isinstance(reply, wire.ViewReply)
             reading = reply.reading
-            head = reading.explanation.head
-            assert isinstance(head, records.HeadExplanation)
-            self.assertEqual(head.decision.state, "admit")
+            self.assertIsInstance(reading.explanation.head, records.NoWaiter)
             self.assertEqual(reading.explanation.decided_from.reservations, ())
             cell = self.hana_cell(reading)
             self.assertEqual((cell.used, cell.limit), (0, 2))
