@@ -16,6 +16,7 @@ from typing import cast, override
 from unittest import mock
 
 from scripts.lib.test_models_registry import write_registry
+from scripts.accounts import role_map
 from scripts.accounts.home_test_support import scratch_accounts_config
 from scripts.message import send_budget
 from scripts.agents import remote
@@ -63,15 +64,17 @@ class QuotaAlertTests(support.SeededQuotaReminderFixture):
         claude = self.note("claude2.md", "active", "0", limit_reset_count="3")
         codex = self.note("codex1.md", "active", "0")
         spare = self.note("claude1.md", "inactive", "80", login="spare@example.invalid")
-        sends = self.user_sends(lambda: self.alert([claude, codex, spare], self.now))
-        sends |= self.user_sends(lambda: self.block([codex], self.now))
+        with mock.patch("socket.gethostname", return_value=role_map.ROLE_MAP_HOST):
+            sends = self.user_sends(lambda: self.alert([claude, codex, spare], self.now))
+            sends |= self.user_sends(lambda: self.block([codex], self.now))
         notes = [title for title, (need, _action) in sends.items() if need == "note"]
         self.assertEqual(len(notes), 1)
         for title in notes:
             _ = sends.pop(title)
         self.assertEqual(sends, {
             "quota_alert: codex1 now uses paid credits": ("decision", ActionRequired(
-                f"To stop it, remove codex1 from codex_credit_accounts in ~/.claude/config/accounts.conf on {remote.local_machine()}")),
+                "To stop it, remove codex1 from codex_credit_accounts in ~/.claude/config/accounts.conf on "
+                + role_map.ROLE_MAP_HOST)),
             "Codex work stopped for lack of usage": ("decision", ActionRequired(REFUSAL_ACTION)),
         })
 

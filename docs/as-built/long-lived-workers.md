@@ -713,7 +713,7 @@ The command runs in its own session, including through a systemd scope prefix.
 Other `systemd-run` forms return exit 2.
 The guard skips `env` assignments and the two-word `-u` and `--unset` options.
 If `env` uses another option, the guard refuses the start when a later argument contains `systemd-run`.
-To limit memory, use `systemd-run --user --scope -q -p MemoryMax=<cap> -- <command>` as the detached command.
+To limit memory, use `systemd-run --user --scope --collect -q -p MemoryMax=<cap> -- <command>`.
 The record saves the command's process group as `command_group`.
 The supervisor leaves the signal dispositions unchanged.
 The supervisor refuses to start if it inherits `SIGCHLD=SIG_IGN`.

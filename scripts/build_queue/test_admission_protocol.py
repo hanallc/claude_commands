@@ -147,7 +147,7 @@ class ProtocolTests(unittest.TestCase):
         with AdmissionFixture() as fixture:
             for place in (wire.LocalPlace(), wire.CloudPlace("aws")):
                 with self.subTest(place=place):
-                    request = replace(fixture.request(step="merge-gate"), place=place)
+                    request = replace(fixture.request(step="gate"), place=place)
                     parsed = wire.parse_request(wire.encode_request(request))
                     self.assertEqual(parsed, request)
                     assert isinstance(parsed, wire.AdmitRequest)
@@ -224,7 +224,7 @@ class ProtocolTests(unittest.TestCase):
             assert isinstance(reply, wire.ViewReply)
             base = reply.reading
             cloud_row = wire.CloudRow(wire.Owner(700001, "10"),
-                wire.Identity("cloud-session", "cloud-worker", "merge-gate", "/private", "cloud-unit"),
+                wire.Identity("cloud-session", "cloud-worker", "gate", "/private", "cloud-unit"),
                 wire.CloudPlace("aws"), NOW - 60, NOW - 50,
                 cloud_progress.CloudProgress("running", 32, 1, NOW - 20),
                 progress_profile.ProgressCounter("modules", 7, 12), records.ReadyForAdmission())
@@ -317,11 +317,19 @@ class ProtocolTests(unittest.TestCase):
             line = json.dumps(encoded) + "\n"
             self.assertEqual(wire.parse_reply(line), reply)
             granted = admitted_reply()
-            transport = ScriptedTransport(fixture.clock, Exchange((line + wire.encode_reply(granted)).encode()))
+            exchange = Exchange(line.encode())
+            transport = ScriptedTransport(fixture.clock, exchange)
             waits: list[wire.Wait] = []
-            with mock.patch.object(client, "CLOCK", fixture.clock), mock.patch.object(
-                    socket, "socket", side_effect=transport.socket), redirect_stderr(io.StringIO()):
-                result = client.admit(request, waits.append, lambda: request)
+
+            def receive_wait(wait: wire.Wait) -> None:
+                waits.append(wait)
+                exchange.events.append(wire.encode_reply(granted).encode())
+
+            with (mock.patch.object(client, "CLOCK", fixture.clock),
+                  mock.patch.object(socket, "socket", side_effect=transport.socket),
+                  mock.patch.object(client, "DefaultSelector", side_effect=transport.selector),
+                  redirect_stderr(io.StringIO())):
+                result = client.admit(request, receive_wait, lambda: request)
             self.assertEqual(waits, [reply])
             self.assertEqual(result, granted)
             self.assertEqual(len(transport.requests), 1)
@@ -390,7 +398,7 @@ class ProtocolTests(unittest.TestCase):
         current["diagnostics"] = [{"kind": "ConfigurationDiagnostic", "diagnostic": "service warning"}]
         parsed = codec.parse_snapshot_value(current, records.QueueRead)
         self.assertEqual(parsed, replace(reading, diagnostics=(records.ConfigurationDiagnostic("service warning"),)))
-        step = records.RunningStep("owner", "worker", "merge-gate", "/tree", GIB, records.MeasuredMemory(0),
+        step = records.RunningStep("owner", "worker", "gate", "/tree", GIB, records.MeasuredMemory(0),
                                 run=LiveBuildRun(123, "456", NOW - 60), started_at=NOW - 30, pid=123)
         self.assertEqual(codec.parse_snapshot_value(codec.snapshot_value(step), records.RunningStep), step)
 
@@ -405,6 +413,9 @@ class ProtocolTests(unittest.TestCase):
                     self.assertEqual(wire.parse_record(wire.encode_record(current), type(current)), current)
 
     def test_shell_and_protocol_share_a_version_that_includes_the_version_module(self) -> None:
+        for name, expected in (("gate.py", True), ("cloud_gate.py", False), ("gate_box.py", False)):
+            with self.subTest(name=name):
+                self.assertEqual(f"production/{name}" in admission_code.ADMISSION_CODE_PATHS, expected)
         source = Path(__file__).resolve().parents[1]
         test_modules = {"admission_protocol_v1_fixture.py", "admission_test_support.py"}
         admission_modules = {str(path.relative_to(source))
@@ -473,7 +484,7 @@ printf '%s\\n' "$BUILDLOG_ADMISSION_CODE_VERSION"
         with AdmissionFixture() as fixture:
             request = fixture.request()
             requests: list[wire.Request] = [request, fixture.launch(),
-                replace(request, profile=records.ProgramProfile("merge-gate", "repo", "tree", records.HistoryPeakSizing(3 * GIB, records.FirstProgramPeak(3 * GIB), 0.0))),
+                replace(request, profile=records.ProgramProfile("gate", "repo", "tree", records.HistoryPeakSizing(3 * GIB, records.FirstProgramPeak(3 * GIB), 0.0))),
                 replace(request, profile=records.ProgramProfile("rust-analyzer", "repo", "tree",
                     records.HistoryPeakSizing(18 * GIB, records.FirstProgramPeak(18 * GIB), NOW))),
                 replace(request, profile=records.ProgramProfile("rust-analyzer", "repo", "tree",

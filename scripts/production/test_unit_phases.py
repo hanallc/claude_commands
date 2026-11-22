@@ -45,6 +45,7 @@ from scripts.style.ledger_test_support import write_style_units
 from scripts.production import staff
 from scripts.production.staff_test_support import isolated_staff_file, fixture_member, fixture_runtime_id, recorded_unit
 
+from scripts.direct import pass_record as pass_recorder
 from scripts.direct import phase_table
 from scripts.direct import plan_history, progress_history, recorder_state
 from scripts.direct.findings_test_support import invoke_findings
@@ -164,7 +165,7 @@ class UnitPhasesTests(unittest.TestCase):
                                                     "UNIT_HISTORY_DIR": str(self.root / "history"),
                                                     "UNIT_QUEUE_STATE_DIR": str(self.root / "queue"),
                                                     "XDG_STATE_HOME": str(self.root / "state"),
-                                                    "MERGE_GATE_STATE_DIR": str(self.root / "merge-gate")}))
+                                                    "GATE_STATE_DIR": str(self.root / "merge-gate")}))
         _ = self.enterContext(patch.object(process_table, "snapshot", return_value={}))
         _ = self.enterContext(patch.object(census, "read", return_value=LOCAL))
 
@@ -2880,7 +2881,7 @@ class UnitPhasesTests(unittest.TestCase):
               patch.object(staff, "snapshot", wraps=staff.snapshot) as staff_reads,
               patch.object(census, "read", wraps=census.read) as census_reads,
               patch.object(io, "open", wraps=io.open) as opened,
-              patch.object(plan_history, "now_epoch", return_value=230),
+              patch.object(pass_recorder, "now_epoch", return_value=230),
               contextlib.redirect_stdout(output)):
             self.assertEqual(unit_phases.main(["--production", "show"]), 0)
         self.assertCountEqual([call.args[0] for call in headers.call_args_list], run_files)

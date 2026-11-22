@@ -14,7 +14,7 @@ import sys
 import time
 import unittest
 from collections.abc import Callable, Iterable
-from contextlib import ExitStack, redirect_stderr
+from contextlib import ExitStack, nullcontext, redirect_stderr
 from dataclasses import replace
 from pathlib import Path
 from typing import Literal, cast, override
@@ -29,6 +29,8 @@ from scripts.production.rename_unit_test_support import FolderRenameFixture, Fol
 from scripts.production.rename_rerun_test_support import file_versions, saved_fixture
 from scripts.production.staff_test_support import fixture_member, fixture_unit_saved_name, fixture_worker
 from scripts.agents import pane_record, restart, shutdown_record
+from scripts.lib import build_folders
+from scripts.lint.memory_test_support import write_config_fixture
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.herdr import herdr
 from scripts.herdr.test_worker_panes import PaneWorld
@@ -168,10 +170,86 @@ class UnitFolderMoveTests(FolderRenameFixture):
             ):
                 self.assertEqual(unit_move.move_processes_inside(self.owner, self.source, preserved_workers=[worker]), list(extra))
 
+    def test_managed_move_reuses_the_git_entry_after_a_partial_move(self) -> None:
+        root = self.root / "worktrees"
+        _ = write_config_fixture(Path(self.env["CONF_DIR"]) / "build_folders.conf",
+            f"roots.workspace={root}\n"
+            + f"roots.build={self.root / 'build'}\nroots.build.natedev={self.root / 'build'}\n")
+        repo = build_folders.repo_word(self.source)
+        destination = build_folders.worktree_path(repo, self.old_name, "edit").resolve()
+        destination.parent.mkdir(parents=True)
+        saved_entry = unit_move.checkout_folders(self.source).git_dir
+        _ = self.git("worktree", "move", str(self.source), str(destination))
+        self.source.symlink_to(destination, target_is_directory=True)
+        layout = unit_move.worktree_destination(self.source.resolve(), destination)
+        api = mock.Mock(return_value=destination)
+        with mock.patch.object(unit_move, "managed_move_api", return_value=api):
+            retry = unit_move.prepare_checkout_move(self.source, destination, destination, layout)
+            self.assertEqual(retry(), destination)
+        api.assert_called_once_with(self.source, repo, self.old_name, "edit")
+        self.assertEqual(unit_move.checkout_folders(destination).git_dir, saved_entry)
+
+    def test_managed_rename_moves_the_existing_output_with_the_unit(self) -> None:
+        workspace = self.root / "worktrees"
+        build = self.root / "build"
+        _ = write_config_fixture(Path(self.env["CONF_DIR"]) / "build_folders.conf",
+            f"roots.workspace={workspace}\nroots.build={build}\nroots.build.natedev={build}\n")
+        repo = build_folders.repo_word(self.source)
+        old = build_folders.worktree_path(repo, self.old_name, "edit")
+        new = build_folders.worktree_path(repo, self.new_name, "edit")
+        old.parent.mkdir(parents=True)
+        _ = self.git("worktree", "move", str(self.source), str(old))
+        owner = staff.set_worktree(self.owner.id, staff.PresentWorktree(remote.local_machine(), old),
+                                   expected=self.owner.worktree)
+        old_build = build_folders.unit_folder(repo, self.old_name)
+        new_build = build_folders.unit_folder(repo, self.new_name)
+        output = old_build / old.name
+        output.mkdir(parents=True)
+        _ = (output / "artifact").write_text("cached")
+        saved_entry = unit_move.checkout_folders(old).git_dir
+
+        def finish() -> None:
+            self.assertTrue(output.is_dir())
+            self.assertFalse(new_build.exists())
+            _ = old_build.rename(new_build)
+            new.parent.mkdir()
+            _ = self.git("worktree", "move", "--force", "--force", str(old), str(new))
+            old.parent.rmdir()
+            _ = staff.set_worktree(owner.id, replace(cast(staff.PresentWorktree, owner.worktree), path=new),
+                                   expected=owner.worktree)
+
+        check_available = mock.Mock(side_effect=FileExistsError("destination is occupied"))
+        hold_copy_allocations = mock.Mock(return_value=nullcontext())
+        hold_outputs = mock.Mock(return_value=nullcontext())
+        finish_move = mock.Mock(side_effect=finish)
+        transaction = mock.Mock(check_available=check_available, hold_copy_allocations=hold_copy_allocations,
+                                hold_outputs=hold_outputs, finish=finish_move)
+        with (mock.patch.object(unit_move, "unit_folder_rename", return_value=transaction) as rename,
+              mock.patch.object(unit_move, "managed_move_api") as single_checkout_move,
+              mock.patch.object(unit_move, "worktree_busy", return_value=False)):
+            with self.assertRaisesRegex(FileExistsError, "destination is occupied"):
+                _ = unit_move.prepare_rename(owner, new, unit_move.KeepBranch.CURRENT, self.new_name)
+            self.assertIsNone(unit_move.pending_rename(owner.id))
+            finish_move.assert_not_called()
+            check_available.side_effect = None
+            pending = unit_move.prepare_rename(owner, new, unit_move.KeepBranch.CURRENT, self.new_name)
+            _ = staff.rename(owner.id, self.new_name)
+            self.assertTrue(unit_move.move_idle_folder(owner.id, pending.destination, branch=pending.branch))
+            self.assertEqual(rename.call_args_list, [mock.call(old, new)] * 3)
+            hold_copy_allocations.assert_called_once()
+            hold_outputs.assert_called_once()
+            finish_move.assert_called_once()
+            single_checkout_move.assert_not_called()
+        self.assertFalse(old_build.exists())
+        self.assertEqual((new_build / new.name / "artifact").read_text(), "cached")
+        self.assertEqual(unit_move.checkout_folders(new).git_dir, saved_entry)
+
     def test_processes_inside_reads_the_selected_process_root(self) -> None:
         process_root = self.root / "selected-proc"
         process_root.mkdir()
-        for pid, cwd in ((41, str(self.source)), (23, str(self.source / "child")),
+        alias = self.root / "old-source"
+        alias.symlink_to(self.source, target_is_directory=True)
+        for pid, cwd in ((41, str(alias)), (23, str(self.source / "child")),
                          (17, str(self.source) + "-other"), (31, str(self.source) + " (deleted)")):
             process = process_root / str(pid)
             process.mkdir()
@@ -1487,7 +1565,8 @@ class FolderBranchRecoveryTests(FolderRenameFixture):
                 self.assertEqual(staff.by_id(current.id), current)
                 result = invoke_cli(shutdown, lambda: shutdown.main(arguments), arguments,
                                     dict(os.environ), self.checkout)
-                self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "done\n", ""))
+                expected_error = f"anomaly: folder is absent: {self.destination}\n" if removed_location else ""
+                self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "done\n", expected_error))
                 self.assertEqual(self.git("--git-dir", str(self.root / "origin.git"), "rev-parse",
                                           f"refs/heads/{target_branch}"), tip)
                 self.assertIsNone(unit_move.pending_rename(current.id))

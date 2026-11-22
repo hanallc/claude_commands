@@ -29,7 +29,7 @@ from scripts.build_queue.admission_test_support import AdmissionFixture
 from scripts.build_queue.queue_fixture import write_process
 from scripts.lib.process_group import send_process_group
 from scripts.lib.test_hang_guard import LauncherHangGuard, TEST_HANG_GUARD_SECS
-from scripts.build_queue import admission_records as records, step_estimator
+from scripts.build_queue import admission_records as records, program_start, step_estimator
 from scripts.lint import memory_admit as gate
 
 from scripts.buildlog import store
@@ -190,31 +190,6 @@ class HelperLifelineTests(unittest.TestCase):
                     stream.close()
 
 
-def private_scope_start() -> None:
-    """Use the real startup rule with a private kernel path at its input boundary."""
-    private_slice, action, sidecar, holder, start, record, *argv = sys.argv[1:]
-    if action != "--scope-start":
-        raise AssertionError("the private scope wrapper received another action")
-    cgroup_path = Path("/proc/self/cgroup")
-    actual = cgroup_path.read_text()
-    if not any(private_slice in Path(line[3:]).parts for line in actual.splitlines() if line.startswith("0::")):
-        raise AssertionError("the program did not enter the private test slice")
-    read_text = Path.read_text
-    publish = atomic_file.atomic_sample
-
-    def kernel_path(path: Path, encoding: str | None = None, errors: str | None = None) -> str:
-        if path == cgroup_path:
-            return actual.replace("0::/", "0::/builds.slice/")
-        return read_text(path, encoding=encoding, errors=errors)
-
-    def publish_actual_path(path: Path, value: str) -> None:
-        publish(path, value.replace("/sys/fs/cgroup/builds.slice/", "/sys/fs/cgroup/", 1))
-
-    with mock.patch.object(Path, "read_text", new=kernel_path), \
-         mock.patch.object(atomic_file, "atomic_sample", side_effect=publish_actual_path):
-        queue.scope_start(Path(sidecar), int(holder), start, argv, record=Path(record))
-
-
 def private_slice_name() -> str:
     """Name a private test slice after the test process that owns it."""
     return f"{PRIVATE_SLICE_PREFIX}{os.getpid()}_{time.monotonic_ns()}.slice"
@@ -302,7 +277,7 @@ class QueuePlaceFixture(ExitStack):
             if "--scope-start" in argv:
                 index = argv.index("--scope-start") - 2
                 argv = [*argv[:index], str(Path(__file__).resolve().parents[2] / "scripts/lib/py"), "-c",
-                        "from scripts.build_queue.test_queue_place import private_scope_start; private_scope_start()",
+                        "from scripts.build_queue.program_start_test_support import private_scope_start; private_scope_start()",
                         self.private_slice, *argv[index + 2:]]
             if argv[:1] != ["git"]:
                 kwargs["pass_fds"] = (*kwargs.get("pass_fds", ()), self.lifeline_read)
@@ -824,11 +799,19 @@ with queue_place('rust-analyzer', Path(sys.argv[1])) as place:
 
     def test_normal_exit_records_the_exit_code_and_one_peak(self) -> None:
         with QueuePlaceFixture() as fixture:
-            for status in (0, 7):
-                with self.subTest(status=status):
+            for status, wrapper in ((0, "program_start.py"), (7, "program_start.py"), (0, "queue_place.py")):
+                with self.subTest(status=status, wrapper=wrapper):
                     with queue.queue_place("rust-analyzer", fixture.root) as place:
-                        child = place.popen([sys.executable, "-c", CHILD, str(status)],
-                                            stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+                        spawn = subprocess.Popen
+
+                        def start(argv: list[str], **kwargs: Unpack[queue.PopenArguments]) -> subprocess.Popen[bytes]:
+                            if argv[2:3] == ["--program-start"]:
+                                argv = [argv[0], str(Path(queue.__file__).with_name(wrapper)), *argv[2:]]
+                            return spawn(argv, **kwargs)
+
+                        with mock.patch.object(subprocess, "Popen", side_effect=start):
+                            child = place.popen([sys.executable, "-c", CHILD, str(status)],
+                                                stdin=subprocess.PIPE, stdout=subprocess.PIPE)
                         output, _ = child.communicate(b"queued protocol\x00\xff", timeout=3)
                         self.assertEqual(output, b"queued protocol\x00\xff")
                         _, row = fixture.reservation()
@@ -1250,7 +1233,7 @@ with queue_place('rust-analyzer', Path(sys.argv[1])) as place:
                         program_pid = int(os.read(ready_read, 64))
                         saved = list(queue.program_starts().glob("*.json"))
                         self.assertEqual(len(saved), 1)
-                        record = wire.parse_record(saved[0].read_text(), queue.ProgramStart)
+                        record = wire.parse_record(saved[0].read_text(), program_start.ProgramStart)
                         self.assertEqual(record.holder.pid, holder)
                         self.assertEqual(record.program.pid, program_pid)
                         descriptor = os.pidfd_open(holder)
@@ -1273,7 +1256,7 @@ with queue_place('rust-analyzer', Path(sys.argv[1])) as place:
                                          128 + signal.SIGINT if number == signal.SIGINT else -number)
                         for path in queue.program_starts().iterdir():
                             self.assertEqual(path.suffix, ".json", "a partial record escaped publication")
-                            remaining = wire.parse_record(path.read_text(), queue.ProgramStart)
+                            remaining = wire.parse_record(path.read_text(), program_start.ProgramStart)
                             self.assertEqual(remaining.program, record.program)
                         shutil.rmtree(fixture.proc / str(holder))
                         with queue.queue_place("rust-analyzer", fixture.root):
@@ -1469,16 +1452,16 @@ with queue_place('rust-analyzer', Path(sys.argv[1])) as place:
             record = Path(directory) / "program.json"
             scope = "/sys/fs/cgroup/fixture.scope"
             guard = LauncherHangGuard("Program startup while the holder exits")
-            startup = worker.submit(queue.program_start, record, owner, ["fixture-program"], scope=scope)
+            startup = worker.submit(program_start.program_start, record, owner, ["fixture-program"], scope=scope)
             try:
                 guard.event(published)
-                expected = queue.ProgramStart(owner, wire.Owner(os.getpid(), wrapper_start), scope)
+                expected = program_start.ProgramStart(owner, wire.Owner(os.getpid(), wrapper_start), scope)
                 self.assertEqual(record.read_text(), wire.encode_record(expected))
                 holder.kill()
                 self.assertEqual(holder.wait(timeout=guard.remaining()), -signal.SIGKILL)
             finally:
                 resume.set()
-            with self.assertRaisesRegex(queue.QueuePlaceRefused, "the queue place holder exited during program publication"):
+            with self.assertRaisesRegex(program_start.ProgramStartRefused, "the queue place holder exited during program publication"):
                 guard.result(startup)
             execute.assert_not_called()
             self.assertFalse(record.exists())
