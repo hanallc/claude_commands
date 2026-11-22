@@ -588,31 +588,40 @@ with ExitStack() as locks:
         if current_boot == boot:
             try:
                 launch = json.loads(fence.with_suffix(".group").read_text())
+            except FileNotFoundError:
+                if lock is not None or fence.with_suffix(".revoked").is_file():
+                    candidates.append((name, path, lock, 0, True))
+                continue
             except (OSError, ValueError):
                 continue
             if not isinstance(launch, dict) or launch.get("boot") != boot:
                 continue
             group = launch.get("group")
             if type(group) is int and group > 1:
-                candidates.append((name, path, lock, group))
+                candidates.append((name, path, lock, group, False))
         elif current_boot["boot_id"] != boot["boot_id"] and current_boot["boot_at_us"] > boot["boot_at_us"]:
-            candidates.append((name, path, lock, 0))
+            candidates.append((name, path, lock, 0, False))
     groups = set()
-    if any(group for _, _, _, group in candidates):
+    if any(group for _, _, _, group, _ in candidates):
         groups = set(subprocess.check_output(["ps", "-axo", "pgid="], text=True).split())
         if not groups or not all(group.isascii() and group.isdecimal() for group in groups):
             raise ValueError("Invalid Mac process groups")
-    for name, path, lock, group in candidates:
+    for name, path, lock, group, unused in candidates:
         if group and str(group) in groups:
             continue
         try:
             current = path.stat()
         except FileNotFoundError:
-            pass
+            if unused and not path.with_suffix(".revoked").is_file():
+                continue
         else:
             if lock is None or not os.path.samestat(current, os.fstat(lock.fileno())):
                 continue
-            path.unlink()
+            if unused:
+                # Keep the proof if SSH loses the reply after revocation.
+                path.replace(path.with_suffix(".revoked"))
+            else:
+                path.unlink()
         ended.append(name)
 print(json.dumps(ended))
 '''
@@ -649,6 +658,8 @@ def prepare_start_fence_command(identity: claim_state.ClaimIdentity, target: str
     program = '''import pathlib, sys
 base = pathlib.Path.home() / bytes.fromhex(sys.argv[1]).decode()
 base.parent.mkdir(parents=True, exist_ok=True)
+if base.with_suffix(".revoked").exists():
+    sys.exit(75)
 base.with_suffix(".lock").touch()
 '''
     return shlex.join(["python3", "-c", program, encoded])
@@ -688,7 +699,7 @@ except FileNotFoundError:
     current = None
 opened = os.fstat(8)
 matches = current is not None and (current.st_dev, current.st_ino) == (opened.st_dev, opened.st_ino)
-if not matches:
+if not matches or base.with_suffix(".revoked").exists():
     print("dispatch_start_settled=" + sys.argv[2], flush=True)
     sys.exit(75)
 '''
@@ -1088,6 +1099,19 @@ class ProcessController:
         self.claim_target: str = ""
         self.claim_scope_key: str = "run"
         self.mac_boot: claim_state.MacClaimBoot | claim_state.MacBootNotRecorded = claim_state.MAC_BOOT_NOT_RECORDED
+        self.mac_command_fence: claim_state.ClaimIdentity | claim_state.NoClaimIdentity = claim_state.NO_CLAIM_IDENTITY
+
+    def command_identity(self, claim: claim_state.ClaimIdentity) -> claim_state.ClaimIdentity:
+        if isinstance(self.placement, AssignedOffloadRequest):
+            assignment = self.placement.assignment
+            return claim_state.ClaimIdentity(claim.claim_id, assignment.episode, assignment.attempt)
+        return claim
+
+    @property
+    def active_start_identity(self) -> claim_state.ClaimIdentity | claim_state.NoClaimIdentity:
+        if isinstance(self.mac_command_fence, claim_state.ClaimIdentity):
+            return self.mac_command_fence
+        return self.claim_identity
 
     def stop(self) -> None:
         active = self.active
@@ -1284,7 +1308,7 @@ class ProcessController:
                     line = raw_line
                 line = line.replace("\r\n", "\n").replace("\r", "\n")
                 marker = line.rstrip("\r\n")
-                identity = self.claim_identity
+                identity = self.active_start_identity
                 if (isinstance(identity, claim_state.ClaimIdentity)
                         and marker == "dispatch_start_settled=" + pending_start_key(identity)):
                     self.pending = SettledDispatchOperations()
@@ -1678,6 +1702,7 @@ def release_claim(controller: ProcessController, target: str = "") -> ClaimRelea
     identity = controller.claim_identity
     if isinstance(identity, claim_state.NoClaimIdentity):
         return ClaimReleaseUnconfirmed("the exact claim identity is unavailable")
+    fence = controller.active_start_identity
     result = controller.capture(
         [
             str(Path(__file__).resolve().parents[1] / "lib/py"),
@@ -1695,13 +1720,16 @@ def release_claim(controller: ProcessController, target: str = "") -> ClaimRelea
     if isinstance(result, CommandOutput):
         if result.status == 0:
             controller.claim_identity = claim_state.NO_CLAIM_IDENTITY
+            controller.mac_command_fence = claim_state.NO_CLAIM_IDENTITY
+            controller.mac_boot = claim_state.MAC_BOOT_NOT_RECORDED
         for line in result.stdout.splitlines():
             if line.startswith("copy_bytes="):
                 transfers = cast(list[transfer_bytes.TransferBytes], json.loads(line.removeprefix("copy_bytes=")))
                 controller.attempt_evidence.traffic.transfers.extend(transfers)
 
     if isinstance(result, CommandOutput) and result.status == 0:
-        pending_start_path(target, identity).unlink(missing_ok=True)
+        if isinstance(fence, claim_state.ClaimIdentity):
+            pending_start_path(target, fence).unlink(missing_ok=True)
         return ClaimReleaseConfirmed()
     return ClaimReleaseUnconfirmed("the provider did not confirm exact release")
 
@@ -1916,9 +1944,10 @@ def record_reachable(target: str = "mac") -> None:
 
 def record_mac_claim_boot(controller: ProcessController, identity: claim_state.ClaimIdentity,
                           target: str, host: str, boot: claim_state.MacClaimBoot) -> None:
-    """Bind the start to the Mac boot before the caller can launch work."""
+    """Save the exact command fence and boot before the caller requests permission."""
     paths = claim_state.state_paths(target)
     start = process_identity.process_start(os.getpid())
+    fence = controller.command_identity(identity)
     with claim_state.locked(paths.lock):
         for path in claim_state.claim_files(paths):
             if path.stem != controller.claim_scope_key:
@@ -1931,9 +1960,14 @@ def record_mac_claim_boot(controller: ProcessController, identity: claim_state.C
                 continue
             if "mac_boot" in record and record["mac_boot"] != boot:
                 raise claim_state.StateReadError("the Mac rebooted while the claim was preparing")
+            previous = claim_state.claim_fence_identity(record)
+            if previous != fence and pending_start_path(target, previous).exists():
+                raise claim_state.StateReadError("the previous Mac command fence is still pending")
             record["mac_boot"] = boot
+            record["mac_command_fence"] = {"episode": fence.episode, "attempt": fence.attempt}
             write_text_atomic(path, json.dumps(record) + "\n")
             controller.mac_boot = boot
+            controller.mac_command_fence = fence
             return
     raise claim_state.StateReadError("the exact Mac claim changed during the probe")
 
@@ -1976,15 +2010,16 @@ def probe_mac(
         timeout_s = config.probe_timeout_s
     identity = controller.claim_identity
     if isinstance(identity, claim_state.ClaimIdentity):
-        path = pending_start_path(target, identity)
+        fence = identity if linux else controller.command_identity(identity)
+        path = pending_start_path(target, fence)
         path.parent.mkdir(parents=True, exist_ok=True)
-        write_text_atomic(path, pending_start_key(identity))
+        write_text_atomic(path, pending_start_key(fence))
         boot = "" if linux else shlex.join(
             ["python3", "-c", MAC_BOOT_READER + 'print("mac_boot=" + json.dumps(mac_boot()))']) + " || exit 1\n"
         script = ("(\n" + script + "\n)\nprobe_status=$?\n"
                   + "if [ \"$probe_status\" -eq 0 ]; then\n"
                   + boot
-                  + prepare_start_fence_command(identity, target, scope_key=controller.claim_scope_key) + " || exit 1\nfi\n"
+                  + prepare_start_fence_command(fence, target, scope_key=controller.claim_scope_key) + " || exit 1\nfi\n"
                   + 'exit "$probe_status"')
     result = controller.capture(
         [*ssh_prefix(config), script],
@@ -2660,7 +2695,7 @@ def settle_pending_start(controller: ProcessController, config: OffloadConfig, h
                          repository: KnownRepository, target: str = "mac", slot: int = 1
                          ) -> StartSettled | StartUnsettled:
     """Keep the claim until the remote fence prevents a delayed start."""
-    identity = controller.claim_identity
+    identity = controller.active_start_identity
     if not isinstance(identity, claim_state.ClaimIdentity):
         return StartUnsettled("the exact start identity is unavailable", LeftoverCheckFailed("the exact start identity is unavailable"))
     try:
@@ -2746,14 +2781,21 @@ def claim_for_run(
                      else claim_state.target_claim_scope(paths, str(request.repo_root)))
             if isinstance(scope, claim_state.RepositoryScope) and not target_config.uses_legacy_mac_layout(paths.platform):
                 scope = replace(scope, slot=attempt.answer.slot)
-            controller.claim_scope_key = claim_path(paths, scope).stem
+            path = claim_path(paths, scope)
+            controller.claim_scope_key = path.stem
+            if isinstance(attempt.answer, TakenOverMacClaim) and paths.platform == "macos":
+                record = claim_state.read_run(path)
+                if (not isinstance(record, claim_state.NoRun) and "remote_host" in record
+                        and "mac_command_fence" in record and claim_state.claim_identity(record) == controller.claim_identity):
+                    controller.mac_command_fence = claim_state.claim_fence_identity(record)
         if isinstance(request.placement, AssignedOffloadRequest) and isinstance(controller.claim_identity, claim_state.ClaimIdentity):
             assigned = request.placement.assignment
             identity = controller.claim_identity
             controller.attempt_evidence.provider = placement.ProviderClaimReference(
                 assigned.destination.provider, assigned.destination.target, assigned.destination.scope,
                 identity.claim_id, identity.episode, identity.attempt)
-            if pending_start_path(request.target, identity).exists():
+            fence = controller.active_start_identity
+            if isinstance(fence, claim_state.ClaimIdentity) and pending_start_path(request.target, fence).exists():
                 controller.pending = PendingStartOperation()
         if isinstance(attempt.interruption, OffloadInterrupted):
             raise attempt.interruption
@@ -2883,6 +2925,8 @@ def claimed_run(
                 assignment.destination.target, assignment.destination.scope,
                 identity.claim_id, identity.episode, identity.attempt)
             holder = placement.ClaimHolderIdentity(store.host_name(), os.getpid(), start.start)
+            if isinstance(controller.mac_command_fence, claim_state.ClaimIdentity):
+                controller.pending = PendingStartOperation()
             while True:
                 try:
                     permission = admission_client.consume_permission(wire.ConsumePermission(
@@ -2900,7 +2944,7 @@ def claimed_run(
                 time.sleep(records.read_memory_config().waiting_pass_seconds)
             evidence.launch_authorized = True
         release_allowed = False
-        identity = controller.claim_identity
+        identity = controller.active_start_identity
         command = copies.remote_use_command(request_mirror(config, request, repository), step_command)
         if isinstance(identity, claim_state.ClaimIdentity):
             command = fenced_start_command(identity, request.target, command,

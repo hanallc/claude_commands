@@ -261,6 +261,13 @@ class MacBootNotRecorded:
 MAC_BOOT_NOT_RECORDED = MacBootNotRecorded()
 
 
+class MacCommandFence(TypedDict):
+    """The command attempt that owns the saved Mac start fence."""
+
+    episode: str
+    attempt: str
+
+
 def decode_mac_claim_boot(value: object, path: Path) -> MacClaimBoot:
     if isinstance(value, dict):
         fields = cast(dict[str, object], value)
@@ -280,9 +287,17 @@ class RemoteJobClaim(ClaimOwnerRecord):
     cleanup_pending: NotRequired[bool]
     instance_generation: NotRequired[str]
     mac_boot: NotRequired[MacClaimBoot]
+    mac_command_fence: NotRequired[MacCommandFence]
 
 
 RunRecord = ProcessBoundClaim | RemoteJobClaim
+
+
+def claim_fence_identity(record: RunRecord) -> ClaimIdentity:
+    if "remote_host" in record and "mac_command_fence" in record:
+        command = record["mac_command_fence"]
+        return ClaimIdentity(record["claim_id"], command["episode"], command["attempt"])
+    return claim_identity(record)
 
 
 @dataclass(frozen=True)
@@ -441,6 +456,15 @@ def read_run(path: Path) -> RunState:
     remote: RemoteJobClaim = {**record, "remote_host": host}
     if "mac_boot" in values:
         remote["mac_boot"] = decode_mac_claim_boot(values["mac_boot"], path)
+    if "mac_command_fence" in values:
+        command = values["mac_command_fence"]
+        if "mac_boot" not in remote or not isinstance(command, dict):
+            raise StateReadError(f"{path} has an invalid mac_command_fence")
+        fields = cast(dict[str, object], command)
+        episode, attempt = fields.get("episode"), fields.get("attempt")
+        if not isinstance(episode, str) or not episode or not isinstance(attempt, str) or not attempt:
+            raise StateReadError(f"{path} has an invalid mac_command_fence")
+        remote["mac_command_fence"] = {"episode": episode, "attempt": attempt}
     if 'instance_generation' in values:
         generation = required_string(values, 'instance_generation', path)
         if not generation:

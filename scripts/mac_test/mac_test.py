@@ -1525,7 +1525,7 @@ def claim_watch_pass(paths: StatePaths, config: MacTestConfig) -> bool:
         record = claim.record
         if "remote_host" in record and "mac_boot" in record and claim_holder_ended(record):
             fence = offload.start_fence_relative(
-                claim_state.claim_identity(record), paths.target, scope_key=claim.path.stem)
+                claim_state.claim_fence_identity(record), paths.target, scope_key=claim.path.stem)
             probes_by_host.setdefault(record["remote_host"], []).append(offload.MacClaimEndProbe(fence, record["mac_boot"]))
     activity: dict[str, MacActivity] = {}
     traffic: dict[str, transfer_bytes.TransferLedger] = {}
@@ -1564,7 +1564,8 @@ def watch_claim(
         if isinstance(current, NoRun):
             return False
         if (claim_owner(current) != claim_owner(run) or current.get("remote_host") != run.get("remote_host")
-                or current.get("mac_boot") != run.get("mac_boot")):
+                or current.get("mac_boot") != run.get("mac_boot")
+                or claim_state.claim_fence_identity(current) != claim_state.claim_fence_identity(run)):
             return True
         if not run_is_live(current):
             return False
@@ -1582,9 +1583,10 @@ def watch_claim(
             return True
         boot_recorded = "remote_host" in current and "mac_boot" in current
         identity = claim_state.claim_identity(current)
-        fence = offload.start_fence_relative(identity, paths.target, scope_key=claim.path.stem)
+        fence_identity = claim_state.claim_fence_identity(current)
+        fence = offload.start_fence_relative(fence_identity, paths.target, scope_key=claim.path.stem)
         if boot_recorded and str(fence) in ended and claim_holder_ended(current):
-            remove_settled_claim(claim.path, offload.pending_start_path(paths.target, identity))
+            remove_settled_claim(claim.path, offload.pending_start_path(paths.target, fence_identity))
             block_present = not isinstance(read_block(paths.block), NoMacBlock)
             proof = True
         elif keep_watching_for_idle(claim.path, current, activity, config, now, changed) or boot_recorded:
@@ -2268,10 +2270,11 @@ def release_exact_claims(
                 owned.append((path, record))
     transfers: list[transfer_bytes.TransferBytes] = []
     for path, record in owned:
-        pending = offload.pending_start_path(paths.target, identity)
+        fence_identity = claim_state.claim_fence_identity(record)
+        pending = offload.pending_start_path(paths.target, fence_identity)
         if "remote_host" in record and pending.exists():
             connection = eligibility.read_connection_settings(Path(settings) if settings else config_path(paths.target))
-            fence = offload.start_fence_command(identity, paths.target, settle=True, scope_key=path.stem)
+            fence = offload.start_fence_command(fence_identity, paths.target, settle=True, scope_key=path.stem)
             # Stopped work ends first, so the fence it holds is free to settle.
             command = (offload.leftover_check_script(remote_work.repository, paths.target, record.get("slot", 0) or 1)
                        + "\n" + fence + "\n" if isinstance(remote_work, EndStoppedWork)
@@ -2279,12 +2282,13 @@ def release_exact_claims(
             observed = offload.read_leftovers(connection, record["remote_host"], command, paths.target)
             if not isinstance(observed.result, offload.LeftoversEnded):
                 return ClaimReleaseRefused("the remote work of the claim has not ended")
-            if "dispatch_start_settled=" + offload.pending_start_key(identity) not in observed.output.splitlines():
+            if "dispatch_start_settled=" + offload.pending_start_key(fence_identity) not in observed.output.splitlines():
                 return ClaimReleaseRefused("the remote start fence remains unconfirmed")
         with nullcontext() if provider_lock_held else locked(paths.lock):
             # The claim watcher rewrites its own fields during the settle; only a new owner refuses.
             current = read_run(path)
-            if isinstance(current, NoRun) or claim_owner(current) != claim_owner(record):
+            if (isinstance(current, NoRun) or claim_owner(current) != claim_owner(record)
+                    or claim_state.claim_fence_identity(current) != fence_identity):
                 return ClaimReleaseRefused("the exact claim changed during cleanup")
             transfers.extend(current.get("transfers", []))
             remove_settled_claim(path, pending)

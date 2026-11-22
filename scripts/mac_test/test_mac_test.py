@@ -3522,7 +3522,8 @@ class ClaimWatchTests(NotificationGuardedTestCase):
         identity = claim_state.ClaimIdentity("fixture-claim", "fixture-episode", "fixture-attempt")
         controller = offload.ProcessController()
         offload.record_mac_claim_boot(controller, identity, "mac", "claim-mac", boot)
-        self.assertEqual(mac_test.read_run(self.paths.run), {**record, "mac_boot": boot})
+        self.assertEqual(mac_test.read_run(self.paths.run), {**record, "mac_boot": boot,
+            "mac_command_fence": {"episode": identity.episode, "attempt": identity.attempt}})
         self.assertEqual(controller.mac_boot, boot)
         with self.assertRaisesRegex(mac_test.StateReadError, "rebooted"):
             offload.record_mac_claim_boot(controller, identity, "mac", "claim-mac",
@@ -3562,6 +3563,93 @@ class ClaimWatchTests(NotificationGuardedTestCase):
                     self.assertTrue(pending.exists())
                     self.assertEqual(self.read_claim()["mac_boot"], record["mac_boot"])
                     send.assert_not_called()
+
+    def test_lost_nextest_permission_reply_releases_the_unused_command_fence(self) -> None:
+        from scripts.build_hold.owning_session import NoOwningSession
+        from scripts.build_queue import admission_client, admission_protocol as wire, execution_identity, placement
+        from scripts.copies import copies
+        from scripts.mac_test import eligibility, offload
+
+        _ = self.write_claim()
+        claim = claim_state.ClaimIdentity("fixture-claim", "fixture-episode", "fixture-attempt")
+        command = claim_state.ClaimIdentity(claim.claim_id, "nextest-episode", "nextest-attempt")
+        assignment = placement.PlacementAssignment(command.episode, command.attempt,
+            placement.PlacementDestination("mac", "mac", "claim-mac", claim_state.WholeMacScope()),
+            execution_identity.SourceKeyUnavailable("fixture"),
+            placement.SubmittingOwner("natedev", os.getpid(), "owner-start"), NoOwningSession(), 1)
+        request = offload.OffloadRequest(self.root, "", command.episode, offload.NoResultFile(),
+            (), "", "", placement=offload.AssignedOffloadRequest(assignment))
+        controller = offload.ProcessController()
+        controller.claim_identity = claim
+        controller.placement = request.placement
+        boot: claim_state.MacClaimBoot = {
+            "boot_id": "b75adc32-d178-493b-b7cd-88f740989f65", "boot_at_us": 100_000_000,
+        }
+        pending = offload.pending_start_path("mac", command)
+        fence = self.root / offload.start_fence_relative(command, "mac")
+        pending.parent.mkdir(parents=True)
+        sysctl = self.root / "sysctl"
+        _ = sysctl.write_text("#!/bin/sh\ncase \"$2\" in\n"
+            + f"kern.bootsessionuuid) echo {boot['boot_id']} ;;\n"
+            + "kern.boottime) echo '{ sec = 100, usec = 0 }' ;;\n"
+            + "*) exit 1 ;;\nesac\n")
+        sysctl.chmod(0o700)
+
+        def prepare(*_arguments: object) -> offload.ProbeSnapshot:
+            result = self.run_private_shell(offload.prepare_start_fence_command(command, "mac"), self.root)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            pending.touch()
+            offload.record_mac_claim_boot(controller, claim, "mac", "claim-mac", boot)
+            return offload.ProbeSnapshot(100, "claim-mac")
+
+        seen: list[dict[str, object]] = []
+
+        def lose_permission(_: wire.ConsumePermission) -> wire.FirstAuthorization:
+            self.assertTrue(fence.with_suffix(".lock").exists())
+            self.assertIsInstance(controller.pending, offload.PendingStartOperation)
+            seen.append(self.read_claim())
+            raise wire.AdmissionUnavailable("fixture lost the reply")
+
+        config = eligibility.read_config(Path(os.environ["MAC_TEST_CONFIG"]))
+        with (mock.patch.object(offload, "probe_mac", side_effect=prepare),
+              mock.patch.object(offload, "ensure_mac_disk_floor", return_value=offload.MacDiskReady(100)),
+              mock.patch.object(offload, "copy_tree_with_key", return_value=offload.CopiedTree(offload.KnownTreeKey("tree"))),
+              mock.patch.object(offload, "remote_test_command", return_value="true"),
+              mock.patch.object(offload, "request_mirror"),
+              mock.patch.object(copies, "register_remote"),
+              mock.patch.object(admission_client, "consume_permission", side_effect=lose_permission),
+              mock.patch.object(controller, "stream_mac_run") as stream, redirect_stdout(io.StringIO())):
+            result = offload.claimed_run(controller, config, request, eligibility.KnownRepository("alpha"), time.monotonic())
+        self.assertIsInstance(result, offload.DeclinedMacRun)
+        stream.assert_not_called()
+        self.assertFalse(fence.with_suffix(".group").exists())
+        self.assertTrue(self.paths.run.exists())
+
+        def private_ssh(arguments: list[str], **_options: object) -> subprocess.CompletedProcess[str]:
+            self.assertEqual((arguments[0], arguments[-2]), ("ssh", "claim-mac"))
+            return self.run_private_shell(arguments[-1], self.root)
+
+        with (mock.patch.dict(os.environ, {"PATH": str(self.root) + os.pathsep + os.environ["PATH"]}),
+              mock.patch.object(subprocess, "run", side_effect=private_ssh),
+              mock.patch.object(process_identity, "process_start", return_value=process_identity.Gone()),
+              mock.patch.object(mac_test, "mac_activity_script", return_value="printf 'active=1\\nwork=1\\nrc=0\\n'\n"),
+              mock.patch.object(mac_test, "send_message", return_value=True) as send):
+            _ = self.watch_once()
+        self.assertFalse(self.paths.run.exists())
+        self.assertFalse(pending.exists())
+        self.assertFalse(fence.with_suffix(".lock").exists())
+        self.assertTrue(fence.with_suffix(".revoked").is_file())
+        send.assert_called_once()
+        self.assertEqual(seen[0].get("mac_command_fence"), {"episode": command.episode, "attempt": command.attempt})
+        with mock.patch.dict(os.environ, {"PATH": str(self.root) + os.pathsep + os.environ["PATH"]}):
+            remote = offload.start_fence_relative(command, "mac")
+            probe = offload.mac_claim_end_command((offload.MacClaimEndProbe(remote, boot),))
+            self.assertEqual(json.loads(self.run_private_shell(probe, self.root).stdout), [str(remote)])
+        prepared_again = self.run_private_shell(offload.prepare_start_fence_command(command, "mac"), self.root)
+        self.assertEqual(prepared_again.returncode, 75, prepared_again.stderr)
+        late = self.run_private_shell(offload.fenced_start_command(command, "mac", "printf 'started\\n'"), self.root)
+        self.assertEqual(late.returncode, 75, late.stderr)
+        self.assertNotIn("started", late.stdout)
 
     def test_pass_does_not_modify_claim_changed_during_activity_check(self) -> None:
         for field, value in (("pid", 1234), ("proc_start", "new-start"), ("since", "2026-10-13T12:01:00+00:00")):
