@@ -47,6 +47,13 @@ from scripts.agents import detached_run_process, detached_runs, worker_lifecycle
 LAUNCH_PREPARED_AGENT = herdr.launch_prepared_agent
 
 
+def prepare_recorder_history(path: Path) -> Path:
+    """Create the recorder history file if it is absent."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.touch(exist_ok=True)
+    return path
+
+
 def final_reply(row: staff.StaffRow, message: str = "The conversation is complete.") -> None:
     """Give an idle worker its final transcript reply."""
     backend = staff.backend(row)
@@ -941,9 +948,7 @@ class WorkerPaneTests(StaffTestCase):
         run = Path(os.environ["UNIT_RUN_DIR"])
         state = run / "progress_history_state.json"
         if not state.exists():
-            run.mkdir(exist_ok=True)
-            history = run / "history.jsonl"
-            history.touch(exist_ok=True)
+            history = prepare_recorder_history(run / "history.jsonl")
             write_text_atomic(state, json.dumps({"owner_staff_id": self.parent.id, "working_dir": str(self.root),
                 "open_phases": [{"id": "earlier", "title": "Earlier", "instance_id": "earlier-phase", "started_at": 1,
                                  "status": "active"}], "pass": {}, "events": [],

@@ -375,8 +375,7 @@ class WorkerCommandTests(unittest.TestCase):
         self.prompt = self.run_dir / "prompt.md"
         atomic_file.write_text_atomic(self.prompt, "Read the source and preserve its behavior.\n")
         self.reply = self.run_dir / "reply.md"
-        history = self.run_dir / "history.jsonl"
-        atomic_file.write_text_atomic(history, "")
+        history = pane_fixtures.prepare_recorder_history(self.run_dir / "history.jsonl")
         atomic_file.write_text_atomic(self.run_dir / "progress_history_state.json", json.dumps({
             "open_phases": [{"id": "8", "title": "Workers", "instance_id": "phase-eight", "status": "active", "started_at": 1}],
             "pass": {}, "events": [], "project": {}, "unit": "unit",

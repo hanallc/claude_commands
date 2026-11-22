@@ -30,6 +30,7 @@ from scripts.agents import detached_runs, restart, shutdown_record, worker_lifec
 from scripts.astra import astra_roles
 from scripts.direct import assign, progress_history
 from scripts.herdr import herdr, side_pane, turn_end, worker_panes
+from scripts.herdr.test_worker_panes import prepare_recorder_history
 from scripts.lib import atomic_file, copy_record, process_start, scratch
 from scripts.message import send
 from scripts.lib.test_hang_guard import LauncherHangGuard, TEST_HANG_GUARD_SECS
@@ -1855,8 +1856,7 @@ class TurnEndTests(unittest.TestCase):
                 first_run = self.case.run_dir
                 next_run = self.case.fixture.root / ("next-run-" + recovery.replace(" ", "-"))
                 next_state = cast(dict[str, object], json.loads((first_run / "progress_history_state.json").read_text()))
-                next_history = next_run / "history.jsonl"
-                atomic_file.write_text_atomic(next_history, "")
+                next_history = prepare_recorder_history(next_run / "history.jsonl")
                 next_state["history_file"] = str(next_history)
                 atomic_file.write_text_atomic(next_run / "progress_history_state.json", json.dumps(next_state))
                 first_reply = first_run / (name + "-reply.md")

@@ -32,7 +32,7 @@ from scripts.astra import astra_review, astra_work, design_roles  # noqa: E402
 from scripts.direct import progress_history, recorder_state
 from scripts.astra.design_role_test_support import HeldRolePaneCase, write_empty_binding_record
 from scripts.herdr import worker_panes
-from scripts.herdr.test_worker_panes import PaneWorld, idle_transcript
+from scripts.herdr.test_worker_panes import PaneWorld, idle_transcript, prepare_recorder_history
 from scripts.whoami import agent_accounts  # noqa: E402
 from scripts.lib.stop_injection_test_support import InjectedStop, stop_once
 
@@ -664,8 +664,7 @@ class DurableRolesTests(HeldRolePaneCase):
         _ = (phase / "delegated_phase_reservation_state.json").write_text(json.dumps({
             "kind": "enrolled_awaiting_first_touch", "phase": "1"}))
         _ = (phase / "files").write_text("design.md\n")
-        history = self.root / (name + ".jsonl")
-        _ = history.write_text("")
+        history = prepare_recorder_history(self.root / (name + ".jsonl"))
         _ = (directory / "progress_history_state.json").write_text(json.dumps({
             "run_id": name, "owner_staff_id": owner.id, "history_file": str(history),
             "phase": {"id": "1", "instance_id": instance, "status": "open"},
