@@ -1130,3 +1130,41 @@ Ordered after the red main repair and the guard repair (builds). It does not mov
 - **Acceptance gate:**
   1. A table row: a `verify.sh` process in another pid namespace is not a waiting gate; the same process in the enforcer's namespace is; an unreadable namespace is.
   2. `test_hold_enforcer` and the `build_hold` tests pass; basedpyright zero errors and warnings on changed files.
+
+### Phase 421 — a gate reads its time limit from a small recent-times file  · status: todo
+**Depends on:** none
+
+#### Work Order
+- **Goal:** a gate never updates, rebuilds or locks the buildlog index to get its time limit. It reads a small recent-times file. On 2026-11-21 a merge gate spent more than 60 min with no tests in `index.update()` after the gate rename deploy rewrote the history files. nate approved (List item 190, via bob and builds, 19:31): "1. a small file for the time limit - yes - of course - duh".
+- **Spec:**
+  1. `gate.read_time_limit` (`scripts/production/gate.py:1028`) calls `index.update()` and then `gate_record.history_time_limit` (`scripts/test_times/gate_record.py:425`), which reads only the newest `TOP_RUNS` (5) passing walls: full runs keyed by vCPU count and job count, and per-module walls keyed by vCPU count and module.
+  2. One small file keeps exactly those values: for each full-run key and each module key, the newest `TOP_RUNS` passing walls with their start times. Each passing gate record adds its walls at the place where natedev writes or imports a gate record (local `write_gate_run`, the cloud gate result, the Mac gate result; find every writer). One shared update function; atomic replace under a lock.
+  3. `read_time_limit` reads only this file. With no entry for the key, the result is `NoGateTimeLimit` (today's no-history rule). The selection rules stay the same (status, aborted, selection, step, modules_run, restart, attempt).
+  4. One seed command fills the file once from the committed index (read-only SQL, no `index.update()`).
+  5. No config key changes; no check goes away (builds limit). If one must, stop and tell builds.
+- **Files:** `scripts/test_times/gate_record.py`; `scripts/production/gate.py`; one new module in `scripts/test_times/` for the file; the cloud and Mac record importers; their tests.
+- **Workers:** 1 writer.
+  - impl: all; one shared file reader and writer.
+- **Constraints from prior phases:** Phase 409 (in the merge line) adds a per-module rerun limit that shares the per-module median read; when 409 is on main, merge main and move that read to the file too.
+- **Acceptance gate:**
+  1. Table rows: the full-run limit and the per-module limit from the file equal the index result for the same records; no entry gives `NoGateTimeLimit`; a failed, aborted or restarted run adds nothing; the file keeps only `TOP_RUNS` walls per key.
+  2. A test proves `read_time_limit` opens no index file and takes no index lock.
+  3. The changed test modules pass; basedpyright zero errors and warnings on changed files.
+
+### Phase 422 — old gate records lose their read lists once  · status: todo
+**Depends on:** Phase 421
+
+#### Work Order
+- **Goal:** the history files shrink from 9.5 GiB to a small part of that. Each gate record holds about 10 MB of read lists (content_reads 7.45 MB, folder_scans 2.16 MB in one natedev record). nate approved (via bob and builds, 19:31): "3. yes". Keep the newest lists that `affected_modules.latest_module_reads` reads until the affected-test choice (List item 190 point 2) is settled.
+- **Spec:**
+  1. A one-time deploy step rewrites the month files: it removes `content_reads`, `folder_scans` and `config_reads` from every gate record, except in the newest full, non-aborted gate record that has each field (the rows `affected_modules.py:723` selects).
+  2. The same step updates the index rows in place and writes the new file marks for each rewritten file, so the index reads no file again.
+  3. It runs under a drain hold with the buildlog timer stopped, like the gate rename deploy, at a time natemerge picks after the Part 1 gate. No reader changes.
+  4. New gate records keep their lists until point 2 is settled.
+- **Files:** one deploy module under `scripts/production/`; its tests.
+- **Workers:** 1 writer.
+  - impl: all.
+- **Constraints from prior phases:** Phase 421: gates no longer read the index for the time limit.
+- **Acceptance gate:**
+  1. Table rows on a fixture history: lists removed from old records, kept in the newest record for each field; `latest_module_reads` returns the same result before and after; the index reads no file again after the step.
+  2. A dry run on natedev states the bytes before and after.
