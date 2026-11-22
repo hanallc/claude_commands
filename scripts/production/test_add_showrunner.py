@@ -137,7 +137,10 @@ class AddShowrunnerTests(AddShowrunnerFixture):
     def invoke(self, arguments: list[str], *, cwd: Path | None = None,
                subprocess_cli: bool = False) -> subprocess.CompletedProcess[str]:
         if subprocess_cli:
-            return subprocess.run([sys.executable, "-c", LINUX_LAUNCHER_CLI, str(SCRIPT), *arguments],
+            bootstrap = ("import sys\nfrom pathlib import Path\nfrom scripts.production import production_doc\n"
+                         + "production_doc.GUARD_REPOSITORY = Path(sys.argv.pop(1))\n" + LINUX_LAUNCHER_CLI)
+            return subprocess.run([sys.executable, "-c", bootstrap, str(self.root / "kid-checkout"),
+                                   str(SCRIPT), *arguments],
                                   env=self.env, capture_output=True, text=True, check=False, cwd=cwd,
                                   timeout=TEST_HANG_GUARD_SECS)
         return super().invoke(arguments, cwd=cwd)
