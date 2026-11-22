@@ -6,7 +6,7 @@ from concurrent.futures import Future, ThreadPoolExecutor, wait
 from contextlib import closing, contextmanager, nullcontext, redirect_stderr, redirect_stdout, suppress
 from dataclasses import asdict, dataclass, replace
 from decimal import Decimal
-from functools import cached_property
+from functools import cached_property, partial
 from hashlib import sha256
 from io import StringIO
 import base64
@@ -3285,6 +3285,23 @@ class CloudRouteTests(CloudGateHangGuard, CostFixture):
         self.assertEqual(gate.checked_git(clone, 'rev-parse', 'HEAD^{tree}'), request['tree'])
         self.assertEqual((clone / 'untracked').read_text(), 'untracked file\n')
 
+    def test_request_includes_a_force_added_ignored_module(self) -> None:
+        name = 'scripts/fixture/test_ignored.py'
+        _ = (self.repo / '.git/info/exclude').write_text('/' + name + '\n')
+        _ = (self.repo / name).write_text('import unittest\n')
+        _ = gate.checked_git(self.repo, 'add', '-f', name)
+        head = gate.checked_git(self.repo, 'rev-parse', 'HEAD')
+        index = (self.repo / '.git/index').read_bytes()
+
+        request = cloud_gate.prepare_request(self.repo, self.root / 'attempt', gate.SuiteMode.GATE, 1800)
+
+        self.assertEqual(request['modules'], [name, 'scripts/fixture/test_one.py', 'scripts/fixture/test_two.py'])
+        self.assertEqual(request['dirty_paths'], [name])
+        self.assertEqual(gate.checked_git(self.repo, 'show', ledger.text(request, 'tree') + ':' + name),
+                         'import unittest')
+        self.assertEqual(gate.checked_git(self.repo, 'rev-parse', 'HEAD'), head)
+        self.assertEqual((self.repo / '.git/index').read_bytes(), index)
+
     def test_working_tree_reads_a_same_size_edit_at_the_index_mtime(self) -> None:
         _ = gate.checked_git(self.repo, 'config', 'core.trustctime', 'false')
         source = self.repo / 'racy'
@@ -3308,6 +3325,27 @@ class CloudRouteTests(CloudGateHangGuard, CostFixture):
         tree, dirty = cloud_gate.working_tree(self.repo)
         self.assertIn('racy', dirty)
         self.assertEqual(tree, expected)
+
+    def test_working_tree_reads_edits_to_files_marked_to_skip(self) -> None:
+        source = self.modules[0][1]
+        name = str(source.relative_to(self.repo))
+        head = gate.checked_git(self.repo, 'rev-parse', 'HEAD^{tree}')
+        original = source.read_bytes()
+        for flag in ('assume-unchanged', 'skip-worktree'):
+            with self.subTest(flag=flag):
+                _ = gate.checked_git(self.repo, 'update-index', '--' + flag, '--', name)
+                _ = source.write_text('changed working contents\n')
+                index = (self.repo / '.git/index').read_bytes()
+                try:
+                    tree, dirty = cloud_gate.working_tree(self.repo)
+                    self.assertEqual(dirty, {name})
+                    self.assertNotEqual(tree, head)
+                    self.assertEqual(gate.checked_git(self.repo, 'show', tree + ':' + name),
+                                     'changed working contents')
+                    self.assertEqual((self.repo / '.git/index').read_bytes(), index)
+                finally:
+                    _ = source.write_bytes(original)
+                    _ = gate.checked_git(self.repo, 'update-index', '--no-' + flag, '--', name)
 
     def test_targeted_selection_runs_locally_and_sends_only_selected_paths(self) -> None:
         for dirty, paths, later in ((False, ('test_one.py',), ''), (True, ('test_one.py',), ''),
@@ -3536,6 +3574,29 @@ class CloudRouteTests(CloudGateHangGuard, CostFixture):
             run = gate.run_gate_suites(self.repo)
         self.assertTrue(run.passed)
         self.assertTrue((folder / 'imported.json').is_file())
+
+    def test_cloud_routes_finalize_the_gate_once(self) -> None:
+        folder = self._unimported_gate()
+        typed = gate.GateRun((gate.GateJobResult('types', 'basedpyright', 0, 1, '',
+                                               kind=gate.GateJobKind.TYPE_CHECK),), 1, 0)
+        finish = mock.Mock(side_effect=self._finish_gate_for_resume)
+        run_cloud = partial(cloud_gate.run, service=finish)
+        for route, types in (('saved', ()), ('fresh', ()), ('fallback', ()), ('cloud and types', ('scripts',))):
+            finish.reset_mock()
+            with (self.subTest(route=route), redirect_stdout(StringIO()),
+                  mock.patch.object(cloud_gate, 'AwsCli', side_effect=AssertionError('Use the fake cloud service')),
+                  mock.patch.object(cloud_gate, 'run', side_effect=None if route == 'fallback' else run_cloud,
+                                    return_value=cloud_gate.LocalFallback('fixture fallback')),
+                  mock.patch.object(gate, 'run_suites', return_value=typed) as local,
+                  mock.patch.object(gate, 'finalize_gate', create=True,
+                                    wraps=cast(object, getattr(gate, 'finalize_gate', None))) as finalize):
+                run = gate.run_gate_suites(self.repo, types)
+                self.assertTrue(run.passed)
+                self.assertTrue((folder / 'imported.json').is_file())
+                self.assertEqual(finish.call_count, int(route in ('fresh', 'cloud and types')))
+                self.assertEqual(local.call_count, int(route in ('fallback', 'cloud and types')))
+                finalize.assert_called_once()
+                self.assertIs(run, cast(object, finalize.call_args.args[-1]))
 
     def test_complete_imported_gate_starts_a_new_attempt(self) -> None:
         folder = self._unimported_gate()
@@ -4240,17 +4301,17 @@ class CloudRouteTests(CloudGateHangGuard, CostFixture):
 
     def test_cloud_service_error_releases_its_slot(self) -> None:
         cloud_gate.save(self.state / 'gate-deployment.json', {'image': 'fixture-image', 'template': 'fixture-template'})
-        for status_error in (False, True):
-            with (self.subTest(status_error=status_error),
-                  mock.patch.object(affected_modules, 'dirty_paths', return_value=set(),
-                                    side_effect=affected_modules.GraphError('fixture status error') if status_error else None)):
+        for tree_error in (False, True):
+            with (self.subTest(tree_error=tree_error),
+                  mock.patch.object(cloud_gate, 'working_tree', wraps=cloud_gate.working_tree,
+                                    side_effect=affected_modules.GraphError('fixture tree error') if tree_error else None)):
                 service = mock.Mock(side_effect=OSError('fixture service error'))
                 outcome = cloud_gate.run(self.repo, mode=gate.SuiteMode.GATE, full=True,
                                          module_time_limit_s=1800, service=service)
                 self.assertIsInstance(outcome, cloud_gate.LocalFallback)
                 self.assertTrue(self.admission.callers_released())
-                if status_error:
-                    self.assertEqual(outcome, cloud_gate.LocalFallback('fixture status error'))
+                if tree_error:
+                    self.assertEqual(outcome, cloud_gate.LocalFallback('fixture tree error'))
                     service.assert_not_called()
 
     def test_route_uses_installed_limit_and_handles_missing_results(self) -> None:

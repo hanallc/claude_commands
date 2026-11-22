@@ -9,7 +9,7 @@ import argparse
 import ast
 from collections.abc import Callable, Generator, Sequence
 from concurrent.futures import ThreadPoolExecutor, wait
-from contextlib import ExitStack, contextmanager
+from contextlib import ExitStack, contextmanager, suppress
 from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -34,10 +34,10 @@ from scripts.aws_target.config import account_settings_path, gate_deployment, ga
 from scripts.aws_target.run_cost import GateLaunchVariant as GateLaunchVariant
 from scripts.build_queue import admission_client, admission_protocol as wire, cloud_progress, progress_profile, queue_place, snapshot_codec
 from scripts.build_queue.admission_wire import CloudGroup, NoCloudGroup, NO_CLOUD_GROUP
-from scripts.lib import cancellation
+from scripts.lib import cancellation, git_index
 from scripts.build_targets import target_config
 from scripts.buildlog import store
-from scripts.lib import conf, git_index
+from scripts.lib import conf
 from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, GateJobNotRecorded, StepJob
 from scripts.lib.process_start import process_start, Started, Unreadable
 from scripts.lib.atomic_file import write_text_atomic
@@ -1162,16 +1162,42 @@ def import_record(folder: Path, row: dict[str, object]) -> None:
 
 
 def working_tree(repo: Path) -> tuple[str, set[str]]:
-    dirty = affected_modules.dirty_paths(repo)
-    if not dirty:
-        return gate.checked_git(repo, 'rev-parse', 'HEAD^{tree}'), dirty
+    head, index_path = gate.checked_git(
+        repo, 'rev-parse', '--path-format=absolute', 'HEAD^{tree}', '--git-path', 'index').split('\n', 1)
+    routed = gate.routed_gate_tree(repo)
+    bound = routed.tree if isinstance(routed, gate.RoutedGateTree) else head
     with tempfile.TemporaryDirectory(prefix='cloud-gate-index-') as temporary:
+        def git(index: Path, *arguments: str, input: bytes = b'') -> bytes:
+            environment = {**os.environ, 'GIT_INDEX_FILE': str(index)}
+            return subprocess.run(['git', *arguments], cwd=repo, env=environment, input=input,
+                                  check=True, capture_output=True).stdout
+
         index = Path(temporary) / 'index'
-        git_index.private_copy(Path(gate.checked_git(repo, 'rev-parse', '--path-format=absolute', '--git-path', 'index')), index)
-        environment = {**os.environ, 'GIT_INDEX_FILE': str(index)}
-        _ = subprocess.run(['git', 'add', '-A'], cwd=repo, env=environment, check=True, capture_output=True)
-        tree = subprocess.run(['git', 'write-tree'], cwd=repo, env=environment, check=True, capture_output=True, text=True)
-        return tree.stdout.strip(), dirty
+        # Keep the stat cache and its timestamp for Git's racy-entry check.
+        with suppress(FileNotFoundError):
+            git_index.private_copy(Path(index_path), index)
+        index_changes = git(index, 'diff-index', '--cached', '--no-renames', '--ignore-submodules=none',
+                            '--name-status', '-z', head)
+        files = git(index, 'ls-files', '-v', '-z', '--cached', '--modified', '--others', '--exclude-standard')
+        states = {entry[:1] for entry in files.split(b'\0') if entry}
+        # H marks tracked entries. Other tags can indicate changes or skipped checks.
+        if bound == head and not index_changes and states <= {b'H'}:
+            return head, set()
+        staged = index_changes.split(b'\0')
+        skipped = any(state == b'S' or state.islower() for state in states)
+        if bound != head or b'D' in staged[::2] or skipped:
+            # Keep removed paths and read files that the copied index marks to skip.
+            entries = git(index, 'ls-files', '--stage', '-z')
+            index = Path(temporary) / 'working'
+            _ = git(index, 'read-tree', bound, head)
+            _ = git(index, 'update-index', '--replace', '-z', '--index-info', input=entries)
+        _ = git(index, 'add', '-A')
+        tree = git(index, 'write-tree').decode('ascii').strip()
+        working_changes = (git(index, 'diff-tree', '--no-renames', '--ignore-submodules=none', '--name-only', '-r',
+                               '-z', head, tree).split(b'\0') if tree != head else [])
+    dirty = {path.decode('utf-8', errors='replace') for path in (*staged[1::2], *working_changes)}
+    dirty.discard('')
+    return tree, dirty
 
 
 def create_source_bundle(repo: Path, bundle: Path, commits: Sequence[str], *, exclude: str = '') -> None:

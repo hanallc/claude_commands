@@ -1216,14 +1216,19 @@ ACTIVE_ROUTED_GATE_TREE: ContextVar[RoutedGateTree | NoRoutedGateTree] = Context
     "routed_gate_tree", default=NoRoutedGateTree())
 
 
+def routed_gate_tree(repo: Path) -> RoutedGateTree | NoRoutedGateTree:
+    routed = ACTIVE_ROUTED_GATE_TREE.get()
+    return routed if isinstance(routed, RoutedGateTree) and routed.repo == repo else NoRoutedGateTree()
+
+
 def matches_routed_gate_tree(repo: Path, tree: str) -> bool:
-    expected = ACTIVE_ROUTED_GATE_TREE.get()
-    return isinstance(expected, NoRoutedGateTree) or expected.repo != repo or expected.tree == tree
+    routed = routed_gate_tree(repo)
+    return isinstance(routed, NoRoutedGateTree) or routed.tree == tree
 
 
-def routed_source_tree(cloud: CloudGateRoute, repo: Path) -> str:
+def read_gate_checkout(cloud: CloudGateRoute, repo: Path) -> tuple[str, set[str]]:
     try:
-        return cloud.working_tree(repo)[0]
+        return cloud.working_tree(repo)
     except (affected_modules.GraphError, OSError, ValueError, subprocess.CalledProcessError) as error:
         raise GateRefused(str(error)) from error
 
@@ -1235,8 +1240,12 @@ def clean_test_tree(repo: Path) -> CleanTestTree | UnrecordableTestTree:
         raise GateRefused(str(error)) from error
     if paths:
         return UnrecordableTestTree("checkout is dirty", tuple(paths))
-    commit = checked_git(repo, "rev-parse", "HEAD")
-    return CleanTestTree(checked_git(repo, "rev-parse", f"{commit}^{{tree}}"), commit)
+    return head_test_tree(repo)
+
+
+def head_test_tree(repo: Path) -> CleanTestTree:
+    commit, tree = checked_git(repo, "show", "-s", "--no-show-signature", "--format=%H%n%T", "HEAD").splitlines()
+    return CleanTestTree(tree, commit)
 
 
 @dataclass(frozen=True)
@@ -1364,38 +1373,54 @@ class PendingTestPass:
     discovered: Sequence[tuple[str, Path]]
     required: FullSuite | NoFullRunRequired
 
-    def observe_checkout(self) -> tuple[CleanTestTree | UnrecordableTestTree, bool]:
-        repo = self.ledger.repo
-        modules_match = not self.discovered or list(self.discovered) == discover_test_modules(repo)
-        return clean_test_tree(repo), modules_match
+    def coverage_matches(self) -> bool:
+        return not self.discovered or list(self.discovered) == discover_test_modules(self.ledger.repo)
 
-    def publish_if_eligible(self, ending: CleanTestTree | UnrecordableTestTree, modules_match: bool) -> None:
+    def publish_if_eligible(self, clean_tree: str, modules_match: bool) -> None:
         tested = self.ledger.tree
-        if (modules_match and isinstance(tested, CleanTestTree) and isinstance(ending, CleanTestTree)
-                and tested.tree == ending.tree):
+        if modules_match and isinstance(tested, CleanTestTree) and tested.tree == clean_tree:
             self.ledger.append_pass(ValidatedTestPass(tested, self.selection, self.required))
 
     def publish_local(self) -> None:
         if self.ledger.unavailable or isinstance(self.ledger.tree, UnrecordableTestTree):
             return
         try:
-            ending, modules_match = self.observe_checkout()
+            modules_match = self.coverage_matches()
+            ending = clean_test_tree(self.ledger.repo)
         except (GateRefused, OSError, ValueError) as error:
             self.ledger.report_error(error)
             return
-        self.publish_if_eligible(ending, modules_match)
+        if isinstance(ending, CleanTestTree):
+            self.publish_if_eligible(ending.tree, modules_match)
 
-    def finalize_routed(self, cloud: CloudGateRoute, expected_tree: str) -> None:
+
+@dataclass(frozen=True)
+class PendingEmptyAffectedPass(PendingTestPass):
+    started_at: float
+
+
+def finalize_gate(cloud: CloudGateRoute, routed: RoutedGateTree, run: GateRun) -> GateRun:
+    """Validate the checkout and publish an eligible pass."""
+    pending = routed.pending_pass
+    modules_match = False
+    tested_tree_matches = True
+    if isinstance(pending, PendingTestPass):
+        tested = pending.ledger.tree
         try:
-            ending, modules_match = self.observe_checkout()
+            modules_match = pending.coverage_matches()
         except (OSError, ValueError) as error:
             raise GateRefused(str(error)) from error
-        ending_tree = (ending.tree if isinstance(ending, CleanTestTree)
-                       else routed_source_tree(cloud, self.ledger.repo))
-        tested = self.ledger.tree
-        if ending_tree != expected_tree or (isinstance(tested, CleanTestTree) and tested.tree != expected_tree):
-            raise GateRefused("The checkout changed during the gate")
-        self.publish_if_eligible(ending, modules_match)
+        tested_tree_matches = isinstance(tested, UnrecordableTestTree) or tested.tree == routed.tree
+    tree, dirty = read_gate_checkout(cloud, routed.repo)
+    if tree != routed.tree or not tested_tree_matches:
+        raise GateRefused("The checkout changed during the gate")
+    if run.passed and not dirty and isinstance(pending, PendingTestPass):
+        pending.publish_if_eligible(tree, modules_match)
+    if isinstance(pending, PendingEmptyAffectedPass):
+        record_gate_run(pending.ledger, (), (), {}, {}, started_at=pending.started_at, wall_s=0.0,
+                        hold_wait_s=0.0, selection=pending.selection, reused=False, reason="", status=0,
+                        max_jobs=0, peak_mib=0.0, cap_mib=0.0, aborted=False, mode=SuiteMode.TARGETED)
+    return run
 
 
 def full_required() -> FullSuite | NoFullRunRequired:
@@ -1457,7 +1482,12 @@ def record_gate_run(ledger: PassedTreeLedger, executions: Sequence[GateJobResult
                                if job.kind is GateJobKind.TEST_MODULE and job.suite == suite))}
             for suite, began in suite_started.items()
         ]
-        sha, branch = checked_git(ledger.repo, "rev-parse", "HEAD", "--abbrev-ref", "HEAD").splitlines()
+        tested = ledger.tree
+        if isinstance(tested, CleanTestTree):
+            sha = tested.commit
+            branch = checked_git(ledger.repo, "rev-parse", "--abbrev-ref", "HEAD")
+        else:
+            sha, branch = checked_git(ledger.repo, "rev-parse", "HEAD", "--abbrev-ref", "HEAD").splitlines()
         run: gate_record.GateRun = {
             "started_at": store.utc_iso(started_at), "ended_at": store.utc_iso(datetime.now(UTC).timestamp()),
             "wall_s": wall_s, "hold_wait_s": hold_wait_s,
@@ -1467,11 +1497,11 @@ def record_gate_run(ledger: PassedTreeLedger, executions: Sequence[GateJobResult
             "vcpus": os.cpu_count() or 1,
             "status": status, "max_jobs": max_jobs, "peak_mib": peak_mib, "cap_mib": cap_mib,
             "checkout": str(ledger.repo), "branch": branch, "sha": sha,
-            "tree": ledger.tree.tree if isinstance(ledger.tree, CleanTestTree) else "",
+            "tree": tested.tree if isinstance(tested, CleanTestTree) else "",
             "source": ledger.source, "step": mode.value, "aborted": aborted,
-            "dirty": isinstance(ledger.tree, UnrecordableTestTree),
-            "dirty_paths": list(ledger.tree.dirty_paths[:50]) if isinstance(ledger.tree, UnrecordableTestTree) else [],
-            "dirty_path_count": len(ledger.tree.dirty_paths) if isinstance(ledger.tree, UnrecordableTestTree) else 0,
+            "dirty": isinstance(tested, UnrecordableTestTree),
+            "dirty_paths": list(tested.dirty_paths[:50]) if isinstance(tested, UnrecordableTestTree) else [],
+            "dirty_path_count": len(tested.dirty_paths) if isinstance(tested, UnrecordableTestTree) else 0,
             "suites": suites, "modules": modules, "slow_test_s": slow_test_s,
         }
     except Exception as error:
@@ -1928,8 +1958,8 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
     print(f"One-minute load: start={starting_load:.2f} max={maximum_load:.2f} end={ending_load:.2f}", flush=True)
     if run.passed and not reused and ledger is not None and not isinstance(selection, SelectedModules):
         pending_pass = PendingTestPass(ledger, selection, discovered, required)
-        routed = ACTIVE_ROUTED_GATE_TREE.get()
-        if isinstance(routed, RoutedGateTree) and routed.repo == repo:
+        routed = routed_gate_tree(repo)
+        if isinstance(routed, RoutedGateTree):
             routed.pending_pass = pending_pass
         else:
             pending_pass.publish_local()
@@ -2975,81 +3005,58 @@ def run_gate_suites(repo: Path, type_dirs: Sequence[str] = (),
                           mode=mode, selected=SelectedModules(paths))
 
     def run_cloud(selection: AllModules | TreeSelection) -> GateRun:
-        try:
-            tree = routed_source_tree(cloud, repo) if isinstance(selection, AllModules) else selection.tree
-            routed = RoutedGateTree(repo, tree)
-            token = ACTIVE_ROUTED_GATE_TREE.set(routed)
-            try:
-                outcome = cloud.route(repo, mode=mode, full=full, module_time_limit_s=module_time_limit_s,
-                                      selected=selection, gate_job=gate_job)
-                if isinstance(outcome, str):
-                    print('Cloud gate uses natedev: ' + outcome, flush=True)
-                    run = run_local(type_dirs)
-                elif type_dirs and not outcome.time_limit_report:
-                    local = run_local_subset((), type_dirs)
-                    run = combine_gate_runs(outcome, local, seconds=outcome.seconds + local.seconds)
-                else:
-                    run = outcome
-                if routed_source_tree(cloud, repo) != tree:
-                    raise GateRefused("The checkout changed during the gate")
-                if isinstance(routed.pending_pass, PendingTestPass):
-                    routed.pending_pass.finalize_routed(cloud, tree)
-            finally:
-                ACTIVE_ROUTED_GATE_TREE.reset(token)
-        except affected_modules.GraphError as error:
-            raise GateRefused(str(error)) from error
-        return run
-
-    absent = [name for name in type_dirs if not (repo / name).exists()]
-    if absent:
-        raise GateRefused(f"type dirs not found under {repo}: {', '.join(absent)}")
-    if mode is SuiteMode.GATE:
-        return run_cloud(ALL_MODULES)
-
-    selected: AllModules | TreeSelection = ALL_MODULES
-    whole_suite = full
-    if not full:
-        try:
-            tree, dirty = cloud.working_tree(repo)
-        except affected_modules.GraphError as error:
-            raise GateRefused(str(error)) from error
-        tested_tree = (UnrecordableTestTree("checkout is dirty", tuple(sorted(dirty))) if dirty
-                       else CleanTestTree(tree, checked_git(repo, "rev-parse", "HEAD")))
-        modules = discover_test_modules(repo)
-        selection, ledger = select_targeted_modules(repo, tested_tree, modules, source=source)
-        if ledger.reuse(report=False):
+        outcome = cloud.route(repo, mode=mode, full=full, module_time_limit_s=module_time_limit_s,
+                              selected=selection, gate_job=gate_job)
+        if isinstance(outcome, str):
+            print('Cloud gate uses natedev: ' + outcome, flush=True)
             return run_local(type_dirs)
-        whole_suite = isinstance(selection, FullSuite)
-        paths = selection.modules if isinstance(selection, AffectedSelection) else tuple(path for _, path in modules)
-        selected = TreeSelection(tuple(str(path.relative_to(repo)) for path in paths), tree)
-        if isinstance(selection, AffectedSelection) and not selection.modules:
-            if type_dirs:
+        if type_dirs and not outcome.time_limit_report:
+            local = run_local_subset((), type_dirs)
+            return combine_gate_runs(outcome, local, seconds=outcome.seconds + local.seconds)
+        return outcome
+
+    def select_and_run(routed: RoutedGateTree, dirty: set[str]) -> GateRun:
+        if mode is SuiteMode.GATE:
+            return run_cloud(ALL_MODULES)
+
+        selected: AllModules | TreeSelection = ALL_MODULES
+        whole_suite = full
+        if not full:
+            tested_tree = (UnrecordableTestTree("checkout is dirty", tuple(sorted(dirty))) if dirty
+                           else head_test_tree(repo))
+            if isinstance(tested_tree, CleanTestTree) and tested_tree.tree != routed.tree:
+                raise GateRefused("The checkout changed before test selection")
+            modules = discover_test_modules(repo)
+            selection, ledger = select_targeted_modules(repo, tested_tree, modules, source=source)
+            if ledger.reuse(report=False):
                 return run_local(type_dirs)
-            ledger.record_pass(selection, discovered=modules)
-            record_gate_run(ledger, (), (), {}, {}, started_at=time.time(), wall_s=0.0,
-                            hold_wait_s=0.0, selection=selection, reused=False, reason="", status=0,
-                            max_jobs=0, peak_mib=0.0, cap_mib=0.0, aborted=False, mode=mode)
-            return GateRun((), 0.0, 0.0, selection_certified=True)
+            whole_suite = isinstance(selection, FullSuite)
+            paths = selection.modules if isinstance(selection, AffectedSelection) else tuple(path for _, path in modules)
+            selected = TreeSelection(tuple(str(path.relative_to(repo)) for path in paths), routed.tree)
+            if isinstance(selection, AffectedSelection) and not selection.modules:
+                if type_dirs:
+                    return run_local(type_dirs)
+                routed.pending_pass = PendingEmptyAffectedPass(ledger, selection, modules, NO_FULL_RUN_REQUIRED,
+                                                              started_at=time.time())
+                return GateRun((), 0.0, 0.0, selection_certified=True)
 
-    # Nate ordered the Mac split off on 2026-11-21.
-    return run_cloud(selected)
-
-    mac_module = mac_gate_process.MAC_GATE_MODULE  # pyright: ignore[reportUnreachable]
-    try:
-        mac = mac_gate_process.load_mac_gate_route(mac_module)
-    except ModuleNotFoundError as error:
-        if error.name != mac_module:
-            raise
+        # Nate ordered the Mac split off on 2026-11-21.
         return run_cloud(selected)
-    try:
+
+        mac_module = mac_gate_process.MAC_GATE_MODULE  # pyright: ignore[reportUnreachable]
+        try:
+            mac = mac_gate_process.load_mac_gate_route(mac_module)
+        except ModuleNotFoundError as error:
+            if error.name != mac_module:
+                raise
+            return run_cloud(selected)
         exclusions = mac.read_modules(repo)
         if isinstance(exclusions, MacGateExcludeFileMissing):
             return run_cloud(selected)
         excluded = set(exclusions.paths)
         if isinstance(selected, AllModules):
-            tree, _dirty = cloud.working_tree(repo)
             modules = discover_test_modules(repo)
-            assignment = TreeSelection(tuple(path.relative_to(repo).as_posix() for _, path in modules), tree)
+            assignment = TreeSelection(tuple(path.relative_to(repo).as_posix() for _, path in modules), routed.tree)
         else:
             assignment = selected
         mac_paths = tuple(path for path in assignment.paths if path not in excluded)
@@ -3094,11 +3101,21 @@ def run_gate_suites(repo: Path, type_dirs: Sequence[str] = (),
             run = run_local(type_dirs)
         else:
             run = run_local_subset(linux_paths, type_dirs)
-        if cloud.working_tree(repo)[0] != assignment.tree:
-            raise GateRefused("The checkout changed during the split gate")
         return run
+
+    absent = [name for name in type_dirs if not (repo / name).exists()]
+    if absent:
+        raise GateRefused(f"type dirs not found under {repo}: {', '.join(absent)}")
+    tree, dirty = read_gate_checkout(cloud, repo)
+    routed = RoutedGateTree(repo, tree)
+    token = ACTIVE_ROUTED_GATE_TREE.set(routed)
+    try:
+        run = select_and_run(routed, dirty)
+        return finalize_gate(cloud, routed, run)
     except affected_modules.GraphError as error:
         raise GateRefused(str(error)) from error
+    finally:
+        ACTIVE_ROUTED_GATE_TREE.reset(token)
 
 
 def tell_time_limit(owner: str, repo: Path, run: GateRun) -> None:
