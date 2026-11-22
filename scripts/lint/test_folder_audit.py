@@ -998,7 +998,7 @@ class FolderAuditTests(unittest.TestCase):
         idle = folder(self.temp / "idle", 8)
         now = time.time()
         output = f"p42\nfcwd\nn{used}\n"
-        completed = subprocess.CompletedProcess(tmp_sweep.LSOF, 1, output, "")
+        completed = subprocess.CompletedProcess(tmp_sweep.LSOF, 0, output, "")
         with unittest.mock.patch.object(subprocess, "run", return_value=completed):
             outcomes = folder_audit.judge([(used, now - 8 * DAY), (idle, now - 8 * DAY)], now, False,
                                          proc=str(self.root / "no-proc"), sockets=str(self.root / "no-sockets"))

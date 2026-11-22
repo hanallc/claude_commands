@@ -194,9 +194,15 @@ The supervisor needs a restart request; an exited child alone does not cause a r
 A saved launch keeps its conversation marks but cannot replace an explicit destination account.
 The batch includes the existing stay observation before it records a confirmed or failed move outcome.
 
-The staff row lock covers each member through its build wait, stop, and resume.
-The batch verifies each reference and reads the current conversation while it holds the row lock.
-If a native session gains a staff row, the batch acquires the staff row lock before it acts.
+Each move and unit attachment acquires the native session lock first.
+If the session has a staff row, the operation also acquires that row lock.
+The move holds both locks through its build wait, stop, and resume.
+If the native session changes during a build wait, the move releases the old locks.
+It acquires the new native lock before it acquires the row lock again.
+Attachment refuses while a move holds either lock.
+Retired unit recovery holds both locks in the same order before it starts `add_unit --resume`.
+The child verifies both inherited lock descriptors in native-first order.
+The batch verifies each reference and reads the current conversation while it holds the locks.
 References to the same member share one move and receive the same result.
 Each build check uses the current conversation.
 The batch reports a move to the same account as in progress.
@@ -204,23 +210,46 @@ Other busy rows remain pending while the batch moves available members.
 The pending result is final for the batch and gives the user a retry command.
 The batch omits busy members from both the self-move and build handoffs.
 Each attempt reads the member's live account while it holds the row lock.
+If the read fails, the batch leaves the request file and writes no journal request.
+For a live source, the stop must prove the same PID and start time before it records the request.
+If the request append fails, the batch refuses that member before sending a stop signal.
 The batch reads the current role map for a group move.
 A single-session move uses the explicit account.
 The batch keeps a member running when its live account matches the target.
-The batch checks the Claude destination again after build waits and before it writes a request or sends a stop signal.
-The destination needs a matching local sign-in, an access or refresh token, and a future refresh expiry.
-The batch refuses a member if its live source read fails.
-The stop verifies the live source PID and process start time before it records the source and sends a signal.
-A refused destination leaves the members running and goes in the batch result.
-The handoff carries the group name or explicit account and the results already collected.
-The child saves and reports the carried failures even if a startup read fails.
+The batch validates the Claude destination again after build waits and before launch preparation.
+A Claude destination needs a real account directory and a matching local sign-in.
+The sign-in needs an unexpired refresh token or an unexpired access token if only that token is present.
+A refused destination leaves the members running and keeps their request files.
+The handoff carries the request ID, target, and native session references.
+Before a stop or handoff, the parent writes the new request ID and target under the session locks.
+It writes one file per native session in `latest-requests` beside the move journal.
+The key stays the same when a session gains or loses a staff row.
+The mover checks the request ID under the locks before it stops the member.
+A detached child checks that it owns the request before it reports a member outcome.
+A superseded move reports `not moved: a newer move ran`.
+Success removes the move's own file under the locks.
+Failure leaves the file for retry.
+Each explicit group request checks all members, including members that appear to be on the target.
+If the live account matches the target, the request clears the earlier file under the native lock.
+A busy lock refuses a new request and prints a fresh `batch --target` command for an explicit target.
+For a group request, it prints `batch --group` so the batch reads the current group target under the session lock.
+The batch creates the default `move.log` directory and its parents before it opens the log.
+`retry` can run only a saved request.
+`result` and `retry` check live accounts under the session locks.
+They remove requests for members already on their target, including after `shutdown resume --to`.
+They remove a missing session's request only when a fresh read proves absence.
+Unknown liveness keeps the request and reports the cause.
+Both commands name each file with a decode error and continue with valid files.
+Legacy reports supply display data only.
+Both commands show a fresh batch command for an off-target legacy member.
+`retry` starts a new move for each saved request that still needs a move.
+The journal writer rolls back an incomplete append before it releases the journal lock.
 The refusal watcher reads the row lock, and the unit watchdog holds it through recovery.
 
 The batch keeps the showrunner notices and sends one phone push for the members that still need help.
-The push shows qualified names and gives a short command to retry the batch.
+The push shows qualified names and gives a short command to retry pending moves.
 If the names and the phone footer exceed the push limit, the message gives a command to read the full list.
-The saved batch result holds every pending name and its fixed reference.
-The sender uses the same key for retries of the batch.
+The group and target identify the phone push for repeat suppression.
 `MOVE_ALERT_REPEAT_MINUTES` sets the repeat window to 1,440 minutes by default.
 A standalone resume failure still sends its own keyed push.
 Each completed member records its outcome without waiting for other resumes.
@@ -641,7 +670,52 @@ An unreadable native identity in a retained pane excludes that pane from placeme
 It does not abort another row's launch.
 
 `agents restart` resumes the saved rows that do not run.
-A running row prints `unchanged`.
+`agents restart` and `agents stop --all` print the log path first.
+The commands keep the full report under `shutdown_state_root()/logs` and retain the files.
+A command that stops its caller continues in a detached process.
+The parent gives the detached process access to the open log file.
+The detached process fixes the selected staff IDs before it attempts the claim.
+The report uses these IDs for its session count.
+The detached process creates a claim file before it stops any session.
+On Linux, the detached process confirms the claim to `systemd-run`.
+On macOS, the detached process confirms the claim through a pipe.
+The parent tries to create the same claim file after the launcher returns.
+If the child claims the log, the parent prints one line with the log path and the background status.
+The child writes a failure report if a step fails after it claims the log.
+If SIGKILL or power loss leaves only the log path, run `agents restart` again.
+The failure report names each selected session and records its known result.
+The detached process writes and flushes the full list of sessions before it stops any session.
+If the parent claims the log, it reports the count, the cause, and the step in the terminal and the log.
+A child that starts after the parent claims the log exits without stopping any session.
+If a report write fails, the child tries the same log again and returns a nonzero status.
+If the second write fails, the child writes the full report to stderr.
+The Linux user service sends stderr to the journal.
+Its final line includes the names and steps for unresolved sessions from the first process.
+If log setup fails, the first line gives the path and the rest of the report still appears.
+If the command needs to detach, the report gives the repair for the log error.
+For an unknown log error, Nate sends the error to the efficiency unit.
+The report counts confirmed sessions out of the total, including workers.
+Restart counts sessions that resumed and sessions that already run.
+Dry runs show the count and list sessions without making changes.
+Each unresolved session gets one line with its name, the reason, and who does the next step.
+A worker line also names its owner.
+The final line gives the open steps for the directors and Nate.
+If there are no steps, the final line says `Nothing for you to do.`
+Restart keeps entries that need another restore attempt.
+Restart reads the dispatch state and live detached runs by worker staff ID.
+Restart counts a worker as back when it needs no resume message or when restart sends the message.
+Restart sends a required resume message before it tries to recover the worker's completion.
+If recovery fails after the resume, the worker counts as back and the report gives the director's step.
+If removing a saved entry fails, the report names the session and gives Nate's step.
+Restart removes only worker entries that it resolves.
+Run `worker.py restore` in the owner session to see completed dispatches in open phases.
+
+Herdr upkeep skips row work while a stop or restart holds the activity lock.
+Saved rows can remain after the activity lock closes.
+Stop pauses upkeep and waits for its producer row locks before reading fresh staff and liveness data.
+The `UPKEEP_ROW_WAIT_SECONDS` setting in `config/shutdown.conf` limits the wait.
+If the time expires, the report names the row and gives the command to run again.
+
 A restarted unit director or showrunner gets one continuation message in its current conversation.
 The shared resume message builder supplies the text.
 The default cause is "agents restart ran".
@@ -714,14 +788,9 @@ A Claude transcript missing from the current read also makes the transcript unre
 A matching user turn followed by an assistant turn or tool call confirms resumed work.
 All checked directors share one deadline.
 The check ends as soon as every director resumes.
-At the deadline, each failed check prints one of these lines:
-
-- `<name>: restart check: no continuation message`
-- `<name>: restart check: no work after the continuation message`
-- `<name>: restart check: transcript unreadable`
-
-The check then prints `restart check: <passed> of <checked> directors resumed`.
-The check prints nothing when it checks no director.
+After the deadline, the report names each director whose check failed.
+The reason can be a missing continuation message, no work after the message, or an unreadable transcript.
+The director checks the continuation message.
 It skips held directors, unchanged rows, failed starts, workers, producers, dry runs, and stop-only commands.
 It does not change the exit code, restart record, or staff.
 config/shutdown.conf sets RESUME_CHECK_SECONDS=180 and RESUME_CHECK_INTERVAL_SECONDS=5.
@@ -751,7 +820,8 @@ The record stores no session facts, progress, claims, recovery states, or pane p
 The record holds only rows that a restart starts:
 - `stop --all` and scoped `held-sessions` save no worker that `worker.restore` would not start.
 - `worker.not_restored` names that worker: a Codex worker in no-worker mode, or a worker with no active dispatch and no detached run.
-- `restart` removes a saved id with no staff row, or a saved worker that `worker.not_restored` names, with one anomaly line: `<name>: restart anomaly: <reason>; removed from the restart record`.
+- `restart` removes a saved id with no staff row or a saved worker that `worker.not_restored` names.
+- The report names the removed entry and gives the reason.
 - `restart --dry-run` prints the same line with `would leave the restart record` and changes nothing.
 - `staff.retire`, a worker pane close in `worker_panes.close`, and the Codex worker stop in `worker_capacity.py` remove the id with `shutdown_record.forget`.
 - An id stays only after a failure that a retry can fix, such as an unreadable dispatch record.
