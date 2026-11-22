@@ -179,8 +179,6 @@ class AddStyleTests(unittest.TestCase):
         self.checkout = home / "worktrees" / self.repo.name / self.merge_name / "integration-sample-style"
         self.doc = self.repo / "docs" / f"sample-style-production{LIVE_DOCUMENT_SUFFIX}"
         _ = shutil.copytree(self.repository_seed, self.repo)
-        _ = self.git("remote", "add", "origin", str(self.repo.with_suffix(".git")))
-        home = self.root / "home"
         config = home / ".claude/config"
         config.mkdir(parents=True)
         _ = (config / "build_folders.conf").write_text(
@@ -220,6 +218,7 @@ class AddStyleTests(unittest.TestCase):
             "UNIT_RUN_ROOT": str(self.root / "units"),
             "SCRATCH_ROOT": str(self.root / "scratch"),
         }
+        _ = self.git("remote", "add", "origin", str(self.repo.with_suffix(".git")))
         _ = self.enterContext(isolated_staff_file(self.root / "staff/staff.json", self.env))
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, self.env, clear=True)))
         _ = self.enterContext(mock.patch.object(style_rules, "NATE_STYLE_DIR", rule_root))
