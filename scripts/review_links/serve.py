@@ -1415,16 +1415,17 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             if not self.valid_request_token(fields.pop("token", None)):
                 self.json_response(403, {"reason": "The queue move token expired. Refresh Builds."})
                 return
-            if fields.keys() - {"undo_destination"} != {"request_id", "row_id", "revision", "destination"}:
-                raise ValueError("Send a request ID, row, revision and destination.")
-            request = admission.parse_record(json.dumps({**fields, "kind": "QueueMoveRequest"}), admission.QueueMoveRequest)
-            other_id = (request.destination.neighbor if isinstance(request.destination, admission.QueueDrop)
-                        else request.destination.move_request_id)
-            identities = (request.request_id, request.row_id, other_id, request.revision)
-            if request.undo_destination is not None:
-                if isinstance(request.destination, admission.QueueUndo):
-                    raise ValueError("Undo uses the saved destination.")
-                identities = (*identities, request.undo_destination.neighbor)
+            kind = fields.get("kind")
+            if "code_version" in fields or kind not in ("QueueMoveRequest", "QueueUndoRequest"):
+                raise ValueError("Send one queue move or Undo request.")
+            if kind == "QueueUndoRequest":
+                request = admission.parse_record(json.dumps(fields), admission.QueueUndoRequest)
+                other_ids = (request.move_request_id,)
+            else:
+                request = admission.parse_record(json.dumps(fields), admission.QueueMoveRequest)
+                other_ids = tuple(drop.neighbor for drop in (request.destination, request.undo_destination)
+                                  if isinstance(drop, admission.QueueDrop))
+            identities = (request.request_id, request.row_id, request.revision, *other_ids)
             if any(not re.fullmatch(r"[0-9a-f]{32}", key) for key in identities):
                 raise ValueError("Invalid queue move identity.")
         except (ValueError, TypeError, TimeoutError, RecursionError) as error:

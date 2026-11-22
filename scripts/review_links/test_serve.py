@@ -4213,7 +4213,10 @@ class ReviewLinksServerTests(unittest.TestCase):
             undo_destination=admission.QueueDrop("6" * 32, "after"))
         line = records.QueueMoveLine("5" * 32, (records.QueueMoveMember(request.row_id),))
         content = cast(dict[str, object], json.loads(admission.encode_record(request)))
-        del content["kind"], content["code_version"]
+        del content["code_version"]
+        undo = admission.QueueUndoRequest("7" * 32, request.row_id, request.revision, request.request_id)
+        undo_content = cast(dict[str, object], json.loads(admission.encode_record(undo)))
+        del undo_content["code_version"]
         headers = {"Content-Type": "application/json"}
         remote_node: dict[str, object] = {}
         remote_user = {"ID": 8}
@@ -4243,7 +4246,7 @@ class ReviewLinksServerTests(unittest.TestCase):
             del self_node["Tags"]
             token = self.request(serve.QUEUE_MOVE_PATH)
             self.assertEqual(token.status, 200)
-            content["token"] = self.server.new_item_token
+            content["token"] = undo_content["token"] = self.server.new_item_token
             body = json.dumps(content)
             for sent, sent_origin, status in (
                 (body, "", 403),
@@ -4251,6 +4254,7 @@ class ReviewLinksServerTests(unittest.TestCase):
                 (json.dumps({**content, "token": "wrong"}), origin, 403),
                 (json.dumps({**content, "undo_destination": {"kind": "QueueDrop",
                     "neighbor": "not-a-row-id", "side": "before"}}), origin, 400),
+                (json.dumps({**undo_content, "destination": content["destination"]}), origin, 400),
                 (body + " " * 512, origin, 400),
             ):
                 with self.subTest(status=status, origin=sent_origin):
@@ -4261,6 +4265,10 @@ class ReviewLinksServerTests(unittest.TestCase):
             self.assertEqual(status, 409)
             self.assertIn(b'"reason": "The queue changed."', reply)
             move.assert_called_once_with(request, 3)
+            move.reset_mock()
+            status, _ = self.post(serve.QUEUE_MOVE_PATH, json.dumps(undo_content), origin=origin, headers=headers)
+            self.assertEqual(status, 409)
+            move.assert_called_once_with(undo, 3)
 
     def test_console_tune_requires_the_origin_and_token(self) -> None:
         key = "faster_box_max_cost_ratio"

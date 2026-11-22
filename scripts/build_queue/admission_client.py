@@ -1472,7 +1472,8 @@ def width(reservation: str, width: int) -> wire.Ok | wire.Refused:
     return _mutation(wire.WidthRequest(request_id(), reservation, width))
 
 
-def move_queue(request: wire.QueueMoveRequest, timeout: float) -> wire.QueueMoved | wire.QueueMoveConflict | wire.Refused:
+def move_queue(request: wire.QueueMoveRequest | wire.QueueUndoRequest, timeout: float
+               ) -> wire.QueueMoved | wire.QueueMoveConflict | wire.Refused:
     """Submit one console move with a bounded response time."""
     deadline = CLOCK.monotonic() + timeout
     with _connect(timeout) as connection:

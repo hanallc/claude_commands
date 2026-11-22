@@ -2411,6 +2411,8 @@ If that neighbor left the queue, the service refuses Undo.
 Undo uses the current queue order and saves pins as a new move.
 A conflict supplies the current order. If the revision changed, the page waits for a fresh reading.
 A move sends the drop target and the former shown neighbor for Undo.
-The service uses the full order to anchor the drop.
+A drop above the first shown row uses the head anchor, ahead of unnamed and absent waits.
+Other drops use their neighbor in the full order.
+An Undo request identifies the move to restore. The service gets the destination from the saved reply.
 The page applies the confirmed order to the rows it shows.
 The confirmation uses the table numbers, including the places of waits without handles.

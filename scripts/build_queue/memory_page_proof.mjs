@@ -155,6 +155,8 @@ try {
   let servedReading = base;
   let currentFixture = base;
   let queueFixture = null;
+  let unnamedPlace = 0;
+  let confirmedQueueLine = null;
   const undoDrops = new Map();
   const server = createServer(async (req, res) => {
     if (req.url === '/console/builds/queue-move') {
@@ -171,35 +173,40 @@ try {
       const {revision, row_id, destination} = request;
       const rows = queueFixture.waiters;
       const ordered = rows.filter(row => row.move);
-      const line = () => {
-        const members = ordered.map(row => row.move);
-        members.splice(1, 0, {row_id:'unnamed-wait'});
-        return {revision:queueFixture.move_revision, members};
-      };
+      const members = ordered.map(row => row.move);
+      const unnamed = {row_id:'unnamed-wait'};
+      members.splice(unnamedPlace, 0, unnamed);
+      const line = () => ({revision:queueFixture.move_revision, members});
       if (revision !== queueFixture.move_revision) return json(409, {reason:'The queue changed.', line:line()});
-      const keys = ['destination', 'request_id', 'revision', 'row_id', 'token'];
-      if (destination.kind === 'QueueDrop') keys.push('undo_destination');
-      assert.deepEqual(Object.keys(request).sort(), keys);
+      const undo = request.kind === 'QueueUndoRequest';
+      if (!undo) assert.equal(request.kind, 'QueueMoveRequest');
+      assert.deepEqual(Object.keys(request).sort(), undo
+        ? ['kind', 'move_request_id', 'request_id', 'revision', 'row_id', 'token']
+        : ['destination', 'kind', 'request_id', 'revision', 'row_id', 'token', 'undo_destination']);
       const index = ordered.findIndex(row => row.move.row_id === row_id);
       const after = ordered[index + 1]?.move.row_id;
       const before = ordered[index - 1]?.move.row_id;
-      const drop = destination.kind === 'QueueUndo' ? undoDrops.get(destination.move_request_id) : destination;
-      if (!drop || !ordered.some(item => item.move.row_id === drop.neighbor)) {
+      const drop = undo ? undoDrops.get(request.move_request_id) : destination;
+      if (!drop || (drop.kind !== 'QueueHeadDrop' && !ordered.some(item => item.move.row_id === drop.neighbor))) {
         return json(409, {reason:'The old neighbor left the queue.', line:line()});
       }
-      const [row] = ordered.splice(index, 1);
-      const neighbor = ordered.findIndex(item => item.move.row_id === drop.neighbor);
-      const next = neighbor + (drop.side === 'after' ? 1 : 0);
-      ordered.splice(next, 0, row);
+      const [member] = members.splice(members.findIndex(item => item.row_id === row_id), 1);
+      const next = drop.kind === 'QueueHeadDrop' ? 0
+        : members.findIndex(item => item.row_id === drop.neighbor) + (drop.side === 'after' ? 1 : 0);
+      members.splice(next, 0, member);
+      unnamedPlace = members.indexOf(unnamed);
+      const byId = new Map(ordered.map(row => [row.move.row_id, row]));
+      const shown = members.filter(item => byId.has(item.row_id)).map(item => byId.get(item.row_id));
       let place = 0;
-      queueFixture.waiters = rows.map(item => item.move ? ordered[place++] : item);
-      if (destination.kind === 'QueueDrop') {
+      queueFixture.waiters = rows.map(item => item.move ? shown[place++] : item);
+      if (!undo) {
         assert.deepEqual(request.undo_destination, {kind:'QueueDrop',
           neighbor:after || before, side:after ? 'before' : 'after'});
         undoDrops.set(request.request_id, request.undo_destination);
       }
       queueFixture.move_revision += '1';
-      return json(200, {line:line()});
+      confirmedQueueLine = line();
+      return json(200, {line:confirmedQueueLine});
     }
     const isData = req.url.startsWith('/memory.json'), isReport = req.url.startsWith('/report.json');
     res.writeHead(200, {'Content-Type':isData || isReport ? 'application/json' : 'text/html; charset=utf-8'});
@@ -470,6 +477,7 @@ try {
       async function checkQueueDrag(navigate, evaluate, call) {
         const template = readings.spacing.waiters.find(row => row.kind !== 'cloud');
         const units = ['natemerge', 'unit-board', 'aws', 'postmaster', 'typesafe'];
+        unnamedPlace = 0;
         queueFixture = {...structuredClone(readings.spacing), move_revision:'fixture',
           waiters:units.map((unit, index) => ({...template, key:unit, unit, detail:unit,
             name:queueDragProof ? 'test affected' : `${unit} test affected`, title:{unit, step:'test affected'},
@@ -550,6 +558,8 @@ try {
         assert.equal((await snapshot()).line, 'Place 1');
         await evaluate(`document.activeElement.dispatchEvent(new KeyboardEvent('keydown', {key:'Enter', bubbles:true}))`);
         await waitForLine('unit-board · test affected moved from 2 to 1');
+        assert.deepEqual(confirmedQueueLine.members.slice(0, 3).map(member => member.row_id),
+          ['unit-board', 'unnamed-wait', 'natemerge']);
         assert.deepEqual((await snapshot()).handles, ['unit-board', 'natemerge', 'aws', 'postmaster', 'typesafe']);
         await evaluate("document.querySelector('#queue-action').click(); true");
         await waitForLine('unit-board · test affected moved from 1 to 2');

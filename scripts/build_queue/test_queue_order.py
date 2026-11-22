@@ -101,8 +101,8 @@ class QueueMoveTests(unittest.TestCase):
                 moved, = fixture.server.handle_request(wire.QueueMoveRequest("move", second_id, line.revision, drop))
                 assert isinstance(moved, wire.QueueMoved)
                 self.assertEqual(fixture.server.slots[first_grant.reservation], claim)
-                undone, = fixture.server.handle_request(wire.QueueMoveRequest(
-                    "undo", second_id, moved.line.revision, wire.QueueUndo("move")))
+                undone, = fixture.server.handle_request(wire.QueueUndoRequest(
+                    "undo", second_id, moved.line.revision, "move"))
                 assert isinstance(undone, wire.QueueMoved)
                 self.assertEqual(ids(undone.line), [first_id, second_id])
                 self.assertEqual(fixture.server.slots[first_grant.reservation], claim)
@@ -145,8 +145,8 @@ class QueueMoveTests(unittest.TestCase):
             assert isinstance(claim, records.ContinuationSlot)
             self.assertEqual(claim.owner, records.run_owner(second.owner.pid, second.owner.start_time))
 
-            undone, = fixture.server.handle_request(wire.QueueMoveRequest(
-                "undo-after-release", second_id, moved.line.revision, wire.QueueUndo("move-before-release")))
+            undone, = fixture.server.handle_request(wire.QueueUndoRequest(
+                "undo-after-release", second_id, moved.line.revision, "move-before-release"))
             assert isinstance(undone, wire.QueueMoved)
             result = fixture.run_pass()
             self.assertFalse(fixture.server.reservations)
@@ -357,8 +357,8 @@ class QueueMoveTests(unittest.TestCase):
                 assert isinstance(stall, head_stall.HeadStall)
                 self.assertEqual(stall.pid, ci.owner.pid)
                 line = move_line(fixture)
-                undo, = fixture.server.handle_request(wire.QueueMoveRequest(
-                    "undo-missing", line.members[-1].row_id, line.revision, wire.QueueUndo("missing")))
+                undo, = fixture.server.handle_request(wire.QueueUndoRequest(
+                    "undo-missing", line.members[-1].row_id, line.revision, "missing"))
                 self.assertEqual(undo, wire.QueueMoveConflict(line, "Undo not available"))
                 self.assertEqual(fixture.server.handle_request(wire.CancelPlacement(
                     "cancel-remote", remote.episode, remote.owner, "fixture")), [wire.Ok()])
@@ -454,8 +454,8 @@ class QueueMoveTests(unittest.TestCase):
             self.assertEqual(ids(current), [first, pinned, third, fourth, last, fifth])
             self.assertEqual(fixture.server.queue_pins,
                              (QueuePin(pinned, QueueRowAnchor(first)), QueuePin(last, QueueRowAnchor(fourth))))
-            undone, = fixture.server.handle_request(wire.QueueMoveRequest(
-                "undo-last", last, current.revision, wire.QueueUndo("drag-last")))
+            undone, = fixture.server.handle_request(wire.QueueUndoRequest(
+                "undo-last", last, current.revision, "drag-last"))
             assert isinstance(undone, wire.QueueMoved)
             self.assertEqual(ids(undone.line), [first, pinned, third, fourth, fifth, last])
             self.assertEqual(fixture.server.queue_pins,
@@ -545,8 +545,8 @@ class QueueMoveTests(unittest.TestCase):
             _ = fixture.run_pass()
             self.assertEqual(move_line(fixture), move.line)
 
-            undo, = fixture.server.handle_request(wire.QueueMoveRequest(
-                "undo-second", first, move.line.revision, wire.QueueUndo("pin-after")))
+            undo, = fixture.server.handle_request(wire.QueueUndoRequest(
+                "undo-second", first, move.line.revision, "pin-after"))
             assert isinstance(undo, wire.QueueMoved)
             self.assertEqual(ids(undo.line), [first, second, third, pinned, fourth])
             self.assertEqual(fixture.server.queue_pins,
@@ -597,11 +597,78 @@ class QueueMoveTests(unittest.TestCase):
                 undo_destination=wire.QueueDrop(third, "before")))
             assert isinstance(lifted, wire.QueueMoved)
             self.assertEqual(lifted.undo_destination, wire.QueueDrop(third, "before"))
-            undone, = fixture.server.handle_request(wire.QueueMoveRequest(
-                "undo-hidden", last, lifted.line.revision, wire.QueueUndo("move-to-head")))
+            undone, = fixture.server.handle_request(wire.QueueUndoRequest(
+                "undo-hidden", last, lifted.line.revision, "move-to-head"))
             assert isinstance(undone, wire.QueueMoved)
             self.assertEqual(ids(undone.line), [first, hidden, last, third, hidden_tail])
             self.assertEqual(fixture.server.queue_pins, (QueuePin(last, QueueRowAnchor(hidden)),))
+
+    def test_head_drop_goes_ahead_of_a_leading_unnamed_wait(self) -> None:
+        from scripts.build_queue import admission_client, memory_feed
+        from scripts.build_queue.test_memory_feed import MemoryFeedTests
+
+        with AdmissionFixture() as fixture:
+            fixture.free(0)
+            fixture.hold_starts()
+            unnamed, first, second = [fixture.request(since=fixture.clock.now() + index) for index in range(3)]
+            unnamed = replace(unnamed, identity=wire.Identity("", "", "", ""), cwd="",
+                profile=replace(unnamed.profile, step="", repo=""))
+            for request in (unnamed, first, second):
+                self.assertIsInstance(fixture.server.handle_request(request)[0], wire.Wait)
+            line = move_line(fixture)
+            hidden_id, first_id, second_id = ids(line)
+            moved, = fixture.connect(wire.QueueMoveRequest(
+                "head-drop", second_id, line.revision, wire.QueueHeadDrop(),
+                undo_destination=wire.QueueDrop(first_id, "after"))).replies()
+            assert isinstance(moved, wire.QueueMoved)
+            self.assertEqual(ids(moved.line), [second_id, hidden_id, first_id])
+            self.assertEqual(fixture.server.queue_pins, (QueuePin(second_id, QueueHeadAnchor()),))
+
+            reply, = fixture.server.handle_request(wire.ViewRequest())
+            assert isinstance(reply, wire.ViewReply)
+            self.assertEqual(fixture.queue_pids(), [second.owner.pid, unnamed.owner.pid, first.owner.pid])
+            feed = MemoryFeedTests()
+            feed.setUp()
+            try:
+                with patch.object(admission_client, "view", return_value=reply.reading):
+                    page = memory_feed.reading()
+            finally:
+                _ = feed.doCleanups()
+            self.assertEqual([row["pid"] for row in page["waiters"]], [second.owner.pid, first.owner.pid])
+            self.assertEqual(page.get("move_revision"), moved.line.revision)
+
+    def test_socket_refuses_undo_with_an_unrelated_destination(self) -> None:
+        with AdmissionFixture() as fixture:
+            fixture.free(0)
+            fixture.hold_starts()
+            for index in range(3):
+                self.assertIsInstance(fixture.server.handle_request(
+                    fixture.request(since=fixture.clock.now() + index))[0], wire.Wait)
+            line = move_line(fixture)
+            first, second, third = ids(line)
+            moved, = fixture.server.handle_request(wire.QueueMoveRequest(
+                "move", second, line.revision, wire.QueueDrop(first, "before")))
+            assert isinstance(moved, wire.QueueMoved)
+            message = wire.encode_record({"v": wire.VERSION, "type": "queue_move", "data": {
+                "kind": "QueueMoveRequest", "request_id": "undo", "row_id": second,
+                "revision": moved.line.revision, "destination": {"kind": "QueueUndo", "move_request_id": "move"},
+                "undo_destination": wire.QueueDrop(third, "after")}}) + "\n"
+            reply, = fixture.connect(message).replies()
+            self.assertIsInstance(reply, wire.Refused)
+
+            undo = wire.QueueUndoRequest("undo", second, moved.line.revision, "move")
+            data = cast(dict[str, object], json.loads(wire.encode_record(undo)))
+            for field, value in (("destination", wire.QueueDrop(third, "after")), ("undo_destination", None)):
+                with self.subTest(field=field):
+                    message = wire.encode_record({"v": wire.VERSION, "type": "queue_undo",
+                        "data": {**data, field: value}}) + "\n"
+                    self.assertEqual(fixture.connect(message).replies(),
+                                     [wire.Refused("Unexpected queue move request field.")])
+                    self.assertEqual(move_line(fixture), moved.line)
+
+            undone, = fixture.connect(undo).replies()
+            assert isinstance(undone, wire.QueueMoved)
+            self.assertEqual(ids(undone.line), [first, second, third])
 
     def test_unstarted_scoped_grant_shows_once_and_keeps_its_memory_charge(self) -> None:
         from scripts.build_queue import admission_client, memory_feed
@@ -934,8 +1001,8 @@ class QueueMoveTests(unittest.TestCase):
             self.assertEqual(ids(cross.line), [merge, third, urgent, first, second])
             _ = fixture.run_pass()
             self.assertEqual(move_line(fixture), cross.line)
-            undone, = fixture.server.handle_request(wire.QueueMoveRequest(
-                "undo-cross", third, cross.line.revision, wire.QueueUndo("cross")))
+            undone, = fixture.server.handle_request(wire.QueueUndoRequest(
+                "undo-cross", third, cross.line.revision, "cross"))
             assert isinstance(undone, wire.QueueMoved)
             self.assertEqual((undone.old_place, undone.new_place), (2, 5))
             self.assertEqual(ids(undone.line), ids(line))
@@ -978,8 +1045,8 @@ class QueueMoveTests(unittest.TestCase):
                 "bump-dragged-unit", "ordinary", "fixture", "fixture")), [wire.Ok()])
             current = move_line(fixture)
             self.assertEqual(ids(current), [third, merge, urgent, first, new_id, second])
-            undone, = fixture.server.handle_request(wire.QueueMoveRequest(
-                "undo-after-bump", third, current.revision, wire.QueueUndo("move")))
+            undone, = fixture.server.handle_request(wire.QueueUndoRequest(
+                "undo-after-bump", third, current.revision, "move"))
             assert isinstance(undone, wire.QueueMoved)
             self.assertEqual(ids(undone.line), [merge, urgent, first, new_id, second, third])
             self.assertEqual(fixture.server.queue_pins, (QueuePin(third, QueueRowAnchor(second)),))
@@ -1037,8 +1104,8 @@ class QueueMoveTests(unittest.TestCase):
             pinned_again, = fixture.server.handle_request(wire.QueueMoveRequest(
                 "pin-first", second, moved.revision, wire.QueueDrop(first, "before")))
             assert isinstance(pinned_again, wire.QueueMoved)
-            undone_pin, = fixture.server.handle_request(wire.QueueMoveRequest(
-                "restore-pin", second, pinned_again.line.revision, wire.QueueUndo("pin-first")))
+            undone_pin, = fixture.server.handle_request(wire.QueueUndoRequest(
+                "restore-pin", second, pinned_again.line.revision, "pin-first"))
             assert isinstance(undone_pin, wire.QueueMoved)
             self.assertEqual(ids(undone_pin.line), ids(moved))
             self.assertEqual(fixture.server.queue_pins, (QueuePin(second, QueueRowAnchor(last)),))
@@ -1049,11 +1116,11 @@ class QueueMoveTests(unittest.TestCase):
             self.assertEqual(ids(crossed.line), [third, last, second, first])
             _ = fixture.run_pass()
             self.assertEqual(move_line(fixture), crossed.line)
-            restored, = fixture.server.handle_request(wire.QueueMoveRequest(
-                "undo-crossing", first, crossed.line.revision, wire.QueueUndo("cross-pinned")))
+            restored, = fixture.server.handle_request(wire.QueueUndoRequest(
+                "undo-crossing", first, crossed.line.revision, "cross-pinned"))
             assert isinstance(restored, wire.QueueMoved)
             self.assertEqual(ids(restored.line), ids(moved))
-            undo = wire.QueueMoveRequest("undo", second, restored.line.revision, wire.QueueUndo("move"))
+            undo = wire.QueueUndoRequest("undo", second, restored.line.revision, "move")
             reply, = fixture.server.handle_request(undo)
             assert isinstance(reply, wire.QueueMoved)
             self.assertEqual(ids(reply.line), ids(line))
@@ -1067,8 +1134,8 @@ class QueueMoveTests(unittest.TestCase):
             for waiting in (requests[0], requests[1], requests[3]):
                 _ = fixture.server.handle_request(waiting)
             current = move_line(fixture)
-            reply, = fixture.server.handle_request(wire.QueueMoveRequest(
-                "missing-neighbor", second, current.revision, wire.QueueUndo("move-again")))
+            reply, = fixture.server.handle_request(wire.QueueUndoRequest(
+                "missing-neighbor", second, current.revision, "move-again"))
             self.assertEqual(reply, wire.QueueMoveConflict(current, "The old neighbor left the queue."))
 
     def test_mac_only_join_refuses_a_confirm_with_an_old_revision(self) -> None:

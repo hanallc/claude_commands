@@ -4666,7 +4666,7 @@ done
             return ""
         if isinstance(request, (wire.PrioritySetRequest, wire.PriorityClearRequest)):
             return "queue priority and head admission require the service account"
-        if isinstance(request, wire.QueueMoveRequest):
+        if isinstance(request, (wire.QueueMoveRequest, wire.QueueUndoRequest)):
             return "queue moves require the service account"
         if isinstance(request, (wire.BuildHistoryRequest, wire.ViewRequest, wire.ExplainRequest, wire.MineRequest)):
             return ""
@@ -4817,7 +4817,7 @@ done
             if isinstance(request, wire.ViewRequest):
                 return [published.view]
             return [wire.MineReply(published.view.reading)]
-        if isinstance(request, wire.QueueMoveRequest):
+        if isinstance(request, (wire.QueueMoveRequest, wire.QueueUndoRequest)):
             return self._move_queue(request)
         key = request.episode if isinstance(request, (wire.AdmitRequest, wire.LaunchRequest)) else request.request_id
         replay = self.ledger.get(key)
@@ -4905,7 +4905,7 @@ done
             return replies if ran else []
         return [self.ledger[key].reply]
 
-    def _move_queue(self, request: wire.QueueMoveRequest) -> list[wire.Reply]:
+    def _move_queue(self, request: wire.QueueMoveRequest | wire.QueueUndoRequest) -> list[wire.Reply]:
         key = "queue-move:" + request.request_id
         previous = self.ledger.get(key)
         if previous is not None:
@@ -4916,8 +4916,8 @@ done
         rows = self._visible_queue_order(full_order)
         line = self._current_move_line(rows, self._movable_wait_ids(check_owners=True))
         undo = None
-        if isinstance(destination := request.destination, wire.QueueUndo):
-            saved = self.ledger.get("queue-move:" + destination.move_request_id)
+        if isinstance(request, wire.QueueUndoRequest):
+            saved = self.ledger.get("queue-move:" + request.move_request_id)
             if saved is not None and isinstance(saved.reply, wire.QueueMoved):
                 undo = saved.reply
         result = self._move_destination(request, line, undo,
@@ -4927,41 +4927,48 @@ done
             self.next_pass = self.clock.monotonic()
         return self._mutation_reply(key, result)
 
-    def _move_destination(self, request: wire.QueueMoveRequest, line: records.QueueMoveLine,
+    def _move_destination(self, request: wire.QueueMoveRequest | wire.QueueUndoRequest, line: records.QueueMoveLine,
                           saved: wire.QueueMoved | None, full_order: list[str]
                           ) -> wire.QueueMoved | wire.QueueMoveConflict:
         changed = wire.QueueMoveConflict(line, "The queue changed. Try the move again.")
         unavailable = wire.QueueMoveConflict(line, "Undo not available")
         by_id = {member.row_id: member for member in line.members}
         moving = by_id.get(request.row_id)
-        destination = request.destination
-        undo = isinstance(destination, wire.QueueUndo)
+        undo = isinstance(request, wire.QueueUndoRequest)
         if moving is None or not moving.movable or request.revision != line.revision:
             return unavailable if undo else changed
         row_id = moving.row_id
         order = list(by_id)
         old_index = order.index(row_id)
         del order[old_index]
-        if isinstance(destination, wire.QueueUndo):
+        if isinstance(request, wire.QueueUndoRequest):
             if saved is None or saved.row_id != row_id:
                 return unavailable
             destination = saved.undo_destination
-        if destination.neighbor not in order:
-            return wire.QueueMoveConflict(line, "The old neighbor left the queue.") if undo else changed
-        undo_destination = request.undo_destination
+            undo_destination = None
+        else:
+            destination = request.destination
+            undo_destination = request.undo_destination
+        if isinstance(destination, wire.QueueHeadDrop):
+            if not order:
+                return changed
+            place = 0
+        else:
+            if destination.neighbor not in order:
+                return wire.QueueMoveConflict(line, "The old neighbor left the queue.") if undo else changed
+            place = order.index(destination.neighbor) + int(destination.side == "after")
         if undo_destination is None:
             undo_destination = (wire.QueueDrop(order[old_index], "before") if old_index < len(order)
                                 else wire.QueueDrop(order[-1], "after"))
         elif undo_destination.neighbor not in order:
             return unavailable if undo else changed
-        place = order.index(destination.neighbor) + int(destination.side == "after")
         updated = line
-        if place != old_index:
-            self._move_pin(row_id, destination, full_order, first=place == 0)
+        if place != old_index or isinstance(destination, wire.QueueHeadDrop):
+            self._move_pin(row_id, wire.QueueHeadDrop() if place == 0 else destination, full_order)
             updated = self._revise_move_line(tuple(by_id[member] for member in full_order if member in by_id))
         return wire.QueueMoved(row_id, updated, old_index + 1, place + 1, undo_destination)
 
-    def _move_pin(self, row_id: str, destination: wire.QueueDrop, order: list[str], *, first: bool) -> None:
+    def _move_pin(self, row_id: str, destination: wire.QueueDrop | wire.QueueHeadDrop, order: list[str]) -> None:
         pins = {pin.row_id: pin.anchor for pin in self.queue_pins}
         moved = QueueRowAnchor(row_id)
         old_index = order.index(row_id)
@@ -4970,7 +4977,8 @@ done
         if old_index < len(order) and pins.get(order[old_index]) == moved:
             pins[order[old_index]] = old_anchor
 
-        index = 0 if first else order.index(destination.neighbor) + int(destination.side == "after")
+        index = (0 if isinstance(destination, wire.QueueHeadDrop)
+                 else order.index(destination.neighbor) + int(destination.side == "after"))
         anchor = QueueRowAnchor(order[index - 1]) if index else QueueHeadAnchor()
         if index < len(order) and pins.get(order[index]) == anchor:
             pins[order[index]] = moved

@@ -305,8 +305,8 @@ class QueueDrop:
 
 
 @dataclass(frozen=True)
-class QueueUndo:
-    move_request_id: str
+class QueueHeadDrop:
+    """Place the step at the head of the full wait order."""
 
 
 @dataclass(frozen=True)
@@ -314,8 +314,16 @@ class QueueMoveRequest(CallerCode):
     request_id: str
     row_id: str
     revision: str
-    destination: QueueDrop | QueueUndo
+    destination: QueueDrop | QueueHeadDrop
     undo_destination: QueueDrop | None = field(default=None, kw_only=True)
+
+
+@dataclass(frozen=True)
+class QueueUndoRequest(CallerCode):
+    request_id: str
+    row_id: str
+    revision: str
+    move_request_id: str
 
 
 @dataclass(frozen=True)
@@ -667,7 +675,8 @@ class DispatchStatus:
 
 
 Request = (RepositorySlotRequest | ServiceEstimateRequest | AdmitRequest | LaunchRequest | ReleaseRequest | WidthRequest | ViewRequest
-           | BuildHistoryRequest | ExplainRequest | MineRequest | PrioritySetRequest | PriorityClearRequest | QueueMoveRequest | TokenWaitRequest
+           | BuildHistoryRequest | ExplainRequest | MineRequest | PrioritySetRequest | PriorityClearRequest
+           | QueueMoveRequest | QueueUndoRequest | TokenWaitRequest
            | PlacementRequest | PlacementStatusRequest | ClaimFailure | ConsumePermission | ExecutionReport | PrerequisiteReport | CancelPlacement)
 
 Reply = (RepositorySlotWaiting | RepositorySlotReady | RepositorySlotExpired | Wait | RunnerAdmitted | Admitted | LaunchAdmitted | Refused | Ok | BuildHistoryReply
@@ -680,7 +689,7 @@ _REQUESTS: dict[str, type] = {
     "service_estimate": ServiceEstimateRequest, "admit": AdmitRequest, "launch": LaunchRequest, "release": ReleaseRequest,
     "width": WidthRequest, "view": ViewRequest, "explain": ExplainRequest,
     "build_history": BuildHistoryRequest, "mine": MineRequest,
-    "queue_move": QueueMoveRequest,
+    "queue_move": QueueMoveRequest, "queue_undo": QueueUndoRequest,
     "priority_set": PrioritySetRequest, "priority_clear": PriorityClearRequest, "token_wait": TokenWaitRequest,
     "placement": PlacementRequest, "placement_status": PlacementStatusRequest, "claim_failure": ClaimFailure,
     "consume_permission": ConsumePermission, "execution_report": ExecutionReport,
@@ -765,6 +774,13 @@ def parse_record(text: str, schema: type[T]) -> T:
 
 
 def _parse_value(value: object, schema: type[T]) -> T:
+    if schema in (QueueMoveRequest, QueueUndoRequest):
+        if not isinstance(value, dict):
+            raise ValueError("Invalid queue move request.")
+        value = cast(dict[str, object], value)
+        allowed = set(codec.record_field_names(schema)) | {"kind"}
+        if value.keys() - allowed:
+            raise ValueError("Unexpected queue move request field.")
     return cast(T, codec.parse_snapshot_value(value, schema))
 
 

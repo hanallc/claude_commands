@@ -2024,8 +2024,10 @@ The console also checks the Tailscale address and Host.
 The JSON POST requires the same Origin and a console token.
 The console limits the request size and time with `build_queue.conf`.
 
-The POST sends a request ID, a wait ID, an order revision, and a destination.
-The destination names a neighbor and a side, or the request ID of the move to undo.
-A drop also sends the former shown neighbor and side for Undo.
+A drop and an Undo each send a request ID, a wait ID, and an order revision.
+A drop also sends a head destination or a neighbor and side.
+It sends the former shown neighbor and side for Undo.
+An Undo sends only the original move ID in addition to the common fields.
+The console and the admission socket reject fields outside the request type.
 The admission service commits the move on its loop and replays the reply for a repeated request ID.
 The console returns HTTP 409 with the current order when it detects a conflict.
