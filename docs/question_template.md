@@ -21,6 +21,14 @@ A question with choices needs at least two `--choice` and one `--recommend`.
 An open question has no `--choice`.
 Do not put a list, a step or a command in `--context`. Give it an `--item`.
 
+## Public API questions
+
+Before you ask the user about public API, answer these from the code:
+
+1. Must it exist? Name each thing that exists and could do the job: a model, a public item, the behavior on the trunk, a line of the plan. Say why each one cannot.
+2. Is it an event? Say who reads the item, and when.
+3. What is the code? Show the item beside its neighbours, with one real scenario.
+
 ## Example
 
 ```sh
