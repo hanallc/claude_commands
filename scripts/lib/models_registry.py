@@ -328,9 +328,24 @@ def _fast_forward(repo: Path, path: Path, target: str, *,
             raise OSError(f"registry fast-forward failed for {path}: {error}") from error
 
 
+def _registry_for_publication(registry: SharedRegistry, path: Path, published: str) -> str:
+    git_directory = registry.git_directory
+    with file_lock.exclusive(waiting_rows.registry_writer_lock(git_directory)):
+        local = registry_text(path)
+        contents = waiting_rows.registry_publication_text(git_directory, local, published)
+        if contents != local:
+            write_text_atomic(path, contents)
+        waiting_rows.settle_protected_producers(git_directory, contents, published)
+    return contents
+
+
 def _reconcile_shared(registry: SharedRegistry, path: Path, target: str, expected_head: str, published: str) -> bool:
+    repo = registry.repository
     try:
-        _fast_forward(registry.repository, path, target, expected_head=expected_head, published_registry=published)
+        with waiting_rows.locked_checkout(repo):
+            _fast_forward(repo, path, target, expected_head=expected_head, published_registry=published)
+            head = _git(repo, "show", f"HEAD:{REGISTRY_PATH}") + "\n"
+            _ = _registry_for_publication(registry, path, head)
     except OSError as error:
         raise OSError(f"{path} is shared, but local reconciliation failed: {error}") from error
     return True
@@ -374,11 +389,7 @@ def _publish(registry: SharedRegistry, path: Path, description: str) -> bool:
             waiting_rows.restore_checkout(repo, "HEAD")
             base = _git(repo, "rev-parse", "HEAD")
             previous = _git(repo, "show", f"{base}:{REGISTRY_PATH}") + "\n"
-            with file_lock.exclusive(waiting_rows.registry_writer_lock(registry.git_directory)):
-                local = registry_text(path)
-                contents = waiting_rows.registry_publication_text(registry.git_directory, local, previous)
-                if contents != local:
-                    write_text_atomic(path, contents)
+            contents = _registry_for_publication(registry, path, previous)
         if not registry_rows.changes(previous, contents):
             return False
         commit = _registry_commit(repo, base, contents, description)

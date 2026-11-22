@@ -327,6 +327,7 @@ class MergeCheckpointFixture(unittest.TestCase):
                     "GIT_CONFIG_GLOBAL": str(write_fixture_git_config(root.parent)), "GIT_CONFIG_NOSYSTEM": "1",
                     "MERGE_CHECKPOINT_STYLE_SYNC": str(self.bin / "style_sync.py"),
                     "MERGE_CHECKPOINT_STYLE_LEDGER": str(self.bin / "style_ledger.py"),
+                    "MAC_WAKE_PROGRAM": "",
                     "PATH": str(self.bin) + os.pathsep + os.environ.get("PATH", ""),
                     "CHECKPOINT_TEST_STATE": str(self.state),
                     "MERGE_CHECKPOINT_SCRATCH": str(self.state),

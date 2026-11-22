@@ -431,6 +431,49 @@ class RegistryPublicationTests(ScriptRepositoryTestCase):
                 self.assertTrue(models_registry.publish_pending(registry))
         self.assertEqual(self.git("show", "origin/main:config/models.conf").stdout, edited)
 
+    def test_published_producer_addition_allows_a_later_direct_edit(self) -> None:
+        before = "[fixture]\nmodel=old\n[producers]\n"
+        registry = self.write(self.repo / "config/models.conf", before)
+        self.seed()
+        original = before + "example=codex:gpt-6.2-sol:low\n"
+        newer = original.replace(":low", ":high")
+        environment = {**self.environment, "MODELS_CONFIG_PUBLISH": "later", "TMPDIR": str(self.root)}
+        with patch.dict(os.environ, environment, clear=True), patch.object(models_registry, "DEFAULT_PATH", registry):
+            _ = models_registry.save_registry(registry, before, original, "add producer", preserve_producer_rows=True)
+            with main_push_lock.settings_push(self.repo) as gap:
+                self.assertIsInstance(gap, land_queue.SettingsGap)
+                self.assertTrue(models_registry.publish_pending(registry))
+
+            peer = self.root / "peer"
+            _ = self.git("worktree", "add", "--detach", str(peer), "origin/main")
+            _ = self.write(peer / "config/models.conf", newer)
+            _ = self.git("-C", str(peer), "commit", "-qam", "Edit the published producer row")
+            _ = self.git("-C", str(peer), "push", "-q", "origin", "HEAD:main")
+            waiting_rows.move_to(self.repo, "origin/main", fast_forward=True)
+            self.assertEqual(registry.read_text(), newer)
+
+            _ = self.write(registry, original)
+            with main_push_lock.settings_push(self.repo) as gap:
+                self.assertIsInstance(gap, land_queue.SettingsGap)
+                self.assertTrue(models_registry.publish_pending(registry))
+        self.assertEqual(self.git("show", "origin/main:config/models.conf").stdout, original)
+
+    def test_competing_published_producer_allows_a_later_direct_edit(self) -> None:
+        registry, before, local, remote = self._producer_conflict()
+        environment = {**self.environment, "MODELS_CONFIG_PUBLISH": "later", "TMPDIR": str(self.root)}
+        with patch.dict(os.environ, environment, clear=True), patch.object(models_registry, "DEFAULT_PATH", registry):
+            _ = models_registry.save_registry(registry, before, local, "add producer", preserve_producer_rows=True)
+            with main_push_lock.settings_push(self.repo) as gap:
+                self.assertIsInstance(gap, land_queue.SettingsGap)
+                self.assertFalse(models_registry.publish_pending(registry))
+            self.assertEqual(registry.read_text(), remote)
+
+            _ = self.write(registry, local)
+            with main_push_lock.settings_push(self.repo) as gap:
+                self.assertIsInstance(gap, land_queue.SettingsGap)
+                self.assertTrue(models_registry.publish_pending(registry))
+        self.assertEqual(self.git("show", "origin/main:config/models.conf").stdout, local)
+
     def test_a_deferred_registry_write_returns_during_move_preflight(self) -> None:
         before = "[fixture]\nmodel=old\nsecond=old\n"
         registry = self.write(self.repo / "config/models.conf", before)

@@ -100,7 +100,7 @@ The Mac publishes registry edits through its local Git checkout.
 The notes timer starts one detached publisher through `live_settings.publish_waiting()`.
 The publisher waits until it can confirm that no land runs.
 `publish_pending(registry)` then commits and pushes the rows that HEAD does not have.
-The publisher records errors in `~/.local/state/merge-gate/settings-publisher.log`.
+The publisher records errors in `~/.local/state/gate/settings-publisher.log`.
 If set, `GATE_STATE_DIR` sets the log directory.
 Local integration uses fast-forward only.
 A successful push with failed local reconciliation reports both facts.

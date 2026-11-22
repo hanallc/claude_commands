@@ -356,6 +356,14 @@ def _registry_replay_intent(git_directory: Path) -> PendingRegistryReplay:
     return {(section, key): line for section, key, line in rows}
 
 
+def _write_registry_replay_intent(git_directory: Path, intent: PendingRegistryReplay) -> None:
+    path = _registry_replay_path(git_directory)
+    if intent:
+        write_text_atomic(path, json.dumps([(*address, value) for address, value in intent.items()]) + "\n")
+    else:
+        path.unlink(missing_ok=True)
+
+
 def record_registry_edit(git_directory: Path, before: str, after: str, mode: RegistryEditMode) -> None:
     """Keep the replay intent for pending registry rows."""
     intent = _registry_replay_intent(git_directory)
@@ -371,11 +379,18 @@ def record_registry_edit(git_directory: Path, before: str, after: str, mode: Reg
             case RegistryEditMode.ORDINARY:
                 _ = intent.pop(address, None)
     if intent != previous:
-        path = _registry_replay_path(git_directory)
-        if intent:
-            write_text_atomic(path, json.dumps([(*address, value) for address, value in intent.items()]) + "\n")
-        else:
-            path.unlink(missing_ok=True)
+        _write_registry_replay_intent(git_directory, intent)
+
+
+def settle_protected_producers(git_directory: Path, local: str, published: str) -> None:
+    """Clear settled producer protection while the caller holds the writer lock."""
+    intent = _registry_replay_intent(git_directory)
+    local_values = registry_rows.values(local)
+    published_values = registry_rows.values(published)
+    pending = {address: value for address, value in intent.items()
+               if address[0] != "producers" or (address not in published_values and local_values.get(address) == value)}
+    if pending != intent:
+        _write_registry_replay_intent(git_directory, pending)
 
 
 def _registry_git_directory(checkout: Path) -> Path:
