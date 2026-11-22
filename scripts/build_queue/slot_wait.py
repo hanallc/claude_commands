@@ -196,16 +196,21 @@ def verify_value_options() -> frozenset[str]:
                      for flag in case.group(1).split("|"))
 
 
-@lru_cache(maxsize=128)
 def verify_package(step: str, arguments: tuple[str, ...]) -> str:
     """Pass literal arguments to the verify parser without starting a build."""
     try:
-        result = subprocess.run(["bash", "--noprofile", "--norc", "-c", verify_package_parser(),
-                                 "verify-package", step, *arguments], env={}, stdin=subprocess.DEVNULL,
-                                capture_output=True, text=True, timeout=2, check=False)
-    except (OSError, subprocess.TimeoutExpired, AssertionError):
+        return _parse_verify_package(step, arguments)
+    except (OSError, subprocess.SubprocessError, AssertionError):
         return ""
-    return result.stdout if result.returncode == 0 else ""
+
+
+@lru_cache(maxsize=128)
+def _parse_verify_package(step: str, arguments: tuple[str, ...]) -> str:
+    result = subprocess.run(["bash", "--noprofile", "--norc", "-c", verify_package_parser(),
+                             "verify-package", step, *arguments], env={}, stdin=subprocess.DEVNULL,
+                            capture_output=True, text=True, timeout=2, check=False)
+    result.check_returncode()
+    return result.stdout
 
 
 def command_slot_name(command: Sequence[str], names: StepNames) -> QueueRowName | NoNamedStep:

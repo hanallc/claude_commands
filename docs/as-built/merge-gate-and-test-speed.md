@@ -248,6 +248,15 @@ Merge gates and nightly runs use all modules.
 Merge and tests-only runs skip basedpyright.
 The daily `--nightly` run checks all of `scripts`, including hooks.
 The queue reservation and the runner governor use separate configuration keys.
+Gate startup checks recovery records for dead gate processes across checkouts.
+A `--tests-only` gate runs its cleanup before it exits on SIGTERM.
+Successful recovery removes a record if it names no retained folders.
+Recovery reports retained folders for manual removal and keeps their finished record.
+The scanner skips finished records on later runs.
+If recovery refuses a record from another checkout, the gate reports its path and reason on stderr.
+Each gate process reports a refused record once.
+The gate keeps that record and checks the remaining records.
+A recovery refusal in the gate's own checkout stops the gate.
 A clean tree with a recorded full pass on this host reuses its test modules.
 Test modules use `builds.slice` scopes when available.
 After the parallel pass, up to eight failed modules run once more, alone.
@@ -290,6 +299,14 @@ The completion case retains its strict socket send.
 **One test hang guard.** Tests import `TEST_HANG_GUARD_SECS` and `LauncherHangGuard` directly from `scripts.lib.test_hang_guard`. The shared limit is 600 seconds. `scripts/lib/test_one_hang_guard.py` parses every Python file under `scripts/` and refuses local assignments or imports through other modules. Each refusal gives its path and line. Fixture script text is data and can receive the shared value through a placeholder. Expected events use the shared guard; negative observation windows, product timeout settings and elapsed-time assertions keep their behavior.
 
 ## How it works
+
+### Mac gate journal cleanup
+
+Each Mac gate attempt stores its process groups in `~/.local/state/mac-gate/<attempt>/run.json` on the Mac.
+When a task has an end receipt, cleanup checks each live recorded group against its saved process start.
+Cleanup stops the confirmed groups and removes the journal, even when the temporary build folder is gone.
+The receipt stays with a retained checkout.
+See [Mac gate cleanup](mac-test-offload.md#mac-gate-cleanup) for the queue callbacks.
 
 ### Targeted tests: `scripts/production/targeted_test.py`
 
@@ -562,16 +579,21 @@ The admission, scheduling caches, and rerun rules below apply to `SharedMachine`
   The per-gate job limit still applies. Admission and token waits retain the checkout's shared busy lock.
   Memory waits print when the need or hold reason changes, with a reminder at most once a minute otherwise.
 - **CPU scope.** Once per run, the gate probes `systemd-run --user --scope --quiet --collect --expand-environment=no --slice=builds.slice -- true` with a 10 s timeout. On success it puts the same prefix before each test module's argv, including reruns. The `types` job has no prefix. The scope replaces itself with the command, so the module keeps the `Popen` PID, process group and memory sampling. `builds.slice` has CPUWeight=20; the gate adds no nice value. It skips the prefix when `BUILDLOG_SCOPE=0`, `/proc/self/cgroup` contains `/builds.slice/`, or the probe fails. One line reports the scope or the skip reason.
-- Each job has its own `TMPDIR` under `/dev/shm/merge-gate-*` or `/dev/shm/targeted-test-*`.
+- Each attempt has its own `TMPDIR` in a numbered folder such as `m0001`.
+  The parent holds the gate lease and uses a `g-*` name for a gate or a `t-*` name for affected tests.
+  Both modes use the configured gate root for top-level runs.
+  If that root contains the calling module folder, the nested gate uses the module folder as its parent.
+  The outer gate removes the nested gate files when it removes the module folder.
+  The short names leave room for Unix socket paths below `TMPDIR`.
   The runner reads the output and removes the temporary folder when the job ends.
   Outside gate jobs, the shared Python bootstrap gives direct unittest and timed runs a maker folder.
   The bootstrap decides once, at interpreter startup, while `GATE_PARENT_PID` marks a gate job.
   A later `package_root.py` run inside an import selects the checkout only and starts no folder.
-  `targeted_test.py` uses the same test-folder context for its outer run.
-  These folders use `<inherited TMPDIR>/test-runs/test-run-*`.
+  `gate.py --affected` uses the same test-folder context for its outer run.
+  These folders use `<inherited TMPDIR>/test-runs/r*`.
   Child processes inherit TMPDIR, and each run holds its folder lock.
   Normal exit removes the folder, its lease, and its lock.
-  Before allocation, the next run sweeps free folders in that test-runs parent.
+  Before allocation, the next run sweeps free folders in that `test-runs` parent, including older `test-run-*` folders.
   The sweep also removes free lease records, lock records, and unfinished temporary lease files.
   Held locks prevent removal.
   SIGTERM and SIGKILL leave recorded residue until the next sweep observes a free lock.
@@ -738,6 +760,8 @@ A batch can contain one item.
 1. Take the production merge lock once. While it holds the lock, `land_runs.landing` records every item's commit, so the units board says `waiting on running checkpoint`; a single land records its one commit the same way.
    Each item that lands or stops adds a row to `land_results.jsonl` (`land_runs.record_result`); the board shows the newest row of a checkpoint that has not landed.
 2. Fetch the merge branch and the unit branches from origin.
+   If the merge branch fetch fails, ask each current requester to send the checkpoint again when origin is available.
+   Leave existing results unchanged when this fetch fails.
    Fetch all origin heads only if an item still needs a commit or a fresh tracking ref.
    Resolve every item to a commit before writing the record or starting a merge.
    Refuse the batch and name the item if it cannot resolve to a commit.
@@ -745,8 +769,8 @@ A batch can contain one item.
    Normalize shell quoting and keep the argument order.
    Resume checkpoint merges only when the arguments and commits match the record and an unpushed checkpoint belongs to the batch.
    Identify checkpoint merges by their subjects and second parents.
-   If the record is missing or differs, reset the merge branch to its pushed tip.
-   Then start a fresh batch. Remove the record after the push or when the batch ends without unpushed merges.
+   If the record is missing or differs, refuse the batch and tell the requester how to start again.
+   Remove the record after the push or when the batch ends without unpushed merges.
    If record removal fails, report a warning and continue.
    Resume each item that the merge branch already contains through the single command's route, in file order.
 3. Retain the starting tip and whether a merge is unfinished.
@@ -755,65 +779,52 @@ A batch can contain one item.
 6. Use one `tested_main_push` hold, one push, and one local promotion.
 7. Complete each item's branch cleanup, receipt, review record, scratch cleanup, and director result.
 
-A resumed item retests an unpushed merge and resumes the promotion of a pushed merge, as the single command does.
-A failed resume stops every later item from the same unit, and the batch exits 1 after the other items land.
+A resumed item tests an unpushed merge or resumes promotion of a pushed merge.
+A stop during test preparation, a red test, or a main conflict returns every pending item in the resumed batch.
+A published merge with a promotion marker keeps its completed result.
+For other stops, the existing resume rules apply.
 
 Shrink and as-built items add no test paths of their own.
 A batch skips tests only when its unpublished paths belong entirely to its shrink and as-built items.
 The published tip is `origin/<merge branch>`.
-An interrupted batch's merged item retests its unpublished paths when it resumes.
-A red resume undoes that unpushed merge before the other items merge.
 Main integration retains the existing retest rule before publication.
 Any item's `--cancel-prior` applies to the shared push.
 Review-list publication, style notification, checkout announcement, and Mac promotion run once for the batch.
 Each merge retains its own review ownership and completion record.
 
-A held or failed item before the push starts drops from the batch.
-Every later item from the same unit drops with it and receives a report that names the stopped item.
-The checkout returns to the starting tip before each retry.
-Retries continue until an attempt passes or no item remains.
-Each stopped attempt removes at least one item, so attempts never exceed the initial item count.
+A hold, failure, or cancellation ends a fresh batch and returns each row to its requester.
+Before each gate run, record the tested tip and each row's selected commands in memory.
+For attribution, compare a merged row with its merge's first parent.
+Compare an unmerged row with the destination tip before preparation.
+A red report names the failed test step and says whether the row selects it.
+If command selection failed for a row, report unknown changed paths and include the error.
+The batch stops at the first failed test command.
+The next queued item can proceed after the batch exits.
+Before publication, the shared stop attempts to restore the starting tip.
+The batch record lists each row tip.
+The batch adds each main target to the record before Git starts the merge.
+The stop accepts HEAD at the expected tip or at a merge with that first parent and a recorded second parent.
+The batch reads MERGE_HEAD after every merge command.
+A successful command with an open merge stops the batch.
+The stop aborts a merge with a recorded target or an empty or unreadable MERGE_HEAD.
+The stop preserves an open merge to an unrelated target and reports the refusal.
+The stop aborts the merge before it queries origin.
+If abort restores the starting tip, the stop skips the query and reset.
+Without an open merge, the stop runs the reset even at the starting tip to clear merge state.
+A reset that moves HEAD requires origin to match the recorded published tip or the starting tip.
+The stop sends every notice before it writes result records.
+Rollback and result-record errors appear after the notices.
+Each run starts a fresh shared test log. Tests after main moves append to the same log.
+Publication rollback checks the live origin before it restores the tip.
+It also removes unpublished formatter commits.
+
 Shrink and as-built items use their commit subject's plan slug within the configured plan folder.
 Subjects without the closing-item format retain the configured plan.
 An ancestry hold names the first unmerged commit by its short hash and subject.
-Reset aborts an unfinished merge only when no merge was unfinished at batch start.
-An earlier unfinished merge and its staged edits remain unchanged.
-A red test identifies its items through the shared checkpoint test selector.
-Candidates are the code items that select a red command, or all code items when none selects it.
-When no code item remains, every remaining item is a candidate.
-One candidate drops directly.
-For multiple candidates, a binary search finds the first merge that makes the red commands fail.
-Each probe resets the checkout to a candidate's unpublished merge commit.
-It merges the same main commit that the red test tip holds, without another fetch.
-A conflict stops the search and drops every candidate.
-The probe selects test steps again from the batch paths at that tip.
-It runs only unresolved red steps that the tip still selects.
-A red step absent from that selection counts as green.
-Full tests and probes use the same runner and flake rules.
-The starting tip is treated as green; the last candidate is known red.
-Seven candidates need at most three probes.
-Each probe reports its item, merge commit, and green or red result.
-Each batch invocation clears its shared test log once before the first attempt.
-Full tests, probes, main retests, and all retries append to that log.
-The search restores the starting tip and drops the causing item and that unit's later items.
-A cancelled probe or another non-red stop drops every candidate with that stop.
-A command that cannot start is a non-red probe stop; full runs retain their existing failure behavior.
-A batch line that repeats an item merged in the same attempt receives `resume it alone with the single command`.
-The push start is the boundary for drop, reset, and retry.
-Once the push starts, a failure drops no items and starts no batch reset or retry.
-Only `push_rollback` can undo a failed push after it checks the live origin.
-Each item receives the stop report.
+A row that repeats a checkpoint in the batch receives instructions to resume it alone.
 
-`test_merge_checkpoint_batch.py` covers shared publication, a conflicting middle item, and a red command selected by one item.
-It also covers unpublished paths after interruption and a wrapper failure after a successful push.
-The interruption rows resume the merged item alone, including a shrink-only batch.
-The rerun row resumes the promotion of two pushed items and then lands a new item.
-The held-batch rows preserve an earlier unfinished merge and its staged edits.
-They also land a clean item after two holds and remove a held unit's later item.
-The history rows merge closing items for an older plan after the configured plan changes.
-The shared-red row uses two probes to identify the middle item and land the other two.
-The main-integration row keeps new main content at every probe and drops the first item.
-The package-rename row skips the renamed test at the earlier tip and drops the second item.
+`test_merge_checkpoint_batch.py` checks fresh and resumed red batches, formatter rollback, and the next queued item.
+`test_merge_checkpoint_rerun.py` covers shared publication and recovery after interruption.
 
 Findings-ledger tests remain in `scripts/direct/test_findings.py`, with `findings_test_support.py` restoring one private fixture seed at the same path for each case. Commands execute the real CLI in-process with a fresh module namespace, so every invocation rereads configuration and all ledger, event, parser and locking code stays active. Stable-ID persistence across invocations and unusable-configuration cases retain real Python subprocesses. All original test bodies and assertions are retained.
 
@@ -965,9 +976,6 @@ Repository imports use `scripts.<folder>` package names, including mock patch ta
 Entry scripts load that helper after their docstring and future imports.
 Bare `python3 <path>` therefore imports the entry's own checkout from any caller folder.
 A copied entry without the helper can use an existing `PYTHONPATH`.
-`package_imports.py bootstrap <checkout>` adds the four-line block to new entry scripts.
-It preserves CRLF and skips test and test-support modules.
-The command provides no import converter.
 
 The gate starts test modules through the checked tree's `scripts/lib/py`.
 It removes the caller's `PYTHONPATH` before the shim sets the checked tree's package root.

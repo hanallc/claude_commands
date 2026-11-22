@@ -69,6 +69,7 @@ import statistics
 import sqlite3
 import subprocess
 import tempfile
+import threading
 import time
 from typing import Literal, TextIO, cast
 
@@ -115,6 +116,7 @@ from scripts.build_queue.queue_place import (  # noqa: E402
 
 DEFAULT_MAX_RUNNING_JOBS = max(1, (os.cpu_count() or 2) // 2)
 TEST_HERDR_BIN = "/nonexistent/herdr"
+GATE_MODULE_TEMP_DIR = "GATE_MODULE_TEMP_DIR"
 # The largest measured module was 0.52 GiB; this includes the 1.2 growth margin.
 UNRECORDED_MODULE_RESERVATION_MIB = 640
 # A module still running this long is killed and the run is red: a hung module holds every gate
@@ -765,6 +767,7 @@ class NoGateRecovery:
 
 ACTIVE_GATE_RECOVERY: ContextVar[GateRecovery | NoGateRecovery] = ContextVar(
     "merge_gate_recovery", default=NoGateRecovery())
+_reported_foreign_gate_refusals: set[tuple[int, Path]] = set()
 
 
 def gate_run_directory(repo: Path) -> Path:
@@ -776,46 +779,72 @@ def recover_gate_runs(repo: Path) -> None:
     current = ACTIVE_GATE_RECOVERY.get()
     if isinstance(current, GateRecovery) and current.repo == str(repo.resolve()) and current.pid == os.getpid():
         return
-    root = gate_state_dir() / "active-runs"
+    own_directory = gate_run_directory(repo)
+    root = own_directory.parent
     if not root.exists():
         return
     for directory in sorted(root.iterdir()):
         if directory.is_dir():
-            recover_gate_directory(directory)
+            recover_gate_directory(directory, own_directory=own_directory)
 
 
-def recover_gate_directory(directory: Path) -> None:
+def recover_gate_directory(directory: Path, *, own_directory: Path) -> None:
     """Recover dead owners while holding the directory lock."""
     descriptor = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
     try:
         fcntl.flock(descriptor, fcntl.LOCK_EX)
         for path in sorted(directory.glob("*.json")):
-            data = cast(dict[str, object], json.loads(path.read_text()))
-            if data.get("finished") is True:
-                continue
-            pid, start = cast(int, data["pid"]), cast(str, data["start"])
-            owner = process_start(pid)
-            if isinstance(owner, Unreadable):
-                raise GateRefused(f"cannot recover gate {pid}: {owner.reason}")
-            if isinstance(owner, Started) and owner.start == start:
-                continue
-            groups = cast(dict[str, str], data["groups"])
-            tokens = [HeldGateToken(cast(str, token["path"]), cast(int, token["device"]),
-                                    cast(int, token["inode"]), cast(str, token["value"]))
-                      for token in cast(list[dict[str, object]], data["tokens"])]
-            folders = [entry if isinstance(entry, str) else cast(dict[str, str], entry)["path"]
-                       for entry in cast(list[object], data["folders"])]
-            recovery = GateRecovery(path, cast(str, data["repo"]), pid, start,
-                                    {int(group): identity for group, identity in groups.items()},
-                                    folders, tokens, cast(str, data["rollback"]),
-                                    cast(str, data["rollback_head"]), cast(str, data["rollback_source"]))
-            active = ACTIVE_GATE_RECOVERY.set(recovery)
             try:
-                recovery.recover()
-            finally:
-                ACTIVE_GATE_RECOVERY.reset(active)
+                recover_gate_record(path)
+            except GateRefused as error:
+                if directory == own_directory:
+                    raise
+                report_key = (os.getpid(), path)
+                if report_key not in _reported_foreign_gate_refusals:
+                    reason = " ".join(str(error).splitlines())
+                    print(f"Gate recovery kept {str(path)!r}: {reason}", file=sys.stderr)
+                    _reported_foreign_gate_refusals.add(report_key)
     finally:
         os.close(descriptor)
+
+
+def recover_gate_record(path: Path) -> None:
+    """Recover one record under its directory lock."""
+    try:
+        data = cast(dict[str, object], json.loads(path.read_text()))
+    except FileNotFoundError:
+        # The gate can remove its record while the scanner reads the directory.
+        return
+    if data.get("finished") is True:
+        return
+    pid, start = cast(int, data["pid"]), cast(str, data["start"])
+    owner = process_start(pid)
+    if isinstance(owner, Unreadable):
+        raise GateRefused(f"cannot recover gate {pid}: {owner.reason}")
+    if isinstance(owner, Started) and owner.start == start:
+        return
+    try:
+        data = cast(dict[str, object], json.loads(path.read_text()))
+    except FileNotFoundError:
+        # The owner can finish cleanup before the process check detects its exit.
+        return
+    if data.get("finished") is True:
+        return
+    groups = cast(dict[str, str], data["groups"])
+    tokens = [HeldGateToken(cast(str, token["path"]), cast(int, token["device"]),
+                            cast(int, token["inode"]), cast(str, token["value"]))
+              for token in cast(list[dict[str, object]], data["tokens"])]
+    folders = [entry if isinstance(entry, str) else cast(dict[str, str], entry)["path"]
+               for entry in cast(list[object], data["folders"])]
+    recovery = GateRecovery(path, cast(str, data["repo"]), pid, start,
+                            {int(group): identity for group, identity in groups.items()},
+                            folders, tokens, cast(str, data["rollback"]),
+                            cast(str, data["rollback_head"]), cast(str, data["rollback_source"]))
+    active = ACTIVE_GATE_RECOVERY.set(recovery)
+    try:
+        recovery.recover()
+    finally:
+        ACTIVE_GATE_RECOVERY.reset(active)
 
 
 @contextmanager
@@ -845,14 +874,16 @@ def gate_recovery(repo: Path) -> Generator[GateRecovery]:
         directory = gate_run_directory(repo)
         path = directory / f"{os.getpid()}-{token_hex(12)}.json"
         recovery = GateRecovery(path, str(repo.resolve()), os.getpid(), identity.start)
-        recovery.save()
         token = ACTIVE_GATE_RECOVERY.set(recovery)
         try:
+            with cancellation.defer_cleanup_signals():
+                recovery.save()
             yield recovery
         finally:
-            ACTIVE_GATE_RECOVERY.reset(token)
-            if not (recovery.groups or recovery.tokens or recovery.rollback):
-                recovery.finish()
+            with cancellation.defer_cleanup_signals():
+                ACTIVE_GATE_RECOVERY.reset(token)
+                if not (recovery.groups or recovery.tokens or recovery.rollback):
+                    recovery.finish()
 
 
 @contextmanager
@@ -1112,7 +1143,7 @@ def test_module_environment(root: Path, environment: dict[str, str]) -> dict[str
     tools = root / "build-tool-tripwires"
     tools.mkdir()
     marker = root / "build-tool-calls.jsonl"
-    script = f"""#!{Path(__file__).resolve().parents[1] / "lib/py"}
+    script = f"""#!/usr/bin/env {Path(__file__).resolve().parents[1] / "lib/py"}
 import fcntl, json, sys
 with open({str(marker)!r}, "a") as output:
     fcntl.flock(output, fcntl.LOCK_EX)
@@ -1128,6 +1159,7 @@ raise SystemExit(99)
             "CARGO_TARGET_DIR": cargo, "CARGO_BUILD_BUILD_DIR": cargo,
             "HERDR_BIN": TEST_HERDR_BIN,
             "STAFF_FILE": str(root / "staff.json"),
+            GATE_MODULE_TEMP_DIR: str(root),
             "HERDR_PANE_RECORD_DIR": str(root / "herdr-panes"),
             "BUILDLOG_DIR": str(buildlog),
             session_folder.ROOT_ENV: str(root / "session"),
@@ -1527,6 +1559,16 @@ def module_runner(repo: Path) -> Path:
     return runner
 
 
+def _gate_job_parent() -> Path:
+    """Keep jobs below the module folder that the outer gate removes."""
+    root = build_folders.configured_gate_root()
+    if inherited_module := os.environ.get(GATE_MODULE_TEMP_DIR):
+        module = Path(inherited_module)
+        if module.is_dir() and (resolved := module.resolve()).is_relative_to(root.resolve()):
+            return resolved
+    return root
+
+
 def gate_test_parent(tmpfs: Path) -> Path:
     """Return the parent of the merge gate test fixtures."""
     return tmpfs / "merge-gate-tests"
@@ -1568,7 +1610,7 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
     if absent:
         raise GateRefused(f"type dirs not found under {repo}: {', '.join(absent)}")
     runner = module_runner(repo)
-    tmpfs = build_folders.tmpfs_temporary_parent()
+    tmpfs = _gate_job_parent()
     if not tmpfs.is_dir() or not os.access(tmpfs, os.W_OK):
         raise GateRefused(f"the test runner requires a writable gate folder at {tmpfs}")
     report_retained_gate_test_folders(tmpfs)
@@ -1690,8 +1732,8 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
                 record(1, aborted=True)
             raise
 
-    # Folder keys stay unchanged until chunk 6.
-    folder_tool = "merge-gate" if mode is SuiteMode.GATE else "targeted-test"
+    folder_tool = "g" if mode is SuiteMode.GATE else "t"
+    module_number = 0
     with ((gate_recovery(repo) if shared else private_gate_recovery(repo, tmpfs)) as recovery, record_on_abort(),
           gate_temporary(recovery, folder_tool, tmpfs) as temporary,
           ExitStack() as module_folders,
@@ -1851,7 +1893,11 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
                     suite, path = request.suite, request.path
                     folder_cleanup = ExitStack()
                     _ = module_folders.callback(folder_cleanup.close)
-                    root = folder_cleanup.enter_context(build_folders.tool_folder(f"{suite}-{path.stem}", temporary))
+                    # Each attempt gets a short name in this gate's private folder.
+                    module_number += 1
+                    module_folder = build_folders.BuildFolderSpec(
+                        kind="tool", parent=temporary, purpose=f"m{module_number:04x}", suffix_length=0)
+                    root = folder_cleanup.enter_context(build_folders.temporary_build_folder(module_folder))
                     log = root / "output.log"
                     job_environment = ({**environment, "TMPDIR": str(root)} if request.kind is GateJobKind.TYPE_CHECK
                                        else test_module_environment(root, environment))
@@ -3145,6 +3191,30 @@ def run_named_modules(repo: Path, names: Sequence[str], module_time_limit_s: flo
                       time_limit=gate_record.NoGateTimeLimit("named modules"))
 
 
+@contextmanager
+def unwind_tests_only_on_sigterm() -> Generator[None]:
+    """Finish test cleanup before the default SIGTERM action."""
+    if (threading.current_thread() is not threading.main_thread()
+            or signal.getsignal(signal.SIGTERM) != signal.SIG_DFL):
+        yield
+        return
+    terminated = False
+
+    def terminate(number: int, _frame: object) -> None:
+        nonlocal terminated
+        if not terminated:
+            terminated = True
+            raise SystemExit(128 + number)
+
+    try:
+        _ = signal.signal(signal.SIGTERM, terminate)
+        yield
+    finally:
+        _ = signal.signal(signal.SIGTERM, signal.SIG_DFL)
+        if terminated:
+            signal.raise_signal(signal.SIGTERM)
+
+
 def run_tests_only(args: GateArguments, mode: SuiteMode) -> int:
     try:
         with scratch.copy_lock(Path(args.repo).expanduser().resolve()):
@@ -3170,13 +3240,16 @@ def _sweep_nightly_build_folders() -> None:
                     raise RuntimeError("the build folder sweep failed")
             else:
                 scripts = Path(__file__).resolve().parents[1]
-                _ = subprocess.run([sys.executable, str(scripts / "lib/nix_env.py"), "exec",
-                                    sys.executable, str(scripts / "mac_test/mac_queue_run.py"),
-                                    "--kind", "run", "--what", "Sweep unused Mac build folders", "--package", "claude",
-                                    # The nightly runs from $HOME, which is not a repository; the queue refuses that as "repo".
-                                    "--worktree", str(scripts.parent), "--", "/bin/zsh", "-c",
-                                    '"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/lint/sweep.py" --unused-folders'],
-                                   check=True, capture_output=True, text=True)
+                caller, lifetime = os.pipe()
+                with os.fdopen(caller, "rb"), os.fdopen(lifetime, "wb"):
+                    _ = subprocess.run([sys.executable, str(scripts / "lib/nix_env.py"), "exec",
+                                        sys.executable, str(scripts / "mac_test/mac_queue_run.py"),
+                                        "--kind", "run", "--what", "Sweep unused Mac build folders", "--package", "claude",
+                                        # The queue requires a repository. Nightly runs from the home directory.
+                                        "--worktree", str(scripts.parent), "--caller-fd", str(caller), "--", "/bin/zsh", "-c",
+                                        '"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/lint/sweep.py" --unused-folders'],
+                                       check=True, capture_output=True, text=True,
+                                       pass_fds=(caller,), start_new_session=True)
         except (Exception, KeyboardInterrupt) as error:
             detail = f"Nightly build folder sweep on {machine} failed: " + " ".join(str(error).splitlines())
             if isinstance(error, subprocess.CalledProcessError):
@@ -3248,7 +3321,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         with test_run_folder():
             return run_tests_only(args, SuiteMode.TARGETED)
     if args.tests_only:
-        return run_tests_only(args, SuiteMode.GATE)
+        with unwind_tests_only_on_sigterm():
+            return run_tests_only(args, SuiteMode.GATE)
     try:
         if args.nightly:
             args.unit = _nightly_unit(args)

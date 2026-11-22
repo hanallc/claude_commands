@@ -21,6 +21,24 @@ from scripts.mac_test.offload_test_support import OffloadCommandFixture
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
 
 
+class MacDiskFloorTests(unittest.TestCase):
+    def test_free_space_above_the_floor(self) -> None:
+        result = offload.check_mac_disk_floor(offload.ProbeSnapshot(120, "fake-mac"), 100)
+        self.assertEqual(result, offload.MacDiskReady(120))
+
+    def test_free_space_equal_to_the_floor(self) -> None:
+        result = offload.check_mac_disk_floor(offload.ProbeSnapshot(100, "fake-mac"), 100)
+        self.assertEqual(result, offload.MacDiskReady(100))
+
+    def test_free_space_below_the_floor_starts_no_sweep_or_command(self) -> None:
+        with (mock.patch.object(offload, "ensure_mac_disk_floor") as sweep_floor,
+              mock.patch.object(subprocess, "Popen") as command):
+            result = offload.check_mac_disk_floor(offload.ProbeSnapshot(99, "fake-mac"), 100)
+        self.assertEqual(result, offload.MacDiskShort(99, 100))
+        sweep_floor.assert_not_called()
+        command.assert_not_called()
+
+
 class FloorSweepTests(unittest.TestCase):
     def __init__(self, methodName: str = "runTest") -> None:
         super().__init__(methodName)

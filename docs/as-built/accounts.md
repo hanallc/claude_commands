@@ -229,7 +229,8 @@ The [launch environment](nix-shell-launch.md) describes shared Nix setup and acc
 ## Moves, refusals, and workers
 
 Account moves use the shared stop and resume API.
-Each session attempt writes a request and one confirmed or failed outcome to `~/.local/state/accounts/moves.jsonl`.
+Each recorded session attempt writes a request and one confirmed or failed outcome to `~/.local/state/accounts/moves.jsonl`.
+If the request append fails, the batch reports the error and refuses that member before any stop.
 Each attempt has its own move ID and cause.
 A session proved live on the target writes nothing.
 A failed live source read stops the move before it records a source or sends a signal.
@@ -282,13 +283,43 @@ One count line covers workers with nothing to move.
 These include closed workers without an active dispatch, workers without a current session, and workers already on the target.
 
 A group move validates the destination before it changes the selection for future launches.
+`check_move_target` reads sign-in metadata from the local credential file or the macOS keychain.
+If the target has no usable sign-in, the check blocks the move before any stop.
+The refusal names the destination label and gives the sign-in command.
+The watcher checks sign-in when it finds a destination for a due queue entry.
+It checks again with the current time before it writes the new selection and removes the entry.
+If no destination is ready, the watcher keeps the entry queued and notifies showrunners when the reason changes.
 Staff rows define the group.
 The live registry supplies each member's account.
 A local row lock keeps an eligible member in the batch even without a local process or worktree.
-The group passes stable staff references to the batch.
-The batch saves the pending member and reports the retry command.
-The batch resolves the current conversation and reads the current group selection under the member's row lock.
-The retry command for a group move uses the current selection for that group.
+The group passes stable staff references to the mover.
+The mover resolves each staff reference to its native session before it saves the request.
+The detached batch uses that native session and reads the current group selection under the session locks.
+Moves and unit attachment take the native session lock before the staff row lock.
+A failed live account read refuses that member before recording a source account or stopping its process.
+The batch checks the PID and process start time from the live account read against the native stop proof.
+A different process gets no request or signal under the old source account.
+Each native session has one latest-request file, even when it gains or loses a staff row.
+The file holds the request ID and the account or group.
+The move checks each selected member under the native lock.
+This check includes group members that appear to be on the target.
+A member on the target clears its pending file.
+A busy lock refuses a new request and prints a fresh `batch --target` command for an explicit target.
+For a group request, it prints `batch --group` so the batch reads the current group target under the session lock.
+`retry` can run only a saved request.
+The detached child checks its request ID before it reports a member outcome.
+The mover checks the request ID under the locks before stopping the member.
+It removes its file after success and leaves it after failure.
+A failed journal append restores the prior journal contents under the journal lock.
+`stop_resume.py result` and `retry` check each member under the session locks.
+They remove completed requests, including moves completed by `shutdown resume --to`.
+They remove a missing session's request only after a fresh read proves absence.
+If the registry cannot prove liveness because the process start is unreadable, both commands keep the request and report the cause.
+Both commands name each file with a decode error and continue with valid files.
+Legacy reports supply display data only.
+Both commands show a fresh batch command for an off-target legacy member.
+`retry` starts a new move for each saved request that still needs a move.
+It uses the current selection for a saved group.
 A workers swap also selects eligible Codex producers.
 A producers group move selects only eligible Claude producers.
 `eligible_producers` requires active, local, unpaused staff rows with valid settings for the requested family.
@@ -305,6 +336,10 @@ Each member has an independent result.
 The group command prints moved, pending, and failed members by staff name.
 A retry of the selected destination reuses the group transition ID.
 The refusal watcher skips members whose staff rows are busy.
+The watcher uses one read of the move journal for all members.
+It skips a member when the latest request was by hand, names a different account, and is newer than the group selection.
+A selection without a time is older than any move by hand.
+A later group selection lets the watcher complete the move for that member.
 A pending refusal stays eligible until its move completes or a detached batch accepts it.
 An in-progress result from another move keeps the refusal pending.
 The watcher saves the decision ID before it requests the move.
@@ -554,6 +589,10 @@ The server keeps the clear records in `console/.accounts-quota-cleared.json` und
 If the file is malformed, the table shows the problem, the sidebar hides the icon and Clear refuses to write.
 The Accounts table has one row per account.
 It shows the weekly quota, reading status, reset, and credits.
+The roles column lists the roles that select the account as their default.
+It shows the role names in role order, with commas between them.
+The list stays on one line and ends with an ellipsis if it is too long.
+The tooltip shows the full list.
 The page and the Claude expiry push use `quota_alert.weekly_forecast` with the same usage history.
 The page starts its forecast from the displayed weekly reading.
 It excludes history before the current weekly window or the last refill.
@@ -574,6 +613,8 @@ The Accounts table starts in account order. The Roles table starts in role order
 The quota, rate, run-out time, and reset sort from the smallest or earliest value.
 Credits sort from the largest balance. An unlimited balance comes first.
 Enabled accounts come first when you sort by the credits setting.
+The roles column sorts by the full list without regard to letter case.
+Accounts without selected roles sort last in both directions.
 The next column sorts by target account.
 Role counts sort by the sum for the role, largest first.
 Missing values stay last in both directions.

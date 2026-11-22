@@ -133,7 +133,7 @@ class GuestCommandSupervisor:
                        arguments[0], '--quiet', '--pipe', '--property=ExitType=main',
                        f'--property=EnvironmentFile={RUNNER_ENVIRONMENT}',
                        f'--property=RuntimeMaxSec={self.settings.command_timeout_s:g}',
-                       f'--property=TemporaryFileSystem={hana_payload.PAYLOAD_MOUNT}:'
+                       f'--property=TemporaryFileSystem={hana_payload.payload_mount(guest.RUNNER_HOME)}:'
                        + f'mode=1777,nodev,nosuid,size={self.settings.source_max_bytes}',
                        f'--property=TimeoutStopSec={self.timeout_s}',
                        '--unit=' + command_unit(directory),
@@ -257,7 +257,7 @@ class GuestCommandSupervisor:
                 policy = hana_payload.read_slot_policy(self.slot_policy)
                 probe_timing = build_folder_lock.ProbeTiming(policy.probe_wait_seconds, policy.probe_retry_seconds)
                 lease_free = build_folder_lock.probe(
-                    policy.root / f'hana-slot{slot}', policy.root, lambda: probe_timing) == 'free'
+                    policy.copy_path(slot), policy.build_root, lambda: probe_timing) == 'free'
                 if lease_free:
                     timing['lease_free_at'] = self.clock()
             if launcher_ended:
