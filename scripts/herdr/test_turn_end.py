@@ -1855,7 +1855,9 @@ class TurnEndTests(unittest.TestCase):
                 first_run = self.case.run_dir
                 next_run = self.case.fixture.root / ("next-run-" + recovery.replace(" ", "-"))
                 next_state = cast(dict[str, object], json.loads((first_run / "progress_history_state.json").read_text()))
-                next_state["history_file"] = str(next_run / "history.jsonl")
+                next_history = next_run / "history.jsonl"
+                atomic_file.write_text_atomic(next_history, "")
+                next_state["history_file"] = str(next_history)
                 atomic_file.write_text_atomic(next_run / "progress_history_state.json", json.dumps(next_state))
                 first_reply = first_run / (name + "-reply.md")
                 self.assertIs(worker.dispatch(self.case.fixture.parent.id, staff.WorkerName.parse(name), role, self.case.prompt,

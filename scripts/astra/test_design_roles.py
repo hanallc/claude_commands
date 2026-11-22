@@ -661,8 +661,10 @@ class DurableRolesTests(HeldRolePaneCase):
         _ = (phase / "delegated_phase_reservation_state.json").write_text(json.dumps({
             "kind": "enrolled_awaiting_first_touch", "phase": "1"}))
         _ = (phase / "files").write_text("design.md\n")
+        history = self.root / (name + ".jsonl")
+        _ = history.write_text("")
         _ = (directory / "progress_history_state.json").write_text(json.dumps({
-            "run_id": name, "owner_staff_id": owner.id, "history_file": str(self.root / (name + ".jsonl")),
+            "run_id": name, "owner_staff_id": owner.id, "history_file": str(history),
             "phase": {"id": "1", "instance_id": instance, "status": "open"},
             "open_phases": [{"id": "1", "instance_id": instance, "status": "open"}],
         }))
