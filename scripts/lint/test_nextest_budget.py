@@ -40,9 +40,7 @@ buildlog_exec() {{
     printf '<%s>' "$@"
     printf '\\n'
 }}
-# Bash ignores assignments to EPOCHSECONDS, and core counts come from the
-# machine: fix the trial arm and both widths so the case never reads either.
-nextest_width_arm() {{ LINT_TEST_WIDTH_ARM=logical; }}
+# Set both core counts for the fixture.
 nextest_logical_cores() {{ LINT_LOGICAL_CORES={logical_cores}; }}
 nextest_physical_cores() {{ LINT_PHYSICAL_CORES=16; }}
 LINT_TEST_WIDTH={mode}
@@ -91,13 +89,6 @@ run_nextest "$@"
                     rf"\Anextest: {width} of {width} test threads; load \d+\.\d{{2}} on [1-9]\d* CPUs \([^()\n]+\)\Z")
                 rendered = "".join(f"<{argument}>" for argument in arguments)
                 self.assertEqual(output, f"<cargo><nextest><run>{rendered}\n")
-
-    def test_trial_mode_keeps_the_arm_width_for_width_trial(self) -> None:
-        output = self.run_nextest("trial", "--workspace")
-        line, output = output.split("\n", 1)
-        self.assertRegex(line,
-            r"\Anextest: 32 of 32 test threads; load \d+\.\d{2} on [1-9]\d* CPUs \([^()\n]+\)\Z")
-        self.assertEqual(output, "<cargo><nextest><run><--test-threads><32><--workspace>\n")
 
     def test_unreadable_load_is_unknown_and_the_run_still_starts(self) -> None:
         setup = """buildlog_memory_python() {

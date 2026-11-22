@@ -129,16 +129,18 @@ class SharedGateAdmissionTests(ServiceGateFixture):
         self.assert_gate_released()
 
     def test_suites_refuse_unwritable_memory_parent_before_admission(self) -> None:
+        gate_root = self.root
         access = os.access
 
         def writable(path: str | os.PathLike[str], mode: int) -> bool:
-            return False if Path(path) == build_folders.tmpfs_temporary_parent() else access(path, mode)
+            return False if Path(path) == gate_root else access(path, mode)
 
         with self.admission_environment(), \
+             mock.patch.object(build_folders, "configured_gate_root", return_value=gate_root), \
              mock.patch.object(os, "access", side_effect=writable), \
              mock.patch.object(gate, "gate_reservation") as admission:
             with self.assertRaisesRegex(GateRefused,
-                                        f"requires a writable gate folder at {build_folders.tmpfs_temporary_parent()}"):
+                                        f"requires a writable gate folder at {gate_root}"):
                 _ = gate.run_suites(self.checkout)
             admission.assert_not_called()
         self.assert_gate_released()
@@ -159,7 +161,7 @@ class SharedGateAdmissionTests(ServiceGateFixture):
         foreign.mkdir()
         (tmpfs / "foreign.lock").touch()
         with (self.admission_environment(),
-              mock.patch.object(build_folders, "tmpfs_temporary_parent", return_value=tmpfs),
+              mock.patch.object(build_folders, "configured_gate_root", return_value=tmpfs),
               mock.patch.object(gate, "gate_reservation", side_effect=GateRefused("stopped at admission")),
               redirect_stderr(io.StringIO()) as report):
             with self.assertRaisesRegex(GateRefused, "stopped at admission"):

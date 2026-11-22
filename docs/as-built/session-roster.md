@@ -284,6 +284,7 @@ The relay runs `command claude -p` with Sonnet, auto mode, and only the `SendMes
 It disables MCP, slash commands, and settings sources and removes inherited `CLAUDE_*` variables.
 The proxy checks the request and writes it to the recipient's verified socket.
 The relay requires a completed proxy write of the approved text and one explicit success result for the forwarded tool ID.
+The relay logs changed calls locally in `STATE/relay_mismatches.jsonl`, with a bounded target and short excerpts at the first text difference.
 The `SENT` line reports how many SendMessage calls the relay made and that the proxy forwarded one.
 It saves the tool stream in `STATE/relay/<to>.jsonl`.
 `--timeout` defaults to 40 s for every transport.
@@ -769,7 +770,7 @@ Release recalculates the priority of a kept decision.
 
 **Tests**
 - `PROCESS_TABLE_PS` is read at import: a test that sets it reloads `process_table` or patches `process_table.PS`.
-- `scripts/agents/test_inventory.py` fakes `sessions.live_session`, so `live_sessions()` must call that predicate per record. Suites outside the message package (build_hold, model_study rerun, shutdown) read `live_sessions()`.
+- `scripts/agents/test_inventory.py` fakes `sessions.live_session`, so `live_sessions()` must call that predicate per record. The build hold and shutdown suites read `live_sessions()`.
 - Tests that fake both session readers hide the socket cases; socket fixtures build real session records, and socketless fixtures carry a real start.
 - `RUN_REMOTE` stubs and restores four bindings: `remote.run_remote`, `restart_support.run_remote`, `restart.run_remote`, `shutdown.run_remote`.
 - `_REAL_LEAF_BINDINGS` holds the real functions captured at import, so `allow_leaf` restores them even inside a case nested in another guarded case.

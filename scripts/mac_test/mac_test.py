@@ -78,6 +78,7 @@ from scripts.mac_test.claim_state import (
     read_run as read_run,
     aware_timestamp as aware_timestamp,
     required_string as required_string,
+    scopes_overlap as scopes_overlap,
     target_claim_scope as target_claim_scope,
     claim_files as claim_files,
     read_claims as read_claims,
@@ -234,6 +235,7 @@ class ExpiredBlockLiftFailed:
 
 ExpiredBlockLiftFailure = NoExpiredBlockLiftFailure | ExpiredBlockLiftFailed
 NO_EXPIRED_BLOCK_LIFT_FAILURE = NoExpiredBlockLiftFailure()
+BLOCK_LIFT_FAILURE_FILE = "block-lift-failure.json"
 
 
 @dataclass(frozen=True)
@@ -544,9 +546,29 @@ def blocking_claim_block(paths: StatePaths, session: SubmittingSession) -> MacBl
     return block
 
 
+def lift_expired_claim_block(
+    paths: StatePaths, session: SubmittingSession, block: PendingMacBlock | ActiveMacBlock,
+) -> MacBlockState:
+    if utc_now() < block.expires:
+        return block
+    with locked(paths.control_lock):
+        current = blocking_claim_block(paths, session)
+        if isinstance(current, NoMacBlock) or utc_now() < current.expires:
+            return current
+        if isinstance(read_block_lift_failure(paths, current), ExpiredBlockLiftFailed):
+            return current
+        target = paths.target if paths.registry_selected else ""
+        return expire_block(paths, read_config(target), (), current).block
+
+
 def blocked_claim(block: PendingMacBlock | ActiveMacBlock) -> ClaimFinished:
     print(f"blocked by {holder_name(block.holder)}: {block.reason}")
     return ClaimFinished(10)
+
+
+def unreadable_claim(path: Path) -> ClaimFinished:
+    print(f"state unreadable: {path}")
+    return ClaimFinished(12)
 
 
 def timestamp(value: datetime) -> str:
@@ -692,13 +714,6 @@ def claim_path(paths: StatePaths, scope: ClaimScope) -> Path:
         suffix = f".slot-{scope.slot}" if scope.slot else ""
         return paths.claims / f"{key}{suffix}.json"
     return paths.run
-
-
-def scopes_overlap(first: ClaimScope, second: ClaimScope) -> bool:
-    if isinstance(first, WholeMacScope) or isinstance(second, WholeMacScope):
-        return True
-    same_repository = first.key == second.key if first.key and second.key else first.name == second.name
-    return same_repository and (not first.slot or not second.slot or first.slot == second.slot)
 
 
 def slot_capacity(paths: StatePaths, scope: ClaimScope, *,
@@ -1215,18 +1230,47 @@ def send_to_block_recipients(
         )
 
 
+def read_block_lift_failure(paths: StatePaths, block: PendingMacBlock | ActiveMacBlock) -> ExpiredBlockLiftFailure:
+    path = paths.directory / BLOCK_LIFT_FAILURE_FILE
+    saved = read_json_object(path)
+    if saved is None or saved.get("holder") != block.holder or saved.get("since") != timestamp(block.since):
+        return NO_EXPIRED_BLOCK_LIFT_FAILURE
+    return ExpiredBlockLiftFailed(required_string(saved, "gh_error_line", path))
+
+
+def remove_block(paths: StatePaths, block: PendingMacBlock | ActiveMacBlock) -> None:
+    with locked(paths.lock):
+        at = utc_now()
+        try:
+            paths.block.unlink()
+        except FileNotFoundError:
+            pass
+        else:
+            record_hold_event("ended", block, at, paths.target)
+    (paths.directory / BLOCK_LIFT_FAILURE_FILE).unlink(missing_ok=True)
+
+
 def expire_block(
     paths: StatePaths,
     config: MacTestConfig,
     claims: tuple[HeldClaim, ...],
     block: PendingMacBlock | ActiveMacBlock,
+    *,
+    retry_failed_restore: bool = True,
 ) -> SettleOutcome:
+    if not retry_failed_restore:
+        failure = read_block_lift_failure(paths, block)
+        if isinstance(failure, ExpiredBlockLiftFailed):
+            return SettleOutcome(claims, block, failure, NO_PROBLEM, NO_PROBLEM)
     label = "Mac" if paths.target == "mac" else paths.target
     if not config.ci_repo:
         block = replace_ci(block, "not_configured")
     elif ci_needs_restore(block.ci):
         restored = switch_ci_back(config)
         if isinstance(restored, GhFailure):
+            write_json(paths.directory / BLOCK_LIFT_FAILURE_FILE, {
+                "holder": block.holder, "since": timestamp(block.since), "gh_error_line": restored.line,
+            })
             text = (
                 f"Message from mac-test: {label} block by {holder_name(block.holder)} is past "
                 + f"its time limit but still in place: CI's {label} switch could not be "
@@ -1246,14 +1290,7 @@ def expire_block(
                 NO_PROBLEM,
                 NO_PROBLEM,
             )
-    with locked(paths.lock):
-        at = utc_now()
-        try:
-            paths.block.unlink()
-        except FileNotFoundError:
-            pass
-        else:
-            record_hold_event("ended", block, at, paths.target)
+    remove_block(paths, block)
     skipped = (
         skipped_ci_runs(config, block.since)
         if block.ci != "not_configured"
@@ -1643,7 +1680,7 @@ def full_settle(
         )
     now = utc_now()
     if now >= block.expires:
-        outcome = expire_block(paths, config, claims, block)
+        outcome = expire_block(paths, config, claims, block, retry_failed_restore=not watcher_holds_lock)
         if (
             not watcher_holds_lock
             and not isinstance(outcome.block, NoMacBlock)
@@ -1830,15 +1867,13 @@ def claim_once(args: CliArguments, paths: StatePaths, scope: ClaimScope,
     try:
         claims = live_claims(paths)
     except ClaimStateUnreadable as error:
-        print(f"state unreadable: {error.path}")
-        return ClaimFinished(12)
+        return unreadable_claim(error.path)
     overlapping = tuple(claim for claim in claims if scopes_overlap(claim.scope, scope))
     identity = claim_state.ClaimIdentity(args.claim_id, args.episode, args.attempt)
     try:
         block = blocking_claim_block(paths, session)
     except (OSError, StateReadError):
-        print(f"state unreadable: {paths.block}")
-        return ClaimFinished(12)
+        return unreadable_claim(paths.block)
     for claim in overlapping:
         record = claim.record
         if ("remote_host" in record and record.get("cleanup_pending")
@@ -1888,7 +1923,7 @@ def claim_once(args: CliArguments, paths: StatePaths, scope: ClaimScope,
     if isinstance(args.remote, str) or reserve_wait:
         for claim in overlapping:
             record = claim.record
-            if scopes_overlap(claim.scope, scope) and run_is_kept(record):
+            if claim_state.cleanup_scope_matches(paths, claim, scope) and run_is_kept(record):
                 return take_over_kept_claim(args, claim, record, session=session)
     if not isinstance(block, NoMacBlock):
         return blocked_claim(block)
@@ -1975,7 +2010,8 @@ def adopt_wait_claim(args: CliArguments, paths: StatePaths, scope: ClaimScope,
     worktree = claim_worktree_path(args.worktree)
     checks: tuple[tuple[WaitClaimCheck, Callable[[HeldClaim], bool]], ...] = (
         (WaitClaimCheck.IDENTITY, lambda claim: claim_state.claim_identity(claim.record) == identity),
-        (WaitClaimCheck.SCOPE, lambda claim: scopes_overlap(claim.scope, scope)),
+        (WaitClaimCheck.SCOPE, lambda claim: claim_state.cleanup_scope_matches(paths, claim, scope)
+            if claim.record.get("cleanup_pending") is True else scopes_overlap(claim.scope, scope)),
         (WaitClaimCheck.PID, lambda claim: claim.record["pid"] == args.from_pid),
         (WaitClaimCheck.SESSION, lambda claim: claim.record["submitting_session"] == claim_state.session_id(session)),
         (WaitClaimCheck.REMOTE_HOST, lambda claim: "remote_host" not in claim.record or claim.record.get("cleanup_pending") is True),
@@ -2434,14 +2470,7 @@ def command_unblock(
                     + f"on ({restored.line}). Run github-warmup, then unblock again."
                 )
                 return 2
-        with locked(paths.lock):
-            at = utc_now()
-            try:
-                paths.block.unlink()
-            except FileNotFoundError:
-                pass
-            else:
-                record_hold_event("ended", block, at, paths.target)
+        remove_block(paths, block)
         if ci_needs_restore(block.ci):
             print("Mac unblocked; CI may use the Mac again.")
         elif block.ci == "off_before":
