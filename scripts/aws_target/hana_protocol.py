@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
 import json
+from pathlib import Path
 import re
 from typing import ClassVar, Literal, TypedDict, cast
 from urllib.parse import urlsplit
@@ -17,7 +18,14 @@ CONTROL_MAX_BYTES = 65536
 # Reserve space for the wrapper, the permit, and both signed publication URLs.
 COMMAND_ENVELOPE_RESERVE_BYTES = 16 * 1024
 COMMAND_RESULT_PENDING = 'The command result is pending'
-RUNTIME_ABI = 1
+RUNTIME_ABI = 2
+REPOSITORY = 'hana'
+COPY_UNIT = 'aws-hana'
+
+
+def main_checkout(home: Path) -> Path:
+    """Select the guest's main checkout."""
+    return home / 'rust' / REPOSITORY
 
 
 def fence_settlement_seconds(control_timeout_s: int, poll_seconds: int) -> int:

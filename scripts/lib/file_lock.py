@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import fcntl
 import os
+import stat
 import time
 from collections.abc import Generator
 from contextlib import contextmanager
@@ -35,6 +36,28 @@ def acquire_exclusive_with_timeout(descriptor: int, timeout_s: float) -> bool:
 class LockResult(Enum):
     ACQUIRED = "acquired"
     BUSY = "busy"
+
+
+class LockAvailability(Enum):
+    AVAILABLE = "available"
+    HELD = "held"
+
+
+def probe_existing_exclusive(path: Path) -> LockAvailability:
+    """Probe the lock without waiting or creating a file."""
+    try:
+        descriptor = os.open(path, os.O_WRONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+    except FileNotFoundError:
+        return LockAvailability.AVAILABLE
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise OSError(f"{path}: expected a regular lock file")
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return LockAvailability.HELD
+    finally:
+        os.close(descriptor)
+    return LockAvailability.AVAILABLE
 
 
 @dataclass(frozen=True)

@@ -42,7 +42,7 @@ from scripts.direct.step_selection import Pinned
 
 
 REPOSITORY = Path(__file__).resolve().parents[2]
-KEY = 'https://github.com/natepiano/hana'
+KEY = 'https://github.com/hanallc/hana'
 PREVIEW_SECONDS = 2
 
 

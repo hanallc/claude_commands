@@ -932,7 +932,7 @@ def cleanup_refused_claims(target: SshTarget, args: CliArguments, *, session: Su
         return
     with mac_test.locked(paths.lock):
         claims = tuple(claim for claim in mac_test.read_claims(paths)
-                       if mac_test.scopes_overlap(claim.scope, scope) and "remote_host" in claim.record
+                       if claim_state.cleanup_scope_matches(paths, claim, scope) and "remote_host" in claim.record
                        and (mac_test.run_is_kept(claim.record)
                             or (claim.record.get("cleanup_pending") and claim.record["pid"] == args.pid
                                 and claim.record["proc_start"] == start.start)))
@@ -1113,7 +1113,7 @@ def command_reserve(args: CliArguments) -> int:
         if args.recover_only:
             scope = mac_test.target_claim_scope(paths, args.repo_root)
             with mac_test.locked(paths.lock):
-                retained = any(mac_test.scopes_overlap(claim.scope, scope)
+                retained = any(claim_state.cleanup_scope_matches(paths, claim, scope)
                                and mac_test.run_is_kept(claim.record)
                                for claim in mac_test.read_claims(paths))
             if not retained:

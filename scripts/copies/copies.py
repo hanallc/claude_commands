@@ -277,9 +277,15 @@ def _private_index_git(source: Path, index: Path, *arguments: str) -> bytes:
     return result.stdout
 
 
-def staged_tree(source: Path, *, include_worktree: bool = False) -> str:
+DEFAULT_INDEX_PARENT = build_folders.InheritedTemporaryParent()
+
+
+def staged_tree(source: Path, *, include_worktree: bool = False,
+                index_parent: build_folders.ExplicitBuildParent | build_folders.InheritedTemporaryParent
+                = DEFAULT_INDEX_PARENT) -> str:
     """Read staged or working files through a private index."""
-    with build_folders.tool_folder("copies-index") as temporary:
+    parent = index_parent.path if isinstance(index_parent, build_folders.ExplicitBuildParent) else None
+    with build_folders.tool_folder("copies-index", parent=parent) as temporary:
         index = Path(git(source, "rev-parse", "--path-format=absolute", "--git-path", "index").decode().strip())
         private = temporary / "index"
         if index.exists():
@@ -307,14 +313,16 @@ def source_commit(source: Path, policy: SourcePolicy) -> str:
                data=b"copies: staged source\n").decode().strip()
 
 
-def capture_source(source: Path) -> str:
+def capture_source(source: Path, *,
+                   index_parent: build_folders.ExplicitBuildParent | build_folders.InheritedTemporaryParent
+                   = DEFAULT_INDEX_PARENT) -> str:
     """Commit exact working files through the private index without changing caller refs."""
     before = treekey.tree_key(str(source))
     head = source_commit(source, WorktreeSource("HEAD", source))
-    index = staged_tree(source)
-    tree = staged_tree(source, include_worktree=True)
-    if (staged_tree(source, include_worktree=True) != tree or not before
-            or treekey.tree_key(str(source)) != before or staged_tree(source) != index
+    index = staged_tree(source, index_parent=index_parent)
+    tree = staged_tree(source, include_worktree=True, index_parent=index_parent)
+    if (staged_tree(source, include_worktree=True, index_parent=index_parent) != tree or not before
+            or treekey.tree_key(str(source)) != before or staged_tree(source, index_parent=index_parent) != index
             or commit_at(source, "HEAD") != head):
         raise SourceChangedDuringCapture("SourceChanged: inputs changed during source capture")
     return git(source, "-c", "user.name=copies.py", "-c", "user.email=copies@localhost",

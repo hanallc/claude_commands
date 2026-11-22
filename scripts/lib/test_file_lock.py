@@ -12,6 +12,16 @@ from scripts.lib import file_lock
 
 
 class FileLockTests(unittest.TestCase):
+    def test_probe_checks_an_existing_lock_without_creating_one(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "operation.lock"
+            self.assertIs(file_lock.probe_existing_exclusive(path), file_lock.LockAvailability.AVAILABLE)
+            self.assertFalse(path.exists())
+            with file_lock.exclusive(path, wait=False) as acquired:
+                self.assertIs(acquired, file_lock.LockResult.ACQUIRED)
+                self.assertIs(file_lock.probe_existing_exclusive(path), file_lock.LockAvailability.HELD)
+            self.assertIs(file_lock.probe_existing_exclusive(path), file_lock.LockAvailability.AVAILABLE)
+
     def test_closing_a_parent_handle_keeps_the_inherited_lock(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "operation.lock"
