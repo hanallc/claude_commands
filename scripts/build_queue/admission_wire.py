@@ -68,6 +68,18 @@ class Owner:
     start_time: str
 
 
+@dataclass(frozen=True)
+class VerifyRunGeneration:
+    """The generation identifies the worker on the coordinator's host."""
+    id: str
+    worker: Owner
+
+
+@dataclass(frozen=True)
+class RunGenerationUnrecorded:
+    """The record supplies no generation or worker for continuation."""
+
+
 def _natedev_run_destination() -> placement.PlacementDestination:
     from scripts.mac_test.claim_state import WHOLE_MAC
 
@@ -98,12 +110,33 @@ class LegacyAttemptBoundRunClaim:
 
 
 @dataclass(frozen=True)
+class RunCommandAttempt:
+    """The episode and attempt identify one command of the run."""
+    episode: str
+    attempt: str
+
+
+@dataclass(frozen=True)
+class MacRunWatcherFence:
+    """The watcher record identifies the exact command, run claim and start fence."""
+    command: RunCommandAttempt
+    binding: placement.RunCommandBinding
+
+
+@dataclass(frozen=True)
+class MacRunWatcherFenceUnrecorded:
+    """The provider record supplies no command fence for the watcher."""
+
+
+@dataclass(frozen=True)
 class RemoteRunProvider:
     """The saved endpoint and claim identify the provider that must settle the run."""
     endpoint: str
     transport: ExecutionTransport
     claim: placement.RunProviderClaimReference | LegacyAttemptBoundRunClaim
     holder: placement.ClaimHolderIdentity
+    watcher_fence: MacRunWatcherFence | MacRunWatcherFenceUnrecorded = field(
+        default=MacRunWatcherFenceUnrecorded(), kw_only=True)
 
 
 @dataclass(frozen=True)
@@ -112,13 +145,6 @@ class LegacyRunProviderUnrecorded:
 
 
 RunProviderIdentity = LocalRunProvider | RemoteRunProvider | LegacyRunProviderUnrecorded
-
-
-@dataclass(frozen=True)
-class RunCommandAttempt:
-    """The episode and attempt identify one command of the run."""
-    episode: str
-    attempt: str
 
 
 @dataclass(frozen=True)
@@ -140,6 +166,12 @@ class RunClaimReleasePending:
 
 
 @dataclass(frozen=True)
+class MacWatcherSettlementPending:
+    """Only the watcher can release this lost claim. Use the saved provider fence."""
+    claim: placement.RunProviderClaimReference
+
+
+@dataclass(frozen=True)
 class RunOpen:
     """The run can still request a command grant."""
 
@@ -148,7 +180,8 @@ class RunOpen:
 class SettlementPending:
     """The run is closing and holds its place until this operation settles."""
     reason: str
-    operation: RunClaimAcquisitionPending | RunCommandSettlementPending | RunClaimReleasePending
+    operation: (RunClaimAcquisitionPending | RunCommandSettlementPending | RunClaimReleasePending
+                | MacWatcherSettlementPending)
 
 
 @dataclass(frozen=True)
@@ -185,6 +218,7 @@ class VerifyRunSlot:
     provider: RunProviderIdentity = field(default=LegacyRunProviderUnrecorded(), kw_only=True)
     settlement: RunOpen | SettlementPending = field(default=RunOpen(), kw_only=True)
     launch: RunLaunchState = field(default=RunLaunchUnrecorded(), kw_only=True)
+    generation: VerifyRunGeneration | RunGenerationUnrecorded = field(default=RunGenerationUnrecorded(), kw_only=True)
 
     @property
     def run_key(self) -> str:
@@ -628,15 +662,17 @@ class PlacementStatusReply:
 
 @dataclass(frozen=True)
 class RunGrantRequest(CallerCode):
-    """The owner asks for the destination already saved for the run."""
+    """The owner and worker generation request the saved destination."""
     episode: str
     owner: placement.SubmittingOwner
+    generation: VerifyRunGeneration | RunGenerationUnrecorded = field(default=RunGenerationUnrecorded(), kw_only=True)
 
 
 @dataclass(frozen=True)
 class RunGrant:
-    """The reply gives the destination saved for the run."""
+    """The reply gives the destination for the matched worker generation."""
     destination: placement.PlacementDestination
+    generation: VerifyRunGeneration | RunGenerationUnrecorded = field(default=RunGenerationUnrecorded(), kw_only=True)
 
 
 @dataclass(frozen=True)
@@ -732,6 +768,15 @@ class ConsumePermission(CallerCode):
 
 
 @dataclass(frozen=True)
+class ConsumeRunCommandPermission(CallerCode):
+    """The worker requests permission for this command and its run claim."""
+    request_id: str
+    assignment: placement.PlacementAssignment
+    generation: VerifyRunGeneration
+    binding: placement.RunCommandBinding
+
+
+@dataclass(frozen=True)
 class ExecutionReport(CallerCode):
     """The report holds assignment, claim, execution evidence, outcome, and path state."""
     request_id: str
@@ -792,6 +837,14 @@ class FirstAuthorization:
     """The first launch authorization pairs an assignment with its provider claim."""
     assignment: placement.PlacementAssignment
     claim: placement.ProviderClaimReference
+
+
+@dataclass(frozen=True)
+class RunCommandAuthorization:
+    """The authorization covers one command, worker generation and run claim."""
+    assignment: placement.PlacementAssignment
+    generation: VerifyRunGeneration
+    binding: placement.RunCommandBinding
 
 
 @dataclass(frozen=True)

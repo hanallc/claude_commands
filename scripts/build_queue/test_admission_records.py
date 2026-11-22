@@ -25,6 +25,7 @@ class RunRecordCodecTests(unittest.TestCase):
         self.assertEqual(slot.provider, wire.LegacyRunProviderUnrecorded())
         self.assertEqual(slot.settlement, wire.RunOpen())
         self.assertEqual(slot.launch, wire.RunLaunchUnrecorded())
+        self.assertEqual(slot.generation, wire.RunGenerationUnrecorded())
         self.assertEqual(slot.key, "123-4200:fixture")
         self.assertEqual(wire.parse_record(wire.encode_record(slot), wire.VerifyRunSlot), slot)
 
@@ -44,28 +45,33 @@ class RunRecordCodecTests(unittest.TestCase):
 
     def test_run_launch_states_survive_the_slot_codec(self) -> None:
         command = wire.RunCommandAttempt("first-step", "first-attempt")
+        generation = wire.VerifyRunGeneration("local-generation", wire.Owner(124, "4201"))
         for launch in (wire.RunNeverLaunched(), wire.RunLaunchUnresolved(command), wire.RunLaunched()):
             with self.subTest(launch=launch):
                 slot = wire.VerifyRunSlot("fixture", wire.Owner(123, "4200"),
-                    provider=wire.LocalRunProvider(), launch=launch)
+                    provider=wire.LocalRunProvider(), launch=launch, generation=generation)
                 self.assertEqual(wire.parse_record(wire.encode_record(slot), wire.VerifyRunSlot), slot)
 
     def test_remote_settlement_retains_the_provider_and_the_exact_operation(self) -> None:
         scope = RepositoryScope("fixture", "fixture-key", 2)
         destination = placement.PlacementDestination("mac", "mac", "mac-host", scope, 2)
         claim = placement.RunProviderClaimReference("mac", "mac", scope, "run-claim", "run-a", "placement-a")
+        command = wire.RunCommandAttempt("nextest-step", "nextest-attempt")
+        fence = wire.MacRunWatcherFence(command, placement.RunCommandBinding(claim, "nextest-fence"))
+        generation = wire.VerifyRunGeneration("placement-a", wire.Owner(124, "4201"))
         provider = wire.RemoteRunProvider("original-mac",
             SshCommandTransport(Path("/fixture/mac.conf")), claim,
-            placement.ClaimHolderIdentity("natedev", 123, "4200"))
-        command = wire.RunCommandAttempt("nextest-step", "nextest-attempt")
+            placement.ClaimHolderIdentity("natedev", 124, "4201"), watcher_fence=fence)
         for operation, launch in (
             (wire.RunClaimAcquisitionPending(claim), wire.RunNeverLaunched()),
             (wire.RunCommandSettlementPending(command), wire.RunLaunched()),
             (wire.RunClaimReleasePending(claim), wire.RunLaunched()),
+            (wire.MacWatcherSettlementPending(claim), wire.RunLaunched()),
         ):
             with self.subTest(operation=operation):
                 slot = wire.VerifyRunSlot("fixture", wire.Owner(123, "4200"), destination=destination,
-                    provider=provider, settlement=wire.SettlementPending("cancelled", operation), launch=launch)
+                    provider=provider, settlement=wire.SettlementPending("run ended", operation),
+                    launch=launch, generation=generation)
                 self.assertEqual(wire.parse_record(wire.encode_record(slot), wire.VerifyRunSlot), slot)
 
     def test_legacy_remote_slot_preserves_the_attempt_claim_and_fence(self) -> None:

@@ -37,16 +37,55 @@ class ProtocolTests(unittest.TestCase):
         from scripts.build_queue import admission_wire as grant_wire
         from scripts.mac_test.claim_state import RepositoryScope
 
-        request = grant_wire.RunGrantRequest("run-a", placement.SubmittingOwner("natedev", 123, "4200"))
+        generation = grant_wire.VerifyRunGeneration("generation-a", grant_wire.Owner(124, "4201"))
+        request = grant_wire.RunGrantRequest("run-a", placement.SubmittingOwner("natedev", 123, "4200"),
+            generation=generation)
         self.assertEqual(grant_wire.parse_record(grant_wire.encode_record(request), grant_wire.RunGrantRequest), request)
+        old = grant_wire.parse_record(grant_wire.encode_record(request), dict[str, object])
+        del old["generation"]
+        self.assertEqual(grant_wire.parse_record(grant_wire.encode_record(old), grant_wire.RunGrantRequest),
+            replace(request, generation=grant_wire.RunGenerationUnrecorded()))
 
         scope = RepositoryScope("fixture", "fixture-key", 1)
-        grant = grant_wire.RunGrant(placement.PlacementDestination("mac", "mac", "mac-host", scope, 1))
+        grant = grant_wire.RunGrant(placement.PlacementDestination("mac", "mac", "mac-host", scope, 1),
+            generation=generation)
         for reply in (grant, grant_wire.RunGrantRefused("missing_run"),
                       grant_wire.RunGrantRefused("stale_run"), grant_wire.RunGrantRefused("not_built"),
                       grant_wire.RunGrantSettlementPending("waiting for exact claim release")):
             with self.subTest(reply=reply):
                 self.assertEqual(codec.parse_snapshot_value(codec.snapshot_value(reply), grant_wire.RunGrantReply), reply)
+        old = grant_wire.parse_record(grant_wire.encode_record(grant), dict[str, object])
+        del old["generation"]
+        self.assertEqual(grant_wire.parse_record(grant_wire.encode_record(old), grant_wire.RunGrant),
+            replace(grant, generation=grant_wire.RunGenerationUnrecorded()))
+
+    def test_run_command_permission_pairs_the_stable_claim_with_the_exact_attempt(self) -> None:
+        from scripts.build_hold.owning_session import NoOwningSession
+        from scripts.build_queue import admission_wire as grant_wire
+        from scripts.mac_test.claim_state import RepositoryScope
+
+        scope = RepositoryScope("fixture", "fixture-key", 1)
+        destination = placement.PlacementDestination("mac", "mac", "mac-host", scope, 1)
+        owner = placement.SubmittingOwner("natedev", 123, "4200")
+        generation = grant_wire.VerifyRunGeneration("generation-a", grant_wire.Owner(124, "4201"))
+        claim = placement.RunProviderClaimReference("mac", "mac", scope, "run-claim", "run-a", generation.id)
+        for command in ("check", "nextest"):
+            with self.subTest(command=command):
+                assignment = placement.PlacementAssignment(command, command + "-attempt", destination,
+                    execution_identity.SourceKeyKnown("source"), owner, NoOwningSession(), NOW)
+                binding = placement.RunCommandBinding(claim, command + "-fence")
+                request = grant_wire.ConsumeRunCommandPermission(command + "-permission", assignment, generation, binding)
+                reply = grant_wire.RunCommandAuthorization(assignment, generation, binding)
+                self.assertEqual(grant_wire.parse_record(grant_wire.encode_record(request),
+                    grant_wire.ConsumeRunCommandPermission), request)
+                self.assertEqual(grant_wire.parse_record(grant_wire.encode_record(reply),
+                    grant_wire.RunCommandAuthorization), reply)
+
+                old_claim = placement.ProviderClaimReference("mac", "mac", scope, "old-claim", command, assignment.attempt)
+                raw = grant_wire.parse_record(grant_wire.encode_record(request), dict[str, object])
+                raw["binding"] = {"kind": "RunCommandBinding", "claim": old_claim, "start_fence_id": binding.start_fence_id}
+                with self.assertRaises(ValueError):
+                    _ = grant_wire.parse_record(grant_wire.encode_record(raw), grant_wire.ConsumeRunCommandPermission)
 
     def test_placement_status_round_trips_without_launch_permission(self) -> None:
         from scripts.build_queue import admission_wire as status_wire
