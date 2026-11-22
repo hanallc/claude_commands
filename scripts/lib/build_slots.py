@@ -382,8 +382,8 @@ def _copy_order(parent: Path) -> Generator[int]:
 
 @contextmanager
 def take_copy(source: Path, commit: str, *, showrunner: str, unit: str, work: str,
-              purpose: str) -> Generator[LeasedCopy]:
-    """Take the first free existing copy or make the first missing number."""
+              purpose: str, selection: SlotSelection = LOWEST_FREE_SLOT) -> Generator[LeasedCopy]:
+    """Take the assigned number or the first free copy."""
     repository = _persistent_source(source_checkout(source))
     name = build_folders.repo_word(repository)
     revision = _git(source, "rev-parse", "--verify", "--end-of-options", f"{commit}^{{commit}}")
@@ -391,9 +391,10 @@ def take_copy(source: Path, commit: str, *, showrunner: str, unit: str, work: st
         raise SlotGitFailure(f"{revision}: the commit tracks a reserved copy path")
     parent = build_folders.unit_folder(name, unit)
     checkout = build_folders.SlotCheckout(repository, revision)
+    numbers = (selection.number,) if isinstance(selection, ExactSlotRequest) else _copy_order(parent)
     with _slot_commit(repository, source, revision), ExitStack() as unit_claim:
         _ = unit_claim.enter_context(build_folders.unit_allocation_lock(parent, exclusive=False))
-        for number in _copy_order(parent):
+        for number in numbers:
             spec = build_folders.BuildFolderSpec(kind="copy", parent=build_folders.build_root(),
                 suffix_length=0, repository=name, slot=number, showrunner=showrunner, unit=unit,
                 work=work, purpose=purpose, slot_checkout=checkout, machine=host_name())
@@ -444,6 +445,18 @@ def take_copy(source: Path, commit: str, *, showrunner: str, unit: str, work: st
                     build_folders.NUMBERED_COPY_LOCK_ENV: str(descriptor),
                 }), (descriptor,))
                 return
+        if isinstance(selection, ExactSlotRequest):
+            raise BlockingIOError(f"{parent}: assigned copy {selection.number} is unavailable")
+
+
+def limit_copy_size(copy: LeasedCopy, limit: int) -> None:
+    """Discard Cargo output when a held copy exceeds its size limit."""
+    size = _size(copy.path)
+    if size > limit:
+        shutil.rmtree(copy.cargo_dir)
+        copy.cargo_dir.mkdir()
+        print(f"slots: {copy.path} was {size / 2**30:g} GiB, over its {limit / 2**30:g} GiB limit. "
+              + "The maker deleted its Cargo output.")
 
 
 class NumberedCopyEnvrc(Enum):
