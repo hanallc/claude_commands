@@ -574,6 +574,34 @@ class QueueMoveTests(unittest.TestCase):
             self.assertEqual(move_line(fixture), moved.line)
             self.assertEqual(ids(moved.line), [first, pinned, last, middle])
 
+    def test_hidden_waits_keep_anchors_and_stay_out_of_move_positions(self) -> None:
+        with AdmissionFixture() as fixture:
+            fixture.free(0)
+            fixture.hold_starts()
+            for index in range(4):
+                request = fixture.request(since=fixture.clock.now() + index)
+                self.assertIsInstance(fixture.server.handle_request(request)[0], wire.Wait)
+            line = move_line(fixture)
+            first, hidden, third, last = ids(line)
+            moved, = fixture.server.handle_request(wire.QueueMoveRequest(
+                "move-hidden", last, line.revision, wire.QueueDrop(third, "before"), hidden_move_ids=(hidden,)))
+            assert isinstance(moved, wire.QueueMoved)
+            self.assertEqual((moved.old_place, moved.new_place), (3, 2))
+            self.assertEqual(ids(moved.line), [first, hidden, last, third])
+            self.assertEqual(fixture.server.queue_pins, (QueuePin(last, QueueRowAnchor(hidden)),))
+            self.assertEqual(move_line(fixture), moved.line)
+
+            lifted, = fixture.server.handle_request(wire.QueueMoveRequest(
+                "move-to-head", last, moved.line.revision, wire.QueueDrop(first, "before"), hidden_move_ids=(hidden,)))
+            assert isinstance(lifted, wire.QueueMoved)
+            self.assertEqual((lifted.old_place, lifted.new_place), (2, 1))
+            self.assertEqual(lifted.undo_destination, wire.QueueDrop(third, "before"))
+            undone, = fixture.server.handle_request(wire.QueueMoveRequest(
+                "undo-hidden", last, lifted.line.revision, wire.QueueUndo("move-to-head"), hidden_move_ids=(hidden,)))
+            assert isinstance(undone, wire.QueueMoved)
+            self.assertEqual(ids(undone.line), [first, hidden, last, third])
+            self.assertEqual(fixture.server.queue_pins, (QueuePin(last, QueueRowAnchor(hidden)),))
+
     def test_grant_publishes_the_order_used_to_confirm_moves_after_restart(self) -> None:
         with AdmissionFixture() as fixture:
             fixture.free(0)

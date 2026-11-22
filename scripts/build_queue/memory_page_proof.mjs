@@ -171,8 +171,11 @@ try {
       const {revision, row_id, destination} = request;
       const rows = queueFixture.waiters;
       const ordered = rows.filter(row => row.move);
-      const line = () => ({revision:queueFixture.move_revision, members:ordered.map(row => row.move)});
+      const hidden = queueFixture.hidden_move_ids.map(row_id => ({row_id}));
+      const line = () => ({revision:queueFixture.move_revision,
+        members:[...hidden, ...ordered.map(row => row.move)]});
       if (revision !== queueFixture.move_revision) return json(409, {reason:'The queue changed.', line:line()});
+      assert.deepEqual(request.hidden_move_ids, queueFixture.hidden_move_ids);
       const index = ordered.findIndex(row => row.move.row_id === row_id);
       const after = ordered[index + 1]?.move.row_id;
       const before = ordered[index - 1]?.move.row_id;
@@ -460,6 +463,7 @@ try {
         const template = readings.spacing.waiters.find(row => row.kind !== 'cloud');
         const units = ['natemerge', 'unit-board', 'aws', 'postmaster', 'typesafe'];
         queueFixture = {...structuredClone(readings.spacing), move_revision:'fixture',
+          hidden_move_ids:['unnamed-wait'],
           waiters:units.map((unit, index) => ({...template, key:unit, unit, detail:unit,
             name:queueDragProof ? 'test affected' : `${unit} test affected`, title:{unit, step:'test affected'},
             showrunner:['sdlc','sdlc','builds','natedev','natedev'][index],

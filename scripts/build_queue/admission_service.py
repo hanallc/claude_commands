@@ -4931,10 +4931,12 @@ done
         moving = by_id.get(request.row_id)
         destination = request.destination
         undo = isinstance(destination, wire.QueueUndo)
-        if moving is None or not moving.movable or request.revision != line.revision:
+        hidden = set(request.hidden_move_ids)
+        if (moving is None or not moving.movable or request.revision != line.revision
+                or moving.row_id in hidden or not hidden <= by_id.keys()):
             return unavailable if undo else changed
         row_id = moving.row_id
-        order = [member.row_id for member in line.members]
+        order = [member_id for member_id in by_id if member_id not in hidden]
         old_index = order.index(row_id)
         del order[old_index]
         if isinstance(destination, wire.QueueUndo):
@@ -4946,10 +4948,10 @@ done
         undo_destination = (wire.QueueDrop(order[old_index], "before") if old_index < len(order)
                             else wire.QueueDrop(order[-1], "after"))
         place = order.index(destination.neighbor) + int(destination.side == "after")
+        updated = line
         if place != old_index:
             self._move_pin(row_id, destination, full_order, first=place == 0)
-        order.insert(place, row_id)
-        updated = self._revise_move_line(tuple(by_id[member] for member in order))
+            updated = self._revise_move_line(tuple(by_id[member] for member in full_order if member in by_id))
         return wire.QueueMoved(row_id, updated, old_index + 1, place + 1, undo_destination)
 
     def _move_pin(self, row_id: str, destination: wire.QueueDrop, order: list[str], *, first: bool) -> None:

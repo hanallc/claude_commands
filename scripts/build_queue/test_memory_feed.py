@@ -3860,13 +3860,16 @@ process.stdout.write(JSON.stringify({
         unnamed_member = admission_records.QueueMoveMember("unnamed-wait")
         unnamed_row = gate.rank_waiter({"pid": 201, "since": unnamed.since, "start_time": "unnamed-start",
             "need": unnamed.need, "move_id": unnamed_member.row_id}, admission_records.NormalOrder())
-        complete = replace(line, members=(*line.members, unnamed_member))
+        complete = replace(line, members=(unnamed_member, *line.members))
         with mock.patch.object(admission_client, "view", return_value=replace(reading,
-                               view=replace(reading.view, waiting=(step, unnamed), move_line=complete),
-                               ordered=[*reading.ordered, (self.root / "unnamed", unnamed_row)])):
+                               view=replace(reading.view, waiting=(unnamed, step), move_line=complete),
+                               ordered=[(self.root / "unnamed", unnamed_row), *reading.ordered])):
             named = memory_feed.reading()
         self.assertEqual(named.get("move_revision"), line.revision)
-        self.assertEqual([wait["name"] for wait in named["waiters"]], [rows[0]["name"], "Build step"])
+        self.assertEqual(named.get("hidden_move_ids"), [unnamed_member.row_id])
+        shown, = named["waiters"]
+        self.assertEqual(shown["name"], rows[0]["name"])
+        self.assertEqual(shown.get("move"), member)
 
         incomplete = replace(line, members=(*line.members, admission_records.QueueMoveMember("new-wait")))
         with mock.patch.object(admission_client, "view",

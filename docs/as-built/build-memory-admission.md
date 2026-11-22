@@ -2382,7 +2382,8 @@ The anchor identifies the row directly ahead or the head of the queue.
 The service applies the usual priority and arrival rules to all saved waits.
 It then places each pinned wait directly after its anchor.
 A move gives the moved row a new anchor and keeps its former successor in place.
-Absent waits stay in this order until they return or depart.
+Absent and unnamed waits stay in the full order.
+The page omits waits with no name source.
 Placement, memory admission, and continuation claims use the eligible rows in this order.
 The head-stall snapshot uses the order of local waits.
 The page, client positions, and move validation include granted rows until the service sees them start.
@@ -2404,11 +2405,11 @@ A refusal before launch keeps the pin. Closing the attempt removes the local wai
 
 The service checks the order revision for all rows, including rows without handles.
 Its replay ledger records the reply with the new order and one Undo destination.
-Undo moves the step before its former next neighbor.
-If the step was last, Undo moves it after its former previous neighbor.
+Undo moves the step before its former next shown neighbor.
+If the step was last, Undo moves it after its former previous shown neighbor.
 If that neighbor left the queue, the service refuses Undo.
 Undo uses the current queue order and saves pins as a new move.
 A conflict supplies the current order.
-The page requires a complete move list before it enables another move.
-The page shows an unnamed wait as “Build step.”
+The page matches the service order to the shown and hidden wait IDs before it enables a move.
+Move requests include the hidden wait IDs. A drop can use a hidden wait as its anchor.
 The confirmation uses the current table numbers, including the places of waits without handles.

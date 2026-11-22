@@ -4209,7 +4209,8 @@ class ReviewLinksServerTests(unittest.TestCase):
             "move_timeout_seconds=3\nmove_request_bytes=512\nmove_highlight_seconds=2\n")
         _ = write_config_fixture(configuration / "review_links.conf", "kill_operator_login=local-node-owner\n")
         origin = f"http://127.0.0.1:{self.port}"
-        request = admission.QueueMoveRequest("1" * 32, "2" * 32, "3" * 32, admission.QueueDrop("4" * 32, "before"))
+        request = admission.QueueMoveRequest("1" * 32, "2" * 32, "3" * 32, admission.QueueDrop("4" * 32, "before"),
+            hidden_move_ids=("6" * 32,))
         line = records.QueueMoveLine("5" * 32, (records.QueueMoveMember(request.row_id),))
         content = cast(dict[str, object], json.loads(admission.encode_record(request)))
         del content["kind"], content["code_version"]
@@ -4248,6 +4249,7 @@ class ReviewLinksServerTests(unittest.TestCase):
                 (body, "", 403),
                 (body, "http://other.invalid", 403),
                 (json.dumps({**content, "token": "wrong"}), origin, 403),
+                (json.dumps({**content, "hidden_move_ids": ["not-a-row-id"]}), origin, 400),
                 (body + " " * 512, origin, 400),
             ):
                 with self.subTest(status=status, origin=sent_origin):
