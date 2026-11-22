@@ -1,6 +1,6 @@
 """Test first-step admission and handoff."""
 
-from contextlib import nullcontext
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import replace
 import os
 from pathlib import Path
@@ -28,6 +28,11 @@ PROGRAM_GRANT = wire.Admitted("program", 1, "test", "", "", {})
 
 def setUpModule() -> None:
     forbid_real_sender()
+
+
+def forbid_admission_calls() -> AbstractContextManager[object]:
+    """Fail at once when a test with mocked placement reaches an admission socket."""
+    return mock.patch.object(client, "_call", side_effect=AssertionError("unmocked admission service call"))
 
 
 class FirstStepTests(unittest.TestCase):
@@ -79,7 +84,8 @@ class FirstStepTests(unittest.TestCase):
                   mock.patch.object(client, "acquire_placement", side_effect=grant),
                   mock.patch.object(queue_place, "request_place", return_value=PROGRAM_GRANT) as program,
                   mock.patch.object(queue_place, "release_place", return_value=wire.Ok()),
-                  mock.patch.object(client, "cancel_placement", return_value=wire.Ok()) as cancel):
+                  mock.patch.object(client, "cancel_placement", return_value=wire.Ok()) as cancel,
+                  forbid_admission_calls()):
                 with first_step.admitted_run(GATE_COMMAND, fixture.root, targets=("natedev", "mac-linux")) as admitted:
                     self.assertEqual(len(requests), 1)
                     request = requests[0]
@@ -118,7 +124,8 @@ class FirstStepTests(unittest.TestCase):
                   mock.patch.object(build_folders, "tool_folder", return_value=nullcontext(fixture.root)),
                   mock.patch.object(first_step, "_placement_grant") as placement_grant,
                   mock.patch.object(queue_place, "request_place", side_effect=grant),
-                  mock.patch.object(queue_place, "release_place", return_value=wire.Ok()) as release):
+                  mock.patch.object(queue_place, "release_place", return_value=wire.Ok()) as release,
+                  forbid_admission_calls()):
                 with first_step.admitted_run(GATE_COMMAND, fixture.root) as admitted:
                     self.assertEqual(len(program_requests), 1)
                     profile = program_requests[0].profile
