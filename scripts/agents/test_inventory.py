@@ -986,11 +986,30 @@ elif "comm=" in joined:
         self.herdr_process(DESKTOP_PID, 71_001, ["/bin/claude"],
                            {"HERDR_PANE_ID": "w1:p1", "HERDR_SESSION": "inherited-other-name"})
         self.assertEqual(herdr.herdr_place_of(DESKTOP_PID), herdr.HerdrPlace("writing", "w1:p1"))
-        found = inventory.inventory(TARGET_LOGIN)
-        desktop = next(session for session in found["sessions"] if session["session_id"] == DESKTOP_ID)
-        self.assertEqual(desktop["host"], {"kind": "herdr", "herdr_session": "writing", "pane_id": "w1:p1", "presentation": "detached"})
-        self.assertEqual(inventory.parse_inventory(json.dumps(found)), found)
-        self.assertEqual(status_entry._host_text(desktop["host"]), "herdr writing")  # pyright: ignore[reportPrivateUsage]
+        self.herdr_process(self.director_pid, 71_001, ["/bin/claude"], {"HERDR_PANE_ID": "w1:p2"})
+        self.herdr_sessions(["unit-renamed", "writing"])
+        # Keep the live panes and give both processes an old launch pane ID.
+        for pid in (DESKTOP_PID, self.director_pid):
+            _ = (self.proc / str(pid) / "environ").write_bytes(b"HERDR_PANE_ID=old-pane\0")
+
+        for run in (1, 2):
+            with self.subTest(run=run):
+                _ = self.herdr_log.write_text("")
+                found = inventory.inventory(TARGET_LOGIN)
+                hosts = {session["session_id"]: session["host"] for session in found["sessions"]}
+                desktop = hosts[DESKTOP_ID]
+                self.assertEqual(desktop, {"kind": "herdr", "herdr_session": "writing", "pane_id": "w1:p1", "presentation": "detached"})
+                self.assertEqual(hosts[DIRECTOR_ID], {**desktop, "pane_id": "w1:p2"})
+                self.assertEqual(inventory.parse_inventory(json.dumps(found)), found)
+                self.assertEqual(status_entry._host_text(desktop), "herdr writing")  # pyright: ignore[reportPrivateUsage]
+                commands = [cast(list[str], json.loads(line)) for line in self.herdr_log.read_text().splitlines()]
+                pane_reads = [command[2:] for command in commands if command[:2] == ["--session", "writing"]
+                              and command[2:4] in (["pane", "list"], ["pane", "process-info"])]
+                self.assertCountEqual(pane_reads, [
+                    ["pane", "list"],
+                    ["pane", "process-info", "--pane", "w1:p1"],
+                    ["pane", "process-info", "--pane", "w1:p2"],
+                ])
 
     def test_unreadable_herdr_placement_stays_unknown_in_inventory(self) -> None:
         with patch.object(herdr, "herdr_place_of", return_value=herdr.UnprovedHerdrPlacement("placement denied")):

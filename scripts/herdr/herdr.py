@@ -5659,16 +5659,25 @@ def _herdr_command(arguments: list[str], default_session: str) -> tuple[str, lis
 
 
 def attached_clients(name: str) -> ClientsAttached | NoClientAttached | ClientsUnreadable:
+    snapshot = _active_placement_snapshot()
+    if snapshot is None:
+        return _read_attached_clients(name)
+    if name not in snapshot.clients:
+        snapshot.clients[name] = _read_attached_clients(name)
+    return snapshot.clients[name]
+
+
+def _read_attached_clients(name: str) -> ClientsAttached | NoClientAttached | ClientsUnreadable:
     if _platform() == "darwin":
         return _darwin_attached_clients(name)
     try:
-        processes = list(proc_root().iterdir())
+        snapshot = _active_placement_snapshot()
+        processes = (snapshot.linux().candidates if snapshot is not None
+                     else [path for path in proc_root().iterdir() if path.name.isdecimal()])
     except OSError as error:
         return ClientsUnreadable(str(error))
     count = 0
     for process in processes:
-        if not process.name.isdecimal():
-            continue
         try:
             if process.stat().st_uid != os.getuid():
                 continue
@@ -5996,14 +6005,19 @@ def process_placement(pid: int, *, environment: Mapping[str, str] | None = None)
             environment = process_environment(pid)
         if (not environment.get("HERDR_PANE_ID")) or environment.get("TMUX_PANE"):
             return _placement_in_session(pid, environment, "", linux_process_parent)
+        snapshot = _active_placement_snapshot()
         if _platform() == "darwin":
-            processes = {process.pid: process for process in _darwin_processes()}
-            session = _darwin_process_sessions(processes, _darwin_bound_sockets()).get(pid)
+            scan = snapshot.darwin() if snapshot is not None else _read_darwin_placement_scan(with_terminal=False)
+            session = scan.sessions.get(pid)
             if session is not None:
-                return _placement_in_session(pid, environment, session, lambda item: processes[item].parent)
+                return _placement_in_session(pid, environment, session, lambda item: scan.processes[item].parent)
         else:
-            candidates = [path for path in proc_root().iterdir() if path.name.isdecimal()]
-            session = _process_sessions(candidates, _live_server_processes(candidates)).get(pid)
+            if snapshot is None:
+                candidates = [path for path in proc_root().iterdir() if path.name.isdecimal()]
+                sessions = _process_sessions(candidates, _live_server_processes(candidates))
+            else:
+                sessions = snapshot.linux().sessions
+            session = sessions.get(pid)
             if session is not None:
                 return _placement_in_session(pid, environment, session, linux_process_parent)
     except (HerdrFailure, OSError, ValueError, subprocess.SubprocessError):
@@ -6029,12 +6043,20 @@ def herdr_places() -> HerdrProcessPlacements:
     failures: list[str] = []
     servers: dict[int, str] = {}
     try:
+        snapshot = _active_placement_snapshot()
         if _platform() == "darwin":
-            processes = {process.pid: process for process in _darwin_processes()}
-            sessions = _darwin_process_sessions(processes, _darwin_bound_sockets(), failures=failures)
+            darwin = (snapshot.darwin() if snapshot is not None
+                      else _read_darwin_placement_scan(with_terminal=False))
+            failures.extend(darwin.failures)
+            sessions = darwin.sessions
 
             def parent(pid: int) -> int:
-                return processes[pid].parent
+                return darwin.processes[pid].parent
+        elif snapshot is not None:
+            linux = snapshot.linux()
+            failures.extend(linux.failures)
+            servers, sessions = linux.servers, linux.sessions
+            parent = linux_process_parent
         else:
             candidates = [path for path in proc_root().iterdir() if path.name.isdecimal()]
             servers = _live_server_processes(candidates, failures=failures)
@@ -6374,7 +6396,8 @@ def _darwin_processes(*, complete: bool = False, with_terminal: bool = False,
 
 def _darwin_attached_clients(name: str) -> ClientsAttached | NoClientAttached | ClientsUnreadable:
     try:
-        processes = _darwin_processes()
+        snapshot = _active_placement_snapshot()
+        processes = snapshot.darwin().processes.values() if snapshot is not None else _darwin_processes()
     except (HerdrFailure, subprocess.TimeoutExpired, OSError) as error:
         return ClientsUnreadable(str(error))
     count = 0
@@ -6463,13 +6486,28 @@ def _darwin_process_sessions(by_pid: dict[int, _UserProcess], listeners: list[_B
     return sessions
 
 
+@dataclass(frozen=True)
+class _DarwinPlacementScan:
+    processes: dict[int, _UserProcess]
+    sessions: dict[int, str]
+    failures: tuple[str, ...]
+
+
+def _read_darwin_placement_scan(*, with_terminal: bool) -> _DarwinPlacementScan:
+    processes = _darwin_processes(with_terminal=True) if with_terminal else _darwin_processes()
+    by_pid = {process.pid: process for process in processes}
+    failures: list[str] = []
+    sessions = _darwin_process_sessions(by_pid, _darwin_bound_sockets(), failures=failures)
+    return _DarwinPlacementScan(by_pid, sessions, tuple(failures))
+
+
 def _darwin_herdr_processes(*, inherited_marks_only: bool = False) -> list[HerdrProcess]:
     try:
-        by_pid = {process.pid: process for process in _darwin_processes(with_terminal=True)}
-        listeners = _darwin_bound_sockets()
+        snapshot = _active_placement_snapshot()
+        scan = snapshot.darwin() if snapshot is not None else _read_darwin_placement_scan(with_terminal=True)
     except (HerdrFailure, subprocess.TimeoutExpired):
         return []
-    sessions = _darwin_process_sessions(by_pid, listeners)
+    by_pid, sessions = scan.processes, scan.sessions
     ancestry = ProcessAncestry({pid: process.parent for pid, process in by_pid.items()},
                               {pid: process.terminal for pid, process in by_pid.items()
                                if process.terminal is not None})
@@ -6545,6 +6583,72 @@ class UnitTabClassifier:
         return self.units.get(owner.identity, OtherTab())
 
 
+@dataclass(frozen=True)
+class _LinuxPlacementScan:
+    candidates: list[Path]
+    servers: dict[int, str]
+    sessions: dict[int, str]
+    ancestry: _LinuxProcessScan
+    failures: tuple[str, ...]
+
+
+def _read_linux_placement_scan() -> _LinuxPlacementScan:
+    candidates = [path for path in proc_root().iterdir() if path.name.isdecimal()]
+    scan = _LinuxProcessScan()
+    failures: list[str] = []
+    servers = _live_server_processes(candidates, failures=failures)
+    sessions = _process_sessions(candidates, servers, scan=scan, failures=failures)
+    return _LinuxPlacementScan(candidates, servers, sessions, scan, tuple(failures))
+
+
+def _retain_placement_scan[Scan](read: Callable[[], Scan]) -> Callable[[], Scan]:
+    @cache
+    def observed() -> Scan | Exception:
+        try:
+            return read()
+        except (OSError, HerdrFailure, ValueError, subprocess.SubprocessError) as error:
+            return error
+
+    def result() -> Scan:
+        scan = observed()
+        if isinstance(scan, Exception):
+            raise scan.with_traceback(None)
+        return scan
+
+    return result
+
+
+class _PlacementProcessSnapshot:
+    def __init__(self) -> None:
+        self.active: bool = True
+        self.linux: Callable[[], _LinuxPlacementScan] = _retain_placement_scan(_read_linux_placement_scan)
+        self.darwin: Callable[[], _DarwinPlacementScan] = _retain_placement_scan(
+            lambda: _read_darwin_placement_scan(with_terminal=True))
+        self.clients: dict[str, ClientsAttached | NoClientAttached | ClientsUnreadable] = {}
+
+
+_placement_process_snapshot: ContextVar[_PlacementProcessSnapshot | None] = ContextVar(
+    "herdr_placement_process_snapshot", default=None)
+
+
+def _active_placement_snapshot() -> _PlacementProcessSnapshot | None:
+    snapshot = _placement_process_snapshot.get()
+    return snapshot if snapshot is not None and snapshot.active and not _process_action.get() else None
+
+
+@contextmanager
+def placement_snapshot() -> Generator[None]:
+    """Share report placement and client reads until the inventory ends."""
+    snapshot = _PlacementProcessSnapshot()
+    token = _placement_process_snapshot.set(snapshot)
+    try:
+        with observation_snapshot(), pane_snapshot():
+            yield
+    finally:
+        snapshot.active = False
+        _placement_process_snapshot.reset(token)
+
+
 @observation_snapshot()
 @pane_snapshot()
 def _scan_herdr_processes(*, inherited_marks_only: bool = False) -> list[HerdrProcess]:
@@ -6552,11 +6656,11 @@ def _scan_herdr_processes(*, inherited_marks_only: bool = False) -> list[HerdrPr
         return _darwin_herdr_processes(inherited_marks_only=True) if inherited_marks_only else _darwin_herdr_processes()
     processes: list[HerdrProcess] = []
     try:
-        candidates = [path for path in proc_root().iterdir() if path.name.isdecimal()]
+        snapshot = _active_placement_snapshot()
+        placement = snapshot.linux() if snapshot is not None else _read_linux_placement_scan()
     except OSError:
         return processes
-    scan = _LinuxProcessScan()
-    sessions = _process_sessions(candidates, _live_server_processes(candidates), scan=scan)
+    scan, sessions = placement.ancestry, placement.sessions
     ancestry = ProcessAncestry(scan.parents, scan.terminals)
     for pid, session in sessions.items():
         process = proc_root() / str(pid)

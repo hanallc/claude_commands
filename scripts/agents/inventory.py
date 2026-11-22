@@ -859,6 +859,7 @@ def all_live_accounts() -> list[Inventory]:
         return list(pool.map(read_account, logins))
 
 
+@herdr.placement_snapshot()
 def inventory(
     login: str,
     only: frozenset[str] = frozenset(),  # pyright: ignore[reportCallInDefaultInitializer]
