@@ -198,6 +198,10 @@ class StaffRefused(Exception):
     """A requested change would break the staff rules."""
 
 
+class UpkeepRowBusy(StaffRefused):
+    """Herdr upkeep did not release the row within the wait time."""
+
+
 class StaffNotFound(LookupError):
     """A requested member does not exist."""
 
@@ -946,20 +950,78 @@ def _clear_slot_holder(lock: IO[bytes]) -> None:
         os.ftruncate(lock.fileno(), 0)
 
 
-def _slot_holder_suffix(lock: IO[bytes]) -> str:
+def _slot_holder(lock: IO[bytes]) -> tuple[int, str] | None:
     try:
         _ = lock.seek(0)
         line = lock.read(4096).partition(b"\n")[0]
         holder = cast(object, json.loads(line))
     except (OSError, ValueError):
-        return ""
+        return None
     if not isinstance(holder, dict):
-        return ""
+        return None
     record = cast(dict[str, object], holder)
     pid, command = record.get("pid"), record.get("command")
     if type(pid) is not int or pid <= 0 or not isinstance(command, str) or not command:
-        return ""
-    return f" (pid {pid}: {command})"
+        return None
+    return pid, command
+
+
+_UPKEEP_LOCK_WAIT: ContextVar[float | None] = ContextVar("_UPKEEP_LOCK_WAIT", default=None)
+
+
+@contextmanager
+def upkeep_lock_wait(seconds: float) -> Generator[None]:
+    token = _UPKEEP_LOCK_WAIT.set(seconds)
+    try:
+        yield
+    finally:
+        _UPKEEP_LOCK_WAIT.reset(token)
+
+
+def _upkeep_pid(holder: tuple[int, str]) -> int | None:
+    with suppress(ValueError):
+        arguments = shlex.split(holder[1])
+        if "--work" in arguments and any(Path(arg).name == "herdr_upkeep.py" for arg in arguments):
+            return holder[0]
+    return None
+
+
+def _acquire_slot(lock: IO[bytes], name: str) -> None:
+    seconds = _UPKEEP_LOCK_WAIT.get()
+    deadline = time.monotonic() + seconds if seconds is not None else 0.0
+    upkeep_pid: int | None = None
+    while True:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return
+        except BlockingIOError as error:
+            holder = _slot_holder(lock)
+            if seconds is not None:
+                if holder is not None:
+                    upkeep_pid = _upkeep_pid(holder)
+                if upkeep_pid is not None:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise UpkeepRowBusy(f"Herdr upkeep still holds {name} (pid {upkeep_pid})") from error
+                    time.sleep(min(0.05, remaining))
+                    continue
+            suffix = f" (pid {holder[0]}: {holder[1]})" if holder else ""
+            raise StaffRefused(f"{name}: another operation holds this row{suffix}") from error
+
+
+def wait_for_upkeep_row(row: StaffRow, deadline: float) -> None:
+    """Wait for upkeep to release this row before reading liveness."""
+    path, _variable = _row_lock(row.id)
+    try:
+        with path.open("rb", buffering=0) as lock, upkeep_lock_wait(max(0, deadline - time.monotonic())):
+            try:
+                _acquire_slot(lock, row.name)
+            except UpkeepRowBusy:
+                raise
+            except StaffRefused:
+                pass
+    except FileNotFoundError:
+        pass
 
 
 @contextmanager
@@ -971,10 +1033,7 @@ def slot_operation(key: str, name: str) -> Generator[None]:
         return
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a+b", buffering=0) as lock:
-        try:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError as error:
-            raise StaffRefused(f"{name}: another operation holds this row{_slot_holder_suffix(lock)}") from error
+        _acquire_slot(lock, name)
         previous = os.environ.get(variable)
         _write_slot_holder(lock)
         try:
