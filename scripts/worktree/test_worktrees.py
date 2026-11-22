@@ -137,6 +137,8 @@ class WorktreeLifecycleTests(unittest.TestCase):
             "GIT_AUTHOR_NAME": "Worktree fixture", "GIT_AUTHOR_EMAIL": "fixture@example.invalid",
             "GIT_COMMITTER_NAME": "Worktree fixture", "GIT_COMMITTER_EMAIL": "fixture@example.invalid",
         }
+        for key in ("CARGO_TARGET_DIR", "CARGO_BUILD_TARGET_DIR"):
+            _ = self.environment.pop(key, None)
         _ = self.git(self.root, "init", "--bare", "--initial-branch=main", str(self.origin))
         _ = self.git(self.root, "clone", str(self.origin), str(self.repository))
         _ = (self.repository / "code.txt").write_text("base\n")
