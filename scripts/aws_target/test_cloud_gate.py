@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Generator, Iterable, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor, wait
-from contextlib import closing, contextmanager, nullcontext, redirect_stderr, redirect_stdout, suppress
+from contextlib import contextmanager, nullcontext, redirect_stderr, redirect_stdout, suppress
 from dataclasses import asdict, dataclass, replace
 from decimal import Decimal
 from functools import cached_property
@@ -42,7 +42,7 @@ from scripts.build_queue import admission_client, admission_protocol as wire, cl
 from scripts.build_queue.admission_jobs import GateJobNotRecorded, StepJob
 from scripts.build_queue.admission_wire import CloudGroup, Owner, ReservedCloudSlot
 from scripts.build_queue.admission_test_support import AdmissionFixture, caller_admission
-from scripts.buildlog import index, store
+from scripts.buildlog import store
 from scripts.build_targets import target_config
 from scripts.production import affected_modules
 from scripts.production import gate
@@ -58,6 +58,7 @@ from scripts.build_hold.owning_session import OwningSession, owning_session
 from scripts.build_queue import admission_records, queue_evidence
 from scripts.lib.build_steps import read_step_names
 from scripts.message.unit_labels import OwnerRole, UnitLabels
+from scripts.test_times import gate_record, recent_gate_times
 
 
 def service_environment(command: Sequence[str]) -> dict[str, str]:
@@ -367,13 +368,12 @@ class CloudGateTests(CloudGateHangGuard, CostFixture):
                 'subnets': [{'id': 'fixture-a', 'zone': 'a'}, {'id': 'fixture-b', 'zone': 'b'}]}]}
         self.fake.result = self.result()
 
+    def record_passing_wall(self, seconds: float) -> None:
+        recorded = ledger.mapping(self.result()['record'])
+        recent_gate_times.update_recent_times({**recorded, 'vcpus': 32, 'max_jobs': 32, 'wall_s': seconds})
+
     def test_time_limit_returns_red_with_traceback_and_ends_the_box(self) -> None:
-        import sqlite3
-        _ = index.update()
-        with closing(sqlite3.connect(index.index_path())) as connection, connection:
-            connection.execute("""INSERT INTO gate_runs
-                (id, started_at, step, vcpus, max_jobs, status, aborted, selection, wall_s, modules_run)
-                VALUES ('normal', '2026-01-01', 'gate', 32, 32, 0, 0, 'full', 7, 1)""").close()
+        self.record_passing_wall(7)
         modules = ['scripts/fixture/test_ok.py', 'scripts/fixture/nested/test_busy.py']
         log = ('Runner: 2 modules, whole machine, 32 CPUs\n'
                'Starting module: fixture/test_ok.py\n'
@@ -467,12 +467,7 @@ class CloudGateTests(CloudGateHangGuard, CostFixture):
                 self.assertEqual(ledger.mapping(row['record'])['vcpus'], 32)
 
     def test_finished_result_wins_when_polling_crosses_the_time_limit(self) -> None:
-        import sqlite3
-        _ = index.update()
-        with closing(sqlite3.connect(index.index_path())) as connection, connection:
-            connection.execute("""INSERT INTO gate_runs
-                (id, started_at, step, vcpus, max_jobs, status, aborted, selection, wall_s, modules_run)
-                VALUES ('normal', '2026-01-01', 'gate', 32, 32, 0, 0, 'full', 1, 1)""").close()
+        self.record_passing_wall(1)
         for arrival in ('before-poll', 'at-stop', 'at-stop-log-timeout', 'ec2-timeout', 'at-deadline',
                         'ec2-outage-limit', 'boot-and-result'):
             with self.subTest(arrival=arrival):
@@ -2130,6 +2125,10 @@ with (mock.patch.object(cloud_gate, 'AwsCli', return_value=api),
                       mock.patch.object(store, 'host_file', return_value=destination) as host_file):
                     cloud_gate.import_record(self.folder, result)
                     cloud_gate.import_record(self.folder, result)
+                    vcpus = os.cpu_count() or 1
+                    self.assertEqual(gate.read_time_limit(vcpus, (), vcpus, False), gate_record.GateTimeLimit(6))
+                    self.assertEqual(gate.read_time_limit(vcpus, ('fixture/test_ok.py',), vcpus, True),
+                                     gate_record.GateTimeLimit(2))
                 self.assertEqual(host_file.call_args.args[0], 'aws')
                 # The result leaves the gate copy for the store, beside the gate run record.
                 self.assertFalse((self.folder / cloud_gate.RESULT_FILE).exists())
