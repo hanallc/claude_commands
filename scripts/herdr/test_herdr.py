@@ -28,7 +28,7 @@ from scripts.lint.memory_test_support import config_environment, write_config_fi
 from scripts.lib.script_envelope import script_prompt
 from scripts.herdr import herdr_types
 from types import SimpleNamespace
-from typing import BinaryIO, Literal, NamedTuple, cast, final, override
+from typing import BinaryIO, Literal, NamedTuple, TextIO, cast, final, override
 from unittest.mock import Mock, call, patch
 
 
@@ -1248,12 +1248,13 @@ class PromptSubmissionTests(unittest.TestCase):
         failures: list[float] = []
 
         @contextmanager
-        def open_transcript(path: Path, mode: str) -> Generator[BinaryIO]:
+        def open_transcript(path: Path, mode: str = "r", buffering: int = -1, encoding: str | None = None,
+                            errors: str | None = None, newline: str | None = None) -> Generator[BinaryIO | TextIO]:
             if path == self.path and mode == "rb" and from_second <= self.elapsed < until_second:
                 failures.append(self.elapsed)
                 raise PermissionError("scratch transcript temporarily unreadable")
-            with original_open(path, mode) as stream:
-                yield cast(BinaryIO, stream)
+            with original_open(path, mode, buffering, encoding, errors, newline) as stream:
+                yield cast(BinaryIO | TextIO, stream)
 
         with patch.object(Path, "open", open_transcript):
             yield failures
@@ -2481,12 +2482,13 @@ class PromptSubmissionTests(unittest.TestCase):
             return self.read_screen(*arguments)
 
         @contextmanager
-        def open_transcript(path: Path, mode: str) -> Generator[BinaryIO]:
+        def open_transcript(path: Path, mode: str = "r", buffering: int = -1, encoding: str | None = None,
+                            errors: str | None = None, newline: str | None = None) -> Generator[BinaryIO | TextIO]:
             if path == self.path and mode == "rb" and blocked:
                 failures.append(self.elapsed)
                 raise PermissionError("scratch final transcript check unreadable")
-            with original_open(path, mode) as stream:
-                yield cast(BinaryIO, stream)
+            with original_open(path, mode, buffering, encoding, errors, newline) as stream:
+                yield cast(BinaryIO | TextIO, stream)
 
         with (patch.object(self.client, "run", side_effect=show_draft),
               patch.object(Path, "open", open_transcript)):
@@ -4106,6 +4108,53 @@ class HerdrTests(unittest.TestCase):
         self.assertEqual([entry.args for entry in checks.call_args_list], [(session,)] * 3)
         self.assertTrue(all(entry.kwargs["action"] == "keys" for entry in checks.call_args_list))
 
+    def test_answer_question_records_the_text_before_typing(self) -> None:
+        from scripts.lib import script_prompts
+
+        client = self.herdr
+        pane, session, text = "w1:p1", "fixture-question", "Use JSON."
+        record = script_prompts.record
+        with self.question_box(client, pane, session) as commands:
+            def record_before_send(pane: str, text: str) -> None:
+                self.assertNotIn(("pane", "send-text", pane, text), commands)
+                record(pane, text)
+
+            with patch.object(script_prompts, "record", side_effect=record_before_send) as evidence:
+                client.answer_question(pane, text, target=session)
+            evidence.assert_called_once_with(pane, text)
+        self.assertIn(("pane", "send-text", pane, text), commands)
+        self.assertTrue(script_prompts.typed_by_script(pane, text))
+
+    def test_send_keys_records_printable_text_before_transport(self) -> None:
+        from scripts.lib import script_prompts
+
+        client = self.herdr
+        pane, session = "w1:p1", "fixture-keys"
+        keys = ("y", "e", "s", "enter", "shift+g", "o", "space", "n", "o", "w", "period", "return")
+
+        def send(*arguments: str) -> str:
+            self.assertEqual(arguments, ("pane", "send-keys", pane, *keys))
+            self.assertTrue(script_prompts.keys_since(pane, before_send))
+            self.assertTrue(script_prompts.typed_by_script(pane, "yes"))
+            self.assertTrue(script_prompts.typed_by_script(pane, "Go now."))
+            return ""
+
+        before_send = datetime.now(timezone.utc) - timedelta(seconds=1)
+        with (self.prompt_target(client, pane, session), patch.object(client, "run", side_effect=send) as transport):
+            client.send_keys(pane, *keys, target=session)
+        transport.assert_called_once()
+
+    def test_send_keys_leaves_no_mark_for_control_keys(self) -> None:
+        from scripts.lib import script_prompts
+
+        client = self.herdr
+        pane, session = "w1:p1", "fixture-keys"
+        before_send = datetime.now(timezone.utc) - timedelta(seconds=1)
+        with (self.prompt_target(client, pane, session), patch.object(client, "run", return_value="") as transport):
+            client.send_keys(pane, "ctrl-c", "BackSpace", "Enter", target=session)
+        transport.assert_called_once_with("pane", "send-keys", pane, "ctrl-c", "BackSpace", "Enter")
+        self.assertFalse(script_prompts.keys_since(pane, before_send))
+
     def test_answer_question_sends_all_keys_with_the_real_codex_box_composer(self) -> None:
         client = self.herdr
         pane, session, text = "w1:p1", "fixture-question", "Use JSON."
@@ -4213,11 +4262,27 @@ class HerdrTests(unittest.TestCase):
                     client.prompt("w1:p1", "Continue", target="fixture-submission")
                 text = cast(str, submit.call_args.args[-1])
                 self.assertTrue(text.startswith('<system-reminder source="script">'))
-                self.assertFalse(script_prompts.root().exists())
+                self.assertFalse(script_prompts.typed_by_script("w1:p1", text))
                 with patch.object(script_prompts, "typed_here", side_effect=AssertionError("store read")):
                     source = conversation_pause.prompt_source(text, lambda: frozenset(), lambda: (),
                                                               typed_by_script=script_prompts.typed_here)
                 self.assertIs(source, conversation_pause.PromptSource.SCHEDULED)
+
+    def test_enveloped_prompt_keeps_plain_text_evidence_at_the_record_limit(self) -> None:
+        from scripts.lib import script_prompts
+
+        client = self.herdr
+        pane, session = "w1:p1", "fixture-submission"
+        configuration = Path(os.environ["CONF_DIR"])
+        _ = write_config_fixture(configuration / "script_prompts.conf", "# whole: 1..\nmax_records=1\n")
+        script_prompts.record(pane, "yes")
+        with (self.prompt_target(client, pane, session),
+              patch.object(client, "run", return_value="") as transport):
+            client.prompt(pane, "Continue", target=session)
+        text = script_prompt("Continue")
+        transport.assert_called_once_with("agent", "prompt", pane, text)
+        self.assertFalse(script_prompts.typed_by_script(pane, text))
+        self.assertTrue(script_prompts.typed_by_script(pane, "yes"))
 
     def test_timed_out_slash_command_keeps_its_source_record(self) -> None:
         from scripts.lib import script_prompts

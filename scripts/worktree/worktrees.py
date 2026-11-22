@@ -24,7 +24,7 @@ import shutil
 import stat
 import subprocess
 import tempfile
-from contextlib import AbstractContextManager, ExitStack, contextmanager, redirect_stdout
+from contextlib import AbstractContextManager, ExitStack, contextmanager, redirect_stdout, suppress
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 from enum import Enum
@@ -1318,6 +1318,26 @@ def _existing_move(path: Path) -> MoveJournal | None:
         return read_move(move_file(path))
     except FileNotFoundError:
         return None
+
+
+def moved_launch_folder(folder: Path) -> Path:
+    """Use the verified destination for a saved folder inside a moved checkout."""
+    if not folder.is_absolute() or ".." in folder.parts:
+        return folder
+    for former in (folder, *folder.parents):
+        try:
+            journal = _existing_move(former)
+            if journal is None:
+                continue
+            current = journal.move.new
+            if (journal.stage in {MoveStage.LINKED, MoveStage.FINISHED}
+                    and current.is_absolute() and journal.destination.matches(current)
+                    and (not os.path.lexists(former) or (former.is_symlink() and former.resolve() == current.resolve()))):
+                return current / folder.relative_to(former)
+        except (KeyError, OSError, RuntimeError, TypeError, ValueError):
+            return folder
+        break
+    return folder
 
 
 def _unfinished_move_at(path: Path) -> bool:
@@ -2617,15 +2637,95 @@ def _migration_processes(paths: tuple[Path, ...], *, ignored_fds: frozenset[int]
     return replace(uses, paths=sorted(paths_in_use))
 
 
-def _migration_process_use(path: Path, uses: tmp_sweep.ProcessUsesKnown | tmp_sweep.ProcessUsesUnavailable) -> str:
+def _stopped_pane_shell(proc: Path, pid: int, checkout: Path, scanned: tmp_sweep.CwdOnlyProcess) -> bool:
+    """Check the stopped pane and confirm that its shell can stay in the checkout."""
+    from scripts.herdr import herdr, herdr_types, pane_launch
+    from scripts.lint import tmp_sweep
+    from scripts.production import staff
+
+    process = proc / str(pid)
+    try:
+        observed = tmp_sweep.linux_process_stat(process)
+        if observed.state in {"Z", "X"} or observed.start_ticks != scanned.start_ticks:
+            return False
+        parent = observed.parent
+        command = (proc / str(parent) / "cmdline").read_bytes().removesuffix(b"\0").split(b"\0")
+        match [os.fsdecode(argument) for argument in command]:
+            case [executable, "--session", server, "server"] if (
+                Path(executable).name == "herdr" and re.fullmatch(r"[A-Za-z0-9_.-]+", server)
+                and server not in {".", ".."}
+            ):
+                pass
+            case _:
+                return False
+        marks = (process / "environ").read_bytes().split(b"\0")
+        panes = [part.removeprefix(b"HERDR_PANE_ID=") for part in marks if part.startswith(b"HERDR_PANE_ID=")]
+        if len(panes) != 1 or not panes[0]:
+            return False
+        pane = os.fsdecode(panes[0])
+        directory = pane_launch.record_directory()
+        # Read the atomic record without a publication lock that can write during a dry run.
+        if os.path.lexists(directory / ".producer-publication"):
+            return False
+        entries = cast(object, json.loads((directory / f"{server}.json").read_text()))
+        saved = cast(dict[str, object], entries).get(pane) if isinstance(entries, dict) else None
+        if not isinstance(saved, dict):
+            return False
+        entry = cast(dict[str, object], saved)
+        if entry.get("ended") is not True or entry.get("pane_id") != pane:
+            return False
+        owner = staff_record().by_member_reference(pane_launch.reference_id(entry))
+        if owner is None or not isinstance(herdr.read_conversation(owner.current_session), herdr.StoppedConversation):
+            return False
+        info = herdr.Herdr(server).result("pane", "process-info", "--pane", pane).get("process_info")
+        if not isinstance(info, dict):
+            return False
+        shell_pid = cast(dict[str, object], info).get("shell_pid")
+        if type(shell_pid) is not int or shell_pid != pid:
+            return False
+        folders = _linux_checkout_spellings((checkout,))[checkout]
+        for candidate in proc.iterdir():
+            if not candidate.name.isdecimal():
+                continue
+            try:
+                state = (candidate / "stat").read_text().rpartition(")")[2].split(maxsplit=2)
+            except FileNotFoundError:
+                if candidate.exists():
+                    return False
+                continue
+            if int(state[1]) == pid:
+                return False
+        if not tmp_sweep.process_clear_beyond_cwd(process, pid, folders):
+            return False
+        if ((process / "comm").read_text().rstrip("\n") not in {"zsh", "bash", "sh"}
+                or os.readlink(process / "exe") != scanned.executable):
+            return False
+        current = tmp_sweep.linux_process_stat(process)
+        return (current.state not in {"Z", "X"} and current.parent == parent
+                and current.start_ticks == scanned.start_ticks)
+    except (OSError, ValueError, IndexError, KeyError, staff.StaffRefused, herdr_types.HerdrFailure,
+            subprocess.SubprocessError):
+        return False
+
+
+def _migration_process_use(path: Path, uses: tmp_sweep.ProcessUsesKnown | tmp_sweep.ProcessUsesUnavailable, *,
+                           ignore_stopped_pane_shells: bool) -> str:
     from scripts.lint import tmp_sweep
 
     if isinstance(uses, tmp_sweep.ProcessUsesUnavailable):
         return "process paths unavailable"
     if uses.unreadable_process_pids:
         return f"unreadable process {min(uses.unreadable_process_pids)}"
-    root = str(path)
-    pids = {pid for name, pid, _ in uses.paths if name == root}
+    by_pid: dict[int, set[str]] = {}
+    for name, pid, how in uses.paths:
+        if name == str(path):
+            by_pid.setdefault(pid, set()).add(how)
+    unchecked = set(uses.unreadable_cwd_pids) | {process.pid for process in uses.kernel_hidden}
+    pids = [pid for pid, modes in by_pid.items()
+            if (not ignore_stopped_pane_shells or sys.platform != "linux"
+                or pid in unchecked or modes != {tmp_sweep.WORKS_IN}
+                or pid not in uses.cwd_only_processes
+                or not _stopped_pane_shell(Path(tmp_sweep.PROC_DIR), pid, path, uses.cwd_only_processes[pid]))]
     if pids:
         return "pids " + ", ".join(map(str, sorted(pids)))
     return ""
@@ -2764,6 +2864,7 @@ class MigrationPublication:
 @contextmanager
 def _hold_worktree_relocation(
     path: Path, journal: MoveJournal, locations: MigrationLocations, folders: MigrationFolders, *,
+    ignore_stopped_pane_shells: bool = False,
     record_process_scan: Callable[[tmp_sweep.ProcessUsesKnown | tmp_sweep.ProcessUsesUnavailable], None] = lambda _: None,
 ) -> Generator[Callable[[], None]]:
     _check_planned_clone_members(journal)
@@ -2789,7 +2890,7 @@ def _hold_worktree_relocation(
             uses = _migration_processes(paths, ignored_fds=frozenset(fds))
             record_process_scan(uses)
             for member, source in current.items():
-                if reason := _migration_process_use(source, uses):
+                if reason := _migration_process_use(source, uses, ignore_stopped_pane_shells=ignore_stopped_pane_shells):
                     if member != path and not reason.startswith("unreadable process "):
                         reason = f"linked worktree {member}: {reason}"
                     raise MigrationInUse(reason)
@@ -2966,6 +3067,8 @@ def migrate_worktrees(list_file: Path | None, *, dry_run: bool, scope: Migration
 
 def _apply_migration(selection: MigrationSelection, snapshot: staff.StaffSnapshot,
                      folders: MigrationFolders, *, dry_run: bool) -> int:
+    from scripts.lint import tmp_sweep
+
     publication = MigrationPublication.read(snapshot, folders)
     journals = _migration_journals(selection, folders, dry_run=dry_run)
     active_journals: dict[Path, MoveJournal] = {}
@@ -2982,11 +3085,13 @@ def _apply_migration(selection: MigrationSelection, snapshot: staff.StaffSnapsho
 
     def protect(path: Path, journal: MoveJournal) -> AbstractContextManager[Callable[[], None]]:
         return _hold_worktree_relocation(path, journal, locations, folders,
+                                         ignore_stopped_pane_shells=not journal.copy_tag,
                                          record_process_scan=progress.record_process_scan)
 
     plan = plan_worktree_migration(selection, snapshot, folders, journals, locations)
     progress.kept.update(plan.skipped)
     sources = {move.move.new: move.move.old for move in plan.moves}
+    destinations = {source: destination for destination, source in sources.items()}
     groups = {clone: (clone, *(sources.get(member, member) for member in members))
               for clone, members in plan.clone_members.items()}
     paths: dict[Path, Path] = {}
@@ -3004,13 +3109,21 @@ def _apply_migration(selection: MigrationSelection, snapshot: staff.StaffSnapsho
     leases = _migration_leases(folders, tuple(chain.from_iterable(lock_paths.values())))
     uses = _migration_processes(tuple(paths.values()))
     progress.record_process_scan(uses)
+    idle_shell_candidates: set[str] = set()
+    if isinstance(uses, tmp_sweep.ProcessUsesKnown):
+        idle_shell_candidates = {name for name, pid, _ in uses.paths if pid in uses.cwd_only_processes}
     for source, path in paths.items():
         reason = ""
         for lock_path in lock_paths[source]:
             reason = _probe_migration_locks(lock_path, folders) or _migration_lease_use(lock_path, leases)
             if reason:
                 break
-        reason = reason or _migration_process_use(path, uses)
+        if not reason:
+            rename = False
+            if str(path) in idle_shell_candidates and source in destinations:
+                with suppress(OSError, ValueError, StopIteration):
+                    rename = not _worktree_copy_required(path, destinations[source])
+            reason = _migration_process_use(path, uses, ignore_stopped_pane_shells=rename)
         if reason:
             busy_paths[source] = reason
     for planned in plan.moves:
