@@ -2,7 +2,8 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from contextlib import nullcontext
+from contextlib import nullcontext, redirect_stdout
+import io
 from dataclasses import replace
 import os
 from pathlib import Path
@@ -145,14 +146,15 @@ class CheckpointGatePlacementTests(unittest.TestCase):
             return subprocess.CompletedProcess(command, 0, "", "")
 
         invoked = mock.Mock(side_effect=run)
-        with mock.patch.object(checkpoint_gate, "report", wraps=checkpoint_gate.report) as report:
+        with (mock.patch.object(checkpoint_gate, "report", wraps=checkpoint_gate.report) as report,
+              redirect_stdout(io.StringIO()) as output):
             detail = fixture.run_step(invoked)
         self.assertEqual(detail, fixture.step.label)
         self.assertEqual(invoked.call_count, 2)
         fixture.report_failure.assert_called_once_with(fixture.refusal)
         fixture.place_again.assert_called_once_with(fixture.request)
-        self.assertIn("fixture-mac", str(report.call_args_list))
-        self.assertIn("mac-linux", str(report.call_args_list))
+        # gate-step prints the retry line into the gate output.
+        self.assertIn("placement: retry — fixture-mac (mac-linux) did not answer.", output.getvalue())
         self.assertIn("0 red", str(report.call_args_list))
 
     def test_silent_guest_output_does_not_select_a_flaky_test(self) -> None:
