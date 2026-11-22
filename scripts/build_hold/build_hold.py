@@ -1868,17 +1868,25 @@ def stopped_runs_text(name: str, runs: Sequence[StoppedRun]) -> str:
     return f" Restart the stopped runs for {name}: {listed}."
 
 
+def run_worker(entry: ReleaseEntry, run: StoppedRun, membership: staff.StaffSnapshot | None) -> staff.StaffRow | None:
+    """Return the staff member that owns a stopped run, or None when no row resolves."""
+    reference = run["staff_id"] or entry["session_id"].removeprefix("codex:")
+    return membership.by_member_reference(reference) if membership is not None else None
+
+
 def send_stopped_run_release(entry: ReleaseEntry, runs: Sequence[StoppedRun], notice: str,
                              membership: staff.StaffSnapshot | None) -> ReleaseNoticeResult:
     """Send one notice for runs that share the entry's session, staff member and director folder."""
     from scripts.production import staff, worker_admission
 
     run = runs[0]
-    worker = (membership.by_member_reference(run["staff_id"] or entry["session_id"].removeprefix("codex:"))
-              if membership is not None else None)
+    worker = run_worker(entry, run, membership)
     name = worker.name if worker is not None else entry["name"]
     notice += stopped_runs_text(name, runs)
-    if worker is None:
+    if worker is None and membership is not None and entry["session_id"].startswith("codex:"):
+        # A Codex thread without a staff row has no session; a send would only fail its lookup.
+        result: ReleaseNoticeResult = RecipientGone()
+    elif worker is None:
         result = send_session_release(entry, notice)
     elif worker.kind == "worker" and (
         entry["session_id"].startswith("codex:")
@@ -1960,7 +1968,7 @@ def send_cycle_notices(cycle: HoldCycle, entries: Sequence[ReleaseEntry]) -> str
     else:
         without_staff = {entry["session_id"] for entry in entries
                          if membership.by_member_reference(entry["session_id"].removeprefix("codex:")) is None}
-    for batch in notice_batches(entries):
+    for batch in notice_batches(entries, membership):
         if has_holder_file(holder_directory()):
             break
         for entry in batch:
@@ -1983,16 +1991,27 @@ def send_cycle_notices(cycle: HoldCycle, entries: Sequence[ReleaseEntry]) -> str
     return not_reached_detail(cycle)
 
 
-def notice_batches(entries: Sequence[ReleaseEntry]) -> list[list[ReleaseEntry]]:
-    """Put the stopped runs of one recipient in one batch; each other entry is its own batch."""
+def notice_batches(entries: Sequence[ReleaseEntry],
+                   membership: staff.StaffSnapshot | None) -> list[list[ReleaseEntry]]:
+    """Put the stopped runs of one recipient in one batch; each other entry is its own batch.
+
+    A staff member is one recipient for all its sessions. Codex threads without a staff row
+    share their director folder's batch, so the director gets one notice.
+    """
     batches: list[list[ReleaseEntry]] = []
-    runs: dict[tuple[str, str, str], list[ReleaseEntry]] = {}
+    runs: dict[str, list[ReleaseEntry]] = {}
     for entry in entries:
         run = entry.get("run")
         if run is None:
             batches.append([entry])
             continue
-        key = (entry["session_id"], run["staff_id"], run["director_dir"])
+        worker = run_worker(entry, run, membership)
+        if worker is not None:
+            key = f"staff:{worker.id}"
+        elif membership is not None and entry["session_id"].startswith("codex:"):
+            key = f"director:{run['director_dir']}"
+        else:
+            key = f"session:{entry['session_id']}"
         if key not in runs:
             runs[key] = []
             batches.append(runs[key])

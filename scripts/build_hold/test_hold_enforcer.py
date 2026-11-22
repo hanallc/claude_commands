@@ -1037,13 +1037,14 @@ class HoldEnforcerTests(unittest.TestCase):
             self.assertEqual(build_hold.release_cycle(self.holders, holder.key), "released, builds may resume.")
             self.assertEqual(build_hold.release_cycle(self.holders, holder.key), "hold is already released.")
 
-        expected = (f"codex:{live.current_session}", f"codex:{ended.current_session}", str(director.id),
-                    f"codex:{ended.current_session}")
+        expected = (f"codex:{live.current_session}", f"codex:{ended.current_session}", str(director.id))
         self.assertEqual([to for to, _ in sent], list(expected))
-        self.assertEqual(attempts, [*expected[:2], f"codex:{closed.current_session}", *expected[2:]])
-        for index, ((_, notice), (worker, _, _, _)) in enumerate(zip(sent, cases, strict=False)):
-            self.assertIn(f"Restart the stopped run python3 unittest for {worker.name}.", notice)
-            self.assertIn(f"Run ID run-{index}.", notice)
+        self.assertEqual(attempts, [*expected[:2], f"codex:{closed.current_session}", expected[2]])
+        texts = ("Restart the stopped run python3 unittest for live. Run ID run-0.",
+                 "Restart the stopped runs for ended: python3 unittest (Run ID run-1); python3 unittest (Run ID run-3).",
+                 "Restart the stopped run python3 unittest for closed. Run ID run-2.")
+        for (_, notice), text in zip(sent, texts, strict=True):
+            self.assertIn(text, notice)
         cycle = build_hold.read_cycle()
         assert not isinstance(cycle, build_hold.NoCycle)
         self.assertEqual([entry["delivery"] for entry in build_hold.stopped_run_entries(cycle["entries"]).values()],
@@ -1061,6 +1062,35 @@ class HoldEnforcerTests(unittest.TestCase):
             result = build_hold.send_stopped_run_release(entry, (run,), "released", staff.initial_snapshot())
         self.assertEqual(result, failure)
         send.assert_called_once_with(entry, address, "released Restart the stopped run checks for worker. Run ID checks.")
+
+    def test_release_sends_nothing_to_a_codex_thread_without_a_staff_row(self) -> None:
+        self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
+        director = fixture_member("showrunner", name="director")
+        membership = staff.initial_snapshot()
+        entries: list[build_hold.ReleaseEntry] = []
+        for index, folder in enumerate(("/runs/a", "/runs/a", "")):
+            entry = build_hold.new_entry(f"codex:gone-{index}", f"codex:gone-{index}")
+            entry["run"] = {"id": f"process:{index}", "label": "cargo test", "staff_id": "", "director_dir": folder}
+            entries.append(entry)
+        batches = build_hold.notice_batches(entries, membership)
+        self.assertEqual([[entry["session_id"] for entry in batch] for batch in batches],
+                         [["codex:gone-0", "codex:gone-1"], ["codex:gone-2"]])
+        first, second = batches
+        runs = [run for entry in first if (run := entry.get("run")) is not None]
+        with (mock.patch.object(build_hold, "send_release_to", return_value=build_hold.ReleaseDelivered()) as send,
+              mock.patch("scripts.production.worker_admission.parent", return_value=director)):
+            self.assertEqual(build_hold.send_stopped_run_release(first[0], runs, "released", membership),
+                             build_hold.ReleaseDelivered())
+        call, = send.call_args_list
+        self.assertEqual(call.args[1], str(director.id))
+        listed = "cargo test (Run ID process:0); cargo test (Run ID process:1)"
+        self.assertIn(f"Restart the stopped runs for codex:gone-0: {listed}.", cast(str, call.args[2]))
+        orphan = second[0].get("run")
+        assert orphan is not None
+        with mock.patch.object(build_hold, "send_release_to") as send:
+            self.assertEqual(build_hold.send_stopped_run_release(second[0], (orphan,), "released", membership),
+                             build_hold.RecipientGone())
+        send.assert_not_called()
 
     def test_release_does_not_name_a_run_if_enforcer_exits_before_signaling(self) -> None:
         holder, = build_hold.natedev_holds(self.holders).in_force
