@@ -524,6 +524,8 @@ If a finished detached result is pending, restore tries its delivery before it s
 For a worker with no active pass, restore checks every held run folder for pending results without a pass ID.
 Restore recovers completion in the selected pass folder after replay from another folder.
 Before replay sends a result from another folder, it saves the run ID and source folder in the selected pass.
+Before a retry sends input, it syncs the pass folder if the proof is already present.
+Restore can save missing proof from a valid source record and a transcript receipt before it recovers completion.
 The receipt uses this proof to accept the earlier DONE after pruning removes the source record.
 This rule also applies when a completion action fails after the worker sends DONE.
 Without proof of another folder or pass, an unmatched result keeps the pass waiting for a new DONE.

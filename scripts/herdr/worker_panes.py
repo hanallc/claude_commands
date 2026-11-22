@@ -32,7 +32,7 @@ from typing import TYPE_CHECKING, Protocol, Literal, cast, final
 
 from scripts.herdr import herdr, pane_launch
 from scripts.herdr import herdr_types
-from scripts.lib import conf, models_registry, nix_env, unit_runs
+from scripts.lib import atomic_file, conf, models_registry, nix_env, unit_runs
 from scripts.whoami import quota_state
 from scripts.production import staff, worker_admission
 from scripts.agents import detached_run_process, pane_record, shutdown_record, worker_lifecycle
@@ -815,6 +815,8 @@ def record_replayed_result(row: staff.StaffRow, run: Path, instance: str, run_id
         if sources.get(run_id) != str(source):
             passed[REPLAYED_RESULT_SOURCES] = {**sources, run_id: str(source)}
             pass_recorder.write_state(run, state)
+        else:
+            atomic_file.sync_folder(run)
 
 
 def _pass_in(row: staff.StaffRow, fields: dict[str, object], record: staff.StaffSnapshot) -> dict[str, object]:

@@ -1602,6 +1602,35 @@ class RestoreReport:
     record_busy: set[StaffId] = field(default_factory=set)
 
 
+def _save_legacy_replay_sources(row: staff.StaffRow, run: Path, held_runs: Iterable[Path],
+                                record: staff.StaffSnapshot) -> None:
+    """Save proof for results the worker received before replay saved it."""
+    current = run.resolve()
+    sources = [source for source in held_runs if source != current]
+    if not sources:
+        return
+    passed = worker_panes.worker_pass(row, run, record=record)
+    instance = passed.get("instance_id")
+    if passed.get("status") not in ("completed", "error") or not isinstance(instance, str) or not instance:
+        return
+    delivery = pass_recorder.dispatch_delivery(passed)
+    if not delivery.line or not delivery.completion_id:
+        return
+    receipt = dispatch_receipt(row, delivery.line, delivery.completion_id, run=run, require_transcript=True)
+    if (not isinstance(receipt, DispatchWaitingForRuns) or not isinstance(reply := receipt.reply, DispatchAwaitingReply)
+            or not isinstance(reply.matching_done, DispatchComplete)):
+        return
+    unmatched = set(reply.runs).difference(receipt.undelivered_runs)
+    local = current / worker_lifecycle.DETACHED_RUNS_DIR
+    for source in sources:
+        for run_id in detached_runs.finished_unbound_worker_result_ids(source, row.id, sorted(unmatched)):
+            if not (local / f"{run_id}.json").exists():
+                worker_panes.record_replayed_result(row, run, instance, run_id, source, record=record)
+                unmatched.remove(run_id)
+        if not unmatched:
+            break
+
+
 @herdr.pane_evidence_run()
 def restore(parent: StaffId, *, record: staff.StaffSnapshot | None = None,
             only: frozenset[StaffId] | Literal["all"] = "all", account: str | accounts.AccountSelection = "",
@@ -1666,6 +1695,7 @@ def restore(parent: StaffId, *, record: staff.StaffSnapshot | None = None,
                     if isinstance(plan, DispatchEvidenceUnknown):
                         failed(state.row, plan.reason, notice=f"anomaly: {name}: {plan.reason}")
                         continue
+                    _save_legacy_replay_sources(state.row, run if plan is None else plan.run, held_runs, record)
                     if plan is None:
                         recovery = completion_notices.recover_completion(state.row, holder, run, hold, record=record)
                         if recovery is CompletionRecovery.RECOVERED:

@@ -701,6 +701,65 @@ class WorkerCommandTests(unittest.TestCase):
     def test_an_unreadable_result_beside_the_replayed_result_preserves_the_earlier_done(self) -> None:
         self.assert_restore_recovers_pass_after_replay("completed", source_after_replay="unreadable-neighbor")
 
+    def test_restore_saves_proof_for_a_result_already_in_the_transcript(self) -> None:
+        self.unfinished_turn()
+        pane, _ = self.agent.submitted[-1]
+        row = self.agent.row(pane)
+        delivery = pass_recorder.dispatch_delivery(worker_panes.worker_pass(row, self.run_dir))
+        progress_history.complete_dispatch(self.run_dir, "impl", delivery.completion_id)
+        previous = self.fixture.worker_run("previous", "unit", self.fixture.parent.current_session)
+        path, result = self.detached_record(row, "other-check", run=previous)
+        result.update(exit_code=0, pane_dispatch_id="", worker_received=True)
+        atomic_file.write_text_atomic(path, json.dumps(result))
+        self.agent.append(pane, "user", "Detached run: other-check\nResult: PASS (exit 0)")
+        self.assertIsInstance(self.receipt(), worker.DispatchWaitingForRuns)
+        runs = {str(self.fixture.parent.current_session): [str(self.run_dir), str(previous)]}
+        prompts = self.fixture.prompts()
+        report = worker.RestoreReport()
+        self.assertEqual(worker.restore(self.fixture.parent.id, runs=runs, report=report), worker.ExitCode.OK)
+
+        self.assertEqual(report.failures, {})
+        self.assertEqual(self.fixture.prompts(), prompts)
+        passed = worker_panes.worker_pass(row, self.run_dir)
+        self.assertEqual(passed[worker_panes.REPLAYED_RESULT_SOURCES], {"other-check": str(previous.resolve())})
+        self.assertEqual(detached_runs.prune_finished(path.parent), ["other-check"])
+        self.assertEqual(worker_panes.recorded_completion_close(row, self.run_dir, passed), worker_panes.CloseAllowed())
+
+    def test_replay_retries_the_pass_folder_sync_before_sending_input(self) -> None:
+        self.unfinished_turn()
+        pane, _ = self.agent.submitted[-1]
+        row = self.agent.row(pane)
+        delivery = pass_recorder.dispatch_delivery(worker_panes.worker_pass(row, self.run_dir))
+        progress_history.complete_dispatch(self.run_dir, "impl", delivery.completion_id)
+        previous = self.fixture.worker_run("previous", "unit", self.fixture.parent.current_session)
+        path, result = self.detached_record(row, "other-check", run=previous)
+        result.update(exit_code=0, pane_dispatch_id="")
+        atomic_file.write_text_atomic(path, json.dumps(result))
+        _ = write_config_fixture(self.fixture.root / "conf/postmaster.conf")
+        sync_folder = atomic_file.sync_folder
+        prompts = self.fixture.prompts()
+
+        def fail_pass_folder_sync(folder: Path) -> None:
+            if folder == self.run_dir:
+                raise OSError("the pass folder sync failed")
+            sync_folder(folder)
+
+        def replay() -> detached_runs.WorkerResultReplay:
+            return detached_runs.submit_finished_worker_result(previous, row,
+                worker_input=detached_runs.WorkerResultInput.TYPE,
+                pane_dispatch_id=detached_runs.UnboundWorkerResult.ONLY)
+
+        with self.fixture.record_codex_prompt(row, pane):
+            with patch.object(atomic_file, "sync_folder", side_effect=fail_pass_folder_sync):
+                self.assertIs(replay(), detached_runs.WorkerResultReplay.RETRY)
+                passed = worker_panes.worker_pass(row, self.run_dir)
+                self.assertEqual(passed[worker_panes.REPLAYED_RESULT_SOURCES], {"other-check": str(previous.resolve())})
+                self.assertIs(replay(), detached_runs.WorkerResultReplay.RETRY)
+                self.assertEqual(self.fixture.prompts(), prompts)
+            self.assertIs(replay(), detached_runs.WorkerResultReplay.SUBMITTED)
+        self.assertEqual(len(self.fixture.prompts()), len(prompts) + 1)
+        self.assertIs(worker_lifecycle.read_json_object(path)["worker_received"], True)
+
     def assert_restore_recovers_pass_after_replay(self, status: Literal["completed", "error"], *,
                                                  source_after_replay: Literal[
                                                      "present", "pruned", "unreadable-neighbor"] = "present") -> None:

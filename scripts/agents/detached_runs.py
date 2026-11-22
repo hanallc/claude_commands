@@ -1807,6 +1807,29 @@ def has_unbound_worker_result(run: Path, worker: staff.StaffRow) -> bool:
                for record in _pending_worker_results(run / DETACHED_RUNS_DIR, worker, UnboundWorkerResult.ONLY))
 
 
+def finished_unbound_worker_result_ids(run: Path, worker_id: staff.StaffId,
+                                      candidate_ids: Collection[str]) -> Generator[str]:
+    """Validate source records for the requested transcript markers."""
+    run = run.resolve()
+    session_dir = str(run)
+    for run_id in candidate_ids:
+        if not run_id or "/" in run_id or "\0" in run_id:
+            continue
+        path = run / DETACHED_RUNS_DIR / f"{run_id}.json"
+        if (owner := _record_owner(path)) and owner != worker_id:
+            continue
+        try:
+            record = worker_lifecycle.read_json_object(path)
+        except worker_lifecycle.WorkerStateUnreadable:
+            continue
+        if (_is_run_record(record) and record["run_id"] == run_id and record["staff_id"] == worker_id
+                and record["status"] == "finished" and not record.get("result_suppressed")
+                and not _awaits_stop_completion(record)
+                and result_in_pass(record, UnboundWorkerResult.ONLY)
+                and record["session_dir"] == session_dir):
+            yield run_id
+
+
 def _alert_director(path: Path) -> None:
     """Save the director receipt after the sender accepts the alert."""
     from scripts.message import send
