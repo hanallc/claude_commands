@@ -56,6 +56,10 @@ class ScopeStopFailed(OSError):
     """The stop could not confirm an empty scope."""
 
 
+class _ScopeRemoved(FileNotFoundError):
+    """The kernel removed the empty scope tree."""
+
+
 @dataclass(frozen=True)
 class ScopeStopReceipt:
     term_reached: int
@@ -197,30 +201,38 @@ def _open_saved_scope(scope: ScopeIdentity) -> int:
     path = Path(scope["path"])
     if (not path.is_absolute() or ".." in path.parts or path.name != scope["unit"]
             or not path.name.endswith(".scope")):
-        raise ValueError("invalid command scope path")
-    directory = _open_directory(CGROUP_ROOT / path.relative_to("/"))
+        raise ScopeStopFailed("cannot open command scope: invalid command scope path")
+    try:
+        directory = _open_directory(CGROUP_ROOT / path.relative_to("/"))
+    except FileNotFoundError as error:
+        raise _ScopeRemoved from error
+    except OSError as error:
+        raise ScopeStopFailed(f"cannot open command scope: {error}") from error
     if _directory_identity(scope["unit"], path, directory) != scope:
         os.close(directory)
-        raise FileNotFoundError("the original scope is gone")
+        raise ScopeStopFailed("cannot open command scope: the directory identity changed")
     return directory
+
+
+def _check_saved_scope(scope: ScopeIdentity) -> None:
+    os.close(_open_saved_scope(scope))
 
 
 def scope_has_ended(scope: ScopeIdentity) -> bool:
     """Use the kernel event for the full scope tree."""
-    with _scope_events(scope) as (_, descriptor):
-        return _scope_is_empty(descriptor)
+    with suppress(_ScopeRemoved), _scope_events(scope) as (_, descriptor):
+        return _scope_is_empty(scope, descriptor)
+    return True
 
 
 @contextmanager
 def _scope_events(scope: ScopeIdentity) -> Generator[tuple[int, int]]:
-    try:
-        directory = _open_saved_scope(scope)
-    except (OSError, ValueError) as error:
-        raise ScopeStopFailed(f"cannot open command scope: {error}") from error
+    directory = _open_saved_scope(scope)
     try:
         try:
             descriptor = os.open("cgroup.events", os.O_RDONLY | os.O_NOFOLLOW, dir_fd=directory)
         except OSError as error:
+            _check_saved_scope(scope)
             raise ScopeStopFailed(f"cannot read cgroup.events: {error}") from error
         try:
             yield directory, descriptor
@@ -230,7 +242,7 @@ def _scope_events(scope: ScopeIdentity) -> Generator[tuple[int, int]]:
         os.close(directory)
 
 
-def _scope_is_empty(descriptor: int) -> bool:
+def _scope_is_empty(scope: ScopeIdentity, descriptor: int) -> bool:
     try:
         lines = os.pread(descriptor, 4096, 0).splitlines()
         if b"populated 0" in lines:
@@ -239,6 +251,7 @@ def _scope_is_empty(descriptor: int) -> bool:
             return False
         raise ValueError("no populated field in cgroup.events")
     except (OSError, ValueError) as error:
+        _check_saved_scope(scope)
         raise ScopeStopFailed(f"cannot read cgroup.events: {error}") from error
 
 
@@ -300,8 +313,9 @@ def _term_scope(directory: int, scope: ScopeIdentity, deadline: float) -> int:
 
 
 def scope_ends_by(scope: ScopeIdentity, deadline: float) -> bool:
-    with _scope_events(scope) as (_, descriptor):
-        return _scope_ends_on(descriptor, deadline)
+    with suppress(_ScopeRemoved), _scope_events(scope) as (_, descriptor):
+        return _scope_ends_on(scope, descriptor, deadline)
+    return True
 
 
 def _wait_scope_event(descriptor: int, seconds: float) -> None:
@@ -310,8 +324,8 @@ def _wait_scope_event(descriptor: int, seconds: float) -> None:
     _ = events.poll(seconds * 1000)
 
 
-def _scope_ends_on(descriptor: int, deadline: float) -> bool:
-    while not _scope_is_empty(descriptor):
+def _scope_ends_on(scope: ScopeIdentity, descriptor: int, deadline: float) -> bool:
+    while not _scope_is_empty(scope, descriptor):
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             return False
@@ -321,26 +335,27 @@ def _scope_ends_on(descriptor: int, deadline: float) -> bool:
 
 def scope_member_pids(scope: ScopeIdentity) -> list[int]:
     """List the live process IDs in the scope tree."""
-    try:
+    with suppress(_ScopeRemoved):
         directory = _open_saved_scope(scope)
-    except FileNotFoundError:
-        return []
-    try:
-        return sorted({process.pid for process in _scope_processes(directory)})
-    finally:
-        os.close(directory)
+        try:
+            return sorted({process.pid for process in _scope_processes(directory)})
+        except OSError:
+            _check_saved_scope(scope)
+            raise
+        finally:
+            os.close(directory)
+    return []
 
 
 def stop_scope(scope: ScopeIdentity, grace: float, kill_grace: float) -> ScopeStopReceipt:
     """Send TERM, then use cgroup.kill if the scope stays populated."""
     deadline = time.monotonic() + grace
-    with _scope_events(scope) as (directory, events):
-        if _scope_is_empty(events):
+    reached = 0
+    with suppress(_ScopeRemoved), _scope_events(scope) as (directory, events):
+        if _scope_is_empty(scope, events):
             return ScopeStopReceipt(0)
         reached = _term_scope(directory, scope, deadline)
-        if _scope_ends_on(events, deadline):
-            if not reached:
-                raise ScopeStopFailed("no TERM signal reached a member of the populated scope")
+        if _scope_ends_on(scope, events, deadline):
             return ScopeStopReceipt(reached)
         try:
             descriptor = os.open("cgroup.kill", os.O_WRONLY | os.O_NOFOLLOW, dir_fd=directory)
@@ -349,13 +364,13 @@ def stop_scope(scope: ScopeIdentity, grace: float, kill_grace: float) -> ScopeSt
             finally:
                 os.close(descriptor)
         except OSError as error:
-            if reached and _scope_is_empty(events):
+            if _scope_is_empty(scope, events):
                 return ScopeStopReceipt(reached)
             detail = "" if reached else "no TERM signal reached a member. "
             raise ScopeStopFailed(f"{detail}cgroup.kill failed: {error}") from error
-        if not _scope_ends_on(events, time.monotonic() + kill_grace):
+        if not _scope_ends_on(scope, events, time.monotonic() + kill_grace):
             raise ScopeStopFailed("the scope remains populated after KILL")
-        return ScopeStopReceipt(reached)
+    return ScopeStopReceipt(reached)
 
 
 def stop_group(leader: ProcessLifetime, number: int) -> None:

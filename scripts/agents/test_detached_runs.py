@@ -1202,7 +1202,7 @@ sys.exit(1)
     @unittest.skipUnless(process_stop.supported(), "pidfd stop needs Linux")
     def test_scoped_stop_uses_the_launch_record_and_waits_for_the_scope_tree(self) -> None:
         for outcome in ("TERM", "KILL", "EPERM", "still populated", "natural", "unreadable",
-                        "missing", "replaced", "receipt"):
+                        "missing", "replaced", "receipt", "empty before TERM"):
             with self.subTest(outcome=outcome), contextlib.ExitStack() as descriptors:
                 path = self.record(["fixture command"])
                 proc = self.root / f"proc-{outcome}"
@@ -1254,6 +1254,10 @@ sys.exit(1)
 
                 def open_pidfd(pid: int) -> int:
                     self.assertEqual(pid, 702)
+                    if outcome == "empty before TERM":
+                        _ = members.write_text("")
+                        _ = events.write_text("populated 0\nfrozen 0\n")
+                        raise ProcessLookupError(pid)
                     started = process_start.proc_table_start(pid, proc)
                     if not isinstance(started, process_start.Started):
                         raise ProcessLookupError(pid)
@@ -1315,20 +1319,36 @@ sys.exit(1)
                       contextlib.redirect_stdout(io.StringIO()) as stdout,
                       contextlib.redirect_stderr(io.StringIO()) as stderr):
                     if outcome in ("missing", "replaced"):
+                        _ = members.write_text("")
+                        _ = events.write_text("populated 0\n")
                         _ = scope.rename(scope.with_name(scope.name + ".old"))
                         if outcome == "replaced":
                             scope.mkdir()
                             _ = (scope / "cgroup.events").write_text("populated 0\n")
                         if not process_stop.is_scope_identity(published):
                             self.fail("the launcher did not save its scope")
-                        with self.assertRaisesRegex(process_stop.ScopeStopFailed, "cannot open command scope"):
-                            _ = process_stop.scope_has_ended(published)
+                        if outcome == "missing":
+                            self.assertTrue(process_stop.scope_has_ended(published))
+                            self.assertTrue(process_stop.scope_ends_by(published, now))
+                            self.assertEqual(process_stop.scope_member_pids(published), [])
+                            self.assertEqual(process_stop.stop_scope(published, 2, 2).term_reached, 0)
+                        else:
+                            with self.assertRaisesRegex(process_stop.ScopeStopFailed, "the directory identity changed"):
+                                _ = process_stop.scope_has_ended(published)
+                            with self.assertRaisesRegex(process_stop.ScopeStopFailed, "the directory identity changed"):
+                                _ = process_stop.scope_member_pids(published)
                         continue
-                    if outcome == "receipt":
+                    if outcome in ("receipt", "empty before TERM"):
                         if not process_stop.is_scope_identity(published):
                             self.fail("the launcher did not save its scope")
-                        self.assertEqual(process_stop.stop_scope(published, 2, 2).term_reached, 1)
-                        self.assertEqual(terms, ["22"])
+                        receipt = process_stop.stop_scope(published, 2, 2)
+                        if outcome == "receipt":
+                            self.assertEqual(receipt.term_reached, 1)
+                            self.assertEqual(terms, ["22"])
+                        else:
+                            self.assertEqual(receipt.term_reached, 0)
+                            self.assertEqual(terms, [])
+                            self.assertEqual(kill.read_text(), "0\n")
                         continue
                     if outcome in ("natural", "unreadable"):
                         if outcome == "unreadable":

@@ -726,7 +726,8 @@ It sends TERM through individual pidfds to verified members of the saved scope t
 It also checks the scope of a verified leader that runs a nested systemd scope.
 It uses `cgroup.kill` after the stop grace if the scope stays populated.
 A failed scope kill reports a stop error if the scope stays populated.
-A verified empty scope proves the stop. A missing or replaced scope reports an error without a saved proof.
+A verified empty scope or removal of its directory proves the run ended.
+A replacement directory with a different identity reports an error.
 A legacy group TERM without a verified scope reports an unconfirmed stop.
 A separate session in the saved scope receives the same stop signals.
 After a normal exit, the supervisor gives scope members the stop grace to exit.
