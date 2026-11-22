@@ -18,7 +18,6 @@ from typing import TYPE_CHECKING, Literal, NotRequired, Self, TypedDict, cast, o
 from uuid import uuid4
 
 from scripts.build_hold.owning_session import NoOwningSession, OwningSession
-from scripts.buildlog import store
 from scripts.build_targets import target_config
 from scripts.lib import process_start as process_identity
 from scripts.lib.atomic_file import write_text_atomic
@@ -378,6 +377,8 @@ class KnownMacHistoryKey:
     key: str
 
     def __post_init__(self) -> None:
+        from scripts.buildlog import store
+
         if not self.key:
             raise ValueError("the Mac history key is empty")
         if self.key == store.UNKNOWN_IDENTITY:
@@ -492,6 +493,8 @@ def valid_fence_generation(generation: object) -> bool:
 
 
 def mac_repository_record(value: object) -> MacRepositoryIdentity | CleanupOnlyMacRepository:
+    from scripts.buildlog import store
+
     if not isinstance(value, dict):
         raise StateReadError("invalid Mac repository identity")
     fields = cast(dict[str, object], value)
