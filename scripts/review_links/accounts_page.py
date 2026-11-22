@@ -306,25 +306,17 @@ def _spans(spans: list[accounts.BoardSpan]) -> str:
     return "".join(parts)
 
 
-def _next_cell(row: accounts.BoardRow, reading: accounts.StatusReading, labels: dict[str, accounts.BoardSpan]) -> str:
+def _next_cell(row: accounts.BoardRow, move: accounts.BoardNextMoveTarget | accounts.NextMovesUnavailable | Literal["unselected", "none", "auto"],
+               labels: dict[str, accounts.BoardSpan]) -> str:
     """Render the selected group's target or the reason this line has no target."""
     if row["cells"]["label"] and row["cells"]["label"][0]["text"] == "total":
         return ""
-    move = accounts.account_board_next_move(row, reading.first_next_moves)
     editable = row.get("group")
     if move == "unselected":
         return ('<span class="next-muted next-minus" title="Not the selected account for a role">'
                 + page_frame.icon_svg("minus") + '</span>')
-    target = ""
-    if isinstance(move, accounts.BoardNextMoveTarget):
-        target = move.label
-        content = _spans([labels.get(target, accounts.BoardSpan(text=target, tone="default", kind="bold"))])
-    elif isinstance(move, accounts.NextMovesUnavailable):
-        content = '<span class="next-muted" title="' + html.escape(move.reason, quote=True) + '">unavailable</span>'
-    elif move == "none":
-        content = '<span class="next-muted">none</span>'
-    else:
-        content = ('<span class="next-muted" title="Codex workers move between the Codex accounts by themselves">auto</span>')
+    target = move.label if isinstance(move, accounts.BoardNextMoveTarget) else ""
+    content = _next_text(move, labels)
     if editable:
         content += (f'<button type="button" class="next-button" data-next-button data-next-target="{html.escape(target, quote=True)}" '
                     + f'data-move-account="{html.escape(editable["account"], quote=True)}" data-move-group="{editable["group"]}" '
@@ -333,8 +325,19 @@ def _next_cell(row: accounts.BoardRow, reading: accounts.StatusReading, labels: 
     return content
 
 
-def _next_sort_value(row: accounts.BoardRow, reading: accounts.StatusReading) -> str | None:
-    move = accounts.account_board_next_move(row, reading.first_next_moves)
+def _next_text(move: accounts.BoardNextMoveTarget | accounts.NextMovesUnavailable | Literal["none", "auto"],
+               labels: dict[str, accounts.BoardSpan]) -> str:
+    """Render a next move target or state as text, without the move control."""
+    if isinstance(move, accounts.BoardNextMoveTarget):
+        return _spans([labels.get(move.label, accounts.BoardSpan(text=move.label, tone="default", kind="bold"))])
+    if isinstance(move, accounts.NextMovesUnavailable):
+        return '<span class="next-muted" title="' + html.escape(move.reason, quote=True) + '">unavailable</span>'
+    if move == "none":
+        return '<span class="next-muted">none</span>'
+    return '<span class="next-muted" title="Codex workers move between the Codex accounts by themselves">auto</span>'
+
+
+def _next_sort_value(move: accounts.BoardNextMoveTarget | accounts.NextMovesUnavailable | Literal["unselected", "none", "auto"]) -> str | None:
     if isinstance(move, accounts.BoardNextMoveTarget):
         return move.label.casefold()
     if isinstance(move, accounts.NextMovesUnavailable):
@@ -375,7 +378,7 @@ ACCOUNT_COLUMNS = (
     ("used / hour", "right"), ("empty at", "left"), ("role", "left"), ("", "left"), ("next", "left"),
     ("resets", "right"), ("credits", "right"), ("enabled", "left"),
 )
-ROLE_COLUMNS = (("role", "left"), ("", "left"), ("account", "left"),
+ROLE_COLUMNS = (("role", "left"), ("", "left"), ("account", "left"), ("next", "left"),
                 *((key, "right") for key in accounts.COUNT_COLUMNS))
 ACCOUNT_DETAIL_COLUMNS = "1,0,2,3,4,5,9,10,11"
 DASH = '<span class="next-muted">—</span>'
@@ -474,13 +477,14 @@ def _accounts_table(reading: accounts.StatusReading, rows_by_account: dict[str, 
             spans = line["cells"]["roles"]
             visible_role = [span for span in spans if span["text"] != " ✓"] if role_lines else []
             role = visible_role[0]["text"] if visible_role else ""
+            move = accounts.account_board_next_move(line, reading.first_next_moves)
             rows.append(f'<tr data-account-row="{html.escape(label, quote=True)}">'
                         + (account_start if index == 0 else _cell("") + '<td class="left" data-account-name></td>'
                            + _cell("") + _cell("", "right") * 2 + _cell(""))
                         + _cell(_spans(visible_role)) + _cell(_swatch(visible_role))
-                        + _cell(_next_cell(line, reading, labels), "left next-cell")
+                        + _cell(_next_cell(line, move, labels), "left next-cell")
                         + (account_end if index == 0 else _cell("", "right") * 2 + _cell("")) + "</tr>")
-            values.append({**account_values, "role": role.casefold() or None, "next": _next_sort_value(line, reading)})
+            values.append({**account_values, "role": role.casefold() or None, "next": _next_sort_value(move)})
             labels_in_row_order.append(label)
     problems = "".join(f"<li>{html.escape(note.removeprefix('* '))}</li>" for note in reading.notes)
     targets_json = html.escape(json.dumps(targets), quote=True)
@@ -521,8 +525,9 @@ def _role_count_cell(role: str, assignments: list[tuple[str, accounts.BoardRow]]
     return f'<td class="right"{attributes}>{value}</td>', total
 
 
-def _roles_table(groups: dict[str, list[tuple[str, accounts.BoardRow]]], labels: dict[str, accounts.BoardSpan],
-                 selected: dict[str, tuple[str, ...]], total: accounts.BoardRow) -> str:
+def _roles_table(reading: accounts.StatusReading, groups: dict[str, list[tuple[str, accounts.BoardRow]]],
+                 labels: dict[str, accounts.BoardSpan], selected: dict[str, tuple[str, ...]],
+                 total: accounts.BoardRow) -> str:
     rows: list[str] = []
     values: list[SortValues] = []
     role_names = sorted(set(groups) | set(accounts.CLAUDE_GROUPS) | {accounts.CODEX_ROLE})
@@ -532,6 +537,9 @@ def _roles_table(groups: dict[str, list[tuple[str, accounts.BoardRow]]], labels:
         role_span = (assignments[0][1]["cells"]["roles"][:1] if assignments
                      else [accounts.board_role_span(role, missing_colors)])
         selected_assignment = next(((label, line) for label, line in assignments if role in selected[label]), None)
+        move = (accounts.account_board_next_move(selected_assignment[1], reading.first_next_moves)
+                if selected_assignment else "unselected")
+        next_text = DASH if move == "unselected" else _next_text(move, labels)
         if selected_assignment is None:
             name = '<span class="inactive">no account</span>'
             account_value = None
@@ -544,16 +552,17 @@ def _roles_table(groups: dict[str, list[tuple[str, accounts.BoardRow]]], labels:
             label != selected_label and line["cells"]["total"][0]["text"] not in ("", "0")
             for label, line in assignments
         )
-        values.append({"role": role.casefold(), "account": account_value})
+        values.append({"role": role.casefold(), "account": account_value,
+                       "next": _next_sort_value(move)})
         count_cells: list[str] = []
         for key in accounts.COUNT_COLUMNS:
             cell, count = _role_count_cell(role, assignments, key, show_breakdown=show_breakdown)
             count_cells.append(cell)
             values[-1][key] = count
         rows.append("<tr>" + _cell(_spans(role_span)) + _cell(_swatch(role_span)) + _cell(name)
-                    + "".join(count_cells) + "</tr>")
+                    + _cell(next_text, "left next-cell") + "".join(count_cells) + "</tr>")
     cells = total["cells"]
-    rows.append('<tr data-summary>' + _cell(_spans(cells["label"])) + _cell("") * 2
+    rows.append('<tr data-summary>' + _cell(_spans(cells["label"])) + _cell("") * 3
                 + "".join(_cell(_spans(cells[key]), "right") for key in accounts.COUNT_COLUMNS) + "</tr>")
     return _split_card("Roles", "roles", "role", ROLE_COLUMNS, rows, _sort_orders(values, accounts.COUNT_COLUMNS),
                        descending=accounts.COUNT_COLUMNS)
@@ -577,7 +586,7 @@ def board(reading: accounts.StatusReading, alerts: Mapping[str, QuotaAlert] | No
             groups.setdefault(role, []).append((label, line))
     selected = {row.label: row.selected_roles for row in reading.rows}
     return (_accounts_table(reading, rows_by_account, labels, alerts or {})
-            + _roles_table(groups, labels, selected, lines[-1]))
+            + _roles_table(reading, groups, labels, selected, lines[-1]))
 
 
 def _model_cell(row: accounts.ModelsBoardRow, column: accounts.BoardColumn) -> str:

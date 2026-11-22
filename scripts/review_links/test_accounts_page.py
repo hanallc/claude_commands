@@ -528,6 +528,33 @@ window.fetch=(url,options)=>options?.method==='POST'
             for count, value in ((2, ""), (0, ""), (1, ""), (0, ""), (3, "unknown"))
         ])
 
+    def test_roles_next_column_shows_each_target_as_text_without_a_control(self) -> None:
+        rows = (
+            replace(status_row("claude1"), roles=("showrunners", "units"), selected_roles=("units", "showrunners")),
+            replace(status_row("claude2"), roles=("producers",), selected_roles=()),
+            replace(status_row("codex1"), tool="codex", roles=("workers",), selected_roles=("workers",)),
+        )
+        reading = accounts.StatusReading(rows, (), (), timezone.utc, AT,
+                                         first_next_moves=accounts.FirstNextMoveTargets({"units": "claude2"}))
+        markup = accounts_page.board(reading)
+        account_table, roles_table = markup.split('aria-label="Roles"', 1)
+        self.assertIn('data-next-button', account_table)
+        self.assertNotIn('data-next-button', roles_table)
+        heads = re.findall(r'<th class="[a-z]+"(?: data-role-sort="([^"]*)")?', roles_table.split("</thead>", 1)[0])
+        self.assertEqual(heads[:4], ["role", "", "account", "next"])
+        def next_cell(role: str) -> str:
+            row = roles_table.split(f">{role}</span>", 1)[1].split("</tr>", 1)[0]
+            match = re.search(r'<td class="left next-cell">(.*?)</td>', row)
+            assert match is not None
+            return match.group(1)
+        self.assertEqual(re.sub(r"<[^>]+>", "", next_cell("units")), "claude2")
+        self.assertIn('class="default bold"', next_cell("units"))
+        self.assertEqual(re.sub(r"<[^>]+>", "", next_cell("showrunners")), "none")
+        self.assertEqual(next_cell("producers"), accounts_page.DASH)
+        self.assertEqual(re.sub(r"<[^>]+>", "", next_cell("workers")), "auto")
+        orders = rendered_sort_orders(markup, "roles")
+        self.assertEqual(orders["next"], [3, 2, 1, 0])
+
     def test_roles_shows_a_total_without_accounts(self) -> None:
         reading = accounts.StatusReading((), (), (), timezone.utc, AT)
         roles_table = accounts_page.board(reading).split('aria-label="Roles"', 1)[1]
@@ -541,9 +568,9 @@ window.fetch=(url,options)=>options?.method==='POST'
         self.assertEqual(re.findall(r'data-account-sort="([^"]+)"', markup),
                          ["account", "left", "used / hour", "empty at", "role", "next", "resets", "credits", "enabled"])
         self.assertEqual(re.findall(r'data-role-sort="([^"]+)"', markup),
-                         ["role", "account", "busy", "idle", "paused", "exited", "total"])
-        self.assertEqual(len(re.findall(r'<th [^>]*tabindex="0"', markup)), 16)
-        self.assertEqual(markup.count('class="sort-arrow"'), 16)
+                         ["role", "account", "next", "busy", "idle", "paused", "exited", "total"])
+        self.assertEqual(len(re.findall(r'<th [^>]*tabindex="0"', markup)), 17)
+        self.assertEqual(markup.count('class="sort-arrow"'), 17)
         self.assertIn('data-account-sort="account" tabindex="0" aria-sort="ascending"', markup)
         self.assertIn('data-role-sort="role" tabindex="0" aria-sort="ascending"', markup)
 
@@ -827,7 +854,7 @@ realFetch('/probe',{method:'POST',body:JSON.stringify(failures)});
    'claude-fable-5-1::max,claude-opus-5-5::low,::high,gpt-6.2-sol::medium,unknown::-,total::',
    'model IDs and efforts are grouped');
   check(rows().at(-1).cells[7].textContent===document.querySelector('[data-sort-table=roles] tbody')
-   .lastElementChild.cells[7].textContent,'both tables show the same total');
+   .lastElementChild.cells[8].textContent,'both tables show the same total');
   check(rows()[0].cells[4].querySelector('.inactive').textContent==='0','zero has a muted tone');
   check(table().querySelectorAll('[data-color-key="model.claude-opus-5-5"]').length===1,'each model has one swatch');
   check(header('model').getAttribute('aria-sort')==='ascending','model ascending is the default');
@@ -1196,7 +1223,12 @@ realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
                       accounts.FirstNextMoveTargets(), accounts.NextMovesUnavailable("fixture damaged log")):
             with self.subTest(first=first):
                 markup = accounts_page.board(accounts.StatusReading(rows, (), (), timezone.utc, AT, first_next_moves=first))
-                cells = cast(list[str], re.findall(r'<td class="left next-cell">(.*?)</td>', markup, re.S))
+                account_table, roles_table = markup.split('aria-label="Roles"', 1)
+                role_cells = cast(list[str], re.findall(r'<td class="left next-cell">(.*?)</td>', roles_table, re.S))
+                self.assertFalse(any('<button' in cell for cell in role_cells))
+                if isinstance(first, accounts.NextMovesUnavailable):
+                    self.assertEqual(sum('>unavailable</span>' in cell for cell in role_cells), 3)
+                cells = cast(list[str], re.findall(r'<td class="left next-cell">(.*?)</td>', account_table, re.S))
                 self.assertEqual(len(cells), 6)
                 units, showrunners, unselected, spare, workers, codex_spare = cells
                 for cell in (unselected, spare, codex_spare):
@@ -1477,8 +1509,8 @@ window.fetch=async()=>{calls++;return {ok:true,text:async()=>FRESH_PAGE};};
    'the swatch column without a heading sits between account and left');
   check(heads.slice(4,10).join(',')==='used / hour,empty at,role,,next,resets',
    'Accounts puts role and next after the forecast');
-  check(roleHeads.join(',')==='role,,account,busy,idle,paused,exited,total',
-   'Roles shows the role, account and counts');
+  check(roleHeads.join(',')==='role,,account,next,busy,idle,paused,exited,total',
+   'Roles shows the role, account, next and counts');
   check(getComputedStyle(cell).textAlign==='left' && getComputedStyle(swatch).marginLeft==='0px' &&
    Math.abs(swatch.getBoundingClientRect().left-cell.getBoundingClientRect().left-parseFloat(getComputedStyle(cell).paddingLeft))<1,
    'the swatch aligns with the cell content on the left');

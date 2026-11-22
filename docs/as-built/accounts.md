@@ -608,6 +608,8 @@ The count tooltip lists counts by account when any observed sessions run outside
 The tooltip also lists accounts outside the selected account when their counts are unknown.
 If the role has no selected account, the tooltip lists the count for each observed account.
 If a role has no selected account, the account cell shows muted `no account` text.
+The next column shows the next move of the selected account as text.
+Only the Accounts table has the control that changes the next move.
 The total row stays last, including when the account list is empty.
 
 The Models table groups session counts by model ID and effort.
@@ -618,7 +620,8 @@ The quota, rate, run-out time, and reset sort from the smallest or earliest valu
 Credits sort from the largest balance. An unlimited balance comes first.
 Enabled accounts come first when you sort by the credits setting.
 The role column sorts by role name without regard to letter case.
-The next column sorts by target account.
+The next column sorts by its text without regard to letter case.
+`auto`, `none` and `unavailable` sort as words. Rows with no next move stay last.
 Role counts sort by the sum for the role, largest first.
 Missing values stay last in both directions.
 Select the active header again to reverse the order.

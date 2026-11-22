@@ -957,6 +957,10 @@ It refuses a clear for an empty group.
 The cell then shows the next queued target, or `none`.
 Success clears the cached page and refreshes the `next` cell.
 A refused request returns 400 and a failed write returns 503, each with its reason.
+
+The Roles table has a `next` column after **account**.
+It shows the same target, `none`, `auto` or `unavailable` as text, without a button.
+A role with no selected account shows a dash.
 A failed move shows `<group>: <reason>` in the status line.
 Codex workers keep their own moves; the menu shows no Codex account.
 
