@@ -822,6 +822,13 @@ def recover_gate_record(path: Path) -> None:
         raise GateRefused(f"cannot recover gate {pid}: {owner.reason}")
     if isinstance(owner, Started) and owner.start == start:
         return
+    try:
+        data = cast(dict[str, object], json.loads(path.read_text()))
+    except FileNotFoundError:
+        # The owner can finish cleanup before the process check detects its exit.
+        return
+    if data.get("finished") is True:
+        return
     groups = cast(dict[str, str], data["groups"])
     tokens = [HeldGateToken(cast(str, token["path"]), cast(int, token["device"]),
                             cast(int, token["inode"]), cast(str, token["value"]))

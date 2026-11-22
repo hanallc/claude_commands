@@ -22,6 +22,7 @@ from datetime import UTC, datetime, tzinfo
 from unittest import mock
 from scripts.direct.wait_for_test_state import wait_until
 from scripts.lib import scratch
+from scripts.lib.process_start import Gone
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.production import change_review, gate, staff
 from scripts.production.gate_modules import GateRefused
@@ -562,6 +563,32 @@ class MergeGateCheckpointTests(MergeGateFixture):
 
 @final
 class GateRecoveryTests(MergeGateFixture):
+    def test_recovery_skips_record_removed_during_owner_check(self) -> None:
+        directory = self.root / "recovery"
+        directory.mkdir()
+        pool = self.root / "tokens"
+        os.mkfifo(pool)
+        descriptor = os.open(pool, os.O_RDWR | os.O_NONBLOCK)
+        self.addCleanup(os.close, descriptor)
+        status = os.fstat(descriptor)
+        token = gate.HeldGateToken(str(pool), status.st_dev, status.st_ino, b"t".hex())
+        recovery = gate.GateRecovery(directory / "owner.json", str(self.checkout), 5_000_001, "owner",
+                                     tokens=[token])
+        recovery.save()
+
+        def finish_owner(_pid: int) -> Gone:
+            _ = os.write(descriptor, b"t")
+            recovery.finish()
+            return Gone()
+
+        with (mock.patch.object(gate, "process_start", side_effect=finish_owner) as read_start,
+              mock.patch.dict(os.environ, self.environment)):
+            gate.recover_gate_directory(directory, own_directory=directory)
+
+        read_start.assert_called_once_with(recovery.pid)
+        self.assertFalse(recovery.path.exists())
+        self.assertEqual(os.read(descriptor, 2), b"t")
+
     def test_tests_only_sigterm_closes_the_active_record(self) -> None:
         self.write(self.state / "hold-module", "hold")
         ready = self.state / "module-held"
