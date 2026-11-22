@@ -15,7 +15,7 @@ import sys
 import time
 from dataclasses import dataclass, replace
 from enum import Enum
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import ExitStack, redirect_stderr, redirect_stdout
 from io import StringIO
 from zoneinfo import ZoneInfo
 from datetime import datetime
@@ -763,7 +763,10 @@ def main(argv: list[str] | None = None) -> int:
             return set_model.run(options.role, options.model, options.effort)
         except (OSError, ValueError, conf.Unusable, staff.StaffRefused) as error:
             return set_model.report_error(error)
+    locks = ExitStack()
     try:
+        if options.command in ("resume", "restart", "add-producer", "transfer", "move"):
+            locks.enter_context(stop_resume.start_lock())
         if options.command == "resume" and options.resend_opening_prompt:
             if options.production or options.retired:
                 raise ValueError("--resend-opening-prompt needs one producer name and an active pane")
@@ -894,6 +897,9 @@ def main(argv: list[str] | None = None) -> int:
         result = (stop_resume.stop_producer(target.id, "agents stop ran", deadline=deadline)
                   if target is not None and target.kind == "producer" else stop_resume.stop(options.session, deadline=deadline))
         return max(_result_code(result), int(bool(unresolved)))
+    except stop_resume.RebootLockBusy as error:
+        print(error, file=sys.stderr)
+        return 1
     except staff.StaffRefused as error:
         print(f"shutdown: StaffRefused: {error}", file=sys.stderr)
         return 2
@@ -901,6 +907,8 @@ def main(argv: list[str] | None = None) -> int:
             InvalidInventory, herdr_types.HerdrFailure) as error:
         print(f"shutdown: {error}", file=sys.stderr)
         return 2
+    finally:
+        locks.close()
 
 
 SCRIPTS = Path(__file__).resolve().parent.parent

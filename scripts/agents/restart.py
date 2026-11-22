@@ -21,7 +21,7 @@ from collections.abc import Callable, Generator, Iterable, Mapping
 from contextlib import ExitStack, contextmanager, nullcontext, redirect_stderr, redirect_stdout, suppress
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from contextvars import ContextVar, copy_context
-from threading import Event
+from threading import Event, Lock
 from dataclasses import dataclass, field, replace
 from enum import Enum
 from functools import partial
@@ -352,13 +352,15 @@ class BulkReport:
     stop_signal: signal.Signals | None = None
     not_started: dict[str, str] = field(default_factory=dict)
     reboot: bool = False
-    on_finish: Callable[[str, int], None] | None = None
+    on_finish: Callable[[str, int, int], None] | None = None
+    _progress_lock: Lock = field(default_factory=Lock, init=False, repr=False, compare=False)
 
     def track(self, row: staff.StaffRow, record: staff.StaffSnapshot) -> None:
         owner = record.parent_of(row) if row.kind == "worker" else row
-        self.targets[row.id] = f"{owner.name} / {row.name}" if row.kind == "worker" and owner is not None else row.name
-        if owner is not None and owner.kind in ("unit", "showrunner"):
-            self.units[row.id] = owner.name
+        with self._progress_lock:
+            self.targets[row.id] = f"{owner.name} / {row.name}" if row.kind == "worker" and owner is not None else row.name
+            if owner is not None and owner.kind in ("unit", "showrunner"):
+                self.units[row.id] = owner.name
 
     def failure(self, key: str, name: str, reason: str) -> None:
         self.issues[key] = FollowUp(self.targets.get(key, name), reason, f"Nate runs {self.retry} again.", operator=True)
@@ -393,11 +395,12 @@ class BulkReport:
         return f"Nate {repair}. Then Nate runs {self.retry} again."
 
     def finish(self, key: str) -> None:
-        first = key not in self.completed
-        self.completed.add(key)
-        _ = self.issues.pop(key, None)
-        if first and self.on_finish is not None:
-            self.on_finish(self.targets[key], len(self.targets))
+        with self._progress_lock:
+            first = key not in self.completed
+            self.completed.add(key)
+            _ = self.issues.pop(key, None)
+            if first and self.on_finish is not None:
+                self.on_finish(self.targets[key], len(self.completed), len(self.targets))
 
     def mark_not_started(self, keys: Iterable[str], retry: str) -> None:
         step = _plain_terminal_step(retry)

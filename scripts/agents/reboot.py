@@ -1,7 +1,6 @@
 """Reboot the shared Herdr session from a terminal outside Herdr."""
 from __future__ import annotations
 
-import fcntl
 import io
 import json
 import math
@@ -20,7 +19,7 @@ from threading import Event, Lock, Thread, get_ident
 from typing import TextIO, cast, final, override
 from uuid import uuid4
 
-from scripts.agents import restart, shutdown_record
+from scripts.agents import restart, shutdown_record, stop_resume
 from scripts.herdr import herdr, herdr_types
 from scripts.lib import conf
 from scripts.lib.atomic_file import write_text_atomic
@@ -97,7 +96,7 @@ class StepDisplay:
         self.prefix = f"{step.value} of {len(Step)}  {LABELS[step]}"
         self.lock = Lock()
         self.detail = ""
-        self.count = 0
+        self.member_shown = False
         self.spinner = " |"
 
     def _line(self, spinner: str = "") -> str:
@@ -112,11 +111,11 @@ class StepDisplay:
         print(("\r\x1b[K" if self.tty else "") + self._line(spinner if self.tty else ""),
               end="\n" if final or not self.tty else "", file=self.terminal, flush=True)
 
-    def member(self, name: str, total: int) -> None:
+    def member(self, name: str, count: int, total: int) -> None:
         with self.lock:
-            self.count += 1
+            self.member_shown = True
             verb = "stopped" if self.step is Step.STOP else "back"
-            self.detail = f"{self.count} of {total} {verb} - {' '.join(name.split())}"
+            self.detail = f"{count} of {total} {verb} - {' '.join(name.split())}"
             self.log.line(self._line())
             self._show(spinner=self.spinner)
 
@@ -145,7 +144,7 @@ class StepDisplay:
                 done.set()
                 thread.join()
                 self._show(final=True)
-            elif self.count == 0:
+            elif not self.member_shown:
                 self._show(final=True)
             self.log.line(self._line())
 
@@ -254,7 +253,7 @@ def run_bulk(step: Step, path: Path, display: StepDisplay) -> tuple[bool, list[r
         failed = True
     if failed and not report.follow_ups():
         report.failure("", command, "Could not confirm that the step finished")
-    if display.count == 0:
+    if not report.completed:
         verb = "stopped" if stopping else "back"
         display.detail = f"0 of {len(report.targets)} {verb}"
     display.log.finish()
@@ -379,13 +378,10 @@ def run(*, dry_run: bool = False) -> int:
         return 2
     terminal = sys.stdout
     settings = conf.read_or_repository("shutdown")
-    folder = settings.text("REBOOT_LOG_FOLDER")
-    if folder in ("", ".", "..") or Path(folder).name != folder:
-        raise ValueError("REBOOT_LOG_FOLDER must be one folder name")
+    directory = stop_resume.reboot_directory(settings)
     interval = settings.number("REBOOT_SPINNER_SECONDS")
     if not math.isfinite(interval) or interval <= 0:
         raise ValueError("REBOOT_SPINNER_SECONDS must be finite and greater than zero")
-    directory = Path(os.environ.get("XDG_STATE_HOME", str(Path.home() / ".local/state"))) / "agents" / folder
     directory.mkdir(parents=True, exist_ok=True)
     path = directory / f"{datetime.now():%Y%m%dT%H%M%S}-{uuid4().hex}.log"
     with path.open("x", encoding="utf-8") as stream:
@@ -402,17 +398,16 @@ def run(*, dry_run: bool = False) -> int:
                 latest.unlink(missing_ok=True)
             if dry_run:
                 return int(not show_plan(terminal, log))
-            with (directory / "lock").open("a") as lock:
-                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            with stop_resume.reboot_lock(directory, exclusive=True):
                 if herdr.shared_session() != herdr.SHARED_SESSION:
                     raise ValueError("The shared Herdr session must be named agents")
                 checkpoint = directory / "reboot.json"
                 if not checkpoint.exists():
                     Checkpoint().save(checkpoint)
                 failed, issues = run_steps(checkpoint, path, terminal, log, interval)
-        except BlockingIOError:
+        except stop_resume.RebootLockBusy:
             failed = True
-            issues.append(restart.FollowUp("agents reboot", "Another reboot holds the lock", RETRY, operator=True))
+            issues.append(restart.FollowUp("agents reboot", "A reboot or session start holds the lock", RETRY, operator=True))
         except (KeyboardInterrupt, *FAILURES) as error:
             failed = True
             reason = "The reboot was interrupted" if isinstance(error, KeyboardInterrupt) else str(error)

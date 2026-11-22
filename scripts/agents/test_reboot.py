@@ -1,6 +1,7 @@
 """Test agents reboot with private state and simulated lifecycle operations."""
 from __future__ import annotations
 
+import fcntl
 import io
 import os
 import shlex
@@ -9,12 +10,15 @@ import sys
 import tempfile
 import unittest
 from collections.abc import Generator
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from pathlib import Path
+from threading import Event
 from typing import cast, final, override
 from unittest.mock import patch
 
-from scripts.agents import reboot, restart, shutdown, shutdown_record
+from scripts.accounts import accounts
+from scripts.agents import producer_lifecycle, producer_transfer, reboot, restart, shutdown, shutdown_record, stop_resume
 from scripts.herdr import herdr
 from scripts.maintenance import herdr_upkeep
 from scripts.production import staff
@@ -227,6 +231,95 @@ else:
         self.assertEqual(self.invoke()[0], 1)
         self.assertEqual(self.events, ["check", "plan", "stop", "check", "server", "move", "start"])
         self.assertEqual(set(shutdown_record.read()), {"alpha", "beta"})
+
+    def test_server_retry_refuses_start_commands_between_the_check_and_stop(self) -> None:
+        self.directory = self.directory.with_name("custom-reboot")
+        _ = (self.root / "config" / "shutdown.conf").write_text(
+            "REBOOT_LOG_FOLDER=custom-reboot\n# range: 0.001..10\nREBOOT_SPINNER_SECONDS=0.1\n")
+        self.directory.mkdir(parents=True)
+        reboot.Checkpoint(reboot.Step.SERVER).save(self.directory / "reboot.json")
+        shutdown_record.save(["alpha"])
+        stop_server = reboot.stop_server
+        refusal = "A reboot is running; wait for it to end."
+
+        def server(log: reboot.RunLog) -> None:
+            self.assertEqual(self.events, ["check"])
+            commands = (["resume", "alpha"], ["resume", "--production", "alpha"],
+                        ["resume", "alpha", "--retired"], ["resume", "alpha", "--resend-opening-prompt"],
+                        ["restart"], ["restart", "--all"], ["restart", "--only", "alpha"],
+                        ["add-producer", "alpha"], ["transfer", "alpha"], ["move", "alpha", "claude2"])
+            for arguments in commands:
+                with (self.subTest(arguments=arguments), redirect_stdout(io.StringIO()) as output,
+                      redirect_stderr(io.StringIO()) as errors):
+                    self.assertEqual(shutdown.main(arguments), 1)
+                    self.assertEqual(output.getvalue(), "")
+                    self.assertEqual(errors.getvalue().splitlines(), [refusal])
+            self.assertEqual(stop_resume.resume("alpha"), stop_resume.ResumeFailed("alpha", refusal))
+            stop_server(log)
+
+        with (patch.object(reboot, "stop_server", side_effect=server),
+              patch.object(shutdown, "_lifecycle", side_effect=AssertionError("Resume passed the lock")),
+              patch.object(shutdown, "recover_named_unit", side_effect=AssertionError("Recovery passed the lock")),
+              patch.object(stop_resume, "_resume", side_effect=AssertionError("Resume passed the lock")),
+              patch.object(stop_resume, "resend_producer_opening", side_effect=AssertionError("Resend passed the lock")),
+              patch.object(producer_transfer, "transfer", side_effect=AssertionError("Transfer passed the lock")),
+              patch.object(producer_lifecycle, "add", side_effect=AssertionError("Add passed the lock")),
+              patch.object(accounts, "main", side_effect=AssertionError("Move passed the lock"))):
+            self.assertEqual(self.invoke()[0], 0)
+        self.assertEqual(self.events, ["check", "server", "move", "start"])
+        self.assertEqual(shutdown_record.read(), [])
+
+        def resume(_options: shutdown.CommandLine) -> int:
+            with (self.directory / "lock").open("a") as lock, self.assertRaises(BlockingIOError):
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return 0
+
+        with patch.object(shutdown, "_lifecycle", side_effect=resume) as start:
+            self.assertEqual(shutdown.main(["resume", "alpha"]), 0)
+        start.assert_called_once()
+
+    def test_concurrent_workers_use_the_report_count_and_total(self) -> None:
+        terminal = io.StringIO()
+        display = reboot.StepDisplay(reboot.Step.START, terminal, reboot.RunLog(io.StringIO()))
+        reporting_first = Event()
+        second_ready = Event()
+
+        def member(name: str, count: int, total: int) -> None:
+            if name == "alpha / first":
+                reporting_first.set()
+                self.assertTrue(second_ready.wait(5))
+            display.member(name, count, total)
+
+        alpha, beta = (staff.StaffRow(staff.StaffId(name), "unit", name, staff.StaffRoot(),
+                                    current_session=staff.StaffId(f"{name}-native"))
+                       for name in ("alpha", "beta"))
+        first = staff.StaffRow(staff.StaffId("first"), "worker", "first", staff.ReportsTo(alpha.id),
+                               current_session=staff.StaffId("first-native"))
+        second = staff.StaffRow(staff.StaffId("second"), "worker", "second", staff.ReportsTo(beta.id),
+                                current_session=staff.StaffId("second-native"))
+        record = staff.StaffSnapshot((alpha, beta, first, second))
+        report = restart.BulkReport(self.root / "fixture.log", "agents restart", "agents reboot",
+                                    reboot=True, on_finish=member)
+        for owner in (alpha, beta):
+            report.track(owner, record)
+        for owner in (alpha, beta):
+            report.finish(owner.id)
+        first_workers = restart.RestoredWorkers(report, record)
+        second_workers = restart.RestoredWorkers(report, record)
+
+        def restore_second() -> None:
+            self.assertTrue(reporting_first.wait(5))
+            second_ready.set()
+            second_workers.add(second.id)
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            first_job = pool.submit(first_workers.add, first.id)
+            second_job = pool.submit(restore_second)
+            first_job.result(timeout=5)
+            second_job.result(timeout=5)
+        self.assertEqual([line.split("  ")[2] for line in terminal.getvalue().splitlines()], [
+            "1 of 2 back - alpha", "2 of 2 back - beta",
+            "3 of 3 back - alpha / first", "4 of 4 back - beta / second"])
 
     def test_interrupted_server_stop_names_the_saved_sessions(self) -> None:
         self.interrupt_server = True
