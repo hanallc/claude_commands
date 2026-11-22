@@ -14,6 +14,7 @@ import math
 from pathlib import Path
 import os
 import re
+import select
 import shlex
 import shutil
 import signal
@@ -49,6 +50,7 @@ GUEST_END_PENDING_STATUS = 76
 GUEST_END_PENDING_MESSAGE = 'Mac Linux guest run not proven ended; the Mac claim stays held'
 RUN_LOCK_PATH = '.git/mac-linux-run.lock'
 RUN_LOCK_FD = 9
+ARM_RECORD_PREFIX = 'mac-linux-armed'
 CANCEL_RECORD_PREFIX = 'mac-linux-cancel'
 
 
@@ -197,6 +199,13 @@ if [ -L "$checkout" ] || [ -L "$checkout/.git" ]; then
 fi'''
 
 
+def guest_checkout_shell(settings: GuestSettings) -> str:
+    return guest_shell(settings) + '''
+umask 077
+mkdir -p -- "$checkout/.git"
+cd "$checkout"'''
+
+
 @dataclass(frozen=True)
 class EmptyGuestMain:
     """The guest does not have a main commit."""
@@ -226,16 +235,85 @@ fi'''
     return GuestMain(commit)
 
 
+@dataclass(frozen=True)
+class ArmedGuestAttempt:
+    """Keep the guest deadline and the caller's receipt time."""
+
+    attempt: str
+    boot_id: str
+    deadline_ns: int
+    acknowledged_at: float
+
+
+ARM_ATTEMPT = '''\
+import os
+import sys
+import time
+
+prefix, attempt, window = sys.argv[1:]
+if not attempt or any(character not in '0123456789abcdefghijklmnopqrstuvwxyz-' for character in attempt):
+    sys.exit('The guest attempt ID is invalid.')
+with open('/proc/sys/kernel/random/boot_id', encoding='ascii') as identity:
+    boot = identity.read().strip()
+git = os.open('.git', os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+deadline = time.clock_gettime_ns(time.CLOCK_BOOTTIME) + int(window) * 10**9
+record = f'{prefix}.{boot}.{deadline}.{attempt}'
+flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+os.close(os.open(record, flags, 0o600, dir_fd=git))
+os.close(git)
+print(f'armed {boot} {deadline}', flush=True)
+'''
+
+
+def stop_ssh_process(process: subprocess.Popen[bytes]) -> None:
+    while True:
+        try:
+            with suppress(ProcessLookupError):
+                os.killpg(process.pid, signal.SIGKILL)
+            _ = process.wait()
+            return
+        except KeyboardInterrupt:
+            continue
+
+
+def arm_guest(settings: GuestSettings, attempt: str) -> ArmedGuestAttempt:
+    arm = shlex.join(('python3', '-I', '-S', '-c', ARM_ATTEMPT, ARM_RECORD_PREFIX, attempt,
+                      str(SSH_CONNECT_TIMEOUT_SECONDS)))
+    command = settings.command(guest_checkout_shell(settings) + f'\nexec {arm}')
+    with subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                          stderr=subprocess.PIPE, start_new_session=True) as process:
+        try:
+            assert process.stdout is not None
+            expires = time.monotonic() + GUEST_REF_TIMEOUT_SECONDS
+            line = b''
+            while b'\n' not in line and len(line) < 128:
+                if not select.select([process.stdout], [], [], max(0, expires - time.monotonic()))[0]:
+                    raise subprocess.TimeoutExpired(command, GUEST_REF_TIMEOUT_SECONDS)
+                chunk = os.read(process.stdout.fileno(), 128)
+                if not chunk:
+                    break
+                line += chunk
+            acknowledged_at = time.monotonic()
+            trailing, errors = process.communicate(timeout=max(0, expires - acknowledged_at))
+        except BaseException:
+            stop_ssh_process(process)
+            raise
+    if process.returncode:
+        diagnostic = errors.decode(errors='replace').strip() or 'no diagnostic'
+        raise GuestUnavailable(f'guest arm exited {process.returncode}: {diagnostic}')
+    reply = re.fullmatch(rb'armed ([0-9a-f-]{36}) ([0-9]{1,20})\n', line + trailing)
+    if reply is None:
+        raise GuestUnavailable('the guest did not acknowledge the armed deadline')
+    return ArmedGuestAttempt(attempt, reply[1].decode('ascii'), int(reply[2]), acknowledged_at)
+
+
 OPEN_RUN_LOCK = '''\
 import os
 import stat
 import sys
 
-path, number, shell, mode = sys.argv[1:]
+path, number, shell = sys.argv[1:]
 try:
-    if mode == 'run':
-        with open(f'/proc/{os.getsid(0)}/stat', encoding='utf-8') as session:
-            start_ticks = session.read().rsplit(')', 1)[1].split()[19]
     if os.path.islink(path):
         raise OSError('The guest run lock must not be a symlink.')
     directory, name = os.path.split(path)
@@ -255,66 +333,87 @@ if lock == descriptor:
 else:
     os.dup2(lock, descriptor)
     os.close(lock)
-command = ['bash', '-c', shell]
-if mode == 'run':
-    command = ['setsid', '--wait', *command, 'mac-linux-run', start_ticks]
-os.execvp(command[0], command)
+os.execvp('bash', ['bash', '-c', shell])
 '''
 
 
-def open_run_lock_command(descriptor: int, shell: str, mode: Literal['run', 'cleanup']) -> str:
-    return shlex.join(('python3', '-I', '-S', '-c', OPEN_RUN_LOCK, RUN_LOCK_PATH, str(descriptor), shell, mode))
+def open_run_lock_command(descriptor: int, shell: str) -> str:
+    return shlex.join(('python3', '-I', '-S', '-c', OPEN_RUN_LOCK, RUN_LOCK_PATH, str(descriptor), shell))
 
 
-GUEST_CANCEL_RECORDS = '''\
+GUEST_ATTEMPT_RECORDS = '''\
+import fcntl
 import os
+import stat
 import sys
 import time
 
-mode, prefix, attempt, window, lock_name, descriptor, *arguments = sys.argv[1:]
-if not attempt or any(character not in '0123456789abcdefghijklmnopqrstuvwxyz-' for character in attempt):
-    sys.exit('The guest attempt ID is invalid.')
-window_ns = int(window) * 10**9
+mode, arm_prefix, cancel_prefix, attempt, boot, deadline, lock_name, descriptor, *arguments = sys.argv[1:]
 with open('/proc/sys/kernel/random/boot_id', encoding='ascii') as identity:
     boot_id = identity.read().strip()
 git = os.open('.git', os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+arm = f'{arm_prefix}.{boot}.{deadline}.{attempt}'
+cancel = f'{cancel_prefix}.{boot}.{deadline}.{attempt}'
 lock = int(descriptor)
 path_stat = os.stat(lock_name, dir_fd=git, follow_symlinks=False)
 if not os.path.samestat(os.fstat(lock), path_stat):
     sys.exit('The guest run lock path changed.')
 if mode == 'cancel':
-    now = time.clock_gettime_ns(time.CLOCK_BOOTTIME)
-    record = f'{prefix}.{boot_id}.{now}.{attempt}'
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
-    os.close(os.open(record, flags, 0o600, dir_fd=git))
-    # An older session cannot start after the launch window.
+    try:
+        os.close(os.open(cancel, flags, 0o600, dir_fd=git))
+    except FileExistsError:
+        if not stat.S_ISREG(os.stat(cancel, dir_fd=git, follow_symlinks=False).st_mode):
+            sys.exit('The guest cancel record must be a regular file.')
+    now = time.clock_gettime_ns(time.CLOCK_BOOTTIME)
     for name in os.listdir(git):
         fields = name.split('.')
-        if len(fields) == 4 and fields[0] == prefix and fields[2].isdecimal() and name != record:
-            _, boot, written, owner = fields
-            if boot != boot_id or now - int(written) >= window_ns or owner == attempt:
+        if len(fields) == 4 and fields[0] in (arm_prefix, cancel_prefix) and fields[2].isdecimal() and name != cancel:
+            _, record_boot, record_deadline, _ = fields
+            if record_boot != boot_id or now >= int(record_deadline):
                 os.unlink(name, dir_fd=git)
     sys.exit(0)
 
-start_ticks, group, shell = arguments
-if any(name.startswith(f'{prefix}.{boot_id}.') and name.endswith(f'.{attempt}') for name in os.listdir(git)):
+if boot_id != boot or time.clock_gettime_ns(time.CLOCK_BOOTTIME) >= int(deadline):
+    sys.exit('The guest armed deadline passed.')
+try:
+    if not stat.S_ISREG(os.stat(arm, dir_fd=git, follow_symlinks=False).st_mode):
+        sys.exit('The guest armed record must be a regular file.')
+except FileNotFoundError:
+    sys.exit('The guest attempt has no armed record.')
+try:
+    os.stat(cancel, dir_fd=git, follow_symlinks=False)
+except FileNotFoundError:
+    pass
+else:
     sys.exit('The guest attempt was cancelled.')
-started = int(start_ticks) * 10**9 // os.sysconf('SC_CLK_TCK')
-if time.clock_gettime_ns(time.CLOCK_BOOTTIME) - started >= window_ns:
-    sys.exit('The guest SSH session exceeded the launch window.')
+if mode == 'lock':
+    if time.clock_gettime_ns(time.CLOCK_BOOTTIME) >= int(deadline):
+        sys.exit('The guest armed deadline passed.')
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        sys.exit('The guest run lock is held.')
+    if time.clock_gettime_ns(time.CLOCK_BOOTTIME) >= int(deadline):
+        fcntl.flock(lock, fcntl.LOCK_UN)
+        sys.exit('The guest armed deadline passed.')
+    sys.exit(0)
 os.close(git)
+group, shell = arguments
 os.ftruncate(lock, 0)
 os.write(lock, f'{group} {attempt}\\n'.encode('ascii'))
+if time.clock_gettime_ns(time.CLOCK_BOOTTIME) >= int(deadline):
+    sys.exit('The guest armed deadline passed.')
 os.execvp('bash', ['bash', '-c', shell])
 '''
 
 
-def guest_attempt_command(mode: Literal['start', 'cancel'], attempt: str, descriptor: int) -> str:
-    return shlex.join(('python3', '-I', '-S', '-c', GUEST_CANCEL_RECORDS, mode, CANCEL_RECORD_PREFIX, attempt,
-                       str(SSH_CONNECT_TIMEOUT_SECONDS), Path(RUN_LOCK_PATH).name, str(descriptor)))
+def guest_attempt_command(mode: Literal['lock', 'start', 'cancel'], armed: ArmedGuestAttempt, descriptor: int) -> str:
+    return shlex.join(('python3', '-I', '-S', '-c', GUEST_ATTEMPT_RECORDS, mode, ARM_RECORD_PREFIX, CANCEL_RECORD_PREFIX,
+                       armed.attempt, armed.boot_id, str(armed.deadline_ns), Path(RUN_LOCK_PATH).name, str(descriptor)))
 
 
-def run_shell(settings: GuestSettings, source: CandidateSource, bootstrap_bytes: int, attempt: str) -> str:
+def run_shell(settings: GuestSettings, source: CandidateSource, bootstrap_bytes: int, armed: ArmedGuestAttempt) -> str:
     object_format = 'sha256' if len(source.commit) == 64 else 'sha1'
     checkout = f'''set -euo pipefail
 if [ ! -f .git/mac-linux-owned ]; then
@@ -365,19 +464,16 @@ printf 'update refs/heads/main %s\\nupdate {ORIGIN_MAIN} %s\\n' "$origin_main" "
 git reset --hard -q "$origin_main"
 umask 022
 ./scripts/lib/py "$bootstrap/runner.py" "$bootstrap/request.json"'''
-    start = guest_attempt_command('start', attempt, RUN_LOCK_FD)
+    lock = guest_attempt_command('lock', armed, RUN_LOCK_FD)
+    start = guest_attempt_command('start', armed, RUN_LOCK_FD)
     locked_run = f'''set -euo pipefail
-flock -x -n {RUN_LOCK_FD} || {{ printf 'The guest run lock is held.\\n' >&2; exit 1; }}
-exec timeout --signal=KILL {settings.run_time_limit_seconds} {start} "$1" "$BASHPID" {shlex.quote(checkout)}'''
-    return guest_shell(settings) + f'''
-umask 077
-mkdir -p -- "$checkout/.git"
-cd "$checkout"
-exec {open_run_lock_command(RUN_LOCK_FD, locked_run, 'run')}'''
+{lock}
+exec timeout --signal=KILL {settings.run_time_limit_seconds} {start} "$BASHPID" {shlex.quote(checkout)}'''
+    return guest_checkout_shell(settings) + f'\nexec setsid --wait {open_run_lock_command(RUN_LOCK_FD, locked_run)}'
 
 
-def cleanup_shell(settings: GuestSettings, attempt: str) -> str:
-    cancel = guest_attempt_command('cancel', attempt, 8)
+def cleanup_shell(settings: GuestSettings, armed: ArmedGuestAttempt) -> str:
+    cancel = guest_attempt_command('cancel', armed, 8)
     cleanup = f'''set -euo pipefail
 lock="/proc/$$/fd/8"
 prove_end() {{
@@ -390,7 +486,7 @@ prove_end() {{
 }}
 prove_end || :
 read -r group owner < "$lock" || :
-if [[ "$owner" == {shlex.quote(attempt)} ]]; then
+if [[ "$owner" == {shlex.quote(armed.attempt)} ]]; then
     if [[ "$group" =~ ^[1-9][0-9]{{0,9}}$ ]] && (( group > 1 && group <= 2147483647 )); then
         if [[ /proc/$group/fd/{RUN_LOCK_FD} -ef "$lock" ]]; then
             kill -KILL -- "-$group" 2>/dev/null || :
@@ -405,11 +501,7 @@ done
 prove_end || :
 printf 'The guest run lock is still held.\\n' >&2
 exit {GUEST_END_PENDING_STATUS}'''
-    return guest_shell(settings) + f'''
-umask 077
-mkdir -p -- "$checkout/.git"
-cd "$checkout"
-exec {open_run_lock_command(8, cleanup, 'cleanup')}'''
+    return guest_checkout_shell(settings) + f'\nexec {open_run_lock_command(8, cleanup)}'
 
 
 class GuestEndStatus(StrEnum):
@@ -424,9 +516,9 @@ class GuestEndProof:
     detail: str = ''
 
 
-def prove_guest_end(settings: GuestSettings, attempt: str) -> GuestEndProof:
+def prove_guest_end(settings: GuestSettings, armed: ArmedGuestAttempt) -> GuestEndProof:
     try:
-        reply = subprocess.run(settings.command(cleanup_shell(settings, attempt)), stdin=subprocess.DEVNULL,
+        reply = subprocess.run(settings.command(cleanup_shell(settings, armed)), stdin=subprocess.DEVNULL,
                                capture_output=True, text=True, errors='replace',
                                timeout=GUEST_CLEANUP_TIMEOUT_SECONDS, check=False)
     except (OSError, subprocess.TimeoutExpired) as error:
@@ -439,13 +531,13 @@ def prove_guest_end(settings: GuestSettings, attempt: str) -> GuestEndProof:
     return GuestEndProof(status, reason)
 
 
-def finish_guest_run(settings: GuestSettings, attempt: str, ssh_ended_at: float) -> GuestEndProof:
-    bound = ssh_ended_at + SSH_CONNECT_TIMEOUT_SECONDS + settings.run_time_limit_seconds + GUEST_KILL_GRACE_SECONDS
+def finish_guest_run(settings: GuestSettings, armed: ArmedGuestAttempt) -> GuestEndProof:
+    bound = armed.acknowledged_at + SSH_CONNECT_TIMEOUT_SECONDS + settings.run_time_limit_seconds + GUEST_KILL_GRACE_SECONDS
     first_failure = ''
     interruption: KeyboardInterrupt | None = None
     while True:
         try:
-            proof = prove_guest_end(settings, attempt)
+            proof = prove_guest_end(settings, armed)
             if proof.status is GuestEndStatus.ENDED:
                 detail = 'Guest cleanup: ended' + (f' after {first_failure}' if first_failure else '')
                 break
@@ -564,8 +656,9 @@ def run_remote(repo: Path, settings: GuestSettings, source: CandidateSource, req
         base, header = '', ''
         form, reason = BundleForm.FIRST, bundle.reason
     timeout = settings.transfer_timeout_seconds
-    transport = uuid4().hex
-    command = settings.command(run_shell(settings, source, len(bootstrap), transport))
+    # Only a confirmed arm can authorize a separate run command.
+    armed = arm_guest(settings, uuid4().hex)
+    command = settings.command(run_shell(settings, source, len(bootstrap), armed))
     stream_error: BaseException | None = None
     try:
         with subprocess.Popen(['bash', '-o', 'pipefail', '-c', STREAM_SOURCE, TARGET, prefix, base, header,
@@ -574,21 +667,13 @@ def run_remote(repo: Path, settings: GuestSettings, source: CandidateSource, req
             try:
                 output, errors = stream.communicate(bootstrap, timeout=timeout)
             except BaseException:
-                while True:
-                    try:
-                        with suppress(ProcessLookupError):
-                            os.killpg(stream.pid, signal.SIGKILL)
-                        _ = stream.wait()
-                        break
-                    except KeyboardInterrupt:
-                        continue
+                stop_ssh_process(stream)
                 raise
     except BaseException as error:
         stream_error = error
         raise
     finally:
-        # The source stream shell waits for SSH before it exits.
-        proof = finish_guest_run(settings, transport, time.monotonic())
+        proof = finish_guest_run(settings, armed)
         if isinstance(stream_error, subprocess.TimeoutExpired):
             raise GuestUnavailable(f'SSH or guest run exceeded {timeout} seconds. {proof.detail}') from stream_error
         if stream_error is not None:
