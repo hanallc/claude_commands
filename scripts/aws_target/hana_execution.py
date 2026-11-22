@@ -17,7 +17,7 @@ from scripts.aws_target.hana_result import HanaAttemptKey, LogicalStepLink
 from scripts.aws_target.ledger import CostLedger
 from scripts.aws_target.remote import read_record
 from scripts.build_queue import admission_protocol as wire, execution_identity, placement
-from scripts.lib.atomic_file import write_text_atomic
+from scripts.lib import atomic_file
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping
@@ -151,8 +151,8 @@ def _read_journal(directory: Path, execution: str) -> dict[str, object]:
 
 
 def _save_journal(directory: Path, execution: str, row: dict[str, object]) -> None:
-    write_text_atomic(execution_path(directory, execution), json.dumps(row, sort_keys=True, allow_nan=False) + '\n',
-                      new_file_mode=0o600)
+    atomic_file.write_text_atomic(execution_path(directory, execution),
+                                  json.dumps(row, sort_keys=True, allow_nan=False) + '\n', new_file_mode=0o600)
 
 
 def _journal_lock(directory: Path, execution: str):
