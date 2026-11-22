@@ -54,7 +54,7 @@ from scripts.lint import memory_admit as gate
 from scripts.build_hold import override_guard
 from scripts.production import staff
 
-from scripts.buildlog import store
+from scripts.buildlog import repository, store
 from scripts.lib import test_phase
 from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, GateJobNotRecorded, StepJob
 from scripts.lib.build_steps import gate_job_from_process
@@ -489,12 +489,26 @@ def reservation_row(record: ReservationRecord) -> records.Reservation:
     return row
 
 
+@cache
+def gate_worktree_repository_name(worktree: str) -> str | records.UnknownRepository:
+    """Read the Git repository name for this gate worktree."""
+    try:
+        key = repository.repository_key(worktree)
+        if key == store.UNKNOWN_IDENTITY or key.startswith(repository.MANIFEST_IDENTITY_PREFIX):
+            return records.UnknownRepository()
+        if key.startswith("git-root:"):
+            return repository.repo_name(worktree) or records.UnknownRepository()
+        return key.rsplit("/", 1)[-1] or records.UnknownRepository()
+    except (OSError, ValueError):
+        return records.UnknownRepository()
+
+
 def gate_repository_name(step: str, repository_name: str, worktree: str) -> str:
     """Resolve the Git repository for a gate with a legacy program profile."""
     if step in records.REPOSITORY_RUN_STEPS and Path(repository_name).is_absolute() and Path(worktree).is_absolute():
-        repository, _ = step_estimator.git_identity([step], worktree)
-        if isinstance(repository, records.RepositoryIdentity):
-            return repository.name
+        name = gate_worktree_repository_name(worktree)
+        if isinstance(name, str):
+            return name
     return repository_name
 
 
