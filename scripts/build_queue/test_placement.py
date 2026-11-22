@@ -109,6 +109,25 @@ def local_candidate(fixture: AdmissionFixture) -> placement.PlacementCandidate:
         "local", "natedev", fixture.server.host, WholeMacScope()))
 
 
+def mac_linux_fixture(fixture: AdmissionFixture, *, enabled: str = "on", registered: bool = True) -> Path:
+    names = "mac-linux,natedev" if registered else "natedev"
+    _ = (fixture.root / "build_targets.conf").write_text(
+        f"targets={names}\nkind.natedev=local\nplatform.natedev=linux\n"
+        + "kind.mac-linux=ssh\nplatform.mac-linux=linux\nsettings.mac-linux=mac_linux.conf\n"
+        + f"enabled.mac-linux={enabled}\n")
+    _ = (fixture.root / "mac_linux.conf").write_text(
+        "ssh.hops=fixture-mac fixture-guest\nguest.user=fixture\ntest.jobs=8\n"
+        + "run.time_limit_seconds=7200\nrun.unreachable_wait_seconds=600\n")
+    backoff = fixture.root / "target-state" / "mac-linux" / "unreachable_until"
+    backoff.parent.mkdir(parents=True, exist_ok=True)
+    return backoff
+
+
+def mac_linux_candidate() -> placement.PlacementCandidate:
+    return placement.PlacementCandidate(placement.PlacementDestination(
+        "ssh", "mac-linux", "fixture-guest", RepositoryScope("claude", slot=1), 1))
+
+
 def publish_candidate(fixture: PlacementFixture, request: wire.PlacementRequest,
                       eligibility: placement.HostEligibility = ALLOWED_HOST,
                       claims: tuple[placement.AdoptedProviderClaim, ...] = ()) -> placement.FreshHostEvidence:
@@ -546,6 +565,143 @@ class CargoFolderTests(unittest.TestCase):
 
 
 class PlacementTests(unittest.TestCase):
+    def test_gate_constraints_name_the_guest_and_natedev(self) -> None:
+        from scripts.build_targets import build_targets
+        from scripts.lib import build_folders
+
+        with PlacementFixture() as fixture:
+            _ = mac_linux_fixture(fixture, enabled="off")
+            with (mock.patch.object(eligibility, "repository_identity", return_value=eligibility.KnownRepository("claude")),
+                  mock.patch.object(build_folders, "repo_word", return_value="claude"),
+                  mock.patch.dict(os.environ, {"BUILD_TARGETS_STATE_DIR": str(fixture.root / "target-state")})):
+                constraints = build_targets.fixed_placement_constraints(fixture.root, "", "lint",
+                    ("scripts/production/gate.py", "--affected"), SUBMITTING_SESSION, "source-a")
+            self.assertEqual(constraints.candidates, (mac_linux_candidate(), local_candidate(fixture)))
+
+    def test_mac_linux_candidate_checks_switch_backoff_and_the_latest_good_reading(self) -> None:
+        cases = (("off", "mac_linux_off"), ("unregistered", "mac_linux_unregistered"),
+                 ("unreadable", "mac_linux_backoff_unreadable"), ("active", "mac_linux_backoff"),
+                 ("stale", "mac_linux_reading_required"), ("fresh", ""))
+        for case, reason in cases:
+            with self.subTest(case=case), PlacementFixture() as fixture:
+                backoff = mac_linux_fixture(fixture, enabled="off" if case == "off" else "on",
+                                            registered=case != "unregistered")
+                now = fixture.clock.now()
+                if case in ("unreadable", "active", "stale", "fresh"):
+                    deadline = now + 5 if case == "active" else now - 1
+                    _ = backoff.write_text("invalid" if case == "unreadable" else str(deadline))
+                    failed_at = now if case == "stale" else now - 2
+                    os.utime(backoff, (failed_at, failed_at))
+                guest = mac_linux_candidate()
+                request = placement_request(fixture)
+                request = replace(request, constraints=replace(request.constraints, candidates=(guest, local_candidate(fixture))))
+                with mock.patch.dict(os.environ, {"BUILD_TARGETS_STATE_DIR": str(backoff.parents[1])}):
+                    _ = publish_candidate(fixture, request)
+                    reply, = fixture.server.handle_request(request)
+                if not reason:
+                    assert isinstance(reply, wire.Assignment), reply
+                    self.assertEqual(reply.assignment.destination, guest.destination)
+                    continue
+                assert isinstance(reply, wire.LocalPlacementGranted), reply
+                self.assertEqual(reply.assignment.destination, local_candidate(fixture).destination)
+                self.assertEqual(fixture.server.placement_eligibility[request.episode][0],
+                                 placement.CandidateEligibility(guest.destination, placement.TemporaryExclusion(reason)))
+                if case == "off":
+                    _ = fixture.run_pass()
+                    view, = fixture.server.handle_request(wire.ViewRequest())
+                    assert isinstance(view, wire.ViewReply)
+                    running, = (row for row in view.reading.view.running if row.pid == request.owner.pid)
+                    self.assertEqual(running.placement_candidates, (
+                        placement.CandidateEligibility(guest.destination, placement.TemporaryExclusion("the guest is off")),
+                        placement.CandidateEligibility(local_candidate(fixture).destination, ALLOWED_HOST)))
+
+    def test_a_guest_reading_after_backoff_can_restore_a_waiting_guest(self) -> None:
+        with PlacementFixture() as fixture:
+            backoff = mac_linux_fixture(fixture)
+            guest = mac_linux_candidate()
+            request = placement_request(fixture)
+            request = replace(request, constraints=replace(request.constraints, candidates=(guest,)))
+            now = fixture.clock.now()
+            _ = backoff.write_text(str(now + 1))
+            os.utime(backoff, (now, now))
+            with mock.patch.dict(os.environ, {"BUILD_TARGETS_STATE_DIR": str(backoff.parents[1])}):
+                _ = publish_candidate(fixture, request)
+                first, = fixture.server.handle_request(request)
+                assert isinstance(first, wire.PlacementWait), first
+                self.assertEqual(first.eligibility[0].eligibility, placement.TemporaryExclusion("mac_linux_backoff"))
+                recorded = (placement.CandidateEligibility(
+                    guest.destination, placement.TemporaryExclusion("the guest is in retry backoff")),)
+                snapshot = queue_snapshot.read_queue_snapshot(fixture.state_dir)
+                assert isinstance(snapshot, queue_snapshot.QueueSnapshot)
+                self.assertEqual(tuple(snapshot.inputs.placement_candidates.values()), (recorded,))
+                reply, = fixture.server.handle_request(wire.ViewRequest())
+                assert isinstance(reply, wire.ViewReply)
+                decoded = wire.parse_reply(wire.encode_reply(reply))
+                assert isinstance(decoded, wire.ViewReply)
+                row, = decoded.reading.view.waiting
+                self.assertEqual((row.pid, row.since, row.placement_candidates),
+                                 (request.owner.pid, request.since, recorded))
+                fixture.clock.advance(2)
+                waiting, = fixture.server.handle_request(request)
+                assert isinstance(waiting, wire.PlacementWait), waiting
+                self.assertEqual(waiting.eligibility[0].eligibility,
+                                 placement.TemporaryExclusion("mac_linux_reading_required"))
+                _ = publish_candidate(fixture, request)
+                assignment = assignment_for(fixture, request)
+                claim = adopt_assignment(fixture, request, assignment)
+                execution = execution_identity.ObservedExecution(execution_identity.ProcessExecution(
+                    guest.destination.host, "host-generation-a", 700001, "guest-start"))
+                _ = fixture.server.handle_request(wire.ExecutionReport("guest-before-launch", assignment, claim, execution,
+                    placement.PrelaunchRefused("fixture")))
+                granted, = fixture.server.handle_request(consume_permission("guest-launch", assignment, claim))
+                self.assertEqual(granted, wire.FirstAuthorization(assignment, claim))
+                wrong = replace(assignment, attempt="another-attempt")
+                _ = fixture.server.handle_request(wire.ExecutionReport("stale-guest-running", wrong, claim, execution))
+                reply, = fixture.server.handle_request(wire.ViewRequest())
+                assert isinstance(reply, wire.ViewReply)
+                pending, = (row for row in reply.reading.view.running if row.assignment_target == "mac-linux")
+                self.assertEqual((pending.confirmed_guest_run, pending.mac_placement), (None, ""))
+
+                _ = fixture.server.handle_request(wire.ExecutionReport("guest-running", assignment, claim, execution))
+                reply, = fixture.server.handle_request(wire.ViewRequest())
+                assert isinstance(reply, wire.ViewReply)
+                decoded = wire.parse_reply(wire.encode_reply(reply))
+                assert isinstance(decoded, wire.ViewReply)
+                running, = (row for row in decoded.reading.view.running if row.assignment_target == "mac-linux")
+                self.assertEqual((running.pid, running.execution, running.placement_candidates),
+                                 (700001, execution, (placement.CandidateEligibility(guest.destination, ALLOWED_HOST),)))
+                self.assertEqual(running.confirmed_guest_run, {"target": "mac-linux", "attempt": assignment.attempt})
+                self.assertEqual(running.mac_placement, f"{assignment.episode}/{assignment.attempt}")
+            self.assertEqual((assignment.destination, assignment.since), (guest.destination, request.since))
+
+    def test_a_native_mac_assignment_keeps_every_named_target_and_exclusion(self) -> None:
+        with PlacementFixture() as fixture:
+            backoff = mac_linux_fixture(fixture, enabled="off")
+            registry = fixture.root / "build_targets.conf"
+            _ = registry.write_text(registry.read_text().replace("targets=", "targets=mac,", 1)
+                                    + "kind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n")
+            request = placement_request(fixture)
+            native, = request.constraints.candidates
+            guest = mac_linux_candidate()
+            local = replace(local_candidate(fixture), eligibility=placement.FixedExclusion("command"))
+            request = replace(request, constraints=replace(request.constraints, candidates=(guest, native, local)))
+            with mock.patch.dict(os.environ, {"BUILD_TARGETS_STATE_DIR": str(backoff.parents[1])}):
+                _ = publish_candidate(fixture, replace(request, constraints=replace(request.constraints, candidates=(native,))))
+                assignment = assignment_for(fixture, request)
+                self.assertEqual(assignment.destination, native.destination)
+                reply, = fixture.server.handle_request(wire.ViewRequest())
+                assert isinstance(reply, wire.ViewReply)
+                decoded = wire.parse_reply(wire.encode_reply(reply))
+                assert isinstance(decoded, wire.ViewReply)
+            running, = (row for row in decoded.reading.view.running if row.assignment_host == native.destination.host)
+            self.assertEqual(running.placement_candidates, (
+                placement.CandidateEligibility(guest.destination, placement.TemporaryExclusion("the guest is off")),
+                placement.CandidateEligibility(native.destination, ALLOWED_HOST),
+                placement.CandidateEligibility(local.destination,
+                    placement.FixedExclusion("the target does not support this command"))))
+            self.assertIsNone(running.confirmed_guest_run)
+            self.assertEqual(running.mac_placement, f"{assignment.episode}/{assignment.attempt}")
+
     def test_blocked_provider_claim_and_cleanup_keep_local_socket_requests_responsive(self) -> None:
         for operation in ("claim", "cleanup"):
             with self.subTest(operation=operation), PlacementFixture() as fixture:
