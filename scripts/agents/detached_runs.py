@@ -1428,7 +1428,8 @@ class WorkerResultInput(Enum):
 
 
 def deliver(record: RunRecord, result: CommandResult, *,
-            worker_input: WorkerResultInput = WorkerResultInput.TYPE) -> str:
+            worker_input: WorkerResultInput = WorkerResultInput.TYPE,
+            on_submission: Callable[[], object] = lambda: None) -> str:
     """Deliver the command result to its current worker or director."""
     runs = _runs_dir(record["session_dir"])
     path = runs / f"{record['run_id']}.json"
@@ -1444,6 +1445,7 @@ def deliver(record: RunRecord, result: CommandResult, *,
             text = f"Run finished: {record['label']}\nResult: PASS (exit 0)\n(done message {done_file} unreadable: {exc})"
     else:
         text = result_text(record, result)
+    from scripts.agents import shutdown_record
     from scripts.message import send
 
     marker = f"Detached run: {record['run_id']}"
@@ -1530,9 +1532,10 @@ def deliver(record: RunRecord, result: CommandResult, *,
         def before_input() -> None:
             check_pass()
             _ = _save_delivery(path, pane_checkpoint)
+            _ = on_submission()
 
         receipt = send.WorkerResultReceipt(marker, wait_for_idle=worker_input == WorkerResultInput.TURN_ENDED,
-            worker_only=self_stop, before_input=before_input)
+            worker_only=self_stop or str(worker.id) in shutdown_record.read(), before_input=before_input)
         try:
             check_pass()
             if unconfirmed:
@@ -1577,19 +1580,28 @@ class WorkerResultReplay(Enum):
 
 
 def submit_finished_worker_result(run: Path, worker: staff.StaffRow, *,
-                                  worker_input: WorkerResultInput) -> WorkerResultReplay:
+                                  worker_input: WorkerResultInput,
+                                  on_submission: Callable[[], object] = lambda: None) -> WorkerResultReplay:
     """Submit one waiting result. The next turn can receive the next result."""
-    runs = run / DETACHED_RUNS_DIR
-    for record in _registered_runs(runs, worker.id):
-        if (record["status"] != "finished" or record.get("staff_id") != worker.id
-                or not _worker_result_pending(record.get("delivery", ""))):
-            continue
-        delivery = deliver(record, command_result(record), worker_input=worker_input)
+    for record in _pending_worker_results(run, worker):
+        delivery = deliver(record, command_result(record), worker_input=worker_input, on_submission=on_submission)
         if _worker_result_pending(delivery):
             return WorkerResultReplay.RETRY
         if delivery.startswith(f"sent: worker {worker.name} at "):
             return WorkerResultReplay.SUBMITTED
     return WorkerResultReplay.NONE
+
+
+def _pending_worker_results(run: Path, worker: staff.StaffRow) -> Generator[RunRecord]:
+    for record in _registered_runs(run / DETACHED_RUNS_DIR, worker.id):
+        if (record["status"] == "finished" and record.get("staff_id") == worker.id
+                and _worker_result_pending(record.get("delivery", ""))):
+            yield record
+
+
+def has_pending_worker_result(run: Path, worker: staff.StaffRow) -> bool:
+    """Check for an undelivered result for this worker."""
+    return next(_pending_worker_results(run, worker), None) is not None
 
 
 def _alert_failed_push(path: Path, *, check_receipt: bool = False) -> None:

@@ -496,9 +496,13 @@ A full restore reaps once per held run folder.
 A limited restore reaps once per selected worker in each held run folder.
 It preserves excluded workers and workers with unknown pane evidence.
 It prints each reaped run id.
-Restore reopens only workers with active dispatches.
+Restore reopens workers with active dispatches or detached work that needs their attention.
 It reads each worker's dispatch record and transcript once to select the resume step.
-An accepted dispatch gets a continuation prompt only when the worker is idle.
+An accepted dispatch gets a continuation prompt in the proved worker pane when the worker is idle.
+The pane can prove its native conversation before Herdr reports the session ID.
+Herdr checks the native input target again before it sends the prompt.
+If a finished detached result is pending, restore tries its delivery before it sends a continuation prompt.
+Delivery requires a receipt in the worker transcript.
 Restore holds the dispatch lock across the record read, receipt read, and prompt delivery.
 An unsubmitted dispatch keeps the saved assign command as its step.
 Restore, named resume, and director notes use the same receipt rule.
@@ -692,6 +696,7 @@ After the command ends, the supervisor starts `detached_runs.py deliver <record>
 This process imports the current delivery code and saves the delivery outcome in the run record.
 The supervisor records the command exit before it starts delivery.
 After the first delivery attempt, it marks the run finished and keeps the latest delivery outcome.
+A worker in the restart record keeps its result pending if its pane cannot receive input.
 A failed push saves the send error as pending delivery.
 The finished run leaves the live-run limit and keeps its record and log.
 The reaper saves an ended orphan as finished before it makes one delivery attempt.
@@ -914,8 +919,8 @@ The close reads no process. It closes the pane at once.
 Closure keeps the staff row and thread.
 The next assign resumes that thread in a new pane.
 An account move resumes an open or stopped worker in its same pane and closes no pane.
-Restore reopens only workers with active dispatches.
-Idle workers stay closed until their next assign.
+Restore reopens workers with active dispatches, live detached runs, or pending detached results.
+Workers with no active work or pending result stay closed until their next assign.
 Account moves preserve closed idle workers.
 After restore, the command lists completed passes in open phases, newest first.
 Each line gives the current worker name, phase, dispatch id, and reply path.
@@ -939,6 +944,9 @@ That row has no `home` field.
 
 `worker.py list [open|closed|all]` defaults to open panes.
 `list closed` shows closed panes. `list all` includes uncertain rows too.
+A fresh inventory can confirm that a pane closed during a process read.
+A confirmed closure lets the listing show absent siblings as closed.
+A pane that stays present and unreadable leaves sibling absence uncertain.
 The positional filter uses `WorkerFilter`; `--all-parents` replaces the old `--all` flag.
 The flag still selects saved dispatches from every parent.
 `list all --json --all-parents` needs no caller staff row or live pane read.

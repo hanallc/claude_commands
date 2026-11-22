@@ -454,6 +454,7 @@ def _read_panes(record: staff.StaffSnapshot, client: herdr.Herdr) -> PaneRead | 
     try:
         panes = [dict(pane) for pane in client.panes()]
         scan = client.scan_row_panes(record, panes)
+        panes = [pane for pane in panes if _text(pane, "pane_id") not in scan.closed]
     except (herdr_types.HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
         return PaneReadUnavailable(str(error))
     launches: LaunchRecords | LaunchRecordsUnavailable

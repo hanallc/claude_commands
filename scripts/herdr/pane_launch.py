@@ -192,6 +192,8 @@ class NativePaneScan(Protocol):
     def found(self) -> Mapping[staff.StaffId, Sequence[Mapping[str, object]]]: ...
     @property
     def unknown(self) -> Sequence[UnknownNativePane]: ...
+    @property
+    def closed(self) -> frozenset[str]: ...
 
 
 class NativePaneServer(Protocol):
@@ -232,12 +234,12 @@ def reference_panes(reference: StaffLaunchReference | NativeLaunchReference,
     if isinstance(evidence, ReadNativePanes):
         panes = [dict(pane) for pane in client.panes()]
         scan = client.scan_row_panes(record, [dict(pane) for pane in panes])
-        found = scan.found
-        unknown = {item.pane for item in scan.unknown}
     else:
         panes = evidence.panes
-        found = evidence.scan.found
-        unknown = {item.pane for item in evidence.scan.unknown}
+        scan = evidence.scan
+    panes = [pane for pane in panes if str(pane["pane_id"]) not in scan.closed]
+    found = scan.found
+    unknown = {item.pane for item in scan.unknown}
     decoded: dict[str, set[str]] = {}
     if isinstance(reference, StaffLaunchReference):
         matches = found.get(reference.id, ())

@@ -1309,44 +1309,38 @@ def resume_step(row: staff.StaffRow, dispatch: progress_history.ActiveDispatch
     return receipt if isinstance(receipt, DispatchEvidenceUnknown) else NO_OWN_PASS
 
 
-@dataclass(frozen=True)
-class NoLaunchCleanup:
-    """The restore owns no new pane to close."""
-
-
-NO_LAUNCH_CLEANUP = NoLaunchCleanup()
-
-
-def _resume_launcher(row: staff.StaffRow,
+def _resume_launcher(opened: worker_panes.OpenWorker,
                      dispatch: progress_history.ActiveDispatch | progress_history.NoActiveDispatch, *,
-                     detached: str = "",
-                     on_submission: Callable[[], object] | NoLaunchCleanup = NO_LAUNCH_CLEANUP) -> ExitCode:
+                     run: Path, detached: str = "", on_submission: Callable[[], object] = lambda: None) -> ExitCode:
     """Read and deliver the resume step while restore holds the dispatch lock."""
-    record = staff.snapshot()
-    parent = record.parent_of(row)
+    row = opened.row
     step = resume_step(row, dispatch) if isinstance(dispatch, progress_history.ActiveDispatch) else NO_OWN_PASS
-    if isinstance(step, NoOwnPass) and not detached:
-        return ExitCode.OK
-    recipient = row if isinstance(step, (BusyPass, NoOwnPass)) else parent
-    client = _client()
-    pane = next((item for item in client.tab_sessions()
-                 if recipient is not None and item.session_id == recipient.current_session), None)
-    if pane is None or parent is None or recipient is None:
-        print(f"anomaly: {row.name}: {'worker' if recipient == row else 'director'} session is unavailable", file=sys.stderr)
-        return ExitCode.UNCERTAIN
     if isinstance(step, DispatchEvidenceUnknown):
         print(f"anomaly: {row.name}: {step.reason}", file=sys.stderr)
         return ExitCode.UNCERTAIN
-    if isinstance(step, (BusyPass, NoOwnPass)):
-        status = next((agent["agent_status"] for agent in client.agents() if agent["pane_id"] == pane.pane_id),
-                      herdr.AgentStatus.UNKNOWN)
-        if status not in (herdr.AgentStatus.IDLE, herdr.AgentStatus.DONE):
-            return ExitCode.OK
-    text = (launcher_prompt(row.id, step.dispatch_id, step.command) + ("\n" + detached if detached else "")
-            if isinstance(step, UnsubmittedAssignment) else resume_message("", own_pass=step, detached=detached))
-    submit = (client.prompt if isinstance(on_submission, NoLaunchCleanup) else
-              partial(client.prompt, on_submission=on_submission))
-    submit(pane.pane_id, text, target=str(recipient.current_session))
+    client = _client()
+    if isinstance(step, UnsubmittedAssignment):
+        parent = staff.snapshot().parent_of(row)
+        pane = next((item for item in client.tab_sessions()
+                     if parent is not None and item.session_id == parent.current_session), None)
+        if pane is None or parent is None:
+            print(f"anomaly: {row.name}: director session is unavailable", file=sys.stderr)
+            return ExitCode.UNCERTAIN
+        text = launcher_prompt(row.id, step.dispatch_id, step.command) + ("\n" + detached if detached else "")
+        client.prompt(pane.pane_id, text, target=str(parent.current_session), on_submission=on_submission)
+        return ExitCode.OK
+    status = next((agent["agent_status"] for agent in client.agents() if agent["pane_id"] == opened.pane),
+                  herdr.AgentStatus.UNKNOWN)
+    if not status.idle:
+        return ExitCode.OK
+    replay = detached_runs.submit_finished_worker_result(run, row,
+        worker_input=detached_runs.WorkerResultInput.TYPE, on_submission=on_submission)
+    if replay is detached_runs.WorkerResultReplay.RETRY:
+        print(f"anomaly: {row.name}: a detached run result awaits confirmed delivery", file=sys.stderr)
+        return ExitCode.UNCERTAIN
+    if replay is detached_runs.WorkerResultReplay.NONE and (isinstance(step, BusyPass) or detached):
+        client.prompt(opened.pane, resume_message("", own_pass=step, detached=detached),
+                      target=str(row.current_session), on_submission=on_submission)
     return ExitCode.OK
 
 
@@ -1488,20 +1482,23 @@ def restore(parent: StaffId, *, record: staff.StaffSnapshot | None = None,
                     if recovery is CompletionRecovery.RECOVERED:
                         changed = True
                         continue
-                    if recovery in (CompletionRecovery.PENDING_CLOSE, CompletionRecovery.WAITING_ON_RUNS,
-                                    CompletionRecovery.WAITING_ON_REPLY):
-                        print(f"{state.row.name}: {recovery.value}", file=sys.stderr)
-                        outcome = ExitCode.UNCERTAIN
-                        continue
-                    if isinstance(state, worker_panes.OpenWorker) and not state.status.idle:
-                        continue
                     active = progress_history.active_dispatch(state.row.id, run)
                     if isinstance(active, progress_history.ActiveDispatchUnavailable):
                         print(f"anomaly: {state.row.name}: {active.reason}", file=sys.stderr)
                         outcome = ExitCode.UNCERTAIN
                         continue
+                    if (recovery in (CompletionRecovery.PENDING_CLOSE, CompletionRecovery.WAITING_ON_RUNS)
+                            or (recovery is CompletionRecovery.WAITING_ON_REPLY
+                                and (not isinstance(active, progress_history.ActiveDispatch)
+                                     or not detached_runs.has_pending_worker_result(run, state.row)))):
+                        print(f"{state.row.name}: {recovery.value}", file=sys.stderr)
+                        outcome = ExitCode.UNCERTAIN
+                        continue
+                    if isinstance(state, worker_panes.OpenWorker) and not state.status.idle:
+                        continue
                     detached = detached_runs.resume_context(run / worker_lifecycle.DETACHED_RUNS_DIR, state.row.name)
-                    if not isinstance(active, progress_history.ActiveDispatch) and not detached:
+                    if (not isinstance(active, progress_history.ActiveDispatch) and not detached
+                            and not detached_runs.has_pending_worker_result(run, state.row)):
                         if isinstance(state, (worker_panes.OpenWorker, worker_panes.StoppedWorker)):
                             allowed = worker_panes.can_close(state, run=worker_panes.DispatchRun(run), lock=hold)
                             if isinstance(allowed, worker_panes.Kept):
@@ -1517,7 +1514,7 @@ def restore(parent: StaffId, *, record: staff.StaffSnapshot | None = None,
                     if workers_held and isinstance(staff.backend(state.row), staff.CodexBackend):
                         print(f"{state.row.name}: not resumed: no-worker mode")
                         continue
-                    resume = partial(_resume_launcher, detached=detached) if detached else _resume_launcher
+                    resume = partial(_resume_launcher, run=run, detached=detached)
                     if not isinstance(state, worker_panes.OpenWorker):
                         role = worker_panes.dispatch_role(state.row)
                         before = rows_before_launch()
@@ -1528,16 +1525,15 @@ def restore(parent: StaffId, *, record: staff.StaffSnapshot | None = None,
                         if code != ExitCode.OK:
                             outcome = code
                             continue
-                        if isinstance(started_panes, dict):
-                            started_panes[state.row.id] = cast(worker_panes.OpenWorker, result).pane
                         opened = cast(worker_panes.OpenWorker, result)
+                        if isinstance(started_panes, dict):
+                            started_panes[state.row.id] = opened.pane
                         if isinstance(opened.created_pane, worker_panes.CreatedWorkerPane):
                             resume = partial(resume, on_submission=cleanup.pop_all)
                         changed = True
-                        row = opened.row
                     else:
-                        row = state.row
-                    code = resume(row, active)
+                        opened = state
+                    code = resume(opened, active)
                     if code != ExitCode.OK:
                         outcome = code
                     else:

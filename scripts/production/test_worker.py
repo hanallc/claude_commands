@@ -21,7 +21,7 @@ from dataclasses import replace
 from contextlib import ExitStack, contextmanager, redirect_stderr, redirect_stdout
 from typing import Literal, TextIO, cast, final, override
 import unittest
-from unittest.mock import call, patch
+from unittest.mock import ANY, call, patch
 from uuid import UUID
 
 from scripts.agents import detached_run_process, detached_runs, worker_lifecycle
@@ -39,6 +39,7 @@ from scripts.lib import atomic_file, detached, unit_runs
 from scripts.lib.transcript_test_support import compressed_copy
 from scripts.lib.transcripts import open_transcript
 from scripts.lib.script_envelope import script_prompt
+from scripts.lint.memory_test_support import write_config_fixture
 from scripts.lib.test_models_registry import claude_catalog_environment, write_registry
 from scripts.lib.test_hang_guard import LauncherHangGuard
 from scripts.message import send, sessions
@@ -471,7 +472,9 @@ class WorkerCommandTests(unittest.TestCase):
         folder = path.parent
         delivery = send.PaneTextDelivered("sent", f"worker {opened.row.name} at fixture pane")
 
-        def resume(_row: staff.StaffRow, _active: progress_history.ActiveDispatch) -> worker.ExitCode:
+        def resume(_opened: worker_panes.OpenWorker, _active: progress_history.ActiveDispatch, *,
+                   run: Path, detached: str) -> worker.ExitCode:
+            self.assertEqual((run, detached), (self.run_dir, ""))
             saved = cast(dict[str, object], json.loads(path.read_text()))
             self.assertEqual(saved["status"], "finished")
             return worker.ExitCode.OK
@@ -654,6 +657,81 @@ class WorkerCommandTests(unittest.TestCase):
     def test_restore_resumes_a_stopped_busy_worker_with_live_runs_and_exact_context(self) -> None:
         self.assert_restore_live_run(active=True)
 
+    def test_restore_continues_a_codex_pass_without_a_reported_session(self) -> None:
+        self.assert_restore_without_worker_session_report(stopped_run=False)
+
+    def test_restore_delivers_the_stopped_run_to_a_codex_worker_without_a_reported_session(self) -> None:
+        self.assert_restore_without_worker_session_report(stopped_run=True)
+
+    def assert_restore_without_worker_session_report(self, *, stopped_run: bool) -> None:
+        from scripts.agents import shutdown_record
+
+        opened = self.opened()
+        row, pane = opened.row, opened.pane
+        self.assertIsInstance(staff.backend(row), staff.CodexBackend)
+        dispatch_id = progress_history.begin_dispatch(self.run_dir, slot="impl", phase="8", role="impl",
+            worker_name=row.name, worker_id=row.id, launcher_command=["assign.sh"],
+            prompt=self.prompt, kind="impl", lens="")
+        line = f"Complete the work. End your reply with DONE {dispatch_id}."
+        progress_history.save_dispatch_delivery(self.run_dir, dispatch_id,
+            pass_recorder.DispatchDelivery(line, dispatch_id, str(self.reply)))
+        self.agent.append(pane, "user", line)
+        self.agent.append(pane, "assistant", "I am waiting for the check." if stopped_run else "I am waiting for the director.")
+        world = self.fixture.world
+        shutdown_record.save([str(row.id)])
+        _ = world.stop(row, world)
+        run_path, run_record = self.detached_record(row, "restart-check")
+        if stopped_run:
+            _ = write_config_fixture(self.fixture.root / "conf/detached_runs.conf")
+            _ = write_config_fixture(self.fixture.root / "conf/postmaster.conf")
+            run_record.update(exit_code=143, stop_reason="The restart stopped the command.", pane_dispatch_id=dispatch_id)
+            atomic_file.write_text_atomic(run_path, json.dumps(run_record))
+            delivery = detached_runs.deliver(run_record, detached_runs.command_result(run_record))
+            self.assertEqual(delivery, detached_runs.DEFERRED_WORKER_RESULT + "worker is stopped")
+            self.assertNotIn("delivered_at", worker_lifecycle.read_json_object(run_path))
+
+        result = world.result
+        run = world.run
+
+        def read(*arguments: str, deadline: float = math.inf) -> dict[str, object]:
+            reply = result(*arguments, deadline=deadline)
+            if arguments[:2] == ("pane", "list"):
+                for location in cast(list[dict[str, object]], reply["panes"]):
+                    if location["pane_id"] == pane:
+                        _ = location.pop("agent_session", None)
+                        _ = location.pop("session_id", None)
+            return reply
+
+        def record_input(*arguments: str, deadline: float = math.inf) -> str:
+            output = run(*arguments, deadline=deadline)
+            if arguments[:3] == ("agent", "prompt", pane):
+                self.agent.append(pane, "user", arguments[3])
+                world.locations[pane]["agent_status"] = "working"
+            return output
+
+        selected = frozenset({row.id})
+        with (patch.object(world, "result", side_effect=read), patch.object(world, "run", side_effect=record_input),
+              redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as errors):
+            self.assertEqual(worker.restore(self.fixture.parent.id, only=selected), worker.ExitCode.OK)
+            self.assertIsNone(next(item["session_id"] for item in world.panes() if item["pane_id"] == pane))
+        self.assertEqual(errors.getvalue(), "")
+        self.assertEqual(self.agent.notices, [])
+        self.assertEqual(world.closed, [])
+        current = staff.by_id(row.id)
+        assert current is not None
+        self.assertEqual(current.current_session, row.current_session)
+        prompt, = self.fixture.prompts()
+        self.assertEqual(prompt[2], pane)
+        if stopped_run:
+            self.assertIn("Detached run: restart-check\n", prompt[3])
+            self.assertIn("Result: STOPPED (exit 143)", prompt[3])
+            receipt = worker_lifecycle.read_json_object(run_path)
+            self.assertEqual(receipt["delivery"], f"sent: worker {row.name} at {pane}")
+            self.assertIn("delivered_at", receipt)
+            self.assertFalse(detached_runs.has_pending_worker_result(self.run_dir, current))
+        else:
+            self.assertIn(f"Continue pass {dispatch_id} in this conversation.", prompt[3])
+
     def assert_restore_live_run(self, *, active: bool) -> None:
         from scripts.whoami import agent_accounts
 
@@ -704,14 +782,14 @@ class WorkerCommandTests(unittest.TestCase):
         before = self.fixture.staff_state(), len(self.fixture.world.launches)
         with patch.object(worker, "_resume_launcher", return_value=worker.ExitCode.OK) as resume:
             self.assertEqual(self.command("restore"), (0, f"{self.fixture.parent.name}: workers restored\n", ""))
-        resume.assert_called_once_with(replace(busy.row, role=staff.KnownWorkerRole("impl")),
-            progress_history.ActiveDispatch(dispatch_id, ("assign.sh", "--to", "impl")))
         self.assertEqual(self.fixture.staff_state(), before[0])
         self.assertEqual(len(self.fixture.world.launches), before[1] + 1)
         states = {state.row.id: state for state in worker_panes.observe(self.fixture.parent.id, staff.snapshot())}
         self.assertIsInstance(states[busy.row.id], worker_panes.OpenWorker)
         resumed = states[busy.row.id]
         assert isinstance(resumed, worker_panes.OpenWorker)
+        resume.assert_called_once_with(resumed, progress_history.ActiveDispatch(dispatch_id, ("assign.sh", "--to", "impl")),
+                                       run=self.run_dir, detached="")
         self.assertEqual(resumed.pane, busy.pane)
         self.assertEqual(resumed.terminal, busy.terminal)
         self.assertIsInstance(states[idle.row.id], worker_panes.ClosedWorker)
@@ -785,7 +863,9 @@ class WorkerCommandTests(unittest.TestCase):
         launches = len(self.fixture.world.launches)
         with patch.object(worker, "_resume_launcher", return_value=worker.ExitCode.OK) as resume:
             self.assertEqual(worker.restore(self.fixture.parent.id), worker.ExitCode.OK)
-        resume.assert_called_once_with(replace(opened.row, role=staff.KnownWorkerRole("impl")), active)
+        resumed = self.fixture.observation(opened.row)
+        self.assertIsInstance(resumed, worker_panes.OpenWorker)
+        resume.assert_called_once_with(resumed, active, run=self.run_dir, detached="")
         self.assertEqual(len(self.fixture.world.launches), launches)
         self.assertEqual(self.agent.submitted, [])
         self.assertEqual(progress_history.active_dispatch(opened.row.id, self.run_dir), active)
@@ -821,7 +901,8 @@ class WorkerCommandTests(unittest.TestCase):
                     self.assertIn("saved-pass", text)
                     self.assertIn(str(opened.row.id), text)
                     self.assertNotIn('<system-reminder source="script">', text)
-                    self.assertEqual(prompt.call_args.kwargs, {"target": str(self.fixture.parent.current_session)})
+                    self.assertEqual(prompt.call_args.kwargs,
+                                     {"target": str(self.fixture.parent.current_session), "on_submission": ANY})
                     with lock_path.open("r") as available:
                         fcntl.flock(available, fcntl.LOCK_EX | fcntl.LOCK_NB)
 
@@ -1175,6 +1256,32 @@ class WorkerCommandTests(unittest.TestCase):
         self.assertEqual(errors.splitlines(), ["anomaly: impl: worker transcript has incomplete records"])
         self.assertIn(impl.pane, self.fixture.world.locations)
         self.assertNotIn(cm.pane, self.fixture.world.locations)
+
+    def test_list_distinguishes_a_closed_pane_from_one_that_stays_unreadable(self) -> None:
+        closing = self.opened()
+        siblings = (self.fixture.worker("closed-a"), self.fixture.worker("closed-b"))
+        world = self.fixture.world
+        result = world.result
+        for disappeared in (False, True):
+            with self.subTest(disappeared=disappeared):
+                def read(*arguments: str, deadline: float = math.inf) -> dict[str, object]:
+                    if arguments == ("pane", "process-info", "--pane", closing.pane):
+                        if disappeared and closing.pane in world.locations:
+                            world.remove_pane(closing.pane)
+                        raise herdr_types.HerdrFailure("fixture could not read the pane", "pane_not_found")
+                    return result(*arguments, deadline=deadline)
+
+                with patch.object(world, "result", side_effect=read):
+                    code, output, errors = self.command("list", "all", "--json")
+                self.assertEqual(code, worker.ExitCode.OK)
+                listing = {row["name"]: row["state"] for row in cast(list[dict[str, str]], json.loads(output))}
+                for sibling in siblings:
+                    self.assertEqual(listing[sibling.name], "ClosedWorker" if disappeared else "UncertainWorker")
+                self.assertEqual(listing[closing.row.name], "ClosedWorker" if disappeared else "ProcessUnknownWorker")
+                if disappeared:
+                    self.assertEqual(errors, "")
+                else:
+                    self.assertIn("absence is unproved", errors)
 
     def test_herdr_dispatch_records_the_worker_staff_id(self) -> None:
         for foreign_tab in (False, True):
@@ -4492,8 +4599,8 @@ class WorkerCommandTests(unittest.TestCase):
         opened = self.opened()
         with (patch.object(self.fixture.world, "tab_sessions", return_value=[]),
               patch.object(self.fixture.world, "prompt") as prompt, redirect_stderr(io.StringIO()) as errors):
-            self.assertEqual(worker._resume_launcher(opened.row, progress_history.ActiveDispatch("saved-pass", ("assign.sh",))),  # pyright: ignore[reportPrivateUsage]
-                             worker.ExitCode.UNCERTAIN)
+            active = progress_history.ActiveDispatch("saved-pass", ("assign.sh",))
+            self.assertEqual(worker._resume_launcher(opened, active, run=self.run_dir), worker.ExitCode.UNCERTAIN)  # pyright: ignore[reportPrivateUsage]
         prompt.assert_not_called()
         self.assertEqual(errors.getvalue(), "anomaly: impl: director session is unavailable\n")
 

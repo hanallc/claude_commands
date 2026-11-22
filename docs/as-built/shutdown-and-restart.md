@@ -537,7 +537,9 @@ A skipped worker leaves the restart record. The next assignment resumes it.
 The resume, restart and relaunch messages of a director then carry the `no_worker_mode_on` text from `config/accounts.conf` and no worker lines.
 A paused director gets `Continue where you stopped.` and the same text.
 Pane worker resume uses the dispatch record and transcript to select one step.
-An idle worker receives a continuation prompt when its transcript contains the open dispatch.
+An idle worker with an accepted open dispatch receives a continuation prompt in its proved native pane.
+Herdr checks the native input target even if its inventory has no session ID for the pane.
+Restore gives a pending detached result priority over the continuation prompt.
 Restore holds the dispatch lock across the record read, receipt read, and prompt delivery.
 Restore, named resume, and director notes use one receipt rule.
 An unsubmitted dispatch keeps the saved assign command and its saved prompt path.
@@ -846,7 +848,11 @@ The record, the log and the exit code stay in the run folder's `detached_runs` d
 After the command ends, the supervisor starts a new Python process to deliver the result from the current code tree.
 The supervisor waits for delivery before it marks the run finished.
 The result goes to the worker's fixed staff row and its current conversation.
-A stopped worker's result goes to its parent. A stopped parent's result waits in its queue.
+A result for a worker in the restart record stays pending while its pane cannot receive input.
+Restore replays the saved exit or stopped result after the worker opens.
+The replay confirms delivery in the worker transcript.
+Outside restart, the parent normally receives the stopped worker's result.
+A stopped parent's result waits in its queue.
 
 `verify.sh final` detaches by itself only for a registered Codex worker.
 A bare call from a Claude director stays attached.

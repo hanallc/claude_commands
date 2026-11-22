@@ -975,6 +975,7 @@ class UnknownPane:
 class RowPaneScan:
     found: dict[staff.StaffId, list[dict[str, object]]]
     unknown: list[UnknownPane]
+    closed: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -2091,6 +2092,7 @@ class Herdr:
         scan = self.scan_row_panes(record, self.listed("pane")) if isinstance(scan, ScanAtUse) else scan
         owners = _tab_members(record, scan)
         saved = saved_layout(self.session)
+        incomplete = bool(scan.unknown or scan.closed)
         retained = {tab["staff_id"]: space["name"] for space in saved["workspaces"] for tab in space["tabs"]}
         groups: dict[str, _LiveSpace] = {}
         for space in spaces:
@@ -2099,17 +2101,17 @@ class Herdr:
                 member = owners.get(json_text(tab.get("tab_id"), "herdr tab id"))
                 if tab.get("workspace_id") != workspace or member is None:
                     continue
-                name = (retained[member.id] if scan.unknown and member.id in retained else
+                name = (retained[member.id] if incomplete and member.id in retained else
                         row_workspace(member, record, str(space.get("label", member.name))))
                 group = groups.setdefault(name, _LiveSpace(workspace, name, []))
                 if member.id not in group.tabs:
                     group.tabs.append(member.id)
         live = list(groups.values())
         if live:
-            if not scan.unknown:
+            if not incomplete:
                 for space in saved["workspaces"]:
                     space["tabs"] = [item for item in space["tabs"] if record.by_id(staff.StaffId(item["staff_id"])) is not None]
-            _write_layout(self.session, merged_layout(saved, live, time.time(), expire=not scan.unknown, record=record))
+            _write_layout(self.session, merged_layout(saved, live, time.time(), expire=not incomplete, record=record))
 
     def pane_tab(self, pane: str) -> tuple[str, int, SavedMemberTab | UnownedTab]:
         """Read the native member and the current tab position."""
@@ -2349,8 +2351,9 @@ class Herdr:
                                        if isinstance(sessions, _PaneProcessNotFound)})
         for pane, sessions in observations:
             if isinstance(sessions, _PaneProcessNotFound):
-                sessions = (PaneSessionsChanging("pane closed during scan") if str(pane.get("pane_id", "")) in closed
-                            else PaneSessionsUnknown(sessions.reason))
+                if str(pane.get("pane_id", "")) in closed:
+                    continue
+                sessions = PaneSessionsUnknown(sessions.reason)
             if isinstance(sessions, (PaneSessionsStarting, PaneSessionsChanging, PaneSessionsUnknown)):
                 reason = "starting" if isinstance(sessions, PaneSessionsStarting) else sessions.reason
                 unread = UnknownPane(str(pane.get("pane_id", "")), str(pane.get("tab_id", "")), reason)
@@ -2381,7 +2384,7 @@ class Herdr:
                 for identity in sessions:
                     if (row := record.by_current_session(identity)) is not None:
                         found.setdefault(row.id, []).append(pane)
-        return RowPaneScan(found, unknown)
+        return RowPaneScan(found, unknown, frozenset(closed))
 
     @pane_evidence_run()
     def retitle_row(self, row_id: str) -> bool:
@@ -2424,7 +2427,7 @@ class Herdr:
             focused_space = next((item.get("workspace_id") for item in spaces if item.get("focused") is True), "")
             focused = next((json_text(pane.get("pane_id"), "pane id") for pane in panes
                             if pane.get("focused") is True and pane.get("workspace_id") == focused_space), "")
-            changed, bound, placed = bool(scan.unknown), False, False
+            changed, bound, placed = bool(scan.unknown or scan.closed), False, False
             visited: set[str] = set()
             try:
                 for member in (row, *record.find(parent=row.id)):
