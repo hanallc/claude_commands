@@ -523,9 +523,10 @@ Herdr checks the native input target again before it sends the prompt.
 If a finished detached result is pending, restore tries its delivery before it sends a continuation prompt.
 For a worker with no active pass, restore checks every held run folder for pending results without a pass ID.
 Restore recovers completion in the selected pass folder after replay from another folder.
-The receipt accepts the earlier DONE if a valid record places a replayed result outside the pass.
+Before replay sends a result from another folder, it saves the run ID and source folder in the selected pass.
+The receipt uses this proof to accept the earlier DONE after pruning removes the source record.
 This rule also applies when a completion action fails after the worker sends DONE.
-A missing or invalid result record keeps the pass waiting for a new DONE.
+Without proof of another folder or pass, an unmatched result keeps the pass waiting for a new DONE.
 If a live run is in a different folder from the active pass, the resume prompt names the director as the notice recipient.
 Delivery requires a receipt in the worker transcript.
 Restore uses the shared dispatch receipt when an active pass waits for a reply to a detached result.

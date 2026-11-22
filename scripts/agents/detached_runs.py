@@ -1530,7 +1530,7 @@ def _worker_input_unconfirmed(record: RunRecord) -> bool:
 
 
 def _worker_pass_current(record: RunRecord, member: staff.StaffRow, membership: staff.StaffSnapshot, *,
-                         allow_unbound: bool = False) -> bool:
+                         allow_unbound: bool = False, save_origin: bool = False) -> bool:
     from scripts.direct import progress_history
     from scripts.herdr import worker_panes
 
@@ -1546,6 +1546,10 @@ def _worker_pass_current(record: RunRecord, member: staff.StaffRow, membership: 
     passed = worker_panes.worker_pass(member, run, record=membership)
     linked = record.get("pane_dispatch_id")
     if allow_unbound and (not passed or (linked == "" and passed.get("status") != "active")):
+        if (save_origin and passed.get("status") in ("completed", "error")
+                and isinstance(instance := passed.get("instance_id"), str) and instance
+                and (source := result_run.resolve()) != run.resolve()):
+            worker_panes.record_replayed_result(member, run, instance, record["run_id"], source, record=membership)
         return linked is None or linked == ""
     return (passed.get("status") == "active" and run == result_run
             and result_in_pass(record, passed.get("instance_id"), since=passed.get("started_at") or 0))
@@ -1638,9 +1642,10 @@ def deliver(record: RunRecord, result: CommandResult, *,
 
         from scripts.direct import recorder_state
 
-        def check_pass() -> None:
+        def check_pass(*, save_origin: bool = False) -> None:
             try:
-                in_pass = _worker_pass_current(current, member, membership, allow_unbound=True)
+                in_pass = _worker_pass_current(current, member, membership, allow_unbound=True,
+                                               save_origin=save_origin)
             except (OSError, ValueError, recorder_state.OldRecorderState) as error:
                 raise _WorkerPassDeliveryBlocked(
                     DEFERRED_WORKER_RESULT + f"worker pass is unavailable: {error}") from error
@@ -1648,7 +1653,7 @@ def deliver(record: RunRecord, result: CommandResult, *,
                 raise _WorkerPassDeliveryBlocked(OUT_OF_PASS_RESULT, out_of_pass=True)
 
         def before_input() -> None:
-            check_pass()
+            check_pass(save_origin=True)
             _ = _save_delivery(path, UNCONFIRMED_WORKER_RESULT + "the prompt may have sent input",
                                failed=True, input_unconfirmed=True)
             _ = on_submission()

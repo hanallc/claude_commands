@@ -799,6 +799,24 @@ def worker_pass(row: staff.StaffRow, run: Path, *,
     return _pass_in(row, _run_state(run), record)
 
 
+REPLAYED_RESULT_SOURCES = "replayed_result_sources"
+
+
+def record_replayed_result(row: staff.StaffRow, run: Path, instance: str, run_id: str, source: Path, *,
+                           record: staff.StaffSnapshot) -> None:
+    """Save the result origin in the exact pass before replay sends input."""
+    with pass_recorder.recorder_lock_path(run).open("a+", encoding="utf-8") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        state = _run_state(run)
+        passed = _pass_in(row, state, record)
+        if passed.get("instance_id") != instance or passed.get("status") not in ("completed", "error"):
+            raise ValueError("the pass changed before detached result delivery")
+        sources = pass_recorder.object_dict(passed.get(REPLAYED_RESULT_SOURCES)) or {}
+        if sources.get(run_id) != str(source):
+            passed[REPLAYED_RESULT_SOURCES] = {**sources, run_id: str(source)}
+            pass_recorder.write_state(run, state)
+
+
 def _pass_in(row: staff.StaffRow, fields: dict[str, object], record: staff.StaffSnapshot) -> dict[str, object]:
     no_pass: dict[str, object] = {}
     return max(_worker_passes_in(row, fields, record), key=_pass_started_at, default=no_pass)

@@ -695,7 +695,15 @@ class WorkerCommandTests(unittest.TestCase):
     def test_restore_recovers_the_saved_done_after_a_completion_action_fails(self) -> None:
         self.assert_restore_recovers_pass_after_replay("error")
 
-    def assert_restore_recovers_pass_after_replay(self, status: Literal["completed", "error"]) -> None:
+    def test_pruning_a_replayed_result_preserves_the_earlier_done(self) -> None:
+        self.assert_restore_recovers_pass_after_replay("completed", source_after_replay="pruned")
+
+    def test_an_unreadable_result_beside_the_replayed_result_preserves_the_earlier_done(self) -> None:
+        self.assert_restore_recovers_pass_after_replay("completed", source_after_replay="unreadable-neighbor")
+
+    def assert_restore_recovers_pass_after_replay(self, status: Literal["completed", "error"], *,
+                                                 source_after_replay: Literal[
+                                                     "present", "pruned", "unreadable-neighbor"] = "present") -> None:
         opened = self.opened()
         row = opened.row
         previous = self.fixture.worker_run("previous", "unit", self.fixture.parent.current_session)
@@ -728,9 +736,16 @@ class WorkerCommandTests(unittest.TestCase):
         self.assertIn("Detached run: other-check", prompt[3].splitlines())
         self.assertIs(worker_lifecycle.read_json_object(path)["worker_received"], True)
         self.assertEqual(self.reply.read_text().rstrip(), reply)
+        passed = worker_panes.worker_pass(row, self.run_dir)
+        if source_after_replay == "pruned":
+            self.assertEqual(detached_runs.prune_finished(path.parent), ["other-check"])
+            self.assertFalse(path.exists())
+        elif source_after_replay == "unreadable-neighbor":
+            atomic_file.write_text_atomic(path.with_name("broken.json"), "{")
         self.assertEqual(self.receipt(), worker.DispatchComplete(reply, restored_done=True))
-        completion = progress_history.hook_completion(worker_panes.worker_pass(row, self.run_dir))
-        self.assertIsInstance(completion, progress_history.HookCompletion)
+        self.assertEqual(worker_panes.recorded_completion_close(row, self.run_dir, passed), worker_panes.CloseAllowed())
+        self.assertEqual(passed[worker_panes.REPLAYED_RESULT_SOURCES], {"other-check": str(previous.resolve())})
+        self.assertIsInstance(progress_history.hook_completion(passed), progress_history.HookCompletion)
         self.assertEqual(self.fixture.world.closed, [])
 
     def test_restore_resumes_a_stopped_idle_worker_with_live_runs_and_exact_context(self) -> None:
