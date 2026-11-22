@@ -22,7 +22,7 @@ from scripts.production.staff_test_support import isolated_staff_file, recorded_
 from scripts.agents import remote
 from scripts.production.gate_modules import GateRefused
 from scripts.production.gate_test_support import MergeGateFixture, wait_for_file
-from scripts.lib import land_main
+from scripts.lib import land_main, waiting_rows
 from scripts.lib.git_test_support import fixture_git_environment
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.main_push_lock_test_support import publish_after_contender
@@ -625,6 +625,38 @@ sys.meta_path.insert(0, NoRepositoryModules())
                     self.assertEqual(self.git(mac, "show", ":settings.json"), "local settings")
                 if state == "untracked":
                     self.assertEqual((mac / "local.lock").read_text(), "keep\n")
+
+    def test_mac_retry_recovers_a_settings_move_after_head_advanced(self) -> None:
+        args = self.publish_for_promotion()
+        mac = self.root / "mac-retry"
+        _ = self.git(self.root, "clone", "-q", "--branch", "integration", str(self.origin), str(mac))
+        args.mac_repo = str(mac)
+        relative = "config/retry.conf"
+        file = mac / relative
+        self.write(file, "limit=5\n")
+        head = self.commit(mac, "Mac settings update")
+        plan = waiting_rows.MovePlan(
+            source=self.checkpoint, target=head,
+            before={relative: "limit=5\n"}, after={relative: "limit=6\n"},
+            writes=waiting_rows.MoveWrites(
+                index_before=self.git(mac, "rev-parse", f"{self.checkpoint}^{{tree}}"),
+                expected_index=self.git(mac, "rev-parse", "HEAD^{tree}"),
+                files_before={relative: waiting_rows.file_version(file)}))
+        receipt = mac / ".git/waiting-rows.move"
+        self.write(receipt, json.dumps(plan))
+        self.write(self.bin / "ssh", f'#!{sys.executable}\nimport subprocess, sys\n'
+                   + 'raise SystemExit(subprocess.call(["sh", "-c", sys.argv[-1]]))\n')
+        self.write(mac / "scripts/lib/py", '#!/bin/sh\nexec "$GATE_TEST_REPO/scripts/lib/py" "$@"\n')
+        (mac / "scripts/lib/py").chmod(0o755)
+        self.write(mac / "scripts/lib/waiting_rows.py",
+                   "from scripts.lib.waiting_rows import main\nraise SystemExit(main())\n")
+
+        with mock.patch.dict(os.environ, self.environment), redirect_stdout(io.StringIO()):
+            gate.promote(args)
+
+        self.assertFalse(receipt.exists())
+        self.assertEqual(file.read_text(), "limit=6\n")
+        self.assertEqual(self.git(mac, "rev-parse", "HEAD"), head)
 
     def test_promote_preserves_local_edits_that_block_fast_forward(self) -> None:
         self.write(self.unit / "subject.txt", "checkpoint changes this file\n")

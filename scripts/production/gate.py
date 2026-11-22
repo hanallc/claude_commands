@@ -2087,7 +2087,9 @@ def promote_mac(args: GateArguments, main_repo: Path, published: promotion.Publi
     waiting = shlex.quote(waiting_rows.WAITING_PATHS)
     remote = (f"(cd {remote_path} && "
               "git fetch -q origin +refs/heads/main:refs/remotes/origin/main && "
-              f"if git merge-base --is-ancestor {shlex.quote(promoted)} HEAD; then :; "
+              f"if git merge-base --is-ancestor {shlex.quote(promoted)} HEAD; then "
+              "if [ -f scripts/lib/waiting_rows.py ]; "
+              "then scripts/lib/py scripts/lib/waiting_rows.py fast-forward HEAD; fi; "
               "elif [ -f scripts/lib/waiting_rows.py ]; "
               f"then {check} {waiting} && scripts/lib/py scripts/lib/waiting_rows.py fast-forward {shlex.quote(promoted)}; "
               f"else {check} && git merge --ff-only -q {shlex.quote(promoted)}; fi); rc=$?; "
