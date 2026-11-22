@@ -595,6 +595,15 @@ collect_child() {
     wait "$1" 2>/dev/null || true
 }
 
+# Run the cleanup command after $1, which names it. A failure prints one line
+# and returns 0, so the step status stays the exit status of the call.
+run_cleanup() {
+    local what=$1 status=0
+    shift
+    "$@" || status=$?
+    (( status == 0 )) || printf 'verify.sh: cleanup failed: %s (status %s)\n' "$what" "$status" >&2
+}
+
 # One parent-owned helper serves command substitutions and cleanup traps.
 verify_helper() {
     if [[ "${1:-}" == --start ]]; then
@@ -1913,7 +1922,7 @@ finish_hold_wait() {
     collect_hold_wait
     if [[ -n "${TOKEN_WAIT_ENTRY:-}" ]]; then rm -f -- "$TOKEN_WAIT_ENTRY"; fi
     if [[ -n "$HOLD_WAIT_DIR" ]]; then
-        verify_helper "$BUILD_FOLDERS_SCRIPT" remove "$HOLD_WAIT_DIR"
+        run_cleanup "hold-wait folder removal" verify_helper "$BUILD_FOLDERS_SCRIPT" remove "$HOLD_WAIT_DIR"
         HOLD_WAIT_DIR=""
     fi
     [[ -z "${VERIFY_HELPER_LOCK:-}" ]] || rm -f -- "$VERIFY_HELPER_LOCK"
@@ -1936,6 +1945,7 @@ if [[ "$CMD" == test ]]; then
     export VERIFY_TEST_ENV_NAMES="${MAC_ENV_NAMES[*]}"
 fi
 RUN_LOG=""
+VERIFY_STOPPED_AT=""
 RUN_LOG_PIDS=()
 VERDICT_KEY=""
 VERDICT_TREE_KEY=""
@@ -2088,7 +2098,7 @@ cancel_tree_run() {
     if [[ -s "$TREE_WATCH_DIR/fired.path" ]]; then changed_path=" ($(< "$TREE_WATCH_DIR/fired.path"))"; fi
     printf 'verify.sh: cancelled — the tree changed while %s ran%s, so this result would be stale. Resubmit the %s when your edits are done.\n' "$CMD" "$changed_path" "$CMD" >&2
     note_event cancelled "${RUN_STARTED}" "$(( SECONDS - RUN_STARTED ))" "" 0 "$TREE_CHANGED_STATUS"
-    verify_helper "$BUILD_FOLDERS_SCRIPT" remove "$TREE_WATCH_DIR"
+    run_cleanup "tree-watch folder removal" verify_helper "$BUILD_FOLDERS_SCRIPT" remove "$TREE_WATCH_DIR"
     TREE_WATCH_DIR=""
     exit "$TREE_CHANGED_STATUS"
 }
@@ -2110,7 +2120,7 @@ start_tree_watch() {
 finish_tree_watch() {
     stop_tree_watch
     cancel_tree_run
-    [[ -z "$TREE_WATCH_DIR" ]] || verify_helper "$BUILD_FOLDERS_SCRIPT" remove "$TREE_WATCH_DIR"
+    [[ -z "$TREE_WATCH_DIR" ]] || run_cleanup "tree-watch folder removal" verify_helper "$BUILD_FOLDERS_SCRIPT" remove "$TREE_WATCH_DIR"
     TREE_WATCH_DIR=""
 }
 
@@ -3303,7 +3313,7 @@ stop_copy_watch() {
             esac
         done < "$COPY_WATCH_DIR/result"
     fi
-    verify_helper "$BUILD_FOLDERS_SCRIPT" remove "$COPY_WATCH_DIR"
+    run_cleanup "copy-watch folder removal" verify_helper "$BUILD_FOLDERS_SCRIPT" remove "$COPY_WATCH_DIR"
     COPY_WATCH_DIR="" VERIFY_STEP_INFO_FILE=""
     if [[ -n "$COPY_WORD" && "$copy_count" =~ ^[0-9]+$ && "$copy_s" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
         BUILDLOG_MAC_COPY="$COPY_WORD"
@@ -3547,7 +3557,8 @@ finish_run() {
         error) lint_failure_is_the_tree && kind=fail ;;
     esac
     note_event "${outcome}" "${RUN_STARTED}" "${wall}" "${build:-0}" 0 "${code}"
-    if [[ -z "${kind}" || -z "${CACHE_DIR}" ]] || ! cache_record "${kind}" "${repeat}"; then
+    # A command that failed outside an exit gives no verdict. Its run log stays as the evidence.
+    if [[ -z "${VERIFY_STOPPED_AT}" ]] && { [[ -z "${kind}" || -z "${CACHE_DIR}" ]] || ! cache_record "${kind}" "${repeat}"; }; then
         rm -f "${RUN_LOG}"
     fi
     RUN_LOG=""
@@ -4321,7 +4332,7 @@ verify_cleanup() {
     if [[ -n "${DOC_COPY_OWNER_PID:-}" ]]; then step_close_checkout stop; fi
     if [[ -n "${COPY_RUN_WATCH_PID:-}" ]]; then collect_child "$COPY_RUN_WATCH_PID" TERM; fi
     stop_tree_watch
-    [[ -z "$TREE_WATCH_DIR" ]] || verify_helper "$BUILD_FOLDERS_SCRIPT" remove "$TREE_WATCH_DIR"
+    [[ -z "$TREE_WATCH_DIR" ]] || run_cleanup "tree-watch folder removal" verify_helper "$BUILD_FOLDERS_SCRIPT" remove "$TREE_WATCH_DIR"
     TREE_WATCH_DIR=""
     lint_copy_drop
     if [[ "$STEP_RECORD_ACTIVE" == 1 ]]; then
@@ -4363,8 +4374,10 @@ verify_cleanup() {
 # hold stop ends the run-log readers, runs this trap with the status of the
 # last command, often 0. Only an exit command completes a run, so any other
 # command records the run as interrupted (status 128: the signal is
-# unknown here) and writes no pass. Cleanup is best effort: errexit is off,
-# so one failed cleanup command does not end the trap with its status.
+# unknown here) and writes no pass. A non-zero status from any other command,
+# most often an errexit stop, gives no verdict: the trap names that command,
+# and finish_run keeps the run log and writes no record. Cleanup is best effort: errexit is off, so one
+# failed cleanup command does not end the trap with its status.
 verify_exit() {
     EXIT_STATUS=$1
     set +e
@@ -4375,6 +4388,11 @@ verify_exit() {
     elif (( EXIT_STATUS == 0 )); then
         verify_cleanup completed
     else
+        if [[ "$2" != exit && "$2" != "exit "* ]]; then
+            VERIFY_STOPPED_AT=$2
+            printf 'verify.sh: stopped by a failed command (status %s): %s%s\n' \
+                "$EXIT_STATUS" "$2" "${RUN_LOG:+; run log kept: $RUN_LOG}" >&2
+        fi
         verify_cleanup error
     fi
     finish_verify_run "$EXIT_STATUS"
