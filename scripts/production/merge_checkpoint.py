@@ -753,6 +753,10 @@ class ResetBatchCheckout:
     published_tip: str
     record: BatchResumeRecord
 
+    def finish_merge(self, tip: str) -> None:
+        self.expected_tip = tip
+        self.record.store_merge_state(NO_BATCH_MERGE)
+
 
 class KeepBatchCheckout(NamedTuple):
     pass
@@ -776,13 +780,14 @@ def merge(request: MergeRequest, *, batch_checkout: ResetBatchCheckout | KeepBat
     with build_folders.tool_folder("merge-message") as directory:
         message_path = Path(directory) / f"merge_{short}.msg"
         _ = message_path.write_text(message + "\n", encoding="utf-8")
-        result = run_merge_command(checkout, batch_checkout, "merge", "--no-ff", "-q", "-F", str(message_path), request.commit)
+        result = run_merge_command(checkout, batch_checkout, "merge", request.commit,
+                                   "--no-ff", "-q", "-F", str(message_path))
     if result.returncode:
         raise checkpoint_gate.Stop("merge", "failed", result.stderr.strip() or "merge failed",
                    "the showrunner will inspect the merge failure")
     head = good(git(checkout, "rev-parse", "HEAD"), "merge")
     if isinstance(batch_checkout, ResetBatchCheckout):
-        batch_checkout.expected_tip = head
+        batch_checkout.finish_merge(head)
     change_review.record_merge_producer(change_review.KnownMergeProducer(head, request.unit.staff_id))
     checkpoint_gate.report("merge", "ok", f"merged as {head}")
     return head
@@ -906,7 +911,7 @@ def merge_main(production: ProductionDocument, *,
 
 
 class OpenMerge(NamedTuple):
-    targets: frozenset[str]
+    targets: tuple[str, ...]
 
 
 class NoOpenMerge(NamedTuple):
@@ -914,6 +919,7 @@ class NoOpenMerge(NamedTuple):
 
 
 MERGE_TARGET_ID = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
+OPEN_MERGE_ERROR = "You have not concluded your merge (MERGE_HEAD exists)."
 
 
 def merge_head_path(checkout: Path) -> Path:
@@ -926,16 +932,27 @@ def read_open_merge(path: Path) -> OpenMerge | NoOpenMerge:
     except FileNotFoundError:
         return NoOpenMerge()
     except (OSError, UnicodeError):
-        return OpenMerge(frozenset())
-    return OpenMerge(frozenset(target for target in targets if MERGE_TARGET_ID.fullmatch(target)))
+        return OpenMerge(())
+    return OpenMerge(tuple(targets))
+
+
+def require_closed_batch_merge(checkout: Path, batch_checkout: ResetBatchCheckout | KeepBatchCheckout) -> None:
+    if isinstance(batch_checkout, ResetBatchCheckout) and isinstance(
+            read_open_merge(merge_head_path(checkout)), OpenMerge):
+        raise checkpoint_gate.Stop("push", "held", OPEN_MERGE_ERROR,
+                                   "the showrunner will inspect the merge branch")
 
 
 def run_merge_command(checkout: Path, batch_checkout: ResetBatchCheckout | KeepBatchCheckout,
-                      step: str, *args: str) -> subprocess.CompletedProcess[str]:
+                      step: str, target: str, *options: str) -> subprocess.CompletedProcess[str]:
+    args = ("merge", *options, target)
     if isinstance(batch_checkout, KeepBatchCheckout):
-        return git(checkout, "merge", *args)
+        return git(checkout, *args)
     merge_head = merge_head_path(checkout)
-    result = git(checkout, "merge", *args)
+    if isinstance(read_open_merge(merge_head), OpenMerge):
+        return subprocess.CompletedProcess(args, 1, "", OPEN_MERGE_ERROR)
+    batch_checkout.record.store_merge_state(InFlightBatchMerge(target))
+    result = git(checkout, *args)
     open_merge = read_open_merge(merge_head)
     if isinstance(open_merge, OpenMerge) and not result.returncode:
         raise checkpoint_gate.Stop(step, "failed", "git merge left MERGE_HEAD open",
@@ -956,11 +973,10 @@ def merge_main_commit(production: ProductionDocument, main_commit: str, *,
     """Integrate the given main commit without fetching another tip."""
     checkout = production.checkout
     if git(checkout, "merge-base", "--is-ancestor", main_commit, "HEAD").returncode == 0:
+        require_closed_batch_merge(checkout, batch_checkout)
         return
-    if isinstance(batch_checkout, ResetBatchCheckout):
-        batch_checkout.record.add_main_target(main_commit)
-    merged = run_merge_command(checkout, batch_checkout, "push", "--no-ff", "-m",
-                               "Merge origin/main into " + production.merge_branch, main_commit)
+    merged = run_merge_command(checkout, batch_checkout, "push", main_commit, "--no-ff", "-m",
+                               "Merge origin/main into " + production.merge_branch)
     if merged.returncode:
         try:
             conflicts = git(checkout, "--no-optional-locks", "diff", "--name-only", "--diff-filter=U")
@@ -975,6 +991,8 @@ def merge_main_commit(production: ProductionDocument, main_commit: str, *,
         if conflicts.returncode == 0 and conflicts.stdout.strip():
             raise MainConflict(tuple(conflicts.stdout.strip().splitlines()), failure_detail(merged))
         _ = good(merged, "push")
+    if isinstance(batch_checkout, ResetBatchCheckout):
+        batch_checkout.finish_merge(good(git(checkout, "rev-parse", "HEAD"), "test"))
 
 
 @contextmanager
@@ -1010,8 +1028,6 @@ def prepare_checkpoint(production: ProductionDocument, merge_head: str, *, publi
     before_merge_tip = good(git(checkout, "rev-parse", f"{merge_head}^1"), "test")
     with push_rollback(production, before_merge_tip, batch_checkout=batch_checkout):
         merge_main(production, batch_checkout=batch_checkout)
-        if isinstance(batch_checkout, ResetBatchCheckout):
-            batch_checkout.expected_tip = good(git(checkout, "rev-parse", "HEAD"), "test")
     output = good(git(checkout, "diff", "--name-only", published_tip or before_merge_tip, "HEAD"), "test")
     return tuple(output.splitlines())
 
@@ -1074,6 +1090,7 @@ def tested_main_push(production: ProductionDocument, tested_tip: str,
                     paths = tuple(good(git(checkout, "diff", "--name-only", tested_tip, tip), "test").splitlines())
                     retest(paths, tip)
                 tested_tip = tip
+            require_closed_batch_merge(checkout, batch_checkout)
         yield tested_tip
 
 
@@ -1857,25 +1874,36 @@ class MergedBatchItem(NamedTuple):
     own_paths: tuple[str, ...]
 
 
+class LegacyBatchMerge(NamedTuple):
+    """An older batch record has no in-flight field."""
+
+
+class NoBatchMerge(NamedTuple):
+    pass
+
+
+class InFlightBatchMerge(NamedTuple):
+    target: str
+
+
+NO_BATCH_MERGE = NoBatchMerge()
+
+
 @dataclass
 class BatchResumeRecord:
     path: Path
     checkpoints: tuple[MergeRequest, ...]
     unpublished_checkpoints: tuple[MergeRequest, ...]
-    main_targets: tuple[str, ...] = ()
+    merge_state: LegacyBatchMerge | NoBatchMerge | InFlightBatchMerge = NO_BATCH_MERGE
     retirement_attempted: bool = False
 
     def checkpoint_rows(self) -> str:
         return "".join(f"{item.commit}\t{item.batch_argument_line}\n" for item in self.checkpoints)
 
-    def add_main_target(self, target: str) -> None:
-        if target not in self.main_targets:
-            targets = (*self.main_targets, target)
-            write_text_atomic(self.path, self.checkpoint_rows() + "".join(f"main\t{tip}\n" for tip in targets))
-            self.main_targets = targets
-
-    def merge_targets(self) -> frozenset[str]:
-        return frozenset((*self.main_targets, *(row.commit for row in self.checkpoints)))
+    def store_merge_state(self, state: NoBatchMerge | InFlightBatchMerge) -> None:
+        target = state.target if isinstance(state, InFlightBatchMerge) else "-"
+        write_text_atomic(self.path, self.checkpoint_rows() + f"in-flight\t{target}\n")
+        self.merge_state = state
 
     def retire(self) -> None:
         self.retirement_attempted = True
@@ -1889,28 +1917,35 @@ def reset_batch(rollback: ResetBatchCheckout) -> None:
     """Undo every unpublished merge from the current batch attempt."""
     production = rollback.production
     checkout = production.checkout
-    targets = rollback.record.merge_targets()
+    record = rollback.record
+    state = record.merge_state
     head = good(git(checkout, "rev-parse", "HEAD"), "merge")
     if head != rollback.expected_tip:
         parents = good(git(checkout, "show", "-s", "--format=%P", head), "merge").split()
-        if len(parents) != 2 or parents[0] != rollback.expected_tip or parents[1] not in targets:
+        if not isinstance(state, InFlightBatchMerge) or parents != [rollback.expected_tip, state.target]:
             raise checkpoint_gate.Stop("red", "failed", f"HEAD moved from {rollback.expected_tip}",
                                        "the showrunner will inspect the merge branch")
     open_merge = read_open_merge(merge_head_path(checkout))
     if isinstance(open_merge, OpenMerge):
-        if unrelated := open_merge.targets - targets:
-            raise checkpoint_gate.Stop("merge", "held", f"the batch left the operator merge open: {', '.join(sorted(unrelated))}",
+        owns_merge = isinstance(state, InFlightBatchMerge) and (
+            not open_merge.targets or open_merge.targets == (state.target,))
+        if not owns_merge and not isinstance(state, LegacyBatchMerge):
+            detail = ", ".join(sorted(open_merge.targets)) or "MERGE_HEAD is empty or unreadable"
+            raise checkpoint_gate.Stop("merge", "held", f"the batch left the operator merge open: {detail}",
                                        "the showrunner will inspect the merge branch")
         _ = good(git(checkout, "merge", "--abort"), "merge")
+        record.store_merge_state(NO_BATCH_MERGE)
         if good(git(checkout, "rev-parse", "HEAD"), "merge") == rollback.start_tip:
             return
     if head == rollback.start_tip:
         _ = good(git(checkout, "reset", "--keep", head), "red")
-        return
-    if not push_origin_matches(production, rollback.published_tip, rollback.start_tip):
-        raise checkpoint_gate.Stop("push", "failed", "origin moved; cannot reset the batch",
-                                   "the showrunner will inspect the merge branch")
-    undo_unpushed_merge(production, head, rollback.start_tip)
+    else:
+        if not push_origin_matches(production, rollback.published_tip, rollback.start_tip):
+            raise checkpoint_gate.Stop("push", "failed", "origin moved; cannot reset the batch",
+                                       "the showrunner will inspect the merge branch")
+        undo_unpushed_merge(production, head, rollback.start_tip)
+    if isinstance(record.merge_state, InFlightBatchMerge):
+        record.store_merge_state(NO_BATCH_MERGE)
 
 
 class BatchStopNotice(NamedTuple):
@@ -2236,22 +2271,32 @@ def batch_resume_record(requests: tuple[MergeRequest, ...], upstream: str) -> Ge
         saved = path.read_bytes().decode("utf-8")
     except (FileNotFoundError, UnicodeError):
         saved = ""
-    main_entries = saved[len(rows):].splitlines()
-    record_matches = saved.startswith(rows) and all(
-        entry.startswith("main\t") and MERGE_TARGET_ID.fullmatch(entry[5:]) for entry in main_entries)
+    suffix = saved[len(rows):]
+    target = suffix.removeprefix("in-flight\t").removesuffix("\n")
+    has_merge_field = suffix == f"in-flight\t{target}\n" and (
+        target == "-" or MERGE_TARGET_ID.fullmatch(target) is not None)
+    legacy = all(entry.startswith("main\t") and MERGE_TARGET_ID.fullmatch(entry[5:]) for entry in suffix.splitlines())
+    record_matches = saved.startswith(rows) and (has_merge_field or legacy)
     if sources and (not record_matches or sources.isdisjoint(row.commit for row in checkpoints)):
         raise Refusal("unpushed merges do not have a matching batch record; "
                       + "reset the merge branch to its pushed tip, then start a fresh batch")
     if record_matches:
-        record.main_targets = tuple(entry.removeprefix("main\t") for entry in main_entries)
+        if legacy:
+            record.merge_state = LegacyBatchMerge()
+        elif target != "-":
+            record.merge_state = InFlightBatchMerge(target)
+        if not isinstance(record.merge_state, NoBatchMerge) and isinstance(
+                read_open_merge(merge_head_path(checkout)), NoOpenMerge):
+            record.store_merge_state(NO_BATCH_MERGE)
     else:
         path.parent.mkdir(parents=True, exist_ok=True)
-        write_text_atomic(path, rows)
+        record.store_merge_state(NO_BATCH_MERGE)
     try:
         yield record
     finally:
         if not record.retirement_attempted and not unpushed_checkpoint_sources(production, upstream):
-            if not record.main_targets or isinstance(read_open_merge(merge_head_path(checkout)), NoOpenMerge):
+            if isinstance(record.merge_state, NoBatchMerge) or isinstance(
+                    read_open_merge(merge_head_path(checkout)), NoOpenMerge):
                 record.retire()
 
 

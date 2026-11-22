@@ -429,6 +429,23 @@ subprocess.run(["git", "-C", {str(self.root / "main-fix-writer")!r}, "push", "or
                     self.assertIn("beta phase 2", warning)
                     self.assertEqual(results.read_bytes(), b"\xff\n")
 
+    def merge_as_operator_during_gate(self, target: str, path: str, *, advance_main: bool = False) -> Path:
+        saved_index = self.state / "operator-index"
+        after_merge = (f'''
+subprocess.run(["git", "-C", {str(self.root / "main-fix-writer")!r}, "push", "origin", "main"],
+               check=True, timeout=TEST_HANG_GUARD_SECS)
+''' if advance_main else "raise SystemExit(1)\n")
+        self.executable(self.bin / "checkpoint-test", STUB + rf'''
+import subprocess
+conflict = subprocess.run(["git", "merge", "--no-ff", "--no-commit", {target!r}],
+                          capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
+assert conflict.returncode == 1, conflict.stdout + conflict.stderr
+Path({path!r}).write_text("operator resolution\n")
+subprocess.run(["git", "add", {path!r}], check=True, timeout=TEST_HANG_GUARD_SECS)
+Path({str(saved_index)!r}).write_bytes(Path(".git/index").read_bytes())
+''' + after_merge)
+        return saved_index
+
     def test_batch_stop_uses_the_recorded_merge_targets(self) -> None:
         cases = (
             ("main hook", "hook rejected the merge �"),
@@ -438,6 +455,7 @@ subprocess.run(["git", "-C", {str(self.root / "main-fix-writer")!r}, "push", "or
             ("committed merge", "fixture failed after Git moved HEAD"),
             ("operator commit", "repair merge test 1"),
             ("resumed main merge", "origin/main conflicts: src/beta.txt"),
+            ("resumed legacy main merge", "origin/main conflicts: src/beta.txt"),
             ("no-commit option", "git merge left MERGE_HEAD open"),
             ("empty merge head", "hook rejected the merge �"),
             ("unreadable merge head", "hook rejected the merge �"),
@@ -450,7 +468,8 @@ subprocess.run(["git", "-C", {str(self.root / "main-fix-writer")!r}, "push", "or
                 start = self.git("rev-parse", "HEAD")
                 alpha = self.checkpoint()
                 operator_merge = case.startswith("operator merge")
-                main_conflict = operator_merge or case == "resumed main merge"
+                resumed_main_merge = case in ("resumed main merge", "resumed legacy main merge")
+                main_conflict = operator_merge or resumed_main_merge
                 beta = self.beta_checkpoint("src/beta.txt", "beta change\n")
                 rows = [self.batch_line("alpha", "2", alpha), self.batch_line("beta", "2", beta)]
                 main = self.push_main_change("src/beta.txt" if main_conflict else "main.txt", "main change\n")
@@ -470,6 +489,8 @@ subprocess.run(["git", "-C", {str(self.root / "main-fix-writer")!r}, "push", "or
 
                 def git_with_fault(checkout: Path, *args: str) -> subprocess.CompletedProcess[str]:
                     attempted_merge = args[:2] == ("merge", "--no-ff")
+                    if attempted_merge:
+                        self.assertEqual(self.batch_record().read_text().splitlines()[-1], f"in-flight\t{args[-1]}")
                     if hook_rejects and attempted_merge and args[-1] == hook_target:
                         self.executable(hook, "#!/usr/bin/env python3\n"
                                         + "import sys\nsys.stderr.buffer.write(b'hook rejected the merge \\xff\\n')\n"
@@ -494,7 +515,7 @@ subprocess.run(["git", "-C", {str(self.root / "main-fix-writer")!r}, "push", "or
                             self.assertEqual(self.git("show", "-s", "--format=%P", "HEAD"), f"{before_commit} {main}")
                             interrupted_tips.append(self.git("rev-parse", "HEAD"))
                             return subprocess.CompletedProcess(args, 1, "", detail)
-                        if case == "resumed main merge" and not interrupted_tips:
+                        if resumed_main_merge and not interrupted_tips:
                             self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
                             self.assertEqual(self.git("rev-parse", "MERGE_HEAD"), main)
                             interrupted_tips.append(self.git("rev-parse", "HEAD"))
@@ -507,21 +528,8 @@ subprocess.run(["git", "-C", {str(self.root / "main-fix-writer")!r}, "push", "or
                         _ = self.git("fetch", "origin", "main")
                         operator_tip = self.git("commit-tree", f"{main}^{{tree}}", "-p", start, "-m", "Operator change")
                         _ = self.git("update-ref", "refs/heads/main", start, cwd=self.origin)
-                        publish_main = case == "operator merge before main merge"
-                        self.executable(self.bin / "checkpoint-test", STUB + rf'''
-import subprocess
-conflict = subprocess.run(["git", "merge", "--no-ff", "--no-commit", {operator_tip!r}],
-                          capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
-assert conflict.returncode == 1, conflict.stdout + conflict.stderr
-Path("src/beta.txt").write_text("operator resolution\n")
-subprocess.run(["git", "add", "src/beta.txt"], check=True, timeout=TEST_HANG_GUARD_SECS)
-Path({str(saved_index)!r}).write_bytes(Path(".git/index").read_bytes())
-if {publish_main!r}:
-    subprocess.run(["git", "-C", {str(self.root / "main-fix-writer")!r}, "push", "origin", "main"],
-                   check=True, timeout=TEST_HANG_GUARD_SECS)
-else:
-    raise SystemExit(1)
-''')
+                        saved_index = self.merge_as_operator_during_gate(
+                            operator_tip, "src/beta.txt", advance_main=case == "operator merge before main merge")
                     else:
                         self.executable(self.bin / "checkpoint-test", STUB + '''
 import subprocess
@@ -531,10 +539,13 @@ raise SystemExit(1)
 ''')
 
                 with patch.object(merge_checkpoint, "git", git_with_fault):
-                    if case == "resumed main merge":
+                    if resumed_main_merge:
                         with self.assertRaises(KeyboardInterrupt):
                             _ = self.land_batch(rows)
-                        self.assertIn(f"main\t{main}\n", self.batch_record().read_text())
+                        row_records = f"{alpha}\t{rows[0]}\n{beta}\t{rows[1]}\n"
+                        self.assertEqual(self.batch_record().read_text(), row_records + f"in-flight\t{main}\n")
+                        if case == "resumed legacy main merge":
+                            _ = self.batch_record().write_text(row_records, encoding="utf-8")
                         next_main = self.git("commit-tree", f"{main}^{{tree}}", "-p", main, "-m", "Advance main")
                         _ = self.git("push", "origin", f"{next_main}:refs/heads/main")
                     result = self.land_batch(rows)
@@ -567,7 +578,7 @@ raise SystemExit(1)
                     self.assertEqual(abort_tips, [])
                 else:
                     self.assertEqual(len(abort_tips), 1)
-                if case == "resumed main merge":
+                if resumed_main_merge:
                     self.assertIn("batch: resume", result.stdout)
                     self.assertEqual(abort_tips, interrupted_tips)
                 self.assert_rolled_back(start)
@@ -667,6 +678,21 @@ raise SystemExit(1)
         with self.assertRaises(KeyboardInterrupt):
             _ = self.land_batch(list(lines))
         self.executable(self.bin / "checkpoint-test", STUB)
+        return self.git("rev-parse", "HEAD")
+
+    def interrupt_batch_before_row(self, rows: list[str], commit: str) -> str:
+        merge_row = merge_checkpoint.merge_checked_checkpoint
+
+        def merge_until_row(
+            request: merge_checkpoint.MergeRequest, *, batch_checkout: merge_checkpoint.ResetBatchCheckout,
+        ) -> merge_checkpoint.CheckedCheckpointMerge:
+            if request.commit == commit:
+                raise KeyboardInterrupt
+            return merge_row(request, batch_checkout=batch_checkout)
+
+        with (patch.object(merge_checkpoint, "merge_checked_checkpoint", merge_until_row),
+              self.assertRaises(KeyboardInterrupt)):
+            _ = self.land_batch(rows)
         return self.git("rev-parse", "HEAD")
 
     def assert_batch_requires_reset(self, result: subprocess.CompletedProcess[str], published: str, unpublished: str) -> None:
@@ -811,7 +837,7 @@ raise SystemExit(1)
 
                 result = self.land_batch(lines)
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-                self.assertEqual(saved, [f"{first}\t{lines[0]}", f"{second}\t{lines[1]}"])
+                self.assertEqual(saved, [f"{first}\t{lines[0]}", f"{second}\t{lines[1]}", "in-flight\t-"])
                 for unit in ("alpha", "beta"):
                     self.assertIn(f"batch: resume — {unit} phase 2 is already merged", result.stdout)
                 self.assertEqual(self.git("rev-parse", "production", cwd=self.origin), unpublished)
@@ -1161,6 +1187,35 @@ raise SystemExit(1)
                     self.assertEqual(self.git("show", "-s", "--format=%s", "HEAD"), "Operator commit")
                     self.assertEqual(self.git("rev-parse", "HEAD^"), tested_tip)
 
+    def test_resumed_red_gate_preserves_an_operator_merge_of_a_pending_row(self) -> None:
+        start = self.git("rev-parse", "HEAD")
+        _ = self.checkpoint("src/alpha.txt", "alpha first change\n", push=False)
+        alpha = self.checkpoint("src/beta.txt", "alpha second change\n")
+        _ = self.beta_checkpoint("src/alpha.txt", "beta first change\n")
+        beta = self.beta_checkpoint("src/beta.txt", "beta second change\n")
+        rows = [self.batch_line("alpha", "2", alpha), self.batch_line("beta", "2", beta)]
+        resumed_tip = self.interrupt_batch_before_row(rows, beta)
+        self.assertEqual(self.git("rev-parse", "HEAD^2"), alpha)
+        self.assertTrue(self.batch_record().read_text().endswith("in-flight\t-\n"))
+        saved_index = self.merge_as_operator_during_gate(beta, "src/alpha.txt")
+
+        result = self.land_batch(rows)
+
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("batch: resume — alpha phase 2 is already merged", result.stdout)
+        before, _, warning = result.stdout.partition("rollback failed:")
+        notices = [line for line in before.splitlines() if line.startswith("send ")]
+        self.assertEqual([line.split(":", 1)[0] for line in notices], ["send alpha", "send beta"])
+        for notice in notices:
+            self.assertIn("repair merge test 1", notice)
+        self.assertIn(f"the batch left the operator merge open: {beta}", warning)
+        self.assertEqual(self.git("rev-parse", "HEAD"), resumed_tip)
+        self.assertEqual(self.git("rev-parse", "MERGE_HEAD"), beta)
+        self.assertEqual((self.checkout / ".git/index").read_bytes(), saved_index.read_bytes())
+        self.assertEqual(self.git("show", ":src/alpha.txt"), "operator resolution")
+        self.assertTrue(self.git("ls-files", "--unmerged", "--", "src/beta.txt"))
+        self.assertEqual(self.git("rev-parse", "production", cwd=self.origin), start)
+
     def test_resumed_batch_captures_pending_attribution_before_the_gate(self) -> None:
         start = self.git("rev-parse", "HEAD")
         manifest = "crates/alpha-proof/Cargo.toml"
@@ -1169,18 +1224,7 @@ raise SystemExit(1)
         beta = self.beta_checkpoint("crates/damaged/src/lib.rs", "pub fn beta() {}\n")
         rows = [self.batch_line("alpha", "2", alpha), self.batch_line("beta", "2", beta),
                 self.batch_line("alpha", "3", later)]
-        merge_checkpoint_row = merge_checkpoint.merge_checked_checkpoint
-
-        def interrupt_after_alpha(
-            request: merge_checkpoint.MergeRequest, *, batch_checkout: merge_checkpoint.ResetBatchCheckout,
-        ) -> merge_checkpoint.CheckedCheckpointMerge:
-            if request.commit != alpha:
-                raise KeyboardInterrupt
-            return merge_checkpoint_row(request, batch_checkout=batch_checkout)
-
-        with (patch.object(merge_checkpoint, "merge_checked_checkpoint", interrupt_after_alpha),
-              self.assertRaises(KeyboardInterrupt)):
-            _ = self.land_batch(rows)
+        _ = self.interrupt_batch_before_row(rows, beta)
         self.assertEqual(self.git("rev-parse", "HEAD^2"), alpha)
         self.write(self.checkout, "crates/damaged/Cargo.toml", "[package]\n")
         self.executable(self.bin / "verify.sh", STUB + '''
