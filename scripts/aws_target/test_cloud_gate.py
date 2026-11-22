@@ -2884,7 +2884,7 @@ class CloudRouteTests(CloudGateHangGuard, CostFixture):
                 before = len(self.fallback_rows())
                 outcome = gate.run_gate_suites(self.repo, full=True, mode=mode)
                 self.assertTrue(outcome.passed)
-                local.assert_called_once_with(self.repo, (), gate.DEFAULT_MODULE_TIME_LIMIT_S,
+                local.assert_called_once_with(self.repo, (), None,
                                               source='tests-only', full=True, mode=mode)
                 service.assert_not_called()
                 reason = f'The tested commit does not read SuiteMode value {mode.wire!r}'

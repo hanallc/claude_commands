@@ -370,7 +370,7 @@ class MacGateSuitesTests(GateSuitesFixture):
             self.checkout, mode=SuiteMode.TARGETED, full=False,
             module_time_limit_s=gate.DEFAULT_MODULE_TIME_LIMIT_S, selected=TreeSelection((HOOKS,), tree),
             gate_job=GATE_JOB_NOT_RECORDED)
-        run_suites.assert_called_once_with(self.checkout, (), gate.DEFAULT_MODULE_TIME_LIMIT_S,
+        run_suites.assert_called_once_with(self.checkout, (), None,
                                            source="tests-only", full=False, mode=SuiteMode.TARGETED)
         self.assertIn("Cloud gate uses natedev: fixture cloud unavailable", self.output.getvalue())
         self.assertFalse((self.state / "mac-call.json").exists())
