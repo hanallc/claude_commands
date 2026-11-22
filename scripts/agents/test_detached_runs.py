@@ -3105,6 +3105,59 @@ class PaneRunDeliveryTests(unittest.TestCase):
         self.assertIn(pane, self.fixture.world.locations)
         self.assertEqual((self.run_dir / unit_runs.STATE_FILE).read_bytes(), before)
 
+    def test_direct_recovery_retries_diagnostics_after_closing_the_pane(self) -> None:
+        agent = test_worker.DispatchAgent(self.fixture)
+        agent.pane_commands(self)
+        row = self.fixture.worker("impl", family="codex")
+        pane = "w1:p1"
+        self.fixture.world.add(row, pane, family="codex")
+        dispatch, _ = self.begin_pane_pass(row)
+        delivery = pass_recorder.dispatch_delivery(worker_panes.worker_pass(row, self.run_dir))
+        agent.append(pane, "user", delivery.line)
+        path = self.create_stopped_run(row, dispatch)
+        with patch.object(detached_runs, "_group_is_live", return_value=False):
+            self.assertEqual(detached_runs.main(["deliver", str(path)]), 0)
+        agent.append(pane, "assistant", f"The work is complete.\nDONE {dispatch}")
+        self.fixture.world.locations[pane]["agent_status"] = "done"
+        parent = self.fixture.parent
+        name = staff.WorkerName.parse(row.name)
+        message = "detached run cleanup failed for impl: private cleanup failure"
+        digest = hashlib.sha256(dispatch.encode()).hexdigest()
+        diagnostic = self.run_dir / f".{digest}.completion-diagnostics.json"
+        attempts: list[str] = []
+        deliver = send.send
+
+        def send_diagnostic(options: send.Options) -> send.Result:
+            if send.body_text(options) == message:
+                with worker_panes.worker_lock(parent.id, name) as hold:
+                    self.assertIsInstance(hold, worker_panes.WorkerLockHold)
+                attempts.append(message)
+                if len(attempts) == 1:
+                    return send.Result("failed", "private diagnostic send failed")
+            return deliver(options)
+
+        with patch.object(send, "send", side_effect=send_diagnostic):
+            with (patch.object(detached_runs, "prune_finished", side_effect=OSError("private cleanup failure")),
+                  contextlib.redirect_stderr(io.StringIO()) as errors,
+                  worker_panes.worker_lock(parent.id, name) as hold):
+                assert isinstance(hold, worker_panes.WorkerLockHold)
+                self.assertEqual(turn_end.recover_stopped_in_run(self.run_dir, row.id, hold=hold),
+                                 worker.CompletionRecovery.RECOVERED)
+                self.assertNotIn(pane, self.fixture.world.locations)
+                self.assertEqual(attempts, [])
+            self.assertIn("private diagnostic send failed", errors.getvalue())
+            self.assertEqual(worker_lifecycle.read_json_object(diagnostic), {message: False})
+            saved = progress_history.hook_completion(progress_history.pass_for_finalization(self.run_dir, dispatch))
+            assert isinstance(saved, progress_history.HookCompletion)
+            self.assertTrue(saved.finished)
+            self.assertEqual(attempts, [message])
+            for _ in range(2):
+                self.assertEqual(turn_end.recover_stopped_in_run(self.run_dir, row.id),
+                                 worker.CompletionRecovery.NO_PENDING_NOTICE)
+        self.assertEqual(worker_lifecycle.read_json_object(diagnostic), {message: True})
+        self.assertEqual(attempts, [message, message])
+        self.assertEqual(agent.notices[1:], [message])
+
     def test_late_done_after_reassignment_uses_the_stopped_pass_receipt(self) -> None:
         for status, shared_role in (("idle", False), ("done", False), ("working", True)):
             with self.subTest(status=status, shared_role=shared_role):

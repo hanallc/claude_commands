@@ -7,6 +7,7 @@ try:
 except FileNotFoundError:
     pass
 
+import fcntl
 import hashlib
 import io
 import json
@@ -570,8 +571,9 @@ def _finalize_completion(row: staff.StaffRow, parent: staff.StaffRow, run: Path,
     new_details = tuple(dict.fromkeys((*details, *diagnostics)))
     completion = replace(completion, details=new_details)
     progress_history.save_hook_completion(run, instance, completion)
-    # The turn hook sends stopped diagnostics after it releases the worker lock.
-    if not stopped:
+    if stopped:
+        _defer_stopped_diagnostics(hold, row, parent, run, instance, completion.sender_native_id)
+    else:
         _deliver_completion_diagnostics(row, parent, run, instance, diagnostic_path, recorded,
                                         sender_native_id=completion.sender_native_id)
     if closed and completion.recording_done:
@@ -644,6 +646,7 @@ def recover_completion(row: staff.StaffRow, parent: staff.StaffRow, run: Path,
     stopped = progress_history.hook_completion(passed)
     if isinstance(stopped, progress_history.HookCompletion) and stopped.outcome == TurnOutcome.STOPPED:
         if stopped.finished:
+            _defer_stopped_diagnostics(hold, row, parent, run, instance, stopped.sender_native_id)
             return worker.CompletionRecovery.NO_PENDING_NOTICE
         if passed.get("status") not in ("canceled", "interrupted") or isinstance(pane, worker.KeepCompletedPane):
             return worker.CompletionRecovery.NO_PENDING_NOTICE
@@ -829,6 +832,7 @@ def _finalize_stopped(row: staff.StaffRow, parent: staff.StaffRow, run: Path, in
                       report: Callable[[str], None] | None = None,
                       ownership: StoppedPassPane = StoppedPassPane.CURRENT) -> worker.CompletionRecovery:
     if completion.finished:
+        _defer_stopped_diagnostics(hold, row, parent, run, instance, completion.sender_native_id)
         return worker.CompletionRecovery.NO_PENDING_NOTICE
     if not progress_history.stopped_notice_delivered(run, instance):
         return worker.CompletionRecovery.PENDING_CLOSE
@@ -909,8 +913,6 @@ def _close_stopped_after_notice(row: staff.StaffRow, parent: staff.StaffRow, run
             except ValueError as error:
                 _ = after_unlock.callback(report, str(error))
                 return TurnOutcome.RETRY_EVIDENCE if event_kind == EventKind.RUN_FINISHED else None
-            _ = after_unlock.callback(_send_stopped_diagnostics, current, parent, run, instance,
-                                      sender_native_id=saved.sender_native_id)
             if event_kind == EventKind.RUN_FINISHED and recovery in (
                     worker.CompletionRecovery.PENDING_CLOSE, worker.CompletionRecovery.WAITING_ON_RUNS,
                     worker.CompletionRecovery.WAITING_ON_REPLY):
@@ -971,8 +973,10 @@ def recover_stopped_in_run(run: Path, identity: staff.StaffId, *,
         for receipt in progress_history.stopped_pass_receipts(run, identity):
             passed = progress_history.pass_for_finalization(run, receipt.instance_id)
             completion = progress_history.hook_completion(passed)
-            if (not isinstance(completion, progress_history.HookCompletion) or completion.finished
-                    or completion.outcome != TurnOutcome.STOPPED):
+            if not isinstance(completion, progress_history.HookCompletion) or completion.outcome != TurnOutcome.STOPPED:
+                continue
+            if completion.finished:
+                _defer_stopped_diagnostics(locked, current, parent, run, receipt.instance_id, completion.sender_native_id)
                 continue
             delivery = progress_history.dispatch_delivery(passed)
             use = _stopped_pane_use(current, run, receipt, passed, record)
@@ -999,6 +1003,18 @@ def recover_stopped_in_run(run: Path, identity: staff.StaffId, *,
         return recovery
 
 
+def _defer_stopped_diagnostics(hold: worker_panes.WorkerLockHold, row: staff.StaffRow, parent: staff.StaffRow,
+                               run: Path, instance: str, sender_native_id: str = "") -> None:
+    def deliver() -> None:
+        try:
+            _send_stopped_diagnostics(row, parent, run, instance, sender_native_id=sender_native_id)
+        except (OSError, ValueError, staff.StaffUnreadable, staff.StaffRefused) as error:
+            unit_runs.report_anomaly(
+                " ".join(f"anomaly: {row.name}: close diagnostic retry failed: {error}".splitlines()))
+
+    hold.defer_until_unlock(deliver)
+
+
 def _send_stopped_diagnostics(row: staff.StaffRow, parent: staff.StaffRow, run: Path, instance: str,
                               messages: tuple[str, ...] = (), *, sender_native_id: str = "") -> None:
     path = _completion_diagnostics_path(run, instance)
@@ -1006,7 +1022,14 @@ def _send_stopped_diagnostics(row: staff.StaffRow, parent: staff.StaffRow, run: 
         return
     digest = hashlib.sha256(instance.encode()).hexdigest()
     artifacts = worker.CompletionArtifacts(parent, run)
-    with artifacts.lock(run / f".{digest}.notice.lock"):
+    with artifacts.append(run / f".{digest}.notice.lock") as stream:
+        # A notice can start recovery before its sender releases this lock.
+        try:
+            worker_lifecycle.acquire_flock(stream, mode=fcntl.LOCK_EX if messages else fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            if messages:
+                raise
+            return
         recorded = _record_completion_diagnostics(artifacts, path, messages)
         _deliver_completion_diagnostics(row, parent, run, instance, path, recorded, sender_native_id=sender_native_id)
 
@@ -1246,16 +1269,8 @@ def _handle_locked(event: WorkerEvent,
         archived_stops = [(directory, receipt) for directory in _stopped_pass_folders(parent, record, run)
                           for receipt in progress_history.stopped_pass_receipts(directory, row.id)]
 
-        def retry_stopped_diagnostics() -> None:
-            for directory, receipt in archived_stops:
-                try:
-                    _send_stopped_diagnostics(row, parent, directory, receipt.instance_id)
-                except (OSError, ValueError, staff.StaffUnreadable, staff.StaffRefused) as error:
-                    unit_runs.report_anomaly(
-                        " ".join(f"anomaly: {row.name}: close diagnostic retry failed: {error}".splitlines()))
-
-        if archived_stops:
-            _ = after_unlock.callback(retry_stopped_diagnostics)
+        for directory, receipt in archived_stops:
+            _defer_stopped_diagnostics(hold, row, parent, directory, receipt.instance_id)
         marker = _done_marker(event.reply) if event.kind == EventKind.TURN_END else ""
         late: TurnOutcome | NoLateDone = NoLateDone.UNRECORDED
         if event.kind == EventKind.RUN_FINISHED or (event.kind == EventKind.TURN_END

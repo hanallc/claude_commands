@@ -326,10 +326,12 @@ def worker_id_lock(identity: StaffId, *, blocking: bool = False,
 class WorkerLockHold:
     """Hold the worker's fixed-id lock through startup and dispatch."""
 
-    def __init__(self, parent: StaffId, name: WorkerName, operations: ExitStack, *, blocking: bool) -> None:
+    def __init__(self, parent: StaffId, name: WorkerName, operations: ExitStack, after_unlock: ExitStack, *,
+                 blocking: bool) -> None:
         self.parent = parent
         self.name = name
         self._operations = operations
+        self._after_unlock = after_unlock
         self._held: set[StaffId] = set()
         self._blocking = blocking
         self.active = True
@@ -345,6 +347,12 @@ class WorkerLockHold:
     def owns(self, row: staff.StaffRow) -> bool:
         return self.active and row.id in self._held
 
+    def defer_until_unlock(self, action: Callable[[], None]) -> None:
+        """Run the action after this context releases both locks."""
+        if not self.active:
+            raise ValueError("the worker lock is no longer active")
+        _ = self._after_unlock.callback(action)
+
 
 @contextmanager
 def worker_lock(parent: StaffId, name: WorkerName, *, blocking: bool = False,
@@ -353,7 +361,7 @@ def worker_lock(parent: StaffId, name: WorkerName, *, blocking: bool = False,
 
     A deadline limits the wait for both locks.
     """
-    with ExitStack() as operations:
+    with ExitStack() as after_unlock, ExitStack() as operations:
         record = staff.snapshot()
         row = worker_admission.find_worker(record, parent, name.value)
         path = _worker_lock_path(f"{parent}-{name.value}")
@@ -369,7 +377,7 @@ def worker_lock(parent: StaffId, name: WorkerName, *, blocking: bool = False,
             return
         if row is None:
             row = worker_admission.find_worker(staff.snapshot(), parent, name.value)
-        hold = WorkerLockHold(parent, name, operations, blocking=blocking)
+        hold = WorkerLockHold(parent, name, operations, after_unlock, blocking=blocking)
         try:
             if row is not None:
                 hold.bind(row, deadline=deadline)
