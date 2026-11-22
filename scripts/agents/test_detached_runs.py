@@ -1229,6 +1229,7 @@ from pathlib import Path
 from unittest.mock import patch
 from scripts.agents import detached_runs
 from scripts.lib import process_group, process_start
+from scripts.lib.test_hang_guard import LauncherHangGuard
 start = subprocess.Popen.__init__
 run = subprocess.run
 sleep = time.sleep
@@ -1271,8 +1272,13 @@ def fixture_sleep(delay):
     if command_pid is not None and not reported:
         reported = True
         if command_mode == 'suspend':
-            _, status = os.waitpid(command_pid, os.WUNTRACED)
-            assert os.WIFSTOPPED(status) and os.WSTOPSIG(status) == signal.SIGSTOP
+            guard = LauncherHangGuard('fixture command stops')
+            while True:
+                state = run(['ps', '-p', str(command_pid), '-o', 'stat='], capture_output=True,
+                            text=True, check=True, timeout=guard.remaining()).stdout.strip()
+                if state.startswith('T'):
+                    break
+                sleep(0.01)
         row = dict(role='supervisor', group=os.getpgrp(), dispositions_unchanged=dispositions() == initial_dispositions,
                    masks_unchanged=masks() == initial_masks)
         with socket.socket(socket.AF_UNIX) as connection:
@@ -1281,11 +1287,10 @@ def fixture_sleep(delay):
             if command_mode != 'receive':
                 assert connection.recv(1) == b's'
         if command_mode == 'suspend-child':
-            if hasattr(os, 'waitid'):
-                os.waitid(os.P_PID, command_pid, os.WEXITED | os.WNOWAIT)
-            else:
-                while isinstance(process_start.process_start(command_pid), process_start.Started):
-                    sleep(0.01)
+            record = json.loads(Path(sys.argv[-1]).read_text())
+            guard = LauncherHangGuard('fixture leader exits')
+            while not detached_runs._child_has_exited(command_pid, record['command_started']):
+                sleep(min(0.01, guard.remaining()))
     if command_mode == 'receive':
         sleep(delay)
     else:
@@ -1355,7 +1360,7 @@ leader_reads = []
 reads_before_reap = []
 texts = []
 def read_identity(pid):
-    if sys.platform != 'linux' or pid != command.group:
+    if pid != command.group:
         return read_start(pid)
     state = read_start(pid) if leader_reads else process_start.Unreadable('fixture unreadable identity')
     leader_reads.append(type(state).__name__)
@@ -1414,8 +1419,9 @@ sys.exit(status)
                             self.update_record(path, pid=supervisor.pid)
 
                             def accept() -> tuple[socket.socket, dict[str, object]]:
-                                self.assertTrue(select.select([ready], [], [], guard.remaining())[0],
-                                                "the run did not report")
+                                if not select.select([ready], [], [], guard.remaining())[0]:
+                                    supervisor_log = (self.root / "supervisor.log").read_text()
+                                    self.fail(f"The run did not report. Supervisor output:\n{supervisor_log}")
                                 connection = ready.accept()[0]
                                 _ = connections.enter_context(connection)
                                 connection.settimeout(guard.remaining())
@@ -1488,7 +1494,7 @@ sys.exit(status)
                                     for group in (command_pid, supervisor.pid):
                                         with contextlib.suppress(ProcessLookupError, ValueError):
                                             process_group.send_process_group(group, signal.SIGKILL)
-                                _ = supervisor.wait(timeout=guard.remaining())
+                                _ = supervisor.wait(timeout=TEST_HANG_GUARD_SECS)
                         address.unlink()
                         record = cast(detached_runs.RunRecord, json.loads(path.read_text()))
                         if cancel is None:
@@ -1517,11 +1523,10 @@ sys.exit(status)
                                 self.assertEqual(delivered["scan_failures"], 2)
                         else:
                             self.assertEqual(delivered["verb"], "supervisor-gone")
-                            if sys.platform == "linux":
-                                reads = cast(list[str], delivered["leader_reads"])
-                                self.assertGreaterEqual(len(reads), 2)
-                                self.assertEqual(reads[0], "Unreadable")
-                                self.assertIn(reads[-1], ("Gone", "Zombie"))
+                            reads = cast(list[str], delivered["leader_reads"])
+                            self.assertGreaterEqual(len(reads), 2)
+                            self.assertEqual(reads[0], "Unreadable")
+                            self.assertIn(reads[-1], ("Gone", "Zombie"))
                             self.assertIn("Result: STOPPED (no exit status)", str(delivered["text"]))
                             self.assertIn(f"Stop reason: {detached_runs.SUPERVISOR_GONE_REASON}",
                                           str(delivered["text"]))
@@ -1537,7 +1542,7 @@ sys.exit(status)
             reap_leader = MagicMock()
             lost_leader = (patch.object(os, "waitid", side_effect=ChildProcessError)
                            if hasattr(os, "waitid")
-                           else patch.object(select, "kqueue", side_effect=ProcessLookupError))
+                           else patch.object(detached_runs, "_saved_process", return_value=process_start.Gone()))
             with io.BytesIO() as gate:
                 child = MagicMock(spec=subprocess.Popen, pid=DEAD_PID, stdin=gate, wait=reap_leader)
                 with (lost_leader, patch.object(subprocess, "Popen", return_value=child),
@@ -1549,6 +1554,17 @@ sys.exit(status)
                     _ = detached_runs.main(["supervise", str(path)])
             send.assert_not_called()
             reap_leader.assert_not_called()
+
+        with self.subTest(command_mode="waitid reports a stop before exit"):
+            stopped = SimpleNamespace(si_code=os.CLD_STOPPED)
+            exited = SimpleNamespace(si_code=os.CLD_KILLED)
+            has_exited = cast(Callable[[int, str], bool], getattr(detached_runs, "_child_has_exited"))
+            with patch.object(os, "waitid", side_effect=[stopped, None, exited], create=True) as waitid:
+                self.assertFalse(has_exited(DEAD_PID, "fixture start"))
+                self.assertTrue(has_exited(DEAD_PID, "fixture start"))
+            observe_exit = call(os.P_PID, DEAD_PID, os.WEXITED | os.WNOWAIT | os.WNOHANG)
+            self.assertEqual(waitid.call_args_list,
+                             [observe_exit, call(os.P_PID, DEAD_PID, os.WSTOPPED | os.WNOHANG), observe_exit])
 
         with self.subTest(command_mode="SIGCHLD ignored"):
             path = self.record(["fixture command"])

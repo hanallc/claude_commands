@@ -27,7 +27,6 @@ import json
 import math
 import os
 import secrets
-import select
 import shlex
 import shutil
 import signal
@@ -1124,8 +1123,12 @@ def _live_runs(runs: Path, owns: Callable[[dict[str, object]], bool],
 
 
 def _valid_live_record(path: Path, raw: dict[str, object]) -> bool:
-    if _is_run_record(raw):
-        return path.name == f"{raw['run_id']}.json"
+    record = raw
+    if not _record_owner(path) and "staff_id" not in raw:
+        # Older records saved the worker name without a staff ID.
+        record = {**raw, "staff_id": ""}
+    if _is_run_record(record):
+        return path.name == f"{record['run_id']}.json"
     # The old stop format has exactly these four fields.
     match raw:
         case {"worker": str(name), "pid": int(pid), "status": "running", "stop_reason": str()}:
@@ -1781,28 +1784,20 @@ def scope_prefix(marker: Path, environment: dict[str, str], *,
             "--", "/bin/sh", "-c", SCOPE_SCRIPT, str(marker)]
 
 
-@contextlib.contextmanager
-def _observe_process_exit(pid: int, saved_start: str, *, direct_child: bool) -> Generator[Callable[[], bool]]:
+def _child_has_exited(pid: int, saved_start: str) -> bool:
     """Observe exit without reaping the process."""
-    if direct_child and hasattr(os, "waitid"):
-        def child_exited() -> bool:
-            status = os.waitid(os.P_PID, pid, os.WEXITED | os.WNOWAIT | os.WNOHANG)
-            # macOS can report a stopped child even with WEXITED.
-            return status is not None and status.si_code in (os.CLD_EXITED, os.CLD_KILLED, os.CLD_DUMPED)
-
-        yield child_exited
-    elif sys.platform == "darwin":
-        watcher = select.kqueue()
-        try:
-            event = select.kevent(pid, select.KQ_FILTER_PROC, select.KQ_EV_ADD | select.KQ_EV_ONESHOT,
-                                  select.KQ_NOTE_EXIT)
-            _ = watcher.control([event], 0)
-            yield lambda: bool(watcher.control(None, 1, 0))
-        finally:
-            watcher.close()
-    else:
-        yield lambda: isinstance(_saved_process(pid, saved_start),
-                                 (process_start.Zombie, process_start.Gone, SavedProcessIdReused))
+    if not hasattr(os, "waitid"):
+        observed = _saved_process(pid, saved_start)
+        if isinstance(observed, (process_start.Gone, SavedProcessIdReused)):
+            raise ChildProcessError(pid)
+        return isinstance(observed, process_start.Zombie)
+    status = os.waitid(os.P_PID, pid, os.WEXITED | os.WNOWAIT | os.WNOHANG)
+    if status is None:
+        return False
+    if status.si_code == os.CLD_STOPPED:
+        # macOS can report a stopped child with WEXITED. Consume only that event.
+        _ = os.waitid(os.P_PID, pid, os.WSTOPPED | os.WNOHANG)
+    return status.si_code in (os.CLD_EXITED, os.CLD_KILLED, os.CLD_DUMPED)
 
 
 def _run(command: list[str], environment: dict[str, str], log: Path) -> int:
@@ -1837,19 +1832,19 @@ def _run(command: list[str], environment: dict[str, str], log: Path) -> int:
             return _exit_status(child.wait())
         path = Path(environment["UNIT_DETACHED_RECORD"])
         try:
-            with _observe_process_exit(child.pid, started.start, direct_child=True) as leader_exited:
-                if leader_exited():
-                    return _exit_status(child.wait())
-                with record_lock(path):
-                    record = _read_record(path)
-                    record.update(command_pid=child.pid, command_group=os.getpgid(child.pid),
-                                  command_started=started.start)
-                    supervisor = process_start.process_start(os.getpid())
-                    if isinstance(supervisor, process_start.Started):
-                        record["supervisor_started"] = supervisor.start
-                    write_text_atomic(path, json.dumps(record, indent=2, sort_keys=True))
-                    _send_gate_line(gate, b"start\n")
-                return _exit_status(_wait_for_command(child, gate, path, grace, alert_after, leader_exited))
+            if _child_has_exited(child.pid, started.start):
+                return _exit_status(child.wait())
+            with record_lock(path):
+                record = _read_record(path)
+                record.update(command_pid=child.pid, command_group=os.getpgid(child.pid),
+                              command_started=started.start)
+                supervisor = process_start.process_start(os.getpid())
+                if isinstance(supervisor, process_start.Started):
+                    record["supervisor_started"] = supervisor.start
+                write_text_atomic(path, json.dumps(record, indent=2, sort_keys=True))
+                _send_gate_line(gate, b"start\n")
+            return _exit_status(_wait_for_command(child, gate, path, grace, alert_after,
+                                                  lambda: _child_has_exited(child.pid, started.start)))
         except (ChildProcessError, ProcessLookupError):
             _send_gate_line(gate, b"done\n")
             raise SystemExit(f"detached_runs: {path}: the command leader was already reaped") from None
@@ -2071,15 +2066,8 @@ def command_supervisor_gone(args: argparse.Namespace) -> int:
 
 def _wait_for_leader(command: CommandGroup) -> None:
     """Wait until the command leader exits, so the reap reads the status that the command saved."""
-    try:
-        with _observe_process_exit(command.group, command.started, direct_child=False) as exited:
-            if (sys.platform == "darwin"
-                    and process_start.process_start(command.group) != process_start.Started(command.started)):
-                return
-            while not exited():
-                time.sleep(STOPPED_GROUP_CHECK_SECONDS)
-    except ProcessLookupError:
-        return
+    while isinstance(_saved_process(command.group, command.started), (process_start.Started, process_start.Unreadable)):
+        time.sleep(STOPPED_GROUP_CHECK_SECONDS)
 
 
 def command_record_exit(args: argparse.Namespace) -> int:

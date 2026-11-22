@@ -3131,7 +3131,7 @@ class WorkerCommandTests(unittest.TestCase):
                 record = staff.snapshot()
                 only_first = replace(record, rows=tuple(row for row in record.rows if row.id != second.row.id))
                 expected = "impl" if work in ("damaged other worker", "damaged other unit") else "impl2"
-                folder_held = work in ("damaged own run", "missing supervised record")
+                folder_held = work == "missing supervised record"
                 with (patch.object(detached_run_process, "supervisor_records", return_value=supervisors) as supervised,
                       patch.object(worker_lifecycle, "read_json_object", wraps=worker_lifecycle.read_json_object) as reads,
                       redirect_stderr(io.StringIO()) as errors):
@@ -3163,7 +3163,7 @@ class WorkerCommandTests(unittest.TestCase):
                                     self.assertEqual(selected["work"], "busy")
                                     if unknown and not scope:
                                         self.assertEqual(selected["state"], "ProcessUnknownWorker")
-                    if folder_held:
+                    if folder_held or work == "damaged own run":
                         self.assertEqual(len(errors.getvalue().splitlines()), 1)
                         self.assertIn(str(damaged), errors.getvalue())
                         supervised.return_value = {}
@@ -4125,16 +4125,17 @@ class WorkerCommandTests(unittest.TestCase):
         self.fixture.dispatch(opened.row, "impl")
         run = worker_panes.worker_run(opened.row, record=staff.snapshot())
         directory = run / worker_lifecycle.DETACHED_RUNS_DIR
-        for run_id, name, status, pid, label in (
-                ("live", opened.row.name, "running", 101, "TEST suite"),
-                ("multiline", opened.row.name, "running", 101, "TEST build\ncontinued"),
-                ("finished", opened.row.name, "finished", 101, "TEST finished"),
-                ("dead", opened.row.name, "running", 102, "TEST dead"),
-                ("other", "another-worker", "running", 101, "TEST other worker")):
-            atomic_file.write_text_atomic(directory / (run_id + ".json"), json.dumps({
-                "run_id": run_id, "worker": name,
-                "staff_id": opened.row.id if name == opened.row.name else fixture_runtime_id("another-worker"),
-                "status": status, "pid": pid, "label": label}))
+        for run_id, name, running, pid, label in (
+                ("live", opened.row.name, True, 101, "TEST suite"),
+                ("multiline", opened.row.name, True, 101, "TEST build\ncontinued"),
+                ("finished", opened.row.name, False, 101, "TEST finished"),
+                ("dead", opened.row.name, True, 102, "TEST dead"),
+                ("other", "another-worker", True, 101, "TEST other worker")):
+            _, record = self.detached_record(opened.row, run_id)
+            record.update(worker=name, status="running" if running else "finished", pid=pid, label=label)
+            if name != opened.row.name:
+                record["staff_id"] = fixture_runtime_id("another-worker")
+            atomic_file.write_text_atomic(directory / (run_id + ".json"), json.dumps(record))
         for alive, hold, expected, location, activity in (
                 (True, "", "busy", "known", "idle"), (False, "", "idle", "known", "idle"),
                 (True, "pause", "paused", "known", "idle"), (True, "exit", "exited", "known", "idle"),
