@@ -1013,8 +1013,15 @@ def cleanup_refused_claims(target: SshTarget, args: CliArguments, *, session: Su
                 continue
             lease = nullcontext()
             mirror = eligibility.KnownRepository(cleanup_scope.name, cleanup_scope.key)
-        try:
-            with lease:
+        with ExitStack() as cleanup:
+            try:
+                cleanup.enter_context(lease)
+            except copies.BusyRemoteMirror:
+                continue
+            except (OSError, conf.Unusable, copies.CopyError) as error:
+                print(f"build targets: {target.name}: cleanup lease unavailable: {error}", file=sys.stderr)
+                continue
+            try:
                 with mac_test.locked(paths.lock):
                     if mac_test.read_run(claim.path) != record:
                         continue
@@ -1031,10 +1038,10 @@ def cleanup_refused_claims(target: SshTarget, args: CliArguments, *, session: Su
                     release.attempt = record["attempt"]
                     release.settings = str(target.settings)
                     _ = mac_test.command_release(release, paths)
-        except copies.BusyRemoteMirror:
-            continue
-        except (conf.Unusable, copies.CopyError) as error:
-            print(f"build targets: {target.name}: cleanup settings unavailable: {error}", file=sys.stderr)
+            except copies.BusyRemoteMirror:
+                continue
+            except (conf.Unusable, copies.CopyError) as error:
+                print(f"build targets: {target.name}: cleanup settings unavailable: {error}", file=sys.stderr)
 
 
 def publish_wait_reservation(args: CliArguments, target: SshTarget,

@@ -250,12 +250,31 @@ class ProcessBoundClaim(ClaimOwnerRecord):
     """The claim holds Mac capacity while its process lives."""
 
 
+class ReplacedMacReservation(TypedDict):
+    """Identify the local reservation that a remote claim replaces."""
+
+    claim_id: str
+    episode: str
+    attempt: str
+    pid: int
+    proc_start: str
+    since: str
+    file: str
+
+
+def replaced_reservation(record: ProcessBoundClaim, path: Path, paths: StatePaths) -> ReplacedMacReservation:
+    return {"claim_id": record["claim_id"], "episode": record["episode"], "attempt": record["attempt"],
+            "pid": record["pid"], "proc_start": record["proc_start"], "since": record["since"],
+            "file": str(path.relative_to(paths.directory))}
+
+
 class RemoteJobClaim(ClaimOwnerRecord):
     """The claim holds Mac capacity until the named host confirms that its job ends."""
 
     remote_host: str
     cleanup_pending: NotRequired[bool]
     instance_generation: NotRequired[str]
+    replaced_reservation: NotRequired[ReplacedMacReservation]
 
 
 RunRecord = ProcessBoundClaim | RemoteJobClaim
@@ -421,6 +440,24 @@ class HeldClaim:
         return False
 
 
+def retire_replaced_reservation(paths: StatePaths, replacement: Path, record: RunRecord) -> tuple[Path, ...]:
+    """Remove the exact local reservation under the provider lock."""
+    if (paths.platform != "macos" or "remote_host" not in record or "replaced_reservation" not in record
+            or not isinstance(saved_mac_repository(record), MacRepositoryIdentity)):
+        return ()
+    replaced = record["replaced_reservation"]
+    path = paths.directory / replaced["file"]
+    if path == replacement:
+        return ()
+    old = read_run(path)
+    if (isinstance(old, NoRun) or "remote_host" in old
+            or isinstance(saved_mac_repository(old), MacRepositoryIdentity)
+            or replaced_reservation(old, path, paths) != replaced):
+        return ()
+    path.unlink(missing_ok=True)
+    return (path,)
+
+
 class NoRun:
     """No process owns the Mac."""
 
@@ -552,6 +589,8 @@ def read_run(path: Path) -> RunState:
     if not isinstance(host, str) or not host.strip():
         raise StateReadError(f"{path} has an invalid remote_host")
     remote: RemoteJobClaim = {**record, "remote_host": host}
+    if "replaced_reservation" in values:
+        remote["replaced_reservation"] = read_replaced_reservation(values["replaced_reservation"], path)
     if 'instance_generation' in values:
         generation = required_string(values, 'instance_generation', path)
         if not generation:
@@ -562,6 +601,29 @@ def read_run(path: Path) -> RunState:
             raise StateReadError(f"{path} has an invalid cleanup_pending")
         remote["cleanup_pending"] = True
     return remote
+
+
+def read_replaced_reservation(value: object, path: Path) -> ReplacedMacReservation:
+    if not isinstance(value, dict):
+        raise StateReadError(f"{path} has an invalid replaced reservation")
+    fields = cast(dict[str, object], value)
+    pid = fields.get("pid")
+    if type(pid) is not int:
+        raise StateReadError(f"{path} has an invalid replaced reservation pid")
+    file = required_string(fields, "file", path)
+    relative = Path(file)
+    if file != "run.json" and (len(relative.parts) != 2 or relative.parts[0] != "claims"
+                               or relative.suffix != ".json" or str(relative) != file):
+        raise StateReadError(f"{path} has an invalid replaced reservation file")
+    return {
+        "claim_id": required_string(fields, "claim_id", path),
+        "episode": required_string(fields, "episode", path),
+        "attempt": required_string(fields, "attempt", path),
+        "pid": pid,
+        "proc_start": required_string(fields, "proc_start", path),
+        "since": required_string(fields, "since", path),
+        "file": file,
+    }
 
 
 def aware_timestamp(value: object, path: Path, field: str) -> datetime:

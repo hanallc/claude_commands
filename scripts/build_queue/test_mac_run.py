@@ -1,7 +1,7 @@
 """Check mac-linux claims against the native Mac claim path."""
 from collections.abc import Callable, Generator
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import ExitStack, contextmanager, redirect_stdout
+from contextlib import ExitStack, contextmanager, redirect_stderr, redirect_stdout
 from dataclasses import replace
 import fcntl
 from io import StringIO
@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import shlex
 import subprocess
+import sys
 import tempfile
 from threading import Event
 import time
@@ -283,6 +284,55 @@ class MacRunTests(unittest.TestCase):
         self.assertTrue(marker.exists())
         self.assertEqual(claim_state.read_claims(self.paths), ())
 
+    def test_refused_cleanup_continues_after_a_lease_open_error(self) -> None:
+        settings = self.root / "mac_test.conf"
+        with settings.open("a") as config:
+            _ = config.write("mirror_root=~/.local/state/mac-test/mirror\n")
+        start = process_identity.process_start(os.getpid())
+        assert isinstance(start, process_identity.Started)
+        self.paths.claims.mkdir(parents=True)
+        first, second = (self.paths.claims / f"{name}.json" for name in ("first", "second"))
+        for index, path in enumerate((first, second), 1):
+            mac_test.write_json(path, {
+                "claim_id": path.stem, "episode": "wait", "attempt": "attempt", "submitting_session": "",
+                "pid": os.getpid(), "proc_start": f"{start.start}-ended", "what": "retained", "worktree": str(self.checkout),
+                "since": f"2026-11-22T00:00:0{index}+00:00", "remote_host": path.stem,
+            })
+        registry = copies.remote_registry()
+        lease = registry / (copies.remote_key("first", "") + ".host-lease")
+        lease.mkdir(parents=True)
+        before = first.read_bytes()
+        args = build_targets.CliArguments()
+        args.pid, args.repo_root = os.getpid(), str(self.checkout)
+        target = target_config.SshTarget("mac", "macos", settings)
+        config = eligibility.SshConnectionSettings("fixture-mac", 1, 1)
+        diagnostic = StringIO()
+        with mock.patch.object(eligibility, "read_connection_settings", return_value=config), \
+                mock.patch.object(offload, "check_leftovers", return_value=offload.LeftoversEnded()) as check, \
+                redirect_stderr(diagnostic):
+            build_targets.cleanup_refused_claims(target, args, session=NoOwningSession())
+        check.assert_called_once_with(config, "second", offload.ALL_MIRRORS, "mac", 1)
+        self.assertIn(str(lease), diagnostic.getvalue())
+        self.assertEqual(first.read_bytes(), before)
+        self.assertFalse(second.exists())
+
+    def test_linked_worktrees_with_a_relative_origin_share_capacity(self) -> None:
+        _ = subprocess.run(["git", "-C", str(self.checkout), "remote", "set-url", "origin", "../.claude"], check=True)
+        linked = self.root / "linked"
+        linked.mkdir()
+        worktrees = (self.root / "one", linked / "two")
+        for worktree in worktrees:
+            _ = subprocess.run(["git", "-C", str(self.checkout), "worktree", "add", "-q", "--detach",
+                                str(worktree)], check=True)
+        scopes = tuple(claim_state.target_claim_scope(self.paths, str(path)) for path in worktrees)
+        self.assertEqual(scopes, (claim_state.RepositoryScope(".claude", REPOSITORY_KEY),) * 2)
+        with mac_run.held(worktrees[0], "mac", SuiteMode.GATE, GATE_JOB_NOT_RECORDED):
+            with self.assertRaisesRegex(mac_run.MacRunRefused, "busy with mac-linux"):
+                with mac_run.held(worktrees[1], "mac", SuiteMode.GATE, GATE_JOB_NOT_RECORDED):
+                    self.fail("The second guest took the shared slot")
+        with mac_run.held(worktrees[1], "mac", SuiteMode.GATE, GATE_JOB_NOT_RECORDED):
+            self.assertEqual(len(claim_state.read_claims(self.paths)), 1)
+
     def test_mac_local_origins_follow_the_upstream_repository(self) -> None:
         source = claim_state.mac_repository_identity(str(self.repo))
         assert isinstance(source, claim_state.MacMirrorIdentity)
@@ -554,6 +604,91 @@ class MacRunTests(unittest.TestCase):
         self.assertEqual(fresh.record["what"], "replacement")
         runner.claim_id, runner.episode, runner.attempt = fresh.record["claim_id"], fresh.record["episode"], fresh.record["attempt"]
         self.assertEqual(mac_test.command_release(runner, self.paths), 0)
+
+    def test_interrupted_replacement_retires_the_wait_reservation(self) -> None:
+        script = """
+import os
+from pathlib import Path
+import sys
+from unittest.mock import patch
+
+from scripts.mac_test import mac_test
+
+path = Path(sys.argv[1])
+args = mac_test.parser().parse_args(sys.argv[3:], namespace=mac_test.CliArguments())
+if sys.argv[2] == "retry":
+    args.pid = os.getpid()
+unlink = Path.unlink
+
+def interrupt(self, *args, **kwargs):
+    if self == path:
+        os._exit(71)
+    return unlink(self, *args, **kwargs)
+
+with patch.object(Path, "unlink", interrupt):
+    sys.exit(mac_test.command_claim(args, mac_test.state_paths("mac"), watch_claim=False))
+"""
+        resolved = claim_state.mac_repository_identity(str(self.checkout))
+        assert isinstance(resolved, claim_state.ResolvedMacMirror)
+        saved = resolved.claim_repository()
+        assert isinstance(saved, claim_state.MacRepositoryIdentity)
+        config = eligibility.OffloadConfig(True, eligibility.SshConnectionSettings("fixture-mac", 1, 1),
+                                           1, 1, 1, "1", {})
+        for recovery in ("inspect", "retry", "release"):
+            with self.subTest(recovery=recovery):
+                waiting = self.native_claim(self.checkout)
+                if recovery == "release":
+                    waiting.episode, waiting.attempt = "episode", "attempt"
+                    waiting.claim_id = execution_identity.assigned_claim_id(waiting.episode, waiting.attempt)
+                self.assertEqual(mac_test.command_claim(waiting, self.paths, watch_claim=False,
+                                                       mac_repository=claim_state.WHOLE_MAC), 0)
+                old_path = self.paths.run
+                if recovery == "release":
+                    self.paths.claims.mkdir(exist_ok=True)
+                    old_path = old_path.rename(self.paths.claims / "zz-legacy.json")
+                reserved, = claim_state.read_claims(self.paths)
+                self.assertEqual(reserved.path, old_path)
+                identity = claim_state.claim_identity(reserved.record)
+                scope = claim_state.RepositoryScope(saved.mirror_name, saved.key)
+                assigned = placement.PlacementAssignment("episode", "attempt",
+                    placement.PlacementDestination("mac", "mac", "fixture-mac", scope),
+                    execution_identity.SourceKeyUnavailable("The fixture has no source key"),
+                    placement.SubmittingOwner("fixture-host", waiting.pid, reserved.record["proc_start"]),
+                    NoOwningSession(), 0)
+                request = offload.OffloadRequest(self.checkout, "hana", "test", offload.NO_RESULT_FILE, (),
+                    "verify", "", target="mac", placement=offload.AssignedOffloadRequest(assigned),
+                    admission=offload.MacClaimFromWait(waiting.pid, identity, NoOwningSession()))
+                command = offload.claim_arguments(request, config, retire_wait=True, mac_repository=saved)
+                child = subprocess.run([sys.executable, "-c", script, str(reserved.path), recovery, *command[2:]],
+                                       capture_output=True, text=True, timeout=5)
+                self.assertEqual(child.returncode, 71, child.stdout + child.stderr)
+                self.assertEqual(len(claim_state.read_claims(self.paths)), 2)
+                expected = claim_state.ClaimIdentity(execution_identity.assigned_claim_id(assigned.episode, assigned.attempt),
+                                                     assigned.episode, assigned.attempt)
+                if recovery == "inspect":
+                    controller = offload.ProcessController()
+                    controller.placement = request.placement
+                    inspection = offload.LocalClaimAttempt()
+                    controller.inspect_claim(inspection, expected)
+                    self.assertIsInstance(inspection.answer, offload.FreshMacClaim)
+                    self.assertEqual(controller.claim_identity, expected)
+                elif recovery == "retry":
+                    retry = mac_test.parser().parse_args(command[2:], namespace=mac_test.CliArguments())
+                    self.assertEqual(mac_test.command_claim(retry, self.paths, watch_claim=False), 13)
+                release = mac_test.CliArguments()
+                release.pid = os.getpid()
+                release.claim_id, release.episode, release.attempt = expected.claim_id, expected.episode, expected.attempt
+                if recovery == "release":
+                    self.assertEqual(mac_test.command_release(release, self.paths), 0)
+                    self.assertEqual(claim_state.read_claims(self.paths), ())
+                    continue
+                kept, = claim_state.read_claims(self.paths)
+                self.assertFalse(reserved.path.exists())
+                self.assertEqual(claim_state.claim_identity(kept.record), expected)
+                if recovery == "retry":
+                    self.assertTrue(kept.record.get("cleanup_pending"))
+                    self.assertEqual(kept.record["pid"], os.getpid())
+                self.assertEqual(mac_test.command_release(release, self.paths), 0)
 
     def test_cleanup_handoff_holds_the_mirror_lease_and_retries_direct_claim(self) -> None:
         with (self.root / "mac_test.conf").open("a") as settings:

@@ -1098,6 +1098,7 @@ class ProcessController:
                 start = process_identity.process_start(os.getpid())
                 if not isinstance(start, process_identity.Started) or start.start != record["proc_start"]:
                     continue
+                _ = claim_state.retire_replaced_reservation(paths, held.path, record)
                 self.claim_identity = expected
                 self.claim_scope_key = claim_state.claim_fence_directory(held.path, record)
                 self.mac_repository = claim_state.saved_mac_repository(record)

@@ -109,7 +109,9 @@ class MacSourceRepository:
 def mac_source_repository(worktree: str, common: str) -> MacSourceRepository:
     """Follow local clone origins from the checkout to the source repository."""
     checkout_origin = _mac_origin(["-C", worktree])
-    origin, directory = checkout_origin, worktree
+    origin = checkout_origin
+    # Use the shared Git directory to locate the checkout that owns the relative origin.
+    directory = os.path.dirname(common)
     seen = {common}
     while origin:
         source = local_origin_git_dir(origin, directory)

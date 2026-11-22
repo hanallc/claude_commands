@@ -140,6 +140,21 @@ class ClaimHeldByCopy:
 ClaimAttempt = ClaimFinished | ClaimDenied | ClaimBusy | ClaimHeldByCopy
 
 
+@dataclass(frozen=True)
+class _VerifiedMacReservation:
+    """A local Mac reservation that passed the retirement checks under the provider lock."""
+
+    path: Path
+    record: ProcessBoundClaim
+
+
+class _KeepOtherReservations:
+    """This acquisition does not replace a local reservation."""
+
+
+_KEEP_OTHER_RESERVATIONS = _KeepOtherReservations()
+
+
 class NoRemoteJob:
     """A claim requested for the calling process alone."""
 
@@ -863,8 +878,15 @@ def live_claims(paths: StatePaths) -> tuple[HeldClaim, ...]:
     """Read every claim and remove each one whose owner has ended."""
     from scripts.mac_test import offload
 
+    claims = read_claims(paths)
+    retired: set[Path] = set()
+    if paths.platform == "macos":
+        for claim in claims:
+            retired.update(claim_state.retire_replaced_reservation(paths, claim.path, claim.record))
     live: list[HeldClaim] = []
-    for claim in read_claims(paths):
+    for claim in claims:
+        if claim.path in retired:
+            continue
         if run_is_live(claim.record):
             live.append(claim)
         elif offload.pending_start_path(paths.target, claim_state.ClaimIdentity(
@@ -1988,7 +2010,8 @@ def claim_once(args: CliArguments, paths: StatePaths, scope: ClaimScope,
                assignment: placement.PlacementAssignment | UnassignedClaim = UNASSIGNED_CLAIM,
                mac_kind: MacClaimKind = MacClaimKind.MIRROR,
                mac_repository: claim_state.MacRepositoryIdentity | claim_state.CleanupOnlyMacRepository
-               | WholeMacScope = WHOLE_MAC, replaces: HeldClaim | None = None) -> ClaimAttempt:
+               | WholeMacScope = WHOLE_MAC,
+               replaces: _VerifiedMacReservation | _KeepOtherReservations = _KEEP_OTHER_RESERVATIONS) -> ClaimAttempt:
     """Acquire or replace a claim under state.lock."""
     if (isinstance(mac_repository, claim_state.MacMirrorIdentity)
             and not claim_state.valid_mac_path_component(mac_repository.mirror_name)):
@@ -1997,7 +2020,7 @@ def claim_once(args: CliArguments, paths: StatePaths, scope: ClaimScope,
         claims = live_claims(paths)
     except ClaimStateUnreadable as error:
         return ClaimDenied(12, f"state unreadable: {error.path}")
-    if replaces is not None:
+    if isinstance(replaces, _VerifiedMacReservation):
         claims = tuple(claim for claim in claims if claim.path != replaces.path)
     overlapping = tuple(claim for claim in claims if scopes_overlap(claim.scope, scope))
     identity = claim_state.ClaimIdentity(args.claim_id, args.episode, args.attempt)
@@ -2058,10 +2081,13 @@ def claim_once(args: CliArguments, paths: StatePaths, scope: ClaimScope,
     if (not target_config.uses_legacy_mac_layout(paths.platform) and isinstance(scope, RepositoryScope)
             and args.leased_slots and scope.slot not in args.leased_slots):
         return ClaimDenied(11, "the assigned claim slot is unavailable")
-    if replaces is None and (isinstance(args.remote, str) or reserve_wait):
+    if isinstance(args.remote, str) or reserve_wait:
         for claim in overlapping:
             record = claim.record
-            if cleanup_claim_matches(paths, claim, scope) and recoverable_kept_claim(record):
+            if (cleanup_claim_matches(paths, claim, scope) and recoverable_kept_claim(record)
+                    and (isinstance(replaces, _KeepOtherReservations)
+                         or record.get("replaced_reservation")
+                         == claim_state.replaced_reservation(replaces.record, replaces.path, paths))):
                 return take_over_kept_claim(args, claim, record, session=session)
     if not isinstance(block, NoMacBlock):
         return blocked_claim(block)
@@ -2093,6 +2119,8 @@ def claim_once(args: CliArguments, paths: StatePaths, scope: ClaimScope,
         claimed["copy"] = True
     if isinstance(args.remote, str):
         remote_claim: RemoteJobClaim = {**claimed, "remote_host": args.remote}
+        if isinstance(replaces, _VerifiedMacReservation):
+            remote_claim["replaced_reservation"] = claim_state.replaced_reservation(replaces.record, replaces.path, paths)
         claimed = remote_claim
     if isinstance(owner, OwningSession):
         claimed["holder_session"] = owner.session_id
@@ -2112,7 +2140,7 @@ def claim_once(args: CliArguments, paths: StatePaths, scope: ClaimScope,
     path.parent.mkdir(parents=True, exist_ok=True)
     # Keep the old reservation until the replacement is visible.
     write_json(path, claimed)
-    if replaces is not None and replaces.path != path:
+    if isinstance(replaces, _VerifiedMacReservation) and replaces.path != path:
         try:
             replaces.path.unlink(missing_ok=True)
         except OSError:
@@ -2216,7 +2244,7 @@ def adopt_wait_claim(args: CliArguments, paths: StatePaths, scope: ClaimScope,
                 replacement.episode, replacement.attempt = assignment.episode, assignment.attempt
                 replacement.claim_id = execution_identity.assigned_claim_id(assignment.episode, assignment.attempt)
             return claim_once(replacement, paths, replacement_scope, session=session, assignment=assignment,
-                              mac_repository=mac_repository, replaces=claim)
+                              mac_repository=mac_repository, replaces=_VerifiedMacReservation(claim.path, claim.record))
     record: RemoteJobClaim
     if "remote_host" in claim.record:
         record = {**claim.record}
@@ -2405,7 +2433,10 @@ def release_exact_claims(
             if isinstance(record, dict) and record["pid"] == pid and claim_state.claim_identity(record) == identity:
                 owned.append((path, record))
     transfers: list[transfer_bytes.TransferBytes] = []
+    retired: set[Path] = set()
     for path, record in owned:
+        if path in retired:
+            continue
         saved = claim_state.saved_mac_repository(record)
         with ExitStack() as cleanup:
             if paths.platform == "macos" and isinstance(remote_work, EndStoppedWork) and "remote_host" in record:
@@ -2450,6 +2481,7 @@ def release_exact_claims(
                 current = read_run(path)
                 if isinstance(current, NoRun) or claim_owner(current) != claim_owner(record):
                     return ClaimReleaseRefused("the exact claim changed during cleanup")
+                retired.update(claim_state.retire_replaced_reservation(paths, path, current))
                 transfers.extend(current.get("transfers", []))
                 pending.unlink(missing_ok=True)
                 path.unlink(missing_ok=True)
