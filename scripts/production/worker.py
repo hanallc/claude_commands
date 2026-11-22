@@ -1309,13 +1309,17 @@ def resume_step(row: staff.StaffRow, dispatch: progress_history.ActiveDispatch
     return receipt if isinstance(receipt, DispatchEvidenceUnknown) else NO_OWN_PASS
 
 
+class NoReplyContinuation(Enum):
+    SKIP = "the receipt does not require a continuation for a detached result"
+
+
 def _restore_reply_step(row: staff.StaffRow, dispatch: progress_history.ActiveDispatch, run: Path,
-                        record: staff.StaffSnapshot) -> BusyPass | None:
+                        record: staff.StaffSnapshot) -> BusyPass | NoReplyContinuation:
     """Check whether the active pass still needs a reply after a detached result."""
     passed = worker_panes.worker_pass(row, run, record=record)
     delivery = pass_recorder.dispatch_delivery(passed)
     if passed.get("instance_id") != dispatch.instance_id or not delivery.line:
-        return None
+        return NoReplyContinuation.SKIP
     receipt = dispatch_receipt(row, delivery.line, delivery.completion_id, run=run, require_transcript=True)
     if isinstance(receipt, DispatchEvidenceUnknown):
         raise ValueError(receipt.reason)
@@ -1323,17 +1327,17 @@ def _restore_reply_step(row: staff.StaffRow, dispatch: progress_history.ActiveDi
         receipt = receipt.reply
     if isinstance(receipt, (DispatchSubmitted, DispatchAwaitingReply)):
         return BusyPass(dispatch.instance_id)
-    return None
+    return NoReplyContinuation.SKIP
 
 
 def _resume_launcher(opened: worker_panes.OpenWorker,
                      dispatch: progress_history.ActiveDispatch | progress_history.NoActiveDispatch, *,
-                     run: Path, detached: str = "", continuation: BusyPass | None = None,
+                     run: Path, detached: str = "", continuation: BusyPass | NoReplyContinuation = NoReplyContinuation.SKIP,
                      on_submission: Callable[[], object] = lambda: None) -> ExitCode:
     """Read and deliver the resume step while restore holds the dispatch lock."""
     row = opened.row
-    step = continuation or (resume_step(row, dispatch)
-                            if isinstance(dispatch, progress_history.ActiveDispatch) else NO_OWN_PASS)
+    step = (continuation if isinstance(continuation, BusyPass) else
+            resume_step(row, dispatch) if isinstance(dispatch, progress_history.ActiveDispatch) else NO_OWN_PASS)
     if isinstance(step, DispatchEvidenceUnknown):
         print(f"anomaly: {row.name}: {step.reason}", file=sys.stderr)
         return ExitCode.UNCERTAIN
@@ -1501,6 +1505,9 @@ def restore(parent: StaffId, *, record: staff.StaffSnapshot | None = None,
                     if recovery is CompletionRecovery.RECOVERED:
                         changed = True
                         continue
+                    busy = isinstance(state, worker_panes.OpenWorker) and not state.status.idle
+                    if busy and recovery is CompletionRecovery.NO_PENDING_NOTICE:
+                        continue
                     active = progress_history.active_dispatch(state.row.id, run)
                     if isinstance(active, progress_history.ActiveDispatchUnavailable):
                         print(f"anomaly: {state.row.name}: {active.reason}", file=sys.stderr)
@@ -1508,13 +1515,13 @@ def restore(parent: StaffId, *, record: staff.StaffSnapshot | None = None,
                         continue
                     continuation = (_restore_reply_step(state.row, active, run, record)
                                     if recovery is CompletionRecovery.WAITING_ON_REPLY
-                                    and isinstance(active, progress_history.ActiveDispatch) else None)
+                                    and isinstance(active, progress_history.ActiveDispatch) else NoReplyContinuation.SKIP)
                     if (recovery in (CompletionRecovery.PENDING_CLOSE, CompletionRecovery.WAITING_ON_RUNS)
-                            or recovery is CompletionRecovery.WAITING_ON_REPLY and continuation is None):
+                            or recovery is CompletionRecovery.WAITING_ON_REPLY and continuation is NoReplyContinuation.SKIP):
                         print(f"{state.row.name}: {recovery.value}", file=sys.stderr)
                         outcome = ExitCode.UNCERTAIN
                         continue
-                    if isinstance(state, worker_panes.OpenWorker) and not state.status.idle:
+                    if busy:
                         continue
                     detached = detached_runs.resume_context(run / worker_lifecycle.DETACHED_RUNS_DIR, state.row.name)
                     if (not isinstance(active, progress_history.ActiveDispatch) and not detached
@@ -1535,7 +1542,7 @@ def restore(parent: StaffId, *, record: staff.StaffSnapshot | None = None,
                         print(f"{state.row.name}: not resumed: no-worker mode")
                         continue
                     resume = partial(_resume_launcher, run=run, detached=detached)
-                    if continuation is not None:
+                    if isinstance(continuation, BusyPass):
                         resume = partial(resume, continuation=continuation)
                     if not isinstance(state, worker_panes.OpenWorker):
                         role = worker_panes.dispatch_role(state.row)

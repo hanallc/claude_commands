@@ -718,6 +718,7 @@ class WorkerCommandTests(unittest.TestCase):
             return output
 
         selected = frozenset({row.id})
+        prompts_before = len(self.fixture.prompts())
         with (patch.object(world, "result", side_effect=read), patch.object(world, "run", side_effect=record_input),
               redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as errors):
             self.assertEqual(worker.restore(self.fixture.parent.id, only=selected), worker.ExitCode.OK)
@@ -728,7 +729,9 @@ class WorkerCommandTests(unittest.TestCase):
         current = staff.by_id(row.id)
         assert current is not None
         self.assertEqual(current.current_session, row.current_session)
-        prompt, = self.fixture.prompts()
+        prompts = self.fixture.prompts()[prompts_before:]
+        self.assertEqual(len(prompts), 1, prompts)
+        prompt = prompts[0]
         self.assertEqual(prompt[2], pane)
         if result_state == "pending":
             self.assertIn("Detached run: restart-check\n", prompt[3])
@@ -1226,7 +1229,7 @@ class WorkerCommandTests(unittest.TestCase):
             self.assertEqual(self.command("restore"), (0, f"{self.fixture.parent.name}: workers unchanged\n", ""))
         self.assertEqual(len(self.fixture.world.launches), before)
 
-    def test_restore_reports_each_worker_with_pending_completion(self) -> None:
+    def test_restore_continues_a_worker_when_another_workers_receipt_is_unreadable(self) -> None:
         impl = self.opened("impl")
         cm = self.opened("cm")
         dispatches: dict[str, str] = {}
@@ -1260,10 +1263,15 @@ class WorkerCommandTests(unittest.TestCase):
             return sorted(observe(parent, record), key=lambda state: state.row.name != "impl")
 
         _ = self.enterContext(patch.object(worker_panes, "observe", side_effect=observe_impl_first))
+        prompts_before = len(self.fixture.prompts())
         code, _, errors = self.command("restore")
         self.assertEqual(code, worker.ExitCode.UNCERTAIN)
-        self.assertEqual(errors.splitlines(), ["anomaly: impl: worker transcript has incomplete records",
-                                               "cm: a detached run result awaits a matching DONE"])
+        self.assertEqual(errors.splitlines(), ["anomaly: impl: worker transcript has incomplete records"])
+        prompts = self.fixture.prompts()[prompts_before:]
+        self.assertEqual(len(prompts), 1, prompts)
+        prompt = prompts[0]
+        self.assertEqual(prompt[2], cm.pane)
+        self.assertIn(f"Continue pass {dispatches['cm']} in this conversation.", prompt[3])
         self.assertIn(impl.pane, self.fixture.world.locations)
         self.assertIn(cm.pane, self.fixture.world.locations)
 
@@ -1304,10 +1312,12 @@ class WorkerCommandTests(unittest.TestCase):
         world = self.fixture.world
         result = world.result
         sibling = self.fixture.worker("absent-sibling")
-        for unreadable, replacement in ((False, "w1:p90"), (True, "w1:p91")):
+        for unreadable in (False, True):
             with self.subTest(unreadable=unreadable):
-                closing = self.opened(f"closing-{replacement[-1]}")
-                row = self.fixture.worker(f"replacement-{replacement[-1]}")
+                suffix = "unreadable" if unreadable else "readable"
+                closing = self.opened(f"closing-{suffix}")
+                row = self.fixture.worker(f"replacement-{suffix}")
+                replacement = f"w1:p{int(closing.pane.split(':p')[-1]) + 1}"
                 tab = cast(str, world.locations[closing.pane]["tab_id"])
 
                 def read(*arguments: str, deadline: float = math.inf) -> dict[str, object]:
