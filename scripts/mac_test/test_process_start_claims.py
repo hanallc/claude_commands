@@ -108,7 +108,7 @@ class ClaimProcessStartTests(unittest.TestCase):
                         self.assertEqual(mac_test.command_claim(reserve, paths, watch_claim=False, session=reserve.session), 0)
                         reserved, = mac_test.read_claims(paths)
                         saved = claim_state.MacRepositoryIdentity("fixture-key", "fixture-mirror",
-                                                                  reserved.path.name, reserved.path.stem, "fixture-history")
+                            reserved.path.name, reserved.path.stem, claim_state.KnownMacHistoryKey("fixture-history"))
                         mac_test.write_json(reserved.path, {**reserved.record, "worktree": raw if stored_raw_path else canonical,
                             "repo_key": saved.key, "repo_name": saved.mirror_name, "mac_repository": saved.record()})
                         status = mac_test.command_claim(adopt, paths, watch_claim=False, session=adopt.session)
@@ -374,7 +374,7 @@ class ClaimProcessStartTests(unittest.TestCase):
                     waiting = mac_test.read_run(paths.run)
                     assert not isinstance(waiting, mac_test.NoRun)
                     saved_mirror = claim_state.MacRepositoryIdentity("fixture-key", "fixture-mirror",
-                                                                     paths.run.name, paths.run.stem, "fixture-history")
+                        paths.run.name, paths.run.stem, claim_state.KnownMacHistoryKey("fixture-history"))
                     mac_test.write_json(paths.run, {**waiting, "repo_key": saved_mirror.key,
                         "repo_name": saved_mirror.mirror_name, "mac_repository": saved_mirror.record()})
                 args = mac_test.CliArguments()

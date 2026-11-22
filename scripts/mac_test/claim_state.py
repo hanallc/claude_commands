@@ -367,6 +367,10 @@ class CleanupOnlyMacRepository(MacMirrorIdentity):
     """The saved mirror identifies work for cleanup."""
 
 
+class UnknownMacHistoryKeyError(ValueError):
+    """The history reader returned its unknown identity."""
+
+
 @dataclass(frozen=True)
 class KnownMacHistoryKey:
     """The submitting checkout has this history key."""
@@ -374,8 +378,10 @@ class KnownMacHistoryKey:
     key: str
 
     def __post_init__(self) -> None:
-        if not self.key or self.key == store.UNKNOWN_IDENTITY:
-            raise ValueError("the Mac history key is unavailable")
+        if not self.key:
+            raise ValueError("the Mac history key is empty")
+        if self.key == store.UNKNOWN_IDENTITY:
+            raise UnknownMacHistoryKeyError("the Mac history key is unknown")
 
 
 class UnavailableMacHistoryKey:
@@ -391,9 +397,10 @@ READ_CHECKOUT_HISTORY_KEY = ReadCheckoutHistoryKey()
 
 def mac_history_key(key: str) -> KnownMacHistoryKey | UnavailableMacHistoryKey:
     """Convert the result of the build history reader."""
-    if not key or key == store.UNKNOWN_IDENTITY:
+    try:
+        return KnownMacHistoryKey(key)
+    except ValueError:
         return UnavailableMacHistoryKey()
-    return KnownMacHistoryKey(key)
 
 
 @dataclass(frozen=True)
@@ -411,22 +418,18 @@ class ResolvedMacMirror(MacMirrorIdentity):
             history_key = mac_history_key(repository.repository_key(self.worktree))
         if isinstance(history_key, UnavailableMacHistoryKey):
             return CleanupOnlyMacRepository(self.key, self.mirror_name, self.claim_file, self.fence_directory)
-        return MacRepositoryIdentity(self.key, self.mirror_name, self.claim_file, self.fence_directory, history_key.key)
+        return MacRepositoryIdentity(self.key, self.mirror_name, self.claim_file, self.fence_directory, history_key)
 
 
 @dataclass(frozen=True)
 class MacRepositoryIdentity(MacMirrorIdentity):
     """The saved mirror and history key required to execute work."""
 
-    history_key: str
-
-    def __post_init__(self) -> None:
-        if not self.history_key or self.history_key == store.UNKNOWN_IDENTITY:
-            raise ValueError("the Mac repository identity needs a history key")
+    history_key: KnownMacHistoryKey
 
     @override
     def record(self) -> MacRepositoryRecord:
-        return {**super().record(), "history_key": self.history_key}
+        return {**super().record(), "history_key": self.history_key.key}
 
 
 def mac_claim_key(key: str) -> str:
@@ -504,11 +507,15 @@ def mac_repository_record(value: object) -> MacRepositoryIdentity | CleanupOnlyM
     generation = fields.get("fence_generation", "")
     if not isinstance(generation, str) or ("fence_generation" in fields and not valid_fence_generation(generation)):
         raise StateReadError("invalid Mac fence generation")
-    history_key = fields.get("history_key", store.UNKNOWN_IDENTITY)
-    if not isinstance(history_key, str) or not history_key:
+    raw_history_key = fields.get("history_key", store.UNKNOWN_IDENTITY)
+    if not isinstance(raw_history_key, str):
         raise StateReadError("invalid Mac history key")
-    if history_key == store.UNKNOWN_IDENTITY:
+    try:
+        history_key = KnownMacHistoryKey(raw_history_key)
+    except UnknownMacHistoryKeyError:
         return CleanupOnlyMacRepository(key, mirror, file, fence, fence_generation=generation)
+    except ValueError as exc:
+        raise StateReadError("invalid Mac history key") from exc
     return MacRepositoryIdentity(key, mirror, file, fence, history_key, fence_generation=generation)
 
 

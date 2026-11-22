@@ -726,7 +726,7 @@ sys.exit(71)
                     saved = claim_state.saved_mac_repository(fresh.record)
                     assert isinstance(saved, claim_state.MacRepositoryIdentity)
                     self.assertEqual(saved.mirror_name, "source-b" if changed else ".claude")
-                    self.assertEqual(saved.history_key, queue_repository.key)
+                    self.assertEqual(saved.history_key.key, queue_repository.key)
                     self.assertEqual(controller.attempt_evidence.repository_key, queue_repository.key)
                     fresh_identity = claim_state.claim_identity(fresh.record)
                     if assigned:
@@ -1470,12 +1470,20 @@ with patch.object(Path, "unlink", interrupt_unlink), patch.object(Path, "replace
             read.assert_not_called()
             self.assertEqual(mirror.claim_repository(), supplied)
             read.assert_called_once_with(str(self.checkout))
-            read.return_value = store.UNKNOWN_IDENTITY
-            self.assertEqual(mirror.claim_repository(), absent)
-        self.assertIsInstance(supplied, claim_state.MacRepositoryIdentity)
+            for unavailable_key in ("", store.UNKNOWN_IDENTITY):
+                read.return_value = unavailable_key
+                self.assertEqual(mirror.claim_repository(), absent)
+        assert isinstance(supplied, claim_state.MacRepositoryIdentity)
+        self.assertIs(supplied.history_key, supplied_key)
         self.assertEqual(supplied.record(), {**mirror.record(), "history_key": history_key})
+        self.assertEqual(claim_state.mac_repository_record(supplied.record()), supplied)
         self.assertIsInstance(absent, claim_state.CleanupOnlyMacRepository)
         self.assertEqual(absent.record(), mirror.record())
+        self.assertEqual(claim_state.mac_repository_record(absent.record()), absent)
+        self.assertEqual(claim_state.mac_repository_record({**mirror.record(), "history_key": store.UNKNOWN_IDENTITY}), absent)
+        for invalid_key in ("", 1):
+            with self.subTest(invalid_key=invalid_key), self.assertRaisesRegex(claim_state.StateReadError, "invalid Mac history key"):
+                _ = claim_state.mac_repository_record({**mirror.record(), "history_key": invalid_key})
 
     def test_new_remote_claim_refuses_an_identity_without_history(self) -> None:
         args = self.native_claim(self.checkout)
@@ -1534,8 +1542,8 @@ with patch.object(Path, "unlink", interrupt_unlink), patch.object(Path, "replace
                          (self.repo.name, REPOSITORY_KEY, f"{stem}.json"))
         self.assertEqual(saved.fence_directory, stem)
         self.assertTrue(saved.fence_generation)
-        self.assertEqual(saved.history_key, str(self.repo))
-        self.assertEqual(controller.attempt_evidence.repository_key, saved.history_key)
+        self.assertEqual(saved.history_key.key, str(self.repo))
+        self.assertEqual(controller.attempt_evidence.repository_key, saved.history_key.key)
         self.assertEqual(origin_reads, [str(self.repo)])
 
     def test_fresh_takeover_waits_for_the_previous_hosts_cleanup_lease(self) -> None:
@@ -1639,7 +1647,7 @@ with patch.object(Path, "unlink", interrupt_unlink), patch.object(Path, "replace
                     assert isinstance(saved, claim_state.MacRepositoryIdentity)
                     self.assertEqual(saved.key, REPOSITORY_KEY if local_origin
                                      else "git-dir:" + str(metadata if checkout == separate else checkout / ".git"))
-                    self.assertEqual(saved.history_key, queue_repository.key)
+                    self.assertEqual(saved.history_key.key, queue_repository.key)
                     admission = offload.MacClaimFromWait(waiting.pid, claim_state.claim_identity(held.record), NoOwningSession())
                     request = offload.OffloadRequest(checkout, "hana", "test", offload.NO_RESULT_FILE, (),
                         "verify", "", target="mac", verb="check", admission=admission)
@@ -1671,7 +1679,7 @@ with patch.object(Path, "unlink", interrupt_unlink), patch.object(Path, "replace
         held, = claim_state.read_claims(self.paths)
         saved = claim_state.saved_mac_repository(held.record)
         assert isinstance(saved, claim_state.MacRepositoryIdentity)
-        self.assertEqual(saved.history_key, REPOSITORY_KEY)
+        self.assertEqual(saved.history_key.key, REPOSITORY_KEY)
         rewrite = "https://github.com/Team/History"
         _ = subprocess.run(["git", "-C", str(linked), "config", "--worktree",
                            f"url.{rewrite}.git.insteadOf", ORIGIN], check=True)
