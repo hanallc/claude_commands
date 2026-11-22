@@ -10,22 +10,15 @@ except FileNotFoundError:
 import hashlib
 import json
 import os
-import signal
 import subprocess
 import sys
 from pathlib import Path
-from types import FrameType
-from typing import TYPE_CHECKING, NoReturn, TypedDict, cast
+from typing import TYPE_CHECKING, TypedDict, cast
+
+from scripts.hooks.hook_budget import print_hook_error, run_hook_with_budget
 
 if TYPE_CHECKING:
     from scripts.production import staff
-
-
-HOOK_BUDGET_SECONDS = 5
-
-
-class HookBudgetSpent(Exception):
-    pass
 
 
 class PromptPayload(TypedDict, total=False):
@@ -39,8 +32,6 @@ def _record_typed_prompt() -> None:
         from scripts.message import escalate
 
         escalate.typed()
-    except HookBudgetSpent:
-        raise
     except Exception as error:
         lines = str(error).splitlines()
         detail = lines[0] if lines else ""
@@ -64,15 +55,13 @@ def _record_activity(session_id: str, source: str, prompt: str, record: staff.St
         _ = subprocess.Popen([*command, "active", "--source", source, "--session-id", session_id,
                               "--pane-id", os.environ.get("HERDR_PANE_ID", ""), "--prompt-hash", digest], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                              stderr=subprocess.DEVNULL, start_new_session=True)
-    except HookBudgetSpent:
-        raise
     except Exception as error:
         lines = str(error).splitlines()
         detail = lines[0] if lines else ""
         print(f"conversation-pause: auto silence: {type(error).__name__}: {detail}", file=sys.stderr)
 
 
-def main() -> None:
+def main(*, budgeted: bool = False) -> None:
     payload = cast(PromptPayload, json.loads(sys.stdin.read()))
     try:
         from scripts.hooks.compaction_marker import clear
@@ -87,14 +76,7 @@ def main() -> None:
         return
     prompt = payload.get("prompt", "")
 
-    budget = int(os.environ.get("CONVERSATION_PAUSE_HOOK_BUDGET", HOOK_BUDGET_SECONDS))
-
-    def budget_spent(_signal_number: int, _frame: FrameType | None) -> NoReturn:
-        raise HookBudgetSpent(f"gave up after {budget} seconds")
-
-    _ = signal.signal(signal.SIGALRM, budget_spent)
-    _ = signal.alarm(budget)
-    try:
+    def process_prompt() -> None:
         from scripts.hooks import conversation_pause
 
         source = conversation_pause.prompt_source(
@@ -172,15 +154,16 @@ def main() -> None:
             print(f"review hold: {error}", file=sys.stderr)
         if not emitted:
             emit()
-    finally:
-        _ = signal.alarm(0)
+
+    if budgeted:
+        run_hook_with_budget(process_prompt)
+    else:
+        process_prompt()
 
 
 if __name__ == "__main__":
     try:
-        main()
+        main(budgeted=True)
     except Exception as error:
-        lines = str(error).splitlines()
-        detail = lines[0] if lines else ""
-        print(f"conversation-pause: {type(error).__name__}: {detail}", file=sys.stderr)
+        print_hook_error(error)
     raise SystemExit(0)
