@@ -223,7 +223,14 @@ class WorktreeAttributionTests(unittest.TestCase):
     def test_claim_refuses_a_git_read_failure_inside_the_home(self) -> None:
         with mock.patch.object(phase_reservation, "repository_root", return_value=None):
             errors = self.assert_claim_refused("1", self.first)
-        self.assertIn(f"{self.first}: Git cannot read this path inside the unit home checkout", errors)
+        self.assertIn(f"{self.first}: Git cannot read this path inside a phase checkout", errors)
+
+    def test_claim_retry_refuses_a_git_read_failure_of_the_recorded_checkout(self) -> None:
+        self.assertEqual(self.claim("2", self.second), (0, ""))
+        with mock.patch.object(phase_reservation, "repository_root", return_value=None):
+            code, errors = self.claim("2", self.first)
+        self.assertEqual(code, 2, errors)
+        self.assertIn(f"{self.second}: Git cannot read this path inside a phase checkout", errors)
 
     def test_claim_uses_the_model_home_without_a_phase_worktree_file(self) -> None:
         directory = phase_reservation.phase_directory(self.session, "1")

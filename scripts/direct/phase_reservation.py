@@ -985,15 +985,17 @@ def _claim_command(args: argparse.Namespace) -> int:
     try:
         home = _phase_run_home(directory)
         _require_model_worktree(home.root.resolve(), home)
+        checkouts = [home.root.resolve()]
         if (directory / WORKTREE_FILE).is_file():
             recorded = phase_worktree(directory).root
+            checkouts.append(recorded.resolve())
             if recorded.is_dir():
                 requested = recorded
         elif (directory / BASELINE_FILE).is_file() and home.root.is_dir():
             requested = home.root
         root = repository_root(requested)
-        if root is None and requested.resolve().is_relative_to(home.root.resolve()):
-            raise StateRefused(f"{requested}: Git cannot read this path inside the unit home checkout")
+        if root is None and any(requested.resolve().is_relative_to(checkout) for checkout in checkouts):
+            raise StateRefused(f"{requested}: Git cannot read this path inside a phase checkout")
         if root is None:
             print("phase reservation: no repository or no files to claim; still awaiting first touch")
             return 0
