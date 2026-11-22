@@ -1342,3 +1342,13 @@ Ordered after the red main repair and the guard repair (builds). It does not mov
 - **Files:** `scripts/mac_test/mac_queue_run.py`; `scripts/production/mac_run.sh` only if needed; `scripts/production/test_mac_run.py`; `scripts/mac_test/test_mac_queue_run.py`; the as-built doc for Mac queue runs.
 - **Workers:** 1 writer.
 - **Acceptance gate:** fixtures for busy and damaged run.json exit 9 and start no remote command; the changed modules pass in tests-only gates after the builds go; basedpyright zero on changed files; one blind review.
+
+### Phase 435 — module_cost.py imports the gate module by its real name  · status: todo
+**Depends on:** none
+
+#### Work Order
+- **Goal:** gate 03:47: the nightly type check is red on `scripts/test_times/module_cost.py:34`. It imports `test_module_environment` from `scripts.production.merge_gate`, a shim that replaces itself with `scripts.production.gate` at run time, so basedpyright cannot see the name.
+- **Spec:** import from `scripts.production.gate`; no behavior change; no other file changes.
+- **Files:** `scripts/test_times/module_cost.py`.
+- **Workers:** 1 writer.
+- **Acceptance gate:** basedpyright zero on the file; the test_times module tests pass in the affected run before the hash; one blind review.
