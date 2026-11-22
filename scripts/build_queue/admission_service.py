@@ -3440,11 +3440,12 @@ for placement_pid in $placement_pids; do
 done
 '''
         probe = eligibility.SshProbeSettings(config)
-        options, timeout = offload.ssh_options(probe), probe.probe_timeout_s
         try:
+            # A build target registry without a usable unreachable wait raises conf.Unusable, a ValueError.
+            options = offload.ssh_options(probe)
             result = subprocess.run(["ssh", *options, host, "sh -c " + shlex.quote(script)],
                 stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-                check=False, timeout=timeout)
+                check=False, timeout=probe.probe_timeout_s)
             if result.returncode == 0:
                 for line in result.stdout.splitlines():
                     pid, separator, start = line.partition("\t")

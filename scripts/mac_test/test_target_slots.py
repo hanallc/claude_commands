@@ -34,7 +34,7 @@ from scripts.mac_test import eligibility, claim_state, mac_test, offload
 from scripts.mac_test.offload_test_support import split_mac_run_command
 from scripts.build_hold import owning_session as session_owner
 from scripts.build_targets import targets
-from scripts.lint.memory_test_support import config_environment, write_config_fixture
+from scripts.lint.memory_test_support import UNREACHABLE_WAIT_FIXTURE, config_environment, write_config_fixture
 
 
 class RepositoryKeyTests(unittest.TestCase):
@@ -120,7 +120,7 @@ class RepositorySlotTests(unittest.TestCase):
         _ = registry.write_text(
             "targets=mac,linux,natedev\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac.conf\n"
             + "kind.linux=ssh\nplatform.linux=linux\nsettings.linux=linux.conf\n"
-            + "kind.natedev=local\nplatform.natedev=linux\n"
+            + "kind.natedev=local\nplatform.natedev=linux\n" + UNREACHABLE_WAIT_FIXTURE
         )
         private = copies_environment(self.root)
         _ = shutil.copy2(Path(private["CONF_DIR"]) / "build_folders.conf", self.root / "build_folders.conf")
