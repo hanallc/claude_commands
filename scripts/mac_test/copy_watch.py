@@ -256,7 +256,7 @@ def read_mac_words(path: Path) -> MacWords | None:
     except (OSError, UnicodeDecodeError):
         return None
     macs = [line.removeprefix("mac=") for line in lines if line.startswith("mac=")]
-    if len(macs) != 1 or macs[0] not in ("passed", "failed", "lost", "declined"):
+    if len(macs) != 1 or macs[0] not in ("passed", "failed", "lost", "declined", "prelaunch_failed"):
         return None
     reason = seconds = ""
     for line in lines:
@@ -278,6 +278,8 @@ def copy_result(words: MacWords | None, status: int) -> CopyWin | CopyEnded:
         return CopyWin(words, status)
     if words.mac == "declined":
         return CopyEnded("declined", final=words.reason in FINAL_DECLINE_REASONS)
+    if words.mac == "prelaunch_failed" and words.reason and status not in (0, 75):
+        return CopyEnded("declined", final=True)
     return CopyEnded("lost", final=False)
 
 

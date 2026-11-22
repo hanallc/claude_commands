@@ -71,7 +71,7 @@ import subprocess
 import tempfile
 import threading
 import time
-from typing import Literal, TextIO, cast
+from typing import Literal, Protocol, TextIO, cast
 
 from scripts.agents import remote
 from scripts.lib import process_group
@@ -79,7 +79,8 @@ from scripts.lib.process_start import Started, Unreadable, Zombie, process_start
 from scripts.copies import copies
 from scripts.lib import build_folders, cancellation, conf, land_main, main_push_lock, session_folder, unit_runs, waiting_rows
 from scripts.lib.atomic_file import write_text_atomic
-from scripts.lib.build_steps import gate_job_for_command, read_step_names
+from scripts.lib.build_steps import (CLAIM_FAILURE_SUFFIX, MAC_LINUX_NO_ANSWER, MAC_LINUX_PRELAUNCH_REFUSED_STATUS,
+                                     gate_job_for_command, gate_job_from_process, read_step_names)
 from scripts.lint import sweep
 from scripts.message import send_budget, session_send
 from scripts.production import (  # noqa: E402
@@ -106,7 +107,7 @@ from scripts.lib.user_zone import user_zone  # noqa: E402
 from scripts.lib.process_failure import failure_detail  # noqa: E402
 from scripts.lib import scratch  # noqa: E402
 from scripts.test_times import gate_record
-from scripts.build_queue import admission_records  # noqa: E402
+from scripts.build_queue import admission_client, admission_records, admission_wire, placement  # noqa: E402
 from scripts.build_queue import progress_profile
 from scripts.build_queue.admission_client import AdmissionHoldCheck  # noqa: E402
 from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, GateJobNotRecorded, StepJob
@@ -197,9 +198,16 @@ class SharedMachine:
 
 
 @dataclass(frozen=True)
+class ConfiguredGateParent:
+    """Use the gate parent from build_folders.conf."""
+
+
+@dataclass(frozen=True)
 class WholeMachine:
     """Use every CPU without shared admission, holds, or failure reruns."""
     module_seconds: dict[str, float] = field(default_factory=dict[str, float])
+    gate_parent: ConfiguredGateParent | build_folders.ExplicitBuildParent = field(
+        default_factory=ConfiguredGateParent, kw_only=True)
 
 
 SHARED_MACHINE = SharedMachine()
@@ -1470,6 +1478,13 @@ def report_retained_gate_test_folders(tmpfs: Path) -> None:
             report_retained_gate_folder(str(folder), "an earlier test fixture created this folder")
 
 
+def gate_work_parent(machine: SharedMachine | WholeMachine) -> Path:
+    """Select the folder for gate recovery, state, and tests."""
+    if isinstance(machine, WholeMachine) and isinstance(machine.gate_parent, build_folders.ExplicitBuildParent):
+        return machine.gate_parent.path
+    return _gate_job_parent()
+
+
 def run_suites(repo: Path, type_dirs: Sequence[str] = (),
                module_time_limit_s: float = DEFAULT_MODULE_TIME_LIMIT_S,
                max_running_jobs: int = DEFAULT_MAX_RUNNING_JOBS, *,
@@ -1506,10 +1521,10 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
             raise GateRefused('selected modules are absent from the tested tree')
         modules = [(suite, path) for suite, path in modules if str(path.relative_to(repo)) in paths]
     runner = module_runner(repo)
-    tmpfs = _gate_job_parent()
-    if not tmpfs.is_dir() or not os.access(tmpfs, os.W_OK):
-        raise GateRefused(f"the test runner requires a writable gate folder at {tmpfs}")
-    report_retained_gate_test_folders(tmpfs)
+    gate_parent = gate_work_parent(machine)
+    if not gate_parent.is_dir() or not os.access(gate_parent, os.W_OK):
+        raise GateRefused(f"the test runner requires a writable gate folder at {gate_parent}")
+    report_retained_gate_test_folders(gate_parent)
     hold = BuildHoldWait() if shared else None
     if hold is not None:
         hold.wait_until_free()
@@ -1559,7 +1574,7 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
     if isinstance(time_limit, gate_record.NoGateTimeLimit):
         print(f"Gate time limit disabled: {time_limit.reason}", flush=True)
     scope_prefix = suite_scope_prefix() if shared else []
-    state_directory = gate_state_dir() if shared else tmpfs
+    state_directory = gate_state_dir() if shared else gate_parent
     timings_path = state_directory / "module_seconds.json"
     timings = read_measures(timings_path) if isinstance(machine, SharedMachine) else machine.module_seconds.copy()
     cpu_path = state_directory / "module_cpu_seconds.json"
@@ -1620,8 +1635,8 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
 
     folder_tool = "g" if mode is SuiteMode.GATE else "t"
     module_number = 0
-    with ((gate_recovery(repo) if shared else private_gate_recovery(repo, tmpfs)) as recovery, record_on_abort(),
-          gate_temporary(recovery, folder_tool, tmpfs) as temporary,
+    with ((gate_recovery(repo) if shared else private_gate_recovery(repo, gate_parent)) as recovery, record_on_abort(),
+          gate_temporary(recovery, folder_tool, gate_parent) as temporary,
           ExitStack() as module_folders,
           (gate_reservation(repo, temporary, hold, type_dirs=type_dirs, mode=mode) if hold is not None else nullcontext(None)) as reservation,
           (shared_cpu_pool() if shared else nullcontext(NoSharedCPU())) as cpu_pool):
@@ -1829,7 +1844,7 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
                 if running or pending:
                     time.sleep(0.05)
         finally:
-            # Only terminate groups created by this runner. Reap them before tmpfs cleanup.
+            # Reap this runner's groups before the gate folder cleanup.
             with cancellation.defer_cleanup_signals():
                 stop_gate_jobs(running)
                 for job in running:
@@ -2245,7 +2260,8 @@ def merge_checkpoint(args: GateArguments) -> int:
         if isinstance(recovery, GateRecovery):
             recovery.rollback = ""
             recovery.save()
-        raise GateRefused(f"{error or type(error).__name__}; merge undone, not pushed") from error
+        refused = MacLinuxNoAnswer if isinstance(error, MacLinuxNoAnswer) else GateRefused
+        raise refused(f"{error or type(error).__name__}; merge undone, not pushed") from error
     if isinstance(recovery, GateRecovery):
         recovery.rollback = ""
         recovery.save()
@@ -2919,37 +2935,157 @@ def combine_gate_runs(first: GateRun, second: GateRun, *, seconds: float) -> Gat
                    time_limit_report=reports)
 
 
+@dataclass(frozen=True)
+class NoGateAssignment:
+    """The caller supplied no placement file."""
+
+
+class GateAssignmentRefused(GateRefused):
+    """The gate could not verify the placement supplied by the caller."""
+
+
+def current_gate_target(mode: SuiteMode, gate_job: StepJob | GateJobNotRecorded) -> str | NoGateAssignment:
+    """Return the target from the queue assignment for this gate."""
+    path = os.environ.get("BUILDLOG_PLACEMENT_FILE")
+    if path is None:
+        return NoGateAssignment()
+    if not path:
+        raise GateAssignmentRefused("BUILDLOG_PLACEMENT_FILE is empty")
+    try:
+        saved = admission_wire.read_assignment(Path(path)).assignment
+    except (OverflowError, ValueError, OSError, admission_wire.AdmissionUnavailable) as error:
+        raise GateAssignmentRefused(f"Cannot read the gate placement file {path!r}: {error}") from error
+    if saved.episode != os.environ.get("BUILDLOG_PLACEMENT_EPISODE"):
+        raise GateAssignmentRefused("The placement episode does not match BUILDLOG_PLACEMENT_EPISODE")
+    if not isinstance(gate_job, StepJob):
+        raise GateAssignmentRefused("The placement has no recorded gate job to verify")
+    owner = saved.owner
+    identity = build_hold.ProcessIdentity(owner.pid, owner.start_time)
+    pid = os.getpid()
+    if owner.host != host_name() or identity not in build_hold.caller_processes(build_hold.PROC_ROOT, pid):
+        raise GateAssignmentRefused("The placement owner is not this process or a live ancestor")
+    if (owner.pid != pid and gate_job != gate_job_from_process(
+            mode.value, build_hold.PROC_ROOT / str(owner.pid), start_time=owner.start_time)):
+        raise GateAssignmentRefused("The placement owner's command does not match this gate job")
+    try:
+        status = admission_client.placement_status(saved.episode, saved.attempt, wait_for_service=False).status
+    except (OverflowError, ValueError, OSError, admission_wire.AdmissionUnavailable) as error:
+        raise GateAssignmentRefused(f"Cannot query the gate placement status: {error}") from error
+    if isinstance(status, admission_wire.UnknownPlacementStatus):
+        raise GateAssignmentRefused("The queue does not know the gate placement attempt")
+    if status.assignment != saved:
+        raise GateAssignmentRefused("The queue assignment does not match the gate placement file")
+    if isinstance(status.state, placement.ClosedAssignment):
+        raise GateAssignmentRefused(f"The gate placement attempt is stale: {status.state.reason}")
+    return saved.destination.target
+
+
+class MacLinuxGateRefused(GateRefused):
+    """The assigned Mac Linux guest could not complete the gate."""
+
+
+class MacLinuxNoAnswer(GateRefused):
+    """The assigned Mac Linux guest took no run. The caller can place the gate again."""
+
+
+class GuestNotStartedOutcome(Protocol):
+    @property
+    def reason(self) -> str: ...
+
+
+class MacLinuxGateRoute(Protocol):
+    """Run the tests and type checks in the Mac Linux guest."""
+
+    def route(self, repo: Path, *, mode: SuiteMode, full: bool,
+              module_time_limit_s: float, selected: AllModules | TreeSelection,
+              gate_job: StepJob | GateJobNotRecorded,
+              type_dirs: Sequence[str]) -> GateRun | GuestNotStartedOutcome | str: ...
+
+
+def report_mac_linux_no_answer(reason: str) -> MacLinuxNoAnswer:
+    """Write the claim failure next to the placement file for the caller that owns the placement."""
+    path = Path(os.environ["BUILDLOG_PLACEMENT_FILE"])
+    assignment = admission_wire.read_assignment(path).assignment
+    failure = admission_wire.ClaimFailure(token_hex(16), assignment, MAC_LINUX_NO_ANSWER)
+    write_text_atomic(path.with_name(path.name + CLAIM_FAILURE_SUFFIX), admission_wire.encode_request(failure))
+    return MacLinuxNoAnswer(f"Mac Linux guest took no run: {reason}")
+
+
 def run_gate_suites(repo: Path, type_dirs: Sequence[str] = (),
                     module_time_limit_s: float = DEFAULT_MODULE_TIME_LIMIT_S, *,
                     source: Literal["tests-only", "checkpoint"] = "tests-only", full: bool = False,
                     mode: SuiteMode = SuiteMode.GATE,
                     gate_job: StepJob | GateJobNotRecorded = GATE_JOB_NOT_RECORDED) -> GateRun:
-    """Route gates through AWS. Split affected tests between natedev and the Mac."""
+    """Route the whole test selection to the Mac Linux guest, AWS, or natedev."""
     def run_local(types: Sequence[str]) -> GateRun:
         return run_suites(repo, types, module_time_limit_s, source=source, full=full, mode=mode)
-
-    cloud = cast(CloudGateRoute, cast(object, import_module('scripts.aws_target.cloud_gate')))
 
     def run_local_subset(paths: tuple[str, ...], types: Sequence[str]) -> GateRun:
         return run_suites(repo, types, module_time_limit_s, source=source, full=full,
                           mode=mode, selected=SelectedModules(paths))
 
-    def run_cloud(selection: AllModules | TreeSelection) -> GateRun:
-        outcome = cloud.route(repo, mode=mode, full=full, module_time_limit_s=module_time_limit_s,
-                              selected=selection, gate_job=gate_job)
-        if isinstance(outcome, str):
-            print('Cloud gate uses natedev: ' + outcome, flush=True)
-            return run_local(type_dirs)
+    def finish_remote(outcome: GateRun) -> GateRun:
         if not type_dirs or outcome.time_limit_report:
             return outcome
         local = run_local_subset((), type_dirs)
         return combine_gate_runs(outcome, local, seconds=outcome.seconds + local.seconds)
 
+    def run_cloud(selection: AllModules | TreeSelection) -> GateRun:
+        outcome = cloud.route(repo, mode=mode, full=full, module_time_limit_s=module_time_limit_s,
+                              selected=selection, gate_job=gate_job)
+        if isinstance(outcome, str):
+            if not isinstance(target, NoGateAssignment):
+                raise GateRefused(f"AWS gate failed: {outcome}")
+            print('Cloud gate uses natedev: ' + outcome, flush=True)
+            return run_local(type_dirs)
+        return finish_remote(outcome) if isinstance(target, NoGateAssignment) else outcome
+
+    def run_guest(selection: AllModules | TreeSelection) -> GateRun:
+        guest = cast(MacLinuxGateRoute, cast(object, import_module("scripts.build_targets.mac_linux")))
+        outcome = guest.route(repo, mode=mode, full=full, module_time_limit_s=module_time_limit_s,
+                              selected=selection, gate_job=gate_job, type_dirs=type_dirs)
+        if isinstance(outcome, str):
+            raise MacLinuxGateRefused(f"Mac Linux guest gate failed: {outcome}")
+        if not isinstance(outcome, GateRun):
+            raise report_mac_linux_no_answer(outcome.reason)
+        if not outcome.passed:
+            print("Mac Linux guest gate failed", file=sys.stderr, flush=True)
+            if outcome.time_limit_report:
+                print(outcome.time_limit_report, file=sys.stderr, flush=True)
+            for job in outcome.jobs:
+                if job.returncode:
+                    print(f"--- {job.suite}/{job.module} exit={job.returncode} ---\n{job.output}",
+                          file=sys.stderr, flush=True)
+        return outcome
+
+    target = current_gate_target(mode, gate_job)
+    match target:
+        case "natedev":
+            return run_local(type_dirs)
+        case "mac-linux":
+            key = "enabled.mac-linux"
+            try:
+                enabled = conf.read("build_targets").value(key, conf.on_off, default=False, recover_invalid=False)
+            except conf.Unusable as error:
+                raise MacLinuxGateRefused(f"Mac Linux guest gate cannot read build_targets.conf {key}: {error}") from error
+            if not enabled:
+                raise MacLinuxGateRefused(f"Mac Linux guest gate refused with build_targets.conf {key}=off")
+            run_selected = run_guest
+        case "aws":
+            if type_dirs:
+                raise GateRefused("The AWS gate route does not support type checks")
+            run_selected = run_cloud
+        case NoGateAssignment():
+            run_selected = run_cloud
+        case _:
+            raise GateRefused(f"The gate does not support the assigned target {target}")
+
+    cloud = cast(CloudGateRoute, cast(object, import_module('scripts.aws_target.cloud_gate')))
     absent = [name for name in type_dirs if not (repo / name).exists()]
     if absent:
         raise GateRefused(f"type dirs not found under {repo}: {', '.join(absent)}")
     if mode is SuiteMode.GATE:
-        return run_cloud(ALL_MODULES)
+        return run_selected(ALL_MODULES)
 
     selected: AllModules | TreeSelection = ALL_MODULES
     whole_suite = full
@@ -2962,14 +3098,19 @@ def run_gate_suites(repo: Path, type_dirs: Sequence[str] = (),
                        else CleanTestTree(tree, checked_git(repo, "rev-parse", "HEAD")))
         modules = discover_test_modules(repo)
         selection, ledger = select_targeted_modules(repo, tested_tree, modules, source=source)
-        if ledger.reuse(report=False):
-            return run_local(type_dirs)
+        unassigned = isinstance(target, NoGateAssignment)
+        if ledger.reuse(report=not unassigned and not type_dirs):
+            if unassigned:
+                return run_local(type_dirs)
+            if type_dirs:
+                return run_selected(TreeSelection((), tree))
+            return GateRun((), 0.0, 0.0, tests_reused=True)
         whole_suite = isinstance(selection, FullSuite)
         paths = selection.modules if isinstance(selection, AffectedSelection) else tuple(path for _, path in modules)
         selected = TreeSelection(tuple(str(path.relative_to(repo)) for path in paths), tree)
         if isinstance(selection, AffectedSelection) and not selection.modules:
             if type_dirs:
-                return run_local(type_dirs)
+                return run_local(type_dirs) if unassigned else run_selected(selected)
             ledger.record_pass(selection)
             record_gate_run(ledger, (), (), {}, {}, started_at=time.time(), wall_s=0.0,
                             hold_wait_s=0.0, selection=selection, reused=False, reason="", status=0,
@@ -2977,7 +3118,7 @@ def run_gate_suites(repo: Path, type_dirs: Sequence[str] = (),
             return GateRun((), 0.0, 0.0, selection_certified=True)
 
     # Nate ordered the Mac split off on 2026-11-21.
-    return run_cloud(selected)
+    return run_selected(selected)
 
     mac_module = mac_gate_process.MAC_GATE_MODULE  # pyright: ignore[reportUnreachable]
     try:
@@ -3107,6 +3248,9 @@ def run_tests_only(args: GateArguments, mode: SuiteMode) -> int:
             if run.time_limit_report:
                 tell_time_limit(copies.source_owner(repo), repo, run)
             return 0 if run.passed else 1
+    except MacLinuxNoAnswer as error:
+        print(f"REFUSED: {error}", file=sys.stderr, flush=True)
+        return MAC_LINUX_PRELAUNCH_REFUSED_STATUS
     except (copies.CopyError, GateRefused, OSError, subprocess.SubprocessError, KeyboardInterrupt) as error:
         print(f"REFUSED: {error}", file=sys.stderr, flush=True)
         return 1
@@ -3222,6 +3366,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 return 0
             with gate_recovery(checkout):
                 return merge_checkpoint(args)
+    except MacLinuxNoAnswer as error:
+        print(f"REFUSED: {error}", file=sys.stderr, flush=True)
+        return MAC_LINUX_PRELAUNCH_REFUSED_STATUS
     except (copies.CopyError, GateRefused, OSError, subprocess.SubprocessError, KeyboardInterrupt) as error:
         print(f"REFUSED: {error}", file=sys.stderr, flush=True)
         return 1

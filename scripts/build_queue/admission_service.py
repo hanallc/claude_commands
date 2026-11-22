@@ -29,7 +29,7 @@ import threading
 import time
 import uuid
 from types import MappingProxyType
-from typing import Callable, Protocol, cast, override
+from typing import TYPE_CHECKING, Callable, Literal, Protocol, cast, override
 
 from scripts.build_queue import execution_identity
 from scripts.build_hold.owning_session import NoOwningSession, OwningSession
@@ -66,6 +66,9 @@ from scripts.build_queue.scope_activity import (
 from scripts.lint.build_shape import build_shape, recorded_build_shape
 from scripts.lib.atomic_file import atomic_sample, write_text_atomic
 from scripts.accounts import outage_alerts
+
+if TYPE_CHECKING:
+    from scripts.mac_test.claim_state import RemoteJobClaim
 
 
 
@@ -698,7 +701,7 @@ def raw_reservation_memory(record: ReservationRecord, row: records.Reservation,
         return records.GoneMemory()
     if isinstance(lifetime, gate.PopulatedStepScope):
         try:
-            return gate.process_memory(lifetime, proc)
+            return gate.scope_memory(lifetime.directory, gate.ScopeMembershipPass())
         except FileNotFoundError:
             identity = processes.get(row["pid"])
             if identity is None or identity.start != row["start_time"]:
@@ -806,8 +809,9 @@ def read_system(plan: SystemReadingPlan, readings: Readings, proc: Proc, clock: 
             sample_file(Path(record.path).with_suffix(".max")),
             sample_file(Path(record.path).with_suffix(".wave")), gate.observed_test_phase(row), scope)
     # Capture every scope before the loop applies current reservation ownership.
+    membership = gate.ScopeMembershipPass()
     unowned = gate.unowned_slice_memory([], processes, proc.path,
-        activity_reader=activity, ci_memory_slice=plan.config.ci_memory_slice)
+        activity_reader=activity, ci_memory_slice=plan.config.ci_memory_slice, membership=membership)
     has_caller = plan.runs or any(isinstance(row.activity, ScopeProcesses) and row.activity.session_id for row in unowned)
     staff_members = records.queue_staff() if has_caller else records.NO_STAFF_LOOKUP
 
@@ -820,12 +824,9 @@ def read_system(plan: SystemReadingPlan, readings: Readings, proc: Proc, clock: 
     members: dict[str, frozenset[int]] = {}
     workers: dict[str, frozenset[int]] = {}
     for reading in unowned:
-        if not reading.cgroup:
+        if not reading.cgroup or reading.diagnostic:
             continue
-        try:
-            members[reading.cgroup] = frozenset(gate.scope_members(Path(reading.cgroup)))
-        except (OSError, ValueError):
-            members[reading.cgroup] = frozenset()
+        members[reading.cgroup] = membership.read(Path(reading.cgroup))
         if not isinstance(records.recorded_service_state(reading), NotServiceSlice):
             programs = gate.member_programs(members[reading.cgroup].intersection(processes), proc.path)
             workers[reading.cgroup] = frozenset(pid for pid, name in programs.items() if name == "Runner.Worker")
@@ -847,11 +848,13 @@ def read_system(plan: SystemReadingPlan, readings: Readings, proc: Proc, clock: 
         if not isinstance(evidence, ScopeProcesses):
             continue
         live_run = LiveBuildRun(run.pid, run.start_time, activity.started_at(run.pid) or place.since)
-        measured = gate.tree_memory(run.pid, run.start_time, processes, proc.path)
-        if isinstance(measured, records.GoneMemory):
-            continue
+        tree = gate.process_tree({run.pid: run.start_time}, processes)
+        measured = gate.process_memory(tree - scope_process_memory.keys(), proc.path)
+        cached = [scope_process_memory[pid] for pid in tree & scope_process_memory.keys()]
+        used = measured.bytes + sum(item.bytes for item in cached)
+        swap = measured.swap_bytes + sum(item.swap_bytes for item in cached)
         caller = scope_caller(evidence, place.unit)
-        memory = records.UnownedSliceMemory(measured.bytes, swap_bytes=measured.swap_bytes,
+        memory = records.UnownedSliceMemory(used, swap_bytes=swap,
             pid=run.pid, activity=replace(evidence, run=live_run, session_name=caller.name))
         between.append(records.RunningStep(caller.session_id, caller.name, "between steps",
             evidence.folder, 0, memory, live_run, live_run.started_at, pid=run.pid, unit=caller.unit))
@@ -1120,7 +1123,7 @@ def same_remote_resource(first: placement.PlacementDestination, second: placemen
     from scripts.mac_test.mac_test import scopes_overlap
 
     return (first.provider == second.provider and first.target == second.target
-            and scopes_overlap(first.scope, second.scope))
+            and scopes_overlap(first.scope, second.scope, mac=first.provider == "mac"))
 
 
 @dataclass(frozen=True)
@@ -3347,32 +3350,41 @@ class AdmissionServer:
             if isinstance(target, target_config.SshTarget):
                 answer = build_targets.ssh_target_eligibility(target, Path(request.constraints.repository),
                     request.constraints.package, kind, target_config.ANY_ELIGIBLE_TARGET,
-                    new_step=True, session=key.session, configuration=configuration)
+                    new_step=True, session=key.session, configuration=configuration, mac_scope=destination.scope)
             else:
                 answer = build_targets.mac_target_eligibility(target, Path(request.constraints.repository),
                     request.constraints.package, kind, target_config.ANY_ELIGIBLE_TARGET, session=key.session,
-                    configuration=configuration)
+                    configuration=configuration, mac_scope=destination.scope)
             eligibility = (placement.TemporaryExclusion(answer.reason)
                 if isinstance(answer, target_config.ExcludedTarget) else placement.AllowedHost())
         paths = claim_state.state_paths(destination.target)
+        with claim_state.locked(paths.lock):
+            held, _ = claim_state.sweep_mac_replacements(paths, claim_state.read_claims(paths))
         # Routing keeps a busy Mac eligible so a step can wait for it. Placement must wait too,
         # or each pass makes a new attempt that the Mac refuses as busy.
         if (isinstance(eligibility, placement.AllowedHost) and isinstance(target, target_config.SshTarget)
                 and target.platform == "macos"
                 and mac_test.free_now(paths, target.settings, Path(request.constraints.repository),
-                                      session=key.session, configuration=configuration) == "busy"):
+                                      session=key.session, configuration=configuration,
+                                      mac_scope=destination.scope) == "busy"):
             eligibility = placement.TemporaryExclusion("busy")
         adopted: list[placement.AdoptedProviderClaim] = []
         cleanup: list[placement.RetainedCleanupClaim] = []
         executions: list[tuple[placement.ProviderClaimReference, execution_identity.ExecutionEvidence]] = []
-        with claim_state.locked(paths.lock):
-            held = claim_state.read_claims(paths)
         holder = placement.ResourceHolderUnknown()
         diagnostic: placement.BusyProviderDiagnostic | placement.NoProviderDiagnostic = placement.NO_PROVIDER_DIAGNOSTIC
-        scope = claim_state.target_claim_scope(paths, request.constraints.repository)
+        scope = destination.scope
+        if paths.platform == "linux":
+            scope = claim_state.target_claim_scope(paths, request.constraints.repository)
         for claim in held:
-            if (mac_test.scopes_overlap(claim.scope, scope)
-                    and mac_test.run_holds_work(claim.record)):
+            if not mac_test.claim_blocks_scope(paths, claim, scope):
+                continue
+            if paths.platform == "macos" and (mac_test.run_is_kept(claim.record) or claim.record.get("cleanup_pending")):
+                if isinstance(diagnostic, placement.NoProviderDiagnostic):
+                    diagnostic = placement.BusyProviderDiagnostic(
+                        destination.target, claim.record["what"] + " (kept for cleanup)", claim.record["since"])
+                continue
+            if mac_test.run_holds_work(claim.record):
                 diagnostic = placement.BusyProviderDiagnostic(destination.target, claim.record["what"], claim.record["since"])
                 session_id = claim.record.get("holder_session", "")
                 if session_id and session_id != claim_state.session_id(key.session):
@@ -3381,9 +3393,17 @@ class AdmissionServer:
         generation = ""
         for claim in held:
             record = claim.record
-            if "remote_host" not in record:
+            if "remote_host" not in record or "replaced_reservation" in record:
                 continue
-            reference = placement.ProviderClaimReference(destination.provider, destination.target, claim.scope,
+            reference_scope = claim.scope
+            if paths.platform == "macos":
+                saved = self.assignments.get(execution_identity.attempt_key(record["episode"], record["attempt"]))
+                if saved is not None:
+                    assigned = saved.assignment.destination
+                    if (assigned.provider == destination.provider and assigned.target == destination.target
+                            and claim.matches_mac_assignment_scope(assigned.scope)):
+                        reference_scope = assigned.scope
+            reference = placement.ProviderClaimReference(destination.provider, destination.target, reference_scope,
                 record["claim_id"], record["episode"], record["attempt"])
             session_id = record["submitting_session"]
             session = OwningSession(session_id) if session_id else NoOwningSession()
@@ -3395,20 +3415,27 @@ class AdmissionServer:
                 placement.ClaimHolderIdentity(self.host, record["pid"], record["proc_start"]),
                 session, record["remote_host"], record.get("instance_generation", "")))
             executions.append((reference, self._observe_provider_execution(request, destination, reference,
-                record["remote_host"], record.get("instance_generation", ""), configuration)))
+                record, paths.platform, configuration)))
         return placement.FreshHostEvidence(key, self.clock.now(), generation, eligibility, tuple(adopted), tuple(cleanup), tuple(executions), holder, diagnostic)
 
     def _observe_provider_execution(self, request: wire.PlacementRequest, destination: placement.PlacementDestination,
-                                    reference: placement.ProviderClaimReference, host: str, generation: str,
+                                    reference: placement.ProviderClaimReference, record: RemoteJobClaim,
+                                    platform: Literal["linux", "macos"],
                                     config: conf.ConfigRead) -> execution_identity.ExecutionEvidence:
         """Read existing mirror process evidence without invoking provider cleanup."""
         from scripts.mac_test import eligibility, offload, claim_state
 
         if isinstance(eligibility.read_backoff(time.time(), destination.target), eligibility.ActiveBackoff):
             return execution_identity.ExecutionEvidenceUnavailable("provider retry backoff is active", self.clock.now())
-        repository = eligibility.repository_identity(Path(request.constraints.repository))
-        if not isinstance(repository, eligibility.KnownRepository):
-            return execution_identity.ExecutionEvidenceUnavailable("repository execution scope is unavailable", self.clock.now())
+        if platform == "macos":
+            saved = claim_state.saved_mac_repository(record)
+            if not isinstance(saved, claim_state.MacMirrorIdentity):
+                return execution_identity.ExecutionEvidenceUnavailable("the claim has no saved Mac mirror", self.clock.now())
+            repository = eligibility.KnownRepository(saved.mirror_name, saved.key)
+        else:
+            repository = eligibility.repository_identity(Path(request.constraints.repository))
+            if not isinstance(repository, eligibility.KnownRepository):
+                return execution_identity.ExecutionEvidenceUnavailable("repository execution scope is unavailable", self.clock.now())
         scope = reference.scope
         slot = scope.slot if isinstance(scope, claim_state.RepositoryScope) and scope.slot else destination.slot or 1
         script = offload.mirror_selector_script(repository, destination.target, slot) + r'''
@@ -3421,6 +3448,7 @@ done
 '''
         probe = eligibility.SshProbeSettings(config)
         options, timeout = offload.ssh_options(probe), probe.probe_timeout_s
+        host = record["remote_host"]
         try:
             result = subprocess.run(["ssh", *options, host, "sh -c " + shlex.quote(script)],
                 stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
@@ -3429,7 +3457,8 @@ done
                 for line in result.stdout.splitlines():
                     pid, separator, start = line.partition("\t")
                     if separator and pid.isdecimal() and int(pid) > 0 and start.strip():
-                        return execution_identity.ObservedExecution(execution_identity.ProcessExecution(host, generation, int(pid), start.strip()))
+                        return execution_identity.ObservedExecution(execution_identity.ProcessExecution(
+                            host, record.get("instance_generation", ""), int(pid), start.strip()))
                 return execution_identity.ExecutionEvidenceUnavailable("remote execution remains unresolved", self.clock.now())
         except (OSError, ValueError, subprocess.TimeoutExpired):
             pass
@@ -3550,7 +3579,7 @@ done
                 and not self._placement_owner_live(saved.assignment.owner))
 
     def _start_pending(self, saved: records.SavedPlacementAssignment) -> bool:
-        from scripts.mac_test import claim_state, offload
+        from scripts.mac_test import claim_state
 
         provider = saved.provider
         from scripts.aws_target import hana_placement
@@ -3614,8 +3643,9 @@ done
         identity = claim_state.ClaimIdentity(provider.claim_id, provider.episode, provider.attempt)
         with conf.report_key_changes():
             try:
-                return offload.pending_start_path(saved.assignment.destination.target, identity).exists()
-            except conf.Unusable:
+                return claim_state.pending_start_exists(
+                    claim_state.state_paths(saved.assignment.destination.target), identity)
+            except (OSError, conf.Unusable):
                 return True
 
     def _recovered_hana_dispatch(self, saved: records.SavedPlacementAssignment) -> wire.ExecutionReport | placement.NoTerminalReport:
@@ -3736,8 +3766,8 @@ done
                         and isinstance(report.outcome, (placement.PrelaunchRefused, execution_identity.HanaCommandAdmissionRefused))
                         and isinstance(attempt.provider, placement.ProviderClaimReference)
                         and attempt.provider.provider == destination.provider and attempt.provider.target == destination.target
-                        and scopes_overlap(attempt.provider.scope, destination.scope))
-                    if any(scopes_overlap(claim.reference.scope, destination.scope)
+                        and scopes_overlap(attempt.provider.scope, destination.scope, mac=destination.provider == "mac"))
+                    if any(scopes_overlap(claim.reference.scope, destination.scope, mac=destination.provider == "mac")
                             and (isinstance(claim, placement.RetainedCleanupClaim)
                                  or any(claim.reference == item[0] for item in retained))
                             for claim in (*evidence.cleanup_claims, *evidence.claims)):
@@ -4513,7 +4543,7 @@ done
 
                     destination = assignment.destination
                     if (request.claim.provider != destination.provider or request.claim.target != destination.target
-                            or not scopes_overlap(request.claim.scope, destination.scope)):
+                            or not scopes_overlap(request.claim.scope, destination.scope, mac=destination.provider == "mac")):
                         return [self._placement_status(assignment, "retained claim does not match the assigned provider scope",
                             check_lifetime=False)]
                 terminal = placement.TerminalAttemptReport(placement.PrelaunchRefused(request.reason),

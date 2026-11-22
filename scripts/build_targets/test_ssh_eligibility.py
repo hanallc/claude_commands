@@ -26,6 +26,7 @@ import unittest
 from unittest import mock
 
 from scripts.build_targets import build_targets as build_targets, targets
+from scripts.build_targets.test_targets import fixture_mac_mirror
 from scripts.mac_test import eligibility, claim_state, mac_test as mac_test, offload as offload
 from scripts.build_hold import owning_session as session_owner
 from scripts.aws_target import ledger
@@ -64,10 +65,13 @@ class SshEligibilityTests(unittest.TestCase):
             "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions"),
         })))
         _ = self.enterContext(mock.patch.object(Path, "home", return_value=self.root))
+        key = "https://github.com/team/hana"
         _ = self.enterContext(mock.patch.object(eligibility, "repository_identity",
-                                               return_value=eligibility.KnownRepository("hana", "github.com/team/hana")))
+                                               return_value=eligibility.KnownRepository("hana", key)))
+        _ = self.enterContext(mock.patch.object(claim_state, "mac_repository_identity",
+                                               return_value=fixture_mac_mirror(self.root, "hana", key)))
         _ = self.enterContext(mock.patch.object(mac_test, "target_claim_scope",
-                                               return_value=mac_test.RepositoryScope("hana", "github.com/team/hana")))
+                                               return_value=mac_test.RepositoryScope("hana", key)))
         _ = self.enterContext(mock.patch.object(process_identity, "process_start", side_effect=process_reader(self.process_start)))
         _ = self.enterContext(mock.patch.object(mac_test, "start_claim_watcher"))
         _ = self.enterContext(mock.patch.object(session_owner, "owning_session", return_value=NoOwningSession()))

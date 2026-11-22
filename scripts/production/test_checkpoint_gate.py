@@ -1,7 +1,9 @@
 """Test how checkpoint gates enter placement and retry a silent Mac guest."""
 from __future__ import annotations
 
-from contextlib import nullcontext
+from collections.abc import Callable
+from contextlib import nullcontext, redirect_stdout
+import io
 from dataclasses import replace
 import os
 from pathlib import Path
@@ -52,12 +54,17 @@ class CheckpointGateTests(unittest.TestCase):
                   mock.patch.object(subprocess, "run",
                       return_value=subprocess.CompletedProcess(GATE, 0)) as child):
                 handoff = mock.Mock()
-                admitted = mock.Mock(spec=first_step.FirstStepAdmission, handoff=handoff)
+
+                def run_gate(run: Callable[[], subprocess.CompletedProcess[str]]) -> subprocess.CompletedProcess[str]:
+                    return run()
+
+                admitted = mock.Mock(spec=first_step.FirstStepAdmission, handoff=handoff,
+                                     run_gate=mock.Mock(side_effect=run_gate))
                 place.return_value = nullcontext(admitted)
                 self.assertEqual(copies.main(argv[2:]), 0)
                 place.assert_called_once_with(list(GATE), folder, targets=("natedev", "mac-linux"))
                 handoff.assert_called_once_with(folder)
-                child.assert_called_once_with(list(GATE), cwd=folder, pass_fds=[9], check=False)
+                child.assert_called_once_with(list(GATE), cwd=folder, pass_fds=[9], check=False, text=True)
 
     def test_gate_without_targets_starts_directly(self) -> None:
         folder = Path("/fixture")
@@ -113,7 +120,7 @@ class GatePlacementFixture:
 
     def run_step(self, child: mock.Mock, *, retry_failed_steps: bool = False) -> str:
         def run(command: list[str], folder: Path) -> subprocess.CompletedProcess[str]:
-            return checkpoint_gate.run_gate_with_placement(
+            return first_step.run_gate_with_placement(
                 lambda: cast("subprocess.CompletedProcess[str]", child(command, folder)),
                 self.assignment_file, self.request, self.place_again)
 
@@ -139,14 +146,15 @@ class CheckpointGatePlacementTests(unittest.TestCase):
             return subprocess.CompletedProcess(command, 0, "", "")
 
         invoked = mock.Mock(side_effect=run)
-        with mock.patch.object(checkpoint_gate, "report", wraps=checkpoint_gate.report) as report:
+        with (mock.patch.object(checkpoint_gate, "report", wraps=checkpoint_gate.report) as report,
+              redirect_stdout(io.StringIO()) as output):
             detail = fixture.run_step(invoked)
         self.assertEqual(detail, fixture.step.label)
         self.assertEqual(invoked.call_count, 2)
         fixture.report_failure.assert_called_once_with(fixture.refusal)
         fixture.place_again.assert_called_once_with(fixture.request)
-        self.assertIn("fixture-mac", str(report.call_args_list))
-        self.assertIn("mac-linux", str(report.call_args_list))
+        # gate-step prints the retry line into the gate output.
+        self.assertIn("placement: retry — fixture-mac (mac-linux) did not answer.", output.getvalue())
         self.assertIn("0 red", str(report.call_args_list))
 
     def test_silent_guest_output_does_not_select_a_flaky_test(self) -> None:

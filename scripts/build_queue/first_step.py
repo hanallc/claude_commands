@@ -21,8 +21,9 @@ from scripts.direct.step_selection import Pinned
 from scripts.lib import build_folders
 from scripts.lib.build_slots import SlotQueuePosition
 from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, StepJob
+from scripts.build_queue.admission_wire import read_assignment
 from scripts.lib.build_steps import (
-    GATE_SCRIPTS, OtherCommand, VerifyCommand, command_job, command_program, parse_command_program, verify_command,
+    CLAIM_FAILURE_SUFFIX, GATE_SCRIPTS, MAC_LINUX_NO_ANSWER, MAC_LINUX_PRELAUNCH_REFUSED_STATUS, OtherCommand, VerifyCommand, command_job, command_program, parse_command_program, verify_command,
 )
 from scripts.mac_test import claim_state
 
@@ -45,6 +46,7 @@ class GatePlacement:
     """The gate uses this assignment until its caller ends."""
 
     grant: wire.LocalPlacementGranted | wire.Assignment
+    request: wire.PlacementRequest
 
 
 @dataclass
@@ -60,14 +62,7 @@ class FirstStepAdmission:
         os.environ['BUILDLOG_PREPARED_COPY'] = str(tree)
         grant = self.grant
         if isinstance(grant, GatePlacement):
-            if isinstance(grant.grant, wire.LocalPlacementGranted):
-                # The gate takes its own memory reservation when it starts.
-                local = grant.grant.grant
-                answer = queue_place.release_place(local.reservation, 0, local.cleanup_timing)
-                if isinstance(answer, wire.Refused):
-                    raise FirstStepRefused(answer.reason)
-            os.environ['BUILDLOG_PLACEMENT_FILE'] = str(self.assignment_file)
-            os.environ['BUILDLOG_PLACEMENT_EPISODE'] = grant.grant.assignment.episode
+            self._hand_gate(grant)
             return
         if isinstance(grant, wire.Admitted):
             answer = queue_place.release_place(grant.reservation, 0, grant.cleanup_timing)
@@ -83,6 +78,32 @@ class FirstStepAdmission:
                 destination.host, str(destination.slot), grant.assignment.episode, grant.assignment.attempt))
             return
         self.grant = HandedOff()
+
+    def _hand_gate(self, grant: GatePlacement) -> None:
+        if isinstance(grant.grant, wire.LocalPlacementGranted):
+            # The gate takes its own memory reservation when it starts.
+            local = grant.grant.grant
+            answer = queue_place.release_place(local.reservation, 0, local.cleanup_timing)
+            if isinstance(answer, wire.Refused):
+                raise FirstStepRefused(answer.reason)
+        os.environ['BUILDLOG_PLACEMENT_FILE'] = str(self.assignment_file)
+        os.environ['BUILDLOG_PLACEMENT_EPISODE'] = grant.grant.assignment.episode
+
+    def place_again(self, request: wire.PlacementRequest) -> None:
+        """Place the gate again with its original request and pass the new assignment to the next run."""
+        grant = self.grant
+        if not isinstance(grant, GatePlacement) or grant.request != request:
+            raise wire.AdmissionUnavailable('only the original gate request can be placed again')
+        self.grant = GatePlacement(_placement_grant(request), request)
+        client.write_assignment(self.assignment_file, self.grant.grant)
+        self._hand_gate(self.grant)
+
+    def run_gate(self, run: Callable[[], subprocess.CompletedProcess[str]]) -> subprocess.CompletedProcess[str]:
+        """Run the gate; place it again while its Mac Linux guest takes no run."""
+        grant = self.grant
+        if not isinstance(grant, GatePlacement):
+            return run()
+        return run_gate_with_placement(run, self.assignment_file, grant.request, self.place_again)
 
     def close(self) -> None:
         """Release preparation after an error before command startup."""
@@ -218,6 +239,64 @@ def _program_grant(command: Sequence[str], source: Path, owner: wire.Owner,
     return answer
 
 
+def run_gate_with_placement(
+    run: Callable[[], subprocess.CompletedProcess[str]],
+    assignment_file: Path,
+    request: wire.PlacementRequest,
+    place_again: Callable[[wire.PlacementRequest], None],
+) -> subprocess.CompletedProcess[str]:
+    """Retry a gate within the scope that owns its original placement request.
+
+    The placement callback installs the new assignment before the next run.
+    """
+    while True:
+        result = run()
+        if result.returncode != MAC_LINUX_PRELAUNCH_REFUSED_STATUS:
+            return result
+        try:
+            refusal = read_gate_claim_failure(assignment_file, request)
+            settled = client.claim_failure(refusal)
+            if (settled.assignment != refusal.assignment
+                    or settled.state != placement.ClosedAssignment(refusal.reason)
+                    or not isinstance(settled.permission, placement.PermissionAvailable)
+                    or not isinstance(settled.retry, placement.RetryAt)):
+                raise wire.AdmissionUnavailable('the queue has not settled the Mac guest attempt')
+            destination = refusal.assignment.destination
+            print(f'placement: retry — {destination.host} ({destination.target}) did not answer. '
+                  + 'Requesting placement again.', flush=True)
+            place_again(request)
+            replacement = read_assignment(assignment_file).assignment
+            if (not assignment_matches_request(replacement, request)
+                    or replacement.attempt == refusal.assignment.attempt):
+                raise wire.AdmissionUnavailable('the queue did not provide a replacement assignment')
+        except (OSError, ValueError, wire.AdmissionUnavailable) as error:
+            return subprocess.CompletedProcess(request.constraints.command, result.returncode, '',
+                                               f'Gate placement blocked. {error}\n')
+
+
+def assignment_matches_request(assignment: placement.PlacementAssignment, request: wire.PlacementRequest) -> bool:
+    destination = assignment.destination
+    return (assignment.episode == request.episode and assignment.owner == request.owner
+            and assignment.since == request.since and assignment.source_key == request.constraints.source_key
+            and assignment.session == request.constraints.session
+            and any(candidate.destination.target == destination.target
+                    and candidate.destination.provider == destination.provider
+                    for candidate in request.constraints.candidates))
+
+
+def read_gate_claim_failure(assignment_file: Path, request: wire.PlacementRequest) -> wire.ClaimFailure:
+    assignment = read_assignment(assignment_file).assignment
+    report_file = assignment_file.with_name(assignment_file.name + CLAIM_FAILURE_SUFFIX)
+    refusal = wire.parse_request(report_file.read_bytes())
+    if (not isinstance(refusal, wire.ClaimFailure) or not refusal.request_id
+            or refusal.assignment != assignment or refusal.reason != MAC_LINUX_NO_ANSWER
+            or assignment.destination.provider != 'ssh' or assignment.destination.target != 'mac-linux'
+            or not isinstance(refusal.claim, placement.NoProviderClaim)
+            or not assignment_matches_request(assignment, request)):
+        raise wire.AdmissionUnavailable('the gate report does not match the Mac guest assignment')
+    return refusal
+
+
 def gate_targets(command: Sequence[str], requested: str = "") -> tuple[str, ...]:
     """Read the targets for a gate from the caller."""
     if command_program(command) not in GATE_SCRIPTS:
@@ -290,7 +369,8 @@ def admitted_run(command: Sequence[str], source: Path, *,
                 request = _verify_request(verify, source, folder, owner, position)
                 grant = _placement_grant(request)
             elif targets:
-                grant = GatePlacement(_placement_grant(_gate_request(command, source, targets, owner, position, run)))
+                gate_request = _gate_request(command, source, targets, owner, position, run)
+                grant = GatePlacement(_placement_grant(gate_request), gate_request)
             else:
                 grant = _program_grant(command, source, owner, position, run)
             admitted = FirstStepAdmission(position, grant, assignment_file)

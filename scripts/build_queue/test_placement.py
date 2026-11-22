@@ -42,6 +42,7 @@ from scripts.build_targets.target_config import ANY_ELIGIBLE_TARGET, LOCAL_CALLE
 SUBMITTING_SESSION = OwningSession("submitting-session")
 ALLOWED_HOST = placement.AllowedHost()
 HANA_REPOSITORY = "https://github.com/hanallc/hana"
+FIXTURE_MAC_SCOPE = RepositoryScope("hana")
 
 
 class PlacementFixture(AdmissionFixture):
@@ -70,10 +71,10 @@ class PlacementFixture(AdmissionFixture):
 
 
 def placement_request(fixture: AdmissionFixture, *, session: placement.SubmittingSession = SUBMITTING_SESSION,
-                      since: float | None = None) -> wire.PlacementRequest:
+                      since: float | None = None, scope: RepositoryScope = FIXTURE_MAC_SCOPE) -> wire.PlacementRequest:
     local = fixture.request(since=since)
     local = replace(local, run=wire.RunIdentity(local.owner.pid, local.owner.start_time))
-    destination = placement.PlacementDestination("mac", "mac", "fixture-mac", RepositoryScope("hana"))
+    destination = placement.PlacementDestination("mac", "mac", "fixture-mac", scope)
     constraints = placement.PlacementConstraints(execution_identity.SourceKeyKnown("source-a"), ("cargo", "nextest", "run"), "hana", "hana", session,
                                                  (placement.PlacementCandidate(destination),))
     owner = placement.SubmittingOwner(fixture.server.host, local.owner.pid, local.owner.start_time)
@@ -82,6 +83,16 @@ def placement_request(fixture: AdmissionFixture, *, session: placement.Submittin
                                  local=wire.LocalAdmissionContext(constraints.command, local.cwd, local.sidecar,
                                      local.call, local.test_width, local.fresh_test),
                                  code_version=local.code_version)
+
+
+def mac_claim_request(fixture: AdmissionFixture) -> tuple[wire.PlacementRequest, Path]:
+    """Give a provider claim a private checkout that matches its assignment."""
+    worktree = fixture.root / "hana"
+    _ = subprocess.run(["git", "init", "-q", str(worktree)],
+                       capture_output=True, check=True, timeout=TEST_HANG_GUARD_SECS)
+    _ = subprocess.run(["git", "-C", str(worktree), "remote", "add", "origin", HANA_REPOSITORY],
+                       capture_output=True, check=True, timeout=TEST_HANG_GUARD_SECS)
+    return placement_request(fixture, scope=RepositoryScope("hana", HANA_REPOSITORY)), worktree
 
 
 def coordinator_holder(assignment: placement.PlacementAssignment) -> placement.ClaimHolderIdentity:
@@ -543,7 +554,7 @@ class PlacementTests(unittest.TestCase):
                 }))
                 _ = (fixture.root / "build_targets.conf").write_text(
                     "targets=mac\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n")
-                request = placement_request(fixture)
+                request, worktree = mac_claim_request(fixture)
                 _ = publish_candidate(fixture, request)
                 assignment = assignment_for(fixture, request)
                 reference = adopt_assignment(fixture, request, assignment)
@@ -552,7 +563,7 @@ class PlacementTests(unittest.TestCase):
                 record: mac_test.RemoteJobClaim = {"claim_id": reference.claim_id, "episode": reference.episode,
                     "attempt": reference.attempt, "submitting_session": "submitting-session",
                     "pid": request.owner.pid, "proc_start": request.owner.start_time, "remote_host": assignment.destination.host,
-                    "what": "blocked provider", "worktree": str(fixture.root), "since": "2026-11-10T12:00:00+00:00"}
+                    "what": "blocked provider", "worktree": str(worktree), "since": "2026-11-10T12:00:00+00:00"}
                 mac_test.write_json(paths.run, record)
                 before = paths.run.read_bytes()
                 granted = only_admitted(fixture.connect(fixture.request()).replies())
@@ -566,7 +577,7 @@ class PlacementTests(unittest.TestCase):
 
                 def adapter() -> int:
                     args = mac_test.CliArguments()
-                    args.pid, args.worktree, args.remote = request.owner.pid, str(fixture.root), assignment.destination.host
+                    args.pid, args.worktree, args.remote = request.owner.pid, str(worktree), assignment.destination.host
                     args.claim_id, args.episode, args.attempt = reference.claim_id, reference.episode, reference.attempt
                     with redirect_stdout(io.StringIO()):
                         if operation == "cleanup":
@@ -1442,16 +1453,13 @@ class PlacementTests(unittest.TestCase):
                         fixture.proc.register(wire.Owner(coordinator.pid, owner_start))
                         fixture.proc.register(wire.Owner(holder_pid, holder_start))
                         write_process(fixture.proc.path, holder_pid, parent=coordinator.pid, start=holder_start)
-                        request = placement_request(fixture)
+                        request, repository = mac_claim_request(fixture)
                         request = replace(request, owner=placement.SubmittingOwner(
                             fixture.server.host, coordinator.pid, owner_start), run=wire.RunIdentity(coordinator.pid, owner_start))
                         _ = publish_candidate(fixture, request)
                         assignment = assignment_for(fixture, request)
-                        paths = mac_test.StatePaths(fixture.root / "provider")
-                        repository = fixture.root / "hana"
-                        repository.mkdir()
-                        _ = subprocess.run(["git", "init", "-q", str(repository)],
-                            capture_output=True, check=True, timeout=TEST_HANG_GUARD_SECS)
+                        fixture.enter_context(mock.patch.dict(os.environ, {"MAC_TEST_STATE_DIR": str(fixture.root / "provider")}))
+                        paths = mac_test.state_paths("mac")
                         settings = fixture.root / "mac_test.conf"
                         _ = write_config_fixture(settings,
                             "offload=on\nlinux_only.hana=\nmac_skip.hana=\n", template="mac_test")
@@ -1460,7 +1468,6 @@ class PlacementTests(unittest.TestCase):
                         args.repo_root, args.package, args.settings = str(repository), "hana", str(settings)
                         args.target = "mac"
                         with mock.patch.object(mac_test, "start_claim_watcher"), \
-                             mock.patch.object(mac_test, "target_claim_scope", return_value=assignment.destination.scope), \
                              redirect_stdout(io.StringIO()):
                             self.assertEqual(mac_test.command_claim_wait(args, paths,
                                 session=assignment.session, assignment=assignment), 0)
@@ -1522,15 +1529,15 @@ class PlacementTests(unittest.TestCase):
                             _ = publish_candidate(fixture, request, claims=(adopted,))
                             _ = fixture.run_pass()
                             self.assertIsInstance(fixture.server.assignments[key].state, placement.CurrentAssignment)
-                            pending = offload.pending_start_path(assignment.destination.target, identity)
+                            scope_key = claim_state.claim_fence_scope_key(transferred.path, transferred.record)
+                            pending = claim_state.claim_pending_start(paths, transferred.path, transferred.record)
                             pending.parent.mkdir(parents=True, exist_ok=True)
                             _ = pending.write_text("pending startup\n")
                             _ = publish_candidate(fixture, request)
                             _ = fixture.run_pass()
                             self.assertIsInstance(fixture.server.assignments[key].state, placement.CurrentAssignment)
                             if ending == "adapter-release-interrupted":
-                                command = offload.prepare_start_fence_command(
-                                    identity, "mac", scope_key=transferred.path.stem)
+                                command = offload.prepare_start_fence_command(identity, "mac", scope_key=scope_key)
                                 prepared = subprocess.run(["bash", "-c", command],
                                     capture_output=True, text=True, check=False, timeout=5)
                                 self.assertEqual(prepared.returncode, 0, prepared.stderr)
@@ -1572,8 +1579,7 @@ with mock.patch.object(subprocess, "run", side_effect=private_transport), \
                                                  interrupted.stdout + interrupted.stderr)
                                 self.assertFalse(pending.exists())
                                 self.assertEqual(transferred.path.read_bytes(), before)
-                                fence = fixture.root / offload.start_fence_relative(
-                                    identity, "mac", scope_key=transferred.path.stem).with_suffix(".lock")
+                                fence = fixture.root / offload.start_fence_relative(identity, "mac", scope_key=scope_key).with_suffix(".lock")
                                 self.assertFalse(fence.exists())
                                 _ = publish_candidate(fixture, request, claims=(adopted,))
                                 _ = fixture.run_pass()

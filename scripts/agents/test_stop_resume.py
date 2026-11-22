@@ -5126,6 +5126,45 @@ class StopResumeTests(unittest.TestCase):
         self.assertEqual(self.client.started, [])
 
 
+    def test_resume_launches_in_the_saved_move_destination(self) -> None:
+        from scripts.worktree import worktrees
+
+        old = self.root / "old checkout"
+        new = self.root / "new checkout"
+        (old / "crates").mkdir(parents=True)
+        self.entry["cwd"] = str(old / "crates")
+        pane_record.write("agents", self.entry)
+        identity = worktrees.FolderIdentity.read(old)
+        _ = old.rename(new)
+        move = worktrees.WorktreeMove(old, new, "origin", "alpha", "test", worktrees.MoveOutput.LIVE_UNIT)
+        journal = worktrees.MoveJournal(move, identity, identity, "", Path(".git"), (), worktrees.MoveStage.FINISHED)
+        with patch.dict(os.environ, {"WORKTREES_STATE_DIR": str(self.root / "worktrees")}):
+            worktrees.write_move(journal)
+            result = stop_resume.resume("alpha", why="worktree move")
+        self.assertIsInstance(result, stop_resume.ClaudeUp)
+        self.start.assert_called_once()
+        command = self._typed(cast(tuple[str, ...], self.start.call_args.args))
+        self.assertEqual(command[command.index("resume") + 1], str(new / "crates"))
+
+    def test_resume_uses_the_saved_folder_with_an_incomplete_move_record(self) -> None:
+        from scripts.worktree import worktrees
+
+        saved = self.root / "saved checkout"
+        saved.mkdir()
+        self.entry["cwd"] = str(saved)
+        pane_record.write("agents", self.entry)
+        with patch.dict(os.environ, {"WORKTREES_STATE_DIR": str(self.root / "worktrees")}):
+            record = worktrees.move_file(saved)
+            record.parent.mkdir(parents=True)
+            _ = record.write_text("{}")
+            result = stop_resume.resume("alpha", why="worktree move")
+            _ = record.write_text(json.dumps({"old": str(saved)}))
+            self.assertEqual(worktrees.moved_launch_folder(saved), saved)
+        self.assertIsInstance(result, stop_resume.ClaudeUp)
+        self.start.assert_called_once()
+        command = self._typed(cast(tuple[str, ...], self.start.call_args.args))
+        self.assertEqual(command[command.index("resume") + 1], str(saved))
+
     def test_resume_returns_before_the_stay_window_and_detaches_its_generation(self) -> None:
         result = stop_resume.resume("alpha", why="maintenance")
         self.assertLess(self.clock.elapsed, conf.read("shutdown").number("STAY_SECONDS"))
