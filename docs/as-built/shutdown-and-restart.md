@@ -684,7 +684,7 @@ Run `worker.py restore` in the owner session to see completed dispatches in open
 Herdr upkeep skips row work while a stop or restart holds the activity lock.
 Saved rows can remain after the activity lock closes.
 Stop pauses upkeep and waits for its producer row locks before reading fresh staff and liveness data.
-The `UPKEEP_ROW_WAIT_SECONDS` setting in `config/shutdown.conf` limits the wait.
+The `upkeep_row_wait_seconds` setting in `config/shutdown.conf` limits the wait.
 If the time expires, the report names the row and gives the command to run again.
 
 A restarted unit director or showrunner gets one continuation message in its current conversation.
