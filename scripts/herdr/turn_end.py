@@ -569,8 +569,10 @@ def _finalize_completion(row: staff.StaffRow, parent: staff.StaffRow, run: Path,
     new_details = tuple(dict.fromkeys((*details, *diagnostics)))
     completion = replace(completion, details=new_details)
     progress_history.save_hook_completion(run, instance, completion)
-    _deliver_completion_diagnostics(row, parent, run, instance, diagnostic_path, recorded,
-                                    sender_native_id=completion.sender_native_id)
+    # The turn hook sends stopped diagnostics after it releases the worker lock.
+    if not stopped:
+        _deliver_completion_diagnostics(row, parent, run, instance, diagnostic_path, recorded,
+                                        sender_native_id=completion.sender_native_id)
     if closed and completion.recording_done:
         progress_history.save_hook_completion(run, instance, replace(completion, finished=True))
         if isinstance(pane, worker.CloseCompletedPane):
@@ -906,6 +908,8 @@ def _close_stopped_after_notice(row: staff.StaffRow, parent: staff.StaffRow, run
             except ValueError as error:
                 _ = after_unlock.callback(report, str(error))
                 return TurnOutcome.RETRY_EVIDENCE if event_kind == EventKind.RUN_FINISHED else None
+            _ = after_unlock.callback(_send_stopped_diagnostics, current, parent, run, instance,
+                                      sender_native_id=saved.sender_native_id)
             if event_kind == EventKind.RUN_FINISHED and recovery in (
                     worker.CompletionRecovery.PENDING_CLOSE, worker.CompletionRecovery.WAITING_ON_RUNS,
                     worker.CompletionRecovery.WAITING_ON_REPLY):
@@ -1040,6 +1044,11 @@ def _recover_replaced_stops(event: WorkerEvent, row: staff.StaffRow, parent: sta
             unit_runs.report_anomaly(reason)
             _log_hook_event(event, reason, row.name)
             continue
+        if (marker and result is StoppedReplyRecovery.ALREADY_SAVED
+                and isinstance(completion, progress_history.HookCompletion)
+                and completion.stopped_reply is progress_history.StoppedReplyDisposition.SAVED
+                and progress_history.stopped_notice_delivered(directory, receipt.instance_id)):
+            return TurnOutcome.STOPPED
         if (isinstance(completion, progress_history.HookCompletion) and not completion.finished
                 and completion.outcome == TurnOutcome.STOPPED
                 and result in (StoppedReplyRecovery.SAVED, StoppedReplyRecovery.ALREADY_SAVED,
@@ -1300,6 +1309,10 @@ def _handle_locked(event: WorkerEvent,
                         if wait == worker.CompletionRecovery.WAITING_ON_RUNS:
                             return TurnOutcome.WAITING_ON_RUNS
                         if wait == worker.CompletionRecovery.WAITING_ON_REPLY:
+                            if (marker and marker == receipt.completion_id
+                                    and stopped.stopped_reply is progress_history.StoppedReplyDisposition.SAVED
+                                    and progress_history.stopped_notice_delivered(run, instance)):
+                                return TurnOutcome.STOPPED
                             return TurnOutcome.WAITING_ON_REPLY
                     else:
                         stopped = recovered
