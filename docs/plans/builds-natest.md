@@ -1262,3 +1262,17 @@ Ordered after the red main repair and the guard repair (builds). It does not mov
 - **Files:** `scripts/production/gate.py`; its test module; the as-built doc that describes gate recovery.
 - **Workers:** 1 writer.
 - **Acceptance gate:** fixtures: a SIGTERM stop leaves no open record; a dead-pid record with finished false is dropped by the next run and that run passes; the changed test modules pass in one tests-only gate; basedpyright zero on changed files; one blind review.
+
+### Phase 429 — cleanup releases a legacy Mac claim only for a verified repository  · status: todo
+**Depends on:** none
+
+#### Work Order
+- **Goal:** builds 00:39 (queue unit item 28, macclaim-legacy, moved to natest): a cleanup releases a legacy `run.json` Mac claim only when the claim names a verified repository. A relative worktree path with no repository metadata matches nothing.
+- **Spec:**
+  1. `scripts/mac_test/claim_state.py:444-450` (`target_claim_scope`) gives a worktree with no repository name or common dir the whole Mac scope; `:490` (`read_claims`) gives a relative legacy worktree the whole Mac scope. Find each cleanup caller that releases a claim by scope match, with file:line.
+  2. A cleanup releases a legacy `run.json` claim only when its repository is verified (repository name and key from the claim's absolute worktree). A legacy claim with a relative path and no repository metadata matches no cleanup; it stays until its owner releases it or the existing expiry ends it.
+  3. Claim reading and admission keep their current scope (a legacy claim with no repository still blocks the whole Mac). Copy no scope logic.
+  4. No config key changes; no check goes away.
+- **Files:** `scripts/mac_test/claim_state.py`; its test module. verify owns `claim_state.py` and reviews the change.
+- **Workers:** 1 writer.
+- **Acceptance gate:** fixtures: a cleanup for a verified repository releases its own legacy claim; a cleanup never releases a relative-path legacy claim with no repository metadata; claim reading keeps the whole-Mac scope for that claim; the changed test module passes in one tests-only gate after the builds go; basedpyright zero on changed files; review by verify.
