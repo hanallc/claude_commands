@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Save a worker turn and notify its director through one completion rule."""
 from __future__ import annotations
+
 try:
     with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
 except FileNotFoundError:
@@ -25,10 +26,12 @@ from pathlib import Path
 from typing import Callable, cast
 
 from scripts.agents import detached_runs, remote, shutdown_record, worker_lifecycle
+from scripts.direct import pass_record as pass_recorder
 from scripts.direct import progress_history, recorder_state
 from scripts.herdr import herdr_types
 from scripts.lib import atomic_file, conf, scratch, unit_runs
 from scripts.herdr import herdr, worker_panes
+from scripts.message import send
 from scripts.production import staff, worker, worker_admission
 
 COMPLETION_NOTICE_REPEAT_MINUTES = 52_596_000
@@ -150,7 +153,6 @@ def _prepare_notice(worker_name: str, parent: staff.StaffRow, run: Path, passed:
                     turn_cursor: worker.TranscriptCursor | worker.NoTranscriptTurn = worker.NoTranscriptTurn.UNRECORDED,
                     ) -> TurnDecision:
     """Prepare a notice for delivery outside the worker lock."""
-    from scripts.message import send
 
     stamp = (_completion_notice_stamp(outcome) if notice_type or repeat
              else _notice_stamp(outcome, reply, runs))
@@ -172,7 +174,7 @@ def _prepare_notice(worker_name: str, parent: staff.StaffRow, run: Path, passed:
     if details:
         message += "\n" + details
     identity = staff.StaffId(str(passed.get("worker_id", "")))
-    completion_id = (progress_history.dispatch_delivery(passed).completion_id
+    completion_id = (pass_recorder.dispatch_delivery(passed).completion_id
                      if busy or ordered or outcome == TurnOutcome.UNCERTAIN else "")
     attempt_id = uuid.uuid4() if busy else None
     if busy:
@@ -234,7 +236,7 @@ def _prepare_notice(worker_name: str, parent: staff.StaffRow, run: Path, passed:
                         or worker_panes.worker_run(member, record=record) != run):
                     return
                 current = worker_panes.worker_pass(member, run, record=record)
-                current_delivery = progress_history.dispatch_delivery(current)
+                current_delivery = pass_recorder.dispatch_delivery(current)
                 if (current.get("instance_id") != instance or current.get("status") not in ("active", "refused")
                         or current_delivery.completion_id != completion_id
                         or isinstance(progress_history.hook_completion(current), progress_history.HookCompletion)):
@@ -391,7 +393,7 @@ def stop_pass(run: Path, stopped: detached_runs.RunRecord,
             if stopped["started_at"] < started:
                 return worker_panes.NoOwningPanePass.UNRECORDED
         completion = progress_history.hook_completion(passed)
-        delivery = progress_history.dispatch_delivery(passed)
+        delivery = pass_recorder.dispatch_delivery(passed)
         if isinstance(completion, progress_history.HookCompletion) and completion.outcome == TurnOutcome.STOPPED:
             if passed.get("status") == "canceled":
                 return worker_panes.StoppedRunPassCompletion(
@@ -465,7 +467,7 @@ def repeat_completion_notice(worker_name: str, parent: staff.StaffRow, run: Path
                     raise ValueError(f"{worker_name}: {recovery.value}")
 
         return recover
-    delivery = progress_history.dispatch_delivery(passed)
+    delivery = pass_recorder.dispatch_delivery(passed)
     outcome = TurnOutcome(completion.outcome) if isinstance(completion, progress_history.HookCompletion) else TurnOutcome.DONE
     path = Path(completion.reply_file if isinstance(completion, progress_history.HookCompletion) else delivery.reply_file)
     details = "\n".join(completion.details) if isinstance(completion, progress_history.HookCompletion) else ""
@@ -483,7 +485,7 @@ def repeat_completion_notice(worker_name: str, parent: staff.StaffRow, run: Path
 
 def _submit_stage(parent: staff.StaffRow, row: staff.StaffRow, state: worker_panes.WorkerPane,
                   client: herdr.Herdr, run: Path, passed: dict[str, object], instance: str,
-                  delivery: progress_history.DispatchDelivery, hold: worker_panes.WorkerLockHold) -> TurnOutcome | TurnDecision:
+                  delivery: pass_recorder.DispatchDelivery, hold: worker_panes.WorkerLockHold) -> TurnOutcome | TurnDecision:
     record = staff.snapshot()
     availability = worker.CheckAssignmentAvailability.for_worker(record, row, run)
 
@@ -512,7 +514,7 @@ def _submit_stage(parent: staff.StaffRow, row: staff.StaffRow, state: worker_pan
 
 
 def _finish_completion(row: staff.StaffRow, parent: staff.StaffRow, run: Path, passed: dict[str, object],
-                       instance: str, delivery: progress_history.DispatchDelivery,
+                       instance: str, delivery: pass_recorder.DispatchDelivery,
                        completion: progress_history.HookCompletion,
                        state: worker_panes.WorkerPane | worker_panes.WorkerNotObserved, *,
                        pane: worker.CloseCompletedPane | worker.ReuseCompletedPane = worker.CloseCompletedPane.CLOSE,
@@ -520,7 +522,6 @@ def _finish_completion(row: staff.StaffRow, parent: staff.StaffRow, run: Path, p
                        after_pass_recorded: Callable[[], None] = _no_notice,
                        ) -> TurnDecision:
     from scripts.direct import assign
-    from scripts.message import send
 
     path = Path(completion.reply_file)
     if not completion.sender_native_id:
@@ -586,7 +587,7 @@ def _finish_completion(row: staff.StaffRow, parent: staff.StaffRow, run: Path, p
 
 
 def _finalize_completion(row: staff.StaffRow, parent: staff.StaffRow, run: Path, instance: str,
-                         delivery: progress_history.DispatchDelivery, completion: progress_history.HookCompletion,
+                         delivery: pass_recorder.DispatchDelivery, completion: progress_history.HookCompletion,
                          state: worker_panes.WorkerPane | worker_panes.WorkerNotObserved,
                          hold: worker_panes.WorkerLockHold, pane: worker.CloseCompletedPane | worker.ReuseCompletedPane,
                          ) -> TurnOutcome:
@@ -663,7 +664,7 @@ def _finalize_completion(row: staff.StaffRow, parent: staff.StaffRow, run: Path,
     return outcome
 
 
-def _remove_completed_restart(row: staff.StaffRow, delivery: progress_history.DispatchDelivery) -> None:
+def _remove_completed_restart(row: staff.StaffRow, delivery: pass_recorder.DispatchDelivery) -> None:
     shutdown_record.forget([str(row.id)])
     if delivery.actions.end_worker:
         _ = staff.retire(row.id)
@@ -686,7 +687,6 @@ def _record_completion_diagnostics(path: Path, messages: Iterable[str]) -> dict[
 
 def _deliver_completion_diagnostics(row: staff.StaffRow, parent: staff.StaffRow, instance: str,
                                     path: Path, recorded: dict[str, object], *, sender_native_id: str = "") -> None:
-    from scripts.message import send
 
     for message, delivered in recorded.items():
         if delivered is True:
@@ -725,7 +725,7 @@ def recover_completion(row: staff.StaffRow, parent: staff.StaffRow, run: Path,
     stopped = progress_history.hook_completion(passed)
     if isinstance(stopped, progress_history.HookCompletion) and stopped.outcome == TurnOutcome.STOPPED:
         if passed.get("status") == "canceled":
-            receipt = _stopped_receipt(instance, progress_history.dispatch_delivery(passed))
+            receipt = _stopped_receipt(instance, pass_recorder.dispatch_delivery(passed))
             recovered = _record_stopped_reply(row, run, receipt, stopped)
             _ = _stopped_notice(row, parent, run, passed, stopped).send_notice()
             if isinstance(pane, worker.ReuseCompletedPane):
@@ -739,7 +739,7 @@ def recover_completion(row: staff.StaffRow, parent: staff.StaffRow, run: Path,
             if recovered == StoppedReplyRecovery.WAITING_ON_REAP:
                 return worker.CompletionRecovery.WAITING_ON_REAP
         return worker.CompletionRecovery.NO_PENDING_NOTICE
-    delivery = progress_history.dispatch_delivery(passed)
+    delivery = pass_recorder.dispatch_delivery(passed)
     event = WorkerEvent(str(row.current_session), EventKind.RUN_FINISHED)
     completion = _recover_pass(event, row, run, passed, delivery, require_transcript=True)
     if isinstance(completion, worker.DispatchEvidenceUnknown):
@@ -859,7 +859,7 @@ def _late_reply_path(row: staff.StaffRow, run: Path, reply_file: str, instance: 
     return destination.with_name(f"{destination.stem}_late_{instance}{destination.suffix}")
 
 
-def _stopped_receipt(instance: str, delivery: progress_history.DispatchDelivery) -> progress_history.StoppedPassReceipt:
+def _stopped_receipt(instance: str, delivery: pass_recorder.DispatchDelivery) -> progress_history.StoppedPassReceipt:
     return progress_history.StoppedPassReceipt(instance, delivery.line, delivery.completion_id or instance,
                                                delivery.reply_file)
 
@@ -942,7 +942,7 @@ def _close_stopped_after_notice(row: staff.StaffRow, parent: staff.StaffRow, run
                 return
             if saved.pane_closed:
                 return
-            receipt = _stopped_receipt(instance, progress_history.dispatch_delivery(passed))
+            receipt = _stopped_receipt(instance, pass_recorder.dispatch_delivery(passed))
             recovered = _record_stopped_reply(current, run, receipt, saved)
             try:
                 with redirect_stderr(io.StringIO()):
@@ -1015,7 +1015,7 @@ def _recover_replaced_stops(event: WorkerEvent, row: staff.StaffRow, run: Path, 
 
 def _save_late_done(event: WorkerEvent, row: staff.StaffRow, run: Path, passed: dict[str, object],
                     completion: progress_history.HookCompletion | progress_history.NoHookCompletion,
-                    delivery: progress_history.DispatchDelivery, *, require_transcript: bool,
+                    delivery: pass_recorder.DispatchDelivery, *, require_transcript: bool,
                     verify: worker.VerifyPassDone | worker.ReadPassDone,
                     ) -> progress_history.HookCompletion | worker.DispatchEvidenceUnknown | TurnOutcome | NoLateDone:
     """Save the late reply and notice outcome for a pass the recorder already ended."""
@@ -1071,7 +1071,7 @@ def _save_late_done(event: WorkerEvent, row: staff.StaffRow, run: Path, passed: 
 
 
 def _recover_pass(event: WorkerEvent, row: staff.StaffRow, run: Path, passed: dict[str, object],
-                  delivery: progress_history.DispatchDelivery, *, require_transcript: bool = False,
+                  delivery: pass_recorder.DispatchDelivery, *, require_transcript: bool = False,
                   notice_positions: worker.NoticePositions = worker.NO_NOTICE_POSITIONS,
                   ) -> progress_history.HookCompletion | progress_history.NoHookCompletion | worker.DispatchReceipt | TurnOutcome:
     """Select the saved completion or record a matching DONE under the worker lock."""
@@ -1176,7 +1176,7 @@ def _handle_locked(event: WorkerEvent,
 
         raw_instance = passed.get("instance_id")
         instance = raw_instance if isinstance(raw_instance, str) else ""
-        delivery = progress_history.dispatch_delivery(passed)
+        delivery = pass_recorder.dispatch_delivery(passed)
         if result_pass and instance and result_pass != instance:
             return TurnOutcome.IGNORED
         marker = _done_marker(event.reply) if event.kind == EventKind.TURN_END else ""

@@ -1,9 +1,12 @@
 """Start, observe, and close staff workers through proved native panes."""
 from __future__ import annotations
+
 try:
     with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
 except FileNotFoundError:
     pass
+
+from scripts.direct import pass_record as pass_recorder
 
 import argparse
 import errno
@@ -33,10 +36,9 @@ from scripts.lib import conf, models_registry, nix_env, unit_runs
 from scripts.whoami import quota_state
 from scripts.production import staff, worker_admission
 from scripts.agents import detached_run_process, pane_record, shutdown_record, worker_lifecycle
-from scripts.direct import recorder_state
+from scripts.direct import progress_history, recorder_state
 
 if TYPE_CHECKING:
-    from scripts.direct import progress_history
     from scripts.accounts import accounts
 
 StaffId = staff.StaffId
@@ -645,7 +647,6 @@ def worker_run_directories(record: staff.StaffSnapshot, *, scanned: dict[str, li
     workers = record.find(kind="worker")
     if not workers:
         return unit_runs.LauncherRunDirectories({}, {})
-    from scripts.direct import progress_history
 
     scanned = parent_run_index(record) if scanned is None else scanned
     linked = progress_history.recorded_dispatch_runs()
@@ -692,7 +693,6 @@ def worker_run(member: staff.StaffRow, *,
     first = runs[0] if runs else worker_fallback_run(parent, record=record)
     if member.kind != "worker":
         return first
-    from scripts.direct import progress_history
 
     dispatched = progress_history.recorded_dispatch_run(member.id)
     linked = dispatched.directory if isinstance(dispatched, progress_history.RecordedDispatchRun) else None
@@ -796,10 +796,10 @@ class PassDetachedResults:
 
 
 class RecordedCompletionEvidence(Protocol):
-    def completion_close_evidence(self, row: staff.StaffRow, delivery: progress_history.DispatchDelivery, *,
+    def completion_close_evidence(self, row: staff.StaffRow, delivery: pass_recorder.DispatchDelivery, *,
                                   run: Path, reply_file: str) -> CloseAllowed | Kept: ...
 
-    def pass_reply_evidence(self, row: staff.StaffRow, delivery: progress_history.DispatchDelivery, *,
+    def pass_reply_evidence(self, row: staff.StaffRow, delivery: pass_recorder.DispatchDelivery, *,
                             run: Path, reply_file: str, require_completion: bool,
                             detached_results: PassDetachedResults) -> CloseAllowed | Kept: ...
 
@@ -807,12 +807,11 @@ class RecordedCompletionEvidence(Protocol):
 def recorded_completion_close(row: staff.StaffRow, run: Path, passed: dict[str, object], *,
                               worker_is_working: bool = False) -> CloseAllowed | Kept:
     """Accept a finished hook or check the saved reply against the transcript."""
-    from scripts.direct import progress_history
 
     completion = progress_history.hook_completion(passed)
     if isinstance(completion, progress_history.HookCompletion) and completion.finished:
         return Kept("agent state is working") if worker_is_working else CloseAllowed()
-    delivery = progress_history.dispatch_delivery(passed)
+    delivery = pass_recorder.dispatch_delivery(passed)
     if not delivery.line or not delivery.completion_id:
         return Kept("the dispatch has no saved completion id")
     reply_file = completion.reply_file if isinstance(completion, progress_history.HookCompletion) else delivery.reply_file
@@ -894,7 +893,6 @@ def worker_dispatch_state(row: staff.StaffRow, run: Path,
                           read: Callable[[Path], dict[str, object]] = run_state,
                           ) -> WorkerDispatchState:
     """Check the worker lock, detached runs, and all saved passes for this worker."""
-    from scripts.direct import progress_history
 
     locked = check_worker_lock(row, lock)
     if isinstance(locked, Kept):
@@ -945,11 +943,9 @@ def worker_dispatch_state(row: staff.StaffRow, run: Path,
 
 def _pass_dispatch_state(row: staff.StaffRow, run: Path, passed: dict[str, object], status: object,
                          dispatch: object, *, live_runs_checked: bool) -> WorkerDispatchState:
-    from scripts.direct import progress_history
-
     if status == "canceled":
         return ReleasedWorkerPass.ENDED
-    delivery = progress_history.dispatch_delivery(passed)
+    delivery = pass_recorder.dispatch_delivery(passed)
     completion = progress_history.hook_completion(passed)
     active = status == "active" and bool(delivery.line)
     finished = isinstance(completion, progress_history.HookCompletion) and completion.finished
@@ -1031,12 +1027,11 @@ def can_close(worker: OpenWorker | StoppedWorker | ClosedWorker, *,
     state = worker_dispatch_state(worker.row, directory, lock)
     if isinstance(state, DispatchHoldsWorker):
         return Kept(state.blocker)
-    from scripts.direct import progress_history
 
     working = isinstance(worker, OpenWorker) and worker.status == herdr.AgentStatus.WORKING
     if isinstance(state, CompletedWorkerPass):
         passed = worker_pass(worker.row, directory)
-        if progress_history.dispatch_delivery(passed).line:
+        if pass_recorder.dispatch_delivery(passed).line:
             completion = recorded_completion_close(worker.row, directory, passed, worker_is_working=working)
         elif isinstance(worker, StoppedWorker):
             return CloseAllowed()
@@ -1049,7 +1044,10 @@ def can_close(worker: OpenWorker | StoppedWorker | ClosedWorker, *,
                 return Kept(f"agent state is {worker.status.value}")
             return CloseAllowed()
         hook = progress_history.hook_completion(passed)
-        delivery = progress_history.dispatch_delivery(passed)
+        if (isinstance(hook, progress_history.HookCompletion) and hook.outcome == "stopped"
+                and isinstance(worker, OpenWorker) and not worker.status.idle):
+            return Kept(f"agent state is {worker.status.value}")
+        delivery = pass_recorder.dispatch_delivery(passed)
         if delivery.line:
             completion = recorded_completion_close(worker.row, directory, passed, worker_is_working=working)
         elif isinstance(worker, StoppedWorker):
