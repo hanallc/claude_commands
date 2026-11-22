@@ -253,6 +253,11 @@ def is_outermost_gate(process: build_hold.AuditProcess, ancestors: Sequence[buil
     return is_waiting_gate(process) and not any(is_waiting_gate(parent) for parent in ancestors)
 
 
+def is_outermost_drain_gate(process: build_hold.AuditProcess, ancestors: Sequence[build_hold.AuditProcess]) -> bool:
+    return (process.pid_namespace is not build_hold.PidNamespaceRelation.DIFFERENT
+            and is_outermost_gate(process, ancestors))
+
+
 def classify_drain_runs(
     processes: Mapping[int, build_hold.AuditProcess],
     admitted: frozenset[build_hold.ProcessIdentity],
@@ -264,9 +269,7 @@ def classify_drain_runs(
     runs: list[WaitingRun | WorkingRun] = []
     ancestors = {pid: build_hold.audit_ancestors(process, processes) for pid, process in processes.items()}
     for process in processes.values():
-        if process.pid_namespace is build_hold.PidNamespaceRelation.DIFFERENT:
-            continue
-        if not is_outermost_gate(process, ancestors[process.identity.pid]):
+        if not is_outermost_drain_gate(process, ancestors[process.identity.pid]):
             continue
         owner = build_hold.audit_owner(process, ancestors[process.identity.pid])
         family = [item for item in processes.values()
@@ -332,7 +335,7 @@ def wait_for_kept_runs(
 def working_gates(
     processes: Mapping[int, build_hold.AuditProcess], claims: build_hold.LiveClaims | build_hold.ClaimsUnreadable,
 ) -> tuple[build_hold.ProcessIdentity, ...]:
-    """Name the outermost gates that hold work; unreadable evidence keeps every gate."""
+    """Keep every eligible gate if the drain cannot read work evidence."""
     try:
         runs = classify_drain_runs(processes, admitted_processes(), claims)
     except OSError as error:
@@ -343,7 +346,7 @@ def working_gates(
         unreadable = f"claims unreadable: {runs.reason}"
     print(unreadable, file=sys.stderr)
     return tuple(process.identity for process in processes.values()
-                 if is_outermost_gate(process, build_hold.audit_ancestors(process, processes)))
+                 if is_outermost_drain_gate(process, build_hold.audit_ancestors(process, processes)))
 
 
 def detached_run(

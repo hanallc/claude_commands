@@ -136,6 +136,17 @@ class HoldEnforcerTests(unittest.TestCase):
                 else:
                     self.assertEqual(runs, ())
 
+    def test_drain_with_unreadable_claims_skips_a_gate_in_another_pid_namespace(self) -> None:
+        for pid in (700, 701):
+            _ = self.process(pid, "bash", argv=("bash", "verify.sh", "test"), session="gate-owner")
+        table = self.table()
+        table[700] = replace(table[700], pid_namespace=build_hold.PidNamespaceRelation.DIFFERENT)
+
+        with mock.patch.object(hold_enforcer, "admitted_processes", return_value=frozenset()), \
+             redirect_stderr(io.StringIO()):
+            kept = hold_enforcer.working_gates(table, build_hold.ClaimsUnreadable("private claims are damaged"))
+        self.assertEqual(kept, (table[701].identity,))
+
     def test_regular_enforcement_protects_a_suite_runner_in_another_pid_namespace(self) -> None:
         own = self.proc / "self/ns/pid"
         own.parent.mkdir(parents=True)
