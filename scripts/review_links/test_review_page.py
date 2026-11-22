@@ -3062,6 +3062,80 @@ window.fetch=(url,options)=>String(url).includes('for-you.json') ? Promise.resol
         self.assertEqual([event.words for event in events],
                          ['feedback: Adjust the spacing.', 'Answer: The spacing is adjusted.'])
 
+    def test_waiting_change_feedback_matches_the_request_id(self) -> None:
+        page = self.fixture.page
+        words = 'Adjust the spacing.'
+        answer = 'The spacing is adjusted.'
+        with self.status.locked():
+            slots = self.status.slots(page, 'C1')
+            legacy = change_page.CompletedFeedback('legacy-feedback', words, answer)
+            self.status.write_slots(page, 'C1', replace(slots, question=legacy))
+        change_review.record_review_log(page.review_list, 'C1', 'Answer: ' + answer, page.production)
+        returned = next(item for item in review_items.read(self.root) if item.key == 'page-owner/C1')
+        self.assertEqual([event.words for event in returned.log[1:]],
+                         ['feedback: ' + words, 'Answer: ' + answer])
+
+        key = 'page-owner/C2'
+        delivery, _ = review_page.submit(self.root, self.body(key, 'feedback', words), self.status)
+        assert isinstance(delivery, change_page.MessageDelivery)
+        slots = self.status.slots(delivery.page, delivery.row)
+        request = slots.question
+        assert isinstance(request, change_page.OpenFeedback)
+        waiting = next(item for item in review_items.read(self.root) if item.key == key)
+        self.assertEqual([(event.words, event.feedback_request_id) for event in waiting.log[1:]],
+                         [('feedback: ' + words, request.question_id)])
+
+        later = change_page.OpenFeedback('later-feedback', words, change_page.NoDelivery())
+        with self.status.locked():
+            self.status.write_slots(delivery.page, delivery.row, replace(slots, question=later))
+        waiting = next(item for item in review_items.read(self.root) if item.key == key)
+        self.assertCountEqual([(event.words, event.feedback_request_id) for event in waiting.log[1:]],
+                              [('feedback: ' + words, request.question_id), ('feedback: ' + words, later.question_id)])
+
+        key = 'page-owner/C3'
+        legacy_open = change_page.OpenFeedback('untagged-feedback', words, change_page.NoDelivery())
+        change_review.record_review_log(page.review_list, 'C3', 'feedback: ' + words, page.production)
+        with self.status.locked():
+            slots = self.status.slots(page, 'C3')
+            self.status.write_slots(page, 'C3', replace(slots, question=legacy_open))
+        waiting = next(item for item in review_items.read(self.root) if item.key == key)
+        self.assertEqual([event.words for event in waiting.log[1:]], ['feedback: ' + words])
+        self.assertEqual(review_page.build_snapshot(self.root).body(key).count(words.encode()), 1)
+
+        self.assertTrue(change_page.answer_item(key, answer, legacy_open.question_id, self.status))
+        returned = next(item for item in review_items.read(self.root) if item.key == key)
+        self.assertEqual([event.words for event in returned.log[1:]], ['feedback: ' + words, 'Answer: ' + answer])
+        self.assertEqual(review_page.build_snapshot(self.root).body(key).count(words.encode()), 1)
+
+    def test_feedback_send_reuses_the_log_entry_after_a_slot_write_failure(self) -> None:
+        page = self.fixture.page
+        key = 'page-owner/C1'
+        words = 'Adjust the spacing.'
+        before = review_page.build_snapshot(self.root)
+        body = self.card_body(before, key, 'feedback', words)
+        with patch.object(self.status, 'write_slots', side_effect=OSError('The delivery slot cannot be saved.')):
+            with self.assertRaisesRegex(OSError, 'The delivery slot cannot be saved.'):
+                _ = review_page.submit(self.root, body, self.status, snapshot=before)
+        row = change_page.answer_row(page, 'C1')
+        entry, = review_events.decode(row['Review log'])
+        self.assertTrue(entry.feedback_request_id)
+        self.assertIsInstance(self.status.slots(page, 'C1').question, change_page.NoQuestion)
+
+        restarted = change_page.DeliveryStatus(self.root)
+        refreshed = review_page.build_snapshot(self.root)
+        changed = self.card_body(before, key, 'feedback', 'Use a different size.')
+        with self.assertRaises(review_items.ReviewRecordChanged):
+            _ = review_page.submit(self.root, changed, restarted, snapshot=refreshed)
+        delivery, _ = review_page.submit(self.root, body, restarted, snapshot=refreshed)
+        assert isinstance(delivery, change_page.MessageDelivery)
+        request = restarted.slots(page, 'C1').question
+        assert isinstance(request, change_page.OpenFeedback)
+        self.assertEqual(request.question_id, entry.feedback_request_id)
+        row = change_page.answer_row(page, 'C1')
+        self.assertEqual(review_events.decode(row['Review log']), (entry,))
+        waiting = review_page.build_snapshot(self.root)
+        self.assertEqual(waiting.body(key).count(words.encode()), 1)
+
     def test_both_change_pages_refuse_a_second_handoff(self) -> None:
         key = 'page-owner/C1'
         delivery, _ = review_page.submit(self.root, self.body(key, 'validate', 'Check this.'), self.status)

@@ -477,8 +477,10 @@ def change_item(path: Path, row: dict[str, str], assignment: change_routing.Chan
         logs.append(ReviewLog(filed, 'nate', validation_log_label('validate', validator_name)))
     request = slots.question
     exchange: set[str] = set()
-    if isinstance(request, (delivery_state.OpenQuestion, delivery_state.AnsweredQuestion)) and not isinstance(
-            request, (OpenFeedback, CompletedFeedback)):
+    if isinstance(request, (OpenFeedback, CompletedFeedback)):
+        if not any(entry.matches_feedback(request.question_id, request.text) for entry in saved_log):
+            logs.append(ReviewLog(filed, 'nate', 'feedback: ' + request.text, request.question_id))
+    elif isinstance(request, (delivery_state.OpenQuestion, delivery_state.AnsweredQuestion)):
         event = 'Question: ' + request.text
         exchange.add(event.casefold())
         if event.casefold() not in words:

@@ -1339,7 +1339,8 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                 change_page.recover_pending(server.delivery_status, only=error.cleanup)
             return
         except (ValueError, change_page.change_review.ChangeReviewError) as error:
-            self.failed_answer(page, body, 400, "Check the answer and submit it again.", error)
+            reason = str(error) if isinstance(error, change_page.ChangeHandoffRefused) else "Check the answer and submit it again."
+            self.failed_answer(page, body, 400, reason, error)
             return
         except change_page.FeatureLogFailed as error:
             self.failed_answer(page, body, 503, "The feature log could not be updated.", error)
