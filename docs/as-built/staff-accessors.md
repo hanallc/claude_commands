@@ -372,7 +372,7 @@ The shared pane launch builder uses `set_home`.
 | `scripts/worktree/worktrees.py` | read | snapshot, StaffSnapshot, StaffAbsent, StaffRefused |
 | `~/rust/cargo-liner-handler/crates/cargo-handler/src/census/hierarchy.rs` | read | StaffFileReader reads staff.json (Rust, direct) |
 
-231 accessor rows: 41 write, 189 read, 1 owner.
+227 accessor rows: 41 write, 185 read, 1 owner.
 
 ## Approved copies
 
