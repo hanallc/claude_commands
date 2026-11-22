@@ -690,6 +690,12 @@ class WorkerCommandTests(unittest.TestCase):
         self.assertIs(worker_lifecycle.read_json_object(path)["worker_received"], True)
 
     def test_restore_recovers_the_selected_pass_after_replaying_a_result_from_another_run(self) -> None:
+        self.assert_restore_recovers_pass_after_replay("completed")
+
+    def test_restore_recovers_the_saved_done_after_a_completion_action_fails(self) -> None:
+        self.assert_restore_recovers_pass_after_replay("error")
+
+    def assert_restore_recovers_pass_after_replay(self, status: Literal["completed", "error"]) -> None:
         opened = self.opened()
         row = opened.row
         previous = self.fixture.worker_run("previous", "unit", self.fixture.parent.current_session)
@@ -702,7 +708,12 @@ class WorkerCommandTests(unittest.TestCase):
             pass_recorder.DispatchDelivery(line, dispatch_id, str(self.reply)))
         self.agent.append(opened.pane, "user", line)
         self.agent.append(opened.pane, "assistant", reply)
-        progress_history.complete_dispatch(self.run_dir, row.name, dispatch_id)
+        progress_history.complete_dispatch(self.run_dir, row.name, dispatch_id, status=status)
+        if status == "error":
+            worker.save_reply(self.reply, reply)
+            progress_history.save_hook_completion(self.run_dir, dispatch_id,
+                progress_history.HookCompletion(turn_end.TurnOutcome.ERROR, str(self.reply),
+                                                ("A completion action failed.",), actions_done=True))
         path, record = self.detached_record(row, "other-check", run=previous)
         record.update(exit_code=0, pane_dispatch_id="")
         atomic_file.write_text_atomic(path, json.dumps(record))
@@ -717,6 +728,7 @@ class WorkerCommandTests(unittest.TestCase):
         self.assertIn("Detached run: other-check", prompt[3].splitlines())
         self.assertIs(worker_lifecycle.read_json_object(path)["worker_received"], True)
         self.assertEqual(self.reply.read_text().rstrip(), reply)
+        self.assertEqual(self.receipt(), worker.DispatchComplete(reply, restored_done=True))
         completion = progress_history.hook_completion(worker_panes.worker_pass(row, self.run_dir))
         self.assertIsInstance(completion, progress_history.HookCompletion)
         self.assertEqual(self.fixture.world.closed, [])
@@ -2356,6 +2368,25 @@ class WorkerCommandTests(unittest.TestCase):
             [f"assistant:\n{stale_done}", f"user:\n{second_prompt}", f"assistant:\n{stale_done}"],
             worker.DispatchPrompt(dispatch_id, include_stage_two=True), worker.DoneReply(dispatch_id))
         self.assertEqual(receipt.receipt, worker.DispatchSubmitted(stale_done))
+
+    def test_completed_pass_waits_for_a_result_with_missing_or_invalid_record(self) -> None:
+        self.unfinished_turn()
+        pane, _ = self.agent.submitted[-1]
+        row = self.agent.row(pane)
+        delivery = pass_recorder.dispatch_delivery(worker_panes.worker_pass(row, self.run_dir))
+        progress_history.complete_dispatch(self.run_dir, "impl", delivery.completion_id)
+        self.agent.append(pane, "user", "Detached run: private-check\nRun finished: private verification")
+        path, record = self.detached_record(row, "private-check")
+        for invalid in (False, True):
+            with self.subTest(invalid=invalid):
+                if invalid:
+                    atomic_file.write_text_atomic(path, json.dumps({**record, "command": "invalid command"}))
+                receipt = self.receipt()
+                self.assertIsInstance(receipt, worker.DispatchWaitingForRuns)
+                assert isinstance(receipt, worker.DispatchWaitingForRuns)
+                self.assertEqual(receipt.runs, ("private-check",))
+                self.assertIsInstance(worker.completion_close_evidence(row, delivery, run=self.run_dir,
+                                                                      reply_file=str(self.reply)), worker_panes.Kept)
 
     def test_ended_pass_waits_for_the_saved_second_stage_reply_before_close(self) -> None:
         for status in ("canceled", "interrupted"):

@@ -284,6 +284,31 @@ class CurrentPanePass(Enum):
     CURRENT = "read the current pane pass"
 
 
+def _other_folder_results(row: staff.StaffRow, run: Path, run_ids: set[str]) -> set[str]:
+    """Find finished result records in the parent's other held folders."""
+    membership = staff.local_snapshot()
+    parent = membership.parent_of(row)
+    if parent is None:
+        return set()
+    held = unit_runs.held(str(parent.current_session), record=membership,
+                         scanned=worker_panes.parent_run_index(membership))
+    current = run.resolve()
+    found: set[str] = set()
+    for path in held:
+        folder = Path(path).resolve()
+        if folder == current:
+            continue
+        with suppress(OSError, worker_lifecycle.WorkerStateUnreadable):
+            for record in detached_runs._registered_runs(  # pyright: ignore[reportPrivateUsage]
+                    folder / worker_lifecycle.DETACHED_RUNS_DIR, row.id):
+                run_id = record["run_id"]
+                if (run_id in run_ids and record["staff_id"] == row.id and record["status"] == "finished"
+                        and Path(record["session_dir"]).resolve() == folder
+                        and not (current / worker_lifecycle.DETACHED_RUNS_DIR / f"{run_id}.json").exists()):
+                    found.add(run_id)
+    return found
+
+
 def dispatch_receipt(row: staff.StaffRow, line: str, dispatch_id: str, *,
                      run: Path, require_transcript: bool = False,
                      pane_pass: CurrentPanePass | progress_history.StoppedPassReceipt | worker_panes.PassDetachedResults = CurrentPanePass.CURRENT,
@@ -335,12 +360,11 @@ def dispatch_receipt(row: staff.StaffRow, line: str, dispatch_id: str, *,
         deliveries, other_passes = detached_runs.worker_results(directory, row, since=since,
             pane_dispatch_id=instance, received_runs=transcript.received_runs)
         if isinstance(reply, DispatchAwaitingReply) and isinstance(reply.matching_done, DispatchComplete):
-            # A completed pass can only reopen for a result from its run.
             unmatched = set(reply.runs).difference(deliveries, other_passes, (record["run_id"] for record in live))
             if unmatched:
                 saved = passed if passed is not None else worker_panes.worker_pass(row, run)
-                if saved.get("instance_id") == instance and saved.get("status") == "completed":
-                    other_passes.update(unmatched)
+                if saved.get("instance_id") == instance and saved.get("status") in ("completed", "error"):
+                    other_passes.update(_other_folder_results(row, run, unmatched))
         if isinstance(reply, DispatchAwaitingReply) and other_passes.intersection(reply.runs):
             transcript = transcript_receipt(records(), prompt, done, other_pass_results=frozenset(other_passes))
             recovered = transcript.receipt
