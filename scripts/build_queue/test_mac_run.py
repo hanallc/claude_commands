@@ -1,13 +1,17 @@
 """Check mac-linux claims against the native Mac claim path."""
-from collections.abc import Callable
-from contextlib import ExitStack, redirect_stdout
+from collections.abc import Callable, Generator
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import ExitStack, contextmanager, redirect_stdout
 from dataclasses import replace
+import fcntl
 from io import StringIO
+import json
 import os
 from pathlib import Path
 import shlex
 import subprocess
 import tempfile
+from threading import Event
 import time
 from typing import cast, final, override
 import unittest
@@ -449,9 +453,7 @@ class MacRunTests(unittest.TestCase):
                         self.assertIn("--retire-wait", command)
                     with redirect_stdout(output):
                         status = mac_test.command_claim(args, self.paths, watch_claim=False)
-                    if "--from-pid" in command:
-                        self.assertNotIn("--mac-repository", command)
-                        self.assertEqual(status, claim_state.LEGACY_WAIT_CLAIM_RELEASED)
+                    self.assertIn("--mac-repository", command)
                     return mock.Mock(returncode=status, communicate=mock.Mock(return_value=(output.getvalue(), "")),
                                      poll=mock.Mock(return_value=status))
 
@@ -475,7 +477,7 @@ class MacRunTests(unittest.TestCase):
                     self.assertEqual(claim_state.read_claims(self.paths), ())
                 else:
                     self.assertIsInstance(result, offload.PassedOnMac)
-                    self.assertEqual(len(claim_calls), 2)
+                    self.assertEqual(len(claim_calls), 1)
                     run.assert_called_once()
                     fresh, = claim_state.read_claims(self.paths)
                     saved = claim_state.saved_mac_repository(fresh.record)
@@ -484,12 +486,71 @@ class MacRunTests(unittest.TestCase):
                     self.assertEqual(saved.history_key, queue_repository.key)
                     self.assertEqual(controller.attempt_evidence.repository_key, queue_repository.key)
                     fresh_identity = claim_state.claim_identity(fresh.record)
-                    if not assigned:
+                    if assigned:
+                        self.assertEqual(fresh_identity.claim_id, execution_identity.assigned_claim_id(
+                            assignment.episode, assignment.attempt))
+                    else:
                         self.assertNotEqual(fresh_identity, identity)
+                        self.assertEqual(fresh_identity.episode, request.call_id)
                     self.assertEqual(run.call_args.args[3], eligibility.KnownRepository(saved.mirror_name, saved.key))
                     waiting.claim_id, waiting.episode, waiting.attempt = (fresh_identity.claim_id, fresh_identity.episode,
                                                                           fresh_identity.attempt)
                     self.assertEqual(mac_test.command_release(waiting, self.paths), 0)
+
+    def test_guest_waits_for_the_replacement_and_cannot_take_its_slot(self) -> None:
+        waiting = self.native_claim(self.checkout)
+        self.assertEqual(mac_test.command_claim(waiting, self.paths, watch_claim=False), 0)
+        reserved, = claim_state.read_claims(self.paths)
+        legacy = reserved.path.rename(reserved.path.with_name("legacy.json"))
+        incomplete = reserved.record.copy()
+        _ = incomplete.pop("mac_repository")
+        mac_test.write_json(legacy, incomplete)
+        resolved = claim_state.mac_repository_identity(str(self.checkout))
+        assert isinstance(resolved, claim_state.ResolvedMacMirror)
+        saved = resolved.claim_repository()
+        assert isinstance(saved, claim_state.MacRepositoryIdentity)
+        runner = self.native_claim(self.checkout)
+        runner.what, runner.remote, runner.from_pid = "replacement", "fixture-mac", waiting.pid
+        runner.retire_wait = "replacement-episode"
+        runner.mac_repository = json.dumps(saved.record())
+        retiring = Event()
+        guest_waits = Event()
+        lock = claim_state.locked
+
+        @contextmanager
+        def guest_lock(path: Path) -> Generator[None]:
+            with path.open("a+") as lock_file:
+                with self.assertRaises(BlockingIOError):
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                guest_waits.set()
+            with lock(path):
+                yield
+
+        def claim_guest() -> None:
+            self.assertTrue(retiring.wait(3))
+            with self.assertRaisesRegex(mac_run.MacRunRefused, "busy with replacement"):
+                with mac_run.held(self.checkout, "mac", SuiteMode.GATE, GATE_JOB_NOT_RECORDED):
+                    self.fail("The guest took the shared slot")
+
+        def retire(path: Path, missing_ok: bool = False) -> None:
+            if path == legacy:
+                retiring.set()
+                self.assertTrue(guest_waits.wait(3))
+            unlink(path, missing_ok=missing_ok)
+
+        unlink = Path.unlink
+        with ThreadPoolExecutor(max_workers=1) as guests, \
+                mock.patch.object(claim_state, "locked", new=guest_lock), \
+                mock.patch.object(Path, "unlink", autospec=True, side_effect=retire):
+            guest = guests.submit(claim_guest)
+            status = mac_test.command_claim(runner, self.paths, watch_claim=False)
+            guest.result(timeout=3)
+        self.assertEqual(status, 0)
+        fresh, = claim_state.read_claims(self.paths)
+        self.assertEqual(fresh.path, reserved.path)
+        self.assertEqual(fresh.record["what"], "replacement")
+        runner.claim_id, runner.episode, runner.attempt = fresh.record["claim_id"], fresh.record["episode"], fresh.record["attempt"]
+        self.assertEqual(mac_test.command_release(runner, self.paths), 0)
 
     def test_cleanup_handoff_holds_the_mirror_lease_and_retries_direct_claim(self) -> None:
         with (self.root / "mac_test.conf").open("a") as settings:

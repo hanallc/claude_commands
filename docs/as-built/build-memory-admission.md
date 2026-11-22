@@ -536,11 +536,12 @@ The runner, release, cleanup, and execution observer use the saved identity. Han
 A handoff can adopt an exact cleanup claim after the checkout is gone.
 A legacy Mac claim with no key blocks all repositories. Any Mac caller can take the exact claim for cleanup after the saved owner ends.
 A claim without a proven mirror or history key authorizes cleanup only.
-The runner holds the execution lease before it retires an incomplete local reservation.
-The runner keeps that lease until it finishes the new claim and run.
+The runner takes the execution lease before it replaces an incomplete local reservation.
+The claim child publishes the replacement and removes the old reservation under one provider lock.
+The runner keeps the execution lease through the run.
 Cleanup uses the saved mirror lease when the claim identifies the mirror. Otherwise, it takes the host lease and counts processes in all mirrors.
 The idle watcher reads an expired remote claim again under its cleanup lease before release.
-If a cleanup lease cannot open, the watcher skips that claim for the current pass.
+If a cleanup lease cannot open or its mirror root is invalid, the watcher skips that claim for the current pass.
 Shell and Python runners take a shared host lease before they take a mirror lease.
 The host-wide count sends no process signals. Unrelated mirror work can keep the claim pending.
 The Mac build log and the queue use the same Git root key for history when a repository has no origin.

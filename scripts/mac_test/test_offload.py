@@ -535,7 +535,8 @@ class OffloadSettingsTests(unittest.TestCase):
             self.assertEqual(offload.write_result(result, offload.ResultFile(result_path)), 75)
 
         self.assertEqual(claim.call_args_list, [
-            mock.call(controller, config, request, HANA, (1,), mac_repository=claim_state.NO_SAVED_MAC_REPOSITORY),
+            mock.call(controller, config, request, HANA, (1,), mac_repository=claim_state.NO_SAVED_MAC_REPOSITORY,
+                      retire_wait=False),
             mock.call(controller, config, replace(request, admission=offload.UnclaimedMacRun()), HANA, (1,),
                       mac_repository=claim_state.NO_SAVED_MAC_REPOSITORY),
         ])

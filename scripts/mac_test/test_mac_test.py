@@ -3401,6 +3401,33 @@ class ClaimWatchTests(NotificationGuardedTestCase):
         send.assert_called_once()
         self.assertIn('Your Mac claim "hana tests"', cast(str, send.call_args.args[4]))
 
+    def test_idle_watcher_skips_a_claim_with_an_invalid_mirror_root(self) -> None:
+        from scripts.copies import copies
+
+        _ = write_config_fixture(self.root / "mac_test.conf", "mirror_root=/invalid\n")
+        expired = mac_test.timestamp(self.now - timedelta(minutes=20))
+        records = self.write_repository_claims(idle_since=expired)
+        oldest = self.paths.claims / "cargo-liner.json"
+        saved = claim_state.CleanupOnlyMacRepository("repo-key", "cargo-liner", oldest.name, oldest.stem)
+        _ = oldest.write_text(json.dumps({**records["cargo-liner"], "idle_since": expired,
+                                         "since": mac_test.timestamp(self.now - timedelta(hours=1)),
+                                         "repo_key": saved.key, "repo_name": saved.mirror_name,
+                                         "mac_repository": saved.record()}))
+        before = oldest.read_bytes()
+        with mock.patch.object(conf, "_committed_files", return_value=()), \
+             mock.patch.object(copies, "remote_registry", return_value=self.root / "mirror-registry"), \
+             mock.patch.object(mac_test, "check_mac_activity", return_value=mac_test.MacIdle()), \
+             mock.patch.object(mac_test, "send_message") as send:
+            output = self.watch_once()
+        self.assertEqual(oldest.read_bytes(), before)
+        self.assertFalse((self.paths.claims / "hana.json").exists())
+        warning = "Mac claim cleanup lease unavailable"
+        self.assertIn(warning, output)
+        self.assertIn("mirror_root", output)
+        self.assertLess(output.index(warning), output.index('Your Mac claim "hana tests"'))
+        send.assert_called_once()
+        self.assertIn('Your Mac claim "hana tests"', cast(str, send.call_args.args[4]))
+
     def test_stopped_holder_release_ends_remote_work_before_the_fence_settles(self) -> None:
         from scripts.copies import copies
         from scripts.mac_test import eligibility, offload, claim_state
