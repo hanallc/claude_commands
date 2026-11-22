@@ -1342,7 +1342,9 @@ function renderBuildLimits(limits) {
   section.querySelector("summary .name").textContent = words.title;
   if (!section.open) return;
   const container = $("build-limits-content");
-  const machines = [["natedev", words.local], ["mac", words.mac], ["aws", words.aws]];
+  const machines = [["natedev", words.local]];
+  if (limits.mac) machines.push(["mac", words.mac]);
+  machines.push(["aws", words.aws]);
   const headings = machines.map(([key, name]) => {
     const data = limits[key];
     return `<th scope="col">${esc(name)}

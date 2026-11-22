@@ -13,6 +13,7 @@ from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from threading import Thread
+from typing import cast
 from unittest import mock
 from xml.etree import ElementTree
 
@@ -279,7 +280,8 @@ class BuildLimitsTests(unittest.TestCase):
             assert isinstance(started, process_start.Started)
             record: claim_state.RemoteJobClaim = {"claim_id": "project-claim", "episode": "episode", "attempt": "attempt",
                 "submitting_session": "build", "pid": os.getpid(), "proc_start": started.start, "what": "test",
-                "worktree": str(source), "since": since.isoformat(), "repo_name": "project", "repo_key": "",
+                "worktree": str(source), "since": since.isoformat(), "repo_name": "project",
+                "repo_key": "https://example.invalid/team/project",
                 "remote_host": "fixture-host"}
             for path in (claims / "one.json", claims / "copy.json"):
                 mac_test.write_json(path, record)
@@ -291,7 +293,7 @@ class BuildLimitsTests(unittest.TestCase):
             waits = limits_view.visible_waits(queue_view.QueueModel(queue, {}), {}, {})
 
             def show(snapshot: targets.TargetSnapshot) -> limits_view.BuildLimits:
-                mac = limits_view.read_mac(snapshot, origins, origins)
+                mac = limits_view.read_mac(snapshot, origins)
                 return limits_view.build_limits(queue, (snapshot,), waits, {},
                     {"build": "Build name", "cleanup": "Cleanup name"}, saved, UTC, mac=mac)
 
@@ -302,6 +304,18 @@ class BuildLimitsTests(unittest.TestCase):
                 normal = show(targets.ssh_target_snapshot(target))
                 _ = (root / "block.json").write_text("{", encoding="utf-8")
                 bad_block = show(targets.ssh_target_snapshot(target))
+                _ = subprocess.run(["git", "-C", str(source), "remote", "set-url", "origin",
+                                    "https://example.invalid/team/other"], env=env, check=True,
+                                    capture_output=True, timeout=TEST_HANG_GUARD_SECS)
+                for path in (claims / "one.json", claims / "copy.json"):
+                    mac_test.write_json(path, {**record, "repo_key": ""})
+                keyless = show(targets.ssh_target_snapshot(target))
+                for path in (claims / "one.json", claims / "copy.json"):
+                    mac_test.write_json(path, record)
+                mac_test.write_json(claims / "unknown.json",
+                                    {**record, "claim_id": "unknown", "repo_key": "https://example.invalid/"})
+                unresolved = show(targets.ssh_target_snapshot(target))
+                (claims / "unknown.json").unlink()
                 mac_test.write_json(root / "run.json", whole)
                 full_mac = show(targets.ssh_target_snapshot(target))
                 _ = (claims / "corrupt.json").write_text("{", encoding="utf-8")
@@ -314,6 +328,12 @@ class BuildLimitsTests(unittest.TestCase):
                              (1, 1, ["Build name"]))
             self.assertEqual((mac_cells["cleanup"].used, mac_cells["cleanup"].runs), (1, []))
             self.assertEqual((mac_cells["quiet"].used, mac_cells["quiet"].limit), (0, 1))
+        for shown, total in ((keyless, 2), (unresolved, 3)):
+            with self.subTest(mac_claims=total):
+                self.assertEqual(shown.mac.unattributed, total)
+                self.assertEqual(shown.mac.waits, normal.mac.waits)
+                self.assertTrue(all(row.mac == limits_view.Cell() for row in shown.repositories))
+                self.assertNotIn("other", {row.name for row in shown.repositories})
         self.assertTrue(mac_test.run_holds_work(cleanup))
         self.assertEqual(full_mac.mac.unattributed, 1)
         self.assertTrue(all(row.mac.limit is None and row.mac.used != 0 for row in full_mac.repositories))
@@ -462,17 +482,31 @@ class BuildLimitsTests(unittest.TestCase):
                          (None, None, 1, limits_view.CellPolicy.CONFIGURED))
 
     def check_page(self, shown: limits_view.BuildLimits) -> None:
-        rendered = test_memory_hover.MemoryHoverTests().page_expression(
-            "(renderBuildLimits(data.build_limits), $('build-limits-content').innerHTML)",
-            {"build_limits": snapshot_codec.snapshot_value(shown)}, limits=True)
-        assert isinstance(rendered, str)
-        table = ElementTree.fromstring(f"<root>{rendered}</root>")
+        current, previous = cast(list[str], test_memory_hover.MemoryHoverTests().page_expression("""(() => {
+            const limits = data.build_limits;
+            renderBuildLimits(limits);
+            const current = $('build-limits-content').innerHTML;
+            delete limits.mac;
+            delete limits.words.mac;
+            limits.repositories.forEach(row => { delete row.mac; });
+            renderBuildLimits(limits);
+            return [current, $('build-limits-content').innerHTML];
+        })()""",
+            {"build_limits": snapshot_codec.snapshot_value(shown)}, limits=True))
+        table = ElementTree.fromstring(f"<root>{current}</root>")
+        old_table = ElementTree.fromstring(f"<root>{previous}</root>")
         headings = table.findall(".//thead/tr/th")
+        self.assertEqual([heading.text for heading in old_table.findall(".//thead/tr/th")],
+                         [headings[index].text for index in (0, 1, 3)])
+        for row, old_row in zip(table.findall(".//tbody/tr"), old_table.findall(".//tbody/tr"), strict=True):
+            self.assertEqual(row.findtext("th"), old_row.findtext("th"))
+            self.assertEqual(["".join(cell.itertext()) for cell in old_row.findall("td")],
+                             ["".join(row.findall("td")[index].itertext()) for index in (0, 2)])
         self.assertIn("2 runs wait behind an earlier step in the queue.", "".join(headings[1].itertext()))
         self.assertIn("1 run waits behind an earlier step in the queue.", "".join(headings[2].itertext()))
         self.assertIn("1 run waits behind an earlier step in the queue.", "".join(headings[3].itertext()))
-        self.assertNotIn("2 waiting", rendered)
-        self.assertNotIn("1 waiting", rendered)
+        self.assertNotIn("2 waiting", current)
+        self.assertNotIn("1 waiting", current)
         self.assertIsNone(table.find(".//tbody/tr/th/small"))
         quiet = next(row for row in table.findall(".//tbody/tr") if row.findtext("th") == "quiet")
         cells = quiet.findall("td")

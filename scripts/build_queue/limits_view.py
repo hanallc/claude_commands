@@ -565,7 +565,6 @@ class MacClaim:
 class MacReading:
     claims: tuple[MacClaim, ...] = ()
     limits: Mapping[str, Mapping[str, int]] = field(default_factory=dict[str, Mapping[str, int]])
-    claim_origins: Origins = field(default_factory=Origins)
     claims_readable: bool = False
 
 
@@ -588,7 +587,7 @@ def read_mac_origins(now: float, earlier: Origins) -> Origins | ReadingState:
     return ReadingState.UNAVAILABLE if isinstance(paths, charts.IndexUnavailable) else earlier.refresh(paths)
 
 
-def read_mac(snapshot: targets.TargetSnapshot, origins: Origins, earlier: Origins) -> MacReading:
+def read_mac(snapshot: targets.TargetSnapshot, origins: Origins) -> MacReading:
     """Read claim and policy facts for one configured Mac."""
     target = snapshot.target
     assert isinstance(target, target_config.SshTarget)
@@ -607,8 +606,6 @@ def read_mac(snapshot: targets.TargetSnapshot, origins: Origins, earlier: Origin
         identity = claim_state.claim_identity(claim.record)
         if identity not in live and mac_test.run_is_live(claim.record):
             live[identity] = claim
-    checkout_origins = earlier.refresh({claim.record["worktree"] for claim in live.values()
-        if isinstance(claim.scope, claim_state.RepositoryScope) and not recorded_origin(claim.record.get("repo_key", ""))})
     claims: list[MacClaim] = []
     for claim in live.values():
         record = claim.record
@@ -617,7 +614,7 @@ def read_mac(snapshot: targets.TargetSnapshot, origins: Origins, earlier: Origin
         if isinstance(scope, claim_state.RepositoryScope):
             # The Mac admits a checkout under a scope that uses only its name.
             scope = claim_state.RepositoryScope(scope.name)
-            origin = recorded_origin(record.get("repo_key", "")) or checkout_origins.resolve("", record["worktree"])
+            origin = recorded_origin(record.get("repo_key", ""))
         session = (record["submitting_session"]
                    if not record.get("cleanup_pending") and mac_test.run_holds_work(record) else "")
         claims.append(MacClaim(scope, mac_test.slot_capacity(paths, scope), origin, session))
@@ -635,7 +632,7 @@ def read_mac(snapshot: targets.TargetSnapshot, origins: Origins, earlier: Origin
         for origin, names in origins.source_names.items():
             if name := short_name(origin):
                 limits.setdefault(name, {}).update((scope, configured[scope]) for scope in names if scope in configured)
-    return MacReading(tuple(claims), limits, checkout_origins, claims_readable=True)
+    return MacReading(tuple(claims), limits, claims_readable=True)
 
 
 @final
@@ -659,9 +656,7 @@ class MacRefresh:
         origins = safe_read(read_origins) if once else self.origins.current(now, self.report_interval, read_origins)
 
         def read_facts() -> MacReading:
-            earlier = self.facts.reusable()
-            return read_mac(snapshot, origins if isinstance(origins, Origins) else Origins(),
-                            earlier.claim_origins if isinstance(earlier, MacReading) else Origins())
+            return read_mac(snapshot, origins if isinstance(origins, Origins) else Origins())
 
         facts = safe_read(read_facts) if once else self.facts.current(now, self.feed_interval, read_facts, key=snapshot)
         return facts if isinstance(facts, MacReading) else None
@@ -779,12 +774,14 @@ def place_mac_counts(mac: MacReading, rows: dict[str, RepositoryRow], names: Map
     show_free = mac.claims_readable
     for claim in mac.claims:
         scope_use[claim.scope] += 1
-        if isinstance(claim.scope, claim_state.RepositoryScope) and (name := short_name(claim.origin)):
+        if isinstance(claim.scope, claim_state.RepositoryScope):
+            name = short_name(claim.origin)
+            if not name:
+                return len(mac.claims)
             by_row.setdefault(name, []).append(claim)
         else:
             unattributed += 1
-            if isinstance(claim.scope, claim_state.WholeMacScope):
-                show_free = False
+            show_free = False
 
     for name, claims in by_row.items():
         if name not in rows:
