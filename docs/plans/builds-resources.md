@@ -2240,7 +2240,7 @@ Each Mac run without `--target-dir` trims the mirror target to `mac_budget_gib.<
 - A missing, malformed or zone-less `createdAt` gives `CiUnknown`.
 - `config/mac_test.conf` has `ci_jobless_queued_minutes=60`. `read_config()` reads the key only when `ci_repo` is set, so the Linux and aws target configs need no new key.
 - No new `gh` call, flag, cancel call or state file.
-- Measured before the fix: run 43096016385 (natepiano/hana `ci.yml`) was queued from 2026-11-11 20:25 UTC with no jobs, and `gh run cancel` refused it as "completed". It held hana trunk's Mac block `pending` from 2026-11-12 20:04 EST.
+- Measured before the fix: run 43096016385 (hanallc/hana `ci.yml`) was queued from 2026-11-11 20:25 UTC with no jobs, and `gh run cancel` refused it as "completed". It held hana trunk's Mac block `pending` from 2026-11-12 20:04 EST.
 
 **Files:**
 - `scripts/mac_test/mac_test.py` — `CiRun`, `ci_activity()`, `MacTestConfig.ci_jobless_queued_minutes`
