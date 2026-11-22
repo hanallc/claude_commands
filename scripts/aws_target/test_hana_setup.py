@@ -17,7 +17,7 @@ from unittest import mock
 from scripts.aws_target import aws_cli, deploy, hana_box, hana_image, hana_render, hana_replacement, hana_replacement_record, hana_spend, ledger, plan_run, remote
 from scripts.aws_target.control_test_support import TestClock
 from scripts.aws_target.config import DeploymentSettings
-from scripts.aws_target.ledger_test_support import CostFixture, text_setting, write_hana_config
+from scripts.aws_target.ledger_test_support import CostFixture, text_setting, write_hana_config, set_hana_switch
 from scripts.aws_target.test_hana_box import FakeProvider
 from scripts.aws_target.test_hana_provider import FakeAws, IDENTITY
 from scripts.lib import conf
@@ -877,7 +877,7 @@ class HanaSetupTests(CostFixture):
         self.assertNotIn('deploy', calls)
         self.assertNotIn('start-instances', calls)
         self.assertFalse((self.state / 'gate-deployment.json').exists())
-        self.assertEqual(conf.read(self.workload).text('enabled'), 'off')
+        self.assertEqual(conf.read('build_targets').text('enabled.hana-aws'), 'off')
         self.assertEqual(prepared.parameters['InstanceType'], conf.read(self.workload).text('instance_type'))
 
     @contextmanager
@@ -1255,13 +1255,13 @@ class HanaSetupTests(CostFixture):
         self.assertEqual(fake.calls, [])
         self.assertIsInstance(hana_image.saved(self.state), hana_image.NoRegisteredImage)
 
-    def test_image_preview_reads_placement_with_invalid_spending_settings(self) -> None:
+    def test_image_preview_works_with_invalid_switch_and_spending_settings(self) -> None:
         fake = FakeAws(self.clock)
-        text_setting(self.workload, 'enabled', 'on')
+        set_hana_switch(self.root, 'invalid')
         text_setting(self.workload, 'fallback_instance_types', 'c7a.4xlarge,c7a.4xlarge')
         with mock.patch('sys.stdout', new_callable=StringIO) as output:
             self.assertFalse(self.subject(fake).hana_image(self.built_image()))
-        self.assertIn('Hana placement is enabled. This command does not change it.', output.getvalue())
+        self.assertIn('Hana placement stays as configured.', output.getvalue())
         self.assertEqual(fake.calls, [])
         self.assertIsInstance(hana_image.saved(self.state), hana_image.NoRegisteredImage)
 

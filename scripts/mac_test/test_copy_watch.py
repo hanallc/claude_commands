@@ -407,7 +407,7 @@ class CopyWatchProcessTests(unittest.TestCase):
         self.runner = self.root / "runner.py"
         _ = self.runner.write_text(RUNNER_STUB)
         _ = (self.root / "step.py").write_text(STEP_STUB)
-        _ = write_config_fixture(self.root / "mac_test.conf", "offload=on\nlinux_only.repo=\n")
+        _ = write_config_fixture(self.root / "mac_test.conf", "linux_only.repo=\n")
         busy: ClaimRecord = {
             "claim_id": "busy-claim", "episode": "busy-episode", "attempt": "busy-attempt", "submitting_session": "",
             "pid": os.getpid(),

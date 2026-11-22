@@ -1,15 +1,18 @@
 from __future__ import annotations
 
 import os
+import subprocess
+import sys
 import tempfile
 import unittest
 import io
 import json
 from contextlib import redirect_stdout
 from collections.abc import Callable, Mapping
-from datetime import UTC, datetime
+from datetime import UTC, datetime, tzinfo
 from dataclasses import replace
 from pathlib import Path
+from types import ModuleType
 from typing import cast
 from unittest import mock
 
@@ -117,7 +120,7 @@ class MacRouteTests(unittest.TestCase):
         root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         (root / "mac.conf").touch()
         _ = (root / "build_targets.conf").write_text(
-            "targets=mac,natedev\n"
+            "enabled.mac=on\ntargets=mac,natedev\n"
             + "kind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac.conf\n"
             + "kind.natedev=local\nplatform.natedev=linux\n",
             encoding="utf-8",
@@ -126,6 +129,44 @@ class MacRouteTests(unittest.TestCase):
 
     def routes(self, *mac_states: targets.TargetState) -> target_availability.MacRoutes:
         return target_availability.MacRoutes((snapshot(MAC, *mac_states), snapshot(NATEDEV, targets.Free())), LABELS, UTC)
+
+    def test_mac_enabled_preserves_main_routing_for_the_same_requests(self) -> None:
+        self.use_target_config()
+        revision = "3e0104530a"
+        path = "scripts/build_queue/target_availability.py"
+        source = subprocess.run(["git", "show", f"{revision}:{path}"],
+            cwd=Path(__file__).resolve().parents[2], capture_output=True, text=True, check=True).stdout
+        baseline = ModuleType("_baseline_target_availability")
+        with mock.patch.dict(sys.modules, {baseline.__name__: baseline}):
+            exec(compile(source, f"{revision}:{path}", "exec"), baseline.__dict__)
+        baseline_routes = cast(
+            Callable[[tuple[targets.TargetSnapshot, ...], Mapping[str, unit_labels.UnitLabels], tzinfo],
+                     target_availability.MacRoutes],
+            getattr(baseline, "MacRoutes"))
+        job = targets.RunningJob("nextest fixture", SINCE, targets.NotSeenIdle())
+        snapshots = (
+            (snapshot(MAC, targets.Free()),),
+            (snapshot(MAC, MAC_BLOCK),),
+            (snapshot(MAC, targets.Running((job,))),),
+            (snapshot(MAC, targets.Unreachable("fixture backoff")),),
+            (snapshot(MAC, targets.StateUnreadable("fixture state")),),
+            (snapshot(NATEDEV, targets.Free()),),
+        )
+        routes = (target_config.ANY_ELIGIBLE_TARGET, target_config.MAC_ONLY, target_config.LOCAL_CALLER,
+                  target_config.WRITES_TREE, target_config.PinnedTarget("mac"), target_config.PinnedTarget("natedev"))
+        waiter = WaitingStep(42, "", "", "build", "/fixture/project", 0, 0, NeedsMemory(), package="fixture")
+        disabled = target_availability.read_disabled_mac_targets()
+        self.assertFalse(disabled)
+        for policy in (eligibility.KnownRepository("fixture"), ExcludedTarget(MAC, "linux_only")):
+            with mock.patch.object(build_targets, "step_policy", return_value=policy):
+                for reading in snapshots:
+                    old = baseline_routes(reading, LABELS, UTC)
+                    current = target_availability.MacRoutes(reading, LABELS, UTC, disabled_mac_targets=disabled)
+                    for route in routes:
+                        for step in ("build", "nextest", "run", "mend", "final"):
+                            with self.subTest(policy=policy, reading=reading, route=route, step=step):
+                                request = replace(waiter, step=step, route=route)
+                                self.assertEqual(current.line(request), old.line(request))
 
     def test_holds_names_each_mac_state_and_a_free_mac_gives_nothing(self) -> None:
         cases: tuple[tuple[targets.TargetState, str], ...] = (

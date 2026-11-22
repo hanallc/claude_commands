@@ -63,7 +63,7 @@ class LifecycleSettings:
 def read_settings(configuration: conf.ConfigRead) -> LifecycleSettings:
     settings = LifecycleSettings(*(configuration.whole(key) for key in
         ('idle_stop_seconds', 'start_timeout_seconds', 'tick_interval_s', 'controller_tick_timeout_s')))
-    safety = hana_guest.read_settings(configuration)
+    safety = hana_guest.read_settings(configuration, enabled=True)
     if (min(settings.idle_stop_seconds, settings.start_timeout_seconds, settings.tick_interval_s,
             settings.controller_tick_timeout_s) <= 0
             or settings.tick_interval_s + settings.controller_tick_timeout_s >= safety.guard_grace_seconds
@@ -389,6 +389,13 @@ def _claim_owner_refusal(row: BoxRecord) -> str:
 
 def _start_refusal(row: BoxRecord, now: int, settings: LifecycleSettings) -> str:
     return _start_deadline_refusal(row, now, settings) or _claim_owner_refusal(row)
+
+
+def _permit_use(row: BoxRecord) -> hana_spend.PermitUse:
+    if (row.state == Lifecycle.READY and row.claims and row.claims[0].active
+            and isinstance(row.delivered, DeliveredPermit) and row.delivered.execution == row.claims[0].execution):
+        return hana_spend.PermitUse.ACTIVE_CLAIM
+    return hana_spend.PermitUse.NEW_WORK
 
 
 def _decode(document: dict[str, object]) -> BoxRecord:
@@ -792,7 +799,8 @@ class HanaController:
                 row.reason = abandonment
                 self._save(row)
             elif operation.action in (Action.BOOTSTRAP, Action.START, Action.PUBLISH):
-                allowed = spending.check_start(now, operation.generation)
+                use = _permit_use(row) if operation.action == Action.PUBLISH else hana_spend.PermitUse.NEW_WORK
+                allowed = spending.check_start(now, operation.generation, use=use)
                 if isinstance(allowed, hana_spend.PermitRefused):
                     row.reason = allowed.reason
                     self._save(row)
@@ -928,9 +936,11 @@ class HanaController:
             self._stop(row, now, row.stop_cause)
             return
         valid_boot = _boot_is_current(row, observed.boot)
-        if not spending.settings.enabled or not row.claims or not valid_boot:
-            if row.state == Lifecycle.READY and not row.claims and valid_boot and spending.settings.enabled:
-                if now - row.idle_since < settings.idle_stop_seconds:
+        use = _permit_use(row)
+        if (not row.claims or not valid_boot
+                or not spending.settings.enabled and use is hana_spend.PermitUse.NEW_WORK):
+            if row.state == Lifecycle.READY and not row.claims and valid_boot:
+                if spending.settings.enabled and now - row.idle_since < settings.idle_stop_seconds:
                     return
                 self._stop(row, now, StopCause.IDLE)
             elif (row.state != Lifecycle.STARTING or not isinstance(row.start, DemandStart)
@@ -952,11 +962,13 @@ class HanaController:
         expected = row.delivered.generation if isinstance(row.delivered, DeliveredPermit) else 0
         if exposure.expires - now <= renewal_margin and isinstance(row.delivered, DeliveredPermit):
             permission = spending.issue(now, now + spending.settings.permit_max_seconds, row.boot.boot_id,
-                expected_generation=row.generation)
+                expected_generation=row.generation, use=use)
         else:
-            permission = spending.bind_start(now, row.generation, row.boot.boot_id)
+            permission = spending.bind_start(now, row.generation, row.boot.boot_id, use=use)
         if isinstance(permission, hana_spend.PermitRefused):
             row.reason = permission.reason
+            if not spending.settings.enabled:
+                self._stop(row, now, StopCause.UNKNOWN)
             return
         row.generation = permission.exposure.generation
         if (not isinstance(row.delivered, DeliveredPermit) or row.delivered.generation != row.generation

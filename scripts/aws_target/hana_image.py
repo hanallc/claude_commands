@@ -9,6 +9,7 @@ from typing import cast
 
 from scripts.aws_target import hana_render, ledger, remote
 from scripts.aws_target.aws_cli import AwsExecutor
+from scripts.build_targets import machine_switch
 from scripts.lib import conf
 from scripts.lib.atomic_file import write_text_atomic
 
@@ -111,12 +112,19 @@ def artifact_digest(store: Path, execute: AwsExecutor, timeout: float) -> hana_r
     raise ImageRefused('The Hana image has no verified guest digest. Build the Hana image from the current input.')
 
 
-def guest_digest_is_current(digest: hana_render.GuestDigest, configuration: Path | conf.ConfigRead) -> bool:
+def guest_digest_is_current(digest: hana_render.GuestDigest, configuration: Path | conf.ConfigRead, *,
+                            switch: machine_switch.MachineSwitch | conf.UseConfiguredValue = conf.UseConfiguredValue.CURRENT
+                            ) -> bool:
     """Compare the installed image files with the current render."""
     try:
-        return digest == hana_render.guest_digest(configuration)
+        return digest == hana_render.guest_digest(configuration, switch=switch)
     except (OSError, ValueError):
         return False
+
+
+def guest_digest_matches_build(digest: hana_render.GuestDigest, configuration: Path | conf.ConfigRead) -> bool:
+    """Check the image build inputs for a manual resource command."""
+    return any(guest_digest_is_current(digest, configuration, switch=switch) for switch in machine_switch.MachineSwitch)
 
 
 def setup_image_is_current(setup: dict[str, object], configuration: Path | conf.ConfigRead) -> bool:

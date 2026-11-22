@@ -89,6 +89,9 @@ class RemoteStartHoldEnded:
     """The remote assignment no longer keeps a place on natedev."""
 
 
+MacLaunchSource = Literal["adapter", "coordinator", "unrecorded"]
+
+
 @dataclass(frozen=True)
 class SavedPlacementAssignment:
     """The saved assignment holds its settings generation and dispatch state."""
@@ -103,6 +106,7 @@ class SavedPlacementAssignment:
         placement.UnknownAssignedSettingsGeneration())
     refusal_settings: RefusalSettings | NoRefusalSettings = NoRefusalSettings()
     remote_start_hold: RemoteStartHold | RemoteStartHoldUnrecorded | RemoteStartHoldEnded = RemoteStartHoldUnrecorded()
+    mac_launch_source: MacLaunchSource = "unrecorded"
 
 # Historical multiplier for saved dev bases from the Phase 24 replay.
 DEV_HEADROOM = 4.2034275337646125

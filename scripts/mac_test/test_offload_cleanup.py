@@ -26,7 +26,7 @@ from scripts.lib.checkout_test_support import fixture_shim_source
 from scripts.lib import conf, removal_guard, test_hang_guard
 
 
-MAC_TARGET_CONFIG = "targets=mac\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n"
+MAC_TARGET_CONFIG = "enabled.mac=on\ntargets=mac\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n"
 DOC_INDEX_MIB = "250"
 LINT_TRIM_CONFIG = f"""\
 # range: 0..
@@ -285,7 +285,7 @@ exit "$CLEANUP_TEST_STATUS"
         _ = settings.write_text(nextest_settings(overrides.get(nextest_log.TAIL_BYTES, "65536"),
                                                 overrides.get(nextest_log.SUMMARY_BYTES, "1024")))
         config = eligibility.OffloadConfig(
-            enabled=True, connection=eligibility.SshConnectionSettings("unused-host", 6, 10), probe_timeout_s=1,
+            connection=eligibility.SshConnectionSettings("unused-host", 6, 10), probe_timeout_s=1,
             unreachable_backoff_s=300, free_floor_gib=free_floor_gib,
             default_target_budget_gib=budget_gib,
             values={"abandoned_session_minutes": str(abandoned_session_minutes), **overrides},

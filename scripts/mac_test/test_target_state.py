@@ -81,11 +81,11 @@ class IsolatedTargetState(unittest.TestCase):
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.config = self.root / "build_targets.conf"
         self.mac_state = self.root / "legacy-mac"
-        lines = ["targets=mac,linux,linux-two,natedev"]
+        lines = ["enabled.mac=on", "targets=mac,linux,linux-two,natedev"]
         for name, hours in zip(TARGET_NAMES, (4, 1, 2), strict=True):
             settings = self.root / f"{name}.conf"
             _ = write_config_fixture(settings,
-                f"host=fake-{name}\noffload=on\nci_repo=\nblock_hours={hours}\n"
+                f"host=fake-{name}\nci_repo=\nblock_hours={hours}\n"
                 + "block_max_hours=48\nblock_warn_minutes=15\n"
                 + "gh_timeout_s=1\nclaim_idle_minutes=15\nclaim_poll_seconds=60\n"
                 + "connect_timeout_s=1\nprobe_timeout_s=1\nunreachable_backoff_s=30\n",
@@ -226,16 +226,23 @@ class TargetStateTests(IsolatedTargetState):
             self.assertEqual(state.holder, member.name)
             self.assertEqual(self.invoke_mac(["unblock", "--holder", member.id, "--target", "mac"]).returncode, 0)
 
-    def test_explicit_mac_free_now_reads_the_registry_offload_setting(self) -> None:
+    def test_mac_capacity_reads_the_switch_with_either_ssh_settings_file(self) -> None:
         legacy = self.root / "mac_test.conf"
-        _ = write_config_fixture(legacy, "offload=on\nci_repo=", template="mac_test")
-        settings = self.root / "mac.conf"
-        _ = settings.write_text(settings.read_text().replace("offload=on", "offload=off"), encoding="utf-8")
+        _ = write_config_fixture(legacy, "ci_repo=", template="mac_test")
+        _ = write_config_fixture(self.config, "enabled.mac=off\n")
         with mock.patch.dict(os.environ, {"MAC_TEST_CONFIG": str(legacy)}):
             selected = self.invoke_mac(["free-now", "--target", "mac"])
             default = self.invoke_mac(["free-now"])
         self.assertEqual((selected.returncode, selected.stdout.strip()), (1, "off"))
-        self.assertEqual((default.returncode, default.stdout.strip()), (0, "free"))
+        self.assertEqual((default.returncode, default.stdout.strip()), (1, "off"))
+
+    def test_manual_mac_capacity_and_status_do_not_read_the_switch(self) -> None:
+        _ = write_config_fixture(self.config, "enabled.mac=invalid\n")
+        with self.assertRaisesRegex(ValueError, "enabled.mac"):
+            _ = mac_test.free_now(mac_test.state_paths("mac"), self.root / "mac.conf", self.root)
+        result = self.invoke_mac(["free-now", "--target", "mac", "--manual"])
+        self.assertEqual((result.returncode, result.stdout.strip()), (0, "free"))
+        self.assertEqual(self.invoke_mac(["status", "--target", "mac"]).returncode, 0)
 
     def test_macos_peer_accepts_ci_settings_and_linux_peer_refuses_them(self) -> None:
         settings = self.root / "linux-two.conf"

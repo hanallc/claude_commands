@@ -94,7 +94,7 @@ class IsolatedTargetTest(unittest.TestCase):
         (self.root / "sessions").mkdir()
         _ = config_environment(self.root)
         _ = write_config_fixture(self.root / "build_targets.conf",
-                                 "targets=mac,natedev\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n"
+                                 "enabled.mac=on\ntargets=mac,natedev\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n"
                                  + "kind.natedev=local\nplatform.natedev=linux\n")
         _ = write_config_fixture(self.settings, "host=test-mac\n", template="mac_test")
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
@@ -256,13 +256,13 @@ class ConfigurationTests(IsolatedTargetTest):
             _ = targets.read_targets(config)
 
     def test_missing_settings_key_names_its_key(self) -> None:
-        config = self.write_config("targets=mac\nkind.mac=ssh\nplatform.mac=macos\n")
+        config = self.write_config("enabled.mac=on\ntargets=mac\nkind.mac=ssh\nplatform.mac=macos\n")
         with self.assertRaisesRegex(targets.ConfigError, r"settings\.mac"):
             _ = targets.read_targets(config)
 
     def test_missing_settings_file_names_its_key(self) -> None:
         config = self.write_config(
-            "targets=mac\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=absent.conf\n"
+            "enabled.mac=on\ntargets=mac\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=absent.conf\n"
         )
         with self.assertRaisesRegex(targets.ConfigError, r"settings\.mac"):
             _ = targets.read_targets(config)
@@ -274,7 +274,7 @@ class ConfigurationTests(IsolatedTargetTest):
         _ = write_config_fixture(settings, "host=test-mac\n", template="mac_test")
         config = folder / "targets.conf"
         _ = config.write_text(
-            "targets=mac\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=remote.conf\n",
+            "enabled.mac=on\ntargets=mac\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=remote.conf\n",
             encoding="utf-8",
         )
         self.assertEqual(targets.read_targets(config), (targets.SshTarget("mac", "macos", settings),))
@@ -295,7 +295,7 @@ class EligibilityTests(IsolatedTargetTest):
     def setUp(self) -> None:
         super().setUp()
         config = self.write_config(
-            "targets=mac,natedev\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n"
+            "enabled.mac=on\ntargets=mac,natedev\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n"
             + "kind.natedev=local\nplatform.natedev=linux\n"
         )
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"CONF_DIR": str(Path(config).parent)})))
@@ -346,7 +346,7 @@ class EligibilityTests(IsolatedTargetTest):
         alternate = self.root / "alternate.conf"
         _ = write_config_fixture(alternate, "linux_only.hana=hana\n", template="mac_test")
         config = self.write_config(
-            "targets=natedev,mac\nkind.natedev=local\nplatform.natedev=linux\n"
+            "enabled.mac=on\ntargets=natedev,mac\nkind.natedev=local\nplatform.natedev=linux\n"
             + "kind.mac=ssh\nplatform.mac=macos\nsettings.mac=alternate.conf\n"
         )
         with mock.patch.dict(os.environ, {"CONF_DIR": str(Path(config).parent)}):
@@ -708,8 +708,8 @@ class TargetStateTests(IsolatedTargetTest):
 class ReservationTests(IsolatedTargetTest):
     def test_takeover_retry_publishes_its_session_after_an_interrupted_publication(self) -> None:
         _ = self.write_config(
-            "targets=mac\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n")
-        _ = write_config_fixture(self.settings, "offload=on\nhost=test-mac\nlinux_only.hana=\n", template="mac_test")
+            "enabled.mac=on\ntargets=mac\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n")
+        _ = write_config_fixture(self.settings, "host=test-mac\nlinux_only.hana=\n", template="mac_test")
         args = build_targets.CliArguments()
         args.target, args.kind, args.package = "mac", "test", "sample"
         args.repo_root, args.pid = str(self.root), os.getpid()

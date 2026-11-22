@@ -52,11 +52,14 @@ runpy.run_path(os.environ["TEST_REAL_TARGETS"], run_name="__main__")
     def test_disk_decline_during_eligibility_leaves_memory_wait_for_a_free_mac(self) -> None:
         self.assert_disk_decline_leaves_for_mac()
 
-    def test_mac_disk_with_linux_off_leaves_memory_wait_for_a_free_mac(self) -> None:
+    def test_mac_disk_with_linux_excluded_leaves_memory_wait_for_a_free_mac(self) -> None:
         config = self.root / "build_targets.conf"
         _ = config.write_text(config.read_text().replace("targets=mac,natedev", "targets=mac,natedev,linux")
                               + "kind.linux=ssh\nplatform.linux=linux\nsettings.linux=linux.conf\n")
-        _ = write_config_fixture(self.root / "linux.conf", "offload=off\nkinds=test\n", template="mac_test")
+        _ = write_config_fixture(self.root / "linux.conf", "kinds=test\n", template="mac_test")
+        state = self.home / ".local/state/build-targets/linux"
+        state.mkdir(parents=True, exist_ok=True)
+        _ = (state / "unreachable_until").write_text("1000000000000\n")
         self.assert_disk_decline_leaves_for_mac(disabled_linux=True)
 
     def assert_disk_decline_leaves_for_mac(self, *, disabled_linux: bool = False) -> None:
@@ -209,7 +212,7 @@ class StepRetryPermissionTests(unittest.TestCase):
                             configuration += f"kind.{name}=ssh\nplatform.{name}={'macos' if name == 'mac' else 'linux'}\n"
                             configuration += f"settings.{name}={name}.conf\n"
                             _ = write_config_fixture(fixture.root / f"{name}.conf",
-                                "offload=on\nlinux_only.hana=\nslots=1\nkinds=test,check,lint,doc,build,example\n",
+                                "linux_only.hana=\nslots=1\nkinds=test,check,lint,doc,build,example\n",
                                 template="mac_test")
                         configuration += "kind.natedev=local\nplatform.natedev=linux\n"
                         _ = (fixture.root / "build_targets.conf").write_text(configuration)

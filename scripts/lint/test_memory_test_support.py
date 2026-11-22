@@ -7,11 +7,32 @@ import tempfile
 import unittest
 from unittest import mock
 
-from scripts.lint.memory_test_support import ConfigFixtureRefused, commit_config_fixture, write_config_fixture
+from scripts.lint.memory_test_support import ConfigFixtureRefused, commit_config_fixture, config_environment, write_config_fixture
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 class ConfigFixtureTests(unittest.TestCase):
+    def test_fixture_defaults_read_no_checkout_configuration(self) -> None:
+        tracked = Path(__file__).resolve().parents[2] / "config"
+        read_text, read_bytes = Path.read_text, Path.read_bytes
+
+        def fixture_text(path: Path) -> str:
+            self.assertFalse(path.is_relative_to(tracked))
+            return read_text(path)
+
+        def fixture_bytes(path: Path) -> bytes:
+            self.assertFalse(path.is_relative_to(tracked))
+            return read_bytes(path)
+
+        with (tempfile.TemporaryDirectory() as directory,
+            mock.patch.object(Path, "read_text", new=fixture_text),
+            mock.patch.object(Path, "read_bytes", new=fixture_bytes),
+        ):
+            root = Path(directory)
+            environment = config_environment(root, fixture_defaults_only=True)
+            self.assertEqual(environment["BUILD_TARGETS_CONFIG"], str(root / "build_targets.conf"))
+            self.assertEqual(list(root.iterdir()), [root / "build_admission.conf"])
+
     def test_partial_config_keeps_values_and_receives_committed_defaults_and_limits(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "direct.conf"
@@ -42,10 +63,10 @@ class ConfigFixtureTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "private-mac.conf"
             _ = path.write_text("host=private-host\n")
-            _ = write_config_fixture(path, "offload=on\n", template="mac_test")
+            _ = write_config_fixture(path, "free_floor_gib=90\n", template="mac_test")
             text = path.read_text()
         self.assertIn("host=private-host\n", text)
-        self.assertIn("offload=on\n", text)
+        self.assertIn("free_floor_gib=90\n", text)
         self.assertIn("leftover_timeout_s=", text)
 
     def test_existing_and_explicit_limits_follow_their_values(self) -> None:
@@ -53,7 +74,7 @@ class ConfigFixtureTests(unittest.TestCase):
             path = Path(directory) / "aws_target.conf"
             _ = path.write_text("# range: 0..\nfixed_usd_per_month=0\n")
             _ = write_config_fixture(path, "kinds=test,doc\n# whole: 0..\nslots=0\n")
-            _ = write_config_fixture(path, "offload=on\n")
+            _ = write_config_fixture(path, "build_budget_gib=4\n")
             text = path.read_text()
         self.assertIn("# range: 0..\nfixed_usd_per_month=0\n", text)
         self.assertIn("# whole: 0..\nslots=0\n", text)

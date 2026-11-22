@@ -186,7 +186,7 @@ def hana_billed_hours(directory: Path, day: date) -> Decimal | None:
             return None
     except (OSError, ValueError, ArithmeticError):
         return None
-    settings = hana_spend.read_settings(conf.read_or_repository('hana_aws'))
+    settings = hana_spend.read_resource_settings(conf.read_or_repository('hana_aws'))
     keys = {(size, settings.region) for size in (settings.instance_type, *settings.fallback_instance_types)}
     return sum((row.quantity for row in bill.usage_types if _spot_usage_key(row.usage_type) in keys), Decimal('0.0'))
 

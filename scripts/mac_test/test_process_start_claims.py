@@ -34,7 +34,7 @@ class ClaimProcessStartTests(unittest.TestCase):
             repository.mkdir()
             alias = root / "checkout"
             alias.symlink_to(repository, target_is_directory=True)
-            _ = write_config_fixture(root / "mac_test.conf", "offload=on\nlinux_only.hana=\n", template="mac_test")
+            _ = write_config_fixture(root / "mac_test.conf", "linux_only.hana=\n", template="mac_test")
             request = placement_request(fixture, since=fixture.clock.now())
             fixture.clock.advance(3600)
             _ = publish_candidate(fixture, request)
@@ -257,9 +257,9 @@ class ClaimProcessStartTests(unittest.TestCase):
             with self.subTest(provider=provider, first=first_scope, second=second_scope), PlacementFixture() as fixture:
                 target = "mac" if provider == "mac" else "box"
                 _ = (fixture.root / "build_targets.conf").write_text(
-                    "targets=mac,box\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n"
+                    "enabled.mac=on\ntargets=mac,box\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n"
                     + "kind.box=ssh\nplatform.box=linux\nsettings.box=box.conf\n")
-                _ = write_config_fixture(fixture.root / "box.conf", "offload=on\nslots=2\n", template="mac_test")
+                _ = write_config_fixture(fixture.root / "box.conf", "slots=2\n", template="mac_test")
                 paths = mac_test.StatePaths(fixture.root / "provider", target,
                     platform="macos" if provider == "mac" else "linux")
                 assignments: list[placement.PlacementAssignment] = []

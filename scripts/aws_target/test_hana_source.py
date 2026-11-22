@@ -73,7 +73,7 @@ class HanaSourceTests(unittest.TestCase):
         _ = (config_dir / 'copies.conf').write_text(
             'wait_seconds=1\ngit_timeout_seconds=60\nguard_timeout_seconds=10\n')
         _ = (config_dir / 'build_targets.conf').write_text(
-            '# range: 0.001..\nloopback.shell_timeout_s=120\n')
+            'enabled.hana-aws=on\n# range: 0.001..\nloopback.shell_timeout_s=120\n')
         private = private_slot_config(self.root, repository='hana')
         self.enterContext(mock.patch.dict(os.environ, private.environment))
 
@@ -81,7 +81,6 @@ class HanaSourceTests(unittest.TestCase):
         configuration = config_dir / 'hana_aws.conf'
         _ = configuration.write_text("""\
 host=aws-hana
-enabled=on
 # whole: 1..60
 guard_grace_seconds=60
 # whole: 1..60

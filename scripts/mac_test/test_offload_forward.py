@@ -17,6 +17,7 @@ from scripts.build_queue import placement
 from scripts.mac_test import eligibility, nextest_log, offload
 from scripts.mac_test.claim_state import RepositoryScope
 from scripts.buildlog import sync as buildlog_sync
+from scripts.lint.memory_test_support import write_config_fixture
 from scripts.mac_test.offload_test_support import HANA, OffloadCommandFixture
 from scripts.lib import test_hang_guard
 
@@ -309,7 +310,7 @@ class OffloadForwardTests(OffloadCommandFixture):
                 self.assert_fetch_wire("fetched", wire_status, reason)
                 self.assertTrue((self.state_directory / f"fetched/call-{status}/target/shots-{status}/shot.png").exists())
 
-    def test_lost_and_declined_runs_do_not_fetch(self) -> None:
+    def test_lost_runs_do_not_fetch(self) -> None:
         self.fixture["run_status_reported"] = False
         self.sync_fixture()
         answer = self.command(
@@ -319,16 +320,17 @@ class OffloadForwardTests(OffloadCommandFixture):
         self.assertEqual(answer.returncode, 75, answer.stdout + answer.stderr)
         self.assert_fetch_wire("not_run", "lost")
         self.assertFalse((self.stub_directory / "pull-started").exists())
-        self.config["offload"] = "off"
-        self.sync_config()
-        self.clear_events()
+
+    def test_switch_refusal_does_not_fetch(self) -> None:
+        _ = write_config_fixture(self.root / "build_targets.conf", "enabled.mac=off\n")
         answer = self.command(
             "--workspace", runner_options=("--fetch", "target/shots"), call_id="call-forward",
-            subprocess_cli=True, separate_stderr=True, assigned_adapter=True,
+            subprocess_cli=True, separate_stderr=True,
         )
         self.assertEqual(answer.returncode, 75, answer.stdout + answer.stderr)
         self.assert_fetch_wire("not_run", "declined", "off")
-        self.assertEqual(self.events(), [])
+        self.assertNotIn("mac_test: running on the Mac", answer.stdout)
+        self.assertFalse((self.stub_directory / "pull-started").exists())
 
     def test_existing_destination_is_not_overwritten(self) -> None:
         landing = self.state_directory / "fetched/call-forward"

@@ -174,7 +174,7 @@ class ConfigRead:
         def read_key(settings: dict[str, Setting]) -> tuple[Result, str | None]:
             nonlocal bad
             try:
-                setting = _setting(settings, key)
+                setting = _setting(settings, key, self.source)
             except _MissingKey:
                 if isinstance(default, UseConfiguredValue):
                     raise
@@ -252,7 +252,7 @@ class ConfigRead:
     def effective_key(self, key: str) -> str:
         """Return the host override key when the live file has one."""
         if isinstance(self.settings, dict):
-            return effective_key(self.settings, key, host_name=_local_host_name())
+            return effective_key(self.settings, key, host_name=_local_host_name(), file=self.source)
         return key
 
     def number(self, key: str) -> float:
@@ -278,7 +278,7 @@ class ConfigRead:
         result: dict[str, str] = {}
         for key in selected:
             try:
-                setting = _setting(settings, key)
+                setting = _setting(settings, key, self.source)
             except _MissingKey:
                 continue
             if not setting.value and not setting.limit.startswith(("# whole:", "# range:", "# one of:")):
@@ -397,15 +397,20 @@ def _local_host_name() -> str:
     return socket.gethostname().partition(".")[0]
 
 
-def effective_key(settings: dict[str, Setting], key: str, *, host_name: str) -> str:
+def _exact_machine_key(file: str | Path, key: str) -> bool:
+    registry = file.name == "build_targets.conf" if isinstance(file, Path) else file == "build_targets"
+    return registry and (key == "enabled" or key.startswith("enabled."))
+
+
+def effective_key(settings: dict[str, Setting], key: str, *, host_name: str, file: str | Path = "") -> str:
     """Select the override for the specified short host name when it exists."""
     candidate = f"{key}.{host_name}"
-    return candidate if candidate in settings else key
+    return candidate if candidate in settings and not _exact_machine_key(file, key) else key
 
 
-def _setting(settings: dict[str, Setting], key: str) -> Setting:
+def _setting(settings: dict[str, Setting], key: str, file: Path) -> Setting:
     try:
-        return settings[effective_key(settings, key, host_name=_local_host_name())]
+        return settings[effective_key(settings, key, host_name=_local_host_name(), file=file)]
     except KeyError:
         raise _MissingKey("key is missing") from None
 
@@ -506,7 +511,7 @@ def effective_line(file: str | Path, key: str) -> tuple[int, str]:
     """Return the effective source line index and its value without a write."""
     source = path(file)
     try:
-        setting = _setting(_parse(source.read_text(encoding="utf-8")), key)
+        setting = _setting(_parse(source.read_text(encoding="utf-8")), key, source)
     except (OSError, UnicodeError, ValueError) as error:
         raise Unusable(f"{source}: {key}: {error}") from error
     return setting.line, setting.value
@@ -546,6 +551,8 @@ def full_model_color_key(file: str | Path, key: str) -> bool:
 
 def host_override(file: str | Path, settings: dict[str, Setting], key: str) -> str | None:
     """Find an override. Require a known host suffix for full model color keys."""
+    if _exact_machine_key(file, key):
+        return None
     prefix = f"{key}."
     candidates = [candidate for candidate in settings if candidate.startswith(prefix)]
     if not candidates:
@@ -577,7 +584,7 @@ def editable_line(file: str | Path, key: str) -> tuple[int, str]:
 def check(file: str | Path, key: str, value: str) -> None:
     source = path(file)
     try:
-        setting = _setting(_parse(source.read_text(encoding="utf-8")), key)
+        setting = _setting(_parse(source.read_text(encoding="utf-8")), key, source)
         _limits(setting.limit, value)
     except (OSError, UnicodeError, ValueError) as error:
         raise Unusable(f"{source}: {key}={value!r}: {error}") from error

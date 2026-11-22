@@ -14,6 +14,11 @@
 set -o pipefail
 callback_mode=''
 argv_file=''
+manual=()
+if [[ $1 == --manual ]]; then
+  manual=(--manual)
+  shift
+fi
 if [[ $1 == prepare || $1 == cleanup ]]; then
   callback_mode=$1
   argv_file=$2
@@ -72,7 +77,7 @@ on_mac() {
 if [[ -z $callback_mode ]]; then
   ssh -o BatchMode=yes $host true 2>/dev/null || { print "mac unreachable"; exit 3 }
   exec "$lib/py" "$lib/../mac_test/mac_queue_run.py" --what "mac run $sha" --kind run --package hana \
-    --worktree "$repo" --cwd '' --lifecycle-script "${0:A}" -- "$repo" "$sha" "$hold"
+    "${manual[@]}" --worktree "$repo" --cwd '' --lifecycle-script "${0:A}" -- "$repo" "$sha" "$hold"
 fi
 host=$MAC_QUEUE_HOST
 copies_script=$lib/../copies/copies.py

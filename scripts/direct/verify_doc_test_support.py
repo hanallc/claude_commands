@@ -241,9 +241,9 @@ class VerifyDocFixture(unittest.TestCase):
         holders.mkdir()
         _ = (holders / "other").write_text("private hold")
         settings = self.root / "mac.conf"
-        _ = write_config_fixture(settings, f"offload=on\nlinux_only.{self.repo.name}=\n", template="mac_test")
+        _ = write_config_fixture(settings, f"linux_only.{self.repo.name}=\n", template="mac_test")
         _ = (self.root / "build_targets.conf").write_text(
-            "targets=natedev,mac\nkind.natedev=local\nplatform.natedev=linux\n"
+            "enabled.mac=on\ntargets=natedev,mac\nkind.natedev=local\nplatform.natedev=linux\n"
             + "kind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac.conf\n")
         self.environment["MAC_TEST_CONFIG"] = str(settings)
         self.environment["CONF_DIR"] = str(Path(settings).parent)

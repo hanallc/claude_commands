@@ -3047,6 +3047,7 @@ def _sweep_nightly_build_folders() -> None:
                     raise RuntimeError("the build folder sweep failed")
             else:
                 scripts = Path(__file__).resolve().parents[1]
+                # The nightly sweep uses placed Mac work.
                 _ = subprocess.run([sys.executable, str(scripts / "lib/nix_env.py"), "exec",
                                     sys.executable, str(scripts / "mac_test/mac_queue_run.py"),
                                     "--kind", "run", "--what", "Sweep unused Mac build folders", "--package", "claude",

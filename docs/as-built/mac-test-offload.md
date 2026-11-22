@@ -493,13 +493,43 @@ A new block writes one `hold_event` `began`; record removal in `expire_block` or
 
 `offload.py` reads `treekey.tree_key` immediately before and after a successful copy. It sends `BUILDLOG_SENT_TREE_KEY` only when both keys are known and equal. `record.step` uses it for a `verify-mac` step whose own keys are unavailable, preserves an own verified key, and never fills a changed tree. A file read raising `OSError` gives no key and leaves the run able to proceed. `Mac failures with a natedev pass of the same tree` counts failed Mac calls with a keyed nextest step and a passing natedev nextest step of the same package, command and key; filtered commands match only the same filter. Steps from before the install still count as `without a tree key`. All windows share one step read, with a 24-hour lookback.
 
-## Config — `config/mac_test.conf`
+## Configuration
+
+The admission service reads `enabled.mac` in `config/build_targets.conf` at first launch authorization.
+When the value is `off`, the service refuses new placed work with `enabled.mac is off`.
+A run with launch authorization can finish after the value changes.
+The Memory feed removes the Mac from the targets for new work, even when the target snapshot is unreadable.
+Status reads continue.
+
+Use `mac_queue_run.py --manual` with `--kind shot`, `install`, `probe`, or `run` for a command you type.
+Use `mac_run.sh --manual` to request a manual Hana run.
+Use `mac_test.py free-now --target mac --manual` to check capacity for a manual Mac command.
+These commands skip the switch and still check capacity.
+Automated commands omit `--manual` and use the switch.
+The nightly build folder sweep is an automated command.
+For commands from `mac_queue_run.py`, the reply that supplies the assignment also authorizes launch.
+The service can repeat that reply to the same coordinator for the same source and command.
+An adapter claim authorizes launch through the first reply to its claim request.
+
+### `config/mac_test.conf`
 
 `fetch_limit_mib` limits one returned folder (default 512 MiB).
 `fetch_retention_days` sets the retention period for completed and partial fetch folders (default 14 days).
 Both values use the existing configuration reader.
 
-`offload=on`; `host=mac`; `free_floor_gib=100`; `mac_budget_gib=24` and `mac_budget_gib.hana=56` (size limits of each mirror's build folder, not memory); `linux_only.hana=hana_video,hana_clerestory`; `linux_only.cargo-liner=`, `linux_only.bevy_brp=` and `linux_only..claude=` (empty: each key sends that repository to the Mac); `mac_skip.hana=test(world_panel_words_match_drawn_pixels)`; `ci_repo=hanallc/hana`, `ci_variable=MACOS_CI`, `ci_workflow=ci.yml`, `ci_job=macOS: Compile and Test`; `gh_timeout_s`, `block_hours`, `block_max_hours`, `block_warn_minutes`; `claim_idle_minutes=15`, `claim_poll_seconds=60`. `leftover_timeout_s` is not set, so the leftover check uses 10 s. `free_floor_gib` serves both the probe's disk decline and the cleanup's keep-or-remove test. A repository needs a `linux_only.<repo>` key, even empty, before it runs on the Mac. `MAC_TEST_CONFIG` selects another file.
+- The Mac host is `host=mac`.
+- `free_floor_gib=100` sets the disk floor for the probe and the cleanup.
+- `mac_budget_gib=24` and `mac_budget_gib.hana=56` limit the size of a mirror's build folder.
+- `linux_only.hana=hana_video,hana_clerestory` sets the Hana packages that must run on Linux.
+- A repository needs a `linux_only.<repo>` key before it can run on the Mac.
+- For cargo-liner, bevy_brp, and .claude, the `linux_only.<repo>` values are empty.
+- `mac_skip.hana=test(world_panel_words_match_drawn_pixels)` excludes one test from Hana runs on the Mac.
+- The Mac CI job is `ci_job=macOS: Compile and Test` in `ci_workflow=ci.yml` in `ci_repo=hanallc/hana`.
+- `ci_variable=MACOS_CI` controls the Mac CI job.
+- `gh_timeout_s`, `block_hours`, `block_max_hours`, and `block_warn_minutes` limit CI calls and blocks.
+- `claim_idle_minutes=15` and `claim_poll_seconds=60` control when the claim watcher releases idle claims.
+- The leftover check uses a default of 10 seconds when the file has no `leftover_timeout_s` value.
+- `MAC_TEST_CONFIG` selects a different file.
 
 ## Invariants
 

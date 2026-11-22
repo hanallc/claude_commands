@@ -138,6 +138,17 @@ class QueueRunTests(unittest.TestCase):
                       tempfile.TemporaryDirectory() as temporary):
                     self.check_returned_placement(Path(temporary), kind, status, queue_refuses, return_fails)
 
+    def test_the_manual_flag_marks_the_placement_request(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            command = self.command(root)
+            command.insert(command.index("--"), "--manual")
+            result = subprocess.run(command, capture_output=True, text=True, env=queue_fixture(root),
+                                    timeout=TEST_HANG_GUARD_SECS)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            placed, _released = self.events(root)
+            self.assertIn("--manual", placed[:placed.index("--")])
+
     def check_returned_placement(self, root: Path, kind: str, status: int, queue_refuses: bool, return_fails: bool) -> None:
         environment = {**queue_fixture(root), "FAKE_MAC_STATUS": str(status),
                        "FAKE_QUEUE_REFUSE": "1" if queue_refuses else "0", "FAKE_RETURN_FAIL": "1" if return_fails else "0"}
@@ -148,6 +159,7 @@ class QueueRunTests(unittest.TestCase):
         # A Mac placement has no local grant, so each run returns it with a cancel.
         self.assertEqual([event[0] for event in events], ["place-step", "cancel-placement"])
         placed, released = events
+        self.assertNotIn("--manual", placed)
         self.assertIn("--once", placed)
         self.assertIn("--wait-events", placed)
         self.assertEqual(placed[placed.index("--target") + 1], "mac")

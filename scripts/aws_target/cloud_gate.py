@@ -35,7 +35,7 @@ from scripts.aws_target.run_cost import GateLaunchVariant as GateLaunchVariant
 from scripts.build_queue import admission_client, admission_protocol as wire, cloud_progress, progress_profile, queue_place, snapshot_codec
 from scripts.build_queue.admission_wire import CloudGroup, NoCloudGroup, NO_CLOUD_GROUP
 from scripts.lib import cancellation
-from scripts.build_targets import target_config
+from scripts.build_targets import machine_switch, target_config
 from scripts.buildlog import store
 from scripts.lib import conf, git_index
 from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, GateJobNotRecorded, StepJob
@@ -99,9 +99,7 @@ def retryable_cloud_failure(outcome: dict[str, object]) -> RetryableCloudFailure
     return RetryableCloudFailure.NONE
 
 
-class CloudGateSwitch(StrEnum):
-    ON = 'on'
-    OFF = 'off'
+CLOUD_GATE_OFF = 'Cloud gates are off (build_targets.conf enabled.aws-gate=off)'
 
 
 @dataclass(frozen=True)
@@ -109,22 +107,28 @@ class InvalidCloudGateSwitch:
     reason: str
 
 
-type CloudGateSetting = CloudGateSwitch | InvalidCloudGateSwitch
+type CloudGateSetting = machine_switch.MachineSwitch | InvalidCloudGateSwitch
 
 
 def settings() -> conf.ConfigRead:
     return conf.read_or_repository('cloud_gate')
 
 
-def launch_switch(configuration: conf.ConfigRead) -> CloudGateSetting:
+def launch_switch() -> CloudGateSetting:
     try:
-        return configuration.value('enabled', CloudGateSwitch, recover_invalid=False)
-    except conf.Unusable as error:
+        return machine_switch.read(machine_switch.Machine.AWS_GATE)
+    except machine_switch.MachineSwitchError as error:
         return InvalidCloudGateSwitch(str(error))
 
 
 def read(path: Path) -> dict[str, object]:
     return ledger.mapping(cast(object, json.loads(path.read_text())))
+
+
+def _instances_for_launch(api: AwsCli, arguments: dict[str, object]) -> tuple[dict[str, object], ...]:
+    token = ledger.text(arguments, 'ClientToken')
+    observed = api.call('describe-instances', '--filters', 'Name=client-token,Values=' + token)
+    return tuple(row for group in ledger.rows(observed, 'Reservations') for row in ledger.rows(group, 'Instances'))
 
 
 def save(path: Path, row: dict[str, object]) -> None:
@@ -722,7 +726,8 @@ class GateWorker:
         stop = max(index + 1, len(variants)) if launch.get('arguments') else len(variants)
         unreachable: set[str] = set()
         for offset in range(index, stop):
-            if launch.get('arguments') and offset == index:
+            saved_arguments = bool(launch.get('arguments')) and offset == index
+            if saved_arguments:
                 arguments = ledger.mapping(launch['arguments'])
                 self.box_region = str(launch.get('region', self.api.region))
                 size = ledger.text(arguments, 'InstanceType')
@@ -784,10 +789,7 @@ class GateWorker:
             self.book.gate_region(ledger.text(request, 'attempt'), self.box_region)
             self.size_vcpus = int(ledger.text(arguments, 'InstanceType').split('.')[1].removesuffix('xlarge')) * 4
             if self.clock() >= ledger.instant(request, 'expires'):
-                reply = api.call('describe-instances', '--filters',
-                                      'Name=client-token,Values=' + ledger.text(arguments, 'ClientToken'))
-                instances = [instance for group in ledger.rows(reply, 'Reservations')
-                             for instance in ledger.rows(group, 'Instances')]
+                instances = _instances_for_launch(api, arguments)
                 if len(instances) == 1:
                     instance = ledger.text(instances[0], 'InstanceId')
                     save(path, {**launch, 'instance': instance})
@@ -798,11 +800,23 @@ class GateWorker:
             launch_json = json.dumps(arguments)
             try:
                 for retry in range(settings().whole('launch_reply_tries')):
+                    if request.get('task') != 'paired':
+                        try:
+                            switch = machine_switch.read(machine_switch.Machine.AWS_GATE)
+                            refusal = CLOUD_GATE_OFF if switch is machine_switch.MachineSwitch.OFF else ''
+                        except machine_switch.MachineSwitchError as error:
+                            refusal = str(error)
+                        if refusal:
+                            if not saved_arguments and retry == 0:
+                                self.book.resolve_gate(ledger.text(request, 'attempt'), ledger.GateAbsent(int(self.clock())))
+                            # Cleanup resolves any launch that AWS may have accepted.
+                            return LocalFallback(refusal)
                     try:
                         if retry == 0:
                             cloud_progress.publish(self.sidecar, cloud_progress.CloudProgress(
                                 'requesting', self.size_vcpus, 0, self.clock(), stage='launch'))
                         reply = api.call('run-instances', '--cli-input-json', launch_json)
+                        instances = ledger.rows(reply, 'Instances')
                         self.record_launch(request, size, zone, 'launched')
                         break
                     except AwsUnavailable as error:
@@ -840,7 +854,6 @@ class GateWorker:
                     raise
                 self.book.resolve_gate(ledger.text(request, 'attempt'), ledger.GateAbsent(int(self.clock())))
                 return LocalFallback(f'{size} in {zone}: {launch_error_code(str(error))}')
-            instances = ledger.rows(reply, 'Instances')
             if len(instances) != 1:
                 raise AwsUnavailable('The launch reply has no unique instance')
             instance = ledger.text(instances[0], 'InstanceId')
@@ -1285,11 +1298,11 @@ def run(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit_s: fl
 def run_cloud(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit_s: float,
               service: Callable[[Sequence[str]], int], attempt: CloudAttempt,
               selected: gate.AllModules | gate.TreeSelection = gate.ALL_MODULES) -> LocalFallback | CloudCompleted:
-    switch = launch_switch(settings())
+    switch = launch_switch()
     if isinstance(switch, InvalidCloudGateSwitch):
         return LocalFallback(switch.reason)
-    if switch is CloudGateSwitch.OFF:
-        return LocalFallback('cloud gates are off (cloud_gate.conf enabled=off)')
+    if switch is machine_switch.MachineSwitch.OFF:
+        return LocalFallback(CLOUD_GATE_OFF)
     directory = attempt.directory
     command_job = attempt.gate_job
     deployment_path = directory / 'gate-deployment.json'
@@ -1401,6 +1414,10 @@ def run_cloud(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit
                         request['retry_launch'] = retry_launch
                     save(folder / 'request.json', request)
                     save(folder / 'deployment.json', deployment)
+                    if (not (folder / 'launch.json').exists()
+                            and machine_switch.read(machine_switch.Machine.AWS_GATE) is machine_switch.MachineSwitch.OFF):
+                        reservation.status = 0
+                        return LocalFallback(CLOUD_GATE_OFF)
                     outcome = run_service(repo, folder, request, command, service)
                     result = read(result_path) if result_path.exists() else {}
                     failure = retryable_cloud_failure(result)

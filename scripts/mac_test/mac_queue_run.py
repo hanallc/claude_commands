@@ -33,6 +33,7 @@ import time
 from typing import TextIO, TypedDict, cast
 import uuid
 
+from scripts.build_queue import placement
 from scripts.lib import conf, process_group
 from scripts.lib.atomic_file import write_text_atomic
 
@@ -58,11 +59,12 @@ def parse_placement(output: str) -> MacPlacement:
 
 def placement_arguments(episode: str, since: float, pid: int, worktree: Path, package: str,
                         kind: str, source_key: str, session: str, assignment_file: Path,
-                        argv: list[str]) -> list[str]:
+                        argv: list[str], origin: placement.MacCommandOrigin) -> list[str]:
     return ["place-step", "--once", "--wait-events", "--episode", episode, "--since", str(since),
         "--pid", str(pid), "--repo-root", str(worktree), "--package", package, "--kind", kind,
         "--source-key", source_key, "--session-id", session, "--target", "mac",
-        "--assignment-file", str(assignment_file), "--token", "none", "--", *argv]
+        "--assignment-file", str(assignment_file), "--token", "none",
+        *(("--manual",) if isinstance(origin, placement.ManualMacCommand) else ()), "--", *argv]
 
 
 def remote_wrapper(work: str, on_close: str, grace_polls: int, *, owned_close: bool = False) -> str:
@@ -286,6 +288,7 @@ def ended_run_callback(saved_script: str) -> tuple[Path, str]:
 class Arguments(argparse.Namespace):
     what: str = ""
     kind: str = ""
+    mac_origin: placement.MacCommandOrigin = placement.PlacedMacWork()
     package: str = ""
     worktree: Path = Path()
     cwd: str = ""
@@ -308,7 +311,7 @@ def run(args: Arguments) -> int:
     status = 1
     remote = RemoteRun()
     prepared = False
-    placement = MacPlacement("", episode, "")
+    assigned = MacPlacement("", episode, "")
     receipts = Path.home() / RECEIPTS
     receipts.mkdir(parents=True, exist_ok=True, mode=0o700)
     assignment_file = receipts / (episode + ".json")
@@ -321,7 +324,7 @@ def run(args: Arguments) -> int:
         try:
             while True:
                 code, output = capture_command(admission_command() + placement_arguments(episode, since, pid,
-                    args.worktree, args.package, args.kind, source_key, session, assignment_file, command))
+                    args.worktree, args.package, args.kind, source_key, session, assignment_file, command, args.mac_origin))
                 if code != MAC_BUSY_STATUS or args.no_wait:
                     break
                 print(output, end="", flush=True)
@@ -330,13 +333,13 @@ def run(args: Arguments) -> int:
                 print(output, end="", flush=True)
                 status = 9 if args.lifecycle_script and code in (10, 11, 12) else code
             else:
-                placement = parse_placement(output)
-                callback_environment["MAC_QUEUE_HOST"] = placement.host
+                assigned = parse_placement(output)
+                callback_environment["MAC_QUEUE_HOST"] = assigned.host
                 clean_ended_runs(callback_environment)
                 on_close = ""
                 if args.lifecycle_script:
                     saved: SavedRun = {"lifecycle_script": args.lifecycle_script, "arguments": original_command,
-                                       "host": placement.host}
+                                       "host": assigned.host}
                     write_text_atomic(directory / "run.json", json.dumps(saved))
                     prepared = True
                     status = run_callback(args.lifecycle_script, "prepare", argv_file, original_command,
@@ -356,7 +359,7 @@ def run(args: Arguments) -> int:
                     status = 1
                     if args.owned_close and not on_close:
                         raise ValueError("the run needs a close hook")
-                    status = stream_remote(remote_command(placement, args.cwd, command, on_close,
+                    status = stream_remote(remote_command(assigned, args.cwd, command, on_close,
                                                           owned_close=args.owned_close), remote, ssh)
         except (OSError, ValueError) as error:
             print(f"mac queue: {error}", file=sys.stderr)
@@ -367,7 +370,7 @@ def run(args: Arguments) -> int:
             safe = remote.state != RemoteState.LIVE
             if not safe and not args.owned_close:
                 try:
-                    safe = stop_remote(placement, remote)
+                    safe = stop_remote(assigned, remote)
                 except OSError:
                     safe = False
             if prepared and (safe or args.owned_close):
@@ -501,7 +504,10 @@ def main(argv: list[str] | None = None) -> int:
         return watch_caller(int(words[1]), int(words[2]))
     parser = argparse.ArgumentParser(description=__doc__)
     _ = parser.add_argument("--what", required=True)
-    _ = parser.add_argument("--kind", choices=("shot", "install", "probe", "run"), required=True)
+    _ = parser.add_argument("--kind", choices=placement.MAC_RUN_KINDS, required=True)
+    _ = parser.add_argument("--manual", dest="mac_origin", action="store_const",
+                            const=placement.ManualMacCommand(), default=placement.PlacedMacWork(),
+                            help="Mark a command that a person requests on the Mac.")
     _ = parser.add_argument("--package", required=True)
     _ = parser.add_argument("--worktree", type=Path, default=Path.cwd())
     _ = parser.add_argument("--cwd", default="")

@@ -200,7 +200,8 @@ It passes when every region passes.
 ## Hana guest safety files
 
 `scripts/aws_target/hana_guest.py` renders safety files for the kept Hana box.
-`config/hana_aws.conf` supplies the image's admission setting, safety timing, and resource values.
+`config/hana_aws.conf` supplies the image's safety timing and resource limits.
+The renderer copies `enabled.hana-aws` from `config/build_targets.conf` to `enabled` in `safety.json`.
 
 `scripts/aws_target/hana_render.py` renders the safety and receiver entry points, settings, and systemd units.
 It applies each rendered file's mode.
@@ -569,7 +570,7 @@ NixOS supplies the approved slot roots and capacity, compiler version, and runne
 Those NixOS settings take effect with a new image.
 
 An edit to a runtime-only file leaves the image digest unchanged.
-The receiver still uses `enabled` as an independent image admission switch.
+The receiver uses the installed `enabled` value in `safety.json` for guest admission.
 This split requires one image replacement before the box accepts a combined payload.
 
 `hana-image` reads the digest from the renderer output in the built image's Nix derivation closure.
@@ -827,8 +828,9 @@ The gate ranks deployed types and public zones by the expected USD per run befor
 Equal costs retain the configured region, type, and zone order.
 Capacity refusals and unsupported types select the next variant.
 A normal gate uses natedev after all capacity choices refuse.
-With `enabled=off` in `cloud_gate.conf`, the route sends merge gates and targeted tests to natedev.
-For each request, the route reads this setting before it reads deployment state or calls AWS.
+With `enabled.aws-gate=off` in `build_targets.conf`, the route sends new gates and affected tests to natedev.
+The route checks the switch at entry and before each new attempt. The worker checks it before each launch request.
+Running gates and status reads continue. Manual AWS gate commands do not read the switch.
 A confirmed Spot interruption before a final result starts another cloud attempt.
 `spot_interruption_retries=2` permits two retries, which can reach another zone and then another region.
 The retry uses the next choice in the saved launch order.
@@ -1187,7 +1189,7 @@ A region filter at the top of the page shows all regions by default; the user as
    One region has no column scale or column box.
 4. The cheapest line names the cheapest estimate in the chosen regions (`RunCosts.estimates`, cheapest first).
 5. A snapshot line for one region shows only when that region is chosen.
-6. The page keeps the region choice in browser storage. The URL keeps Show, Types, and Runs as `?show=spot,cost,quota&types=standard&runs=merge-gate`.
+6. The page keeps the region choice in browser storage. The URL keeps Show, Types, and Runs as `?show=spot,cost,quota&types=standard&runs=gate`. An old link with `runs=merge-gate` still opens the gate runs.
 
 ### Billed hours check
 
@@ -1715,7 +1717,11 @@ The active `hana-aws` target accepts one assigned step at a time.
 The route accepts check and lint judgments for the normalized Hana repository.
 These judgments run direct `cargo check` or `cargo clippy` commands.
 The command policy rejects repairs, builds, nextest, final steps, path overrides, and unknown wrappers.
-`enabled=on` enables the route in `hana_aws.conf`.
+`enabled.hana-aws=on` in `build_targets.conf` permits new placed work.
+With the switch off, the controller renews the permit for an active claim while spending permits it.
+The controller orders a stop on the next tick after the claim ends.
+The daily, monthly, and reserve limits still apply to each renewal.
+Manual Hana AWS resource commands and status reports continue independently of the switch.
 The queue checks the Hana image and capacity before it assigns work.
 A pinned request uses only its requested target.
 
@@ -1803,7 +1809,9 @@ Run `deploy.py probe-status` to read the saved verdicts and record age without c
 The command shows verdicts only for a readable record that matches the current deployment.
 It checks the recorded regions and instance types against `gate-deployment.json`.
 
-After the GPU setup probe passes, set `hana_gpu_route_enabled=on` in `config/cloud_gate.conf`.
+After the GPU setup probe passes, set `enabled.hana-gpu=on` in `config/build_targets.conf`.
+The switch controls new placed GPU work. Running GPU work and status reads continue.
+Manual GPU commands do not read the switch.
 The route checks the deployment record for every type in `hana_gpu_instance_types`.
 
 Run the pilot from the Hana checkout.

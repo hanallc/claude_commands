@@ -149,7 +149,7 @@ class ReturnFixTests(unittest.TestCase):
 
     def return_fix(self, sent: offload.TreeKey) -> fix_return.FixResult:
         config = eligibility.OffloadConfig(
-            enabled=True, connection=eligibility.SshConnectionSettings(HOST, 6, 10), probe_timeout_s=1,
+            connection=eligibility.SshConnectionSettings(HOST, 6, 10), probe_timeout_s=1,
             unreachable_backoff_s=300, free_floor_gib=1, default_target_budget_gib="24", values={},
         )
         request = offload.OffloadRequest(

@@ -85,6 +85,7 @@ from scripts.mac_test.claim_state import (
     pending_hold_events as pending_hold_events,
     coordination_depth as coordination_depth,
 )
+from scripts.build_queue import placement
 from scripts.lib import conf
 from scripts.buildlog import transfer_bytes
 from scripts.lib.user_zone import user_zone
@@ -97,7 +98,6 @@ from scripts.buildlog.mac_idle_alert import MacIdleConfigError, idle_config as i
 
 if TYPE_CHECKING:
     from scripts.build_queue.placement import SubmittingSession
-    from scripts.build_queue import placement
     from scripts.mac_test import eligibility
 
 MESSAGE_TIMEOUT_S = 30.0
@@ -315,6 +315,7 @@ UNASSIGNED_CLAIM = UnassignedClaim()
 
 
 class CliArguments(argparse.Namespace):
+    mac_origin: placement.MacCommandOrigin = placement.PlacedMacWork()
     """Arguments accepted across the mac-test subcommands."""
 
     def __init__(self) -> None:
@@ -2032,6 +2033,8 @@ def command_claim_wait(args: CliArguments, paths: StatePaths, *, kind: str = "",
     """Reserve a slot for a live local wait without starting remote work."""
     from scripts.mac_test import eligibility
     settings = Path(args.settings) if args.settings else config_path(args.target)
+    if not eligibility.placement_enabled(paths.platform):
+        return 1
     config = eligibility.read_config(settings)
     worktree = claim_worktree_path(args.repo_root)
     if isinstance(eligibility.mac_step_eligibility(config, worktree, args.package,
@@ -2201,6 +2204,7 @@ def free_now(
     paths: StatePaths, settings: Path | eligibility.DefaultMacSettings, repo_root: Path, copy: bool = False,
     *, session: SubmittingSession | claim_state.CallingSession = claim_state.CALLING_SESSION,
     configuration: conf.ConfigRead | conf.UseConfiguredValue = conf.UseConfiguredValue.CURRENT,
+    origin: placement.MacCommandOrigin = placement.PLACED_MAC_WORK,
 ) -> FreeNowAnswer:
     """Whether a claim for repo_root's repository made now could start a Mac run.
 
@@ -2220,7 +2224,7 @@ def free_now(
     else:
         path = eligibility.config_path() if isinstance(settings, eligibility.DefaultMacSettings) else settings
         capacity_settings = conf.read(path)
-    if not capacity_settings.value("offload", conf.on_off):
+    if not isinstance(origin, placement.ManualMacCommand) and not eligibility.placement_enabled(paths.platform):
         return "off"
     backoff = (eligibility.read_backoff(time.time()) if paths.target == "mac"
                else eligibility.read_backoff(time.time(), paths.target))
@@ -2267,7 +2271,7 @@ def command_free_now(args: CliArguments, paths: StatePaths) -> int:
     settings = Path(args.settings) if args.settings else eligibility.DEFAULT_MAC_SETTINGS
     if not args.settings and args.target:
         settings = config_path(args.target)
-    answer = free_now(paths, settings, Path(args.repo_root), args.copy, session=args.session)
+    answer = free_now(paths, settings, Path(args.repo_root), args.copy, session=args.session, origin=args.mac_origin)
     print(answer)
     return 0 if answer == "free" else 1
 
@@ -2657,6 +2661,9 @@ def parser() -> argparse.ArgumentParser:
     _ = free.add_argument("--settings", default="")
     _ = free.add_argument("--repo-root", default=os.getcwd())
     _ = free.add_argument("--copy", action="store_true")
+    _ = free.add_argument("--manual", dest="mac_origin", action="store_const",
+                          const=placement.ManualMacCommand(), default=placement.PlacedMacWork(),
+                          help="Check capacity for a manual Mac command.")
 
     _ = commands.add_parser("status")
     _ = commands.add_parser("watch")

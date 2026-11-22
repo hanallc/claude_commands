@@ -11,7 +11,7 @@ from scripts.direct.verify_mac_offload_test_support import VerifyMacOffloadFixtu
 @final
 class VerifyMacFallbackTests(VerifyMacOffloadFixture):
     def test_excluded_mac_reason_is_recorded_without_calling_offload(self) -> None:
-        for settings, reason in (("offload=on\n", "repo"), (f"offload=on\nlinux_only.{self.root.name}=sample\n", "linux_only")):
+        for settings, reason in (("", "repo"), (f"linux_only.{self.root.name}=sample\n", "linux_only")):
             with self.subTest(reason=reason):
                 self.clear_observations()
                 Path(self.environment["MAC_TEST_CONFIG"]).unlink()
