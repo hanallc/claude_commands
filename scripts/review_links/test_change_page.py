@@ -2482,6 +2482,12 @@ class ChangePageTests(unittest.TestCase):
     def test_production_aliases_share_one_document_read_per_page_request(self) -> None:
         runner = fixture_member("showrunner", name="sdlc", doc=staff.LiveDoc(local_machine(), self.production_copy("sdlc")))
         _ = staff.move(self.unit.id, staff.ReportsTo(runner.id))
+        aliases = ("legacy-page-owner", "former-page-owner")
+        listings = [change_review.list_file(alias) for alias in aliases]
+        for listing in listings:
+            _ = listing.write_text(f"---\nproductions:\n  - {self.production}\n---\n" + change_review.BODY)
+        routing = change_page.list_routing({listing: change_review.review_snapshot(listing) for listing in listings})
+        self.assertEqual([routing.production(alias) for alias in aliases], [self.production, self.production])
         reads: list[Path] = []
         read_text = Path.read_text
 
@@ -2493,6 +2499,7 @@ class ChangePageTests(unittest.TestCase):
             path, forms, body = self.browser()
         del path, body
         self.assertEqual(reads.count(self.production), 1)
+        self.assertEqual([forms.counts[alias] for alias in aliases], [0, 0])
         self.assertEqual(forms.counts["sdlc"], 3)
         self.assertEqual(set(forms.save_urls), {"page-owner/C1", "page-owner/C2", "page-owner/C3"})
 
