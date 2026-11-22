@@ -12,6 +12,7 @@ import unittest
 from collections.abc import Sequence
 from pathlib import Path
 from scripts.hooks.test_stop_context_deferral import CONTEXT_DEFERRAL_FIXTURE
+from scripts.lib.build_slots_test_support import copy_fixture_settings
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.production import staff
@@ -951,7 +952,9 @@ class CopyGuardDispatchTests(IsolatedHookTests):
             + f"dispatch.EVENTS['pre_tool_use'] = (dispatch.CopyPolicyHook(), dispatch.HookSpec({str(later)!r}, None))\n"
             + "sys.argv = ['hook_dispatch.py', 'pre_tool_use']\ndispatch.main()\n"
         )
-        for config in (ROOT / "config/copies.conf", self.root / "missing-copies.conf"):
+        valid_config = self.root / "copies.conf"
+        _ = write_config_fixture(valid_config, defaults=copy_fixture_settings(self.root))
+        for config in (valid_config, self.root / "missing-copies.conf"):
             with self.subTest(config=config.name):
                 marker.unlink(missing_ok=True)
                 self.environment["COPIES_CONFIG"] = str(config)

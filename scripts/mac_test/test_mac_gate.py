@@ -560,11 +560,6 @@ print(json.dumps([os.environ["PYTHONPATH"], *sys.argv[1:]]))
         self.assertFalse(root.exists())
 
     def ended_gate_with_group(self, job_pid: int, temporary: Path) -> mac_gate.MacGateRecovery:
-        config = self.root / 'config'
-        _ = write_config_fixture(config / 'mac_gate.conf', 'terminate_grace_seconds=3\n')
-        _ = write_config_fixture(config / 'build_admission.conf', 'program_stop_seconds=5\n')
-        _ = cast(object, self.enterContext(mock.patch.dict(
-            os.environ, {'HOME': str(self.root), 'CONF_DIR': str(config)})))
         folder = self.root / mac_gate.REMOTE_ROOT / 'mac-gate-fixture'
         folder.mkdir(parents=True)
         cloud_gate.save(folder / 'checkout.json', {'path': str(self.repo)})

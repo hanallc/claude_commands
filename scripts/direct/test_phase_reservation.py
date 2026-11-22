@@ -24,6 +24,7 @@ from unittest import mock
 from scripts.direct import phase_reservation, plan_history  # noqa: E402
 from scripts.agents import worker_lifecycle
 from scripts.lib import atomic_file
+from scripts.lib.build_folders_test_support import workspace_folder_settings
 from scripts.lib.git_test_support import fixture_git_environment
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.production import staff
@@ -55,14 +56,11 @@ def isolate_fixture_git(test: unittest.TestCase, root: Path) -> None:
 
 def model_worktree_environment(root: Path, configuration: Path) -> dict[str, str]:
     """Give worktree creation private roots and records."""
-    configuration.mkdir(parents=True, exist_ok=True)
-    source = Path(__file__).resolve().parents[2] / "config" / "build_folders.conf"
-    keys = {line.partition("=")[0].strip() for line in source.read_text(encoding="utf-8").splitlines()}
-    roots = "".join(f"{key}={root / ('worktrees' if key == 'roots.workspace' else key.split('.')[1])}\n"
-                    for key in sorted(keys) if key.startswith("roots."))
-    _ = write_config_fixture(configuration / source.name, roots
-                             + "# range: 0..\nlocks.probe_wait_seconds=1\n"
-                             + "# range: 0.001..\nlocks.probe_retry_seconds=0.01\n")
+    _ = write_config_fixture(configuration / "build_folders.conf", f"""\
+roots.workspace={root / 'worktrees'}
+locks.probe_wait_seconds=1
+locks.probe_retry_seconds=0.01
+""", defaults=workspace_folder_settings(root))
     copies = configuration / "copies.conf"
     _ = copies.write_text("# range: 0.001..\ngit_timeout_seconds=30\n")
     templates = root / "git-templates"
@@ -291,6 +289,8 @@ class WorktreeAttributionTests(unittest.TestCase):
         self.assertEqual((directory / phase_reservation.BASELINE_STATUS_FILE).read_text(), status)
 
     def test_claim_uses_the_unit_word_from_completed_records(self) -> None:
+        configuration = self.session.parent / "config"
+        _ = write_config_fixture(configuration / "build_folders.conf", "repo_word.claude_commands=claude\n")
         main = self.session.parent / ".claude"
         _ = subprocess.run(["git", "clone", "-q", str(self.first), str(main)], check=True, capture_output=True,
                            timeout=TEST_HANG_GUARD_SECS)
