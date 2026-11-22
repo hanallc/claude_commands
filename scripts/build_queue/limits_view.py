@@ -6,7 +6,7 @@ import os
 import sqlite3
 from collections import Counter
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, tzinfo
 from pathlib import Path
 from typing import Literal, cast
@@ -22,10 +22,9 @@ from scripts.buildlog import charts, repository, store
 from scripts.lib import conf, git_files
 from scripts.lib.build_slots import slot_cargo_root
 from scripts.lint.memory_admit import gpu_test_reservation, repository_run_owner, reserved_repository_runs
-from scripts.mac_test import claim_state, eligibility, mac_test
 from scripts.production import gate
 
-Machine = Literal["natedev", "mac", "aws"]
+Machine = Literal["natedev", "aws"]
 HISTORY_SECONDS = 30 * 24 * 60 * 60
 NO_AWS_HOSTS: frozenset[str] = frozenset()
 
@@ -44,13 +43,6 @@ class MachineLimits:
     state: str
     shared: tuple[Metric, ...] = ()
     waits: dict[str, list[str]] = field(default_factory=dict[str, list[str]])
-    claims: int = 0
-    runs: tuple[str, ...] = ()
-    other: tuple[str, ...] = ()
-    other_note: str = ""
-    cleanup: bool = False
-    startup: tuple[str, ...] = ()
-    target: str = ""
 
 
 @dataclass
@@ -65,30 +57,19 @@ class Cell:
     waits: dict[str, list[str]] = field(default_factory=dict[str, list[str]])
     budgets: tuple[Metric, ...] = ()
     note: str = ""
-    standard_mac_builds: bool | None = None
-    starting: list[str] = field(default_factory=list[str])
-
-
-@dataclass(frozen=True)
-class MacSlot:
-    name: str
-    cell: Cell
 
 
 @dataclass
 class RepositoryRow:
     name: str
     natedev: Cell = field(default_factory=Cell)
-    mac: Cell = field(default_factory=Cell)
     aws: Cell = field(default_factory=Cell)
     unplaced: dict[str, list[str]] = field(default_factory=dict[str, list[str]])
-    mac_slots: tuple[MacSlot, ...] = ()
 
 
 @dataclass(frozen=True)
 class BuildLimits:
     natedev: MachineLimits
-    mac: MachineLimits
     aws: MachineLimits
     repositories: tuple[RepositoryRow, ...]
     history_unavailable: bool
@@ -123,8 +104,6 @@ class Origins:
     aliases: dict[str, str] = field(default_factory=dict[str, str])
     identities: dict[str, str] = field(default_factory=dict[str, str])
     active_folders: set[str] = field(default_factory=set[str])
-    mac_folders: dict[str, claim_state.RepositoryScope] = field(
-        default_factory=dict[str, claim_state.RepositoryScope])
 
     def key(self, identity: str) -> str:
         if identity not in self.identities:
@@ -157,9 +136,6 @@ class Origins:
             checkout = git_files.locate(Path(folder))
         except (git_files.GitFilesError, OSError):
             return ""
-        scope = claim_state.checkout_claim_scope(folder, "macos")
-        if isinstance(scope, claim_state.RepositoryScope):
-            self.mac_folders[folder] = scope
         if checkout.common_dir not in self.common:
             self.common[checkout.common_dir] = ""
             remote = repository.output(["git", "config", "--includes", "--file", str(checkout.common_dir / "config"),
@@ -361,24 +337,6 @@ def local_limits(reading: records.QueueRead, memory: Metric, folders: conf.Confi
     return tuple(metrics)
 
 
-def mac_configuration(snapshot: targets.TargetSnapshot | None) -> eligibility.OffloadConfig | None:
-    if snapshot is None or not isinstance(snapshot.target, target_config.SshTarget):
-        return None
-    try:
-        return eligibility.read_config(snapshot.target.settings)
-    except conf.Unusable:
-        return None
-
-
-def mac_budget(config: eligibility.OffloadConfig, scope: claim_state.RepositoryScope) -> Metric:
-    try:
-        value = config.values.get(f"mac_budget_gib.{scope.name}", config.default_target_budget_gib)
-        maximum = float(conf.decimal(value))
-    except ValueError:
-        maximum = None
-    return Metric("Build folder", None, maximum, "GiB", "maximum")
-
-
 @dataclass(frozen=True)
 class HanaRoute:
     repository: str
@@ -446,11 +404,9 @@ def wait_cause(step: records.WaitingStep) -> records.WaitReason:
     return step.reason.cause if isinstance(step.reason, records.HeadAdmissionStatus) else step.reason
 
 
-def machine_for_target(target: str, local: str, mac: str, aws: frozenset[str]) -> Machine | None:
+def machine_for_target(target: str, local: str, aws: frozenset[str]) -> Machine | None:
     if target == local:
         return "natedev"
-    if target == mac:
-        return "mac"
     if target == "aws" or target in aws:
         return "aws"
     return None
@@ -495,48 +451,18 @@ def placement_reason(reason: str) -> str:
             return public_queue_text(reason) or "Placement pending"
 
 
-MAC_WAIT_LABELS: dict[claim_state.MacBlocker, str] = {
-    "limit-full": "Limit full",
-    "whole-mac-full": "Whole Mac in use",
-    "mirror-backoff": "Waiting for the mirror",
-    "starting": "Starting",
-    "ineligible": "Not eligible",
-    "machine-held": "Machine held",
-    "disk-floor": "Disk floor",
-    "cleanup": "Claim held for cleanup",
-    "copy-yield": "Waiting for a copy to stop",
-    "copy-running": "Copy in progress",
-    "whole-mac-cleanup": "Claim held for cleanup",
-}
-MAC_SHARED_BLOCKERS = frozenset(("whole-mac-full", "whole-mac-cleanup", "machine-held", "disk-floor"))
-
-
 def queue_wait(step: records.WaitingStep, cause: records.WaitReason, local_target: str,
-               mac_target: str, aws_targets: frozenset[str]) -> tuple[Machine | None, str]:
+               aws_targets: frozenset[str]) -> tuple[Machine | None, str]:
     if (block := step.placement_block) is not None:
-        if block.provider == "mac":
-            decision = block.mac_decision
-            blocker = decision.blocker if decision is not None else None
-            label = (MAC_WAIT_LABELS[blocker] if blocker is not None and blocker != "older-request"
-                     else placement_reason(block.reason))
-            if not mac_target:
-                return "mac", f"{block.target} · {label}"
-            if block.target != mac_target:
-                return None, f"{block.target} · {label}"
-            return "mac", label
         machine = ("natedev" if block.provider == "local" else
-                   machine_for_target(block.target, local_target, mac_target, aws_targets))
+                   machine_for_target(block.target, local_target, aws_targets))
         label = "Limit full" if block.reason == "busy" else placement_reason(block.reason)
         return machine, f"{block.target} · {label}" if machine is None and block.target else label
     if step.placement_pending or isinstance(cause, records.ReadyForAdmission):
         route = step.route
-        machine = ("mac" if isinstance(route, target_config.MacOnly) else
-                   machine_for_target(route.target, local_target, mac_target, aws_targets)
-                   if isinstance(route, target_config.PinnedTarget) else None)
+        machine = machine_for_target(route.target, local_target, aws_targets) if isinstance(route, target_config.PinnedTarget) else None
         if isinstance(route, target_config.PinnedTarget) and machine is None:
             return None, f"{route.target} · Evidence pending"
-        if isinstance(route, target_config.MacOnly) and not mac_target:
-            return "mac", "mac · Evidence pending"
         return machine, "Evidence pending"
     if isinstance(cause, (records.EstimateExpired, records.PressureUnavailable, records.ReadingUnavailable)):
         return "natedev", "Evidence pending"
@@ -551,14 +477,12 @@ def queue_wait(step: records.WaitingStep, cause: records.WaitReason, local_targe
     if isinstance(cause, placement.CargoFolderWait):
         return "natedev", "Build folder in use"
     route = step.route
-    if isinstance(route, target_config.MacOnly):
-        return "mac", "Placement pending" if mac_target else "mac · Placement pending"
     if isinstance(route, target_config.PinnedTarget) and route.target != local_target:
-        machine = machine_for_target(route.target, local_target, mac_target, aws_targets)
+        machine = machine_for_target(route.target, local_target, aws_targets)
         return machine, "Placement pending" if machine else f"{route.target} · Placement pending"
     if isinstance(cause, records.BehindHead):
         if cause.head_name == "remote startup":
-            return None, "Waiting for remote startup"
+            return "natedev", "Waiting for remote startup"
         return "natedev", records.behind_queue_text(public_queue_text(cause.head_name) or "the first step")
     if isinstance(cause, (records.NeedsMemory, records.MemoryPressure)):
         return "natedev", "Memory"
@@ -567,91 +491,22 @@ def queue_wait(step: records.WaitingStep, cause: records.WaitReason, local_targe
     return "natedev", "Waiting in queue"
 
 
-def with_mac_claim_waits(reading: records.QueueRead, snapshots: target_availability.Snapshots) -> records.QueueRead:
-    """Show claim waits once, including calls that did not ask for placement."""
-    waiting = list(reading.view.waiting)
-    found = snapshots if isinstance(snapshots, tuple) else ()
-    matched = {step.episode: index for index, step in enumerate(waiting) if step.episode}
-    callers: dict[tuple[int, str, str], list[int]] = {}
-    for index, step in enumerate(waiting):
-        if step.caller_start:
-            callers.setdefault((step.pid, step.caller_start, step.folder), []).append(index)
-    for snapshot in found:
-        target = snapshot.target
-        if not isinstance(target, target_config.SshTarget) or target.platform != "macos":
-            continue
-        directory = target_config.ssh_target_state_directory(target.name)
-        for wait in claim_state.read_claim_waits(claim_state.StatePaths(directory, target.name)):
-            block = records.PlacementBlock("mac", target.name, wait.reason, wait.episode, wait.decision)
-            caller = (wait.caller, wait.caller_start, wait.folder)
-            index = matched.get(wait.episode) if wait.episode else None
-            if index is None:
-                candidates = [index for index in callers.get(caller, ())
-                              if not wait.episode or not waiting[index].episode]
-                if len(candidates) == 1:
-                    index = candidates[0]
-            if index is not None:
-                previous = waiting[index].placement_block
-                if previous is not None and previous.provider == "mac" and (
-                        previous.target != block.target or previous.mac_decision is not None and wait.decision is None):
-                    continue
-                episode = waiting[index].episode or wait.episode
-                if episode:
-                    matched[episode] = index
-                waiting[index] = replace(waiting[index], placement_block=block, placement_pending=False,
-                                         placement_episode=episode)
-                continue
-            if wait.episode:
-                matched[wait.episode] = len(waiting)
-            callers.setdefault(caller, []).append(len(waiting))
-            waiting.append(records.WaitingStep(wait.caller, wait.session, wait.name, wait.name,
-                wait.folder, wait.since, 0, records.ReadyForAdmission(), placement_block=block,
-                placement_episode=wait.episode, caller_start=wait.caller_start))
-    return replace(reading, view=replace(reading.view, waiting=tuple(waiting)))
-
-
-def claim_name(record: claim_state.RunRecord, names: QueueNames) -> str:
-    return names.sessions.get(record.get("holder_session", ""), "") or record["what"]
-
-
 def build_limits(reading: records.QueueRead, snapshots: target_availability.Snapshots, names: QueueNames,
-                 memory: Metric, folders: conf.ConfigRead, saved: Background, zone: tzinfo,
-                 mac_runs: Sequence[tuple[queue_view.MacBuild, str]], mac_disk_free: float | None = None,
-                 *, mac_activity_target: str = "") -> BuildLimits:
+                 memory: Metric, folders: conf.ConfigRead, saved: Background, zone: tzinfo) -> BuildLimits:
     explanation = reading.explanation
     inputs = explanation.decided_from
     policy = explanation.policy.repository_runs
     found = snapshots if isinstance(snapshots, tuple) else ()
-    mac = queue_view.selected_mac_snapshot(found)
-    mac_name = mac.target.name if mac is not None else ""
-    if not mac_name or mac_activity_target != mac_name:
-        mac_runs = ()
-        mac_disk_free = None
     local = next((snap for snap in found if isinstance(snap.target, target_config.LocalTarget)), None)
-    mac_paths = claim_state.StatePaths(target_config.ssh_target_state_directory(mac_name or "mac"), mac_name)
     aws_targets = aws_placement_targets(found)
-    mac_config = mac_configuration(mac)
+    mac_targets = {snap.target.name for snap in found
+                   if isinstance(snap.target, target_config.SshTarget) and snap.target.platform == "macos"}
     hana = hana_route(found)
     history = saved.history.machines if isinstance(saved.history, RecentRepositories) else {}
     rows = {origin: RepositoryRow(origin_name(origin)) for origin in history}
-    shared: dict[str, dict[str, list[str]]] = {machine: {} for machine in ("natedev", "mac", "aws")}
+    shared: dict[str, dict[str, list[str]]] = {machine: {} for machine in ("natedev", "aws")}
     unplaced: dict[str, list[str]] = {}
     origins = saved.origins
-    mac_claims = mac.claims if mac is not None else ()
-    retained = {claim_state.ClaimIdentity(ref.claim_id, ref.episode, ref.attempt)
-                for ref in reading.view.mac_retained_claims if ref.target == mac_name}
-    mac_claims_unavailable = mac is None or any(isinstance(state, targets.StateUnreadable)
-                                                for state in mac.states)
-    whole_mac = False
-    shared_mac_claims = 0
-    shared_mac_runs: list[str] = []
-    shared_mac_other: list[str] = []
-    shared_mac_starting: list[str] = []
-    shared_mac_cleanup = False
-    mac_other_note = "Claim status unavailable" if mac_claims_unavailable else "No matching claim"
-    mac_occupied_scopes: list[claim_state.RepositoryScope] = []
-    mac_cells: dict[str, dict[str, Cell]] = {}
-    claimed: set[str] = set()
     cloud_repositories: set[str] = set()
     local_runs: set[str] = set()
     local_repositories: dict[str, str] = {}
@@ -661,26 +516,6 @@ def build_limits(reading: records.QueueRead, snapshots: target_availability.Snap
         if origin not in rows:
             rows[origin] = RepositoryRow(origin_name(origin))
         return rows[origin]
-
-    def mac_cell(origin: str, scope: claim_state.RepositoryScope) -> Cell:
-        cells = mac_cells.setdefault(origin, {})
-        if scope.name not in cells:
-            cells[scope.name] = Cell()
-        return cells[scope.name]
-
-    def recorded_mac_cell(scope: claim_state.ClaimScope | None, folder: str,
-                          recorded_project: str = "") -> Cell | None:
-        if not isinstance(scope, claim_state.RepositoryScope):
-            return None
-        project = origins.resolve(scope.key, folder) or recorded_project
-        if not project:
-            return None
-        _ = row(project)
-        return mac_cell(project, scope)
-
-    for folder, scope in origins.mac_folders.items():
-        if project := origins.folders.get(folder):
-            _ = mac_cell(origins.canonical(project), scope)
 
     def known_origin(name: str) -> str:
         matches = [origin for origin, current in rows.items() if current.name == name]
@@ -710,59 +545,6 @@ def build_limits(reading: records.QueueRead, snapshots: target_availability.Snap
             cell.other.append(label)
         else:
             cell.runs.append(label)
-
-    mac_placements: dict[str, list[tuple[queue_view.MacBuild, str]]] = {}
-    for build, label in mac_runs:
-        if build.gate_label is queue_view.MacGateLabel.PLACEMENT and build.gate_placement:
-            mac_placements.setdefault(build.gate_placement, []).append((build, label))
-
-    for claim in mac_claims:
-        record = claim.record
-        state = mac_test.claim_report_state(claim, retained=claim_state.claim_identity(record) in retained)
-        if state == "ended":
-            continue
-        cleanup = state == "cleanup"
-        key = f'{record["episode"]}/{record["attempt"]}'
-        first = key not in claimed
-        matching = mac_placements.get(key, ()) if first else ()
-        claimed.add(key)
-        scope = claim.scope
-        if isinstance(scope, claim_state.WholeMacScope):
-            whole_mac = True
-        else:
-            mac_occupied_scopes.append(scope)
-        cell = recorded_mac_cell(scope, record["worktree"])
-        if cell is None:
-            shared_mac_claims += 1
-            shared_mac_cleanup |= cleanup
-        elif cleanup:
-            cell.note = "Claim held for cleanup"
-        labels = shared_mac_runs if cell is None else cell.runs
-        if not cleanup:
-            labels.extend(label for _, label in matching)
-            if first and not matching:
-                labels.append(claim_name(record, names))
-
-    waiting_episodes = {entry.source.step.episode for entry in names.waits
-                        if isinstance(entry.source, queue_view.WaitingBuild)}
-    for step in reading.view.running:
-        decision = step.mac_startup
-        if decision is None or decision.target != mac_name or step.mac_placement in claimed:
-            continue
-        scope = decision.scope
-        cell = recorded_mac_cell(scope, step.folder)
-        label = step.unit or names.sessions.get(step.session_id) or step.step
-        if step.mac_placement.partition("/")[0] in waiting_episodes:
-            label = ""
-        if cell is None:
-            shared_mac_starting.append(label)
-        else:
-            cell.starting.append(label)
-
-    for build, label in mac_runs:
-        matched = build.gate_label is queue_view.MacGateLabel.PLACEMENT and build.gate_placement in claimed
-        if not matched:
-            shared_mac_other.append(label)
 
     switch = cloud_gate.launch_switch(conf.read("cloud_gate"))
     aws_state = ("On" if switch is cloud_gate.CloudGateSwitch.ON or hana is not None else
@@ -797,27 +579,23 @@ def build_limits(reading: records.QueueRead, snapshots: target_availability.Snap
                 shared["aws"].setdefault(reason, []).append(visible.name)
             continue
         step = entry.step
+        if (isinstance(step.route, target_config.MacOnly)
+                or isinstance(step.route, target_config.PinnedTarget) and step.route.target in mac_targets):
+            continue
         item = order[entry.position - 1][1] if entry.position <= len(order) else None
         key = item.get("repo_identity", "") if item is not None and item.get("folder") == step.folder else ""
         project = origins.resolve(key, step.folder)
         cause = wait_cause(step)
-        machine, reason = queue_wait(step, cause, inputs.local_machine, mac_name, aws_targets)
+        machine, reason = queue_wait(step, cause, inputs.local_machine, aws_targets)
         if isinstance(cause, records.RunLimitWait) and reason == "Run limit full":
             if cause.repository != origin_name(project):
                 project = known_origin(cause.repository)
             if not project:
                 reason = f"{cause.repository} run limit full"
         elif (reason == "Machine held"
-              or machine == "natedev" and reason in ("Memory", "Disk floor", "GPU limit full", "Cargo token")):
+              or machine == "natedev" and reason in ("Memory", "Disk floor", "GPU limit full", "Cargo token", "Waiting for remote startup")):
             project = ""
-        if machine == "mac":
-            block = step.placement_block
-            decision = block.mac_decision if block is not None else None
-            slot = (recorded_mac_cell(decision.scope, step.folder, project)
-                    if decision is not None and decision.target == mac_name
-                    and decision.blocker not in MAC_SHARED_BLOCKERS else None)
-            waits = slot.waits if slot is not None else shared["mac"]
-        elif machine is None:
+        if machine is None:
             waits = row(project).unplaced if project else unplaced
         elif project:
             current = row(project)
@@ -850,32 +628,6 @@ def build_limits(reading: records.QueueRead, snapshots: target_availability.Snap
                 current.natedev.note = f"Shared {name} run limit"
         else:
             current.natedev.used = len(current.natedev.runs)
-        slots = mac_cells.get(origin, {})
-        shown_slots: list[MacSlot] = []
-        for scope_name, slot in sorted(slots.items()):
-            scope = claim_state.RepositoryScope(scope_name)
-            occupied = any(mac_test.scopes_overlap(recorded, scope) for recorded in mac_occupied_scopes)
-            enabled = mac_test.standard_mac_builds_enabled(mac_config, scope) if mac_config is not None else None
-            slot.standard_mac_builds = enabled
-            has_slot = bool(enabled or occupied or slot.runs or slot.waits or slot.starting)
-            if not has_slot:
-                continue
-            if has_slot:
-                slot.limit = mac_test.slot_capacity(mac_paths, scope)
-                slot.used = slot.limit if whole_mac or occupied else None if mac_claims_unavailable else 0
-                if not slot.note:
-                    if whole_mac:
-                        slot.note = "Whole Mac in use"
-                    elif occupied and not slot.runs:
-                        slot.note = "Mac slot claimed"
-                if mac_config is not None:
-                    slot.budgets = (mac_budget(mac_config, scope),)
-            shown_slots.append(MacSlot(scope_name, slot))
-        if len(shown_slots) == 1:
-            current.mac = shown_slots[0].cell
-        else:
-            current.mac.available = None if not slots or mac_config is None else False
-            current.mac_slots = tuple(shown_slots)
         cell = current.aws
         has_cloud = origin in cloud_repositories or saved.cloud_routes.get(origin) is True
         if cell.limit is None:
@@ -888,17 +640,7 @@ def build_limits(reading: records.QueueRead, snapshots: target_availability.Snap
         if shown_names[current.name] > 1:
             current.name = origin.removeprefix("https://")
     ordered = tuple(sorted(rows.values(), key=lambda item: item.name.casefold()))
-    mac_shared: tuple[Metric, ...] = ()
-    if mac is not None and isinstance(mac.target, target_config.SshTarget):
-        try:
-            floor = conf.read(mac.target.settings).number("free_floor_gib")
-            mac_shared = (Metric("Free disk", mac_disk_free, floor, "GiB", "minimum"),)
-        except conf.Unusable:
-            pass
     return BuildLimits(MachineLimits(target_state(local, zone), local_limits(reading, memory, folders), shared["natedev"]),
-                       MachineLimits(target_state(mac, zone), mac_shared, shared["mac"], shared_mac_claims,
-                                     tuple(shared_mac_runs), tuple(shared_mac_other), mac_other_note,
-                                     shared_mac_cleanup, tuple(shared_mac_starting), mac_name),
                        MachineLimits(aws_state, (Metric("Cloud gates", cloud_used, cloud_limit), saved.aws_money),
                                      shared["aws"]),
                        ordered, isinstance(saved.history, charts.IndexUnavailable), unplaced, saved.history_stale)

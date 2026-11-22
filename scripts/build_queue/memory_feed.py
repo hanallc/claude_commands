@@ -2703,10 +2703,6 @@ def memory_status(explanation: admission_records.QueueExplanation, room: admissi
             "next_need_bytes": check.need, "check_room_bytes": check.room}
 
 
-def mac_activity_host(reading: queue_view.MacBuildReading) -> str:
-    return reading.hostname or conf.read_or_repository("machines").words("mac.hosts")[0]
-
-
 def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.UseConfiguredValue.CURRENT,
             report_version: str = "", holders: TokenHolders | TokenHoldersUnknown = NO_TOKEN_DUMP_YET,
             *, limit_background: limits_view.Background | None = None) -> MemoryPage:
@@ -2723,12 +2719,10 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
     if not isinstance(captured, admission_records.MemoryRoom) or not isinstance(host, admission_records.HostMemory):
         raise RuntimeError("recorded room unavailable")
     snapshots = target_availability.read_snapshots()
-    if limit_background is not None:
-        parsed = limits_view.with_mac_claim_waits(parsed, snapshots)
     folder_settings = conf.read_or_repository("build_folders")
     slot_roots = folder_settings.values()
     mac_reading = queue_view.read_mac_builds()
-    mac_machine = mac_activity_host(mac_reading)
+    mac_machine = conf.read_or_repository("machines").words("mac.hosts")[0]
     machine = host_name()
     slot_homes = {mac_machine: mac_reading.home, machine: str(Path.home())}
     with staff.supplied_snapshot(staff_display.members):
@@ -2737,11 +2731,7 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
              *target_availability.holder_sessions(snapshots)], os.environ)
     members = FeedStaff(staff_display.members)
     zone = user_zone()
-    route_snapshots = snapshots
-    if isinstance(snapshots, tuple):
-        selected_mac = queue_view.selected_mac_snapshot(snapshots)
-        route_snapshots = () if selected_mac is None else (selected_mac,)
-    routes = target_availability.MacRoutes(route_snapshots, labels, zone)
+    routes = target_availability.MacRoutes(snapshots, labels, zone)
     ci_rows: dict[str, RunRow] = {}
     for entry in explanation.running:
         memory = entry.step.measured
@@ -3039,7 +3029,6 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
                         **job_notes(job, names, step=waiter.step, verify=waiter.verify,
                                     ci=bool(ci_label))}
     work_rows: list[RunRow | CloudRunRow | MacBuildRow | MacReadingUnavailableRow] = list(walk)
-    mac_runs: list[tuple[queue_view.MacBuild, str]] = []
     mac_status = queue_view.mac_reading_status(mac_reading, explanation.now)
     if mac_status:
         name = QueueRowName.fixed(QueueKind.MAC)
@@ -3049,11 +3038,8 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
             "read_at": mac_reading.read_at, "used": queue_view.MacMemoryUnavailable(),
             "stage": queue_view.MacStageUnavailable(), "vcpus": queue_view.MacJobsUnavailable(), "status": mac_status})
     else:
-        mac_claims = next((snapshot.claims for snapshot in snapshots
-                           if snapshot.target.name == (mac_reading.target or "mac")
-                           and snapshot.target.platform == "macos"), ()) if isinstance(snapshots, tuple) else ()
         with staff.supplied_snapshot(staff_display.members):
-            mac_units = mac_build_units(mac_reading.builds, mac_claims)
+            mac_units = mac_build_units(mac_reading.builds, target_availability.mac_claims(snapshots))
         mac_steps = {step.mac_placement: step for step in parsed.view.running if step.mac_placement}
         for build in mac_reading.builds:
             current = members.labels_for(build.session, mac_machine, Path(build.folder))
@@ -3064,7 +3050,6 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
             mac_row = mac_work_row(build, mac_reading, identity,
                                    names=names, slot_roots=slot_roots, slot_machine=mac_machine, placed_step=placed)
             work_rows.append(mac_row)
-            mac_runs.append((build, mac_row["name"]))
     work_rows.sort(key=lambda row: row["started_at"])
     model = queue_view.QueueModel(parsed, labels, names=names)
     limit_cloud_names: dict[wire.Owner, str] = {}
@@ -3222,12 +3207,10 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
     if limit_background is not None:
         limit_names = limits_view.QueueNames(visible_waits,
             limit_cloud_names, {session: identity.owner_text for session, identity in labels.items()})
-        mac_disk_bytes = queue_view.current_mac_disk_bytes(mac_reading, mac_status)
         page["build_limits"] = limits_view.build_limits(parsed, snapshots, limit_names,
             limits_view.Metric("Memory for builds", gib(captured.cap_use),
                                gib(captured.cap) if isinstance(captured.cap, int) else None, "GiB"),
-            folder_settings, limit_background, zone, mac_runs,
-            gib(mac_disk_bytes) if mac_disk_bytes is not None else None, mac_activity_target=mac_reading.target)
+            folder_settings, limit_background, zone)
     page["render_seconds"] = time.perf_counter() - started
     return page
 
@@ -3277,10 +3260,7 @@ class LimitsRefresh:
                         and isinstance(previous.history, limits_view.RecentRepositories)):
                     current.origins.aliases.update(previous.history.origins.aliases)
                     for folder, origin in previous.history.origins.folders.items():
-                        if folder not in current.origins.folders:
-                            current.origins.folders[folder] = origin
-                            if (scope := previous.history.origins.mac_folders.get(folder)) is not None:
-                                current.origins.mac_folders[folder] = scope
+                        _ = current.origins.folders.setdefault(folder, origin)
                     current = replace(current, history=previous.history, cloud_routes=previous.cloud_routes,
                                       history_stale=True)
                 self.saved = current

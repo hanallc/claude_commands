@@ -77,8 +77,6 @@ __PAGE_FRAME_STYLE__
 .build-limits-table .quiet th, .build-limits-table .quiet td { padding-block: 6px; }
 .build-limits-table .quiet th { font-weight: 400; }
 .build-limit-state { display: inline-block; margin-left: .55em; color: var(--ink-2); font-size: .8em; font-weight: 400; }
-.build-limit-slot + .build-limit-slot { margin-top: 8px; }
-.build-limit-slot > strong { overflow-wrap: anywhere; }
 .build-limit-metric, .build-limit-count { display: flex; flex-wrap: wrap; gap: 4px 8px; align-items: center; }
 .build-limit-metric { margin-top: 5px; font-weight: 400; }
 .build-limit-metric > :last-child { margin-left: auto; }
@@ -1270,10 +1268,10 @@ function limitMarks(kind, count = 1) {
   const marks = `<span class="build-limit-mark ${kind}" aria-hidden="true"></span>`.repeat(Math.min(24, count));
   return marks + (count > 24 ? '<span aria-hidden="true">…</span>' : "");
 }
-function limitPlaces(used, limit, runs, exempt = 0) {
+function limitPlaces(used, limit, runs) {
   const free = Number.isInteger(limit) && Number.isInteger(used) ? Math.max(0, limit - used) : 0;
   return `<span class="build-limit-marks">${limitMarks("run", runs)}${limitMarks("free", free)}
-    ${limit == null ? "" : limitMarks("line")}${limitMarks("merge", exempt)}</span>`;
+    ${limit == null ? "" : limitMarks("line")}</span>`;
 }
 function limitMetric(metric, compact = false) {
   const {label, used, limit, unit, qualifier} = metric;
@@ -1301,58 +1299,45 @@ function limitWaits(waits) {
     <div class="build-limit-count"><span class="build-limit-marks">${limitMarks("wait", names.length)}</span>
       <span>${names.length} waiting · ${esc(reason)}</span></div>${limitNames(names)}</div>`).join("");
 }
-function limitStartup(names) {
-  if (!names?.length) return "";
-  const label = names.length === 1 ? "1 pending start" : `${names.length} pending starts`;
-  return `<div class="build-limit-note">${label}</div>${limitNames(names.filter(Boolean))}`;
-}
-function limitCell(cell, mac = false) {
-  const {available, limit, used, runs, exempt, other, other_note, waits, budgets, note, starting} = cell;
+function limitCell(cell) {
+  const {available, limit, used, runs, exempt, other, other_note, waits, budgets, note} = cell;
   let contents;
-  if (available === false) contents = `<span class="build-limit-note">${mac ? "No standard Mac builds" : "Does not run here"}</span>`;
+  if (available === false) contents = `<span class="build-limit-note">Does not run here</span>`;
   else if (available == null) contents = '<span class="build-limit-note">State unavailable</span>';
   else {
-    const marks = limitPlaces(used, limit, Math.min(runs.length, used ?? runs.length), exempt.length);
+    const marks = limitPlaces(used, limit, Math.min(runs.length, used ?? runs.length));
     const count = limit == null ? (used ? `${used} running · no limit` : "no limit")
       : used == null ? `Use unavailable · limit ${limit}` : `${used} of ${limit}`;
     contents = `<div class="build-limit-count num">${marks}<span>${esc(count)}</span></div>${limitNames(runs)}`;
   }
-  if (exempt.length) contents += `<div class="build-limit-note">Merge runs above the limit</div>${limitNames(exempt)}`;
+  if (limit != null && used != null && used > limit) {
+    contents += '<div class="build-limit-note">Above the limit</div>';
+  }
+  if (exempt.length) contents += `<div class="build-limit-count build-limit-note">
+    <span class="build-limit-marks">${limitMarks("merge", exempt.length)}</span><span>Exempt merge runs</span>
+    </div>${limitNames(exempt)}`;
   if (other.length) contents += `<div class="build-limit-note">${esc(other_note || `${other.length} other running`)}</div>${limitNames(other)}`;
   if (note) contents += `<div class="build-limit-note">${esc(note)}</div>`;
-  if (mac && available && cell.standard_mac_builds === false) {
-    contents += '<div class="build-limit-note">No standard Mac builds</div>';
-  }
-  contents += limitStartup(starting);
   return `${contents}${budgets.map(metric => limitMetric(metric, metric.qualifier === "maximum")).join("")}${limitWaits(waits)}`;
 }
 let lastBuildLimitsHtml = "";
 function renderBuildLimits(limits) {
   if (!limits || !$("build-limits").open) return;
   const container = $("build-limits-content");
-  const machines = [["natedev", limits.natedev], ["Mac", limits.mac], ["AWS", limits.aws]];
+  const machines = [["natedev", limits.natedev], ["AWS", limits.aws]];
   const headings = machines.map(([name, data]) => `<th scope="col">${name}
     <span class="build-limit-state">${esc(data.state)}</span>
     ${data.shared.map(metric => limitMetric(metric)).join("")}
-    ${data.claims ? `<div class="build-limit-note">${data.claims} ${data.claims === 1 ? "claim" : "claims"}</div>` : ""}
-    ${data.target && data.target !== "mac" ? `<div class="build-limit-note">${esc(data.target)}</div>` : ""}
-    ${limitNames(data.runs ?? [])}
-    ${data.cleanup ? '<div class="build-limit-note">Claim held for cleanup</div>' : ""}
-    ${limitStartup(data.startup)}
-    ${data.other?.length ? `<div class="build-limit-note">${esc(data.other_note)}</div>${limitNames(data.other)}` : ""}
     ${limitWaits(data.waits)}</th>`).join("");
   const rows = limits.repositories.map(row => {
-    const slots = row.mac_slots ?? [];
-    const cells = [row.natedev, row.mac, row.aws, ...slots.map(slot => slot.cell)];
     const pending = limitWaits(row.unplaced);
-    const quiet = cells.every(cell => !cell.runs.length && !cell.exempt.length && !cell.other.length && !cell.starting?.length);
-    const mac = slots.length ? slots.map(slot => `<div class="build-limit-slot">
-      <strong>${esc(slot.name)}</strong>${limitCell(slot.cell, true)}</div>`).join("") : limitCell(row.mac, true);
+    const quiet = [row.natedev, row.aws].every(cell =>
+      !cell.runs.length && !cell.exempt.length && !cell.other.length);
     return `<tr${quiet ? ' class="quiet"' : ""}><th scope="row">${esc(row.name)}${pending}</th>
-      <td>${limitCell(row.natedev)}</td><td>${mac}</td><td>${limitCell(row.aws)}</td></tr>`;
+      <td>${limitCell(row.natedev)}</td><td>${limitCell(row.aws)}</td></tr>`;
   }).join("");
   const legend = [["run", "A run that is in progress"], ["free", "A free place"], ["line", "The limit"],
-    ["merge", "A merge run above the limit"], ["wait", "A run that waits"]];
+    ["merge", "An exempt merge run"], ["wait", "A run that waits"]];
   const html = `<div class="build-limits-scroll"><table class="build-limits-table" aria-label="Build limits by repository and machine">
     <thead><tr><th scope="col">Repository</th>${headings}</tr></thead><tbody>${rows}</tbody></table></div>
     ${limitWaits(limits.unplaced)}

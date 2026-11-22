@@ -114,14 +114,14 @@ class ClaimFinished:
 class ClaimBusy:
     """A claim attempt refused by a live claim whose scope overlaps."""
 
-    holder: HeldClaim
+    holder: RunRecord
 
 
 @dataclass(frozen=True)
 class ClaimHeldByCopy:
     """A claim attempt whose overlapping live claims are all copies, which give way."""
 
-    holders: tuple[HeldClaim, ...]
+    holders: tuple[RunRecord, ...]
 
 
 ClaimAttempt = ClaimFinished | ClaimBusy | ClaimHeldByCopy
@@ -666,21 +666,6 @@ def run_holds_work(run: RunRecord) -> bool:
     return run_is_live(run) and not run_is_kept(run)
 
 
-def claim_report_state(claim: HeldClaim, *, retained: bool = False) -> Literal["cleanup", "running", "ended"]:
-    """Read the claim state for the Builds page."""
-    record = claim.record
-    if retained or record.get("cleanup_pending") is True or run_is_kept(record):
-        return "cleanup"
-    return "running" if run_is_live(record) else "ended"
-
-
-def claim_blocker(claim: HeldClaim) -> claim_state.MacBlocker:
-    whole = isinstance(claim.scope, WholeMacScope)
-    if claim.record.get("cleanup_pending") is True:
-        return "whole-mac-cleanup" if whole else "cleanup"
-    return "whole-mac-full" if whole else "limit-full"
-
-
 def copy_gives_way(run: RunRecord) -> bool:
     """A live test copy whose process still runs, so a new step can stop it.
 
@@ -724,15 +709,6 @@ def slot_capacity(paths: StatePaths, scope: ClaimScope, *,
     missing = (target_config.MissingSlotCapacity.REQUIRE_CONFIGURED if scope.key
                else target_config.MissingSlotCapacity.SINGLE_SLOT)
     return target_config.slot_capacity(settings, scope.name, missing=missing)
-
-
-def standard_mac_builds_enabled(config: eligibility.OffloadConfig, scope: RepositoryScope) -> bool:
-    """Read standard build eligibility without a package restriction."""
-    from scripts.mac_test import eligibility
-
-    return config.enabled and isinstance(
-        eligibility.linux_only_policy(config, eligibility.KnownRepository(scope.name), Path(), "", "check"),
-        eligibility.KnownRepository)
 
 
 def affinity_path(paths: StatePaths, scope: RepositoryScope) -> Path:
@@ -1920,8 +1896,8 @@ def claim_once(args: CliArguments, paths: StatePaths, scope: ClaimScope,
     if overlapping:
         # A test copy gives way to any new step; a copy never replaces a copy.
         if not args.copy and all(copy_gives_way(claim.record) for claim in overlapping):
-            return ClaimHeldByCopy(overlapping)
-        return ClaimBusy(overlapping[0])
+            return ClaimHeldByCopy(tuple(claim.record for claim in overlapping))
+        return ClaimBusy(overlapping[0].record)
     proc_start = process_identity.process_start(args.pid)
     if not isinstance(proc_start, process_identity.Started):
         print(f"cannot claim: process {args.pid} is not running", file=sys.stderr)
@@ -2092,55 +2068,45 @@ def command_claim(args: CliArguments, paths: StatePaths, *, watch_claim: bool = 
         session = assignment.session
     else:
         scope = target_claim_scope(paths, args.worktree)
-    reporting = (claim_state.publish_claim_waits(paths, args.pid, args.worktree, args.what, session, args.episode)
-                 if paths.platform == "macos" and not args.from_pid and (args.wait > 0 or not args.copy)
-                 else nullcontext(None))
-    with reporting as report:
-        deadline = time.monotonic() + max(args.wait, 0.0)
-        yield_deadline = 0.0
-        stopped: set[tuple[int, str]] = set()
-        while True:
-            with locked(paths.lock):
-                attempt = (adopt_wait_claim(args, paths, scope, session=session) if args.from_pid
-                           else claim_once(args, paths, scope, session=session, reserve_wait=not watch_claim, assignment=assignment))
-            if isinstance(attempt, ClaimFinished):
-                if watch_claim and attempt.status in (0, 13):
-                    start_claim_watcher(paths)
-                return attempt.status
-            if isinstance(attempt, ClaimHeldByCopy):
-                # Signal outside state.lock, then wait for each copy's runner to
-                # clean up and release; the lock is never held while waiting.
-                if not stopped:
-                    yield_deadline = time.monotonic() + copy_yield_seconds()
-                for claim in attempt.holders:
-                    holder = claim.record
-                    if (holder["pid"], holder["proc_start"]) not in stopped:
-                        stopped.add((holder["pid"], holder["proc_start"]))
-                        stop_copy(holder)
-                if time.monotonic() < yield_deadline:
-                    if report is not None:
-                        report(claim_state.MacDecision(paths.target, attempt.holders[0].scope, "copy-yield"))
-                    time.sleep(0.1)
-                    continue
-                busy_run = attempt.holders[0].record
-                print(f"busy: {busy_run['what']} since {local_time(busy_run['since'], include_zone=False)}")
+    deadline = time.monotonic() + max(args.wait, 0.0)
+    yield_deadline = 0.0
+    stopped: set[tuple[int, str]] = set()
+    while True:
+        with locked(paths.lock):
+            attempt = (adopt_wait_claim(args, paths, scope, session=session) if args.from_pid
+                       else claim_once(args, paths, scope, session=session, reserve_wait=not watch_claim, assignment=assignment))
+        if isinstance(attempt, ClaimFinished):
+            if watch_claim and attempt.status in (0, 13):
+                start_claim_watcher(paths)
+            return attempt.status
+        if isinstance(attempt, ClaimHeldByCopy):
+            # Signal outside state.lock, then wait for each copy's runner to
+            # clean up and release; the lock is never held while waiting.
+            if not stopped:
+                yield_deadline = time.monotonic() + copy_yield_seconds()
+            for holder in attempt.holders:
+                if (holder["pid"], holder["proc_start"]) not in stopped:
+                    stopped.add((holder["pid"], holder["proc_start"]))
+                    stop_copy(holder)
+            if time.monotonic() < yield_deadline:
+                time.sleep(0.1)
+                continue
+            busy_run = attempt.holders[0]
+            print(f"busy: {busy_run['what']} since {local_time(busy_run['since'], include_zone=False)}")
+            return 11
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            busy_run = attempt.holder
+            if run_is_kept(busy_run):
+                print(f"busy: leftovers of {busy_run['what']} on {busy_run['remote_host']} since "
+                      + f"{local_time(busy_run['since'], include_zone=False)}")
                 return 11
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                busy_run = attempt.holder.record
-                if run_is_kept(busy_run):
-                    print(f"busy: leftovers of {busy_run['what']} on {busy_run['remote_host']} since "
-                          + f"{local_time(busy_run['since'], include_zone=False)}")
-                    return 11
-                print(
-                    f"busy: {busy_run['what']} since "
-                    + f"{local_time(busy_run['since'], include_zone=False)}"
-                )
-                return 11
-            if report is not None:
-                report(claim_state.MacDecision(paths.target, attempt.holder.scope,
-                                               claim_blocker(attempt.holder)))
-            time.sleep(min(2.0, remaining))
+            print(
+                f"busy: {busy_run['what']} since "
+                + f"{local_time(busy_run['since'], include_zone=False)}"
+            )
+            return 11
+        time.sleep(min(2.0, remaining))
 
 
 @dataclass(frozen=True)
@@ -2235,7 +2201,6 @@ def free_now(
     paths: StatePaths, settings: Path | eligibility.DefaultMacSettings, repo_root: Path, copy: bool = False,
     *, session: SubmittingSession | claim_state.CallingSession = claim_state.CALLING_SESSION,
     configuration: conf.ConfigRead | conf.UseConfiguredValue = conf.UseConfiguredValue.CURRENT,
-    note_busy: Callable[[claim_state.MacBlocker, ClaimScope], None] | None = None,
 ) -> FreeNowAnswer:
     """Whether a claim for repo_root's repository made now could start a Mac run.
 
@@ -2273,8 +2238,6 @@ def free_now(
     repository_name = repository.repo_name(str(repo_root))
     if repository_name is not None and isinstance(
             eligibility.read_mirror_busy(time.time(), repository_name, paths.target), eligibility.ActiveBackoff):
-        if note_busy is not None:
-            note_busy("mirror-backoff", RepositoryScope(repository_name))
         return "busy"
     scopes: tuple[ClaimScope, ...] = (scope,)
     if not target_config.uses_legacy_mac_layout(paths.platform) and isinstance(scope, RepositoryScope):
@@ -2285,21 +2248,11 @@ def free_now(
             if isinstance(error, conf.Unusable) and isinstance(configuration, conf.ConfigRead):
                 raise
             return "state"
-    blockers: list[tuple[claim_state.MacBlocker, ClaimScope]] = []
-
-    def holds_scope(claim: HeldClaim, candidate: ClaimScope) -> bool:
-        if (scopes_overlap(claim.scope, candidate) and run_holds_work(claim.record)
-                and (copy or not copy_gives_way(claim.record))):
-            if note_busy is not None:
-                reason = claim_blocker(claim)
-                if reason in ("whole-mac-full", "whole-mac-cleanup") or not blockers or blockers[0][0] == "limit-full":
-                    blockers[:] = [(reason, claim.scope)]
-            return True
-        return False
-
-    if all(any(holds_scope(claim, candidate) for claim in claims) for candidate in scopes):
-        if note_busy is not None and blockers:
-            note_busy(*blockers[0])
+    held = all(any(
+        scopes_overlap(claim.scope, candidate) and run_holds_work(claim.record)
+        and (copy or not copy_gives_way(claim.record)) for claim in claims
+    ) for candidate in scopes)
+    if held:
         return "busy"
     if isinstance(eligibility.read_failed_probe(paths.target), eligibility.FailedProbe):
         return "bad"

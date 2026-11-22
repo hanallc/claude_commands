@@ -3,25 +3,18 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Generator
-from contextlib import ExitStack, contextmanager
+from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
 import fcntl
 import json
-import os
 from pathlib import Path
-from queue import SimpleQueue
-from threading import Thread
-import time
 from typing import TYPE_CHECKING, Literal, NotRequired, TypedDict, cast
-from uuid import uuid4
 
 from scripts.build_hold.owning_session import NoOwningSession, OwningSession
 from scripts.build_targets import target_config
-from scripts.lib import process_start
-from scripts.lib.atomic_file import write_text_atomic
 
 if TYPE_CHECKING:
     from scripts.buildlog.transfer_bytes import TransferBytes
@@ -318,7 +311,6 @@ class StatePaths:
         self.claim_watch_lock: Path = directory / "claim_watch.lock"
         self.run: Path = directory / "run.json"
         self.claims: Path = directory / "claims"
-        self.claim_waits: Path = directory / "claim-waits"
         self.block: Path = directory / "block.json"
         self.affinity: Path = directory / "affinity"
 
@@ -451,17 +443,13 @@ def required_string(values: dict[str, object], key: str, path: Path) -> str:
 
 
 def target_claim_scope(paths: StatePaths, worktree: str) -> ClaimScope:
-    return checkout_claim_scope(worktree, paths.platform)
-
-
-def checkout_claim_scope(worktree: str, platform: target_config.Platform) -> ClaimScope:
     from scripts.buildlog import repository, store
 
     name = repository.repo_name(worktree)
     common = repository.git_common_dir(worktree)
     if name is None or common is None:
         return WHOLE_MAC
-    if target_config.uses_legacy_mac_layout(platform):
+    if target_config.uses_legacy_mac_layout(paths.platform):
         return RepositoryScope(name)
     source = Path(repository.source_git_dir(common))
     if not (source / "config").is_file():
@@ -479,140 +467,6 @@ def claim_files(paths: StatePaths) -> tuple[Path, ...]:
     except OSError as error:
         raise ClaimStateUnreadable(paths.claims, error) from error
     return (paths.run, *repository_files)
-
-
-MacBlocker = Literal["limit-full", "whole-mac-full", "mirror-backoff", "starting", "ineligible",
-                     "machine-held", "disk-floor", "cleanup", "whole-mac-cleanup", "copy-yield", "copy-running", "older-request"]
-
-
-@dataclass(frozen=True)
-class MacDecision:
-    target: str
-    scope: ClaimScope
-    blocker: MacBlocker | None = None
-
-
-@dataclass(frozen=True)
-class ClaimWait:
-    caller: int
-    caller_start: str
-    folder: str
-    name: str
-    session: str
-    episode: str
-    reason: Literal["busy"]
-    since: float
-    decision: MacDecision | None = None
-
-
-@contextmanager
-def record_claim_wait(paths: StatePaths, caller: int, folder: str, name: str,
-                      session: SubmittingSession, episode: str, *,
-                      decision: MacDecision | None = None) -> Generator[None, None, None]:
-    """Keep one record for the life of this claim wait."""
-    pid = os.getpid()
-    owner = process_start.process_start(pid)
-    caller_identity = owner if caller == pid else process_start.process_start(caller)
-    if not isinstance(owner, process_start.Started) or not isinstance(caller_identity, process_start.Started):
-        yield
-        return
-    path = paths.claim_waits / f"{pid}-{uuid4().hex}.json"
-    scope = decision.scope if decision is not None else None
-    facts = ({"target": decision.target, "blocker": decision.blocker,
-              "scope": {"name": scope.name, "key": scope.key, "slot": scope.slot}
-              if isinstance(scope, RepositoryScope) else "whole"} if decision is not None else {})
-    try:
-        paths.claim_waits.mkdir(parents=True, exist_ok=True)
-        write_text_atomic(path, json.dumps({"pid": pid, "start": owner.start, "caller": caller, "caller_start": caller_identity.start,
-            "folder": folder, "name": name, "session": session_id(session), "episode": episode,
-            "reason": "busy", "since": time.time(), **facts}, separators=(",", ":")))
-    except OSError:
-        yield
-        return
-    try:
-        yield
-    finally:
-        try:
-            path.unlink(missing_ok=True)
-        except OSError:
-            pass
-
-
-@contextmanager
-def publish_claim_waits(paths: StatePaths, caller: int, folder: str, name: str,
-                        session: SubmittingSession, episode: str) -> Generator[Callable[[MacDecision], None] | None, None, None]:
-    """Publish wait records without delaying the next claim attempt."""
-    pending: SimpleQueue[MacDecision | None] = SimpleQueue()
-
-    def write_waits() -> None:
-        with ExitStack() as record:
-            last: MacDecision | None = None
-            while (decision := pending.get()) is not None:
-                if decision != last:
-                    record.close()
-                    _ = record.enter_context(record_claim_wait(paths, caller, folder, name, session, episode,
-                                                               decision=decision))
-                    last = decision
-
-    writer = Thread(target=write_waits, name="claim-wait-record", daemon=True)
-    try:
-        writer.start()
-    except RuntimeError:
-        yield None
-        return
-    try:
-        yield pending.put
-    finally:
-        pending.put(None)
-
-
-def claim_wait_decision(row: dict[str, object], target: str) -> MacDecision | None:
-    blocker = row.get("blocker")
-    if row.get("target") != target or blocker not in ("limit-full", "whole-mac-full", "cleanup", "whole-mac-cleanup", "copy-yield"):
-        return None
-    scope = row.get("scope")
-    if scope == "whole":
-        return MacDecision(target, WHOLE_MAC, cast(MacBlocker, blocker))
-    if isinstance(scope, dict):
-        fields = cast(dict[str, object], scope)
-        name, key, slot = fields.get("name"), fields.get("key"), fields.get("slot")
-        if isinstance(name, str) and isinstance(key, str) and type(slot) is int:
-            return MacDecision(target, RepositoryScope(name, key, slot), cast(MacBlocker, blocker))
-    return None
-
-
-def read_claim_waits(paths: StatePaths) -> tuple[ClaimWait, ...]:
-    """Read waits whose helper and caller still have the recorded identity."""
-    waits: list[ClaimWait] = []
-    for path in paths.claim_waits.glob("*.json"):
-        try:
-            row = read_json_object(path)
-            if row is None:
-                continue
-            pid, start = row.get("pid"), row.get("start")
-            caller, caller_start, since = row.get("caller"), row.get("caller_start"), row.get("since")
-            if (not isinstance(pid, int) or not isinstance(start, str)
-                    or not isinstance(caller, int) or not isinstance(caller_start, str)):
-                continue
-            owner = process_start.process_start(pid)
-            caller_identity = owner if caller == pid else process_start.process_start(caller)
-            identities = ((owner, start), (caller_identity, caller_start))
-            if any(isinstance(identity, (process_start.Gone, process_start.Zombie))
-                   or isinstance(identity, process_start.Started) and identity.start != saved
-                   for identity, saved in identities):
-                path.unlink(missing_ok=True)
-                continue
-            if not all(isinstance(identity, process_start.Started) for identity, _ in identities):
-                continue
-            folder, name, session, episode = (row.get(key) for key in ("folder", "name", "session", "episode"))
-            if (isinstance(since, (int, float))
-                    and isinstance(folder, str) and isinstance(name, str) and isinstance(session, str)
-                    and isinstance(episode, str) and row.get("reason") == "busy"):
-                waits.append(ClaimWait(caller, caller_start, folder, name, session, episode, "busy", since,
-                                       claim_wait_decision(row, paths.target)))
-        except (StateReadError, OSError):
-            continue
-    return tuple(sorted(waits, key=lambda wait: wait.since))
 
 
 def read_claims(paths: StatePaths) -> tuple[HeldClaim, ...]:

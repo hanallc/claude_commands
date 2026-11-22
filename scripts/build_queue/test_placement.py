@@ -27,7 +27,7 @@ from scripts.build_queue import admission_protocol as wire, admission_records as
 from scripts.build_queue import admission_client as client, queue_snapshot
 from scripts.build_queue import snapshot_codec as codec
 from scripts.build_queue.admission_test_support import AdmissionFixture, ObservedAdmissionServer, only_admitted, GIB
-from scripts.mac_test.claim_state import ClaimScope, RepositoryScope, WholeMacScope
+from scripts.mac_test.claim_state import RepositoryScope, WholeMacScope
 from scripts.mac_test import claim_state, eligibility, mac_test, offload
 from scripts.lint.memory_test_support import write_config_fixture, write_pressure_reading
 from scripts.lint import memory_admit as gate
@@ -1937,9 +1937,8 @@ with mock.patch.object(subprocess, "run", side_effect=private_transport), \
             evidence = publish_candidate(fixture, younger)
             server.placement_host_keys[(younger.episode, destination)] = evidence.key
             held_for_older = cast(Callable[[wire.PlacementRequest, placement.PlacementDestination, list[service.PlacementHold],
-                dict[tuple[str, placement.PlacementDestination], float]], wire.PlacementRequest | None],
-                getattr(server, "_held_for_older"))
-            self.assertIsNone(held_for_older(younger, destination, [hold] if hold is not None else [], {}))
+                dict[tuple[str, placement.PlacementDestination], float]], bool], getattr(server, "_held_for_older"))
+            self.assertFalse(held_for_older(younger, destination, [hold] if hold is not None else [], {}))
             self.assertIsNone(hold)
 
     def client_constraints(self, request: wire.PlacementRequest) -> placement.PlacementConstraints:
@@ -2633,15 +2632,11 @@ HOLD_SECONDS = 1 + 5
 class MacOrderTests(unittest.TestCase):
     """A younger request never takes the Mac from an older request whose busy reading is older."""
 
-    def mac_order(self, fixture: PlacementFixture, *, older_scope: ClaimScope | None = None) -> MacOrder:
+    def mac_order(self, fixture: PlacementFixture) -> MacOrder:
         fixture.configure(waiting_pass_seconds=1)
         _ = write_config_fixture(fixture.root / "mac_test.conf", "probe_timeout_s=5\n", template="mac_test")
         _ = fixture.run_pass()
         older = placement_request(fixture, since=fixture.clock.now() - 60)
-        if older_scope is not None:
-            candidate, = older.constraints.candidates
-            older = replace(older, constraints=replace(older.constraints, candidates=(
-                replace(candidate, destination=replace(candidate.destination, scope=older_scope)),)))
         older_key = self.provide(fixture, older, placement.TemporaryExclusion("busy"))
         self.assertIsInstance(fixture.connect(older).replies()[-1], wire.PlacementWait)
         _ = fixture.run_pass()

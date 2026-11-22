@@ -30,7 +30,6 @@ from scripts.build_targets.target_config import LocalRequired, StepRoute
 from scripts.buildlog import parse
 from scripts.lib import conf
 from scripts.lib.proc_text import read_proc_text
-from scripts.mac_test.claim_state import MacDecision
 from scripts.production import staff
 from scripts.production.staff import StaffId
 from scripts.lib.test_phase import (CallRecord as CallRecord, NoCallRecord as NoCallRecord,
@@ -104,26 +103,6 @@ class SavedPlacementAssignment:
         placement.UnknownAssignedSettingsGeneration())
     refusal_settings: RefusalSettings | NoRefusalSettings = NoRefusalSettings()
     remote_start_hold: RemoteStartHold | RemoteStartHoldUnrecorded | RemoteStartHoldEnded = RemoteStartHoldUnrecorded()
-
-def refused_claim(saved: SavedPlacementAssignment) -> placement.RetainedCleanupClaim | None:
-    """Read the claim that a refused attempt retains for cleanup."""
-    report = saved.terminal_report
-    if (isinstance(saved.provider, placement.ProviderClaimReference)
-            and isinstance(report, placement.TerminalAttemptReport)
-            and isinstance(report.outcome, (placement.PrelaunchRefused, execution_identity.HanaCommandAdmissionRefused))):
-        return placement.RetainedCleanupClaim(saved.provider, report.outcome.reason)
-    return None
-
-
-def assignment_pending_start(saved: SavedPlacementAssignment,
-                             evidence: execution_identity.ExecutionEvidence | None = None,
-                             *, has_claim: bool = False) -> bool:
-    """Read the start state from the assignment, its claim, and execution evidence."""
-    return (isinstance(saved.state, placement.CurrentAssignment)
-            and isinstance(saved.terminal_report, placement.NoTerminalReport)
-            and isinstance(saved.provider, placement.NoProviderClaim)
-            and not has_claim and not isinstance(evidence, execution_identity.ObservedExecution))
-
 
 # Historical multiplier for saved dev bases from the Phase 24 replay.
 DEV_HEADROOM = 4.2034275337646125
@@ -1130,11 +1109,10 @@ class PackageNotRecorded:
 class PlacementBlock:
     """The queue records the destination and its last observed blocker."""
 
-    provider: Literal["local", "mac", "ssh", "scaler"]
+    provider: Literal["local", "ssh", "scaler"]
     target: str
     reason: str
     episode: str = ""
-    mac_decision: MacDecision | None = None
 
 
 @dataclass(frozen=True)
@@ -1159,7 +1137,6 @@ class WaitingStep:
     placement_block: PlacementBlock | None = field(default=None, kw_only=True)
     placement_pending: bool = field(default=False, kw_only=True)
     placement_episode: str = field(default="", kw_only=True)
-    caller_start: str = field(default="", kw_only=True)
 
     @property
     def episode(self) -> str:
@@ -1183,7 +1160,6 @@ class RunningStep:
     execution: execution_identity.ExecutionEvidence = execution_identity.ExecutionNotStarted()
     assignment_host: str = ""
     mac_placement: str = field(default="", kw_only=True)
-    mac_startup: MacDecision | None = field(default=None, kw_only=True)
     package: str | PackageNotRecorded = field(default=PackageNotRecorded(), kw_only=True)
     route: StepRoute = field(default=DIRECT_CARGO, kw_only=True)
     verify: VerifyStep = field(default=NotVerifyCall(), kw_only=True)
@@ -1220,7 +1196,6 @@ class QueueView:
     promised: int
     reserve: int
     now: float
-    mac_retained_claims: tuple[placement.ProviderClaimReference, ...] = field(default=(), kw_only=True)
 
 
 @dataclass(frozen=True)
