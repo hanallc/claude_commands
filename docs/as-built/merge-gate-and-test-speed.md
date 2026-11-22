@@ -455,6 +455,13 @@ The fourth rule counts names in imports, strings, and comments.
 Removed source files also count.
 The selector reads that text only when no earlier rule selects the module.
 
+A file scan also selects a test module.
+The module, or a source that it imports, calls `glob` or `rglob` on a repository folder, and a changed path matches that scan.
+A `scan_roots` row in `config/gate.conf` declares a module's folders and replaces its inferred scans.
+When the selector cannot resolve the scanned folder, it infers a scan of the whole repository.
+`runtime_files()` in `scripts/lib/checkout_test_support.py` is such a scan, and about 420 test modules import that file.
+So any changed path, a doc line included, selects those modules: 76.5% of the CPU of a full run.
+
 Only test modules have graph rows. All Python paths can resolve imports.
 A removed Python file uses import facts from the base.
 A syntax error in a test module requires a full run. Non-test syntax errors do not block selection.
