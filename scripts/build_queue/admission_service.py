@@ -366,6 +366,7 @@ class WaiterPlace:
     queue_identity: records.QueueLifeIdentity = field(kw_only=True)
     move_id: str = field(default="", kw_only=True)
     move_rank: records.WaitRank | records.SubmissionRank = field(default=records.SubmissionRank(), kw_only=True)
+    move_place: int = field(default=0, kw_only=True)
     ci_runner: str = field(default="", kw_only=True)
 
     @property
@@ -379,7 +380,7 @@ def waiter_place(row: records.Waiter, episode: str) -> WaiterPlace:
         row.get("priority_since", OrderNotStarted()), row.get("token_left_at", TokenNotLeft()),
         order_since=row.get("order_since", row["since"]), queue_identity=gate.queue_life_identity(row),
         move_id=row.get("move_id", ""), move_rank=row.get("move_rank", records.SubmissionRank()),
-        ci_runner=row.get("ci_runner", ""))
+        move_place=row.get("move_place", 0), ci_runner=row.get("ci_runner", ""))
 
 
 @dataclass(frozen=True)
@@ -577,8 +578,38 @@ class PendingCloudGroup:
     group: status_wire.CloudGroup
 
 
-def move_neighbors(group: list[str], index: int) -> tuple[str, str]:
-    return (group[index - 1] if index else "", group[index + 1] if index + 1 < len(group) else "")
+def move_neighbors(order: list[str], index: int) -> tuple[str, str]:
+    return (order[index - 1] if index else "", order[index + 1] if index + 1 < len(order) else "")
+
+
+def place_dragged_waiters(rows: list[tuple[Path, records.RankedWaiter]],
+                          changes: Mapping[str, int] | None = None) -> list[tuple[Path, records.RankedWaiter]]:
+    """Keep dragged waits in their saved places and fill the other places in group order."""
+    pinned: list[tuple[int, Path, records.RankedWaiter]] = []
+    natural: list[tuple[Path, records.RankedWaiter]] = []
+    tracked = 0
+    for path, row in rows:
+        if not (row_id := row.get("move_id")):
+            continue
+        tracked += 1
+        place = changes.get(row_id, row.get("move_place", 0)) if changes is not None else row.get("move_place", 0)
+        if place:
+            pinned.append((place, path, row))
+        else:
+            natural.append((path, row))
+    if not pinned:
+        return rows
+    pinned.sort(key=lambda item: (item[0], item[2]["pid"], item[2]["start_time"]))
+    slots: dict[int, tuple[Path, records.RankedWaiter]] = {}
+    next_place = 0
+    for index, (place, path, row) in enumerate(pinned):
+        position = min(max(place - 1, next_place), tracked - len(pinned) + index)
+        slots[position] = (path, row)
+        next_place = position + 1
+    fill = iter(natural)
+    tracked_rows = iter(slots[index] if index in slots else next(fill) for index in range(tracked))
+    ordered = (next(tracked_rows) if row.get("move_id") else (path, row) for path, row in rows)
+    return [(path, {**row, "queue_position": position}) for position, (path, row) in enumerate(ordered)]
 
 
 @dataclass(frozen=True)
@@ -1674,7 +1705,7 @@ class AdmissionServer:
 
     def _inputs_with_current_slots(self, inputs: records.QueueInputs) -> records.QueueInputs:
         self._prune_runs()
-        self._claim_slots()
+        self._claim_slots(inputs)
         remaining = gate.inputs_after_reservations_end(inputs, self._live_reservation_ids())
         occupied = self._occupied_local_cargo_folders()
         local_owners = {records.waiter_owner(row) for _, row in remaining.ordered}
@@ -1862,6 +1893,10 @@ class AdmissionServer:
         return row.get("ci_runner") or row.get("unit", "")
 
     def _queue_order(self) -> tuple[list[tuple[Path, records.RankedWaiter]], records.QueuePriority | records.NoQueuePriority]:
+        rows, priority = self._priority_order()
+        return place_dragged_waiters(rows), priority
+
+    def _priority_order(self) -> tuple[list[tuple[Path, records.RankedWaiter]], records.QueuePriority | records.NoQueuePriority]:
         rows = self._ordered_waiters()
         if isinstance(self.priority, records.NoQueuePriority):
             return rows, self.priority
@@ -1931,9 +1966,12 @@ class AdmissionServer:
                 else:
                     del self.slots[key]
 
-    def _claim_slots(self) -> None:
+    def _claim_slots(self, inputs: records.QueueInputs) -> None:
         claimed = {slot.owner for slot in self.slots.values() if isinstance(slot, records.ContinuationSlot)}
-        for waiting in sorted(self.waiters.values(), key=lambda item: gate.waiter_order(item.row)):
+        ranks = {records.waiter_owner(row): gate.waiter_order(row) for _, row in inputs.ordered
+                 if "queue_position" in row}
+        for waiting in sorted(self.waiters.values(),
+                key=lambda item: ranks.get(records.waiter_owner(item.row), gate.waiter_order(item.row))):
             request = waiting.request
             saved = self.assignments.get(self.current_assignments.get(request.episode, ""))
             if saved is not None and isinstance(saved.remote_start_hold, records.RemoteStartHold):
@@ -2044,6 +2082,8 @@ class AdmissionServer:
                 row["move_id"] = place.move_id
             if not isinstance(place.move_rank, records.SubmissionRank):
                 row["move_rank"] = place.move_rank
+            if place.move_place:
+                row["move_place"] = place.move_place
         if isinstance(identity.verify, records.VerifyCall):
             row["verify"] = identity.verify
         if isinstance(identity.job, StepJob):
@@ -2827,6 +2867,8 @@ class AdmissionServer:
         key = _place_key(request.owner, row["since"])
         previous = self.places.get(key)
         if "move_id" not in row:
+            if any(place.move_place for place in self.places.values()):
+                self._fit_drag_places_before_join()
             row["move_id"] = uuid.uuid4().hex
             tail = self._manual_group_tail(row)
             if tail is not None:
@@ -2834,9 +2876,19 @@ class AdmissionServer:
         place = waiter_place(row, request.episode)
         self.places[key] = replace(place, queue_identity=previous.queue_identity) if previous is not None else place
 
+    def _fit_drag_places_before_join(self) -> None:
+        """Keep a new wait behind a dragged row at the end of a shorter list."""
+        rows = self._ordered_waiters()
+        size = sum(1 for _, row in rows if row.get("move_id"))
+        if any(row.get("move_place", 0) > size for _, row in rows):
+            ordered = [row for _, row in place_dragged_waiters(rows) if "move_id" in row]
+            self._save_drag_places({row["move_id"]: position for position, row in enumerate(ordered, 1)
+                                    if "move_id" in row and row.get("move_place")})
+
     def _manual_group_tail(self, row: records.Waiter) -> records.WaitRank | None:
         places = [place for place in self.places.values() if place.move_id]
-        if not any(isinstance(place.move_rank, tuple) for place in places):
+        has_drag = any(place.move_place for place in places)
+        if not has_drag and not any(isinstance(place.move_rank, tuple) for place in places):
             return None
         bumped = {entry["unit"] for entry in self.priority.entries} if isinstance(self.priority, records.QueuePriority) else set[str]()
         sessions = {place.queue_identity["session_id"] for place in places
@@ -2852,19 +2904,22 @@ class AdmissionServer:
         own_group = group(self._priority_name(row), row.get("session_id", ""))
         members = [place for place in places if group(place.ci_runner or place.queue_identity.get("unit", ""),
                                                      place.queue_identity["session_id"]) == own_group]
-        saved = [place.move_rank for place in members if isinstance(place.move_rank, tuple)]
-        return max(max(saved), max(place.submission_rank for place in members)) if saved else None
+        if not members or (not has_drag and not any(isinstance(place.move_rank, tuple) for place in members)):
+            return None
+        return max(max(place.submission_rank, place.move_rank) if isinstance(place.move_rank, tuple)
+                   else place.submission_rank for place in members)
 
     def _end_move(self, waiting: WaitingAdmission) -> None:
         self._clear_wait_rank(waiting.request.owner, waiting.row["since"], waiting.request.episode)
         _ = waiting.row.pop("move_id", None)
         _ = waiting.row.pop("move_rank", None)
+        _ = waiting.row.pop("move_place", None)
 
     def _clear_wait_rank(self, owner: wire.Owner, since: float, episode: str) -> None:
         key = _place_key(owner, since)
         place = self.places.get(key)
         if place is not None and place.episode == episode and place.move_id:
-            self.places[key] = replace(place, move_id="", move_rank=records.SubmissionRank())
+            self.places[key] = replace(place, move_id="", move_rank=records.SubmissionRank(), move_place=0)
 
     def _end_placement_rank(self, request: wire.PlacementRequest) -> None:
         waiting = self.waiters.get(request.episode)
@@ -2941,6 +2996,7 @@ class AdmissionServer:
         queue_waiter = records.stored_waiter(waiting.row)
         _ = queue_waiter.pop("move_id", None)
         _ = queue_waiter.pop("move_rank", None)
+        _ = queue_waiter.pop("move_place", None)
         record = ReservationRecord(request.episode, str(stem), request.owner, 0 if cloud else profile.peak.bytes,
             profile.repo, profile.step, profile.worktree, store.utc_iso(now), request.sidecar,
             request.test_width, request.call, stem.name, queue_waiter,
@@ -4773,29 +4829,46 @@ done
             return [previous.reply]
         if isinstance(self.configuration, gate.UnusableAdmissionConfiguration):
             return [wire.Refused(self.configuration.reason)]
-        rows, _ = self._queue_order()
+        baseline, _ = self._priority_order()
+        rows = place_dragged_waiters(baseline)
         line = self._current_move_line(rows, check_owners=True)
-        result = self._move_destination(request, line)
+        pins = {row["move_id"] for _, row in rows if "move_id" in row and row.get("move_place")}
+        undo = None
+        if isinstance(destination := request.destination, wire.QueueUndo):
+            saved = self.ledger.get("queue-move:" + destination.move_request_id)
+            if saved is not None and isinstance(saved.reply, wire.QueueMoved):
+                undo = saved.reply
+        result = self._move_destination(request, line, undo, was_pinned=request.row_id in pins)
         if isinstance(result, wire.QueueMoved) and result.line != line:
-            group = next(member.group for member in line.members if member.row_id == request.row_id)
-            group_members = {member.row_id for member in line.members if member.group == group}
-            ranks = (gate.waiter_order(row)[1:] for _, row in rows if row.get("move_id") in group_members)
-            moved = (member.row_id for member in result.line.members if member.group == group)
-            new_ranks = dict(zip(moved, ranks, strict=True))
-            for place_key, place in self.places.items():
-                if place.move_id in new_ranks:
-                    self.places[place_key] = replace(place, move_rank=new_ranks[place.move_id])
-            for waiting in self.waiters.values():
-                row_id = waiting.row.get("move_id", "")
-                if row_id in new_ranks:
-                    waiting.row["move_rank"] = new_ranks[row_id]
+            new_places = {member.row_id: position for position, member in enumerate(result.line.members, 1)
+                          if member.row_id in pins or member.row_id == request.row_id}
+            if undo is not None and not undo.was_pinned:
+                new_places[request.row_id] = 0
+                restored = [row["move_id"] for _, row in place_dragged_waiters(baseline, new_places) if "move_id" in row]
+                if restored != [member.row_id for member in result.line.members]:
+                    new_places[request.row_id] = result.new_place
+            self._save_drag_places(new_places)
         response = self._mutation_reply(key, result)
         if isinstance(result, wire.QueueMoved):
             self.move_line = result.line
             self.next_pass = self.clock.monotonic()
         return response
 
-    def _move_destination(self, request: wire.QueueMoveRequest, line: records.QueueMoveLine
+    def _save_drag_places(self, changes: Mapping[str, int]) -> None:
+        for place_key, place in self.places.items():
+            if place.move_id in changes and place.move_place != changes[place.move_id]:
+                self.places[place_key] = replace(place, move_place=changes[place.move_id])
+        for waiting in self.waiters.values():
+            row_id = waiting.row.get("move_id", "")
+            if row_id not in changes:
+                continue
+            if position := changes[row_id]:
+                waiting.row["move_place"] = position
+            else:
+                _ = waiting.row.pop("move_place", None)
+
+    def _move_destination(self, request: wire.QueueMoveRequest, line: records.QueueMoveLine,
+                          saved: wire.QueueMoved | None, *, was_pinned: bool
                           ) -> wire.QueueMoved | wire.QueueMoveConflict:
         changed = wire.QueueMoveConflict(line, "The queue changed. Try the move again.")
         unavailable = wire.QueueMoveConflict(line, "Undo not available")
@@ -4805,37 +4878,30 @@ done
         undo = isinstance(destination, wire.QueueUndo)
         if moving is None or not moving.movable or request.revision != line.revision:
             return unavailable if undo else changed
-        group = [member.row_id for member in line.members if member.group == moving.group]
-        old_index = group.index(moving.row_id)
-        old_before, old_after = move_neighbors(group, old_index)
-        del group[old_index]
+        order = [member.row_id for member in line.members]
+        old_index = order.index(moving.row_id)
+        old_before, old_after = move_neighbors(order, old_index)
+        del order[old_index]
         if isinstance(destination, wire.QueueUndo):
-            saved = self.ledger.get("queue-move:" + destination.move_request_id)
-            reply = saved.reply if saved is not None else None
-            if (not isinstance(reply, wire.QueueMoved) or reply.row_id != moving.row_id
-                    or moving not in reply.line.members or (old_before, old_after) != (reply.new_before, reply.new_after)):
+            if (saved is None or saved.row_id != moving.row_id
+                    or (old_before, old_after) != (saved.new_before, saved.new_after)):
                 return unavailable
-            before, after = reply.old_before, reply.old_after
-            if before and before not in group or after and after not in group:
+            before, after = saved.old_before, saved.old_after
+            if before and before not in order or after and after not in order:
                 return unavailable
-            index = group.index(before) + 1 if before else 0
-            if index != (group.index(after) if after else len(group)):
+            index = order.index(before) + 1 if before else 0
+            if index != (order.index(after) if after else len(order)):
                 return unavailable
         else:
-            neighbor = by_id.get(destination.neighbor)
-            if neighbor is None or neighbor == moving:
+            if destination.neighbor not in order:
                 return changed
-            if neighbor.group != moving.group:
-                return wire.QueueMoveConflict(line, "Use /build:bump to move a unit ahead")
-            index = group.index(neighbor.row_id) + int(destination.side == "after")
-        group.insert(index, moving.row_id)
-        new_before, new_after = move_neighbors(group, index)
-        reorder = iter(group)
-        members = tuple(by_id[next(reorder)] if member.group == moving.group else member for member in line.members)
+            index = order.index(destination.neighbor) + int(destination.side == "after")
+        order.insert(index, moving.row_id)
+        new_before, new_after = move_neighbors(order, index)
+        members = tuple(by_id[row_id] for row_id in order)
         updated = line if members == line.members else records.QueueMoveLine(uuid.uuid4().hex, members)
-        old_place = line.members.index(moving) + 1
-        new_place = updated.members.index(moving) + 1
-        return wire.QueueMoved(moving.row_id, updated, old_place, new_place, old_before, old_after, new_before, new_after)
+        return wire.QueueMoved(moving.row_id, updated, old_index + 1, index + 1,
+                              old_before, old_after, new_before, new_after, was_pinned=was_pinned)
 
     def _submit_queue_change(self, request: QueueChange,
                              connection: Connection | NoConnection) -> list[wire.Reply]:

@@ -1371,7 +1371,6 @@ function placeLimitLabels() {
 window.addEventListener("resize", placeLimitLabels);
 
 const queueMovePath = "/console/builds/queue-move";
-const queueBumpTip = "Use /build:bump to move a unit ahead";
 const queueGripTip = "Drag to move. Press Space, then an arrow key. Press Enter to drop.";
 let queueAccess = null;
 let queueDrag = null;
@@ -1393,9 +1392,8 @@ function queueMessage(text, action = null) {
 function queueGrip(row, ready) {
   if (!ready || !queueAccess?.token || !row.move || row.move.movable === false) return "";
   const active = row.move.row_id === queueDrag?.row.move.row_id;
-  const title = active && queueDrag.blocked ? queueBumpTip : queueGripTip;
   return `<button type="button" class="queue-grip" data-move-id="${esc(row.move.row_id)}"
-    aria-label="Move ${esc(row.name)}" aria-pressed="${active}" title="${esc(title)}">
+    aria-label="Move ${esc(row.name)}" aria-pressed="${active}" title="${esc(queueGripTip)}">
     <svg aria-hidden="true" viewBox="0 0 24 24"><path d="M4 6h16M4 12h16M4 18h16"/></svg></button>`;
 }
 
@@ -1434,7 +1432,7 @@ function beginQueueDrag(id, pointer) {
   if (!reading.move_revision || reading.queueReady === false) return false;
   const row = reading.waiters.find(item => item.move?.row_id === id);
   if (!row || row.move.movable === false) return false;
-  queueDrag = {reading, rows:reading.waiters, row, pointer, destination:null, blocked:false};
+  queueDrag = {reading, rows:reading.waiters, row, pointer, destination:null};
   queueMessage("");
   tips.hide();
   return true;
@@ -1443,20 +1441,15 @@ function beginQueueDrag(id, pointer) {
 function previewQueueMove(neighbor) {
   const drag = queueDrag;
   if (!drag || !neighbor || neighbor === drag.row) return;
-  drag.blocked = neighbor.move.group !== drag.row.move.group;
-  if (drag.blocked) {
-    queueMessage(queueBumpTip);
-  } else {
-    const rows = drag.rows.filter(row => row.move?.group === drag.row.move.group);
-    const from = rows.indexOf(drag.row), to = rows.indexOf(neighbor);
-    rows.splice(from, 1);
-    rows.splice(to, 0, drag.row);
-    let index = 0;
-    drag.rows = drag.rows.map(row => row.move?.group === drag.row.move.group ? rows[index++] : row);
-    drag.destination = {kind:"QueueDrop", neighbor:neighbor.move.row_id, side:to < from ? "before" : "after"};
-    const place = drag.rows.slice(0, drag.rows.indexOf(drag.row) + 1).filter(row => row.kind !== "cloud").length;
-    queueMessage(drag.pointer === null ? `Place ${place}` : "");
-  }
+  const rows = drag.rows.filter(row => row.move);
+  const from = rows.indexOf(drag.row), to = rows.indexOf(neighbor);
+  rows.splice(from, 1);
+  rows.splice(to, 0, drag.row);
+  let index = 0;
+  drag.rows = drag.rows.map(row => row.move ? rows[index++] : row);
+  drag.destination = {kind:"QueueDrop", neighbor:neighbor.move.row_id, side:to < from ? "before" : "after"};
+  const place = drag.rows.slice(0, drag.rows.indexOf(drag.row) + 1).filter(row => row.kind !== "cloud").length;
+  queueMessage(drag.pointer === null ? `Place ${place}` : "");
   renderWalk({...drag.reading, waiters:drag.rows});
 }
 
@@ -1466,10 +1459,10 @@ function finishQueueDrag(commit) {
   queueDrag = null;
   const walk = $("walk");
   if (drag.pointer !== null && walk.hasPointerCapture(drag.pointer)) walk.releasePointerCapture(drag.pointer);
-  if (commit && !drag.blocked && drag.destination && drag.rows.indexOf(drag.row) !== drag.reading.waiters.indexOf(drag.row)) {
+  if (commit && drag.destination && drag.rows.indexOf(drag.row) !== drag.reading.waiters.indexOf(drag.row)) {
     void sendQueueMove(drag.row, drag.reading, drag.destination);
   } else {
-    queueMessage(drag.blocked && commit ? queueBumpTip : "");
+    queueMessage("");
     if (latest) showQueue(latest);
   }
 }
@@ -1560,9 +1553,7 @@ $("walk").addEventListener("pointermove", event => {
 });
 $("walk").addEventListener("pointerup", event => {
   if (queueDrag?.pointer !== event.pointerId) return;
-  const neighbor = queueRowAt(event);
-  if (neighbor && neighbor.move.group !== queueDrag.row.move.group) queueDrag.blocked = true;
-  finishQueueDrag(Boolean(neighbor));
+  finishQueueDrag(Boolean(queueRowAt(event)));
 });
 $("walk").addEventListener("lostpointercapture", event => {
   if (queueDrag?.pointer === event.pointerId) finishQueueDrag(false);

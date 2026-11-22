@@ -327,6 +327,7 @@ class QueueMoved:
     old_after: str
     new_before: str
     new_after: str
+    was_pinned: bool = field(default=False, kw_only=True)
 
 
 @dataclass(frozen=True)

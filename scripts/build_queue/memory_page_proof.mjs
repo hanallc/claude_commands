@@ -452,7 +452,7 @@ try {
 
       async function checkQueueDrag(navigate, evaluate, call) {
         const template = readings.spacing.waiters.find(row => row.kind !== 'cloud');
-        const units = ['admin-console', 'unit-board', 'aws', 'postmaster', 'typesafe'];
+        const units = ['natemerge', 'unit-board', 'aws', 'postmaster', 'typesafe'];
         queueFixture = {...structuredClone(readings.spacing), move_revision:'fixture',
           waiters:units.map((unit, index) => ({...template, key:unit, unit, detail:unit,
             name:queueDragProof ? 'test affected' : `${unit} test affected`, title:{unit, step:'test affected'},
@@ -495,7 +495,7 @@ try {
         await call('Input.dispatchMouseEvent',{type:'mousePressed', ...start, button:'left', buttons:1, clickCount:1});
         await call('Input.dispatchMouseEvent',{type:'mouseMoved', ...target, button:'left', buttons:1});
         const preview = await snapshot();
-        assert.deepEqual(preview.handles,['admin-console','typesafe','unit-board','aws','postmaster']);
+        assert.deepEqual(preview.handles,['natemerge','typesafe','unit-board','aws','postmaster']);
         assert.equal(preview.lifted,'typesafe');
         assert.ok(await evaluate(`(() => {
           const bounds = selector => document.querySelector(selector).getBoundingClientRect();
@@ -530,14 +530,22 @@ try {
           document.activeElement.dispatchEvent(new KeyboardEvent('keydown', {key:'ArrowUp', bubbles:true}));
           return true;
         })()`);
-        assert.equal((await snapshot()).line, 'Use /build:bump to move a unit ahead');
+        assert.equal((await snapshot()).line, 'Place 1');
+        await evaluate(`document.activeElement.dispatchEvent(new KeyboardEvent('keydown', {key:'Enter', bubbles:true}))`);
+        await waitForLine('unit-board · test affected moved from 2 to 1');
+        assert.deepEqual((await snapshot()).handles, ['unit-board', 'natemerge', 'aws', 'postmaster', 'typesafe']);
+        await evaluate("document.querySelector('#queue-action').click(); true");
+        await waitForLine('unit-board · test affected moved from 1 to 2');
         await evaluate(`(() => {
+          const button = document.querySelector('[data-move-id="unit-board"]');
+          button.focus();
+          button.dispatchEvent(new KeyboardEvent('keydown', {key:' ', bubbles:true}));
           document.activeElement.dispatchEvent(new KeyboardEvent('keydown', {key:'ArrowDown', bubbles:true}));
           document.activeElement.dispatchEvent(new KeyboardEvent('keydown', {key:'Enter', bubbles:true}));
           return true;
         })()`);
         await waitForLine('unit-board · test affected moved from 2 to 3');
-        assert.deepEqual((await snapshot()).handles, ['admin-console', 'aws', 'unit-board', 'postmaster', 'typesafe']);
+        assert.deepEqual((await snapshot()).handles, ['natemerge', 'aws', 'unit-board', 'postmaster', 'typesafe']);
         const moveStart = await grip('typesafe');
         const moveTarget = await cell('aws', 'machine');
         await call('Input.dispatchMouseEvent',{type:'mousePressed', ...moveStart, button:'left', buttons:1, clickCount:1});
@@ -556,14 +564,14 @@ try {
         assert.ok(await evaluate('queueReading(latest).move_revision !== ' + JSON.stringify(queueFixture.move_revision)));
         servedReading = queueFixture;
         await evaluate('pageRefresh.refresh(true)');
-        assert.deepEqual((await snapshot()).handles, ['admin-console', 'new-unit', 'aws', 'unit-board', 'postmaster', 'typesafe']);
+        assert.deepEqual((await snapshot()).handles, ['natemerge', 'new-unit', 'aws', 'unit-board', 'postmaster', 'typesafe']);
         const retryStart = await grip('typesafe');
         const retryTarget = await cell('new-unit', 'machine');
         await call('Input.dispatchMouseEvent',{type:'mousePressed', ...retryStart, button:'left', buttons:1, clickCount:1});
         await call('Input.dispatchMouseEvent',{type:'mouseMoved', ...retryTarget, button:'left', buttons:1});
         await call('Input.dispatchMouseEvent',{type:'mouseReleased', ...retryTarget, button:'left', buttons:0, clickCount:1});
         await waitForLine('typesafe · test affected moved from 7 to 3');
-        assert.deepEqual((await snapshot()).handles, ['admin-console', 'typesafe', 'new-unit', 'aws', 'unit-board', 'postmaster']);
+        assert.deepEqual((await snapshot()).handles, ['natemerge', 'typesafe', 'new-unit', 'aws', 'unit-board', 'postmaster']);
         assert.deepEqual(await evaluate(`['remote-start', 'typesafe'].map(key =>
           document.querySelector('tr[data-tip="wait:' + key + '"] .place').textContent)`), ['1', '3']);
         const nextStart = await grip('typesafe');
@@ -585,13 +593,13 @@ try {
           move:{row_id:'mac-only', group:'', movable:false}});
         await evaluate('pageRefresh.refresh(true)');
         const macStart = await grip('typesafe');
-        const macTarget = await cell('new-unit', 'machine');
+        const macTarget = await cell('natemerge', 'machine');
         await call('Input.dispatchMouseEvent',{type:'mousePressed', ...macStart, button:'left', buttons:1, clickCount:1});
         await call('Input.dispatchMouseEvent',{type:'mouseMoved', ...macTarget, button:'left', buttons:1});
         await call('Input.dispatchMouseEvent',{type:'mouseReleased', ...macTarget, button:'left', buttons:0, clickCount:1});
-        await waitForLine('typesafe · test affected moved from 7 to 2');
-        assert.deepEqual(await evaluate(`['typesafe', 'new-unit', 'mac-only'].map(key =>
-          document.querySelector('tr[data-tip="wait:' + key + '"] .place').textContent)`), ['2', '3', '4']);
+        await waitForLine('typesafe · test affected moved from 7 to 1');
+        assert.deepEqual(await evaluate(`['typesafe', 'natemerge', 'new-unit', 'mac-only'].map(key =>
+          document.querySelector('tr[data-tip="wait:' + key + '"] .place').textContent)`), ['1', '2', '3', '4']);
         assert.equal(await evaluate(`document.querySelector('tr[data-tip="wait:mac-only"] .machine').textContent`), 'mac');
         assert.ok(!(await snapshot()).handles.includes('mac-only'));
         assert.ok(await evaluate(`document.querySelector('.wrow[data-tip="wait:mac-only"]').textContent.includes('Newest eligible copy starts first')`));

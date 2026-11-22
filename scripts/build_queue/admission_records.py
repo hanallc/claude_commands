@@ -650,6 +650,8 @@ class Waiter(TypedDict):
     order_since: NotRequired[float]
     move_id: NotRequired[str]
     move_rank: NotRequired[WaitRank]
+    move_place: NotRequired[int]
+    queue_position: NotRequired[int]
     label: NotRequired[str]
     session_id: NotRequired[str]
     session_name: NotRequired[str]

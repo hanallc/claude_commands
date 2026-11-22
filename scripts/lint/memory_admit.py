@@ -1402,6 +1402,8 @@ def waiter_label(row: Waiter) -> str:
 
 
 def waiter_order(row: Waiter) -> tuple[int, float, int]:
+    if "queue_position" in row:
+        return -1, float(row["queue_position"]), row["pid"]
     order = records.waiter_priority(row)
     rank = order.position if isinstance(order, PriorityUnit) else sys.maxsize
     natural_place = (row.get("order_since", row["since"]), row["pid"])

@@ -2352,7 +2352,7 @@ See [Synchronous verify helpers](build-targets.md#synchronous-verify-helpers) fo
 
 ### Move a waiting step
 
-Use the three-line handle on the Builds page to move a natedev wait within its priority group.
+Use the three-line handle on the Builds page to move a natedev wait to any place in the list.
 To use the keyboard, press Space on the handle, press an arrow key, then press Enter.
 Press Escape to cancel.
 The numbers show queue positions.
@@ -2365,15 +2365,15 @@ A refresh keeps the ID.
 The service saves each moved episode's rank in `state.json`.
 The rank lasts until the command starts or the request ends.
 A remote startup timeout or an expired local claim keeps the rank while the assignment settles.
-The bumped units still have priority.
-New waits join after all current ranks in a group with manual order.
+Rows follow priority group order, with each dragged row in its saved place.
+When the queue has a dragged row, new waits join the end of their group.
 Both hosts use the visible order for normal steps.
 Only starts that the local preview selects can pass a new remote startup hold.
 The table includes remote-only waits at their rank positions.
 The table identifies waits that a build hold blocks.
 Speculative Mac copy rows show the newest-first rule.
 A refusal before launch keeps the rank and any active local startup claim.
-Use `/build:bump` to change priority between groups.
+Use `/build:bump` to change the order of the groups.
 
 The service checks the current order revision before it commits a move.
 Its replay ledger records the reply with the new order.
