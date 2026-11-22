@@ -251,7 +251,9 @@ class ClaimOwnerRecord(TypedDict):
 
 
 class ProcessBoundClaim(ClaimOwnerRecord):
-    """The claim holds Mac capacity while its process lives."""
+    """The local process holds capacity until it releases the claim or ends."""
+
+    wait_released: NotRequired[Literal[True]]
 
 
 class ReplacedMacReservation(TypedDict):
@@ -548,7 +550,7 @@ def read_retired_mac_reservation(
     if values is None:
         return NO_SAVED_RETRY_PERMISSION
     record = decode_run(values, path)
-    if "remote_host" in record or claim_identity(record) != identity:
+    if "remote_host" in record or "wait_released" in record or claim_identity(record) != identity:
         return NO_SAVED_RETRY_PERMISSION
     reservation = (paths.directory / reservation_file(values, "reservation_file", path)
                    if "reservation_file" in values else UnrecordedReservationPath())
@@ -591,7 +593,7 @@ def retire_replaced_reservation(paths: StatePaths, replacement: Path, record: Ru
             or replaced_reservation(old, path, paths) != replaced):
         return ()
     try:
-        if allow_retry:
+        if allow_retry and "wait_released" not in old:
             proof = retired_mac_reservation_path(paths, claim_identity(old))
             proof.parent.mkdir(parents=True, exist_ok=True)
             # Keep the reservation identity if the writer stops before the replacement commits.
@@ -771,6 +773,10 @@ def decode_run(values: dict[str, object], path: Path) -> RunRecord:
             raise StateReadError(f"{path} has a mismatched Mac repository identity")
         record["mac_repository"] = saved.record()
     if "remote_host" not in values:
+        if "wait_released" in values:
+            if values["wait_released"] is not True:
+                raise StateReadError(f"{path} has an invalid wait_released flag")
+            record["wait_released"] = True
         return record
     host = values["remote_host"]
     if not isinstance(host, str) or not host.strip():
@@ -910,6 +916,13 @@ def read_wait_reservations(
         record = decode_run(values, path)
         assert "remote_host" not in record
         yield path, record
+
+
+def mark_wait_released(path: Path) -> None:
+    """Record release of the exact local reservation under the provider lock."""
+    values = read_json_object(path)
+    if values is not None:
+        write_text_atomic(path, json.dumps({**values, "wait_released": True}) + "\n")
 
 
 def read_claims(paths: StatePaths) -> tuple[HeldClaim, ...]:

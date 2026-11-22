@@ -936,6 +936,7 @@ def wait_claim_identity(paths: mac_test.StatePaths, repo_root: str, pid: int, *,
         block = mac_test.blocking_claim_block(paths, session)
         claims = [claim for claim in mac_test.read_claims(paths)
                   if claim.record["pid"] == pid and claim.record["proc_start"] == start.start
+                  and "wait_released" not in claim.record
                   and claim.record["submitting_session"] == claim_state.session_id(session)
                   and ("remote_host" not in claim.record or claim.record.get("cleanup_pending"))
                   and (isinstance(block, mac_test.NoMacBlock) or "remote_host" in claim.record)]
@@ -1104,6 +1105,7 @@ def reserve_assigned(args: CliArguments) -> int:
                             and mac_test.cleanup_claim_matches(paths, held, scope)))
                         if paths.platform == "macos" else held.scope == scope)
                     and held.record["pid"] == args.pid
+                    and "wait_released" not in held.record
                     and owner == process_start.Started(held.record["proc_start"])
                     and held.record["submitting_session"] == claim_state.session_id(assignment.session)
                     and ((args.recover_only and claim_state.claim_identity(held.record) == expected)
@@ -1264,10 +1266,13 @@ def command_release_wait(pid: int, *,
                         # An interrupted retirement can leave both the proof and the original reservation.
                         release_start = retired.proc_start
                         reservation = retired.reservation
-                if release_start is not None:
+                if release_start is not None or (paths.platform == "macos" and isinstance(start, process_identity.Unreadable)):
                     for path, record in claim_state.read_wait_reservations(paths, identity, reservation):
-                        if (record["pid"] == pid and record["proc_start"] == release_start
-                                and record["submitting_session"] == session_id):
+                        if record["pid"] != pid or record["submitting_session"] != session_id:
+                            continue
+                        if release_start is None:
+                            claim_state.mark_wait_released(path)
+                        elif record["proc_start"] == release_start:
                             if claim_state.claim_pending_start(paths, path, record).exists():
                                 fenced.append(record)
                             else:

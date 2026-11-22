@@ -678,7 +678,10 @@ def message_time(instant: datetime) -> str:
 
 
 def run_is_live(run: RunRecord) -> bool:
-    return "remote_host" in run or process_identity.process_start(run["pid"]) == process_identity.Started(run["proc_start"])
+    if "remote_host" in run:
+        return True
+    return ("wait_released" not in run
+            and process_identity.process_start(run["pid"]) == process_identity.Started(run["proc_start"]))
 
 
 def claim_owner(run: RunRecord) -> tuple[claim_state.ClaimIdentity, int, str, str]:
@@ -706,7 +709,7 @@ def copy_gives_way(run: RunRecord) -> bool:
 
     A kept copy claim holds leftovers like any other kept claim and never gives way.
     """
-    return ("replaced_reservation" not in run and run.get("copy") is True
+    return ("replaced_reservation" not in run and "wait_released" not in run and run.get("copy") is True
             and process_identity.process_start(run["pid"]) == process_identity.Started(run["proc_start"]))
 
 
@@ -2270,6 +2273,8 @@ def adopt_wait_claim(args: CliArguments, paths: StatePaths, scope: ClaimScope,
     if len(owners) != 1:
         return refuse_wait_claim(WaitClaimCheck.RESERVATION_COUNT)
     claim = owners[0]
+    if "wait_released" in claim.record:
+        return refuse_wait_claim(WaitClaimCheck.NO_RESERVATION)
     saved = claim_state.saved_mac_repository(claim.record)
     if args.retire_wait and (paths.platform != "macos" or "remote_host" in claim.record
                              or isinstance(saved, claim_state.MacRepositoryIdentity)):
