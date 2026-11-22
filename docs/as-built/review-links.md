@@ -2202,3 +2202,21 @@ The shared script uses the clipboard API when available.
 Plain HTTP pages use a temporary textarea and `execCommand('copy')` when the clipboard API is absent.
 The fallback restores focus and the previous selection.
 One document listener also handles code blocks from page updates.
+
+### Builds queue moves
+
+The Builds page requests a token with `GET /console/builds/queue-move`.
+Move and Kill requests use the shared `builds_operator(peer)` check.
+The check uses the TCP peer and rejects tagged nodes.
+By default, the operator is the owner of the untagged local Tailscale node.
+The console also checks the Tailscale address and Host.
+The JSON POST requires the same Origin and a console token.
+The console limits the request size and time with `build_queue.conf`.
+
+A drop and an Undo each send a request ID, a wait ID, and an order revision.
+A drop also sends a head destination or a neighbor and side.
+An Undo sends the original move ID in addition to the common fields.
+The admission service restores the anchor it saved for that move.
+The console and the admission socket reject fields outside the request type.
+The admission service commits the move on its loop and replays the reply for a repeated request ID.
+The console returns HTTP 409 with the current order when it detects a conflict.
