@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Literal
 
 from scripts.build_queue import execution_identity
+from scripts.lib.build_steps import MAC_LINUX_NO_ANSWER
 from scripts.build_hold.owning_session import NoOwningSession, OwningSession
 from scripts.mac_test.claim_state import ClaimScope
 
@@ -524,7 +525,9 @@ def retry_decision(destination: PlacementDestination, reason: str | execution_id
         return DoNotRetry(reason)
     if reason in SETTINGS_REFUSAL_REASONS or reason in ("no_tests", "linux_only", "local_flag", "command"):
         return DoNotRetry(reason)
-    delay = 180 if destination.provider == "mac" and reason not in ("busy", "blocked", "disk") else 0
+    # A Mac Linux guest that took no run waits like a Mac decline, so the retry goes to another machine first.
+    remote_decline = destination.provider == "mac" or reason == MAC_LINUX_NO_ANSWER
+    delay = 180 if remote_decline and reason not in ("busy", "blocked", "disk") else 0
     return RetryAt(now + delay)
 
 

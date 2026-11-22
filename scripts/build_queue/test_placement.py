@@ -21,6 +21,7 @@ from unittest import mock
 from typing import TextIO, cast, override
 
 from scripts.build_queue import execution_identity
+from scripts.lib.build_steps import MAC_LINUX_NO_ANSWER
 from scripts.aws_target import hana_placement as hana
 from scripts.build_hold.owning_session import NoOwningSession, OwningSession
 from scripts.build_queue import admission_protocol as wire, admission_records as records, admission_service as service, placement
@@ -1290,6 +1291,12 @@ class PlacementTests(unittest.TestCase):
                 replacement_claim = adopt_assignment(fixture, request, replacement)
                 self.assertIsInstance(fixture.connect(consume_permission(
                     "replacement-launch", replacement, replacement_claim)).replies()[-1], wire.FirstAuthorization)
+
+    def test_a_mac_linux_guest_that_took_no_run_waits_before_the_same_guest_again(self) -> None:
+        guest = placement.PlacementDestination("ssh", "mac-linux", "fixture-guest", FIXTURE_MAC_SCOPE)
+        local = placement.PlacementDestination("local", "natedev", "natedev", FIXTURE_MAC_SCOPE)
+        self.assertEqual(placement.retry_decision(guest, MAC_LINUX_NO_ANSWER, 10.0), placement.RetryAt(190.0))
+        self.assertEqual(placement.retry_decision(local, "busy", 10.0), placement.RetryAt(10.0))
 
     def test_settings_refusals_retry_after_the_provider_settings_change(self) -> None:
         for reason in ("off", "repo", "command"):
