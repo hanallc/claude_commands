@@ -13,6 +13,7 @@ import sys
 import tempfile
 import unittest
 from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 from threading import Event, current_thread
@@ -34,12 +35,12 @@ ACTIVE: dict[str, object] = {"kind": "active", "active_phase_reservation": {
     "reservation_id": "r1", "coordination_run_id": "c1", "phase": "34h", "phase_start_head": "a" * 40}}
 
 
-def record_unit(test: unittest.TestCase, run: Path, home: Path, phase: str) -> None:
+def record_unit(test: unittest.TestCase, run: Path, home: Path, phase: str, *, name: str = "reservation") -> None:
     """Record a private unit and its durable run owner."""
     _ = test.enterContext(isolated_staff_file(run / "staff.json", {}))
     _ = (run / "staff.json").write_text(json.dumps({"schema": 2, "rows": []}))
     owner = fixture_member("showrunner", name="reservation")
-    row = fixture_unit_location(owner, "reservation", home)
+    row = fixture_unit_location(owner, name, home)
     _ = (run / plan_history.STATE_FILENAME).write_text(json.dumps({
         "owner_staff_id": row.id, "open_phases": [{"id": phase, "status": "active"}]}))
 
@@ -129,6 +130,27 @@ class WorktreeAttributionTests(unittest.TestCase):
         directory = phase_reservation.phase_directory(self.session, "2")
         self.assertEqual(self.claim("2", self.second), (0, ""))
         self.assertEqual((directory / phase_reservation.WORKTREE_FILE).read_text(), str(self.second) + "\n")
+
+    def test_claim_uses_the_unit_word_from_completed_records(self) -> None:
+        main = self.session.parent / ".claude"
+        _ = subprocess.run(["git", "clone", "-q", str(self.first), str(main)], check=True, capture_output=True,
+                           timeout=TEST_HANG_GUARD_SECS)
+        _ = subprocess.run(["git", "-C", str(main), "remote", "set-url", "origin",
+                            str(main.parent / "claude_commands.git")], check=True, capture_output=True,
+                           timeout=TEST_HANG_GUARD_SECS)
+        record_unit(self, self.session, main, "1", name="board")
+        source = worktrees.FrozenWorktreeSource(main, phase_reservation.commit_id(main, "HEAD"))
+        _ = (worktrees.state_folder() / "invalid.json").write_text("{")
+        owned = worktrees.make("claude", "natedev-board", "owned", source)
+        ownerless = worktrees.make("claude", "natedev-board", "ownerless", source)
+        foreign = worktrees.make("claude", "natedev-other", "foreign", source)
+        for checkout, owner in ((owned, "board"), (ownerless, ""), (foreign, "other")):
+            record = worktrees.read_record(worktrees.record_file(checkout))
+            worktrees.write_record(replace(record, owner=owner))
+
+        self.assertEqual(self.claim("2", owned), (0, ""))
+        self.assertEqual(self.claim("3", ownerless), (0, ""))
+        self.assert_model_worktree_refused("4", foreign, "the checkout is for unit 'natedev-other'")
 
     def test_claim_refuses_a_clone_outside_the_model(self) -> None:
         clone = self.session.parent / "scratch" / "fixture" / "reservation" / "p3"
