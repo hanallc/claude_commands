@@ -774,6 +774,29 @@ def _reading_values_fingerprint() -> str:
     return hashlib.sha256(json.dumps(values, sort_keys=True).encode()).hexdigest()
 
 
+def _latest_claude_requests(entries: list[moves.MoveEntry]) -> dict[str, tuple[datetime, moves.RequestedMove]]:
+    latest: dict[str, tuple[datetime, moves.RequestedMove]] = {}
+    for entry in entries:
+        if entry["kind"] != "requested" or entry["tool"] != "claude":
+            continue
+        identity = entry["subject"].split(": ", 1)[0]
+        at = datetime.fromisoformat(entry["at"])
+        previous = latest.get(identity)
+        if previous is None or at >= previous[0]:
+            latest[identity] = at, entry
+    return latest
+
+
+def _newer_by_hand_move(latest: tuple[datetime, moves.RequestedMove] | None,
+                       target: str, selected_at: datetime | None) -> bool:
+    if latest is None:
+        return False
+    at, request = latest
+    destination = request["to"]
+    return (request.get("cause") == "by hand" and isinstance(destination, str) and destination != target
+            and (selected_at is None or at > selected_at))
+
+
 def _run(now: datetime, dry_run: bool, proof_group: frozenset[str] = NO_SESSION_FILTER, *,
          refresh_usage: Callable[[], None] = lambda: None, account_config: conf.ConfigRead | accounts.ReadCurrentAccountSettings = accounts.CURRENT_ACCOUNT_SETTINGS) -> list[str]:
     account_config = accounts.read_account_settings(account_config)
@@ -1047,8 +1070,7 @@ def _run(now: datetime, dry_run: bool, proof_group: frozenset[str] = NO_SESSION_
                 _set_transition(state, session["session_id"], refusal.entry_id, "group selected", "")
             # The chosen group account survives a member's failed request or interrupted delivery.
             _save_state(state)
-            batches[transition.move_id] = [session.session_id for session in all_members[group_name]
-                                           if not accounts.session_on_account(session, chosen.label)]
+            batches[transition.move_id] = [session.session_id for session in all_members[group_name]]
         else:
             for identity, refusal in by_id.items():
                 prior = state["sessions"].get(identity)
@@ -1061,11 +1083,11 @@ def _run(now: datetime, dry_run: bool, proof_group: frozenset[str] = NO_SESSION_
             # The decision survives an interruption before a move returns.
             _save_state(state)
         for decision, members in batches.items():
-            available = _available_members(tuple(members))
+            available = _available_members(tuple(members)) if group_name == "ungrouped" else tuple(members)
             intent = (moves.ExplicitMoveTarget.REQUESTED_ACCOUNT if group_name == "ungrouped"
                       else moves.FollowGroupAccount(group_name))
             outcomes = accounts.move_sessions(available, chosen.label, why=why, cause="refusal",
-                                              batch_id=decision, intent=intent) if available else ()
+                                              intent=intent) if available else ()
             for outcome in outcomes:
                 lines.append(accounts.move_result_line(outcome))
                 if (refusal := by_id.get(outcome.session_id)) is None:
@@ -1110,6 +1132,7 @@ def _run(now: datetime, dry_run: bool, proof_group: frozenset[str] = NO_SESSION_
         else:
             needs_completion = False
         if needs_completion:
+            latest_requests = None
             with herdr.process_action():
                 all_members = accounts.live_group_members()
                 for group_name in accounts.CLAUDE_GROUPS:
@@ -1123,6 +1146,15 @@ def _run(now: datetime, dry_run: bool, proof_group: frozenset[str] = NO_SESSION_
                     members = [session for session in members if session.session_id in available]
                     if not members:
                         continue
+                    if latest_requests is None:
+                        # A move can reach its target after the first journal read.
+                        latest_requests = _latest_claude_requests(moves.read_moves())
+                    transition = accounts.group_transition(group_name)
+                    selected_at = transition.at if isinstance(transition, accounts.GroupTransition) else None
+                    members = [session for session in members if not _newer_by_hand_move(
+                        latest_requests.get(session.session_id), target, selected_at)]
+                    if not members:
+                        continue
                     directory = accounts.claude_account_dir(target)
                     login = accounts.claude_login(directory)
                     held = refusals.load().get(refusals.key("claude", login))
@@ -1132,14 +1164,13 @@ def _run(now: datetime, dry_run: bool, proof_group: frozenset[str] = NO_SESSION_
                     if dry_run:
                         lines.extend(accounts.move_preview_line(session, target) for session in members)
                     else:
-                        transition = accounts.group_transition(group_name)
-                        if isinstance(transition, accounts.NoGroupTransition):
-                            transition = accounts.set_group_account(group_name, target, why=f"complete {group_name} move to {target}", now=now)
                         why = f"complete {group_name} move to {target}"
+                        if isinstance(transition, accounts.NoGroupTransition):
+                            transition = accounts.set_group_account(group_name, target, why=why, now=now)
                         if isinstance(transition.origin, accounts.AutoOrigin):
                             why = transition.why.text if isinstance(transition.why, accounts.RecordedTransitionReason) else ""
                         outcomes = accounts.move_sessions(tuple(session.session_id for session in members), target, why=why,
-                            cause=accounts.move_origin_fields(transition.origin)["cause"], batch_id=transition.move_id,
+                            cause=accounts.move_origin_fields(transition.origin)["cause"],
                             intent=moves.FollowGroupAccount(group_name))
                         lines.extend(accounts.move_result_line(outcome) for outcome in outcomes)
     if not dry_run and state != original_state:
@@ -1351,7 +1382,7 @@ def _run_auto_moves_locked(now: datetime, *, dry_run: bool = False,
             lines.append(_record_blocked_head(state, rule, TargetPreparationRefused(sign_in.reason), checked_at, dry_run))
             continue
         rule = chosen
-        transition = accounts.set_group_account(rule.group, rule.to, why=why, now=now, origin=accounts.AutoOrigin())
+        _ = accounts.set_group_account(rule.group, rule.to, why=why, now=now, origin=accounts.AutoOrigin())
         _ = notices.pop(rule.entry_id, None)
         lines.append(f"{rule.group}: {why}; move from {selection.account} to {rule.to}")
         moved.add(rule.group)
@@ -1359,10 +1390,8 @@ def _run_auto_moves_locked(now: datetime, *, dry_run: bool = False,
         # Remove the entry after the role writer records the selection.
         _remove_auto_move_entries(frozenset({rule.entry_id}))
         _save_state(state)
-        ids = tuple(member.session_id for member in members.get(rule.group, ())
-                    if not accounts.session_on_account(member, rule.to))
-        ids = _available_members(ids)
-        outcomes = accounts.move_sessions(ids, rule.to, why=why, cause="auto", batch_id=transition.move_id,
+        ids = tuple(member.session_id for member in members.get(rule.group, ()))
+        outcomes = accounts.move_sessions(ids, rule.to, why=why, cause="auto",
                                          intent=moves.FollowGroupAccount(rule.group)) if ids else ()
         lines.extend(accounts.move_result_line(outcome) for outcome in outcomes)
     if not dry_run and state != original:

@@ -298,7 +298,7 @@ memory_thread = None
 cpu_started = None
 try:
     repo = root / 'repo'
-    from scripts.production import merge_gate
+    from scripts.production import gate as gate_runner
     from scripts.lib import cancellation
     timings = {}
     if 'module_seconds' in links:
@@ -316,15 +316,15 @@ try:
         cpu_started = busy_cpu_seconds()
         result['gate_started_at'] = time.time()
         if links.get('production'):
-            gate = merge_gate.run_suites(repo, full=gate_request.get('full', False), machine=merge_gate.WholeMachine(timings),
-                                        time_limit=(merge_gate.gate_record.GateTimeLimit(float(links['gate_time_limit_s']))
+            gate = gate_runner.run_suites(repo, full=gate_request.get('full', False), machine=gate_runner.WholeMachine(timings),
+                                        time_limit=(gate_runner.gate_record.GateTimeLimit(float(links['gate_time_limit_s']))
                                                     if float(links.get('gate_time_limit_s', 0)) > 0 else
-                                                    merge_gate.gate_record.NoGateTimeLimit('no passing history on the controller')),
+                                                    gate_runner.gate_record.NoGateTimeLimit('no passing history on the controller')),
                                         module_time_limit_s=links['module_time_limit_s'],
-                                        selected=merge_gate.SelectedModules(tuple(gate_request['modules'])),
-                                        mode=merge_gate.SuiteMode(links['mode']))
+                                        selected=gate_runner.SelectedModules(tuple(gate_request['modules'])),
+                                        mode=gate_runner.SuiteMode(links['mode']))
         else:
-            gate = merge_gate.run_suites(repo, full=True, machine=merge_gate.WholeMachine(timings),
+            gate = gate_runner.run_suites(repo, full=True, machine=gate_runner.WholeMachine(timings),
                                         module_time_limit_s=links['module_time_limit_s'])
         if links.get('production'):
             result['record'] = completion_record(gate, links['attempt'], links['commit'], links['tree'], os.uname().nodename,

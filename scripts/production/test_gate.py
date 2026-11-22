@@ -15,13 +15,18 @@ import io
 import os
 from pathlib import Path
 import re
+import signal
 import sqlite3
+import subprocess
 import tempfile
 from typing import cast, final, override
 from contextlib import AbstractContextManager, redirect_stdout
 from datetime import UTC, datetime, tzinfo
 from unittest import mock
+from scripts.direct.wait_for_test_state import wait_until
 from scripts.lib import scratch
+from scripts.lib.process_start import Gone
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.production import change_review, gate, staff
 from scripts.production.gate_modules import GateRefused
@@ -277,6 +282,49 @@ class MergeGateCheckpointTests(MergeGateFixture):
         timings = gate.read_measures(self.state / "runner" / "module_seconds.json")
         self.assertEqual(set(timings), {"hooks/test_first.py", "hooks/tests/test_first.py"})
         self.assertEqual(self.pass_records()[0]["suites"], ["hooks"])
+
+    def test_gate_uses_configured_root_when_module_folder_is_missing(self) -> None:
+        gate_root = self.fixture_root.parent
+        missing = gate_root / "missing-module"
+        with (mock.patch.dict(self.environment, {gate.GATE_MODULE_TEMP_DIR: str(missing)}),
+              mock.patch.object(gate, "gate_temporary", wraps=gate.gate_temporary) as allocate):
+            result = self.run_gate("--tests-only", "--module", "hooks/test_first.py")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        allocate.assert_called_once_with(mock.ANY, "g", gate_root)
+        self.assert_all_modules_started()
+
+    @gate_suites("hooks", "message")
+    def test_gate_and_affected_module_folders_leave_room_for_unix_sockets(self) -> None:
+        prepare = gate.test_module_environment
+        gate_root = self.fixture_root.parent
+        legacy_run = Path("test-runs/test-run-abcdefgh")
+        inherited_run = gate_root / legacy_run
+        inherited_run.mkdir(parents=True)
+        deep_tmpdir = gate_root / "gate-invocation-abcdefghijklmnopqrstuvwxyz"
+        deep_tmpdir.mkdir()
+        sockets = (Path(".com.google.Chrome.123456/SingletonSocket"),
+                   Path("style-socket-abcdefgh/outside.sock"))
+        for flag in ("--tests-only", "--affected"):
+            for inherited in (gate_root, inherited_run, deep_tmpdir):
+                with self.subTest(mode=flag, inherited=inherited):
+                    job_folders: list[Path] = []
+
+                    def prepare_module(root: Path, environment: dict[str, str]) -> dict[str, str]:
+                        job_folders.append(root)
+                        return prepare(root, environment)
+
+                    with (mock.patch.dict(self.environment, {"TMPDIR": str(inherited)}),
+                          mock.patch.object(gate, "test_module_environment", side_effect=prepare_module)):
+                        result = self.run_gate(flag, "--module", "hooks/test_first.py", "--module", "message/test_first.py")
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertCountEqual([root.name for root in job_folders], ["m0001", "m0002"])
+                    for root in job_folders:
+                        self.assertEqual(root.parent.parent, gate_root)
+                        relative = root.relative_to(gate_root)
+                        for platform_root, limit in ((Path("/dev/shm"), 108), (Path("/private/tmp"), 104)):
+                            for suffix in sockets:
+                                socket_path = platform_root / relative / legacy_run / suffix
+                                self.assertLessEqual(len(os.fsencode(socket_path)) + 1, limit, str(socket_path))
 
     def test_folders_without_test_modules_and_cached_files_are_not_suites(self) -> None:
         scripts = self.checkout / "scripts"
@@ -576,6 +624,79 @@ class MergeGateCheckpointTests(MergeGateFixture):
         self.assertEqual(code, 0, output.getvalue())
         self.assertIn("style sync: invalid production", output.getvalue())
         self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), self.git(self.origin, "rev-parse", "integration"))
+
+
+@final
+class GateRecoveryTests(MergeGateFixture):
+    def test_recovery_skips_record_removed_during_owner_check(self) -> None:
+        directory = self.root / "recovery"
+        directory.mkdir()
+        pool = self.root / "tokens"
+        os.mkfifo(pool)
+        descriptor = os.open(pool, os.O_RDWR | os.O_NONBLOCK)
+        self.addCleanup(os.close, descriptor)
+        status = os.fstat(descriptor)
+        token = gate.HeldGateToken(str(pool), status.st_dev, status.st_ino, b"t".hex())
+        recovery = gate.GateRecovery(directory / "owner.json", str(self.checkout), 5_000_001, "owner",
+                                     tokens=[token])
+        recovery.save()
+
+        def finish_owner(_pid: int) -> Gone:
+            _ = os.write(descriptor, b"t")
+            recovery.finish()
+            return Gone()
+
+        with (mock.patch.object(gate, "process_start", side_effect=finish_owner) as read_start,
+              mock.patch.dict(os.environ, self.environment)):
+            gate.recover_gate_directory(directory, own_directory=directory)
+
+        read_start.assert_called_once_with(recovery.pid)
+        self.assertFalse(recovery.path.exists())
+        self.assertEqual(os.read(descriptor, 2), b"t")
+
+    def test_tests_only_sigterm_closes_the_active_record(self) -> None:
+        self.write(self.state / "hold-module", "hold")
+        ready = self.state / "module-held"
+        with mock.patch.dict(os.environ, self.environment):
+            records = gate.gate_run_directory(self.checkout)
+        command = [*self.gate_command(), "--tests-only", "--repo", str(self.checkout),
+                   "--module", "hooks/test_first.py"]
+        with subprocess.Popen(command, cwd=self.root, env=self.environment, stdin=subprocess.DEVNULL,
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) as process:
+            try:
+                wait_until(lambda: ready.exists() or process.poll() is not None, self.state, processes=(process,))
+                self.assertTrue(ready.is_file())
+                self.assertEqual(len(list(records.glob(f"{process.pid}-*.json"))), 1)
+                process.send_signal(signal.SIGTERM)
+                output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
+                self.assertEqual(process.returncode, -signal.SIGTERM, output + errors)
+                self.assertEqual(list(records.glob("*.json")), [])
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                    _ = process.communicate(timeout=TEST_HANG_GUARD_SECS)
+
+    def test_tests_only_recovers_unfinished_record_and_keeps_finished_record(self) -> None:
+        with mock.patch.dict(os.environ, self.environment):
+            directory = gate.gate_run_directory(self.checkout)
+        directory.mkdir(parents=True)
+        unfinished = gate.GateRecovery(directory / "unfinished.json", str(self.checkout), 5_000_001, "dead-owner")
+        unfinished.save()
+        folder = self.root / "retained"
+        canary = folder / "canary"
+        self.write(canary, "fixture data")
+        finished = gate.GateRecovery(directory / "finished.json", str(self.checkout), 5_000_002, "dead-owner",
+                                     folders=[str(folder)], finished=True)
+        finished.save()
+        saved = finished.path.read_text()
+
+        result = self.run_gate("--tests-only", "--module", "hooks/test_first.py")
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(list(directory.glob("*.json")), [finished.path])
+        self.assertEqual(finished.path.read_text(), saved)
+        self.assertEqual(canary.read_text(), "fixture data")
+        self.assertNotIn(str(folder), result.stderr)
 
 
 if __name__ == "__main__":

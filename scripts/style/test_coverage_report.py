@@ -207,6 +207,16 @@ class CoverageReportTests(unittest.TestCase):
             _ = unit_membership("sample-style", unit)
 
 
+    def test_report_skips_both_style_branch_names_without_a_registration(self) -> None:
+        _ = self.git("branch", "style/main")
+        _ = self.git("branch", "sample-style-worktree")
+        self.sync(style_branch="sample-style-worktree")
+
+        self.assertIn(f"synced main {self.tip[:7]}", self.report().stdout)
+
+        _ = self.git("branch", "-m", "main", "z-parent")
+        self.assertIn(f"synced z-parent {self.tip[:7]}", self.report().stdout)
+
     def test_report_reads_configured_units_without_a_family_suffix(self) -> None:
         self.sync()
         with style_ledger.open_ledger(self.repo) as ledger:

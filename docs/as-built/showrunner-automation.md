@@ -332,19 +332,15 @@ Each local Promote checkout must exist before the command pushes.
      A command that the base does not select, such as a package the checkpoint adds or renames, stays the unit's red without a run.
      A command that cannot start on the base, and a main conflict, also leave the red with the unit.
      A resumed merge whose restored tip already holds the checkpoint runs no base check.
-     A batch runs the base check before its bisect. A base red holds every item, and the bisect runs only the units' own red names.
+     A batch stops at its first red test step and returns every row with the failed step and the row's test selection.
   9. *push and promote*: `tested_main_push` acquires `main_push_lock` and fetches main after tests.
      It publishes only when the tested tip contains main.
      Otherwise, it keeps the lock, merges main, retests the new paths, and tries again.
      The first test run is outside this lock. Retests run inside it, so main cannot move under a tested tip.
      `push_git` pushes without another merge.
      A main conflict aborts the merge and reports `push: held` with the conflicting paths.
-     Before publication, a held batch checks each checkpoint against the same main commit with `git merge-tree --write-tree`.
-     Only conflicting items receive their conflict files and instructions to merge `origin/main` into their own unit branch.
-     The batch removes those items and their unit's later items, restores the starting tip, and retries the remaining items.
-     Clean items can land in the same run.
-     If every item is clean, the combined merge conflict keeps the batch held.
-     Each notice then says the checkpoint is clean against main and can land alone.
+     A conflict with main ends a batch and sends the conflicting paths to every requester.
+     The next queued item can proceed.
      Preparation failure restores the tip before this run when origin still has its old tip.
      An interrupted promotion and a child handoff use the same test loop.
      Each caller retains its own rollback rule for a failed push.
@@ -1147,17 +1143,6 @@ An unstaffed session requires an explicit native id and an explicit unit name.
     Zero recent builds gives `no ETA: nothing built in 24 h`.
     Numbers use thousands commas; times and the date use the production zone.
   - **Style reads and tests:** `unit_phases.main` passes each unit's staff worktree to `style_ledger.ledger_location`. A missing plan folder does not affect this lookup. A worktree that cannot be resolved supplies no ledger data for that row. It passes the explicit unit-to-database map to the renderer even when phase records are unavailable. One read-only SQLite connection serves each distinct database; missing databases or tables supply no data. No ledger lock or migration runs. The command overlaps independent reads. `display_cells.py` owns the shared step and escaping helpers used by both tables. `style_units.table` requires the keyword argument `ledger_paths` (unit id to database path); it never reads ledger paths from phase records. It also accepts `now`, `zone`, and `decision_folder` for fixed test inputs. Relative proposal paths use that folder; absolute paths stay absolute.
-
-- **A unit's newest run.** `unit_run.py --production <showrunner name> <unit>` prints the run id, machine, and UTC start.
-  Staff supplies the current unit folder.
-  Each candidate `run_started` event resolves its owner through staff before the reader compares that folder.
-  The newest numeric start wins; sorted file order settles equal starts.
-  Invalid or unreadable files are skipped.
-  The scan stops after the first valid run-start event in each file.
-  `--root` selects the history root, then `UNIT_HISTORY_DIR`, then the configured history default.
-  With no local match, the reader queries the Mac unless `--no-mac` is present.
-  An unavailable Mac prints its cause.
-  No matching run exits 1 with the unit and folder in the diagnostic.
 
 - **Open proposals table (`proposals_table.py [--production <showrunner name>]`, `/showrunner:proposals`, user 2026-10-12).** Prints one Markdown table, `| Proposed by | Proposal | Date | State |`, of every proposal still open for the user. It reads only, and finds the doc as the units table does. Three sources, in this order:
   - **Issues** (2026-10-15, replacing the `proposals/index.md` table and the `docs/plans/proposal-*.md` scan): each `*.md` directly in the issues folder that the optional `- **Proposals:**` line names, of the production doc only (`proposals_folder.scope_docs`; the productions below list their own, user 2026-10-27), a file read once (`issues_folder`; a relative folder is taken from the showrunner checkout; without the line there are no issue rows). Subfolders hold research notes and are not read. `issues.py` reads the frontmatter between the leading `---` lines, a list inline (`[issue, proposal]`) or as `- item` lines, and strips quotes and a wiki link's brackets, keeping its alias over its target (`"[[2026-10-09]]"` reads `2026-10-09`). A row shows while `status` is `open` and `tags` holds `proposal`; rows sort by `date_created`. Proposed by is `proposed_by`, else `—`; the Proposal is the file's name; the Date is `date_created`.

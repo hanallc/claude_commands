@@ -2294,6 +2294,7 @@ class GroupTransition:
     move_id: str
     origin: MoveOrigin
     why: TransitionReason = field(default_factory=UnavailableTransitionReason)
+    at: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -2345,7 +2346,8 @@ def group_transition(group: ClaudeGroup) -> GroupTransition | NoGroupTransition:
         origin = RefusalOrigin(selection["window"], reset)
     elif selection["cause"] == "auto":
         origin = AutoOrigin()
-    return GroupTransition(selection["move_id"], origin, role_map.selection_reason(selection))
+    at = datetime.fromisoformat(selection["at"]) if "at" in selection else None
+    return GroupTransition(selection["move_id"], origin, role_map.selection_reason(selection), at)
 
 
 def session_group(session: Session | ListedSession) -> ClaudeGroup | Literal["ungrouped"]:
@@ -2633,7 +2635,7 @@ def set_group_account(group: ClaudeGroup, label: str, *, why: str,
         selection["reset"] = fields["reset"]
     write_role_map(RoleMapChange(group, label, why, at.isoformat(), selection["move_id"],
         fields["cause"], fields["window"], fields.get("reset", "")))
-    return GroupTransition(selection["move_id"], origin, RecordedTransitionReason(why))
+    return GroupTransition(selection["move_id"], origin, RecordedTransitionReason(why), at)
 
 
 def placement_report(now: datetime | AccountDecisionNow = ACCOUNT_DECISION_NOW, *, account_config: conf.ConfigRead | ReadCurrentAccountSettings = CURRENT_ACCOUNT_SETTINGS) -> str:
@@ -2966,13 +2968,13 @@ class AccountPaneReader(Protocol):
 
 class SessionBatchMove(Protocol):
     def __call__(self, sessions: list[str], target: str, *, why: str, cause: moves.MoveCause,
-                 source_accounts: Mapping[str, str], batch_id: str = "",
+                 source_accounts: Mapping[str, str],
                  intent: moves.FollowGroupAccount | moves.ExplicitMoveTarget =
                  moves.ExplicitMoveTarget.REQUESTED_ACCOUNT,
                  staff_members: Collection[staff.StaffId] = ()) -> list[stop_results.MoveResult]: ...
 
 
-def move_sessions(ids: tuple[str, ...], target: str, *, why: str, cause: moves.MoveCause = "by hand", live: Sequence[ListedSession] | None = None, account_config: conf.ConfigRead | ReadCurrentAccountSettings = CURRENT_ACCOUNT_SETTINGS, batch_id: str = "",
+def move_sessions(ids: tuple[str, ...], target: str, *, why: str, cause: moves.MoveCause = "by hand", live: Sequence[ListedSession] | None = None, account_config: conf.ConfigRead | ReadCurrentAccountSettings = CURRENT_ACCOUNT_SETTINGS,
                   intent: moves.FollowGroupAccount | moves.ExplicitMoveTarget =
                   moves.ExplicitMoveTarget.REQUESTED_ACCOUNT,
                   staff_members: tuple[staff.StaffRow, ...] = ()) -> tuple[SessionMoveOutcome, ...]:
@@ -3008,17 +3010,14 @@ def move_sessions(ids: tuple[str, ...], target: str, *, why: str, cause: moves.M
     batch = cast(SessionBatchMove, import_module("scripts.agents.stop_resume").move_sessions)
     if staff_members:
         results = batch(eligible, target, why=why, cause=cause, source_accounts=sources,
-                        batch_id=batch_id, intent=intent, staff_members=frozenset(row.id for row in staff_members))
+                        intent=intent, staff_members=frozenset(row.id for row in staff_members))
     elif isinstance(intent, moves.FollowGroupAccount):
-        results = batch(eligible, target, why=why, cause=cause, source_accounts=sources,
-                        batch_id=batch_id, intent=intent)
-    elif batch_id:
-        results = batch(eligible, target, why=why, cause=cause, source_accounts=sources, batch_id=batch_id)
+        results = batch(eligible, target, why=why, cause=cause, source_accounts=sources, intent=intent)
     else:
         results = batch(eligible, target, why=why, cause=cause, source_accounts=sources)
     for identity, result in zip(eligible, results):
         if isinstance(result, stop_results.SessionNotFound):
-            if batch_id:
+            if isinstance(intent, moves.FollowGroupAccount) or cause != "by hand":
                 outcomes[identity] = SessionMoveRefused(identity, "no saved session was found")
             else:
                 account_anomaly(f"{identity}: no saved session was found")
@@ -3037,9 +3036,11 @@ def move_result_line(result: SessionMoveOutcome) -> str:
     if isinstance(result, stop_results.ResumePending):
         return f"{result.session_id}: stopped, resume pending on {result.account}: {next(iter(result.reason.splitlines()), 'unknown error')}"
     if isinstance(result, moves.MoveInProgress):
-        return f"{result.session_id}: move to {result.account} already in progress"
+        line = f"{result.session_id}: move to {result.account} already in progress"
+        return f"{line}. Run again: {result.command}" if result.command else line
     if isinstance(result, moves.MoveWaitingForRow):
-        return f"{result.session_id}: move pending: {result.reason}"
+        line = f"{result.session_id}: move pending: {result.reason}"
+        return f"{line}. Run again: {result.command}" if result.command else line
     if isinstance(result, stop_results.MoveHandedOff):
         return f"{result.session_id}: moving now"
     return stop_results.claude_up_line(result)
@@ -3464,13 +3465,13 @@ def move_group(group: ClaudeGroup, target: str, *, dry_run: bool = False, why: s
     reason = why or f"{group} moved by hand"
     transition = NoGroupTransition() if dry_run else group_transition(group)
     if not dry_run and (isinstance(transition, NoGroupTransition) or group_label(group_accounts(), group) != target):
-        transition = set_group_account(group, target, why=reason)
+        _ = set_group_account(group, target, why=reason)
     members = group_move_members(group)
     stopped = members.without_live_account
     selected = [member for member in members.live if not session_on_account(member.session, target)
                 or (not dry_run and member.row.id in members.busy)]
-    rows = (*(member.row for member in selected), *stopped)
-    ids = tuple(row.current_session for row in rows)
+    selected_rows = (*(member.row for member in selected), *stopped)
+    ids = tuple(row.current_session for row in selected_rows)
     if members.claude_registry_unreadable:
         notices = (f"{group}: member list is incomplete because the Claude session registry is unreadable",)
     else:
@@ -3491,10 +3492,15 @@ def move_group(group: ClaudeGroup, target: str, *, dry_run: bool = False, why: s
             *(move_preview_line(item.session, target) for item in selected),
             *(f"{row.name}: {row.current_session} · resume on {target} (from {claude_config_label(row.home.path)})"
               for row in stopped if isinstance(row.home, staff.SessionHome)), *notices))
-    assert isinstance(transition, GroupTransition)
+    rows = (*(member.row for member in members.live), *stopped)
     results = move_sessions(tuple(row.id for row in rows), target, why=reason, account_config=account_config,
-                            batch_id=transition.move_id, intent=moves.FollowGroupAccount(group), staff_members=rows) if rows else ()
-    names = {result.session_id: row.name for result, row in zip(results, rows)}
+                            intent=moves.FollowGroupAccount(group), staff_members=rows) if rows else ()
+    reported = [(row, result) for row, result in zip(rows, results)
+                if not isinstance(result, stop_results.ClaudeUp)
+                or result.start_state != stop_results.ClaudeStartState.ALREADY_RUNNING]
+    ids = tuple(dict.fromkeys((*ids, *(row.current_session for row, _ in reported))))
+    names = {result.session_id: row.name for row, result in reported}
+    results = tuple(result for _, result in reported)
     stdout, stderr, code = _move_output(results, (*checked.notices, *notices), names=names)
     outcome = GroupMoveStartFailed if code else GroupMoveStarted
     return outcome(ids, target, stdout, stderr, code, outcomes=results)
@@ -3520,6 +3526,8 @@ def move(session: str, target: str, *, dry_run: bool, why: str = "", alerts: Mov
 
 def move(session: str, target: str, *, dry_run: bool = False, why: str = "", alerts: MoveAlerts = "user", account_config: conf.ConfigRead | ReadCurrentAccountSettings = CURRENT_ACCOUNT_SETTINGS) -> MoveStarted | MoveStartFailed | MoveDryRun | MoveRefused:
     """Skip an owner on the target; check quota before moving another owner."""
+    from scripts.production import staff
+
     account_config = read_account_settings(account_config)
     del alerts
     target = note_file.canonical_label(target)
@@ -3541,8 +3549,21 @@ def move(session: str, target: str, *, dry_run: bool = False, why: str = "", ale
             matches = [item for item in live if item.name == session]
         if len(matches) == 1 and session_account_label(matches[0]) == target:
             owner = matches[0]
-            line = f"{owner.name}: already on {target}"
-            return MoveDryRun(owner.session_id, (line,)) if dry_run else MoveStarted(owner.session_id, target, line + "\n", "", 0)
+            if dry_run:
+                return MoveDryRun(owner.session_id, (f"{owner.name}: already on {target}",))
+            session = owner.session_id
+            try:
+                with staff.session_operation(session, native_key=moves.native_row_key(session)):
+                    live = inventory.listing()
+                    matches = [item for item in live if item.session_id == session]
+                    if len(matches) == 1 and session_account_label(matches[0]) == target:
+                        moves.latest_request_path(session).unlink(missing_ok=True)
+                        return MoveStarted(session, target, f"{matches[0].name}: already on {target}\n", "", 0)
+            except staff.StaffRefused:
+                busy = moves.MoveWaitingForRow(session, "could not acquire the session and staff row locks",
+                                               moves.batch_move_command(session, target))
+                stdout, stderr, code = _move_output((busy,), (), names={session: owner.name})
+                return MoveStartFailed(session, target, stdout, stderr, code)
         checked = check_move_target(target, datetime.now(timezone.utc), repair=not dry_run, account_config=account_config)
         if isinstance(checked, MoveRefused):
             return checked
