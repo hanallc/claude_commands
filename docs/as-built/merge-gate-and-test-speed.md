@@ -73,7 +73,7 @@ If the write fails, the route adds the write error to the probe failure.
 `mac_test.free_now` reads this backoff now.
 Queue placement will read the backoff when item 191 B3 registers `mac-linux` for placement.
 After the SSH transfer ends, `unreachable_wait_seconds` in `build_targets.conf` limits the wait for the guest to prove the run ended.
-This one setting is for every machine. Today only the `mac-linux` route reads it.
+This one setting is for every machine. The `mac-linux` and AWS routes read it.
 The setting accepts whole numbers from 1 to 86400 seconds.
 The Mac claim is a placeholder until item 191 B3. The guest run holds a separate lock.
 If the wait expires, the gate fails with `guest unreachable` and the guest alias from `ssh.hops`.
@@ -188,6 +188,7 @@ The gate bucket blocks public access, requires HTTPS, encrypts objects, and remo
 | `attempt_allowance_usd` | `0.02` | Reserve storage, IPv4, and transfer charges. |
 | `log_push_s` | `5` | Send progress logs. |
 | `result_poll_s` | `2` | Check remote results. |
+| `unreachable_wait_seconds` (`build_targets.conf`) | `600` | End a run whose box sends no new log for this long: the run fails with `unreachable` and the box ends. |
 | `observe_outage_s` | `180` | Keep polling a running box through a short AWS outage. |
 | `launch_reply_tries` | `2` | Recover an uncertain launch reply. |
 | `api_timeout_s` | `30` | Bound each scaler API command. |
