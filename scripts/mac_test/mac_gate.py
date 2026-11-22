@@ -14,7 +14,6 @@ import re
 from pathlib import Path
 import select
 import shlex
-import shutil
 import signal
 import subprocess
 import sys
@@ -176,7 +175,7 @@ def stop_guest(folder: Path, deadline: float) -> None:
     for name in cast(list[str], folders):
         path = Path(name)
         with suppress(FileNotFoundError):
-            if not build_folders.remove_build_folder(path, lambda: shutil.rmtree(path), wait=False):
+            if not build_folders.remove_build_folder(path, wait=False):
                 raise GateRefused(f'The Mac kept its gate folder {path}')
 
 
@@ -270,8 +269,9 @@ def stop_checkout(folder: Path, saved_checkout: Path | None = None) -> CheckoutC
             else:
                 outcome = CheckoutCleanup.RETAINED
         if outcome is CheckoutCleanup.REMOVED:
-            shutil.rmtree(folder)
-            return saved_checkout_status(saved_checkout)
+            if build_folders.remove_build_folder(folder, wait=False, child_locks=(lock.fileno(),)):
+                return saved_checkout_status(saved_checkout)
+            return CheckoutCleanup.RETAINED
         return outcome
 
 

@@ -1163,7 +1163,6 @@ def finish_gate_job(job: RunningGateJob, status: int) -> GateJobResult:
         captured += f"\n{job.module}: a test read live memory {detail}\n"
     times = (gate_record.TimingNotApplicable() if job.kind is GateJobKind.TYPE_CHECK
              else gate_record.read_module_times(job.log.parent / "test-times.json"))
-    shutil.rmtree(job.log.parent)
     job.folder_cleanup.close()
     if job.killed_for:
         captured = f"{job.killed_for}\n{captured}"

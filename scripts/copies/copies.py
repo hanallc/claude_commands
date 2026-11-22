@@ -2316,8 +2316,11 @@ def mirror_remove(args: CopyArguments) -> int:
                         for lock in (floor_claims.mirror_lock_path(tree), floor_claims.record_lock_path(tree)):
                             lock.unlink(missing_ok=True)
                 else:
-                    clear_mirror_content(tree)
-                    tree.rmdir()
+                    def delete(staged: build_folders.CheckedRemovalTree) -> None:
+                        staged.remove(metadata_last=floor_claims.MIRROR_METADATA)
+
+                    if not build_folders.remove_build_folder(tree, wait=False, delete=delete):
+                        raise CopyError(f"{tree}: a child lease is held")
             if scratch.removal_mark(tree).exists() or scratch.cargo_removal_mark(tree).exists():
                 scratch.remove_marked(tree)
             authority.unlink(missing_ok=True)

@@ -233,6 +233,24 @@ class MergeGateCheckpointTests(MergeGateFixture):
                 self.assertTrue(folders)
                 self.assertTrue(all(not folder.exists() for folder in folders), folders)
 
+    def test_finished_module_keeps_a_held_child_folder(self) -> None:
+        prepare = gate.test_module_environment
+        children: list[Path] = []
+
+        def hold_child(root: Path, environment: dict[str, str]) -> dict[str, str]:
+            child = root / "active-child"
+            child.mkdir()
+            lock = self.enterContext((root / "active-child.lock").open("wb"))
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            children.append(child)
+            return prepare(root, environment)
+
+        with mock.patch.object(gate, "test_module_environment", side_effect=hold_child):
+            result = self.run_gate("--tests-only", "--full")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertTrue(children)
+        self.assertTrue(all(child.is_dir() for child in children), children)
+
     def test_nested_modules_run_and_retry_from_their_own_folder_under_the_top_suite(self) -> None:
         nested = self.checkout / "scripts" / "hooks" / "tests" / "test_first.py"
         self.write(nested, SUITE_MODULE)

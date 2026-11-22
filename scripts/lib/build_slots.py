@@ -16,7 +16,6 @@ from enum import Enum, auto
 import os
 from pathlib import Path
 import re
-import shutil
 import stat
 import subprocess
 import sys
@@ -335,11 +334,10 @@ def _try_slot(source: Path, commit: str, *, showrunner: str, unit: str, work: st
                     limit = settings.whole(key)
                     size = _size(path) + _size(cargo)
                     if size > limit:
-                        if cargo.exists():
-                            shutil.rmtree(cargo)
-                        target = path / "target"
-                        if target.is_dir() and not target.is_symlink():
-                            shutil.rmtree(target)
+                        for output in (cargo, target):
+                            if output.is_dir() and not output.is_symlink():
+                                if not build_folders.remove_build_folder(output, wait=False):
+                                    raise BlockingIOError(f"{output}: the build output or a child lease is held")
                         report(f"slots: {path.name} was {size / 2**30:g} GiB, over its {limit / 2**30:g} GiB limit; "
                                + "its build output is deleted once.")
                 cargo.mkdir(parents=True, exist_ok=True)
@@ -453,7 +451,8 @@ def limit_copy_size(copy: LeasedCopy, limit: int) -> None:
     """Discard Cargo output when a held copy exceeds its size limit."""
     size = _size(copy.path)
     if size > limit:
-        shutil.rmtree(copy.cargo_dir)
+        if not build_folders.remove_build_folder(copy.cargo_dir, wait=False):
+            raise BlockingIOError(f"{copy.cargo_dir}: the build output or a child lease is held")
         copy.cargo_dir.mkdir()
         print(f"slots: {copy.path} was {size / 2**30:g} GiB, over its {limit / 2**30:g} GiB limit. "
               + "The maker deleted its Cargo output.")

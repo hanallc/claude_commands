@@ -1862,6 +1862,24 @@ class WorktreeLifecycleTests(unittest.TestCase):
         self.assertIn("Rerun when idle", result.stdout)
         self.assertFalse((self.root / "build/origin/demo").exists())
 
+    def test_output_creation_retries_when_the_parent_moves_during_mkdir(self) -> None:
+        self.layout_fixture()
+        parent = self.root / "build/origin/demo"
+        parent.mkdir(parents=True)
+        output, former = parent / "probe", parent.with_name("former")
+        mkdir = os.mkdir
+
+        def move_parent(path: str | os.PathLike[str], mode: int = 0o777, *, dir_fd: int | None = None) -> None:
+            mkdir(path, mode, dir_fd=dir_fd)
+            if path == output.name and dir_fd is not None and not former.exists():
+                _ = parent.rename(former)
+
+        with (patch.dict(os.environ, self.environment, clear=True),
+              patch.object(os, "mkdir", side_effect=move_parent)):
+            worktrees.ensure_output_folder(output)
+        self.assertTrue(former.is_dir())
+        self.assertTrue(output.is_dir())
+
     def test_rename_keeps_a_nonempty_old_output_parent(self) -> None:
         self.layout_fixture()
         source = self.trees / "origin/demo"

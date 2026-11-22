@@ -252,9 +252,13 @@ def _target_matches(target: Path, output: Path) -> bool:
     return target.is_symlink() and target.readlink() == output
 
 
-def ensure_target_link(checkout: Path, output: Path, *, save_existing: bool = True) -> None:
+def ensure_target_link(checkout: Path, output: Path, *, save_existing: bool = True,
+                       output_parent: int | None = None) -> None:
     """Create the output and repair the checkout's target link."""
-    ensure_output_folder(output)
+    if output_parent is None:
+        ensure_output_folder(output)
+    else:
+        _mkdir_output(output, output_parent)
     target = checkout / "target"
     if _target_matches(target, output):
         return
@@ -290,15 +294,28 @@ def ensure_target_link(checkout: Path, output: Path, *, save_existing: bool = Tr
     print(f"worktrees: saved {target} in {saved}", file=sys.stderr)
 
 
+def _mkdir_output(output: Path, parent: int) -> None:
+    try:
+        os.mkdir(output.name, dir_fd=parent)
+    except FileExistsError:
+        mode = os.stat(output.name, dir_fd=parent, follow_symlinks=False).st_mode
+        if not stat.S_ISDIR(mode):
+            raise ValueError(f"{output}: expected a real output folder") from None
+
+
 def ensure_output_folder(output: Path) -> None:
-    """Create the output without following links below the build root."""
-    with build_folder_lock.folder_parent(output, build_folders.build_root(), create=True) as parent:
-        try:
-            os.mkdir(output.name, dir_fd=parent)
-        except FileExistsError:
-            mode = os.stat(output.name, dir_fd=parent, follow_symlinks=False).st_mode
-            if not stat.S_ISDIR(mode):
-                raise ValueError(f"{output}: expected a real output folder") from None
+    """Create the output under the current parent without following links."""
+    for _attempt in range(2):
+        with build_folder_lock.folder_parent(output, build_folders.build_root(), create=True) as parent:
+            try:
+                _mkdir_output(output, parent)
+            except FileNotFoundError:
+                if build_folder_lock.parent_current(output, parent):
+                    raise
+                continue
+            if build_folder_lock.parent_current(output, parent):
+                return
+    raise FileNotFoundError(f"{output}: the build folder parent changed")
 
 
 def worktree_output(path: Path) -> RecordedWorktreeOutput | UnassignedOutput:
@@ -910,8 +927,6 @@ class UnitFolderRename:
             for folder in (old, new):
                 for name in sorted(names):
                     path = folder / name
-                    _ = locks.enter_context(build_folder_lock.folder_parent(
-                        path, build_folders.build_root(), create=True))
                     lease = locks.enter_context(build_folders.folder_removal_lease(
                         path, root=build_folders.build_root(), create=True, wait=False))
                     if not isinstance(lease, build_folders.HeldFolderRemovalLease):
@@ -1341,9 +1356,11 @@ def _source_signature(source: Path) -> dict[Path, tuple[int, int, int]]:
 def _discard_changed_stage(journal: MoveJournal) -> None:
     stage = journal.staging
     try:
-        if not journal.destination.matches(stage):
+        status = stage.lstat()
+        if not stat.S_ISDIR(status.st_mode) or journal.destination != FolderIdentity(status.st_dev, status.st_ino):
             raise ValueError("the stage identity changed")
-        shutil.rmtree(stage)
+        if not build_folders.remove_build_folder(stage, wait=False, expected=status):
+            report_retained_folder(stage, "cannot discard the stage after the source changed")
     except (OSError, ValueError):
         report_retained_folder(stage, "cannot discard the stage after the source changed")
 
@@ -2388,7 +2405,8 @@ def _take_migration_locks(source: Path, folders: MigrationFolders, locks: ExitSt
         leased.add(lease_path)
         lease = locks.enter_context(build_folders.folder_removal_lease(
             lease_path, children=covered and not isinstance(copy, Path), wait=False,
-            create=create and isinstance(copy, Path), probe_fds=fds))
+            create=create and isinstance(copy, Path), root=folders.build_root if isinstance(copy, Path) else None,
+            probe_fds=fds))
         if isinstance(lease, build_folders.RemovalLockHeld):
             raise MigrationInUse(f"kept: {lease.lock} held")
         if isinstance(lease, build_folders.RefusedRemovalLease):

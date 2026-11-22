@@ -103,16 +103,30 @@ def _use_linked_output(workspace: CargoWorkspace, output: Path,
     if not target.is_symlink() and target.exists():
         raise OutsideBuildFolders(f"{target}: expected a link to {output}; retain the existing path")
     root = build_folders.build_root()
-    directory = locks.enter_context(build_folder_lock.folder_parent(output, root, create=True))
-    current_link = target.is_symlink() and target.readlink() == output and output.is_dir() and not output.is_symlink()
-    descriptor = build_folder_lock.open_lock(output, directory, create=True)
-    _ = locks.callback(os.close, descriptor)
-    mode = fcntl.LOCK_EX if not current_link else fcntl.LOCK_SH
-    fcntl.flock(descriptor, mode | fcntl.LOCK_NB)
-    if not build_folder_lock.lock_current(output, directory, descriptor):
-        raise ValueError(f"{output}: the build folder lock changed")
-    worktrees.ensure_target_link(workspace.checkout, output, save_existing=False)
-    return descriptor
+    for _attempt in range(2):
+        with ExitStack() as opened:
+            directory = opened.enter_context(build_folder_lock.folder_parent(output, root, create=True))
+            current_link = (target.is_symlink() and target.readlink() == output
+                            and output.is_dir() and not output.is_symlink())
+            try:
+                descriptor = build_folder_lock.open_lock(output, directory, create=True)
+            except FileNotFoundError:
+                if not build_folder_lock.parent_current(output, directory):
+                    continue
+                raise
+            _ = opened.callback(os.close, descriptor)
+            mode = fcntl.LOCK_SH if current_link else fcntl.LOCK_EX
+            fcntl.flock(descriptor, mode | fcntl.LOCK_NB)
+            build_folder_lock.mark_lock(descriptor)
+            if not build_folders.allocation_parent_current(output, directory):
+                continue
+            if not build_folder_lock.lock_current(output, directory, descriptor):
+                break
+            worktrees.ensure_target_link(workspace.checkout, output, save_existing=False, output_parent=directory)
+            _ = locks.enter_context(opened.pop_all())
+            return descriptor
+    raise ValueError(f"{output}: the build folder lock changed")
+
 
 
 def _stamp_assignment(output: Path, checkout: Path) -> None:
