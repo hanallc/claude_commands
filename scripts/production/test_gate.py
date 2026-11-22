@@ -14,12 +14,16 @@ import io
 import os
 from pathlib import Path
 import re
+import sys
+from collections.abc import Generator
 from typing import cast, final, override
-from contextlib import AbstractContextManager, redirect_stdout
+from contextlib import AbstractContextManager, contextmanager, redirect_stdout
 from datetime import UTC, datetime, tzinfo
 from unittest import mock
 from scripts.lib import scratch
-from scripts.production import change_review, gate, staff
+from scripts.lib.git_test_support import fixture_git_environment
+from scripts.lib.process_start import Gone
+from scripts.production import change_review, gate, promotion, staff
 from scripts.production.gate_modules import GateRefused
 from scripts.production.test_change_review import ProducerFixture
 from scripts.production.staff_test_support import (
@@ -30,6 +34,16 @@ from scripts.production.gate_test_support import FIXTURE_FOLDERS, MergeGateFixtu
 
 @final
 class MergeGateCheckpointTests(MergeGateFixture):
+    @override
+    def bind_fixture(self, root: Path) -> None:
+        super().bind_fixture(root)
+        self.environment = {
+            **fixture_git_environment(root.parent),
+            **{key: value for key, value in self.environment.items() if not key.startswith("GIT_")},
+            "GIT_CONFIG_SYSTEM": os.devnull,
+            "SHOWRUNNER_STATE_DIR": str(Path(self.environment["HOME"]) / ".local/state/showrunner"),
+        }
+
     @override
     def setUp(self) -> None:
         super().setUp()
@@ -54,6 +68,24 @@ class MergeGateCheckpointTests(MergeGateFixture):
         self.environment["CLAUDE_CODE_SESSION_ID"] = runner.current_session
         unit = fixture_unit_location(runner, "fixture", self.unit)
         return unit.id
+
+    def install_rollback_prepare_hook(self, body: str) -> Path:
+        hook = self.checkout / ".git/hooks/reference-transaction"
+        marker = self.checkout / ".git/rollback-prepare"
+        self.write(hook, f'''#!{sys.executable}
+import sys
+from pathlib import Path
+
+rows = [line.split() for line in sys.stdin]
+merge = next((old for old, new, ref in rows
+              if new == {self.base!r} and ref in ("HEAD", "refs/heads/integration")), "")
+if sys.argv[1] != "prepared" or not merge:
+    raise SystemExit(0)
+Path({str(marker)!r}).write_text(merge)
+{body}
+''')
+        hook.chmod(0o755)
+        return marker
 
     def test_checkout_holds_a_shared_copy_lock_through_suites_and_releases_it_on_error(self) -> None:
         copies = self.root / "copies"
@@ -132,15 +164,177 @@ class MergeGateCheckpointTests(MergeGateFixture):
                     self.assertEqual(result.returncode == 0, outcome == "pass", result.stdout + result.stderr)
                     self.assertEqual(restored, [previous])
 
+    def test_rollback_and_recovery_keep_a_commit_made_during_the_suites(self) -> None:
+        for change in ("commit", "amend"):
+            state = self.state / change
+            with self.subTest(change=change), mock.patch.dict(self.environment, GATE_STATE_DIR=str(state)):
+                checkout = self.root / change
+                _ = self.git(self.root, "clone", "-q", "--branch", "integration", str(self.origin), str(checkout))
+                file = checkout / "concurrent.txt"
+                changed_head = ""
+
+                def suites(repo: Path, *_arguments: object, **_keywords: object) -> gate.GateRun:
+                    nonlocal changed_head
+                    self.assertEqual(repo, checkout)
+                    self.write(file, "concurrent change\n")
+                    _ = self.git(repo, "add", file.name)
+                    commit_args = ("--amend", "--no-edit") if change == "amend" else ("-m", "concurrent change")
+                    _ = self.git(repo, "commit", *commit_args)
+                    changed_head = self.git(repo, "rev-parse", "HEAD")
+                    return gate.GateRun((), 0, 0, tests_reused=True)
+
+                with mock.patch.object(gate, "run_gate_suites", side_effect=suites):
+                    result = self.run_gate("--repo", str(checkout))
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertEqual(self.git(checkout, "rev-parse", "HEAD"), changed_head)
+                self.assertIn(f"rollback kept HEAD {changed_head}", result.stderr)
+                self.assertEqual(file.read_text(), "concurrent change\n")
+
+                with mock.patch.dict(os.environ, self.environment, clear=True), \
+                        mock.patch.object(gate, "process_start", return_value=Gone()):
+                    with self.assertRaisesRegex(GateRefused, f"rollback kept HEAD {changed_head}"):
+                        gate.recover_gate_directory(gate.gate_run_directory(checkout))
+                self.assertEqual(self.git(checkout, "rev-parse", "HEAD"), changed_head)
+                self.assertEqual(file.read_text(), "concurrent change\n")
+                self.assert_not_pushed()
+
+    def test_rollback_keeps_a_commit_made_before_rollback_starts(self) -> None:
+        file = self.checkout / "concurrent.txt"
+        changed_head = ""
+
+        def fail_after_commit(repo: Path, *_arguments: object, **_keywords: object) -> gate.GateRun:
+            nonlocal changed_head
+            self.write(file, "concurrent change\n")
+            changed_head = self.commit(repo, "concurrent change")
+            raise GateRefused("fixture suite failure")
+
+        with mock.patch.object(gate, "run_gate_suites", side_effect=fail_after_commit):
+            result = self.run_gate()
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), changed_head)
+        self.assertIn(changed_head, result.stderr)
+        self.assertEqual(file.read_text(), "concurrent change\n")
+        self.assertEqual((self.checkout / "unit.txt").read_text(), "checkpoint\n")
+        self.assertEqual(self.git(self.checkout, "status", "--porcelain"), "")
+
+        with mock.patch.dict(os.environ, self.environment, clear=True), \
+                mock.patch.object(gate, "process_start", return_value=Gone()):
+            with self.assertRaisesRegex(GateRefused, f"rollback kept HEAD {changed_head}"):
+                gate.recover_gate_directory(gate.gate_run_directory(self.checkout))
+        self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), changed_head)
+        self.assertEqual(self.git(self.checkout, "status", "--porcelain"), "")
+        self.assert_not_pushed()
+
+    def test_rollback_restores_the_index_before_a_competing_commit_can_land(self) -> None:
+        hook = self.checkout / ".git/hooks/reference-transaction"
+        attempts = self.checkout / ".git/rollback-commit-attempts"
+        self.write(hook, f'''#!/bin/sh
+matches=$(awk '$2 == "{self.base}" && ($3 == "HEAD" || $3 == "refs/heads/integration") {{ print $3 }}')
+case "$1" in
+prepared|committed)
+    if [ -n "$matches" ]; then
+        git commit --allow-empty -qm 'concurrent change' >/dev/null 2>&1
+        printf '%s %s\\n' "$1" "$?" >> .git/rollback-commit-attempts
+    fi
+    ;;
+esac
+exit 0
+''')
+        hook.chmod(0o755)
+
+        with mock.patch.object(gate, "run_gate_suites", side_effect=GateRefused("fixture suite failure")):
+            result = self.run_gate()
+
+        self.assertEqual(attempts.read_text().splitlines(), ["prepared 128", "committed 0"])
+        self.assertEqual(self.git(self.checkout, "ls-tree", "HEAD", "--", "unit.txt"), "",
+                         "The competing commit contains the rejected checkpoint.")
+        self.assertEqual(self.git(self.checkout, "ls-files", "--", "unit.txt"), "")
+        self.assertFalse((self.checkout / "unit.txt").exists())
+        self.assertEqual(self.git(self.checkout, "log", "-1", "--format=%s"), "concurrent change")
+        self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD^"), self.base)
+        self.assertEqual(self.git(self.checkout, "status", "--porcelain"), "")
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("merge undone, not pushed", result.stderr)
+        self.assert_not_pushed()
+
+    def test_rollback_completes_when_the_prepare_hook_writes_large_diagnostics(self) -> None:
+        marker = self.install_rollback_prepare_hook('sys.stderr.write("x" * (256 * 1024) + "\\n")')
+        result = self.run_gate(own_process=True, preamble='''\
+def fail_suites(*args, **kwargs):
+    raise gate.GateRefused("fixture suite failure")
+
+gate.run_gate_suites = fail_suites
+''')
+        self.assertTrue(marker.is_file(), result.stderr[-512:])
+        self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), self.base)
+        self.assertEqual(self.git(self.checkout, "status", "--porcelain"), "")
+        self.assertEqual(result.returncode, 1, result.stderr[-512:])
+        self.assertIn("fixture suite failure; merge undone, not pushed", result.stderr[-512:])
+        self.assert_not_pushed()
+
+    def test_rollback_refusal_includes_the_prepare_hook_diagnostic(self) -> None:
+        message = "fixture prepare hook refused rollback"
+        marker = self.install_rollback_prepare_hook(f"print({message!r}, file=sys.stderr)\nraise SystemExit(1)")
+        with mock.patch.object(gate, "run_gate_suites", side_effect=GateRefused("fixture suite failure")):
+            result = self.run_gate()
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertTrue(marker.is_file(), result.stderr)
+        self.assertIn(message, result.stderr)
+        self.assertIn("cannot prepare the rollback ref transaction", result.stderr)
+        merged = marker.read_text()
+        self.assertEqual(self.git(self.checkout, "rev-list", "--parents", "-n", "1", "HEAD").split(),
+                         [merged, self.base, self.checkpoint])
+        self.assertEqual(self.git(self.checkout, "status", "--porcelain"), "")
+        self.assert_not_pushed()
+
+    def test_recovery_finishes_rollback_on_either_side_of_the_ref_commit(self) -> None:
+        hold = gate.hold_rollback_head
+        for when in ("before", "after"):
+            state = self.state / when
+            with self.subTest(when=when), mock.patch.dict(self.environment, GATE_STATE_DIR=str(state)):
+                checkout = self.root / f"rollback-{when}"
+                _ = self.git(self.root, "clone", "-q", "--branch", "integration", str(self.origin), str(checkout))
+                merged = ""
+                injected = False
+
+                def fail_suites(repo: Path, *_arguments: object, **_keywords: object) -> gate.GateRun:
+                    nonlocal merged
+                    merged = self.git(repo, "rev-parse", "HEAD")
+                    raise GateRefused("fixture suite failure")
+
+                @contextmanager
+                def interrupt_ref_commit(repo: Path, baseline: str, head: str) -> Generator[None]:
+                    nonlocal injected
+                    with hold(repo, baseline, head):
+                        yield
+                        if when == "before":
+                            injected = True
+                            raise KeyboardInterrupt("fixture stop before the ref commit")
+                    injected = True
+                    raise KeyboardInterrupt("fixture stop after the ref commit")
+
+                with mock.patch.object(gate, "run_gate_suites", side_effect=fail_suites), \
+                        mock.patch.object(gate, "hold_rollback_head", side_effect=interrupt_ref_commit):
+                    result = self.run_gate("--repo", str(checkout))
+                self.assertTrue(injected)
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertIn(f"fixture stop {when} the ref commit", result.stderr)
+                self.assertEqual(self.git(checkout, "rev-parse", "HEAD"), merged if when == "before" else self.base)
+                self.assertEqual(self.git(checkout, "ls-files", "--", "unit.txt"), "")
+                self.assertFalse((checkout / "unit.txt").exists())
+
+                with mock.patch.dict(os.environ, self.environment, clear=True), \
+                        mock.patch.object(gate, "process_start", return_value=Gone()):
+                    directory = gate.gate_run_directory(checkout)
+                    self.assertEqual(len(list(directory.glob("*.json"))), 1)
+                    gate.recover_gate_directory(directory)
+                    self.assertEqual(list(directory.glob("*.json")), [])
+                self.assertEqual(self.git(checkout, "rev-parse", "HEAD"), self.base)
+                self.assertEqual(self.git(checkout, "status", "--porcelain"), "")
+                self.assert_not_pushed()
+
     def test_checkpoint_retries_its_merge_after_a_stop_before_push(self) -> None:
-        checked = gate.checked_git
-
-        def stop_at_push(repo: Path, *arguments: str) -> str:
-            if arguments == ("push", "origin", "integration"):
-                raise GateRefused("injected stop before push")
-            return checked(repo, *arguments)
-
-        with mock.patch.object(gate, "checked_git", side_effect=stop_at_push):
+        with mock.patch.object(promotion, "push_integration", side_effect=GateRefused("injected stop before push")):
             stopped = self.run_gate()
         self.assertNotEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
         self.assertIn("injected stop before push", stopped.stderr)
@@ -158,14 +352,7 @@ class MergeGateCheckpointTests(MergeGateFixture):
         self.write(self.checkout / "published.txt", "published code\n")
         published = self.commit(self.checkout, "published non-doc change")
         _ = self.git(self.checkout, "push", "origin", "integration")
-        checked = gate.checked_git
-
-        def stop_at_push(repo: Path, *arguments: str) -> str:
-            if arguments == ("push", "origin", "integration"):
-                raise GateRefused("injected stop before push")
-            return checked(repo, *arguments)
-
-        with mock.patch.object(gate, "checked_git", side_effect=stop_at_push):
+        with mock.patch.object(promotion, "push_integration", side_effect=GateRefused("injected stop before push")):
             stopped = self.run_gate()
         self.assertNotEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
         self.assertIn("injected stop before push", stopped.stderr)
@@ -181,14 +368,7 @@ class MergeGateCheckpointTests(MergeGateFixture):
         self.assertEqual(self.git(self.origin, "rev-parse", "integration"), self.base)
 
     def test_checkpoint_retry_refuses_a_recorded_merge_for_another_checkpoint(self) -> None:
-        checked = gate.checked_git
-
-        def stop_at_push(repo: Path, *arguments: str) -> str:
-            if arguments == ("push", "origin", "integration"):
-                raise GateRefused("injected push failure")
-            return checked(repo, *arguments)
-
-        with mock.patch.object(gate, "checked_git", side_effect=stop_at_push):
+        with mock.patch.object(promotion, "push_integration", side_effect=GateRefused("injected push failure")):
             stopped = self.run_gate()
         self.assertIn("injected push failure", stopped.stderr)
         merged = self.git(self.checkout, "rev-parse", "HEAD")
@@ -443,6 +623,9 @@ class MergeGateCheckpointTests(MergeGateFixture):
         producer = self.review_producer(doc)
         runner = staff.by_id(producer)
         assert runner is not None and isinstance(runner.parent, staff.ReportsTo)
+        owner = staff.by_id(runner.parent.id)
+        assert owner is not None
+        self.environment["CODEX_THREAD_ID"] = owner.current_session
         timer = Path(self.environment["NOTIFIER_STATE_DIR"]) / f"showrunner-{runner.parent.id}"
         timer.mkdir(parents=True)
         self.write(timer / "conf", f"TARGET=session:{runner.parent.id}\n"
@@ -468,7 +651,7 @@ class MergeGateCheckpointTests(MergeGateFixture):
 
     def test_a_production_without_a_list_still_merges_a_checkpoint_with_its_line(self) -> None:
         doc = self.root / "production.md"
-        self.write(doc, "# p\n")
+        self.write(doc, "# p\n\n- **Merge branch:** `integration`\n")
         _ = self.review_producer(doc)
         checkpoint = self.checkpoint_commit("checkpoint(fixture): grid fades\n\nChange-Review: none — the gate script")
         result = self.run_gate("--promote", "--production", "fixture-showrunner", checkpoint=checkpoint)
@@ -547,7 +730,7 @@ class MergeGateCheckpointTests(MergeGateFixture):
                      "--main-repo", str(self.main),
                      "--ssh", str(self.bin / "ssh"), "--production", "quiet"]
         output = io.StringIO()
-        with mock.patch.dict(os.environ, self.environment), mock.patch.object(
+        with mock.patch.dict(os.environ, self.environment, clear=True), mock.patch.object(
             gate, "notify_style", side_effect=malformed_notification,
         ), redirect_stdout(output):
             code = gate.main(arguments)

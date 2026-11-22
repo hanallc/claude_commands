@@ -5,11 +5,19 @@ import json
 import os
 from pathlib import Path
 import shutil
+from typing import override
 
 from scripts.lib.rerun_test_support import ScriptRepositoryTestCase
 
 
 class ValidationRerunTests(ScriptRepositoryTestCase):
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        record = self.write(self.root / "staff.json", '{"schema": 2, "rows": []}')
+        self.environment["STAFF_FILE"] = str(record)
+        self.environment["GIT_ALLOW_PROTOCOL"] = "file"
+
     def test_dispatch_and_poll_report_the_run_or_error(self) -> None:
         self.seed()
         _ = self.git("switch", "-c", "ci-delay")
@@ -83,6 +91,10 @@ if args[:2] == ["repo", "view"]:
 elif args[:2] == ["pr", "view"]:
     if "mergeCommit" in args:
         subprocess.run(["git", "rev-parse", "main"], check=True)
+    elif "state" in args:
+        print("MERGED")
+    elif "headRefOid" in args:
+        subprocess.run(["git", "rev-parse", "refs/heads/retry-pr"], check=True)
     else:
         print(7)
 elif args[:2] == ["pr", "checks"]:

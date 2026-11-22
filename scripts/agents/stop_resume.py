@@ -52,6 +52,7 @@ from scripts.agents.launch_names import LaunchNames, LaunchNamesNotRead
 from scripts.agents.codex_trust import trust_arguments
 from scripts.herdr import pane_launch
 from scripts.production import staff
+from scripts.production.production_doc import EnrolledPaths, ProductionPathsError
 from scripts.lib.resume_message import (
     AccountMove, NO_ACCOUNT_MOVE, BusyPass, NO_OWN_PASS, WorkersHeld, launcher_prompt, worker_mode,
     ResumeWorkers as ResumeWorkers,
@@ -1686,6 +1687,17 @@ def _unit_resume_owner(production: str, unit: str, record: StaffSnapshot) -> uni
     return owner
 
 
+def _enrolled_showrunner_worker(row: staff.StaffRow, record: staff.StaffSnapshot) -> bool:
+    if row.kind != "worker":
+        return False
+    owner = record.parent_of(row)
+    if owner is None or owner.kind != "showrunner":
+        return False
+    from scripts.herdr.worker_panes import enrolled_worker_owner
+
+    return isinstance(enrolled_worker_owner(owner), EnrolledPaths)
+
+
 def _resume_once(session: str, *, why: str, to: str | None = None, requester: str = "",
                  names: LaunchNames,
                  client: herdr.Herdr | herdr.LaunchClientSource = herdr.LaunchClientSource.NEW) -> ResumeResult:
@@ -1779,15 +1791,16 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
         mode = worker_mode() if row is not None else NO_WORKERS
         if isinstance(mode, WorkersHeld) and row is not None and row.kind == "worker" and kind == "codex":
             return ResumeFailed(identity, "no-worker mode keeps Codex workers stopped")
-        if entry is None:
-            if row is None:
-                return SessionNotFound(session)
+        if row is None and entry is None:
+            return SessionNotFound(session)
+        if row is not None and (entry is None or _enrolled_showrunner_worker(row, names.tab_record)):
             restart = cast(RowStarter, cast(object, import_module("scripts.agents.restart")))
             pane = restart.start_row(row, names.tab_record, client, target_account=to or "")
             result = running_on_account(identity, pane, kind=kind)
             if isinstance(result, ClaudeUp):
                 return replace(result, elapsed_seconds=monotonic() - began, start_state=ClaudeStartState.STARTED)
             return ResumeFailed(identity, "session did not start") if isinstance(result, sessions.SessionNotLive) else result
+        assert entry is not None
         entry = entry.copy()
         entry["session_id"] = identity
         entry["environment"] = names.environment(entry)
@@ -1943,7 +1956,7 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
         if not _move_resume.get():
             _watch_resume(identity, tab.pane_id, label, started, requester, why)
         return ClaudeUp(identity, tab.pane_id, label, monotonic() - began, copied_from)
-    except (OSError, ValueError, herdr_types.HerdrFailure, subprocess.SubprocessError) as error:
+    except (OSError, ValueError, ProductionPathsError, herdr_types.HerdrFailure, subprocess.SubprocessError) as error:
         if original is not None and attempt_pane:
             try:
                 cleanup_client = herdr.Herdr(herdr.shared_session())

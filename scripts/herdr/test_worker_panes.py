@@ -27,6 +27,7 @@ from unittest.mock import ANY, patch
 from weakref import finalize
 
 from scripts.production import fake_unit_host, staff, worker_admission
+from scripts.production.production_doc import EnrolledPaths
 from scripts.herdr import herdr_types
 from scripts.agents import pane_record, restart, stop_resume
 from scripts.agents.stop_results import SourceReleased
@@ -44,6 +45,13 @@ from scripts.direct import progress_history
 from scripts.agents import detached_run_process, detached_runs, worker_lifecycle
 
 LAUNCH_PREPARED_AGENT = herdr.launch_prepared_agent
+
+
+def prepare_recorder_history(path: Path) -> Path:
+    """Create the recorder history file if it is absent."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.touch(exist_ok=True)
+    return path
 
 
 def final_reply(row: staff.StaffRow, message: str = "The conversation is complete.") -> None:
@@ -940,11 +948,11 @@ class WorkerPaneTests(StaffTestCase):
         run = Path(os.environ["UNIT_RUN_DIR"])
         state = run / "progress_history_state.json"
         if not state.exists():
-            run.mkdir(exist_ok=True)
+            history = prepare_recorder_history(run / "history.jsonl")
             write_text_atomic(state, json.dumps({"owner_staff_id": self.parent.id, "working_dir": str(self.root),
                 "open_phases": [{"id": "earlier", "title": "Earlier", "instance_id": "earlier-phase", "started_at": 1,
                                  "status": "active"}], "pass": {}, "events": [],
-                "history_file": str(run / "history.jsonl"),
+                "history_file": str(history),
                 "main_agent": {"session_id": self.parent.current_session, "family": "claude",
                                "model": "fixture", "effort": "high"}}))
         return run
@@ -983,8 +991,11 @@ class WorkerPaneTests(StaffTestCase):
                 self.assertEqual(self.staff_state(), before)
 
     def test_pass_end_and_restore_close_an_interrupted_worker_without_a_reply_and_keep_a_live_turn(self) -> None:
+        from scripts.message import send
         from scripts.production import worker
 
+        _ = self.enterContext(patch.object(send, "delivery_timeout", return_value=1.0))
+        _ = self.enterContext(patch.object(send, "send", return_value=send.Result("sent", "fixture director")))
         cases = (("restore", "idle"), ("restore", "done"), ("restore", "working"),
                  ("finish-phase", "idle"), ("finish-phase", "working"), ("finish-run", "idle"))
         for index, (operation, status) in enumerate(cases, start=1):
@@ -3065,13 +3076,55 @@ class WorkerPaneTests(StaffTestCase):
         self.assertEqual(self.world.launches, [])
 
     def test_showrunner_can_start_a_worker(self) -> None:
-        self.parent_id = fixture_member("showrunner", name="showrunner").id
+        main, integration, run = (self.root / name for name in ("main", "integration", "review-run"))
+        for directory in (main, integration, run):
+            directory.mkdir()
+        doc = main / "production-live.md"
+        paths = EnrolledPaths(main=main, live_doc=doc, log=main / "LOG.md", notes=main / "notes", integration=integration)
+        legacy = fixture_member("showrunner", name="legacy-showrunner")
+        enrolled = fixture_member("showrunner", name="enrolled-showrunner", doc=staff.LiveDoc("natedev", doc))
         self.world.foreground.clear()
-        self.world.add(self.parent, "w1:p0")
-        with patch.dict(os.environ, {"CODEX_THREAD_ID": self.parent.current_session}):
-            code, _, errors = self.command("start-or-resume", "helper", "--role", "test")
-        self.assertEqual(code, worker_panes.ExitCode.OK, errors)
-        self.assertEqual(len(staff.snapshot().find(kind="worker", parent=self.parent.id)), 1)
+        self.world.add(legacy, "w2:p0", workspace="w2", tab="w2:t0")
+        self.world.add(enrolled, "w3:p0", workspace="w3", tab="w3:t0")
+        assignments: tuple[tuple[staff.StaffRow, staff.WorkerRole, Literal["claude", "codex"]], ...] = (
+            (legacy, "test", "codex"), (enrolled, "review", "claude"), (enrolled, "astra-reviewer", "codex"))
+        with patch.object(worker_panes, "resolve_production_paths", return_value=paths):
+            _ = staff.set_run(enrolled.id, staff.OpenRun(self.root))
+            with self.subTest(run="recorded run contains both checkouts"):
+                refused = worker_panes.start_or_resume(enrolled.id, staff.WorkerName.parse("review"), "review")
+                self.assertIsInstance(refused, worker_panes.AdmissionRefused)
+                self.assertEqual(self.world.launches, [])
+            _ = staff.set_run(enrolled.id, staff.OpenRun(run))
+            for owner, role, family in assignments:
+                with self.subTest(owner=owner.name, role=role, family=family):
+                    self.parent_id = owner.id
+                    if owner.id == legacy.id:
+                        with patch.dict(os.environ, {"CODEX_THREAD_ID": owner.current_session}):
+                            code, _, errors = self.command("start-or-resume", "helper", "--role", role)
+                        self.assertEqual(code, worker_panes.ExitCode.OK, errors)
+                        self.assertEqual(len(staff.snapshot().find(kind="worker", parent=owner.id)), 1)
+                        continue
+                    selected = worker_panes.LaunchPolicy(models_registry.LaunchSettings(family, "fixture", "high", ""),
+                                                         "read-only", "plan")
+                    name = staff.WorkerName.parse(role)
+                    opened = worker_panes.start_or_resume(self.parent.id, name, role, policy=selected)
+                    self.assertIsInstance(opened, worker_panes.OpenWorker)
+                    assert isinstance(opened, worker_panes.OpenWorker)
+                    self.assertEqual(self.world.locations[opened.pane]["cwd"], str(main))
+                    pid, backend, arguments = self.world.foreground[opened.pane]
+                    if family == "claude":
+                        self.assertEqual(arguments[arguments.index("--tools") + 1], "Read,Grep,Glob")
+                        self.assertEqual(arguments[arguments.index("--permission-mode") + 1], "plan")
+                    else:
+                        self.assertEqual(arguments[arguments.index("--sandbox") + 1], "read-only")
+                        self.assertEqual(arguments[arguments.index("--ask-for-approval") + 1], "never")
+                        unsafe = arguments.copy()
+                        unsafe[unsafe.index("--sandbox") + 1] = "danger-full-access"
+                        self.world.foreground[opened.pane] = (pid, backend, unsafe)
+                        result = worker_panes.start_or_resume(self.parent.id, name, role, policy=selected)
+                        self.assertIsInstance(result, worker_panes.AdmissionRefused)
+            self.assertEqual(len(self.world.launches), 3)
+            self.assertEqual(len(staff.snapshot().find(kind="worker", parent=enrolled.id)), 2)
 
     def test_unusable_configuration_opens_no_split(self) -> None:
         config = self.root / "conf/direct.conf"

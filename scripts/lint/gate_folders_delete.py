@@ -18,6 +18,7 @@ import sys
 
 from scripts.lib import removal_guard, scratch
 from scripts.lint.sweep import gib
+from scripts.production.production_doc import ProductionPathsError, protected_checkouts
 
 
 @dataclass(frozen=True)
@@ -150,6 +151,12 @@ def inspect_folder(path: Path) -> GateContents:
 
 def assess_gate(path: Path) -> FolderDecision:
     try:
+        canonical = path.resolve()
+        for checkout in sorted(protected_checkouts(), key=lambda item: item.path):
+            if checkout.path.is_relative_to(canonical):
+                return KeptFilesystemError(path, f"contains protected production checkout {checkout.path}")
+            if canonical.is_relative_to(checkout.path):
+                return KeptFilesystemError(path, f"inside protected production checkout {checkout.path}")
         with scratch.judgment_lock(path) as idle:
             if not idle:
                 return KeptBusy(path)
@@ -157,7 +164,7 @@ def assess_gate(path: Path) -> FolderDecision:
             if contents.repositories:
                 return KeptRepository(path)
             return WouldDelete(path, contents.size)
-    except OSError as error:
+    except (OSError, ProductionPathsError) as error:
         return KeptFilesystemError(path, str(error))
 
 

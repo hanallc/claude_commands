@@ -4974,7 +4974,9 @@ class HerdrTests(unittest.TestCase):
         copy_session_modules(message)
         _ = shutil.copytree(Path(herdr.__file__).resolve().parents[1] / "lib", isolated.parent / "lib", dirs_exist_ok=True,
                             ignore=shutil.ignore_patterns("__pycache__", "test_*"))
-        for relative in ("agents/worker_lifecycle.py", "production/staff.py", "agents/remote.py"):
+        for relative in ("agents/remote.py", "agents/worker_lifecycle.py", "message/session_send.py",
+                         "production/production_doc.py", "production/production_names.py",
+                         "production/showrunners.py", "production/staff.py"):
             destination = isolated.parent / relative
             destination.parent.mkdir(parents=True, exist_ok=True)
             _ = shutil.copy2(Path(herdr.__file__).resolve().parents[1] / relative, destination)

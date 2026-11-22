@@ -30,7 +30,10 @@ from dataclasses import dataclass, replace
 from typing import Literal, NamedTuple, NotRequired, TypedDict, cast, overload
 from zoneinfo import ZoneInfo
 
-from scripts.production.production_doc import Production, Refusal, read_production
+from scripts.production.production_doc import (
+    EnrolledPaths, Production, Refusal, read_production, resolve_production_paths,
+)
+from scripts.production.production_admission import require_admission
 from scripts.production.checkpoint_gate import report
 
 from scripts.production import change_routing, delivery_state, showrunners, session_staff, showrunner_tree, staff, unit_lookup
@@ -42,6 +45,7 @@ from scripts.production.issues import Issue, frontmatter
 from scripts.lib import urgency
 from scripts.lib.urgency import Urgency, UrgencyError
 from scripts.lib.atomic_file import write_text_atomic
+from scripts.lib.git_exclude import require_untracked_ignored
 from scripts.lib.user_zone import user_zone
 
 from scripts.review_links import new_item_dialog, review_events
@@ -811,19 +815,32 @@ def adopt_moved_state(production: Production, *, record: staff.StaffSnapshot | N
     return done
 
 
+def status_line(lines: list[str]) -> re.Match[str] | None:
+    return next((re.search(r"^> \*\*Status: PRODUCTION — (planned|running|wrapped)\.\*\*", line)
+                 for line in lines if line.startswith("> **Status:")), None)
+
+
 def register(production: Production) -> None:
     session_id = os.environ.get("CLAUDE_CODE_SESSION_ID", "")
     if not session_id:
         raise RegistrationFailure("register", "CLAUDE_CODE_SESSION_ID is required")
+    require_admission(production)
     try:
         agents_log.append(session_id, "showrunner", None, datetime.now(timezone.utc))
     except Exception as exc:
         # Recording must never interrupt registration.
         print("agents_log: " + " ".join(str(exc).splitlines()), file=sys.stderr)
-    relative = production.doc.relative_to(production.checkout)
-    dirty = command("register", ["git", "status", "--porcelain", "--", str(relative)], cwd=production.checkout)
-    if dirty:
-        raise RegistrationFailure("register", "the production doc has uncommitted edits; commit or discard them first")
+    paths = resolve_production_paths(production.doc)
+    if isinstance(paths, EnrolledPaths):
+        for path in (paths.live_doc, paths.log):
+            require_untracked_ignored(paths.main, path.relative_to(paths.main).as_posix())
+    else:
+        relative = production.doc.relative_to(production.checkout)
+        dirty = command("register", ["git", "status", "--porcelain", "--", str(relative)], cwd=production.checkout)
+        if dirty:
+            raise RegistrationFailure("register", "the production doc has uncommitted edits; commit or discard them first")
+    for line in adopt_moved_state(production):
+        report("state-dir", "ok", line)
     # The staff row owns the timer.
     owner = production.owner
     updates = f"showrunner-{owner.id}"
@@ -2688,6 +2705,9 @@ def main() -> int:
             questions_table(scope, identities=identities)
             return 0
         production = read_production(name, identities.record if identities else None)
+        if action == "register":
+            register(production)
+            return 0
         if action == "questions":
             questions(production, cast(Path | None, args.state), identities=identities)
             for line in adopt_moved_state(production):
@@ -2695,9 +2715,7 @@ def main() -> int:
             return 0
         for line in adopt_moved_state(production, record=identities.record if identities is not None else None):
             report("state-dir", "ok", line)
-        if action == "register":
-            register(production)
-        elif action == "time":
+        if action == "time":
             report("time", "ok", production_time(production, cast(str, args.stamp)))
         elif action == "log":
             append_log(production, cast(str, args.event), cast(Path | None, args.state), cast(bool, args.before_compaction))

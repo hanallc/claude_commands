@@ -41,6 +41,30 @@ if [ -f "$TEST_HOOK_FAIL" ]; then exit 9; fi
         common = self.git("rev-parse", "--path-format=absolute", "--git-common-dir").stdout.strip()
         return Path(common) / "post-push-completed"
 
+    def test_fetches_the_symbolic_remote_head_without_updating_local_refs(self) -> None:
+        writer = self.root / "writer"
+        _ = self.git("clone", str(self.remote), str(writer))
+        _ = self.git("-C", str(writer), "switch", "-c", "trunk", "origin/main")
+        _ = self.git("-C", str(writer), "commit", "--allow-empty", "-m", "Publish trunk.")
+        commit = self.git("-C", str(writer), "rev-parse", "HEAD").stdout.strip()
+        _ = self.git("-C", str(writer), "push", "origin", "trunk")
+        _ = self.git("-C", str(self.remote), "symbolic-ref", "HEAD", "refs/heads/trunk")
+        old_head = self.run_in_repo("git", "symbolic-ref", "--quiet", "refs/remotes/origin/HEAD")
+        if old_head.returncode == 0:
+            _ = self.git("symbolic-ref", "--delete", "refs/remotes/origin/HEAD")
+        fetch_head = self.write(self.repo / ".git/FETCH_HEAD", "saved fetch state\n")
+        columns = ("--format=%(refname) %(objectname) %(symref)",)
+        refs = self.git("for-each-ref", *columns).stdout
+        self.assertNotEqual(self.run_in_repo("git", "cat-file", "-e", commit).returncode, 0)
+
+        tip = land_main.remote_branch_tip(self.repo, "origin", land_main.RemoteDefaultBranch.HEAD,
+                                         time_limit=land_main.CommandTimeLimit(10))
+
+        self.assertEqual((tip.branch, tip.commit), ("trunk", commit))
+        self.assertEqual(self.git("cat-file", "-t", commit).stdout.strip(), "commit")
+        self.assertEqual(self.git("for-each-ref", *columns).stdout, refs)
+        self.assertEqual(fetch_head.read_text(), "saved fetch state\n")
+
     def test_push_runs_the_hook_from_the_checkout_root_with_the_full_commit(self) -> None:
         self.install_hook()
         expected: list[str] = []

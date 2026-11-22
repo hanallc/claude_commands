@@ -24,6 +24,7 @@ from scripts.lib import build_folders
 from scripts.worktree import worktrees
 from scripts.lib.git_exclude import ensure_excluded
 from scripts.production import showrunner_tree
+from scripts.production.production_names import LIVE_DOCUMENT_SUFFIX, MERGE_CHECKOUT_FIELD
 from scripts.production.add_showrunner import NoEndingTab, herdr_tab_open
 from scripts.herdr import herdr
 from scripts.production.production_doc import Production, Refusal, production_field, read_production, read_new_production, optional_field, FieldPresent
@@ -100,13 +101,8 @@ class NoStyleProduction:
     name: str
 
     @property
-    def checkout(self) -> Path:
-        return build_folders.worktree_path(build_folders.repo_word(self.repository), self.name,
-                                           worktrees.UNIT_WORKTREE_NAME)
-
-    @property
     def doc(self) -> Path:
-        return self.checkout / "docs" / f"{self.name}-production.md"
+        return self.repository / "docs" / f"{self.name}-production{LIVE_DOCUMENT_SUFFIX}"
 
 
 @dataclass(frozen=True)
@@ -159,10 +155,12 @@ def _style_production(repo_dir: Path, *, include_direct: bool) -> StandingStyleP
         lines = doc.read_text().splitlines()
         if optional_field(lines, "Kind") == FieldPresent("style"):
             branch_point = production_field(lines, "Branch point").removeprefix("refs/heads/")
+            if staff.declares_merge_checkout(lines):
+                checkout = read_production(row).checkout
             return StandingStyleProduction(repository, row.name, checkout, doc, branch_point)
         if include_direct and style_config.has_style_units(lines):
             config = style_config.read_config(doc)
-            return StandingStyleProduction(repository, row.name, checkout, doc, config.route.branch_point)
+            return StandingStyleProduction(repository, row.name, config.route.checkout, doc, config.route.branch_point)
     return NoStyleProduction(repository, f"{repository.name}-style")
 
 
@@ -170,8 +168,38 @@ def style_production_branch(name: str) -> str:
     return f"{name}-{worktrees.UNIT_WORKTREE_NAME}"
 
 
+def _integration_style_branch(branch: str, production: str) -> bool:
+    return branch.endswith(f"-integration-{production}")
+
+
 def is_style_production_branch(branch: str, production: str) -> bool:
-    return branch.startswith(LEGACY_STYLE_BRANCH_PREFIX) or branch == style_production_branch(production)
+    return (branch.startswith(LEGACY_STYLE_BRANCH_PREFIX) or branch == style_production_branch(production)
+            or _integration_style_branch(branch, production))
+
+
+@dataclass(frozen=True)
+class UnfinishedStyleCheckout:
+    checkout: Path
+    doc: Path
+    branch: str
+
+
+def _unfinished_style_checkout(standing: NoStyleProduction) -> UnfinishedStyleCheckout | None:
+    repository, name = standing.repository, standing.name
+    checkout = build_folders.worktree_path(build_folders.repo_word(repository), name, worktrees.UNIT_WORKTREE_NAME)
+    branches = worktrees.worktree_branches(repository)
+    for candidate in (checkout, checkout.with_name("production")):
+        doc = candidate / "docs" / f"{name}-production.md"
+        if doc.is_file():
+            branch = production_field(doc.read_text().splitlines(), "Merge branch")
+            return UnfinishedStyleCheckout(candidate, doc, branch)
+        branch = branches.get(candidate.resolve(), "")
+        if not branch and (record := worktrees.checkout_record(candidate)) is not None:
+            if Path(record.repo) == repository:
+                branch = record.branch
+        if is_style_production_branch(branch, name):
+            return UnfinishedStyleCheckout(candidate, standing.doc, branch)
+    return None
 
 
 def _request(name: str) -> StyleProduction:
@@ -184,30 +212,26 @@ def _request(name: str) -> StyleProduction:
     branch_point = parent.merge_branch.removeprefix("refs/heads/")
     _ = _git(repository, "check-ref-format", f"refs/heads/{branch_point}")
     branch_tip = _git(repository, "rev-parse", "--verify", f"refs/heads/{branch_point}^{{commit}}")
-    checkout, doc = standing.checkout, standing.doc
-    legacy_checkout = checkout.with_name("production")
-    legacy_doc = legacy_checkout / "docs" / doc.name
-    if isinstance(standing, NoStyleProduction) and not doc.is_file() and legacy_doc.is_file():
-        checkout, doc = legacy_checkout, legacy_doc
-    if isinstance(standing, StandingStyleProduction) or doc.is_file():
-        merge_branch = production_field(doc.read_text().splitlines(), "Merge branch")
+    if isinstance(standing, StandingStyleProduction):
+        checkout, doc = standing.checkout, standing.doc
+        branch = read_production(standing.name).merge_branch
     else:
-        merge_branch = style_production_branch(name)
-        branches = worktrees.worktree_branches(repository)
-        for candidate, candidate_doc in ((checkout, doc), (legacy_checkout, legacy_doc)):
-            branch = branches.get(candidate.resolve(), "")
-            if not branch and (record := worktrees.checkout_record(candidate)) is not None:
-                if Path(record.repo) == repository:
-                    branch = record.branch
-            if is_style_production_branch(branch, name):
-                checkout, doc, merge_branch = candidate, candidate_doc, branch
-                break
+        route = _unfinished_style_checkout(standing)
+        if route is not None:
+            checkout, doc, branch = route.checkout, route.doc, route.branch
         else:
-            legacy_branch = LEGACY_STYLE_BRANCH_PREFIX + branch_point.replace("/", "-")
-            if not worktrees.has_branch(repository, merge_branch) and worktrees.has_branch(repository, legacy_branch):
-                merge_branch = legacy_branch
+            from scripts.production.production_lifecycle import require_guard_ready
+
+            require_guard_ready()
+            merge_unit = staff.serving_merge_unit(parent.owner.id)
+            if merge_unit is None:
+                raise Refusal(f"{parent.name}: add a serving merge unit before creating the style production")
+            suffix = f"integration-{name}"
+            checkout = build_folders.worktree_path(build_folders.repo_word(repository), merge_unit.name, suffix)
+            doc = standing.doc
+            branch = f"{merge_unit.name}-{suffix}"
     return StyleProduction(
-        parent, repository, name, branch_point, branch_tip, merge_branch, checkout, doc, proposals,
+        parent, repository, name, branch_point, branch_tip, branch, checkout, doc, proposals,
         tuple(line for line in lines if line.startswith("- **Merge tests:** ")),
     )
 
@@ -262,7 +286,8 @@ def _check_existing(style: StyleProduction) -> bool:
         branch_point = _recorded_branch_point(style)
         if branch_point:
             _require_branch_point(style, branch_point)
-        elif (style.checkout / ".git").exists() or worktrees.checkout_record(style.checkout) is not None:
+        elif (style.merge_branch == style_production_branch(style.name)
+              and ((style.checkout / ".git").exists() or worktrees.checkout_record(style.checkout) is not None)):
             raise Refusal(f"{style.checkout}: no recorded branch point for {style.merge_branch}")
     if (style.checkout / ".git").exists():
         common = _git(style.checkout, "rev-parse", "--path-format=absolute", "--git-common-dir")
@@ -285,6 +310,7 @@ def _production_text(style: StyleProduction) -> str:
         "- **Kind:** style",
         f"- **Branch point:** {style.branch_point}",
         f"- **Showrunner checkout:** {style.checkout}",
+        f"- **{MERGE_CHECKOUT_FIELD}:** {style.repository}",
         f"- **Log:** {style.log}",
         f"- **Proposals:** {style.proposals}",
         "- **Updates:** on demand", "- **Push:** git", *style.merge_tests, "",
@@ -372,7 +398,8 @@ def _pilot_steps(steps: tuple[str, ...], pilot: AllStyleUnits | PilotUnits, name
 
 
 def _exclude(style: StyleProduction) -> None:
-    patterns = ("/docs/style-production/", f"/docs/{style.doc.name}", f"/{style.log.as_posix()}")
+    relative_doc = style.doc.relative_to(style.repository if style.doc.is_relative_to(style.repository) else style.checkout)
+    patterns = ("/docs/style-production/", f"/{relative_doc.as_posix()}", f"/{style.log.as_posix()}")
     for pattern in patterns:
         ensure_excluded(style.repository, pattern)
 
@@ -443,7 +470,7 @@ def _steps(style: StyleProduction, existing: bool) -> tuple[str, ...]:
         (f"set Proposals in existing production doc {style.doc}"
          if style.doc.exists() else f"write missing production doc {style.doc}"),
         f"write missing standing plans for the configured units under {style.checkout / PLAN_DIRECTORY}",
-        f"exclude docs/style-production/, {style.doc.relative_to(style.checkout)} and {style.log} in shared info/exclude",
+        f"exclude docs/style-production/, {style.doc} and {style.log} in shared info/exclude",
         f"initialize ledger at {style.branch_tip} with {style.merge_branch}; launch via add_showrunner.py",
     )
 
@@ -459,6 +486,10 @@ def main(argv: list[str]) -> int:
     try:
         style = _request(cast(str, args.production))
         existing = _check_existing(style)
+        standing = standing_style_production(style.repository)
+        if (isinstance(standing, NoStyleProduction) and not (style.checkout / ".git").exists()
+                and not worktrees.pending_checkout(style.checkout, style.repository, style.merge_branch)):
+            raise Refusal(f"the serving merge unit must prepare {style.checkout} on {style.merge_branch}")
         pilot_arguments = cast(list[str], args.pilot)
         if existing and pilot_arguments:
             raise Refusal(f"--pilot applies only while creating {style.name}")
@@ -476,14 +507,21 @@ def main(argv: list[str]) -> int:
         branch = (build_folders.ExistingWorktreeBranch(style.merge_branch)
                   if worktrees.has_branch(style.repository, style.merge_branch)
                   else build_folders.NewWorktreeBranch(style.merge_branch, style.branch_tip))
-        layout = worktrees.unit_checkout_output(style.checkout, build_folders.repo_word(style.repository), style.name)
-        if not style.doc.is_file() and style.merge_branch == style_production_branch(style.name):
+        repo_word = build_folders.repo_word(style.repository)
+        record = worktrees.checkout_record(style.checkout)
+        if _integration_style_branch(style.merge_branch, style.name):
+            layout = (record.layout if record is not None else
+                      worktrees.output_record(repo_word, style.checkout.parent.name, style.checkout.name))
+        else:
+            layout = worktrees.unit_checkout_output(style.checkout, repo_word, style.name)
+        if not style.doc.is_file() and not style.merge_branch.startswith(LEGACY_STYLE_BRANCH_PREFIX):
             _record_branch_point(style)
         _ = worktrees.create_checkout(style.checkout, style.repository, branch, layout, owner=style.name,
                                       allow_empty=True, allow_existing=True)
         if existing:
             _attach(style)
             return 0
+        _exclude(style)
         _write_missing(style.doc, _production_text(style))
         _update_destination(style)
         config = style_config.read_config(style.doc)
@@ -491,7 +529,6 @@ def main(argv: list[str]) -> int:
             _write_missing(style.checkout / PLAN_DIRECTORY / f"{assignment.unit}-unit.md", _plan_text(style, assignment, catalog))
         if isinstance(pilot, PilotUnits):
             _configure_pilot(style, pilot)
-        _exclude(style)
         style_tip = _git(style.repository, "rev-parse", "--verify", f"refs/heads/{style.merge_branch}^{{commit}}")
         with style_ledger.open_ledger(style.checkout) as ledger:
             ledger.ensure_synced_tip(style_tip, style.merge_branch)

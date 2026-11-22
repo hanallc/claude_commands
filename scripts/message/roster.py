@@ -29,7 +29,7 @@ from scripts.message import codex_daemon  # noqa: E402
 from scripts.message import process_table  # noqa: E402
 from scripts.message import sessions  # noqa: E402
 from scripts.production import staff, session_staff
-from scripts.production.production_doc import Refusal as ProductionDocumentRefused
+from scripts.production.production_doc import EnrolledPaths, ProductionPathsError, Refusal as ProductionDocumentRefused
 from scripts.accounts import role_map
 if TYPE_CHECKING:
     from scripts.accounts.role_map import role_map_command
@@ -1258,7 +1258,9 @@ def _unit_workers(
                     existing = claude_entries.get(row.current_session)
                     if (isinstance(state, worker_panes.OpenWorker)
                             and not isinstance(backend, staff.CodexBackend) and existing is not None):
-                        entries.append(replace(existing, role="worker", director=director, showrunner=showrunner))
+                        paths = worker_panes.enrolled_worker_owner(parent)
+                        cwd = str(paths.main) if isinstance(paths, EnrolledPaths) else existing.cwd
+                        entries.append(replace(existing, role="worker", director=director, showrunner=showrunner, cwd=cwd))
                         continue
                     if isinstance(state, worker_panes.OpenWorker):
                         status = f"{state.status}; pane {state.pane}"
@@ -1277,14 +1279,14 @@ def _unit_workers(
                     entries.append(RosterEntry(
                         machine=machine, kind="codex" if isinstance(backend, staff.CodexBackend) else "claude",
                         role="worker", name=row.name, status=status, reach=reach,
-                        cwd=str(session_staff.worker_directory(membership, row.id)),
+                        cwd=str(worker_panes.worker_directory(membership, row.id)),
                         showrunner=showrunner, director=director,
                         assignment=assignment,
                         thread=CodexThread(row.current_session) if isinstance(backend, staff.CodexBackend) else NoCodexThread(),
                         session=ClaudeSession(row.current_session) if isinstance(backend, staff.ClaudeBackend) else NoClaudeSession(),
                         account=_codex_home_account(backend.codex_home) if isinstance(backend, staff.CodexBackend)
                         else AccountUnread("worker account not read")))
-    except (OSError, ValueError, herdr_types.HerdrFailure, ProductionDocumentRefused) as error:
+    except (OSError, ValueError, herdr_types.HerdrFailure, ProductionDocumentRefused, ProductionPathsError) as error:
         _problem(problems, "pane workers", error)
     # Blind review rows have no native address and cannot identify either participant.
     if isinstance(participants, MessageParticipants):

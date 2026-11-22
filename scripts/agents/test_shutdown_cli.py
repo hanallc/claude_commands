@@ -45,15 +45,18 @@ from scripts.lib import (
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.cargo_output_test_support import fake_cargo_output_roots
 from scripts.lib.conf import UseConfiguredValue
+from scripts.lib.git_test_support import fixture_git_environment as shared_fixture_git_environment
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.unit_runs_test_support import bind_private_run_roots
 from scripts.message import session_records, sessions, session_send
 from scripts.message.sessions import SessionRecord
 from scripts.production import (
     unit_lookup, unit_move, staff, staff_test_support, unit_config, add_unit, completion_receipt, worker,
-    rename_unit_test_support,
+    production_admission, production_doc, production_lifecycle, rename_unit_test_support, update_registration,
 )
-from scripts.production.production_doc import Production, read_production
+from scripts.production.production_doc import Production, Refusal, read_production
+from scripts.production.add_showrunner_test_support import write_guard_proof
+from scripts.production.production_names import GUARD_READY_FILE, MERGE_CHECKOUT_FIELD
 from scripts.production.staff import StaffId
 from scripts.production.staff_test_support import (
     foreign_hostname,
@@ -76,6 +79,7 @@ from scripts.production.rename_test_support import (
 from scripts.production.rename_rerun_test_support import file_versions, final_files, saved_fixture
 from scripts.production.cli_fixture import invoke_cli
 from scripts.production.rename_unit_test_support import FolderRenameFixture, FolderSessionFixture, UnitRenameFixture
+from scripts.usage import agents_log
 
 class AgentsUsageTests(unittest.TestCase):
     def test_resume_dwight_admits_the_first_conversation_and_retains_the_live_conversation(self) -> None:
@@ -2983,6 +2987,14 @@ class WorkerRenameTests(StaffTestCase):
 
 @final
 class ProductionRenameTests(support.ProductionRenameFixture):
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        git_environment = shared_fixture_git_environment(self.root.parent)
+        self.env.update({key: value for key, value in git_environment.items() if key.startswith("GIT_")})
+        with mock.patch.dict(os.environ, self.env, clear=True):
+            _ = production_admission.capture_rollout_inventory([self.production_row().id])
+
     def test_same_name_keeps_a_pane_with_another_native_session(self) -> None:
         row = self.production_row()
         displays = support.RenameDisplays(row)
@@ -3077,7 +3089,17 @@ class ProductionRenameTests(support.ProductionRenameFixture):
         self.assertEqual(self.snapshot(), before)
 
     def test_retry_after_doc_move_updates_the_live_doc_on_the_same_staff_id(self) -> None:
+        forms = ("legacy", "guarded", "migrated")
+        stages = ("complete", "before staff", "after staff")
+        cases = [(form, stage) for form in forms for stage in stages]
+        cases.extend((("legacy", "before move"), ("legacy", "atomic source save"),
+                      ("legacy alias", "after staff"), ("legacy", "interrupted capture")))
         with saved_fixture(self.root) as restore:
+            for form, stage in cases:
+                with self.subTest(form=form, stage=stage):
+                    restore()
+                    with mock.patch.dict(os.environ, self.env, clear=True):
+                        self.check_admitted_document_rename(form, stage)
             for legacy, collision in ((False, ""), (True, ""),
                                       (False, "source tracked"), (False, "source removed")):
                 with self.subTest(legacy=legacy, collision=collision):
@@ -3120,6 +3142,163 @@ class ProductionRenameTests(support.ProductionRenameFixture):
                     self.assert_success(self.run_command(OLD, NEW, "--to-doc", str(self.new_doc), "--to-branch", NEW))
                     self.assertEqual(self.snapshot(), before)
                     self.assertEqual({path: path.read_bytes() for path in legacy_files}, legacy_files)
+
+    def check_admitted_document_rename(self, form: str, stage: str) -> None:
+        owner = self.production_row()
+        legacy = self.doc
+        source, destination = legacy, self.new_doc
+        machine = remote.local_machine()
+        folder = production_admission.admission_folder()
+        receipt = folder / f"{owner.id}.json"
+        inventory = folder / "rollout-inventory.json"
+        if form in ("guarded", "legacy alias") or stage == "interrupted capture":
+            receipt.unlink()
+            inventory.unlink()
+        if form == "legacy alias":
+            alias = source.parent / "alias" / ".." / source.name
+            (source.parent / "alias").mkdir()
+            owner = staff.set_doc(owner.id, staff.LiveDoc(machine, alias))
+            form = "legacy"
+        frozen = b""
+        if stage == "interrupted capture":
+            def stop_capture(path: Path, content: str) -> bool:
+                if path == receipt:
+                    raise OSError("Stopped before publishing the receipt")
+                return atomic_file.create_text_atomic(path, content)
+
+            with (mock.patch.object(production_admission, "create_text_atomic", side_effect=stop_capture),
+                  self.assertRaisesRegex(OSError, "Stopped before publishing the receipt")):
+                _ = production_admission.capture_rollout_inventory([owner.id])
+            self.assertTrue(inventory.is_file())
+            self.assertFalse(receipt.exists())
+            self.check_rename_refuses_without_receipt(owner, destination)
+            return
+        if form in ("legacy", "migrated"):
+            inventory = production_admission.capture_rollout_inventory([owner.id])
+            frozen = inventory.read_bytes()
+        if form != "legacy":
+            _ = self.git("switch", "-c", "main")
+            integration = self.root / "integration"
+            _ = self.git("worktree", "add", str(integration), OLD)
+            source = legacy.with_name("old-production-live.md")
+            destination = self.new_doc.with_name("new-production-live.md")
+            log = self.checkout / "production.log"
+            self.write(log, "Fixture LOG.\n")
+            excludes = self.checkout / ".git/info/exclude"
+            with excludes.open("a", encoding="utf-8") as output:
+                for path in (source, log):
+                    _ = output.write(f"\n/{path.relative_to(self.checkout).as_posix()}\n")
+            self.write(source, legacy.read_text().replace(
+                f"- **Showrunner checkout:** `{self.checkout}`",
+                f"- **Showrunner checkout:** `{integration}`\n"
+                + f"- **Repository:** `{self.checkout}`\n"
+                + f"- **{MERGE_CHECKOUT_FIELD}:** `{self.checkout}`"))
+            if form == "migrated":
+                production_admission.record_verified_move(read_production(owner), source)
+            owner = staff.set_doc(owner.id, staff.LiveDoc(machine, source))
+            if form == "guarded":
+                write_guard_proof(self.root, self.state, self.checkout)
+                with mock.patch.object(production_doc, "GUARD_REPOSITORY", self.checkout):
+                    production_admission.require_admission(read_production(owner))
+                (self.state / GUARD_READY_FILE).unlink()
+
+        binding = staff.LiveDoc(machine, destination)
+        rename = (OLD, NEW, "--to-doc", str(destination), "--to-branch", OLD)
+        if stage in ("before move", "atomic source save"):
+            prepare = production_admission.prepare_document_rebind
+
+            def stop_before_move(row: staff.StaffRow, target: production_admission.DocumentBinding) -> None:
+                prepare(row, target)
+                raise OSError("Stopped before moving the document")
+
+            with mock.patch.object(production_admission, "prepare_document_rebind", side_effect=stop_before_move):
+                interrupted = self.run_command(*rename)
+            self.assertIn("Stopped before moving the document", interrupted.stderr)
+            self.assertTrue(source.is_file())
+            self.assertFalse(destination.exists())
+            self.assertIn('"pending"', receipt.read_text())
+            if stage == "atomic source save":
+                write_text_atomic(source, source.read_text() + "\nAn edit before the rename.\n")
+        elif stage != "complete":
+            set_doc = staff.set_doc
+
+            def interrupt(identity: staff.StaffId, doc: staff.LiveDoc, *, expected: staff.LiveDoc) -> staff.StaffRow:
+                self.assertIn('"pending"', receipt.read_text())
+                if stage == "after staff":
+                    _ = set_doc(identity, doc, expected=expected)
+                raise OSError("Stopped during document publication")
+
+            with mock.patch.object(staff, "set_doc", side_effect=interrupt):
+                interrupted = self.run_command(*rename)
+            self.assertIn("Stopped during document publication", interrupted.stderr)
+            self.assertFalse(source.exists())
+            self.assertTrue(destination.is_file())
+            current = staff.by_id(owner.id)
+            assert current is not None
+            self.assertEqual(current.doc, binding if stage == "after staff" else owner.doc)
+
+        content = (source if source.exists() else destination).read_bytes()
+        result = self.run_command(*rename)
+        self.assert_success(result)
+        self.assertNotIn("anomaly: document_move", result.stderr)
+        renamed = staff.by_id(owner.id)
+        assert renamed is not None
+        self.assertEqual(renamed.doc, binding)
+        self.assertNotIn('"pending"', receipt.read_text())
+        self.assertFalse(source.exists())
+        self.assertEqual(destination.read_bytes(), content)
+        self.check_renamed_document_admission(renamed)
+
+        if form in ("legacy", "migrated"):
+            self.assertEqual(production_admission.capture_rollout_inventory([owner.id]).read_bytes(), frozen)
+        if form == "migrated":
+            rolled_back = staff.set_doc(owner.id, staff.LiveDoc(machine, legacy))
+            production_admission.require_admission(read_production(rolled_back))
+            _ = staff.set_doc(owner.id, binding)
+        unrelated = self.checkout / "docs/plans/unrelated.md"
+        self.write(unrelated, self.production_doc())
+        for rejected in (staff.LiveDoc(machine, unrelated),
+                         staff.LiveDoc(remote.other_machine(), destination)):
+            with self.assertRaisesRegex(staff.StaffRefused, "requires a prepared move"):
+                _ = staff.set_doc(owner.id, rejected)
+            self.assertEqual(staff.by_id(owner.id), renamed)
+        uncaptured = fixture_member("showrunner", name="uncaptured", doc=staff.LiveDoc(machine, unrelated))
+        with self.assertRaisesRegex(Refusal, GUARD_READY_FILE):
+            production_admission.require_admission(read_production(uncaptured))
+
+    def check_rename_refuses_without_receipt(self, owner: staff.StaffRow, destination: Path) -> None:
+        document = self.doc.read_bytes()
+        index = (self.git("ls-files", "--stage"), self.git("rev-parse", "HEAD"))
+        refused = self.run_command(OLD, NEW, "--to-doc", str(destination), "--to-branch", NEW)
+        self.assertNotEqual(refused.returncode, 0, refused.stdout + refused.stderr)
+        self.assertIn("requires an admission receipt", refused.stderr)
+        current = staff.by_id(owner.id)
+        assert current is not None
+        self.assertEqual(current, owner)
+        binding = staff.LiveDoc(remote.local_machine(), destination)
+        with self.assertRaisesRegex(staff.StaffRefused, "requires an admission receipt"):
+            production_admission.prepare_document_rebind(current, binding)
+        with self.assertRaisesRegex(staff.StaffRefused, "requires an admission receipt"):
+            _ = production_admission.complete_document_rebind(current, binding)
+        self.assertEqual(self.doc.read_bytes(), document)
+        self.assertFalse(destination.exists())
+        self.assertEqual((self.git("ls-files", "--stage"), self.git("rev-parse", "HEAD")), index)
+
+    def check_renamed_document_admission(self, owner: staff.StaffRow) -> None:
+        production = read_production(owner)
+        lines = production.doc.read_text().splitlines()
+        with mock.patch.object(production_lifecycle, "checkout_ready", side_effect=RuntimeError("Admission passed")):
+            for operation in ("load", "open"):
+                with self.subTest(operation=operation), self.assertRaisesRegex(RuntimeError, "Admission passed"):
+                    if operation == "load":
+                        production_lifecycle.load(production, lines, False, None)
+                    else:
+                        production_lifecycle.open_production(production, lines)
+        with (mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": owner.current_session}),
+              mock.patch.object(agents_log, "append"),
+              mock.patch.object(update_registration, "resolve_production_paths", side_effect=RuntimeError("Admission passed")),
+              self.assertRaisesRegex(RuntimeError, "Admission passed")):
+            update_registration.register(production)
 
     def production_row(self) -> staff.StaffRow:
         return next(row for row in staff.find(kind="showrunner") if row.name == OLD)
@@ -3347,19 +3526,20 @@ class ProductionRenameTests(support.ProductionRenameFixture):
         content = self.doc.read_bytes()
         set_doc = staff.set_doc
 
-        def publish(identity: staff.StaffId, doc: staff.LiveDoc | staff.WrappedDoc) -> staff.StaffRow:
+        def publish(identity: staff.StaffId, doc: staff.LiveDoc | staff.WrappedDoc, *,
+                    expected: production_admission.DocumentBinding) -> staff.StaffRow:
             self.assertEqual(identity, row.id)
             self.assertFalse(self.doc.exists())
             self.assertEqual(self.new_doc.read_bytes(), content)
             current = staff.by_id(identity)
             assert current is not None
             self.assertEqual(current.doc, row.doc)
-            return set_doc(identity, doc)
+            return set_doc(identity, doc, expected=expected)
 
         with mock.patch.object(staff, "set_doc", side_effect=publish) as published:
             self.assert_success(self.run_command(OLD, NEW,
                 "--to-doc", str(self.new_doc), "--to-branch", NEW))
-        published.assert_called_once_with(row.id, staff.LiveDoc("natedev", self.new_doc))
+        published.assert_called_once_with(row.id, staff.LiveDoc("natedev", self.new_doc), expected=row.doc)
         self.assertEqual(staff.by_id(row.id), replace(row, name=NEW, doc=staff.LiveDoc("natedev", self.new_doc)))
         self.assertEqual(self.git("branch", "--show-current"), NEW)
         before = self.file_versions()
@@ -4236,9 +4416,17 @@ class UnitRenameTests(UnitRenameFixture):
                         self.assertIsInstance(row.parent, staff.ReportsTo)
                         assert isinstance(row.parent, staff.ReportsTo)
                         document = destination / "docs/plans/alpha.md"
+                        self.write(document, document.read_text() + "\n".join((
+                            "", "## Production Context", "",
+                            f"- **Merge branch:** `{final_branch}`",
+                            f"- **Showrunner checkout:** `{destination}`",
+                            "- **Log:** `production.log`", "",
+                        )))
                         content = document.read_bytes()
                         promoted = staff.promote_unit(row.id, name="gamma", parent=row.parent.id,
                             doc=staff.LiveDoc("natedev", document))
+                        with mock.patch.dict(os.environ, self.env, clear=True):
+                            _ = production_admission.capture_rollout_inventory([promoted.id])
                         new_document = document.with_name("omega.md")
                         moved = self.invoke(["rename", str(promoted.id), "omega", "--to-doc", str(new_document),
                                              "--to-branch", "promoted-omega"])

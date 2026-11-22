@@ -1823,7 +1823,9 @@ class FolderMoveReviewTests(FolderRenameFixture):
         from scripts.production.staff_test_support import fixture_member
 
         parent = fixture_member("showrunner", name="receiving")
-        production = Production(self.checkout / "receiving-production.md", "receiving", "main",
+        document = self.checkout / "receiving-production.md"
+        _ = document.write_text("# Receiving production\n")
+        production = Production(document, "receiving", "main",
                                 self.checkout, self.checkout / "production.log", ZoneInfo("UTC"), parent)
         request = transfer_unit.UnitTransfer(self.owner, parent, production, "source")
         lock = self.staff_file.parent / "rows" / f"{self.owner.id}.lock"

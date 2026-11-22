@@ -90,5 +90,6 @@ scripts/message/process_table.py
 scripts/message/relay_identity.py
 scripts/message/session_records.py
 scripts/message/sessions.py
+scripts/production/production_names.py
 scripts/production/staff.py
 scripts/test_times/gate_record.py

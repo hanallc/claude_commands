@@ -50,7 +50,11 @@ from scripts.lib.user_zone import user_zone  # noqa: E402
 from scripts.production import issues  # noqa: E402
 from scripts.production.proposals_folder import owner_docs, scope_docs  # noqa: E402
 from scripts.production import change_routing, delivery_state, session_staff, showrunner_tree, showrunners, staff, unit_config, unit_lookup
-from scripts.production.production_doc import ProductionDocument, Refusal, production_field
+from scripts.production.production_doc import (
+    EnrolledPaths, LegacyProduction, ProductionDocument, ProductionPathsError, Refusal, production_field,
+    resolve_production_paths,
+)
+from scripts.production.production_names import MERGE_CHECKOUT_FIELD
 from scripts.review_links import image_store, review_events, review_later
 from scripts.agents import remote
 
@@ -1392,6 +1396,29 @@ def _found_repo(repos: Iterable[Path], sha: str) -> Path | None:
         capture_output=True, check=False).returncode == 0), None)
 
 
+@dataclass(frozen=True)
+class EnrolledReviewCheckouts:
+    main: Path
+    integration: Path
+
+
+def enrolled_review_checkouts(doc: Path, lines: list[str], *, record: staff.StaffSnapshot | None = None
+                              ) -> EnrolledReviewCheckouts | LegacyProduction:
+    """Read historical checkout paths from the exact wrapped document."""
+    if not staff.declares_merge_checkout(lines):
+        return LegacyProduction()
+    record = staff.snapshot() if record is None else record
+    machine = remote.local_machine()
+    if any(isinstance(row.doc, staff.WrappedDoc) and row.doc.machine == machine and row.doc.path == doc.absolute()
+           for row in record.find(kind="showrunner")):
+        return EnrolledReviewCheckouts(Path(production_field(lines, MERGE_CHECKOUT_FIELD)).expanduser(),
+                                       Path(production_field(lines, "Showrunner checkout")).expanduser())
+    paths = resolve_production_paths(doc)
+    if isinstance(paths, EnrolledPaths):
+        return EnrolledReviewCheckouts(paths.main, paths.integration)
+    raise ProductionPathsError(f"{doc}: enrollment changed during review")
+
+
 class Tree:
     """The productions one list belongs to: the units they list, their repositories and merge branches."""
 
@@ -1407,11 +1434,21 @@ class Tree:
                 lines = doc.read_text(encoding="utf-8").splitlines()
             except OSError:
                 continue
-            for field in ("Repository", "Showrunner checkout"):
-                try:
-                    repo = Path(production_field(lines, field)).expanduser()
-                except Refusal:
-                    continue
+            try:
+                paths = enrolled_review_checkouts(doc, lines, record=self.record)
+            except Refusal as error:
+                raise ChangeReviewError(str(error)) from error
+            if isinstance(paths, EnrolledReviewCheckouts):
+                repositories = (paths.main, paths.integration)
+            else:
+                legacy: list[Path] = []
+                for field in ("Repository", "Showrunner checkout"):
+                    try:
+                        legacy.append(Path(production_field(lines, field)).expanduser())
+                    except Refusal:
+                        continue
+                repositories = tuple(legacy)
+            for repo in repositories:
                 if repo not in self.repos:
                     self.repos.append(repo)
                 try:
@@ -2316,7 +2353,7 @@ def production_doc(production: str, *, record: staff.StaffSnapshot | None = None
         if isinstance(row.doc, (staff.LiveDoc, staff.WrappedDoc)):
             return row.doc.path
         raise ChangeReviewError(f"{row.name}: no production document")
-    found = showrunners.production_of(os.environ.get("CLAUDE_CODE_SESSION_ID", ""))
+    found = showrunners.production_of(staff.runtime_id(), record=record)
     if found is None:
         raise ChangeReviewError("this session is no production's showrunner; pass --production <name>")
     return found

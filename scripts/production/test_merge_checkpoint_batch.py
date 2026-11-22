@@ -23,6 +23,10 @@ def setUpModule() -> None:
     configure_test_environment()
 
 
+def is_checkpoint_merge(arguments: tuple[str, ...]) -> bool:
+    return arguments[:1] == ("merge",) and "--no-ff" in arguments
+
+
 @final
 class MergeCheckpointBatchTests(MergeCheckpointFixture):
     def batch_line(self, unit: str, phase: str, checkpoint: str, *flags: str) -> str:
@@ -385,7 +389,7 @@ subprocess.run(["git", "-C", {str(self.root / "main-fix-writer")!r}, "push", "or
                         elif args[:2] == ("reset", "--keep"):
                             cleanup.append("reset")
                     result = git(checkout, *args)
-                    if args == ("merge", "--no-ff", "-m", "Merge origin/main into production", main):
+                    if is_checkpoint_merge(args) and args[-1] == main:
                         self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
                         conflict_tips.append(self.git("rev-parse", "HEAD"))
                         if fault == "origin moves":
@@ -519,7 +523,7 @@ Path({str(saved_index)!r}).write_bytes(Path(".git/index").read_bytes())
                 git = merge_checkpoint.git
 
                 def git_with_fault(checkout: Path, *args: str) -> subprocess.CompletedProcess[str]:
-                    attempted_merge = args[:2] == ("merge", "--no-ff")
+                    attempted_merge = is_checkpoint_merge(args)
                     if attempted_merge:
                         self.assertEqual(self.batch_record().read_text().splitlines()[-1], f"in-flight\t{args[-1]}")
                     if hook_rejects and attempted_merge and args[-1] == hook_target:
@@ -627,7 +631,7 @@ raise SystemExit(1)
         git = merge_checkpoint.git
 
         def fail_after_autostash(checkout: Path, *args: str) -> subprocess.CompletedProcess[str]:
-            if args[:2] == ("merge", "--no-ff") and args[-1] == main:
+            if is_checkpoint_merge(args) and args[-1] == main:
                 self.assertEqual(self.git("rev-parse", "HEAD"), published)
                 self.assertFalse(merge_head.exists())
                 self.write(self.checkout, "src/beta.txt", "local edit\n")

@@ -4,7 +4,9 @@ from __future__ import annotations
 import io
 import json
 import os
+import shutil
 import subprocess
+import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import replace
@@ -17,8 +19,10 @@ from unittest import mock
 from scripts.accounts import accounts
 from scripts.herdr import herdr
 from scripts.lib.atomic_file import write_text_atomic
+from scripts.lib.git_test_support import fixture_git_environment
 from scripts.production import add_unit, demote_showrunner as demote, promote_showrunner, session_staff, showrunners, staff, transfer_unit, unit_config, unit_effort, unit_lookup, update_registration
 from scripts.production.production_doc import Production, read_production
+from scripts.production.production_names import MERGE_CHECKOUT_FIELD
 from scripts.production.staff_test_support import StaffTestCase, fixture_member
 from scripts.agents import pane_record, remote, stop_resume
 
@@ -73,6 +77,9 @@ class DemoteShowrunnerTests(StaffTestCase):
     @override
     def setUp(self) -> None:
         super().setUp()
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
+            **fixture_git_environment(self.root), "GIT_CONFIG_SYSTEM": os.devnull,
+        }, clear=True)))
         self.checkout = self.root / "parent"
         self.checkout.mkdir()
         self.child_tree = self.root / self.child_branch
@@ -614,11 +621,46 @@ class DemoteShowrunnerTests(StaffTestCase):
         _ = self.retired_unit("old", "deleted-branch")
         _ = self.git("-C", str(self.child_tree), "switch", "-c", "temporary-branch")
         fields: dict[str, object] = {}
-        for count, saved_completion in enumerate((False, True), start=1):
-            with self.subTest(saved_completion=saved_completion):
+        parent_text = self.doc.read_text()
+        child_text = self.child_doc.read_text()
+        snapshot = Path(self.enterContext(tempfile.TemporaryDirectory())) / "fixture"
+        _ = shutil.copytree(self.root, snapshot, symlinks=True)
+
+        def stop_enrolled_child(name: str, marked: unit_lookup.LabeledSession, claude: unit_lookup.LiveClaude) -> bool:
+            self.assertTrue(self.stop_child(name, marked, claude))
+            _ = self.git("-C", str(self.child_tree), "switch", "temporary-branch")
+            return True
+
+        for scenario in ("legacy", "saved completion", "enrolled"):
+            with self.subTest(scenario=scenario):
+                if scenario != "legacy":
+                    shutil.rmtree(self.root)
+                    _ = shutil.copytree(snapshot, self.root, symlinks=True)
+                    self.events.clear()
+                    self.account.reset_mock()
+                saved_completion = scenario == "saved completion"
+                if scenario == "enrolled":
+                    _ = self.git("-C", str(self.child_tree), "switch", self.child_branch)
+                    integration = self.root / "parent-integration"
+                    _ = self.git("worktree", "add", "-qb", "parent-integration", str(integration), "main")
+                    parent_live = self.checkout / "parent-production-live.md"
+                    child_live = self.checkout / "child-production-live.md"
+                    write_text_atomic(parent_live, parent_text.replace(
+                        "- **Merge branch:** main", "- **Merge branch:** parent-integration").replace(
+                        f"- **Showrunner checkout:** {self.checkout}",
+                        f"- **Showrunner checkout:** {integration}")
+                        + f"- **{MERGE_CHECKOUT_FIELD}:** {self.checkout}\n")
+                    write_text_atomic(child_live, child_text.replace("- **Log:** log.md", "- **Log:** child.log")
+                        + f"- **{MERGE_CHECKOUT_FIELD}:** {self.checkout}\n")
+                    with (self.checkout / ".git/info/exclude").open("a", encoding="utf-8") as output:
+                        _ = output.write("\n/*-production-live.md\n/log.md\n/child.log\n")
+                    _ = staff.set_doc(self.parent.id, staff.LiveDoc(remote.local_machine(), parent_live))
+                    self.doc, self.child_doc = parent_live, child_live
+                    _ = staff.set_doc(self.child.id, staff.LiveDoc(remote.local_machine(), self.child_doc))
+                    self.stop.side_effect = stop_enrolled_child
                 if saved_completion:
-                    _ = staff.change_director(self.child.id, staff.ShowrunnerRole(self.child_name, self.parent.id, staff.LiveDoc(remote.local_machine(), self.child_doc)))
                     demote.save(self.journal(), fields, demote.Step.PLACED)
+                main = self.git("symbolic-ref", "HEAD"), self.git("rev-parse", "HEAD"), self.git("ls-files", "--stage")
                 with (mock.patch.object(demote, "save", wraps=demote.save) as save,
                       mock.patch.object(demote, "checked", wraps=demote.checked) as checked):
                     plan = self.plan_relative if saved_completion else self.plan
@@ -626,9 +668,8 @@ class DemoteShowrunnerTests(StaffTestCase):
                 self.assertEqual(code, 0, errors)
                 checked.assert_called_once()
                 fields = cast(dict[str, object], save.call_args.args[1])
-                self.assertEqual(self.events, ["detach", "timer", "stop", "start", "place"] * count)
-                self.assertEqual(self.account.call_count, count)
-                self.account.assert_called_with("unit", resume=True)
+                self.assertEqual(self.events, ["detach", "timer", "stop", "start", "place"])
+                self.account.assert_called_once_with("unit", resume=True)
                 self.assertEqual(staff.by_id(self.worker.id), self.worker)
                 document = self.doc.read_text()
                 self.assertIn(f"| {self.child_name} |  | {self.child_tree} | {self.child_branch} | {self.plan_relative} |", document)
@@ -637,11 +678,17 @@ class DemoteShowrunnerTests(StaffTestCase):
                 else:
                     self.assertNotIn("Port", document)
                 self.assertIn("| existing | retained |", document)
-                self.assertEqual(self.git("show", "main:production.md"), document.strip())
+                if scenario == "enrolled":
+                    self.assertEqual((self.git("symbolic-ref", "HEAD"), self.git("rev-parse", "HEAD"),
+                                      self.git("ls-files", "--stage")), main)
+                    self.assertIn("Status: ended", self.child_doc.read_text())
+                    self.assertEqual(self.git("ls-files", "--", str(self.doc), str(self.child_doc)), "")
+                else:
+                    self.assertEqual(self.git("show", "main:production.md"), document.strip())
                 self.assertEqual(self.git("status", "--porcelain"), "")
                 self.assertFalse(self.journal().exists())
                 self.assertEqual(self.run_command()[0], 2)
-                self.assertEqual(self.events, ["detach", "timer", "stop", "start", "place"] * count)
+                self.assertEqual(self.events, ["detach", "timer", "stop", "start", "place"])
 
     def test_placed_or_cleaned_journal_resumes_an_unchanged_unit_without_another_launch(self) -> None:
         with mock.patch.object(demote, "save", wraps=demote.save) as save:

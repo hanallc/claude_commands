@@ -236,7 +236,7 @@ class SetTests(unittest.TestCase):
 
         with self.subTest(queue="zone notice with an explicit default pull"):
             _ = self.queued().write_text(json.dumps({"zone": "zone", "text": "Zone changed", "since": "2026-11-01",
-                "reason": "offline", "pulls": [{"mac": "~/.claude", "source": str(self.checkout)}]}))
+                "reason": "offline", "pulls": [{"kind": "settings", "mac": "~/.claude", "source": str(self.checkout)}]}))
             before = len(self.log("ssh.log"))
             shown = self.run_zone()
             self.assertEqual(shown.returncode, 0, shown.stderr)

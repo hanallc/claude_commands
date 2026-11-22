@@ -26,9 +26,9 @@ from typing import Literal
 
 from scripts.agents import detached_runs, restart
 from scripts.direct import progress_history, recorder_state
-from scripts.herdr import herdr, herdr_types, worker_panes
+from scripts.herdr import herdr, herdr_types, turn_end, worker_panes
 from scripts.lib import conf
-from scripts.production import broadcast, session_staff, showrunners, staff
+from scripts.production import broadcast, session_staff, showrunners, staff, worker
 
 SENDER = "worker-capacity"
 # A loaded machine can pass the stop deadline between SIGTERM and SIGKILL (seen 2026-11-13).
@@ -114,7 +114,14 @@ def stop_worker(parent: staff.StaffRow, row: staff.StaffRow, client: herdr.Herdr
         detached = tuple(f"{record['run_id']}: result {runs / (record['run_id'] + '.json')}; log {record['log']}"
                          for record in detached_runs.live_runs_for_staff(runs, frozenset({row.id})))
         pane: PaneOpen | None = None
-        if isinstance(state, worker_panes.StoppedWorker):
+        try:
+            recovery = turn_end.recover_stopped_in_run(run, row.id, hold=hold)
+        except (herdr_types.HerdrFailure, OSError, ValueError, staff.StaffRefused, recorder_state.OldRecorderState) as error:
+            return WorkerStopped(row.name, process, canceled, detached, PaneOpen("uncertain", str(error)))
+        if recovery in (worker.CompletionRecovery.PENDING_CLOSE, worker.CompletionRecovery.WAITING_ON_REPLY,
+                        worker.CompletionRecovery.WAITING_ON_RUNS):
+            return WorkerStopped(row.name, process, canceled, detached, PaneOpen("kept", recovery.value))
+        if recovery is worker.CompletionRecovery.NO_PENDING_NOTICE and isinstance(state, worker_panes.StoppedWorker):
             # The stop is complete here. The pane closes only when the close checks permit it.
             try:
                 closed = worker_panes.close(parent.id, name, lock=hold)
@@ -124,7 +131,8 @@ def stop_worker(parent: staff.StaffRow, row: staff.StaffRow, client: herdr.Herdr
                 pane = PaneOpen("kept", closed.blocker)
             elif isinstance(closed, worker_panes.UncertainWorker):
                 pane = PaneOpen("uncertain", closed.reason)
-        worker_panes.forget_restart(row)
+        if not isinstance(canceled, PassesNotCanceled) and pane is None:
+            worker_panes.forget_restart(row)
         return WorkerStopped(row.name, process, canceled, detached, pane)
 
 

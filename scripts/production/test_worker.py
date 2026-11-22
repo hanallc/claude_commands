@@ -17,12 +17,12 @@ import time
 from threading import Event, Timer, current_thread
 from concurrent.futures import Future, ThreadPoolExecutor
 from collections.abc import Callable, Generator, Iterator
-from dataclasses import replace
+from dataclasses import asdict, replace
 from contextlib import ExitStack, contextmanager, redirect_stderr, redirect_stdout
 from typing import Literal, TextIO, cast, final, override
 import unittest
 from unittest.mock import call, patch
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from scripts.agents import detached_run_process, detached_runs, worker_lifecycle
 from scripts.agents import pane_record
@@ -34,8 +34,9 @@ from scripts.direct import assign, progress_history
 from scripts.direct.recorder_fixture import invoke_recorder
 from scripts.production.cli_fixture import invoke_cli
 from scripts.production import fake_unit_host, staff, worker, worker_admission
+from scripts.production.production_doc import EnrolledPaths
 from scripts.production.staff_test_support import fixture_member, fixture_session, record_fixture_claude_start, fixture_runtime_id, fixture_worker
-from scripts.lib import atomic_file, detached, unit_runs
+from scripts.lib import atomic_file, detached, models_registry, unit_runs
 from scripts.lib.transcript_test_support import compressed_copy
 from scripts.lib.transcripts import open_transcript
 from scripts.lib.script_envelope import script_prompt
@@ -374,10 +375,11 @@ class WorkerCommandTests(unittest.TestCase):
         self.prompt = self.run_dir / "prompt.md"
         atomic_file.write_text_atomic(self.prompt, "Read the source and preserve its behavior.\n")
         self.reply = self.run_dir / "reply.md"
+        history = pane_fixtures.prepare_recorder_history(self.run_dir / "history.jsonl")
         atomic_file.write_text_atomic(self.run_dir / "progress_history_state.json", json.dumps({
             "open_phases": [{"id": "8", "title": "Workers", "instance_id": "phase-eight", "status": "active", "started_at": 1}],
             "pass": {}, "events": [], "project": {}, "unit": "unit",
-            "history_file": str(self.run_dir / "history.jsonl"),
+            "history_file": str(history),
             "owner_staff_id": self.fixture.parent.id,
             "main_agent": {"session_id": str(self.fixture.parent.current_session),
                            "family": "claude", "model": "fixture", "effort": "high"},
@@ -897,7 +899,8 @@ class WorkerCommandTests(unittest.TestCase):
             agents_log.append(native.current_session, "impl", None, datetime.now(timezone.utc))
             _ = staff.set_worker_role(child.id, staff.KnownWorkerRole("impl"))
             _ = staff.set_worker_role(native.id, staff.KnownWorkerRole("impl"))
-            result = worker.resume_workers(self.fixture.parent.id, staff.snapshot())
+            record = staff.snapshot()
+            result = worker.resume_workers(self.fixture.parent.id, record)
         saved = next(item for item in result.results if isinstance(item, Resumable))
         self.assertEqual(saved.seat["staff_id"], child.id)
         self.assertEqual(saved.seat["launcher_command"], command)
@@ -916,6 +919,30 @@ class WorkerCommandTests(unittest.TestCase):
         self.assertIn("legacy-child (impl, was working):", text)
         self.assertIn(str(self.run_dir / "legacy-child.resume-prompt.md"), text)
         self.assertIn(missing.reason, text)
+
+        main = self.fixture.root / "main"
+        integration = self.fixture.root / "integration"
+        doc = main / "production-live.md"
+        paths = EnrolledPaths(main=main, live_doc=doc, log=main / "LOG.md", notes=main / "notes",
+                              integration=integration)
+        holder = replace(self.fixture.parent, kind="showrunner", doc=staff.LiveDoc("natedev", doc),
+                         worktree=staff.PresentWorktree("natedev", integration), unit_type=staff.NotUnit())
+        reviewers = {row.id: replace(row, role=staff.KnownWorkerRole("review"))
+                     for row in record.rows if row.id in {child.id, native.id}}
+        enrolled = replace(record, rows=tuple(holder if row.id == holder.id else reviewers.get(row.id, row)
+                                              for row in record.rows))
+        for reply, keep_dispatch in ((self.reply, True), (main / "reply.md", False)):
+            with self.subTest(enrolled_reply=reply), patch.object(worker_panes, "resolve_production_paths", return_value=paths):
+                progress_history.save_dispatch_delivery(self.run_dir, dispatch,
+                    progress_history.DispatchDelivery("Read the source.", dispatch, str(reply)))
+                resumed = worker.resume_workers(holder.id, enrolled)
+                self.assertEqual(resumed.results, [])
+                note = resume_message("a shutdown", workers=resumed)
+                self.assertNotIn("legacy-child.resume-prompt.md", note)
+                if keep_dispatch:
+                    self.assertIn(PaneWorkerResume(native.id, BusyPass(dispatch)), resumed.panes)
+                else:
+                    self.assertNotIn(native.id, {pane.staff_id for pane in resumed.panes})
 
     def test_own_pass_reads_the_workers_parent_and_names_only_its_dispatch(self) -> None:
         from scripts.lib.resume_message import UnsubmittedAssignment, NO_OWN_PASS
@@ -1227,9 +1254,17 @@ class WorkerCommandTests(unittest.TestCase):
 
     def test_fast_dispatch_writes_reply_without_changing_the_prompt(self) -> None:
         before = self.prompt.read_bytes(), self.prompt.stat().st_mtime_ns
-        self.assertEqual(self.dispatch(), worker.ExitCode.OK)
+        with self.subTest(reply_parent="existing ordinary worker alias"):
+            parent = self.run_dir / "ordinary-replies"
+            parent.mkdir()
+            alias = self.run_dir / "reply-alias"
+            alias.symlink_to(parent, target_is_directory=True)
+            self.reply = alias / self.reply.name
+            self.assertEqual(self.dispatch(), worker.ExitCode.OK)
+            self.assertEqual(self.finish(), turn_end.TurnOutcome.DONE)
+            self.assertIn(self.agent.final, (parent / self.reply.name).read_text())
+            self.assertTrue(alias.is_symlink())
         self.assertEqual(len(self.agent.submitted), 1)
-        self.assertEqual(self.finish(), turn_end.TurnOutcome.DONE)
         self.assertIn(self.agent.final, self.reply.read_text())
         self.assertIn("DONE ", self.reply.read_text())
         self.assertEqual((self.prompt.read_bytes(), self.prompt.stat().st_mtime_ns), before)
@@ -1747,12 +1782,14 @@ class WorkerCommandTests(unittest.TestCase):
 
     def test_dispatch_rerun_after_done_restores_the_reply_once(self) -> None:
         self.assertIs(self.dispatch(), worker.DispatchSubmission.SUBMITTED)
-        write = atomic_file.write_text_atomic
+        save = worker.save_reply
+
         def interrupted(path: Path, text: str) -> None:
             if path == self.reply:
                 raise OSError("interrupted before reply publication")
-            write(path, text)
-        with patch.object(atomic_file, "write_text_atomic", side_effect=interrupted):
+            save(path, text)
+
+        with patch.object(worker, "save_reply", side_effect=interrupted):
             with self.assertRaisesRegex(OSError, "before reply"):
                 _ = self.finish()
         self.assertEqual(self.finish(), turn_end.TurnOutcome.DONE)
@@ -3393,6 +3430,236 @@ class WorkerCommandTests(unittest.TestCase):
                 self.assertEqual(arguments[arguments.index("--model") + 1], expected)
                 self.assertEqual(self.finish(name), turn_end.TurnOutcome.DONE)
 
+    def test_enrolled_showrunner_receives_both_design_verdicts(self) -> None:
+        main = self.fixture.root / "main"
+        integration = self.fixture.root / "integration"
+        main.mkdir()
+        integration.mkdir()
+        source = main / "design.txt"
+        _ = source.write_text("Confirm the selected panel.")
+        paths = EnrolledPaths(main, main / "production-live.md", main / "LOG.md", main / "notes", integration)
+        owner = fixture_member("showrunner", name="design-showrunner",
+                               doc=staff.LiveDoc("natedev", paths.live_doc))
+        _ = staff.clear_run(self.fixture.parent.id, self.run_dir)
+        self.fixture.parent_id = owner.id
+        owner = staff.set_run(owner.id, staff.OpenRun(self.run_dir))
+        self.fixture.world.add(owner, "w2:p0", workspace="w2", tab="w2:t0")
+        state_path = self.run_dir / unit_runs.STATE_FILE
+        state = cast(dict[str, object], json.loads(state_path.read_text()))
+        state["owner_staff_id"] = owner.id
+        atomic_file.write_text_atomic(state_path, json.dumps(state))
+        _ = self.prompt.write_text(f"Read {source.name} in main and return the design verdict.")
+        self.agent.finish_after = 1
+        families: dict[staff.WorkerRole, Literal["claude", "codex"]] = {"review": "claude", "astra-reviewer": "codex"}
+
+        def launch_policy(role: staff.WorkerRole,
+                          family: Literal["claude", "codex", "assigned"] = "assigned") -> worker_panes.LaunchPolicy:
+            selected = families[role] if family == "assigned" else family
+            settings = models_registry.LaunchSettings(selected, "fixture", "high", "")
+            return worker_panes.LaunchPolicy(settings, "read-only", "plan")
+
+        with (patch.dict(os.environ, {"CODEX_THREAD_ID": owner.current_session}),
+              patch.object(worker_panes, "resolve_production_paths", return_value=paths),
+              patch.object(worker_panes, "launch_policy", side_effect=launch_policy)):
+            def assign_review(role: staff.WorkerRole, reply: Path) -> tuple[int, str, str]:
+                return self.command("assign", role, str(self.prompt), "--to", role,
+                    "--session-dir", str(self.run_dir), "--slot", role, "--phase", "8", "--kind", "review",
+                    "--reply", str(reply), "--launcher-command", json.dumps(["assign.sh", "--role", role]))
+
+            for role, location in zip(families, (main, integration), strict=True):
+                with self.subTest(reply_link_in=location.name):
+                    link = location / "verdict.md"
+                    link.symlink_to(self.run_dir / "unwritten.md")
+                    code, output, errors = assign_review(role, link)
+                    self.assertEqual((code, output), (int(worker.ExitCode.REFUSED), ""), errors)
+                    self.assertEqual(self.agent.submitted, [])
+                    self.assertTrue(link.is_symlink())
+
+            for role in families:
+                with self.subTest(role=role):
+                    directory = self.run_dir / role
+                    directory.mkdir()
+                    reply = directory / "verdict.md"
+                    code, output, errors = assign_review(role, reply)
+                    self.assertEqual((code, output), (0, "submitted\n"), errors)
+
+            self.assertEqual(len(self.agent.submitted), 2)
+            self.assertEqual(self.agent.notices, [])
+            first = self.agent.row(self.agent.submitted[0][0])
+            opened = worker_panes.observe_worker(owner.id, first, staff.snapshot())
+            self.assertIsInstance(opened, worker_panes.OpenWorker)
+            for (pane, line), (role, family) in zip(self.agent.submitted, families.items(), strict=True):
+                with self.subTest(reply_from=role):
+                    self.assertIn(str(self.prompt), line)
+                    self.assertEqual(self.fixture.world.foreground[pane][1], family)
+                    checkout = Path(str(self.fixture.world.locations[pane]["cwd"]))
+                    self.agent.final = f"Design verdict: {(checkout / source.name).read_text()}"
+                    directory = self.run_dir / role
+                    target = main if role == "review" else integration
+                    protected = target / "verdict.md"
+                    _ = protected.write_text("Keep the checkout file.\n")
+                    directory.rmdir()
+                    directory.symlink_to(target, target_is_directory=True)
+                    legacy_status = self.run_dir / f"{role}-legacy-status"
+                    if role == "review":
+                        current_state = cast(dict[str, object], json.loads(state_path.read_text()))
+                        slots = cast(dict[str, dict[str, object]], current_state["pass"])
+                        slot_pass = slots[role]
+                        slot_pass["assign_status_file"] = str(legacy_status)
+                        atomic_file.write_text_atomic(state_path, json.dumps(current_state))
+                        _ = legacy_status.write_text("running\n")
+                    if role == "review":
+                        with self.subTest(completion_writer="retry reply"):
+                            turn_reply = target / "verdict_turn.md"
+                            _ = turn_reply.write_text("Keep the retry target.\n")
+                            self.agent.without_done = True
+                            self.agent.complete(pane)
+                            with self.assertRaises(OSError):
+                                _ = self.finish(role)
+                            self.assertEqual(turn_reply.read_text(), "Keep the retry target.\n")
+                            self.agent.without_done = False
+                    self.agent.complete(pane)
+                    with self.assertRaises(OSError):
+                        _ = self.finish(role)
+                    self.assertEqual(protected.read_text(), "Keep the checkout file.\n")
+                    directory.unlink()
+                    directory.mkdir()
+                    self.assertEqual(self.finish(role), turn_end.TurnOutcome.DONE)
+                    reply = directory / "verdict.md"
+                    self.assertIn("Design verdict: Confirm the selected panel.", reply.read_text())
+                    self.assertIn(f"reply {reply}", self.agent.notices[-1])
+                    if role == "review":
+                        self.assertEqual(legacy_status.read_text(), "done\n")
+
+            row = first
+            passed = worker_panes.worker_pass(row, self.run_dir)
+            reply = self.run_dir / "review" / "verdict.md"
+            directories = (main, integration)
+            baseline = {path / "verdict.md": (path / "verdict.md").read_bytes() for path in directories}
+            for index, field in enumerate(("summary_file", "report_file", "status_file", "repeat status")):
+                with self.subTest(completion_writer=field):
+                    folder = self.run_dir / f"artifact-{index}"
+                    folder.symlink_to(directories[index % 2], target_is_directory=True)
+                    path = folder / "verdict.md"
+                    if field == "repeat status":
+                        delivery = progress_history.dispatch_delivery(passed)
+                        delivery = replace(delivery, actions=replace(delivery.actions, status_file=str(path)))
+                        repeated = {key: value for key, value in passed.items() if key != "assign_status_file"}
+                        with self.assertRaises(OSError):
+                            _ = turn_end.repeat_completion_notice(row.name, owner, self.run_dir,
+                                {**repeated, "delivery": asdict(delivery)})
+                    else:
+                        actions = progress_history.CompletionActions(
+                            summary_file=str(path) if field == "summary_file" else "",
+                            report_file=str(path) if field == "report_file" else "",
+                            status_file=str(path) if field == "status_file" else "")
+                        with self.assertRaises(OSError):
+                            _ = assign.complete_herdr(self.run_dir, row, {**passed, "kind": "astra"},
+                                                      actions, reply, owner=owner)
+                    self.assertEqual({path: path.read_bytes() for path in baseline}, baseline)
+
+            for writer in ("hook", "launcher", "recorder"):
+                for swap in ("before open", "after open"):
+                    with self.subTest(completion_writer=writer, swap=swap):
+                        folder = self.run_dir / f"{writer}-{swap.replace(' ', '-')}"
+                        folder.mkdir()
+                        original = self.run_dir / f"{folder.name}-original"
+                        path = folder / "requested_status"
+                        published = folder / f"{row.name}_status" if writer == "launcher" else path
+                        _ = path.write_text("Previous status.\n")
+                        checkout = main if swap == "before open" else integration
+                        existing = {tree / name: f"Keep {tree.name}/{name}.\n"
+                                    for tree in directories for name in {path.name, published.name}}
+                        for target, content in existing.items():
+                            _ = target.write_text(content)
+                        replace_file = os.replace
+
+                        def redirect() -> None:
+                            _ = folder.rename(original)
+                            folder.symlink_to(checkout, target_is_directory=True)
+
+                        def replace_after_open(source: str | Path, destination: str | Path, *,
+                                               src_dir_fd: int | None = None, dst_dir_fd: int | None = None) -> None:
+                            if Path(destination).name == published.name:
+                                redirect()
+                            replace_file(source, destination, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd)
+
+                        launch_id = uuid4()
+                        if writer == "recorder":
+                            with patch.dict(os.environ, {progress_history.ASSIGN_STATUS_FILE_ENV: str(path)}):
+                                _ = progress_history.begin_dispatch(self.run_dir, slot=row.name, phase="8",
+                                    role="review", worker_name=row.name, worker_id=row.id,
+                                    launcher_command=["saved-launcher", str(launch_id)], prompt=self.prompt,
+                                    kind="assign", lens="", new_pass_instance_id=launch_id)
+                            _ = path.write_text("Previous status.\n")
+
+                        def publish() -> None:
+                            if writer == "launcher":
+                                with patch.object(worker, "dispatch", return_value=worker.DispatchSubmission.SUBMITTED):
+                                    self.assertIs(worker.assign(owner.id, "review", self.prompt, session_dir=self.run_dir,
+                                        slot="requested", name=row.name, phase="8", kind="assign", launcher_command=[],
+                                        completion_actions=progress_history.CompletionActions(status_file=str(path))),
+                                        worker.DispatchSubmission.SUBMITTED)
+                            elif writer == "recorder":
+                                result = progress_history.record_assignment_launch_exit(self.run_dir, launch_id,
+                                    progress_history.AssignmentLaunchExit.CLOSE_FAILED_PASS)
+                                self.assertEqual(result, progress_history.RecordedAssignmentLaunch(
+                                    row.name, failure_recorded=True))
+                            else:
+                                actions = progress_history.CompletionActions(status_file=str(path))
+                                _ = assign.complete_herdr(self.run_dir, row, {**passed, "kind": "astra"},
+                                                          actions, reply, owner=owner)
+
+                        if swap == "before open":
+                            redirect()
+                            if writer == "launcher":
+                                with redirect_stderr(io.StringIO()):
+                                    result = worker.assign(owner.id, "review", self.prompt, session_dir=self.run_dir,
+                                        slot="requested", name=row.name, phase="8", kind="assign", launcher_command=[],
+                                        completion_actions=progress_history.CompletionActions(status_file=str(path)))
+                                self.assertIs(result, worker.ExitCode.REFUSED)
+                            else:
+                                with self.assertRaises(OSError):
+                                    publish()
+                        else:
+                            with patch.object(os, "replace", side_effect=replace_after_open):
+                                publish()
+                            expected_text = {"launcher": "Previous status.\n", "recorder": "error\n", "hook": "done\n"}
+                            self.assertEqual((original / published.name).read_text(), expected_text[writer])
+                        self.assertEqual({target: target.read_text() for target in existing}, existing)
+                        folder.unlink()
+                        if writer == "recorder" and swap == "before open":
+                            _ = original.rename(folder)
+                            instance = str(launch_id)
+                            progress_history.confirm_assignment_submission(self.run_dir, instance, instance)
+                            self.assertTrue(progress_history.dispatch_submission_confirmed(self.run_dir, instance, instance))
+                            self.assertEqual(path.read_text(), "running\n")
+
+            with self.subTest(completion_writer="dispatch error"):
+                folder = self.run_dir / "dispatch-error"
+                folder.mkdir()
+                destination = folder / "verdict.md"
+                protected = integration / "verdict_dispatch_error.md"
+                _ = protected.write_text("Keep the error target.\n")
+                instance = progress_history.begin_dispatch(self.run_dir, slot=row.name, phase="8", role="review",
+                    worker_name=row.name, worker_id=row.id, launcher_command=["retry-review"], prompt=self.prompt,
+                    kind="review", lens="")
+                progress_history.save_dispatch_delivery(self.run_dir, instance,
+                    progress_history.DispatchDelivery("Retry the review.", instance, str(destination)))
+
+                def refuse_after_redirect(*_args: object, **_kwargs: object) -> worker.ExitCode:
+                    folder.rmdir()
+                    folder.symlink_to(integration, target_is_directory=True)
+                    return worker.ExitCode.REFUSED
+
+                with (patch.object(worker_panes, "observe_worker", return_value=opened),
+                      patch.object(worker, "dispatch_turn", side_effect=refuse_after_redirect),
+                      patch.object(worker, "_dispatch_notice"), redirect_stderr(io.StringIO()) as errors):
+                    self.assertEqual(worker.finish_dispatch(owner.id, row.id, self.run_dir, instance, instance),
+                                     worker.ExitCode.REFUSED)
+                self.assertIn("error reply failed", errors.getvalue())
+                self.assertEqual(protected.read_text(), "Keep the error target.\n")
+
     def test_new_review_prompt_does_not_reuse_a_completed_predecessor(self) -> None:
         for already_completed in (False, True):
             with self.subTest(already_completed=already_completed):
@@ -3554,7 +3821,7 @@ class WorkerCommandTests(unittest.TestCase):
             self.assertEqual(path, self.run_dir / unit_runs.STATE_FILE)
             raise OSError("confirmation save failed")
 
-        with (patch.object(pass_recorder, "write_text_atomic", side_effect=fail_state_write) as writes,
+        with (patch.object(progress_history, "write_text_atomic", side_effect=fail_state_write) as writes,
               self.assertRaisesRegex(OSError, "confirmation save failed")):
             _ = self.finish(row.name, turn_end.EventKind.STAGE_READY)
 

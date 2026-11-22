@@ -19,7 +19,7 @@ from scripts.copies import copies
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.process_failure import failure_detail
 from scripts.message import session_send
-from scripts.production import staff
+from scripts.production import showrunners, staff
 from scripts.production.production_doc import ProductionDocument
 
 TREE_CHANGED_STATUS = 77
@@ -40,6 +40,54 @@ def report(step: str, state: str, detail: str) -> None:
 
 def tool(name: str, fallback: Path, override: str) -> str:
     return os.environ.get(override) or shutil.which(name) or str(fallback)
+
+
+type PromotionCiPolicy = Literal["cargo-liner", "standard"]
+
+
+class CiRecord(NamedTuple):
+    merges_collected: int
+    tip: str
+    policy: PromotionCiPolicy = "standard"
+
+
+class NoCiRecord(NamedTuple):
+    pass
+
+
+class InvalidCiRecord(ValueError):
+    pass
+
+
+def read_ci_record(state_dir: Path) -> CiRecord | NoCiRecord:
+    path = state_dir / "ci_points.json"
+    try:
+        raw = cast(object, json.loads(path.read_text(encoding="utf-8")))
+    except FileNotFoundError:
+        return NoCiRecord()
+    if not isinstance(raw, dict):
+        raise InvalidCiRecord(f"invalid {path}")
+    fields = cast(dict[str, object], raw)
+    count, tip = fields.get("count"), fields.get("tip")
+    if not isinstance(count, int) or isinstance(count, bool) or count < 0 or not isinstance(tip, str):
+        raise InvalidCiRecord(f"invalid {path}")
+    policy = fields.get("policy", "standard")
+    if policy not in ("standard", "cargo-liner"):
+        raise InvalidCiRecord(f"invalid {path}")
+    return CiRecord(count, tip, "cargo-liner" if policy == "cargo-liner" else "standard")
+
+
+def require_promotion_ci(owner: staff.StaffRow, tip: str, policy: PromotionCiPolicy) -> None:
+    """Require a collected verdict for the commit that will be published."""
+    state_dir = showrunners.session_state_dir(owner.id) / "waiting_state"
+    try:
+        record = read_ci_record(state_dir)
+    except (OSError, ValueError) as error:
+        raise Stop("promote", "held", str(error), "collect CI and retry promotion") from error
+    if not isinstance(record, CiRecord) or record.policy != policy or record.tip != tip:
+        detail = (f"collect cargo-liner CI on the integration tip before promoting {tip}"
+                  if policy == "cargo-liner" else f"collect {owner.name} CI on {tip} before promotion")
+        raise Stop("promote", "held", detail, "collect CI and retry promotion")
 
 
 class CheckpointTestStep(NamedTuple):
@@ -297,6 +345,7 @@ class BumpGateRecord(TypedDict):
     name: str
     merge_branch: str
     checkout: str
+    # Older gates store the LOG relative to their recorded checkout.
     production_log: str
     zone: str
     unit: str

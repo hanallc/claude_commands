@@ -10,24 +10,26 @@ except FileNotFoundError:
 from scripts.direct import pass_record as pass_recorder
 
 import argparse
+import fcntl
 from collections.abc import Callable, Generator, Iterable
-from contextlib import ExitStack, redirect_stderr, suppress
+from contextlib import ExitStack, contextmanager, redirect_stderr, suppress
 from dataclasses import dataclass, field, replace
 from enum import Enum, IntEnum
 from importlib import import_module
-from functools import cache, partial
+from functools import cache, cached_property, partial
 import io
 import json
 import math
 import os
 import re
 import shlex
+import stat
 import time
 from pathlib import Path
 import subprocess
 import sys
 import uuid
-from typing import Literal, Protocol, cast, final
+from typing import Literal, Protocol, TextIO, cast, final
 
 from scripts.agents import detached_runs, pane_record, shutdown_record, worker_lifecycle
 from scripts.herdr import herdr_types, pane_launch
@@ -41,6 +43,7 @@ from scripts.lib.resume_message import BusyPass, IdleWorker, NoOwnPass, NO_OWN_P
 from scripts.lib.resume_message import UnsubmittedAssignment as UnsubmittedAssignment
 from scripts.lib.script_envelope import script_prompt
 from scripts.production import display_cells, session_staff, staff, worker_admission
+from scripts.production.production_doc import EnrolledPaths, ProductionPathsError
 from scripts.whoami import quota_state
 
 from scripts.herdr import herdr
@@ -497,15 +500,268 @@ def startup_result(name: WorkerName, result: worker_panes.WorkerStart) -> ExitCo
     return code
 
 
-def save_reply(path: Path, reply: str) -> None:
-    text = reply.rstrip() + "\n"
+@dataclass(frozen=True)
+class ExistingArtifact:
+    content: bytes
+    mode: int
+
+
+class ArtifactAbsent(Enum):
+    MISSING = "the destination does not exist"
+
+
+def _read_review_artifact(parent: int, path: Path) -> ExistingArtifact | ArtifactAbsent:
     try:
-        if path.read_text(encoding="utf-8") == text:
-            return
+        descriptor = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
     except FileNotFoundError:
-        pass
-    path.parent.mkdir(parents=True, exist_ok=True)
-    atomic_file.write_text_atomic(path, text)
+        return ArtifactAbsent.MISSING
+    with os.fdopen(descriptor, "rb") as source:
+        mode = os.fstat(source.fileno()).st_mode
+        if not stat.S_ISREG(mode):
+            raise OSError(f"{path}: expected a regular completion file")
+        return ExistingArtifact(source.read(), stat.S_IMODE(mode))
+
+
+def _write_review_artifact(parent: int, path: Path, content: bytes, *, create_only: bool = False) -> None:
+    existing = _read_review_artifact(parent, path)
+    if isinstance(existing, ExistingArtifact):
+        if create_only:
+            raise FileExistsError(f"{path}: the artifact already exists")
+        if existing.content == content:
+            return
+    temporary = f".{path.name}.{uuid.uuid4().hex}.tmp"
+    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o666, dir_fd=parent)
+    try:
+        with os.fdopen(descriptor, "wb") as output:
+            if isinstance(existing, ExistingArtifact):
+                os.fchmod(output.fileno(), existing.mode)
+            _ = output.write(content)
+            output.flush()
+            os.fsync(output.fileno())
+        if isinstance(existing, ArtifactAbsent):
+            os.link(temporary, path.name, src_dir_fd=parent, dst_dir_fd=parent, follow_symlinks=False)
+        else:
+            if _read_review_artifact(parent, path) != existing:
+                raise OSError(f"{path}: completion file changed before publication")
+            os.replace(temporary, path.name, src_dir_fd=parent, dst_dir_fd=parent)
+        os.fsync(parent)
+    finally:
+        with suppress(FileNotFoundError):
+            os.unlink(temporary, dir_fd=parent)
+
+
+def _read_ordinary_artifact(path: Path) -> ExistingArtifact | ArtifactAbsent:
+    try:
+        with path.open("rb") as source:
+            return ExistingArtifact(source.read(), stat.S_IMODE(os.fstat(source.fileno()).st_mode))
+    except FileNotFoundError:
+        if path.is_symlink():
+            raise
+        return ArtifactAbsent.MISSING
+
+
+def _write_ordinary_artifact(path: Path, content: bytes) -> None:
+    existing = _read_ordinary_artifact(path)
+    if isinstance(existing, ExistingArtifact) and existing.content == content:
+        return
+    mode = existing.mode if isinstance(existing, ExistingArtifact) else 0o600
+    with atomic_file.prepared_replacement(path, content, mode=mode) as temporary:
+        if _read_ordinary_artifact(path) != existing:
+            raise OSError(f"{path}: completion file changed before publication")
+        os.replace(temporary, path)
+    atomic_file.sync_folder(path.parent)
+
+
+def save_reply(path: Path, reply: str) -> None:
+    """Save a plain reply through the ordinary path policy."""
+    _write_ordinary_artifact(path, (reply.rstrip() + "\n").encode())
+
+
+class ReviewRunAccess(Enum):
+    RECORDED = "the record fixes the owner"
+    INITIALIZING = "initialize the current run"
+
+
+@dataclass(frozen=True)
+class CompletionArtifacts:
+    owner: staff.StaffRow
+    run: Path
+    access: ReviewRunAccess = ReviewRunAccess.RECORDED
+
+    @cached_property
+    def policy(self) -> EnrolledPaths | worker_panes.OrdinaryWorkerOwner:
+        if self.owner.kind not in ("unit", "showrunner"):
+            raise OSError("completion artifacts require a unit or showrunner owner")
+        if self.owner.kind == "showrunner" and isinstance(self.owner.doc, staff.DocUnfilled):
+            raise OSError("showrunner completion requires its staff document")
+        return worker_panes.enrolled_worker_owner(self.owner)
+
+    @property
+    def protected(self) -> bool:
+        return isinstance(self.policy, EnrolledPaths)
+
+    def authorized_path(self, path: Path) -> Path:
+        policy = self.policy
+        if isinstance(policy, EnrolledPaths):
+            if refusal := worker_panes.review_artifact_refusal(self.run, policy, path):
+                raise OSError(refusal.reason)
+            with self._directory(self.run):
+                pass
+            return path.absolute()
+        return path
+
+    def validate_status(self, passed: dict[str, object]) -> None:
+        if destination := progress_history.dispatch_delivery(passed).actions.status_file:
+            _ = self.authorized_path(Path(destination))
+
+    @contextmanager
+    def _directory(self, path: Path, *, create: bool = False) -> Generator[int]:
+        """Open the recorded run first, then open each relative component."""
+        root = self.run.absolute()
+        path = path.absolute()
+        if ".." in path.parts or not path.is_relative_to(root):
+            raise OSError(f"{path}: the destination must stay in the recorded run")
+        policy = self.policy
+        if isinstance(policy, EnrolledPaths):
+            if refusal := worker_panes.review_artifact_refusal(root, policy):
+                raise OSError(refusal.reason)
+        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+        with ExitStack() as descriptors:
+            parent = os.open(root.anchor, flags)
+            _ = descriptors.callback(os.close, parent)
+            for folder in root.parts[1:]:
+                parent = os.open(folder, flags, dir_fd=parent)
+                _ = descriptors.callback(os.close, parent)
+            if isinstance(policy, EnrolledPaths):
+                self._require_saved_run_owner(parent, policy)
+            for folder in path.relative_to(root).parts:
+                if create:
+                    with suppress(FileExistsError):
+                        os.mkdir(folder, dir_fd=parent)
+                parent = os.open(folder, flags, dir_fd=parent)
+                _ = descriptors.callback(os.close, parent)
+            yield parent
+
+    def _require_saved_run_owner(self, directory: int, policy: EnrolledPaths) -> None:
+        flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+        try:
+            fd = os.open(unit_runs.STATE_FILE, flags, dir_fd=directory)
+        except FileNotFoundError:
+            if self.access is ReviewRunAccess.INITIALIZING:
+                if refusal := worker_panes.review_run_refusal(self.owner, self.run, policy):
+                    raise OSError(refusal.reason) from None
+                return
+            raise
+        with os.fdopen(fd, encoding="utf-8") as stream:
+            if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+                raise OSError(f"{self.run}: expected a regular run record")
+            fields = cast(object, json.load(stream))
+        if not isinstance(fields, dict) or cast(dict[str, object], fields).get(unit_runs.OWNER_FIELD) != self.owner.id:
+            raise OSError(f"{self.run}: the saved run owner differs from {self.owner.name}")
+
+    @contextmanager
+    def _parent(self, path: Path, *, create: bool = False) -> Generator[int]:
+        if ".." in path.parts or path.absolute() == self.run.absolute():
+            raise OSError(f"{path}: the destination must stay in the recorded run")
+        with self._directory(path.absolute().parent, create=create) as parent:
+            yield parent
+
+    def mkdir(self, path: Path) -> None:
+        if self.protected:
+            with self._directory(path, create=True):
+                pass
+        else:
+            path.mkdir(parents=True, exist_ok=True)
+
+    def new_directory(self, parent: Path, name: str) -> Path:
+        if not name or name in (".", "..") or Path(name).name != name:
+            raise ValueError(f"invalid artifact directory name: {name}")
+        with self._directory(parent, create=True) as directory:
+            os.mkdir(name, dir_fd=directory)
+        return parent / name
+
+    @contextmanager
+    def open_read(self, path: Path) -> Generator[TextIO]:
+        if not self.protected:
+            with path.open(encoding="utf-8") as stream:
+                yield stream
+            return
+        with self._parent(path) as parent:
+            flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+            descriptor = os.open(path.name, flags, dir_fd=parent)
+            with os.fdopen(descriptor, encoding="utf-8") as stream:
+                if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+                    raise OSError(f"{path}: expected a regular completion file")
+                yield stream
+
+    def read(self, path: Path) -> str:
+        with self.open_read(path) as stream:
+            return stream.read()
+
+    def write(self, path: Path, text: str, *, create_only: bool = False) -> None:
+        if self.protected:
+            with self._parent(path, create=True) as parent:
+                _write_review_artifact(parent, path, text.encode(), create_only=create_only)
+        elif create_only:
+            if not atomic_file.create_text_atomic(path, text):
+                raise FileExistsError(f"{path}: the artifact already exists")
+        else:
+            _write_ordinary_artifact(path, text.encode())
+
+    @contextmanager
+    def append(self, path: Path) -> Generator[TextIO]:
+        if not self.protected:
+            with path.open("a", encoding="utf-8") as stream:
+                yield stream
+            return
+        with self._parent(path, create=True) as parent:
+            flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK
+            descriptor = os.open(path.name, flags, 0o666, dir_fd=parent)
+            with os.fdopen(descriptor, "a", encoding="utf-8") as stream:
+                status = os.fstat(stream.fileno())
+                if not stat.S_ISREG(status.st_mode) or status.st_nlink != 1:
+                    raise OSError(f"{path}: expected an unshared regular completion file")
+                yield stream
+
+    @contextmanager
+    def lock(self, path: Path) -> Generator[TextIO]:
+        with self.append(path) as stream:
+            worker_lifecycle.acquire_flock(stream, mode=fcntl.LOCK_EX)
+            yield stream
+
+    def rename(self, source: Path, target: Path) -> None:
+        if not self.protected:
+            if source.is_file():
+                _ = source.replace(target)
+            return
+        with self._parent(source) as source_parent, self._parent(target) as target_parent:
+            before = _read_review_artifact(source_parent, source)
+            destination = _read_review_artifact(target_parent, target)
+            if isinstance(before, ArtifactAbsent):
+                return
+            if (_read_review_artifact(source_parent, source) != before
+                    or _read_review_artifact(target_parent, target) != destination):
+                raise OSError(f"{target}: an artifact changed before rename")
+            os.replace(source.name, target.name, src_dir_fd=source_parent, dst_dir_fd=target_parent)
+            os.fsync(source_parent)
+            os.fsync(target_parent)
+
+    def unlink(self, path: Path) -> None:
+        if self.protected:
+            with self._parent(path) as parent:
+                os.unlink(path.name, dir_fd=parent)
+        else:
+            path.unlink()
+
+    def reply(self, path: Path, text: str) -> None:
+        if self.protected:
+            self.write(path, text.rstrip() + "\n")
+        else:
+            save_reply(path, text)
+
+
+def initializing_review_run_artifacts(owner: staff.StaffRow, run: Path) -> CompletionArtifacts:
+    return CompletionArtifacts(owner, run, ReviewRunAccess.INITIALIZING)
 
 
 @dataclass(frozen=True)
@@ -662,6 +918,41 @@ def _completion_notices() -> CompletionNotices:
     return cast(CompletionNotices, cast(object, import_module("scripts.herdr.turn_end")))
 
 
+def _require_review_order(owner: staff.StaffRow, role: WorkerRole | worker_panes.WorkerRoleUnavailable,
+                          run: Path, *artifacts: Path) -> EnrolledPaths | worker_panes.OrdinaryWorkerOwner:
+    paths = worker_panes.enrolled_worker_owner(owner)
+    if isinstance(paths, EnrolledPaths):
+        refusal = worker_panes.review_role_refusal(owner, role) or worker_panes.review_run_refusal(owner, run, paths, *artifacts)
+        if refusal:
+            raise ValueError(refusal.reason)
+    return paths
+
+
+def _review_artifacts(actions: progress_history.CompletionActions) -> tuple[Path, ...]:
+    return tuple(Path(value) for value in (actions.summary_file, actions.status_file, actions.report_file,
+                                           actions.style_directory) if value)
+
+
+def _require_review_delivery(owner: staff.StaffRow, row: staff.StaffRow, run: Path,
+                             passed: dict[str, object]) -> None:
+    delivery = progress_history.dispatch_delivery(passed)
+    artifacts = tuple(Path(value) for value in (passed.get("prompt_file"), delivery.reply_file, delivery.early_ready)
+                      if isinstance(value, str) and value)
+    writer = CompletionArtifacts(owner, run)
+    if writer.protected:
+        if refusal := worker_panes.review_role_refusal(owner, worker_panes.dispatch_role(row)):
+            raise ValueError(refusal.reason)
+        for path in (*artifacts, *_review_artifacts(delivery.actions)):
+            _ = writer.authorized_path(path)
+    writer.validate_status(passed)
+
+
+def _require_running_review(owner: staff.StaffRow, client: herdr.Herdr, current: worker_panes.OpenWorker) -> None:
+    paths = worker_panes.enrolled_worker_owner(owner)
+    if isinstance(paths, EnrolledPaths):
+        worker_panes.require_review_process(client, current.pane, paths)
+
+
 def dispatch(parent: StaffId, name: WorkerName, role: WorkerRole, prompt: Path, dispatch_id: str = "", *,
              session_dir: Path, slot: str, phase: str, kind: str, launcher_command: list[str],
              lens: str = "", reply: Path | ReplyBesidePrompt = REPLY_BESIDE_PROMPT, fix_cause: str = "",
@@ -675,7 +966,27 @@ def dispatch(parent: StaffId, name: WorkerName, role: WorkerRole, prompt: Path, 
              new_pass_instance_id: uuid.UUID | None = None,
              ) -> DispatchSubmission | ExitCode:
     """Record the hook destinations, submit one prompt, and return at once."""
-    prompt = prompt.resolve()
+    record = staff.snapshot()
+    owner = record.by_id(parent)
+    if owner is None:
+        print(f"{parent}: dispatch owner is unavailable", file=sys.stderr)
+        return ExitCode.REFUSED
+    record_status = os.environ.get(progress_history.ASSIGN_STATUS_FILE_ENV, "") if kind == "assign" else ""
+    destination = reply if isinstance(reply, Path) else prompt.with_name(prompt.stem + "_reply.txt")
+    artifacts = (prompt, destination, *(path for path in (early_ready,) if isinstance(path, Path)),
+                 *(Path(value) for value in (record_status,) if value), *_review_artifacts(completion_actions))
+    try:
+        enrolled = isinstance(_require_review_order(owner, role, session_dir, *artifacts), EnrolledPaths)
+    except (OSError, ValueError, ProductionPathsError, staff.StaffRefused, staff.StaffUnreadable) as error:
+        print(error, file=sys.stderr)
+        return ExitCode.REFUSED
+    prompt = prompt.absolute() if enrolled else prompt.resolve()
+    if enrolled:
+        if isinstance(reply, Path):
+            reply = reply.absolute()
+        if record_status and not completion_actions.status_file:
+            status = progress_history.worker_artifact(Path(record_status), slot, name.value).absolute()
+            completion_actions = replace(completion_actions, status_file=str(status))
     with ExitStack() as after_dispatch, ExitStack() as operations, ExitStack() as cleanup:
         notice_delivery = notices if isinstance(notices, ExitStack) else after_dispatch
         hold = operations.enter_context(worker_panes.worker_lock(parent, name)) if isinstance(lock, worker_panes.WorkerLockAtUse) else lock
@@ -688,6 +999,11 @@ def dispatch(parent: StaffId, name: WorkerName, role: WorkerRole, prompt: Path, 
         if isinstance(selection, pass_recorder.ActiveDispatchPromptConflict):
             return _prompt_conflict(selection)
         matched = selection.action
+        if (unit_runs.terminal_run(unit_runs.read_run_fields(session_dir))
+                and not (isinstance(matched, progress_history.MatchedDispatch)
+                         and progress_history.dispatch_completed(session_dir, selection.slot, matched.instance_id))):
+            print(f"{session_dir}: the run has ended dispatch admission", file=sys.stderr)
+            return ExitCode.REFUSED
         completion_notices = _completion_notices()
         record = staff.snapshot()
         row = worker_admission.find_worker(record, parent, name.value)
@@ -696,7 +1012,12 @@ def dispatch(parent: StaffId, name: WorkerName, role: WorkerRole, prompt: Path, 
             recorded = progress_history.recorded_dispatch_run(row.id)
             if isinstance(recorded, progress_history.RecordedDispatchRun):
                 previous = worker_panes.worker_pass(row, recorded.directory, record=record)
-                same_pass = (isinstance(matched, pass_recorder.MatchedDispatch)
+                try:
+                    _require_review_delivery(owner, row, recorded.directory, previous)
+                except (OSError, ValueError, ProductionPathsError, staff.StaffRefused, staff.StaffUnreadable) as error:
+                    print(error, file=sys.stderr)
+                    return ExitCode.REFUSED
+                same_pass = (isinstance(matched, progress_history.MatchedDispatch)
                              and matched.instance_id == previous.get("instance_id"))
                 if same_pass:
                     pane = (KeepCompletedPane.KEEP if completion_notices.completion_notice_delivered(previous)
@@ -733,7 +1054,10 @@ def dispatch(parent: StaffId, name: WorkerName, role: WorkerRole, prompt: Path, 
                 delivery = pass_recorder.dispatch_delivery(passed)
                 receipt = dispatch_receipt(row, delivery.line, delivery.completion_id, run=session_dir)
                 if isinstance(receipt, DispatchComplete):
-                    save_reply(Path(delivery.reply_file), receipt.reply)
+                    holder = record.by_id(parent)
+                    if holder is None:
+                        raise OSError(f"{parent}: completion owner is unavailable")
+                    CompletionArtifacts(holder, session_dir).reply(Path(delivery.reply_file), receipt.reply)
                 _ = notice_delivery.callback(completion_notices.repeat_completion_notice(
                     row.name, worker_admission.parent(staff.snapshot(), run=session_dir), session_dir,
                     worker_panes.worker_pass(row, session_dir)))
@@ -764,6 +1088,8 @@ def dispatch(parent: StaffId, name: WorkerName, role: WorkerRole, prompt: Path, 
             _ = on_submission()
 
         try:
+            if enrolled and record_status:
+                _ = os.environ.pop(progress_history.ASSIGN_STATUS_FILE_ENV, None)
             instance = progress_history.begin_dispatch(session_dir, slot=slot, phase=phase, role=role,
                 worker_name=name.value, worker_id=started.row.id, launcher_command=launcher_command, prompt=prompt, kind=kind, lens=lens,
                 fix_cause=fix_cause, fix_pass=fix_pass, activity=activity, called=launched_agent(started.row),
@@ -772,6 +1098,9 @@ def dispatch(parent: StaffId, name: WorkerName, role: WorkerRole, prompt: Path, 
             return _prompt_conflict(refused.conflict)
         except pass_recorder.DispatchSelectionChanged as error:
             return _selection_changed(error)
+        finally:
+            if enrolled and record_status:
+                os.environ[progress_history.ASSIGN_STATUS_FILE_ENV] = record_status
         if dispatch_id and dispatch_id not in (instance, worker_panes.stage_two_completion_id(instance)):
             print("dispatch id differs from the recorder pass", file=sys.stderr)
             return ExitCode.REFUSED
@@ -788,6 +1117,11 @@ def dispatch(parent: StaffId, name: WorkerName, role: WorkerRole, prompt: Path, 
             saved = pass_recorder.DispatchDelivery(line, dispatch_id, str(destination),
                 str(early_ready) if isinstance(early_ready, Path) else "", completion_actions)
             progress_history.save_dispatch_delivery(session_dir, instance, saved)
+            if enrolled and kind == "assign" and completion_actions.status_file:
+                holder = record.by_id(parent)
+                if holder is None:
+                    raise OSError(f"{parent}: completion owner is unavailable")
+                CompletionArtifacts(holder, session_dir).write(Path(completion_actions.status_file), "running\n")
         deferred = False
 
         def defer_compaction() -> None:
@@ -840,6 +1174,18 @@ def dispatch_turn(parent: StaffId, started: worker_panes.OpenWorker, client: her
                    defer_compaction: Callable[[], None] | AttachedCompaction = AttachedCompaction.RUN,
                    ) -> DispatchSubmission | ExitCode:
     """Submit the saved prompt after the bounded idle checks."""
+    record = staff.snapshot()
+    owner = record.by_id(parent)
+    if owner is not None:
+        try:
+            paths = worker_panes.enrolled_worker_owner(owner)
+            if isinstance(paths, EnrolledPaths):
+                _require_review_delivery(owner, started.row, run, worker_panes.worker_pass(started.row, run, record=record))
+                worker_panes.require_review_process(client, started.pane, paths)
+        except (OSError, ValueError, ProductionPathsError, herdr_types.HerdrFailure, subprocess.SubprocessError,
+                staff.StaffRefused, staff.StaffUnreadable) as error:
+            print(error, file=sys.stderr)
+            return ExitCode.REFUSED
     if started.status == herdr.AgentStatus.BLOCKED and isinstance(staff.backend(started.row), staff.CodexBackend):
         return _blocked_question(client, started)
     receipt = dispatch_receipt(started.row, line, dispatch_id, run=run)
@@ -975,7 +1321,15 @@ def finish_dispatch(parent: StaffId, identity: StaffId, run: Path, instance: str
                 passed = worker_panes.worker_pass(row, run)
                 if passed.get("instance_id") != instance or passed.get("status") != "active":
                     return ExitCode.OK
-                delivery = pass_recorder.dispatch_delivery(passed)
+                owner = record.by_id(parent)
+                if owner is None or not row.reports_to(parent):
+                    raise OSError(f"{parent}: dispatch owner is unavailable")
+                try:
+                    _require_review_delivery(owner, row, run, passed)
+                except (OSError, ValueError, ProductionPathsError, staff.StaffRefused, staff.StaffUnreadable) as error:
+                    print(error, file=sys.stderr)
+                    return ExitCode.REFUSED
+                delivery = progress_history.dispatch_delivery(passed)
                 if delivery.completion_id != completion_id:
                     return ExitCode.OK
                 if delivery.reply_file:
@@ -1034,7 +1388,13 @@ def finish_dispatch(parent: StaffId, identity: StaffId, run: Path, instance: str
             _ = _dispatch_failure_step(identity, "pass end", end_pass)
             completion_saved = _dispatch_failure_step(identity, "hook completion", lambda: progress_history.save_hook_completion(
                 run, instance, progress_history.HookCompletion("error", str(path), (detail,))))
-            reply_saved = _dispatch_failure_step(identity, "error reply", lambda: save_reply(path, detail))
+            def save_error_reply() -> None:
+                holder = staff.snapshot().by_id(parent)
+                if holder is None:
+                    raise OSError(f"{parent}: completion owner is unavailable")
+                CompletionArtifacts(holder, run).reply(path, detail)
+
+            reply_saved = _dispatch_failure_step(identity, "error reply", save_error_reply)
     if submission_unproved:
         _ = _dispatch_failure_step(identity, "notice", lambda: _dispatch_notice(
             parent, identity, run, instance, passed, "uncertain", detail))
@@ -1148,8 +1508,18 @@ def assign(parent: StaffId, role: WorkerRole, prompt: Path, *, session_dir: Path
                 name = matched.worker_name
         record = staff.snapshot()
         rows = record.find(kind="worker", parent=parent)
+        owner = record.by_id(parent)
+        enrolled = False
+        if owner is not None:
+            artifacts = (prompt, *(path for path in (reply, early_ready) if isinstance(path, Path)),
+                         *_review_artifacts(completion_actions))
+            try:
+                enrolled = isinstance(_require_review_order(owner, role, session_dir, *artifacts), EnrolledPaths)
+            except (OSError, ValueError, ProductionPathsError, staff.StaffRefused, staff.StaffUnreadable) as error:
+                print(error, file=sys.stderr)
+                return ExitCode.REFUSED
         needs_team = False
-        if not name and role in ("impl", "fix", "review", "test"):
+        if not enrolled and not name and role in ("impl", "fix", "review", "test"):
             needs_team = not any(isinstance(worker_panes.dispatch_role(row), str) for row in rows)
         if needs_team:
             names = {row.name for row in rows}
@@ -1204,13 +1574,13 @@ def assign(parent: StaffId, role: WorkerRole, prompt: Path, *, session_dir: Path
                     refusal = worker_panes.StartRefusal.BUSY_ROLE_CHANGE
                     print(f"{refusal.value}: workers unavailable: {row.name}", file=sys.stderr)
                     return ExitCode.BUSY
-        if chosen.value != slot:
+        if chosen.value != slot and owner is not None:
+            writer = CompletionArtifacts(owner, session_dir)
             if completion_actions.status_file:
                 status = Path(completion_actions.status_file)
                 target = progress_history.worker_artifact(status, slot, chosen.value)
                 completion_actions = replace(completion_actions, status_file=str(target))
-                if status.is_file():
-                    _ = status.replace(target)
+                writer.rename(status, target)
             if completion_actions.summary_file:
                 target = progress_history.worker_artifact(Path(completion_actions.summary_file), slot, chosen.value)
                 completion_actions = replace(completion_actions, summary_file=str(target))
@@ -1268,6 +1638,13 @@ def answer(parent: StaffId, name: WorkerName, text: str) -> ExitCode:
         if not isinstance(state, worker_panes.OpenWorker):
             return ExitCode.UNCERTAIN
         client = _client()
+        if (owner := record.by_id(parent)) is not None:
+            try:
+                _require_review_delivery(owner, row, run, passed)
+                _require_running_review(owner, client, state)
+            except (OSError, ValueError, ProductionPathsError, herdr_types.HerdrFailure, subprocess.SubprocessError,
+                    staff.StaffRefused, staff.StaffUnreadable) as error:
+                return _refuse_answer(name, str(error))
         if state.status is herdr.AgentStatus.BLOCKED and isinstance(backend, staff.CodexBackend):
             client.answer_question(state.pane, text, target=str(row.current_session))
         else:
@@ -1420,14 +1797,19 @@ def own_pass(row: staff.StaffRow, record: staff.StaffSnapshot, *,
 
 
 def resume_workers(parent: StaffId, record: staff.StaffSnapshot) -> ResumeWorkers:
-    """Supply Claude child launchers and pane dispatch ids to the shared builder."""
+    """Supply pane dispatches and legacy Claude child launchers."""
     from scripts.agents.inventory import worker_resumes
 
     holder = record.by_id(parent)
     if holder is None:
         return ResumeWorkers()
+    try:
+        enrolled = isinstance(worker_panes.enrolled_worker_owner(holder), EnrolledPaths)
+    except ProductionPathsError as error:
+        raise ValueError(str(error)) from error
+    legacy_launches = [] if enrolled else worker_resumes(holder, record)
     results = {staff.StaffId(result.staff_id if isinstance(result, Unavailable) else result.seat["staff_id"]): result
-               for result in worker_resumes(holder, record)}
+               for result in legacy_launches}
     members = record.find(kind="worker", parent=parent)
     unavailable = [row for row in members if isinstance(results.get(row.id), Unavailable)]
     recorded = session_staff.worker_run_entries(record, unavailable) if unavailable else {}
@@ -1439,6 +1821,10 @@ def resume_workers(parent: StaffId, record: staff.StaffSnapshot) -> ResumeWorker
     scanned = {str(holder.current_session): [str(path) for path in runs]}
     with progress_history.dispatch_reads(record, runs):
         for row in members:
+            if enrolled:
+                role = worker_panes.dispatch_role(row)
+                if not isinstance(role, str) or role not in worker_panes.REVIEW_ROLES:
+                    continue
             run = worker_panes.worker_run(row, record=record, scanned=scanned)
             active = progress_history.active_dispatch(row.id, run)
             if isinstance(active, progress_history.ActiveDispatchUnavailable):
@@ -1446,6 +1832,15 @@ def resume_workers(parent: StaffId, record: staff.StaffSnapshot) -> ResumeWorker
                 continue
             if isinstance(active, progress_history.ActiveDispatch):
                 _ = results.pop(row.id, None)
+                if enrolled:
+                    try:
+                        passed = worker_panes.worker_pass(row, run, record=record)
+                        if passed.get("instance_id") != active.instance_id:
+                            raise ValueError("the saved review pass changed")
+                        _require_review_delivery(holder, row, run, passed)
+                    except (OSError, ValueError, ProductionPathsError) as error:
+                        print(f"anomaly: {row.name}: {error}", file=sys.stderr)
+                        continue
                 step = resume_step(row, active)
                 if isinstance(step, (BusyPass, UnsubmittedAssignment)):
                     panes.append(PaneWorkerResume(row.id, step))
@@ -1457,7 +1852,7 @@ def resume_workers(parent: StaffId, record: staff.StaffSnapshot) -> ResumeWorker
                         and isinstance(latest.status, str) and latest.status != "active"):
                     continue
                 panes.append(PaneWorkerResume(row.id, IdleWorker()))
-    return ResumeWorkers(list(results.values()), str(session_staff.worker_directory(record, parent)) if results else "", panes)
+    return ResumeWorkers(list(results.values()), str(worker_panes.worker_directory(record, parent)) if results else "", panes)
 
 
 @dataclass(frozen=True)
@@ -1560,6 +1955,11 @@ def restore(parent: StaffId, *, record: staff.StaffSnapshot | None = None,
                         failed(state.row, hold.blocker, ExitCode.REFUSED)
                         continue
                     run = worker_panes.worker_run(state.row, record=record, scanned=runs)
+                    if isinstance(worker_panes.enrolled_worker_owner(holder), EnrolledPaths):
+                        passed = worker_panes.worker_pass(state.row, run, record=record)
+                        _require_review_delivery(holder, state.row, run, passed)
+                        if isinstance(state, worker_panes.OpenWorker):
+                            _require_running_review(holder, _client(), state)
                     plan = _resume_needed(state, (run, *held_runs))
                     if isinstance(plan, DispatchEvidenceUnknown):
                         failed(state.row, plan.reason, notice=f"anomaly: {name}: {plan.reason}")
@@ -1638,7 +2038,7 @@ def restore(parent: StaffId, *, record: staff.StaffSnapshot | None = None,
                                                                      pane=KeepCompletedPane.KEEP)
                     if report is None and recovery in pending_completion:
                         print(f"{name}: {recovery.value}", file=sys.stderr)
-            except (OSError, ValueError, herdr_types.HerdrFailure, subprocess.SubprocessError,
+            except (OSError, ValueError, ProductionPathsError, herdr_types.HerdrFailure, subprocess.SubprocessError,
                     staff.StaffRefused, staff.StaffUnreadable) as error:
                 reason = " ".join(str(error).splitlines()) or type(error).__name__
                 if isinstance(error, shutdown_record.RecordBusy) and report is not None:

@@ -7,6 +7,7 @@ import io
 import os
 from contextlib import ExitStack, redirect_stdout
 from pathlib import Path
+from unittest.mock import patch
 import shutil
 import subprocess
 import sys
@@ -17,8 +18,12 @@ import unittest
 
 from scripts.lint import gate_folders_delete
 from scripts.lint.sweep import gib
+from scripts.agents import remote
 from scripts.lib import removal_guard, scratch
 from scripts.lib.git_test_support import fixture_git_environment
+from scripts.production import staff
+from scripts.production.staff_test_support import fixture_member, isolated_staff_file
+from scripts.production.test_production_doc import enrolled_document
 
 GATE_RECORD = '{"owner":"fixture","repo":"repository","commit":"' + "1" * 40 + '"}\n'
 
@@ -30,6 +35,12 @@ class GateFoldersDeleteTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.enterContext(patch.dict(os.environ, {
+            **fixture_git_environment(self.root), "HOME": str(self.root), "GIT_CONFIG_SYSTEM": os.devnull,
+        }, clear=True))
+        staff_file = self.root / "staff.json"
+        _ = staff_file.write_text('{"schema": 2, "rows": []}')
+        self.enterContext(isolated_staff_file(staff_file, {}))
         self.gates = self.root / "gates"
         self.gates.mkdir()
         home = self.root / "home"
@@ -70,7 +81,7 @@ class GateFoldersDeleteTests(unittest.TestCase):
         return folder
 
     def linked_checkout(self, gate: Path) -> tuple[Path, Path]:
-        source = self.repository(self.root / "source")
+        source = self.repository(self.root / f"{gate.name}-source")
         checkout = gate / "checkout"
         _ = self.git(source, "worktree", "add", "--quiet", "--detach", str(checkout), "HEAD")
         _ = (checkout / "source.txt").write_text("edited source\n")
@@ -199,17 +210,31 @@ class GateFoldersDeleteTests(unittest.TestCase):
         self.assertEqual((checkout / "source.txt").read_text(), "edited source\n")
 
     def test_main_exits_zero_when_a_gate_stays(self) -> None:
-        for case in ("free", "busy", "missing-source"):
+        for case in ("free", "busy", "missing-source", "protected-dry-run", "protected-review"):
             with self.subTest(case=case), ExitStack() as contexts:
                 gate = self.gate(case)
+                source, checkout = self.root / "source", gate / "checkout"
+                protected = case.startswith("protected-")
+                before: dict[Path, bytes] = {}
+                refs = ""
                 if case == "busy":
                     busy = contexts.enter_context((gate / scratch.BUSY).open("w"))
                     fcntl.flock(busy, fcntl.LOCK_SH | fcntl.LOCK_NB)
                 elif case == "missing-source":
                     source = self.linked_checkout(gate)[0]
                     shutil.rmtree(source)
+                elif protected:
+                    source, checkout = self.linked_checkout(gate)
+                    _ = self.git(source, "branch", "-M", "main")
+                    _ = self.git(checkout, "switch", "-c", "integration")
+                    doc = source / "fixture-production-live.md"
+                    enrolled_document(doc, source, checkout, "integration")
+                    _ = fixture_member("showrunner", name=case, doc=staff.LiveDoc(remote.local_machine(), doc))
+                    refs = self.git(source, "for-each-ref", "--format=%(refname) %(objectname)")
+                    before = {path: path.read_bytes() for path in gate.rglob("*") if path.is_file()}
+                flags = ["--dry-run"] if case == "protected-dry-run" else []
                 result = subprocess.run(
-                    [sys.executable, gate_folders_delete.__file__, "--root", str(self.gates)],
+                    [sys.executable, gate_folders_delete.__file__, "--root", str(self.gates), *flags],
                     capture_output=True, text=True, check=False, timeout=20)
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 if case == "free":
@@ -218,6 +243,10 @@ class GateFoldersDeleteTests(unittest.TestCase):
                 elif case == "busy":
                     self.assertIn(f"kept {gate}: busy", result.stdout.splitlines())
                     self.assertEqual((gate / "target" / "output").read_bytes(), b"generated output")
+                elif protected:
+                    self.assertIn(f"kept {gate}: contains protected production checkout {checkout}", result.stdout)
+                    self.assertEqual({path: path.read_bytes() for path in gate.rglob("*") if path.is_file()}, before)
+                    self.assertEqual(self.git(source, "for-each-ref", "--format=%(refname) %(objectname)"), refs)
                 else:
                     self.assertIn(f"review {gate}: ", result.stdout)
                     self.assertEqual((gate / "checkout" / "source.txt").read_text(), "edited source\n")

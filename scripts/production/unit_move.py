@@ -130,33 +130,6 @@ def remote_tip(checkout: Path, branch: str) -> str:
     return listed.split("\t", 1)[0] if listed else ""
 
 
-def delete_remote_branch(checkout: Path, branch: str, tip: str) -> None:
-    remote = remote_tip(checkout, branch)
-    if remote:
-        if remote != tip:
-            try:
-                _ = git(checkout, "merge-base", "--is-ancestor", remote, tip)
-            except RenameRefused as error:
-                raise RenameRefused(f"origin branch {branch} has history outside the preserved tip") from error
-        # The lease deletes only the tip just checked: a push that lands meanwhile keeps the branch.
-        _ = git(checkout, "push", f"--force-with-lease=refs/heads/{branch}:{remote}", "origin", "--delete", branch)
-
-
-def delete_local_branch(checkout: Path, branch: str, tip: str) -> None:
-    local = branch_tip(checkout, branch)
-    if local:
-        if local != tip:
-            raise RenameRefused(f"branch {branch} moved during the rename")
-        _ = git(checkout, "update-ref", "-d", f"refs/heads/{branch}", tip)
-        _ = subprocess.run(["git", "-C", str(checkout), "config", "--remove-section", f"branch.{branch}"],
-                           capture_output=True, check=False)
-
-
-def delete_branch(checkout: Path, branch: str, tip: str) -> None:
-    delete_remote_branch(checkout, branch, tip)
-    delete_local_branch(checkout, branch, tip)
-
-
 def check_tip(checkout: Path, branch: str, tip: str) -> None:
     current = branch_tip(checkout, branch)
     if current and current != tip:
@@ -543,6 +516,15 @@ def finish_rename(row: staff.StaffRow, pending: PendingRename) -> bool:
     return True
 
 
+def _owner_git_checkout(doc: staff.LiveDoc | staff.WrappedDoc) -> Path:
+    from scripts.production.production_doc import EnrolledPaths, ProductionPathsError, resolve_production_paths
+
+    try:
+        paths = resolve_production_paths(doc.path)
+    except ProductionPathsError as error:
+        raise RenameRefused(str(error)) from error
+    return paths.integration if isinstance(paths, EnrolledPaths) else doc.path.parent
+
 def continue_rename(row: staff.StaffRow, pending: PendingRename) -> bool:
     """Keep the old unit allocation lock until the rename record is cleared."""
     with ExitStack() as allocation_locks:
@@ -569,7 +551,7 @@ def _finish_rename_push(record: staff.StaffSnapshot, row: staff.StaffRow,
             if (owner is None or not isinstance(owner.doc, (staff.LiveDoc, staff.WrappedDoc))
                     or owner.doc.machine != remote.local_machine()):
                 raise RenameRefused("the owner's repository is unavailable")
-            checkout = owner.doc.path.parent
+            checkout = _owner_git_checkout(owner.doc)
         tip = branch_tip(checkout, pending.branch)
         if not tip:
             raise RenameRefused("the local destination branch is unavailable")
@@ -634,7 +616,7 @@ def _recoverable_folder(record: staff.StaffSnapshot, row: staff.StaffRow, destin
             or owner.doc.machine != remote.local_machine() or not (destination / ".git").is_file()):
         return False
     try:
-        repository = checkout_folders(owner.doc.path.parent).common_dir
+        repository = checkout_folders(_owner_git_checkout(owner.doc)).common_dir
         target = checkout_folders(destination)
         identity = target.git_dir / "locked"
         return (repository == target.common_dir and identity.parent.parent == repository / "worktrees"
@@ -654,7 +636,7 @@ def move_checkout(record: staff.StaffSnapshot, row: staff.StaffRow) -> Path:
     if (owner is not None and isinstance(owner.doc, (staff.LiveDoc, staff.WrappedDoc))
             and owner.doc.machine == remote.local_machine()):
         found = [Path(line.removeprefix("worktree ")).resolve()
-                 for line in git(owner.doc.path.parent, "worktree", "list", "--porcelain").splitlines()
+                 for line in git(_owner_git_checkout(owner.doc), "worktree", "list", "--porcelain").splitlines()
                  if line.startswith("worktree ")]
         matching = [path for path in found if _recoverable_folder(record, row, path)]
         if len(matching) == 1:

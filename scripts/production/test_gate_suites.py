@@ -15,13 +15,14 @@ import subprocess
 import select
 from types import SimpleNamespace
 from pathlib import Path
-from typing import cast, final
+from typing import cast, final, override
 from collections.abc import Generator
 from unittest import mock
 from scripts.build_queue.admission_jobs import GateJobNotRecorded, StepJob
 from scripts.production import affected_modules, checkpoint_gate, gate, targeted_test
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.lib import process_group
+from scripts.lib.git_test_support import fixture_git_environment
 from scripts.test_times import gate_record
 from scripts.production.gate_modules import discover_test_modules, test_module_name
 from scripts.production.gate_test_support import SUITE_MODULE, gate_suites, install_test_runner, wait_for_file
@@ -30,6 +31,12 @@ from scripts.production.gate_suites_test_support import GateSuitesFixture
 
 @final
 class MergeGateSuitesTests(GateSuitesFixture):
+    @override
+    def setUp(self) -> None:
+        environment = {**fixture_git_environment(self.fixture_root.parent), "GIT_CONFIG_SYSTEM": os.devnull}
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, environment, clear=True)))
+        super().setUp()
+
     @gate_suites("hooks")
     def test_finished_local_job_wins_when_polling_crosses_the_deadline(self) -> None:
         # The queue admission wait comes before the time limit starts.

@@ -47,6 +47,7 @@ from typing import IO, TYPE_CHECKING, Literal, NotRequired, TypedDict, TypeGuard
 
 from scripts.agents import detached_run_process, worker_lifecycle
 from scripts.buildlog import treekey
+from scripts.direct import recorder_state
 from scripts.lib import atomic_file, conf, process_group, process_start, unit_runs
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.cancellation import CANCELLATION_SIGNALS
@@ -706,14 +707,21 @@ def _finish_record(path: Path, record: RunRecord) -> CompletionReplay:
     with path.with_suffix(".completion.lock").open("a") as claim:
         fcntl.flock(claim, fcntl.LOCK_EX)
         current = _read_record(path)
-        if current["status"] == "finished":
-            if current.get("completion_pending") is True:
-                return _replay_completion(path, current)
-            if current.get("completion_pending") is False or current.get("delivery"):
-                return CompletionReplay.HANDLED
-        record["completion_pending"] = True
-        record = _write_record(path, record)
-        return _replay_completion(path, record)
+        if current["status"] == "finished" and current.get("completion_pending") is True:
+            return _replay_completion(path, current)
+        if (current["status"] != "finished"
+                or not (current.get("completion_pending") is False or current.get("delivery"))):
+            record["completion_pending"] = True
+            record = _write_record(path, record)
+            return _replay_completion(path, record)
+    if not _cancels_pass(current):
+        return CompletionReplay.HANDLED
+    from scripts.herdr.worker_panes import StoppedDiagnosticRecovery
+
+    retry = cast(Callable[[Path, staff.StaffId], StoppedDiagnosticRecovery],
+                 import_module("scripts.herdr.turn_end").retry_stopped_diagnostics)
+    outcome = retry(Path(current["session_dir"]), staff.StaffId(current["staff_id"]))
+    return CompletionReplay.HANDLED if outcome is StoppedDiagnosticRecovery.SETTLED else CompletionReplay.RETRY
 
 
 def _replay_completion(path: Path, record: RunRecord) -> CompletionReplay:
@@ -723,7 +731,7 @@ def _replay_completion(path: Path, record: RunRecord) -> CompletionReplay:
     try:
         if _cancels_pass(record) and record.get("delivery", "") in ("", ORPHAN_RESULT_PENDING):
             delivery = _complete_stopped_run(path, record)
-            if _worker_result_pending(delivery):
+            if delivery is CompletionReplay.RETRY or _worker_result_pending(delivery):
                 return CompletionReplay.RETRY
         elif _retired_worker_result(record):
             if _result_push_failed(deliver(record, command_result(record))):
@@ -744,7 +752,7 @@ def _replay_completion(path: Path, record: RunRecord) -> CompletionReplay:
     return CompletionReplay.HANDLED
 
 
-def _complete_stopped_run(path: Path, record: RunRecord) -> str:
+def _complete_stopped_run(path: Path, record: RunRecord) -> str | Literal[CompletionReplay.RETRY]:
     """End the proved pane pass or deliver the ordinary stopped result."""
     from scripts.herdr import worker_panes
 
@@ -779,7 +787,8 @@ def _complete_stopped_run(path: Path, record: RunRecord) -> str:
         import_module("scripts.herdr.turn_end").stop_pass)
     result = stop_pass(run, record, guard_ended)
     if isinstance(result, worker_panes.StoppedRunPassCompletion):
-        _ = result.send_notice()
+        if result.send_notice() is worker_panes.StoppedPassCleanup.RETRY:
+            return CompletionReplay.RETRY
         return _save_delivery(path, f"finished: the pane pass {result.outcome}")
     if isinstance(result, worker_panes.Kept):
         print(f"detached_runs: {record['run_id']}: kept the pane pass: {result.blocker}", file=sys.stderr)
@@ -1052,6 +1061,57 @@ def live_runs(runs: Path, worker: str, *, identity: str = "") -> list[RunRecord]
     return evidence.require_readable()
 
 
+@contextlib.contextmanager
+def prepared_run_admission(run: Path) -> Generator[bool]:
+    """Exclude detached starts while a prepared run's pointer is cleared."""
+    runs = run / DETACHED_RUNS_DIR
+    runs.mkdir(exist_ok=True)
+    directory = os.open(runs, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        descriptor = os.open(".start.lock", os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK,
+                             0o666, dir_fd=directory)
+        with os.fdopen(descriptor, "a") as admission:
+            try:
+                fcntl.flock(admission, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                yield False
+            else:
+                yield True
+    finally:
+        os.close(directory)
+
+
+def run_execution_blocker(run: Path, *, admission_lock_held: bool = False) -> unit_runs.RunExecutionState:
+    """Read command execution after dispatch admission ends."""
+    runs = run / DETACHED_RUNS_DIR
+    if admission_lock_held:
+        return _detached_execution_blocker(runs)
+    try:
+        with (runs / ".start.lock").open("r") as admission:
+            try:
+                fcntl.flock(admission, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return unit_runs.RunExecutionBlocker("a detached command is starting")
+            return _detached_execution_blocker(runs)
+    except FileNotFoundError:
+        return _detached_execution_blocker(runs)
+
+
+def _detached_execution_blocker(runs: Path) -> unit_runs.RunExecutionBlocker | unit_runs.NoRunExecutionBlocker:
+    for path in _run_record_paths(runs):
+        raw = worker_lifecycle.read_json_object(path)
+        if not raw and not path.exists():
+            continue
+        status = raw.get("status")
+        if status not in ("running", "finished"):
+            return unit_runs.RunExecutionBlocker(f"{path.name}: the detached command state is unavailable")
+        pid = _integer(raw.get("pid"))
+        if ((status == "running" and not _orphaned(path, raw, time.time()))
+                or (raw.get("stop_pass_requested") and not _command_has_ended(raw, pid))):
+            return unit_runs.RunExecutionBlocker(f"detached run {path.stem} can still be running")
+    return unit_runs.NoRunExecutionBlocker.IDLE
+
+
 def live_runs_for_staff(runs: Path, identities: frozenset[staff.StaffId]) -> list[RunRecord]:
     """Read live records for fixed staff identities, including renamed members."""
     evidence = live_run_evidence_for_staff(runs, identities)
@@ -1189,6 +1249,21 @@ def resume_context(runs: Path, worker: str) -> str:
     return "\n".join(lines)
 
 
+def _start_refusal(run: Path) -> str:
+    path = run / unit_runs.STATE_FILE
+    try:
+        state = recorder_state.read_state(path)
+    except FileNotFoundError:
+        if path.exists(follow_symlinks=False):
+            return "the recorder state is unavailable"
+    except (OSError, ValueError, recorder_state.OldRecorderState) as error:
+        return str(error)
+    else:
+        if unit_runs.terminal_run(state):
+            return "the run has ended dispatch admission"
+    return ""
+
+
 SCOPE_REFUSAL = ("detached_runs: Start with systemd-run --scope or systemd-run --user --scope. "
                  + "Use the exact option names in that order.")
 
@@ -1236,7 +1311,6 @@ def command_start(args: argparse.Namespace) -> int:
             return 2
         if not session_dir:
             return NOT_A_DETACHED_WORKER
-        name = seat_name(session_dir, name)
     session_dir = str(Path(session_dir).resolve())
     label = str(getattr(args, "label", "") or "") or " ".join(command)
     kind = cast(DetachedRunKind, args.kind)
@@ -1250,6 +1324,11 @@ def command_start(args: argparse.Namespace) -> int:
     try:
         with (runs / ".start.lock").open("a") as admission:
             fcntl.flock(admission, fcntl.LOCK_EX)
+            if refusal := _start_refusal(Path(session_dir)):
+                print(f"detached_runs: {session_dir}: {refusal}", file=sys.stderr)
+                return 2
+            if isinstance(caller, NotDetachedWorker) or isinstance(caller, DirectorCaller) and not reference:
+                name = seat_name(session_dir, name)
             reaped = _reap_orphans_locked(runs)
             if twin := live_twin(runs, name, command, tree_key):
                 started = time.strftime("%H:%M:%S", time.localtime(twin["started_at"]))
