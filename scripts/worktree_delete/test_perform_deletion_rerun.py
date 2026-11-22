@@ -318,38 +318,40 @@ class ProtectedDeletionTests(unittest.TestCase):
                     _ = staff_file.write_bytes(staff_bytes)
                 if case == "missing staff record":
                     staff_file.unlink()
-                validation = attempt(checkout, worktree, "worktree_delete_validation.sh")
-                kept = bool(refusal)
-                self.assertEqual(validation.returncode, int(kept), validation.stdout + validation.stderr)
-                options = [protected_preview] if protected_preview else []
-                if not kept:
-                    fields = cast(dict[str, object], json.loads(validation.stdout))
-                    preview_id = cast(str, fields["preview_id"])
-                    options.append(preview_id)
-                    if confirmed:
-                        self.confirm(checkout, preview_id)
+                try:
+                    validation = attempt(checkout, worktree, "worktree_delete_validation.sh")
+                    kept = bool(refusal)
+                    self.assertEqual(validation.returncode, int(kept), validation.stdout + validation.stderr)
+                    options = [protected_preview] if protected_preview else []
+                    if not kept:
+                        fields = cast(dict[str, object], json.loads(validation.stdout))
+                        preview_id = cast(str, fields["preview_id"])
+                        options.append(preview_id)
+                        if confirmed:
+                            self.confirm(checkout, preview_id)
+                        else:
+                            options.append("--automatic")
+                    nonces = {path: path.read_bytes() for path in self.nonce_dir.glob("*")}
+                    result = attempt(checkout, worktree, "perform_deletion.sh", "integration", *options)
+                    self.assertEqual(result.returncode, int(kept), result.stdout + result.stderr)
+                    self.assertTrue(worktree.is_dir())
+                    if refusal:
+                        self.assertIn(refusal, validation.stdout)
+                        self.assertIn(refusal, result.stderr)
+                        self.assertEqual({path: path.read_bytes() for path in self.nonce_dir.glob("*")}, nonces)
+                        self.assertIn("refs/heads/integration", git(checkout, "show-ref"))
                     else:
-                        options.append("--automatic")
-                nonces = {path: path.read_bytes() for path in self.nonce_dir.glob("*")}
-                result = attempt(checkout, worktree, "perform_deletion.sh", "integration", *options)
-                self.assertEqual(result.returncode, int(kept), result.stdout + result.stderr)
-                self.assertTrue(worktree.is_dir())
-                if refusal:
-                    self.assertIn(refusal, validation.stdout)
-                    self.assertIn(refusal, result.stderr)
-                    self.assertEqual({path: path.read_bytes() for path in self.nonce_dir.glob("*")}, nonces)
-                    self.assertIn("refs/heads/integration", git(checkout, "show-ref"))
-                else:
-                    self.assertIn('"keep_origin": true', validation.stdout)
-                    self.assertIn('"has_remote_branch": false', validation.stdout)
-                    self.assertIn('"cleanup": true', validation.stdout)
-                    self.assertIn("Kept origin ref refs/heads/integration", result.stdout)
-                    if unresolved_id:
-                        self.assertIn(unresolved_id, result.stdout)
-                    self.assertIn("refs/heads/integration", git(checkout, "show-ref"))
-                self.assertEqual(tuple(git(folder, *pattern) for folder in protected_repos), protected_refs)
-                if case == "missing staff record":
-                    _ = staff_file.write_bytes(staff_bytes)
+                        self.assertIn('"keep_origin": true', validation.stdout)
+                        self.assertIn('"has_remote_branch": false', validation.stdout)
+                        self.assertIn('"cleanup": true', validation.stdout)
+                        self.assertIn("Kept origin ref refs/heads/integration", result.stdout)
+                        if unresolved_id:
+                            self.assertIn(unresolved_id, result.stdout)
+                        self.assertIn("refs/heads/integration", git(checkout, "show-ref"))
+                    self.assertEqual(tuple(git(folder, *pattern) for folder in protected_repos), protected_refs)
+                finally:
+                    if case == "missing staff record":
+                        _ = staff_file.write_bytes(staff_bytes)
 
 
 if __name__ == "__main__":
