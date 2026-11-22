@@ -1312,6 +1312,7 @@ GPU slot waits use the same shape with a `_gpu_slot` field.
 Repository run limits use `max_runs.<machine>.<repository>` in `build_admission.conf`.
 The admission service reads the limits each pass.
 `max_runs.natedev.claude_commands` permits two concurrent local `gate` or `test-affected` runs.
+`max_runs.natedev.hana` permits two concurrent local hana `gate` or `test-affected` runs.
 The admission service uses the Git repository name when a gate profile supplies an absolute path.
 Each run uses one slot while it holds an admission reservation for either step.
 Module jobs and remote placements use no slots.
