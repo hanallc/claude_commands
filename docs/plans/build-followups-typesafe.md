@@ -423,3 +423,34 @@ The governing rule, from the skill: **Jev makes the judgments, and code makes th
 **Binds later work:** A value change is a user decision through `/tune`; a move with the same value needs no approval. Code that names `questions.THRESHOLDS` or `questions.BUDGET_USD` now calls `questions.thresholds()` or `questions.budget_usd()`. Scores made before this phase carry the old `content_hash` formula: the current tree misses their cache and `apply_labels.py` refuses their review rows.
 
 **Gotchas:** `basedpyright` exits 3 in this repository because `.venv` is absent; the pass check is the `0 errors, 0 warnings, 0 notes` footer.
+
+### Phase 9 — style scripts stop and time out with no signal handler  · status: done
+
+**Depends on:** none (queued by the natedev showrunner; no-signal-handlers rule, sdlc verify inventory on main 06586b2227)
+
+#### Work Order
+
+**Goal:** the style split time limit and the lint stop cleanup keep their outcome with no signal handler, signal mask or signal disposition in any process.
+
+**Spec:**
+- `scripts/style/style_plan.py` `split_time_limit` (about lines 4339-4360): remove the `SIGALRM` handler and both `setitimer` calls. Keep the outcome: a split that passes `timeout_minutes` before its ledger commit starts fails with `SplitDeadline.timeout_error()` and stores nothing on the original ledger. The deadline is checked before the commit starts; after that, the commit result is the result, because disk I/O inside a commit has no bound without a signal. A deadline check that finds no time left, or a lock wait that reaches the deadline, raises the timeout; any other SQLite error keeps its own cause, before or after the commit starts (director's call after the F001 Astra review and closure pass 5, 2026-11-21). A step that waits (a subprocess, a git call, a ledger lock) gets its bound from `deadline.remaining_seconds()`, as the ledger lock already does at about line 4383. The time is checked between steps.
+- `scripts/style/style_sync.py` (about lines 60-62 and 263-295, 358, 368-376, 445, 469-476, 719): remove `LintStopped`, `stop_signals_raise`, `signal_mask`, `STOP_SIGNALS`, `HELD_SIGNALS` and every `signal.signal` and `pthread_sigmask` call. Keep the outcome: after SIGTERM, SIGHUP or SIGINT reaches a lint run, its lint dir, its worktree slot and every child and grandchild process go away, without a later command. The cleanup must run in a process that does not receive the stop signal and that installs no handler, for example a child in its own session that sees its parent end. Use the existing owner record, `process_group` and dead-owner sweep where they fit; do not add a second sweep.
+- The stopped process now ends by the default signal action. Its exit status and its stderr text after a stop are no longer kept: the tests that assert `128 + signum` and `lint stopped by <name>` change to assert the outcome above. This is the director's design call for this phase.
+- No other guard, refusal or check.
+
+**Files:**
+- `scripts/style/style_plan.py`
+- `scripts/style/style_sync.py`
+- `scripts/style/lint_keeper.py` — new, only if the cleanup process needs its own module
+- `scripts/style/test_style_sync.py`
+- `scripts/style/test_style_plan_split.py`
+- `scripts/style/style_ledger.py` — the split writer `record_split_at`
+- `scripts/style/test_style_ledger.py` — the locked-ledger split test
+
+**Workers:** 1 writer + 1 tester
+- `impl`: `scripts/style/style_plan.py`, `scripts/style/style_sync.py`, `scripts/style/lint_keeper.py`
+- `test`: `scripts/style/test_style_sync.py`, `scripts/style/test_style_plan_split.py`
+
+**State:** none
+
+**Acceptance gate:** `git grep -nE "signal\.(signal|setitimer|pthread_sigmask|SIG_BLOCK|SIG_UNBLOCK|SIG_SETMASK)" scripts/style/` prints nothing; the split timeout test and the stop tests pass (SIGTERM, SIGHUP and SIGINT each leave no lint dir, no worktree slot and no live child); `basedpyright` on each slot's files reads `0 errors, 0 warnings, 0 notes`; the targeted test passes.
