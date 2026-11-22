@@ -255,10 +255,6 @@
       "owner": "shutdown-unit"
     },
     {
-      "path": "scripts/model_study/",
-      "owner": "models-unit"
-    },
-    {
       "path": "scripts/shot_report/",
       "owner": "screenshot-unit"
     },

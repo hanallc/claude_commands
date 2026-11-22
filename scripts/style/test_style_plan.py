@@ -7,17 +7,23 @@ from scripts.style.style_config import StyleUnitAssignment
 
 import fcntl
 import io
+import os
+import shutil
+import socket
 import subprocess
+import tempfile
 import threading
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
-from typing import IO, final
+from typing import IO, cast, final, override
 from unittest import mock
 
 
-from scripts.style import style_plan
+from scripts.build_queue import admission_protocol as wire
+from scripts.style import bulk_rename, fake_fmt, style_plan
+from scripts.style.style_child_test_support import StyleQueueFake, unqueued_style_children
 from scripts.style import unit_plans
 from scripts.style import style_proposals
 
@@ -29,6 +35,74 @@ from scripts.style.style_plan_test_support import StylePlanFixture, unit_staff_i
 from scripts.production import staff, unit_names
 from scripts.production.staff_test_support import fixture_unit_location, recorded_showrunner, recorded_unit
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+
+
+@final
+class StyleCargoAdmissionTests(unittest.TestCase):
+    repo: Path = Path()
+    state: Path = Path()
+    queue: StyleQueueFake = StyleQueueFake()
+
+    @override
+    def setUp(self) -> None:
+        self.repo = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="style-admission-test-")))
+        self.state = self.repo / "fmt"
+        fake_fmt.install(self.repo / "bin", self.state)
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
+            "PATH": str(self.repo / "bin") + os.pathsep + os.environ.get("PATH", ""),
+            fake_fmt.STATE: str(self.state),
+        })))
+        self.queue = self.enterContext(unqueued_style_children())
+
+    def test_plan_cargo_format_starts_at_the_shared_place(self) -> None:
+        _ = (self.state / "cargo/stdout").write_text("Formatting src/lib.rs\n")
+        result = style_plan.cargo_format(self.repo)
+        self.assertEqual(result.visited, frozenset({self.repo / "src/lib.rs"}))
+        self.assertEqual(self.queue.calls, [("cargo", self.repo)])
+        place, = self.queue.places
+        self.assertEqual(place.arguments, [style_plan.CARGO_FMT_CHECK])
+        self.assertTrue(place.closed)
+
+    def test_cargo_output_returns_the_queue_child_result(self) -> None:
+        for name, content in (("stdout", "out"), ("stderr", "err"), ("exit", "7")):
+            _ = (self.state / "cargo" / name).write_text(content)
+        result = bulk_rename.cargo_output(self.repo, ("cargo", "check"))
+        self.assertEqual((result.returncode, result.stdout, result.stderr), (7, "out", "err"))
+        self.assertEqual(self.queue.calls, [("cargo", self.repo)])
+        place, = self.queue.places
+        self.assertEqual(place.arguments, [("cargo", "check")])
+        self.assertTrue(place.closed)
+
+    def test_cargo_format_reports_the_queue_refusal(self) -> None:
+        key = "program_first_peak_gib.cargo"
+        reason = f"{self.repo / 'lint.conf'}: {key} is missing or invalid"
+        self.queue.refusals["cargo"] = reason
+        errors = io.StringIO()
+        with redirect_stderr(errors), self.assertRaises(SystemExit) as stopped:
+            _ = style_plan.cargo_format(self.repo)
+        self.assertEqual(stopped.exception.code, 2)
+        self.assertIn(reason, errors.getvalue())
+        self.assertEqual(self.queue.calls, [("cargo", self.repo)])
+        self.assertEqual(self.queue.places, [])
+
+
+@final
+class StyleQueueIsolationTests(unittest.TestCase):
+    def test_the_style_fixture_replaces_an_inherited_admission_socket(self) -> None:
+        directory = Path(tempfile.mkdtemp(prefix="style-socket-"))
+        self.addCleanup(shutil.rmtree, directory)
+        with socket.socket(socket.AF_UNIX) as outside:
+            inherited = directory / "outside.sock"
+            outside.bind(str(inherited))
+            outside.listen(1)
+            with mock.patch.dict(os.environ, {"ADMISSION_SOCKET": str(inherited)}):
+                with unqueued_style_children():
+                    private = wire.admission_socket_path()
+                    self.assertNotEqual(private, inherited)
+                    self.assertTrue(private.parent.is_dir())
+                    with socket.socket(socket.AF_UNIX) as connection, self.assertRaises(FileNotFoundError):
+                        connection.connect(str(private))
+                self.assertEqual(wire.admission_socket_path(), inherited)
 
 
 @final
