@@ -51,7 +51,8 @@ if (gateMode) args.shift();
 const [callerFolder, previousPage, comparison] = args;
 const verifyCallProof = previousPage === '--verify-call';
 const buildToolsProof = previousPage === '--build-tools';
-const focusedProof = verifyCallProof || buildToolsProof;
+const queueDragProof = previousPage === '--queue-drag';
+const focusedProof = verifyCallProof || buildToolsProof || queueDragProof;
 const themes = gateMode ? ['dark'] : ['light','dark'];
 const widths = gateMode ? [1400] : [1400,900,390];
 const runningHeaders = ['Stage','Done','Step','Dur','Verify','Unit','Pid','Target','vCPU','Slot','Tokens'];
@@ -153,7 +154,34 @@ try {
 
   let servedReading = base;
   let currentFixture = base;
-  const server = createServer((req, res) => {
+  let queueFixture = null;
+  const server = createServer(async (req, res) => {
+    if (req.url === '/console/builds/queue-move') {
+      const json = (status, result) => {
+        res.writeHead(status, {'Content-Type':'application/json'});
+        res.end(JSON.stringify(result));
+      };
+      if (!queueFixture) return json(403, {});
+      if (req.method === 'GET') return json(200, {token:'fixture-token', highlight_seconds:20});
+      req.setEncoding('utf8');
+      let body = '';
+      for await (const part of req) body += part;
+      const request = JSON.parse(body);
+      const {revision, row_id, destination} = request;
+      const rows = queueFixture.waiters;
+      const line = () => ({revision:queueFixture.move_revision, members:rows.flatMap(row => row.move ? [row.move] : [])});
+      if (revision !== queueFixture.move_revision) return json(409, {reason:'The queue changed.', line:line()});
+      const index = rows.findIndex(row => row.move?.row_id === row_id);
+      const row = rows[index];
+      rows.splice(index, 1);
+      const neighbor = rows.findIndex(item => item.move?.row_id === destination.neighbor);
+      const undo = destination.kind === 'QueueUndo';
+      const next = undo ? queueFixture.undoPlace : neighbor + (destination.side === 'after' ? 1 : 0);
+      rows.splice(next, 0, row);
+      queueFixture.undoPlace = index;
+      queueFixture.move_revision += '1';
+      return json(200, {line:line(), old_place:index + 1, new_place:next + 1});
+    }
     const isData = req.url.startsWith('/memory.json'), isReport = req.url.startsWith('/report.json');
     res.writeHead(200, {'Content-Type':isData || isReport ? 'application/json' : 'text/html; charset=utf-8'});
     res.end(isData ? JSON.stringify(servedReading) : isReport ? JSON.stringify(base.report)
@@ -403,6 +431,11 @@ try {
           console.log(JSON.stringify({pass:true,views}));
           break browserProof;
         }
+        await checkQueueDrag(navigate, evaluate, call);
+        if (queueDragProof) {
+          console.log(JSON.stringify({shot:join(folder, 'drag-dark.png')}));
+          break browserProof;
+        }
         await checkHeadcounts(navigate, evaluate, call);
         if (headcountComparison) console.log(JSON.stringify({pass:true,comparison:'headcount'}));
         else {
@@ -413,6 +446,99 @@ try {
         if(ws) ws.close();
         chrome.kill('SIGTERM');
         await exited;
+      }
+
+      async function checkQueueDrag(navigate, evaluate, call) {
+        const template = readings.spacing.waiters.find(row => row.kind !== 'cloud');
+        const units = ['admin-console', 'unit-board', 'aws', 'postmaster', 'typesafe'];
+        queueFixture = {...structuredClone(readings.spacing), move_revision:'fixture',
+          waiters:units.map((unit, index) => ({...template, unit, detail:unit, name:'test affected',
+            showrunner:['sdlc','sdlc','builds','natedev','natedev'][index],
+            since:fixtureTime - (14 - index * 3) * 60, pid:500 + index,
+            need:1.2 + index / 10, machine:'natedev', place:index + 1,
+            move:{row_id:unit, group:index === 0 ? unit : ''}}))};
+        if (!queueDragProof) {
+          const cloud = readings.cloud.waiters.find(row => row.kind === 'cloud');
+          queueFixture.waiters.push({...cloud, kind:'cloud', name:'cloud fixture', pid:600});
+        }
+        servedReading = queueFixture;
+        await navigate('memory_live.html');
+        await evaluate(`new Promise(resolve => {
+          const walk = document.querySelector('#walk');
+          const ready = () => walk.querySelector('[data-move-id="typesafe"]');
+          if (ready()) return resolve(true);
+          const observer = new MutationObserver(() => {
+            if (ready()) { observer.disconnect(); resolve(true); }
+          });
+          observer.observe(walk, {childList:true, subtree:true});
+        })`);
+        const snapshot = () => evaluate(`({
+          handles:[...document.querySelectorAll('.queue-grip')].map(button => button.dataset.moveId),
+          lifted:document.querySelector('.wrow.queue-lift .queue-grip')?.dataset.moveId,
+          places:[...document.querySelectorAll('tr.wait td.place')].map(cell => cell.textContent),
+          line:document.querySelector('#queue-status').textContent,
+          action:document.querySelector('#queue-action').hidden ? '' : document.querySelector('#queue-action').textContent
+        })`);
+        await evaluate("document.querySelector('#walk .queue-title').scrollIntoView({block:'center'}); true");
+        const point = unit => evaluate(`(() => {
+          const box = document.querySelector('[data-move-id="' + ${JSON.stringify(unit)} + '"]').getBoundingClientRect();
+          return {x:box.left+box.width/2, y:box.top+box.height/2};
+        })()`);
+        const start = await point('typesafe');
+        const target = await point('unit-board');
+        await call('Input.dispatchMouseEvent',{type:'mousePressed', ...start, button:'left', buttons:1, clickCount:1});
+        await call('Input.dispatchMouseEvent',{type:'mouseMoved', ...target, button:'left', buttons:1});
+        const preview = await snapshot();
+        if (!queueDragProof) {
+          assert.deepEqual(preview.handles,['admin-console','typesafe','unit-board','aws','postmaster']);
+          assert.equal(preview.lifted,'typesafe');
+          assert.deepEqual(preview.places,['1','2','3','4','5','cloud']);
+          await evaluate('renderReading({...latest, read_at:latest.read_at+1}); true');
+          assert.deepEqual(await snapshot(),preview);
+        }
+        await call('Input.dispatchMouseEvent',{type:'mouseReleased', ...target, button:'left', buttons:0, clickCount:1});
+        const waitForLine = line => evaluate(`new Promise(resolve => {
+          const node = document.querySelector('#queue-status');
+          const ready = () => node.textContent === ${JSON.stringify(line)};
+          if (ready()) return resolve(true);
+          const observer = new MutationObserver(() => {
+            if (ready()) { observer.disconnect(); resolve(true); }
+          });
+          observer.observe(node, {childList:true, characterData:true, subtree:true});
+        })`);
+        await waitForLine('typesafe · test affected moved from 5 to 2');
+        if (queueDragProof) {
+          const clip = await evaluate(`(() => {
+            const walk = document.querySelector('#walk').getBoundingClientRect();
+            const top = document.querySelector('#walk .queue-title').getBoundingClientRect().top + scrollY - 10;
+            const bottom = document.querySelector('#queue-feedback').getBoundingClientRect().bottom + scrollY + 12;
+            return {x:Math.max(0,walk.left-10),y:top,width:Math.min(innerWidth-walk.left,walk.width+20),height:bottom-top,scale:1};
+          })()`);
+          const shot = await call('Page.captureScreenshot',{format:'png',captureBeyondViewport:true,clip});
+          await writeFile(join(folder, 'drag-dark.png'), Buffer.from(shot.data,'base64'));
+          return;
+        }
+        assert.equal((await snapshot()).action,'Undo');
+        await evaluate("document.querySelector('#queue-action').click(); true");
+        await waitForLine('typesafe · test affected moved from 2 to 5');
+        assert.deepEqual((await snapshot()).handles, units);
+        await evaluate(`(() => {
+          const button = document.querySelector('[data-move-id="unit-board"]');
+          button.focus();
+          button.dispatchEvent(new KeyboardEvent('keydown', {key:' ', bubbles:true}));
+          document.activeElement.dispatchEvent(new KeyboardEvent('keydown', {key:'ArrowUp', bubbles:true}));
+          return true;
+        })()`);
+        assert.equal((await snapshot()).line, 'Use /build:bump to move a unit ahead');
+        await evaluate(`(() => {
+          document.activeElement.dispatchEvent(new KeyboardEvent('keydown', {key:'ArrowDown', bubbles:true}));
+          document.activeElement.dispatchEvent(new KeyboardEvent('keydown', {key:'Enter', bubbles:true}));
+          return true;
+        })()`);
+        await waitForLine('unit-board · test affected moved from 2 to 3');
+        assert.deepEqual((await snapshot()).handles, ['admin-console', 'aws', 'unit-board', 'postmaster', 'typesafe']);
+        queueFixture = null;
+        servedReading = base;
       }
 
       async function checkHeadcounts(navigate, evaluate, call) {

@@ -1401,10 +1401,10 @@ def waiter_label(row: Waiter) -> str:
         return f"caller pid {row['pid']}"
 
 
-def waiter_order(row: Waiter) -> tuple[int, float, int]:
+def waiter_order(row: Waiter) -> tuple[int, int, float, int]:
     order = records.waiter_priority(row)
     rank = order.position if isinstance(order, PriorityUnit) else sys.maxsize
-    return rank, row.get("order_since", row["since"]), row["pid"]
+    return rank, row.get("move_position", sys.maxsize), row.get("order_since", row["since"]), row["pid"]
 
 
 @dataclass(frozen=True)

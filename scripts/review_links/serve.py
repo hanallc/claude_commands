@@ -39,7 +39,7 @@ STARTED_NS = time.time_ns()
 
 from scripts.disks import disks_page, sessions, slots
 from scripts.aws_target import aws_page, machines_page
-from scripts.build_queue import memory_files
+from scripts.build_queue import admission_client, admission_protocol as admission, memory_files
 from scripts.lib import conf, scratch
 from scripts.production import change_routing, change_review, staff
 from scripts.review_links import accounts_page, branch_page, change_page, change_browser, console, for_you, image_store, images, investigations_page, list_page, review_items, review_page
@@ -53,7 +53,23 @@ LISTEN_FD = "REVIEW_LINKS_LISTEN_FD"
 # Allow page state and rows in addition to the existing words and image budget.
 MAX_NEW_ITEM_BODY = (4 * ((new_item_dialog.MAX_TOTAL_IMAGE_BYTES + 2) // 3) + 256 * 1024
                      + new_item_dialog.MAX_PAGE_DATA_BYTES + new_item_dialog.MAX_BUG_PAGE_STATE_BYTES)
+QUEUE_MOVE_PATH = "/console/builds/queue-move"
 ATTACHMENT_MEDIA = {f"image.{extension}": media for media, extension in new_item_dialog.IMAGE_FORMATS.items()}
+
+
+def queue_move_owner(peer: str, login: str, timeout: float) -> bool:
+    """Check the connection's Tailscale user against the configured login."""
+    if not login:
+        return False
+    try:
+        address = str(ipaddress.ip_address(peer))
+        result = subprocess.run(["tailscale", "whois", "--json", address],
+            capture_output=True, text=True, check=True, timeout=timeout)
+        lookup = cast(dict[str, object], json.loads(result.stdout))
+        profile = lookup["UserProfile"]
+        return isinstance(profile, dict) and cast(dict[str, object], profile).get("LoginName") == login
+    except (OSError, subprocess.SubprocessError, ValueError, TypeError, KeyError):
+        return False
 
 
 def published_console_page(root: Path, path: str) -> str:
@@ -581,6 +597,9 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         if route.path in (investigations_page.PAGE_PATH, "/console/questions.html", "/console/changes.html"):
             self.redirect(review_page.legacy_url(route.path, route.query))
             return None
+        if route.path == QUEUE_MOVE_PATH:
+            self.queue_move_token(route.query)
+            return None
         if route.path == console_tune.PAGE_PATH:
             self.tune_token(route.query)
             return None
@@ -857,6 +876,9 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         route = urlsplit(self.path)
         if server.mode is ServerMode.LIST_FIXTURE and route.path != list_page.PAGE_PATH:
             self.send_error(404)
+            return
+        if route.path == QUEUE_MOVE_PATH:
+            self.queue_move_post(route.query)
             return
         refusal = self.tailscale_refusal()
         if refusal:
@@ -1326,6 +1348,80 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                 except Exception as error:
                     print(f"review-links review delivery release: {error}", file=sys.stderr)
                 server.review_cache.invalidate()
+
+    def queue_move_allowed(self, settings: conf.ConfigRead, *, origin_required: bool) -> bool:
+        if self.tailscale_refusal() or not self.same_origin(required=origin_required):
+            return False
+        login = settings.value("move_owner_login", str, allow_blank=True)
+        return queue_move_owner(self.client_address[0], login, settings.number("move_timeout_seconds"))
+
+    def queue_move_token(self, query: str) -> None:
+        if self.command != "GET" or query:
+            self.send_error(400)
+            return
+        settings = conf.read_or_repository("build_queue")
+        try:
+            allowed = self.queue_move_allowed(settings, origin_required=False)
+            highlight = settings.number("move_highlight_seconds") if allowed else 0
+        except ValueError:
+            allowed = False
+            highlight = 0
+        if not allowed:
+            self.json_response(403, {"reason": "Queue moves require the configured Tailscale account."})
+            return
+        server = cast(ReviewLinksServer, self.server)
+        self.json_response(200, {"token": server.new_item_token, "highlight_seconds": highlight})
+
+    def queue_move_post(self, query: str) -> None:
+        settings = conf.read_or_repository("build_queue")
+        try:
+            if not self.queue_move_allowed(settings, origin_required=True):
+                self.json_response(403, {"reason": "Queue moves require the configured Tailscale account."})
+                return
+            if query or self.headers.get_content_type() != "application/json":
+                raise ValueError("Send a queue move as JSON.")
+            lengths = self.headers.get_all("Content-Length", [])
+            limit = settings.whole("move_request_bytes")
+            if len(lengths) != 1 or not lengths[0].isascii() or not lengths[0].isdecimal():
+                raise ValueError("Invalid queue move request size.")
+            length = int(lengths[0])
+            if not 0 < length <= limit or self.headers.get_all("Transfer-Encoding"):
+                raise ValueError("Invalid queue move request size.")
+            timeout = settings.number("move_timeout_seconds")
+            connection = cast(socket.socket, self.connection)
+            previous_timeout = connection.gettimeout()
+            connection.settimeout(timeout)
+            try:
+                payload = cast(object, json.loads(self.rfile.read(length)))
+            finally:
+                connection.settimeout(previous_timeout)
+            if not isinstance(payload, dict):
+                raise ValueError("Send one queue move.")
+            fields = cast(dict[str, object], payload)
+            if not self.valid_request_token(fields.pop("token", None)):
+                self.json_response(403, {"reason": "The queue move token expired. Refresh Builds."})
+                return
+            if fields.keys() != {"request_id", "row_id", "revision", "destination"}:
+                raise ValueError("Send a request ID, row, revision and destination.")
+            request = admission.parse_record(json.dumps({**fields, "kind": "QueueMoveRequest"}), admission.QueueMoveRequest)
+            other_id = (request.destination.neighbor if isinstance(request.destination, admission.QueueDrop)
+                        else request.destination.move_request_id)
+            if (any(not re.fullmatch(r"[0-9a-f]{32}", key) for key in (request.request_id, request.row_id, other_id))
+                    or not re.fullmatch(r"[0-9a-f]{32}", request.revision)):
+                raise ValueError("Invalid queue move identity.")
+        except (ValueError, TypeError, TimeoutError, RecursionError) as error:
+            self.json_response(400, {"reason": str(error)})
+            return
+        try:
+            result = admission_client.move_queue(request, timeout)
+        except (OSError, ValueError) as error:
+            self.browser_failure(503, "The queue could not confirm the move. Refresh Builds.", error)
+            return
+        if isinstance(result, admission.Refused):
+            self.json_response(503, {"reason": result.reason})
+        else:
+            content = cast(dict[str, object], json.loads(admission.encode_record(result)))
+            self.json_response(409 if isinstance(result, admission.QueueMoveConflict) else 200, content)
 
     def tune_token(self, query: str) -> None:
         """Return the console request token for a Go confirmation."""

@@ -640,6 +640,8 @@ class Waiter(TypedDict):
     need: int
     since: float
     order_since: NotRequired[float]
+    move_id: NotRequired[str]
+    move_position: NotRequired[int]
     label: NotRequired[str]
     session_id: NotRequired[str]
     session_name: NotRequired[str]
@@ -1062,6 +1064,25 @@ class PackageNotRecorded:
 
 
 @dataclass(frozen=True)
+class QueueMoveMember:
+    """Identify one wait and its current priority group."""
+    row_id: str
+    group: str
+
+
+@dataclass(frozen=True)
+class QueueMoveLine:
+    """Keep the revision and order of the waits that can move."""
+    revision: str
+    members: tuple[QueueMoveMember, ...]
+
+
+@dataclass(frozen=True)
+class QueueMoveUnavailable:
+    """The service did not publish an order that supports moves."""
+
+
+@dataclass(frozen=True)
 class WaitingStep:
     """The waiting step holds its caller, memory need, wait reason, and run identity."""
     pid: int
@@ -1135,6 +1156,7 @@ class QueueView:
     promised: int
     reserve: int
     now: float
+    move_line: QueueMoveLine | QueueMoveUnavailable = field(default=QueueMoveUnavailable(), kw_only=True)
 
 
 @dataclass(frozen=True)

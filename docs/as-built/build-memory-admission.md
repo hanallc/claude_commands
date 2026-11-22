@@ -2349,3 +2349,26 @@ Session TMPDIRs and unit session folders remain for later session commands.
 
 `verify.sh` shares one Python process across synchronous helper calls.
 See [Synchronous verify helpers](build-targets.md#synchronous-verify-helpers) for the protocol, process exceptions, recovery, and trace format.
+
+### Move a waiting step
+
+Use the three-line handle on the Builds page to move a natedev wait within its priority group.
+To use the keyboard, press Space on the handle, press an arrow key, then press Enter.
+Press Escape to cancel.
+The numbers show queue positions.
+The policy still checks eligibility before each start.
+Cloud waits have their own order.
+
+The admission service gives each wait an ID.
+The saved place binds the ID to the owner PID, process start time, original arrival time, and episode.
+A refresh keeps the ID.
+A grant or cancellation ends the move.
+The service saves the manual order apart from the bump list in `state.json`.
+The bumped units still have priority.
+New waits join the end of a group with manual order.
+Use `/build:bump` to change priority between groups.
+
+The service checks the current order revision before it commits a move.
+Its replay ledger records the reply with the new order.
+Undo restores the row between its old neighbors if they still define the destination.
+A conflict supplies the current order.

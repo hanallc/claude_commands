@@ -966,6 +966,7 @@ class MemoryWaitRow(WaitRow):
     """A step that holds a place in the memory queue."""
 
     place: int
+    move: NotRequired[admission_records.QueueMoveMember]
 
 
 class MacBuildRow(RowQueueNotes, SlotPlace, NamedQueueRow):
@@ -1114,6 +1115,7 @@ class MemoryPage(TypedDict):
     swap: SwapTotals
     walk: list[RunRow | CloudRunRow | MacBuildRow | MacReadingUnavailableRow]
     waiters: list[WaitRow | CloudWaitRow]
+    move_revision: NotRequired[str]
     swap_by: list[SwapRow]
     priority_text: str
     queued_priority_units: list[str]
@@ -2975,6 +2977,9 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
         checks[explanation.head.waiter.pid] = explanation.head.room
         order_holds[explanation.head.waiter.pid] = explanation.head.decision.order_hold
     waiting = parsed.view.waiting
+    move_line = parsed.view.move_line
+    move_members = ({member.row_id: member for member in move_line.members}
+                    if isinstance(move_line, admission_records.QueueMoveLine) else {})
     positions = {waiter.pid: place for place, waiter in enumerate(waiting, 1)}
     for place, waiter in enumerate(waiting, 1):
         check = checks.get(waiter.pid)
@@ -3018,6 +3023,11 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
                                      waiter.folder, host_name()),
                         **job_notes(job, names, step=waiter.step, verify=waiter.verify,
                                     ci=bool(ci_label))}
+        if place <= len(parsed.ordered):
+            _, ordered_waiter = parsed.ordered[place - 1]
+            member = move_members.get(ordered_waiter.get("move_id", ""))
+            if member is not None and (ordered_waiter["pid"], ordered_waiter["since"]) == (waiter.pid, waiter.since):
+                waiters[place]["move"] = member
     work_rows: list[RunRow | CloudRunRow | MacBuildRow | MacReadingUnavailableRow] = list(walk)
     mac_status = queue_view.mac_reading_status(mac_reading, explanation.now)
     if mac_status:
@@ -3191,6 +3201,8 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
         "report_version": report_version,
         "swap_rows": configuration.swap_rows, "leftovers": leftovers,
     }
+    if move_members and isinstance(move_line, admission_records.QueueMoveLine):
+        page["move_revision"] = move_line.revision
     page["render_seconds"] = time.perf_counter() - started
     return page
 
