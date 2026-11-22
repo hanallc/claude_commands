@@ -6,6 +6,7 @@ from scripts.lib.checkout_test_support import copy_test_runner
 
 from contextlib import ExitStack
 from dataclasses import dataclass
+from itertools import product
 import json
 import math
 import os
@@ -25,6 +26,7 @@ from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.lib.process_group import send_process_group
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.message.process_test_support import OwnedTestProcesses
+from scripts.production import gate
 from scripts.test_times.gate_record import ModuleTimes
 from scripts.test_times.module_run import FixtureMeasure, TestMeasure
 
@@ -338,7 +340,6 @@ class ModuleRunnerTests(unittest.TestCase):
 
     def test_config_reads_include_python_and_shell_children(self) -> None:
         from scripts.lib import build_folders
-        from scripts.production import merge_gate
 
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()
@@ -376,6 +377,7 @@ class Reads(unittest.TestCase):
         import json
         from pathlib import Path
         module = Path(os.environ['TMPDIR'])
+        self.assertNotIn('GATE_PARENT_PID', os.environ)
         self.assertNotIn('MERGE_GATE_PARENT_PID', os.environ)
         self.assertNotIn('MERGE_GATE_MODULE_DIR', os.environ)
         paths = [Path(os.environ[name]) for name in ('SCRATCH_ROOT', 'ASTRA_REVIEW_DIR', 'CONF_READ_LOG')]
@@ -395,22 +397,22 @@ class Reads(unittest.TestCase):
 """, encoding="utf-8")
                     extra = {**os.environ, **interpreter_cache_environment(root / "cache"),
                              "CONF_DIR": str(config), "PYTHONPATH": str(root)}
-                    env = merge_gate.test_module_environment(gate_root, extra)
-                    shim = merge_gate.python_shim(repository)
-                    job = merge_gate.start_gate_job(
+                    env = gate.test_module_environment(gate_root, extra)
+                    shim = gate.python_shim(repository)
+                    job = gate.start_gate_job(
                         "test_times", fixture_path, [str(shim), str(RUNNER), str(root), fixture_path.name],
                         repository, env, gate_root / "output.log")
                     try:
                         status = job.process.wait(timeout=TEST_HANG_GUARD_SECS)
                     except subprocess.TimeoutExpired:
-                        merge_gate.kill_job_group(job)
+                        gate.kill_job_group(job)
                         raise
                     runner_entries = sorted(path.name for path in module.glob("test-run-roots*"))
                     runner_entries.extend(path.name for path in module.glob("config-reads*"))
                     retained = module / "scratch" / "nested" / "output"
                     scratch_output = retained.read_text() if relative and status == 0 else ""
                     job.folder_cleanup = cleanup.pop_all()
-                    result = merge_gate.finish_gate_job(job, status)
+                    result = gate.finish_gate_job(job, status)
                     self.assertEqual(status, 0, result.output)
                     self.assertEqual(result.returncode, 0, result.output)
                     self.assertIn("runner files ", result.output)
@@ -788,10 +790,11 @@ class FixtureCPU(unittest.TestCase):
 class ModuleProcessCleanupTests(unittest.TestCase):
     def test_gate_parent_death_keeps_the_sigkill_status_without_a_traceback(self) -> None:
         from scripts.lib import build_folders
-        from scripts.production import merge_gate
 
-        for runner_case in ("standalone", "unleased TMPDIR", "gate"):
-            with self.subTest(runner=runner_case), ExitStack() as cleanup:
+        cases = ("standalone", "unleased TMPDIR", "gate")
+        parent_names = ("GATE_PARENT_PID", "MERGE_GATE_PARENT_PID")
+        for runner_case, parent_name in product(cases, parent_names):
+            with self.subTest(runner=runner_case, parent_name=parent_name), ExitStack() as cleanup:
                 root = Path(cleanup.enter_context(tempfile.TemporaryDirectory())).resolve()
                 processes = OwnedTestProcesses()
                 environment = processes.environment({**os.environ, "HOME": str(root / "home"),
@@ -815,7 +818,7 @@ class ParentDeath(unittest.TestCase):
                 module = root / "module"
                 if runner_case == "gate":
                     module = cleanup.enter_context(build_folders.tool_folder("module", root))
-                    environment = merge_gate.test_module_environment(module, environment)
+                    environment = gate.test_module_environment(module, environment)
                 elif runner_case == "unleased TMPDIR":
                     module.mkdir()
                     environment.update(TMPDIR=str(module), TEST_TIMES_OUT=str(module / "test-times.json"))
@@ -823,7 +826,9 @@ class ParentDeath(unittest.TestCase):
                 parent = subprocess.Popen([sys.executable, "-c", "import signal; signal.pause()"],
                     env=environment, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 processes.track(parent)
-                environment["MERGE_GATE_PARENT_PID"] = str(parent.pid)
+                for name in parent_names:
+                    _ = environment.pop(name, None)
+                environment[parent_name] = str(parent.pid)
                 runner = subprocess.Popen([sys.executable, str(RUNNER), str(root), "test_parent.py"],
                     env=environment, cwd=root, stdin=subprocess.DEVNULL,
                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)
@@ -850,8 +855,6 @@ class ParentDeath(unittest.TestCase):
                     self.assertEqual(list(module.glob("config-reads*")), [])
 
     def test_gate_parent_death_before_bootstrap_stops_the_module(self) -> None:
-        from scripts.production import merge_gate
-
         root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         processes = OwnedTestProcesses()
         self.addCleanup(processes.finish)
@@ -860,9 +863,9 @@ class ParentDeath(unittest.TestCase):
         source = fr"""import os, signal, subprocess, sys
 reader, writer = os.pipe()
 prefix = 'import os; os.write(' + str(writer) + ', b"R"); os.close(' + str(writer) + '); os.read(0, 1)\n'
-child = subprocess.Popen([sys.executable, '-c', prefix + {merge_gate.SUITE_BOOTSTRAP!r},
+child = subprocess.Popen([sys.executable, '-c', prefix + {gate.SUITE_BOOTSTRAP!r},
     sys.executable, '-c', 'import signal; signal.pause()'],
-    env={{**os.environ, 'MERGE_GATE_PARENT_PID': str(os.getpid())}},
+    env={{**os.environ, 'GATE_PARENT_PID': str(os.getpid())}},
     stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     pass_fds=(writer,), start_new_session=True)
 os.close(writer)

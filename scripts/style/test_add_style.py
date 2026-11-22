@@ -34,6 +34,7 @@ from scripts.production.cli_fixture import invoke_cli
 from scripts.production.staff_test_support import isolated_staff_file, recorded_showrunner
 
 from scripts.style.style_reader_test_support import oracle_reader
+from scripts.worktree import worktrees
 
 
 def setUpModule() -> None:
@@ -167,9 +168,20 @@ class AddStyleTests(unittest.TestCase):
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="add-style-")))
         self.repo = self.root / "sample"
-        self.checkout = self.root / "sample-style"
+        self.checkout = self.root / "worktrees/sample/sample-style/production"
         self.doc = self.checkout / "docs/sample-style-production.md"
         _ = shutil.copytree(self.repository_seed, self.repo)
+        _ = self.git("remote", "add", "origin", str(self.repo.with_suffix(".git")))
+        home = self.root / "home"
+        config = home / ".claude/config"
+        config.mkdir(parents=True)
+        _ = (config / "build_folders.conf").write_text(
+            f"roots.workspace={self.root / 'worktrees'}\nroots.build={self.root / 'build'}\n"
+            + "# one of: report, enforce\nfolders.check=report\n"
+            + "# range: 0.001..1\nlocks.probe_wait_seconds=0.01\n"
+            + "# range: 0.001..1\nlocks.probe_retry_seconds=0.005\n")
+        copies_config = config / "copies.conf"
+        _ = copies_config.write_text("# range: 0.001..\ngit_timeout_seconds=10\n")
         rule_root = self.root / "nate_style"
         (rule_root / "rust").mkdir(parents=True)
         for family in add_style.FAMILIES:
@@ -180,7 +192,9 @@ class AddStyleTests(unittest.TestCase):
             _ = (self.root / name).write_text(STUB)
         (self.root / "live-sessions").mkdir()
         self.env = {
-            **os.environ,
+            **{key: value for key, value in os.environ.items() if key != "CONF_DIR"},
+            "HOME": str(home),
+            "COPIES_CONFIG": str(copies_config),
             "STYLE_HISTORY_NATE_STYLE_DIR": str(rule_root),
             "STYLE_LEDGER_STATE_DIR": str(self.root / "ledger"),
             "SHOWRUNNER_STATE_DIR": str(self.root / "showrunners"),
@@ -197,7 +211,7 @@ class AddStyleTests(unittest.TestCase):
             "SCRATCH_ROOT": str(self.root / "scratch"),
         }
         _ = self.enterContext(isolated_staff_file(self.root / "staff/staff.json", self.env))
-        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, self.env)))
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, self.env, clear=True)))
         _ = self.enterContext(mock.patch.object(style_rules, "NATE_STYLE_DIR", rule_root))
         self.parent = self.parent_doc("parent")
 
@@ -481,7 +495,7 @@ class AddStyleTests(unittest.TestCase):
                           (self.repo / ".git/info/exclude").read_bytes()), before)
 
     def test_bootstrap_creates_excluded_production_plans_and_pins_style_branch(self) -> None:
-        self.checkout.mkdir()
+        self.checkout.mkdir(parents=True)
         self.checkout.chmod(0o700)
         self.assertFalse(any(row.name == "sample-style" for row in staff.snapshot().find(kind="showrunner")))
         _ = self.run_bootstrap_process()
@@ -839,6 +853,26 @@ class AddStyleTests(unittest.TestCase):
         for family in add_style.FAMILIES:
             self.assertIn(f"global:rust/{family}.md", plan.read_text())
         self.assertIn("# cargo-liner-style", plan.read_text())
+
+    def test_retry_finishes_a_registered_style_checkout(self) -> None:
+        with mock.patch.object(worktrees, "ensure_target_link", side_effect=OSError("output setup stopped")):
+            stopped = self.run_bootstrap(success=False)
+        self.assertEqual(stopped.returncode, 2, stopped.stdout + stopped.stderr)
+        self.assertIn("output setup stopped", stopped.stderr)
+        inode = self.checkout.stat().st_ino
+        with mock.patch.dict(os.environ, self.env):
+            record_path = worktrees.record_file(self.checkout)
+            pending = worktrees.read_record(record_path)
+        self.assertIs(pending.stage, worktrees.MakeStage.MAKING)
+        self.assertFalse((self.checkout / "target").is_symlink())
+
+        _ = self.run_bootstrap()
+
+        self.assertEqual(worktrees.read_record(record_path), replace(pending, stage=worktrees.MakeStage.DONE))
+        self.assertEqual(self.checkout.stat().st_ino, inode)
+        self.assertIsInstance(pending.layout, worktrees.RecordedWorktreeOutput)
+        assert isinstance(pending.layout, worktrees.RecordedWorktreeOutput)
+        self.assertEqual((self.checkout / "target").readlink(), pending.layout.output)
 
     def test_retry_completes_worktree_left_before_production_doc_was_written(self) -> None:
         _ = self.git("worktree", "add", "-q", "-b", "style/main", str(self.checkout), self.initial_tip)

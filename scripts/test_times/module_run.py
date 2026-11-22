@@ -34,6 +34,8 @@ from typing import TYPE_CHECKING, ClassVar, Literal, Protocol, TypedDict, cast, 
 import unittest
 import unittest.case as unittest_case
 
+from scripts.lib.python_startup.sitecustomize import gate_parent_pid
+
 if TYPE_CHECKING:
     from scripts.test_times.gate_record import TestStatus, TestTime
 
@@ -556,7 +558,9 @@ def runner_folder(owner: GateModuleLease | StandaloneModuleRun, name: str) -> Ge
             yield folder
 
 
-def main(owner: GateModuleLease | StandaloneModuleRun) -> None:
+def main(owner: GateModuleLease | StandaloneModuleRun | None = None) -> None:
+    if owner is None:
+        owner = StandaloneModuleRun()
     try:
         from scripts.lib import conf_reads
     except ImportError:
@@ -635,7 +639,7 @@ def run_with_descendant_cleanup(owner: GateModuleLease | StandaloneModuleRun, cl
     global startup_cpu_s
     from scripts.lib.descendants import adopt_descendants
 
-    parent = os.environ.pop("MERGE_GATE_PARENT_PID", "")
+    parent = gate_parent_pid(consume=True)
     if not adopt_descendants():
         cleanup.enter_context(private_run_roots(owner))
         main(owner)

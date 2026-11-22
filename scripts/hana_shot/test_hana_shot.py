@@ -1506,7 +1506,7 @@ class PortGuardTests(HanaShotTest):
         environment = self.script_environment()
         _ = environment.pop("PYTHONPATH", None)
         result = subprocess.run(
-            [str(SCRIPT.resolve().parents[1] / "lib/py"), "--isolated", str(SCRIPT.resolve()), "targets", "--port", str(self.port)],
+            [str(SCRIPT.resolve().parents[1] / "lib/py"), "--isolated", "-B", str(SCRIPT.resolve()), "targets", "--port", str(self.port)],
             cwd=self.scratch, env=environment, capture_output=True, text=True,
             timeout=TEST_HANG_GUARD_SECS, check=False,
         )
