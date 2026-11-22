@@ -101,6 +101,7 @@ class Metric:
     waits: Mapping[str, list[str]] = field(default_factory=dict[str, list[str]])
     unreadable: bool = False
     reserved_waiting: int = 0
+    exempt_runs: int = 0
 
 
 @dataclass
@@ -611,13 +612,14 @@ def build_limits(reading: records.QueueRead, snapshots: target_availability.Snap
         recorded_unit = reservation.get("unit", "") or (waiter.get("unit", "") if waiter is not None else "")
         session = waiter.get("session_id", "") if waiter is not None else reservation.get("session_id", "")
         session_name = waiter.get("session_name", "") if waiter is not None else reservation.get("session_name", "")
+        repository_name = waiter.get("repository_name", reservation["repo"]) if waiter is not None else reservation["repo"]
+        if origin and repository_name in local_limits:
+            row(origin).natedev.has_limit_key = True
         if owner in limited_owners:
             if reservation["step"] in records.REPOSITORY_RUN_STEPS:
                 keys = reserved_repository_runs(replace(single_reservation, reservations=(reservation,)), policy)
                 for key in keys:
                     policy_rows.setdefault(key, set()).add(origin)
-                    if origin:
-                        row(origin).natedev.has_limit_key = True
                     _ = run_labels.setdefault((key, owner),
                         (clean_label(recorded_unit, names.get(session, ""), session_name), recorded_unit))
             continue
@@ -637,7 +639,8 @@ def build_limits(reading: records.QueueRead, snapshots: target_availability.Snap
         key: origin for key, bound in policy_rows.items() if len(bound) == 1
         for origin in bound if origin and bindings[origin] == 1
     }
-    full_waits: set[str] = set()
+    repository_wait_counts: dict[str, set[tuple[int, int]]] = {}
+    gpu_wait_counts: set[tuple[int, int]] = set()
     for visible in waits:
         entry = visible.source
         if isinstance(entry, wire.CloudRow):
@@ -658,13 +661,13 @@ def build_limits(reading: records.QueueRead, snapshots: target_availability.Snap
         if pinned != local:
             destination = remote_wait(pinned)
         elif isinstance(reason, records.RunLimitWait) and reason.machine == local:
-            if reason.used >= reason.limit:
-                full_waits.add(reason.repository)
+            repository_wait_counts.setdefault(reason.repository, set()).add((reason.used, reason.limit))
             origin = bound_origins.get(reason.repository, "")
             destination = row(origin).natedev.waits if origin else local_waits
         elif isinstance(reason, (records.BuildSpaceLow, records.BuildSpaceUnreadable)):
             destination = metric_waits.setdefault("disk", {})
         elif isinstance(reason, records.GpuSlotWait):
+            gpu_wait_counts.add((reason.used, reason.slots))
             destination = metric_waits.setdefault("gpu", {})
         elif isinstance(reason, (records.NeedsMemory, records.MemoryPressure, records.PressureUnavailable)):
             destination = metric_waits.setdefault("memory", {})
@@ -677,23 +680,29 @@ def build_limits(reading: records.QueueRead, snapshots: target_availability.Snap
         bound = policy_rows.get(repository_key, set[str]())
         owners = occupancy.get(repository_key, set[str]())
         used = len(owners)
-        if used < limit and repository_key in full_waits:
+        wait_counts = repository_wait_counts.get(repository_key)
+        if wait_counts and wait_counts != {(used, limit)}:
+            continue
+        runs: list[str] = []
+        merge_above: list[str] = []
+        for owner in sorted(owners):
+            label, recorded_unit = run_labels.get((repository_key, owner), ("", ""))
+            if used > limit and recorded_unit and recorded_unit == policy.exempt_unit:
+                merge_above.append(label)
+            elif label:
+                runs.append(label)
+        if used - limit > len(merge_above):
             continue
         origin = bound_origins.get(repository_key, "")
         if not origin:
             labels = {short_name(candidate) for candidate in bound if candidate}
             name = next(iter(labels)) if len(labels) == 1 else policy_name(repository_key)
             label = WORDS["policy_key"].format(name=name) if name else WORDS["repository_run_limit"]
-            shared.append(Metric(label, used, limit))
+            shared.append(Metric(label, used, limit, exempt_runs=len(merge_above)))
             continue
         cell = row(origin).natedev
         cell.limit, cell.used = limit, used
-        for owner in sorted(owners):
-            label, recorded_unit = run_labels.get((repository_key, owner), ("", ""))
-            if used > limit and recorded_unit and recorded_unit == policy.exempt_unit:
-                cell.merge_above.append(label)
-            elif label:
-                cell.runs.append(label)
+        cell.runs, cell.merge_above = runs, merge_above
 
     cloud_slots = saved.cloud_slots
     cloud_used = cloud_waiting = 0
@@ -752,8 +761,11 @@ def build_limits(reading: records.QueueRead, snapshots: target_availability.Snap
                      unreadable=isinstance(room, records.ReadingUnavailable))]
     gpu = explanation.policy.gpu_tests
     if gpu.repositories or "gpu" in metric_waits:
-        used = sum(gpu_test_reservation(item, gpu) for item in inputs.reservations) if gpu.repositories else None
-        limits.append(Metric("gpu", used, gpu.slots if gpu.repositories else None, waits=metric_waits.get("gpu", {})))
+        gpu_used = sum(gpu_test_reservation(item, gpu) for item in inputs.reservations)
+        counts_agree = not gpu_wait_counts or gpu_wait_counts == {(gpu_used, gpu.slots)}
+        gpu_readable = bool(gpu.repositories) and counts_agree
+        limits.append(Metric("gpu", gpu_used if gpu_readable else None, gpu.slots if gpu_readable else None,
+                             waits=metric_waits.get("gpu", {})))
     disk = inputs.build_space
     disk_waits = metric_waits.get("disk", {})
     if isinstance(disk, records.BuildSpaceLow):

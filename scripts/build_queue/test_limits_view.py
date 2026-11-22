@@ -127,13 +127,17 @@ class BuildLimitsTests(unittest.TestCase):
         names = {1: "Run limit", 2: "Disk wait", 3: "Memory wait", 4: "AWS target wait", 5: "Mac wait",
                  7: "/private/caller", 8: "Unplaced wait", 9: "Unbound wait"}
         cloud_names = {cloud[0].owner: "Cloud wait", cloud[1].owner: "Starting wait"}
-        waits = limits_view.visible_waits(queue_view.QueueModel(queue, {}), names, cloud_names)
+
+        def show(current: wire.CloudQueueRead) -> limits_view.BuildLimits:
+            waits = limits_view.visible_waits(queue_view.QueueModel(current, {}), names, cloud_names)
+            return limits_view.build_limits(current, (), waits, cloud_names, {}, saved, UTC)
+
         saved = limits_view.Background(history, limits_view.Metric("money", 2, 5, "USD", "estimate"),
             cloud_slots=9, hana=(limits_view.HanaCapacity(hana, 1, limits_view.ReadingState.OMITTED),),
             aws_targets=frozenset({"fixture-aws"}), origins=origins)
 
         with mock.patch.object(repository, "output", side_effect=AssertionError("Git read in the feed tick")):
-            shown = limits_view.build_limits(queue, (), waits, cloud_names, {}, saved, UTC)
+            shown = show(queue)
         self.assertEqual([(row.name, row.owner, row.quiet) for row in shown.repositories], [
             ("hana", "", False), ("project", "team · example.invalid", False), ("project", "other", True),
             ("project", "team · fork.invalid", True), ("quiet", "", True),
@@ -170,26 +174,42 @@ class BuildLimitsTests(unittest.TestCase):
         self.assertEqual((idle.aws.shared[0].used, idle.aws.shared[0].limit), (0, 9))
         self.assertEqual(idle.aws.state, "")
         self.assertFalse(any(metric.label == "disk" for metric in idle.natedev.shared))
-        copy_only = replace(queue, explanation=replace(explanation,
+        copy_only = replace(queue,
+            view=replace(queue.view, waiting=(replace(waiting[0], reason=replace(full, used=1)), *waiting[1:])),
+            explanation=replace(explanation,
             decided_from=replace(explanation.decided_from, reservations=reservations[1:2])))
-        copy_limits = limits_view.build_limits(copy_only, (), waits, cloud_names, {}, saved, UTC)
+        copy_limits = show(copy_only)
         copy_cell = next(row.natedev for row in copy_limits.repositories if row.owner == "team · example.invalid")
         self.assertEqual((copy_cell.used, copy_cell.limit, copy_cell.runs), (1, 1, ["merge-owner"]))
         self.assertEqual(copy_cell.waits, cell.waits)
         self.assertEqual(copy_limits.natedev.waits, shown.natedev.waits)
-        within_limit = replace(queue, explanation=replace(explanation,
-            policy=replace(explanation.policy, repository_runs=records.RepositoryRunLimits({"natedev.project": 2}, "merge-owner"))))
-        within = limits_view.build_limits(within_limit, (), waits, cloud_names, {}, saved, UTC)
+        matching = replace(full, limit=2)
+        within_limit = replace(queue,
+            view=replace(queue.view, waiting=(replace(waiting[0], reason=matching), *waiting[1:])),
+            explanation=replace(explanation, policy=replace(explanation.policy,
+                repository_runs=records.RepositoryRunLimits({"natedev.project": 2}, "merge-owner"))))
+        within = show(within_limit)
         merge_cell = next(row.natedev for row in within.repositories if row.owner == "team · example.invalid")
         self.assertEqual(merge_cell.merge_above, [])
         self.assertEqual(merge_cell.runs, ["regular", "merge-owner"])
-        conflicting_wait = replace(within_limit, explanation=replace(within_limit.explanation,
-            decided_from=copy_only.explanation.decided_from))
-        wait_limits = limits_view.build_limits(conflicting_wait, (), waits, cloud_names, {}, saved, UTC)
+        gpu = records.GpuTestSlots(1, frozenset({"gpu-project"}))
+        conflicting_wait = replace(within_limit,
+            view=replace(queue.view, waiting=(
+                replace(waiting[0], reason=replace(matching, used=3)),
+                waiting[1],
+                replace(waiting[2], reason=records.GpuSlotWait(1, 1)),
+                *waiting[3:],
+            )),
+            explanation=replace(within_limit.explanation, policy=replace(within_limit.explanation.policy, gpu_tests=gpu)))
+        wait_limits = show(conflicting_wait)
         wait_cell = next(row.natedev for row in wait_limits.repositories if row.owner == "team · example.invalid")
         self.assertEqual(wait_cell.waits, cell.waits)
         self.assertIsNone(wait_cell.limit)
+        self.assertEqual(wait_cell.used, 0)
         self.assertEqual(wait_cell.runs, [])
+        gpu_meter = next(metric for metric in wait_limits.natedev.shared if metric.label == "gpu")
+        self.assertEqual((gpu_meter.used, gpu_meter.limit, gpu_meter.waits),
+                         (None, None, {"All GPU test places are in use.": ["Memory wait"]}))
         self.check_policy_evidence(queue, saved, reservations[0], primary, fork)
         self.check_hana_claim(hana)
         self.check_cache_expiry()
@@ -197,7 +217,9 @@ class BuildLimitsTests(unittest.TestCase):
     def check_policy_evidence(self, queue: records.QueueRead, saved: limits_view.Background,
                               admitted: records.Reservation, primary: str, fork: str) -> None:
         root_key = "git-root:fixture"
-        policy = records.RepositoryRunLimits({"natedev.project": 2, "natedev.other": 2, f"natedev.{root_key}": 1})
+        policy = records.RepositoryRunLimits({
+            "natedev.project": 2, "natedev.other": 2, "natedev.project-local": 1, f"natedev.{root_key}": 1,
+        }, "merge-owner")
         run = LiveBuildRun(501, "fixture", 0)
         first: records.Reservation = {**admitted, "build_run": run}
         unrelated: records.Reservation = {**first, "repo": "unrestricted", "repo_identity": fork}
@@ -229,12 +251,22 @@ class BuildLimitsTests(unittest.TestCase):
                          "The repository run limit is full.")
         for origin in ("", fork):
             with self.subTest(origin=origin):
-                shown = show(first, {**fixture_reservation(503, 0, step="gate"), "repo": "project",
-                                     "repo_identity": origin})
+                conflicting: records.Reservation = {**fixture_reservation(503, 0, step="gate"), "repo": "project",
+                                                    "repo_identity": origin}
+                shown = show(first, conflicting)
                 self.assertIsNone(project(shown).limit)
                 meter = next(metric for metric in shown.natedev.shared if metric.label == "project run limit")
                 self.assertEqual((meter.used, meter.limit), (2, 2))
-        unrestricted = project(show({**first, "step": "check", "repo_identity": primary}))
+                third: records.Reservation = {**fixture_reservation(504, 0, step="gate"), "repo": "project",
+                                              "repo_identity": primary}
+                without_exempt = show(first, conflicting, third)
+                self.assertNotIn("project run limit", [metric.label for metric in without_exempt.natedev.shared])
+                with_exempt = show(first, conflicting, {**third, "unit": "merge-owner"})
+                meter = next(metric for metric in with_exempt.natedev.shared if metric.label == "project run limit")
+                self.assertEqual((meter.used, meter.limit, meter.exempt_runs), (3, 2, 1))
+        unrestricted = next(row.natedev for row in show({
+            **first, "step": "check", "repo": "project-local", "repo_identity": "https://example.invalid/team/upstream",
+        }).repositories if row.name == "upstream")
         self.assertEqual((unrestricted.used, unrestricted.limit, unrestricted.has_limit_key), (1, None, True))
 
     def check_cache_expiry(self) -> None:

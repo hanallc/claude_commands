@@ -1270,16 +1270,16 @@ function limitMarks(kind, count = 1) {
   const marks = `<span class="build-limit-mark ${kind}" aria-hidden="true"></span>`.repeat(shown);
   return marks + (count > shown ? '<span aria-hidden="true">…</span>' : "");
 }
-function limitPlaces(used, limit, runs, waiting = 0) {
+function limitPlaces(used, limit, runs, waiting = 0, exempt = 0) {
   const free = Number.isInteger(limit) && Number.isInteger(used) ? Math.max(0, limit - used) : 0;
   return `<span class="build-limit-marks">${limitMarks("run", runs)}${limitMarks("wait", waiting)}${limitMarks("free", free)}
-    ${limit == null ? "" : limitMarks("line")}</span>`;
+    ${limit == null ? "" : limitMarks("line")}${limitMarks("merge", exempt)}</span>`;
 }
 function limitWords(words, key, values = {}) {
   return words[key].replace(/\{(\w+)\}/g, (_, name) => values[name]);
 }
 function limitMetric(metric, words) {
-  const {label, used, limit, unit, qualifier, unreadable, reserved_waiting = 0} = metric;
+  const {label, used, limit, unit, qualifier, unreadable, reserved_waiting = 0, exempt_runs = 0} = metric;
   const amount = value => unit === "USD" ? limitWords(words, "money_value", {value: value.toFixed(2)})
     : unit === "GiB" ? limitWords(words, "gib_value", {value: f1(value)}) : String(value);
   const current = used == null ? (unreadable ? words.not_available : "") : amount(used);
@@ -1293,7 +1293,8 @@ function limitMetric(metric, words) {
   const bar = used != null && limit > 0 && unit
     ? `<span class="build-limit-track${qualifier === "minimum" && used < limit ? " below" : ""}" aria-hidden="true">
       <i style="width:${Math.min(100, Math.max(0, used / limit * 100))}%"></i></span>` : "";
-  const places = unit || limit == null ? "" : limitPlaces(used, limit, (used ?? 0) - reserved_waiting, reserved_waiting);
+  const places = unit || limit == null ? "" : limitPlaces(
+    used, limit, (used ?? 0) - reserved_waiting - exempt_runs, reserved_waiting, exempt_runs);
   const note = qualifier && qualifier !== "minimum" ? ` · ${esc(words[qualifier])}` : "";
   const detail = text ? `<div class="build-limit-metric"><span>${esc(words[label] ?? label)}${note}</span>
     ${bar || places}<span class="num">${esc(text)}</span></div>` : "";
@@ -1319,10 +1320,8 @@ function limitCell(cell, words) {
     count = used ? limitWords(words, "running", {count: used}) : "";
     if (!cell.has_limit_key) count += count ? ` · ${words.no_limit}` : words.no_limit;
   }
-  const marks = limitPlaces(used, limit, Math.max(0, (used ?? 0) - merge_above.length));
-  let contents = count ? `<div class="build-limit-count num">${marks}
-    ${merge_above.length ? `<span class="build-limit-marks">${limitMarks("merge", merge_above.length)}</span>` : ""}
-    <span>${esc(count)}</span></div>` : "";
+  const marks = limitPlaces(used, limit, Math.max(0, (used ?? 0) - merge_above.length), 0, merge_above.length);
+  let contents = count ? `<div class="build-limit-count num">${marks}<span>${esc(count)}</span></div>` : "";
   contents += limitNames(runs);
   if (merge_above.length) contents += limitNames(merge_above);
   if (other_used) contents += `<div class="build-limit-note">${esc(limitWords(words, "other_running", {count: other_used}))}</div>${limitNames(other)}`;
