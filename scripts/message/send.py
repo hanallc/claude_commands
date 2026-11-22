@@ -34,7 +34,7 @@ Staff `worker:` paths deliver through observed panes or their holders.
 Other `codex:` addresses use a reported herdr pane or the shared Codex daemon.
 An absent staff recipient keeps its queue without selecting a session family.
 One staff snapshot selects each staff recipient.
-Unit names also accept the form from copies.unit_owner. Ambiguous staff names stop delivery.
+Unit names also accept the form from copy_record.unit_owner. Ambiguous staff names stop delivery.
 Use a staff name or staff:<id> to reach the current staff conversation.
 An explicit session or registered socket address keeps its native conversation.
 A name without a staff row matches a live freestanding Claude session's registry name.
@@ -150,7 +150,7 @@ from scripts.agents import remote as machine_routes
 from scripts.herdr import herdr_types
 from scripts.lib import process_group
 from scripts.production import session_staff, staff, unit_lookup, unit_names
-from scripts.lib import conf, models_registry, process_start
+from scripts.lib import conf, copy_record, models_registry, process_start
 from scripts.lib.atomic_file import write_bytes_atomic
 from scripts.lib.atomic_file import write_text_atomic as write_atomic
 from scripts.notify import decision_priority
@@ -3052,10 +3052,8 @@ def _staff_recipient_match(
 
     match_names(membership.rows)
     if allow_unit_form and not matches:
-        from scripts.copies import copies
-
         for candidate in membership.find(kind="unit"):
-            short = normalized_name(copies.unit_owner(candidate.name))
+            short = normalized_name(copy_record.unit_owner(candidate.name))
             if short != normalized.rsplit("/", 1)[-1]:
                 continue
             chain = name_chain(candidate)

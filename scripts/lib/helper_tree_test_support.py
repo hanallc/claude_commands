@@ -18,7 +18,12 @@ COPY_HELPERS = (
     "scripts/production", "scripts/agents", "scripts/direct", "scripts/hooks", "scripts/lint", "scripts/herdr",
     "scripts/build_hold", "scripts/build_queue", "scripts/build_targets", "scripts/test_times", "scripts/aws_target",
 )
-VERIFY_HELPERS = (*COPY_HELPERS, "scripts/whoami", "scripts/notify")
+VERIFY_HELPERS = (
+    *COPY_HELPERS, "scripts/whoami", "scripts/notify",
+    "scripts/style/git_process.py",
+    "scripts/review_links/image_store.py", "scripts/review_links/question_record.py",
+    "scripts/review_links/review_events.py", "scripts/review_links/review_later.py",
+)
 VERIFY_TEST_ENVIRONMENT = frozenset({
     "PATH", "HOME", "USER", "LOGNAME", "TZ", "TMPDIR", "TERM",
     # Keep the test runner's Python process settings in fixture subprocesses.

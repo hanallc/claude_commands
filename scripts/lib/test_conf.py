@@ -183,6 +183,22 @@ conf_reads.record('disabled')
             self.fail("The invalid live setting must identify history recovery")
         self.assertEqual(origin.value, 8)
 
+    def test_saved_configuration_requires_a_checkout_with_a_commit(self) -> None:
+        self.assertIsInstance(conf.committed_configuration_revision(self.path), conf.NoCommittedConfiguration)
+        self.history()
+        self.assertIsInstance(conf.committed_configuration_revision(self.path), conf.NoCommittedConfiguration)
+        self.commit("label=committed\n")
+        self.assertEqual(conf.committed_configuration_revision(self.path), conf.CommittedConfigurationRevision(
+            self.root.resolve(), "config/example.conf", self.git("rev-parse", "HEAD")))
+
+    def test_saved_configuration_rejects_malformed_git_output(self) -> None:
+        commit = "a" * 40
+        for output in ("", f"{self.root}\n", f"{self.root}\nHEAD\n", f"{self.root}\n{commit}\nextra\n",
+                       f"relative\n{commit}\n", f"/\x00\n{commit}\n"):
+            with self.subTest(output=output), mock.patch.object(
+                    conf, "_git", return_value=subprocess.CompletedProcess(["git"], 0, stdout=output)):
+                self.assertIsInstance(conf.committed_configuration_revision(self.path), conf.NoCommittedConfiguration)
+
     def test_missing_file_defers_recovery_until_a_setting_is_used(self) -> None:
         self.history()
         self.commit("# whole: 1..10\ncount=3\n")

@@ -9,7 +9,7 @@ from urllib.parse import urlsplit
 
 from scripts.aws_target import hana_result
 from scripts.aws_target.hana_guest import CommandAdmissionRefusalCode, WorkPermit
-from scripts.aws_target.hana_result import HanaAttemptKey, LogicalStepLink, decode_result, encode_result
+from scripts.aws_target.hana_result import HanaAttemptKey, LogicalStepLink, decode_result, encode_result, object_fields, string_field
 from scripts.build_queue import execution_identity
 
 
@@ -429,8 +429,6 @@ def _positive_integer(row: dict[str, object], name: str) -> int:
 
 
 def _signed_url(row: dict[str, object], name: str) -> str:
-    from urllib.parse import urlsplit
-
     value = hana_result.string_field(row, name)
     parts = urlsplit(value)
     if (parts.scheme != 'https' or not parts.hostname or not parts.hostname.endswith('.amazonaws.com')
@@ -513,8 +511,6 @@ def encode_source_outcome(outcome: HanaSourceUpdateOutcome) -> bytes:
 
 
 def decode_source_outcome(content: bytes) -> HanaSourceUpdateOutcome:
-    from scripts.aws_target.hana_result import object_fields, string_field
-
     row = object_fields(cast(object, json.loads(content)))
     if set(row) == {'source_updated'}:
         identity = object_fields(row['source_updated'])
@@ -526,8 +522,6 @@ def decode_source_outcome(content: bytes) -> HanaSourceUpdateOutcome:
 
 
 def decode_outcome(content: bytes) -> HanaRunOutcome:
-    from scripts.aws_target.hana_result import object_fields, string_field
-
     row = object_fields(cast(object, json.loads(content)))
     if set(row) == {'finished'}:
         return HanaCommandFinished(decode_result(json.dumps(row['finished']).encode()))

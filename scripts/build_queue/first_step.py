@@ -14,7 +14,7 @@ from scripts.build_queue import admission_client as client, admission_protocol a
 from scripts.build_queue import admission_records as records
 from scripts.build_queue import queue_place
 from scripts.buildlog import store
-from scripts.direct.local_release_wait import local_release_waiter
+from scripts.direct.release_events import local_release_waiter
 from scripts.lib import build_folders
 from scripts.lib.build_slots import SlotQueuePosition
 from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, StepJob

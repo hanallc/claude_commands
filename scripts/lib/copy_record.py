@@ -70,6 +70,11 @@ def copies_root() -> Path:
     return Path(os.path.realpath(Path(configured).expanduser()))
 
 
+def unit_owner(name: str) -> str:
+    """Return the recorded unit name with one unit suffix."""
+    return name.removesuffix("-unit") + "-unit"
+
+
 def worktree_root() -> Path:
     """Return the configured source root."""
     return Path(_configured_root("roots.workspace")).expanduser().resolve()

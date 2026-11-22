@@ -20,6 +20,7 @@ from scripts.aws_target.hana_guest import CommandAdmissionRefusalCode, WorkPermi
 from scripts.build_hold.owning_session import NoOwningSession
 from scripts.build_queue import admission_protocol as wire, placement
 from scripts.mac_test.claim_state import RepositoryScope
+from scripts.aws_target.ledger import CostLedger
 
 
 @dataclass
@@ -563,8 +564,6 @@ class HanaExecutionTests(unittest.TestCase):
         self.assertEqual(self.objects.envelopes, [])
 
     def test_transfer_charge_replay_keeps_measured_counts_without_new_dollar_totals(self) -> None:
-        from scripts.aws_target.ledger import CostLedger
-
         _ = self.dispatch()
         _ = self.settle()
         book = CostLedger(self.root)

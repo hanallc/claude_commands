@@ -10,13 +10,13 @@ from enum import Enum
 import json
 from pathlib import Path
 from statistics import median
+import time
 from typing import cast
 
 from scripts.aws_target import hana_spend, ledger
 from scripts.aws_target.ledger import gate_vcpus as gate_vcpus
 from scripts.aws_target.measurement import number
-from scripts.lib import conf
-from scripts.lib.build_steps import read_step_names
+from scripts.lib import build_steps, conf
 
 KINDS = ('gate', 'test-affected')
 _MODE_ALIASES = {'merge-gate': 'gate', 'targeted-test': 'test-affected'}
@@ -60,11 +60,20 @@ def deployed_gate_variants(deployment: dict[str, object], types: tuple[str, ...]
 def read_deployed_gate_variants(directory: Path, types: tuple[str, ...], home: str) -> tuple[GateLaunchVariant, ...]:
     """Read the local deployment. Return no variants if the deployment is unavailable."""
     try:
-        deployment = ledger.mapping(cast(object, json.loads((directory / 'gate-deployment.json').read_text())))
-        if 'regions' not in deployment:
-            deployment = {**deployment, 'regions': [{**deployment, 'region': deployment.get('region', home)}]}
-        return deployed_gate_variants(deployment, types).variants
+        deployment = ledger.mapping(cast(object, json.loads((directory / ledger.GATE_DEPLOYMENT_FILE).read_text())))
+        return gate_variants_from(deployment, types, home)
     except (OSError, ValueError, TypeError):
+        return ()
+
+
+def gate_variants_from(deployment: dict[str, object], types: tuple[str, ...], home: str) -> tuple[GateLaunchVariant, ...]:
+    if not deployment:
+        return ()
+    if 'regions' not in deployment:
+        deployment = {**deployment, 'regions': [{**deployment, 'region': deployment.get('region', home)}]}
+    try:
+        return deployed_gate_variants(deployment, types).variants
+    except (KeyError, ValueError, TypeError):
         return ()
 
 
@@ -79,11 +88,13 @@ class RunScope:
     modes: tuple[str, ...]
 
 
-def scopes() -> tuple[RunScope, ...]:
-    gate = read_step_names().shown('gate')
-    return (RunScope('gate', gate.capitalize() + 's', gate, ('gate',)),
-            RunScope('test-affected', 'Targeted runs', 'targeted test', ('test-affected',)),
-            RunScope('both', 'Both', 'run', KINDS))
+def run_scopes(names: build_steps.StepNames) -> tuple[RunScope, ...]:
+    scopes: list[RunScope] = []
+    for mode in KINDS:
+        name = names.shown(mode)
+        label = name[:1].upper() + name[1:] + ' runs'
+        scopes.append(RunScope(mode, label, name, (mode,)))
+    return (*scopes, RunScope('both', 'Both', 'run', KINDS))
 
 # AWS had no Spot box for this type and zone at this price.
 ZONE_REFUSALS = frozenset({'InsufficientInstanceCapacity', 'InsufficientSpotCapacity', 'SpotMaxPriceTooLow'})
@@ -148,15 +159,32 @@ DayKey = tuple[str, str, str]
 BilledKey = tuple[str, str, str, str]
 
 
-def billed_readings(book: ledger.CostLedger, start: datetime, end: datetime) -> list[ledger.ChargeRead]:
-    """The bill reads of the UTC days in [start, end) that have a bill."""
-    return [reading for reading in book.read_bills()
-            if start.date().isoformat() <= reading.day < end.date().isoformat() and ledger.is_billed_day(reading)]
+class LegacyBillPolicy(Enum):
+    LEGACY = 'legacy'
 
 
-def spot_bills(book: ledger.CostLedger, start: datetime, end: datetime) -> dict[tuple[str, str, str], tuple[Decimal, Decimal]]:
+@dataclass(frozen=True)
+class ValidateBillsAt:
+    cutoff: int
+
+
+def billed_readings(book: ledger.CostLedger, start: datetime, end: datetime, *,
+                    bill_policy: LegacyBillPolicy | ValidateBillsAt = LegacyBillPolicy.LEGACY) -> list[ledger.ChargeRead]:
+    """Read bill amounts for the UTC days in [start, end)."""
+    readings = (tuple(reading for reading in book.read_bills() if ledger.is_billed_day(reading))
+                if bill_policy is LegacyBillPolicy.LEGACY else book.validated_bills(bill_policy.cutoff))
+    return readings_in_window(readings, start, end)
+
+
+def readings_in_window(readings: Sequence[ledger.ChargeRead], start: datetime, end: datetime) -> list[ledger.ChargeRead]:
+    first, following = start.date().isoformat(), end.date().isoformat()
+    return [reading for reading in readings if first <= reading.day < following]
+
+
+def spot_bills(book: ledger.CostLedger, start: datetime, end: datetime, *,
+               bill_policy: LegacyBillPolicy | ValidateBillsAt = LegacyBillPolicy.LEGACY) -> dict[tuple[str, str, str], tuple[Decimal, Decimal]]:
     """The billed Spot USD and box hours for each type, region and day in [start, end)."""
-    return bills_from_readings(billed_readings(book, start, end))
+    return bills_from_readings(billed_readings(book, start, end, bill_policy=bill_policy))
 
 
 def _spot_usage_key(usage_type: str) -> tuple[str, str] | None:
@@ -181,8 +209,10 @@ def hana_billed_hours(directory: Path, day: date) -> Decimal | None:
     """Read Hana's billed Spot hours for a UTC day, or return None when the bill is unavailable."""
     path = directory / 'charges' / (day.isoformat() + '.json')
     try:
-        bill = ledger.read_strict_charge(path)
-        if not ledger.matches_utc_charge_day(path.name, bill, day):
+        record = ledger.read_saved_bill(path, int(time.time()))
+        bill = record.pricing_read
+        if (record.validation_result is ledger.BillRecordRejection.DUPLICATE_FIELDS
+                or not ledger.matches_utc_charge_day(path.name, bill, day)):
             return None
     except (OSError, ValueError, ArithmeticError):
         return None
@@ -297,14 +327,19 @@ def _box_hours(snapshot: ledger.LedgerEvidence, start: datetime, end: datetime, 
 
 
 def day_hours_checks(book: ledger.CostLedger, start: datetime, end: datetime, home: str, builder: str,
-                     scope: SpotHoursScope, max_ratio: Decimal) -> dict[DayKey, HoursCheck]:
+                     scope: SpotHoursScope, max_ratio: Decimal, *, bill_policy: LegacyBillPolicy | ValidateBillsAt = LegacyBillPolicy.LEGACY) -> dict[DayKey, HoursCheck]:
     """Check each type in scope by region and UTC day in the window.
 
     A bill without Spot usage for a type counts as zero hours."""
-    readings = billed_readings(book, start, end)
+    readings = billed_readings(book, start, end, bill_policy=bill_policy)
+    return day_hours_from(book.read_snapshot(), readings, start, end, home, builder, scope, max_ratio)
+
+
+def day_hours_from(snapshot: ledger.LedgerEvidence, readings: Sequence[ledger.ChargeRead], start: datetime,
+                   end: datetime, home: str, builder: str, scope: SpotHoursScope, max_ratio: Decimal
+                   ) -> dict[DayKey, HoursCheck]:
     read_days = {reading.day for reading in readings}
     bills = bills_from_readings(readings)
-    snapshot = book.read_snapshot()
     boxes = _box_hours(snapshot, start, end, home, builder)
     reserved_by_region: dict[tuple[str, str], Decimal] = defaultdict(Decimal)
     seen_generations: set[int] = set()
@@ -326,20 +361,50 @@ def day_hours_checks(book: ledger.CostLedger, start: datetime, end: datetime, ho
                              hana_reserved_hours=reserved.get(key, _NO_RESERVED_HOURS)) for key in keys}
 
 
+@dataclass(frozen=True)
+class ComparedMachineHours:
+    billed_hours: Decimal
+    box_hours: Decimal
+    hana_reserved_hours: Decimal
+    hours_gap_over: bool
+    first_utc_day: date
+    last_utc_day: date
+
+
+@dataclass(frozen=True)
+class MachineHoursAwaitingBill:
+    box_hours: Decimal
+
+
 def hours_checks(book: ledger.CostLedger, start: datetime, end: datetime, home: str, builder: str,
-                 scope: SpotHoursScope, max_ratio: Decimal) -> dict[tuple[str, str], HoursCheck]:
-    """The hours check of each type in sizes and region, summed over the days in [start, end) with a bill."""
-    billed: dict[tuple[str, str], list[HoursCheck]] = defaultdict(list)
-    unbilled: dict[tuple[str, str], list[HoursCheck]] = defaultdict(list)
-    daily = day_hours_checks(book, start, end, home, builder, scope, max_ratio)
-    for (size, region, _day), check in daily.items():
-        (unbilled if check.billed_hours is None else billed)[size, region].append(check)
-    checks: dict[tuple[str, str], HoursCheck] = {}
-    for key in billed.keys() | unbilled.keys():
-        days = billed[key] if key in billed else unbilled[key]
-        billed_hours = sum((day.billed_hours or Decimal(0) for day in days), Decimal(0)) if key in billed else None
-        checks[key] = hours_check(billed_hours, sum((day.box_hours for day in days), Decimal(0)), max_ratio,
-                                 hana_reserved_hours=sum((day.hana_reserved_hours for day in days), Decimal(0)))
+                 scope: SpotHoursScope, max_ratio: Decimal, *,
+                 bill_policy: LegacyBillPolicy | ValidateBillsAt = LegacyBillPolicy.LEGACY
+                 ) -> dict[tuple[str, str], ComparedMachineHours | MachineHoursAwaitingBill]:
+    """Sum the hours for each type and region over its days with a bill."""
+    daily = day_hours_checks(book, start, end, home, builder, scope, max_ratio, bill_policy=bill_policy)
+    return sum_hours_checks(daily, max_ratio)
+
+
+def sum_hours_checks(daily: Mapping[DayKey, HoursCheck], max_ratio: Decimal
+                     ) -> dict[tuple[str, str], ComparedMachineHours | MachineHoursAwaitingBill]:
+    billed: dict[tuple[str, str], list[tuple[str, HoursCheck]]] = defaultdict(list)
+    unbilled: dict[tuple[str, str], Decimal] = defaultdict(Decimal)
+    for (size, region, day), check in daily.items():
+        if check.billed_hours is None:
+            unbilled[size, region] += check.box_hours
+        else:
+            billed[size, region].append((day, check))
+    checks: dict[tuple[str, str], ComparedMachineHours | MachineHoursAwaitingBill] = {
+        key: MachineHoursAwaitingBill(hours) for key, hours in unbilled.items() if key not in billed
+    }
+    for key, days in billed.items():
+        billed_hours = sum((check.billed_hours or Decimal(0) for _, check in days), Decimal(0))
+        box_hours = sum((check.box_hours for _, check in days), Decimal(0))
+        reserved = sum((check.hana_reserved_hours for _, check in days), Decimal(0))
+        first, last = min(day for day, _ in days), max(day for day, _ in days)
+        over = hours_check(billed_hours, box_hours, max_ratio, hana_reserved_hours=reserved).hours_gap_over
+        checks[key] = ComparedMachineHours(billed_hours, box_hours, reserved, over,
+                                          date.fromisoformat(first), date.fromisoformat(last))
     return checks
 
 
@@ -400,18 +465,25 @@ class RunEvidence:
             return None, 0, 0
         return Decimal(refused) / max(launched, 1), refused, launched
 
-    def expected_usd(self, price: Decimal, size: str, region: str, modes: tuple[str, ...], wait_usd_per_minute: Decimal,
-                     default_seconds: Decimal, *, unmeasured_extra_s: Decimal) -> Decimal:
-        """Spot price for the median box time, plus the wait cost of the expected refusals first.
-
-        A region without its own runs borrows the other regions' box time and adds unmeasured_extra_s for its transfers."""
+    def expected_box_time(self, size: str, region: str, modes: tuple[str, ...], default_seconds: Decimal,
+                          unmeasured_extra_s: Decimal) -> tuple[Decimal, BoxTimeSource | NoBoxTimeMeasurement]:
+        """Estimate box seconds and identify the source of the measurement."""
         seconds, source = self.box_seconds(size, region, modes)
-        seconds = seconds or [time for kind in dict.fromkeys(map(_run_kind, modes)) for time in self.by_mode.get(kind, [])]
-        box = ((Decimal(median(seconds)) if seconds else default_seconds)
+        baseline = seconds or [time for kind in dict.fromkeys(map(_run_kind, modes)) for time in self.by_mode.get(kind, [])]
+        box = ((median(baseline) if baseline else default_seconds)
                + (Decimal(0) if source is BoxTimeSource.OWN else unmeasured_extra_s))
+        return box, source if seconds else NoBoxTimeMeasurement()
+
+    def refusal_wait_usd(self, size: str, region: str, wait_usd_per_minute: Decimal) -> Decimal:
         # Capacity refusals do not depend on the run kind, so every request counts.
         refusals = self.refusals_per_launch(size, region, KINDS)[0] or Decimal(0)
-        return price * box / 3600 + refusals * self.refusal_wait_s * wait_usd_per_minute / 60
+        return refusals * self.refusal_wait_s * wait_usd_per_minute / 60
+
+    def expected_usd(self, price: Decimal, size: str, region: str, modes: tuple[str, ...], wait_usd_per_minute: Decimal,
+                     default_seconds: Decimal, *, unmeasured_extra_s: Decimal) -> Decimal:
+        """Estimate compute and the cost of waiting for capacity."""
+        box, _ = self.expected_box_time(size, region, modes, default_seconds, unmeasured_extra_s)
+        return price * box / 3600 + self.refusal_wait_usd(size, region, wait_usd_per_minute)
 
 
 @dataclass(frozen=True)
@@ -471,6 +543,13 @@ def gate_break_even(
 
 
 @dataclass(frozen=True)
+class GatePlacementEstimate:
+    aws_spend_usd: Decimal
+    order_cost_usd: Decimal
+    same_type_seconds: Decimal | NoBoxTimeMeasurement
+
+
+@dataclass(frozen=True)
 class GateRunPricing:
     """The policy and run evidence that rank priced gate variants."""
     evidence: RunEvidence
@@ -494,14 +573,19 @@ class GateRunPricing:
                    region_numbers(values, 'region_extra_gate_seconds'),
                    region_numbers(values, 'unmeasured_region_extra_seconds'))
 
-    def expected_usd(self, price: Decimal, size: str, region: str) -> Decimal:
-        box_and_refusals = self.evidence.expected_usd(
-            price, size, region, self.modes, self.wait_usd_per_minute, self.default_seconds,
-            unmeasured_extra_s=self.unmeasured_extra_seconds.get(region, Decimal(0)),
-        )
+    def placement_estimate(self, price: Decimal, size: str, region: str) -> GatePlacementEstimate:
+        box, source = self.evidence.expected_box_time(
+            size, region, self.modes, self.default_seconds, self.unmeasured_extra_seconds.get(region, Decimal(0)))
+        compute = price * box / 3600
         transfer = self.region_transfer_usd.get(region, self.remote_transfer_usd) if region != self.home else Decimal(0)
-        wait = self.region_extra_seconds.get(region, Decimal(0)) * self.wait_usd_per_minute / 60
-        return box_and_refusals + transfer + wait
+        extra_seconds = self.region_extra_seconds.get(region, Decimal(0))
+        refusal_cost = self.evidence.refusal_wait_usd(size, region, self.wait_usd_per_minute)
+        wait = extra_seconds * self.wait_usd_per_minute / 60
+        measured = box + extra_seconds if source in (BoxTimeSource.OWN, BoxTimeSource.OTHER_REGIONS) else NoBoxTimeMeasurement()
+        return GatePlacementEstimate(compute + transfer, compute + refusal_cost + transfer + wait, measured)
+
+    def expected_usd(self, price: Decimal, size: str, region: str) -> Decimal:
+        return self.placement_estimate(price, size, region).order_cost_usd
 
     def estimate(self, price: Decimal, size: str, region: str) -> GateRunEstimate:
         seconds = self.evidence.median_box_seconds(size, region, self.modes)
@@ -512,11 +596,16 @@ class GateRunPricing:
 def current_zone_prices(directory: Path, now: float, max_age: int) -> dict[tuple[str, str, str], Decimal]:
     """Use the latest current Spot price for each region, type, and zone."""
     try:
-        return {(row.region, row.instance_type, row.zone): row.usd_per_hour
-                for row in sorted(ledger.read_spot_prices(directory), key=lambda row: row.read_at)
-                if 0 <= now - row.read_at <= max_age}
+        return zone_prices_from(ledger.read_spot_prices(directory), now, max_age)
     except (OSError, ValueError, KeyError, TypeError, ArithmeticError):
         return {}
+
+
+def zone_prices_from(prices: Sequence[ledger.RegionalSpotPrice], now: float, max_age: int
+                     ) -> dict[tuple[str, str, str], Decimal]:
+    return {(row.region, row.instance_type, row.zone): row.usd_per_hour
+            for row in sorted(prices, key=lambda row: row.read_at)
+            if 0 <= now - row.read_at <= max_age}
 
 
 def gate_launch_history(directory: Path, now: float, window_seconds: int) -> tuple[dict[str, object], ...]:
@@ -571,10 +660,22 @@ def read_gate_pricing_inputs(directory: Path, now: int, values: conf.ConfigRead,
     return GatePricingInputs(deployed, deployed_gate_prices(deployed, zone_prices), history.evidence)
 
 
+def gate_pricing_from(evidence: ledger.SpendEvidenceAt, launches: Sequence[dict[str, object]]) -> GatePricingInputs:
+    policy, values = evidence.account_configuration, evidence.gate_configuration
+    home = evidence.builder_region
+    deployed = gate_variants_from(evidence.gate_deployment, values.words('instance_types'), home)
+    zone_prices = zone_prices_from(evidence.spot_prices, evidence.at, policy.whole('price_max_age_seconds'))
+    end = datetime.fromtimestamp(evidence.at, UTC)
+    start = end - timedelta(days=policy.whole('run_cost_days'))
+    window = max(policy.whole('price_max_age_seconds'), values.whole('capacity_cooldown_seconds'),
+                 policy.whole('run_cost_days') * 86400)
+    rows = tuple(row for row in launches if float(str(row['time'])) >= evidence.at - window)
+    return GatePricingInputs(deployed, deployed_gate_prices(deployed, zone_prices), run_evidence(rows, start, end, home))
+
+
 @dataclass(frozen=True)
 class GateVariantEligibility:
     variants: tuple[GateLaunchVariant, ...]
-    prices: dict[GateLaunchVariant, Decimal]
     slow_box_seconds: dict[tuple[str, str], Decimal]
 
 
@@ -589,15 +690,21 @@ def slow_gate_types(
 
 
 def gate_variant_eligibility(
-    deployed: Sequence[GateLaunchVariant], directory: Path, evidence: RunEvidence, mode: str,
-    *, now: float, max_age: int, max_gate_minutes: int, live_prices: Sequence[ledger.RegionalSpotPrice] = (),
+    deployed: Sequence[GateLaunchVariant], evidence: RunEvidence, mode: str, max_gate_minutes: int,
 ) -> GateVariantEligibility:
-    """Filter deployed variants by median time and match prices by region, type, and zone."""
-    zone_prices = current_zone_prices(directory, now, max_age)
-    zone_prices.update({(row.region, row.instance_type, row.zone): row.usd_per_hour for row in live_prices})
+    """Exclude variants whose median box time exceeds the limit."""
     slow = slow_gate_types(deployed, evidence, (mode,), max_gate_minutes)
     variants = tuple(variant for variant in deployed if (variant.instance_type, variant.region) not in slow)
-    return GateVariantEligibility(variants, deployed_gate_prices(variants, zone_prices), slow)
+    return GateVariantEligibility(variants, slow)
+
+
+def gate_variant_prices(
+    eligible: Sequence[GateLaunchVariant], directory: Path, now: float, max_age: int,
+    live_prices: Sequence[ledger.RegionalSpotPrice],
+) -> dict[GateLaunchVariant, Decimal]:
+    zone_prices = current_zone_prices(directory, now, max_age)
+    zone_prices.update({(row.region, row.instance_type, row.zone): row.usd_per_hour for row in live_prices})
+    return deployed_gate_prices(eligible, zone_prices)
 
 
 def gate_comparisons(directory: Path, now: int, values: conf.ConfigRead,
@@ -643,17 +750,22 @@ class GateRunHistory:
 
 def read_gate_run_history(book: ledger.CostLedger, start: datetime, end: datetime, home: str) -> GateRunHistory:
     """Read all launch rows to match runs that finish in the window."""
-    rows = book.launches()
+    return gate_run_history_from(book.launches(), start, end, home)
+
+
+def gate_run_history_from(rows: Sequence[dict[str, object]], start: datetime, end: datetime,
+                          home: str) -> GateRunHistory:
     runs = runs_from_rows(rows, start, end, home).runs
-    return GateRunHistory(runs, _run_evidence(runs, rows, start, end, home))
+    return GateRunHistory(runs, evidence_from_runs(runs, rows, start, end, home))
 
 
 def run_evidence(rows: Sequence[dict[str, object]], start: datetime, end: datetime, home: str) -> RunEvidence:
-    return _run_evidence(runs_from_rows(rows, start, end, home).runs, rows, start, end, home)
+    return evidence_from_runs(runs_from_rows(rows, start, end, home).runs, rows, start, end, home)
 
 
-def _run_evidence(runs: Sequence[FinishedGateRun], rows: Sequence[dict[str, object]],
-                  start: datetime, end: datetime, home: str) -> RunEvidence:
+def evidence_from_runs(runs: Sequence[FinishedGateRun], rows: Sequence[dict[str, object]],
+                       start: datetime, end: datetime, home: str) -> RunEvidence:
+    """Combine measured run times with launch and refusal evidence."""
     by_region: dict[tuple[str, str, str], list[Decimal]] = defaultdict(list)
     by_type: dict[tuple[str, str], list[Decimal]] = defaultdict(list)
     by_mode: dict[str, list[Decimal]] = defaultdict(list)

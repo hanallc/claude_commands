@@ -15,14 +15,17 @@ import subprocess
 import tempfile
 import time
 from typing import TYPE_CHECKING, cast
+import hashlib
 
 from scripts.aws_target import admin_secrets, hana_box as box, hana_guest, ledger, remote, s3_presign
 from scripts.aws_target.aws_cli import AwsCli, AwsExecutor, AwsUnavailable, aws_error_code, execute_command
 from scripts.lib import conf
 from scripts.lib.atomic_file import write_text_atomic
+from scripts.aws_target.hana_protocol import CONTROL_MAX_BYTES, HanaCommandEnvelope, HanaExecutionAccess, HanaFenceEnvelope, decode_envelope, decode_observation
+from scripts.aws_target.hana_result import HanaResultDownloadTimedOut, RESULT_MAX_BYTES
 
 if TYPE_CHECKING:
-    from scripts.aws_target.hana_protocol import HanaExecutionAccess, HanaExecutionObservation
+    from scripts.aws_target.hana_protocol import HanaExecutionObservation
     from scripts.aws_target.hana_result import HanaAttemptKey
 
 # Use this mapping for provider calls and policy coverage tests.
@@ -154,8 +157,6 @@ class AwsHanaProvider:
         return self.directory / (operation.token + '.json'), self.directory / 'mutation.lock'
 
     def _execution_prefix(self, key: HanaAttemptKey) -> str:
-        import hashlib
-
         generation = key.generation
         if not all(re.fullmatch(r'[A-Za-z0-9_-]+', value) for value in (generation.deployment, generation.start_token)):
             raise ValueError('The Hana execution generation is invalid')
@@ -164,8 +165,6 @@ class AwsHanaProvider:
 
     def execution_access(self, key: HanaAttemptKey) -> HanaExecutionAccess:
         """Grant bounded root publication access for this exact execution."""
-        from scripts.aws_target.hana_protocol import HanaExecutionAccess
-
         prefix = self._execution_prefix(key)
         signing = self.signing_key()
         now = self.clock()
@@ -192,8 +191,6 @@ class AwsHanaProvider:
 
     def publish_execution(self, content: bytes) -> None:
         """Publish one bounded command or an idempotent exact-attempt fence."""
-        from scripts.aws_target.hana_protocol import HanaCommandEnvelope, HanaFenceEnvelope, decode_envelope
-
         envelope = decode_envelope(content)
         key = envelope.request.key if isinstance(envelope, HanaCommandEnvelope) else envelope.key
         _ = self._execution_prefix(key)
@@ -214,15 +211,11 @@ class AwsHanaProvider:
 
     def observe_execution(self, key: HanaAttemptKey, *, timeout_s: float | None = None) -> HanaExecutionObservation:
         """Read execution evidence without repeating command publication."""
-        from scripts.aws_target.hana_protocol import CONTROL_MAX_BYTES, decode_observation
-
         timeout = self.api.timeout_s if timeout_s is None else min(self.api.timeout_s, timeout_s)
         return decode_observation(self._execution_bytes(key, '/observation.json', CONTROL_MAX_BYTES, timeout))
 
     def execution_result(self, key: HanaAttemptKey) -> bytes:
         """Read the bounded result after the guest publishes its terminal observation."""
-        from scripts.aws_target.hana_result import RESULT_MAX_BYTES, HanaResultDownloadTimedOut
-
         try:
             return self._execution_bytes(key, '/result.json', RESULT_MAX_BYTES, self.result_transfer_timeout_s)
         except ProviderTimedOut:

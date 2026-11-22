@@ -11,7 +11,6 @@ except FileNotFoundError:
 
 import argparse
 import fcntl
-import importlib
 import io
 import json
 import os
@@ -183,6 +182,7 @@ from scripts.build_targets.target_config import (
     WRITES_TREE,
     read_targets,
 )
+from scripts.direct.release_events import local_release_waiter
 from scripts.direct.step_selection import Pinned, ROUTED, TargetSelection
 
 
@@ -440,7 +440,7 @@ def fixed_remote_candidates(
     *, selection: TargetSelection,
 ) -> tuple[placement.PlacementCandidate, ...]:
     """Read the remote keys that determine the fixed candidate set."""
-    from scripts.aws_target import hana_placement, hana_placement_adapter
+    from scripts.aws_target import hana_placement
     from scripts.build_queue import placement
     from scripts.build_targets import target_config
     from scripts.mac_test import eligibility
@@ -451,6 +451,8 @@ def fixed_remote_candidates(
         configuration = conf.read(target.settings)
         transport = target_config.read_execution_transport(target, configuration=configuration)
         if isinstance(transport, HanaGpuNextestTransport):
+            from scripts.aws_target import hana_placement_adapter
+
             scope = (claim_state.RepositoryScope(repository.name, repository.key, 1)
                      if isinstance(repository, eligibility.KnownRepository) else claim_state.WHOLE_MAC)
             if isinstance(rule, NatedevOnly):
@@ -464,6 +466,8 @@ def fixed_remote_candidates(
             destination = placement.PlacementDestination('ssh', target.name, transport.host, scope, 1)
             return (placement.PlacementCandidate(destination, policy, settings),)
         if isinstance(transport, hana_placement.HanaControlTransport):
+            from scripts.aws_target import hana_placement_adapter
+
             scope = (claim_state.RepositoryScope(repository.name, repository.key, 1)
                      if isinstance(repository, eligibility.KnownRepository) else claim_state.WHOLE_MAC)
             route = hana_placement_adapter.configured_route(configuration, str(repo_root), kind)
@@ -778,7 +782,7 @@ def ssh_target_eligibility(target: SshTarget, repo_root: Path, package: str,
     from scripts.mac_test import eligibility, mac_test
 
     session = claim_state.submitting_session(session)
-    from scripts.aws_target import hana_placement, hana_placement_adapter
+    from scripts.aws_target import hana_placement
     from scripts.build_targets import target_config
 
     settings = conf.read(target.settings) if isinstance(configuration, conf.UseConfiguredValue) else configuration
@@ -790,6 +794,8 @@ def ssh_target_eligibility(target: SshTarget, repo_root: Path, package: str,
             return ExcludedTarget(target, routing.reason)
         if not isinstance(selection, Pinned) or selection.target != target.name:
             return ExcludedTarget(target, 'This target requires --target hana-gpu')
+        from scripts.aws_target import hana_placement_adapter
+
         identity = eligibility.repository_identity(repo_root)
         policy = hana_placement_adapter.gpu_step(transport,
             identity.key if isinstance(identity, eligibility.KnownRepository) else '',
@@ -1372,10 +1378,6 @@ def command_wait_local(call_id: str, *, pid: int = 0, leave_hook: str = "", call
     from scripts.build_hold import build_hold
     from scripts.build_targets.targets import Held, StateUnreadable
 
-    # This CLI's import root excludes the worker module.
-    # Use importlib at the typed provider boundary.
-    release_waiter = cast(Callable[[Path, Path], LocalHoldWait], getattr(
-        importlib.import_module("scripts.direct.local_release_wait"), "local_release_waiter"))
     _ = pid
     if not leave_hook and not caller:
         leave_hook = os.environ.get("BUILDLOG_MAC_IDLE_HOOK", "")
@@ -1403,7 +1405,7 @@ def command_wait_local(call_id: str, *, pid: int = 0, leave_hook: str = "", call
             _ = temporary.write_text(json.dumps(waiter))
             os.replace(temporary, waiter_file)
         target = local_target()
-        release_events = notifications.enter_context(release_waiter(
+        release_events = notifications.enter_context(local_release_waiter(
             build_hold.holder_directory(), build_hold.release_directory()))
         context = LOCAL_HOLD_WAIT.set(release_events)
         _ = notifications.callback(LOCAL_HOLD_WAIT.reset, context)

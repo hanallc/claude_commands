@@ -1,24 +1,29 @@
 """Dispatch one assigned Hana command and retain its execution until settlement."""
 from __future__ import annotations
 
+import base64
 from dataclasses import asdict, dataclass, replace
+import hashlib
 import json
 import time
 from typing import TYPE_CHECKING, Protocol, cast
+from uuid import uuid4
 
-from scripts.build_queue import execution_identity
+from scripts.aws_target import hana_box, hana_protocol, hana_result
+from scripts.aws_target.controller_lock import control_lock
 from scripts.aws_target.hana_guest import WorkPermit
-from scripts.aws_target.hana_placement import HanaClaimRelease, HanaClaimReleaseRefused
-from scripts.aws_target import hana_protocol, hana_result
+from scripts.aws_target.hana_placement import HanaClaimRelease, HanaClaimReleaseRefused, generation_text
 from scripts.aws_target.hana_result import HanaAttemptKey, LogicalStepLink
-from scripts.build_queue import placement
+from scripts.aws_target.ledger import CostLedger
+from scripts.aws_target.remote import read_record
+from scripts.build_queue import admission_protocol as wire, execution_identity, placement
+from scripts.lib import atomic_file
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping
     from contextlib import ExitStack
     from pathlib import Path
-    from scripts.aws_target import hana_box, hana_placement
-    from scripts.build_queue import admission_protocol as wire
+    from scripts.aws_target import hana_placement
     from scripts.buildlog.sync import TransferBytes
 
 _MISSING_BASIS_PREFIX = 'MissingBasis: '
@@ -118,8 +123,6 @@ class SourceCapture(Protocol):
 
 
 def execution_path(directory: Path, execution: str) -> Path:
-    import hashlib
-
     return directory / 'hana' / 'executions' / (hashlib.sha256(execution.encode()).hexdigest() + '.json')
 
 
@@ -128,8 +131,6 @@ def execution_guard_path(directory: Path, execution: str) -> Path:
 
 
 def _read_journal(directory: Path, execution: str) -> dict[str, object]:
-    from scripts.aws_target.remote import read_record
-
     row = read_record(execution_path(directory, execution))
     if row.get('kind') == 'unpublished':
         if row.get('claim_id') != execution or not hana_result.string_field(row, 'episode') or not hana_result.string_field(row, 'attempt'):
@@ -150,16 +151,12 @@ def _read_journal(directory: Path, execution: str) -> dict[str, object]:
 
 
 def _save_journal(directory: Path, execution: str, row: dict[str, object]) -> None:
-    from scripts.lib.atomic_file import write_text_atomic
-
-    write_text_atomic(execution_path(directory, execution), json.dumps(row, sort_keys=True, allow_nan=False) + '\n',
-                      new_file_mode=0o600)
+    atomic_file.write_text_atomic(execution_path(directory, execution),
+                                  json.dumps(row, sort_keys=True, allow_nan=False) + '\n', new_file_mode=0o600)
 
 
 def _journal_lock(directory: Path, execution: str):
     """Acquire only the attempt lock during transport waits."""
-    from scripts.aws_target.controller_lock import control_lock
-
     return control_lock(execution_path(directory, execution).with_suffix('.lock'))
 
 
@@ -205,8 +202,6 @@ def read_claim_admission_refusal(directory: Path, reference: placement.ProviderC
 
 def read_claim_execution(directory: Path, reference: placement.ProviderClaimReference) -> execution_identity.ExecutionEvidence:
     """Supply durable remote evidence without using the local holder as proof of departure."""
-    import time
-
     try:
         row = _read_journal(directory, reference.claim_id)
         if _journal_attempt(row) != (reference.episode, reference.attempt):
@@ -317,8 +312,6 @@ def read_dispatch_observation(directory: Path, request: hana_protocol.HanaExecut
 
 def dispatch_claim_boot_matches(directory: Path, reference: placement.ProviderClaimReference, generation: str) -> bool:
     """Require a published dispatch and its retained claim to name the same boot."""
-    from scripts.aws_target.hana_placement import generation_text
-
     try:
         row = _read_journal(directory, reference.claim_id)
         if row['publication_attempted'] is False:
@@ -340,8 +333,6 @@ def prepare_execution(adopted: hana_placement.HanaClaimAdopted, sender: SourceCa
                       ) -> (tuple[hana_protocol.HanaExecutionRequest, Callable[[], None]]
                             | ExecutionPreparationRefused | execution_identity.HanaCommandAdmissionRefused):
     """Capture exact source and bind it to the checked assignment before permission consumption."""
-    from scripts.aws_target.hana_placement import generation_text
-
     assignment = adopted.reserved.assignment
     claim = adopted.reserved.claim
     expected = execution_identity.assigned_claim_id(assignment.episode, assignment.attempt)
@@ -389,10 +380,6 @@ def dispatch_execution(directory: Path, request: hana_protocol.HanaExecutionRequ
                        current_source_key: Callable[[], execution_identity.SourceIdentity]
                        ) -> HanaDispatchState | execution_identity.HanaCommandAdmissionRefused:
     """Persist the dispatch before consuming permission and publish its command at most once."""
-    from importlib import import_module
-    from scripts.build_queue import admission_protocol as wire
-    from uuid import uuid4
-
     execution = request.key.claim_id
     assignment = adopted.reserved.assignment
     if (request.key != HanaAttemptKey(assignment.episode, assignment.attempt,
@@ -406,12 +393,10 @@ def dispatch_execution(directory: Path, request: hana_protocol.HanaExecutionRequ
         cause = ' '.join(str(error).splitlines())
         return execution_identity.HanaCommandAdmissionRefused(f'The Hana command could not be prepared: {cause}')
 
-    permission_type = cast('type[hana_box.CommandPermission]', import_module('scripts.aws_target.hana_box').CommandPermission)
-
     def permit_for_claim() -> WorkPermit | execution_identity.HanaCommandAdmissionRefused:
         permission = current_permission()
-        if not isinstance(permission, permission_type):
-            reason = cast('hana_box.ClaimRefused', permission).reason
+        if not isinstance(permission, hana_box.CommandPermission):
+            reason = permission.reason
             return execution_identity.HanaCommandAdmissionRefused(' '.join(reason.splitlines()))
         if (permission.execution != execution or permission.boot.boot_id != request.key.generation.boot_id
                 or permission.boot.start_token != request.key.generation.start_token):
@@ -540,8 +525,6 @@ def publish_source_update(directory: Path, request: hana_protocol.HanaExecutionR
 def accept_result(directory: Path, request: hana_protocol.HanaExecutionRequest, content: bytes, host: str,
                   current_source_key: Callable[[], execution_identity.SourceIdentity]) -> hana_result.HanaResultDecision:
     """Persist one checked terminal result before the recorder or verify adapter uses it."""
-    import base64
-
     result = hana_result.decode_result(content)
     expected = hana_result.HanaResultExpectation(request.key, request.source_key.key, request.manifest.commit,
         request.manifest.toolchain, host, request.argv, request.slot)
@@ -573,8 +556,6 @@ def replay_accepted_result(directory: Path, request: hana_protocol.HanaExecution
 
 
 def _accepted_result(row: dict[str, object]) -> hana_result.HanaResultDecision:
-    import base64
-
     encoded = row.get('accepted_result')
     if not isinstance(encoded, str):
         return hana_result.RejectedHanaResult('The Hana dispatch has no accepted terminal result')
@@ -630,8 +611,6 @@ def replay_execution_settlement(directory: Path, assignment: placement.Placement
                                 retained_generation: str | placement.NoProviderClaim,
                                 release_claim: Callable[[], HanaClaimRelease]) -> HanaSettlement:
     """Recover the exact assigned dispatch from local proof."""
-    from scripts.aws_target.hana_placement import generation_text
-
     reference = placement.assigned_claim_reference(assignment)
     try:
         row = _read_journal(directory, reference.claim_id)
@@ -802,8 +781,6 @@ def settle_execution(directory: Path, request: hana_protocol.HanaExecutionReques
 def record_attempt_charge(directory: Path, request: hana_protocol.HanaExecutionRequest, transfers: list[TransferBytes],
                           started_at: float, finished_at: float) -> None:
     """Persist measured transfer links without creating another dollar total."""
-    from scripts.aws_target.ledger import CostLedger
-
     book = CostLedger(directory)
     with _journal_lock(directory, request.key.claim_id):
         row = _read_journal(directory, request.key.claim_id)
