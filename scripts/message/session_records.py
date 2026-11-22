@@ -6,7 +6,7 @@ import os
 import stat
 import time
 import tomllib
-from collections.abc import Callable, Generator, Iterable, Iterator
+from collections.abc import Callable, Generator, Iterable, Iterator, Set
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
@@ -14,7 +14,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Literal, NotRequired, TypedDict, cast
 
-from scripts.lib.transcripts import config_dirs as config_dirs, transcript_paths
+from scripts.lib.transcripts import config_dirs as config_dirs, transcript_paths, uncompressed_path
 from scripts.lib.session_paths import sessions_directory
 from scripts.message.process_identity import process_start as process_start
 from scripts.message.relay_identity import RelayIdentity, live_relay_identity, relay_senders_directory
@@ -408,10 +408,39 @@ def live_sessions() -> list[SessionRecord]:
     return _matching_records((item.record for item in read_registry().entries), live_session)
 
 
+def _claude_project_roots() -> Iterator[Path]:
+    return (directory / "projects" for directory in config_dirs())
+
+
 def transcript_locations(session_id: str) -> list[Path]:
     """Return distinct transcript paths across the Claude accounts."""
-    return sorted({path.resolve() for directory in config_dirs()
-                   for path in transcript_paths(directory / "projects", f"*/{session_id}.jsonl")})
+    return sorted({path.resolve() for projects in _claude_project_roots()
+                   for path in transcript_paths(projects, f"*/{session_id}.jsonl")})
+
+
+def transcript_session_ids(wanted: Set[str]) -> set[str]:
+    """Find Claude transcripts for the requested sessions with one scan per root."""
+    if len(wanted) <= 1:
+        return {identity for identity in wanted if transcript_locations(identity)}
+    found: set[str] = set()
+    scanned: set[Path] = set()
+    for root in _claude_project_roots():
+        try:
+            projects = root.resolve()
+        except (OSError, RuntimeError):
+            # Python 3.12 raises RuntimeError for a symlink loop.
+            continue
+        if projects in scanned:
+            continue
+        scanned.add(projects)
+        try:
+            for path in projects.glob("*/*.jsonl*"):
+                logical = uncompressed_path(path)
+                if logical.suffix == ".jsonl" and logical.stem in wanted:
+                    found.add(logical.stem)
+        except OSError:
+            continue
+    return found
 
 
 def latest_transcript(session_id: str, projects: Path) -> Path | None:

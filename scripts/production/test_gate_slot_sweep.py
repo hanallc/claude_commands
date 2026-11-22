@@ -16,16 +16,16 @@ from scripts.copies import copies
 from scripts.lib import scratch
 from scripts.lint import sweep as folder_sweep
 from scripts.lib.build_slots_test_support import private_slot_config
-from scripts.production import merge_gate, staff
+from scripts.production import gate, staff
 from scripts.production.gate_modules import GateRefused
 
 
 class NightlySlotSweepTests(unittest.TestCase):
     def test_nightly_requires_a_unit_or_production_before_work_starts(self) -> None:
-        with (mock.patch.object(merge_gate, "nightly_git") as git,
-              mock.patch.object(merge_gate, "_sweep_nightly_build_folders") as sweep,
+        with (mock.patch.object(gate, "nightly_git") as git,
+              mock.patch.object(gate, "_sweep_nightly_build_folders") as sweep,
               redirect_stderr(io.StringIO()) as output, self.assertRaises(SystemExit) as status):
-            _ = merge_gate.main(["--nightly", "--merge-branch", "fixture"])
+            _ = gate.main(["--nightly", "--merge-branch", "fixture"])
         self.assertEqual(status.exception.code, 2)
         self.assertIn("--nightly needs --unit or --production", output.getvalue())
         git.assert_not_called()
@@ -54,15 +54,15 @@ class NightlySlotSweepTests(unittest.TestCase):
             for rows, expected_status, expected_unit in cases:
                 with (self.subTest(unit=expected_unit), staff.supplied_snapshot(staff.StaffSnapshot(rows)),
                       mock.patch.object(scratch, "copy_lock", return_value=nullcontext()),
-                      mock.patch.object(merge_gate, "nightly_git") as git,
-                      mock.patch.object(merge_gate, "checked_git", return_value="fixture-commit"),
+                      mock.patch.object(gate, "nightly_git") as git,
+                      mock.patch.object(gate, "checked_git", return_value="fixture-commit"),
                       mock.patch.object(copies, "standing", return_value=nullcontext(Path(checkout))) as take,
-                      mock.patch.object(merge_gate, "run_suites", return_value=merge_gate.GateRun((merge_gate.GateJobResult("test", "fixture", 0, 0, ""),), 0, 0)),
-                      mock.patch.object(merge_gate, "gate_state_dir", return_value=Path(checkout)),
-                      mock.patch.object(merge_gate, "push_nightly_result"),
-                      mock.patch.object(merge_gate, "_sweep_nightly_build_folders") as sweep,
+                      mock.patch.object(gate, "run_suites", return_value=gate.GateRun((gate.GateJobResult("test", "fixture", 0, 0, ""),), 0, 0)),
+                      mock.patch.object(gate, "gate_state_dir", return_value=Path(checkout)),
+                      mock.patch.object(gate, "push_nightly_result"),
+                      mock.patch.object(gate, "_sweep_nightly_build_folders") as sweep,
                       redirect_stderr(io.StringIO()) as output):
-                    self.assertEqual(merge_gate.main(arguments), expected_status)
+                    self.assertEqual(gate.main(arguments), expected_status)
                     if expected_status == 0:
                         take.assert_called_once_with(expected_unit, Path(checkout).resolve(),
                             copies.CommittedSource("fixture-commit"), step="test-nightly")
@@ -92,7 +92,7 @@ class NightlySlotSweepTests(unittest.TestCase):
                         events.append("Mac")
                         self.assertEqual(list(argv[5:15]),
                                          ["--kind", "run", "--what", "Sweep unused Mac build folders", "--package", "claude",
-                                          "--worktree", str(Path(merge_gate.__file__).resolve().parents[2]), "--", "/bin/zsh"])
+                                          "--worktree", str(Path(gate.__file__).resolve().parents[2]), "--", "/bin/zsh"])
                         # The nightly runs from $HOME; the Mac queue refuses a worktree that is not a repository.
                         self.assertTrue((Path(argv[12]) / ".git").exists())
                     else:
@@ -103,11 +103,11 @@ class NightlySlotSweepTests(unittest.TestCase):
 
                 with (mock.patch.dict(os.environ, config.environment),
                       mock.patch.object(scratch, "copy_lock", return_value=nullcontext()),
-                      mock.patch.object(merge_gate, "nightly", return_value=status),
+                      mock.patch.object(gate, "nightly", return_value=status),
                       mock.patch.object(folder_sweep, "main", side_effect=sweep),
                       mock.patch.object(subprocess, "run", side_effect=run),
                       redirect_stdout(io.StringIO()) as output):
-                    self.assertEqual(merge_gate.main(["--nightly", "--merge-branch", "fixture", "--unit", "fixture-merge"]), status)
+                    self.assertEqual(gate.main(["--nightly", "--merge-branch", "fixture", "--unit", "fixture-merge"]), status)
                 self.assertEqual(events, ["local", "Mac"])
                 self.assertEqual(len(notices), 1)
                 self.assertIn("natedev failed: local cleanup failed", notices[0])
@@ -132,11 +132,11 @@ class NightlySlotSweepTests(unittest.TestCase):
 
                 with (mock.patch.dict(os.environ, config.environment),
                       mock.patch.object(scratch, "copy_lock", return_value=nullcontext()),
-                      mock.patch.object(merge_gate, "nightly", return_value=status),
+                      mock.patch.object(gate, "nightly", return_value=status),
                       mock.patch.object(folder_sweep, "main", return_value=0) as local,
                       mock.patch.object(subprocess, "run", side_effect=run),
                       redirect_stdout(io.StringIO()) as output):
-                    self.assertEqual(merge_gate.main(["--nightly", "--merge-branch", "fixture", "--unit", "fixture-merge"]), status)
+                    self.assertEqual(gate.main(["--nightly", "--merge-branch", "fixture", "--unit", "fixture-merge"]), status)
                 local.assert_called_once_with(["--unused-folders"])
                 self.assertEqual(len(notices), 1)
                 self.assertIn("on Mac failed:", notices[0])
@@ -148,7 +148,7 @@ class NightlySlotSweepTests(unittest.TestCase):
             config = private_slot_config(Path(temporary), repository="fixture")
             events: list[str] = []
 
-            def nightly(args: merge_gate.GateArguments) -> int:
+            def nightly(args: gate.GateArguments) -> int:
                 events.append("nightly:" + args.merge_branch)
                 raise GateRefused("gate failed")
 
@@ -164,10 +164,10 @@ class NightlySlotSweepTests(unittest.TestCase):
 
             with (mock.patch.dict(os.environ, config.environment),
                   mock.patch.object(scratch, "copy_lock", return_value=nullcontext()),
-                  mock.patch.object(merge_gate, "nightly", side_effect=nightly),
+                  mock.patch.object(gate, "nightly", side_effect=nightly),
                   mock.patch.object(folder_sweep, "main", side_effect=local),
                   mock.patch.object(subprocess, "run", side_effect=run),
                   redirect_stderr(io.StringIO()) as output):
-                self.assertEqual(merge_gate.main(["--nightly", "--merge-branch", "fixture", "--unit", "fixture-merge"]), 1)
+                self.assertEqual(gate.main(["--nightly", "--merge-branch", "fixture", "--unit", "fixture-merge"]), 1)
             self.assertEqual(events, ["nightly:fixture", "local", "Mac"])
             self.assertIn("gate failed", output.getvalue())
