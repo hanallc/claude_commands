@@ -22,7 +22,7 @@ from typing import cast
 
 from scripts.lib import conf
 from scripts.test_times.gate_record import (
-    ListedDirectory, ModuleReadRecord, NoConfigReadRecord, NoContentReadRecord,
+    ListedDirectory, LocalModuleReadsUnavailable, ModuleReadRecord, NoConfigReadRecord, NoContentReadRecord,
     NoFolderScanRecord, RecordedContentReads, RecordedFolderScans,
     RecursiveDirectory, WholeRepository, read_latest_module_reads,
 )
@@ -716,8 +716,8 @@ def graph_for_files(repo: Path, paths: set[str], blobs: dict[str, str], dirty: s
     return SourceGraph(graph, tokens, config_reads, repository_scan_graph(repo, scan_facts, bare_modules))
 
 
-def latest_module_reads() -> dict[str, ModuleReadRecord]:
-    """Read each field from its newest full, non-aborted gate."""
+def latest_module_reads() -> dict[str, ModuleReadRecord] | LocalModuleReadsUnavailable:
+    """Read the latest evidence from all hosts."""
     return read_latest_module_reads()
 
 
@@ -923,6 +923,9 @@ def select_affected(repo: Path, base: CertifiedBase | NoCertifiedBase,
             differences.append((candidate, set(changes.split("\0")) - {""}))
         base, committed_changes = min(differences, key=lambda item: len(item[1]))
         changed = committed_changes | dirty
+        recorded = latest_module_reads()
+        if isinstance(recorded, LocalModuleReadsUnavailable):
+            return FullSuite("local module read snapshot unavailable")
         paths, blobs = worktree_files(repo, dirty)
         cache_path = state_dir / "affected-module-facts.json" if state_dir is not None else None
         cached = read_fact_cache(cache_path) if cache_path is not None else {}
@@ -930,11 +933,10 @@ def select_affected(repo: Path, base: CertifiedBase | NoCertifiedBase,
         graph = graph_for_files(repo, paths, blobs, dirty, cached, worktree=True)
         config_paths = {path for path in changed if path.startswith("config/") and path.endswith(".conf")}
         configs = {Path(path).name.removesuffix(".conf") for path in config_paths}
-        recorded = latest_module_reads() if changed else {}
         has_folder_records = any(isinstance(reads.folder_scans, RecordedFolderScans) for reads in recorded.values())
         has_content_records = any(isinstance(reads.content_reads, RecordedContentReads) for reads in recorded.values())
         content_changes = {path for path in changed if not path.startswith("config/")}
-        base_blobs = revision_files(repo, base.commit) if has_folder_records else {}
+        base_blobs = revision_files(repo, base.commit) if has_folder_records and changed else {}
         scanned_parents: set[str] = changed_path_parents(repo, changed, set(base_blobs)) if has_folder_records else set()
         retained = source_blobs(paths | dirty, blobs)
         python = {path for path in changed if path.endswith(".py")}

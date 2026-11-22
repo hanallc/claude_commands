@@ -1162,7 +1162,8 @@ def import_record(folder: Path, row: dict[str, object]) -> None:
             store.append_locked(handle, record)
         else:
             record = appended.row
-    gate_record.update_gate_history(record, transferred_modules)
+    gate_record.update_latest_module_reads(record, transferred_modules, host=store.host_name())
+    gate_record.update_recent_times(record)
     from scripts.buildlog.record import keep_result
     imported: dict[str, object] = {'id': record_id}
     try:

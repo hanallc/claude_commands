@@ -1,12 +1,15 @@
 """Read module times and append gate runs to the build log."""
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
+from contextlib import closing
 from dataclasses import dataclass, field
 import hashlib
+from itertools import chain
 import json
 import math
 from pathlib import Path
+import sqlite3
 import sys
 import time
 from typing import Final, Literal, NotRequired, TypedDict, cast, get_args
@@ -277,7 +280,7 @@ def _read_snapshots(path: Path) -> dict[ReadField, GateReadSnapshot]:
             continue
         snapshot = _fields(document[field])
         started_at, run_id = snapshot.get("started_at"), snapshot.get("run_id")
-        if not isinstance(started_at, str) or not isinstance(run_id, str):
+        if not isinstance(started_at, str) or not started_at or not isinstance(run_id, str) or not run_id:
             raise ValueError("invalid module read gate identity")
         modules = {name: None if reads is None else _read_names(reads, field)
                    for name, reads in _fields(snapshot.get("modules")).items()}
@@ -287,17 +290,57 @@ def _read_snapshots(path: Path) -> dict[ReadField, GateReadSnapshot]:
     return snapshots
 
 
-def read_latest_module_reads() -> dict[str, ModuleReadRecord]:
-    """Read the latest gate recorded for each module read field."""
+@dataclass(frozen=True)
+class LocalModuleReadsUnavailable:
+    """The local snapshot has no usable module reads."""
+
+
+def latest_module_reads_path(host: str) -> Path:
+    if not host or host in (".", "..") or Path(host).name != host:
+        raise ValueError("invalid module read host")
+    return store.root() / host / LATEST_MODULE_READS_NAME
+
+
+def read_latest_module_reads() -> dict[str, ModuleReadRecord] | LocalModuleReadsUnavailable:
+    """Combine the local snapshot with snapshots from peers."""
+    local_path = latest_module_reads_path(store.host_name())
     try:
-        snapshots = _read_snapshots(store.root() / LATEST_MODULE_READS_NAME)
+        local = _read_snapshots(local_path)
     except (FileNotFoundError, ValueError, RecursionError):
-        return {}
-    configs = snapshots["config_reads"]["modules"] if "config_reads" in snapshots else {}
-    folders = snapshots["folder_scans"]["modules"] if "folder_scans" in snapshots else {}
-    contents = snapshots["content_reads"]["modules"] if "content_reads" in snapshots else {}
-    return {name: module_read_record(configs.get(name), folders.get(name), contents.get(name))
-            for name in configs.keys() | folders.keys() | contents.keys()}
+        return LocalModuleReadsUnavailable()
+    if not local:
+        return LocalModuleReadsUnavailable()
+
+    reads_by_module: dict[str, dict[ReadField, list[str]]] = {}
+    for snapshots in chain((local,), _peer_snapshots(local_path)):
+        for field, snapshot in snapshots.items():
+            for module, reads in snapshot["modules"].items():
+                fields = reads_by_module.setdefault(module, {})
+                if reads is not None:
+                    fields.setdefault(field, []).extend(reads)
+    return {module: module_read_record(fields.get("config_reads"), fields.get("folder_scans"),
+                                      fields.get("content_reads"))
+            for module, fields in reads_by_module.items()}
+
+
+def _peer_snapshots(local_path: Path) -> Iterator[dict[ReadField, GateReadSnapshot]]:
+    for folder in sorted(local_path.parent.parent.iterdir()):
+        if (folder == local_path.parent or folder.name in (store.CI_DIR, store.CLOUD_GATE_PLACE)
+                or not folder.is_dir()):
+            continue
+        path = folder / LATEST_MODULE_READS_NAME
+        try:
+            snapshots = _read_snapshots(path)
+            if not snapshots:
+                raise ValueError("empty snapshot")
+        except FileNotFoundError:
+            if any(folder.glob("????-??.jsonl")):
+                print(f"latest module reads: {path} is missing", file=sys.stderr)
+        except (OSError, ValueError, RecursionError) as error:
+            detail = " ".join(str(error).splitlines())
+            print(f"latest module reads: skipped {path}: {detail}", file=sys.stderr)
+        else:
+            yield snapshots
 
 
 def without_module_reads(modules: Sequence[ModuleRun]) -> list[ModuleRun]:
@@ -312,60 +355,85 @@ def without_module_reads(modules: Sequence[ModuleRun]) -> list[ModuleRun]:
     return stripped
 
 
-def update_latest_module_reads(record: Mapping[str, object], modules: Sequence[object]) -> None:
-    """Replace each field only when a later full gate recorded it."""
+def _gate_read_snapshots(started_at: str, run_id: str,
+                         modules: Iterator[Mapping[str, object]]) -> dict[ReadField, GateReadSnapshot]:
+    module_paths: set[str] = set()
+    reads_by_field: dict[ReadField, dict[str, set[str]]] = {field: {} for field in READ_FIELDS}
+    for row in modules:
+        suite, name = row.get("suite"), row.get("module")
+        if not isinstance(suite, str) or not isinstance(name, str):
+            continue
+        path = f"scripts/{suite}/{name}"
+        module_paths.add(path)
+        for field in READ_FIELDS:
+            value = row.get(field)
+            if value is not None:
+                reads_by_field[field].setdefault(path, set()).update(_read_names(value, field))
+    paths = sorted(module_paths)
+    return {field: {"started_at": started_at, "run_id": run_id,
+                    "modules": {path: sorted(reads[path]) if path in reads else None for path in paths}}
+            for field, reads in reads_by_field.items() if reads}
+
+
+def _publish_read_snapshots(host: str, candidates: Mapping[ReadField, GateReadSnapshot]) -> None:
+    if not candidates:
+        return
+    path = latest_module_reads_path(host)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with file_lock.exclusive(path.with_suffix(".lock")):
+        try:
+            snapshots = _read_snapshots(path)
+        except (FileNotFoundError, ValueError, RecursionError):
+            snapshots = {}
+        newer: dict[ReadField, GateReadSnapshot] = {field: candidate for field, candidate in candidates.items()
+                 if field not in snapshots or (candidate["started_at"], candidate["run_id"])
+                 > (snapshots[field]["started_at"], snapshots[field]["run_id"])}
+        if newer:
+            snapshots.update(newer)
+            write_text_atomic(path, json.dumps(snapshots, separators=(",", ":")) + "\n")
+
+
+def update_latest_module_reads(record: Mapping[str, object], modules: Sequence[object], *, host: str) -> None:
+    """Publish each field from a newer full gate."""
     started_at, run_id = record.get("started_at"), record.get("id")
     if (record.get("selection") != "full" or record.get("aborted") != 0
             or not isinstance(started_at, str) or not isinstance(run_id, str)):
         return
-    try:
-        module_paths: set[str] = set()
-        reads_by_field: dict[ReadField, dict[str, set[str]]] = {field: {} for field in READ_FIELDS}
-        for module in modules:
-            row = _fields(module)
-            suite, name = row.get("suite"), row.get("module")
-            if not isinstance(suite, str) or not isinstance(name, str):
-                continue
-            path = f"scripts/{suite}/{name}"
-            module_paths.add(path)
-            for field in READ_FIELDS:
-                value = row.get(field)
-                if value is not None:
-                    reads_by_field[field].setdefault(path, set()).update(_read_names(value, field))
-        if not any(reads_by_field.values()):
-            return
-        paths = sorted(module_paths)
-        cache = store.root() / LATEST_MODULE_READS_NAME
-        cache.parent.mkdir(parents=True, exist_ok=True)
-        with file_lock.exclusive(cache.with_suffix(".lock")):
-            try:
-                snapshots = _read_snapshots(cache)
-            except (FileNotFoundError, ValueError, RecursionError):
-                snapshots = {}
-            changed = False
-            for field, reads in reads_by_field.items():
-                if not reads:
-                    continue
-                if field in snapshots:
-                    previous = snapshots[field]
-                    if (started_at, run_id) <= (previous["started_at"], previous["run_id"]):
-                        continue
-                snapshots[field] = {
-                    "started_at": started_at, "run_id": run_id,
-                    "modules": {path: sorted(reads[path]) if path in reads else None for path in paths},
-                }
-                changed = True
-            if changed:
-                write_text_atomic(cache, json.dumps(snapshots, separators=(",", ":")) + "\n")
-    except (OSError, ValueError, RecursionError) as error:
-        detail = " ".join(str(error).splitlines())
-        print(f"latest module reads not written: {detail}", file=sys.stderr)
+    _publish_read_snapshots(host, _gate_read_snapshots(started_at, run_id, map(_fields, modules)))
 
 
-def update_gate_history(record: Mapping[str, object], modules: Sequence[object]) -> None:
-    """Update the files that the next gate reads."""
-    update_recent_times(record)
-    update_latest_module_reads(record, modules)
+def _indexed_module_reads(connection: sqlite3.Connection, run_id: str,
+                          field: ReadField) -> Iterator[Mapping[str, object]]:
+    with closing(connection.execute(
+        f"SELECT suite, module, {field} FROM gate_modules WHERE run_id = ?", (run_id,),
+    )) as cursor:
+        for suite, module, reads in cast(Iterator[tuple[str, str, str | None]], iter(cursor)):
+            yield {"suite": suite, "module": module, field: None if reads is None else cast(object, json.loads(reads))}
+
+
+def seed_latest_module_reads(connection: sqlite3.Connection) -> None:
+    """Seed each host from its latest full gate for each field."""
+    by_host: dict[str, dict[ReadField, GateReadSnapshot]] = {}
+    # The controller publishes cloud reads in its own snapshot.
+    local = store.host_name()
+    for field in READ_FIELDS:
+        with closing(connection.execute(f"""
+            WITH eligible AS (
+                SELECT CASE WHEN src LIKE ? THEN ? ELSE host END AS owner, started_at, id
+                FROM gate_runs
+                WHERE selection = 'full' AND aborted = 0 AND started_at IS NOT NULL
+                  AND EXISTS (SELECT 1 FROM gate_modules WHERE run_id = gate_runs.id AND {field} IS NOT NULL)
+            ), ranked AS (
+                SELECT *, row_number() OVER (PARTITION BY owner ORDER BY started_at DESC, id DESC) AS rank
+                FROM eligible WHERE owner IS NOT NULL AND owner != ''
+            )
+            SELECT owner, started_at, id FROM ranked WHERE rank = 1
+        """, (f"{store.CLOUD_GATE_PLACE}/%", local))) as cursor:
+            for host, started_at, run_id in cast(Iterator[tuple[str, str, str]], iter(cursor)):
+                snapshots = _gate_read_snapshots(started_at, run_id, _indexed_module_reads(connection, run_id, field))
+                by_host.setdefault(host, {}).update(snapshots)
+    for host, snapshots in by_host.items():
+        _publish_read_snapshots(host, snapshots)
 
 
 def _seconds(value: object) -> float:
@@ -511,9 +579,10 @@ def write_gate_run(run: GateRun, executions: Sequence[Execution]) -> None:
         entry: GateRunRecord = {"kind": "gate_run", "v": record.RECORD_VERSION,
                                 "id": record.new_id(host, epoch), "host": host, **run,
                                 "tests_run": sum(module["tests_run"] for module in run["modules"])}
+        update_latest_module_reads(entry, run["modules"], host=host)
         keep_failure_logs(entry["id"], host, epoch, run["modules"], executions)
         store.append_line(store.host_file(host, epoch), {**entry, "modules": without_module_reads(run["modules"])})
-        update_gate_history(entry, run["modules"])
+        update_recent_times(entry)
     except Exception as error:
         report_not_written(error)
 

@@ -2184,6 +2184,30 @@ with (mock.patch.object(cloud_gate, 'AwsCli', return_value=api),
             'scripts/fixture/test_ok.py': gate_record.module_read_record(['limits'], ['docs/'], []),
         })
 
+    def test_cloud_snapshot_write_failure_keeps_payload_for_retry(self) -> None:
+        result = self.result()
+        outgoing = ledger.mapping(result['record'])
+        ledger.rows(outgoing, 'modules')[0]['config_reads'] = ['limits']
+        payload = self.folder / cloud_gate.RESULT_FILE
+        marker = self.folder / 'imported.json'
+        snapshot = gate_record.latest_module_reads_path(store.host_name())
+        cloud_gate.save(payload, result)
+        with mock.patch.object(gate_record, 'write_text_atomic', side_effect=OSError('fixture snapshot write failed')):
+            with self.assertRaisesRegex(OSError, 'fixture snapshot write failed'):
+                cloud_gate.import_record(self.folder, result)
+        self.assertFalse(marker.exists())
+        self.assertFalse(snapshot.exists())
+        self.assertEqual(cloud_gate.read(payload), result)
+
+        cloud_gate.import_record(self.folder, cloud_gate.read(payload))
+        self.assertTrue(marker.exists())
+        self.assertFalse(payload.exists())
+        rows = list(store.locked_rows(store.host_file(store.CLOUD_GATE_PLACE, self.now)))
+        self.assertEqual([row['id'] for row in rows], ['gate-attempt'])
+        self.assertEqual(gate_record.read_latest_module_reads(), {
+            'scripts/fixture/test_ok.py': gate_record.module_read_record(['limits'], None, None),
+        })
+
     def test_first_import_skips_existing_rows(self) -> None:
         destination = store.host_file('aws', self.now)
         destination.parent.mkdir(parents=True)

@@ -205,6 +205,8 @@ class GateRecordTests(unittest.TestCase):
         stderr = io.StringIO()
         with (mock.patch.object(show, "open_read_only_index", side_effect=replace_then_open),
               mock.patch.object(recent_gate_times, "seed", side_effect=AssertionError("seed queried an incomplete index")),
+              mock.patch.object(gate_record, "seed_latest_module_reads",
+                                side_effect=AssertionError("read seed queried an incomplete index")),
               redirect_stderr(stderr)):
             self.assertEqual(show.main(["seed-gate-times"]), 1)
         self.assertEqual(stderr.getvalue(), "recent gate times not seeded: the opened index has no completed refresh\n")
@@ -557,7 +559,7 @@ class GateRecordTests(unittest.TestCase):
         run["modules"][0].update(config_reads=["limits"], folder_scans=[], content_reads=["docs/guide.md"])
         gate_record.write_gate_run(run, fixture_executions(run))
 
-        latest_path = self.buildlog / gate_record.LATEST_MODULE_READS_NAME
+        latest_path = gate_record.latest_module_reads_path(store.host_name())
         previous = latest_path.read_bytes()
         self.assertEqual(gate_record.read_latest_module_reads(), {
             "scripts/scripts/test_example.py": gate_record.module_read_record(["limits"], [], ["docs/guide.md"]),
@@ -578,6 +580,26 @@ class GateRecordTests(unittest.TestCase):
             self.assertEqual(module["wall_s"], run["modules"][0]["wall_s"])
             self.assertEqual(module["peak_mib"], run["modules"][0]["peak_mib"])
             self.assertEqual(module["status"], run["modules"][0]["status"])
+
+    def test_local_snapshot_write_failure_prevents_the_stripped_append(self) -> None:
+        run = gate_run()
+        run["selection"] = "full"
+        run["modules"][0]["config_reads"] = ["limits"]
+        gate_record.write_gate_run(run, fixture_executions(run))
+        snapshot = gate_record.latest_module_reads_path(store.host_name())
+        previous = snapshot.read_bytes()
+        month, = self.buildlog.glob("*/*.jsonl")
+        records = month.read_bytes()
+        run["started_at"] = "2030-01-01"
+        run["modules"][0]["config_reads"] = ["tools"]
+        stderr = io.StringIO()
+        with (mock.patch.object(gate_record, "write_text_atomic", side_effect=OSError("fixture snapshot write failed")),
+              redirect_stderr(stderr)):
+            gate_record.write_gate_run(run, fixture_executions(run))
+        self.assertEqual(snapshot.read_bytes(), previous)
+        self.assertEqual(month.read_bytes(), records)
+        self.assertEqual(run["modules"][0]["config_reads"], ["tools"])
+        self.assertIn("fixture snapshot write failed", stderr.getvalue())
 
     def test_gate_write_failure_reports_one_line_and_returns(self) -> None:
         _ = self.buildlog.write_text("This file blocks the output directory.\n", encoding="utf-8")

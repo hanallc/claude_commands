@@ -37,7 +37,7 @@ from scripts.lib import conf, file_lock
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.terminal_cells import print_table, seconds
 from scripts.lib.user_zone import user_zone
-from scripts.test_times import recent_gate_times
+from scripts.test_times import gate_record, recent_gate_times
 
 # Each AWS gate host name starts with this prefix; `top --host aws` selects every such host.
 AWS_HOST_PREFIX = "ip-"
@@ -585,7 +585,7 @@ def arguments(argv: list[str]) -> ReportRequestArguments:
     test_parser = subcommands.add_parser("test", help="find kept test names by substring")
     _ = test_parser.add_argument("subject", metavar="text")
     _ = test_parser.add_argument("--runs", type=positive, default=20)
-    _ = subcommands.add_parser("seed-gate-times", help="seed recent gate times from the committed buildlog index")
+    _ = subcommands.add_parser("seed-gate-times", help="seed gate times and module reads from the committed buildlog index")
     if not argv or argv[0].startswith("--") and argv[0] != "--help":
         argv = ["top", *argv]
     request = parser.parse_args(argv, namespace=ReportRequestArguments())
@@ -661,8 +661,9 @@ def main(argv: list[str] | None = None) -> int:
                     print("recent gate times not seeded: the opened index has no completed refresh", file=sys.stderr)
                     return 1
                 keys = recent_gate_times.seed(connection)
-        except (OSError, sqlite3.Error, conf.Unusable) as error:
-            print(f"recent gate times not seeded: {error}", file=sys.stderr)
+                gate_record.seed_latest_module_reads(connection)
+        except (OSError, sqlite3.Error, ValueError, conf.Unusable) as error:
+            print(f"gate history seed failed: {error}", file=sys.stderr)
             return 1
         print(f"Recent gate time keys: {keys}")
         return 0

@@ -2,8 +2,9 @@
 from __future__ import annotations
 
 import ast
-from contextlib import closing
+from contextlib import closing, redirect_stderr, redirect_stdout
 from datetime import UTC, datetime
+import io
 import json
 import os
 from pathlib import Path
@@ -14,8 +15,10 @@ import unittest
 from typing import cast, override
 from unittest import mock
 
-from scripts.buildlog import index
+from scripts.aws_target import cloud_gate
+from scripts.buildlog import index, store
 from scripts.production import affected_modules as affected
+from scripts.production import gate, mac_gate_process
 from scripts.test_times import gate_record
 from scripts.test_times.gate_record_test_support import gate_run
 
@@ -38,6 +41,7 @@ class AffectedModulesTests(unittest.TestCase):
                    + "# text:\nscan_roots=\n")
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"CONF_DIR": str(self.repo / ".git/test-config")})))
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"BUILDLOG_DIR": str(self.repo / ".git/buildlog")})))
+        _ = self.enterContext(mock.patch.object(store, "host_name", return_value="natedev"))
         self.write(".gitignore", "__pycache__/\n")
         # Ten unrelated modules distinguish direct selection from a full selection.
         for index in range(10):
@@ -73,10 +77,10 @@ class AffectedModulesTests(unittest.TestCase):
         return {**gate_run(), "kind": "gate_run", "v": 1, "id": "fixture-full", "host": "mac",
                 "selection": "full", "aborted": False, "modules": modules}
 
-    def record_history(self, *runs: dict[str, object]) -> None:
-        (self.repo / ".git/buildlog" / gate_record.LATEST_MODULE_READS_NAME).unlink(missing_ok=True)
+    def record_history(self, *runs: dict[str, object], host: str = "natedev") -> None:
+        gate_record.latest_module_reads_path(host).unlink(missing_ok=True)
         for run in runs:
-            gate_record.update_latest_module_reads(run, cast(list[object], run["modules"]))
+            gate_record.update_latest_module_reads(run, cast(list[object], run["modules"]), host=host)
 
     def record_configs(self, reads: dict[str, list[str]]) -> None:
         self.record_history(self.config_gate(reads))
@@ -123,8 +127,8 @@ class AffectedModulesTests(unittest.TestCase):
         self.assertIn("unreadable read history", result.reason)
         self.write("config/limits.conf", "value=one\n")
         (self.repo / "scripts/checks/test_new.py").unlink()
-        with mock.patch.object(affected, "latest_module_reads", side_effect=AssertionError("No config changed")):
-            _ = affected.select_affected(self.repo, self.base, self.modules[:-1], set())
+        clean = affected.select_affected(self.repo, self.base, self.modules[:-1], set())
+        self.assertEqual(clean, affected.AffectedSelection(self.base, (), ()))
 
     def test_config_selection_skips_a_newer_full_gate_without_config_records(self) -> None:
         self.write("config/limits.conf", "value=one\n")
@@ -409,12 +413,14 @@ class AffectedModulesTests(unittest.TestCase):
         unrecorded = {**full, "id": "no-reads", "started_at": "6", "modules": [template]}
         runs = (newest, contents, subset, config, unrecorded, folders, aborted)
         self.record_history(*runs)
+        published = affected.latest_module_reads()
+        gate_record.latest_module_reads_path("natedev").unlink()
 
         expected: dict[str, dict[gate_record.ReadField, list[str]]] = {}
         with closing(sqlite3.connect(":memory:")) as connection:
             index.create_schema(connection)
             for run in runs:
-                index.add_gate_run(connection, run, "fixture")
+                index.add_gate_run(connection, {**run, "host": "natedev"}, "natedev/2026-11.jsonl")
             for field in gate_record.READ_FIELDS:
                 newest_id = cast(tuple[str], connection.execute(f"""
                     SELECT module.run_id FROM gate_modules AS module
@@ -429,20 +435,72 @@ class AffectedModulesTests(unittest.TestCase):
                     fields = expected.setdefault(f"scripts/{suite}/{module}", {})
                     if values is not None:
                         fields.setdefault(field, []).extend(cast(list[str], json.loads(values)))
-        self.assertEqual(affected.latest_module_reads(), {
-            name: gate_record.module_read_record(fields.get("config_reads"),
-                fields.get("folder_scans"), fields.get("content_reads"))
-            for name, fields in expected.items()
-        })
+            gate_record.seed_latest_module_reads(connection)
+        oracle = {name: gate_record.module_read_record(fields.get("config_reads"),
+                  fields.get("folder_scans"), fields.get("content_reads")) for name, fields in expected.items()}
+        self.assertEqual(published, oracle)
+        self.assertEqual(affected.latest_module_reads(), oracle)
 
-    def test_missing_or_corrupt_latest_reads_match_empty_history(self) -> None:
-        relative = ".git/buildlog/" + gate_record.LATEST_MODULE_READS_NAME
-        (self.repo / relative).unlink()
-        self.assertEqual(affected.latest_module_reads(), {})
-        for contents in ("{", "[]", '{"folder_scans":{"started_at":"1","run_id":"x","modules":{"test":4}}}'):
-            with self.subTest(contents=contents):
-                self.write(relative, contents)
-                self.assertEqual(affected.latest_module_reads(), {})
+    def test_missing_empty_or_corrupt_local_snapshot_requests_every_module(self) -> None:
+        self.add_test("checks/test_dynamic.py", "VALUE = 1\n")
+        self.certify()
+        self.record_history(self.config_gate({}), host="Mac")
+        self.write("docs/guide.md", "changed\n")
+        local_path = gate_record.latest_module_reads_path("natedev")
+        found = [(path.parent.name, path) for path in self.modules]
+        expected = {path.relative_to(self.repo).as_posix() for path in self.modules}
+        cloud_result = gate.GateRun((), 0.0, 0.0)
+        for label, contents in (("missing", None), ("blank", ""), ("empty", "{}"),
+                                ("invalid JSON", "{"), ("invalid field", '{"config_reads":4}')):
+            with self.subTest(case=label):
+                if contents is None:
+                    local_path.unlink()
+                else:
+                    _ = local_path.write_text(contents)
+                self.assertEqual(affected.select_affected(self.repo, self.base, self.modules, {"docs/guide.md"}),
+                                 affected.FullSuite("local module read snapshot unavailable"))
+                with (mock.patch.object(gate, "discover_test_modules", return_value=found),
+                      mock.patch.object(gate.PassedTreeLedger, "certified_base", return_value=self.base),
+                      mock.patch.object(gate.PassedTreeLedger, "reuse", return_value=False),
+                      mock.patch.object(mac_gate_process, "load_mac_gate_route",
+                                        side_effect=ModuleNotFoundError(name=mac_gate_process.MAC_GATE_MODULE)),
+                      mock.patch.object(cloud_gate, "working_tree", return_value=("tree", {"docs/guide.md"})),
+                      mock.patch.object(cloud_gate, "route", return_value=cloud_result) as route,
+                      redirect_stdout(io.StringIO())):
+                    self.assertEqual(gate.run_gate_suites(self.repo, mode=gate.SuiteMode.TARGETED), cloud_result)
+                selection = cast(gate.TreeSelection, route.call_args.kwargs["selected"])
+                self.assertEqual(set(selection.paths), expected)
+
+    def test_mac_snapshot_adds_a_module_to_natedev_selection(self) -> None:
+        self.add_test("checks/test_local.py", "VALUE = 1\n")
+        self.add_test("checks/test_mac.py", "VALUE = 1\n")
+        self.certify()
+        self.record_configs({"test_local.py": ["limits"], "test_mac.py": ["tools"]})
+        self.write("config/limits.conf", "value=one\n")
+        self.assertEqual({path.name for path in self.selection().modules}, {"test_local.py"})
+
+        self.record_history(self.config_gate({"test_mac.py": ["limits"]}), host="Mac")
+        self.assertEqual({path.name for path in self.selection().modules}, {"test_local.py", "test_mac.py"})
+        reads = affected.latest_module_reads()
+        assert isinstance(reads, dict)
+        self.assertEqual(reads["scripts/checks/test_mac.py"], gate_record.module_read_record(["limits", "tools"], None, None))
+
+    def test_corrupt_or_missing_mac_snapshot_is_skipped(self) -> None:
+        self.add_test("checks/test_local.py", "VALUE = 1\n")
+        self.certify()
+        self.record_configs({"test_local.py": ["limits"]})
+        self.write("config/limits.conf", "value=one\n")
+        self.write(".git/buildlog/Mac/2026-11.jsonl", "")
+        peer = gate_record.latest_module_reads_path("Mac")
+        for label, contents in (("missing", None), ("corrupt", "{")):
+            with self.subTest(case=label):
+                if contents is not None:
+                    _ = peer.write_text(contents)
+                stderr = io.StringIO()
+                with redirect_stderr(stderr):
+                    self.assertEqual({path.name for path in self.selection().modules}, {"test_local.py"})
+                line, = stderr.getvalue().splitlines()
+                self.assertIn(str(peer), line)
 
     def test_landing_bases_exclude_changes_that_already_passed_the_gate(self) -> None:
         self.write("scripts/landed/subject.py", "VALUE = 1\n")
