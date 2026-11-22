@@ -2438,17 +2438,21 @@ class RemoteHostUnreachable(CopyError):
 
 
 def remove_remote_mirror(mirror: RemoteMirror) -> None:
+    from scripts.mac_test import eligibility, offload
+
     command = remote_copies_command("mirror-remove", mirror, "--host", mirror.host)
     command += '; copies_status=$?; printf "\\nrc=%s\\n" "$copies_status"; exit "$copies_status"'
+    settings = eligibility.SshProbeSettings(conf.read("mac_test"))
     try:
-        answer = subprocess.run(["ssh", "-o", "BatchMode=yes", mirror.host, command],
-                                capture_output=True, text=True, timeout=load_config().git_timeout_seconds)
+        answer = subprocess.run(["ssh", *offload.ssh_options(settings), mirror.host, command],
+                                capture_output=True, text=True)
     except subprocess.TimeoutExpired as error:
         raise RemoteHostUnreachable(f"{mirror.host}:{mirror.path}: {error}") from error
     if answer.returncode:
         failure = (RemoteHostUnreachable if answer.returncode == 255 and any(
             text in answer.stderr.lower() for text in (
                 "ssh: connect to host ", "ssh: connect to address ", "ssh: could not resolve hostname ",
+                "timeout, server ",
             )) else CopyError)
         raise failure(f"{mirror.host}:{mirror.path}: {failure_detail(answer)}")
     status = next((line for line in reversed(answer.stdout.splitlines()) if line.startswith("rc=")), "")

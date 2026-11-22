@@ -2290,7 +2290,7 @@ def fetch_folder(
             + "printf 'fetch_kib=%s\\nrc=0\\n' \"${size%%[[:space:]]*}\"; else exit 1; fi; "
             + "else printf 'fetch=missing\\nrc=0\\n'; fi"
         )
-        size = controller.capture([*ssh_prefix(config), size_command], CommandTimeLimit(config.probe_timeout_s))
+        size = controller.capture([*ssh_prefix(config), size_command])
         if not isinstance(size, CommandOutput) or size.status != 0:
             return FetchFailed("the Mac folder size could not be read")
         if size.stdout.strip() == "fetch=missing\nrc=0":

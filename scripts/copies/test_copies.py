@@ -29,6 +29,7 @@ from scripts.copies.test_remote_copies import expected_remote_lease_columns
 from scripts.accounts import accounts
 from scripts.lib import build_folders, copy_record, nix_env, process_start, scratch, session_folder
 from scripts.lib.build_slots_test_support import private_slot_config
+from scripts.lib.checkout_test_support import write_stdlib_tool
 from scripts.lint import folder_audit, tmp_sweep
 from scripts.lint.memory_test_support import ADMISSION_CONFIG_FIXTURE, write_config_fixture
 from textwrap import dedent
@@ -1233,6 +1234,47 @@ with patch.object(subprocess, 'run', pause_clone):
             self.assertEqual(projects[key + "/child"], {"hasTrustDialogAccepted": True})
             self.assertIn("/other", projects)
             self.assertIn(str(self.source.resolve()), projects)
+
+    def test_deferred_mirror_removal_allows_slow_ssh_and_keeps_stalled_mirrors(self) -> None:
+        self.write_config({**self.settings, "git_timeout_seconds": "0.25"})
+        config = Path(os.environ["CONF_DIR"]) / "mac_test.conf"
+        _ = write_config_fixture(config, "connect_timeout_s=7\n")
+        tools = self.base / "tools"
+        tools.mkdir()
+        write_stdlib_tool(tools / "ssh", r"""
+import os
+import select
+import sys
+
+arguments = sys.argv[1:-2]
+if "copies.py mirror-remove " not in sys.argv[-1]:
+    raise SystemExit("expected mirror removal")
+if os.environ["MIRROR_TRANSPORT"] == "stalled":
+    if {"ServerAliveInterval=15", "ServerAliveCountMax=3"}.issubset(arguments):
+        print("Timeout, server fixture.invalid not responding.", file=sys.stderr)
+        raise SystemExit(255)
+else:
+    select.select([], [], [], 0.7)
+print("rc=0")
+""")
+        repository = copies.SelectedRepository(self.source.name)
+        mirror = copies.RemoteMirror(self.owner_id, repository, "fixture.invalid", "mirror/old", "prior")
+        active = copies.RemoteMirror(self.owner_id, repository, mirror.host, "mirror/active", "current")
+        for transport in ("slow", "stalled"):
+            with self.subTest(transport=transport), mock.patch.dict(os.environ, {
+                "PATH": str(tools) + os.pathsep + os.environ["PATH"], "MIRROR_TRANSPORT": transport,
+            }):
+                copies.register_remote(mirror)
+                copies.defer_remote_removal(mirror)
+                error = io.StringIO()
+                with redirect_stderr(error):
+                    copies.register_remote(active)
+                if transport == "slow":
+                    self.assertEqual(copies.owned_remote_mirrors(self.owner_id), [active], error.getvalue())
+                else:
+                    saved = copies.read_remote_mirror(copies.remote_record_path(mirror))
+                    self.assertEqual(saved.removal, copies.RemoteRemoval.DEFERRED)
+                    self.assertIn("Timeout, server fixture.invalid not responding.", error.getvalue())
 
     def test_mirror_receiver_names_the_check_that_refused_it(self) -> None:
         tree = self.base / "mirrors" / "hana"

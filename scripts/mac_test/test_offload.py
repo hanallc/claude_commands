@@ -1090,6 +1090,54 @@ select.select([], [], [], 2)
         detail = "copy: ssh: timed out" if stamp else "copy: rsync: I/O timeout"
         self.assertEqual(controller.copy_failure_detail, detail)
 
+    def test_fetch_allows_a_slow_size_scan_and_fails_on_lost_ssh(self) -> None:
+        self.config.update({"connect_timeout_s": "7", "probe_timeout_s": "0.25"})
+        self.sync_config()
+        for program, source in (
+            ("ssh", r"""
+import os
+import select
+import sys
+
+if "du -sk output" not in sys.argv[-1]:
+    raise SystemExit("expected a folder size scan")
+if os.environ["FETCH_TRANSPORT"] == "stalled":
+    if {"ServerAliveInterval=15", "ServerAliveCountMax=3"}.issubset(sys.argv[1:-2]):
+        print("Timeout, server not responding.", file=sys.stderr)
+        raise SystemExit(255)
+else:
+    select.select([], [], [], 0.7)
+print("fetch_kib=12\nrc=0")
+"""),
+            ("rsync", """
+from pathlib import Path
+import sys
+
+(Path(sys.argv[-1]) / "report.txt").write_text("report")
+"""),
+        ):
+            executable = self.bin_directory / program
+            executable.unlink()
+            write_stdlib_tool(executable, source)
+        for transport in ("slow", "stalled"):
+            with self.subTest(transport=transport), mock.patch.dict(
+                os.environ, {**self.environment, "FETCH_TRANSPORT": transport}, clear=True,
+            ):
+                config = eligibility.read_config(self.config_path)
+                request = offload.OffloadRequest(
+                    self.repository, "hana", transport, offload.NO_RESULT_FILE, (), owner="verify",
+                    holder_session="fixture", fetch=offload.FetchFolder("output"),
+                )
+                destination = self.state_directory / "fetched" / transport
+                result = offload.fetch_folder(offload.ProcessController(), config, request, HANA)
+                if transport == "slow":
+                    folder = destination / "output"
+                    self.assertEqual(result, offload.Fetched(folder, 12))
+                    self.assertEqual((folder / "report.txt").read_text(), "report")
+                else:
+                    self.assertEqual(result, offload.FetchFailed("the Mac folder size could not be read"))
+                    self.assertEqual(list(destination.parent.glob(f"{transport}*")), [])
+
     def test_waiter_hands_relative_path_claim_to_runner_for_cleanup_only(self) -> None:
         assignment = self.assignment_options(self.repository, "nextest", self.config_path, ())
         retained = self.write_kept_claim()

@@ -112,9 +112,9 @@ if (( ${@[(Ie)ConnectTimeout=7]} && ${@[(Ie)ServerAliveInterval=15]} && ${@[(Ie)
     keepalive=1
 fi
 case "$MAC_RUN_STALL:$command:$remote" in
-    probe:ssh:true|head:ssh:*'rev-parse HEAD'|stop:ssh:*' stop-checkout '*)
+    probe:ssh:true|head:ssh:*'rev-parse HEAD')
         sleep 0.85 ;;
-    bundle:scp:*|clone:ssh:*'copies.py clone '*|cleanup:ssh:*'scratch.py end '*)
+    bundle:scp:*|clone:ssh:*'copies.py clone '*|stop:ssh:*' stop-checkout '*|cleanup:ssh:*'scratch.py end '*)
         if (( keepalive )); then
             sleep 0.1
             exit 255
@@ -122,7 +122,7 @@ case "$MAC_RUN_STALL:$command:$remote" in
         sleep 0.85 ;;
 esac
 case "$MAC_RUN_SLOW:$command:$remote" in
-    1:ssh:*'copies.py clone '*|1:ssh:*'scratch.py end '*)
+    1:ssh:*'copies.py clone '*|1:ssh:*' stop-checkout '*|1:ssh:*'scratch.py end '*)
         (( keepalive )) || exit 90
         sleep 0.85 ;;
 esac
@@ -749,13 +749,18 @@ class MacRunTests(unittest.TestCase):
                     self.assertIn("ConnectTimeout=7", event["args"])
                     self.assertIn("ServerAliveInterval=15", event["args"])
                     self.assertIn("ServerAliveCountMax=3", event["args"])
+                if stage == "stop":
+                    self.assertIn("process exit not confirmed", result.stderr)
+                    self.assertFalse(any("scratch.py end " in event["args"][-1] for event in remote))
 
-    def test_slow_clone_and_folder_removal_finish(self) -> None:
+    def test_slow_clone_stop_and_folder_removal_finish(self) -> None:
         _ = write_config_fixture(self.config_path, "connect_timeout_s=7\nprobe_timeout_s=0.25\n")
+        _ = write_config_fixture(self.config_path.parent / "mac_gate.conf", "terminate_grace_seconds=0.25\n")
         result = self.mac_run(extra={"MAC_RUN_SLOW": "1"}, timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         remote = [event["args"][-1] for event in self.events() if event["command"] == "ssh"]
         self.assertTrue(any("copies.py clone " in command for command in remote), remote)
+        self.assertTrue(any("hana_instances.py stop-checkout " in command for command in remote), remote)
         self.assertTrue(any("scratch.py end " in command for command in remote), remote)
         self.assert_claim_released()
 
