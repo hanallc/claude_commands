@@ -215,8 +215,6 @@ class TidyWrappedTests(unittest.TestCase):
         receipt = review_submissions.image_folder(original).parent / "receipt.json"
         journal = receipt.with_name("move.json")
         stop_before_receipt = change != "destination reply"
-        if change == "destination read":
-            self.assertTrue(review_submissions.answer(original.key, "Reply before wrap", original.reply_token))
         _ = self.write(doc, doc.read_text().replace("— running.**", "— wrapped.**"))
         root = self.root / "review"
         status = change_page.DeliveryStatus(root)
@@ -235,6 +233,9 @@ class TidyWrappedTests(unittest.TestCase):
 
         with mock.patch.object(change_page, "send_to_staff") as send:
             change_page.deliver(review_actions.prepare_submission_delivery(original, request.words, status), status)
+            if change == "destination read":
+                # The answer follows the delivery that carried its reply token.
+                self.assertTrue(review_submissions.answer(original.key, "Reply before wrap", original.reply_token))
             with (mock.patch.object(tidy_wrapped, "STATE_DIR", self.state),
                   mock.patch.object(Path, "unlink", autospec=True, side_effect=stop_at_source),
                   mock.patch.object(atomic_file, "write_text_atomic", side_effect=stop_at_receipt),
