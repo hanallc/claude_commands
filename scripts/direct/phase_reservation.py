@@ -454,18 +454,23 @@ def _require_model_worktree(root: Path, owner_unit: str) -> None:
         raise StateRefused(f"{root}: {error}. {fix}") from error
 
 
-def _record_baselines(directory: Path, root: Path) -> None:
-    """Keep the first launch's commit and status while the caller holds the phase lock."""
+def _validate_retained_baseline(directory: Path, root: Path) -> bool:
+    """Return True if the retained baseline exists and names a commit in the checkout."""
     baseline = directory / BASELINE_FILE
     legacy_baseline = directory.parent.parent / BASELINE_FILE
     if legacy_baseline.is_file() and _read_located_phase_state(directory).directory == legacy_baseline.parent:
         baseline = legacy_baseline
-    if baseline.exists():
-        try:
-            _ = commit_id(root, baseline.read_text().strip())
-        except StateRefused as refused:
-            raise StateRefused(f"phase baseline {baseline} is not a commit in {root}: {refused}") from refused
-        return
+    if not baseline.exists():
+        return False
+    try:
+        _ = commit_id(root, baseline.read_text().strip())
+    except StateRefused as refused:
+        raise StateRefused(f"phase baseline {baseline} is not a commit in {root}: {refused}") from refused
+    return True
+
+
+def _write_fresh_baselines(directory: Path, root: Path) -> None:
+    """Record the first commit and status after the caller publishes the checkout."""
     head = commit_id(root, "HEAD")
     status = subprocess.run(["git", "-C", str(root), "status", "--short"], capture_output=True,
                             text=True, check=False, stdin=subprocess.DEVNULL)
@@ -473,7 +478,7 @@ def _record_baselines(directory: Path, root: Path) -> None:
         raise StateRefused(f"git status --short failed in {root}: {status.stderr.strip()}")
     # Publish the commit last. The next claim retries both writes if the first claim stops early.
     write_text_atomic(directory / BASELINE_STATUS_FILE, status.stdout)
-    write_text_atomic(baseline, head + "\n")
+    write_text_atomic(directory / BASELINE_FILE, head + "\n")
 
 
 def _has_recorded_checkout(directory: Path) -> bool:
@@ -553,11 +558,13 @@ def _record_claim_checkout(directory: Path, requested: Path | None, *, repo_argu
         _require_model_worktree(root, home.unit)
     if replacing:
         _require_checkout_move(directory)
-    _record_baselines(directory, root)
+    has_retained_baseline = _validate_retained_baseline(directory, root)
     if is_home:
         (directory / WORKTREE_FILE).unlink(missing_ok=True)
     else:
         write_text_atomic(directory / WORKTREE_FILE, str(root) + "\n")
+    if not has_retained_baseline:
+        _write_fresh_baselines(directory, root)
     return root
 
 

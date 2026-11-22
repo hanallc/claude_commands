@@ -626,8 +626,55 @@ class WorktreeAttributionTests(unittest.TestCase):
         self.assertFalse((directory / phase_reservation.WORKTREE_FILE).exists())
         self.assertEqual({name: (directory / name).read_bytes() for name in before}, before)
 
-    def test_claim_retries_after_interruption_between_baseline_writes(self) -> None:
+    @staticmethod
+    def interrupt_worktree_write(path: Path, content: str) -> None:
+        if path.name == phase_reservation.WORKTREE_FILE:
+            raise OSError("interrupted worktree publication")
+        atomic_file.write_text_atomic(path, content)
+
+    def test_claim_retries_a_replacement_after_the_worktree_write_fails(self) -> None:
+        clone = self.session.parent / "phase-2-clone"
+        self.record_clone("2", clone)
+        directory = phase_reservation.phase_directory(self.session, "2")
+        worktree_file = directory / phase_reservation.WORKTREE_FILE
+        baseline = directory / phase_reservation.BASELINE_FILE
+        status = directory / phase_reservation.BASELINE_STATUS_FILE
+        _ = (self.second / "replacement.txt").write_text("replacement checkout\n")
+
+        with mock.patch.object(phase_reservation, "write_text_atomic", self.interrupt_worktree_write):
+            code, errors = self.claim("2", self.second)
+
+        self.assertEqual(code, 2)
+        self.assertIn("interrupted worktree publication", errors)
+        self.assertEqual(worktree_file.read_text(), str(clone) + "\n")
+        self.assertFalse(baseline.exists())
+        self.assertFalse(status.exists())
+        self.assertEqual(self.claim("2", self.second), (0, ""))
+        self.assertEqual(worktree_file.read_text(), str(self.second) + "\n")
+        self.assertEqual(baseline.read_text(), phase_reservation.commit_id(self.second, "HEAD") + "\n")
+        self.assertEqual(status.read_text(), "?? replacement.txt\n")
+
+    def test_claim_retries_a_first_model_checkout_after_the_worktree_write_fails(self) -> None:
         directory = phase_reservation.phase_directory(self.session, "1")
+        _ = phase_reservation.enroll(directory, "1", "unconfigured")
+        worktree_file = directory / phase_reservation.WORKTREE_FILE
+        baseline = directory / phase_reservation.BASELINE_FILE
+        status = directory / phase_reservation.BASELINE_STATUS_FILE
+
+        with mock.patch.object(phase_reservation, "write_text_atomic", self.interrupt_worktree_write):
+            code, errors = self.claim("1", self.second)
+
+        self.assertEqual(code, 2)
+        self.assertIn("interrupted worktree publication", errors)
+        self.assertFalse(worktree_file.exists())
+        self.assertFalse(baseline.exists())
+        self.assertFalse(status.exists())
+        self.assertEqual(self.claim("1", self.second), (0, ""))
+        self.assertEqual(worktree_file.read_text(), str(self.second) + "\n")
+        self.assertEqual(baseline.read_text(), phase_reservation.commit_id(self.second, "HEAD") + "\n")
+        self.assertEqual(status.read_text(), "")
+
+    def test_claim_retries_after_interruption_between_baseline_writes(self) -> None:
         publish = atomic_file.write_text_atomic
 
         def interrupt(path: Path, content: str) -> None:
@@ -635,17 +682,25 @@ class WorktreeAttributionTests(unittest.TestCase):
                 raise OSError("interrupted before commit publication")
             publish(path, content)
 
-        _ = (self.first / "before.txt").write_text("interrupted launch\n")
-        with mock.patch.object(phase_reservation, "write_text_atomic", interrupt):
-            code, errors = self.claim("1", self.first)
-        self.assertEqual(code, 2)
-        self.assertIn("interrupted", errors)
-        self.assertFalse((directory / phase_reservation.BASELINE_FILE).exists())
-        (self.first / "before.txt").unlink()
-        self.assertEqual(self.claim("1", self.first), (0, ""))
-        self.assertEqual((directory / phase_reservation.BASELINE_FILE).read_text(),
-                         phase_reservation.commit_id(self.first, "HEAD") + "\n")
-        self.assertEqual((directory / phase_reservation.BASELINE_STATUS_FILE).read_text(), "")
+        for phase, checkout in (("1", self.first), ("2", self.second)):
+            with self.subTest(checkout=checkout):
+                directory = phase_reservation.phase_directory(self.session, phase)
+                _ = (checkout / "before.txt").write_text("interrupted launch\n")
+                with mock.patch.object(phase_reservation, "write_text_atomic", interrupt):
+                    code, errors = self.claim(phase, checkout)
+                self.assertEqual(code, 2)
+                self.assertIn("interrupted", errors)
+                self.assertFalse((directory / phase_reservation.BASELINE_FILE).exists())
+                if checkout == self.second:
+                    self.assertEqual((directory / phase_reservation.WORKTREE_FILE).read_text(), str(checkout) + "\n")
+                (checkout / "before.txt").unlink()
+                retry_path = f"retry-{phase}.txt"
+                _ = (checkout / retry_path).write_text("retry\n")
+
+                self.assertEqual(self.claim(phase, self.first), (0, ""))
+                self.assertEqual((directory / phase_reservation.BASELINE_FILE).read_text(),
+                                 phase_reservation.commit_id(checkout, "HEAD") + "\n")
+                self.assertEqual((directory / phase_reservation.BASELINE_STATUS_FILE).read_text(), f"?? {retry_path}\n")
 
     def test_same_file_in_linked_worktrees_belongs_to_each_worktrees_phase(self) -> None:
         for root in (self.first, self.second):
