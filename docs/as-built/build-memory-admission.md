@@ -1813,16 +1813,15 @@ The server determines the caller from the reservation's session ID and the curre
 1. The feed publishes an opaque reference for each eligible reservation.
 2. The console supplies a handle when it can verify the current PID, start identity, staff recipient, and stop route.
 3. The server reads the reservation and process evidence again when the operator confirms.
-4. The server saves a private action record with the notice before it requests the stop.
-5. The shared stop helper signals the confirmed Cargo scope members through pidfds.
-6. The server uses the detached stop record when the supervisor supports a verified stop.
-7. The holder or supervisor follows its usual cleanup path.
-8. The server saves a TERM receipt when the stop route returns success.
-9. The server checks the Cargo scope or the detached run's saved scope tree.
-10. The server sends the notice after it confirms the scope is empty.
+4. The server saves the notice and the verified scope identity before it requests the stop.
+5. The shared stop helper signals the saved scope.
+6. The server saves a TERM receipt when the helper confirms that it sent TERM.
+7. The server confirms the scope tree is empty through the shared stop helper.
+8. The server sends the notice after it saves both confirmations.
 
-Cargo Kill requires the shared pinned Cargo scope API.
-Detached Kill requires the phase 44fh launch scope and verified stop API.
+Cargo Kill uses the scope identity that the shared stop helper reads from the Cargo process.
+Detached Kill uses the scope identity that the supervisor records at launch.
+Both routes require a shared helper that returns an explicit TERM receipt.
 Verify only creates scopes per step, so the console leaves Kill off for Verify.
 The server offers Cargo Kill only when the verified scope contains the known Cargo descendants.
 A restart before the TERM receipt shows **Kill not sent; try again**.
