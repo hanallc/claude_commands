@@ -425,7 +425,17 @@ It collects recovery diagnostics and emits them only after a successful read.
 Estimates receive the cargo peak and history factors from that configuration.
 A recovered setting remains usable and produces one warning per process.
 An unavailable setting stops grants.
-If no source change is pending, the service returns a refusal that names the file and key.
+The following paths check the watched sources before they can return a refusal for an unusable configuration.
+
+1. An admission pass checks before it can refuse admission waiters or Verify run slot waiters.
+   A `ServiceEstimateRequest` runs that pass before it can return the configuration refusal.
+2. A `VerifyRunSlotRequest` checks before it processes the request and any Verify run slot waiters.
+3. `ViewRequest`, `ExplainRequest`, and `MineRequest` use the check in a pending pass.
+   With no pending pass, they check the sources before returning a cached configuration refusal.
+4. The request size limit path checks before it can refuse an oversized request with the configuration error.
+   That path uses the configuration error only before the first usable configuration read.
+
+A configuration refusal reports the configuration read error.
 The service listens during a refusal and watches the nearest existing configuration directory.
 `scripts.lib.inotify` reports directory replacement, permission repairs, completed writes, and overflow events.
 Each relevant event re-arms the watch before a configuration read; no stamp filter discards repairs.
@@ -1025,9 +1035,9 @@ It sends `READY=1` after listener setup.
 The main loop clears the outage claim once after `silence_seconds` of continuous operation.
 It uses the last usable configuration and retries a failed clear on a later loop.
 A shorter service start preserves the claim.
-Scheduled source checks start after the first usable configuration read.
-The service checks the watched sources before it returns an unusable configuration error.
-If a source change is pending, the service saves its state and reloads immediately without refusing waiters.
+As before, a service that starts with an unusable configuration has no scheduled source check until it reads a usable configuration.
+The first deployment must load the new service code before the reload guard can apply.
+If a check before a configuration refusal finds a pending source change, the service saves its state and stops for immediate reload.
 After the reload decision, the service sends no replies and writes no more queue state.
 Clients can retry unacknowledged priority changes after the service restarts.
 The journal gives the unusable configuration as the reason for skipping the settle interval.
