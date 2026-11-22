@@ -599,7 +599,7 @@ def build_limits(reading: records.QueueRead, snapshots: target_availability.Snap
 
     def row(origin: str) -> RepositoryRow:
         if origin not in rows:
-            rows[origin] = RepositoryRow(origin_name(origin))
+            rows[origin] = RepositoryRow(origin_name(origin) or "Repository not recorded")
         return rows[origin]
 
     def known_origin(name: str) -> str:
@@ -641,26 +641,39 @@ def build_limits(reading: records.QueueRead, snapshots: target_availability.Snap
         else:
             cell.runs.append(label)
 
+    mac_placements: dict[str, list[tuple[queue_view.MacBuild, str]]] = {}
+    for build, label in mac_runs:
+        if build.gate_label is queue_view.MacGateLabel.PLACEMENT and build.gate_placement:
+            mac_placements.setdefault(build.gate_placement, []).append((build, label))
+
     for claim in mac_claims:
         record = claim.record
-        active = mac_test.run_holds_work(record)
         kept = mac_test.run_is_kept(record)
-        if not active and not kept:
+        if not kept and not mac_test.run_is_live(record):
             continue
-        claimed.add(f'{record["episode"]}/{record["attempt"]}')
+        key = f'{record["episode"]}/{record["attempt"]}'
+        claimed.add(key)
+        matching = mac_placements.get(key, ())
         if isinstance(claim.scope, claim_state.WholeMacScope):
             whole_mac = True
+            for build, label in matching:
+                project = origins.resolve("", build.folder) or known_origin(build.repository)
+                row(project).mac.runs.append(label)
+                repositories_with_claims.add(project)
             continue
         project = origins.resolve(claim.scope.key, record["worktree"])
-        if not project:
+        if not project and matching:
+            project = known_origin(claim.scope.name)
+        if not project and not matching:
             continue
         cell = row(project).mac
         cell.used = (cell.used or 0) + 1
         repositories_with_claims.add(project)
-        if active:
-            cell.runs.append(claim_name(record, names))
-        else:
+        if kept:
+            cell.runs.extend(label for _, label in matching)
             cell.note = "Claim held for cleanup"
+        else:
+            cell.runs.append(claim_name(record, names))
     for build, label in mac_runs:
         matched = build.gate_label is queue_view.MacGateLabel.PLACEMENT and build.gate_placement in claimed
         if not matched and (origin := known_origin(build.repository)):

@@ -266,6 +266,20 @@ class BuildLimitsTests(unittest.TestCase):
                 mac_runs = tuple(zip(activity.builds, ("matching run", "other attempt"), strict=True))
                 result = limits_view.build_limits(current, (mac, hana), names, memory, folders,
                                                   stale_saved, UTC, mac_runs, disk_free / records.GIB)
+                kept: claim_state.RemoteJobClaim = {
+                    **claim, "pid": 8, "proc_start": "ends", "remote_host": "fixture-mac",
+                }
+                for scope, note in ((held.scope, "Claim held for cleanup"),
+                                    (claim_state.WHOLE_MAC, "Whole Mac claimed")):
+                    with self.subTest(scope=scope):
+                        retained = replace(mac, claims=(replace(held, scope=scope, record=kept),))
+                        retained_limits = limits_view.build_limits(current, (retained, hana), names, memory,
+                                                                  folders, saved, UTC, mac_runs)
+                        mac_cell = next(row.mac for row in retained_limits.repositories if row.name == "workspace")
+                        self.assertEqual((mac_cell.used, mac_cell.limit), (1, 1))
+                        self.assertEqual(mac_cell.runs, ["matching run"])
+                        self.assertEqual(mac_cell.other, ["other attempt"])
+                        self.assertEqual(mac_cell.note, note)
                 unreadable = replace(mac, states=(targets.StateUnreadable("Cannot read fixture claims"),), claims=())
                 claim_status = limits_view.build_limits(current, (unreadable, hana), names, memory,
                                                        folders, saved, UTC, mac_runs)
