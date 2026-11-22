@@ -38,7 +38,7 @@ from scripts.message import session_send
 from scripts.production import staff
 from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, isolated_staff_file
 from scripts.buildlog import record, store
-from scripts.build_targets.test_targets import END, NOW, SINCE, IsolatedTargetTest
+from scripts.build_targets.test_targets import END, NOW, SINCE, IsolatedTargetTest, fixture_mac_mirror
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
 from scripts.lib import test_hang_guard
 
@@ -818,6 +818,12 @@ class StepKindEligibilityTests(IsolatedBuildTargetTest):
             _ = (member / "Cargo.toml").write_text(f'[package]\nname="{name}"\nversion="0.1.0"\n')
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"CONF_DIR": str(Path(config).parent)})))
         _ = self.enterContext(mock.patch.object(eligibility, "repository_identity", return_value=eligibility.KnownRepository("hana")))
+        mirror = fixture_mac_mirror(self.root, "hana", "https://fixture.invalid/hana")
+
+        def mac_repository(worktree: str) -> claim_state.ResolvedMacMirror | claim_state.WholeMacScope:
+            return mirror if Path(worktree) == self.root else claim_state.WHOLE_MAC
+
+        _ = self.enterContext(mock.patch.object(claim_state, "mac_repository_identity", side_effect=mac_repository))
 
     def kind_output(self, kind: str, package: str = "", free_gib: float = 60) -> str:
         output = io.StringIO()
@@ -961,7 +967,8 @@ class StepKindEligibilityTests(IsolatedBuildTargetTest):
         )
         for repo, kind, selection, expected in cases:
             with self.subTest(repo=repo, kind=kind, selection=selection), mock.patch.object(
-                eligibility, "repository_identity", return_value=eligibility.KnownRepository(repo),
+                claim_state, "mac_repository_identity",
+                return_value=fixture_mac_mirror(self.root, repo, f"https://fixture.invalid/{repo}"),
             ):
                 constraints = build_targets.fixed_placement_constraints(
                     self.root, "portable", kind, ("cargo", kind), NoOwningSession(), "fixed-source",

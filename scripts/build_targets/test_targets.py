@@ -39,6 +39,13 @@ NOW = datetime(2026, 10, 11, 21, 0, tzinfo=timezone.utc)
 SINCE = datetime(2026, 10, 11, 20, 5, tzinfo=timezone.utc)
 END = datetime(2026, 10, 11, 22, 5, tzinfo=timezone.utc)
 
+
+def fixture_mac_mirror(worktree: Path, repository: str, key: str) -> claim_state.ResolvedMacMirror:
+    """Give routing tests a mirror identity without Git commands."""
+    fence = claim_state.mac_claim_stem(key, 0)
+    return claim_state.ResolvedMacMirror(key, repository, f"{fence}.json", fence, str(worktree))
+
+
 HoldRecord = TypedDict(
     "HoldRecord",
     {"holder": str, "since": str, "for": str, "release_eta": str},

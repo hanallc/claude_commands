@@ -21,7 +21,6 @@ from pathlib import Path
 from typing import ClassVar, Literal, NotRequired, TypedDict, cast, override
 
 from scripts.lib.py_floor_test_support import interpreter_cache_environment
-from scripts.lib import conf
 from scripts.lib import process_start as process_identity
 from scripts.copies.copies_test_support import copies_environment
 
@@ -425,13 +424,6 @@ class OffloadCommandFixture(unittest.TestCase):
             "BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": "",
             "PYTHONPYCACHEPREFIX": str(self.private_tools() / "bytecode"),
         }
-        # The copies test also uses its private slot settings for Mac claims.
-        copied_slots = Path(self.environment["COPIES_CONFIG"]).with_name("build_folders.conf")
-        mac_host = conf.read(self.root / "machines.conf").words("mac.hosts")[0]
-        mac_limit = f"slots.{mac_host}.default_max"
-        if mac_limit not in conf.read(copied_slots).values():
-            with copied_slots.open("a", encoding="utf-8") as stream:
-                _ = stream.write(f"\n# whole: 1..\n{mac_limit}=1\n")
         _ = self.environment.pop("PYTHONDONTWRITEBYTECODE", None)
         self.start_admission()
 

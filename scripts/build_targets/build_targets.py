@@ -922,6 +922,7 @@ def wait_claim_identity(paths: mac_test.StatePaths, repo_root: str, pid: int, *,
                         session: SubmittingSession | claim_state.CallingSession = claim_state.CALLING_SESSION,
                         expected: claim_state.ClaimIdentity | claim_state.NoClaimIdentity = claim_state.NO_CLAIM_IDENTITY,
                         mac_scope: claim_state.ClaimScope = claim_state.WHOLE_MAC,
+                        cleanup_only: bool = False,
                         ) -> claim_state.ClaimIdentity | claim_state.NoClaimIdentity:
     """Find the exact reservation for this process and session."""
     from scripts.lib import process_start as process_identity
@@ -939,6 +940,7 @@ def wait_claim_identity(paths: mac_test.StatePaths, repo_root: str, pid: int, *,
                   and "wait_released" not in claim.record
                   and claim.record["submitting_session"] == claim_state.session_id(session)
                   and ("remote_host" not in claim.record or claim.record.get("cleanup_pending"))
+                  and (not cleanup_only or claim.record.get("cleanup_pending"))
                   and (not claim.record.get("cleanup_pending") or claim_state.cleanup_scope_is_known(paths, claim))
                   and (isinstance(block, mac_test.NoMacBlock) or "remote_host" in claim.record)]
         if paths.platform == "macos":
@@ -1189,10 +1191,14 @@ def command_reserve(args: CliArguments) -> int:
         if not config.enabled:
             continue
         paths = mac_test.state_paths(target.name)
-        identity = wait_claim_identity(paths, args.repo_root, args.pid, session=session)
+        mac_in_backoff = (paths.platform == "macos"
+                          and isinstance(eligibility.read_backoff(time.time(), target.name), eligibility.ActiveBackoff))
+        identity = wait_claim_identity(paths, args.repo_root, args.pid, session=session, cleanup_only=mac_in_backoff)
         if paths.platform == "macos" and isinstance(identity, claim_state.ClaimIdentity):
             publish_wait_reservation(args, target, identity, session)
             return 0
+        if mac_in_backoff:
+            continue
         if isinstance(identity, claim_state.NoClaimIdentity):
             answer = mac_test.free_now(paths, target.settings, Path(args.repo_root), session=session)
             if answer not in ("free", "busy") and not (answer == "bad" and args.new_step):
