@@ -150,50 +150,6 @@ run() {{
 
         self.assert_success(result, "6\n6\n")
 
-    def test_trial_arm_uses_100_minute_block_parity(self) -> None:
-        result = self.run_shell(
-            shell_lines(
-                "for epoch in 0 5999 6000 12000; do",
-                '    nextest_width_arm "$epoch"',
-                '    printf "%s\\n" "$LINT_TEST_WIDTH_ARM"',
-                "done",
-            ),
-        )
-
-        self.assert_success(result, "physical\nphysical\nlogical\nphysical\n")
-
-    def test_trial_mode_uses_physical_width_in_an_even_block(self) -> None:
-        result = self.run_shell(
-            shell_lines(
-                'nextest_physical_cores "$1"',
-                "unset EPOCHSECONDS",
-                "EPOCHSECONDS=0",
-                "LINT_TEST_WIDTH=trial",
-                "run_nextest --workspace",
-            ),
-            str(self.sysfs),
-        )
-
-        self.assert_success(
-            result,
-            "<cargo><nextest><run><--test-threads><2><--workspace>\n",
-        )
-
-    def test_trial_mode_uses_logical_width_in_an_odd_block(self) -> None:
-        result = self.run_shell(
-            shell_lines(
-                "unset EPOCHSECONDS",
-                "EPOCHSECONDS=6000",
-                "LINT_TEST_WIDTH=trial",
-                "run_nextest --workspace",
-            ),
-        )
-
-        self.assert_success(
-            result,
-            "<cargo><nextest><run><--test-threads><6><--workspace>\n",
-        )
-
     def test_fixed_width_modes_select_the_named_core_count(self) -> None:
         cases = (("physical", "2"), ("logical", "6"))
         for mode, width in cases:

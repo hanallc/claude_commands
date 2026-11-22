@@ -620,12 +620,10 @@ verify_helper() {
     fi
     (
     [[ -z "${VERIFY_EXIT_STDERR_FD:-}" ]] || close_verify_exit_stderr
-    if [[ "${1:-}" == --stdin ]]; then
-        shift
-        set -- 1 "$@"
-    else
-        set -- 0 "$@"
-    fi
+    case "${1:-}" in
+        --stdin|--require-helper) ;;
+        *) set -- --normal "$@" ;;
+    esac
     if [[ -n "${VERIFY_HELPER_INPUT:-}" && -n "${VERIFY_HELPER_OUTPUT:-}" ]]; then
         if [[ "$2" == "${BUILDLOG_MEM_ADMIT_SCRIPT:-}" || "$2" == "${BUILDLOG_QUEUE_PLACE_SCRIPT:-}" ]]; then
             export VERIFY_HELPER_STDERR_PATH="/proc/${BASHPID:-$$}/fd/2"
@@ -647,10 +645,10 @@ verify_helper() {
             } < <(command env -0 && printf '\0')
         fi
     fi
-    local input="" has_input=$1 status output errors entry
+    local input="" helper_mode=$1 status output errors entry
     local forwarded=()
     shift
-    if [[ "$has_input" == 1 ]]; then
+    if [[ "$helper_mode" == --stdin ]]; then
         input="$(cat; printf '\001')"
         input="${input%$'\001'}"
     fi
@@ -690,11 +688,15 @@ verify_helper() {
             exec 72>&-
         fi
     fi
+    if [[ "$helper_mode" == --require-helper ]]; then
+        printf 'verify.sh: the Python helper could not run %s %s\n' "${1##*/}" "${2:-}" >&2
+        return 2
+    fi
     if [[ -n "${VERIFY_RESULT_ENVIRONMENT_FD:-}" && ${#forwarded[@]} -gt 0 ]]; then
         exec 73< <(printf '%s\0' "${forwarded[@]}")
         export VERIFY_RESULT_ENVIRONMENT_FD=73
     fi
-    if [[ "$has_input" == 1 ]]; then
+    if [[ "$helper_mode" == --stdin ]]; then
         printf '%s' "$input" | "$PY" "$@"
     else
         "$PY" "$@"
@@ -1572,6 +1574,31 @@ if [[ "${OSTYPE:-}" != darwin* && -z "${BUILDLOG_RUN+x}" ]]; then
         export BUILDLOG_RUN="$$:$BUILDLOG_RUN_START"
     fi
 fi
+
+VERIFY_RUN_SLOT_HELD=0
+admit_verify_run() {
+    [[ "${OSTYPE:-}" != darwin* && "$VERIFY_RUN_SLOT_HELD" == 0 ]] || return 0
+    local status=0 monitor=0 placement_previous_job_pid=${!:-}
+    local -a request=("$BUILDLOG_MEM_ADMIT_SCRIPT" verify-run-slot --pid "$$" --episode "${1:-}")
+    PLACEMENT_CLIENT_ACTIVE=1
+    [[ $- != *m* ]] || monitor=1
+    set -m
+    if [[ -p "/proc/$$/fd/2" || -c "/proc/$$/fd/2" ]]; then
+        verify_helper --require-helper "${request[@]}" </dev/null &
+    else
+        # Relay diagnostics through a pipe to keep the caller's file offset.
+        ( verify_helper --require-helper "${request[@]}" </dev/null 2>&1 >/dev/null | cat >&2 ) &
+    fi
+    HOLD_WAITER_PID=$!
+    if [[ "$monitor" == 0 ]]; then set +m; fi
+    wait "$HOLD_WAITER_PID" || status=$?
+    HOLD_WAITER_PID="" PLACEMENT_CLIENT_ACTIVE=0
+    if (( status != 0 )); then
+        PLACEMENT_FAILED=1
+        return "$status"
+    fi
+    VERIFY_RUN_SLOT_HELD=1
+}
 
 shift
 if [[ "$CMD" == example-test ]]; then
@@ -3146,6 +3173,7 @@ route_test() {
         local placement_status=0 admission=0
         check_routing_hold || admission=$?
         (( admission == 0 || admission == 10 )) || return "$admission"
+        if [[ "$MAC_ONLY" == 0 ]]; then admit_verify_run || exit $?; fi
         placement_once "$refresh_source" || placement_status=$?
         refresh_source=0
         if (( placement_status == 78 )); then
@@ -3180,8 +3208,10 @@ route_test() {
             require_nextest
         fi
         collect_routing_wait
-        if [[ "$MAC_ONLY" == 1 ]] && cache_lookup; then
-            exit "$LOOKUP_STATUS"
+        if [[ "$MAC_ONLY" == 1 ]]; then
+            if cache_lookup; then exit "$LOOKUP_STATUS"; fi
+            # The Mac assignment has no claim until Verify reserves it.
+            admit_verify_run "$PLACEMENT_EPISODE" || exit $?
         fi
         if [[ "$PLACEMENT_PROVIDER" == local ]]; then
             if [[ "${LINT_MAC_FIX:-0}" == 1 ]]; then
@@ -3561,8 +3591,8 @@ record_mac_pass() {
 }
 
 # A failed lint is the tree's own answer unless the run never reached a
-# verdict: a usage or tooling error (2), the sandbox (3), a kill, or a step
-# placement that failed before its step started. A fix pass that still changes
+# verdict: a usage or tooling error (2), the sandbox (3), a kill, or an
+# admission or placement failure. A fix pass that still changes
 # the tree at the limit can leave more fixes for the next call.
 # An incomplete fix pass can also leave fixes for the next call.
 lint_failure_is_the_tree() {
