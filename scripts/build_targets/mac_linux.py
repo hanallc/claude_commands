@@ -825,6 +825,12 @@ def route(repo: Path, *, mode: SuiteMode, full: bool, module_time_limit_s: float
         return f'{TARGET}: ' + ' '.join((str(error), *notes))
 
 
+def sandboxed_suite_command(tmp: Path, command: Sequence[str]) -> list[str]:
+    # Mount the guest root before mounting proc for the new PID namespace.
+    return ['bwrap', '--die-with-parent', '--unshare-pid', '--dev-bind', '/', '/',
+            '--proc', '/proc', '--bind', str(tmp), '/tmp', '--tmpfs', '/dev/shm', '--', *command]
+
+
 def run_guest(request_path: Path) -> int:
     """Take a numbered copy before starting the guest gate."""
     from scripts.lib import build_slots
@@ -860,10 +866,8 @@ def run_guest(request_path: Path) -> int:
                        str(Path(__file__).resolve()), str(request_path), '--run-copy']
             if shutil.which('dbus-run-session'):
                 command[:0] = ['dbus-run-session', '--']
-            # Mount the guest root before mounting proc for the new PID namespace.
-            command[:0] = ['bwrap', '--die-with-parent', '--unshare-pid', '--dev-bind', '/', '/',
-                           '--proc', '/proc', '--bind', str(tmp), '/tmp', '--tmpfs', '/dev/shm', '--']
-            return subprocess.run(command, cwd=copy.path, env=environment, stdin=subprocess.DEVNULL, check=False,
+            return subprocess.run(sandboxed_suite_command(tmp, command), cwd=copy.path, env=environment,
+                                  stdin=subprocess.DEVNULL, check=False,
                                   pass_fds=build_folders.held_build_folder_descriptors()).returncode
 
 

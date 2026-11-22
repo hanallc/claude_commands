@@ -10,6 +10,7 @@ import pwd
 import select
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -131,6 +132,31 @@ assert Path(os.environ['TMPDIR']).is_dir()
 os.environ['FIXTURE_SANDBOX'] = 'bwrap'
 command = sys.argv[1 + len(flags):]
 os.execvp(command[0], command)
+'''
+
+
+SANDBOX_SUITE = '''import fcntl
+import os
+from pathlib import Path
+import signal
+import sys
+
+tmp_device, tmp_inode, shm_device, pid_namespace, lock = map(int, sys.argv[1:])
+tmp = os.stat('/tmp')
+assert (tmp.st_dev, tmp.st_ino) == (tmp_device, tmp_inode), 'The suite /tmp must use the run folder.'
+assert os.stat('/dev/shm').st_dev != shm_device, 'The suite /dev/shm must have its own file system.'
+assert os.stat('/proc/self/ns/pid').st_ino != pid_namespace, 'The suite must have its own PID namespace.'
+assert os.readlink('/proc/self') == str(os.getpid()), 'The suite /proc must show its own PIDs.'
+Path('/tmp/suite-output').write_text('suite output')
+Path('/dev/shm/suite-output').write_text('shared memory output')
+if os.fork() == 0:
+    # Limit the child lifetime if the sandbox fails to stop it.
+    signal.alarm(6)
+    os.setsid()
+    assert os.getsid(0) == os.getpid()
+    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    print('The separate session holds the run lock.', flush=True)
+signal.pause()
 '''
 
 
@@ -256,6 +282,35 @@ path = sys.argv[2]
 sys.argv = sys.argv[2:]
 runpy.run_path(path, run_name='__main__')
 '''
+
+
+class MacLinuxSandboxTests(unittest.TestCase):
+    def test_deadline_stops_the_sandbox_and_releases_the_run_lock(self) -> None:
+        if shutil.which('bwrap') is None:
+            self.fail('This Mac Linux sandbox test requires Bubblewrap (bwrap) on PATH.')
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        tmp = root / 'suite-tmp'
+        tmp.mkdir()
+        tmp_identity = tmp.stat()
+        run_lock = root / 'run.lock'
+        output_path = root / 'suite.log'
+        with run_lock.open('wb') as lock, output_path.open('wb') as output:
+            descriptor = lock.fileno()
+            command = mac_linux.sandboxed_suite_command(tmp, [
+                sys.executable, '-I', '-S', '-c', SANDBOX_SUITE, str(tmp_identity.st_dev), str(tmp_identity.st_ino),
+                str(os.stat('/dev/shm').st_dev),
+                str(os.stat('/proc/self/ns/pid').st_ino), str(descriptor),
+            ])
+            # A surviving child must not keep the deadline check waiting for a pipe.
+            result = subprocess.run(['timeout', '--signal=KILL', '3', *command], pass_fds=(descriptor,),
+                                    stdout=output, stderr=subprocess.STDOUT, timeout=7, check=False)
+        report = output_path.read_text()
+        self.assertIn('The separate session holds the run lock.', report, report)
+        self.assertEqual(result.returncode, -signal.SIGKILL, report)
+        self.assertEqual((tmp / 'suite-output').read_text(), 'suite output')
+        unlocked = subprocess.run(['flock', '--exclusive', '--timeout', '1', str(run_lock), 'true'],
+                                  timeout=2, check=False)
+        self.assertEqual(unlocked.returncode, 0, 'The guest run lock is still held after the deadline.')
 
 
 class MacLinuxRouteTests(unittest.TestCase):

@@ -74,6 +74,8 @@ The Mac Linux route runs the suite in a numbered copy.
 It makes a per-run tool folder under the copy's `target` directory.
 Bubblewrap binds the tool folder's `tmp` directory to `/tmp` and mounts a private tmpfs at `/dev/shm`.
 The guest removes the tool folder when the suite returns.
+A forced stop can leave the tool folder in the numbered copy.
+On a later allocation, the shared build folder allocator removes the folder if its lease owner has ended and the locks permit removal.
 The suite uses a private PID namespace and mounts its own `/proc`.
 At the guest deadline, the namespace ends all suite processes, including processes that change groups.
 If `bwrap` is missing, the route declines before it sends the source.
