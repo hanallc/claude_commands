@@ -596,6 +596,7 @@ def build_limits(reading: records.QueueRead, snapshots: target_availability.Snap
     whole_mac = False
     shared_mac_claims = 0
     shared_mac_runs: list[str] = []
+    shared_mac_scopes: list[claim_state.RepositoryScope] = []
     claimed: set[str] = set()
     repositories_with_claims: set[str] = set()
     cloud_repositories: set[str] = set()
@@ -671,6 +672,7 @@ def build_limits(reading: records.QueueRead, snapshots: target_availability.Snap
         project = origins.resolve(claim.scope.key, record["worktree"])
         if not project:
             shared_mac_claims += 1
+            shared_mac_scopes.append(claim.scope)
             shared_mac_runs.extend(label for _, label in matching)
             if not matching and not kept:
                 shared_mac_runs.append(claim_name(record, names))
@@ -760,7 +762,9 @@ def build_limits(reading: records.QueueRead, snapshots: target_availability.Snap
         mac_names = {name, ".claude"} if name == "claude_commands" else {name}
         mac_allowed = (bool(mac_names & mac_settings.repositories) if mac_settings is not None else None)
         cell = current.mac
-        if origin in repositories_with_claims or cell.other or cell.waits:
+        scope_claimed = any(mac_test.scopes_overlap(scope, claim_state.RepositoryScope(scope_name, origin))
+                            for scope in shared_mac_scopes for scope_name in mac_names)
+        if scope_claimed or origin in repositories_with_claims or cell.other or cell.waits:
             mac_allowed = True
         cell.available = mac_allowed if not cell.waits else True
         if mac_settings is not None and (mac_allowed or mac_names & mac_settings.overrides):
@@ -770,6 +774,9 @@ def build_limits(reading: records.QueueRead, snapshots: target_availability.Snap
             if whole_mac:
                 cell.used = max(1, cell.used or 0)
                 cell.note = "Whole Mac claimed"
+            elif scope_claimed:
+                cell.used = max(1, cell.used or 0)
+                cell.note = cell.note or "Mac slot claimed"
             elif mac_claims_unavailable:
                 cell.used = None
         elif cell.waits:

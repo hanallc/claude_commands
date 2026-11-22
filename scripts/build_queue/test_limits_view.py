@@ -296,7 +296,13 @@ class BuildLimitsTests(unittest.TestCase):
                             self.assertEqual(len(shared_limits.repositories), 5 if background is duplicate else 4)
                             self.assertTrue(all(not row.mac.runs for row in shared_limits.repositories))
                             if isinstance(scope, claim_state.RepositoryScope):
-                                self.assertTrue(all(row.mac.used == 0 for row in shared_limits.repositories))
+                                affected = ({route_origin.removeprefix("https://"), same_name.removeprefix("https://")}
+                                            if background is duplicate else {"workspace"})
+                                self.assertEqual({row.name for row in shared_limits.repositories if row.mac.used}, affected)
+                                for row in shared_limits.repositories:
+                                    if row.name in affected:
+                                        self.assertEqual((row.mac.used, row.mac.limit, row.mac.note),
+                                                         (1, 1, "Mac slot claimed"))
                 unreadable = replace(mac, states=(targets.StateUnreadable("Cannot read fixture claims"),), claims=())
                 claim_status = limits_view.build_limits(current, (unreadable, hana), names, memory,
                                                        folders, saved, UTC, mac_runs)
