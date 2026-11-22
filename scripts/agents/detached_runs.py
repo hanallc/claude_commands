@@ -492,13 +492,14 @@ def _scope_stop_graces() -> tuple[float, float]:
 
 def _stop_slice_command(
     path: Path, reason: str, run_slice: process_stop.RunSliceIdentity, *,
-    check: Callable[[], bool], stop_pass: bool,
+    check: Callable[[], bool], stop_pass: bool, retract_on_failure: bool = False,
 ) -> bool:
     grace, kill_grace = _scope_stop_graces()
     with _scope_stop_lock(path) as acquired:
         if not acquired:
             return False
         added_reason = False
+        pane_stop: StopFields = {}
         try:
             with record_lock(path):
                 record = _read_record(path)
@@ -511,33 +512,41 @@ def _stop_slice_command(
                 added_reason = bool(reason and not record.get("stop_reason"))
                 if added_reason:
                     stopping["stop_reason"] = reason
-                if stop_pass and stopping.get("stop_reason") and not stopping.get("stop_pass_requested"):
-                    stopping["stop_pass_requested"] = True
-                    if _stop_caller_is_owner(stopping["staff_id"], os.environ):
-                        stopping["self_stop"] = True
-                if stopping != record:
+                if stop_pass and stopping.get("stop_reason") and not record.get("stop_pass_requested"):
+                    pane_stop["stop_pass_requested"] = True
+                    if _stop_caller_is_owner(record["staff_id"], os.environ):
+                        pane_stop["self_stop"] = True
+                saved = record
+                if added_reason and not stop_pass:
                     write_text_atomic(path, json.dumps(stopping, indent=2, sort_keys=True))
+                    saved = stopping.copy()
                 ended = process_stop.slice_has_ended(run_slice)
-                if stopping != record:
-                    if not check():
+                if not check():
+                    if saved != record:
                         write_text_atomic(path, json.dumps(record, indent=2, sort_keys=True))
-                        return False
-                    if ended and added_reason:
-                        write_text_atomic(path, json.dumps(record, indent=2, sort_keys=True))
-                if ended and not pending:
                     return False
+                if ended and added_reason:
+                    stopping = record
+                else:
+                    stopping = {**stopping, **pane_stop}
                 if not ended and not stopping.get("stop_reason"):
                     stopping["slice_leftovers"] = True
+                if stopping != saved:
                     write_text_atomic(path, json.dumps(stopping, indent=2, sort_keys=True))
+                if ended and not pending:
+                    return False
             if not ended:
                 process_stop.stop_slice(run_slice, grace, kill_grace)
         except process_stop.SliceStopFailed as error:
             with record_lock(path):
                 record = _read_record(path)
                 if record.get("command_slice") == run_slice and record["status"] == "running":
-                    if added_reason and not stop_pass:
-                        _ = record.pop("stop_reason", None)
-                    record["scope_error"] = str(error)
+                    if added_reason:
+                        if retract_on_failure:
+                            _ = record.pop("stop_reason", None)
+                        else:
+                            record["stop_reason"] = reason
+                    record = {**record, **pane_stop, "scope_error": str(error)}
                     write_text_atomic(path, json.dumps(record, indent=2, sort_keys=True))
             raise
         with record_lock(path):
@@ -554,6 +563,7 @@ def _stop_slice_command(
 def stop_command(
     path: Path, reason: str, *, check: Callable[[], bool] = lambda: True,
     stop_pass: bool = True, signal_group: Callable[[int, int], None] | None = None,
+    keep_request_on_failure: bool = False,
 ) -> bool:
     """Request a stop and confirm that the run slice has ended."""
     if not process_stop.supported():
@@ -564,7 +574,8 @@ def stop_command(
         run_slice = record["command_slice"]
         if not process_stop.is_slice_identity(run_slice):
             raise process_stop.SliceStopFailed("the saved run slice is invalid")
-        return _stop_slice_command(path, reason, run_slice, check=check, stop_pass=stop_pass)
+        return _stop_slice_command(path, reason, run_slice, check=check, stop_pass=stop_pass,
+                                   retract_on_failure=not (stop_pass or keep_request_on_failure))
     starting_command = _recorded_group(record)
     if starting_command is None or record.get("status") != "running":
         return False
@@ -2152,7 +2163,7 @@ def command_supervisor_gone(args: argparse.Namespace) -> int:
     # Leave the command group, so its TERM spares this watcher.
     os.setsid()
     try:
-        _ = stop_command(path, SUPERVISOR_GONE_REASON, stop_pass=False)
+        _ = stop_command(path, SUPERVISOR_GONE_REASON, stop_pass=False, keep_request_on_failure=True)
     except process_stop.SliceStopFailed as error:
         print(f"detached_runs: {path.stem}: stop failed: {error}", file=sys.stderr)
         return 1

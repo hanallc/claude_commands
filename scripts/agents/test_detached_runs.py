@@ -1438,6 +1438,44 @@ sys.exit(1)
                 killed = outcome in ("KILL", "scan error", "resume", "still populated")
                 self.assertEqual(kill.read_text(), "1\n" if killed else "0\n")
 
+    def test_watcher_stop_survives_a_slice_read_error(self) -> None:
+        path = self.record(["fixture command"])
+        cgroups = self.root / "watcher-cgroups"
+        scope = cgroups / "builds.slice/builds-detached.slice/builds-detached-watcher.slice"
+        scope.mkdir(parents=True)
+        identity: process_stop.RunSliceIdentity = {
+            "unit": scope.name, "path": "/" + str(scope.relative_to(cgroups)),
+            "device": scope.stat().st_dev, "inode": scope.stat().st_ino,
+        }
+        self.update_record(path, command_slice=identity, exit_code=143)
+        events = scope / "cgroup.events"
+
+        def finish_scope(_directory: int, saved_scope: process_stop.RunSliceIdentity) -> None:
+            self.assertEqual(saved_scope, identity)
+            _ = events.write_text("populated 0\n")
+
+        with (patch.object(os, "setsid"),
+              patch.object(detached_run_process, "supervises", return_value=False),
+              patch.object(process_stop, "CGROUP_ROOT", cgroups),
+              patch.object(process_stop, "_term_slice", side_effect=finish_scope) as term,
+              contextlib.redirect_stderr(io.StringIO()) as errors):
+            self.assertEqual(detached_runs.main(["supervisor-gone", str(path)]), 1)
+            self.assertIn("cannot read cgroup.events", errors.getvalue())
+            term.assert_not_called()
+            saved = worker_lifecycle.read_json_object(path)
+            self.assertEqual(saved.get("stop_reason"), detached_runs.SUPERVISOR_GONE_REASON)
+            self.assertNotIn("stop_pass_requested", saved)
+            self.assertNotIn("slice_cleanup_pending", saved)
+            self.assertNotIn("finished_at", saved)
+            _ = events.write_text("populated 1\n")
+            self.assertEqual(detached_runs.reap_orphans(str(self.session)), [path.stem])
+            term.assert_called_once()
+        saved = worker_lifecycle.read_json_object(path)
+        self.assertEqual(saved["status"], "finished")
+        self.assertTrue(saved["finished_at"])
+        self.assertNotIn("scope_error", saved)
+        self.assertEqual(events.read_text(), "populated 0\n")
+
     def test_start_rejects_an_unknown_kind(self) -> None:
         with contextlib.redirect_stderr(io.StringIO()) as error, self.assertRaises(SystemExit) as raised:
             _ = detached_runs.main(["start", "--kind", "unknown", "--", "true"])
@@ -2982,6 +3020,62 @@ class PaneRunDeliveryTests(unittest.TestCase):
         self.assertIn(pane, self.fixture.world.locations)
         self.assertEqual(self.notices, [])
         self.assertFalse(reply.exists())
+
+    def test_empty_slice_stop_preserves_the_normal_result_during_delivery(self) -> None:
+        row = self.fixture.worker("impl", family="codex")
+        pane = "w1:p1"
+        self.fixture.world.add(row, pane, family="codex")
+        dispatch, _ = self.begin_pane_pass(row)
+        record = self.record(row)
+        cgroups = self.fixture.root / "cgroups"
+        scope = cgroups / "builds.slice/builds-detached.slice/builds-detached-emptystop.slice"
+        scope.mkdir(parents=True)
+        _ = (scope / "cgroup.events").write_text("populated 0\n")
+        identity: process_stop.RunSliceIdentity = {
+            "unit": scope.name, "path": "/" + str(scope.relative_to(cgroups)),
+            "device": scope.stat().st_dev, "inode": scope.stat().st_ino,
+        }
+        record.update(pid=DEAD_PID, pane_dispatch_id=dispatch, exit_code=0, command_slice=identity)
+        path = Path(record["log"]).with_suffix(".json")
+        write_text_atomic(path, json.dumps(record))
+        read_record = worker_lifecycle.read_json_object
+        read_end = process_stop.slice_has_ended
+        delivery_snapshot: dict[str, object] | None = None
+
+        def read_end_during_stop(saved_scope: process_stop.RunSliceIdentity) -> bool:
+            nonlocal delivery_snapshot
+            delivery_snapshot = read_record(path)
+            return read_end(saved_scope)
+
+        def read_during_delivery(request: Path) -> dict[str, object]:
+            nonlocal delivery_snapshot
+            if request == path and delivery_snapshot is not None:
+                snapshot, delivery_snapshot = delivery_snapshot, None
+                return snapshot
+            return read_record(request)
+
+        with (patch.object(process_stop, "CGROUP_ROOT", cgroups),
+              patch.object(process_stop, "_term_slice") as term,
+              patch.object(detached_runs, "_stop_caller_is_owner", return_value=False)):
+            with patch.object(process_stop, "slice_has_ended", side_effect=read_end_during_stop):
+                self.assertFalse(detached_runs.stop_command(path, "Stop the private command."))
+            self.assertIsNotNone(delivery_snapshot)
+            with patch.object(worker_lifecycle, "read_json_object", side_effect=read_during_delivery):
+                self.assertEqual(detached_runs.main(["deliver", str(path)]), 0)
+            (target, text), = self.inputs
+            self.assertEqual(target, pane)
+            self.assertIn("Result: PASS (exit 0)", text)
+            with (patch.object(detached_runs, "_run", return_value=0),
+                  patch.object(detached_runs, "scope_prefix", return_value=[])):
+                self.assertEqual(detached_runs.main(["supervise", str(path)]), 0)
+            term.assert_not_called()
+        self.assertEqual(len(self.inputs), 1)
+        self.assertEqual(self.notices, [])
+        self.assertIsInstance(progress_history.active_dispatch(row.id, self.run_dir), progress_history.ActiveDispatch)
+        saved = worker_lifecycle.read_json_object(path)
+        self.assertEqual(saved["status"], "finished")
+        self.assertNotIn("stop_reason", saved)
+        self.assertNotIn("stop_pass_requested", saved)
 
     def test_director_stop_releases_the_owning_pass_without_done(self) -> None:
         row = self.fixture.worker("impl", family="codex")

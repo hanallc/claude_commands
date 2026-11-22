@@ -726,7 +726,7 @@ If `env` uses another option, the guard refuses the start when a later argument 
 To limit memory, use `systemd-run --user --scope --collect -q -p MemoryMax=<cap> -- <command>`.
 The record saves the command's process group as `command_group`.
 
-1. Save the stop reason and any pass cancellation request in the run record.
+1. Save the accepted stop request in the run record.
 2. Send TERM through pidfds to processes that still belong to the run slice.
 3. Give the processes the stop grace to exit.
 4. Write `1` to the slice's `cgroup.kill` if the slice is still populated.
@@ -739,6 +739,8 @@ The run record saves `finished_at` when it records the confirmed end of the slic
 Startup recovery resumes a saved stop even if the supervisor still runs.
 It resumes pending cleanup if the supervisor is gone.
 A failed hold stop retracts the request it added. A saved error cannot authorize recovery to stop the slice.
+The supervisor-loss watcher's request stays saved if a slice read fails. Recovery resumes that request.
+An empty slice with no earlier stop request keeps its normal result. Delivery sees only committed pane cancellation requests.
 A run without a saved slice can receive a legacy group TERM, which reports an unconfirmed stop.
 The stop requires Linux pidfd support.
 After a normal command exit, the supervisor gives the slice members the stop grace to exit.
