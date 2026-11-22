@@ -216,11 +216,11 @@ class WaitingRowsTests(unittest.TestCase):
                                  "message": "tune(gate): Save time limit", "save_order": 3}],
                 }))
                 legacy_gate.unlink()
-                _ = legacy_gate.write_text(original.replace("gate_time_limit_factor=2", "GATE_TIME_LIMIT_FACTOR=3"))
+                _ = legacy_gate.write_text(original.replace("gate_time_limit_factor=2", "GATE_TIME_LIMIT_FACTOR=3 # local note"))
                 waiting_rows.restore_live(self.checkout)
                 self.assertTrue(legacy_gate.is_symlink())
                 self.assertEqual(legacy_gate.readlink(), Path("gate.conf"))
-                self.assertEqual(gate.read_text(), original.replace("factor=2", f"factor={expected}"))
+                self.assertEqual(gate.read_text(), original.replace("factor=2", f"factor={expected} # local note"))
                 with waiting_rows.locked_journal(journal) as pending:
                     self.assertEqual(pending.order("gate", "gate_time_limit_factor"), max(3, published_order))
                     self.assertEqual(pending.changes[0].stem, "gate")
@@ -239,6 +239,7 @@ class WaitingRowsTests(unittest.TestCase):
             "changes": [{"stem": "example", "key": "AMOUNT", "value": "3",
                          "message": "tune(example): Save amount", "save_order": 3}],
         }))
+        self.edit(relative, "AMOUNT=2", "AMOUNT=3 # local note")
         target = self.peer_change(relative, "AMOUNT=2", "amount=2")
         def old_setting_name(stem: str, key: str) -> tuple[str, str]:
             return stem, key
@@ -246,11 +247,11 @@ class WaitingRowsTests(unittest.TestCase):
         # Use the old name handling while the mover installs the rename.
         with mock.patch.object(waiting_rows, "migrated_setting_name", old_setting_name):
             waiting_rows.move_to(self.checkout, target)
-        self.assertEqual(path.read_text(), SETTINGS + "AMOUNT=3\n")
+        self.assertEqual(path.read_text(), SETTINGS + "AMOUNT=3 # local note\n")
         self.edit(relative, "limit=5", "limit=8")
         with mock.patch.object(live_settings, "pull_mac", return_value="mac: pulled"):
             self.assertEqual(live_settings.publish(self.checkout, wait=True), ["main: pushed", "mac: pulled"])
-        self.assertEqual(path.read_text(), SETTINGS.replace("amount=2", "amount=3").replace("limit=5", "limit=8"))
+        self.assertEqual(path.read_text(), SETTINGS.replace("amount=2", "amount=3 # local note").replace("limit=5", "limit=8"))
         self.assertEqual(self.output("show", f"origin/main:{relative}"), SETTINGS.replace("amount=2", "amount=3"))
         with pending_rows() as changes:
             self.assertEqual(changes, [])

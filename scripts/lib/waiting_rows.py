@@ -174,7 +174,7 @@ class LockedJournal:
         if (checkout / "config").resolve() != conf.directory().resolve():
             return
         orders = published_orders(checkout, head)
-        _restore_legacy_rows(checkout, head, self)
+        legacy_keys = _legacy_keys(self)
         changed = self._migrate(checkout, head)
         files: dict[str, str] = {}
         for stem in self.accepted.keys() | orders.keys():
@@ -193,6 +193,7 @@ class LockedJournal:
                     text = files[path] if path in files else live_text(conf.path(stem)) or ""
                     setting = conf.settings(text).get(key)
                     files[path] = replace_value(text, setting.line, save.value) if setting else append_setting(text, key, save.value)
+        _restore_legacy_rows(checkout, head, legacy_keys, files)
         if changed or self.migrating:
             self.save()
         write_files(checkout, files)
@@ -400,7 +401,27 @@ def _without_rows(text: str, lines: Iterable[int]) -> str:
     return "".join(line for index, line in enumerate(text.splitlines(keepends=True)) if index not in removed)
 
 
-def _restore_legacy_gate_link(checkout: Path, head: str, keys: set[str]) -> None:
+def _keep_legacy_comment(text: str, key: str, legacy_line: str) -> str:
+    comment = re.search(r"[ \t]+#[^\r\n]*", legacy_line.partition("=")[2])
+    if comment is None:
+        return text
+    suffix = comment[0]
+    setting = conf.settings(text).get(key)
+    if setting is None:
+        note = suffix.lstrip()
+        if note in text.splitlines():
+            return text
+        separator = "\n" if text and not text.endswith(("\r", "\n")) else ""
+        return text + separator + note + "\n"
+    lines = text.splitlines(keepends=True)
+    line = lines[setting.line]
+    body = line.rstrip("\r\n")
+    if not re.search(re.escape(suffix) + r"(?=[ \t]+#|$)", body):
+        lines[setting.line] = body + suffix + line[len(body):]
+    return "".join(lines)
+
+
+def _restore_legacy_gate_link(checkout: Path, head: str, keys: set[str], files: dict[str, str]) -> None:
     relative = f"config/{LEGACY_GATE_STEM}.conf"
     path = checkout / relative
     if path.is_symlink() or not path.is_file():
@@ -410,12 +431,21 @@ def _restore_legacy_gate_link(checkout: Path, head: str, keys: set[str]) -> None
     if not rows:
         return
     restored = _without_rows(text, rows.values())
-    gate = tree_text(checkout, head, "config/gate.conf") or ""
+    gate_path = "config/gate.conf"
+    gate = tree_text(checkout, head, gate_path) or ""
     absent = {migrated_setting_name(LEGACY_GATE_STEM, key)[1] for key in rows} - conf.settings(text).keys()
     expected = _without_rows(gate, (setting.line for key, setting in conf.settings(gate).items() if key in absent))
     entry = index_entry(checkout, head, relative)
     if not entry.startswith("120000 ") or show(checkout, head, relative) != "gate.conf" or restored != expected:
         raise OSError(f"{relative} has local edits other than replayed settings")
+    live = files[gate_path] if gate_path in files else live_text(checkout / gate_path) or ""
+    repaired = live
+    lines = text.splitlines(keepends=True)
+    for key, index in rows.items():
+        repaired = _keep_legacy_comment(repaired, migrated_setting_name(LEGACY_GATE_STEM, key)[1], lines[index])
+    if repaired != live:
+        write_files(checkout, {gate_path: repaired})
+        _ = files.pop(gate_path, None)
     with tempfile.TemporaryDirectory(prefix="restore-gate-link-", dir=path.parent) as folder:
         link = Path(folder) / path.name
         link.symlink_to("gate.conf")
@@ -423,26 +453,33 @@ def _restore_legacy_gate_link(checkout: Path, head: str, keys: set[str]) -> None
         sync_folder(path.parent)
 
 
-def _restore_legacy_rows(checkout: Path, head: str, pending: LockedJournal) -> None:
-    """Remove legacy rows left by the old mover for pending Saves."""
+def _legacy_keys(pending: LockedJournal) -> dict[str, set[str]]:
     keys = {stem: {key for key, save in saves.items() if isinstance(save, AcceptedSave)}
             for stem, saves in pending.accepted.items()}
     for row in pending.changes:
         keys.setdefault(row.stem, set()).add(row.key)
-    files: dict[str, str] = {}
+    return keys
+
+
+def _restore_legacy_rows(checkout: Path, head: str, keys: dict[str, set[str]], files: dict[str, str]) -> None:
+    """Remove legacy rows and keep their comments on the current rows."""
     for stem, pending_keys in keys.items():
         if not pending_keys:
             continue
         relative = f"config/{stem}.conf"
-        text = live_text(checkout / relative) or ""
+        text = files[relative] if relative in files else live_text(checkout / relative) or ""
         if rows := _legacy_row_lines(stem, text, pending_keys):
             tracked = conf.settings(tree_text(checkout, head, relative) or "")
-            repaired = _without_rows(text, (line for key, line in rows.items() if key not in tracked))
-            if repaired != text:
-                files[relative] = repaired
+            removed = {key: index for key, index in rows.items() if key not in tracked}
+            if removed:
+                repaired = _without_rows(text, removed.values())
+                lines = text.splitlines(keepends=True)
+                for key, index in removed.items():
+                    repaired = _keep_legacy_comment(repaired, migrated_setting_name(stem, key)[1], lines[index])
+                write_files(checkout, {relative: repaired})
+                _ = files.pop(relative, None)
     if gate_keys := keys.get("gate"):
-        _restore_legacy_gate_link(checkout, head, gate_keys)
-    write_files(checkout, files)
+        _restore_legacy_gate_link(checkout, head, gate_keys, files)
 
 
 def pending_files(checkout: Path, journal: LockedJournal) -> dict[str, dict[str, AcceptedOrder]]:

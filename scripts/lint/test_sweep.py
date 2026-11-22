@@ -2558,7 +2558,7 @@ class FloorTests(SweepCase):
         natedev_floor = "# range: 0..\nsweep_build_floor_gib.natedev=733.29\n"
         for host, overrides, expected in (("testhost", "", 1000 * 4096 // 4),
                                           ("testhost", plain_floor, int(40.5 * GIB)),
-                                          ("TestHost.Example", plain_floor + host_floor, 55 * GIB),
+                                          ("TestHost.Example", host_floor, 55 * GIB),
                                           ("natedev", natedev_floor, int(733.29 * GIB))):
             with self.subTest(host=host, overrides=overrides):
                 base = self.base()

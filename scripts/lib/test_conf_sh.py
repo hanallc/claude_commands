@@ -145,11 +145,29 @@ class ShellConfTests(unittest.TestCase):
         self.assertFalse((self.root / "python.log").exists())
         self.assertFalse((self.root / "subshell.log").exists())
 
-    def test_mixed_case_hostname_without_proc_uses_the_lower_case_override(self) -> None:
+    def reader_with_hostname_file(self, hostname_file: Path) -> Path:
         reader = self.root / "conf.sh"
-        missing = self.root / "no-proc-hostname"
-        _ = reader.write_text(SHELL_READER.read_text().replace("/proc/sys/kernel/hostname", shlex.quote(str(missing))))
+        _ = reader.write_text(SHELL_READER.read_text().replace("/proc/sys/kernel/hostname", shlex.quote(str(hostname_file))))
         (reader.parent / "conf_record.sh").symlink_to(SHELL_READER.with_name("conf_record.sh"))
+        return reader
+
+    def test_mixed_case_proc_hostname_uses_no_child_process(self) -> None:
+        supports_lower_case = subprocess.run(
+            [*self.shell, "-c", '[[ -n "${ZSH_VERSION:-}" ]] || (( BASH_VERSINFO[0] >= 4 ))'],
+            env=self.env, check=False, timeout=TEST_HANG_GUARD_SECS,
+        )
+        if supports_lower_case.returncode:
+            self.skipTest("Bash 3 uses tr to convert the host name")
+        hostname_file = self.root / "proc-hostname"
+        _ = hostname_file.write_text("Mixed-Host.Example\n")
+        self.write("count.mixed-host=7\n")
+        result = self.run_reader("count", trace=True, reader=self.reader_with_hostname_file(hostname_file))
+        self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "7\n", ""))
+        self.assertFalse((self.root / "python.log").exists())
+        self.assertFalse((self.root / "subshell.log").exists())
+
+    def test_mixed_case_hostname_without_proc_uses_the_lower_case_override(self) -> None:
+        reader = self.reader_with_hostname_file(self.root / "no-proc-hostname")
         programs = self.root / "bin"
         uname = programs / "uname"
         _ = uname.write_text('#!/bin/bash\nprintf "%s\\n" "Mixed-Host.Example"\n')

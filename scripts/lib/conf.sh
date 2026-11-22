@@ -20,7 +20,14 @@ else
 fi
 _CONF_HOST="${_CONF_HOST%%.*}"
 if [[ "$_CONF_HOST" == *[[:upper:]]* ]]; then
-    _CONF_HOST="$(printf '%s' "$_CONF_HOST" | LC_ALL=C tr '[:upper:]' '[:lower:]')" || return
+    if [[ -n "${ZSH_VERSION:-}" ]]; then
+        # shellcheck disable=SC2296 # zsh converts the host name to lower case.
+        _CONF_HOST="${(L)_CONF_HOST}"
+    elif (( BASH_VERSINFO[0] >= 4 )); then
+        _CONF_HOST="${_CONF_HOST,,}"
+    else
+        _CONF_HOST="$(printf '%s' "$_CONF_HOST" | LC_ALL=C tr '[:upper:]' '[:lower:]')" || return
+    fi
 fi
 
 conf_value() {
