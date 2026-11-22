@@ -313,7 +313,7 @@ class RelaunchTests(ShutdownTestCase):
             fixture_session(director.current_session, staff.ClaudeBackend())
             workers = [fixture_worker(name, director.id) for name in ("impl", "review")]
             entry = pane_record.launch("w1:p2", director.current_session, str(self.root), {}, ["claude"])
-            from scripts.agents.test_pane_restore import FakeClient
+            from scripts.agents.test_pane_record_recovery import FakeClient
             from scripts.herdr import herdr
 
             client = FakeClient([{"pane_id": "w1:p2", "label": director.name, "workspace_id": "w1"}])
