@@ -418,7 +418,7 @@ class RemoteCopiesTests(unittest.TestCase):
         cases: tuple[tuple[str, int, str, str], ...] = (
             ("connect", 255, "", "ssh: connect to host host port 22: Connection timed out"),
             ("dns", 255, "", "ssh: Could not resolve hostname host: Name or service not known"),
-            ("timeout", 255, "", ""),
+            ("keepalive", 255, "", "Timeout, server host not responding."),
             ("refused", 2, "", "mirror is busy"),
             ("authentication", 255, "", "host: Permission denied (publickey)."),
             ("remote-refused", 0, "rc=2\n", "mirror is busy"),
@@ -432,8 +432,7 @@ class RemoteCopiesTests(unittest.TestCase):
                     copies.register_remote(mirror)
                 output = io.StringIO()
                 answer = subprocess.CompletedProcess(["ssh"], status, remote_output, detail)
-                failure = subprocess.TimeoutExpired("ssh", 10) if cause == "timeout" else None
-                with mock.patch.object(subprocess, "run", return_value=answer, side_effect=failure) as run, \
+                with mock.patch.object(subprocess, "run", return_value=answer) as run, \
                         redirect_stdout(output):
                     for attempt in range(2):
                         if cause in ("refused", "authentication", "remote-refused", "missing-status"):

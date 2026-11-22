@@ -114,7 +114,8 @@ fi
 case "$MAC_RUN_STALL:$command:$remote" in
     probe:ssh:true|head:ssh:*'rev-parse HEAD')
         sleep 0.85 ;;
-    bundle:scp:*|clone:ssh:*'copies.py clone '*|stop:ssh:*' stop-checkout '*|cleanup:ssh:*'scratch.py end '*)
+    bundle:scp:*|clone:ssh:*'copies.py clone '*|stop:ssh:*' stop-checkout '*|\
+    cleanup:ssh:*'scratch.py end '*|unregister:ssh:*'copies.py unregister-remote '*)
         if (( keepalive )); then
             sleep 0.1
             exit 255
@@ -122,7 +123,8 @@ case "$MAC_RUN_STALL:$command:$remote" in
         sleep 0.85 ;;
 esac
 case "$MAC_RUN_SLOW:$command:$remote" in
-    1:ssh:*'copies.py clone '*|1:ssh:*' stop-checkout '*|1:ssh:*'scratch.py end '*)
+    1:ssh:*'copies.py clone '*|1:ssh:*' stop-checkout '*|\
+    1:ssh:*'scratch.py end '*|unregister:ssh:*'copies.py unregister-remote '*)
         (( keepalive )) || exit 90
         sleep 0.85 ;;
 esac
@@ -763,6 +765,21 @@ class MacRunTests(unittest.TestCase):
         self.assertTrue(any("hana_instances.py stop-checkout " in command for command in remote), remote)
         self.assertTrue(any("scratch.py end " in command for command in remote), remote)
         self.assert_claim_released()
+
+    def test_unregister_allows_a_slow_lock_wait_and_fails_on_lost_ssh(self) -> None:
+        _ = write_config_fixture(self.config_path, "connect_timeout_s=7\nprobe_timeout_s=0.25\n")
+        checkout = self.environment["MAC_RUN_CHECKOUT"]
+        for transport, status, expected_paths in (("SLOW", 0, ()), ("STALL", 4, (checkout,))):
+            with self.subTest(transport=transport):
+                self.clear_events()
+                result = self.mac_run(extra={f"MAC_RUN_{transport}": "unregister"}, timeout=TEST_HANG_GUARD_SECS)
+                self.assertEqual(result.returncode, status, result.stdout + result.stderr)
+                events = self.events()
+                unregister = [event for event in events if event["command"] == "ssh"
+                              and "copies.py unregister-remote " in event["args"][-1]]
+                self.assertEqual(len(unregister), 1, events)
+                records = self.clone_registry_records(self.environment["COPIES_CONFIG"])
+                self.assertEqual(tuple(record["path"] for record in records), expected_paths)
 
     def test_claim_names_the_repository_so_another_repository_runs_beside_it(self) -> None:
         (self.repository / ".git").mkdir()

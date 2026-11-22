@@ -106,7 +106,7 @@ cleanup_mac_run() {
   local confirmation
   if confirmation=$(on_mac "~/.claude/scripts/lib/py ~/.claude/scripts/hana_instances/hana_instances.py stop-checkout $clone_arg" none) && [[ ${confirmation##*$'\n'} == 'hana-instances: checkout clear' ]]; then
     on_mac "~/.claude/scripts/lib/py ~/.claude/scripts/lib/scratch.py end --task $clone_task" none >/dev/null || return 4
-    on_mac "~/.claude/scripts/lib/py ~/.claude/scripts/copies/copies.py unregister-remote --host localhost --path $clone_arg" "$probe_timeout" >/dev/null || return 4
+    on_mac "~/.claude/scripts/lib/py ~/.claude/scripts/copies/copies.py unregister-remote --host localhost --path $clone_arg" none >/dev/null || return 4
     "$lib/py" $copies_script unregister-remote --host $host --path $clone || return 4
   else
     print -u2 "mac_run: process exit not confirmed; kept checkout $clone and task $clone_task${confirmation:+: $confirmation}"
