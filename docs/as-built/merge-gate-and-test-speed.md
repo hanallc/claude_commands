@@ -72,7 +72,8 @@ The route reads and writes this record independently of the placement registry.
 If the write fails, the route adds the write error to the probe failure.
 `mac_test.free_now` reads this backoff now.
 Queue placement will read the backoff when item 191 B3 registers `mac-linux` for placement.
-After the SSH transfer ends, `run.unreachable_wait_seconds` limits the wait for the guest to prove the run ended.
+After the SSH transfer ends, `unreachable_wait_seconds` in `build_targets.conf` limits the wait for the guest to prove the run ended.
+This one setting is for every machine. Today only the `mac-linux` route reads it.
 The setting accepts whole numbers from 1 to 86400 seconds.
 The route takes the Mac repository claim before the first SSH request.
 The guest run holds a separate lock. Before it can prove the run ended, the guest checks its machine ID and the checkout path from the arm step. The route also refuses the proof when the guest account in the settings differs from the armed account.

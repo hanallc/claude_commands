@@ -74,7 +74,7 @@ The Mac Linux route uses `mac_run.held` to take a repository slot on the Mac.
 A Mac block or a busy repository slot can refuse the claim.
 The route reports `not started` with the refusal reason before any upload or retry backoff.
 The route releases the claim when the guest proves the run ended.
-The current API also releases the claim at `run.unreachable_wait_seconds` if the guest cannot prove the run ended.
+The current API also releases the claim at `unreachable_wait_seconds` (`build_targets.conf`) if the guest cannot prove the run ended.
 The guest run lock still refuses another guest run until the first run ends.
 Item 191 B3 will keep the Mac claim until proof and bind the claim identity to the guest attempt.
 

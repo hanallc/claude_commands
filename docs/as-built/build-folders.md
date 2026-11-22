@@ -9,7 +9,7 @@ The build root is `/build` on natedev and `~/build` on the Mac and the Hana AWS 
 The Mac Linux guest uses the default build root `~/build` and the main checkout `~/.claude` for the `gate-runner` user.
 The route takes the Mac's repository claim through `mac_run.held` before it contacts the guest.
 The guest run holds a separate lock.
-The route waits up to `run.unreachable_wait_seconds` for proof that the guest run ended.
+The route waits up to `unreachable_wait_seconds` (`build_targets.conf`) for proof that the guest run ended.
 After proof, the route releases the Mac claim.
 The current API also releases the Mac claim when the wait expires.
 The guest run keeps its lock until it ends.
