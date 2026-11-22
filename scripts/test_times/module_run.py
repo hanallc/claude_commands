@@ -34,7 +34,10 @@ import unittest
 import unittest.case as unittest_case
 
 from scripts.lib import build_folders, git_files
-from scripts.lib.python_startup.sitecustomize import checkout_root, gate_parent_pid, verified_gate
+from scripts.lib.python_startup.sitecustomize import (
+    UnverifiedGateParent, checkout_root, gate_parent, verified_gate,
+)
+from scripts.lib.testing_folders import prepare_test_runs_parent, use_test_runs_parent
 
 if TYPE_CHECKING:
     from scripts.test_times.gate_record import TestStatus, TestTime
@@ -604,10 +607,10 @@ def run_with_descendant_cleanup(run: Callable[[], None], cleanup_run_roots: Call
     if signal_fd < 0:
         raise OSError(ctypes.get_errno(), "cannot watch runner signals")
     parent_fds: list[int] = []
-    parent = gate_parent_pid(consume=True)
-    if parent:
+    parent = gate_parent(consume=True)
+    if not isinstance(parent, UnverifiedGateParent):
         # No test child exists before the parent-death handoff completes.
-        parent_fds.append(os.pidfd_open(int(parent)))
+        parent_fds.append(os.pidfd_open(int(parent.pid)))
         if cast(int, libc.prctl(1, 0, 0, 0, 0)) != 0:
             raise OSError(ctypes.get_errno(), "cannot watch the gate parent")
     usage = resource.getrusage(resource.RUSAGE_SELF)
@@ -691,9 +694,8 @@ def main() -> None:
             checkout = git_files.locate(start_dir).toplevel
         except git_files.GitFilesError:
             checkout = Path(checkout_root(str(start_dir)) or start_dir)
-        parent = build_folders.test_runs_parent(checkout)
-        parent.mkdir(parents=True, exist_ok=True)
-        build_folders.sweep_temporary_build_folders(parent, wait=False)
+        parent = prepare_test_runs_parent(checkout)
+        use_test_runs_parent(parent)
     with private_run_roots(parent) as cleanup_run_roots:
         run_with_descendant_cleanup(lambda: run_module_with_config_log(start_dir, pattern, parent), cleanup_run_roots)
 

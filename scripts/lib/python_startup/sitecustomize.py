@@ -34,7 +34,8 @@ STARTUP_FILES = ("scripts/lib/py", "scripts/lib/package_root.py", "scripts/lib/p
 TEST_RUNNER_FILES = (*STARTUP_FILES, "scripts/test_times/module_run.py", "scripts/lib/descendants.py",
                      "scripts/lib/conf_reads.py", "scripts/lib/build_folders.py", "scripts/lib/build_folder_lock.py",
                      "scripts/lib/boot_identity.py", "scripts/lib/process_start.py",
-                     "scripts/lib/conf.py", "scripts/lib/git_files.py", "config/build_folders.conf",
+                     "scripts/lib/conf.py", "scripts/lib/git_files.py", "scripts/lib/testing_folders.py",
+                     "scripts/lib/session_folder.py", "config/build_folders.conf",
                      "config/test_times.conf")
 _DIRECT_TEST_UNIT_PREFIX = "claude-direct-test-"
 _SESSION_STARTUP = "session_python_startup"
@@ -246,14 +247,37 @@ def start_process(arguments: list[str]) -> str:
     return selected
 
 
-def _gate_source_descriptor(parent: str) -> int:
+class UnverifiedGateParent:
+    """The process has no verified gate parent."""
+
+
+class VerifiedGateParentWithoutDescriptor:
+    """The process verified the gate parent and holds no source descriptor."""
+
+    def __init__(self, pid: str) -> None:
+        self.pid: str = pid
+
+
+class VerifiedGateParentWithDescriptor:
+    """The process verified the gate parent and holds its source descriptor."""
+
+    def __init__(self, pid: str, descriptor: int) -> None:
+        self.pid: str = pid
+        self.descriptor: int = descriptor
+
+
+if TYPE_CHECKING:
+    GateParent = UnverifiedGateParent | VerifiedGateParentWithoutDescriptor | VerifiedGateParentWithDescriptor
+
+
+def _gate_source_identity(parent: str) -> VerifiedGateParentWithDescriptor | UnverifiedGateParent:
     """Check that the gate passed an open descriptor for its source file."""
     raw = os.environ.get(GATE_PARENT_SOURCE_FD, "")
     if not raw.isascii() or not raw.isdecimal() or len(raw) > 10:
-        return -1
+        return UnverifiedGateParent()
     descriptor = int(raw)
     if descriptor < 3:
-        return -1
+        return UnverifiedGateParent()
     try:
         parent_file = f"/proc/{parent}/fd/{descriptor}"
         target = os.readlink(parent_file)
@@ -262,10 +286,10 @@ def _gate_source_descriptor(parent: str) -> int:
                 and checkout_root(os.path.dirname(target))
                 and stat.S_ISREG(opened.st_mode)
                 and os.path.samestat(os.stat(parent_file), opened)):
-            return descriptor
+            return VerifiedGateParentWithDescriptor(parent, descriptor)
     except OSError:
         pass
-    return -1
+    return UnverifiedGateParent()
 
 
 def _gate_command(pid: str) -> bool:
@@ -298,14 +322,18 @@ def _gate_command(pid: str) -> bool:
     return False
 
 
-def _gate_identity() -> tuple[str, int]:
+def _gate_identity() -> GateParent:
     parent = os.environ.get("GATE_PARENT_PID") or os.environ.get("MERGE_GATE_PARENT_PID", "")
+    if not parent:
+        return UnverifiedGateParent()
     if sys.platform != "linux":
-        return parent, -1
+        return VerifiedGateParentWithoutDescriptor(parent)
     if parent != str(os.getppid()):
-        return "", -1
-    descriptor = _gate_source_descriptor(parent)
-    return (parent, descriptor) if descriptor >= 0 or _gate_command(parent) else ("", -1)
+        return UnverifiedGateParent()
+    identity = _gate_source_identity(parent)
+    if isinstance(identity, UnverifiedGateParent) and _gate_command(parent):
+        return VerifiedGateParentWithoutDescriptor(parent)
+    return identity
 
 
 def _remember_gate(parent: str) -> bool:
@@ -318,20 +346,21 @@ def _remember_gate(parent: str) -> bool:
     return True
 
 
-def gate_parent_pid(consume: bool = False) -> str:
-    """Return only a gate parent that the current process can verify."""
-    parent, descriptor = _gate_identity()
-    if parent and sys.platform == "linux" and not _remember_gate(parent):
-        parent = ""
-    if consume or not parent:
+def gate_parent(consume: bool = False) -> GateParent:
+    """Verify the gate parent and manage the source descriptor."""
+    identity = _gate_identity()
+    verified = (not isinstance(identity, UnverifiedGateParent)
+                and (sys.platform != "linux" or _remember_gate(identity.pid)))
+    if consume or not verified:
         _ = os.environ.pop("GATE_PARENT_PID", None)
         _ = os.environ.pop("MERGE_GATE_PARENT_PID", None)
         _ = os.environ.pop(GATE_PARENT_SOURCE_FD, None)
-        if descriptor >= 0:
-            os.close(descriptor)
-    elif descriptor >= 0:
-        os.set_inheritable(descriptor, False)
-    return parent
+        if isinstance(identity, VerifiedGateParentWithDescriptor):
+            os.close(identity.descriptor)
+            identity = VerifiedGateParentWithoutDescriptor(identity.pid)
+    elif isinstance(identity, VerifiedGateParentWithDescriptor):
+        os.set_inheritable(identity.descriptor, False)
+    return identity if verified else UnverifiedGateParent()
 
 
 def _unittest_boundary(module: ModuleType) -> None:
@@ -417,9 +446,9 @@ def verified_gate() -> bool:
         if readable:
             return False
         if "GATE_PARENT_PID" in os.environ or "MERGE_GATE_PARENT_PID" in os.environ:
-            _ = gate_parent_pid()
+            _ = gate_parent()
         return True
-    return bool(gate_parent_pid())
+    return not isinstance(gate_parent(), UnverifiedGateParent)
 
 
 def _begin_direct_test() -> None:

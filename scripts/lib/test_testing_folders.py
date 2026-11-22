@@ -15,7 +15,7 @@ from unittest import mock
 
 from scripts.lib import build_folders, testing_folders
 from scripts.lib.checkout_test_support import (
-    copy_test_runner, copy_with_bytecode, direct_test_fixture_environment, run_gate_test_fixture,
+    copy_test_runner, direct_test_fixture_environment, run_gate_test_fixture,
 )
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
@@ -80,8 +80,6 @@ class TestRunFolderTests(unittest.TestCase):
 
     def checkout_shim(self, checkout: Path) -> Path:
         copy_test_runner(checkout)
-        for name in ("testing_folders.py", "session_folder.py"):
-            copy_with_bytecode(SHIM.with_name(name), checkout / "scripts/lib" / name)
         return checkout / "scripts/lib/py"
 
     def assert_run_uses_output(self, shim: Path, output_folder: Path) -> None:

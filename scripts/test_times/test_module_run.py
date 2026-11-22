@@ -316,6 +316,7 @@ class Folders(unittest.TestCase):
     def test_paths(self):
         for setting in ("CONF_READ_LOG", "SCRATCH_ROOT", "ASTRA_REVIEW_DIR"):
             print(setting + "=" + str(Path(os.environ[setting]).parent.parent))
+        print("TMPDIR=" + str(Path(os.environ["TMPDIR"]).parent))
 """
 
 
@@ -464,12 +465,14 @@ runpy.run_path(sys.argv[0], run_name="__main__")
             timeout=TEST_HANG_GUARD_SECS,
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        for setting in ("CONF_READ_LOG", "SCRATCH_ROOT", "ASTRA_REVIEW_DIR"):
+        for setting in ("CONF_READ_LOG", "SCRATCH_ROOT", "ASTRA_REVIEW_DIR", "TMPDIR"):
             self.assertIn(f"{setting}={output / 'test-runs'}", result.stdout.splitlines())
         self.assertEqual(list((output / "test-runs").iterdir()), [])
 
     def test_runner_folders_follow_start_dir_into_another_checkout(self) -> None:
         root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        runner_checkout = root / "runner"
+        copy_test_runner(runner_checkout)
         checkout = root / "worktrees/claude/verify/tested"
         start_dir = checkout / "tests"
         start_dir.mkdir(parents=True)
@@ -481,11 +484,12 @@ runpy.run_path(sys.argv[0], run_name="__main__")
         _ = source.write_text(FOLDER_PATHS)
         environment = {**direct_test_fixture_environment(root), "PYTHONPATH": str(start_dir)}
         result = subprocess.run(
-            [str(RUNNER.parents[1] / "lib/py"), "-B", str(RUNNER), str(start_dir), source.name],
+            [str(runner_checkout / "scripts/lib/py"), "-B", str(runner_checkout / "scripts/test_times/module_run.py"),
+             str(start_dir), source.name],
             cwd=root, env=environment, capture_output=True, text=True, check=False, timeout=30,
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        for setting in ("CONF_READ_LOG", "SCRATCH_ROOT", "ASTRA_REVIEW_DIR"):
+        for setting in ("CONF_READ_LOG", "SCRATCH_ROOT", "ASTRA_REVIEW_DIR", "TMPDIR"):
             self.assertIn(f"{setting}={output / 'test-runs'}", result.stdout.splitlines())
         self.assertEqual(list((output / "test-runs").iterdir()), [])
 

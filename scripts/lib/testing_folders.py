@@ -16,8 +16,37 @@ RUN_FOLDER_ENV = build_folders.TEST_RUN_FOLDER_ENV
 BUILDLOG_ENV = "BUILDLOG_DIR"
 
 
+class SelectParentFromCheckout:
+    """Select the parent when the test starts."""
+
+
+_prepared_parent: Path | SelectParentFromCheckout = SelectParentFromCheckout()
+
+
+def prepare_test_runs_parent(checkout: Path) -> Path:
+    """Prepare the selected checkout's parent for private test folders."""
+    parent = build_folders.test_runs_parent(checkout)
+    parent.mkdir(parents=True, exist_ok=True)
+    build_folders.sweep_temporary_build_folders(parent, wait=False)
+    return parent
+
+
+def use_test_runs_parent(parent: Path) -> None:
+    """Use the timed runner's prepared parent at the unittest boundary."""
+    global _prepared_parent
+    _prepared_parent = parent
+
+
 @contextmanager
 def test_run_folder() -> Generator[Path]:
+    """Give a test command a private folder in its checkout's output."""
+    parent = prepare_test_runs_parent(Path(__file__).resolve().parents[2])
+    with _test_run_folder(parent) as folder:
+        yield folder
+
+
+@contextmanager
+def _test_run_folder(parent: Path) -> Generator[Path]:
     """Set TMPDIR for one run and restore the caller's temporary parent afterward.
 
     A run with no BUILDLOG_DIR keeps its build log in the run folder, so no test writes the caller's log.
@@ -25,9 +54,6 @@ def test_run_folder() -> Generator[Path]:
     """
     previous = {name: os.environ.get(name) for name in ("TMPDIR", RUN_FOLDER_ENV, BUILDLOG_ENV, SESSION_ROOT_ENV)}
     old_tempdir = tempfile.tempdir
-    parent = build_folders.test_runs_parent(Path(__file__).resolve().parents[2])
-    parent.mkdir(parents=True, exist_ok=True)
-    build_folders.sweep_temporary_build_folders(parent, wait=False)
     request = build_folders.UniqueBuildFolder("r", build_folders.ExplicitBuildParent(parent))
     with build_folders.temporary_build_folder(request) as path:
         os.environ["TMPDIR"] = str(path)
@@ -50,7 +76,8 @@ def test_run_folder() -> Generator[Path]:
 def start_test_run() -> None:
     """Keep the bootstrap allocation until normal interpreter exit."""
     owner = os.getpid()
-    lifetime = test_run_folder()
+    parent = _prepared_parent
+    lifetime = _test_run_folder(parent) if isinstance(parent, Path) else test_run_folder()
     _ = lifetime.__enter__()
 
     def finish() -> None:

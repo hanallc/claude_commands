@@ -322,7 +322,7 @@ Queue tables and cards use `[names]`; `test-affected` has the shown name `test a
 Other step IDs keep their display text.
 Sentences use `[prose]`, then the shown name as a fallback.
 The step column fits `test affected`.
-Build holds apply to both entries. Their test children keep the same hold rules.
+Build holds apply to both entries, with the configured exemption for named module runs.
 Temporary folders use each step's prefix from `config/build_folders.conf`.
 
 Each `gate_run` record carries `step`. Old records retain an empty step in the index.
@@ -333,12 +333,15 @@ This record changes no selection and refuses no run.
 ### The gate: `scripts/production/merge_gate.py`
 
 **Invocation.** `gate.py --merge-branch B --unit-branch U --checkpoint C --previous-checkpoint P --unit NAME --phase LABEL [--production <showrunner name>] [--change-review LIST] [--repo/--checkout DIR] [--body TEXT] [--promote] [--promote-only] [--main-repo ~/.claude] [--ssh ssh] [--mac-host mac] [--mac-repo ~/.claude] [--settings-blob b3466859] [--full] [--nightly]`.
-The six merge flags are required unless `--tests-only`, `--promote-only`, or `--nightly` is given.
-`--tests-only --module <suite>/<module>`, given once for each module, runs only the named modules, with the names the gate prints.
-This run uses the whole machine: it takes no admission, hold, time limit, passed-tree record or gate record, so it never certifies a tree.
+The six merge flags are required unless `--tests-only`, `--affected`, `--promote-only`, or `--nightly` is given.
+Use `--module <suite>/<module>` once for each module to run with `--tests-only` or `--affected`.
+Use the names the gate prints.
+The run uses shared admission and writes a gate record.
+Only the configured exempt unit can run named modules during a build hold.
+Each module keeps its time limit. The run has no overall time limit.
+A named module run never certifies a tree.
 A red module runs once more alone, as in the gate.
 The merge checkpoint uses it to run a red merge test again on its base (see [showrunner automation](showrunner-automation.md)).
-`--module` without `--tests-only` is refused.
 `--promote-only --merge-branch B` promotes the pushed branch to main and the Mac without merging or testing.
 `--production` defaults to the calling showrunner's production, read from its update timer.
 The gate refuses a merge when it cannot find a production.
@@ -520,9 +523,10 @@ A failed delivery prints its cause. A test failure keeps its marker after a fail
 **Suite runner** (`run_suites(repo, type_dirs, module_time_limit_s, max_running_jobs, *, source="tests-only", full=False, mode=SuiteMode.MERGE_GATE, machine=SharedMachine()) -> GateRun`):
 
 `SharedMachine` is the default and keeps the existing shared scheduling behavior.
+`HoldExemptNamedModuleMachine` uses shared scheduling and skips the build hold.
 `WholeMachine` uses one job per CPU and runs every discovered module without reruns.
 It uses no admission service, hold check, queue reservation, memory governor, CPU pool, systemd scope, or test ledger.
-Both modes use one launch loop with the same commands, test environments, timeouts, tripwires, and process cleanup.
+All three modes use the same launch loop, commands, test environments, module timeouts, tripwires, and process cleanup.
 `WholeMachine` prints each completed job's name, exit status, and seconds.
 `WholeMachine.module_seconds` supplies recorded times to `module_order`, which places unknown modules first, then measured modules from slowest to fastest.
 Without recorded times, `WholeMachine` keeps the discovery order. It writes no module times file.
@@ -543,12 +547,13 @@ The guest timeline records CPU busy percent between samples from the aggregate `
 The guest result records busy CPU seconds, gate seconds, vCPU count, and CPU use percent during the gate.
 CPU use percent equals 100 times busy CPU seconds divided by vCPU count times gate seconds.
 The trial text table shows CPU use percent for each size and run.
-The admission, scheduling caches, and rerun rules below apply to `SharedMachine`.
+The admission, scheduling caches, and rerun rules below apply to `SharedMachine` and `HoldExemptNamedModuleMachine`.
 
 - `test_modules(repo)` finds every `scripts/**/test_*.py` file outside `__pycache__`, sorted by path. A module belongs to its first folder under `scripts/`, including modules in nested `tests/` folders. A folder without test modules is no suite. New test folders need no registration.
 - Before any job starts it refuses (and the merge rolls back) if the test list is empty or `/dev/shm` is not writable. The nightly runner also requires the `scripts` folder.
 - Each module is one job: `python -c SUITE_BOOTSTRAP -m unittest discover -s <its folder> -p <its file>`, with the checkout as cwd, started in its own session and process group, stdin `/dev/null`. `SUITE_BOOTSTRAP` resets every signal disposition except KILL and STOP to `SIG_DFL`, then `execv`s, so a suite started from a background shell does not inherit SIGINT ignored.
-- **Shared admission.** After the build hold ends, `gate_reservation` obtains one `gate` reservation through `queue_place`.
+- **Shared admission.** `gate_reservation` obtains one `gate` reservation through `queue_place`.
+  `SharedMachine` waits for the build hold to end before it requests admission.
   Targeted tests use step `test-affected` through the same reservation path.
   It reads `program_first_peak_gib.gate` from `config/build_admission.conf` at use; the initial value is 4 GiB.
   The gate uses the first peak as its full need.
@@ -572,7 +577,7 @@ The admission, scheduling caches, and rerun rules below apply to `SharedMachine`
   Stop signals interrupt the wait without a masked blocking read.
   Cleanup returns all registered slots.
   Steve recovers a byte at process exit if a signal interrupts its registration after the read.
-  The gate checks holds again after the blocking read.
+  `SharedMachine` checks holds again after the blocking read.
   If a hold prevents admission, the gate returns the slot before it waits for the hold.
   An absent pool keeps the existing behavior. `BUILDLOG_JOBSERVER_FIFO` selects a private FIFO in tests.
   Launch and cleanup registration defer cancellation together. The child restores its signal mask before exec.
@@ -597,7 +602,7 @@ The admission, scheduling caches, and rerun rules below apply to `SharedMachine`
   A checkout without a model output uses `$TMPDIR/test-runs`.
   A verified gate keeps both timed runner folders in its `TMPDIR`.
   A direct timed runner selects the output from the checkout that contains `start_dir`.
-  The runner gives `config-reads-*` and `test-run-roots-*` unique names in that checkout's `test-runs` folder.
+  The runner places `TMPDIR`, `config-reads-*`, and `test-run-roots-*` in that checkout's `test-runs` folder.
   A nested legacy run uses the parent of the current run folder.
   Child processes inherit `TMPDIR`.
   Each run holds its folder lock.
