@@ -611,6 +611,7 @@ class FeatureLogTests(unittest.TestCase):
             ("git@github.com:hanallc/claude_commands\n", "claude", True),
             ("https://github.com/hanallc/hana.git\n", "hana", True),
             ("https://github.com/hanallc/nixos.git\n", "natedev", False),
+            ("https://github.com/natepiano/nixos.git\n", "natedev", False),
             ("git@github.com:natepiano/claude_commands\n", "claude", True),
             ("https://github.com/someone/unknown.git\n", "none", False),
         )
