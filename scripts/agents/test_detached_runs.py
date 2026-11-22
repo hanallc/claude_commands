@@ -1937,8 +1937,11 @@ sys.exit(status)
         starts: dict[int, process_start.ProcessStart] = {leader: process_start.Started("replacement")}
         reason = "fixture stop"
 
+        def read_start(pid: int, **_options: object) -> process_start.ProcessStart:
+            return starts[pid]
+
         with (self.darwin_without_pidfds(),
-              patch.object(process_start, "process_start", side_effect=starts.__getitem__),
+              patch.object(process_start, "process_start", side_effect=read_start),
               patch.object(detached_run_process, "supervisor_match", return_value=True) as supervisor,
               patch.object(detached_runs, "_stop_caller_is_owner", return_value=True),
               patch.object(os, "killpg") as send,

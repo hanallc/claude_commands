@@ -708,8 +708,7 @@ def _saved_process(
     """Read the saved process identity and identify a reused PID."""
     if not isinstance(started, str) or not started or _integer(pid) <= 0:
         return process_start.Gone()
-    observed = (process_start.process_start(_integer(pid), budget=budget)
-                if isinstance(budget, process_start.ProcessReadDeadline) else process_start.process_start(_integer(pid)))
+    observed = process_start.process_start(_integer(pid), budget=budget)
     if isinstance(observed, (process_start.Started, process_start.Zombie)) and observed.start != started:
         return SavedProcessIdReused()
     return observed
