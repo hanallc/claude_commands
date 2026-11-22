@@ -119,6 +119,14 @@ class MachineFactsTests(unittest.TestCase):
         self.assertEqual(self.sample()["mac"], machine_facts.facts("load_unreadable", link_ms=3.2,
                                                                     detail="Permission denied (publickey)."))
 
+    def test_mac_answer_without_a_valid_load_is_load_unreadable(self) -> None:
+        for answer in ("{ nan 1.0 1.0 }\n12\n", "{ -1.0 1.0 1.0 }\n12\n", "{ 1.0 1.0 1.0 }\n0\n"):
+            with self.subTest(answer=answer):
+                self.commands.answers["ssh"] = answer
+                machines = self.sample()
+                self.assertEqual(machines["mac"]["state"], "load_unreadable")
+                self.assertIsNotNone(machine_facts.read_facts(self.path))
+
     def test_name_lookup_past_its_time_limit_is_a_timeout(self) -> None:
         release = threading.Event()
 

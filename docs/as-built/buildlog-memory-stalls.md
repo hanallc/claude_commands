@@ -101,6 +101,7 @@ The pass probes three machines in parallel threads. Each machine records its own
 - AWS: the newest `GateRunning` reservation in the cost ledger that has not expired. No such box records `no_box`. A running box records `box_running`: `GateSecurityGroup` has egress rules only, so natedev cannot connect to it.
 The file is `{"version":1,"written":<epoch>,"machines":{"natedev"|"mac"|"aws":{"state","link_ms","load","cpus","battery","detail"}}}`.
 `state` is `read`, `load_unreadable`, `unreachable`, `no_box`, `box_running` or `failed`; `battery` is `{"percent","mains"}`, `"unreadable"` or `null` (no battery).
+`failed` means the probe could not start: the `mac_test.conf` or `ssh -G` read failed, the cost ledger is unavailable, or a probe raised another exception.
 A failed write prints `buildlog sample: machine facts not saved: <error>` and the sample still exits 0.
 The slowest probe sets the pass time. For the Mac it is at most three times `connect_timeout_s` (`ssh -G`, the name lookup, the connect) plus `probe_timeout_s`: 33 s with today's `mac_test.conf`, under the 60 s timer period.
 

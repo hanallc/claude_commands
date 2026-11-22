@@ -160,7 +160,7 @@ def ups_battery(text: str) -> Battery | Literal["unreadable"]:
     status = values.get("ups.status", "").split()
     try:
         percent = round(float(values["battery.charge"]))
-    except (KeyError, ValueError):
+    except (KeyError, ValueError, OverflowError):
         return "unreadable"
     if "OB" in status:
         return {"percent": percent, "mains": False}
@@ -198,7 +198,10 @@ def mac_load(text: str) -> tuple[float, int]:
     lines = text.splitlines()
     if len(lines) < 2:
         raise ValueError("the Mac answer has no load and CPU lines")
-    return float(lines[0].strip("{} ").split()[0]), int(lines[1])
+    load, cpus = float(lines[0].strip("{} ").split()[0]), int(lines[1])
+    if not math.isfinite(load) or load < 0 or cpus <= 0:
+        raise ValueError(f"the Mac answer has no valid load and CPU count: {lines[0]!r}, {lines[1]!r}")
+    return load, cpus
 
 
 def ssh_address(probes: Probes, link: MacLink) -> tuple[str, int]:
