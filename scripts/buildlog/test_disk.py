@@ -109,6 +109,22 @@ class DiskTests(unittest.TestCase):
                   mock.patch.dict(os.environ, {copy_record.ROOT_ENV: str(scratch)})):
                 self.assertEqual(disk.scanned_folders(), expected)
 
+    def test_scanned_folders_keep_fixed_rows_when_ci_cannot_be_listed(self) -> None:
+        root = Path(os.environ["CONF_DIR"])
+        ci = root / "build/hana/ci"
+        (ci / "1").mkdir(parents=True)
+        folders = [("tmp", str(root / "tmp"))]
+        scandir = os.scandir
+
+        def list_directory(path: Path) -> Iterator[os.DirEntry[str]]:
+            if path == ci:
+                raise PermissionError(path)
+            return scandir(path)
+
+        with (mock.patch.object(disk, "FOLDERS", folders),
+              mock.patch.object(os, "scandir", side_effect=list_directory)):
+            self.assertEqual(disk.scanned_folders(), folders)
+
     def test_linux_capacity_checks_the_external_output_device(self) -> None:
         base = self.base()
         outputs = CargoOutputRoots(base, base / "target", base / "external")

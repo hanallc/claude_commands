@@ -91,7 +91,11 @@ FOLDERS: list[tuple[str, str]] = [
 def scanned_folders() -> list[tuple[str, str]]:
     """List fixed folders, Hana CI runners, and the scratch root if separate."""
     folders = list(FOLDERS)
-    folders.extend((f"CI runner {number}", str(path)) for number, path in build_folders.ci_folders("hana"))
+    try:
+        runners = build_folders.ci_folders("hana")
+    except OSError:
+        runners = []
+    folders.extend((f"CI runner {number}", str(path)) for number, path in runners)
     scratch = copy_record.root()
     if not any(scratch.is_relative_to(Path(path).expanduser()) for _, path in folders):
         folders.append(("scratch", str(scratch)))
