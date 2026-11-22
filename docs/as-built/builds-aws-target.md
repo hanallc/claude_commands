@@ -2,7 +2,7 @@
 
 ## Current model
 
-AWS runs temporary Spot boxes for merge gates, paired AWS trials, and the GPU size trial.
+AWS runs temporary Spot boxes for gate jobs, paired AWS trials, and the GPU size trial.
 The configured build target order is `hana-aws,mac,natedev`.
 Hana placement has been enabled since 2026-11-17.
 The queue tries `hana-aws` first for eligible Hana check and clippy steps.
@@ -165,7 +165,7 @@ If the template has no policy or the plan cannot resolve it, the plan prints a n
 The plan then simulates S3 without a bucket policy.
 Bucket policies added outside the stack are out of scope.
 
-To plan a merge gate update, run this command in a terminal on natedev.
+To plan a gate infrastructure update, run this command in a terminal on natedev.
 
 ```sh
 deploy.py up --workload merge-gates --plan
@@ -743,8 +743,8 @@ The sweep preserves boxes with live owners, even when another owner in the same 
 The sweep preserves trial folders.
 Guest expiry and the AWS expiry function remain independent termination controls.
 AWS failures can delay termination beyond the configured expiry and confirmation timeout.
-Merge gate units also use `ExecStopPost` with `cloud_gate --cleanup`.
-Trials and merge gates use the same attempt cleanup code in `cloud_gate.py`.
+Gate units also use `ExecStopPost` with `cloud_gate --cleanup`.
+Trials and gate runs use the same attempt cleanup code in `cloud_gate.py`.
 The worker installs no signal handler.
 The ledger records each worker's PID, process start identity, and attempt folder.
 Reconciliation preserves live workers and workers whose identity cannot be read.
@@ -795,7 +795,7 @@ The bootstrap removes each known signed URL and its query from the result record
 Older paired candidates can send logs directly. The bootstrap cannot filter those uploads.
 The upload count and measured result fields remain unchanged.
 
-`cloud_gate.log_cloud_progress` reads stages for both paired trials and merge gates.
+`cloud_gate.log_cloud_progress` reads stages for both paired trials and gate runs.
 The progress record adds `stage`, `region`, and `zone` beside the existing fields.
 Before the first box log line, the state is `requesting` and the stage is `launch`.
 The last UTC `stage=` line supplies the stage text.
@@ -833,7 +833,7 @@ The gate ranks deployed types and public zones by the expected USD per run befor
 Equal costs retain the configured region, type, and zone order.
 Capacity refusals and unsupported types select the next variant.
 A normal gate uses natedev after all capacity choices refuse.
-With `enabled=off` in `cloud_gate.conf`, the route sends merge gates and targeted tests to natedev.
+With `enabled=off` in `cloud_gate.conf`, the route sends gate jobs to natedev.
 For each request, the route reads this setting before it reads deployment state or calls AWS.
 A confirmed Spot interruption before a final result starts another cloud attempt.
 `spot_interruption_retries=2` permits two retries, which can reach another zone and then another region.
@@ -1122,7 +1122,7 @@ The user asked for this layout on 2026-11-14 through builds. Each line has these
 The bill names the region by its usage type prefix, such as `USE2-SpotUsage:c7a.8xlarge`.
 `ledger.REGION_USAGE_PREFIXES` maps each prefix to a region.
 A launch row without a region ran in the home region, `region` in `aws_target.conf`.
-The next line names the cheapest merge gate by estimate.
+The next line names the cheapest gate by estimate.
 Below them, two tables show the refused requests and the launched boxes of each type and region.
 Refused requests are capacity and quota refusals.
 The last card asks “Did AWS bill more machine hours than we used?”
