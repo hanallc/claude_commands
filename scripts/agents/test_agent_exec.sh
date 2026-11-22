@@ -1,16 +1,19 @@
 #!/usr/bin/env bash
 
 set -euo pipefail
-if [[ "${1:-}" != --fixture-environment ]]; then
-    exec env -i PATH="$PATH" bash "$0" --fixture-environment
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+if [[ "${1:-}" == --fixture-folder ]]; then
+    exec env -i PATH="$PATH" bash "$0" --fixture-environment "$2"
 fi
-shift
+if [[ "${1:-}" != --fixture-environment ]]; then
+    exec "$SCRIPT_DIR/../lib/py" -m scripts.lib.testing_folders agent-exec- "$0"
+fi
+TEST_DIR="$2"
+shift 2
+export TMPDIR="$TEST_DIR"
 export MODELS_CONFIG_PUBLISH=0
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "$SCRIPT_DIR/../lib/test_models_registry.sh"
-TEST_DIR="$(mktemp -d "${TMPDIR:-/tmp}/agent-exec.XXXXXX")"
-trap 'rm -rf "$TEST_DIR"' EXIT
 
 export HOME="$TEST_DIR/home"
 export PYTHONDONTWRITEBYTECODE=1

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.lib.build_folders import SystemTemporaryParent
+from scripts.lib.testing_folders import fixture_folder
 from scripts.production.change_review_test_support import registered_fixture_image
 
 from scripts.lib.checkout_test_support import copy_runtime, copy_test_runner
@@ -24,7 +26,6 @@ import sqlite3
 import subprocess
 import sys
 import time
-import tempfile
 from typing import ClassVar, ParamSpec, TypedDict, cast, override
 import unittest
 from unittest import mock
@@ -326,6 +327,7 @@ class MergeGateFixture(unittest.TestCase):
 
     admission: AdmissionFixture = cast(AdmissionFixture, cast(object, None))
 
+    fixture_parent: ClassVar[Path]
     fixture_root: ClassVar[Path]
 
     fixture_snapshot: ClassVar[Path]
@@ -335,20 +337,21 @@ class MergeGateFixture(unittest.TestCase):
     @classmethod
     def fixture_configuration(cls, directory: Path) -> dict[str, str]:
         environment = config_environment(directory)
-        pin_gate_root(directory / "build_folders.conf", Path("/tmp").resolve())
+        pin_gate_root(directory / "build_folders.conf", directory)
         return environment
 
     @classmethod
     @override
     def setUpClass(cls) -> None:
-        configuration = Path(cls.enterClassContext(tempfile.TemporaryDirectory(prefix="gate-config-", dir="/tmp")))
+        configuration = cls.enterClassContext(fixture_folder("gc-", SystemTemporaryParent())).resolve()
+        cls.fixture_parent = configuration
         environment = fixture_git_environment(configuration)
         for key in ("BASH_ENV", "STAFF_CONFIG"):
             _ = environment.pop(key, None)
         environment.update(cls.fixture_configuration(configuration))
         _ = cast(object, cls.enterClassContext(mock.patch.dict(os.environ, environment, clear=True)))
         tmpfs = build_folders.tmpfs_temporary_parent()
-        private = Path(cls.enterClassContext(tempfile.TemporaryDirectory(prefix="mg-", dir=tmpfs)))
+        private = cls.enterClassContext(fixture_folder("mg-", build_folders.ExplicitBuildParent(tmpfs)))
         parent = gate.gate_test_parent(private)
         parent.mkdir(mode=0o700)
         directory = cls.enterClassContext(build_folders.temporary_build_folder(

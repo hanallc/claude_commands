@@ -31,6 +31,7 @@ from typing import Literal, TextIO, TypedDict, cast, override
 from unittest import mock
 from uuid import NAMESPACE_URL, uuid5
 
+from scripts.lib.testing_folders import fixture_folder
 from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.lib import process_group
 from scripts.lib.atomic_file import write_text_atomic
@@ -432,7 +433,7 @@ def isolated_staff_file(path: Path, environment: dict[str, str]) -> Generator[No
     environment["STAFF_CONFIG"] = os.environ.get("STAFF_CONFIG", str(CHECKOUT / "config/staff.conf"))
     with ExitStack() as contexts:
         if Path(environment["STAFF_CONFIG"]) == CHECKOUT / "config/staff.conf":
-            configuration = Path(contexts.enter_context(tempfile.TemporaryDirectory(prefix="staff-config-", dir="/tmp"))) / "staff.conf"
+            configuration = contexts.enter_context(fixture_folder("staff-config-")) / "staff.conf"
             _ = write_config_fixture(configuration, "PRODUCER_WORKSPACE=producers\n")
             environment["STAFF_CONFIG"] = str(configuration)
         _ = contexts.enter_context(cast(AbstractContextManager[object], mock.patch.dict(os.environ, {

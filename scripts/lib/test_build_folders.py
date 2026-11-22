@@ -2251,12 +2251,14 @@ assert not loaded, loaded
         for source in sources.glob("*.conf"):
             if source.name != ADMISSION_CONFIG_FIXTURE.name:
                 self.assertEqual((config.parent / source.name).read_bytes(), source.read_bytes())
-        _ = write_config_fixture(config, "prefixes.admit-test=admit-test-\nroots.system=/tmp\n")
+        system = self.root / "system"
+        system.mkdir()
+        _ = write_config_fixture(config, f"prefixes.admit-test=admit-test-\nroots.system={system}\n")
         original = config.read_text()
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, environment)))
         self.assertEqual(folders.FOLDER_PREFIXES["admit-test"], "admit-test-")
         with folders.temporary_build_folder(folders.UniqueBuildFolder("probe-", folders.SystemTemporaryParent())) as path:
-            self.assertEqual(path.parent, Path("/tmp"))
+            self.assertEqual(path.parent, system)
             self.assertTrue(path.is_dir())
         self.assertFalse(path.exists())
         _ = config.write_text(original.replace("prefixes.admit-test=admit-test-", "prefixes.admit-test=private-"))

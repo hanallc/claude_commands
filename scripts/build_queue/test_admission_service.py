@@ -1,6 +1,7 @@
 """In-process service decisions, persistence and owner events."""
 from __future__ import annotations
 
+from scripts.lib.testing_folders import fixture_folder
 from scripts.build_queue import execution_identity
 from scripts.aws_target import hana_protocol
 from scripts.lib import test_phase
@@ -5242,8 +5243,8 @@ class ServiceTests(unittest.TestCase):
             self.assertFalse(fixture.server.reservations)
 
     def test_socket_fixture_works_with_a_long_tmpdir(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="admit-long-", dir="/tmp") as root:
-            long_tmpdir = Path(root) / ("nested-" * 24)
+        with fixture_folder("admit-long-") as root:
+            long_tmpdir = root / ("nested-" * 24)
             long_tmpdir.mkdir()
             with mock.patch.dict(os.environ, {"TMPDIR": str(long_tmpdir)}), \
                  mock.patch.object(tempfile, "tempdir", str(long_tmpdir)), \

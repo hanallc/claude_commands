@@ -3,12 +3,15 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+if [[ "${1:-}" != --fixture-folder ]]; then
+    exec "$SCRIPT_DIR/../lib/py" -m scripts.lib.testing_folders sync-codex-catalog- "$0"
+fi
+TEST_DIR="$2"
+shift 2
 source "$SCRIPT_DIR/../lib/test_models_registry.sh"
 SYNC_SCRIPT="$SCRIPT_DIR/sync_codex_catalog.sh"
-TEST_DIR="$(mktemp -d "${TMPDIR:-/tmp}/sync-codex-catalog.XXXXXX")"
-# The unwritable-state-directory case chmods a directory read-only, and rm needs
-# it writable again to clear the tree.
-trap 'chmod -R u+rwx "$TEST_DIR" 2>/dev/null; rm -rf "$TEST_DIR"' EXIT
+# Restore write access so the fixture owner can remove the folder.
+trap 'chmod -R u+rwx "$TEST_DIR" 2>/dev/null' EXIT
 
 export HOME="$TEST_DIR/home"
 mkdir -p "$HOME"

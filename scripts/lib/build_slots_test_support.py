@@ -51,7 +51,6 @@ names.suffix_length=8
 # whole: 1..64
 names.repository_key_length=8
 names.suffix_characters=abcdefghijklmnopqrstuvwxyz0123456789_
-roots.system=/tmp
 roots.gate=/dev/shm
 roots.temporary={root / 'temporary'}
 roots.build={root / 'build'}

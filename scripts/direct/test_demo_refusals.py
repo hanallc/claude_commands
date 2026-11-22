@@ -6,9 +6,9 @@ from __future__ import annotations
 import shutil
 import subprocess
 import sys
-import tempfile
 import unittest
 from pathlib import Path
+from scripts.lib.testing_folders import fixture_folder
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lint.memory_test_support import config_environment
 
@@ -30,8 +30,7 @@ class RefusalDemoTests(unittest.TestCase):
         git = shutil.which("git")
         if not git:
             self.fail("the recorder requires git on PATH")
-        with tempfile.TemporaryDirectory(prefix="refusal-demo-test-", dir="/tmp") as temporary:
-            root = Path(temporary)
+        with fixture_folder("refusal-demo-test-") as root:
             working = root / "working"
             scratch = root / "scratch"
             commands = root / "bin"

@@ -25,6 +25,8 @@ from pathlib import Path
 from typing import ClassVar, cast, final, override
 from unittest import mock
 
+from scripts.lib.build_folders import SystemTemporaryParent
+from scripts.lib.testing_folders import fixture_folder
 from scripts.accounts import accounts
 from scripts.lib.state_home_test_support import isolate_state_home
 from scripts.herdr import herdr_types
@@ -260,7 +262,6 @@ names.suffix_length=8
 # whole: 1..64
 names.repository_key_length=8
 names.suffix_characters=abcdefghijklmnopqrstuvwxyz0123456789_
-roots.system=/tmp
 roots.temporary=${TMPDIR}/builds
 roots.gate=/tmp
 roots.session=~/session
@@ -442,7 +443,10 @@ def setUpModule() -> None:
     unittest.enterModuleContext(foreign_hostname())
     unittest.enterModuleContext(mock.patch.dict(os.environ, {"USER_ZONE": "America/New_York"}))
     isolate_state_home()
-    root = Path(unittest.enterModuleContext(tempfile.TemporaryDirectory(prefix="shutdown-config-")))
+    root = unittest.enterModuleContext(fixture_folder("sd-", SystemTemporaryParent()))
+    folders = f"roots.system={root}\n" + SHUTDOWN_FIXTURE_SETTINGS["build_folders"]
+    _ = cast(object, unittest.enterModuleContext(
+        mock.patch.dict(SHUTDOWN_FIXTURE_SETTINGS, {"build_folders": folders})))
     environment = {**fixture_git_environment(), **shutdown_fixture_configuration(root)}
     ShutdownStaffFixture.owner_server = SharedStaffOwner(root)
     unittest.addModuleCleanup(ShutdownStaffFixture.owner_server.close)
