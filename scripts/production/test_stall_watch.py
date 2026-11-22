@@ -37,6 +37,7 @@ from scripts.buildlog.test_holds import write_mac_block
 from scripts.lib import unit_runs
 from scripts.lib.test_models_registry import write_registry
 from scripts.lib.process_group import send_process_group
+from scripts.lib.socket_test_support import short_socket_directory
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
@@ -221,7 +222,7 @@ class StallWatchTests(unittest.TestCase):
     @classmethod
     @override
     def setUpClass(cls) -> None:
-        cls.listener_root = Path(cls.enterClassContext(tempfile.TemporaryDirectory(prefix="p-")))
+        cls.listener_root = Path(cls.enterClassContext(short_socket_directory("p-")))
         cls.listeners = []
         cls.addClassCleanup(cls.close_listeners)
 
@@ -233,6 +234,7 @@ class StallWatchTests(unittest.TestCase):
     def __init__(self, methodName: str = "runTest") -> None:
         super().__init__(methodName)
         self.root: Path = Path()
+        self.socket_root: Path = Path()
         self.watches: dict[str, stall_watch.WatchedUnit] = {}
         self.bin: Path = Path()
         self.notifier: Path = Path()
@@ -261,6 +263,7 @@ class StallWatchTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="sw-")))
+        self.socket_root = Path(self.enterContext(short_socket_directory("sw-")))
         _ = cast(object, self.enterContext(mock.patch.multiple(
             unit_runs, RUN_ROOT=self.root / "held", FORMER_RUN_ROOT=self.root / "former-held")))
         defaults = self.root / "watch-defaults.conf"
@@ -476,7 +479,7 @@ always=natedev
             stop_child(child)
 
     def record_session(self, pid: int, session_id: str, name: str, *, running: bool = True) -> Path:
-        path = self.root / f"{session_id}.sock"
+        path = self.socket_root / f"{session_id}.sock"
         record = {"pid": pid, "procStart": sessions.process_start(pid), "sessionId": session_id, "name": name,
                   "messagingSocketPath": str(path), "updatedAt": START, "running": running}
         _ = (self.sessions / f"{pid}.json").write_text(json.dumps(record))
@@ -533,7 +536,7 @@ with socket.socket(socket.AF_UNIX) as sock:
         return listener
 
     def unit(self, name: str) -> tuple[int, Path]:
-        socket_path = self.root / f"{unit_session(name)}.sock"
+        socket_path = self.socket_root / f"{unit_session(name)}.sock"
         peer_path = self.listener_root / str(self.unit_count)
         pid = self.unit_listener(self.unit_count, peer_path).process.pid
         self.unit_count += 1
@@ -749,7 +752,7 @@ runpy.run_path(str(script), run_name='__main__')
         self.assertEqual(self.tick(at).returncode, 0)
         notices = self.prompt_notices()
         self.assertEqual(len(notices), before + 1)
-        self.assertEqual(notices[-1]["to"], f"uds:{self.root / '54c9fdb8-6dfc-55dd-8242-a523c2e9f81f.sock'}")
+        self.assertEqual(notices[-1]["to"], f"uds:{self.socket_root / '54c9fdb8-6dfc-55dd-8242-a523c2e9f81f.sock'}")
         self.assertIn("unit-one on ", notices[-1]["text"])
         self.assertIn("waits at a permission prompt:", notices[-1]["text"])
 
@@ -954,7 +957,7 @@ runpy.run_path(str(script), run_name='__main__')
         self.assertEqual(result.stderr.count("fixture lookup timed out; retained"), 1)
         self.assertEqual(len(self.sent()), 2)
         self.assertEqual({item["to"] for item in self.sent()},
-                         {f"uds:{self.root / '204f532d-a97a-59e7-a6a7-caf86af3f5ee.sock'}", f"uds:{self.root / '54c9fdb8-6dfc-55dd-8242-a523c2e9f81f.sock'}"})
+                         {f"uds:{self.socket_root / '204f532d-a97a-59e7-a6a7-caf86af3f5ee.sock'}", f"uds:{self.socket_root / '54c9fdb8-6dfc-55dd-8242-a523c2e9f81f.sock'}"})
 
     def test_slow_discovery_and_inspection_keep_skipped_state_for_the_next_pass(self) -> None:
         _ = self.unit("unit-two")
@@ -1068,7 +1071,7 @@ runpy.run_path(str(script), run_name='__main__')
                     else:
                         self.assertEqual(reads[0], "w2:p1")
                         self.assertEqual(len(self.sent()), 2, "a found alert must use this pass's reserve")
-                        self.assertIn(f"uds:{self.root / '3764fee6-1374-598d-bb7d-1511c0d8b8e9.sock'}", {item["to"] for item in self.sent()})
+                        self.assertIn(f"uds:{self.socket_root / '3764fee6-1374-598d-bb7d-1511c0d8b8e9.sock'}", {item["to"] for item in self.sent()})
 
     def test_persistently_slow_leading_panes_cannot_starve_later_alerts(self) -> None:
         names = ["unit-one", *(f"unit-{number}" for number in range(2, 14))]
@@ -1103,8 +1106,8 @@ runpy.run_path(str(script), run_name='__main__')
             self.assertEqual(inspected[0], expected, "the last pass's first attempt yields to its successor")
             previous_first = inspected[0]
         self.assertEqual(len(self.sent()), len(names) * 2)
-        self.assertEqual({item["to"] for item in self.sent() if item["to"] != f"uds:{self.root / '54c9fdb8-6dfc-55dd-8242-a523c2e9f81f.sock'}"},
-                         {f"uds:{self.root / (unit_session(name) + '.sock')}" for name in names})
+        self.assertEqual({item["to"] for item in self.sent() if item["to"] != f"uds:{self.socket_root / '54c9fdb8-6dfc-55dd-8242-a523c2e9f81f.sock'}"},
+                         {f"uds:{self.socket_root / (unit_session(name) + '.sock')}" for name in names})
 
     def test_failed_leading_reads_do_not_starve_a_healthy_pane(self) -> None:
         names = ["unit-one", *(f"unit-{number}" for number in range(2, 14))]
@@ -1129,7 +1132,7 @@ runpy.run_path(str(script), run_name='__main__')
                   mock.patch.object(stall_watch, "agent_status", return_value="idle")):
                 self.assertEqual(self.tick(START + 300 + pass_number).returncode, 0)
         self.assertEqual(len(self.sent()), 2)
-        self.assertIn(f"uds:{self.root / 'fdf3198c-88d1-5942-8de0-ccb90fa5c7b6.sock'}", {item["to"] for item in self.sent()})
+        self.assertIn(f"uds:{self.socket_root / 'fdf3198c-88d1-5942-8de0-ccb90fa5c7b6.sock'}", {item["to"] for item in self.sent()})
 
     def test_a_herdr_unit_is_watched_through_a_joined_400_line_read(self) -> None:
         self.panes["unit-one"].update(session="native", label="native")
@@ -1162,8 +1165,8 @@ runpy.run_path(str(script), run_name='__main__')
         self.assertEqual({item["from"] for item in first}, {"stall-watch"})
         bump = next(item for item in first if item["key"].endswith(":bump"))
         tell = next(item for item in first if item["key"].endswith(":tell"))
-        self.assertEqual(bump["to"], f"uds:{self.root / '204f532d-a97a-59e7-a6a7-caf86af3f5ee.sock'}")
-        self.assertEqual(tell["to"], f"uds:{self.root / '54c9fdb8-6dfc-55dd-8242-a523c2e9f81f.sock'}")
+        self.assertEqual(bump["to"], f"uds:{self.socket_root / '204f532d-a97a-59e7-a6a7-caf86af3f5ee.sock'}")
+        self.assertEqual(tell["to"], f"uds:{self.socket_root / '54c9fdb8-6dfc-55dd-8242-a523c2e9f81f.sock'}")
         self.assertIn("idle since 12:00 PDT", bump["text"])
         self.assertIn("Continue your run", bump["text"])
         self.assertIn("Last status: none on screen", tell["text"])
@@ -1363,7 +1366,7 @@ runpy.run_path(str(script), run_name='__main__')
         self.panes["unit-one"]["agent_status"] = "blocked"
         self.panes["unit-one"]["pane"] = EDIT_PROMPT
         _ = self.tick(START)
-        _ = self.fail_file.write_text(json.dumps([f"uds:{self.root / '54c9fdb8-6dfc-55dd-8242-a523c2e9f81f.sock'}"]))
+        _ = self.fail_file.write_text(json.dumps([f"uds:{self.socket_root / '54c9fdb8-6dfc-55dd-8242-a523c2e9f81f.sock'}"]))
         for offset in (60, 179):
             failed = self.tick(START + offset)
             self.assertIn("prompt-owner", failed.stderr)
@@ -1842,7 +1845,7 @@ runpy.run_path(str(script), run_name='__main__')
                           PROMPT_KEY, ""))
         owner = self.owner_messages()
         self.assertEqual([(item["to"], item["from"], item["key"]) for item in owner],
-                         [(f"uds:{self.root / '54c9fdb8-6dfc-55dd-8242-a523c2e9f81f.sock'}", "rca", "rca-261006-1")])
+                         [(f"uds:{self.socket_root / '54c9fdb8-6dfc-55dd-8242-a523c2e9f81f.sock'}", "rca", "rca-261006-1")])
         self.assertIn(DELETE_CALL["command"], owner[0]["text"])
         self.assertIn("rca.py start 261006-1 --owner", owner[0]["text"])
         # The same prompt opens nothing more; 30 minutes after the case opened its owner gets one reminder.
@@ -2186,7 +2189,7 @@ runpy.run_path(str(script), run_name='__main__')
                 if notice:
                     tell, = self.sent()
                     self.assertTrue(tell["key"].endswith(":tell"))
-                    self.assertEqual(tell["to"], f"uds:{self.root / '54c9fdb8-6dfc-55dd-8242-a523c2e9f81f.sock'}")
+                    self.assertEqual(tell["to"], f"uds:{self.socket_root / '54c9fdb8-6dfc-55dd-8242-a523c2e9f81f.sock'}")
                     good_read = datetime.fromtimestamp(START + 3600, ZoneInfo("UTC")).isoformat()
                     for offset, outcome in ((0.1, UsageReadOutcome.OK), (0.2, UsageReadOutcome.RATE_LIMITED_429)):
                         with self.subTest(usage_outcome=outcome):
@@ -2302,7 +2305,7 @@ runpy.run_path(str(script), run_name='__main__')
                 sent = self.sent()
                 self.assertEqual(len(sent), 4)
                 self.assertEqual({item["to"] for item in sent if item["key"].endswith(":bump")},
-                                 {f"uds:{self.root / (unit_session(name) + '.sock')}"
+                                 {f"uds:{self.socket_root / (unit_session(name) + '.sock')}"
                                   for name in ("unit-one", "following")})
                 self.assertEqual(len([item for item in sent if item["key"].endswith(":tell")]), 2)
 
@@ -2839,7 +2842,7 @@ runpy.run_path(str(script), run_name='__main__')
         self.assertTrue(first_keys.isdisjoint({item["key"] for item in second}))
 
     def test_failed_showrunner_delivery_retries_without_rebumping_unit(self) -> None:
-        _ = self.fail_file.write_text(json.dumps([f"uds:{self.root / '54c9fdb8-6dfc-55dd-8242-a523c2e9f81f.sock'}"]))
+        _ = self.fail_file.write_text(json.dumps([f"uds:{self.socket_root / '54c9fdb8-6dfc-55dd-8242-a523c2e9f81f.sock'}"]))
         _ = self.tick(START)
         _ = self.tick(START + 300)
         first = self.sent()
@@ -2995,7 +2998,7 @@ runpy.run_path(str(script), run_name='__main__')
         self.assertTrue(all("idle since 12:01 PDT" in item["text"] for item in sent))
 
     def test_transcript_reply_keeps_reported_stretch_and_failed_delivery_key(self) -> None:
-        _ = self.fail_file.write_text(json.dumps([f"uds:{self.root / '54c9fdb8-6dfc-55dd-8242-a523c2e9f81f.sock'}"]))
+        _ = self.fail_file.write_text(json.dumps([f"uds:{self.socket_root / '54c9fdb8-6dfc-55dd-8242-a523c2e9f81f.sock'}"]))
         _ = self.tick(START)
         _ = self.tick(START + 300)
         first = self.sent()
@@ -3139,7 +3142,7 @@ runpy.run_path(str(script), run_name='__main__')
         _ = self.tick(START)
         _ = self.tick(START + 600)
         self.assertEqual([one["to"] for one in self.sent() if "idle since" in one["text"] and "bumped" in one["text"]],
-                         [f"uds:{self.root / '54c9fdb8-6dfc-55dd-8242-a523c2e9f81f.sock'}"])
+                         [f"uds:{self.socket_root / '54c9fdb8-6dfc-55dd-8242-a523c2e9f81f.sock'}"])
 
     def test_locked_tick_exits_without_sending(self) -> None:
         _ = self.tick(START)
@@ -3336,7 +3339,7 @@ runpy.run_path(str(script), run_name='__main__')
         _ = self.unit("unit-three")
         self.configure({"showrunner": ["unit-one", "unit-two", "unit-three"]})
         _ = self.tick(START)
-        address = self.root / "send-barrier.sock"
+        address = self.socket_root / "send-barrier.sock"
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener, ThreadPoolExecutor(max_workers=1) as server:
             listener.bind(str(address))
             listener.listen(6)

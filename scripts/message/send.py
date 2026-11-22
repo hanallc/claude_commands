@@ -4075,9 +4075,8 @@ def _forward_relay_socket(listener: socket.socket, peer: socket.socket, stop: so
 
 
 @contextmanager
-def _relay_proxy_directory() -> Generator[str]:
+def _relay_proxy_directory(*, root: str = "/tmp") -> Generator[str]:
     """Remove the proxy directory when the sender closes its pipe or dies."""
-    root = conf.read_or_repository("build_folders").text("roots.system")
     program = """
 import sys
 from tempfile import TemporaryDirectory

@@ -19,6 +19,7 @@ from unittest import mock
 
 from scripts.message import process_table
 from scripts.herdr import herdr_types
+from scripts.lib.socket_test_support import short_socket_directory
 from scripts.message import codex_daemon
 from scripts.message import roster
 from scripts.herdr import herdr
@@ -322,7 +323,7 @@ class TopLevelRunningRecordTests(unittest.TestCase):
             + "with open(os.environ['SSH_RECORD'], 'a') as log: log.write(repr(sys.argv[1:]) + '\\n')\n"
             + "raise SystemExit(91)\n", encoding="utf-8")
         ssh.chmod(0o755)
-        sockets = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="s-")))
+        sockets = Path(self.enterContext(short_socket_directory("s-")))
         self.socket_path = sockets / "live.sock"
         listener = self.enterContext(socket.socket(socket.AF_UNIX))
         listener.bind(str(self.socket_path))

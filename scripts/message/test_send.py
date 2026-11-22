@@ -150,11 +150,12 @@ def write_send_config(path: Path, values: str) -> int:
 @contextmanager
 def relay_socket_directory() -> Generator[str]:
     """Keep both ends of the relay in a short private folder."""
-    with tempfile.TemporaryDirectory(prefix="r-") as directory:
+    with short_socket_directory("r-") as directory:
         config = Path(directory) / "config"
         _ = write_send_config(config / "send.conf", "")
-        _ = write_config_fixture(config / "build_folders.conf", f"roots.system={directory}\n")
-        with mock.patch.dict(os.environ, {"CONF_DIR": str(config)}):
+        proxy = partial(send._relay_proxy_directory, root=directory)  # pyright: ignore[reportPrivateUsage]
+        with (mock.patch.dict(os.environ, {"CONF_DIR": str(config)}),
+              mock.patch.object(send, "_relay_proxy_directory", proxy)):
             yield directory
 
 
@@ -203,6 +204,7 @@ class RelayAccountTests(unittest.TestCase):
             assert started
             program = """
 import os, re, signal, sys
+from functools import partial
 from scripts.message import review_hold, send, send_later
 
 def killed(_command, prompt, _timeout, _environment, _cwd):
@@ -211,6 +213,7 @@ def killed(_command, prompt, _timeout, _environment, _cwd):
     os.kill(os.getpid(), signal.SIGKILL)
 
 send.run = killed
+send._relay_proxy_directory = partial(send._relay_proxy_directory, root=sys.argv[4])
 send._validate_attempt_recipient = lambda _attempt: send.SocketAttemptValidated()
 message = send.Message("uds:" + sys.argv[1], "fixture", "Preview", "body", None)
 attempt = send.ClaudeDeliveryAttempt(send.RelayProcessRecipient(send.machine(), int(sys.argv[2]), sys.argv[3]), int(sys.argv[2]), sys.argv[3], sys.argv[1])
@@ -1180,7 +1183,8 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
         )
         (self.root / "config").mkdir()
         _ = write_send_config(self.root / "config/send.conf", "")
-        _ = write_config_fixture(self.root / "config/build_folders.conf", f"roots.system={self.root}\n")
+        proxy = partial(send._relay_proxy_directory, root=str(self.root))  # pyright: ignore[reportPrivateUsage]
+        _ = self.enterContext(mock.patch.object(send, "_relay_proxy_directory", proxy))
         _ = self.enterContext(mock.patch.object(staff, "runtime_id", return_value=""))
         _ = self.enterContext(mock.patch.object(unit_lookup, "checked_conversation", side_effect=self.checked_recipient))
         _ = self.enterContext(mock.patch.object(unit_lookup, "current_claude_record", side_effect=self.current_fixture_record))
@@ -2001,9 +2005,8 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
         """Record a live Claude session, or its rename: this test process stands in for it."""
         path = self.root / f"{session_id}.sock"
         if not path.exists():
-            held = socket.socket(socket.AF_UNIX)
+            held = self.enterContext(socket.socket(socket.AF_UNIX))
             held.bind(str(path))
-            self.addCleanup(held.close)
         if session_id != "recipient" and name.casefold() == "recipient":
             _ = self.staff_rows.pop("recipient", None)
         self.staff_member(session_id, name)
@@ -8064,7 +8067,7 @@ class AccountDaemonRoutingTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
-        self.root = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="d-")))
+        self.root = Path(self.enterContext(short_socket_directory("d-")))
         self.homes = (self.root / ".codex", self.root / ".codex2")
         notes = self.root / "agents"
         self.queue_contents, self.queued = {}, []
@@ -8083,7 +8086,6 @@ class AccountDaemonRoutingTests(unittest.TestCase):
         (self.root / "claude-sessions").mkdir()
         (self.root / "config").mkdir()
         _ = write_send_config(self.root / "config/send.conf", "")
-        _ = write_config_fixture(self.root / "config/build_folders.conf", f"roots.system={self.root}\n")
         binaries = self.root / "bin"
         binaries.mkdir()
         ps = binaries / "ps"
@@ -8140,8 +8142,8 @@ class AccountDaemonRoutingTests(unittest.TestCase):
         return FakeDaemon(home / "app-server-control/app-server-control.sock",
                           partial(self.serve_loaded_thread, name=name), repeat=True)
 
-    def command(self, script: str, *arguments: str) -> subprocess.CompletedProcess[str]:
-        return subprocess.run(staff_child_command(Path(send.__file__).with_name(script), self.members, *arguments),
+    def command(self, script: str | Path, *arguments: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(staff_child_command(Path(send.__file__).parent / script, self.members, *arguments),
                               capture_output=True, text=True, check=False, timeout=30)
 
     def assert_queues_unchanged(self) -> None:
@@ -8264,8 +8266,17 @@ class AccountDaemonRoutingTests(unittest.TestCase):
             _ = (self.root / "claude-sessions" / f"{pid}.json").write_text(json.dumps({
                 "pid": pid, "sessionId": sender_id, "name": "sdlc", "updatedAt": 1,
                 "procStart": started, "messagingSocketPath": address.removeprefix("uds:")}))
+            relay_script = self.root / "send-reply.py"
+            _ = relay_script.write_text("""import sys
+from functools import partial
+from scripts.message import send
+
+send._relay_proxy_directory = partial(send._relay_proxy_directory, root=sys.argv.pop(1))
+raise SystemExit(send.main(sys.argv[1:]))
+""")
             with mock.patch.dict(os.environ, {**host, "CODEX_THREAD_ID": "account-thread"}):
-                returned = self.command("send.py", "--to", address, "--from", "Account window", "--text", response)
+                returned = self.command(relay_script, str(self.root), "--to", address,
+                                        "--from", "Account window", "--text", response)
             self.assertEqual(returned.returncode, 0, returned.stderr)
             self.assertTrue(returned.stdout.startswith("SENT:"), returned.stdout)
             with sender.accept()[0] as connection:
