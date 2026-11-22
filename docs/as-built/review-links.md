@@ -935,15 +935,26 @@ A review ID opens one card in a dialog on the List.
 A summary links to the card when exactly one review is available.
 A summary for zero or multiple available reviews is plain text.
 The List loads the card document only when the dialog opens.
-The existing Review body route supplies the summary, body, styles, and controls.
-The Review table uses the same card renderer and action code.
+The existing Review body route supplies the title, metadata, body, and controls.
+The Review table and the dialog use the same body renderer and action code.
+The dialog places the full title above the metadata, with Close beside the title.
+The metadata shows the Waiting reason and urgency when available.
+The body scrolls between the header and the feedback controls.
+With feedback controls, the body reserves at least 96 px.
+The whole box scrolls if the header, footer, and body minimum exceed the frame height.
+The Later menu and calendar open over the body above the footer.
+The box reserves room for the menu and calendar so they do not cover the footer.
+The body hides empty sections and sections that match the title without inline code marks.
+The body shows the item text and log in one column below 800 px.
+When the item has no text, the log uses the full body width.
 The dialog reads a Done card on demand and shows it without actions.
 A Validating card lets the user ask the validator a question.
 If the record disappears, the dialog shows a message.
 Escape, Close, and a click outside the card close the dialog.
 Focus returns to the List link.
 The dialog fills the screen at the console's phone breakpoint, including on the direct List page.
-On a desktop, the List centers the dialog.
+On a desktop, the List centers the dialog and leaves at least 48 px above and below it.
+The dialog dims the List with a 90 percent black backdrop and a 3 px blur.
 Switching browser tabs keeps the dialog and its draft.
 Changing console pages closes an idle dialog when it has no draft.
 The dialog preserves the List and Review addresses and filters.

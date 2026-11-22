@@ -1039,8 +1039,8 @@ def render(root: Path, *, include_counts: bool = True, defer_counts: bool = Fals
                + '<div class="list-table"><table aria-labelledby="list-linked-heading">' + columns
                + '<thead><tr>' + linked_headers + '</tr></thead></table></div></section>'
                + counts + '</div>'
-               + '<dialog data-list-review-dialog aria-label="Review card"><div class="list-review-close">'
-               + '<button type="button" autofocus>Close</button></div></dialog>'
+               + '<dialog data-list-review-dialog aria-label="Review card">'
+               + '<button class="list-review-close" type="button" autofocus>Close</button></dialog>'
                + new_item_dialog.render()
                + '<script>' + SCRIPT + '</script>')
     return page_frame.rendered(change_page.document(content, "The List"), started, read_at)
@@ -1048,15 +1048,16 @@ def render(root: Path, *, include_counts: bool = True, defer_counts: bool = Fals
 
 STYLE = record_table.STYLE + record_table.DATE_TIME_STYLE + '<style>' + review_page.QUESTION_COLOR_RULE + '''
 [data-list-review-dialog]{width:min(1060px,calc(100% - 48px));max-width:none;max-height:none;padding:0;
-border:1px solid var(--line);border-radius:12px;background:var(--bg);color:var(--ink);overflow:hidden;box-sizing:border-box}
-[data-list-review-dialog]::backdrop{background:#0009}
-.list-review-close{display:flex;justify-content:flex-end;padding:8px 12px}
-.list-review-close button{margin:0;border:1px solid var(--line);border-radius:8px;background:var(--card);color:var(--ink)}
+border:1px solid var(--line);border-radius:12px;background:var(--card);color:var(--ink);overflow:hidden;box-sizing:border-box}
+[data-list-review-dialog]::backdrop{background:rgb(0 0 0 / 90%);backdrop-filter:blur(3px)}
+.list-review-close{position:absolute;top:24px;right:24px;z-index:1;margin:0;min-height:32px;padding:4px 12px;
+font-size:13px;border:1px solid var(--line);border-radius:8px;background:var(--card);color:var(--ink)}
 [data-list-review-dialog] iframe{display:block;width:100%;height:var(--review-card-height,15rem);
-max-height:calc(100dvh - 108px);border:0}
-:root:has([data-list-review-dialog][open][data-fullscreen]){overflow:hidden;scrollbar-gutter:auto}
+max-height:calc(100dvh - 98px);border:0}
+:root:has([data-list-review-dialog][open]){overflow:hidden}
+:root:has([data-list-review-dialog][open]) [data-list]{opacity:.35}
+:root:has([data-list-review-dialog][open][data-fullscreen]){scrollbar-gutter:auto}
 [data-list-review-dialog][data-fullscreen]{width:100vw;height:100dvh;border:0;border-radius:0;margin:0}
-[data-list-review-dialog][data-fullscreen][open]{display:grid;grid-template-rows:auto minmax(0,1fr)}
 [data-list-review-dialog][data-fullscreen] iframe{height:100%;max-height:none}
 [data-record-filters] .record-filter-row button{max-width:100%;overflow-wrap:anywhere}
 .list-producer-filter{display:flex;align-items:center;flex-wrap:wrap;gap:8px 12px;margin-bottom:8px}
@@ -1735,7 +1736,7 @@ function closeReviewCard(){
  reviewMotion.finish();
  reviewDialog.close();
  card.restoreHost?.();
- card.remove();
+ card.frame.remove();
  reviewClose.disabled=false;
  if(!listHost?.hidden && document.visibilityState==='visible') restoreReviewLink(card.link);
 }
@@ -1778,14 +1779,10 @@ document.addEventListener('click',event=>{
  const frame=document.createElement('iframe');
  frame.title='Review card';
  frame.src=link.href;
- const observer=new ResizeObserver(([entry])=>frame.style.setProperty('--review-card-height',Math.ceil(entry.borderBoxSize[0].blockSize)+'px'));
- const card={frame,link:reviewLinkPlace(link),restoreHost:fitReviewDialog(),
-  remove:()=>{observer.disconnect();frame.remove();}};
+ const card={frame,link:reviewLinkPlace(link),restoreHost:fitReviewDialog()};
  activeReview=card;
  frame.addEventListener('load',()=>{
   const doc=frame.contentDocument;
-  const main=doc?.querySelector('main');
-  if(main) observer.observe(main,{box:'border-box'});
   doc?.addEventListener('keydown',event=>{
    if(event.key==='Escape' && !event.defaultPrevented && activeReview===card){
     event.preventDefault();closeReviewCard();
