@@ -2722,13 +2722,14 @@ def run_handoff(request: ChildHandoffRequest) -> int:
         tip = pushed.tip if isinstance(pushed, PushedTip) else delivery.merge_head
         before_merge_tip = tip
         try:
-            follow_main = isinstance(request.promotion, production_doc.PromoteTo) and not production_checkpoint_step_record(
-                request.production, delivery.merge_head, "handoff-promotion").exists()
-            with tested_main_push(request.production, tip, retest, tip, follow_main=follow_main) as tested_tip:
-                if tested_tip != tip:
-                    tip = push_git(request.production, False)
-                published = promote_handoff(request, delivery.merge_head, tip)
-            finish_handoff_promotion(request, delivery.merge_head, published)
+            if isinstance(request.promotion, production_doc.PromoteTo):
+                follow_main = not production_checkpoint_step_record(
+                    request.production, delivery.merge_head, "handoff-promotion").exists()
+                with tested_main_push(request.production, tip, retest, tip, follow_main=follow_main) as tested_tip:
+                    if tested_tip != tip:
+                        tip = push_git(request.production, False)
+                    published = promote_handoff(request, delivery.merge_head, tip)
+                finish_handoff_promotion(request, delivery.merge_head, published)
         finally:
             record_handoff_publication(request, delivery.merge_head, tip)
         record_publication_changes(request.production, report_unchanged=False)
