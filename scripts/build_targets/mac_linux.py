@@ -892,7 +892,8 @@ def route(repo: Path, *, mode: SuiteMode, full: bool, module_time_limit_s: float
                 reply = transfer_source(repo, settings, source, request)
                 run = completed_run(reply, request, source)
         except GuestMissingPrerequisite:
-            request = {**request, 'attempt': uuid4().hex}
+            request = request.copy()
+            request['attempt'] = uuid4().hex
             with (mac_linux_reservation(repo, mode, gate_job),
                   bundle_refs(repo, source, request['attempt']) as prefix):
                 reply = run_remote(repo, settings, source, request, prefix,
