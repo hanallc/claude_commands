@@ -1288,8 +1288,23 @@ def retirement_rebase(unit: RetiringUnit, *, settings: conf.ConfigRead) -> Path 
     return None
 
 
+def _branch_content_already_on_merge_ref(unit: RetiringUnit, ref: str, merge_ref: str,
+                                         *, settings: conf.ConfigRead) -> bool:
+    """Check that a merge of the branch leaves the merge tree unchanged."""
+    merged = retirement_git(unit, "merge-tree", "--write-tree", merge_ref, ref, settings=settings)
+    if merged.returncode == 1:
+        return False
+    if merged.returncode:
+        raise OSError(retirement_failure(merged))
+    current = retirement_git(unit, "rev-parse", f"{merge_ref}^{{tree}}", settings=settings)
+    if current.returncode:
+        raise OSError(retirement_failure(current))
+    merged_tree = merged.stdout.partition("\n")[0]
+    return bool(merged_tree) and merged_tree == current.stdout.strip()
+
+
 def retirement_refusals(unit: RetiringUnit, *, settings: conf.ConfigRead, check_absent_branch: bool = False) -> list[str]:
-    """Keep uncommitted work and commits outside the merge branch."""
+    """Keep uncommitted work and branch content missing from the merge branch."""
     present = unit.worktree.is_dir()
     if unit.branch and (rebasing := retirement_rebase(unit, settings=settings)) is not None:
         return [f"branch {unit.branch} is rebasing in {rebasing}"]
@@ -1313,7 +1328,10 @@ def retirement_refusals(unit: RetiringUnit, *, settings: conf.ConfigRead, check_
         commits = retirement_git(unit, "rev-list", "--no-merges", ref, "--not", *merge_refs, settings=settings)
         if commits.returncode:
             raise OSError(retirement_failure(commits))
-        if commits.stdout.strip():
+        if commits.stdout.strip() and not any(
+            _branch_content_already_on_merge_ref(unit, ref, merge_ref, settings=settings)
+            for merge_ref in merge_refs
+        ):
             found.append(f"unmerged commits on {unit.branch or ref}: {commits.stdout.splitlines()[0]}")
             break
     return found
