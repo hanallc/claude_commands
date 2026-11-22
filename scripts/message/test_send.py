@@ -41,6 +41,7 @@ from unittest import mock
 from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.lib.test_models_registry import write_registry
 from scripts.herdr import herdr_types
+from scripts.herdr.place import HerdrPlace
 from scripts.lib.signal_test_support import install_signal_pid_guard
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.script_envelope import script_prompt
@@ -171,6 +172,13 @@ def approve_relay_call(command: list[str], target: str, text: str, summary: str,
 
 
 RELAY_FIXTURE_TARGET = "uds:/fixture/private/delivery.sock"
+
+
+def relay_mismatches(state: Path) -> list[dict[str, object]]:
+    path = state / "relay_mismatches.jsonl"
+    if not path.exists():
+        return []
+    return [send.as_dict(send.loads(line)) for line in path.read_text().splitlines()]
 
 
 class RelayAccountTests(unittest.TestCase):
@@ -696,30 +704,43 @@ send._bound_relay(message, 2, [], {}, attempt)
         original = "Message from sender-address: Preview\n\nbody"
         displayed = ("Message from sender-address: Preview\nSender native id: unavailable"
                      "\nShown sender: sdlc · roles · worker test\nSent: 01:12 EST\n\nbody")
+        at = datetime(2026, 11, 19, 6, 12, tzinfo=timezone.utc)
+        changed_message = {
+            "time": at.isoformat(), "to": RELAY_FIXTURE_TARGET, "to_truncated": False,
+            "text_difference": {"first_difference": 37, "approved_window": displayed[5:69],
+                                "sent_window": original[5:]},
+        }
+        other_target = "session:other"
         with tempfile.TemporaryDirectory() as directory:
             home = Path(directory)
             (home / ".claude").mkdir()
             _ = write_registry(home / ".claude/config/models.conf")
             _ = (home / ".claude.json").write_text(json.dumps({
                 "oauthAccount": {"emailAddress": "fixture@example.invalid"}}))
-            for label, code, events, outcome, detail in (
-                ("approved", 0, stream(INIT, call(displayed), answer(OK)), "sent", "; verbatim;"),
-                ("changed", 0, stream(INIT, call(original), answer(OK)), "failed", "different target or payload"),
+            for label, code, events, outcome, detail, mismatches in (
+                ("approved", 0, stream(INIT, call(displayed), answer(OK)), "sent", "; verbatim;", []),
+                ("changed message", 0, stream(INIT, call(original), answer(OK)), "failed",
+                 "different target or payload", [changed_message]),
+                ("changed target", 0, stream(INIT, call(displayed, target=other_target), answer(OK)), "failed",
+                 "different target or payload", [{"time": at.isoformat(), "to": other_target, "to_truncated": False}]),
                 ("timeout", None, stream(INIT, call(displayed)), "failed",
-                 "relay timed out after 10 s; delivery unconfirmed"),
+                 "relay timed out after 10 s; delivery unconfirmed", []),
+                ("timeout with changed message", None, stream(INIT, call(original)), "failed",
+                 "relay timed out after 10 s; delivery unconfirmed", [changed_message]),
                 ("second call approved", 0,
                  stream(INIT, call(original, "refused"), answer("unexpected SendMessage input", "refused", error=True),
                         call(displayed), answer(OK)),
-                 "sent", "queued there (msg_id m1); forwarded 1 of 2 SendMessage calls"),
+                 "sent", "queued there (msg_id m1); forwarded 1 of 2 SendMessage calls", [changed_message]),
             ):
+                state = home / label
                 with (
                     self.subTest(label=label),
                     mock.patch.dict(os.environ, {"HOME": str(home), "PATH": os.environ["PATH"], "USER_ZONE": "America/New_York"}, clear=True),
-                    mock.patch.object(send, "now", return_value=datetime(2026, 11, 19, 6, 12, tzinfo=timezone.utc)),
+                    mock.patch.object(send, "now", return_value=at),
                     scratch_accounts_config() as config,
                     mock.patch.object(send, "_bound_relay", side_effect=run_bound_fixture),
                     mock.patch.object(send, "claude_binary", return_value="claude"),
-                    mock.patch.object(send, "STATE", home / "message-state"),
+                    mock.patch.object(send, "STATE", state),
                     mock.patch.object(send, "run", return_value=(code, events, "")) as launch,
                 ):
                     _ = write_send_config(config / "send.conf", "")
@@ -727,6 +748,7 @@ send._bound_relay(message, 2, [], {}, attempt)
                                                              "sdlc · roles · worker test"), 10)
                     self.assertEqual(result.outcome, outcome, result.detail)
                     self.assertIn(detail, result.detail)
+                    self.assertEqual(relay_mismatches(state), mismatches)
                     if code is None:
                         self.assertIsInstance(result, send.UncertainRelayDelivery)
                     command = cast(list[str], launch.call_args.args[0])
@@ -4824,13 +4846,14 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
     def test_a_note_to_the_user_with_one_key_has_no_window_without_repeat_minutes(self) -> None:
         note = ["--here", "--to", "user", "--from", "hana", "--summary", "Build done", "--key", "build", "--no-action",
                 "--text", "The build passed."]
-        for extra in ([], ["--through-silence"]):
-            note.extend(extra)
+        for extra in ([], ["--through-silence"], ["--user-asked"]):
             with self.subTest(extra=extra), mock.patch.object(send, "run", return_value=(0, "pushover: sent\n", "")) as channel:
-                self.assertEqual([send.send(send.parse(registered_arguments(note))).outcome for _ in range(2)], ["sent", "sent"])
+                options = send.parse(registered_arguments([*note, *extra]))
+                self.assertEqual([send.send(options).outcome for _ in range(2)], ["sent", "sent"])
             self.assertEqual(channel.call_count, 2)
             command = cast(list[str], channel.call_args.args[0])
-            self.assertEqual("--through-silence" in command, bool(extra))
+            self.assertEqual("--through-silence" in command, "--through-silence" in extra)
+            self.assertEqual("--user-asked" in command, "--user-asked" in extra)
             self.assertEqual(command[command.index("--priority") + 1], "0")
             self.assertNotIn("--repeat-minutes", command)
 
@@ -6614,16 +6637,22 @@ runpy.run_path(sys.argv[0], run_name="__main__")
         self.assertIn("action=log in", commands[0][-1])
 
     def test_pushover_refusal_exits_2_and_keeps_nothing(self) -> None:
-        refused = f"pushover: {REFUSED_BEFORE_SENDING}: priority 2 requires --action"
-        output = io.StringIO()
-        arguments = ["--to", "user", "--from", "test", "--summary", "natedev: disk", "--no-action",
-                     "--text", "full"]
-        with mock.patch.object(send, "run", return_value=(2, "", refused)), redirect_stdout(output):
-            code = registered_main(arguments)
-        self.assertEqual(code, 2)
-        self.assertEqual(output.getvalue(), f"REFUSED: {refused}\n")
-        self.assertEqual(send.pending("user"), "")
-        self.assertEqual(self.log()[0]["outcome"], "refused")
+        cases = (
+            (["--to", "user", "--from", "test", "--summary", "natedev: disk", "--no-action", "--text", "full"],
+             "priority 2 requires --action"),
+            (["--to", "user", "--user-asked", "--text-id", "nixos.ups_replace_battery"],
+             "--user-asked requires --text-id nate.adhoc"),
+        )
+        for index, (arguments, reason) in enumerate(cases):
+            refused = f"pushover: {REFUSED_BEFORE_SENDING}: {reason}"
+            output = io.StringIO()
+            with (self.subTest(reason=reason), mock.patch.object(send, "run", return_value=(2, "", refused)),
+                  redirect_stdout(output)):
+                code = registered_main(arguments)
+            self.assertEqual(code, 2)
+            self.assertEqual(output.getvalue(), f"REFUSED: {refused}\n")
+            self.assertEqual(send.pending("user"), "")
+            self.assertEqual(self.log()[index]["outcome"], "refused")
 
     def test_pushover_exit_2_for_missing_keys_is_failed(self) -> None:
         keys_missing = "pushover: PUSHOVER_USER and PUSHOVER_TOKEN must both be set in /missing/env"
@@ -6917,6 +6946,7 @@ runpy.run_path(sys.argv[0], run_name="__main__")
                                          "--value", "title=work stopped", "--value", f"description={description}"])
                 self.assertEqual(send.wrong_template(options, description), expected)
                 self.assertIsNone(send.wrong_template(options._replace(text_id="quota.paid_credits"), description))
+                self.assertIsNone(send.wrong_template(options._replace(user_asked=True), description))
 
     def paid_credits_arguments(self, *extra: str) -> list[str]:
         values = {"account": "codex2", "machine": "natedev", "credits": "25,345", "refill": "Tue 10-27 02:33 EDT",
@@ -7201,6 +7231,14 @@ runpy.run_path(sys.argv[0], run_name="__main__")
                 marker = send.as_dict(send.loads(self.failure_marker().read_text()))
                 self.assertEqual(marker["fallback"], "Title: Build stopped\nAction: Choose in natedev terminal.\n"
                                  + "Choose whether to retry.\n\nSent by: Build writer · Template: alert.decision")
+        arguments = ["--to", "user", "--machine", "natedev", "--text-id", "nate.adhoc", "--user-asked",
+                     "--through-silence", "--value", "sender=writer", "--value", "title=Build passed",
+                     "--value", "description=You asked to be told when the build passed."]
+        with mock.patch.object(send, "run", return_value=(0, "SENT: to the user\n", "")) as run:
+            self.assertEqual(send.send(send.parse(arguments)).outcome, "sent")
+        forwarded = shlex.split(cast(list[str], run.call_args.args[0])[-1])
+        self.assertIn("--user-asked", forwarded)
+        self.assertIn("--through-silence", forwarded)
         with mock.patch.object(send, "run", return_value=(255, "", "ssh unavailable")):
             result = send.send(send.parse(registered_arguments(self.user_arguments("--machine", "natedev"))))
         self.assertIn(send.UNREVIEWED_FALLBACK, result.detail)
@@ -7362,7 +7400,7 @@ runpy.run_path(sys.argv[0], run_name="__main__")
         self.assertEqual(options.action, send.NoUserRecipient())
 
     def test_action_flags_are_only_for_user_messages(self) -> None:
-        for action in (["--no-action"], ["--action", "reply"], ["--through-silence"]):
+        for action in (["--no-action"], ["--action", "reply"], ["--through-silence"], ["--user-asked"]):
             errors = io.StringIO()
             with self.assertRaises(SystemExit) as raised, mock.patch("sys.stderr", errors):
                 _ = local_options(["--to", "natedev", *action, "--text", "hello"])
@@ -7440,9 +7478,13 @@ class PeerSendTests(RecipientStaffFixture, ShutdownTestCase):
     def read_local(self, _environment: object, scope: roster.RosterScope, *, membership: staff.StaffSnapshot,
                    registry: sessions.RegistryRead,
                    participants: roster.AllRosterSessions | roster.MessageParticipants) -> roster.Roster:
-        del registry, participants
+        del registry
         self.assertEqual(scope, roster.ThisMachine())
         self.assertEqual(membership, staff.StaffSnapshot(tuple(self.staff_rows.values())))
+        if isinstance(participants, roster.MessageParticipants):
+            return replace(self.local, entries=[entry for entry in self.local.entries if not (
+                entry.kind == "codex" and isinstance(entry.thread, roster.NoCodexThread)
+                and isinstance(entry.pane, HerdrPlace))])
         return self.local
 
     def relay(self, message: send.Message, _timeout: float) -> send.Result:
@@ -7521,17 +7563,25 @@ class PeerSendTests(RecipientStaffFixture, ShutdownTestCase):
 
     def test_skip_closed_cannot_prove_absence_with_an_incomplete_roster(self) -> None:
         unknown = replace(self.row("", "codex:unknown"), thread=roster.NoCodexThread(),
-                          reach=roster.CannotReceiveMessages("interactive Codex in a herdr pane"))
+                          reach=roster.CannotReceiveMessages("interactive Codex in a herdr pane"),
+                          pane=HerdrPlace("agents", "w1:p1"))
         clean = self.recipient_roster([], [])
         unreadable = self.recipient_roster([], ["Codex daemon: socket unreadable"])
         unidentified = self.recipient_roster([unknown], [])
-        for local, peer in ((unreadable, clean), (clean, unreadable),
-                            (unidentified, clean), (clean, unidentified)):
-            with self.subTest(local=local, peer=peer):
+        self.staff_member("holder", "holder")
+        worker = staff.StaffRow(staff.StaffId("worker"), "worker", "impl", staff.ReportsTo(staff.StaffId("holder")),
+                                current_session=staff.StaffId("worker-thread"))
+        self.staff_rows[worker.id] = worker
+        for address, local, peer in (
+            ("codex:gone", unreadable, clean), ("codex:gone", clean, unreadable),
+            ("codex:gone", unidentified, clean), ("codex:gone", clean, unidentified),
+            (f"codex:{worker.current_session}", unidentified, clean),
+        ):
+            with self.subTest(address=address, local=local, peer=peer):
                 self.local = local
                 self.peer(peer.entries, problems=tuple(peer.problems))
                 with mock.patch.object(failed_lookup, "report") as report:
-                    status, output, errors = self.run_main("codex:gone", "--skip-closed")
+                    status, output, errors = self.run_main(address, "--skip-closed")
                 self.assertEqual(status, 3, output + errors)
                 self.assertTrue(output.startswith("FAILED: "), output)
                 report.assert_called_once()
@@ -7754,10 +7804,14 @@ class PeerSendTests(RecipientStaffFixture, ShutdownTestCase):
 
     def test_local_problems_prevent_unproven_bare_name_fallback_to_the_peer(self) -> None:
         director = self.row("queue", "codex:director-thread", machine="natedev")
-        self.local = self.recipient_roster([director], ["worker source unreadable"])
         self.peer([self.row("absent here", "codex:peer")])
-        for target, expected_status in (("absent here", 2), ("queue-unit", 0)):
-            with self.subTest(target=target):
+        for target, expected_status, problems in (
+            ("absent here", 2, ["worker source unreadable"]),
+            ("queue-unit", 0, ["worker source unreadable"]),
+            ("queue-unit", 0, []),
+        ):
+            with self.subTest(target=target, problems=problems):
+                self.local = self.recipient_roster([director], problems)
                 status, output, errors = self.run_main(target)
                 self.assertEqual(status, expected_status, output + errors)
                 if target == "absent here":
@@ -7871,6 +7925,13 @@ class PeerSendTests(RecipientStaffFixture, ShutdownTestCase):
 
 class ReadRelayTests(ShutdownTestCase):
     FORWARDED: send.RelayForward = send.RelayRequestForwarded("t1", "hello")
+    state: Path = Path()
+
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        self.state = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        _ = self.enterContext(mock.patch.object(send, "STATE", self.state))
 
     def read_relay(self, stdout: str, forward: send.RelayForward = FORWARDED
                    ) -> send.CheckedRelayAcceptance | send.Result:
@@ -7879,11 +7940,41 @@ class ReadRelayTests(ShutdownTestCase):
     def test_delivered_verbatim(self) -> None:
         result = self.read_relay(stream(INIT, call("hello"), answer(OK)))
         self.assertEqual(result, send.CheckedRelayAcceptance("t1", "mode auto; verbatim; queued there (msg_id m1)"))
+        self.assertEqual(relay_mismatches(self.state), [])
 
-    def test_reworded_call_is_unconfirmed(self) -> None:
-        result = self.read_relay(stream(INIT, call("hi"), answer(OK)))
-        self.assertIsInstance(result, send.UncertainRelayDelivery)
-        self.assertIn("different target or payload", result.detail)
+    def test_changed_call_is_unconfirmed_and_records_the_difference(self) -> None:
+        for text, target, logged_target, truncated, difference in (
+            ("hi", RELAY_FIXTURE_TARGET, RELAY_FIXTURE_TARGET, False,
+             {"first_difference": 1, "approved_window": "hello", "sent_window": "hi"}),
+            ("hell", RELAY_FIXTURE_TARGET, RELAY_FIXTURE_TARGET, False,
+             {"first_difference": 4, "approved_window": "hello", "sent_window": "hell"}),
+            ("hello", "session:other", "session:other", False, None),
+            ("hello", "a" * 257, "a" * 256, True, None),
+        ):
+            with self.subTest(text=text, target=target):
+                result = self.read_relay(stream(INIT, call(text, target=target), answer(OK)))
+                assert isinstance(result, send.UncertainRelayDelivery)
+                self.assertEqual(result.detail, "SendMessage used a different target or payload; delivery unconfirmed")
+                entry = relay_mismatches(self.state)[-1]
+                self.assertEqual((entry["to"], entry["to_truncated"]), (logged_target, truncated))
+                self.assertEqual(entry.get("text_difference"), difference)
+
+    def test_multiple_changed_calls_are_logged_before_the_forward_result(self) -> None:
+        events = stream(INIT, call("changed", target="session:first"), call("hello", "t2", target="session:second"))
+        refused = send.RefusedRelayRequest("failed", "the relay tool call has no approval")
+        for forward, expected in (
+            (send.RelayRequestNotForwarded(), send.Result("failed", "2 SendMessage calls")),
+            (refused, refused),
+            (send.RelayRequestInterrupted("write interrupted"),
+             send.UncertainRelayDelivery("failed", "write interrupted; delivery unconfirmed")),
+        ):
+            with self.subTest(forward=forward):
+                before = len(relay_mismatches(self.state))
+                result = self.read_relay(events, forward)
+                self.assertIs(type(result), type(expected))
+                self.assertEqual(result, expected)
+                self.assertEqual([entry["to"] for entry in relay_mismatches(self.state)[before:]],
+                                 ["session:first", "session:second"])
 
     def test_error_result_is_not_delivered(self) -> None:
         no_write = send.RelayRequestNotForwarded()

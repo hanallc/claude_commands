@@ -212,11 +212,13 @@ The two flags together cause a usage error.
 
 `send.py` reads one `staff.snapshot()` for each session send. `resolve_staff_recipient` selects each staff recipient.
 A typed name first matches an exact canonical staff path or short name. Unit names use the staff name.
-A `<name>-unit` target finds the unit `<name>` when no staff row or live session has that exact name.
+An exact staff name takes precedence over the `<name>-unit` form.
 The `<name>-unit` form uses `copies.unit_owner` and matches only rows of kind `unit`.
 In a `/` path, only the last part uses the form, and the earlier parts must match the parent chain.
+The resolver selects the unit's staff ID before it checks the peer roster.
+For a live local Claude address or a Codex worker with a local holder, the roster limits worker detail reads to the sender and recipient.
 
-A `RecipientLookupFailed` route or a missing recipient name calls `failed_lookup.report`.
+A lookup failure or a missing recipient name calls `failed_lookup.report`.
 The detector records the sender and failed name in `failed_lookups.json` under the message state directory.
 The detector tells the sender's owner on the first failure and at most once per pair every 24 hours.
 Each notice includes the count since the last notice, the caller command line, known configuration paths, and the printed reason.
@@ -282,6 +284,7 @@ The relay runs `command claude -p` with Sonnet, auto mode, and only the `SendMes
 It disables MCP, slash commands, and settings sources and removes inherited `CLAUDE_*` variables.
 The proxy checks the request and writes it to the recipient's verified socket.
 The relay requires a completed proxy write of the approved text and one explicit success result for the forwarded tool ID.
+The relay logs changed calls locally in `STATE/relay_mismatches.jsonl`, with a bounded target and short excerpts at the first text difference.
 The `SENT` line reports how many SendMessage calls the relay made and that the proxy forwarded one.
 It saves the tool stream in `STATE/relay/<to>.jsonl`.
 `--timeout` defaults to 40 s for every transport.

@@ -757,6 +757,28 @@ class StatusTests(IsolatedBuildTargetTest):
 
 
 class EligibleCommandTests(IsolatedBuildTargetTest):
+    def test_refused_target_cleanup_keeps_relative_legacy_claim(self) -> None:
+        self.write_claim()
+        path = self.mac_state / "run.json"
+        record = cast(dict[str, object], json.loads(path.read_text()))
+        record.update(worktree=".", remote_host="test-mac")
+        _ = path.write_text(json.dumps(record))
+        before = path.read_bytes()
+        target = target_config.SshTarget("mac", "macos", self.settings)
+        args = build_targets.CliArguments()
+        args.repo_root, args.pid = str(self.root), os.getpid()
+
+        def owner_start(pid: int) -> process_identity.ProcessStart:
+            return process_identity.Started("cleanup-owner") if pid == args.pid else process_identity.Gone()
+
+        with (mock.patch.object(mac_test, "target_claim_scope", return_value=mac_test.RepositoryScope("hana")),
+              mock.patch.object(process_identity, "process_start", side_effect=owner_start),
+              mock.patch.object(offload, "check_leftovers", return_value=offload.LeftoversEnded()) as cleanup):
+            build_targets.cleanup_refused_claims(target, args, session=WAITING_SESSION)
+
+        cleanup.assert_not_called()
+        self.assertEqual(path.read_bytes(), before)
+
     def test_cli_prints_every_target_in_config_order_with_resolved_settings(self) -> None:
         config = self.write_config(
             "targets=natedev,mac\nkind.natedev=local\nplatform.natedev=linux\n"

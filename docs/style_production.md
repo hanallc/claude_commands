@@ -568,10 +568,12 @@ Exit 1 means the trees differ; run the five steps:
    grant no successful coverage. Exit 0 means clean, every tool recorded passing;
    continue the sync. Exit 1 means diagnostics recorded or a tool did not pass;
    continue to `set-tip` and `tip done`. Exit 2 means an error (refusal, failed
-   `lint-record` or unreadable checkout); stop the sync. Exit 143 or 129 means
-   SIGTERM or SIGHUP stopped the run; stop the sync.
-   Every exit the run can catch stops verify.sh and its processes, removes
-   its temporary supervision metadata, and releases the standing checkout.
+   `lint-record` or unreadable checkout); stop the sync. SIGTERM, SIGHUP or
+   SIGINT ends the run by the default signal action (a shell reads 143, 129 or
+   130); stop the sync. The run installs no signal handler.
+   A keeper process sees the run end for any cause. It then stops verify.sh and
+   its processes, removes the temporary supervision metadata, and releases the
+   standing checkout.
    Each `style-sync-lint-*` dir holds `owner.json`, `verifier.pgid`, and a link
    to the checkout. Recovery keeps the metadata while its owner or verifier
    group runs; stale legacy worktree registrations are removed on recovery.

@@ -184,6 +184,19 @@ def read_record(path: Path) -> WorktreeRecord:
         made_at=text_field("made_at"), layout=layout, stage=stage)
 
 
+def has_unit_word(owner: str, unit: str) -> bool:
+    """Check if a completed record for this owner uses the unit word."""
+    for path in state_folder().glob("*.json"):
+        try:
+            record = read_record(path)
+        except (OSError, ValueError):
+            continue
+        if (record.owner == owner and record.stage is MakeStage.DONE
+                and isinstance(record.layout, RecordedWorktreeOutput) and record.layout.unit == unit):
+            return True
+    return False
+
+
 def write_record(record: WorktreeRecord) -> None:
     path = record_file(Path(record.path))
     fields = cast(dict[str, object], asdict(record))

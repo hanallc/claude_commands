@@ -14,6 +14,7 @@ import tempfile
 import unittest
 from io import StringIO
 from pathlib import Path
+from types import SimpleNamespace
 from typing import IO, cast, override
 from unittest import mock
 
@@ -131,9 +132,9 @@ class PoolCase(unittest.TestCase):
                             "FAKE_SELECTION": fake_selection(16), "FAKE_TOKEN_POOL": str(self.pool),
                             "TMPDIR": str(self.root)}
 
-    def configure_nested_tokens(self, count: int) -> None:
+    def configure_nested_tokens(self, count: int, *, test_floor: int = 2) -> None:
         _ = (self.root / "config/build_admission.conf").write_text(
-            f"[memory]\n# whole: 1..\ntest_token_floor=2\n# whole: 0..\nnested_tokens={count}\n",
+            f"[memory]\n# whole: 1..\ntest_token_floor={test_floor}\n# whole: 0..\nnested_tokens={count}\n",
             encoding="utf-8",
         )
 
@@ -351,8 +352,9 @@ class HolderTests(PoolCase):
         run = tokens.test_run(["cargo", "nextest", "run", "--test-threads", "4"])
         assert isinstance(run, tokens.SizedTestRun)
         errors = StringIO()
+        remove = mock.Mock(side_effect=PermissionError("fixture denies removal"))
         with (mock.patch.dict(os.environ, {**self.environment, "FAKE_QUIET": "1"}),
-              mock.patch.object(shutil, "rmtree", side_effect=PermissionError("fixture denies removal")) as remove,
+              mock.patch.object(tokens, "shutil", SimpleNamespace(rmtree=remove)),
               mock.patch("sys.stderr", errors)):
             status = tokens.run_with_tokens(run, self.pool, 2, None, lambda _: None, nested_tokens=0)
         remove.assert_called_once_with(str(stale))
@@ -400,6 +402,73 @@ class HolderTests(PoolCase):
                                               "nextest run --test-threads 2 --workspace"])
         self.assertEqual((self.root / "width").read_text(encoding="utf-8"), "2\n")
         self.assertEqual(self.free_tokens(), 2)
+
+    def test_thread_floor_takes_priority_over_nested_cargo_at_the_width_limit(self) -> None:
+        self.fill(8)
+        compile_tokens = self.take(1)
+        self.configure_nested_tokens(3, test_floor=4)
+        child = self.holder("cargo", "nextest", "run", "--test-threads", "4", extra={"FAKE_TEST": "inspect"})
+        output, _ = child.communicate(timeout=30)
+        self.assertEqual(child.returncode, 0, output)
+        self.assertEqual(self.cargo_calls()[-1], "nextest run --test-threads 4")
+        self.assertIn("free during nextest: 3\n", output)
+        self.assertEqual(self.free_tokens(), 7)
+        _ = os.write(self.keeper, compile_tokens)
+
+    def test_nested_cargo_cannot_borrow_shared_tokens_at_the_width_limit(self) -> None:
+        self.fill(7)
+        self.configure_nested_tokens(3, test_floor=4)
+        child = self.holder(
+            "cargo", "nextest", "run", "--test-threads", "4",
+            extra={"FAKE_TEST": "inspect", "FAKE_BORROW": "1", "CARGO_MAKEFLAGS": f"--jobserver-auth=fifo:{self.pool}"},
+        )
+        output, _ = child.communicate(timeout=30)
+        self.assertEqual(child.returncode, 0, output)
+        self.assertIn("free during nextest: 3\n", output)
+        self.assertIn("nested borrowed: 0\n", output)
+        self.assertEqual(self.free_tokens(), 7)
+
+    def test_the_test_floor_can_use_the_entire_pool(self) -> None:
+        self.fill(4)
+        self.configure_nested_tokens(3, test_floor=4)
+        child = self.holder("cargo", "nextest", "run", "--test-threads", "8", extra={"FAKE_TEST": "inspect"})
+        output, _ = child.communicate(timeout=30)
+        self.assertEqual(child.returncode, 0, output)
+        self.assertEqual(self.cargo_calls()[-1], "nextest run --test-threads 4")
+        self.assertNotIn("waiting for", output)
+        self.assertNotIn("tokens for nested Cargo", output)
+        self.assertIn("free during nextest: 0\n", output)
+        self.assertEqual(self.free_tokens(), 4)
+
+    def test_run_waits_for_the_test_floor_and_gives_cargo_the_surplus(self) -> None:
+        self.fill(6)
+        compile_tokens = self.take(3)
+        self.configure_nested_tokens(3, test_floor=4)
+        child = self.holder("cargo", "nextest", "run", "--test-threads", "8",
+                            extra={"FAKE_TEST": "inspect", "FAKE_BORROW": "1"})
+        self.assertEqual(read_line(child), "built\n")
+        self.assertEqual(read_line(child), "nextest: waiting for 1 more jobserver tokens\n")
+        _ = os.write(self.keeper, compile_tokens[:2])
+        output, _ = child.communicate(timeout=30)
+        self.assertEqual(child.returncode, 0, output)
+        self.assertEqual(self.cargo_calls()[-1], "nextest run --test-threads 4")
+        self.assertIn("nested borrowed: 1\n", output)
+        self.assertEqual(self.free_tokens(), 5)
+
+    def test_two_selected_tests_limit_the_test_floor_to_two(self) -> None:
+        self.fill(5)
+        compile_tokens = self.take(4)
+        self.configure_nested_tokens(3, test_floor=4)
+        child = self.holder("cargo", "nextest", "run", "--test-threads", "8",
+                            extra={"FAKE_TEST": "inspect", "FAKE_BORROW": "1", "FAKE_SELECTION": fake_selection(2)})
+        self.assertEqual(read_line(child), "built\n")
+        self.assertEqual(read_line(child), "nextest: waiting for 1 more jobserver tokens\n")
+        _ = os.write(self.keeper, compile_tokens)
+        output, _ = child.communicate(timeout=30)
+        self.assertEqual(child.returncode, 0, output)
+        self.assertEqual(self.cargo_calls()[-1], "nextest run --test-threads 2")
+        self.assertIn("nested borrowed: 3\n", output)
+        self.assertEqual(self.free_tokens(), 5)
 
     def test_free_tokens_up_to_the_width_and_every_token_goes_back(self) -> None:
         self.fill(12)
@@ -489,7 +558,7 @@ class ReservationTests(PoolCase):
         self.assertEqual((self.root / "width").read_text(encoding="utf-8"), "3\n")
         self.assertEqual(self.cargo_calls()[-1], "nextest run --test-threads 3 --workspace")
 
-    def test_reservation_width_keeps_one_thread_when_the_pool_is_small(self) -> None:
+    def test_reservation_width_records_one_test_thread_with_one_nested_token(self) -> None:
         self.fill(2)
         recorded: list[int] = []
         run = tokens.test_run(["cargo", "nextest", "run", "--test-threads", "8", "--workspace"])
@@ -497,7 +566,7 @@ class ReservationTests(PoolCase):
         with mock.patch.dict(os.environ, {**self.environment, "FAKE_QUIET": "1"}), \
                 mock.patch("sys.stdout", new=open(os.devnull, "w")) as quiet:
             self.addCleanup(quiet.close)
-            status = tokens.run_with_tokens(run, self.pool, 2, self.root / "width", recorded.append, nested_tokens=3)
+            status = tokens.run_with_tokens(run, self.pool, 1, self.root / "width", recorded.append, nested_tokens=3)
         self.assertEqual(status, 0)
         self.assertEqual(recorded, [1])
         self.assertEqual((self.root / "width").read_text(encoding="utf-8"), "1\n")

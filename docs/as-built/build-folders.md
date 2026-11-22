@@ -4,17 +4,20 @@ Editable source lives under `~/worktrees`. Cargo output lives under the configur
 
 ## Paths and names
 
-The build root is `/build` on natedev and `~/build` on the Mac. The table uses `/build` for the build root.
+The build root is `/build` on natedev and `~/build` on the Mac and the Hana AWS guest. The table uses `/build` for the build root.
 
 | Form | Path | Cargo output |
 | --- | --- | --- |
 | Worktree | `~/worktrees/<repo>/<unit>/<short-name>` | `target` links to the worktree output. |
 | Worktree output | `/build/<repo>/<unit>/<short-name>` | The folder holds intermediate and final output. |
 | Numbered copy | `/build/<repo>/<unit>/<number>` | The copy holds the fixed source and a real `target` folder. |
-| Main output | `/build/<repo>/main` | `target` in the main checkout links here. |
+| Main output | `/build/<repo>/main` | Local main checkouts link `target` here. The Hana guest creates no main checkout `target` link. |
 | CI | `/build/<repo>/ci/<number>` | Each number has a runner folder that also holds the runner's home. |
 
 The main checkouts stay at `~/rust/<repo>` and `~/.claude`. The repo word is the last part of the Git origin path without the `.git` suffix. The local alias for `claude_commands` is `claude`. The path has no showrunner component.
+
+The Hana guest stores its shell cache under `<build root>/hana/main/shells`.
+Each numbered copy uses its own real `target` directory.
 
 The unit word names the unit. Use a unit word for only one active unit. A new unit can reuse a retired unit's word. The folder rules reserve `main` and `ci`.
 
@@ -27,6 +30,13 @@ A new unit or style production uses `worktree` as its main short name. The branc
 - `worktrees.py make <repo word> <unit> <short-name>` creates the source, the output link, and the worktree record.
   It uses the main checkout for the repo word and checks its origin.
   It creates the branch `<unit>-<short-name>` from the main checkout's HEAD.
+- A phase that runs beside the current phase uses a model worktree.
+  The director creates it with `worktrees.py make <repo word> <unit> p<phase id>`.
+  The director uses a distinct short name `p<phase id>` for each phase.
+  The director runs `~/.claude/scripts/lib/py ~/.claude/scripts/worktree/worktrees.py remove <path>` after the checkpoint reaches origin.
+  The director sends the reported checkout and output paths to the showrunner as a removal list.
+  `phase_reservation.py claim` accepts the unit's home worktree or a model worktree.
+  The command records the path only for a separate model worktree.
 - `worktrees.py move <path> <unit> <short-name>` gets the repo word from origin and prints the new path.
   The move keeps the Git worktree entry and branch.
   It refuses a numbered build copy before it reads the move record.
@@ -34,7 +44,7 @@ A new unit or style production uses `worktree` as its main short name. The branc
   A retry resumes from the move record.
   If a prior copy stopped before it recorded the stage identity, a retry reports that stage and makes a fresh copy.
   A managed unit rename uses `unit_folder_rename` to move the unit's source and build folders together.
-- `worktrees.py remove <path>` removes the checkout and its assigned output under the folder locks.
+- `~/.claude/scripts/lib/py ~/.claude/scripts/worktree/worktrees.py remove <path>` reports the checkout and its assigned output for manual removal.
   `worktrees.py retire <unit>` removes that unit's named outputs and numbered copies across the build root.
   A held lock prevents removal of its folder.
 - `worktrees.py migrate --list <file> --dry-run` prints the plan for the listed worktrees without writing files.
@@ -121,11 +131,22 @@ The Cargo seed is absent. The first test build of a new Hana worktree takes abou
 
 ## Numbered copies and removal
 
+Use a numbered copy for tests and proofs that need a source copy.
+Run `~/.claude/scripts/lib/py ~/.claude/scripts/lib/build_slots.py run --source <worktree> --commit <hash> --showrunner <name> --unit <unit> --work <word> --purpose <word> -- <command>`.
+The director creates a model worktree for a trial project.
+Workers use `scratch.py new --worker` only for downloads and other files unrelated to builds, tests, gates, or source copies.
+
 `build_slots.take_copy` takes the lowest free existing number for the repo and unit. If none is free, it takes the smallest unused number. A worker has no fixed number. The maker checks out the requested commit and keeps the real `target` folder. Nightly tests of main use the merge unit's numbered copies.
 
 Copy `1` has sibling files `1.lock` and `1.lease.json`. The lease records the holder, source, commit, and checkout and Git directory identities. The kernel lock alone determines when the copy is free. The owner passes the lock descriptor to children and keeps the lease through use. The lock remains held until the last holder closes its descriptor.
 
-The Nix environment check uses the lease to verify the numbered copy's `.envrc` against the recorded commit in a trusted source. Style lint passes its copy lease to the verifier. Legacy temporary cleanup excludes these folders and their lock and lease files. The AWS gate still has a separate slot path.
+The Nix environment check uses the lease to verify the numbered copy's `.envrc` against the recorded commit in a trusted source. Style lint passes its copy lease to the verifier. Legacy temporary cleanup excludes these folders and their lock and lease files.
+
+The Hana AWS guest fetches verified bundles into its main checkout at `~/rust/hana`.
+The command uses its assigned copy number under `~/build/hana/aws-hana`.
+Each copy keeps its Cargo output under `target`.
+The guest keeps the shell cache under `~/build/hana/main/shells` and holds the main output lock during use.
+The AWS gate uses its separate slot path.
 
 `lint/sweep.py --unused-folders` uses each folder's `.lint-sweep-used` stamp. The cutoff is two days. The sweep checks the stamp again under the folder lock. It keeps unstamped folders, folders in use, and CI folders. It lists eligible folders and keeps unit and repository parents. The nightly gate invokes the sweep.
 
