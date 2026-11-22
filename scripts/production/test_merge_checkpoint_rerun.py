@@ -54,7 +54,8 @@ class CheckpointRerunTests(MergeCheckpointFixture):
         with (patch.object(readers, "snapshot", wraps=staff.snapshot) as snapshot,
               patch.object(merge_checkpoint, "staff", readers),
               patch.object(change_review, "staff", readers),
-              self.after_input(lambda path: path.write_bytes(b"invalid staff JSON\n"))):
+              self.after_input(lambda path: path.write_text(
+                  json.dumps(cast(object, json.loads(path.read_text())), indent=2) + "\n"))):
             result = self.run_checkpoint(checkpoint).process
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(snapshot.call_count, 1)
