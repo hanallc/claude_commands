@@ -203,12 +203,15 @@ class CheckedEntry:
 
     def recheck(self) -> None:
         """Verify the same directory entries below the build root."""
+        self.recheck_ancestors()
+        require_identity(self.parent, self.name, identity(self.info))
+
+    def recheck_ancestors(self) -> None:
         if (identity(self.root.stat()) != self.root_identity
                 or isinstance(self.form, MirrorOutputForm) and self.root.resolve(strict=True) != self.root):
             raise ChangedEntry("the build root changed")
         for parent, name, expected in self.ancestors:
             require_identity(parent, name, expected)
-        require_identity(self.parent, self.name, identity(self.info))
 
 
 def mount_id(descriptor: int) -> str:
@@ -367,10 +370,20 @@ def read_mirror(root: Path, *, mount_reader: Callable[[], tuple[Path, ...]] | No
     mounts = mount_snapshot(mount_reader)
     protected = frozenset(identity(path.stat()) for path in (home, *home.parents))
     with ExitStack() as opened:
-        info = os.fstat(open_mirror_root(home, root, mounts, opened))
-    if identity(info) in protected:
-        raise Refused(RefusalReason.INVALID_ROOT, str(root))
-    return RemovalGuard(home, root, identity(info), protected, MirrorOutputForms(mount_reader),
+        root_key = identity(os.fstat(open_mirror_root(home, root, mounts, opened)))
+        root_ancestors = {identity(path.stat()) for path in root.parents}
+        for tree in excluded:
+            try:
+                resolved = tree.resolve(strict=True)
+                tree_key = identity(resolved.stat())
+            except FileNotFoundError:
+                continue
+            if (tree_key == root_key or tree_key in root_ancestors
+                    or any(identity(parent.stat()) == root_key for parent in resolved.parents)):
+                raise Refused(RefusalReason.INVALID_ROOT, str(root))
+        if root_key in protected or identity(root.stat()) != root_key:
+            raise Refused(RefusalReason.INVALID_ROOT, str(root))
+    return RemovalGuard(home, root, root_key, protected, MirrorOutputForms(mount_reader),
                         KnownNames(frozenset(), frozenset()), mounts)
 
 
@@ -411,6 +424,49 @@ def mirror_targets(guard: RemovalGuard, check_time: Callable[[], None]) -> list[
 
         visit(root_fd, guard.root, 0)
     return targets
+
+
+class MirrorStageEntryState(Enum):
+    STAGED = "the entry remains in staging"
+    ORIGINAL = "the entry is at its original location"
+    MISSING = "the entry is absent from both locations"
+
+
+def observe_mirror_stage(guard: RemovalGuard, parent: Path, parent_key: Identity, stage: str,
+                         stage_inode: int, entry: Path) -> MirrorStageEntryState:
+    """Check for an entry at its original or staged location without following links."""
+    with ExitStack() as opened:
+        root = open_mirror_root(guard.home, guard.root, guard.mounts, opened)
+        if identity(os.fstat(root)) != guard.root_identity:
+            raise ChangedEntry("the mirror root changed")
+        anchor = open_mirror_root(guard.home, parent, guard.mounts, opened)
+        if identity(os.fstat(anchor)) != parent_key:
+            raise ChangedEntry(f"the staging parent changed: {parent}")
+        mount = mount_id(anchor)
+
+        def present(parts: tuple[str, ...]) -> bool:
+            with ExitStack() as descendants:
+                descriptor = anchor
+                try:
+                    for name in parts[:-1]:
+                        child = os.open(name, DIRECTORY_FLAGS, dir_fd=descriptor)
+                        _ = descendants.callback(os.close, child)
+                        observed = os.fstat(child)
+                        if name == stage and observed.st_ino != stage_inode:
+                            raise ChangedEntry(f"the staging folder changed: {stage}")
+                        if observed.st_dev != parent_key[0] or mount_id(child) != mount:
+                            raise Refused(RefusalReason.MOUNT, name)
+                        descriptor = child
+                    _ = os.stat(parts[-1], dir_fd=descriptor, follow_symlinks=False)
+                except FileNotFoundError:
+                    return False
+            return True
+
+        if present((stage, *entry.parts)):
+            return MirrorStageEntryState.STAGED
+        if present(entry.parts):
+            return MirrorStageEntryState.ORIGINAL
+        return MirrorStageEntryState.MISSING
 
 
 @dataclass(frozen=True)
@@ -489,34 +545,37 @@ def stage_mirror_output(checked: CheckedEntry) -> Generator[CheckedEntry]:
     stage = ".mac-floor-" + uuid4().hex
     checked.recheck()
     os.mkdir(stage, 0o700, dir_fd=checked.parent)
-    stage_info = os.stat(stage, dir_fd=checked.parent, follow_symlinks=False)
+    stage_key = identity(os.stat(stage, dir_fd=checked.parent, follow_symlinks=False))
+    descriptor = os.open(stage, DIRECTORY_FLAGS, dir_fd=checked.parent)
     try:
-        descriptor = os.open(stage, DIRECTORY_FLAGS, dir_fd=checked.parent)
+        if identity(os.fstat(descriptor)) != stage_key:
+            raise ChangedEntry("the staging folder changed")
+        require_identity(checked.parent, stage, stage_key)
+        checked.recheck()
+        rename_exclusive(checked.parent, checked.name, descriptor, checked.name)
+        staged = replace(checked, parent=descriptor,
+                         ancestors=(*checked.ancestors, (checked.parent, stage, stage_key)))
         try:
-            key = identity(os.fstat(descriptor))
-            if key != identity(stage_info):
-                raise ChangedEntry("the staging folder changed")
-            require_identity(checked.parent, stage, key)
-            checked.recheck()
-            rename_exclusive(checked.parent, checked.name, descriptor, checked.name)
-            staged = replace(checked, parent=descriptor,
-                             ancestors=(*checked.ancestors, (checked.parent, stage, key)))
-            try:
-                staged.recheck()
-                yield staged
-            finally:
-                try:
-                    _ = os.stat(checked.name, dir_fd=descriptor, follow_symlinks=False)
-                except FileNotFoundError:
-                    pass
-                else:
-                    require_identity(descriptor, checked.name, identity(checked.info))
-                    rename_exclusive(descriptor, checked.name, checked.parent, checked.name)
+            os.fsync(descriptor)
+            os.fsync(checked.parent)
+            staged.recheck()
+            yield staged
         finally:
-            os.close(descriptor)
+            checked.recheck_ancestors()
+            require_identity(checked.parent, stage, stage_key)
+            try:
+                require_identity(descriptor, checked.name, identity(checked.info))
+            except FileNotFoundError:
+                pass
+            else:
+                rename_exclusive(descriptor, checked.name, checked.parent, checked.name)
+                os.fsync(descriptor)
+            checked.recheck_ancestors()
+            require_identity(checked.parent, stage, stage_key)
+            os.rmdir(stage, dir_fd=checked.parent)
+            os.fsync(checked.parent)
     finally:
-        require_identity(checked.parent, stage, identity(stage_info))
-        os.rmdir(stage, dir_fd=checked.parent)
+        os.close(descriptor)
 
 
 def _configured_path_templates(value: str) -> tuple[tuple[Path, Form], ...]:
@@ -582,6 +641,17 @@ def remove(checked: CheckedEntry, *, account: Callable[[str, os.stat_result], No
         check_position()
         require_identity(parent, name, identity(before))
 
+    def remove_name(parent: int, name: str, key: Identity, *, directory: bool) -> None:
+        if mirror is not None:
+            check_position()
+        require_identity(parent, name, key)
+        if directory:
+            os.rmdir(name, dir_fd=parent)
+        else:
+            os.unlink(name, dir_fd=parent)
+        if mirror is not None:
+            os.fsync(parent)
+
     def visit(parent: int, name: str, path: Path, before: os.stat_result) -> None:
         key = identity(before)
         if key[0] != checked.info.st_dev or mirror is not None and key in checked.mount_points:
@@ -609,9 +679,7 @@ def remove(checked: CheckedEntry, *, account: Callable[[str, os.stat_result], No
                 if mirror is not None:
                     before = os.fstat(folder)
                 prepare_unlink(parent, name, path, before)
-                if identity(os.stat(name, dir_fd=parent, follow_symlinks=False)) != key:
-                    raise ChangedEntry(f"folder changed before removal: {path}")
-                os.rmdir(name, dir_fd=parent)
+                remove_name(parent, name, key, directory=True)
             finally:
                 os.close(folder)
         else:
@@ -626,9 +694,7 @@ def remove(checked: CheckedEntry, *, account: Callable[[str, os.stat_result], No
                         raise ChangedEntry(f"entry changed before open: {path}")
                     if mount_id(leaf) != checked.mount:
                         raise Refused(RefusalReason.MOUNT, str(path))
-                    if identity(os.stat(name, dir_fd=parent, follow_symlinks=False)) != key:
-                        raise ChangedEntry(f"entry changed before removal: {path}")
-                    os.unlink(name, dir_fd=parent)
+                    remove_name(parent, name, key, directory=False)
                 finally:
                     os.close(leaf)
             else:

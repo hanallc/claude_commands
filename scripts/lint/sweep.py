@@ -52,6 +52,7 @@ from typing import TYPE_CHECKING, Literal, TypeGuard, cast, overload, override
 
 from scripts.message import send_budget, send_result, session_send
 from scripts.message.session_send import session_send_argv
+from scripts.lib.atomic_file import sync_folder
 from scripts.lib import file_lock
 from scripts.lib.file_lock import PROC_LOCKS as PROC_LOCKS
 from scripts.lib import build_folders, conf, removal_guard
@@ -4338,6 +4339,47 @@ def require_held_mac_cargo_lock(held: HeldMacTakeTarget, parts: tuple[str, ...],
         raise removal_guard.ChangedEntry(f"a Cargo lock appeared or changed: {path}")
 
 
+def recheck_mac_cargo_locks(held: HeldMacTakeTarget, target: removal_guard.CheckedEntry,
+                           deadline: MacFloorDeadline) -> None:
+    """Check the target and every current profile for new Cargo locks."""
+    def check(parent: int, prefix: tuple[str, ...], names: Sequence[str]) -> None:
+        for name in names:
+            try:
+                info = os.stat(name, dir_fd=parent, follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            require_held_mac_cargo_lock(held, (*prefix, name), removal_guard.identity(info))
+
+    def profiles(parent: int, prefix: tuple[str, ...]) -> None:
+        for name in os.listdir(parent):
+            deadline.check()
+            if prefix and (name in MAC_OUTPUT_CATEGORIES or name.startswith(".mac-floor-")):
+                continue
+            current = os.stat(name, dir_fd=parent, follow_symlinks=False)
+            if stat.S_ISREG(current.st_mode):
+                continue
+            parts = (*prefix, name)
+            profile = os.open(name, removal_guard.DIRECTORY_FLAGS, dir_fd=parent)
+            try:
+                if not os.path.samestat(os.fstat(profile), current):
+                    raise removal_guard.ChangedEntry(f"the profile changed: {target.path.joinpath(*parts)}")
+                check(profile, parts, (*LOCK_NAMES, DOC_LOCK_NAME) if name == DOC_DIR else LOCK_NAMES)
+                if not prefix and name != DOC_DIR:
+                    profiles(profile, parts)
+            finally:
+                os.close(profile)
+
+    target.recheck()
+    fd = os.open(target.name, removal_guard.DIRECTORY_FLAGS, dir_fd=target.parent)
+    try:
+        if not os.path.samestat(os.fstat(fd), target.info):
+            raise removal_guard.ChangedEntry(f"the target changed: {target.path}")
+        check(fd, (), LOCK_NAMES)
+        profiles(fd, ())
+    finally:
+        os.close(fd)
+
+
 @contextmanager
 def mac_take_target(guard: removal_guard.RemovalGuard, target: MacMirrorTakeTarget,
                     deadline: MacFloorDeadline) -> Generator[HeldMacTakeTarget]:
@@ -4382,6 +4424,63 @@ def mac_take_target(guard: removal_guard.RemovalGuard, target: MacMirrorTakeTarg
 MAC_FINGERPRINT_NAME = re.compile(
     r"(?:lib|bin|test-lib|test-bin|test-integration-test|build-script|run-build-script)-[A-Za-z0-9_-]+")
 MAC_INCREMENTAL_SESSION = re.compile(r"s-[a-z0-9]+-[a-z0-9]+-[a-z0-9]+")
+MAC_INCREMENTAL_CRATE = re.compile(r"[A-Za-z0-9_]+-[a-z0-9]+")
+MAC_CARGO_UNIT = re.compile(r"[A-Za-z0-9_-]+-[0-9a-f]{16}")
+MAC_DEP_OUTPUT = re.compile(
+    r"[A-Za-z0-9_-]+-[0-9a-f]{16}(?:\.[A-Za-z0-9_-]+\.rcgu)?\.(?:a|bc|d|dylib|o|rlib|rmeta|so)")
+MAC_PROFILE_ARTIFACT = re.compile(r"[A-Za-z0-9_-]+(?:\.(?:a|d|dylib|rlib|so))?")
+MAC_OUTPUT_CATEGORIES = frozenset(("deps", "build", FINGERPRINT_DIR, INCREMENTAL_DIR))
+
+
+def known_mac_cargo_output(parts: tuple[str, ...], entry: removal_guard.MirrorEntry,
+                           inventory: removal_guard.MirrorOutputInventory) -> bool:
+    """Accept only the Cargo output names that the Mac take understands."""
+    directory = stat.S_ISDIR(entry.mode)
+    match parts:
+        case ():
+            return directory
+        case (name,):
+            if not directory:
+                return name in (removal_guard.CARGO_TAG, ".rustc_info.json", ".rustdoc_fingerprint.json",
+                                USE_STAMP, *LOCK_NAMES)
+            return name in ("debug", "release") or any(
+                (profile := inventory.entries.get((name, category))) is not None and stat.S_ISDIR(profile.mode)
+                for category in MAC_OUTPUT_CATEGORIES)
+        case (profile, name):
+            if directory:
+                return name in MAC_OUTPUT_CATEGORIES
+            if name in (*LOCK_NAMES, USE_STAMP):
+                return True
+            if not MAC_PROFILE_ARTIFACT.fullmatch(name):
+                return False
+            if name.endswith(".d"):
+                return True
+            dep_info = inventory.entries.get((profile, Path(name).stem + ".d"))
+            return dep_info is not None and stat.S_ISREG(dep_info.mode) and (
+                "." in name or bool(entry.mode & 0o111))
+        case (_, "deps", name):
+            return not directory and (MAC_DEP_OUTPUT.fullmatch(name) is not None
+                                      or bool(entry.mode & 0o111) and MAC_CARGO_UNIT.fullmatch(name) is not None)
+        case (_, "build" | ".fingerprint", name):
+            return directory and MAC_CARGO_UNIT.fullmatch(name) is not None
+        case (_, "build", _, name):
+            if directory:
+                return name == "out"
+            return name in ("output", "stderr", "root-output", "invoked.timestamp", "build-script-build") or (
+                name.startswith("build_script_build-") and MAC_DEP_OUTPUT.fullmatch(name) is not None)
+        case (_, ".fingerprint", _, name):
+            marker = name.removeprefix("dep-").removesuffix(".json")
+            return not directory and (name == "invoked.timestamp" or MAC_FINGERPRINT_NAME.fullmatch(marker) is not None)
+        case (_, "incremental", name):
+            return directory and MAC_INCREMENTAL_CRATE.fullmatch(name) is not None
+        case (_, "incremental", _, name):
+            return MAC_INCREMENTAL_SESSION.fullmatch(name) is not None if directory else (
+                re.fullmatch(r"s-[a-z0-9]+-[a-z0-9]+\.lock", name) is not None)
+        case (_, "incremental", _, _, name):
+            return not directory and (name in ("dep-graph.bin", "query-cache.bin", "work-products.bin")
+                                      or re.fullmatch(r"[a-z0-9]+\.(?:bc|o)", name) is not None)
+        case _:
+            return False
 
 
 def mac_cargo_fingerprint(guard: removal_guard.RemovalGuard, target: Path, path: Path,
@@ -4427,7 +4526,8 @@ def mac_cargo_markers(inventory: removal_guard.MirrorOutputInventory) -> tuple[
 
 
 def mac_mirror_take_units(guard: removal_guard.RemovalGuard, target: MacMirrorTakeTarget,
-                          inventory: removal_guard.MirrorOutputInventory, deadline: MacFloorDeadline, *,
+                          inventory: removal_guard.MirrorOutputInventory,
+                          unknown_output: set[tuple[str, ...]], deadline: MacFloorDeadline, *,
                           lint_settings: conf.ConfigRead
                           ) -> list[MacMirrorTakeUnit]:
     """Keep current lockfile packages and the newest build of each crate."""
@@ -4487,6 +4587,8 @@ def mac_mirror_take_units(guard: removal_guard.RemovalGuard, target: MacMirrorTa
                 paths: list[Path] = []
                 for entry in group.entries:
                     path = Path(entry)
+                    if path.relative_to(target.path).parts in unknown_output:
+                        continue
                     try:
                         form = guard.matching_form(path.relative_to(guard.root).parts)
                     except removal_guard.Refused:
@@ -4527,20 +4629,106 @@ def record_mac_floor_removal(path: Path, size: int, allocated: int, last_use: fl
     })
 
 
-def record_mac_floor_entry(path: Path, size: int, last_use: float, *,
-                           kind: Literal["sweep_trim_intent", "sweep_trim_entry"],
-                           fields: dict[str, object]) -> str:
+MAC_FLOOR_PENDING = ".floor-take-pending.json"
+
+
+class NoPendingMacFloorEntry(Enum):
+    NONE = "no pending Mac floor entry"
+
+
+@dataclass(frozen=True)
+class PendingMacFloorEntry:
+    """One staged entry whose removal result has yet to reach the build log."""
+
+    intent: str
+    host: str
+    at: float
+    log_offset: int
+    path: str
+    candidate: str
+    stage: str
+    stage_inode: int
+    parent_device: int
+    parent_inode: int
+    size: int
+    last_use: float
+
+    @property
+    def log(self) -> Path:
+        return store.host_file(self.host, self.at)
+
+    def row(self, kind: Literal["sweep_trim_intent", "sweep_trim_entry"]) -> dict[str, object]:
+        from scripts.buildlog import record
+
+        return {
+            "kind": kind, "v": record.RECORD_VERSION,
+            "id": self.intent if kind == "sweep_trim_intent" else self.intent + "-result",
+            "host": self.host, "at": store.utc_iso(time.time()), "folder": self.path,
+            "last_use": self.last_use, "bytes": self.size, "cause": "floor take",
+            "reason": "free space below the mirror sweep floor",
+        }
+
+    def result(self, outcome: Literal["kept", "removed"], freed: int) -> dict[str, object]:
+        return {**self.row("sweep_trim_entry"), "intent": self.intent, "outcome": outcome, "bytes_freed": freed}
+
+    def append(self, row: dict[str, object]) -> None:
+        store.append_line(self.log, row)
+        sync_folder(self.log.parent)
+
+
+def read_pending_mac_floor_entry(journal: Path) -> PendingMacFloorEntry | NoPendingMacFloorEntry:
+    try:
+        fd = os.open(journal, removal_guard.FILE_FLAGS)
+    except FileNotFoundError:
+        return NoPendingMacFloorEntry.NONE
+    with os.fdopen(fd, "rb") as source:
+        decoded = cast(object, json.loads(source.read(65536)))
+    match decoded:
+        case {"intent": str(intent), "host": str(host), "at": (int() | float()) as at,
+              "log_offset": int(offset), "path": str(path), "candidate": str(candidate), "stage": str(stage),
+              "stage_inode": int(stage_inode),
+              "parent_device": int(device), "parent_inode": int(inode),
+              "size": int(size), "last_use": (int() | float()) as last_use} if (
+                  host == store.host_name() and re.fullmatch(re.escape(host) + r"-[0-9]+", intent)
+                  and _finite_number(at) and _finite_number(last_use) and offset >= 0 and size >= 0
+                  and re.fullmatch(r"\.mac-floor-[0-9a-f]{32}", stage)):
+            return PendingMacFloorEntry(intent, host, at, offset, path, candidate, stage, stage_inode,
+                                        device, inode, size, last_use)
+        case _:
+            raise removal_guard.ChangedEntry(f"invalid Mac floor intent: {journal}")
+
+
+def recover_mac_floor_entry(guard: removal_guard.RemovalGuard, journal: Path) -> bool:
+    """Record one interrupted result without removing any mirror output."""
     from scripts.buildlog import record
 
-    at = time.time()
-    host = store.host_name()
-    row_id = f"{host}-{time.time_ns()}"
-    store.append_line(store.host_file(host, at), {
-        "kind": kind, "v": record.RECORD_VERSION, "id": row_id,
-        "host": host, "at": store.utc_iso(at), "folder": str(path), "last_use": last_use,
-        "bytes": size, "cause": "floor take", "reason": "free space below the mirror sweep floor", **fields,
-    })
-    return row_id
+    pending = read_pending_mac_floor_entry(journal)
+    if isinstance(pending, NoPendingMacFloorEntry):
+        return False
+    logged = {kind for row in store.locked_rows(pending.log, pending.log_offset)
+              if row.get("id") in (pending.intent, pending.intent + "-result")
+              for kind in (row.get("kind"),) if isinstance(kind, str)}
+    published = "sweep_trim_intent" in logged
+    if published and "sweep_trim_entry" not in logged:
+        candidate = Path(pending.candidate)
+        path = Path(pending.path)
+        if (".." in path.parts or ".." in candidate.parts or not path.is_relative_to(candidate)
+                or not candidate.is_relative_to(guard.root)):
+            raise removal_guard.ChangedEntry(f"invalid Mac floor intent paths: {journal}")
+        _ = guard.matching_form(candidate.relative_to(guard.root).parts)
+        relative = path.relative_to(candidate.parent)
+        location = removal_guard.observe_mirror_stage(
+            guard, candidate.parent, (pending.parent_device, pending.parent_inode),
+            pending.stage, pending.stage_inode, relative)
+        row = pending.result("removed" if location is removal_guard.MirrorStageEntryState.MISSING else "kept", 0)
+        if location is removal_guard.MirrorStageEntryState.STAGED:
+            row["staged"] = str(candidate.parent / pending.stage / relative)
+        _ = record.append_row_once(pending.log, {**row, "recovered": True}, pending.log_offset)
+    elif published:
+        sync_folder(pending.log.parent)
+    journal.unlink()
+    sync_folder(journal.parent)
+    return published
 
 
 def remove_mac_floor_entries(guard: removal_guard.RemovalGuard, target: MacMirrorTakeTarget,
@@ -4549,6 +4737,7 @@ def remove_mac_floor_entries(guard: removal_guard.RemovalGuard, target: MacMirro
                              recheck_input: Callable[[], None]) -> bool:
     """Stage the whole candidate, then check its entries and budget again."""
     require_mac_mirror_outside_git(target.path)
+    journal = guard.root / MAC_FLOOR_PENDING
     with ExitStack() as opened:
         checked = [opened.enter_context(guard.check(path)) for path in paths]
         previous = [removal_guard.inspect_mirror_output(entry, frozenset(), deadline.check) for entry in checked]
@@ -4568,8 +4757,8 @@ def remove_mac_floor_entries(guard: removal_guard.RemovalGuard, target: MacMirro
         for entry, expected in zip(staged, previous, strict=True):
             if removal_guard.inspect_mirror_output(entry, frozenset(), deadline.check) != expected:
                 raise removal_guard.ChangedEntry(f"the staged mirror output changed: {entry.path}")
-        cargo_lock_sites: list[tuple[str, ...]] = []
-        if all(entry.form is removal_guard.MirrorOutputForm.UNIT for entry in staged):
+        whole = staged[0].form is removal_guard.MirrorOutputForm.TARGET
+        if not whole:
             stage_folders = tuple((entry.path.with_name(entry.ancestors[-1][1]), entry.ancestors[-1][2])
                                   for entry in staged)
             observed = removal_guard.inspect_mirror_output(
@@ -4577,10 +4766,6 @@ def remove_mac_floor_entries(guard: removal_guard.RemovalGuard, target: MacMirro
                 frozenset(), deadline.check, staged_folders=stage_folders)
             for parts in mac_cargo_lock_names(observed):
                 require_held_mac_cargo_lock(held, parts, observed.entries[parts].key)
-            for parts, output in observed.entries.items():
-                if len(parts) <= 1 and stat.S_ISDIR(output.mode):
-                    cargo_lock_sites.extend((*parts, name) for name in LOCK_NAMES)
-            cargo_lock_sites.append(("doc", DOC_LOCK_NAME))
 
         def require_original_paths_unused() -> None:
             for original in checked:
@@ -4603,9 +4788,9 @@ def remove_mac_floor_entries(guard: removal_guard.RemovalGuard, target: MacMirro
             removed_bytes = 0
             freed_bytes = 0
             removed_paths = 0
-            pending_intent = ""
-            pending_path = entry.path
-            pending_size = 0
+            pending: PendingMacFloorEntry | NoPendingMacFloorEntry = NoPendingMacFloorEntry.NONE
+            anchor, stage, (_, stage_inode) = entry.ancestors[-1]
+            parent_key = removal_guard.identity(os.fstat(anchor))
 
             def require_space_for(size: int) -> None:
                 deadline.check()
@@ -4613,37 +4798,44 @@ def remove_mac_floor_entries(guard: removal_guard.RemovalGuard, target: MacMirro
                 if not shortfall or size > shortfall:
                     raise MacFloorReached
 
-            def before_unlink(path: Path, info: os.stat_result) -> None:
-                nonlocal pending_intent, pending_path, pending_size
-                pending_path = path
-                pending_size = info.st_blocks * 512
-                require_space_for(pending_size)
-                pending_intent = record_mac_floor_entry(path, pending_size, last_use,
-                                                       kind="sweep_trim_intent", fields={})
-                require_original_paths_unused()
-                require_mac_mirror_outside_git(target.path)
-                recheck_input()
-                for parts in cargo_lock_sites:
-                    try:
-                        current = target.path.joinpath(*parts).lstat()
-                    except FileNotFoundError:
-                        if parts in held.cargo_locks:
-                            raise
-                    else:
-                        require_held_mac_cargo_lock(held, parts, removal_guard.identity(current))
-                require_space_for(pending_size)
+            def finish(outcome: Literal["kept", "removed"], freed: int) -> None:
+                nonlocal pending
+                if not isinstance(pending, PendingMacFloorEntry):
+                    raise removal_guard.ChangedEntry("the Mac floor result has no intent")
+                pending.append(pending.result(outcome, freed))
+                journal.unlink()
+                sync_folder(journal.parent)
+                pending = NoPendingMacFloorEntry.NONE
 
-            def account(path: str, info: os.stat_result) -> None:
-                nonlocal removed_bytes, freed_bytes, removed_paths, pending_intent
+            def before_unlink(path: Path, info: os.stat_result) -> None:
+                nonlocal pending
+                size = info.st_blocks * 512
+                require_space_for(size)
+                host, at = store.host_name(), time.time()
+                offset = store.read_last_whole_row_end(store.host_file(host, at))
+                pending = PendingMacFloorEntry(f"{host}-{time.time_ns()}", host, at, offset, str(path),
+                    str(entry.path), stage, stage_inode, *parent_key, size, last_use)
+                write_text_atomic(journal, json.dumps(asdict(pending)) + "\n", new_file_mode=0o600)
+                pending.append(pending.row("sweep_trim_intent"))
+                try:
+                    require_original_paths_unused()
+                    require_mac_mirror_outside_git(target.path)
+                    recheck_input()
+                    recheck_mac_cargo_locks(held, entry if whole else held.checked, deadline)
+                    require_space_for(size)
+                except BaseException:
+                    finish("kept", 0)
+                    raise
+
+            def account(_path: str, info: os.stat_result) -> None:
+                nonlocal removed_bytes, freed_bytes, removed_paths
                 allocated = info.st_blocks * 512
                 freed = allocated if info.st_nlink == 1 or stat.S_ISDIR(info.st_mode) else 0
                 budget.remaining -= allocated
                 removed_bytes += allocated
                 freed_bytes += freed
                 removed_paths += 1
-                intent, pending_intent = pending_intent, ""
-                _ = record_mac_floor_entry(Path(path), allocated, last_use, kind="sweep_trim_entry",
-                                           fields={"intent": intent, "outcome": "removed", "bytes_freed": freed})
+                finish("removed", freed)
 
             complete = False
             try:
@@ -4651,9 +4843,6 @@ def remove_mac_floor_entries(guard: removal_guard.RemovalGuard, target: MacMirro
                                      before_unlink=before_unlink, account=account)
                 complete = True
             finally:
-                if pending_intent:
-                    _ = record_mac_floor_entry(pending_path, pending_size, last_use, kind="sweep_trim_entry",
-                                               fields={"intent": pending_intent, "outcome": "kept", "bytes_freed": 0})
                 if removed_paths:
                     record_mac_floor_removal(entry.path, freed_bytes, removed_bytes, last_use,
                         "whole" if complete and entry.form is removal_guard.MirrorOutputForm.TARGET else "partial")
@@ -4670,8 +4859,10 @@ def take_mac_mirror_floor(guard: removal_guard.RemovalGuard, desired: int, timeo
     status = 0
     try:
         with mac_floor_lock(root / ".floor-take.lock", create=True):
-            budget = MacFloorBudget(desired, desired - free_bytes(str(root)))
             try:
+                if recover_mac_floor_entry(guard, root / MAC_FLOOR_PENDING):
+                    return 0
+                budget = MacFloorBudget(desired, desired - free_bytes(str(root)))
                 if budget.remaining > 0:
                     targets = mac_mirror_take_targets(guard, deadline)
                     claims = floor_claims.read_claims(min(10, deadline.remaining()))
@@ -4700,11 +4891,13 @@ def take_mac_mirror_floor(guard: removal_guard.RemovalGuard, desired: int, timeo
                             try:
                                 with ExitStack() as candidate_locks:
                                     held = candidate_locks.enter_context(mac_take_target(guard, target, deadline))
-                                    if (target.repository != repository and remove_mac_floor_entries(
+                                    unknown_output = {parts[:3] for parts, output in held.inventory.entries.items()
+                                                      if not known_mac_cargo_output(parts, output, held.inventory)}
+                                    if (target.repository != repository and not unknown_output and remove_mac_floor_entries(
                                             guard, target, (target.path,), target.last_use, budget, deadline, held,
                                             recheck_input=deadline.check)):
                                         continue
-                                    selected = mac_mirror_take_units(guard, target, held.inventory, deadline,
+                                    selected = mac_mirror_take_units(guard, target, held.inventory, unknown_output, deadline,
                                                                      lint_settings=lint_settings)
                                     if selected:
                                         units.extend(selected)

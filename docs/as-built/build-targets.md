@@ -244,6 +244,16 @@ The runner, the claim and the block are covered in [mac-test-offload.md](mac-tes
 - `remote_test_command` sets `MACOSX_DEPLOYMENT_TARGET=14.0` (module constant `MACOSX_DEPLOYMENT_TARGET`), so a test binary that reaches a Swift bridge loads on the Mac. It also sends `BUILDLOG_SENT_TREE_KEY` when `copy_tree_with_key` read the same known tree key before and after the copy, and `LINT_SKIP_SWEEP=1` so the Mac's steps start no detached sweep. After the tests it removes the mirror's `target` folder only when the Mac's free space is below `free_floor_gib` (100 GiB), and keeps it otherwise (`mac_cleanup=kept`); a run that names `--target-dir` skips the cleanup with one line.
 - `scripts/production/mac_run.sh` (the showrunner's Mac build) claims without `--remote`, so its claim lapses with its process. It builds hana and each example with `MACOSX_DEPLOYMENT_TARGET=14.0 ~/.cargo/bin/cargo build`, so a build typed in the Mac's clone reuses them. When `git merge-base --is-ancestor <sha> <clone head>` holds, it checks the commit out in one ssh call with no bundle.
 
+The Mac floor take checks free space before each unlink. Free space can change
+between that check and the unlink, so the take can pass the floor by at most one
+unit. It checks entry identity under the staging descriptor immediately before
+each unlink. A same-user process can still replace an entry in the private
+staging directory between that check and the unlink.
+
+The take records each unlink intent before it removes the entry. If the result
+is missing, the next take records whether the entry remains. It keeps any
+staged files and ends that invocation without removing more output.
+
 ### The commands: `commands/build/`
 
 | Command | Script | Role |

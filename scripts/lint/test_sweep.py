@@ -7749,7 +7749,7 @@ class MacMirrorTakeTests(SweepCase):
         _ = (mirror / floor_claims.MIRROR_RECORD).write_text(json.dumps({
             "kind": "remote-mirror", "repo": name, "last_use": used,
         }))
-        _ = (target / "output").write_bytes(b"old build")
+        _ = (target / ".rustc_info.json").write_bytes(b"old build")
         return target
 
     def take(self, desired: int, *, timeout: float = 10) -> int:
@@ -7802,11 +7802,11 @@ class MacMirrorTakeTests(SweepCase):
         newer = self.mirror_target("newer", 200)
         checkout = older.parent.parent
         git("init", cwd=checkout)
-        git("add", "-f", "--", str((older / "output").relative_to(checkout)), cwd=checkout)
+        git("add", "-f", "--", str((older / ".rustc_info.json").relative_to(checkout)), cwd=checkout)
         with mock.patch.object(sweep, "free_bytes", return_value=GIB):
             self.assertEqual(self.take(2 * GIB), 1)
-        self.assertEqual((older / "output").read_bytes(), b"old build")
-        self.assertEqual((newer / "output").read_bytes(), b"old build")
+        self.assertEqual((older / ".rustc_info.json").read_bytes(), b"old build")
+        self.assertEqual((newer / ".rustc_info.json").read_bytes(), b"old build")
 
     def old_and_new_fingerprints(self, target: Path) -> tuple[Path, Path]:
         _ = (target.parent / "Cargo.lock").write_text("version = 4\n")
@@ -7845,31 +7845,37 @@ class MacMirrorTakeTests(SweepCase):
         with late_lock.open("x") as reserved:
             fcntl.flock(reserved, fcntl.LOCK_EX | fcntl.LOCK_NB)
 
-            def append_with_late_lock(path: Path, row: object) -> None:
-                append(path, row)
-                match row:
-                    case {"kind": "sweep_trim_intent"}:
-                        _ = late_lock.rename(cargo_lock)
-                    case _:
-                        pass
+            for profile in ("debug", "new-profile", "aarch64-apple-darwin/new-profile"):
+                with self.subTest(profile=profile):
+                    published = target / profile / cargo_lock.name
 
-            with (mock.patch.object(sweep, "free_bytes", return_value=GIB),
-                  mock.patch.object(store, "append_line", side_effect=append_with_late_lock)):
-                self.assertEqual(self.take(2 * GIB), 1)
-            self.assertEqual(os.stat(cargo_lock).st_ino, os.fstat(reserved.fileno()).st_ino)
+                    def append_with_late_lock(path: Path, row: object) -> None:
+                        append(path, row)
+                        match row:
+                            case {"kind": "sweep_trim_intent"} if late_lock.exists():
+                                published.parent.mkdir(parents=True, exist_ok=True)
+                                _ = late_lock.rename(published)
+                            case _:
+                                pass
+
+                    with (mock.patch.object(sweep, "free_bytes", return_value=GIB),
+                          mock.patch.object(store, "append_line", side_effect=append_with_late_lock)):
+                        self.assertEqual(self.take(2 * GIB), 1)
+                    self.assertEqual(os.stat(published).st_ino, os.fstat(reserved.fileno()).st_ino)
+                    _ = published.rename(late_lock)
         for unit in (old, new):
             self.assertEqual((unit / "lib-crate").read_text(), "d0123456789abcde")
         self.assertEqual(self.trim_rows(), [])
 
     def test_mac_take_stops_inside_a_whole_target_at_the_floor(self) -> None:
         target = self.mirror_target("older", 100)
-        _ = (target / "second").write_bytes(b"second")
+        _ = (target / "CACHEDIR.TAG").write_bytes(b"second")
         unlink = os.unlink
         removed: list[str] = []
 
         def unlink_and_free(path: str, *, dir_fd: int | None = None) -> None:
             unlink(path, dir_fd=dir_fd)
-            if path in ("output", "second"):
+            if path in (".rustc_info.json", "CACHEDIR.TAG"):
                 removed.append(path)
 
         def free(_path: str) -> int:
@@ -7899,6 +7905,25 @@ class MacMirrorTakeTests(SweepCase):
         for path in (old, new, incremental / "customer-notes", incremental / "customer-plan"):
             self.assertEqual((path / "notes").read_text(), "keep my notes")
         self.assertEqual(self.trim_rows(), [])
+
+    def test_mac_take_keeps_private_files_with_a_cargo_stem_and_hash(self) -> None:
+        warm = self.mirror_target("sample", 100)
+        idle = self.mirror_target("idle", 200)
+        notes: list[Path] = []
+        for target in (warm, idle):
+            old, _ = self.old_and_new_fingerprints(target)
+            note = target / "debug/deps" / (old.name + ".notes")
+            note.parent.mkdir()
+            _ = note.write_text("private notes")
+            notes.append(note)
+        with mock.patch.object(sweep, "free_bytes", return_value=GIB):
+            self.assertEqual(self.take(2 * GIB), 0)
+        for note in notes:
+            with self.subTest(note=note):
+                self.assertEqual(note.read_text() if note.exists() else "", "private notes")
+        self.assertEqual({row["folder"] for row in self.trim_rows()},
+                         {str(target / "debug/.fingerprint/crate-0000000000000001")
+                          for target in (warm, idle)})
 
     def test_mac_take_stops_when_it_cannot_read_a_fingerprint_time(self) -> None:
         target = self.mirror_target("sample", 100)
@@ -7935,16 +7960,45 @@ class MacMirrorTakeTests(SweepCase):
         with (mock.patch.object(sweep, "free_bytes", return_value=GIB),
               mock.patch.object(store, "append_line", side_effect=fail_intent)):
             self.assertEqual(self.take(2 * GIB), 1)
-        self.assertEqual((target / "output").read_bytes(), b"old build")
+        self.assertEqual((target / ".rustc_info.json").read_bytes(), b"old build")
         with mock.patch.object(sweep, "free_bytes", return_value=GIB):
             self.assertEqual(self.take(2 * GIB), 0)
         rows = self.build_log_rows()
         intents = [row for row in rows if row.get("kind") == "sweep_trim_intent"]
         results = [row for row in rows if row.get("kind") == "sweep_trim_entry"]
-        self.assertEqual([row["folder"] for row in intents], [str(target / "output"), str(target)])
+        self.assertEqual([row["folder"] for row in intents], [str(target / ".rustc_info.json"), str(target)])
         self.assertEqual([row["intent"] for row in results], [row["id"] for row in intents])
         for intent, result in zip(intents, results, strict=True):
             self.assertLess(rows.index(intent), rows.index(result))
+
+    def test_mac_take_recovers_a_failed_result_without_removing_more_output(self) -> None:
+        older = self.mirror_target("older", 100)
+        newer = self.mirror_target("newer", 200)
+        append = store.append_line
+
+        def fail_result(path: Path, row: object) -> None:
+            match row:
+                case {"kind": "sweep_trim_entry"}:
+                    raise OSError("The buildlog cannot record the result")
+                case _:
+                    append(path, row)
+
+        with mock.patch.object(sweep, "free_bytes", return_value=GIB):
+            with mock.patch.object(store, "append_line", side_effect=fail_result):
+                self.assertEqual(self.take(2 * GIB), 1)
+            self.assertFalse((older / ".rustc_info.json").exists())
+            before = self.build_log_rows()
+            [intent] = [row for row in before if row.get("kind") == "sweep_trim_intent"]
+            self.assertEqual([row for row in before if row.get("kind") == "sweep_trim_entry"], [])
+            self.assertEqual(self.take(2 * GIB), 0)
+        self.assertTrue(older.is_dir())
+        self.assertEqual((newer / ".rustc_info.json").read_bytes(), b"old build")
+        rows = self.build_log_rows()
+        self.assertEqual([row for row in rows if row.get("kind") == "sweep_trim_intent"], [intent])
+        [result] = [row for row in rows if row.get("kind") == "sweep_trim_entry"]
+        self.assertEqual((result["intent"], result["folder"], result["outcome"]),
+                         (intent["id"], str(older / ".rustc_info.json"), "removed"))
+        self.assertEqual((result["bytes_freed"], result["recovered"]), (0, True))
 
     def test_mac_take_keeps_a_target_with_a_live_child_build_lease(self) -> None:
         held = self.mirror_target("held", 100)
@@ -7963,7 +8017,7 @@ class MacMirrorTakeTests(SweepCase):
         target = self.mirror_target("large", 100)
         with mock.patch.object(sweep, "free_bytes", return_value=GIB):
             self.assertEqual(self.take(GIB + 1), 0)
-        self.assertEqual((target / "output").read_bytes(), b"old build")
+        self.assertEqual((target / ".rustc_info.json").read_bytes(), b"old build")
         self.assertEqual(self.trim_rows(), [])
 
     def test_mac_take_stops_after_the_first_unverified_removal(self) -> None:
@@ -7974,7 +8028,7 @@ class MacMirrorTakeTests(SweepCase):
             self.assertEqual(self.take(2 * GIB), 1)
         check.assert_called_once()
         for target in (older, newer):
-            self.assertEqual((target / "output").read_bytes(), b"old build")
+            self.assertEqual((target / ".rustc_info.json").read_bytes(), b"old build")
         self.assertEqual(self.trim_rows(), [])
 
     def test_mac_take_stops_at_the_floor_after_removing_the_oldest_target(self) -> None:
@@ -7987,7 +8041,7 @@ class MacMirrorTakeTests(SweepCase):
         with mock.patch.object(sweep, "free_bytes", side_effect=free):
             self.assertEqual(self.take(2 * GIB), 0)
         self.assertFalse(older.exists())
-        self.assertEqual((newer / "output").read_bytes(), b"old build")
+        self.assertEqual((newer / ".rustc_info.json").read_bytes(), b"old build")
         [row] = self.trim_rows()
         self.assertEqual((row["folder"], row["cause"], row["last_use"]), (str(older), "floor take", 100))
 
@@ -8002,7 +8056,7 @@ class MacMirrorTakeTests(SweepCase):
         with mock.patch.object(sweep, "free_bytes", return_value=GIB):
             self.assertEqual(self.take(2 * GIB), 1)
         self.assertEqual(nested.read_bytes(), b"tracked source")
-        self.assertEqual((newer / "output").read_bytes(), b"old build")
+        self.assertEqual((newer / ".rustc_info.json").read_bytes(), b"old build")
         self.assertEqual(self.trim_rows(), [])
 
     def test_mac_take_orders_idle_targets_before_old_units_and_keeps_cargo_builds(self) -> None:

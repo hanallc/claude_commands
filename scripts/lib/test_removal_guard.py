@@ -96,6 +96,15 @@ class RemovalGuardTests(unittest.TestCase):
                     checked, frozenset({artifact}), lambda: None)
         self.assertEqual(artifact.read_bytes(), b"output")
 
+    def test_mirror_guard_refuses_a_case_alias_of_an_excluded_tree(self) -> None:
+        excluded = self.home / "Rust"
+        mirror = excluded / "mirror"
+        mirror.mkdir(parents=True)
+        (self.home / "rust").symlink_to(excluded, target_is_directory=True)
+        for root in (excluded, mirror):
+            with self.subTest(root=root), self.assertRaises(removal_guard.Refused):
+                _ = removal_guard.read_mirror(root, mount_reader=lambda: (Path("/"),))
+
     def test_mirror_guard_refuses_links_and_mounts(self) -> None:
         guard = self.mirror_guard()
         target = guard.root / "repo/target"
@@ -153,6 +162,33 @@ class RemovalGuardTests(unittest.TestCase):
                     removal_guard.remove(staged, mirror=inventory)
         self.assertEqual((target / "output").read_bytes(), b"tracked source")
         self.assertEqual((target / "previous").read_bytes(), b"build output")
+
+    def test_mirror_unlink_refuses_a_parent_renamed_after_the_leaf_opens(self) -> None:
+        guard = self.mirror_guard()
+        target = guard.root / "repo/target"
+        target.mkdir(parents=True)
+        _ = (target / "output").write_bytes(b"build output")
+        open_entry = os.open
+
+        with guard.check(target) as checked:
+            inventory = removal_guard.inspect_mirror_output(checked, frozenset(), lambda: None)
+            with removal_guard.stage_mirror_output(checked) as staged:
+                def open_and_move(path: str, flags: int, mode: int = 0o777, *,
+                                  dir_fd: int | None = None) -> int:
+                    fd = open_entry(path, flags, mode, dir_fd=dir_fd)
+                    if path == "output":
+                        os.rename(staged.name, "moved", src_dir_fd=staged.parent, dst_dir_fd=staged.parent)
+                        os.mkdir(staged.name, dir_fd=staged.parent)
+                    return fd
+
+                try:
+                    with (mock.patch.object(os, "open", side_effect=open_and_move),
+                          self.assertRaises(removal_guard.ChangedEntry)):
+                        removal_guard.remove(staged, mirror=inventory)
+                finally:
+                    os.rmdir(staged.name, dir_fd=staged.parent)
+                    os.rename("moved", staged.name, src_dir_fd=staged.parent, dst_dir_fd=staged.parent)
+        self.assertEqual((target / "output").read_bytes(), b"build output")
 
     def assert_refused(self, path: Path, reason: removal_guard.RefusalReason,
                        *, mounts: tuple[Path, ...] = ()) -> None:
