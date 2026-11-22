@@ -2018,9 +2018,12 @@ class SettledChargeWatchTests(CostFixture):
         last_read = first + 8 * day
         self.replace('cost_explorer_watch_days', '45')
         fetch = mock.Mock(side_effect=recent_reads)
-        for elapsed in range(5, 3 * day + 1, 5):
-            _ = book.refresh_charges(self.settings, last_read + elapsed, fetch)
-            self.assertEqual(fetch.call_count, elapsed // day, f'{elapsed} seconds after the last seven-day query')
+        for offset in range(3):
+            day_start = offset * day
+            day_end = day_start + day
+            for elapsed in (day_start + 5, day_end - 5, day_end):
+                _ = book.refresh_charges(self.settings, last_read + elapsed, fetch)
+                self.assertEqual(fetch.call_count, elapsed // day, f'{elapsed} seconds after the last seven-day query')
 
         self.assertEqual(fetch.call_args_list, [
             mock.call(last_read + (offset - 45) * day, last_read + offset * day)
