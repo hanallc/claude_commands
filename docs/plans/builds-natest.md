@@ -1151,20 +1151,38 @@ Ordered after the red main repair and the guard repair (builds). It does not mov
   2. A test proves `read_time_limit` opens no index file and takes no index lock.
   3. The changed test modules pass; basedpyright zero errors and warnings on changed files.
 
-### Phase 422 — old gate records lose their read lists once  · status: todo
+### Phase 422 — affected-test choice reads a small latest-reads file  · status: todo
 **Depends on:** Phase 421
 
 #### Work Order
-- **Goal:** the history files shrink from 9.5 GiB to a small part of that. Each gate record holds about 10 MB of read lists (content_reads 7.45 MB, folder_scans 2.16 MB in one natedev record). nate approved (via bob and builds, 19:31): "3. yes". Keep the newest lists that `affected_modules.latest_module_reads` reads until the affected-test choice (List item 190 point 2) is settled.
+- **Goal:** a gate run record keeps times, results and memory peaks and no file-read lists. The config reads, folder scans and content reads of the newest full gate that has each go into one small latest-reads file, and `affected_modules` reads that file, not the index. nate approved (List item 190 point 2, via bob, 19:37): "you can ask for the affected test data source and read to change".
 - **Spec:**
-  1. A one-time deploy step rewrites the month files: it removes `content_reads`, `folder_scans` and `config_reads` from every gate record, except in the newest full, non-aborted gate record that has each field (the rows `affected_modules.py:723` selects).
+  1. `affected_modules.latest_module_reads` (`scripts/production/affected_modules.py:723`) calls `index.update()` and selects, for each of the three fields, the newest full non-aborted gate that has it. Keep that selection rule exactly.
+  2. Each gate that would write the lists writes them to the latest-reads file instead (atomic replace under a lock), per field, only for a full non-aborted run. The gate run record no longer holds `config_reads`, `folder_scans` or `content_reads`.
+  3. `latest_module_reads` reads only the file. A missing or corrupt file gives the same result as today's empty history.
+  4. The method of the affected-test choice does not change; no check goes away. If one must, stop and tell bob.
+- **Files:** `scripts/production/affected_modules.py`; the gate record writers (`scripts/test_times/gate_record.py`, the cloud and Mac importers); the Phase 421 module folder; their tests.
+- **Workers:** 1 writer.
+  - impl: all; the same writer as Phase 421, on top of its branch.
+- **Constraints from prior phases:** Phase 421 adds the recent-times file and its writers; use the same writer hook.
+- **Acceptance gate:**
+  1. Table rows: `latest_module_reads` from the file equals the index result for the same records; a non-full or aborted run does not replace the file; a new gate record has no read lists.
+  2. A test proves `latest_module_reads` opens no index file and takes no index lock.
+  3. The changed test modules pass; basedpyright zero errors and warnings on changed files.
+
+### Phase 423 — old gate records lose their read lists once  · status: todo
+**Depends on:** Phase 421, Phase 422
+
+#### Work Order
+- **Goal:** the history files shrink from 9.5 GiB to a small part of that. Each gate record holds about 10 MB of read lists (content_reads 7.45 MB, folder_scans 2.16 MB in one natedev record). nate approved (via bob and builds, 19:31): "3. yes". Phase 422 moves the newest lists to the latest-reads file first, so this is the only rewrite.
+- **Spec:**
+  1. A one-time deploy step first seeds the Phase 422 latest-reads file from the newest full, non-aborted gate record that has each field (the rows `affected_modules.py:723` selects), then rewrites the month files without `content_reads`, `folder_scans` and `config_reads` in any gate record.
   2. The same step updates the index rows in place and writes the new file marks for each rewritten file, so the index reads no file again.
   3. It runs under a drain hold with the buildlog timer stopped, like the gate rename deploy, at a time natemerge picks after the Part 1 gate. No reader changes.
-  4. New gate records keep their lists until point 2 is settled.
-- **Files:** one deploy module under `scripts/production/`; its tests.
+  - **Files:** one deploy module under `scripts/production/`; its tests.
 - **Workers:** 1 writer.
   - impl: all.
 - **Constraints from prior phases:** Phase 421: gates no longer read the index for the time limit.
 - **Acceptance gate:**
-  1. Table rows on a fixture history: lists removed from old records, kept in the newest record for each field; `latest_module_reads` returns the same result before and after; the index reads no file again after the step.
+  1. Table rows on a fixture history: lists removed from every record; the latest-reads file holds the newest lists; `latest_module_reads` returns the same result before and after; the index reads no file again after the step.
   2. A dry run on natedev states the bytes before and after.
