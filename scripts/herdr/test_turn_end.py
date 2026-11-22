@@ -31,7 +31,7 @@ from scripts.agents import detached_runs, restart, shutdown_record, worker_lifec
 from scripts.astra import astra_roles
 from scripts.direct import assign, progress_history
 from scripts.herdr import herdr, pass_notices, side_pane, turn_end, worker_panes
-from scripts.lib import atomic_file, copy_record, process_start, scratch
+from scripts.lib import atomic_file, copy_record, process_start, scratch, unit_runs
 from scripts.message import send
 from scripts.lib.test_hang_guard import LauncherHangGuard, TEST_HANG_GUARD_SECS
 from scripts.lib.test_models_registry import write_registry
@@ -640,6 +640,105 @@ class TurnEndTests(unittest.TestCase):
             self.assertIs(self.case.dispatch(), worker.ExitCode.UNCERTAIN)
         self.assertEqual(errors.getvalue().splitlines(), ["impl: completion has pending pane cleanup"])
         self.assertEqual(self.case.agent.submitted, before)
+
+    def test_completion_retries_check_saved_scratch_paths(self) -> None:
+        for attempt in ("hook", "resend", "reap"):
+            with self.subTest(attempt=attempt):
+                name = f"impl-{attempt}"
+                run = self.case.run_dir
+                self.case.prompt = run / f"{name}.md"
+                worker.save_reply(self.case.prompt, "Read the assignment.")
+                self.assertIs(self.case.dispatch(name), worker.DispatchSubmission.SUBMITTED)
+                root = self.case.fixture.root.resolve()
+                relative = root / f"{name} relative"
+                missing = root / f"{name} scratch"
+                retained = root / f"{name} retained"
+                relative.mkdir()
+                missing.mkdir()
+                retained.symlink_to(root / "missing-target")
+                parent = root / "nested"
+                parent.mkdir(exist_ok=True)
+                reason = "The task ended (scratch, a fixture reason)."
+                folders = [scratch.KeptFolder(Path(os.path.relpath(relative)), "task ended"),
+                           scratch.KeptFolder(missing, reason),
+                           scratch.KeptFolder(parent / ".." / retained.name, reason)]
+                missing_notices = (scratch.retained_task_folder_notice(relative, "task ended"),
+                                   scratch.retained_task_folder_notice(missing, reason))
+                retained_notice = scratch.retained_task_folder_notice(retained, reason)
+                self.case.agent.notice_failures = 1
+                with (patch.object(scratch, "end", return_value=folders),
+                      patch.object(send, "send", wraps=send.send) as transport,
+                      self.assertRaisesRegex(ValueError, "director message failed")):
+                    _ = self.case.finish(name)
+                initial = send.body_text(cast(send.Options, transport.call_args.args[0]))
+                for notice in (*missing_notices, retained_notice):
+                    self.assertIn(notice, initial)
+
+                for folder in (relative, missing):
+                    _ = folder.rename(root / f"{folder.name} moved")
+                before = len(self.case.agent.notices)
+                with patch.object(scratch, "end", return_value=[]):
+                    if attempt == "hook":
+                        self.assertIs(self.case.finish(name), turn_end.TurnOutcome.DONE)
+                    elif attempt == "resend":
+                        self.assertIs(self.case.dispatch(name), worker.DispatchSubmission.SUBMITTED)
+                    else:
+                        _ = detached_runs.reap_orphans(str(run))
+                self.assertEqual(len(self.case.agent.notices), before + 1)
+                notice = self.case.agent.notices[-1]
+                for missing_notice in missing_notices:
+                    self.assertNotIn(missing_notice, notice)
+                self.assertIn(retained_notice, notice)
+
+    def test_retry_with_invalid_scratch_paths_does_not_send(self) -> None:
+        self.assertIs(self.case.dispatch(), worker.DispatchSubmission.SUBMITTED)
+        row = self.case.agent.row(self.case.agent.submitted[-1][0])
+        run = self.case.run_dir
+        instance = str(worker_panes.worker_pass(row, run)["instance_id"])
+        retained = self.case.fixture.root / "retained"
+        retained.mkdir()
+        reason = "The task ended."
+        self.case.agent.notice_failures = 1
+        with (patch.object(scratch, "end", return_value=[scratch.KeptFolder(retained, reason)]),
+              self.assertRaisesRegex(ValueError, "director message failed")):
+            _ = self.case.finish()
+        saved_paths, = run.glob(".*.completion-scratch.json")
+        valid = saved_paths.read_text()
+        for invalid in ("{", json.dumps({str(retained): reason, "relative": reason})):
+            with self.subTest(invalid=invalid):
+                atomic_file.write_text_atomic(saved_paths, invalid)
+                with (patch.object(send, "send", wraps=send.send) as transport,
+                      patch.object(unit_runs, "report_anomaly") as anomaly):
+                    _ = detached_runs.reap_orphans(str(run))
+                transport.assert_not_called()
+                anomaly.assert_called_once()
+                self.assertFalse(pass_notices.is_settled(run, instance, "done"))
+
+        atomic_file.write_text_atomic(saved_paths, valid)
+        _ = detached_runs.reap_orphans(str(run))
+        self.assertEqual(len(self.case.agent.notices), 1)
+        self.assertIn(scratch.retained_task_folder_notice(retained, reason), self.case.agent.notices[0])
+        self.assertTrue(pass_notices.is_settled(run, instance, "done"))
+
+    def test_retry_omits_legacy_scratch_text_and_preserves_other_details(self) -> None:
+        self.assertIs(self.case.dispatch(), worker.DispatchSubmission.SUBMITTED)
+        row = self.case.agent.row(self.case.agent.submitted[-1][0])
+        run = self.case.run_dir
+        instance = str(worker_panes.worker_pass(row, run)["instance_id"])
+        root = self.case.fixture.root.resolve()
+        retained = root / "retained"
+        retained.mkdir()
+        legacy = scratch.retained_task_folder_notice(retained, "The task ended.")
+        other_notice = f"kept for a manual removal list: {root / 'removed'} (remove_run_scratch, the run ended)"
+        diagnostic = "The fixture saved another diagnostic."
+        message = "\n".join(("impl: phase 8: done", legacy, other_notice, diagnostic))
+        route = pass_notices.Route(instance, self.case.fixture.parent.id, row.name)
+        pass_notices.stage_result(run, route, "done",
+                                  pass_notices.Notice(message, f"codex:{row.current_session}", pass_notices.NoticeKind.RESULT),
+                                  legacy=pass_notices.LegacyNoticeStamp("", ""))
+        _ = detached_runs.reap_orphans(str(run))
+        self.assertEqual(self.case.agent.notices, ["\n".join(("impl: phase 8: done", other_notice, diagnostic))])
+        self.assertTrue(pass_notices.is_settled(run, instance, "done"))
 
     def test_a_director_or_an_idle_worker_hook_changes_no_pass(self) -> None:
         opened = self.case.opened()

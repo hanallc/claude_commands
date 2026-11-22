@@ -138,6 +138,43 @@ class ScratchTests(unittest.TestCase):
         assert isinstance(record, copy_record.Registered)
         self.assertEqual(record.fields["ended_task"], task)
 
+    def test_task_end_omits_missing_paths_and_keeps_saved_holds(self) -> None:
+        task = scratch.worker_task(MAKER_ID)
+        kept = self.base / "kept"
+        kept.mkdir()
+        canary = kept / "canary"
+        _ = canary.write_text("fixture data")
+        missing = self.base / "missing"
+        link = self.base / "dangling-link"
+        link.symlink_to(missing, target_is_directory=True)
+        denied = self.base / "denied"
+        denied.mkdir()
+        saved_holds = {
+            str(path): scratch.Hold(task=task, reason="fixture", maker=MAKER_ID, made=1.0, ended=2.0)
+            for path in (kept, missing, link, denied)
+        }
+        scratch.write_holds(saved_holds)
+        lstat = os.lstat
+
+        def deny_one(path: str | bytes | os.PathLike[str] | os.PathLike[bytes], *,
+                     dir_fd: int | None = None) -> os.stat_result:
+            if os.fspath(path) == str(denied):
+                raise PermissionError("path access denied")
+            return lstat(path, dir_fd=dir_fd)
+
+        with (mock.patch.object(os, "lstat", side_effect=deny_one),
+              mock.patch.object(scratch, "remove_folder", side_effect=AssertionError("task end requested removal")),
+              redirect_stderr(io.StringIO()) as errors):
+            result = scratch.end(task)
+        self.assertCountEqual([entry.path for entry in result], [kept, link, denied])
+        self.assertCountEqual(errors.getvalue().splitlines(), [
+            scratch.retained_task_folder_notice(entry.path, entry.reason) for entry in result
+        ])
+        self.assertEqual(scratch.holds(), saved_holds)
+        self.assertEqual(canary.read_text(), "fixture data")
+        self.assertTrue(link.is_symlink())
+        self.assertFalse(missing.exists())
+
     def test_a_callers_folder_goes_in_its_session_folder_and_its_task_ends_it(self) -> None:
         sessions = self.base / "session"
         sessions.mkdir()

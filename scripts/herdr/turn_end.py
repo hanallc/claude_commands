@@ -190,6 +190,11 @@ def _completion_reply(completion: progress_history.HookCompletion) -> str:
         return "\n".join(completion.details)
 
 
+def _completion_notice_details(completion: progress_history.HookCompletion) -> str:
+    # Old scratch notices have no saved path to check.
+    return "\n".join(detail for detail in completion.details if not scratch.is_retained_task_folder_notice(detail))
+
+
 def _stopped_notice(row: staff.StaffRow, parent: staff.StaffRow, run: Path, passed: dict[str, object],
                     completion: progress_history.HookCompletion, *, defer_notice: bool = False) -> TurnDecision:
     return _prepare_notice(row.name, parent, run, passed, str(passed["instance_id"]), TurnOutcome.STOPPED,
@@ -305,7 +310,7 @@ def retry_completed_notice(worker_name: str, parent: staff.StaffRow, run: Path,
     delivery = pass_recorder.dispatch_delivery(passed)
     outcome = TurnOutcome(completion.outcome) if isinstance(completion, progress_history.HookCompletion) else TurnOutcome.DONE
     path = Path(completion.reply_file if isinstance(completion, progress_history.HookCompletion) else delivery.reply_file)
-    details = "\n".join(completion.details) if isinstance(completion, progress_history.HookCompletion) else ""
+    details = _completion_notice_details(completion) if isinstance(completion, progress_history.HookCompletion) else ""
     reply = _completion_reply(completion) if isinstance(completion, progress_history.HookCompletion) else path.read_text()
     if delivery.actions.status_file:
         atomic_file.write_text_atomic(Path(delivery.actions.status_file), "done\n")
@@ -370,21 +375,17 @@ def _finish_completion(row: staff.StaffRow, parent: staff.StaffRow, run: Path, p
             completion = replace(completion, outcome=TurnOutcome.ERROR, details=(*completion.details, result.reason))
         progress_history.save_hook_completion(run, instance, completion)
     outcome = TurnOutcome(completion.outcome)
-    diagnostics: list[str] = []
     try:
-        for folder in scratch.end(scratch.worker_task(row.id)):
-            diagnostics.append(scratch.retained_task_folder_notice(folder.path, folder.reason))
+        pass_notices.save_completion_scratch(run, instance, scratch.end(scratch.worker_task(row.id)))
     except Exception as error:
-        diagnostics.append(f"scratch cleanup failed for {row.name}: {' '.join(str(error).splitlines())}")
-    if diagnostics:
-        details = tuple(dict.fromkeys((*completion.details, *diagnostics)))
-        if details != completion.details:
-            completion = replace(completion, details=details)
+        diagnostic = f"scratch cleanup failed for {row.name}: {' '.join(str(error).splitlines())}"
+        if diagnostic not in completion.details:
+            completion = replace(completion, details=(*completion.details, diagnostic))
             progress_history.save_hook_completion(run, instance, completion)
     reply = _completion_reply(completion)
 
     decision = _prepare_notice(row.name, parent, run, {**passed, "hook_completion": asdict(completion)},
-                               instance, outcome, path, reply, "\n".join(completion.details),
+                               instance, outcome, path, reply, _completion_notice_details(completion),
                                notice_type=_result_notice_type(outcome, reply, delivery),
                                defer_notice=not isinstance(pane, worker.CloseCompletedPane))
     if outcome != TurnOutcome.LATE_DONE and passed.get("status") in ("active", "refused"):

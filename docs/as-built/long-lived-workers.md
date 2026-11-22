@@ -262,6 +262,10 @@ Peer delivery preserves the repeat-guard hold reason. Other holds leave the noti
 The hook ends `scratch.worker_task(row.id)` before it closes the pane.
 This removes the worker's `scratch.py new --worker` folders and keeps other workers' folders.
 A failed cleanup adds a diagnostic to the director notice and permits pane closure.
+The hook saves each retained scratch path and reason separately from the notice text.
+Each send checks the saved paths and omits confirmed missing folders.
+The notice omits legacy scratch details that have only text.
+A scratch record read or validation failure leaves the notice pending without a send.
 `progress_history.complete_dispatch` records both completed passes and failed managed Astra review passes.
 It matches the slot and dispatch instance id before it records an outcome.
 A refused launcher retry retains the existing pass and its run, including a run with one worker.

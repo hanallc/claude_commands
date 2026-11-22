@@ -15,7 +15,7 @@ from typing import cast
 
 from scripts.agents import worker_lifecycle
 from scripts.direct import pass_record
-from scripts.lib import atomic_file, unit_runs
+from scripts.lib import atomic_file, scratch, unit_runs
 from scripts.message import send
 from scripts.production import staff
 
@@ -231,13 +231,42 @@ def _received(route: Route, key: str) -> bool:
     return send.confirmed_skip(message, timedelta(minutes=REPEAT_MINUTES), send.now()) is not None
 
 
-def _send(route: Route, key: str, notice: Notice) -> send.Result:
+def _completion_scratch_path(run: Path, instance: str) -> Path:
+    digest = hashlib.sha256(instance.encode()).hexdigest()
+    return run / f".{digest}.completion-scratch.json"
+
+
+def save_completion_scratch(run: Path, instance: str, retained: list[scratch.KeptFolder]) -> None:
+    if not retained:
+        return
+    path = _completion_scratch_path(run, instance)
+    saved = worker_lifecycle.read_json_object(path)
+    updated = saved | {str(folder.path.parent.resolve() / folder.path.name): folder.reason for folder in retained}
+    if updated != saved:
+        atomic_file.write_text_atomic(path, json.dumps(updated))
+
+
+def _completion_text(run: Path, instance: str, saved_text: str) -> str:
+    path = _completion_scratch_path(run, instance)
+    lines = [line for line in saved_text.split("\n") if not scratch.is_retained_task_folder_notice(line)]
+    for name, reason in worker_lifecycle.read_json_object(path).items():
+        folder = Path(name)
+        if not folder.is_absolute() or not isinstance(reason, str):
+            raise worker_lifecycle.WorkerStateUnreadable(path, f"invalid retained folder entry {name!r}")
+        if scratch.retained_folder_exists(folder):
+            lines.append(scratch.retained_task_folder_notice(folder, reason))
+    return "\n".join(lines)
+
+
+def _send(run: Path, route: Route, key: str, notice: Notice) -> send.Result:
     director = staff.snapshot().by_id(route.director_id)
     if director is None:
         raise ValueError(f"{route.director_id}: notice recipient is not in staff")
     prefix = "codex:" if isinstance(staff.backend(director), staff.CodexBackend) else "session:"
+    body = (_completion_text(run, route.instance_id, notice.text)
+            if notice.kind == NoticeKind.RESULT and key != "stopped" else notice.text)
     options = send.parse(["--to", prefix + str(director.current_session), "--from", route.worker_name,
-                          "--text", notice.text, "--key", _delivery_key(route, key),
+                          "--text", body, "--key", _delivery_key(route, key),
                           "--recipient-key", send.staff_queue_key(route.director_id),
                           "--repeat-minutes", str(REPEAT_MINUTES)])
     return send.send(options._replace(sender_origin=send.ForwardedSender(send.read_sender_stamp(notice.sender_native_id)),
@@ -271,7 +300,7 @@ def _deliver(path: Path, keys: Collection[str], *, retry: bool = False) -> None:
                 continue
             try:
                 if not retry or not _received(record.route, key):
-                    result = _send(record.route, key, notice)
+                    result = _send(path.parent, record.route, key, notice)
                     if not isinstance(result, send.RepeatGuardHeld) and result.outcome not in ("sent", "skipped"):
                         if result.outcome == "held" and notice.kind == NoticeKind.DIAGNOSTIC:
                             continue
