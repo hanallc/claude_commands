@@ -35,7 +35,6 @@ import sys
 import tempfile
 import time
 import tomllib
-from types import FrameType
 from typing import IO, Literal, NamedTuple, NoReturn, NotRequired, TypedDict, cast, override
 
 from scripts.lib import build_folders
@@ -104,75 +103,6 @@ def next_step(action: str) -> str:
 
 class CaptureTimeout(Exception):
     """A screenshot that never answered; exit 3, and never resend it."""
-
-
-class ExitSignal(BaseException):
-    """A catchable process signal that should unwind the active shot."""
-
-    def __init__(self, number: int) -> None:
-        super().__init__(number)
-        self.number: int = number
-
-
-@dataclass(frozen=True)
-class ExitSignalsEnabled:
-    """The first exit signal may unwind the active operation."""
-
-
-@dataclass(frozen=True)
-class ExitSignalsDeferred:
-    """Cleanup must finish before an exit signal unwinds the operation."""
-
-
-@dataclass(frozen=True)
-class DeferredExitSignal:
-    """The first exit signal received while cleanup was protected."""
-
-    number: int
-
-
-@dataclass(frozen=True)
-class ExitSignalsLatched:
-    """An unwind or final cleanup has begun; later exit signals do nothing."""
-
-
-class ExitSignalLatch:
-    """Make the first exit signal unwind once, after any cleanup in progress."""
-
-    def __init__(self) -> None:
-        self.state: ExitSignalsEnabled | ExitSignalsDeferred | DeferredExitSignal | ExitSignalsLatched
-        self.state = ExitSignalsEnabled()
-
-    def reset(self) -> None:
-        self.state = ExitSignalsEnabled()
-
-    def latch(self) -> None:
-        self.state = ExitSignalsLatched()
-
-    def interrupt(self, number: int) -> None:
-        if isinstance(self.state, ExitSignalsEnabled):
-            self.state = ExitSignalsLatched()
-            raise ExitSignal(number)
-        if isinstance(self.state, ExitSignalsDeferred):
-            self.state = DeferredExitSignal(number)
-
-    @contextmanager
-    def defer_during_cleanup(self) -> Generator[None, None, None]:
-        deferring = isinstance(self.state, ExitSignalsEnabled)
-        if deferring:
-            self.state = ExitSignalsDeferred()
-        try:
-            yield
-        finally:
-            if deferring and isinstance(self.state, ExitSignalsDeferred):
-                self.state = ExitSignalsEnabled()
-            elif deferring and isinstance(self.state, DeferredExitSignal):
-                deferred = self.state
-                self.state = ExitSignalsLatched()
-                raise ExitSignal(deferred.number)
-
-
-EXIT_SIGNAL_LATCH = ExitSignalLatch()
 
 
 class BrpCallError(Failure):
@@ -877,8 +807,7 @@ class Session:
         return camera_state(rows[0]["components"])
 
     def close(self) -> None:
-        """Latch exit signals, restore the window, then end the keep-awake."""
-        EXIT_SIGNAL_LATCH.latch()
+        """Restore the window and end the keep-awake."""
         self.restore_window_and_end_keep_awake()
 
     def restore_window_and_end_keep_awake(self) -> None:
@@ -1849,8 +1778,7 @@ def keep_visible(session: Session) -> None:
         session.wait_frames(hana_shot_settings.whole("window_frames"))
         session.window_level = prepared_window
     except BaseException:
-        with EXIT_SIGNAL_LATCH.defer_during_cleanup():
-            session.restore_window_and_end_keep_awake()
+        session.restore_window_and_end_keep_awake()
         raise
 
 
@@ -3350,10 +3278,6 @@ def arguments(argv: list[str], *,
     return parser.parse_args(normalized, namespace=Arguments())
 
 
-def exit_for_signal(number: int, _frame: FrameType | None) -> None:
-    EXIT_SIGNAL_LATCH.interrupt(number)
-
-
 def main(argv: list[str]) -> int:
     hana_shot_settings = conf.read("hana_shot")
     try:
@@ -3387,10 +3311,6 @@ def main(argv: list[str]) -> int:
                   if args.command == "shot" or args.command == "views" and args.action == "check" else None)
     if invocation is not None and args.face is not None:
         invocation.orientation = TargetFace(args.face)
-    EXIT_SIGNAL_LATCH.reset()
-    _ = signal.signal(signal.SIGINT, exit_for_signal)
-    _ = signal.signal(signal.SIGTERM, exit_for_signal)
-    _ = signal.signal(signal.SIGHUP, exit_for_signal)
     exit_code = 1
     try:
         if args.command == "views" and args.action in ("check", "add") and args.from_current or (
@@ -3420,12 +3340,11 @@ def main(argv: list[str]) -> int:
         exit_code = 1
         if invocation is not None and not invocation.failures:
             invocation.failures.append(CaptureFailure(failure_reason(exc), str(exc)))
-    except ExitSignal as exc:
-        exit_code = 128 + exc.number
-        error = f"terminated by {signal.Signals(exc.number).name}"
-        print(f"hana_shot: {error}", file=sys.stderr)
-        if invocation is not None:
-            invocation.failures.append(CaptureFailure(FailureReason.SHOT_FAILED, error))
+    except KeyboardInterrupt:
+        exit_code = 130
+        if invocation is not None and not invocation.failures:
+            invocation.failures.append(CaptureFailure(FailureReason.SHOT_FAILED, "interrupted (Ctrl-C)"))
+        raise
     except Exception as exc:
         if invocation is not None:
             invocation.failures.append(CaptureFailure(FailureReason.SHOT_FAILED, f"{type(exc).__name__}: {exc}"))

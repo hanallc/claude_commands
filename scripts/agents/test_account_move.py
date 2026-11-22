@@ -307,7 +307,7 @@ class AccountMoveTests(ShutdownTestCase):
             result = accounts.move_group("showrunners", "claude3", why="manual group move")
         self.assertIsInstance(result, accounts.GroupMoveStarted)
         self.assertEqual(self.moves.calls, [MoveCall(identity, "claude3", "manual group move") for identity in ("first", "second")])
-        self.assertEqual(self.moves.batches, [["first", "second"]])
+        self.assertEqual(self.moves.batches, [["first", "second", "already"]])
         self.assertEqual(accounts.group_accounts().get("showrunners"), "claude3")
         assert isinstance(result, accounts.GroupMoveStarted)
         self.assertEqual(sum("Claude is up on" in line for line in result.stdout.splitlines()), 2)

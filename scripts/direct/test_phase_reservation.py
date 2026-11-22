@@ -14,6 +14,7 @@ import tempfile
 import unittest
 from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 from threading import Event, current_thread
@@ -35,12 +36,12 @@ ACTIVE: dict[str, object] = {"kind": "active", "active_phase_reservation": {
     "reservation_id": "r1", "coordination_run_id": "c1", "phase": "34h", "phase_start_head": "a" * 40}}
 
 
-def record_unit(test: unittest.TestCase, run: Path, home: Path, phase: str) -> None:
+def record_unit(test: unittest.TestCase, run: Path, home: Path, phase: str, *, name: str = "reservation") -> None:
     """Record a private unit and its durable run owner."""
     _ = test.enterContext(isolated_staff_file(run / "staff.json", {}))
     _ = (run / "staff.json").write_text(json.dumps({"schema": 2, "rows": []}))
     owner = fixture_member("showrunner", name="reservation")
-    row = fixture_unit_location(owner, "reservation", home)
+    row = fixture_unit_location(owner, name, home)
     _ = (run / plan_history.STATE_FILENAME).write_text(json.dumps({
         "owner_staff_id": row.id, "open_phases": [{"id": phase, "status": "active"}]}))
 
@@ -134,6 +135,184 @@ class WorktreeAttributionTests(unittest.TestCase):
         self.assertEqual(self.claim("2", self.second), (0, ""))
         self.assertEqual((directory / phase_reservation.WORKTREE_FILE).read_text(), str(self.second) + "\n")
 
+    def record_clone(self, phase: str, clone: Path) -> None:
+        _ = subprocess.run(["git", "clone", "-q", str(self.first), str(clone)], check=True, capture_output=True,
+                           timeout=TEST_HANG_GUARD_SECS)
+        directory = phase_reservation.phase_directory(self.session, phase)
+        directory.mkdir(parents=True)
+        _ = (directory / phase_reservation.WORKTREE_FILE).write_text(str(clone) + "\n")
+
+    def test_claim_moves_a_recorded_clone_to_a_model_worktree(self) -> None:
+        for phase, clone in (("2", self.session.parent / "phase-2-clone"),
+                             ("3", self.session.parent / "worktrees" / "legacy-home")):
+            with self.subTest(clone=clone):
+                self.record_clone(phase, clone)
+                directory = phase_reservation.phase_directory(self.session, phase)
+                baseline = directory / phase_reservation.BASELINE_FILE
+                status = directory / phase_reservation.BASELINE_STATUS_FILE
+                first_commit = phase_reservation.commit_id(clone, "HEAD") + "\n"
+                first_status = "?? first-launch.txt\n"
+                _ = baseline.write_text(first_commit)
+                _ = status.write_text(first_status)
+                if phase == "3":
+                    _ = phase_reservation.enroll(directory, phase, "board_ready")
+
+                self.assertEqual(self.claim(phase, self.second), (0, ""))
+                self.assertEqual((directory / phase_reservation.WORKTREE_FILE).read_text(), str(self.second) + "\n")
+                self.assertEqual(baseline.read_text(), first_commit)
+                self.assertEqual(status.read_text(), first_status)
+
+    def test_claim_keeps_the_recorded_model_worktree(self) -> None:
+        self.assertEqual(self.claim("2", self.second), (0, ""))
+        other = make_fixture_worktree(self.first, "reservation", "p3")
+        directory = phase_reservation.phase_directory(self.session, "2")
+
+        self.assertEqual(self.claim("2", other), (0, ""))
+        self.assertEqual((directory / phase_reservation.WORKTREE_FILE).read_text(), str(self.second) + "\n")
+
+    def test_claim_keeps_the_recorded_model_worktree_when_the_requested_folder_is_gone(self) -> None:
+        self.assertEqual(self.claim("2", self.second), (0, ""))
+        removed = self.second.with_name("removed")
+        removed.mkdir()
+        removed.rmdir()
+        directory = phase_reservation.phase_directory(self.session, "2")
+
+        self.assertEqual(self.claim("2", removed), (0, ""))
+        self.assertEqual((directory / phase_reservation.WORKTREE_FILE).read_text(), str(self.second) + "\n")
+
+    def test_claim_refuses_a_recorded_clone_without_a_valid_model_worktree(self) -> None:
+        clone = self.session.parent / "phase-2-clone"
+        self.record_clone("2", clone)
+        directory = phase_reservation.phase_directory(self.session, "2")
+        foreign = make_fixture_worktree(self.first, "other-unit", "p3")
+        for requested, reason in ((clone, f"{str(clone)!r} is not in the subpath of"),
+                                  (self.main, f"{str(self.main)!r} is not in the subpath of"),
+                                  (foreign, "the checkout is for unit 'other-unit'")):
+            with self.subTest(requested=requested):
+                code, errors = self.claim("2", requested)
+                self.assertEqual(code, 2)
+                self.assertIn(f"{requested}: {reason}", errors)
+                self.assertEqual((directory / phase_reservation.WORKTREE_FILE).read_text(), str(clone) + "\n")
+                self.assertFalse((directory / phase_reservation.BASELINE_FILE).exists())
+
+    def test_claim_refuses_to_move_a_phase_with_a_reservation(self) -> None:
+        clone = self.session.parent / "phase-2-clone"
+        self.record_clone("2", clone)
+        directory = phase_reservation.phase_directory(self.session, "2")
+        head = phase_reservation.commit_id(clone, "HEAD")
+        _ = phase_reservation.enroll(directory, "2", "board_ready")
+        self.assertTrue(phase_reservation.record_active(directory, phase_reservation.Acquisition("r1", "c1", head)))
+
+        code, errors = self.claim("2", self.second)
+
+        self.assertEqual(code, 2)
+        self.assertIn(f"state {phase_reservation.ACTIVE!r}", errors)
+        self.assertIn("Release the phase reservation, then claim again.", errors)
+        self.assertEqual((directory / phase_reservation.WORKTREE_FILE).read_text(), str(clone) + "\n")
+
+    def test_claim_refuses_a_foreign_replacement_for_a_recorded_legacy_checkout(self) -> None:
+        legacy = self.session.parent / "worktrees" / "legacy-home"
+        self.record_clone("2", legacy)
+        directory = phase_reservation.phase_directory(self.session, "2")
+        foreign = make_fixture_worktree(self.first, "other-unit", "p3")
+
+        code, errors = self.claim("2", foreign)
+
+        self.assertEqual(code, 2)
+        self.assertIn(f"{foreign}: the checkout is for unit 'other-unit', and the run belongs to 'reservation'", errors)
+        self.assertEqual((directory / phase_reservation.WORKTREE_FILE).read_text(), str(legacy) + "\n")
+
+    def test_claim_refuses_a_non_git_replacement_for_a_recorded_legacy_checkout(self) -> None:
+        legacy = self.session.parent / "worktrees" / "legacy-home"
+        self.record_clone("2", legacy)
+        directory = phase_reservation.phase_directory(self.session, "2")
+        worktree_file = directory / phase_reservation.WORKTREE_FILE
+        outside = self.session.parent / "outside-git"
+        outside.mkdir()
+
+        code, errors = self.claim("2", outside)
+
+        self.assertEqual(code, 2)
+        self.assertIn(f"{outside}: --repo does not name a Git checkout", errors)
+        self.assertEqual(worktree_file.read_text(), str(legacy) + "\n")
+
+    def test_claim_with_no_recorded_checkout_and_no_git_checkout_does_nothing(self) -> None:
+        outside = self.session.parent / "outside-git"
+        outside.mkdir()
+        output = io.StringIO()
+
+        with contextlib.redirect_stdout(output):
+            code = phase_reservation.main(["claim", "--session-dir", str(self.session),
+                                           "--phase", "3", "--repo", str(outside)])
+
+        self.assertEqual(code, 0)
+        self.assertIn("no repository or no files to claim", output.getvalue())
+        self.assertFalse(phase_reservation.phase_directory(self.session, "3").exists())
+
+    def test_claim_tells_a_phase_without_a_reservation_to_clear_its_state(self) -> None:
+        clone = self.session.parent / "phase-2-clone"
+        self.record_clone("2", clone)
+        directory = phase_reservation.phase_directory(self.session, "2")
+        _ = phase_reservation.enroll(directory, "2", "unconfigured")
+
+        code, errors = self.claim("2", self.second)
+
+        self.assertEqual(code, 2)
+        self.assertIn(f"state {phase_reservation.NOT_ENROLLED!r}", errors)
+        self.assertIn("phase_reservation.py clear " + shlex.join(["--session-dir", str(self.session), "--phase", "2"]),
+                      errors)
+        self.assertEqual((directory / phase_reservation.WORKTREE_FILE).read_text(), str(clone) + "\n")
+
+    def test_claim_can_clear_legacy_state_before_moving(self) -> None:
+        clone = self.session.parent / "phase-2-clone"
+        self.record_clone("2", clone)
+        directory = phase_reservation.phase_directory(self.session, "2")
+        state_file = self.session / phase_reservation.STATE_FILE
+        _ = state_file.write_text(json.dumps({"kind": phase_reservation.NOT_ENROLLED, "phase": "2"}))
+        baseline = phase_reservation.commit_id(clone, "HEAD") + "\n"
+        status = "?? first-launch.txt\n"
+        _ = (self.session / phase_reservation.BASELINE_FILE).write_text(baseline)
+        _ = (self.session / phase_reservation.BASELINE_STATUS_FILE).write_text(status)
+
+        code, errors = self.claim("2", self.second)
+
+        self.assertEqual(code, 2)
+        self.assertIn(str(state_file), errors)
+        self.assertIn(f"state {phase_reservation.NOT_ENROLLED!r}", errors)
+        self.assertIn("phase_reservation.py clear " + shlex.join(["--session-dir", str(self.session), "--phase", "2"]),
+                      errors)
+        self.assertEqual((directory / phase_reservation.WORKTREE_FILE).read_text(), str(clone) + "\n")
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(phase_reservation.main(["clear", "--session-dir", str(self.session), "--phase", "2"]), 0)
+        self.assertFalse(state_file.exists())
+        self.assertFalse((directory / phase_reservation.STATE_FILE).exists())
+        self.assertEqual(self.claim("2", self.second), (0, ""))
+        self.assertEqual((directory / phase_reservation.WORKTREE_FILE).read_text(), str(self.second) + "\n")
+        self.assertEqual((directory / phase_reservation.BASELINE_FILE).read_text(), baseline)
+        self.assertEqual((directory / phase_reservation.BASELINE_STATUS_FILE).read_text(), status)
+
+    def test_claim_uses_the_unit_word_from_completed_records(self) -> None:
+        main = self.session.parent / ".claude"
+        _ = subprocess.run(["git", "clone", "-q", str(self.first), str(main)], check=True, capture_output=True,
+                           timeout=TEST_HANG_GUARD_SECS)
+        _ = subprocess.run(["git", "-C", str(main), "remote", "set-url", "origin",
+                            str(main.parent / "claude_commands.git")], check=True, capture_output=True,
+                           timeout=TEST_HANG_GUARD_SECS)
+        source = worktrees.FrozenWorktreeSource(main, phase_reservation.commit_id(main, "HEAD"))
+        _ = (worktrees.state_folder() / "invalid.json").write_text("{")
+        owned = worktrees.make("claude", "natedev-board", "owned", source)
+        ownerless = worktrees.make("claude", "natedev-board", "ownerless", source)
+        foreign = worktrees.make("claude", "natedev-other", "foreign", source)
+        for checkout, owner in ((owned, "board"), (ownerless, ""), (foreign, "other")):
+            record = worktrees.read_record(worktrees.record_file(checkout))
+            worktrees.write_record(replace(record, owner=owner))
+        record_unit(self, self.session, owned, "1", name="board")
+
+        self.assertEqual(self.claim("2", owned), (0, ""))
+        self.assertEqual(self.claim("3", ownerless), (0, ""))
+        self.assert_model_worktree_refused("4", foreign, "the checkout is for unit 'natedev-other'")
+
     def test_claim_refuses_a_clone_outside_the_model(self) -> None:
         clone = self.session.parent / "scratch" / "fixture" / "reservation" / "p3"
         clone.parent.mkdir(parents=True)
@@ -210,6 +389,14 @@ class WorktreeAttributionTests(unittest.TestCase):
                 self.assertIn(str(home), errors)
                 self.assertIn(phase_reservation.MOVE_UNIT_HOME, errors)
 
+    def test_claim_refuses_a_model_home_without_a_worktree_record(self) -> None:
+        worktrees.record_file(self.first).unlink()
+
+        errors = self.assert_claim_refused("1", self.second)
+
+        self.assertIn(f"{self.first}: no completed worktree record matches the checkout", errors)
+        self.assertIn(phase_reservation.MOVE_UNIT_HOME, errors)
+
     def test_claim_refuses_a_non_git_path_when_the_run_owner_is_unavailable(self) -> None:
         _ = (self.session / plan_history.STATE_FILENAME).write_text("{}")
         errors = self.assert_claim_refused("1", self.session)
@@ -227,7 +414,12 @@ class WorktreeAttributionTests(unittest.TestCase):
 
     def test_claim_retry_refuses_a_git_read_failure_of_the_recorded_checkout(self) -> None:
         self.assertEqual(self.claim("2", self.second), (0, ""))
-        with mock.patch.object(phase_reservation, "repository_root", return_value=None):
+        read_root = phase_reservation.repository_root
+
+        def fail_recorded_read(root: Path) -> Path | None:
+            return None if root == self.second else read_root(root)
+
+        with mock.patch.object(phase_reservation, "repository_root", fail_recorded_read):
             code, errors = self.claim("2", self.first)
         self.assertEqual(code, 2, errors)
         self.assertIn(f"{self.second}: Git cannot read this path inside the worktree model", errors)
@@ -467,7 +659,7 @@ class WorktreeAttributionTests(unittest.TestCase):
         directory = phase_reservation.phase_directory(self.session, "1")
         self.assertEqual(self.claim("1", self.second), (0, ""))
         before = {name: (directory / name).read_bytes() for name in
-                  (phase_reservation.BASELINE_FILE, phase_reservation.BASELINE_STATUS_FILE)}
+                  (phase_reservation.WORKTREE_FILE, phase_reservation.BASELINE_FILE, phase_reservation.BASELINE_STATUS_FILE)}
         _ = subprocess.run(["git", "-C", str(self.first), "worktree", "remove", str(self.second)],
                            check=True, capture_output=True, timeout=TEST_HANG_GUARD_SECS)
         _ = subprocess.run(["git", "-C", str(self.main), "checkout", "-q", "--orphan", "replacement"],
@@ -490,6 +682,22 @@ class WorktreeAttributionTests(unittest.TestCase):
         self.assertIn(str(replacement), errors)
         self.assertEqual({name: (directory / name).read_bytes() for name in before}, before)
 
+    def test_claim_refuses_when_the_recorded_model_checkout_and_request_are_missing(self) -> None:
+        directory = phase_reservation.phase_directory(self.session, "1")
+        self.assertEqual(self.claim("1", self.second), (0, ""))
+        before = {name: (directory / name).read_bytes() for name in
+                  (phase_reservation.WORKTREE_FILE, phase_reservation.BASELINE_FILE, phase_reservation.BASELINE_STATUS_FILE)}
+        _ = subprocess.run(["git", "-C", str(self.first), "worktree", "remove", str(self.second)],
+                           check=True, capture_output=True, timeout=TEST_HANG_GUARD_SECS)
+        missing = self.session.parent / "missing"
+
+        code, errors = self.claim("1", missing)
+
+        self.assertEqual(code, 2)
+        self.assertIn(f"{missing}: --repo does not name a Git checkout", errors)
+        self.assertIn(f"recorded checkout is {self.second}", errors)
+        self.assertEqual({name: (directory / name).read_bytes() for name in before}, before)
+
     def test_claim_keeps_a_baseline_present_in_a_replacement_checkout(self) -> None:
         directory = phase_reservation.phase_directory(self.session, "1")
         self.assertEqual(self.claim("1", self.second), (0, ""))
@@ -497,12 +705,60 @@ class WorktreeAttributionTests(unittest.TestCase):
                   (phase_reservation.BASELINE_FILE, phase_reservation.BASELINE_STATUS_FILE)}
         _ = subprocess.run(["git", "-C", str(self.first), "worktree", "remove", str(self.second)],
                            check=True, capture_output=True, timeout=TEST_HANG_GUARD_SECS)
+        self.second.mkdir()
         self.assertEqual(self.claim("1", self.first), (0, ""))
         self.assertFalse((directory / phase_reservation.WORKTREE_FILE).exists())
         self.assertEqual({name: (directory / name).read_bytes() for name in before}, before)
 
-    def test_claim_retries_after_interruption_between_baseline_writes(self) -> None:
+    @staticmethod
+    def interrupt_worktree_write(path: Path, content: str) -> None:
+        if path.name == phase_reservation.WORKTREE_FILE:
+            raise OSError("interrupted worktree publication")
+        atomic_file.write_text_atomic(path, content)
+
+    def test_claim_retries_a_replacement_after_the_worktree_write_fails(self) -> None:
+        clone = self.session.parent / "phase-2-clone"
+        self.record_clone("2", clone)
+        directory = phase_reservation.phase_directory(self.session, "2")
+        worktree_file = directory / phase_reservation.WORKTREE_FILE
+        baseline = directory / phase_reservation.BASELINE_FILE
+        status = directory / phase_reservation.BASELINE_STATUS_FILE
+        _ = (self.second / "replacement.txt").write_text("replacement checkout\n")
+
+        with mock.patch.object(phase_reservation, "write_text_atomic", self.interrupt_worktree_write):
+            code, errors = self.claim("2", self.second)
+
+        self.assertEqual(code, 2)
+        self.assertIn("interrupted worktree publication", errors)
+        self.assertEqual(worktree_file.read_text(), str(clone) + "\n")
+        self.assertFalse(baseline.exists())
+        self.assertFalse(status.exists())
+        self.assertEqual(self.claim("2", self.second), (0, ""))
+        self.assertEqual(worktree_file.read_text(), str(self.second) + "\n")
+        self.assertEqual(baseline.read_text(), phase_reservation.commit_id(self.second, "HEAD") + "\n")
+        self.assertEqual(status.read_text(), "?? replacement.txt\n")
+
+    def test_claim_retries_a_first_model_checkout_after_the_worktree_write_fails(self) -> None:
         directory = phase_reservation.phase_directory(self.session, "1")
+        _ = phase_reservation.enroll(directory, "1", "unconfigured")
+        worktree_file = directory / phase_reservation.WORKTREE_FILE
+        baseline = directory / phase_reservation.BASELINE_FILE
+        status = directory / phase_reservation.BASELINE_STATUS_FILE
+
+        with mock.patch.object(phase_reservation, "write_text_atomic", self.interrupt_worktree_write):
+            code, errors = self.claim("1", self.second)
+
+        self.assertEqual(code, 2)
+        self.assertIn("interrupted worktree publication", errors)
+        self.assertFalse(worktree_file.exists())
+        self.assertFalse(baseline.exists())
+        self.assertFalse(status.exists())
+        self.assertEqual(self.claim("1", self.second), (0, ""))
+        self.assertEqual(worktree_file.read_text(), str(self.second) + "\n")
+        self.assertEqual(baseline.read_text(), phase_reservation.commit_id(self.second, "HEAD") + "\n")
+        self.assertEqual(status.read_text(), "")
+
+    def test_claim_retries_after_interruption_between_baseline_writes(self) -> None:
         publish = atomic_file.write_text_atomic
 
         def interrupt(path: Path, content: str) -> None:
@@ -510,17 +766,25 @@ class WorktreeAttributionTests(unittest.TestCase):
                 raise OSError("interrupted before commit publication")
             publish(path, content)
 
-        _ = (self.first / "before.txt").write_text("interrupted launch\n")
-        with mock.patch.object(phase_reservation, "write_text_atomic", interrupt):
-            code, errors = self.claim("1", self.first)
-        self.assertEqual(code, 2)
-        self.assertIn("interrupted", errors)
-        self.assertFalse((directory / phase_reservation.BASELINE_FILE).exists())
-        (self.first / "before.txt").unlink()
-        self.assertEqual(self.claim("1", self.first), (0, ""))
-        self.assertEqual((directory / phase_reservation.BASELINE_FILE).read_text(),
-                         phase_reservation.commit_id(self.first, "HEAD") + "\n")
-        self.assertEqual((directory / phase_reservation.BASELINE_STATUS_FILE).read_text(), "")
+        for phase, checkout in (("1", self.first), ("2", self.second)):
+            with self.subTest(checkout=checkout):
+                directory = phase_reservation.phase_directory(self.session, phase)
+                _ = (checkout / "before.txt").write_text("interrupted launch\n")
+                with mock.patch.object(phase_reservation, "write_text_atomic", interrupt):
+                    code, errors = self.claim(phase, checkout)
+                self.assertEqual(code, 2)
+                self.assertIn("interrupted", errors)
+                self.assertFalse((directory / phase_reservation.BASELINE_FILE).exists())
+                if checkout == self.second:
+                    self.assertEqual((directory / phase_reservation.WORKTREE_FILE).read_text(), str(checkout) + "\n")
+                (checkout / "before.txt").unlink()
+                retry_path = f"retry-{phase}.txt"
+                _ = (checkout / retry_path).write_text("retry\n")
+
+                self.assertEqual(self.claim(phase, self.first), (0, ""))
+                self.assertEqual((directory / phase_reservation.BASELINE_FILE).read_text(),
+                                 phase_reservation.commit_id(checkout, "HEAD") + "\n")
+                self.assertEqual((directory / phase_reservation.BASELINE_STATUS_FILE).read_text(), f"?? {retry_path}\n")
 
     def test_same_file_in_linked_worktrees_belongs_to_each_worktrees_phase(self) -> None:
         for root in (self.first, self.second):

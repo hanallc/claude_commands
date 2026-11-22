@@ -841,6 +841,53 @@ def _file() -> Path:
     return Path(_file_override() or _default_file()).expanduser()
 
 
+def _record_lock_path(record: Path) -> Path:
+    return record.with_name(record.name + ".lock")
+
+
+def _operation_lock_path(record: Path) -> Path:
+    return record.with_name("operation.lock")
+
+
+@dataclass(frozen=True)
+class StaffWorktreeWriteAvailable:
+    """No held lock prevents the staff worktree write."""
+
+
+@dataclass(frozen=True)
+class StaffWorktreeWriteLockHeld:
+    lock: Path
+
+
+def _probe_worktree_write(*, check_operation: bool) -> StaffWorktreeWriteAvailable | StaffWorktreeWriteLockHeld:
+    from scripts.lib import file_lock
+
+    record = _file()
+    locks = (_record_lock_path(record),)
+    if check_operation:
+        locks = (_operation_lock_path(record), *locks)
+    for lock in locks:
+        try:
+            if file_lock.probe_existing_exclusive(lock) is file_lock.LockAvailability.HELD:
+                return StaffWorktreeWriteLockHeld(lock.absolute())
+        except OSError as error:
+            raise StaffUnreadable(f"cannot check staff lock {lock}: {error}") from error
+    return StaffWorktreeWriteAvailable()
+
+
+def worktree_write_lock_status() -> StaffWorktreeWriteAvailable | StaffWorktreeWriteLockHeld:
+    """Check the staff locks on the machine that writes the record."""
+    if is_owner():
+        return _probe_worktree_write(check_operation=False)
+    match _remote(["worktree-write-lock-status"]):
+        case {"state": "available"}:
+            return StaffWorktreeWriteAvailable()
+        case {"state": "held", "lock": str() as lock} if Path(lock).is_absolute():
+            return StaffWorktreeWriteLockHeld(Path(lock))
+        case _:
+            raise StaffUnreadable("invalid worktree write lock status from the staff owner")
+
+
 def is_owner() -> bool:
     """An explicit STAFF_FILE is local state owned by this process."""
     from scripts.agents import remote
@@ -978,10 +1025,34 @@ def wait_for_upkeep_row(row: StaffRow, deadline: float) -> None:
 
 
 @contextmanager
-def slot_operation(key: str, name: str) -> Generator[None]:
+def session_operation(session: str, *, native_key: str, join_recovery: bool = False) -> Generator[StaffSnapshot]:
+    """Lock the native session before its staff row, if it has one."""
+    if join_recovery:
+        if not _joined_operation(*_row_lock(native_key)):
+            raise StaffRefused("recovery did not pass the native session lock")
+        record = initial_snapshot()
+        row = record.by_current_session(session)
+        if row is None or not _joined_operation(*_row_lock(row.id)):
+            raise StaffRefused("recovery did not pass the staff row lock")
+        yield record
+        return
+    with slot_operation(native_key, session, join=False), ExitStack() as locks:
+        record = initial_snapshot()
+        row = record.by_current_session(session)
+        if row is not None:
+            _ = locks.enter_context(slot_operation(row.id, row.name, join=False))
+            record = initial_snapshot()
+            current = record.by_current_session(session)
+            if current is None or current.id != row.id:
+                raise StaffRefused(f"{row.name}: the session owner changed while acquiring its row")
+        yield record
+
+
+@contextmanager
+def slot_operation(key: str, name: str, *, join: bool = True) -> Generator[None]:
     """Lock a row or a named worker slot across inherited children."""
     path, variable = _row_lock(key)
-    if _joined_operation(path, variable):
+    if join and _joined_operation(path, variable):
         yield
         return
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -1127,7 +1198,7 @@ def operation() -> AbstractContextManager[None]:
 
     @contextmanager
     def locked() -> Generator[None]:
-        path = _file().parent / "operation.lock"
+        path = _operation_lock_path(_file())
         if _joined_operation(path):
             yield
             return
@@ -1549,7 +1620,7 @@ def wait_for_writes() -> None:
 
     path = _file()
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.with_name(path.name + ".lock").open("a", encoding="utf-8") as lock:
+    with _record_lock_path(path).open("a", encoding="utf-8") as lock:
         worker_lifecycle.acquire_flock(lock, mode=fcntl.LOCK_SH)
 
 
@@ -1664,14 +1735,8 @@ def _copy_to_mac(*, detached: bool = True) -> None:
                     stdout=subprocess.DEVNULL, stderr=errors, start_new_session=True,
                 )
             return
-        import signal
-
         path = _default_file()
-        # Keep this lock through SSH so an older send cannot follow a newer send.
-        with path.with_name("mac-copy.lock").open("a", encoding="utf-8") as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX)
-            text = path.read_text(encoding="utf-8")
-            command = '''set -e
+        command = '''set -e
 directory="$HOME/.local/state/staff"
 mkdir -p "$directory"
 temporary=$(mktemp "$directory/staff.json.mac-copy.XXXXXXXX")
@@ -1679,31 +1744,18 @@ trap 'rm -f "$temporary"' EXIT
 cat > "$temporary"
 mv -f "$temporary" "$directory/staff.json"
 '''
-            def stop(_number: int, _frame: object) -> None:
-                raise InterruptedError("copier terminated")
-
-            # Defer SIGTERM until the SSH child has a cleanup handler.
-            blocked = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM})
-            previous_handler = signal.signal(signal.SIGTERM, stop)
-            try:
-                with subprocess.Popen(
-                    ["ssh", "-o", "BatchMode=yes", remote.other_machine(), command],
-                    stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-                ) as process:
-                    try:
-                        _ = signal.pthread_sigmask(signal.SIG_SETMASK, blocked)
-                        _, errors = process.communicate(input=text, timeout=remote.STANDARD_TIME_LIMIT["seconds"])
-                    except BaseException:
-                        _ = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM})
-                        process.terminate()
-                        _ = process.wait()
-                        raise
-                    if process.returncode:
-                        reason = " ".join(errors.split()) or f"ssh exited {process.returncode}"
-                        raise OSError(reason)
-            finally:
-                _ = signal.signal(signal.SIGTERM, previous_handler)
-                _ = signal.pthread_sigmask(signal.SIG_SETMASK, blocked)
+        seconds = remote.STANDARD_TIME_LIMIT["seconds"]
+        # The holder keeps the lock if the copier exits before SSH.
+        result = subprocess.run([
+            "flock", str(path.with_name("mac-copy.lock")), "sh", "-c",
+            'exec timeout -s KILL "$1" ssh -o BatchMode=yes "$2" "$3" < "$4"',
+            "sh", str(seconds), remote.other_machine(), command, str(path),
+        ], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, check=False)
+        if result.returncode in (124, 137):
+            raise OSError(f"ssh timed out after {seconds:g} s")
+        if result.returncode:
+            reason = " ".join(result.stderr.split()) or f"ssh exited {result.returncode}"
+            raise OSError(reason)
     except (OSError, subprocess.SubprocessError) as error:
         print(f"staff: Mac copy failed: {' '.join(str(error).split())}", file=sys.stderr)
 
@@ -1715,7 +1767,7 @@ def _record_transaction(edit: Callable[[list[StaffRow], set[StaffId]], _Result])
     path = _file()
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        with path.with_name(path.name + ".lock").open("a", encoding="utf-8") as lock:
+        with _record_lock_path(path).open("a", encoding="utf-8") as lock:
             worker_lifecycle.acquire_flock(lock)
             for temporary in path.parent.glob(f".{path.name}.*"):
                 temporary.unlink()
@@ -2498,6 +2550,8 @@ def _parser() -> argparse.ArgumentParser:
 
     parser = argparse.ArgumentParser(description=__doc__)
     verbs = parser.add_subparsers(dest="verb", required=True)
+    lock_status = verbs.add_parser("worktree-write-lock-status", help=argparse.SUPPRESS)
+    _ = lock_status.add_argument("--json", action="store_true")
     for command in ("set-worker-role", "set-home"):
         fact = verbs.add_parser(command, help=argparse.SUPPRESS)
         _ = fact.add_argument("target")
@@ -2695,6 +2749,14 @@ def _mutate(arguments: _Arguments, seed_text: str) -> StaffRow | StaffSnapshot |
 
 
 def _main(arguments: _Arguments) -> int:
+    if arguments.verb == "worktree-write-lock-status":
+        if not is_owner():
+            raise StaffRefused("the staff owner must check the worktree write lock")
+        status = _probe_worktree_write(check_operation=True)
+        lock_result = ({"state": "held", "lock": str(status.lock)} if isinstance(status, StaffWorktreeWriteLockHeld)
+                       else {"state": "available"})
+        print(json.dumps(lock_result))
+        return 0
     if arguments.verb == "producer-creation":
         action = arguments.creation_action
         creation = producer_creation_registry("read" if action == "read-named" else action,
