@@ -3966,12 +3966,10 @@ done
                             else placement.TokenNotRequired())
             unchecked = (isinstance(prerequisite, placement.TokenRequired)
                          and isinstance(prerequisite.readiness, placement.TokenReadinessUnchecked))
-            if "move_order" in row or unchecked:
+            if unchecked:
                 row = row.copy()
-                _ = row.pop("move_order", None)
-                if unchecked:
-                    _ = row.pop("token_left_at", None)
-                    _ = row.pop("token_back_at", None)
+                _ = row.pop("token_left_at", None)
+                _ = row.pop("token_back_at", None)
             preview_ordered.append((path, row))
         preview = gate.admission_pass(replace(inputs, ordered=preview_ordered), inputs.now, policy)
         local_starts = {row.owner for row in preview.rows if isinstance(row.admission, gate.ProposedAdmission)}
@@ -4061,9 +4059,11 @@ done
         self.placement_holds = holds
         self.placement_hold_answers = answers
         local_order = (inputs.waiter_orders.keys() | pending_remote_starts) - removed
+        parallel_starts: set[str] = pending_remote_starts - inputs.pending_remote_starts if local_starts else set()
         return replace(inputs, ordered=[(path, row) for path, row in ordered
             if records.waiter_owner(row) in local_order], slots=tuple(self.slots.values()), cargo_folders=cargo_folders,
-            pending_remote_starts=frozenset(pending_remote_starts))
+            pending_remote_starts=frozenset(pending_remote_starts),
+            parallel_remote_starts=frozenset(parallel_starts))
 
     def _placement_hold(self, request: wire.PlacementRequest, candidate: placement.CandidateEligibility,
                         answers: dict[tuple[str, placement.PlacementDestination], float]) -> PlacementHold | None:

@@ -3004,7 +3004,8 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
         shown_waiter = replace(waiter, step=job_step(job, waiter.step), unit=identity.unit)
         named = local_step_name(shown_waiter, owner, names, labels, ci_label, job)
         if isinstance(named, NoNamedStep):
-            continue
+            name = QueueRowName.owner_only("Build step")
+            named = LocalStepName(name, name, staff_names.text_parts(name))
         waiters[place] = {**queue_row_labels(named.title, named.name, unit=owner.unit, ci_label=ci_label, caller=owner.caller),
                         "name_parts": named.parts if staff_names.parts_text(named.parts) == named.name else staff_names.text_parts(named.name),
                         **owner.fields(ci_label=ci_label),

@@ -159,6 +159,40 @@ class QueueMoveTests(unittest.TestCase):
                     self.assertNotIn(first.episode, fixture.server.current_assignments)
                     self.assertNotIn(second.episode, fixture.server.current_assignments)
 
+    def test_a_move_allows_local_and_mac_starts_in_one_pass(self) -> None:
+        for promote_local in (True, False):
+            with self.subTest(promote_local=promote_local), PlacementFixture() as fixture:
+                fixture.free(0)
+                fixture.hold_starts()
+                earlier = fixture.clock.now() - 10
+                a = placement_request(fixture, since=earlier + int(promote_local))
+                b = placement_request(fixture, since=earlier + int(not promote_local))
+                _ = publish_candidate(fixture, b, placement.TemporaryExclusion("busy"))
+                a = replace(a, prerequisite=placement.TokenNotRequired(), constraints=replace(a.constraints,
+                    candidates=(local_candidate(fixture), *a.constraints.candidates)))
+                b = replace(b, prerequisite=placement.TokenNotRequired() if promote_local else placement.TokenRequired(),
+                    constraints=replace(b.constraints, candidates=(local_candidate(fixture), *b.constraints.candidates)))
+                for request in (a, b):
+                    self.assertIsInstance(fixture.server.handle_request(request)[0], wire.PlacementWait)
+                line = move_line(fixture)
+                first, second = ids(line)
+                moved, = fixture.server.handle_request(wire.QueueMoveRequest(
+                    "move", second, line.revision, wire.QueueDrop(first, "before")))
+                assert isinstance(moved, wire.QueueMoved)
+                fixture.free(12 * GIB)
+                fixture.clock.advance(1)
+                mac_probe = replace(b, constraints=replace(b.constraints, candidates=b.constraints.candidates[1:]))
+                _ = publish_candidate(fixture, mac_probe)
+                _ = fixture.run_pass()
+                self.assertEqual(set(fixture.server.reservations), {a.episode})
+                self.assertEqual(set(fixture.server.current_assignments), {a.episode, b.episode})
+                local = fixture.server.assignments[fixture.server.current_assignments[a.episode]]
+                remote = fixture.server.assignments[fixture.server.current_assignments[b.episode]]
+                self.assertEqual(local.assignment.destination.provider, "local")
+                self.assertIsInstance(local.permission, placement.PermissionConsumed)
+                self.assertEqual(remote.assignment.destination.provider, "mac")
+                self.assertIsInstance(remote.remote_start_hold, records.RemoteStartHold)
+
     @unittest.skipUnless(hasattr(wire, "LandingRepositoryKey"), "requires the 44eb landing protection")
     def test_move_preserves_the_landing_test_hold(self) -> None:
         with (AdmissionFixture(skip_idle_spacing=True) as fixture,

@@ -1317,6 +1317,8 @@ class QueueInputs:
     cargo_folders: dict[str, placement.CargoFolder] = field(default_factory=dict, kw_only=True)
     occupied_cargo_folders: frozenset[placement.CargoFolder] = field(default=frozenset(), kw_only=True)
     pending_remote_starts: frozenset[str] = field(default=frozenset(), kw_only=True)
+    # These new holds allow the local starts from this pass.
+    parallel_remote_starts: frozenset[str] = field(default=frozenset(), kw_only=True)
     local_waits: dict[str, placement.EvidenceNeeded] = field(default_factory=dict, kw_only=True)
     build_space: BuildSpaceHold | NoBuildSpaceHold = field(default=NoBuildSpaceHold(), kw_only=True)
 

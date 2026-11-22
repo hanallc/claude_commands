@@ -2017,7 +2017,7 @@ One document listener also handles code blocks from page updates.
 ### Builds queue moves
 
 The Builds page requests a token with `GET /console/builds/queue-move`.
-Each request uses the Kill control's `kill_operator(peer)` check.
+Move and Kill requests use the shared `builds_operator(peer)` check.
 The check uses the TCP peer and rejects tagged nodes.
 By default, the operator is the owner of the untagged local Tailscale node.
 The console also checks the Tailscale address and Host.

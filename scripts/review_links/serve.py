@@ -518,7 +518,7 @@ def accepts_gzip(header: str, *, allow_wildcard: bool = False) -> bool:
     return wildcard
 
 
-def kill_operator(peer: tuple[str, int]) -> bool:
+def builds_operator(peer: tuple[str, int]) -> bool:
     """Authenticate the TCP peer through Tailscale."""
     def read(timeout: float, *args: str) -> dict[str, object]:
         result = subprocess.run(["tailscale", *args], capture_output=True, text=True,
@@ -1367,7 +1367,7 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         if self.tailscale_refusal() or not self.same_origin(required=origin_required):
             return False
         server = cast(ReviewLinksServer, self.server)
-        return server.mode is ServerMode.LIVE and kill_operator(self.client_address)
+        return server.mode is ServerMode.LIVE and builds_operator(self.client_address)
 
     def queue_move_token(self, query: str) -> None:
         if self.command != "GET" or query:

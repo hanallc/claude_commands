@@ -169,15 +169,17 @@ try {
       const request = JSON.parse(body);
       const {revision, row_id, destination} = request;
       const rows = queueFixture.waiters;
-      const line = () => ({revision:queueFixture.move_revision, members:rows.flatMap(row => row.move ? [row.move] : [])});
+      const movable = rows.filter(row => row.move);
+      const line = () => ({revision:queueFixture.move_revision, members:movable.map(row => row.move)});
       if (revision !== queueFixture.move_revision) return json(409, {reason:'The queue changed.', line:line()});
-      const index = rows.findIndex(row => row.move?.row_id === row_id);
-      const row = rows[index];
-      rows.splice(index, 1);
-      const neighbor = rows.findIndex(item => item.move?.row_id === destination.neighbor);
+      const index = movable.findIndex(row => row.move.row_id === row_id);
+      const [row] = movable.splice(index, 1);
+      const neighbor = movable.findIndex(item => item.move.row_id === destination.neighbor);
       const undo = destination.kind === 'QueueUndo';
       const next = undo ? queueFixture.undoPlace : neighbor + (destination.side === 'after' ? 1 : 0);
-      rows.splice(next, 0, row);
+      movable.splice(next, 0, row);
+      let place = 0;
+      queueFixture.waiters = rows.map(item => item.move ? movable[place++] : item);
       queueFixture.undoPlace = index;
       queueFixture.move_revision += '1';
       return json(200, {line:line(), old_place:index + 1, new_place:next + 1});
@@ -464,6 +466,7 @@ try {
         }
         servedReading = queueFixture;
         await navigate('memory_live.html');
+        await evaluate('window.render = window.renderReading; true');
         await evaluate(`new Promise(resolve => {
           const walk = document.querySelector('#walk');
           const ready = () => walk.querySelector('[data-move-id="typesafe"]');
@@ -492,21 +495,19 @@ try {
         await call('Input.dispatchMouseEvent',{type:'mousePressed', ...start, button:'left', buttons:1, clickCount:1});
         await call('Input.dispatchMouseEvent',{type:'mouseMoved', ...target, button:'left', buttons:1});
         const preview = await snapshot();
-        if (!queueDragProof) {
-          assert.deepEqual(preview.handles,['admin-console','typesafe','unit-board','aws','postmaster']);
-          assert.equal(preview.lifted,'typesafe');
-          assert.ok(await evaluate(`(() => {
-            const bounds = selector => document.querySelector(selector).getBoundingClientRect();
-            const emphasis = bounds('.queue-emphasis.lift');
-            const chart = bounds('.wrow.queue-lift');
-            const table = bounds('tr.queue-lift');
-            return emphasis.left === chart.left && emphasis.right >= table.right &&
-              emphasis.top === chart.top && Math.abs(emphasis.top - table.top) < 1;
-          })()`));
-          assert.deepEqual(preview.places,['1','2','3','4','5','cloud']);
-          await evaluate('renderReading({...latest, read_at:latest.read_at+1}); true');
-          assert.deepEqual(await snapshot(),preview);
-        }
+        assert.deepEqual(preview.handles,['admin-console','typesafe','unit-board','aws','postmaster']);
+        assert.equal(preview.lifted,'typesafe');
+        assert.ok(await evaluate(`(() => {
+          const bounds = selector => document.querySelector(selector).getBoundingClientRect();
+          const emphasis = bounds('.queue-emphasis.lift');
+          const chart = bounds('.wrow.queue-lift');
+          const table = bounds('tr.queue-lift');
+          return emphasis.left === chart.left && emphasis.right >= table.right &&
+            emphasis.top === chart.top && Math.abs(emphasis.top - table.top) < 1;
+        })()`));
+        assert.deepEqual(preview.places, queueDragProof ? ['1','2','3','4','5'] : ['1','2','3','4','5','cloud']);
+        await evaluate('renderReading({...latest, read_at:latest.read_at+1}); true');
+        assert.deepEqual(await snapshot(),preview);
         await call('Input.dispatchMouseEvent',{type:'mouseReleased', ...target, button:'left', buttons:0, clickCount:1});
         const waitForLine = line => evaluate(`new Promise(resolve => {
           const node = document.querySelector('#queue-status');
@@ -527,7 +528,6 @@ try {
           })()`);
           const shot = await call('Page.captureScreenshot',{format:'png',captureBeyondViewport:true,clip});
           await writeFile(join(folder, 'drag-dark.png'), Buffer.from(shot.data,'base64'));
-          return;
         }
         assert.equal((await snapshot()).action,'Undo');
         await evaluate("document.querySelector('#queue-action').click(); true");
@@ -556,6 +556,8 @@ try {
         queueFixture.move_revision += 'joined';
         queueFixture.waiters.splice(1, 0, {...template, key:'new-unit', unit:'new-unit', pid:650,
           title:{unit:'new-unit', step:'test affected'}, move:{row_id:'new-unit', group:''}});
+        queueFixture.waiters.unshift({...template, key:'remote-start', pid:651,
+          name:'remote startup', machine:'mac', reason:'remote startup'});
         await call('Input.dispatchMouseEvent',{type:'mouseReleased', ...moveTarget, button:'left', buttons:0, clickCount:1});
         await waitForLine('The queue changed.');
         assert.deepEqual((await snapshot()).handles, []);
@@ -568,8 +570,10 @@ try {
         await call('Input.dispatchMouseEvent',{type:'mousePressed', ...retryStart, button:'left', buttons:1, clickCount:1});
         await call('Input.dispatchMouseEvent',{type:'mouseMoved', ...retryTarget, button:'left', buttons:1});
         await call('Input.dispatchMouseEvent',{type:'mouseReleased', ...retryTarget, button:'left', buttons:0, clickCount:1});
-        await waitForLine('typesafe · test affected moved from 6 to 2');
+        await waitForLine('typesafe · test affected moved from 7 to 3');
         assert.deepEqual((await snapshot()).handles, ['admin-console', 'typesafe', 'new-unit', 'aws', 'unit-board', 'postmaster']);
+        assert.deepEqual(await evaluate(`['remote-start', 'typesafe'].map(key =>
+          document.querySelector('tr[data-tip="wait:' + key + '"] .place').textContent)`), ['1', '3']);
         queueFixture = null;
         servedReading = base;
       }

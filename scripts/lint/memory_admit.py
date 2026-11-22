@@ -2074,7 +2074,8 @@ def admission_walk(inputs: QueueInputs, ordered: list[tuple[Path, RankedWaiter]]
     clear = isinstance(inputs.pressure, NoPressureHold)
     disk_allows_start = isinstance(inputs.build_space, records.NoBuildSpaceHold)
     due = not isinstance(inputs.spacing, NextStartAt) or now >= inputs.spacing.at
-    local_head = first_queued_waiter((row for _, row in ordered if can_use_natedev(row)), inputs.pending_remote_starts)
+    local_head = first_queued_waiter((row for _, row in ordered if can_use_natedev(row)
+        and records.waiter_owner(row) not in inputs.parallel_remote_starts), inputs.pending_remote_starts)
     head_owner = records.waiter_owner(local_head.waiter) if isinstance(local_head, QueuedWaiter) else ""
     head_can_start_alone = not inputs.reservations and all(
         not slot_in_force(slot, inputs.now)
@@ -2104,7 +2105,8 @@ def admission_walk(inputs: QueueInputs, ordered: list[tuple[Path, RankedWaiter]]
         remote_start_pending = owner in inputs.pending_remote_starts
         state = QueuedWaiter(row) if remote_start_pending else waiter_state(row)
         fresh = not estimate_expired(row, now, policy)
-        local_route = can_use_natedev(row)
+        # Keep the row visible during startup. Let the local start from this pass proceed.
+        local_route = can_use_natedev(row) and owner not in inputs.parallel_remote_starts
         local = local_route and isinstance(state, QueuedWaiter)
         folder = inputs.cargo_folders.get(owner) if local_route else None
         folder_busy = folder in inputs.occupied_cargo_folders

@@ -1464,7 +1464,7 @@ function finishQueueDrag(commit) {
   const walk = $("walk");
   if (drag.pointer !== null && walk.hasPointerCapture(drag.pointer)) walk.releasePointerCapture(drag.pointer);
   if (commit && !drag.blocked && drag.destination && drag.rows.indexOf(drag.row) !== drag.reading.waiters.indexOf(drag.row)) {
-    void sendQueueMove(drag.row, drag.reading.move_revision, drag.destination);
+    void sendQueueMove(drag.row, drag.reading, drag.destination);
   } else {
     queueMessage(drag.blocked && commit ? queueBumpTip : "");
     if (latest) showQueue(latest);
@@ -1475,7 +1475,8 @@ function queueRequestId() {
   return Array.from(crypto.getRandomValues(new Uint8Array(16)), byte => byte.toString(16).padStart(2, "0")).join("");
 }
 
-async function sendQueueMove(row, revision, destination, id = queueRequestId()) {
+async function sendQueueMove(row, reading, destination, id = queueRequestId()) {
+  const revision = reading.move_revision;
   if (queueSending) return;
   queueSending = true;
   const undo = destination.kind === "QueueUndo";
@@ -1498,23 +1499,25 @@ async function sendQueueMove(row, revision, destination, id = queueRequestId()) 
       }, queueAccess.highlight_seconds * 1000);
       const {unit, step} = row.title ?? olderStepTitle(row);
       const label = [ownerText(unit), publicText(step)].filter(Boolean).join(" · ");
-      queueMessage(`${label} moved from ${result.old_place} to ${result.new_place}`,
+      const places = reading.waiters.filter(item => item.kind !== "cloud")
+        .flatMap((item, index) => item.move ? [index + 1] : []);
+      queueMessage(`${label} moved from ${places[result.old_place - 1]} to ${places[result.new_place - 1]}`,
         undo ? null : {label:"Undo", run:() => {
           const current = queueReading(latest);
           if (current.queueReady === false || !current.move_revision || !current.waiters.some(item => item.move?.row_id === row.move.row_id)) {
             queueMessage("Undo not available");
             return;
           }
-          void sendQueueMove(row, current.move_revision, {kind:"QueueUndo", move_request_id:id});
+          void sendQueueMove(row, current, {kind:"QueueUndo", move_request_id:id});
         }});
     } else if (response.status === 503) {
-      queueMessage(result.reason, {label:"Retry", run:() => void sendQueueMove(row, revision, destination, id)});
+      queueMessage(result.reason, {label:"Retry", run:() => void sendQueueMove(row, reading, destination, id)});
     } else {
       queueMessage(result.reason || "The queue move was refused.");
     }
   } catch {
     queueMessage("The queue could not confirm the move.",
-      {label:"Retry", run:() => void sendQueueMove(row, revision, destination, id)});
+      {label:"Retry", run:() => void sendQueueMove(row, reading, destination, id)});
   } finally {
     queueSending = false;
     if (latest) showQueue(latest);
