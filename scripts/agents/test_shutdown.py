@@ -10,7 +10,7 @@ import os
 import signal
 import subprocess
 import unittest
-from contextlib import ExitStack, redirect_stdout
+from contextlib import ExitStack, redirect_stderr, redirect_stdout
 from dataclasses import replace
 from pathlib import Path
 from typing import cast, override
@@ -66,7 +66,7 @@ class EnrolledProductionShutdownTests(StaffTestCase):
         return subprocess.run(["git", "-C", str(self.repository), *arguments], env=self.environment, check=True,
                               text=True, capture_output=True).stdout
 
-    def test_retirement_preserves_integration_and_removes_an_ordinary_staging_worktree(self) -> None:
+    def test_retirement_preserves_integration_and_waits_for_worktree_removal(self) -> None:
         origin = self.root / "origin.git"
         _ = subprocess.run(["git", "init", "-q", "--bare", str(origin)], env=self.environment, check=True)
         _ = self.git("remote", "add", "origin", str(origin))
@@ -93,12 +93,21 @@ class EnrolledProductionShutdownTests(StaffTestCase):
             (collision, "collision", False, True),
         ):
             with self.subTest(branch=branch):
-                result = shutdown.retirement_remove(shutdown.RetiringUnit(production, unit.name, target, branch, unit),
-                                                    settings=settings)
+                retiring = shutdown.RetiringUnit(production, unit.name, target, branch, unit)
+                with redirect_stderr(io.StringIO()) as notices:
+                    result = shutdown.retirement_remove(retiring, settings=settings)
                 if kept:
                     self.assertIn("protected production", result[0])
+                    self.assertEqual(notices.getvalue(), "")
                 else:
                     self.assertEqual(result, [])
+                    self.assertIn(f"kept for a manual removal list: {target}", notices.getvalue())
+                self.assertTrue(target.is_dir())
+                self.assertTrue(self.git("branch", "--list", branch))
+                self.assertTrue(self.git("ls-remote", "--heads", "origin", branch))
+                if not kept:
+                    _ = self.git("worktree", "remove", str(target))
+                    self.assertEqual(shutdown.retirement_remove(retiring, settings=settings), [])
                 self.assertEqual(target.exists(), kept)
                 self.assertEqual(bool(self.git("branch", "--list", branch)), kept)
                 self.assertEqual(bool(self.git("ls-remote", "--heads", "origin", branch)), keep_origin)
