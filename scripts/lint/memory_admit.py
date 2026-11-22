@@ -2122,12 +2122,9 @@ def admission_walk(inputs: QueueInputs, ordered: list[tuple[Path, RankedWaiter]]
     clear = isinstance(inputs.pressure, NoPressureHold)
     disk_allows_start = isinstance(inputs.build_space, records.NoBuildSpaceHold)
     due = not isinstance(inputs.spacing, NextStartAt) or now >= inputs.spacing.at
-    local_head = first_queued_waiter((row for _, row in ordered if can_use_natedev(row)), inputs.pending_remote_starts)
-    head_owner = records.waiter_owner(local_head.waiter) if isinstance(local_head, QueuedWaiter) else ""
-    head_can_start_alone = not inputs.reservations and all(
-        not slot_in_force(slot, inputs.now)
-        or (isinstance(slot, ContinuationSlot) and slot.owner == head_owner)
-        for slot in inputs.slots)
+    active_slots = tuple(slot for slot in inputs.slots if slot_in_force(slot, inputs.now))
+    # A repository limit does not take the start-alone place.
+    memory_head_seen = False
     new_started = False
     gpu = policy.gpu_tests
     # The reservation is the slot: it ends at release or when its owner exits.
@@ -2184,7 +2181,8 @@ def admission_walk(inputs: QueueInputs, ordered: list[tuple[Path, RankedWaiter]]
         released = (folder_slot_bytes.get(folder, 0) - held
                     if folder is not None and not folder_busy and isinstance(earlier, NoWaiter) else 0)
         checked_room = remaining + released
-        alone = head_owner == owner and head_can_start_alone
+        alone = local and not memory_head_seen and not inputs.reservations and all(
+            isinstance(slot, ContinuationSlot) and slot.owner == owner for slot in active_slots)
         fits = extra <= checked_room
         basis: StartBasis = (WithinSlot() if within else Fits() if fits else
                              StartsAlone() if alone else DoesNotFit())
@@ -2223,6 +2221,7 @@ def admission_walk(inputs: QueueInputs, ordered: list[tuple[Path, RankedWaiter]]
         cargo_folder = placement.CargoFolderWait() if folder_busy else placement.CargoFolderFree()
         decisions.append(WaiterAdmission(row, decision, state, cargo_folder))
         if can_start:
+            memory_head_seen = True
             remaining += held + released - need
             gpu_used += gpu_step
             if runs is not None:
@@ -2239,6 +2238,7 @@ def admission_walk(inputs: QueueInputs, ordered: list[tuple[Path, RankedWaiter]]
                 run_limit_waiters[owner] = repository
                 _ = first_held_by_run_limit.setdefault(repository, row)
             else:
+                memory_head_seen |= local
                 if isinstance(first_held, NoWaiter):
                     first_held = row
                 if GPU_WAIT_MAY_PASS and isinstance(first_held_other_than_gpu, NoWaiter) and not (

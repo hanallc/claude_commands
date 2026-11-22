@@ -406,6 +406,11 @@ class OwnerExited:
 
 
 @dataclass(frozen=True)
+class LocalGrantReturned:
+    """The caller gave back its local placement grant."""
+
+
+@dataclass(frozen=True)
 class NoFinalizationIntent:
     pass
 
@@ -414,6 +419,9 @@ class NoFinalizationIntent:
 class TokenWaiting:
     request_id: str
     left_at: float
+
+
+ReservationEnding = NotEnding | ReleaseStatus | OwnerExited | LocalGrantReturned | TokenWaiting
 
 
 @dataclass(frozen=True)
@@ -438,7 +446,7 @@ class ReservationRecord:
     filters: tuple[str, ...] = ()
     shape: str = ""
     test_phase_need: records.TestPhaseNeed | gate.NoTestPhaseNeed = gate.NoTestPhaseNeed("not_recorded")
-    ending: NotEnding | ReleaseStatus | OwnerExited | TokenWaiting = NotEnding()
+    ending: ReservationEnding = NotEnding()
     finalization: records.FinalizationIntent | NoFinalizationIntent = NoFinalizationIntent()
     charge_use: test_phase.TestPhaseChargeUse | test_phase.NoTestPhaseChargeUse = test_phase.NoTestPhaseChargeUse()
     run: wire.RunIdentity | wire.NoRun = wire.NO_RUN
@@ -617,10 +625,22 @@ class PendingCloudGroup:
 
 
 @dataclass(frozen=True)
+class PendingVerifyGrants:
+    """The reservations can still return the slot before execution."""
+    reservations: frozenset[str]
+
+
+@dataclass(frozen=True)
+class UsedVerifySlot:
+    """A local step used the slot, so the run keeps it until exit."""
+
+
+@dataclass(frozen=True)
 class VerifyRunSlot:
     """Hold one repository slot until the Verify process exits."""
     repository: str
     owner: wire.Owner
+    use: PendingVerifyGrants | UsedVerifySlot = UsedVerifySlot()
 
     @property
     def run_key(self) -> str:
@@ -1399,7 +1419,7 @@ def _notify(message: str) -> None:
             _ = notifier.send(message.encode())
 
 
-def finalization_outcome(ending: ReleaseStatus | OwnerExited | NotEnding | TokenWaiting
+def finalization_outcome(ending: ReservationEnding
                          ) -> tuple[step_estimator.FinalOutcome, int | step_estimator.OutcomeNotRecorded, gate.StepEnd | gate.TokenReturn]:
     if isinstance(ending, TokenWaiting):
         return step_estimator.Completed(), 0, gate.TokenReturn()
@@ -1443,7 +1463,8 @@ class StateIntents:
     def __init__(self, reservations: dict[str, ReservationRecord],
                  advance_generation: Callable[[], None], episode: str,
                  persist: Callable[[], None], fault: Callable[[str], None],
-                 places: dict[str, WaiterPlace], writes: ServiceStateWrites | RegisteredServiceWrites) -> None:
+                 places: dict[str, WaiterPlace], writes: ServiceStateWrites | RegisteredServiceWrites, *,
+                 retire_verify_grant: Callable[[str], None] | None = None) -> None:
         boundary = writes.writes if isinstance(writes, RegisteredServiceWrites) else writes
         selected = (reservations[episode],) if isinstance(writes, RegisteredServiceWrites) else reservations.values()
         boundary.require(*(Path(record.path) for record in selected),
@@ -1455,6 +1476,7 @@ class StateIntents:
         self.episode: str = episode
         self.persist: Callable[[], None] = persist
         self.fault: Callable[[str], None] = fault
+        self.retire_verify_grant: Callable[[str], None] | None = retire_verify_grant
 
     def _require_record(self) -> None:
         record = self.reservations[self.episode]
@@ -1484,6 +1506,8 @@ class StateIntents:
         if not isinstance(record.ending, TokenWaiting):
             _ = self.places.pop(_place_key(record.owner, record.queue_waiter["since"]), None)
         del self.reservations[self.episode]
+        if self.retire_verify_grant is not None:
+            self.retire_verify_grant(record.reservation_id)
         self.persist()
 
 
@@ -1989,6 +2013,19 @@ class AdmissionServer:
         for slot in self.verify_run_slots.values():
             owners.setdefault(slot.repository, set()).add(slot.run_key)
         return {repository: frozenset(runs) for repository, runs in owners.items()}
+
+    def _finish_verify_grant(self, reservation: str, *, started: bool) -> None:
+        for key, slot in self.verify_run_slots.items():
+            if not isinstance(slot.use, PendingVerifyGrants) or reservation not in slot.use.reservations:
+                continue
+            remaining = slot.use.reservations - {reservation}
+            if started:
+                self.verify_run_slots[key] = replace(slot, use=UsedVerifySlot())
+            elif remaining:
+                self.verify_run_slots[key] = replace(slot, use=PendingVerifyGrants(remaining))
+            else:
+                del self.verify_run_slots[key]
+            return
 
     def _verify_slot_owner(self, request: wire.AdmitRequest, repository: str) -> wire.Owner:
         owner, run = request.owner, request.run
@@ -3028,9 +3065,15 @@ class AdmissionServer:
                     max(0.0, now - waiting.row["since"])))
                 self.reservations[request.episode] = admission
                 slot = verify_slots.get(records.waiter_owner(waiting.row))
-                if slot is not None and slot.key not in self.verify_run_slots:
-                    self.verify_run_slots[slot.key] = slot
-                    self._watch_owner(slot.owner)
+                if slot is not None:
+                    current = self.verify_run_slots.get(slot.key)
+                    if current is None:
+                        self.verify_run_slots[slot.key] = replace(slot,
+                            use=PendingVerifyGrants(frozenset({admission.reservation_id})))
+                        self._watch_owner(slot.owner)
+                    elif isinstance(current.use, PendingVerifyGrants):
+                        self.verify_run_slots[slot.key] = replace(current,
+                            use=PendingVerifyGrants(current.use.reservations | {admission.reservation_id}))
                 for key, slot in list(self.slots.items()):
                     if isinstance(slot, records.ContinuationSlot) and slot.owner == records.waiter_owner(waiting.row):
                         del self.slots[key]
@@ -3053,15 +3096,25 @@ class AdmissionServer:
         for waiting, reply in zip(waiters, replies, strict=True):
             self._remove_waiter(waiting, reply)
 
-    def _end(self, episode: str, ending: ReleaseStatus | OwnerExited | NotEnding | TokenWaiting) -> None:
+    def _end(self, episode: str, ending: ReservationEnding) -> None:
         record = self.reservations[episode]
+        started = isinstance(ending, ReleaseStatus)
+        if not started and "verify" in record.queue_waiter and record.sidecar:
+            try:
+                started = bool(Path(record.sidecar).read_text().strip())
+            except FileNotFoundError:
+                pass
+        if started:
+            self._finish_verify_grant(record.reservation_id, started=True)
         record = replace(record, ending=ending)
         self.reservations[episode] = record
         self.persist()
         row = reservation_row(record)
-        if isinstance(ending, (OwnerExited, NotEnding)):
+        if isinstance(ending, (OwnerExited, NotEnding, LocalGrantReturned)):
             lifetime = self._lifetime(record)
             if isinstance(lifetime, gate.PopulatedStepScope):
+                self._finish_verify_grant(record.reservation_id, started=True)
+                self.persist()
                 self._watch_scope(lifetime, episode)
                 return
         ended_at = (step_estimator.epoch(record.finalization["ended_at"])
@@ -3079,9 +3132,11 @@ class AdmissionServer:
             self.places[_place_key(record.owner, row_waiter["since"])] = waiter_place(row_waiter, record.episode)
         _ = gate.finalize_reservation(path, row, outcome, datetime.fromtimestamp(ended_at, UTC), status,
             intents=StateIntents(self.reservations, self._advance_build_history, episode, self.persist, self.fault,
-                                self.places, RegisteredServiceWrites(self.writes)),
+                                self.places, RegisteredServiceWrites(self.writes),
+                                retire_verify_grant=lambda reservation: self._finish_verify_grant(reservation, started=False)),
             end_kind=end_kind)
-        if (isinstance(record.place, wire.LocalPlace) and isinstance(record.run, wire.RunIdentity)
+        if ((started or not isinstance(ending, LocalGrantReturned))
+                and isinstance(record.place, wire.LocalPlace) and isinstance(record.run, wire.RunIdentity)
                 and self._run_alive(record.run)
                 and isinstance(self.last_usable_configuration, records.MemoryConfig)):
             if isinstance(record.slot_staff, records.NoEndedStepStaff):
@@ -3681,40 +3736,6 @@ done
                 return placement.RetryAt(0)
         return retry
 
-    def _mac_run_limit(self, request: wire.PlacementRequest, destination: placement.PlacementDestination
-                       ) -> records.RunLimitFree | records.RunLimitWait:
-        """Count Mac runs that hold launch authorization for this repository."""
-        config = self.last_usable_configuration
-        if (destination.provider != "mac" or not isinstance(request.purpose, placement.NormalStep)
-                or not isinstance(config, records.MemoryConfig)):
-            return records.RunLimitFree()
-        limits = config.policy.repository_runs
-        repository = profile_repository_name(request.profile)
-        limit = limits.for_repository(destination.target, repository)
-        if not isinstance(limit, records.RepositoryRunLimit):
-            return records.RunLimitFree()
-        active = [submitted for key in self.current_assignments.values()
-            if (saved := self.assignments[key]).assignment.destination.provider == "mac"
-            and saved.assignment.destination.target == destination.target
-            and isinstance(saved.permission, placement.PermissionConsumed)
-            and (submitted := self.placement_requests.get(saved.assignment.episode)) is not None
-            and isinstance(submitted.purpose, placement.NormalStep)
-            and profile_repository_name(submitted.profile) == repository
-            and isinstance(self._assignment_state(saved), placement.CurrentAssignment)]
-        sessions = list(dict.fromkeys(item.identity.session_id for item in (*active, request)
-                                     if item.identity.session_id and not item.identity.unit))
-        labels: Mapping[str, gate.UnitMembership] = gate.priority_labels(sessions) if limits.exempt_unit and sessions else {}
-        if limits.exempt_unit:
-            unit = gate.queue_unit(request.identity.unit, request.identity.session_id, labels)
-            if unit == limits.exempt_unit:
-                return records.RunLimitFree()
-            active = [item for item in active
-                      if gate.queue_unit(item.identity.unit, item.identity.session_id, labels) != limits.exempt_unit]
-        owners = {item.owner for item in active}
-        if request.owner not in owners and len(owners) >= limit.maximum:
-            return records.RunLimitWait(len(owners), limit.maximum, repository, destination.target)
-        return records.RunLimitFree()
-
     def _candidate_eligibility(self, request: wire.PlacementRequest, keys: PlacementEvidenceKeys
                                ) -> tuple[tuple[placement.CandidateEligibility, ...], placement.ResourceHolder]:
         result: list[placement.CandidateEligibility] = []
@@ -3758,9 +3779,6 @@ done
                         permitted = placement.TemporaryExclusion("busy")
                     elif evidence.observed_at < max((item[1] for item in retained), default=float("-inf")):
                         permitted = placement.EvidenceNeeded("provider evidence predates the retained claim report")
-            if isinstance(permitted, placement.AllowedHost) and isinstance(
-                    self._mac_run_limit(request, destination), records.RunLimitWait):
-                permitted = placement.TemporaryExclusion("busy")
             result.append(placement.CandidateEligibility(destination, permitted))
         return tuple(result), local_holder
 
@@ -4294,9 +4312,6 @@ done
                        and claim.session == assignment.session and claim.host == destination.host
                        and claim.generation == evidence.generation for claim in evidence.claims):
                 return self._placement_status(assignment, "the exact claim is not adopted")
-        run_wait = self._mac_run_limit(submitted, destination)
-        if isinstance(run_wait, records.RunLimitWait):
-            return self._placement_status(assignment, records.run_limit_text(run_wait))
         saved = replace(saved, permission=placement.PermissionConsumed(self.clock.now()), provider=reference, holder=request.holder)
         self.assignments[key] = saved
         self._watch_owner(wire.Owner(request.holder.pid, request.holder.start_time))
@@ -4415,6 +4430,13 @@ done
 
     def _close_for_report(self, saved: records.SavedPlacementAssignment, report: placement.TerminalAttemptReport) -> None:
         outcome = report.outcome
+        assignment = saved.assignment
+        if (assignment.destination.provider == "local" and isinstance(outcome, placement.PrelaunchRefused)
+                and (reservation := self.reservations.get(assignment.episode)) is not None):
+            with retry_cleanup(Path(reservation.path)):
+                self._end(assignment.episode, LocalGrantReturned())
+            if assignment.episode in self.reservations:
+                return
         if isinstance(outcome, placement.AttemptCompleted):
             self._close_placement(saved, "completed", placement.DoNotRetry("command result is final"))
         elif isinstance(outcome, placement.AttemptCancelled):
@@ -4451,7 +4473,7 @@ done
                     if saved.assignment.destination.provider == "local" and request.episode in self.reservations:
                         reservation = self.reservations[request.episode]
                         with retry_cleanup(Path(reservation.path)):
-                            self._end(request.episode, OwnerExited())
+                            self._end(request.episode, LocalGrantReturned())
                     report = saved.terminal_report
                     if (self._start_pending(saved) or (isinstance(report, placement.TerminalAttemptReport)
                             and isinstance(report.path, placement.DispatchPathPending))):
