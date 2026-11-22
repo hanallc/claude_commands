@@ -1397,6 +1397,7 @@ class WorkerResume:
     run: Path
     active: progress_history.ActiveDispatch | None = None
     detached: str = ""
+    result_run: Path | None = None
 
 
 def _resume_launcher(opened: worker_panes.OpenWorker, resume: WorkerResume, *,
@@ -1425,7 +1426,8 @@ def _resume_launcher(opened: worker_panes.OpenWorker, resume: WorkerResume, *,
     if resume.active is not None:
         pass_scope = resume.active.instance_id
         since = worker_panes.worker_pass(row, resume.run).get("started_at") or 0
-    replay = detached_runs.submit_finished_worker_result(resume.run, row,
+    result_run = resume.run if resume.result_run is None else resume.result_run
+    replay = detached_runs.submit_finished_worker_result(result_run, row,
         worker_input=detached_runs.WorkerResultInput.TYPE, pane_dispatch_id=pass_scope, since=since,
         on_submission=on_submission)
     if replay is detached_runs.WorkerResultReplay.RETRY:
@@ -1481,7 +1483,7 @@ def _resume_needed(state: worker_panes.OpenWorker | worker_panes.StoppedWorker |
     if dispatch is None and not already_working:
         for directory in directories:
             if detached_runs.has_unbound_worker_result(directory, state.row):
-                return WorkerResume(step, directory, detached=detached)
+                return WorkerResume(step, run, detached=detached, result_run=directory)
     if detached or isinstance(step, UnsubmittedAssignment) or (isinstance(step, BusyPass) and not already_working):
         return WorkerResume(step, dispatch_run, dispatch, detached)
     return None

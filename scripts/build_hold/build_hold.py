@@ -1853,7 +1853,7 @@ def send_release_to(entry: ReleaseEntry, address: str, notice: str) -> ReleaseNo
         return RecipientGone()
     outcome = send_outcome(result.returncode, result.stdout)
     if (isinstance(outcome, ConfirmedSendOutcome) and outcome.header.outcome == "refused"
-            and outcome.header.detail.endswith(". Use assign.sh for new work.")):
+            and outcome.header.payload == "SEND_OUTCOME: worker_refused"):
         return ReleaseWorkerRefused(outcome.header.detail)
     return ReleaseSendFailed(f"send.py: {failure_detail(result)}")
 

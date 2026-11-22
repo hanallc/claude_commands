@@ -689,6 +689,37 @@ class WorkerCommandTests(unittest.TestCase):
         self.assertIn("Detached run: other-check", prompt[3].splitlines())
         self.assertIs(worker_lifecycle.read_json_object(path)["worker_received"], True)
 
+    def test_restore_recovers_the_selected_pass_after_replaying_a_result_from_another_run(self) -> None:
+        opened = self.opened()
+        row = opened.row
+        previous = self.fixture.worker_run("previous", "unit", self.fixture.parent.current_session)
+        dispatch_id = progress_history.begin_dispatch(self.run_dir, slot=row.name, phase="8", role="impl",
+            worker_name=row.name, worker_id=row.id, launcher_command=["assign.sh"],
+            prompt=self.prompt, kind="impl", lens="")
+        line = f"Complete the work. End your final reply with DONE {dispatch_id}."
+        reply = f"The work is complete.\nDONE {dispatch_id}"
+        progress_history.save_dispatch_delivery(self.run_dir, dispatch_id,
+            pass_recorder.DispatchDelivery(line, dispatch_id, str(self.reply)))
+        self.agent.append(opened.pane, "user", line)
+        self.agent.append(opened.pane, "assistant", reply)
+        progress_history.complete_dispatch(self.run_dir, row.name, dispatch_id)
+        path, record = self.detached_record(row, "other-check", run=previous)
+        record.update(exit_code=0, pane_dispatch_id="")
+        atomic_file.write_text_atomic(path, json.dumps(record))
+        runs = {str(self.fixture.parent.current_session): [str(self.run_dir), str(previous)]}
+        with (patch.object(detached_runs, "_alert_director"),
+              patch.object(detached_runs, "submit_finished_worker_result",
+                           return_value=detached_runs.WorkerResultReplay.SUBMITTED) as replay,
+              redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as errors):
+            self.assertEqual(worker.restore(self.fixture.parent.id, runs=runs), worker.ExitCode.OK)
+        self.assertEqual(errors.getvalue(), "")
+        replay.assert_called_once()
+        self.assertEqual(replay.call_args.args[0], previous)
+        self.assertEqual(self.reply.read_text().rstrip(), reply)
+        completion = progress_history.hook_completion(worker_panes.worker_pass(row, self.run_dir))
+        self.assertIsInstance(completion, progress_history.HookCompletion)
+        self.assertEqual(self.fixture.world.closed, [])
+
     def test_restore_resumes_a_stopped_idle_worker_with_live_runs_and_exact_context(self) -> None:
         self.assert_restore_live_run(active=False)
 

@@ -1061,18 +1061,22 @@ class HoldEnforcerTests(unittest.TestCase):
         run: build_hold.StoppedRun = {"id": "checks", "label": "checks", "staff_id": str(worker.id), "director_dir": ""}
         entry = build_hold.new_entry(address, worker.name)
         membership = staff.initial_snapshot()
-        refusal = subprocess.CompletedProcess([], 2, "REFUSED: worker: no active pass. Use assign.sh for new work.\n", "")
         accepted = subprocess.CompletedProcess([], 0, "SENT: director\n", "")
-        with mock.patch.object(subprocess, "run", side_effect=[refusal, accepted]) as send:
-            result = build_hold.send_stopped_run_release(entry, run, "released", membership)
-        self.assertIsInstance(result, build_hold.ReleaseDelivered)
         notice = f"released Restart the stopped run checks for worker. Run ID checks. Session {address}."
-        self.assertEqual(send.call_args_list, [
+        expected = [
             mock.call(session_send.send_argv("--to", address, "--text", notice, "--skip-closed"),
                       capture_output=True, text=True),
             mock.call(session_send.send_argv("--to", str(director.id), "--text", notice),
                       capture_output=True, text=True),
-        ])
+        ]
+        for detail in ("no active pass. Use assign.sh for new work.", "worker is blocked",
+                       "the worker pane changed before delivery"):
+            refusal = subprocess.CompletedProcess([], 2, f"REFUSED: worker: {detail}\nSEND_OUTCOME: worker_refused\n", "")
+            with (self.subTest(detail=detail),
+                  mock.patch.object(subprocess, "run", side_effect=[refusal, accepted]) as send):
+                result = build_hold.send_stopped_run_release(entry, run, "released", membership)
+                self.assertIsInstance(result, build_hold.ReleaseDelivered)
+                self.assertEqual(send.call_args_list, expected)
 
     def test_release_does_not_forward_a_send_failure(self) -> None:
         self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
@@ -1081,11 +1085,17 @@ class HoldEnforcerTests(unittest.TestCase):
         address = f"codex:{worker.current_session}"
         run: build_hold.StoppedRun = {"id": "checks", "label": "checks", "staff_id": str(worker.id), "director_dir": ""}
         entry = build_hold.new_entry(address, worker.name)
-        failure = build_hold.ReleaseSendFailed("delivery was not confirmed")
-        with mock.patch.object(build_hold, "send_release_to", return_value=failure) as send:
-            result = build_hold.send_stopped_run_release(entry, run, "released", staff.initial_snapshot())
-        self.assertEqual(result, failure)
-        send.assert_called_once_with(entry, address, "released Restart the stopped run checks for worker. Run ID checks.")
+        membership = staff.initial_snapshot()
+        for code, output in (
+            (3, "FAILED: delivery was not confirmed\n"),
+            (2, "REFUSED: worker: no active pass. Use assign.sh for new work.\n"),
+            (3, "REFUSED: worker: worker is blocked\nSEND_OUTCOME: worker_refused\n"),
+        ):
+            with (self.subTest(code=code, output=output),
+                  mock.patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], code, output, "")) as send):
+                result = build_hold.send_stopped_run_release(entry, run, "released", membership)
+                self.assertIs(type(result), build_hold.ReleaseSendFailed)
+                send.assert_called_once()
 
     def test_release_does_not_name_a_run_if_enforcer_exits_before_signaling(self) -> None:
         holder, = build_hold.natedev_holds(self.holders).in_force

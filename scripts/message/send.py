@@ -779,6 +779,14 @@ class PaneTextDelivered(Result):
     """The observed worker pane accepted the text input."""
 
 
+class WorkerMessageRefused(Result):
+    """The worker route refused the message before submission."""
+
+
+# The refusal payload preserves the REFUSED header and exit code.
+WORKER_REFUSED_PAYLOAD = "SEND_OUTCOME: worker_refused"
+
+
 class WorkerMessageUnconfirmed(Result):
     """The ordinary message may have reached the worker pane."""
 
@@ -4642,6 +4650,8 @@ def remote(message: Message, host: str, options: Options) -> Result:
     parsed = outcome.header
     if parsed.outcome == "absent" and not options.skip_closed:
         return Result("failed", f"ssh {host}: unexpected ABSENT result")
+    if parsed.outcome == "refused" and parsed.payload == WORKER_REFUSED_PAYLOAD:
+        return WorkerMessageRefused("refused", f"on {host}: {parsed.detail}", failure, receiver)
     detail = parsed.detail
     if parsed.payload:
         detail += "\n" + parsed.payload
@@ -5248,6 +5258,10 @@ def _blocked_worker_refusal(place: HerdrPlace | SharedServerScan) -> str:
     return "worker is blocked"
 
 
+class _WorkerInputRefused(herdr_types.HerdrFailure):
+    """The final status check refused input before submission."""
+
+
 def _deliver_worker_answer(parent: staff.StaffId, row: staff.StaffRow, text: str, *, timeout: float,
                            selection: RecipientSelection | NoFixedStaffLookup,
                            observed_place: HerdrPlace | SharedServerScan,
@@ -5260,14 +5274,15 @@ def _deliver_worker_answer(parent: staff.StaffId, row: staff.StaffRow, text: str
     try:
         with worker_panes.answer_for_message(parent, row, text, server=server) as checked:
             if isinstance(checked, worker_panes.WorkerAnswerRefused):
-                return Result("refused", checked.detail(row.name))
+                return WorkerMessageRefused("refused", checked.detail(row.name))
             state = checked.worker
             if isinstance(observed_place, HerdrPlace) and state.pane != observed_place.pane:
-                return Result("refused", f"{row.name}: the worker pane changed before delivery")
+                return WorkerMessageRefused("refused", f"{row.name}: the worker pane changed before delivery")
             if state.status is herdr.AgentStatus.BLOCKED:
-                return Result("refused", f"{row.name}: {_blocked_worker_refusal(observed_place)}")
+                return WorkerMessageRefused("refused", f"{row.name}: {_blocked_worker_refusal(observed_place)}")
             if state.status not in ordinary_states:
-                return Result("refused", worker_panes.WorkerAnswerRefused(f"worker is {state.status.value}").detail(row.name))
+                refusal = worker_panes.WorkerAnswerRefused(f"worker is {state.status.value}")
+                return WorkerMessageRefused("refused", refusal.detail(row.name))
             if isinstance(selection, FixedStaffLookup):
                 current = _current_staff_session(selection, ExpectedStaffSession(row.current_session))
                 if isinstance(current, RecipientLookupFailed):
@@ -5276,19 +5291,22 @@ def _deliver_worker_answer(parent: staff.StaffId, row: staff.StaffRow, text: str
             def check_message_status() -> None:
                 status = client.readiness(state.pane)["agent_status"]
                 if status is herdr.AgentStatus.BLOCKED:
-                    raise herdr_types.HerdrFailure(_blocked_worker_refusal(observed_place))
+                    raise _WorkerInputRefused(_blocked_worker_refusal(observed_place))
                 if status not in ordinary_states:
-                    raise herdr_types.HerdrFailure(f"worker is {status.value}")
+                    raise _WorkerInputRefused(f"worker is {status.value}")
 
             submission = herdr.TrackedPromptSubmission(check_message_status)
             client = server.client if isinstance(server, worker_panes.ObservedServer) else herdr.Herdr(herdr.shared_session())
             client.prompt(state.pane, checked.text, target=str(state.row.current_session),
                           proof=herdr.SubmitStarts(int(timeout * 1000)), on_submission=submission)
             return PaneTextDelivered("sent", f"worker {row.name} at {state.pane}")
+    except _WorkerInputRefused as error:
+        return WorkerMessageRefused("refused", f"{row.name}: {error}")
     except (herdr_types.HerdrFailure, OSError, ValueError, subprocess.SubprocessError,
             staff.StaffRefused, recorder_state.OldRecorderState) as error:
         if submission is None:
-            return Result("refused", worker_panes.WorkerAnswerRefused(one_line(str(error))).detail(row.name))
+            refusal = worker_panes.WorkerAnswerRefused(one_line(str(error)))
+            return WorkerMessageRefused("refused", refusal.detail(row.name))
         if submission.may_have_submitted:
             return WorkerMessageUnconfirmed("failed", f"worker message delivery unconfirmed: {error}. "
                                             + "The message may already have arrived. Do not resend it.")
@@ -5309,7 +5327,7 @@ def deliver_worker_text(worker: staff.StaffRow, membership: staff.StaffSnapshot,
     worker_only = isinstance(receipt, WorkerResultReceipt) and receipt.worker_only
     if holder is None:
         if isinstance(observed_place, HerdrPlace):
-            return Result("refused", f"{worker.name}: worker holder is unavailable")
+            return WorkerMessageRefused("refused", f"{worker.name}: worker holder is unavailable")
         return Result("retry" if worker_only else "failed", f"{worker.name}: worker holder is unavailable")
     if not reason or isinstance(receipt, OrdinaryWorkerMessage):
         if isinstance(observed_place, HerdrPlace) and isinstance(receipt, OrdinaryWorkerMessage):
@@ -5317,7 +5335,8 @@ def deliver_worker_text(worker: staff.StaffRow, membership: staff.StaffSnapshot,
                 server = worker_panes.ObservedServer(herdr.Herdr(observed_place.session))
                 state = worker_panes.observe_worker(holder.id, worker, membership, server=server)
             except (herdr_types.HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
-                return Result("refused", f"{worker.name}: {one_line(str(error))}. Use assign.sh for new work.")
+                refusal = worker_panes.WorkerAnswerRefused(one_line(str(error)))
+                return WorkerMessageRefused("refused", refusal.detail(worker.name))
             if not isinstance(state, (worker_panes.ClosedWorker, worker_panes.StoppedWorker)):
                 return _deliver_worker_answer(holder.id, worker, review_text or text, timeout=timeout,
                                               selection=selection, observed_place=observed_place, server=server)
@@ -5326,7 +5345,7 @@ def deliver_worker_text(worker: staff.StaffRow, membership: staff.StaffSnapshot,
         if isinstance(state, worker_panes.OpenWorker):
             if isinstance(receipt, OrdinaryWorkerMessage):
                 if state.status is herdr.AgentStatus.BLOCKED:
-                    return Result("refused", f"{worker.name}: {_blocked_worker_refusal(SharedServerScan.WORKER)}")
+                    return WorkerMessageRefused("refused", f"{worker.name}: {_blocked_worker_refusal(SharedServerScan.WORKER)}")
                 return _deliver_worker_answer(holder.id, worker, review_text or text, timeout=timeout,
                                               selection=selection, observed_place=SharedServerScan.WORKER,
                                               server=worker_panes.SharedServer.CONFIGURED)
@@ -5977,6 +5996,8 @@ def main(argv: list[str]) -> int:
             outcome = ("pending" if options.review_delivery and isinstance(result, UncertainRelayDelivery)
                        else result.outcome)
             print(f"{outcome.upper()}: {result.detail}")
+            if isinstance(result, WorkerMessageRefused):
+                print(WORKER_REFUSED_PAYLOAD)
             if outcome == "failed" and options.to.startswith("uds:"):
                 print(f"send.py: {result.detail}", file=sys.stderr)
             if isinstance(result.failure, FailedPush):

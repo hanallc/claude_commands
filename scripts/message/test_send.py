@@ -7625,6 +7625,14 @@ class PeerSendTests(RecipientStaffFixture, ShutdownTestCase):
             status, output, errors = self.run_main("codex:peer-thread", "--skip-closed", "--machine", "mac")
         self.assertEqual((status, output, errors), (SEND_CLOSED_EXIT, "CLOSED: on mac: closed worker\n", ""))
 
+    def test_peer_preserves_the_confirmed_worker_refusal_outcome(self) -> None:
+        peer_reply = "REFUSED: impl: worker is blocked\nSEND_OUTCOME: worker_refused\n"
+        with mock.patch.object(send, "run", return_value=(2, peer_reply, "")):
+            result = send.send(local_options(["--to", "codex:peer-thread", "--skip-closed", "--machine", "mac",
+                                              "--from", "fixture sender", "--text", "fixture text"]))
+        self.assertIsInstance(result, send.WorkerMessageRefused)
+        self.assertEqual(result.detail, "on mac: impl: worker is blocked")
+
     def test_skip_closed_reports_proven_absence_after_a_clean_peer_miss(self) -> None:
         with mock.patch.object(failed_lookup, "report") as report:
             status, output, errors = self.run_main("codex:gone", "--skip-closed")
@@ -8715,6 +8723,29 @@ class PaneWorkerMessageTests(unittest.TestCase):
         self.assertEqual(world.commands, [])
         self.assertEqual(send.pending(f"staff:{self.fixture.parent.id}"), "")
 
+    def test_worker_refusal_outcome_covers_blocked_and_changed_panes(self) -> None:
+        from scripts.herdr import herdr
+
+        world = self.fixture.world
+        world.session = "reported"
+        row = self.fixture.worker("reported-worker", family="codex")
+        pane = "w1:p2"
+        world.add(row, pane, family="codex")
+        _ = self.accept_pass(row)
+        for address, reported_pane, status, detail in (
+            (f"session:{row.current_session}", "w1:p9", "idle", "the worker pane changed before delivery"),
+            (f"staff:{row.id}", pane, "blocked", "worker is blocked"),
+        ):
+            world.locations[pane]["agent_status"] = status
+            observed = self.codex_worker_roster(row, world.session, reported_pane)
+            with (self.subTest(detail=detail), mock.patch.object(roster, "roster", return_value=observed),
+                  mock.patch.object(herdr, "shared_session", return_value="agents"),
+                  mock.patch.object(herdr, "Herdr", return_value=world), redirect_stdout(io.StringIO()) as output):
+                status_code = send.main(["--here", "--to", address, "--text", "Continue the work."])
+                self.assertEqual(status_code, 2, output.getvalue())
+                self.assertEqual(output.getvalue(), f"REFUSED: {row.name}: {detail}\nSEND_OUTCOME: worker_refused\n")
+                self.assertEqual(world.commands, [])
+
     def test_roster_problem_is_silent_while_a_usable_worker_still_succeeds(self) -> None:
         instance = self.accept_pass(self.row)
         with (mock.patch.object(roster, "roster", return_value=roster.Roster([], ["one run was unreadable"])),
@@ -8888,6 +8919,8 @@ class PaneWorkerMessageTests(unittest.TestCase):
                     self.assertIn(f"DONE {instance}", prompt[3])
                 else:
                     self.assertIn(result.outcome, ("failed", "refused"), result.detail)
+                    if case == "pane became blocked":
+                        self.assertIsInstance(result, send.WorkerMessageRefused)
                     self.assertIn(reason, result.detail)
                     self.assertEqual(retained, "")
                     self.assertEqual(prompts, [])
