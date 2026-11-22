@@ -1313,6 +1313,8 @@ Ordered after the red main repair and the guard repair (builds). It does not mov
   1. The test sets its own fixture: `SCCACHE_DIR` is unset, or points at a fixture folder, for every snapshot in the test. Prefer the fixture class, so no test in the module reads the live cache.
   2. Keep every assertion. Change no product code.
   3. No config key changes.
-- **Files:** `scripts/buildlog/test_disk.py`.
+  4. Added builds 01:20 (sdlc): the reservation test in `production/test_gate_suites_admission.py` reads the live `/proc/pressure/memory`; it failed once and passed on rerun. Give it a fixture pressure read.
+  5. Note: the `setUp` pop of `SCCACHE_DIR` is on main since 9b98021e11 (11-21 21:55); a branch without it still fails.
+- **Files:** `scripts/buildlog/test_disk.py`; `scripts/production/test_gate_suites_admission.py`.
 - **Workers:** 1 writer.
-- **Acceptance gate:** the test passes with a live `SCCACHE_DIR` set; the module passes in one tests-only gate after the builds go; basedpyright zero on the changed file; one blind review.
+- **Acceptance gate:** the test passes with a live `SCCACHE_DIR` set; the reservation test reads no live pressure file; the module passes in one tests-only gate after the builds go; basedpyright zero on the changed file; one blind review.
