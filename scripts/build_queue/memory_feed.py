@@ -1539,6 +1539,7 @@ def mac_work_row(build: queue_view.MacBuild, reading: queue_view.MacBuildReading
     parts.extend(staff_names.text_parts(" · " + shown_gate if shown_gate else ""))
     unit = staff_unit(identity, missing="—")
     verify = placed_step.verify if placed_step is not None else admission_records.NotVerifyCall()
+    placement_notes = gate_placement_notes(placed_step) if placed_step is not None else None
     call = ""
     if not isinstance(verify, admission_records.VerifyCall):
         try:
@@ -1549,6 +1550,7 @@ def mac_work_row(build: queue_view.MacBuild, reading: queue_view.MacBuildReading
         public_owner_name(identity.session, build.session))
     return {"kind": "mac-build", **queue_row_labels(title_step, display_name, unit=unit, ci_label=label, caller=caller),
             **call_notes(verify, placed_step.step if placed_step is not None else verb, call),
+            **(placement_notes or {}),
             **job_notes(NotGateStep(), names, step=verb, verify=verify, ci=ci),
             "name_parts": parts if staff_names.parts_text(parts) == display_name else staff_names.text_parts(display_name),
             **page_owner_labels(identity, ci_label=label, unit=unit, caller=caller), "gate_label": gate, "repository": build.repository,

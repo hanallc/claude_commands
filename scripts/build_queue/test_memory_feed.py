@@ -127,7 +127,7 @@ class GatePlacementWaiter(admission_records.WaitingStep):
 
 
 @dataclass(frozen=True)
-class GuestPlacementStep(admission_records.RunningStep):
+class GatePlacementStep(admission_records.RunningStep):
     confirmed_guest_run: Mapping[str, str] = field(default_factory=dict[str, str])
     placement_candidates: tuple[placement.CandidateEligibility, ...] = ()
 
@@ -538,10 +538,40 @@ class MemoryFeedTests(unittest.TestCase):
         unavailable_tips, _table = self.render_assignment_table(payload)
         self.assertIn("mac-linux: backoff until 15:30 EST", "\n".join(unavailable_tips["waiters"][0]))
 
-    def test_guest_gate_row_shows_only_the_confirmed_attempt(self) -> None:
+    def test_native_mac_gate_row_keeps_named_targets_and_guest_exclusion(self) -> None:
         base = captured_reading()
         now = base.explanation.now
-        guest = GuestPlacementStep("gate-session", "fixture gate", "gate", "/fixture/claude_commands", 0,
+        scope = RepositoryScope("claude_commands")
+        native = placement.CandidateEligibility(placement.PlacementDestination("mac", "mac", "mac", scope),
+                                               placement.AllowedHost())
+        step = GatePlacementStep("gate-session", "fixture gate", "gate", "/Mac/claude_commands", 0,
+            admission_records.RemoteMemoryUnavailable("remote memory is unavailable"),
+            pid=8200, started_at=now - 30, assignment_host="mac", mac_placement="episode/native-attempt",
+            job=StepJob("gate"), placement_candidates=(native, *gate_candidates(placement.FixedExclusion("not enabled"))))
+        reading = replace(base, view=replace(base.view, running=(step,)))
+        build = queue_view.MacBuild(8202, step.folder, step.started_at, "merge gate", "claude_commands",
+            gate_label=queue_view.MacGateLabel.PLACEMENT, gate_placement=step.mac_placement)
+        other = replace(build, pid=8203, gate_placement="episode/other-attempt")
+        mac = queue_view.MacBuildReading(now, (build, other))
+        with (mock.patch.object(admission_client, "view", return_value=reading),
+              mock.patch.object(queue_view, "read_mac_builds", return_value=mac),
+              mock.patch.object(memory_feed, "mac_build_units", return_value={})):
+            page = memory_feed.reading()
+        row = next(row for row in page["walk"] if row["pid"] == build.pid)
+        self.assertEqual(row.get("targets"), ["mac", "natedev", "mac-linux", "hana-aws"])
+        self.assertEqual(row.get("because"), "mac-linux: not enabled")
+        unrelated = next(row for row in page["walk"] if row["pid"] == other.pid)
+        self.assertNotIn("targets", unrelated)
+        payload = cast(dict[str, object], json.loads(memory_feed.page_json(page)))
+        tips, table = self.render_assignment_table(payload)
+        self.assertIn("mac-linux: not enabled", "\n".join(tips["walk"][page["walk"].index(row)]))
+        self.assertIn('<td class="machine" data-machine="mac or natedev or mac-linux or hana-aws">'
+            '<strong class="machine" data-machine="mac">mac (running)</strong>', table)
+
+    def guest_gate_page(self) -> memory_feed.MemoryPage:
+        base = captured_reading()
+        now = base.explanation.now
+        guest = GatePlacementStep("gate-session", "fixture gate", "gate", "/fixture/claude_commands", 0,
             admission_records.RemoteMemoryUnavailable("remote memory is unavailable"),
             pid=8200, started_at=now - 30, assignment_host="guest-ssh-name", mac_placement="episode/placement-attempt",
             job=StepJob("gate"), confirmed_guest_run={"target": "mac-linux", "attempt": "guest-attempt"},
@@ -559,22 +589,33 @@ class MemoryFeedTests(unittest.TestCase):
         with (mock.patch.object(admission_client, "view", return_value=reading),
               mock.patch.object(queue_view, "read_mac_builds", return_value=mac),
               mock.patch.object(memory_feed, "mac_build_units", return_value={})):
-            page = memory_feed.reading()
-        row = next(row for row in page["walk"] if row["pid"] == guest.pid)
+            return memory_feed.reading()
+
+    def test_guest_gate_row_shows_only_the_confirmed_attempt(self) -> None:
+        page = self.guest_gate_page()
+        row = next(row for row in page["walk"] if row["pid"] == 8200)
         self.assertEqual(row.get("guest_run"), {"target": "mac-linux", "attempt": "guest-attempt"})
         self.assertEqual((row.get("machine"), row.get("state")), ("mac-linux", "running"))
-        self.assertFalse(any(other["pid"] == native.pid for other in page["walk"]))
-        unconfirmed = next(row for row in page["walk"] if row["pid"] == pending.pid)
+        self.assertFalse(any(other["pid"] == 8202 for other in page["walk"]))
+        unconfirmed = next(row for row in page["walk"] if row["pid"] == 8201)
         self.assertNotIn("guest_run", unconfirmed)
         self.assertEqual(unconfirmed.get("state"), "uncertain")
         payload = cast(dict[str, object], json.loads(memory_feed.page_json(page)))
         tips, table = self.render_assignment_table(payload)
         self.assertEqual(table.count(f'data-tip="row:{row.get("key")}" tabindex="0"'), 1)
-        self.assertIn('<td class="machine" data-machine="mac-linux">mac-linux</td>', table)
         text = "\n".join(tips["walk"][page["walk"].index(row)])
         self.assertIn("Runs on  mac-linux", text)
         self.assertIn("Guest attempt  guest-attempt", text)
         self.assertIn("Named targets  natedev or mac-linux or hana-aws", text)
+
+    def test_running_gate_table_lists_named_targets_and_marks_the_selected_target(self) -> None:
+        page = self.guest_gate_page()
+        payload = cast(dict[str, object], json.loads(memory_feed.page_json(page)))
+        _tips, table = self.render_assignment_table(payload)
+        self.assertIn('<td class="machine" data-machine="natedev or mac-linux or hana-aws">'
+            '<span class="machine" data-machine="natedev">natedev</span> or '
+            '<strong class="machine" data-machine="mac-linux">mac-linux (running)</strong> or '
+            '<span class="machine" data-machine="hana-aws">hana-aws</span></td>', table)
 
     def render_assignment_table(self, payload: dict[str, object]) -> tuple[dict[str, list[list[str]]], str]:
         html = self.expected_page()
