@@ -26,6 +26,7 @@ import contextlib
 import fcntl
 import json
 import os
+import re
 import secrets
 import shlex
 import shutil
@@ -102,6 +103,7 @@ class PaneDispatchUnavailable(TypedDict):
 class StopFields(TypedDict, total=False):
     stop_reason: str
     scope_error: str
+    hold_stop_requests: list[str]
     stop_pass_requested: Literal[True]
     self_stop: Literal[True]
 
@@ -240,7 +242,7 @@ def _write_record(path: Path, record: RunRecord) -> RunRecord:
             fields.update(current)
         if delivery := current.get("delivery"):
             fields["delivery"] = delivery
-        stop_fields = ("stop_reason", "stop_pass_requested", "self_stop")
+        stop_fields = ("stop_reason", "hold_stop_requests", "stop_pass_requested", "self_stop")
         if _has_saved_cgroup(current):
             stop_fields += ("scope_error", "slice_leftovers", "slice_cleanup_pending", "stop_notice_id")
         saved = cast(Mapping[str, object], current)
@@ -270,6 +272,13 @@ def _write_record(path: Path, record: RunRecord) -> RunRecord:
         return fields
 
 
+def _is_hold_stop_requests(value: object) -> TypeGuard[list[str]]:
+    return isinstance(value, list) and all(
+        isinstance(item, str) and re.fullmatch(r"[0-9a-f]{32}", item) is not None
+        for item in cast(list[object], value)
+    )
+
+
 def _is_run_record(raw: dict[str, object]) -> TypeGuard[RunRecord]:
     pane_dispatch = raw.get("pane_dispatch_id")
     match raw:
@@ -287,6 +296,7 @@ def _is_run_record(raw: dict[str, object]) -> TypeGuard[RunRecord]:
                     and all(key not in raw or isinstance(raw[key], str)
                             for key in ("supervisor_started", "command_started", "tree_key", "finished_at",
                                         "delivery", "ended", "stop_reason", "scope_error", "stop_notice_id"))
+                    and ("hold_stop_requests" not in raw or _is_hold_stop_requests(raw["hold_stop_requests"]))
                     and ("delivered_at" not in raw or type(raw["delivered_at"]) in (int, float))
                     and ("completion_pending" not in raw or isinstance(raw["completion_pending"], bool))
                     and ("command_slice" not in raw or process_stop.is_slice_identity(raw["command_slice"]))
@@ -305,12 +315,16 @@ def _read_stop_fields(path: Path, run_id: object) -> StopFields:
     if not saved:
         return {}
     reason = saved.get("stop_reason")
+    requests = saved.get("hold_stop_requests", [])
     if (not isinstance(run_id, str) or saved.get("run_id") != run_id or not isinstance(reason, str)
+            or not _is_hold_stop_requests(requests)
             or any(key in saved and saved[key] is not True for key in ("stop_pass_requested", "self_stop"))):
         raise worker_lifecycle.WorkerStateUnreadable(path, "invalid stop fields")
     fields: StopFields = {"stop_reason": reason}
     if isinstance(error := saved.get("scope_error"), str):
         fields["scope_error"] = error
+    if requests:
+        fields["hold_stop_requests"] = requests
     if saved.get("stop_pass_requested") is True:
         fields["stop_pass_requested"] = True
     if saved.get("self_stop") is True:
@@ -326,8 +340,24 @@ def _read_record_if_present(path: Path) -> RunRecord | None:
         raise SystemExit(f"detached_runs: {path} is not a run record")
     if path.name != f"{raw['run_id']}.json":
         raise SystemExit(f"detached_runs: {path} does not match run ID {raw['run_id']}")
-    confirmed = _read_stop_fields(path.with_suffix(CONFIRMED_STOP_SUFFIX), raw["run_id"])
-    return {**raw, **confirmed} if confirmed else raw
+    return _with_confirmed_stop(path, raw)
+
+
+def _with_confirmed_stop(path: Path, record: RunRecord) -> RunRecord:
+    confirmed = _read_stop_fields(path.with_suffix(CONFIRMED_STOP_SUFFIX), record["run_id"])
+    requests = confirmed.get("hold_stop_requests")
+    if requests:
+        confirmed["hold_stop_requests"] = list(dict.fromkeys([*record.get("hold_stop_requests", []), *requests]))
+    return {**record, **confirmed} if confirmed else record
+
+
+def confirms_hold_stop(path: Path, run_id: str, request_id: str) -> bool:
+    """Check the published confirmation of this hold request."""
+    try:
+        record = _read_record(path)
+    except (SystemExit, worker_lifecycle.WorkerStateUnreadable):
+        return False
+    return record["run_id"] == run_id and request_id in record.get("hold_stop_requests", [])
 
 
 def _read_record(path: Path) -> RunRecord:
@@ -359,6 +389,7 @@ def stop_with_reason(
     path: Path, reason: str, *, verify_group: Callable[[], CommandGroup | CommandGroupUnverified],
     signal_group: Callable[[int, int], None], stop_pass: bool = False, self_stop: bool = False,
     unconfirmed: str = "",
+    hold_request_id: str = "",
 ) -> bool:
     """Publish the stop reason after signaling the verified group."""
     with record_lock(path):
@@ -375,6 +406,8 @@ def stop_with_reason(
         stopping = {**record, "stop_reason": reason}
         if unconfirmed:
             stopping["scope_error"] = unconfirmed
+        if hold_request_id:
+            stopping["hold_stop_requests"] = [*record.get("hold_stop_requests", []), hold_request_id]
         pending_stop = path.with_suffix(PENDING_STOP_SUFFIX)
         if stop_pass:
             # Index the run before it can outlive its supervisor.
@@ -462,7 +495,7 @@ def _scope_stop_graces() -> tuple[float, float]:
 
 def _finish_slice_stop(
     path: Path, run_slice: process_stop.RunSliceIdentity, *, ended: bool,
-    grace: float, kill_grace: float, cleanup: bool = False, commit_synced: bool = False,
+    grace: float, kill_grace: float, cleanup: bool = False, commit_synced: bool = False, hold_request_id: str = "",
 ) -> None:
     """Confirm the end of an authorized stop under the stop lock."""
     if not ended:
@@ -479,7 +512,10 @@ def _finish_slice_stop(
         record = _read_record(path)
         if record.get("command_slice") != run_slice:
             raise process_stop.SliceStopFailed("the saved run slice changed during the stop")
-        if record.pop("slice_cleanup_pending", False):
+        cleanup_pending = record.pop("slice_cleanup_pending", False)
+        if hold_request_id:
+            record["hold_stop_requests"] = [*record.get("hold_stop_requests", []), hold_request_id]
+        if cleanup_pending or hold_request_id:
             write_text_atomic(path, json.dumps(record, indent=2, sort_keys=True))
 
 
@@ -512,7 +548,7 @@ def _read_slice_end(run_slice: process_stop.RunSliceIdentity, *, retry_seconds: 
 
 def _stop_slice_command(
     path: Path, run_slice: process_stop.RunSliceIdentity, reason: str, *,
-    check: Callable[[], bool], retry_slice_read: bool, stop_notice_id: str,
+    check: Callable[[], bool], retry_slice_read: bool, stop_notice_id: str, hold_request_id: str,
 ) -> bool:
     grace, kill_grace = _scope_stop_graces()
     with _scope_stop_lock(path, blocking=True):
@@ -525,15 +561,15 @@ def _stop_slice_command(
             if record is None or record.get("command_slice") != run_slice or record["status"] != "running" or not check():
                 return False
             recovered_commit = bool(record.get("stop_pass_requested"))
+            if ended and (not recovered_commit or hold_request_id):
+                return False
             if not recovered_commit:
-                if ended:
-                    return False
                 record.update(stop_reason=reason, stop_pass_requested=True)
                 if stop_notice_id:
                     record["stop_notice_id"] = stop_notice_id
                 write_text_atomic(path, json.dumps(record, indent=2, sort_keys=True))
         _finish_slice_stop(path, run_slice, ended=ended, grace=grace, kill_grace=kill_grace,
-                           commit_synced=not recovered_commit)
+                           commit_synced=not recovered_commit, hold_request_id=hold_request_id)
     return True
 
 
@@ -578,7 +614,7 @@ def _stop_caller_is_owner(owner: object, environment: Mapping[str, str]) -> bool
 def stop_command(
     path: Path, reason: str, *, check: Callable[[], bool] = lambda: True,
     stop_pass: bool = True, signal_group: Callable[[int, int], None] | None = None,
-    retry_slice_read: bool = False, stop_notice_id: str = "",
+    retry_slice_read: bool = False, stop_notice_id: str = "", hold_request_id: str = "",
 ) -> bool:
     """Stop the saved run slice or signal the verified command group."""
     if not reason:
@@ -593,7 +629,7 @@ def stop_command(
         if not process_stop.is_slice_identity(run_slice):
             raise process_stop.SliceStopFailed("the saved run slice is invalid")
         return _stop_slice_command(path, run_slice, reason, check=check, retry_slice_read=retry_slice_read,
-                                   stop_notice_id=stop_notice_id)
+                                   stop_notice_id=stop_notice_id, hold_request_id=hold_request_id)
     if stop_notice_id:
         return False
     starting_command = _recorded_group(record)
@@ -628,6 +664,7 @@ def stop_command(
             path, reason, verify_group=verify_group, signal_group=signal_command, stop_pass=cancel_pass,
             self_stop=cancel_pass and _stop_caller_is_owner(record.get("staff_id"), os.environ),
             unconfirmed="the command group received TERM without a verified scope" if use_pidfd else "",
+            hold_request_id=hold_request_id if not use_pidfd else "",
         )
         return sent and not use_pidfd
     except (ProcessLookupError, PermissionError):
@@ -1034,6 +1071,7 @@ def _prune_finished_locked(runs: Path) -> list[str]:
     Keep another owner's result until that owner starts again.
     Keep stop notice evidence until the caller acknowledges the notice ID.
     """
+    from scripts.build_hold.override_guard import SharedStateWriteRefused
     from scripts.direct import progress_history
     from scripts.herdr import worker_panes
 
@@ -1080,10 +1118,33 @@ def _prune_finished_locked(runs: Path) -> list[str]:
                 continue
             if _has_saved_cgroup(current) and not _command_has_ended(current, _integer(current.get("pid"))):
                 continue
+            if _is_run_record(current):
+                record = _with_confirmed_stop(path, current)
+                if requests := record.get("hold_stop_requests"):
+                    try:
+                        _preserve_hold_stop_confirmations(requests)
+                    except (OSError, SharedStateWriteRefused) as error:
+                        print(f"detached_runs: kept {path}: could not copy hold stop confirmations: {error}",
+                              file=sys.stderr)
+                        continue
             for name in _RUN_FILES:
                 (runs / name.format(run_id)).unlink(missing_ok=True)
         removed.append(run_id)
     return removed
+
+
+def _preserve_hold_stop_confirmations(request_ids: Sequence[str]) -> None:
+    """Copy confirmed signals before the runner deletes their source record."""
+    from scripts.build_hold import override_guard, shared_state_defaults
+
+    # The enforcer takes the release lock before the record lock.
+    # Each marker has a unique request ID and can record the same signal twice.
+    for request_id in request_ids:
+        if shared_state_defaults.read_stop_confirmation(request_id) == "stopped":
+            continue
+        path = shared_state_defaults.stop_confirmation_path(request_id)
+        override_guard.require_hold_write(path)
+        shared_state_defaults.write_stop_confirmation(path, "stopped")
 
 
 def _run_record_paths(runs: Path) -> list[Path]:

@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from scripts.review_links.test_page_frame import assert_status_states
-from scripts.build_queue import admission_records, admission_service, placement, queue_evidence
+from scripts.build_queue import admission_records, admission_service, placement, queue_evidence, slot_wait
 from scripts.build_queue import snapshot_codec as codec
 from scripts.build_queue.test_queue_view import with_converted_executions
 
@@ -2019,6 +2019,27 @@ process.stdout.write(JSON.stringify({
                 self.assertEqual(after["reserved"], before["reserved"])
                 self.assertEqual(after["used"], before["used"])
                 self.assertEqual(after["waiting"], before["waiting"])
+
+    def test_wrapped_verify_command_names_the_first_call_in_feed_notes(self) -> None:
+        verify = "bash ~/.claude/scripts/direct/verify.sh --session-dir"
+        cases = (
+            ("startup", f"{verify} /fixture/sessions/startup test hana --filter 'name with spaces'",
+             ("hana", "--filter", "name with spaces"), "verify test hana --filter 'name with spaces'"),
+            ("widget", f"direnv allow . >/dev/null; direnv exec . {verify} /fixture/sessions/widget test hana_diegetic; "
+             + f"{verify} /fixture/sessions/widget build hana_diegetic --example scrolling --local test",
+             ("hana_diegetic",), "verify test hana_diegetic"),
+        )
+        for unit, command, arguments, call in cases:
+            with (self.subTest(unit=unit),
+                  mock.patch.object(slot_wait, "verify_package", return_value=arguments[0]) as parse):
+                name, _, facts = slot_wait.command_slot_job(("bash", "-c", command), RECORDED_STEP_NAMES)
+                assert isinstance(name, memory_feed.QueueRowName)
+                step = f"test {arguments[0]}"
+                row = memory_feed.queue_row_labels(name, name, unit=memory_feed.StaffUnitName(unit))
+                self.assertEqual(row["title"], {"unit": unit, "step": step})
+                self.assertEqual(memory_feed.call_notes(facts, name).get("verify"),
+                    {"verb": "test", "call": call, "position": 1, "total": 1, "step": step})
+                parse.assert_called_once_with("test", arguments)
 
     def test_queue_row_name_rejects_shell_words_and_ids_inside_names(self) -> None:
         for name in ("startup bash", "startup /bin/env", "exec -a", "startup $UNIT",
