@@ -1873,6 +1873,8 @@ select.select([], [], [], 2)
                 self.assertEqual(observed["LC_TERMINAL"], "target-terminal")
 
     def test_probe_copy_and_run_arguments_preserve_nextest_words(self) -> None:
+        self.config["copy_stall_timeout_s"] = "60"
+        self.sync_config()
         _ = (self.repository / ".gitignore").write_text(
             "generated/\n", encoding="utf-8"
         )

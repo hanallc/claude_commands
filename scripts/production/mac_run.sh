@@ -58,11 +58,30 @@ source_repo=$(conf_value production mac_run_source) || exit 2
 source_arg=${(q)source_repo}
 [[ $source_repo != \~/* ]] || source_arg="\$HOME/${(q)${source_repo#\~/}}"
 
+probe_timeout=$(conf_value mac_test probe_timeout_s) || exit 2
+terminate_grace=$(conf_value mac_gate terminate_grace_seconds) || exit 2
+ssh_option_lines=$("$lib/py" -c '
+from scripts.lib import conf
+from scripts.mac_test import eligibility, offload
+print(*offload.ssh_options(eligibility.SshProbeSettings(conf.read("mac_test"))), sep="\n")
+' "$lib/../mac_test/offload.py") || exit 2
+ssh_options=("${(@f)ssh_option_lines}")
+
+short_ssh() {
+  local deadline=$1
+  shift
+  timeout --kill-after="$terminate_grace" "$deadline" ssh "${ssh_options[@]}" "$host" "$@"
+}
+
 # Tailscale SSH serves the Mac, and its exit status is always 0, so a command
 # whose status matters prints it as its last line and on_mac returns that.
 on_mac() {
   local out code
-  out=$(ssh $host "$1; echo mac_exit=\$?") || return $?
+  if [[ $2 == none ]]; then
+    out=$(ssh "${ssh_options[@]}" "$host" "$1; echo mac_exit=\$?") || return $?
+  else
+    out=$(short_ssh "$2" "$1; echo mac_exit=\$?") || return $?
+  fi
   print -rn -- "${out%mac_exit=*}"
   code=${out##*mac_exit=}
   [[ $code == <-> ]] || code=255
@@ -70,7 +89,7 @@ on_mac() {
 }
 
 if [[ -z $callback_mode ]]; then
-  ssh -o BatchMode=yes $host true 2>/dev/null || { print "mac unreachable"; exit 3 }
+  short_ssh "$probe_timeout" true 2>/dev/null || { print "mac unreachable"; exit 3 }
   exec "$lib/py" "$lib/../mac_test/mac_queue_run.py" --what "mac run $sha" --kind run --package hana \
     --worktree "$repo" --cwd '' --lifecycle-script "${0:A}" -- "$repo" "$sha" "$hold"
 fi
@@ -84,10 +103,10 @@ cleanup_mac_run() {
   [[ ! -r $argv_file.state ]] || source "$argv_file.state"
   [[ -z $bundle ]] || rm -f -- "$bundle"
   [[ -n $clone_task && -n $clone ]] || return 0
-  local confirmation
-  if confirmation=$(on_mac "~/.claude/scripts/lib/py ~/.claude/scripts/hana_instances/hana_instances.py stop-checkout $clone_arg") && [[ ${confirmation##*$'\n'} == 'hana-instances: checkout clear' ]]; then
-    on_mac "~/.claude/scripts/lib/py ~/.claude/scripts/lib/scratch.py end --task $clone_task" >/dev/null || return 4
-    on_mac "~/.claude/scripts/lib/py ~/.claude/scripts/copies/copies.py unregister-remote --host localhost --path $clone_arg" >/dev/null || return 4
+  local confirmation stop_timeout=$(( probe_timeout + terminate_grace ))
+  if confirmation=$(on_mac "~/.claude/scripts/lib/py ~/.claude/scripts/hana_instances/hana_instances.py stop-checkout $clone_arg" "$stop_timeout") && [[ ${confirmation##*$'\n'} == 'hana-instances: checkout clear' ]]; then
+    on_mac "~/.claude/scripts/lib/py ~/.claude/scripts/lib/scratch.py end --task $clone_task" none >/dev/null || return 4
+    on_mac "~/.claude/scripts/lib/py ~/.claude/scripts/copies/copies.py unregister-remote --host localhost --path $clone_arg" "$probe_timeout" >/dev/null || return 4
     "$lib/py" $copies_script unregister-remote --host $host --path $clone || return 4
   else
     print -u2 "mac_run: process exit not confirmed; kept checkout $clone and task $clone_task${confirmation:+: $confirmation}"
@@ -110,7 +129,7 @@ copy_owner=$("$lib/py" -c 'import sys; from pathlib import Path; from scripts.co
 copy_owner_arg=${(q)copy_owner}
 copy_session=${owner:-pid-$$}
 copy_session_arg=${(q)copy_session}
-clone=$(on_mac "~/.claude/scripts/lib/py ~/.claude/scripts/copies/copies.py clone $source_arg --task $clone_task --name hana --owner $copy_owner_arg --repository hana --session $copy_session_arg") || exit 4
+clone=$(on_mac "~/.claude/scripts/lib/py ~/.claude/scripts/copies/copies.py clone $source_arg --task $clone_task --name hana --owner $copy_owner_arg --repository hana --session $copy_session_arg" none) || exit 4
 [[ $clone == /* && $clone != *$'\n'* ]] || { print -u2 'mac_run: scratch clone returned no absolute checkout'; exit 4 }
 clone_arg=${(q)clone}
 save_state
@@ -121,7 +140,7 @@ registry_args=(--repository hana --owner $copy_owner --host $host --path $clone 
 mirror_lease=$("$lib/py" $copies_script register-remote "${registry_args[@]}" --shell-lease) || exit 4
 print -r -- "$mirror_lease" > "$argv_file.lease"
 "$lib/py" $copies_script register-remote "${registry_args[@]}" || exit 4
-base=$(ssh $host "git -C $clone_arg rev-parse HEAD")
+base=$(short_ssh "$probe_timeout" "git -C $clone_arg rev-parse HEAD") || exit 4
 if git -C $repo merge-base --is-ancestor $sha $base 2>/dev/null; then
   checkout_command="git -C $clone_arg checkout -q --detach $sha"
 else
@@ -137,7 +156,7 @@ else
   bundle_exit=$?
   git -C $repo update-ref -d $ref
   (( bundle_exit == 0 )) || { rm -f $bundle; exit 4 }
-  scp -q $bundle "$host:$remote_bundle" || { rm -f $bundle; exit 4 }
+  scp -q "${ssh_options[@]}" "$bundle" "$host:$remote_bundle" || { rm -f $bundle; exit 4 }
   rm -f $bundle
 
   checkout_command="git -C $clone_arg fetch -q $bundle_arg $ref && git -C $clone_arg checkout -q --detach FETCH_HEAD; rm -f $bundle_arg"

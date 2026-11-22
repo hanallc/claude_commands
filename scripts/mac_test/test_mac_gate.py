@@ -23,13 +23,13 @@ from scripts.copies import copies
 from scripts.copies.copies_test_support import copies_environment
 from scripts.direct.wait_for_test_state import wait_until
 from scripts.lint import folder_audit, tmp_sweep
-from scripts.lint.memory_test_support import write_config_fixture
-from scripts.lib import scratch
+from scripts.lint.memory_test_support import config_environment, write_config_fixture
+from scripts.lib import conf, scratch
 from scripts.lib.checkout_test_support import write_stdlib_tool
 from scripts.lib.git_test_support import commit_repository, fixture_git_environment
 from scripts.lib.process_start import Started, Unreadable, process_start
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
-from scripts.mac_test import mac_gate
+from scripts.mac_test import eligibility, mac_gate, offload
 from scripts.mac_test.test_mac_queue_run import queue_fixture
 from scripts.production import gate
 from scripts.production.gate_modules import GateRefused
@@ -434,15 +434,18 @@ print(json.dumps([os.environ["PYTHONPATH"], *sys.argv[1:]]))
         captured = subprocess.run
         clone_commands: list[str] = []
 
-        def reply(command: list[str], *, text: bool) -> str:
+        def reply(command: list[str], *, text: bool, timeout: float | None = None) -> str:
             self.assertTrue(text)
             remote = command[-1]
             if 'cat-file' in remote:
+                self.assertIsNotNone(timeout)
                 return captured(['/bin/sh', '-c', remote], capture_output=True, check=True, text=True).stdout
             if ' clone ' in remote:
+                self.assertIsNone(timeout)
                 self.assertIn('fixture-owner fixture-project', remote)
                 clone_commands.append(remote)
                 return f'mac_gate_checkout={clone}'
+            self.assertIsNotNone(timeout)
             return 'created'
 
         sends: list[list[str]] = []
@@ -492,8 +495,74 @@ print(json.dumps([os.environ["PYTHONPATH"], *sys.argv[1:]]))
         error = subprocess.CalledProcessError(3, ['ssh'], output=f"{request['commit']}\npresent\npresent\n")
         with (mock.patch.object(subprocess, 'check_output', side_effect=error),
               self.assertRaises(subprocess.CalledProcessError)):
-            _ = mac_gate.checkout_bundle(['ssh', 'fixture-mac'], str(self.repo), self.repo, folder, request)
+            _ = mac_gate.checkout_bundle(['ssh', 'fixture-mac'], str(self.repo), self.repo, folder, request,
+                                         probe_timeout=1)
         self.assertFalse((folder / 'source.bundle').exists())
+
+    def test_lifecycle_distinguishes_stalls_from_slow_work(self) -> None:
+        tools = self.root / 'tools'
+        tools.mkdir()
+        transport = tools / 'ssh'
+        write_stdlib_tool(transport, """\
+import os, select, sys
+from pathlib import Path
+
+args = sys.argv[1:]
+remote = args[-1]
+keepalive = {'ConnectTimeout=7', 'ServerAliveInterval=15', 'ServerAliveCountMax=3'} <= set(args)
+if Path(sys.argv[0]).name == 'scp':
+    stage = 'script' if remote.endswith('mac_gate.py.new') else 'files'
+    reply = ''
+elif 'mkdir --' in remote:
+    stage, reply = 'create', 'created'
+elif ' clone ' in remote:
+    stage, reply = 'clone', 'mac_gate_checkout=' + os.environ['CHECKOUT']
+elif 'cat-file' in remote:
+    stage, reply = 'probe', os.environ['CHECKOUT_HEAD'] + '\\npresent\\npresent'
+else:
+    stage, reply = 'cleanup', 'mac_gate_cleaned'
+if os.environ['SLOW_STAGE'] == stage:
+    if not keepalive:
+        raise SystemExit(90)
+    select.select([], [], [], 0.85)
+if os.environ['STALL_STAGE'] == stage:
+    if stage in {'script', 'files', 'clone', 'cleanup'} and keepalive:
+        select.select([], [], [], 0.1)
+        raise SystemExit(255)
+    select.select([], [], [], 0.85)
+print(reply)
+""")
+        shutil.copyfile(transport, tools / 'scp').chmod(0o755)
+        config = self.root / 'config'
+        _ = write_config_fixture(config / 'mac_test.conf', 'connect_timeout_s=7\nprobe_timeout_s=0.25\n')
+        _ = write_config_fixture(config / 'mac_gate.conf', 'terminate_grace_seconds=0.25\n')
+        environment = {**config_environment(config), 'PATH': str(tools) + os.pathsep + os.environ['PATH'],
+                       'MAC_QUEUE_HOST': 'fixture-mac', 'CHECKOUT': str(self.repo),
+                       'CHECKOUT_HEAD': gate.checked_git(self.repo, 'rev-parse', 'HEAD')}
+        for stage, stalled in (('create', True), ('script', True), ('clone', True), ('probe', True),
+                               ('files', True), ('cleanup', True), ('clone', False), ('cleanup', False)):
+            with self.subTest(stage=stage, stalled=stalled):
+                folder = self.root / f'mac-gate-{stage}_{int(stalled)}'
+                request = cloud_gate.prepare_request(self.repo, folder, gate.SuiteMode.GATE, 30)
+                cloud_gate.save(folder / 'request.json', request)
+                _ = (folder / 'local-repo').write_text(str(self.repo))
+                phase = 'cleanup-ended' if stage == 'cleanup' else 'prepare'
+                with (mock.patch.dict(os.environ, {**environment, 'STALL_STAGE': stage if stalled else '',
+                                                    'SLOW_STAGE': '' if stalled else stage}),
+                      mock.patch.object(copies, 'source_owner', return_value='fixture-owner'),
+                      mock.patch.object(copies, 'repository_name', return_value='fixture-project'),
+                      mock.patch.object(copies, 'register_remote'),
+                      mock.patch.object(copies, 'reconcile_remote_mirrors'),
+                      redirect_stdout(StringIO()) as output):
+                    if not stalled or stage == 'cleanup':
+                        self.assertEqual(mac_gate.lifecycle(phase, folder / 'argv.json', folder, '1'), int(stalled))
+                        if stalled:
+                            self.assertIn(mac_gate.CLEANUP_ERROR_PREFIX, output.getvalue())
+                    else:
+                        failure = (subprocess.TimeoutExpired if stage in ('create', 'probe')
+                                   else subprocess.CalledProcessError)
+                        with self.assertRaises(failure):
+                            _ = mac_gate.lifecycle(phase, folder / 'argv.json', folder, '1')
 
     def test_aws_verdict_error_precedes_module_error(self) -> None:
         request: dict[str, object] = {'attempt': 'fixture', 'commit': 'commit', 'tree': 'tree',
@@ -677,7 +746,8 @@ print(json.dumps([os.environ["PYTHONPATH"], *sys.argv[1:]]))
         run = subprocess.run
 
         def ssh(command: list[str], *, capture_output: bool, text: bool, check: bool) -> subprocess.CompletedProcess[str]:
-            self.assertEqual(command[:-1], ['ssh', '-n', '-o', 'BatchMode=yes', 'fixture-mac'])
+            settings = eligibility.SshProbeSettings(conf.read('mac_test'))
+            self.assertEqual(command[:-1], ['ssh', '-n', *offload.ssh_options(settings), 'fixture-mac'])
             self.assertTrue(capture_output and text and not check)
             expanded = run(['/bin/sh', '-c', command[-1]], capture_output=True, text=True,
                            timeout=TEST_HANG_GUARD_SECS, check=True)

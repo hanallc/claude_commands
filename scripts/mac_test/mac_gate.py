@@ -310,14 +310,14 @@ def clone_checkout(folder: Path, owner: str, repository: str, session: str) -> P
 
 
 def checkout_bundle(ssh: list[str], checkout: str, repo: Path, folder: Path,
-                    request: dict[str, object]) -> list[Path]:
+                    request: dict[str, object], *, probe_timeout: float) -> list[Path]:
     """Send both requested tips if the Mac clone lacks either one."""
     revisions = (ledger.text(request, 'commit'), ledger.text(request, 'origin_main'))
     git = shlex.join(['git', '-C', checkout])
     probes = [f'if {git} cat-file -e {shlex.quote(revision + "^{commit}")} 2>/dev/null; '
               + 'then printf "present\n"; else printf "absent\n"; fi' for revision in revisions]
     rows = subprocess.check_output([*ssh, f'{git} rev-parse --verify HEAD && ' + ' && '.join(probes)],
-                                   text=True).splitlines()
+                                   text=True, timeout=probe_timeout).splitlines()
     if (len(rows) != 3 or re.fullmatch(r'[0-9a-f]{40}|[0-9a-f]{64}', rows[0]) is None
             or any(row not in ('present', 'absent') for row in rows[1:])):
         raise GateRefused('The Mac checkout did not report its source commits')
@@ -340,6 +340,8 @@ def checkout_cleanup_command(root: str, runner: str, checkout: str) -> str:
 
 
 def lifecycle(phase: str, argv_file: Path, folder: Path, full: str) -> int:
+    from scripts.mac_test import eligibility, offload
+
     source_attempt = attempt_name(folder)
     attempt_file = argv_file.with_suffix('.json.attempt')
     if phase == 'prepare':
@@ -355,7 +357,9 @@ def lifecycle(phase: str, argv_file: Path, folder: Path, full: str) -> int:
     python = '/usr/bin/env PYTHONPATH="$HOME/.claude" "$HOME/.claude/scripts/lib/py"'
     runner = f'{python} {root}/mac_gate.py'
     host = os.environ['MAC_QUEUE_HOST']
-    ssh = ['ssh', '-n', '-o', 'BatchMode=yes', host]
+    settings = eligibility.SshProbeSettings(conf.read('mac_test'))
+    options = offload.ssh_options(settings)
+    ssh = ['ssh', '-n', *options, host]
     checkout_file = argv_file.with_suffix('.json.checkout')
     if phase in ('cleanup', 'cleanup-ended'):
         try:
@@ -389,11 +393,13 @@ def lifecycle(phase: str, argv_file: Path, folder: Path, full: str) -> int:
     session = os.environ.get('CODEX_THREAD_ID') or os.environ.get('CLAUDE_CODE_SESSION_ID') or attempt_name(folder)
     files = [folder / 'request.json', folder / 'module_seconds.json']
     parent = root.rsplit('/', 1)[0]
+    probe_timeout = settings.probe_timeout_s
     created = subprocess.check_output(
-        [*ssh, f'umask 077 && mkdir -p -- {parent} && mkdir -- {root} && printf "created\n"'], text=True)
+        [*ssh, f'umask 077 && mkdir -p -- {parent} && mkdir -- {root} && printf "created\n"'],
+        text=True, timeout=probe_timeout)
     if created.strip() != 'created':
         raise GateRefused('Could not create the Mac gate state folder')
-    _ = subprocess.run(['scp', '-q', '-o', 'BatchMode=yes', str(Path(__file__).resolve()),
+    _ = subprocess.run(['scp', '-q', *options, str(Path(__file__).resolve()),
                         f'{host}:{remote}/mac_gate.py.new'], check=True)
     clone = f'mv -- {root}/mac_gate.py.new {root}/mac_gate.py && {runner} clone {root} '
     response = subprocess.check_output([*ssh, clone + shlex.join([owner, repository, session])], text=True)
@@ -407,8 +413,8 @@ def lifecycle(phase: str, argv_file: Path, folder: Path, full: str) -> int:
     _ = argv_file.with_suffix('.json.lease').write_text(str(copies.remote_lease_path(mirror)))
     copies.register_remote(mirror)
     copies.reconcile_remote_mirrors(host, is_mac_gate_checkout)
-    files.extend(checkout_bundle(ssh, checkout, local_repo, folder, request))
-    _ = subprocess.run(['scp', '-q', '-o', 'BatchMode=yes', *map(str, files), f'{host}:{remote}/'], check=True)
+    files.extend(checkout_bundle(ssh, checkout, local_repo, folder, request, probe_timeout=probe_timeout))
+    _ = subprocess.run(['scp', '-q', *options, *map(str, files), f'{host}:{remote}/'], check=True)
     _ = argv_file.write_text(json.dumps(['/bin/zsh', '-c', f'exec {runner} stage {root} {full}']))
     return 0
 

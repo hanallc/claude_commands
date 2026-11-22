@@ -639,6 +639,41 @@ else:
                              [f"{callback} cleanup {called}", f"{installed} cleanup-ended {called}"])
             self.assertFalse(saved.exists())
 
+    def test_ended_gate_recovery_waits_for_slow_cleanup_and_retains_stalled_records(self) -> None:
+        ssh = """\
+import os, select, sys
+
+keepalive = {'ServerAliveInterval=15', 'ServerAliveCountMax=3'} <= set(sys.argv)
+if keepalive and os.environ['MAC_LINK_LOST'] == '1':
+    select.select([], [], [], 0.1)
+    raise SystemExit(255)
+if not keepalive:
+    raise SystemExit('Missing SSH keepalives')
+select.select([], [], [], 0.9)
+print('mac_gate_cleaned')
+"""
+        for link_lost in (True, False):
+            with self.subTest(link_lost=link_lost), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                environment = {**queue_fixture(root, ssh), "MAC_LINK_LOST": str(int(link_lost))}
+                _ = write_config_fixture(root / "config/mac_gate.conf", "terminate_grace_seconds=0.2\n")
+                _ = write_config_fixture(root / "config/mac_test.conf", "probe_timeout_s=0.25\n")
+                stale = root / mac_queue_run.RUNS / "stale"
+                stale.mkdir(parents=True)
+                (stale / "lock").touch()
+                record = stale / "run.json"
+                _ = record.write_text(json.dumps({"lifecycle_script": "mac_gate.py", "host": "fake-mac",
+                                                  "arguments": [str(root / 'mac-gate-fixture'), '1']}))
+                installed = root / ".claude" / mac_queue_run.MAC_GATE_SCRIPT
+                installed.parent.mkdir(parents=True)
+                installed.symlink_to(Path(__file__).with_name("mac_gate.py").resolve())
+                with (mock.patch.dict(os.environ, environment, clear=True),
+                      redirect_stderr(io.StringIO()) as errors):
+                    mac_queue_run.clean_ended_runs(environment)
+                self.assertEqual(record.exists(), link_lost)
+                if link_lost:
+                    self.assertIn("cleanup of an ended run failed (1)", errors.getvalue())
+
     def test_ended_custom_callback_uses_its_saved_path(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

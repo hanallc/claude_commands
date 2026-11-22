@@ -107,6 +107,26 @@ fi
 # NUL separates fields so labels and command input keep their original bytes.
 printf '%s\0' "$command" "$claimed" "$input" "$#" "$@" >> "$state/events"
 
+keepalive=0
+if (( ${@[(Ie)ConnectTimeout=7]} && ${@[(Ie)ServerAliveInterval=15]} && ${@[(Ie)ServerAliveCountMax=3]} )); then
+    keepalive=1
+fi
+case "$MAC_RUN_STALL:$command:$remote" in
+    probe:ssh:true|head:ssh:*'rev-parse HEAD'|stop:ssh:*' stop-checkout '*)
+        sleep 0.85 ;;
+    bundle:scp:*|clone:ssh:*'copies.py clone '*|cleanup:ssh:*'scratch.py end '*)
+        if (( keepalive )); then
+            sleep 0.1
+            exit 255
+        fi
+        sleep 0.85 ;;
+esac
+case "$MAC_RUN_SLOW:$command:$remote" in
+    1:ssh:*'copies.py clone '*|1:ssh:*'scratch.py end '*)
+        (( keepalive )) || exit 90
+        sleep 0.85 ;;
+esac
+
 case $command in
     systemd-run|scp|curl) exit 0 ;;
     git)
@@ -715,6 +735,30 @@ class MacRunTests(unittest.TestCase):
         )
         self.assert_claim_released()
 
+    def test_stalled_lifecycle_connections_fail_the_run(self) -> None:
+        _ = write_config_fixture(self.config_path, "connect_timeout_s=7\nprobe_timeout_s=0.25\n")
+        _ = write_config_fixture(self.config_path.parent / "mac_gate.conf", "terminate_grace_seconds=0.25\n")
+        for stage, status in (("probe", 3), ("clone", 4), ("head", 4), ("bundle", 4), ("stop", 4), ("cleanup", 4)):
+            with self.subTest(stage=stage):
+                (self.stub_state / "events").unlink(missing_ok=True)
+                result = self.mac_run(extra={"MAC_RUN_STALL": stage}, timeout=TEST_HANG_GUARD_SECS)
+                self.assertEqual(result.returncode, status, result.stdout + result.stderr)
+                remote = [event for event in self.events() if event["command"] in ("ssh", "scp")]
+                self.assertTrue(remote)
+                for event in remote:
+                    self.assertIn("ConnectTimeout=7", event["args"])
+                    self.assertIn("ServerAliveInterval=15", event["args"])
+                    self.assertIn("ServerAliveCountMax=3", event["args"])
+
+    def test_slow_clone_and_folder_removal_finish(self) -> None:
+        _ = write_config_fixture(self.config_path, "connect_timeout_s=7\nprobe_timeout_s=0.25\n")
+        result = self.mac_run(extra={"MAC_RUN_SLOW": "1"}, timeout=TEST_HANG_GUARD_SECS)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        remote = [event["args"][-1] for event in self.events() if event["command"] == "ssh"]
+        self.assertTrue(any("copies.py clone " in command for command in remote), remote)
+        self.assertTrue(any("scratch.py end " in command for command in remote), remote)
+        self.assert_claim_released()
+
     def test_claim_names_the_repository_so_another_repository_runs_beside_it(self) -> None:
         (self.repository / ".git").mkdir()
         other = self.root / "other"
@@ -804,7 +848,7 @@ class MacRunTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         copy = next(event for event in self.events() if event["command"] == "scp")
         self.assertTrue(
-            Path(copy["args"][1]).is_relative_to(self.temp_directory), copy
+            Path(copy["args"][-2]).is_relative_to(self.temp_directory), copy
         )
 
     def test_early_failure_releases_claim(self) -> None:
