@@ -1573,14 +1573,16 @@ def _nearby_resume_names(reference: str, names: LaunchNames) -> list[str]:
 
 def resume(session: str, *, why: str = "resumed by name", to: str | None = None, requester: str = "",
            client: herdr.Herdr | herdr.LaunchClientSource = herdr.LaunchClientSource.NEW) -> ResumeResult:
-    try:
-        settings = conf.read("shutdown")
-        for key in ("START_SECONDS", "STAY_SECONDS"):
-            _ = settings.number(key)
-    except conf.Unusable as error:
-        return ResumeFailed(session, str(error))
-    with staff.row_operation(session):
-        return _resume(session, why=why, to=to, requester=requester, client=client)
+    with ExitStack() as locks:
+        try:
+            locks.enter_context(herdr.reboot_lock())
+            settings = conf.read("shutdown")
+            for key in ("START_SECONDS", "STAY_SECONDS"):
+                _ = settings.number(key)
+        except (conf.Unusable, herdr.RebootLockBusy) as error:
+            return ResumeFailed(session, str(error))
+        with staff.row_operation(session):
+            return _resume(session, why=why, to=to, requester=requester, client=client)
 
 
 @dataclass(frozen=True)
@@ -1850,8 +1852,11 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
             if isinstance(result, ClaudeUp):
                 return replace(result, elapsed_seconds=monotonic() - began, start_state=ClaudeStartState.STARTED)
             return ResumeFailed(identity, "session did not start") if isinstance(result, sessions.SessionNotLive) else result
+        from scripts.worktree import worktrees
+
         entry = entry.copy()
         entry["session_id"] = identity
+        entry["cwd"] = str(worktrees.moved_launch_folder(Path(entry["cwd"])))
         entry["environment"] = names.environment(entry)
 
         source = pane_launch.config_home(entry, record=names.tab_record)

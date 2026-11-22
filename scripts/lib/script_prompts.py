@@ -1,6 +1,6 @@
-"""Keep slash-command evidence until the prompt hook consumes its hash.
+"""Keep script prompt evidence until the prompt hook consumes its hash.
 
-Each submission has one record without time expiry.
+Each recorded submission has one record without time expiry.
 The configured count limit removes the oldest evidence and records its cause.
 """
 from __future__ import annotations
@@ -19,6 +19,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from scripts.agents import worker_lifecycle
 from scripts.lib import conf
+from scripts.lib.script_envelope import SCRIPT_ENVELOPE_START
+
+_KEY_MARKS = "keys"
 
 
 def root() -> Path:
@@ -29,6 +32,26 @@ def root() -> Path:
 def _path(pane: str, text: str) -> Path:
     words = " ".join(text.split())
     return root() / hashlib.sha256(f"{pane}\0{words}".encode()).hexdigest()
+
+
+def _key_mark_path(pane: str) -> Path:
+    return root() / _KEY_MARKS / hashlib.sha256(pane.encode()).hexdigest()
+
+
+def mark_keys(pane: str) -> None:
+    """Save the time of printable key input for the pane."""
+    path = _key_mark_path(pane)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.touch(mode=0o600)
+
+
+def keys_since(pane: str, since: datetime) -> bool:
+    """Check for printable key input at or after the given time."""
+    try:
+        modified = _key_mark_path(pane).stat().st_mtime
+    except FileNotFoundError:
+        return False
+    return datetime.fromtimestamp(modified, timezone.utc) >= since
 
 
 @contextmanager
@@ -71,11 +94,17 @@ def _evict(path: Path) -> None:
     path.unlink(missing_ok=True)
 
 
+def needs_record(text: str) -> bool:
+    text = text.lstrip()
+    return bool(text) and not text.startswith(SCRIPT_ENVELOPE_START)
+
+
 def record(pane: str, text: str) -> None:
-    if text.lstrip().startswith("/"):
-        prepared = prepare_record(pane, text, deadline=math.inf)
-        prepared.publish()
-        prepared.trim()
+    if not needs_record(text):
+        return
+    prepared = prepare_record(pane, text, deadline=math.inf)
+    prepared.publish()
+    prepared.trim()
 
 
 @dataclass(frozen=True)
@@ -91,7 +120,7 @@ class PreparedRecord:
 
     def trim(self) -> None:
         with locked(self.deadline):
-            records = _oldest_first([item for item in root().iterdir() if item.name != ".lock"])
+            records = _oldest_first([item for item in root().iterdir() if item.name not in (".lock", _KEY_MARKS)])
             for old in records[:max(0, len(records) - self.limit)]:
                 self._check_deadline()
                 _evict(old)
@@ -104,7 +133,7 @@ class PreparedRecord:
 def prepare_record(pane: str, text: str, *, deadline: float) -> PreparedRecord:
     """Prepare the record without writing it or evicting another record."""
     path = _path(pane, text)
-    limit = conf.read("script_prompts").whole("max_records")
+    limit = conf.read_or_repository("script_prompts").whole("max_records")
     return PreparedRecord(path.with_name(path.name + "." + uuid.uuid4().hex), limit, deadline)
 
 
