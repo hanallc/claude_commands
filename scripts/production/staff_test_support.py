@@ -85,6 +85,7 @@ FIXTURE_GIT: str = shutil.which("git") or "git"
 CHECKOUT = Path(__file__).resolve().parents[2]
 STAFF_SCRIPT = Path(__file__).with_name("staff.py")
 SOURCES_SCRIPT = Path(__file__).with_name("staff_sources.py")
+STAFF_OWNER_PARENT_CHECK_SECONDS = 1.0
 FixtureMachine = Literal["natedev", "mac"]
 UNFILLED_WORKTREE = staff.WorktreeUnfilled()
 UNFILLED_DOC = staff.DocUnfilled()
@@ -738,49 +739,76 @@ import sys
 from contextlib import suppress
 from pathlib import Path
 
+parent_pid = int(sys.argv[1])
+if os.getppid() != parent_pid:
+    raise SystemExit
 with open(Path(os.environ['STAFF_TEST_CHECKOUT']) / "scripts/lib/package_root.py") as package_root:
     exec(package_root.read(), {"__file__": package_root.name})
-from scripts.production.staff_test_support import run_staff_owner_request
+from scripts.production.staff_test_support import STAFF_OWNER_PARENT_CHECK_SECONDS, run_staff_owner_request
 from scripts.production import staff_sources
 
+def fork_request(listener, connection, notices, wake):
+    pid = os.fork()
+    if pid:
+        return pid
+    try:
+        signal.set_wakeup_fd(-1)
+        signal.signal(signal.SIGCHLD, signal.SIG_DFL)
+        notices.close()
+        wake.close()
+        listener.close()
+        sys.stdin.close()
+        connection.setblocking(True)
+        with connection.makefile('rb') as channel:
+            line = channel.readline()
+        if line:
+            run_staff_owner_request(connection, json.loads(line))
+    finally:
+        connection.close()
+        os._exit(0)
+
 children = set()
-try:
-    with socket.socket() as listener:
-        listener.bind(('127.0.0.1', 0))
-        listener.listen()
-        listener.setblocking(False)
-        print(listener.getsockname()[1], flush=True)
-        while True:
-            ready, _, _ = select.select([sys.stdin, listener], [], [])
-            # The test never writes to the pipe. Readiness means end of file.
-            if sys.stdin in ready:
-                break
-            try:
-                connection, _ = listener.accept()
-            except BlockingIOError:
-                continue
-            with connection:
+notices, wake = socket.socketpair()
+closing = False
+with notices, wake:
+    # Wake select when a request exits, including during a normal close.
+    wake.setblocking(False)
+    signal.signal(signal.SIGCHLD, lambda *_: None)
+    signal.set_wakeup_fd(wake.fileno(), warn_on_full_buffer=False)
+    try:
+        with socket.socket() as listener:
+            listener.bind(('127.0.0.1', 0))
+            listener.listen()
+            listener.setblocking(False)
+            print(listener.getsockname()[1], flush=True)
+            while os.getppid() == parent_pid:
                 children = {pid for pid in children if os.waitpid(pid, os.WNOHANG)[0] == 0}
-                pid = os.fork()
-                if pid == 0:
-                    try:
-                        listener.close()
-                        sys.stdin.close()
-                        connection.setblocking(True)
-                        with connection.makefile('rb') as channel:
-                            line = channel.readline()
-                        if line:
-                            run_staff_owner_request(connection, json.loads(line))
-                    finally:
-                        connection.close()
-                        os._exit(0)
-                children.add(pid)
-finally:
-    for pid in children:
-        with suppress(ProcessLookupError):
-            os.kill(pid, signal.SIGKILL)
-    for pid in children:
-        os.waitpid(pid, 0)
+                if closing and not children:
+                    break
+                readers = [notices] if closing else [sys.stdin, listener, notices]
+                ready, _, _ = select.select(readers, [], [], STAFF_OWNER_PARENT_CHECK_SECONDS)
+                if notices in ready:
+                    notices.recv(4096)
+                # The test never writes to the pipe. Readiness means end of file.
+                if sys.stdin in ready:
+                    listener.close()
+                    closing = True
+                    continue
+                if listener not in ready or os.getppid() != parent_pid:
+                    continue
+                try:
+                    connection, _ = listener.accept()
+                except BlockingIOError:
+                    continue
+                with connection:
+                    children.add(fork_request(listener, connection, notices, wake))
+    finally:
+        signal.set_wakeup_fd(-1)
+        for pid in children:
+            with suppress(ProcessLookupError):
+                os.kill(pid, signal.SIGKILL)
+        for pid in children:
+            os.waitpid(pid, 0)
 '''
 
 
@@ -798,7 +826,7 @@ class SharedStaffOwner:
         write_text_atomic(script, STAFF_OWNER_SERVER)
         errors = self.lifetime.enter_context((self.root / "fake-staff-owner.log").open("w"))
         process = self.lifetime.enter_context(start_staff_owner(
-            [sys.executable, str(script)], cwd=self.root,
+            [sys.executable, str(script), str(os.getpid())], cwd=self.root,
             env={**os.environ, "TMPDIR": str(self.root)},
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=errors, text=True,
             start_new_session=True,

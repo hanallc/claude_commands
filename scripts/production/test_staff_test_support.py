@@ -23,44 +23,69 @@ from scripts.lint.memory_test_support import config_environment
 CHECKOUT = Path(__file__).resolve().parents[2]
 OWNER_EXIT_SECONDS = 5
 OWNER_START_SECONDS = 20
+OWNER_CLOSE_OBSERVE_SECONDS = 1
 OWNER_PARENT = '''
+import os
+import subprocess
 import sys
 from pathlib import Path
+from unittest.mock import patch
 from scripts.production.staff_test_support import SharedStaffOwner
+
+wait_for_owner = subprocess.Popen.wait
+
+def report_close(process, *args, **kwargs):
+    if kwargs.get("timeout") is not None:
+        print("pipe closed", flush=True)
+    return wait_for_owner(process, *args, **kwargs)
 
 owner = SharedStaffOwner(Path(sys.argv[1]))
 try:
-    print(owner.port, owner.pid, flush=True)
+    port = owner.port
+    keeper_pid = 0
+    if sys.argv[2] == "1":
+        keeper_pid = os.fork()
+        if keeper_pid == 0:
+            os.close(sys.stdout.fileno())
+            try:
+                sys.stdin.read()
+            finally:
+                os._exit(0)
+    print(port, owner.pid, keeper_pid, flush=True)
     sys.stdin.read()
 finally:
-    owner.close()
+    with patch.object(subprocess.Popen, "wait", report_close):
+        owner.close()
 '''
 BLOCKED_REQUEST = '''
 import os
+from pathlib import Path
 import socket
 import sys
 
 with socket.create_connection(("127.0.0.1", int(sys.argv[1]))) as connection:
     connection.sendall(f"{os.getpid()}\\n".encode())
-    connection.recv(1)
+    if connection.recv(1) == b"w":
+        Path(sys.argv[2]).write_text("accepted request\\n")
+        print("fixture request")
 '''
 
 
 @contextmanager
-def watch_exit(pid: int) -> Generator[Callable[[], bool]]:
+def watch_exit(pid: int) -> Generator[Callable[[float], bool]]:
     """Watch the process before sending a signal."""
     if sys.platform == "darwin":
         queue = select.kqueue()
         try:
             _ = queue.control([select.kevent(pid, select.KQ_FILTER_PROC,
                                select.KQ_EV_ADD | select.KQ_EV_ONESHOT, select.KQ_NOTE_EXIT)], 0)
-            yield lambda: bool(queue.control(None, 1, OWNER_EXIT_SECONDS))
+            yield lambda timeout: bool(queue.control(None, 1, timeout))
         finally:
             queue.close()
         return
     descriptor = os.pidfd_open(pid)
     try:
-        yield lambda: bool(select.select([descriptor], [], [], OWNER_EXIT_SECONDS)[0])
+        yield lambda timeout: bool(select.select([descriptor], [], [], timeout)[0])
     finally:
         os.close(descriptor)
 
@@ -85,18 +110,22 @@ class SharedStaffOwnerTests(unittest.TestCase):
             "TMPDIR": str(self.root),
         }
 
+    def parent_line(self, parent: subprocess.Popen[str]) -> str:
+        output = cast(TextIO, parent.stdout)
+        self.assertTrue(select.select([output], [], [], OWNER_START_SECONDS)[0],
+                        "The parent did not report its state")
+        return output.readline().strip()
+
     @contextmanager
-    def owner(self) -> Generator[tuple[subprocess.Popen[str], int, int]]:
-        with subprocess.Popen([sys.executable, "-c", OWNER_PARENT, str(self.root)], cwd=CHECKOUT,
-                              env=self.environment, stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True) as parent:
-            output = cast(TextIO, parent.stdout)
+    def owner(self, *, fork_writer: bool = False) -> Generator[tuple[subprocess.Popen[str], int, int, int]]:
+        command = [sys.executable, "-c", OWNER_PARENT, str(self.root), str(int(fork_writer))]
+        with subprocess.Popen(command, cwd=CHECKOUT, env=self.environment, stdin=subprocess.PIPE,
+                              stdout=subprocess.PIPE, text=True) as parent:
             owner_pid = None
             try:
-                self.assertTrue(select.select([output], [], [], OWNER_START_SECONDS)[0],
-                                "The parent did not report the owner port and pid")
-                port, owner_pid = map(int, output.readline().split())
+                port, owner_pid, keeper_pid = map(int, self.parent_line(parent).split())
                 self.assertGreater(owner_pid, 1)
-                yield parent, port, owner_pid
+                yield parent, port, owner_pid, keeper_pid
             except BaseException:
                 if owner_pid is not None and owner_pid > 1:
                     with suppress(ProcessLookupError):
@@ -114,36 +143,67 @@ class SharedStaffOwnerTests(unittest.TestCase):
             connection.sendall(json.dumps(payload).encode() + b"\n")
             yield connection
 
-    def test_killed_parent_stops_owner_and_active_request(self) -> None:
+    @contextmanager
+    def blocked_request(self, port: int) -> Generator[tuple[socket.socket, socket.socket, int, Path]]:
         script = self.root / "blocked-request.py"
         _ = script.write_text(BLOCKED_REQUEST)
-        with self.owner() as (parent, port, owner_pid), socket.socket() as listener:
+        written = self.root / "accepted.txt"
+        with socket.socket() as listener:
             listener.bind(("127.0.0.1", 0))
             listener.listen()
             listener.settimeout(OWNER_START_SECONDS)
             notice_port = cast(tuple[str, int], listener.getsockname())[1]
-            with self.request(port, script, str(notice_port)):
+            with self.request(port, script, str(notice_port), str(written)) as connection:
                 peer = listener.accept()[0]
                 with peer, peer.makefile("rb") as channel:
                     peer.settimeout(OWNER_START_SECONDS)
-                    request_pid = int(channel.readline())
-                    with watch_exit(owner_pid) as owner_exited, watch_exit(request_pid) as request_exited:
-                        parent.kill()
-                        _ = parent.communicate(timeout=OWNER_EXIT_SECONDS)
-                        self.assertEqual(parent.returncode, -signal.SIGKILL)
-                        self.assertTrue(owner_exited(), "The staff owner survived its parent")
-                        self.assertTrue(request_exited(), "The request survived the staff owner")
+                    yield connection, peer, int(channel.readline()), written
+
+    def test_killed_parent_stops_owner_and_active_request(self) -> None:
+        with self.owner() as (parent, port, owner_pid, _), self.blocked_request(port) as (_, _, request_pid, _):
+            with watch_exit(owner_pid) as owner_exited, watch_exit(request_pid) as request_exited:
+                parent.kill()
+                self.assertEqual(parent.wait(timeout=OWNER_EXIT_SECONDS), -signal.SIGKILL)
+                self.assertTrue(owner_exited(OWNER_EXIT_SECONDS), "The staff owner survived its parent")
+                self.assertTrue(request_exited(OWNER_EXIT_SECONDS), "The request survived the staff owner")
+
+    def test_killed_parent_stops_owner_with_inherited_writer(self) -> None:
+        with self.owner(fork_writer=True) as (parent, _, owner_pid, keeper_pid):
+            self.assertGreater(keeper_pid, 1)
+            with watch_exit(owner_pid) as owner_exited, watch_exit(keeper_pid) as keeper_exited:
+                parent.kill()
+                self.assertEqual(parent.wait(timeout=OWNER_EXIT_SECONDS), -signal.SIGKILL)
+                self.assertTrue(owner_exited(OWNER_EXIT_SECONDS), "The inherited writer kept the staff owner alive")
+                self.assertFalse(keeper_exited(0), "The forked child did not keep the pipe open")
+                cast(TextIO, parent.stdin).close()
+                self.assertTrue(keeper_exited(OWNER_EXIT_SECONDS), "The forked child survived fixture cleanup")
+
+    def test_close_lets_an_accepted_request_finish(self) -> None:
+        with self.owner() as (parent, port, owner_pid, _):
+            with self.blocked_request(port) as (connection, peer, request_pid, written):
+                with watch_exit(owner_pid) as owner_exited, watch_exit(request_pid) as request_exited:
+                    cast(TextIO, parent.stdin).close()
+                    self.assertEqual(self.parent_line(parent), "pipe closed")
+                    self.assertFalse(request_exited(OWNER_CLOSE_OBSERVE_SECONDS),
+                                     "Close ended the accepted request")
+                    peer.sendall(b"w")
+                    with connection.makefile("rb") as channel:
+                        result = cast(dict[str, object], json.loads(channel.readline()))
+                    self.assertEqual(result["status"], 0, result)
+                    self.assertEqual(written.read_text(), "accepted request\n")
+                    self.assertEqual(parent.wait(timeout=OWNER_EXIT_SECONDS), 0)
+                    self.assertTrue(owner_exited(OWNER_EXIT_SECONDS), "The staff owner survived close()")
 
     def test_close_stops_owner_after_a_request(self) -> None:
         script = self.root / "echo-request.py"
         _ = script.write_text('print("fixture request")\n')
-        with self.owner() as (parent, port, owner_pid), watch_exit(owner_pid) as owner_exited:
+        with self.owner() as (parent, port, owner_pid, _), watch_exit(owner_pid) as owner_exited:
             with self.request(port, script) as connection, connection.makefile("rb") as channel:
                 result = cast(dict[str, object], json.loads(channel.readline()))
                 self.assertEqual(result, {"status": 0, "stdout": "fixture request\n", "stderr": ""})
             _ = parent.communicate(timeout=OWNER_EXIT_SECONDS)
             self.assertEqual(parent.returncode, 0)
-            self.assertTrue(owner_exited(), "The staff owner survived close()")
+            self.assertTrue(owner_exited(OWNER_EXIT_SECONDS), "The staff owner survived close()")
 
 
 PREPARE = '''
