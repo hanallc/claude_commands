@@ -1,4 +1,4 @@
-# Hook dispatch: one Python process per hook event
+# Hook dispatch with forked children
 
 **Status:** as-built (build-followups-efficiency phase 4, 2026-10-28).
 
@@ -9,11 +9,10 @@ change, a Bash call started 6 Python interpreters for PreToolUse and 2 for
 PostToolUse, and a Stop started 4. Each interpreter pays its start-up and
 import cost again.
 
-`scripts/hooks/hook_dispatch.py <event>` runs the listed Python hooks of one event
-in one interpreter. The events are `pre_tool_use`, `post_tool_use` and `stop`.
-It reads stdin once, then runs each hook file in table order. The decisions,
-the text to Claude and the user, and the exit codes stay the same as with
-separate hooks.
+`scripts/hooks/hook_dispatch.py <event>` starts one Python interpreter for the event.
+The events are `pre_tool_use`, `post_tool_use` and `stop`.
+The dispatcher reads stdin once and forks one child per matching hook in table order.
+The decisions, the text to Claude and the user, and the exit codes stay the same.
 
 ## The tables
 
@@ -26,7 +25,7 @@ the whole compound command, so the deny comes before the user gets a prompt.
 | Event | Hooks, in order | Matcher |
 | --- | --- | --- |
 | `pre_tool_use` | heredoc-guard, tool-output-read, showrunner-move-guard, change-review-gate, checkpoint-doc-gate, push-alone (10 s) | `Bash` |
-| | scratch-guard (10 s) | `Bash\|Write\|NotebookEdit` |
+| | copy and scratch policy (`scripts/copies/copy_guard.py`, `guard_timeout_seconds` in `config/copies.conf`) | `Bash\|Write\|NotebookEdit` |
 | `post_tool_use` | basedpyright, fn-length | `Edit\|MultiEdit\|Write` |
 | | context-usage (message off in `config/context_usage.conf`) | all tools |
 | | push-delivered | `PushNotification` |
@@ -79,17 +78,23 @@ that turns it on again.
 
 ## How a hook runs
 
-- Each hook file is loaded as a fresh `__main__` module from its path, through
-  importlib's bytecode cache. Its streams (with `stdin.buffer`), file
-  descriptors, argv, environment, cwd, import path and signal handlers are
-  isolated. `SystemExit` maps to the hook's exit code.
-- A hook file still runs as a script, so its tests and any caller that runs it
-  by path keep working.
-- A crash, exception or timeout in one hook never stops the hooks after it.
-  A timed-out hook gives no decision and no output, the same as a timed-out
-  hook process.
-- A hook's own `SIGALRM` budget is multiplexed with its outer deadline.
-- Library modules stay imported between hooks. That is the start-up saving.
+- The copy policy child calls the entry point from the module that supplies its budget.
+  Each other child loads its hook as a fresh `__main__` module through importlib's bytecode cache.
+  The child has its own input, output, argv, environment, working directory, import path and signal state.
+- The child reports its exit code, stdout and stderr to the dispatcher through a pipe.
+  `SystemExit` supplies the exit code. Hook files can still run directly as scripts.
+- The dispatcher enforces each deadline. It kills and reaps a child that exceeds its budget.
+  The dispatcher discards that child's output and continues with the next hook.
+- The dispatcher uses no signal handler. Each hook runs with its own signal state.
+- A separate worker has 10 seconds to preload the shared libraries and report readiness.
+  If the worker misses the deadline, the dispatcher kills and reaps it. The dispatcher then runs the hooks without shared imports.
+  The preload worker waits for approval before it starts a hook.
+  The worker checks its connection before each hook. If the dispatcher exits, the worker stops scheduling hooks.
+- The copy policy child has a separate 10-second deadline to read its configured budget.
+  The dispatcher applies the hook's usual output rules to diagnostics from this read.
+- The preload worker pauses garbage collection during shared imports and restores the previous setting.
+  The process that forks hooks freezes its objects to reduce page copying during child garbage collection.
+  Imports made in one hook child end with that child.
 
 ## How the results combine
 
@@ -147,7 +152,7 @@ The next turn clears a marker when compaction fails or the user cancels it.
 Claude reads the registration from `settings.json` after deployment.
 Install and trust the Codex handler separately for each account home through `CODEX_HOME`.
 
-## Bench
+## Original dispatcher benchmark
 
 Child CPU per hook event, measured by `bench_hooks.py`: 20 runs per side,
 `settings.json` before and after, the same payloads and transcript.
