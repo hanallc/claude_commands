@@ -693,10 +693,7 @@ def run_is_kept(run: RunRecord) -> TypeGuard[RemoteJobClaim]:
 
 def recoverable_kept_claim(run: RunRecord) -> TypeGuard[RemoteJobClaim]:
     """Require proof that the saved owner of the remote claim ended."""
-    if "remote_host" not in run or "replaced_reservation" in run:
-        return False
-    owner = process_identity.process_start(run["pid"])
-    return not isinstance(owner, process_identity.Unreadable) and owner != process_identity.Started(run["proc_start"])
+    return "remote_host" in run and "replaced_reservation" not in run and claim_state.claim_owner_ended(run)
 
 
 def run_holds_work(run: RunRecord) -> bool:
@@ -2144,7 +2141,7 @@ def claim_once(args: CliArguments, paths: StatePaths, scope: ClaimScope,
     if isinstance(replaces, _VerifiedMacReservation):
         assert "remote_host" in claimed
         try:
-            _ = claim_state.retire_replaced_reservation(paths, path, claimed)
+            _ = claim_state.retire_replaced_reservation(paths, path, claimed, allow_retry=True)
         except claim_state.ReservationRetirementError as error:
             try:
                 path.unlink(missing_ok=True)
@@ -2189,19 +2186,25 @@ def replace_incomplete_wait_claim(
     """Acquire a Mac claim under the execution lease."""
     if not isinstance(repository, claim_state.MacRepositoryIdentity):
         return ClaimDenied(12, "the replacement Mac claim needs a repository and history key")
+    identity = claim_state.ClaimIdentity(args.claim_id, args.episode, args.attempt)
+    proof = claim_state.retired_mac_reservation_path(paths, identity)
     if isinstance(assignment, UnassignedClaim):
         scope = RepositoryScope(repository.mirror_name, repository.key)
     elif not isinstance(scope, RepositoryScope) or scope.key != repository.key:
         if isinstance(replaces, _VerifiedMacReservation):
             replaces.path.unlink()
+        proof.unlink(missing_ok=True)
         return ClaimFinished(claim_state.LEGACY_WAIT_CLAIM_RELEASED, ("legacy reservation released",))
     replacement = copy(args)
     replacement.claim_id, replacement.episode, replacement.attempt = "", args.retire_wait, ""
     if not isinstance(assignment, UnassignedClaim):
         replacement.episode, replacement.attempt = assignment.episode, assignment.attempt
         replacement.claim_id = execution_identity.assigned_claim_id(assignment.episode, assignment.attempt)
-    return claim_once(replacement, paths, scope, session=session, assignment=assignment,
-                      mac_repository=repository, replaces=replaces)
+    result = claim_once(replacement, paths, scope, session=session, assignment=assignment,
+                        mac_repository=repository, replaces=replaces)
+    if isinstance(result, ClaimFinished):
+        proof.unlink(missing_ok=True)
+    return result
 
 
 def adopt_wait_claim(args: CliArguments, paths: StatePaths, scope: ClaimScope,
@@ -2217,13 +2220,34 @@ def adopt_wait_claim(args: CliArguments, paths: StatePaths, scope: ClaimScope,
         return refuse_wait_claim(WaitClaimCheck.REMOTE_MISSING)
     owners, _ = claim_state.sweep_mac_replacements(paths, read_claims(paths))
     identity = claim_state.ClaimIdentity(args.claim_id, args.episode, args.attempt)
+    worktree = claim_worktree_path(args.worktree)
     if (paths.platform == "macos" and args.retire_wait
             and not any(claim_state.claim_identity(claim.record) == identity for claim in owners)):
-        return replace_incomplete_wait_claim(args, paths, scope, assignment, session, mac_repository,
-                                             _KEEP_OTHER_RESERVATIONS)
+        try:
+            retired = claim_state.read_retired_mac_reservation(paths, identity)
+        except StateReadError as error:
+            return ClaimDenied(12, str(error), to_stderr=True)
+        if not isinstance(retired, NoRun):
+            if retired["pid"] != args.from_pid:
+                return refuse_wait_claim(WaitClaimCheck.PID)
+            if retired["submitting_session"] != claim_state.session_id(session):
+                return refuse_wait_claim(WaitClaimCheck.SESSION)
+            if process_identity.process_start(args.from_pid) != process_identity.Started(retired["proc_start"]):
+                return refuse_wait_claim(WaitClaimCheck.OWNER_START)
+            if not recorded_worktree_matches(retired["worktree"], worktree):
+                return refuse_wait_claim(WaitClaimCheck.WORKTREE)
+            return replace_incomplete_wait_claim(args, paths, scope, assignment, session, mac_repository,
+                                                 _KEEP_OTHER_RESERVATIONS)
     if not owners:
         return refuse_wait_claim(WaitClaimCheck.NO_RESERVATION)
-    worktree = claim_worktree_path(args.worktree)
+    if paths.platform == "macos" and not args.retire_wait:
+        for claim in owners:
+            kept = claim.record
+            if (claim_state.claim_identity(kept) == identity and recoverable_kept_claim(kept)
+                    and kept["submitting_session"] == claim_state.session_id(session)
+                    and recorded_worktree_matches(kept["worktree"], worktree)
+                    and (isinstance(scope, WholeMacScope) or claim.matches_mac_assignment_scope(scope))):
+                return take_over_kept_claim(args, claim, kept, session=session)
     checks: tuple[tuple[WaitClaimCheck, Callable[[HeldClaim], bool]], ...] = (
         (WaitClaimCheck.IDENTITY, lambda claim: claim_state.claim_identity(claim.record) == identity),
         (WaitClaimCheck.SCOPE, lambda claim: wait_claim_matches(paths, claim, scope, worktree)
@@ -2447,6 +2471,13 @@ def release_exact_claims(
     from scripts.mac_test import eligibility, offload
 
     with nullcontext() if provider_lock_held else locked(paths.lock):
+        if paths.platform == "macos":
+            try:
+                reservation = claim_state.read_retired_mac_reservation(paths, identity)
+                if not isinstance(reservation, NoRun) and reservation["pid"] == pid:
+                    claim_state.retired_mac_reservation_path(paths, identity).unlink()
+            except (StateReadError, OSError) as error:
+                return ClaimReleaseRefused(str(error))
         # Each file is read alone, so another repository's damaged record
         # cannot keep this owner's claim in place.
         owned: list[tuple[Path, RunRecord]] = []

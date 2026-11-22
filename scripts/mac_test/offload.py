@@ -3382,16 +3382,13 @@ def run_offload(
                 return declined("state", started)
             held = next((claim for claim in claims
                 if claim_state.claim_identity(claim.record) == admission.identity
-                and "replaced_reservation" not in claim.record
-                and ("remote_host" not in claim.record
-                     or (claim.record.get("cleanup_pending") and claim.record["pid"] == admission.owner_pid
-                         and process_identity.process_start(admission.owner_pid)
-                         == process_identity.Started(claim.record["proc_start"])))), None)
+                and ("replaced_reservation" not in claim.record
+                     or claim_state.claim_uses_legacy_fence(claim.record))), None)
             if held is None:
-                request = replace(request, admission=UnclaimedMacRun())
+                retire_wait = True
             else:
                 saved = claim_state.saved_mac_repository(held.record)
-                if isinstance(saved, claim_state.MacRepositoryIdentity) and not held.record.get("cleanup_pending"):
+                if isinstance(saved, claim_state.MacRepositoryIdentity) and "remote_host" not in held.record:
                     policy_repository = saved
                     controller.attempt_evidence.repository_key = saved.history_key
                 elif "remote_host" not in held.record:

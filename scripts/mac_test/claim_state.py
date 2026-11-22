@@ -480,6 +480,11 @@ def claim_fence_scope_key(path: Path, record: RunRecord) -> str:
     return saved.fence_scope_key() if isinstance(saved, MacMirrorIdentity) else path.stem
 
 
+def claim_uses_legacy_fence(record: RunRecord) -> bool:
+    saved = saved_mac_repository(record)
+    return not isinstance(saved, MacMirrorIdentity) or not saved.fence_generation
+
+
 @dataclass(frozen=True)
 class HeldClaim:
     """One claim record and the file that holds it."""
@@ -507,7 +512,26 @@ class ReservationRetirementError(OSError):
         self.path: Path = path
 
 
-def retire_replaced_reservation(paths: StatePaths, replacement: Path, record: RunRecord) -> tuple[Path, ...]:
+def retired_mac_reservation_path(paths: StatePaths, identity: ClaimIdentity) -> Path:
+    return paths.directory / "retired-reservations" / pending_start_key(identity)
+
+
+def read_retired_mac_reservation(paths: StatePaths, identity: ClaimIdentity) -> ProcessBoundClaim | NoRun:
+    """Read the exact local reservation that an interrupted replacement retired."""
+    record = read_run(retired_mac_reservation_path(paths, identity))
+    if isinstance(record, NoRun) or "remote_host" in record or claim_identity(record) != identity:
+        return NO_RUN
+    return record
+
+
+def claim_owner_ended(record: RunRecord) -> bool:
+    """Confirm that the saved process no longer owns the claim."""
+    owner = process_identity.process_start(record["pid"])
+    return not isinstance(owner, process_identity.Unreadable) and owner != process_identity.Started(record["proc_start"])
+
+
+def retire_replaced_reservation(paths: StatePaths, replacement: Path, record: RunRecord, *,
+                                allow_retry: bool = False) -> tuple[Path, ...]:
     """Remove the exact local reservation under the provider lock."""
     if (paths.platform != "macos" or "remote_host" not in record or "replaced_reservation" not in record
             or not isinstance(saved_mac_repository(record), MacRepositoryIdentity)):
@@ -522,6 +546,12 @@ def retire_replaced_reservation(paths: StatePaths, replacement: Path, record: Ru
             or replaced_reservation(old, path, paths) != replaced):
         return ()
     try:
+        if allow_retry:
+            proof = retired_mac_reservation_path(paths, claim_identity(old))
+            proof.parent.mkdir(parents=True, exist_ok=True)
+            # Keep the reservation identity if the writer stops before the replacement commits.
+            _ = old.pop("mac_repository", None)
+            write_text_atomic(proof, json.dumps(old) + "\n")
         path.unlink(missing_ok=True)
     except OSError as error:
         raise ReservationRetirementError(path, error) from error
@@ -541,22 +571,18 @@ def sweep_mac_replacements(paths: StatePaths, claims: tuple[HeldClaim, ...]) -> 
             current.append(claim)
             continue
         pending = claim_pending_start(paths, claim.path, record).exists()
-        legacy = "/" not in claim_fence_scope_key(claim.path, record)
-        if legacy and not pending:
-            # Older runners kept this marker after launch.
-            owner = process_identity.process_start(record["pid"])
-            if isinstance(owner, process_identity.Unreadable) or owner == process_identity.Started(record["proc_start"]):
-                current.append(claim)
-                continue
+        legacy = claim_uses_legacy_fence(record)
+        if legacy and not pending and not claim_owner_ended(record):
+            current.append(claim)
+            continue
         try:
-            retired.update(retire_replaced_reservation(paths, claim.path, record))
-            if pending:
-                if legacy:
-                    completed = record.copy()
-                    del completed["replaced_reservation"]
-                    write_text_atomic(claim.path, json.dumps(completed) + "\n")
-                    claim = HeldClaim(claim.scope, claim.path, completed)
-                current.append(claim)
+            retired.update(retire_replaced_reservation(paths, claim.path, record, allow_retry=not legacy and not pending))
+            if legacy or pending:
+                # Keep the claim for remote cleanup. Remote work can still run.
+                completed = record.copy()
+                del completed["replaced_reservation"]
+                write_text_atomic(claim.path, json.dumps(completed) + "\n")
+                current.append(HeldClaim(claim.scope, claim.path, completed))
                 continue
             claim.path.unlink(missing_ok=True)
             retired.add(claim.path)

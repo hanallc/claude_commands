@@ -723,6 +723,9 @@ sys.exit(71)
     def test_status_keeps_an_older_replacement_with_a_pending_start(self) -> None:
         self.exercise_interrupted_replacement(("legacy-pending",))
 
+    def test_status_keeps_an_older_replacement_after_the_start_settles(self) -> None:
+        self.exercise_interrupted_replacement(("legacy-launched",))
+
     def test_failed_retirement_keeps_the_reservation_and_allows_an_unrelated_claim(self) -> None:
         self.exercise_interrupted_replacement(("unlink-error",))
 
@@ -740,14 +743,14 @@ from scripts.mac_test import claim_state, mac_test
 checkpoint = sys.argv[1]
 old = Path(sys.argv[2])
 args = mac_test.parser().parse_args(sys.argv[3:], namespace=mac_test.CliArguments())
-if checkpoint == "committed":
+if checkpoint in ("committed", "legacy-launched"):
     args.pid = os.getpid()
 paths = mac_test.state_paths("mac")
 unlink = Path.unlink
 write_json = mac_test.write_json
 
 def interrupt_unlink(self, *args, **kwargs):
-    if checkpoint == "retire" and self == old:
+    if checkpoint in ("retire", "legacy-launched") and self == old:
         os._exit(71)
     return unlink(self, *args, **kwargs)
 
@@ -776,7 +779,7 @@ with patch.object(Path, "unlink", interrupt_unlink), patch.object(mac_test, "wri
         for recovery in recoveries:
             with self.subTest(recovery=recovery):
                 waiting = self.native_claim(self.checkout)
-                if recovery == "committed":
+                if recovery in ("committed", "legacy-launched"):
                     waiting.episode, waiting.attempt = "episode", "attempt"
                     waiting.claim_id = execution_identity.assigned_claim_id(waiting.episode, waiting.attempt)
                 reservation = saved if recovery == "unlink-error" else claim_state.WHOLE_MAC
@@ -802,7 +805,7 @@ with patch.object(Path, "unlink", interrupt_unlink), patch.object(mac_test, "wri
                     "verify", "", target="mac", placement=route,
                     admission=offload.MacClaimFromWait(waiting.pid, identity, NoOwningSession()))
                 command = offload.claim_arguments(request, config, retire_wait=True, mac_repository=saved)
-                checkpoint = "committed" if recovery == "committed" else "retire"
+                checkpoint = recovery if recovery in ("committed", "legacy-launched") else "retire"
                 child = subprocess.run([sys.executable, "-c", script, checkpoint, str(old_path), *command[2:]],
                                        capture_output=True, text=True, timeout=5)
                 if recovery == "committed":
@@ -822,8 +825,13 @@ with patch.object(Path, "unlink", interrupt_unlink), patch.object(mac_test, "wri
                 if recovery == "unlink-error":
                     self.check_unrelated_acquisition_after_failed_retirement(old_path)
                     continue
-                if recovery == "legacy-pending":
-                    self.check_legacy_pending_replacement(reserved, abandoned)
+                if recovery in ("legacy-pending", "legacy-launched"):
+                    pending = recovery == "legacy-pending"
+                    self.check_legacy_replacement(reserved, abandoned, pending=pending)
+                    if not pending:
+                        kept, = claim_state.read_claims(self.paths)
+                        self.assertTrue(mac_test.recoverable_kept_claim(kept.record))
+                        self.check_committed_replacement_retry(request, assignment, config, kept, script)
                     continue
                 if recovery == "status":
                     status_config = mac_test.MacTestConfig("", "", "", "", 1, 0, 1, 1, 1)
@@ -852,15 +860,22 @@ with patch.object(Path, "unlink", interrupt_unlink), patch.object(mac_test, "wri
                                           config: eligibility.OffloadConfig, completed: claim_state.HeldClaim,
                                           script: str) -> None:
         original_arguments = offload.claim_arguments
+        handoffs: list[bool] = []
 
         def private_claim(*args: object, **kwargs: object) -> list[str]:
             command = cast(Callable[..., list[str]], original_arguments)(*args, **kwargs)
-            self.assertNotIn("--from-pid", command)
+            handoffs.append("--from-pid" in command)
             return [sys.executable, "-c", script, "none", str(completed.path), *command[2:]]
+
+        def finish_cleanup(*_args: object) -> offload.LeftoversEnded:
+            retained, = claim_state.read_claims(self.paths)
+            self.assertEqual(retained.path, completed.path)
+            self.assertTrue(retained.record.get("cleanup_pending"))
+            return offload.LeftoversEnded()
 
         with (
             mock.patch.object(offload, "claim_arguments", side_effect=private_claim),
-            mock.patch.object(offload, "check_current_leftovers", return_value=offload.LeftoversEnded()) as cleanup,
+            mock.patch.object(offload, "check_current_leftovers", side_effect=finish_cleanup) as cleanup,
             mock.patch.object(offload, "claimed_run", return_value=offload.PassedOnMac(1)) as launched,
         ):
             result = offload.run_offload(offload.ProcessController(), config, request, time.monotonic())
@@ -868,18 +883,21 @@ with patch.object(Path, "unlink", interrupt_unlink), patch.object(mac_test, "wri
             self.assertFalse(completed.path.exists())
             cleanup.assert_called_once()
             launched.assert_not_called()
+            self.assertEqual(handoffs, [True])
             fresh = offload.AssignedOffloadRequest(replace(assignment, attempt="fresh-attempt"))
             result = offload.run_offload(offload.ProcessController(), config,
-                                         replace(request, placement=fresh), time.monotonic())
+                                         replace(request, placement=fresh, admission=offload.UnclaimedMacRun()),
+                                         time.monotonic())
             self.assertIsInstance(result, offload.PassedOnMac)
             launched.assert_called_once()
+            self.assertEqual(handoffs, [True, False])
         running, = claim_state.read_claims(self.paths)
         self.assertEqual(running.record["attempt"], "fresh-attempt")
         self.assertNotEqual(claim_state.claim_fence_scope_key(running.path, running.record),
                             claim_state.claim_fence_scope_key(completed.path, completed.record))
 
-    def check_legacy_pending_replacement(self, reserved: claim_state.HeldClaim,
-                                         replacement: claim_state.HeldClaim) -> None:
+    def check_legacy_replacement(self, reserved: claim_state.HeldClaim,
+                                 replacement: claim_state.HeldClaim, *, pending: bool) -> None:
         old = reserved.record
         record = dict(replacement.record)
         saved = claim_state.saved_mac_repository(replacement.record)
@@ -892,9 +910,11 @@ with patch.object(Path, "unlink", interrupt_unlink), patch.object(mac_test, "wri
         }
         mac_test.write_json(replacement.path, record)
         identity = claim_state.claim_identity(replacement.record)
-        pending = offload.pending_start_path(self.paths.target, identity, scope_key=scope)
-        pending.parent.mkdir()
-        _ = pending.write_text(offload.pending_start_key(identity))
+        marker = offload.pending_start_path(self.paths.target, identity, scope_key=scope)
+        marker.parent.mkdir()
+        _ = marker.write_text(offload.pending_start_key(identity))
+        if not pending:
+            marker.unlink()
         status_config = mac_test.MacTestConfig("", "", "", "", 1, 0, 1, 1, 1)
         self.assertEqual(mac_test.command_status(self.paths, status_config), 0)
         self.assertFalse(reserved.path.exists())
@@ -902,7 +922,7 @@ with patch.object(Path, "unlink", interrupt_unlink), patch.object(mac_test, "wri
         self.assertEqual(kept.path, replacement.path)
         self.assertNotIn("replaced_reservation", kept.record)
         self.assertEqual(claim_state.claim_identity(kept.record), identity)
-        self.assertTrue(pending.exists())
+        self.assertEqual(marker.exists(), pending)
 
     def check_replacement_retry(self, request: offload.OffloadRequest, config: eligibility.OffloadConfig,
                                 old_path: Path, abandoned: claim_state.HeldClaim, script: str, *,
@@ -957,6 +977,13 @@ with patch.object(Path, "unlink", interrupt_unlink), patch.object(mac_test, "wri
         args.pid = os.getpid()
         args.claim_id, args.episode, args.attempt = identity.claim_id, identity.episode, identity.attempt
         self.assertEqual(mac_test.command_release(args, self.paths), 0)
+        with mock.patch.object(offload, "claim_arguments", side_effect=private_claim), \
+                mock.patch.object(offload, "claimed_run") as launched_again:
+            refused = offload.run_offload(offload.ProcessController(), config, request, time.monotonic())
+        assert isinstance(refused, offload.WaitClaimAdoptionDeclined)
+        self.assertEqual(refused.diagnostic, "state: claim child exited 12: cannot adopt the Mac claim: no reservation")
+        self.assertEqual(claim_state.read_claims(self.paths), ())
+        launched_again.assert_not_called()
 
     def check_unrelated_acquisition_after_failed_retirement(self, old_path: Path) -> None:
         before = old_path.read_bytes()
