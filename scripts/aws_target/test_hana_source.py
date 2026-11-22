@@ -215,6 +215,20 @@ source_basis_max_commits=8
                         self.sender.acknowledge(leased.identity)
         self.assertFalse((self.root / 'outside').exists())
 
+    def test_sender_accepts_a_worktree_under_a_symlinked_workspace_root(self) -> None:
+        workspace = self.root / 'workspace-disk'
+        workspace.mkdir()
+        alias = self.root / 'workspace-link'
+        alias.symlink_to(workspace)
+        override_fixture_settings(self.pool_settings, f'roots.workspace={alias}\n')
+        checkout = build_folders.worktree_path('hana', 'aws', 'linked')
+        self.assertEqual(checkout, alias / 'hana/aws/linked')
+        _ = self.git('worktree', 'add', '--detach', str(checkout.resolve()), self.base)
+
+        manifest = self.prepare(checkout)
+
+        self.assertEqual(self.objects.uploads, [manifest.bundle_sha256])
+
     def test_sender_refuses_unmanaged_checkouts_before_capture_and_retry(self) -> None:
         manifest = self.prepare()
         linked = self.root / 'unmanaged-worktree'

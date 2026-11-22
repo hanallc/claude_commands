@@ -101,7 +101,7 @@ def managed_source_metadata(source: Path) -> Path:
                     and checkout.toplevel.is_relative_to(copy_record.worktree_root())):
                 parts = checkout.toplevel.relative_to(copy_record.worktree_root()).parts
                 if (len(parts) == 3 and parts[0] == hana_protocol.REPOSITORY
-                        and checkout.toplevel == build_folders.worktree_path(*parts).absolute()):
+                        and checkout.toplevel == build_folders.worktree_path(*parts).resolve()):
                     return common
     except (OSError, ValueError, copies.CopyError) as error:
         raise UnmanagedHanaCheckout('The Hana source requires a managed checkout and local Git metadata') from error

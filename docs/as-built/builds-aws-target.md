@@ -216,13 +216,16 @@ The NixOS image requires these integration changes.
 2. Use `scripts/aws_target/hana_render.files` as the renderer input filter.
 3. Install the rendered `runtime/` at `/var/lib/hana-runtime`.
 4. Append the approved capacity block below to the rendered `runtime/config/build_folders.conf`.
-5. Create `~/rust/hana/.git/hana-payload` with the runner's ownership after the data mount.
-6. Give the runner write access to `~/rust/hana` and the rendered build root, normally `~/build`.
-7. Remove the old slot, Cargo, mirror, shell, and temporary root settings and directory creation.
-8. Provide Python 3.13 or newer for the bootstrap.
-9. Remove `CONF_DIR` and `TMPDIR` from `runner-environment`.
+5. Create the directories below with runner ownership after the data mount.
+6. Remove the old slot, Cargo, mirror, shell, and temporary root settings and directory creation.
+7. Provide Python 3.13 or newer for the bootstrap.
+8. Remove `CONF_DIR` and `TMPDIR` from `runner-environment`.
+
+List `~/rust`, `~/rust/hana`, `~/rust/hana/.git`, `~/rust/hana/.git/hana-payload`, and `~/build` explicitly in the directory command.
 
 ```ini
+# whole: 1..
+slots.aws-hana.default_max=1
 # whole: 1..
 slots.aws-hana.hana.max=1
 # whole: 1..
@@ -566,7 +569,9 @@ It adds the digest to the rendered `safety.json`.
 Safety settings, receiver settings, the command timeout, and the slot probe settings affect the digest.
 The renderer selects overrides by the Hana alias in `hana_aws.conf` and writes plain keys.
 The renderer rejects invalid slot probe settings before it computes the digest.
-NixOS supplies the approved slot roots and capacity, compiler version, and runner environment.
+The renderer supplies `roots.build` and includes it in the digest.
+NixOS appends the approved capacity settings.
+NixOS supplies the compiler version and runner environment.
 Those NixOS settings take effect with a new image.
 
 An edit to a runtime-only file leaves the image digest unchanged.
