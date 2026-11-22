@@ -818,34 +818,27 @@ def next_sitecustomize(filename: str, search: list[str] | None = None) -> None:
     spec = PathFinder.find_spec("sitecustomize", remaining)
     if spec is not None and spec.loader is not None:
         module = module_from_spec(spec)
-        attributes = sys.modules["_devtools_checkout"].__dict__
+        attributes = _checkout_attributes(sys.modules["_devtools_checkout"])
         # Keep hook contexts active for the process lifetime.
         hooks = _retained_startup_hooks(attributes)
         # Selection removed startup directories from sys.path, so a following startup hook continues from this search.
-        _pass_startup_search(attributes, remaining)
+        attributes["startup_search"] = remaining
         try:
             spec.loader.exec_module(module)
         finally:
-            _end_startup_search(attributes)
+            _ = attributes.pop("startup_search", None)
         hooks.append(module)
 
 
-def _pass_startup_search(attributes: _CheckoutStartupAttributes, search: list[str]) -> None:
-    attributes["startup_search"] = search
-
-
-def _end_startup_search(attributes: _CheckoutStartupAttributes) -> None:
-    _ = attributes.pop("startup_search", None)
-
-
-def _passed_startup_search(attributes: _CheckoutStartupAttributes) -> list[str] | None:
-    return attributes.get("startup_search")
+def _checkout_attributes(state: ModuleType) -> _CheckoutStartupAttributes:
+    # A declared return type keeps the typed view; an annotated local narrows back to dict.
+    return state.__dict__
 
 
 def _startup_search() -> list[str] | None:
     """Return the search that an earlier startup hook passes to this hook."""
     state = sys.modules.get("_devtools_checkout")
-    return _passed_startup_search(state.__dict__) if state is not None else None
+    return _checkout_attributes(state).get("startup_search") if state is not None else None
 
 
 # Reuse this module when an entry loads package_root.py.
@@ -854,8 +847,10 @@ if __name__ in sys.modules:
 
 
 if __name__ == "sitecustomize":
-    # Save the hook order before selection removes this startup directory.
-    following = _startup_search() or sys.path[:]
+    # Continue the search of an earlier hook, or save the hook order before selection removes this startup directory.
+    following = _startup_search()
+    if following is None:
+        following = sys.path[:]
     _ = start_process(sys.argv)
     next_sitecustomize(__file__, following)
     finish_startup(__file__, sys.argv)

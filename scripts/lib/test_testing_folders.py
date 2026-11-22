@@ -119,7 +119,8 @@ class TestRunFolderTests(unittest.TestCase):
 
     def test_a_gate_job_keeps_its_folder_when_a_test_imports_the_maker(self) -> None:
         # On Linux the child finds the gate module among its ancestors and keeps the folder that the
-        # gate job gives it. Without process records it is a direct test and makes its own run folder.
+        # gate job gives it. On other systems the child cannot read its ancestors, so it is a direct
+        # test and makes its own run folder.
         child_source = """import os, pathlib, sys, unittest
 class Child(unittest.TestCase):
     def test_folder(self):
