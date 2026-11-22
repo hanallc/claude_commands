@@ -37,7 +37,7 @@ from scripts.build_targets import build_targets, target_config, targets
 from scripts.disks.slots import lease_record
 from scripts.build_queue.queue_view import refresh_mac_builds
 from scripts.build_queue.admission_test_support import AdmissionFixture, NOW as ADMISSION_NOW, only_admitted
-from scripts.build_queue.queue_fixture import write_process, write_scope
+from scripts.build_queue.queue_fixture import fixture_reservation, write_process, write_scope
 from scripts.build_queue.scope_activity import (RunningServiceJob, IdleService, LiveBuildRun, NoLiveBuildRun, NotServiceSlice,
                                                 ScopeProcess, ScopeProcesses)
 from scripts.lint import test_memory_admit as memory_tests
@@ -129,10 +129,58 @@ def leftover_step(minutes: int, *, small: bool = False, members: tuple[ScopeProc
                             memory, pid=minutes, started_at=started_at)
 
 
+def write_outside_queue_fixture(root: Path) -> staff.StaffSnapshot:
+    """Write process trees and staff for a private CPU time reading."""
+    _ = write_config_fixture(root / "test_times.conf",
+        "[direct_test]\n# whole: 1..\ndirect_test.time_limit_seconds=120\n")
+    runner = staff.StaffRow(staff.StaffId("builds"), "showrunner", "builds", staff.StaffRoot(),
+                            current_session=staff.StaffId("runner-session"))
+    director = staff.StaffRow(staff.StaffId("queue"), "unit", "queue", staff.ReportsTo(runner.id),
+                              current_session=staff.StaffId("director-session"))
+    worker = staff.StaffRow(staff.StaffId("test-worker"), "worker", "test", staff.ReportsTo(director.id),
+                            current_session=staff.StaffId("worker-session"))
+    ticks = os.sysconf("SC_CLK_TCK")
+    for pid, parent, argv, user, system in (
+        (8100, 1, "/bin/bash\0--login\0--norc", 200, 0),
+        (8101, 8100, "/bin/codex", 200, 0),
+        (8102, 8101, "/bin/python3\0/fixture/scripts/production/targeted_test.py", 71, 17),
+        (8103, 8102, "/bin/python3", 35, 13),
+        (8104, 8101, "/bin/rustc", 80, 40),
+        (8105, 8101, "/bin/cargo", 200, 0),
+        (8106, 8105, "/bin/rustc", 15, 0),
+        (8107, 8101, "/bin/pytest", 19, 0),
+    ):
+        process = root / "proc" / str(pid)
+        write_process(process.parent, pid, parent=parent)
+        fields = ["S", str(parent), *(["0"] * 9), str(user * ticks), str(system * ticks), *(["0"] * 6), str(pid)]
+        _ = (process / "stat").write_text(f"{pid} (fixture ) command) {' '.join(fields)}\n")
+        _ = (process / "cmdline").write_text(argv + "\0")
+    _ = (root / "proc/8101/environ").write_text("CODEX_THREAD_ID=worker-session\0")
+    user_group = root / "user"
+    write_scope(user_group / "app.slice/app-agents.slice/run-p8100.scope",
+                members=(8100, 8101, 8102, 8103, 8104, 8105, 8107))
+    write_scope(user_group / "builds.slice")
+    write_scope(user_group / "builds.slice/build-fixture.scope", members=(8106,))
+    return staff.StaffSnapshot((runner, director, worker))
+
+
 class MemoryFeedTests(unittest.TestCase):
     root: Path = Path()
     output: Path = Path()
     configuration: Path = Path()
+
+    def test_cpu_time_marks_only_unadmitted_command_trees_over_the_limit(self) -> None:
+        staff_members = write_outside_queue_fixture(self.root)
+        reading = captured_reading()
+        with (mock.patch.object(staff, "snapshot", return_value=staff_members),
+              mock.patch.object(admission_client, "view", return_value=reading)):
+            page = memory_feed.reading()
+        self.assertEqual(page["outside_queue"], [
+            {"pid": 8102, "unit": "queue", "owner": "test", "command": "targeted_test.py", "cpu_seconds": 136.0},
+        ])
+        inputs = reading.explanation.decided_from
+        source = replace(inputs, reservations=(fixture_reservation(8103, admission_records.GIB),))
+        self.assertEqual(memory_feed.outside_queue_processes(source, memory_feed.FeedStaff(staff_members)), [])
 
     def test_each_reading_shares_current_staff_role_names_with_the_page(self) -> None:
         runner = staff.StaffRow(staff.StaffId("fixture-runner"), "showrunner", "fixture-runner", staff.StaffRoot(),
@@ -386,6 +434,7 @@ class MemoryFeedTests(unittest.TestCase):
             "USER_ZONE": "UTC",
             "MAC_IDLE_STATE_DIR": str(self.root / "mac-idle"),
             "BUILDLOG_USER_CGROUP": str(self.root / "user"),
+            "BUILDLOG_BUILDS_CGROUP": str(self.root / "user/builds.slice"),
         })))
         _ = self.enterContext(mock.patch.object(admission_client, "view",
             side_effect=AssertionError("The test must supply a private queue reading")))
@@ -4073,6 +4122,10 @@ def write_browser_fixture(folder: Path) -> None:
               mock.patch.object(queue_view, "read_mac_builds", return_value=queue_view.MacBuildReading(
                   base.explanation.now, (placed,)))):
             pages["macroute_running"] = json.loads(memory_feed.page_json(memory_feed.reading(configuration)))
+        staff_members = write_outside_queue_fixture(fixture.root)
+        with (mock.patch.object(staff, "snapshot", return_value=staff_members),
+              mock.patch.object(admission_client, "view", return_value=base)):
+            pages["outside_queue"] = json.loads(memory_feed.page_json(memory_feed.reading(configuration)))
         # The proof serves each reading's report as report.json and shows it with its reading.
         default_report = memory_feed.report_file(memory_feed.report_reading(configuration.history_days))
         for name, page in pages.items():

@@ -13,6 +13,7 @@
 // Use --verify-call as the third argument for the Verify column proof.
 // Use --headcount to compare the Running and Queued headers.
 // Use --build-tools as the third argument for the Build tools proof.
+// Use --outside-queue as the third argument for the CPU time proof.
 // Set SWAP_BEFORE_PAGE to compare the swap tooltip with the previous page.
 import assert from 'node:assert/strict';
 import {accessSync, constants, statSync} from 'node:fs';
@@ -51,7 +52,8 @@ if (gateMode) args.shift();
 const [callerFolder, previousPage, comparison] = args;
 const verifyCallProof = previousPage === '--verify-call';
 const buildToolsProof = previousPage === '--build-tools';
-const focusedProof = verifyCallProof || buildToolsProof;
+const outsideQueueProof = previousPage === '--outside-queue';
+const focusedProof = verifyCallProof || buildToolsProof || outsideQueueProof;
 const themes = gateMode ? ['dark'] : ['light','dark'];
 const widths = gateMode ? [1400] : [1400,900,390];
 const runningHeaders = ['Stage','Done','Step','Dur','Verify','Unit','Pid','Target','vCPU','Slot','Tokens'];
@@ -259,6 +261,39 @@ try {
           fitLabels();
           })()`);
         };
+        if (outsideQueueProof || !focusedProof) {
+          servedReading = readings.outside_queue;
+          await navigate('memory_live.html');
+          const result = await evaluate(`(() => {
+            const section = document.querySelector('#outside-queue');
+            section.scrollIntoView({block:'center'});
+            const bounds = section.getBoundingClientRect();
+            const rows = Array.from(section.querySelectorAll('.outside-queue-row'), row => ({
+              owner:row.querySelector('.detail').textContent,
+              color:row.querySelector('.detail [data-color-text]')?.getAttribute('data-color-text'),
+              mark:row.querySelector('.outside-queue-mark').textContent,
+              cpu:row.querySelector('.num').textContent,
+            }));
+            return {rows, visible:!section.hidden, clip:{x:bounds.left+scrollX,y:bounds.top+scrollY,
+              width:bounds.width,height:bounds.height,scale:1}};
+          })()`);
+          assert.equal(result.visible, true);
+          assert.deepEqual(result.rows, [{owner:'queue · test · targeted_test.py', color:'role.unit-director',
+            mark:'Outside the queue', cpu:'136.0 s CPU'}]);
+          const output = join(folder, 'cpumark-dark.png');
+          if (outsideQueueProof) {
+            const shot = await call('Page.captureScreenshot',{format:'png',captureBeyondViewport:true,clip:result.clip});
+            await writeFile(output, Buffer.from(shot.data, 'base64'));
+          }
+          assert.equal(await evaluate(`(() => {
+            renderReading({...proofData, outside_queue:[]});
+            return document.querySelector('#outside-queue').hidden;
+          })()`), true);
+          if (outsideQueueProof) {
+            console.log(JSON.stringify({pass:true, views:1, output}));
+            break browserProof;
+          }
+        }
         if (buildToolsProof) {
           const ram = JSON.parse(await readFile(join(folder, 'legend_ram.json'), 'utf8'));
           const gib = 1024**3;

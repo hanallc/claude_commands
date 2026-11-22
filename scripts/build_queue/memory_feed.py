@@ -61,12 +61,13 @@ from scripts.lib.build_steps import (GATE_PROGRAMS, RECORDED_STEP_NAMES,
                                      gate_job_from_process, process_arguments, read_step_names)
 from scripts.lib.build_steps import CommandUnreadable as CommandUnreadable
 from scripts.build_queue.slot_wait import QueueRowName as QueueRowName
-from scripts.build_queue.slot_wait import (NoNamedStep, QueueKind, command_programs,
+from scripts.build_queue.slot_wait import (SHELLS, NoNamedStep, QueueKind, command_programs,
                                            public_queue_text, recorded_step, verify_value_options)
 from scripts.build_queue.scope_activity import LiveBuildRun, NotServiceSlice, RunningServiceJob, ScopeProcesses
 from scripts.build_queue import admission_records, target_availability
 from scripts.build_queue.memory_files import DATA_NAME, PAGE_NAME, PAGE_SOURCE, configured_output_folder
 from scripts.build_targets import target_config
+from scripts.herdr.herdr import is_claude_process, is_codex_process
 from scripts.lint import memory_admit as gate
 from scripts.message import unit_labels
 from scripts.production import staff
@@ -1086,6 +1087,14 @@ class SwapTotals(TypedDict):
     reserve_share_percent: int
 
 
+class OutsideQueueProcess(TypedDict):
+    pid: int
+    unit: str
+    owner: str
+    command: str
+    cpu_seconds: float
+
+
 class MemoryPage(TypedDict):
     colors: PageColors
     staff_names: NotRequired[dict[str, str]]
@@ -1131,6 +1140,7 @@ class MemoryPage(TypedDict):
     report_version: str
     swap_rows: int
     leftovers: list[LeftoverScope]
+    outside_queue: list[OutsideQueueProcess]
 
 
 class RetainedReading(MemoryPage):
@@ -2396,6 +2406,116 @@ def tool_group_children(path: Path) -> list[Path]:
         return []
 
 
+def direct_test_time_limit_seconds() -> float:
+    """Read the CPU time limit from the direct test configuration."""
+    return conf.read("test_times").value("direct_test.time_limit_seconds", conf.positive_whole_seconds)
+
+
+def process_cpu_ticks(pid: int, identity: gate.ProcessIdentity) -> int:
+    """Read user and system ticks for the observed process lifetime."""
+    try:
+        fields = (PROC / str(pid) / "stat").read_bytes().rsplit(b") ", 1)[1].split()
+        if fields[0] not in (b"Z", b"X") and fields[19].decode() == identity.start:
+            return int(fields[11]) + int(fields[12])
+    except (OSError, ValueError, IndexError):
+        pass
+    return 0
+
+
+def agent_process_owner(pids: Sequence[int], members: FeedStaff) -> unit_labels.UnitLabels:
+    """Resolve the first staff identity from processes in the same agent scope."""
+    for pid in pids:
+        try:
+            raw = (PROC / str(pid) / "environ").read_bytes()
+        except OSError:
+            continue
+        marks = {key: value for key, _, value in (entry.partition(b"=") for entry in raw.split(b"\0"))}
+        for key in (b"CODEX_THREAD_ID", b"CLAUDE_CODE_SESSION_ID", b"STAFF_ID"):
+            if value := marks.get(key):
+                member = members.members.by_member_reference(value.decode(errors="replace"))
+                if member is not None and (labels := members.labels.get(member.current_session)) is not None:
+                    return labels
+    return unit_labels.UnitLabels("")
+
+
+def outside_queue_processes(inputs: admission_records.QueueInputs, staff_members: FeedStaff
+                            ) -> list[OutsideQueueProcess]:
+    """Mark command trees in agent scopes when no member has queue admission."""
+    agents = gate.user_manager_cgroup() / "app.slice" / "app-agents.slice"
+    scopes = [path for path in tool_group_children(agents) if path.suffix == ".scope"]
+    if not scopes:
+        return []
+    try:
+        limit = direct_test_time_limit_seconds()
+        processes = gate.process_table(PROC)
+        queued = gate.scope_members(gate.builds_slice_cgroup())
+    except (conf.Unusable, OSError, ValueError):
+        return []
+    queued.update(row["pid"] for row in inputs.reservations
+                  if (process := processes.get(row["pid"])) is not None and process.start == row["start_time"])
+    for step in inputs.running:
+        memory = step.measured
+        if not isinstance(memory, admission_records.MeasuredMemory):
+            continue
+        source = memory.anonymous_source
+        if isinstance(source, admission_records.ScopeSource):
+            queued.update(source.members)
+        elif isinstance(source, admission_records.ProcessSource):
+            queued.update(process.pid for process in source.processes)
+
+    children: dict[int, list[int]] = {}
+    for pid, process in processes.items():
+        children.setdefault(process.parent, []).append(pid)
+
+    ticks_per_second = os.sysconf("SC_CLK_TCK")
+    reader = ToolProcessReader()
+    rows: list[OutsideQueueProcess] = []
+    seen: set[int] = set()
+    for scope in sorted(scopes):
+        try:
+            scope_pids = gate.scope_members(scope).intersection(processes)
+        except (OSError, ValueError):
+            continue
+        pending: list[tuple[int, tuple[int, ...]]] = [
+            (pid, ()) for pid in sorted(scope_pids) if processes[pid].parent not in scope_pids]
+        while pending:
+            pid, ancestors = pending.pop()
+            if pid in seen:
+                continue
+            command = reader.command(pid)
+            if not command or not command[0]:
+                continue
+            program = Path(command[0]).name
+            idle_shell = program.lstrip("-") in SHELLS and all(
+                word.startswith("-") and word.split("=", 1)[0] != "--command"
+                and not re.fullmatch(r"-[a-zA-Z]*c[a-zA-Z]*", word) for word in command[1:])
+            if (is_claude_process(command) or is_codex_process(command) or program == "codex-real"
+                    or idle_shell):
+                seen.add(pid)
+                pending.extend((child, (pid, *ancestors)) for child in children.get(pid, ()) if child in scope_pids)
+                continue
+            tree: set[int] = set()
+            descendants = [pid]
+            while descendants:
+                child = descendants.pop()
+                if child in tree or child in seen:
+                    continue
+                tree.add(child)
+                descendants.extend(children.get(child, ()))
+            seen.update(tree)
+            if not tree.isdisjoint(queued):
+                continue
+            seconds = sum(process_cpu_ticks(child, processes[child]) for child in tree) / ticks_per_second
+            if seconds <= limit:
+                continue
+            owner = agent_process_owner((pid, *ancestors), staff_members)
+            script = command_script(command)
+            label = public_queue_text(Path(script).name if script else program) or "Unknown command"
+            rows.append({"pid": pid, "unit": staff_unit(owner), "owner": public_queue_text(owner.session),
+                         "command": label[:80], "cpu_seconds": seconds})
+    return sorted(rows, key=lambda row: (-row["cpu_seconds"], row["pid"]))
+
+
 class ToolGroupKind(Enum):
     PYTHON_TESTS = auto()
     OTHER = auto()
@@ -3190,6 +3310,7 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
         "limits": {"some": policy.some_avg10_limit, "full": policy.full_avg10_limit},
         "report_version": report_version,
         "swap_rows": configuration.swap_rows, "leftovers": leftovers,
+        "outside_queue": outside_queue_processes(explanation.decided_from, members),
     }
     page["render_seconds"] = time.perf_counter() - started
     return page
