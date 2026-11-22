@@ -417,7 +417,7 @@ def stop_saved_scope(scope: process_stop.ScopeIdentity, *, on_term: Callable[[in
 
 
 def stop_verified_scope(target: KillTarget, reason: str, *, on_term: Callable[[int], None]) -> bool:
-    """Check the saved route and forward each TERM receipt before the exit wait."""
+    """Check the saved route and report the total TERM count before the exit wait."""
     def route_matches() -> bool:
         return stop_route(target.candidate, target.recipient, memory_admit.process_table(PROC)) == target.route
 
@@ -610,13 +610,8 @@ class KillActions:
         action = SavedKillAction(identity, run, result, target.recipient, body, StopRequested(), target.route.scope)
 
         def save_term(count: int) -> None:
-            nonlocal action
-            receipt = TermSent(count)
-            if isinstance(action.stage, TermSent):
-                receipt = TermSent(action.stage.term_reached + count)
-            saved = replace(action, stage=receipt)
-            self._save(saved)
-            action = saved
+            if count != 0:
+                self._save(replace(action, stage=TermSent(count)))
 
         with self._record_lock(reference):
             try:

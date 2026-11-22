@@ -24,7 +24,7 @@ from scripts.build_queue import admission_client, admission_records as records, 
 from scripts.build_queue.admission_jobs import VerifyCall
 from scripts.build_queue.test_memory_feed import reservation_reading
 from scripts.buildlog import store
-from scripts.lib import process_start, process_stop
+from scripts.lib import atomic_file, process_start, process_stop
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lint import memory_admit
 from scripts.lint.memory_test_support import write_config_fixture
@@ -593,7 +593,10 @@ class KillActionTests(unittest.TestCase):
         _ = write_config_fixture(self.root / "shutdown.conf")
         _ = write_config_fixture(self.root / "codex_daemon.conf")
         for detached in (False, True):
-            for scenario in ("natural exit", "restart", "error", "reused scope"):
+            scenarios = ("natural exit", "restart", "error", "reused scope")
+            if detached:
+                scenarios = (*scenarios, "two scopes")
+            for scenario in scenarios:
                 with self.subTest(detached=detached, scenario=scenario):
                     self.check_term_receipt(detached, scenario)
 
@@ -602,7 +605,7 @@ class KillActionTests(unittest.TestCase):
         folder = root / "builds-detached.slice" / "detached-fixture.scope"
         folder.mkdir(parents=True)
         events = folder / "cgroup.events"
-        _ = events.write_text("populated 1\n")
+        _ = events.write_text("populated 0\n" if scenario == "natural exit" else "populated 1\n")
         kill_file = folder / "cgroup.kill"
         kill_file.touch()
         scope = self.scope_identity(folder)
@@ -612,6 +615,12 @@ class KillActionTests(unittest.TestCase):
         route = (kill_action.DetachedCommand(record, 17, "123", 16, "122", scope)
                  if detached else kill_action.ProgramScope(scope, 17, "123"))
         target = kill_action.KillTarget(run, route, recipient, "impl2", "impl2", "worker")
+        extra_scope: dict[str, process_stop.ScopeIdentity] = {}
+        if scenario == "two scopes":
+            moved = folder.with_name("moved-fixture.scope")
+            moved.mkdir()
+            _ = (moved / "cgroup.events").write_text("populated 1\n")
+            extra_scope["moved_scope"] = self.scope_identity(moved)
         if detached:
             _ = record.write_text(json.dumps({
                 "run_id": "fixture", "status": "running", "session_dir": str(root),
@@ -619,20 +628,20 @@ class KillActionTests(unittest.TestCase):
                 "log": str(root / "fixture.log"), "started_at": 10, "pid": 16, "director_dir": "",
                 "done_message_file": "", "command_scope": scope, "command_pid": 17,
                 "command_group": 17, "command_started": "123", "supervisor_started": "122",
+                **extra_scope,
             }))
         actions = kill_action.KillActions(root)
         journal = root / ".review-link-build-kill" / f"{run.reference}.json"
-        count = 0 if scenario == "natural exit" else 2
+        count = {"natural exit": 0, "two scopes": 5}.get(scenario, 2)
 
         class Restart(BaseException):
             pass
 
-        def enter_exit_wait(_scope: process_stop.ScopeIdentity, _descriptor: int, _deadline: float) -> bool:
+        def send_term(_directory: int, saved_scope: process_stop.ScopeIdentity, _deadline: float) -> int:
+            return 2 if saved_scope == scope else 3
+
+        def enter_exit_wait(saved_scope: process_stop.ScopeIdentity, _descriptor: int, _deadline: float) -> bool:
             saved = admission_wire.parse_record(journal.read_text(), kill_action.SavedKillAction)
-            if not count:
-                self.assertIsInstance(saved.stage, kill_action.StopRequested)
-                _ = events.write_text("populated 0\n")
-                return True
             self.assertEqual(saved.stage, kill_action.TermSent(count))
             if detached:
                 detached_record = cast(dict[str, object], json.loads(record.read_text()))
@@ -651,6 +660,11 @@ class KillActionTests(unittest.TestCase):
                 folder.mkdir()
                 _ = events.write_text("populated 1\n")
                 return True
+            if scenario == "two scopes":
+                self.assertEqual(term.call_count, 2)
+                scope_events = self.root / saved_scope["path"].lstrip("/") / "cgroup.events"
+                _ = scope_events.write_text("populated 0\n")
+                return True
             raise process_stop.ScopeStopFailed("fixture failure after TERM")
 
         def start(target_actions: kill_action.KillActions) -> kill_action.KillResult | kill_action.NoStopRoute:
@@ -665,14 +679,17 @@ class KillActionTests(unittest.TestCase):
                 self.assertEqual(events.read_text(), "populated 1\n")
             else:
                 self.assertTrue(self.scope_has_ended(scope))
+                for moved_scope in extra_scope.values():
+                    self.assertTrue(self.scope_has_ended(moved_scope))
             return kill_action.DeliveryState.SENT
 
         with (patch.object(process_stop, "CGROUP_ROOT", self.root),
-              patch.object(process_stop, "_term_scope", return_value=count) as term,
+              patch.object(process_stop, "_term_scope", side_effect=send_term) as term,
               patch.object(process_stop, "_scope_ends_on", side_effect=enter_exit_wait) as wait,
               patch.object(memory_admit, "process_table", return_value={}),
               patch.object(kill_action, "stop_route", return_value=route),
               patch.object(kill_action, "live_targets", return_value={run.reference: target}) as targets,
+              patch.object(kill_action, "write_text_atomic", wraps=atomic_file.write_text_atomic) as save,
               patch.object(actions, "_start_watch"),
               patch.object(kill_action, "deliver", side_effect=deliver) as send):
             if scenario == "restart":
@@ -685,10 +702,16 @@ class KillActionTests(unittest.TestCase):
                     "error": kill_action.StopState.UNCONFIRMED,
                     "natural exit": kill_action.StopState.ALREADY_ENDED,
                     "reused scope": kill_action.StopState.STOPPED,
+                    "two scopes": kill_action.StopState.STOPPED,
                 }
                 self.assertEqual(outcome["stop"], expected[scenario])
-            wait.assert_called_once()
-            if scenario == "reused scope":
+            self.assertEqual(wait.call_count, {"natural exit": 0, "two scopes": 2}.get(scenario, 1))
+            if scenario in ("natural exit", "two scopes"):
+                saved_actions = [admission_wire.parse_record(cast(str, call.args[1]), kill_action.SavedKillAction)
+                                 for call in save.call_args_list]
+                receipts = [action.stage for action in saved_actions if isinstance(action.stage, kill_action.TermSent)]
+                self.assertEqual(receipts, [kill_action.TermSent(count)] if count else [])
+            if scenario in ("reused scope", "two scopes"):
                 send.assert_called_once()
             else:
                 send.assert_not_called()
@@ -717,7 +740,7 @@ class KillActionTests(unittest.TestCase):
             (_, (result,)) = recovered_again.options()
             self.assertEqual(result["stop"],
                              kill_action.StopState.STOPPED if count else kill_action.StopState.ALREADY_ENDED)
-            self.assertEqual(term.call_count, 2 if scenario == "restart" else 1)
+            self.assertEqual(term.call_count, {"natural exit": 0, "restart": 2, "two scopes": 2}.get(scenario, 1))
             if scenario == "restart":
                 self.assertEqual(kill_file.read_text(), "1\n")
                 self.assertTrue(self.scope_has_ended(scope))
