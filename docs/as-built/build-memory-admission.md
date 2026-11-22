@@ -1312,7 +1312,7 @@ GPU slot waits use the same shape with a `_gpu_slot` field.
 Repository run limits use `max_runs.<machine>.<repository>` in `build_admission.conf`.
 An absent key sets no repository run limit.
 A value of zero holds new runs on that machine.
-`max_runs.natedev.hana` can limit new Hana Verify runs on natedev.
+`max_runs.natedev.hana` permits two concurrent Hana Verify runs on natedev.
 Verify requests a repository slot for its first compiling Cargo step.
 The request follows detachment, the cache checks, and lint step selection.
 In Mac-only mode Verify checks the cache after it gets an assignment.
@@ -1329,7 +1329,7 @@ Copy preparation and commands that only format or read cached results take no ru
 Copy preparation can retain its memory during the configured gap before Verify takes a slot.
 The gap is about ten seconds with the current configuration.
 Local `gate` and `test-affected` runs count while they hold a reservation.
-`max_runs.natedev.claude_commands` applies this rule to the repository's `gate` and `test-affected` steps.
+`max_runs.natedev.claude_commands` permits two concurrent runs and applies this rule to the repository's `gate` and `test-affected` steps.
 The admission service uses the Git repository name when a gate profile supplies an absolute path.
 The unit in `max_runs_exempt_unit` can start above the limit. Its runs use slots.
 Verify prints the count, limit, repository, and machine while it waits.
