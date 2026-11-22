@@ -7804,7 +7804,7 @@ class VerifyRunSlotTests(unittest.TestCase):
         fixture.configure(slot_gap_seconds=60)
         config = fixture.root / "build_admission.conf"
         _ = config.write_text(config.read_text() +
-            f"\nmax_runs.{fixture.server.host}.fixture={maximum}\nmax_runs.exempt_unit=natemerge\n")
+            f"\nmax_runs.{conf.host_key_name(fixture.server.host)}.fixture={maximum}\nmax_runs.exempt_unit=natemerge\n")
 
     def slot_request(self, run: wire.RunIdentity, session_id: str = "") -> wire.VerifyRunSlotRequest:
         return wire.VerifyRunSlotRequest(wire.Owner(run.pid, run.start_time), "fixture", session_id)
