@@ -118,18 +118,24 @@ class TestRunFolderTests(unittest.TestCase):
         self.assertEqual(list(live_folder.parent.iterdir()), [])
 
     def test_a_gate_job_keeps_its_folder_when_a_test_imports_the_maker(self) -> None:
-        child_source = """import os, pathlib, unittest
+        # On Linux the child finds the gate module among its ancestors and keeps the folder that the
+        # gate job gives it. Without process records it is a direct test and makes its own run folder.
+        child_source = """import os, pathlib, sys, unittest
 class Child(unittest.TestCase):
     def test_folder(self):
         path = pathlib.Path(os.environ['TMPDIR'])
-        self.assertEqual(path.parent.name, 'test-runs')
+        given = pathlib.Path(os.environ['FIXTURE_GIVEN_TMPDIR'])
+        if sys.platform == 'linux':
+            self.assertEqual(path, given)
+        else:
+            self.assertEqual(path.parent, given / 'test-runs')
         self.assertTrue(path.is_dir())
 """
         _ = (self.root / "test_child.py").write_text(child_source)
         source = GATE_FIXTURE + f"""        with tempfile.TemporaryDirectory(dir=os.environ['TMPDIR']) as temporary:
             child = subprocess.run(
                 [{str(SHIM)!r}, '-m', 'unittest', 'discover', '-s', {str(self.root)!r}, '-p', 'test_child.py'],
-                env={{**os.environ, 'TMPDIR': temporary}},
+                env={{**os.environ, 'TMPDIR': temporary, 'FIXTURE_GIVEN_TMPDIR': temporary}},
                 capture_output=True, text=True, timeout={TEST_HANG_GUARD_SECS!r})
             self.assertEqual(child.returncode, 0, child.stdout + child.stderr)
 """

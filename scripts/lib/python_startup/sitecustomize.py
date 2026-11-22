@@ -22,11 +22,16 @@ from types import CodeType, ModuleType
 # Keep typing out of interpreter startup.
 TYPE_CHECKING = False
 if TYPE_CHECKING:
-    from typing import Literal, Protocol
+    from typing import Literal, Protocol, overload
 
     class _CheckoutStartupAttributes(Protocol):
         def __contains__(self, key: Literal["ready"], /) -> bool: ...
+        @overload
         def pop(self, key: Literal["ready"], /) -> Callable[[], None]: ...
+        @overload
+        def pop(self, key: Literal["startup_search"], default: None, /) -> list[str] | None: ...
+        def get(self, key: Literal["startup_search"], /) -> list[str] | None: ...
+        def __setitem__(self, key: Literal["startup_search"], value: list[str], /) -> None: ...
         def setdefault(self, key: Literal["startup_hooks"], default: list[ModuleType], /) -> list[ModuleType]: ...
 
 
@@ -813,10 +818,34 @@ def next_sitecustomize(filename: str, search: list[str] | None = None) -> None:
     spec = PathFinder.find_spec("sitecustomize", remaining)
     if spec is not None and spec.loader is not None:
         module = module_from_spec(spec)
+        attributes = sys.modules["_devtools_checkout"].__dict__
         # Keep hook contexts active for the process lifetime.
-        hooks = _retained_startup_hooks(sys.modules["_devtools_checkout"].__dict__)
-        spec.loader.exec_module(module)
+        hooks = _retained_startup_hooks(attributes)
+        # Selection removed startup directories from sys.path, so a following startup hook continues from this search.
+        _pass_startup_search(attributes, remaining)
+        try:
+            spec.loader.exec_module(module)
+        finally:
+            _end_startup_search(attributes)
         hooks.append(module)
+
+
+def _pass_startup_search(attributes: _CheckoutStartupAttributes, search: list[str]) -> None:
+    attributes["startup_search"] = search
+
+
+def _end_startup_search(attributes: _CheckoutStartupAttributes) -> None:
+    _ = attributes.pop("startup_search", None)
+
+
+def _passed_startup_search(attributes: _CheckoutStartupAttributes) -> list[str] | None:
+    return attributes.get("startup_search")
+
+
+def _startup_search() -> list[str] | None:
+    """Return the search that an earlier startup hook passes to this hook."""
+    state = sys.modules.get("_devtools_checkout")
+    return _passed_startup_search(state.__dict__) if state is not None else None
 
 
 # Reuse this module when an entry loads package_root.py.
@@ -826,7 +855,7 @@ if __name__ in sys.modules:
 
 if __name__ == "sitecustomize":
     # Save the hook order before selection removes this startup directory.
-    following = sys.path[:]
+    following = _startup_search() or sys.path[:]
     _ = start_process(sys.argv)
     next_sitecustomize(__file__, following)
     finish_startup(__file__, sys.argv)
