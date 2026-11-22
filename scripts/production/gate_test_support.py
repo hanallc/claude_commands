@@ -801,7 +801,7 @@ class MergeGateFixture(unittest.TestCase):
                    + f"- **Repository:** `{self.checkout}`\n- **Showrunner checkout:** `{self.checkout}`\n"
                    + "- **Merge branch:** `integration`\n")
         with isolated_staff_file(Path(self.environment["STAFF_FILE"]), self.environment):
-            _ = fixture_member("showrunner", name="fixture-showrunner", doc=staff.LiveDoc("natedev", doc))
+            _ = fixture_member("showrunner", name="fixture-showrunner", doc=staff.LiveDoc(remote.local_machine(), doc))
         return review, doc
 
     def publish_for_promotion(self) -> gate.GateArguments:

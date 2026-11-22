@@ -460,64 +460,6 @@ def limit_copy_size(copy: LeasedCopy, limit: int) -> None:
               + "The maker deleted its Cargo output.")
 
 
-class NumberedCopyEnvrc(Enum):
-    """The numbered copy requires byte proof for its envrc."""
-
-    OUTSIDE_COPY = auto()
-    TRUSTED = auto()
-    NEEDS_APPROVAL = auto()
-
-
-def numbered_copy_envrc(envrc: Path, *, trusted_source: Callable[[Path], bool]) -> NumberedCopyEnvrc:
-    """Compare an envrc with the recorded commit in a trusted source checkout."""
-    try:
-        root = build_folders.build_root()
-        candidate = Path(os.path.abspath(envrc))
-        physical_root = root.resolve()
-        for directory, base in ((candidate.parent, root.absolute()),
-                                (candidate.parent.resolve(), physical_root)):
-            if not directory.is_relative_to(base):
-                continue
-            parts = directory.relative_to(base).parts
-            if len(parts) >= 3 and parts[1] not in ("main", "ci") and re.fullmatch(r"[0-9]+", parts[2]):
-                parent = root.joinpath(*parts[:3])
-                break
-        else:
-            return NumberedCopyEnvrc.OUTSIDE_COPY
-        exact = physical_root / parent.relative_to(root)
-        if (candidate.name != ".envrc" or candidate.parent.resolve() != exact
-                or len(parts) != 3):
-            return NumberedCopyEnvrc.NEEDS_APPROVAL
-        record = build_folders.numbered_copy_record(parent)
-        if not isinstance(record, build_folders.NumberedCopySource) or not trusted_source(record.source):
-            return NumberedCopyEnvrc.NEEDS_APPROVAL
-        descriptor = os.open(candidate, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-        with os.fdopen(descriptor, "rb") as stream:
-            identity = os.fstat(stream.fileno())
-            if not stat.S_ISREG(identity.st_mode):
-                return NumberedCopyEnvrc.NEEDS_APPROVAL
-            command = ["git", "--git-dir", str(record.common_directory)]
-            environment = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
-            timeout = build_folders.repository_git_timeout()
-            entry = subprocess.run([*command, "ls-tree", record.commit, "--", ".envrc"],
-                cwd=record.source, env=environment, capture_output=True, check=True, timeout=timeout)
-            if not entry.stdout.startswith((b"100644 blob ", b"100755 blob ")):
-                return NumberedCopyEnvrc.NEEDS_APPROVAL
-            expected = subprocess.run(
-                [*command, "cat-file", "blob", f"{record.commit}:.envrc"],
-                cwd=record.source, env=environment, capture_output=True, check=True, timeout=timeout)
-            if stream.read(len(expected.stdout) + 1) != expected.stdout:
-                return NumberedCopyEnvrc.NEEDS_APPROVAL
-            current = candidate.lstat()
-            if (not os.path.samestat(identity, current) or identity.st_ctime_ns != current.st_ctime_ns
-                    or identity.st_mtime_ns != current.st_mtime_ns
-                    or record != build_folders.numbered_copy_record(parent)):
-                return NumberedCopyEnvrc.NEEDS_APPROVAL
-        return NumberedCopyEnvrc.TRUSTED
-    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError):
-        return NumberedCopyEnvrc.NEEDS_APPROVAL
-
-
 def _check_directory_identity(path: Path, expected: build_folders.CopyDirectoryIdentity) -> bool:
     try:
         identity = build_folders.CopyDirectoryIdentity.from_stat(path.lstat())

@@ -17,10 +17,11 @@ from typing import cast, final
 from unittest import mock
 from scripts.build_queue import admission_records
 from scripts.lib import build_folders, conf
-from scripts.lib.process_start import Zombie
+from scripts.lib.process_start import Gone, Started, Unreadable, Zombie
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.lib.process_group import send_process_group
 from scripts.production import gate, gate_suites_test_support
+from scripts.production.gate_modules import GateRefused
 from scripts.direct.wait_for_test_state import wait_until
 from scripts.production.gate_test_support import gate_suites
 from scripts.production.gate_suites_test_support import GateSuitesFixture
@@ -46,8 +47,8 @@ class GateProcessStateTests(unittest.TestCase):
               mock.patch.object(admission_records, "read_memory_config",
                                 return_value=mock.Mock(program_stop_seconds=0)),
               redirect_stderr(io.StringIO()) as error):
-            gate.recover_gate_directory(directory)
-            gate.recover_gate_directory(directory)
+            gate.recover_gate_directory(directory, own_directory=directory)
+            gate.recover_gate_directory(directory, own_directory=directory)
         self.assertEqual(error.getvalue().splitlines(), [
             f"kept for a manual removal list: {folder} (gate, the gate owner ended)"
             for folder in recovery.folders
@@ -57,6 +58,55 @@ class GateProcessStateTests(unittest.TestCase):
         saved = cast(dict[str, object], json.loads(recovery.path.read_text()))
         self.assertEqual(saved["folders"], recovery.folders)
         self.assertIs(saved["finished"], True)
+
+    def test_recovery_reports_foreign_refusals_and_recovers_later_records(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="gate-recovery-test-")))
+        checkout, other = root / "checkout", root / "other"
+        _ = self.enterContext(mock.patch.object(gate, "gate_state_dir", return_value=root / "state"))
+        directory = gate.gate_run_directory(other)
+        directory.mkdir(parents=True)
+        unreadable_owner = gate.GateRecovery(directory / "a-owner.json", str(other), 5000001, "fixture")
+        unreadable_group = gate.GateRecovery(directory / "b-group.json", str(other), 5000002, "fixture",
+                                             groups={5000003: "fixture"})
+        recoverable = gate.GateRecovery(directory / "c-dead.json", str(other), 5000004, "fixture")
+        for recovery in (unreadable_owner, unreadable_group, recoverable):
+            recovery.save()
+        identities = {
+            unreadable_owner.pid: Unreadable("owner status\ncannot be read"),
+            unreadable_group.pid: Gone(),
+            5000003: Unreadable("group status cannot be read"),
+            recoverable.pid: Gone(),
+            os.getpid(): Started("caller"),
+        }
+        with (mock.patch.object(gate, "process_start", side_effect=identities.__getitem__) as read_start,
+              mock.patch.object(admission_records, "read_memory_config",
+                                return_value=mock.Mock(program_stop_seconds=0)),
+              redirect_stderr(io.StringIO()) as report):
+            gate.recover_gate_runs(checkout)
+            with gate.gate_recovery(checkout) as current:
+                self.assertTrue(current.path.is_file())
+        self.assertEqual(read_start.call_args_list.count(mock.call(unreadable_owner.pid)), 2)
+        self.assertEqual(report.getvalue().splitlines(), [
+            f"Gate recovery kept {str(unreadable_owner.path)!r}: cannot recover gate 5000001: owner status cannot be read",
+            f"Gate recovery kept {str(unreadable_group.path)!r}: cannot recover gate group 5000003: group status cannot be read",
+        ])
+        self.assertTrue(unreadable_owner.path.is_file())
+        self.assertTrue(unreadable_group.path.is_file())
+        self.assertFalse(recoverable.path.exists())
+
+    def test_recovery_refuses_the_callers_checkout(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="gate-recovery-test-")))
+        checkout = root / "checkout"
+        _ = self.enterContext(mock.patch.object(gate, "gate_state_dir", return_value=root / "state"))
+        directory = gate.gate_run_directory(checkout)
+        directory.mkdir(parents=True)
+        recovery = gate.GateRecovery(directory / "unreadable.json", str(checkout), 5000001, "fixture")
+        recovery.save()
+        with (mock.patch.object(gate, "process_start", return_value=Unreadable("owner status cannot be read")),
+              self.assertRaisesRegex(GateRefused, "cannot recover gate 5000001: owner status cannot be read"),
+              gate.gate_recovery(checkout)):
+            self.fail("the gate started with an unreadable owner in its checkout")
+        self.assertEqual(list(directory.iterdir()), [recovery.path])
 
     def test_process_exit_counts_as_stopped_at_stat_read_or_pidfd_event(self) -> None:
         fixture = GateSuitesFixture()

@@ -76,7 +76,7 @@ class ModuleCostTests(unittest.TestCase):
                 + f"Path({str(pid_file)!r}).write_text(str(os.getpid()))\n"
                 + "os.write(writer, b'1')\nsignal.pause()\n", encoding="utf-8")
             started = time.monotonic()
-            _ = (tree / "test_times.conf").write_text("module_cost_leftover_s=0.25\n")
+            _ = (tree / "test_times.conf").write_text("# range: 5e-324..\nmodule_cost_leftover_s=0.25\n")
             with (mock.patch.dict(os.environ, {"CONF_DIR": str(tree)}),
                   self.assertRaises(task_cpu.LeftoverProcesses) as failure):
                 _ = task_cpu.measure([sys.executable, str(script)], cwd=tree,
@@ -103,7 +103,9 @@ class ModuleCostTests(unittest.TestCase):
                 + "if os.fork():\n    os.read(reader, 1)\n    os._exit(0)\n"
                 + "os.write(writer, b'1')\n"
                 + "time.sleep(1.25)\n", encoding="utf-8")
-            _ = (tree / "test_times.conf").write_text("module_cost_stage_timeout_s=0.75\nmodule_cost_leftover_s=2\n")
+            _ = (tree / "test_times.conf").write_text(
+                "# range: 5e-324..\nmodule_cost_stage_timeout_s=0.75\n"
+                + "# range: 1..\nmodule_cost_leftover_s=2\n")
             with (mock.patch.dict(os.environ, {"CONF_DIR": str(tree)}),
                   self.assertRaisesRegex(task_cpu.MeasurementTimeout, "timed out after 0.75 s")):
                 _ = task_cpu.measure([sys.executable, str(script)], cwd=tree,

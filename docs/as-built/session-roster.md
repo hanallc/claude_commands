@@ -770,7 +770,7 @@ Release recalculates the priority of a kept decision.
 
 **Tests**
 - `PROCESS_TABLE_PS` is read at import: a test that sets it reloads `process_table` or patches `process_table.PS`.
-- `scripts/agents/test_inventory.py` fakes `sessions.live_session`, so `live_sessions()` must call that predicate per record. Suites outside the message package (build_hold, model_study rerun, shutdown) read `live_sessions()`.
+- `scripts/agents/test_inventory.py` fakes `sessions.live_session`, so `live_sessions()` must call that predicate per record. The build hold and shutdown suites read `live_sessions()`.
 - Tests that fake both session readers hide the socket cases; socket fixtures build real session records, and socketless fixtures carry a real start.
 - `RUN_REMOTE` stubs and restores four bindings: `remote.run_remote`, `restart_support.run_remote`, `restart.run_remote`, `shutdown.run_remote`.
 - `_REAL_LEAF_BINDINGS` holds the real functions captured at import, so `allow_leaf` restores them even inside a case nested in another guarded case.
