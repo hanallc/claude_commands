@@ -5790,9 +5790,9 @@ class QueueLeaveTests(unittest.TestCase):
         self.assertEqual(calls.read_text().splitlines(), [
             "nextest run --no-run --workspace",
             "nextest list --message-format json --workspace",
-            "nextest run --test-threads 3 --workspace",
+            "nextest run --test-threads 4 --workspace",
         ])
-        self.assertEqual(json.loads(reservation.read_text())["test_threads"], 3)
+        self.assertEqual(json.loads(reservation.read_text())["test_threads"], 4)
         self.assertEqual(len(os.read(keeper, 64)), 6)
 
     def test_full_width_nextest_run_reports_threads_and_load_after_admission(self) -> None:

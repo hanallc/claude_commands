@@ -13,7 +13,7 @@ from typing import Literal, override
 from unittest.mock import patch
 
 from scripts.accounts import accounts
-from scripts.agents import pane_record, remote, test_stop_resume, worker_lifecycle
+from scripts.agents import pane_record, remote, shutdown_record, stop_resume, test_stop_resume, worker_lifecycle
 from scripts.maintenance import herdr_upkeep as job
 from scripts.herdr import herdr, detection_rules, herdr_types
 from scripts.lib import operation_deadline
@@ -49,6 +49,7 @@ class UpkeepTests(unittest.TestCase):
         self.root = Path(temporary.name)
         self.enterContext(patch.dict(os.environ, {"XDG_STATE_HOME": str(self.root),
             "GATE_STATE_DIR": str(self.root / "merge-gate"),
+            "SHUTDOWN_STATE_DIR": str(self.root / "shutdown"),
             "HERDR_UPKEEP_CONFIG": str(self.root / "config.toml")}))
         _ = (self.root / "config.toml").write_text("[job]\ninterval_seconds=120\ntimeout_seconds=0.2\n")
 
@@ -93,6 +94,15 @@ class UpkeepTests(unittest.TestCase):
             job.upkeep()
         layout.assert_called_once_with({"shared"})
         rules.assert_called_once_with({"shared"}, herdr.reload_agent_rules)
+
+    def test_upkeep_skips_rows_during_live_restart(self) -> None:
+        with (shutdown_record.active_operation(), patch.object(herdr, "restore_server") as restore,
+              patch.object(accounts, "producer_upkeep_members") as members,
+              patch.object(stop_resume, "resume") as resume):
+            job.upkeep()
+        restore.assert_not_called()
+        members.assert_not_called()
+        resume.assert_not_called()
 
     def test_producer_restore_retries_failures_and_keeps_live_sessions(self) -> None:
         case = test_stop_resume.StopResumeTests()
@@ -210,7 +220,11 @@ class UpkeepTests(unittest.TestCase):
               patch.object(case, "live", side_effect=live),
               patch.object(case.client, "save_layout"), patch.object(detection_rules, "refresh"),
               redirect_stderr(io.StringIO()) as errors):
+            with shutdown_record.active_operation():
+                shutdown_record.save([str(rows["alpha"].id)])
+            self.assertEqual(shutdown_record.read(), [str(rows["alpha"].id)])
             job.upkeep()
+            self.assertEqual(shutdown_record.read(), [])
             self.assertEqual(set(launches), {rows[name].current_session for name in ("alpha", "own-codex")})
             self.assertEqual(attempts.count("failed"), 1)
             self.assertEqual(errors.getvalue().count("fixture start failed"), 1)

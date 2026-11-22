@@ -140,7 +140,7 @@ class RepositorySlotTests(unittest.TestCase):
         _ = shutil.copy2(Path(private["CONF_DIR"]) / "build_folders.conf", self.root / "build_folders.conf")
         _ = write_config_fixture(self.root / "machines.conf", "mac.hosts=fake-mac\n")
         _ = write_config_fixture(self.root / "build_folders.conf",
-            "names.repository_key_length=8\npatterns.mirror={repository}/{owner}-s{slot}\n"
+            "names.repository_key_length=8\n"
             + "# whole: 1..\nslots.fake-mac.default_max=1\n"
             + "# whole: 1..\nslots.fake-mac.hana.max=2\n")
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
@@ -185,6 +185,9 @@ class RepositorySlotTests(unittest.TestCase):
     def git_reply(self, argv: list[str], **_options: object) -> subprocess.CompletedProcess[str]:
         self.assertEqual(argv[0], "git", f"Unexpected external command: {argv}")
         directory = argv[argv.index("-C") + 1] if "-C" in argv else str(_options.get("cwd", ""))
+        if "config" in argv and "--git-dir" in argv:
+            origin = self.origins[str(Path(directory).parent)]
+            return subprocess.CompletedProcess(argv, 0, f"local\0remote.origin.url\n{origin}\0", "")
         origin = self.origins.get(directory)
         if origin is None:
             return subprocess.CompletedProcess(argv, 128, "", "not a repository")

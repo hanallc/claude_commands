@@ -80,6 +80,7 @@ from scripts.mac_test.claim_state import (
     read_run as read_run,
     aware_timestamp as aware_timestamp,
     required_string as required_string,
+    scopes_overlap as scopes_overlap,
     target_claim_scope as target_claim_scope,
     claim_files as claim_files,
     read_claims as read_claims,
@@ -739,13 +740,6 @@ def claim_path(paths: StatePaths, scope: ClaimScope) -> Path:
     return paths.run
 
 
-def scopes_overlap(first: ClaimScope, second: ClaimScope) -> bool:
-    if isinstance(first, WholeMacScope) or isinstance(second, WholeMacScope):
-        return True
-    same_repository = first.key == second.key if first.key and second.key else first.name == second.name
-    return same_repository and (not first.slot or not second.slot or first.slot == second.slot)
-
-
 def claim_scope_matches(paths: StatePaths, claim: HeldClaim, scope: ClaimScope) -> bool:
     """Match a claim for handoff or cleanup."""
     if paths.platform == "linux":
@@ -757,13 +751,17 @@ def claim_scope_matches(paths: StatePaths, claim: HeldClaim, scope: ClaimScope) 
 
 def cleanup_claim_matches(paths: StatePaths, claim: HeldClaim, scope: ClaimScope) -> bool:
     """Match a cleanup scope, including a keyless Mac claim from any repository."""
-    return claim_scope_matches(paths, claim, scope) or (paths.platform == "macos" and not claim.record.get("repo_key"))
+    return claim_state.cleanup_scope_is_known(paths, claim) and (
+        claim_scope_matches(paths, claim, scope) or (paths.platform == "macos" and not claim.record.get("repo_key")))
 
 
 def wait_claim_matches(paths: StatePaths, claim: HeldClaim, scope: ClaimScope, worktree: Path) -> bool:
     """Match a reservation before verifying its exact owner."""
-    if paths.platform == "macos" and claim.record.get("cleanup_pending") and cleanup_claim_matches(paths, claim, scope):
-        return True
+    if claim.record.get("cleanup_pending"):
+        if not claim_state.cleanup_scope_is_known(paths, claim):
+            return False
+        if paths.platform == "macos" and cleanup_claim_matches(paths, claim, scope):
+            return True
     if claim_scope_matches(paths, claim, scope):
         return True
     if paths.platform != "macos" or not isinstance(claim.scope, WholeMacScope):
@@ -2035,6 +2033,7 @@ def claim_once(args: CliArguments, paths: StatePaths, scope: ClaimScope,
         record = claim.record
         if ("remote_host" in record and "replaced_reservation" not in record and record.get("cleanup_pending")
                 and record["pid"] == args.pid and claim_state.claim_identity(record) == identity
+                and claim_state.cleanup_scope_is_known(paths, claim)
                 and not run_is_kept(record)
                 and (not args.leased_slots or record.get("slot", 1) in args.leased_slots)):
             return finished_claim(args, record, claim.path)
@@ -2257,7 +2256,7 @@ def adopt_wait_claim(args: CliArguments, paths: StatePaths, scope: ClaimScope,
     checks: tuple[tuple[WaitClaimCheck, Callable[[HeldClaim], bool]], ...] = (
         (WaitClaimCheck.IDENTITY, lambda claim: claim_state.claim_identity(claim.record) == identity),
         (WaitClaimCheck.SCOPE, lambda claim: wait_claim_matches(paths, claim, scope, worktree)
-            or (paths.platform == "macos"
+            or (paths.platform == "macos" and claim_state.cleanup_scope_is_known(paths, claim)
                 and (isinstance(scope, WholeMacScope) or claim.matches_mac_assignment_scope(scope)))),
         (WaitClaimCheck.PID, lambda claim: claim.record["pid"] == args.from_pid),
         (WaitClaimCheck.SESSION, lambda claim: claim.record["submitting_session"] == claim_state.session_id(session)),

@@ -1070,8 +1070,7 @@ def _run(now: datetime, dry_run: bool, proof_group: frozenset[str] = NO_SESSION_
                 _set_transition(state, session["session_id"], refusal.entry_id, "group selected", "")
             # The chosen group account survives a member's failed request or interrupted delivery.
             _save_state(state)
-            batches[transition.move_id] = [session.session_id for session in all_members[group_name]
-                                           if not accounts.session_on_account(session, chosen.label)]
+            batches[transition.move_id] = [session.session_id for session in all_members[group_name]]
         else:
             for identity, refusal in by_id.items():
                 prior = state["sessions"].get(identity)
@@ -1084,11 +1083,11 @@ def _run(now: datetime, dry_run: bool, proof_group: frozenset[str] = NO_SESSION_
             # The decision survives an interruption before a move returns.
             _save_state(state)
         for decision, members in batches.items():
-            available = _available_members(tuple(members))
+            available = _available_members(tuple(members)) if group_name == "ungrouped" else tuple(members)
             intent = (moves.ExplicitMoveTarget.REQUESTED_ACCOUNT if group_name == "ungrouped"
                       else moves.FollowGroupAccount(group_name))
             outcomes = accounts.move_sessions(available, chosen.label, why=why, cause="refusal",
-                                              batch_id=decision, intent=intent) if available else ()
+                                              intent=intent) if available else ()
             for outcome in outcomes:
                 lines.append(accounts.move_result_line(outcome))
                 if (refusal := by_id.get(outcome.session_id)) is None:
@@ -1171,7 +1170,7 @@ def _run(now: datetime, dry_run: bool, proof_group: frozenset[str] = NO_SESSION_
                         if isinstance(transition.origin, accounts.AutoOrigin):
                             why = transition.why.text if isinstance(transition.why, accounts.RecordedTransitionReason) else ""
                         outcomes = accounts.move_sessions(tuple(session.session_id for session in members), target, why=why,
-                            cause=accounts.move_origin_fields(transition.origin)["cause"], batch_id=transition.move_id,
+                            cause=accounts.move_origin_fields(transition.origin)["cause"],
                             intent=moves.FollowGroupAccount(group_name))
                         lines.extend(accounts.move_result_line(outcome) for outcome in outcomes)
     if not dry_run and state != original_state:
@@ -1383,7 +1382,7 @@ def _run_auto_moves_locked(now: datetime, *, dry_run: bool = False,
             lines.append(_record_blocked_head(state, rule, TargetPreparationRefused(sign_in.reason), checked_at, dry_run))
             continue
         rule = chosen
-        transition = accounts.set_group_account(rule.group, rule.to, why=why, now=now, origin=accounts.AutoOrigin())
+        _ = accounts.set_group_account(rule.group, rule.to, why=why, now=now, origin=accounts.AutoOrigin())
         _ = notices.pop(rule.entry_id, None)
         lines.append(f"{rule.group}: {why}; move from {selection.account} to {rule.to}")
         moved.add(rule.group)
@@ -1391,10 +1390,8 @@ def _run_auto_moves_locked(now: datetime, *, dry_run: bool = False,
         # Remove the entry after the role writer records the selection.
         _remove_auto_move_entries(frozenset({rule.entry_id}))
         _save_state(state)
-        ids = tuple(member.session_id for member in members.get(rule.group, ())
-                    if not accounts.session_on_account(member, rule.to))
-        ids = _available_members(ids)
-        outcomes = accounts.move_sessions(ids, rule.to, why=why, cause="auto", batch_id=transition.move_id,
+        ids = tuple(member.session_id for member in members.get(rule.group, ()))
+        outcomes = accounts.move_sessions(ids, rule.to, why=why, cause="auto",
                                          intent=moves.FollowGroupAccount(rule.group)) if ids else ()
         lines.extend(accounts.move_result_line(outcome) for outcome in outcomes)
     if not dry_run and state != original:

@@ -870,6 +870,19 @@ def mac_repository_identity(worktree: str) -> ResolvedMacMirror | WholeMacScope:
     return ResolvedMacMirror(source.key, mirror, f"{fence}.json", fence, worktree, source.checkout_origin)
 
 
+def scopes_overlap(first: ClaimScope, second: ClaimScope) -> bool:
+    if isinstance(first, WholeMacScope) or isinstance(second, WholeMacScope):
+        return True
+    same_repository = first.key == second.key if first.key and second.key else first.name == second.name
+    return same_repository and (not first.slot or not second.slot or first.slot == second.slot)
+
+
+def cleanup_scope_is_known(paths: StatePaths, claim: HeldClaim) -> bool:
+    """Require a repository identity or an absolute path for a legacy machine claim."""
+    return (claim.path != paths.run or "repo_name" in claim.record
+            or Path(claim.record["worktree"]).is_absolute())
+
+
 def target_claim_scope(paths: StatePaths, worktree: str) -> ClaimScope:
     from scripts.buildlog import repository, store
 

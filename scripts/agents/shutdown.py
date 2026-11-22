@@ -22,7 +22,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Literal, TypedDict, NamedTuple, NotRequired, cast
 
-from scripts.accounts import accounts
+from scripts.accounts import accounts, moves
 from scripts.build_hold import override_guard
 from scripts.herdr import herdr_types
 from scripts.agents import set_model
@@ -760,9 +760,10 @@ def main(argv: list[str] | None = None) -> int:
         if options.command == "add-producer":
             return producer_lifecycle.add(options.producer, model=options.model, effort=options.effort, job=options.job)
         if options.command == "stop" and options.all:
-            return restart.stop_all(dry_run=options.dry_run,
-                                    only=tuple(item for item in options.only.split(",") if item),
-                                    account=_restart_account(options.account))
+            selection = restart.BulkCommand("stop", account=options.account, all_rows=True,
+                only=tuple(item for item in options.only.split(",") if item), dry_run=options.dry_run)
+            return restart.run_command(lambda: restart.stop_all(dry_run=selection.dry_run,
+                                    only=selection.only, account=_restart_account(selection.account)), selection)
         if options.command == "move":
             move_arguments = ["move", options.session, note_file.canonical_label(options.target)]
             if options.dry_run:
@@ -771,9 +772,11 @@ def main(argv: list[str] | None = None) -> int:
                 move_arguments.extend(("--why", options.why))
             return accounts.main(move_arguments)
         if options.command == "restart":
-            return restart.restart(stop_all=options.all, dry_run=options.dry_run,
-                                   only=tuple(item for item in options.only.split(",") if item),
-                                   account=_restart_account(options.account), why=options.why)
+            selection = restart.BulkCommand(account=options.account, all_rows=options.all,
+                only=tuple(item for item in options.only.split(",") if item), why=options.why,
+                dry_run=options.dry_run, here=options.here)
+            return restart.run_command(lambda: restart.restart(stop_all=selection.all_rows, dry_run=selection.dry_run,
+                                   only=selection.only, account=_restart_account(selection.account), why=selection.why), selection)
         if options.command == "records":
             print(json.dumps(shutdown_record.read()))
             return 0
@@ -1856,7 +1859,8 @@ def recovery_refusals(unit: RetiredUnitRecovery) -> list[str]:
 
 def recovery_launch_command(unit: RetiredUnitRecovery) -> list[str]:
     arguments = [sys.executable, str(ADD_UNIT), "--production", unit.production.name, unit.name,
-                 "--resume", unit.session_id, "--cwd", str(unit.worktree), *unit_config.plan_arguments(unit.plan)]
+                 "--resume", unit.session_id, "--cwd", str(unit.worktree), "--join-recovery-locks",
+                 *unit_config.plan_arguments(unit.plan)]
     if isinstance(unit.account, accounts.NamedAccount):
         arguments.extend(["--account", unit.account.label])
     return arguments
@@ -1965,7 +1969,10 @@ def recovery_apply(name: str, *,
     try:
         record = staff.initial_snapshot()
         row = named_staff_unit(name, record)
-        with staff.row_operation(str(row.id)):
+        with staff.session_operation(row.current_session, native_key=moves.native_row_key(row.current_session)) as record:
+            current = record.by_current_session(row.current_session)
+            if current is None or current.id != row.id:
+                raise RecoveryRefused(f"{row.name}: recovery could not lock the current staff row")
             unit = recovery_find_unit(unit_production_name(row, record), str(row.id), record=record)
             completed = completion_receipt.read_receipt(recovery_resume_record(unit.production, unit.name).with_suffix(".done"),
                                                     record)

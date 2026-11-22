@@ -245,6 +245,12 @@ def _read_target(config: conf.ConfigRead, name: str, purpose: RegistryRead) -> T
     return SshTarget(name, platform, settings)
 
 
+def pinned_target_names(configuration: conf.ConfigRead) -> tuple[str, ...]:
+    """Read the names that a caller can select explicitly."""
+    pinned = configuration.value("pinned_targets", str, default="", allow_blank=True)
+    return tuple(name for item in pinned.split(",") if (name := item.strip()))
+
+
 def read_targets(path: Path | None = None, *, selected: str = "", target_name: str = "",
                  purpose: RegistryRead = RegistryRead.REQUIRE_SETTINGS_FILES,
                  configuration: conf.ConfigRead | conf.UseConfiguredValue = conf.UseConfiguredValue.CURRENT
@@ -262,10 +268,8 @@ def read_targets(path: Path | None = None, *, selected: str = "", target_name: s
         else:
             configuration = conf.read(registry)
     names = _registry_value(configuration, "targets", _target_names, purpose)
-    if selected and selected not in names:
-        pinned = configuration.value("pinned_targets", str, default="", allow_blank=True)
-        if any(name.strip() == selected for name in pinned.split(",")):
-            names = (selected,)
+    if selected and selected not in names and selected in pinned_target_names(configuration):
+        names = (selected,)
     targets: list[Target] = []
     for name in names:
         if selected and name != selected:

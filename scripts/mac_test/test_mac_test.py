@@ -437,7 +437,7 @@ class MacTestCommandTests(NotificationGuardedTestCase):
 
     def write_config(self, **changes: str | None) -> None:
         values: dict[str, str] = {
-            "ci_repo": "natepiano/hana",
+            "ci_repo": "hanallc/hana",
             "ci_variable": "MACOS_CI",
             "ci_workflow": "ci.yml",
             "ci_job": CI_JOB,
@@ -774,7 +774,7 @@ class MacTestCommandTests(NotificationGuardedTestCase):
                 errors = io.StringIO()
                 with mock.patch.dict(os.environ, self.environment), redirect_stderr(errors):
                     config = mac_test.read_config()
-                self.assertEqual(config.ci_repo, "natepiano/hana")
+                self.assertEqual(config.ci_repo, "hanallc/hana")
                 self.assertIn("warning:", errors.getvalue())
                 self.assertIn(str(self.config_path), errors.getvalue())
         empty = self.root / "no-history"
@@ -1439,6 +1439,36 @@ finally:
         self.state_directory.mkdir(exist_ok=True)
         _ = (self.state_directory / "run.json").write_text(json.dumps(record), encoding="utf-8")
         return record
+
+    def test_read_claims_keeps_whole_mac_scope_for_relative_legacy_worktree(self) -> None:
+        record = self.write_machine_wide_record(os.getpid(), Path("repositories/hana"))
+        paths = mac_test.StatePaths(self.state_directory)
+
+        claim, = mac_test.read_claims(paths)
+
+        self.assertEqual((claim.scope, claim.path, claim.record), (mac_test.WHOLE_MAC, paths.run, record))
+
+    def test_relative_legacy_cleanup_cannot_resume_from_a_reservation(self) -> None:
+        from scripts.build_hold.owning_session import NoOwningSession
+        from scripts.build_targets import build_targets
+
+        worktree = self.repository("hana")
+        owner = self.start_child()
+        record = self.write_machine_wide_record(owner.pid, Path("repositories/hana"))
+        paths = mac_test.StatePaths(self.state_directory)
+        record.update(remote_host="previous-mac", cleanup_pending=True)
+        _ = paths.run.write_text(json.dumps(record), encoding="utf-8")
+        before = paths.run.read_bytes()
+        identity = claim_state.ClaimIdentity(record["claim_id"], record["episode"], record["attempt"])
+        with mock.patch.dict(os.environ, self.environment):
+            self.assertEqual(build_targets.wait_claim_identity(paths, str(worktree), owner.pid,
+                session=NoOwningSession(), expected=identity), claim_state.NO_CLAIM_IDENTITY)
+        result = self.command("claim", "--what", "hana tests", "--pid", str(os.getpid()), "--from-pid", str(owner.pid),
+                              "--worktree", str(worktree), "--remote", "fixture-mac", "--claim-id",
+                              identity.claim_id, "--episode", identity.episode, "--attempt", identity.attempt)
+        self.assertEqual(result.returncode, 12, result.stdout + result.stderr)
+        self.assertIn("cannot adopt the Mac claim: scope", result.stderr)
+        self.assertEqual(paths.run.read_bytes(), before)
 
     def test_machine_wide_record_holds_every_repository_with_a_known_worktree(self) -> None:
         hana, liner = self.repository("hana"), self.repository("cargo-liner")
@@ -2393,7 +2423,7 @@ for arguments in (
             + "  alpha: 2 runs, newest 222222222\n"
             + "  zeta: 1 runs, newest 333333333\n"
             + "Run CI again on each branch's newest commit to make up its macOS check: "
-            + "gh workflow run ci.yml --repo natepiano/hana --ref <branch>\n",
+            + "gh workflow run ci.yml --repo hanallc/hana --ref <branch>\n",
         )
 
     def test_skipped_run_report_handles_none_failure_and_two_hundred(self) -> None:

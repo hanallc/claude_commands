@@ -939,6 +939,7 @@ def wait_claim_identity(paths: mac_test.StatePaths, repo_root: str, pid: int, *,
                   and "wait_released" not in claim.record
                   and claim.record["submitting_session"] == claim_state.session_id(session)
                   and ("remote_host" not in claim.record or claim.record.get("cleanup_pending"))
+                  and (not claim.record.get("cleanup_pending") or claim_state.cleanup_scope_is_known(paths, claim))
                   and (isinstance(block, mac_test.NoMacBlock) or "remote_host" in claim.record)]
         if paths.platform == "macos":
             claims = [claim for claim in claims
@@ -1106,6 +1107,7 @@ def reserve_assigned(args: CliArguments) -> int:
                         if paths.platform == "macos" else held.scope == scope)
                     and held.record["pid"] == args.pid
                     and "wait_released" not in held.record
+                    and (not held.record.get("cleanup_pending") or claim_state.cleanup_scope_is_known(paths, held))
                     and owner == process_start.Started(held.record["proc_start"])
                     and held.record["submitting_session"] == claim_state.session_id(assignment.session)
                     and ((args.recover_only and claim_state.claim_identity(held.record) == expected)
