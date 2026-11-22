@@ -44,7 +44,7 @@ except FileNotFoundError:
 
 import argparse
 from collections import deque
-from collections.abc import Callable, Generator, Sequence
+from collections.abc import Callable, Generator, Mapping, Sequence
 from contextlib import ExitStack, closing, contextmanager, nullcontext
 from contextvars import ContextVar
 from dataclasses import asdict, dataclass, field, replace
@@ -80,7 +80,7 @@ from scripts.copies import copies
 from scripts.lib import build_folders, cancellation, conf, land_main, main_push_lock, session_folder, unit_runs, waiting_rows
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.build_steps import gate_job_for_command, read_step_names
-from scripts.lint import sweep
+from scripts.lint import memory_admit, sweep
 from scripts.message import send_budget, session_send
 from scripts.production import (  # noqa: E402
     affected_modules, change_review, land_runs, session_staff, showrunners, staff, unit_config, unit_lookup, unit_names,
@@ -109,7 +109,7 @@ from scripts.lib import scratch  # noqa: E402
 from scripts.test_times import gate_record
 from scripts.build_queue import admission_records  # noqa: E402
 from scripts.build_queue import progress_profile
-from scripts.build_queue.admission_client import AdmissionHoldCheck  # noqa: E402
+from scripts.build_queue.admission_client import AdmissionHoldCheck, step_identity  # noqa: E402
 from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, GateJobNotRecorded, StepJob
 from scripts.build_queue.queue_place import (  # noqa: E402
     QueuePlace, QueuePlaceRefused, no_hold_wait, queue_place, suite_scope_prefix,
@@ -197,8 +197,8 @@ class SharedMachine:
 
 
 @dataclass(frozen=True)
-class NamedModuleMachine:
-    """Share resources and record the run without waiting for a build hold."""
+class HoldExemptNamedModuleMachine:
+    """Share resources and record a named run that the hold exempts."""
 
 
 @dataclass(frozen=True)
@@ -1453,7 +1453,7 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
                max_running_jobs: int = DEFAULT_MAX_RUNNING_JOBS, *,
                source: Literal["tests-only", "checkpoint"] = "tests-only", full: bool = False,
                mode: SuiteMode = SuiteMode.GATE,
-               machine: SharedMachine | NamedModuleMachine | WholeMachine = SHARED_MACHINE,
+               machine: SharedMachine | HoldExemptNamedModuleMachine | WholeMachine = SHARED_MACHINE,
                selected: AllModules | SelectedModules = ALL_MODULES,
                time_limit: gate_record.GateTimeLimit | gate_record.NoGateTimeLimit | gate_record.ReadGateTimeLimit = gate_record.READ_GATE_TIME_LIMIT) -> GateRun:
     shared = not isinstance(machine, WholeMachine)
@@ -3039,8 +3039,24 @@ def tell_time_limit(owner: str, repo: Path, run: GateRun) -> None:
 
 
 def run_named_modules(repo: Path, names: Sequence[str], module_time_limit_s: float, mode: SuiteMode) -> GateRun:
-    """Reserve resources and record the run without waiting for a build hold."""
-    return run_suites(repo, [], module_time_limit_s, machine=NamedModuleMachine(), mode=mode,
+    """Reserve resources and apply the hold exemption for the configured unit.
+
+    The unit identity is not proof against a session that claims to be that unit.
+    It is the same trust that the run limit exemption uses, and builds accepts it.
+    """
+    try:
+        exempt_unit = admission_records.read_memory_config().policy.repository_runs.exempt_unit
+    except conf.Unusable as error:
+        raise GateRefused(str(error)) from error
+    machine: SharedMachine | HoldExemptNamedModuleMachine = SHARED_MACHINE
+    if exempt_unit:
+        caller = step_identity(mode.value, str(repo))
+        labels: Mapping[str, memory_admit.UnitMembership] = {}
+        if caller.session_id and not caller.unit:
+            labels = memory_admit.priority_labels([caller.session_id])
+        if memory_admit.queue_unit(caller.unit, caller.session_id, labels) == exempt_unit:
+            machine = HoldExemptNamedModuleMachine()
+    return run_suites(repo, [], module_time_limit_s, machine=machine, mode=mode,
                       selected=SelectedModules(tuple(f"scripts/{name}" for name in names)),
                       time_limit=gate_record.NoGateTimeLimit("named modules"))
 

@@ -487,6 +487,11 @@ def _start_transient_unit(unit: str, properties: Sequence[Sequence[str]], descri
 
 
 def _adopt_direct_test_scope(seconds: int) -> None:
+    """Move this process into a deadline scope at the first unittest call.
+
+    Known limit: a child that started before this call stays outside the scope.
+    The deadline does not stop that child.
+    """
     from contextlib import ExitStack
     from secrets import token_hex
 

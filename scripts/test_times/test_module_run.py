@@ -757,25 +757,25 @@ job = gate.start_gate_job("lib", Path({str(case)!r}), {arguments!r},
 print(job.process.pid, flush=True)
 sys.exit(job.process.wait())
 """
-                with subprocess.Popen([sys.executable, "-c", source], cwd=repository, env=environment,
-                                      stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                                      stderr=subprocess.PIPE, text=True) as parent:
-                    processes.track(parent)
-                    output = parent.stdout
-                    assert output is not None
-                    self.assertTrue(select.select([output], [], [], TEST_HANG_GUARD_SECS)[0])
-                    runner_pid = int(cast(str, output.readline()))
-                    runner = os.pidfd_open(runner_pid)
-                    self.addCleanup(os.close, runner)
-                    wait_until(lambda: "ready\n" in log.read_text() or parent.poll() is not None,
-                               root, processes=(parent,))
-                    self.assertIn("ready\n", log.read_text())
-                    parent.terminate()
-                    self.assertEqual(parent.wait(timeout=TEST_HANG_GUARD_SECS), -signal.SIGTERM)
-                    self.assertTrue(select.select([runner], [], [], TEST_HANG_GUARD_SECS)[0], log.read_text())
-                    _, status = os.waitpid(runner_pid, 0)
-                    self.assertEqual(os.waitstatus_to_exitcode(status), -signal.SIGKILL, log.read_text())
-                    self.assertNotIn("Traceback", log.read_text())
+                parent = subprocess.Popen([sys.executable, "-c", source], cwd=repository, env=environment,
+                                          stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                          stderr=subprocess.PIPE, text=True)
+                processes.track(parent)
+                output = parent.stdout
+                assert output is not None
+                self.assertTrue(select.select([output], [], [], TEST_HANG_GUARD_SECS)[0])
+                runner_pid = int(cast(str, output.readline()))
+                runner = os.pidfd_open(runner_pid)
+                self.addCleanup(os.close, runner)
+                wait_until(lambda: "ready\n" in log.read_text() or parent.poll() is not None,
+                           root, processes=(parent,), watch_writes=True)
+                self.assertIn("ready\n", log.read_text())
+                parent.terminate()
+                self.assertEqual(parent.wait(timeout=TEST_HANG_GUARD_SECS), -signal.SIGTERM)
+                self.assertTrue(select.select([runner], [], [], TEST_HANG_GUARD_SECS)[0], log.read_text())
+                _, status = os.waitpid(runner_pid, 0)
+                self.assertEqual(os.waitstatus_to_exitcode(status), -signal.SIGKILL, log.read_text())
+                self.assertNotIn("Traceback", log.read_text())
 
     def test_gate_parent_death_before_bootstrap_stops_the_module(self) -> None:
         root = Path(self.enterContext(tempfile.TemporaryDirectory()))
