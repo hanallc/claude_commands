@@ -160,6 +160,18 @@ class StateReadError(ValueError):
     """A Mac coordination record cannot be read or decoded."""
 
 
+@dataclass(frozen=True)
+class StateFileReadFailed:
+    """An OS error prevented a read of the state file."""
+
+    path: Path
+    error: OSError
+
+    @property
+    def diagnostic(self) -> str:
+        return f"{self.path}: {self.error}"
+
+
 class ClaimStateUnreadable(StateReadError):
     """A claim file, or the claims folder, that cannot be read or decoded."""
 
@@ -356,19 +368,50 @@ class CleanupOnlyMacRepository(MacMirrorIdentity):
 
 
 @dataclass(frozen=True)
+class KnownMacHistoryKey:
+    """The submitting checkout has this history key."""
+
+    key: str
+
+    def __post_init__(self) -> None:
+        if not self.key or self.key == store.UNKNOWN_IDENTITY:
+            raise ValueError("the Mac history key is unavailable")
+
+
+class UnavailableMacHistoryKey:
+    """The submitting checkout has no known history key."""
+
+
+class ReadCheckoutHistoryKey:
+    """Read the history key from the submitting checkout."""
+
+
+READ_CHECKOUT_HISTORY_KEY = ReadCheckoutHistoryKey()
+
+
+def mac_history_key(key: str) -> KnownMacHistoryKey | UnavailableMacHistoryKey:
+    """Convert the result of the build history reader."""
+    if not key or key == store.UNKNOWN_IDENTITY:
+        return UnavailableMacHistoryKey()
+    return KnownMacHistoryKey(key)
+
+
+@dataclass(frozen=True)
 class ResolvedMacMirror(MacMirrorIdentity):
     """The mirror and the checkout that needs it."""
 
     worktree: str
 
-    def claim_repository(self, *, history_key: str = "") -> MacRepositoryIdentity | CleanupOnlyMacRepository:
-        from scripts.buildlog import repository
+    def claim_repository(
+        self, *, history_key: KnownMacHistoryKey | UnavailableMacHistoryKey | ReadCheckoutHistoryKey = READ_CHECKOUT_HISTORY_KEY,
+    ) -> MacRepositoryIdentity | CleanupOnlyMacRepository:
+        if isinstance(history_key, ReadCheckoutHistoryKey):
+            from scripts.buildlog import repository
 
-        if not history_key:
-            history_key = repository.repository_key(self.worktree)
-        if not history_key or history_key == store.UNKNOWN_IDENTITY:
+            history_key = mac_history_key(repository.repository_key(self.worktree))
+        if isinstance(history_key, UnavailableMacHistoryKey):
             return CleanupOnlyMacRepository(self.key, self.mirror_name, self.claim_file, self.fence_directory)
-        return MacRepositoryIdentity(self.key, self.mirror_name, self.claim_file, self.fence_directory, history_key)
+        return MacRepositoryIdentity(self.key, self.mirror_name, self.claim_file, self.fence_directory, history_key.key)
 
 
 @dataclass(frozen=True)
@@ -704,11 +747,24 @@ def locked(path: Path) -> Generator[None, None, None]:
 
 
 def read_json_object(path: Path) -> dict[str, object] | None:
+    values = _read_json_object(path)
+    if isinstance(values, StateFileReadFailed):
+        raise StateReadError(values.diagnostic) from values.error
+    return values
+
+
+def _read_json_object(path: Path) -> dict[str, object] | None | StateFileReadFailed:
     try:
-        decoded = cast(object, json.loads(path.read_text(encoding="utf-8")))
+        contents = path.read_text(encoding="utf-8")
     except FileNotFoundError:
         return None
-    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+    except OSError as error:
+        return StateFileReadFailed(path, error)
+    except UnicodeError as error:
+        raise StateReadError(f"{path}: {error}") from error
+    try:
+        decoded = cast(object, json.loads(contents))
+    except (ValueError, RecursionError) as error:
         raise StateReadError(f"{path}: {error}") from error
     if not isinstance(decoded, dict):
         raise StateReadError(f"{path} does not contain a JSON object")
@@ -989,9 +1045,11 @@ class NoWaitRemoval:
     """Release has no saved removal record for this reservation."""
 
 
-def read_wait_removal(path: Path) -> WaiterProcessIdentity | NoWaitRemoval:
+def read_wait_removal(path: Path) -> WaiterProcessIdentity | NoWaitRemoval | StateFileReadFailed:
     """Read the owner from the reservation that release moved to this path."""
-    values = read_json_object(path)
+    values = _read_json_object(path)
+    if isinstance(values, StateFileReadFailed):
+        return values
     if values is None:
         return NoWaitRemoval()
     record = decode_run(values, path, moved_from_claim=True)
@@ -1026,10 +1084,15 @@ def _wait_slot_has_claim(paths: StatePaths, location: Path, live_paths: set[Path
     return isinstance(saved, UnrecordedReservationPath) or saved.path in live_paths
 
 
+_reported_wait_removal_reads: dict[Path, set[Path]] = {}
+
+
 def sweep_wait_locations(paths: StatePaths, live_paths: set[Path]) -> None:
     """Sweep wait records after the sweep of live claims under the provider lock."""
     key = "[0-9a-f]" * 64
     retained_locations: set[Path] = set()
+    reported_reads = _reported_wait_removal_reads.get(paths.wait_locations, set())
+    failed_reads: set[Path] = set()
     for path in paths.wait_locations.glob(f"{key}.released"):
         try:
             try:
@@ -1042,10 +1105,20 @@ def sweep_wait_locations(paths: StatePaths, live_paths: set[Path]) -> None:
                     path.unlink(missing_ok=True)
                     print(str(error), file=sys.stderr)
                 continue
-            if isinstance(owner, WaiterProcessIdentity) and owner.ended():
+            if isinstance(owner, StateFileReadFailed):
+                failed_reads.add(path)
+                # Keep the saved slot path until the sweep can read the removal record.
+                retained_locations.add(path.with_suffix(""))
+                if path not in reported_reads:
+                    print(owner.diagnostic, file=sys.stderr)
+            elif isinstance(owner, WaiterProcessIdentity) and owner.ended():
                 path.unlink(missing_ok=True)
         except OSError as error:
             print(str(error), file=sys.stderr)
+    if failed_reads:
+        _reported_wait_removal_reads[paths.wait_locations] = failed_reads
+    else:
+        _ = _reported_wait_removal_reads.pop(paths.wait_locations, None)
     for path in paths.wait_locations.glob(key):
         if path in retained_locations:
             continue

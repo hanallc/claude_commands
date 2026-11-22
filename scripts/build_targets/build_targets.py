@@ -1265,6 +1265,9 @@ def command_release_wait(pid: int, *,
             matched = False
             try:
                 removal = claim_state.read_wait_removal(claim_state.released_wait_path(paths, identity))
+                if isinstance(removal, claim_state.StateFileReadFailed):
+                    print(removal.diagnostic, file=sys.stderr)
+                    return 1
                 if isinstance(removal, claim_state.WaiterProcessIdentity):
                     located = True
                     continue

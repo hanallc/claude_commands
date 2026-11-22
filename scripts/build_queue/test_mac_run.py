@@ -3,6 +3,7 @@ from collections.abc import Callable, Generator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack, contextmanager, redirect_stderr, redirect_stdout
 from dataclasses import replace
+import errno
 import fcntl
 from io import StringIO
 import json
@@ -23,7 +24,7 @@ from scripts.build_queue import execution_identity, mac_run, placement, step_est
 from scripts.build_queue.admission_records import RepositoryIdentity
 from scripts.build_queue import admission_wire as wire
 from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, StepJob
-from scripts.buildlog import repository, sync as buildlog_sync
+from scripts.buildlog import repository, store, sync as buildlog_sync
 from scripts.build_targets import build_targets, target_config
 from scripts.copies import copies
 from scripts.direct import phase_wait_holder
@@ -934,6 +935,38 @@ sys.exit(71)
         self.assertEqual(len(diagnostic.getvalue().splitlines()), 1)
         self.assertFalse(removal.exists())
 
+    def test_wait_removal_read_failure_reports_once_and_keeps_the_record(self) -> None:
+        waiter = self.native_claim(self.checkout)
+        self.assertEqual(mac_test.command_claim(waiter, self.paths, watch_claim=False), 0)
+        claim, = claim_state.read_claims(self.paths)
+        identity = claim_state.claim_identity(claim.record)
+        self.assertEqual(build_targets.command_release_wait(waiter.pid, identity=identity), 0)
+        removal = claim_state.released_wait_path(self.paths, identity)
+        contents = removal.read_bytes()
+        read_text = Path.read_text
+
+        for failure in (PermissionError(errno.EACCES, "fixture permission error"), OSError(errno.EIO, "fixture I/O error")):
+            with self.subTest(failure=failure):
+                def read_with_failure(path: Path, *, encoding: str = "utf-8") -> str:
+                    if path == removal:
+                        raise failure
+                    return read_text(path, encoding=encoding)
+
+                with mock.patch.object(Path, "read_text", autospec=True, side_effect=read_with_failure):
+                    with redirect_stderr(StringIO()) as diagnostic, claim_state.locked(self.paths.lock):
+                        self.assertEqual(mac_test.live_claims(self.paths), ())
+                        self.assertEqual(mac_test.live_claims(self.paths), ())
+                    self.assertEqual(diagnostic.getvalue().splitlines(), [f"{removal}: {failure}"])
+                    self.assertEqual(removal.read_bytes(), contents)
+                    with redirect_stderr(StringIO()) as diagnostic:
+                        self.assertEqual(build_targets.command_release_wait(waiter.pid, identity=identity), 1)
+                    self.assertEqual(diagnostic.getvalue().splitlines(), [f"{removal}: {failure}"])
+                with claim_state.locked(self.paths.lock):
+                    self.assertEqual(mac_test.live_claims(self.paths), ())
+                self.assertEqual(removal.read_bytes(), contents)
+
+        self.assertEqual(build_targets.command_release_wait(waiter.pid, identity=identity), 0)
+
     def test_repeated_release_wait_skips_unrelated_damage(self) -> None:
         waiter = self.native_claim(self.checkout)
         self.assertEqual(mac_test.command_claim(waiter, self.paths, watch_claim=False), 0)
@@ -1197,8 +1230,7 @@ with patch.object(Path, "unlink", interrupt_unlink), patch.object(Path, "replace
                     self.assertIsInstance(claim_state.read_retired_mac_reservation(self.paths, identity),
                                           claim_state.NoSavedRetryPermission)
                     if recovery in ("release-with-damaged-claim", "release-with-damaged-location"):
-                        removal = claim_state.released_wait_path(self.paths, identity)
-                        self.assertEqual(reads.call_args_list, [mock.call(removal), mock.call(proof), mock.call(old_path)])
+                        self.assertEqual(reads.call_args_list, [mock.call(proof), mock.call(old_path)])
                         self.assertEqual(build_targets.command_release_wait(waiting.pid, identity=identity), 0)
                     if recovery == "release-with-damaged-claim":
                         self.assertEqual(damaged.read_text(), "{")
@@ -1426,6 +1458,24 @@ with patch.object(Path, "unlink", interrupt_unlink), patch.object(Path, "replace
                     check.assert_called_once_with(config, "old-mac", offload.ALL_MIRRORS if legacy else repo, "mac", 1)
                     release_child.assert_called_once()
                     run.assert_called_once()
+
+    def test_claim_repository_distinguishes_the_three_history_key_cases(self) -> None:
+        mirror = claim_state.mac_repository_identity(str(self.checkout))
+        assert isinstance(mirror, claim_state.ResolvedMacMirror)
+        history_key = "https://github.com/Team/Repository"
+        supplied_key = claim_state.KnownMacHistoryKey(history_key)
+        with mock.patch.object(repository, "repository_key", return_value=history_key) as read:
+            supplied = mirror.claim_repository(history_key=supplied_key)
+            absent = mirror.claim_repository(history_key=claim_state.UnavailableMacHistoryKey())
+            read.assert_not_called()
+            self.assertEqual(mirror.claim_repository(), supplied)
+            read.assert_called_once_with(str(self.checkout))
+            read.return_value = store.UNKNOWN_IDENTITY
+            self.assertEqual(mirror.claim_repository(), absent)
+        self.assertIsInstance(supplied, claim_state.MacRepositoryIdentity)
+        self.assertEqual(supplied.record(), {**mirror.record(), "history_key": history_key})
+        self.assertIsInstance(absent, claim_state.CleanupOnlyMacRepository)
+        self.assertEqual(absent.record(), mirror.record())
 
     def test_new_remote_claim_refuses_an_identity_without_history(self) -> None:
         args = self.native_claim(self.checkout)

@@ -872,7 +872,7 @@ class OffloadSettingsTests(unittest.TestCase):
         responses = [offload.COMMAND_COULD_NOT_START, offload.CommandOutput(0, "", "")]
         mirror = claim_state.ResolvedMacMirror("fixture-hana", "hana", "hana.json", "hana", str(self.root))
         history_key = "https://fixture.invalid/hana"
-        saved = mirror.claim_repository(history_key=history_key)
+        saved = mirror.claim_repository(history_key=claim_state.KnownMacHistoryKey(history_key))
 
         def complete_claim(controller: offload.ProcessController, arguments: Sequence[str],
                            attempt: offload.LocalClaimAttempt) -> None:
