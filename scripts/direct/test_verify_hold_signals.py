@@ -162,6 +162,7 @@ placement_once
 RUN_LOG=$1 RUN_LOG_PIDS=() CMD=test held_token=$2 VERIFY_START_DIR=$3
 RUN_STEP_PID=""
 PY=$VERIFY_START_DIR/../lib/py
+exec {exit_stderr}>&2
 exit_diagnostics="$RUN_LOG.exit-diagnostics"
 : > "$exit_diagnostics"
 interrupt_hold_wait() { printf 'hold diagnostic\n' >&2; }
@@ -183,11 +184,11 @@ finish_verify_run() { :; }
                                 env=verify_test_environment(), capture_output=True, text=True,
                                 check=False, timeout=SIGNAL_EXIT_SECONDS)
         self.assertEqual(result.returncode, 128, result.stdout + result.stderr)
-        self.assertEqual(result.stdout, "\n".join((
+        self.assertEqual(result.stderr, "\n".join((
             "hold diagnostic", "cleanup diagnostic", "interrupted",
             "verify.sh: interrupted before test completed (status 128).", "",
         )))
-        self.assertEqual(result.stderr, "")
+        self.assertEqual(result.stdout, "")
         self.assertFalse((self.fixture.root / "run.log.exit-diagnostics").exists())
 
     def test_interrupted_exit_finishes_with_full_stdout(self) -> None:
@@ -247,7 +248,7 @@ trap 'verify_interrupted 15' TERM
         action = r'''
 start_run_log
 kill -0 "${RUN_LOG_PIDS[1]}" || exit 90
-# Write enough diagnostics to fill the pipe to tee while tee cannot write.
+# Keep the original stderr pipe full during diagnostic forwarding.
 cleanup_diagnostic_width=1048576
 trap 'verify_interrupted 15' TERM
 kill -TERM "$$"

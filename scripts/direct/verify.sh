@@ -4275,6 +4275,9 @@ stop_interrupted_run_log() {
     RUN_LOG_PIDS=()
 }
 
+# Save the original stderr before the run log redirects it.
+{ exec {exit_stderr}>&1; } 1>&2 2>/dev/null || exit_stderr=""
+
 if [[ -n "${CACHE_DIR}" ]] && mkdir -p "${CACHE_DIR}"; then
     # Taken now, after the token and hold waits: an edit made while this call
     # waited is part of the tree it runs on.
@@ -4363,10 +4366,10 @@ verify_cleanup() {
 
 finish_exit_diagnostics() {
     [[ -n "$exit_diagnostics" ]] || return 0
-    if [[ -s "$exit_diagnostics" ]]; then
+    if [[ -s "$exit_diagnostics" && -n "${exit_stderr:-}" ]]; then
         # Forward diagnostics only after cleanup releases the token and lease.
         VERIFY_PY_HELPER=VERIFY_EXIT_DIAGNOSTIC "$PY" "$VERIFY_START_DIR/../lib/time_limit.py" 1 0 \
-            cat -- "$exit_diagnostics" 2>/dev/null || true
+            cat -- "$exit_diagnostics" 2>/dev/null >&"$exit_stderr" || true
     fi
     rm -f -- "$exit_diagnostics" || true
 }
