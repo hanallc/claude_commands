@@ -623,6 +623,9 @@ gate.run_gate_suites = fail_suites
         producer = self.review_producer(doc)
         runner = staff.by_id(producer)
         assert runner is not None and isinstance(runner.parent, staff.ReportsTo)
+        owner = staff.by_id(runner.parent.id)
+        assert owner is not None
+        self.environment["CODEX_THREAD_ID"] = owner.current_session
         timer = Path(self.environment["NOTIFIER_STATE_DIR"]) / f"showrunner-{runner.parent.id}"
         timer.mkdir(parents=True)
         self.write(timer / "conf", f"TARGET=session:{runner.parent.id}\n"
