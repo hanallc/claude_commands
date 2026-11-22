@@ -365,6 +365,22 @@ def _adopt_session_level_files(session_dir: Path) -> None:
             os.replace(session_dir / name, target / name)
 
 
+class _LocatedPhaseState(NamedTuple):
+    directory: Path
+    state: dict[str, object]
+
+
+def _read_located_phase_state(directory: Path) -> _LocatedPhaseState:
+    state = read_state(directory)
+    if state or (directory / STATE_FILE).exists():
+        return _LocatedPhaseState(directory, state)
+    session_dir = directory.parent.parent
+    legacy = read_state(session_dir)
+    if phase_directory_name(_state_phase(legacy)) == directory.name:
+        return _LocatedPhaseState(session_dir, legacy)
+    return _LocatedPhaseState(directory, state)
+
+
 class _PhaseRunHome(NamedTuple):
     unit: str
     root: Path
@@ -438,22 +454,12 @@ def _require_model_worktree(root: Path, owner_unit: str) -> None:
         raise StateRefused(f"{root}: {error}. {fix}") from error
 
 
-def _record_worktree(directory: Path, root: Path) -> None:
-    """Record a separate checkout after verifying its worktree record."""
-    home = _phase_run_home(directory)
-    is_home = root == home.root.resolve()
-    if not is_home:
-        _require_model_worktree(root, home.unit)
-    directory.mkdir(parents=True, exist_ok=True)
-    if is_home:
-        (directory / WORKTREE_FILE).unlink(missing_ok=True)
-    else:
-        write_text_atomic(directory / WORKTREE_FILE, str(root) + "\n")
-
-
 def _record_baselines(directory: Path, root: Path) -> None:
     """Keep the first launch's commit and status while the caller holds the phase lock."""
     baseline = directory / BASELINE_FILE
+    legacy_baseline = directory.parent.parent / BASELINE_FILE
+    if legacy_baseline.is_file() and _read_located_phase_state(directory).directory == legacy_baseline.parent:
+        baseline = legacy_baseline
     if baseline.exists():
         try:
             _ = commit_id(root, baseline.read_text().strip())
@@ -471,55 +477,87 @@ def _record_baselines(directory: Path, root: Path) -> None:
 
 
 def _has_recorded_checkout(directory: Path) -> bool:
-    return (directory / WORKTREE_FILE).is_file() or (directory / BASELINE_FILE).is_file()
+    if (directory / WORKTREE_FILE).is_file() or (directory / BASELINE_FILE).is_file():
+        return True
+    session_dir = directory.parent.parent
+    return (session_dir / BASELINE_FILE).is_file() and _read_located_phase_state(directory).directory == session_dir
 
 
 def _require_checkout_move(directory: Path) -> None:
     """Check the reservation state while the caller holds the phase lock."""
-    state = read_state(directory)
-    state_in_phase = bool(state) or (directory / STATE_FILE).exists()
-    if not state_in_phase:
-        state = read_state(directory.parent.parent)
-        if phase_directory_name(_state_phase(state)) != directory.name:
-            return
+    location, state = _read_located_phase_state(directory)
+    state_file = location / STATE_FILE
+    if not state and not state_file.exists():
+        return
     kind = _string(state.get("kind")) or "unreadable"
     if kind == AWAITING_FIRST_TOUCH:
         return
     if kind in HOLDS_RESERVATION:
         action = "Release the phase reservation, then claim again."
-    elif state_in_phase and kind in BOARD_STATES.values():
+    elif kind in BOARD_STATES.values():
         command = shlex.join(["python3", str(Path(__file__).resolve()), "clear",
                               "--session-dir", str(directory.parent.parent), "--phase", directory.name])
         action = f"Run {command}, then claim again."
     else:
         action = "Check the phase reservation state, then claim again."
-    raise StateRefused(f"phase {directory.name} has reservation state {kind!r}. {action}")
+    raise StateRefused(f"{state_file}: phase {directory.name} has reservation state {kind!r}. {action}")
+
+
+class _NoRecordedCheckout(NamedTuple):
+    """The phase has no checkout or baseline record."""
+
+
+class _RecordedCheckout(NamedTuple):
+    """A recorded path and its model and Git checkout status."""
+
+    root: Path
+    model: bool
+    available: bool
+
+
+def _recorded_checkout(directory: Path) -> _NoRecordedCheckout | _RecordedCheckout:
+    if not _has_recorded_checkout(directory):
+        return _NoRecordedCheckout()
+    root = phase_worktree(directory).root.resolve()
+    git_root = repository_root(root)
+    return _RecordedCheckout(root, model=isinstance(_model_worktree_path(root), _ModelWorktreePath),
+                             available=git_root is not None and git_root.resolve() == root)
 
 
 def _record_claim_checkout(directory: Path, requested: Path | None, *, repo_argument: str | None) -> Path | None:
     """Select and record the checkout while the caller holds the phase lock."""
-    root = requested
-    if _has_recorded_checkout(directory):
-        recorded = phase_worktree(directory).root.resolve()
-        recorded_exists = recorded.is_dir()
-        if requested != recorded and (requested is not None or repo_argument is not None):
-            if isinstance(_model_worktree_path(recorded), ValueError):
-                if requested is not None:
-                    _require_model_worktree(requested, _phase_run_home(directory).unit)
-                    _require_checkout_move(directory)
-                    _record_baselines(directory, requested)
-                    _record_worktree(directory, requested)
-                    return requested
-                if repo_argument is not None and Path(repo_argument).resolve() != recorded:
-                    raise StateRefused(f"{repo_argument}: --repo does not name a Git checkout")
-            elif requested is not None and not recorded_exists:
-                _require_checkout_move(directory)
-        if recorded_exists:
-            root = repository_root(recorded)
-    if root is not None:
-        root = root.resolve()
-        _record_worktree(directory, root)
-        _record_baselines(directory, root)
+    replacing = False
+    require_model = False
+    match _recorded_checkout(directory), requested:
+        case _NoRecordedCheckout(), Path() as root:
+            pass
+        case _NoRecordedCheckout(), None:
+            return None
+        case _RecordedCheckout(root=root, model=True, available=True), _:
+            pass
+        case _RecordedCheckout(root=root, model=False, available=True), Path() if root == requested:
+            pass
+        case _RecordedCheckout(root=previous, model=False), Path() as root if root != previous:
+            replacing = True
+            require_model = True
+        case _RecordedCheckout(model=True, available=False), Path() as root:
+            replacing = True
+        case _RecordedCheckout(root=previous), _:
+            if requested is None and repo_argument is not None and Path(repo_argument).resolve() != previous:
+                raise StateRefused(f"{repo_argument}: --repo does not name a Git checkout; recorded checkout is {previous}")
+            raise StateRefused(f"{previous}: no usable checkout for this phase. Pass --repo with a valid checkout.")
+
+    home = _phase_run_home(directory)
+    is_home = root == home.root.resolve()
+    if require_model or not is_home:
+        _require_model_worktree(root, home.unit)
+    if replacing:
+        _require_checkout_move(directory)
+    _record_baselines(directory, root)
+    if is_home:
+        (directory / WORKTREE_FILE).unlink(missing_ok=True)
+    else:
+        write_text_atomic(directory / WORKTREE_FILE, str(root) + "\n")
     return root
 
 
@@ -705,10 +743,10 @@ def clear(phase_dir: Path, released: str = "", repo: Path = WORKING_DIRECTORY) -
     name `repo` resolves to the recorded commit. The recorded commit remains in the release marker
     until enrollment restores the phase. `Active` clears only when berth's board in `repo` shows its
     reservation released without a checkpoint; that clear writes no release marker."""
-    if not (phase_dir / STATE_FILE).is_file():
+    if not (phase_dir / STATE_FILE).is_file() and not (phase_dir.parent.parent / STATE_FILE).is_file():
         return False
     with phase_lock(phase_dir):
-        state = read_state(phase_dir)
+        location, state = _read_located_phase_state(phase_dir)
         kind = _string(state.get("kind"))
         if not kind:
             return False
@@ -721,6 +759,8 @@ def clear(phase_dir: Path, released: str = "", repo: Path = WORKING_DIRECTORY) -
             released = ""
         elif kind not in BOARD_STATES.values():
             raise StateRefused(f"the phase is {kind}; commit its checkpoint and confirm the release first")
+        if location != phase_dir:
+            _adopt_session_level_files(location)
         if released:
             # Publish proof before unlinking the state, so a concurrent edit never sees a lost record.
             write_text_atomic(phase_dir / RELEASED_FILE, released + "\n")
@@ -1034,6 +1074,8 @@ def _record_active_command(args: argparse.Namespace) -> int:
 
 def _claim_command(args: argparse.Namespace) -> int:
     """Acquire a phase's reservation over its whole files list before any worker edits.
+
+    If the caller omits `--repo`, resolve `.` to its Git checkout.
 
     A worker's first edit is claimed only when the worker runs the berth check itself: a Codex worker
     whose hook never fires, on either machine, edits with no reservation, and drift charges those

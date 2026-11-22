@@ -233,7 +233,19 @@ class WorktreeAttributionTests(unittest.TestCase):
         self.assertEqual(code, 2)
         self.assertIn(f"{outside}: --repo does not name a Git checkout", errors)
         self.assertEqual(worktree_file.read_text(), str(self.first) + "\n")
-        self.assertEqual(self.claim("3", outside), (0, ""))
+
+    def test_claim_with_no_recorded_checkout_and_no_git_checkout_does_nothing(self) -> None:
+        outside = self.session.parent / "outside-git"
+        outside.mkdir()
+        output = io.StringIO()
+
+        with contextlib.redirect_stdout(output):
+            code = phase_reservation.main(["claim", "--session-dir", str(self.session),
+                                           "--phase", "3", "--repo", str(outside)])
+
+        self.assertEqual(code, 0)
+        self.assertIn("no repository or no files to claim", output.getvalue())
+        self.assertFalse(phase_reservation.phase_directory(self.session, "3").exists())
 
     def test_claim_tells_a_phase_without_a_reservation_to_clear_its_state(self) -> None:
         clone = self.session.parent / "phase-2-clone"
@@ -249,20 +261,34 @@ class WorktreeAttributionTests(unittest.TestCase):
                       errors)
         self.assertEqual((directory / phase_reservation.WORKTREE_FILE).read_text(), str(clone) + "\n")
 
-    def test_claim_tells_a_phase_with_legacy_state_to_check_its_state(self) -> None:
+    def test_claim_can_clear_legacy_state_before_moving(self) -> None:
         clone = self.session.parent / "phase-2-clone"
         self.record_clone("2", clone)
         directory = phase_reservation.phase_directory(self.session, "2")
-        _ = (self.session / phase_reservation.STATE_FILE).write_text(json.dumps({
-            "kind": phase_reservation.NOT_ENROLLED, "phase": "2"}))
+        state_file = self.session / phase_reservation.STATE_FILE
+        _ = state_file.write_text(json.dumps({"kind": phase_reservation.NOT_ENROLLED, "phase": "2"}))
+        baseline = phase_reservation.commit_id(clone, "HEAD") + "\n"
+        status = "?? first-launch.txt\n"
+        _ = (self.session / phase_reservation.BASELINE_FILE).write_text(baseline)
+        _ = (self.session / phase_reservation.BASELINE_STATUS_FILE).write_text(status)
 
         code, errors = self.claim("2", self.second)
 
         self.assertEqual(code, 2)
+        self.assertIn(str(state_file), errors)
         self.assertIn(f"state {phase_reservation.NOT_ENROLLED!r}", errors)
-        self.assertIn("Check the phase reservation state, then claim again.", errors)
-        self.assertNotIn("phase_reservation.py clear", errors)
+        self.assertIn("phase_reservation.py clear " + shlex.join(["--session-dir", str(self.session), "--phase", "2"]),
+                      errors)
         self.assertEqual((directory / phase_reservation.WORKTREE_FILE).read_text(), str(clone) + "\n")
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(phase_reservation.main(["clear", "--session-dir", str(self.session), "--phase", "2"]), 0)
+        self.assertFalse(state_file.exists())
+        self.assertFalse((directory / phase_reservation.STATE_FILE).exists())
+        self.assertEqual(self.claim("2", self.second), (0, ""))
+        self.assertEqual((directory / phase_reservation.WORKTREE_FILE).read_text(), str(self.second) + "\n")
+        self.assertEqual((directory / phase_reservation.BASELINE_FILE).read_text(), baseline)
+        self.assertEqual((directory / phase_reservation.BASELINE_STATUS_FILE).read_text(), status)
 
     def test_claim_uses_the_unit_word_from_completed_records(self) -> None:
         main = self.session.parent / ".claude"
@@ -549,7 +575,7 @@ class WorktreeAttributionTests(unittest.TestCase):
         directory = phase_reservation.phase_directory(self.session, "1")
         self.assertEqual(self.claim("1", self.second), (0, ""))
         before = {name: (directory / name).read_bytes() for name in
-                  (phase_reservation.BASELINE_FILE, phase_reservation.BASELINE_STATUS_FILE)}
+                  (phase_reservation.WORKTREE_FILE, phase_reservation.BASELINE_FILE, phase_reservation.BASELINE_STATUS_FILE)}
         _ = subprocess.run(["git", "-C", str(self.first), "worktree", "remove", str(self.second)],
                            check=True, capture_output=True, timeout=TEST_HANG_GUARD_SECS)
         _ = subprocess.run(["git", "-C", str(self.first), "checkout", "-q", "--orphan", "replacement"],
@@ -572,6 +598,22 @@ class WorktreeAttributionTests(unittest.TestCase):
         self.assertIn(str(replacement), errors)
         self.assertEqual({name: (directory / name).read_bytes() for name in before}, before)
 
+    def test_claim_refuses_when_the_recorded_model_checkout_and_request_are_missing(self) -> None:
+        directory = phase_reservation.phase_directory(self.session, "1")
+        self.assertEqual(self.claim("1", self.second), (0, ""))
+        before = {name: (directory / name).read_bytes() for name in
+                  (phase_reservation.WORKTREE_FILE, phase_reservation.BASELINE_FILE, phase_reservation.BASELINE_STATUS_FILE)}
+        _ = subprocess.run(["git", "-C", str(self.first), "worktree", "remove", str(self.second)],
+                           check=True, capture_output=True, timeout=TEST_HANG_GUARD_SECS)
+        missing = self.session.parent / "missing"
+
+        code, errors = self.claim("1", missing)
+
+        self.assertEqual(code, 2)
+        self.assertIn(f"{missing}: --repo does not name a Git checkout", errors)
+        self.assertIn(f"recorded checkout is {self.second}", errors)
+        self.assertEqual({name: (directory / name).read_bytes() for name in before}, before)
+
     def test_claim_keeps_a_baseline_present_in_a_replacement_checkout(self) -> None:
         directory = phase_reservation.phase_directory(self.session, "1")
         self.assertEqual(self.claim("1", self.second), (0, ""))
@@ -579,6 +621,7 @@ class WorktreeAttributionTests(unittest.TestCase):
                   (phase_reservation.BASELINE_FILE, phase_reservation.BASELINE_STATUS_FILE)}
         _ = subprocess.run(["git", "-C", str(self.first), "worktree", "remove", str(self.second)],
                            check=True, capture_output=True, timeout=TEST_HANG_GUARD_SECS)
+        self.second.mkdir()
         self.assertEqual(self.claim("1", self.first), (0, ""))
         self.assertFalse((directory / phase_reservation.WORKTREE_FILE).exists())
         self.assertEqual({name: (directory / name).read_bytes() for name in before}, before)
