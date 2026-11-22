@@ -403,7 +403,7 @@ def _require_model_worktree(root: Path, owner_unit: str) -> None:
         model_path = build_folders.worktree_path(repo, unit, short_name).absolute()
         if root != model_path.resolve():
             raise ValueError("the checkout is outside the worktree model")
-        if unit != owner_unit:
+        if unit != owner_unit and not worktrees.has_unit_word(owner_unit, unit):
             raise ValueError(f"the checkout is for unit {unit!r}, and the run belongs to {owner_unit!r}")
         record = worktrees.checkout_record(model_path)
         if (record is None or record.stage is not worktrees.MakeStage.DONE
