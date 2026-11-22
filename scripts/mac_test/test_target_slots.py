@@ -125,7 +125,7 @@ class RepositorySlotTests(unittest.TestCase):
         private = copies_environment(self.root)
         _ = shutil.copy2(Path(private["CONF_DIR"]) / "build_folders.conf", self.root / "build_folders.conf")
         _ = write_config_fixture(self.root / "build_folders.conf",
-            "names.repository_key_length=8\npatterns.mirror={repository}/{owner}-s{slot}\n")
+            "names.repository_key_length=8\n")
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
             **config_environment(self.root),
             **private,

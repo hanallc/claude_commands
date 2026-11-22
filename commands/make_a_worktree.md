@@ -3,6 +3,7 @@ description: Create a Git worktree and branch.
 ---
 
 1. Get the repo word, unit name, and short name. Use the current repo word if the user omits it.
+   Use `worktree` for the main worktree of a unit or style production.
 2. Find the source at `~/rust/<repo>`. For `claude`, use `~/.claude`.
 3. Show the repo, unit, short name, and branch `<unit>-<short-name>`. Wait for approval.
 4. Run `bash ~/.claude/scripts/worktree/make_worktree.sh <repo> <unit> <short-name>`. Keep its output path.

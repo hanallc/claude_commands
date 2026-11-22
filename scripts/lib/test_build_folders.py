@@ -553,7 +553,7 @@ class BuildFolderTests(unittest.TestCase):
         _ = write_config_fixture(config / "build_folders.conf",
             "patterns.temporary={repository}/{owner}-{purpose}-{suffix}\npatterns.gate={purpose}-{suffix}\n"
             + "patterns.standing={repository}/{owner}-gate{suffix}\n"
-            + "patterns.mirror={repository}/{owner}-s{slot}\npatterns.target={purpose}\npatterns.shell-cache={repository}\n"
+            + "patterns.target={purpose}\n"
             + "patterns.scratch={purpose}-{suffix}\npatterns.legacy-unique={purpose}{suffix}\n"
             + "patterns.legacy-stable={purpose}\nnames.repository_key_length=8\n"
             + "patterns.tool={purpose}{suffix}\npatterns.named={showrunner}-{unit}/{work}-{purpose}\n"
@@ -2206,7 +2206,7 @@ assert not loaded, loaded
         cases: list[tuple[folders.BuildFolderKind, str]] = [
             ("temporary", "hana-key/unit-proof-abcdef"), ("gate", "proof-abcdef"),
             ("standing", "hana-key/unit-gate"), ("editable", "hana-key-unit/proof"),
-            ("mirror", "hana-key/unit-s3"), ("target", "proof"), ("shell-cache", "hana-key"),
+            ("mirror", "hana-key/unit-s3"), ("target", "proof"),
         ]
         for kind, expected in cases:
             with self.subTest(kind=kind):

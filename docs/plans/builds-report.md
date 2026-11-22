@@ -1799,7 +1799,7 @@ Builds asked for verify's folder layout phase 4 (10c25b033) in this branch befor
 - `scripts/disks/sessions.py`:
   - `session_report` reads the root from `session_folder.session_root`. Until that folder exists, it returns nothing and the page shows no card.
   - `read_sessions` lists each folder under the root, largest first. Dot folders, links and files are not sessions.
-  - Size: `measure.tree_size` of the folder at `measure.drive_path`. On natedev `/session` is a mount of `/build/session`, so the size comes from the build drive's tree.
+  - Size: `measure.tree_size` of the folder at `measure.drive_path`. On natedev `/session` is a bind of `/home/natepiano/session`, so the size comes from the system disk tree.
   - Held folders: each `scratch.holds()` path inside the folder, by its path in the folder. A hold that ended with unsaved work shows "(unsaved work)".
   - State: `session_records.session_liveness` of the session id in `.session.json`: running, ended, or unknown ("—").
   - No code deletes a session folder yet, so the card shows no delete time (condition 5). The held folders go when their task ends (`scratch.end`); the task name is the tooltip of each held folder.

@@ -31,8 +31,8 @@ entry: "/showrunner:accounts table: two 5-hour columns removed" (two-accounts, 2
   Case and later words do not change that result. Other verdicts return the row and verdict to its unit.
   The fix returns as a new row.
 - **Feature log.** A landed row adds a feature-log note when the production's project is one the feature log knows.
-  The feature log stores notes for `~/.claude` under project `claude` (`hanallc/claude_commands`).
-  Ask the Hanadocs owner to add the `feature-log/claude/` folder and its Base.
+  ~/.claude becomes a feature-log project (`claude`, repo hanallc/claude_commands), so build-followups changes land
+  as notes too. The vault folder `feature-log/claude/` and its Base are asked of hanadocs.
 
 ## Checkpoint 1 — the list everywhere
 
