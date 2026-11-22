@@ -101,7 +101,13 @@ Other options include `--permanent`, `--account`, `--model`, `--port`, `--resume
   A failed trust write prints one anomaly and prevents the start.
 
 - **Steps**, each skipped when already done: the brief stub beside the production doc at `<its directory>/<branch>.md` (`## Source`, a zone stamp and the user's words); the unit staff row and its `.unit.toml`; commit `production(<showrunner name>): add unit <unit> (<plan|brief|standby|permanent>)` on the merge branch for a brief stub or a brief-to-plan switch, which is not pushed here and goes out with the next merge push (user, 2026-10-08); `git worktree add` from the local merge branch, with no push of the unit branch (the unit's first checkpoint push sets its upstream), plus `branch.<branch>.cargoBerthTarget` when the repo has `.claude/config/berth.toml`; the herdr session (Launch below); the wait for `/remote-control is active` (default 90 s, last 15 pane lines on timeout); one LOG line `added <unit> (<mode>), worktree <path>`. It prints `<unit> started: herdr session attach <name>`. Shutdown restart resumes the staff session directly.
- New units select the configured units account through `accounts.account_for_group_launch("unit", ...)`. Resumes use the pane launch’s account when available, else the configured units account. `--source-fallback` must name the pane launch’s account. Resume model selection uses explicit `--model`, then the pane launch, then the last assistant model from the unit session (`transcript_model`); otherwise it uses the director model.
+ New units use the configured units account through `accounts.account_for_group_launch("unit", ...)`.
+ Resumes use the pane launch's account when available and the configured units account otherwise.
+ `--source-fallback` must name the pane launch's account.
+ A resume uses the model and effort from the latest real assistant turn across the Claude homes.
+ An explicit `--model` overrides the turn's model.
+ If no turn supplies a model, the pane launch supplies the fallback model.
+ The director settings supply any model or effort that remains unset.
 
 - **Launch.** `launch_session` starts the shared herdr server and opens the unit's tab in its production workspace.
   The tab title uses the unit name. The agent name uses the production and unit names.
@@ -204,7 +210,11 @@ The queue survives a unit rename because its key is the fixed staff id.
 - `[assignments]` has `production=claude`; `[production.claude]` has `director=opus:xhigh`. There is no `[production.codex]`: unit directors launch only on Claude, and the showrunner is whichever session runs `/showrunner:produce`. The header Consumers list names `production unit directors (add_unit.py)`.
 - `director_agent(request) -> DirectorAgent(model, effort: DefaultEffort | Effort(value))` runs `bash -c 'source "$1" && agents_resolve production.director && printf …'` with the `models_config.sh` from the script's own checkout (`Path(__file__).resolve().parents[1] / "agents/models_config.sh"`); `MODELS_CONFIG_FILE` comes from the caller (default `~/.claude/config/models.conf`). A resolver failure is exit 2 with its first `ERROR:` line; a family other than `claude` is exit 2 with `unit directors launch only on claude; production.director resolves to <family> (<model>)`. Both happen in `preflight`, so `--check` refuses too. `--effort` is passed only for `Effort(value)`.
 - **One-family pinning** (`scripts/agents/models_config.sh`): a function with exactly one family set is pinned to it (`_agents_pinned_family`). Every-function switches (`agents_set_all_assignments <family>`, `agents_set_model <agent>` with no function) leave it as it is and add it to `AGENT_KEPT_FUNCTIONS`; `default_models.sh` prints `# kept production on claude: its only set`. A switch aimed at it (`agents_set_assignment production codex`, `agents_set_model <codex agent> production`, `agents_set_row production.director <codex agent>`) prints `ERROR: 'production' runs only on claude: [production.claude] is its only set.`, returns 1 and leaves the file untouched. `/default_models production.director <model>:<effort>` changes the row.
-- **Resume** in `<LaunchUnits/>` uses add_unit’s live session and pane launch checks. Its Claude arguments come from `models_config.sh`, `agents_resolve production.director` and `agents_claude_args`, then `--resume <session-id> --remote-control <session> -n <session>`. No shutdown hold is read.
+- **Resume** in `<LaunchUnits/>` uses `add_unit.py` and checks the live session and pane launch.
+  It uses the model and effort from the latest real assistant turn.
+  An explicit `--model` overrides the turn's model.
+  The pane launch supplies the fallback model.
+  The director role supplies any missing model or effort.
 
 ### Phase end on the unit side
 
@@ -555,9 +565,11 @@ The Added line preserves initial field values, including state, ETA, next step, 
 Quoted log values preserve line endings as JSON escapes.
 
 States are `New`, `Working`, `Blocked`, `Waiting for nate`, `Delivered`, `Done`, `Paused`, and `Closed`.
-Parking sets a time without changing the state.
+Parking stores a time or a delivery condition and keeps the current item state.
+The List ends a delivery park automatically when the producer sets the item state to Delivered.
+Linked changes supply review information on the List.
 The List hides an item with unanswered questions while each send is pending or successful.
-If any unanswered question needs a resend, the item appears with its resend control.
+If a question send fails, the item shows Question not delivered.
 The `the_list.py list` command still shows the item.
 The producer uses `the_list.py answer` to save an answer and mark the item unread.
 Add and update accept `Mon D`, `Mon D HH:MM ZONE`, `No time yet`, `Waiting for nate`, `Paused`, and `Delivered` as an ETA.
@@ -579,7 +591,8 @@ An empty optional time removes that time.
 1. Add an item with `the_list.py add --owner <showrunner staff id> --title <text> --source <source>`.
 2. Preserve an existing item number with `add --number <n>`.
 3. Change fields with `update --id L<n> --source <source>` and the corresponding field options.
-4. Park or unpark an item with `park --id L<n> --until <time-or-empty> --source <source>`.
+4. Park or unpark an item with `park --id L<n> --until <condition> --source <source>`.
+   Use a time or `delivered` to park. Use an empty condition to unpark.
 5. Close an item with `close --id L<n> --words <closing words> --source <source>`.
 6. Restore a Closed item as New with `reopen --id L<n> --source <source>`.
 7. Clear its unread time with `mark-read --id L<n> --source <source>`.
@@ -637,7 +650,7 @@ Update and park refuse Closed items until reopen restores them.
 The table uses `# | Owner | Producer | Item | State | Next step | ETA | Update`; Producer shows the producer's name.
 It sorts Waiting for nate first, unread items second, and next check times third.
 State cells include the check time and identify overdue checks.
-Future parked items and Closed items remain hidden by default.
+Items with active parks and Closed items remain hidden by default.
 
 `load`, `records`, `table`, and the write functions share this store with future console callers.
 `records` watches the folder and record paths, reports invalid records, and preserves their files.
@@ -876,7 +889,15 @@ Pane labels do not identify a consultation.
 `ci_points.py due | ci start [--cancel-prior] | ci collect | watch | notice clear <gate> | notice lift <gate> --log <path>`, each with `--production`; `due`, `ci`, `watch` take `--state-dir`; `due` and `ci` take `--no-ci`.
 
 - `due` counts distinct recorded unit checkpoints that reached the merge branch. Five checkpoints after the last CI point produce `CiDue`. A collected point saves the count and tip in `ci_points.json`. Shrink commits and child hand-offs have no unit checkpoint record.
-- `ci start`: `bash validate_and_push.sh --to <merge branch> --fix-commit "ci(<showrunner name>): validation fixes after <unit> phase <N>|production wrap" [--cancel-prior]`; reads `repo`, `sha` and `run_id` from the `=== CI HANDOFF TO AGENT ===` block (`run_id: none` fails); the sha must be the merge-branch tip; writes `ci_run.json` (`repo`, `run_id`, `tip`), the only handoff to `collect`.
+- `ci start`: validates the merge-branch tip with `validate_and_push.sh`, publishes it with `push_direct.sh --publish-only`, follows the CI run with `push_direct.sh --follow-published`, and writes `ci_run.json` (`repo`, `run_id`, `tip`), the only handoff to `collect`. The run's repository and head commit must match the push remote and the published commit.
+  - Trigger: before validation it reads every workflow file at the tip and keeps the ones that run the `Test Suite` job. It reads all workflow registrations of the push repository (`gh api …/actions/workflows`).
+    1. Exactly one such workflow has a push trigger that covers the merge branch (no `paths` or `paths-ignore` filter), and its registration is active or absent: CI starts on push.
+    2. None covers the branch, and exactly one has `workflow_dispatch` and an active registration: `ci start` dispatches it after the push.
+    3. Otherwise it refuses before validation with one line: no trigger, a disabled registration, or several candidates.
+  - Validation reuse: `ci_validation.json` holds `input_tip` and `validated_commit`. A rerun whose tip equals either one skips validation.
+  - Dispatch: under the merge lock, `push_direct.sh --dispatch-published` checks that origin's branch tip is the published commit. It lists `workflow_dispatch` runs of the workflow on that branch and commit (`--repo`, at most 100). It follows the newest unfinished run, reuses the newest completed run when it succeeded, and otherwise dispatches once. The follow step polls outside the lock with the same selection and never dispatches. A run list that lags can let a later retry start a second run on the same commit.
+  - A failed run still runs the `--cancel-prior` step before `ci start` exits with the failure.
+  - An `ssh.github.com` (SSH over 443) remote uses `github.com` for GitHub API calls and run links.
 - `ci collect`: takes the tip and its code-merge count before `gh run watch --exit-status`, then `gh run view --json headSha,status,conclusion,jobs`. It passes only when `headSha` equals the validated tip and the current tip, the run is `completed` and concluded `success`, job `Test Suite` succeeded, and every other job succeeded or was skipped. Then it records `{count, tip}` and prints `--ci-green <tip>` as the last line, which `promote-main` and `wrap` take as is. Anything else is `ci collect: failed — rerun <check> on <tip>: …`, with no flag; a missing or empty `headSha` is never a pass.
 - `watch` / `review_watch(production, state_dir) -> WatchFirstAlert(line, table) | WatchRepeat(line) | WatchBelowThreshold(line)`: runs `review_regime.py watch` under `fcntl.flock` on `review_watch.lock`. On the first exit 3 with no `review_watch.json`, it takes `review_regime.py report --since 2026-09-28`, appends `- HH:MM <zone>: review watch: <line>` and the table to `LOG`, then writes `review_watch.json`. It sends no phone push: a status note that asks nothing goes to the log (`docs/as-built/message-clarity.md`). The shared state prevents repeated first alerts.
 - `notice clear <gate>` requires the code merge.
@@ -1328,7 +1349,7 @@ An unreadable registry preserves `ClaudeUnknown(reason)`.
 A registered Claude without its messaging socket also remains unknown.
 
 Units launch in herdr and restore through `add_unit.py --host-session`.
-Resume models come from transcripts.
+Resumes use the latest assistant turn's settings with the overrides and fallbacks described above.
 Native runtime ids select staff rows.
 New launches carry no copied staff identity.
 Promotion waits for Claude to exit before it starts the replacement.

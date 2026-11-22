@@ -293,7 +293,7 @@ An existing unit resumes its recorded plan without requiring a Production header
 Its requested directory must match the worktree in its staff row.
 A different recorded plan refuses reuse.
 
-A restore uses the script prompt envelope and the transcript's last assistant model unless `--model` overrides it.
+A restore uses the script prompt envelope. It uses the model and effort from the latest real assistant turn. An explicit `--model` overrides the model. The pane launch supplies the fallback model. The director role supplies any missing model or effort.
 A new unit waits for Remote Control readiness.
 The launcher prints the unit's attach hint after launch.
 `AgentNotReady` and other failures exit 1; a refusal exits 2.

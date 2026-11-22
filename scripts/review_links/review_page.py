@@ -248,6 +248,30 @@ def retain_asset(item: ReviewItem, assets: dict[str, str]) -> None:
         assets['submission:'+item.key] = submission_assets(item.key, origin)
 
 
+def retain_question_delivery(item: ReviewItem, assets: dict[str, str], status: change_page.DeliveryStatus,
+                             sources: ReviewSourceStamps) -> None:
+    source = item.source
+    if isinstance(source, review_items.ChangeSource):
+        row = source.row['#']
+        page = change_page.ReviewPage(source.path, source.path.parent, (row,), '')
+        question = source.slots.question
+    elif item.state == ReviewState.WAITING and isinstance(
+            source, (review_items.QuestionSource, review_items.InvestigationSource,
+                     review_items.ProposalSource, review_items.EfficiencySource)):
+        page = review_actions.delivery_page(item, status)
+        row = page.rows[0]
+        path = status.path(page, row)
+        sources.append(path)
+        question = status.slots(page, row).question
+    else:
+        return
+    if not isinstance(question, change_page.OpenQuestion) or isinstance(question, change_page.OpenFeedback):
+        return
+    sources.append(status.closeout_path(page, row))
+    if change_page.review_question_failed(status, page, row, question):
+        assets['question-delivery:'+item.key] = change_page.question_failure_html(True)
+
+
 def submission_assets(key: str, origin: new_item_dialog.ReviewSubmission) -> str:
     """Render the saved evidence and references for one lazy card."""
     evidence = origin.evidence
@@ -381,6 +405,7 @@ def build_snapshot(root: Path) -> ReviewSnapshot:
     assets: dict[str, str] = {}
     submission_keys: dict[str, str] = {}
     unavailable_cards: set[str] = set()
+    status = change_page.DeliveryStatus(root)
     for item in review_items.read(root, members=members, show='active', sources=sources, assign_ids=False):
         path = review_items.source_path(item)
         with guard_source(path, sources, entry=item.id):
@@ -388,6 +413,7 @@ def build_snapshot(root: Path) -> ReviewSnapshot:
             try:
                 record_assets: dict[str, str] = {}
                 retain_asset(item, record_assets)
+                retain_question_delivery(item, record_assets, status, sources)
                 validate_body_inputs(item, record_assets)
                 summary = card_entry(item, members, names)
             except (UnicodeError, TypeError, ValueError, OSError, RuntimeError) as error:
@@ -483,9 +509,6 @@ class ReviewSnapshotCache:
             self._initialization_requested = True
             self._wake.set()
         self._thread.start()
-
-    def _after_snapshot_update(self, _snapshot: ReviewSnapshot, /) -> None:
-        """Run background work after the worker publishes a snapshot."""
 
     def get(self) -> ReviewSnapshot:
         with self._condition:
@@ -607,13 +630,13 @@ class ReviewSnapshotCache:
         started = time.perf_counter()
         records = current.records.copy()
         assets = current.assets.copy()
-        asset_keys = (key, 'image:'+key, 'submission:'+key)
+        asset_keys = (key, 'image:'+key, 'submission:'+key, 'question-delivery:'+key)
         previous_key = replaced_key or key
         previous = records.get(previous_key)
         if previous_key != key:
             _ = records.pop(previous_key, None)
         for removed in {previous_key, key}:
-            for asset in (removed, 'image:'+removed, 'submission:'+removed):
+            for asset in (removed, 'image:'+removed, 'submission:'+removed, 'question-delivery:'+removed):
                 _ = assets.pop(asset, None)
         submission_keys = current.submission_keys.copy()
         if previous is not None:
@@ -696,7 +719,6 @@ class ReviewSnapshotCache:
                     self._condition.notify_all()
                 checked = time.monotonic()
                 last_failure = None
-                self._after_snapshot_update(fresh)
             except Exception as error:
                 failure = ' '.join(str(error).splitlines())
                 if failure != last_failure:
@@ -876,6 +898,7 @@ def details(item: ReviewItem, inputs: ReviewBodyInputs) -> str:
     footer = ('' if response is not None else '<p class="review-source">Owner: '+names.html(item.owner, owner)
               +' · Source: '+names.html(item.source_unit, review_items.name(item.source_unit, inputs.members))+'</p>')
     fallback = '<section data-title-fallback hidden><h3>Item</h3><p>'+html.escape(item.title)+'</p></section>'
+    body += inputs.assets.get('question-delivery:'+item.key, '')
     body += inputs.assets.get('submission:'+item.key, '')
     return ('<div class="list-panel review-panel '+item.type+'"><div>'+fallback+handoff+'<div data-review-body>'+body+'</div></div><div><section><h3>Log · newest first</h3>'
             +'<ol class="list-log">'+logs+'</ol></section>'+exchange+'</div>'
@@ -1530,17 +1553,24 @@ const savedVerdictsKey='review-saved-verdicts:'+location.pathname;
 let focusAfterLoad=null,firstRequest=firstReviewCard;
 let deferredLink=null,revealCreated=null;
 function allEntries(){return [...index.values()];}
-function matches(entry,{owner='',show='all',query='',type='',sourceOwner='',keys}){
+function isInvestigation(entry){return entry.type==='investigation' || entry.type==='bug';}
+function matchesOwner(entry,owner){return !owner || entry.owner===owner || isInvestigation(entry) && entry.sourceOwner===owner;}
+function matches(entry,{owner='',show='all',query='',type='',sourceOwner='',keys,now=Date.now()}){
  const linked=keys?.has(entry.key);
- return (!keys?.size || linked) && (linked || view.linkedItem===entry.key || entry.hiddenUntil<=Date.now()) &&
-  (!owner || entry.owner===owner || isInvestigation(entry) && entry.sourceOwner===owner) &&
+ return (!keys?.size || linked) && (linked || view.linkedItem===entry.key || entry.hiddenUntil<=now) &&
+  matchesOwner(entry,owner) &&
   (!type || (type==='investigations' ? isInvestigation(entry) : entry.type===type)) &&
   (!sourceOwner || entry.sourceOwner===sourceOwner) &&
   (!query || entry.id.toLowerCase().includes(query) || entry.title.toLowerCase().includes(query)) &&
   (show==='all' || entry.state===(show==='open' ? 'Open' : show));
 }
-function isInvestigation(entry){return entry.type==='investigation' || entry.type==='bug';}
-function matching(filters){return allEntries().filter(entry=>!pendingSaves.has(entry.key) && matches(entry,filters));}
+function isListed(entry,filters){
+ const key=entry.key,departure=saved.get(key);
+ if(pendingSaves.get(key)?.departing) return false;
+ if(departure?.handed && departure.awaitingSnapshot && view.linkedItem===key) return false;
+ return (!departure || departure.handed && entry.state!=='Open') && matches(entry,filters);
+}
+function matching(filters){return allEntries().filter(entry=>isListed(entry,filters));}
 function savedEntry(key,result){
  if(result.state==='Done'){index.delete(key);return;}
  const entry=index.get(key);if(!entry) return;
@@ -1586,24 +1616,18 @@ const view=createRecordTable({content:()=>content,
  resolveItem:value=>resolveShownRecordId(index,value),
  hasKey:key=>index.has(key),
  shows:showValues,
- visible:(data,filters)=>{
-  const key=data.key,entry=index.get(key),departure=saved.get(key);
-  if(!entry || pendingSaves.get(key)?.departing) return false;
-  if(departure?.handed && departure.awaitingSnapshot && view.linkedItem===key) return false;
-  return (!departure || departure.handed && entry.state!=='Open') && matches(entry,filters);
- },
+ visible:isListed,
  sortValues:data=>data.sortValues===undefined ? entrySortValues(data) : undefined,
- applied:(_items,{type,show,owner,query,sourceOwner,keys})=>{
+ applied:(_items,filters)=>{
+  const {type,show,owner,query,keys,now}=filters;
   content.dataset.show=show;loadBodies();
-  const eligibleOwners=allEntries().filter(entry=>matches(entry,{type,query,keys}));
-  const shownOwners=matching({show,type,query,keys});
-  const matchesOwner=(entry,id)=>!id || entry.owner===id || isInvestigation(entry) && entry.sourceOwner===id;
+  const eligibleOwners=allEntries().filter(entry=>matches(entry,{type,query,keys,now}));
   content.querySelectorAll('[data-owner-chip]').forEach(button=>{
    const id=button.dataset.ownerChip;
    button.hidden=Boolean(id) && id!==owner && !eligibleOwners.some(entry=>matchesOwner(entry,id));
-   button.querySelector('b').textContent=shownOwners.filter(entry=>matchesOwner(entry,id)).length;
+   button.querySelector('b').textContent=matching(view.ownerChipSelection(filters,id)).length;
   });
-  const eligible=matching({type,owner,query,sourceOwner,keys});
+  const eligible=matching({...filters,show:'all'});
   const stateCounts=new Map();
   for(const {state} of eligible) stateCounts.set(state,(stateCounts.get(state) ?? 0)+1);
   content.querySelectorAll('[data-show-chip]').forEach(button=>{
@@ -1616,7 +1640,7 @@ const view=createRecordTable({content:()=>content,
   content.querySelectorAll('[data-type-chip]').forEach(button=>{
    if(button.dataset.typeChip==='investigations') button.hidden=type!=='investigations';
    button.setAttribute('aria-pressed',String(button.dataset.typeChip===type));
-   button.querySelector('b').textContent=matching({owner,show,query,sourceOwner,keys,type:button.dataset.typeChip}).length;
+   button.querySelector('b').textContent=matching({...filters,type:button.dataset.typeChip}).length;
   });
  }
 });

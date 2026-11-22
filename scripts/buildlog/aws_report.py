@@ -88,10 +88,10 @@ def gate_type_report(directory: Path, day: str, days: int) -> GateCostReport:
     sizes = sorted({run.instance_type for run in runs})
     for size in sizes:
         selected = [run for run in runs if run.instance_type == size]
-        cells = [run_cost_cell([run for run in selected if run.mode == mode], allocations) for mode, _label in kinds]
+        cells = [run_cost_cell([run for run in selected if run.mode == mode], allocations) for mode in kinds]
         lines.append(f'| {size} | ' + ' | '.join([*cells, run_cost_cell(selected, allocations)]) + ' |')
     if len(sizes) >= 2:
-        cells = [run_cost_cell([run for run in runs if run.mode == mode], allocations) for mode, _label in kinds]
+        cells = [run_cost_cell([run for run in runs if run.mode == mode], allocations) for mode in kinds]
         lines.append('| All types | ' + ' | '.join([*cells, run_cost_cell(runs, allocations)]) + ' |')
     source = (f'Source: cloud-gate-launches.jsonl and charges/<day>.json; UTC {start.date()} through {end.date() - timedelta(days=1)} '
               + f'({days} days); billed days only; {omitted} rows omitted with no kind or matching launch.')
@@ -100,14 +100,14 @@ def gate_type_report(directory: Path, day: str, days: int) -> GateCostReport:
     for at in sorted({run.day for run in runs}, reverse=True):
         selected = [run for run in runs if run.day == at]
         cells: list[str] = []
-        for mode, _label in kinds:
+        for mode in kinds:
             matching = [run for run in selected if run.mode == mode]
             cells.extend((str(len(matching)), run_cost.median_run_time([run.test_s for run in matching]),
                           run_cost.median_run_time([run.box_s for run in matching])))
         cost = trend_cost_cell(selected, allocations)
         lines.append(f'| {at} | ' + ' | '.join([*cells, cost]) + ' |')
     totals: list[str] = []
-    for mode, _label in kinds:
+    for mode in kinds:
         matching = [run for run in runs if run.mode == mode]
         totals.extend((str(len(matching)), run_cost.median_run_time([run.test_s for run in matching]),
                        run_cost.median_run_time([run.box_s for run in matching])))

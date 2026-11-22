@@ -1,5 +1,7 @@
 # Repair rounds
 
+Launchers run `check-launch`, `start-pass`, and `finish-pass` through `scripts/direct/pass_record.py`.
+
 <FindingsLedger>
 Use `~/.claude/scripts/lib/py ~/.claude/scripts/direct/findings.py <command> --session-dir
 "${SESSION_DIR}" --phase "<phase id>"` after <Synthesize/> confirms an issue,

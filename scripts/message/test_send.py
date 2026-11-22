@@ -48,6 +48,7 @@ from scripts.lib.stop_injection_test_support import InjectedStop, stop_once, sto
 from scripts.lib.socket_test_support import ShortUnixSocket, short_socket_directory
 from scripts.message import review_hold, send, send_later
 from scripts.message import failed_lookup
+from scripts.message.send_result import SEND_ABSENT_EXIT, SEND_CLOSED_EXIT
 from scripts.message.roster import roster as read_roster
 from scripts.message import repeat_guard
 from scripts.message.relay_identity import publish_relay_identity, relay_session_name
@@ -3623,6 +3624,21 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
         self.assertEqual([path.name for path in (self.root / "queue").iterdir()], ["session-recipient.jsonl"])
         self.assertEqual((self.log()[-1]["via"], self.log()[-1]["postmaster"]), ("relay", "failed"))
 
+    def test_unwritten_relay_mismatch_refuses_and_releases_the_send_key(self) -> None:
+        self.session("recipient", "Recipient")
+        options = local_options(["--to", "session:recipient", "--from", "Sender", "--key", "notice",
+                                 "--repeat-minutes", "30", "--text", "body"])
+        events = stream(INIT, call("changed body"), answer(OK))
+        result = send.read_relay(
+            send.RelayTransportResponse(0, events, "", RELAY_FIXTURE_TARGET, send.RelayRequestNotForwarded()), "body")
+        with mock.patch.object(send, "relay", side_effect=(result, self.outcome)) as relay:
+            first = send.send(options)
+            self.assertIsInstance(first, send.RefusedRelayRequest)
+            self.assertEqual(first, send.RefusedRelayRequest("refused", "SendMessage used a different target or payload"))
+            self.assertEqual(self.claims("notice"), {})
+            self.assertEqual(send.send(options).outcome, "sent")
+            self.assertEqual(relay.call_count, 2)
+
     def test_queued_relay_reports_recipient_that_exits_during_delivery(self) -> None:
         self.session("recipient", "Recipient")
         def relay(message: send.Message, timeout: float) -> send.Result:
@@ -6050,6 +6066,60 @@ runpy.run_path(sys.argv[0], run_name="__main__")
         self.assertEqual(self.relayed, [])
         self.assertFalse((self.root / "queue").exists())
 
+    def closed_codex_row(self, status: str = "closed") -> roster.RosterEntry:
+        daemon = daemon_session_row(self.daemon_owner(), "thread-one", "worker")
+        return replace(daemon, role="worker", status=status, reach=roster.CannotReceiveMessages(status),
+                       daemon=roster.NotDaemonSession())
+
+    def test_skip_closed_returns_exit_code_without_delivery_or_failure_notice(self) -> None:
+        for status in ("closed", "stopped; pane w1:p1"):
+            output = io.StringIO()
+            observed = roster.Roster([self.closed_codex_row(status)], ["Claude session records: cannot read old.json"])
+            with (self.subTest(status=status), redirect_stdout(output),
+                  mock.patch.object(roster, "roster", return_value=observed),
+                  mock.patch.object(codex_daemon, "read_daemons") as read_daemons,
+                  mock.patch.object(send, "deliver_codex") as deliver,
+                  mock.patch.object(send, "deliver_worker_text") as deliver_worker,
+                  mock.patch.object(failed_lookup, "report") as report):
+                code = send.main(["--here", "--skip-closed", "--to", "codex:thread-one", "--text", "hello"])
+            self.assertEqual(code, SEND_CLOSED_EXIT)
+            self.assertEqual(output.getvalue(), "CLOSED: codex:thread-one has a closed or stopped worker pane\n")
+            read_daemons.assert_not_called()
+            deliver.assert_not_called()
+            deliver_worker.assert_not_called()
+            report.assert_not_called()
+
+    def test_closed_worker_without_option_keeps_missing_route_failure(self) -> None:
+        output = io.StringIO()
+        observed = roster.Roster([self.closed_codex_row()], [])
+        with (redirect_stdout(output), mock.patch.object(roster, "roster", return_value=observed),
+              mock.patch.object(codex_daemon, "daemons", return_value=[]),
+              mock.patch.object(failed_lookup, "report") as report):
+            code = send.main(["--here", "--to", "codex:thread-one", "--from", "test", "--text", "hello"])
+        self.assertEqual(code, 3)
+        self.assertTrue(output.getvalue().startswith("FAILED: no live Codex daemon has thread thread-one loaded"))
+        report.assert_called_once()
+
+    def test_skip_closed_reports_unreadable_codex_route(self) -> None:
+        output = io.StringIO()
+        observed = roster.Roster([self.closed_codex_row()], ["Codex daemon fixture: socket unreadable"])
+        with (redirect_stdout(output), redirect_stderr(io.StringIO()),
+              mock.patch.object(roster, "roster", return_value=observed),
+              mock.patch.object(failed_lookup, "report") as report):
+            code = send.main(["--here", "--skip-closed", "--to", "codex:thread-one", "--text", "hello"])
+        self.assertEqual(code, 3)
+        self.assertTrue(output.getvalue().startswith("FAILED:"))
+        report.assert_called_once()
+
+    def test_skip_closed_delivers_through_a_daemon_route_in_the_roster(self) -> None:
+        daemon = self.daemon_row("thread-one")
+        observed = self.recipient_roster([self.closed_codex_row(), daemon], [])
+        with (mock.patch.object(roster, "roster", return_value=observed),
+              mock.patch.object(codex_daemon, "queue", return_value=codex_daemon.Queued()) as queue):
+            result = send.send(local_options(["--skip-closed", "--to", "codex:thread-one", "--text", "hello"]))
+        self.assertEqual(result.outcome, "sent")
+        queue.assert_called_once_with(self.daemon_owner(), "thread-one", mock.ANY, timeout=send.delivery_timeout())
+
     def test_codex_thread_address_queues_after_one_local_roster_read(self) -> None:
         output = io.StringIO()
         with (
@@ -7344,7 +7414,8 @@ class PeerSendTests(RecipientStaffFixture, ShutdownTestCase):
             + "if 'roster.py' in sys.argv[-1]:\n"
             + "    print(os.environ['SSH_SNAPSHOT'])\n"
             + "    raise SystemExit(int(os.environ.get('SSH_ROSTER_STATUS', '0')))\n"
-            + "print(os.environ.get('SSH_SEND_RESULT', 'SENT: fixture recipient'))\n",
+            + "print(os.environ.get('SSH_SEND_RESULT', 'SENT: fixture recipient'))\n"
+            + "raise SystemExit(int(os.environ.get('SSH_SEND_STATUS', '0')))\n",
             encoding="utf-8",
         )
         ssh.chmod(0o755)
@@ -7418,6 +7489,87 @@ class PeerSendTests(RecipientStaffFixture, ShutdownTestCase):
             except SystemExit as error:
                 status = int(cast(int, error.code))
         return status, output.getvalue(), errors.getvalue()
+
+    def test_skip_closed_uses_live_peer_worker_after_closed_local_worker(self) -> None:
+        peer = self.row("impl", "worker:peer-run/impl")
+        assert isinstance(peer.thread, roster.CodexThread)
+        address = f"codex:{peer.thread.thread_id}"
+        closed = replace(peer, machine="natedev", status="closed", reach=roster.CannotReceiveMessages("closed"))
+        self.local = self.recipient_roster([closed], [])
+        self.peer([peer])
+        status, output, errors = self.run_main(address, "--skip-closed")
+        self.assertEqual((status, errors), (0, ""), output)
+        forwarded, = self.forwarded()
+        self.assertEqual(forwarded[forwarded.index("--to") + 1], address)
+        self.assertIn("--skip-closed", forwarded)
+        self.assertEqual(self.relayed + self.daemon_calls, [])
+
+    def test_skip_closed_accepts_the_peer_closed_result(self) -> None:
+        with mock.patch.object(send, "run",
+                               return_value=(SEND_CLOSED_EXIT, "CLOSED: closed worker\n", "")):
+            status, output, errors = self.run_main("codex:peer-thread", "--skip-closed", "--machine", "mac")
+        self.assertEqual((status, output, errors), (SEND_CLOSED_EXIT, "CLOSED: on mac: closed worker\n", ""))
+
+    def test_skip_closed_reports_proven_absence_after_a_clean_peer_miss(self) -> None:
+        with mock.patch.object(failed_lookup, "report") as report:
+            status, output, errors = self.run_main("codex:gone", "--skip-closed")
+        self.assertEqual((status, output, errors),
+                         (SEND_ABSENT_EXIT, "ABSENT: no live Codex session has address codex:gone\n", ""))
+        self.assertEqual(len(self.ssh_calls()), 1)
+        self.assertEqual(self.forwarded(), [])
+        report.assert_not_called()
+
+    def test_skip_closed_cannot_prove_absence_with_an_incomplete_roster(self) -> None:
+        unknown = replace(self.row("", "codex:unknown"), thread=roster.NoCodexThread(),
+                          reach=roster.CannotReceiveMessages("interactive Codex in a herdr pane"))
+        clean = self.recipient_roster([], [])
+        unreadable = self.recipient_roster([], ["Codex daemon: socket unreadable"])
+        unidentified = self.recipient_roster([unknown], [])
+        for local, peer in ((unreadable, clean), (clean, unreadable),
+                            (unidentified, clean), (clean, unidentified)):
+            with self.subTest(local=local, peer=peer):
+                self.local = local
+                self.peer(peer.entries, problems=tuple(peer.problems))
+                with mock.patch.object(failed_lookup, "report") as report:
+                    status, output, errors = self.run_main("codex:gone", "--skip-closed")
+                self.assertEqual(status, 3, output + errors)
+                self.assertTrue(output.startswith("FAILED: "), output)
+                report.assert_called_once()
+        self.assertEqual(self.forwarded(), [])
+
+    def test_skip_closed_accepts_only_a_confirmed_peer_absence_result(self) -> None:
+        reply = "ABSENT: no live Codex session has address codex:gone\n"
+        for code, flags, expected in (
+            (SEND_ABSENT_EXIT, ("--skip-closed",), SEND_ABSENT_EXIT),
+            (SEND_ABSENT_EXIT, (), 3),
+            (3, ("--skip-closed",), 3),
+        ):
+            with (self.subTest(code=code, flags=flags),
+                  mock.patch.object(send, "run", return_value=(code, reply, ""))):
+                status, output, errors = self.run_main("codex:gone", "--machine", "mac", *flags)
+            self.assertEqual((status, errors), (expected, ""), output)
+            if expected == SEND_ABSENT_EXIT:
+                self.assertEqual(output, "ABSENT: on mac: no live Codex session has address codex:gone\n")
+            else:
+                self.assertTrue(output.startswith("FAILED: "), output)
+
+    def test_skip_closed_requires_local_absence_when_the_peer_loses_its_route(self) -> None:
+        address = "codex:peer-thread"
+        self.peer([self.row("peer", address)])
+        for problems, expected in ((["Codex daemon: socket unreadable"], 3), ([], SEND_ABSENT_EXIT)):
+            with (self.subTest(problems=problems), mock.patch.dict(os.environ, {
+                "SSH_SEND_RESULT": f"ABSENT: no live Codex session has address {address}",
+                "SSH_SEND_STATUS": str(SEND_ABSENT_EXIT),
+            })):
+                self.local = self.recipient_roster([], problems)
+                status, output, errors = self.run_main(address, "--skip-closed")
+            self.assertEqual((status, errors), (expected, ""), output)
+            if expected == SEND_ABSENT_EXIT:
+                self.assertEqual(output, f"ABSENT: on mac: no live Codex session has address {address}\n")
+            else:
+                self.assertEqual(output, f"FAILED: cannot prove local absence of {address} after the peer lost its route\n")
+        self.assertEqual(len(self.ssh_calls()), 4)
+        self.assertEqual(len(self.forwarded()), 2)
 
     def test_peer_worker_staff_identity_uses_the_native_thread(self) -> None:
         previous = self.row("peer worker", "worker:peer-run/impl")
@@ -8124,6 +8276,60 @@ class PaneWorkerMessageTests(unittest.TestCase):
         self.assertEqual(code, 3)
         self.assertEqual(output.getvalue(), "FAILED: agent_prompt_stalled: private pane did not start\n")
         self.assertEqual(send.pending(f"staff:{row.id}"), "")
+
+    def live_codex_worker(self) -> tuple[staff.StaffRow, str, roster.Roster]:
+        worker = self.fixture.worker("codex-impl", family="codex")
+        pane = "w1:p2"
+        self.fixture.world.add(worker, pane, family="codex")
+        entry = roster.RosterEntry(
+            "natedev", "codex", "worker", worker.name, f"working; pane {pane}",
+            roster.Messageable(f"worker:{self.fixture.parent.name}/{worker.name}"), "/fixture",
+            roster.NoShowrunner(), roster.NoDirector(), roster.WorkerAssignment("impl", "/fixture/run"),
+            thread=roster.CodexThread(str(worker.current_session)),
+        )
+        return worker, pane, roster.Roster([entry], [])
+
+    def test_skip_closed_delivers_to_a_live_codex_worker_pane(self) -> None:
+        worker, pane, observed = self.live_codex_worker()
+        with mock.patch.object(roster, "roster", return_value=observed):
+            result = send.send(send.parse(["--here", "--skip-closed", "--to", f"codex:{worker.current_session}",
+                "--from", "fixture", "--forwarded-shown-sender", "fixture", "--text", "Start the build."]))
+        self.assertEqual(result.outcome, "sent", result.detail)
+        prompt, = [command for command in self.fixture.world.commands if command[:2] == ("agent", "prompt")]
+        self.assertEqual(prompt[2], pane)
+        self.assertIn("Start the build.", prompt[3])
+
+    def test_skip_closed_at_pane_recheck_keeps_default_holder_forward(self) -> None:
+        from scripts.herdr import worker_panes
+
+        worker, pane, observed = self.live_codex_worker()
+        address = f"codex:{worker.current_session}"
+        holder = f"staff:{self.fixture.parent.id}"
+        args = ["--here", "--to", address, "--from", "fixture", "--forwarded-shown-sender", "fixture"]
+        for state, reason in (
+            (worker_panes.ClosedWorker(worker), "worker pane is closed"),
+            (worker_panes.StoppedWorker(worker, pane, "terminal-" + pane), "worker is stopped"),
+        ):
+            text = f"Release message for {type(state).__name__}."
+            output = io.StringIO()
+            with (self.subTest(state=type(state).__name__),
+                  mock.patch.object(roster, "roster", return_value=observed),
+                  mock.patch.object(worker_panes, "observe", return_value=[state]) as recheck,
+                  mock.patch.object(failed_lookup, "report") as report):
+                with redirect_stdout(output):
+                    self.assertEqual(send.main([*args, "--skip-closed", "--text", text]), SEND_CLOSED_EXIT)
+                self.assertEqual(output.getvalue(), f"CLOSED: {address} has a closed or stopped worker pane\n")
+                recheck.assert_called_once()
+                self.assertNotIn(text, send.pending(holder))
+                report.assert_not_called()
+
+                with redirect_stdout(io.StringIO()):
+                    self.assertEqual(send.main([*args, "--text", text]), 1)
+                retained = send.pending(holder)
+                self.assertIn(f"Worker {worker.name}: {reason}", retained)
+                self.assertIn(text, retained)
+                report.assert_not_called()
+        self.assertFalse(any(command[:2] == ("agent", "prompt") for command in self.fixture.world.commands))
 
     def test_roster_problem_is_silent_while_a_usable_worker_still_succeeds(self) -> None:
         with (mock.patch.object(roster, "roster", return_value=roster.Roster([], ["one run was unreadable"])),

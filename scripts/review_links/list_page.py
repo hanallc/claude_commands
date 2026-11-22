@@ -67,12 +67,12 @@ CHIP_BY_STATE = {
 
 
 def list_chip(state: the_list.ItemState, *, parked: bool, open_question: bool,
-              unread_delivery: bool = False) -> ListChip:
+              unread_delivery: bool = False, unread_answer: bool = False) -> ListChip:
     """Find the one status chip for this item."""
     chip = CHIP_BY_STATE[state]
     if parked:
         return ListChip.PARKED
-    if unread_delivery:
+    if unread_delivery or unread_answer:
         return ListChip.NEEDS_ME
     return ListChip.MORTY_ANSWERING if open_question else chip
 
@@ -390,14 +390,12 @@ def signed_form_fields(entry: ListRecord, secret: str) -> str:
                    for name, value in fields.items())
 
 
-def feedback_form(entry: ListRecord, secret: str, today: datetime, resends: tuple[the_list.QuestionResend, ...],
-                  *, parking_label: str = "") -> str:
+def feedback_form(entry: ListRecord, secret: str, *, parking_label: str = "") -> str:
     hidden = signed_form_fields(entry, secret)
     read = '<button name="action" value="read">Mark read</button>' if isinstance(entry.item.unread_since, datetime) else ''
     key = html.escape(entry.key.replace('/', '-'), quote=True)
     parked = '' if parking_label else ' hidden'
     note = 'Parked until ' + parking_label if parking_label else ''
-    retry = "".join(question_resend(resend, today) for resend in resends)
     return ('<form method="post" data-feedback-form>' + hidden + f'<p data-parked-detail{parked}>{note}</p>'
             + '<div class="list-actions"><button name="action" value="remove">Remove</button>' + read
             + f'<div class="list-parking-actions"><button name="action" value="unpark" id="unpark-{key}"{parked}>Unpark</button>'
@@ -405,25 +403,11 @@ def feedback_form(entry: ListRecord, secret: str, today: datetime, resends: tupl
             + '<div role="dialog" aria-label="Park until" data-later-menu hidden>'
             + '<button type="submit" name="action" value="park-until-delivered" data-later-preset>Until delivered</button>'
             + record_table.date_time_picker(field="until", action="action", value="park") + '</div></div></div></div>'
-            + retry
             + f'<textarea name="words" id="words-{key}" rows="4" maxlength="10000" '
             + 'placeholder="Your words for morty about this item" aria-label="Your words for morty about this item"></textarea>'
             + '<div class="list-tell"><span role="status" data-send-status></span>'
             + '<button name="action" value="question" disabled>Ask question</button>'
             + '<button name="action" value="tell" disabled>Tell morty</button></div></form>')
-
-
-def question_resend(resend: the_list.QuestionResend, today: datetime) -> str:
-    question = resend.question
-    notice = {"failed": "did not reach morty", "ready": "is ready to send",
-              "prepared": "is ready to send"}.get(resend.delivery.state, "may not have reached morty")
-    block = resend.delivery
-    action = (f'<p>{html.escape(block.reason)}</p>' if isinstance(block, change_page.ResendBlocked)
-              else f'<button name="action" value="resend-{question.question_id}">Resend question {question.question_id}</button>')
-    return (f'<section class="page-question" data-question="{question.question_id}">'
-            + f'<h3>Question {question.question_id} {notice}</h3>'
-            + question_time_html(question.asked_at, today)
-            + f'<p>{html.escape(question.words)}</p>' + action + '</section>')
 
 
 def review_card_link(key: str, label: str) -> str:
@@ -462,6 +446,7 @@ def review_card(identity: str, reviews: Mapping[str, review_items.ReviewItem]) -
 
 
 WAITING_NOTE = "The producer will answer."
+NO_FAILED_QUESTIONS: frozenset[str] = frozenset()
 
 
 def question_time_html(stamp: str, today: datetime) -> str:
@@ -469,15 +454,15 @@ def question_time_html(stamp: str, today: datetime) -> str:
 
 
 def panel_questions(item: the_list.ListItem, today: datetime, unread_answers: frozenset[str],
-                    resends: tuple[the_list.QuestionResend, ...] = ()) -> str:
-    retry = {resend.question.question_id for resend in resends}
+                    failed: frozenset[str] = NO_FAILED_QUESTIONS) -> str:
     sections: list[str] = []
     for question in item.questions:
         answer = question.answer
-        if answer is None and question.question_id not in retry:
+        if answer is None:
             sections.append(page_question.open_question_html(
-                question, asked_time_html=question_time_html(question.asked_at, today)))
-        elif answer is not None and question.question_id in unread_answers:
+                question, asked_time_html=question_time_html(question.asked_at, today),
+                failed=question.question_id in failed))
+        elif question.question_id in unread_answers:
             sections.append(page_question.answered_question_html(question, answer,
                 asked_time_html=question_time_html(question.asked_at, today),
                 answer_time_html=question_time_html(answer.answered_at, today),
@@ -486,15 +471,10 @@ def panel_questions(item: the_list.ListItem, today: datetime, unread_answers: fr
 
 
 def detail_panel(entry: ListRecord, sections: str, today: datetime, names: staff_names.StaffNames,
-                 unread_answers: frozenset[str], secret: str) -> str:
+                 unread_answers: frozenset[str]) -> str:
     log = item_log_html(entry, today, names, unread_answers)
     log_id = html.escape('log-' + entry.key.replace('/', '-'), quote=True)
-    read = ''
-    keeper = names.members.by_id(entry.keeper)
-    if unread_answers and keeper is not None and keeper.kind == "producer" and keeper.name == "morty":
-        request, token = signed_item_request(entry, secret)
-        read = f' data-open-read-request="{request}" data-open-read-token="{token}"'
-    return (f'<div class="list-panel"{read}><div>' + sections
+    return ('<div class="list-panel"><div>' + sections
             + '</div><section class="list-log-panel"><h3>Log · newest first</h3>'
             + f'<div class="list-log-scroll" id="{log_id}" tabindex="0" role="region" aria-label="Log · newest first">'
             + '<ol class="list-log">' + log + '</ol></div></section></div>')
@@ -555,8 +535,7 @@ def review_version(item: the_list.ListItem) -> str:
     return html.escape(json.dumps((str(item.updated), len(item.log), item.reviews)), quote=True)
 
 
-def waiting_feedback_form(entry: ListRecord, secret: str, parking_label: str) -> str:
-    unread = the_list.unread_delivery(entry.item)
+def waiting_feedback_form(entry: ListRecord, secret: str, parking_label: str, *, unread: bool) -> str:
     if not parking_label and not unread:
         return ""
     parked = '' if parking_label else ' hidden'
@@ -578,12 +557,13 @@ def waiting_details(entry: ListRecord, today: datetime, names: staff_names.Staff
                     reviews: ReviewDisplay, parking_label: str) -> str:
     sections = (f'<p data-waiting-note>{WAITING_NOTE}</p><div data-waiting-questions>'
                 + panel_questions(entry.item, today, unread_answers) + '</div>'
-                + review_links(entry.item, reviews, today) + waiting_feedback_form(entry, secret, parking_label))
-    return detail_panel(entry, sections, today, names, unread_answers, secret)
+                + review_links(entry.item, reviews, today) + waiting_feedback_form(
+                    entry, secret, parking_label, unread=bool(unread_answers) or the_list.unread_delivery(entry.item)))
+    return detail_panel(entry, sections, today, names, unread_answers)
 
 
 def details(entry: ListRecord, today: datetime, secret: str, reviews: ReviewDisplay,
-            names: staff_names.StaffNames, visibility: the_list.WaitingForAnswer | the_list.QuestionResends,
+            names: staff_names.StaffNames, visibility: the_list.WaitingForAnswer | the_list.QuestionAttention,
             unread_answers: frozenset[str], *, parking_label: str) -> str:
     item = entry.item
     if isinstance(visibility, the_list.WaitingForAnswer):
@@ -601,20 +581,19 @@ def details(entry: ListRecord, today: datetime, secret: str, reviews: ReviewDisp
     if links:
         sections += '<section><h3>Links</h3><ul>' + ''.join(links) + '</ul></section>'
     sections += review_links(item, reviews, today)
-    questions = panel_questions(item, today, unread_answers, visibility.questions)
-    form = feedback_form(entry, secret, today, visibility.questions, parking_label=parking_label)
+    questions = panel_questions(item, today, unread_answers, visibility.failed)
+    form = feedback_form(entry, secret, parking_label=parking_label)
     return f'<p data-waiting-note hidden>{WAITING_NOTE}</p>' + detail_panel(
-        entry, sections + questions + form, today, names, unread_answers, secret)
+        entry, sections + questions + form, today, names, unread_answers)
 
 
 def item_rows(entry: ListRecord, names: staff_names.StaffNames, today: datetime, index: int, secret: str,
               reviews: ReviewDisplay, *, parked: bool, open_question: bool,
-              visibility: the_list.WaitingForAnswer | the_list.QuestionResends) -> str:
+              visibility: the_list.WaitingForAnswer | the_list.QuestionAttention, unread_answers: frozenset[str]) -> str:
     item = entry.item
     owner = owner_name(names.members, item.owner)
     producer = owner_name(names.members, item.producer)
     unread = isinstance(item.unread_since, datetime)
-    unread_answers = the_list.unread_answer_ids(item)
     waiting = isinstance(visibility, the_list.WaitingForAnswer)
     due = the_list.eta_due(item.eta)
     eta_sort: tuple[int, float | str] = (0, due.timestamp()) if due is not None else (1, eta_text(item.eta, today).casefold())
@@ -626,6 +605,7 @@ def item_rows(entry: ListRecord, names: staff_names.StaffNames, today: datetime,
                   "keeper-produces": str(item.producer == entry.keeper).lower(), "state": item.state.value,
                   "unread": str(unread).lower(), "parked": parking, "waiting-for-answer": str(waiting).lower(),
                   "open-question": str(open_question).lower(), "unread-delivery": str(the_list.unread_delivery(item)).lower(),
+                  "unread-answer": str(bool(unread_answers)).lower(),
                   "title": item.title.lower(),
                   "owner-name": owner.lower(),
                   "order": str(index), "sort-values": json.dumps(values, ensure_ascii=False)}
@@ -728,6 +708,7 @@ class SavedActionState(TypedDict):
     waiting_for_answer: str
     open_question: str
     unread_delivery: NotRequired[str]
+    unread_answer: NotRequired[str]
     waiting_details_html: NotRequired[str]
     review_summary_html: NotRequired[str]
     park_request_saved: NotRequired[bool]
@@ -746,6 +727,7 @@ def saved_action_state(keeper: str, identity: str, *, status: change_page.Delive
                     if parking is not the_list.NoTimestamp.UNSET and the_list.parking_active(parking, today) else "")
     parked = bool(parked_until)
     unread = item.unread_since
+    unread_answers = the_list.unread_answer_ids(item)
     reading = status if status is not None else change_page.DeliveryStatus(review_link.review_root())
     open_question = item.state != the_list.ItemState.CLOSED and has_open_question(item)
     waiting = open_question and isinstance(the_list.question_visibility(owner, item, reading), the_list.WaitingForAnswer)
@@ -756,7 +738,8 @@ def saved_action_state(keeper: str, identity: str, *, status: change_page.Delive
                                "check_html": check_row_html(item.next_check, local_today, parked=parked),
                                "waiting_for_answer": str(waiting).lower(),
                                "open_question": str(open_question).lower(),
-                               "unread_delivery": str(the_list.unread_delivery(item)).lower()}
+                               "unread_delivery": str(the_list.unread_delivery(item)).lower(),
+                               "unread_answer": str(bool(unread_answers)).lower()}
     if park_request:
         saved["park_request_saved"] = the_list.has_park_receipt(item, park_request)
     if waiting:
@@ -772,7 +755,7 @@ def saved_action_state(keeper: str, identity: str, *, status: change_page.Delive
                     reviews = review_records
             saved["review_summary_html"] = review_summary(item, reviews, today)
         saved["waiting_details_html"] = waiting_details(
-            ListRecord(owner, item), local_today, names, the_list.unread_answer_ids(item),
+            ListRecord(owner, item), local_today, names, unread_answers,
             form_secret(reading.root), reviews, parked_until)
     return saved
 
@@ -810,14 +793,11 @@ def submit(root: Path, body: str, status: change_page.DeliveryStatus | None = No
                                page_request=the_list.PageRequest(request, "read", words))
         return change_page.NoMessageDelivery()
     item = the_list.load(morty.id, identity)
-    resend = re.fullmatch(r"resend-(Q[1-9]\d*)", action)
-    if action == "question" or resend is not None:
+    if action == "question":
         status = change_page.DeliveryStatus(root) if status is None else status
-        question = (the_list.resend_question(morty.id, identity, resend[1], request, status) if resend is not None
-                    else the_list.ask_question(morty.id, identity, the_list.PageRequest(request, "question", words), status))
+        question = the_list.ask_question(morty.id, identity, the_list.PageRequest(request, "question", words), status)
         if isinstance(question, change_page.MessageDelivery):
-            if resend is None:
-                _mark_seen_update_read(morty.id, item, prefix.seen_update)
+            _mark_seen_update_read(morty.id, item, prefix.seen_update)
             return ListQuestionDelivery(question, status)
         return question
     if action == "remove":
@@ -996,8 +976,10 @@ def render(root: Path, *, include_counts: bool = True, defer_counts: bool = Fals
         producers[entry.item.producer] += 1
         open_question = has_open_question(entry.item)
         visibility = the_list.question_visibility(entry.keeper, entry.item, status)
+        unread_answers = the_list.unread_answer_ids(entry.item)
         chip_counts[list_chip(entry.item.state, parked=parked, open_question=open_question,
-                              unread_delivery=the_list.unread_delivery(entry.item))] += 1
+                              unread_delivery=the_list.unread_delivery(entry.item),
+                              unread_answer=bool(unread_answers))] += 1
         row_reviews = reviews
         if entry.item.reviews and (
             reviews is LinkedReviewRead.AFTER_RENDER
@@ -1008,7 +990,7 @@ def render(root: Path, *, include_counts: bool = True, defer_counts: bool = Fals
             deferred_links = True
         rows.append(
             item_rows(entry, names, today, index, secret, row_reviews, parked=parked,
-                      open_question=open_question, visibility=visibility))
+                      open_question=open_question, visibility=visibility, unread_answers=unread_answers))
     shows = [record_table.Chip("all", "All", len(items)),
              *(record_table.Chip(chip.value, chip.value.replace("-", " ").capitalize(), chip_counts[chip])
                for chip in ListChip if chip != ListChip.ALL)]
@@ -1171,7 +1153,7 @@ const isParked=data=>data.parked==='true' || data.parked===deliveryParking;
 const chipFor=data=>{
  if(data.state==='Closed') return;
  const parked=isParked(data);
- if(!parked && data.unreadDelivery==='true') return 'needs-me';
+ if(!parked && (data.unreadDelivery==='true' || data.unread==='true' && data.unreadAnswer==='true')) return 'needs-me';
  return chipsByQuestion[data.openQuestion][String(parked)][data.state];
 };
 let content=document.querySelector('[data-list]');
@@ -1254,7 +1236,8 @@ function syncUnread(item,form,unread,unreadSort){
   update.querySelector('[aria-label="No unread update"]')?.remove();
   if(!dot){const mark=document.createElement('span');mark.className='list-dot';mark.setAttribute('role','img');
    mark.setAttribute('aria-label','Unread update');update.prepend(mark);}
-  const canRead=!form.hasAttribute('data-waiting-actions') || item.dataset.unreadDelivery==='true';
+  const canRead=!form.hasAttribute('data-waiting-actions') ||
+   item.dataset.unreadDelivery==='true' || item.dataset.unreadAnswer==='true';
   if(!canRead) read?.remove();
   if(canRead && !read){
    const button=document.createElement('button');button.name='action';button.value='read';
@@ -1267,82 +1250,6 @@ function syncUnread(item,form,unread,unreadSort){
   dot?.remove();read?.remove();
   if(!update.querySelector('[aria-label="No unread update"]')){const empty=document.createElement('span');
    empty.setAttribute('aria-label','No unread update');empty.textContent='—';update.prepend(empty);}
- }
-}
-const pendingOpenReads=new Map(),keepOpenAfterRead=new Set();
-/** @type {Map<string, {unseen: Set<Element>, seen: Set<string>}>} */
-const watchedAnswers=new Map();
-let unreadShow='',unreadFilterVersion=0;
-// The second threshold reports a positive intersection after contact at the viewport edge.
-const answerVisibility=new IntersectionObserver(entries=>{
- if(listIsHidden()) return;
- for(const entry of entries){
-  if(!entry.isIntersecting || !entry.intersectionRect.width || !entry.intersectionRect.height) continue;
-  const item=entry.target.closest('[data-list-item]');
-  if(!item?.isConnected || item.hidden || entry.target.closest('[data-detail]').hidden) continue;
-  const watch=watchedAnswers.get(item.dataset.key);
-  if(!watch?.unseen.delete(entry.target)) continue;
-  watch.seen.add(entry.target.parentElement.dataset.question);
-  answerVisibility.unobserve(entry.target);
-  if(!watch.unseen.size) void markOpenedAnswerRead(item,watch);
- }
-},{threshold:[0,0.000001]});
-function listIsHidden(){
- return document.visibilityState!=='visible' || window.frameElement?.hidden===true;
-}
-function stopWatchingOpenedAnswer(key){
- for(const answer of watchedAnswers.get(key)?.unseen ?? []) answerVisibility.unobserve(answer);
- watchedAnswers.delete(key);
-}
-function watchOpenedAnswer(item,seen=new Set()){
- const key=item.dataset.key;
- if(!tableView.opened.has(key) || pendingOpenReads.has(key) || watchedAnswers.has(key)) return;
- const unseen=new Set([...item.querySelectorAll(
-  '.list-panel[data-open-read-request] .page-question:has(.question-unread) > p:last-child')]
-  .filter(answer=>!seen.has(answer.parentElement.dataset.question)));
- if(!unseen.size) return;
- watchedAnswers.set(key,{unseen,seen});
- if(!listIsHidden()) for(const answer of unseen) answerVisibility.observe(answer);
-}
-function resumeOpenedAnswerReads(){
- if(listIsHidden()) return;
- for(const {unseen} of watchedAnswers.values()) for(const answer of unseen){
-  answerVisibility.unobserve(answer);
-  answerVisibility.observe(answer);
- }
-}
-async function markOpenedAnswerRead(item,watch){
- const key=item.dataset.key;
- if(watchedAnswers.get(key)!==watch || watch.unseen.size) return;
- if(item.hidden || !tableView.opened.has(key) || listIsHidden()) return;
- const panel=item.querySelector('[data-detail]:not([hidden]) .list-panel');
- const request=panel?.dataset.openReadRequest;
- if(!request || pendingOpenReads.has(key)) return;
- stopWatchingOpenedAnswer(key);
- const token=panel.dataset.openReadToken;
- const filterVersion=unreadFilterVersion;
- const [keeper,id]=key.split('/');
- const body=new URLSearchParams({keeper,id,request,token,action:'read',words:'',until:''});
- const submission=tableView.startAction(item);
- const pending={keepOpen:true};
- pendingOpenReads.set(key,pending);startListSave();
- let saved=false;
- try{
-  const response=await fetch(location.pathname,{method:'POST',body});
-  const result=await response.json();
-  if(!response.ok) throw new Error(result.reason || 'HTTP '+response.status);
-  saved=true;
-  if(result.unread==='false'){
-   delete panel.dataset.openReadRequest;
-   if(pending.keepOpen && unreadShow && filterVersion===unreadFilterVersion && tableView.opened.has(key))
-    keepOpenAfterRead.add(key);
-  }
- }catch(error){
-  tableView.showActionResult(item,submission,'Item '+item.dataset.number,
-   {kind:'failure',message:'Read not confirmed: '+error.message});
- }finally{
-  pendingOpenReads.delete(key);saving--;
-  refreshAfterListSave(saved);
  }
 }
 const tableView=createRecordTable({content:()=>content,
@@ -1359,18 +1266,7 @@ const tableView=createRecordTable({content:()=>content,
  filters:['producer','unread'],
  staffChipFilters:['owner','producer'],
  beforeApply:rememberLogPositions,
- applied:(_items,{show,filters})=>{
-  const nextUnreadShow=filters.unread ? show : '';
-  if(nextUnreadShow!==unreadShow){
-   unreadShow=nextUnreadShow;unreadFilterVersion++;keepOpenAfterRead.clear();
-  }
-  for(const key of watchedAnswers.keys()) if(!tableView.opened.has(key)) stopWatchingOpenedAnswer(key);
-  for(const key of keepOpenAfterRead) if(!tableView.opened.has(key)) keepOpenAfterRead.delete(key);
-  restoreLogPositions();
- },
- itemOpened:watchOpenedAnswer,
- expandedSelection:(data,selection)=>selection.filters.unread && selection.show===unreadShow &&
-  keepOpenAfterRead.has(data.key) ? {...selection,filters:{...selection.filters,unread:''}} : undefined,
+ applied:restoreLogPositions,
  hasKey:key=>!closedKeys.has(key) && !!content.querySelector('[data-list-item][data-key="'+CSS.escape(key)+'"]'),
  revealLinked:(data,{filters})=>data.openQuestion==='true' || (filters.unread && data.unread!=='true'),
  missingItem:key=>{
@@ -1450,12 +1346,13 @@ function bindFeedbackForm(form){
   notice.textContent=tableView.actionNotice(item);
   const waitingForm=form.hasAttribute('data-waiting-actions');
   const confirmed={state:item.dataset.state,parked:item.dataset.parked,
-   unread:item.dataset.unread==='true',unreadDelivery:item.dataset.unreadDelivery,
+   unread:item.dataset.unread==='true',unreadDelivery:item.dataset.unreadDelivery,unreadAnswer:item.dataset.unreadAnswer,
    unreadSort:JSON.parse(item.dataset.sortValues)[7]};
   const syncConfirmed=()=>{
    item.dataset.state=confirmed.state;
    item.dataset.parked=confirmed.parked;
    item.dataset.unreadDelivery=confirmed.unreadDelivery;
+   item.dataset.unreadAnswer=confirmed.unreadAnswer;
    unpark.hidden=confirmed.parked==='false' || confirmed.state==='Closed';
    syncUnread(item,form,confirmed.unread,confirmed.unreadSort);
   };
@@ -1474,6 +1371,7 @@ function bindFeedbackForm(form){
    if(['true','false'].includes(result.parked))
     confirmed.parked=result.parked_until===deliveryParking ? deliveryParking : result.parked;
    if(['true','false'].includes(result.unread_delivery)) confirmed.unreadDelivery=result.unread_delivery;
+   if(['true','false'].includes(result.unread_answer)) confirmed.unreadAnswer=result.unread_answer;
    if(['true','false'].includes(result.unread)){
     confirmed.unread=unread;
     confirmed.unreadSort=unread ? (result.unread_sort ?? confirmed.unreadSort) : 0;
@@ -1562,7 +1460,7 @@ function bindFeedbackForm(form){
    const changesParking=parks || action==='unpark';
    const focusUnpark=action==='unpark' && document.activeElement===unpark;
    const usesWords=action==='tell' || action==='question';
-   const asksQuestion=action==='question' || action.startsWith('resend-');
+   const asksQuestion=action==='question';
    if(usesWords && !words.value.trim()) return;
    const retry=matching(action);
    let parkingTime=parkForDelivery ? deliveryParking : retry?.parkingTime ?? until.value;
@@ -1596,12 +1494,8 @@ function bindFeedbackForm(form){
    }
    if(parks) item.dataset.parked=parkForDelivery ? deliveryParking : 'true';
    if(clearsUnread) item.dataset.unread='false';
-   const releasesHolds=action==='read' || parks || action==='remove';
-   const restoreLink=releasesHolds ? tableView.releaseLink(key) : undefined;
-   const readFilterVersion=unreadFilterVersion;
-   const hadReadHold=releasesHolds && keepOpenAfterRead.delete(key);
-   const pendingRead=releasesHolds ? pendingOpenReads.get(key) : undefined;
-   if(pendingRead) pendingRead.keepOpen=false;
+   const releasesLink=action==='read' || parks || action==='remove';
+   const restoreLink=releasesLink ? tableView.releaseLink(key) : undefined;
    const submission=tableView.startAction(item);
    const hidUnread=clearsUnread && wasVisible && item.hidden;
    try{
@@ -1631,7 +1525,7 @@ function bindFeedbackForm(form){
     }
    }catch(error){
     const wasHidden=item.hidden;
-    let restore=refused || releasesHolds;
+    let restore=refused || releasesLink;
     if(refused) syncConfirmed();
     else if(parks || action==='remove'){
      restore=false;
@@ -1647,13 +1541,7 @@ function bindFeedbackForm(form){
       // Keep the pending row state until a refresh can read the record.
      }
     }else if(clearsUnread) item.dataset.unread=unreadBefore;
-    if(restore){
-     restoreLink?.();
-     if(readFilterVersion===unreadFilterVersion){
-      if(hadReadHold) keepOpenAfterRead.add(key);
-      if(pendingRead) pendingRead.keepOpen=true;
-     }
-    }
+    if(restore) restoreLink?.();
     if((refused || hidUnread) && !tableView.opened.size) tableView.openCard(key);
     const message=(refused ? 'Not saved: ' : 'Save not confirmed: ')+error.message;
     tableView.showActionResult(item,submission,'Item '+item.dataset.number,{kind:'failure',message});
@@ -1772,8 +1660,6 @@ async function refresh(_supersede=false,current=()=>true){
  rememberLogPositions();
  const surviving=new Set([...fresh.querySelectorAll('[data-list-item]')].map(item=>item.dataset.key));
  for(const key of logPositions.keys()) if(!surviving.has(key)) logPositions.delete(key);
- const priorWatches=new Map(watchedAnswers);
- for(const key of priorWatches.keys()) stopWatchingOpenedAnswer(key);
  const footer=content.querySelector('[data-list-counts-url]'),nextFooter=fresh.querySelector('[data-list-counts-url]');
  if(footer && nextFooter) nextFooter.replaceChildren(...footer.childNodes);
  restoreEvidenceDetails(fresh);
@@ -1781,10 +1667,6 @@ async function refresh(_supersede=false,current=()=>true){
  void loadListCounts();
  closedKeys=new Set(JSON.parse(content.dataset.closedKeys));
  bindListControls();tableView.replace();
- if(priorWatches.size) for(const item of content.querySelectorAll('[data-list-item]')){
-  const watch=priorWatches.get(item.dataset.key);
-  if(watch) watchOpenedAnswer(item,watch.seen);
- }
  if(focus){const field=document.getElementById(focus);field?.focus({preventScroll:true});
   if(typeof field?.setSelectionRange==='function' && typeof start==='number' && typeof end==='number')
    field.setSelectionRange(start,end,direction);}
@@ -1801,7 +1683,6 @@ async function refresh(_supersede=false,current=()=>true){
   createdItem='';
   tableView.followItemLink({inheritFilters:true});
  } else scrollTo({top,behavior:'instant'});
- watchLinkedAnswer();
  return pageRefreshFacts(page);
 }
 const reviewDialog=document.querySelector('[data-list-review-dialog]');
@@ -1924,10 +1805,7 @@ document.addEventListener('click',event=>{
 tableView.place();
 tableView.bind();bindListControls();tableView.apply(true);
 addEventListener('popstate',tableView.restorePlace);
-addEventListener('hashchange',event=>{
- tableView.restorePlace(event);
- watchLinkedAnswer();
-});
+addEventListener('hashchange',tableView.restorePlace);
 const pageRefresh=createPageRefresh(refresh,()=>content.dataset.refreshSeconds);
 document.addEventListener('review-item-created',event=>{
  if(typeof event.detail?.list_key!=='string') return;
@@ -1935,15 +1813,5 @@ document.addEventListener('review-item-created',event=>{
  listSaveVersion++;
  refreshAfterListSave(false);
 });
-document.addEventListener('visibilitychange',resumeOpenedAnswerReads);
-window.addEventListener('message',event=>{
- if(event.source===parent && event.origin===location.origin && event.data==='console-shown') resumeOpenedAnswerReads();
-});
-function watchLinkedAnswer(){
- if(!tableView.linkedItem) return;
- const row=[...content.querySelectorAll('[data-list-item]:not([hidden])')].find(item=>item.dataset.key===tableView.linkedItem);
- if(row) watchOpenedAnswer(row);
-}
-watchLinkedAnswer();
 void loadListCounts();
 })();''')

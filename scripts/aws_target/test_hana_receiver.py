@@ -267,7 +267,7 @@ with socket.socket(socket.AF_UNIX) as connection:
                 ('runtime/abi', f'{hana_protocol.RUNTIME_ABI}\n'.encode(), tarfile.REGTYPE),
                 ('runtime/config/build_folders.conf', b'patterns.slot=fixture\n', tarfile.REGTYPE))
             bootstrap, _, _ = bootstrap_fixture(root, mount, payload, request_for(payload))
-            launch = ['systemd-run', '--user', '--wait', '--property=PrivateUsers=yes',
+            launch = ['systemd-run', '--user', '--wait', '--collect', '--property=PrivateUsers=yes',
                       '--property=KillSignal=SIGKILL',
                       f'--setenv=PATH={root}:{os.environ["PATH"]}',
                       f'--setenv=FIXTURE_ARCHIVE={root / "payload.tar"}', '--', *bootstrap]

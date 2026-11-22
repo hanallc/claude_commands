@@ -1,0 +1,646 @@
+"""Merge gate suites contracts."""
+
+from __future__ import annotations
+
+import unittest
+import json
+import contextlib
+import io
+import os
+import sys
+import signal
+import resource
+import time
+import subprocess
+import select
+from types import SimpleNamespace
+from pathlib import Path
+from typing import cast, final
+from collections.abc import Generator
+from unittest import mock
+from scripts.build_queue.admission_jobs import GateJobNotRecorded, StepJob
+from scripts.production import affected_modules, checkpoint_gate, gate, targeted_test
+from scripts.lint.memory_test_support import write_config_fixture
+from scripts.lib import process_group
+from scripts.test_times import gate_record
+from scripts.production.gate_modules import discover_test_modules, test_module_name
+from scripts.production.gate_test_support import SUITE_MODULE, gate_suites, install_test_runner, wait_for_file
+from scripts.production.gate_suites_test_support import GateSuitesFixture
+
+
+@final
+class MergeGateSuitesTests(GateSuitesFixture):
+    @gate_suites("hooks")
+    def test_finished_local_job_wins_when_polling_crosses_the_deadline(self) -> None:
+        # The queue admission wait comes before the time limit starts.
+        cases = (("whole machine", gate.WholeMachine(), 0.0),
+                 ("shared after a 300 s admission wait", gate.SHARED_MACHINE, 300.0))
+        for name, machine, admission_wait in cases:
+            with self.subTest(name):
+                now = 0.0
+                began = 0.0
+                process = cast(subprocess.Popen[str], cast(object, SimpleNamespace(pid=987654321, returncode=None)))
+
+                @contextlib.contextmanager
+                def admitted_after_wait(*_arguments: object, **_options: object) -> Generator[None]:
+                    nonlocal now, began
+                    now += admission_wait
+                    began = now
+                    yield None
+
+                def start(*arguments: object) -> gate.RunningGateJob:
+                    nonlocal now
+                    suite, path, log = cast(str, arguments[0]), cast(Path, arguments[1]), cast(Path, arguments[5])
+                    now = began + 9.98
+                    self.write(log, "OK\n")
+                    return gate.RunningGateJob(suite, path, process, began, 0, log.open("r+"), log, path.name)
+
+                def reap(*arguments: int) -> tuple[int, int, resource.struct_rusage]:
+                    return (arguments[0] if now >= began + 9.99 else 0), 0, resource.getrusage(resource.RUSAGE_SELF)
+
+                def advance(seconds: float) -> None:
+                    nonlocal now
+                    now += seconds
+
+                with (mock.patch.dict(os.environ, self.environment),
+                      mock.patch.object(time, "monotonic", side_effect=lambda: now),
+                      mock.patch.object(time, "sleep", side_effect=advance),
+                      mock.patch.object(gate, "gate_reservation", side_effect=admitted_after_wait),
+                      mock.patch.object(gate, "start_gate_job", side_effect=start),
+                      mock.patch.object(os, "wait4", side_effect=reap),
+                      mock.patch.object(process_group, "send_process_group"),
+                      contextlib.redirect_stdout(io.StringIO())):
+                    run = gate.run_suites(self.checkout, machine=machine,
+                                               time_limit=gate_record.GateTimeLimit(10))
+                self.assertTrue(run.passed, run.time_limit_report)
+                self.assertEqual(run.jobs[0].returncode, 0)
+                self.assertEqual(run.jobs[0].killed_for, "")
+                self.assertEqual(run.time_limit_report, "")
+                self.assertLess(run.seconds, 20)
+
+    def test_time_limit_notice_resolves_staff_ids_and_unit_names(self) -> None:
+        from scripts.message import roster, send
+        from scripts.production import staff
+        from scripts.production.staff_test_support import fixture_member, isolated_staff_file
+
+        report = "time limit: limit 10 s; elapsed 11 s; running modules: hooks/test_busy.py"
+        run = gate.GateRun((), 11, 0, time_limit_report=report)
+        received: list[tuple[str, str]] = []
+
+        with (mock.patch.dict(os.environ, self.environment),
+              isolated_staff_file(Path(self.environment["STAFF_FILE"]), self.environment)):
+            parent = fixture_member("showrunner", name="fixture-production")
+            owner = fixture_member("unit", name="fixture-unit", parent=parent.id)
+            for position, reference in enumerate((str(owner.id), owner.name)):
+                with self.subTest(owner=reference), mock.patch.object(subprocess, "run", return_value=
+                        subprocess.CompletedProcess([], 0, "SENT: fixture owner", "")) as delivery, \
+                        contextlib.redirect_stdout(io.StringIO()):
+                    gate.tell_time_limit(reference, self.checkout, run)
+                    for call in delivery.call_args_list:
+                        arguments = send.parse(cast(list[str], call.args[0])[2:])
+                        route = send.resolve_recipient(arguments.to, send.LocalOnly(), roster.Roster([], []),
+                                                       membership=staff.snapshot(), records=[])
+                        self.assertIsInstance(route, send.QueuedStaffRecipient)
+                        if not isinstance(route, send.QueuedStaffRecipient):
+                            self.fail("The private owner must resolve through its staff row")
+                        received.append((route.address, send.body_text(arguments)))
+                    self.assertEqual(received[position:position + 1], [(f"session:{owner.current_session}", report)])
+        self.assertEqual(len(received), 2)
+
+    def test_cpu_slot_wait_returns_to_the_runner_at_its_deadline(self) -> None:
+        reader, writer = os.pipe()
+        self.addCleanup(os.close, reader)
+        self.addCleanup(os.close, writer)
+        pool = gate.SharedCPUPool(reader, reader, deadline=12)
+        now = 10.0
+        waits: list[float | None] = []
+        def wait(*arguments: object) -> tuple[list[int], list[int], list[int]]:
+            nonlocal now
+            waits.append(cast(float, arguments[3]))
+            now = 13.0
+            return [], [], []
+        with mock.patch.object(time, "monotonic", side_effect=lambda: now), \
+                mock.patch.object(select, "select", side_effect=wait), contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaisesRegex(TimeoutError, "gate time limit"):
+                _ = pool.acquire()
+        self.assertEqual(waits, [2.0])
+        self.assertEqual(pool.owned, [])
+
+    def test_deadline_stops_groups_and_keeps_names_and_tracebacks(self) -> None:
+        output = io.StringIO()
+        log = self.root / "timed-module.log"
+        self.write(log, "partial module output")
+        process = cast(subprocess.Popen[str], cast(object, SimpleNamespace(pid=987654321, returncode=None)))
+        job = gate.RunningGateJob("hooks", Path("test_busy.py"), process, 10, 10, output, log, "test_busy.py")
+        failed = gate.GateJobResult("message", "test_red.py", 1, 1,
+                                         "Traceback (most recent call last):\nAssertionError: fixture failure")
+        signals: list[tuple[int, int]] = []
+        def send(pid: int, signum: int) -> None:
+            signals.append((pid, signum))
+        with mock.patch.object(time, "monotonic", return_value=11), \
+                mock.patch.object(process_group, "send_process_group", side_effect=send):
+            self.assertEqual(gate.stop_at_time_limit([job], [failed], 10, 12), "")
+        self.assertEqual(signals, [])
+        with mock.patch.object(time, "monotonic", return_value=13), \
+                mock.patch.object(process_group, "send_process_group", side_effect=send), \
+                mock.patch.object(os, "wait4", return_value=(process.pid, signal.SIGTERM, resource.getrusage(resource.RUSAGE_SELF))), \
+                contextlib.redirect_stdout(io.StringIO()):
+            report = gate.stop_at_time_limit([job], [failed], 10, 12)
+        self.assertEqual(signals, [(process.pid, signal.SIGTERM), (process.pid, signal.SIGKILL)])
+        self.assertIn("limit 2 s; elapsed 3.000 s; running modules: hooks/test_busy.py", report)
+        self.assertIn("message/test_red.py", report)
+        self.assertIn("Traceback (most recent call last):\nAssertionError: fixture failure", report)
+        self.assertIn("partial module output", report)
+        self.assertEqual(job.killed_for, report.split("\n", 1)[0])
+        run = gate.GateRun((failed,), 3, 0, time_limit_report=report)
+        self.assertFalse(run.passed)
+        from scripts.message import session_send
+        with mock.patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "SENT: fixture", "")) as tell:
+            gate.tell_time_limit("fixture", self.checkout, run)
+        self.assertEqual(tell.call_args.args, (session_send.send_argv(
+            "--to", "fixture", "--from", "gate", "--key", f"gate-time-limit:{self.checkout}", "--text", report),))
+
+    @gate_suites("hooks", "message")
+    def test_targeted_selection_precedes_the_route_and_survives_fallback(self) -> None:
+        from scripts.aws_target import cloud_gate
+
+        _ = write_config_fixture(Path(self.environment["CONF_DIR"]) / "gate.conf", "scan_roots=\n")
+        subject, base = self.prepare_affected_subject()
+        first = self.run_gate("--tests-only")
+        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+        rows = (
+            ("unchanged", False, 0),
+            ("document", False, 0),
+            ("subject", False, 0),
+            ("subject", True, 0),
+            ("committed-subject", False, 1),
+            ("fallback-edit", True, 1),
+            ("fallback-commit", True, 1),
+            ("fallback-full", True, 1),
+        )
+        for change, fallback, status in rows:
+            with self.subTest(change=change, fallback=fallback):
+                _ = self.git(self.checkout, "reset", "--hard", base)
+                (self.checkout / "scripts/hooks/test_second.py").unlink(missing_ok=True)
+                if change in ("subject", "committed-subject") or change.startswith("fallback-"):
+                    self.write(subject, "VALUE = 2\n")
+                    if change == "committed-subject":
+                        _ = self.commit(self.checkout, "Change the subject")
+                elif change == "document":
+                    self.write(self.checkout / "subject.txt", "unrelated document\n")
+                self.clear_gate_events()
+                if change == "fallback-full":
+                    (Path(self.environment["GATE_PASSED_DIR"]) / "passed-trees.jsonl").unlink()
+                    for ref in self.git(self.checkout, "for-each-ref", "--format=%(refname)", "refs/remotes/origin").splitlines():
+                        _ = self.git(self.checkout, "update-ref", "-d", ref)
+                expected_tree = cloud_gate.working_tree(self.checkout)[0]
+                routed: list[gate.AllModules | gate.TreeSelection] = []
+
+                def route(repo: Path, *, mode: gate.SuiteMode, full: bool,
+                          module_time_limit_s: float, selected: gate.AllModules | gate.TreeSelection,
+                          gate_job: StepJob | GateJobNotRecorded) -> gate.GateRun | str:
+                    self.assertEqual(gate_job, StepJob("test-affected"))
+                    self.assertEqual(repo, self.checkout)
+                    self.assertEqual(mode, gate.SuiteMode.TARGETED)
+                    self.assertFalse(full)
+                    self.assertEqual(module_time_limit_s, gate.DEFAULT_MODULE_TIME_LIMIT_S)
+                    routed.append(selected)
+                    if change.startswith("fallback-"):
+                        added = self.checkout / "scripts/hooks/test_second.py"
+                        self.write(added, SUITE_MODULE)
+                        self.write(added, added.read_text() + '\nclass NewFailure(unittest.TestCase):\n'
+                                   + '    def test_new_failure(self):\n        self.fail("new failing module")\n')
+                        if change in ("fallback-commit", "fallback-full"):
+                            _ = self.commit(self.checkout, "Add a failing test during the route")
+                    if fallback:
+                        return "fixture cloud unavailable"
+                    return gate.GateRun((gate.GateJobResult(
+                        "hooks", "test_first.py", int(change == "committed-subject"), 1, ""),), 1, 0)
+
+                arguments = ["--repo", str(self.checkout)]
+                with (mock.patch.dict(os.environ, self.environment),
+                      mock.patch.object(cloud_gate, "route", side_effect=route),
+                      mock.patch.object(gate, "select_affected", wraps=affected_modules.select_affected) as select,
+                      contextlib.redirect_stdout(io.StringIO()) as output,
+                      contextlib.redirect_stderr(io.StringIO()) as errors):
+                    result = gate.main(["--affected", *arguments])
+                self.assertEqual(result, status, output.getvalue() + errors.getvalue())
+                self.assertEqual(select.call_count, 2 if fallback else 1)
+                if change in ("subject", "committed-subject") or change.startswith("fallback-"):
+                    selected, = routed
+                    self.assertIsInstance(selected, gate.TreeSelection)
+                    assert isinstance(selected, gate.TreeSelection)
+                    self.assertEqual(selected.tree, expected_tree)
+                    if change == "fallback-full":
+                        self.assertCountEqual(selected.paths, ("scripts/hooks/test_first.py", "scripts/message/test_first.py"))
+                        self.assertEqual(output.getvalue().splitlines().count("full suite: no certified base"), 2)
+                    else:
+                        self.assertEqual(selected.paths, ("scripts/hooks/test_first.py",))
+                        self.assertIn("affected: 1 of 2 modules", output.getvalue())
+                else:
+                    self.assertEqual(routed, [])
+                    self.assertIn("affected: 0 of 2 modules", output.getvalue())
+                    self.assertIn("(none)", output.getvalue())
+                starts = [(row["suite"], row["module"]) for row in self.module_events() if row["event"] == "start"]
+                if change.startswith("fallback-"):
+                    expected = {("hooks", "test_first.py"), ("hooks", "test_second.py")}
+                    if change == "fallback-full":
+                        expected.add(("message", "test_first.py"))
+                    self.assertEqual(set(starts), expected)
+                    self.assertIn("new failing module", output.getvalue())
+                    self.assertFalse(any(record["tree"] == cloud_gate.working_tree(self.checkout)[0]
+                                         for record in self.pass_records()))
+                else:
+                    self.assertEqual(starts, [("hooks", "test_first.py")] if fallback else [])
+                self.assertFalse(any(call["tool"] == "basedpyright" for call in self.calls()))
+                if change == "committed-subject":
+                    tree = self.git(self.checkout, "rev-parse", "HEAD^{tree}")
+                    self.assertFalse(any(record["tree"] == tree and record["kind"] == "full"
+                                         and record["suites"] == list(self.suites) for record in self.pass_records()))
+
+    @gate_suites("hooks", "direct")
+    def test_whole_machine_orders_modules_from_supplied_times_without_writing_them(self) -> None:
+        path = self.state / "module_seconds.json"
+        content = json.dumps({"hooks/test_first.py": 100.0, "direct/test_first.py": 1.0})
+        self.write(path, content)
+        machine = gate.WholeMachine(gate.read_measures(path))
+        with (mock.patch.dict(os.environ, self.environment),
+              mock.patch.object(os, "cpu_count", return_value=1),
+              mock.patch.object(gate, "save_measures", side_effect=AssertionError("measure write")),
+              contextlib.redirect_stdout(io.StringIO()) as output):
+            run = gate.run_suites(self.checkout, machine=machine)
+        self.assertTrue(run.passed, output.getvalue())
+        starts = [event["suite"] for event in self.module_events() if event["event"] == "start"]
+        self.assertEqual(starts, ["hooks", "direct"])
+        self.assertEqual(path.read_text(), content)
+        self.assertEqual(machine.module_seconds, {"hooks/test_first.py": 100.0, "direct/test_first.py": 1.0})
+
+    @gate_suites("hooks", "direct")
+    def test_whole_machine_without_times_keeps_the_discovery_order(self) -> None:
+        with (mock.patch.dict(os.environ, self.environment),
+              mock.patch.object(os, "cpu_count", return_value=1),
+              contextlib.redirect_stdout(io.StringIO()) as output):
+            run = gate.run_suites(self.checkout, machine=gate.WholeMachine())
+        self.assertTrue(run.passed, output.getvalue())
+        starts = [event["suite"] for event in self.module_events() if event["event"] == "start"]
+        self.assertEqual(starts, ["direct", "hooks"])
+
+    @gate_suites("lib")
+    def test_whole_machine_uses_all_cpus_without_shared_admission_or_holds(self) -> None:
+        self.write(self.state / "barrier", "two")
+        output = io.StringIO()
+        with (mock.patch.dict(os.environ, self.environment),
+              mock.patch.object(os, "cpu_count", return_value=2),
+              mock.patch.object(os, "getloadavg", side_effect=[(1.25, 4.0, 5.0), (2.5, 6.0, 7.0)]),
+              mock.patch.object(gate, "typecheck_python", return_value=Path(sys.executable)),
+              contextlib.ExitStack() as blocked, contextlib.redirect_stdout(output)):
+            for name in ("BuildHoldWait", "gate_reservation", "queue_place", "shared_cpu_pool",
+                         "suite_scope_prefix", "merge_gate_governor_gib", "SampledRSSAdmission",
+                         "PassedTreeLedger", "clean_test_tree", "process_memory_mib"):
+                _ = blocked.enter_context(mock.patch.object(gate, name, side_effect=AssertionError(name)))
+            run = gate.run_suites(self.checkout, type_dirs=("scripts",), max_running_jobs=1,
+                                       machine=gate.WholeMachine())
+        self.assertTrue(run.passed, output.getvalue())
+        self.assertEqual(len(run.jobs), 3)
+        self.assertIn("at most 2 modules at once", output.getvalue())
+        self.assertIn("One-minute load: start=1.25 max=2.50 end=2.50", output.getvalue())
+        active: set[int] = set()
+        peak = 0
+        for event in self.module_events():
+            if event["event"] == "start":
+                active.add(event["pid"])
+            else:
+                active.remove(event["pid"])
+            peak = max(peak, len(active))
+        self.assertEqual(peak, 2)
+        self.assertEqual(active, set())
+        self.assertFalse(any(call["tool"] in ("systemd-run", "ssh") for call in self.calls()))
+        for job in run.jobs:
+            self.assertIn(f"{job.suite}/{job.module} exit=0 seconds=", output.getvalue())
+
+    @gate_suites("hooks")
+    def test_whole_machine_does_not_rerun_a_failed_module(self) -> None:
+        self.write(self.state / "fail-first-hooks", "once")
+        with mock.patch.dict(os.environ, self.environment), contextlib.redirect_stdout(io.StringIO()) as output:
+            run = gate.run_suites(self.checkout, machine=gate.WholeMachine())
+        self.assertFalse(run.passed, output.getvalue())
+        self.assertEqual(len(run.jobs), 1)
+        self.assertEqual(run.jobs[0].returncode, 1)
+        self.assertEqual(len([event for event in self.module_events() if event["event"] == "start"]), 1)
+        self.assertIn("hooks/test_first.py exit=1 seconds=", output.getvalue())
+        self.assertNotIn("Rerun alone", output.getvalue())
+
+    @gate_suites("lib", "hooks")
+    def test_named_modules_run_alone_with_no_hold_ledger_or_record(self) -> None:
+        self.write(self.checkout / "scripts/hooks/test_first.py", SUITE_MODULE
+                   + "\n\nclass Red(unittest.TestCase):\n    def test_red(self):\n        self.fail('red')\n")
+        output = io.StringIO()
+        with (mock.patch.dict(os.environ, self.environment),
+              contextlib.ExitStack() as blocked, contextlib.redirect_stdout(output)):
+            for name in ("BuildHoldWait", "gate_reservation", "PassedTreeLedger", "record_gate_run", "run_gate_suites"):
+                _ = blocked.enter_context(mock.patch.object(gate, name, side_effect=AssertionError(name)))
+            code = gate.main(["--tests-only", "--repo", str(self.checkout),
+                                    "--module", "hooks/test_first.py", "--module", "lib/test_second.py"])
+        self.assertEqual(code, 1, output.getvalue())
+        starts = sorted((event["suite"], event["module"]) for event in self.module_events() if event["event"] == "start")
+        # A red module runs once more alone, as in the gate, so a flake is not a red name.
+        self.assertEqual(starts, [("hooks", "test_first.py"), ("hooks", "test_first.py"), ("lib", "test_second.py")])
+        self.assertEqual(checkpoint_gate.red_names(["gate.py"], output.getvalue()), frozenset({"hooks/test_first.py"}))
+
+    def test_a_named_module_needs_tests_only(self) -> None:
+        with contextlib.redirect_stderr(io.StringIO()) as errors, self.assertRaises(SystemExit):
+            _ = gate.main(["--repo", str(self.checkout), "--module", "hooks/test_first.py"])
+        self.assertIn("--module needs --tests-only", errors.getvalue())
+
+    def test_gate_commands_refuse_abbreviated_options(self) -> None:
+        for main, arguments, short in (
+            (gate.main, ["--tests-on", "--full"], "--tests-on"),
+            (targeted_test.main, ["--ful"], "--ful"),
+        ):
+            with (self.subTest(command=main.__module__),
+                  mock.patch.object(gate, "run_tests_only") as run,
+                  contextlib.redirect_stderr(io.StringIO()) as errors, self.assertRaises(SystemExit) as refusal):
+                _ = main(arguments)
+            self.assertEqual(refusal.exception.code, 2)
+            self.assertIn(f"unrecognized arguments: {short}", errors.getvalue())
+            run.assert_not_called()
+
+    @gate_suites("hooks")
+    def test_whole_machine_stops_a_module_at_its_time_limit(self) -> None:
+        self.write(self.state / "hold-module", "held")
+        with mock.patch.dict(os.environ, self.environment), contextlib.redirect_stdout(io.StringIO()) as output:
+            run = gate.run_suites(self.checkout, module_time_limit_s=2,
+                                       machine=gate.WholeMachine())
+        self.assertFalse(run.passed, output.getvalue())
+        self.assertEqual(len(run.jobs), 1)
+        self.assertTrue(run.jobs[0].killed_for)
+        self.assertIn("seconds=", output.getvalue())
+        self.assertIn("stopped", output.getvalue())
+
+    @gate_suites("hooks")
+    def test_runner_reaps_a_module_when_journal_publication_fails(self) -> None:
+        self.write(self.state / "hold-module", "held")
+        save = gate.GateRecovery.save
+        launched: list[int] = []
+
+        def fail_publication(recovery: gate.GateRecovery) -> None:
+            if recovery.groups:
+                launched.extend(recovery.groups)
+                wait_for_file(self.state / "module-held")
+                raise OSError("fixture journal write failed")
+            save(recovery)
+
+        try:
+            with (mock.patch.dict(os.environ, self.environment),
+                  mock.patch.object(gate.GateRecovery, "save", new=fail_publication),
+                  contextlib.redirect_stdout(io.StringIO())):
+                with self.assertRaisesRegex(OSError, "fixture journal write failed"):
+                    _ = gate.run_suites(
+                        self.checkout, machine=gate.WholeMachine(),
+                        time_limit=gate_record.NoGateTimeLimit("fixture"))
+            self.assertEqual(len(launched), 1)
+            with self.assertRaises(ChildProcessError):
+                _ = os.waitpid(launched[0], os.WNOHANG)
+        finally:
+            for pid in launched:
+                with contextlib.suppress(ChildProcessError):
+                    if os.waitpid(pid, os.WNOHANG)[0] == 0:
+                        process_group.send_process_group(pid, signal.SIGKILL)
+                        _ = os.waitpid(pid, 0)
+
+    def test_modules_run_the_checkout_runner_and_import_from_the_checkout(self) -> None:
+        runner = install_test_runner(self.checkout)
+        marker = self.state / "checkout-runner"
+        self.write(runner, runner.read_text().replace(
+            'if __name__ == "__main__":',
+            f'Path({str(marker)!r}).write_text(str(Path(__file__).resolve()))\n\n'
+            + 'if __name__ == "__main__":'))
+        self.write(self.checkout / "checkout_identity.py", 'VALUE = "tested checkout"\n')
+        self.write(self.checkout / "scripts/hooks/test_first.py", SUITE_MODULE + '''
+    def test_imports_use_the_checkout(self):
+        import checkout_identity
+        self.assertEqual(checkout_identity.VALUE, "tested checkout")
+''')
+        result = self.run_gate("--tests-only", "--full")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(marker.read_text(), str(runner))
+        self.assert_all_modules_started()
+
+    def test_a_missing_checkout_runner_is_refused_before_any_job_starts(self) -> None:
+        runner = self.checkout / "scripts/test_times/module_run.py"
+        runner.unlink(missing_ok=True)
+        result = self.run_gate("--tests-only", "--full")
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(result.stderr.strip(), f"REFUSED: test runner not found: {runner}")
+        self.assertEqual(self.calls(), [])
+        self.assertEqual(self.module_events(), [])
+
+    def test_recovery_suites_include_their_real_regression_modules(self) -> None:
+        repo = Path(__file__).resolve().parents[2]
+        found = {(suite, test_module_name(repo, suite, path))
+                 for suite, path in discover_test_modules(repo)}
+        self.assertTrue({
+            ("release", "test_release.py"), ("claude_to_codex", "test_sync.py"),
+            ("new_rust_project", "test_rust_generate.py"), ("validate_and_push", "test_rerun.py"),
+            ("exclude", "test_exclude.py"), ("prioritize", "tests/test_renumber.py"),
+            ("prioritize", "tests/test_run_watcher.py"),
+        }.issubset(found), found)
+
+    def test_discovery_keeps_path_order_and_skips_cache_folders(self) -> None:
+        repo = self.checkout / "discovery"
+        for name in ("z/test_last.py", "a/test_last.py", "a/nested/test_first.py",
+                     "a/__pycache__/test_hidden.py", "__pycache__/test_hidden.py"):
+            self.write(repo / "scripts" / name, "# A fixture module.\n")
+        found = discover_test_modules(repo)
+        self.assertEqual(found, [
+            ("a", repo / "scripts/a/nested/test_first.py"),
+            ("a", repo / "scripts/a/test_last.py"),
+            ("z", repo / "scripts/z/test_last.py"),
+        ])
+        self.assertEqual([test_module_name(repo, suite, path) for suite, path in found],
+                         ["nested/test_first.py", "test_last.py", "test_last.py"])
+
+    @gate_suites("prioritize")
+    def test_a_nested_suite_module_runs_and_retries_at_its_discovered_path(self) -> None:
+        flat = self.checkout / "scripts/prioritize/test_first.py"
+        nested = flat.parent / "tests/test_first.py"
+        # The shared job fixture finds its suite from the checkout path.
+        self.write(nested, SUITE_MODULE)
+        flat.unlink()
+        self.write(self.state / "signal-prioritize", "once")
+        result = self.run_gate("--tests-only")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("Rerun alone: prioritize/tests/test_first.py passed", result.stdout)
+        self.assertEqual(len([row for row in self.module_events() if row["event"] == "start"]), 2)
+
+    @gate_suites("types")
+    def test_a_suite_named_types_runs_tests_and_reports_them_apart_from_the_type_check(self) -> None:
+        module = self.checkout / "scripts/types/test_first.py"
+        _ = module.rename(module.with_name("test_x.py"))
+        self.write(self.state / "signal-types", "once")
+        with mock.patch.dict(os.environ, self.environment), contextlib.redirect_stdout(io.StringIO()) as output:
+            run = gate.run_suites(self.checkout, type_dirs=("scripts",), full=True)
+        report = output.getvalue()
+        self.assertTrue(run.passed, report)
+        self.assertCountEqual([(job.kind, job.suite, job.module, job.returncode) for job in run.jobs], [
+            (gate.GateJobKind.TEST_MODULE, "types", "test_x.py", 0),
+            (gate.GateJobKind.TYPE_CHECK, "types", "basedpyright", 0),
+        ])
+        self.assertEqual([(row["suite"], row["module"], row["event"]) for row in self.module_events()], [
+            ("types", "test_x.py", "start"), ("types", "test_x.py", "start"), ("types", "test_x.py", "finish"),
+        ])
+        self.assertIn("Rerun alone: types/test_x.py passed", report)
+        self.assertRegex(report, r"(?m)^types: OK \d+\.\d+s$")
+        self.assertIn("basedpyright: OK", report)
+        self.assertEqual(len([call for call in self.calls() if call["tool"] == "basedpyright"]), 1)
+        self.assertIn("types/test_x.py", gate.read_measures(self.state / "runner/module_seconds.json"))
+
+    def test_a_test_file_directly_under_scripts_is_refused_before_jobs_start(self) -> None:
+        self.write(self.checkout / "scripts/test_x.py", SUITE_MODULE)
+        result = self.run_gate("--tests-only")
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("test module must be in a suite folder under scripts/: test_x.py", result.stderr)
+        self.assertEqual(self.module_events(), [])
+        self.assertFalse(any(call["tool"] == "basedpyright" for call in self.calls()))
+
+    @gate_suites("hooks", "notify")
+    def test_folder_with_its_last_module_deleted_is_not_a_suite(self) -> None:
+        (self.checkout / "scripts" / "notify" / "test_first.py").unlink()
+        result = self.run_gate("--tests-only")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        starts = [(row["suite"], row["module"]) for row in self.module_events() if row["event"] == "start"]
+        self.assertEqual(starts, [("hooks", "test_first.py")])
+        self.assertRegex(result.stdout, r"(?m)^hooks: OK \d+\.\d+s$")
+        self.assertNotRegex(result.stdout, r"(?m)^notify:")
+
+    def test_modules_use_only_the_checked_tree_pythonpath(self) -> None:
+        caller_path = self.root / "caller-pythonpath"
+        caller_path.mkdir()
+        self.environment.update({"PYTHONPATH": str(caller_path), "GATE_TEST_PYTHONPATH": str(caller_path),
+                                 "GATE_TEST_ISOLATION": "1"})
+        result = self.run_gate("--tests-only")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    @gate_suites("hooks", "message")
+    def test_caller_modules_fail_and_plain_python_children_import_the_checked_tree(self) -> None:
+        caller_path = self.root / "caller-pythonpath"
+        self.write(caller_path / "caller_only.py", 'VALUE = "caller"\n')
+        self.environment["PYTHONPATH"] = str(caller_path)
+        del self.environment["GATE_PYTHON"]
+        self.write(self.checkout / "scripts/hooks/test_first.py", "import caller_only\n")
+        identity = self.checkout / "scripts/message/checkout_identity.py"
+        self.write(identity, 'VALUE = "checked tree"\n')
+        marker = self.state / "plain-python-import"
+        self.write(self.checkout / "scripts/message/test_first.py", f'''import subprocess
+import select
+import sys
+import signal
+import resource
+import time
+from types import SimpleNamespace
+import unittest
+from pathlib import Path
+
+class ChildImports(unittest.TestCase):
+    def test_child_imports_the_checked_tree(self):
+        result = subprocess.run(
+            [sys.executable, "-c", "from scripts.message import checkout_identity; print(checkout_identity.__file__)"],
+            capture_output=True, text=True, check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), {str(identity)!r})
+        Path({str(marker)!r}).write_text(result.stdout.strip())
+''')
+        result = self.run_gate("--tests-only", "--full", own_process=True)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("No module named 'caller_only'", result.stdout)
+        self.assertIn("hooks: RED", result.stdout)
+        self.assertIn("message: OK", result.stdout)
+        self.assertEqual(marker.read_text(), str(identity))
+
+    @gate_suites("lib")
+    def test_modules_use_private_build_logs_and_remove_them(self) -> None:
+        caller_log = self.root / "caller-buildlog"
+        self.write(caller_log / "keep", "caller log")
+        self.environment["BUILDLOG_DIR"] = str(caller_log)
+        result = self.run_gate("--tests-only")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        rows = [cast(dict[str, str], json.loads(line))
+                for line in (self.state / "buildlogs.jsonl").read_text().splitlines()]
+        self.assertEqual(len(rows), self.module_count)
+        self.assertEqual(len({row["buildlog"] for row in rows}), self.module_count)
+        for row in rows:
+            self.assertTrue(Path(row["buildlog"]).is_relative_to(row["tmpdir"]))
+            self.assertFalse(Path(row["tmpdir"]).exists())
+        gate_records = [cast(dict[str, object], json.loads(line))
+                        for path in caller_log.rglob("*")
+                        if path.is_file() and path != caller_log / "keep"
+                        for line in path.read_text().splitlines()]
+        self.assertEqual([record.get("kind") for record in gate_records], ["gate_run"])
+        self.assertEqual((caller_log / "keep").read_text(), "caller log")
+        self.assertEqual(list((caller_log / "admission").glob("*.reservation")), [])
+        self.assertEqual(list((caller_log / "admission").glob("*.waiting")), [])
+
+    def test_tests_only_reuses_results_without_running_a_red_type_check(self) -> None:
+        first = self.run_gate("--tests-only")
+        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+        records = self.pass_records()
+        self.clear_gate_events()
+        self.write(self.state / "types-red", "red")
+
+        result = self.run_gate("--tests-only")
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("tests reused from", result.stdout)
+        self.assertFalse(any(call["tool"] == "basedpyright" for call in self.calls()))
+        self.assertEqual(self.module_events(), [])
+        self.assertEqual(self.pass_records(), records)
+        self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), self.base)
+        self.assert_not_pushed()
+
+    def test_explicit_fetch_updates_refs_without_matching_remote_configuration(self) -> None:
+        _ = self.git(self.checkout, "config", "--unset-all", "remote.origin.fetch")
+        _ = self.git(self.checkout, "update-ref", "refs/remotes/origin/unit-phase", self.base)
+        result = self.run_gate("--promote")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.git(self.checkout, "rev-parse", "origin/unit-phase"), self.checkpoint)
+
+    @gate_suites("lib", "direct")
+    def test_recorded_durations_start_unknown_then_slowest_modules(self) -> None:
+        timings = {f"{suite}/test_first.py": 1.0 for suite in self.suites}
+        timings["direct/test_first.py"] = 100.0
+        self.write(self.state / "runner" / "module_seconds.json", json.dumps(timings))
+        scripts = self.checkout / "scripts"
+        modules = [*((suite, scripts / suite / "test_first.py") for suite in self.suites),
+                   ("lib", scripts / "lib" / "test_second.py")]
+        ordered = gate.module_order(modules, timings, self.checkout)
+        self.assertEqual([(suite, path.name) for suite, path in ordered[:2]],
+                         [("lib", "test_second.py"), ("direct", "test_first.py")])
+        result = self.run_gate("--tests-only")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        updated = cast(object, json.loads((self.state / "runner" / "module_seconds.json").read_text()))
+        self.assertIsInstance(updated, dict)
+        assert isinstance(updated, dict)
+        self.assertEqual(len(cast(dict[str, object], updated)), self.module_count)
+
+    @gate_suites("lib", "hooks")
+    def test_the_report_names_a_module_slower_than_its_record(self) -> None:
+        runner = self.state / "runner"
+        runner.mkdir()
+        self.write(runner / "module_history.json", json.dumps({
+            "lib/test_second.py": [0.0, 0.0, 1000.0], "hooks/test_first.py": [1000.0] * 5}))
+        with mock.patch.object(gate, "SLOW_MODULE_FLOOR_S", 0.0), \
+                mock.patch.dict(os.environ, self.environment), \
+                contextlib.redirect_stdout(io.StringIO()) as output:
+            run = gate.run_suites(self.checkout)
+        self.assertTrue(run.passed, output.getvalue())
+        self.assertRegex(output.getvalue(), r"(?m)^Slow module: lib/test_second\.py \d+ s, median of the last 3 runs 0 s \(3x or more\)$")
+        history = cast(dict[str, list[float]], json.loads((runner / "module_history.json").read_text()))
+        self.assertEqual(history["lib/test_second.py"][:3], [0.0, 0.0, 1000.0])
+        self.assertEqual(len(history["lib/test_second.py"]), 4)
+        self.assertEqual(history["hooks/test_first.py"][:4], [1000.0] * 4)
+        self.assertEqual(len(history["hooks/test_first.py"]), 5)
+        self.assertNotIn("Slow module: hooks/", output.getvalue())
+
+
+if __name__ == "__main__":
+    _ = unittest.main()

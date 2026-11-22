@@ -9,7 +9,7 @@ except FileNotFoundError:
 
 import argparse
 import json
-from collections.abc import Iterator, Mapping
+from collections.abc import Mapping
 from contextlib import chdir
 import os
 import shlex
@@ -19,15 +19,15 @@ import time
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, NamedTuple, TypedDict, cast, override
+from typing import TYPE_CHECKING, NamedTuple, cast, override
 
 from scripts.production import staff, unit_lookup, staff_sources, unit_config, session_staff
 from scripts.herdr import herdr_types
 from scripts.herdr import pane_launch
 from scripts.herdr import herdr
-from scripts.agents import remote
+from scripts.agents import pane_record, remote
 from scripts.lib import build_folders, git_exclude, git_files, models_registry
-from scripts.lib.transcripts import open_transcript, transcript_paths
+from scripts.worktree import worktrees
 
 SCRIPTS = Path(__file__).resolve().parents[1]
 from scripts.production import autocompact
@@ -291,12 +291,31 @@ def relative_plan(production: Production, raw: str) -> Path:
         raise Refusal("plan must be inside Showrunner checkout") from error
 
 
-def stub_plan(production: Production, branch: str) -> Path:
-    """Name a brief's stub plan beside the production doc, relative to Showrunner checkout."""
+def stub_plan(production: Production, unit: str) -> Path:
+    """Name the stub plan from the production and unit."""
+    name = unit_names.branch(production.name, unit_names.stem(unit))
     try:
-        return production.doc.parent.relative_to(production.checkout) / f"{branch}.md"
+        return production.doc.parent.relative_to(production.checkout) / f"{name}.md"
     except ValueError as error:
         raise Refusal("production doc must be inside Showrunner checkout") from error
+
+
+def require_unit_worktree(production: Production, worktree: Path, branch: str) -> None:
+    """Keep a unit out of the showrunner checkout and the production merge branch."""
+    if worktree.resolve() == production.checkout.resolve():
+        raise Refusal(f"{worktree}: a unit cannot use the showrunner checkout")
+    if branch == production.merge_branch:
+        raise Refusal(f"{worktree}: a unit cannot use the production merge branch {branch}")
+
+
+def default_worktree(production: Production, unit: str) -> Path:
+    word = build_folders.repo_word(production.checkout)
+    path = build_folders.worktree_path(word, unit, worktrees.UNIT_WORKTREE_NAME)
+    legacy = path.with_name("director")
+    if not os.path.lexists(path) and worktrees.checkout_record(path) is None:
+        if worktrees.checkout_record(legacy) is not None:
+            return legacy
+    return path
 
 
 def launch_request(args: argparse.Namespace, *,
@@ -307,6 +326,8 @@ def launch_request(args: argparse.Namespace, *,
         name = unit_names.name(cast(str, args.name))
     except unit_names.BadName as error:
         raise Refusal(str(error)) from error
+    if name in ("main", "ci"):
+        raise Refusal(f"unit name {name!r} is reserved")
     given_plan = cast(str | None, args.plan)
     given_brief = cast(str | None, args.brief)
     standby = cast(bool, args.standby)
@@ -333,7 +354,7 @@ def launch_request(args: argparse.Namespace, *,
         member = checked_unit_member(production, name, record)
         folder = (member.row.worktree.path if isinstance(member, staff_sources.MemberFound)
                   and isinstance(member.row.worktree, staff.PresentWorktree)
-                  else unit_names.worktree(production.checkout, unit_names.stem(name)))
+                  else default_worktree(production, name))
         try:
             saved_plan = unit_config.default_plan(folder, production.doc, name)
         except unit_config.ConfigRefused as error:
@@ -345,15 +366,12 @@ def launch_request(args: argparse.Namespace, *,
             permanent = isinstance(saved_plan, unit_config.PermanentPlan)
     if sum((given_plan is not None, given_brief is not None, standby, permanent)) != 1:
         raise Refusal("give exactly one of --plan, --brief, --standby, or --permanent")
-    kebab = unit_names.stem(name)
-    branch = unit_names.branch(production.name, kebab)
-    worktree = unit_names.worktree(production.checkout, kebab)
     plan: PlanGiven | BriefGiven | Standby
     if given_plan is not None:
         plan = PlanGiven(relative_plan(production, given_plan))
     elif given_brief is not None:
         assert given_brief is not None
-        plan = BriefGiven(given_brief, stub_plan(production, branch))
+        plan = BriefGiven(given_brief, stub_plan(production, name))
     else:
         plan = Standby(permanent)
     identity = attached if attached is not None else resumed
@@ -384,6 +402,21 @@ def launch_request(args: argparse.Namespace, *,
         requested_type = saved_type
     member = checked_unit_member(production, name, record,
         identity=session_staff.LiveSession(identity) if identity is not None else session_staff.NO_SESSION)
+    worktree = default_worktree(production, name)
+    branch = f"{name}-{worktree.name}"
+    if isinstance(member, staff_sources.MemberFound) and isinstance(member.row.worktree, staff.PresentWorktree):
+        recorded = unit_lookup.local_worktree(member).path
+        if isinstance(session, NewSession) or recorded != worktree or os.path.lexists(recorded):
+            saved_make = worktrees.checkout_record(recorded)
+            if saved_make is not None and worktrees.pending_checkout(recorded, production.checkout, saved_make.branch):
+                branch = saved_make.branch
+            else:
+                observed = git(replace(production, checkout=recorded), "branch", "--show-current", check=False)
+                branch = observed.stdout.strip()
+                if observed.returncode or not branch:
+                    raise Refusal(f"{recorded}: cannot read the recorded worktree branch")
+            require_unit_worktree(production, recorded, branch)
+            worktree = recorded
     unit_type = requested_type or "direct"
     if isinstance(member, staff_sources.MemberFound):
         if not isinstance(member.row.unit_type, staff.UnitDetails):
@@ -414,8 +447,8 @@ def plan_text(config: unit_config.UnitConfig) -> str:
 
 
 def row_is_present(request: RequestedUnitLaunch, member: staff_sources.MemberFound | staff_sources.NoSuchMember,
-                   record: staff.StaffSnapshot) -> NoUnitRow | ExistingUnitRow:
-    """Read an admitted unit from its staff worktree; a resumed session keeps that worktree and branch."""
+                   record: staff.StaffSnapshot, *, pending: bool) -> NoUnitRow | ExistingUnitRow:
+    """Read the unit configuration in its recorded worktree."""
     holder = record.unit_by_worktree(remote.local_machine(), request.worktree)
     if holder is not None and (isinstance(member, staff_sources.NoSuchMember) or holder.id != member.row.id):
         raise Refusal(f"worktree {request.worktree} for {request.unit} is already used by {holder.name}")
@@ -423,6 +456,9 @@ def row_is_present(request: RequestedUnitLaunch, member: staff_sources.MemberFou
                 else request.worktree)
     config = unit_config.read(worktree, cleanup=False)
     if isinstance(config, unit_config.ConfigMissing):
+        if (not pending and isinstance(request.session, NewSession) and isinstance(member, staff_sources.MemberFound)
+                and isinstance(member.row.worktree, staff.PresentWorktree)):
+            raise Refusal(config.reason)
         return NoUnitRow()
     branch = subprocess.run(["git", "-C", str(worktree), "branch", "--show-current"],
                             text=True, capture_output=True, check=False).stdout.strip()
@@ -445,7 +481,7 @@ def recorded_mode(request: UnitLaunch, plan: str) -> str:
             return subject.removeprefix(subject_prefix).removesuffix(")")
     if plan in ("standby", "permanent"):
         return plan
-    stub = stub_plan(request.production, request.branch)
+    stub = stub_plan(request.production, request.identity.unit)
     if plan == stub.as_posix():
         path = request.production.checkout / stub
         # A missing stub is a brief whose stub write stopped after its config was published.
@@ -456,6 +492,7 @@ def recorded_mode(request: UnitLaunch, plan: str) -> str:
 
 def worktree_on_branch(request: UnitLaunch) -> bool:
     worktree = request.worktree
+    require_unit_worktree(request.production, worktree, request.branch)
     if not worktree.exists() and not worktree.is_symlink():
         return False
     top = subprocess.run(["git", "-C", str(worktree), "rev-parse", "--show-toplevel"],
@@ -543,7 +580,8 @@ def preflight(request: RequestedUnitLaunch, selected: ClaudeLaunchAccount, *,
         _ = production.doc.relative_to(production.checkout)
     except ValueError as error:
         raise Refusal("production doc must be inside Showrunner checkout") from error
-    existing = row_is_present(request, member, record)
+    pending = worktrees.pending_checkout(request.worktree, production.checkout, request.branch)
+    existing = row_is_present(request, member, record, pending=pending)
     plan_context: ProductionPlanRequired | ExistingConversationPlan = ProductionPlanRequired()
     if (isinstance(existing, ExistingUnitRow)
             and isinstance(request.session, ResumedSession)
@@ -553,6 +591,7 @@ def preflight(request: RequestedUnitLaunch, selected: ClaudeLaunchAccount, *,
         if request.session.cwd != existing.worktree.resolve() and not resuming_opening:
             raise Refusal(f"unit {request.unit} resumes in {request.session.cwd}; its staff row names {existing.worktree}")
         request = replace(request, worktree=existing.worktree, branch=existing.branch)
+        pending = worktrees.pending_checkout(request.worktree, production.checkout, request.branch)
     launch = UnitLaunch(
         production=request.production,
         identity=UnitIdentity(request.unit, request.requested_name),
@@ -565,7 +604,7 @@ def preflight(request: RequestedUnitLaunch, selected: ClaudeLaunchAccount, *,
         responsibilities=request.responsibilities,
         unit_type=request.unit_type,
     )
-    if launch.worktree.exists():
+    if not pending and launch.worktree.exists():
         git_exclude.require_untracked_ignored(launch.worktree, ".unit.toml", planned_pattern="/.unit.toml")
     plan_transition: NoPlanTransition | BriefToPlanTransition = NoPlanTransition()
     if isinstance(existing, ExistingUnitRow):
@@ -585,10 +624,11 @@ def preflight(request: RequestedUnitLaunch, selected: ClaudeLaunchAccount, *,
     config = configuration_for(launch)
     launch = replace(launch, responsibilities=config.responsibilities,
                      port=SuppliedCell(str(config.port.number)) if isinstance(config.port, unit_config.AppPort) else launch.port)
-    has_worktree = worktree_on_branch(launch)
+    require_unit_worktree(production, launch.worktree, launch.branch)
+    has_worktree = False if pending else worktree_on_branch(launch)
     local_branch = git(production, "show-ref", "--verify", "--quiet",
                        f"refs/heads/{request.branch}", check=False).returncode == 0
-    if (local_branch or remote_head(production, request.branch)) and not has_worktree:
+    if not has_worktree and ((local_branch and not pending) or remote_head(production, request.branch)):
         raise Refusal(f"branch {request.branch} already exists")
     if isinstance(launch.plan, PlanGiven) and isinstance(plan_context, ProductionPlanRequired):
         result = git(production, "show", f"{production.merge_branch}:{launch.plan.path.as_posix()}", check=False)
@@ -723,11 +763,15 @@ def ensure_worktree(request: UnitLaunch) -> None:
     """
     production = request.production
     worktree = request.worktree
-    if worktree.exists():
-        _ = worktree_on_branch(request)
-    else:
-        _ = build_folders.create_build_folder(build_folders.LinkedEditableRepository(
-            worktree, production.checkout, build_folders.NewWorktreeBranch(request.branch, production.merge_branch)))
+    require_unit_worktree(production, worktree, request.branch)
+    word = build_folders.repo_word(production.checkout)
+    layout = worktrees.unit_checkout_output(worktree, word, request.identity.unit)
+    try:
+        _ = worktrees.create_checkout(
+            worktree, production.checkout, build_folders.NewWorktreeBranch(request.branch, production.merge_branch),
+            layout, owner=request.identity.unit, merge_branch=production.merge_branch, allow_existing=True)
+    except worktrees.Refused as error:
+        raise Refusal(str(error)) from error
     if isinstance(request.plan, PlanGiven):
         destination = worktree / request.plan.path
         if not destination.exists():
@@ -1071,7 +1115,12 @@ def account_for_launch(request: RequestedUnitLaunch, target: str = "", config_di
         if isinstance(request.session, ResumedSession) and not config_dir:
             from scripts.production import unit_move
 
-            conversation = unit_move.unit_conversation(None, session_id=request.session.session_id)
+            try:
+                conversation = unit_move.unit_conversation(None, session_id=request.session.session_id)
+            except staff.StaffUnreadable:
+                raise
+            except (OSError, unit_move.RenameRefused):
+                conversation = unit_move.NoUnitConversation()
             if source_fallback and (not isinstance(conversation, unit_move.UnitConversation)
                                     or conversation.account != target):
                 raise Refusal("--source-fallback must name the pane launch's source account")
@@ -1086,74 +1135,41 @@ def account_for_launch(request: RequestedUnitLaunch, target: str = "", config_di
         raise Refusal(str(error)) from error
 
 
-class TranscriptMessage(TypedDict, total=False):
-    model: str
-
-
-class TranscriptEntry(TypedDict, total=False):
-    type: str
-    message: TranscriptMessage
-
-
-def transcript_lines_from_end(path: Path) -> Iterator[str]:
-    """Read newest entries first without loading the whole conversation."""
-    with open_transcript(path) as stream:
-        offset = stream.seek(0, os.SEEK_END)
-        pending = b""
-        while offset:
-            size = min(offset, 65536)
-            offset -= size
-            _ = stream.seek(offset)
-            lines = (stream.read(size) + pending).split(b"\n")
-            pending = lines[0]
-            for line in reversed(lines[1:]):
-                yield line.decode("utf-8", errors="replace")
-        if pending:
-            yield pending.decode("utf-8", errors="replace")
-
-
 def transcript_model(session_id: str) -> str:
-    """The newest real assistant model in the newest transcript for this session."""
-    try:
-        matches = transcript_paths(Path.home() / ".claude/projects", f"**/{session_id}.jsonl")
-        if not matches:
-            return ""
-        path = max(matches, key=lambda path: path.stat().st_mtime)
-        for line in transcript_lines_from_end(path):
-            try:
-                value = cast(object, json.loads(line))
-            except ValueError:
-                continue
-            if not isinstance(value, dict):
-                continue
-            entry = cast(TranscriptEntry, cast(object, value))
-            message = cast(object, entry.get("message"))
-            if entry.get("type") != "assistant" or not isinstance(message, dict):
-                continue
-            model = cast(object, cast(TranscriptMessage, cast(object, message)).get("model", ""))
-            if isinstance(model, str) and model and model != "<synthetic>":
-                return model
-    except OSError:
-        pass
-    return ""
+    """Read the model of the latest real assistant turn."""
+    turn = pane_record.claude_turn_settings(session_id)
+    return turn.model if isinstance(turn, pane_record.ClaudeTurnSettings) else ""
 
 
 def model_for_resume(request: RequestedUnitLaunch, explicit: str = "") -> str:
-    """Use the pane launch model when available, with --model as the restore boundary."""
+    """Read the model for a unit resume."""
+    return settings_for_resume(request, explicit).model
+
+
+def settings_for_resume(request: RequestedUnitLaunch, explicit: str = "", *config_dirs: Path) -> pane_record.ClaudeResumeSettings:
+    """Use the latest Claude turn, with an explicit model override."""
     if isinstance(request.session, NewSession):
         if explicit:
             raise Refusal("--model requires --resume")
-        return ""
-    if explicit:
-        return explicit
-    from scripts.agents import pane_record
+        return pane_record.ClaudeResumeSettings()
+    identity = request.session.session_id
+    record = staff.initial_snapshot()
+    owner = record.by_current_session(identity)
+    if owner is not None and isinstance(owner.home, staff.SessionHome):
+        config_dirs = (*config_dirs, owner.home.path)
+    turn = pane_record.claude_turn_settings(identity, *config_dirs)
     try:
-        entry = pane_record.launch_for_session(request.session.session_id)
+        entry = pane_record.launch_for_session(identity)
     except (OSError, ValueError) as error:
-        raise Refusal(f"pane launch unreadable: {error}") from error
-    if entry is not None and entry["model"]:
-        return entry["model"]
-    return transcript_model(request.session.session_id) if isinstance(launched_unit(request), LabeledSessionFound) else ""
+        if not explicit and isinstance(turn, pane_record.NoClaudeTurn):
+            raise Refusal(f"pane launch unreadable: {error}") from error
+        entry = None
+    if entry is not None:
+        home = pane_launch.config_home(entry, record=record)
+        if isinstance(home, staff.SessionHome) and home.path not in (*config_dirs, *sessions.config_dirs()):
+            turn = pane_record.claude_turn_settings(identity, *config_dirs, home.path)
+    fallback = pane_record.ClaudeResumeSettings(model=entry["model"] if entry is not None else "")
+    return pane_record.claude_resume_settings(turn, fallback=fallback, explicit_model=explicit)
 
 
 def autocompact_for_resume(request: RequestedUnitLaunch, explicit: str = "") -> str:
@@ -1217,7 +1233,7 @@ def configuration_for(request: UnitLaunch) -> unit_config.UnitConfig:
     config = unit_config.UnitConfig(plan, port, responsibilities)
     if isinstance(existing, unit_config.UnitConfig):
         comparable = replace(existing, port=port) if isinstance(existing.port, unit_config.NoAppPort) else existing
-        stub = stub_plan(request.production, request.branch)
+        stub = stub_plan(request.production, request.identity.unit)
         if (isinstance(request.plan, PlanGiven) and existing.plan == unit_config.PlanFile(stub)
                 and recorded_mode(request, stub.as_posix()) == "brief"):
             comparable = replace(comparable, plan=plan)
@@ -1298,7 +1314,12 @@ def checked_unit_member(production: Production, unit: str,
         found = staff_sources.member(staff_sources.ObservedUnit(unit, identity), record)
     else:
         # A new admission checks reserved names in staff, without observing a process.
-        reservations = [row.id for row in record.find(kind="unit") if row.name == unit_names.name(unit)]
+        rows = record.find(kind="unit")
+        for row in rows:
+            if (row.parent == staff.ReportsTo(production.owner.id) and row.name != unit
+                    and unit_names.stem(row.name) == unit_names.stem(unit)):
+                raise Refusal(f"unit {unit} conflicts with the existing name {row.name}")
+        reservations = [row.id for row in rows if row.name == unit_names.name(unit)]
         if len(reservations) > 1:
             raise staff.StaffUnreadable(f"{unit}: no unique staff entry")
         row = record.by_id(reservations[0]) if reservations else None
@@ -1390,7 +1411,8 @@ def _main(argv: list[str]) -> int:
                 raise Refusal(
                     f"unit account {unit_account.label}: {problems[0]}; see Hana console, Accounts"
                 )
-            resume_model = model_for_resume(request, cast(str, args.model))
+            explicit_model = cast(str, args.model)
+            resume = settings_for_resume(request, explicit_model, unit_account.dir)
             resume_autocompact = autocompact_for_resume(request, cast(str, args.autocompact))
 
             handoff: NoSessionHandoff | StoppedSessionHandoff = NoSessionHandoff()
@@ -1402,6 +1424,7 @@ def _main(argv: list[str]) -> int:
                 assert isinstance(source, RunningSessionHandoff)
                 stop_for_attach(source)
                 require_stopped_session(source)
+                resume = settings_for_resume(request, explicit_model, unit_account.dir)
                 handoff = StoppedSessionHandoff(source)
                 request = replace(request, session=request.session._replace(handoff=ResumeStoppedSession()))
 
@@ -1449,8 +1472,13 @@ def _main(argv: list[str]) -> int:
                 autocompact.record(request.session.session_id, cast(str, args.autocompact))
             if isinstance(labeled_session, NoLabeledSession):
                 prompt = prompt_for(request)
-                outcome = launch_session(request, ready.director, prompt, unit_account, target=unit_account.label
-                               if isinstance(request.session, ResumedSession) else "", model=resume_model,
+                role_effort = ready.director.effort
+                launch_settings = pane_record.claude_resume_settings(resume, fallback=pane_record.ClaudeResumeSettings(
+                    effort=role_effort.value if isinstance(role_effort, Effort) else ""))
+                director = ready.director._replace(
+                    effort=Effort(launch_settings.effort) if launch_settings.effort else DefaultEffort())
+                outcome = launch_session(request, director, prompt, unit_account, target=unit_account.label
+                               if isinstance(request.session, ResumedSession) else "", model=launch_settings.model,
                                autocompact_window=resume_autocompact)
             elif opening_record(request.production, request.unit_id).exists():
                 recovered = finish_opening(request, labeled_session)

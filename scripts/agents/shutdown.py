@@ -47,7 +47,7 @@ from scripts.production import (
 from scripts.production.production_doc import Production, Refusal, read_production
 from scripts.production.unit_move import RenameRefused, read_json, write_json
 from scripts.lib.atomic_file import sync_folder, write_text_atomic
-from scripts.worktree.worktrees import release_worktree_pair
+from scripts.worktree import worktrees
 from scripts.agents import (
     producer_lifecycle,
     producer_transfer,
@@ -1220,7 +1220,7 @@ def retirement_find_unit(production_name: str, given: str, *,
         raise ValueError(f"{member.name}: staff worktree is unfilled")
     branch = location.branch.value if isinstance(location, staff.RemovedWorktree) and isinstance(location.branch, staff.ParkedBranch) else ""
     if unit_machine_is_local(location.machine) and location.path.is_dir():
-        branch = retirement_branch(location.path)
+        branch = retirement_branch(location.path) or branch
     return RetiringUnit(production, member.name, location.path, branch, member)
 
 def retirement_last_session(unit: RetiringUnit) -> str:
@@ -1244,9 +1244,52 @@ def retirement_branch_commits(unit: RetiringUnit, branch: str, *, settings: conf
         commits.append(remote.stdout.split()[0])
     return commits
 
+def retirement_rebase(unit: RetiringUnit, *, settings: conf.ConfigRead) -> Path | None:
+    """Find a checkout that is rebasing the unit branch."""
+    listed = retirement_git(unit, "worktree", "list", "--porcelain", "-z", settings=settings)
+    if listed.returncode:
+        raise OSError(f"cannot list Git worktrees: {retirement_failure(listed)}")
+    checkouts: list[Path | None] = []
+    for section in listed.stdout.split("\0\0"):
+        entry, *fields = section.split("\0")
+        if entry.startswith("worktree "):
+            checkouts.append(None if "bare" in fields else Path(entry.removeprefix("worktree ")))
+    if not checkouts:
+        return None
+    primary, *linked = checkouts
+    resolved = retirement_git(unit, "rev-parse", "--path-format=absolute", "--git-common-dir", settings=settings)
+    if resolved.returncode:
+        raise OSError(f"cannot read the common Git folder: {retirement_failure(resolved)}")
+    common = Path(resolved.stdout.removesuffix("\n"))
+    try:
+        entries = tuple((common / "worktrees").iterdir())
+    except FileNotFoundError:
+        entries = ()
+    expected = f"refs/heads/{unit.branch}"
+    for git_dir in (common, *entries):
+        if git_dir == common and primary is None:
+            continue
+        for operation in ("rebase-merge", "rebase-apply"):
+            try:
+                branch = (git_dir / operation / "head-name").read_text(encoding="utf-8").removesuffix("\n")
+            except FileNotFoundError:
+                continue
+            if branch != expected:
+                continue
+            if git_dir == common:
+                return primary
+            pointer = (git_dir / "gitdir").read_text(encoding="utf-8", errors="surrogateescape").removesuffix("\n")
+            checkout = Path(os.path.abspath(git_dir / pointer)).parent
+            if checkout in linked:
+                return checkout
+    return None
+
+
 def retirement_refusals(unit: RetiringUnit, *, settings: conf.ConfigRead, check_absent_branch: bool = False) -> list[str]:
     """Keep uncommitted work and commits outside the merge branch."""
     present = unit.worktree.is_dir()
+    if unit.branch and (rebasing := retirement_rebase(unit, settings=settings)) is not None:
+        return [f"branch {unit.branch} is rebasing in {rebasing}"]
     if not present and (not check_absent_branch or not unit.branch):
         return []
     found: list[str] = []
@@ -1277,17 +1320,27 @@ def retirement_members(unit: RetiringUnit, record: staff.StaffSnapshot) -> list[
 
 def retirement_remove(unit: RetiringUnit, *, settings: conf.ConfigRead) -> list[str]:
     failed: list[str] = []
-    if unit.worktree.exists():
-        result = retirement_git(unit, "worktree", "remove", "--force", str(unit.worktree), settings=settings)
-        if result.returncode:
-            return [retirement_failure(result)]
-        release_worktree_pair(unit.worktree)
-        print(f"removed: worktree {unit.worktree}")
+    if not unit.branch and not os.path.lexists(unit.worktree):
+        return failed
+    try:
+        layout = worktrees.worktree_output(unit.worktree)
+        worktrees.remove_git_checkout(unit.worktree, unit.production.checkout, force=True, retain_record=True)
+        if isinstance(layout, worktrees.RecordedWorktreeOutput) or worktrees.enforce_build_folders():
+            worktrees.retire(unit.name)
+    except (OSError, ValueError, worktrees.Refused) as error:
+        return [str(error)]
+    if os.path.lexists(unit.worktree):
+        return failed
     if unit.branch:
-        if retirement_git(unit, "show-ref", "--verify", "--quiet", f"refs/heads/{unit.branch}", settings=settings).returncode == 0:
+        if (rebasing := retirement_rebase(unit, settings=settings)) is not None:
+            return [f"branch {unit.branch} is rebasing in {rebasing}"]
+        local = retirement_git(unit, "show-ref", "--verify", "--quiet", f"refs/heads/{unit.branch}", settings=settings)
+        if local.returncode not in (0, 1):
+            return [retirement_failure(local)]
+        if local.returncode == 0:
             result = retirement_git(unit, "branch", "-D", unit.branch, settings=settings)
             if result.returncode:
-                failed.append(retirement_failure(result))
+                return [retirement_failure(result)]
         observed = retirement_git(unit, "ls-remote", "--exit-code", "--heads", "origin", unit.branch, settings=settings)
         if observed.returncode not in (0, 2):
             return [retirement_failure(observed)]
@@ -1753,7 +1806,9 @@ def recovery_find_unit(production_name: str, given: str, *, record: staff.StaffS
     pair = unit_config.place(member.row.id, worktree, cleanup=False)
     if isinstance(pair, unit_config.Both) and not pair.same:
         raise RecoveryRefused(f"{pair.worktree} and {pair.parked}: configurations differ; no file was changed")
-    return RetiredUnitRecovery(production, name, worktree, member.row.name, saved.plan, member.row.current_session)
+    branch = (location.branch.value if isinstance(location, staff.RemovedWorktree)
+              and isinstance(location.branch, staff.ParkedBranch) else member.row.name)
+    return RetiredUnitRecovery(production, name, worktree, branch, saved.plan, member.row.current_session)
 
 def recovery_resume_record(production: Production, name: str) -> Path:
     try:
@@ -1789,35 +1844,40 @@ def recovery_refusals(unit: RetiredUnitRecovery) -> list[str]:
             refused.append(f"{unit.name}: no account has the transcript of session {unit.session_id}")
     except (RetirementRefused, OSError) as error:
         refused.append(f"{unit.name}: {error}")
-    if unit.worktree.exists() and not recovery_has_worktree(unit):
+    pending = worktrees.pending_checkout(unit.worktree, unit.production.checkout, unit.branch)
+    if os.path.lexists(unit.worktree) and not (pending or recovery_has_worktree(unit)):
         refused.append(f"{unit.worktree} exists and is not {unit.name}'s worktree on {unit.branch}")
-    elif not unit.worktree.exists():
-        if recovery_git(unit, "branch", "--list", unit.branch):
+    elif pending or not unit.worktree.exists():
+        if not pending and recovery_git(unit, "branch", "--list", unit.branch):
             refused.append(f"branch {unit.branch} still exists; retire did not finish")
         if recovery_git(unit, "ls-remote", "--heads", "origin", unit.branch):
             refused.append(f"origin {unit.branch} still exists; retire did not finish")
     return refused
 
 def recovery_launch_command(unit: RetiredUnitRecovery) -> list[str]:
-    # The row name is both the branch and the add_unit name.
-    arguments = [sys.executable, str(ADD_UNIT), "--production", unit.production.name, unit.branch,
+    arguments = [sys.executable, str(ADD_UNIT), "--production", unit.production.name, unit.name,
                  "--resume", unit.session_id, "--cwd", str(unit.worktree), *unit_config.plan_arguments(unit.plan)]
     if isinstance(unit.account, accounts.NamedAccount):
         arguments.extend(["--account", unit.account.label])
     return arguments
 
 def recovery_make_worktree(unit: RetiredUnitRecovery) -> None:
-    if recovery_has_worktree(unit):
-        return
+    had_checkout = recovery_has_worktree(unit)
     branch = (build_folders.ExistingWorktreeBranch(unit.branch)
               if recovery_git(unit, "branch", "--list", unit.branch)
               else build_folders.NewWorktreeBranch(unit.branch, unit.production.merge_branch))
     try:
-        _ = build_folders.create_build_folder(build_folders.LinkedEditableRepository(
-            unit.worktree, unit.production.checkout, branch))
-    except (OSError, ValueError) as error:
+        record = worktrees.checkout_record(unit.worktree)
+        layout = (record.layout if record is not None and record.stage is worktrees.MakeStage.MAKING
+                  else worktrees.unit_checkout_output(
+                      unit.worktree, build_folders.repo_word(unit.production.checkout), unit.name))
+        _ = worktrees.create_checkout(unit.worktree, unit.production.checkout, branch,
+                                      layout, owner=unit.name, merge_branch=unit.production.merge_branch,
+                                      allow_existing=True)
+    except (OSError, ValueError, worktrees.Refused) as error:
         raise RecoveryRefused(f"worktree {unit.worktree}: {error}") from error
-    print(f"made: worktree {unit.worktree} on {unit.branch}, from {unit.production.merge_branch}")
+    if not had_checkout:
+        print(f"made: worktree {unit.worktree} on {unit.branch}, from {unit.production.merge_branch}")
 
 def recovery_launch(unit: RetiredUnitRecovery) -> None:
     if recovery_is_running(unit) and not add_unit.pending_opening(unit.production, unit.name, unit.session_id):
@@ -2336,14 +2396,17 @@ def rename_apply_unit(request: RenamePlan) -> RenamePlan:
                 if row.worktree.machine != remote.local_machine():
                     raise ValueError(f"{row.name}: run rename on {row.worktree.machine}")
                 folder = row.worktree.path.expanduser().resolve()
+                layout_destination = worktrees.unit_rename_destination(folder, row.name, request.name)
                 target = _unit_rename_target(folder.name, row.name, request.name) if changed else folder.name
-                destination = folder.with_name(target) if target is not None else folder
+                destination = layout_destination or (folder.with_name(target) if target is not None else folder)
                 unit_move.require_move_destination(record, row, destination)
                 checkout = unit_move.move_checkout(record, row)
                 branch = unit_move.checked_out_branch(checkout) if checkout.exists() else ""
                 renamed_branch = (request.move.branch if isinstance(request.move, UnitBranchMove) else
                                   _unit_rename_target(branch, row.name, request.name))
-                if changed and target is None:
+                if layout_destination is not None and not isinstance(request.move, UnitBranchMove):
+                    renamed_branch = request.name + "-" + folder.name if branch == row.name + "-" + folder.name else branch
+                if changed and target is None and layout_destination is None:
                     print(f"anomaly: folder {folder} does not end with -{row.name}", file=sys.stderr)
                 if changed and renamed_branch is None:
                     print(f"anomaly: branch {branch} does not end with -{row.name}", file=sys.stderr)
@@ -2364,15 +2427,8 @@ def rename_apply_unit(request: RenamePlan) -> RenamePlan:
             if not isinstance(row.worktree, staff.WorktreeUnfilled):
                 changed = unit_move.move_idle_folder(row.id, row.worktree.path, branch=request.move.branch) or changed
         if pending is not None:
-            if not unit_move.rename_complete(staff.snapshot(), row, pending):
-                changed = unit_move.move_idle_folder(row.id, pending.destination, branch=pending.branch) or changed
-                record = staff.snapshot()
-                if (current := record.by_id(row.id)) is None:
-                    raise RenameRefused(f"{row.id}: the staff row is unavailable after the rename")
-                row = current
-            if unit_move.finish_rename(row, pending):
-                pending = None
-                changed = True
+            changed = unit_move.continue_rename(row, pending) or changed
+            pending = unit_move.pending_rename(row.id)
         notice = rename_notice_path(row.id)
         if notice.exists() and pending is None:
             fields = unit_move.json_object(read_json(notice))
@@ -2452,7 +2508,7 @@ def rename_named_member(old: str, new: str, *, to_doc: str = "", to_branch: str 
         except subprocess.TimeoutExpired as error:
             print(f"rename: error: {str(error).splitlines()[0]}", file=sys.stderr)
             return 1
-        except (ValueError, OSError, UnicodeError, RenameRefused, herdr_types.HerdrFailure) as error:
+        except (ValueError, OSError, UnicodeError, RenameRefused, herdr_types.HerdrFailure, worktrees.Refused) as error:
             print(f"rename: {error}", file=sys.stderr)
             return 1
         return 0

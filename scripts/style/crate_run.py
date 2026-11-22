@@ -16,6 +16,7 @@ import json
 import posixpath
 import re
 import subprocess
+import sys
 from collections import defaultdict
 from collections.abc import Callable, Generator, Sequence
 from contextlib import ExitStack, contextmanager, nullcontext
@@ -28,7 +29,9 @@ from typing import NotRequired, Protocol, TypedDict, cast
 from scripts.style import bulk_rename as bulk
 from scripts.style import bulk_run as run
 from scripts.style import coverage_report
-from scripts.lib import copy_record, scratch
+from scripts.lib import build_folders, copy_record, git_files, scratch
+from scripts.production import staff
+from scripts.worktree import worktrees
 from scripts.style import rules
 from scripts.style import style_ledger as ledger_api
 from scripts.style import style_proposals
@@ -110,6 +113,8 @@ class CrateRecord(TypedDict):
     checkout: str
     branch: str
     intent: str
+    worktree_branch: NotRequired[str]
+    removal_reported: NotRequired[bool]
     result_path: str
     selected: list[FrozenFinding]
     finding_holders: NotRequired[dict[str, list[str]]]
@@ -807,6 +812,76 @@ class CrateRun:
     def save(self, manifest: Manifest) -> None:
         bulk.atomic_json(self.path, manifest)
 
+    def worktree_names(self, package: str) -> tuple[str, str, str]:
+        repo = build_folders.repo_word(self.repo)
+        row = staff.local_snapshot().owner_of(self.owner)
+        unit = row.name if row is not None else self.owner
+        return repo, unit, f"crate-{self.run_id}.{package}"
+
+    @contextmanager
+    def worker_checkout(self, manifest: Manifest, package: str) -> Generator[Path]:
+        record = manifest["crates"][package]
+        checkout = Path(record["checkout"])
+        base = manifest["base"]
+        if "worktree_branch" not in record and checkout.exists():
+            with copies.workspace(self.owner, self.repo, base, name=checkout.name, branch=record["branch"],
+                                  task=self.task, path=checkout, run_manifest=self.path) as worker:
+                yield worker
+            return
+
+        repo, unit, short_name = self.worktree_names(package)
+        current = build_folders.worktree_path(repo, unit, short_name)
+        worktree_file = worktrees.record_file(current)
+        common = git_files.at(self.repo).common_dir
+        try:
+            saved = worktrees.read_record(worktree_file)
+        except FileNotFoundError:
+            saved = None
+        already_made = saved is not None and saved.stage is worktrees.MakeStage.DONE
+        if saved is None or saved.stage is worktrees.MakeStage.MAKING:
+            if (record["stage"] != CrateStage.SELECTED or (record["intent"] and "worktree_branch" in record)
+                    or (checkout != current and checkout.exists())):
+                raise bulk.BulkRenameError(f"{checkout}: the saved worker checkout is missing or incomplete")
+            try:
+                _ = worktrees.make(repo, unit, short_name, worktrees.FrozenWorktreeSource(self.repo, base))
+            except worktrees.Refused as error:
+                raise bulk.BulkRenameError(str(error)) from error
+            saved = worktrees.read_record(worktree_file)
+        branch = saved.branch
+        if (saved.path != str(current) or git_files.at(Path(saved.repo)).common_dir != common or saved.base != base
+                or (checkout == current and record.get("worktree_branch", branch) != branch)):
+            raise bulk.BulkRenameError(f"{current}: the worktree record differs from the frozen run")
+        checkout = current
+        descriptors: list[int] = []
+        with copies.claim_tree(checkout, create=False, inherited_fds=descriptors) as claim:
+            if claim is not copies.ClaimState.ACQUIRED:
+                raise bulk.BulkRenameError(f"{checkout}: the worker is busy or was replaced")
+            if git_files.at(checkout).common_dir != common:
+                raise bulk.BulkRenameError(f"{checkout}: the worker belongs to another repository")
+            if run.git(checkout, "symbolic-ref", "HEAD") != f"refs/heads/{branch}":
+                raise bulk.BulkRenameError(f"{checkout}: the worker branch changed")
+            if already_made:
+                try:
+                    _ = worktrees.create_checkout(
+                        checkout, self.repo, build_folders.NewWorktreeBranch(branch, base),
+                        worktrees.output_record(repo, unit, short_name),
+                        owner=unit, fixed_base=True)
+                except worktrees.Refused as error:
+                    raise bulk.BulkRenameError(str(error)) from error
+            intent = run.git(checkout, "rev-parse", "--path-format=absolute", "--git-path", "style-batch-intent.json")
+            if record["intent"] and "worktree_branch" in record and record["intent"] != intent:
+                raise bulk.BulkRenameError(f"{checkout}: the worker journal path changed")
+            if (record["checkout"], record.get("worktree_branch"), record["intent"]) != (str(checkout), branch, intent):
+                record["checkout"] = str(checkout)
+                record["worktree_branch"] = branch
+                record["intent"] = intent
+                self.save(manifest)
+            token = copies.COMMAND_LOCKS.set((*copies.COMMAND_LOCKS.get(), *descriptors))
+            try:
+                yield checkout
+            finally:
+                copies.COMMAND_LOCKS.reset(token)
+
     def create(self, definition: rules.Rule, base_tree: str, destination: str) -> None:
         with serial(self.folder), ledger_api.refill_lock(self.repo):
             if self.path.exists():
@@ -832,7 +907,6 @@ class CrateRun:
                 if isinstance(skipped, run.OpenTicketRefusal):
                     directory = style_proposals.crate_for(directories, skipped.path)
                     held_by_crate[directory][skipped.finding_id] = list(skipped.ticket_ids)
-            checkout_parent = copies.workspace_path(self.owner, self.repo, f"crate-{self.run_id}.selected").parent
             for member in members:
                 if not re.fullmatch(r"[A-Za-z0-9_-]+", member.package_name):
                     raise bulk.BulkRenameError("unsafe package name")
@@ -849,11 +923,13 @@ class CrateRun:
                     frozen.append({"id": finding.finding_id, "path": finding.path, "proposal": proposal,
                                    "rule_blob": finding.rule_blob, "evidence": evidence(finding),
                                    "proposal_sha256": hashlib.sha256(Path(proposal).read_bytes()).hexdigest()})
-                checkout = checkout_parent / f"crate-{self.run_id}.{member.package_name}"
+                repo, unit, short_name = self.worktree_names(member.package_name)
+                checkout = build_folders.worktree_path(repo, unit, short_name)
                 records[member.package_name] = {
                     "directory": member.directory, "checkout": str(checkout),
                     "branch": f"refs/heads/style-crate/{self.run_id}/workers/{member.package_name}",
-                    "intent": str(checkout / ".git/style-batch-intent.json"),
+                    "intent": "",
+                    "worktree_branch": f"{unit}-{short_name}",
                     "result_path": str(self.folder / (member.package_name + ".result.json")),
                     "selected": frozen, "stage": CrateStage.SELECTED,
                     "finding_holders": held_by_crate.get(member.directory, {}),
@@ -977,8 +1053,7 @@ class CrateRun:
     def advance(self, package: str, planner: Planner = plan, runner: run.Runner = run.run_command,
                 available: Callable[[Path, str], None] = bulk.check_available,
                 executor: PlanExecutor | ExecutionService = ExecutionService.BULK_RUN) -> Manifest:
-        with serial(self.folder) as run_lock, self.complete_run(run_lock):
-            manifest = self.read()
+        with serial(self.folder) as run_lock, self.complete_run(run_lock) as manifest:
             if package not in manifest["crates"]:
                 raise bulk.BulkRenameError("crate is not in the frozen run")
             record = manifest["crates"][package]
@@ -993,18 +1068,7 @@ class CrateRun:
                 base = manifest["base"]
                 definition = self.checked_definition(manifest, frozen)
                 if stage != CrateStage.SELECTED or record["selected"]:
-                    legacy = checkout if checkout.exists() else None
-                    worker = workers.enter_context(copies.workspace(
-                        self.owner, self.repo, base,
-                        name=checkout.name, branch=record["branch"], task=self.task, path=legacy,
-                        run_manifest=self.path))
-                    if worker != checkout and stage == CrateStage.SELECTED and not checkout.exists():
-                        record["checkout"] = str(worker)
-                        record["intent"] = str(worker / ".git/style-batch-intent.json")
-                        self.save(manifest)
-                        checkout = worker
-                    if worker != checkout:
-                        raise bulk.BulkRenameError("worker registration differs from the frozen run")
+                    checkout = workers.enter_context(self.worker_checkout(manifest, package))
                 intent = run.WorkspaceIntent(checkout, f"bulk_run --run {self.run_id} --crate {package} --repo {self.repo}") if checkout.exists() else None
                 if stage == CrateStage.CLAIMING:
                     # Write-ahead intent owns independently committed claims even if claim() never returned.
@@ -1118,7 +1182,9 @@ class CrateRun:
                         if (run.git(checkout, "write-tree") != result_evidence["tree"]
                                 or run.git(checkout, "diff", "--name-only")):
                             raise bulk.BulkRenameError("worker index or files changed after commit preparation")
-                        _ = run.git(checkout, "update-ref", record["branch"], commit, base)
+                        worker_branch = (f"refs/heads/{record['worktree_branch']}"
+                                         if "worktree_branch" in record else record["branch"])
+                        _ = run.git(checkout, "update-ref", worker_branch, commit, base)
                     elif actual != commit:
                         raise bulk.BulkRenameError("worker checkout moved after commit")
                     if run.git(checkout, "status", "--porcelain", "--untracked-files=no"):
@@ -1160,22 +1226,41 @@ class CrateRun:
                 return manifest
 
     @contextmanager
-    def complete_run(self, run_lock: copies.HeldCrateRunLock) -> Generator[None]:
-        """Remove terminal copies after worker locks close and before the run lock closes."""
+    def complete_run(self, run_lock: copies.HeldCrateRunLock) -> Generator[Manifest]:
+        """Report terminal worktrees and end legacy copy tasks."""
+        manifest = self.read()
         try:
-            yield
+            yield manifest
         finally:
-            manifest = self.read()
-            terminal = [record for record in manifest["crates"].values()
-                        if CrateStage(record["stage"]) in {CrateStage.INTEGRATED, CrateStage.ABANDONED}]
-            paths = [Path(record["checkout"]) for record in terminal]
-            for record in terminal:
+            saved = self.read()
+            paths: list[Path] = []
+            for package, record in saved["crates"].items():
+                if CrateStage(record["stage"]) not in (CrateStage.INTEGRATED, CrateStage.ABANDONED):
+                    continue
                 path = Path(record["checkout"])
+                if "worktree_branch" in record:
+                    if not record.get("removal_reported"):
+                        def save_removal_report() -> None:
+                            record["removal_reported"] = True
+                            self.save(saved)
+                            manifest["crates"][package]["removal_reported"] = True
+
+                        try:
+                            if path.exists():
+                                worktrees.remove_git_checkout(path, self.repo, before_report=save_removal_report)
+                        except (OSError, ValueError, worktrees.Refused) as error:
+                            if record.get("removal_reported"):
+                                raise
+                            reason = " ".join(str(error).splitlines())
+                            print(f"bulk_run: cannot report removal for {str(path)!r}: {reason}", file=sys.stderr)
+                    continue
+                paths.append(path)
                 if path.exists() and isinstance(scratch.pending_removal(path), copy_record.NotRegistered):
                     with copies.workspace(self.owner, self.repo, manifest["base"], name=path.name,
                                           branch=record["branch"], task=self.task, path=path, run_manifest=self.path):
                         pass
-            copies.end_workspaces(self.task, paths, run_lock=run_lock)
+            if paths:
+                copies.end_workspaces(self.task, paths, run_lock=run_lock)
 
     def wait_for_reservations(self, manifest: Manifest, record: CrateRecord,
                               pending: tuple[bulk.PendingFinding, ...], refused: dict[str, str]) -> None:
@@ -1321,7 +1406,8 @@ class CrateRun:
         with ledger_api.refill_lock(self.repo):
             self.owned(record)
             commit = result_evidence["commit"]
-            _ = run.git(self.repo, "fetch", "--no-tags", record["checkout"], commit)
+            if "worktree_branch" not in record:
+                _ = run.git(self.repo, "fetch", "--no-tags", record["checkout"], commit)
             current = run.git(self.repo, "rev-parse", record["branch"])
             if current != commit:
                 _ = run.git(self.repo, "update-ref", record["branch"], commit, manifest["base"])
