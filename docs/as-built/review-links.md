@@ -991,7 +991,10 @@ A filter that hides the row closes it.
 If the row closes with an action result, the page notice keeps the result until the row opens again or a new action starts.
 The footer gets fresh counts from the other pages on each refresh.
 The List discards a result if a newer snapshot has replaced its source.
-The log uses the page scroll.
+The open row's log scrolls in its own area.
+On a desktop, the log ends with the details beside it.
+On a narrow page, the log is at most `list_log_max_height_rem` tall, which each render reads.
+A refresh, a save result, a sort or a filter change keeps the log's first visible entry at the same place.
 Opening a List item leaves its unread state unchanged.
 After a lost Park or Remove reply, The List reads the current row state.
 A confirmed Park or Remove collapses the row.
@@ -1443,7 +1446,6 @@ An unread update shows a dot and marks the navigation entry as new.
 The navigation key includes the record ID and update time.
 The page uses `page_refresh_seconds` and the shared refresh helper.
 A refresh retains the search text, selection, focus, open item, and filters.
-The dialog keeps its own scroll position.
 An older response cannot replace a newer response.
 Phone layouts show each row as a card.
 The List uses the published Review snapshot for rows with all their linked records.
