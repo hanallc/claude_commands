@@ -30,7 +30,7 @@ def test_run_folder() -> Generator[Path]:
               else inherited / "test-runs")
     parent.mkdir(parents=True, exist_ok=True)
     build_folders.sweep_temporary_build_folders(parent)
-    request = build_folders.UniqueBuildFolder("test-run-", build_folders.ExplicitBuildParent(parent))
+    request = build_folders.UniqueBuildFolder("r", build_folders.ExplicitBuildParent(parent))
     with build_folders.temporary_build_folder(request) as path:
         os.environ["TMPDIR"] = str(path)
         os.environ[RUN_FOLDER_ENV] = str(path)

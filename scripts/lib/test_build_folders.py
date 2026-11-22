@@ -344,17 +344,17 @@ class FolderFormTests(unittest.TestCase):
                 self.assertTrue(reader.pass_fds)
             self.assertFalse(build_slots.remove_copy(record))
             envrc = copy.path / ".envrc"
-            self.assertEqual(build_slots.numbered_copy_envrc(envrc, trusted_source=lambda source: source == self.root),
-                             build_slots.NumberedCopyEnvrc.TRUSTED)
-            self.assertEqual(build_slots.numbered_copy_envrc(envrc, trusted_source=lambda _: False),
-                             build_slots.NumberedCopyEnvrc.NEEDS_APPROVAL)
+            self.assertEqual(folders.numbered_copy_envrc(envrc, trusted_source=lambda source: source == self.root),
+                             folders.NumberedCopyEnvrc.TRUSTED)
+            self.assertEqual(folders.numbered_copy_envrc(envrc, trusted_source=lambda _: False),
+                             folders.NumberedCopyEnvrc.NEEDS_APPROVAL)
             _ = envrc.write_text("export FIXTURE=changed\n")
-            self.assertEqual(build_slots.numbered_copy_envrc(envrc, trusted_source=lambda _: True),
-                             build_slots.NumberedCopyEnvrc.NEEDS_APPROVAL)
+            self.assertEqual(folders.numbered_copy_envrc(envrc, trusted_source=lambda _: True),
+                             folders.NumberedCopyEnvrc.NEEDS_APPROVAL)
             envrc.unlink()
             envrc.symlink_to(self.root / ".envrc")
-            self.assertEqual(build_slots.numbered_copy_envrc(envrc, trusted_source=lambda _: True),
-                             build_slots.NumberedCopyEnvrc.NEEDS_APPROVAL)
+            self.assertEqual(folders.numbered_copy_envrc(envrc, trusted_source=lambda _: True),
+                             folders.NumberedCopyEnvrc.NEEDS_APPROVAL)
         _ = copy.path.rename(copy.path.with_name("old"))
         copy.path.mkdir()
         self.assertIsInstance(folders.numbered_copy_record(copy.path), folders.UnreadableNumberedCopySource)
@@ -452,6 +452,16 @@ class FolderFormTests(unittest.TestCase):
             path = folders.output_path("hana", "demo", "mac")
             self.assertEqual(path, self.root / "build/hana/demo/mac")
             self.assertEqual(folders.parse_form(path), folders.WorktreeOutput("hana", "demo", "mac"))
+
+    def test_ci_folders_list_only_numbered_directories_in_number_order(self) -> None:
+        self.assertEqual(folders.ci_folders("hana"), [])
+        parent = self.root / "disk/hana/ci"
+        for name in ("10", "2", "0", "03", "-1", "３", "old"):
+            (parent / name).mkdir(parents=True)
+        (parent / "4").touch()
+        (parent / "5").symlink_to(parent / "2", target_is_directory=True)
+        (parent / "6.lock").touch()
+        self.assertEqual(folders.ci_folders("hana"), [(2, parent / "2"), (10, parent / "10")])
 
     def test_paths_refuse_invalid_components_and_numbers(self) -> None:
         for name in ("", ".", "..", "parent/child", "/absolute", "bad\x00name", "probe.lock", "probe.lease.json"):
@@ -1910,7 +1920,7 @@ assert not loaded, loaded
     @unittest.skipUnless(Path("/dev/shm").is_dir() and os.access("/dev/shm", os.W_OK),
                          "the memory filesystem is unavailable")
     def test_explicit_parent_allocates_under_a_private_dev_shm_parent(self) -> None:
-        with tempfile.TemporaryDirectory(dir=folders.tmpfs_temporary_parent()) as temporary:
+        with tempfile.TemporaryDirectory(dir="/dev/shm") as temporary:
             parent = Path(temporary)
             with folders.temporary_build_folder(folders.UniqueBuildFolder(
                     "merge-gate-", folders.ExplicitBuildParent(parent))) as name:
