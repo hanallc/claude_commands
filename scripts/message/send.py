@@ -4205,6 +4205,9 @@ def _claude_delivery_plan(message: Message, mailbox: ClaudeMailbox, registry: se
                           records: list[sessions.SessionRecord]) -> RelayPlan:
     conversation = conversation_recipient(mailbox).conversation
     checked = unit_lookup.checked_conversation(conversation, registry=registry, probe_address=False)
+    if isinstance(checked, unit_lookup.RefreshedConversationOwner):
+        registry = checked.registry
+        records = sessions.running_records(registry)
     candidates = [record for record in records if record["sessionId"] == conversation]
     if isinstance(checked, unit_lookup.ClaudeArgvUnavailable):
         try:

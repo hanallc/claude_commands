@@ -943,7 +943,8 @@ class SessionLabelObservations:
                     return result
                 if isinstance(result, UnknownUnit):
                     failures.append(result.reason)
-            elif isinstance(pane.identity, UnprovedPaneIdentity):
+            elif (isinstance(pane.identity, UnprovedPaneIdentity)
+                  and (not pane.identity.candidates or identity in pane.identity.candidates)):
                 result = checked_unit_owner(pane)
                 if isinstance(result, UnknownUnit):
                     failures.append(result.reason)

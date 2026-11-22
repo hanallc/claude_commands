@@ -21,6 +21,18 @@ from scripts.herdr.test_herdr import codex_foreground_cases
 
 
 class StatusDiscoveryTests(StaffTestCase):
+    def test_exact_conversation_ignores_an_error_from_another_pane_candidate(self) -> None:
+        reason = "pid 42: process exited"
+        pane = labels.LabeledSession("", labels.ClaudeUnknown(reason), herdr.HerdrPlace("agents", "w1:p1"))
+        for candidates, result in (
+                (frozenset({"other"}), labels.ProvedAbsentUnit()),
+                (frozenset({"recipient"}), labels.UnknownUnit(reason)),
+                (frozenset[str](), labels.UnknownUnit(reason))):
+            with self.subTest(candidates=candidates):
+                unknown = replace(pane, identity=labels.UnprovedPaneIdentity(candidates))
+                observed = labels.SessionLabelObservations((unknown,))
+                self.assertEqual(observed.checked_conversation("recipient"), result)
+
     def test_worker_home_uses_the_recorded_account_with_shared_sessions(self) -> None:
         fixture = self.row_production()
         shared = Path.home() / ".codex" / "sessions"

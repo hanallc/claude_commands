@@ -135,6 +135,7 @@ INIT: dict[str, object] = {"type": "system", "subtype": "init", "permissionMode"
 
 REAL_OPEN_CASE = rca.open_case
 REAL_RELAY = send.relay
+REAL_CONVERSATION_LOOKUP = unit_lookup.checked_conversation
 REAL_CURRENT_CLAUDE_RECORD = unit_lookup.current_claude_record
 
 
@@ -2453,6 +2454,46 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
         launch.assert_not_called()
         alternate.assert_not_called()
         self.assertFalse((self.root / "queue").exists())
+
+    def test_send_refreshes_a_pane_process_exit_before_delivery(self) -> None:
+        from scripts.herdr import herdr
+
+        _, previous = self.canonical_recipient()
+        place = herdr.HerdrPlace("agents", "w1:p1")
+        pid = previous["pid"]
+        started = previous.get("procStart", "")
+        self.assertTrue(started)
+        exited = 991001
+        with socket.socket(socket.AF_UNIX) as listener:
+            path = str(self.root / "current.sock")
+            listener.bind(path)
+            current = previous.copy()
+            current["messagingSocketPath"] = path
+            snapshots = [sessions.RegistryRead((sessions.RegistryObservation(row, {}),), ())
+                         for row in (previous, current)]
+            processes = [herdr.HerdrProcess(pid, place, {}, "claude", str(self.root))]
+            pane_reports = [{"process_info": {"shell_pid": 991000, "foreground_process_group_id": owner,
+                "foreground_processes": [{"pid": owner, "name": "claude", "argv": ["claude"]}]}}
+                for owner in (exited, pid)]
+            native = herdr.NativeAgentProcess(herdr.EnvironmentThread(current["sessionId"]), started, {})
+            with (mock.patch.object(unit_lookup, "checked_conversation", REAL_CONVERSATION_LOOKUP),
+                  mock.patch.object(sessions, "read_registry", side_effect=snapshots) as registry,
+                  mock.patch.object(unit_lookup, "current_claude_record", return_value=current),
+                  mock.patch.object(herdr, "live_sessions", return_value=[{"name": place.session}]),
+                  mock.patch.object(herdr, "herdr_processes", return_value=processes),
+                  mock.patch.object(herdr.Herdr, "listed", return_value=[{"pane_id": place.pane}]) as inventory,
+                  mock.patch.object(herdr.Herdr, "result", side_effect=pane_reports),
+                  mock.patch.object(herdr, "native_process", side_effect=[
+                      herdr.NativeRegistryChanging(herdr.process_exit_reason(exited)), native]) as read_native):
+                result = send.send(local_options(["--to", "session:recipient", "--from", "test", "--text", "body"]))
+        self.assertEqual(result.outcome, "sent", result.detail)
+        self.assertEqual(inventory.call_count, 2)
+        self.assertEqual(registry.call_count, 2)
+        self.assertEqual(read_native.call_args_list, [mock.call(exited, "claude"), mock.call(pid, "claude")])
+        self.assertEqual(len(self.relayed), 1)
+        attempt = self.relayed[0].claude_attempt
+        self.assertEqual(attempt, send.ClaudeDeliveryAttempt(
+            send.ConversationRecipient(send.machine(), "recipient"), pid, started, path))
 
     def test_recovered_socket_lost_during_connect_queues_for_the_checked_conversation(self) -> None:
         self.session("recipient", "Recipient")

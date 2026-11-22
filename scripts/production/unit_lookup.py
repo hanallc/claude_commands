@@ -873,20 +873,37 @@ class ClaudeArgvUnavailable(UnknownUnit):
     place: HerdrPlace
 
 
+@dataclass(frozen=True)
+class RefreshedConversationOwner(ProvedLiveUnit):
+    """Bind the proved owner to the refreshed registry read."""
+
+    registry: sessions.RegistryRead = field(kw_only=True, repr=False)
+
+
 def checked_conversation(identity: str, *, record: staff.StaffSnapshot | None = None,
                          registry: sessions.RegistryRead | None = None, probe_address: bool = True) -> UnitOwner:
     """Check the exact conversation with fresh pane evidence."""
     from scripts.herdr import herdr
 
-    try:
+    def observe(snapshot: sessions.RegistryRead | None) -> session_staff.SessionLabelObservations:
         with herdr.process_action():
-            if probe_address and registry is None:
-                observed = observed_session_labels(record=record)
-            else:
-                observed = observed_session_labels(record=record, registry=registry, probe_address=probe_address)
+            if probe_address and snapshot is None:
+                return observed_session_labels(record=record)
+            return observed_session_labels(record=record, registry=snapshot, probe_address=probe_address)
+
+    try:
+        observed = observe(registry)
+        checked = observed.checked_conversation(identity)
+        if not isinstance(checked, ProvedLiveUnit) and any(
+                isinstance(pane.claude, ClaudeUnknown) and herdr.exited_process_pid(pane.claude.reason) is not None
+                for pane in observed.labels):
+            refreshed = sessions.read_registry()
+            observed = observe(refreshed)
+            checked = observed.checked_conversation(identity)
+            if isinstance(checked, ProvedLiveUnit):
+                return RefreshedConversationOwner(checked.owner, checked.standalone_generation, registry=refreshed)
     except (OSError, ValueError, subprocess.SubprocessError) as error:
         return UnknownUnit(str(error))
-    checked = observed.checked_conversation(identity)
     if (not isinstance(checked, UnknownUnit) or identity in observed.registry_owners
             or observed.unreadable_pane_lists or observed.registry_failures):
         return checked

@@ -37,6 +37,24 @@ SCRIPT = Path(__file__).with_name("unit_lookup.py")
 
 
 class UnitReferenceTests(StaffTestCase):
+    def test_exact_conversation_refreshes_once_after_a_confirmed_pane_process_exit(self) -> None:
+        first = sessions.RegistryRead((), ())
+        fresh = sessions.RegistryRead((), ())
+        place = herdr.HerdrPlace("agents", "w1:p1")
+        for reason, count in ((herdr.process_exit_reason(42), 2), ("pid 42: process start is unavailable", 1)):
+            pane = unit_lookup.LabeledSession("", ClaudeUnknown(reason), place,
+                identity=session_staff.UnprovedPaneIdentity(frozenset({"recipient"})))
+            observed = session_staff.SessionLabelObservations((pane,))
+            with (self.subTest(reason=reason),
+                  mock.patch.object(unit_lookup, "observed_session_labels", return_value=observed) as observe,
+                  mock.patch.object(sessions, "read_registry", return_value=fresh) as refresh):
+                self.assertEqual(unit_lookup.checked_conversation("recipient", registry=first, probe_address=False),
+                                 unit_lookup.UnknownUnit(reason))
+                self.assertEqual(observe.call_count, count)
+                self.assertEqual(refresh.call_count, count - 1)
+                used = cast(sessions.RegistryRead, observe.call_args.kwargs["registry"])
+                self.assertIs(used, fresh if count == 2 else first)
+
     def test_pane_selector_reports_an_unproved_owner_without_an_address(self) -> None:
         found = unit_lookup.LabeledSession("member", ClaudeUnknown("process read denied"),
                                          herdr.HerdrPlace("agents", "w1:p1"),
