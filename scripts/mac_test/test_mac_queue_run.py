@@ -79,7 +79,6 @@ if "mac_stopped=" in args[-1]:
 (root / "remote").write_text(json.dumps(args))
 print("mac_group=4567", flush=True)
 if os.environ.get("FAKE_SSH_HOLD") == "1":
-    (root / "running").write_text(str(os.getpid()))
     print("Mac command started", flush=True)
     # The real ssh sends the end of its input to the Mac wrapper, which stops the work.
     _ = sys.stdin.read()
@@ -584,9 +583,10 @@ else:
                 with subprocess.Popen(self.command(root), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                       text=True, env=environment, start_new_session=True) as process:
                     try:
-                        wait_until((root / ("waiting" if waiting else "running")).exists, root, processes=(process,))
-                        if signum == signal.SIGINT:
-                            # The queue reads the group before it forwards this line.
+                        if waiting:
+                            wait_until((root / "waiting").exists, root, processes=(process,))
+                        else:
+                            # Wait for the queue to forward SSH's last line before sending the signal.
                             assert process.stdout is not None
                             queue_output = cast(TextIO, process.stdout)
                             self.assertTrue(select.select([queue_output], [], [], TEST_HANG_GUARD_SECS)[0])
@@ -612,7 +612,8 @@ else:
                     # The queue ends the placement when this process ends.
                     self.assertEqual(events, ["place-step"])
                     if not waiting:
-                        wait_until((root / "input_closed").exists, root)
+                        # The SSH fixture keeps the captured stderr open until it exits.
+                        self.assertTrue((root / "input_closed").exists(), errors)
                     # The run's state folder stays until the next run cleans it.
                     runs = root / mac_queue_run.RUNS
                     self.assertEqual(len(list(runs.iterdir())), 1)
