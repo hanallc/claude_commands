@@ -62,6 +62,8 @@ def recovery_instruction(director: StaffId, worker_name: str, run: Path, instanc
                     return "The result is complete. The completion notice follows."
                 if isinstance(receipt, worker.DispatchWaitingForRuns) and receipt.results_pending:
                     return "The pass is waiting for detached results. The completion notice follows."
+            if passed.get("instance_id") != instance or passed.get("status") != "active":
+                return "The pass is no longer active. Send no recovery prompt for it."
             pane = worker_panes.observe_worker(director, row, record)
     except (OSError, ValueError, herdr_types.HerdrFailure, recorder_state.OldRecorderState):
         pass

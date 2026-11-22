@@ -17,7 +17,7 @@ from typing import Literal, cast, get_args
 from scripts.buildlog import ci
 from scripts.buildlog.health import Machine
 from scripts.lib.atomic_file import write_text_atomic
-from scripts.lib import file_lock, land_main
+from scripts.lib import file_lock, land_main, main_push_lock
 from scripts.lib.process_failure import failure_detail
 from scripts.buildlog import store
 from scripts.buildlog import sync
@@ -275,6 +275,16 @@ def remote_outcome(result: subprocess.CompletedProcess[str]) -> MacMerged | Pull
 
 
 def publish_mac(merged: MacMerged) -> PullOutcome:
+    try:
+        with main_push_lock.main_push_lock(LOCAL_VAULT, "vault-pull", wait=False):
+            return _publish_mac(merged)
+    except BlockingIOError:
+        return DeferredSync("the vault lock is busy; the next hour retries")
+    except OSError as error:
+        return VaultCommandFailed(str(error))
+
+
+def _publish_mac(merged: MacMerged) -> PullOutcome:
     fetched = mac_git("fetch", f"{sync.peer_name()}:rust/hanadocs", f"refs/heads/main:{MAC_MAIN}")
     if isinstance(fetched, (VaultCommandFailed, MacUnreachable)):
         return fetched

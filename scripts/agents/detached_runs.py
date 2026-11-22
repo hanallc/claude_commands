@@ -687,13 +687,20 @@ def reap_orphans(session_dir: str, worker: str = "") -> list[str]:
     A claim file prevents duplicate delivery.
     """
     runs = _runs_dir(session_dir)
-    if not runs.is_dir():
-        return []
-    with (runs / ".start.lock").open("a") as admission:
-        fcntl.flock(admission, fcntl.LOCK_EX)
-        result = _reap_orphans_locked(runs, worker)
-    result.complete()
-    return result.run_ids
+    if runs.is_dir():
+        with (runs / ".start.lock").open("a") as admission:
+            fcntl.flock(admission, fcntl.LOCK_EX)
+            result = _reap_orphans_locked(runs, worker)
+        result.complete()
+        run_ids = result.run_ids
+    else:
+        run_ids = []
+    run = runs.parent
+    if next(run.glob(".*.pass-notices.jsonseq"), None) is not None:
+        retry = cast(Callable[[Path, str], None],
+                     import_module("scripts.herdr.pass_notices").retry)
+        retry(run, worker)
+    return run_ids
 
 
 def _reap_orphans_locked(runs: Path, worker: str = "") -> OrphanReapResult:
@@ -827,10 +834,13 @@ def _complete_stopped_run(path: Path, record: RunRecord, read_membership: Callab
     result = stop_pass(run, record, guard_ended)
     if isinstance(result, worker_panes.StoppedRunPassCompletion):
         from scripts.direct import progress_history
+        from scripts.herdr import pass_notices
 
         _ = result.send_notice()
         notice = progress_history.stopped_run_notice(run, record["run_id"])
-        receipt = "sent: stopped pass notice" if isinstance(notice, progress_history.StoppedPassNotice) and notice.delivered else ""
+        # The stopped notice key is turn_end.TurnOutcome.STOPPED.
+        receipt = ("sent: stopped pass notice" if isinstance(notice, progress_history.StoppedPassNotice)
+                   and pass_notices.is_settled(run, notice.instance_id, "stopped") else "")
         return _save_delivery(path, f"finished: the pane pass {result.outcome}", suppressed=True,
                               director_delivery=receipt)
     if isinstance(result, worker_panes.Kept):

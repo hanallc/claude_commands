@@ -363,7 +363,9 @@ def complete_herdr(run: Path, row: staff.StaffRow, passed: dict[str, object],
         if shown not in content:
             write_text_atomic(summary, shown + "\n\n" + content)
     if actions.report_file:
-        write_text_atomic(Path(actions.report_file), summary.read_text())
+        report = Path(actions.report_file)
+        if report.resolve() != reply.resolve():
+            write_text_atomic(report, summary.read_text())
     failure = ""
     if actions.resolve_fix:
         env = dict(os.environ, UNIT_RUN_DIR=str(run), UNIT_TEAM_ROLE=text(passed.get("team_slot")), UNIT_PASS_OWNER="launcher")
@@ -550,7 +552,9 @@ def execute_herdr(args: Arguments, run: Path, phase: str, prompt: Path,
     with log.open() as output:
         _ = output.seek(offset)
         for line in output:
-            if line.rstrip().endswith(staff_worker.COMPACTION_STARTED_TEXT):
+            if result.returncode:
+                print(line, end="", file=sys.stderr)
+            elif line.rstrip().endswith(staff_worker.COMPACTION_STARTED_TEXT):
                 print(line, end="")
     outcome = progress_history.AssignmentLaunchExit.SUBMITTED
     if result.returncode:
@@ -745,9 +749,9 @@ def execute_astra_review_herdr(args: Arguments, run: Path, cwd: Path, prompt: Pa
             and progress_history.dispatch_completed(run, args.new_worker, matched.instance_id)):
         parent = worker_admission.parent(staff.snapshot(), run=run)
         passed = object_map(object_map(read_object(run / unit_runs.STATE_FILE).get("pass")).get(args.new_worker))
-        repeat = cast(Callable[[str, staff.StaffRow, Path, dict[str, object]], Callable[[], None]],
-                      import_module("scripts.herdr.turn_end").repeat_completion_notice)
-        repeat(args.new_worker, parent, run, passed)()
+        retry = cast(Callable[[str, staff.StaffRow, Path, dict[str, object]], Callable[[], None]],
+                     import_module("scripts.herdr.turn_end").retry_completed_notice)
+        retry(args.new_worker, parent, run, passed)()
         return staff_worker.DispatchSubmission.SUBMITTED
     for arguments in (["start-run", "--session-dir", str(run), "--working-dir", str(cwd)],
                       ["start-phase", "--session-dir", str(run), "--phase-id", "astra-review",

@@ -57,7 +57,7 @@ from scripts.notify import push_texts  # noqa: E402
 from scripts.message import rca  # noqa: E402
 from scripts.message import sessions  # noqa: E402
 
-from scripts.herdr import herdr, worker_panes  # noqa: E402
+from scripts.herdr import herdr, pass_notices, worker_panes  # noqa: E402
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Generator, Iterable, Iterator
@@ -1549,6 +1549,7 @@ def watch_pass(now: float, *, deadline: float, read_panes: Callable[[str], list[
     worker_deadline = (time.monotonic() + inspection_deadline) / 2
     pane_workers = read_pane_workers(tuple(worker_parents.values()), record, worker_deadline)
     with operation_deadline.within(worker_deadline):
+        pass_notices.retry_pending(worker_deadline)
         pending.extend(blocked_worker_deliveries(pane_workers, record, now, worker_deadline))
     inspection_started = False
     labels_by_session: dict[str, dict[str, str]] = {}

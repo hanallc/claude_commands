@@ -61,6 +61,8 @@ An unproved Codex prompt returns uncertain when this bound passes or the process
 A recorded prompt remains submitted after a process exit.
 Claude can record the prompt later.
 A failed delivery command returns an error.
+The launcher copies captured worker output to stderr on a nonzero exit.
+Assignment recovery prints the reason if pending pane cleanup prevents submission.
 The transcript prevents replay.
 A matching final transcript reply proves completion.
 A matching dispatch prompt also permits completion from the hook's own DONE reply before the final transcript record appears.
@@ -101,21 +103,25 @@ With an active pass, changed content returns busy and names that pass without pr
 This refusal applies when the launcher arguments change.
 The recorder repeats the content check under its lock before it changes the pass.
 The intentional second review stage keeps its existing pass across its separate prompt path.
-An identical rerun of a completed dispatch sends one completion message through the hook's notice code.
+An identical rerun of a completed dispatch uses the saved pass notice.
 It saves the reply without typing another prompt.
 This rule also applies to a completed managed Astra review.
 The saved completion includes the reason and pane for a close anomaly.
-A successful completed rerun sets its status file to `done` after it sends the notice.
-Native duplicate hook events still send no second message.
+A completed rerun sets its status file to `done` before it checks the notice.
+A replay of a settled hook event sends no second message.
+This includes a legacy status replay that arrives after a different status.
 Each completion notice ends its first line with `; pass <dispatch instance id>`.
-An explicit rerun repeats the saved completion text with the same pass id.
+An explicit rerun can retry a pending notice with its original delivery key.
+An explicit rerun leaves settled notices alone.
 Each notice uses the worker's native identity and name, including a notice from the director's rerun.
 The saved completion supplies the sender identity for a retired managed Astra reviewer.
 The sender identity remains the same after a session change and retirement.
-Turn and run events send no notice when the outcome, reply, and run ids match the last notice.
-A changed waiting outcome, reply, or run ID sends one notice.
-The completion notice records delivery separately from the reply text.
-After delivery, recovery can replace the saved reply without sending another completion notice.
+Each status transition gets a sequence ID and a delivery key.
+A repeated native turn ID uses its existing event.
+Without a native turn ID, an unchanged status uses the current event.
+A transition back to an earlier status gets a new event.
+The pass keeps notices separately from the saved reply.
+Recovery can replace the saved reply after the notice settles.
 Waiting notices add `; runs <run ids>` to the first line.
 The run ids include received results that still await a worker reply.
 An empty turn reply writes no reply file and adds no `; reply <path>` text.
@@ -197,11 +203,22 @@ The turn hook alerts the director when the pass stays active after a turn with n
 An accepted prompt followed by an empty turn can trigger this alert.
 Waiting only for a board post counts as a turn with no pending work.
 A delivered detached result can still require a fresh DONE.
+A turn that ends with a reply but no DONE is a status event.
+The director gets a status notice with the phase, the pass, the recovery instruction, and the reply as the last line.
+Each status event is sent once, and a return to an earlier status is sent again.
+A run event and a later turn end with the same reply are one status event.
+The recovery instruction in that notice uses the pane state at each send.
+When the pass is no longer active, the instruction says so and gives no recovery prompt.
+A failed notice send names its record in `pass-notices-pending` beside the staff record.
+Stall watch sends the unsettled notices of each named record again on each tick.
+It removes the name when every notice of the record is settled or the record is gone.
+It also removes the name, with one anomaly line, when the record is unreadable or its director is not in staff.
+An empty turn, a DONE for another pass, and a wait on a run reply send an alert.
 An alert names the worker, pass, and reason.
 The turn hook and stall watch check the current pane when they build an alert.
 The alert gives `worker.py answer --question` when the pane is blocked.
 The alert gives `worker.py list all` when the pane state is unknown.
-The alert includes the last reply when available.
+The alert includes the details of the turn when available.
 The turn hook and stall watch use the same sender and delivery record.
 The sender keeps one accepted alert for each pass and reason.
 An unexpected question in a worker pane can block the worker before the turn ends.
@@ -224,6 +241,9 @@ An alert for a different DONE names both IDs.
 The pass stays active and the pane stays open until the reply contains the matching DONE.
 A saved stage ID controls pane closure and reuse.
 The reply on disk must match the completed receipt.
+If the report path resolves to the reply path, the hook keeps the raw reply there.
+If the caller requests a distinct report path, the hook writes the report there.
+The report includes the heading when the assignment has a summary.
 The completion hook saves the reply and records the pending notice for the exact pass.
 Live detached work delays normal and late DONE notices.
 Restart restores a selected live worker before it removes the worker from the restart record.
@@ -242,7 +262,7 @@ The hook, restore, and assignment use the same completion recovery under the wor
 Recovery continues a saved completion or checks for matching DONE in the transcript.
 A detached completion uses the pass ID from the run record.
 A completion from a replaced pass cannot act on the current pass.
-Turn-end and detached completion events use the same alert for each pass and reason.
+For an alert, turn-end and detached completion events use the same alert for each pass and reason.
 The restart prefilter sends each saved worker to restore, including workers with no active pass.
 Unavailable completion evidence keeps the restart entry.
 Pane closure alone keeps the restart entry.
@@ -250,11 +270,32 @@ Completion removes the entry after it saves the final result.
 Restore reports incomplete recovery if pane closure fails.
 Restore reports the worker name and reason when completion recovery keeps its pane.
 The next restore retries closure without sending the completion notice again.
-The hook records closure diagnostic delivery separately from the diagnostic text.
-A later recovery retries an undelivered diagnostic with the same delivery key.
-The hook ends `scratch.worker_task(row.id)` before it closes the pane.
-This removes the worker's `scratch.py new --worker` folders and keeps other workers' folders.
+Each pass keeps an append-only notice record in its run directory.
+The record holds each event ID, notice, route, and settlement.
+The record retains event IDs so a retry can recognize a duplicate.
+The first notice for a pass with a legacy stamp imports the stamp as one settled event.
+The record keeps the stamp for that status even if a different status arrives first.
+The progress recorder keeps the stopped pass receipt for late reply recovery.
+The hook saves pending diagnostics in the completion checkpoint before it writes the notice record.
+The hook sets `recording_done` after all pending diagnostics are durable in the notice record.
+If the notice write fails, the next hook publishes the saved diagnostics.
+A new assignment can use an open, stopped, or closed idle worker while the old notice remains pending.
+The new assignment still requires valid completion evidence and safe pane reuse.
+A new assignment can append notices without reading the notice record or taking a message lock.
+A later hook or reap retries the pending notices with their original delivery keys.
+The stopped pass can retry its diagnostics while it waits for a matching DONE.
+The retry checks for a director receipt with the same delivery key.
+A matching receipt settles the notice without a send.
+A receipt lookup failure leaves the notice pending.
+A repeat-guard hold settles the notice after the guard queues a notice for the owner.
+Peer delivery preserves the repeat-guard hold reason. Other holds leave the notice pending.
+The hook marks `scratch.worker_task(row.id)` ended before it closes the pane.
+The worker's scratch folders remain for manual removal.
 A failed cleanup adds a diagnostic to the director notice and permits pane closure.
+The hook saves each retained scratch path and reason separately from the notice text.
+Each send checks the saved paths and omits confirmed missing folders.
+The notice omits legacy scratch details that have only text.
+A failure to read or check the saved paths leaves the notice pending without a send.
 `progress_history.complete_dispatch` records both completed passes and failed managed Astra review passes.
 It matches the slot and dispatch instance id before it records an outcome.
 A refused launcher retry retains the existing pass and its run, including a run with one worker.

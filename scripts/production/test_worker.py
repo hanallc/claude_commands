@@ -363,6 +363,7 @@ class WorkerCommandTests(unittest.TestCase):
             + "# whole: 1..\nrepo_depth=3\n"
             + "repo_skip=target node_modules .git\n")
         root = self.fixture.root
+        _ = self.enterContext(patch.object(send, "STATE", root / "message-state"))
         (root / "worker-tmp").mkdir()
         _ = cast(object, self.enterContext(patch.dict(os.environ, {
             "TMPDIR": str(root / "worker-tmp"),
@@ -433,7 +434,7 @@ class WorkerCommandTests(unittest.TestCase):
         before = cast(dict[str, dict[str, dict[str, object]]], json.loads(previous))["pass"]["impl"]
         after = cast(dict[str, dict[str, dict[str, object]]],
                      json.loads((self.run_dir / "progress_history_state.json").read_text()))["pass"]["impl"]
-        changed = {"status", "finished_at", "hook_notice", "hook_completion"}
+        changed = {"status", "finished_at", "hook_completion"}
         self.assertEqual({key: value for key, value in after.items() if key not in changed},
                          {key: value for key, value in before.items() if key not in changed})
         self.assertEqual(after["status"], "completed")
@@ -2104,23 +2105,17 @@ class WorkerCommandTests(unittest.TestCase):
         progress_history.complete_dispatch(self.run_dir, "impl", instance, status="error")
         if fail_notice:
             self.agent.notice_failures = 1
-            with redirect_stderr(io.StringIO()) as errors:
-                self.assertIs(self.dispatch(), worker.ExitCode.UNCERTAIN)
-            self.assertIn("director message failed", errors.getvalue())
-            self.assertEqual(len(self.agent.submitted), 1)
-            self.assertEqual(self.agent.notices, [])
-            pending = worker_panes.worker_pass(row, self.run_dir)
-            self.assertEqual((pending["instance_id"], pending["status"]), (instance, "error"))
-            self.assertNotIn("hook_notice", pending)
-
-        def check_notice() -> None:
-            notice, = self.agent.notices
-            self.assertIn(f"; pass {instance}", notice)
-            self.assertIn("The earlier pass ended with state error.", notice)
-            self.assertEqual(self.reply.read_text().rstrip(), self.agent.replies[0])
-
-        self.agent.during_prompt = check_notice
-        self.assertIs(self.dispatch(), worker.DispatchSubmission.SUBMITTED)
+            with self.assertRaisesRegex(ValueError, "director message failed"):
+                _ = self.finish()
+        with patch.object(send, "send") as send_during_assignment:
+            self.assertIs(self.dispatch(), worker.DispatchSubmission.SUBMITTED)
+        send_during_assignment.assert_not_called()
+        self.assertEqual(self.agent.notices, [])
+        self.assertEqual(self.reply.read_text().rstrip(), self.agent.replies[0])
+        _ = detached_runs.reap_orphans(str(self.run_dir))
+        notice, = self.agent.notices
+        self.assertIn(f"; pass {instance}", notice)
+        self.assertIn("The earlier pass ended with state error.", notice)
         self.assertEqual(len(self.agent.submitted), 2)
         next_pane, line = self.agent.submitted[-1]
         self.assertEqual(self.agent.row(next_pane).id, row.id)
@@ -2132,13 +2127,13 @@ class WorkerCommandTests(unittest.TestCase):
         self.assertEqual(len(self.agent.submitted), 2)
         self.assertEqual(len(self.agent.notices), 1)
 
-    def test_reassignment_after_launcher_error_starts_a_new_turn_after_the_old_notice(self) -> None:
+    def test_reassignment_after_launcher_error_starts_a_new_turn_before_delivery(self) -> None:
         self.assert_reassignment_after_launcher_error(fail_notice=False)
 
     def test_reassignment_after_a_failed_notice_starts_one_new_turn(self) -> None:
         self.assert_reassignment_after_launcher_error(fail_notice=True)
 
-    def test_completed_dispatch_rerun_repeats_its_notice_without_typing(self) -> None:
+    def test_completed_dispatch_rerun_leaves_the_settled_notice_and_pane_alone(self) -> None:
         self.assertIs(self.dispatch(), worker.DispatchSubmission.SUBMITTED)
         pane = self.agent.submitted[-1][0]
         self.assertEqual(self.finish(), turn_end.TurnOutcome.DONE)
@@ -2169,14 +2164,7 @@ class WorkerCommandTests(unittest.TestCase):
                     self.assertEqual(status.read_text(), "running\n")
                     continue
                 if repeated == 3:
-                    send_notice = send.send
-
-                    def send_unlocked(options: send.Options) -> send.Result:
-                        with worker_panes.worker_lock(self.fixture.parent.id, staff.WorkerName.parse("impl")) as acquired:
-                            self.assertIsInstance(acquired, worker_panes.WorkerLockHold)
-                        return send_notice(options)
-
-                    _ = sends.enter_context(patch.object(send, "send", side_effect=send_unlocked))
+                    transport = sends.enter_context(patch.object(send, "send"))
                     with ExitStack() as notices, worker_panes.worker_lock(self.fixture.parent.id, staff.WorkerName.parse("impl")) as hold:
                         self.assertIsInstance(hold, worker_panes.WorkerLockHold)
                         assert isinstance(hold, worker_panes.WorkerLockHold)
@@ -2185,16 +2173,17 @@ class WorkerCommandTests(unittest.TestCase):
                             launcher_command=["assign.sh", "--phase", "8", "--prompt", str(self.prompt)], reply=self.reply,
                             lock=hold, notices=notices)
                     self.assertIs(result, worker.DispatchSubmission.SUBMITTED)
+                    transport.assert_not_called()
                 else:
                     self.assertIs(self.dispatch(), worker.DispatchSubmission.SUBMITTED)
-                self.assertEqual(self.agent.notices, [notice] * (repeated + 1))
+                self.assertEqual(self.agent.notices, [notice])
                 self.assertEqual(len(self.agent.submitted), 1)
                 self.assertEqual(len(self.fixture.world.launches), 1)
                 self.assertNotIn(pane, self.fixture.world.locations)
                 self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns, self.fixture.staff_state()), before)
                 self.assertEqual((self.reply.read_bytes(), self.reply.stat().st_mtime_ns), reply)
         self.assertEqual(self.finish(), turn_end.TurnOutcome.IGNORED)
-        self.assertEqual(len(self.agent.notices), 5)
+        self.assertEqual(len(self.agent.notices), 1)
 
     def test_dispatch_rerun_before_prompt_records_one_submission(self) -> None:
         target = herdr.check_target

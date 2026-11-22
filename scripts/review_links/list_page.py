@@ -25,7 +25,7 @@ from scripts.production import change_review, footer_counts, record_store, sessi
 from scripts.production.the_list import list_time
 from scripts.production.update_registration import QuestionStaff, RegistrationFailure
 from scripts.review_links import change_browser, change_page, console, page_frame, page_question, record_table, review_link
-from scripts.review_links import new_item_dialog, review_items, review_page
+from scripts.review_links import review_items, review_page
 from scripts.review_links import staff_names
 from scripts.review_links import question_record
 from scripts.statusline import counts_row, rebuild_row
@@ -70,9 +70,11 @@ def list_chip(state: the_list.ItemState, *, parked: bool, open_question: bool,
               unread_delivery: bool = False, unread_answer: bool = False) -> ListChip:
     """Find the one status chip for this item."""
     chip = CHIP_BY_STATE[state]
+    if unread_answer:
+        return ListChip.NEEDS_ME
     if parked:
         return ListChip.PARKED
-    if unread_delivery or unread_answer:
+    if unread_delivery:
         return ListChip.NEEDS_ME
     return ListChip.MORTY_ANSWERING if open_question else chip
 
@@ -137,7 +139,8 @@ def parked_for_delivery(item: the_list.ListItem) -> bool:
 def waiting_updates(_request: console.NewsRequest) -> frozenset[str]:
     """Identify each unread update by its record and time."""
     return frozenset(f"{entry.key}/{entry.item.unread_since.isoformat()}" for entry in records()
-                     if isinstance(entry.item.unread_since, datetime) and not parked_for_delivery(entry.item))
+                     if isinstance(entry.item.unread_since, datetime)
+                     and (not parked_for_delivery(entry.item) or the_list.unread_answer_ids(entry.item)))
 
 
 def owner_name(members: staff.StaffSnapshot, owner: the_list.ItemOwner) -> str:
@@ -474,7 +477,17 @@ def detail_panel(entry: ListRecord, sections: str, today: datetime, names: staff
                  unread_answers: frozenset[str]) -> str:
     log = item_log_html(entry, today, names, unread_answers)
     log_id = html.escape('log-' + entry.key.replace('/', '-'), quote=True)
-    return ('<div class="list-panel"><div>' + sections
+    item = entry.item
+    status_time = item.latest_status_time
+    status_stamp = " · " + time_html(status_time, today) if item.latest_status and isinstance(status_time, datetime) else ""
+    fields = ''.join(
+        f'<section class="list-field-{field}"><h3>{FIELD_LABELS[field]}'
+        + (status_stamp if field == "latest_status" else "") + '</h3>'
+        + field_html(field, value, today, names) + '</section>'
+        for field, value in (("state", item.state), ("eta", item.eta), ("latest_status", item.latest_status),
+                             ("next_step", item.next_step), ("done_when", item.done_when)))
+    return ('<div class="list-panel"><div><div class="list-item-fields">' + fields
+            + '</div><div data-list-item-content>' + sections + '</div>'
             + '</div><section class="list-log-panel"><h3>Log · newest first</h3>'
             + f'<div class="list-log-scroll" id="{log_id}" tabindex="0" role="region" aria-label="Log · newest first">'
             + '<ol class="list-log">' + log + '</ol></div></section></div>')
@@ -496,7 +509,7 @@ def has_all_linked_reviews(item: the_list.ListItem, reviews: ReviewRecords) -> b
 
 def read_linked_reviews(root: Path, *, members: staff.StaffSnapshot) -> list[review_items.ReviewItem]:
     """Read the Review records without assigning IDs to legacy questions."""
-    return review_items.read(root, members=members, assign_ids=False)
+    return review_items.read(root, members=members)
 
 
 def linked_reviews(root: Path, members: staff.StaffSnapshot, records: ImmediateReviewRecords,
@@ -508,12 +521,11 @@ def linked_reviews(root: Path, members: staff.StaffSnapshot, records: ImmediateR
 
 
 def review_links(item: the_list.ListItem, reviews: ReviewDisplay, today: datetime) -> str:
-    if not item.reviews:
-        return ""
-    if reviews is LinkedReviewRead.AFTER_RENDER:
-        return '<div data-list-review-links></div>'
-    cards = (review_card(identity, reviews) for identity in item.reviews)
-    return '<p>' + review_summary(item, reviews, today) + '</p><p>' + ' · '.join(cards) + '</p>'
+    links = ''
+    if item.reviews and reviews is not LinkedReviewRead.AFTER_RENDER:
+        cards = (review_card(identity, reviews) for identity in item.reviews)
+        links = '<p>' + review_summary(item, reviews, today) + '</p><p>' + ' · '.join(cards) + '</p>'
+    return '<div data-list-review-links>' + links + '</div>'
 
 
 def render_review_updates(root: Path, members: staff.StaffSnapshot, review_records: ImmediateReviewRecords) -> str:
@@ -527,7 +539,7 @@ def render_review_updates(root: Path, members: staff.StaffSnapshot, review_recor
         f'<template data-list-review-key="{html.escape(entry.key, quote=True)}"'
         + f' data-list-review-version="{review_version(entry.item)}">'
         + '<span data-list-review-summary>' + review_summary(entry.item, reviews, today) + '</span>'
-        + '<div data-list-review-links>' + review_links(entry.item, reviews, today) + '</div></template>'
+        + review_links(entry.item, reviews, today) + '</template>'
         for entry in entries)
 
 
@@ -568,18 +580,11 @@ def details(entry: ListRecord, today: datetime, secret: str, reviews: ReviewDisp
     item = entry.item
     if isinstance(visibility, the_list.WaitingForAnswer):
         return waiting_details(entry, today, names, unread_answers, secret, reviews, parking_label)
-    status_time = item.latest_status_time
-    status_stamp = " · " + time_html(status_time, today) if item.latest_status and isinstance(status_time, datetime) else ""
-    sections = ''.join(
-        f'<section><h3>{FIELD_LABELS[field]}{status_stamp if field == "latest_status" else ""}</h3>'
-        + field_html(field, value, today, names) + '</section>'
-        for field, value in (("latest_status", item.latest_status), ("done_when", item.done_when)))
     links = [f'<li><a data-record-jump href="{html.escape(item_link(entry.keeper, link.number), quote=True)}">#{link.number}</a>'
              + ' — ' + html.escape(link.condition) + '</li>' for link in item.blocked_by]
     links.extend(f'<li>Related: <a data-record-jump href="{html.escape(item_link(entry.keeper, number), quote=True)}">#{number}</a></li>'
                  for number in item.related_to)
-    if links:
-        sections += '<section><h3>Links</h3><ul>' + ''.join(links) + '</ul></section>'
+    sections = '<section><h3>Links</h3><ul>' + ''.join(links) + '</ul></section>' if links else ''
     sections += review_links(item, reviews, today)
     questions = panel_questions(item, today, unread_answers, visibility.failed)
     form = feedback_form(entry, secret, parking_label=parking_label)
@@ -656,11 +661,19 @@ def item_rows(entry: ListRecord, names: staff_names.StaffNames, today: datetime,
              title, state, field_html("next_step", item.next_step, today, names), eta_cell, update)
     row = ''.join(f'<td' + (' class="record-id"' if label == '#' else '')
                   + f' data-label="{label}">{cell}</td>' for label, cell in zip(HEADERS, cells))
-    return (f'<tbody data-list-item{attrs}><tr class="list-row">' + row
+    body = details(entry, today, secret, reviews, names, visibility, unread_answers, parking_label=parking_label)
+    revision = detail_revision(item, body)
+    return (f'<tbody data-list-item{attrs} data-detail-revision="{revision}"><tr class="list-row">' + row
             + f'</tr><tr data-detail id="{panel}" hidden><td colspan="{len(HEADERS)}">'
-            + details(entry, today, secret, reviews, names, visibility, unread_answers, parking_label=parking_label)
-            + '</td></tr></tbody>')
+            + body + '</td></tr></tbody>')
 
+
+def detail_revision(item: the_list.ListItem, body: str) -> str:
+    version = re.sub(r'<div data-list-review-links>.*?</div>', '', body, count=1, flags=re.DOTALL)
+    # Keep the unread fingerprint in the detail revision.
+    version = re.sub(r'(name="request" value=")[a-f0-9]{32}', r'\1', version)
+    version = re.sub(r'(name="token" value=")[a-f0-9]{64}', r'\1', version)
+    return hashlib.sha256(f'{item.updated}\0{item.title}\0{version}'.encode()).hexdigest()
 
 @dataclass(frozen=True)
 class ListFeedbackDelivery:
@@ -712,13 +725,24 @@ class SavedActionState(TypedDict):
     waiting_details_html: NotRequired[str]
     review_summary_html: NotRequired[str]
     park_request_saved: NotRequired[bool]
+    detail_html: NotRequired[str]
+    detail_revision: NotRequired[str]
+    detail_closed: NotRequired[bool]
 
 
 def saved_action_state(keeper: str, identity: str, *, status: change_page.DeliveryStatus | None = None,
                        park_request: str = "",
-                       review_records: ImmediateReviewRecords = LinkedReviewRead.FROM_DISK) -> SavedActionState:
+                       review_records: ImmediateReviewRecords = LinkedReviewRead.FROM_DISK,
+                       include_detail: bool = False) -> SavedActionState:
     owner = staff.StaffId(keeper)
-    item = the_list.load(owner, identity)
+    return action_state(owner, the_list.load(owner, identity), status=status,
+                        park_request=park_request, review_records=review_records, include_detail=include_detail)
+
+
+def action_state(owner: staff.StaffId, item: the_list.ListItem, *,
+                 status: change_page.DeliveryStatus | None = None, park_request: str = "",
+                 review_records: ImmediateReviewRecords = LinkedReviewRead.FROM_DISK,
+                 include_detail: bool = False) -> SavedActionState:
     zone = user_zone()
     today = the_list.now()
     local_today = today.astimezone(zone)
@@ -730,7 +754,8 @@ def saved_action_state(keeper: str, identity: str, *, status: change_page.Delive
     unread_answers = the_list.unread_answer_ids(item)
     reading = status if status is not None else change_page.DeliveryStatus(review_link.review_root())
     open_question = item.state != the_list.ItemState.CLOSED and has_open_question(item)
-    waiting = open_question and isinstance(the_list.question_visibility(owner, item, reading), the_list.WaitingForAnswer)
+    visibility = the_list.question_visibility(owner, item, reading)
+    waiting = open_question and isinstance(visibility, the_list.WaitingForAnswer)
     saved: SavedActionState = {"unread": str(isinstance(unread, datetime)).lower(),
                                "unread_sort": unread.timestamp() if isinstance(unread, datetime) else 0,
                                "item_state": item.state.value,
@@ -742,7 +767,7 @@ def saved_action_state(keeper: str, identity: str, *, status: change_page.Delive
                                "unread_answer": str(bool(unread_answers)).lower()}
     if park_request:
         saved["park_request_saved"] = the_list.has_park_receipt(item, park_request)
-    if waiting:
+    if waiting or include_detail and item.state != the_list.ItemState.CLOSED:
         members = staff.snapshot()
         names = staff_names.StaffNames(members)
         reviews: ReviewRecords = {}
@@ -754,9 +779,16 @@ def saved_action_state(keeper: str, identity: str, *, status: change_page.Delive
                 if review_records is not LinkedReviewRead.FROM_DISK:
                     reviews = review_records
             saved["review_summary_html"] = review_summary(item, reviews, today)
-        saved["waiting_details_html"] = waiting_details(
-            ListRecord(owner, item), local_today, names, unread_answers,
-            form_secret(reading.root), reviews, parked_until)
+        secret = form_secret(reading.root)
+        body = details(ListRecord(owner, item), local_today, secret, reviews, names,
+                       visibility, unread_answers, parking_label=parked_until)
+        if waiting:
+            saved["waiting_details_html"] = body
+        if include_detail:
+            revision = detail_revision(item, body)
+            saved.update(detail_html=body, detail_revision=revision)
+    if include_detail and item.state == the_list.ItemState.CLOSED:
+        saved["detail_closed"] = True
     return saved
 
 
@@ -770,9 +802,16 @@ def _mark_seen_update_read(keeper: staff.StaffId, item: the_list.ListItem,
 
 
 def submit(root: Path, body: str, status: change_page.DeliveryStatus | None = None) -> ListActionSubmission:
+    return save_action(root, body, status)[0]
+
+
+def save_action(root: Path, body: str, status: change_page.DeliveryStatus | None = None, *,
+                review_records: ImmediateReviewRecords = LinkedReviewRead.FROM_DISK,
+                include_detail: bool = False) -> tuple[ListActionSubmission, SavedActionState | None]:
     """Accept signed item actions and save their notices for morty."""
     fields = parse_qs(body, keep_blank_values=True, strict_parsing=True)
-    if set(fields) != {"keeper", "id", "request", "token", "action", "words", "until"} or any(len(values) != 1 for values in fields.values()):
+    if (set(fields) != {"keeper", "id", "request", "token", "action", "words", "until"}
+            or any(len(values) != 1 for values in fields.values())):
         raise question_record.AnswerRefused("use the form on this page")
     keeper, identity, request = fields["keeper"][0], fields["id"][0], fields["request"][0]
     if re.fullmatch(r"L[1-9]\d*", identity) is None:
@@ -788,10 +827,27 @@ def submit(root: Path, body: str, status: change_page.DeliveryStatus | None = No
     if morty is None or morty.kind != "producer" or morty.name != "morty":
         raise question_record.AnswerRefused("the item has no morty producer")
     action, words, until = fields["action"][0], fields["words"][0].strip(), fields["until"][0]
+    read_edit = None
     if action == "read":
-        _ = the_list.mark_read(morty.id, identity, source=the_list.PAGE_SOURCE, update=prefix.seen_update,
-                               page_request=the_list.PageRequest(request, "read", words))
-        return change_page.NoMessageDelivery()
+        read_edit = the_list.mark_read_edit(morty.id, identity, source=the_list.PAGE_SOURCE, update=prefix.seen_update,
+                                           page_request=the_list.PageRequest(request, "read", words))
+        delivery = change_page.NoMessageDelivery()
+    else:
+        delivery = _submit_action(root, morty, identity, request, prefix, action, words, until, status)
+    if not include_detail:
+        return delivery, None
+    try:
+        item = read_edit.item if read_edit is not None else the_list.load(morty.id, identity)
+        state = action_state(morty.id, item, status=status, review_records=review_records, include_detail=True)
+    except Exception as error:
+        print(f"review-links List saved {identity}: {error}", file=sys.stderr)
+        return delivery, None
+    return delivery, state
+
+
+def _submit_action(root: Path, morty: staff.StaffRow, identity: str, request: str,
+                   prefix: ListFormRequestPrefix, action: str, words: str, until: str,
+                   status: change_page.DeliveryStatus | None) -> ListActionSubmission:
     item = the_list.load(morty.id, identity)
     if action == "question":
         status = change_page.DeliveryStatus(root) if status is None else status
@@ -1003,6 +1059,7 @@ def render(root: Path, *, include_counts: bool = True, defer_counts: bool = Fals
     settings = conf.read("review_links")
     seconds = settings.number("page_refresh_seconds")
     request_timeout = settings.whole("page_request_timeout_seconds")
+    delivery_window = record_table.delivery_window_seconds(settings)
     card_motion = page_frame.CardMotion.read(settings)
     morning = record_table.clock_minutes(settings, "later_morning")
     log_max_height = settings.whole("list_log_max_height_rem")
@@ -1013,9 +1070,9 @@ def render(root: Path, *, include_counts: bool = True, defer_counts: bool = Fals
             counts = f'<div data-list-counts-url="{PAGE_PATH}?{html.escape(query)}"></div>'
         else:
             counts = counts_strip(members, names)
-    content = (STYLE + page_frame.title("The List", "list", action=new_item_dialog.title_button("list"), compact_actions=True)
+    content = (STYLE + page_frame.title("The List", "list")
                + f'<div data-list data-refresh-seconds="{seconds}" data-zone="{html.escape(zone.key, quote=True)}"'
-               + f' data-request-timeout-seconds="{request_timeout}"'
+               + f' data-request-timeout-seconds="{request_timeout}" data-delivery-window-seconds="{delivery_window}"'
                + f' {card_motion.attributes()}'
                + f' data-closed-keys="{html.escape(json.dumps(closed_keys), quote=True)}"'
                + f' data-park-morning="{morning}" style="--list-log-max-height:{log_max_height}rem">'
@@ -1039,15 +1096,16 @@ def render(root: Path, *, include_counts: bool = True, defer_counts: bool = Fals
                + '<div class="list-table"><table aria-labelledby="list-linked-heading">' + columns
                + '<thead><tr>' + linked_headers + '</tr></thead></table></div></section>'
                + counts + '</div>'
+               + page_frame.CONSOLE_DIALOG_ASSETS
                + '<dialog data-list-review-dialog aria-label="Review card"><div class="list-review-close">'
-               + '<button type="button" autofocus>Close</button></div></dialog>'
-               + new_item_dialog.render()
+               + '<button type="button" data-close autofocus>Close</button></div></dialog>'
+               + record_table.render_inline_detail()
                + '<script>' + SCRIPT + '</script>')
     return page_frame.rendered(change_page.document(content, "The List"), started, read_at)
 
 
 STYLE = record_table.STYLE + record_table.DATE_TIME_STYLE + '<style>' + review_page.QUESTION_COLOR_RULE + '''
-[data-list-review-dialog]{width:min(1060px,calc(100% - 48px));max-width:none;max-height:none;padding:0;
+[data-list-review-dialog]{position:fixed;inset:0;margin:16px auto auto;width:min(1060px,calc(100% - 48px));max-width:none;max-height:none;padding:0;
 border:1px solid var(--line);border-radius:12px;background:var(--bg);color:var(--ink);overflow:hidden;box-sizing:border-box}
 [data-list-review-dialog]::backdrop{background:#0009}
 .list-review-close{display:flex;justify-content:flex-end;padding:8px 12px}
@@ -1093,11 +1151,18 @@ background:var(--ink-2);border-radius:50%}
 .list-next-step-column{width:var(--list-next-step-width,23%)}
 .list-owner-name{display:block;overflow-wrap:anywhere;hyphens:none}
 .list-table td[data-label="Next step"]>:first-child{margin-top:0}.list-table td[data-label="Next step"]>:last-child{margin-bottom:0}
+.list-item-fields{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));column-gap:16px}
+.list-item-fields section{grid-column:span 2}
+.list-item-fields :is(.list-field-state,.list-field-eta){grid-column:auto}
 .list-actions{position:relative}
+:is(.list-tell,.list-actions,.list-parking-actions)>button,.list-park>[data-later-toggle]{
+ border:1px solid var(--ink-3);border-radius:8px;background:var(--card);color:var(--ink);cursor:pointer
+}
+.list-tell>[data-send-status]:empty{display:none}
 .list-parking-actions{display:flex;gap:inherit;margin-inline-start:auto}
 .list-park [data-later-menu] [data-later-preset]{display:block;width:calc(100% - 12px);margin:6px 6px 4px}
 .list-table [data-parked]:not([data-parked="false"]) [data-list-check]{display:none}
-.list-table tbody:has([data-parked-detail]:not([hidden])) .list-row.open [data-parked-note]{display:none}
+.list-table .list-row.open [data-parked-note]{display:none}
 .list-table:has(.list-park>[data-later-menu]:not([hidden]),.list-eta:focus-visible),
 .list-table tbody:has(.list-park>[data-later-menu]:not([hidden]),.list-eta:focus-visible){overflow:visible}
 .list-tell{display:flex;justify-content:flex-end;align-items:center;gap:10px;flex-wrap:wrap}
@@ -1116,6 +1181,10 @@ background:var(--ink-2);border-radius:50%}
 .page-question .question-unread{margin-inline-start:6px;color:var(--accent);text-transform:none}
 .list-panel:has([data-waiting-note]){min-height:12rem}
 .list-panel [data-waiting-note]{margin-top:16px}
+[data-record-inline-view] .record-dialog-status{border-inline-start:3px solid var(--accent);text-align:left}
+[data-record-inline-view] .record-dialog-status:not(:has(> :not([hidden]))){display:none}
+[data-record-inline-view] [data-record-error]{padding-inline:24px;text-align:left}
+[data-record-inline-view] [data-record-link-notice]{padding:0;border:0}
 .list-table td[data-label="State"]{color:var(--ink)}
 .list-table td[data-label="Producer"],.list-table td[data-label="ETA"]{color:var(--ink-2)}
 .list-eta{display:block;position:relative;min-width:0}
@@ -1153,13 +1222,16 @@ const isParked=data=>data.parked==='true' || data.parked===deliveryParking;
 const chipFor=data=>{
  if(data.state==='Closed') return;
  const parked=isParked(data);
- if(!parked && (data.unreadDelivery==='true' || data.unread==='true' && data.unreadAnswer==='true')) return 'needs-me';
+ if(data.unread==='true' && data.unreadAnswer==='true' || !parked && data.unreadDelivery==='true') return 'needs-me';
  return chipsByQuestion[data.openQuestion][String(parked)][data.state];
 };
 let content=document.querySelector('[data-list]');
 let closedKeys=new Set(JSON.parse(content.dataset.closedKeys));
 let saving=0,listSaveVersion=0,refreshNeeded=false;
 let createdItem='';
+function listRequestSignal(){
+ return AbortSignal.timeout(Number(content.dataset.requestTimeoutSeconds)*1000);
+}
 function startListSave(){
  saving++;listSaveVersion++;pageRefresh.abandon();
 }
@@ -1176,38 +1248,30 @@ const unparkMessages={
  expired:'Parking time already expired',
  no_active_parking:'No active parking time to clear',
 };
-/** @type {Map<string, {index: string, offset: number}>} */
-const logPositions=new Map();
-function visibleLogs(){
- return content.querySelectorAll('[data-list-item]:not([hidden]) [data-detail]:not([hidden]) .list-log-scroll');
+/** @typedef {{key: string, index: string, offset: number}} LogPosition */
+const openLog=()=>recordDetails(tableView.openItem)?.querySelector('.list-log-scroll');
+/** @type {LogPosition | null} */
+let heldLog=null;
+// Moving or replacing the open row resets its log scroll, so hold the first visible entry for this task.
+function holdLog(){
+ const log=openLog();
+ if(heldLog || !log?.clientHeight || !log.scrollTop) return;
+ const top=log.getBoundingClientRect().top;
+ const entry=[...log.querySelector('.list-log').children].find(entry=>entry.getBoundingClientRect().bottom>top);
+ if(!entry) return;
+ heldLog={key:tableView.openItem.dataset.key,index:entry.dataset.logIndex,offset:entry.getBoundingClientRect().top-top};
+ queueMicrotask(()=>{heldLog=null;});
 }
-function rememberLogPositions(){
- for(const log of visibleLogs()){
-  if(!log.clientHeight) continue;
-  const key=log.closest('[data-list-item]').dataset.key;
-  if(!log.scrollTop){logPositions.delete(key);continue;}
-  const top=log.getBoundingClientRect().top;
-  for(const entry of log.querySelector('.list-log').children){
-   const bounds=entry.getBoundingClientRect();
-   if(bounds.bottom<=top) continue;
-   logPositions.set(key,{index:entry.dataset.logIndex,offset:bounds.top-top});
-   break;
-  }
- }
-}
-function restoreLogPositions(){
- if(!logPositions.size) return;
- for(const log of visibleLogs()){
-  const position=logPositions.get(log.closest('[data-list-item]').dataset.key);
-  if(!position || !log.clientHeight) continue;
-  const entry=log.querySelector('[data-log-index="'+position.index+'"]');
-  if(entry) log.scrollTop+=entry.getBoundingClientRect().top-log.getBoundingClientRect().top-position.offset;
- }
+function restoreLog(){
+ const log=openLog();
+ if(!heldLog || tableView.openItem?.dataset.key!==heldLog.key) return;
+ const entry=log?.querySelector('[data-log-index="'+CSS.escape(heldLog.index)+'"]');
+ if(entry) log.scrollTop+=entry.getBoundingClientRect().top-log.getBoundingClientRect().top-heldLog.offset;
 }
 function restoreEvidenceDetails(fresh){
  const opened=new Map();
  for(const details of content.querySelectorAll('.log-evidence[open]')){
-  const key=details.closest('[data-list-item]').dataset.key;
+  const key=recordFromDetail(details).dataset.key;
   if(!opened.has(key)) opened.set(key,new Set());
   opened.get(key).add(details.closest('[data-log-index]').dataset.logIndex);
  }
@@ -1231,11 +1295,12 @@ function syncUnread(item,form,unread,unreadSort){
  sortValues[7]=unread ? unreadSort : 0;
  item.dataset.sortValues=JSON.stringify(sortValues);
  const update=item.querySelector('[data-label="Update"]'),dot=update.querySelector('.list-dot');
- const read=form.querySelector('[value="read"]');
+ const read=form?.querySelector('[value="read"]');
  if(unread){
   update.querySelector('[aria-label="No unread update"]')?.remove();
   if(!dot){const mark=document.createElement('span');mark.className='list-dot';mark.setAttribute('role','img');
    mark.setAttribute('aria-label','Unread update');update.prepend(mark);}
+  if(!form) return;
   const canRead=!form.hasAttribute('data-waiting-actions') ||
    item.dataset.unreadDelivery==='true' || item.dataset.unreadAnswer==='true';
   if(!canRead) read?.remove();
@@ -1252,6 +1317,30 @@ function syncUnread(item,form,unread,unreadSort){
    empty.setAttribute('aria-label','No unread update');empty.textContent='—';update.prepend(empty);}
  }
 }
+function installListDetail(item){
+  const detail=recordDetails(item),form=detail.querySelector('[data-feedback-form]');
+  if(form && !form.retainDraft) bindFeedbackForm(form);
+  tableView.showDraftCopy(drafts.get(item.dataset.key)?.words,form?.elements.words?.type==='textarea');
+}
+function renderListDetail(revision,text,{retainLinks=false}={}){
+ return (row,detail)=>{
+  const links=retainLinks ? detail.querySelector('[data-list-review-links]') : null;
+  if(row===tableView.openItem) holdLog();
+  row.dataset.detailRevision=revision;
+  detail.innerHTML=text;
+  if(links) detail.querySelector('[data-list-review-links]')?.replaceWith(links);
+  installListDetail(row);
+  restoreLog();
+ };
+}
+function installSavedListDetail(request,revision,text,options){
+ tableView.installOwnItemResult(request,revision,renderListDetail(revision,text,options));
+}
+function presentListDetail(item,result){
+ const revision=result.detail_revision,text=result.detail_html;
+ if(revision && typeof text==='string')
+  tableView.presentItemRevision(item,revision,renderListDetail(revision,text,{retainLinks:true}));
+}
 const tableView=createRecordTable({content:()=>content,
  shows,
  defaultShow:'all',
@@ -1265,8 +1354,22 @@ const tableView=createRecordTable({content:()=>content,
  },
  filters:['producer','unread'],
  staffChipFilters:['owner','producer'],
- beforeApply:rememberLogPositions,
- applied:restoreLogPositions,
+ emptyFilters:(root,{filters})=>[
+  ...activeChipLabels(root,'[data-filter-row] [aria-pressed="true"]:not([data-filter-value="all"])'),
+  ...(filters.unread ? ['Unread only'] : []),
+ ],
+ firstFilter:root=>root.querySelector('#filter-owner-all'),
+ closeHiddenItem:changingFilters=>changingFilters || !saving,
+ ownsFocus:listOwnsFocus,
+ keepItemOnMissingLink:true,
+ rememberItem:item=>{
+  recordDetails(item).querySelector('[data-feedback-form]')?.retainDraft?.();
+ },
+ itemRevision:item=>item.dataset.detailRevision,
+ retainedDetailSlot:'[data-list-review-links]',
+ detailInstalled:installListDetail,
+ beforeApply:holdLog,
+ applied:restoreLog,
  hasKey:key=>!closedKeys.has(key) && !!content.querySelector('[data-list-item][data-key="'+CSS.escape(key)+'"]'),
  revealLinked:(data,{filters})=>data.openQuestion==='true' || (filters.unread && data.unread!=='true'),
  missingItem:key=>{
@@ -1329,7 +1432,6 @@ function bindListControls(){
   }
  }
  sizeListColumns();
- content.querySelectorAll('[data-feedback-form]').forEach(bindFeedbackForm);
 }
 function listPickerSummary(zone){
  const format=new Intl.DateTimeFormat('en-US',{timeZone:zone,month:'short',day:'numeric',
@@ -1340,23 +1442,25 @@ function listPickerSummary(zone){
  };
 }
 function bindFeedbackForm(form){
-  const item=form.closest('[data-list-item]'),key=item.dataset.key;
+  let item=recordFromDetail(form);
+  const key=item.dataset.key;
   const notice=form.querySelector('[data-send-status]');
   const unpark=form.querySelector('[value="unpark"]'),parkedDetail=form.querySelector('[data-parked-detail]');
   notice.textContent=tableView.actionNotice(item);
   const waitingForm=form.hasAttribute('data-waiting-actions');
-  const confirmed={state:item.dataset.state,parked:item.dataset.parked,
+  const confirmation=()=>({state:item.dataset.state,parked:item.dataset.parked,
    unread:item.dataset.unread==='true',unreadDelivery:item.dataset.unreadDelivery,unreadAnswer:item.dataset.unreadAnswer,
-   unreadSort:JSON.parse(item.dataset.sortValues)[7]};
-  const syncConfirmed=()=>{
+   unreadSort:JSON.parse(item.dataset.sortValues)[7]});
+  let confirmed=confirmation();
+  const syncConfirmed=(metadataOnly=false)=>{
    item.dataset.state=confirmed.state;
    item.dataset.parked=confirmed.parked;
    item.dataset.unreadDelivery=confirmed.unreadDelivery;
    item.dataset.unreadAnswer=confirmed.unreadAnswer;
-   unpark.hidden=confirmed.parked==='false' || confirmed.state==='Closed';
-   syncUnread(item,form,confirmed.unread,confirmed.unreadSort);
+   if(!metadataOnly) unpark.hidden=confirmed.parked==='false' || confirmed.state==='Closed';
+   syncUnread(item,metadataOnly ? null : form,confirmed.unread,confirmed.unreadSort);
   };
-  const applySavedState=(result,keepDetailFocus=false)=>{
+  const applySavedState=(result,{keepDetailFocus=false,hasDetail=false,metadataOnly=false}={})=>{
    delete item.dataset.listReviewVersion;
    if(typeof result.review_summary_html==='string'){
     const summary=item.querySelector('[data-list-review-summary]');
@@ -1365,7 +1469,7 @@ function bindFeedbackForm(form){
    if(typeof result.item_state==='string') confirmed.state=result.item_state;
    if(confirmed.state==='Closed'){
     closedKeys.add(key);
-    tableView.closeCard(key);
+    if(!metadataOnly) tableView.closeCard(key);
    }
    const unread=result.unread==='true';
    if(['true','false'].includes(result.parked))
@@ -1376,17 +1480,20 @@ function bindFeedbackForm(form){
     confirmed.unread=unread;
     confirmed.unreadSort=unread ? (result.unread_sort ?? confirmed.unreadSort) : 0;
    }
-   syncConfirmed();
+   syncConfirmed(metadataOnly);
    const state=item.querySelector('.list-state');state.textContent=item.dataset.state;
    state.className='list-state '+({'Waiting for nate':'warning',Blocked:'error',Working:'accent',Delivered:'room',Done:'room'}[item.dataset.state] || 'muted');
    const sortValues=JSON.parse(item.dataset.sortValues);sortValues[4]=item.dataset.state.toLowerCase();item.dataset.sortValues=JSON.stringify(sortValues);
    if(typeof result.parked_until==='string'){
     let note=item.querySelector('[data-parked-note]');
-    parkedDetail.hidden=!result.parked_until;
-    parkedDetail.textContent=result.parked_until ? 'Parked until '+result.parked_until : '';
+    const text=result.parked_until ? 'Parked until '+result.parked_until : '';
+    if(!metadataOnly){
+     parkedDetail.hidden=!result.parked_until;
+     parkedDetail.textContent=text;
+    }
     if(result.parked_until){
      if(!note){note=document.createElement('small');note.dataset.parkedNote='';state.parentElement.append(note);}
-     note.textContent=parkedDetail.textContent;
+     note.textContent=text;
     }else note?.remove();
    }
    if(['true','false'].includes(result.open_question)) item.dataset.openQuestion=result.open_question;
@@ -1406,21 +1513,21 @@ function bindFeedbackForm(form){
      (item.querySelector('[data-open-question-note]') ?? state).insertAdjacentHTML('afterend',result.check_html);
    }
    const waiting=result.waiting_for_answer==='true';
-   if(waiting){
-    item.dataset.waitingForAnswer='true';
-    const detail=item.querySelector('[data-detail] td');
+   if(typeof result.waiting_for_answer==='string') item.dataset.waitingForAnswer=result.waiting_for_answer;
+   if(waiting && !hasDetail && !metadataOnly && confirmed.state!=='Closed'){
+    const detail=recordDetails(item);
     if(typeof result.waiting_details_html==='string'){
      const field=keepDetailFocus && listOwnsFocus() && detail.contains(document.activeElement)
       ? document.activeElement : null;
      const reviewLink=field?.matches('[data-list-review-card]') ? reviewLinkPlace(field) : null;
-     detail.innerHTML=result.waiting_details_html;
+     tableView.updateItemDetail(item,detail=>{detail.innerHTML=result.waiting_details_html;});
      if(reviewLink) restoreReviewLink(reviewLink);
      else if(field?.id && field!==unpark) document.getElementById(field.id)?.focus({preventScroll:true});
      return detail.querySelector('[data-feedback-form]');
     }
     const note=detail.querySelector('[data-waiting-note]');
     note.hidden=false;
-    detail.querySelector('.list-panel > div').replaceChildren(note);
+    detail.querySelector('[data-list-item-content]').replaceChildren(note);
    }
   };
   const words=form.elements.words,until=form.elements.until;
@@ -1436,6 +1543,7 @@ function bindFeedbackForm(form){
    token:signed.token
   });
   const draft=drafts.get(key);if(draft && !waitingForm){words.value=draft.words;until.value=draft.until;}
+  let draftStamp=draft?.stamp ?? 0;
   const unconfirmed=draft?.unconfirmed ?? new Set();
   const matching=action=>[...unconfirmed].findLast(attempt=>attempt.words===words.value &&
    (attempt.action==='park-until-delivered' || attempt.until===until.value) &&
@@ -1443,18 +1551,25 @@ function bindFeedbackForm(form){
   const identity=request=>{form.elements.request.value=request.request;form.elements.token.value=request.token;};
   const retainDraft=()=>{
    drafts.set(key,{words:waitingForm ? draft?.words ?? '' : words.value,
-    until:waitingForm ? draft?.until ?? '' : until.value,unconfirmed});
+    until:waitingForm ? draft?.until ?? '' : until.value,stamp:draftStamp,unconfirmed});
    identity(matching() ?? fresh);
   };
   const retain=()=>{retainDraft();syncTell();};
+  form.retainDraft=retainDraft;
   retain();
-  words.addEventListener('input',retain);until.addEventListener('input',retain);
+  const edit=()=>{draftStamp++;retain();};
+  words.addEventListener('input',edit);until.addEventListener('input',edit);
   const zone=content.dataset.zone;
   const parkToggle=form.querySelector('[data-later-toggle]');
   if(!waitingForm) bindDateTimePicker(form,{zone,defaultMinutes:()=>Number(content.dataset.parkMorning),summaryPrefix:'Parks until ',
    formatSummary:listPickerSummary(zone),retryTime:()=>Date.parse(matching('park')?.parkingTime ?? '')});
   form.addEventListener('submit',async event=>{
-   event.preventDefault();if(cardSubmitBlocked(form,tableView.rowFading(key))) return;
+   event.preventDefault();
+   const formKey=form.elements.keeper.value+'/'+form.elements.id.value;
+   const current=recordFromDetail(form);
+   if(!tableView.canSubmit(form,formKey) || current!==tableView.openItem || !content.contains(current) ||
+    cardSubmitBlocked(form,tableView.rowFading(key))) return;
+   if(item!==current){item=current;confirmed=confirmation();}
    const submitter=event.submitter,action=submitter?.value || 'tell';
    const parkForDelivery=action==='park-until-delivered',parks=action==='park' || parkForDelivery;
    const changesParking=parks || action==='unpark';
@@ -1475,87 +1590,175 @@ function bindFeedbackForm(form){
    const attempt=retry ?? {...fresh,action,words:words.value,until:until.value,parkingTime};
    identity(attempt);
    const data=new URLSearchParams(new FormData(form));data.set('action',parks ? 'park' : action);
-   if(parks) data.set('until',parkingTime);
+   if(parks){data.set('until',parkingTime);data.set('words','');}
    if(!retry){unconfirmed.add(attempt);fresh=newRequest();}
    retainDraft();
+   const stampAtSubmit=draftStamp;
+   const request=tableView.startItemRequest(key);
+   item.listRequest=request;
    startListSave();
-   const hadFocus=asksQuestion && item.contains(document.activeElement);
+   const hadFocus=asksQuestion && recordDetails(item).contains(document.activeElement);
    let focusChoice;
    const trackFocus=event=>{if(event.target!==document.body) focusChoice=event.target;};
    if(hadFocus) document.addEventListener('focusin',trackFocus);
-   let saved=false,refused=false,nextForm;
-   setCardSubmitting(form,true,item);
-   notice.textContent=action==='read' ? 'Saving…' : 'Sending…';
+   let saved=false,refused=false,stale=false,focusParkedAfterClose=false,nextForm;
    const clearsUnread=action==='read' || usesWords,unreadBefore=item.dataset.unread,wasVisible=!item.hidden;
-   if(action==='remove'){
-    item.dataset.state='Closed';
-    unpark.hidden=true;
-    syncUnread(item,form,false,0);
-   }
-   if(parks) item.dataset.parked=parkForDelivery ? deliveryParking : 'true';
-   if(clearsUnread) item.dataset.unread='false';
    const releasesLink=action==='read' || parks || action==='remove';
-   const restoreLink=releasesLink ? tableView.releaseLink(key) : undefined;
-   const submission=tableView.startAction(item);
+   let restoreLink;
+   const submission=tableView.preserveRecordRowTop(()=>{
+    setCardSubmitting(form,true,recordDetails(item));
+    notice.textContent='';
+    if(action==='remove'){
+     item.dataset.state='Closed';
+     unpark.hidden=true;
+     syncUnread(item,form,false,0);
+    }
+    if(parks) item.dataset.parked=parkForDelivery ? deliveryParking : 'true';
+    if(clearsUnread) item.dataset.unread='false';
+    if(releasesLink) restoreLink=tableView.releaseLink(key);
+    return tableView.startAction(item);
+   });
    const hidUnread=clearsUnread && wasVisible && item.hidden;
+   const showUnparkResult=result=>{
+    const unparked=result.unpark_outcome==='cleared';
+    const message=unparkMessages[result.unpark_outcome] ?? 'Unpark result unavailable';
+    const label='Item #'+item.dataset.number;
+    const hiddenMessage=unparked ? label+' unparked.' : label+': '+message+'.';
+    tableView.showActionResult(item,submission,label,{kind:'success',message,hiddenMessage});
+   };
    try{
     const response=await fetch(location.pathname,{method:'POST',body:data});
+    saved=response.ok;
     refused=!response.ok && (response.status<500 || (!asksQuestion && !parks && action!=='remove'));
+    if(saved && tableView.currentItemRequest(request) && usesWords &&
+       draftStamp===stampAtSubmit && words.value===attempt.words) words.value='';
     const result=await response.json();
+    stale=!tableView.currentItemRequest(request);
+    if(item.listRequest!==request) return;
     if(!response.ok) throw new Error(result.reason || 'HTTP '+response.status);
-    saved=true;
-    nextForm=applySavedState(result,changesParking);
-    const unread=result.unread==='true';
-    const unparked=action==='unpark' && result.unpark_outcome==='cleared';
-    const message=action==='remove' ? 'Removed' : parks ? (parkForDelivery ? 'Parked until delivered' : 'Parked') :
-     action==='unpark' ? (unparkMessages[result.unpark_outcome] ?? 'Unpark result unavailable') :
-     action==='read' ? (unread ? 'Update remains unread' : 'Marked read') :
-     asksQuestion ? (unread ? 'Question saved; update remains unread' : 'Question saved') :
-     action==='tell' && unread ? 'sent to morty; update remains unread' : 'sent to morty';
-    if(usesWords && words.value===data.get('words')) words.value='';
-    if(unparked) until.value='';
-    if(action==='unpark' || parkForDelivery){
-     const label='Item #'+item.dataset.number;
-     const hiddenMessage=parkForDelivery ? label+' parked until delivered.'
-      : unparked ? label+' unparked.' : label+': '+message+'.';
-     tableView.showActionResult(item,submission,label,{kind:'success',message,hiddenMessage});
-    }else{
-     notice.textContent=message;
-     tableView.applyAction();
+    if(stale){
+     if(tableView.openItem?.dataset.key===key) return;
+     tableView.preserveRecordRowTop(()=>{
+      applySavedState(result,{metadataOnly:true});
+      if(action==='unpark') showUnparkResult(result);
+      else tableView.applyAction();
+     });
+     return;
     }
+    const closes=parks || action==='remove' || result.detail_closed;
+    if(closes){
+     tableView.preserveRecordRowTop(()=>{
+      nextForm=applySavedState(result,{keepDetailFocus:changesParking,hasDetail:true});
+      tableView.closeCard(key);
+      tableView.applyAction();
+      if(result.detail_unavailable)
+       tableView.showActionResult(item,submission,'Item '+item.dataset.number,
+        {kind:'failure',message:'Saved; the item could not refresh.'});
+     });
+     return;
+    }
+    tableView.startDeliveryWindow(request,result);
+    let revision=result.detail_revision,text=result.detail_html ?? result.waiting_details_html;
+    if(typeof text!=='string' && ('delivery_pending' in result || revision || result.detail_unavailable)){
+     const response=await fetch(location.pathname,{cache:'no-store',signal:listRequestSignal()});
+     if(!response.ok) throw new Error('The saved item body is unavailable.');
+     const page=new DOMParser().parseFromString(await response.text(),'text/html');
+     const updated=page.querySelector('[data-list-item][data-key="'+CSS.escape(key)+'"]');
+     if(!updated) throw new Error('The saved item is unavailable.');
+     revision=updated.dataset.detailRevision;
+     text=recordDetails(updated).innerHTML;
+    }
+    stale=!tableView.currentItemRequest(request);
+    if(stale) return;
+    const hasDetail=typeof text==='string' && Boolean(revision);
+    tableView.preserveRecordRowTop(()=>{
+     nextForm=applySavedState(result,{keepDetailFocus:changesParking,hasDetail});
+     if(hasDetail){
+      unconfirmed.delete(attempt);
+      retainDraft();
+      installSavedListDetail(request,revision,text);
+     }
+     if(action==='unpark'){
+      if(result.unpark_outcome==='cleared') until.value='';
+      showUnparkResult(result);
+     }else tableView.applyAction();
+     if(wasVisible && item.hidden && tableView.opened.has(key)){
+      const focus=document.activeElement;
+      const inside=recordDetails(item).contains(focus);
+      focusParkedAfterClose=focusUnpark && (inside || focus===document.body);
+      tableView.closeCard(key);tableView.applyAction();
+      if(hadFocus && listOwnsFocus() && (inside || focus===document.body)) focusAfterQuestion(item);
+     }
+    });
    }catch(error){
+    stale=!tableView.currentItemRequest(request);
+    if(item.listRequest!==request) return;
+    if(saved){
+     if(stale) return;
+     tableView.preserveRecordRowTop(()=>{
+      if(parks || action==='remove'){
+       if(action==='remove') closedKeys.add(key);
+       tableView.closeCard(key);
+       tableView.showActionResult(item,submission,'Item '+item.dataset.number,
+        {kind:'failure',message:'Saved; the item could not refresh.'});
+      }else tableView.savedItemError(request);
+     });
+     return;
+    }
     const wasHidden=item.hidden;
-    let restore=refused || releasesLink;
-    if(refused) syncConfirmed();
-    else if(parks || action==='remove'){
-     restore=false;
+    let current;
+    if(!refused && (parks || action==='remove')){
      try{
       const query=new URLSearchParams({'item-state':data.get('id'),keeper:data.get('keeper')});
       if(parks) query.set('park-request',attempt.request);
-      const response=await fetch(location.pathname+'?'+query,{cache:'no-store'});
+      const response=await fetch(location.pathname+'?'+query,{cache:'no-store',signal:listRequestSignal()});
       if(!response.ok) throw new Error('HTTP '+response.status);
-      const current=await response.json();
-      nextForm=applySavedState(current);
-      restore=confirmed.state!=='Closed' && (!parks || current.park_request_saved===false);
-     }catch(_){
-      // Keep the pending row state until a refresh can read the record.
+      current=await response.json();
+     }catch(_){}
+     stale=!tableView.currentItemRequest(request);
+     if(item.listRequest!==request) return;
+    }
+    tableView.preserveRecordRowTop(()=>{
+     let restore=refused || releasesLink,confirmedByReadback=false;
+     if(refused) syncConfirmed(stale);
+     else if(parks || action==='remove'){
+      if(current){
+       applySavedState(current,{metadataOnly:true});
+       restore=confirmed.state!=='Closed' && (!parks || current.park_request_saved===false);
+       confirmedByReadback=confirmed.state==='Closed' || current.park_request_saved===true;
+       if(confirmedByReadback){
+        if(!stale) tableView.closeCard(key);
+        tableView.applyAction();
+       }else if(!stale) presentListDetail(item,current);
+      }else{
+       syncConfirmed(stale);
+       restore=confirmed.state!=='Closed';
+      }
+     }else if(clearsUnread) item.dataset.unread=unreadBefore;
+     if(restore) restoreLink?.();
+     if(!confirmedByReadback){
+      if(!stale && (refused || hidUnread) && !tableView.opened.size) tableView.openCard(key);
+      const message=(refused ? 'Not saved: ' : 'Save not confirmed: ')+error.message;
+      tableView.showActionResult(item,submission,'Item '+item.dataset.number,{kind:'failure',message});
      }
-    }else if(clearsUnread) item.dataset.unread=unreadBefore;
-    if(restore) restoreLink?.();
-    if((refused || hidUnread) && !tableView.opened.size) tableView.openCard(key);
-    const message=(refused ? 'Not saved: ' : 'Save not confirmed: ')+error.message;
-    tableView.showActionResult(item,submission,'Item '+item.dataset.number,{kind:'failure',message});
-    // The return animation now has the confirmed sort keys.
-    if(refused && wasHidden && !item.hidden) tableView.applyAction();
+     // The return animation uses the confirmed sort keys.
+     if(refused && wasHidden && !item.hidden) tableView.applyAction();
+    });
    }
    finally{
     if(saved || refused) unconfirmed.delete(attempt);
-    setCardSubmitting(form,false,item);syncTell();
-    retainDraft();
-    if(nextForm) bindFeedbackForm(nextForm);
-    if(focusUnpark && document.hasFocus() &&
-       (document.activeElement===document.body || document.activeElement===unpark)){
-     const currentUnpark=item.querySelector('[value="unpark"]:not([hidden])');
+    tableView.preserveRecordRowTop(()=>{
+     setCardSubmitting(form,false,stale ? form : recordDetails(item));syncTell();
+     if(!stale) retainDraft();
+     if(nextForm && !stale){
+      bindFeedbackForm(nextForm);
+      if(tableView.currentItemRequest(request))
+       tableView.showDraftCopy(drafts.get(key)?.words,nextForm.elements.words?.type==='textarea');
+     }
+    });
+    if(!stale && focusUnpark && document.hasFocus() &&
+       (focusParkedAfterClose || document.activeElement===document.body || document.activeElement===unpark)){
+     const currentUnpark=recordDetails(item).querySelector('[value="unpark"]:not([hidden])');
      const target=saved && item.hidden ? content.querySelector('[data-filter-row="show"] [aria-pressed="true"]')
       : currentUnpark ?? item.querySelector('.list-toggle');
      if(target?.getClientRects().length){
@@ -1569,111 +1772,153 @@ function bindFeedbackForm(form){
       }
      }
     }
-    if(parkForDelivery && saved && item.hidden && listOwnsFocus() && document.activeElement===document.body){
-     content.querySelector('[data-filter-row="show"] [aria-pressed="true"]')?.focus({preventScroll:true});
-    }
-    if(!saved && parks){
+    if(!stale && !saved && parks){
      await tableView.settled();
      if(listOwnsFocus() && document.activeElement===document.body && parkToggle.getClientRects().length && !parkToggle.disabled){
       parkToggle.focus({preventScroll:true});
      }
     }
-    if(hadFocus && !item.hidden && document.activeElement===document.body)
+    if(!stale && hadFocus && !item.hidden && document.activeElement===document.body)
      await tableView.rowSettled(item);
     saving--;
     if(hadFocus){
      document.removeEventListener('focusin',trackFocus);
-     if(listOwnsFocus()){
-      if(item.hidden && (!focusChoice || item.contains(focusChoice))) focusAfterQuestion(item);
+     if(!stale && listOwnsFocus()){
+      if(item.hidden && (!focusChoice || recordDetails(item).contains(focusChoice))) focusAfterQuestion(item);
       else if(!focusChoice?.isConnected && !item.hidden && document.activeElement===document.body){
        const target=!saved && submitter?.matches(':enabled') ? submitter : item.querySelector('.list-toggle');
        target.focus({preventScroll:true});
       }
      }
     }
-    refreshAfterListSave((saved && (changesParking || item.dataset.waitingForAnswer!=='true')) ||
+    refreshAfterListSave(stale || Boolean(tableView.deliveryRequest()) ||
+      (saved && (changesParking || action==='remove' || item.dataset.waitingForAnswer!=='true')) ||
       (!saved && !refused && (parks || action==='remove')));
    }
   });
 }
 let listCounts=null,reviewSaveVersion=0;
+const listCountsSource=()=>content.querySelector('[data-list-counts-url]');
+function presentReviewLinks(row,links){
+ const target=recordDetails(row).querySelector('[data-list-review-links]');
+ if(target && links && target.innerHTML!==links.innerHTML)
+  tableView.updateItemDetail(row,detail=>detail.querySelector('[data-list-review-links]').replaceChildren(...links.childNodes));
+}
+function rowIn(root,key){
+ return root.querySelector('[data-list-item][data-key="'+CSS.escape(key)+'"]');
+}
 function loadListCounts(){
- const source=content.querySelector('[data-list-counts-url]');
+ const source=listCountsSource();
  if(!source || listCounts) return listCounts;
- listCounts=readListCounts(source);
+ listCounts=refreshListCounts(source);
  return listCounts;
 }
 async function readListCounts(source){
+ try{
+  const response=await fetch(source.dataset.listCountsUrl,{cache:'no-store',signal:listRequestSignal()});
+  if(response.ok) return await response.text();
+ }catch(_){}
+ return undefined;
+}
+async function refreshListCounts(source){
  const pendingRows=()=>[...content.querySelectorAll('[data-list-review-version]')];
- const versions=new Map(pendingRows()
-  .map(row=>[row.dataset.key,row.dataset.listReviewVersion]));
+ const versions=new Map(pendingRows().map(row=>[row.dataset.key,row.dataset.listReviewVersion]));
  const saveVersion=reviewSaveVersion;
  const wasRequested=row=>saveVersion===reviewSaveVersion &&
   versions.get(row.dataset.key)===row.dataset.listReviewVersion;
  try{
-  const signal=AbortSignal.timeout(Number(content.dataset.requestTimeoutSeconds)*1000);
-  const response=await fetch(source.dataset.listCountsUrl,{cache:'no-store',signal});
-  if(!response.ok) return;
-  const markup=await response.text();
-  const footer=content.querySelector('[data-list-counts-url]');
-  if(signal.aborted || !footer) return;
-  footer.innerHTML=markup;
-  const updates=new Map([...footer.querySelectorAll('template[data-list-review-key]')]
-   .map(update=>[update.dataset.listReviewKey,update]));
-  if(updates.size) for(const row of pendingRows().filter(wasRequested)){
-   const update=updates.get(row.dataset.key);
-   if(!update || update.dataset.listReviewVersion!==row.dataset.listReviewVersion) continue;
-   for(const selector of ['[data-list-review-summary]','[data-list-review-links]']){
-    const target=row.querySelector(selector),source=update.content.querySelector(selector);
-    if(target && source) target.replaceChildren(...source.childNodes);
-   }
-   delete row.dataset.listReviewVersion;
-  }
-  for(const update of updates.values()) update.remove();
+  const markup=await readListCounts(source);
+  if(source!==listCountsSource()) return;
+  const rows=pendingRows().filter(wasRequested);
+  tableView.preserveRecordRowTop(()=>updateLinkedRows(rows,fillListCounts(source,markup)));
  }catch(_){}finally{
   listCounts=null;
-  const pending=pendingRows();
-  for(const row of pending.filter(wasRequested)){
-   const summary=row.querySelector('[data-list-review-summary]');
+  if(source!==listCountsSource() || pendingRows().some(row=>!wasRequested(row))) await loadListCounts();
+ }
+}
+function fillListCounts(footer,markup){
+ if(markup!==undefined) footer.innerHTML=markup;
+ const updates=new Map();
+ for(const update of footer.querySelectorAll('template[data-list-review-key]')){
+  updates.set(update.dataset.listReviewKey,update);
+  update.remove();
+ }
+ return updates;
+}
+function updateLinkedRows(rows,updates){
+ for(const row of rows){
+  const version=row.dataset.listReviewVersion;
+  if(!version) continue;
+  const update=updates.get(row.dataset.key);
+  const summary=row.querySelector('[data-list-review-summary]');
+  if(!update || update.dataset.listReviewVersion!==version){
    if(summary) summary.textContent=summary.dataset.listReviewSummary;
+   continue;
   }
-  if(pending.some(row=>!wasRequested(row))) await loadListCounts();
+  if(summary){
+   summary.replaceChildren(...update.content.querySelector('[data-list-review-summary]').childNodes);
+   summary.dataset.listReviewSummary='';
+  }
+  const links=update.content.querySelector('[data-list-review-links]');
+  presentReviewLinks(row,links);
+  delete row.dataset.listReviewVersion;
  }
 }
 async function refresh(_supersede=false,current=()=>true){
- if(saving || dateTimePickerOpen(content)) return;
- const signal=AbortSignal.timeout(Number(content.dataset.requestTimeoutSeconds)*1000);
- const response=await fetch(location.pathname,{cache:'no-store',signal});
+ if(saving || dateTimePickerOpen(document)) return;
+ const signal=listRequestSignal();
+ const delivery=tableView.deliveryRequest();
+ const query=delivery ? '?'+new URLSearchParams({delivery:delivery.delivery}) : '';
+ const response=await fetch(location.pathname+query,{cache:'no-store',signal});
  if(!response.ok) throw new Error('HTTP '+response.status);
  const page=new DOMParser().parseFromString(await response.text(),'text/html');
  const fresh=page.querySelector('[data-list]');
  if(!fresh) throw new Error('The page has no list.');
  await tableView.settled();
- if(saving || dateTimePickerOpen(content) || !current()) return;
+ if(saving || dateTimePickerOpen(document) || !current()) return;
  refreshNeeded=false;
- const top=scrollY,field=listOwnsFocus() ? document.activeElement : null;
+ const revealCreated=createdItem && rowIn(fresh,createdItem);
+ if(revealCreated && tableView.openItem){
+  tableView.closeCard(tableView.openItem.dataset.key);
+  tableView.applyAction();
+ }
+ tableView.preserveRecordRowTop(()=>applyListSnapshot(fresh));
+ if(delivery && response.headers?.get('X-Item-Delivery-Pending')==='false')
+  tableView.finishDeliveryWindow(delivery);
+ return pageRefreshFacts(page);
+}
+function applyListSnapshot(fresh){
+ const field=listOwnsFocus() && content.contains(document.activeElement) ? document.activeElement : null;
  const focus=field?.id,start=field?.selectionStart,end=field?.selectionEnd;
  const direction=field?.selectionDirection;
  const reviewLink=field?.matches('[data-list-review-card]') ? reviewLinkPlace(field) : null;
  const action=field?.matches('button[name="action"]') ? field.value : '';
  const focusedRow=action || field?.matches('.list-toggle') ? field.closest('[data-list-item]')?.dataset.key : '';
- rememberLogPositions();
- const surviving=new Set([...fresh.querySelectorAll('[data-list-item]')].map(item=>item.dataset.key));
- for(const key of logPositions.keys()) if(!surviving.has(key)) logPositions.delete(key);
+ recordDetails(tableView.openItem)?.querySelector('[data-feedback-form]')?.retainDraft?.();
+ holdLog();
  const footer=content.querySelector('[data-list-counts-url]'),nextFooter=fresh.querySelector('[data-list-counts-url]');
- if(footer && nextFooter) nextFooter.replaceChildren(...footer.childNodes);
+ if(footer && nextFooter && !nextFooter.childNodes.length)
+  nextFooter.replaceChildren(...footer.childNodes);
  restoreEvidenceDetails(fresh);
+ const key=tableView.openItem?.dataset.key;
+ const nextItem=key && rowIn(fresh,key);
+ if(key && !nextItem) tableView.closeCard(key);
+ const links=nextItem && !nextItem.dataset.listReviewVersion &&
+  recordDetails(nextItem).querySelector('[data-list-review-links]');
  content.replaceWith(fresh);content=fresh;
- void loadListCounts();
  closedKeys=new Set(JSON.parse(content.dataset.closedKeys));
  bindListControls();tableView.replace();
- if(focus){const field=document.getElementById(focus);field?.focus({preventScroll:true});
+ const openItem=tableView.openItem;
+ if(links && openItem?.dataset.key===key) presentReviewLinks(openItem,links);
+ restoreLog();
+ if(field?.isConnected) field.focus({preventScroll:true});
+ else if(focus){const field=document.getElementById(focus);field?.focus({preventScroll:true});
   if(typeof field?.setSelectionRange==='function' && typeof start==='number' && typeof end==='number')
    field.setSelectionRange(start,end,direction);}
- if(reviewLink) restoreReviewLink(reviewLink);
- if(focusedRow){
+ if(reviewLink && !field?.isConnected) restoreReviewLink(reviewLink);
+ if(focusedRow && !field?.isConnected){
   const row=[...content.querySelectorAll('[data-list-item]')].find(item=>item.dataset.key===focusedRow && !item.hidden);
-  const button=action && row?.querySelector('[data-detail]:not([hidden]) button[name="action"][value="'+CSS.escape(action)+'"]:enabled');
+  const button=action && recordDetails(row)?.querySelector('button[name="action"][value="'+CSS.escape(action)+'"]:enabled');
   (button || row?.querySelector('.list-toggle') || content.querySelector('#list-search')).focus({preventScroll:true});
  }
  if(createdItem && content.querySelector('[data-list-item][data-key="'+CSS.escape(createdItem)+'"]')){
@@ -1682,8 +1927,8 @@ async function refresh(_supersede=false,current=()=>true){
   history.replaceState(history.state,'',place);
   createdItem='';
   tableView.followItemLink({inheritFilters:true});
- } else scrollTo({top,behavior:'instant'});
- return pageRefreshFacts(page);
+ }
+ void loadListCounts();
 }
 const reviewDialog=document.querySelector('[data-list-review-dialog]');
 const reviewClose=reviewDialog.querySelector('button');
@@ -1708,14 +1953,16 @@ function fitReviewDialog(){
  };
 }
 function reviewLinkPlace(link){
- const row=link.closest('[data-list-item]'),href=link.getAttribute('href');
+ const row=recordFromDetail(link),href=link.getAttribute('href');
  const selector='[data-list-review-card][href="'+CSS.escape(href)+'"]';
- return {key:row.dataset.key,selector,position:[...row.querySelectorAll(selector)].indexOf(link)};
+ const detail=recordDetails(row).contains(link),scope=detail ? recordDetails(row) : row;
+ return {key:row.dataset.key,selector,detail,position:[...scope.querySelectorAll(selector)].indexOf(link)};
 }
-function restoreReviewLink({key,selector,position}){
+function restoreReviewLink({key,selector,detail,position}){
  const findRow=()=>content.querySelector('[data-list-item][data-key="'+CSS.escape(key)+'"]:not([hidden])');
  const visibleLink=row=>{
-  const link=row?.querySelectorAll(selector)[position];
+  const scope=detail ? recordDetails(row) : row;
+  const link=scope?.querySelectorAll(selector)[position];
   return link?.getClientRects().length ? link : null;
  };
  const row=findRow(),link=visibleLink(row);
@@ -1763,13 +2010,7 @@ if(listHost) new MutationObserver(()=>{
  if(!form?.elements.feedback?.value && !form?.elements.later?.value && !doc?.querySelector('[data-review-draft]'))
   closeReviewCard();
 }).observe(listHost,{attributes:true,attributeFilter:['hidden']});
-reviewClose.addEventListener('click',()=>closeReviewCard());
-reviewDialog.addEventListener('cancel',event=>{event.preventDefault();closeReviewCard();});
-let pressedBackdrop=false;
-reviewDialog.addEventListener('pointerdown',event=>{pressedBackdrop=event.target===reviewDialog;});
-reviewDialog.addEventListener('click',event=>{
- if(pressedBackdrop && event.target===reviewDialog) closeReviewCard();
-});
+bindConsoleDialog(reviewDialog,closeReviewCard);
 document.addEventListener('click',event=>{
  const link=event.target instanceof Element && event.target.closest('a[data-list-review-card]');
  if(!link || event.defaultPrevented || event.button!==0 || event.ctrlKey || event.metaKey || event.shiftKey || event.altKey) return;
@@ -1799,7 +2040,6 @@ document.addEventListener('click',event=>{
   refreshAfterListSave(false);
  });
  reviewDialog.append(frame);
- pressedBackdrop=false;
  reviewDialog.showModal();
 });
 tableView.place();
@@ -1807,6 +2047,11 @@ tableView.bind();bindListControls();tableView.apply(true);
 addEventListener('popstate',tableView.restorePlace);
 addEventListener('hashchange',tableView.restorePlace);
 const pageRefresh=createPageRefresh(refresh,()=>content.dataset.refreshSeconds);
+document.addEventListener('review-item-saved',event=>{
+ if(typeof event.detail?.list_key!=='string' || !event.detail.list_key) return;
+ listSaveVersion++;
+ refreshAfterListSave(true);
+});
 document.addEventListener('review-item-created',event=>{
  if(typeof event.detail?.list_key!=='string') return;
  createdItem=event.detail.list_key;

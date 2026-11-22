@@ -7,7 +7,6 @@ from scripts.lint.memory_test_support import write_config_fixture
 
 import contextlib
 import fcntl
-import hashlib
 import io
 import json
 import math
@@ -41,7 +40,7 @@ from scripts.build_hold import build_hold, hold_enforcer, shared_state_defaults
 from scripts.direct import progress_history
 from scripts.lib import atomic_file, conf, process_group, process_start, unit_runs
 from scripts.lib.atomic_file import write_text_atomic
-from scripts.herdr import herdr, herdr_types, turn_end, worker_panes
+from scripts.herdr import herdr, herdr_types, pass_notices, turn_end, worker_panes
 from scripts.herdr.worker_panes import worker_run
 from scripts.herdr import test_worker_panes as pane_support
 from scripts.message import roster, send, sessions
@@ -3250,7 +3249,7 @@ class PaneRunDeliveryTests(unittest.TestCase):
                         nonlocal locks
                         locks += 1
                         if locks == 2:
-                            self.assertTrue(progress_history.stopped_notice_delivered(self.run_dir, dispatch))
+                            self.assertTrue(pass_notices.is_settled(self.run_dir, dispatch, "stopped"))
                             if later == "new prompt":
                                 agent.append(pane, "user", "Check another file.")
                                 self.fixture.world.locations[pane]["agent_status"] = "working"
@@ -3273,9 +3272,7 @@ class PaneRunDeliveryTests(unittest.TestCase):
                         self.assertEqual(turn_end.handle(event), turn_end.TurnOutcome.STOPPED)
                     if later == "new prompt":
                         self.assertEqual(errors.getvalue().splitlines(), ["impl: kept pane: agent state is working"])
-                        digest = hashlib.sha256(dispatch.encode()).hexdigest()
-                        diagnostic_path = self.run_dir / f".{digest}.completion-diagnostics.json"
-                        self.assertEqual(worker_lifecycle.read_json_object(diagnostic_path),
+                        self.assertEqual(self.stopped_diagnostics(dispatch),
                                          {"impl: kept pane: agent state is working": True})
                         self.assertEqual(agent.notices[1], "impl: kept pane: agent state is working")
                         self.assertEqual(agent.notice_senders[-1], send.CodexSender(str(row.current_session)))
@@ -3312,12 +3309,16 @@ class PaneRunDeliveryTests(unittest.TestCase):
                     self.assertEqual(len(agent.notices), notice_count)
                     self.assertEqual(reply_path.read_bytes(), saved_reply)
 
+    def stopped_diagnostics(self, dispatch: str) -> dict[str, bool]:
+        record = pass_notices.read(self.run_dir, dispatch)
+        assert record is not None
+        return {notice.text: notice.settled for notice in record.notices.values()
+                if notice.kind == pass_notices.NoticeKind.DIAGNOSTIC}
+
     def check_stopped_diagnostic_retry(self, agent: test_worker.DispatchAgent, row: staff.StaffRow,
                                        pane: str, dispatch: str, event: turn_end.WorkerEvent,
                                        *, reassign: bool, assign_during_retry: bool = False) -> None:
         message = "impl: kept pane: agent state is working"
-        digest = hashlib.sha256(dispatch.encode()).hexdigest()
-        diagnostic = self.run_dir / f".{digest}.completion-diagnostics.json"
         self.fixture.world.locations[pane]["agent_status"] = "working"
         deliver = send.send
 
@@ -3330,7 +3331,7 @@ class PaneRunDeliveryTests(unittest.TestCase):
               contextlib.redirect_stderr(io.StringIO()),
               self.assertRaisesRegex(ValueError, "private diagnostic send failed")):
             _ = turn_end.handle(event)
-        self.assertEqual(worker_lifecycle.read_json_object(diagnostic), {message: False})
+        self.assertEqual(self.stopped_diagnostics(dispatch), {message: False})
         self.assertEqual(len(agent.notices), 1)
         self.assertIn("phase 40: stopped", agent.notices[0])
 
@@ -3375,7 +3376,7 @@ class PaneRunDeliveryTests(unittest.TestCase):
             with patch.object(send, "send", side_effect=assign_before_delivery):
                 self.assertEqual(turn_end.handle(event), turn_end.TurnOutcome.STOPPED)
                 self.assertEqual(turn_end.handle(event), turn_end.TurnOutcome.IGNORED)
-            self.assertEqual(worker_lifecycle.read_json_object(diagnostic), {message: True})
+            self.assertEqual(self.stopped_diagnostics(dispatch), {message: True})
             self.assertEqual(agent.notices[1:], [message])
             self.assertEqual(agent.submitted[-1][0], pane)
             passed = worker_panes.worker_pass(row, self.run_dir)
@@ -3385,7 +3386,7 @@ class PaneRunDeliveryTests(unittest.TestCase):
 
         before = (self.run_dir / unit_runs.STATE_FILE).read_bytes()
         self.assertEqual(turn_end.handle(event), turn_end.TurnOutcome.STOPPED)
-        self.assertEqual(worker_lifecycle.read_json_object(diagnostic), {message: True})
+        self.assertEqual(self.stopped_diagnostics(dispatch), {message: True})
         self.assertEqual(turn_end.handle(event), turn_end.TurnOutcome.STOPPED)
         self.assertEqual(agent.notices[1:], [message])
         self.assertIn(pane, self.fixture.world.locations)
@@ -3583,7 +3584,8 @@ class PaneRunDeliveryTests(unittest.TestCase):
             turn_reply = new_reply.with_stem(new_reply.stem + "_turn")
             self.assertEqual(turn_reply.read_text().rstrip(), replacement_reply)
             self.assertEqual(len(agent.notices), 2)
-            self.assertIn(f"{row.name}: pass {replacement}: no DONE.", agent.notices[-1])
+            self.assertIn(f"{row.name}: phase 40: no DONE; reply {turn_reply}", agent.notices[-1])
+            self.assertIn(f"pass {replacement}", agent.notices[-1])
             self.assertIn(replacement_reply, agent.notices[-1])
             return
         if later_user_message:
@@ -3645,7 +3647,8 @@ class PaneRunDeliveryTests(unittest.TestCase):
         self.assertNotIn(str(state), lines[0])
         self.assertEqual(reply.with_stem("reply_turn").read_text().rstrip(), result)
         self.assertEqual(len(agent.notices), 1)
-        self.assertIn(f"{row.name}: pass {dispatch}: no DONE.", agent.notices[0])
+        self.assertIn(f"{row.name}: phase 40: no DONE", agent.notices[0])
+        self.assertIn(f"pass {dispatch}", agent.notices[0])
         self.assertIn(result, agent.notices[0])
 
     def test_supervisor_waits_for_the_stopped_group_after_the_leader_exits(self) -> None:
