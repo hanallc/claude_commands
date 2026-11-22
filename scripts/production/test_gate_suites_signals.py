@@ -549,7 +549,7 @@ gate.run_gate_suites = whole_gate
                         later = self.commit(self.checkout, "Add an unrelated later commit")
                         refused = self.run_gate("--tests-only", "--full", own_process=True)
                         self.assertEqual(refused.returncode, 1, refused.stdout + refused.stderr)
-                        self.assertIn("differs from the recorded merge", refused.stderr)
+                        self.assertIn(f"rollback kept HEAD {later}: it differs from the gate merge", refused.stderr)
                         self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), later)
                         self.assertTrue(record_path.is_file())
                         _ = self.git(self.checkout, "reset", "--hard", merged)
