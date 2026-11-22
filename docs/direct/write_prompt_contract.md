@@ -38,7 +38,8 @@ Codex review prompts also include section 3's command block.
    other command as
    `~/.claude/scripts/lib/py ~/.claude/scripts/agents/detached_runs.py start --label "<what>" -- <command>`.
    For Python test runs, pass `--kind python-tests` before `--`.
-   To limit memory, use `systemd-run --user --scope -q -p MemoryMax=<cap> -- <command>` as the detached command.
+   To limit memory, use `systemd-run --user --scope --collect -q -p MemoryMax=<cap> -- <command>`.
+   Include `--collect` in each `systemd-run` command that starts a transient unit.
    A successful start returns at once with the run, its pid and its log.
    A live twin takes priority over config/detached_runs.conf LIVE_RUN_LIMIT.
    Exit 4 refuses a new run at that limit and names the live runs.
@@ -129,7 +130,8 @@ Codex review prompts also include section 3's command block.
     3. While editing, use `verify.sh check`. Lint runs once, at the phase gate.
     ```
 
-    Run `targeted_test.py` for a unit. Run `merge_gate.py --tests-only` for a merge. Require each worker's listed tests before its checkpoint.
+    Run `gate.py --affected` for a unit. Run `gate.py --tests-only` for a merge.
+    Require each worker's listed tests before its checkpoint.
 </WritePromptContract>
 
 <MergeWorkerCommands>

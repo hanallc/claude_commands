@@ -12,20 +12,20 @@ from typing import cast, final, override
 from contextlib import AbstractContextManager, redirect_stderr, redirect_stdout
 from unittest import mock
 from scripts.lib import scratch
-from scripts.production import change_review, merge_gate, staff
+from scripts.production import change_review, gate, staff
 from scripts.production.gate_modules import GateRefused
 from scripts.production.test_change_review import ProducerFixture
 from scripts.production.staff_test_support import isolated_source_readers, source_environment
-from scripts.production.merge_gate_test_support import MergeGateFixture, SUITE_MODULE, gate_suites
+from scripts.production.gate_test_support import MergeGateFixture, SUITE_MODULE, gate_suites
 
 
 @final
 class MergeGateTests(MergeGateFixture):
     def test_gate_requires_an_explicit_mode(self) -> None:
         with redirect_stderr(io.StringIO()) as errors, self.assertRaises(SystemExit) as refusal:
-            _ = merge_gate.main(["--checkout", str(self.checkout)])
+            _ = gate.main(["--checkout", str(self.checkout)])
         self.assertEqual(refusal.exception.code, 2)
-        self.assertIn("choose --tests-only, --promote-only, or --nightly", errors.getvalue())
+        self.assertIn("choose --tests-only, --affected, --promote-only, or --nightly", errors.getvalue())
         self.assertEqual(self.module_events(), [])
         self.assert_not_pushed()
 
@@ -42,7 +42,7 @@ class MergeGateTests(MergeGateFixture):
                                   copy_commit=commit, target_mode="none", seed_source="", borrows_from="")
         observed: list[Path] = []
 
-        def suites(repo: Path, *_arguments: object, **_keywords: object) -> merge_gate.GateRun:
+        def suites(repo: Path, *_arguments: object, **_keywords: object) -> gate.GateRun:
             self.assertEqual(repo, checkout)
             with scratch.busy_path(repo).open("a") as contender:
                 with self.assertRaises(BlockingIOError):
@@ -51,7 +51,7 @@ class MergeGateTests(MergeGateFixture):
             observed.append(repo)
             raise GateRefused("injected suite stop")
 
-        with mock.patch.object(merge_gate, "run_suites", side_effect=suites):
+        with mock.patch.object(gate, "run_suites", side_effect=suites):
             result = self.run_gate("--tests-only", "--checkout", str(checkout))
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("injected suite stop", result.stderr)
@@ -71,7 +71,7 @@ class MergeGateTests(MergeGateFixture):
         self.assertEqual(self.pass_records()[0]["suites"], ["folder_from_the_checkout"])
 
     def test_module_folders_are_removed_after_success_and_preparation_error(self) -> None:
-        prepare = merge_gate.test_module_environment
+        prepare = gate.test_module_environment
         for fails in (False, True):
             with self.subTest(raises=fails):
                 folders: list[Path] = []
@@ -85,7 +85,7 @@ class MergeGateTests(MergeGateFixture):
                     self.assertEqual(prepared["HERDR_BIN"], "/nonexistent/herdr")
                     return prepared
 
-                with mock.patch.object(merge_gate, "test_module_environment", side_effect=prepare_module):
+                with mock.patch.object(gate, "test_module_environment", side_effect=prepare_module):
                     if fails:
                         with self.assertRaisesRegex(RuntimeError, "module preparation failed"):
                             _ = self.run_gate("--tests-only", "--full")
@@ -114,7 +114,7 @@ class MergeGateTests(MergeGateFixture):
                               [[runner, str(folder), nested.name]
                                for folder in (nested.parent, nested.parent.parent)] * 2)
         self.assertTrue(all(call["cwd"] == str(self.checkout) for call in launches))
-        timings = merge_gate.read_measures(self.state / "runner" / "module_seconds.json")
+        timings = gate.read_measures(self.state / "runner" / "module_seconds.json")
         self.assertEqual(set(timings), {"hooks/test_first.py", "hooks/tests/test_first.py"})
         self.assertEqual(self.pass_records()[0]["suites"], ["hooks"])
 
@@ -150,7 +150,7 @@ class MergeGateProducerTests(ProducerFixture):
 
     def test_record_changes_writes_the_checkpoint_units_staff_id(self) -> None:
         merged = self.merge()
-        merge_gate.record_changes(self.repo, self.listing, self.doc, "main")
+        gate.record_changes(self.repo, self.listing, self.doc, "main")
         self.assertEqual(change_review.pending(self.listing)[0]["Producer"], self.unit.id)
         assert isinstance(self.unit.parent, staff.ReportsTo)
         self.assertEqual(change_review.pending(self.listing)[0]["Production"], self.unit.parent.id)
@@ -160,7 +160,7 @@ class MergeGateProducerTests(ProducerFixture):
             _ = self.listing.unlink()
             record = staff.StaffSnapshot(tuple(row for row in staff.snapshot().rows if row.id != self.unit.id))
             with mock.patch.object(staff, "snapshot", return_value=record):
-                merge_gate.record_changes(self.repo, self.listing, self.doc, "main",
+                gate.record_changes(self.repo, self.listing, self.doc, "main",
                     known_producer=change_review.KnownMergeProducer(merged, self.unit.id))
             self.assertEqual(change_review.pending(self.listing)[0]["Producer"], self.unit.id)
             self.assertEqual(self.listing.read_bytes(), before)
@@ -170,7 +170,7 @@ class MergeGateProducerTests(ProducerFixture):
         output = io.StringIO()
         with (mock.patch.object(staff, "snapshot", return_value=record), redirect_stdout(output)):
             _ = self.merge()
-            merge_gate.record_changes(self.repo, self.listing, self.doc,
+            gate.record_changes(self.repo, self.listing, self.doc,
                                       "main")
         self.assertEqual(change_review.pending(self.listing)[0]["Producer"], "")
         notes = [line for line in output.getvalue().splitlines() if line.startswith("change review: no staff row")]

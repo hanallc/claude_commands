@@ -502,7 +502,7 @@ Each local Promote checkout must exist before the command pushes.
 - **Unit targeted tests.** A unit runs `scripts/production/targeted_test.py --checkout TREE`.
   It uses the shared runner with affected-module selection.
 - **The `~/.claude` repo's own gate.** `scripts/production/merge_checkpoint.py` manages the merge and uses the gate result to decide whether to publish it.
-  `scripts/production/merge_gate.py --tests-only` runs the tests under a memory governor.
+  `scripts/production/gate.py --tests-only` runs the tests under a memory governor.
   `--nightly` also runs basedpyright.
   The gate sorts test paths and uses the first folder under `scripts/` as the suite.
   Test modules use `builds.slice` scopes when available.
