@@ -481,11 +481,13 @@ class LocalVersionPreflightTests(unittest.TestCase):
                         _ = (root / "box-tools.json").write_text('{"versions":{"rustc":"rustc 1.99.0"}}')
                         _ = offload.run_offload(controller, config, request, 1)
                         claim.assert_called_once_with(controller, config, request, HANA, mock.ANY,
-                                                      mac_repository=claim_state.WHOLE_MAC)
+                                                      mac_repository=claim_state.NO_SAVED_MAC_REPOSITORY,
+                                                      retire_wait=False)
                         self.assertFalse(eligibility.linux_version_decline_path("linux", HANA.name).exists())
                 else:
                     claim.assert_called_once_with(controller, config, request, HANA, mock.ANY,
-                                                  mac_repository=claim_state.WHOLE_MAC)
+                                                  mac_repository=claim_state.NO_SAVED_MAC_REPOSITORY,
+                                                  retire_wait=False)
                     self.assertFalse(offload.linux_version_declined_recently("linux", HANA.name, 60, 100))
             scripts_copy.assert_not_called()
             tree_copy.assert_not_called()
@@ -1012,6 +1014,17 @@ class BusyHolderTests(unittest.TestCase):
 class VerifyMirrorWaitTests(verify_mac_offload_test_support.VerifyMacOffloadFixture):
     def test_verify_waits_and_names_the_busy_mirror_session(self) -> None:
         _ = self.routing_fixture()
+        git = self.bin_directory / "git"
+        origin = """if [[ "$*" == *' remote get-url origin' ]]; then
+    printf '%s\\n' 'https://fixture.invalid/case.git'
+    exit 0
+fi
+"""
+        script = git.read_text().replace("#!/bin/bash\n", "#!/bin/bash\n" + origin, 1)
+        self.write_executable(git, script)
+        mac_host = conf.read(self.root / "machines.conf").words("mac.hosts")[0]
+        with (self.root / "build_folders.conf").open("a", encoding="utf-8") as settings:
+            _ = settings.write(f"\n# whole: 1..\nslots.{mac_host}.{self.root.name}.max=1\n")
         holder = "last recorded mirror session reader (mirror process check)"
         self.environment.update({"TEST_FREE_NOW_FREE": "1", "TEST_RUNNER_HOLDER": holder})
         process = self.start_routing()
@@ -1771,7 +1784,16 @@ class OffloadCommandTests(OffloadCommandFixture):
         _ = (snapshot / "Cargo.toml").write_text('[package]\nname="staged"\nversion="0.1.0"\n')
         _ = (self.repository / ".gitignore").write_text("staged-file.rs\n")
         _ = (snapshot / "staged-file.rs").write_text("staged source")
-        result = self.command("--workspace", verb="doc", source=offload.StagedDocSnapshot(snapshot))
+        git_environment = {name: value for name, value in self.environment.items() if not name.startswith("GIT_")}
+        git_environment.update({"GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"})
+        git = ["git", "-C", str(snapshot), "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
+               "-c", "core.hooksPath=/dev/null"]
+        _ = subprocess.run([*git, "init", "-q"], check=True, env=git_environment)
+        _ = subprocess.run([*git, "add", "--", "Cargo.toml", "staged-file.rs"], check=True, env=git_environment)
+        _ = subprocess.run([*git, "commit", "-qm", "Staged doc source", "--no-gpg-sign"],
+                           check=True, env=git_environment)
+        snapshot_source = offload.StagedDocSnapshot(snapshot)
+        result = self.command("--workspace", verb="doc", source=snapshot_source)
         self.assertEqual(result.returncode, 0, result.stdout)
         copied, = self.events_for("rsync")
         self.assertIn(str(snapshot) + "/", copied["args"])
@@ -1779,7 +1801,6 @@ class OffloadCommandTests(OffloadCommandFixture):
         self.assertNotIn("/staged-file.rs", copied.get("exclude", ""))
         self.config["linux_only.hana"] = "staged"
         self.sync_config()
-        snapshot_source = offload.StagedDocSnapshot(snapshot)
         result = self.command("--workspace", verb="doc", package="", source=snapshot_source)
         self.assertEqual(result.returncode, 0, result.stdout)
         self.assertEqual(len(self.events_for("rsync")), 2)
@@ -2058,17 +2079,19 @@ class BackoffReadTests(unittest.TestCase):
     def test_a_passed_backoff_decides_eligibility_without_a_read(self) -> None:
         config = eligibility.OffloadConfig(True, eligibility.SshConnectionSettings("dummy", 1, 1), 1, 1, 1, "1",
                                        {"linux_only.hana": ""})
+        root = Path("/fixture/hana")
+        key = "https://fixture.invalid/hana"
+        mirror = claim_state.ResolvedMacMirror(key, "hana", "hana.json", "hana", str(root), key)
         cases: tuple[tuple[eligibility.BackoffState, eligibility.KnownRepository | eligibility.IneligibleMacStep], ...] = (
             (eligibility.UnreadableBackoff("bad"), eligibility.IneligibleMacStep("state")),
             (eligibility.ACTIVE_BACKOFF, eligibility.IneligibleMacStep("backoff")),
-            (eligibility.NO_BACKOFF, HANA),
+            (eligibility.NO_BACKOFF, eligibility.KnownRepository("hana", key)),
         )
-        with mock.patch.object(eligibility, "repository_identity", return_value=HANA), \
-             mock.patch.object(eligibility, "read_backoff", side_effect=AssertionError("backoff was passed")):
+        with mock.patch.object(eligibility, "read_backoff", side_effect=AssertionError("backoff was passed")):
             for backoff, expected in cases:
                 with self.subTest(backoff=type(backoff).__name__):
-                    self.assertEqual(eligibility.mac_step_eligibility(config, Path("/fixture/hana"), "hana", "nextest",
-                                                                  backoff=backoff), expected)
+                    self.assertEqual(eligibility.mac_step_eligibility(config, root, "hana", "nextest",
+                                                                  backoff=backoff, mac_repository=mirror), expected)
 
 if __name__ == "__main__":
     _ = unittest.main()

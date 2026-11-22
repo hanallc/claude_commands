@@ -450,7 +450,8 @@ class OffloadCommandFixture(unittest.TestCase):
 
     def assignment_options(self, repository: Path, verb: eligibility.MacVerb,
                            settings: Path | eligibility.DefaultMacSettings,
-                           runner_options: tuple[str, ...], *, environment: dict[str, str] | None = None) -> list[str]:
+                           runner_options: tuple[str, ...], *, environment: dict[str, str] | None = None,
+                           source: offload.MacSource = WORKING_TREE_SOURCE) -> list[str]:
         """Give command fixtures one real queue assignment before the adapter starts."""
         if "--assignment-file" in runner_options:
             return []
@@ -470,10 +471,11 @@ class OffloadCommandFixture(unittest.TestCase):
                  if provider == "mac" else claim_state.RepositoryScope(repository.name, "", 1))
         destination = placement.PlacementDestination(provider, target, host, scope, 1 if provider == "ssh" else 0)
         local = admission.request(owner=owner, episode=uuid.uuid4().hex, step=verb)
-        source_key = treekey.tree_key(str(repository))
-        source = (execution_identity.SourceKeyKnown(source_key) if source_key is not None
-                  else execution_identity.SourceKeyUnavailable("the fixture has no tree key"))
-        constraints = placement.PlacementConstraints(source, ("cargo", verb), str(repository), "hana",
+        source_path = source.root if isinstance(source, offload.StagedDocSnapshot) else repository
+        source_key = treekey.tree_key(str(source_path))
+        source_identity = (execution_identity.SourceKeyKnown(source_key) if source_key is not None
+                           else execution_identity.SourceKeyUnavailable("the fixture has no tree key"))
+        constraints = placement.PlacementConstraints(source_identity, ("cargo", verb), str(repository), "hana",
             session_owner.owning_session(self.environment if environment is None else environment),
             (placement.PlacementCandidate(destination),), placement.PinnedHost(target))
         request = wire.PlacementRequest(local.episode, placement.SubmittingOwner(admission.server.host, owner.pid, owner.start_time),
@@ -560,7 +562,7 @@ class OffloadCommandFixture(unittest.TestCase):
         if last_decline:
             arguments.extend(["--last-decline", last_decline])
         assignment_options = (() if direct_placement or assigned_adapter else self.assignment_options(
-            self.repository if repository is None else repository, verb, settings, runner_options))
+            self.repository if repository is None else repository, verb, settings, runner_options, source=source))
         arguments.extend(["--result", str(self.result_path), *runner_options, *assignment_options, "--"])
         arguments.extend(nextest_arguments)
         if assigned_adapter:
