@@ -741,6 +741,17 @@ class FolderAuditTests(unittest.TestCase):
         [line] = plan.read_text().splitlines()
         self.assertEqual(removal_guard.ListedEntry.parse(line).path, cache)
 
+    def test_finds_a_live_socket_with_spaces_in_its_path(self) -> None:
+        path = self.rust / "live socket "
+        table = self.root / "unix"
+        with socket.socket(socket.AF_UNIX) as server, chdir(self.rust):
+            server.bind(path.name)
+            server.listen()
+            _ = table.write_text(f"Num RefCount Protocol Flags Type St Inode Path\n0: 2 0 10000 1 1 7 {path}\n")
+            bound = folder_audit.bound_sockets(str(table))
+            self.assertEqual(bound, frozenset({str(path)}))
+            self.assertTrue(folder_audit.live_socket(self.rust, bound))
+
     def test_clone_cleanup_keeps_process_hold_socket_and_busy_lock_guards(self) -> None:
         used = self.clone_folder("used-clone", 3)
         held = self.clone_folder("held-clone", 3)
