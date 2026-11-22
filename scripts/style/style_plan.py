@@ -14,6 +14,7 @@ import math
 import os
 import posixpath
 import re
+import select
 import signal
 import sqlite3
 import subprocess
@@ -22,23 +23,24 @@ import tempfile
 import time
 import tomllib
 from collections import Counter, defaultdict
-from collections.abc import Generator, Iterable, Mapping
-from contextlib import closing, contextmanager
-from dataclasses import dataclass, field, replace
+from collections.abc import Callable, Generator, Iterable, Mapping
+from contextlib import closing, contextmanager, suppress
+from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime
 from enum import Enum
 from functools import cached_property
 from itertools import accumulate
 from pathlib import Path, PurePosixPath
 
-from types import FrameType, MappingProxyType
-from typing import Literal, assert_never, cast, override
+from types import MappingProxyType
+from typing import IO, Literal, TextIO, TypedDict, assert_never, cast, override
 
 SCRIPTS = Path(__file__).resolve().parents[1]
 
 from scripts.copies import copies
 from scripts.direct import phase_reservation
-from scripts.lib import berth_board, build_folders, unit_runs
+from scripts.lib import berth_board, build_folders, process_group, unit_runs
+from scripts.lib.descendants import adopt_descendants
 from scripts.whoami import quota_state
 from scripts.lib.git_blob import git_blob_id
 from scripts.lib.process_failure import failure_detail
@@ -56,7 +58,8 @@ from scripts.style import rules, style_config
 from scripts.style import style_ledger
 from scripts.style import style_reader
 from scripts.style.refill_findings import FindingFootprint, decode_proof, encode_proof, proof_types
-from scripts.style.style_ledger import PendingPublication, publication_lock, publication_path
+from scripts.style.style_ledger import (PendingPublication, SplitDeadline as SplitDeadline,
+                                       SplitTimedOut as SplitTimedOut, publication_lock, publication_path)
 from scripts.style import approved_renames
 from scripts.style import style_footprint
 from scripts.style import style_proposals
@@ -4321,18 +4324,58 @@ def classify_split(ledger: style_ledger.Ledger, unit: str, doc: Path, base: Unit
 
 
 @dataclass(frozen=True)
-class SplitDeadline:
-    at: float
-    timeout_minutes: float
+class StyleWorkerGroup:
+    """A worker group and a pipe that closes when the worker exits."""
 
-    def timeout_error(self) -> TimeoutError:
-        return TimeoutError(f"time limit of {self.timeout_minutes:g} min reached")
+    pid: int
+    ended: IO[bytes]
 
-    def remaining_seconds(self) -> float:
-        remaining = self.at - time.monotonic()
-        if remaining <= 0:
-            raise self.timeout_error()
-        return remaining
+    def send(self, signum: int) -> None:
+        with suppress(ProcessLookupError):
+            process_group.send_process_group(self.pid, signum)
+
+
+def child_process_ids() -> set[int]:
+    children = Path(f"/proc/self/task/{os.getpid()}/children")
+    return {int(pid) for pid in children.read_text().split()}
+
+
+def stop_adopted_children() -> None:
+    """Stop and reap descendants that left the worker group."""
+    while pids := child_process_ids():
+        for pid in pids:
+            with suppress(ProcessLookupError):
+                os.kill(pid, signal.SIGKILL)
+        for pid in pids:
+            with suppress(ChildProcessError):
+                _ = os.waitpid(pid, 0)
+
+
+@contextmanager
+def worker_group(work: Callable[[], None]) -> Generator[StyleWorkerGroup]:
+    adopted = adopt_descendants()
+    read_fd, write_fd = os.pipe()
+    with os.fdopen(read_fd, "rb") as ended, os.fdopen(write_fd, "wb") as finished:
+        pid = os.fork()
+        if pid == 0:
+            try:
+                ended.close()
+                os.setpgid(0, 0)
+                work()
+            finally:
+                os._exit(0)
+        finished.close()
+        worker = StyleWorkerGroup(pid, ended)
+        try:
+            # Either process can establish the group before the first wait.
+            with suppress(ProcessLookupError):
+                os.setpgid(pid, pid)
+            yield worker
+        finally:
+            worker.send(signal.SIGKILL)
+            _ = os.waitpid(pid, 0)
+            if adopted:
+                stop_adopted_children()
 
 
 @contextmanager
@@ -4340,48 +4383,135 @@ def split_time_limit(minutes: float) -> Generator[SplitDeadline]:
     if not math.isfinite(minutes) or minutes <= 0:
         raise style_ledger.LedgerError("timeout-minutes must be positive and finite")
 
-    began = time.monotonic()
-    deadline = SplitDeadline(began + minutes * 60, minutes)
+    yield SplitDeadline(time.monotonic() + minutes * 60, minutes, time.monotonic)
 
-    def expired(_signum: int, _frame: FrameType | None) -> None:
-        raise deadline.timeout_error()
 
-    previous_handler = signal.signal(signal.SIGALRM, expired)
-    previous_timer = signal.setitimer(signal.ITIMER_REAL, minutes * 60)
+def measure_split(unit: str, repo: Path, database: Path, measured_at: str,
+                  deadline: SplitDeadline) -> style_ledger.RecordedSplit:
+    style_ledger.require_split_table(database)
+    _ = deadline.remaining_seconds()
+    doc = style_document(repo, unit)
+    row = next((row for row in unit_worktrees(doc) if row.unit == unit), None)
+    if row is None:
+        raise style_ledger.LedgerError(f"{unit}: no staff row under {doc}")
+    plan = unit_plan_path(unit, row.worktree)
+    scope = unit_plan_settings(plan.read_text(), repo).pilot_scope
+    _ = deadline.remaining_seconds()
+    board = berth_board.read_board(repo)
+    if isinstance(board, berth_board.BoardUnavailable):
+        raise style_ledger.LedgerError(f"board unavailable: {board.reason}")
+    _ = deadline.remaining_seconds()
+    cache = style_ledger.GitReadCache(repo)
+    with style_ledger.preview_ledger(repo, git_cache=cache) as ledger:
+        _ = deadline.remaining_seconds()
+        busy = busy_files(repo, doc, ledger, unit, board)
+        definitions = {rule.rule_id: rule for rule in rules.load_rules(repo)}
+        _ = deadline.remaining_seconds()
+        result = classify_split(ledger, unit, doc, unit_base(repo, row.branch), scope, busy, definitions, cache,
+                                measured_at)
+    _ = deadline.remaining_seconds()
+    return result
+
+
+@dataclass(frozen=True)
+class MeasuredSplit:
+    database: Path
+    split: style_ledger.RecordedSplit
+
+
+class SplitCounts(TypedDict):
+    ready: int
+    changed: int
+    structure: int
+    other: int
+    measured_at: str
+
+
+class SplitMeasured(TypedDict):
+    database: str
+    split: SplitCounts
+
+
+class SplitMeasurementFailed(TypedDict):
+    error: str
+
+
+class SplitMeasurementExpired(TypedDict):
+    expired: Literal[True]
+
+
+def keep_split_measurement(unit: str, repo: Path, measured_at: str, deadline: SplitDeadline,
+                           caller: IO[bytes], reply: TextIO) -> None:
+    """Own the temporary files until the scan ends or the caller exits."""
     try:
-        yield deadline
-    finally:
-        _ = signal.setitimer(signal.ITIMER_REAL, 0)
-        _ = signal.signal(signal.SIGALRM, previous_handler)
-        if previous_timer[0] > 0:
-            _ = signal.setitimer(signal.ITIMER_REAL, max(0.000001, previous_timer[0] - (time.monotonic() - began)),
-                                 previous_timer[1])
+        _ = deadline.remaining_seconds()
+        with build_folders.temporary_build_folder(build_folders.UniqueBuildFolder("style-split-")) as directory:
+            def work() -> None:
+                os.environ["TMPDIR"] = str(directory)
+                tempfile.tempdir = str(directory)
+                result: dict[str, object]
+                try:
+                    location = style_ledger.ledger_location(repo)
+                    database = location.database.resolve()
+                    recorded = measure_split(unit, location.repo, database, measured_at, deadline)
+                    result = {"database": str(database), "split": asdict(recorded)}
+                except SplitTimedOut:
+                    result = {"expired": True}
+                except Exception as error:
+                    result = {"error": str(error)}
+                json.dump(result, reply)
+                reply.flush()
+
+            with worker_group(work) as worker:
+                ready, _, _ = select.select([caller, worker.ended], [], [], deadline.remaining_seconds())
+                if not ready:
+                    raise deadline.timeout_error()
+    except SplitTimedOut:
+        # The worker has stopped, so only the keeper can write the reply.
+        _ = reply.seek(0)
+        _ = reply.truncate()
+        json.dump({"expired": True}, reply)
+        reply.flush()
+
+
+def bounded_split_measurement(unit: str, repo: Path, measured_at: str, deadline: SplitDeadline) -> MeasuredSplit:
+    """Bound the read-only scan, including the Git lookup for the final write."""
+    _ = deadline.remaining_seconds()
+    with tempfile.TemporaryFile(mode="w+t") as reply:
+        read_fd, write_fd = os.pipe()
+        with os.fdopen(read_fd, "rb") as caller, os.fdopen(write_fd, "wb") as alive:
+            keeper = os.fork()
+            if keeper == 0:
+                try:
+                    alive.close()
+                    os.setsid()
+                    keep_split_measurement(unit, repo, measured_at, deadline, caller, reply)
+                except Exception as error:
+                    _ = reply.seek(0)
+                    _ = reply.truncate()
+                    json.dump({"error": str(error)}, reply)
+                    reply.flush()
+                finally:
+                    os._exit(0)
+            caller.close()
+            _ = os.waitpid(keeper, 0)
+            _ = deadline.remaining_seconds()
+        _ = reply.seek(0)
+        measured = cast(SplitMeasured | SplitMeasurementFailed | SplitMeasurementExpired, json.load(reply))
+        if "expired" in measured:
+            raise deadline.timeout_error()
+        if "error" in measured:
+            raise style_ledger.LedgerError(measured["error"])
+        return MeasuredSplit(Path(measured["database"]), style_ledger.RecordedSplit(**measured["split"]))
 
 
 def split(unit: str, repo: Path, timeout_minutes: float = 90) -> style_ledger.RecordedSplit:
     """Scan a backup copy, then store only a complete split on the original ledger."""
     measured_at = datetime.now(UTC).isoformat()
     with split_time_limit(timeout_minutes) as deadline:
-        repo = repo.expanduser().resolve()
-        style_ledger.require_split_table(repo)
-        doc = style_document(repo, unit)
-        row = next((row for row in unit_worktrees(doc) if row.unit == unit), None)
-        if row is None:
-            raise style_ledger.LedgerError(f"{unit}: no staff row under {doc}")
-        plan = unit_plan_path(unit, row.worktree)
-        scope = unit_plan_settings(plan.read_text(), repo).pilot_scope
-        board = berth_board.read_board(repo)
-        if isinstance(board, berth_board.BoardUnavailable):
-            raise style_ledger.LedgerError(f"board unavailable: {board.reason}")
-        cache = style_ledger.GitReadCache(repo)
-        with style_ledger.preview_ledger(repo, git_cache=cache) as ledger:
-            busy = busy_files(repo, doc, ledger, unit, board)
-            definitions = {rule.rule_id: rule for rule in rules.load_rules(repo)}
-            result = classify_split(ledger, unit, doc, unit_base(repo, row.branch), scope, busy, definitions, cache,
-                                    measured_at)
-        style_ledger.record_split(repo, unit, result,
-                                  busy_timeout_seconds=min(style_ledger.BUSY_TIMEOUT_SECONDS, deadline.remaining_seconds()))
-    return result
+        measured = bounded_split_measurement(unit, repo, measured_at, deadline)
+        style_ledger.record_split_at(measured.database, unit, measured.split, deadline=deadline)
+    return measured.split
 
 
 def split_line(unit: str, result: style_ledger.RecordedSplit, minutes: float) -> str:
