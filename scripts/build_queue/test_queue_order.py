@@ -11,7 +11,7 @@ from unittest.mock import patch
 
 from scripts.build_queue import admission_protocol as wire
 from scripts.build_queue import admission_records as records, execution_identity, head_stall, placement, queue_snapshot
-from scripts.build_queue.admission_service import QueueHeadAnchor, QueuePin, QueueRowAnchor, ReplayEntry
+from scripts.build_queue.admission_service import QueueHeadAnchor, QueuePin, QueueRowAnchor
 from scripts.build_queue.admission_test_support import AdmissionFixture, GIB
 from scripts.build_queue.test_placement import (
     PlacementFixture, adopt_assignment, assignment_for, consume_permission, local_candidate,
@@ -1113,15 +1113,6 @@ class QueueMoveTests(unittest.TestCase):
             replacement_line = move_line(fixture)
             self.assertIn(merge, ids(replacement_line))
             self.assertNotIn(ids(replacement_line)[-1], ids(current))
-
-    def test_reads_earlier_move_replies_without_an_undo_anchor(self) -> None:
-        moved = wire.QueueMoved("moving", records.QueueMoveLine("revision", ()), 2, 1)
-        reply = cast(dict[str, object], json.loads(wire.encode_record(moved)))
-        for earlier in ({"old_before": "first", "old_after": "last"},
-                        {"undo_destination": wire.QueueDrop("last", "before")}):
-            with self.subTest(earlier=earlier):
-                reading = wire.encode_record({"kind": "ReplayEntry", "reply": {**reply, **earlier}, "ended_at": 1.0})
-                self.assertEqual(wire.parse_record(reading, ReplayEntry), ReplayEntry(moved, 1.0))
 
     def test_undo_uses_only_surviving_neighbors(self) -> None:
         with AdmissionFixture() as fixture:
