@@ -36,6 +36,17 @@ class VerifyPythonStartsTests(VerifyLintCacheFixture):
         self.assert_lint_start_count(self)
         self.assert_ssh_helper_calls()
 
+    def test_detached_lint_with_file_stderr_runs_slot_request_in_the_helper(self) -> None:
+        trace = self.root / "detached-starts.tsv"
+        log = self.root / "detached.log"
+        with log.open("ab") as output:
+            result = subprocess.run(["bash", str(VERIFY), "lint", "sample"], cwd=self.root,
+                env={**self.environment, "UNIT_DETACHED_RUN": "1", "VERIFY_PY_TRACE": str(trace)},
+                stdout=output, stderr=subprocess.STDOUT, timeout=TEST_HANG_GUARD_SECS, check=False)
+        self.assertEqual(result.returncode, 0, log.read_text())
+        calls = [line.split("\t") for line in trace.with_suffix(".tsv.calls").read_text().splitlines()]
+        self.assertEqual(sum(call[:2] == ["admission_client.py", "verify-run-slot"] for call in calls), 1)
+
     def assert_lint_start_count(self, fixture: VerifyLintCacheFixture) -> None:
         _ = fixture.enable_cache()
         trace = fixture.root / "python-starts.tsv"
@@ -63,8 +74,10 @@ class VerifyPythonStartsTests(VerifyLintCacheFixture):
         # The dev features read also runs in the helper, so no inline Python starts for it.
         self.assertEqual(len(rows), 6, counts)
         # The per-run helper reads the dev features; no Python process of its own starts.
-        in_helper = Counter(line.split("\t")[0] for line in Path(str(trace) + ".calls").read_text().splitlines())
+        calls = [line.split("\t") for line in Path(str(trace) + ".calls").read_text().splitlines()]
+        in_helper = Counter(call[0] for call in calls)
         self.assertEqual((counts["dev_features.py"], in_helper["dev_features.py"]), (0, 1), rows)
+        self.assertEqual(sum(call[:2] == ["admission_client.py", "verify-run-slot"] for call in calls), 1)
 
     def assert_ssh_helper_calls(self) -> None:
         for target, mode in (("unknown", "passed"), ("linux", "disk")):
