@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import cast, override
 from unittest import mock
 
+from scripts.lib.fixture_test_support import set_up_fixture
 from scripts.buildlog import index
 from scripts.buildlog import parse
 from scripts.buildlog import repository
@@ -252,9 +253,7 @@ class StepBuildIdentityRecordingTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
-        self.fixture = record_tests.RecordTests()
-        self.addCleanup(self.fixture.doCleanups)
-        self.fixture.setUp()
+        self.fixture = set_up_fixture(self.addCleanup, record_tests.RecordTests())
         self.enterContext(mock.patch.dict(os.environ))
         if "CARGO_TARGET_DIR" in os.environ:
             del os.environ["CARGO_TARGET_DIR"]

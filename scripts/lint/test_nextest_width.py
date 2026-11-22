@@ -13,6 +13,7 @@ from typing import final, override
 
 
 from scripts.build_hold.override_guard import require_checkout
+from scripts.lint.memory_test_support import memory_gate_shell_environment
 
 require_checkout(Path(__file__))
 
@@ -60,7 +61,7 @@ class NextestWidthTests(unittest.TestCase):
         buildlog = self.root / "buildlog"
         buildlog.mkdir()
         self.environment = {
-            **os.environ,
+            **memory_gate_shell_environment(),
             "BUILD_HOLD_DIR": str(self.root / "holders"),
             "BUILD_HOLD_RELEASE_DIR": str(self.root / "release"),
             "STAFF_FILE": str(self.root / "staff.json"),

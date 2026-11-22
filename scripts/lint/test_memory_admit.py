@@ -51,7 +51,10 @@ from scripts.build_queue.admission_test_support import queue_decision, Admission
 from scripts.build_queue.queue_fixture import write_memory_config as write_memory_config, fixture_queue_inputs, fixture_reservation, write_process, write_scope, ci_step
 from scripts.direct.verify_examples_test_support import SeededExampleWorkspaceFixture, VERIFY, workspace_metadata
 from scripts.lint.build_shape import BuildShape, CompiledCrates, build_shape
-from scripts.lint.memory_test_support import fake_memory_readings, gate_isolation_environment, write_config_fixture, commit_config_fixture
+from scripts.lint.memory_test_support import (
+    commit_config_fixture, fake_memory_readings, gate_isolation_environment, memory_gate_shell_environment,
+    write_config_fixture,
+)
 from scripts.buildlog import store
 from scripts.buildlog import record as buildlog_record
 from scripts.buildlog import index as file_marks
@@ -4166,7 +4169,7 @@ class LiveMemoryTripwireTests(MemoryQueueFixture):
                 with fixture.serving():
                     result = subprocess.run(
                         ["bash", "-c", 'source "$1"; buildlog_wait_for_memory', "test", str(MEMORY_GATE)],
-                        env=dict(os.environ), capture_output=True, text=True,
+                        env=memory_gate_shell_environment(), capture_output=True, text=True,
                         check=False, timeout=test_hang_guard.TEST_HANG_GUARD_SECS,
                     )
                 self.assertEqual(result.returncode, 2, result.stderr)
@@ -5275,7 +5278,7 @@ class ShellTests(unittest.TestCase):
         command = 'set -e; source "$1"; shift; ' + body
         return subprocess.run(["bash", "-c", command, "test", str(MEMORY_GATE),
                                *([] if launch else ["/bin/true"])],
-            env={**os.environ, "BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": "",
+            env={**memory_gate_shell_environment(), "BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": "",
                  "BUILD_HOLD_DIR": str(self.admission.root / "holders"),
                  "BUILD_HOLD_RELEASE_DIR": str(self.admission.root / "releases"),
                  "UNIT_RUN_DIR": "",
@@ -5634,7 +5637,7 @@ class QueueLeaveTests(unittest.TestCase):
             + "from scripts.build_queue.admission_records import RequestedTestWidth\n"
             + "from scripts.build_queue.admission_service import read_state\n"
             + f"record, = read_state(Path({str(self.admission.state_dir)!r})).reservations.values()\n"
-            + "reservation_id, _, _ = os.environ['BUILDLOG_RESERVED_STEP'].split('\\t')\n"
+            + "reservation_id = os.environ['BUILDLOG_RESERVED_STEP'].split('\\t', 1)[0]\n"
             + "assert record.reservation_id == reservation_id\n"
             + "width = record.test_width\nassert isinstance(width, RequestedTestWidth)\n"
             + "print(json.dumps({'test_threads': width.threads}))\n")
@@ -6288,10 +6291,67 @@ class QueueExplanationTests(MemoryQueueFixture):
         self.assertEqual(follower.reason, admission_records.BehindHead("worker-300", NOW_EPOCH - 1200, "session-300"))
         self.assertIsInstance(nextest.admission, gate.ProposedAdmission)
 
+        # A head that waits for its repository limit holds back no other step also when it does not fit (rule 8).
         path, waiter = inputs.ordered[0]
         memory_hold = replace(inputs, ordered=[(path, {**waiter, "need": 70 * GIB}), *inputs.ordered[1:]])
         rows = gate.admission_pass(memory_hold, inputs.now, policy).rows
-        self.assertEqual(rows[2].reason, follower.reason)
+        self.assertEqual(rows[1].reason, follower.reason)
+        self.assertIsInstance(rows[2].admission, gate.ProposedAdmission)
+
+    def test_verify_waiting_only_for_its_run_limit_does_not_hold_another_repository(self) -> None:
+        _ = self.waiting(300, 2 * GIB, 20, repository_name="hana", step="nextest")
+        _ = self.waiting(400, 2 * GIB, 10, repository_name="claude_commands", step="nextest")
+        snapshot = self.snapshot_inputs()
+        hana, commands = (admission_records.waiter_owner(row) for _, row in snapshot.ordered)
+        inputs = replace(snapshot, host=admission_records.HostMemory(60 * GIB, 60 * GIB),
+            verify_run_owners={"hana": frozenset({"100-100", "200-200"})},
+            verify_slot_requests={hana: hana, commands: commands})
+        policy = replace(admission_policy_fixture(),
+            repository_runs=admission_records.RepositoryRunLimits({"natedev.hana": 2, "natedev.claude_commands": 1}))
+        head, peer = gate.admission_pass(inputs, inputs.now, policy).rows
+        self.assertEqual(cast(admission_records.HeadAdmissionStatus, head.reason).cause,
+                         admission_records.RunLimitWait(2, 2, "hana", "natedev"))
+        self.assertIsInstance(peer.admission, gate.ProposedAdmission)
+
+        path, waiter = inputs.ordered[1]
+        oversized = replace(inputs, ordered=[inputs.ordered[0], (path, {**waiter, "need": 70 * GIB})])
+        capped, peer = gate.admission_pass(oversized, oversized.now, policy).rows
+        self.assertEqual(capped.decision.run_limit, admission_records.RunLimitWait(2, 2, "hana", "natedev"))
+        self.assertIsInstance(peer.admission, gate.ProposedAdmission)
+        self.assertIsInstance(peer.decision.room.basis, admission_records.StartsAlone)
+
+    def limit_full_inputs(self, repository: str) -> tuple[admission_records.QueueInputs, admission_records.AdmissionPolicy]:
+        """Fill the natedev limit of one repository with a started run (pid 90)."""
+        inputs = replace(self.snapshot_inputs(), host=admission_records.HostMemory(60 * GIB, 60 * GIB),
+            verify_run_owners={repository: frozenset({admission_records.run_owner(90, "90")})})
+        policy = replace(admission_policy_fixture(),
+            repository_runs=admission_records.RepositoryRunLimits({f"natedev.{repository}": 1}))
+        return inputs, policy
+
+    def test_started_run_next_step_does_not_wait_behind_its_repository_limit_head(self) -> None:
+        repo = "claude_commands"
+        _ = self.waiting(300, 2 * GIB, 20, repository_name=repo, step="test-affected")
+        _ = self.waiting(400, 2 * GIB, 10, repository_name=repo, step="test-affected")
+        inputs, policy = self.limit_full_inputs(repo)
+        (head_path, head), (path, step) = inputs.ordered
+        started = replace(inputs, ordered=[(head_path, head),
+                                           (path, {**step, "build_run": LiveBuildRun(90, "90", inputs.now - 35)})])
+        new_run, next_step = gate.admission_pass(started, started.now, policy).rows
+        self.assertEqual(new_run.decision.run_limit, admission_records.RunLimitWait(1, 1, repo, "natedev"))
+        self.assertEqual(next_step.decision.state, "admit")
+
+    def test_expired_row_behind_a_repository_limit_head_holds_no_other_repository(self) -> None:
+        repo = "claude_commands"
+        _ = self.waiting(300, 2 * GIB, 30, repository_name=repo, step="test-affected")
+        _ = self.waiting(400, 2 * GIB, 20, repository_name=repo, step="test-affected")
+        _ = self.waiting(200, 2 * GIB, 10, repository_name="hana", step="nextest")
+        inputs, policy = self.limit_full_inputs(repo)
+        head, (path, row), other = inputs.ordered
+        # A held row gets no EstimateExpired reason, so its estimate stays expired.
+        expired = replace(inputs, ordered=[head, (path, {**row, "build_history_current": False}), other])
+        rows = gate.admission_pass(expired, expired.now, policy).rows
+        self.assertEqual([row.decision.state for row in rows], ["hold", "hold", "admit"])
+        self.assertIsInstance(rows[1].reason, admission_records.BehindHead)
 
     def test_pass_is_pure_and_ignores_reader_environment_and_clock(self) -> None:
         _ = self.waiting(300, 4 * GIB, 1)

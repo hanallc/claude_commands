@@ -15,6 +15,7 @@ except FileNotFoundError:
     pass
 
 import argparse
+from collections.abc import Sequence
 from dataclasses import dataclass
 import os
 from pathlib import Path
@@ -84,15 +85,40 @@ class NoTimeLimit:
 
 
 UNLIMITED_GIT = NoTimeLimit()
+ALLOWED_GIT_SETTINGS = frozenset({"core.fsync"})
+
+
+def _git_quote(value: str) -> str:
+    """Quote a field for Git's GIT_CONFIG_PARAMETERS parser."""
+    return "'" + value.replace("'", r"'\''").replace("!", r"'\!'") + "'"
+
+
+def _git_config_environment(git_config: Sequence[str]) -> dict[str, str] | None:
+    if not git_config:
+        return None
+    environment = os.environ.copy()
+    parameters = [environment.get("GIT_CONFIG_PARAMETERS", "")]
+    for setting in git_config:
+        key, separator, value = setting.partition("=")
+        if key.lower() not in ALLOWED_GIT_SETTINGS:
+            allowed = ", ".join(sorted(ALLOWED_GIT_SETTINGS))
+            raise LandError(f"Git setting {key!r} is forbidden. Allowed settings are {allowed}.")
+        quoted_value = _git_quote(value) if separator else ""
+        parameters.append(f"{_git_quote(key)}={quoted_value}")
+    environment["GIT_CONFIG_PARAMETERS"] = " ".join(filter(None, parameters))
+    return environment
 
 
 def land(checkout: Path, commit: str, branch: str = "main", *,
-         time_limit: CommandTimeLimit | NoTimeLimit = UNLIMITED_GIT) -> Landed:
+         time_limit: CommandTimeLimit | NoTimeLimit = UNLIMITED_GIT,
+         git_config: Sequence[str] = ()) -> Landed:
     """Push only a fast-forward and run any pending default-branch hook."""
+    environment = _git_config_environment(git_config)
+
     def git(*arguments: str) -> subprocess.CompletedProcess[str]:
         try:
             return subprocess.run(["git", "-C", str(checkout), *arguments],
-                                  capture_output=True, text=True, check=False,
+                                  capture_output=True, text=True, check=False, env=environment,
                                   timeout=time_limit.seconds if isinstance(time_limit, CommandTimeLimit) else None)
         except subprocess.TimeoutExpired as error:
             details = "; ".join(output.decode(errors="replace").strip()

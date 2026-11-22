@@ -1976,28 +1976,130 @@ frame.addEventListener('load',async()=>{
         self.assertEqual(log.count("<dl>"), 1)
         self.assertIn("State</dt><dd>Done</dd>", log)
 
-    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
-    def test_browser_list_log_uses_page_scroll(self) -> None:
+    def long_log_item(self, entries: int = 30) -> the_list.ListItem:
         item = self.add("Long log", number=1)
-        for update in range(18):
+        for update in range(entries):
             _ = the_list.update(MORTY.id, item.id, {"next_step": f"Check result {update}."}, source="morty")
+        return item
+
+    def set_log_max_height(self, rem: int) -> None:
+        config = self.root / "config" / "review_links.conf"
+        text = config.read_text()
+        self.assertIn("list_log_max_height_rem=16\n", text)
+        _ = config.write_text(text.replace("list_log_max_height_rem=16\n", f"list_log_max_height_rem={rem}\n"))
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
+    def test_browser_list_log_scrolls_in_its_own_area(self) -> None:
+        _ = self.long_log_item()
+        self.set_log_max_height(9)
         markup = list_page.render(self.root / "reviews", include_counts=False).decode()
+        self.assertIn('style="--list-log-max-height:9rem"', markup)
         probe = r'''<script>
 document.querySelector('.list-toggle').click();
-const [left,right]=document.querySelector('.list-panel').children;
+const panel=document.querySelector('.list-panel'),[left,right]=panel.children;
 const log=right.querySelector('.list-log-scroll');
-const desktop=innerWidth>600;
-const placed=desktop ? right.getBoundingClientRect().left>left.getBoundingClientRect().right :
- right.getBoundingClientRect().top>=left.getBoundingClientRect().bottom;
-const fits=placed && log.scrollHeight===log.clientHeight && log.clientHeight>innerHeight &&
- getComputedStyle(log).overflowY==='visible';
+const desktop=innerWidth>600,box=log.getBoundingClientRect();
+const rem=parseFloat(getComputedStyle(document.documentElement).fontSize);
+const failures=[];
+if(getComputedStyle(log).overflowY!=='auto' || log.scrollHeight<=log.clientHeight)
+ failures.push('The log scrolls in its own area.');
+if(desktop && !(box.left>left.getBoundingClientRect().right && box.bottom<=panel.getBoundingClientRect().bottom &&
+ panel.getBoundingClientRect().height<innerHeight))
+ failures.push('On a desktop the log sits beside the details and ends with the panel.');
+if(!desktop && Math.abs(log.clientHeight-9*rem)>1)
+ failures.push('On a narrow page the log is 9rem tall from the config. Found '+log.clientHeight+' px.');
 const result=document.createElement('p');result.id='probe-results';
-result.textContent=JSON.stringify(fits ? [] : ['The row uses page scroll for the full log.']);
+result.textContent=JSON.stringify(failures);
 document.body.append(result);
 </script>'''
         for width in (1440, 500):
             with self.subTest(width=width):
                 self.browser_actions(markup, "", probe, window_size=(width, 600))
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
+    def test_browser_list_refresh_keeps_the_open_row_and_its_log_position(self) -> None:
+        item = self.long_log_item()
+        _ = self.add("Another row", number=2)
+        with patch.object(list_page, "counts_strip", return_value=""):
+            initial = list_page.render(self.root / "reviews").decode()
+            _ = the_list.update(MORTY.id, item.id, {"next_step": "The newest step."}, source="morty")
+            fresh = list_page.render(self.root / "reviews").decode()
+        steps = r"""
+ const log=recordDetails(row).querySelector('.list-log-scroll');
+ row.scrollIntoView({block:'start',behavior:'instant'});
+ scrollBy({top:-40,behavior:'instant'});
+ log.scrollTop=Math.round(log.scrollHeight/2);
+ const top=row.getBoundingClientRect().top,logTop=log.getBoundingClientRect().top;
+ const first=[...log.querySelectorAll('[data-log-index]')].find(entry=>entry.getBoundingClientRect().bottom>logTop);
+ const index=first.dataset.logIndex,offset=first.getBoundingClientRect().top-logTop;
+ const entries=log.querySelectorAll('[data-log-index]').length;
+ refreshMarkup=FRESH_PAGE;
+ dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));
+ await flush();
+ const freshLog=recordDetails(row).querySelector('.list-log-scroll');
+ check(freshLog.querySelectorAll('[data-log-index]').length>entries,'The refresh adds the new log entry.');
+ check(row.getBoundingClientRect().top===top,
+  'The open row keeps its place. Expected '+top+' px, found '+row.getBoundingClientRect().top+' px.');
+ const entry=freshLog.querySelector('[data-log-index="'+index+'"]');
+ const freshOffset=entry.getBoundingClientRect().top-freshLog.getBoundingClientRect().top;
+ check(freshLog.scrollTop>0 && Math.abs(freshOffset-offset)<1,
+  'The log keeps its first visible entry at the same place. Expected '+offset+' px, found '+freshOffset+' px.');
+"""
+        steps = steps.replace("FRESH_PAGE", json.dumps(fresh).replace("</", "<\\/"))
+        for width in (1440, 500):
+            with self.subTest(width=width):
+                self.browser_action_sequence(steps, reduced_motion=True, add_item=False, markup=initial,
+                                             window_size=(width, 700))
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
+    def test_browser_list_sort_and_save_keep_the_open_log_position(self) -> None:
+        item = self.long_log_item()
+        _ = self.add("Another row", number=2)
+        with patch.object(list_page, "counts_strip", return_value=""):
+            initial = list_page.render(self.root / "reviews").decode()
+            _ = the_list.update(MORTY.id, item.id, {"next_step": "The newest step."}, source="morty")
+            saved = list_page.render(self.root / "reviews").decode()
+        setup = r"""
+ const scrolledLog=()=>{
+  const log=recordDetails(row).querySelector('.list-log-scroll');
+  log.scrollTop=Math.round(log.scrollHeight/2);
+  const top=log.getBoundingClientRect().top;
+  const first=[...log.querySelectorAll('[data-log-index]')].find(entry=>entry.getBoundingClientRect().bottom>top);
+  return {index:first.dataset.logIndex,offset:first.getBoundingClientRect().top-top};
+ };
+ const checkLog=(position,name)=>{
+  const log=recordDetails(row).querySelector('.list-log-scroll');
+  const entry=log.querySelector('[data-log-index="'+position.index+'"]');
+  const offset=entry.getBoundingClientRect().top-log.getBoundingClientRect().top;
+  check(log.scrollTop>0 && Math.abs(offset-position.offset)<1,
+   name+' Expected '+position.offset+' px, found '+offset+' px.');
+ };
+"""
+        sort = setup + r"""
+ const position=scrolledLog();
+ const place=()=>[...document.querySelectorAll('[data-list-item]')].indexOf(row);
+ const before=place(),sort=document.querySelector('[data-sort="0"]');
+ sort.click();sort.click();
+ await flush();
+ check(place()!==before,'The sort moves the open row.');
+ checkLog(position,'A sort that moves the open row keeps its log position.');
+"""
+        save = setup + r"""
+ const position=scrolledLog();
+ const savedRow=new DOMParser().parseFromString(SAVED_PAGE,'text/html').querySelector('[data-number="1"]');
+ submit('read');
+ finishPost({item_state:'Working',unread:'false',unread_sort:0,detail_html:recordDetails(savedRow).innerHTML,
+  detail_revision:savedRow.dataset.detailRevision});
+ await flush();await flush();
+ check(recordDetails(row).querySelector('.list-log').children.length===savedRow.querySelectorAll('[data-log-index]').length,
+  'The save result installs the new detail.');
+ checkLog(position,'A save result keeps the log position.');
+""".replace("SAVED_PAGE", json.dumps(saved).replace("</", "<\\/"))
+        for name, steps in (("sort", sort), ("save", save)):
+            for width in (1440, 500):
+                with self.subTest(case=name, width=width):
+                    self.browser_action_sequence(steps, reduced_motion=True, add_item=False, markup=initial,
+                                                 window_size=(width, 700))
 
     def test_log_entries_share_one_label_column(self) -> None:
         self.assertIn(".list-log dl{display:grid;grid-template-columns:min(7rem,42%) minmax(0,1fr)", list_page.STYLE)
