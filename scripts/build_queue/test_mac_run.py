@@ -405,6 +405,34 @@ sys.exit(71)
                 self.checkout, "mac", SuiteMode.GATE, GATE_JOB_NOT_RECORDED):
             self.fail("The clone exceeded the repository limit")
 
+    def test_mac_capacity_uses_only_the_shared_git_origin_and_rewrites(self) -> None:
+        linked = self.root / "linked"
+        git = ["git", "-C", str(self.checkout)]
+        origin = "shared:upstream/.claude"
+        _ = subprocess.run([*git, "remote", "set-url", "origin", origin], check=True)
+        _ = subprocess.run([*git, "config", "--local", "url.https://fixture.invalid/fallback/.insteadOf",
+                            "shared:"], check=True)
+        _ = subprocess.run([*git, "config", "--local", f"url.{self.root}/.insteadOf", "shared:upstream/"], check=True)
+        _ = subprocess.run([*git, "config", "--local", "extensions.worktreeConfig", "true"], check=True)
+        _ = subprocess.run([*git, "worktree", "add", "-q", "--detach", str(linked)], check=True)
+        for checkout, key in (
+            (self.checkout, "url.https://fixture.invalid/primary.git.insteadOf"),
+            (linked, "url.https://fixture.invalid/linked.git.insteadOf"),
+        ):
+            worktree = ["git", "-C", str(checkout), "config", "--worktree"]
+            _ = subprocess.run([*worktree, key, origin], check=True)
+
+        native = self.native_claim(self.repo)
+        self.assertEqual(mac_test.command_claim(native, self.paths, watch_claim=False), 0)
+        self.addCleanup(mac_test.command_release, native, self.paths)
+        for checkout in (self.checkout, linked):
+            with self.subTest(checkout=checkout.name):
+                with self.assertRaisesRegex(mac_run.MacRunRefused, "busy with native Mac run"):
+                    with mac_run.held(checkout, "mac", SuiteMode.GATE, GATE_JOB_NOT_RECORDED):
+                        self.fail("A worktree override bypassed the repository limit")
+                self.assertEqual(claim_state.target_claim_scope(self.paths, str(checkout)),
+                                 claim_state.RepositoryScope(".claude", REPOSITORY_KEY))
+
     def test_separate_git_directory_with_a_relative_origin_shares_capacity(self) -> None:
         separate = self.root / "separate"
         metadata = self.root / "metadata" / "hana" / "repo.git"
@@ -724,6 +752,9 @@ sys.exit(71)
     def test_release_wait_revokes_an_interrupted_replacement_retry(self) -> None:
         self.exercise_interrupted_replacement(("release-wait",))
 
+    def test_release_wait_revokes_a_retry_with_an_unreadable_process_start(self) -> None:
+        self.exercise_interrupted_replacement(("release-unreadable", "release-before-unlink"))
+
     def test_sweep_removes_a_retry_proof_when_the_waiter_ends(self) -> None:
         self.exercise_interrupted_replacement(("waiter-ended",))
 
@@ -849,7 +880,7 @@ with patch.object(Path, "unlink", interrupt_unlink), patch.object(mac_test, "wri
                 if recovery == "status":
                     status_config = mac_test.MacTestConfig("", "", "", "", 1, 0, 1, 1, 1)
                     self.assertEqual(mac_test.command_status(self.paths, status_config), 0)
-                elif recovery in ("sweep", "release-wait", "waiter-ended"):
+                elif recovery in ("sweep", "release-wait", "release-unreadable", "waiter-ended"):
                     with claim_state.locked(self.paths.lock):
                         self.assertEqual(mac_test.live_claims(self.paths), ())
                 elif recovery == "inspect":
@@ -863,7 +894,8 @@ with patch.object(Path, "unlink", interrupt_unlink), patch.object(mac_test, "wri
                     child = subprocess.run([sys.executable, "-c", script, "fresh-write", str(old_path), *command[2:]],
                                            capture_output=True, text=True, timeout=5)
                     self.assertEqual(child.returncode, 72, child.stdout + child.stderr)
-                if recovery in ("status", "sweep", "release-wait", "waiter-ended", "inspect", "second-interruption"):
+                if recovery in ("status", "sweep", "release-wait", "release-unreadable",
+                                "waiter-ended", "inspect", "second-interruption"):
                     self.assertEqual(claim_state.read_claims(self.paths), ())
                 if recovery == "waiter-ended":
                     proof = claim_state.retired_mac_reservation_path(self.paths, identity)
@@ -874,13 +906,19 @@ with patch.object(Path, "unlink", interrupt_unlink), patch.object(mac_test, "wri
                             self.assertEqual(mac_test.live_claims(self.paths), ())
                         self.assertEqual(proof.exists(), isinstance(start, process_identity.Unreadable))
                     continue
-                if recovery == "release-wait":
+                if recovery in ("release-wait", "release-unreadable", "release-before-unlink"):
                     proof = claim_state.retired_mac_reservation_path(self.paths, identity)
                     self.assertTrue(proof.exists())
+                    self.assertEqual(old_path.exists(), recovery == "release-before-unlink")
                     with mock.patch.object(claim_state, "submitting_session", return_value=OwningSession("other")):
                         self.assertEqual(build_targets.command_release_wait(waiting.pid, identity=identity), 0)
                     self.assertTrue(proof.exists())
-                    self.assertEqual(build_targets.command_release_wait(waiting.pid, identity=identity), 0)
+                    start = (process_identity.Started(reserved.record["proc_start"]) if recovery == "release-wait"
+                             else process_identity.Unreadable("fixture"))
+                    with mock.patch.object(process_identity, "process_start", return_value=start):
+                        self.assertEqual(build_targets.command_release_wait(waiting.pid, identity=identity), 0)
+                    self.assertIsInstance(claim_state.read_retired_mac_reservation(self.paths, identity),
+                                          claim_state.NoSavedRetryPermission)
                     child = subprocess.run([sys.executable, "-c", script, "none", str(old_path), *command[2:]],
                                            capture_output=True, text=True, timeout=5)
                     self.assertEqual(child.returncode, 12, child.stdout + child.stderr)
@@ -1132,8 +1170,8 @@ with patch.object(Path, "unlink", interrupt_unlink), patch.object(mac_test, "wri
 
         def change_origin(command: list[str], **options: object) -> subprocess.CompletedProcess[str]:
             result = run_git(command, **options)
-            if command[:3] == set_origin[:3] and command[-3:] == ["remote", "get-url", "origin"]:
-                origin_reads.append(result.stdout.strip())
+            if command[:3] == ["git", "--git-dir", str(self.checkout / ".git")] and command[-2] == "--get-regexp":
+                origin_reads.append(result.stdout.removesuffix("\0").split("\n", 1)[1])
                 if len(origin_reads) == 1:
                     _ = run_git([*set_origin, str(other)], check=True)
             return result

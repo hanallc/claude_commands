@@ -1239,8 +1239,6 @@ def command_release_wait(pid: int, *,
     session = claim_state.submitting_session(session)
     session_id = claim_state.session_id(session)
     start = process_identity.process_start(pid)
-    if not isinstance(start, process_identity.Started):
-        return 0
     for target in read_targets():
         if not isinstance(target, SshTarget):
             continue
@@ -1251,25 +1249,32 @@ def command_release_wait(pid: int, *,
         paths = claim_state.state_paths(target.name)
         fenced: list[claim_state.HeldClaim] = []
         with claim_state.locked(paths.lock):
-            if paths.platform == "macos" and isinstance(identity, claim_state.ClaimIdentity):
-                try:
+            release_start = start.start if isinstance(start, process_identity.Started) else None
+            permission: claim_state.RetiredMacReservation | claim_state.NoSavedRetryPermission
+            permission = claim_state.NO_SAVED_RETRY_PERMISSION
+            try:
+                if paths.platform == "macos" and isinstance(identity, claim_state.ClaimIdentity):
                     retired = claim_state.read_retired_mac_reservation(paths, identity)
                     if (isinstance(retired, claim_state.RetiredMacReservation)
-                            and retired.pid == pid and retired.proc_start == start.start
-                            and retired.submitting_session == session_id):
-                        retired.path.unlink(missing_ok=True)
-                except (claim_state.StateReadError, OSError) as error:
-                    print(str(error), file=sys.stderr)
-                    return 1
-            for claim in claim_state.read_claims(paths):
-                if (claim.record["pid"] == pid and claim.record["proc_start"] == start.start
-                        and claim.record["submitting_session"] == session_id
-                        and claim_state.claim_identity(claim.record) == identity
-                        and "remote_host" not in claim.record):
-                    if claim_state.claim_pending_start(paths, claim.path, claim.record).exists():
-                        fenced.append(claim)
-                    else:
-                        claim.path.unlink(missing_ok=True)
+                            and retired.pid == pid and retired.submitting_session == session_id):
+                        permission = retired
+                        # An interrupted retirement can leave both the proof and the original reservation.
+                        release_start = retired.proc_start
+                if release_start is not None:
+                    for claim in claim_state.read_claims(paths):
+                        if (claim.record["pid"] == pid and claim.record["proc_start"] == release_start
+                                and claim.record["submitting_session"] == session_id
+                                and claim_state.claim_identity(claim.record) == identity
+                                and "remote_host" not in claim.record):
+                            if claim_state.claim_pending_start(paths, claim.path, claim.record).exists():
+                                fenced.append(claim)
+                            else:
+                                claim.path.unlink(missing_ok=True)
+                if isinstance(permission, claim_state.RetiredMacReservation):
+                    permission.path.unlink(missing_ok=True)
+            except (claim_state.StateReadError, OSError) as error:
+                print(str(error), file=sys.stderr)
+                return 1
         for claim in fenced:
             from scripts.mac_test import mac_test
 

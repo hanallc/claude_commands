@@ -104,7 +104,7 @@ def _git_checkout(directory: str) -> git_files.Checkout | None:
 
 @dataclass(frozen=True)
 class MacSourceRepository:
-    """The source Git folder and key from one checkout origin read."""
+    """The source Git folder and key from the shared origin."""
 
     git_dir: str
     key: str
@@ -117,7 +117,7 @@ class UnrecordedSourceCheckout:
 
 def mac_source_repository(worktree: str, common: str) -> MacSourceRepository | UnrecordedSourceCheckout:
     """Follow local clone origins from the checkout to the source repository."""
-    checkout_origin = _mac_origin(worktree)
+    checkout_origin = _mac_origin(Path(common))
     origin = checkout_origin
     directory = worktree
     seen = {common}
@@ -133,16 +133,14 @@ def mac_source_repository(worktree: str, common: str) -> MacSourceRepository | U
         common = str(source.common_dir)
         seen.add(common)
         directory = str(source.toplevel)
-        origin = _mac_origin(directory)
+        origin = _mac_origin(source.common_dir)
     return MacSourceRepository(common, "git-dir:" + common, checkout_origin)
 
 
 def _relative_origin_directory(common: Path, worktree: str) -> str | UnrecordedSourceCheckout:
     # Resolve relative origins from the primary checkout.
-    configured = subprocess.run(
-        ["git", "--git-dir", str(common), "config", "--default", str(common.parent), "--get", "core.worktree"],
-        cwd=common, capture_output=True, text=True, check=True, timeout=GIT_TIMEOUT_S, stdin=subprocess.DEVNULL,
-    )
+    configured = _shared_git_config(common, "--default", str(common.parent), "--get", "core.worktree")
+    configured.check_returncode()
     directory = (common / configured.stdout.removesuffix("\n")).resolve()
     try:
         source = git_files.at(directory)
@@ -156,13 +154,41 @@ def _relative_origin_directory(common: Path, worktree: str) -> str | UnrecordedS
     return UnrecordedSourceCheckout()
 
 
-def _mac_origin(directory: str) -> str:
-    result = subprocess.run(["git", "-C", directory, "remote", "get-url", "origin"],
-                            capture_output=True, text=True, timeout=GIT_TIMEOUT_S, stdin=subprocess.DEVNULL)
-    if result.returncode == 2:
+def _shared_git_config(common: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
+    """Read Git configuration and included files from the shared repository."""
+    environment = {**os.environ, "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_COUNT": "0"}
+    for name in ("GIT_COMMON_DIR", "GIT_WORK_TREE", "GIT_CONFIG", "GIT_CONFIG_PARAMETERS"):
+        _ = environment.pop(name, None)
+    return subprocess.run(
+        ["git", "--git-dir", str(common), "config", "--local", "--includes", *arguments],
+        cwd=common, env=environment, capture_output=True, text=True, timeout=GIT_TIMEOUT_S, stdin=subprocess.DEVNULL,
+    )
+
+
+def _mac_origin(common: Path) -> str:
+    result = _shared_git_config(common, "--null", "--get-regexp", r"^(remote\.origin\.url|url\..*\.insteadof)$")
+    if result.returncode == 1:
         return ""
     result.check_returncode()
-    return result.stdout.strip()
+    urls: list[str] = []
+    rewrites: dict[str, list[str]] = {}
+    for entry in result.stdout.split("\0"):
+        key, separator, value = entry.partition("\n")
+        if not separator:
+            continue
+        if key == "remote.origin.url":
+            urls.append(value)
+        else:
+            base = key.removeprefix("url.").removesuffix(".insteadof")
+            rewrites.setdefault(base, []).append(value)
+    if not urls:
+        return ""
+    origin = urls[0]
+    prefix, base = max(
+        ((prefix, base) for base, prefixes in rewrites.items() for prefix in prefixes if origin.startswith(prefix)),
+        key=lambda rewrite: len(rewrite[0]), default=("", ""),
+    )
+    return (base + origin[len(prefix):]).strip()
 
 
 def source_git_dir(common: str) -> str:

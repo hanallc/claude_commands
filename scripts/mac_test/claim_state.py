@@ -527,12 +527,21 @@ class RetiredMacReservation:
     worktree: str
 
 
-def read_retired_mac_reservation(paths: StatePaths, identity: ClaimIdentity) -> RetiredMacReservation | NoRun:
+class NoSavedRetryPermission:
+    """No saved permission authorizes this retry."""
+
+
+NO_SAVED_RETRY_PERMISSION = NoSavedRetryPermission()
+
+
+def read_retired_mac_reservation(
+    paths: StatePaths, identity: ClaimIdentity,
+) -> RetiredMacReservation | NoSavedRetryPermission:
     """Read the saved retry permission for this claim identity."""
     path = retired_mac_reservation_path(paths, identity)
     record = read_run(path)
     if isinstance(record, NoRun) or "remote_host" in record or claim_identity(record) != identity:
-        return NO_RUN
+        return NO_SAVED_RETRY_PERMISSION
     return RetiredMacReservation(path, record["pid"], record["proc_start"], record["submitting_session"],
                                  record["worktree"])
 
