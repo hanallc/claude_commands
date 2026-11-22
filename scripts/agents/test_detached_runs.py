@@ -1917,6 +1917,80 @@ sys.exit(status)
                                              ("finished", None, "supervisor gone"))
                         self.assertEqual(detached_runs.reap_orphans(str(self.session)), [])
 
+    @contextlib.contextmanager
+    def darwin_without_pidfds(self) -> Generator[None]:
+        """Use Darwin dispatch with no Linux process APIs."""
+        with contextlib.ExitStack() as stack:
+            _ = stack.enter_context(patch.object(sys, "platform", "darwin"))
+            for module, name in ((os, "pidfd_open"), (signal, "pidfd_send_signal")):
+                if hasattr(module, name):
+                    _ = stack.enter_context(patch.object(module, name))
+                    delattr(module, name)
+            _ = stack.enter_context(patch.object(
+                process_start, "proc_table_start", side_effect=AssertionError("Darwin read a Linux PID")))
+            yield
+
+    def test_mac_stop_checks_the_saved_leader_signals_the_group_and_reaps(self) -> None:
+        path = self.record(["fixture command"])
+        leader = DEAD_PID
+        self.update_record(path, command_pid=leader, command_group=leader, command_started="original")
+        starts: dict[int, process_start.ProcessStart] = {leader: process_start.Started("replacement")}
+        reason = "fixture stop"
+
+        with (self.darwin_without_pidfds(),
+              patch.object(process_start, "process_start", side_effect=starts.__getitem__),
+              patch.object(detached_run_process, "supervisor_match", return_value=True) as supervisor,
+              patch.object(detached_runs, "_stop_caller_is_owner", return_value=True),
+              patch.object(os, "killpg") as send,
+              patch.object(detached_runs, "_group_is_live", return_value=False),
+              patch.object(detached_runs, "_replay_completion", return_value=detached_runs.CompletionReplay.HANDLED)):
+            self.assertFalse(detached_runs.stop_command(path, reason))
+            send.assert_not_called()
+            self.assertNotIn("stop_reason", worker_lifecycle.read_json_object(path))
+
+            starts[leader] = process_start.Started("original")
+            self.assertTrue(detached_runs.stop_command(path, reason))
+            send.assert_called_once_with(leader, signal.SIGTERM)
+            saved = worker_lifecycle.read_json_object(path)
+            self.assertEqual(saved.get("stop_reason"), reason)
+            self.assertIs(saved.get("stop_pass_requested"), True)
+            self.assertIs(saved.get("self_stop"), True)
+            self.assertNotIn("scope_error", saved)
+            self.assertEqual(detached_runs.reap_orphans(str(self.session)), [])
+
+            starts[leader] = process_start.Gone()
+            supervisor.return_value = False
+            self.assertEqual(detached_runs.reap_orphans(str(self.session)), [path.stem])
+            self.assertEqual(worker_lifecycle.read_json_object(path).get("status"), "finished")
+
+    def test_mac_watcher_waits_for_the_saved_leader_before_reaping(self) -> None:
+        path = self.record(["fixture command"])
+        leader = DEAD_PID
+        self.update_record(path, command_pid=leader, command_group=leader, command_started="original")
+        start = process_start.Started("original")
+
+        def save_status(_seconds: float) -> None:
+            self.assertEqual(worker_lifecycle.read_json_object(path).get("status"), "running")
+            self.assertEqual(detached_runs.main(["record-exit", "--pid", str(leader), str(path), "143"]), 0)
+            read_start.return_value = process_start.Started("replacement")
+
+        with (self.darwin_without_pidfds(),
+              patch.object(process_start, "process_start", return_value=start) as read_start,
+              patch.object(detached_run_process, "supervisor_match", return_value=False),
+              patch.object(detached_runs, "_scope_stop_graces", return_value=(2.0, 2.0)),
+              patch.object(os, "setsid"),
+              patch.object(os, "killpg") as send,
+              patch.object(time, "sleep", side_effect=save_status) as sleep,
+              patch.object(detached_runs, "_group_is_live", side_effect=AssertionError("the group ID was reused")),
+              patch.object(detached_runs, "_replay_completion", return_value=detached_runs.CompletionReplay.HANDLED)):
+            self.assertEqual(detached_runs.main(["supervisor-gone", str(path)]), 0)
+        send.assert_called_once_with(leader, signal.SIGTERM)
+        sleep.assert_called_once_with(0.05)
+        saved = worker_lifecycle.read_json_object(path)
+        self.assertEqual(saved.get("stop_reason"), detached_runs.SUPERVISOR_GONE_REASON)
+        self.assertEqual(saved.get("exit_code"), 143)
+        self.assertEqual(saved.get("status"), "finished")
+
     def test_stop_refuses_a_record_without_a_current_command_group(self) -> None:
         path = self.record([sys.executable, "-c", "pass"])
         pending_stop = path.with_suffix(detached_runs.PENDING_STOP_SUFFIX)

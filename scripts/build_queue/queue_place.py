@@ -80,6 +80,8 @@ def no_hold_wait() -> None:
 
 
 def in_builds_slice() -> bool:
+    if sys.platform != "linux":
+        return False
     try:
         return "/builds.slice/" in Path("/proc/self/cgroup").read_text()
     except OSError:
@@ -98,6 +100,8 @@ def suite_scope_prefix() -> list[str]:
 
 def probe_scope_prefix() -> list[str]:
     """Check whether the user manager can start a separate program scope."""
+    if sys.platform != "linux":
+        return []
     slice_args = process_stop.scope_slice_args("builds.slice")
     prefix = ["systemd-run", "--user", "--scope", "--quiet", "--collect",
               "--expand-environment=no", *slice_args, "--"]
@@ -316,6 +320,8 @@ class QueuePlace:
                 self.wave_at = now
 
     def popen(self, argv: Sequence[str], **popen_arguments: Unpack[PopenArguments]) -> subprocess.Popen[bytes]:
+        if sys.platform != "linux":
+            raise QueuePlaceRefused("a queued program requires Linux")
         if isinstance(self.program, StartedProgram):
             raise QueuePlaceRefused("a queue place can start only one program")
         if self.arguments and tuple(argv) != self.arguments:

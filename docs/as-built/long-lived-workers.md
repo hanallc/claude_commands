@@ -764,8 +764,10 @@ An acknowledgment error does not block notice delivery.
 After acknowledgment, the usual pruning rules apply.
 A run that ends by itself just after the stop commit reports as stopped.
 Recovery finishes committed stops and the pending cleanup of runs without a supervisor.
-A run without a saved slice can receive a legacy group TERM, which reports an unconfirmed stop.
-The stop requires Linux pidfd support.
+On Linux with pidfds, a run without a saved slice can receive TERM and reports an unconfirmed stop.
+On systems without pidfds, the stop checks the saved leader identity and sends TERM to the group.
+The watcher waits for the saved leader to exit before it reaps the run.
+The stop grace limits this wait.
 After a normal command exit, the supervisor gives the slice members the stop grace to exit.
 It stops any processes that remain and reports them as a cleanup in the result.
 A build hold records the run as stopped after the same slice stop confirms the end.
@@ -774,7 +776,7 @@ A run with a saved stop reason reports `STOPPED` and includes the reason.
 The result includes the command's exit status.
 Exits 76 and 77 also include instructions for the next action.
 A committed slice stop cancels the verified owning pass.
-An older group-stop record with `self_stop: true` keeps the pass active and sends the result to the owning worker.
+A group stop with `self_stop: true` keeps the pass active and sends the result to the owning worker.
 Delivery stays pending if the worker cannot receive the result.
 If the worker's staff row is gone, the director receives the run result.
 New worker runs save the recorder pass ID or the reason the lookup failed.

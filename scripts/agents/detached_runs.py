@@ -6,7 +6,8 @@ The supervisor runs the command and delivers its result to the current worker.
 A unit director or showrunner names its run folder and receives its result through send.py.
 Reap finishes records whose supervisor disappeared and delivers their results.
 The command runs in its own session; the record names its process group.
-`stop` uses pidfds and the run's slice. The supervisor records and delivers the result.
+`stop` uses the run's slice on Linux and the saved group on systems without pidfds.
+The supervisor records and delivers the result.
 A watcher in the command group holds the supervisor pipe. If the supervisor ends first, the watcher
 stops the command group and delivers the STOPPED result.
 Exit 3 means that the caller is neither a registered worker nor a director with a run folder.
@@ -45,7 +46,7 @@ from typing import IO, TYPE_CHECKING, Literal, NotRequired, TypedDict, TypeGuard
 
 from scripts.agents import detached_run_process, worker_lifecycle
 from scripts.buildlog import treekey
-from scripts.lib import atomic_file, conf, process_start, process_stop, unit_runs
+from scripts.lib import atomic_file, conf, process_group, process_start, process_stop, unit_runs
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.cancellation import CANCELLATION_SIGNALS
 from scripts.message import send_budget
@@ -536,17 +537,58 @@ def _stop_slice_command(
     return True
 
 
+def _stop_caller_is_owner(owner: object, environment: Mapping[str, str]) -> bool:
+    """Match the caller's native process to the run's worker staff ID."""
+    from scripts.agents import pane_record
+    from scripts.herdr import herdr, herdr_types
+    from scripts.message import session_records
+
+    pid = os.getpid()
+    sessions = session_records.sessions_dir()
+    try:
+        for _ in range(pane_record.ANCESTOR_LIMIT):
+            try:
+                _ = (sessions / f"{pid}.json").stat()
+            except FileNotFoundError:
+                arguments = pane_record.process_arguments(pid)
+                if herdr.is_claude_process(arguments):
+                    return False
+                if herdr.is_codex_process(arguments):
+                    native = herdr.native_process(pid, "codex")
+                    current = native.identity.id if isinstance(native.identity, herdr.PaneSessionReport) else ""
+                    break
+            else:
+                current = staff.runtime_id(pid)
+                break
+            if pid <= 1:
+                return False
+            pid = pane_record.process_parent(pid)
+        else:
+            return False
+        identities = {identity for identity in (environment.get("CODEX_THREAD_ID"),
+                                               environment.get("CLAUDE_CODE_SESSION_ID")) if identity}
+        if not current or identities - {current}:
+            return False
+        member = staff.local_snapshot().by_current_session(current)
+    except (OSError, ValueError, IndexError, staff.StaffRefused, herdr_types.HerdrFailure, subprocess.SubprocessError):
+        return False
+    return member is not None and member.kind == "worker" and member.id == owner
+
+
 def stop_command(
     path: Path, reason: str, *, check: Callable[[], bool] = lambda: True,
     stop_pass: bool = True, signal_group: Callable[[int, int], None] | None = None,
     retry_slice_read: bool = False, stop_notice_id: str = "",
 ) -> bool:
-    """Request a stop and confirm that the run slice has ended."""
-    if not reason or not process_stop.supported():
+    """Stop the saved run slice or signal the verified command group."""
+    if not reason:
         return False
+    use_pidfd = process_stop.supported()
     record = worker_lifecycle.read_json_object(path)
     supervisor = _integer(record.get("pid"))
     if "command_slice" in record:
+        if not use_pidfd:
+            return False
         run_slice = record["command_slice"]
         if not process_stop.is_slice_identity(run_slice):
             raise process_stop.SliceStopFailed("the saved run slice is invalid")
@@ -565,7 +607,7 @@ def stop_command(
                 or not check()
                 or (stop_pass and detached_run_process.supervisor_match(supervisor, path) is not True
                     and not isinstance(process_start.process_start(supervisor), (process_start.Gone, process_start.Zombie)))
-                or (signal_group is None and process_start.process_start(command.group)
+                or ((signal_group is None or not use_pidfd) and process_start.process_start(command.group)
                     != process_start.Started(command.started))):
             return CommandGroupUnverified()
         return command
@@ -573,15 +615,21 @@ def stop_command(
     def signal_command(group: int, number: int) -> None:
         if group != starting_command.group:
             raise ProcessLookupError("the command changed")
-        if signal_group is None:
+        if signal_group is not None:
+            signal_group(group, number)
+        elif use_pidfd:
             _signal_stopped_command(starting_command, number)
         else:
-            signal_group(group, number)
+            process_group.send_process_group(group, number)
 
+    cancel_pass = stop_pass and not use_pidfd
     try:
-        _ = stop_with_reason(path, reason, verify_group=verify_group, signal_group=signal_command,
-                             unconfirmed="the command group received TERM without a verified scope")
-        return False
+        sent = stop_with_reason(
+            path, reason, verify_group=verify_group, signal_group=signal_command, stop_pass=cancel_pass,
+            self_stop=cancel_pass and _stop_caller_is_owner(record.get("staff_id"), os.environ),
+            unconfirmed="the command group received TERM without a verified scope" if use_pidfd else "",
+        )
+        return sent and not use_pidfd
     except (ProcessLookupError, PermissionError):
         return False
 
@@ -1226,6 +1274,7 @@ def live_run_evidence_in_folders(folders: Mapping[Path, frozenset[staff.StaffId]
         for path in supervisors:
             if path.parent.name == DETACHED_RUNS_DIR and path.parent.parent in folders:
                 named.setdefault(path.parent.parent, set()).add(path)
+    if sys.platform == "linux" and not isinstance(supervisors, detached_run_process.ProcessTableUnavailable):
         # Older launchers saved the slice identity before they wrote an index.
         directory = _user_run_slice_directory()
         try:
@@ -1961,7 +2010,7 @@ def scope_prefix(log: Path, environment: dict[str, str], *,
                  kind: DetachedRunKind = DetachedRunKind.DETECT) -> list[str]:
     """Start the command in its own slice when a scope is available."""
     runtime = environment.get("XDG_RUNTIME_DIR", "")
-    if (environment.get("BUILDLOG_SCOPE", "1") == "0" or not runtime
+    if (not process_stop.supported() or environment.get("BUILDLOG_SCOPE", "1") == "0" or not runtime
             or not Path(runtime, "systemd", "private").is_socket() or shutil.which("systemd-run") is None):
         return []
     scope = _command_scope_unit(kind, log.stem)
@@ -2182,8 +2231,17 @@ def command_supervise(args: argparse.Namespace) -> int:
     return 0
 
 
+def _wait_for_leader(command: CommandGroup, deadline: float) -> None:
+    """Wait for the saved leader to exit or for the stop grace to end."""
+    while isinstance(_saved_process(command.group, command.started), (process_start.Started, process_start.Unreadable)):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return
+        time.sleep(min(0.05, remaining))
+
+
 def command_supervisor_gone(args: argparse.Namespace) -> int:
-    """Stop the saved scope after the supervisor pipe closes."""
+    """Stop the saved scope or command group after the supervisor pipe closes."""
     path = Path(str(getattr(args, "record", "")))
     # Leave the command group, so its TERM spares this watcher.
     os.setsid()
@@ -2193,14 +2251,18 @@ def command_supervisor_gone(args: argparse.Namespace) -> int:
         return not _has_saved_cgroup(record) or not detached_run_process.supervises(record["pid"], path)
 
     try:
-        _ = stop_command(path, SUPERVISOR_GONE_REASON, check=supervisor_is_gone, stop_pass=False, retry_slice_read=True)
+        _ = stop_command(path, SUPERVISOR_GONE_REASON, check=supervisor_is_gone,
+                         stop_pass=False, retry_slice_read=True)
     except OSError as error:
         print(f"detached_runs: {path.stem}: stop failed: {error}", file=sys.stderr)
         return 1
     record = _read_record(path)
-    if record.get("scope_error") and not _has_saved_cgroup(record):
+    group_stop = not process_stop.supported() and bool(record.get("stop_reason"))
+    if not _has_saved_cgroup(record) and (group_stop or record.get("scope_error")):
         grace, _ = _scope_stop_graces()
         deadline = time.monotonic() + grace
+        if group_stop and (command := _recorded_group(record)) is not None:
+            _wait_for_leader(command, deadline)
         while not _command_has_ended(record, record["pid"]):
             remaining = deadline - time.monotonic()
             if remaining <= 0:

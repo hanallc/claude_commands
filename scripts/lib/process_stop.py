@@ -142,6 +142,8 @@ def _is_run_slice_path(path: Path) -> bool:
 
 def command_slice(pid: int, scope: ScopeUnit) -> RunSliceIdentity:
     """Identify the run slice while the launcher is in its command scope."""
+    if sys.platform != "linux":
+        raise SliceStopFailed("run slices require Linux")
     path = _cgroup_path(pid)
     if (path.name != scope.unit or path.suffix != ".scope" or path.parent.name != scope.slice
             or not _is_run_slice_path(path.parent)):
@@ -187,6 +189,8 @@ def launch_in_slice(record: Path, scope: ScopeUnit, command: list[str]) -> int:
 
 
 def _open_saved_slice(scope: RunSliceIdentity) -> int:
+    if sys.platform != "linux":
+        raise SliceStopFailed("run slices require Linux")
     path = Path(scope["path"])
     if path.name != scope["unit"] or not _is_run_slice_path(path):
         raise SliceStopFailed("cannot open run slice: invalid run slice path")

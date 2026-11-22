@@ -13,6 +13,7 @@ import re
 import shutil
 import socket
 import subprocess
+import sys
 import time
 from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
@@ -68,7 +69,9 @@ class Mount:
 
 
 def read_mounts(table: Path = MOUNT_TABLE) -> tuple[Mount, ...]:
-    """This machine's mounts in mount order, or none where the system has no mount table, as on the Mac."""
+    """Read the mounts in mount order from the Linux table or a supplied file."""
+    if sys.platform != "linux" and table == MOUNT_TABLE:
+        return ()
     try:
         lines = table.read_text(encoding="utf-8").splitlines()
     except OSError:

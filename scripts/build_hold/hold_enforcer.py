@@ -410,6 +410,8 @@ def stop_waiting_run(
     supervisor_args: Callable[[int, Path], tuple[str, ...]] = supervisor_args,
 ) -> StoppedRun | RunIdentityChanged:
     """Check process identities before TERM and record each stopped gate."""
+    if sys.platform != "linux":
+        return RunIdentityChanged(run)
     override_guard.require_shared_state_write(
         Path(__file__), "build_hold/hold_enforcer.py", proc_root, build_hold.holder_directory(),
         build_hold.release_directory(), state_directory(), store.root())
