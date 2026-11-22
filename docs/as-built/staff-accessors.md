@@ -372,6 +372,7 @@ The shared pane launch builder uses `set_home`.
 | `scripts/usage/waste_watch.py` | read | snapshot |
 | `scripts/whoami/five_hour.py` | read | snapshot |
 | `scripts/whoami/quota_alert.py` | read | snapshot; send.staff_named |
+| `scripts/worktree/finished_worktrees.py` | read | StaffSnapshot, PresentWorktree, StaffRefused; the snapshot comes from worktrees.staff_record |
 | `scripts/worktree/worktrees.py` | read | snapshot, StaffSnapshot, StaffAbsent, StaffRefused |
 | `~/rust/cargo-liner-handler/crates/cargo-handler/src/census/hierarchy.rs` | read | StaffFileReader reads staff.json (Rust, direct) |
 
