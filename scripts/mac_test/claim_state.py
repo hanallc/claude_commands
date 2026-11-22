@@ -497,11 +497,13 @@ class HeldClaim:
 
     def matches_mac_assignment_scope(self, scope: ClaimScope) -> bool:
         """Match the scope from an assignment with the same claim identity."""
+        from scripts.buildlog.repository import repository_key_case
+
         if self.scope == scope:
             return True
         if isinstance(scope, RepositoryScope) and self.record.get("slot", 0) == scope.slot:
             if scope.key:
-                return self.record.get("repo_key") == scope.key
+                return repository_key_case(self.record.get("repo_key", "")) == repository_key_case(scope.key)
             return self.record.get("repo_name") == scope.name
         return False
 
@@ -672,6 +674,7 @@ class StatePaths:
         self.run: Path = directory / "run.json"
         self.claims: Path = directory / "claims"
         self.retired_reservations: Path = directory / "retired-reservations"
+        self.wait_locations: Path = directory / "wait-locations"
         self.block: Path = directory / "block.json"
         self.affinity: Path = directory / "affinity"
 
@@ -871,9 +874,12 @@ def mac_repository_identity(worktree: str) -> ResolvedMacMirror | WholeMacScope:
 
 
 def scopes_overlap(first: ClaimScope, second: ClaimScope) -> bool:
+    from scripts.buildlog.repository import repository_key_case
+
     if isinstance(first, WholeMacScope) or isinstance(second, WholeMacScope):
         return True
-    same_repository = first.key == second.key if first.key and second.key else first.name == second.name
+    same_repository = (repository_key_case(first.key) == repository_key_case(second.key)
+                       if first.key and second.key else first.name == second.name)
     return same_repository and (not first.slot or not second.slot or first.slot == second.slot)
 
 
@@ -913,9 +919,74 @@ def claim_files(paths: StatePaths) -> tuple[Path, ...]:
     return (paths.run, *repository_files)
 
 
+@dataclass(frozen=True)
+class WaitReservationLocation:
+    """The claim file that a particular waiter reserved."""
+
+    path: Path
+    pid: int
+    proc_start: str
+    submitting_session: str
+
+    @classmethod
+    def for_claim(cls, path: Path, claim: ProcessBoundClaim) -> WaitReservationLocation:
+        return cls(path, claim["pid"], claim["proc_start"], claim["submitting_session"])
+
+
+def save_wait_location(paths: StatePaths, identity: ClaimIdentity, reservation: WaitReservationLocation) -> None:
+    """Save the claim path before release needs to read the claim."""
+    location = paths.wait_locations / pending_start_key(identity)
+    location.parent.mkdir(parents=True, exist_ok=True)
+    values = {"reservation_file": str(reservation.path.relative_to(paths.directory)), "pid": reservation.pid,
+              "proc_start": reservation.proc_start, "submitting_session": reservation.submitting_session}
+    write_text_atomic(location, json.dumps(values) + "\n")
+
+
+def _read_wait_location(paths: StatePaths, location: Path) -> WaitReservationLocation | UnrecordedReservationPath:
+    values = read_json_object(location)
+    if values is None:
+        return UnrecordedReservationPath()
+    pid = values.get("pid")
+    if type(pid) is not int:
+        raise StateReadError(f"{location} has an invalid waiter pid")
+    return WaitReservationLocation(paths.directory / reservation_file(values, "reservation_file", location), pid,
+                                   required_string(values, "proc_start", location),
+                                   required_string(values, "submitting_session", location))
+
+
+def read_wait_location(paths: StatePaths, identity: ClaimIdentity) -> WaitReservationLocation | UnrecordedReservationPath:
+    return _read_wait_location(paths, paths.wait_locations / pending_start_key(identity))
+
+
+def sweep_wait_locations(paths: StatePaths) -> None:
+    """Keep the claim path for repeat release while the waiter lives."""
+    for path in paths.wait_locations.glob("[0-9a-f]" * 64):
+        try:
+            location = _read_wait_location(paths, path)
+            if isinstance(location, WaitReservationLocation):
+                owner = process_identity.process_start(location.pid)
+                if not isinstance(owner, process_identity.Unreadable) and owner != process_identity.Started(location.proc_start):
+                    path.unlink(missing_ok=True)
+        except (StateReadError, OSError) as error:
+            print(str(error), file=sys.stderr)
+
+
+@dataclass(frozen=True)
+class WaitReservation:
+    """The local claim and its original fields for a release marker."""
+
+    path: Path
+    record: ProcessBoundClaim
+    original_fields: dict[str, object]
+
+
+class UnlocatedWaitReservation(StateReadError):
+    """An unreadable claim could be a reservation with no recorded path."""
+
+
 def read_wait_reservations(
     paths: StatePaths, identity: ClaimIdentity, reservation: Path | UnrecordedReservationPath,
-) -> Generator[tuple[Path, ProcessBoundClaim, dict[str, object]], None, None]:
+) -> Generator[WaitReservation, None, None]:
     """Read the exact local reservation for release."""
     expected = (identity.claim_id, identity.episode, identity.attempt)
     unreadable: StateReadError | None = None
@@ -923,11 +994,11 @@ def read_wait_reservations(
     for path in (reservation,) if isinstance(reservation, Path) else claim_files(paths):
         try:
             values = read_json_object(path)
-            if values is None or "remote_host" in values:
+            if values is None:
                 continue
             fields = (values.get("claim_id"), values.get("episode"), values.get("attempt"))
             if fields != expected:
-                if paths.platform == "macos" and not any(
+                if not any(
                     isinstance(value, str) and value and value != name for value, name in zip(fields, expected)
                 ):
                     raise StateReadError(f"{path} has an incomplete reservation identity")
@@ -939,11 +1010,12 @@ def read_wait_reservations(
                 unreadable = error
             continue
         record = decode_run(values, path)
-        assert "remote_host" not in record
+        if "remote_host" in record:
+            continue
         found = True
-        yield path, record, values
-    if paths.platform == "macos" and not found and unreadable is not None:
-        raise unreadable
+        yield WaitReservation(path, record, values)
+    if not found and unreadable is not None:
+        raise UnlocatedWaitReservation(str(unreadable)) from unreadable
 
 
 def mark_wait_released(path: Path, values: dict[str, object]) -> None:

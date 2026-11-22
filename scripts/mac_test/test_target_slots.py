@@ -51,10 +51,18 @@ class RepositoryKeyTests(unittest.TestCase):
 
     def test_real_origin_forms_keep_the_normalized_repository_key(self) -> None:
         expected = eligibility.KnownRepository("project", "https://github.com/nate/project")
-        for remote in ("git@GitHub.com:nate/project.git", "https://github.com/nate/project.git"):
+        for remote in ("git@GitHub.com:Nate/Project.git", "https://github.com/NATE/Project.git",
+                       "ssh://git@github.com:22/nate/PROJECT.git"):
             with self.subTest(remote=remote):
                 _ = self.git("config", "remote.origin.url", remote)
                 self.assertEqual(eligibility.repository_identity(self.root), expected)
+
+    def test_other_hosts_keep_repository_case(self) -> None:
+        for remote in ("git@fixture.invalid:Team/Project.git", "https://fixture.invalid/Team/Project.git"):
+            with self.subTest(remote=remote):
+                _ = self.git("config", "remote.origin.url", remote)
+                self.assertEqual(eligibility.repository_identity(self.root),
+                                 eligibility.KnownRepository("project", "https://fixture.invalid/Team/Project"))
 
     def test_real_repository_without_origin_keeps_the_root_commit_key(self) -> None:
         root_commit = commit_repository(self.root, "Fixture", allow_empty=True)
@@ -247,7 +255,7 @@ class RepositorySlotTests(unittest.TestCase):
                 for claim in mac_test.read_claims(mac_test.state_paths(target))}
 
     def test_origin_forms_and_clone_names_share_repository_capacity(self) -> None:
-        main = self.repository("hana", "git@GitHub.com:nate/hana.git")
+        main = self.repository("hana", "git@GitHub.com:Nate/Hana.git")
         clone = self.repository("tmp/phase-copy", "https://github.com/nate/hana/")
         linked = self.repository("worktrees/feature", "ssh://git@github.com:22/nate/hana.git", main)
 
@@ -275,6 +283,18 @@ class RepositorySlotTests(unittest.TestCase):
             self.assertEqual(result.status, 0)
 
         self.assertEqual(self.claim("mac", linked, 103)[0], 11)
+
+    def test_saved_github_key_in_mixed_case_still_holds_capacity(self) -> None:
+        first = self.repository("first/hana", "https://github.com/Nate/Hana.git")
+        second = self.repository("second/clone", "https://github.com/nate/hana.git")
+        with mock.patch("scripts.buildlog.repository.repository_key_case", side_effect=str):
+            self.assertEqual(self.claim("mac", first, 101)[0], 0)
+        paths = mac_test.state_paths("mac")
+        saved, = mac_test.read_claims(paths)
+        original = saved.path.read_bytes()
+        self.assertEqual(saved.record.get("repo_key"), "https://github.com/Nate/Hana")
+        self.assertEqual(self.claim("mac", second, 102)[0], 11)
+        self.assertEqual(saved.path.read_bytes(), original)
 
     def test_linux_clones_with_different_names_share_origin_capacity(self) -> None:
         main = self.repository("project", "git@github.com:nate/project.git")

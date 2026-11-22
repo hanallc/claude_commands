@@ -97,6 +97,7 @@ from scripts.lib import process_start as process_identity
 from scripts.build_targets import target_config
 from scripts.build_targets.target_config import ConfigError
 from scripts.buildlog.mac_idle_alert import MacIdleConfigError, idle_config as idle_config
+from scripts.buildlog.repository import repository_key_case
 
 if TYPE_CHECKING:
     from scripts.build_queue.placement import SubmittingSession
@@ -745,7 +746,7 @@ def claim_scope_matches(paths: StatePaths, claim: HeldClaim, scope: ClaimScope) 
     if paths.platform == "linux":
         return scopes_overlap(claim.scope, scope)
     if isinstance(claim.scope, RepositoryScope) and isinstance(scope, RepositoryScope):
-        return bool(scope.key) and claim.scope.key == scope.key
+        return bool(scope.key) and repository_key_case(claim.scope.key) == repository_key_case(scope.key)
     return isinstance(scope, WholeMacScope) and claim.path == paths.run and claim.scope == scope
 
 
@@ -877,6 +878,7 @@ def remember_slot(paths: StatePaths, scope: RepositoryScope, record: RunRecord) 
 def live_claims(paths: StatePaths) -> tuple[HeldClaim, ...]:
     """Read every claim and remove each one whose owner has ended."""
     claims, retained = claim_state.sweep_mac_replacements(paths, read_claims(paths))
+    claim_state.sweep_wait_locations(paths)
     live: list[HeldClaim] = []
     for claim in claims:
         if claim.path in retained or run_is_live(claim.record):
@@ -2065,6 +2067,9 @@ def claim_once(args: CliArguments, paths: StatePaths, scope: ClaimScope,
                     and not run_is_kept(claim.record) and "slot" in claim.record
                     and (not args.leased_slots or claim.record["slot"] in args.leased_slots)
                     and isinstance(block, NoMacBlock)):
+                if reserve_wait and "remote_host" not in claim.record:
+                    claim_state.save_wait_location(paths, identity,
+                                                   claim_state.WaitReservationLocation.for_claim(claim.path, claim.record))
                 return finished_claim(args, claim.record, claim.path)
         for slot in slots:
             selected = RepositoryScope(scope.name, scope.key, slot)
@@ -2141,6 +2146,9 @@ def claim_once(args: CliArguments, paths: StatePaths, scope: ClaimScope,
         if claim.path == path:
             return ClaimBusy(claim.record)
     path.parent.mkdir(parents=True, exist_ok=True)
+    if reserve_wait and "remote_host" not in claimed:
+        claim_state.save_wait_location(paths, claim_state.claim_identity(claimed),
+                                       claim_state.WaitReservationLocation.for_claim(path, claimed))
     # Keep the old reservation until the replacement is visible.
     write_json(path, claimed)
     if isinstance(replaces, _VerifiedMacReservation):
@@ -2195,11 +2203,13 @@ def replace_incomplete_wait_claim(
     proof = claim_state.retired_mac_reservation_path(paths, identity)
     if isinstance(assignment, UnassignedClaim):
         scope = RepositoryScope(repository.mirror_name, repository.key)
-    elif not isinstance(scope, RepositoryScope) or scope.key != repository.key:
+    elif not isinstance(scope, RepositoryScope) or repository_key_case(scope.key) != repository_key_case(repository.key):
         if isinstance(replaces, _VerifiedMacReservation):
             replaces.path.unlink()
         proof.unlink(missing_ok=True)
         return ClaimFinished(claim_state.LEGACY_WAIT_CLAIM_RELEASED, ("legacy reservation released",))
+    else:
+        scope = RepositoryScope(scope.name, repository.key, scope.slot)
     replacement = copy(args)
     replacement.claim_id, replacement.episode, replacement.attempt = "", args.retire_wait, ""
     if not isinstance(assignment, UnassignedClaim):
@@ -2371,7 +2381,8 @@ def command_claim(args: CliArguments, paths: StatePaths, *, watch_claim: bool = 
         if destination.provider == "ssh" and (not isinstance(scope, RepositoryScope) or scope.slot != destination.slot):
             return 12
         if paths.platform == "macos" and isinstance(scope, RepositoryScope) and not args.from_pid:
-            if not isinstance(mac_repository, claim_state.MacMirrorIdentity) or (scope.key and scope.key != mac_repository.key):
+            if (not isinstance(mac_repository, claim_state.MacMirrorIdentity)
+                    or (scope.key and repository_key_case(scope.key) != repository_key_case(mac_repository.key))):
                 print("the assigned Mac repository has changed", file=sys.stderr)
                 return 12
             # Keep the mirror file name for an assignment from an older client.
