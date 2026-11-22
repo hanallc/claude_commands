@@ -490,6 +490,7 @@ Upkeep checks the hold under the producer's row lock. It reports the skipped pro
 `agents resume` and `agents restart` clear the hold after the producer starts or a live process confirms it already runs.
 Resume in the producer's own pane clears the hold before `execvpe`, so upkeep can retry if the new agent exits.
 A saved restart ID alone does not block upkeep. A crash without an exit hold remains eligible for recovery.
+Accepted limit: a storage fault after the hold write (a failed directory sync, or an unreadable staff record during rollback) can leave a running producer with a hold. Upkeep then does not recover it after a crash; `agents resume NAME` clears the hold.
 
 ## Worker resume results
 
