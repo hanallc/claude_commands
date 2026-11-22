@@ -1925,8 +1925,6 @@ def finished_claim(args: CliArguments, record: RunRecord, path: Path, *, adopted
         lines.append("claim_fence=" + claim_state.claim_fence_directory(path, record))
         if "mac_repository" in record:
             lines.append("mac_repository=" + json.dumps(record["mac_repository"]))
-        elif record.get("cleanup_pending") and (mirror := claim_state.legacy_mac_mirror_name(record)):
-            lines.append("claim_mirror=" + mirror)
     slot = (f"slot: {record['slot']}",) if "slot" in record else ()
     if "remote_host" in record and record.get("cleanup_pending"):
         leftovers = f"leftovers: {record['remote_host']}"
@@ -2280,7 +2278,7 @@ def command_claim(args: CliArguments, paths: StatePaths, *, watch_claim: bool = 
 
 @dataclass(frozen=True)
 class EndStoppedWork:
-    """The holder has exited: end its mirror's remote work before the start fence settles."""
+    """Confirm that remote work has ended after the holder exits."""
 
     repository: eligibility.KnownRepository
 
@@ -2332,14 +2330,14 @@ def release_exact_claims(
             connection = eligibility.read_connection_settings(Path(settings) if settings else config_path(paths.target))
             fence = offload.start_fence_command(identity, paths.target, settle=True,
                                                scope_key=claim_state.claim_fence_directory(path, record))
-            # Stopped work ends first, so the fence it holds is free to settle.
-            saved = claim_state.saved_mac_repository(record)
-            mirror = (eligibility.KnownRepository(saved.mirror_name, saved.key)
-                      if isinstance(saved, claim_state.MacRepositoryIdentity) else
-                      remote_work.repository if isinstance(remote_work, EndStoppedWork) else offload.ALL_MIRRORS)
-            command = (offload.leftover_check_script(mirror, paths.target, record.get("slot", 0) or 1)
-                       + "\n" + fence + "\n" if isinstance(remote_work, EndStoppedWork)
-                       else fence + "\nprintf 'leftovers=0\\nrc=0\\n'\n")
+            if isinstance(remote_work, EndStoppedWork):
+                # Check stopped work before settling the fence it can hold.
+                mirror = (offload.mac_cleanup_scope(claim_state.saved_mac_repository(record))
+                          if paths.platform == "macos" else remote_work.repository)
+                command = (offload.leftover_check_script(mirror, paths.target, record.get("slot", 0) or 1)
+                           + "\n" + fence + "\n")
+            else:
+                command = fence + "\nprintf 'leftovers=0\\nrc=0\\n'\n"
             observed = offload.read_leftovers(connection, record["remote_host"], command, paths.target)
             if not isinstance(observed.result, offload.LeftoversEnded):
                 return ClaimReleaseRefused("the remote work of the claim has not ended")

@@ -1908,10 +1908,27 @@ class BusyRemoteMirror(CopyError):
 
 
 @contextmanager
+def remote_host_lease(host: str, *, exclusive: bool) -> Generator[None]:
+    """Use a shared lease for one mirror and an exclusive lease for all mirrors."""
+    registry = remote_registry()
+    registry.mkdir(parents=True, exist_ok=True)
+    lock_path = registry / (remote_key(host, "") + ".host-lease")
+    with lock_path.open("a", encoding="utf-8") as lock:
+        operation = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
+        try:
+            fcntl.flock(lock.fileno(), operation | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            raise BusyRemoteMirror(f"{host}: a mirror lease is busy") from error
+        yield
+
+
+@contextmanager
 def remote_lease(mirror: RemoteMirror) -> Generator[None]:
     """Take the mirror lease before admission, claims and record locks."""
-    remote_registry().mkdir(parents=True, exist_ok=True)
-    with file_lock.exclusive(remote_lease_path(mirror), wait=False) as state:
+    with (
+        remote_host_lease(mirror.host, exclusive=False),
+        file_lock.exclusive(remote_lease_path(mirror), wait=False) as state,
+    ):
         if state is file_lock.LockResult.BUSY:
             record = remote_record_path(mirror)
             session = read_remote_mirror(record).session if record.exists() else mirror.session

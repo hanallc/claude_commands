@@ -233,8 +233,6 @@ def main() -> int:
                  "claim_fence=" + claim_state.claim_fence_directory(path, record)]
         if "mac_repository" in record:
             reply.append("mac_repository=" + json.dumps(record["mac_repository"]))
-        elif mirror := claim_state.legacy_mac_mirror_name(record):
-            reply.append("claim_mirror=" + mirror)
         path.parent.mkdir(parents=True, exist_ok=True)
         actions = (root / "state-events").read_text().splitlines()
         cleanup_pending = record.get("cleanup_pending", False)

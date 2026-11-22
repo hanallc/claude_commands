@@ -3341,8 +3341,8 @@ class ClaimWatchTests(NotificationGuardedTestCase):
                 _ = pending.write_text("pending")
                 scripts: list[str] = []
 
-                def end_work(repository: eligibility.KnownRepository, target: str, slot: int) -> str:
-                    self.assertEqual((repository.name, target, slot), ("alpha", self.paths.target, 1))
+                def end_work(repository: offload.MirrorScope, target: str, slot: int) -> str:
+                    self.assertEqual((repository, target, slot), (offload.ALL_MIRRORS, self.paths.target, 1))
                     return f"echo ended-work; printf 'leftovers={leftovers}\\nrc=0\\n'"
 
                 def remote(arguments: list[str], **options: object) -> subprocess.CompletedProcess[str]:

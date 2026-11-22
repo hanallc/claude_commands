@@ -1040,6 +1040,13 @@ class OffloadCommandTests(OffloadCommandFixture):
 
         missing = self.repository
         _ = missing.rename(self.root / "former-checkout")
+        selectors = self.stub_directory / "selectors"
+        selectors.mkdir()
+        self.write_executable(selectors / "pgrep", "raise SystemExit(1)\n")
+        self.write_executable(selectors / "lsof", f"print('p41\\nn/home/fixture/{FIXTURE_MIRROR_ROOT}/old-mirror')\n")
+        self.write_executable(selectors / "sleep", "raise SystemExit(0)\n")
+        self.fixture["selector_shell"] = "sh"
+        self.sync_fixture()
         result = self.command(repository=missing, subprocess_cli=True, assigned_adapter=True, settings=Path(settings), runner_options=(
             *assignment, "--target", target, "--claim-owner-pid", waiter, "--claim-id", claim_id,
             "--episode", episode, "--attempt", attempt, "--claim-session", session,
@@ -1047,7 +1054,7 @@ class OffloadCommandTests(OffloadCommandFixture):
         self.assertEqual(result.returncode, 75, result.stdout)
         self.assertTrue(result.stdout.endswith(f"mac_test: not running on the {target} (busy)\n"), result.stdout)
         self.assert_wire("declined", "busy")
-        self.assertFalse(claim_file.exists())
+        self.assertTrue(claim_file.exists())
         cleanup, = self.leftover_events()
         self.assertEqual(self.events(), [cleanup])
         adopted = cleanup.get("claim")
@@ -1058,13 +1065,8 @@ class OffloadCommandTests(OffloadCommandFixture):
         self.assertEqual(adopted["worktree"], ".")
         self.assertEqual(adopted["remote_host"], retained["remote_host"])
         script = cleanup["args"][-1]
-        self.assert_leftover_selectors(script)
         self.assertNotIn("kill ", script)
-        fixture_commands = ("pgrep() { return 1; }\n"
-                            + f"lsof() {{ printf 'p41\\nn/home/fixture/{FIXTURE_MIRROR_ROOT}/other\\n'; }}\n")
-        counted = subprocess.run(["bash", "-c", fixture_commands + script], check=True, capture_output=True,
-                                 text=True, timeout=5)
-        self.assertEqual(counted.stdout.splitlines(), ["leftovers=0", "rc=0"])
+        self.assertEqual((self.stub_directory / "selector-answer").read_text().splitlines(), ["leftovers=1", "rc=0"])
 
     def test_claim_stub_preserves_the_host_and_worktree_during_cleanup_handoff(self) -> None:
         kept = self.write_kept_claim(legacy=True)

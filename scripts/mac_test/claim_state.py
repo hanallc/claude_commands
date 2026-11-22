@@ -298,7 +298,7 @@ class MacRepositoryRecord(TypedDict):
 
 @dataclass(frozen=True)
 class MacRepositoryIdentity:
-    """The repository, mirror, and files selected when a Mac claim starts."""
+    """The repository, proven mirror, and files saved when a Mac claim starts."""
 
     key: str
     mirror_name: str
@@ -353,7 +353,7 @@ def mac_repository_record(value: object) -> MacRepositoryIdentity:
 
 
 class NoSavedMacRepository:
-    """The claim has no structured Mac repository identity."""
+    """The claim has no proven mirror. A legacy scope name does not identify a mirror."""
 
 
 NO_SAVED_MAC_REPOSITORY = NoSavedMacRepository()
@@ -361,11 +361,6 @@ NO_SAVED_MAC_REPOSITORY = NoSavedMacRepository()
 
 def saved_mac_repository(record: RunRecord) -> MacRepositoryIdentity | NoSavedMacRepository:
     return mac_repository_record(record["mac_repository"]) if "mac_repository" in record else NO_SAVED_MAC_REPOSITORY
-
-
-def legacy_mac_mirror_name(record: RunRecord) -> str:
-    name = record.get("repo_name", "")
-    return name if valid_mac_path_component(name) else ""
 
 
 def claim_fence_directory(path: Path, record: RunRecord) -> str:

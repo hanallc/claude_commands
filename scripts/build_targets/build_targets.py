@@ -1005,8 +1005,7 @@ def cleanup_refused_claims(target: SshTarget, args: CliArguments, *, session: Su
         try:
             mirror: offload.MirrorScope = offload.ALL_MIRRORS
             if paths.platform == "macos":
-                mirror = offload.mac_cleanup_scope(claim_state.saved_mac_repository(claim.record),
-                                                   claim_state.legacy_mac_mirror_name(claim.record))
+                mirror = offload.mac_cleanup_scope(claim_state.saved_mac_repository(claim.record))
             else:
                 cleanup_scope = claim.scope if isinstance(claim.scope, claim_state.RepositoryScope) else scope
                 if not isinstance(cleanup_scope, claim_state.RepositoryScope):
