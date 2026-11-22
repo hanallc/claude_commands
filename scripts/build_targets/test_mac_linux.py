@@ -80,7 +80,8 @@ if probe:
 assert 'mkdir -p -- "$checkout/.git"' in shell
 assert 'O_NOFOLLOW' in shell
 assert 'EPOCHREALTIME' not in shell
-assert f'timeout --signal=KILL {os.environ["FIXTURE_RUN_SECONDS"]} python3' in shell
+outer_seconds = int(os.environ['FIXTURE_RUN_SECONDS']) + int(os.environ['FIXTURE_TRANSFER_SECONDS'])
+assert f'timeout --signal=KILL {outer_seconds} python3' in shell
 payload = sys.stdin.buffer.read()
 offset = re.search(r'^head -c ([0-9]+) [|] tar', shell, re.M)
 assert offset
@@ -119,6 +120,7 @@ import os
 from pathlib import Path
 import signal
 import subprocess
+from time import sleep
 
 from scripts.copies import copies
 from scripts.production.gate_modules import discover_test_modules
@@ -172,6 +174,12 @@ def run_suites(repo, *, full, mode, machine, selected, module_time_limit_s, time
         signal.pause()
     if scenario == 'runner-failure':
         raise RuntimeError('fixture guest runner failed')
+    if scenario == 'time-limit':
+        sleep(time_limit.seconds)
+        report = f'time limit: limit {time_limit.seconds:g} s'
+        jobs = tuple(GateJobResult(suite, path.name, 124, time_limit.seconds, report)
+                     for suite, path in discover_test_modules(repo))
+        return GateRun(jobs, time_limit.seconds, 0, time_limit_report=report)
     if scenario == 'leave-edit':
         (repo / 'history.txt').write_text('copy edit\\n')
     timing = dict(wall_s=1.3, cpu_s=1.0, tests_s=0.7, tests_run=3, failures=0, errors=0, tests=[])
@@ -249,6 +257,7 @@ class MacLinuxRouteTests(unittest.TestCase):
             'FIXTURE_BUNDLE_FORMS': str(self.root / 'bundle.forms'),
             'FIXTURE_GUEST_USER': account, 'FIXTURE_GUEST_RESULT': 'pass',
             'FIXTURE_RUN_SECONDS': '7', 'FIXTURE_RUN_GROUP': str(self.root / 'run.group'),
+            'FIXTURE_TRANSFER_SECONDS': str(mac_linux.TRANSFER_ALLOWANCE_SECONDS),
             'BUILDLOG_UNIT': 'caller', 'FIXTURE_EXPECTED_UNIT': 'caller',
             'GH_TOKEN': 'fixture-token', 'SSH_AUTH_SOCK': str(self.root / 'agent.sock'),
             'XDG_CONFIG_HOME': str(self.root / 'outside-config'),
@@ -725,7 +734,8 @@ fi
     def test_guest_deadline_stops_a_hung_runner(self) -> None:
         configuration = self.registry.with_name('mac_linux.conf')
         _ = configuration.write_text(configuration.read_text().replace('seconds=7', 'seconds=3'))
-        with patch.dict(os.environ, {'FIXTURE_RUN_SECONDS': '3'}):
+        with (patch.dict(os.environ, {'FIXTURE_RUN_SECONDS': '3', 'FIXTURE_TRANSFER_SECONDS': '4'}),
+              patch.object(mac_linux, 'TRANSFER_ALLOWANCE_SECONDS', 4)):
             result = self.route('hang')
         self.assertIsInstance(result, str)
         self.assertRegex(str(result), r'SSH or source stream exited (9|137):')
@@ -733,6 +743,17 @@ fi
         self.assertTrue((self.root / 'run.group').is_file())
         self.assertEqual(subprocess.call(['flock', '-x', '-n', self.run_lock(), 'true']), 0)
         self.assertEqual(self.trace.read_text().splitlines(), ['probe', 'arm', 'run', 'cleanup'])
+
+    def test_guest_returns_its_time_limit_result(self) -> None:
+        configuration = self.registry.with_name('mac_linux.conf')
+        _ = configuration.write_text(configuration.read_text().replace('seconds=7', 'seconds=2'))
+        with patch.dict(os.environ, {'FIXTURE_RUN_SECONDS': '2'}):
+            result = self.route('time-limit')
+        assert isinstance(result, mac_linux.MacLinuxGateRun), result
+        self.assertFalse(result.passed)
+        self.assertEqual(result.time_limit_report, 'time limit: limit 2 s')
+        self.assertEqual([job.returncode for job in result.jobs], [124, 124])
+        self.assert_guest_clean('probe', 'arm', 'run', 'cleanup')
 
     def test_guest_returns_module_metrics(self) -> None:
         result = self.route()

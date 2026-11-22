@@ -8,6 +8,7 @@ import json
 import math
 import os
 from pathlib import Path
+from stat import S_ISREG
 from scripts.build_queue import execution_identity
 from scripts.build_hold.shared_state_defaults import DEFAULT_ADMISSION_SOCKET as DEFAULT_ADMISSION_SOCKET
 from typing import TYPE_CHECKING, TypeVar, cast
@@ -42,6 +43,7 @@ else:
     placement = _DeferredPlacement()
 
 VERSION = 3
+ASSIGNMENT_MAX_BYTES = 1024 * 1024
 
 
 def _no_test_width() -> records.NoTestWidth:
@@ -752,7 +754,7 @@ def parse_envelope(line: str | bytes, variants: dict[str, type]) -> tuple[int, o
         if version < 3 and variants[name] in _PLACEMENT_TYPES:
             raise ValueError("placement requires version 3")
         return version, cast(object, _parse_value(data, variants[name]))
-    except (ArithmeticError, KeyError, TypeError, UnicodeError) as error:
+    except (ArithmeticError, KeyError, RecursionError, TypeError, UnicodeError) as error:
         raise ValueError("invalid admission message") from error
 
 
@@ -824,7 +826,16 @@ def encode_reply(reply: Reply, *, version: int = VERSION) -> str:
 
 
 def read_assignment(path: Path) -> Assignment | LocalPlacementGranted:
-    reply = parse_reply(path.read_text())
+    def open_assignment(name: str, flags: int) -> int:
+        return os.open(name, flags | os.O_NONBLOCK)
+
+    with open(path, "rb", opener=open_assignment) as stream:
+        if not S_ISREG(os.fstat(stream.fileno()).st_mode):
+            raise AdmissionUnavailable("the assignment file must be a regular file")
+        data = stream.read(ASSIGNMENT_MAX_BYTES + 1)
+    if len(data) > ASSIGNMENT_MAX_BYTES:
+        raise AdmissionUnavailable("the assignment file exceeds its size limit")
+    reply = parse_reply(data.decode("utf-8"))
     if isinstance(reply, (Assignment, LocalPlacementGranted)):
         return reply
     raise AdmissionUnavailable("file contains no assigned attempt")

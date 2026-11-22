@@ -79,7 +79,7 @@ from scripts.lib.process_start import Started, Unreadable, Zombie, process_start
 from scripts.copies import copies
 from scripts.lib import build_folders, cancellation, conf, land_main, main_push_lock, session_folder, unit_runs, waiting_rows
 from scripts.lib.atomic_file import write_text_atomic
-from scripts.lib.build_steps import gate_job_for_command, read_step_names
+from scripts.lib.build_steps import gate_job_for_command, gate_job_from_process, read_step_names
 from scripts.lint import sweep
 from scripts.message import send_budget, session_send
 from scripts.production import (  # noqa: E402
@@ -106,7 +106,7 @@ from scripts.lib.user_zone import user_zone  # noqa: E402
 from scripts.lib.process_failure import failure_detail  # noqa: E402
 from scripts.lib import scratch  # noqa: E402
 from scripts.test_times import gate_record
-from scripts.build_queue import admission_records, admission_wire  # noqa: E402
+from scripts.build_queue import admission_client, admission_records, admission_wire, placement  # noqa: E402
 from scripts.build_queue import progress_profile
 from scripts.build_queue.admission_client import AdmissionHoldCheck  # noqa: E402
 from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, GateJobNotRecorded, StepJob
@@ -2929,19 +2929,35 @@ def combine_gate_runs(first: GateRun, second: GateRun, *, seconds: float) -> Gat
                    time_limit_report=reports)
 
 
-def mac_linux_gate_placed() -> bool:
-    """Check that the enabled Mac Linux guest has the queue assignment."""
+def mac_linux_gate_placed(mode: SuiteMode, gate_job: StepJob | GateJobNotRecorded) -> bool:
+    """Check that the current gate has the Mac Linux assignment."""
     path = os.environ.get("BUILDLOG_PLACEMENT_FILE")
     if not path:
         return False
     try:
+        saved = admission_wire.read_assignment(Path(path)).assignment
+        if saved.destination.target != "mac-linux":
+            return False
         if not conf.read("build_targets").value("enabled.mac-linux", conf.on_off,
                                                default=False, recover_invalid=False):
             return False
-        placement = admission_wire.read_assignment(Path(path))
+        if not isinstance(gate_job, StepJob) or saved.episode != os.environ.get("BUILDLOG_PLACEMENT_EPISODE"):
+            return False
+        owner = saved.owner
+        identity = build_hold.ProcessIdentity(owner.pid, owner.start_time)
+        pid = os.getpid()
+        if (owner.host != host_name()
+                or identity not in build_hold.caller_processes(build_hold.PROC_ROOT, pid)):
+            return False
+        if (owner.pid != pid and gate_job != gate_job_from_process(
+                mode.value, build_hold.PROC_ROOT / str(owner.pid), start_time=owner.start_time)):
+            return False
+        status = admission_client.placement_status(saved.episode, saved.attempt, wait_for_service=False).status
+        return (isinstance(status, admission_wire.KnownPlacementStatus)
+                and isinstance(status.state, placement.CurrentAssignment)
+                and status.assignment == saved)
     except (OSError, ValueError, admission_wire.AdmissionUnavailable):
         return False
-    return placement.assignment.destination.target == "mac-linux"
 
 
 def run_gate_suites(repo: Path, type_dirs: Sequence[str] = (),
@@ -2977,7 +2993,7 @@ def run_gate_suites(repo: Path, type_dirs: Sequence[str] = (),
         return finish_remote(outcome)
 
     def run_whole_gate(selection: AllModules | TreeSelection) -> GateRun:
-        if mac_linux_gate_placed():
+        if mac_linux_gate_placed(mode, gate_job):
             guest = cast(WholeGateRoute, cast(object, import_module("scripts.build_targets.mac_linux")))
             outcome = attempt(guest, selection)
             if isinstance(outcome, GateRun):

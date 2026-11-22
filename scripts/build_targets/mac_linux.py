@@ -40,7 +40,7 @@ ORIGIN_MAIN = 'refs/remotes/origin/main'
 SSH_CONNECT_TIMEOUT_SECONDS = 8
 SSH = ('ssh', '-T', '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=yes', '-o', 'ForwardAgent=no',
        '-o', f'ConnectTimeout={SSH_CONNECT_TIMEOUT_SECONDS}', '-o', 'ServerAliveInterval=15', '-o', 'ServerAliveCountMax=2')
-# Give SSH time to connect and return the result.
+# Allow time for setup, cleanup, and result transfer.
 TRANSFER_ALLOWANCE_SECONDS = 120
 GUEST_REF_TIMEOUT_SECONDS = 30
 GUEST_KILL_GRACE_SECONDS = 3
@@ -84,8 +84,12 @@ class GuestSettings:
     run_time_limit_seconds: int
 
     @property
-    def transfer_timeout_seconds(self) -> int:
+    def guest_timeout_seconds(self) -> int:
         return self.run_time_limit_seconds + TRANSFER_ALLOWANCE_SECONDS
+
+    @property
+    def transfer_timeout_seconds(self) -> int:
+        return self.guest_timeout_seconds + TRANSFER_ALLOWANCE_SECONDS
 
     def command(self, shell: str) -> tuple[str, ...]:
         mac, guest = self.ssh_hops
@@ -457,7 +461,7 @@ umask 022
     start = guest_attempt_command('start', armed, RUN_LOCK_FD)
     locked_run = f'''set -euo pipefail
 {lock}
-exec timeout --signal=KILL {settings.run_time_limit_seconds} {start} "$BASHPID" {shlex.quote(checkout)}'''
+exec timeout --signal=KILL {settings.guest_timeout_seconds} {start} "$BASHPID" {shlex.quote(checkout)}'''
     return guest_checkout_shell(settings) + f'\nexec setsid --wait {open_run_lock_command(RUN_LOCK_FD, locked_run)}'
 
 
