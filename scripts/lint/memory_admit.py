@@ -914,29 +914,51 @@ class LiveOwnerProcess:
     pass
 
 
-def scope_members(directory: Path) -> set[int]:
-    """Read nested scope members and skip scopes removed during the walk."""
-    members: set[int] = set()
-    pending = [directory]
-    while pending:
-        scope = pending.pop()
+class ScopeMembershipPass:
+    """Read each scope once for a memory reading, including nested scopes."""
+
+    def __init__(self) -> None:
+        self.members: dict[Path, frozenset[int] | OSError | ValueError] = {}
+
+    def read(self, directory: Path) -> frozenset[int]:
+        if directory not in self.members:
+            try:
+                self.members[directory] = self._read(directory)
+            except (OSError, ValueError) as error:
+                self.members[directory] = error
+        members = self.members[directory]
+        if isinstance(members, (OSError, ValueError)):
+            raise members
+        return members
+
+    def _read(self, directory: Path) -> frozenset[int]:
+        members: set[int] = set()
         try:
-            path = scope / "cgroup.procs"
+            path = directory / "cgroup.procs"
             check_memory_reading(path)
             members.update(int(pid) for pid in path.read_text().split())
-            pending.extend(child for child in scope.iterdir() if child.is_dir())
+            children = [child for child in directory.iterdir() if child.is_dir()]
         except OSError as error:
             if error.errno not in (errno.ENOENT, errno.ESRCH, errno.ENODEV):
                 raise
-    return members
+            return frozenset(members)
+        for child in children:
+            members.update(self.read(child))
+        return frozenset(members)
 
 
-def process_memory(source: set[int] | PopulatedStepScope, proc: Path = PROC) -> MeasuredMemory:
+def scope_members(directory: Path) -> set[int]:
+    """Read nested scope members and skip scopes removed during the walk."""
+    return set(ScopeMembershipPass().read(directory))
+
+
+def process_memory(source: set[int] | PopulatedStepScope, proc: Path = PROC, *,
+                   membership: ScopeMembershipPass | None = None) -> MeasuredMemory:
     """Read swap-backed use from the scope or processes; retain resident bytes and swap."""
     if isinstance(source, PopulatedStepScope):
         reading = slice_working_set(source.directory)
         try:
-            members = frozenset(scope_members(source.directory))
+            members = (membership or ScopeMembershipPass()).read(source.directory)
         except (OSError, ValueError) as error:
             return replace(reading, anonymous=RunUseUnavailable(f"{source.directory}: {error}"),
                            anonymous_source=ScopeSource(source.directory, frozenset()))
@@ -2841,9 +2863,12 @@ def builds_slice_cgroup() -> Path:
 
 def detached_tool_memory(memory: StepMemory, builds: Path) -> bool:
     """Identify an unowned tool scope below the detached builds slice."""
-    return (isinstance(memory, UnownedSliceMemory) and bool(memory.cgroup)
-            and not memory.diagnostic and isinstance(records.recorded_service_state(memory), NotServiceSlice)
-            and Path(memory.cgroup).is_relative_to(builds / "builds-detached.slice"))
+    if (not isinstance(memory, UnownedSliceMemory) or not memory.cgroup or memory.diagnostic
+            or not isinstance(records.recorded_service_state(memory), NotServiceSlice)):
+        return False
+    path = Path(memory.cgroup)
+    return path.is_relative_to(builds / "builds-detached.slice") or any(
+        parent.name == "builds-detached.slice" and parent.parent.name == "builds.slice" for parent in path.parents)
 
 
 def desktop_guarantee() -> int | ReadingUnavailable:
@@ -2990,7 +3015,8 @@ def build_scope_charge_groups(directory: Path) -> Iterable[Path]:
 
 def unowned_slice_memory(rows: list[Reservation], processes: dict[int, ProcessIdentity], proc: Path,
                          *, activity_reader: ScopeActivityReader | None = None,
-                         ci_memory_slice: str = "", waiters: Sequence[Waiter] = ()) -> tuple[UnownedSliceMemory, ...]:
+                         ci_memory_slice: str = "", waiters: Sequence[Waiter] = (),
+                         membership: ScopeMembershipPass | None = None) -> tuple[UnownedSliceMemory, ...]:
     """Count child scopes that no reservation owns, without duplicate process charges."""
     directory = builds_slice_cgroup()
     owned: set[Path] = set()
@@ -3006,6 +3032,7 @@ def unowned_slice_memory(rows: list[Reservation], processes: dict[int, ProcessId
             tree_pids.update(process_tree({row["pid"]: row["start_time"]}, processes))
     result: list[UnownedSliceMemory] = []
     activity_reader = activity_reader or ScopeActivityReader(processes, proc)
+    membership = membership or ScopeMembershipPass()
     children = list(build_scope_charge_groups(directory))
     ci_group = ci_slice_cgroup(ci_memory_slice) if ci_memory_slice else ReadingUnavailable("CI slice not configured")
     ci_groups = (ci_group,) if isinstance(ci_group, Path) else ()
@@ -3020,12 +3047,12 @@ def unowned_slice_memory(rows: list[Reservation], processes: dict[int, ProcessId
             working_set = slice_working_set(child)
             amount = working_set.bytes
             swapped = working_set.swap_bytes
-            members = scope_members(child)
-            scoped = [process_memory(PopulatedStepScope(scope), proc)
+            members = membership.read(child)
+            scoped = [process_memory(PopulatedStepScope(scope), proc, membership=membership)
                       for scope in owned_scope_roots(owned, child)] if required else []
             scoped_pids = {pid for memory in scoped if isinstance(memory.anonymous_source, ScopeSource)
                            for pid in memory.anonymous_source.members}
-            duplicate = process_memory((members & tree_pids) - scoped_pids, proc)
+            duplicate = process_memory((tree_pids & members) - scoped_pids, proc)
             duplicate_use = (duplicate.anonymous.bytes if required
                 and isinstance(duplicate.anonymous, AnonymousRunUse) else duplicate.bytes)
             duplicate_use += sum(memory.anonymous.bytes for memory in scoped
@@ -3035,7 +3062,7 @@ def unowned_slice_memory(rows: list[Reservation], processes: dict[int, ProcessId
                                              (duplicate.anonymous, *(memory.anonymous for memory in scoped)))
             swapped = max(0, swapped - duplicate.swap_bytes - sum(memory.swap_bytes for memory in scoped))
             promise: MemoryPromise = NoPromise()
-            activity = activity_reader.scope(members, child.name)
+            activity = activity_reader.scope(set(members), child.name)
             row_pid: int | PidNotRecorded = (activity.members[0].pid
                 if isinstance(activity, ScopeProcesses) and activity.members else PidNotRecorded())
             job_state: RunningServiceJob | IdleService | NotServiceSlice = NotServiceSlice()

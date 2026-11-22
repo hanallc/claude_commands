@@ -1614,6 +1614,31 @@ process.stdout.write(JSON.stringify({
         self.assertEqual(owner["bytes"], gib)
         self.assertEqual(swap.builds_ci, 4 * gib)
 
+    def test_swap_shows_both_cgroups_below_a_detached_tool_scope(self) -> None:
+        gib = admission_records.GIB
+        total = 3 * gib // 4
+        self.host_swap(2 * gib, total)
+        user = "user.slice/user-1000.slice/user@1000.service"
+        for group in ("user.slice", "user.slice/user-1000.slice", user):
+            _ = self.cgroup(group, total)
+        builds = user + "/builds.slice"
+        detached = builds + "/builds-detached.slice"
+        run = detached + "/builds-detached-r1.slice"
+        for group in (builds, detached, run):
+            _ = self.cgroup(group, total)
+        parent = self.cgroup(run + "/tool.scope", total)
+        _ = self.cgroup(run + "/tool.scope/first.scope", gib // 2)
+        _ = self.cgroup(run + "/tool.scope/second.scope", gib // 4)
+        tool = admission_records.RunningStep("", "tool", "unowned", str(parent), 0,
+            admission_records.UnownedSliceMemory(gib, cgroup=str(parent), owner="tool", pid=700001), pid=700001)
+        names = read_step_names()
+        baseline = memory_feed.read_swap((), {}, 6, names)
+        swap = memory_feed.read_swap((tool,), {}, 6, names)
+        assert isinstance(swap, memory_feed.SwapReading)
+        self.assertEqual(swap, baseline)
+        self.assertEqual([(row["name"], row["bytes"]) for row in swap.rows if row["kind"] == "owner"],
+                         [("first", gib // 2), ("second", gib // 4)])
+
     def test_swap_small_groups_and_total_use_the_same_current_host_reading(self) -> None:
         self.host_swap(4 * admission_records.GIB, 3 * admission_records.GIB)
         for number in range(3):
@@ -3808,6 +3833,45 @@ process.stdout.write(JSON.stringify({
             self.assertEqual(retained, original)
             self.assertEqual(owned["ram"]["queued_builds_bytes"], 5 * gib)
             self.assertEqual(owned["ram"]["build_tools_bytes"], 0)
+
+    def test_system_read_reuses_detached_scope_membership(self) -> None:
+        gib = admission_records.GIB
+        with AdmissionFixture() as fixture:
+            builds = Path(os.environ["BUILDLOG_BUILDS_CGROUP"])
+            run = builds / "builds-detached.slice/builds-detached-r1.slice"
+            helper = run / "helper.scope"
+            child = helper / "cargo.scope"
+            helper_owner = fixture.fixture_owner(700001, "100")
+            cargo_owner = fixture.fixture_owner(700002, "200")
+            write_scope(helper, members=(helper_owner.pid,), current=2 * gib, anonymous=2 * gib)
+            sidecar = fixture.scope(cargo_owner, folder=str(child.relative_to(fixture.root)), current=gib, anonymous=gib)
+            request = replace(fixture.request(owner=cargo_owner), sidecar=str(sidecar))
+            _ = only_admitted(fixture.server.handle_request(request))
+            record = fixture.server.reservations[request.episode]
+            config = fixture.server.last_usable_configuration
+            assert isinstance(config, admission_records.MemoryConfig)
+            plan = admission_service.SystemReadingPlan(config, (record,), (), False)
+            read_text = Path.read_text
+            reads: Counter[Path] = Counter()
+
+            def read_members(path: Path, encoding: str | None = None, errors: str | None = None) -> str:
+                if path.name == "cgroup.procs" and path.is_relative_to(run):
+                    reads[path.parent] += 1
+                return read_text(path, encoding=encoding, errors=errors)
+
+            # The real lifetime check reads the reserved scope's direct members.
+            with (mock.patch.object(fixture.proc, "lifetime", return_value=gate.PopulatedStepScope(child)),
+                  mock.patch.object(Path, "read_text", autospec=True, side_effect=read_members)):
+                first = admission_service.read_system(plan, fixture.readings, fixture.proc, fixture.clock)
+                self.assertEqual(reads, {helper: 1, child: 1})
+                _ = (helper / "cgroup.procs").write_text("")
+                second = admission_service.read_system(plan, fixture.readings, fixture.proc, fixture.clock)
+                self.assertEqual(reads, {helper: 2, child: 2})
+            self.assertEqual(first.scope_members[str(helper)], {helper_owner.pid, cargo_owner.pid})
+            self.assertEqual(second.scope_members[str(helper)], {cargo_owner.pid})
+            memory = first.reservations[request.episode].memory
+            assert isinstance(memory, admission_records.MeasuredMemory)
+            self.assertEqual(memory.anonymous_source, admission_records.ScopeSource(child, frozenset({cargo_owner.pid})))
 
     def test_registered_and_unregistered_ci_jobs_count_once_without_margin_text(self) -> None:
         for registered, registered_use, unregistered_use, kept in (

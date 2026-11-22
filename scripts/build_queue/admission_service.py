@@ -660,13 +660,13 @@ class ReservationEvidence:
 
 def raw_reservation_memory(record: ReservationRecord, row: records.Reservation,
                            lifetime: gate.StepLifetime, processes: dict[int, gate.ProcessIdentity],
-                           proc: Path) -> records.StepMemory:
+                           proc: Path, *, membership: gate.ScopeMembershipPass | None = None) -> records.StepMemory:
     _ = record
     if isinstance(lifetime, gate.EndedStep):
         return records.GoneMemory()
     if isinstance(lifetime, gate.PopulatedStepScope):
         try:
-            return gate.process_memory(lifetime, proc)
+            return gate.process_memory(lifetime, proc, membership=membership)
         except FileNotFoundError:
             identity = processes.get(row["pid"])
             if identity is None or identity.start != row["start_time"]:
@@ -746,13 +746,14 @@ class SystemEvidence:
 
 def read_system(plan: SystemReadingPlan, readings: Readings, proc: Proc, clock: Clock, *,
                 reservation_reader: Callable[[ReservationRecord, records.Reservation, gate.StepLifetime,
-                    dict[int, gate.ProcessIdentity], Path], records.StepMemory] = raw_reservation_memory) -> SystemEvidence:
+                    dict[int, gate.ProcessIdentity], Path], records.StepMemory] | None = None) -> SystemEvidence:
     """Read operating-system evidence without access to mutable service state."""
     started_monotonic = clock.monotonic()
     now = clock.now()
     processes = proc.processes()
     activity = ScopeActivityReader(processes, proc.path,
         tuple(LiveBuildRun(place.run.pid, place.run.start_time, place.since) for place in plan.runs))
+    membership = gate.ScopeMembershipPass()
     lifetimes: dict[str, gate.StepLifetime] = {}
     reservations: dict[str, ReservationEvidence] = {}
     for record in plan.reservations:
@@ -760,7 +761,8 @@ def read_system(plan: SystemReadingPlan, readings: Readings, proc: Proc, clock: 
         live = owner_may_be_live(proc.owner_start(record.owner.pid), record.owner.start_time)
         lifetime = proc.lifetime(row, live)
         lifetimes[record.episode] = lifetime
-        memory = reservation_reader(record, row, lifetime, processes, proc.path)
+        memory = (raw_reservation_memory(record, row, lifetime, processes, proc.path, membership=membership)
+                  if reservation_reader is None else reservation_reader(record, row, lifetime, processes, proc.path))
         if isinstance(memory, records.MeasuredMemory):
             memory = replace(memory, promise=records.NoPromise(), observed_peak=0,
                              unknown_peak_promise=0, peak_history=records.NoPeakRecorded())
@@ -775,7 +777,7 @@ def read_system(plan: SystemReadingPlan, readings: Readings, proc: Proc, clock: 
             sample_file(Path(record.path).with_suffix(".wave")), gate.observed_test_phase(row), scope)
     # Capture every scope before the loop applies current reservation ownership.
     unowned = gate.unowned_slice_memory([], processes, proc.path,
-        activity_reader=activity, ci_memory_slice=plan.config.ci_memory_slice)
+        activity_reader=activity, ci_memory_slice=plan.config.ci_memory_slice, membership=membership)
     has_caller = plan.runs or any(isinstance(row.activity, ScopeProcesses) and row.activity.session_id for row in unowned)
     staff_members = records.queue_staff() if has_caller else records.NO_STAFF_LOOKUP
 
@@ -788,12 +790,9 @@ def read_system(plan: SystemReadingPlan, readings: Readings, proc: Proc, clock: 
     members: dict[str, frozenset[int]] = {}
     workers: dict[str, frozenset[int]] = {}
     for reading in unowned:
-        if not reading.cgroup:
+        if not reading.cgroup or reading.diagnostic:
             continue
-        try:
-            members[reading.cgroup] = frozenset(gate.scope_members(Path(reading.cgroup)))
-        except (OSError, ValueError):
-            members[reading.cgroup] = frozenset()
+        members[reading.cgroup] = membership.read(Path(reading.cgroup))
         if not isinstance(records.recorded_service_state(reading), NotServiceSlice):
             programs = gate.member_programs(members[reading.cgroup].intersection(processes), proc.path)
             workers[reading.cgroup] = frozenset(pid for pid, name in programs.items() if name == "Runner.Worker")
