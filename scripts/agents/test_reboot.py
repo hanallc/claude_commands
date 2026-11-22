@@ -36,9 +36,13 @@ class RebootTests(unittest.TestCase):
     save_stop: bool = True
     fail_stop: bool = False
     fail_server: bool = False
+    interrupt_server: bool = False
     fail_start: bool = False
+    plan_status: int = 0
     move_status: int = 0
     move_diagnostics: str = ""
+    live_sessions: tuple[staff.StaffRow, ...] = ()
+    stop_ids: tuple[str, ...] = ("alpha", "beta")
 
     @override
     def setUp(self) -> None:
@@ -69,6 +73,7 @@ from pathlib import Path
 lib = Path(__file__).parent
 if sys.argv[1:] == ['--dry-run']:
     print('session_move: would move 8 folders (1.75 GiB), kept 2 live, refused 0 other')
+    sys.exit(int((lib / 'plan-status').read_text()))
 else:
     print('copy 1024 bytes /scratch/alpha -> /sessions/alpha')
     print((lib / 'diagnostics').read_text(), file=sys.stderr, end='')
@@ -92,11 +97,13 @@ else:
 
         def move(log: reboot.RunLog, *, dry_run: bool = False) -> reboot.MoveResult:
             self.events.append("plan" if dry_run else "move")
-            self.check_upkeep(held=not dry_run)
+            if not dry_run:
+                self.check_upkeep(held=True)
             return move_folders(log, dry_run=dry_run)
 
         _ = self.enterContext(patch.object(restart, "use_report", side_effect=report))
         _ = self.enterContext(patch.object(restart, "stop_all", side_effect=self.stop))
+        _ = self.enterContext(patch.object(restart, "live_rows", side_effect=self.check_sessions))
         _ = self.enterContext(patch.object(restart, "restart", side_effect=self.start))
         _ = self.enterContext(patch.object(reboot, "move_folders", side_effect=move))
         _ = self.enterContext(patch.object(herdr, "herdr_binary", return_value="herdr"))
@@ -111,9 +118,9 @@ else:
         self.events.append("stop")
         self.check_upkeep(held=True)
         assert self.report is not None
-        self.report.targets.update({"alpha": "alpha", "beta": "beta"})
+        self.report.targets.update({key: key for key in self.stop_ids})
         if self.save_stop:
-            shutdown_record.save(["alpha", "beta"])
+            shutdown_record.update(started=[], pending=list(self.stop_ids))
         print("Stop detail from stdout")
         print("Stop detail from stderr", file=sys.stderr)
         for key in self.report.targets:
@@ -121,7 +128,14 @@ else:
                 self.report.failure(key, key, "The session still runs")
             else:
                 self.report.finish(key)
+        if not self.fail_stop:
+            self.live_sessions = ()
         return 0
+
+    def check_sessions(self, _record: staff.StaffSnapshot, _client: herdr.Herdr) -> restart.CompleteLiveRows:
+        self.events.append("check")
+        self.check_upkeep(held=True)
+        return restart.CompleteLiveRows(list(self.live_sessions))
 
     def start(self) -> int:
         self.events.append("start")
@@ -142,10 +156,14 @@ else:
         if args[-2:] == ["status", "server"]:
             return subprocess.CompletedProcess(args, 0, "status: running\n", "")
         self.assertEqual(args, ["herdr", "--session", "agents", "server", "stop"])
+        self.assertEqual(self.live_sessions, ())
         self.events.append("server")
+        if self.interrupt_server:
+            raise KeyboardInterrupt
         return subprocess.CompletedProcess(args, int(self.fail_server), "", "Server refused\n" if self.fail_server else "")
 
     def invoke(self, *arguments: str) -> tuple[int, list[str]]:
+        _ = (self.lib / "plan-status").write_text(str(self.plan_status))
         _ = (self.lib / "status").write_text(str(self.move_status))
         _ = (self.lib / "diagnostics").write_text(self.move_diagnostics)
         with redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors:
@@ -173,14 +191,14 @@ else:
         self.events.clear()
         code, lines = self.invoke()
         self.assertEqual(code, 0)
-        self.assertEqual(self.events, ["plan", "stop", "server", "move", "start"])
+        self.assertEqual(self.events, ["plan", "stop", "check", "server", "move", "start"])
         self.assertEqual(lines[-2:], ["Nate has no step.", "Attach: herdr session attach agents"])
 
     def test_rerun_continues_at_the_failed_step(self) -> None:
         self.fail_server = True
         code, lines = self.invoke()
         self.assertEqual(code, 1)
-        self.assertEqual(self.events, ["plan", "stop", "server"])
+        self.assertEqual(self.events, ["plan", "stop", "check", "server"])
         self.assertIn("alpha: The reboot stopped before it could restart this session. Nate runs agents reboot again.", lines)
 
         self.fail_server = False
@@ -188,7 +206,7 @@ else:
         self.events.clear()
         code, lines = self.invoke()
         self.assertEqual(code, 1)
-        self.assertEqual(self.events, ["server", "move", "start"])
+        self.assertEqual(self.events, ["check", "server", "move", "start"])
         self.assertIn("beta: The session failed to start. Nate runs agents reboot again.", lines)
 
         self.fail_start = False
@@ -196,6 +214,30 @@ else:
         self.assertEqual(self.invoke()[0], 0)
         self.assertEqual(self.events, ["start"])
         self.assertFalse((self.directory / "reboot.json").exists())
+
+    def test_server_retry_saves_and_stops_a_session_resumed_between_runs(self) -> None:
+        self.fail_server = True
+        self.assertEqual(self.invoke()[0], 1)
+        self.fail_server = False
+        self.fail_start = True
+        self.live_sessions = (staff.StaffRow(staff.StaffId("alpha"), "producer", "alpha", staff.StaffRoot(),
+                                             current_session=staff.StaffId("alpha-native")),)
+        self.stop_ids = ("alpha",)
+        self.events.clear()
+        self.assertEqual(self.invoke()[0], 1)
+        self.assertEqual(self.events, ["check", "plan", "stop", "check", "server", "move", "start"])
+        self.assertEqual(set(shutdown_record.read()), {"alpha", "beta"})
+
+    def test_interrupted_server_stop_names_the_saved_sessions(self) -> None:
+        self.interrupt_server = True
+        code, lines = self.invoke()
+        self.assertEqual(code, 1)
+        self.assertEqual(self.events, ["plan", "stop", "check", "server"])
+        for name in ("alpha", "beta"):
+            self.assertIn(f"{name}: The reboot stopped before it could restart this session. "
+                          + "Nate runs agents reboot again.", lines)
+        self.assertIn("agents reboot: The reboot was interrupted. Nate runs agents reboot again.", lines)
+        self.check_upkeep(held=False)
 
     def test_refuses_in_a_herdr_pane_on_one_line(self) -> None:
         with patch.dict(os.environ, {"HERDR_PANE_ID": "w1:p2"}):
@@ -222,6 +264,7 @@ else:
         self.assertFalse(any("\r" in line or "\x1b" in line for line in lines))
 
     def test_terminal_replaces_each_step_line(self) -> None:
+        _ = (self.lib / "plan-status").write_text("0")
         _ = (self.lib / "status").write_text("0")
         _ = (self.lib / "diagnostics").write_text("")
         with redirect_stdout(Terminal()) as output:
@@ -276,4 +319,13 @@ else:
         self.assertEqual(self.events, ["plan"])
         self.assertEqual(lines[1:], ["Plan: 1.75 GiB in idle folders now, 2 live folders sized after the stop."])
         self.assertFalse(shutdown_record.record_path().exists())
+        self.assertFalse((self.directory / "reboot.json").exists())
+
+    def test_dry_run_suppresses_incomplete_totals_and_fails(self) -> None:
+        self.plan_status = 1
+        code, lines = self.invoke("--dry-run")
+        self.assertEqual(code, 1)
+        self.assertEqual(self.events, ["plan"])
+        self.assertEqual(lines[1:], ["Plan: Incomplete. See the session_move details in the log."])
+        self.assertIn("1.75 GiB", Path(lines[0]).read_text())
         self.assertFalse((self.directory / "reboot.json").exists())

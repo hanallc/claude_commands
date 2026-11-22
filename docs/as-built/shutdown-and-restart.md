@@ -952,17 +952,22 @@ Run `agents reboot` from a terminal outside Herdr. The command refuses inside a 
 The shared Herdr session must have the name `agents`.
 
 1. Save and stop the local sessions through `agents stop --all`.
-2. Run `herdr --session agents server stop` after the stop confirms all selected sessions stopped and the restart record contains their IDs.
+2. Stop Herdr only when a fresh read finds no live or unidentified agent.
 3. Run `~/.claude/scripts/lib/py ~/.claude/scripts/lib/session_move.py`.
 4. Restore the server and the saved sessions through `agents restart`.
+
+The server stop uses `herdr --session agents server stop`.
 
 Before the first step, the command runs `session_move.py --dry-run` through the same Python shim.
 The plan gives the size of idle folders and counts live folders to size after the stop.
 Use `agents reboot --dry-run` to see the plan without running the four steps.
+If session move returns an error, the plan reports that it is incomplete and omits the totals. The dry run returns status 1.
 
 The reboot holds the Herdr upkeep job lock across the four steps and releases it on failure.
 A failed stop, server stop, or restart leaves the next step in `reboot.json`.
 Run `agents reboot` again to continue at that step.
+A retry at the server stop checks for resumed sessions. Step 1 saves and stops those sessions and keeps the earlier restart entries.
+If an interrupt ends the reboot, the report lists the saved sessions that still need a restart.
 A folder move failure permits restart to proceed.
 The final report names the failed copy folder if available and assigns the move failure to the verify owner.
 

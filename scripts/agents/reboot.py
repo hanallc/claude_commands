@@ -264,11 +264,15 @@ def run_bulk(step: Step, path: Path, display: StepDisplay) -> tuple[bool, list[r
 def show_plan(terminal: TextIO, log: RunLog) -> bool:
     planned = move_folders(log, dry_run=True)
     match = MOVE_SUMMARY.fullmatch(planned.summary)
-    line = (f"Plan: {match[1]} in idle folders now, {match[2]} live folders sized after the stop."
-            if match else "Plan: Could not size the session folders. See the log.")
+    if planned.code == 0 and match is not None:
+        line = f"Plan: {match[1]} in idle folders now, {match[2]} live folders sized after the stop."
+        complete = True
+    else:
+        line = "Plan: Incomplete. See the session_move details in the log."
+        complete = False
     print(line, file=terminal, flush=True)
     log.line(line)
-    return match is not None
+    return complete
 
 
 def report_pending(path: Path, log: RunLog, issues: list[restart.FollowUp]) -> None:
@@ -292,45 +296,77 @@ def report_pending(path: Path, log: RunLog, issues: list[restart.FollowUp]) -> N
                                            RETRY, operator=True))
 
 
+def check_sessions(path: Path, log: RunLog) -> tuple[list[staff.StaffRow], restart.BulkReport]:
+    report = restart.BulkReport(path, "agents stop --all", "agents reboot", reboot=True)
+    try:
+        with restart.use_report(report), redirect_stdout(log), redirect_stderr(log):
+            record = staff.initial_snapshot()
+            reading = restart.live_rows(record, herdr.Herdr(herdr.SHARED_SESSION))
+        if isinstance(reading, restart.PartialLiveRows) and not report.issues:
+            report.failure("", "Herdr", "Could not check all sessions")
+        for row in reading.rows:
+            report.track(row, record)
+        return reading.rows, report
+    except FAILURES as error:
+        report.failure("", "Herdr", f"Could not check the sessions. {error}")
+        return [], report
+
+
 def run_steps(checkpoint: Path, path: Path, terminal: TextIO, log: RunLog,
               interval: float) -> tuple[bool, list[restart.FollowUp]]:
     state = Checkpoint.read(checkpoint)
-    if state.step is Step.STOP:
-        _ = show_plan(terminal, log)
     issues: list[restart.FollowUp] = []
     failed = False
-    with herdr_upkeep.upkeep_lock(blocking=True) as hold:
-        if hold is None:
-            raise OSError("Could not hold the Herdr upkeep job")
-        for step in Step:
-            if step < state.step:
-                continue
-            display = StepDisplay(step, terminal, log)
-            failed = False
-            with display.display(interval):
-                if step in (Step.STOP, Step.START):
-                    failed, issues = run_bulk(step, path, display)
-                elif step is Step.SERVER:
-                    try:
-                        stop_server(log)
-                        display.detail = "Stopped"
-                    except FAILURES as error:
-                        display.detail = "Could not stop the server"
-                        issues = [restart.FollowUp("Herdr", str(error), RETRY, operator=True)]
-                        failed = True
+    try:
+        with herdr_upkeep.upkeep_lock(blocking=True) as hold:
+            if hold is None:
+                raise OSError("Could not hold the Herdr upkeep job")
+            checked: tuple[list[staff.StaffRow], restart.BulkReport] | None = None
+            if state.step is Step.SERVER:
+                rows, report = check_sessions(path, log)
+                if rows and not report.issues:
+                    state = Checkpoint(Step.STOP, state.move_failure)
+                    state.save(checkpoint)
                 else:
-                    moved = move_folders(log)
-                    state = Checkpoint(step, moved.failure())
-                    display.detail = moved.summary or "Could not complete session move"
-            if failed:
-                if step is not Step.START:
-                    report_pending(path, log, issues)
-                break
-            if step is Step.START:
-                checkpoint.unlink()
-            else:
-                state = Checkpoint(Step(step + 1), state.move_failure)
-                state.save(checkpoint)
+                    checked = rows, report
+            if state.step is Step.STOP:
+                _ = show_plan(terminal, log)
+            for step in Step:
+                if step < state.step:
+                    continue
+                display = StepDisplay(step, terminal, log)
+                with display.display(interval):
+                    if step in (Step.STOP, Step.START):
+                        failed, issues = run_bulk(step, path, display)
+                    elif step is Step.SERVER:
+                        rows, report = checked if checked is not None else check_sessions(path, log)
+                        for row in rows:
+                            report.failure(row.id, row.name, "The session still runs")
+                        if not report.issues:
+                            try:
+                                stop_server(log)
+                            except FAILURES as error:
+                                report.failure("", "Herdr", str(error))
+                        issues = list(report.issues.values())
+                        failed = bool(issues)
+                        display.detail = "Could not stop the server" if failed else "Stopped"
+                    else:
+                        moved = move_folders(log)
+                        state = Checkpoint(step, moved.failure())
+                        display.detail = moved.summary or "Could not complete session move"
+                if failed:
+                    if step is not Step.START:
+                        report_pending(path, log, issues)
+                    break
+                if step is Step.START:
+                    checkpoint.unlink()
+                else:
+                    state = Checkpoint(Step(step + 1), state.move_failure)
+                    state.save(checkpoint)
+    except KeyboardInterrupt:
+        failed = True
+        issues.append(restart.FollowUp("agents reboot", "The reboot was interrupted", RETRY, operator=True))
+        report_pending(path, log, issues)
     if state.move_failure:
         issues.append(restart.FollowUp("session_move", state.move_failure,
                                        "The verify owner checks the log."))
