@@ -31,25 +31,36 @@ assert host == 'fixture-guest'
 assert sys.argv[-4:-2] == ['-l', os.environ['FIXTURE_GUEST_USER']]
 shell = shlex.split(command)[-1]
 assert 'checkout="$HOME/.claude"' in shell
-assert 'mkdir -p -- "$checkout"' in shell
-assert 'exec 9< .' in shell
 assert shell.count('$HOME') == 1
+probe = 'bundle unbundle -' not in shell
 with Path(os.environ['FIXTURE_SSH_TRACE']).open('a') as trace:
-    trace.write('run\\n')
+    trace.write('probe\\n' if probe else 'run\\n')
 home = Path(os.environ['FIXTURE_GUEST_HOME'])
 if os.environ['FIXTURE_GUEST_RESULT'] == 'offline':
     print('fixture SSH refused the connection', file=sys.stderr)
     sys.exit(255)
 environment = dict(os.environ, HOME=str(home))
+if probe:
+    assert 'mkdir' not in shell
+    if 'FIXTURE_PROBED_MAIN' in os.environ:
+        print(os.environ['FIXTURE_PROBED_MAIN'])
+        sys.exit(0)
+    sys.exit(subprocess.call(['bash', '-c', shell], stdin=subprocess.DEVNULL, env=environment))
+assert 'mkdir -p -- "$checkout"' in shell
+assert 'exec 9< .' in shell
 payload = sys.stdin.buffer.read()
-offset = re.search(r'^head -c ([0-9]+) [|] zstd', shell, re.M)
+offset = re.search(r'^head -c ([0-9]+) [|] tar', shell, re.M)
 assert offset
 bootstrap_bytes = int(offset[1])
-magic = bytes.fromhex('28 b5 2f fd')
-assert payload.startswith(magic) and payload[bootstrap_bytes:].startswith(magic)
-Path(os.environ['FIXTURE_SOURCE_BYTES']).write_text(str(len(payload) - bootstrap_bytes))
+bundle = payload[bootstrap_bytes:]
+assert bundle.startswith((b'# v2 git bundle\\n', b'# v3 git bundle\\n'))
+header, pack = bundle.split(b'\\n\\n', 1)
+assert pack.startswith(b'PACK')
+Path(os.environ['FIXTURE_SOURCE_BYTES']).write_text(str(len(bundle)))
+with Path(os.environ['FIXTURE_BUNDLE_FORMS']).open('a') as forms:
+    forms.write('delta\\n' if any(line.startswith(b'-') for line in header.splitlines()) else 'first\\n')
 if os.environ['FIXTURE_GUEST_RESULT'] == 'disconnect':
-    payload = payload[:bootstrap_bytes + 12]
+    payload = payload[:-1]
 sys.exit(subprocess.run(['bash', '-c', shell], input=payload, env=environment).returncode)
 '''
 
@@ -96,10 +107,9 @@ def run_suites(repo, *, full, mode, machine, selected, module_time_limit_s, time
     assert not {'SSH_AUTH_SOCK', 'GH_TOKEN', 'XDG_CONFIG_HOME', 'CONF_DIR'} & os.environ.keys()
     assert os.cpu_count() == 2 and time_limit.seconds == 7 and module_time_limit_s == 3
     assert checked_git(repo, 'show', 'origin/main:history.txt') == 'old source'
-    assert checked_git(repo, 'rev-list', '--count', 'main', 'origin/main') == '1'
-    head = checked_git(repo, 'rev-parse', 'HEAD')
-    assert checked_git(repo, 'rev-parse', 'main') == head
-    assert checked_git(repo, 'rev-parse', 'origin/main') == head
+    assert int(checked_git(repo, 'rev-list', '--count', 'main', 'origin/main')) >= 2
+    assert checked_git(repo, 'rev-parse', 'main') == os.environ['FIXTURE_EXPECTED_MAIN']
+    assert checked_git(repo, 'rev-parse', 'origin/main') == os.environ['FIXTURE_EXPECTED_MAIN']
     assert full == (mode is SuiteMode.GATE)
     print('A guest log line must stay outside the JSON result.')
     scenario = os.environ['FIXTURE_GUEST_RESULT']
@@ -165,16 +175,17 @@ class MacLinuxRouteTests(unittest.TestCase):
         self.registry = config / 'build_targets.conf'
         _ = self.registry.write_text(
             'kind.mac-linux=ssh\nplatform.mac-linux=linux\nsettings.mac-linux=mac_linux.conf\n'
-            + 'enabled.mac-linux=on\nhost.mac-linux=fixture-mac\n',
+            + 'enabled.mac-linux=on\n',
             encoding='utf-8')
         _ = (config / 'mac_linux.conf').write_text(
             f'ssh.hops=fixture-mac fixture-guest\nguest.user={account}\ntest.jobs=2\n'
-            + 'run.time_limit_seconds=7\ncopy.zstd_level=3\n',
+            + 'run.time_limit_seconds=7\n',
             encoding='utf-8')
         _ = cast(object, self.enterContext(patch.dict(os.environ, {
             'CONF_DIR': str(config), 'PATH': str(binaries) + os.pathsep + os.environ['PATH'],
             'FIXTURE_SSH_TRACE': str(self.trace), 'FIXTURE_GUEST_HOME': str(self.guest_home),
             'FIXTURE_SOURCE_BYTES': str(self.root / 'source.bytes'),
+            'FIXTURE_BUNDLE_FORMS': str(self.root / 'bundle.forms'),
             'FIXTURE_GUEST_USER': account, 'FIXTURE_GUEST_RESULT': 'pass',
             'BUILDLOG_UNIT': 'caller', 'FIXTURE_EXPECTED_UNIT': 'caller',
             'GH_TOKEN': 'fixture-token', 'SSH_AUTH_SOCK': str(self.root / 'agent.sock'),
@@ -209,7 +220,8 @@ fi
                         + f'exec {shlex.quote(sys.executable)} -B "${{options[@]}}"'
                         + f' -c {shlex.quote(GUEST_BOOTSTRAP)} "$candidate" "$@"\n')
         _ = self.git('add', '.')
-        _ = self.git('commit', '-qm', 'candidate')
+        _ = self.git('commit', '-qm', 'main checkout')
+        _ = self.git('update-ref', 'refs/remotes/origin/main', 'HEAD')
 
     @staticmethod
     def executable(path: Path, content: str) -> None:
@@ -217,7 +229,11 @@ fi
         path.chmod(0o755)
 
     def git(self, *args: str) -> str:
-        return subprocess.check_output(['git', *args], cwd=self.repo, text=True, timeout=10).strip()
+        return self.git_at(self.repo, *args)
+
+    @staticmethod
+    def git_at(folder: Path, *args: str) -> str:
+        return subprocess.check_output(['git', *args], cwd=folder, text=True, timeout=10).strip()
 
     def route(self, scenario: str = 'pass', selected: AllModules | TreeSelection = ALL_MODULES,
               gate_job: StepJob | GateJobNotRecorded = GATE_JOB_NOT_RECORDED) -> GateRun | str:
@@ -228,30 +244,40 @@ fi
             self.assertEqual(prefix, 'cloud-gate-index-')
             return temporary_directory(prefix=prefix)
 
-        with (patch.dict(os.environ, {'FIXTURE_GUEST_RESULT': scenario}),
+        with (patch.dict(os.environ, {'FIXTURE_GUEST_RESULT': scenario,
+                                     'FIXTURE_EXPECTED_MAIN': self.git('rev-parse', 'origin/main')}),
               patch.object(tempfile, 'TemporaryDirectory', snapshot_index),
               patch.object(tempfile, 'TemporaryFile', side_effect=AssertionError('Keep the bootstrap in memory.'))):
-            return mac_linux.route(self.repo, mode=mode, full=mode is SuiteMode.GATE, selected=selected,
-                                   module_time_limit_s=3, gate_job=gate_job)
+            result = mac_linux.route(self.repo, mode=mode, full=mode is SuiteMode.GATE, selected=selected,
+                                     module_time_limit_s=3, gate_job=gate_job)
+        self.assertEqual(self.git('for-each-ref', 'refs/mac-linux'), '')
+        return result
 
-    def assert_guest_clean(self, events: list[str]) -> None:
+    def assert_guest_clean(self, *events: str) -> None:
         main = self.guest_home / '.claude'
         build = self.guest_home / 'build'
         self.assertLessEqual(set(self.guest_home.iterdir()), {main, build})
         self.assertFalse((main / '.git/mac-linux').exists())
         self.assertEqual(list(build.rglob('mac-linux*')), [])
-        self.assertEqual(self.trace.read_text(encoding='utf-8').splitlines(), events)
+        self.assertEqual(self.trace.read_text(encoding='utf-8').splitlines(), list(events))
+
+    def assert_bundle(self, run: mac_linux.MacLinuxGateRun, form: mac_linux.BundleForm,
+                      reason: mac_linux.BundleReason, *forms: str) -> None:
+        self.assertEqual(run.bundle_bytes, int((self.root / 'source.bytes').read_text(encoding='utf-8')))
+        self.assertGreater(run.bundle_bytes, 0)
+        self.assertEqual((run.bundle_form, run.bundle_reason), (form, reason))
+        self.assertEqual((self.root / 'bundle.forms').read_text(encoding='utf-8').splitlines(), list(forms))
 
     def test_switch_off_returns_local_reason_without_ssh(self) -> None:
         _ = self.registry.write_text('enabled.mac-linux=off\n', encoding='utf-8')
         self.assertEqual(self.route(), 'mac-linux is off (build_targets.conf enabled.mac-linux=off)')
-        self.assert_guest_clean([])
+        self.assert_guest_clean()
 
     def test_transport_failure_returns_reason(self) -> None:
         result = self.route('offline')
         self.assertIsInstance(result, str)
         self.assertIn('fixture SSH refused the connection', str(result))
-        self.assert_guest_clean(['run'])
+        self.assert_guest_clean('probe')
 
     def test_guest_returns_module_metrics(self) -> None:
         result = self.route()
@@ -266,23 +292,22 @@ fi
                          (0, 1.3, 'fixture module output', 1.0, 22))
         assert isinstance(job.times, dict)
         self.assertEqual(job.times['tests_run'], 3)
-        self.assertEqual(result.compressed_bytes, int((self.root / 'source.bytes').read_text(encoding='utf-8')))
-        self.assertGreater(result.compressed_bytes, 0)
+        self.assert_bundle(result, mac_linux.BundleForm.FIRST, mac_linux.BundleReason.FIRST_RUN, 'first')
         self.assertEqual(result.module_skips, {'scripts/fixture/test_first.py': 0, 'scripts/fixture/test_second.py': 1})
-        self.assert_guest_clean(['run'])
+        self.assert_guest_clean('probe', 'run')
 
     def test_red_module_returns_a_failed_gate(self) -> None:
         result = self.route('red')
         assert isinstance(result, GateRun), result
         self.assertFalse(result.passed)
         self.assertEqual([job.returncode for job in result.jobs], [1, 1])
-        self.assert_guest_clean(['run'])
+        self.assert_guest_clean('probe', 'run')
 
     def test_guest_runner_failure_returns_reason_and_cleans(self) -> None:
         result = self.route('runner-failure')
         self.assertIsInstance(result, str)
         self.assertIn('fixture guest runner failed', str(result))
-        self.assert_guest_clean(['run'])
+        self.assert_guest_clean('probe', 'run')
 
     def test_copy_can_retry_after_a_partial_upload(self) -> None:
         main = self.guest_home / '.claude'
@@ -293,36 +318,75 @@ fi
         self.assertIn('SSH or source stream exited', str(result))
         self.assertEqual((main / 'history.txt').read_text(encoding='utf-8'), 'old source\n')
         self.assertFalse((main / 'scripts/fixture/test_added.py').exists())
-        self.assert_guest_clean(['run', 'run'])
+        self.assert_guest_clean('probe', 'run', 'probe', 'run')
         retry = self.route()
         assert isinstance(retry, GateRun), retry
         self.assertTrue(retry.passed)
-        self.assert_guest_clean(['run', 'run', 'run'])
+        self.assert_guest_clean('probe', 'run', 'probe', 'run', 'probe', 'run')
 
     def test_copy_uses_the_job_unit(self) -> None:
         with patch.dict(os.environ, {'FIXTURE_EXPECTED_UNIT': 'checkpoint-owner'}):
             result = self.route(gate_job=StepJob('integrate', unit='checkpoint-owner'))
         assert isinstance(result, GateRun), result
         self.assertTrue(result.passed)
-        self.assert_guest_clean(['run'])
+        self.assert_guest_clean('probe', 'run')
 
-    def test_copy_reuses_number_after_main_moves_to_a_new_root(self) -> None:
+    def test_delta_updates_main_and_reuses_the_numbered_copy(self) -> None:
         main = self.guest_home / '.claude'
         numbered = self.guest_home / 'build/claude/caller/1'
-        self.assertIsInstance(self.route(), GateRun)
-        first = subprocess.check_output(['git', '-C', str(main), 'rev-parse', 'HEAD'], text=True).strip()
+        first = self.route()
+        assert isinstance(first, mac_linux.MacLinuxGateRun), first
+        old_main = self.git('rev-parse', 'origin/main')
         use_stamp = numbered / 'target/fixture-output'
         use_stamp.touch()
         (self.repo / 'scripts/fixture/test_first.py').unlink()
-        self.assertIsInstance(self.route(), GateRun)
-        second = subprocess.check_output(['git', '-C', str(main), 'rev-list', '--all'], text=True).splitlines()
-        self.assertEqual(len(second), 1)
-        self.assertNotEqual(second[0], first)
+        _ = self.git('commit', '-qam', 'advance main')
+        _ = self.git('update-ref', 'refs/remotes/origin/main', 'HEAD')
+        (self.repo / 'scripts/fixture/test_added.py').touch()
+        _ = self.git('add', '.')
+        _ = self.git('commit', '-qm', 'candidate change')
+        second = self.route()
+        assert isinstance(second, mac_linux.MacLinuxGateRun), second
+        self.assert_bundle(second, mac_linux.BundleForm.DELTA, mac_linux.BundleReason.DELTA, 'first', 'delta')
+        self.assertLess(second.bundle_bytes, first.bundle_bytes)
+        self.assertEqual(self.git_at(main, 'rev-parse', 'HEAD', 'origin/main').splitlines(),
+                         [self.git('rev-parse', 'origin/main')] * 2)
+        self.assertEqual(self.git_at(main, 'rev-parse', 'HEAD^'), old_main)
+        self.assertEqual(self.git_at(numbered, 'rev-parse', 'HEAD'), self.git('rev-parse', 'HEAD'))
         self.assertFalse((main / 'scripts/fixture/test_first.py').exists())
-        self.assertFalse((numbered / 'scripts/fixture/test_first.py').exists())
+        self.assertFalse((main / 'scripts/fixture/test_added.py').exists())
+        self.assertTrue((numbered / 'scripts/fixture/test_added.py').exists())
         self.assertTrue(use_stamp.is_file())
         self.assertTrue(numbered.with_suffix('.lease.json').is_file())
-        self.assert_guest_clean(['run', 'run'])
+        self.assert_guest_clean('probe', 'run', 'probe', 'run')
+
+    def test_empty_guest_repository_takes_first_bundle_and_then_empty_delta(self) -> None:
+        main = self.guest_home / '.claude'
+        _ = self.git_at(self.guest_home, 'init', '-q', '--initial-branch=main', str(main))
+        first = self.route()
+        assert isinstance(first, mac_linux.MacLinuxGateRun), first
+        self.assert_bundle(first, mac_linux.BundleForm.FIRST, mac_linux.BundleReason.FIRST_RUN, 'first')
+        result = self.route()
+        assert isinstance(result, mac_linux.MacLinuxGateRun), result
+        self.assert_bundle(result, mac_linux.BundleForm.DELTA, mac_linux.BundleReason.DELTA, 'first', 'delta')
+        self.assertLess(result.bundle_bytes, first.bundle_bytes)
+        self.assert_guest_clean('probe', 'run', 'probe', 'run')
+
+    def test_guest_missing_prerequisite_retries_once_with_a_full_bundle(self) -> None:
+        (self.repo / 'scripts/fixture/test_added.py').touch()
+        with patch.dict(os.environ, {'FIXTURE_PROBED_MAIN': self.git('rev-parse', 'origin/main')}):
+            result = self.route()
+        assert isinstance(result, mac_linux.MacLinuxGateRun), result
+        self.assert_bundle(result, mac_linux.BundleForm.FIRST, mac_linux.BundleReason.GUEST_LACKS_PREREQUISITE,
+                           'delta', 'first')
+        self.assert_guest_clean('probe', 'run', 'run')
+
+    def test_unknown_guest_main_uses_full_bundle_with_cause(self) -> None:
+        with patch.dict(os.environ, {'FIXTURE_PROBED_MAIN': 'f' * 40}):
+            result = self.route()
+        assert isinstance(result, mac_linux.MacLinuxGateRun), result
+        self.assert_bundle(result, mac_linux.BundleForm.FIRST, mac_linux.BundleReason.SOURCE_LACKS_BASE, 'first')
+        self.assert_guest_clean('probe', 'run')
 
     def test_copy_rescues_edits_after_main_moves(self) -> None:
         self.assertIsInstance(self.route('leave-edit'), GateRun)
@@ -344,7 +408,7 @@ fi
         self.assertTrue(result.passed)
         self.assertEqual(result.coverage, ModuleCoverage.SUBSET)
         self.assertEqual([job.module for job in result.jobs], ['test_second.py'])
-        self.assert_guest_clean(['run'])
+        self.assert_guest_clean('probe', 'run')
 
     def test_dirty_modules_are_included_in_the_snapshot(self) -> None:
         (self.repo / 'scripts/fixture/test_added.py').touch()
@@ -352,7 +416,7 @@ fi
         assert isinstance(result, GateRun), result
         self.assertTrue(result.passed)
         self.assertEqual([job.module for job in result.jobs], ['test_added.py', 'test_first.py', 'test_second.py'])
-        self.assert_guest_clean(['run'])
+        self.assert_guest_clean('probe', 'run')
 
 
 if __name__ == '__main__':

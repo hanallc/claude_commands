@@ -1,7 +1,8 @@
 """Run the gate in the Mac's Linux guest."""
 from __future__ import annotations
 
-from contextlib import AbstractContextManager, nullcontext, redirect_stdout
+from collections.abc import Generator
+from contextlib import AbstractContextManager, contextmanager, nullcontext, redirect_stdout
 from dataclasses import dataclass
 from enum import StrEnum
 from io import BytesIO
@@ -33,10 +34,17 @@ SSH = ('ssh', '-T', '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=yes', '-
        '-o', 'ConnectTimeout=8', '-o', 'ServerAliveInterval=15', '-o', 'ServerAliveCountMax=2')
 # Give the transfer, checkout, and result time outside the guest runner deadline.
 TRANSFER_ALLOWANCE_SECONDS = 120
+GUEST_REF_TIMEOUT_SECONDS = 30
+MISSING_PREREQUISITE_STATUS = 75
+MISSING_PREREQUISITE_MESSAGE = 'Repository lacks these prerequisite commits:'
 
 
 class GuestUnavailable(RuntimeError):
     """The guest cannot return a completed gate."""
+
+
+class GuestMissingPrerequisite(GuestUnavailable):
+    """The guest needs the full Git bundle."""
 
 
 class GuestSwitch(StrEnum):
@@ -50,7 +58,6 @@ class GuestSettings:
     guest_user: str
     jobs: int
     run_time_limit_seconds: int
-    zstd_level: int
 
     def command(self, shell: str) -> tuple[str, ...]:
         mac, guest = self.ssh_hops
@@ -67,26 +74,23 @@ def read_settings(registry: conf.ConfigRead) -> GuestSettings:
     user = settings.text('guest.user', recover_invalid=False)
     jobs = settings.value('test.jobs', int, recover_invalid=False)
     limit = settings.value('run.time_limit_seconds', int, recover_invalid=False)
-    zstd_level = settings.value('copy.zstd_level', int, recover_invalid=False)
     if len(hops) != 2 or not all(re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]*', host) for host in hops):
         raise GuestUnavailable('ssh.hops must name two SSH aliases')
     if not re.fullmatch(r'[a-z_][a-z0-9_-]*', user):
         raise GuestUnavailable('guest.user must name a Linux user')
     if jobs < 1 or limit < 1:
         raise GuestUnavailable('test.jobs and run.time_limit_seconds must be positive')
-    if not 1 <= zstd_level <= 19:
-        raise GuestUnavailable('copy.zstd_level must be between 1 and 19')
-    return GuestSettings((hops[0], hops[1]), user, jobs, limit, zstd_level)
+    return GuestSettings((hops[0], hops[1]), user, jobs, limit)
 
 
 def mac_linux_reservation(_repo: Path, _work: SuiteMode | StepJob,
                           _gate_job: StepJob | GateJobNotRecorded) -> AbstractContextManager[None]:
     """Keep the reservation through the guest attempt.
 
-    B3 adds scripts.build_queue.whole_run.held(repo: Path, target: str, work: SuiteMode | StepJob, gate_job).
-    The context manager yields WholeRun. Set its integer status as for CloudReservation.status.
-    On whole_run.WholeRunRefused, return str(error) as the route fallback.
-    The whole-Mac claim awaits Nate's approval.
+    B3 adds scripts.build_queue.mac_run.held(repo, 'mac', work, gate_job).
+    The context manager takes the native claude_commands repository claim on the Mac.
+    Set the integer status field on the value that it yields.
+    Return str(error) as the route fallback on mac_run.MacRunRefused.
     """
     # TODO(item 191 B3): Reserve mac-linux through the queue before the guest attempt.
     return nullcontext()
@@ -96,6 +100,7 @@ class GuestRequest(TypedDict):
     attempt: str
     commit: str
     tree: str
+    origin_main: str
     mode: str
     full: bool
     selection: list[str] | Literal['all']
@@ -110,6 +115,7 @@ class CandidateSource:
     head: str
     commit: str
     tree: str
+    origin_main: str
     origin_url: str
     modules: frozenset[str]
     coverage: ModuleCoverage
@@ -120,6 +126,7 @@ def candidate_source(repo: Path, selected: AllModules | TreeSelection) -> Candid
     from scripts.production.gate import checked_git
 
     head = checked_git(repo, 'rev-parse', 'HEAD')
+    origin_main = checked_git(repo, 'rev-parse', '--verify', f'{ORIGIN_MAIN}^{{commit}}')
     tree, dirty = cloud_gate.working_tree(repo)
     paths = frozenset(str(path.relative_to(repo)) for _, path in discover_test_modules(repo))
     modules = paths
@@ -135,10 +142,10 @@ def candidate_source(repo: Path, selected: AllModules | TreeSelection) -> Candid
         raise GuestUnavailable('the origin URL must contain no credential')
     commit = checked_git(repo, 'commit-tree', tree, '-p', head, '-m', 'Mac Linux gate snapshot') if dirty else head
     coverage = ModuleCoverage.COMPLETE if modules == paths else ModuleCoverage.SUBSET
-    return CandidateSource(head, commit, tree, origin_url, modules, coverage)
+    return CandidateSource(head, commit, tree, origin_main, origin_url, modules, coverage)
 
 
-def compressed_bootstrap(request: GuestRequest, level: int) -> bytes:
+def runner_bootstrap(request: GuestRequest) -> bytes:
     manifest = json.dumps(request).encode('utf-8')
     record = tarfile.TarInfo('request.json')
     record.size = len(manifest)
@@ -146,28 +153,62 @@ def compressed_bootstrap(request: GuestRequest, level: int) -> bytes:
         with tarfile.open(fileobj=bootstrap, mode='w') as archive:
             archive.addfile(record, BytesIO(manifest))
             archive.add(Path(__file__).resolve(), arcname='runner.py')
-        return subprocess.run(['zstd', f'-{level}', '-q', '-c'], input=bootstrap.getvalue(),
-                              capture_output=True, check=True, timeout=TRANSFER_ALLOWANCE_SECONDS).stdout
+        return bootstrap.getvalue()
 
 
-def run_shell(settings: GuestSettings, source: CandidateSource, bootstrap_bytes: int) -> str:
+def guest_shell(settings: GuestSettings) -> str:
     return f'''set -euo pipefail
 if [ "$(id -un)" != {shlex.quote(settings.guest_user)} ]; then
     printf 'Expected SSH account %s.\\n' {shlex.quote(settings.guest_user)} >&2
     exit 1
 fi
-umask 077
 checkout="$HOME/.claude"
 if [ -L "$checkout" ] || [ -L "$checkout/.git" ]; then
     printf 'The guest main checkout must be a real directory.\\n' >&2
     exit 1
-fi
+fi'''
+
+
+@dataclass(frozen=True)
+class EmptyGuestMain:
+    """The guest does not have a main commit."""
+
+
+@dataclass(frozen=True)
+class GuestMain:
+    """Use the guest main commit as a bundle prerequisite."""
+
+    commit: str
+
+
+def read_guest_main(settings: GuestSettings) -> GuestMain | EmptyGuestMain:
+    shell = guest_shell(settings) + '''
+if [ -f "$checkout/.git/HEAD" ]; then
+    git -C "$checkout" rev-parse --verify --quiet refs/heads/main || test "$?" -eq 1
+fi'''
+    reply = subprocess.run(settings.command(shell), stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                           errors='replace', timeout=GUEST_REF_TIMEOUT_SECONDS, check=False)
+    if reply.returncode:
+        raise GuestUnavailable(f'guest main probe exited {reply.returncode}: {reply.stderr.strip() or "no diagnostic"}')
+    commit = reply.stdout.strip()
+    if not commit:
+        return EmptyGuestMain()
+    if re.fullmatch(r'[0-9a-f]{40}|[0-9a-f]{64}', commit) is None:
+        raise GuestUnavailable('the guest main probe returned an invalid commit ID')
+    return GuestMain(commit)
+
+
+def run_shell(settings: GuestSettings, source: CandidateSource, bootstrap_bytes: int) -> str:
+    object_format = 'sha256' if len(source.commit) == 64 else 'sha1'
+    return guest_shell(settings) + f'''
+umask 077
 mkdir -p -- "$checkout"
 cd "$checkout"
 exec 9< .
 flock -x 9
 if [ ! -f .git/mac-linux-owned ]; then
-    if [ -n "$(find . -mindepth 1 ! -path './.git' -print -quit)" ]; then
+    if [ -n "$(find . -mindepth 1 -maxdepth 1 ! -name .git -print -quit)" ] ||
+       {{ [ -f .git/HEAD ] && [ -n "$(git for-each-ref --count=1)" ]; }}; then
         printf 'The guest main checkout belongs to another tool.\\n' >&2
         exit 1
     fi
@@ -182,70 +223,139 @@ unset DBUS_SESSION_BUS_ADDRESS SSH_AUTH_SOCK SSH_AGENT_PID SUDO_USER SUDO_UID SU
 unset XDG_CONFIG_HOME XDG_CACHE_HOME XDG_DATA_HOME XDG_STATE_HOME
 unset GH_CONFIG_DIR GH_TOKEN GITHUB_TOKEN GH_ENTERPRISE_TOKEN GITHUB_ENTERPRISE_TOKEN
 unset CLAUDE_CONFIG_DIR CODEX_HOME CONF_DIR PYTHONPATH PYTHONHOME
-git init -q
-git config core.logAllRefUpdates false
-git config remote.origin.url {shlex.quote(source.origin_url)}
-git symbolic-ref HEAD refs/heads/main
-git symbolic-ref refs/remotes/origin/HEAD {ORIGIN_MAIN}
+if [ ! -f .git/HEAD ]; then
+    git init -q --initial-branch=main --object-format={object_format}
+fi
 bootstrap="$checkout/.git/mac-linux"
 rm -rf -- "$bootstrap"
 mkdir -p -- "$bootstrap/tmp"
-installing=no
-cleanup() {{
-    if [ "$installing" = yes ]; then
-        if git rev-parse --verify -q HEAD >/dev/null; then
-            git reset --hard -q HEAD
-        else
-            git read-tree --empty
-        fi
-        git clean -ffdx -q
-    fi
-    rm -rf -- "$bootstrap"
-}}
-trap cleanup EXIT
+trap 'rm -rf -- "$bootstrap"' EXIT
 export TMPDIR="$bootstrap/tmp" XDG_CACHE_HOME="$bootstrap/cache"
-head -c {bootstrap_bytes} | zstd -d -q | tar -xf - -C "$bootstrap"
-installing=yes
-git read-tree --empty
-git clean -ffdx -q
-zstd -d -q | tar -xf -
-git -c core.autocrlf=false -c core.filemode=true add --force --all
-tree=$(git write-tree)
-if [ "$tree" != {shlex.quote(source.tree)} ]; then
-    printf 'The archive tree %s differs from the requested tree.\\n' "$tree" >&2
+head -c {bootstrap_bytes} | tar -xf - -C "$bootstrap"
+if ! LC_ALL=C git bundle unbundle - >/dev/null 2>"$bootstrap/bundle-error"; then
+    cat "$bootstrap/bundle-error" >&2
+    if grep -Fq {shlex.quote(MISSING_PREREQUISITE_MESSAGE)} "$bootstrap/bundle-error"; then
+        exit {MISSING_PREREQUISITE_STATUS}
+    fi
     exit 1
 fi
-commit=$(git -c user.name='Mac Linux gate' -c user.email='mac-linux@localhost' commit-tree "$tree" -m 'Mac Linux gate source')
-printf 'update refs/heads/main %s\\nupdate {ORIGIN_MAIN} %s\\n' "$commit" "$commit" | git update-ref --stdin
-installing=no
+commit={shlex.quote(source.commit)}
+origin_main={shlex.quote(source.origin_main)}
+tree=$(git rev-parse --verify "$commit^{{tree}}")
+if [ "$tree" != {shlex.quote(source.tree)} ]; then
+    printf 'The bundle tree %s differs from the requested tree.\\n' "$tree" >&2
+    exit 1
+fi
+git cat-file -e "$origin_main^{{commit}}"
+git config remote.origin.url {shlex.quote(source.origin_url)}
+git symbolic-ref HEAD refs/heads/main
+git symbolic-ref refs/remotes/origin/HEAD {ORIGIN_MAIN}
+printf 'update refs/heads/main %s\\nupdate {ORIGIN_MAIN} %s\\n' "$origin_main" "$origin_main" | git update-ref --stdin
+git reset --hard -q "$origin_main"
 umask 022
 ./scripts/lib/py "$bootstrap/runner.py" "$bootstrap/request.json"'''
+
+
+class BundleForm(StrEnum):
+    FIRST = 'first'
+    DELTA = 'delta'
+
+
+class BundleReason(StrEnum):
+    FIRST_RUN = 'the guest has no main commit'
+    SOURCE_LACKS_BASE = 'the guest main commit is absent from the source repository'
+    GUEST_LACKS_PREREQUISITE = 'the guest lacks a Git bundle prerequisite'
+    DELTA = 'the guest accepted the delta bundle'
+
+
+@dataclass(frozen=True)
+class FullBundle:
+    """Send the complete Git history for the candidate and origin/main."""
+
+    reason: BundleReason
+
+
+@dataclass(frozen=True)
+class DeltaBundle:
+    """Exclude the Git history that the guest main already has."""
+
+    base: str
 
 
 @dataclass(frozen=True)
 class GuestReply:
     result: str
-    compressed_source_bytes: int
+    bundle_bytes: int
+    bundle_form: BundleForm
+    bundle_reason: BundleReason
+
+
+@contextmanager
+def bundle_refs(repo: Path, source: CandidateSource, attempt: str) -> Generator[str]:
+    """Keep named bundle tips for the duration of the transfer."""
+    from scripts.production.gate import checked_git
+
+    prefix = f'refs/mac-linux/{attempt}'
+    try:
+        _ = checked_git(repo, 'update-ref', f'{prefix}/candidate', source.commit)
+        _ = checked_git(repo, 'update-ref', f'{prefix}/main', source.origin_main)
+        yield prefix
+    finally:
+        _ = checked_git(repo, 'update-ref', '-d', f'{prefix}/candidate')
+        _ = checked_git(repo, 'update-ref', '-d', f'{prefix}/main')
+
+
+def empty_delta_header(repo: Path, source: CandidateSource, basis: DeltaBundle, prefix: str) -> str:
+    from scripts.production.gate import checked_git
+
+    if checked_git(repo, 'rev-list', '--max-count=1', source.commit, source.origin_main, f'^{basis.base}'):
+        return ''
+    object_format = 'sha256' if len(source.commit) == 64 else 'sha1'
+    # Git refuses to create a bundle when both tips are already in the prerequisite.
+    return (f'# v3 git bundle\n@object-format={object_format}\n-{basis.base} guest main\n'
+            + f'{source.commit} {prefix}/candidate\n{source.origin_main} {prefix}/main\n\n')
 
 
 # Send the SSH result to descriptor 3. Use descriptor 4 to collect the byte count.
 STREAM_SOURCE = '''
+prefix=$1
+base=$2
+header=$3
+shift 3
+bundle() {
+    if [ -n "$header" ]; then
+        printf '%s' "$header" && git pack-objects --stdout </dev/null
+    else
+        local refs=("$prefix/candidate" "$prefix/main")
+        if [ -n "$base" ]; then
+            refs+=("^$base")
+        fi
+        git bundle create - "${refs[@]}"
+    fi
+}
 exec 3>&1
 size=$(
     exec 4>&1
-    { cat && git archive --format=tar "$1" | zstd "$2" -T0 -q -c; } |
-        tee >(wc -c >&4) | "${@:3}" >&3 3>&- 4>&-
+    { cat && bundle; } | tee >(wc -c >&4) | "$@" >&3 3>&- 4>&-
 ) || exit "$?"
 printf '\\n%s\\n' "$size"
 '''
 
 
-def run_remote(repo: Path, settings: GuestSettings, source: CandidateSource, request: GuestRequest) -> GuestReply:
-    bootstrap = compressed_bootstrap(request, settings.zstd_level)
+def run_remote(repo: Path, settings: GuestSettings, source: CandidateSource, request: GuestRequest,
+               prefix: str, bundle: FullBundle | DeltaBundle) -> GuestReply:
+    bootstrap = runner_bootstrap(request)
+    if isinstance(bundle, DeltaBundle):
+        base = bundle.base
+        header = empty_delta_header(repo, source, bundle, prefix)
+        form, reason = BundleForm.DELTA, BundleReason.DELTA
+    else:
+        base, header = '', ''
+        form, reason = BundleForm.FIRST, bundle.reason
     timeout = settings.run_time_limit_seconds + TRANSFER_ALLOWANCE_SECONDS
     command = settings.command(run_shell(settings, source, len(bootstrap)))
-    with subprocess.Popen(['bash', '-o', 'pipefail', '-c', STREAM_SOURCE, TARGET, source.tree,
-                           f'-{settings.zstd_level}', *command], cwd=repo, stdin=subprocess.PIPE,
+    with subprocess.Popen(['bash', '-o', 'pipefail', '-c', STREAM_SOURCE, TARGET, prefix, base, header,
+                           *command], cwd=repo, stdin=subprocess.PIPE,
                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True) as stream:
         try:
             output, errors = stream.communicate(bootstrap, timeout=timeout)
@@ -258,23 +368,44 @@ def run_remote(repo: Path, settings: GuestSettings, source: CandidateSource, req
                 raise GuestUnavailable(f'SSH or guest run exceeded {timeout} seconds') from error
             raise
         if stream.returncode:
-            detail = ' '.join(errors.decode(errors='replace').split())[-1200:]
+            diagnostics = errors.decode(errors='replace')
+            if stream.returncode == MISSING_PREREQUISITE_STATUS and MISSING_PREREQUISITE_MESSAGE in diagnostics:
+                raise GuestMissingPrerequisite(diagnostics.strip())
+            detail = ' '.join(diagnostics.split())[-1200:]
             raise GuestUnavailable(f'SSH or source stream exited {stream.returncode}: {detail or "no diagnostic"}')
     result, _, count = output.rstrip().rpartition(b'\n')
-    return GuestReply(result.decode('utf-8'), int(count) - len(bootstrap))
+    return GuestReply(result.decode('utf-8'), int(count) - len(bootstrap), form, reason)
+
+
+def transfer_source(repo: Path, settings: GuestSettings, source: CandidateSource, request: GuestRequest) -> GuestReply:
+    guest = read_guest_main(settings)
+    with bundle_refs(repo, source, request['attempt']) as prefix:
+        if isinstance(guest, EmptyGuestMain):
+            reason = BundleReason.FIRST_RUN
+        elif subprocess.run(['git', 'cat-file', '-e', f'{guest.commit}^{{commit}}'], cwd=repo,
+                            capture_output=True, timeout=TRANSFER_ALLOWANCE_SECONDS, check=False).returncode:
+            reason = BundleReason.SOURCE_LACKS_BASE
+        else:
+            try:
+                return run_remote(repo, settings, source, request, prefix, DeltaBundle(guest.commit))
+            except GuestMissingPrerequisite:
+                reason = BundleReason.GUEST_LACKS_PREREQUISITE
+        return run_remote(repo, settings, source, request, prefix, FullBundle(reason))
 
 
 @dataclass(frozen=True, kw_only=True)
 class MacLinuxGateRun(GateRun):
-    """Keep the source size and the skip counts that the guest measured."""
+    """Keep the bundle details and the skip counts from the guest."""
 
-    compressed_bytes: int
+    bundle_bytes: int
+    bundle_form: BundleForm
+    bundle_reason: BundleReason
     module_skips: dict[str, int]
 
 
-def completed_run(text: str, request: GuestRequest, source: CandidateSource, compressed_bytes: int) -> MacLinuxGateRun:
-    row = ledger.mapping(cast(object, json.loads(text)))
-    for key in ('attempt', 'commit', 'tree'):
+def completed_run(reply: GuestReply, request: GuestRequest, source: CandidateSource) -> MacLinuxGateRun:
+    row = ledger.mapping(cast(object, json.loads(reply.result)))
+    for key in ('attempt', 'commit', 'tree', 'origin_main'):
         if row.get(key) != request[key]:
             raise GuestUnavailable(f'the guest result has a different {key}')
     run = gate_box.decode_run(row['gate'])
@@ -288,7 +419,8 @@ def completed_run(text: str, request: GuestRequest, source: CandidateSource, com
              if isinstance(job.times, dict)}
     return MacLinuxGateRun(run.jobs, run.seconds, run.peak_memory_mib, run.tests_reused, run.selection_certified,
                            run.executions, run.time_limit_report, coverage=source.coverage,
-                           compressed_bytes=compressed_bytes, module_skips=skips)
+                           bundle_bytes=reply.bundle_bytes, bundle_form=reply.bundle_form,
+                           bundle_reason=reply.bundle_reason, module_skips=skips)
 
 
 def route(repo: Path, *, mode: SuiteMode, full: bool, module_time_limit_s: float,
@@ -312,13 +444,14 @@ def route(repo: Path, *, mode: SuiteMode, full: bool, module_time_limit_s: float
         if not unit:
             raise GuestUnavailable('the gate has no owner unit for a numbered copy')
         source = candidate_source(repo, selected)
-        request = GuestRequest(attempt=uuid4().hex, commit=source.commit, tree=source.tree, mode=mode.wire, full=full,
+        request = GuestRequest(attempt=uuid4().hex, commit=source.commit, tree=source.tree,
+                               origin_main=source.origin_main, mode=mode.wire, full=full,
                                selection=list(selected.paths) if isinstance(selected, TreeSelection) else 'all',
                                module_time_limit_s=module_time_limit_s, run_time_limit_seconds=settings.run_time_limit_seconds,
                                jobs=settings.jobs, unit=unit)
         with mac_linux_reservation(repo, mode, gate_job):
-            reply = run_remote(repo, settings, source, request)
-            run = completed_run(reply.result, request, source, reply.compressed_source_bytes)
+            reply = transfer_source(repo, settings, source, request)
+            run = completed_run(reply, request, source)
         if gate.checked_git(repo, 'rev-parse', 'HEAD') != source.head or cloud_gate.working_tree(repo)[0] != source.tree:
             raise GuestUnavailable('the checkout changed during the guest run')
         return run
@@ -333,9 +466,8 @@ def run_guest(request_path: Path) -> int:
 
     request = guest_request(request_path)
     main = Path.cwd()
-    with build_slots.take_copy(main, 'HEAD', showrunner='', unit=request['unit'],
-                               work=request['mode'], purpose=TARGET,
-                               base_policy=build_slots.CopyBasePolicy.REPLACE) as copy:
+    with build_slots.take_copy(main, request['commit'], showrunner='', unit=request['unit'],
+                               work=request['mode'], purpose=TARGET) as copy:
         with build_folders.tool_folder(TARGET, copy.cargo_dir) as runtime:
             home = runtime / 'home'
             (home / '.claude').mkdir(parents=True)
@@ -381,6 +513,10 @@ def run_copy(request_path: Path) -> None:
     request = guest_request(request_path)
     if os.cpu_count() != request['jobs']:
         raise GuestUnavailable(f'The guest Python did not set the CPU count to {request["jobs"]}.')
+    commit = gate.checked_git(repo, 'rev-parse', 'HEAD')
+    origin_main = gate.checked_git(repo, 'rev-parse', ORIGIN_MAIN)
+    if commit != request['commit'] or origin_main != request['origin_main']:
+        raise GuestUnavailable('The guest checkout refs differ from the request.')
     tree = gate.checked_git(repo, 'rev-parse', 'HEAD^{tree}')
     if tree != request['tree']:
         raise GuestUnavailable('The guest checkout differs from the request.')
@@ -395,7 +531,7 @@ def run_copy(request_path: Path) -> None:
                                   time_limit=GateTimeLimit(request['run_time_limit_seconds']))
     finally:
         copies.COMMAND_LOCKS.reset(token)
-    print(json.dumps({'attempt': request['attempt'], 'commit': request['commit'], 'tree': tree,
+    print(json.dumps({'attempt': request['attempt'], 'commit': commit, 'tree': tree, 'origin_main': origin_main,
                       'verdict': 'pass' if run.passed else 'fail', 'gate': gate_box.encode_run(run)}), flush=True)
 
 

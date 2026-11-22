@@ -253,34 +253,18 @@ def _build_rescue(work_tree: Path, name: str, checkout: git_files.Checkout, excl
         return _RescueCommit(_commit(work_tree, tree, parents, f"Rescue {name}"), tree)
 
 
-@dataclass(frozen=True)
-class ReplaceableBase:
-    """Allow a clean copy to release this source commit."""
-
-    commit: str
-
-
-@dataclass(frozen=True)
-class PreserveBase:
-    """Preserve a source base when no other ref holds it."""
-
-
-PRESERVE_BASE = PreserveBase()
-
-
 def rescue(work_tree: Path, name: str, *, generated: Sequence[Path] = (),
-           retain_local_refs: bool = False, pass_fds: Sequence[int] = (),
-           base: ReplaceableBase | PreserveBase = PRESERVE_BASE) -> RescueResult:
+           retain_local_refs: bool = False, pass_fds: Sequence[int] = ()) -> RescueResult:
     """Retain the caller's maker descriptors through every rescue Git command."""
     token = RESCUE_DESCRIPTORS.set(tuple(dict.fromkeys((*RESCUE_DESCRIPTORS.get(), *pass_fds))))
     try:
-        return _rescue(work_tree, name, generated=generated, retain_local_refs=retain_local_refs, base=base)
+        return _rescue(work_tree, name, generated=generated, retain_local_refs=retain_local_refs)
     finally:
         RESCUE_DESCRIPTORS.reset(token)
 
 
-def _rescue(work_tree: Path, name: str, *, generated: Sequence[Path],
-            retain_local_refs: bool, base: ReplaceableBase | PreserveBase) -> RescueResult:
+def _rescue(work_tree: Path, name: str, *, generated: Sequence[Path] = (),
+           retain_local_refs: bool = False) -> RescueResult:
     """Retain work in the common object store without changing the checkout or its index."""
     work_tree = work_tree.absolute()
     command = ["git", "-C", str(work_tree), "rescue"]
@@ -289,9 +273,8 @@ def _rescue(work_tree: Path, name: str, *, generated: Sequence[Path],
         excluded = _excluded(work_tree, generated)
         status = _git(work_tree, "status", "--porcelain=v2", "--untracked-files=all", "--ignored=matching", "-z",
                       "--", ".", *(f":(top,exclude,literal){path.as_posix()}" for path in excluded)).stdout
-        exclusions = (base.commit,) if isinstance(base, ReplaceableBase) else ()
         unheld = _git(work_tree, "rev-list", "--max-count=1", "HEAD", "--not",
-                      "--branches", "--tags", "--remotes", *exclusions).stdout
+                      "--branches", "--tags", "--remotes").stdout
         nested_paths = _nested_repositories(work_tree, excluded)
         operation = any((checkout.git_dir / path).exists()
                         for path in (*_OPERATION_HEAD_FILES, "sequencer/todo", "rebase-merge", "rebase-apply"))
@@ -301,12 +284,12 @@ def _rescue(work_tree: Path, name: str, *, generated: Sequence[Path],
         if (not refs and not _status_has_source(work_tree, status, excluded) and not unheld and not operation and not nested_paths
                 and not flagged):
             return NothingToSave()
-        ref_base = f"refs/rescue/{name}"
-        _ = _git(work_tree, "check-ref-format", ref_base)
+        base = f"refs/rescue/{name}"
+        _ = _git(work_tree, "check-ref-format", base)
         saved = _build_rescue(work_tree, name, checkout, excluded, nested_paths, tuple(refs.values()))
         suffix = 1
         while True:
-            ref = ref_base if suffix == 1 else f"{ref_base}-{suffix}"
+            ref = base if suffix == 1 else f"{base}-{suffix}"
             result = _git(work_tree, "show-ref", "--verify", "--quiet", ref, accepted=(0, 1))
             if result.returncode == 0:
                 suffix += 1

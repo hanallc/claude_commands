@@ -228,12 +228,12 @@ def _slot_commit(repository: Path, source: Path, commit: str) -> Generator[None]
         _ = _git(repository, "update-ref", "-d", reference)
 
 
-def _rescue(path: Path, base: git_rescue.ReplaceableBase | git_rescue.PreserveBase = git_rescue.PRESERVE_BASE) -> None:
+def _rescue(path: Path) -> None:
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
     name = f"{path.name}-{stamp}"
     try:
         _ = git_rescue.rescue(path, name, generated=[path / "target", path / build_folders.COPY_USE_STAMP],
-                             pass_fds=build_folders.held_build_folder_descriptors(), base=base)
+                             pass_fds=build_folders.held_build_folder_descriptors())
     except git_rescue.RescueError as error:
         if "status" not in error.command or "index" not in error.stderr:
             raise
@@ -245,7 +245,7 @@ def _rescue(path: Path, base: git_rescue.ReplaceableBase | git_rescue.PreserveBa
             descriptor = build_folders.build_folder_lock_fd(path)
             _ = _git(path, "read-tree", "HEAD", pass_fds=(descriptor,))
             _ = git_rescue.rescue(path, name, generated=[path / "target", path / build_folders.COPY_USE_STAMP],
-                                 pass_fds=build_folders.held_build_folder_descriptors(), base=base)
+                                 pass_fds=build_folders.held_build_folder_descriptors())
         except BaseException:
             _ = saved_index.replace(index)
             raise
@@ -380,16 +380,9 @@ def _copy_order(parent: Path) -> Generator[int]:
         number += 1
 
 
-class CopyBasePolicy(Enum):
-    """Choose whether to keep the previous source commit during rescue."""
-
-    PRESERVE = auto()
-    REPLACE = auto()
-
-
 @contextmanager
 def take_copy(source: Path, commit: str, *, showrunner: str, unit: str, work: str,
-              purpose: str, base_policy: CopyBasePolicy = CopyBasePolicy.PRESERVE) -> Generator[LeasedCopy]:
+              purpose: str) -> Generator[LeasedCopy]:
     """Take the first free existing copy or make the first missing number."""
     repository = _persistent_source(source_checkout(source))
     name = build_folders.repo_word(repository)
@@ -415,8 +408,6 @@ def take_copy(source: Path, commit: str, *, showrunner: str, unit: str, work: st
                 record = build_folders.numbered_copy_record(path)
                 if not isinstance(record, build_folders.NumberedCopySource):
                     continue
-                base = (git_rescue.ReplaceableBase(record.commit) if base_policy is CopyBasePolicy.REPLACE
-                        else git_rescue.PRESERVE_BASE)
                 build_folders.mark_folder_use(path)
                 index = record.git_directory / "index"
                 index.with_name("index.lock").unlink(missing_ok=True)
@@ -429,7 +420,7 @@ def take_copy(source: Path, commit: str, *, showrunner: str, unit: str, work: st
                 except SlotGitFailure as error:
                     if isinstance(error.__cause__, subprocess.TimeoutExpired):
                         raise
-                    _rescue(path, base)
+                    _rescue(path)
                     rescued = True
                     untracked = _git(path, *scan, pass_fds=(descriptor,))
                 if any(name.endswith("/") for name in untracked.split("\0")):
@@ -441,7 +432,7 @@ def take_copy(source: Path, commit: str, *, showrunner: str, unit: str, work: st
                     target.unlink()
                 _exclude_slot_target(path, descriptor)
                 if not rescued:
-                    _rescue(path, base)
+                    _rescue(path)
                 _ = _git(path, "update-index", "--really-refresh", accepted=(0, 1))
                 _ = _git(path, "checkout", "--force", "--detach", revision)
                 _ = _git(path, "clean", "-ffx", "--exclude=/target",
