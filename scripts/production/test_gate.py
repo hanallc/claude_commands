@@ -263,10 +263,12 @@ class MergeGateCheckpointTests(MergeGateFixture):
         legacy_run = Path("test-runs/test-run-abcdefgh")
         inherited_run = gate_root / legacy_run
         inherited_run.mkdir(parents=True)
+        deep_tmpdir = gate_root / "gate-invocation-abcdefghijklmnopqrstuvwxyz"
+        deep_tmpdir.mkdir()
         sockets = (Path(".com.google.Chrome.123456/SingletonSocket"),
                    Path("style-socket-abcdefgh/outside.sock"))
         for flag in ("--tests-only", "--affected"):
-            for inherited in (gate_root, inherited_run):
+            for inherited in (gate_root, inherited_run, deep_tmpdir):
                 with self.subTest(mode=flag, inherited=inherited):
                     job_folders: list[Path] = []
 

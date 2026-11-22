@@ -1460,9 +1460,7 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
             raise GateRefused('selected modules are absent from the tested tree')
         modules = [(suite, path) for suite, path in modules if str(path.relative_to(repo)) in paths]
     runner = module_runner(repo)
-    tmpfs = build_folders.tmpfs_temporary_parent()
-    if mode is SuiteMode.TARGETED or "test-runs" in tmpfs.parts:
-        tmpfs = build_folders.configured_gate_root()
+    tmpfs = build_folders.configured_gate_root()
     if not tmpfs.is_dir() or not os.access(tmpfs, os.W_OK):
         raise GateRefused(f"the test runner requires a writable gate folder at {tmpfs}")
     report_retained_gate_test_folders(tmpfs)
