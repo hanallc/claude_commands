@@ -1024,6 +1024,8 @@ It sends `READY=1` after listener setup.
 The main loop clears the outage claim once after `silence_seconds` of continuous operation.
 It uses the last usable configuration and retries a failed clear on a later loop.
 A shorter service start preserves the claim.
+Source checks start after the first usable configuration read.
+An unusable configuration keeps the last usable source timing, and repeated passes preserve the pending check time.
 Source changes stop the service after the settle interval. A missing source also counts as a change.
 Under systemd, the service then runs the new code in the same process with `execv`, and keeps the inherited socket.
 It sends `RELOADING=1` before `execv` and `READY=1` when the new listener is ready, so the systemd restart delay does not apply.

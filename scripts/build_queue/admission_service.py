@@ -2553,8 +2553,9 @@ class AdmissionServer:
             self.local_hold_holders.clear()
             self.reading_hold = NoReadingHold()
             self.next_pass = self.next_config_watch_retry
-            self.next_source_check = (self.clock.monotonic() + self.last_usable_configuration.source_check_seconds
-                                      if isinstance(self.last_usable_configuration, records.MemoryConfig) else float("inf"))
+            last_config = self.last_usable_configuration
+            self.next_source_check = (min(self.next_source_check, self.clock.monotonic() + last_config.source_check_seconds)
+                                      if isinstance(last_config, records.MemoryConfig) else float("inf"))
             self.last_inputs = self.last_result = self.last_policy = NoPass()
             self.published = NoPass()
             self.last_diagnostics = ()

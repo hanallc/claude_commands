@@ -6480,6 +6480,34 @@ class ServiceTests(unittest.TestCase):
             self.assertIn("memory admission: source watch will stop after the changes settled", entries)
             self.assertEqual(entries[-1], f"memory admission: ready with git revision {revision}")
 
+    def test_source_watch_stops_during_repeated_unusable_configuration_passes(self) -> None:
+        with AdmissionFixture() as fixture:
+            check_seconds = 1
+            settle_seconds = 2
+            pass_seconds = 0.25
+            fixture.configure(source_check_seconds=check_seconds, source_settle_seconds=settle_seconds,
+                              min_pass_gap_seconds=pass_seconds)
+            fixture.restart()
+            server = fixture.server
+            self.assertIsInstance(server.configuration, gate.UsableAdmissionConfiguration)
+            source = fixture.root / "loaded.py"
+            _ = source.write_text("old")
+            stamp = source.stat()
+            server.sources = {source: (stamp.st_ino, stamp.st_mtime_ns)}
+
+            write_memory_config(fixture.root / "build_admission.conf", estimate_refresh_seconds="invalid")
+            source.unlink()
+            for _turn in range(int((check_seconds + settle_seconds) / pass_seconds)):
+                fixture.clock.advance(pass_seconds)
+                server.next_pass = fixture.clock.monotonic()
+                server.run_once(0)
+                self.assertEqual(server.last_pass_started, fixture.clock.monotonic())
+                self.assertIsInstance(server.configuration, gate.UnusableAdmissionConfiguration)
+                if server.stopped:
+                    break
+
+            self.assertTrue(server.stopped)
+
     def test_a_module_loaded_after_start_stops_the_service_when_it_changes(self) -> None:
         from scripts.mac_test import eligibility
 
