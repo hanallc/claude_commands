@@ -12,13 +12,14 @@ import tempfile
 import unittest
 from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
+from contextlib import redirect_stdout
 from datetime import datetime, timezone
 from functools import cached_property
 from pathlib import Path
 from threading import Event
 from scripts.lib.transcript_test_support import compressed_copy
 from typing import ClassVar, IO, cast, final, override
-from unittest.mock import patch
+from unittest.mock import call, patch
 
 
 from scripts.lib.socket_test_support import short_socket_directory
@@ -991,6 +992,47 @@ elif "comm=" in joined:
         self.assertEqual(desktop["host"], {"kind": "herdr", "herdr_session": "writing", "pane_id": "w1:p1", "presentation": "detached"})
         self.assertEqual(inventory.parse_inventory(json.dumps(found)), found)
         self.assertEqual(status_entry._host_text(desktop["host"]), "herdr writing")  # pyright: ignore[reportPrivateUsage]
+
+    def test_status_shares_herdr_pane_reads_and_keeps_each_place(self) -> None:
+        server = 71_001
+        self.herdr_process(server, 1, ["/fixture/herdr", "--session", "writing", "server"], {})
+        panes = ((self.director_pid, DIRECTOR_ID, "w1:p1"), (DESKTOP_PID, DESKTOP_ID, "w1:p2"))
+        for pid, _, pane in panes:
+            self.herdr_process(pid, server, ["/bin/claude"], {"HERDR_PANE_ID": pane})
+        for pid, _, _ in panes:
+            # Keep the live panes and give each process its old launch pane ID.
+            _ = (self.proc / str(pid) / "environ").write_bytes(b"HERDR_PANE_ID=old-pane\0")
+        places = {session_id: herdr.herdr_place_of(pid) for pid, session_id, _ in panes}
+        self.assertEqual(places, {session_id: herdr.HerdrPlace("writing", pane) for _, session_id, pane in panes})
+        _ = self.herdr_log.write_text("")
+
+        replies = cast(dict[str, CommandResponse], json.loads((self.root / "herdr-responses.json").read_text()))
+
+        def request(session: str, method: str, *, pane_id: str) -> dict[str, object]:
+            self.assertEqual(method, "pane.process_info")
+            response = replies[f"--session {session} pane process-info --pane {pane_id}"]
+            return cast(dict[str, object], json.loads(response["stdout"])["result"])
+
+        output = io.StringIO()
+        with (patch.object(herdr, "session_socket_request", side_effect=request) as requests,
+              redirect_stdout(output)):
+            self.assertEqual(status_entry.main(["status", TARGET_LOGIN, "--json", "--here"], usage=lambda: ""), 0)
+        report = inventory.parse_inventory(output.getvalue())
+        with self.subTest(check="pane reads"):
+            commands = [cast(list[str], json.loads(line)) for line in self.herdr_log.read_text().splitlines()]
+            self.assertEqual([command[2:] for command in commands if command[:2] == ["--session", "writing"]
+                              and command[2:4] in (["pane", "list"], ["pane", "process-info"])],
+                             [["pane", "list"]])
+            self.assertCountEqual([request for request in requests.call_args_list if request.args[0] == "writing"], [
+                call("writing", "pane.process_info", pane_id=pane) for _, _, pane in panes
+            ])
+        with self.subTest(check="placement"):
+            hosts = {session["session_id"]: session["host"] for session in report["sessions"]}
+            for _, session_id, _ in panes:
+                host = hosts[session_id]
+                self.assertEqual(host["kind"], "herdr")
+                assert host["kind"] == "herdr"
+                self.assertEqual(herdr.HerdrPlace(host["herdr_session"], host["pane_id"]), places[session_id])
 
     def test_unreadable_herdr_placement_stays_unknown_in_inventory(self) -> None:
         with patch.object(herdr, "herdr_place_of", return_value=herdr.UnprovedHerdrPlacement("placement denied")):
