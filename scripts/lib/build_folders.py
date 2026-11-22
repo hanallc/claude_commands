@@ -190,7 +190,6 @@ class RemoteEditableRepository:
 
 
 EditableRepositoryRequest = LinkedEditableRepository | RemoteEditableRepository
-BuildFolderRequest = UniqueBuildFolder | StableOwnerFolder | EditableRepositoryRequest
 
 
 def inherited_temporary_parent() -> Path:
@@ -222,7 +221,7 @@ def _check_name(name: str) -> None:
         raise ValueError("a build folder name must be one path component")
 
 
-BuildFolderKind = Literal["temporary", "gate", "standing", "editable", "mirror", "target", "shell-cache",
+BuildFolderKind = Literal["temporary", "gate", "standing", "editable", "main", "mirror", "target",
                           "scratch", "legacy-unique", "legacy-stable", "tool", "slot", "copy"]
 
 
@@ -310,6 +309,7 @@ class CiOutput:
 
 
 FolderForm = WorktreeOutput | BuildCopy | MainOutput | CiOutput
+BuildFolderRequest = UniqueBuildFolder | StableOwnerFolder | EditableRepositoryRequest | MainOutput
 
 
 @final
@@ -533,6 +533,8 @@ def _new_suffix(length: int, settings: ConfigRead) -> str:
 
 def build_folder_path(spec: BuildFolderSpec) -> Path:
     """Apply the configured name rule without creating a folder."""
+    if spec.kind == "main":
+        return spec.parent / _form_name(spec.repository) / "main"
     settings = _settings()
     if spec.kind == "copy":
         return copy_path(spec.repository, spec.unit, spec.slot)
@@ -1278,6 +1280,8 @@ def _request_spec(request: BuildFolderRequest | BuildFolderSpec | _TemporaryFold
         return _request_spec(request.request)
     if isinstance(request, BuildFolderSpec):
         return request
+    if isinstance(request, MainOutput):
+        return BuildFolderSpec(kind="main", parent=build_root(), repository=request.repo, suffix_length=0)
     if isinstance(request, (LinkedEditableRepository, RemoteEditableRepository)):
         path = request.path.expanduser().absolute()
         if isinstance(request, RemoteEditableRepository) and request.depth < 1:
@@ -1295,7 +1299,7 @@ def _request_spec(request: BuildFolderRequest | BuildFolderSpec | _TemporaryFold
 
 
 def _stable_folder(spec: BuildFolderSpec) -> bool:
-    return spec.kind in ("standing", "editable", "mirror", "target", "shell-cache", "legacy-stable", "slot", "copy")
+    return spec.kind in ("standing", "editable", "main", "mirror", "target", "legacy-stable", "slot", "copy")
 
 
 FolderCreationNotice = Callable[[Path, os.stat_result], None] | Literal["untracked"]
@@ -1416,7 +1420,7 @@ def _create_build_folder(request: BuildFolderRequest | BuildFolderSpec | _Tempor
                     elif spec.kind != "copy":
                         _write_lease(path, directory, allocation)
                     if existing is None:
-                        mode = request.mode if isinstance(request, StableOwnerFolder) else 0o777 if stable else 0o700
+                        mode = original.mode if isinstance(original, StableOwnerFolder) else 0o777 if stable and spec.kind != "main" else 0o700
                         try:
                             os.mkdir(path.name, mode=mode, dir_fd=directory)
                             made_inode = os.stat(path.name, dir_fd=directory, follow_symlinks=False)
@@ -1731,7 +1735,7 @@ def collector_lease(path: Path, *, children: bool = False, wait: bool = True) ->
 
 
 @contextmanager
-def leased_build_folder(spec: BuildFolderSpec | UniqueBuildFolder, *,
+def leased_build_folder(spec: BuildFolderSpec | UniqueBuildFolder | MainOutput, *,
                         on_create: FolderCreationNotice = "untracked") -> Generator[Path]:
     """Hold the maker lease while a persistent folder is in use."""
     path = create_build_folder(spec, on_create=on_create)
