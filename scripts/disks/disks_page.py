@@ -15,7 +15,7 @@ from typing import NamedTuple, TypedDict, cast
 from scripts.build_queue import memory_files
 from scripts.lib import conf, file_lock
 from scripts.lib.atomic_file import write_text_atomic
-from scripts.review_links import console_theme, page_frame, review_link
+from scripts.review_links import console_theme, page_frame, record_table, review_link
 from scripts.review_links import staff_names
 
 PAGE_NAME = "disks.html"
@@ -109,6 +109,7 @@ def publish(folder: Path, settings: PageSettings) -> Path:
     page = (page_frame.template(source, "Disks", "disks")
             .replace("__STEP_TIP_STYLE__", tip.style).replace("__STEP_TIP_SCRIPT__", tip.script)
             .replace("__DISKS_SETTINGS__", json.dumps(settings).replace("</", "<\\/")))
+    page = record_table.with_empty_result(page)
     page = page.replace('</head>', staff_names.script(staff_names.read().registry()) + '</head>', 1)
     folder.mkdir(parents=True, exist_ok=True)
     page_path = folder / PAGE_NAME

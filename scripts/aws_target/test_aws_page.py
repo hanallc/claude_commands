@@ -457,6 +457,36 @@ class AwsCombinedTableTests(PageCostFixture):
           "Refresh shows the last good launch and latest attempt");
 """, blocked=True)
 
+    def test_empty_price_table_names_the_region_filter_and_restores_all(self) -> None:
+        self.run_browser_checks("", """
+    const click = selector => document.querySelector(selector).click();
+    click("#regions button:last-child");
+    const table = () => document.querySelector("#price-table table");
+    const empty = () => table().querySelector("[data-empty-result]");
+    const message = () => empty().querySelector('[role="status"]').textContent;
+    check(message() === "No item matches Regions: none.",
+          "The empty table names the region filter");
+    click("#show [data-measure='quota']");
+    click("#runs-chips [data-scope='both']");
+    check(message().includes("Show:") && message().includes("Runs: Both"),
+          "The empty Standard table names the Show and Runs filters");
+    click("#types [data-types='gpu']");
+    check(message().includes("Types: GPU") && !message().includes("Runs:"),
+          "The empty GPU table omits the Runs filter");
+    check(localStorage.getItem("aws-prices-regions") === "[]", "None saves an empty selection");
+    empty().querySelector("[data-reset-empty-filters]").click();
+    check(!table().querySelector("[data-empty-result]") && table().tBodies[0].rows.length === 3,
+          "Show all items restores the price rows");
+    check(document.activeElement === document.querySelector("#geographies button"),
+          "Show all items focuses the first filter");
+    check(localStorage.getItem("aws-prices-regions") === null, "Show all items clears the saved selection");
+    const params = new URLSearchParams(location.search);
+    check([...params.keys()].sort().join() === "runs,show,types", "The URL has no region selection");
+    check(params.get("show") === "spot,cost,quota", "Show all items restores all Show choices");
+    check(params.get("types") === "standard", "Show all items restores Standard types");
+    check(params.get("runs") === "gate", "Show all items restores the Gates run scope");
+""")
+
     def test_default_table_marks_and_shared_filters(self) -> None:
         self.run_browser_checks('?prices=cost', """
     check(scope === null && scopeCosts().scope === "gate", "The default scope shows gate prices");

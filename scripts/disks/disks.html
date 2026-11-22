@@ -237,6 +237,15 @@ function fromSlider(position, range) {
   return snapLimit(range.min * (range.max / range.min) ** (position / SLIDER_STEPS), range);
 }
 
+function sizeLimitAt(position, range) {
+  if (position === 0) return 0;
+  return position === 1 ? range.min : fromSlider(position, range);
+}
+
+function sizeLimitPosition(limit, range) {
+  return limit ? Math.max(1, toSlider(limit, range)) : 0;
+}
+
 function startLimit(range, settings) {
   return snapLimit(settings.slider_default_gib * GIB, range);
 }
@@ -416,7 +425,7 @@ function slotsHtml(report, keepBytes, now, opened, step = () => null) {
 
 // The Sessions card rows: each session folder of at least the limit, largest first, with its held folders and whether
 // its session runs. One row adds up the smaller sessions.
-function sessionRows(report, keepBytes, limit) {
+function sessionRows(report, keepBytes, limit, {shown, smaller} = sessionsAtLeast(report, limit)) {
   const folderSize = bytes => esc(measuredSize(bytes, keepBytes));
   const largest = Math.max(0, ...report.sessions.map(row => row.size || 0));
   const held = row => {
@@ -431,7 +440,6 @@ function sessionRows(report, keepBytes, limit) {
   const sessionRow = row => `<tr data-tip="session:${esc(row.name)}"><td class="path">${stepTip.roleName(row.name)}</td><td class="n">${folderSize(row.size)}</td>`
     + `<td class="share">${row.size && largest ? `<i style="width:${(100 * row.size / largest).toFixed(1)}%"></i>` : ""}</td>`
     + `<td class="held">${held(row)}</td><td>${state(row)}</td></tr>`;
-  const {shown, smaller} = sessionsAtLeast(report, limit);
   const rest = smaller.length ? `<tr data-tip="smaller:sessions"><td class="dim">${smaller.length} smaller</td>`
     + `<td class="n dim">${folderSize(slotTotal(smaller))}</td><td class="share"></td><td></td><td></td></tr>` : "";
   return shown.map(sessionRow).join("") + rest;
@@ -446,10 +454,6 @@ function sessionsAtLeast(report, limit) {
 function sessionRange(report, keepBytes) {
   const min = Math.max(keepBytes, 1024 ** 2);
   return {min, max: Math.max(min, ...report.sessions.map(row => row.size || 0))};
-}
-
-function sessionLimitAt(position, range) {
-  return position > 0 ? fromSlider(position, range) : 0;
 }
 
 const settings = JSON.parse(document.getElementById("disks-settings").textContent);
@@ -570,21 +574,33 @@ function refill(part, attribute, html) {
 function driveView(card) {
   let drive = null, range = null, state = null, slider = null;
   const fill = () => {
-    card.querySelector("output").textContent = limitLabel(state.limit);
-    refill(card.querySelector("tbody"), "data-path",
-           treeRows(drive.tree, drive.mount, state, data.keep_bytes).map(row => rowHtml(row, drive.tree.size)).join(""));
+    const limit = state.limit ? limitLabel(state.limit) : "any size";
+    card.querySelector("output").textContent = limit;
+    const rows = treeRows(drive.tree, drive.mount, state, data.keep_bytes);
+    refill(card.querySelector("tbody"), "data-path", rows.map(row => rowHtml(row, drive.tree.size)).join(""));
+    updateEmptyResult(card.querySelector("table"), {
+      empty: drive.tree.children.length > 0 && !rows.some(row => row.depth === 0 && row.kind !== "files" && !row.other),
+      noun: "folder",
+      labels: ["the " + limit + " minimum size"],
+      resetFilters: () => {
+        state.limit = 0;
+        slider.value = "0";
+        fill();
+        slider.focus({preventScroll: true});
+      },
+    });
   };
   const build = () => {
     // A div, not a label: a label around the slider can take the press that starts a drag.
     card.innerHTML = `<div class="top"></div><div class="limit">Name top folders of at least<span class="range">`
-      + `<span class="end low"></span><input type="range" min="0" max="${SLIDER_STEPS}" aria-label="Name top folders of at least">`
+      + `<span class="end low">any</span><input type="range" min="0" max="${SLIDER_STEPS}" aria-label="Name top folders of at least">`
       + `<span class="end high"></span><output></output></span></div>`
       + `<table class="tree"><colgroup><col class="place"><col class="size"><col class="pct"><col class="walk"></colgroup>`
       + `<thead><tr><th>Place</th><th class="n">Size</th><th class="n pct">Of parent</th><th aria-label="Place in the drive"></th></tr></thead>`
       + `<tbody></tbody></table>`;
     slider = card.querySelector("input");
     slider.addEventListener("input", () => {
-      state.limit = fromSlider(Number(slider.value), range);
+      state.limit = sizeLimitAt(Number(slider.value), range);
       fill();
     });
     onToggle(card.querySelector("tbody"), "tr[data-path]", row => {
@@ -603,10 +619,9 @@ function driveView(card) {
     range = sliderRange(drive.tree, settings);
     state = stateFor(drive, range);
     card.querySelector(".top").innerHTML = headHtml(drive);
-    card.querySelector(".end.low").textContent = limitLabel(range.min);
     card.querySelector(".end.high").textContent = limitLabel(range.max);
-    slider.disabled = range.max <= range.min;
-    const position = String(toSlider(state.limit, range));
+    slider.disabled = !drive.tree.children.length;
+    const position = String(sizeLimitPosition(state.limit, range));
     if (slider.value !== position) slider.value = position;
     fill();
   };
@@ -616,8 +631,21 @@ function driveView(card) {
 function sessionsView(card) {
   let report = null, keepBytes = 0, range = null, slider = null;
   const fill = () => {
-    card.querySelector("output").textContent = sessionLimit ? limitLabel(sessionLimit) : "any size";
-    card.querySelector("tbody").innerHTML = sessionRows(report, keepBytes, sessionLimit);
+    const limit = sessionLimit ? limitLabel(sessionLimit) : "any size";
+    card.querySelector("output").textContent = limit;
+    const sessions = sessionsAtLeast(report, sessionLimit);
+    card.querySelector("tbody").innerHTML = sessionRows(report, keepBytes, sessionLimit, sessions);
+    updateEmptyResult(card.querySelector("table"), {
+      empty: report.sessions.length > 0 && sessions.shown.length === 0,
+      noun: "session",
+      labels: ["the " + limit + " minimum size"],
+      resetFilters: () => {
+        sessionLimit = 0;
+        slider.value = "0";
+        fill();
+        slider.focus({preventScroll: true});
+      },
+    });
   };
   const build = () => {
     card.innerHTML = `<div class="top"></div><div class="limit">Show sessions of at least<span class="range">`
@@ -628,7 +656,7 @@ function sessionsView(card) {
       + `<th>Held folders</th><th>State</th></tr></thead><tbody></tbody></table>`;
     slider = card.querySelector("input");
     slider.addEventListener("input", () => {
-      sessionLimit = sessionLimitAt(Number(slider.value), range);
+      sessionLimit = sizeLimitAt(Number(slider.value), range);
       fill();
     });
   };
@@ -647,7 +675,7 @@ function sessionsView(card) {
     sessionLimit = range.max <= range.min ? 0 : Math.min(sessionLimit, range.max);
     card.querySelector(".end.high").textContent = limitLabel(range.max);
     slider.disabled = range.max <= range.min;
-    const position = String(sessionLimit ? toSlider(sessionLimit, range) : 0);
+    const position = String(sizeLimitPosition(sessionLimit, range));
     if (slider.value !== position) slider.value = position;
     fill();
   };

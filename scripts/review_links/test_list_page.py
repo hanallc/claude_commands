@@ -923,6 +923,54 @@ window.fetch=async (path,options={})=>{
  check(isExpanded(alpha,true) && isExpanded(beta,false),'Only the selected match opens.');
 ''')
 
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for browser checks")
+    def test_browser_empty_results_name_the_filters_and_offer_their_actions(self) -> None:
+        read = self.add("Deploy alpha")
+        _ = the_list.mark_read(MORTY.id, read.id, source="nate")
+        _ = self.add("Deploy beta", owner=OTHER.id)
+        for search, filter_on, message, actions in (
+            ("xa", False, 'No item contains "xa".', ["Clear search"]),
+            ("", True, "No item matches Owner: sdlc and Unread only.", ["Show all items"]),
+            ("xa", True, 'No item contains "xa" and matches Owner: sdlc and Unread only.',
+             ["Clear search", "Show all items"]),
+        ):
+            with self.subTest(search=search, filter_on=filter_on):
+                params = json.dumps({"search": search, "filterOn": filter_on, "message": message,
+                                     "actions": actions, "owner": OWNER.id})
+                self.browser_row_expansion("const example=" + params + ";\n" + r'''
+const words=document.querySelector('#list-search'),unread=document.querySelector('#list-unread');
+if(example.filterOn){selectOwner(example.owner);unread.click();}
+if(example.search){
+ const filtered=new Promise(resolve=>words.addEventListener('filterchange',resolve,{once:true}));
+ words.value=example.search;words.dispatchEvent(new Event('input'));await filtered;
+}
+const empty=()=>document.querySelector('.list-table table > [data-empty-result]');
+const message=()=>empty()?.querySelector('[role="status"]').textContent;
+const clear=()=>empty()?.querySelector('[data-clear-empty-search]');
+const reset=()=>empty()?.querySelector('[data-reset-empty-filters]');
+check(message()===example.message,'The empty row names the active filters.');
+check(JSON.stringify([...empty().querySelectorAll('button:not([hidden])')].map(button=>button.textContent))
+ ===JSON.stringify(example.actions),'The empty row offers the correct actions.');
+if(example.search){
+ clear().click();
+ check(!words.value && document.activeElement===words,'Clear search empties and focuses the search box.');
+ check(unread.checked===example.filterOn,'Clear search preserves Unread only.');
+ if(example.filterOn){
+  check(chip('owner','staff:'+example.owner).getAttribute('aria-pressed')==='true'
+   && message()==='No item matches Owner: sdlc and Unread only.','Clear search preserves Owner and updates the message.');
+  const filtered=new Promise(resolve=>words.addEventListener('filterchange',resolve,{once:true}));
+  words.value=example.search;words.dispatchEvent(new Event('input'));await filtered;
+ }else check(!empty() && rows.every(row=>!row.hidden),'Clear search shows the items.');
+}
+if(example.filterOn){
+ reset().click();
+ const all=chip('owner','all');
+ check(!words.value && !unread.checked && all.getAttribute('aria-pressed')==='true'
+  && document.activeElement===all,'Show all items resets the filters and focuses the first filter.');
+ check(!empty() && rows.every(row=>!row.hidden),'Show all items reveals every row.');
+}
+''')
+
     def browser_row_expansion(self, steps: str) -> None:
         markup = list_page.render(self.root / "reviews", include_counts=False).decode()
         probe = r'''<script>

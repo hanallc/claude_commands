@@ -1183,11 +1183,16 @@ The user approved the combined table on 2026-11-18.
    A page refresh keeps the horizontal scroll position.
 
 A region filter at the top of the page shows all regions by default; the user asked for it on 2026-11-14 through builds.
+When the filters hide every price row, the table names the filters.
+It names Runs only when the price table has run-cost columns.
+**Show all items** restores all regions and the default Show, Types and Runs choices.
 1. A chip for each region toggles it. `All` shows every region again.
    The chips show the groups `us`, `eu`, `ap`, `ca` and `sa` in that order, each A to Z; a region outside them comes last.
    `aws_page.region_filter_key` sets the order; the user asked for it on 2026-11-15 through sdlc and builds.
    `None` at the end clears every region, so one click then shows only that region; the user asked for it on 2026-11-15 through builds.
-   With no region chosen, each card says `No region chosen.` A reload with no region saved shows every region.
+   With no region chosen, the empty price table names Regions when the snapshot has price rows.
+   Other tables with rows can still say `No region chosen.`
+   A reload with no region saved shows every region.
 2. Every section follows it: tables with a region column drop the other columns, and tables with a region row drop the other rows.
 3. The colors, the box and the table marks use only the chosen regions. `Table.values` holds the number of each cell.
    One region has no column scale or column box.
