@@ -116,7 +116,9 @@ class PythonRootTests(unittest.TestCase):
                 destination.parent.mkdir(parents=True, exist_ok=True)
                 _ = shutil.copy2(repository / relative, destination)
             self.assertTrue((checkout / shim).is_file())
-            self.assertFalse((checkout / "scripts/lib/python_startup/sitecustomize.py").exists())
+            self.assertFalse((checkout / "scripts/lib/python_startup").exists())
+            for package in ("scripts", "scripts/lib", "scripts/build_targets"):
+                self.assertFalse((checkout / package / "__init__.py").exists(), package)
             output = self.run_shim(repository / shim, ["-c",
                 "from scripts.build_targets import execution_transport; print(execution_transport.__file__)"],
                 checkout, dict(os.environ))
