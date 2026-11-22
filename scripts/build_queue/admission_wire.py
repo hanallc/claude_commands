@@ -10,7 +10,7 @@ import os
 from pathlib import Path
 from scripts.build_queue import execution_identity
 from scripts.build_hold.shared_state_defaults import DEFAULT_ADMISSION_SOCKET as DEFAULT_ADMISSION_SOCKET
-from typing import TYPE_CHECKING, TypeVar, cast
+from typing import Literal, TYPE_CHECKING, TypeVar, cast
 
 from scripts.build_queue import snapshot_codec as codec
 from scripts.lib.atomic_file import write_text_atomic
@@ -66,6 +66,28 @@ class Owner:
     """The owner identity holds a process identifier and start time."""
     pid: int
     start_time: str
+
+
+def _natedev_run_destination() -> placement.PlacementDestination:
+    from scripts.mac_test.claim_state import WHOLE_MAC
+
+    return placement.PlacementDestination("local", "natedev", "natedev", WHOLE_MAC)
+
+
+@dataclass(frozen=True)
+class VerifyRunSlot:
+    """The Verify run holds one place on its chosen machine."""
+    repository: str
+    owner: Owner
+    destination: placement.PlacementDestination = field(default_factory=_natedev_run_destination, kw_only=True)
+
+    @property
+    def run_key(self) -> str:
+        return records.run_owner(self.owner.pid, self.owner.start_time)
+
+    @property
+    def key(self) -> str:
+        return f"{self.run_key}:{self.repository}"
 
 
 @dataclass(frozen=True)
@@ -497,6 +519,28 @@ class UnknownPlacementStatus:
 class PlacementStatusReply:
     """The reply holds the known or unknown placement status."""
     status: KnownPlacementStatus | UnknownPlacementStatus
+
+
+@dataclass(frozen=True)
+class RunGrantRequest(CallerCode):
+    """The owner asks for the destination already saved for the run."""
+    episode: str
+    owner: placement.SubmittingOwner
+
+
+@dataclass(frozen=True)
+class RunGrant:
+    """The reply gives the destination saved for the run."""
+    destination: placement.PlacementDestination
+
+
+@dataclass(frozen=True)
+class RunGrantRefused:
+    """The service cannot return a saved destination."""
+    reason: Literal["missing_run", "stale_run", "not_built"]
+
+
+RunGrantReply = RunGrant | RunGrantRefused
 
 
 @dataclass(frozen=True)

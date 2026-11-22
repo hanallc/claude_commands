@@ -5963,6 +5963,17 @@ class StrictLineReplayTests(unittest.TestCase):
         self.assertIn(nextest, starts)
 
 
+class RunDecisionShapeTests(unittest.TestCase):
+    def test_admission_pass_starts_with_no_run_decisions(self) -> None:
+        inputs = admission_records.QueueInputs([], (), (), admission_records.HostMemory(14 * GIB, 64 * GIB),
+            admission_records.NoPressureHold(), admission_records.ReadyToStart(), NOW_EPOCH)
+
+        result = gate.admission_pass(inputs, inputs.now, admission_policy_fixture())
+        runs: Mapping[str, gate.RunDecision] = result.runs
+
+        self.assertEqual(runs, {})
+
+
 class StrictTargetLineTests(unittest.TestCase):
     def waiter(self, pid: int, need: float, **fields: object) -> admission_records.Waiter:
         return cast(admission_records.Waiter, cast(object, {"pid": pid, "start_time": str(pid),

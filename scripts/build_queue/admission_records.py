@@ -104,6 +104,23 @@ class SavedPlacementAssignment:
     refusal_settings: RefusalSettings | NoRefusalSettings = NoRefusalSettings()
     remote_start_hold: RemoteStartHold | RemoteStartHoldUnrecorded | RemoteStartHoldEnded = RemoteStartHoldUnrecorded()
 
+
+@dataclass(frozen=True)
+class NamedMachines:
+    """The caller names the machines that can run the whole invocation."""
+    names: frozenset[str]
+
+
+@dataclass(frozen=True)
+class RunRequest:
+    """One queue entry holds the machine names for a whole run."""
+    episode: str
+    owner: placement.SubmittingOwner
+    repository: str
+    since: float
+    machines: NamedMachines
+
+
 # Historical multiplier for saved dev bases from the Phase 24 replay.
 DEV_HEADROOM = 4.2034275337646125
 

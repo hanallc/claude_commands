@@ -33,6 +33,20 @@ from scripts.build_queue.admission_test_support import AdmissionFixture, Exchang
 
 
 class ProtocolTests(unittest.TestCase):
+    def test_run_grant_messages_round_trip(self) -> None:
+        from scripts.build_queue import admission_wire as grant_wire
+        from scripts.mac_test.claim_state import RepositoryScope
+
+        request = grant_wire.RunGrantRequest("run-a", placement.SubmittingOwner("natedev", 123, "4200"))
+        self.assertEqual(grant_wire.parse_record(grant_wire.encode_record(request), grant_wire.RunGrantRequest), request)
+
+        scope = RepositoryScope("fixture", "fixture-key", 1)
+        grant = grant_wire.RunGrant(placement.PlacementDestination("mac", "mac", "mac-host", scope, 1))
+        for reply in (grant, grant_wire.RunGrantRefused("missing_run"),
+                      grant_wire.RunGrantRefused("stale_run"), grant_wire.RunGrantRefused("not_built")):
+            with self.subTest(reply=reply):
+                self.assertEqual(grant_wire.parse_record(grant_wire.encode_record(reply), type(reply)), reply)
+
     def test_placement_status_round_trips_without_launch_permission(self) -> None:
         from scripts.build_queue import admission_wire as status_wire
         from scripts.build_queue.test_placement import placement_request

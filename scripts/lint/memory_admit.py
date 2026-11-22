@@ -27,6 +27,7 @@ from typing import BinaryIO, Literal, Protocol, TypedDict, cast
 from itertools import chain
 
 from scripts.build_queue import admission_records as records, placement, progress_profile as progress, snapshot_codec as codec, step_estimator
+from scripts.build_queue.admission_wire import VerifyRunSlot
 from scripts.build_queue.scope_activity import (EmptyBuildScope, IdleService, LiveBuildRun, NoLiveBuildRun,
     NotServiceSlice, RunningServiceJob, WaitingServiceJob, UnmatchedServiceJob, ServiceJobState, ScopeActivityReader, ScopeProcesses,
     SESSION_KEYS, environment_values)
@@ -503,9 +504,37 @@ class PassRow:
 
 
 @dataclass(frozen=True)
+class RunWaiting:
+    """Each reason explains why a named machine cannot take the run yet."""
+    reasons: Mapping[str, str]
+
+
+@dataclass(frozen=True)
+class StartRun:
+    """The run can take a place at this destination."""
+    destination: placement.PlacementDestination
+
+
+@dataclass(frozen=True)
+class KeepRunPlace:
+    """The run keeps its saved place."""
+    slot: VerifyRunSlot
+
+
+@dataclass(frozen=True)
+class RunRefused:
+    """The request cannot enter any line."""
+    reason: str
+
+
+RunDecision = RunWaiting | StartRun | KeepRunPlace | RunRefused
+
+
+@dataclass(frozen=True)
 class PassResult:
     rows: tuple[PassRow, ...]
     policy: HeadPolicy
+    runs: Mapping[str, RunDecision] = field(default_factory=dict[str, RunDecision], kw_only=True)
 
 
 @dataclass(frozen=True)
