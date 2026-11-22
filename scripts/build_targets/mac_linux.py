@@ -229,6 +229,10 @@ class GuestMain:
 
 def read_guest_main(settings: GuestSettings) -> GuestMain | EmptyGuestMain:
     shell = guest_shell(settings) + '''
+if ! command -v bwrap >/dev/null 2>&1; then
+    printf 'bwrap is absent from the guest PATH.\\n' >&2
+    exit 127
+fi
 if [ -f "$checkout/.git/HEAD" ]; then
     git -C "$checkout" rev-parse --verify --quiet refs/heads/main || test "$?" -eq 1
 fi'''
@@ -856,6 +860,9 @@ def run_guest(request_path: Path) -> int:
                        str(Path(__file__).resolve()), str(request_path), '--run-copy']
             if shutil.which('dbus-run-session'):
                 command[:0] = ['dbus-run-session', '--']
+            # Mount the guest root before mounting proc for the new PID namespace.
+            command[:0] = ['bwrap', '--die-with-parent', '--unshare-pid', '--dev-bind', '/', '/',
+                           '--proc', '/proc', '--bind', str(tmp), '/tmp', '--tmpfs', '/dev/shm', '--']
             return subprocess.run(command, cwd=copy.path, env=environment, stdin=subprocess.DEVNULL, check=False,
                                   pass_fds=build_folders.held_build_folder_descriptors()).returncode
 
