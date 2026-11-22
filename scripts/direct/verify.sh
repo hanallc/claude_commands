@@ -3962,6 +3962,7 @@ fi
 # This also covers the first instant of a step, when a killed verify cannot
 # leave a command that a periodic process scan has not found yet.
 STEP_OWNER_PY='
+from contextlib import suppress
 import fcntl
 import json
 import os
@@ -3985,6 +3986,11 @@ def identity(pid):
     if not isinstance(result, Started):
         raise RuntimeError("cannot read the step owner start")
     return result.start
+
+exit_stderr_fd = os.environ.pop("VERIFY_EXIT_STDERR_FD", "")
+if exit_stderr_fd.isdecimal() and int(exit_stderr_fd) >= 74:
+    with suppress(OSError):
+        os.close(int(exit_stderr_fd))
 
 child = os.fork()
 if child:
@@ -4105,7 +4111,9 @@ buildlog_exec() {
             return 125
         fi
         VERIFY_TOKEN_LOST_FILE="${HOLD_WAIT_DIR:+$HOLD_WAIT_DIR/token-lost}" \
-            VERIFY_PY_HELPER=STEP_OWNER_PY buildlog_exec_unowned env VERIFY_PROCESS_GROUP_LIB="$(dirname -- "${STEP_RECORD_SCRIPT:-$BOARD_HELPER}")/../lib" "$PY" -c "$STEP_OWNER_PY" \
+            VERIFY_PY_HELPER=STEP_OWNER_PY buildlog_exec_unowned env \
+                VERIFY_EXIT_STDERR_FD="${VERIFY_EXIT_STDERR_FD:-}" \
+                VERIFY_PROCESS_GROUP_LIB="$(dirname -- "${STEP_RECORD_SCRIPT:-$BOARD_HELPER}")/../lib" "$PY" -c "$STEP_OWNER_PY" \
                 "${BOARD_DIR}/locks/cargo.d" "$$" "$@" || step_status=$?
         stop_token_renewer
         return "$step_status"
@@ -4250,7 +4258,28 @@ if [[ "$CMD" == test ]]; then
     # The common path calculates once; a later hold refreshes after its wait.
     refresh_test_build_inputs
 fi
+save_verify_exit_stderr() {
+    VERIFY_EXIT_STDERR_FD=""
+    # Find a free descriptor before duplicating stderr.
+    {
+        local fd=74
+        while [[ -e "/dev/fd/$fd" || -L "/dev/fd/$fd" ]]; do
+            fd=$((fd + 1))
+        done
+        if eval "exec $fd>&1"; then
+            VERIFY_EXIT_STDERR_FD=$fd
+        fi
+    } 1>&2 2>/dev/null || true
+}
+
+close_verify_exit_stderr() {
+    if [[ ${VERIFY_EXIT_STDERR_FD:-} =~ ^[1-9][0-9]+$ ]]; then
+        eval "exec $VERIFY_EXIT_STDERR_FD>&-"
+    fi
+}
+
 run_log_tee() {
+    close_verify_exit_stderr
     # Keep readers alive while verify_interrupted stops the step and records its result.
     # An early reader exit can cause SIGPIPE during cleanup.
     trap '' INT TERM HUP
@@ -4276,7 +4305,7 @@ stop_interrupted_run_log() {
 }
 
 # Save the original stderr before the run log redirects it.
-{ exec {exit_stderr}>&1; } 1>&2 2>/dev/null || exit_stderr=""
+save_verify_exit_stderr
 
 if [[ -n "${CACHE_DIR}" ]] && mkdir -p "${CACHE_DIR}"; then
     # Taken now, after the token and hold waits: an edit made while this call
@@ -4366,10 +4395,10 @@ verify_cleanup() {
 
 finish_exit_diagnostics() {
     [[ -n "$exit_diagnostics" ]] || return 0
-    if [[ -s "$exit_diagnostics" && -n "${exit_stderr:-}" ]]; then
+    if [[ -s "$exit_diagnostics" && -n "${VERIFY_EXIT_STDERR_FD:-}" ]]; then
         # Forward diagnostics only after cleanup releases the token and lease.
         VERIFY_PY_HELPER=VERIFY_EXIT_DIAGNOSTIC "$PY" "$VERIFY_START_DIR/../lib/time_limit.py" 1 0 \
-            cat -- "$exit_diagnostics" 2>/dev/null >&"$exit_stderr" || true
+            cat -- "$exit_diagnostics" 2>/dev/null >&"$VERIFY_EXIT_STDERR_FD" || true
     fi
     rm -f -- "$exit_diagnostics" || true
 }
@@ -4435,7 +4464,10 @@ trap 'verify_interrupted 2' INT
 trap 'verify_interrupted 15' TERM
 trap 'verify_interrupted 1' HUP
 if [[ -n "${COPIES_RUN_PID:-}" ]]; then
-    "$PY" "$STEP_COPIES_SCRIPT" watch-owner --pid "$COPIES_RUN_PID" --verify-pid "$$" &
+    (
+        close_verify_exit_stderr
+        exec "$PY" "$STEP_COPIES_SCRIPT" watch-owner --pid "$COPIES_RUN_PID" --verify-pid "$$"
+    ) &
     COPY_RUN_WATCH_PID=$!
 fi
 

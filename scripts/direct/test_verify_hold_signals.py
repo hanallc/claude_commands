@@ -156,13 +156,16 @@ placement_once
 
     def verify_exit_command(self, token: Path, action: str) -> list[str]:
         harness = shell_functions(
-            VERIFY, "finish_exit_diagnostics", "run_log_tee", "start_run_log", "stop_interrupted_run_log",
+            VERIFY, "save_verify_exit_stderr", "close_verify_exit_stderr", "finish_exit_diagnostics",
+            "run_log_tee", "start_run_log", "stop_interrupted_run_log",
             "verify_exit", "verify_interrupted",
         ) + r'''
 RUN_LOG=$1 RUN_LOG_PIDS=() CMD=test held_token=$2 VERIFY_START_DIR=$3
 RUN_STEP_PID=""
 PY=$VERIFY_START_DIR/../lib/py
-exec {exit_stderr}>&2
+exec 74>"$RUN_LOG.lease"
+save_verify_exit_stderr
+[[ /dev/fd/74 -ef "$RUN_LOG.lease" && -n "$VERIFY_EXIT_STDERR_FD" ]] || exit 90
 exit_diagnostics="$RUN_LOG.exit-diagnostics"
 : > "$exit_diagnostics"
 interrupt_hold_wait() { printf 'hold diagnostic\n' >&2; }
@@ -191,15 +194,16 @@ finish_verify_run() { :; }
         self.assertEqual(result.stdout, "")
         self.assertFalse((self.fixture.root / "run.log.exit-diagnostics").exists())
 
-    def test_interrupted_exit_finishes_with_full_stdout(self) -> None:
+    def test_interrupted_exit_finishes_with_full_stderr(self) -> None:
         token = self.fixture.root / "held-token"
         token.touch()
         with full_output_pipe() as write_fd:
             result = subprocess.run(self.verify_exit_command(token, "verify_exit 0 'printf output'"),
-                                    env=verify_test_environment(), stdout=write_fd, stderr=subprocess.PIPE, text=True,
+                                    env=verify_test_environment(), stdout=subprocess.PIPE, stderr=write_fd, text=True,
                                     check=False, timeout=SIGNAL_EXIT_SECONDS)
-        self.assertEqual(result.returncode, 128, result.stderr)
+        self.assertEqual(result.returncode, 128, result.stdout)
         self.assertFalse(token.exists())
+        self.assertFalse((self.fixture.root / "run.log.exit-diagnostics").exists())
 
     def test_exit_and_term_release_token_when_diagnostics_cannot_open(self) -> None:
         setup = r'''
@@ -267,7 +271,7 @@ kill -TERM "$$"
         with full_output_pipe() as write_fd:
             log = self.fixture.root / "blocked-run.log"
             harness = shell_functions(
-                VERIFY, "run_log_tee", "start_run_log", "stop_interrupted_run_log",
+                VERIFY, "close_verify_exit_stderr", "run_log_tee", "start_run_log", "stop_interrupted_run_log",
             ) + r'''
 RUN_LOG=$1 RUN_LOG_PIDS=()
 trap 'stop_interrupted_run_log; exit 129' HUP

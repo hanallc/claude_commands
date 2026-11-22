@@ -568,7 +568,8 @@ sweep_after_step test-step
             _ = write_config_fixture(configuration / "build_folders.conf", "patterns.legacy-stable={purpose}\n")
             reader, writer = os.pipe()
             process = subprocess.Popen(
-                ["bash", "-c", f'source "$1"; {SWEEP_STAND_IN}; sweep_after_step test-step', "sweep-test", str(INVOKE)],
+                ["bash", "-c", 'source "$1"; exec 74>&2; VERIFY_EXIT_STDERR_FD=74; '
+                 + SWEEP_STAND_IN + "; sweep_after_step test-step", "sweep-test", str(INVOKE)],
                 cwd=root, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                 pass_fds=(writer,),
                 env={**os.environ, **environment, "HOME": directory, "TMPDIR": directory,

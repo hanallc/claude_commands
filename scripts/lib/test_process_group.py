@@ -285,7 +285,7 @@ class ShellProcessGroupTests(PrivateGroupFixture):
 
     def cancel_step(self, function: str, child: subprocess.Popen[str]) -> subprocess.CompletedProcess[str]:
         verify = self.root / "scripts/direct/verify.sh"
-        definitions = shell_functions(verify, "finish_exit_diagnostics", function)
+        definitions = shell_functions(verify, "save_verify_exit_stderr", "finish_exit_diagnostics", function)
         watch = self.root / "watch"
         watch.mkdir(exist_ok=True)
         driver = """
@@ -310,11 +310,11 @@ stop_interrupted_run_log() { :; }
             driver += """
 VERIFY_START_DIR="$4"
 PY="$VERIFY_START_DIR/../lib/py"
-exec {exit_stderr}>&2
+save_verify_exit_stderr
 exit_diagnostics="$TREE_WATCH_DIR/exit-diagnostics"
 """
         return subprocess.run(
-            ["bash", "-c", driver + definitions + f"\n{function} 15\n", "fixture",
+            ["bash", "-c", definitions + driver + f"\n{function} 15\n", "fixture",
              str(child.pid), str(verify.with_name("step_record.py")), str(watch),
              str(Path(__file__).resolve().parents[1] / "direct")],
             env=self.environment, capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS,

@@ -203,8 +203,13 @@ buildlog_end() {
     if [[ "${BUILDLOG_SYNC:-0}" == 1 ]]; then
         buildlog_write_step "$status" "$BUILDLOG_START" "${BUILDLOG_NOW:-}" "$tty" "$held" "${BUILDLOG_PEAK:-}" ${1+"$@"}
     else
-        ( trap '' HUP
-          buildlog_write_step "$status" "$BUILDLOG_START" "${BUILDLOG_NOW:-}" "$tty" "$held" "${BUILDLOG_PEAK:-}" ${1+"$@"} & )
+        (
+            trap '' HUP
+            if [[ ${VERIFY_EXIT_STDERR_FD:-} =~ ^[1-9][0-9]+$ ]]; then
+                eval "exec $VERIFY_EXIT_STDERR_FD>&-"
+            fi
+            buildlog_write_step "$status" "$BUILDLOG_START" "${BUILDLOG_NOW:-}" "$tty" "$held" "${BUILDLOG_PEAK:-}" ${1+"$@"} &
+        )
     fi
     BUILDLOG_START="" BUILDLOG_TREE="" BUILDLOG_TEST_PHASE_FILE=""
     return 0
@@ -576,13 +581,14 @@ sweep_after_step() {
         local -a copy_lease_fds=()
         IFS=, read -r -a copy_lease_fds <<< "${COPIES_COMMAND_LEASE_FDS:-},${COPIES_MIRROR_LEASE_FDS:-}"
         for fd in ${copy_lease_fds[@]+"${copy_lease_fds[@]}"} \
-            "${DOC_COPY_LEASE_FD:-}" "${NUMBERED_COPY_LOCK_FD:-}" "${COPIES_STEP_SOURCE_LOCK_FD:-}"; do
+            "${DOC_COPY_LEASE_FD:-}" "${NUMBERED_COPY_LOCK_FD:-}" "${COPIES_STEP_SOURCE_LOCK_FD:-}" \
+            "${VERIFY_EXIT_STDERR_FD:-}"; do
             if [[ "$fd" =~ ^([3-9]|[1-9][0-9]+)$ ]]; then
                 eval "exec $fd>&-"
             fi
         done
         unset COPIES_COMMAND_LEASE_FDS COPIES_MIRROR_LEASE_FDS
-        unset DOC_COPY_LEASE_FD NUMBERED_COPY_LOCK_FD COPIES_STEP_SOURCE_LOCK_FD
+        unset DOC_COPY_LEASE_FD NUMBERED_COPY_LOCK_FD COPIES_STEP_SOURCE_LOCK_FD VERIFY_EXIT_STDERR_FD
         TOKEN_HELD=0
         run() { run_once "$@"; }
         if command -v systemd-cat >/dev/null 2>&1; then
