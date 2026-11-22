@@ -574,6 +574,18 @@ try {
         assert.deepEqual((await snapshot()).handles, ['admin-console', 'typesafe', 'new-unit', 'aws', 'unit-board', 'postmaster']);
         assert.deepEqual(await evaluate(`['remote-start', 'typesafe'].map(key =>
           document.querySelector('tr[data-tip="wait:' + key + '"] .place').textContent)`), ['1', '3']);
+        const nextStart = await grip('typesafe');
+        const nextTarget = await cell('postmaster', 'machine');
+        await call('Input.dispatchMouseEvent',{type:'mousePressed', ...nextStart, button:'left', buttons:1, clickCount:1});
+        await call('Input.dispatchMouseEvent',{type:'mouseMoved', ...nextTarget, button:'left', buttons:1});
+        queueFixture = {...queueFixture, waiters:queueFixture.waiters.filter(row => row.key !== 'remote-start')};
+        servedReading = queueFixture;
+        await evaluate('pageRefresh.refresh(true)');
+        assert.ok(await evaluate('!latest.waiters.some(row => row.key === "remote-start")'));
+        assert.ok(await evaluate(`Boolean(document.querySelector('tr[data-tip="wait:remote-start"]'))`));
+        await call('Input.dispatchMouseEvent',{type:'mouseReleased', ...nextTarget, button:'left', buttons:0, clickCount:1});
+        await waitForLine('typesafe · test affected moved from 2 to 6');
+        assert.equal(await evaluate(`document.querySelector('tr[data-tip="wait:typesafe"] .place').textContent`), '6');
         queueFixture = null;
         servedReading = base;
       }

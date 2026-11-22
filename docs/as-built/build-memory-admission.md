@@ -2366,10 +2366,9 @@ A grant or cancellation ends the move.
 The service saves the manual order apart from the bump list in `state.json`.
 The bumped units still have priority.
 New natedev waits join the end of a group with manual order.
-The manual order applies to local admission, including grants for routed steps.
-The placement pass checks local starts in the manual order.
-Remote assignments use submission order within each priority group after the local check.
-A new remote startup hold lets the local starts from the same pass proceed.
+Both hosts use the visible order, and only starts selected by the local preview can pass a new remote startup hold.
+Remote-only waits stay behind the older movable waits in their priority group.
+A prelaunch refusal keeps the local wait and its continuation claim.
 Use `/build:bump` to change priority between groups.
 
 The service checks the current order revision before it commits a move.
@@ -2378,4 +2377,4 @@ Undo restores the row between its old neighbors if they still define the destina
 A conflict supplies the current order.
 The page requires a complete move list before it enables another move.
 The page shows an unnamed wait as “Build step.”
-The confirmation uses the table numbers, including the places of waits without handles.
+The confirmation uses the current table numbers, including the places of waits without handles.

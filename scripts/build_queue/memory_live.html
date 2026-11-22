@@ -1400,7 +1400,7 @@ function queueGrip(row, ready) {
 
 function queueReading(d) {
   if (!queueReply || !d.move_revision) return d;
-  if (d.move_revision !== queueReply.previous) {
+  if (!queueReply.previousRevisions.includes(d.move_revision)) {
     queueReply = null;
     return d;
   }
@@ -1480,17 +1480,19 @@ async function sendQueueMove(row, reading, destination, id = queueRequestId()) {
   if (queueSending) return;
   queueSending = true;
   const undo = destination.kind === "QueueUndo";
-  const previous = queueReply?.line.revision === revision ? queueReply.previous : revision;
+  const previousRevisions = queueReply?.line.revision === revision
+    ? [...queueReply.previousRevisions, revision] : [revision];
   queueMessage(undo ? "Restoring the queue place…" : "Saving the queue place…");
   try {
     const response = await fetch(queueMovePath, {method:"POST", headers:{"Content-Type":"application/json"},
       body:JSON.stringify({request_id:id, row_id:row.move.row_id, revision, destination, token:queueAccess.token})});
     const result = await response.json();
     if (response.status === 409) {
-      queueReply = {line:result.line, previous};
+      queueReply = {line:result.line, previousRevisions};
       queueMessage(result.reason);
     } else if (response.ok) {
-      queueReply = {line:result.line, previous};
+      const current = queueReading(latest);
+      queueReply = {line:result.line, previousRevisions};
       queueHighlight = row.move.row_id;
       clearTimeout(queueHighlightTimer);
       queueHighlightTimer = setTimeout(() => {
@@ -1499,9 +1501,11 @@ async function sendQueueMove(row, reading, destination, id = queueRequestId()) {
       }, queueAccess.highlight_seconds * 1000);
       const {unit, step} = row.title ?? olderStepTitle(row);
       const label = [ownerText(unit), publicText(step)].filter(Boolean).join(" · ");
-      const places = reading.waiters.filter(item => item.kind !== "cloud")
-        .flatMap((item, index) => item.move ? [index + 1] : []);
-      queueMessage(`${label} moved from ${places[result.old_place - 1]} to ${places[result.new_place - 1]}`,
+      const places = current.queueReady !== false && [revision, result.line.revision].includes(current.move_revision)
+        ? current.waiters.filter(item => item.kind !== "cloud").flatMap((item, index) => item.move ? [index + 1] : [])
+        : [];
+      const from = places[result.old_place - 1], to = places[result.new_place - 1];
+      queueMessage(from && to ? `${label} moved from ${from} to ${to}` : `${label} moved`,
         undo ? null : {label:"Undo", run:() => {
           const current = queueReading(latest);
           if (current.queueReady === false || !current.move_revision || !current.waiters.some(item => item.move?.row_id === row.move.row_id)) {

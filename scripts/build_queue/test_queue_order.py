@@ -114,7 +114,7 @@ class QueueMoveTests(unittest.TestCase):
                 "missing-neighbor", second, current.revision, wire.QueueUndo("move-again")))
             self.assertEqual(reply, wire.QueueMoveConflict(current, "Undo not available"))
 
-    def test_the_local_order_leaves_mac_competition_in_submission_order(self) -> None:
+    def test_a_mac_only_waiter_ahead_of_both_movable_waiters_keeps_its_place(self) -> None:
         for open_local in (False, True):
             with self.subTest(open_local=open_local), PlacementFixture() as fixture:
                 fixture.free(0)
@@ -158,6 +158,85 @@ class QueueMoveTests(unittest.TestCase):
                     self.assertEqual(assignment_for(fixture, mac).destination.provider, "mac")
                     self.assertNotIn(first.episode, fixture.server.current_assignments)
                     self.assertNotIn(second.episode, fixture.server.current_assignments)
+
+    def test_placement_follows_the_visible_order_on_both_hosts(self) -> None:
+        for moved in (False, True):
+            with self.subTest(moved=moved), PlacementFixture() as fixture:
+                fixture.free(0)
+                fixture.hold_starts()
+                first, mac, last = [placement_request(fixture, since=fixture.clock.now() - 10 + index)
+                                    for index in range(3)]
+                mac = replace(mac, constraints=replace(mac.constraints, selection=placement.MacOnlyHost()))
+                _ = publish_candidate(fixture, mac, placement.TemporaryExclusion("busy"))
+                first, last = [replace(request, prerequisite=placement.TokenNotRequired(),
+                    constraints=replace(request.constraints, candidates=(local_candidate(fixture), *request.constraints.candidates)))
+                    for request in (first, last)]
+                for position, request in enumerate((first, mac, last), 1):
+                    reply, = fixture.server.handle_request(request)
+                    assert isinstance(reply, wire.PlacementWait)
+                    self.assertEqual(reply.position, position)
+                if moved:
+                    line = move_line(fixture)
+                    before, after = ids(line)
+                    result, = fixture.server.handle_request(wire.QueueMoveRequest(
+                        "move", after, line.revision, wire.QueueDrop(before, "before")))
+                    assert isinstance(result, wire.QueueMoved)
+                    self.assertEqual(ids(result.line), [after, before])
+                    for position, request in enumerate((last, first, mac), 1):
+                        reply, = fixture.server.handle_request(request)
+                        assert isinstance(reply, wire.PlacementWait)
+                        self.assertEqual(reply.position, position)
+
+                fixture.free(12 * GIB)
+                write_pressure_reading(fixture.root / "pressure")
+                _ = publish_candidate(fixture, mac)
+                _ = fixture.run_pass()
+                local, remote = (last, first) if moved else (first, mac)
+                self.assertEqual(set(fixture.caller_reservations()), {local.episode})
+                self.assertEqual(set(fixture.server.current_assignments), {local.episode, remote.episode})
+                self.assertEqual(assignment_for(fixture, remote).destination.provider, "mac")
+
+    def test_new_mac_hold_blocks_an_unselected_local_waiter_and_keeps_its_claim(self) -> None:
+        with PlacementFixture() as fixture:
+            run = fixture.run_owner()
+            slot_key = fixture.finish_step(fixture.request(run=run, need=4 * GIB)).reservation
+            fixture.free(0)
+            fixture.hold_starts()
+            head = placement_request(fixture, since=fixture.clock.now() - 10)
+            _ = publish_candidate(fixture, head, placement.TemporaryExclusion("busy"))
+            head = replace(head, run=run, prerequisite=placement.TokenNotRequired(), constraints=replace(
+                head.constraints, candidates=(*head.constraints.candidates, local_candidate(fixture))))
+            later = placement_request(fixture)
+            later = replace(later, prerequisite=placement.TokenNotRequired(), constraints=replace(
+                later.constraints, candidates=(local_candidate(fixture),)))
+            for request in (head, later):
+                self.assertIsInstance(fixture.server.handle_request(request)[0], wire.PlacementWait)
+
+            fixture.allow_next_start()
+            fixture.free(16 * GIB)
+            write_pressure_reading(fixture.root / "pressure")
+            _ = publish_candidate(fixture, head)
+            result = fixture.run_pass()
+            self.assertFalse(fixture.caller_reservations())
+            self.assertEqual(fixture.queue_pids(), [head.owner.pid, later.owner.pid])
+            later_decision = result.rows[1].decision
+            self.assertTrue(later_decision.room.passes)
+            assert isinstance(later_decision.order_hold, records.HeldBehindHead)
+            self.assertEqual(later_decision.order_hold.waiter["pid"], head.owner.pid)
+            claim = fixture.server.slots[slot_key]
+            assert isinstance(claim, records.ContinuationSlot)
+            self.assertEqual(claim.owner, records.run_owner(head.owner.pid, head.owner.start_time))
+            remote = assignment_for(fixture, head)
+            self.assertEqual(remote.destination.provider, "mac")
+
+            _ = publish_candidate(fixture, head, placement.TemporaryExclusion("busy"))
+            refused, = fixture.server.handle_request(wire.ClaimFailure("mac-busy", remote, "busy"))
+            assert isinstance(refused, wire.DispatchStatus)
+            self.assertEqual(refused.state, placement.ClosedAssignment("busy"))
+            self.assertEqual(fixture.server.slots[slot_key], claim)
+            _ = fixture.run_pass()
+            self.assertEqual(set(fixture.caller_reservations()), {head.episode})
+            self.assertIsInstance(fixture.server.handle_request(later)[0], wire.PlacementWait)
 
     def test_a_move_allows_local_and_mac_starts_in_one_pass(self) -> None:
         for promote_local in (True, False):

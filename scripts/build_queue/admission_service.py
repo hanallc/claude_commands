@@ -1910,12 +1910,28 @@ class AdmissionServer:
             member = self._move_member(row)
             if member.row_id in active and member.group in self.queue_moves.groups:
                 groups.setdefault(member.group, {})[member.row_id] = row
+        if not groups:
+            return rows
         for group, waiters in groups.items():
             self.queue_moves = self.queue_moves.include(group, waiters)
             places = [gate.waiter_order(row)[1:] for row in waiters.values()]
             reordered = (waiters[row_id] for row_id in self.queue_moves.groups[group] if row_id in waiters)
             for row, place in zip(reordered, places, strict=True):
                 row["move_order"] = place
+        remote_only = {records.run_owner(request.owner.pid, request.owner.start_time)
+                       for request in self.placement_requests.values()
+                       if isinstance(request.purpose, placement.NormalStep) and not self._can_hold_local_place(request)}
+        if remote_only:
+            # Keep remote-only waits behind the older movable waits in their group.
+            earlier_places: dict[int, tuple[float, int]] = {}
+            for _, row in rows:
+                rank, since, pid = gate.waiter_order(row)
+                earlier = earlier_places.get(rank)
+                if "move_order" in row:
+                    place = row["move_order"]
+                    earlier_places[rank] = place if earlier is None else max(earlier, place)
+                elif earlier is not None and records.waiter_owner(row) in remote_only:
+                    row["move_order"] = max(earlier, (since, pid))
         return sorted(rows, key=lambda item: gate.waiter_order(item[1]))
 
     def _current_move_line(self, rows: list[tuple[Path, records.RankedWaiter]]) -> records.QueueMoveLine:
@@ -2496,7 +2512,7 @@ class AdmissionServer:
         if held_owners:
             inputs = replace(inputs, ordered=[(path, row) for path, row in inputs.ordered
                                              if records.waiter_owner(row) not in held_owners])
-        inputs = self._placement_pass(inputs, policy, remote_start_hold_seconds)
+        inputs = self._placement_pass(inputs, captured.queue_order, policy, remote_start_hold_seconds)
         result = gate.admission_pass(inputs, inputs.now, policy)
         for reservation in result.policy.returned_claims:
             del self.slots[reservation]
@@ -3949,7 +3965,8 @@ done
                          if isinstance(record.place, wire.LocalPlace)
                          and isinstance(record.cargo_folder, placement.CargoFolder))
 
-    def _placement_pass(self, inputs: records.QueueInputs, policy: records.AdmissionPolicy,
+    def _placement_pass(self, inputs: records.QueueInputs, ordered: list[tuple[Path, records.RankedWaiter]],
+                        policy: records.AdmissionPolicy,
                         remote_start_hold_seconds: int) -> records.QueueInputs:
         """Keep pending remote starts in the local order until their holds end."""
         if not any(self._placement_waiting(request) for request in self.placement_requests.values()):
@@ -3973,10 +3990,6 @@ done
             preview_ordered.append((path, row))
         preview = gate.admission_pass(replace(inputs, ordered=preview_ordered), inputs.now, policy)
         local_starts = {row.owner for row in preview.rows if isinstance(row.admission, gate.ProposedAdmission)}
-        ordered, _priority = self._queue_order()
-        # Remote destinations use submission order within each priority group.
-        remote_order = (sorted(ordered, key=lambda item: gate.waiter_order(item[1], allow_moves=False))
-                        if self.queue_moves.groups else ordered)
         copies = tuple(request for request in owners.values() if isinstance(request.purpose, placement.SpeculativeCopy))
         held_copy_destinations = [saved.assignment.destination
             for episode, key in self.current_assignments.items()
@@ -3991,7 +4004,7 @@ done
         taken: list[placement.PlacementDestination] = []
         holds: dict[tuple[str, placement.PlacementDestination], float] = {}
         answers: dict[tuple[str, placement.PlacementDestination], float] = {}
-        for _, row in remote_order:
+        for _, row in ordered:
             owner = records.waiter_owner(row)
             request = owners.get(owner)
             if request is None:
@@ -4063,7 +4076,8 @@ done
         return replace(inputs, ordered=[(path, row) for path, row in ordered
             if records.waiter_owner(row) in local_order], slots=tuple(self.slots.values()), cargo_folders=cargo_folders,
             pending_remote_starts=frozenset(pending_remote_starts),
-            parallel_remote_starts=frozenset(parallel_starts))
+            parallel_remote_starts=frozenset(parallel_starts),
+            preview_local_starts=frozenset(local_starts) if parallel_starts else frozenset())
 
     def _placement_hold(self, request: wire.PlacementRequest, candidate: placement.CandidateEligibility,
                         answers: dict[tuple[str, placement.PlacementDestination], float]) -> PlacementHold | None:
@@ -4209,9 +4223,15 @@ done
                          retry: placement.RetryDecision) -> None:
         assignment = saved.assignment
         key = execution_identity.attempt_key(assignment.episode, assignment.attempt)
-        self._remove_waiter(self.waiters.get(assignment.episode))
-        if self.current_assignments.get(assignment.episode) == key:
-            request = self.placement_requests.get(assignment.episode)
+        current = self.current_assignments.get(assignment.episode) == key
+        request = self.placement_requests.get(assignment.episode)
+        report = saved.terminal_report
+        keep_local_wait = (current and request is not None and isinstance(saved.remote_start_hold, records.RemoteStartHold)
+            and isinstance(report, placement.TerminalAttemptReport) and isinstance(report.outcome, placement.PrelaunchRefused)
+            and reason == report.outcome.reason and self._can_hold_local_place(request))
+        if not keep_local_wait:
+            self._remove_waiter(self.waiters.get(assignment.episode))
+        if current:
             if request is not None:
                 saved = self._end_remote_start_hold(request, saved)
             del self.current_assignments[assignment.episode]
