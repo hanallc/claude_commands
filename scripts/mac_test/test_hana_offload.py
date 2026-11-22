@@ -66,7 +66,7 @@ class HanaOffloadTests(unittest.TestCase):
 execution_transport=hana-control
 host=fixture-host
 enabled=on
-repository_identity=https://github.com/natepiano/hana
+repository_identity=https://github.com/hanallc/hana
 kinds=check
 # whole: 1..
 max_steps=1
@@ -1195,7 +1195,7 @@ route_test
               mock.patch.object(offload, 'restore_ignored_interrupt_default'),
               mock.patch.object(copies, 'source_owner', return_value='fixture'),
               mock.patch.object(eligibility, 'repository_identity',
-                                return_value=eligibility.KnownRepository('hana', 'https://github.com/natepiano/hana')),
+                                return_value=eligibility.KnownRepository('hana', 'https://github.com/hanallc/hana')),
               mock.patch.object(time, 'monotonic', side_effect=lambda: monotonic),
               mock.patch.object(objects, 'boot_control_deadline', return_value=boot_deadline),
               mock.patch.object(objects, 'publish_execution', side_effect=publish_near_deadline),
