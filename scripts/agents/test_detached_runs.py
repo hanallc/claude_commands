@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from scripts.direct import pass_record as pass_recorder
+from scripts.lib.fixture_test_support import set_up_fixture
 from scripts.lint.memory_test_support import write_config_fixture
 
 import contextlib
@@ -97,7 +98,7 @@ class DetachedRunsTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
-        self.stack = contextlib.ExitStack()
+        self.stack = self.enterContext(contextlib.ExitStack())
         self.root = Path(self.stack.enter_context(tempfile.TemporaryDirectory()))
         _ = self.stack.enter_context(isolated_staff_file(self.root / "staff.json", {}))
         self.session = self.root / "unit" / "run-1"
@@ -117,9 +118,7 @@ class DetachedRunsTests(unittest.TestCase):
         self.sent = []
         _ = self.stack.enter_context(patch.object(treekey, "tree_key", return_value="key-1"))
 
-        fixture = StaffTestCase()
-        fixture.setUp()
-        _ = self.stack.callback(fixture.doCleanups)
+        fixture = set_up_fixture(self.stack.callback, StaffTestCase())
         _, self.unit, _ = fixture.tree()
         self.unit = staff.set_worktree(self.unit.id, staff.PresentWorktree("natedev", self.root), expected=self.unit.worktree)
         self.stack.enter_context(patch.dict(os.environ, {
@@ -144,11 +143,6 @@ class DetachedRunsTests(unittest.TestCase):
         _ = self.stack.enter_context(patch.object(send, "deliver_worker_text", side_effect=deliver_fixture))
         _ = self.stack.enter_context(patch.object(detached_runs, "deliver_in_fresh_process",
                                                  side_effect=deliver_in_fixture))
-
-    @override
-    def tearDown(self) -> None:
-        self.stack.close()
-
 
     def record_worker(self, name: str, thread_id: str) -> staff.StaffRow:
         fixture_session(thread_id, staff.CodexBackend(self.root / "codex-home"))
@@ -2253,9 +2247,7 @@ class PaneRunDeliveryTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
-        self.fixture = pane_support.WorkerPaneTests()
-        self.fixture.setUp()
-        self.addCleanup(self.fixture.doCleanups)
+        self.fixture = set_up_fixture(self.addCleanup, pane_support.WorkerPaneTests())
         _ = self.enterContext(patch.object(send, "STATE", self.fixture.root / "message-state"))
         self.inputs = []
         self.notices = []
