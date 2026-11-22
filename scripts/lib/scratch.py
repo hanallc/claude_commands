@@ -446,9 +446,16 @@ def judgment_lock(path: Path, *, scope: BusyMarkScope | BusyMarkOwnership = Busy
         yield free and idle
 
 
+class BusyMarkHeld(Exception):
+    def __init__(self, lock: Path) -> None:
+        super().__init__(str(lock))
+        self.lock: Path = lock
+
+
 @contextmanager
 def busy_locks(path: Path, *, create: bool, inherited_fds: list[int] | None = None,
-               wait: bool = False, scope: BusyMarkScope | BusyMarkOwnership = BusyMarkOwnership.LOCAL) -> Generator[bool]:
+               wait: bool = False, scope: BusyMarkScope | BusyMarkOwnership = BusyMarkOwnership.LOCAL,
+               raise_if_held: bool = False) -> Generator[bool]:
     """Hold busy marks; optionally export live descriptors or wait for their release.
 
     Exported descriptors belong to this context. A child can retain the same
@@ -471,8 +478,11 @@ def busy_locks(path: Path, *, create: bool, inherited_fds: list[int] | None = No
             for mark, creating in marks.items():
                 if mark in scope.held:
                     continue
-                if not creating and not os.path.lexists(mark):
-                    continue
+                if not creating:
+                    try:
+                        _ = mark.lstat()
+                    except (FileNotFoundError, NotADirectoryError):
+                        continue
                 try:
                     fd = open_busy_mark(mark, create=False)
                 except FileNotFoundError:
@@ -485,7 +495,14 @@ def busy_locks(path: Path, *, create: bool, inherited_fds: list[int] | None = No
                     else:
                         created.add(mark)
                 held[mark] = fd
-                fcntl.flock(fd, fcntl.LOCK_EX | (0 if wait else fcntl.LOCK_NB))
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | (0 if wait else fcntl.LOCK_NB))
+                except BlockingIOError as error:
+                    if raise_if_held:
+                        raise BusyMarkHeld(mark) from error
+                    raise
+                if not os.path.samestat(os.fstat(fd), mark.stat(follow_symlinks=False)):
+                    raise OSError(f"{mark}: the busy mark changed")
         except OSError:
             acquired = False
         if acquired:
@@ -2594,8 +2611,29 @@ def unsaved_work(path: Path, *,
     return work.reason if isinstance(work, KeptFolder) else None
 
 
+def retained_folder_exists(path: Path) -> bool:
+    """Keep a path in the report unless lstat confirms it is absent."""
+    try:
+        _ = os.lstat(path)
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    return True
+
+
+_RETAINED_TASK_FOLDER_PREFIX = "kept for a manual removal list: "
+_RETAINED_TASK_FOLDER_REASON = " (scratch, "
+
+
 def retained_task_folder_notice(path: Path, reason: str) -> str:
-    return f"kept for a manual removal list: {path} (scratch, {reason})"
+    return f"{_RETAINED_TASK_FOLDER_PREFIX}{path}{_RETAINED_TASK_FOLDER_REASON}{reason})"
+
+
+def is_retained_task_folder_notice(detail: str) -> bool:
+    """Recognize the format of a saved scratch notice."""
+    return (detail.startswith(_RETAINED_TASK_FOLDER_PREFIX)
+            and _RETAINED_TASK_FOLDER_REASON in detail and detail.endswith(")"))
 
 
 def report_retained_task_folder(path: Path, reason: str) -> None:
@@ -2643,14 +2681,16 @@ def end(task: str, now: float | None = None, *, keep: Callable[[Path], bool] = l
             write_holds(found, scratch_settings=scratch_settings)
 
     for path in paths.values():
+        if not retained_folder_exists(path):
+            continue
         reason = "selected by the keep rule" if path in protected else f"task {task} ended"
-        if path not in protected and not path.is_symlink():
-            current = copy_record.read_record(path / copy_record.RECORD)
-            if isinstance(current, copy_record.Registered) and current.task == task:
-                try:
+        try:
+            if path not in protected and not path.is_symlink():
+                current = copy_record.read_record(path / copy_record.RECORD)
+                if isinstance(current, copy_record.Registered) and current.task == task:
                     record_task_end(path, task, moment, scratch_settings=scratch_settings)
-                except (ScratchError, OSError) as error:
-                    reason = " ".join(str(error).splitlines())
+        except (ScratchError, OSError) as error:
+            reason = " ".join(str(error).splitlines())
         report_retained_task_folder(path, reason)
         kept.append(KeptFolder(path, reason))
     return kept
