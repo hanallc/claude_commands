@@ -274,6 +274,17 @@ class ArmedGuestAttempt:
         return cls(**record)
 
 
+class GuestNoAnswer(GuestUnavailable):
+    """The guest did not answer before it armed a run, so nothing ran there."""
+
+
+@dataclass(frozen=True)
+class GuestNotStarted:
+    """The guest took no run: the Mac refused the claim, or the guest gave no answer before the arm."""
+
+    reason: str
+
+
 class GuestEndUnproven(GuestUnavailable):
     """The proof wait expired for an armed guest attempt."""
 
@@ -737,7 +748,10 @@ def run_remote(repo: Path, settings: GuestSettings, source: CandidateSource, req
                     break
                 try:
                     if armed is None:
-                        armed = arm_guest(settings, request['attempt'])
+                        try:
+                            armed = arm_guest(settings, request['attempt'])
+                        except (GuestUnavailable, OSError, subprocess.SubprocessError) as error:
+                            raise GuestNoAnswer(f'the guest did not arm the run: {error}') from error
                         command = settings.command(run_shell(settings, source, len(bootstrap), armed))
                         arguments = ['bash', '-o', 'pipefail', '-c', STREAM_SOURCE, TARGET, prefix, base, header, *command]
                         stream = stream_guest_bundle(repo, arguments, bootstrap, settings.transfer_timeout_seconds)
@@ -804,12 +818,13 @@ def transfer_source(repo: Path, settings: GuestSettings, source: CandidateSource
     except (GuestUnavailable, OSError, subprocess.SubprocessError) as error:
         from scripts.mac_test import offload
 
+        no_answer = GuestNoAnswer(f'the guest main probe failed: {error}')
         try:
             delay = conf.read('mac_test').number('unreachable_backoff_s')
             offload.write_backoff(time() + delay, TARGET, strict=True)
         except (conf.Unusable, OSError) as backoff_error:
-            error.add_note(f'Cannot record the {TARGET} backoff: {backoff_error}')
-        raise
+            no_answer.add_note(f'Cannot record the {TARGET} backoff: {backoff_error}')
+        raise no_answer from error
     with bundle_refs(repo, source, request['attempt']) as prefix:
         if isinstance(guest, EmptyGuestMain):
             bundle = FullBundle(BundleReason.FIRST_RUN)
@@ -857,8 +872,8 @@ def completed_run(reply: GuestReply, request: GuestRequest, source: CandidateSou
 
 def route(repo: Path, *, mode: SuiteMode, full: bool, module_time_limit_s: float,
           selected: AllModules | TreeSelection, gate_job: StepJob | GateJobNotRecorded,
-          type_dirs: Sequence[str] = ()) -> GateRun | str:
-    """Return the guest gate result or the reason the guest route failed."""
+          type_dirs: Sequence[str] = ()) -> GateRun | GuestNotStarted | str:
+    """Return the guest gate result, a run the guest did not take, or the reason the guest route failed."""
     from scripts.aws_target import cloud_gate
     from scripts.build_queue import mac_run
     from scripts.build_queue.admission_client import step_identity
@@ -870,7 +885,7 @@ def route(repo: Path, *, mode: SuiteMode, full: bool, module_time_limit_s: float
             return f'{TARGET} is off (build_targets.conf enabled.{TARGET}=off)'
         settings = read_settings(registry)
         if isinstance(eligibility.read_backoff(time(), TARGET), eligibility.ActiveBackoff):
-            return f'{TARGET}: guest unreachable during retry backoff'
+            return GuestNotStarted(f'{TARGET}: guest unreachable during retry backoff')
         if not math.isfinite(module_time_limit_s) or module_time_limit_s <= 0:
             raise GuestUnavailable('the module time limit must be positive and finite')
         repo = repo.resolve()
@@ -903,7 +918,10 @@ def route(repo: Path, *, mode: SuiteMode, full: bool, module_time_limit_s: float
             raise GuestUnavailable('the checkout changed during the guest run')
         return run
     except mac_run.MacRunRefused as error:
-        return f'{TARGET}: not started: {error}'
+        return GuestNotStarted(f'{TARGET}: not started: {error}')
+    except GuestNoAnswer as error:
+        notes = cast(list[str], getattr(error, '__notes__', []))
+        return GuestNotStarted(f'{TARGET}: not started: ' + ' '.join((str(error), *notes)))
     except (GuestUnavailable, OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError,
             GateRefused, affected_modules.GraphError) as error:
         notes = cast(list[str], getattr(error, '__notes__', []))

@@ -79,7 +79,8 @@ from scripts.lib.process_start import Started, Unreadable, Zombie, process_start
 from scripts.copies import copies
 from scripts.lib import build_folders, cancellation, conf, land_main, main_push_lock, session_folder, unit_runs, waiting_rows
 from scripts.lib.atomic_file import write_text_atomic
-from scripts.lib.build_steps import gate_job_for_command, gate_job_from_process, read_step_names
+from scripts.lib.build_steps import (CLAIM_FAILURE_SUFFIX, MAC_LINUX_NO_ANSWER, MAC_LINUX_PRELAUNCH_REFUSED_STATUS,
+                                     gate_job_for_command, gate_job_from_process, read_step_names)
 from scripts.lint import sweep
 from scripts.message import send_budget, session_send
 from scripts.production import (  # noqa: E402
@@ -2259,7 +2260,8 @@ def merge_checkpoint(args: GateArguments) -> int:
         if isinstance(recovery, GateRecovery):
             recovery.rollback = ""
             recovery.save()
-        raise GateRefused(f"{error or type(error).__name__}; merge undone, not pushed") from error
+        refused = MacLinuxNoAnswer if isinstance(error, MacLinuxNoAnswer) else GateRefused
+        raise refused(f"{error or type(error).__name__}; merge undone, not pushed") from error
     if isinstance(recovery, GateRecovery):
         recovery.rollback = ""
         recovery.save()
@@ -2982,12 +2984,31 @@ class MacLinuxGateRefused(GateRefused):
     """The assigned Mac Linux guest could not complete the gate."""
 
 
+class MacLinuxNoAnswer(GateRefused):
+    """The assigned Mac Linux guest took no run. The caller can place the gate again."""
+
+
+class GuestNotStartedOutcome(Protocol):
+    @property
+    def reason(self) -> str: ...
+
+
 class MacLinuxGateRoute(Protocol):
     """Run the tests and type checks in the Mac Linux guest."""
 
     def route(self, repo: Path, *, mode: SuiteMode, full: bool,
               module_time_limit_s: float, selected: AllModules | TreeSelection,
-              gate_job: StepJob | GateJobNotRecorded, type_dirs: Sequence[str]) -> GateRun | str: ...
+              gate_job: StepJob | GateJobNotRecorded,
+              type_dirs: Sequence[str]) -> GateRun | GuestNotStartedOutcome | str: ...
+
+
+def report_mac_linux_no_answer(reason: str) -> MacLinuxNoAnswer:
+    """Write the claim failure next to the placement file for the caller that owns the placement."""
+    path = Path(os.environ["BUILDLOG_PLACEMENT_FILE"])
+    assignment = admission_wire.read_assignment(path).assignment
+    failure = admission_wire.ClaimFailure(token_hex(16), assignment, MAC_LINUX_NO_ANSWER)
+    write_text_atomic(path.with_name(path.name + CLAIM_FAILURE_SUFFIX), admission_wire.encode_request(failure))
+    return MacLinuxNoAnswer(f"Mac Linux guest took no run: {reason}")
 
 
 def run_gate_suites(repo: Path, type_dirs: Sequence[str] = (),
@@ -3025,6 +3046,8 @@ def run_gate_suites(repo: Path, type_dirs: Sequence[str] = (),
                               selected=selection, gate_job=gate_job, type_dirs=type_dirs)
         if isinstance(outcome, str):
             raise MacLinuxGateRefused(f"Mac Linux guest gate failed: {outcome}")
+        if not isinstance(outcome, GateRun):
+            raise report_mac_linux_no_answer(outcome.reason)
         if not outcome.passed:
             print("Mac Linux guest gate failed", file=sys.stderr, flush=True)
             if outcome.time_limit_report:
@@ -3225,6 +3248,9 @@ def run_tests_only(args: GateArguments, mode: SuiteMode) -> int:
             if run.time_limit_report:
                 tell_time_limit(copies.source_owner(repo), repo, run)
             return 0 if run.passed else 1
+    except MacLinuxNoAnswer as error:
+        print(f"REFUSED: {error}", file=sys.stderr, flush=True)
+        return MAC_LINUX_PRELAUNCH_REFUSED_STATUS
     except (copies.CopyError, GateRefused, OSError, subprocess.SubprocessError, KeyboardInterrupt) as error:
         print(f"REFUSED: {error}", file=sys.stderr, flush=True)
         return 1
@@ -3340,6 +3366,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 return 0
             with gate_recovery(checkout):
                 return merge_checkpoint(args)
+    except MacLinuxNoAnswer as error:
+        print(f"REFUSED: {error}", file=sys.stderr, flush=True)
+        return MAC_LINUX_PRELAUNCH_REFUSED_STATUS
     except (copies.CopyError, GateRefused, OSError, subprocess.SubprocessError, KeyboardInterrupt) as error:
         print(f"REFUSED: {error}", file=sys.stderr, flush=True)
         return 1

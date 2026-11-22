@@ -18,15 +18,14 @@ from typing import Literal, NamedTuple, TypedDict, cast
 from scripts.build_queue import admission_client, admission_wire, placement
 from scripts.copies import copies
 from scripts.lib.atomic_file import write_text_atomic
-from scripts.lib.build_steps import GATE_SCRIPTS, command_program
+from scripts.lib.build_steps import (CLAIM_FAILURE_SUFFIX, GATE_SCRIPTS, MAC_LINUX_NO_ANSWER,
+                                     MAC_LINUX_PRELAUNCH_REFUSED_STATUS, command_program)
 from scripts.lib.process_failure import failure_detail
 from scripts.message import session_send
 from scripts.production import staff
 from scripts.production.production_doc import ProductionDocument
 
 TREE_CHANGED_STATUS = 77
-MAC_LINUX_PRELAUNCH_REFUSED_STATUS = 79
-MAC_LINUX_NO_ANSWER = "mac_linux_no_answer"
 
 
 class Stop(Exception):
@@ -173,7 +172,7 @@ def assignment_matches_request(assignment: placement.PlacementAssignment, reques
 
 def read_gate_claim_failure(assignment_file: Path, request: admission_wire.PlacementRequest) -> admission_wire.ClaimFailure:
     assignment = admission_wire.read_assignment(assignment_file).assignment
-    report_file = assignment_file.with_name(assignment_file.name + ".claim-failure")
+    report_file = assignment_file.with_name(assignment_file.name + CLAIM_FAILURE_SUFFIX)
     refusal = admission_wire.parse_request(report_file.read_bytes())
     if (not isinstance(refusal, admission_wire.ClaimFailure) or not refusal.request_id
             or refusal.assignment != assignment or refusal.reason != MAC_LINUX_NO_ANSWER
