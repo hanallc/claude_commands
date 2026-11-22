@@ -336,6 +336,10 @@ Each member has an independent result.
 The group command prints moved, pending, and failed members by staff name.
 A retry of the selected destination reuses the group transition ID.
 The refusal watcher skips members whose staff rows are busy.
+The watcher uses one read of the move journal for all members.
+It skips a member when the latest request was by hand, names a different account, and is newer than the group selection.
+A selection without a time is older than any move by hand.
+A later group selection lets the watcher complete the move for that member.
 A pending refusal stays eligible until its move completes or a detached batch accepts it.
 An in-progress result from another move keeps the refusal pending.
 The watcher saves the decision ID before it requests the move.
@@ -585,6 +589,10 @@ The server keeps the clear records in `console/.accounts-quota-cleared.json` und
 If the file is malformed, the table shows the problem, the sidebar hides the icon and Clear refuses to write.
 The Accounts table has one row per account.
 It shows the weekly quota, reading status, reset, and credits.
+The roles column lists the roles that select the account as their default.
+It shows the role names in role order, with commas between them.
+The list stays on one line and ends with an ellipsis if it is too long.
+The tooltip shows the full list.
 The page and the Claude expiry push use `quota_alert.weekly_forecast` with the same usage history.
 The page starts its forecast from the displayed weekly reading.
 It excludes history before the current weekly window or the last refill.
@@ -605,6 +613,8 @@ The Accounts table starts in account order. The Roles table starts in role order
 The quota, rate, run-out time, and reset sort from the smallest or earliest value.
 Credits sort from the largest balance. An unlimited balance comes first.
 Enabled accounts come first when you sort by the credits setting.
+The roles column sorts by the full list without regard to letter case.
+Accounts without selected roles sort last in both directions.
 The next column sorts by target account.
 Role counts sort by the sum for the role, largest first.
 Missing values stay last in both directions.

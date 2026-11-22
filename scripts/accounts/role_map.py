@@ -50,6 +50,7 @@ class StoredGroupSelection(TypedDict):
     window: Literal["weekly", "five_hour", "unknown"]
     reset: NotRequired[str]
     why: NotRequired[str]
+    at: NotRequired[str]
 
 
 def selection_reason(selection: StoredGroupSelection) -> TransitionReason:
@@ -372,15 +373,17 @@ def _groups(raw: dict[str, object]) -> StoredGroupSelections:
         selected = StoredGroupSelection(label=cast(str, fields["label"]), move_id=cast(str, fields["move_id"]),
             cause=cast(Literal["by hand", "refusal", "auto"], fields["cause"]),
             window=cast(Literal["weekly", "five_hour", "unknown"], fields["window"]))
-        if "reset" in fields:
+        for key in ("reset", "at"):
+            if key not in fields:
+                continue
             try:
-                reset = fields["reset"]
-                if not isinstance(reset, str) or datetime.fromisoformat(reset).tzinfo is None:
+                stamp = fields[key]
+                if not isinstance(stamp, str) or datetime.fromisoformat(stamp).tzinfo is None:
                     raise ValueError
             except ValueError:
-                print(f"accounts: anomaly: invalid {group} reset", file=sys.stderr)
+                print(f"accounts: anomaly: invalid {group} {key}", file=sys.stderr)
             else:
-                selected["reset"] = reset
+                selected[key] = stamp
         if "why" in fields:
             why = fields["why"]
             if isinstance(why, str):
@@ -617,7 +620,7 @@ def write_role_map(change: RoleMapChange | WorkersClaudeRouteChange) -> None:
                     else:
                         assert change.cause != "credits off"
                         selection = StoredGroupSelection(label=change.label, move_id=change.move_id,
-                            cause=change.cause, window=change.window, why=change.why)
+                            cause=change.cause, window=change.window, why=change.why, at=change.at)
                         if change.reset:
                             selection["reset"] = change.reset
                         values[change.role] = selection
@@ -653,7 +656,7 @@ def write_role_map(change: RoleMapChange | WorkersClaudeRouteChange) -> None:
         else:
             assert change.cause != "credits off"
             selected = StoredGroupSelection(label=change.label, move_id=change.move_id,
-                cause=change.cause, window=change.window, why=change.why)
+                cause=change.cause, window=change.window, why=change.why, at=change.at)
             if change.reset:
                 selected["reset"] = change.reset
             groups[change.role] = selected

@@ -2294,6 +2294,7 @@ class GroupTransition:
     move_id: str
     origin: MoveOrigin
     why: TransitionReason = field(default_factory=UnavailableTransitionReason)
+    at: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -2345,7 +2346,8 @@ def group_transition(group: ClaudeGroup) -> GroupTransition | NoGroupTransition:
         origin = RefusalOrigin(selection["window"], reset)
     elif selection["cause"] == "auto":
         origin = AutoOrigin()
-    return GroupTransition(selection["move_id"], origin, role_map.selection_reason(selection))
+    at = datetime.fromisoformat(selection["at"]) if "at" in selection else None
+    return GroupTransition(selection["move_id"], origin, role_map.selection_reason(selection), at)
 
 
 def session_group(session: Session | ListedSession) -> ClaudeGroup | Literal["ungrouped"]:
@@ -2633,7 +2635,7 @@ def set_group_account(group: ClaudeGroup, label: str, *, why: str,
         selection["reset"] = fields["reset"]
     write_role_map(RoleMapChange(group, label, why, at.isoformat(), selection["move_id"],
         fields["cause"], fields["window"], fields.get("reset", "")))
-    return GroupTransition(selection["move_id"], origin, RecordedTransitionReason(why))
+    return GroupTransition(selection["move_id"], origin, RecordedTransitionReason(why), at)
 
 
 def placement_report(now: datetime | AccountDecisionNow = ACCOUNT_DECISION_NOW, *, account_config: conf.ConfigRead | ReadCurrentAccountSettings = CURRENT_ACCOUNT_SETTINGS) -> str:

@@ -774,6 +774,29 @@ def _reading_values_fingerprint() -> str:
     return hashlib.sha256(json.dumps(values, sort_keys=True).encode()).hexdigest()
 
 
+def _latest_claude_requests(entries: list[moves.MoveEntry]) -> dict[str, tuple[datetime, moves.RequestedMove]]:
+    latest: dict[str, tuple[datetime, moves.RequestedMove]] = {}
+    for entry in entries:
+        if entry["kind"] != "requested" or entry["tool"] != "claude":
+            continue
+        identity = entry["subject"].split(": ", 1)[0]
+        at = datetime.fromisoformat(entry["at"])
+        previous = latest.get(identity)
+        if previous is None or at >= previous[0]:
+            latest[identity] = at, entry
+    return latest
+
+
+def _newer_by_hand_move(latest: tuple[datetime, moves.RequestedMove] | None,
+                       target: str, selected_at: datetime | None) -> bool:
+    if latest is None:
+        return False
+    at, request = latest
+    destination = request["to"]
+    return (request.get("cause") == "by hand" and isinstance(destination, str) and destination != target
+            and (selected_at is None or at > selected_at))
+
+
 def _run(now: datetime, dry_run: bool, proof_group: frozenset[str] = NO_SESSION_FILTER, *,
          refresh_usage: Callable[[], None] = lambda: None, account_config: conf.ConfigRead | accounts.ReadCurrentAccountSettings = accounts.CURRENT_ACCOUNT_SETTINGS) -> list[str]:
     account_config = accounts.read_account_settings(account_config)
@@ -1109,6 +1132,7 @@ def _run(now: datetime, dry_run: bool, proof_group: frozenset[str] = NO_SESSION_
         else:
             needs_completion = False
         if needs_completion:
+            latest_requests = None
             with herdr.process_action():
                 all_members = accounts.live_group_members()
                 for group_name in accounts.CLAUDE_GROUPS:
@@ -1122,6 +1146,15 @@ def _run(now: datetime, dry_run: bool, proof_group: frozenset[str] = NO_SESSION_
                     members = [session for session in members if session.session_id in available]
                     if not members:
                         continue
+                    if latest_requests is None:
+                        # A move can reach its target after the first journal read.
+                        latest_requests = _latest_claude_requests(moves.read_moves())
+                    transition = accounts.group_transition(group_name)
+                    selected_at = transition.at if isinstance(transition, accounts.GroupTransition) else None
+                    members = [session for session in members if not _newer_by_hand_move(
+                        latest_requests.get(session.session_id), target, selected_at)]
+                    if not members:
+                        continue
                     directory = accounts.claude_account_dir(target)
                     login = accounts.claude_login(directory)
                     held = refusals.load().get(refusals.key("claude", login))
@@ -1131,10 +1164,9 @@ def _run(now: datetime, dry_run: bool, proof_group: frozenset[str] = NO_SESSION_
                     if dry_run:
                         lines.extend(accounts.move_preview_line(session, target) for session in members)
                     else:
-                        transition = accounts.group_transition(group_name)
-                        if isinstance(transition, accounts.NoGroupTransition):
-                            transition = accounts.set_group_account(group_name, target, why=f"complete {group_name} move to {target}", now=now)
                         why = f"complete {group_name} move to {target}"
+                        if isinstance(transition, accounts.NoGroupTransition):
+                            transition = accounts.set_group_account(group_name, target, why=why, now=now)
                         if isinstance(transition.origin, accounts.AutoOrigin):
                             why = transition.why.text if isinstance(transition.why, accounts.RecordedTransitionReason) else ""
                         outcomes = accounts.move_sessions(tuple(session.session_id for session in members), target, why=why,
