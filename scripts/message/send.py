@@ -791,6 +791,15 @@ class WorkerResultUnconfirmed(Result):
     """The prompt may have sent input, and the transcript receipt is missing."""
 
 
+@dataclass(frozen=True)
+class BlockedWorkerResult:
+    """The worker needs input, and the result must wait for the pane."""
+
+    detail: str
+    send_to_holder: Callable[[str, str], Result]
+    outcome: Literal["retry"] = field(init=False, default="retry")
+
+
 class RecordedDeliveryAcceptance(Result):
     """This keyed send has durable acceptance; later bookkeeping must not repeat it."""
 
@@ -5133,6 +5142,7 @@ class WorkerResultReceipt:
     wait_for_idle: bool = False
     before_input: Callable[[], object] = lambda: None
     worker_only: bool = False
+    before_holder: Callable[[], object] = lambda: None
 
     def received(self, worker: staff.StaffRow, membership: staff.StaffSnapshot) -> bool:
         from scripts.production import worker_admission
@@ -5153,7 +5163,7 @@ def deliver_worker_text(worker: staff.StaffRow, membership: staff.StaffSnapshot,
                         sender: str, timeout: float, reason: str = "",
                         receipt: WorkerResultReceipt | OrdinaryWorkerMessage = OrdinaryWorkerMessage.SEND,
                         selection: RecipientSelection | NoFixedStaffLookup = NO_FIXED_STAFF_LOOKUP,
-                        review_text: str = "", allow_holder_fallback: bool = True, skip_closed: bool = False) -> Result:
+                        review_text: str = "", allow_holder_fallback: bool = True, skip_closed: bool = False) -> Result | BlockedWorkerResult:
     """Deliver to a proved pane or retain the message through its holder."""
     from scripts.herdr import worker_panes
     from scripts.herdr import herdr
@@ -5162,6 +5172,13 @@ def deliver_worker_text(worker: staff.StaffRow, membership: staff.StaffSnapshot,
     worker_only = isinstance(receipt, WorkerResultReceipt) and receipt.worker_only
     if holder is None:
         return Result("retry" if worker_only else "failed", f"{worker.name}: worker holder is unavailable")
+
+    def send_to_holder(fallback_reason: str, body: str) -> Result:
+        address = f"session:{holder.current_session}"
+        options = parse(["--here", "--to", address, "--from", sender, "--timeout", str(timeout),
+                         "--text", f"Worker {worker.name}: {one_line(fallback_reason)}\n{body}"])
+        return _send(options._replace(selection=WorkerHolderRecipient(address, holder.id)), membership=membership)
+
     if not reason:
         state = next((item for item in worker_panes.observe(holder.id, membership) if item.row.id == worker.id), None)
         if isinstance(state, worker_panes.OpenWorker):
@@ -5234,8 +5251,11 @@ def deliver_worker_text(worker: staff.StaffRow, membership: staff.StaffSnapshot,
                     return WorkerResultUnconfirmed("retry", reason or "the worker transcript has no result receipt")
             else:
                 reason = f"worker is {state.status.value}"
-                if isinstance(receipt, WorkerResultReceipt) and state.status != herdr.AgentStatus.BLOCKED:
-                    return Result("retry", reason)
+                if isinstance(receipt, WorkerResultReceipt):
+                    if state.status != herdr.AgentStatus.BLOCKED or worker_only:
+                        return Result("retry", reason)
+                    if allow_holder_fallback and not isinstance(selection, FixedStaffLookup):
+                        return BlockedWorkerResult(reason, send_to_holder)
         elif state is None:
             reason = "worker observation is unavailable"
         elif isinstance(state, (worker_panes.ProcessUnknownWorker, worker_panes.UncertainWorker)):
@@ -5248,10 +5268,9 @@ def deliver_worker_text(worker: staff.StaffRow, membership: staff.StaffSnapshot,
         return Result("retry", reason)
     if not allow_holder_fallback or isinstance(selection, FixedStaffLookup):
         return Result("failed", reason)
-    address = f"session:{holder.current_session}"
-    options = parse(["--here", "--to", address, "--from", sender,
-                     "--timeout", str(timeout), "--text", f"Worker {worker.name}: {one_line(reason)}\n{text}"])
-    return _send(options._replace(selection=WorkerHolderRecipient(address, holder.id)), membership=membership)
+    if isinstance(receipt, WorkerResultReceipt):
+        _ = receipt.before_holder()
+    return send_to_holder(reason, text)
 
 
 def _send(options: Options, *, membership: staff.StaffSnapshot) -> Result:
@@ -5545,6 +5564,7 @@ def _send_with_review(options: Options, membership: staff.StaffSnapshot, review_
                                          sender=message.sender, timeout=options.timeout, selection=options.selection,
                                          review_text=review_text, allow_holder_fallback=not batch_only,
                                          skip_closed=options.skip_closed)
+            assert isinstance(result, Result)
         else:
             claude_started = time.monotonic()
             def relay_and_queue(relay_message: Message, timeout: float) -> Result:

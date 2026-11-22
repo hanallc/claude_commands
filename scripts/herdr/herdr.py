@@ -1613,6 +1613,10 @@ class PaneEvidenceRun:
     lock: RLock = field(default_factory=RLock)
 
 
+class RestorePaneEvidenceRun(PaneEvidenceRun):
+    """Retain classified uncertainty for the duration of a worker restore."""
+
+
 _pane_evidence_run: ContextVar[PaneEvidenceRun | ScanAtUse] = ContextVar(
     "pane_evidence_run", default=_SCAN_AT_USE)
 
@@ -1628,6 +1632,27 @@ def pane_evidence_run() -> Generator[None]:
         yield
     finally:
         _pane_evidence_run.reset(token)
+
+
+@contextmanager
+def restore_pane_evidence_run() -> Generator[None]:
+    """Keep restore evidence in its own scope."""
+    token = _pane_evidence_run.set(RestorePaneEvidenceRun())
+    try:
+        yield
+    finally:
+        _pane_evidence_run.reset(token)
+
+
+def refresh_restore_pane_evidence() -> None:
+    """Keep only classified uncertainty for identified terminals until restore ends."""
+    run = _pane_evidence_run.get()
+    if isinstance(run, RestorePaneEvidenceRun):
+        with run.lock:
+            for key, evidence in tuple(run.sessions.items()):
+                if not key[2] or not isinstance(evidence, PaneSessionsUnknown):
+                    del run.sessions[key]
+            run.shell_processes.clear()
 
 
 @dataclass
@@ -1811,8 +1836,7 @@ class Herdr:
         run = _pane_evidence_run.get()
         if isinstance(run, PaneEvidenceRun):
             with run.lock:
-                panes = [pane for pane in panes if
-                         (self.session, str(pane.get("pane_id", "")), str(pane.get("terminal_id", ""))) not in run.sessions]
+                panes = [pane for pane in panes if self._pane_evidence_key(pane) not in run.sessions]
         def read(pane: str) -> tuple[str, dict[str, object]]:
             try:
                 return pane, self.socket_request("pane.process_info", pane_id=pane)
@@ -1963,7 +1987,7 @@ class Herdr:
                                   json_text(matches[0].get("workspace_id"), "herdr workspace id"))
         run = cast(PaneEvidenceRun, _pane_evidence_run.get())
         for pane in panes:
-            key = (self.session, str(pane.get("pane_id", "")), str(pane.get("terminal_id", "")))
+            key = self._pane_evidence_key(pane)
             with run.lock:
                 pid = run.shell_processes.get(key)
             if pid is None:
@@ -2302,8 +2326,12 @@ class Herdr:
         except (HerdrFailure, OSError, ValueError, subprocess.SubprocessError):
             return set()
 
+    def _pane_evidence_key(self, pane: dict[str, object]) -> tuple[str, str, str]:
+        terminal = pane.get("terminal_id")
+        return self.session, str(pane.get("pane_id", "")), terminal if isinstance(terminal, str) else ""
+
     def _row_pane_sessions(self, pane: dict[str, object], run: PaneEvidenceRun) -> PaneSessions:
-        key = (self.session, str(pane.get("pane_id", "")), str(pane.get("terminal_id", "")))
+        key = self._pane_evidence_key(pane)
         with run.lock:
             if key in run.sessions:
                 return run.sessions[key]
@@ -2349,8 +2377,16 @@ class Herdr:
                                        if isinstance(sessions, _PaneProcessNotFound)})
         for pane, sessions in observations:
             if isinstance(sessions, _PaneProcessNotFound):
-                sessions = (PaneSessionsChanging("pane closed during scan") if str(pane.get("pane_id", "")) in closed
-                            else PaneSessionsUnknown(sessions.reason))
+                key = self._pane_evidence_key(pane)
+                if key[1] in closed:
+                    sessions = PaneSessionsChanging("pane closed during scan")
+                else:
+                    uncertain = PaneSessionsUnknown(sessions.reason)
+                    if isinstance(run, RestorePaneEvidenceRun):
+                        with run.lock:
+                            if run.sessions.get(key) is sessions:
+                                run.sessions[key] = uncertain
+                    sessions = uncertain
             if isinstance(sessions, (PaneSessionsStarting, PaneSessionsChanging, PaneSessionsUnknown)):
                 reason = "starting" if isinstance(sessions, PaneSessionsStarting) else sessions.reason
                 unread = UnknownPane(str(pane.get("pane_id", "")), str(pane.get("tab_id", "")), reason)
@@ -3380,9 +3416,17 @@ class Herdr:
             if not check_target(target, action="keys", place=HerdrPlace(self.session, pane), text=expected,
                                 pane_info=self.pane_row(pane), client=self):
                 raise HerdrFailure(f"{pane}: would send keys to an unproved target instead of session {target}")
-            self._send_keys(pane, key)
+            try:
+                self._send_keys(pane, key)
+            except HerdrCommandNotStarted as error:
+                if index == 0:
+                    raise
+                raise HerdrFailure(f"{pane}: the answer may be partly typed: {error}") from error
             if index == 0:
-                _ = self.run("pane", "send-text", pane, text)
+                try:
+                    _ = self.run("pane", "send-text", pane, text)
+                except HerdrCommandNotStarted as error:
+                    raise HerdrFailure(f"{pane}: the answer selection key was sent: {error}") from error
 
     def _send_keys(self, pane: str, *keys: str) -> None:
         _ = self.run("pane", "send-keys", pane, *keys)
