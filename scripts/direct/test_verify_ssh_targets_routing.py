@@ -8,7 +8,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
-from typing import TypedDict, cast, override
+from typing import Literal, TypedDict, cast, override
 from unittest import mock
 
 from scripts.aws_target import hana_placement_adapter as hana
@@ -27,6 +27,10 @@ class ClaimReleaseObservation(TypedDict):
     reserved_identity: list[str]
     remaining: list[str]
     availability: str
+    pass_recorded: bool
+
+
+type ClaimReleaseMode = Literal["release", "refuse", "target-removed", "state-unavailable"]
 
 
 class VerifySshRoutingTests(VerifySshTargetsFixture):
@@ -35,16 +39,18 @@ class VerifySshRoutingTests(VerifySshTargetsFixture):
         super().build_fixture()
         _ = copy_helpers(self.home, "scripts/style/git_process.py", "scripts/review_links")
 
-    def run_prelaunch_mac_refusal(self, *, refuse_release: bool) -> tuple[subprocess.CompletedProcess[str], ClaimReleaseObservation]:
+    def run_mac_with_claim_release(self, mode: ClaimReleaseMode, *,
+                                   pass_on_mac: bool = False) -> tuple[subprocess.CompletedProcess[str], ClaimReleaseObservation]:
         self.configure("mac,natedev")
         self.enable_mac()
         _ = self.hold_memory()
-        runner = support.SSH_RUNNER.replace(
-            "result = offload.run_offload(controller, config, request, started)",
-            'Path(os.environ["BUILDLOG_MEMINFO"]).write_text("MemAvailable: 268435456 kB\\n")\n'
-            + '    result = offload.DeclinedMacRun("state", 0)',
-        )
-        self.write_executable(self.runner, runner)
+        if not pass_on_mac:
+            runner = support.SSH_RUNNER.replace(
+                "result = offload.run_offload(controller, config, request, started)",
+                'Path(os.environ["BUILDLOG_MEMINFO"]).write_text("MemAvailable: 268435456 kB\\n")\n'
+                + '    result = offload.DeclinedMacRun("state", 0)',
+            )
+            self.write_executable(self.runner, runner)
         wrapper = self.root / "observe-release.py"
         self.write_executable(wrapper, r'''
 import json
@@ -62,40 +68,61 @@ def main() -> object:
     if sys.argv[1] != "release-wait":
         return build_targets_status()
     paths = mac_test.state_paths("mac")
-    claim, = mac_test.read_claims(paths)
+    claims = mac_test.read_claims(paths)
     fields = ("claim-id", "episode", "attempt", "session")
     identity = [sys.argv[sys.argv.index("--" + field) + 1] for field in fields]
-    reserved = [claim.record[field] for field in ("claim_id", "episode", "attempt", "submitting_session")]
-    if os.environ["TEST_REFUSE_CLAIM_RELEASE"] == "1":
+    reserved = [claim.record[field] for claim in claims
+                for field in ("claim_id", "episode", "attempt", "submitting_session")]
+    cache = Path(os.environ["UNIT_RUN_DIR"]) / "verify_cache"
+    pass_recorded = any("host=mac\n" in path.read_text() for path in cache.glob("*.pass"))
+    mode = os.environ["TEST_CLAIM_RELEASE_MODE"]
+    if mode == "refuse":
         print("private release refusal", file=sys.stderr)
         status = 12
+    elif mode == "target-removed":
+        registry = Path(os.environ["CONF_DIR"]) / "build_targets.conf"
+        original = registry.read_text()
+        registry.write_text(original.replace("targets=mac,natedev", "targets=natedev"))
+        try:
+            status = build_targets_status()
+        finally:
+            registry.write_text(original)
+    elif mode == "state-unavailable":
+        saved = paths.directory.with_name("saved-mac-state")
+        paths.directory.rename(saved)
+        try:
+            status = build_targets_status()
+        finally:
+            saved.rename(paths.directory)
     else:
         status = build_targets_status()
     state = Path(os.environ["TEST_RUNNER_STATE"])
     with (state / "claim-releases.jsonl").open("a") as output:
         output.write(json.dumps(dict(identity=identity, reserved_identity=reserved,
             remaining=[current.record["claim_id"] for current in mac_test.read_claims(paths)],
-            availability=mac_test.free_now(paths, state.parent / "mac_test.conf", state.parent))) + "\n")
+            availability=mac_test.free_now(paths, state.parent / "mac_test.conf", state.parent),
+            pass_recorded=pass_recorded)) + "\n")
     return status
 
 if __name__ == "__main__":
     raise SystemExit(main())
 ''')
         result = self.verify("test", "sample", "--no-cache", extra={
-            "BUILD_TARGETS_SCRIPT": str(wrapper), "TEST_REFUSE_CLAIM_RELEASE": str(int(refuse_release)),
+            "BUILD_TARGETS_SCRIPT": str(wrapper), "TEST_CLAIM_RELEASE_MODE": mode,
         })
         event, = self.ssh_events()
         self.assertTrue(event["reserved"])
-        self.assertEqual(event["adopted_claim_ids"], [])
-        self.assertEqual(event["actions"], [])
         observation_line, = (self.runner_state / "claim-releases.jsonl").read_text().splitlines()
         observation = cast(ClaimReleaseObservation, json.loads(observation_line))
-        self.assertEqual(observation["identity"], observation["reserved_identity"])
         self.assertEqual(event["entry_claim_ids"], observation["identity"][:1])
+        if not pass_on_mac:
+            self.assertEqual(event["adopted_claim_ids"], [])
+            self.assertEqual(event["actions"], [])
+            self.assertEqual(observation["identity"], observation["reserved_identity"])
         return result, observation
 
     def test_prelaunch_mac_refusal_stops_when_exact_release_fails(self) -> None:
-        result, release = self.run_prelaunch_mac_refusal(refuse_release=True)
+        result, release = self.run_mac_with_claim_release("refuse")
         output = result.stdout + result.stderr
         self.assertEqual(result.returncode, 2, output)
         self.assertEqual(self.local_runs(), [])
@@ -105,11 +132,41 @@ if __name__ == "__main__":
         self.assertEqual(errors, [f"verify.sh: cannot release SSH claim {claim_id} (status 12): private release refusal"])
 
     def test_prelaunch_mac_refusal_releases_exact_claim_before_local_fallback(self) -> None:
-        result, release = self.run_prelaunch_mac_refusal(refuse_release=False)
+        result, release = self.run_mac_with_claim_release("release")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(release["remaining"], [])
         self.assertEqual(release["availability"], "free")
         self.assertEqual(len(self.local_runs()), 1)
+
+    def assert_refusal_when_claim_store_is_unavailable(self, mode: ClaimReleaseMode, reason: str) -> None:
+        result, release = self.run_mac_with_claim_release(mode)
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertEqual(self.local_runs(), [])
+        self.assertEqual(release["remaining"], release["identity"][:1])
+        claim_id = release["identity"][0]
+        errors = [line for line in result.stderr.splitlines() if "cannot release SSH claim" in line]
+        self.assertEqual(len(errors), 1, result.stderr)
+        self.assertIn(claim_id, errors[0])
+        self.assertIn(reason, errors[0])
+
+    def test_prelaunch_mac_refusal_stops_when_the_target_leaves_the_registry(self) -> None:
+        self.assert_refusal_when_claim_store_is_unavailable("target-removed", "SSH target mac is no longer configured")
+
+    def test_prelaunch_mac_refusal_stops_when_the_state_directory_is_gone(self) -> None:
+        self.assert_refusal_when_claim_store_is_unavailable("state-unavailable", "the state directory for mac is unavailable")
+
+    def test_mac_pass_is_recorded_before_a_claim_release_error(self) -> None:
+        result, release = self.run_mac_with_claim_release("refuse", pass_on_mac=True)
+        output = result.stdout + result.stderr
+        self.assertEqual(result.returncode, 2, output)
+        self.assertTrue(release["pass_recorded"], output)
+        self.assertEqual(self.last_call()["mac"], "passed_full")
+        self.assertEqual(self.last_call()["status"], 0)
+        self.assertEqual(self.local_runs(), [])
+        self.assertIn("verify.sh: PASS on the Mac", result.stdout)
+        claim_id = release["identity"][0]
+        errors = [line for line in result.stderr.splitlines() if "cannot release SSH claim" in line]
+        self.assertEqual(errors, [f"verify.sh: cannot release SSH claim {claim_id} (status 12): private release refusal"])
 
     def test_failed_mac_reservation_keeps_its_episode_for_local_fallback(self) -> None:
         self.configure("mac,natedev")

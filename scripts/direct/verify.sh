@@ -2436,8 +2436,6 @@ runpy.run_path(sys.argv[0], run_name="__main__")
     trap - INT TERM HUP
     eval "$caller_traps"
     MAC_RUNNER_PID=""
-    local claim_release_status=0
-    release_wait_claim || claim_release_status=$?
 
     if result_text="$(verify_helper "$VERIFY_START_DIR/runner_result.py" \
         "$MAC_RESULT_FILE" "$runner_status" "$selected_is_mac")"; then
@@ -2464,11 +2462,17 @@ runpy.run_path(sys.argv[0], run_name="__main__")
     fi
     MAC_RESULT_FILE=""
 
-    if (( claim_release_status != 0 )); then
-        exec 9>&-
-        rm -f "$MAC_LOG_FILE"
-        MAC_LOG_FILE=""
-        return "$claim_release_status"
+    if [[ "$result_usable" == 0 || "$result_word" != passed ]]; then
+        local claim_release_status=0
+        local release_arguments=()
+        if [[ "$result_usable" == 1 ]]; then release_arguments=(--after-runner); fi
+        release_wait_claim ${release_arguments[@]+"${release_arguments[@]}"} || claim_release_status=$?
+        if (( claim_release_status != 0 )); then
+            exec 9>&-
+            rm -f "$MAC_LOG_FILE"
+            MAC_LOG_FILE=""
+            return "$claim_release_status"
+        fi
     fi
 
     if [[ "$result_usable" == 0 ]]; then
@@ -2530,6 +2534,7 @@ runpy.run_path(sys.argv[0], run_name="__main__")
                 rm -f "$MAC_LOG_FILE"
                 MAC_LOG_FILE=""
                 note_event failed "$SECONDS" 0 "" 0 2
+                release_wait_claim --after-runner || exit $?
                 exit 2
             fi
             MAC_PASSED=1
@@ -2537,15 +2542,17 @@ runpy.run_path(sys.argv[0], run_name="__main__")
                 exec 9>&-
                 rm -f "$MAC_LOG_FILE"
                 MAC_LOG_FILE=""
-                return 0
+                release_wait_claim --after-runner
+                return $?
             fi
             if [[ "$selected_is_mac" == 0 ]]; then
                 record_mac_pass "$MAC_LOG_FILE" "$result_seconds"
                 echo "verify.sh: PASS on $selected_target (Linux)."
                 note_event ran "${SECONDS}" 0 "" 0 0
+                release_wait_claim --after-runner || exit $?
                 exit 0
             fi
-            finish_mac_pass "$MAC_LOG_FILE" "$result_seconds"
+            finish_mac_pass "$MAC_LOG_FILE" "$result_seconds" --after-runner
             ;;
     esac
 }
@@ -2561,6 +2568,7 @@ finish_mac_pass() {
     record_mac_pass "$1" "$2"
     echo "verify.sh: PASS on the Mac (macOS), so nothing ran on natedev."
     note_event ran "${SECONDS}" 0 "" 0 0
+    if [[ "${3:-}" == --after-runner ]]; then release_wait_claim --after-runner || exit $?; fi
     exit 0
 }
 
@@ -2765,13 +2773,17 @@ target_for_settings() {
 release_wait_claim() {
     [[ -n "${HOLD_WAIT_DIR:-}" ]] || return 0
     [[ -e "$HOLD_WAIT_DIR/ssh-reservation" || -e "$HOLD_WAIT_DIR/ssh-reservation.identity" ]] || return 0
-    local claim_id="" episode="" attempt="" claim_session="" error="" status=0
+    local claim_id="" episode="" attempt="" claim_session="" target="" error="" status=0
+    if [[ -s "$HOLD_WAIT_DIR/ssh-reservation" ]]; then
+        IFS= read -r target < "$HOLD_WAIT_DIR/ssh-reservation" || true
+        target=${target%%$'\t'*}
+    fi
     if [[ -s "$HOLD_WAIT_DIR/ssh-reservation.identity" ]]; then
         IFS=$'\t' read -r claim_id episode attempt claim_session < "$HOLD_WAIT_DIR/ssh-reservation.identity" || true
     fi
-    if [[ -n "$claim_id" && -n "$episode" && -n "$attempt" ]]; then
+    if [[ -n "$claim_id" && -n "$episode" && -n "$attempt" && -n "$target" ]]; then
         error="$(verify_helper "$BUILD_TARGETS_SCRIPT" release-wait --pid "$$" --claim-id "$claim_id" \
-            --episode "$episode" --attempt "$attempt" --session "$claim_session" 2>&1 >/dev/null)" || status=$?
+            --episode "$episode" --attempt "$attempt" --session "$claim_session" --target "$target" "$@" 2>&1 >/dev/null)" || status=$?
     else
         status=2
         error="the exact claim identity is unavailable"

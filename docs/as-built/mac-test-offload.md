@@ -691,8 +691,9 @@ Adoption preserves the claim identity and updates the local holder under the tar
 `holder_session` preserves the original job evidence.
 Strict session equality prevents an unrelated session from adopting the claim.
 `ClaimHolderIdentity` names the offload child.
-Before fallback to natedev, Verify confirms release of the exact claim it still owns.
-If Verify cannot confirm the release, it stops and prints the claim ID and the release error.
+Before fallback to natedev, Verify checks the target in the reservation receipt and releases the exact claim it still owns.
+If the target or its state is unavailable, Verify stops and prints the claim ID and the release error.
+Verify records a completed remote pass before it reports a release error.
 `SubmittingOwner` remains the verify coordinator.
 The service checks both lifetimes and their process-tree relationship.
 

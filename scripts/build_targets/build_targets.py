@@ -80,6 +80,7 @@ class CliArguments(argparse.Namespace):
         self.remote_kinds_file: str = ""
         self.session: SubmittingSession | claim_state.CallingSession = claim_state.CALLING_SESSION
         self.claim_identity_file: str = ""
+        self.after_runner: bool = False
         self.claim_id: str = ""
         self.episode: str = ""
         self.attempt: str = ""
@@ -127,6 +128,8 @@ def parser() -> argparse.ArgumentParser:
     _ = recovery.add_argument("--recovery-fd", type=int, required=True)
     release = commands.add_parser("release-wait")
     _ = release.add_argument("--pid", type=positive_pid, required=True)
+    _ = release.add_argument("--target", default="")
+    _ = release.add_argument("--after-runner", action="store_true")
     for field in ("claim-id", "episode", "attempt"):
         _ = release.add_argument("--" + field, default="")
 
@@ -1137,50 +1140,77 @@ def command_reserve(args: CliArguments) -> int:
 
 def command_release_wait(pid: int, *,
                          identity: claim_state.ClaimIdentity | claim_state.NoClaimIdentity = claim_state.NO_CLAIM_IDENTITY,
-                         session: SubmittingSession | claim_state.CallingSession = claim_state.CALLING_SESSION) -> int:
+                         session: SubmittingSession | claim_state.CallingSession = claim_state.CALLING_SESSION,
+                         target: str = "", after_runner: bool = False) -> int:
     """Release only process-bound reservations; remote claims retain ownership."""
     from scripts.lib import process_start as process_identity
 
     session = claim_state.submitting_session(session)
     start = process_identity.process_start(pid)
-    if isinstance(start, process_identity.Unreadable):
-        print(f"cannot read claim owner {pid}: {start.reason}", file=sys.stderr)
+
+    def refuse(reason: str) -> int:
+        claim_id = identity.claim_id if isinstance(identity, claim_state.ClaimIdentity) else "unknown"
+        print(f"cannot release claim {claim_id}: {' '.join(reason.splitlines())}", file=sys.stderr)
         return 2
+
+    if isinstance(start, process_identity.Unreadable):
+        return refuse(f"cannot read claim owner {pid}: {start.reason}")
     if not isinstance(start, process_identity.Started):
-        return 0
-    for target in read_targets():
-        if not isinstance(target, SshTarget):
+        return refuse(f"claim owner {pid} is no longer running") if target else 0
+    try:
+        targets = read_targets()
+    except (ConfigError, OSError, ValueError) as error:
+        return refuse(str(error))
+    for configured in targets:
+        if not isinstance(configured, SshTarget) or target and configured.name != target:
             continue
         from scripts.build_targets import target_config
 
-        if not target_config.ssh_target_state_directory(target.name).exists():
-            continue
-        paths = claim_state.state_paths(target.name)
-        fenced: list[claim_state.HeldClaim] = []
-        with claim_state.locked(paths.lock):
-            for claim in claim_state.read_claims(paths):
-                if (claim.record["pid"] == pid and claim.record["proc_start"] == start.start
-                        and claim.record["submitting_session"] == claim_state.session_id(session)
-                        and claim_state.claim_identity(claim.record) == identity
-                        and "remote_host" not in claim.record):
+        try:
+            if not target_config.ssh_target_state_directory(configured.name).is_dir():
+                if target:
+                    return refuse(f"the state directory for {target} is unavailable")
+                continue
+            paths = claim_state.state_paths(configured.name)
+            fenced: list[claim_state.ClaimIdentity] = []
+            with claim_state.locked(paths.lock):
+                exact = [claim for claim in claim_state.read_claims(paths)
+                         if claim_state.claim_identity(claim.record) == identity]
+                for claim in exact:
+                    record = claim.record
+                    if (record["pid"] != pid or record["proc_start"] != start.start
+                            or record["submitting_session"] != claim_state.session_id(session)
+                            or "remote_host" in record):
+                        continue
                     from scripts.mac_test import offload
 
-                    exact = claim_state.ClaimIdentity(claim.record["claim_id"], claim.record["episode"], claim.record["attempt"])
-                    if offload.pending_start_path(target.name, exact).exists():
-                        fenced.append(claim)
+                    claim_key = claim_state.claim_identity(record)
+                    if offload.pending_start_path(configured.name, claim_key).exists():
+                        fenced.append(claim_key)
                     else:
-                        claim.path.unlink(missing_ok=True)
-        for claim in fenced:
-            from scripts.mac_test import mac_test
+                        claim.path.unlink()
+                        if target:
+                            return 0
+                if target and not fenced:
+                    # A runner can adopt or remove the reservation before it returns a result.
+                    if after_runner and all("remote_host" in claim.record for claim in exact):
+                        return 0
+                    return refuse(f"the exact reservation for {target} was not found")
+            for claim_key in fenced:
+                from scripts.mac_test import mac_test
 
-            release = mac_test.CliArguments()
-            release.pid, release.target, release.settings = pid, target.name, str(target.settings)
-            release.claim_id = claim.record["claim_id"]
-            release.episode, release.attempt = claim.record["episode"], claim.record["attempt"]
-            status = mac_test.command_release(release, paths)
-            if status != 0:
-                return status
-    return 0
+                released = mac_test.release_exact_claims(paths, pid, claim_key, str(configured.settings))
+                if isinstance(released, mac_test.ClaimReleaseRefused):
+                    return refuse(released.reason)
+                if released.count == 0:
+                    return refuse("the exact reservation changed during release")
+                if released.transfers:
+                    print("copy_bytes=" + json.dumps(list(released.transfers)))
+            if target:
+                return 0
+        except (ConfigError, OSError, ValueError) as error:
+            return refuse(str(error))
+    return refuse(f"SSH target {target} is no longer configured") if target else 0
 
 
 def command_kind_eligible(repo_root: Path, package: str, kind: StepKind, routing: Routing,
@@ -1634,7 +1664,8 @@ def main() -> int:
             with target_config.command_configuration():
                 if args.command == "release-wait":
                     return command_release_wait(args.pid, identity=claim_state.ClaimIdentity(
-                        args.claim_id, args.episode, args.attempt), session=args.session)
+                        args.claim_id, args.episode, args.attempt), session=args.session,
+                        target=args.target, after_runner=args.after_runner)
                 return command_constraints(args) if args.command == "constraints" else command_eligibility(args)
         if args.command == "register-local":
             return command_register_local(args.call_id, pid=args.pid, session=args.session)
