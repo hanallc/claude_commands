@@ -71,7 +71,7 @@ class MacRunTests(unittest.TestCase):
         with ExitStack() as guest:
             _ = guest.enter_context(mac_run.held(self.checkout, "mac", SuiteMode.GATE, StepJob("test-all")))
             claim, = claim_state.read_claims(self.paths)
-            self.assertEqual(claim.scope, claim_state.RepositoryScope(".claude"))
+            self.assertEqual(claim.scope, claim_state.RepositoryScope(".claude", slot=1))
             self.assertEqual(claim.record["what"], "mac-linux test-all")
             self.assertEqual(claim.record["worktree"], str(self.checkout))
             with self.assertRaisesRegex(mac_run.MacRunRefused, "busy with mac-linux test-all"):
@@ -82,7 +82,9 @@ class MacRunTests(unittest.TestCase):
             self.assertEqual(mac_test.command_claim(other, self.paths, watch_claim=False), 0)
             self.assertEqual(mac_test.command_release(other, self.paths), 0)
 
-            native = self.native_claim(self.repo)
+            native = self.native_claim(self.checkout)
+            self.assertEqual(mac_test.free_now(self.paths, self.root / "mac_test.conf", self.checkout), "busy")
+            self.assertEqual(mac_test.command_claim(native, self.paths, watch_claim=False), 11)
             native.wait = 10
 
             def release_guest(_seconds: float) -> None:
@@ -124,6 +126,35 @@ class MacRunTests(unittest.TestCase):
                 with self.assertRaises(mac_run.MacRunRefused):
                     with mac_run.held(self.checkout, "mac", SuiteMode.GATE, GATE_JOB_NOT_RECORDED):
                         self.fail("A third run exceeded the configured limit")
+            self.assertEqual(claim_state.read_claims(self.paths), ())
+
+    def test_native_starts_when_either_guest_releases_a_slot(self) -> None:
+        self.configure_limit(2)
+        settings = self.root / "mac_test.conf"
+        for ends_first in (0, 1):
+            with self.subTest(ends_first=ends_first), ExitStack() as claims:
+                guests = [claims.enter_context(ExitStack()) for _ in range(2)]
+                for guest in guests:
+                    _ = guest.enter_context(mac_run.held(self.checkout, "mac", SuiteMode.GATE, GATE_JOB_NOT_RECORDED))
+                self.assertEqual({claim.scope for claim in claim_state.read_claims(self.paths)},
+                                 {claim_state.RepositoryScope(".claude", slot=slot) for slot in (1, 2)})
+                native = self.native_claim(self.checkout)
+                self.assertEqual(mac_test.free_now(self.paths, settings, self.checkout), "busy")
+                self.assertEqual(mac_test.command_claim(native, self.paths, watch_claim=False), 11)
+
+                guests[ends_first].close()
+                self.assertEqual(mac_test.free_now(self.paths, settings, self.checkout), "free")
+                self.assertEqual(mac_test.command_claim(native, self.paths, watch_claim=False), 0)
+                _ = claims.callback(mac_test.command_release, native, self.paths)
+                self.assertEqual(mac_test.free_now(self.paths, settings, self.checkout, mac_kind=mac_test.MacClaimKind.GUEST),
+                                 "busy")
+
+                guests[1 - ends_first].close()
+                self.assertEqual(mac_test.free_now(self.paths, settings, self.checkout), "busy")
+                self.assertEqual(mac_test.free_now(self.paths, settings, self.checkout, mac_kind=mac_test.MacClaimKind.GUEST),
+                                 "free")
+                with mac_run.held(self.checkout, "mac", SuiteMode.GATE, GATE_JOB_NOT_RECORDED):
+                    self.assertEqual(len(claim_state.read_claims(self.paths)), 2)
             self.assertEqual(claim_state.read_claims(self.paths), ())
 
     def test_numbered_claim_cannot_replace_a_repository_with_a_slot_suffix(self) -> None:
@@ -183,3 +214,11 @@ class MacRunTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, refused.reason):
                 with mac_run.held(self.checkout, "mac", StepJob("test-affected"), GATE_JOB_NOT_RECORDED):
                     self.assertEqual(len(claim_state.read_claims(self.paths)), 1)
+
+    def test_release_error_preserves_the_guest_error(self) -> None:
+        refused = mac_test.ClaimReleaseRefused("the exact claim changed during cleanup")
+        with mock.patch.object(mac_test, "release_exact_claims", return_value=refused):
+            with self.assertRaisesRegex(ValueError, "guest failed") as failed:
+                with mac_run.held(self.checkout, "mac", StepJob("test-affected"), GATE_JOB_NOT_RECORDED):
+                    raise ValueError("guest failed")
+        self.assertEqual(failed.exception.__notes__, [f"Mac claim release failed: {refused.reason}"])

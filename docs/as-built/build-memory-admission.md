@@ -526,7 +526,7 @@ Mac and SSH records retain their claim id, episode, attempt and submitting sessi
 Release compares the exact claim identity under the provider lock.
 The Mac claim count uses `build_slots.configured_maximum` to read the repository limit or host default in `build_folders.conf`.
 The mac-linux gate shares the claude_commands repository limit with native Mac runs, even from a differently named checkout.
-The guest takes a numbered claim when one is free. Mac mirror work uses the unnumbered claim.
+Each guest uses a numbered claim. Mac mirror work uses the unnumbered claim.
 The provider keeps its existing repository scopes and cleanup policy.
 Held slots and waiting extras remain in memory. A restart removes them and retains the run's queue place.
 The service replaces this file atomically. Reservation records retain accepted needs, run identities, scope paths, and finalization intent.

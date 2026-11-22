@@ -27,7 +27,7 @@ def held(repo: Path, target: str, work: SuiteMode | StepJob,
         raise MacRunRefused(f"{target} is not a Mac claim target")
     if not repository.strip():
         raise MacRunRefused("a Mac repository claim needs a repository name")
-    scope = claim_state.RepositoryScope(".claude" if repository == "claude_commands" else repository)
+    scope = claim_state.mac_repository_scope(repository)
     worktree = str(repo.resolve())
     if isinstance(work, StepJob):
         step = work.step
@@ -44,7 +44,8 @@ def held(repo: Path, target: str, work: SuiteMode | StepJob,
     try:
         try:
             with cancellation.defer_cleanup_signals(), claim_state.locked(paths.lock):
-                attempt = mac_test.claim_once(args, paths, scope, session=session)
+                attempt = mac_test.claim_once(args, paths, scope, session=session,
+                                              mac_kind=mac_test.MacClaimKind.GUEST)
                 acquired = isinstance(attempt, mac_test.ClaimFinished) and attempt.status == 0
         except (OSError, ValueError) as error:
             raise MacRunRefused(str(error)) from error
@@ -57,11 +58,21 @@ def held(repo: Path, target: str, work: SuiteMode | StepJob,
         if not acquired:
             raise MacRunRefused(f"{target} needs cleanup before the run can start")
         yield
-    finally:
+    except BaseException as error:
         if acquired:
-            with cancellation.defer_cleanup_signals():
-                released = mac_test.release_exact_claims(paths, args.pid, identity, "")
-                if isinstance(released, mac_test.ClaimReleaseRefused):
-                    raise RuntimeError(released.reason)
-                if released.count != 1:
-                    raise RuntimeError(f"{target} did not release the exact repository claim")
+            try:
+                _release(paths, args.pid, identity)
+            except BaseException as release_error:
+                error.add_note(f"Mac claim release failed: {release_error}")
+        raise
+    else:
+        _release(paths, args.pid, identity)
+
+
+def _release(paths: claim_state.StatePaths, pid: int, identity: claim_state.ClaimIdentity) -> None:
+    with cancellation.defer_cleanup_signals():
+        released = mac_test.release_exact_claims(paths, pid, identity, "")
+        if isinstance(released, mac_test.ClaimReleaseRefused):
+            raise RuntimeError(released.reason)
+        if released.count != 1:
+            raise RuntimeError(f"{paths.target} did not release the exact repository claim")

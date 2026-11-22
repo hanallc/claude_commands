@@ -442,16 +442,27 @@ def required_string(values: dict[str, object], key: str, path: Path) -> str:
     return value
 
 
+def mac_repository_scope(name: str) -> RepositoryScope:
+    """Use the existing Mac claim name for the claude_commands repository."""
+    return RepositoryScope(".claude" if name == "claude_commands" else name)
+
+
 def target_claim_scope(paths: StatePaths, worktree: str) -> ClaimScope:
     from scripts.buildlog import repository, store
 
-    name = repository.repo_name(worktree)
     common = repository.git_common_dir(worktree)
-    if name is None or common is None:
+    if common is None:
+        return WHOLE_MAC
+    source = Path(repository.source_git_dir(common))
+    name = source.parent.name
+    if not name:
         return WHOLE_MAC
     if target_config.uses_legacy_mac_layout(paths.platform):
-        return RepositoryScope(name)
-    source = Path(repository.source_git_dir(common))
+        origin = repository.origin_url(str(source))
+        if origin:
+            key = repository.remote_identity(origin, str(source.parent))
+            name = key.rsplit("/", 1)[-1] or name
+        return mac_repository_scope(name)
     if not (source / "config").is_file():
         return RepositoryScope(name)
     key = repository.repository_key(str(source.parent))

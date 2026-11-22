@@ -12,6 +12,7 @@ from collections.abc import Callable, Generator
 from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from enum import Enum
 import fcntl
 import json
 import math
@@ -736,27 +737,39 @@ def slot_capacity(paths: StatePaths, scope: ClaimScope, *,
     return target_config.slot_capacity(settings, scope.name, missing=missing)
 
 
-@dataclass(frozen=True)
-class MacClaimSlot:
-    number: int
+class MacClaimKind(Enum):
+    MIRROR = "mirror"
+    GUEST = "guest"
 
 
 @dataclass(frozen=True)
 class MacClaimSlotsBusy:
-    pass
+    holders: tuple[HeldClaim, ...]
 
 
-def mac_claim_slot(claims: tuple[HeldClaim, ...], capacity: int, *, use_mirror: bool) -> MacClaimSlot | MacClaimSlotsBusy:
-    """Choose a free place among the claims for this repository."""
-    if len(claims) >= capacity or any(isinstance(claim.scope, WholeMacScope) for claim in claims):
-        return MacClaimSlotsBusy()
-    slots = {claim.scope.slot for claim in claims if isinstance(claim.scope, RepositoryScope)}
-    # Reserve the unnumbered claim for mirror work when a numbered claim is free.
-    if not use_mirror:
-        for number in range(2, capacity + 1):
-            if number not in slots:
-                return MacClaimSlot(number)
-    return MacClaimSlot(0) if 0 not in slots else MacClaimSlotsBusy()
+def mac_claim_slot(paths: StatePaths, scope: RepositoryScope, claims: tuple[HeldClaim, ...], capacity: int,
+                   *, kind: MacClaimKind) -> RepositoryScope | MacClaimSlotsBusy:
+    """Select a claim file within the shared repository limit."""
+    overlapping = tuple(claim for claim in claims if scopes_overlap(claim.scope, scope))
+    whole_mac = tuple(claim for claim in overlapping if isinstance(claim.scope, WholeMacScope))
+    if whole_mac:
+        return MacClaimSlotsBusy(whole_mac)
+    # The native runner uses one mirror and the unnumbered claim file.
+    numbers = (0,) if kind is MacClaimKind.MIRROR else range(capacity, 0, -1)
+    has_capacity = len(overlapping) < capacity
+    if kind is MacClaimKind.GUEST and not has_capacity:
+        return MacClaimSlotsBusy(overlapping)
+    occupied_paths = {claim.path: claim for claim in claims}
+    occupied_slots = {claim.scope.slot: claim for claim in overlapping if isinstance(claim.scope, RepositoryScope)}
+    holders: list[HeldClaim] = []
+    for number in numbers:
+        candidate = RepositoryScope(scope.name, scope.key, number)
+        holder = occupied_paths.get(claim_path(paths, candidate)) or occupied_slots.get(number)
+        if holder is not None:
+            holders.append(holder)
+        elif has_capacity:
+            return candidate
+    return MacClaimSlotsBusy(tuple(holders) or overlapping)
 
 
 def affinity_path(paths: StatePaths, scope: RepositoryScope) -> Path:
@@ -1878,7 +1891,8 @@ def take_over_kept_claim(args: CliArguments, claim: HeldClaim, kept: RemoteJobCl
 
 def claim_once(args: CliArguments, paths: StatePaths, scope: ClaimScope,
                *, session: SubmittingSession, reserve_wait: bool = False,
-               assignment: placement.PlacementAssignment | UnassignedClaim = UNASSIGNED_CLAIM) -> ClaimAttempt:
+               assignment: placement.PlacementAssignment | UnassignedClaim = UNASSIGNED_CLAIM,
+               mac_kind: MacClaimKind = MacClaimKind.MIRROR) -> ClaimAttempt:
     """One claim attempt under state.lock: take over, refuse, or write the claim."""
     try:
         claims = live_claims(paths)
@@ -1902,11 +1916,12 @@ def claim_once(args: CliArguments, paths: StatePaths, scope: ClaimScope,
             capacity = slot_capacity(paths, scope)
         except (OSError, ConfigError) as error:
             return ClaimDenied(12, f"state unreadable: {error}")
-        use_mirror = isinstance(args.remote, str) or reserve_wait or not isinstance(assignment, UnassignedClaim)
-        slot = mac_claim_slot(overlapping, capacity, use_mirror=use_mirror)
-        if isinstance(slot, MacClaimSlot):
-            scope = RepositoryScope(scope.name, scope.key, slot.number)
+        slot = mac_claim_slot(paths, scope, claims, capacity, kind=mac_kind)
+        if isinstance(slot, RepositoryScope):
+            scope = slot
             overlapping = ()
+        else:
+            overlapping = slot.holders
     if (isinstance(assignment, UnassignedClaim)
             and not target_config.uses_legacy_mac_layout(paths.platform) and isinstance(scope, RepositoryScope)):
         try:
@@ -1950,7 +1965,8 @@ def claim_once(args: CliArguments, paths: StatePaths, scope: ClaimScope,
     owner = session
     if overlapping:
         # A test copy gives way to any new step; a copy never replaces a copy.
-        if not args.copy and all(copy_gives_way(claim.record) for claim in overlapping):
+        if not args.copy and all(scopes_overlap(claim.scope, scope) and copy_gives_way(claim.record)
+                                 for claim in overlapping):
             return ClaimHeldByCopy(tuple(claim.record for claim in overlapping))
         return ClaimBusy(overlapping[0].record)
     proc_start = process_identity.process_start(args.pid)
@@ -2250,31 +2266,29 @@ def free_now(
     paths: StatePaths, settings: Path | eligibility.DefaultMacSettings, repo_root: Path, copy: bool = False,
     *, session: SubmittingSession | claim_state.CallingSession = claim_state.CALLING_SESSION,
     configuration: conf.ConfigRead | conf.UseConfiguredValue = conf.UseConfiguredValue.CURRENT,
+    mac_kind: MacClaimKind = MacClaimKind.MIRROR,
 ) -> FreeNowAnswer:
     """Whether a claim for repo_root's repository made now could start a Mac run.
 
-    Read from local records alone, and cheap enough for LINT_QUEUE_LEAVE_HOOK,
-    which runs it on every held memory poll: no SSH, no gh and no lock. CI is
-    not read, since a claim does not consult it; the claim itself still decides
-    under its lock. Another repository's claim leaves the answer free. A copy
-    claim gives way to a new test, so it holds the scope only for another copy
-    (`copy`). A kept claim leaves the answer free: its holder is gone, and the
-    next claim takes it over and cleans its leftovers.
+    Read local records without taking the claim lock or contacting the Mac.
+    Mirror runs can replace a test copy and take over a kept claim for cleanup.
+    Guest runs use numbered claim files and skip the mirror checks.
     """
     from scripts.mac_test import eligibility
     from scripts.buildlog import repository
 
-    if isinstance(configuration, conf.ConfigRead):
-        capacity_settings = configuration
-    else:
-        path = eligibility.config_path() if isinstance(settings, eligibility.DefaultMacSettings) else settings
-        capacity_settings = conf.read(path)
-    if not capacity_settings.value("offload", conf.on_off):
-        return "off"
-    backoff = (eligibility.read_backoff(time.time()) if paths.target == "mac"
-               else eligibility.read_backoff(time.time(), paths.target))
-    if isinstance(backoff, eligibility.ActiveBackoff):
-        return "backoff"
+    guest = paths.platform == "macos" and mac_kind is MacClaimKind.GUEST
+    capacity_settings = configuration
+    if not guest:
+        if isinstance(capacity_settings, conf.UseConfiguredValue):
+            path = eligibility.config_path() if isinstance(settings, eligibility.DefaultMacSettings) else settings
+            capacity_settings = conf.read(path)
+        if not capacity_settings.value("offload", conf.on_off):
+            return "off"
+        backoff = (eligibility.read_backoff(time.time()) if paths.target == "mac"
+                   else eligibility.read_backoff(time.time(), paths.target))
+        if isinstance(backoff, eligibility.ActiveBackoff):
+            return "backoff"
     session = claim_state.submitting_session(session)
     scope = target_claim_scope(paths, str(repo_root))
     try:
@@ -2284,7 +2298,7 @@ def free_now(
         claims = read_claims(paths)
     except (OSError, StateReadError):
         return "state"
-    repository_name = repository.repo_name(str(repo_root))
+    repository_name = None if guest else repository.repo_name(str(repo_root))
     if repository_name is not None and isinstance(
             eligibility.read_mirror_busy(time.time(), repository_name, paths.target), eligibility.ActiveBackoff):
         return "busy"
@@ -2302,11 +2316,10 @@ def free_now(
             capacity = slot_capacity(paths, scope)
         except (OSError, ConfigError):
             return "state"
-        path = claim_path(paths, scope)
-        overlapping = tuple(claim for claim in claims if (claim.path == path or scopes_overlap(claim.scope, scope))
-                            and run_holds_work(claim.record) and (copy or not copy_gives_way(claim.record)))
-        held = (any(claim.path == path for claim in overlapping)
-                or isinstance(mac_claim_slot(overlapping, capacity, use_mirror=True), MacClaimSlotsBusy))
+        active = (tuple(claim for claim in claims if run_is_live(claim.record)) if guest else
+                  tuple(claim for claim in claims if run_holds_work(claim.record)
+                        and (copy or not copy_gives_way(claim.record))))
+        held = isinstance(mac_claim_slot(paths, scope, active, capacity, kind=mac_kind), MacClaimSlotsBusy)
     else:
         held = all(any(
             scopes_overlap(claim.scope, candidate) and run_holds_work(claim.record)
@@ -2314,6 +2327,8 @@ def free_now(
         ) for candidate in scopes)
     if held:
         return "busy"
+    if guest:
+        return "free"
     if isinstance(eligibility.read_failed_probe(paths.target), eligibility.FailedProbe):
         return "bad"
     if repository_name is not None and eligibility.linux_version_decline_path(paths.target, repository_name).exists():

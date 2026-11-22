@@ -119,6 +119,15 @@ def borrowed_git_dir(common: str) -> str | None:
 
 def local_origin_git_dir(common: str) -> str | None:
     """Return the shared Git folder when origin names a local directory."""
+    origin = origin_url(common)
+    if origin is None:
+        return None
+    url = origin.removeprefix("file://")
+    return git_common_dir(url) if os.path.isabs(url) and os.path.isdir(url) else None
+
+
+def origin_url(common: str) -> str | None:
+    """Read origin from the repository configuration without a Git command."""
     try:
         with open(os.path.join(common, "config"), encoding="utf-8") as handle:
             lines = handle.read().splitlines()
@@ -130,8 +139,5 @@ def local_origin_git_dir(common: str) -> str | None:
         if text.startswith("["):
             in_origin = text == '[remote "origin"]'
         elif in_origin and text.partition("=")[0].strip() == "url":
-            url = text.partition("=")[2].strip().removeprefix("file://")
-            if not os.path.isabs(url) or not os.path.isdir(url):
-                return None
-            return git_common_dir(url)
+            return text.partition("=")[2].strip()
     return None

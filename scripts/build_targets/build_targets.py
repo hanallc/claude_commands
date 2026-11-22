@@ -943,8 +943,7 @@ def cleanup_refused_claims(target: SshTarget, args: CliArguments, *, session: Su
         with mac_test.locked(paths.lock):
             if mac_test.read_run(claim.path) != claim.record or "remote_host" not in claim.record:
                 continue
-            with redirect_stdout(io.StringIO()):
-                attempt = mac_test.take_over_kept_claim(owner, claim, claim.record, session=session)
+            attempt = mac_test.take_over_kept_claim(owner, claim, claim.record, session=session)
             if not isinstance(attempt, mac_test.ClaimFinished) or attempt.status != 13:
                 continue
         try:

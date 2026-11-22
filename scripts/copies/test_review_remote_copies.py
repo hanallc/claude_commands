@@ -822,9 +822,9 @@ with (mock.patch.object(linux_runner, 'prepare_shell', return_value=linux_runner
             args.pid, args.worktree, args.what, args.target = os.getpid(), str(self.source), "reserved", "linux"
             paths = mac_test.state_paths("linux")
             scope = mac_test.RepositoryScope("repository", "key")
-            with mac_test.locked(paths.lock), redirect_stdout(io.StringIO()):
+            with mac_test.locked(paths.lock):
                 first = mac_test.claim_once(args, paths, scope, session=NoOwningSession(), reserve_wait=True)
-            self.assertEqual(first, mac_test.ClaimFinished(0))
+            self.assertEqual(first, mac_test.ClaimFinished(0, ("claimed", "slot: 1")))
             reservation, = mac_test.read_claims(paths)
             request = replace(request, admission=offload.MacClaimFromWait(
                 os.getpid(), claim_state.claim_identity(reservation.record), NoOwningSession()))
