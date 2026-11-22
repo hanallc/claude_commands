@@ -1056,7 +1056,7 @@ Ordered after the red main repair and the guard repair (builds). It does not mov
   3. basedpyright zero errors and warnings on changed files.
   4. A deletion change runs the full gate at the merge.
 
-### Phase 417 — a failed merge batch has one path: each row goes back to its requester  · status: todo
+### Phase 417 — a failed merge batch has one path: each row goes back to its requester  · status: done (main fe0ddb5f46)
 **Depends on:** Phase 355
 
 #### Work Order
