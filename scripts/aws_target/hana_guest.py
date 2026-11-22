@@ -23,6 +23,7 @@ if TYPE_CHECKING:
 CONTROL = Path('/var/lib/hana-aws')
 IMAGE_RUNTIME = Path('/var/lib/hana-runtime')
 DATA = Path('/var/lib/hana')
+RUNNER_HOME = DATA / 'runner'
 PERMIT = Path('/run/hana-aws/active-work-permit.json')
 BOOT_ID = Path('/proc/sys/kernel/random/boot_id')
 WORK_SLICE = 'hana-work.slice'

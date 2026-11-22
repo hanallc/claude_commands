@@ -114,6 +114,12 @@ def require_shared_state_write(script: Path, relative: str, *directories: Path) 
         raise SharedStateWriteRefused(result)
 
 
+def require_hold_write(*paths: Path) -> None:
+    require_shared_state_write(
+        Path(__file__).with_name("build_hold.py"), "build_hold/build_hold.py",
+        shared_state_defaults.holder_directory(), shared_state_defaults.release_directory(), *paths)
+
+
 def require_checkout(script: Path) -> None:
     home = user_home()
     installed_root = home / ".claude" / "scripts"

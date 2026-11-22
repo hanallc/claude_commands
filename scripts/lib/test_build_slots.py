@@ -322,6 +322,22 @@ class BuildSlotsTests(unittest.TestCase):
                 self.fail('The request exceeded its configured pool')
         self.assertFalse((self.slot_root / 'widget-slot3').exists())
 
+    def test_assigned_copy_uses_only_its_number(self) -> None:
+        def assigned():
+            return build_slots.take_copy(self.source, self.base, showrunner='builds', unit='queue',
+                work='assigned', purpose='test', selection=build_slots.ExactSlotRequest(2))
+
+        first = build_folders.copy_path('widget', 'queue', 1)
+        second = first.with_name('2')
+        with assigned() as copy:
+            self.assertEqual((copy.number, copy.path, copy.cargo_dir), (2, second, second / 'target'))
+            self.assertFalse(first.exists())
+            with self.assertRaisesRegex(BlockingIOError, 'assigned copy 2'), assigned():
+                self.fail('The assigned copy admitted another holder')
+        with assigned() as copy:
+            self.assertEqual(copy.path, second)
+        self.assertFalse(first.exists())
+
     def test_two_slots_share_one_git_config_migration(self) -> None:
         common = self.source / ".git"
         lock_path = common / "build-copy-config.lock"
