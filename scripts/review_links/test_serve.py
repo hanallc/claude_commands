@@ -55,7 +55,7 @@ from scripts.production import (
 from scripts.production.production_doc import read_new_production
 from scripts.production.staff_test_support import fixture_member
 from scripts.review_links import test_change_page
-from scripts.review_links import console_tune, new_item_dialog, page_frame, page_question, question_record, review_submissions
+from scripts.review_links import console_tune, new_item_dialog, page_frame, page_question, question_record, reply_tokens, review_submissions
 from scripts.review_links import accounts_page, change_browser, change_page, console, for_you, image_store, images, investigations_page, list_page, review_actions, review_later, review_page, review_items, serve, test_review_page
 from scripts.lib import atomic_file, conf, file_lock, process_start, scratch, urgency
 from scripts.feature_log import feature_log
@@ -137,6 +137,7 @@ class ReviewLinksServerTests(unittest.TestCase):
         temporary = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="review-server-test-")))
         self.root = temporary / "root"
         self.root.mkdir()
+        _ = self.enterContext(patch.object(reply_tokens, "platform", "linux"))
         _ = self.enterContext(patch.object(usage_store, "store_file", return_value=temporary / "usage.json"))
         staff_file = temporary / "staff.json"
         _ = staff_file.write_text('{"schema":2,"rows":[]}', encoding="utf-8")
@@ -146,6 +147,7 @@ class ReviewLinksServerTests(unittest.TestCase):
             "NEXT_STATE_DIR": str(temporary / "next"),
             "FOR_YOU_ACTIONS_DIR": str(temporary / "for-you-actions"),
             "REBUILD_NEEDS_DIR": str(temporary / "rebuild-needs"),
+            "XDG_STATE_HOME": str(temporary / "key-state"),
             "STAFF_FILE": str(staff_file)})))
         self.outside = temporary / "outside.txt"
         _ = self.outside.write_text("outside the served root", encoding="utf-8")
@@ -840,6 +842,19 @@ class ReviewLinksServerTests(unittest.TestCase):
 
         image = base64.b64decode(PNG)
 
+        def sent_message(delivery: change_page.MessageDelivery, status: change_page.DeliveryStatus) -> str:
+            assert isinstance(delivery.page, change_page.ReviewMessagePage)
+            reply = delivery.page.saved.get("scoped_reply")
+            assert reply is not None
+            prefix, separator, command = delivery.message.rpartition("\n")
+            self.assertEqual(command, change_page.reply_command(reply["key"]))
+            proof = review_submissions.current_reply_proof(reply["key"])
+            token = reply_tokens.derive(proof)
+            self.assertNotIn(token, delivery.message)
+            record = status.path(delivery.page, delivery.row).read_text(encoding="utf-8")
+            self.assertNotIn(token, record)
+            return prefix + separator + change_page.reply_command(reply["key"], token)
+
         def capture_body(request: new_item_dialog.NewItemRequest) -> tuple[str, bytes]:
             capture_key = self.server.page_captures.start(FIXTURE_CAPTURE)
             self.assertTrue(capture_key)
@@ -886,17 +901,17 @@ class ReviewLinksServerTests(unittest.TestCase):
                                   page="list", request_id="r2-" + uuid4().hex)
                 capture_key, body = capture_body(request)
                 deliveries: list[change_page.MessageDelivery] = []
-                deliver = change_page.deliver
+                deliver = change_page.deliver_with_outcome
 
                 def record_delivery(delivery: change_page.MessageDelivery | change_page.NoMessageDelivery,
-                                    status: change_page.DeliveryStatus) -> None:
+                                    status: change_page.DeliveryStatus) -> change_page.DeliveryOutcome:
                     if isinstance(delivery, change_page.MessageDelivery):
                         deliveries.append(delivery)
-                    deliver(delivery, status)
+                    return deliver(delivery, status)
 
                 with (patch.object(self.server, "review_cache", cache),
                       patch.object(self.server, "delivery_status", case.status),
-                      patch.object(change_page, "deliver", record_delivery),
+                      patch.object(change_page, "deliver_with_outcome", record_delivery),
                       patch.object(change_page, "send_message") as send,
                       patch.object(image_store, "register_file", wraps=image_store.register_file) as register):
                     with patch.object(the_list, "link", side_effect=OSError("The List link is unavailable.")):
@@ -929,7 +944,8 @@ class ReviewLinksServerTests(unittest.TestCase):
                         self.assertTrue(delivered_id)
                         delivery, = deliveries
                         send.assert_called_once_with(
-                            f"session:{later_owner.current_session}", change_page.SENDER, delivery.message,
+                            f"session:{later_owner.current_session}", change_page.SENDER,
+                            sent_message(delivery, case.status),
                             key=change_page.review_delivery_key(delivery.page.review_list, delivery.row, delivery.attempt),
                             recipient_key=later_owner.id)
                         self.assertEqual(register.call_count, 2)
@@ -1065,7 +1081,7 @@ class ReviewLinksServerTests(unittest.TestCase):
                     sent_to = later_owner if later_owner is not None else target
                     delivery, = deliveries
                     send.assert_called_once_with(
-                        f"session:{sent_to.current_session}", change_page.SENDER, delivery.message,
+                        f"session:{sent_to.current_session}", change_page.SENDER, sent_message(delivery, case.status),
                         key=change_page.review_delivery_key(delivery.page.review_list, delivery.row, delivery.attempt),
                         recipient_key=sent_to.id)
                     self.assertEqual(register.call_count, 2 if later_owner is not None or scenario == "config-reopen" else 1)
@@ -1087,7 +1103,7 @@ class ReviewLinksServerTests(unittest.TestCase):
         body = json.dumps({**asdict(request), "token": self.server.new_item_token}).encode()
         with (patch.object(self.server, "review_cache", cache),
               patch.object(self.server, "delivery_status", case.status),
-              patch.object(change_page, "deliver")):
+              patch.object(change_page, "deliver_with_outcome", return_value=change_page.DeliveryConfirmed())):
             recipients = cast(dict[str, object], json.loads(self.new_item_http(query="?page=review").body))
             self.assertEqual(recipients["page_owner"], child.id)
             self.assertIn({"id": child.id, "name": child.name, "proposal": True},
@@ -1135,7 +1151,7 @@ class ReviewLinksServerTests(unittest.TestCase):
 
         with (patch.object(self.server, "review_cache", cache),
               patch.object(self.server, "delivery_status", case.status),
-              patch.object(change_page, "deliver")):
+              patch.object(change_page, "deliver_with_outcome", return_value=change_page.DeliveryConfirmed())):
             saved = send(request)
             self.assertEqual(cache.get().records[saved["key"]].owner, child.id)
             _ = staff.record_path().write_text(replace(members, pending_retire=(child.id,)).encode())
@@ -1170,7 +1186,7 @@ class ReviewLinksServerTests(unittest.TestCase):
 
         with (patch.object(self.server, "review_cache", cache),
               patch.object(self.server, "delivery_status", case.status),
-              patch.object(change_page, "deliver")):
+              patch.object(change_page, "deliver_with_outcome", return_value=change_page.DeliveryConfirmed())):
             chosen = send(standard)
             owner_item = send(page)
             self.assertNotEqual(owner_item["key"], chosen["key"])
@@ -1209,7 +1225,7 @@ class ReviewLinksServerTests(unittest.TestCase):
 
         with (patch.object(self.server, "review_cache", cache),
               patch.object(self.server, "delivery_status", case.status),
-              patch.object(change_page, "deliver")):
+              patch.object(change_page, "deliver_with_outcome", return_value=change_page.DeliveryConfirmed())):
             saved = send(standard)
             retry = send(page)
             self.assertEqual(retry["key"], saved["key"])
@@ -1283,6 +1299,7 @@ class ReviewLinksServerTests(unittest.TestCase):
             self.assertNotIn("--machine", forwarded)
             output = StringIO()
             with (patch.dict(os.environ, sender_environment), patch.object(remote, "local_machine", return_value=mac),
+                  patch.object(reply_tokens, "path", return_value=case.root / "absent-reply-token.key"),
                   patch.object(record_store, "local_machine", return_value=mac), redirect_stdout(output)):
                 status = change_page.main(forwarded)
             return subprocess.CompletedProcess(ssh, status, output.getvalue(), "")
@@ -1323,6 +1340,7 @@ class ReviewLinksServerTests(unittest.TestCase):
         handler = cast(type[serve.ReviewLinksHandler], self.server.RequestHandlerClass)
         respond = handler.json_response
         lost: list[str] = []
+        real_delivery = change_page.deliver_with_outcome
 
         def lose_response(active: serve.ReviewLinksHandler, status: int, fields: Mapping[str, object]) -> None:
             if active.path == review_page.NEW_ITEM_PATH and status == 200 and not lost:
@@ -1334,16 +1352,93 @@ class ReviewLinksServerTests(unittest.TestCase):
         with (patch.object(self.server, "review_cache", cache), patch.object(self.server, "delivery_status", case.status),
               patch.object(review_submissions, "local_machine", return_value="mac"),
               patch.object(record_store, "local_machine", return_value="mac"),
-              patch.object(handler, "json_response", lose_response), patch.object(change_page, "send_to_staff")):
+              patch.object(handler, "json_response", lose_response),
+              patch.object(change_page, "deliver_with_outcome", return_value=change_page.DeliveryConfirmed()) as deliver):
+            state = self.root / "state"
+            with patch.dict(os.environ, {"XDG_STATE_HOME": str(state)}):
+                overlap = self.new_item_http(body, finished=True)
+                self.assertEqual((overlap.status, json.loads(overlap.body)),
+                                 (503, {"error": "The reply key must be outside the served Review Links root. Try Send again."}))
+                self.assertFalse(state.exists())
             with self.assertRaises(RemoteDisconnected):
                 _ = self.new_item_http(body, finished=True)
+            deliver.assert_called_once()
+            first = cast(change_page.MessageDelivery, deliver.call_args.args[0])
+            deliver.reset_mock()
             _ = staff.record_path().write_text(replace(members, pending_retire=(owner.id,)).encode())
-            response = self.new_item_http(body, finished=True)
+            key_file = reply_tokens.path()
+            self.assertEqual(key_file, Path(os.environ["XDG_STATE_HOME"]) / "review-links" / "reply-token.key")
+            self.assertFalse(key_file.is_relative_to(self.root))
+            self.assertFalse(key_file.is_relative_to(case.root))
+            self.assertEqual(key_file.parent.stat().st_mode & 0o777, 0o700)
+            _ = (self.root / key_file.name).write_bytes(b"fixture key")
+            self.assertEqual(self.request("/" + key_file.name).status, 404)
+            original = key_file.read_bytes()
+            token = change_page.outbound_review_message(first).token
+            key_file.unlink()
+            failure = {"error": "The local reply key is missing. Try Send again."}
+            unavailable = self.new_item_http(body, finished=True)
+            self.assertEqual((unavailable.status, json.loads(unavailable.body)), (503, failure))
+            for invalid, reason in ((b"short", "The local reply key must contain 32 bytes."),
+                                    (bytes(byte ^ 1 for byte in original), "The local reply key does not match the note.")):
+                _ = key_file.write_bytes(invalid)
+                key_file.chmod(0o600)
+                unavailable = self.new_item_http(body, finished=True)
+                self.assertEqual((unavailable.status, json.loads(unavailable.body)),
+                                 (503, {"error": f"{reason} Try Send again."}))
+                self.assertEqual(key_file.read_bytes(), invalid)
+            deliver.assert_not_called()
+            _ = key_file.write_bytes(original)
+
+            deliver.side_effect = real_delivery
+            with (patch.object(change_page, "send_to_staff",
+                               side_effect=change_page.FinalSendFailure("Transport refused.")) as send,
+                  patch.object(case.status, "record_result_locked", side_effect=OSError("Cannot save delivery result."))):
+                refused = self.new_item_http(body, finished=True)
+                self.assertEqual((refused.status, json.loads(refused.body)),
+                                 (503, {"error": "Transport refused. Try Send again."}))
+                self.assertGreater(send.call_count, 0)
+            self.assertIsInstance(case.status.failed_delivery(first.page, first.row), change_page.NoFailedDelivery)
+
+            def lose_key_before_delivery(pending: change_page.MessageDelivery,
+                                         status: change_page.DeliveryStatus) -> change_page.DeliveryOutcome:
+                key_file.unlink()
+                return real_delivery(pending, status)
+
+            deliver.side_effect = lose_key_before_delivery
+            with patch.object(change_page, "send_to_staff") as send:
+                late_failure = self.new_item_http(body, finished=True)
+                self.assertEqual((late_failure.status, json.loads(late_failure.body)), (503, failure))
+                send.assert_not_called()
+                recorded = case.status.failed_delivery(first.page, first.row)
+                assert isinstance(recorded, change_page.FailedDelivery)
+                self.assertEqual((recorded.attempt, recorded.last_error),
+                                 (first.attempt, "The local reply key is missing."))
+                _ = key_file.write_bytes(original)
+                key_file.chmod(0o600)
+                deliver.reset_mock(side_effect=True)
+                deliver.side_effect = real_delivery
+                response = self.new_item_http(body, finished=True)
+                send.assert_called_once()
+            self.assertIsInstance(case.status.failed_delivery(first.page, first.row), change_page.NoFailedDelivery)
             self.assertEqual(response.status, 200, response.body)
+            deliver.assert_called_once()
+            retry = cast(change_page.MessageDelivery, deliver.call_args.args[0])
+            self.assertEqual(retry.attempt, first.attempt)
             saved = cast(dict[str, str], json.loads(response.body))
             self.assertEqual(lost, [saved["key"]])
             record, = update_registration.question_records_for_owner(owner.id, strict=True)
             self.assertEqual(record.item.get("review_id"), saved["id"])
+            key_file.unlink()
+            assert isinstance(first.page, change_page.ReviewMessagePage)
+            command = first.page.saved.get("scoped_reply")
+            assert command is not None
+            self.assertTrue(review_submissions.answer(command["key"], "The owner replied.", token))
+            after_reply = self.new_item_http(body, finished=True)
+            self.assertEqual(after_reply.status, 200, after_reply.body)
+            self.assertEqual(json.loads(after_reply.body)["key"], saved["key"])
+            self.assertIsInstance(cast(object, deliver.call_args.args[0]), change_page.NoMessageDelivery)
+            self.assertFalse(key_file.exists())
 
     def test_f027_mac_question_send_uses_authoritative_retirement(self) -> None:
         case = self.review_fixture()
@@ -1407,6 +1502,8 @@ class ReviewLinksServerTests(unittest.TestCase):
             self.assertEqual(item.state, review_items.ReviewState.WAITING)
             original = review_items.submission_origin(item)
             assert isinstance(original, new_item_dialog.ReviewSubmission)
+            original_token = reply_tokens.derive(original.reply_proof)
+            self.assertTrue(original_token)
             words = "Can you check the second case?"
             status, body = self.post(review_page.PAGE_PATH, case.card_body(snapshot, item.key, "question", words))
             self.assertEqual(status, 200, body)
@@ -1417,9 +1514,13 @@ class ReviewLinksServerTests(unittest.TestCase):
             self.assertIn("question: " + words, [event.words for event in updated.log])
             details = review_items.submission_origin(updated)
             assert isinstance(details, new_item_dialog.ReviewSubmission)
-            self.assertNotEqual(original.reply_token, details.reply_token)
-            messages = [cast(change_page.MessageDelivery, entry.args[0]).message for entry in deliver.call_args_list]
-            self.assertTrue(any("--question " + details.reply_token + " --machine mac" in text for text in messages))
+            token = reply_tokens.derive(details.reply_proof)
+            self.assertTrue(token)
+            self.assertNotEqual(original_token, token)
+            self.assertNotEqual(original.reply_token_nonce, details.reply_token_nonce)
+            delivery = cast(change_page.MessageDelivery, deliver.call_args.args[0])
+            self.assertNotIn(token, delivery.message)
+            self.assertIn("--question " + token + " --machine mac", change_page.outbound_review_message(delivery).text)
 
     def test_page_capture_rejects_non_page_addresses_before_launch(self) -> None:
         self.server.verified_tailscale_address = "127.0.0.1"
@@ -2378,7 +2479,7 @@ class ReviewLinksServerTests(unittest.TestCase):
         with patch.object(change_page, "send_to_staff", side_effect=OSError("Delivery interrupted.")) as send:
             failed = self.new_item_http(self.new_item_body(request), finished=True)
         self.assertEqual(failed.status, 503)
-        self.assertEqual(json.loads(failed.body)["error"], "Could not deliver the item. Try Send again.")
+        self.assertEqual(json.loads(failed.body)["error"], "Delivery interrupted. Try Send again.")
         first, = investigation.records(request.recipient_id)
         with patch.object(change_page, "send_to_staff") as retry:
             confirmed = self.new_item_http(self.new_item_body(request), finished=True)
@@ -2386,6 +2487,22 @@ class ReviewLinksServerTests(unittest.TestCase):
         self.assertEqual(json.loads(confirmed.body)["id"], first.id)
         self.assertEqual(investigation.records(request.recipient_id), [first])
         retry.assert_called_once_with(*send.call_args.args, **send.call_args.kwargs)
+
+    def test_new_item_retry_recovers_a_confirmed_delivery_without_sending_again(self) -> None:
+        _folder, _cache, request = self.page_bug_fixture()
+        request = replace(request, request_id="r6-" + uuid4().hex)
+        body = self.new_item_body(request)
+        with patch.object(change_page, "send_to_staff", return_value=None) as send:
+            with patch.object(self.server.delivery_status, "finish_intent_locked",
+                              side_effect=OSError("Delivery cleanup interrupted.")):
+                interrupted = self.new_item_http(body, finished=True)
+            self.assertEqual(interrupted.status, 503)
+            first, = investigation.records(request.recipient_id)
+            confirmed = self.new_item_http(body, finished=True)
+        self.assertEqual(confirmed.status, 200, confirmed.body)
+        self.assertEqual(json.loads(confirmed.body)["id"], first.id)
+        self.assertEqual(investigation.records(request.recipient_id), [first])
+        send.assert_called_once()
 
     def start_page_capture(self, place: str = "/console/review.html?show=all",
                            width: int = 876, height: int = 640) -> str:
@@ -3038,6 +3155,10 @@ class ReviewLinksServerTests(unittest.TestCase):
                             first = workers.submit(self.new_item_http, body)
                             second = workers.submit(self.new_item_http, body)
                             replies = [first.result(TEST_HANG_GUARD_SECS), second.result(TEST_HANG_GUARD_SECS)]
+                        for index, reply in enumerate(replies):
+                            if reply.status == 503:
+                                self.assertEqual(json.loads(reply.body), {"error": "This item is still sending. Try Send again."})
+                                replies[index] = self.new_item_http(body)
                     else:
                         replies = [self.new_item_http(body), self.new_item_http(body)]
                     for reply in replies:

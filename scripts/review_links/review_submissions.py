@@ -28,11 +28,11 @@ from scripts.lib.user_zone import user_zone
 from scripts.production import investigation, proposal_issue, record_store, staff, update_registration
 from scripts.production.issues import Issue
 from scripts.production.production_doc import WRAPPED, Refusal
-from scripts.review_links import image_store, new_item_dialog, page_frame, review_events, review_link
+from scripts.review_links import image_store, new_item_dialog, page_frame, reply_tokens, review_events, review_link
 from scripts.review_links.new_item_dialog import (
     KEY_PREFIX as KEY_PREFIX, NATIVE_ID_PREFIX, check_recipient_id,
     ScopedSubmissionKey, read_submission_key, require_request_binding, submission_key as submission_key,
-    IMAGE_FORMATS, MAX_IMAGES, MAX_IMAGE_BYTES, MAX_TOTAL_IMAGE_BYTES, ImageReference, max_base64_size, new_reply_token,
+    IMAGE_FORMATS, MAX_IMAGES, MAX_IMAGE_BYTES, MAX_TOTAL_IMAGE_BYTES, ImageReference, max_base64_size,
     read_kind, read_request_id, read_words, read_submission,
     ByRequestId, BuildCell as BuildCell, BuildStepEvidence as BuildStepEvidence, Evidence as Evidence,
     MemoryReading as MemoryReading,
@@ -206,8 +206,22 @@ class SavedSubmission(NativeSubmissionDestination):
         return details
 
     @property
+    def awaiting_reply(self) -> bool:
+        return _awaiting_reply(self.record)
+
+    @property
     def reply_token(self) -> str:
-        return self.details.reply_token
+        return self.details.reply_token if self.awaiting_reply else ""
+
+
+def _awaiting_reply(record: NativeSubmittedRecord) -> bool:
+    match record:
+        case update_registration.QuestionRecord():
+            return update_registration.pending_review_reply(record)
+        case Issue():
+            return proposal_issue.pending_review_reply(record)
+        case investigation.Investigation():
+            return record.state == investigation.InvestigationState.OPEN
 
 
 @dataclass(frozen=True)
@@ -1657,8 +1671,10 @@ def _submit(request: NewItemRequest, *, members: staff.StaffSnapshot | None,
                 raise SubmissionError("Select a recipient with a native proposal folder.")
             pending_file = folder / "pending.json"
             images = tuple(upload.reference for upload in uploads)
-            details = ReviewSubmission(request_id, payload_hash, evidence, images, new_reply_token(),
-                                       page=request.page, page_state=request.page_state, capture_intent=capture_intent)
+            proof = reply_tokens.mint()
+            details = ReviewSubmission(request_id, payload_hash, evidence, images, proof.sha256,
+                                       page=request.page, page_state=request.page_state, capture_intent=capture_intent,
+                                       reply_token_nonce=proof.nonce)
             title = next(line.strip() for line in words.splitlines() if line.strip())[:120].rstrip()
             destinations: list[NativeSubmissionDestination] = []
             staging_started = False
@@ -1780,6 +1796,48 @@ def read_attached_page_screenshot(target: ScopedSubmissionKey, request: new_item
     return new_item_dialog.PageScreenshot(image, new_item_dialog.PageViewport(request.width, request.height, request.dark))
 
 
+def current_reply_proof(key: str) -> reply_tokens.ReplyTokenProof:
+    """Read the proof from the current native note for a saved delivery."""
+    scoped = read_submission_key(key)
+    address = _request_address(scoped.kind, scoped.recipient_id, scoped.request_id)
+    located = locate_native_submission(address, _request_hint(address))
+    if not isinstance(located, LocatedSubmission) or located.destination.id != scoped.item_id:
+        raise reply_tokens.UnavailableReplyToken("Cannot find the note for this reply token.")
+    return located.details.reply_proof
+
+
+def renew_legacy_reply(located: LocatedSubmission) -> SavedSubmission:
+    """Give a waiting legacy note a new proof while the caller holds the recipient locks."""
+    saved = located.saved()
+    if not saved.awaiting_reply or saved.details.reply_token_nonce:
+        return saved
+    target = located.destination
+    lock = (update_registration.wrap_question_locks(target.owner) if target.kind == SubmissionKind.QUESTION
+            else proposal_issue.issue_lock(target.path) if target.kind == SubmissionKind.PROPOSAL
+            else nullcontext())
+    with lock:
+        current = _read_native_submission(target.address, target.path, target.owner)
+        if not isinstance(current, LocatedSubmission) or current.destination.id != target.id:
+            raise reply_tokens.UnavailableReplyToken("Cannot find the note for this reply token.")
+        record = current.record
+        if _awaiting_reply(record) and not current.details.reply_token_nonce:
+            proof = reply_tokens.mint()
+            match record:
+                case update_registration.QuestionRecord():
+                    fields = record.item.get("review_submission", {})
+                    _ = update_registration.write_review_submission(
+                        record, new_item_dialog.renewed_submission_fields(fields, proof))
+                case Issue():
+                    proposal_issue.renew_reply_proof(record, proof)
+                case investigation.Investigation():
+                    investigation.renew_reply_proof(target.path, record, proof)
+            updated = _read_native_submission(target.address, target.path, target.owner)
+            if not isinstance(updated, LocatedSubmission) or updated.destination.id != target.id:
+                raise reply_tokens.UnavailableReplyToken("Cannot read the renewed reply proof.")
+            record = updated.record
+        return replace(saved, path=target.path, owner=target.owner, record=record)
+
+
 def _with_screenshot(details: ReviewSubmission, owner: staff.StaffId,
                      image: bytes | new_item_dialog.PageScreenshot) -> ReviewSubmission:
     """Store the screenshot and keep the page data for a Bug report."""
@@ -1812,13 +1870,9 @@ def _with_screenshot(details: ReviewSubmission, owner: staff.StaffId,
 
 
 def _write_investigation_submission(located: LocatedSubmission, details: ReviewSubmission) -> None:
-    owner, identity, path = located.destination.owner, located.destination.id, located.destination.path
-    store = investigation.Investigations(owner, "investigations", "I", "investigation",
-                                         investigation.InvestigationError)
-    fields, body = store.read(identity, path=path)
-    fields["review_submission"] = json.dumps(new_item_dialog.stored_submission(details))
-    with investigation.investigation_numbers() as numbers, numbers.write(path, identity, owner, folder=store.folder()):
-        store.write(identity, fields, body, path=path)
+    record = located.record
+    assert isinstance(record, investigation.Investigation)
+    investigation.write_review_submission(located.destination.path, record, details)
 
 
 class ScreenshotAttachment(Enum):
@@ -1958,3 +2012,47 @@ def answer(key: str, words: str, reply_token: str, *, members: staff.StaffSnapsh
                     return investigation.answer_submission(path, scoped, words, reply_token, owner=owner)
     except (investigation.InvestigationError, proposal_issue.Refusal, update_registration.RegistrationFailure) as error:
         raise SubmissionError(str(error)) from error
+
+
+def scrub_reply_tokens(members: staff.StaffSnapshot) -> int:
+    """Convert legacy reply tokens in the native stores and archives."""
+    kinds = (record_store.RecordKind.QUESTION, record_store.RecordKind.PROPOSAL,
+             record_store.RecordKind.INVESTIGATION)
+    folders = tuple(folder for kind in kinds for folder in record_store.staff_store_folders(kind, members=members))
+    changed = 0
+    keys = frozenset(("record_type", "registration", "review_submission", "id", "owner"))
+    for path in record_store.stored_paths(folders, strict=True):
+        fields = Issue(path, record_store.read_header(path, strict=True, keys=keys))
+        if fields.value("record_type") == "question":
+            if '"reply_token"' not in fields.value("registration"):
+                continue
+            question = update_registration.read_review_question(path)
+            saved = update_registration.scrub_reply_token(path, question.owner)
+        elif not re.search(r'\breply_token\\?"\s*:', fields.value("review_submission")):
+            continue
+        elif fields.value("record_type") == "proposal":
+            saved = proposal_issue.scrub_reply_token(path)
+        elif fields.value("id") and fields.value("owner"):
+            saved = investigation.scrub_reply_token(path, staff.StaffId(fields.value("owner")), fields.value("id"))
+        else:
+            continue
+        if saved:
+            changed += 1
+            print(f"Rewrote {path}")
+    return changed
+
+
+def main(argv: list[str]) -> int:
+    if argv != ["scrub-reply-tokens"]:
+        print("usage: python -m scripts.review_links.review_submissions scrub-reply-tokens", file=sys.stderr)
+        return 2
+    try:
+        _ = scrub_reply_tokens(staff.snapshot())
+    except (OSError, ValueError, update_registration.RegistrationFailure) as error:
+        print(f"Reply token scrub: {error}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

@@ -27,7 +27,7 @@ from scripts.production import change_review, change_routing, proposal_issue, st
 from scripts.production.record_store import FileStamp, state_root
 from scripts.lib import urgency
 from scripts.review_links import change_browser, change_page, console, for_you, page_frame, record_table, review_items, review_link
-from scripts.review_links import new_item_dialog, review_submissions
+from scripts.review_links import new_item_dialog, reply_tokens, review_submissions
 from scripts.review_links import question_record, review_actions, review_events, staff_names
 from scripts.review_links.review_items import ReviewItem, ReviewSourceStamps, ReviewState, ReviewType, guard_source
 from scripts.review_links.review_items import source_stamp as source_stamp
@@ -1197,7 +1197,8 @@ def repeats_response_followup(item: ReviewItem, outcome: str, words: str, status
     path = source.record.path
     page = status.metadata_page(change_page.ReviewPage(path, path.parent, (path.stem,), ''))
     return (isinstance(page, change_page.UserQuestionPage) and page.saved.get('kind') == 'question'
-            and page.saved.get('question_id') == reply.reply_token and page.saved.get('question_text') == pending['text'])
+            and reply_tokens.matches_reference(reply.reply_token_sha256, page.saved.get('question_id', ''))
+            and page.saved.get('question_text') == pending['text'])
 
 
 def submit_response(item: ReviewItem, outcome: str, words: str, status: change_page.DeliveryStatus,
@@ -1210,7 +1211,7 @@ def submit_response(item: ReviewItem, outcome: str, words: str, status: change_p
     if outcome == 'read':
         with update_registration.outstanding_lock(update_registration.outstanding_path(scope)):
             _ = verify_revision()
-            update_registration.review_sent_question(source.record, scope, 'read', '', '')
+            update_registration.review_sent_question(source.record, scope, 'read', '')
         return change_page.NoMessageDelivery(), 'got it'
     words = new_item_dialog.read_words(words, 'Your words')
     delivery, _ = review_actions.sent_question_action(item, source.record, scope, 'question', words, status,
