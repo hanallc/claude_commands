@@ -1303,10 +1303,12 @@ Status derives `draining (N runs left)` or `held` from matching live keep entrie
 Status and the enforcer report list only live keep entries.
 A reused PID does not count when its start time differs.
 Status names each queued or running local CI placement and its state start time from existing admission records.
-Legacy CI cargo requests use the same hold and lineage check before memory admission.
-CI requests outside the keep list remain queued until release.
-A held CI request gets a `NatedevHeld` wait and waits through the hold; the release admits it.
-Only an unreadable hold state gives `ReadingUnavailable`, which the client refuses after its retry time.
+Each admission pass applies the same hold and lineage check to every local waiter, CI requests included.
+The check uses the waiter's process lineage and its own session, so the holder's own steps and kept runs still start.
+A waiter that joined before the hold is held too; the check runs at each pass, not only when the waiter joins.
+A held waiter keeps its place, gets a `NatedevHeld` wait and starts at the release in its order.
+Only an unreadable hold state gives a legacy CI request `ReadingUnavailable`, which the client refuses after its retry time.
+Other local waiters are not held while the hold state is unreadable; the enforcer stays their guard.
 The CI client that nixos pins (bbc8803f4) does not know `NatedevHeld`.
 `snapshot_codec` writes it as `BehindHead` with a `_natedev_hold` field, and current readers restore it.
 GPU slot waits use the same shape with a `_gpu_slot` field.

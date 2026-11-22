@@ -1447,6 +1447,13 @@ class WaitingAdmission:
     continuation_claim: records.ContinuationSlot | NoContinuationClaim = NoContinuationClaim()
 
 
+def without_owners(inputs: records.QueueInputs, owners: set[str]) -> records.QueueInputs:
+    """Remove held waiters from the order that the admission pass may start."""
+    if not owners:
+        return inputs
+    return replace(inputs, ordered=[(path, row) for path, row in inputs.ordered if records.waiter_owner(row) not in owners])
+
+
 @dataclass(frozen=True)
 class NoPass:
     pass
@@ -1990,10 +1997,10 @@ class AdmissionServer:
                     or isinstance(watch, ScopeWatch) and watch.episode not in self.reservations):
                 self._unwatch(descriptor)
 
-    def _ci_hold_reasons(self) -> dict[str, records.NatedevHeld | records.ReadingUnavailable]:
-        """Apply the existing hold policy to legacy CI admission requests."""
+    def _local_hold_reasons(self) -> dict[str, records.NatedevHeld | records.ReadingUnavailable]:
+        """Hold each local waiter that a natedev hold applies to, at each pass."""
         waiting = {episode: item for episode, item in self.waiters.items()
-                   if isinstance(item.request, ServiceEstimatedAdmission)}
+                   if isinstance(item.request, wire.AdmitRequest) and isinstance(item.request.place, wire.LocalPlace)}
         if not waiting:
             return {}
         from scripts.build_hold import build_hold
@@ -2003,12 +2010,18 @@ class AdmissionServer:
             directory = build_hold.holder_directory()
             holds = build_hold.natedev_holds(directory)
         except OSError as error:
-            return {episode: records.ReadingUnavailable(f"natedev hold state is unreadable: {error}") for episode in waiting}
+            # The enforcer stays the guard for other local steps while the hold state is unreadable.
+            return {episode: records.ReadingUnavailable(f"natedev hold state is unreadable: {error}")
+                    for episode, item in waiting.items() if isinstance(item.request, ServiceEstimatedAdmission)}
+        if not holds.in_force:
+            return {}
         reasons: dict[str, records.NatedevHeld | records.ReadingUnavailable] = {}
         for episode, item in waiting.items():
             owner = item.request.owner
+            session_id = item.row.get("session_id", "")
+            session = OwningSession(session_id) if session_id else NoOwningSession()
             lineage = build_targets.read_caller_lineage(self.proc.path, owner.pid, owner.start_time)
-            blocking = build_targets.hold_waited_on(holds, NoOwningSession(), directory, lineage)
+            blocking = build_targets.hold_waited_on(holds, session, directory, lineage)
             if isinstance(blocking, build_hold.Holder):
                 reasons[episode] = records.NatedevHeld(blocking.name, blocking.purpose)
         return reasons
@@ -2791,14 +2804,14 @@ class AdmissionServer:
         inputs = replace(captured.local, verify_run_owners=self._verify_run_owners())
         if self.host == "natedev" and (floor := config.free_floor_gib) is not None:
             inputs = replace(inputs, build_space=self.readings.build_space(floor))
-        ci_holds = self._ci_hold_reasons()
-        held_owners = {records.waiter_owner(self.waiters[episode].row) for episode in ci_holds}
-        if held_owners:
-            inputs = replace(inputs, ordered=[(path, row) for path, row in inputs.ordered
-                                             if records.waiter_owner(row) not in held_owners])
+        local_holds = self._local_hold_reasons()
+        held_owners = {records.waiter_owner(self.waiters[episode].row) for episode in local_holds}
+        inputs = without_owners(inputs, held_owners)
         verify_slots = self._verify_slot_requests(inputs, policy.repository_runs)
         inputs = replace(inputs, verify_slot_requests={owner: slot.run_key for owner, slot in verify_slots.items()})
-        inputs = self._placement_pass(inputs, captured.queue_order, policy, remote_start_hold_seconds)
+        # The placement pass rebuilds the local order from the queue order, so remove held waiters again.
+        inputs = without_owners(self._placement_pass(inputs, captured.queue_order, policy, remote_start_hold_seconds),
+                                held_owners)
         result = gate.admission_pass(inputs, inputs.now, policy)
         for reservation in result.policy.returned_claims:
             del self.slots[reservation]
@@ -2834,7 +2847,7 @@ class AdmissionServer:
                         cargo_folder=cargo_folder, verify_slots=verify_slots)
         self.persist()
         visible_order = self._visible_queue_order(self._full_queue_order(captured.ranked_waiters))
-        self._publish_replies(visible_order, ci_holds=ci_holds)
+        self._publish_replies(visible_order, local_holds=local_holds)
         assert isinstance(self.published, PublishedReplies)
         waiting_steps = self.published.view.reading.view.waiting
         positions = self.published.wait_positions
@@ -2847,8 +2860,8 @@ class AdmissionServer:
             if (entry := decisions.get(owner)) is not None:
                 reason, decision, holder = entry.reason, entry.decision, entry.holder
                 label = head_label
-            elif (ci_reason := ci_holds.get(episode)) is not None:
-                reason, holder = ci_reason, records.NoHolder()
+            elif (held_reason := local_holds.get(episode)) is not None:
+                reason, holder = held_reason, records.NoHolder()
                 decision = records.AdmissionDecision("hold", waiting.row["need"], 0, 0, 0, free_passes=False)
                 label = ""
             else:
@@ -3079,7 +3092,7 @@ class AdmissionServer:
             explanation=replace(reading.explanation, running=(*reading.explanation.running, *explained)))
 
     def _publish_replies(self, ordered: list[tuple[Path, records.RankedWaiter]], *,
-                         ci_holds: Mapping[str, records.WaitReason] | None = None) -> None:
+                         local_holds: Mapping[str, records.WaitReason] | None = None) -> None:
         if (not isinstance(self.configuration, gate.UsableAdmissionConfiguration)
                 or not isinstance(self.last_inputs, records.QueueInputs)
                 or not isinstance(self.last_policy, records.AdmissionPolicy)
@@ -3090,8 +3103,8 @@ class AdmissionServer:
                           diagnostics=self.last_diagnostics)
         local = {path: replace(step, verify=row.get("verify", step.verify))
                  for (path, row), step in zip(reading.ordered, reading.view.waiting, strict=True)}
-        holds = self._ci_hold_reasons() if ci_holds is None else ci_holds
-        ci_reasons = {records.waiter_owner(self.waiters[episode].row): reason
+        holds = self._local_hold_reasons() if local_holds is None else local_holds
+        held_reasons = {records.waiter_owner(self.waiters[episode].row): reason
                       for episode, reason in holds.items() if episode in self.waiters}
         routed = {place.move_id: request for request in self.placement_requests.values()
                   if (place := self.places.get(_place_key(request.owner, request.since))) is not None
@@ -3108,7 +3121,7 @@ class AdmissionServer:
             candidates = self.placement_eligibility.get(request.episode, ()) if request is not None else ()
             targets = tuple(dict.fromkeys(item.destination.target for item in candidates
                 if item.destination.provider != "local" and not isinstance(item.eligibility, placement.FixedExclusion)))
-            reason = ci_reasons.get(owner, records.ReadyForAdmission())
+            reason = held_reasons.get(owner, records.ReadyForAdmission())
             if request is not None and self._local_placement_eligibility(request) == placement.TemporaryExclusion("blocked"):
                 holder = self.local_hold_holders.get(request.episode)
                 reason = records.NatedevHeld(holder.unit if isinstance(holder, placement.ResourceHolderUnit) else "", "")
