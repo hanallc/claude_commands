@@ -4077,15 +4077,16 @@ def _forward_relay_socket(listener: socket.socket, peer: socket.socket, stop: so
 @contextmanager
 def _relay_proxy_directory() -> Generator[str]:
     """Remove the proxy directory when the sender closes its pipe or dies."""
+    root = conf.read_or_repository("build_folders").text("roots.system")
     program = """
 import sys
 from tempfile import TemporaryDirectory
 
-with TemporaryDirectory(prefix="claude-send-", dir="/tmp") as directory:
+with TemporaryDirectory(prefix="claude-send-", dir=sys.argv[1]) as directory:
     print(directory, flush=True)
     sys.stdin.buffer.read()
 """
-    with subprocess.Popen([sys.executable, "-I", "-c", program], stdin=subprocess.PIPE,
+    with subprocess.Popen([sys.executable, "-I", "-c", program, root], stdin=subprocess.PIPE,
                           stdout=subprocess.PIPE, text=True, start_new_session=True) as cleanup:
         assert cleanup.stdout is not None
         directory = cast(TextIO, cleanup.stdout).readline().strip()

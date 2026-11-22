@@ -146,6 +146,18 @@ def write_send_config(path: Path, values: str) -> int:
     write_configs(path.parent)
     return write_config_fixture(path, values)
 
+
+@contextmanager
+def relay_socket_directory() -> Generator[str]:
+    """Keep both ends of the relay in a short private folder."""
+    with tempfile.TemporaryDirectory(prefix="r-") as directory:
+        config = Path(directory) / "config"
+        _ = write_send_config(config / "send.conf", "")
+        _ = write_config_fixture(config / "build_folders.conf", f"roots.system={directory}\n")
+        with mock.patch.dict(os.environ, {"CONF_DIR": str(config)}):
+            yield directory
+
+
 def fixture_bound_message(address: str, sender: str, summary: str, text: str, shown_sender: str = "") -> send.Message:
     attempt = send.ClaudeDeliveryAttempt(send.RelayProcessRecipient(send.machine(), os.getpid(), "fixture-start"), os.getpid(),
                                          "fixture-start", address.removeprefix("uds:"))
@@ -183,7 +195,7 @@ def relay_mismatches(state: Path) -> list[dict[str, object]]:
 
 class RelayAccountTests(unittest.TestCase):
     def test_killing_the_sender_removes_the_private_relay_socket(self) -> None:
-        with short_socket_directory() as directory, socket.socket(socket.AF_UNIX) as listener:
+        with relay_socket_directory() as directory, socket.socket(socket.AF_UNIX) as listener:
             path = str(Path(directory) / "recipient.sock")
             listener.bind(path)
             listener.listen()
@@ -194,7 +206,8 @@ import os, re, signal, sys
 from scripts.message import review_hold, send, send_later
 
 def killed(_command, prompt, _timeout, _environment, _cwd):
-    print(re.search(r'uds:(/tmp/claude-send-[^"]+/delivery.sock)', prompt)[1], flush=True)
+    root = re.escape(sys.argv[4])
+    print(re.search(rf'uds:({root}/claude-send-[^"]+/delivery.sock)', prompt)[1], flush=True)
     os.kill(os.getpid(), signal.SIGKILL)
 
 send.run = killed
@@ -203,7 +216,7 @@ message = send.Message("uds:" + sys.argv[1], "fixture", "Preview", "body", None)
 attempt = send.ClaudeDeliveryAttempt(send.RelayProcessRecipient(send.machine(), int(sys.argv[2]), sys.argv[3]), int(sys.argv[2]), sys.argv[3], sys.argv[1])
 send._bound_relay(message, 2, [], {}, attempt)
 """
-            result = subprocess.run([sys.executable, "-B", "-c", program, path, str(os.getpid()), started],
+            result = subprocess.run([sys.executable, "-B", "-c", program, path, str(os.getpid()), started, directory],
                                     capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS,
                                     cwd=Path(send.__file__).resolve().parents[2])
             self.assertEqual(result.returncode, -signal.SIGKILL, result.stderr)
@@ -234,7 +247,7 @@ send._bound_relay(message, 2, [], {}, attempt)
     def test_delivery_refuses_an_unbound_socket_and_sends_over_the_checked_connection(self) -> None:
         from scripts.herdr import herdr
 
-        with (short_socket_directory() as directory, socket.socket(socket.AF_UNIX) as listener,
+        with (relay_socket_directory() as directory, socket.socket(socket.AF_UNIX) as listener,
               mock.patch.object(send, "STATE", Path(directory) / "message"),
               mock.patch.object(sessions, "sessions_dir", return_value=Path(directory)),
               mock.patch.object(send, "claude_binary", return_value="/fixture/claude"),
@@ -429,7 +442,7 @@ send._bound_relay(message, 2, [], {}, attempt)
                 self.assertEqual(result.outcome, "sent", result.detail)
 
     def test_early_response_cannot_confirm_a_partial_request(self) -> None:
-        with (short_socket_directory() as directory, socket.socket(socket.AF_UNIX) as listener,
+        with (relay_socket_directory() as directory, socket.socket(socket.AF_UNIX) as listener,
               socket.socket(socket.AF_UNIX) as client,
               mock.patch.object(send, "STATE", Path(directory) / "message"),
               mock.patch.object(send, "claude_binary", return_value="/fixture/claude"),
@@ -470,7 +483,7 @@ send._bound_relay(message, 2, [], {}, attempt)
         self.assertEqual(result, send.Result("failed", "SendMessage has no matching completed proxy forward"))
 
     def test_proxy_accepts_only_the_approved_claude_message_body(self) -> None:
-        with (short_socket_directory() as directory, socket.socket(socket.AF_UNIX) as listener,
+        with (relay_socket_directory() as directory, socket.socket(socket.AF_UNIX) as listener,
               mock.patch.object(send, "STATE", Path(directory) / "message"),
               mock.patch.object(send, "claude_binary", return_value="/fixture/claude"),
               mock.patch.object(accounts, "account_for_unscoped_launch", return_value=accounts.LegacyHomeLaunch()),
@@ -555,7 +568,7 @@ send._bound_relay(message, 2, [], {}, attempt)
                         self.assertEqual(result, refused)
 
     def test_proxy_forwarding_failure_reaches_the_sender(self) -> None:
-        with (short_socket_directory() as directory, socket.socket(socket.AF_UNIX) as listener,
+        with (relay_socket_directory() as directory, socket.socket(socket.AF_UNIX) as listener,
               mock.patch.object(send, "STATE", Path(directory) / "message"),
               mock.patch.object(send, "claude_binary", return_value="/fixture/claude"),
               mock.patch.object(accounts, "account_for_unscoped_launch", return_value=accounts.LegacyHomeLaunch()),
@@ -1167,6 +1180,7 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
         )
         (self.root / "config").mkdir()
         _ = write_send_config(self.root / "config/send.conf", "")
+        _ = write_config_fixture(self.root / "config/build_folders.conf", f"roots.system={self.root}\n")
         _ = self.enterContext(mock.patch.object(staff, "runtime_id", return_value=""))
         _ = self.enterContext(mock.patch.object(unit_lookup, "checked_conversation", side_effect=self.checked_recipient))
         _ = self.enterContext(mock.patch.object(unit_lookup, "current_claude_record", side_effect=self.current_fixture_record))
@@ -8050,7 +8064,7 @@ class AccountDaemonRoutingTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
-        self.root = Path(self.enterContext(short_socket_directory()))
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="d-")))
         self.homes = (self.root / ".codex", self.root / ".codex2")
         notes = self.root / "agents"
         self.queue_contents, self.queued = {}, []
@@ -8069,6 +8083,7 @@ class AccountDaemonRoutingTests(unittest.TestCase):
         (self.root / "claude-sessions").mkdir()
         (self.root / "config").mkdir()
         _ = write_send_config(self.root / "config/send.conf", "")
+        _ = write_config_fixture(self.root / "config/build_folders.conf", f"roots.system={self.root}\n")
         binaries = self.root / "bin"
         binaries.mkdir()
         ps = binaries / "ps"
@@ -8085,7 +8100,7 @@ class AccountDaemonRoutingTests(unittest.TestCase):
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
             **interpreter_cache_environment(self.root / "cache"),
             "HOME": str(self.root), "PATH": str(binaries), "AGENT_NOTES_DIR": str(notes),
-            "CONF_DIR": str(self.root / "config"),
+            "CONF_DIR": str(self.root / "config"), "TMPDIR": str(self.root),
             "PROCESS_TABLE_PS": str(ps), "XDG_STATE_HOME": str(self.root / "state"),
             "NOTIFIER_SESSIONS_DIR": str(self.root / "claude-sessions"),
             "NOTIFIER_STATE_DIR": str(self.root / "notifier"),

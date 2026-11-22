@@ -221,7 +221,7 @@ class StallWatchTests(unittest.TestCase):
     @classmethod
     @override
     def setUpClass(cls) -> None:
-        cls.listener_root = Path(cls.enterClassContext(tempfile.TemporaryDirectory(prefix="sw-peers-", dir="/tmp")))
+        cls.listener_root = Path(cls.enterClassContext(tempfile.TemporaryDirectory(prefix="p-")))
         cls.listeners = []
         cls.addClassCleanup(cls.close_listeners)
 
@@ -260,7 +260,7 @@ class StallWatchTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
-        self.root = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="sw-", dir="/tmp")))
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="sw-")))
         _ = cast(object, self.enterContext(mock.patch.multiple(
             unit_runs, RUN_ROOT=self.root / "held", FORMER_RUN_ROOT=self.root / "former-held")))
         defaults = self.root / "watch-defaults.conf"
