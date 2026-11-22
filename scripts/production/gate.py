@@ -618,6 +618,10 @@ class HeldGateToken:
     value: str
 
 
+class RollbackRecoveryRefused(GateRefused):
+    """The resources are free, but the checkout still needs rollback."""
+
+
 @dataclass
 class GateRecovery:
     """Own the resources and merge baseline of one gate process."""
@@ -729,17 +733,22 @@ class GateRecovery:
             report_retained_gate_folder(folder, "the gate owner ended")
         if self.rollback:
             repo = Path(self.repo)
-            with gate_operation_lock(repo) as descriptor, ExitStack() as cleanup:
-                try:
-                    fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                except BlockingIOError:
-                    print(f"Recovered gate {self.pid}: rollback waits for the live gate in {repo}", flush=True)
-                    return
-                _ = cleanup.enter_context(scratch.copy_lock(repo))
-                rollback_merge(repo, self.rollback, checkpoint=self.rollback_source,
-                               recorded_merge=self.rollback_head, recovery=self)
-                self.rollback = ""
-                self.save()
+            try:
+                with gate_operation_lock(repo) as descriptor, ExitStack() as cleanup:
+                    try:
+                        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    except BlockingIOError:
+                        print(f"Recovered gate {self.pid}: rollback waits for the live gate in {repo}", flush=True)
+                        return
+                    _ = cleanup.enter_context(scratch.copy_lock(repo))
+                    rollback_merge(repo, self.rollback, checkpoint=self.rollback_source,
+                                   recorded_merge=self.rollback_head, recovery=self)
+                    self.rollback = ""
+                    self.save()
+            except (GateRefused, copies.CopyError, scratch.ScratchError, OSError, subprocess.SubprocessError) as error:
+                if self.groups or self.tokens:
+                    raise
+                raise RollbackRecoveryRefused(f"gate recovery kept {self.path} for {repo}: {error}") from error
             print(f"Recovered gate {self.pid}: merge undone, not pushed", flush=True)
         self.finish()
 
@@ -772,19 +781,27 @@ def gate_run_directory(repo: Path) -> Path:
 
 
 def recover_gate_runs(repo: Path) -> None:
+    requested_checkout = str(repo.resolve())
     current = ACTIVE_GATE_RECOVERY.get()
-    if isinstance(current, GateRecovery) and current.repo == str(repo.resolve()) and current.pid == os.getpid():
+    if isinstance(current, GateRecovery) and current.repo == requested_checkout and current.pid == os.getpid():
         return
     root = gate_state_dir() / "active-runs"
     if not root.exists():
         return
+    refusals: list[str] = []
     for directory in sorted(root.iterdir()):
         if directory.is_dir():
-            recover_gate_directory(directory)
+            try:
+                recover_gate_directory(directory, requested_checkout=requested_checkout)
+            except RollbackRecoveryRefused as error:
+                refusals.append(str(error))
+    if refusals:
+        raise RollbackRecoveryRefused("\n".join(refusals))
 
 
-def recover_gate_directory(directory: Path) -> None:
+def recover_gate_directory(directory: Path, *, requested_checkout: str = "") -> None:
     """Recover dead owners while holding the directory lock."""
+    refusals: list[str] = []
     descriptor = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
     try:
         fcntl.flock(descriptor, fcntl.LOCK_EX)
@@ -811,10 +828,17 @@ def recover_gate_directory(directory: Path) -> None:
             active = ACTIVE_GATE_RECOVERY.set(recovery)
             try:
                 recovery.recover()
+            except RollbackRecoveryRefused as error:
+                if not requested_checkout or recovery.repo == requested_checkout:
+                    refusals.append(str(error))
+                else:
+                    print(str(error), file=sys.stderr, flush=True)
             finally:
                 ACTIVE_GATE_RECOVERY.reset(active)
     finally:
         os.close(descriptor)
+    if refusals:
+        raise RollbackRecoveryRefused("\n".join(refusals))
 
 
 @contextmanager

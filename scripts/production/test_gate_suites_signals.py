@@ -184,6 +184,51 @@ sys.stdin.read(1)
                     self.assertTrue(recovery.path.is_file())
                 self.assertEqual(list(directory.glob("*.json")), [recovery.path])
 
+    def test_rollback_refusal_only_blocks_the_checkout_it_names(self) -> None:
+        self.supply_jobserver(b"Q")
+        _ = self.git(self.checkout, "merge", "--no-ff", "--no-edit", self.checkpoint)
+        merged = self.git(self.checkout, "rev-parse", "HEAD")
+        self.write(self.checkout / "concurrent.txt", "concurrent change\n")
+        head = self.commit(self.checkout, "concurrent change")
+        with mock.patch.dict(os.environ, self.environment, clear=True):
+            directory = gate.gate_run_directory(self.checkout)
+            directory.mkdir(parents=True)
+            refused = gate.GateRecovery(directory / "a-refused.json", str(self.checkout), os.getpid(),
+                                        "ended-owner", rollback=self.base, rollback_head=merged,
+                                        rollback_source=self.checkpoint)
+            refused.save()
+            resources = gate.GateRecovery(directory / "z-resources.json", str(self.checkout), os.getpid(), "ended-owner")
+            with subprocess.Popen(
+                    [sys.executable, "-c", "import signal; signal.pause()"], env=self.environment,
+                    stdin=subprocess.DEVNULL, start_new_session=True) as child:
+                try:
+                    resources.add_group(child.pid)
+                    descriptor = os.open(self.environment["BUILDLOG_JOBSERVER_FIFO"], os.O_RDWR | os.O_NONBLOCK)
+                    try:
+                        resources.tokens.append(resources.token(descriptor, os.read(descriptor, 1)))
+                        resources.save()
+                    finally:
+                        os.close(descriptor)
+                    with mock.patch.object(gate, "run_gate_suites",
+                                           return_value=gate.GateRun((), 0, 0, tests_reused=True)):
+                        other = self.run_gate("--tests-only", "--repo", str(self.unit))
+                    self.assertEqual(other.returncode, 0, other.stdout + other.stderr)
+                    self.assertIn(f"rollback kept HEAD {head}", other.stderr)
+                    self.assert_process_stopped(child.pid)
+                    self.assertEqual(self.jobserver_tokens(), b"Q")
+                    self.assertFalse(resources.path.exists())
+                finally:
+                    if child.poll() is None:
+                        child.kill()
+
+            blocked = self.run_gate("--tests-only")
+            self.assertEqual(blocked.returncode, 1, blocked.stdout + blocked.stderr)
+            self.assertIn(f"rollback kept HEAD {head}", blocked.stderr)
+            self.assertTrue(refused.path.is_file())
+        self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), head)
+        self.assertEqual(self.git(self.checkout, "status", "--porcelain"), "")
+        self.assert_not_pushed()
+
     def test_recovery_drops_a_non_fifo_token_without_writing(self) -> None:
         pool = self.root / "token-pool"
         self.write(pool, "original pool")
