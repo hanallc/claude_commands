@@ -370,6 +370,7 @@ def stop_pass(run: Path, stopped: detached_runs.RunRecord,
 def repeat_completion_notice(worker_name: str, parent: staff.StaffRow, run: Path,
                              passed: dict[str, object]) -> Callable[[], None]:
     """Repeat an explicitly requested result after the worker lock is released."""
+    worker.CompletionArtifacts(parent, run).validate_status(passed)
     instance = str(passed["instance_id"])
     completion = progress_history.hook_completion(passed)
     if isinstance(completion, progress_history.HookCompletion) and not completion_notice_delivered(passed):
