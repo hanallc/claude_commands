@@ -738,6 +738,8 @@ A batch can contain one item.
 1. Take the production merge lock once. While it holds the lock, `land_runs.landing` records every item's commit, so the units board says `waiting on running checkpoint`; a single land records its one commit the same way.
    Each item that lands or stops adds a row to `land_results.jsonl` (`land_runs.record_result`); the board shows the newest row of a checkpoint that has not landed.
 2. Fetch the merge branch and the unit branches from origin.
+   If the merge branch fetch fails, ask each current requester to send the checkpoint again when origin is available.
+   Leave existing results unchanged when this fetch fails.
    Fetch all origin heads only if an item still needs a commit or a fresh tracking ref.
    Resolve every item to a commit before writing the record or starting a merge.
    Refuse the batch and name the item if it cannot resolve to a commit.
@@ -745,8 +747,8 @@ A batch can contain one item.
    Normalize shell quoting and keep the argument order.
    Resume checkpoint merges only when the arguments and commits match the record and an unpushed checkpoint belongs to the batch.
    Identify checkpoint merges by their subjects and second parents.
-   If the record is missing or differs, reset the merge branch to its pushed tip.
-   Then start a fresh batch. Remove the record after the push or when the batch ends without unpushed merges.
+   If the record is missing or differs, refuse the batch and tell the requester how to start again.
+   Remove the record after the push or when the batch ends without unpushed merges.
    If record removal fails, report a warning and continue.
    Resume each item that the merge branch already contains through the single command's route, in file order.
 3. Retain the starting tip and whether a merge is unfinished.
@@ -755,65 +757,52 @@ A batch can contain one item.
 6. Use one `tested_main_push` hold, one push, and one local promotion.
 7. Complete each item's branch cleanup, receipt, review record, scratch cleanup, and director result.
 
-A resumed item retests an unpushed merge and resumes the promotion of a pushed merge, as the single command does.
-A failed resume stops every later item from the same unit, and the batch exits 1 after the other items land.
+A resumed item tests an unpushed merge or resumes promotion of a pushed merge.
+A stop during test preparation, a red test, or a main conflict returns every pending item in the resumed batch.
+A published merge with a promotion marker keeps its completed result.
+For other stops, the existing resume rules apply.
 
 Shrink and as-built items add no test paths of their own.
 A batch skips tests only when its unpublished paths belong entirely to its shrink and as-built items.
 The published tip is `origin/<merge branch>`.
-An interrupted batch's merged item retests its unpublished paths when it resumes.
-A red resume undoes that unpushed merge before the other items merge.
 Main integration retains the existing retest rule before publication.
 Any item's `--cancel-prior` applies to the shared push.
 Review-list publication, style notification, checkout announcement, and Mac promotion run once for the batch.
 Each merge retains its own review ownership and completion record.
 
-A held or failed item before the push starts drops from the batch.
-Every later item from the same unit drops with it and receives a report that names the stopped item.
-The checkout returns to the starting tip before each retry.
-Retries continue until an attempt passes or no item remains.
-Each stopped attempt removes at least one item, so attempts never exceed the initial item count.
+A hold, failure, or cancellation ends a fresh batch and returns each row to its requester.
+Before each gate run, record the tested tip and each row's selected commands in memory.
+For attribution, compare a merged row with its merge's first parent.
+Compare an unmerged row with the destination tip before preparation.
+A red report names the failed test step and says whether the row selects it.
+If command selection failed for a row, report unknown changed paths and include the error.
+The batch stops at the first failed test command.
+The next queued item can proceed after the batch exits.
+Before publication, the shared stop attempts to restore the starting tip.
+The batch record lists each row tip.
+The batch adds each main target to the record before Git starts the merge.
+The stop accepts HEAD at the expected tip or at a merge with that first parent and a recorded second parent.
+The batch reads MERGE_HEAD after every merge command.
+A successful command with an open merge stops the batch.
+The stop aborts a merge with a recorded target or an empty or unreadable MERGE_HEAD.
+The stop preserves an open merge to an unrelated target and reports the refusal.
+The stop aborts the merge before it queries origin.
+If abort restores the starting tip, the stop skips the query and reset.
+Without an open merge, the stop runs the reset even at the starting tip to clear merge state.
+A reset that moves HEAD requires origin to match the recorded published tip or the starting tip.
+The stop sends every notice before it writes result records.
+Rollback and result-record errors appear after the notices.
+Each run starts a fresh shared test log. Tests after main moves append to the same log.
+Publication rollback checks the live origin before it restores the tip.
+It also removes unpublished formatter commits.
+
 Shrink and as-built items use their commit subject's plan slug within the configured plan folder.
 Subjects without the closing-item format retain the configured plan.
 An ancestry hold names the first unmerged commit by its short hash and subject.
-Reset aborts an unfinished merge only when no merge was unfinished at batch start.
-An earlier unfinished merge and its staged edits remain unchanged.
-A red test identifies its items through the shared checkpoint test selector.
-Candidates are the code items that select a red command, or all code items when none selects it.
-When no code item remains, every remaining item is a candidate.
-One candidate drops directly.
-For multiple candidates, a binary search finds the first merge that makes the red commands fail.
-Each probe resets the checkout to a candidate's unpublished merge commit.
-It merges the same main commit that the red test tip holds, without another fetch.
-A conflict stops the search and drops every candidate.
-The probe selects test steps again from the batch paths at that tip.
-It runs only unresolved red steps that the tip still selects.
-A red step absent from that selection counts as green.
-Full tests and probes use the same runner and flake rules.
-The starting tip is treated as green; the last candidate is known red.
-Seven candidates need at most three probes.
-Each probe reports its item, merge commit, and green or red result.
-Each batch invocation clears its shared test log once before the first attempt.
-Full tests, probes, main retests, and all retries append to that log.
-The search restores the starting tip and drops the causing item and that unit's later items.
-A cancelled probe or another non-red stop drops every candidate with that stop.
-A command that cannot start is a non-red probe stop; full runs retain their existing failure behavior.
-A batch line that repeats an item merged in the same attempt receives `resume it alone with the single command`.
-The push start is the boundary for drop, reset, and retry.
-Once the push starts, a failure drops no items and starts no batch reset or retry.
-Only `push_rollback` can undo a failed push after it checks the live origin.
-Each item receives the stop report.
+A row that repeats a checkpoint in the batch receives instructions to resume it alone.
 
-`test_merge_checkpoint_batch.py` covers shared publication, a conflicting middle item, and a red command selected by one item.
-It also covers unpublished paths after interruption and a wrapper failure after a successful push.
-The interruption rows resume the merged item alone, including a shrink-only batch.
-The rerun row resumes the promotion of two pushed items and then lands a new item.
-The held-batch rows preserve an earlier unfinished merge and its staged edits.
-They also land a clean item after two holds and remove a held unit's later item.
-The history rows merge closing items for an older plan after the configured plan changes.
-The shared-red row uses two probes to identify the middle item and land the other two.
-The main-integration row keeps new main content at every probe and drops the first item.
-The package-rename row skips the renamed test at the earlier tip and drops the second item.
+`test_merge_checkpoint_batch.py` checks fresh and resumed red batches, formatter rollback, and the next queued item.
+`test_merge_checkpoint_rerun.py` covers shared publication and recovery after interruption.
 
 Findings-ledger tests remain in `scripts/direct/test_findings.py`, with `findings_test_support.py` restoring one private fixture seed at the same path for each case. Commands execute the real CLI in-process with a fresh module namespace, so every invocation rereads configuration and all ledger, event, parser and locking code stays active. Stable-ID persistence across invocations and unusable-configuration cases retain real Python subprocesses. All original test bodies and assertions are retained.
 

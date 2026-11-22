@@ -442,6 +442,21 @@ def required_string(values: dict[str, object], key: str, path: Path) -> str:
     return value
 
 
+def scopes_overlap(first: ClaimScope, second: ClaimScope) -> bool:
+    if isinstance(first, WholeMacScope) or isinstance(second, WholeMacScope):
+        return True
+    same_repository = first.key == second.key if first.key and second.key else first.name == second.name
+    return same_repository and (not first.slot or not second.slot or first.slot == second.slot)
+
+
+def cleanup_scope_matches(paths: StatePaths, claim: HeldClaim, scope: ClaimScope) -> bool:
+    """Check whether a cleanup scope can release the claim."""
+    if (claim.path == paths.run and "repo_name" not in claim.record
+            and not Path(claim.record["worktree"]).is_absolute()):
+        return False
+    return scopes_overlap(claim.scope, scope)
+
+
 def target_claim_scope(paths: StatePaths, worktree: str) -> ClaimScope:
     from scripts.buildlog import repository, store
 
