@@ -736,12 +736,7 @@ class GateRecovery:
                     print(f"Recovered gate {self.pid}: rollback waits for the live gate in {repo}", flush=True)
                     return
                 _ = cleanup.enter_context(scratch.copy_lock(repo))
-                head = checked_git(repo, "rev-parse", "HEAD")
-                if head not in (self.rollback, self.rollback_head):
-                    parents = checked_git(repo, "rev-list", "--parents", "-n", "1", head).split()[1:]
-                    if parents != [self.rollback, self.rollback_source]:
-                        raise GateRefused(f"gate recovery kept {self.path}: HEAD {head} differs from the recorded merge")
-                rollback_merge(repo, self.rollback)
+                rollback_merge(repo, self.rollback, checkpoint=self.rollback_source, recorded_merge=self.rollback_head)
                 self.rollback = ""
                 self.save()
             print(f"Recovered gate {self.pid}: merge undone, not pushed", flush=True)
@@ -2110,10 +2105,14 @@ def promote_mac(args: GateArguments, main_repo: Path, published: promotion.Publi
         raise GateRefused(f"main promoted to {promoted}; Mac fast-forward failed: ssh exit={result.returncode}, ff_rc={statuses}; {detail}; the claude-sync job on the Mac retries within 15 minutes")
 
 
-def rollback_merge(repo: Path, baseline: str) -> None:
+def rollback_merge(repo: Path, baseline: str, *, checkpoint: str = "", recorded_merge: str = "") -> None:
+    merged = checked_git(repo, "rev-parse", "HEAD")
+    if merged not in (baseline, recorded_merge):
+        if recorded_merge or (checkpoint and checked_git(repo, "rev-list", "--parents", "-n", "1", merged).split()[1:]
+                              != [baseline, checkpoint]):
+            raise GateRefused(f"rollback kept HEAD {merged}: it differs from the gate merge")
     if git(repo, "rev-parse", "--verify", "MERGE_HEAD").returncode == 0:
         _ = git(repo, "merge", "--abort")
-    merged = checked_git(repo, "rev-parse", "HEAD")
     result = git(repo, "reset", "--keep", baseline)
     if result.returncode == 0:
         return
@@ -2213,9 +2212,10 @@ def merge_checkpoint(args: GateArguments) -> int:
         raise GateRefused(refusal)
     subject = f"Merge {args.unit} {args.phase} ({args.checkpoint}) into {args.merge_branch}"
     recovery = ACTIVE_GATE_RECOVERY.get()
+    merged = ""
     if isinstance(recovery, GateRecovery):
         recovery.rollback = baseline
-        recovery.rollback_head = baseline
+        recovery.rollback_head = merged
         recovery.rollback_source = checkpoint
         recovery.save()
     try:
@@ -2255,7 +2255,7 @@ def merge_checkpoint(args: GateArguments) -> int:
     except (KeyboardInterrupt, SystemExit):
         raise
     except BaseException as error:
-        rollback_merge(repo, baseline)
+        rollback_merge(repo, baseline, checkpoint=checkpoint, recorded_merge=merged)
         if isinstance(recovery, GateRecovery):
             recovery.rollback = ""
             recovery.save()
