@@ -201,7 +201,7 @@ Provisional: S2 designs the API from the uses and can change these phases. The S
 | S7 | 11 | Timing, memory, Mac proof against the S1 targets | both | S6 |
 | S8 | 12 | Shadow comparison, switch with nate's go, removal of Python selection | `~/.claude` | S7 |
 
-S3 and S4 run one after the other: a unit holds one Rust build-queue item at a time (nate, 2026-11-18). Each speed phase reports its result against its target: **milestone 7**.
+S4 starts beside S3 groups B and C (cargo-liner showrunner, 2026-11-22). The build queue holds the unit's second run by itself. Group C owns the shared files until it merges; S4 adds new lines only. Each step starts when its plan dependencies are on main or in a tree it builds on. Each speed phase reports its result against its target: **milestone 7**.
 
 S3 has nine phases, re-cut from the declaration scope read (style-unit, 2026-11-19: the declaration outcome calls the rename proofs). Each phase is one cargo-liner checkpoint and adds one answer to the `finding` reply. The first two ran in series. The rest run in three groups (cargo-liner showrunner ruling): each group runs the full suite and Python parity once, on its final tree, and merges as one. Group C runs last, after group A merges.
 
@@ -225,6 +225,15 @@ Group C:
 9. `s3-declarations`: `declaration` and `site_evidence`, the complete declaration reading. The request carries an approval snapshot (decision paths and answers); Python keeps the decision-file parse.
 
 Code with no consumer cannot land, so each S3 phase extends `finding`, its consumer. The `next` request and reply types (`NextOutcome`, `SelectedTicket`) move to S5, which builds `next` (style-unit, 2026-11-18).
+
+S4 has six phases, from the S4 scope read (style-unit, 2026-11-22). Phase 1 runs first. Phases 2, 3 and 4 run side by side after it. Phase 5 follows them. Phase 6 builds its ledger projection beside them and joins after phase 5. The full suite and Python parity run once, on the final S4 tree. The Python membership adapter moves to S5, with the publication adapter.
+
+1. `s4-sites-regex` (started 2026-11-22, branch `style-s4-sites-regex`): `sites` with the shared envelope, catalog input, schema 47 and 51 reads, typed `Unavailable`, and regex sites.
+2. `s4-sites-types`: field affixes, variant stutter, field type stutter, struct fields and single-impl traits.
+3. `s4-sites-source`: allows, test allows, observer guards, literals and test literals.
+4. `s4-sites-structure`: module roots, submodule names, workspace dependencies and Bevy Kana; candidate D membership.
+5. `s4-sites-prefilter`: B prefilter rules over the full generator path union.
+6. `s4-coverage`: `coverage` with observed counts and the confirmed cell projection.
 
 ### `syn` and reuse
 
