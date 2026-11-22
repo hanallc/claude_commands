@@ -101,10 +101,15 @@ def reboot_state_directory() -> Path:
     return state / "agents" / "reboot"
 
 
+def reboot_lock_path() -> Path:
+    """Use the directory of the server that agents reboot stops."""
+    return _session_socket(SHARED_SESSION).with_name("reboot.lock")
+
+
 @contextmanager
 def reboot_lock(*, exclusive: bool = False) -> Generator[None]:
     """Hold the lock without waiting. Share the descriptor within the process."""
-    path = reboot_state_directory() / "lock"
+    path = reboot_lock_path().resolve()
     key = os.getpid(), path
     with _reboot_locks_guard:
         held = _reboot_locks.get(key)
@@ -4558,6 +4563,7 @@ def _start_darwin_server(client: Herdr, timeout_ms: int, *, session_kind: Securi
     return ServerCreated()
 
 
+@reboot_lock()
 def start_server(name: str, timeout_ms: int, *,
                  session_kind: SecuritySession | SessionKindNotRead = _SESSION_KIND_NOT_READ) -> ServerCreated | ServerAdopted:
     _timeout(timeout_ms)
@@ -4589,6 +4595,7 @@ def start_server(name: str, timeout_ms: int, *,
             time.sleep(min(PANE_POLL_SECONDS, remaining))
 
 
+@reboot_lock()
 def restore_server(name: str, timeout_ms: int, *,
                    session_kind: SecuritySession) -> ServerCreated | ServerAdopted | WindowServerCreated:
     """Start in Aqua directly, or let a desktop attach window bootstrap its server."""
@@ -5742,7 +5749,7 @@ def attached_clients(name: str) -> ClientsAttached | NoClientAttached | ClientsU
             continue
         except OSError as error:
             return ClientsUnreadable(str(error))
-        if (session == name and not command) or command == ["session", "attach", name]:
+        if (session == name and command in ([], ["client"])) or command == ["session", "attach", name]:
             count += 1
     return ClientsAttached(count) if count else NoClientAttached()
 
@@ -6454,7 +6461,7 @@ def _darwin_attached_clients(name: str) -> ClientsAttached | NoClientAttached | 
             except (HerdrFailure, subprocess.TimeoutExpired, OSError) as error:
                 return ClientsUnreadable(str(error))
             session, command = _herdr_command(arguments, environment.get("HERDR_SESSION") or "default")
-        if (session == name and not command) or command == ["session", "attach", name]:
+        if (session == name and command in ([], ["client"])) or command == ["session", "attach", name]:
             count += 1
     return ClientsAttached(count) if count else NoClientAttached()
 

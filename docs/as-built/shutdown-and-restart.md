@@ -964,12 +964,14 @@ Use `agents reboot --dry-run` to see the plan without running the four steps.
 If session move returns an error, the plan reports that it is incomplete and omits the totals. The dry run returns status 1.
 
 The reboot holds the Herdr upkeep job lock across the four steps and releases it on failure.
-The reboot also holds `agents/reboot/lock` exclusively under the user state folder across the four steps.
+The reboot also holds `reboot.lock` exclusively beside the shared Herdr server socket across the four steps.
 The common Herdr launcher takes a shared lock before it creates a pane.
 The direct Herdr start for a producer reservation takes the same lock.
 A lock refusal reports that a reboot is running.
 Nested starts in one process use the same open lock file, including starts in the reboot's restart step.
-The standalone Herdr commands take a separate shared lock when they restore the server.
+The Herdr server start functions take the same shared lock before they can start a server.
+Manual starts through a pane command, `accounts.py exec`, `cli_agent.sh`, or native Herdr can bypass the lock.
+A shell wrapper can start an agent after a resume times out, and a fork without exec can retain the lock.
 The `agents resume` command holds the lock while it changes staff or recovery records.
 The direct resume API also holds the lock for starts in an existing pane.
 The `agents restart` and `agents move` commands hold the lock while they save restart or move records.

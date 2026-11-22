@@ -3248,7 +3248,8 @@ class LaunchDestinationTests(StaffTestCase):
         proc = self.root / "proc"
         proc.mkdir()
         _ = cast(object, self.enterContext(patch.dict(os.environ, {
-            "HERDR_PROC": str(proc), "HERDR_BIN": "/nonexistent/herdr", "XDG_STATE_HOME": str(self.root / "state"),
+            "HERDR_PROC": str(proc), "HERDR_BIN": "/nonexistent/herdr",
+            "XDG_CONFIG_HOME": str(self.root / "config"), "XDG_STATE_HOME": str(self.root / "state"),
         })))
         _ = self.enterContext(patch.object(herdr, "_PLATFORM", "linux"))
         _ = self.enterContext(patch.object(herdr, "_startup_processes", return_value=herdr.PaneAtShell()))
@@ -3260,9 +3261,9 @@ class LaunchDestinationTests(StaffTestCase):
         case = test_worker_panes.WorkerPaneTests()
         case.setUp()
         self.addCleanup(case.doCleanups)
-        directory = herdr.reboot_state_directory()
-        directory.mkdir(parents=True, exist_ok=True)
-        with ((directory / "lock").open("a") as external,
+        lock = herdr.reboot_lock_path()
+        lock.parent.mkdir(parents=True, exist_ok=True)
+        with (lock.open("a") as external,
               patch.object(herdr, "launch_prepared_agent", side_effect=launch) as attempted,
               patch.object(herdr, "start_agent", side_effect=AssertionError("Started during reboot")) as started):
             fcntl.flock(external, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -3274,6 +3275,16 @@ class LaunchDestinationTests(StaffTestCase):
         self.assertTrue(result.reason.endswith("A reboot is running; wait for it to end."), result.reason)
         self.assertEqual(case.world.commands, [])
         self.assertEqual(staff.snapshot().find(kind="worker", parent=case.parent_id), [])
+
+    def test_the_same_server_uses_one_lock_across_state_homes(self) -> None:
+        path = self.root / "config/herdr/sessions/agents/reboot.lock"
+        with herdr.reboot_lock(exclusive=True):
+            self.assertTrue(path.is_file())
+            with (patch.dict(os.environ, {"XDG_STATE_HOME": str(self.root / "other-state")}),
+                  patch.object(os, "getpid", return_value=os.getpid() + 1),
+                  self.assertRaises(herdr.RebootLockBusy), herdr.reboot_lock()):
+                self.fail("A different state folder passed the server lock")
+        self.assertFalse((self.root / "other-state").exists())
 
     def test_nested_shared_lock_reuses_the_process_descriptor(self) -> None:
         def nested() -> None:
@@ -5614,6 +5625,19 @@ class HerdrTests(unittest.TestCase):
         self.configure(["--session", "default", "session", "list", "--json"], json.dumps({"sessions": rows}))
         self.assertEqual(herdr.live_sessions(), rows[:1])
 
+    def test_reboot_blocks_both_server_start_functions(self) -> None:
+        path = self.root / "config/herdr/sessions/agents/reboot.lock"
+        path.parent.mkdir(parents=True)
+        with (path.open("a") as external, patch.object(herdr, "run_program") as command,
+              patch("scripts.lib.detached.start_detached") as detach):
+            fcntl.flock(external, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            with self.assertRaises(herdr.RebootLockBusy):
+                _ = herdr.start_server("agents", 1_000)
+            with (patch.object(herdr, "_PLATFORM", "darwin"), self.assertRaises(herdr.RebootLockBusy)):
+                _ = herdr.restore_server("agents", 1_000, session_kind=herdr.NonDesktopSession())
+        command.assert_not_called()
+        detach.assert_not_called()
+
     def test_server_start_skips_running_server(self) -> None:
         self.configure_herdr(["status", "server"], "server:\nstatus: running\n")
         self.configure_herdr(["workspace", "list"], json.dumps({
@@ -5994,7 +6018,8 @@ class HerdrTests(unittest.TestCase):
 
     def test_attached_clients_count_only_interactive_clients_for_the_session(self) -> None:
         clients = [["herdr", "session", "attach", "fixture"], ["herdr", "--session", "fixture"],
-                   ["herdr", "--session=fixture"], ["herdr", "--session", "other", "session", "attach", "fixture"]]
+                   ["herdr", "--session=fixture"], ["herdr", "--session", "other", "session", "attach", "fixture"],
+                   ["herdr", "--session", "fixture", "client"]]
         excluded = [["herdr", "--session", "fixture", *command] for command in (
             ["server"], ["pane", "read", "p1"], ["agent", "list"], ["status"],
             ["status", "server"], ["workspace", "create"], ["session", "list"], ["--help"], ["--version"],
@@ -6003,7 +6028,7 @@ class HerdrTests(unittest.TestCase):
                          ["echo", "herdr", "session", "attach", "fixture"]])
         for pid, argv in enumerate(clients + excluded, 100):
             _ = self.process(pid, 1, argv, {})
-        self.assertEqual(herdr.attached_clients("fixture"), herdr.ClientsAttached(4))
+        self.assertEqual(herdr.attached_clients("fixture"), herdr.ClientsAttached(5))
         self.assertEqual(herdr.attached_clients("missing"), herdr.NoClientAttached())
 
     def test_attached_clients_handle_default_unreadable_and_vanished_processes(self) -> None:

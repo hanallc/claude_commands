@@ -2,6 +2,7 @@ from __future__ import annotations
 from scripts.agents.test_support import write_machine_config
 from scripts.lint.memory_test_support import write_config_fixture
 
+import fcntl
 import io
 import json
 import math
@@ -239,7 +240,8 @@ class PaneRestoreTests(unittest.TestCase):
         self.addCleanup(directory.cleanup)
         self.root = Path(directory.name)
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
-            "STAFF_FILE": str(self.root / "staff.json")})))
+            "HOME": str(self.root), "XDG_CONFIG_HOME": str(self.root / "config"),
+            "XDG_STATE_HOME": str(self.root / "state"), "STAFF_FILE": str(self.root / "staff.json")})))
         self.config = self.root / ".claude3"
         self.row = replace(type(self).row, home=staff.SessionHome(self.config))
         _ = self.enterContext(mock.patch.object(staff, "local_snapshot", side_effect=lambda: staff.StaffSnapshot((self.row,))))
@@ -382,6 +384,17 @@ class PaneRestoreTests(unittest.TestCase):
         return FakeClient([{"pane_id": "w1:p2", "label": "alpha", "workspace_id": "w1",
                             "agent_session": {"kind": "id", "value": session_id}}])
 
+
+    def test_reboot_blocks_the_pane_restore_server_start(self) -> None:
+        lock = self.root / "config/herdr/sessions/agents/reboot.lock"
+        lock.parent.mkdir(parents=True)
+        with (lock.open("a") as held, mock.patch.object(herdr, "run_program") as command,
+              mock.patch.object(pane_restore, "restore") as restore, redirect_stderr(io.StringIO()) as errors):
+            fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self.assertEqual(pane_restore.main([]), 1)
+        self.assertEqual(errors.getvalue(), "A reboot is running; wait for it to end.\n")
+        command.assert_not_called()
+        restore.assert_not_called()
 
     def test_restore_uses_each_reader_outcome_for_both_runtimes(self) -> None:
         identity = "019b3a40-4250-7000-8000-000000000102"

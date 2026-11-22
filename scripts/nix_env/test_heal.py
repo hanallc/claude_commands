@@ -531,13 +531,13 @@ class HealTests(NixFixture):
     def test_reboot_after_stop_preserves_the_next_sweep_relaunch(self) -> None:
         _held, _ensure, run = self.install_sweep([self.session])
         command = cast(Callable[..., subprocess.CompletedProcess[str]], run.side_effect)
-        directory = herdr.reboot_state_directory()
-        directory.mkdir(parents=True)
+        lock = herdr.reboot_lock_path()
+        lock.parent.mkdir(parents=True)
         with ExitStack() as reboot:
             def stop_before_reboot(arguments: list[str], **options: object) -> subprocess.CompletedProcess[str]:
                 self.assertEqual(arguments[2], "stop")
                 result = command(arguments, **options)
-                external = reboot.enter_context((directory / "lock").open("a"))
+                external = reboot.enter_context(lock.open("a"))
                 fcntl.flock(external, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 return result
 

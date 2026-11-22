@@ -34,6 +34,7 @@ class Terminal(io.StringIO):
 class RebootTests(unittest.TestCase):
     root: Path = Path()
     directory: Path = Path()
+    start_lock: Path = Path()
     lib: Path = Path()
     events: list[str] = []
     report: restart.BulkReport | None = None
@@ -65,6 +66,7 @@ class RebootTests(unittest.TestCase):
             "HERDR_PANE_ID": "",
             "HERDR_ENV": "",
         })))
+        self.start_lock = config / "herdr/sessions/agents/reboot.lock"
         _ = self.enterContext(patch.object(Path, "home", return_value=self.root))
         lib = self.root / ".claude/scripts/lib"
         lib.mkdir(parents=True)
@@ -268,7 +270,7 @@ else:
         self.assertEqual(shutdown_record.read(), [])
 
         def resume(_options: shutdown.CommandLine) -> int:
-            with (self.directory / "lock").open("a") as lock, self.assertRaises(BlockingIOError):
+            with self.start_lock.open("a") as lock, self.assertRaises(BlockingIOError):
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             return 0
 
@@ -301,7 +303,7 @@ else:
         self.assertEqual(code, 0)
         self.assertEqual(Path(lines[0]).parent, old_logs)
         self.assertEqual(self.events, ["check", "server", "move", "start"])
-        self.assertTrue((self.directory / "lock").is_file())
+        self.assertTrue(self.start_lock.is_file())
         self.assertFalse((self.directory / "reboot.json").exists())
         self.assertFalse((old_logs / "lock").exists())
         self.assertFalse(new_logs.exists())
@@ -316,7 +318,7 @@ else:
         client = herdr.Herdr(herdr.SHARED_SESSION)
 
         def start_agent(*_args: object, **_kwargs: object) -> herdr.PromptSubmissionNotRequired:
-            with (self.directory / "lock").open("a") as external, self.assertRaises(BlockingIOError):
+            with self.start_lock.open("a") as external, self.assertRaises(BlockingIOError):
                 fcntl.flock(external, fcntl.LOCK_SH | fcntl.LOCK_NB)
             return herdr.PromptSubmissionNotRequired()
 

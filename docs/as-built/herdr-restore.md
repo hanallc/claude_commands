@@ -76,8 +76,8 @@ The [launch-name policy](shutdown-and-restart.md#launch-names) supplies current 
 - A replacement closes its source only after resume publication proves the new conversation.
   A source pane that gains another conversation or program stays open and prints an anomaly.
   A failed start preserves the pane. A failed restore returns exit status 1.
-- Herdr keeps the restored layout. Unless its config sets `[session] resume_agents_on_restore = false`,
-  herdr also resumes each pane itself on the server's account, and without the pane's `--env`.
+- Herdr keeps the restored layout. Herdr can also resume each pane on the server's account without the pane's `--env`.
+  Set `[session] resume_agents_on_restore = false` to disable native agent restore.
 - Before a power-off, run `agents stop --all`. It saves each local live staff row before its stop.
 - After login, run `agents restart`. Stop starts nothing.
 - `agents restart --all` uses the same selection and stop loop, then starts the selected rows.
@@ -91,12 +91,13 @@ The [launch-name policy](shutdown-and-restart.md#launch-names) supplies current 
 - On natedev, `herdr-agents.service` is a transient unit that `systemd-run` creates.
   The upkeep timer restores producers through shared resume.
   It does not run `pane_restore.py`.
-- The herdr startup path adopts an answering server. Otherwise it starts one with
-  `systemd-run` on Linux. On the Mac it starts the server directly from a desktop
-  session, or opens an attach window to start it from a non-desktop session.
-  Herdr can replay saved pane commands when its configuration allows agent restore.
-  Claude commands wrapped by `lib/relaunch.py` recover the matching conversation's
-  session labels and resume note. This is separate from `agents restart`.
+- The server start functions take the shared reboot lock before they check for an answering server.
+  On Linux, the start uses `systemd-run` or the installed server unit.
+  On the Mac, a desktop session starts the server directly.
+  A non-desktop session opens an attach window to start the server.
+  The standalone attach command connects in client mode after the server is ready.
+  Remote attach runs the same command through SSH on the target host.
+  A native restore through `lib/relaunch.py` can recover a Claude conversation's labels and resume note.
 - `pane_restore.py` is an explicit command for staff rows and saved panes without staff rows.
   No service invokes it automatically.
 

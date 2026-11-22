@@ -550,39 +550,22 @@ class HerdrSessionsTests(unittest.TestCase):
             self.assertNotIn("Traceback", error)
         self.assertEqual(self.commands(), [])
 
-    def test_remote_attach_focuses_the_hosts_tab_then_attaches_its_shared_session(self) -> None:
+    def test_remote_attach_uses_the_hosts_guarded_attach_command(self) -> None:
         self.respond([], error="local sessions unreadable")
-        with patch.object(subprocess, "run", return_value=subprocess.CompletedProcess(["ssh"], 0, "desk\n", "")) as remote, \
-                patch.object(os, "execvp", side_effect=SystemExit(0)) as execute:
+        with patch.object(os, "execvp", side_effect=SystemExit(0)) as execute:
             with self.assertRaises(SystemExit) as replaced:
-                _ = self.call("attach-remote", "user@mac", "writing")
+                _ = self.call("attach-remote", "user@mac", "writing tools")
         self.assertEqual(replaced.exception.code, 0)
-        remote.assert_called_once_with(
-            ["ssh", "user@mac", "~/.claude/scripts/lib/py", "~/.claude/scripts/herdr/herdr_sessions.py", "focus", "writing"],
-            capture_output=True, text=True, check=False, timeout=15,
-        )
-        binary = os.environ["HERDR_BIN"]
-        execute.assert_called_once_with(binary, [binary, "--remote", "user@mac", "--session", "desk"])
+        execute.assert_called_once_with("ssh", [
+            "ssh", "-t", "user@mac", "~/.claude/scripts/lib/py",
+            "~/.claude/scripts/herdr/herdr_sessions.py", "attach", "'writing tools'",
+        ])
         self.assertEqual(self.commands(), [])
 
     def test_remote_attach_exec_failure_names_its_host(self) -> None:
-        with patch.object(subprocess, "run", return_value=subprocess.CompletedProcess(["ssh"], 0, "agents\n", "")), \
-                patch.object(os, "execvp", side_effect=OSError("attach failed")):
+        with patch.object(os, "execvp", side_effect=OSError("attach failed")):
             self.assertEqual(self.call("attach-remote", "mac", "writing"),
                              (1, "", "herdr_sessions: mac: attach failed: attach failed\n"))
-        self.assertEqual(self.commands(), [])
-
-    def test_remote_attach_never_executes_after_a_failed_or_empty_lookup(self) -> None:
-        for status, output, diagnostic in (
-                (1, "agents\n", "remote focus failed"),
-                (0, " \n", "remote session is unknown")):
-            with (self.subTest(status=status),
-                  patch.object(subprocess, "run", return_value=subprocess.CompletedProcess(
-                      ["ssh"], status, output, "remote focus failed")),
-                  patch.object(os, "execvp") as execute):
-                self.assertEqual(self.call("attach-remote", "mac", "writing"),
-                                 (1, "", f"herdr_sessions: mac: {diagnostic}\n"))
-                execute.assert_not_called()
         self.assertEqual(self.commands(), [])
 
     def test_help_explains_remote_list_and_attach(self) -> None:
@@ -609,13 +592,24 @@ class HerdrSessionsTests(unittest.TestCase):
                 _ = self.call("attach", "target")
         self.assertEqual(replaced.exception.code, 0)
         binary = os.environ["HERDR_BIN"]
-        execute.assert_called_once_with(binary, [binary, "session", "attach", "agents"])
+        execute.assert_called_once_with(binary, [binary, "--session", "agents", "client"])
         self.assertEqual(self.commands(), [["--session", "default", "session", "list", "--json"],
                                            ["--session", "agents", "pane", "list"],
                                            ["--session", "agents", "pane", "list"],
                                            ["--session", "agents", "pane", "process-info", "--pane", "w1:p1"],
                                            ["--session", "agents", "pane", "process-info", "--pane", "w1:p2"],
                                            *self.focused("w1:t2")])
+
+    def test_attach_cannot_restore_a_server_during_reboot(self) -> None:
+        lock = herdr.reboot_lock_path()
+        lock.parent.mkdir(parents=True, exist_ok=True)
+        with (lock.open("a") as held, patch.object(herdr, "live_sessions", return_value=[]),
+              patch.object(herdr, "run_program") as command, patch.object(os, "execvp") as execute):
+            fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self.assertEqual(self.call("attach", "target"),
+                             (1, "", "A reboot is running; wait for it to end.\n"))
+        command.assert_not_called()
+        execute.assert_not_called()
 
     def test_focus_shows_the_named_tab_and_prints_the_shared_session(self) -> None:
         for shown in (None, "old-member-title"):
@@ -681,7 +675,7 @@ class HerdrSessionsTests(unittest.TestCase):
             ["--session", "agents", "pane", "list"], ["--session", "agents", "pane", "list"],
             ["--session", "agents", "pane", "process-info", "--pane", "w1:p1"],
             *self.focused("w1:t1"),
-            ["session", "attach", "agents"],
+            ["--session", "agents", "client"],
         ])
 
     def test_herdr_failure_returns_unreadable_status(self) -> None:
@@ -859,9 +853,9 @@ class StandaloneLaunchTests(unittest.TestCase):
 
 
     def test_start_and_resume_refuse_before_herdr_when_reboot_holds_the_lock(self) -> None:
-        directory = herdr.reboot_state_directory()
-        directory.mkdir(parents=True)
-        with (directory / "lock").open("a") as external:
+        lock = herdr.reboot_lock_path()
+        lock.parent.mkdir(parents=True)
+        with lock.open("a") as external:
             fcntl.flock(external, fcntl.LOCK_EX | fcntl.LOCK_NB)
             for arguments in (("start", "--name", "solo"), ("resume", "solo", "--session-id", "saved")):
                 with self.subTest(arguments=arguments):
@@ -905,7 +899,7 @@ class StandaloneLaunchTests(unittest.TestCase):
         self.assertFalse(any("CLAUDE_CONFIG_DIR=" in value for value in workspace))
         self.assertFalse(any(command[2:4] in (["agent", "prompt"], ["pane", "send-keys"]) for command in self.commands()))
         binary = os.environ["HERDR_BIN"]
-        self.assertEqual(self.attachments, [(binary, [binary, "session", "attach", "agents"])])
+        self.assertEqual(self.attachments, [(binary, [binary, "--session", "agents", "client"])])
 
     def test_start_and_resume_reruns_open_no_second_tab(self) -> None:
         self.destination()

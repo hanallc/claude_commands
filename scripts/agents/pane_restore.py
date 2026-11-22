@@ -174,7 +174,11 @@ def main(arguments: list[str] | None = None) -> int:
     _ = parser.add_argument("--dry-run", action="store_true")
     options = parser.parse_args(arguments)
     session = cast(str, options.session) or herdr.shared_session()
-    _ = herdr.start_server(session, SERVER_TIMEOUT_MS)
+    try:
+        _ = herdr.start_server(session, SERVER_TIMEOUT_MS)
+    except herdr.RebootLockBusy as error:
+        print(error, file=sys.stderr)
+        return 1
     return restore(session, dry_run=cast(bool, options.dry_run))
 
 

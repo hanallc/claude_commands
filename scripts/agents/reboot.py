@@ -405,6 +405,7 @@ def run(*, dry_run: bool = False) -> int:
             with herdr.reboot_lock(exclusive=True):
                 if herdr.shared_session() != herdr.SHARED_SESSION:
                     raise ValueError("The shared Herdr session must be named agents")
+                state.mkdir(parents=True, exist_ok=True)
                 checkpoint = state / "reboot.json"
                 if not checkpoint.exists():
                     # Move any checkpoint from the earlier log folder layout.
