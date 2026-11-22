@@ -1303,3 +1303,16 @@ Ordered after the red main repair and the guard repair (builds). It does not mov
 - **Files:** the listed files; `scripts/lib/testing_folders.py` only if a helper is missing.
 - **Workers:** 2 writers by folder group if the list is long.
 - **Acceptance gate:** the changed modules pass in tests-only gates after the builds go; the guard test passes; basedpyright zero on changed files; one blind review.
+
+### Phase 432 — the disk snapshot test reads no live sccache folder  · status: todo
+**Depends on:** none
+
+#### Work Order
+- **Goal:** builds 01:17 (sdlc; devtools saw it at 01:00 and 01:14): `buildlog/test_disk.py:730` `test_snapshot_reads_the_file_it_will_replace` fails at random. `disk.py:407-409` adds the live `SCCACHE_DIR` as a scanned folder; the sort at `disk.py:213` can put its zero-growth row first, so `assertGreater(outside_build_caches[0]["growth_bytes"], 0)` sees 0.
+- **Spec:**
+  1. The test sets its own fixture: `SCCACHE_DIR` is unset, or points at a fixture folder, for every snapshot in the test. Prefer the fixture class, so no test in the module reads the live cache.
+  2. Keep every assertion. Change no product code.
+  3. No config key changes.
+- **Files:** `scripts/buildlog/test_disk.py`.
+- **Workers:** 1 writer.
+- **Acceptance gate:** the test passes with a live `SCCACHE_DIR` set; the module passes in one tests-only gate after the builds go; basedpyright zero on the changed file; one blind review.
