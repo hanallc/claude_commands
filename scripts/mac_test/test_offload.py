@@ -1022,7 +1022,7 @@ class VerifyMirrorWaitTests(verify_mac_offload_test_support.VerifyMacOffloadFixt
 class OffloadCommandTests(OffloadCommandFixture):
     def test_waiter_hands_relative_path_claim_to_runner_for_cleanup_only(self) -> None:
         assignment = self.assignment_options(self.repository, "nextest", self.config_path, ())
-        retained = self.write_kept_claim()
+        retained = self.write_kept_claim(legacy=True)
         _ = self.claim_file.write_text(json.dumps({**retained, "worktree": "."}))
         reservation = self.root / "reservation"
         identity = self.root / "reservation.identity"
