@@ -52,6 +52,20 @@ Order the latest run's module attempts with this query:
 buildlog query "SELECT module, module_started_at, module_ended_at FROM gate_modules WHERE run_id = (SELECT id FROM gate_runs ORDER BY started_at DESC LIMIT 1) ORDER BY module_started_at"
 ```
 
+## Whole gate route
+
+The Mac Linux guest runs the whole test selection when `enabled.mac-linux=on` and the queue assigns the gate to `mac-linux`.
+The gate reads the target from the bounded assignment file at `BUILDLOG_PLACEMENT_FILE`.
+It reads the guest switch only for a `mac-linux` target.
+The assignment must match the gate's placement episode and submitting process.
+The queue must confirm that the saved attempt is current.
+The gate uses the cloud route when the guest is off or the queue has no `mac-linux` assignment for this gate.
+The guest test timer uses `run.time_limit_seconds`.
+The guest and SSH deadlines allow extra time for setup, cleanup, and result transfer.
+When the test timer expires, the gate returns the guest's time-limit report.
+If the guest cannot return a result, the gate prints `Mac Linux gate falls back: <reason>` and tries the cloud route.
+If the cloud route returns a fallback reason, natedev runs the selection.
+
 ## Cloud gate route
 
 Merge gates and targeted tests use one fresh Spot instance for each attempt after the user deploys the gate resources.
