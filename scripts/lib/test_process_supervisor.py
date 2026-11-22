@@ -1,7 +1,7 @@
 """Exercise ownership across process groups, sessions, and owner death."""
 from __future__ import annotations
 
-from contextlib import suppress
+from contextlib import closing, suppress
 import os
 from pathlib import Path
 import select
@@ -16,7 +16,7 @@ from unittest.mock import patch
 
 from scripts.direct.wait_for_test_state import wait_until
 from scripts.lib import process_supervisor
-from scripts.lib.process_supervisor import ManagedProcess, launch
+from scripts.lib.process_supervisor import ManagedProcess, launch, mac_process_events, open_linux_process_descriptor
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
@@ -341,23 +341,22 @@ class ProcessSupervisorTests(unittest.TestCase):
 
     def stopped(self, pids: set[int], timeout: float = TEST_HANG_GUARD_SECS) -> None:
         deadline = time.monotonic() + timeout
+        platform = sys.platform
         for pid in sorted(pids):
             remaining = max(0, deadline - time.monotonic())
             with suppress(ProcessLookupError):
-                if sys.platform == "linux":
-                    descriptor = os.pidfd_open(pid)
+                if platform == "linux":
+                    descriptor = open_linux_process_descriptor(pid)
                     try:
                         self.assertTrue(select.select([descriptor], [], [], remaining)[0], f"{pid} still runs.")
                     finally:
                         os.close(descriptor)
                 else:
-                    queue = select.kqueue()
-                    try:
-                        subscription = select.kevent(pid, filter=select.KQ_FILTER_PROC,
-                            flags=select.KQ_EV_ADD | select.KQ_EV_ONESHOT, fflags=select.KQ_NOTE_EXIT)
+                    source = mac_process_events()
+                    with closing(source.kqueue()) as queue:
+                        subscription = source.kevent(pid, filter=source.KQ_FILTER_PROC,
+                            flags=source.KQ_EV_ADD | source.KQ_EV_ONESHOT, fflags=source.KQ_NOTE_EXIT)
                         self.assertTrue(queue.control([subscription], 1, remaining), f"{pid} still runs.")
-                    finally:
-                        queue.close()
 
     def test_owner_sigkill_stops_several_sessions_and_separate_groups(self) -> None:
         control = self.owner(PAUSE)
@@ -438,7 +437,8 @@ signal.pause()
 """], stdin=subprocess.PIPE, stdout=subprocess.PIPE))
         child, = self.line(outer)
         self.assertEqual(os.getsid(child), child)
-        if sys.platform == "linux":
+        platform = sys.platform
+        if platform == "linux":
             outer.close()
             self.assertFalse(Path(f"/proc/{child}").exists(), "The detached child must be reaped.")
         else:
@@ -452,6 +452,7 @@ signal.pause()
     def test_close_rescans_when_a_listed_parent_forks_and_exits(self) -> None:
         root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         record = root / "child.pid"
+        platform = sys.platform
         with launch([sys.executable, "-c", CUSTOM_GUARDIAN, FORK_DURING_CLEANUP, "close",
                      FORKING_PARENT, str(record)], cwd=ROOT, stdin=subprocess.PIPE) as owner:
             assert owner.stdin is not None
@@ -459,7 +460,7 @@ signal.pause()
                 self.assertEqual(owner.wait(15), 0)
                 child = int(record.read_text())
                 self.stopped({child}, timeout=5)
-                if sys.platform == "linux":
+                if platform == "linux":
                     self.assertFalse(Path(f"/proc/{child}").exists(), "The adopted child must be reaped.")
             finally:
                 owner.stdin.close()
@@ -557,7 +558,7 @@ if sys.argv[1] == "running":
                 second, = self.line(workload)
                 self.assertIn(0, (first, second))
                 child = first or second
-                descriptor = os.pidfd_open(child)
+                descriptor = open_linux_process_descriptor(child)
                 try:
                     events = select.poll()
                     events.register(descriptor, select.POLLHUP)

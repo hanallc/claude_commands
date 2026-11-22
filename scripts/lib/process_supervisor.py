@@ -18,7 +18,7 @@ import subprocess
 import sys
 import threading
 import time
-from typing import IO, Literal, Self, cast, final, overload
+from typing import IO, Literal, Protocol, Self, cast, final, overload, runtime_checkable
 
 
 STARTUP_SECONDS = 30
@@ -42,6 +42,58 @@ def _close_forked_writers() -> None:
 
 os.register_at_fork(before=_writer_lock.acquire, after_in_parent=_writer_lock.release,
                     after_in_child=_close_forked_writers)
+
+
+@runtime_checkable
+class _LinuxProcessDescriptors(Protocol):
+    def pidfd_open(self, pid: int, /) -> int: ...
+
+
+@runtime_checkable
+class _LinuxProcessSignals(Protocol):
+    def pidfd_send_signal(self, descriptor: int, signum: int, /) -> None: ...
+
+
+def open_linux_process_descriptor(pid: int) -> int:
+    """Open a Linux descriptor for this process."""
+    if not isinstance(os, _LinuxProcessDescriptors):
+        raise OSError(errno.ENOSYS, "Linux process descriptors are unavailable.")
+    return os.pidfd_open(pid)
+
+
+class MacProcessEvent(Protocol):
+    @property
+    def ident(self) -> int: ...
+
+    @property
+    def filter(self) -> int: ...
+
+
+class MacProcessEventQueue(Protocol):
+    def control(self, changes: Sequence[MacProcessEvent] | None, max_events: int,
+                timeout: float | None = None, /) -> list[MacProcessEvent]: ...
+
+    def close(self) -> None: ...
+
+
+@runtime_checkable
+class MacProcessEvents(Protocol):
+    KQ_FILTER_READ: int
+    KQ_FILTER_PROC: int
+    KQ_EV_ADD: int
+    KQ_EV_ONESHOT: int
+    KQ_NOTE_EXIT: int
+
+    def kqueue(self, /) -> MacProcessEventQueue: ...
+
+    def kevent(self, ident: int, /, *, filter: int, flags: int, fflags: int = 0) -> MacProcessEvent: ...
+
+
+def mac_process_events() -> MacProcessEvents:
+    """Get the native events for pipe reads and process exits."""
+    if not isinstance(select, MacProcessEvents):
+        raise OSError(errno.ENOSYS, "macOS process events are unavailable.")
+    return select
 
 
 @final
@@ -103,7 +155,8 @@ class ManagedProcess[Output: (str, bytes)]:
         self._closed = False
         self._output: dict[IO[Output], bytearray] = {}
         self._mac_start = 0
-        if sys.platform == "darwin":
+        platform = sys.platform
+        if platform == "darwin":
             with suppress(ProcessLookupError):
                 self._mac_start = _mac_process_start(pid)
 
@@ -136,7 +189,8 @@ class ManagedProcess[Output: (str, bytes)]:
     def send_signal(self, signum: int) -> None:
         if self.poll() is None:
             with suppress(ProcessLookupError):
-                if sys.platform == "linux":
+                platform = sys.platform
+                if platform == "linux":
                     _signal_linux_member(self.pid, self.session_id, signum)
                 elif self._mac_start:
                     _signal_mac_member(self.pid, self.session_id, self._mac_start, signum)
@@ -374,7 +428,9 @@ def _watch_linux(owner_read: int, status_write: int, child: subprocess.Popen[byt
 
 
 def _signal_linux_member(pid: int, session: int, signum: int) -> None:
-    descriptor = os.pidfd_open(pid)
+    if not isinstance(signal, _LinuxProcessSignals):
+        raise OSError(errno.ENOSYS, "Linux process descriptor signals are unavailable.")
+    descriptor = open_linux_process_descriptor(pid)
     try:
         if os.getsid(pid) == session:
             signal.pidfd_send_signal(descriptor, signum)
@@ -482,12 +538,13 @@ def _watch_mac(owner_read: int, status_write: int, child: subprocess.Popen[bytes
     reported = False
     nested_results: list[int] = []
     try:
-        with closing(select.kqueue()) as events:
-            read_events = [select.kevent(descriptor, filter=select.KQ_FILTER_READ, flags=select.KQ_EV_ADD)
+        source = mac_process_events()
+        with closing(source.kqueue()) as events:
+            read_events = [source.kevent(descriptor, filter=source.KQ_FILTER_READ, flags=source.KQ_EV_ADD)
                            for descriptor in (owner_read, registrations.fileno())]
             _ = events.control(read_events, 0)
-            exit_event = select.kevent(child.pid, filter=select.KQ_FILTER_PROC,
-                flags=select.KQ_EV_ADD | select.KQ_EV_ONESHOT, fflags=select.KQ_NOTE_EXIT)
+            exit_event = source.kevent(child.pid, filter=source.KQ_FILTER_PROC,
+                flags=source.KQ_EV_ADD | source.KQ_EV_ONESHOT, fflags=source.KQ_NOTE_EXIT)
             try:
                 _ = events.control([exit_event], 0)
             except ProcessLookupError:
@@ -500,11 +557,11 @@ def _watch_mac(owner_read: int, status_write: int, child: subprocess.Popen[bytes
                 reported = True
             while True:
                 ready = events.control(None, 3)
-                if any(event.filter == select.KQ_FILTER_READ and event.ident == owner_read for event in ready):
+                if any(event.filter == source.KQ_FILTER_READ and event.ident == owner_read for event in ready):
                     if not os.read(owner_read, 1):
                         break
                 for event in ready:
-                    if event.filter == select.KQ_FILTER_PROC:
+                    if event.filter == source.KQ_FILTER_PROC:
                         if not reported:
                             _report(status_write, str(child.wait()))
                             reported = True
@@ -529,7 +586,8 @@ def _supervise(owner_read: int, status_write: int, command: Sequence[str], envir
         return 0
     with ExitStack() as descriptors:
         try:
-            if sys.platform == "linux":
+            platform = sys.platform
+            if platform == "linux":
                 _enable_linux_subreaper()
                 child = subprocess.Popen(command, env=environment, process_group=0)
                 watch = partial(_watch_linux, owner_read, status_write, child)

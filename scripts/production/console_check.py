@@ -91,7 +91,8 @@ def case_visits(directory: Path) -> list[PageVisit]:
 def browser_command() -> list[str]:
     browser = next((path for name in ("google-chrome", "chromium", "chromium-browser")
                     if (path := shutil.which(name))), "")
-    if not browser and sys.platform == "darwin":
+    platform = sys.platform
+    if not browser and platform == "darwin":
         chrome = Path("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome")
         if os.access(chrome, os.X_OK):
             browser = str(chrome)

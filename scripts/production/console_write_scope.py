@@ -17,7 +17,8 @@ WRITE_FLAGS = os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_TRUNC | os.O_APPEND
 
 
 def descriptor_path(descriptor: int) -> Path:
-    if sys.platform == "darwin":
+    platform = sys.platform
+    if platform == "darwin":
         result = fcntl.fcntl(descriptor, getattr(fcntl, "F_GETPATH", 50), bytes(1024))
         return Path(os.fsdecode(result.split(b"\0", 1)[0]))
     return Path(os.readlink(f"/proc/self/fd/{descriptor}"))
