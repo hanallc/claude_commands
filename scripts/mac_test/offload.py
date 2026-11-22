@@ -2230,7 +2230,10 @@ def runner_values(config: OffloadConfig, target: str) -> dict[str, str]:
 
 
 def remote_cleanup_command(config: OffloadConfig, request: OffloadRequest, repository: KnownRepository) -> str:
-    """Trim the mirror budget before the run releases its lease."""
+    """Trim the mirror budget before the run releases its lease.
+
+    The cleanup runs after the verdict line. It writes only markers: any other line would clear the verdict.
+    """
     if any(word == "--target-dir" or word.startswith("--target-dir=") for word in request.nextest_words):
         return "echo mac_cleanup=skipped"
     budget = config.values.get(f"mac_budget_gib.{repository.name}", config.default_target_budget_gib)
@@ -2243,7 +2246,7 @@ def remote_cleanup_command(config: OffloadConfig, request: OffloadRequest, repos
     )
     floor = shlex.quote(f"{config.free_floor_gib:g}")
     return (
-        f'cd "$HOME"/{shlex.quote(remote_mirror(repository, request.target, request.slot))} && '
+        f'{{ cd "$HOME"/{shlex.quote(remote_mirror(repository, request.target, request.slot))} && '
         + 'trim_started=$(date +%s); '
         + f'if LINT_SWEEP_BUDGET_GIB={shlex.quote(budget)} "$HOME/.claude/scripts/lib/py" '
         + f'-B -c {shlex.quote(program)} "$HOME"/{target} >/dev/null 2>&1; then '
@@ -2265,7 +2268,7 @@ def remote_cleanup_command(config: OffloadConfig, request: OffloadRequest, repos
         + "size_kib=${size_kib%%[[:space:]]*}; else size_kib=-; fi; "
         + f'if rm -rf -- "$HOME"/{target}; then '
         + "printf 'mac_cleanup=0 %s %s\\n' \"$size_kib\" \"$free_gib\"; "
-        + "else echo mac_cleanup=$?; fi; else echo mac_cleanup=kept; fi"
+        + "else echo mac_cleanup=$?; fi; else echo mac_cleanup=kept; fi; } 2>/dev/null"
     )
 
 
@@ -2977,6 +2980,9 @@ def claimed_run(
         if isinstance(remote_status, MacNextestSetupFailed) or setup_failed:
             if not linux:
                 evidence.execution = execution_identity.ExecutionNotStarted()
+            if routed_mac_command and not release_allowed:
+                # A retry would run beside the Mac claim that this run still holds.
+                return MacCleanupUnconfirmed(seconds, "nextest setup failed and the cleanup")
             return declined("state", started)
         if remote_status.status == 0:
             fixed = (return_fix(controller, config, request, repository, copied.tree_key)

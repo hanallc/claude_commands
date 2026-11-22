@@ -1864,6 +1864,21 @@ class OffloadCommandTests(OffloadCommandFixture):
                 self.assertEqual(observed["CLICOLOR"], "call-value")
                 self.assertEqual(observed["LC_TERMINAL"], "target-terminal")
 
+    def test_mac_cleanup_writes_only_markers_after_the_verdict(self) -> None:
+        request = offload.OffloadRequest(
+            self.repository, "hana", "call", offload.NO_RESULT_FILE, (), owner="verify", holder_session="fixture-session")
+        with mock.patch.dict(os.environ, self.environment, clear=True):
+            config = eligibility.read_config(self.config_path)
+            cleanup = offload.remote_cleanup_command(config, request, eligibility.KnownRepository("hana"))
+        # Linux df has no -g option, so the cleanup writes an error line here.
+        result = subprocess.run(["bash", "-c", "echo mac_exit=42; " + cleanup], cwd=self.root,
+                                env={**self.environment, "HOME": str(self.root), "PATH": os.environ["PATH"]},
+                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, check=False, timeout=30)
+        verdict, *after = result.stdout.splitlines()
+        self.assertEqual(verdict, "mac_exit=42")
+        self.assertTrue(after, result.stdout)
+        self.assertTrue(all(line.startswith(("mac_trim=", "mac_cleanup=")) for line in after), result.stdout)
+
     def test_probe_copy_and_run_arguments_preserve_nextest_words(self) -> None:
         _ = (self.repository / ".gitignore").write_text(
             "generated/\n", encoding="utf-8"

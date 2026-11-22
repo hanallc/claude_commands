@@ -49,6 +49,9 @@ class VerifySshRetainedTests(VerifySshTargetsFixture):
     def test_mac_check_cleanup_timeout_preserves_the_failed_verdict(self) -> None:
         self.check_lost_mac("cleanup-stream-timeout", status=42, command="check")
 
+    def test_mac_setup_failure_with_cleanup_timeout_ends_without_a_retry(self) -> None:
+        self.check_lost_mac("setup-failure-cleanup-timeout")
+
     def test_lost_mac_check_releases_the_verify_place_and_keeps_the_claim(self) -> None:
         self.check_lost_mac("lost-cleanup-timeout", command="check")
 
@@ -95,7 +98,9 @@ class VerifySshRetainedTests(VerifySshTargetsFixture):
             self.assertEqual(self.attempts(), [])
         else:
             attempt, = self.attempts()
-            expected = ("lost", "missing") if status == 2 else ("failed", "confirmed")
+            # A setup failure is an observed end; only its cleanup is lost.
+            lost_end = "confirmed" if mode == "setup-failure-cleanup-timeout" else "missing"
+            expected = ("lost", lost_end) if status == 2 else ("failed", "confirmed")
             self.assertEqual((attempt["outcome"], attempt["completion"]), expected)
             self.assertEqual(attempt["cleanup"], "unconfirmed")
         if mode == "post-fetch-cleanup-timeout":

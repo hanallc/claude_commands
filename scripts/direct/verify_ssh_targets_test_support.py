@@ -221,10 +221,11 @@ def stream(arguments, *limits):
     if mode == "missing-result-after-authorization":
         (root / "mac-loss-ready").touch()
         os._exit(75)
-    if mode == "cleanup-stream-timeout" or (
+    if mode in ("cleanup-stream-timeout", "setup-failure-cleanup-timeout") or (
             mode == "post-fetch-cleanup-timeout" and limits and isinstance(limits[0], offload.CleanupOnly)):
         (root / "mac-loss-ready").touch()
-        remote_output, remote_status = "mac_exit=42\n", 42
+        remote_output, remote_status = ((offload.MAC_NEXTTEST_SETUP_FAILURE + "\n", 101)
+                                        if mode == "setup-failure-cleanup-timeout" else ("mac_exit=42\n", 42))
         program = f"import os, select; print({remote_output.rstrip()!r}, flush=True); "
         if mode == "post-fetch-cleanup-timeout":
             program += "os.close(1); os.close(2); "
@@ -280,7 +281,7 @@ real_fetch = offload.fetch_folder
 def commands(arguments, **options):
     if arguments[0] == "ssh":
         actions.append("cleanup")
-        if mode in ("cleanup-stream-timeout", "post-fetch-cleanup-timeout"):
+        if mode in ("cleanup-stream-timeout", "setup-failure-cleanup-timeout", "post-fetch-cleanup-timeout"):
             raise AssertionError("A timed-out stream must not start another cleanup")
         if mode in ("lost-cleanup-timeout", "lost-authorization-reply"):
             (root / "mac-loss-ready").touch()
