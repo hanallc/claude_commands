@@ -215,6 +215,7 @@ The shared receipt lets `answer` request a fresh DONE after all detached results
 Use `assign.sh` for new work.
 An assignment with changed prompt content checks the dispatch receipt.
 For a complete receipt, the recovery instruction says the result is complete and the completion notice follows.
+If DONE is present and detached results are pending, the recovery instruction reports the wait and gives no command.
 Other recovery instructions use the current pane state.
 A blocked Codex question receives only the supplied answer text.
 Other answers include the saved completion ID in the DONE instruction.
