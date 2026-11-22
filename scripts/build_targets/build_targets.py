@@ -445,6 +445,9 @@ def fixed_remote_candidates(
     from scripts.build_targets import target_config
     from scripts.mac_test import eligibility
 
+    if target.name == eligibility.MAC_LINUX_TARGET:
+        return (fixed_mac_linux_candidate(target, settings, repo_root, command, rule),)
+
     provider: Literal["mac", "ssh"] = "mac" if target.platform == "macos" else "ssh"
     policy: placement.AllowedHost | placement.FixedExclusion = placement.AllowedHost()
     try:
@@ -503,6 +506,38 @@ def fixed_remote_candidates(
         claim_state.RepositoryScope(scope.name, scope.key, slot)
             if target.platform == "linux" and isinstance(scope, claim_state.RepositoryScope) else scope,
         slot if target.platform == "linux" else 0), policy, settings) for slot in range(1, slots + 1))
+
+
+def fixed_mac_linux_candidate(target: SshTarget, settings: ProviderSettings, repo_root: Path,
+                               command: tuple[str, ...], rule: AnyTarget | NatedevOnly
+                               ) -> placement.PlacementCandidate:
+    """Name the single guest slot for a supported gate."""
+    from scripts.build_queue import placement
+    from scripts.build_queue.admission_jobs import StepJob
+    from scripts.build_targets import mac_linux
+    from scripts.lib import build_folders
+    from scripts.lib.build_steps import gate_job_for_command
+
+    host = target.name
+    policy: placement.AllowedHost | placement.FixedExclusion
+    job = gate_job_for_command(command)
+    if isinstance(rule, NatedevOnly):
+        policy = placement.FixedExclusion(rule.reason)
+    elif not isinstance(job, StepJob) or job.step not in ("test-affected", "test-all", "test-modules", "test-nightly", "integrate"):
+        policy = placement.FixedExclusion("command")
+    else:
+        try:
+            if build_folders.repo_word(repo_root) == "claude":
+                host = mac_linux.read_settings(conf.read("build_targets")).ssh_hops[1]
+                policy = placement.AllowedHost()
+            else:
+                policy = placement.FixedExclusion("repo")
+        except build_folders.InvalidFolderForm:
+            policy = placement.FixedExclusion("repo")
+        except (conf.Unusable, mac_linux.GuestUnavailable):
+            policy = placement.FixedExclusion("mac_linux_settings_unreadable")
+    destination = placement.PlacementDestination("ssh", target.name, host, claim_state.RepositoryScope("claude", slot=1), 1)
+    return placement.PlacementCandidate(destination, policy, settings)
 
 
 def command_constraints(args: CliArguments) -> int:

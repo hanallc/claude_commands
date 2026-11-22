@@ -1140,6 +1140,7 @@ class WaitingStep:
     verify: VerifyStep = field(default=NotVerifyCall(), kw_only=True)
     job: StepJob | GateJobNotRecorded = field(default=GATE_JOB_NOT_RECORDED, kw_only=True)
     ci_runner: str = field(default="", kw_only=True)
+    placement_candidates: tuple[placement.CandidateEligibility, ...] = field(default=(), kw_only=True)
 
 
 @dataclass(frozen=True)
@@ -1158,6 +1159,8 @@ class RunningStep:
     project: str = ""
     execution: execution_identity.ExecutionEvidence = execution_identity.ExecutionNotStarted()
     assignment_host: str = ""
+    assignment_target: str = field(default="", kw_only=True)
+    placement_candidates: tuple[placement.CandidateEligibility, ...] = field(default=(), kw_only=True)
     mac_placement: str = field(default="", kw_only=True)
     package: str | PackageNotRecorded = field(default=PackageNotRecorded(), kw_only=True)
     route: StepRoute = field(default=DIRECT_CARGO, kw_only=True)
@@ -1360,6 +1363,8 @@ class QueueInputs:
     local_machine: str = field(default="natedev", kw_only=True)
     run_limit_exempt_owners: frozenset[str] = field(default=frozenset(), kw_only=True)
     verify_run_counts: Mapping[str, int] = field(default_factory=dict[str, int], kw_only=True)
+    placement_candidates: dict[str, tuple[placement.CandidateEligibility, ...]] = field(
+        default_factory=dict[str, tuple[placement.CandidateEligibility, ...]], kw_only=True)
 
     def __post_init__(self) -> None:
         orders = {waiter_owner(row): (waiter_priority(row) if isinstance(row.get("order"), (PriorityUnit, NormalOrder))

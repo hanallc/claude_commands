@@ -150,6 +150,45 @@ PlacementEvidenceKeys = dict[tuple[str, placement.PlacementDestination], placeme
 
 
 @dataclass(frozen=True)
+class MacLinuxReadyForProbe:
+    """The guest is enabled and its backoff permits a reading."""
+
+    registry: conf.ConfigRead
+    failed_at: float
+
+
+def mac_linux_backoff(now: float) -> MacLinuxReadyForProbe | placement.TemporaryExclusion:
+    from scripts.mac_test import eligibility
+
+    try:
+        registry = _provider_configuration().read("build_targets")
+        target = records.effective_target(eligibility.MAC_LINUX_TARGET,
+            placement.ConfiguredProviderSettings(), configuration=registry)
+        if not isinstance(target, target_config.SshTarget):
+            return placement.TemporaryExclusion("mac_linux_unregistered")
+        if target.platform != "linux":
+            return placement.TemporaryExclusion("mac_linux_settings_unreadable")
+        if not eligibility.mac_linux_enabled(registry):
+            return placement.TemporaryExclusion("mac_linux_off")
+    except (OSError, ValueError):
+        return placement.TemporaryExclusion("mac_linux_settings_unreadable")
+    try:
+        backoff = eligibility.read_backoff(now, eligibility.MAC_LINUX_TARGET, strict=True)
+        if isinstance(backoff, eligibility.ActiveBackoff):
+            return placement.TemporaryExclusion("mac_linux_backoff")
+        if isinstance(backoff, eligibility.UnreadableBackoff):
+            return placement.TemporaryExclusion("mac_linux_backoff_unreadable")
+        failed_at = eligibility.backoff_path(eligibility.MAC_LINUX_TARGET).stat().st_mtime
+    except target_config.ConfigError:
+        return placement.TemporaryExclusion("mac_linux_unregistered")
+    except FileNotFoundError:
+        failed_at = float("-inf")
+    except OSError:
+        return placement.TemporaryExclusion("mac_linux_backoff_unreadable")
+    return MacLinuxReadyForProbe(registry, failed_at)
+
+
+@dataclass(frozen=True)
 class NoReadingHold:
     """No unreadable reading currently holds a queued start."""
 
@@ -2835,7 +2874,30 @@ class AdmissionServer:
         return wire.CloudQueueRead(reading.view, reading.explanation, reading.ordered, reading.diagnostics,
             tuple(rows), slots, cloud_gate_stale_pushes=configuration.cloud_gate_stale_pushes)
 
+    def _placement_wait_reading(self, reading: records.QueueRead) -> records.QueueRead:
+        candidates = reading.explanation.decided_from.placement_candidates
+        if not candidates:
+            return reading
+        waiting = [replace(step, placement_candidates=candidates.get(records.waiter_owner(row), ()))
+                   for step, (_, row) in zip(reading.view.waiting, reading.ordered, strict=True)]
+        ordered = list(reading.ordered)
+        represented = {records.waiter_owner(row) for _, row in ordered}
+        for path, row in self._queue_order()[0]:
+            owner = records.waiter_owner(row)
+            if owner in represented or owner not in candidates:
+                continue
+            represented.add(owner)
+            waiting.append(records.WaitingStep(row["pid"], row.get("session_id", ""), row.get("session_name", ""),
+                row.get("step", ""), row.get("folder", ""), row["since"], row["need"],
+                records.ReadingUnavailable("waiting for placement"), row.get("unit", ""),
+                project=gate.step_project(row.get("repository_name", "")), run=row.get("build_run", NoLiveBuildRun()),
+                route=records.waiter_route(row), verify=row.get("verify", records.NotVerifyCall()),
+                job=row.get("job", GATE_JOB_NOT_RECORDED), placement_candidates=candidates[owner]))
+            ordered.append((path, row))
+        return replace(reading, view=replace(reading.view, waiting=tuple(waiting)), ordered=ordered)
+
     def _placement_reading(self, reading: records.QueueRead) -> records.QueueRead:
+        reading = self._placement_wait_reading(reading)
         remote: list[records.RunningStep] = []
         waiting_episodes = {waiting.request.placement_episode for waiting in self.verify_run_waiters.values()}
         for key, saved in self.assignments.items():
@@ -2863,6 +2925,7 @@ class AdmissionServer:
             if not isinstance(saved.state, placement.CurrentAssignment) and not retained:
                 continue
             identity = request.identity
+            guest = assignment.destination.target == "mac-linux"
             pid: int | records.PidNotRecorded = records.PidNotRecorded()
             if isinstance(evidence, execution_identity.ObservedExecution) and isinstance(evidence.identity, execution_identity.ProcessExecution):
                 pid = evidence.identity.pid
@@ -2871,6 +2934,9 @@ class AdmissionServer:
                 pid=pid, started_at=saved.permission.consumed_at if isinstance(saved.permission, placement.PermissionConsumed) else 0,
                 unit=identity.unit, project=gate.step_project(request.profile.repo), execution=evidence,
                 assignment_host=assignment.destination.host, verify=identity.verify,
+                assignment_target=assignment.destination.target if guest else "",
+                placement_candidates=self._guest_candidate_reading(request) if guest else (),
+                route=request.route if guest else records.DIRECT_CARGO, job=identity.job if guest else GATE_JOB_NOT_RECORDED,
                 mac_placement=f"{assignment.episode}/{assignment.attempt}"
                     if assignment.destination.provider == "mac" else ""))
         if not remote:
@@ -3139,6 +3205,10 @@ class AdmissionServer:
             request.constraints.command_kind)
 
     def _host_probe_timeout(self, key: placement.HostEvidenceKey) -> float:
+        if key.destination.provider == "ssh" and key.destination.target == "mac-linux":
+            from scripts.build_targets.mac_linux import GUEST_REF_TIMEOUT_SECONDS
+
+            return GUEST_REF_TIMEOUT_SECONDS
         from scripts.aws_target import hana_placement
 
         with conf.report_key_changes():
@@ -3223,6 +3293,8 @@ class AdmissionServer:
                                  key: placement.HostEvidenceKey) -> placement.HostEvidence:
         destination = key.destination
         self.placement_host_keys[(request.episode, destination)] = key
+        if destination.provider == "ssh" and destination.target == "mac-linux":
+            return self._request_mac_linux_evidence(request, key)
         if destination.provider == 'ssh':
             from scripts.aws_target import hana_placement
 
@@ -3246,6 +3318,27 @@ class AdmissionServer:
         if isinstance(self.last_usable_configuration, records.MemoryConfig):
             _ = self._host_evidence_reader(key, self.last_usable_configuration.waiting_pass_seconds)
         return self.host_evidence(key)
+
+    def _request_mac_linux_evidence(self, request: wire.PlacementRequest,
+                                    key: placement.HostEvidenceKey) -> placement.FreshHostEvidence:
+        now = self.clock.now()
+        backoff = mac_linux_backoff(now)
+        if isinstance(backoff, placement.TemporaryExclusion):
+            return placement.FreshHostEvidence(key, now, "", backoff)
+        self.host_requests[key] = request
+        current = self.host_evidence(key)
+        if (isinstance(current, placement.FreshHostEvidence) and current.observed_at > backoff.failed_at
+                and isinstance(current.eligibility, placement.AllowedHost)):
+            if any(saved.assignment.destination.target == "mac-linux" and saved.assignment.episode != request.episode
+                   for attempt in self.current_assignments.values() if (saved := self.assignments.get(attempt)) is not None):
+                return replace(current, eligibility=placement.TemporaryExclusion("busy"))
+            return current
+        if isinstance(self.last_usable_configuration, records.MemoryConfig):
+            _ = self._host_evidence_reader(key, self.last_usable_configuration.waiting_pass_seconds)
+        reason = ("mac_linux_no_answer" if isinstance(current, placement.FreshHostEvidence)
+                  and current.eligibility == placement.TemporaryExclusion("mac_linux_no_answer")
+                  else "mac_linux_reading_required")
+        return placement.FreshHostEvidence(key, now, "", placement.TemporaryExclusion(reason))
 
     def _placement_evidence_key(self, request: wire.PlacementRequest,
                                 destination: placement.PlacementDestination, keys: PlacementEvidenceKeys | None = None
@@ -3320,6 +3413,8 @@ class AdmissionServer:
         request = self.host_requests[key]
         if destination.provider not in ("mac", "ssh"):
             return placement.HostEvidenceUnavailable(key, self.clock.now(), "provider uses its existing admission path")
+        if destination.provider == "ssh" and destination.target == "mac-linux":
+            return self._read_mac_linux_guest(key)
         target = records.effective_target(destination.target, key.settings)
         if isinstance(target, records.UnregisteredTarget):
             return placement.HostEvidenceUnavailable(key, self.clock.now(), "target is no longer configured")
@@ -3397,6 +3492,19 @@ class AdmissionServer:
             executions.append((reference, self._observe_provider_execution(request, destination, reference,
                 record["remote_host"], record.get("instance_generation", ""), configuration)))
         return placement.FreshHostEvidence(key, self.clock.now(), generation, eligibility, tuple(adopted), tuple(cleanup), tuple(executions), holder, diagnostic)
+
+    def _read_mac_linux_guest(self, key: placement.HostEvidenceKey) -> placement.FreshHostEvidence:
+        from scripts.build_targets import mac_linux
+
+        started_at = self.clock.now()
+        backoff = mac_linux_backoff(started_at)
+        if isinstance(backoff, placement.TemporaryExclusion):
+            return placement.FreshHostEvidence(key, started_at, "", backoff)
+        try:
+            _ = mac_linux.read_guest_main(mac_linux.read_settings(backoff.registry))
+        except (mac_linux.GuestUnavailable, OSError, ValueError, subprocess.SubprocessError):
+            return placement.FreshHostEvidence(key, started_at, "", placement.TemporaryExclusion("mac_linux_no_answer"))
+        return placement.FreshHostEvidence(key, started_at, "", placement.AllowedHost())
 
     def _observe_provider_execution(self, request: wire.PlacementRequest, destination: placement.PlacementDestination,
                                     reference: placement.ProviderClaimReference, host: str, generation: str,
@@ -4042,6 +4150,19 @@ done
                          if isinstance(record.place, wire.LocalPlace)
                          and isinstance(record.cargo_folder, placement.CargoFolder))
 
+    def _guest_candidate_reading(self, request: wire.PlacementRequest) -> tuple[placement.CandidateEligibility, ...]:
+        """Keep the named destinations and their eligibility in a queue reading."""
+        candidates = self.placement_eligibility.get(request.episode)
+        if candidates is None:
+            candidates = tuple(placement.CandidateEligibility(candidate.destination,
+                placement.EvidenceNeeded("the target reading is unavailable")
+                    if isinstance(candidate.eligibility, placement.AllowedHost) else candidate.eligibility)
+                for candidate in request.constraints.candidates)
+        selection = request.constraints.selection
+        if isinstance(selection, placement.PinnedHost):
+            candidates = tuple(candidate for candidate in candidates if candidate.destination.target == selection.target)
+        return candidates if any(candidate.destination.target == "mac-linux" for candidate in candidates) else ()
+
     def _placement_pass(self, inputs: records.QueueInputs, policy: records.AdmissionPolicy,
                         remote_start_hold_seconds: int) -> records.QueueInputs:
         """Keep pending remote starts in the local order until their holds end."""
@@ -4150,9 +4271,11 @@ done
         self.placement_holds = holds
         self.placement_hold_answers = answers
         local_order = (inputs.waiter_orders.keys() | pending_remote_starts) - removed
+        named = {owner: candidates for owner, request in owners.items()
+                 if self._placement_waiting(request) and (candidates := self._guest_candidate_reading(request))}
         return replace(inputs, ordered=[(path, row) for path, row in ordered
             if records.waiter_owner(row) in local_order], slots=tuple(self.slots.values()), cargo_folders=cargo_folders,
-            pending_remote_starts=frozenset(pending_remote_starts))
+            pending_remote_starts=frozenset(pending_remote_starts), placement_candidates=named)
 
     def _placement_hold(self, request: wire.PlacementRequest, candidate: placement.CandidateEligibility,
                         answers: dict[tuple[str, placement.PlacementDestination], float]) -> PlacementHold | None:
