@@ -4,7 +4,9 @@ from __future__ import annotations
 
 from scripts.lib.checkout_test_support import copy_test_runner
 
+from contextlib import ExitStack
 from dataclasses import dataclass
+from itertools import product
 import json
 import math
 import os
@@ -337,8 +339,10 @@ class ModuleRunnerTests(unittest.TestCase):
         )
 
     def test_config_reads_include_python_and_shell_children(self) -> None:
+        from scripts.lib import build_folders
+
         with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
+            root = Path(directory).resolve()
             _ = (root / "fixture_root.py").write_text("VALUE = 42\n")
             config = root / "config"
             config.mkdir()
@@ -356,9 +360,68 @@ class Reads(unittest.TestCase):
         subprocess.run(['/bin/bash', '-c', 'source "$1"; conf_value beta value', 'fixture',
                        {str(repository / 'scripts/lib/conf.sh')!r}], check=True, capture_output=True)
 """
-            fixture = run_fixture(root, "config_reads", source)
-            self.assertEqual(fixture.timed.returncode, 0, fixture.timed.stderr)
-            self.assertEqual(fixture.times.get("config_reads"), ["alpha", "beta", "gamma"])
+            with self.subTest(runner="standalone"):
+                fixture = run_fixture(root, "config_reads", source)
+                self.assertEqual(fixture.timed.returncode, 0, fixture.timed.stderr)
+                self.assertEqual(fixture.times.get("config_reads"), ["alpha", "beta", "gamma"])
+
+            for gate_case in ("absolute", "relative with read-only scratch"):
+                with self.subTest(runner=gate_case), ExitStack() as cleanup:
+                    parent = root / "jobs"
+                    parent.mkdir(exist_ok=True)
+                    module = cleanup.enter_context(build_folders.tool_folder("test-module", parent))
+                    relative = gate_case != "absolute"
+                    gate_root = Path(os.path.relpath(module)) if relative else module
+                    fixture_path = root / "test_gate_reads.py"
+                    _ = fixture_path.write_text(source + f"""
+        import json
+        from pathlib import Path
+        module = Path(os.environ['TMPDIR'])
+        self.assertNotIn('GATE_PARENT_PID', os.environ)
+        self.assertNotIn('MERGE_GATE_PARENT_PID', os.environ)
+        self.assertNotIn('MERGE_GATE_MODULE_DIR', os.environ)
+        paths = [Path(os.environ[name]) for name in ('SCRATCH_ROOT', 'ASTRA_REVIEW_DIR', 'CONF_READ_LOG')]
+        scratch, review, config_log = paths
+        for folder in (scratch, review):
+            folder.mkdir()
+            (folder / 'output').write_text('module output')
+            self.assertEqual((folder / 'output').read_text(), 'module output')
+        self.assertEqual(set(config_log.read_text().splitlines()), {{'alpha', 'beta', 'gamma'}})
+        self.assertEqual(list(module.glob('*.lease.json')), [])
+        print('runner files ' + json.dumps([str(path.relative_to(module)) for path in paths]))
+        if {relative!r}:
+            retained = module / 'scratch' / 'nested'
+            retained.mkdir(parents=True)
+            (retained / 'output').write_text('read-only scratch output')
+            retained.chmod(0o500)
+""", encoding="utf-8")
+                    extra = {**os.environ, **interpreter_cache_environment(root / "cache"),
+                             "CONF_DIR": str(config), "PYTHONPATH": str(root)}
+                    env = gate.test_module_environment(gate_root, extra)
+                    shim = gate.python_shim(repository)
+                    job = gate.start_gate_job(
+                        "test_times", fixture_path, [str(shim), str(RUNNER), str(root), fixture_path.name],
+                        repository, env, gate_root / "output.log")
+                    try:
+                        status = job.process.wait(timeout=TEST_HANG_GUARD_SECS)
+                    except subprocess.TimeoutExpired:
+                        gate.kill_job_group(job)
+                        raise
+                    runner_entries = sorted(path.name for path in module.glob("test-run-roots*"))
+                    runner_entries.extend(path.name for path in module.glob("config-reads*"))
+                    retained = module / "scratch" / "nested" / "output"
+                    scratch_output = retained.read_text() if relative and status == 0 else ""
+                    job.folder_cleanup = cleanup.pop_all()
+                    result = gate.finish_gate_job(job, status)
+                    self.assertEqual(status, 0, result.output)
+                    self.assertEqual(result.returncode, 0, result.output)
+                    self.assertIn("runner files ", result.output)
+                    self.assertEqual(runner_entries, [])
+                    if relative:
+                        self.assertEqual(scratch_output, "read-only scratch output")
+                    self.assertIsInstance(result.times, dict)
+                    self.assertEqual(cast(ModuleTimes, result.times).get("config_reads"), ["alpha", "beta", "gamma"])
+                    self.assertEqual(list(parent.iterdir()), [])
 
     def test_folder_scans_record_repository_listings_and_skip_imports_and_children(self) -> None:
         cases: tuple[tuple[str, str, list[str]], ...] = (
@@ -726,26 +789,45 @@ class FixtureCPU(unittest.TestCase):
 @unittest.skipUnless(sys.platform == "linux", "Descendant adoption uses Linux prctl and pidfds")
 class ModuleProcessCleanupTests(unittest.TestCase):
     def test_gate_parent_death_keeps_the_sigkill_status_without_a_traceback(self) -> None:
-        for parent_name in ("GATE_PARENT_PID", "MERGE_GATE_PARENT_PID"):
-            with self.subTest(parent_name=parent_name):
-                root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        from scripts.lib import build_folders
+
+        cases = ("standalone", "unleased TMPDIR", "gate")
+        parent_names = ("GATE_PARENT_PID", "MERGE_GATE_PARENT_PID")
+        for runner_case, parent_name in product(cases, parent_names):
+            with self.subTest(runner=runner_case, parent_name=parent_name), ExitStack() as cleanup:
+                root = Path(cleanup.enter_context(tempfile.TemporaryDirectory())).resolve()
                 processes = OwnedTestProcesses()
-                self.addCleanup(processes.finish)
                 environment = processes.environment({**os.environ, "HOME": str(root / "home"),
                     "CONF_DIR": str(root / "config"), "BUILDLOG_DIR": str(root / "buildlog"),
-                    "PYTHONPATH": str(root)})
+                    "PYTHONPATH": str(root), "TMPDIR": str(root)})
                 _ = environment.pop("TEST_TIMES_OUT", None)
-                _ = (root / "test_parent.py").write_text("""import signal, unittest
+                _ = environment.pop("MERGE_GATE_MODULE_DIR", None)
+                _ = (root / "test_parent.py").write_text("""import os, signal, unittest
+from pathlib import Path
+from scripts.lib import conf_reads
 class ParentDeath(unittest.TestCase):
     def test_wait(self):
+        for name in ('SCRATCH_ROOT', 'ASTRA_REVIEW_DIR'):
+            folder = Path(os.environ[name])
+            folder.mkdir()
+            (folder / 'output').write_text(name)
+        conf_reads.record('ready')
         print('ready', flush=True)
         signal.pause()
 """, encoding="utf-8")
+                module = root / "module"
+                if runner_case == "gate":
+                    module = cleanup.enter_context(build_folders.tool_folder("module", root))
+                    environment = gate.test_module_environment(module, environment)
+                elif runner_case == "unleased TMPDIR":
+                    module.mkdir()
+                    environment.update(TMPDIR=str(module), TEST_TIMES_OUT=str(module / "test-times.json"))
+                _ = cleanup.callback(processes.finish)
                 parent = subprocess.Popen([sys.executable, "-c", "import signal; signal.pause()"],
                     env=environment, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 processes.track(parent)
-                _ = environment.pop("GATE_PARENT_PID", None)
-                _ = environment.pop("MERGE_GATE_PARENT_PID", None)
+                for name in parent_names:
+                    _ = environment.pop(name, None)
                 environment[parent_name] = str(parent.pid)
                 runner = subprocess.Popen([sys.executable, str(RUNNER), str(root), "test_parent.py"],
                     env=environment, cwd=root, stdin=subprocess.DEVNULL,
@@ -755,11 +837,22 @@ class ParentDeath(unittest.TestCase):
                 assert output is not None
                 self.assertTrue(select.select([output], [], [], TEST_HANG_GUARD_SECS)[0])
                 self.assertEqual(cast(str, output.readline()), "ready\n")
+                if runner_case == "gate":
+                    for folder, name in (("scratch", "SCRATCH_ROOT"), ("astra", "ASTRA_REVIEW_DIR")):
+                        self.assertEqual((module / "test-run-roots" / folder / "output").read_text(), name)
+                    self.assertEqual((module / "config-reads" / "reads").read_text(), "ready\n")
+                elif runner_case == "unleased TMPDIR":
+                    lease = cast(dict[str, object], json.loads((module / "test-run-roots.lease.json").read_text()))
+                    self.assertEqual(lease["pid"], runner.pid)
                 parent.send_signal(signal.SIGTERM)
                 self.assertEqual(parent.wait(timeout=TEST_HANG_GUARD_SECS), -signal.SIGTERM)
                 stdout, stderr = runner.communicate(timeout=TEST_HANG_GUARD_SECS)
                 self.assertEqual(runner.returncode, -signal.SIGKILL, stdout + stderr)
                 self.assertNotIn("Traceback", stderr)
+                if runner_case != "standalone":
+                    self.assertEqual(list(module.glob("test-run-roots*")), [])
+                if runner_case == "gate":
+                    self.assertEqual(list(module.glob("config-reads*")), [])
 
     def test_gate_parent_death_before_bootstrap_stops_the_module(self) -> None:
         root = Path(self.enterContext(tempfile.TemporaryDirectory()))
