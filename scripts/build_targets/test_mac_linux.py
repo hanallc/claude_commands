@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Generator
 from contextlib import contextmanager, redirect_stderr, suppress
+from datetime import timedelta
 import fcntl
 import os
 from pathlib import Path
@@ -20,11 +21,13 @@ from typing import cast, override
 import unittest
 from unittest.mock import call, patch
 
+from scripts.build_hold.owning_session import OwningSession
+from scripts.build_queue import mac_run
 from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, GateJobNotRecorded, StepJob
 from scripts.build_targets import mac_linux
 from scripts.lib import build_folders, conf, process_group
 from scripts.lint.memory_test_support import write_config_fixture
-from scripts.mac_test import eligibility, mac_test
+from scripts.mac_test import claim_state, eligibility, mac_test
 from scripts.production import gate
 from scripts.production.gate_routes import ALL_MODULES, AllModules, GateJobKind, GateRun, ModuleCoverage, SuiteMode, TreeSelection
 
@@ -291,6 +294,8 @@ class MacLinuxRouteTests(unittest.TestCase):
             + f'run.time_limit_seconds=7\n{mac_linux.UNREACHABLE_WAIT_KEY}=20\n',
             encoding='utf-8')
         _ = write_config_fixture(config / 'mac_test.conf', 'unreachable_backoff_s=30\n')
+        _ = (config / 'machines.conf').write_text('mac.hosts=fixture-mac\n', encoding='utf-8')
+        _ = write_config_fixture(config / 'build_folders.conf', '# whole: 1..\nslots.fixture-mac.default_max=1\n')
         _ = cast(object, self.enterContext(patch.dict(os.environ, {
             'BUILD_TARGETS_STATE_DIR': str(self.root / 'target-state'),
             'MAC_TEST_STATE_DIR': str(self.root / 'mac-state'),
@@ -387,6 +392,39 @@ fi
     def test_switch_off_returns_local_reason_without_ssh(self) -> None:
         _ = self.registry.write_text('enabled.mac-linux=off\n', encoding='utf-8')
         self.assertEqual(self.route(), 'mac-linux is off (build_targets.conf enabled.mac-linux=off)')
+        self.assert_guest_clean()
+
+    def test_mac_claim_refuses_another_sessions_block(self) -> None:
+        paths = claim_state.state_paths('mac')
+        paths.directory.mkdir()
+        now = mac_test.utc_now()
+        delivery = claim_state.RecordedSession('block-owner', 'fixture-owner')
+        showrunner = claim_state.NoShowrunner()
+        expires = now + timedelta(hours=1)
+        pending = claim_state.PendingMacBlock('fixture-owner', 'fixture block', now, expires, delivery,
+                                              showrunner, 'not_configured', claim_state.WaitingOnCiJob())
+        active = claim_state.ActiveMacBlock('fixture-owner', 'fixture block', now, expires, delivery,
+                                            showrunner, 'not_configured', claim_state.FreeMessageNotNeeded())
+        with patch.object(claim_state, 'submitting_session', return_value=OwningSession('submitting-session')):
+            for block in (pending, active):
+                with self.subTest(state=type(block).__name__):
+                    mac_test.write_block(paths.block, block)
+                    with self.assertRaisesRegex(mac_run.MacRunRefused, 'blocked by .*fixture block'):
+                        with mac_run.held(self.repo, 'mac', SuiteMode.GATE, GATE_JOB_NOT_RECORDED):
+                            self.fail('The guest acquired a claim during a Mac block.')
+                    self.assertRegex(str(self.route()), r'^mac-linux: not started: blocked by .*fixture block$')
+                    self.assertEqual(claim_state.read_claims(paths), ())
+        self.assertIs(eligibility.read_backoff(time.time(), mac_linux.TARGET), eligibility.NO_BACKOFF)
+        self.assert_guest_clean()
+
+    def test_busy_mac_claim_refuses_the_route_before_ssh(self) -> None:
+        paths = claim_state.state_paths('mac')
+        with mac_run.held(self.repo, 'mac', StepJob('test-all'), GATE_JOB_NOT_RECORDED):
+            claims = claim_state.read_claims(paths)
+            self.assertEqual(len(claims), 1)
+            self.assertEqual(self.route(), 'mac-linux: not started: mac is busy with mac-linux test-all')
+            self.assertEqual(claim_state.read_claims(paths), claims)
+        self.assertIs(eligibility.read_backoff(time.time(), mac_linux.TARGET), eligibility.NO_BACKOFF)
         self.assert_guest_clean()
 
     def test_free_now_reads_the_probe_backoff_for_a_registered_guest(self) -> None:
@@ -595,22 +633,17 @@ fi
         self.assertFalse((self.guest_home / 'build').exists())
         self.assertEqual(self.trace.read_text().splitlines(), ['probe', 'arm', 'run', 'cleanup'])
 
-    def test_unreachable_guest_keeps_the_fixture_reservation_until_proof(self) -> None:
+    def test_unreachable_guest_releases_the_mac_claim_after_proof(self) -> None:
         events: list[str] = []
         prove_guest_end = mac_linux.prove_guest_end
-
-        @contextmanager
-        def reservation(*_args: object) -> Generator[None]:
-            events.append('reserved')
-            try:
-                yield
-            finally:
-                events.append('released')
+        paths = claim_state.state_paths('mac')
 
         def prove(settings: mac_linux.GuestSettings,
                   armed: mac_linux.ArmedGuestAttempt, *,
                   proof_deadline: float) -> mac_linux.GuestEndProven | mac_linux.GuestEndPending:
-            self.assertNotIn('released', events)
+            claim, = claim_state.read_claims(paths)
+            self.assertEqual(claim.record['pid'], os.getpid())
+            self.assertEqual(claim.record['worktree'], str(self.repo))
             cancel = self.run_lock().parent / (
                 f'{mac_linux.CANCEL_RECORD_PREFIX}.{armed.boot_id}.{armed.deadline_ns}.{armed.attempt}')
             self.assertFalse(cancel.exists())
@@ -623,15 +656,16 @@ fi
                 self.assertTrue(cancel.is_file())
                 self.assertEqual(subprocess.call(['flock', '-x', '-n', self.run_lock(), 'true']), 0)
                 events.append('ended')
+            self.assertEqual(claim_state.read_claims(paths), (claim,))
             return proof
 
         with (patch.dict(os.environ, {'FIXTURE_OFFLINE_PROOFS': '2'}),
-              patch.object(mac_linux, 'mac_linux_reservation', reservation),
               patch.object(mac_linux, 'prove_guest_end', prove),
               patch.object(mac_linux, 'sleep') as retry_delay):
             result = self.route('disconnect-before-copy')
         self.assertIn('Guest cleanup: ended after fixture cleanup SSH refused the connection', str(result))
-        self.assertEqual(events, ['reserved', 'unreachable', 'unreachable', 'ended', 'released'])
+        self.assertEqual(events, ['unreachable', 'unreachable', 'ended'])
+        self.assertEqual(claim_state.read_claims(paths), ())
         self.assertEqual(retry_delay.call_args_list, [call(mac_linux.SSH_CONNECT_TIMEOUT_SECONDS)] * 2)
         self.assertEqual(self.trace.read_text().splitlines(), ['probe', 'arm', 'run', 'cleanup', 'cleanup', 'cleanup'])
 
@@ -669,6 +703,7 @@ fi
                 proof.assert_called_once_with(settings, first, proof_deadline=2.0)
                 self.assertEqual(now, 2.0)
                 self.assertEqual(self.trace.read_text().splitlines(), ['probe', 'arm', 'run', 'cleanup'])
+                self.assertEqual(claim_state.read_claims(claim_state.state_paths('mac')), ())
                 owner = lock.read_text()
                 self.assertEqual(owner.split()[1], first.attempt)
                 self.assertEqual(subprocess.call(['flock', '-x', '-n', lock, 'true'], timeout=2), 1)

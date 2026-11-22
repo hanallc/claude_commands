@@ -8,7 +8,7 @@ Without a signal handler, Python can raise KeyboardInterrupt at any bytecode. An
 from __future__ import annotations
 
 from collections.abc import Generator, Sequence
-from contextlib import AbstractContextManager, contextmanager, nullcontext, redirect_stdout, suppress
+from contextlib import AbstractContextManager, contextmanager, redirect_stdout, suppress
 from dataclasses import dataclass
 from enum import StrEnum
 from io import BytesIO
@@ -118,17 +118,12 @@ def read_settings(registry: conf.ConfigRead) -> GuestSettings:
     return GuestSettings((hops[0], hops[1]), user, jobs, limit, proof_wait)
 
 
-def mac_linux_reservation(_repo: Path, _work: SuiteMode | StepJob,
-                          _gate_job: StepJob | GateJobNotRecorded) -> AbstractContextManager[None]:
-    """Provide the reservation context that item 191 B3 will implement.
+def mac_linux_reservation(repo: Path, work: SuiteMode | StepJob,
+                          gate_job: StepJob | GateJobNotRecorded) -> AbstractContextManager[None]:
+    """Take the Mac repository claim for the guest route."""
+    from scripts.build_queue import mac_run
 
-    B3 adds scripts.build_queue.mac_run.held(repo, 'mac', work, gate_job).
-    The context manager takes the native claude_commands repository claim on the Mac.
-    Set the integer status field on the value that it yields.
-    Return str(error) as the route fallback on mac_run.MacRunRefused.
-    """
-    # TODO(item 191 B3): Reserve mac-linux through the queue before the guest attempt.
-    return nullcontext()
+    return mac_run.held(repo, 'mac', work, gate_job)
 
 
 class GuestRequest(TypedDict):
@@ -787,6 +782,7 @@ def route(repo: Path, *, mode: SuiteMode, full: bool, module_time_limit_s: float
           type_dirs: Sequence[str] = ()) -> GateRun | str:
     """Return the guest gate result or the reason the guest route failed."""
     from scripts.aws_target import cloud_gate
+    from scripts.build_queue import mac_run
     from scripts.build_queue.admission_client import step_identity
     from scripts.production import affected_modules, gate
 
@@ -819,6 +815,8 @@ def route(repo: Path, *, mode: SuiteMode, full: bool, module_time_limit_s: float
         if gate.checked_git(repo, 'rev-parse', 'HEAD') != source.head or cloud_gate.working_tree(repo)[0] != source.tree:
             raise GuestUnavailable('the checkout changed during the guest run')
         return run
+    except mac_run.MacRunRefused as error:
+        return f'{TARGET}: not started: {error}'
     except (GuestUnavailable, OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError,
             GateRefused, affected_modules.GraphError) as error:
         notes = cast(list[str], getattr(error, '__notes__', []))
