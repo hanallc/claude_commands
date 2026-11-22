@@ -652,6 +652,8 @@ def remove(checked: CheckedEntry, *, account: Callable[[str, os.stat_result], No
         if mirror is not None:
             # Check the ancestors after the leaf, so that a move during the leaf check stops the unlink.
             check_position()
+            # Check the leaf again, so that the leaf check stays the last check before the unlink.
+            require_identity(parent, name, key)
         if directory:
             os.rmdir(name, dir_fd=parent)
         else:

@@ -213,6 +213,36 @@ class RemovalGuardTests(unittest.TestCase):
         self.assertEqual([path.read_bytes() for path in outside.glob(".mac-floor-*/target/output")],
                          [b"build output"])
 
+    def test_mirror_unlink_refuses_a_leaf_replaced_during_the_ancestor_check(self) -> None:
+        guard = self.mirror_guard()
+        target = guard.root / "repo/target"
+        target.mkdir(parents=True)
+        _ = (target / "output").write_bytes(b"build output")
+        verify = removal_guard.require_identity
+        checked_names: list[str] = []
+
+        def record(parent: int, name: str, expected: removal_guard.Identity) -> None:
+            verify(parent, name, expected)
+            checked_names.append(name)
+
+        def replace_leaf() -> None:
+            # The second check of the leaf is the one right before its unlink.
+            if checked_names.count("output") == 2 and "replaced" not in checked_names:
+                checked_names.append("replaced")
+                [staged_output] = (guard.root / "repo").glob(".mac-floor-*/target/output")
+                _ = staged_output.rename(staged_output.with_name("previous"))
+                _ = staged_output.write_bytes(b"replacement")
+
+        with guard.check(target) as checked:
+            inventory = removal_guard.inspect_mirror_output(checked, frozenset(), lambda: None)
+            with self.assertRaises(removal_guard.ChangedEntry), \
+                    removal_guard.stage_mirror_output(checked) as staged:
+                with mock.patch.object(removal_guard, "require_identity", side_effect=record):
+                    removal_guard.remove(staged, mirror=inventory, check_time=replace_leaf)
+        self.assertIn("replaced", checked_names)
+        self.assertEqual((target / "output").read_bytes(), b"replacement")
+        self.assertEqual((target / "previous").read_bytes(), b"build output")
+
     def test_mirror_stage_refuses_a_staging_folder_replaced_before_its_first_stat(self) -> None:
         guard = self.mirror_guard()
         target = guard.root / "repo/target"
