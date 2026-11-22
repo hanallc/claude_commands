@@ -646,10 +646,10 @@ sys.meta_path.insert(0, NoRepositoryModules())
         self.write(receipt, json.dumps(plan))
         self.write(self.bin / "ssh", f'#!{sys.executable}\nimport subprocess, sys\n'
                    + 'raise SystemExit(subprocess.call(["sh", "-c", sys.argv[-1]]))\n')
-        self.write(mac / "scripts/lib/py", '#!/bin/sh\nexec "$GATE_TEST_REPO/scripts/lib/py" "$@"\n')
+        self.write(mac / "scripts/lib/py", '#!/bin/sh\nshift\n'
+                   + 'exec "$GATE_TEST_REPO/scripts/lib/py" "$GATE_TEST_REPO/scripts/lib/waiting_rows.py" "$@"\n')
         (mac / "scripts/lib/py").chmod(0o755)
-        self.write(mac / "scripts/lib/waiting_rows.py",
-                   "from scripts.lib.waiting_rows import main\nraise SystemExit(main())\n")
+        self.write(mac / "scripts/lib/waiting_rows.py", "")
 
         with mock.patch.dict(os.environ, self.environment), redirect_stdout(io.StringIO()):
             gate.promote(args)
