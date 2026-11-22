@@ -1,11 +1,10 @@
 """Test the memory trace boundary with private files and fixed times."""
 from __future__ import annotations
 
-from collections.abc import Buffer, Iterator
+from collections.abc import Buffer
 from dataclasses import replace
 from functools import cached_property
 from io import BytesIO, FileIO
-import os
 from pathlib import Path
 import tempfile
 from typing import override
@@ -20,9 +19,22 @@ from scripts.lib.atomic_file import write_bytes_atomic
 
 DAY_MS = 86_400_000
 NOW_MS = 10 * DAY_MS
-POLICY = traces.MemoryTracePolicy(2, 120, 8192, 2, 3, 3, 1024, final_replay_bytes=100000,
+POLICY = traces.MemoryTracePolicy(2, 120, 8192, 2, 3, 1024, final_replay_bytes=100000,
                                   scope_loss_grace_seconds=9, seal_retry_count=4,
-                                  max_pending_commands=12, shutdown_timeout_seconds=3, prune_interval_seconds=7)
+                                  max_pending_commands=12, shutdown_timeout_seconds=3)
+POLICY_SETTINGS = (
+    "sample.seconds=2\n"
+    "sample.max_per_run=120\n"
+    "sample.max_bytes_per_run=8192\n"
+    "feed.past_run_max_age_days=2\n"
+    "feed.points_per_phase=3\n"
+    "feed.bytes_per_refresh=1024\n"
+    "seal.replay_bytes=100000\n"
+    "seal.scope_loss_grace_seconds=9\n"
+    "seal.retry_count=4\n"
+    "worker.max_pending_commands=12\n"
+    "worker.shutdown_timeout_seconds=3\n"
+)
 ARGV = ("cargo", "nextest", "run", "--bin", "hana", "--profile", "ci",
         "--features", "native", "--target", "target-a", "--package", "hana",
         "--test-threads", "8", "-E", "test(alpha)", "--", "--nocapture")
@@ -63,60 +75,32 @@ class MemoryTraceTests(unittest.TestCase):
         return writer.seal(traces.TraceEnd(ended_at_ms, elapsed_ms, status, coverage))
 
     def test_policy_uses_the_shared_reader_with_injected_settings(self) -> None:
-        stored = (
-            "sample_seconds=2\n"
-            "max_samples_per_run=120\n"
-            "max_bytes_per_run=8192\n"
-            "retention_days=2\n"
-            "max_finished_runs=3\n"
-            "points_per_phase=3\n"
-            "feed_bytes_per_refresh=1024\n"
-            "final_replay_bytes=100000\n"
-            "scope_loss_grace_seconds=9\n"
-            "seal_retry_count=4\n"
-            "max_pending_commands=12\n"
-            "shutdown_timeout_seconds=3\n"
-            "prune_interval_seconds=7\n"
-        )
+        stored = POLICY_SETTINGS
         path = self.root / "fixture.conf"
         settings = conf.ConfigRead(path, path, conf.settings(stored), repository_allowed=False)
         self.assertEqual(traces.read_policy(settings), POLICY)
-        for config in (stored.replace("sample_seconds=2", "sample_seconds=bad"),
-                       stored.replace("retention_days=2\n", ""),
-                       stored.replace("points_per_phase=3", "points_per_phase=2"),
-                       stored.replace("retention_days=2", "retention_days=-1"),
-                       stored.replace("final_replay_bytes=100000\n", ""),
-                       stored.replace("final_replay_bytes=100000", "final_replay_bytes=0"),
-                       stored.replace("final_replay_bytes=100000", "final_replay_bytes=1048577"),
-                       stored.replace("scope_loss_grace_seconds=9\n", ""),
-                       stored.replace("scope_loss_grace_seconds=9", "scope_loss_grace_seconds=61"),
-                       stored.replace("seal_retry_count=4\n", ""),
-                       stored.replace("seal_retry_count=4", "seal_retry_count=-1"),
-                       stored.replace("seal_retry_count=4", "seal_retry_count=11"),
-                       stored.replace("max_pending_commands=12\n", ""),
-                       stored.replace("max_pending_commands=12", "max_pending_commands=0"),
-                       stored.replace("shutdown_timeout_seconds=3\n", ""),
-                       stored.replace("shutdown_timeout_seconds=3", "shutdown_timeout_seconds=61"),
-                       stored.replace("prune_interval_seconds=7\n", ""),
-                       stored.replace("prune_interval_seconds=7", "prune_interval_seconds=0")):
-            with self.subTest(config=config):
+        for key, invalid in (("sample.seconds", "bad"), ("feed.points_per_phase", "2"),
+                             ("feed.past_run_max_age_days", "-1"), ("seal.replay_bytes", "0"),
+                             ("seal.replay_bytes", "1048577"), ("seal.scope_loss_grace_seconds", "61"),
+                             ("seal.retry_count", "-1"), ("seal.retry_count", "11"),
+                             ("worker.max_pending_commands", "0"), ("worker.shutdown_timeout_seconds", "61")):
+            with self.subTest(key=key, invalid=invalid):
+                config = "".join(f"{key}={invalid}\n" if line.startswith(f"{key}=") else line
+                                 for line in stored.splitlines(keepends=True))
                 self.assertIsInstance(traces.read_policy(replace(settings, settings=conf.settings(config))),
+                                      traces.TracesOff)
+        for line in stored.splitlines(keepends=True):
+            with self.subTest(missing=line.strip()):
+                settings_without_key = conf.settings(stored.replace(line, ""))
+                self.assertIsInstance(traces.read_policy(replace(settings, settings=settings_without_key)),
                                       traces.TracesOff)
 
     def test_policy_enforces_byte_bounds_without_range_comments(self) -> None:
-        stored = (
-            "sample_seconds=2\nmax_samples_per_run=120\nretention_days=2\nmax_finished_runs=3\n"
-            "points_per_phase=3\nfeed_bytes_per_refresh=1024\nscope_loss_grace_seconds=9\nseal_retry_count=4\n"
-            "final_replay_bytes=100000\n"
-            "max_pending_commands=12\n"
-            "shutdown_timeout_seconds=3\n"
-            "prune_interval_seconds=7\n"
-        )
         path = self.root / "fixture.conf"
         for value in (1023, 4_194_305, 10**20):
             with self.subTest(value=value):
-                settings = conf.ConfigRead(path, path, conf.settings(f"{stored}max_bytes_per_run={value}\n"),
-                                           repository_allowed=False)
+                stored = POLICY_SETTINGS.replace("sample.max_bytes_per_run=8192", f"sample.max_bytes_per_run={value}")
+                settings = conf.ConfigRead(path, path, conf.settings(stored), repository_allowed=False)
                 self.assertIsInstance(traces.read_policy(settings), traces.TracesOff)
         with self.assertRaisesRegex(ValueError, "max_bytes_per_run"):
             _ = replace(POLICY, max_bytes_per_run=10**20)
@@ -303,7 +287,28 @@ class MemoryTraceTests(unittest.TestCase):
         sealed = self.root / "finished" / KEY / f"{NOW_MS}-copy.jsonl"
         self.assertEqual(list(sealed.parent.iterdir()), [sealed])
         self.assertEqual(sealed.read_bytes(), expected)
-        self.assertFalse(writer.path.exists())
+        self.assertEqual(writer.path.read_bytes(), expected)
+
+    def test_restart_keeps_one_fallback_copy_and_preserves_the_torn_live_trace(self) -> None:
+        writer = self.store.start(self.header("fallback"))
+        _ = writer.append(compile_sample(2000, 5))
+        prefix = writer.path.read_bytes()
+        original = prefix + b'["'
+        _ = writer.path.write_bytes(original)
+        end = traces.TraceEnd(NOW_MS, 5000, 101, WHOLE_RUN)
+        fallback_end = replace(end, coverage=traces.IncompleteRun(traces.IncompleteReason.RECORDING_ERROR))
+
+        writer.seal_prefix(end)
+
+        sealed = self.root / "finished" / KEY / f"{NOW_MS}-fallback.jsonl"
+        self.assertEqual(sealed.read_bytes(), prefix + traces.encode_record(fallback_end))
+        self.assertEqual(writer.path.read_bytes(), original)
+
+        self.store.recover_abandoned()
+
+        self.assertEqual(list(sealed.parent.iterdir()), [sealed])
+        self.assertEqual(sealed.read_bytes(), prefix + traces.encode_record(fallback_end))
+        self.assertEqual(writer.path.read_bytes(), original)
 
     def test_seal_replaces_a_partial_end_at_the_last_verified_offset(self) -> None:
         writer = self.store.start(self.header("torn-end"))
@@ -353,27 +358,6 @@ class MemoryTraceTests(unittest.TestCase):
         assert isinstance(earlier, traces.MemoryTrace)
         self.assertEqual(earlier.header.reservation_id, "a")
 
-    def test_retention_applies_age_and_count_across_shapes_and_keeps_active_files(self) -> None:
-        _ = self.finished("old", key="5" * 64, ended_at_ms=NOW_MS - 3 * DAY_MS)
-        _ = self.finished("extra", ended_at_ms=NOW_MS - 2 * DAY_MS)
-        for index in range(3):
-            _ = self.finished(f"kept-{index}", key=str(index) * 64, ended_at_ms=NOW_MS - index)
-        abandoned = self.store.start(self.header("abandoned"))
-        active = self.store.start(self.header("active"))
-        recent = self.store.start(self.header("recent"))
-        for writer in (abandoned, active):
-            timestamp = (NOW_MS - 3 * DAY_MS) * 1_000_000
-            os.utime(writer.path, ns=(timestamp, timestamp))
-        os.utime(recent.path, ns=(NOW_MS * 1_000_000, NOW_MS * 1_000_000))
-        self.store.prune(NOW_MS, {"active"})
-        self.assertFalse(abandoned.path.exists())
-        self.assertTrue(active.path.exists())
-        self.assertTrue(recent.path.exists())
-        self.assertEqual(len(list((self.root / "finished").glob("*/*.jsonl"))), 3)
-        self.assertFalse((self.root / "finished" / ("5" * 64)).exists())
-        self.store.prune(NOW_MS + 3 * DAY_MS, set())
-        self.assertFalse(list((self.root / "finished").glob("*/")))
-
     def test_recovery_continues_after_one_file_cannot_publish(self) -> None:
         blocked = self.store.start(self.header("blocked"))
         healthy = self.store.start(self.header("healthy"))
@@ -385,7 +369,7 @@ class MemoryTraceTests(unittest.TestCase):
         with mock.patch.object(traces, "write_bytes_atomic", side_effect=deny_one):
             self.store.recover_abandoned()
         self.assertTrue(blocked.path.exists())
-        self.assertFalse(healthy.path.exists())
+        self.assertEqual(healthy.path.read_bytes(), traces.encode_record(healthy.header))
         path, = (self.root / "finished" / KEY).glob("*-healthy.jsonl")
         trace = traces.read_trace(path, POLICY)
         assert isinstance(trace, traces.MemoryTrace) and isinstance(trace.state, traces.TraceEnd)
@@ -395,16 +379,100 @@ class MemoryTraceTests(unittest.TestCase):
         end = self.finished("torn-after-end", ended_at_ms=NOW_MS)
         sealed = self.root / "finished" / KEY / f"{NOW_MS}-torn-after-end.jsonl"
         live = self.root / "live" / "torn-after-end.jsonl"
-        _ = live.write_bytes(sealed.read_bytes() + b'["')
+        original = sealed.read_bytes() + b'["'
+        _ = live.write_bytes(original)
         sealed.unlink()
 
         self.store.recover_abandoned()
 
         trace = traces.read_trace(sealed, POLICY)
         assert isinstance(trace, traces.MemoryTrace) and isinstance(trace.state, traces.TraceEnd)
-        self.assertFalse(live.exists())
+        self.assertEqual(live.read_bytes(), original)
         self.assertEqual(trace.state, replace(end, exit_status=traces.ExitStatusUnavailable(),
                                               coverage=traces.IncompleteRun(traces.IncompleteReason.RESTART)))
+        with mock.patch.object(traces, "write_bytes_atomic") as publish:
+            self.store.recover_abandoned()
+        publish.assert_not_called()
+        self.assertEqual(live.read_bytes(), original)
+
+    def test_recovery_ignores_invalid_finished_traces_for_the_reservation(self) -> None:
+        header = self.header("recover-invalid")
+        writer = self.store.start(header)
+        original = writer.path.read_bytes()
+        ended = header.scope_started_at_ms
+        end = traces.TraceEnd(ended, 0, traces.ExitStatusUnavailable(),
+                              traces.IncompleteRun(traces.IncompleteReason.RESTART))
+        folder = self.root / "finished" / KEY
+        folder.mkdir(parents=True)
+        destination = folder / f"{ended}-recover-invalid.jsonl"
+        wrong_shape = replace(header, shape_key="4" * 64)
+        wrong_reservation = replace(header, reservation_id="other")
+        invalid = {
+            destination: b"bad\n",
+            folder / f"{ended + 1}-recover-invalid.jsonl": original,
+            folder / f"{ended + 2}-recover-invalid.jsonl": original + traces.encode_record(end),
+            folder / f"{ended + 3}-recover-invalid.jsonl": (
+                traces.encode_record(wrong_shape) + traces.encode_record(replace(end, ended_at_ms=ended + 3))),
+            folder / f"{ended + 4}-recover-invalid.jsonl": (
+                traces.encode_record(wrong_reservation) + traces.encode_record(replace(end, ended_at_ms=ended + 4))),
+        }
+        for path, content in invalid.items():
+            _ = path.write_bytes(content)
+
+        self.store.recover_abandoned()
+
+        self.assertEqual(writer.path.read_bytes(), original)
+        recovered = traces.read_trace(destination, POLICY)
+        assert isinstance(recovered, traces.MemoryTrace)
+        self.assertEqual((recovered.header, recovered.state), (header, end))
+        preserved, = folder.glob("*.invalid")
+        self.assertEqual(preserved.read_bytes(), invalid.pop(destination))
+        for path, content in invalid.items():
+            self.assertEqual(path.read_bytes(), content)
+
+    def test_recovery_keeps_both_traces_when_the_finished_read_fails(self) -> None:
+        writer = self.store.start(self.header("recover-read-error"))
+        original = writer.path.read_bytes()
+        ended = writer.header.scope_started_at_ms
+        _ = writer.seal(traces.TraceEnd(ended, 0, traces.ExitStatusUnavailable(),
+                                       traces.IncompleteRun(traces.IncompleteReason.RESTART)))
+        _ = writer.path.write_bytes(original)
+        destination = self.root / "finished" / KEY / f"{ended}-recover-read-error.jsonl"
+        finished = destination.read_bytes()
+
+        def fail_finished_read(path: Path, mode: str = "r") -> FileIO:
+            if path == destination:
+                raise OSError("finished trace read failed")
+            return FileIO(path, mode)
+
+        with mock.patch.object(Path, "open", autospec=True, side_effect=fail_finished_read):
+            self.store.recover_abandoned()
+
+        self.assertEqual(writer.path.read_bytes(), original)
+        self.assertEqual(destination.read_bytes(), finished)
+        self.assertEqual(list(destination.parent.iterdir()), [destination])
+
+    def test_recovery_keeps_both_traces_when_it_cannot_check_the_finished_file(self) -> None:
+        writer = self.store.start(self.header("recover-unchecked"))
+        _ = writer.append(compile_sample(2000, 5))
+        _ = writer.append(compile_sample(4000, 6))
+        end = writer.seal(traces.TraceEnd(NOW_MS, 5000, traces.ExitStatusUnavailable(),
+                                         traces.IncompleteRun(traces.IncompleteReason.RESTART)))
+        original = traces.encode_record(writer.header) + traces.encode_record(end)
+        _ = writer.path.write_bytes(original)
+        destination = self.root / "finished" / KEY / f"{NOW_MS}-recover-unchecked.jsonl"
+        finished = destination.read_bytes()
+        for reason, policy, content in (
+            ("bytes", replace(POLICY, max_bytes_per_run=len(original)), finished),
+            ("samples", replace(POLICY, max_samples_per_run=1), finished),
+            ("version", POLICY, finished.replace(b'["h",1,', b'["h",2,', 1)),
+        ):
+            with self.subTest(reason=reason):
+                _ = destination.write_bytes(content)
+                traces.TraceStore(self.root, policy).recover_abandoned()
+                self.assertEqual(writer.path.read_bytes(), original)
+                self.assertEqual(destination.read_bytes(), content)
+                self.assertEqual(list(destination.parent.iterdir()), [destination])
 
     def test_partial_header_is_removed_before_the_next_start(self) -> None:
         header = self.header("partial")
@@ -425,52 +493,6 @@ class MemoryTraceTests(unittest.TestCase):
         self.assertFalse(path.exists())
         writer = self.store.start(header)
         self.assertEqual(writer.path.read_bytes(), traces.encode_record(header))
-
-    def test_prune_continues_after_one_finished_file_cannot_be_deleted(self) -> None:
-        _ = self.finished("blocked", ended_at_ms=NOW_MS - 3 * DAY_MS)
-        _ = self.finished("healthy", ended_at_ms=NOW_MS - 4 * DAY_MS)
-        folder = self.root / "finished" / KEY
-        blocked, = folder.glob("*-blocked.jsonl")
-        healthy, = folder.glob("*-healthy.jsonl")
-        unlink = Path.unlink
-
-        def deny_one(path: Path, missing_ok: bool = False) -> None:
-            if path == blocked:
-                raise PermissionError("cannot delete this trace")
-            unlink(path, missing_ok=missing_ok)
-
-        with mock.patch.object(Path, "unlink", autospec=True, side_effect=deny_one):
-            self.store.prune(NOW_MS, set())
-        self.assertTrue(blocked.exists())
-        self.assertFalse(healthy.exists())
-
-    def test_prune_continues_after_denied_directory_and_live_file_reads(self) -> None:
-        _ = self.finished("hidden", key="4" * 64, ended_at_ms=NOW_MS - 3 * DAY_MS)
-        _ = self.finished("visible", ended_at_ms=NOW_MS - 3 * DAY_MS)
-        blocked = self.store.start(self.header("blocked"))
-        healthy = self.store.start(self.header("healthy"))
-        timestamp = (NOW_MS - 3 * DAY_MS) * 1_000_000
-        os.utime(healthy.path, ns=(timestamp, timestamp))
-        folder = self.root / "finished" / ("4" * 64)
-        iterdir, file_stat = Path.iterdir, Path.stat
-
-        def scan(path: Path) -> Iterator[Path]:
-            if path == folder:
-                raise PermissionError("cannot scan this shape")
-            return iterdir(path)
-
-        def stat_path(path: Path, *, follow_symlinks: bool = True) -> os.stat_result:
-            if path == blocked.path:
-                raise PermissionError("cannot read this trace's metadata")
-            return file_stat(path, follow_symlinks=follow_symlinks)
-
-        with (mock.patch.object(Path, "iterdir", autospec=True, side_effect=scan),
-              mock.patch.object(Path, "stat", autospec=True, side_effect=stat_path)):
-            self.store.prune(NOW_MS, set())
-        self.assertTrue(blocked.path.exists())
-        self.assertFalse(healthy.path.exists())
-        self.assertTrue(list(folder.glob("*-hidden.jsonl")))
-        self.assertFalse(list((self.root / "finished" / KEY).glob("*-visible.jsonl")))
 
     def test_chart_keeps_endpoints_peak_and_gaps_and_totals_use_all_samples(self) -> None:
         writer = self.store.start(self.header("gaps"))

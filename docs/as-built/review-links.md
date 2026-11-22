@@ -384,7 +384,10 @@ The Compile chart scales this run to the past run's time axis and labels the sca
 It shades the time when the past run compiled the final `hana` crate.
 The values show the latest sample, the past peak, and the past time above half its reserve.
 The Test chart shows **Not started** until tests start.
-The tooltip shows **No past run yet** when no run matches.
+The tooltip shows **No past run yet** when no whole run matches within the chart age limit.
+The `feed.past_run_max_age_days` setting in `config/memory_trace.conf` applies only to the chart.
+The trace worker keeps old trace files.
+On recovery, the worker saves an incomplete copy and keeps the original live trace.
 The open tooltip updates with each `memory.json` reading.
 Disks uses the shared step tooltip fields.
 

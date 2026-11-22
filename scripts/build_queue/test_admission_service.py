@@ -62,9 +62,9 @@ from scripts.build_queue.queue_fixture import write_memory_config, write_process
 from scripts.build_queue.admission_test_support import AdmissionFixture, GIB, InjectedCrash, SocketPeer, caller_admission, only_admitted
 
 
-TRACE_POLICY = memory_trace.MemoryTracePolicy(2, 100, 8192, 7, 10, 16, 1024,
+TRACE_POLICY = memory_trace.MemoryTracePolicy(2, 100, 8192, 7, 16, 1024,
                                             final_replay_bytes=131072,
-                                            max_pending_commands=8, prune_interval_seconds=7,
+                                            max_pending_commands=8,
                                             scope_loss_grace_seconds=5, seal_retry_count=4, shutdown_timeout_seconds=3)
 
 
@@ -8909,37 +8909,6 @@ class MemoryTraceCaptureTests(unittest.TestCase):
             assert isinstance(trace, memory_trace.MemoryTrace)
             self.assertEqual([sample.program_bytes for sample in trace.compile_samples], [9 * GIB])
 
-    def test_prune_error_does_not_stop_active_traces(self) -> None:
-        with AdmissionFixture() as fixture:
-            run = self.grant(fixture)
-            _ = run.log.write_text("Building [=>] 9/10\r")
-
-            def release() -> None:
-                self.assertEqual(fixture.server.handle_request(wire.ReleaseRequest(
-                    "prune-error", run.grant.reservation, 0)), [wire.Ok()])
-
-            error_output = io.StringIO()
-            with (mock.patch.object(memory_trace.TraceStore, "prune", autospec=True,
-                                    side_effect=[PermissionError("cannot remove an old trace"), None]) as mocked,
-                  redirect_stderr(error_output)):
-                self.drive(fixture, run, 4, ((3, release),))
-            self.assertEqual(mocked.call_count, 2)
-            self.assertIn("prune: cannot remove an old trace", error_output.getvalue())
-            self.assertEqual([sample.elapsed_ms for sample in self.sealed(run).compile_samples], [0, 2000])
-
-    def test_idle_prune_uses_the_policy_interval(self) -> None:
-        with AdmissionFixture() as fixture:
-            run = self.grant(fixture, scoped=False, policy=replace(TRACE_POLICY, prune_interval_seconds=7))
-            start = fixture.clock.monotonic()
-            times: list[float] = []
-
-            def prune(_store: memory_trace.TraceStore, _now_ms: int, _active: object) -> None:
-                times.append(fixture.clock.monotonic() - start)
-
-            with mock.patch.object(memory_trace.TraceStore, "prune", autospec=True, side_effect=prune):
-                self.drive(fixture, run, 15, ())
-            self.assertEqual(times, [0, 7, 14])
-
     def test_trace_keeps_only_the_first_test_reserve_from_an_admission_pass(self) -> None:
         with AdmissionFixture() as fixture:
             run = self.grant(fixture)
@@ -9738,11 +9707,11 @@ class MemoryTraceCaptureTests(unittest.TestCase):
             run = self.grant(fixture)
             live_path = run.store.root / "live" / f"{run.grant.reservation}.jsonl"
             move = Path.replace
-            attempts: list[Path] = []
+            attempts: list[tuple[Path, bytes]] = []
 
             def deny_trace_move(path: Path, target: Path) -> Path:
                 if path == live_path:
-                    attempts.append(target)
+                    attempts.append((target, path.read_bytes()))
                     raise OSError("trace move failed")
                 return move(path, target)
 
@@ -9754,7 +9723,9 @@ class MemoryTraceCaptureTests(unittest.TestCase):
                 self.drive(fixture, run, 4 + TRACE_POLICY.sample_seconds * TRACE_POLICY.seal_retry_count,
                            ((3, release),))
             self.assertEqual(len(attempts), 1 + TRACE_POLICY.seal_retry_count)
-            self.assertFalse(live_path.exists())
+            destination, original = attempts[-1]
+            self.assertEqual(live_path.read_bytes(), original)
+            self.assertEqual(destination.read_bytes(), original)
             end = self.sealed(run).state
             assert isinstance(end, memory_trace.TraceEnd)
             self.assertEqual(end.coverage, memory_trace.IncompleteRun(memory_trace.IncompleteReason.NO_NEXTTEST_COMPLETION))
@@ -9829,6 +9800,7 @@ class MemoryTraceCaptureTests(unittest.TestCase):
             assert isinstance(live, memory_trace.MemoryTrace)
             partial = run.store.root / "live" / f"{run.grant.reservation}.jsonl"
             self.append(partial, '["t",')
+            original = partial.read_bytes()
             with mock.patch.object(threading.Thread, "start"):
                 restarted = service.OperatingSystemReader(run.reader.plan, run.reader.latest,
                     fixture.readings, fixture.proc, fixture.clock, fixture.server.reading_events,
@@ -9837,7 +9809,7 @@ class MemoryTraceCaptureTests(unittest.TestCase):
             self.drive(fixture, updated, 1, ())
             trace = self.sealed(run)
             self.assertEqual(trace.compile_samples, live.compile_samples)
-            self.assertFalse(partial.exists())
+            self.assertEqual(partial.read_bytes(), original)
             assert isinstance(trace.state, memory_trace.TraceEnd)
             self.assertEqual(trace.state.coverage, memory_trace.IncompleteRun(memory_trace.IncompleteReason.RESTART))
             self.assertIsInstance(run.store.newest_whole_run(trace.header.shape_key), memory_trace.NoMatchingWholeRun)

@@ -16,6 +16,7 @@ import sys
 from threading import Condition, Thread
 from time import monotonic
 from typing import Protocol, cast, final
+from uuid import uuid4
 
 from scripts.build_queue import admission_records as records, progress_profile as progress
 from scripts.build_queue.admission_records import RequestedTestWidth, UnspecifiedTestWidth
@@ -27,20 +28,18 @@ from scripts.lib.atomic_file import sync_folder, write_bytes_atomic
 from scripts.lint import memory_admit as gate
 
 
-_POLICY_BOUNDS = {
-    "sample_seconds": (1, 60),
-    "max_samples_per_run": (1, 65536),
-    "max_bytes_per_run": (1024, 4194304),
-    "retention_days": (1, 90),
-    "max_finished_runs": (1, 4096),
-    "points_per_phase": (3, 4096),
-    "feed_bytes_per_refresh": (1024, 1048576),
-    "final_replay_bytes": (1, 1048576),
-    "scope_loss_grace_seconds": (1, 60),
-    "seal_retry_count": (0, 10),
-    "max_pending_commands": (2, 4096),
-    "shutdown_timeout_seconds": (1, 60),
-    "prune_interval_seconds": (1, 604800),
+_POLICY_SETTINGS = {
+    "sample_seconds": ("sample.seconds", 1, 60),
+    "max_samples_per_run": ("sample.max_per_run", 1, 65536),
+    "max_bytes_per_run": ("sample.max_bytes_per_run", 1024, 4194304),
+    "past_run_max_age_days": ("feed.past_run_max_age_days", 1, 90),
+    "points_per_phase": ("feed.points_per_phase", 3, 4096),
+    "feed_bytes_per_refresh": ("feed.bytes_per_refresh", 1024, 1048576),
+    "final_replay_bytes": ("seal.replay_bytes", 1, 1048576),
+    "scope_loss_grace_seconds": ("seal.scope_loss_grace_seconds", 1, 60),
+    "seal_retry_count": ("seal.retry_count", 0, 10),
+    "max_pending_commands": ("worker.max_pending_commands", 2, 4096),
+    "shutdown_timeout_seconds": ("worker.shutdown_timeout_seconds", 1, 60),
 }
 
 
@@ -49,25 +48,23 @@ class MemoryTracePolicy:
     sample_seconds: int
     max_samples_per_run: int
     max_bytes_per_run: int
-    retention_days: int
-    max_finished_runs: int
+    past_run_max_age_days: int
     points_per_phase: int
     feed_bytes_per_refresh: int
     final_replay_bytes: int
     max_pending_commands: int
-    prune_interval_seconds: int
-    scope_loss_grace_seconds: int = _POLICY_BOUNDS["scope_loss_grace_seconds"][0]
-    seal_retry_count: int = _POLICY_BOUNDS["seal_retry_count"][0]
-    shutdown_timeout_seconds: int = _POLICY_BOUNDS["shutdown_timeout_seconds"][0]
+    scope_loss_grace_seconds: int = _POLICY_SETTINGS["scope_loss_grace_seconds"][1]
+    seal_retry_count: int = _POLICY_SETTINGS["seal_retry_count"][1]
+    shutdown_timeout_seconds: int = _POLICY_SETTINGS["shutdown_timeout_seconds"][1]
 
     def __post_init__(self) -> None:
         for setting in fields(self):
-            policy_low, high = _POLICY_BOUNDS[setting.name]
+            key, policy_low, high = _POLICY_SETTINGS[setting.name]
             # Direct callers can use small byte budgets to test the limits.
             low = 1 if setting.name in ("max_bytes_per_run", "feed_bytes_per_refresh") else policy_low
             value = cast(object, getattr(self, setting.name))
             if not isinstance(value, int) or isinstance(value, bool) or not low <= value <= high:
-                raise ValueError(f"{setting.name} must be in {low}..{high}")
+                raise ValueError(f"{key} must be in {low}..{high}")
 
     @property
     def sample_interval_ms(self) -> int:
@@ -85,18 +82,17 @@ TRACES_DISABLED = TracesOff("memory trace policy was not supplied")
 def read_policy(settings: conf.ConfigRead | conf.UseConfiguredValue = conf.UseConfiguredValue.CURRENT
                 ) -> MemoryTracePolicy | TracesOff:
     """Disable traces when a setting has no usable live value."""
-    def whole(key: str) -> int:
+    def whole(key: str, low: int, high: int) -> int:
         reading = configuration.origin(key, int)
         if not isinstance(reading, conf.UsableLiveValue):
             raise conf.Unusable(reading.reason)
-        low, high = _POLICY_BOUNDS[key]
         if not low <= reading.value <= high:
             raise ValueError(f"{key} must be in {low}..{high}")
         return reading.value
 
     try:
         configuration = conf.read("memory_trace") if isinstance(settings, conf.UseConfiguredValue) else settings
-        return MemoryTracePolicy(**{key: whole(key) for key in _POLICY_BOUNDS})
+        return MemoryTracePolicy(**{field: whole(*setting) for field, setting in _POLICY_SETTINGS.items()})
     except (OSError, ValueError, ArithmeticError) as error:
         return TracesOff(str(error))
 
@@ -146,7 +142,6 @@ _RESERVATION_NAME = re.compile(r"[A-Za-z0-9_-]+")
 _SHAPE_NAME = re.compile(r"[0-9a-f]{64}")
 _SUFFIX = ".jsonl"
 _MS_PER_SECOND = 1000
-_MS_PER_DAY = 86400 * _MS_PER_SECOND
 
 
 def _integer(value: object, *, minimum: int = 0) -> int:
@@ -305,6 +300,10 @@ def _json_line(values: Sequence[object]) -> bytes:
     return (json.dumps(values, separators=(",", ":")) + "\n").encode("ascii")
 
 
+class _TraceCheckUnavailable(ValueError):
+    """The reader cannot check the trace with its current limits or format."""
+
+
 def encode_record(record: TraceRecord) -> bytes:
     """Encode one complete record as a compact JSONL row."""
     match record:
@@ -328,13 +327,18 @@ def encode_record(record: TraceRecord) -> bytes:
 
 def decode_record(line: bytes) -> TraceRecord:
     """Validate a record from the file boundary."""
-    value = cast(object, json.loads(line))
+    try:
+        value = cast(object, json.loads(line))
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        raise
+    except ValueError as error:
+        raise _TraceCheckUnavailable(str(error)) from error
     if not isinstance(value, list):
         raise ValueError("expected a trace record")
     match cast(list[object], value):
-        case ["h", version, str(reservation_id), str(key), int(started), int(interval), int(reserve)] if (
-            _integer(version) == _VERSION
-        ):
+        case ["h", version, *_] if _integer(version) != _VERSION:
+            raise _TraceCheckUnavailable("unsupported trace version")
+        case ["h", _, str(reservation_id), str(key), int(started), int(interval), int(reserve)]:
             return TraceHeader(reservation_id, key, started, interval, reserve)
         case ["c", int(elapsed), int(used), done, total, crate] if crate is None or isinstance(crate, str):
             if done is None and total is None:
@@ -486,7 +490,7 @@ class MemoryTrace:
             else:
                 order = order.observe(record, self.header.max_gap_ms)
                 if order.sample_count > policy.max_samples_per_run:
-                    raise ValueError("trace exceeds its sample limit")
+                    raise _TraceCheckUnavailable("trace exceeds its sample limit")
                 if isinstance(record, CompileSample):
                     compile_samples.append(record)
                 elif isinstance(record, TestSample):
@@ -500,12 +504,17 @@ class NoMatchingWholeRun:
     pass
 
 
-def read_trace(path: Path, policy: MemoryTracePolicy) -> MemoryTrace | TraceUnavailable:
+def read_trace(path: Path, policy: MemoryTracePolicy, *, raise_unchecked: bool = False
+               ) -> MemoryTrace | TraceUnavailable:
     """Read bounded complete lines and validate phase and end order."""
     try:
         with path.open("rb") as stream:
+            if os.fstat(stream.fileno()).st_size > policy.max_bytes_per_run:
+                raise _TraceCheckUnavailable("trace exceeds its byte limit")
             line = stream.readline(policy.max_bytes_per_run + 1)
-            if not line.endswith(b"\n") or len(line) > policy.max_bytes_per_run:
+            if len(line) > policy.max_bytes_per_run:
+                raise _TraceCheckUnavailable("trace exceeds its byte limit")
+            if not line.endswith(b"\n"):
                 raise ValueError("missing complete trace header")
             header = decode_record(line)
             if not isinstance(header, TraceHeader):
@@ -515,12 +524,16 @@ def read_trace(path: Path, policy: MemoryTracePolicy) -> MemoryTrace | TraceUnav
                 while record_line := stream.readline(remaining + 1):
                     remaining -= len(record_line)
                     if remaining < 0:
-                        raise ValueError("trace exceeds its byte limit")
+                        raise _TraceCheckUnavailable("trace exceeds its byte limit")
                     yield record_line
 
             trace = MemoryTrace(header, (), (), TraceRecording(), _RecordingOrder())
             return trace.read_body(bounded_body(policy.max_bytes_per_run - len(line)), policy)
-    except (OSError, ValueError, RecursionError) as error:
+    except (OSError, RecursionError, _TraceCheckUnavailable) as error:
+        if raise_unchecked:
+            raise
+        return TraceUnavailable(str(error))
+    except ValueError as error:
         return TraceUnavailable(str(error))
 
 
@@ -539,7 +552,7 @@ class TraceWriter:
         self._order = _RecordingOrder()
         self._state: TraceRecording | TraceLimit | TraceEnd = TraceRecording()
         self._bytes_written = len(line)
-        self._moved = False
+        self._saved = False
         self._published = False
         path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         stream = path.open("xb")
@@ -602,13 +615,13 @@ class TraceWriter:
             end = self._order.finish(end, self.header, self._state)
             self._append(encode_record(end))
             self._state = end
-        if not self._moved:
+        if not self._saved:
             self._finished_folder.mkdir(mode=0o700, parents=True, exist_ok=True)
             destination = _sealed_path(self._finished_folder, self.header, end)
             with self.path.open("rb") as stream:
                 os.fsync(stream.fileno())
             _ = self.path.replace(destination)
-            self._moved = True
+            self._saved = True
         if not self._published:
             sync_folder(self._finished_folder)
             sync_folder(self.path.parent)
@@ -616,8 +629,8 @@ class TraceWriter:
         return end
 
     def seal_prefix(self, end: TraceEnd) -> None:
-        """Publish the verified prefix when a normal seal fails."""
-        if self._moved:
+        """Publish the verified prefix and keep the live file."""
+        if self._saved:
             return
         state = self._state
         suffix = b""
@@ -633,9 +646,9 @@ class TraceWriter:
             raise OSError(errno.EIO, "trace lost verified bytes")
         destination = _sealed_path(self._finished_folder, self.header, end)
         write_bytes_atomic(destination, prefix + suffix, mode=0o600)
-        self.path.unlink(missing_ok=True)
-        self._moved = True
-        sync_folder(self.path.parent)
+        self._state = end
+        self._saved = True
+        self._published = True
 
 
 def _sealed_path(folder: Path, header: TraceHeader, end: TraceEnd) -> Path:
@@ -649,21 +662,23 @@ class _SealedTraceFile:
     path: Path
 
 
-def _directory_entries(folder: Path) -> Iterator[Path]:
+def _directory_entries(folder: Path, *, raise_io_errors: bool = False) -> Iterator[Path]:
     try:
         yield from folder.iterdir()
     except FileNotFoundError:
         pass
     except OSError as error:
+        if raise_io_errors:
+            raise
         _report(error, action=f"scan {folder}")
 
 
-def _trace_paths(folder: Path) -> Iterator[Path]:
-    return (entry for entry in _directory_entries(folder) if entry.suffix == _SUFFIX)
+def _trace_paths(entries: Iterable[Path]) -> Iterator[Path]:
+    return (entry for entry in entries if entry.suffix == _SUFFIX)
 
 
-def _finished_files(folder: Path) -> Iterator[_SealedTraceFile]:
-    for path in _trace_paths(folder):
+def _finished_files(entries: Iterable[Path]) -> Iterator[_SealedTraceFile]:
+    for path in _trace_paths(entries):
         ended, _, reservation_id = path.stem.partition("-")
         if ended.isascii() and ended.isdecimal() and _RESERVATION_NAME.fullmatch(reservation_id):
             if len(ended) <= len(str(_MAX_INTEGER)) and int(ended) <= _MAX_INTEGER:
@@ -680,12 +695,29 @@ class TraceStore:
     def _live_path(self, reservation_id: str) -> Path:
         return self.root / "live" / (_name(reservation_id, _RESERVATION_NAME) + _SUFFIX)
 
+    def _finished_folder(self, header: TraceHeader) -> Path:
+        return self.root / "finished" / header.shape_key
+
+    def _finished_for(self, header: TraceHeader, *, raise_io_errors: bool = False) -> Iterator[_SealedTraceFile]:
+        entries = _directory_entries(self._finished_folder(header), raise_io_errors=raise_io_errors)
+        return (file for file in _finished_files(entries) if file.reservation_id == header.reservation_id)
+
+    def _read_finished(self, candidate: _SealedTraceFile, shape_key: str, *, raise_unchecked: bool = False
+                       ) -> MemoryTrace | None:
+        trace = read_trace(candidate.path, self.policy, raise_unchecked=raise_unchecked)
+        if isinstance(trace, TraceUnavailable):
+            _report(trace.reason, action=f"read {candidate.path}")
+            return None
+        if (isinstance(trace.state, TraceEnd) and trace.state.ended_at_ms == candidate.ended_at_ms
+                and trace.header.reservation_id == candidate.reservation_id and trace.header.shape_key == shape_key):
+            return trace
+        return None
+
     def start(self, header: TraceHeader) -> TraceWriter:
         """Start a fresh trace. A prior trace for this reservation blocks a restart."""
-        finished = self.root / "finished" / header.shape_key
-        if any(file.reservation_id == header.reservation_id for file in _finished_files(finished)):
+        if next(self._finished_for(header), None) is not None:
             raise FileExistsError(header.reservation_id)
-        return TraceWriter(self._live_path(header.reservation_id), finished, header, self.policy)
+        return TraceWriter(self._live_path(header.reservation_id), self._finished_folder(header), header, self.policy)
 
     def read_live(self, reservation_id: str) -> MemoryTrace | TraceUnavailable:
         trace = read_trace(self._live_path(reservation_id), self.policy)
@@ -694,8 +726,8 @@ class TraceStore:
         return trace
 
     def recover_abandoned(self) -> None:
-        """Seal the readable prefix from each previous reader as incomplete."""
-        for path in _trace_paths(self.root / "live"):
+        """Save an incomplete copy of each readable trace from a previous worker."""
+        for path in _trace_paths(_directory_entries(self.root / "live")):
             try:
                 self._recover_file(path)
             except Exception as error:
@@ -709,6 +741,11 @@ class TraceStore:
         if path.stem != trace.header.reservation_id:
             _report("reservation ID differs from the file name", action=f"recover {path}")
             return
+        invalid_paths: set[Path] = set()
+        for file in self._finished_for(trace.header, raise_io_errors=True):
+            if self._read_finished(file, trace.header.shape_key, raise_unchecked=True) is not None:
+                return
+            invalid_paths.add(file.path)
         observations: list[TraceRecord] = [trace.header, *trace.compile_samples]
         elapsed = trace.compile_samples[-1].elapsed_ms if trace.compile_samples else 0
         if isinstance(trace.test_start, TestStarted):
@@ -723,64 +760,29 @@ class TraceStore:
         if len(content) > self.policy.max_bytes_per_run:
             _report("verified prefix exceeds the byte limit", action=f"recover {path}")
             return
-        destination = _sealed_path(self.root / "finished" / trace.header.shape_key, trace.header, end)
-        if not destination.exists():
-            write_bytes_atomic(destination, content, mode=0o600)
-        path.unlink(missing_ok=True)
+        destination = _sealed_path(self._finished_folder(trace.header), trace.header, end)
+        if destination in invalid_paths:
+            _ = destination.rename(destination.with_suffix(f".{uuid4().hex}.invalid"))
+        else:
+            try:
+                _ = destination.lstat()
+            except FileNotFoundError:
+                pass
+            else:
+                raise FileExistsError(f"recovery destination was not checked: {destination}")
+        write_bytes_atomic(destination, content, mode=0o600)
 
     def newest_whole_run(self, key: str, *, exclude_reservations: Collection[str] = ()
                          ) -> MemoryTrace | NoMatchingWholeRun:
         """Read the newest eligible trace, using the reservation ID to break ties."""
         folder = self.root / "finished" / _name(key, _SHAPE_NAME)
-        for candidate in sorted(_finished_files(folder), reverse=True):
+        for candidate in sorted(_finished_files(_directory_entries(folder)), reverse=True):
             if candidate.reservation_id in exclude_reservations:
                 continue
-            trace = read_trace(candidate.path, self.policy)
-            if isinstance(trace, TraceUnavailable):
-                _report(trace.reason, action=f"read {candidate.path}")
-                continue
-            if (isinstance(trace.state, TraceEnd)
-                    and isinstance(trace.state.coverage, WholeRun) and trace.state.ended_at_ms == candidate.ended_at_ms
-                    and trace.header.reservation_id == candidate.reservation_id and trace.header.shape_key == key):
+            trace = self._read_finished(candidate, key)
+            if trace is not None and isinstance(trace.state, TraceEnd) and isinstance(trace.state.coverage, WholeRun):
                 return trace
         return NoMatchingWholeRun()
-
-    def prune(self, now_ms: int, active_reservations: Collection[str]) -> None:
-        """Remove aged files and keep the newest finished files within the count limit."""
-        cutoff_ms = now_ms - self.policy.retention_days * _MS_PER_DAY
-        folders: set[Path] = set()
-        for folder in _directory_entries(self.root / "finished"):
-            try:
-                if _SHAPE_NAME.fullmatch(folder.name) and folder.is_dir():
-                    folders.add(folder)
-            except OSError as error:
-                _report(error, action=f"prune {folder}")
-        files = (file for folder in folders for file in _finished_files(folder))
-        for index, file in enumerate(sorted(files, reverse=True)):
-            if file.ended_at_ms < cutoff_ms or index >= self.policy.max_finished_runs:
-                try:
-                    file.path.unlink(missing_ok=True)
-                except OSError as error:
-                    _report(error, action=f"prune {file.path}")
-            else:
-                folders.discard(file.path.parent)
-        for folder in folders:
-            try:
-                folder.rmdir()
-            except OSError as error:
-                if error.errno not in (errno.ENOENT, errno.ENOTEMPTY, errno.EEXIST):
-                    _report(error, action=f"prune {folder}")
-        for path in _trace_paths(self.root / "live"):
-            if path.stem in active_reservations or not _RESERVATION_NAME.fullmatch(path.stem):
-                continue
-            try:
-                modified_ms = path.stat().st_mtime_ns // 1_000_000
-                if modified_ms < cutoff_ms:
-                    path.unlink(missing_ok=True)
-            except FileNotFoundError:
-                continue
-            except OSError as error:
-                _report(error, action=f"prune {path}")
 
 
 @dataclass(frozen=True)
@@ -993,12 +995,10 @@ class TraceCapture:
         self.process_start = process_start
         self._reservations: dict[str, _TraceReservation] = {}
         self._pending_seals: dict[str, _PendingSeal] = {}
-        self._next_prune = float("-inf")
 
     @property
     def deadline(self) -> float:
-        return min(self._next_prune,
-                   min((reservation.due for reservation in self._reservations.values()), default=float("inf")),
+        return min(min((reservation.due for reservation in self._reservations.values()), default=float("inf")),
                    min((seal.due for seal in self._pending_seals.values()), default=float("inf")))
 
     def recover(self) -> None:
@@ -1010,7 +1010,6 @@ class TraceCapture:
                 _ = self._reservations.setdefault(command.reservation_id, _TraceReservation(command, command.monotonic))
         elif isinstance(command, TraceRelease):
             self._release(command)
-            self._maintain()
         else:
             self._record_reserves(command)
 
@@ -1045,15 +1044,6 @@ class TraceCapture:
                         _ = writer.append(TestReserveObserved(reserve))
                     except Exception as error:
                         self._recording_failed(capture, error)
-
-    def _maintain(self) -> None:
-        now = self.clock.monotonic()
-        if now >= self._next_prune:
-            self._next_prune = now + self.store.policy.prune_interval_seconds
-            try:
-                self.store.prune(round(self.clock.now() * _MS_PER_SECOND), self._reservations.keys() | self._pending_seals.keys())
-            except Exception as error:
-                _report(error, action="prune")
 
     def _bind(self, reservation: _TraceReservation) -> _BoundTrace | None:
         try:
@@ -1109,7 +1099,6 @@ class TraceCapture:
             finally:
                 if reservation.scope_loss is None:
                     reservation.due = self.clock.monotonic() + self.store.policy.sample_seconds
-        self._maintain()
 
     def _sample_scope(self, reservation: _TraceReservation, release_time: Callable[[str], float]) -> None:
         if reservation.capture is None:
@@ -1299,7 +1288,6 @@ class TraceCapture:
             except Exception as fallback_error:
                 _report(fallback_error, action=f"seal prefix {identifier}")
                 return
-        self._next_prune = float("-inf")
 
     @staticmethod
     def _recording_failed(capture: _BoundTrace, error: Exception) -> None:

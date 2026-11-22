@@ -14,9 +14,9 @@ from scripts.build_queue.queue_fixture import fixture_reservation
 
 
 TRACE_NOW = 10 * 86_400
-TRACE_POLICY = memory_trace.MemoryTracePolicy(2, 64, 8_192, 2, 8, 8, 65_536,
+TRACE_POLICY = memory_trace.MemoryTracePolicy(2, 64, 8_192, 2, 8, 65_536,
                                             final_replay_bytes=100000,
-                                            max_pending_commands=8, prune_interval_seconds=7,
+                                            max_pending_commands=8,
                                             scope_loss_grace_seconds=4, seal_retry_count=2)
 TRACE_SHAPE = "a" * 64
 
@@ -121,7 +121,10 @@ class ProgramMemoryFeedTests(unittest.TestCase):
         store = self.trace_store()
         rows = self.trace_rows("live-trace")
         feed = program_memory_feed.ProgramMemoryFeed(store)
-        self.seal_past_trace(store, "old-trace", TRACE_NOW - (TRACE_POLICY.retention_days + 1) * 86_400)
+        ended = TRACE_NOW - (TRACE_POLICY.past_run_max_age_days + 1) * 86_400
+        self.seal_past_trace(store, "old-trace", ended)
+        old_trace = store.root / "finished" / TRACE_SHAPE / f"{ended * 1000}-old-trace.jsonl"
+        original = old_trace.read_bytes()
         writer = self.start_trace(store, "live-trace", start=TRACE_NOW - 9)
         _ = writer.append(self.compile_trace_sample(0, 8))
         self.assertEqual(self.views(feed, rows), {})
@@ -134,6 +137,7 @@ class ProgramMemoryFeedTests(unittest.TestCase):
         self.assertEqual(current["live"]["compile"]["peak"], (0, 7))
         self.assertIsNone(current["past"])
         self.assertIsNone(current["test_reserve"])
+        self.assertEqual(old_trace.read_bytes(), original)
         foreign = self.start_trace(store, "other-trace")
         _ = foreign.append(self.compile_trace_sample(2000, 9))
         _ = foreign.path.replace(writer.path)

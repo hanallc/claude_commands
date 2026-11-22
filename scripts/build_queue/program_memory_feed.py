@@ -183,7 +183,7 @@ class ProgramMemoryFeed:
                 self.past[key] = _PastTraceRead(stamp, file, trace)
         if isinstance(trace, memory_trace.MemoryTrace) and trace.header.reservation_id == live.reservation_id:
             trace = self.store.newest_whole_run(key, exclude_reservations=(live.reservation_id,))
-        cutoff = now_ms - self.store.policy.retention_days * 86_400_000
+        cutoff = now_ms - self.store.policy.past_run_max_age_days * 86_400_000
         if (isinstance(trace, memory_trace.MemoryTrace) and isinstance(trace.state, memory_trace.TraceEnd)
                 and trace.state.ended_at_ms >= cutoff):
             return trace
