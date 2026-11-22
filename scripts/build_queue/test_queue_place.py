@@ -32,7 +32,7 @@ from scripts.lib.test_hang_guard import LauncherHangGuard, TEST_HANG_GUARD_SECS
 from scripts.build_queue import admission_records as records, program_start, step_estimator
 from scripts.lint import memory_admit as gate
 
-from scripts.buildlog import store
+from scripts.buildlog import sample, store
 
 from scripts.lint.memory_test_support import commit_config_fixture, fake_memory_readings, gate_isolation_environment
 from scripts.build_queue.queue_fixture import write_memory_config
@@ -394,6 +394,35 @@ class QueuePlaceFixture(ExitStack):
 
 
 class QueuePlaceTests(unittest.TestCase):
+    def test_detached_module_scope_stays_in_builds_slice(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            builds = Path(directory) / "builds.slice"
+            parent = "builds-detached-r1.slice"
+            step = builds / "builds-detached.slice" / parent / "run-step.scope"
+            step.mkdir(parents=True)
+            _ = (step / "memory.stat").write_text("anon 4096\nfile 16384\n")
+            _ = (builds / "memory.stat").write_text("anon 12288\nfile 32768\n")
+            read = Path.read_text
+
+            def read_membership(path: Path) -> str:
+                if path == Path("/proc/self/cgroup"):
+                    return f"0::/{step.relative_to(builds.parent)}\n"
+                return read(path)
+
+            with (mock.patch.dict(os.environ, {"DETACHED_RUN_SLICE": parent, "BUILDLOG_SCOPE": "1"}),
+                  mock.patch.object(Path, "read_text", autospec=True, side_effect=read_membership),
+                  mock.patch.object(subprocess, "run", return_value=subprocess.CompletedProcess(["true"], 0)) as probe):
+                self.assertTrue(queue.in_builds_slice())
+                prefix = queue.suite_scope_prefix()
+                self.assertIn(f"--slice={parent}", prefix)
+                self.assertIn("--scope", prefix)
+                self.assertEqual(probe.call_args.args[0], [*prefix, "true"])
+
+            step_anon = sample.anon_bytes(step)
+            assert isinstance(step_anon, int)
+            self.assertEqual(step_anon, 4096)
+            self.assertEqual(sample.anon_bytes(builds), 8192 + step_anon)
+
     def test_fixture_removes_child_folders_after_exit_term_int_and_kill(self) -> None:
         source = """
 from pathlib import Path

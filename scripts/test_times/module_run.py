@@ -24,6 +24,7 @@ from inspect import currentframe
 from pathlib import Path
 import resource
 import select
+import shutil
 import signal
 import stat
 import sys
@@ -515,7 +516,51 @@ class TimedRunner(unittest.TextTestRunner):
         return result
 
 
-def main() -> None:
+@dataclass(frozen=True)
+class GateModuleLease:
+    root: Path
+
+
+@dataclass(frozen=True)
+class StandaloneModuleRun:
+    """The runner owns its folder leases."""
+
+
+def runner_folder_owner() -> GateModuleLease | StandaloneModuleRun:
+    if root := os.environ.pop("MERGE_GATE_MODULE_DIR", ""):
+        return GateModuleLease(Path(root))
+    return StandaloneModuleRun()
+
+
+@contextmanager
+def runner_folder(owner: GateModuleLease | StandaloneModuleRun, name: str) -> Generator[Path]:
+    if isinstance(owner, GateModuleLease):
+        folder = owner.root / name
+        creator = os.getpid()
+        folder.mkdir(mode=0o700)
+        try:
+            yield folder
+        finally:
+            # The supervisor reaps all descendants before it removes the folders.
+            if os.getpid() == creator:
+                try:
+                    shutil.rmtree(folder)
+                except FileNotFoundError:
+                    pass
+                except PermissionError:
+                    from scripts.lib import build_folders
+
+                    build_folders.remove_folder(folder)
+    else:
+        from scripts.lib import build_folders
+
+        with build_folders.tool_folder(name) as folder:
+            yield folder
+
+
+def main(owner: GateModuleLease | StandaloneModuleRun | None = None) -> None:
+    if owner is None:
+        owner = StandaloneModuleRun()
     try:
         from scripts.lib import conf_reads
     except ImportError:
@@ -526,10 +571,10 @@ def main() -> None:
         run_module(NoConfigReadLog())
         return
 
-    from scripts.lib import build_folders
-
-    with build_folders.tool_folder("config-reads") as temporary:
-        log = Path(temporary) / "reads"
+    with ExitStack() as cleanup:
+        temporary = (owner.root / "config-reads" if isinstance(owner, GateModuleLease)
+                     else cleanup.enter_context(runner_folder(owner, "config-reads")))
+        log = temporary / "reads"
         log.touch()
         with conf_reads.record_reads(log):
             run_module(log)
@@ -572,30 +617,32 @@ def run_module(config_log: Path | NoConfigReadLog) -> None:
 
 
 @contextmanager
-def private_run_roots() -> Generator[Callable[[], None]]:
+def private_run_roots(owner: GateModuleLease | StandaloneModuleRun) -> Generator[None]:
     """Keep imported run roots and child processes under one private folder."""
-    from scripts.lib import build_folders
-
     names = ("SCRATCH_ROOT", "ASTRA_REVIEW_DIR")
     previous = {name: os.environ[name] for name in names if name in os.environ}
     with ExitStack() as cleanup:
-        root = cleanup.enter_context(build_folders.tool_folder("test-run-roots"))
+        root = cleanup.enter_context(runner_folder(owner, "test-run-roots"))
+        if isinstance(owner, GateModuleLease):
+            _ = cleanup.enter_context(runner_folder(owner, "config-reads"))
         try:
             os.environ.update(SCRATCH_ROOT=str(root / "scratch"), ASTRA_REVIEW_DIR=str(root / "astra"))
-            yield cleanup.close
+            yield
         finally:
             for name in names:
                 _ = os.environ.pop(name, None)
             os.environ.update(previous)
 
 
-def run_with_descendant_cleanup(cleanup_run_roots: Callable[[], None]) -> None:
+def run_with_descendant_cleanup(owner: GateModuleLease | StandaloneModuleRun, cleanup: ExitStack) -> None:
     """Use kernel events while the supervisor reaps every adopted descendant."""
     global startup_cpu_s
     from scripts.lib.descendants import adopt_descendants
 
+    parent = gate_parent_pid(consume=True)
     if not adopt_descendants():
-        main()
+        cleanup.enter_context(private_run_roots(owner))
+        main(owner)
         return
     libc = ctypes.CDLL(None, use_errno=True)
     watched = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP, signal.SIGCHLD)
@@ -609,12 +656,12 @@ def run_with_descendant_cleanup(cleanup_run_roots: Callable[[], None]) -> None:
     if signal_fd < 0:
         raise OSError(ctypes.get_errno(), "cannot watch runner signals")
     parent_fds: list[int] = []
-    parent = gate_parent_pid(consume=True)
     if parent:
         # No test child exists before the parent-death handoff completes.
         parent_fds.append(os.pidfd_open(int(parent)))
         if cast(int, libc.prctl(1, 0, 0, 0, 0)) != 0:
             raise OSError(ctypes.get_errno(), "cannot watch the gate parent")
+    cleanup.enter_context(private_run_roots(owner))
     usage = resource.getrusage(resource.RUSAGE_SELF)
     supervisor = os.getpid()
     test_pid = os.fork()
@@ -628,7 +675,7 @@ def run_with_descendant_cleanup(cleanup_run_roots: Callable[[], None]) -> None:
         startup_cpu_s = usage.ru_utime + usage.ru_stime
         _ = signal.signal(signal.SIGCHLD, previous_sigchld)
         _ = signal.pthread_sigmask(signal.SIG_SETMASK, blocked)
-        main()
+        main(owner)
         return
     status = 0
     received = 0
@@ -672,9 +719,9 @@ def run_with_descendant_cleanup(cleanup_run_roots: Callable[[], None]) -> None:
         for descriptor in [signal_fd, test_fd, *parent_fds]:
             os.close(descriptor)
     exit_code = os.waitstatus_to_exitcode(status)
+    cleanup.close()
     if received or exit_code < 0:
         number = received or -exit_code
-        cleanup_run_roots()
         if number not in (signal.SIGKILL, signal.SIGSTOP):
             _ = signal.signal(number, signal.SIG_DFL)
         os.kill(os.getpid(), number)
@@ -684,5 +731,6 @@ def run_with_descendant_cleanup(cleanup_run_roots: Callable[[], None]) -> None:
 
 
 if __name__ == "__main__":
-    with private_run_roots() as cleanup_run_roots:
-        run_with_descendant_cleanup(cleanup_run_roots)
+    folder_owner = runner_folder_owner()
+    with ExitStack() as runner_cleanup:
+        run_with_descendant_cleanup(folder_owner, runner_cleanup)

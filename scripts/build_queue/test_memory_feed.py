@@ -11,6 +11,7 @@ import io
 import os
 import re
 from collections import Counter
+from collections.abc import Iterator
 from contextlib import redirect_stdout
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
@@ -1587,6 +1588,57 @@ process.stdout.write(JSON.stringify({
         self.assertEqual({row["name"] for row in swap.rows if row["kind"] == "owner"}, set(labels))
         self.assertTrue(all("between steps" in row["detail"] for row in swap.rows if row["kind"] == "owner"))
         self.assertTrue(all(row.get("title_kind") == "staff" for row in swap.rows if row["kind"] == "owner"))
+
+    def test_swap_leaves_detached_tool_scope_remainder_unclassified(self) -> None:
+        gib = admission_records.GIB
+        self.host_swap(8 * gib, 4 * gib)
+        builds = self.cgroup("builds.slice", 4 * gib)
+        detached = "builds.slice/builds-detached.slice"
+        _ = self.cgroup(detached, 4 * gib)
+        parent = self.cgroup(detached + "/tool.scope", 4 * gib)
+        child = self.cgroup(detached + "/tool.scope/cargo.scope", gib)
+        tool = admission_records.RunningStep("tool-owner", "tool owner", "between steps", str(parent), 0,
+            admission_records.UnownedSliceMemory(gib, cgroup=str(parent), pid=700001), pid=700001)
+        cargo = reservation_reading().view.running[0]
+        memory = cargo.measured
+        assert isinstance(memory, admission_records.MeasuredMemory)
+        cargo = replace(cargo, measured=replace(memory, anonymous_source=admission_records.ScopeSource(child, frozenset())))
+        with mock.patch.object(gate, "builds_slice_cgroup", return_value=builds):
+            names = read_step_names()
+            baseline = memory_feed.read_swap((cargo,), {}, 6, names)
+            swap = memory_feed.read_swap((tool, cargo), {}, 6, names)
+        assert isinstance(swap, memory_feed.SwapReading)
+        self.assertEqual(swap, baseline)
+        remainder, = (row for row in swap.rows if row["kind"] == "ungrouped")
+        self.assertEqual((remainder["name"], remainder["bytes"]), ("Unclassified groups", 3 * gib))
+        owner, = (row for row in swap.rows if row["kind"] == "owner")
+        self.assertEqual(owner["bytes"], gib)
+        self.assertEqual(swap.builds_ci, 4 * gib)
+
+    def test_swap_shows_both_cgroups_below_a_detached_tool_scope(self) -> None:
+        gib = admission_records.GIB
+        total = 3 * gib // 4
+        self.host_swap(2 * gib, total)
+        user = "user.slice/user-1000.slice/user@1000.service"
+        for group in ("user.slice", "user.slice/user-1000.slice", user):
+            _ = self.cgroup(group, total)
+        builds = user + "/builds.slice"
+        detached = builds + "/builds-detached.slice"
+        run = detached + "/builds-detached-r1.slice"
+        for group in (builds, detached, run):
+            _ = self.cgroup(group, total)
+        parent = self.cgroup(run + "/tool.scope", total)
+        _ = self.cgroup(run + "/tool.scope/first.scope", gib // 2)
+        _ = self.cgroup(run + "/tool.scope/second.scope", gib // 4)
+        tool = admission_records.RunningStep("", "tool", "unowned", str(parent), 0,
+            admission_records.UnownedSliceMemory(gib, cgroup=str(parent), owner="tool", pid=700001), pid=700001)
+        names = read_step_names()
+        baseline = memory_feed.read_swap((), {}, 6, names)
+        swap = memory_feed.read_swap((tool,), {}, 6, names)
+        assert isinstance(swap, memory_feed.SwapReading)
+        self.assertEqual(swap, baseline)
+        self.assertEqual([(row["name"], row["bytes"]) for row in swap.rows if row["kind"] == "owner"],
+                         [("first", gib // 2), ("second", gib // 4)])
 
     def test_swap_small_groups_and_total_use_the_same_current_host_reading(self) -> None:
         self.host_swap(4 * admission_records.GIB, 3 * admission_records.GIB)
@@ -3721,6 +3773,212 @@ process.stdout.write(JSON.stringify({
                 self.assertEqual(len(room.runs), int(bool(cargo_use)))
                 self.assertEqual(room.used, cargo_use)
                 self.assertEqual(room.used + room.kept, 8 * admission_records.GIB if cargo_use else 0)
+
+    def test_tracked_run_keeps_its_row_when_detached_scopes_account_for_its_tools(self) -> None:
+        gib = admission_records.GIB
+        with AdmissionFixture() as fixture:
+            proc = fixture.proc.path
+            root = fixture.fixture_owner(700001, "100")
+            run = wire.RunIdentity(root.pid, root.start_time)
+            helper_pids = (700002, 700003)
+            write_process(proc, root.pid, gib, start=root.start_time)
+            _ = (proc / str(root.pid) / "cmdline").write_bytes(b"bash\0/fixture/verify.sh\0test\0")
+            for pid in helper_pids:
+                write_process(proc, pid, gib // 4, parent=root.pid)
+                _ = (proc / str(pid) / "cmdline").write_bytes(b"sleep\0")
+            first = fixture.fixture_owner(700004, "200")
+            _ = fixture.finish_step(fixture.request(owner=first, run=run))
+            fixture.clock.advance(200)
+            self.assertTrue(fixture.server.run_places)
+
+            builds = Path(os.environ["BUILDLOG_BUILDS_CGROUP"])
+            detached = builds / "builds-detached.slice"
+            run_slice = detached / "builds-detached-r1.slice"
+            write_scope(builds, current=5 * gib, anonymous=5 * gib)
+            write_scope(detached, current=5 * gib, anonymous=5 * gib)
+            write_scope(run_slice, current=5 * gib, anonymous=5 * gib)
+            cargo = fixture.fixture_owner(700005, "300")
+            sidecar = fixture.scope(cargo, folder=str((run_slice / "cargo.scope").relative_to(fixture.root)),
+                                    current=2 * gib, anonymous=2 * gib)
+            _ = only_admitted(fixture.server.handle_request(replace(fixture.request(owner=cargo), sidecar=str(sidecar))))
+
+            def page() -> tuple[memory_feed.MemoryPage, admission_records.QueueRead]:
+                _ = fixture.run_pass()
+                reply, = fixture.server.handle_request(wire.ViewRequest())
+                decoded = wire.parse_reply(wire.encode_reply(reply))
+                assert isinstance(decoded, wire.ViewReply)
+                with (mock.patch.object(admission_client, "view", return_value=decoded.reading),
+                      mock.patch.object(memory_feed, "PROC", proc)):
+                    return memory_feed.reading(), decoded.reading
+
+            before, baseline = page()
+            original, = (row for row in before["walk"] if row["pid"] == root.pid)
+            original = cast(memory_feed.RunRow, original)
+            self.assertEqual((original["name"], original["used"], original["counted"]), ("verify.sh", 1.5, 0.0))
+
+            for pid, scope_gib in zip(helper_pids, (1, 2), strict=True):
+                write_scope(run_slice / f"helper-{pid}.scope", members=(pid,),
+                            current=scope_gib * gib, anonymous=scope_gib * gib)
+            after, reading = page()
+            matching = {str(run_slice / f"helper-{pid}.scope") for pid in helper_pids}
+            self.assertTrue(matching.isdisjoint(step.measured.cgroup for step in reading.view.running
+                                               if isinstance(step.measured, admission_records.UnownedSliceMemory)))
+            shown, = (row for row in after["walk"] if row["pid"] == root.pid)
+            self.assertEqual(shown, original)
+            self.assertEqual(after["walk"], before["walk"])
+            self.assertEqual(reading.explanation.totals, baseline.explanation.totals)
+            self.assertEqual(reading.explanation.totals.measured, 7 * gib // 2)
+            ram = after["ram"]
+            self.assertEqual((ram["queued_builds_bytes"], ram["build_tools_bytes"], ram["other_build_tools_bytes"]),
+                             (2 * gib, 3 * gib, 3 * gib))
+            self.assertEqual(after["used"], 2.0)
+
+            other = fixture.fixture_owner(700006, "400")
+            other_run = wire.RunIdentity(other.pid, other.start_time)
+            for offset, (pid, scope_gib) in enumerate(zip(helper_pids, (1, 2), strict=True)):
+                owner = fixture.fixture_owner(700007 + offset, str(500 + offset))
+                scope = run_slice / f"helper-{pid}.scope"
+                sidecar = fixture.scope(owner, folder=str(scope.relative_to(fixture.root)), members=(pid,),
+                                        current=scope_gib * gib, anonymous=scope_gib * gib)
+                fixture.allow_next_start()
+                request = fixture.request(owner=owner, run=other_run)
+                _ = only_admitted(fixture.server.handle_request(replace(request, sidecar=str(sidecar))))
+
+            owned, reading = page()
+            self.assertTrue(matching.isdisjoint(step.measured.cgroup for step in reading.view.running
+                                               if isinstance(step.measured, admission_records.UnownedSliceMemory)))
+            self.assertEqual({str(step.measured.anonymous_source.directory) for step in reading.view.running
+                              if isinstance(step.run, LiveBuildRun) and step.run.pid == other.pid
+                              and isinstance(step.measured, admission_records.MeasuredMemory)
+                              and isinstance(step.measured.anonymous_source, admission_records.ScopeSource)}, matching)
+            retained, = (row for row in owned["walk"] if row["pid"] == root.pid)
+            self.assertEqual(retained, original)
+            self.assertEqual(owned["ram"]["queued_builds_bytes"], 5 * gib)
+            self.assertEqual(owned["ram"]["build_tools_bytes"], 0)
+
+    def test_system_read_matches_main_for_nested_detached_scopes(self) -> None:
+        gib = admission_records.GIB
+        with AdmissionFixture() as fixture:
+            proc = fixture.proc.path
+            root = fixture.fixture_owner(700001, "100")
+            run = wire.RunIdentity(root.pid, root.start_time)
+            helpers = (700002, 700003)
+            write_process(proc, root.pid, gib, start=root.start_time)
+            _ = (proc / str(root.pid) / "cmdline").write_bytes(b"bash\0/fixture/verify.sh\0test\0")
+            for pid in helpers:
+                write_process(proc, pid, gib // 4, parent=root.pid)
+            first = fixture.fixture_owner(700004, "200")
+            _ = fixture.finish_step(fixture.request(owner=first, run=run))
+            fixture.allow_next_start()
+
+            builds = Path(os.environ["BUILDLOG_BUILDS_CGROUP"])
+            helper = builds / "builds-detached.slice/builds-detached-r1.slice/helper.scope"
+            child = helper / "cargo.scope"
+            write_scope(helper, members=helpers, current=5 * gib, anonymous=5 * gib)
+            cargo_owner = fixture.fixture_owner(700005, "300")
+            for pid in (root.pid, *helpers, cargo_owner.pid):
+                (proc / str(pid) / "cwd").symlink_to(fixture.root)
+            sidecar = fixture.scope(cargo_owner, folder=str(child.relative_to(fixture.root)),
+                                    current=2 * gib, anonymous=2 * gib)
+            request = replace(fixture.request(owner=cargo_owner), sidecar=str(sidecar))
+            _ = only_admitted(fixture.server.handle_request(request))
+            record = fixture.server.reservations[request.episode]
+            config = fixture.server.last_usable_configuration
+            assert isinstance(config, admission_records.MemoryConfig)
+            plan = admission_service.SystemReadingPlan(replace(config, ci_memory_slice=""), (record,),
+                                                       tuple(fixture.server.run_places.values()), False)
+            reads: Counter[str] = Counter()
+            read_bytes = Path.read_bytes
+            read_text = Path.read_text
+            readlink = Path.readlink
+            iterdir = Path.iterdir
+
+            def read_process(path: Path) -> bytes:
+                if path.parent.parent == proc and path.name in ("status", "cmdline", "environ"):
+                    reads[path.name] += 1
+                return read_bytes(path)
+
+            def read_group(path: Path, encoding: str | None = None, errors: str | None = None) -> str:
+                if path.is_relative_to(builds):
+                    if path.name == "cgroup.procs":
+                        reads["cgroup.procs"] += 1
+                    elif path == builds / "sccache.service/memory.current":
+                        reads["compiler probe"] += 1
+                    elif path.name in ("memory.current", "memory.stat", "memory.swap.current"):
+                        reads["memory counters"] += 1
+                return read_text(path, encoding=encoding, errors=errors)
+
+            def read_folder(path: Path) -> Path:
+                if path.parent.parent == proc and path.name == "cwd":
+                    reads["cwd"] += 1
+                return readlink(path)
+
+            def list_groups(path: Path) -> Iterator[Path]:
+                if path.is_relative_to(builds):
+                    reads["cgroup listings"] += 1
+                return iterdir(path)
+
+            with (mock.patch.object(Path, "read_bytes", read_process), mock.patch.object(Path, "read_text", read_group),
+                  mock.patch.object(Path, "readlink", read_folder), mock.patch.object(Path, "iterdir", list_groups)):
+                evidence = admission_service.read_system(plan, fixture.readings, fixture.proc, fixture.clock)
+            self.assertEqual(dict(reads), {"status": 3, "cmdline": 1, "environ": 1, "cwd": 1,
+                                           "cgroup.procs": 2, "cgroup listings": 2, "memory counters": 3,
+                                           "compiler probe": 1})
+            self.assertEqual(evidence.unowned, ())
+            tracked, = evidence.between
+            assert isinstance(tracked.measured, admission_records.MeasuredMemory)
+            self.assertEqual(tracked.measured.bytes, 3 * gib // 2)
+            memory = evidence.reservations[request.episode].memory
+            assert isinstance(memory, admission_records.MeasuredMemory)
+            self.assertEqual(memory.anonymous_source, admission_records.ScopeSource(child, frozenset({cargo_owner.pid})))
+
+    def test_ci_scan_deducts_a_process_that_enters_a_reserved_scope_between_samples(self) -> None:
+        from scripts.build_queue.test_admission_service import FixedSystemReader
+
+        gib = admission_records.GIB
+        with AdmissionFixture() as fixture:
+            ci = Path(os.environ["BUILDLOG_CI_CGROUP"])
+            child = ci / "job.scope"
+            write_scope(ci, current=2 * gib, anonymous=2 * gib)
+            tree_owner = fixture.fixture_owner(700001, "100")
+            scope_owner = fixture.fixture_owner(700002, "200")
+            write_process(fixture.proc.path, tree_owner.pid, gib, start=tree_owner.start_time)
+            tree_request = fixture.request(owner=tree_owner, need=2 * gib)
+            _ = only_admitted(fixture.server.handle_request(tree_request))
+            fixture.allow_next_start()
+            sidecar = fixture.scope(scope_owner, folder=str(child.relative_to(fixture.root)))
+            scope_request = replace(fixture.request(owner=scope_owner, need=2 * gib), sidecar=str(sidecar))
+            _ = only_admitted(fixture.server.handle_request(scope_request))
+            config = fixture.server.last_usable_configuration
+            assert isinstance(config, admission_records.MemoryConfig)
+            plan = admission_service.SystemReadingPlan(config, tuple(fixture.server.reservations.values()), (), False)
+            read_text = Path.read_text
+
+            def move_process(path: Path, encoding: str | None = None, errors: str | None = None) -> str:
+                if path == ci / "memory.current":
+                    # The earlier reservation already measured its child.
+                    write_scope(ci, current=3 * gib, anonymous=3 * gib)
+                    write_scope(child, members=(scope_owner.pid, tree_owner.pid), current=2 * gib, anonymous=2 * gib)
+                return read_text(path, encoding=encoding, errors=errors)
+
+            for move in (False, True):
+                with self.subTest(move=move), mock.patch.object(Path, "read_text", autospec=True,
+                                                                  side_effect=move_process if move else read_text):
+                    evidence = admission_service.read_system(plan, fixture.readings, fixture.proc, fixture.clock)
+                child_memory = evidence.reservations[scope_request.episode].memory
+                assert isinstance(child_memory, admission_records.MeasuredMemory)
+                self.assertEqual(child_memory.anonymous_source,
+                                 admission_records.ScopeSource(child, frozenset({scope_owner.pid})))
+                self.assertEqual(evidence.scope_members[str(ci)], {scope_owner.pid, tree_owner.pid}
+                                 if move else {scope_owner.pid})
+                fixture.server.system_reader = FixedSystemReader(evidence)
+                _ = fixture.run_pass()
+                reply, = fixture.server.handle_request(wire.ViewRequest())
+                assert isinstance(reply, wire.ViewReply)
+                with (mock.patch.object(admission_client, "view", return_value=reply.reading),
+                      mock.patch.object(memory_feed, "PROC", fixture.proc.path)):
+                    page = memory_feed.reading()
+                self.assertEqual(page["ci_ram"], 1.0)
 
     def test_registered_and_unregistered_ci_jobs_count_once_without_margin_text(self) -> None:
         for registered, registered_use, unregistered_use, kept in (

@@ -14,6 +14,7 @@ import socket
 import subprocess
 import sys
 from collections.abc import Sequence
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from scripts.lib.transcripts import open_transcript, transcript_paths
@@ -419,10 +420,11 @@ def _newest_unit_plans() -> dict[str, str]:
         return {}
     for path in paths:
         try:
-            first_line = path.read_text(encoding="utf-8").splitlines()[0]
+            with path.open("rb") as log:
+                first_line = log.readline().decode("utf-8")
             value = cast(object, json.loads(first_line))
             modified = path.stat().st_mtime
-        except (OSError, UnicodeError, ValueError, TypeError, IndexError):
+        except (OSError, ValueError):
             continue
         if not isinstance(value, dict):
             continue
@@ -847,8 +849,6 @@ def listing(login: str | None = None) -> list[ListedSession]:
 
 def all_live_accounts() -> list[Inventory]:
     """Read current restore details for every locally attributed Claude login."""
-    from concurrent.futures import ThreadPoolExecutor
-
     logins = sorted({item.login for item in listing()})
     if not logins:
         return []
@@ -867,7 +867,6 @@ def inventory(
     home_state = account.home_account_state()
     records = [_session_file(record) for record in sessions.live_sessions()]
     membership = staff.snapshot()
-    units = _unit_sessions(membership)
     retired = frozenset(str(identity) for row in membership.rows if isinstance(row.worktree, staff.RemovedWorktree)
                         for identity in (row.id, row.current_session))
     session_ids = {
@@ -890,6 +889,7 @@ def inventory(
         isinstance(entry, ListedSession) and entry.login.casefold() == wanted_login
         for _, entry in candidates
     )
+    units = _unit_sessions(membership) if has_sessions else {}
     plans = _newest_unit_plans() if has_sessions else {}
     found: list[Session] = []
     unattributed: list[UnattributedSession] = []
@@ -905,6 +905,17 @@ def inventory(
         found.append(_session_details(record, entry, directories=run_directories.get(session_id, []),
             host=_host(record, units.get(session_id), plans), timers=_timers(session_id),
             environment=_process_environment(entry.pid), worker_owner=DirectorOwner(kind="director", session_id=worker_owners[session_id]) if session_id in worker_owners else NoDirector(kind="no director")))
+
+    folders = dict.fromkeys(session["cwd"] for session in found if isinstance(session["cwd"], str))
+    if len(folders) > 1:
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            checkouts = dict(zip(folders, pool.map(_checkout, folders), strict=True))
+    else:
+        checkouts = {folder: _checkout(folder) for folder in folders}
+    for session in found:
+        folder = session["cwd"]
+        if isinstance(folder, str):
+            session["checkout"] = checkouts[folder]
 
     return {
         "machine": _machine(),
@@ -932,7 +943,4 @@ def _session_details(record: SessionFile, entry: ListedSession, *, directories: 
         common.update(production=entry.production, doc=entry.doc)
     elif entry.kind == "worker":
         common["owner"] = worker_owner
-    session = parse_session(common, "observed session")
-    folder = session["cwd"]
-    session["checkout"] = _checkout(folder) if isinstance(folder, str) else NotACheckout(kind="not a checkout")
-    return session
+    return parse_session(common, "observed session")
