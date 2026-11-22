@@ -986,8 +986,11 @@ class WorkerPaneTests(StaffTestCase):
                 self.assertEqual(self.staff_state(), before)
 
     def test_pass_end_and_restore_close_an_interrupted_worker_without_a_reply_and_keep_a_live_turn(self) -> None:
+        from scripts.message import send
         from scripts.production import worker
 
+        _ = self.enterContext(patch.object(send, "delivery_timeout", return_value=1.0))
+        _ = self.enterContext(patch.object(send, "send", return_value=send.Result("sent", "fixture director")))
         cases = (("restore", "idle"), ("restore", "done"), ("restore", "working"),
                  ("finish-phase", "idle"), ("finish-phase", "working"), ("finish-run", "idle"))
         for index, (operation, status) in enumerate(cases, start=1):
