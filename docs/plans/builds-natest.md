@@ -1328,3 +1328,17 @@ Ordered after the red main repair and the guard repair (builds). It does not mov
 - **Files:** `scripts/aws_target/fixtures/cloud_gate.conf`; `scripts/mac_test/test_hana_offload.py`.
 - **Workers:** 1 writer.
 - **Acceptance gate:** the modules that read the two fixtures pass in tests-only gates after the builds go; one blind review.
+
+### Phase 434 — mac_run.sh exits 9 for a busy Mac or a damaged claim  · status: todo
+**Depends on:** Phase 424, Phase 427 (builds 03:03: start after both rows are sent)
+
+#### Work Order
+- **Goal:** builds 03:03 (review2 finding on the 427 fix): `scripts/production/mac_run.sh` documents exit 9 for "Mac blocked, busy with a test, or coordination state unreadable". Two cases wait instead: a busy Mac (the production queue returns status 78, and `scripts/mac_test/mac_queue_run.py:325` retries it), and a damaged `run.json` (`scripts/build_queue/admission_service.py:3210` turns it into a wait). Both end with exit 9 and one clear line.
+- **Spec:**
+  1. A `--lifecycle-script` run (mac_run.sh) ends with exit 9 and the existing busy message when the queue returns the busy status. Other runs keep their wait.
+  2. A damaged claim file ends a mac_run.sh run with exit 9 and `state unreadable: <path>` before any retry. Reuse the mac_test.py readers and messages; copy no logic.
+  3. The test proves the production queue response (status 78), not only the claim stub status 11.
+  4. No config key changes. verify's B5 also changes mac_run.sh (by 14:30): tell verify-unit the lines this phase touches.
+- **Files:** `scripts/mac_test/mac_queue_run.py`; `scripts/production/mac_run.sh` only if needed; `scripts/production/test_mac_run.py`; `scripts/mac_test/test_mac_queue_run.py`; the as-built doc for Mac queue runs.
+- **Workers:** 1 writer.
+- **Acceptance gate:** fixtures for busy and damaged run.json exit 9 and start no remote command; the changed modules pass in tests-only gates after the builds go; basedpyright zero on changed files; one blind review.
