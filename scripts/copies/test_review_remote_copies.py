@@ -212,7 +212,7 @@ class RemoteEntryTests(unittest.TestCase):
         }
         key = "https://fixture.invalid/team/repository"
         stem = claim_state.mac_claim_stem(key, 0)
-        identity = claim_state.MacRepositoryIdentity(key, "repository", f"{stem}.json", stem)
+        identity = claim_state.CleanupOnlyMacRepository(key, "repository", f"{stem}.json", stem)
         for name, fields in (
             ("repository.json", record),
             (identity.claim_file, {**record, "repo_name": "alias", "repo_key": key,

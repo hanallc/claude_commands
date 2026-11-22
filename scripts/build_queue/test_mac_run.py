@@ -278,7 +278,7 @@ class MacRunTests(unittest.TestCase):
 
     def test_mac_local_origins_follow_the_upstream_repository(self) -> None:
         source = claim_state.mac_repository_identity(str(self.repo))
-        assert isinstance(source, claim_state.MacRepositoryIdentity)
+        assert isinstance(source, claim_state.MacMirrorIdentity)
         self.assertEqual(source.key, REPOSITORY_KEY)
         for origin in (str(self.repo), "../.claude"):
             with self.subTest(origin=origin):
@@ -302,7 +302,7 @@ class MacRunTests(unittest.TestCase):
         for checkout in (other, self.checkout):
             with self.subTest(checkout=checkout):
                 saved = claim_state.mac_repository_identity(str(checkout))
-                assert isinstance(saved, claim_state.MacRepositoryIdentity)
+                assert isinstance(saved, claim_state.MacMirrorIdentity)
                 self.assertEqual((saved.key, saved.mirror_name), (origin.removesuffix(".git"), "other"))
 
     def test_separate_origins_with_one_base_name_get_separate_claim_files(self) -> None:
@@ -384,12 +384,11 @@ class MacRunTests(unittest.TestCase):
         check.assert_called_once_with(connection, "fixture-mac", offload.ALL_MIRRORS, "mac", 1)
         self.assertEqual(claim_state.read_claims(self.paths), ())
 
-    def test_legacy_wait_claim_releases_before_resolving_a_changed_origin(self) -> None:
+    def test_legacy_wait_claim_retires_under_the_new_execution_lease(self) -> None:
         with (self.root / "mac_test.conf").open("a") as settings:
             _ = settings.write("mirror_root=~/.local/state/mac-test/mirror\n")
         source_b = self.repository("source-b")
         remote = ["git", "-C", str(self.checkout), "remote", "set-url", "origin"]
-        resolve = claim_state.mac_repository_identity
         self.addCleanup(step_estimator.clear_git_identity_cache)
         cases = ((True, True, False), (False, True, False), (True, False, False), (False, False, True))
         for assigned, changed, structured in cases:
@@ -420,12 +419,17 @@ class MacRunTests(unittest.TestCase):
                                                            else offload.DirectOffloadRequest()),
                     admission=offload.MacClaimFromWait(waiting.pid, identity, NoOwningSession()))
                 config = eligibility.OffloadConfig(True, eligibility.SshConnectionSettings("fixture-mac", 1, 1),
-                                                   1, 1, 1, "1", {"linux_only.source-b": "", "linux_only..claude": ""})
+                                                   1, 1, 1, "1", {"linux_only.source-b": "", "linux_only..claude": "",
+                                                                    "mirror_busy_backoff_s": "0"})
                 if changed:
                     _ = subprocess.run([*remote, str(source_b)], check=True)
                 step_estimator.clear_git_identity_cache()
                 queue_repository, _ = step_estimator.git_identity(["cargo", "check"], str(self.checkout))
                 assert isinstance(queue_repository, RepositoryIdentity)
+                repository_name = "source-b" if changed else ".claude"
+                mirror = offload.request_mirror(config, replace(request, slot=1), eligibility.KnownRepository(repository_name))
+                before = legacy.read_bytes()
+                claim_calls: list[str] = []
 
                 launch = cast(Callable[..., object], subprocess.Popen)
 
@@ -433,8 +437,14 @@ class MacRunTests(unittest.TestCase):
                     if command[0] == "git":
                         return launch(command, **options)
                     self.assertEqual(command[2], "claim")
+                    claim_calls.append(command[2])
+                    with self.assertRaises(copies.BusyRemoteMirror), copies.remote_lease(mirror):
+                        self.fail("The runner did not hold the execution lease during the claim")
                     args = mac_test.parser().parse_args(command[2:], namespace=mac_test.CliArguments())
                     output = StringIO()
+                    if "--from-pid" in command:
+                        self.assertEqual(legacy.read_bytes(), before)
+                        self.assertIn("--retire-wait", command)
                     with redirect_stdout(output):
                         status = mac_test.command_claim(args, self.paths, watch_claim=False)
                     if "--from-pid" in command:
@@ -443,15 +453,14 @@ class MacRunTests(unittest.TestCase):
                     return mock.Mock(returncode=status, communicate=mock.Mock(return_value=(output.getvalue(), "")),
                                      poll=mock.Mock(return_value=status))
 
-                def resolve_after_release(worktree: str) -> claim_state.MacRepositoryIdentity | claim_state.WholeMacScope:
-                    self.assertFalse(legacy.exists())
-                    return resolve(worktree)
-
                 with mock.patch.object(subprocess, "Popen", side_effect=claim_child), \
-                        mock.patch.object(claim_state, "mac_repository_identity", side_effect=resolve_after_release), \
                         mock.patch.object(repository, "repo_name", side_effect=AssertionError("Do not resolve legacy policy")), \
-                        mock.patch.object(copies, "remote_lease") as lease, \
                         mock.patch.object(offload, "claimed_run", return_value=offload.PassedOnMac(1)) as run:
+                    with copies.remote_lease(mirror):
+                        blocked = offload.run_offload(offload.ProcessController(), config, request, time.monotonic())
+                    self.assertIsInstance(blocked, offload.BusyMacDecline)
+                    self.assertEqual(legacy.read_bytes(), before)
+                    self.assertEqual(claim_calls, [])
                     controller = offload.ProcessController()
                     result = offload.run_offload(controller, config, request, time.monotonic())
                 if not structured:
@@ -459,11 +468,12 @@ class MacRunTests(unittest.TestCase):
                 if assigned and changed:
                     assert isinstance(result, offload.DeclinedMacRun)
                     self.assertEqual(result.reason, "source_changed")
-                    lease.assert_not_called()
+                    self.assertEqual(len(claim_calls), 1)
                     run.assert_not_called()
                     self.assertEqual(claim_state.read_claims(self.paths), ())
                 else:
                     self.assertIsInstance(result, offload.PassedOnMac)
+                    self.assertEqual(len(claim_calls), 2)
                     run.assert_called_once()
                     fresh, = claim_state.read_claims(self.paths)
                     saved = claim_state.saved_mac_repository(fresh.record)
@@ -549,8 +559,10 @@ class MacRunTests(unittest.TestCase):
     def test_new_remote_claim_refuses_an_identity_without_history(self) -> None:
         args = self.native_claim(self.checkout)
         args.remote = "fixture-mac"
-        identity = claim_state.mac_repository_identity(str(self.checkout))
-        assert isinstance(identity, claim_state.MacRepositoryIdentity)
+        mirror = claim_state.mac_repository_identity(str(self.checkout))
+        assert isinstance(mirror, claim_state.MacMirrorIdentity)
+        identity = claim_state.mac_repository_record(mirror.record())
+        self.assertIsInstance(identity, claim_state.CleanupOnlyMacRepository)
         self.assertEqual(mac_test.command_claim(
             args, self.paths, watch_claim=False, mac_repository=identity), 12)
         self.assertEqual(claim_state.read_claims(self.paths), ())
@@ -750,6 +762,11 @@ class MacRunTests(unittest.TestCase):
             answer="bad", mac_scope=assigned, configuration=configuration), target_config.ExcludedTarget(target, "linux_only"))
 
     def test_shell_mirror_refuses_to_run_or_clean_up_during_host_lease(self) -> None:
+        for interrupted in (False, True):
+            with self.subTest(interrupted=interrupted):
+                self.shell_mirror_contention(interrupted=interrupted)
+
+    def shell_mirror_contention(self, *, interrupted: bool) -> None:
         mirror = copies.RemoteMirror("fixture", copies.SelectedRepository("checkout"),
                                      "fixture-mac", "/fixture/checkout", "fixture-session")
         copies.register_remote(mirror)
@@ -762,6 +779,8 @@ class MacRunTests(unittest.TestCase):
             if phase == "prepare":
                 _ = argv_file.write_text('["true"]')
                 _ = argv_file.with_suffix(".json.lease").write_text(str(copies.remote_lease_path(mirror)))
+                if interrupted:
+                    raise KeyboardInterrupt
             else:
                 self.assertEqual(phase, "cleanup")
                 with self.assertRaises(copies.BusyRemoteHost), copies.remote_host_lease(mirror.host, exclusive=True):
@@ -779,7 +798,13 @@ class MacRunTests(unittest.TestCase):
                 mock.patch.object(mac_queue_run, "stream_remote") as run, \
                 mock.patch.object(subprocess, "run", return_value=run_process):
             with copies.remote_host_lease(mirror.host, exclusive=True):
-                self.assertEqual(mac_queue_run.run(args), 2)
+                if interrupted:
+                    with self.assertRaises(KeyboardInterrupt):
+                        _ = mac_queue_run.main(["--what", "fixture", "--kind", "run", "--package", "hana",
+                                                "--worktree", str(args.worktree), "--no-wait",
+                                                "--lifecycle-script", args.lifecycle_script, "--", "true"])
+                else:
+                    self.assertEqual(mac_queue_run.run(args), 2)
                 mac_queue_run.clean_ended_runs({})
             run.assert_not_called()
             self.assertEqual([call.args[1] for call in lifecycle.call_args_list], ["prepare"])

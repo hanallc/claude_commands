@@ -362,8 +362,15 @@ def run(args: Arguments) -> int:
                         status = run_callback(args.lifecycle_script, "prepare", argv_file, original_command,
                                               callback_environment, interrupt_prepare=args.owned_close)
                     finally:
-                        mirror.enter_context(lifecycle_mirror_lease(argv_file, placement.host))
-                        cleanup_leased = True
+                        interrupted = isinstance(sys.exception(), KeyboardInterrupt)
+                        try:
+                            mirror.enter_context(lifecycle_mirror_lease(argv_file, placement.host))
+                        except (OSError, ValueError) as error:
+                            if not interrupted:
+                                raise
+                            print(f"mac queue: lifecycle cleanup lease unavailable: {error}", file=sys.stderr)
+                        else:
+                            cleanup_leased = True
                     if status == 0:
                         command = cast(list[str], json.loads(argv_file.read_text()))
                         close_path = argv_file.with_suffix(".json.close")

@@ -32,6 +32,9 @@ class ClaimProcessStartTests(unittest.TestCase):
             root = fixture.root
             repository = root / "hana"
             _ = subprocess.run(["git", "init", "-q", str(repository)], check=True)
+            _ = subprocess.run(["git", "-C", str(repository), "-c", "user.name=Fixture",
+                                "-c", "user.email=fixture@example.invalid", "-c", "core.hooksPath=/dev/null",
+                                "commit", "-qm", "Fixture", "--allow-empty"], check=True)
             alias = root / "checkout"
             alias.symlink_to(repository, target_is_directory=True)
             _ = write_config_fixture(root / "mac_test.conf", "offload=on\nlinux_only.hana=\n", template="mac_test")

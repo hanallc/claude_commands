@@ -782,9 +782,12 @@ raise SystemExit(offload.main())
 
     def mac_repository(self) -> claim_state.MacRepositoryIdentity:
         repository = claim_state.mac_repository_identity(str(self.repository))
-        if not isinstance(repository, claim_state.MacRepositoryIdentity):
+        if isinstance(repository, claim_state.WholeMacScope):
             self.fail(f"The fixture repository has no Mac identity: {self.repository}")
-        return repository.with_history(self.repository)
+        saved = repository.with_history(self.repository)
+        if not isinstance(saved, claim_state.MacRepositoryIdentity):
+            self.fail(f"The fixture repository has no history key: {self.repository}")
+        return saved
 
     def write_kept_claim(self, host: str = "previous-mac", *, legacy: bool = False) -> RemoteClaimRecord:
         self.claim_file = Path(self.environment[

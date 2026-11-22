@@ -145,11 +145,10 @@ class SshProbeSettings:
     """Read only the settings needed by an SSH evidence probe."""
 
     configuration: conf.ConfigRead
-    claimed_host: str = ""
 
     @property
     def host(self) -> str:
-        return self.claimed_host or self.configuration.text("host")
+        return self.configuration.text("host")
 
     @property
     def connect_timeout_s(self) -> float:
@@ -387,15 +386,7 @@ def has_linux_only(repo_root: Path, package: str, excluded: set[str]) -> bool:
     return workspace_has_linux_only(repo_root, excluded)
 
 
-class ClaimedMacWorkspace:
-    """The workspace passed the checkout check before the Mac claim."""
-
-
-CLAIMED_MAC_WORKSPACE = ClaimedMacWorkspace()
-
-
-def linux_only_policy(config: OffloadConfig | conf.ConfigRead, repository: KnownRepository,
-                      repo_root: Path | ClaimedMacWorkspace,
+def linux_only_policy(config: OffloadConfig | conf.ConfigRead, repository: KnownRepository, repo_root: Path,
                       package: str, kind: str) -> KnownRepository | IneligibleMacStep:
     """Apply the repository's linux_only setting; an unset or unreadable setting refuses the step."""
     key = f"linux_only.{repository.name}"
@@ -407,28 +398,11 @@ def linux_only_policy(config: OffloadConfig | conf.ConfigRead, repository: Known
     if not linux_only_applies(kind):
         return repository
     try:
-        excluded = comma_values(values)
-        if (package in excluded if isinstance(repo_root, ClaimedMacWorkspace)
-                else has_linux_only(repo_root, package, excluded)):
+        if has_linux_only(repo_root, package, comma_values(values)):
             return IneligibleMacStep("linux_only")
     except (OSError, UnicodeError, ValueError):
         return IneligibleMacStep("repo")
     return repository
-
-
-def claimed_mac_step_eligibility(config: OffloadConfig | conf.ConfigRead,
-                                 saved: claim_state.MacRepositoryIdentity | claim_state.NoSavedMacRepository,
-                                 package: str, kind: str, target: str, backoff: BackoffState | ReadBackoff
-                                 ) -> KnownRepository | IneligibleMacStep:
-    """Read policy for the repository that the claim holds."""
-    enabled = config.enabled if isinstance(config, OffloadConfig) else config.value("offload", conf.on_off)
-    if not enabled:
-        return IneligibleMacStep("off")
-    if isinstance(saved, claim_state.NoSavedMacRepository):
-        return IneligibleMacStep("repo")
-    repository = KnownRepository(saved.mirror_name, saved.key)
-    policy = linux_only_policy(config, repository, CLAIMED_MAC_WORKSPACE, package, kind)
-    return policy if isinstance(policy, IneligibleMacStep) else backoff_eligibility(policy, target, backoff)
 
 
 _LINUX_STEP_KINDS = frozenset({'test', 'check', 'doc', 'lint', 'example', 'build'})
@@ -472,7 +446,7 @@ def recorded_step_kind(step: str) -> str:
 def mac_step_eligibility(config: OffloadConfig | conf.ConfigRead, repo_root: Path, package: str,
                          verb: MacVerb, target: str = "", *, kind: str = "",
                          backoff: BackoffState | ReadBackoff = READ_BACKOFF,
-                         mac_repository: claim_state.MacRepositoryIdentity | claim_state.WholeMacScope
+                         mac_repository: claim_state.MacMirrorIdentity | claim_state.WholeMacScope
                          | claim_state.ResolveMacRepository = claim_state.RESOLVE_MAC_REPOSITORY
                          ) -> KnownRepository | IneligibleMacStep:
     """Share repository, package/workspace and backoff rules with eligible --kind."""

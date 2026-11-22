@@ -1256,7 +1256,7 @@ finally:
 
     def repository_claim_name(self, name: str) -> str:
         identity = claim_state.mac_repository_identity(str(self.root / "repositories" / name))
-        assert isinstance(identity, claim_state.MacRepositoryIdentity)
+        assert isinstance(identity, claim_state.MacMirrorIdentity)
         return identity.claim_file
 
     def claim_in(self, owner: int, what: str, worktree: Path) -> subprocess.CompletedProcess[str]:
@@ -3328,7 +3328,7 @@ class ClaimWatchTests(NotificationGuardedTestCase):
         from scripts.copies import copies
         from scripts.mac_test import offload
 
-        saved = claim_state.MacRepositoryIdentity("repo-key", "alpha", "saved.json", "saved")
+        saved = claim_state.CleanupOnlyMacRepository("repo-key", "alpha", "saved.json", "saved")
         record = self.write_claim(mac_repository=saved.record(), repo_name=saved.mirror_name, repo_key=saved.key,
                                   idle_since=mac_test.timestamp(self.now - timedelta(minutes=15)))
         self.paths.claims.mkdir()
@@ -3360,7 +3360,7 @@ class ClaimWatchTests(NotificationGuardedTestCase):
         acquire = offload.mac_cleanup_lease
 
         @contextmanager
-        def changed_host(saved: claim_state.MacRepositoryIdentity | claim_state.NoSavedMacRepository,
+        def changed_host(saved: claim_state.SavedMacRepository,
                          host: str, target: str) -> Generator[None]:
             self.assertEqual(host, "claim-mac")
             with acquire(saved, host, target):
@@ -3449,41 +3449,6 @@ class ClaimWatchTests(NotificationGuardedTestCase):
         check.assert_called_once_with(offload.ALL_MIRRORS, self.paths.target, 1)
         self.assertEqual(result, mac_test.ClaimReleaseRefused("the remote work of the claim has not ended"))
         self.assertEqual(self.read_claim(), record)
-
-    def test_stopped_saved_mirror_keeps_its_claim_after_the_pending_marker_is_gone(self) -> None:
-        from scripts.copies import copies
-        from scripts.mac_test import eligibility, offload
-
-        saved = claim_state.MacRepositoryIdentity("repo-key", "alpha", "saved.json", "saved")
-        record = self.write_claim(mac_repository=saved.record(), repo_name=saved.mirror_name, repo_key=saved.key)
-        self.paths.claims.mkdir()
-        path = self.paths.run.rename(self.paths.claims / saved.claim_file)
-        before = path.read_bytes()
-        identity = claim_state.ClaimIdentity(cast(str, record["claim_id"]), cast(str, record["episode"]),
-                                             cast(str, record["attempt"]))
-        self.assertFalse(offload.pending_start_path(self.paths.target, identity).exists())
-        stopped = mac_test.EndStoppedWork(eligibility.KnownRepository("different-checkout"))
-        descendant_exists = True
-
-        def remote(arguments: list[str], **options: object) -> subprocess.CompletedProcess[str]:
-            del options
-            self.assertEqual((arguments[0], arguments[-2]), ("ssh", "claim-mac"))
-            cwd = "/home/fixture/" + offload.mac_mirror_root().relative + "/alpha"
-            lsof = f"lsof() {{ printf 'p41\\nn%s\\n' '{cwd}'; }}\n" if descendant_exists else "lsof() { :; }\n"
-            shell = "pgrep() { return 1; }\nkill() { :; }\nsleep() { :; }\n" + lsof
-            return self.run_private_shell(shell + arguments[-1], self.root)
-
-        with mock.patch.object(copies, "remote_registry", return_value=self.root / "mirror-registry"), \
-             mock.patch.object(process_identity, "process_start", return_value=process_identity.Gone()), \
-             mock.patch.object(subprocess, "run", side_effect=remote) as ssh:
-            kept = mac_test.release_exact_claims(self.paths, cast(int, record["pid"]), identity, "", remote_work=stopped)
-            self.assertEqual(kept, mac_test.ClaimReleaseRefused("the remote work of the claim has not ended"))
-            self.assertEqual(path.read_bytes(), before)
-            descendant_exists = False
-            released = mac_test.release_exact_claims(self.paths, cast(int, record["pid"]), identity, "", remote_work=stopped)
-        self.assertEqual(released, mac_test.ClaimsReleased(1, ()))
-        self.assertEqual(ssh.call_count, 2)
-        self.assertFalse(path.exists())
 
     def test_release_survives_a_watcher_pass_during_the_fence_settle(self) -> None:
         from scripts.buildlog import sync as buildlog_sync

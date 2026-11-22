@@ -745,7 +745,7 @@ class ReservationTests(IsolatedTargetTest):
                         mock.patch.object(session_owner, "owning_session", return_value=session), \
                         mock.patch.object(process_identity, "process_start", side_effect=process_start), \
                         mock.patch.object(mac_test, "target_claim_scope", return_value=mac_test.WHOLE_MAC), \
-                        mock.patch.object(claim_state, "mac_repository_identity", return_value=claim_state.MacRepositoryIdentity(
+                        mock.patch.object(claim_state, "mac_repository_identity", return_value=claim_state.MacMirrorIdentity(
                             "fixture-hana", "hana", "hana.json", "hana")), \
                         mock.patch.object(repository, "repository_key", return_value="fixture-history"), \
                         mock.patch.object(offload.ProcessController, "capture", return_value=offload.CommandOutput(0, "", "")):

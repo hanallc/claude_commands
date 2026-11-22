@@ -68,7 +68,6 @@ from scripts.lib.atomic_file import atomic_sample, write_text_atomic
 from scripts.accounts import outage_alerts
 
 if TYPE_CHECKING:
-    from scripts.mac_test import claim_state
     from scripts.mac_test.claim_state import RemoteJobClaim
 
 
@@ -3182,25 +3181,14 @@ class AdmissionServer:
                 return hana_placement.read_evidence(key, request, transport=transport, workload=configuration)
         sent = request.constraints.command_kind
         kind = recorded_step_kind(request.profile.step) if isinstance(sent, placement.CommandKindNotSent) else sent
-        bypasses_policy = build_targets.mac_run_bypasses_repository_policy(target, kind)
-        if not bypasses_policy and kind not in placement.STEP_COMMAND_KINDS:
+        eligibility: placement.HostEligibility
+        if build_targets.mac_run_bypasses_repository_policy(target, kind):
+            eligibility = placement.AllowedHost()
+        elif kind not in placement.STEP_COMMAND_KINDS:
             # The target can never run this command, so a pinned step refuses at once.
             return placement.FreshHostEvidence(key, self.clock.now(), "", placement.FixedExclusion("command"))
-        paths = claim_state.state_paths(destination.target)
-        with claim_state.locked(paths.lock):
-            held = claim_state.read_claims(paths)
-        eligibility: placement.HostEligibility
-        if bypasses_policy:
-            eligibility = placement.AllowedHost()
         else:
-            assert kind in placement.STEP_COMMAND_KINDS
-            acquired = (self._acquired_mac_claim(request, destination, held) if paths.platform == "macos"
-                        else claim_state.RESOLVE_MAC_REPOSITORY)
-            if isinstance(acquired, claim_state.AcquiredMacClaim):
-                answer = build_targets.mac_target_eligibility(target, Path(request.constraints.repository),
-                    request.constraints.package, kind, target_config.ANY_ELIGIBLE_TARGET, session=key.session,
-                    configuration=configuration, mac_scope=destination.scope, mac_claim=acquired)
-            elif isinstance(target, target_config.SshTarget):
+            if isinstance(target, target_config.SshTarget):
                 answer = build_targets.ssh_target_eligibility(target, Path(request.constraints.repository),
                     request.constraints.package, kind, target_config.ANY_ELIGIBLE_TARGET,
                     new_step=True, session=key.session, configuration=configuration, mac_scope=destination.scope)
@@ -3210,6 +3198,7 @@ class AdmissionServer:
                     configuration=configuration, mac_scope=destination.scope)
             eligibility = (placement.TemporaryExclusion(answer.reason)
                 if isinstance(answer, target_config.ExcludedTarget) else placement.AllowedHost())
+        paths = claim_state.state_paths(destination.target)
         # Routing keeps a busy Mac eligible so a step can wait for it. Placement must wait too,
         # or each pass makes a new attempt that the Mac refuses as busy.
         if (isinstance(eligibility, placement.AllowedHost) and isinstance(target, target_config.SshTarget)
@@ -3221,6 +3210,8 @@ class AdmissionServer:
         adopted: list[placement.AdoptedProviderClaim] = []
         cleanup: list[placement.RetainedCleanupClaim] = []
         executions: list[tuple[placement.ProviderClaimReference, execution_identity.ExecutionEvidence]] = []
+        with claim_state.locked(paths.lock):
+            held = claim_state.read_claims(paths)
         holder = placement.ResourceHolderUnknown()
         diagnostic: placement.BusyProviderDiagnostic | placement.NoProviderDiagnostic = placement.NO_PROVIDER_DIAGNOSTIC
         scope = destination.scope
@@ -3268,24 +3259,6 @@ class AdmissionServer:
                 record, paths.platform, configuration)))
         return placement.FreshHostEvidence(key, self.clock.now(), generation, eligibility, tuple(adopted), tuple(cleanup), tuple(executions), holder, diagnostic)
 
-    def _acquired_mac_claim(self, request: wire.PlacementRequest, destination: placement.PlacementDestination,
-                            held: tuple[claim_state.HeldClaim, ...]
-                            ) -> claim_state.AcquiredMacClaim | claim_state.ResolveMacRepository:
-        """Find the claim of the current assignment for this request and destination."""
-        from scripts.mac_test import claim_state
-
-        saved = self.assignments.get(self.current_assignments.get(request.episode, ""))
-        if saved is None or saved.assignment.destination != destination:
-            return claim_state.RESOLVE_MAC_REPOSITORY
-        reference = placement.assigned_claim_reference(saved.assignment)
-        identity = claim_state.ClaimIdentity(reference.claim_id, reference.episode, reference.attempt)
-        for claim in held:
-            if (claim_state.claim_identity(claim.record) == identity
-                    and claim.matches_mac_assignment_scope(reference.scope)):
-                return claim_state.AcquiredMacClaim(claim_state.saved_mac_repository(claim.record),
-                                                   claim.record.get("remote_host", destination.host))
-        return claim_state.RESOLVE_MAC_REPOSITORY
-
     def _observe_provider_execution(self, request: wire.PlacementRequest, destination: placement.PlacementDestination,
                                     reference: placement.ProviderClaimReference, record: RemoteJobClaim,
                                     platform: Literal["linux", "macos"],
@@ -3297,7 +3270,7 @@ class AdmissionServer:
             return execution_identity.ExecutionEvidenceUnavailable("provider retry backoff is active", self.clock.now())
         if platform == "macos":
             saved = claim_state.saved_mac_repository(record)
-            if not isinstance(saved, claim_state.MacRepositoryIdentity):
+            if not isinstance(saved, claim_state.MacMirrorIdentity):
                 return execution_identity.ExecutionEvidenceUnavailable("the claim has no saved Mac mirror", self.clock.now())
             repository = eligibility.KnownRepository(saved.mirror_name, saved.key)
         else:

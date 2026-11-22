@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, cast, final, override
 from unittest import mock
 from scripts.build_queue import execution_identity
+from scripts.buildlog import repository as buildlog_repository
 from scripts.build_targets import build_targets
 from scripts.direct import verify_mac_offload_test_support
 from scripts.lint.memory_test_support import config_environment, write_config_fixture, write_config_fault, commit_config_fixture
@@ -866,6 +867,7 @@ class OffloadSettingsTests(unittest.TestCase):
         _ = self.enterContext(fixture.serving())
         destination = self.root / "result"
         responses = [offload.COMMAND_COULD_NOT_START, offload.CommandOutput(0, "", "")]
+        saved = claim_state.MacRepositoryIdentity("fixture-hana", "hana", "hana.json", "hana", "fixture-history")
 
         def complete_claim(controller: offload.ProcessController, arguments: Sequence[str],
                            attempt: offload.LocalClaimAttempt) -> None:
@@ -873,13 +875,15 @@ class OffloadSettingsTests(unittest.TestCase):
                 arguments[arguments.index("--claim-id") + 1], arguments[arguments.index("--episode") + 1],
                 arguments[arguments.index("--attempt") + 1])
             controller.claim_identity = claim
+            controller.mac_repository = saved
             attempt.answer = offload.FreshMacClaim()
 
         with mock.patch.object(sys, "argv", ["offload.py", "run", "--repo-root", str(self.root),
                                              "--package", "hana", "--call-id", "probe-start", "--result", str(destination),
                                              "--assignment-file", str(assignment_file)]), \
-             mock.patch.object(claim_state, "mac_repository_identity", return_value=claim_state.MacRepositoryIdentity(
+             mock.patch.object(claim_state, "mac_repository_identity", return_value=claim_state.MacMirrorIdentity(
                  "fixture-hana", "hana", "hana.json", "hana")), \
+             mock.patch.object(buildlog_repository, "repository_key", return_value=saved.history_key), \
              mock.patch.object(offload.ProcessController, "complete_claim", autospec=True, side_effect=complete_claim), \
              mock.patch.object(offload.ProcessController, "capture", side_effect=responses) as capture, \
              redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors:
@@ -900,8 +904,9 @@ class OffloadSettingsTests(unittest.TestCase):
         for package, reason in expected.items():
             with self.subTest(package=package):
                 request = offload.OffloadRequest(self.root, package, "cargo-liner", offload.NO_RESULT_FILE, (), owner="verify", holder_session="fixture-session")
-                with mock.patch.object(claim_state, "mac_repository_identity", return_value=claim_state.MacRepositoryIdentity(
-                        "fixture-cargo-liner", "cargo-liner", "cargo-liner.json", "cargo-liner")):
+                with (mock.patch.object(claim_state, "mac_repository_identity", return_value=claim_state.MacMirrorIdentity(
+                        "fixture-cargo-liner", "cargo-liner", "cargo-liner.json", "cargo-liner")),
+                      mock.patch.object(buildlog_repository, "repository_key", return_value="fixture-history")):
                     result = offload.run_offload(offload.ProcessController(), config, request, time.monotonic())
                 self.assertEqual(result.reason if isinstance(result, offload.DeclinedMacRun) else result, reason)
 

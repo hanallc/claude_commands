@@ -1241,7 +1241,7 @@ class LocalHoldPlacementTests(unittest.TestCase):
                 candidates=(replace(candidate, destination=destination),)))
             paths = claim_state.StatePaths(fixture.root / "claims")
             paths.claims.mkdir(parents=True)
-            saved_mirror = claim_state.MacRepositoryIdentity(repo_key, "old_checkout", "saved.json", "saved")
+            saved_mirror = claim_state.CleanupOnlyMacRepository(repo_key, "old_checkout", "saved.json", "saved")
             record: claim_state.RemoteJobClaim = {
                 "claim_id": "saved", "episode": request.episode, "attempt": "saved-attempt", "submitting_session": "",
                 "pid": request.owner.pid, "proc_start": request.owner.start_time, "remote_host": destination.host,
@@ -1281,89 +1281,6 @@ class LocalHoldPlacementTests(unittest.TestCase):
             assert isinstance(legacy, placement.FreshHostEvidence)
             self.assertEqual(legacy.executions, ((adopted.reference, execution_identity.ExecutionEvidenceUnavailable(
                 "the claim has no saved Mac mirror", fixture.clock.now())),))
-
-    def test_acquired_mac_evidence_keeps_the_policy_host_and_mirror_after_an_origin_change(self) -> None:
-        from scripts.build_queue.test_placement import PlacementFixture, assignment_for, placement_request, publish_candidate
-        from scripts.build_targets import target_config
-        from scripts.mac_test import claim_state, eligibility, mac_test, offload
-
-        with PlacementFixture() as fixture:
-            repo = fixture.root / "checkout"
-            for name in ("origin-a", "origin-b"):
-                origin = fixture.root / name
-                _ = subprocess.run(["git", "init", "-q", str(origin)], check=True)
-                _ = subprocess.run(["git", "-C", str(origin), "remote", "add", "origin",
-                                    f"https://fixture.invalid/team/{name}.git"], check=True)
-            _ = subprocess.run(["git", "init", "-q", str(repo)], check=True)
-            remote = ["git", "-C", str(repo), "remote"]
-            _ = subprocess.run([*remote, "add", "origin", "../origin-a"], check=True)
-            saved = claim_state.mac_repository_identity(str(repo))
-            assert isinstance(saved, claim_state.MacRepositoryIdentity)
-            settings = fixture.root / "mac_test.conf"
-            config = "offload=on\nhost=configured-mac\nlinux_only.origin-a=private-package\nlinux_only.origin-b=\n"
-            _ = write_config_fixture(settings, config, template="mac_test")
-            target = target_config.SshTarget("mac", "macos", settings)
-            paths = claim_state.StatePaths(fixture.root / "claims")
-            paths.claims.mkdir(parents=True)
-            request = placement_request(fixture)
-            candidate, = request.constraints.candidates
-            destination = replace(candidate.destination, scope=claim_state.RepositoryScope(saved.mirror_name, saved.key))
-            request = replace(request, constraints=replace(request.constraints, repository=str(repo),
-                package="private-package", command_kind="test", candidates=(replace(candidate, destination=destination),)))
-            with mock.patch.object(target_config, "read_targets", return_value=(target,)), \
-                 mock.patch.object(claim_state, "state_paths", return_value=paths), \
-                 mock.patch.object(mac_test, "free_now", return_value="free"), \
-                 mock.patch.object(offload, "probe_mac", return_value=mock.Mock(spec=offload.ProbeSnapshot)) as probe, \
-                 mock.patch.object(offload, "ensure_mac_disk_floor", return_value=mock.Mock(spec=offload.MacDiskReady)), \
-                 mock.patch.object(fixture.server, "_observe_provider_execution", return_value=execution_identity.ExecutionNotStarted()):
-                _ = publish_candidate(fixture, request)
-                assignment = assignment_for(fixture, request)
-                reference = placement.assigned_claim_reference(assignment)
-                record: claim_state.RemoteJobClaim = {
-                    "claim_id": reference.claim_id, "episode": reference.episode, "attempt": reference.attempt,
-                    "submitting_session": "", "pid": request.owner.pid, "proc_start": request.owner.start_time,
-                    "remote_host": destination.host, "what": "check", "worktree": str(repo),
-                    "since": "2026-11-17T11:00:00+00:00", "repo_name": saved.mirror_name,
-                    "repo_key": saved.key, "mac_repository": saved.record(),
-                }
-                path = paths.claims / saved.claim_file
-                mac_test.write_json(path, {name: value for name, value in record.items() if name != "remote_host"})
-                _ = subprocess.run([*remote, "set-url", "origin", "../origin-b"], check=True)
-                current = claim_state.mac_repository_identity(str(repo))
-                assert isinstance(current, claim_state.MacRepositoryIdentity)
-                self.assertEqual(current.mirror_name, "origin-b")
-                self.assertNotEqual(current.key, saved.key)
-                with mock.patch.object(claim_state, "mac_repository_identity",
-                                       side_effect=AssertionError("The acquired claim has the repository")), \
-                     mock.patch.object(eligibility, "workspace_has_linux_only",
-                                       side_effect=AssertionError("The workspace passed policy before acquisition")):
-                    key = fixture.server.host_evidence_key(request, destination)
-                    fixture.server.host_requests[key] = request
-                    excluded = fixture.server.read_provider_evidence(key)
-                    probe.assert_not_called()
-                    mac_test.write_json(path, record)
-                    workspace = replace(request, constraints=replace(request.constraints, package=""))
-                    workspace_key = fixture.server.host_evidence_key(workspace, destination)
-                    fixture.server.host_requests[workspace_key] = workspace
-                    workspace_evidence = fixture.server.read_provider_evidence(workspace_key)
-                    assert isinstance(workspace_evidence, placement.FreshHostEvidence)
-                    self.assertEqual(workspace_evidence.eligibility, placement.AllowedHost())
-                    probe.assert_called_once()
-                    probe.reset_mock()
-                    _ = write_config_fixture(settings, config.replace(
-                        "origin-a=private-package\nlinux_only.origin-b=", "origin-a=\nlinux_only.origin-b=private-package"),
-                        template="mac_test")
-                    key = fixture.server.host_evidence_key(request, destination)
-                    fixture.server.host_requests[key] = request
-                    allowed = fixture.server.read_provider_evidence(key)
-                assert isinstance(excluded, placement.FreshHostEvidence)
-                assert isinstance(allowed, placement.FreshHostEvidence)
-                self.assertEqual(excluded.eligibility, placement.TemporaryExclusion("linux_only"))
-                self.assertEqual(allowed.eligibility, placement.AllowedHost())
-                probe.assert_called_once()
-                self.assertEqual(probe.call_args.args[2], eligibility.KnownRepository(saved.mirror_name, saved.key))
-                self.assertEqual(cast(eligibility.SshProbeSettings, probe.call_args.args[1]).host, destination.host)
-                self.assertEqual(allowed.claims[0].reference, reference)
 
     def test_busy_diagnostic_skips_an_older_kept_claim_and_names_the_live_holder(self) -> None:
         from scripts.build_queue.test_placement import placement_request
