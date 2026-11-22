@@ -63,10 +63,13 @@ def upkeep() -> None:
                 break
             try:
                 with operation_deadline.within(min(deadline, time.monotonic() + start_seconds)):
-                    result = stop_resume.resume_for_upkeep(str(row.id))
+                    result = stop_resume.resume_for_upkeep(row.id)
                 if result is None:
                     break
-                if isinstance(result, stop_resume.ResumeFailed):
+                if isinstance(result, stop_resume.StoppedOnPurpose):
+                    print(f"herdr-upkeep: {result.name}: stopped on purpose; agents resume brings it back",
+                          file=sys.stderr)
+                elif isinstance(result, stop_resume.ResumeFailed):
                     print(f"herdr-upkeep: {row.name}: {result.reason}", file=sys.stderr)
                 elif isinstance(result, stop_resume.SessionNotFound):
                     print(f"herdr-upkeep: {row.name}: session not found", file=sys.stderr)
