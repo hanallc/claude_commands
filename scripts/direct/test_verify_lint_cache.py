@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import shlex
 import shutil
 import subprocess
 import unittest
@@ -11,6 +12,8 @@ from unittest import mock
 from scripts.build_queue import admission_protocol as wire, admission_records as records, admission_service as service
 from scripts.build_queue.admission_test_support import caller_admission
 from scripts.direct.test_verify_lint_judgment import VerifyLintJudgmentFixture
+from scripts.direct.verify_lint_scope_test_support import GIT_STUB
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 class VerifyLintScopeTests(VerifyLintJudgmentFixture):
@@ -55,12 +58,20 @@ class VerifyLintScopeTests(VerifyLintJudgmentFixture):
     def name_fixture_repository(self, name: str) -> None:
         # Make the fixture a real repository with its own origin.
         # An empty .git lets Git read the checkout that holds the temporary folder (rule 18).
+        # The fixture git stub sends only the origin lookup to real Git.
         git = shutil.which("git")
         assert git is not None
-        environment = {**os.environ, "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"}
+        git_settings = {"GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"}
         for arguments in (["init", "-q", str(self.root)],
                           ["-C", str(self.root), "remote", "add", "origin", f"https://example.invalid/fixture/{name}.git"]):
-            _ = subprocess.run([git, *arguments], check=True, env=environment, capture_output=True)
+            _ = subprocess.run([git, *arguments], check=True, env={**os.environ, **git_settings},
+                               capture_output=True, timeout=TEST_HANG_GUARD_SECS)
+        self.environment.update(git_settings)
+        self.write_shell(self.root / "bin" / "git", f'''
+case " $* " in
+    *" remote get-url origin "*) exec {shlex.quote(git)} "$@" ;;
+esac
+''' + GIT_STUB)
 
     def test_fixed_and_formatted_tree_is_cached(self) -> None:
         cache = self.dirty_cache()
