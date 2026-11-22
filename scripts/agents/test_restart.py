@@ -82,16 +82,6 @@ def short_resume_check_config(file: str | Path) -> conf.ConfigRead:
     return settings
 
 
-@contextmanager
-def restart_socket_directory() -> Generator[Path]:
-    system_root = conf.read_or_repository("build_folders").text("roots.system")
-    with tempfile.TemporaryDirectory(prefix="restart-sockets-", dir=system_root) as parent:
-        with patch.object(socket_test_support, "socket_parent", return_value=Path(parent)):
-            directory = socket_test_support.short_socket_directory()
-        with directory as folder:
-            yield Path(folder)
-
-
 class RestartTestCase(ShutdownTestCase):
     @override
     def setUp(self) -> None:
@@ -780,7 +770,7 @@ class MixedRestartTests(ShutdownTestCase):
         from scripts.production import stall_watch
 
         root = Path(fixture.enter_context(tempfile.TemporaryDirectory(prefix="mixed-")))
-        socket_root = fixture.enter_context(restart_socket_directory())
+        socket_root = Path(fixture.enter_context(socket_test_support.short_socket_directory()))
         _ = fixture.enter_context(patch.object(stall_watch, "STATE_DIR", root / "state/stall-watch"))
         write_text_atomic(root / "staff.json", '{"schema": 2, "rows": []}\n')
         environment = {"HOME": str(root), "STAFF_FILE": str(root / "staff.json"), "XDG_CONFIG_HOME": str(socket_root),
@@ -1929,7 +1919,7 @@ class RestartTests(RestartTestCase):
     def assert_child_report_survives_launcher(self, outcome: str, row: staff.StaffRow) -> None:
         log_path = Path()
         written = b""
-        notification = self.enterContext(restart_socket_directory()) / "notify"
+        notification = Path(self.enterContext(socket_test_support.short_socket_directory())) / "notify"
 
         def create_claim(path: Path, content: str) -> bool:
             if outcome == "full disk" and path.exists():

@@ -12,9 +12,8 @@ import sys
 import tempfile
 import unittest
 from typing import override
-from unittest.mock import patch
 
-from scripts.lib import conf, socket_test_support, test_hang_guard
+from scripts.lib import socket_test_support, test_hang_guard
 from scripts.lib.py_floor_test_support import seed_interpreter_cache
 
 from scripts.build_hold.override_guard import require_checkout
@@ -126,10 +125,7 @@ class CargoWrapperTest(unittest.TestCase):
         self.home = self.root / "home"
         self.cwd = self.root / "working directory"
         self.hold = self.root / "hold"
-        system_root = conf.read_or_repository("build_folders").text("roots.system")
-        socket_parent = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="cargo-sockets-", dir=system_root)))
-        with patch.object(socket_test_support, "socket_parent", return_value=socket_parent):
-            self.runtime = Path(self.enterContext(socket_test_support.short_socket_directory()))
+        self.runtime = Path(self.enterContext(socket_test_support.short_socket_directory()))
         for directory in (
             self.front, self.real_bin, self.tools, self.home,
             self.cwd, self.hold,
