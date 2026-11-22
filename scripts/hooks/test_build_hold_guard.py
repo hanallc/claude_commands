@@ -92,6 +92,19 @@ class BuildHoldGuardTest(TemporaryGuardTest):
             with self.subTest(command=command):
                 self.assert_denied(command, GATE_REFUSAL)
 
+    def test_gate_module_launch_waits_during_another_hold(self) -> None:
+        self.hold()
+        for command in ("python3 -m scripts.production.gate --tests-only",
+                        "scripts/lib/py -u -mscripts.production.gate --tests-only"):
+            with self.subTest(command=command):
+                self.assert_denied(command, GATE_REFUSAL)
+                payload = json.dumps({"session_id": "caller", "tool_name": "Bash",
+                                      "tool_input": {"command": command}})
+                done = subprocess.run(["bash", str(FRONT)], input=payload, capture_output=True,
+                                      text=True, check=True, timeout=TEST_HANG_GUARD_SECS,
+                                      env={**os.environ, "CLAUDE_PYTHON": sys.executable})
+                self.assertEqual(done.stdout, invoke_hook(payload))
+
     def test_merge_gate_launch_forms_are_allowed_without_a_hold(self) -> None:
         for command in GATE_COMMANDS:
             with self.subTest(command=command):
@@ -118,6 +131,8 @@ class BuildHoldGuardTest(TemporaryGuardTest):
             "python3 cloud_gate.py --tests-only",
             "python3 gate_box.py --tests-only",
             "python3 gate.py.bak",
+            "python3 other.py -m scripts.production.gate",
+            "python3 -c pass -m scripts.production.gate",
             "python3 -m scripts.production.cloud_gate",
             "python3 -m scripts.production.gate_box",
         ):
