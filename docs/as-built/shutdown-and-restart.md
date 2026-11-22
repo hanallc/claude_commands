@@ -645,16 +645,20 @@ It does not abort another row's launch.
 The commands keep the full report under `shutdown_state_root()/logs` and retain the files.
 A command that stops its caller continues in a detached process.
 The parent gives the detached process access to the open log file.
+The detached process fixes the selected staff IDs before it attempts the claim.
+The report uses these IDs for its session count.
 The detached process creates a claim file before it stops any session.
 On Linux, the detached process confirms the claim to `systemd-run`.
 On macOS, the detached process confirms the claim through a pipe.
 The parent tries to create the same claim file after the launcher returns.
 If the child claims the log, the parent prints one line with the log path and the background status.
-The child writes the report if its readiness check fails.
+The child writes a failure report if a step fails after it claims the log.
+The failure report names each selected session and records its known result.
 The detached process writes and flushes the full list of sessions before it stops any session.
 If the parent claims the log, it reports the count, the cause, and the step in the terminal and the log.
 A child that starts after the parent claims the log exits without stopping any session.
-If a log write fails after a stop, the child reports the result on stderr and returns a nonzero status.
+If a report write fails, the child tries the same log again and returns a nonzero status.
+If the second write fails, the child writes the full report to stderr.
 The Linux user service sends stderr to the journal.
 Its final line includes the names and steps for unresolved sessions from the first process.
 If log setup fails, the first line gives the path and the rest of the report still appears.

@@ -2021,6 +2021,128 @@ class RestartTests(RestartTestCase):
         self.assertEqual(errors.getvalue(), "")
         self.assertEqual(path.read_bytes(), written)
 
+    def test_detached_child_reports_each_fault_after_the_claim(self) -> None:
+        # Keep these steps in sync with the guard in restart._run_detached_child.
+        for step, detail, completed in (
+            ("claim close", "Input/output error", ()),
+            ("log open", "Could not open the log", ()),
+            ("readiness", "The readiness check failed", ()),
+            ("staff read", "The staff record is unreadable", ()),
+            ("plan write", "Could not save the stop plan", ()),
+            ("plan sync", "Could not sync the stop plan", ()),
+            ("stop 0", "Could not stop the session", (1,)),
+            ("stop 1", "Could not stop the session", (0,)),
+            ("resume 0", "Could not resume the session", (1,)),
+            ("resume 1", "Could not resume the session", (0,)),
+            ("report write", "Could not save the report", (0, 1)),
+            ("report sync", "Could not sync the report", (0, 1)),
+        ):
+            with self.subTest(step=step):
+                self.assert_detached_fault_report(step, detail, completed)
+
+    def assert_detached_fault_report(self, step: str, detail: str, completed: tuple[int, ...]) -> None:
+        rows = self.rows[:2]
+        record = staff.StaffSnapshot(rows)
+        path = self.root / f"{step}.log"
+        resuming = step.startswith("resume")
+        command = "agents restart" if resuming else "agents stop --all"
+        state = "back" if resuming else "stopped"
+        data: restart.DetachedReport = {
+            "retry": f"{command} --all" if resuming else command,
+            "targets": {row.id: row.name for row in rows},
+            "units": {row.id: row.name for row in rows},
+            "issues": {},
+        }
+        arguments = ["restart" if resuming else "stop", "--all", "--only", ",".join(row.id for row in rows),
+                     "--parent-report", json.dumps(data)]
+        injected = False
+        close = os.close
+        sync = os.fsync
+        file_io = io.FileIO
+        write = restart._write_log  # pyright: ignore[reportPrivateUsage]
+
+        def fail_at(check: str, error: BaseException) -> None:
+            nonlocal injected
+            if step == check and not injected:
+                injected = True
+                raise error
+
+        def close_claim(descriptor: int) -> None:
+            close(descriptor)
+            if path.with_suffix(".claim").exists():
+                fail_at("claim close", OSError(errno.EIO, "Input/output error"))
+
+        def open_log(descriptor: int, mode: str, *, closefd: bool) -> io.FileIO:
+            fail_at("log open", OSError(detail))
+            return file_io(descriptor, mode, closefd=closefd)
+
+        def ready(*_args: object, **_options: object) -> None:
+            fail_at("readiness", SystemExit(detail))
+
+        def snapshot() -> staff.StaffSnapshot:
+            fail_at("staff read", OSError(detail))
+            return record
+
+        def stop_row(row: staff.StaffRow, *_args: object, **_options: object) -> bool:
+            fail_at(f"stop {rows.index(row)}", BaseException(detail))
+            return True
+
+        def start_row(row: staff.StaffRow, *_args: object, **_options: object) -> str:
+            fail_at(f"resume {rows.index(row)}", BaseException(detail))
+            return ""
+
+        def write_log(log: io.FileIO, result: str) -> None:
+            if result.startswith("Sessions to stop"):
+                fail_at("plan write", OSError(detail))
+            elif step == "report write" and not injected:
+                write(log, "Partial report")
+                fail_at("report write", BaseException(detail))
+            write(log, result)
+
+        def sync_log(descriptor: int) -> None:
+            if descriptor == self.inherited_log:
+                check = "report sync" if " sessions stopped." in path.read_text() else "plan sync"
+                fail_at(check, OSError(detail))
+            sync(descriptor)
+
+        with (path.open("ab") as log, patch.object(os, "close", side_effect=close_claim),
+              patch.object(io, "FileIO", side_effect=open_log),
+              patch.object(restart, "_notify_log_claim", side_effect=ready),
+              patch.object(staff, "initial_snapshot", side_effect=snapshot),
+              patch.object(restart, "live_rows", return_value=restart.CompleteLiveRows(list(rows))),
+              patch.object(restart, "stop_row", side_effect=stop_row) as stop,
+              patch.object(restart, "start_row", side_effect=start_row) as start,
+              patch.object(restart, "_write_log", side_effect=write_log),
+              patch.object(os, "fsync", side_effect=sync_log), redirect_stderr(io.StringIO()) as errors):
+            _ = log.write(f"{path}\n".encode())
+            log.flush()
+            self.inherited_log = log.fileno()
+            self.assertEqual(self.detached_stop(path, arguments), 2)
+        self.assertTrue(injected)
+        self.assertEqual(errors.getvalue(), "")
+        before_stop = {"claim close", "log open", "readiness", "staff read", "plan write", "plan sync"}
+        if step in before_stop:
+            stop.assert_not_called()
+        self.assertEqual(start.call_count, len(rows) if resuming else 0)
+        contents = path.read_text()
+        result = contents.splitlines()
+        self.assertNotIn("Partial report", contents)
+        count = f"{command}: {len(completed)} of {len(rows)} sessions {state}."
+        self.assertEqual(sum(line.startswith(f"{command}: ") and " sessions " in line for line in result), 1)
+        self.assertIn(count, result)
+        recovery = ("Nate runs agents stop --all there." if step in before_stop - {"staff read"} else
+                    "Nate sends this error to the efficiency unit.")
+        for index, row in enumerate(rows):
+            issue, = [line for line in result if line.startswith(f"{row.name}: ")]
+            if index in completed:
+                self.assertIn(f"The session is {state}.", issue)
+            else:
+                self.assertIn(f"Could not confirm the session is {state}", issue)
+                self.assertIn(detail, issue)
+                self.assertIn(recovery, issue)
+        self.assertIn(detail, contents)
+        self.assertIn(recovery, result[-1])
+
     def test_restart_counts_an_idle_worker_when_its_last_turn_has_no_reply(self) -> None:
         owner = self.rows[0]
         child = replace(self.rows[1], kind="worker", unit_type=staff.NotUnit(),
