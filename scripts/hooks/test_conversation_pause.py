@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 import hashlib
 import json
 import os
@@ -9,7 +10,7 @@ import shutil
 import sys
 import unittest
 from typing import cast
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 
 from scripts.production import session_pane
@@ -446,7 +447,14 @@ class ConversationPauseTests(ConversationPauseFixture):
                                  ("stall-watch", "Report the current status.", 121)):
             with self.subTest(sender=sender):
                 reply = self.parsed_reply(self.run_prompt(cross_session(sender, body), now=at))
-                self.assertEqual(reply, {"decision": "block", "reason": "Kept for the end of the review."})
+                self.assertEqual(reply, {
+                    "decision": "block",
+                    "reason": "Kept for the end of the review.",
+                    "hookSpecificOutput": {
+                        "hookEventName": "UserPromptSubmit",
+                        "suppressOriginalPrompt": True,
+                    },
+                })
         self.assertEqual(self.end_review(122), [
             "Messages from the review\n\n"
             + "1. Review peer\n   Sent: 00:02 UTC\n   Sender native id: uds:/tmp/source.sock\n"
@@ -554,23 +562,36 @@ class ConversationPauseTests(ConversationPauseFixture):
         self.assertLess(batches[0].index("Older report."), batches[0].index("Newer report."))
         self.assertNotIn("Unsent report.", batches[0])
 
-    def test_session_start_release_ends_the_hold_before_it_emits_the_list(self) -> None:
+    def test_session_start_keeps_messages_until_the_hold_expires(self) -> None:
         self.open_review()
         kept = self.parsed_reply(self.run_prompt(cross_session("Review peer", "Held update."), now=101))
         self.assertEqual(kept["decision"], "block")
+        count = self.root / ".local/state/adhoc_review" / SESSION
+        state = count.parent / ".holds" / f"{SESSION}.json"
+        saved = state.read_bytes()
         batches: list[str] = []
 
         def receive(batch: str) -> None:
             batches.append(batch)
-            reply = self.run_prompt(cross_session("Review peer", batch), now=102)
+            reply = self.run_prompt(cross_session("Review peer", batch), now=160)
             self.assertEqual((reply.returncode, reply.stdout, reply.stderr), (0, "", ""))
 
-        with patch.dict(os.environ, self.environment):
+        start_times = [datetime.fromtimestamp(at, timezone.utc) for at in (159, 160)]
+        clock = Mock(wraps=datetime, now=Mock(side_effect=start_times))
+        with patch.dict(os.environ, self.environment), patch.object(review_hold, "datetime", clock):
+            review_hold.deliver_at_session_start(SESSION, batches.append,
+                record_keys=review_hold_delivery.record_keys)
+            self.assertEqual(batches, [])
+            self.assertEqual(state.read_bytes(), saved)
+            self.assertEqual(review_hold.item_count(SESSION), 2)
+            kept = self.parsed_reply(self.run_prompt(cross_session("Review peer", "Second update."), now=159))
+            self.assertEqual(kept["decision"], "block")
             review_hold.deliver_at_session_start(SESSION, receive,
                 record_keys=review_hold_delivery.record_keys)
         self.assertEqual(len(batches), 1)
         self.assertIn("Held update.", batches[0])
-        self.assertEqual(self.end_review(103), [])
+        self.assertIn("Second update.", batches[0])
+        self.assertEqual(self.end_review(161), [])
 
     def test_native_review_prompt_fails_open_when_the_hold_is_unreadable(self) -> None:
         self.open_review()

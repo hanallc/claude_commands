@@ -1505,6 +1505,22 @@ class ClientTests(unittest.TestCase):
                                  [request, request])
                 self.doCleanups()
 
+    def test_verify_run_slot_ignores_inherited_leave_hooks(self) -> None:
+        with AdmissionFixture() as fixture:
+            owner = fixture.run_owner()
+            reply = wire.VerifyRunSlotWaiting(records.RunLimitWait(1, 1, "fixture", fixture.server.host))
+            grant_after = wire.PROTOCOL_ACQUISITION_TIMING.reconnect_seconds + 1
+            transport = self.use_transport(fixture, Exchange(reply_bytes(reply), TimedChunk(grant_after, reply_bytes(wire.Ok()))))
+            with mock.patch.dict(os.environ, {"LINT_QUEUE_LEAVE_HOOK": "test-leave", "BUILDLOG_MAC_IDLE_HOOK": "test-idle"}), \
+                    mock.patch.object(client, "_leave_queue", return_value=True) as hook, \
+                    redirect_stderr(io.StringIO()) as errors:
+                status = client.main(["verify-run-slot", "--pid", str(owner.pid)])
+            self.assertEqual(status, 0, errors.getvalue())
+            hook.assert_not_called()
+            self.assertEqual(fixture.clock.monotonic(), grant_after)
+            self.assertEqual(len(transport.requests), 1)
+            self.assertIn(records.run_limit_text(reply.reason), errors.getvalue())
+
     def test_generation_outage_after_expiry_keeps_the_leave_hook_time_and_cli_status(self) -> None:
         for failure in (b"", b"invalid generation reply\n"):
             with self.subTest(failure=failure), AdmissionFixture() as fixture:

@@ -474,16 +474,24 @@ try{
  mode='good';dispatchEvent(new Event('focus'));await flush();
  const link=panel.querySelector('[data-for-you-card]');
  check(new URL(link.href).searchParams.get('at.list')==='/page?filter=mine','the card href keeps the saved List location');
- link.click();await flush();
+ link.click();
+ const reviewFrame=document.querySelector('[data-console-page=review]');
+ await new Promise(resolve=>reviewFrame.addEventListener('load',resolve,{once:true}));
  const url=new URL(location.href),place=new URL(url.searchParams.get('at.review'),location.origin);
  check(url.searchParams.get('page')==='review' && place.searchParams.get('type')==='for-you' &&
  place.searchParams.get('item')==='rebuild/natedev','a card opens Review with the reserved parameters and key');
  check(panel.hidden,'a card closes the panel');
  check(url.searchParams.get('at.list')==='/page?filter=mine' && url.searchParams.get('extra')==='kept',
   'opening a card preserves unrelated console parameters');
+ const original=reviewFrame.contentDocument;
  trigger.click();await flush();
- panel.querySelector('footer a').click();await flush();
+ const reloaded=new Promise(resolve=>reviewFrame.addEventListener('load',resolve,{once:true}));
+ panel.querySelector('footer a').click();
+ await reloaded;
  const footerURL=new URL(location.href),footerPlace=new URL(footerURL.searchParams.get('at.review'),location.origin);
+ const child=new URL(reviewFrame.contentWindow.location.href);
+ check(reviewFrame.contentDocument!==original && child.search===footerPlace.search,
+  'The footer reloads the fixture at the recorded query.');
  check(footerURL.searchParams.get('at.list')==='/page?filter=mine' && footerURL.searchParams.get('extra')==='kept' &&
   footerPlace.searchParams.get('type')==='for-you' && !footerPlace.searchParams.has('item'),
   'opening the footer preserves unrelated parameters and clears the card key');

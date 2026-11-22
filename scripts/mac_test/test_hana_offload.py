@@ -348,6 +348,7 @@ PLACEMENT_PROVIDER=ssh
 HOLD_WAIT_DIR=.
 DOC_REPO_TOP=.
 release_token() { :; }
+admit_verify_run() { :; }
 check_routing_hold() { :; }
 placement_once() { :; }
 collect_routing_wait() { :; }

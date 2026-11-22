@@ -107,7 +107,11 @@ class RoleMapTests(unittest.TestCase):
         self.assertNotIn("workers_claude", cast(dict[str, object], json.loads(server_config.read_text())))
 
     def test_stale_transition_metadata_reports_anomalies_and_keeps_the_account(self) -> None:
-        for change in ({"move_id": None}, {"reset": "old"}, {"why": 1}):
+        for change, anomaly in (
+            ({"move_id": None}, "invalid units transition metadata"),
+            ({"reset": "old"}, "invalid units reset"),
+            ({"why": 1}, "invalid units reason"),
+        ):
             with self.subTest(change=change):
                 output = io.StringIO()
                 selected = {"label": "claude2", "move_id": "move", "cause": "by hand", "window": "unknown"}
@@ -117,6 +121,8 @@ class RoleMapTests(unittest.TestCase):
                 self.assertEqual(result.groups.get("units"), "claude2" if "move_id" in change else selected)
                 self.assertEqual(len(output.getvalue().splitlines()), 1)
                 self.assertIn("anomaly:", output.getvalue())
+                with self.assertRaisesRegex(role_map.RoleMapAnomaly, anomaly):
+                    _ = role_map.decode_role_map_strict(text)
 
     def test_workers_launch_refuses_an_unreadable_map_without_a_cache(self) -> None:
         self.seed(self.home, groups={})

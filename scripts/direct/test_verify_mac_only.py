@@ -504,6 +504,33 @@ class VerifyMacOnlyTests(VerifyMacOffloadFixture):
         self.assertEqual(self.local_runs(), [])
         self.assertEqual(self.last_call()["mac_reason"], "unreachable")
 
+    def test_mac_pass_published_during_placement_takes_no_run_slot(self) -> None:
+        passed = self.verify("test", "sample", "--mac", "why", extra={
+            "TEST_RUNNER_MAC": "passed", "TEST_RUNNER_STATUS": "0"})
+        self.assertEqual(passed.returncode, 0, passed.stdout + passed.stderr)
+        cached, = self.saved_results()
+        contents = cached.read_bytes()
+        cached.unlink()
+        self.clear_observations()
+        fixture = caller_admission(self, self.root, self.environment)
+        handle = fixture.server.handle_request
+        requests: list[wire.VerifyRunSlotRequest] = []
+
+        def publish(request: wire.Request, connection: service.Connection | service.NoConnection = service.NO_CONNECTION
+                    ) -> list[wire.Reply]:
+            if isinstance(request, wire.PlacementRequest) and not cached.exists():
+                _ = cached.write_bytes(contents)
+            if isinstance(request, wire.VerifyRunSlotRequest):
+                requests.append(request)
+            return handle(request, connection)
+
+        with mock.patch.object(fixture.server, "handle_request", side_effect=publish):
+            reused = self.verify("test", "sample", "--mac", "why")
+        self.assertEqual(reused.returncode, 0, reused.stdout + reused.stderr)
+        self.assertIn("PASS (recorded)", reused.stdout)
+        self.assertFalse(requests)
+        self.assertEqual(self.runner_events(), [])
+
     def test_local_first_target_is_skipped_for_mac_only(self) -> None:
         config = self.root / "build_targets.conf"
         _ = config.write_text(config.read_text().replace("targets=mac,natedev", "targets=natedev,mac"))

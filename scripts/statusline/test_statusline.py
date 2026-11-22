@@ -509,7 +509,8 @@ class ForYouStatusTests(unittest.TestCase):
                 requests.append(self.path)
                 self.send_response(200)
                 self.end_headers()
-                reply: dict[str, object] = {"available": True, "count": 3}
+                reply: dict[str, object] = {"available": True, "count": 3, "other_count": 2,
+                                            "rebuild_machines": ["mac"]}
                 if self.path == "/console/for-you.json":
                     reply["entries"] = [{"command": "x" * 70000}]
                 _ = self.wfile.write(json.dumps(reply).encode())
@@ -549,7 +550,7 @@ class ForYouStatusTests(unittest.TestCase):
                     thread.join()
             unavailable = subprocess.run(["/bin/sh", "-c", command], input="{}", capture_output=True,
                                          text=True, check=True, env=env, cwd=home)
-            self.assertEqual(ANSI.sub("", result.stdout).splitlines()[-1], "For you: 3 actions", result.stderr)
+            self.assertEqual(ANSI.sub("", result.stdout).splitlines()[-1], "For you: rebuild mac, 2 actions", result.stderr)
             self.assertEqual(requests, ["/console/for-you.json?view=count"])
             self.assertEqual(unavailable.stdout.splitlines()[-1], "For you: Unavailable")
             self.assertFalse((home / ".local/state/for-you").exists())
@@ -562,9 +563,9 @@ class ForYouStatusTests(unittest.TestCase):
             _ = config.write_text(f"rebuild.cache={cache}\n", encoding="utf-8")
             _ = cache.write_text("\n9999999999\n", encoding="utf-8")
 
-            def console_count() -> str:
+            def read_console_actions() -> for_you.StatusLineActions:
                 _ = cache.write_text("\n0\n", encoding="utf-8")
-                return "3"
+                return for_you.StatusLineActions(other_count=3)
 
             with (patch.dict(os.environ, {"HOME": directory, "STAFF_FILE": os.devnull,
                                          "STATUSLINE_SYSTEM": "Darwin",
@@ -572,7 +573,7 @@ class ForYouStatusTests(unittest.TestCase):
                   patch.object(sys, "argv", ["assignment.py", "-r"]),
                   patch.object(sys, "stdin", io.StringIO("{}")),
                   patch.object(rebuild_row, "DEFAULT_CONFIG", config),
-                  patch.object(for_you, "console_action_count", side_effect=console_count) as request,
+                  patch.object(for_you, "console_status_line_actions", side_effect=read_console_actions) as request,
                   patch.object(subprocess, "Popen") as refresh,
                   patch.object(os, "execvp") as render):
                 assignment.main()
@@ -618,13 +619,17 @@ class ForYouStatusTests(unittest.TestCase):
                 arguments = cast(list[str], render.call_args.args[1])
                 self.assertEqual(arguments[arguments.index("for_you") + 1], expected)
 
-    def test_review_and_action_rows_have_separate_counts(self) -> None:
+    def test_review_and_for_you_show_separate_rows_with_both_rebuilds(self) -> None:
+        rebuilds = rebuild_row.rebuild_names(("natedev", "mac", "natedev"))
         lines = status_lines({"session_id": "sid"}, counts="sid Review: 1 question, 2 changes, 1 investigation",
-                             adhoc="3 adhoc items", for_you="2", rebuild="rebuild mac")
+                             adhoc="3 adhoc items", for_you="0", rebuild=rebuilds)
         plain = [ANSI.sub("", line) for line in lines]
         self.assertIn("Review: 3 adhoc items, 1 question, 2 changes, 1 investigation", plain)
-        self.assertIn("For you: 2 actions", plain)
-        self.assertNotIn("rebuild mac", "\n".join(plain))
+        self.assertIn("For you: rebuild natedev, rebuild mac", plain)
+
+    def test_rebuild_and_other_action_share_the_for_you_row(self) -> None:
+        lines = status_lines({}, for_you="1", rebuild="rebuild natedev")
+        self.assertIn("For you: rebuild natedev, \x1b[1m1\x1b[22m action", lines)
 
     def test_global_actions_do_not_depend_on_the_session(self) -> None:
         for identity in ("", "sid", "another-session"):
@@ -2205,7 +2210,7 @@ class RebuildRowTests(unittest.TestCase):
         self.assertEqual(ANSI.sub("", line), "Review: 1 question, 2 changes, 1 proposal")
 
     def test_rebuild_argument_does_not_create_an_action_count(self) -> None:
-        self.assertFalse(any(line.startswith(("Review:", "For you:")) for line in status_lines({}, rebuild="rebuild mac")))
+        self.assertIn("For you: rebuild mac", status_lines({}, rebuild="rebuild mac"))
 
     def test_settings_read_values_at_use(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -2521,7 +2526,8 @@ class RebuildRowTests(unittest.TestCase):
                 with self.subTest(need_error=type(error).__name__), patch.object(need, "read_needs", side_effect=error):
                     answer = rebuild_row.read(config)
                     self.assertEqual(answer.row(), "rebuild mac")
-                    self.assertFalse(any(line.startswith(("Review:", "For you:")) for line in status_lines({}, rebuild=answer.row())))
+                    self.assertIn("For you: rebuild mac, Unavailable",
+                                  status_lines({}, rebuild=answer.row(), for_you="unavailable"))
 
     def test_shell_reads_a_fresh_cache_without_running_the_refresh(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -2538,8 +2544,10 @@ class RebuildRowTests(unittest.TestCase):
                 if source == "actions":
                     actions = actions.with_name("malformed-actions")
                     actions.mkdir(parents=True)
-                    depth = 2 * sys.getrecursionlimit()
+                    depth = 100_000
                     _ = (actions / "action.json").write_text("[" * depth + "]" * depth, encoding="utf-8")
+                    with self.assertRaises(RecursionError):
+                        _ = ActionStore(actions).list()
                 elif source == "needs":
                     (home / ".local/state/rebuild/needs/unreadable.json").mkdir(parents=True)
                 for shell in SHELLS:
@@ -2549,7 +2557,7 @@ class RebuildRowTests(unittest.TestCase):
                                                                  "FOR_YOU_ACTIONS_DIR": str(actions),
                                                                  "PATH": os.environ["PATH"],
                                                                  "STAFF_FILE": str(staff_file)}, cwd=home)
-                        expected = "For you: \x1b[1m1\x1b[22m action" if source == "ready" else "For you: Unavailable"
+                        expected = "For you: rebuild natedev" if source == "ready" else "For you: rebuild natedev, Unavailable"
                         self.assertEqual(result.stdout.splitlines()[-1], expected)
                         self.assertEqual(result.stderr, "")
                         self.assertEqual(cache.stat().st_mtime_ns, built)
