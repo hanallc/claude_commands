@@ -612,7 +612,7 @@ def _claudes(processes: list[herdr.HerdrProcess], *,
 def _unproved_pane(place: HerdrPlace, processes: list[herdr.HerdrProcess], claudes: dict[int, list[SessionRecord]],
                    reason: str, pane: Mapping[str, object], *,
                    registry_problem: str = "", native_identity: str = "") -> LabeledSession:
-    """Retain possible unit identities for an unknown result."""
+    """Retain possible identities and process exit evidence."""
     from scripts.herdr import herdr
 
     candidates = {process.marks[key] for process in processes
@@ -628,8 +628,9 @@ def _unproved_pane(place: HerdrPlace, processes: list[herdr.HerdrProcess], claud
     if registry_problem and agent is not None:
         _ = session_staff.collect_anomaly(f"pid {agent.pid} in {place_text(place)}: {registry_problem}",
                                           pid=agent.pid, check_identity=False)
-    return LabeledSession("", ClaudeUnknown(reason), place, process,
-                          session_staff.UnprovedPaneIdentity(frozenset(candidates)))
+    return LabeledSession("", ClaudeUnknown(registry_problem or reason), place, process,
+                          session_staff.UnprovedPaneIdentity(frozenset(candidates)),
+                          exited_pid=herdr.exited_process_pid(reason))
 
 
 @dataclass(frozen=True)
@@ -693,7 +694,7 @@ def _herdr_labeled(registry: dict[HerdrPlace, dict[int, list[SessionRecord]]], e
         problem = evidence.places.get(place, evidence.unplaced.reason
                                     if isinstance(evidence.unplaced, RecordsPartlyUnread) else "")
         if place.session in unreadable:
-            yield _unproved_pane(place, holders, claudes, problem or unreadable[place.session],
+            yield _unproved_pane(place, holders, claudes, unreadable[place.session],
                                  pane, registry_problem=problem)
             continue
         try:
@@ -734,7 +735,7 @@ def _herdr_labeled(registry: dict[HerdrPlace, dict[int, list[SessionRecord]]], e
                     yield LabeledSession("", ClaudeNotRunning(), place, empty=owner)
                 continue
             if isinstance(owner, herdr.UnknownPaneOwner):
-                label = _unproved_pane(place, holders, claudes, problem or owner.reason, pane, registry_problem=problem)
+                label = _unproved_pane(place, holders, claudes, owner.reason, pane, registry_problem=problem)
                 if isinstance(owner, herdr.ClaudePaneWithoutArgv) and not problem and place in panes:
                     registered = claudes.get(owner.pid, ())
                     if len(registered) == 1:
@@ -768,7 +769,7 @@ def _herdr_labeled(registry: dict[HerdrPlace, dict[int, list[SessionRecord]]], e
                                    generation=session_staff.ProvedProcessGeneration(owner.pid, native.started))
             yield ProvedCodexOwner(owner.pid, native.started, identity.id, label)
         except (herdr_types.HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
-            yield _unproved_pane(place, holders, claudes, problem or str(error), pane, registry_problem=problem)
+            yield _unproved_pane(place, holders, claudes, str(error), pane, registry_problem=problem)
 
 
 def _reduce_owner_proofs(proofs: Iterable[ConversationProof]) -> dict[str, ConversationProof | UnknownUnit]:
@@ -873,16 +874,20 @@ class ClaudeArgvUnavailable(UnknownUnit):
     place: HerdrPlace
 
 
-@dataclass(frozen=True)
-class RefreshedConversationOwner(ProvedLiveUnit):
-    """Bind the proved owner to the refreshed registry read."""
-
-    registry: sessions.RegistryRead = field(kw_only=True, repr=False)
+class ConversationLookup(NamedTuple):
+    owner: UnitOwner
+    refreshed_registry: sessions.RegistryRead | None = None
 
 
 def checked_conversation(identity: str, *, record: staff.StaffSnapshot | None = None,
                          registry: sessions.RegistryRead | None = None, probe_address: bool = True) -> UnitOwner:
     """Check the exact conversation with fresh pane evidence."""
+    return lookup_conversation(identity, record=record, registry=registry, probe_address=probe_address).owner
+
+
+def lookup_conversation(identity: str, *, record: staff.StaffSnapshot | None = None,
+                        registry: sessions.RegistryRead | None = None, probe_address: bool = True) -> ConversationLookup:
+    """Return the owner result and any refreshed registry read."""
     from scripts.herdr import herdr
 
     def observe(snapshot: sessions.RegistryRead | None) -> session_staff.SessionLabelObservations:
@@ -891,22 +896,20 @@ def checked_conversation(identity: str, *, record: staff.StaffSnapshot | None = 
                 return observed_session_labels(record=record)
             return observed_session_labels(record=record, registry=snapshot, probe_address=probe_address)
 
+    refreshed = None
     try:
         observed = observe(registry)
         checked = observed.checked_conversation(identity)
         if not isinstance(checked, ProvedLiveUnit) and any(
-                isinstance(pane.claude, ClaudeUnknown) and herdr.exited_process_pid(pane.claude.reason) is not None
-                for pane in observed.labels):
+                pane.exited_pid is not None for pane in observed.labels):
             refreshed = sessions.read_registry()
             observed = observe(refreshed)
             checked = observed.checked_conversation(identity)
-            if isinstance(checked, ProvedLiveUnit):
-                return RefreshedConversationOwner(checked.owner, checked.standalone_generation, registry=refreshed)
     except (OSError, ValueError, subprocess.SubprocessError) as error:
-        return UnknownUnit(str(error))
+        return ConversationLookup(UnknownUnit(str(error)), refreshed)
     if (not isinstance(checked, UnknownUnit) or identity in observed.registry_owners
             or observed.unreadable_pane_lists or observed.registry_failures):
-        return checked
+        return ConversationLookup(checked, refreshed)
     candidates = [pane for pane in observed.labels
                   if pane.identity == LiveSession(identity)
                   or isinstance(pane.identity, session_staff.UnprovedPaneIdentity) and identity in pane.identity.candidates]
@@ -914,8 +917,8 @@ def checked_conversation(identity: str, *, record: staff.StaffSnapshot | None = 
         pane = candidates[0]
         if (isinstance(pane.process, _RegisteredClaudeWithoutArgv) and pane.process.conversation == identity
                 and isinstance(pane.claude, ClaudeUnknown)):
-            return ClaudeArgvUnavailable(pane.claude.reason, pane.process.pid, pane.place)
-    return checked
+            checked = ClaudeArgvUnavailable(pane.claude.reason, pane.process.pid, pane.place)
+    return ConversationLookup(checked, refreshed)
 
 
 def every_labeled_session(*, record: staff.StaffSnapshot | None = None,

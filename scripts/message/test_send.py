@@ -135,7 +135,7 @@ INIT: dict[str, object] = {"type": "system", "subtype": "init", "permissionMode"
 
 REAL_OPEN_CASE = rca.open_case
 REAL_RELAY = send.relay
-REAL_CONVERSATION_LOOKUP = unit_lookup.checked_conversation
+REAL_CONVERSATION_LOOKUP = unit_lookup.lookup_conversation
 REAL_CURRENT_CLAUDE_RECORD = unit_lookup.current_claude_record
 
 
@@ -215,7 +215,8 @@ send._bound_relay(message, 2, [], {}, attempt)
         attempt = send.ClaudeDeliveryAttempt(target, os.getpid(), "fixture-start", address[4:])
         message = send.Message(address, "fixture", "Preview", "body", None, claude_attempt=attempt)
         with (mock.patch.object(sessions, "read_registry", return_value=sessions.RegistryRead((), ())),
-              mock.patch.object(unit_lookup, "checked_conversation", return_value=unit_lookup.ProvedAbsentUnit()),
+              mock.patch.object(unit_lookup, "lookup_conversation",
+                                return_value=unit_lookup.ConversationLookup(unit_lookup.ProvedAbsentUnit())),
               mock.patch.object(staff, "snapshot", side_effect=staff.StaffAbsent("staff record is absent")) as membership,
               mock.patch.object(send, "relay", return_value=send.ConfirmedSocketMiss("queued", "ENOENT")) as relay):
             _, result = send.relay_socket(message, 2)
@@ -887,16 +888,17 @@ class RecipientStaffFixture:
 
     def checked_recipient(self, conversation: str, *, probe_address: bool = True,
                           registry: sessions.RegistryRead | None = None,
-                          record: staff.StaffSnapshot | None = None) -> unit_lookup.UnitOwner:
+                          record: staff.StaffSnapshot | None = None) -> unit_lookup.ConversationLookup:
         """Supply the owner proof for a test that stubs delivery."""
         del probe_address, record
         rows = sessions.live_sessions() if registry is None else sessions.running_records(registry)
         row = sessions.addressed(f"session:{conversation}", rows)
         if row is None:
-            return unit_lookup.ProvedAbsentUnit()
-        return unit_lookup.ProvedLiveUnit(
+            return unit_lookup.ConversationLookup(unit_lookup.ProvedAbsentUnit())
+        owner = unit_lookup.ProvedLiveUnit(
             unit_lookup.LiveClaude(row["name"], conversation, row["messagingSocketPath"], row["pid"]),
             session_staff.ProvedProcessGeneration(row["pid"], row.get("procStart", "")))
+        return unit_lookup.ConversationLookup(owner)
 
     def recipient_roster(self, entries: list[roster.RosterEntry], problems: list[str],
                          warnings: list[str] | None = None) -> roster.Roster:
@@ -1147,7 +1149,7 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
         (self.root / "config").mkdir()
         _ = write_send_config(self.root / "config/send.conf", "")
         _ = self.enterContext(mock.patch.object(staff, "runtime_id", return_value=""))
-        _ = self.enterContext(mock.patch.object(unit_lookup, "checked_conversation", side_effect=self.checked_recipient))
+        _ = self.enterContext(mock.patch.object(unit_lookup, "lookup_conversation", side_effect=self.checked_recipient))
         _ = self.enterContext(mock.patch.object(unit_lookup, "current_claude_record", side_effect=self.current_fixture_record))
 
     def test_runtime_sender_stamps_both_kinds_and_codex_overrides_the_claude_hint(self) -> None:
@@ -2476,7 +2478,7 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
                 "foreground_processes": [{"pid": owner, "name": "claude", "argv": ["claude"]}]}}
                 for owner in (exited, pid)]
             native = herdr.NativeAgentProcess(herdr.EnvironmentThread(current["sessionId"]), started, {})
-            with (mock.patch.object(unit_lookup, "checked_conversation", REAL_CONVERSATION_LOOKUP),
+            with (mock.patch.object(unit_lookup, "lookup_conversation", REAL_CONVERSATION_LOOKUP),
                   mock.patch.object(sessions, "read_registry", side_effect=snapshots) as registry,
                   mock.patch.object(unit_lookup, "current_claude_record", return_value=current),
                   mock.patch.object(herdr, "live_sessions", return_value=[{"name": place.session}]),
@@ -2494,6 +2496,50 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
         attempt = self.relayed[0].claude_attempt
         self.assertEqual(attempt, send.ClaudeDeliveryAttempt(
             send.ConversationRecipient(send.machine(), "recipient"), pid, started, path))
+
+    def test_relay_plan_uses_the_refreshed_registry_for_argv_fallback_and_absence(self) -> None:
+        from scripts.herdr import herdr
+
+        _, previous = self.canonical_recipient()
+        conversation = "00000000-0000-4000-8000-000000000002"
+        previous["sessionId"] = conversation
+        pid = previous["pid"]
+        started = previous.get("procStart", "")
+        self.assertTrue(started)
+        path = str(self.root / "current.sock")
+        current = previous.copy()
+        current["messagingSocketPath"] = path
+        registry = sessions.RegistryRead((sessions.RegistryObservation(previous, {}),),
+                                         (self.root / "sessions" / "unreadable.json",))
+        place = herdr.HerdrPlace("agents", "w1:p1")
+        exited = 991001
+        processes = [herdr.HerdrProcess(pid, place, {}, "claude", str(self.root))]
+        hosts = [{"name": place.session}]
+        pane_reports = [{"process_info": {"shell_pid": 991000, "foreground_process_group_id": owner,
+            "foreground_processes": [{"pid": owner, "name": "claude", "argv": argv}]}}
+            for owner, argv in ((exited, ["claude"]), (pid, []))]
+        target = send.ConversationRecipient(send.machine(), conversation)
+        message = send.Message(f"session:{conversation}", "fixture", "Preview", "body", None)
+        for has_owner in (True, False):
+            entries = (sessions.RegistryObservation(current, {}),) if has_owner else ()
+            fresh = sessions.RegistryRead(entries, ())
+            with (self.subTest(has_owner=has_owner),
+                  mock.patch.object(unit_lookup, "lookup_conversation", REAL_CONVERSATION_LOOKUP),
+                  mock.patch.object(sessions, "read_registry", return_value=fresh) as refresh,
+                  mock.patch.object(herdr, "live_sessions", side_effect=[hosts, hosts if has_owner else []]),
+                  mock.patch.object(herdr, "herdr_processes", return_value=processes),
+                  mock.patch.object(herdr.Herdr, "listed", return_value=[{"pane_id": place.pane}]),
+                  mock.patch.object(herdr.Herdr, "result", side_effect=pane_reports),
+                  mock.patch.object(herdr, "native_process",
+                      side_effect=herdr.NativeRegistryChanging(herdr.process_exit_reason(exited))) as read_native):
+                plan = send.relay_plan(message, registry, [previous], staff.StaffSnapshot(()), target)
+                refresh.assert_called_once_with()
+                read_native.assert_called_once_with(exited, "claude")
+                if has_owner:
+                    attempt = send.ClaudeDeliveryAttempt(target, pid, started, path, fallback_pane=place)
+                    self.assertEqual(plan, send.RelayAttempt(replace(message, to=f"uds:{path}", claude_attempt=attempt)))
+                else:
+                    self.assertEqual(plan, send.SessionIdWithoutLiveRecipient(target))
 
     def test_recovered_socket_lost_during_connect_queues_for_the_checked_conversation(self) -> None:
         self.session("recipient", "Recipient")
@@ -2859,8 +2905,8 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
         self.staff_member("offline", "Offline")
         registry = sessions.RegistryRead((), (self.root / "sessions" / "unreadable.json",))
         with (mock.patch.object(sessions, "read_registry", return_value=registry),
-              mock.patch.object(unit_lookup, "checked_conversation",
-                                return_value=unit_lookup.ProvedAbsentUnit())):
+              mock.patch.object(unit_lookup, "lookup_conversation",
+                                return_value=unit_lookup.ConversationLookup(unit_lookup.ProvedAbsentUnit()))):
             result = self.send("--to", "staff:offline", "--key", "unproved", "--text", "Do not enqueue.")
         self.assertEqual(result.outcome, "failed")
         self.assertIn("registry is unreadable", result.detail)
@@ -2871,8 +2917,9 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
     def test_unknown_owner_with_socket_error_text_never_starts_recovery(self) -> None:
         canonical, row = self.canonical_recipient()
         address = f"uds:{row['messagingSocketPath']}"
-        with (mock.patch.object(unit_lookup, "checked_conversation",
-                                return_value=unit_lookup.UnknownUnit("cannot read pane evidence: ENOENT")) as check,
+        with (mock.patch.object(unit_lookup, "lookup_conversation",
+                                return_value=unit_lookup.ConversationLookup(
+                                    unit_lookup.UnknownUnit("cannot read pane evidence: ENOENT"))) as check,
               mock.patch.object(send, "relay") as relay):
             result = self.send("--to", address, "--key", "race", "--text", "private body")
         self.assertEqual(result.outcome, "failed")
@@ -7473,7 +7520,7 @@ class PeerSendTests(RecipientStaffFixture, ShutdownTestCase):
         _ = self.enterContext(mock.patch.object(send, "STATE", self.root / "state"))
         _ = self.enterContext(mock.patch.object(roster, "roster", side_effect=self.read_local))
         _ = self.enterContext(mock.patch.object(send, "relay", side_effect=self.relay))
-        _ = self.enterContext(mock.patch.object(unit_lookup, "checked_conversation", side_effect=self.checked_recipient))
+        _ = self.enterContext(mock.patch.object(unit_lookup, "lookup_conversation", side_effect=self.checked_recipient))
         _ = self.enterContext(mock.patch.object(unit_lookup, "current_claude_record", side_effect=self.current_fixture_record))
         _ = self.enterContext(mock.patch.object(codex_daemon, "queue", side_effect=self.daemon))
         _ = self.enterContext(mock.patch.object(send, "user", side_effect=AssertionError("never reach a real user channel")))
@@ -8241,8 +8288,8 @@ class PaneWorkerMessageTests(unittest.TestCase):
         _ = (self.fixture.root / "conf/direct.conf").write_text("WORKER_SPLIT_RATIO=0.667\n")
         _ = self.enterContext(mock.patch.object(send, "STATE", self.state))
         _ = self.enterContext(mock.patch.object(roster, "roster", return_value=roster.Roster([], [])))
-        _ = self.enterContext(mock.patch.object(unit_lookup, "checked_conversation",
-                                                 return_value=unit_lookup.ProvedAbsentUnit()))
+        absent = unit_lookup.ConversationLookup(unit_lookup.ProvedAbsentUnit())
+        _ = self.enterContext(mock.patch.object(unit_lookup, "lookup_conversation", return_value=absent))
         _ = self.enterContext(mock.patch.object(sessions, "read_registry", return_value=sessions.RegistryRead((), ())))
         _ = self.enterContext(mock.patch.object(sessions, "live_sessions", return_value=[]))
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {

@@ -134,17 +134,18 @@ def private_sender_acceptance(state: Path, *, before_accept: Callable[[], None] 
     def running_records(reading: sessions.RegistryRead) -> list[sessions.SessionRecord]:
         return [entry.record for entry in reading.entries]
 
-    def checked_conversation(conversation: str, *, registry: sessions.RegistryRead,
-                             probe_address: bool) -> unit_lookup.UnitOwner:
+    def lookup_conversation(conversation: str, *, registry: sessions.RegistryRead,
+                            probe_address: bool) -> unit_lookup.ConversationLookup:
         if probe_address:
             raise AssertionError("the fixture does not probe sockets")
         row = sessions.addressed(f"session:{conversation}", running_records(registry))
         if row is None:
-            return unit_lookup.ProvedAbsentUnit()
-        return unit_lookup.ProvedLiveUnit(
+            return unit_lookup.ConversationLookup(unit_lookup.ProvedAbsentUnit())
+        owner = unit_lookup.ProvedLiveUnit(
             unit_lookup.LiveClaude(row["name"], conversation, row["messagingSocketPath"], row["pid"]),
             session_staff.ProvedProcessGeneration(row["pid"], row.get("procStart", "")),
         )
+        return unit_lookup.ConversationLookup(owner)
 
     def sender_process_start(pid: int) -> process_start.ProcessStart:
         if pid == owner_pid:
@@ -171,7 +172,7 @@ def private_sender_acceptance(state: Path, *, before_accept: Callable[[], None] 
          mock.patch.object(sessions, "read_registry", return_value=registry), \
          mock.patch.object(sessions, "running_records", side_effect=running_records), \
          mock.patch.object(sessions, "running_sessions", return_value=[]), \
-         mock.patch.object(unit_lookup, "checked_conversation", side_effect=checked_conversation), \
+         mock.patch.object(unit_lookup, "lookup_conversation", side_effect=lookup_conversation), \
          mock.patch.object(send, "STATE", state), mock.patch.object(send, "wrong_template", return_value=None), mock.patch.object(send, "run", side_effect=transport), \
          mock.patch.object(send, "resolve_recipient", side_effect=discover), \
          mock.patch.object(send, "relay", side_effect=relay):

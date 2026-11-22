@@ -4704,7 +4704,8 @@ class PaneRunDeliveryTests(unittest.TestCase):
         with (patch.object(send, "STATE", self.fixture.root / "messages"),
               patch.object(roster, "roster", return_value=roster.Roster([], [])),
               patch.object(roster, "peer_roster", return_value=roster.Roster([], [])),
-              patch.object(unit_lookup, "checked_conversation", return_value=unit_lookup.ProvedAbsentUnit()),
+              patch.object(unit_lookup, "lookup_conversation",
+                           return_value=unit_lookup.ConversationLookup(unit_lookup.ProvedAbsentUnit())),
               patch.object(sessions, "read_registry", return_value=sessions.RegistryRead((), ()))):
             self.assertEqual(detached_runs.reap_orphans(str(self.run_dir)), [record["run_id"]])
             saved = worker_lifecycle.read_json_object(path)

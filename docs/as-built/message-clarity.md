@@ -64,7 +64,8 @@ A retry to a native conversation can use a new process generation for that conve
 The sender checks the owner before connecting.
 An unproved lookup refreshes the pane evidence and the Claude registry once after it confirms a pane process exit.
 The refresh checks the same conversation.
-If the refresh proves an owner, the sender uses that registry read to select the socket.
+The lookup preserves evidence of the exit when a registry read also fails.
+The sender uses the refreshed registry for every lookup result.
 An unreadable pane cannot supply the lookup error if its candidates exclude the requested conversation.
 The private proxy checks the peer PID, process start, registry conversation, and socket immediately before forwarding on the same connection.
 A pre-tool hook permits one `SendMessage` call with the private address and expected message.

@@ -825,6 +825,7 @@ class LabeledSession:
     identity: LiveSession | StoredReference | NoSession | UnprovedPaneIdentity = NO_SESSION
     empty: herdr.ObservedEmpty | ShellNotObserved = ShellNotObserved()
     generation: OwnerGeneration = field(default=NoProvedProcessGeneration(), compare=False, repr=False)
+    exited_pid: int | None = field(default=None, compare=False, repr=False)
 
 
 def place_text(place: Place) -> str:
