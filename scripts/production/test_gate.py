@@ -14,6 +14,7 @@ import io
 import os
 from pathlib import Path
 import re
+import subprocess
 from typing import cast, final, override
 from contextlib import AbstractContextManager, redirect_stdout
 from datetime import UTC, datetime, tzinfo
@@ -177,6 +178,81 @@ class MergeGateCheckpointTests(MergeGateFixture):
                 self.assertEqual(self.git(checkout, "rev-parse", "HEAD"), changed_head)
                 self.assertEqual(file.read_text(), "concurrent change\n")
                 self.assert_not_pushed()
+
+    def test_rollback_keeps_commits_made_on_either_side_of_the_ref_update(self) -> None:
+        git = gate.git
+        for when in ("before", "after"):
+            state = self.state / when
+            with self.subTest(when=when), mock.patch.dict(self.environment, GATE_STATE_DIR=str(state)):
+                checkout = self.root / when
+                _ = self.git(self.root, "clone", "-q", "--branch", "integration", str(self.origin), str(checkout))
+                file = checkout / "concurrent.txt"
+                changed_head = ""
+
+                def commit() -> None:
+                    nonlocal changed_head
+                    self.write(file, "concurrent change\n")
+                    changed_head = self.commit(checkout, "concurrent change")
+
+                def change_at_ref_update(repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
+                    if args[:1] != ("update-ref",) or args[-3:-1] != ("HEAD", self.base):
+                        return git(repo, *args)
+                    if when == "before":
+                        commit()
+                    result = git(repo, *args)
+                    if when == "after":
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                        commit()
+                    return result
+
+                with mock.patch.object(gate, "run_gate_suites", side_effect=GateRefused("fixture suite failure")), \
+                        mock.patch.object(gate, "git", side_effect=change_at_ref_update):
+                    result = self.run_gate("--repo", str(checkout))
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertEqual(self.git(checkout, "rev-parse", "HEAD"), changed_head)
+                self.assertIn(changed_head, result.stderr)
+                self.assertEqual(file.read_text(), "concurrent change\n")
+                self.assertEqual((checkout / "unit.txt").read_text(), "checkpoint\n")
+                self.assertEqual(self.git(checkout, "status", "--porcelain"), "")
+
+                with mock.patch.dict(os.environ, self.environment, clear=True), \
+                        mock.patch.object(gate, "process_start", return_value=Gone()):
+                    with self.assertRaisesRegex(GateRefused, f"rollback kept HEAD {changed_head}"):
+                        gate.recover_gate_directory(gate.gate_run_directory(checkout))
+                self.assertEqual(self.git(checkout, "rev-parse", "HEAD"), changed_head)
+                self.assertEqual(self.git(checkout, "status", "--porcelain"), "")
+                self.assert_not_pushed()
+
+    def test_recovery_finishes_the_tree_update_after_an_interrupted_rollback(self) -> None:
+        git = gate.git
+        file = self.checkout / "unit.txt"
+
+        def interrupt_after_ref_update(repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
+            result = git(repo, *args)
+            if args[:1] == ("update-ref",) and args[-3:-1] == ("HEAD", self.base):
+                self.assertEqual(result.returncode, 0, result.stderr)
+                raise KeyboardInterrupt("fixture stop after the ref update")
+            return result
+
+        with mock.patch.object(gate, "run_gate_suites", side_effect=GateRefused("fixture suite failure")), \
+                mock.patch.object(gate, "git", side_effect=interrupt_after_ref_update):
+            result = self.run_gate()
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("fixture stop after the ref update", result.stderr)
+        self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), self.base)
+        self.assertEqual(file.read_text(), "checkpoint\n")
+        self.assertEqual(self.git(self.checkout, "show", ":unit.txt"), "checkpoint")
+
+        with mock.patch.dict(os.environ, self.environment, clear=True), \
+                mock.patch.object(gate, "process_start", return_value=Gone()):
+            directory = gate.gate_run_directory(self.checkout)
+            self.assertEqual(len(list(directory.glob("*.json"))), 1)
+            gate.recover_gate_directory(directory)
+            self.assertEqual(list(directory.glob("*.json")), [])
+        self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), self.base)
+        self.assertFalse(file.exists())
+        self.assertEqual(self.git(self.checkout, "status", "--porcelain"), "")
+        self.assert_not_pushed()
 
     def test_checkpoint_retries_its_merge_after_a_stop_before_push(self) -> None:
         with mock.patch.object(promotion, "push_integration", side_effect=GateRefused("injected stop before push")):

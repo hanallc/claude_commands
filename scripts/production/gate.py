@@ -45,7 +45,7 @@ except FileNotFoundError:
 import argparse
 from collections import deque
 from collections.abc import Callable, Generator, Sequence
-from contextlib import ExitStack, closing, contextmanager, nullcontext
+from contextlib import ExitStack, closing, contextmanager, nullcontext, suppress
 from contextvars import ContextVar
 from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime, timedelta
@@ -736,7 +736,8 @@ class GateRecovery:
                     print(f"Recovered gate {self.pid}: rollback waits for the live gate in {repo}", flush=True)
                     return
                 _ = cleanup.enter_context(scratch.copy_lock(repo))
-                rollback_merge(repo, self.rollback, checkpoint=self.rollback_source, recorded_merge=self.rollback_head)
+                rollback_merge(repo, self.rollback, checkpoint=self.rollback_source,
+                               recorded_merge=self.rollback_head, recovery=self)
                 self.rollback = ""
                 self.save()
             print(f"Recovered gate {self.pid}: merge undone, not pushed", flush=True)
@@ -760,8 +761,9 @@ class NoGateRecovery:
     """No gate owns resources in this calling context."""
 
 
+NO_GATE_RECOVERY = NoGateRecovery()
 ACTIVE_GATE_RECOVERY: ContextVar[GateRecovery | NoGateRecovery] = ContextVar(
-    "merge_gate_recovery", default=NoGateRecovery())
+    "merge_gate_recovery", default=NO_GATE_RECOVERY)
 
 
 def gate_run_directory(repo: Path) -> Path:
@@ -2107,27 +2109,78 @@ def promote_mac(args: GateArguments, main_repo: Path, published: promotion.Publi
         raise GateRefused(f"main promoted to {promoted}; Mac fast-forward failed: ssh exit={result.returncode}, ff_rc={statuses}; {detail}; the claude-sync job on the Mac retries within 15 minutes")
 
 
-def rollback_merge(repo: Path, baseline: str, *, checkpoint: str = "", recorded_merge: str = "") -> None:
-    merged = checked_git(repo, "rev-parse", "HEAD")
-    if merged not in (baseline, recorded_merge):
-        if recorded_merge or (checkpoint and checked_git(repo, "rev-list", "--parents", "-n", "1", merged).split()[1:]
-                              != [baseline, checkpoint]):
-            raise GateRefused(f"rollback kept HEAD {merged}: it differs from the gate merge")
-    if git(repo, "rev-parse", "--verify", "MERGE_HEAD").returncode == 0:
-        _ = git(repo, "merge", "--abort")
-    result = git(repo, "reset", "--keep", baseline)
-    if result.returncode == 0:
-        return
-    # The checkout started clean. Tracked edits created during the gate belong
-    # to this run; restore them to the merge tree before retrying once.
-    changed = checked_git(repo, "diff", "HEAD", "--name-only", "-z").split("\0")
-    tracked = [path for path in changed if path]
+@contextmanager
+def hold_rollback_head(repo: Path, baseline: str) -> Generator[None]:
+    """Hold Git's ref locks while the index and worktree change."""
+    with subprocess.Popen(["git", "update-ref", "--stdin"], cwd=repo, stdin=subprocess.PIPE,
+                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                          errors="replace", pass_fds=copies.COMMAND_LOCKS.get()) as transaction:
+        assert transaction.stdin is not None
+        output = cast(TextIO, transaction.stdout)
+        try:
+            with suppress(BrokenPipeError):
+                _ = transaction.stdin.write(f"start\nverify HEAD {baseline}\nprepare\n")
+                transaction.stdin.flush()
+            response = output.readline()
+            if response == "start: ok\n":
+                response = output.readline()
+            if response == "prepare: ok\n":
+                yield
+                return
+        finally:
+            with suppress(BrokenPipeError):
+                transaction.stdin.close()
+        detail = (response + output.read()).strip()
+    head = checked_git(repo, "rev-parse", "HEAD")
+    raise GateRefused(f"rollback kept HEAD {head}: cannot hold the baseline {baseline}: {detail}")
+
+
+def rollback_failure(repo: Path, merged: str, detail: str) -> GateRefused:
+    blocking = git(repo, "status", "--porcelain", "--untracked-files=all").stdout.strip()
+    return GateRefused(f"merge NOT undone; merge commit {merged}; blocking files: {blocking or detail}; {detail}")
+
+
+def restore_rollback_files(repo: Path, merged: str) -> None:
+    staged = checked_git(repo, "diff", "--cached", merged, "--no-renames", "--name-only", "-z")
+    dirty = checked_git(repo, "diff", "--no-renames", "--name-only", "-z")
+    tracked = sorted(set(staged.split("\0") + dirty.split("\0")) - {""})
     if tracked:
-        _ = git(repo, "restore", "--source=HEAD", "--staged", "--worktree", "--", *tracked)
-    result = git(repo, "reset", "--keep", baseline)
-    if result.returncode:
-        blocking = git(repo, "status", "--porcelain", "--untracked-files=all").stdout.strip()
-        raise GateRefused(f"merge NOT undone; merge commit {merged}; blocking files: {blocking or result.stderr.strip()}; {result.stderr.strip()}")
+        _ = checked_git(repo, "--literal-pathspecs", "restore", f"--source={merged}",
+                        "--staged", "--worktree", "--", *tracked)
+
+
+def rollback_merge(repo: Path, baseline: str, *, checkpoint: str = "", recorded_merge: str = "",
+                   recovery: GateRecovery | NoGateRecovery = NO_GATE_RECOVERY) -> None:
+    head = checked_git(repo, "rev-parse", "HEAD")
+    if head not in (baseline, recorded_merge):
+        if recorded_merge or (checkpoint and checked_git(repo, "rev-list", "--parents", "-n", "1", head).split()[1:]
+                              != [baseline, checkpoint]):
+            raise GateRefused(f"rollback kept HEAD {head}: it differs from the gate merge")
+    merged = recorded_merge or head
+    if head != baseline:
+        # Keep the source tree in the record in case recovery resumes at the baseline.
+        if isinstance(recovery, GateRecovery) and recovery.rollback_head != merged:
+            recovery.rollback_head = merged
+            recovery.save()
+        swapped = git(repo, "update-ref", "-m", "gate rollback", "HEAD", baseline, merged)
+        if swapped.returncode:
+            raise rollback_failure(repo, merged, f"cannot move HEAD: {failure_detail(swapped)}")
+    with hold_rollback_head(repo, baseline):
+        pending = git(repo, "rev-parse", "--verify", "MERGE_HEAD")
+        if pending.returncode == 0:
+            if pending.stdout.strip() != checkpoint or git(repo, "rev-parse", "--verify", "MERGE_AUTOSTASH").returncode == 0:
+                raise GateRefused("rollback kept the pending merge: the gate cannot undo it")
+            restore_rollback_files(repo, merged)
+        result = git(repo, "read-tree", "-m", "-u", merged, baseline)
+        if result.returncode:
+            # Remove tracked edits from the gate before Git tries the tree update again.
+            restore_rollback_files(repo, merged)
+            result = git(repo, "read-tree", "-m", "-u", merged, baseline)
+        if result.returncode:
+            raise rollback_failure(repo, merged, failure_detail(result))
+        _ = checked_git(repo, "read-tree", "--reset", baseline)
+        if pending.returncode == 0:
+            _ = checked_git(repo, "merge", "--quit")
 
 
 def notify_style(repo: Path, branch: str, tip: str) -> None:
@@ -2168,9 +2221,7 @@ def merge_for_gate(repo: Path, checkpoint: str, message: str) -> str:
     result = git(repo, "merge", "--no-overwrite-ignore", "--no-ff", "-m", message, checkpoint)
     if result.returncode:
         conflicts = git(repo, "diff", "--name-only", "--diff-filter=U").stdout.strip()
-        abort = git(repo, "merge", "--abort")
-        raise GateRefused(f"merge failed; conflicts: {conflicts or '(none)'}; {result.stderr.strip()}"
-                          + (f"; abort failed: {abort.stderr.strip()}" if abort.returncode else ""))
+        raise GateRefused(f"merge failed; conflicts: {conflicts or '(none)'}; {result.stderr.strip()}")
     return checked_git(repo, "rev-parse", "HEAD")
 
 
@@ -2257,7 +2308,7 @@ def merge_checkpoint(args: GateArguments) -> int:
     except (KeyboardInterrupt, SystemExit):
         raise
     except BaseException as error:
-        rollback_merge(repo, baseline, checkpoint=checkpoint, recorded_merge=merged)
+        rollback_merge(repo, baseline, checkpoint=checkpoint, recorded_merge=merged, recovery=recovery)
         if isinstance(recovery, GateRecovery):
             recovery.rollback = ""
             recovery.save()
