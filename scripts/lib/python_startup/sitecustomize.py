@@ -37,7 +37,11 @@ TEST_RUNNER_FILES = (*STARTUP_FILES, "scripts/test_times/module_run.py", "script
                      "scripts/lib/conf.py", "scripts/lib/git_files.py", "config/build_folders.conf",
                      "config/test_times.conf")
 _DIRECT_TEST_UNIT_PREFIX = "claude-direct-test-"
+_GATE_ANCESTOR_LIMIT = 32
+_GATE_ENVIRONMENT_LIMIT = 64 * 1024
 _SESSION_STARTUP = "session_python_startup"
+_SYSTEMD_SERVICE = "org.freedesktop.systemd1"
+_SYSTEMD_INFINITE_RUNTIME = (1 << 64) - 1
 _DIRECT_TEST_LIMIT_KEY = "direct_test.time_limit_seconds"
 GATE_PARENT_SOURCE_FD = "DEVTOOLS_GATE_PARENT_SOURCE_FD"
 DATACLASS_CODE_FILENAME = "<string>"
@@ -326,7 +330,7 @@ def _gate_command(pid: str) -> bool:
             entry = (cwd / item).resolve(strict=True)
             installed = Path(getpwuid(os.getuid()).pw_dir, ".claude").resolve()
             roots = (Path(__file__).resolve().parents[3], installed)
-            return (entry.name in {"gate.py", "merge_gate.py", "targeted_test.py", "merge_checkpoint.py"}
+            return (entry.name in {"gate.py", "targeted_test.py", "merge_checkpoint.py"}
                     and any(entry.parent == root / "scripts/production" for root in roots))
     except (KeyError, OSError, ValueError):
         pass
@@ -476,7 +480,9 @@ def _launching_gate(parent: str, descriptor: int) -> bool:
 def _descends_from_gate_module() -> bool:
     """Use the module's exec environment when a descendant replaces its environment."""
     pid = os.getppid()
-    while pid > 1:
+    for _ in range(_GATE_ANCESTOR_LIMIT):
+        if pid <= 1:
+            break
         try:
             with open(f"/proc/{pid}/stat", "rb") as source:
                 fields = source.read().rpartition(b") ")[2].split()
@@ -488,7 +494,8 @@ def _descends_from_gate_module() -> bool:
         if pid == session:
             try:
                 with open(f"/proc/{pid}/environ", "rb") as source:
-                    environment = dict(item.split(b"=", 1) for item in source.read().split(b"\0") if b"=" in item)
+                    contents = source.read(_GATE_ENVIRONMENT_LIMIT)
+                environment = dict(item.split(b"=", 1) for item in contents.split(b"\0")[:-1] if b"=" in item)
                 parent_text = str(parent)
                 expected = environment.get(b"GATE_PARENT_PID") or environment.get(b"MERGE_GATE_PARENT_PID", b"")
                 if expected == parent_text.encode():
@@ -507,12 +514,13 @@ def within_test_limit() -> bool:
         return True
     if sys.platform != "linux":
         return False
+    if _descends_from_gate_module():
+        return True
     try:
-        if _direct_test_unit(_cgroup(os.getpid())):
-            return True
+        unit = _direct_test_unit(_cgroup(os.getpid()))
+        return bool(unit) and _direct_test_scope_enforces_deadline(unit)
     except OSError:
-        pass
-    return _descends_from_gate_module()
+        return False
 
 
 def _begin_direct_test() -> None:
@@ -569,11 +577,26 @@ def _direct_test_unit(cgroup: str) -> str:
     return unit if re.fullmatch(_DIRECT_TEST_UNIT_PREFIX + r"[0-9a-f]{32}\.scope", unit) else ""
 
 
+def _direct_test_scope_enforces_deadline(unit: str) -> bool:
+    """Read the scope deadline and its termination signal from systemd."""
+    import re
+    import signal
+    import subprocess
+
+    path = "/org/freedesktop/systemd1/unit/" + unit.replace("-", "_2d").replace(".", "_2e")
+    result = subprocess.run(["busctl", "--user", "--timeout=5s", "get-property", _SYSTEMD_SERVICE, path,
+                             _SYSTEMD_SERVICE + ".Scope", "RuntimeMaxUSec", "KillSignal"],
+                            capture_output=True, text=True, check=False)
+    limits = re.fullmatch(r"t ([0-9]+)\ni ([0-9]+)\n", result.stdout)
+    return (result.returncode == 0 and limits is not None
+            and 0 < int(limits[1]) < _SYSTEMD_INFINITE_RUNTIME and int(limits[2]) == signal.SIGKILL.value)
+
+
 def _start_transient_unit(unit: str, properties: Sequence[Sequence[str]], descriptors: tuple[int, ...]) -> None:
     import subprocess
 
-    service = "org.freedesktop.systemd1"
-    command = ["busctl", "--user", "--", "call", service, "/org/freedesktop/systemd1", service + ".Manager",
+    command = ["busctl", "--user", "--", "call", _SYSTEMD_SERVICE, "/org/freedesktop/systemd1",
+               _SYSTEMD_SERVICE + ".Manager",
                "StartTransientUnit", "ssa(sv)a(sa(sv))", unit, "fail", str(len(properties)),
                *(field for property_fields in properties for field in property_fields), "0"]
     result = subprocess.run(command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,

@@ -596,10 +596,12 @@ The admission, scheduling caches, and rerun rules below apply to `SharedMachine`
   The short names leave room for Unix socket paths below `TMPDIR`.
   The runner reads the output and removes the temporary folder when the job ends.
   At the first unittest load or run, the bootstrap checks whether the process already runs under a test limit.
-  On Linux, gate descendants use the gate launch proof from the process tree.
-  A descendant in an existing direct test scope uses that scope.
-  A process under a test limit keeps its current folder and reads no configuration for a new limit.
-  Herdr keeps the prepared Python path when it launches an agent from a process under a test limit.
+  On Linux, the bootstrap first checks for a verified gate parent.
+  It then reads at most 32 ancestor records and up to 64 KiB of environment data per session leader.
+  If neither check proves a gate launch, it reads the cgroup name once.
+  For a matching direct test scope, one systemd query checks for a finite runtime limit and SIGKILL.
+  A process with an existing limit keeps its current folder and reads no test limit configuration.
+  Herdr adds the startup path to every agent pane because the server can launch it outside the client's test limit.
   The bootstrap gives a new direct test run a maker folder.
   A later `package_root.py` run inside an import selects the checkout only and starts no folder.
   `gate.py --affected` uses the same test-folder context for its outer run.

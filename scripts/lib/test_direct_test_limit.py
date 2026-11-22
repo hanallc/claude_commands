@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from secrets import token_hex
 import subprocess
 import sys
 import tempfile
@@ -54,12 +55,20 @@ os.execv(sys.argv[1], sys.argv[1:])
 NESTED_TEST_PROBE = """
 import os, sys, unittest
 
+queries = []
+
 def guard(event, arguments):
+    if event == "subprocess.Popen" and sys.argv[2] == "direct":
+        program, command, _, _ = arguments
+        if program == "busctl" and command[-2:] == ["RuntimeMaxUSec", "KillSignal"]:
+            queries.append(command)
+            return
     if event == "subprocess.Popen" or event == "open" and str(arguments[0]).endswith(".conf"):
         raise AssertionError(f"Unexpected setup: {event} {arguments[0]}")
 
 sys.addaudithook(guard)
 unittest.defaultTestLoader.loadTestsFromTestCase(unittest.TestCase)
+assert len(queries) == int(sys.argv[2] == "direct")
 assert "PYTHONPATH" not in os.environ
 assert os.environ["TMPDIR"] == sys.argv[1]
 """
@@ -67,13 +76,14 @@ NESTED_FIXTURE = """
 import os, subprocess
 from pathlib import Path
 
-def run_nested(root, shim, probe, timeout):
+def run_nested(root, shim, probe, timeout, limit="gate"):
     environment = {name: os.environ[name] for name in (
-        "PATH", "HOME", "CONF_DIR", "PYTHONDONTWRITEBYTECODE", "CLAUDE_DISABLE_DATACLASS_CODE_CACHE")
+        "PATH", "HOME", "CONF_DIR", "PYTHONDONTWRITEBYTECODE", "CLAUDE_DISABLE_DATACLASS_CODE_CACHE",
+        "DBUS_SESSION_BUS_ADDRESS", "XDG_RUNTIME_DIR")
         if name in os.environ}
     environment.update(TMPDIR=str(root), XDG_CACHE_HOME=str(root / "cache"))
     result = subprocess.run(
-        [shim, "-c", probe, str(root)], env=environment, start_new_session=True,
+        [shim, "-c", probe, str(root), limit], env=environment, start_new_session=True,
         capture_output=True, text=True, check=False, timeout=timeout)
     assert result.returncode == 0, result.stdout + result.stderr
 """
@@ -127,6 +137,18 @@ class DirectTestLimitTests(unittest.TestCase):
 
     def test_plain_python_stops_at_the_direct_limit(self) -> None:
         self.assert_direct_limit_result(self.run_case("test_long"))
+
+    @unittest.skipUnless(sys.platform == "linux", "Direct test scopes use Linux systemd")
+    def test_scope_name_without_enforcement_cannot_bypass_the_direct_limit(self) -> None:
+        for property_value in ("KillSignal=SIGKILL", "RuntimeMaxSec=90s"):
+            with self.subTest(property=property_value):
+                result = self.invoke(
+                    "systemd-run", "--user", "--scope", "--quiet", "--collect",
+                    "--unit", f"claude-direct-test-{token_hex(16)}",
+                    "--property", "MemoryMax=2G", "--property", property_value,
+                    "--", sys.executable, "-m", "unittest", "direct_case.Example.test_long",
+                )
+                self.assert_direct_limit_result(result)
 
     def test_short_direct_test_preserves_output_and_exit_status(self) -> None:
         self.environment["PYTHONWARNINGS"] = "default"
@@ -183,7 +205,7 @@ class GateChild(unittest.TestCase):
 import unittest
 unittest.defaultTestLoader.loadTestsFromTestCase(unittest.TestCase)
 assert "claude-direct-test-" in Path("/proc/self/cgroup").read_text()
-run_nested(Path({str(self.root)!r}), {shim!r}, {NESTED_TEST_PROBE!r}, {TEST_HANG_GUARD_SECS!r})
+run_nested(Path({str(self.root)!r}), {shim!r}, {NESTED_TEST_PROBE!r}, {TEST_HANG_GUARD_SECS!r}, "direct")
 """)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
