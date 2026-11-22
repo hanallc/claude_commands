@@ -175,7 +175,8 @@ import signal
 import subprocess
 import sys
 args = sys.argv[1:]
-if args[:4] == ["-C", {str(self.checkout)!r}, "merge", "--no-ff"] and args[-1] == {alpha!r}:
+if (args[:3] == ["-C", {str(self.checkout)!r}, "merge"] and "--no-ff" in args[3:-1]
+        and args[-1] == {alpha!r}):
     result = subprocess.run([{real_git!r}, *args], check=False)
     if result.returncode == 0:
         os.kill(os.getppid(), signal.SIGKILL)
