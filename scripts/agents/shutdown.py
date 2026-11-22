@@ -767,9 +767,10 @@ def main(argv: list[str] | None = None) -> int:
         if options.command == "add-producer":
             return producer_lifecycle.add(options.producer, model=options.model, effort=options.effort, job=options.job)
         if options.command == "stop" and options.all:
-            return restart.stop_all(dry_run=options.dry_run,
-                                    only=tuple(item for item in options.only.split(",") if item),
-                                    account=_restart_account(options.account))
+            selection = restart.BulkCommand("stop", account=options.account, all_rows=True,
+                only=tuple(item for item in options.only.split(",") if item), dry_run=options.dry_run)
+            return restart.run_command(lambda: restart.stop_all(dry_run=selection.dry_run,
+                                    only=selection.only, account=_restart_account(selection.account)), selection)
         if options.command == "move":
             move_arguments = ["move", options.session, note_file.canonical_label(options.target)]
             if options.dry_run:
@@ -778,9 +779,11 @@ def main(argv: list[str] | None = None) -> int:
                 move_arguments.extend(("--why", options.why))
             return accounts.main(move_arguments)
         if options.command == "restart":
-            return restart.restart(stop_all=options.all, dry_run=options.dry_run,
-                                   only=tuple(item for item in options.only.split(",") if item),
-                                   account=_restart_account(options.account), why=options.why)
+            selection = restart.BulkCommand(account=options.account, all_rows=options.all,
+                only=tuple(item for item in options.only.split(",") if item), why=options.why,
+                dry_run=options.dry_run, here=options.here)
+            return restart.run_command(lambda: restart.restart(stop_all=selection.all_rows, dry_run=selection.dry_run,
+                                   only=selection.only, account=_restart_account(selection.account), why=selection.why), selection)
         if options.command == "records":
             print(json.dumps(shutdown_record.read()))
             return 0
