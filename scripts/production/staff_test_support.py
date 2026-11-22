@@ -7,6 +7,7 @@ import json
 import os
 import pwd
 import runpy
+import secrets
 import shlex
 import shutil
 import signal
@@ -743,12 +744,13 @@ from pathlib import Path
 parent_pid = int(sys.argv[1])
 if os.getppid() != parent_pid:
     raise SystemExit
+close_token = os.environ.pop('STAFF_TEST_OWNER_CLOSE_TOKEN')
 with open(Path(os.environ['STAFF_TEST_CHECKOUT']) / "scripts/lib/package_root.py") as package_root:
     exec(package_root.read(), {"__file__": package_root.name})
 from scripts.production.staff_test_support import STAFF_OWNER_PARENT_CHECK_SECONDS, run_staff_owner_request
 from scripts.production import staff_sources
 
-# Report a null request to the owner through the request child's exit status.
+# Report a matching close request through the request child's exit status.
 STOP_REQUEST_EXIT_STATUS = 75
 
 def fork_request(listener, connection, notices, wake):
@@ -767,9 +769,9 @@ def fork_request(listener, connection, notices, wake):
             line = channel.readline()
         if line:
             request = json.loads(line)
-            if request is None:
+            if request == {'close': close_token}:
                 status = STOP_REQUEST_EXIT_STATUS
-            else:
+            elif isinstance(request, dict) and 'close' not in request:
                 run_staff_owner_request(connection, request)
     finally:
         connection.close()
@@ -833,12 +835,13 @@ class SharedStaffOwner:
 
     @cached_property
     def port(self) -> str:
+        close_token = secrets.token_hex()
         script = self.root / "fake-staff-owner.py"
         write_text_atomic(script, STAFF_OWNER_SERVER)
         errors = self.lifetime.enter_context((self.root / "fake-staff-owner.log").open("w"))
         process = self.lifetime.enter_context(start_staff_owner(
             [sys.executable, str(script), str(os.getpid())], cwd=self.root,
-            env={**os.environ, "TMPDIR": str(self.root)},
+            env={**os.environ, "TMPDIR": str(self.root), "STAFF_TEST_OWNER_CLOSE_TOKEN": close_token},
             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=errors, text=True,
             start_new_session=True,
         ))
@@ -851,7 +854,7 @@ class SharedStaffOwner:
                 if port:
                     with socket.create_connection(("127.0.0.1", int(port)), timeout=TEST_HANG_GUARD_SECS) as connection:
                         connection.settimeout(max(0, deadline - time.monotonic()))
-                        connection.sendall(b"null\n")
+                        connection.sendall(json.dumps({"close": close_token}).encode() + b"\n")
                 _ = process.wait(timeout=max(0, deadline - time.monotonic()))
             except (OSError, subprocess.TimeoutExpired):
                 try:

@@ -217,6 +217,21 @@ class SharedStaffOwnerTests(unittest.TestCase):
             self.assertEqual(parent.returncode, 0)
             self.assertTrue(owner_exited(OWNER_EXIT_SECONDS), "The staff owner survived close()")
 
+    def test_owner_serves_requests_after_invalid_close(self) -> None:
+        script = self.root / "echo-request.py"
+        _ = script.write_text('print("fixture request")\n')
+        with self.owner() as (parent, port, owner_pid, _), watch_exit(owner_pid) as owner_exited:
+            for payload in (b'{"close":"wrong"}\n', b"null\n"):
+                with socket.create_connection(("127.0.0.1", port), timeout=OWNER_START_SECONDS) as connection:
+                    connection.sendall(payload)
+                    self.assertEqual(connection.recv(1), b"")
+            with self.request(port, script) as connection, connection.makefile("rb") as channel:
+                result = cast(dict[str, object], json.loads(channel.readline()))
+                self.assertEqual(result, {"status": 0, "stdout": "fixture request\n", "stderr": ""})
+            self.assertFalse(owner_exited(OWNER_CLOSE_OBSERVE_SECONDS), "An invalid close stopped the staff owner")
+            _ = parent.communicate(timeout=OWNER_EXIT_SECONDS)
+            self.assertEqual(parent.returncode, 0)
+
 
 PREPARE = '''
 import os
