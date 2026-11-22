@@ -123,6 +123,7 @@ with mock.patch.object(scratch.time, "sleep", side_effect=announce_wait):
         repo = copies / "show-maker" / "21-gate"
         repo.parent.mkdir(parents=True)
         _ = self.git(self.checkout, "clone", str(self.checkout), str(repo))
+        self.write(repo / ".scratch.json", json.dumps({"task": "gate:fixture"}))
         _ = self.git(repo, "merge", "--no-edit", self.checkpoint)
         merged = self.git(repo, "rev-parse", "HEAD")
         self.assertNotEqual(merged, self.base)

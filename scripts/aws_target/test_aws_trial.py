@@ -464,6 +464,7 @@ from pathlib import Path
 prefix = Path('/sys/fs/cgroup/fixture/builds.slice')
 root = Path({str(scopes)!r})
 old_open, old_iterdir, old_realpath = Path.open, Path.iterdir, os.path.realpath
+old_os_open = os.open
 old_write = Path.write_text
 def mapped(path):
     return root / path.relative_to(prefix) if path.is_relative_to(prefix) else path
@@ -482,11 +483,20 @@ def live_members(path):
                 members.append(member)
     return members
 def fixture_open(path, *args, **kwargs):
-    if path.is_relative_to(prefix) and path.name == 'cgroup.procs' and args and args[0] == 'r':
+    mode = args[0] if args else kwargs.get('mode', 'r')
+    if path.is_relative_to(prefix) and path.name == 'cgroup.procs' and mode == 'r':
         return io.StringIO(' '.join(live_members(path)))
     if path == Path('/proc/self/cgroup') and 'FIXTURE_GIT_SCOPE' in os.environ:
         return io.StringIO('0::/fixture/builds.slice/' + os.environ['FIXTURE_GIT_SCOPE'] + '\n')
     return old_open(mapped(path), *args, **kwargs)
+def fixture_os_open(file, flags, *args, **kwargs):
+    if isinstance(file, (str, Path)):
+        path = Path(file)
+        if path.is_relative_to(prefix) and path.name == 'cgroup.events':
+            population = '1' if live_members(path.with_name('cgroup.procs')) else '0'
+            file = mapped(path)
+            old_write(file, 'populated ' + population + '\n')
+    return old_os_open(file, flags, *args, **kwargs)
 def fixture_iterdir(path):
     return old_iterdir(mapped(path))
 def fixture_realpath(path, *args, **kwargs):
@@ -504,6 +514,7 @@ def fixture_write(path, data, *args, **kwargs):
     return old_write(path, data, *args, **kwargs)
 Path.open, Path.iterdir, os.path.realpath = fixture_open, fixture_iterdir, fixture_realpath
 Path.write_text = fixture_write
+os.open = fixture_os_open
 ''')
         systemd_run = self.root / 'systemd-run'
         _ = systemd_run.write_text(f'''#!{sys.executable}
