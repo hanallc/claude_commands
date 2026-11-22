@@ -1014,6 +1014,70 @@ class HoldEnforcerTests(unittest.TestCase):
                 result = detached_runs.result_text(saved, detached_runs.command_result(saved))
                 self.assertIn(f"Result: STOPPED (exit {exit_code})", result)
 
+    def test_release_recovers_a_slice_stop_after_the_enforcer_exits(self) -> None:
+        holder, = build_hold.natedev_holds(self.holders).in_force
+        runs = self.root / detached_runs.DETACHED_RUNS_DIR
+        runs.mkdir()
+        record = runs / "recover-slice-stop.json"
+        self.write_detached_run(record, command_started=True)
+        cgroups = self.root / "cgroups"
+        scope = cgroups / "builds.slice/builds-detached.slice/builds-detached-hold.slice"
+        scope.mkdir(parents=True)
+        events = scope / "cgroup.events"
+        _ = events.write_text("populated 1\n")
+        stat = scope.stat()
+        identity: process_stop.RunSliceIdentity = {
+            "unit": scope.name, "path": "/" + str(scope.relative_to(cgroups)),
+            "device": stat.st_dev, "inode": stat.st_ino,
+        }
+        saved = cast(detached_runs.RunRecord, json.loads(record.read_text()))
+        saved["command_slice"] = identity
+        write_text_atomic(record, json.dumps(saved))
+        _ = self.process(100, "python3", start=10_000,
+                         argv=("python3", "detached_runs.py", "supervise", str(record)))
+        _ = self.process(10, "bash", parent=100, argv=("bash", "verify.sh", "check"),
+                         environment={"CODEX_THREAD_ID": "recover-worker"})
+        table = self.table()
+        waiting = hold_enforcer.WaitingRun(table[10], OwningSession("recover-worker"))
+
+        def send_term(_directory: int, saved_scope: process_stop.RunSliceIdentity) -> None:
+            self.assertEqual(saved_scope, identity)
+            _ = events.write_text("populated 0\n")
+
+        with (isolated_staff_file(self.root / "staff.json", {}),
+              mock.patch.object(process_stop, "CGROUP_ROOT", cgroups),
+              mock.patch.object(process_stop, "supported", return_value=True),
+              mock.patch("scripts.agents.detached_run_process.supervises", return_value=False),
+              mock.patch.object(detached_runs, "_scope_stop_graces", return_value=(0.0, 0.0)),
+              mock.patch.object(detached_runs, "_complete_stopped_run", return_value="sent: private fixture"),
+              mock.patch.object(process_stop, "_term_slice", side_effect=send_term) as term):
+            with (mock.patch.object(process_stop, "stop_slice", side_effect=SystemExit("enforcer exited")),
+                  self.assertRaisesRegex(SystemExit, "enforcer exited")):
+                _ = hold_enforcer.stop_waiting_run(
+                    waiting, holder, table, self.proc,
+                    signal_process=lambda pid, signum: self.fail(f"unexpected process signal {pid} {signum}"),
+                )
+            term.assert_not_called()
+            row, = self.rows()
+            self.assertEqual(row["stop_status"], "requested")
+            request_id = cast(str, row["stop_request_id"])
+            confirmation = build_hold.stop_confirmation_path(request_id)
+            self.assertFalse(confirmation.exists())
+            self.assertFalse(detached_runs.confirms_hold_stop(record, record.stem, request_id))
+            self.assertEqual(detached_runs.reap_orphans(str(self.root)), [record.stem])
+            term.assert_called_once()
+            self.assertTrue(process_stop.slice_has_ended(identity))
+
+            with mock.patch.object(build_hold, "send_release_to", return_value=build_hold.ReleaseDelivered()) as send:
+                self.assertEqual(build_hold.release_cycle(self.holders, holder.key), "released, builds may resume.")
+                self.assertEqual(build_hold.release_cycle(self.holders, holder.key), "hold is already released.")
+        self.assertTrue(detached_runs.confirms_hold_stop(record, record.stem, request_id))
+        send.assert_called_once()
+        self.assertEqual(cast(str, send.call_args.args[1]), "codex:recover-worker")
+        notice = cast(str, send.call_args.args[2])
+        self.assertIn("Restart the stopped run bash verify.sh check for ", notice)
+        self.assertIn(f"Run ID {record.stem}.", notice)
+
     def test_failed_hold_stop_does_not_resume_after_release(self) -> None:
         self.assert_no_hold_commit(interrupted=False)
 

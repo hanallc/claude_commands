@@ -115,6 +115,7 @@ class DetachedRunKind(StrEnum):
 
 
 class RunRecord(StopFields):
+    pending_hold_stop_requests: NotRequired[list[str]]
     run_id: str
     status: Literal["running", "finished"]
     session_dir: str
@@ -244,7 +245,8 @@ def _write_record(path: Path, record: RunRecord) -> RunRecord:
             fields["delivery"] = delivery
         stop_fields = ("stop_reason", "hold_stop_requests", "stop_pass_requested", "self_stop")
         if _has_saved_cgroup(current):
-            stop_fields += ("scope_error", "slice_leftovers", "slice_cleanup_pending", "stop_notice_id")
+            stop_fields += ("scope_error", "slice_leftovers", "slice_cleanup_pending", "stop_notice_id",
+                            "pending_hold_stop_requests")
         saved = cast(Mapping[str, object], current)
         for key in stop_fields:
             if key in saved:
@@ -297,6 +299,9 @@ def _is_run_record(raw: dict[str, object]) -> TypeGuard[RunRecord]:
                             for key in ("supervisor_started", "command_started", "tree_key", "finished_at",
                                         "delivery", "ended", "stop_reason", "scope_error", "stop_notice_id"))
                     and ("hold_stop_requests" not in raw or _is_hold_stop_requests(raw["hold_stop_requests"]))
+                    and ("pending_hold_stop_requests" not in raw or (
+                        raw.get("stop_pass_requested") is True and "command_slice" in raw
+                        and _is_hold_stop_requests(raw["pending_hold_stop_requests"])))
                     and ("delivered_at" not in raw or type(raw["delivered_at"]) in (int, float))
                     and ("completion_pending" not in raw or isinstance(raw["completion_pending"], bool))
                     and ("command_slice" not in raw or process_stop.is_slice_identity(raw["command_slice"]))
@@ -495,7 +500,7 @@ def _scope_stop_graces() -> tuple[float, float]:
 
 def _finish_slice_stop(
     path: Path, run_slice: process_stop.RunSliceIdentity, *, ended: bool,
-    grace: float, kill_grace: float, cleanup: bool = False, commit_synced: bool = False, hold_request_id: str = "",
+    grace: float, kill_grace: float, cleanup: bool = False, commit_synced: bool = False,
 ) -> None:
     """Confirm the end of an authorized stop under the stop lock."""
     if not ended:
@@ -508,14 +513,20 @@ def _finish_slice_stop(
         elif not commit_synced:
             atomic_file.sync_folder(path.parent)
         process_stop.stop_slice(run_slice, grace, kill_grace)
+    _confirm_slice_end(path, run_slice)
+
+
+def _confirm_slice_end(path: Path, run_slice: process_stop.RunSliceIdentity) -> None:
+    """Confirm pending hold requests after the caller verifies the slice ended."""
     with record_lock(path):
         record = _read_record(path)
         if record.get("command_slice") != run_slice:
             raise process_stop.SliceStopFailed("the saved run slice changed during the stop")
         cleanup_pending = record.pop("slice_cleanup_pending", False)
-        if hold_request_id:
-            record["hold_stop_requests"] = [*record.get("hold_stop_requests", []), hold_request_id]
-        if cleanup_pending or hold_request_id:
+        pending_requests = record.pop("pending_hold_stop_requests", [])
+        if pending_requests:
+            record["hold_stop_requests"] = list(dict.fromkeys([*record.get("hold_stop_requests", []), *pending_requests]))
+        if cleanup_pending or pending_requests:
             write_text_atomic(path, json.dumps(record, indent=2, sort_keys=True))
 
 
@@ -561,15 +572,21 @@ def _stop_slice_command(
             if record is None or record.get("command_slice") != run_slice or record["status"] != "running" or not check():
                 return False
             recovered_commit = bool(record.get("stop_pass_requested"))
-            if ended and (not recovered_commit or hold_request_id):
+            pending_requests = record.get("pending_hold_stop_requests", [])
+            new_hold_request = (bool(hold_request_id) and hold_request_id not in pending_requests
+                                and hold_request_id not in record.get("hold_stop_requests", []))
+            if ended and (not recovered_commit or new_hold_request):
                 return False
             if not recovered_commit:
                 record.update(stop_reason=reason, stop_pass_requested=True)
                 if stop_notice_id:
                     record["stop_notice_id"] = stop_notice_id
+            if new_hold_request:
+                record["pending_hold_stop_requests"] = [*pending_requests, hold_request_id]
+            commit_synced = not recovered_commit or new_hold_request
+            if commit_synced:
                 write_text_atomic(path, json.dumps(record, indent=2, sort_keys=True))
-        _finish_slice_stop(path, run_slice, ended=ended, grace=grace, kill_grace=kill_grace,
-                           commit_synced=not recovered_commit, hold_request_id=hold_request_id)
+        _finish_slice_stop(path, run_slice, ended=ended, grace=grace, kill_grace=kill_grace, commit_synced=commit_synced)
     return True
 
 
@@ -908,7 +925,7 @@ def _reap_orphans_locked(runs: Path, worker: str = "") -> OrphanReapResult:
                 record = _read_record(path)
                 if _has_saved_cgroup(record) and not scope_lock.enter_context(_scope_stop_lock(path, blocking=False)):
                     continue
-                if not _orphaned(path, record, now):
+                if record.get("pending_hold_stop_requests") or not _orphaned(path, record, now):
                     continue
                 record = _recover_staged_pane_stop(path, record)
             newer = any(other.get("worker") == record["worker"] and other.get("command") == record["command"]
@@ -2030,6 +2047,9 @@ def command_deliver(args: argparse.Namespace) -> int:
             if not _command_has_ended(record, record["pid"]):
                 print(f"detached_runs: {record['run_id']}: the run slice has no confirmed end", file=sys.stderr)
                 return 1
+            if record.get("pending_hold_stop_requests") and (run_slice := record.get("command_slice")):
+                _confirm_slice_end(record_path, run_slice)
+                record = _read_record(record_path)
     if record.get("stop_pass_requested") and record["status"] != "finished" and not record.get("scope_error"):
         if "exit_code" not in record:
             print(f"detached_runs: {record['run_id']}: the stopped command has no confirmed exit", file=sys.stderr)
