@@ -66,7 +66,7 @@ class QueueMoveTests(unittest.TestCase):
             _ = fixture.run_pass()
             self.assertEqual(set(fixture.server.reservations), {second.episode})
 
-    def test_move_after_release_transfers_the_claim_and_starts_the_earlier_row(self) -> None:
+    def test_move_after_release_reassigns_the_slot_on_the_next_pass(self) -> None:
         with AdmissionFixture() as fixture:
             run = fixture.run_owner()
             running = fixture.request(run=run, need=4 * GIB)
@@ -89,13 +89,135 @@ class QueueMoveTests(unittest.TestCase):
             moved, = fixture.server.handle_request(wire.QueueMoveRequest(
                 "move-after-release", second_id, line.revision, wire.QueueDrop(first_id, "before")))
             assert isinstance(moved, wire.QueueMoved)
-            claim = fixture.server.slots[grant.reservation]
-            assert isinstance(claim, records.ContinuationSlot)
-            self.assertEqual(claim.owner, records.run_owner(second.owner.pid, second.owner.start_time))
+            self.assertEqual(fixture.server.slots[grant.reservation], claim.slot)
             _ = fixture.run_pass()
             self.assertEqual(set(fixture.server.reservations), {second.episode})
             self.assertEqual(ids(move_line(fixture)), [first_id])
             self.assertIn(first.episode, fixture.server.waiters)
+
+    def test_move_reassigns_both_slots_when_the_earlier_wait_needs_the_larger_slot(self) -> None:
+        with AdmissionFixture() as fixture:
+            run = fixture.run_owner()
+            large, = fixture.server.handle_request(fixture.request(run=run, need=8 * GIB))
+            assert isinstance(large, wire.Admitted)
+            fixture.allow_next_start()
+            small, = fixture.server.handle_request(fixture.request(run=run, need=4 * GIB))
+            assert isinstance(small, wire.Admitted)
+            fixture.free(0)
+            fixture.hold_starts()
+            first, second = [fixture.request(run=run, need=8 * GIB, since=fixture.clock.now() + index)
+                             for index in (1, 2)]
+            for request in (first, second):
+                self.assertIsInstance(fixture.server.handle_request(request)[0], wire.Wait)
+            line = move_line(fixture)
+            first_id, second_id = ids(line)
+            fixture.release(large)
+            fixture.clock.advance(0.1)
+            fixture.release(small)
+            large_claim = fixture.server.slots[large.reservation]
+            small_claim = fixture.server.slots[small.reservation]
+            assert isinstance(large_claim, records.ContinuationSlot)
+            assert isinstance(small_claim, records.ContinuationSlot)
+            self.assertEqual(large_claim.owner, records.run_owner(first.owner.pid, first.owner.start_time))
+            self.assertEqual(small_claim.owner, records.run_owner(second.owner.pid, second.owner.start_time))
+
+            moved, = fixture.server.handle_request(wire.QueueMoveRequest(
+                "move-two-slots", second_id, line.revision, wire.QueueDrop(first_id, "before")))
+            assert isinstance(moved, wire.QueueMoved)
+            result = fixture.run_pass()
+            self.assertEqual(set(fixture.server.reservations), {second.episode})
+            self.assertEqual(result.rows[0].decision.room.basis, records.WithinSlot())
+            self.assertEqual(ids(move_line(fixture)), [first_id])
+            claim = fixture.server.slots[small.reservation]
+            assert isinstance(claim, records.ContinuationSlot)
+            self.assertEqual(claim.owner, large_claim.owner)
+
+    def test_undo_returns_a_slot_claimed_after_the_move(self) -> None:
+        with AdmissionFixture() as fixture:
+            run = fixture.run_owner()
+            grant, = fixture.server.handle_request(fixture.request(run=run, need=4 * GIB))
+            assert isinstance(grant, wire.Admitted)
+            fixture.free(0)
+            fixture.hold_starts()
+            first, second = [fixture.request(run=run, need=4 * GIB, since=fixture.clock.now() + index)
+                             for index in (1, 2)]
+            for request in (first, second):
+                self.assertIsInstance(fixture.server.handle_request(request)[0], wire.Wait)
+            line = move_line(fixture)
+            first_id, second_id = ids(line)
+            moved, = fixture.server.handle_request(wire.QueueMoveRequest(
+                "move-before-release", second_id, line.revision, wire.QueueDrop(first_id, "before")))
+            assert isinstance(moved, wire.QueueMoved)
+            fixture.release(grant)
+            claim = fixture.server.slots[grant.reservation]
+            assert isinstance(claim, records.ContinuationSlot)
+            self.assertEqual(claim.owner, records.run_owner(second.owner.pid, second.owner.start_time))
+
+            undone, = fixture.server.handle_request(wire.QueueMoveRequest(
+                "undo-before-pass", second_id, moved.line.revision, wire.QueueUndo("move-before-release")))
+            assert isinstance(undone, wire.QueueMoved)
+            self.assertEqual(fixture.server.slots[grant.reservation], claim.slot)
+            _ = fixture.run_pass()
+            self.assertEqual(set(fixture.server.reservations), {first.episode})
+            self.assertEqual(ids(move_line(fixture)), [second_id])
+
+    def test_move_ahead_of_a_mac_start_keeps_its_local_fallback_slot(self) -> None:
+        with PlacementFixture() as fixture:
+            run = fixture.run_owner()
+            slot_key = fixture.finish_step(fixture.request(run=run, need=8 * GIB)).reservation
+            fixture.free(0)
+            fixture.hold_starts()
+            folder = placement.CargoFolder(fixture.root / "target")
+            mac = placement_request(fixture, since=fixture.clock.now() - 10)
+            mac = replace(mac, run=run, prerequisite=placement.TokenNotRequired(), constraints=replace(
+                mac.constraints, candidates=(*mac.constraints.candidates, local_candidate(fixture)), cargo_folder=folder))
+            _ = publish_candidate(fixture, mac)
+            assignment = assignment_for(fixture, mac)
+            self.assertEqual(assignment.destination.provider, "mac")
+            claim = fixture.server.slots[slot_key]
+            assert isinstance(claim, records.ContinuationSlot)
+            self.assertEqual(claim.owner, records.run_owner(mac.owner.pid, mac.owner.start_time))
+
+            later = placement_request(fixture)
+            later = replace(later, prerequisite=placement.TokenNotRequired(), constraints=replace(
+                later.constraints, candidates=(local_candidate(fixture),), cargo_folder=folder))
+            self.assertIsInstance(fixture.server.handle_request(later)[0], wire.PlacementWait)
+            line = move_line(fixture)
+            mac_row, later_row = line.members
+            self.assertFalse(mac_row.movable)
+            moved, = fixture.server.handle_request(wire.QueueMoveRequest(
+                "move-ahead-of-mac", later_row.row_id, line.revision, wire.QueueDrop(mac_row.row_id, "before")))
+            assert isinstance(moved, wire.QueueMoved)
+            self.assertEqual(moved.line.members, (later_row, mac_row))
+            self.assertEqual(fixture.server.slots[slot_key], claim)
+            result = fixture.run_pass()
+            self.assertEqual(result.rows[1].owner, claim.owner)
+            self.assertIsInstance(result.rows[1].decision.order_hold, records.HeldBehindHead)
+            self.assertEqual(fixture.server.slots[slot_key], claim)
+            room = result.policy.room
+            assert isinstance(room, records.MemoryRoom)
+            self.assertEqual(result.rows[0].decision.room.room, room.signed_room)
+
+            fixture.free(32 * GIB)
+            write_pressure_reading(fixture.root / "pressure")
+            fixture.allow_next_start()
+            _ = fixture.run_pass()
+            local, = fixture.server.handle_request(later)
+            assert isinstance(local, wire.LocalPlacementGranted)
+            self.assertEqual(fixture.server.slots[slot_key], claim)
+            _ = fixture.run_pass()
+            self.assertEqual(fixture.server.slots[slot_key], claim)
+            fixture.release(local.grant)
+
+            _ = publish_candidate(fixture, mac, placement.TemporaryExclusion("busy"))
+            refused, = fixture.server.handle_request(wire.ClaimFailure("mac-busy", assignment, "busy"))
+            assert isinstance(refused, wire.DispatchStatus)
+            self.assertEqual(refused.state, placement.ClosedAssignment("busy"))
+            self.assertEqual(fixture.server.slots[slot_key], claim)
+            fixture.free(0)
+            fixture.hold_starts()
+            _ = fixture.run_pass()
+            self.assertIsInstance(fixture.server.handle_request(mac)[0], wire.LocalPlacementGranted)
 
     def test_tail_drag_keeps_held_ci_at_the_head_of_the_saved_snapshot(self) -> None:
         with AdmissionFixture() as fixture:

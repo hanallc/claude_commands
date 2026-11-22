@@ -6,7 +6,7 @@ except FileNotFoundError:
     pass
 
 from collections import deque
-from collections.abc import Collection, Generator, Mapping
+from collections.abc import Generator, Mapping
 from concurrent.futures import Future
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -1730,7 +1730,8 @@ class AdmissionServer:
                    and isinstance(request.constraints.cargo_folder, placement.CargoFolder)}
         if occupied:
             for key, slot in list(self.slots.items()):
-                if isinstance(slot, records.ContinuationSlot) and folders.get(slot.owner) in occupied:
+                if (isinstance(slot, records.ContinuationSlot) and slot.owner not in inputs.pending_remote_starts
+                        and folders.get(slot.owner) in occupied):
                     del self.slots[key]
         return replace(remaining, slots=tuple(self.slots.values()), cargo_folders=folders,
                        occupied_cargo_folders=occupied)
@@ -1955,9 +1956,9 @@ class AdmissionServer:
         return [(path, gate.rank_waiter(ci_waiters[path], records.waiter_priority(row))
                  if path in ci_waiters else row) for path, row in ranked]
 
-    def _current_move_line(self, rows: list[tuple[Path, records.RankedWaiter]]) -> records.QueueMoveLine:
-        active = self._movable_wait_ids()
-        members = tuple(records.QueueMoveMember(row_id, movable=row_id in active)
+    def _current_move_line(self, rows: list[tuple[Path, records.RankedWaiter]],
+                           movable: set[str]) -> records.QueueMoveLine:
+        members = tuple(records.QueueMoveMember(row_id, movable=row_id in movable)
                         for _, row in rows if (row_id := row.get("move_id")))
         return self._revise_move_line(members)
 
@@ -1996,16 +1997,22 @@ class AdmissionServer:
                 else:
                     del self.slots[key]
 
-    def _claim_slots(self, ordered: list[tuple[Path, records.RankedWaiter]], *,
-                     movable: Collection[str] = ()) -> None:
+    def _return_waiting_claims(self) -> None:
+        for episode, waiting in self.waiters.items():
+            if episode in self.current_assignments or episode in self.reservations:
+                continue
+            claim = waiting.continuation_claim
+            if isinstance(claim, records.ContinuationSlot) and self.slots.get(claim.slot.reservation) is claim:
+                self.slots[claim.slot.reservation] = claim.slot
+                waiting.continuation_claim = NoContinuationClaim()
+
+    def _claim_slots(self, ordered: list[tuple[Path, records.RankedWaiter]]) -> None:
         claimed = {slot.owner for slot in self.slots.values() if isinstance(slot, records.ContinuationSlot)}
         waiters = {records.waiter_owner(item.row): item for item in self.waiters.values()}
-        movable_positions = {records.waiter_owner(row): position for position, (_, row) in enumerate(ordered)
-                             if row.get("move_id", "") in movable and gate.can_use_natedev(row)}
-        for position, (_, row) in enumerate(ordered):
+        for _, row in ordered:
             owner = records.waiter_owner(row)
             waiting = waiters.get(owner)
-            if waiting is None or (movable and owner not in movable_positions):
+            if waiting is None:
                 continue
             request = waiting.request
             saved = self.assignments.get(self.current_assignments.get(request.episode, ""))
@@ -2020,19 +2027,12 @@ class AdmissionServer:
                 continue
             if owner in claimed or isinstance(gate.waiter_state(waiting.row), records.TokenWaitingWaiter):
                 continue
-            candidates = [(key, slot) for key, state in self.slots.items()
-                          if (isinstance(state, records.BetweenStepsSlot)
-                              or movable_positions.get(state.owner, -1) > position)
-                          and (slot := gate.between_steps(state)).run.pid == request.run.pid
-                          and slot.run.start_time == request.run.start_time
-                          and (not movable or row["need"] <= slot.bytes)]
+            candidates = [(key, slot) for key, slot in self.slots.items()
+                          if isinstance(slot, records.BetweenStepsSlot) and slot.run.pid == request.run.pid
+                          and slot.run.start_time == request.run.start_time]
             if not candidates:
                 continue
             key, slot = min(candidates, key=lambda item: (item[1].expires_at, item[0]))
-            previous = self.slots[key]
-            if isinstance(previous, records.ContinuationSlot):
-                claimed.discard(previous.owner)
-                waiters[previous.owner].continuation_claim = NoContinuationClaim()
             claim = records.ContinuationSlot(slot, owner)
             self.slots[key] = claim
             waiting.continuation_claim = claim
@@ -2602,7 +2602,8 @@ class AdmissionServer:
                 self.assignments[key] = replace(self.assignments[key], permission=placement.PermissionConsumed(inputs.now))
                 if isinstance(cargo_folder, placement.CargoFolder):
                     for slot_key, slot in list(self.slots.items()):
-                        if isinstance(slot, records.ContinuationSlot) and inputs.cargo_folders.get(slot.owner) == cargo_folder:
+                        if (isinstance(slot, records.ContinuationSlot) and slot.owner not in inputs.pending_remote_starts
+                                and inputs.cargo_folders.get(slot.owner) == cargo_folder):
                             del self.slots[slot_key]
             proposed = cast(gate.ProposedAdmission, decision.admission)
             self.spacing = proposed.spacing
@@ -2892,8 +2893,8 @@ class AdmissionServer:
                 job=row.get("job", GATE_JOB_NOT_RECORDED), ci_runner=row.get("ci_runner", ""),
                 verify=row.get("verify", records.NotVerifyCall()), placement_targets=targets,
                 speculative_copy=request is not None and isinstance(request.purpose, placement.SpeculativeCopy)))
-        reading = replace(reading, ordered=ordered,
-            view=replace(reading.view, waiting=tuple(visible), move_line=self._current_move_line(ordered)))
+        move_line = self._current_move_line(ordered, self._movable_wait_ids())
+        reading = replace(reading, ordered=ordered, view=replace(reading.view, waiting=tuple(visible), move_line=move_line))
         reading = self._placement_reading(reading)
         reading = self._cloud_reading(reading, self.configuration)
         view = wire.ViewReply(reading)
@@ -4898,10 +4899,7 @@ done
         if isinstance(self.configuration, gate.UnusableAdmissionConfiguration):
             return [wire.Refused(self.configuration.reason)]
         rows, _ = self._queue_order()
-        active = self._movable_wait_ids(check_owners=True)
-        members = tuple(records.QueueMoveMember(row_id, movable=row_id in active)
-                        for _, row in rows if (row_id := row.get("move_id")))
-        line = self._revise_move_line(members)
+        line = self._current_move_line(rows, self._movable_wait_ids(check_owners=True))
         undo = None
         if isinstance(destination := request.destination, wire.QueueUndo):
             saved = self.ledger.get("queue-move:" + destination.move_request_id)
@@ -4909,9 +4907,7 @@ done
                 undo = saved.reply
         result = self._move_destination(request, line, undo)
         if isinstance(result, wire.QueueMoved):
-            if self.slots:
-                self._prune_runs()
-                self._claim_slots(self._queue_order()[0], movable=active)
+            self._return_waiting_claims()
             self.pass_stale = True
             self.next_pass = self.clock.monotonic()
         return self._mutation_reply(key, result)

@@ -2382,7 +2382,9 @@ It inserts present pinned waits in place order and clamps each insertion to the 
 Placement, memory admission, and continuation claims filter the same queue order.
 The page, client replies, and the head-stall snapshot also filter that order.
 When run times tie, the earlier step arrival comes first. PID breaks a tie in step arrival.
-A move can transfer a continuation claim to an earlier step that fits the slot.
+A confirmed move or Undo releases claims for steps that still wait for admission or placement.
+The next admission pass assigns free slots in the shared order.
+An active remote startup keeps its local fallback claim even when another step moves ahead.
 A request that starts or ends removes one place from pins behind it in the full order.
 The full order includes absent requests and applies their pins.
 An absent step keeps its run identity to recover the run's saved queue time.
