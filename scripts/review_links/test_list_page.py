@@ -43,7 +43,7 @@ from scripts.production import change_review, change_routing, delivery_state, in
 from scripts.production.update_registration import QuestionStaff
 from scripts.review_links import console, list_page, page_frame, serve, staff_names
 from scripts.review_links import change_browser, change_page, new_item_dialog, page_question, question_record
-from scripts.review_links import review_items, review_page
+from scripts.review_links import review_items, review_page, review_submissions
 from scripts.review_links.test_change_page import BrowserForms
 from scripts.review_links.test_page_frame import assert_status_states
 from scripts.review_links.test_record_table import save_notice_failures
@@ -2140,12 +2140,13 @@ document.body.append(result);
             "eta": the_list.EtaRange(NOW + timedelta(hours=1), NOW + timedelta(hours=2))})
 
     def fixture_items(self) -> list[the_list.ListItem]:
-        items = [self.add("Remove the mesh code", the_list.ItemState.WAITING_FOR_NATE, number=58),
-                 self.add("Console status", number=105, owner=OTHER.id, next_check=NOW - timedelta(minutes=10)),
-                 self.add("The List in the console Straße", number=106, next_check=NOW + timedelta(hours=1)),
-                 self.add("Shared documentation structure", the_list.ItemState.PAUSED, number=41),
-                 self.add("Read the delivered page", the_list.ItemState.DONE, number=63),
-                 self.add("Removed task", number=54)]
+        paused = self.add("Shared documentation structure", the_list.ItemState.PAUSED, number=41)
+        removed = self.add("Removed task", number=54)
+        waiting = self.add("Remove the mesh code", the_list.ItemState.WAITING_FOR_NATE, number=58)
+        done = self.add("Read the delivered page", the_list.ItemState.DONE, number=63)
+        status = self.add("Console status", number=105, owner=OTHER.id, next_check=NOW - timedelta(minutes=10))
+        latest = self.add("The List in the console Straße", number=106, next_check=NOW + timedelta(hours=1))
+        items = [waiting, status, latest, paused, done, removed]
         _ = the_list.mark_read(MORTY.id, items[0].id, source="nate")
         _ = the_list.update(MORTY.id, items[1].id, {"producer": DWIGHT.id}, source="morty")
         _ = the_list.update(MORTY.id, items[3].id, {"producer": DWIGHT.id}, source="morty")
@@ -2192,11 +2193,11 @@ document.body.append(result);
         self.assertEqual(body.count('value="read">Mark read</button>'), 5)
         self.assertEqual([entry.item.number for entry in list_page.records()],
                          [item.number for item in sorted(the_list.records(MORTY.id), key=the_list.order)])
-        parked = self.add("Check the delivery", the_list.ItemState.WAITING_FOR_NATE, number=59)
+        parked = self.add("Check the delivery", the_list.ItemState.WAITING_FOR_NATE)
         _ = the_list.park(MORTY.id, parked.id, the_list.ParkUntilDelivered.DELIVERED, source="nate")
         parked_markup = list_page.render(self.root / "reviews").decode()
         self.assertEqual(re.findall(r'<tbody data-list-item [^>]*data-number="(\d+)"', parked_markup),
-                         ["58", "105", "106", "63", "59", "41"])
+                         ["58", "105", "106", "63", "107", "41"])
         self.assertNotIn(f'data-key="{MORTY.id}/L54"', body)
         self.assertNotIn('<h3>Closing words</h3>', body)
         _ = the_list.reopen(MORTY.id, "L54", source="nate")
@@ -2963,6 +2964,32 @@ window.fetch=(url,options)=>{
             list_page.deliver(list_page.submit(root, urlencode(fields)))
             send.assert_called_once()
             self.assertEqual(the_list.load(MORTY.id, item.id), saved)
+
+    def test_page_adds_to_the_same_sequence_after_remove(self) -> None:
+        first = self.add("Keep the first item", number=206)
+        removed = self.add("Remove the highest item", number=207)
+        root = self.root / "reviews"
+        _ = list_page.submit(root, urlencode(self.fields(removed, "remove")))
+        saved = the_list.load(MORTY.id, removed.id)
+        self.assertEqual(saved.state, the_list.ItemState.CLOSED)
+        self.assertEqual(saved.log[:-2], removed.log)
+        self.assertEqual([entry.item.id for entry in list_page.records()], [first.id])
+
+        for number, recipient in enumerate((DWIGHT, MORTY), start=208):
+            native = investigation.Investigation("I1", recipient.id, "Read the result",
+                investigation.InvestigationState.OPEN, "", "", "", "Read the result.", "")
+            key = f"{recipient.id}/I1"
+            path = self.root / f"{recipient.name}-I1.md"
+            saved_submission = review_submissions.SavedSubmission(
+                "I1", new_item_dialog.SubmissionKind.INVESTIGATION, recipient.id, str(number), "",
+                path, path, recipient.id, native)
+            published = review_page.PublishedSubmission(saved_submission, key, "fixture-version")
+            entry = list_page.add_submission(published)
+            self.assertEqual((entry.key, entry.item.producer, entry.item.reviews),
+                             (f"{MORTY.id}/L{number}", recipient.id, (key,)))
+            self.assertEqual(list_page.add_submission(published), entry)
+        self.assertFalse(the_list.folder(DWIGHT.id).exists())
+        self.assertEqual(the_list.load(MORTY.id, removed.id), saved)
 
     def test_park_writes_the_date_before_delivery_and_repeated_requests_do_nothing(self) -> None:
         item = self.add("Park this item now")
@@ -3844,13 +3871,13 @@ window.fetch=async(_path,options={})=>{
                 'data-feedback-form>', 'data-feedback-form style="min-height:1100px">')
 
         initial = page()
-        for number in range(1, 6):
+        for number in range(28, 33):
             _ = self.add(f'New List item {number}', number=number)
         _ = the_list.update(MORTY.id, 'L15', {
             'latest_status': 'The fresh List result.\n\nThe build report has another paragraph.',
         }, source='morty')
         fresh = page()
-        for number in (*range(1, 6), *range(7, 15), *range(16, 28)):
+        for number in (*range(7, 15), *range(16, 33)):
             _ = the_list.close(MORTY.id, f'L{number}', 'The work has finished.', source='nate')
         shorter = page()
         _ = the_list.close(MORTY.id, 'L15', 'The work has finished.', source='nate')
@@ -3909,7 +3936,7 @@ window.fetch=async(_path,options={})=>{
  const before=height();
  await refreshList(FRESH_PAGE);
  const updates=dialog.querySelector('[data-show-record-updates]');
- check(height()>before && document.querySelector('[data-number="1"]') &&
+ check(height()>before && document.querySelector('[data-number="28"]') &&
   dialog.open && Math.abs(formTop()-offset)<1 && detail.querySelector('textarea').value==='Keep these words.' &&
   !detail.textContent.includes('The fresh List result.') && !updates.hidden,
   'A longer status and more rows keep the displayed form and draft in place.');

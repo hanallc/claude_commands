@@ -98,23 +98,27 @@ def page_url() -> str:
 
 def add_submission(created: review_page.PublishedSubmission) -> ListRecord:
     """Save the List row once and link it to the native Review item."""
-    keeper = created.saved.owner
+    recipient = created.saved.owner
+    members = staff.snapshot()
+    keeper = the_list.producer_id(members, "morty")
     # Keep the saved Evidence URL so a retry can find a row from an earlier version.
     evidence = review_page.PAGE_PATH + "?show=all#" + urlencode({"show": "open", "jump": created.saved.key})
     folder = the_list.folder(keeper)
     folder.mkdir(parents=True, exist_ok=True)
     with exclusive(folder / ".new-item.lock"):
-        item = next((item for item in the_list.records(keeper, include_closed=True)
-                     if any(isinstance(entry.what, the_list.FieldChange) and entry.what.action == "Added"
-                            and entry.what.fields.get("evidence") == evidence for entry in item.log)), None)
-        if item is None:
-            words = created.saved.words
-            title = next(line.strip() for line in words.splitlines() if line.strip())[:120].rstrip()
-            item = the_list.add(keeper, title, owner=keeper, source=the_list.PAGE_SOURCE,
-                                changes={"latest_status": words, "evidence": evidence})
-        if item.state != the_list.ItemState.CLOSED and created.key not in item.reviews:
-            item = the_list.link(keeper, item.id, (created.key,), source=the_list.PAGE_SOURCE)
-        return ListRecord(keeper, item)
+        for previous_keeper in dict.fromkeys((keeper, recipient)):
+            for item in the_list.records(previous_keeper, include_closed=True):
+                if any(isinstance(entry.what, the_list.FieldChange) and entry.what.action == "Added"
+                       and entry.what.fields.get("evidence") == evidence for entry in item.log):
+                    if item.state != the_list.ItemState.CLOSED and created.key not in item.reviews:
+                        item = the_list.link(previous_keeper, item.id, (created.key,), source=the_list.PAGE_SOURCE)
+                    return ListRecord(previous_keeper, item)
+        producer = next((row.id for row in staff.active(members, "producer") if row.id == recipient), keeper)
+        words = created.saved.words
+        title = next(line.strip() for line in words.splitlines() if line.strip())[:120].rstrip()
+        item = the_list.add(keeper, title, owner=recipient, source=the_list.PAGE_SOURCE,
+                            changes={"producer": producer, "latest_status": words, "evidence": evidence})
+        return ListRecord(keeper, the_list.link(keeper, item.id, (created.key,), source=the_list.PAGE_SOURCE))
 
 
 def records(*, include_closed: bool = False) -> list[ListRecord]:

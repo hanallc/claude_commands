@@ -746,9 +746,74 @@ class NumberedRecords:
     def lock_path(self) -> Path:
         return self.folder() / ".lock"
 
+    def counter_path(self) -> Path:
+        return self.folder() / ".next-number"
+
+    def require_list_keeper(self) -> None:
+        keepers = [row.id for row in staff.active(staff.snapshot(), "producer") if row.name == "morty"]
+        if self.collection != "list" or self.prefix != "L" or keepers != [self.owner]:
+            raise self.error_type("only morty's List folder can allocate List numbers")
+
+    @contextmanager
+    def list_allocation(self) -> Generator[None]:
+        """Check the keeper before creating or locking its folder."""
+        with staff.supplied_snapshot(staff.snapshot()):
+            self.require_list_keeper()
+            with self.locked():
+                yield
+
+    def _previous_numbers(self) -> Iterator[int]:
+        """Read record names and the migration log, including closed records."""
+        for owner in state_root().iterdir():
+            if not owner.is_dir() or owner.is_symlink():
+                continue
+            folder = owner / self.collection
+            try:
+                names = [path.name for path in folder.iterdir()]
+            except FileNotFoundError:
+                continue
+            if ".migration-complete.json" in names:
+                log = folder / ".migration-complete.json"
+                try:
+                    data = cast(object, json.loads(log.read_text(encoding="utf-8")))
+                    if not isinstance(data, dict):
+                        raise ValueError("expected an object")
+                    records = cast(dict[str, object], data).get("records")
+                    if not isinstance(records, dict):
+                        raise ValueError("expected a record index")
+                    names.extend(cast(dict[str, object], records))
+                except ValueError as error:
+                    raise self.error_type(f"{log}: invalid migration log: {error}") from error
+            for name in names:
+                identity = name.removesuffix(".md")
+                if identity != name and self.valid_id(identity):
+                    yield int(identity[len(self.prefix):])
+
+    def _saved_next_number(self) -> int:
+        path = self.counter_path()
+        if path.is_symlink():
+            raise self.error_type(f"{path}: expected a regular counter file")
+        try:
+            value = path.read_text(encoding="utf-8").strip()
+        except FileNotFoundError:
+            return 0
+        if re.fullmatch(r"[1-9][0-9]*", value) is None:
+            raise self.error_type(f"{path}: invalid next number")
+        return int(value)
+
     def next_number(self) -> int:
-        paths = source_paths(self.folder(), f"{self.prefix}*.md")
-        return max((int(path.stem[len(self.prefix):]) for path in paths if self.valid_id(path.stem)), default=0) + 1
+        """Read the next number under the store lock."""
+        self.require_list_keeper()
+        number = self._saved_next_number() or max(self._previous_numbers(), default=0) + 1
+        while os.path.lexists(self.path(f"{self.prefix}{number}")):
+            number += 1
+        return number
+
+    def reserve_number(self, number: int) -> None:
+        """Advance the counter before publishing a record under the same lock."""
+        if number < self.next_number():
+            raise self.error_type("the number is below the saved sequence")
+        write_text_atomic(self.counter_path(), f"{number + 1}\n", new_file_mode=0o600)
 
     def invalid(self, identity: str, error: object) -> ValueError:
         return self.error_type(f"{identity}: invalid {self.noun}: {error}")

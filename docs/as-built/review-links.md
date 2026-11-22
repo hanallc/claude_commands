@@ -986,16 +986,19 @@ A confirmed action closes the dialog.
 An unconfirmed action leaves the dialog open and offers **Show updates** for changed details.
 If the item leaves The List, the dialog keeps the last detail and disables the actions.
 
-`/console/list.html` reads the producer's numbered List records on each request.
+`/console/list.html` reads the numbered List records on each request.
 The navigation label is List, and the page title is The List.
 The page uses the shared status line in `page_frame.py`.
 The page owner button opens the shared New item dialog.
 For a new draft, **To** selects the owner configured in `page.list.owner`.
-**Send** saves a Review item and a linked List row for the selected recipient.
+**Send** saves a Review item for the selected recipient and a linked row in morty's List folder.
+When the recipient is a producer, the row assigns the item to that producer.
+The page uses the same counter as the CLI.
 The browser stores the recipient selection with the draft ID and restores both after a reload.
 The user can edit the draft before a retry.
 Each draft ID can file one Review item.
 A retry of a filed draft returns the original item ID and restores a missing List row.
+A retry can reuse a row saved in a former keeper folder.
 A retry can use a new screenshot if the first screenshot expires before filing.
 After a Send that closes the dialog, The List refreshes and opens the saved row.
 If a row save is in progress, the List refreshes when that save ends.
@@ -1085,7 +1088,9 @@ Old records without the reviews field load with no links.
 Each List record stores a `producer`: the fixed staff ID of a staff row with the producer role.
 `the_list.py add` and `update` take `--producer <name or staff id>`.
 The option refuses a name or ID that does not resolve to exactly one current producer row.
-A new item without the option, and an old record without the field, belong to the record keeper, morty.
+Morty's CLI adds assign the item to morty by default.
+Other producers' CLI adds assign the item to the caller.
+Old records without the field use their record keeper.
 The terminal list shows a Producer column after Owner.
 The CLI shows producers only their assigned items. Morty can see every item.
 See the `the_list.py` section of `showrunner-automation.md` for update permissions and assignment notices.
