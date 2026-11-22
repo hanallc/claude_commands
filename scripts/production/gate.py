@@ -2956,7 +2956,7 @@ def mac_linux_gate_placed(mode: SuiteMode, gate_job: StepJob | GateJobNotRecorde
         return (isinstance(status, admission_wire.KnownPlacementStatus)
                 and isinstance(status.state, placement.CurrentAssignment)
                 and status.assignment == saved)
-    except (OSError, ValueError, admission_wire.AdmissionUnavailable):
+    except (OverflowError, ValueError, OSError, admission_wire.AdmissionUnavailable):
         return False
 
 

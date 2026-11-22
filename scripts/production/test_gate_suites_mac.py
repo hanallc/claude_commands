@@ -275,6 +275,19 @@ class MacGateSuitesTests(GateSuitesFixture):
         self.assertEqual(self.cloud_route.call_count, 2)
         self.placement_status.assert_not_called()
 
+    def test_placement_query_overflow_goes_to_the_cloud(self) -> None:
+        _ = write_config_fixture(Path(self.environment["CONF_DIR"]) / "build_targets.conf", "enabled.mac-linux=on\n")
+        path = self.write_gate_assignment(self.gate_assignment("mac-linux"))
+        self.placement_status.side_effect = OverflowError("fixture socket timeout overflow")
+        result = gate.GateRun((), 1, 0, selection_certified=True)
+        self.cloud_route.return_value = result
+        with (mock.patch.dict(os.environ, {"BUILDLOG_PLACEMENT_FILE": str(path)}),
+              mock.patch.object(mac_linux, "route") as guest):
+            self.assertIs(gate.run_gate_suites(self.checkout, gate_job=StepJob("test-all")), result)
+        self.placement_status.assert_called_once_with("episode", "attempt", wait_for_service=False)
+        self.cloud_route.assert_called_once()
+        guest.assert_not_called()
+
     def test_invalid_assignment_goes_to_the_cloud(self) -> None:
         path = self.state / "gate-assignment.json"
         nested = sys.getrecursionlimit() + 1
