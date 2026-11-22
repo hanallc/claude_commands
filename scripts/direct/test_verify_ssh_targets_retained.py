@@ -15,13 +15,14 @@ from unittest import mock
 from scripts.lib.helper_tree_test_support import verify_test_environment
 from scripts.build_queue import execution_identity
 from scripts.build_targets import test_ssh_eligibility as eligibility_support
-from scripts.build_queue import admission_protocol as wire, placement
+from scripts.build_queue import admission_protocol as wire, admission_records, admission_service as service, placement
 from scripts.build_queue.admission_test_support import caller_provider_controls
 from scripts.direct import verify_ssh_targets_test_support as support
 from scripts.direct.verify_ssh_targets_test_support import VerifySshTargetsFixture
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.lib.process_start_test_support import process_reader
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.mac_test import claim_state, offload
 
 from scripts.lib import process_start as process_identity
 
@@ -30,6 +31,57 @@ mac_test = eligibility_support.mac_test
 
 
 class VerifySshRetainedTests(VerifySshTargetsFixture):
+    def test_lost_mac_releases_the_verify_place_and_keeps_the_claim(self) -> None:
+        self.configure("natedev,mac")
+        self.enable_mac()
+        settings = self.root / "mac_test.conf"
+        _ = write_config_fixture(settings, "leftover_timeout_s=1\n")
+        _ = self.hold_memory()
+        slots_during_report: list[int] = []
+        previous = self.admission.server.handle_request
+
+        def observe(request: wire.Request,
+                    connection: service.Connection | service.NoConnection = service.NO_CONNECTION) -> list[wire.Reply]:
+            if isinstance(request, wire.ExecutionReport):
+                slots_during_report.extend(slot.owner.pid for slot in self.admission.server.verify_run_slots.values())
+            return previous(request, connection)
+
+        with mock.patch.object(self.admission.server, "handle_request", side_effect=observe):
+            process = self.start_verify("test", "sample", "--no-cache", extra={
+                "TEST_SSH_MODES": '{"mac":"lost-cleanup-timeout"}'})
+            try:
+                self.wait_for_path(self.runner_state / "provider-outcome-mac.json", (process,))
+                output, errors = process.communicate(timeout=8)
+            except subprocess.TimeoutExpired:
+                self.fail("Verify stayed in the queue after the Mac cleanup timeout.")
+            finally:
+                if process.poll() is None:
+                    self.stop_verify(process)
+
+        self.assertEqual(process.returncode, 2, output + errors)
+        self.assertIn("the Mac does not answer; stop and submit again", errors)
+        self.assertEqual(slots_during_report, [process.pid])
+        self.assertEqual(self.local_runs(), [])
+        attempt, = self.attempts()
+        self.assertEqual((attempt["outcome"], attempt["cleanup"]), ("lost", "unconfirmed"))
+        controls = caller_provider_controls(self, self.admission)
+        claim, = controls.claims("mac")
+        identity = claim_state.claim_identity(claim.record)
+        journal = controls.claim_paths("mac").directory / "pending-starts" / offload.pending_start_key(identity)
+        self.assertTrue(journal.is_file())
+
+        _ = self.admission.run_pass()
+        with self.admission.loop_turn():
+            server = self.admission.server
+            self.assertEqual(server.verify_run_slots, {})
+            key = execution_identity.attempt_key(identity.episode, identity.attempt)
+            saved = server.assignments[key]
+            self.assertIsInstance(saved.provider, placement.ProviderClaimReference)
+            assert isinstance(saved.provider, placement.ProviderClaimReference)
+            self.assertEqual(saved.provider.claim_id, identity.claim_id)
+            self.assertIsInstance(saved.remote_start_hold, admission_records.RemoteStartHoldEnded)
+            self.assertFalse(any(place.episode == identity.episode for place in server.places.values()))
+
     def test_verify_exit_before_first_memory_hook_fails(self) -> None:
         self.release_memory_after_hook()
         with subprocess.Popen(["true"],

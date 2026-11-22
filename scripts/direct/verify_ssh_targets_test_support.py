@@ -216,7 +216,7 @@ def stream(arguments):
                 + "nextest box=nextest other natedev=nextest fixture; move the box pins in nixos hosts/linux-build.nix\n"
                 + "mac_cleanup=kept\n")
         status = 75
-    elif mode == "lost":
+    elif mode in ("lost", "lost-cleanup-timeout"):
         wire, status = "connection lost\n", 255
     else:
         status = 75 if mode == "completed-decline" else 42 if mode == "failed" else 4 if mode == "no-tests" else 0
@@ -245,6 +245,9 @@ real_run = subprocess.run
 def commands(arguments, **options):
     if arguments[0] == "ssh":
         actions.append("cleanup")
+        if mode == "lost-cleanup-timeout":
+            assert options["timeout"] == 1, options
+            raise subprocess.TimeoutExpired(arguments, options["timeout"])
         unresolved = mode in ("probe-refusal", "run-refusal", "after-probe")
         count = 2 if mode in ("probe-leftovers", "retained-leftovers") else 0
         fence = ""

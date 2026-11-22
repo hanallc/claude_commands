@@ -1338,6 +1338,8 @@ def write_result(
 ) -> int:
     """Write the wire form and return the exit status for one outcome."""
     label = target or "Mac"
+    linux = (isinstance(destination, ResultFile) and bool(target)
+             and not target_config.uses_legacy_mac_layout(eligibility.configured_ssh_target(target).platform))
     if isinstance(result, (PassedOnMac, PassedOnTarget)):
         mac = "passed"
         reason = ""
@@ -1374,7 +1376,11 @@ def write_result(
         mac = "lost"
         reason = result.detail if target else ""
         status = 75
-        if (not isinstance(result, HanaGuestEndedRun) or not isinstance(destination, ResultFile)
+        if (isinstance(destination, ResultFile) and not linux and verb == "nextest"
+                and evidence is not None and evidence.launch_authorized and evidence.cleanup == "unconfirmed"):
+            reason = "cleanup_unconfirmed"
+            print(f"mac_test: the {label} {result.detail}. Cleanup remains unconfirmed.")
+        elif (not isinstance(result, HanaGuestEndedRun) or not isinstance(destination, ResultFile)
                 or os.environ.get('BUILDLOG_PINNED_TARGET') != target):
             print(f"mac_test: the {label} {result.detail}; local fallback requires admission")
     else:
@@ -1396,7 +1402,6 @@ def write_result(
         holder_line = ""
         if isinstance(result, BusyMacDecline):
             holder_line = f"holder={holder_value(result.holder)}\n"
-        linux = bool(target) and not target_config.uses_legacy_mac_layout(eligibility.configured_ssh_target(target).platform)
         prefix = f"outcome={mac}\ntarget={target}" if linux else f"mac={mac}"
         details = ""
         if linux:

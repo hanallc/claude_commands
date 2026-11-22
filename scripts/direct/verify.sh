@@ -2530,6 +2530,11 @@ runpy.run_path(sys.argv[0], run_name="__main__")
             rm -f "$MAC_LOG_FILE"
             MAC_LOG_FILE=""
             export BUILDLOG_TARGET=""
+            if [[ "$CMD" == test && "$selected_is_mac" == 1 && "$result_word" == lost \
+                    && "$result_reason" == cleanup_unconfirmed ]]; then
+                echo 'verify.sh: the Mac does not answer; stop and submit again' >&2
+                exit 2
+            fi
             if [[ "$selected_is_mac" == 1 ]]; then step_state waiting_mac; else step_state waiting_ssh; fi
             return
             ;;
