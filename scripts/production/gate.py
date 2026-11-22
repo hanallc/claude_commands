@@ -1461,6 +1461,8 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
         modules = [(suite, path) for suite, path in modules if str(path.relative_to(repo)) in paths]
     runner = module_runner(repo)
     tmpfs = build_folders.tmpfs_temporary_parent()
+    if mode is SuiteMode.TARGETED or "test-runs" in tmpfs.parts:
+        tmpfs = build_folders.configured_gate_root()
     if not tmpfs.is_dir() or not os.access(tmpfs, os.W_OK):
         raise GateRefused(f"the test runner requires a writable gate folder at {tmpfs}")
     report_retained_gate_test_folders(tmpfs)
@@ -1572,8 +1574,8 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
                 record(1, aborted=True)
             raise
 
-    # Folder keys stay unchanged until chunk 6.
-    folder_tool = "merge-gate" if mode is SuiteMode.GATE else "targeted-test"
+    folder_tool = "g" if mode is SuiteMode.GATE else "t"
+    module_number = 0
     with ((gate_recovery(repo) if shared else private_gate_recovery(repo, tmpfs)) as recovery, record_on_abort(),
           gate_temporary(recovery, folder_tool, tmpfs) as temporary,
           ExitStack() as module_folders,
@@ -1733,9 +1735,10 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
                     suite, path = request.suite, request.path
                     folder_cleanup = ExitStack()
                     _ = module_folders.callback(folder_cleanup.close)
-                    # Leave room for fixture socket paths below TMPDIR.
+                    # Each attempt gets a short name in this gate's private folder.
+                    module_number += 1
                     module_folder = build_folders.BuildFolderSpec(
-                        kind="legacy-unique", parent=temporary, purpose="m", suffix_length=4)
+                        kind="tool", parent=temporary, purpose=f"m{module_number:04x}", suffix_length=0)
                     root = folder_cleanup.enter_context(build_folders.temporary_build_folder(module_folder))
                     log = root / "output.log"
                     job_environment = ({**environment, "TMPDIR": str(root)} if request.kind is GateJobKind.TYPE_CHECK

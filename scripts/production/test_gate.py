@@ -18,7 +18,7 @@ from typing import cast, final, override
 from contextlib import AbstractContextManager, redirect_stdout
 from datetime import UTC, datetime, tzinfo
 from unittest import mock
-from scripts.lib import build_folders, scratch, testing_folders
+from scripts.lib import scratch
 from scripts.production import change_review, gate, staff
 from scripts.production.gate_modules import GateRefused
 from scripts.production.test_change_review import ProducerFixture
@@ -256,28 +256,36 @@ class MergeGateCheckpointTests(MergeGateFixture):
         self.assertEqual(set(timings), {"hooks/test_first.py", "hooks/tests/test_first.py"})
         self.assertEqual(self.pass_records()[0]["suites"], ["hooks"])
 
-    @gate_suites("hooks")
+    @gate_suites("hooks", "message")
     def test_gate_and_affected_module_folders_leave_room_for_unix_sockets(self) -> None:
         prepare = gate.test_module_environment
-        # Chrome uses this suffix below TMPDIR. Include the separator and the final NUL.
-        socket_suffix = Path("com.google.Chrome.123456/SingletonSocket")
+        gate_root = self.fixture_root.parent
+        legacy_run = Path("test-runs/test-run-abcdefgh")
+        inherited_run = gate_root / legacy_run
+        inherited_run.mkdir(parents=True)
+        sockets = (Path(".com.google.Chrome.123456/SingletonSocket"),
+                   Path("style-socket-abcdefgh/outside.sock"))
         for flag in ("--tests-only", "--affected"):
-            with self.subTest(mode=flag):
-                socket_paths: list[Path] = []
+            for inherited in (gate_root, inherited_run):
+                with self.subTest(mode=flag, inherited=inherited):
+                    job_folders: list[Path] = []
 
-                def prepare_module(root: Path, environment: dict[str, str]) -> dict[str, str]:
-                    fixture_parent = build_folders.tmpfs_temporary_parent()
-                    with (mock.patch.dict(os.environ, {"TMPDIR": str(root)}),
-                          testing_folders.test_run_folder() as run):
-                        relative_socket = run.relative_to(fixture_parent) / socket_suffix
-                        socket_paths.append(Path("/private/tmp") / relative_socket)
-                    return prepare(root, environment)
+                    def prepare_module(root: Path, environment: dict[str, str]) -> dict[str, str]:
+                        job_folders.append(root)
+                        return prepare(root, environment)
 
-                with mock.patch.object(gate, "test_module_environment", side_effect=prepare_module):
-                    result = self.run_gate(flag, "--module", "hooks/test_first.py")
-                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-                socket_path, = socket_paths
-                self.assertLessEqual(len(os.fsencode(socket_path)) + 1, 108, str(socket_path))
+                    with (mock.patch.dict(self.environment, {"TMPDIR": str(inherited)}),
+                          mock.patch.object(gate, "test_module_environment", side_effect=prepare_module)):
+                        result = self.run_gate(flag, "--module", "hooks/test_first.py", "--module", "message/test_first.py")
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertCountEqual([root.name for root in job_folders], ["m0001", "m0002"])
+                    for root in job_folders:
+                        self.assertEqual(root.parent.parent, gate_root)
+                        relative = root.relative_to(gate_root)
+                        for platform_root, limit in ((Path("/dev/shm"), 108), (Path("/private/tmp"), 104)):
+                            for suffix in sockets:
+                                socket_path = platform_root / relative / legacy_run / suffix
+                                self.assertLessEqual(len(os.fsencode(socket_path)) + 1, limit, str(socket_path))
 
     def test_folders_without_test_modules_and_cached_files_are_not_suites(self) -> None:
         scripts = self.checkout / "scripts"

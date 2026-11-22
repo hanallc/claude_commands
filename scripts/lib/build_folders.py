@@ -198,9 +198,14 @@ def inherited_temporary_parent() -> Path:
     return Path(os.environ.get("TMPDIR") or tempfile.gettempdir())
 
 
+def configured_gate_root() -> Path:
+    """Return the configured root for gate temporary folders."""
+    return Path(_settings().text("roots.gate"))
+
+
 def tmpfs_temporary_parent() -> Path:
     """Keep nested work under the caller's tmpfs folder."""
-    root = Path(_settings().text("roots.gate"))
+    root = configured_gate_root()
     inherited = inherited_temporary_parent().resolve()
     return inherited if inherited.is_relative_to(root) else root
 
