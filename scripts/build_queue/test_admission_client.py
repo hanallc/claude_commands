@@ -228,7 +228,9 @@ class ClientTests(unittest.TestCase):
                 (consumed, placement.NoTerminalReport(), "consumed", 0),
                 (consumed, placement.TerminalAttemptReport(refused, pending, 2.0), "consumed", 0),
                 (consumed, placement.TerminalAttemptReport(placement.AttemptDeclined("lost"), settled, 2.0), "consumed", 0),
-                (consumed, placement.TerminalAttemptReport(refused, settled, 2.0), "not_started", 0))
+                (consumed, placement.TerminalAttemptReport(refused, settled, 2.0), "not_started", 0),
+                (consumed, placement.TerminalAttemptReport(execution_identity.HanaCommandAdmissionRefused("hana"),
+                    settled, 2.0), "not_started", 0))
             for permission, report, word, code in cases:
                 with self.subTest(permission=permission, report=report), fixture.loop_turn():
                     fixture.server.assignments[key] = records.SavedPlacementAssignment(assignment,

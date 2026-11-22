@@ -337,8 +337,8 @@ A busy result adds `holder`: its known job, `leftovers`, or `unreadable`.
 Verify checks the exact launch permission when a routed Mac command gives no usable result.
 The check uses the admission query timeout.
 Verify exits with status 2 if the queue consumed launch permission or cannot confirm it.
-One exception applies: the runner reported a settled refusal with proof that nothing started.
-Then nothing ran on the Mac, and Verify treats the result as a runner decline.
+One exception applies: the runner reported a settled refusal before any test started.
+Then no test started and no Mac cleanup is open, and Verify treats the result as a runner decline.
 The same exit applies when the runner loses the verdict and cannot confirm Mac cleanup.
 The local Verify place becomes free when Verify exits.
 The remote claim stays available for recovery until the runner confirms cleanup.

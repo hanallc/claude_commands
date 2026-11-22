@@ -2469,7 +2469,7 @@ runpy.run_path(sys.argv[0], run_name="__main__")
         local launch
         launch=$(verify_helper "$BUILDLOG_MEM_ADMIT_SCRIPT" placement-status --launch-only \
             --episode "$PLACEMENT_EPISODE" --attempt "$PLACEMENT_ATTEMPT") || launch=unknown
-        # not_started: the runner reported a settled refusal with proof that nothing ran on the Mac.
+        # not_started: the runner reported a settled refusal: no test started and no Mac cleanup is open.
         if [[ "$launch" != available && "$launch" != not_started ]]; then
             result_word=lost result_reason=cleanup_unconfirmed result_usable=1
         fi
