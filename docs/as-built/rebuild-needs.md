@@ -72,8 +72,8 @@ Each commit's `Claude-Session` id maps to a local session through the transcript
 The refresh finds that transcript with one `rg` scan of the Claude projects folders and keeps the answer in `<rebuild.cache>-sessions.json`.
 A new session id costs one scan; a known id costs none.
 A machine that does not answer keeps its last list.
-The Hana console's bottom-left rebuild link shows only while the answer names a machine (`docs/as-built/review-links.md`, Rebuilds page).
-The `For you:` row shows `rebuild natedev`, `rebuild mac`, or both, without duplicates.
+The status line names each waiting rebuild once in the `For you:` row.
+It shows `rebuild natedev`, `rebuild mac`, or both.
 Open needs appear even when evaluation has no result or the cache does not exist.
 Completed needs leave the row unless the cached system comparison still requires a rebuild.
 A failed need read leaves the cached answer visible.
