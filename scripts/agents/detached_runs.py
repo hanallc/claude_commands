@@ -714,14 +714,11 @@ def _finish_record(path: Path, record: RunRecord) -> CompletionReplay:
             record["completion_pending"] = True
             record = _write_record(path, record)
             return _replay_completion(path, record)
-    if not _cancels_pass(current):
-        return CompletionReplay.HANDLED
-    from scripts.herdr.worker_panes import StoppedDiagnosticRecovery
-
-    retry = cast(Callable[[Path, staff.StaffId], StoppedDiagnosticRecovery],
-                 import_module("scripts.herdr.turn_end").retry_stopped_diagnostics)
-    outcome = retry(Path(current["session_dir"]), staff.StaffId(current["staff_id"]))
-    return CompletionReplay.HANDLED if outcome is StoppedDiagnosticRecovery.SETTLED else CompletionReplay.RETRY
+        if not _cancels_pass(current):
+            return CompletionReplay.HANDLED
+        current["completion_pending"] = True
+        current = _write_record(path, current)
+        return _settle_completion_diagnostics(path, current)
 
 
 def _replay_completion(path: Path, record: RunRecord) -> CompletionReplay:
@@ -747,6 +744,16 @@ def _replay_completion(path: Path, record: RunRecord) -> CompletionReplay:
         with contextlib.suppress(SystemExit, worker_lifecycle.WorkerStateUnreadable):
             _ = _save_delivery(path, FAILED_RESULT_PUSH + detail, if_current=ORPHAN_RESULT_PENDING)
         print(f"anomaly: {record['run_id']}: completion event failed: {detail}", file=sys.stderr)
+        return CompletionReplay.RETRY
+    return _settle_completion_diagnostics(path, record)
+
+
+def _settle_completion_diagnostics(path: Path, record: RunRecord) -> CompletionReplay:
+    from scripts.herdr.worker_panes import StoppedDiagnosticRecovery
+
+    retry = cast(Callable[[Path, staff.StaffId], StoppedDiagnosticRecovery],
+                 import_module("scripts.herdr.turn_end").retry_stopped_diagnostics)
+    if retry(Path(record["session_dir"]), staff.StaffId(record["staff_id"])) is not StoppedDiagnosticRecovery.SETTLED:
         return CompletionReplay.RETRY
     _clear_completion_pending(path)
     return CompletionReplay.HANDLED

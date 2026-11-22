@@ -3253,6 +3253,77 @@ class PaneRunDeliveryTests(unittest.TestCase):
     def test_detached_delivery_retries_diagnostics_after_retirement(self) -> None:
         self.check_diagnostic_retry_after_close(end_worker=True, retry="detached")
 
+    def test_restore_delivers_the_diagnostic_after_detached_completion_closes_the_run(self) -> None:
+        case = self.stopped_diagnostic_fixture(end_worker=True)
+        parent = self.fixture.parent
+        passed = progress_history.pass_for_finalization(self.run_dir, case.dispatch)
+        delivery = progress_history.dispatch_delivery(passed)
+        progress_history.save_dispatch_delivery(self.run_dir, case.dispatch,
+            replace(delivery, actions=replace(delivery.actions, finish_run=True)))
+        saved = worker_lifecycle.read_json_object(case.detached_record)
+        self.assertEqual(saved["delivery"], "finished: the pane pass stopped")
+        saved["completion_pending"] = True
+        write_text_atomic(case.detached_record, json.dumps(saved))
+        message = "detached run cleanup failed for impl: private cleanup failure"
+        deliver = send.send
+
+        def unavailable(options: send.Options) -> send.Result:
+            if send.body_text(options) == message:
+                return send.Result("failed", "private diagnostic send failed")
+            return deliver(options)
+
+        with (patch.object(send, "send", side_effect=unavailable),
+              patch.object(detached_runs, "prune_finished", side_effect=OSError("private cleanup failure")),
+              contextlib.redirect_stderr(io.StringIO()) as errors):
+            self.assertEqual(detached_runs.reap_orphans(str(self.run_dir)), [])
+            self.assertTrue(unit_runs.terminal_run(unit_runs.read_run_fields(self.run_dir)))
+            self.assertIs(progress_history.end_run(self.run_dir, progress_history.RetryRunEnd.RECOVER),
+                          progress_history.RunEndSettled.CLOSED)
+            self.assertEqual(detached_runs.reap_orphans(str(self.run_dir)), [])
+        self.assertIn("private diagnostic send failed", errors.getvalue())
+        self.assertIsNone(staff.by_id(case.row.id))
+        self.assertIsNone(unit_runs.open_run(str(parent.current_session)))
+        self.assertEqual(worker_lifecycle.read_json_object(case.diagnostics)[message], False)
+        self.assertIs(worker_lifecycle.read_json_object(case.detached_record)["completion_pending"], True)
+
+        _ = detached_runs.prune_finished(case.detached_record.parent)
+
+        self.assertTrue(case.detached_record.is_file())
+        self.assertEqual(worker.restore(parent.id), worker.ExitCode.OK)
+        self.assertEqual(worker.restore(parent.id), worker.ExitCode.OK)
+        self.assertIs(worker_lifecycle.read_json_object(case.detached_record)["completion_pending"], False)
+        self.assertIs(worker_lifecycle.read_json_object(case.diagnostics)[message], True)
+        self.assertEqual(case.agent.notices.count(message), 1)
+
+    def test_finished_stop_preserves_an_unreadable_diagnostic_for_restore(self) -> None:
+        case = self.stopped_diagnostic_fixture(end_worker=True)
+        parent = self.fixture.parent
+        with patch.object(detached_runs, "prune_finished", return_value=[]):
+            self.assertIs(turn_end.recover_stopped_in_run(self.run_dir, case.row.id),
+                          worker.CompletionRecovery.RECOVERED)
+        self.assertIsNone(staff.by_id(case.row.id))
+        self.assertIs(progress_history.end_run(self.run_dir, progress_history.RunEndRequested("stopped")),
+                      progress_history.RunEndSettled.CLOSED)
+        self.assertIsNone(unit_runs.open_run(str(parent.current_session)))
+        self.assertIs(worker_lifecycle.read_json_object(case.detached_record)["completion_pending"], False)
+        write_text_atomic(case.diagnostics, "{")
+
+        with contextlib.redirect_stderr(io.StringIO()) as errors:
+            self.assertEqual(detached_runs.main(["deliver", str(case.detached_record)]), 1)
+            self.assertIs(worker_lifecycle.read_json_object(case.detached_record)["completion_pending"], True)
+            self.assertEqual(worker.restore(parent.id), worker.ExitCode.OK)
+
+        self.assertIn("close diagnostic retry failed", errors.getvalue())
+        self.assertIs(worker_lifecycle.read_json_object(case.detached_record)["completion_pending"], True)
+        self.assertEqual(detached_runs.prune_finished(case.detached_record.parent), [])
+        message = "Pending diagnostic."
+        write_text_atomic(case.diagnostics, json.dumps({message: False}))
+        self.assertEqual(worker.restore(parent.id), worker.ExitCode.OK)
+        self.assertEqual(worker.restore(parent.id), worker.ExitCode.OK)
+        self.assertIs(worker_lifecycle.read_json_object(case.detached_record)["completion_pending"], False)
+        self.assertEqual(worker_lifecycle.read_json_object(case.diagnostics), {message: True})
+        self.assertEqual(case.agent.notices[1:], [message])
+
     def test_terminal_run_recovery_retries_diagnostics_without_a_run_pointer(self) -> None:
         self.check_diagnostic_retry_after_close(end_worker=True, retry="terminal run")
 
