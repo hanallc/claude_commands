@@ -1329,6 +1329,33 @@ class HoldEnforcerTests(unittest.TestCase):
         self.assertEqual(cast(str, call.args[1]), f"codex:{thread}")
         self.assertIn("Restart the stopped run cargo test for worker.", cast(str, call.args[2]))
 
+    def test_release_keeps_two_commands_under_the_codex_host_as_two_runs(self) -> None:
+        holder, = build_hold.natedev_holds(self.holders).in_force
+        self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
+        director = fixture_member("showrunner", name="director")
+        worker = fixture_member("worker", name="worker", parent=director.id)
+        thread = str(worker.current_session)
+        environment = {"CODEX_THREAD_ID": thread}
+        _ = self.process(5, "codex", argv=("codex", "resume"), environment=environment)
+        _ = self.process(7, "codex-code-mode", parent=5, argv=("/bin/codex-code-mode-host", "--listen"),
+                         environment=environment)
+        for shell, child, argv in ((8, 11, ("cargo", "test")), (9, 12, ("cargo", "build"))):
+            _ = self.process(shell, "zsh", parent=7, argv=("zsh", "-c", " ".join(argv)), environment=environment)
+            _ = self.process(child, "cargo", parent=shell, argv=argv, environment=environment)
+        table = self.table()
+        owner = OwningSession(thread)
+        stopper = hold_enforcer.StopBuildsAndTests(self.proc, signal_process=lambda _pid, _signum: None)
+        for pid in (11, 12):
+            stopper.stop(hold_enforcer.WouldStopBuild(table[pid], owner, "timed test", holder, table[pid]),
+                         table, (holder,), 999, self.claimed)
+
+        with mock.patch.object(build_hold, "send_release_to", return_value=build_hold.ReleaseDelivered()) as send:
+            self.assertEqual(build_hold.release_cycle(self.holders, holder.key), "released, builds may resume.")
+        call, = send.call_args_list
+        notice = cast(str, call.args[2])
+        self.assertIn("Restart the stopped runs for worker: cargo test (Run ID process:", notice)
+        self.assertIn("; cargo build (Run ID process:", notice)
+
     def test_drain_skips_a_reused_pid_before_a_stop(self) -> None:
         _ = self.process(10, "bash", argv=("bash", "verify.sh", "check"), session="gate-owner")
         table = self.table()

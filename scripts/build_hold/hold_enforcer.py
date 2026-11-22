@@ -422,7 +422,8 @@ def notice_recipients(
 
 
 # The agent programs whose child process is the root of one command.
-AGENT_COMMANDS = frozenset({"claude", "codex"})
+# codex-code-mode-host is a long-lived codex child; a command it starts is its own run.
+AGENT_COMMANDS = frozenset({"claude", "codex", "codex-code-mode-host"})
 
 
 def command_root(lineage: Sequence[build_hold.AuditProcess], stopped: build_hold.AuditProcess) -> build_hold.AuditProcess:
@@ -431,7 +432,7 @@ def command_root(lineage: Sequence[build_hold.AuditProcess], stopped: build_hold
     Without an agent parent, the stopped process is its own run.
     """
     for item, parent in itertools.pairwise(lineage):
-        if build_hold.audit_command(parent) in AGENT_COMMANDS:
+        if (Path(parent.argv[0]).name if parent.argv else parent.command) in AGENT_COMMANDS:
             return item
     return stopped
 

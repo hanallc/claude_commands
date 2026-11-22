@@ -2002,6 +2002,7 @@ def notice_batches(entries: Sequence[ReleaseEntry]) -> list[list[ReleaseEntry]]:
 
 def record_release_outcome(cycle: HoldCycle, entry: ReleaseEntry, result: ReleaseNoticeResult,
                            without_staff: set[str]) -> None:
+    """Record one notice result on an entry of its batch."""
     if isinstance(result, ReleaseDelivered):
         entry["delivery"] = "Delivered"
     elif isinstance(result, ReleaseQueued):
