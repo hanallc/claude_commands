@@ -1879,8 +1879,15 @@ def _wait_for_command(child: subprocess.Popen[bytes], gate: IO[bytes], path: Pat
                         _send_gate_line(gate, b"done\n")
                         raise SystemExit(f"detached_runs: {path}: the command group identity changed")
                     if not record.get("stop_escalated"):
-                        with contextlib.suppress(ProcessLookupError):
+                        try:
                             process_group.send_process_group(child.pid, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+                        except PermissionError:
+                            # Darwin can deny a signal to a group with only zombies.
+                            if _group_is_live(child.pid):
+                                raise
+                        else:
                             record["stop_escalated"] = True
                             write_text_atomic(path, json.dumps(record, indent=2, sort_keys=True))
                     break

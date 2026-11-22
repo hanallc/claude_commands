@@ -58,7 +58,8 @@ THREAD_TWO = fixture_runtime_id("detached-run-thread-two")
 LASTING_THREAD = fixture_runtime_id("detached-run-lasting-thread")
 ADOPTED_THREAD = fixture_runtime_id("detached-run-adopted-thread")
 SHARED_THREAD = fixture_runtime_id("detached-run-shared-thread")
-DEAD_PID = 2 ** 22 + 12345
+# Darwin ps accepts 99999, but the kernel allocates PIDs below it.
+DEAD_PID = 99_999 if sys.platform == "darwin" else 2 ** 22 + 12345
 
 
 def setUpModule() -> None:
@@ -162,17 +163,17 @@ class DetachedRunsTests(unittest.TestCase):
         text = path.read_text(encoding="utf-8") if path.exists() else ""
         return cast(dict[str, object], json.loads(text)) if text.strip() else {}
 
-    def record(self, command: list[str], **extra: str) -> Path:
+    def record(self, command: list[str], *, run_id: str = "r1", done: str = "") -> Path:
         runs = self.session / detached_runs.DETACHED_RUNS_DIR
         runs.mkdir(exist_ok=True)
         record: detached_runs.RunRecord = {
-            "run_id": "r1", "status": "running", "session_dir": str(self.session), "worker": WORKER,
+            "run_id": run_id, "status": "running", "session_dir": str(self.session), "worker": WORKER,
             "staff_id": self.worker_id,
             "label": "verify.sh check", "command": command,
-            "log": str(runs / "r1.log"), "started_at": time.time(), "pid": os.getpid(),
-            "director_dir": str(self.session), "done_message_file": extra.get("done", ""),
+            "log": str(runs / f"{run_id}.log"), "started_at": time.time(), "pid": os.getpid(),
+            "director_dir": str(self.session), "done_message_file": done,
         }
-        path = runs / "r1.json"
+        path = runs / f"{run_id}.json"
         _ = path.write_text(json.dumps(record), encoding="utf-8")
         return path
 
@@ -1213,14 +1214,17 @@ with socket.socket(socket.AF_UNIX) as connection:
     if sys.argv[2] == 'suspend-child':
         child = os.fork()
         if child == 0:
+            # Darwin can end a stopped process with an unblocked SIGTERM.
+            signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM})
             os.kill(os.getpid(), signal.SIGSTOP)
             os._exit(98)
         _, status = os.waitpid(child, os.WUNTRACED)
         assert os.WIFSTOPPED(status) and os.WSTOPSIG(status) == signal.SIGSTOP
     connection.sendall((json.dumps(dict(role='command', pid=os.getpid(), group=os.getpgrp(), session=os.getsid(0))) + '\\n').encode())
     if sys.argv[2] == 'suspend':
-        connection.set_inheritable(True)
-        os.execl('/bin/sh', 'sh', '-c', 'kill -STOP $$; exit 98')
+        signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM})
+        os.kill(os.getpid(), signal.SIGSTOP)
+        os._exit(98)
     connection.recv(1)
 """
         # The fake delivery process reports the result text over the socket instead of sending it.
@@ -1385,13 +1389,15 @@ sys.exit(status)
                         address = Path(socket_root) / f"ready{index}.sock"
                         ready.bind(str(address))
                         ready.listen(3)
-                        path = self.record([sys.executable, "-c", child_source, str(address), command_mode])
+                        path = self.record([sys.executable, "-c", child_source, str(address), command_mode],
+                                           run_id=f"stop-{index}")
+                        supervisor_output = self.root / f"supervisor-{index}.log"
                         environment = {**os.environ, "BUILDLOG_SCOPE": "1" if scoped else "0",
                                        "XDG_RUNTIME_DIR": str(runtime), "PATH": str(tools) + os.pathsep + os.environ["PATH"],
                                        "FIXTURE_READY_SOCKET": str(address), "FIXTURE_WATCHER": str(watcher),
                                        "FIXTURE_COMMAND_MODE": command_mode, "FIXTURE_GROUP_SCAN": scan_mode}
                         supervisor_args = [sys.executable, str(supervisor_script), "supervise", str(path)]
-                        with (Path(self.root / "supervisor.log").open("ab") as output,
+                        with (supervisor_output.open("wb") as output,
                               subprocess.Popen(supervisor_args, env=environment,
                                                stdout=output, stderr=subprocess.STDOUT,
                                                start_new_session=True) as supervisor,
@@ -1400,7 +1406,7 @@ sys.exit(status)
 
                             def accept() -> tuple[socket.socket, dict[str, object]]:
                                 if not select.select([ready], [], [], guard.remaining())[0]:
-                                    supervisor_log = (self.root / "supervisor.log").read_text()
+                                    supervisor_log = supervisor_output.read_text()
                                     self.fail(f"The run did not report. Supervisor output:\n{supervisor_log}")
                                 connection = ready.accept()[0]
                                 _ = connections.enter_context(connection)
@@ -1459,7 +1465,7 @@ sys.exit(status)
                                     self.assertEqual(pending["status"], "running")
                                     self.assertNotIn("delivery", pending)
                                     self.assertEqual(detached_runs.live_runs(path.parent, WORKER), [pending])
-                                    supervisor_log = (self.root / "supervisor.log").read_text()
+                                    supervisor_log = supervisor_output.read_text()
                                     self.assertEqual(supervisor_log.count("the command group end is still unconfirmed"), 1)
                                     scan_connection.sendall(b"r")
                                 _, delivered = accept()
@@ -1550,6 +1556,33 @@ sys.exit(status)
             run.assert_not_called()
             self.assertEqual(refused.get("exit_code"), 125)
             self.assertIn("the supervisor cannot retain the leader", Path(refused["log"]).read_text())
+
+    def test_escalation_accepts_eperm_only_when_the_group_has_ended(self) -> None:
+        wait_for_command = cast(Callable[[subprocess.Popen[bytes], IO[bytes], Path, float, float,
+                                          Callable[[], bool]], int], getattr(detached_runs, "_wait_for_command"))
+        for state, stderr, ended in (("Z", "", True), ("T", "", False), ("Z", "fixture scan failure", False)):
+            with self.subTest(state=state, stderr=stderr):
+                path = self.record(["fixture command"])
+                self.update_record(path, command_pid=DEAD_PID, command_group=DEAD_PID,
+                                   stop_reason="fixture stop", stop_requested_at=1.0)
+                reap_leader = MagicMock(return_value=-signal.SIGTERM)
+                child = MagicMock(spec=subprocess.Popen, pid=DEAD_PID, wait=reap_leader)
+                listing = subprocess.CompletedProcess(["ps"], 0, f"{DEAD_PID} {state}\n", stderr)
+                with (io.BytesIO() as gate,
+                      patch.object(subprocess, "run", return_value=listing),
+                      patch.object(process_group, "send_process_group", side_effect=PermissionError) as send,
+                      patch.object(time, "monotonic", return_value=2.0)):
+                    if ended:
+                        self.assertEqual(wait_for_command(child, gate, path, 1, 2, lambda: True), -signal.SIGTERM)
+                        reap_leader.assert_called_once_with()
+                    else:
+                        with self.assertRaises(PermissionError):
+                            _ = wait_for_command(child, gate, path, 1, 2, lambda: True)
+                        reap_leader.assert_not_called()
+                send.assert_called_once_with(DEAD_PID, signal.SIGKILL)
+                record = worker_lifecycle.read_json_object(path)
+                self.assertNotIn("stop_escalated", record)
+                self.assertEqual(record.get("stop_group_end"), "confirmed" if ended else None)
 
     @unittest.skipUnless(sys.platform == "linux", "pidfd leader wait requires Linux")
     def test_wait_for_leader_with_pidfd(self) -> None:
