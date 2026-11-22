@@ -10,6 +10,7 @@ import math
 import os
 import argparse
 import json
+import select
 import shlex
 import signal
 import sys
@@ -1972,6 +1973,23 @@ def _watch_resume(identity: str, pane: str, account: str,
 
 
 _STOP_RESUME_PROGRAM = Path(__file__).resolve()
+_DETACHED_START_SECONDS = 15
+
+
+def _launch_mac_with_log(command: list[str], environment: dict[str, str], log_fd: int) -> None:
+    read_fd, ready_fd = os.pipe()
+    try:
+        try:
+            _ = subprocess.Popen([*command, "--ready-fd", str(ready_fd)], env=environment, start_new_session=True,
+                                 stdin=subprocess.DEVNULL, stdout=log_fd, pass_fds=(ready_fd,))
+        finally:
+            os.close(ready_fd)
+        if not select.select([read_fd], [], [], _DETACHED_START_SECONDS)[0]:
+            raise subprocess.TimeoutExpired(command, _DETACHED_START_SECONDS)
+        if not os.read(read_fd, 1):
+            raise OSError("The detached process exited before it confirmed the log claim")
+    finally:
+        os.close(read_fd)
 
 
 def _detach(arguments: list[str], task: str, *, program: Path = _STOP_RESUME_PROGRAM, log: Path | None = None,
@@ -1997,16 +2015,15 @@ def _detach(arguments: list[str], task: str, *, program: Path = _STOP_RESUME_PRO
     command = [sys.executable, str(program), arguments[0], *log_options, *arguments[1:]]
     if log_fd is not None:
         if sys.platform == "darwin":
-            _ = subprocess.Popen(command, env=environment, start_new_session=True,
-                                 stdin=subprocess.DEVNULL, stdout=log_fd)
+            _launch_mac_with_log(command, environment, log_fd)
         else:
-            # Keep the descriptor open until systemd opens the same file and starts Python.
+            # Keep the descriptor open until the child claims the log.
             source = f"/proc/{os.getpid()}/fd/{log_fd}"
-            _ = subprocess.run(["systemd-run", "--user", "--collect", "--quiet", "--service-type=exec",
+            _ = subprocess.run(["systemd-run", "--user", "--collect", "--quiet", "--service-type=notify",
                                 "--expand-environment=no", f"--property=StandardOutput=append:{source}",
                                 "--property=StandardError=journal", "--property=UnsetEnvironment=CLAUDE_CODE_SESSION_ID",
-                                *command], env=environment, stdin=subprocess.DEVNULL,
-                               capture_output=True, text=True, check=True, timeout=15)
+                                *command, "--notify-systemd"], env=environment, stdin=subprocess.DEVNULL,
+                               capture_output=True, text=True, check=True, timeout=_DETACHED_START_SECONDS)
     elif sys.platform == "darwin":
         _ = subprocess.Popen(command, env=environment, start_new_session=True,
                              stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)

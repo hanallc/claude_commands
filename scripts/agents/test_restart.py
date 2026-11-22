@@ -15,6 +15,7 @@ import fcntl
 import signal
 import shlex
 import shutil
+import socket
 import socketserver
 import subprocess
 import sys
@@ -1273,9 +1274,14 @@ class RestartTests(RestartTestCase):
     workspace_label: str | None = "live"
     inherited_log: int = -1
 
-    def capture_log(self, _arguments: list[str], _task: str, *, log: Path, log_fd: int, **_options: object) -> Path:
-        self.inherited_log = os.dup(log_fd)
-        self.addCleanup(os.close, self.inherited_log)
+    def launch_detached(self, arguments: list[str], _task: str, *, log: Path, log_fd: int, **_options: object) -> Path:
+        with os.fdopen(os.dup(log_fd), "ab") as stream:
+            self.inherited_log = stream.fileno()
+            self.assertEqual(self.detached_stop(log, arguments), 0)
+        return log
+
+    def claim_detached_log(self, _arguments: list[str], _task: str, *, log: Path, **_options: object) -> Path:
+        log.with_suffix(".claim").touch(exist_ok=False)
         return log
 
     def detached_stop(self, path: Path, arguments: list[str]) -> int:
@@ -1706,24 +1712,30 @@ class RestartTests(RestartTestCase):
 
     def test_detached_stop_appends_to_the_log_printed_by_the_caller(self) -> None:
         row = self.rows[0]
+
+        def launch(arguments: list[str], task: str, *, log: Path, log_fd: int, **_options: object) -> Path:
+            stop.assert_not_called()
+            self.assertEqual(caller.getvalue(), str(log))
+            self.assertEqual(log.read_text(), f"{log}\n")
+            _ = log.rename(log.with_suffix(".moved"))
+            log.mkdir()
+            with redirect_stdout(io.StringIO()) as child:
+                result = self.launch_detached(arguments, task, log=log, log_fd=log_fd)
+            self.assertEqual(child.getvalue(), "")
+            return result
+
         with (patch.object(restart, "live_rows", return_value=restart.CompleteLiveRows([row])),
               patch.object(restart, "stop_row", return_value=True) as stop,
-              patch.object(stop_resume, "detach", side_effect=self.capture_log) as detach,
+              patch.object(stop_resume, "detach", side_effect=launch) as detach,
               patch.dict(os.environ, {"CODEX_THREAD_ID": str(row.current_session)}),
               redirect_stdout(io.StringIO()) as caller):
             self.assertEqual(shutdown.main(["stop", "--all"]), 0)
-            stop.assert_not_called()
-            path = Path(caller.getvalue().strip())
-            self.assertEqual(detach.call_args.kwargs["log"], path)
-            self.assertEqual(path.read_text(), caller.getvalue())
-            arguments = cast(list[str], detach.call_args.args[0])
-            moved = path.rename(path.with_suffix(".moved"))
-            path.mkdir()
-            with redirect_stdout(io.StringIO()) as child:
-                self.assertEqual(self.detached_stop(path, arguments), 0)
-            stop.assert_called_once()
-        self.assertEqual(child.getvalue(), "")
-        self.assertEqual(moved.read_text().splitlines(), [str(path), "Sessions to stop (1).", f"{row.name} ({row.id})",
+        stop.assert_called_once()
+        path = cast(Path, detach.call_args.kwargs["log"])
+        self.assertEqual(caller.getvalue().splitlines(), [
+            f"{path}  agents stop --all runs in the background. Read its report in this log."])
+        self.assertEqual(path.with_suffix(".moved").read_text().splitlines(),
+            [str(path), "Sessions to stop (1).", f"{row.name} ({row.id})",
             "agents stop --all: 1 of 1 sessions stopped.", "Nothing for you to do."])
 
     def test_detached_stop_reports_a_session_with_unreadable_liveness(self) -> None:
@@ -1739,16 +1751,15 @@ class RestartTests(RestartTestCase):
 
         with (patch.object(herdr, "read_conversation", side_effect=conversation),
               patch.object(restart, "stop_row", return_value=True) as stop,
-              patch.object(stop_resume, "detach", side_effect=self.capture_log) as detach,
+              patch.object(stop_resume, "detach", side_effect=self.launch_detached) as detach,
               patch.dict(os.environ, {"CODEX_THREAD_ID": str(caller.current_session)}),
               redirect_stdout(io.StringIO()) as parent):
             self.assertEqual(shutdown.main(["stop", "--all"]), 0)
-            stop.assert_not_called()
-            path = Path(parent.getvalue().strip())
-            arguments = cast(list[str], detach.call_args.args[0])
-            self.assertEqual(self.detached_stop(path, arguments), 0)
-            self.assertEqual(stop.call_args.args[0], caller)
-        self.assertTrue(path.read_text().startswith(parent.getvalue()))
+        stop.assert_called_once()
+        self.assertEqual(stop.call_args.args[0], caller)
+        path = cast(Path, detach.call_args.kwargs["log"])
+        self.assertTrue(parent.getvalue().startswith(f"{path}  agents stop --all runs in the background."))
+        self.assertTrue(path.read_text().startswith(f"{path}\n"))
         lines = path.read_text().splitlines()[3:]
         self.assertEqual(lines[0], "agents stop --all: 1 of 2 sessions stopped.")
         self.assertIn(f"{unreadable.name}: The session liveness is unreadable.", lines[1])
@@ -1823,10 +1834,17 @@ class RestartTests(RestartTestCase):
     def test_detached_launcher_passes_the_open_log_on_both_platforms(self) -> None:
         path = self.root / "detach.log"
         program = Path(restart.__file__)
+
+        def confirm_start(argv: list[str], *, pass_fds: tuple[int, ...], **_options: object) -> None:
+            ready_fd = int(argv[argv.index("--ready-fd") + 1])
+            self.assertEqual(pass_fds, (ready_fd,))
+            _ = os.write(ready_fd, b"1")
+
         with path.open("xb") as log:
             for platform in ("darwin", "linux"):
                 with (self.subTest(platform=platform), patch.object(sys, "platform", platform),
-                      patch.object(subprocess, "Popen") as popen, patch.object(subprocess, "run") as run):
+                      patch.object(subprocess, "Popen", side_effect=confirm_start) as popen,
+                      patch.object(subprocess, "run") as run):
                     self.assertEqual(stop_resume.detach(["stop", "--all", "--requester", "fixture"],
                         "restart", program=program, log=path, log_fd=log.fileno()), path)
                     launch = run if platform == "linux" else popen
@@ -1836,7 +1854,9 @@ class RestartTests(RestartTestCase):
                     if platform == "linux":
                         self.assertEqual(argv[0], "systemd-run")
                         self.assertTrue(run.call_args.kwargs["check"])
-                        self.assertIn("--service-type=exec", argv)
+                        self.assertIn("--service-type=notify", argv)
+                        self.assertIn("--notify-systemd", argv)
+                        self.assertNotIn("--wait", argv)
                         self.assertIn(f"--property=StandardOutput=append:/proc/{os.getpid()}/fd/{log.fileno()}", argv)
                         self.assertIn("--property=StandardError=journal", argv)
                     else:
@@ -1856,6 +1876,8 @@ class RestartTests(RestartTestCase):
             (OSError(errno.EIO, "Input/output error"), "Input/output error"),
             (subprocess.CalledProcessError(-signal.SIGTERM, ["systemd-run"]),
              f"A signal stopped the launcher (signal {signal.SIGTERM})"),
+            (subprocess.TimeoutExpired(["systemd-run"], 15),
+             "The launcher timed out before the detached process claimed the log"),
         ):
             with (self.subTest(error=error), patch.object(sys, "platform", "linux"),
                   patch.object(restart, "live_rows", return_value=restart.CompleteLiveRows([row])),
@@ -1880,35 +1902,72 @@ class RestartTests(RestartTestCase):
                     self.assertEqual(shutdown.main(arguments), 0)
                 stop.assert_called_once()
 
-    def test_self_stop_leaves_the_child_report_intact_after_a_linux_launch_timeout(self) -> None:
+    def test_self_stop_keeps_the_child_report_after_each_launcher_result(self) -> None:
         row = self.rows[0]
-        child_report = b""
+        for outcome in ("exit 0", "signal", "timeout"):
+            with self.subTest(outcome=outcome):
+                self.assert_child_report_survives_launcher(outcome, row)
+
+    def assert_child_report_survives_launcher(self, outcome: str, row: staff.StaffRow) -> None:
         log_path = Path()
+        written = b""
+        notification = self.root / f"notify-{outcome}"
 
         def launch(argv: list[str], **_options: object) -> subprocess.CompletedProcess[str]:
-            nonlocal child_report, log_path
+            nonlocal log_path, written
             self.assertEqual(argv[0], "systemd-run")
             log_index = argv.index("--log")
             log_path = Path(argv[log_index + 1])
             self.assertEqual(output.getvalue(), str(log_path))
             arguments = [argv[log_index - 1], *argv[log_index + 4:]]
-            with log_path.open("ab") as log:
+            with (log_path.open("ab") as log, patch.dict(os.environ, {"NOTIFY_SOCKET": str(notification)})):
                 self.inherited_log = log.fileno()
                 self.assertEqual(self.detached_stop(log_path, arguments), 0)
-            child_report = log_path.read_bytes()
-            raise subprocess.TimeoutExpired(argv, 15)
+            self.assertEqual(notifier.recv(16), b"READY=1")
+            written = log_path.read_bytes()
+            if outcome == "signal":
+                raise subprocess.CalledProcessError(-signal.SIGTERM, argv)
+            if outcome == "timeout":
+                raise subprocess.TimeoutExpired(argv, 15)
+            return subprocess.CompletedProcess(argv, 0)
 
-        with (patch.object(sys, "platform", "linux"),
+        with (socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as notifier,
+              patch.object(sys, "platform", "linux"),
               patch.object(restart, "live_rows", return_value=restart.CompleteLiveRows([row])),
               patch.object(restart, "stop_row", return_value=True) as stop,
               patch.dict(os.environ, {"CODEX_THREAD_ID": str(row.current_session)}),
               patch.object(subprocess, "run", side_effect=launch), redirect_stdout(io.StringIO()) as output):
+            notifier.bind(str(notification))
+            notifier.setblocking(False)
             self.assertEqual(shutdown.main(["stop", "--all"]), 0)
         stop.assert_called_once()
-        self.assertEqual(log_path.read_bytes(), child_report)
-        self.assertIn(b"agents stop --all: 1 of 1 sessions stopped.", child_report)
+        self.assertEqual(log_path.read_bytes(), written)
+        self.assertIn(b"agents stop --all: 1 of 1 sessions stopped.", written)
         self.assertEqual(output.getvalue().splitlines(), [
             f"{log_path}  agents stop --all runs in the background. Read its report in this log."])
+
+    def test_late_child_exits_when_the_parent_claimed_the_log(self) -> None:
+        row = self.rows[0]
+        with (patch.object(restart, "live_rows", return_value=restart.CompleteLiveRows([row])),
+              patch.object(restart, "stop_row") as stop,
+              patch.object(stop_resume, "detach", return_value=self.root) as launch,
+              patch.dict(os.environ, {"CODEX_THREAD_ID": str(row.current_session)}),
+              redirect_stdout(io.StringIO()) as parent):
+            self.assertEqual(shutdown.main(["stop", "--all"]), 2)
+            path = cast(Path, launch.call_args.kwargs["log"])
+            written = path.read_bytes()
+            self.assertEqual(written.decode(), parent.getvalue())
+            self.assertIn("The detached process did not claim the log", parent.getvalue())
+            arguments = cast(list[str], launch.call_args.args[0])
+            with (path.open("ab") as log, patch.object(staff, "initial_snapshot") as discover,
+                  redirect_stdout(io.StringIO()) as child, redirect_stderr(io.StringIO()) as errors):
+                self.inherited_log = log.fileno()
+                self.assertEqual(self.detached_stop(path, arguments), 0)
+            discover.assert_not_called()
+        stop.assert_not_called()
+        self.assertEqual(child.getvalue(), "")
+        self.assertEqual(errors.getvalue(), "")
+        self.assertEqual(path.read_bytes(), written)
 
     def test_restart_counts_an_idle_worker_when_its_last_turn_has_no_reply(self) -> None:
         owner = self.rows[0]
@@ -2180,7 +2239,7 @@ class RestartTests(RestartTestCase):
         with (patch.object(restart, "shutdown_state_root", return_value=root),
               patch.object(restart, "live_rows", return_value=restart.CompleteLiveRows([row])),
               patch.object(restart, "stop_row", return_value=True) as stop,
-              patch.object(stop_resume, "detach", side_effect=self.capture_log) as detach,
+              patch.object(stop_resume, "detach", side_effect=self.launch_detached) as detach,
               patch.dict(os.environ, {"CODEX_THREAD_ID": str(row.current_session)})):
             with redirect_stdout(io.StringIO()) as failed:
                 self.assertEqual(shutdown.main(arguments), 2)
@@ -2194,9 +2253,8 @@ class RestartTests(RestartTestCase):
             root.mkdir()
             with redirect_stdout(io.StringIO()) as retry:
                 self.assertEqual(shutdown.main(arguments), 0)
-            stop.assert_not_called()
-            path = Path(retry.getvalue().strip())
-            self.assertEqual(self.detached_stop(path, cast(list[str], detach.call_args.args[0])), 0)
+            path = cast(Path, detach.call_args.kwargs["log"])
+            self.assertIn(str(path), retry.getvalue())
             stop.assert_called_once()
         self.assertIn("1 of 1 sessions stopped", path.read_text())
 
@@ -2226,7 +2284,7 @@ class RestartTests(RestartTestCase):
                       patch.object(restart, "_create_log", side_effect=open_log),
                       patch.object(restart, "live_rows", return_value=restart.CompleteLiveRows([row])),
                       patch.object(restart, "stop_row", return_value=True) as stop,
-                      patch.object(stop_resume, "detach", side_effect=self.capture_log) as detach,
+                      patch.object(stop_resume, "detach", side_effect=self.launch_detached) as detach,
                       patch.dict(os.environ, {"CODEX_THREAD_ID": str(row.current_session)})):
                     with redirect_stdout(io.StringIO()) as output:
                         self.assertEqual(shutdown.main(arguments), 2)
@@ -2248,8 +2306,8 @@ class RestartTests(RestartTestCase):
                     self.assertIn("Then Nate runs agents stop --all again.", step)
                     with redirect_stdout(io.StringIO()) as retried:
                         self.assertEqual(shutdown.main(arguments), 0)
-                    path = Path(retried.getvalue().strip())
-                    self.assertEqual(self.detached_stop(path, cast(list[str], detach.call_args.args[0])), 0)
+                    path = cast(Path, detach.call_args.kwargs["log"])
+                    self.assertIn(str(path), retried.getvalue())
                     stop.assert_called_once()
                     self.assertIn("1 of 1 sessions stopped", path.read_text())
 
@@ -2408,7 +2466,7 @@ class RestartTests(RestartTestCase):
             with (self.subTest(variable=variable),
                   patch.dict(os.environ, {variable: str(self.rows[0].current_session)}),
                   patch.object(restart, "live_rows", return_value=restart.CompleteLiveRows([self.rows[0]])),
-                  patch.object(stop_resume, "detach", create=True, return_value=self.root / "restart.log") as detach,
+                  patch.object(stop_resume, "detach", create=True, side_effect=self.claim_detached_log) as detach,
                   patch.object(restart, "stop_row") as stop,
                   patch.object(restart, "start_row") as start,
                   patch.object(staff, "row_operation"),
@@ -2417,8 +2475,9 @@ class RestartTests(RestartTestCase):
                 detach.assert_called_once()
                 stop.assert_not_called()
                 start.assert_not_called()
-                self.assertIn(str(self.root / "restart.log"), output.getvalue())
-                self.assertEqual(len(output.getvalue().splitlines()), 1)
+                path = cast(Path, detach.call_args.kwargs["log"])
+                self.assertEqual(output.getvalue().splitlines(), [
+                    f"{path}  agents restart runs in the background. Read its report in this log."])
 
     def test_restart_only_keeps_worker_and_owner_operations_within_selected_rows(self) -> None:
         owner = self.rows[0]
@@ -4201,7 +4260,7 @@ class RestartTests(RestartTestCase):
         shutdown_record.save(["earlier"])
         selected = [str(row.id) for row in self.rows]
         with (patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": str(self.rows[0].current_session)}),
-              patch.object(stop_resume, "detach", return_value=self.root / "stop.log") as detached):
+              patch.object(stop_resume, "detach", side_effect=self.claim_detached_log) as detached):
             self.assertEqual(shutdown.main(["stop", "--all"]), 0)
         arguments = cast(list[str], detached.call_args.args[0])
         self.assertEqual(arguments[:-1], ["stop", "--all", "--only", ",".join(selected), "--parent-report"])

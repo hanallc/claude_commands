@@ -12,6 +12,7 @@ import json
 import math
 import os
 import shlex
+import socket
 import subprocess
 import sys
 import time
@@ -287,10 +288,10 @@ class DetachedReport(TypedDict):
     issues: dict[str, FollowUpFields]
 
 
-class LogHandoff(Enum):
-    LOCAL = "the parent can write the result"
-    TIMED_OUT = "the launcher timed out before it confirmed the start"
-    STARTED = "the launcher confirmed the child started"
+class LogWriter(Enum):
+    LOCAL = "this process owns the report"
+    CHILD = "the child claimed the report"
+    UNKNOWN = "this process could not check the claim"
 
 
 @dataclass
@@ -304,7 +305,7 @@ class BulkReport:
     issues: dict[str, FollowUp] = field(default_factory=dict)
     preview: list[str] = field(default_factory=list)
     inherited: set[str] = field(default_factory=set)
-    handoff: LogHandoff = LogHandoff.LOCAL
+    writer: LogWriter = LogWriter.LOCAL
     log_stream: io.FileIO | None = None
     log_error: OSError | ValueError | None = None
 
@@ -432,6 +433,15 @@ def _create_log(files: ExitStack, path: Path) -> io.FileIO:
     return log
 
 
+def _claim_log(log: Path) -> bool:
+    try:
+        descriptor = os.open(log.with_suffix(".claim"), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        return False
+    os.close(descriptor)
+    return True
+
+
 def _write_log(log: io.FileIO, text: str) -> None:
     data = text.encode("utf-8")
     if log.write(data) != len(data):
@@ -505,17 +515,15 @@ def run_command(action: Callable[[], int], arguments: list[str], *, stop: bool =
             code = 2
         finally:
             _BULK_REPORT.reset(token)
-        if detached is None and log is not None:
-            if report.handoff is LogHandoff.TIMED_OUT:
-                print(f"  {_background_status(report.command)}", flush=True)
-            else:
-                print(flush=True)
-        if report.handoff is not LogHandoff.LOCAL:
+        if report.writer is LogWriter.CHILD:
+            print(f"  {_background_status(report.command)}", flush=True)
             return code
+        if detached is None and log is not None:
+            print(flush=True)
         if code and not report.issues:
             report.failure("", report.command, "Could not complete the command")
         result = "\n".join(report.lines(dry_run=dry_run)) + "\n"
-        if log is not None:
+        if log is not None and report.writer is LogWriter.LOCAL:
             try:
                 _write_log(log, result)
                 if detached is not None:
@@ -713,6 +721,8 @@ def _error_reason(error: object) -> str:
 
 
 def _launch_failure_reason(error: Exception) -> str:
+    if isinstance(error, subprocess.TimeoutExpired):
+        return "The launcher timed out before the detached process claimed the log"
     if isinstance(error, FileNotFoundError) and cast(object, error.filename) == "systemd-run":
         return "The systemd-run command is missing"
     if isinstance(error, subprocess.CalledProcessError):
@@ -1471,6 +1481,48 @@ class AfterStop(Enum):
     KEEP_STOPPED = "keep the selected rows for the next restart"
 
 
+def _detach_stop(arguments: list[str], selected: list[staff.StaffRow], record: staff.StaffSnapshot) -> int:
+    report = _BULK_REPORT.get()
+    if report is None:
+        return run_command(lambda: _detach_stop(arguments, selected, record), arguments, stop=arguments[0] == "stop")
+    for row in selected:
+        report.track(row, record)
+
+    stream = report.log_stream
+    if stream is None:
+        step = report.log_repair_step()
+        detail = _error_reason(report.log_error) if report.log_error is not None else "The log is unavailable"
+        reason = f"Could not write the log. {detail}"
+        for key, issue in report.issues.items():
+            if issue.operator and issue.step == f"Nate runs {report.retry} again.":
+                report.issues[key] = replace(issue, step=step)
+    else:
+        launch_error: Exception | None = None
+        try:
+            _ = stop_resume.detach([*arguments, "--parent-report", report.detach_data()], "restart",
+                                   program=Path(__file__).resolve(), log=report.log, log_fd=stream.fileno())
+        except Exception as error:
+            launch_error = error
+        try:
+            claimed = _claim_log(report.log)
+        except OSError as error:
+            report.writer = LogWriter.UNKNOWN
+            reason = f"Could not claim the log. {_error_reason(error)}"
+            step = "Nate sends this error to the efficiency unit."
+        else:
+            if not claimed:
+                report.writer = LogWriter.CHILD
+                return 0
+            detail = (_launch_failure_reason(launch_error) if launch_error is not None else
+                      "The detached process did not claim the log")
+            reason = f"The launcher could not start the detached command. {detail}"
+            step = f"Nate opens a plain terminal without a staff session. Nate runs {report.retry} there."
+
+    for row in selected:
+        report.issues[row.id] = FollowUp(report.targets[row.id], reason, step, operator=True)
+    return 2
+
+
 def stop_all(*, dry_run: bool = False, only: tuple[str, ...] = (),
              account: AllRestartAccounts | accounts.AccountSelection = ALL_RESTART_ACCOUNTS) -> int:
     return restart(stop_all=True, dry_run=dry_run, only=only, account=account, after_stop=AfterStop.KEEP_STOPPED)
@@ -1631,45 +1683,7 @@ def _restart(pane_evidence: ExitStack, *, stop_all: bool, dry_run: bool, only: t
             if after_stop is AfterStop.KEEP_STOPPED:
                 arguments.append("--account")
             arguments.append(account.label)
-        if report is None:
-            path = shutdown_state_root() / "logs" / f"restart-{uuid4().hex}.log"
-            with ExitStack() as files:
-                stream = _create_log(files, path)
-                try:
-                    log = stop_resume.detach(arguments, "restart", program=Path(__file__).resolve(),
-                                             log=path, log_fd=stream.fileno())
-                except subprocess.TimeoutExpired:
-                    command = "agents stop --all" if after_stop is AfterStop.KEEP_STOPPED else "agents restart"
-                    print(f"{path}  {_background_status(command)}")
-                    return 0
-            print(f"restart continues outside this session; log: {log}")
-        else:
-            if report.log_stream is None:
-                step = report.log_repair_step()
-                reason = _error_reason(report.log_error) if report.log_error is not None else "The log is unavailable"
-                for key, issue in report.issues.items():
-                    if issue.operator and issue.step == f"Nate runs {report.retry} again.":
-                        report.issues[key] = replace(issue, step=step)
-                for row in selected:
-                    report.issues[row.id] = FollowUp(report.targets[row.id],
-                        f"Could not write the log. {reason}", step, operator=True)
-                return 2
-            arguments.extend(("--parent-report", report.detach_data()))
-            try:
-                _ = stop_resume.detach(arguments, "restart", program=Path(__file__).resolve(),
-                                       log=report.log, log_fd=report.log_stream.fileno())
-            except subprocess.TimeoutExpired:
-                report.handoff = LogHandoff.TIMED_OUT
-                return 0
-            except Exception as error:
-                reason = _launch_failure_reason(error)
-                step = f"Nate opens a plain terminal without a staff session. Nate runs {report.retry} there."
-                for row in selected:
-                    report.issues[row.id] = FollowUp(report.targets[row.id],
-                        f"The launcher could not start the detached command. {reason}", step, operator=True)
-                return 2
-            report.handoff = LogHandoff.STARTED
-        return 0
+        return _detach_stop(arguments, selected, record)
     lock_wait = conf.read("shutdown").number("UPKEEP_ROW_WAIT_SECONDS") if holders else 0
     from scripts.herdr.worker_panes import (
         CheckedRolePolicy, StartRefused, checked_role_policy, dispatch_role, use_checked_resume_policies,
@@ -1999,21 +2013,47 @@ def _restart(pane_evidence: ExitStack, *, stop_all: bool, dry_run: bool, only: t
     return exit_code
 
 
+def _notify_log_claim(ready_fd: int | None, *, systemd: bool) -> None:
+    if ready_fd is not None:
+        try:
+            with suppress(BrokenPipeError):
+                _ = os.write(ready_fd, b"1")
+        finally:
+            os.close(ready_fd)
+    if systemd:
+        address = os.environ.pop("NOTIFY_SOCKET", "")
+        if not address:
+            raise OSError("The systemd readiness socket is unavailable")
+        with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as notifier:
+            notifier.connect("\0" + address[1:] if address.startswith("@") else address)
+            _ = notifier.send(b"READY=1")
+
+
 def main() -> int:
     """Run detached restart work and save its output."""
     if __name__ == "__main__":
         sys.modules["scripts.agents.restart"] = sys.modules[__name__]
-    command = cast(AgentsCommand, cast(object, import_module("scripts.agents.shutdown")))
-
     parser = argparse.ArgumentParser(add_help=False)
     _ = parser.add_argument("--log", type=Path, required=True)
     _ = parser.add_argument("--log-fd", type=int, required=True)
+    _ = parser.add_argument("--ready-fd", type=int)
+    _ = parser.add_argument("--notify-systemd", action="store_true")
     _ = parser.add_argument("--requester", default="")
     _ = parser.add_argument("--parent-report", type=json.loads)
     options, arguments = parser.parse_known_args()
+    log = cast(Path, options.log)
+    try:
+        if not _claim_log(log):
+            return 0
+        _notify_log_claim(cast(int | None, options.ready_fd), systemd=cast(bool, options.notify_systemd))
+    except OSError as error:
+        print(f"Could not confirm the log claim at {log}. {_error_reason(error)}", file=sys.stderr, flush=True)
+        return 2
+
+    command = cast(AgentsCommand, cast(object, import_module("scripts.agents.shutdown")))
     _ = os.environ.pop("CLAUDE_CODE_SESSION_ID", None)
     _ = os.environ.pop("CODEX_THREAD_ID", None)
-    token = _DETACHED_LOG.set(DetachedLog(cast(Path, options.log), cast(int, options.log_fd)))
+    token = _DETACHED_LOG.set(DetachedLog(log, cast(int, options.log_fd)))
     data_token = _DETACHED_REPORT.set(cast(DetachedReport | None, options.parent_report))
     try:
         return command.main(arguments)
