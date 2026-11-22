@@ -6,6 +6,7 @@ import sqlite3
 import subprocess
 import tempfile
 import unittest
+from collections.abc import Mapping
 from concurrent.futures import Future
 from contextlib import closing
 from dataclasses import replace
@@ -13,9 +14,11 @@ from datetime import UTC, date
 from pathlib import Path
 from threading import Thread
 from unittest import mock
+from xml.etree import ElementTree
 
 from scripts.aws_target import hana_box, hana_placement
 from scripts.build_queue import admission_protocol as wire, admission_records as records, limits_view, queue_view
+from scripts.build_queue import snapshot_codec, test_memory_hover
 from scripts.build_queue.admission_wire import ReservedCloudSlot
 from scripts.build_queue.cloud_progress import NoCloudProgress
 from scripts.build_queue.progress_profile import NoCounter
@@ -27,6 +30,10 @@ from scripts.buildlog import repository, store
 from scripts.lib.git_test_support import commit_repository, fixture_git_environment
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.mac_test import claim_state
+
+
+def wait_names(groups: Mapping[str, limits_view.WaitGroup]) -> dict[str, list[str]]:
+    return {heading: group.names for heading, group in groups.items()}
 
 
 class BuildLimitsTests(unittest.TestCase):
@@ -138,37 +145,37 @@ class BuildLimitsTests(unittest.TestCase):
 
         with mock.patch.object(repository, "output", side_effect=AssertionError("Git read in the feed tick")):
             shown = show(queue)
-        self.assertEqual([(row.name, row.owner, row.quiet) for row in shown.repositories], [
-            ("hana", "", False), ("project", "team · example.invalid", False), ("project", "other", True),
-            ("project", "team · fork.invalid", True), ("quiet", "", True),
+        self.assertEqual([(row.name, row.quiet) for row in shown.repositories], [
+            ("hana", False), ("project", False), ("quiet", True),
         ])
-        hana_row, project_row, spare_project, fork_row, quiet = shown.repositories
-        self.assertIsNone(fork_row.natedev.limit)
+        hana_row, project_row, quiet = shown.repositories
         cell = project_row.natedev
         self.assertEqual((cell.used, cell.limit, cell.runs, cell.merge_above), (2, 1, ["regular"], ["merge-owner"]))
-        self.assertEqual(cell.waits, {"The run limit for project on natedev is full.": ["Run limit"]})
+        self.assertEqual(wait_names(cell.waits), {"1 run waits because the run limit for project on natedev is full.": ["Run limit"]})
         self.assertIsNone(quiet.natedev.limit)
-        self.assertEqual(spare_project.natedev.used, 0)
+        self.assertEqual(quiet.natedev.used, 0)
         self.assertEqual(shown.natedev.unattributed, 1)
         meters = {metric.label: (metric.used, metric.limit) for metric in shown.natedev.shared}
         self.assertEqual(meters["Repository run limit"], (1, 2))
         self.assertNotIn("unmatched run limit", meters)
-        self.assertEqual(shown.natedev.waits, {
-            "The repository run limit is full.": [""],
-            "The run limit for unmatched on natedev is full.": ["Unbound wait"],
+        self.assertEqual(wait_names(shown.natedev.waits), {
+            "1 run waits because the repository run limit is full.": [""],
+            "1 run waits because the run limit for unmatched on natedev is full.": ["Unbound wait"],
         })
         self.assertEqual((hana_row.aws.used, hana_row.aws.limit), (None, 1))
-        self.assertEqual(next(metric for metric in shown.natedev.shared if metric.label == "disk").waits,
-                         {"The build disk has less free space than the queue requires.": ["Disk wait"]})
-        self.assertEqual(shown.natedev.shared[0].waits,
-                         {"This run needs more free memory to start.": ["Memory wait", ""]})
-        self.assertEqual(shown.aws.waits, {"The queue cannot check whether this run can start.": ["AWS target wait"]})
-        self.assertEqual(shown.unplaced, {"The queue can start this run at its next check.": ["Unplaced wait"]})
+        disk = next(metric for metric in shown.natedev.shared if metric.label == "disk")
+        self.assertEqual(wait_names(disk.waits),
+                         {"1 run waits because the build disk has less free space than the queue requires.": ["Disk wait"]})
+        self.assertEqual(wait_names(shown.natedev.shared[0].waits),
+                         {"1 run needs more free memory to start.": ["Memory wait", ""]})
+        self.assertEqual(wait_names(shown.aws.waits),
+                         {"1 run waits because the queue cannot check whether it can start.": ["AWS target wait"]})
+        self.assertEqual(wait_names(shown.unplaced), {"1 run can start at the queue's next check.": ["Unplaced wait"]})
         self.assertEqual((shown.aws.shared[0].used, shown.aws.shared[0].limit,
                           shown.aws.shared[0].reserved_waiting), (1, 4, 1))
-        self.assertEqual(shown.aws.shared[0].waits, {
-            "This run waits for a place on AWS.": ["Cloud wait"],
-            "This run has a place on AWS and waits for its machine to start.": ["Starting wait"],
+        self.assertEqual(wait_names(shown.aws.shared[0].waits), {
+            "1 run waits for a place on AWS.": ["Cloud wait"],
+            "1 run has a place on AWS and waits for its machine to start.": ["Starting wait"],
         })
         idle = limits_view.build_limits(reading, (), (), {}, {}, saved, UTC)
         self.assertEqual((idle.aws.shared[0].used, idle.aws.shared[0].limit), (0, 9))
@@ -179,13 +186,13 @@ class BuildLimitsTests(unittest.TestCase):
             explanation=replace(explanation,
             decided_from=replace(explanation.decided_from, reservations=reservations[1:2])))
         copy_limits = show(copy_only)
-        copy_cell = next(row.natedev for row in copy_limits.repositories if row.owner == "team · example.invalid")
+        copy_cell = next(row.natedev for row in copy_limits.repositories if row.name == "project")
         self.assertEqual((copy_cell.used, copy_cell.limit, copy_cell.runs), (1, 1, ["merge-owner"]))
         self.assertEqual(copy_cell.waits, cell.waits)
         self.assertEqual(copy_limits.natedev.waits, shown.natedev.waits)
         matching = replace(full, limit=2)
         check: records.Reservation = {**fixture_reservation(105, 0, step="check"), "repo": "project",
-                                      "repo_identity": primary, "unit": "check-owner"}
+                                      "repo_identity": fork, "unit": "check-owner"}
         within_limit = replace(queue,
             view=replace(queue.view, waiting=(replace(waiting[0], reason=matching), *waiting[1:])),
             explanation=replace(explanation,
@@ -193,7 +200,7 @@ class BuildLimitsTests(unittest.TestCase):
                 policy=replace(explanation.policy,
                     repository_runs=records.RepositoryRunLimits({"natedev.project": 2}, "merge-owner"))))
         within = show(within_limit)
-        merge_cell = next(row.natedev for row in within.repositories if row.owner == "team · example.invalid")
+        merge_cell = next(row.natedev for row in within.repositories if row.name == "project")
         self.assertEqual(merge_cell.merge_above, [])
         self.assertEqual(merge_cell.runs, ["regular", "merge-owner"])
         self.assertEqual((merge_cell.used, merge_cell.other_used), (2, 1))
@@ -207,15 +214,20 @@ class BuildLimitsTests(unittest.TestCase):
             )),
             explanation=replace(within_limit.explanation, policy=replace(within_limit.explanation.policy, gpu_tests=gpu)))
         wait_limits = show(conflicting_wait)
-        wait_cell = next(row.natedev for row in wait_limits.repositories if row.owner == "team · example.invalid")
+        wait_cell = next(row.natedev for row in wait_limits.repositories if row.name == "project")
         self.assertEqual(wait_cell.waits, cell.waits)
         self.assertIsNone(wait_cell.limit)
         self.assertIsNone(wait_cell.used)
         self.assertEqual(wait_cell.runs, [])
         self.assertEqual((wait_cell.other_used, wait_cell.other), (1, ["check-owner"]))
         gpu_meter = next(metric for metric in wait_limits.natedev.shared if metric.label == "gpu")
-        self.assertEqual((gpu_meter.used, gpu_meter.limit, gpu_meter.waits),
-                         (None, None, {"All GPU test places are in use.": ["Memory wait"]}))
+        self.assertEqual((gpu_meter.used, gpu_meter.limit, wait_names(gpu_meter.waits)),
+                         (None, None, {"1 run waits because all GPU test places are in use.": ["Memory wait"]}))
+        behind = records.BehindHead("fixture", now, "")
+        self.check_page(show(replace(queue, view=replace(queue.view, waiting=(
+            replace(waiting[2], reason=behind), replace(waiting[5], reason=behind),
+            replace(waiting[3], reason=behind),
+        )))))
         self.check_policy_evidence(queue, saved, reservations[0], primary, fork)
         self.check_hana_claim(hana)
         self.check_cache_expiry()
@@ -241,7 +253,7 @@ class BuildLimitsTests(unittest.TestCase):
             return limits_view.build_limits(reading, (), (), {}, {}, saved, UTC)
 
         def project(shown: limits_view.BuildLimits) -> limits_view.Cell:
-            return next(row.natedev for row in shown.repositories if row.owner == "team · example.invalid")
+            return next(row.natedev for row in shown.repositories if row.name == "project")
 
         one_key = project(show(first, unrelated))
         self.assertEqual((one_key.used, one_key.limit), (1, 2))
@@ -249,13 +261,21 @@ class BuildLimitsTests(unittest.TestCase):
         self.assertEqual((project(shown).used, project(shown).limit), (1, 2))
         other = next(row.natedev for row in shown.repositories if row.name == "other")
         self.assertEqual((other.used, other.limit), (1, 2))
-        self.assertEqual(next(row.natedev.used for row in shown.repositories if row.owner == "team · fork.invalid"), 0)
         self.assertEqual(sum(row.natedev.other_used for row in shown.repositories), 0)
         self.assertEqual(shown.natedev.unattributed, 0)
         self.assertEqual(shown.natedev.shared[-1].label, "Repository run limit")
-        self.assertEqual(limits_view.wait_text(records.RunLimitWait(1, 1, root_key, "natedev")),
-                         "The repository run limit is full.")
-        for origin in ("", fork):
+        self.assertEqual(limits_view.wait_words(records.RunLimitWait(1, 1, root_key, "natedev")).one,
+                         "1 run waits because the repository run limit is full.")
+        fork_gate: records.Reservation = {**fixture_reservation(505, 0, step="gate"), "repo": "project",
+                                          "repo_identity": fork, "unit": "fork-owner"}
+        joined = project(show(first, fork_gate))
+        self.assertEqual((joined.used, joined.limit, joined.runs), (2, 2, ["regular", "fork-owner"]))
+        separate = show(first, {**fork_gate, "repo": "project-local"})
+        self.assertIsNone(project(separate).limit)
+        meters = {metric.label: (metric.used, metric.limit) for metric in separate.natedev.shared}
+        self.assertEqual(meters["project run limit"], (1, 2))
+        self.assertEqual(meters["project-local run limit"], (1, 1))
+        for origin in ("", second_origin):
             with self.subTest(origin=origin):
                 conflicting: records.Reservation = {**fixture_reservation(503, 0, step="gate"), "repo": "project",
                                                     "repo_identity": origin}
@@ -274,6 +294,23 @@ class BuildLimitsTests(unittest.TestCase):
             **first, "step": "check", "repo": "project-local", "repo_identity": "https://example.invalid/team/upstream",
         }).repositories if row.name == "upstream")
         self.assertEqual((unrestricted.used, unrestricted.limit, unrestricted.has_limit_key), (1, None, True))
+
+    def check_page(self, shown: limits_view.BuildLimits) -> None:
+        rendered = test_memory_hover.MemoryHoverTests().page_expression(
+            "(renderBuildLimits(data.build_limits), $('build-limits-content').innerHTML)",
+            {"build_limits": snapshot_codec.snapshot_value(shown)}, limits=True)
+        assert isinstance(rendered, str)
+        table = ElementTree.fromstring(f"<root>{rendered}</root>")
+        headings = table.findall(".//thead/tr/th")
+        self.assertIn("2 runs wait behind an earlier step in the queue.", "".join(headings[1].itertext()))
+        self.assertIn("1 run waits behind an earlier step in the queue.", "".join(headings[2].itertext()))
+        self.assertNotIn("2 waiting", rendered)
+        self.assertNotIn("1 waiting", rendered)
+        self.assertIsNone(table.find(".//tbody/tr/th/small"))
+        quiet = next(row for row in table.findall(".//tbody/tr") if row.findtext("th") == "quiet")
+        cells = quiet.findall("td")
+        self.assertEqual(cells[0].findtext("span[@class='build-limit-note']"), "No limit")
+        self.assertEqual("".join(cells[1].itertext()), "")
 
     def check_cache_expiry(self) -> None:
         cache = limits_view.SourceCache[int]()
