@@ -1505,6 +1505,24 @@ class ClientTests(unittest.TestCase):
             self.assertEqual(len(transport.requests), 1)
             self.assertIn(records.run_limit_text(reply.reason), errors.getvalue())
 
+    def test_verify_run_slot_reports_the_first_answer_after_each_reconnect(self) -> None:
+        with AdmissionFixture() as fixture:
+            owner = fixture.run_owner()
+            first, second, third = (wire.VerifyRunSlotWaiting(records.RunLimitWait(
+                count, count, "fixture", fixture.server.host)) for count in (1, 2, 3))
+            transport = self.use_transport(fixture, Exchange(reply_bytes(first), b""),
+                Exchange(reply_bytes(second), reply_bytes(second), b""),
+                Exchange(reply_bytes(third) + reply_bytes(wire.Ok())))
+            with redirect_stderr(io.StringIO()) as errors:
+                status = client.main(["verify-run-slot", "--pid", str(owner.pid)])
+            self.assertEqual(status, 0, errors.getvalue())
+            self.assertEqual(len(transport.requests), 3)
+            self.assertEqual(transport.requests, [transport.requests[0]] * 3)
+            self.assertEqual([line for line in errors.getvalue().splitlines() if line.startswith("queue reached again")], [
+                f"queue reached again: 2 of 2 fixture runs on {fixture.server.host}",
+                f"queue reached again: 3 of 3 fixture runs on {fixture.server.host}",
+            ])
+
     def test_generation_outage_after_expiry_keeps_the_leave_hook_time_and_cli_status(self) -> None:
         for failure in (b"", b"invalid generation reply\n"):
             with self.subTest(failure=failure), AdmissionFixture() as fixture:
@@ -1565,6 +1583,7 @@ class ClientTests(unittest.TestCase):
                     self.assertEqual(errors.getvalue().count("build queue not reachable; trying for 5 s"), 1)
                     self.assertEqual(errors.getvalue().count(
                         "build queue unreachable for 5 s; step stopped; cargo token given back"), 1)
+                    self.assertNotIn("queue reached again", errors.getvalue())
                     self.assertNotIn("step refused", errors.getvalue())
                     self.doCleanups()
 
@@ -2676,14 +2695,17 @@ class ClientTests(unittest.TestCase):
     def test_closed_connection_reconnects_immediately_with_same_episode_and_since(self) -> None:
         with AdmissionFixture() as fixture:
             request = fixture.request()
+            gpu_wait = reply_bytes(wait_reply(records.GpuSlotWait(1, 1), 1, "head", "GPU test slot"))
             transport = self.use_transport(fixture, Exchange(reply_bytes(WAIT), b""),
-                Exchange(reply_bytes(WAIT), b""), Exchange(reply_bytes(GRANTED)))
+                Exchange(gpu_wait, gpu_wait, b""), Exchange(reply_bytes(WAIT) + reply_bytes(GRANTED)))
             with redirect_stderr(io.StringIO()) as output:
                 result = client.admit(request, lambda _wait: None, lambda: request)
             self.assertEqual(result, GRANTED)
             self.assertEqual(transport.requests, [request] * 3)
             self.assertEqual(transport.attempts, [0, 0, 0])
             self.assertEqual(output.getvalue().count("admission service restarted; waiting again"), 1)
+            self.assertEqual([line for line in output.getvalue().splitlines() if line.startswith("queue reached again")],
+                ["queue reached again: GPU test slot", "queue reached again: free memory"])
 
     def test_silent_service_reports_after_120_seconds_and_keeps_waiting(self) -> None:
         with AdmissionFixture() as fixture:

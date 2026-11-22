@@ -858,6 +858,40 @@ def _begin_unreachable(retry: AcquisitionRetry, configuration: records.MemoryCon
         print(f"build queue not reachable; trying for {duration}", file=sys.stderr)
 
 
+@dataclass
+class ReconnectNotice:
+    pending: bool = False
+    restart_reported: bool = False
+
+    def disconnected(self, *, restarted: bool = False) -> None:
+        self.pending = True
+        if restarted and not self.restart_reported:
+            print("admission service restarted; waiting again", file=sys.stderr)
+            self.restart_reported = True
+
+    def reached(self, reply: wire.Reply) -> None:
+        if not self.pending:
+            return
+        self.pending = False
+        reason = " ".join(_reconnect_wait_reason(reply).splitlines())
+        print("queue reached again" + (f": {reason}" if reason else ""), file=sys.stderr, flush=True)
+
+
+def _reconnect_wait_reason(reply: wire.Reply) -> str:
+    from scripts.build_queue import admission_records as records
+
+    wait = reply.wait if isinstance(reply, wire.PlacementWait) else reply
+    if isinstance(wait, (wire.Wait, wire.RepositorySlotWaiting)):
+        return wait.text
+    if isinstance(wait, wire.VerifyRunSlotWaiting):
+        return records.run_limit_text(wait.reason)
+    if isinstance(wait, wire.PlacementResourceWait):
+        return f"waiting for {wait.resource}: {wait.reason}"
+    if isinstance(wait, wire.PlacementEvidenceWait):
+        return "waiting for host evidence"
+    return ""
+
+
 def _transport_failure(error: OSError, retry: AcquisitionRetry,
                        configuration: records.MemoryConfig | wire.AcquisitionTiming | wire.CleanupTiming,
                        *, bound_outage: bool) -> bool:
@@ -904,7 +938,7 @@ def _control_reply(request: wire.Request, retry: AcquisitionRetry,
         return wire.Refused(LAUNCH_WAIT_LIMIT_REASON) if generation_query else refuse(LAUNCH_WAIT_LIMIT_REASON, checker=True)
 
     last_valid = last_notice = CLOCK.monotonic()
-    restarted = False
+    reconnect = ReconnectNotice()
     showed_slot = False
     verify_wait_text = ""
     while True:
@@ -949,6 +983,7 @@ def _control_reply(request: wire.Request, retry: AcquisitionRetry,
                     reply = _parse_acquisition_reply(line, request)
                     if CLOCK.monotonic() > retry.deadline:
                         return deadline_reply()
+                    reconnect.reached(reply)
                     retry.unreachable_deadline = (CLOCK.monotonic() + configuration.unreachable_limit_seconds
                         if isinstance(configuration, wire.AcquisitionTiming) else float("inf"))
                     if isinstance(reply, wire.Refused):
@@ -1011,10 +1046,10 @@ def _control_reply(request: wire.Request, retry: AcquisitionRetry,
                 return deadline_reply()
             if (expired := retry.expired()) is not None:
                 return deadline_reply(expired)
-            if _transport_failure(error, retry, configuration, bound_outage=bound_outage):
-                if not restarted:
-                    print("admission service restarted; waiting again", file=sys.stderr)
-                    restarted = True
+            restarted = _transport_failure(error, retry, configuration, bound_outage=bound_outage)
+            if restarted or bound_outage:
+                reconnect.disconnected(restarted=restarted)
+            if restarted:
                 continue
             CLOCK.sleep(retry.bound(configuration.reconnect_seconds))
 
@@ -1146,7 +1181,9 @@ def _wait_for_admission_reply(sockets: AcquisitionSockets, initial_request: Admi
     last_valid = last_notice = reconnect_at = CLOCK.monotonic()
     if isinstance(configuration, wire.AcquisitionTiming) and retry.unreachable_deadline == math.inf:
         retry.unreachable_deadline = last_valid + configuration.unreachable_limit_seconds
-    had_wait = restarted = estimate_pending = False
+    had_wait = estimate_pending = False
+    reconnect = ReconnectNotice()
+    replacement_peer: socket.socket | None = None
     waiting_callback: tuple[socket.socket, wire.Wait] | None = None
     refreshing: EstimateRefresh | None = None
     refreshed_write: tuple[socket.socket, AdmissionRequest] | None = None
@@ -1161,11 +1198,9 @@ def _wait_for_admission_reply(sockets: AcquisitionSockets, initial_request: Admi
         checker.fail(error, interval, failure_limit)
 
     def transport_failed(error: OSError) -> None:
-        nonlocal restarted
         _begin_unreachable(retry, configuration)
-        if _transport_failure(error, retry, configuration, bound_outage=False) and not restarted:
-            print("admission service restarted; waiting again", file=sys.stderr)
-            restarted = True
+        restarted = _transport_failure(error, retry, configuration, bound_outage=False)
+        reconnect.disconnected(restarted=restarted)
 
     if (expired := retry.expired()) is not None:
         return request, expired
@@ -1194,6 +1229,14 @@ def _wait_for_admission_reply(sockets: AcquisitionSockets, initial_request: Admi
         checker_due = False
         if sockets.terminal() is None:
             sockets.drain(request)
+        if replacement_peer is not None and replacement_peer is sockets.owner:
+            owner_stream = sockets.streams.get(replacement_peer)
+            if owner_stream is not None:
+                for answer in owner_stream.replies:
+                    if isinstance(answer, (wire.Wait, wire.Admitted, wire.LaunchAdmitted, wire.Refused)):
+                        reconnect.reached(answer)
+                        replacement_peer = None
+                        break
         if refreshed_write is not None:
             written_peer, written_request = cast(tuple[socket.socket, AdmissionRequest], refreshed_write)
             stream = sockets.streams[written_peer]
@@ -1248,6 +1291,7 @@ def _wait_for_admission_reply(sockets: AcquisitionSockets, initial_request: Admi
                 and (message is None or message[0] is not history.connection or isinstance(message[1], wire.Wait))):
             fail_history(CheckerFailure("no build history generation answer"))
             _begin_unreachable(retry, configuration)
+            reconnect.disconnected()
             if len(sockets.streams) == 1:
                 reconnect_at = min(reconnect_at, now)
             continue
@@ -1259,6 +1303,7 @@ def _wait_for_admission_reply(sockets: AcquisitionSockets, initial_request: Admi
             _silence_notice(last_valid)
             last_notice = now
             _begin_unreachable(retry, configuration)
+            reconnect.disconnected()
             if len(sockets.streams) == 1 and reconnect_at == math.inf:
                 reconnect_at = now
 
@@ -1278,6 +1323,8 @@ def _wait_for_admission_reply(sockets: AcquisitionSockets, initial_request: Admi
                         transport_failed(error)
                         reconnect_at = now + interval
                     else:
+                        if reconnect.pending:
+                            replacement_peer = sockets.owner
                         reconnect_at = math.inf
                         if len(sockets.streams) == 1:
                             last_notice = now
