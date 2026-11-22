@@ -1697,6 +1697,7 @@ class ReplyPublicationTests(unittest.TestCase):
             assert isinstance(result, gate.PassResult)
             assert isinstance(policy, records.AdmissionPolicy)
             reading = replace(gate.queue_read_from_pass(inputs, policy, result), diagnostics=server.last_diagnostics)
+            reading = replace(reading, view=replace(reading.view, move_line=server.move_line))
             expected_view = wire.encode_reply(wire.ViewReply(reading)).encode()
             expected_explain = wire.encode_reply(wire.ExplainReply(reading.explanation, reading.diagnostics)).encode()
             with mock.patch.object(wire, "encode_reply", wraps=wire.encode_reply) as encode:
