@@ -7867,6 +7867,39 @@ class MacMirrorTakeTests(SweepCase):
             self.assertEqual((unit / "lib-crate").read_text(), "d0123456789abcde")
         self.assertEqual(self.trim_rows(), [])
 
+    def test_mac_take_stops_when_a_profile_lock_appears_after_the_lock_listing(self) -> None:
+        target = self.mirror_target("sample", 100)
+        old, new = self.old_and_new_fingerprints(target)
+        late_lock = target / "late-profile/.cargo-lock"
+        recheck = sweep.recheck_mac_cargo_locks
+        listdir = os.listdir
+        rechecking: list[bool] = []
+
+        def recheck_with_probe(held: sweep.HeldMacTakeTarget, entry: removal_guard.CheckedEntry,
+                               deadline: sweep.MacFloorDeadline) -> None:
+            rechecking.append(True)
+            try:
+                recheck(held, entry, deadline)
+            finally:
+                _ = rechecking.pop()
+
+        def list_then_add_a_profile(path: int | str = ".") -> list[str]:
+            names = listdir(path)
+            if (rechecking and isinstance(path, int) and not late_lock.exists()
+                    and os.path.samestat(os.fstat(path), target.stat())):
+                late_lock.parent.mkdir()
+                _ = late_lock.write_text("")
+            return names
+
+        with (mock.patch.object(sweep, "free_bytes", return_value=GIB),
+              mock.patch.object(sweep, "recheck_mac_cargo_locks", side_effect=recheck_with_probe),
+              mock.patch.object(os, "listdir", side_effect=list_then_add_a_profile)):
+            self.assertEqual(self.take(2 * GIB), 1)
+        self.assertTrue(late_lock.exists())
+        for unit in (old, new):
+            self.assertEqual((unit / "lib-crate").read_text(), "d0123456789abcde")
+        self.assertEqual(self.trim_rows(), [])
+
     def test_mac_take_stops_inside_a_whole_target_at_the_floor(self) -> None:
         target = self.mirror_target("older", 100)
         _ = (target / "CACHEDIR.TAG").write_bytes(b"second")
@@ -7924,6 +7957,24 @@ class MacMirrorTakeTests(SweepCase):
         self.assertEqual({row["folder"] for row in self.trim_rows()},
                          {str(target / "debug/.fingerprint/crate-0000000000000001")
                           for target in (warm, idle)})
+
+    def test_mac_take_keeps_a_profile_dep_info_file_without_a_cargo_artifact(self) -> None:
+        private = self.mirror_target("private", 100)
+        built = self.mirror_target("built", 200)
+        notes = private / "debug/notes.d"
+        notes.parent.mkdir()
+        _ = notes.write_text("private notes")
+        binary = built / "debug/app"
+        binary.parent.mkdir()
+        _ = binary.write_bytes(b"binary")
+        binary.chmod(0o755)
+        _ = (built / "debug/app.d").write_text("app: src/main.rs")
+        with mock.patch.object(sweep, "free_bytes", return_value=GIB):
+            self.assertEqual(self.take(2 * GIB), 0)
+        self.assertEqual(notes.read_text(), "private notes")
+        self.assertEqual((private / ".rustc_info.json").read_bytes(), b"old build")
+        self.assertFalse(built.exists())
+        self.assertEqual([row["folder"] for row in self.trim_rows()], [str(built)])
 
     def test_mac_take_stops_when_it_cannot_read_a_fingerprint_time(self) -> None:
         target = self.mirror_target("sample", 100)
@@ -7999,6 +8050,33 @@ class MacMirrorTakeTests(SweepCase):
         self.assertEqual((result["intent"], result["folder"], result["outcome"]),
                          (intent["id"], str(older / ".rustc_info.json"), "removed"))
         self.assertEqual((result["bytes_freed"], result["recovered"]), (0, True))
+
+    def test_mac_take_recovery_keeps_a_rebuilt_entry_and_records_the_old_one_removed(self) -> None:
+        older = self.mirror_target("older", 100)
+        newer = self.mirror_target("newer", 200)
+        output = older / ".rustc_info.json"
+        # A second link keeps the old inode in use, so the rebuilt file gets a new inode.
+        os.link(output, self.build_home / "old-inode")
+        append = store.append_line
+
+        def fail_result(path: Path, row: object) -> None:
+            match row:
+                case {"kind": "sweep_trim_entry"}:
+                    raise OSError("The buildlog cannot record the result")
+                case _:
+                    append(path, row)
+
+        with mock.patch.object(sweep, "free_bytes", return_value=GIB):
+            with mock.patch.object(store, "append_line", side_effect=fail_result):
+                self.assertEqual(self.take(2 * GIB), 1)
+            self.assertFalse(output.exists())
+            _ = output.write_bytes(b"new build")
+            self.assertEqual(self.take(2 * GIB), 0)
+        self.assertEqual(output.read_bytes(), b"new build")
+        self.assertEqual((newer / ".rustc_info.json").read_bytes(), b"old build")
+        [result] = [row for row in self.build_log_rows() if row.get("kind") == "sweep_trim_entry"]
+        self.assertEqual((result["folder"], result["outcome"], result["recovered"]),
+                         (str(output), "removed", True))
 
     def test_mac_take_keeps_a_target_with_a_live_child_build_lease(self) -> None:
         held = self.mirror_target("held", 100)

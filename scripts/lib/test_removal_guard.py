@@ -190,6 +190,52 @@ class RemovalGuardTests(unittest.TestCase):
                     os.rename("moved", staged.name, src_dir_fd=staged.parent, dst_dir_fd=staged.parent)
         self.assertEqual((target / "output").read_bytes(), b"build output")
 
+    def test_mirror_unlink_refuses_a_staging_ancestor_moved_outside_the_mirror(self) -> None:
+        guard = self.mirror_guard()
+        target = guard.root / "repo/target"
+        target.mkdir(parents=True)
+        _ = (target / "output").write_bytes(b"build output")
+        outside = self.fixture / "outside"
+        verify = removal_guard.require_identity
+        checked_names: list[str] = []
+
+        def move_ancestor(parent: int, name: str, expected: removal_guard.Identity) -> None:
+            verify(parent, name, expected)
+            checked_names.append(name)
+            if checked_names.count("output") == 2:
+                _ = (guard.root / "repo").rename(outside)
+
+        with guard.check(target) as checked:
+            inventory = removal_guard.inspect_mirror_output(checked, frozenset(), lambda: None)
+            with self.assertRaises(OSError), removal_guard.stage_mirror_output(checked) as staged:
+                with mock.patch.object(removal_guard, "require_identity", side_effect=move_ancestor):
+                    removal_guard.remove(staged, mirror=inventory)
+        self.assertEqual([path.read_bytes() for path in outside.glob(".mac-floor-*/target/output")],
+                         [b"build output"])
+
+    def test_mirror_stage_refuses_a_staging_folder_replaced_before_its_first_stat(self) -> None:
+        guard = self.mirror_guard()
+        target = guard.root / "repo/target"
+        target.mkdir(parents=True)
+        _ = (target / "output").write_bytes(b"build output")
+        make_folder = os.mkdir
+        replaced: list[str] = []
+
+        def replace_stage(path: str, mode: int = 0o777, *, dir_fd: int | None = None) -> None:
+            make_folder(path, mode, dir_fd=dir_fd)
+            os.rmdir(path, dir_fd=dir_fd)
+            make_folder(path, 0o755, dir_fd=dir_fd)
+            os.chmod(path, 0o755, dir_fd=dir_fd)
+            replaced.append(path)
+
+        with guard.check(target) as checked:
+            with (mock.patch.object(os, "mkdir", side_effect=replace_stage),
+                  self.assertRaises(removal_guard.ChangedEntry),
+                  removal_guard.stage_mirror_output(checked)):
+                self.fail("The take staged output in a replaced staging folder.")
+        self.assertEqual([(guard.root / "repo" / name).is_dir() for name in replaced], [True])
+        self.assertEqual((target / "output").read_bytes(), b"build output")
+
     def assert_refused(self, path: Path, reason: removal_guard.RefusalReason,
                        *, mounts: tuple[Path, ...] = ()) -> None:
         with self.assertRaises(removal_guard.Refused) as result:

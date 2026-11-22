@@ -241,7 +241,7 @@ The runner, the claim and the block are covered in [mac-test-offload.md](mac-tes
 - A lost run keeps the Mac busy until its leftovers are gone. The runner claims with `--remote <host>`; the claim (`RemoteJobClaim`) outlives its process until the printed `mac_exit=<n>` line with a confirmed cleanup marker, or a leftover check that counted no process (`check_leftovers` → `LeftoversEnded | LeftoversRemain(count) | LeftoverCheckFailed(reason)`). A later `claim --remote` for the same repository takes a kept claim over (exit 13). Leftovers decline `busy`; a failed check declines `unreachable`.
 - Every claim, remote or process-bound, starts a claim watcher (`mac_test.py watch-claim`, one at a time under `claim_watch.lock`). Every `claim_poll_seconds` (60) it checks the claim's host over ssh for the user's mirror work, `cargo`, `rustc`, `cargo-nextest` or binaries under a `/target/` path, sending no signal. After `claim_idle_minutes` (15) with none it deletes the unchanged claim and messages the holder's session (`holder_session`) how to claim again. A failed check changes nothing. Details are in [mac-test-offload.md](mac-test-offload.md) ("The idle claim").
 - A `busy` decline names its holder: `BusyMacDecline(holder: MacHolder)`, `MacHolder = KnownMacJob(what) | LostRunLeftovers | UnreadableMacHolder`, written as `holder=` in the result file.
-- `remote_test_command` sets `MACOSX_DEPLOYMENT_TARGET=14.0` (module constant `MACOSX_DEPLOYMENT_TARGET`), so a test binary that reaches a Swift bridge loads on the Mac. It also sends `BUILDLOG_SENT_TREE_KEY` when `copy_tree_with_key` read the same known tree key before and after the copy, and `LINT_SKIP_SWEEP=1` so the Mac's steps start no detached sweep. After the tests it removes the mirror's `target` folder only when the Mac's free space is below `free_floor_gib` (100 GiB), and keeps it otherwise (`mac_cleanup=kept`); a run that names `--target-dir` skips the cleanup with one line.
+- `remote_test_command` sets `MACOSX_DEPLOYMENT_TARGET=14.0` (module constant `MACOSX_DEPLOYMENT_TARGET`), so a test binary that reaches a Swift bridge loads on the Mac. It also sends `BUILDLOG_SENT_TREE_KEY` when `copy_tree_with_key` read the same known tree key before and after the copy, and `LINT_SKIP_SWEEP=1` so the Mac's steps start no detached sweep. After the tests, `remote_cleanup_command` trims the mirror's `target` folder to `mac_budget_gib` and prints a `mac_trim=` line. It then runs `sweep.py mac-floor-take <repo>`. The take removes idle Cargo output from the mirrors only while free space is below `sweep_floor_gib` (150 GiB), and only the shortfall, oldest first. It removes a whole `target` folder only when the folder belongs to another repository and holds only known Cargo output. From other targets it removes only old Cargo units. Exit 0 prints `mac_cleanup=kept`; another exit prints `mac_cleanup=<status>`. A run that names `--target-dir` skips the cleanup with one line (`mac_cleanup=skipped`).
 - `scripts/production/mac_run.sh` (the showrunner's Mac build) claims without `--remote`, so its claim lapses with its process. It builds hana and each example with `MACOSX_DEPLOYMENT_TARGET=14.0 ~/.cargo/bin/cargo build`, so a build typed in the Mac's clone reuses them. When `git merge-base --is-ancestor <sha> <clone head>` holds, it checks the commit out in one ssh call with no bundle.
 
 The Mac floor take checks free space before each unlink. Free space can change
@@ -251,8 +251,10 @@ each unlink. A same-user process can still replace an entry in the private
 staging directory between that check and the unlink.
 
 The take records each unlink intent before it removes the entry. If the result
-is missing, the next take records whether the entry remains. It keeps any
-staged files and ends that invocation without removing more output.
+is missing, the next take records whether the same entry, by device and inode,
+remains. A different entry at that path is a new entry: the take records the old
+entry as removed and keeps the new one. It keeps any staged files and ends that
+invocation without removing more output.
 
 ### The commands: `commands/build/`
 

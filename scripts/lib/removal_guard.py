@@ -433,8 +433,11 @@ class MirrorStageEntryState(Enum):
 
 
 def observe_mirror_stage(guard: RemovalGuard, parent: Path, parent_key: Identity, stage: str,
-                         stage_inode: int, entry: Path) -> MirrorStageEntryState:
-    """Check for an entry at its original or staged location without following links."""
+                         stage_inode: int, entry: Path, entry_key: Identity) -> MirrorStageEntryState:
+    """Find the recorded entry at its original or staged location without following links.
+
+    An entry with a different identity at either location is a new entry, not the recorded one.
+    """
     with ExitStack() as opened:
         root = open_mirror_root(guard.home, guard.root, guard.mounts, opened)
         if identity(os.fstat(root)) != guard.root_identity:
@@ -457,10 +460,10 @@ def observe_mirror_stage(guard: RemovalGuard, parent: Path, parent_key: Identity
                         if observed.st_dev != parent_key[0] or mount_id(child) != mount:
                             raise Refused(RefusalReason.MOUNT, name)
                         descriptor = child
-                    _ = os.stat(parts[-1], dir_fd=descriptor, follow_symlinks=False)
+                    info = os.stat(parts[-1], dir_fd=descriptor, follow_symlinks=False)
                 except FileNotFoundError:
                     return False
-            return True
+            return identity(info) == entry_key
 
         if present((stage, *entry.parts)):
             return MirrorStageEntryState.STAGED
@@ -545,10 +548,13 @@ def stage_mirror_output(checked: CheckedEntry) -> Generator[CheckedEntry]:
     stage = ".mac-floor-" + uuid4().hex
     checked.recheck()
     os.mkdir(stage, 0o700, dir_fd=checked.parent)
-    stage_key = identity(os.stat(stage, dir_fd=checked.parent, follow_symlinks=False))
+    checked.recheck()
+    stage_info = os.stat(stage, dir_fd=checked.parent, follow_symlinks=False)
+    stage_key = identity(stage_info)
     descriptor = os.open(stage, DIRECTORY_FLAGS, dir_fd=checked.parent)
     try:
-        if identity(os.fstat(descriptor)) != stage_key:
+        if (identity(os.fstat(descriptor)) != stage_key or stage_info.st_uid != os.geteuid()
+                or stat.S_IMODE(stage_info.st_mode) & 0o077 or os.listdir(descriptor)):
             raise ChangedEntry("the staging folder changed")
         require_identity(checked.parent, stage, stage_key)
         checked.recheck()
@@ -642,9 +648,10 @@ def remove(checked: CheckedEntry, *, account: Callable[[str, os.stat_result], No
         require_identity(parent, name, identity(before))
 
     def remove_name(parent: int, name: str, key: Identity, *, directory: bool) -> None:
-        if mirror is not None:
-            check_position()
         require_identity(parent, name, key)
+        if mirror is not None:
+            # Check the ancestors after the leaf, so that a move during the leaf check stops the unlink.
+            check_position()
         if directory:
             os.rmdir(name, dir_fd=parent)
         else:

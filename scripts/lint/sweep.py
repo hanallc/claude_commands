@@ -4341,7 +4341,16 @@ def require_held_mac_cargo_lock(held: HeldMacTakeTarget, parts: tuple[str, ...],
 
 def recheck_mac_cargo_locks(held: HeldMacTakeTarget, target: removal_guard.CheckedEntry,
                            deadline: MacFloorDeadline) -> None:
-    """Check the target and every current profile for new Cargo locks."""
+    """Check the target and every current profile for new Cargo locks.
+
+    A folder that changes during its check can hold a lock that the check did not see.
+    """
+    def unchanged(folder: int, parts: tuple[str, ...], before: os.stat_result) -> None:
+        after = os.fstat(folder)
+        if ((after.st_ino, after.st_mtime_ns, after.st_ctime_ns, after.st_nlink, after.st_size)
+                != (before.st_ino, before.st_mtime_ns, before.st_ctime_ns, before.st_nlink, before.st_size)):
+            raise removal_guard.ChangedEntry(f"a Cargo folder changed during the lock check: {target.path.joinpath(*parts)}")
+
     def check(parent: int, prefix: tuple[str, ...], names: Sequence[str]) -> None:
         for name in names:
             try:
@@ -4351,6 +4360,7 @@ def recheck_mac_cargo_locks(held: HeldMacTakeTarget, target: removal_guard.Check
             require_held_mac_cargo_lock(held, (*prefix, name), removal_guard.identity(info))
 
     def profiles(parent: int, prefix: tuple[str, ...]) -> None:
+        before = os.fstat(parent)
         for name in os.listdir(parent):
             deadline.check()
             if prefix and (name in MAC_OUTPUT_CATEGORIES or name.startswith(".mac-floor-")):
@@ -4366,8 +4376,10 @@ def recheck_mac_cargo_locks(held: HeldMacTakeTarget, target: removal_guard.Check
                 check(profile, parts, (*LOCK_NAMES, DOC_LOCK_NAME) if name == DOC_DIR else LOCK_NAMES)
                 if not prefix and name != DOC_DIR:
                     profiles(profile, parts)
+                unchanged(profile, parts, current)
             finally:
                 os.close(profile)
+        unchanged(parent, prefix, before)
 
     target.recheck()
     fd = os.open(target.name, removal_guard.DIRECTORY_FLAGS, dir_fd=target.parent)
@@ -4454,7 +4466,11 @@ def known_mac_cargo_output(parts: tuple[str, ...], entry: removal_guard.MirrorEn
             if not MAC_PROFILE_ARTIFACT.fullmatch(name):
                 return False
             if name.endswith(".d"):
-                return True
+                stem = name.removesuffix(".d")
+                return any(
+                    (artifact := inventory.entries.get((profile, stem + suffix))) is not None
+                    and stat.S_ISREG(artifact.mode) and (suffix != "" or bool(artifact.mode & 0o111))
+                    for suffix in ("", ".a", ".dylib", ".rlib", ".so"))
             dep_info = inventory.entries.get((profile, Path(name).stem + ".d"))
             return dep_info is not None and stat.S_ISREG(dep_info.mode) and (
                 "." in name or bool(entry.mode & 0o111))
@@ -4650,6 +4666,7 @@ class PendingMacFloorEntry:
     stage_inode: int
     parent_device: int
     parent_inode: int
+    entry_inode: int
     size: int
     last_use: float
 
@@ -4687,13 +4704,13 @@ def read_pending_mac_floor_entry(journal: Path) -> PendingMacFloorEntry | NoPend
         case {"intent": str(intent), "host": str(host), "at": (int() | float()) as at,
               "log_offset": int(offset), "path": str(path), "candidate": str(candidate), "stage": str(stage),
               "stage_inode": int(stage_inode),
-              "parent_device": int(device), "parent_inode": int(inode),
+              "parent_device": int(device), "parent_inode": int(inode), "entry_inode": int(entry_inode),
               "size": int(size), "last_use": (int() | float()) as last_use} if (
                   host == store.host_name() and re.fullmatch(re.escape(host) + r"-[0-9]+", intent)
                   and _finite_number(at) and _finite_number(last_use) and offset >= 0 and size >= 0
                   and re.fullmatch(r"\.mac-floor-[0-9a-f]{32}", stage)):
             return PendingMacFloorEntry(intent, host, at, offset, path, candidate, stage, stage_inode,
-                                        device, inode, size, last_use)
+                                        device, inode, entry_inode, size, last_use)
         case _:
             raise removal_guard.ChangedEntry(f"invalid Mac floor intent: {journal}")
 
@@ -4719,7 +4736,7 @@ def recover_mac_floor_entry(guard: removal_guard.RemovalGuard, journal: Path) ->
         relative = path.relative_to(candidate.parent)
         location = removal_guard.observe_mirror_stage(
             guard, candidate.parent, (pending.parent_device, pending.parent_inode),
-            pending.stage, pending.stage_inode, relative)
+            pending.stage, pending.stage_inode, relative, (pending.parent_device, pending.entry_inode))
         row = pending.result("removed" if location is removal_guard.MirrorStageEntryState.MISSING else "kept", 0)
         if location is removal_guard.MirrorStageEntryState.STAGED:
             row["staged"] = str(candidate.parent / pending.stage / relative)
@@ -4814,7 +4831,7 @@ def remove_mac_floor_entries(guard: removal_guard.RemovalGuard, target: MacMirro
                 host, at = store.host_name(), time.time()
                 offset = store.read_last_whole_row_end(store.host_file(host, at))
                 pending = PendingMacFloorEntry(f"{host}-{time.time_ns()}", host, at, offset, str(path),
-                    str(entry.path), stage, stage_inode, *parent_key, size, last_use)
+                    str(entry.path), stage, stage_inode, *parent_key, info.st_ino, size, last_use)
                 write_text_atomic(journal, json.dumps(asdict(pending)) + "\n", new_file_mode=0o600)
                 pending.append(pending.row("sweep_trim_intent"))
                 try:

@@ -2004,30 +2004,17 @@ Each later finalization attempt uses the same guard, so other admissions continu
 
 ### Mac disk floor
 
-`sweep.py --floor-only --host mac` uses the existing floor scan and deletion order.
-It reads `mac_test.conf` once for `sweep_floor_gib` and `sweep_floor_roots`.
-The floor is 150 GiB. A missing floor or a floor below `free_floor_gib` refuses the pass.
-The roots are `/tmp`, `~/rust`, and `~/.local/state/mac-test/mirror`.
-Only targets with our use stamp, mirror mark, or a registered copy ancestor are eligible.
-Resolved paths must stay inside these roots. The scan does not follow directory symlinks.
-
-The sweep reads the local and natedev Mac claims under their existing admission locks.
-Each reader releases its admission lock before it returns a claim snapshot.
-The sweep holds acquired mirror leases through deletion.
-It reads claims again before each removal group outside those leases.
-A live or kept claim protects its mirror.
-For a marked target without a copy record, the claim check compares each existing claimed mirror path.
-A missing unrelated claimed mirror does not protect the target.
-Other claim read errors still protect the target.
-Remote mirror removal keeps its own lease exemption and still checks sibling leases.
-An unreadable claim reply protects every target.
-The claim server prints its reply after it releases the admission lock.
-The Mac uses `lsof` for other process use. Unreadable process use protects every target.
-The sweep checks protection again before each target deletion.
-It takes only the shortfall, in the existing least recently used order.
-The result line reports removed bytes, free bytes before and after, and skipped busy targets.
-`--dry-run` lists proposed takes and removes nothing. It does not run the general tmp sweep.
-The nix-darwin `nate.jobs.disk-floor` job runs this same command every 120 seconds on the Mac.
+On macOS, `sweep.py --floor-only --host mac` and `sweep.py mac-floor-take <repository>` run the Mac floor take.
+The take works only in the mirror root that `mac_test.conf` names. It does not scan `/tmp` or `~/rust`.
+It reads `free_floor_gib`, `sweep_floor_gib` (150 GiB) and `floor_sweep_timeout_s` from `mac_test.conf`.
+A `sweep_floor_gib` below `free_floor_gib` stops the take.
+The take works only while free space is below `sweep_floor_gib`, and takes only the shortfall, oldest first.
+It removes only known Cargo output, through `removal_guard` and a private staging folder.
+`mac-floor-take <repository>` names the repository of the run that just ended. The take removes a whole `target` folder only when it belongs to another repository and holds only known Cargo output. From other targets it removes only old Cargo units.
+An error prints `Mac floor take stopped.` with the reason and exits 1.
+Off macOS, `--host mac` accepts only `--dry-run`.
+The selection rules, the recovery rule and the two named costs are in [build-targets.md](build-targets.md).
+The nix-darwin `nate.jobs.disk-floor` job runs `--floor-only --host mac` every 120 seconds on the Mac.
 `modules/darwin/default.nix` imports the new `modules/darwin/disk-floor.nix` module.
 The job uses mirror leases, short claim reads, and the shared floor lock.
 It trims only the shortfall below `sweep_floor_gib`, without an offload request.
