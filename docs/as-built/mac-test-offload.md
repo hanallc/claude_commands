@@ -26,6 +26,18 @@ The same episode can receive a Mac assignment after disk evidence recovers.
 The live step record keeps diagnostic disk evidence.
 Standalone fixed local callers retain their existing local admission path.
 
+## Mac Linux gate type checks
+
+A gate that runs in the Mac Linux guest runs its requested type checks and tests in the same numbered copy.
+The guest puts the type-check environment in the copy's gate tool folder.
+For a run with type checks, the guest checks for `basedpyright` and `uv` before it starts the gate.
+If a tool is missing, the guest refuses the route.
+The guest returns the type-check result with the test results.
+If the assigned Mac Linux guest refuses the route, the gate fails and reports the guest and the reason.
+The caller must submit a new run to retry.
+
+## Mac queue runs
+
 `mac_queue_run.py --kind run` checks the Mac block before placement, before remote preparation, and before the remote command.
 The run uses the holding unit's session for the block check and the placement request.
 Workers of that unit can start a run during its block.
