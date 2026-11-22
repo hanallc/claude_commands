@@ -712,13 +712,11 @@ function countChip(values,name,value,data,selection){
  if(options.countFacet?.(name,data,selection,value)===false) return;
  values[value]=(values[value] ?? 0)+1;
 }
-function matches(item,selection,counts,allowExpanded=false){
+function matches(item,selection,counts){
  if(!isSelected(item)) return false;
  const data=item.dataset,visible=options.visible;
  if(visible && !counts) return visible(data,selection);
- let chip=options.eligibleChip(data,selection.query,selection);
- const expanded=!chip && allowExpanded && opened.has(data.key) && options.expandedSelection?.(data,selection);
- if(expanded) chip=options.eligibleChip(data,expanded.query,expanded);
+ const chip=options.eligibleChip(data,selection.query,selection);
  if(!chip) return visible ? visible(data,selection) : false;
  let excluded=0;
  const fieldValue=field=>field==='chip' ? chip : data[field];
@@ -732,11 +730,6 @@ function matches(item,selection,counts,allowExpanded=false){
  if(counts) for(const [name,field,,countMask] of options.filterFacets){
   if(excluded & countMask) continue;
   const values=counts[name];
-  // A change to Show ends the exception for an open read row.
-  if(expanded && name==='show'){
-   if(!excluded) countChip(values,name,selection.show,data,selection);
-   continue;
-  }
   countChip(values,name,'all',data,selection);
   const raw=fieldValue(field);
   const value=filterChipValue(name,!options.encodedStaffFields && isStaffChipFilter(name) ? encodeIdentity(raw) : raw);
@@ -840,7 +833,7 @@ function applyRows(write,{animate=false,dismissMissingItem=false,normalizeOwner=
   if(linkedSection) linkedSection.hidden=!linked && !leavingLinked;
   items.forEach(item=>{
    const expanded=opened.has(item.dataset.key);
-   const matched=matches(item,active,counts,item!==linked);
+   const matched=matches(item,active,counts);
    const showRow=matched || item===linked,wasShown=!item.hidden;
    if(motion && wasShown && !showRow) animateRow(item.parentElement,item,false);
    item.hidden=!showRow;if(matched) count++;
@@ -955,7 +948,6 @@ function jump(key,{pushPlace=true,focusTarget=true,keepMatchingFilters=false,pre
  row.dataset.recordHighlight='';
  highlightedRow=row;
  highlightTimer=setTimeout(()=>row.removeAttribute('data-record-highlight'),1200);
- options.itemOpened?.(mountedTarget);
 }
 function openCard(key){
  for(const previous of opened) measured.delete(previous);
@@ -1010,7 +1002,6 @@ function bind(){
   const key=item.dataset.key,expanded=!opened.has(key);
   if(expanded) openCard(key);else closeCard(key,false);
   apply(true,{animate:true});
-  if(expanded && !item.hidden) options.itemOpened?.(item);
  });
 }
 return {place,apply,bind,opened,openCard,closeCard,restorePlace,drawWindow,followItemLink,retryItemLink,itemLinkKey,saveDeparturePlace,ownerChipSelection,get linkedItem(){return linkedItem;},

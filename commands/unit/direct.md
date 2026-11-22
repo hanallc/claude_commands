@@ -334,7 +334,7 @@ For Python test runs, pass `--kind python-tests` before `--`.
 To limit memory for the detached command, use this scope form.
 
 ```sh
-systemd-run --user --scope -q -p MemoryMax=<cap> -- <command>
+systemd-run --user --scope --collect -q -p MemoryMax=<cap> -- <command>
 ```
 
 `start` checks for a live twin before it applies `config/detached_runs.conf` `LIVE_RUN_LIMIT` to that worker.

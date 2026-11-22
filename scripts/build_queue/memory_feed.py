@@ -54,13 +54,14 @@ from scripts.build_queue import admission_client, admission_protocol as wire, he
 from scripts.build_queue.admission_wire import ReservedCloudSlot
 from scripts.build_queue.queue_lines import age, blocking_step_name, plain, step_owner_name, step_text
 from scripts.build_queue.queue_view import reason_phrase
-from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, StepJob
-from scripts.lib.build_steps import (GATE_PROGRAMS, OTHER_COMMAND, RECORDED_STEP_NAMES, CopiesRunCommand,
-                                     OtherCommand, StepNames, build_call_arguments, command_script, copies_run_command,
-                                     gate_job_from_process, live_process_arguments, process_arguments, read_step_names)
+from scripts.build_queue.admission_jobs import StepJob
+from scripts.lib.build_steps import (GATE_PROGRAMS, RECORDED_STEP_NAMES,
+                                     CopiesRunCommand, OtherCommand, StepNames, build_call_arguments, command_script,
+                                     copies_run_command, live_process_arguments,
+                                     gate_job_from_process, process_arguments, read_step_names)
 from scripts.lib.build_steps import CommandUnreadable as CommandUnreadable
 from scripts.build_queue.slot_wait import QueueRowName as QueueRowName
-from scripts.build_queue.slot_wait import (NoNamedStep, QueueKind, command_programs, command_slot_job,
+from scripts.build_queue.slot_wait import (NoNamedStep, QueueKind, command_programs,
                                            public_queue_text, recorded_step, verify_value_options)
 from scripts.build_queue.scope_activity import LiveBuildRun, NotServiceSlice, RunningServiceJob, ScopeProcesses
 from scripts.build_queue import admission_records, target_availability
@@ -69,7 +70,7 @@ from scripts.build_targets import target_config
 from scripts.lint import memory_admit as gate
 from scripts.message import unit_labels
 from scripts.production import staff
-from scripts.lib import build_slots, conf
+from scripts.lib import conf
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.proc_text import read_proc_text
 from scripts.lib.user_zone import user_zone
@@ -948,56 +949,7 @@ def leftover_program(pid: int | admission_records.PidNotRecorded, recorded: str)
     return ProcessName(Path(recorded).name)
 
 
-def copies_slot_command(owner: wire.Owner) -> CopiesRunCommand | OtherCommand:
-    """Read the command after copies.py run for this process lifetime."""
-    argv = live_process_arguments(PROC / str(owner.pid), owner.start_time)
-    return OTHER_COMMAND if isinstance(argv, CommandUnreadable) else copies_run_command(argv)
-
-
-def repository_slot_row(slot: wire.RepositorySlotRow, names: StepNames, members: FeedStaff) -> WaitRow | NoNamedStep:
-    identity = slot.identity
-    folder = Path(identity.folder)
-    legacy_gate = identity.step in GATE_STEPS or Path(identity.step).name in GATE_PROGRAMS.values()
-    copied = copies_slot_command(slot.owner)
-    legacy = copied if legacy_gate or not folder.is_absolute() else OTHER_COMMAND
-    source = Path(legacy.source) if isinstance(legacy, CopiesRunCommand) else folder
-    step = NoNamedStep.FOUND if legacy_gate else recorded_step(identity.step, names)
-    legacy_job = GATE_JOB_NOT_RECORDED
-    verify = identity.verify
-    if isinstance(step, NoNamedStep) and isinstance(legacy, CopiesRunCommand):
-        step, legacy_job, copied_verify = command_slot_job(legacy.arguments, names)
-        if isinstance(verify, admission_records.NotVerifyCall):
-            verify = copied_verify
-    elif (isinstance(copied, CopiesRunCommand) and isinstance(verify, admission_records.NotVerifyCall)
-          and identity.step.partition(" ")[0] in admission_records.VERIFY_VERBS):
-        _, _, verify = command_slot_job(copied.arguments, names)
-    current = (members.fixed_owner_labels(staff.StaffId(identity.session_id)) if folder.is_absolute()
-               else members.labels_for(identity.session_id, slot.machine, source))
-    label = current or unit_labels.UnitLabels("")
-    unit = staff_unit(label)
-    owner_label = codec.select_queue_name(public_owner_name(label.showrunner),
-                                          recorded_caller_name(identity.session_id, identity.name, str(source)))
-    caller = codec.resolve_queue_caller(
-        stored_caller=public_owner_name(identity.name, identity.session_id),
-        staff_caller=current.session if current is not None else recorded_caller_name(identity.session_id, "", str(source)))
-    if isinstance(step, NoNamedStep):
-        step = QueueRowName.owner_only(unit, owner_label) if legacy_gate else QueueRowName.repository(slot.wait.repository, str(source))
-    if isinstance(step, NoNamedStep):
-        return step
-    saved_job = identity.job if isinstance(identity.job, StepJob) else legacy_job
-    job = saved_job if isinstance(saved_job, StepJob) else NotGateStep()
-    return {"kind": "repository-slot", **queue_row_labels(step, step, unit=unit, caller=caller),
-            **page_owner_labels(label, unit=unit, caller=caller),
-            **call_notes(verify, identity.step,
-                         build_command_call(copied.arguments) if isinstance(copied, CopiesRunCommand) else ""),
-            **job_notes(job, names, step="merge-gate" if legacy_gate else identity.step,
-                        verify=verify, kind="repository-slot"),
-            "pid": slot.owner.pid, "detail": slot.wait.repository, "need": 0.0, "since": slot.since,
-            "reason": slot.wait.text, "fits": False, "why": "build slot", "runs_on": slot.machine}
-
-
 class WaitRow(RowQueueNotes, SlotPlace, NamedQueueRow):
-    kind: NotRequired[Literal["repository-slot"]]
     showrunner: str
     unit: str
     pid: int
@@ -1394,9 +1346,9 @@ class LocalStepName:
 
 
 def local_step_name(step: admission_records.RunningStep | admission_records.WaitingStep, owner: StepPageOwner,
-                    names: StepNames, labels: Mapping[str, unit_labels.UnitLabels], ci_label: str
+                    names: StepNames, labels: Mapping[str, unit_labels.UnitLabels], ci_label: str, job: StepJobReading
                     ) -> LocalStepName | NoNamedStep:
-    if step.step in GATE_STEPS:
+    if step.step in GATE_STEPS and not isinstance(job, StepJob):
         neutral = QueueRowName.owner_only(ci_label) if ci_label else owner.neutral_name()
         return LocalStepName(neutral, neutral, staff_names.text_parts(neutral))
     title = (build_row_step(step.step, step.package, step.project, step.folder, names, kind=QueueKind.CI)
@@ -1479,8 +1431,8 @@ def mac_build_units(builds: Sequence[queue_view.MacBuild],
 
 
 def build_slot_number(folder: str, machine: str, roots: Mapping[str, str], *, home: str) -> int | Literal["—"]:
-    """Read the slot number from a direct child of the machine's configured root."""
-    root = build_slots.slot_root(roots, machine)
+    """Read the number of a test copy under the machine's build root."""
+    root = roots.get(f"roots.build.{machine}", roots.get("roots.build", ""))
     if not root or not folder:
         return "—"
     uses_home = root == "~" or root.startswith("~/") or re.search(r"\$(?:HOME\b|\{HOME\})", root)
@@ -1492,8 +1444,15 @@ def build_slot_number(folder: str, machine: str, roots: Mapping[str, str], *, ho
     # Compare the Mac root unresolved; the page cannot resolve Mac paths locally.
     configured = Path(os.path.realpath(root) if machine == host_name() else os.path.normpath(root))
     run_folder = Path(os.path.normpath(folder))
-    match = re.fullmatch(r".+-slot([1-9][0-9]*)", run_folder.name)
-    return int(match[1]) if match and run_folder.parent == configured else "—"
+    if not run_folder.is_relative_to(configured):
+        return "—"
+    parts = run_folder.relative_to(configured).parts
+    if len(parts) != 3 or parts[1] in ("main", "ci") or not re.fullmatch(r"[1-9][0-9]*", parts[2]):
+        return "—"
+    try:
+        return int(parts[2])
+    except ValueError:
+        return "—"
 
 
 class SlotNotes(SlotPlace):
@@ -1502,7 +1461,10 @@ class SlotNotes(SlotPlace):
 
 def slot_place(number: int | Literal["—"], folder: str, machine: str) -> SlotPlace:
     """The slot folder and machine of a step in slot number; empty for a step in no slot."""
-    return {} if number == "—" else {"slot_folder": Path(os.path.normpath(folder)).name, "slot_machine": machine}
+    if number == "—":
+        return {}
+    key = "/".join(Path(os.path.normpath(folder)).parts[-3:])
+    return {"slot_folder": key, "slot_machine": machine}
 
 
 def build_slot(folder: str, machine: str, roots: Mapping[str, str], *, home: str) -> SlotNotes:
@@ -1569,11 +1531,7 @@ def need_in_next_part(steps: Sequence[admission_records.RunningStep]) -> bool:
                and isinstance(step.measured.window, progress.WindowPeak) for step in steps)
 
 
-WaitCause = Literal["memory", "its turn", "Cargo token", "GPU slot", "build slot", "memory pressure",
-                    "AWS slot", "build hold", "Mac", "the build in the same Cargo folder"]
-
-
-def wait_why(reason: admission_records.WaitReason) -> WaitCause:
+def wait_why(reason: admission_records.WaitReason) -> str:
     """Name the resource or queue action that a waiter needs."""
     match reason:
         case admission_records.NeedsMemory():
@@ -1588,8 +1546,12 @@ def wait_why(reason: admission_records.WaitReason) -> WaitCause:
             return "memory pressure"
         case placement.CargoFolderWait():
             return "the build in the same Cargo folder"
+        case admission_records.BuildSpaceLow() | admission_records.BuildSpaceUnreadable():
+            return "build space"
         case admission_records.GpuSlotWait():
             return "GPU slot"
+        case admission_records.RunLimitWait():
+            return admission_records.run_limit_text(reason)
         case admission_records.EstimateExpired():
             return "memory"
         case admission_records.NatedevHeld():
@@ -2755,7 +2717,6 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
     mac_machine = conf.read_or_repository("machines").words("mac.hosts")[0]
     machine = host_name()
     slot_homes = {mac_machine: mac_reading.home, machine: str(Path.home())}
-    repository_slots = parsed.repository_slots if isinstance(parsed, wire.CloudQueueRead) else ()
     with staff.supplied_snapshot(staff_display.members):
         labels = unit_labels.unit_labels_for(
             [*(step.session_id for step in (*parsed.view.running, *parsed.view.waiting)),
@@ -2863,7 +2824,7 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
             owner = step_page_owner(step, labels, ci_runners, members, machine, ci_label=ci_label,
                                     reservation_caller=reservation_caller)
             shown = replace(step, step=job_step(job, step.step), unit=owner.labels.unit)
-            named = local_step_name(shown, owner, names, labels, ci_label)
+            named = local_step_name(shown, owner, names, labels, ci_label, job)
             if isinstance(named, NoNamedStep):
                 continue
             title_step, display_name, parts = named.title, named.name, named.parts
@@ -3034,7 +2995,7 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
             reason = reason_phrase(waiter.reason, waiting)
         job = NotGateStep() if ci_label else local_job(waiter)
         shown_waiter = replace(waiter, step=job_step(job, waiter.step), unit=identity.unit)
-        named = local_step_name(shown_waiter, owner, names, labels, ci_label)
+        named = local_step_name(shown_waiter, owner, names, labels, ci_label, job)
         if isinstance(named, NoNamedStep):
             continue
         waiters[place] = {**queue_row_labels(named.title, named.name, unit=owner.unit, ci_label=ci_label, caller=owner.caller),
@@ -3080,9 +3041,6 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
     work_rows.sort(key=lambda row: row["started_at"])
     waiting_rows: list[WaitRow | CloudWaitRow] = list(waiters.values())
     model = queue_view.QueueModel(parsed, labels, names=names)
-    slot_waiters = {slot.owner: slot_row for slot in repository_slots
-                    if not isinstance(slot_row := repository_slot_row(slot, names, members), NoNamedStep)}
-    waiting_rows.extend(slot_waiters.values())
     cloud_slots_used = 0
     cloud_slots = 0
     if isinstance(parsed, wire.CloudQueueRead):
@@ -3110,8 +3068,9 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
             job = cloud.identity.job if isinstance(cloud.identity.job, StepJob) else step_job(
                 cloud.identity.step, cloud.owner.pid, PROC, start_time=cloud.owner.start_time)
             step = job_step(job, cloud.identity.step)
-            if step in GATE_STEPS:
-                title_step = display_name = QueueRowName.owner_only(unit, identity.owner_text)
+            if step in GATE_STEPS and not isinstance(job, StepJob):
+                title_step = display_name = QueueRowName.owner_only(
+                    unit, identity.owner_text, public_owner_name(recorded.name, recorded.session_id))
                 parts = staff_names.text_parts(display_name)
                 if current is not None and not public_owner_name(recorded.name, recorded.session_id):
                     parts = staff_names.owned_step_parts(names, step, unit, identity.role, current=parts)
@@ -3150,9 +3109,9 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
         work_rows.sort(key=lambda row: row["started_at"])
         waiting_rows = []
         for entry in queue_view.waiting_builds(model):
-            waiting_row = (cloud_waiters.get(entry.owner) if isinstance(entry, wire.CloudRow) else
-                           slot_waiters.get(entry.owner) if isinstance(entry, wire.RepositorySlotRow) else
-                           waiters.get(entry.position))
+            if isinstance(entry, wire.RepositorySlotRow):
+                continue
+            waiting_row = cloud_waiters.get(entry.owner) if isinstance(entry, wire.CloudRow) else waiters.get(entry.position)
             if waiting_row is not None:
                 waiting_rows.append(waiting_row)
     unmatched_priority_text = ""

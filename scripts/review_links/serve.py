@@ -560,7 +560,7 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                     print("review-links accounts: could not read the quota alerts", file=sys.stderr)
             try:
                 with server.staff_read_scope():
-                    payload = (console.for_you_count(for_you.read()) if route.query == "view=count"
+                    payload = (console.for_you_count(for_you.read(include_comparison_reason=False)) if route.query == "view=count"
                                else console.for_you_payload())
             except (OSError, ValueError) as error:
                 print(f"review-links actions: {error}", file=sys.stderr)
