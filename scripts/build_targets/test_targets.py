@@ -16,7 +16,6 @@ from typing import Literal, TypedDict, cast, override
 from unittest import mock
 
 from scripts.build_hold.owning_session import OwningSession
-from scripts.direct.step_selection import Pinned
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
 
 from scripts.build_targets import build_targets, target_config, targets
@@ -168,30 +167,6 @@ class IsolatedTargetTest(unittest.TestCase):
 
 
 class ConfigurationTests(IsolatedTargetTest):
-    def test_pinned_guest_uses_its_configured_host(self) -> None:
-        settings = self.write_config("host=guest\n", "mac_linux.conf")
-        registry = self.root / "build_targets.conf"
-        config = (
-            "targets=mac\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n"
-            + "pinned_targets=mac-linux\nkind.mac-linux=ssh\nplatform.mac-linux=linux\n"
-            + "settings.mac-linux=mac_linux.conf\nhost.mac-linux="
-        )
-        for host in ("mac", "missing"):
-            with self.subTest(host=host), mock.patch.dict(os.environ, {"CONF_DIR": str(self.root)}):
-                _ = registry.write_text(config + host + "\n")
-                ordinary = target_config.read_targets(purpose=target_config.RegistryRead.PLACEMENT)
-                self.assertEqual([entry.name for entry in ordinary], ["mac"])
-                if host == "missing":
-                    with self.assertRaisesRegex(target_config.ConfigError, "host.mac-linux"):
-                        _ = target_config.configured_ssh_target("mac-linux")
-                    continue
-                guest = target_config.configured_ssh_target("mac-linux")
-                self.assertEqual(guest, targets.SshTarget("mac-linux", "linux", settings, target_config.SharedHost("mac")))
-                reason = "This target requires --target mac-linux"
-                self.assertEqual(build_targets.ssh_target_eligibility(guest, self.root, "", "check",
-                    target_config.ANY_ELIGIBLE_TARGET, session=OwningSession("test")), target_config.ExcludedTarget(guest, reason))
-                self.assertFalse(build_targets.pin_required(guest, Pinned("mac-linux")))
-
     def test_removed_builder_cannot_register_by_name_or_settings(self) -> None:
         registry = self.root / 'removed-target.conf'
         for name, filename in (('aws', 'custom.conf'), ('builder', 'aws_target.conf')):

@@ -3500,41 +3500,6 @@ class PlacementRestartTests(unittest.TestCase):
 
 
 class CloudAdmissionTests(unittest.TestCase):
-    def test_whole_runs_use_one_slot_per_target_in_queue_order(self) -> None:
-        with AdmissionFixture() as fixture:
-            registry = fixture.root / "build_targets.conf"
-            _ = registry.write_text("targets=mac\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n"
-                + "pinned_targets=mac-linux,second-guest\n"
-                + "".join(f"kind.{target}=ssh\nplatform.{target}=linux\nsettings.{target}=guest.conf\nhost.{target}=mac\n"
-                          for target in ("mac-linux", "second-guest")))
-            fixture.hold_starts()
-            first, earlier, later, other = (
-                replace(fixture.request(need=40 * GIB, step="gate", since=fixture.clock.now() + offset),
-                        place=status_wire.WholeRunPlace(target))
-                for offset, target in ((-40, "mac-linux"), (-30, "mac-linux"), (-20, "mac-linux"), (-10, "second-guest"))
-            )
-            self.assertEqual(wire.parse_request(wire.encode_request(first)), first)
-            grant = only_admitted(fixture.server.handle_request(first))
-            self.assertEqual(grant.need, 0)
-            self.assertEqual(only_admitted(fixture.server.handle_request(other)).need, 0)
-            for request in (later, earlier):
-                reply, = fixture.server.handle_request(request)
-                assert isinstance(reply, wire.Wait)
-                self.assertEqual(reply.position, 1)
-                self.assertEqual(reply.text, "mac-linux runs one whole run at a time")
-                self.assertEqual(wire.parse_reply(wire.encode_reply(reply)), reply)
-            fixture.restart()
-            self.assertIsInstance(fixture.server.handle_request(later)[0], wire.Wait)
-            self.assertIsInstance(fixture.server.handle_request(earlier)[0], wire.Wait)
-            fixture.release(grant)
-            _ = fixture.run_pass()
-            self.assertIn(earlier.episode, fixture.server.reservations)
-            self.assertIn(later.episode, fixture.server.waiters)
-            reading = self.reading(fixture)
-            assert isinstance(reading, wire.CloudQueueRead)
-            self.assertFalse(reading.explanation.decided_from.reservations)
-            self.assertEqual(sorted(row.place.target for row in reading.cloud), ["mac-linux", "mac-linux", "second-guest"])
-
     def test_cloud_and_memory_settings_share_the_checked_pass_and_failure_path(self) -> None:
         from scripts.build_queue import cloud_progress
 

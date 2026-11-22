@@ -117,16 +117,6 @@ class CloudPlace:
     group: CloudGroup | NoCloudGroup = NO_CLOUD_GROUP
 
 
-@dataclass(frozen=True)
-class WholeRunPlace:
-    """One whole run can reserve this target."""
-
-    target: str
-
-
-AdmissionPlace = LocalPlace | CloudPlace | WholeRunPlace
-
-
 def cloud_queue_order(place: CloudPlace, since: float) -> tuple[float, int, str]:
     """Use the trial start time for grouped requests."""
     if isinstance(group := place.group, CloudGroup):
@@ -180,7 +170,7 @@ class AdmitRequest(CallerCode):
     fresh_test: bool
     token_back_at: float = 0.0
     run: RunIdentity | NoRun = NO_RUN
-    place: AdmissionPlace = LocalPlace()
+    place: LocalPlace | CloudPlace = LocalPlace()
     route: target_config.StepRoute = field(default_factory=lambda: records.DIRECT_CARGO, kw_only=True)
 
 
@@ -327,16 +317,13 @@ class ReservedCloudSlot:
 
 @dataclass(frozen=True)
 class CloudSlotWait:
-    """The queued remote row states whether it holds a slot."""
+    """The queued cloud row states whether it holds a slot."""
     used: int
     slots: int
     state: WaitingForCloudSlot | ReservedCloudSlot = field(default_factory=WaitingForCloudSlot)
-    target: str = field(default="aws", kw_only=True)
 
     @property
     def text(self) -> str:
-        if self.target != "aws":
-            return f"{self.target} runs one whole run at a time"
         if isinstance(self.state, ReservedCloudSlot):
             return "waits for launch"
         return f"waits for a cloud slot: {self.used} of {self.slots} in use"
@@ -719,11 +706,8 @@ def _write_wire_record(value: object) -> object:
         del record["route"]
     if record.get("kind") == "CloudPlace" and record.get("group") == codec.snapshot_value(NO_CLOUD_GROUP):
         del record["group"]
-    if record.get("kind") == "CloudSlotWait":
-        if record.get("state") == {"kind": "WaitingForCloudSlot"}:
-            del record["state"]
-        if record.get("target") == "aws":
-            del record["target"]
+    if record.get("kind") == "CloudSlotWait" and record.get("state") == {"kind": "WaitingForCloudSlot"}:
+        del record["state"]
     # Phase 33: a config change introduces other shares after deployment of the new service.
     if record.get("kind") == "ShapeRankedPeak" and record.get("share_percent") == 10:
         record["kind"] = "ShapeP90"

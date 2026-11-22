@@ -13,7 +13,6 @@
 // Use --verify-call as the third argument for the Verify column proof.
 // Use --headcount to compare the Running and Queued headers.
 // Use --build-tools as the third argument for the Build tools proof.
-// Use --whole-run as the third argument for the mac-linux proof.
 // Set SWAP_BEFORE_PAGE to compare the swap tooltip with the previous page.
 import assert from 'node:assert/strict';
 import {accessSync, constants, statSync} from 'node:fs';
@@ -52,8 +51,7 @@ if (gateMode) args.shift();
 const [callerFolder, previousPage, comparison] = args;
 const verifyCallProof = previousPage === '--verify-call';
 const buildToolsProof = previousPage === '--build-tools';
-const wholeRunProof = previousPage === '--whole-run';
-const focusedProof = verifyCallProof || buildToolsProof || wholeRunProof;
+const focusedProof = verifyCallProof || buildToolsProof;
 const themes = gateMode ? ['dark'] : ['light','dark'];
 const widths = gateMode ? [1400] : [1400,900,390];
 const runningHeaders = ['Stage','Done','Step','Dur','Verify','Unit','Pid','Target','vCPU','Slot','Tokens'];
@@ -261,49 +259,6 @@ try {
           fitLabels();
           })()`);
         };
-        if (wholeRunProof) {
-          servedReading = readings.whole_run;
-          await navigate('memory_live.html');
-          const result = await evaluate(`(() => {
-            const run = latest.walk.find(row => row.kind === 'cloud' && row.machine === 'mac-linux');
-            const waiting = latest.waiters.find(row => row.kind === 'cloud' && row.runs_on === 'mac-linux');
-            const runningTip = 'row:' + run.key;
-            const waitingTip = 'wait:' + waiting.key;
-            const runningRow = document.querySelector('tr[data-tip="' + runningTip + '"]');
-            const waitingRow = document.querySelector('tr[data-tip="' + waitingTip + '"]');
-            const runningStatus = document.querySelector('.wrow[data-tip="' + runningTip + '"] .amounts');
-            const tooltip = key => {
-              showTip(key, 700, 500);
-              return document.querySelector('#tip').innerText;
-            };
-            return {
-              target:runningRow.querySelector('.machine').textContent,
-              waitingTarget:waitingRow.querySelector('.machine').textContent,
-              owner:tooltip(runningTip), wait:tooltip(waitingTip),
-              step:runningRow.querySelector('.step').textContent,
-              age:runningRow.querySelector('.duration').textContent,
-              progress:runningStatus.textContent,
-            };
-          })()`);
-          assert.equal(result.target, 'mac-linux');
-          assert.equal(result.waitingTarget, 'mac-linux');
-          assert.match(result.owner, /Runs on\s+mac-linux/);
-          assert.match(result.owner, /route-one/);
-          assert.match(result.wait, /mac-linux runs one whole run at a time/);
-          assert.match(result.step, /gate/);
-          assert.match(result.age, /4 min/);
-          assert.equal(result.progress, '7 of 12 modules');
-          await evaluate(`(() => {
-            document.querySelector('.legend-box').open = false;
-            document.querySelector('#tip').classList.remove('on');
-            scrollTo(0, 0);
-          })()`);
-          const output = join(folder, 'whole-run-dark.png');
-          const shot = await call('Page.captureScreenshot', {format:'png'});
-          await writeFile(output, Buffer.from(shot.data, 'base64'));
-          console.log(JSON.stringify({pass:true, views:1, output}));
-          break browserProof;
-        }
         if (buildToolsProof) {
           const ram = JSON.parse(await readFile(join(folder, 'legend_ram.json'), 'utf8'));
           const gib = 1024**3;
