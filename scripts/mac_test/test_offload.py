@@ -32,6 +32,7 @@ from scripts.build_queue import admission_client, admission_protocol as wire, pl
 from scripts.build_queue.admission_test_support import AdmissionFixture, caller_admission
 from scripts.build_hold.owning_session import NoOwningSession
 from scripts.build_hold import override_guard
+from scripts.buildlog import repository as buildlog_repository
 if TYPE_CHECKING:
     from scripts.lib import copy_record, nix_env, scratch
     from scripts.build_targets import target_config
@@ -869,9 +870,9 @@ class OffloadSettingsTests(unittest.TestCase):
         _ = self.enterContext(fixture.serving())
         destination = self.root / "result"
         responses = [offload.COMMAND_COULD_NOT_START, offload.CommandOutput(0, "", "")]
-        mirror = claim_state.ResolvedMacMirror("fixture-hana", "hana", "hana.json", "hana", str(self.root),
-                                              "https://fixture.invalid/hana.git")
-        saved = mirror.claim_repository()
+        mirror = claim_state.ResolvedMacMirror("fixture-hana", "hana", "hana.json", "hana", str(self.root))
+        history_key = "https://fixture.invalid/hana"
+        saved = mirror.claim_repository(history_key=history_key)
 
         def complete_claim(controller: offload.ProcessController, arguments: Sequence[str],
                            attempt: offload.LocalClaimAttempt) -> None:
@@ -886,6 +887,7 @@ class OffloadSettingsTests(unittest.TestCase):
                                              "--package", "hana", "--call-id", "probe-start", "--result", str(destination),
                                              "--assignment-file", str(assignment_file)]), \
              mock.patch.object(claim_state, "mac_repository_identity", return_value=mirror), \
+             mock.patch.object(buildlog_repository, "repository_key", return_value=history_key), \
              mock.patch.object(offload.ProcessController, "complete_claim", autospec=True, side_effect=complete_claim), \
              mock.patch.object(offload.ProcessController, "capture", side_effect=responses) as capture, \
              redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors:
@@ -906,9 +908,11 @@ class OffloadSettingsTests(unittest.TestCase):
         for package, reason in expected.items():
             with self.subTest(package=package):
                 request = offload.OffloadRequest(self.root, package, "cargo-liner", offload.NO_RESULT_FILE, (), owner="verify", holder_session="fixture-session")
-                with mock.patch.object(claim_state, "mac_repository_identity", return_value=claim_state.ResolvedMacMirror(
-                        "fixture-cargo-liner", "cargo-liner", "cargo-liner.json", "cargo-liner", str(self.root),
-                        "https://fixture.invalid/cargo-liner.git")):
+                mirror = claim_state.ResolvedMacMirror(
+                    "fixture-cargo-liner", "cargo-liner", "cargo-liner.json", "cargo-liner", str(self.root))
+                with mock.patch.object(claim_state, "mac_repository_identity", return_value=mirror), \
+                        mock.patch.object(buildlog_repository, "repository_key",
+                                          return_value="https://fixture.invalid/cargo-liner"):
                     result = offload.run_offload(offload.ProcessController(), config, request, time.monotonic())
                 self.assertEqual(result.reason if isinstance(result, offload.DeclinedMacRun) else result, reason)
 
@@ -2081,7 +2085,7 @@ class BackoffReadTests(unittest.TestCase):
                                        {"linux_only.hana": ""})
         root = Path("/fixture/hana")
         key = "https://fixture.invalid/hana"
-        mirror = claim_state.ResolvedMacMirror(key, "hana", "hana.json", "hana", str(root), key)
+        mirror = claim_state.ResolvedMacMirror(key, "hana", "hana.json", "hana", str(root))
         cases: tuple[tuple[eligibility.BackoffState, eligibility.KnownRepository | eligibility.IneligibleMacStep], ...] = (
             (eligibility.UnreadableBackoff("bad"), eligibility.IneligibleMacStep("state")),
             (eligibility.ACTIVE_BACKOFF, eligibility.IneligibleMacStep("backoff")),

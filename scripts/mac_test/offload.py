@@ -67,6 +67,7 @@ from scripts.lib.atomic_file import write_text_atomic
 from scripts.buildlog import treekey
 from scripts.mac_test.mirror_root import MacMirrorRoot
 from scripts.buildlog import store
+from scripts.buildlog import repository as buildlog_repository
 from scripts.buildlog import transfer_bytes
 from scripts.build_targets import target_config
 from scripts.mac_test import eligibility, nextest_log
@@ -379,7 +380,7 @@ class UnresolvedLeftoverCount:
 
 
 class ReadAttemptRepository:
-    """Read the repository key when recording a non-Mac attempt."""
+    """Read the repository key when recording the attempt."""
 
 
 READ_ATTEMPT_REPOSITORY = ReadAttemptRepository()
@@ -3372,7 +3373,8 @@ def run_offload(
     policy_repository: claim_state.MacRepositoryIdentity | claim_state.ResolveMacRepository = claim_state.RESOLVE_MAC_REPOSITORY
     retire_wait = False
     if not linux:
-        controller.attempt_evidence.repository_key = store.UNKNOWN_IDENTITY
+        history_key = buildlog_repository.repository_key(str(request.repo_root))
+        controller.attempt_evidence.repository_key = history_key
         if isinstance(request.admission, MacClaimFromWait):
             admission = request.admission
             try:
@@ -3390,7 +3392,6 @@ def run_offload(
                 saved = claim_state.saved_mac_repository(held.record)
                 if isinstance(saved, claim_state.MacRepositoryIdentity) and "remote_host" not in held.record:
                     policy_repository = saved
-                    controller.attempt_evidence.repository_key = saved.history_key
                 elif "remote_host" not in held.record:
                     retire_wait = True
                 else:
@@ -3405,11 +3406,10 @@ def run_offload(
             resolved = claim_state.mac_repository_identity(str(request.repo_root))
             if isinstance(resolved, claim_state.WholeMacScope):
                 return declined("repo" if config.enabled else "off", started)
-            executable = resolved.claim_repository()
+            executable = resolved.claim_repository(history_key=history_key)
             if not isinstance(executable, claim_state.MacRepositoryIdentity):
                 return declined("repo" if config.enabled else "off", started)
             mac_repository = policy_repository = executable
-            controller.attempt_evidence.repository_key = mac_repository.history_key
     decision = eligibility.mac_step_eligibility(config, request.repo_root, request.package, request.verb,
                                                request.target, kind=request.kind, mac_repository=policy_repository)
     if isinstance(decision, IneligibleMacStep):
@@ -3418,6 +3418,7 @@ def run_offload(
     if linux and not trusted_linux_source(request.repo_root):
         return declined("repo", started)
     if linux:
+        controller.attempt_evidence.repository_key = repository.key or store.UNKNOWN_IDENTITY
         detail = recorded_linux_version_mismatch(controller, config, request.target)
         decline_path = eligibility.linux_version_decline_path(request.target, repository.name)
         if detail:

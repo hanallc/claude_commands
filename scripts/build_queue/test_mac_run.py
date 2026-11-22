@@ -23,7 +23,7 @@ from scripts.build_queue import execution_identity, mac_run, placement, step_est
 from scripts.build_queue.admission_records import RepositoryIdentity
 from scripts.build_queue import admission_wire as wire
 from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, StepJob
-from scripts.buildlog import repository
+from scripts.buildlog import repository, sync as buildlog_sync
 from scripts.build_targets import build_targets, target_config
 from scripts.copies import copies
 from scripts.direct import phase_wait_holder
@@ -91,6 +91,7 @@ class MacRunTests(unittest.TestCase):
     def configure_limit(self, maximum: int) -> None:
         _ = (self.root / "build_folders.conf").write_text(
             f"# whole: 1..\nslots.fixture-mac.claude_commands.max={maximum}\n"
+            + "# whole: 1..\nnames.repository_key_length=8\n"
             + "# whole: 1..\nslots.fixture-mac.default_max=1\n")
 
     def native_claim(self, repo: Path) -> mac_test.CliArguments:
@@ -820,14 +821,14 @@ sys.exit(71)
     def test_release_wait_reports_its_damaged_reservation_without_a_proof(self) -> None:
         self.exercise_interrupted_replacement(("release-damaged-before-permission",))
 
-    def add_linux_release_target(self) -> None:
+    def add_linux_target(self) -> None:
         targets = self.root / "build_targets.conf"
         _ = targets.write_text(targets.read_text().replace("targets=natedev,mac", "targets=natedev,mac,linux")
                                + "kind.linux=ssh\nplatform.linux=linux\nsettings.linux=linux.conf\n")
         _ = (self.root / "linux.conf").write_text("offload=on\nslots.claude_commands=1\n")
 
     def test_release_wait_reports_damage_on_mac_and_linux(self) -> None:
-        self.add_linux_release_target()
+        self.add_linux_target()
         with mock.patch.dict(os.environ, {"BUILD_TARGETS_STATE_DIR": str(self.root / "target-state")}):
             for target in ("mac", "linux"):
                 with self.subTest(target=target):
@@ -865,7 +866,7 @@ sys.exit(71)
         self.assertEqual(claim.path.read_bytes(), damaged)
 
     def test_repeated_release_wait_skips_a_reused_slot_on_mac_and_linux(self) -> None:
-        self.add_linux_release_target()
+        self.add_linux_target()
         with mock.patch.dict(os.environ, {"BUILD_TARGETS_STATE_DIR": str(self.root / "target-state")}):
             for target in ("mac", "linux"):
                 with self.subTest(target=target):
@@ -1399,7 +1400,7 @@ with patch.object(Path, "unlink", interrupt_unlink), patch.object(Path, "replace
             args, self.paths, watch_claim=False, mac_repository=identity), 12)
         self.assertEqual(claim_state.read_claims(self.paths), ())
 
-    def test_runner_uses_one_checkout_origin_for_the_saved_claim(self) -> None:
+    def test_runner_keeps_the_claim_scope_after_the_checkout_origin_changes(self) -> None:
         with (self.root / "mac_test.conf").open("a") as settings:
             _ = settings.write("mirror_root=~/.local/state/mac-test/mirror\n")
         other = self.repository("source-b")
@@ -1544,8 +1545,7 @@ with patch.object(Path, "unlink", interrupt_unlink), patch.object(Path, "replace
                         self.assertTrue(queue_repository.key.startswith("git-root:"))
                     waiting = self.native_claim(checkout)
                     waiting.repo_root, waiting.verb, waiting.target = str(checkout), "check", "mac"
-                    with mock.patch.object(repository, "repository_key", side_effect=AssertionError("Use the checkout origin")):
-                        self.assertEqual(mac_test.command_claim_wait(waiting, self.paths), 0)
+                    self.assertEqual(mac_test.command_claim_wait(waiting, self.paths), 0)
                     held, = claim_state.read_claims(self.paths)
                     saved = claim_state.saved_mac_repository(held.record)
                     assert isinstance(saved, claim_state.MacRepositoryIdentity)
@@ -1556,8 +1556,7 @@ with patch.object(Path, "unlink", interrupt_unlink), patch.object(Path, "replace
                     request = offload.OffloadRequest(checkout, "hana", "test", offload.NO_RESULT_FILE, (),
                         "verify", "", target="mac", verb="check", admission=admission)
                     controller = offload.ProcessController()
-                    with mock.patch.object(repository, "repository_key", side_effect=AssertionError("Use saved history")), \
-                            mock.patch.object(repository, "mac_source_repository", side_effect=AssertionError("Use saved scope")), \
+                    with mock.patch.object(repository, "mac_source_repository", side_effect=AssertionError("Use saved scope")), \
                             mock.patch.object(copies, "remote_lease"), \
                             mock.patch.object(offload, "leased_offload", return_value=offload.PassedOnMac(1)):
                         self.assertIsInstance(offload.run_offload(controller, config, request, time.monotonic()),
@@ -1570,6 +1569,87 @@ with patch.object(Path, "unlink", interrupt_unlink), patch.object(Path, "replace
                                    if word.startswith("BUILDLOG_REPO_IDENTITY="))
                     self.assertTrue(step_estimator.history_matches_repository({"repo_identity": remote_key}, queue_repository))
                     self.assertEqual(mac_test.command_release(waiting, self.paths), 0)
+
+    def test_mac_worktree_rewrite_changes_history_and_preserves_the_claim_key(self) -> None:
+        with (self.root / "mac_test.conf").open("a") as settings:
+            _ = settings.write("mirror_root=~/.local/state/mac-test/mirror\n")
+        linked = self.root / "linked"
+        git = ["git", "-C", str(self.checkout)]
+        _ = subprocess.run([*git, "config", "--local", "extensions.worktreeConfig", "true"], check=True)
+        _ = subprocess.run([*git, "worktree", "add", "-q", "--detach", str(linked)], check=True)
+        waiter = self.native_claim(linked)
+        self.assertEqual(mac_test.command_claim(waiter, self.paths, watch_claim=False), 0)
+        self.addCleanup(mac_test.command_release, waiter, self.paths)
+        held, = claim_state.read_claims(self.paths)
+        saved = claim_state.saved_mac_repository(held.record)
+        assert isinstance(saved, claim_state.MacRepositoryIdentity)
+        self.assertEqual(saved.history_key, REPOSITORY_KEY)
+        rewrite = "https://github.com/Team/History"
+        _ = subprocess.run(["git", "-C", str(linked), "config", "--worktree",
+                           f"url.{rewrite}.git.insteadOf", ORIGIN], check=True)
+        self.addCleanup(step_estimator.clear_git_identity_cache)
+        queue_repository, _ = step_estimator.git_identity(["cargo", "check"], str(linked))
+        assert isinstance(queue_repository, RepositoryIdentity)
+        self.assertEqual(queue_repository.key, rewrite)
+        scope = claim_state.RepositoryScope("checkout", REPOSITORY_KEY)
+        self.assertEqual(held.scope, scope)
+        self.assertEqual(claim_state.target_claim_scope(self.paths, str(linked)), scope)
+        admission = offload.MacClaimFromWait(waiter.pid, claim_state.claim_identity(held.record), NoOwningSession())
+        request = offload.OffloadRequest(linked, "", "check", offload.NO_RESULT_FILE, (), "verify", "",
+                                         target="mac", verb="check", admission=admission)
+        controller = offload.ProcessController()
+        controller.mac_repository = saved
+        words = self.offload_history_command(controller, request)
+        key, = (word.removeprefix("BUILDLOG_REPO_IDENTITY=") for word in words
+                if word.startswith("BUILDLOG_REPO_IDENTITY="))
+        self.assertEqual(key, queue_repository.key)
+        self.assertEqual(controller.attempt_evidence.repository_key, key)
+        self.assertEqual(claim_state.read_run(held.path), held.record)
+
+    def test_plain_ssh_linux_command_sends_the_source_repository_key(self) -> None:
+        self.add_linux_target()
+        origin = "https://github.com/Team/Hana"
+        source = self.repository("hana", origin=origin + ".git")
+        main_identity = eligibility.repository_identity(source)
+        assert isinstance(main_identity, eligibility.KnownRepository)
+        self.assertEqual(main_identity.key, origin)
+        request = offload.OffloadRequest(source, "", "check", offload.NO_RESULT_FILE, (), "verify", "",
+                                         target="linux", verb="check")
+        controller = offload.ProcessController()
+        with mock.patch.dict(os.environ, {"BUILD_TARGETS_STATE_DIR": str(self.root / "target-state")}):
+            words = self.offload_history_command(controller, request)
+        self.assertEqual(words.count("--repo-identity"), 1)
+        self.assertEqual(words[words.index("--repo-identity") + 1], main_identity.key)
+        self.assertEqual(controller.attempt_evidence.repository_key, main_identity.key)
+
+    def offload_history_command(self, controller: offload.ProcessController,
+                                request: offload.OffloadRequest) -> list[str]:
+        config = eligibility.OffloadConfig(True, eligibility.SshConnectionSettings("fixture", 1, 1),
+            1, 1, 1, "1", {"abandoned_session_minutes": "1", "kinds": "check", "linux_only.checkout": ""})
+
+        def remote_command(_: copies.RemoteMirror, command: str) -> str:
+            return command
+
+        with (
+            mock.patch.object(offload, "claim_for_run", return_value=offload.FreshMacClaim()),
+            mock.patch.object(offload, "probe_mac", return_value=offload.ProbeSnapshot(100, "fixture")),
+            mock.patch.object(offload, "copy_tree_with_key", return_value=offload.CopiedTree(offload.KnownTreeKey("tree"))),
+            mock.patch.object(offload, "trusted_linux_source", return_value=True),
+            mock.patch.object(offload, "expected_linux_parity", return_value={}),
+            mock.patch.object(offload, "copy_tracked_scripts", return_value=True),
+            mock.patch.object(copies, "remote_lease"),
+            mock.patch.object(copies, "register_remote"),
+            mock.patch.object(copies, "remote_use_command", side_effect=remote_command),
+            mock.patch.object(offload, "release_claim", return_value=offload.ClaimReleaseConfirmed()),
+            mock.patch.object(buildlog_sync, "sync_target"),
+            mock.patch.object(controller, "stream_mac_run",
+                return_value=offload.ReportedMacStatus(0, offload.CleanupKept())) as stream,
+        ):
+            result = offload.run_offload(controller, config, request, time.monotonic())
+        self.assertIsInstance(result, offload.PassedOnMac if request.target == "mac" else offload.PassedOnTarget)
+        stream.assert_called_once()
+        arguments = cast(list[str], stream.call_args.args[0])
+        return shlex.split(arguments[-1])
 
     def test_wait_reservation_retry_keeps_the_exact_claim_after_an_origin_change(self) -> None:
         config = eligibility.OffloadConfig(True, eligibility.SshConnectionSettings("fixture-mac", 1, 1),

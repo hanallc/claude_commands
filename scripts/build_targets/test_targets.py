@@ -21,6 +21,7 @@ from scripts.lint.memory_test_support import config_environment, write_config_fi
 from scripts.build_targets import build_targets, target_config, targets
 from scripts.build_hold import build_hold
 from scripts.build_hold import owning_session as session_owner
+from scripts.buildlog import repository
 from scripts.mac_test import mac_test
 from scripts.lib import atomic_file
 from scripts.lib import process_start as process_identity
@@ -745,7 +746,8 @@ class ReservationTests(IsolatedTargetTest):
                         mock.patch.object(process_identity, "process_start", side_effect=process_start), \
                         mock.patch.object(mac_test, "target_claim_scope", return_value=mac_test.WHOLE_MAC), \
                         mock.patch.object(claim_state, "mac_repository_identity", return_value=claim_state.ResolvedMacMirror(
-                            "fixture-hana", "hana", "hana.json", "hana", str(self.root), "https://fixture.invalid/hana.git")), \
+                            "fixture-hana", "hana", "hana.json", "hana", str(self.root))), \
+                        mock.patch.object(repository, "repository_key", return_value="https://fixture.invalid/hana"), \
                         mock.patch.object(offload.ProcessController, "capture", return_value=offload.CommandOutput(0, "", "")):
                     with mock.patch.object(atomic_file, "write_text_atomic", side_effect=interrupted_write):
                         with self.assertRaisesRegex(OSError, "publication interrupted"):

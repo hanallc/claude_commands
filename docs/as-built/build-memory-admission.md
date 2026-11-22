@@ -529,8 +529,9 @@ The mac-linux gate shares the claude_commands repository limit with native Mac r
 Each guest uses a numbered claim. Mac mirror work uses the unnumbered claim.
 The Mac resolves the repository before it takes the claim lock.
 The key follows local clone origins to the upstream repository. Git alternates supply objects only.
-The runner reads the checkout origin once. It uses that value to find the mirror and set the history key.
-Each new work claim saves its repository key, history key, claim file, mirror name, and start fence directory.
+The Mac runner reads the step history key from the submitting checkout. This read includes Git worktree URL rewrites.
+The Mac runner uses the shared origin to find the mirror and set the claim key.
+Each new work claim saves its claim key, history key, claim file, mirror name, and start fence directory.
 The key determines the file name for a new claim. The mirror name identifies the directory the runner uses.
 The runner, release, cleanup, and execution observer use the saved identity. Handoff retains the reservation file and its start fence.
 A handoff can adopt an exact cleanup claim after the checkout is gone.

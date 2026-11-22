@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 import os
 from pathlib import Path
 import subprocess
@@ -108,7 +108,6 @@ class MacSourceRepository:
 
     git_dir: str
     key: str
-    checkout_origin: str = field(repr=False)
 
 
 class UnrecordedSourceCheckout:
@@ -117,8 +116,7 @@ class UnrecordedSourceCheckout:
 
 def mac_source_repository(worktree: str, common: str) -> MacSourceRepository | UnrecordedSourceCheckout:
     """Follow local clone origins from the checkout to the source repository."""
-    checkout_origin = _mac_origin(Path(common))
-    origin = checkout_origin
+    origin = _mac_origin(Path(common))
     directory = worktree
     seen = {common}
     while origin:
@@ -129,12 +127,12 @@ def mac_source_repository(worktree: str, common: str) -> MacSourceRepository | U
             directory = source_directory
         source = _local_origin_checkout(origin, directory)
         if source is None or str(source.common_dir) in seen:
-            return MacSourceRepository(common, remote_identity(origin, directory), checkout_origin)
+            return MacSourceRepository(common, remote_identity(origin, directory))
         common = str(source.common_dir)
         seen.add(common)
         directory = str(source.toplevel)
         origin = _mac_origin(source.common_dir)
-    return MacSourceRepository(common, "git-dir:" + common, checkout_origin)
+    return MacSourceRepository(common, "git-dir:" + common)
 
 
 def _relative_origin_directory(common: Path, worktree: str) -> str | UnrecordedSourceCheckout:

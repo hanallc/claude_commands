@@ -357,16 +357,15 @@ class CleanupOnlyMacRepository(MacMirrorIdentity):
 
 @dataclass(frozen=True)
 class ResolvedMacMirror(MacMirrorIdentity):
-    """The mirror and the checkout origin used to find it."""
+    """The mirror and the checkout that needs it."""
 
     worktree: str
-    checkout_origin: str = field(repr=False)
 
-    def claim_repository(self) -> MacRepositoryIdentity | CleanupOnlyMacRepository:
+    def claim_repository(self, *, history_key: str = "") -> MacRepositoryIdentity | CleanupOnlyMacRepository:
         from scripts.buildlog import repository
 
-        history_key = (repository.remote_identity(self.checkout_origin, self.worktree) if self.checkout_origin
-                       else repository.git_root_key(self.worktree))
+        if not history_key:
+            history_key = repository.repository_key(self.worktree)
         if not history_key or history_key == store.UNKNOWN_IDENTITY:
             return CleanupOnlyMacRepository(self.key, self.mirror_name, self.claim_file, self.fence_directory)
         return MacRepositoryIdentity(self.key, self.mirror_name, self.claim_file, self.fence_directory, history_key)
@@ -880,7 +879,7 @@ def mac_repository_identity(worktree: str) -> ResolvedMacMirror | WholeMacScope:
         return WHOLE_MAC
     key = mac_claim_key(source.key)
     fence = mac_claim_stem(key, 0)
-    return ResolvedMacMirror(key, mirror, f"{fence}.json", fence, worktree, source.checkout_origin)
+    return ResolvedMacMirror(key, mirror, f"{fence}.json", fence, worktree)
 
 
 def scopes_overlap(first: ClaimScope, second: ClaimScope, *, mac: bool = False) -> bool:
