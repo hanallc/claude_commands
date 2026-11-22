@@ -3,6 +3,7 @@
 Release the claim after the guest confirms that it wrote the cancel record under the run lock.
 If the guest is unreachable, hold the claim and retry until the guest can prove the run ended.
 If the gate parent and module supervisor die, a descendant can keep the lock and prevent proof.
+Without a signal handler, Python can raise KeyboardInterrupt at any bytecode. An interrupt outside the protected block acts like process death. The guest timeout still ends the run.
 """
 from __future__ import annotations
 
@@ -631,33 +632,44 @@ def run_remote(repo: Path, settings: GuestSettings, source: CandidateSource, req
     first_failure = ''
     retry_proof = False
     reported_hold = False
+    proof_obtained = False
+
     while True:
         try:
-            if armed is None:
-                armed = arm_guest(settings, uuid4().hex)
-                command = settings.command(run_shell(settings, source, len(bootstrap), armed))
-                stream = stream_guest_bundle(repo, ['bash', '-o', 'pipefail', '-c', STREAM_SOURCE,
-                                                     TARGET, prefix, base, header, *command],
-                                             bootstrap, settings.transfer_timeout_seconds)
+            # Protect the error handler and the jump to the next attempt.
             while True:
-                if retry_proof:
-                    if not reported_hold:
-                        reported_hold = True
-                        with suppress(OSError, ValueError):
-                            print(GUEST_END_PENDING_MESSAGE, file=sys.stderr, flush=True)
-                    sleep(SSH_CONNECT_TIMEOUT_SECONDS)
-                retry_proof = True
-                proof = prove_guest_end(settings, armed)
-                if isinstance(proof, GuestEndProven):
+                # Keep the jump target inside the outer try.
+                if proof_obtained:
                     break
-                if not first_failure:
-                    first_failure = proof.detail
+                try:
+                    if armed is None:
+                        armed = arm_guest(settings, uuid4().hex)
+                        command = settings.command(run_shell(settings, source, len(bootstrap), armed))
+                        arguments = ['bash', '-o', 'pipefail', '-c', STREAM_SOURCE, TARGET, prefix, base, header, *command]
+                        stream = stream_guest_bundle(repo, arguments, bootstrap, settings.transfer_timeout_seconds)
+                    if retry_proof:
+                        if not reported_hold:
+                            reported_hold = True
+                            with suppress(OSError, ValueError):
+                                print(GUEST_END_PENDING_MESSAGE, file=sys.stderr, flush=True)
+                        sleep(SSH_CONNECT_TIMEOUT_SECONDS)
+                    retry_proof = True
+                    proof = prove_guest_end(settings, armed)
+                    if isinstance(proof, GuestEndProven):
+                        proof_obtained = True
+                    elif not first_failure:
+                        first_failure = proof.detail
+                except BaseException as error:
+                    if armed is None:
+                        raise
+                    # Report the first interrupt even if the transfer failed before it.
+                    if first_error is None or (isinstance(first_error, Exception) and not isinstance(error, Exception)):
+                        first_error = error
             break
         except BaseException as error:
             if armed is None:
                 # The route can send a run only after the guest confirms the arm.
                 raise
-            # Report the first interrupt even if the transfer failed before it.
             if first_error is None or (isinstance(first_error, Exception) and not isinstance(error, Exception)):
                 first_error = error
 

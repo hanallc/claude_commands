@@ -14,6 +14,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from types import CodeType
 from typing import cast, override
 import unittest
 from unittest.mock import call, patch
@@ -648,6 +649,54 @@ fi
         self.assertEqual(events, ['reserved', 'interrupted', 'retry interrupted', 'ended', 'released'])
         self.assertEqual(lock_statuses, [1, 0])
         self.assertEqual(log.getvalue().splitlines(), [mac_linux.GUEST_END_PENDING_MESSAGE])
+        self.assertEqual(self.trace.read_text().splitlines(), ['probe', 'arm', 'run', 'cleanup'])
+
+    def test_interrupt_at_retry_jump_keeps_the_claim_until_proof(self) -> None:
+        stream_guest_bundle = mac_linux.stream_guest_bundle
+        interruption = KeyboardInterrupt('fixture interruption at the retry jump')
+        events: list[str] = []
+        lock_statuses: list[int] = []
+
+        @contextmanager
+        def reservation(*_args: object) -> Generator[None]:
+            events.append('reserved')
+            try:
+                yield
+            finally:
+                lock_statuses.append(subprocess.call(['flock', '-x', '-n', self.run_lock(), 'true']))
+                events.append('released')
+
+        def fail_stream(repo: Path, command: list[str], bootstrap: bytes,
+                        timeout: int) -> subprocess.CompletedProcess[bytes]:
+            stream = stream_guest_bundle(repo, command, bootstrap, timeout)
+            self.assertEqual(stream.returncode, 255)
+            events.append('SSH failed')
+            raise mac_linux.GuestUnavailable('fixture SSH failed')
+
+        def interrupt_jump(_code: CodeType, origin: int, destination: int) -> None:
+            if destination < origin and events == ['reserved', 'SSH failed']:
+                lock_statuses.append(subprocess.call(['flock', '-x', '-n', self.run_lock(), 'true']))
+                events.append('interrupted')
+                raise interruption
+
+        monitoring = sys.monitoring
+        run_code = mac_linux.run_remote.__code__
+        tool_id = next(index for index in range(6) if monitoring.get_tool(index) is None)
+        monitoring.use_tool_id(tool_id, 'guest retry jump fixture')
+        try:
+            _ = monitoring.register_callback(tool_id, monitoring.events.JUMP, interrupt_jump)
+            monitoring.set_local_events(tool_id, run_code, monitoring.events.JUMP)
+            with (patch.object(mac_linux, 'mac_linux_reservation', reservation),
+                  patch.object(mac_linux, 'stream_guest_bundle', fail_stream),
+                  self.assertRaises(KeyboardInterrupt) as raised):
+                _ = self.route('disconnect-before-copy')
+        finally:
+            monitoring.set_local_events(tool_id, run_code, 0)
+            _ = monitoring.register_callback(tool_id, monitoring.events.JUMP, None)
+            monitoring.free_tool_id(tool_id)
+        self.assertIs(raised.exception, interruption)
+        self.assertEqual(events, ['reserved', 'SSH failed', 'interrupted', 'released'])
+        self.assertEqual(lock_statuses, [1, 0])
         self.assertEqual(self.trace.read_text().splitlines(), ['probe', 'arm', 'run', 'cleanup'])
 
     def test_run_and_cleanup_refuse_a_symlink_lock(self) -> None:
