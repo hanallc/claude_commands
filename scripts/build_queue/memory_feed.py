@@ -45,7 +45,7 @@ from scripts.build_queue import admission_code
 # Preserve the schema check across the imports below.
 ADMISSION_VERSION_AT_IMPORT = admission_code.admission_code_version(installed.code_root / "scripts")
 
-from scripts.buildlog import charts, cost_actions, mac_idle_alert, parse
+from scripts.buildlog import charts, cost_actions, mac_idle_alert, parse, store
 from scripts.buildlog.store import host_name
 from scripts.build_queue import progress_profile as progress
 from scripts.build_queue import snapshot_codec as codec
@@ -841,14 +841,11 @@ def step_name_parts(step: admission_records.RunningStep | admission_records.Wait
     return staff_names.owned_step_parts(names, step.step, identity.unit, identity.role, ci=ci, current=current)
 
 
-def step_key(row: RunRow | WaitRow | MacBuildRow | MacReadingUnavailableRow | CloudWorkRow, *,
-             placement_episode: str = "") -> str:
+def step_key(row: RunRow | WaitRow | MacBuildRow | MacReadingUnavailableRow | CloudWorkRow) -> str:
     """Keep a process identity across changes to memory, labels, and queue order."""
     # An idle or unreadable CI row has no pid or start time; its cgroup tells two CI rows apart.
     identity = [row.get("machine") or "natedev", row.get("kind", "local"), row["pid"],
                 row.get("started_at", row.get("since", 0)), row.get("group", ""), row.get("ci_cgroup", "")]
-    if placement_episode:
-        identity.append(placement_episode)
     return hashlib.sha256(json.dumps(codec.snapshot_value(identity)).encode()).hexdigest()[:24]
 
 
@@ -2989,11 +2986,7 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
         owner = step_page_owner(waiter, labels, ci_runners, members, machine, ci_label=ci_label)
         identity = owner.labels
         cause = waiter.reason.cause if isinstance(waiter.reason, admission_records.HeadAdmissionStatus) else waiter.reason
-        if waiter.placement_block is not None:
-            reason = limits_view.placement_reason(waiter.placement_block.reason)
-        elif waiter.placement_pending:
-            reason = "Evidence pending"
-        elif isinstance(cause, admission_records.BehindHead):
+        if isinstance(cause, admission_records.BehindHead):
             order = order_holds.get(waiter.pid)
             blocker = (positions.get(order.waiter["pid"], 0) if isinstance(order, admission_records.HeldBehindHead)
                        else admission_records.behind_place(cause, waiting))
@@ -3152,10 +3145,8 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
                 if isinstance(explanation.head, admission_records.HeadExplanation) and explanation.head.decision.state == "hold":
                     waiting_row["head_room"] = head_room(explanation.head.room, explanation.room, ram)
                 break
-    for wait_row, visible in zip(waiting_rows, visible_waits, strict=True):
-        source = visible.source
-        episode = source.step.episode if isinstance(source, queue_view.WaitingBuild) else ""
-        wait_row["key"] = step_key(wait_row, placement_episode=episode)
+    for wait_row in waiting_rows:
+        wait_row["key"] = step_key(wait_row)
     for running_row in work_rows:
         running_row["key"] = step_key(running_row)
     pressure = explanation.decided_from.pressure
@@ -3210,7 +3201,7 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
         page["build_limits"] = limits_view.build_limits(parsed, snapshots, limit_names,
             limits_view.Metric("Memory for builds", gib(captured.cap_use),
                                gib(captured.cap) if isinstance(captured.cap, int) else None, "GiB"),
-            folder_settings, limit_background, zone)
+            limits_view.read_facts(store.root() / "admission", explanation.now), limit_background, zone)
     page["render_seconds"] = time.perf_counter() - started
     return page
 
@@ -3261,7 +3252,7 @@ class LimitsRefresh:
                     current.origins.aliases.update(previous.history.origins.aliases)
                     for folder, origin in previous.history.origins.folders.items():
                         _ = current.origins.folders.setdefault(folder, origin)
-                    current = replace(current, history=previous.history, cloud_routes=previous.cloud_routes,
+                    current = replace(current, history=previous.history,
                                       history_stale=True)
                 self.saved = current
             except (OSError, ValueError, KeyError, RuntimeError) as error:

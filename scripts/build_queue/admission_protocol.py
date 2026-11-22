@@ -123,7 +123,6 @@ class CloudRow:
     progress: cloud_progress.CloudProgress | cloud_progress.NoCloudProgress
     counter: progress_profile.ProgressCounter | progress_profile.NoCounter
     wait: CloudSlotWait | records.ReadyForAdmission
-    repo_identity: str = field(default="", kw_only=True)
 
 
 @dataclass(frozen=True)

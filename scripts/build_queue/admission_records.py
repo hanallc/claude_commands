@@ -685,7 +685,6 @@ class Waiter(TypedDict):
     route: NotRequired[StepRoute]
     verify: NotRequired[VerifyCall]
     job: NotRequired[StepJob]
-    placement_episode: NotRequired[str]
 
 
 @dataclass(frozen=True)
@@ -1106,16 +1105,6 @@ class PackageNotRecorded:
 
 
 @dataclass(frozen=True)
-class PlacementBlock:
-    """The queue records the destination and its last observed blocker."""
-
-    provider: Literal["local", "ssh", "scaler"]
-    target: str
-    reason: str
-    episode: str = ""
-
-
-@dataclass(frozen=True)
 class WaitingStep:
     """The waiting step holds its caller, memory need, wait reason, and run identity."""
     pid: int
@@ -1134,13 +1123,6 @@ class WaitingStep:
     verify: VerifyStep = field(default=NotVerifyCall(), kw_only=True)
     job: StepJob | GateJobNotRecorded = field(default=GATE_JOB_NOT_RECORDED, kw_only=True)
     ci_runner: str = field(default="", kw_only=True)
-    placement_block: PlacementBlock | None = field(default=None, kw_only=True)
-    placement_pending: bool = field(default=False, kw_only=True)
-    placement_episode: str = field(default="", kw_only=True)
-
-    @property
-    def episode(self) -> str:
-        return self.placement_episode or (self.placement_block.episode if self.placement_block is not None else "")
 
 
 @dataclass(frozen=True)
@@ -1376,6 +1358,52 @@ class QueueRead:
     explanation: QueueExplanation
     ordered: list[tuple[Path, RankedWaiter]]
     diagnostics: tuple[ConfigurationDiagnostic, ...] = ()
+
+
+LIMITS_SNAPSHOT = "build-limits.json"
+
+
+@dataclass(frozen=True)
+class PlacementBlock:
+    provider: placement.PlacementProvider
+    target: str
+    reason: str
+
+
+@dataclass(frozen=True)
+class LimitsWait:
+    step: WaitingStep
+    position: int
+    repository: RepositoryIdentity
+    blocks: tuple[PlacementBlock, ...] = ()
+    pending: bool = False
+
+
+@dataclass(frozen=True)
+class LimitsCloud:
+    pid: int
+    start_time: str
+    origin: str
+    reason: str
+
+
+@dataclass(frozen=True)
+class LimitsHana:
+    evidence: placement.HanaCapacity
+    runs: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class LimitsFacts:
+    observed_at: float
+    waits: tuple[LimitsWait, ...]
+    cloud: tuple[LimitsCloud, ...]
+    cloud_slots: int | None
+    disk_floor: int | None
+    disk_free: int | None
+    aws_targets: frozenset[str]
+    mac_targets: frozenset[str]
+    hana: tuple[LimitsHana, ...] = ()
 
 
 @dataclass(frozen=True)

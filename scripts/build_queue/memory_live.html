@@ -1265,21 +1265,21 @@ function render(d) {
 }
 
 function limitMarks(kind, count = 1) {
-  const marks = `<span class="build-limit-mark ${kind}" aria-hidden="true"></span>`.repeat(Math.min(24, count));
-  return marks + (count > 24 ? '<span aria-hidden="true">…</span>' : "");
+  const shown = kind === "run" ? count : Math.min(24, count);
+  const marks = `<span class="build-limit-mark ${kind}" aria-hidden="true"></span>`.repeat(shown);
+  return marks + (count > shown ? '<span aria-hidden="true">…</span>' : "");
 }
 function limitPlaces(used, limit, runs) {
   const free = Number.isInteger(limit) && Number.isInteger(used) ? Math.max(0, limit - used) : 0;
   return `<span class="build-limit-marks">${limitMarks("run", runs)}${limitMarks("free", free)}
     ${limit == null ? "" : limitMarks("line")}</span>`;
 }
-function limitMetric(metric, compact = false) {
+function limitMetric(metric) {
   const {label, used, limit, unit, qualifier} = metric;
   const amount = value => unit === "USD" ? `$${value.toFixed(2)}` : unit === "GiB" ? f1(value) : String(value);
   const suffix = unit === "GiB" ? " GiB" : "";
   let text = "Unavailable";
-  if (limit != null && compact) text = `${amount(limit)}${suffix} maximum`;
-  else if (limit != null && qualifier === "minimum")
+  if (limit != null && qualifier === "minimum")
     text = `${used == null ? "Unavailable" : amount(used) + suffix} · ${amount(limit)}${suffix} minimum`;
   else if (limit != null)
     text = `${used == null ? "Unavailable" : amount(used)} of ${amount(limit)}${suffix}`;
@@ -1287,7 +1287,7 @@ function limitMetric(metric, compact = false) {
     ? `<span class="build-limit-track${qualifier === "minimum" && used < limit ? " below" : ""}" aria-hidden="true">
       <i style="width:${Math.min(100, Math.max(0, used / limit * 100))}%"></i></span>` : "";
   const places = unit || limit == null ? "" : limitPlaces(used, limit, used ?? 0);
-  const note = qualifier && qualifier !== "minimum" && qualifier !== "maximum" ? ` · ${esc(qualifier)}` : "";
+  const note = qualifier && qualifier !== "minimum" ? ` · ${esc(qualifier)}` : "";
   return `<div class="build-limit-metric"><span>${esc(label)}${note}</span>${bar || places}<span class="num">${esc(text)}</span></div>`;
 }
 function limitNames(names) {
@@ -1300,12 +1300,12 @@ function limitWaits(waits) {
       <span>${names.length} waiting · ${esc(reason)}</span></div>${limitNames(names)}</div>`).join("");
 }
 function limitCell(cell) {
-  const {available, limit, used, runs, exempt, other, other_note, waits, budgets, note} = cell;
+  const {available, limit, used, runs, exempt, other, waits, budgets, note} = cell;
   let contents;
   if (available === false) contents = `<span class="build-limit-note">Does not run here</span>`;
   else if (available == null) contents = '<span class="build-limit-note">State unavailable</span>';
   else {
-    const marks = limitPlaces(used, limit, Math.min(runs.length, used ?? runs.length));
+    const marks = limitPlaces(used, limit, used ?? 0);
     const count = limit == null ? (used ? `${used} running · no limit` : "no limit")
       : used == null ? `Use unavailable · limit ${limit}` : `${used} of ${limit}`;
     contents = `<div class="build-limit-count num">${marks}<span>${esc(count)}</span></div>${limitNames(runs)}`;
@@ -1316,9 +1316,9 @@ function limitCell(cell) {
   if (exempt.length) contents += `<div class="build-limit-count build-limit-note">
     <span class="build-limit-marks">${limitMarks("merge", exempt.length)}</span><span>Exempt merge runs</span>
     </div>${limitNames(exempt)}`;
-  if (other.length) contents += `<div class="build-limit-note">${esc(other_note || `${other.length} other running`)}</div>${limitNames(other)}`;
+  if (other.length) contents += `<div class="build-limit-note">${other.length} other running</div>${limitNames(other)}`;
   if (note) contents += `<div class="build-limit-note">${esc(note)}</div>`;
-  return `${contents}${budgets.map(metric => limitMetric(metric, metric.qualifier === "maximum")).join("")}${limitWaits(waits)}`;
+  return `${contents}${budgets.map(limitMetric).join("")}${limitWaits(waits)}`;
 }
 let lastBuildLimitsHtml = "";
 function renderBuildLimits(limits) {

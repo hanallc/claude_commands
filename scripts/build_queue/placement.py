@@ -1,7 +1,7 @@
 """Placement decisions keep submitting owners separate from remote executions."""
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
@@ -226,10 +226,13 @@ class EvidenceNeeded:
 HostEligibility = AllowedHost | FixedExclusion | TemporaryExclusion | EvidenceNeeded
 
 
+PlacementProvider = Literal["local", "mac", "ssh", "scaler"]
+
+
 @dataclass(frozen=True)
 class PlacementDestination:
     """The destination holds its provider, target, host, claim scope, and slot."""
-    provider: Literal["local", "mac", "ssh", "scaler"]
+    provider: PlacementProvider
     target: str
     host: str
     scope: ClaimScope
@@ -355,7 +358,7 @@ LaunchPermission = PermissionAvailable | PermissionConsumed
 @dataclass(frozen=True)
 class ProviderClaimReference:
     """The reference identifies a provider claim for one episode and attempt."""
-    provider: Literal["local", "mac", "ssh", "scaler"]
+    provider: PlacementProvider
     target: str
     scope: ClaimScope
     claim_id: str
@@ -457,6 +460,13 @@ NO_PROVIDER_DIAGNOSTIC = NoProviderDiagnostic()
 
 
 @dataclass(frozen=True)
+class HanaCapacity:
+    repository: str
+    limit: int
+    claim_ids: frozenset[str]
+
+
+@dataclass(frozen=True)
 class FreshHostEvidence:
     """The current evidence holds eligibility, claims, executions, and resource diagnostics."""
     key: HostEvidenceKey
@@ -468,6 +478,7 @@ class FreshHostEvidence:
     executions: tuple[tuple[ProviderClaimReference, execution_identity.ExecutionEvidence], ...] = ()
     holder: ResourceHolder = ResourceHolderUnknown()
     provider_diagnostic: BusyProviderDiagnostic | NoProviderDiagnostic = NO_PROVIDER_DIAGNOSTIC
+    hana: HanaCapacity | None = field(default=None, kw_only=True)
 
 
 @dataclass(frozen=True)
@@ -484,6 +495,8 @@ class HostEvidenceUnavailable:
     key: HostEvidenceKey
     observed_at: float
     reason: str
+
+    hana: HanaCapacity | None = field(default=None, kw_only=True)
 
 
 HostEvidence = FreshHostEvidence | StaleHostEvidence | HostEvidenceUnavailable

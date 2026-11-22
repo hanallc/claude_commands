@@ -1,8 +1,7 @@
 """Prepare the Build limits section from recorded queue and target state."""
 from __future__ import annotations
 
-import ast
-import os
+import json
 import sqlite3
 from collections import Counter
 from collections.abc import Iterable, Mapping, Sequence
@@ -12,17 +11,14 @@ from pathlib import Path
 from typing import Literal, cast
 from zoneinfo import ZoneInfo
 
-from scripts.aws_target import cloud_gate, config as aws_config, hana_box, hana_placement, ledger, spend
-from scripts.build_queue import admission_protocol as wire, admission_records as records, placement, queue_view, target_availability
+from scripts.aws_target import config as aws_config, ledger, spend
+from scripts.build_queue import admission_protocol as wire, admission_records as records, placement, queue_view, snapshot_codec, target_availability
 from scripts.build_queue.admission_wire import ReservedCloudSlot
 from scripts.build_queue.slot_wait import public_queue_text
 from scripts.build_targets import target_config, targets
-from scripts.build_targets.execution_transport import HanaControlTransport, HanaGpuNextestTransport
 from scripts.buildlog import charts, repository, store
 from scripts.lib import conf, git_files
-from scripts.lib.build_slots import slot_cargo_root
 from scripts.lint.memory_admit import gpu_test_reservation, repository_run_owner, reserved_repository_runs
-from scripts.production import gate
 
 Machine = Literal["natedev", "aws"]
 HISTORY_SECONDS = 30 * 24 * 60 * 60
@@ -53,7 +49,6 @@ class Cell:
     runs: list[str] = field(default_factory=list[str])
     exempt: list[str] = field(default_factory=list[str])
     other: list[str] = field(default_factory=list[str])
-    other_note: str = ""
     waits: dict[str, list[str]] = field(default_factory=dict[str, list[str]])
     budgets: tuple[Metric, ...] = ()
     note: str = ""
@@ -154,6 +149,7 @@ class RecentRepositories:
     machines: dict[str, set[str]]
     checkouts: dict[str, Path]
     origins: Origins = field(default_factory=Origins)
+    policy_names: dict[str, set[str]] = field(default_factory=dict[str, set[str]])
 
 
 @dataclass(frozen=True)
@@ -161,7 +157,6 @@ class Background:
     history: RecentRepositories | charts.IndexUnavailable
     aws_money: Metric
     hana_money: Metric
-    cloud_routes: dict[str, bool] = field(default_factory=dict[str, bool])
     origins: Origins = field(default_factory=Origins)
     history_stale: bool = False
 
@@ -169,15 +164,16 @@ class Background:
 def recent_steps(connection: sqlite3.Connection, now: float,
                  aws_hosts: frozenset[str] = NO_AWS_HOSTS, *, origins: Origins | None = None) -> RecentRepositories:
     """Identify repositories from origins or readable source checkouts."""
-    select = """SELECT DISTINCT repo_identity, repo_path, target, host FROM steps
+    select = """SELECT DISTINCT repo_identity, repo_path, target, host, repo FROM steps
                 WHERE started_at >= ? AND started_at <= ?"""
-    rows = cast(Iterable[tuple[object, object, object, object]],
+    rows = cast(Iterable[tuple[object, object, object, object, object]],
                 connection.execute(select, (store.utc_iso(now - HISTORY_SECONDS), store.utc_iso(now))))
     machines: dict[str, set[str]] = {}
     checkouts: dict[str, Path] = {}
     checkout_origins: dict[str, set[str]] = {}
+    policy_names: dict[str, set[str]] = {}
     origins = origins if origins is not None else Origins()
-    for identity, repo_path, target, host in rows:
+    for identity, repo_path, target, host, repo_name in rows:
         key = identity if isinstance(identity, str) else ""
         folder = key if key.startswith("/") else repo_path if isinstance(repo_path, str) else ""
         origin = origins.resolve(key, folder, read_checkout=True)
@@ -191,6 +187,8 @@ def recent_steps(connection: sqlite3.Connection, now: float,
                 _ = checkouts.setdefault(origin, Path(folder))
         machine = target if isinstance(target, str) and target else "aws" if host in aws_hosts else str(host)
         machines.setdefault(origin, set()).add(machine)
+        if isinstance(repo_name, str) and repo_name:
+            policy_names.setdefault(origin, set()).add(repo_name)
     # Prefer a checkout that has recorded both the old URL and the current URL.
     for folder, recorded in checkout_origins.items():
         if len(recorded) < 2:
@@ -206,41 +204,27 @@ def recent_steps(connection: sqlite3.Connection, now: float,
             _ = origins.aliases.setdefault(origin, current)
     canonical_machines: dict[str, set[str]] = {}
     canonical_checkouts: dict[str, Path] = {}
+    canonical_names: dict[str, set[str]] = {}
     for origin, used in machines.items():
         canonical_machines.setdefault(origins.canonical(origin), set()).update(used)
     for origin, candidate in checkouts.items():
         _ = canonical_checkouts.setdefault(origins.canonical(origin), candidate)
-    return RecentRepositories(canonical_machines, canonical_checkouts, origins)
+    for origin, names in policy_names.items():
+        canonical_names.setdefault(origins.canonical(origin), set()).update(names)
+    return RecentRepositories(canonical_machines, canonical_checkouts, origins, canonical_names)
 
 
-def aws_gate_routes(history: RecentRepositories, deployed: bool) -> dict[str, bool]:
-    """Check the wire mode in the recorded checkout with bounded Git reads."""
-    if not deployed:
-        return {}
-    routes: dict[str, bool] = {}
-    mode = gate.SuiteMode.GATE.wire
-    for origin, checkout in history.checkouts.items():
-        for name in ("gate_routes.py", "gate.py", "merge_gate.py"):
-            path = f"scripts/production/{name}"
-            if not (checkout / path).is_file():
-                continue
-            source = repository.output(["git", "show", f"HEAD:{path}"], str(checkout), repository.GIT_TIMEOUT_S)
-            if source is None:
-                continue
-            try:
-                suite = next((node for node in ast.parse(source).body
-                              if isinstance(node, ast.ClassDef) and node.name == "SuiteMode"), None)
-            except SyntaxError:
-                break
-            if suite is not None:
-                routes[origin] = any(
-                    isinstance(node, (ast.Assign, ast.AnnAssign)) and isinstance(node.value, ast.Constant)
-                    and node.value.value == mode
-                    or isinstance(node, ast.FunctionDef) and node.name == "_missing_"
-                    and any(isinstance(value, ast.Constant) and value.value == mode for value in ast.walk(node))
-                    for node in suite.body)
-                break
-    return routes
+def read_facts(directory: Path, observed_at: float) -> records.LimitsFacts | None:
+    """Use only facts for the queue pass that the page displays."""
+    try:
+        raw = cast(object, json.loads((directory / records.LIMITS_SNAPSHOT).read_text()))
+        if not isinstance(raw, dict):
+            return None
+        envelope = cast(dict[str, object], raw)
+        facts = cast(records.LimitsFacts, snapshot_codec.parse_snapshot_value(envelope["limits_facts"], records.LimitsFacts))
+    except (OSError, KeyError, ValueError, TypeError, RecursionError, OverflowError):
+        return None
+    return facts if facts.observed_at == observed_at else None
 
 
 def background(now: float, active_folders: Sequence[str] = ()) -> Background:
@@ -260,8 +244,6 @@ def background(now: float, active_folders: Sequence[str] = ()) -> Background:
     for folder in active_folders:
         _ = origins.resolve("", folder, read_checkout=True)
     directory = target_config.ssh_target_state_directory("aws")
-    routes = aws_gate_routes(history, (directory / "gate-deployment.json").is_file()
-                             ) if isinstance(history, RecentRepositories) else {}
     instant = int(now)
     today = datetime.fromtimestamp(instant, UTC).date().isoformat()
     account = conf.read("aws_target")
@@ -290,7 +272,7 @@ def background(now: float, active_folders: Sequence[str] = ()) -> Background:
     except (ValueError, OSError, KeyError, ArithmeticError):
         pass
     return Background(history, Metric("Money today", aws_used, aws_limit, "USD", qualifier),
-                      Metric("Money today", hana_used, hana_limit, "USD", "estimate"), routes,
+                      Metric("Money today", hana_used, hana_limit, "USD", "estimate"),
                       origins)
 
 
@@ -310,7 +292,7 @@ def target_state(snapshot: targets.TargetSnapshot | None, zone: tzinfo) -> str:
     return "In use" if any(isinstance(state, targets.Running) for state in states) else "Free"
 
 
-def local_limits(reading: records.QueueRead, memory: Metric, folders: conf.ConfigRead) -> tuple[Metric, ...]:
+def local_limits(reading: records.QueueRead, memory: Metric, facts: records.LimitsFacts | None) -> tuple[Metric, ...]:
     explanation = reading.explanation
     inputs = explanation.decided_from
     gpu = explanation.policy.gpu_tests
@@ -318,54 +300,9 @@ def local_limits(reading: records.QueueRead, memory: Metric, folders: conf.Confi
     if gpu.repositories:
         used = sum(gpu_test_reservation(row, gpu) for row in inputs.reservations)
         metrics.append(Metric("GPU tests", used, gpu.slots, qualifier=", ".join(sorted(gpu.repositories))))
-    try:
-        settings = conf.read("build_admission")
-        floor = settings.value("free_floor_gib", conf.positive_whole, default=0)
-    except conf.Unusable:
-        floor = 0
-    if floor:
-        free = None
-        if isinstance(inputs.build_space, records.BuildSpaceLow):
-            free = inputs.build_space.free_gib
-        elif isinstance(inputs.build_space, records.NoBuildSpaceHold):
-            try:
-                disk = os.statvfs(slot_cargo_root(folders))
-                free = disk.f_bavail * disk.f_frsize // records.GIB
-            except (OSError, conf.Unusable):
-                pass
-        metrics.append(Metric("Free disk", free, floor, "GiB", "minimum"))
+    if facts is not None and facts.disk_floor is not None:
+        metrics.append(Metric("Free disk", facts.disk_free, facts.disk_floor, "GiB", "minimum"))
     return tuple(metrics)
-
-
-@dataclass(frozen=True)
-class HanaRoute:
-    repository: str
-    host: str
-    maximum: int
-    lifecycle: hana_box.HanaLifecycleEvidence | hana_box.HanaUnprovisioned | None
-
-
-def hana_route(snapshots: Sequence[targets.TargetSnapshot]) -> HanaRoute | None:
-    for snapshot in snapshots:
-        target = snapshot.target
-        if not isinstance(target, target_config.SshTarget) or target.platform != "linux":
-            continue
-        try:
-            transport = target_config.read_execution_transport(target)
-            if not isinstance(transport, HanaControlTransport):
-                continue
-            route = hana_placement.read_settings(conf.read(transport.settings))
-            if not isinstance(route, hana_placement.EnabledHanaRoute):
-                continue
-        except (OSError, ValueError):
-            continue
-        lifecycle = None
-        try:
-            lifecycle = hana_placement.controller_for(transport, read_only=True).read_saved_lifecycle()
-        except (OSError, ValueError, KeyError, TypeError):
-            pass
-        return HanaRoute(route.repository_key, transport.host, route.max_steps, lifecycle)
-    return None
 
 
 @dataclass(frozen=True)
@@ -381,7 +318,7 @@ def visible_waits(model: queue_view.QueueModel, local_names: Mapping[int, str],
     for entry in queue_view.waiting_builds(model):
         if isinstance(entry, queue_view.WaitingBuild):
             step = entry.step
-            key = step.episode or (step.pid, step.since)
+            key = (step.pid, step.since)
             name = local_names.get(entry.position)
         elif isinstance(entry, wire.CloudRow):
             key = entry.owner
@@ -412,21 +349,6 @@ def machine_for_target(target: str, local: str, aws: frozenset[str]) -> Machine 
     return None
 
 
-def aws_placement_targets(snapshots: Sequence[targets.TargetSnapshot]) -> frozenset[str]:
-    names: set[str] = set()
-    for snapshot in snapshots:
-        target = snapshot.target
-        if not isinstance(target, target_config.SshTarget) or target.platform != "linux":
-            continue
-        try:
-            transport = target_config.read_execution_transport(target)
-        except (OSError, ValueError):
-            continue
-        if isinstance(transport, (HanaControlTransport, HanaGpuNextestTransport)):
-            names.add(target.name)
-    return frozenset(names)
-
-
 def placement_reason(reason: str) -> str:
     match reason:
         case "busy":
@@ -451,19 +373,31 @@ def placement_reason(reason: str) -> str:
             return public_queue_text(reason) or "Placement pending"
 
 
-def queue_wait(step: records.WaitingStep, cause: records.WaitReason, local_target: str,
-               aws_targets: frozenset[str]) -> tuple[Machine | None, str]:
-    if (block := step.placement_block) is not None:
+def queue_wait(wait: records.LimitsWait, cause: records.WaitReason, local_target: str,
+               facts: records.LimitsFacts) -> tuple[Machine | None, str] | None:
+    step = wait.step
+    aws_targets = facts.aws_targets
+    if isinstance(step.route, target_config.MacOnly) or (
+            isinstance(step.route, target_config.PinnedTarget) and step.route.target in facts.mac_targets):
+        return None
+    block = next((block for block in wait.blocks if block.provider != "mac" and block.target not in facts.mac_targets), None)
+    if block is not None:
         machine = ("natedev" if block.provider == "local" else
                    machine_for_target(block.target, local_target, aws_targets))
         label = "Limit full" if block.reason == "busy" else placement_reason(block.reason)
         return machine, f"{block.target} · {label}" if machine is None and block.target else label
-    if step.placement_pending or isinstance(cause, records.ReadyForAdmission):
+    if wait.blocks:
+        return None
+    if wait.pending:
         route = step.route
         machine = machine_for_target(route.target, local_target, aws_targets) if isinstance(route, target_config.PinnedTarget) else None
         if isinstance(route, target_config.PinnedTarget) and machine is None:
             return None, f"{route.target} · Evidence pending"
         return machine, "Evidence pending"
+    if isinstance(cause, records.ReadyForAdmission):
+        return "natedev", "Ready for admission"
+    if isinstance(cause, records.StartSpacingWait):
+        return "natedev", "Waiting for start spacing"
     if isinstance(cause, (records.EstimateExpired, records.PressureUnavailable, records.ReadingUnavailable)):
         return "natedev", "Evidence pending"
     if isinstance(cause, records.NatedevHeld):
@@ -492,16 +426,21 @@ def queue_wait(step: records.WaitingStep, cause: records.WaitReason, local_targe
 
 
 def build_limits(reading: records.QueueRead, snapshots: target_availability.Snapshots, names: QueueNames,
-                 memory: Metric, folders: conf.ConfigRead, saved: Background, zone: tzinfo) -> BuildLimits:
+                 memory: Metric, facts: records.LimitsFacts | None, saved: Background, zone: tzinfo) -> BuildLimits:
     explanation = reading.explanation
     inputs = explanation.decided_from
+    if facts is None:
+        disk = inputs.build_space
+        cloud_slots = reading.cloud_slots if isinstance(reading, wire.CloudQueueRead) else None
+        facts = records.LimitsFacts(explanation.now, tuple(
+            records.LimitsWait(step, position, records.RepositoryIdentity(row.get("repo_identity", ""),
+                row.get("repository_name", ""))) for position, (step, (_, row)) in
+            enumerate(zip(reading.view.waiting, reading.ordered), 1)), (), cloud_slots,
+            disk.floor_gib if isinstance(disk, records.BuildSpaceLow) else None,
+            disk.free_gib if isinstance(disk, records.BuildSpaceLow) else None, frozenset(), frozenset())
     policy = explanation.policy.repository_runs
     found = snapshots if isinstance(snapshots, tuple) else ()
     local = next((snap for snap in found if isinstance(snap.target, target_config.LocalTarget)), None)
-    aws_targets = aws_placement_targets(found)
-    mac_targets = {snap.target.name for snap in found
-                   if isinstance(snap.target, target_config.SshTarget) and snap.target.platform == "macos"}
-    hana = hana_route(found)
     history = saved.history.machines if isinstance(saved.history, RecentRepositories) else {}
     rows = {origin: RepositoryRow(origin_name(origin)) for origin in history}
     shared: dict[str, dict[str, list[str]]] = {machine: {} for machine in ("natedev", "aws")}
@@ -516,10 +455,6 @@ def build_limits(reading: records.QueueRead, snapshots: target_availability.Snap
         if origin not in rows:
             rows[origin] = RepositoryRow(origin_name(origin))
         return rows[origin]
-
-    def known_origin(name: str) -> str:
-        matches = [origin for origin, current in rows.items() if current.name == name]
-        return matches[0] if len(matches) == 1 else ""
 
     for reservation in sorted(inputs.reservations, key=lambda item: item["step"] not in records.REPOSITORY_RUN_STEPS):
         owner = repository_run_owner(reservation)
@@ -546,54 +481,52 @@ def build_limits(reading: records.QueueRead, snapshots: target_availability.Snap
         else:
             cell.runs.append(label)
 
-    switch = cloud_gate.launch_switch(conf.read("cloud_gate"))
-    aws_state = ("On" if switch is cloud_gate.CloudGateSwitch.ON or hana is not None else
-                 "Off" if switch is cloud_gate.CloudGateSwitch.OFF else "State unavailable")
-    cloud_limit = None
+    cloud_limit = facts.cloud_slots
     cloud_used = 0
-    try:
-        cloud_limit = conf.read("build_admission").whole("cloud_gate_slots")
-    except conf.Unusable:
-        pass
+    cloud_facts = {wire.Owner(cloud.pid, cloud.start_time): cloud for cloud in facts.cloud}
+    wait_names = {entry.position: visible.name for visible in names.waits
+                  if isinstance(entry := visible.source, queue_view.WaitingBuild)}
+    cloud_wait_names = {entry.owner: visible.name for visible in names.waits
+                        if isinstance(entry := visible.source, wire.CloudRow)}
     if isinstance(reading, wire.CloudQueueRead):
-        cloud_limit = reading.cloud_slots or cloud_limit
         for cloud in reading.cloud:
-            project = origins.resolve(cloud.repo_identity, cloud.identity.folder)
+            recorded = cloud_facts.get(cloud.owner)
+            project = origins.resolve(recorded.origin, cloud.identity.folder) if recorded is not None else ""
             if project:
                 cloud_repositories.add(project)
             label = names.cloud.get(cloud.owner) or cloud.identity.unit or cloud.identity.step
             if isinstance(cloud.wait, wire.CloudSlotWait):
                 cloud_used += isinstance(cloud.wait.state, ReservedCloudSlot)
+                if cloud.owner in cloud_wait_names:
+                    reason = recorded.reason if recorded is not None and recorded.reason else "Evidence pending"
+                    shared["aws"].setdefault(reason, []).append(cloud_wait_names[cloud.owner])
             else:
                 cloud_used += 1
                 if project:
                     row(project).aws.runs.append(label)
 
-    order = reading.ordered
-    for visible in names.waits:
-        entry = visible.source
-        if isinstance(entry, wire.CloudRow):
-            if isinstance(entry.wait, wire.CloudSlotWait):
-                reason = ("Waiting for launch" if isinstance(entry.wait.state, ReservedCloudSlot) else
-                          "Gate limit full" if entry.wait.used >= entry.wait.slots else "Waiting for cloud slots")
-                shared["aws"].setdefault(reason, []).append(visible.name)
+    seen: set[tuple[int, float]] = set()
+    for wait in facts.waits:
+        step = wait.step
+        if (step.pid, step.since) in seen:
             continue
-        step = entry.step
-        if (isinstance(step.route, target_config.MacOnly)
-                or isinstance(step.route, target_config.PinnedTarget) and step.route.target in mac_targets):
+        if wait.position and wait.position not in wait_names:
             continue
-        item = order[entry.position - 1][1] if entry.position <= len(order) else None
-        key = item.get("repo_identity", "") if item is not None and item.get("folder") == step.folder else ""
-        project = origins.resolve(key, step.folder)
         cause = wait_cause(step)
-        machine, reason = queue_wait(step, cause, inputs.local_machine, aws_targets)
-        if isinstance(cause, records.RunLimitWait) and reason == "Run limit full":
-            if cause.repository != origin_name(project):
-                project = known_origin(cause.repository)
-            if not project:
-                reason = f"{cause.repository} run limit full"
-        elif (reason == "Machine held"
-              or machine == "natedev" and reason in ("Memory", "Disk floor", "GPU limit full", "Cargo token", "Waiting for remote startup")):
+        assigned = queue_wait(wait, cause, inputs.local_machine, facts)
+        if assigned is None:
+            continue
+        seen.add((step.pid, step.since))
+        machine, reason = assigned
+        key = wait.repository.key
+        project = (origins.resolve(key) if isinstance(cause, records.RunLimitWait)
+                   else origins.resolve(key, step.folder))
+        if project and wait.repository.name and machine == "natedev":
+            _ = local_repositories.setdefault(project, wait.repository.name)
+        if isinstance(cause, records.RunLimitWait) and reason == "Run limit full" and not project:
+            reason = f"{cause.repository} run limit full"
+        elif (reason == "Machine held" or machine == "natedev" and reason in (
+                "Memory", "Disk floor", "GPU limit full", "Cargo token", "Waiting for remote startup", "Waiting for start spacing")):
             project = ""
         if machine is None:
             waits = row(project).unplaced if project else unplaced
@@ -602,22 +535,27 @@ def build_limits(reading: records.QueueRead, snapshots: target_availability.Snap
             waits = current.natedev.waits if machine == "natedev" else current.aws.waits
         else:
             waits = shared[machine]
-        waits.setdefault(reason, []).append(visible.name)
+        label = wait_names.get(wait.position) or step.unit or names.sessions.get(step.session_id) or step.step
+        waits.setdefault(reason, []).append(label)
 
-    if hana is not None and (origin := origins.resolve(hana.repository)) in rows:
-        cell = row(origin).aws
-        cell.limit, cell.budgets = hana.maximum, (saved.hana_money,)
-        cell.used = None if hana.lifecycle is None else 0
-        if isinstance(hana.lifecycle, hana_box.HanaLifecycleEvidence):
-            cell.used = len(hana.lifecycle.claims)
-            running = [step for step in reading.view.running if step.assignment_host == hana.host]
-            labels = [step.unit or names.sessions.get(step.session_id) or step.step for step in running]
-            active = sum(claim.active for claim in hana.lifecycle.claims)
-            cell.runs.extend(labels[index] if index < len(labels) else "Hana step" for index in range(active))
-            pending = cell.used - active
-            if pending:
+    for hana in facts.hana:
+        evidence = hana.evidence
+        if origin := origins.resolve(evidence.repository):
+            cell = row(origin).aws
+            cell.limit, cell.budgets = evidence.limit, (saved.hana_money,)
+            cell.used = len(evidence.claim_ids)
+            cell.runs.extend(hana.runs)
+            if cell.used > len(hana.runs):
                 cell.note = "Claim held for startup or cleanup"
 
+    historical_names = saved.history.policy_names if isinstance(saved.history, RecentRepositories) else {}
+    for origin, current in rows.items():
+        matches = {name for name in historical_names.get(origin, set())
+                   if f"{inputs.local_machine}.{name}" in policy.by_machine_and_repository}
+        if len(matches) == 1:
+            _ = local_repositories.setdefault(origin, next(iter(matches)))
+        else:
+            _ = local_repositories.setdefault(origin, current.name)
     shared_local_limits = Counter(local_repositories.get(origin, current.name) for origin, current in rows.items())
     for origin, current in rows.items():
         name = local_repositories.get(origin, current.name)
@@ -629,18 +567,20 @@ def build_limits(reading: records.QueueRead, snapshots: target_availability.Snap
         else:
             current.natedev.used = len(current.natedev.runs)
         cell = current.aws
-        has_cloud = origin in cloud_repositories or saved.cloud_routes.get(origin) is True
         if cell.limit is None:
-            cell.available = bool(cell.waits or cell.runs or has_cloud and switch is not cloud_gate.CloudGateSwitch.OFF)
-            cell.used = len(cell.runs)
+            has_cloud = origin in cloud_repositories
+            cell.available = True if cell.waits or cell.runs or has_cloud else None
+            cell.used = len(cell.runs) if cell.runs or has_cloud else None
             if has_cloud:
                 cell.note = "Uses shared cloud gate slots"
+    aws_state = ("In use" if cloud_used or any(current.aws.used for current in rows.values()) else
+                 "Free" if any(current.aws.limit is not None for current in rows.values()) else "State unavailable")
     shown_names = Counter(current.name for current in rows.values())
     for origin, current in rows.items():
         if shown_names[current.name] > 1:
             current.name = origin.removeprefix("https://")
     ordered = tuple(sorted(rows.values(), key=lambda item: item.name.casefold()))
-    return BuildLimits(MachineLimits(target_state(local, zone), local_limits(reading, memory, folders), shared["natedev"]),
-                       MachineLimits(aws_state, (Metric("Cloud gates", cloud_used, cloud_limit), saved.aws_money),
+    return BuildLimits(MachineLimits(target_state(local, zone), local_limits(reading, memory, facts), shared["natedev"]),
+                       MachineLimits(aws_state, (Metric("Cloud gates", cloud_used if cloud_limit is not None else None, cloud_limit), saved.aws_money),
                                      shared["aws"]),
                        ordered, isinstance(saved.history, charts.IndexUnavailable), unplaced, saved.history_stale)

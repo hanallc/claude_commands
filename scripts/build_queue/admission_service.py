@@ -47,7 +47,7 @@ from scripts.build_queue import progress_profile as progress
 from scripts.build_queue import cloud_progress
 from scripts.build_queue import queue_snapshot
 from scripts.build_targets import target_config
-from scripts.build_targets.execution_transport import ExecutionTransport, HanaGpuNextestTransport
+from scripts.build_targets.execution_transport import ExecutionTransport, HanaControlTransport, HanaGpuNextestTransport
 from scripts.build_queue.admission_records import AdmissionWaitSnapshot, WaitHolder, reason_phrase
 from scripts.build_queue.system_clock import SystemClock as SystemClock
 from scripts.lint import memory_admit as gate
@@ -227,6 +227,7 @@ class Readings(Protocol):
 class SystemReadings:
     def __init__(self) -> None:
         self.swap_in: gate.SwapInHistory = gate.SwapInHistory()
+        self.free_disk: int | None = None
 
     def host(self) -> records.HostMemory | records.ReadingUnavailable:
         try:
@@ -243,6 +244,7 @@ class SystemReadings:
     def build_space(self, floor: int) -> records.BuildSpaceHold | records.NoBuildSpaceHold:
         from scripts.lib.build_slots import slot_cargo_root
 
+        self.free_disk = None
         try:
             root = slot_cargo_root(conf.read("build_folders"))
             reading = os.statvfs(root)
@@ -251,6 +253,7 @@ class SystemReadings:
             print(f"memory admission: {records.build_space_text(hold)}", file=sys.stderr)
             return hold
         free = reading.f_bavail * reading.f_frsize // records.GIB
+        self.free_disk = free
         return records.BuildSpaceLow(free, floor) if free < floor else records.NoBuildSpaceHold()
 
     def compilers(self) -> list[records.StepMemory]:
@@ -1510,7 +1513,12 @@ class AdmissionServer:
         self.prerequisites: dict[str, placement.LocalExecutionPrerequisite] = {}
         self.placement_eligibility: dict[str, tuple[placement.CandidateEligibility, ...]] = {}
         self.active_placement_waits: set[str] = set()
-        self.placement_resource_waits: dict[str, records.PlacementBlock] = {}
+        self.placement_resource_waits: dict[str, list[records.PlacementBlock]] = {}
+        self.limits_disk: tuple[int | None, int | None] = (None, None)
+        self.limits_cloud_reasons: dict[str, str] = {}
+        self.limits_cloud: dict[wire.Owner, records.LimitsCloud] = {}
+        self.limits_hana: dict[str, placement.FreshHostEvidence | placement.HostEvidenceUnavailable] = {}
+        self.limits_snapshot: records.LimitsFacts | None = None
         self.local_hold_holders: dict[str, placement.ResourceHolder] = {}
         self.host_probe: Callable[[placement.HostEvidenceKey], placement.HostEvidence] = (
             host_probe if host_probe is not None else self._read_host_evidence)
@@ -2434,6 +2442,7 @@ class AdmissionServer:
                     self._prune_places()
             self.persist()
             (self.state_dir / "queue.json").unlink(missing_ok=True)
+            self._publish_limits(None)
             for episode, waiting in tuple(self.waiters.items()):
                 if self.waiters.get(episode) is not waiting:
                     continue
@@ -2451,14 +2460,20 @@ class AdmissionServer:
         policy = config.policy
         self.last_diagnostics = config.diagnostics
         evidence_keys: PlacementEvidenceKeys = {}
+        self.limits_hana.clear()
         self._settle_attempt_reports(evidence_keys)
         remote_start_hold_seconds = self.configuration.remote_start_hold_seconds
         self._prepare_placements(evidence_keys, remote_start_hold_seconds)
         captured = self._inputs(config, self.configuration.progress_profile_rank, self.configuration.peak_history_share_percent,
                                 self.configuration.progress_profile_sweep_seconds)
         inputs = captured.local
+        self.limits_disk = (None, None)
         if self.host == "natedev" and (floor := config.free_floor_gib) is not None:
-            inputs = replace(inputs, build_space=self.readings.build_space(floor))
+            space = self.readings.build_space(floor)
+            inputs = replace(inputs, build_space=space)
+            free = (space.free_gib if isinstance(space, records.BuildSpaceLow) else
+                    self.readings.free_disk if isinstance(self.readings, SystemReadings) else None)
+            self.limits_disk = floor, free
         ci_holds = self._ci_hold_reasons()
         held_owners = {records.waiter_owner(self.waiters[episode].row) for episode in ci_holds}
         if held_owners:
@@ -2621,6 +2636,7 @@ class AdmissionServer:
         return groups
 
     def _cloud_pass(self, inputs: records.QueueInputs, configuration: gate.UsableAdmissionConfiguration) -> bool:
+        self.limits_cloud_reasons.clear()
         waiting_cloud = self._cloud_waiters()
         if not waiting_cloud and not self.pending_cloud_groups:
             return False
@@ -2634,6 +2650,8 @@ class AdmissionServer:
         started = False
         blocked = False
         position = 0
+        first_group = ""
+        first_reason = ""
         for waiting in waiting_cloud:
             request = waiting.request
             if self.waiters.get(request.episode) is not waiting:
@@ -2649,6 +2667,12 @@ class AdmissionServer:
                     started = True
                     continue
                 blocked = True
+                first_group = group.key if isinstance(group, status_wire.CloudGroup) else request.episode
+                first_reason = ("Queue order" if self._cloud_order(waiting) >= disconnected else
+                    "Waiting for group members" if len(members) != size else
+                    "Group needs more free slots" if size > 1 else "Gate limit full")
+            key = group.key if isinstance(group, status_wire.CloudGroup) else request.episode
+            self.limits_cloud_reasons[request.episode] = first_reason if key == first_group else "Queue order"
             position += 1
             reason = wire.CloudSlotWait(used, slots)
             snapshot = AdmissionWaitSnapshot(records.AdmissionDecision("hold", 0, 0, 0, 0),
@@ -2663,6 +2687,7 @@ class AdmissionServer:
     def _cloud_reading(self, reading: records.QueueRead, configuration: gate.UsableAdmissionConfiguration
                        ) -> records.QueueRead | wire.CloudQueueRead:
         rows: list[wire.CloudRow] = []
+        self.limits_cloud.clear()
         reservations = [record for record in self.reservations.values() if isinstance(record.place, wire.CloudPlace)]
         used, slots = len(reservations), configuration.cloud_gate_slots
         recorded_launch = False
@@ -2689,7 +2714,9 @@ class AdmissionServer:
                 counter = progress.NoCounter()
                 wait_state = wire.CloudSlotWait(used, slots, status_wire.ReservedCloudSlot())
             rows.append(wire.CloudRow(record.owner, identity, place, waiter["since"], started_at,
-                current, counter, wait_state, repo_identity=waiter.get("repo_identity", "")))
+                current, counter, wait_state))
+            self.limits_cloud[record.owner] = records.LimitsCloud(record.owner.pid, record.owner.start_time,
+                waiter.get("repo_identity", ""), "Waiting for launch" if isinstance(wait_state, wire.CloudSlotWait) else "")
         if recorded_launch:
             self.persist()
         waiting_cloud = self._cloud_waiters()
@@ -2701,63 +2728,109 @@ class AdmissionServer:
             sidecar = Path(request.sidecar)
             rows.append(wire.CloudRow(request.owner, request.identity, request.place, waiting.row["since"], 0.0,
                 cloud_progress.read(sidecar) if request.sidecar else cloud_progress.NoCloudProgress(),
-                progress.read_counter(sidecar) if request.sidecar else progress.NoCounter(), wire.CloudSlotWait(used, slots),
-                repo_identity=waiting.row.get("repo_identity", "")))
+                progress.read_counter(sidecar) if request.sidecar else progress.NoCounter(), wire.CloudSlotWait(used, slots)))
+            self.limits_cloud[request.owner] = records.LimitsCloud(request.owner.pid, request.owner.start_time,
+                waiting.row.get("repo_identity", ""), self.limits_cloud_reasons.get(request.episode, "Evidence pending"))
         return wire.CloudQueueRead(reading.view, reading.explanation, reading.ordered, reading.diagnostics,
             tuple(rows), slots, cloud_gate_stale_pushes=configuration.cloud_gate_stale_pushes)
 
-    def _placement_wait_reading(self, reading: records.QueueRead) -> records.QueueRead:
-        if not self.placement_requests:
-            return reading
-        waiting: list[records.WaitingStep] = []
-        ordered: list[tuple[Path, records.RankedWaiter]] = []
-        shown: set[str] = set()
+    def _limits_waits(self, reading: records.QueueRead) -> tuple[records.LimitsWait, ...]:
         pending_starts = reading.explanation.decided_from.pending_remote_starts
-        for step, (path, row) in zip(reading.view.waiting, reading.ordered, strict=True):
-            episode = row.get("placement_episode", "")
-            request = self.placement_requests.get(episode)
-            if request is not None:
-                shown.add(episode)
-                saved = self.assignments.get(self.current_assignments.get(episode, ""))
-                if saved is not None and saved.assignment.destination.provider != "local":
-                    destination = saved.assignment.destination
-                    if records.waiter_owner(row) not in pending_starts or destination.provider == "mac":
-                        continue
-                    decision = records.PlacementBlock(destination.provider, destination.target, "starting", episode)
-                else:
-                    candidates = self.placement_eligibility.get(episode, ())
-                    if saved is None and self._placement_refusal(request, candidates) is not None:
-                        continue
-                    decision = self._placement_wait_report(request, step.reason)
-                    if decision is None:
-                        continue
-                step = replace(step, placement_block=decision if isinstance(decision, records.PlacementBlock) else None,
-                               placement_pending=isinstance(decision, wire.PlacementEvidenceWait),
-                               placement_episode=episode)
-            waiting.append(step)
-            ordered.append((path, row))
-        remote = (request for episode in self.active_placement_waits - shown - self.current_assignments.keys()
-                  if (request := self.placement_requests.get(episode)) is not None)
-        for request in sorted(remote, key=lambda item: item.since):
-            candidates = self.placement_eligibility.get(request.episode, ())
-            if self._placement_refusal(request, candidates) is not None:
+        requests = {records.run_owner(request.owner.pid, request.owner.start_time): request
+                    for episode in self.active_placement_waits
+                    if (request := self.placement_requests.get(episode)) is not None}
+        waits: list[records.LimitsWait] = []
+        shown: set[str] = set()
+        for position, (step, (_, row)) in enumerate(zip(reading.view.waiting, reading.ordered, strict=True), 1):
+            owner = records.waiter_owner(row)
+            request = requests.get(owner)
+            repo = records.RepositoryIdentity(row.get("repo_identity", ""), row.get("repository_name", ""))
+            if request is None:
+                waits.append(records.LimitsWait(step, position, repo))
                 continue
-            decision = self._placement_wait_report(request, None)
-            if decision is None:
+            shown.add(request.episode)
+            saved = self.assignments.get(self.current_assignments.get(request.episode, ""))
+            if saved is not None:
+                destination = saved.assignment.destination
+                if (destination.provider != "local" and owner in pending_starts
+                        and isinstance(saved.state, placement.CurrentAssignment)
+                        and self._placement_owner_live(request.owner)):
+                    block = records.PlacementBlock(destination.provider, destination.target, "starting")
+                    waits.append(records.LimitsWait(step, position, repo, (block,)))
+            elif self._placement_waiting(request):
+                report = self._limits_placement_wait(request, step, position, repo)
+                if report is not None:
+                    waits.append(report)
+        for request in sorted(requests.values(), key=lambda item: item.since):
+            if request.episode in shown or not self._placement_waiting(request):
                 continue
             row = self._placement_row(request)
             identity = request.identity
-            if not row.get("folder"):
-                row["folder"] = request.profile.worktree
-            waiting.append(records.WaitingStep(row["pid"], identity.session_id, identity.name,
-                identity.step or request.profile.step, row.get("folder", ""),
+            repo = records.RepositoryIdentity(row.get("repo_identity", ""), row.get("repository_name", ""))
+            step = records.WaitingStep(row["pid"], identity.session_id, identity.name,
+                identity.step or request.profile.step, identity.folder or request.profile.worktree,
                 row["since"], row["need"], records.ReadyForAdmission(), identity.unit,
-                project=gate.step_project(request.profile.repo), route=request.route, verify=identity.verify,
-                job=identity.job, placement_block=decision if isinstance(decision, records.PlacementBlock) else None,
-                placement_pending=isinstance(decision, wire.PlacementEvidenceWait),
-                placement_episode=request.episode))
-            ordered.append((self.state_dir / records.waiter_owner(row), gate.rank_waiter(row, records.NormalOrder())))
-        return replace(reading, view=replace(reading.view, waiting=tuple(waiting)), ordered=ordered)
+                project=gate.step_project(request.profile.repo), route=request.route, verify=identity.verify, job=identity.job)
+            report = self._limits_placement_wait(request, step, 0, repo)
+            if report is not None:
+                waits.append(report)
+        return tuple(waits)
+
+    def _limits_facts(self, reading: records.QueueRead, slots: int) -> records.LimitsFacts:
+        waits = self._limits_waits(reading)
+        target_names = {block.target for wait in waits for block in wait.blocks if block.provider == "ssh"}
+        target_names.update(wait.step.route.target for wait in waits
+                            if isinstance(wait.step.route, target_config.PinnedTarget))
+        aws: set[str] = set()
+        mac: set[str] = set()
+        configuration = _provider_configuration()
+        for name in target_names - {reading.explanation.decided_from.local_machine}:
+            try:
+                with conf.report_key_changes():
+                    target = configuration.registered_target(name)
+                    if isinstance(target, target_config.SshTarget):
+                        if target.platform == "macos":
+                            mac.add(name)
+                        elif isinstance(configuration.transport(target), (HanaControlTransport, HanaGpuNextestTransport)):
+                            aws.add(name)
+            except (OSError, ValueError):
+                continue
+        hana: list[records.LimitsHana] = []
+        for observation in self.limits_hana.values():
+            capacity = observation.hana
+            if capacity is None:
+                continue
+            observed: set[str] = ({ref.claim_id for ref, evidence in observation.executions
+                         if isinstance(evidence, execution_identity.ObservedExecution)}
+                        if isinstance(observation, placement.FreshHostEvidence) else set())
+            runs: dict[str, str] = {}
+            for key, saved in self.assignments.items():
+                reference = saved.provider
+                if (not isinstance(reference, placement.ProviderClaimReference) or reference.claim_id not in capacity.claim_ids
+                        or reference.target != observation.key.destination.target):
+                    continue
+                if (reference.claim_id in observed or
+                        isinstance(self.execution_evidence.get(key), execution_identity.ObservedExecution)):
+                    request = self.placement_requests.get(reference.episode)
+                    if request is not None and isinstance(saved.state, placement.CurrentAssignment):
+                        runs[reference.claim_id] = request.identity.unit or request.identity.step or request.profile.step
+            hana.append(records.LimitsHana(capacity, tuple(runs.values())))
+        floor, free = self.limits_disk
+        return records.LimitsFacts(reading.explanation.now, waits, tuple(self.limits_cloud.values()), slots, floor, free,
+                                   frozenset(aws), frozenset(mac), tuple(hana))
+
+    def _publish_limits(self, facts: records.LimitsFacts | None) -> None:
+        if facts is not None and facts == self.limits_snapshot:
+            return
+        path = self.state_dir / records.LIMITS_SNAPSHOT
+        try:
+            if facts is None:
+                path.unlink(missing_ok=True)
+            else:
+                write_text_atomic(path, wire.encode_record({"limits_facts": facts}))
+            self.limits_snapshot = facts
+        except (OSError, ValueError):
+            pass
 
     def _placement_refusal(self, request: wire.PlacementRequest,
                            candidates: tuple[placement.CandidateEligibility, ...]) -> str | None:
@@ -2782,35 +2855,45 @@ class AdmissionServer:
                             if isinstance(candidate.eligibility, placement.FixedExclusion))
         return None
 
-    def _placement_wait_report(self, request: wire.PlacementRequest, reason: records.WaitReason | None
-                                 ) -> records.WaitReason | records.PlacementBlock | wire.PlacementEvidenceWait | None:
-        """Record the resource that holds the request."""
-        candidates = self.placement_eligibility.get(request.episode, ())
+    @staticmethod
+    def _local_placement_block(reason: records.WaitReason | wire.CloudSlotWait) -> bool:
         cause = reason.cause if isinstance(reason, records.HeadAdmissionStatus) else reason
-        if reason is not None and (
-                isinstance(cause, (placement.CargoFolderWait, records.BuildSpaceHold, records.EstimateExpired))
-                or any(candidate.destination.provider == "local"
-                       and isinstance(candidate.eligibility, placement.AllowedHost) for candidate in candidates)):
-            return reason
-        if (block := self.placement_resource_waits.get(request.episode)) is not None:
-            return block
-        possible = [candidate for candidate in candidates if not isinstance(candidate.eligibility, placement.FixedExclusion)]
-        # Prefer the local hold. Otherwise use the first blocked route when all routes have a known blocker.
-        candidate = next((item for item in possible if item.destination.provider == "local"
-                          and isinstance(item.eligibility, placement.TemporaryExclusion)
-                          and item.eligibility.reason in ("blocked", "busy", "starting")), None)
-        if candidate is None and possible and all(
-                isinstance(item.eligibility, placement.TemporaryExclusion) for item in possible):
-            candidate = possible[0]
-        if candidate is not None and isinstance(candidate.eligibility, placement.TemporaryExclusion):
-            destination = candidate.destination
-            if destination.provider == "mac":
-                return None
-            return records.PlacementBlock(destination.provider, destination.target, candidate.eligibility.reason,
-                                          request.episode)
-        if any(item.destination.provider != "mac" for item in possible) or not candidates:
-            return wire.PlacementEvidenceWait()
-        return None
+        return isinstance(cause, (placement.CargoFolderWait, records.BuildSpaceHold, records.EstimateExpired))
+
+    @staticmethod
+    def _placement_reply_blocks(candidates: tuple[placement.CandidateEligibility, ...]
+                                ) -> tuple[placement.CandidateEligibility, ...]:
+        if any(isinstance(candidate.eligibility, placement.EvidenceNeeded) for candidate in candidates):
+            return ()
+        blocked = sorted((candidate for candidate in candidates
+            if isinstance(candidate.eligibility, placement.TemporaryExclusion)
+            and candidate.eligibility.reason in ("blocked", "busy", "starting")),
+            key=lambda candidate: candidate.destination.provider != "local")
+        local_possible = any(candidate.destination.provider == "local"
+            and isinstance(candidate.eligibility, placement.AllowedHost) for candidate in candidates)
+        return tuple(blocked) if blocked and (blocked[0].destination.provider == "local" or not local_possible) else ()
+
+    def _limits_placement_wait(self, request: wire.PlacementRequest, step: records.WaitingStep, position: int,
+                               repo: records.RepositoryIdentity) -> records.LimitsWait | None:
+        candidates = self.placement_eligibility.get(request.episode, ())
+        if self._placement_refusal(request, candidates) is not None:
+            return None
+        if position and self._local_placement_block(step.reason):
+            return records.LimitsWait(step, position, repo)
+        if any(isinstance(candidate.eligibility, placement.EvidenceNeeded) for candidate in candidates):
+            return records.LimitsWait(step, position, repo, pending=True)
+        blocked = self._placement_reply_blocks(candidates)
+        if not blocked and position and any(candidate.destination.provider == "local"
+                and isinstance(candidate.eligibility, placement.AllowedHost) for candidate in candidates):
+            return records.LimitsWait(step, position, repo)
+        possible = tuple(candidate for candidate in candidates
+                         if not isinstance(candidate.eligibility, placement.FixedExclusion))
+        choices = (*blocked, *possible) if blocked or (possible and all(
+            isinstance(candidate.eligibility, placement.TemporaryExclusion) for candidate in possible)) else ()
+        blocks = tuple(dict.fromkeys((*self.placement_resource_waits.get(request.episode, []), *(
+            records.PlacementBlock(candidate.destination.provider, candidate.destination.target, candidate.eligibility.reason)
+            for candidate in choices if isinstance(candidate.eligibility, placement.TemporaryExclusion)))))
+        return records.LimitsWait(step, position, repo, blocks, pending=not blocks and position == 0)
 
     def _placement_reading(self, reading: records.QueueRead) -> records.QueueRead:
         remote: list[records.RunningStep] = []
@@ -2873,11 +2956,12 @@ class AdmissionServer:
             reading = replace(reading, view=replace(reading.view, waiting=(*reading.view.waiting, *held_steps)),
                 ordered=[*reading.ordered, *((self.state_dir / records.waiter_owner(self.waiters[episode].row),
                     gate.rank_waiter(self.waiters[episode].row, records.NormalOrder())) for episode in ci_holds)])
-        reading = self._placement_wait_reading(self._placement_reading(reading))
+        reading = self._placement_reading(reading)
         reading = self._cloud_reading(reading, self.configuration)
         view = wire.ViewReply(reading)
         explain = wire.ExplainReply(reading.explanation, self.last_diagnostics)
         self.published = PublishedReplies(view, explain)
+        self._publish_limits(self._limits_facts(reading, self.configuration.cloud_gate_slots))
 
     def reply_bytes(self, reply: wire.Reply, *, version: int = wire.VERSION) -> bytes:
         if version != wire.VERSION:
@@ -3164,7 +3248,12 @@ class AdmissionServer:
             return key
         with conf.report_key_changes():
             try:
-                return self._request_target_evidence(request, key)
+                evidence = self._request_target_evidence(request, key)
+                if isinstance(evidence, (placement.FreshHostEvidence, placement.HostEvidenceUnavailable)) and evidence.hana is not None:
+                    previous = self.limits_hana.get(destination.target)
+                    if previous is None or previous.observed_at <= evidence.observed_at:
+                        self.limits_hana[destination.target] = evidence
+                return evidence
             except conf.Unusable as error:
                 return placement.HostEvidenceUnavailable(key, self.clock.now(), str(error))
 
@@ -3626,7 +3715,6 @@ done
                 row["order_since"] = min(run_place.since, row.get("order_since", row["since"]))
             row["build_run"] = _live_run(request.run)
         row["route"] = request.route
-        row["placement_episode"] = request.episode
         prerequisite = self.prerequisites.get(request.episode, placement.TokenRequired())
         if isinstance(prerequisite, placement.TokenRequired):
             row["token_left_at"] = row.get("token_left_at", request.since)
@@ -3940,21 +4028,12 @@ done
                          if records.waiter_owner(row) == owner), len(ordered) + 1)
         waiting = self.waiters.get(request.episode)
         if waiting is not None and isinstance(waiting.last_reply, wire.Wait):
-            reason = waiting.last_reply.reason
-            cause = reason.cause if isinstance(reason, records.HeadAdmissionStatus) else reason
-            if isinstance(cause, placement.CargoFolderWait | records.BuildSpaceHold | records.EstimateExpired):
+            if self._local_placement_block(waiting.last_reply.reason):
                 return wire.PlacementWait(request.episode, request.since, position, candidates,
                     waiting.last_reply, diagnostics, disk_exclusions, retry_notices)
         if any(isinstance(candidate.eligibility, placement.EvidenceNeeded) for candidate in candidates):
             return wire.PlacementWait(request.episode, request.since, position, candidates, provider_diagnostics=diagnostics, mac_disk_exclusions=disk_exclusions, retry_notices=retry_notices)
-        blocked = [candidate for candidate in candidates
-            if isinstance(candidate.eligibility, placement.TemporaryExclusion)
-            and candidate.eligibility.reason in ("blocked", "busy", "starting")]
-        blocked.sort(key=lambda candidate: candidate.destination.provider != "local")
-        local_possible = any(candidate.destination.provider == "local"
-            and isinstance(candidate.eligibility, (placement.AllowedHost, placement.EvidenceNeeded))
-            for candidate in candidates)
-        if blocked and (blocked[0].destination.provider == "local" or not local_possible):
+        if blocked := self._placement_reply_blocks(candidates):
             candidate = blocked[0]
             if candidate.destination.provider == "local":
                 holder = local_holder
@@ -4098,9 +4177,8 @@ done
 
     def _record_placement_block(self, request: wire.PlacementRequest,
                                 destination: placement.PlacementDestination, reason: str) -> None:
-        if destination.provider != "mac":
-            _ = self.placement_resource_waits.setdefault(request.episode,
-                records.PlacementBlock(destination.provider, destination.target, reason, request.episode))
+        self.placement_resource_waits.setdefault(request.episode, []).append(
+            records.PlacementBlock(destination.provider, destination.target, reason))
 
     def _placement_hold(self, request: wire.PlacementRequest, candidate: placement.CandidateEligibility,
                         answers: dict[tuple[str, placement.PlacementDestination], float]) -> PlacementHold | None:
