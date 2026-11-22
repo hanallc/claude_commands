@@ -18,7 +18,6 @@ import signal
 import socket
 import subprocess
 import sys
-import tempfile
 import time
 from time import monotonic as wall_monotonic
 import unittest
@@ -31,6 +30,8 @@ from pathlib import Path
 from typing import ClassVar, cast, override
 from zoneinfo import ZoneInfo
 
+from scripts.lib.build_folders import SystemTemporaryParent
+from scripts.lib.testing_folders import fixture_folder
 from scripts.agents import detached_runs
 from scripts.build_hold.build_hold_test_support import write_holder
 from scripts.buildlog.test_holds import write_mac_block
@@ -221,7 +222,7 @@ class StallWatchTests(unittest.TestCase):
     @classmethod
     @override
     def setUpClass(cls) -> None:
-        cls.listener_root = Path(cls.enterClassContext(tempfile.TemporaryDirectory(prefix="sw-peers-", dir="/tmp")))
+        cls.listener_root = cls.enterClassContext(fixture_folder("sw-peers-", SystemTemporaryParent()))
         cls.listeners = []
         cls.addClassCleanup(cls.close_listeners)
 
@@ -260,7 +261,7 @@ class StallWatchTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
-        self.root = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="sw-", dir="/tmp")))
+        self.root = self.enterContext(fixture_folder("sw-", SystemTemporaryParent()))
         _ = cast(object, self.enterContext(mock.patch.multiple(
             unit_runs, RUN_ROOT=self.root / "held", FORMER_RUN_ROOT=self.root / "former-held")))
         defaults = self.root / "watch-defaults.conf"

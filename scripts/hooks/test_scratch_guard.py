@@ -9,12 +9,12 @@ import os
 import secrets
 import stat
 import subprocess
-import tempfile
 import unittest
 from pathlib import Path
 from collections.abc import Callable
 from typing import TypedDict, cast, override
 from unittest import mock
+from scripts.lib.testing_folders import fixture_folder
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
@@ -44,9 +44,7 @@ class ScratchGuardTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
-        base = Path(os.path.realpath(self.enterContext(tempfile.TemporaryDirectory(
-            prefix="scratch-guard-test-", dir="/tmp",
-        ))))
+        base = self.enterContext(fixture_folder("scratch-guard-test-")).resolve()
         self.home, self.temp = base / "home", base / "temp"
         self.build = base / "build"
         config = base / "config"

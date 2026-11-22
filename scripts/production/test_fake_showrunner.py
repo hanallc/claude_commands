@@ -4,11 +4,11 @@ from __future__ import annotations
 import json
 import os
 import socket
-import tempfile
 import unittest
 from pathlib import Path
 from typing import cast
 
+from scripts.lib.testing_folders import fixture_folder
 from scripts.lib.socket_test_support import socket_parent
 from scripts.production.fake_showrunner import write_session
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -16,8 +16,8 @@ from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 class FakeShowrunnerTests(unittest.TestCase):
     def test_long_session_directory_has_a_live_socket_removed_on_close(self) -> None:
-        with tempfile.TemporaryDirectory(dir="/tmp") as temporary:
-            sessions = Path(temporary) / ("long-session-directory-" * 6)
+        with fixture_folder("fake-showrunner-") as temporary:
+            sessions = temporary / ("long-session-directory-" * 6)
             self.assertGreater(len(os.fsencode(sessions)), 108)
             held = write_session(sessions, "showrunner", "demo-session")
             self.addCleanup(held.close)

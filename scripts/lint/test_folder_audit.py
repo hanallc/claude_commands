@@ -18,6 +18,8 @@ import unittest
 from collections.abc import Generator, Iterator
 from contextlib import AbstractContextManager, contextmanager, redirect_stderr, redirect_stdout
 from pathlib import Path
+from scripts.lib.build_folders import SystemTemporaryParent
+from scripts.lib.testing_folders import fixture_folder
 from scripts.lib.transcript_test_support import compressed_copy
 from typing import cast, override
 from types import TracebackType
@@ -77,9 +79,9 @@ class FolderAuditTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
-        configuration = Path(self.enterContext(tempfile.TemporaryDirectory(dir="/tmp")))
+        configuration = self.enterContext(fixture_folder("fa-", SystemTemporaryParent()))
         environment = config_environment(configuration)
-        _ = write_config_fixture(configuration / "build_folders.conf", "roots.system=/tmp\n"
+        _ = write_config_fixture(configuration / "build_folders.conf", f"roots.system={configuration}\n"
             + f"roots.build={configuration / 'build'}\nroots.build.natedev={configuration / 'build'}\n"
             + f"roots.workspace={configuration / 'worktrees'}\n")
         _ = cast(object, self.enterContext(unittest.mock.patch.dict(os.environ, environment)))

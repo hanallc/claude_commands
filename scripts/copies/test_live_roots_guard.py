@@ -6,11 +6,11 @@ import os
 from pathlib import Path
 import subprocess
 import sys
-import tempfile
 import unittest
 from typing import cast
 from unittest.mock import patch
 
+from scripts.lib.testing_folders import fixture_folder
 from scripts.copies import copies
 from scripts.lib import build_folders, conf, session_folder
 from scripts.lib.build_slots_test_support import private_slot_config
@@ -36,14 +36,15 @@ class LiveRootsGuardTests(unittest.TestCase):
         caller_environment = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
         _ = cast(object, self.enterContext(patch.dict(os.environ, caller_environment, clear=True)))
         caller_roots = live_roots()
-        candidates = (Path("/var/tmp"), Path("/tmp"), Path("/dev/shm"), Path.home())
+        candidates = (build_folders.tmpfs_temporary_parent(),
+                      Path(conf.read_or_repository("build_folders").text("roots.system")))
         parents = [parent for parent in map(Path.resolve, candidates)
                    if parent.is_dir() and os.access(parent, os.W_OK | os.X_OK)
                    and not any(parent.is_relative_to(live) for live in caller_roots)]
         self.assertTrue(parents, f"No writable fixture parent is outside the live roots: {caller_roots}")
         # The guarded roots and the roots used by the copy operations are siblings.
-        with tempfile.TemporaryDirectory(dir=parents[0]) as folder:
-            base = Path(folder).resolve()
+        with fixture_folder("cp-guard-", build_folders.ExplicitBuildParent(parents[0])) as folder:
+            base = folder.resolve()
             self.assertFalse(any(base.is_relative_to(parent) for parent in caller_roots), caller_roots)
             guarded = base / "guarded"
             root = base / "private"

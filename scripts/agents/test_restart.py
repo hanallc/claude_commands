@@ -1,6 +1,7 @@
 """Restart staff rows without a session journal."""
 from __future__ import annotations
 
+from scripts.lib.testing_folders import fixture_folder
 from scripts.lint.memory_test_support import write_config_fixture
 
 from scripts.agents import remote
@@ -768,7 +769,7 @@ class MixedRestartTests(ShutdownTestCase):
         from scripts.herdr import worker_panes
         from scripts.herdr.test_worker_panes import PaneWorld
 
-        root = Path(fixture.enter_context(tempfile.TemporaryDirectory(prefix="mixed-", dir="/tmp")))
+        root = fixture.enter_context(fixture_folder("mixed-"))
         write_text_atomic(root / "staff.json", '{"schema": 2, "rows": []}\n')
         environment = {"HOME": str(root), "STAFF_FILE": str(root / "staff.json"), "XDG_CONFIG_HOME": str(root / "config"),
             "XDG_STATE_HOME": str(root / "state"), "SHUTDOWN_STATE_DIR": str(root / "shutdown"),

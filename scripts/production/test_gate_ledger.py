@@ -143,7 +143,7 @@ changes.default=no branch
 }
 
 
-def pin_ledger_settings(directory: Path, root: Path, gate: Path) -> None:
+def pin_ledger_settings(directory: Path, root: Path, gate: Path, *, socket_root: Path) -> None:
     """Give the gate and admission caller fixed settings in their private folders."""
     directory.mkdir(parents=True, exist_ok=True)
     for stem, contents in LEDGER_SETTINGS.items():
@@ -173,7 +173,7 @@ request_slow_seconds=0.25
 """
     )
     _ = (directory / "build_folders.conf").write_text(
-        f"""roots.system=/tmp
+        f"""roots.system={socket_root}
 roots.temporary=${{TMPDIR}}/builds
 roots.gate={gate}
 roots.build={root / 'build'}
@@ -279,7 +279,7 @@ class MergeGateLedgerTests(MergeGateFixture):
     @override
     def fixture_configuration(cls, directory: Path) -> dict[str, str]:
         environment = super().fixture_configuration(directory)
-        pin_ledger_settings(directory, directory, Path("/tmp").resolve())
+        pin_ledger_settings(directory, directory, directory, socket_root=directory)
         return {**environment, "STAFF_CONFIG": str(directory / "staff.conf")}
 
     @override
@@ -295,8 +295,8 @@ class MergeGateLedgerTests(MergeGateFixture):
     def restore_fixture(self, folders: tuple[str, ...]) -> None:
         super().restore_fixture(folders)
         # Keep the host override keys from the shared config templates out of the test.
-        pin_ledger_settings(self.root, self.root, self.root.parent)
-        pin_ledger_settings(self.root / "config", self.root, self.root.parent)
+        pin_ledger_settings(self.root, self.root, self.root.parent, socket_root=self.fixture_parent)
+        pin_ledger_settings(self.root / "config", self.root, self.root.parent, socket_root=self.fixture_parent)
 
     @override
     def build_fixture(self, root: Path) -> None:
@@ -320,7 +320,7 @@ class MergeGateLedgerTests(MergeGateFixture):
 
     @gate_suites(*FIXTURE_FOLDERS)
     def test_clean_pass_records_tree_commit_host_time_checkout_suites_and_source(self) -> None:
-        self.assertTrue(self.fixture_root.is_relative_to(Path("/tmp").resolve()))
+        self.assertTrue(self.fixture_root.is_relative_to(self.fixture_parent))
         result = self.run_gate("--tests-only")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertTrue((self.state / "build-targets/aws/cloud-gate-launches.jsonl").is_file())

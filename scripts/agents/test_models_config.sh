@@ -3,9 +3,12 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+if [[ "${1:-}" != --fixture-folder ]]; then
+    exec "$SCRIPT_DIR/../lib/py" -m scripts.lib.testing_folders agents-config- "$0"
+fi
+TEST_DIR="$2"
+shift 2
 source "$SCRIPT_DIR/../lib/test_models_registry.sh"
-TEST_DIR="$(mktemp -d "${TMPDIR:-/tmp}/agents-config.XXXXXX")"
-trap 'rm -rf "$TEST_DIR"' EXIT
 
 export HOME="$TEST_DIR/home"
 mkdir -p "$HOME"

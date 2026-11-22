@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import atexit
 from collections.abc import Generator
-from contextlib import contextmanager
+from contextlib import AbstractContextManager, contextmanager
 import os
 from pathlib import Path
 import tempfile
@@ -14,6 +14,15 @@ from scripts.lib.session_folder import ROOT_ENV as SESSION_ROOT_ENV
 
 RUN_FOLDER_ENV = "DEVTOOLS_TEST_RUN_FOLDER"
 BUILDLOG_ENV = "BUILDLOG_DIR"
+FIXTURE_PARENT = build_folders.InheritedTemporaryParent()
+
+
+def fixture_folder(
+    prefix: str,
+    parent: build_folders.BuildFolderParent = FIXTURE_PARENT,
+) -> AbstractContextManager[Path]:
+    """Allocate a managed folder for the lifetime of a fixture."""
+    return build_folders.temporary_build_folder(build_folders.UniqueBuildFolder(prefix, parent))
 
 
 @contextmanager
@@ -30,8 +39,7 @@ def test_run_folder() -> Generator[Path]:
               else inherited / "test-runs")
     parent.mkdir(parents=True, exist_ok=True)
     build_folders.sweep_temporary_build_folders(parent)
-    request = build_folders.UniqueBuildFolder("r", build_folders.ExplicitBuildParent(parent))
-    with build_folders.temporary_build_folder(request) as path:
+    with fixture_folder("r", build_folders.ExplicitBuildParent(parent)) as path:
         os.environ["TMPDIR"] = str(path)
         os.environ[RUN_FOLDER_ENV] = str(path)
         if not previous[BUILDLOG_ENV]:
@@ -60,3 +68,13 @@ def start_test_run() -> None:
             _ = lifetime.__exit__(None, None, None)
 
     _ = atexit.register(finish)
+
+
+if __name__ == "__main__":
+    import subprocess
+    import sys
+
+    prefix, script = sys.argv[1:]
+    with fixture_folder(prefix) as folder:
+        result = subprocess.run(["bash", script, "--fixture-folder", str(folder)], check=False)
+    sys.exit(result.returncode if result.returncode >= 0 else 128 - result.returncode)
