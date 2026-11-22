@@ -764,24 +764,20 @@ class DetachedRunsTests(unittest.TestCase):
             self.assertFalse(path.exists())
             self.assertFalse(pending_stop.exists())
 
-    def test_prune_expires_an_unacknowledged_stop_notice(self) -> None:
-        now = datetime(2026, 11, 22, tzinfo=timezone.utc).timestamp()
-        _ = write_config_fixture(self.root / "config/review_links.conf",
-                                 "# range: 5..300\nkill_result_seconds=5\n")
-        recent = self.finished_run("recent-notice", staff_id="retired-worker", started_at=now - 600,
-                                   finished_at=datetime.fromtimestamp(now - 4, timezone.utc).isoformat(),
-                                   stop_notice_id="recent", stop_pass_requested=True)
-        expired = self.finished_run("expired-notice", staff_id="retired-worker", started_at=now - 600,
-                                    finished_at=datetime.fromtimestamp(now - 6, timezone.utc).isoformat(),
-                                    stop_notice_id="expired", stop_pass_requested=True)
+    def test_prune_waits_for_the_matching_stop_notice_acknowledgment(self) -> None:
+        path = self.finished_run("stop-notice", staff_id="retired-worker", stop_notice_id="notice",
+                                 stop_pass_requested=True, stop_reason="fixture stop")
+        self.assertEqual(detached_runs.prune_finished(path.parent), [])
+        detached_runs.acknowledge_stop_notice(path, "different-notice")
+        self.assertEqual(detached_runs.prune_finished(path.parent), [])
 
-        with patch.object(time, "time", return_value=now) as clock:
-            self.assertEqual(detached_runs.prune_finished(recent.parent), [expired.stem])
-            self.assertEqual(self.run_files(expired.stem), [])
-            self.assertTrue(recent.is_file())
-            clock.return_value = now + 1
-            self.assertEqual(detached_runs.prune_finished(recent.parent), [recent.stem])
-        self.assertEqual(self.run_files(recent.stem), [])
+        detached_runs.acknowledge_stop_notice(path, "notice")
+        saved = worker_lifecycle.read_json_object(path)
+        self.assertNotIn("stop_notice_id", saved)
+        self.assertIs(saved["stop_pass_requested"], True)
+        self.assertEqual(saved["stop_reason"], "fixture stop")
+        self.assertEqual(detached_runs.prune_finished(path.parent), [path.stem])
+        self.assertEqual(self.run_files(path.stem), [])
 
     def test_prune_keeps_a_delivered_result_until_the_saved_stage_completes(self) -> None:
         opened = time.time()
