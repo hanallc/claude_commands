@@ -2655,7 +2655,7 @@ process.stdout.write(JSON.stringify({
         labels = {"mac-owner": unit_labels.UnitLabels("director", "hana", "research")}
         background = limits_view.Background(frozenset({"https://example.invalid/team/hana"}),
                                             limits_view.Metric("money", None, None, "USD"))
-        mac = limits_view.MacReading(limits={"hana": {"hana": 1}}, claims_readable=True)
+        mac = limits_view.MacReading(limits={"hana": 1}, claims_readable=True)
         for admission_error, expected in (("", ""), ("fixture down", "MAC IDLE WATCH: admission query failed: fixture down.")):
             with self.subTest(admission_error=admission_error):
                 path = write_idle_alert(self.root / "mac-idle", now)

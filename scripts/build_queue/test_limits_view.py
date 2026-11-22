@@ -31,6 +31,7 @@ from scripts.buildlog import repository, store
 from scripts.lib import conf, process_start
 from scripts.lib.git_test_support import commit_repository, fixture_git_environment
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.lint.memory_admit import queue_read_from
 from scripts.mac_test import claim_state, mac_test
 
 
@@ -39,6 +40,77 @@ def wait_names(groups: Mapping[str, limits_view.WaitGroup]) -> dict[str, list[st
 
 
 class BuildLimitsTests(unittest.TestCase):
+    def test_counts_include_starts_granted_in_the_published_pass(self) -> None:
+        base = head_reading()
+        origin = "https://example.invalid/team/hana"
+        inputs = base.explanation.decided_from
+        first: records.Waiter = {"pid": 1, "start_time": "1", "since": inputs.now - 2, "need": 0,
+            "repository_name": "hana", "repo_identity": origin, "step": "gate"}
+        second: records.Waiter = {**first, "pid": 2, "start_time": "2", "since": inputs.now - 1}
+        existing: records.Reservation = {**fixture_reservation(3, 0, step="test"), "repo": "hana", "repo_identity": origin}
+        running = records.RunningStep("", "", "test", existing["worktree"], 0, records.PromisedMemory(0), pid=3)
+        policy = replace(base.explanation.policy,
+            repository_runs=records.RepositoryRunLimits({"natedev.hana": 2}),
+            gpu_tests=records.GpuTestSlots(2, frozenset({"hana"})))
+        reading = queue_read_from(replace(inputs, ordered=[(Path("first"), first), (Path("second"), second)],
+            running=(running,), reservations=(existing,), slots=(), verify_run_counts={"hana": 1}), policy)
+        reply = wire.parse_reply(wire.encode_reply(wire.ViewReply(reading)))
+        assert isinstance(reply, wire.ViewReply)
+        reading = reply.reading
+        head = reading.explanation.head
+        assert isinstance(head, records.HeadExplanation)
+        self.assertEqual(head.decision.state, "admit")
+        next_waiter, = reading.explanation.line.steps
+        self.assertEqual(next_waiter.decision.run_limit, records.RunLimitWait(2, 2, "hana", "natedev"))
+        self.assertEqual(next_waiter.decision.gpu, records.GpuSlotWait(2, 2))
+        saved = limits_view.Background(frozenset({origin}), limits_view.Metric("money", None, None))
+        shown = limits_view.build_limits(reading, (), (), {}, {}, saved, UTC)
+        cell = shown.repositories[0].natedev
+        self.assertEqual((cell.used, cell.limit, cell.verify_used), (2, 2, 1))
+        self.assertEqual(cell.gpu, limits_view.Metric("gpu", 2, 2))
+
+    def test_mac_only_verify_wait_uses_the_machine_that_holds_the_run(self) -> None:
+        base = head_reading()
+        reason = records.RunLimitWait(2, 2, "hana", "natedev")
+        step = replace(base.view.waiting[0], project="hana", route=target_config.MAC_ONLY, reason=reason,
+                       verify=records.VerifyCall("test", "fixture", 1, 1))
+        saved = limits_view.Background(frozenset(), limits_view.Metric("money", None, None),
+            origins=limits_view.Origins(mac_scopes={step.folder: "hana"}))
+        wait = limits_view.VisibleWait(queue_view.WaitingBuild(1, step), "Verify")
+        shown = limits_view.build_limits(base, (), (wait,), {}, {}, saved, UTC)
+        row, = shown.repositories
+        self.assertEqual(wait_names(row.natedev.waits), {limits_view.wait_words(reason).one: ["Verify"]})
+        self.assertEqual(row.mac.waits, {})
+        self.assertEqual(shown.mac.waits, {})
+
+    def test_mac_claim_and_wait_use_the_source_repository_scope(self) -> None:
+        base = head_reading()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "hana"
+            env = fixture_git_environment(root)
+            _ = subprocess.run(["git", "init", "-q", str(source)], env=env, check=True, capture_output=True,
+                               timeout=TEST_HANG_GUARD_SECS)
+            origin = "https://example.invalid/team/other"
+            _ = subprocess.run(["git", "-C", str(source), "remote", "add", "origin", origin], env=env, check=True,
+                               capture_output=True, timeout=TEST_HANG_GUARD_SECS)
+            step = replace(base.view.waiting[0], folder=str(source), project="other", route=target_config.MAC_ONLY)
+            reading = replace(base, view=replace(base.view, waiting=(step,)))
+            scopes = limits_view.refresh_queue_origins(limits_view.Origins(), limits_view.active_checkouts(reading))
+            paths = claim_state.StatePaths(root, "mac", platform="macos")
+            scope = claim_state.target_claim_scope(paths, str(source))
+        claim = limits_view.MacClaim(scope, 1, "builder")
+        mac = limits_view.MacReading((claim,), claims_readable=True)
+        saved = limits_view.Background(frozenset({origin}), limits_view.Metric("money", None, None), origins=scopes)
+        wait = limits_view.VisibleWait(queue_view.WaitingBuild(1, step), "Mac step")
+        shown = limits_view.build_limits(reading, (), (wait,), {}, {"builder": "Mac run"}, saved, UTC, mac=mac)
+        rows = {row.name: row.mac for row in shown.repositories}
+        self.assertEqual((rows["hana"].used, rows["hana"].limit, rows["hana"].runs), (1, 1, ["Mac run"]))
+        words = limits_view.wait_words(limits_view.waiting_cause(step))
+        self.assertEqual(wait_names(rows["hana"].waits), {words.one: ["Mac step"]})
+        self.assertEqual(rows["other"], limits_view.Cell())
+        self.assertEqual(shown.mac.waits, {})
+
     def test_limits_use_real_policy_shapes_and_keep_each_wait_once(self) -> None:
         reading = head_reading()
         now = reading.explanation.now
@@ -117,7 +189,7 @@ class BuildLimitsTests(unittest.TestCase):
             records.WaitingStep(3, "", "", "test", "", now, 0, records.NeedsMemory()),
             records.WaitingStep(4, "", "", "check", "", now, 0, records.ReadingUnavailable(),
                                 project="hana", route=target_config.PinnedTarget("fixture-aws")),
-            records.WaitingStep(5, "", "", "check", "", now, 0, records.ReadyForAdmission(),
+            records.WaitingStep(5, "", "", "check", str(copied), now, 0, records.ReadyForAdmission(),
                                 project="project", route=target_config.MAC_ONLY),
             records.WaitingStep(8, "", "", "test", "", now, 0, records.NeedsMemory()),
             records.WaitingStep(10, "", "", "check", "", now, 0, records.ReadyForAdmission(),
@@ -148,7 +220,7 @@ class BuildLimitsTests(unittest.TestCase):
 
         saved = limits_view.Background(history, limits_view.Metric("money", 2, 5, "USD", "estimate"),
             cloud_slots=9, hana=(limits_view.HanaCapacity(hana, 1, limits_view.ReadingState.OMITTED),),
-            aws_targets=frozenset({"fixture-aws"}), origins=origins)
+            aws_targets=frozenset({"fixture-aws"}), origins=replace(origins, mac_scopes={str(copied): "project"}))
 
         with mock.patch.object(repository, "output", side_effect=AssertionError("Git read in the feed tick")):
             shown = show(queue)
@@ -329,7 +401,7 @@ class BuildLimitsTests(unittest.TestCase):
                     mac_test.write_json(path, {**record, "repo_key": ""})
                 keyless = show(targets.ssh_target_snapshot(target))
                 for path in (claims / "one.json", claims / "copy.json"):
-                    mac_test.write_json(path, record)
+                    mac_test.write_json(path, {**record, "repo_key": "https://example.invalid/team/other"})
                 mac_test.write_json(claims / "unknown.json",
                                     {**record, "claim_id": "unknown", "repo_key": "https://example.invalid/"})
                 unresolved = show(targets.ssh_target_snapshot(target))
