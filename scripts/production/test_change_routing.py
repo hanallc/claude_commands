@@ -236,13 +236,15 @@ class StaffRoutingTests(unittest.TestCase):
         self.assertEqual(assignment.production, doc)
         self.assertEqual(assignment.owner.tab, "child")
 
-    def test_a_missing_staff_document_uses_the_supplied_production_document(self) -> None:
+    def test_a_missing_live_staff_document_cannot_use_a_supplied_document(self) -> None:
         doc = self.root / "supplied.md"
         _ = doc.write_text("# Supplied")
         _ = staff.set_doc(self.child.id, staff.LiveDoc(remote.local_machine(), self.root / "missing.md"))
         router = change_routing.StaffRouting(staff.snapshot(), {"child": doc})
-        self.assertEqual(router.owner_and_production(self.root / "change-review - top.md",
-                         {"#": "C1", "Producer": self.unit.id}).production, doc)
+        listing = self.root / "change-review - top.md"
+        assignment = router.owner_and_production(listing, {"#": "C1", "Producer": self.unit.id})
+        self.assertEqual(assignment.production, change_routing.UnavailableProduction(listing))
+        self.assertEqual(assignment.owner, change_routing.StaffRoutedChange(self.unit.id, self.child.id, "child"))
 
     def test_repeated_row_assignments_check_documents_once_per_showrunner(self) -> None:
         doc = self.root / "child-production.md"
