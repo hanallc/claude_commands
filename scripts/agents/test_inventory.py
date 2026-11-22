@@ -1317,6 +1317,40 @@ elif "comm=" in joined:
         self.assertEqual(second["checkout"]["kind"], "git")
         self.assertEqual([worker["session_id"] for worker in workers], [WORKER_ID])
 
+        with self.subTest(checkout="three folders in one repository"):
+            for pid in (self.director_pid, UNIT_PID, DESKTOP_PID):
+                folder = self.checkout / f"session-{pid}"
+                folder.mkdir()
+                path = self.records / f"{pid}.json"
+                record = cast(dict[str, object], json.loads(path.read_text()))
+                record["cwd"] = str(folder)
+                _ = path.write_text(json.dumps(record))
+            unit = staff.snapshot().by_current_session(UNIT_ID)
+            assert unit is not None
+            _ = staff.set_worktree(unit.id, staff.PresentWorktree("natedev", self.checkout / f"session-{UNIT_PID}"),
+                                   expected=unit.worktree)
+            status_folders: list[str] = []
+
+            def count_status(folder: str, *arguments: str) -> subprocess.CompletedProcess[str] | None:
+                if arguments == ("status", "--porcelain"):
+                    status_folders.append(folder)
+                return read_git(folder, *arguments)
+
+            with patch.object(inventory, "_git", count_status):
+                report = inventory.inventory(TARGET_LOGIN)
+            by_id = {session["session_id"]: session for session in report["sessions"]}
+            for session_id, pid in ((DIRECTOR_ID, self.director_pid), (UNIT_ID, UNIT_PID), (DESKTOP_ID, DESKTOP_PID)):
+                self.assertEqual(by_id[session_id]["cwd"], str(self.checkout / f"session-{pid}"))
+                self.assertEqual(by_id[session_id]["checkout"], {
+                    "kind": "git",
+                    "path": str(self.checkout),
+                    "head": {"kind": "branch", "name": "shutdown"},
+                    "upstream": {"kind": "tracking", "ahead": 2},
+                    "dirty": ["dirty.txt"],
+                })
+            self.assertEqual(len(status_folders), 1)
+            self.assertEqual(status_folders[0], str(self.checkout))
+
     def test_config_dir_records_the_process_directory_for_the_same_login(self) -> None:
         default_dir = self.home / ".claude"
         default_dir.mkdir(exist_ok=True)

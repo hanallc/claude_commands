@@ -592,23 +592,27 @@ def _git(cwd: str, *arguments: str) -> subprocess.CompletedProcess[str] | None:
         return None
 
 
-def _checkout(cwd: str) -> CheckoutState:
-    if not cwd:
+def _checkout_root(cwd: str) -> str | NotACheckout:
+    if cwd:
+        result = _git(cwd, "rev-parse", "--show-toplevel")
+        if result is not None and result.returncode == 0 and (root := result.stdout.removesuffix("\n")):
+            return root
+    return {"kind": "not a checkout"}
+
+
+def _checkout(root: str) -> CheckoutState:
+    branch = _git(root, "branch", "--show-current")
+    head = _git(root, "rev-parse", "HEAD")
+    if branch is None or branch.returncode or head is None or head.returncode:
         return {"kind": "not a checkout"}
-    root = _git(cwd, "rev-parse", "--show-toplevel")
-    branch = _git(cwd, "branch", "--show-current")
-    head = _git(cwd, "rev-parse", "HEAD")
-    if any(result is None or result.returncode != 0 for result in (root, branch, head)):
-        return {"kind": "not a checkout"}
-    assert root is not None and branch is not None and head is not None
-    ahead_result = _git(cwd, "rev-list", "--count", "@{u}..HEAD")
+    ahead_result = _git(root, "rev-list", "--count", "@{u}..HEAD")
     upstream: Upstream = {"kind": "no upstream"}
     if ahead_result is not None and ahead_result.returncode == 0:
         try:
             upstream = {"kind": "tracking", "ahead": int(ahead_result.stdout.strip())}
         except ValueError:
             pass
-    status = _git(cwd, "status", "--porcelain")
+    status = _git(root, "status", "--porcelain")
     dirty = [] if status is None or status.returncode else [
         line[3:] if len(line) >= 3 else line
         for line in status.stdout.splitlines()
@@ -616,7 +620,7 @@ def _checkout(cwd: str) -> CheckoutState:
     ]
     return {
         "kind": "git",
-        "path": root.stdout.strip(),
+        "path": root,
         "head": (
             {"kind": "branch", "name": branch.stdout.strip()}
             if branch.stdout.strip()
@@ -625,6 +629,21 @@ def _checkout(cwd: str) -> CheckoutState:
         "upstream": upstream,
         "dirty": dirty,
     }
+
+
+def _checkouts(folders: Sequence[str]) -> dict[str, CheckoutState]:
+    if not folders:
+        return {}
+    if len(folders) == 1:
+        folder = folders[0]
+        root = _checkout_root(folder)
+        return {folder: _checkout(root) if isinstance(root, str) else root}
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        folder_roots = dict(zip(folders, pool.map(_checkout_root, folders), strict=True))
+        roots = dict.fromkeys(root for root in folder_roots.values() if isinstance(root, str))
+        checkouts = dict(zip(roots, pool.map(_checkout, roots), strict=True))
+    return {folder: checkouts[root] if isinstance(root, str) else root for folder, root in folder_roots.items()}
 
 
 _LAST_STEP_BYTES = 262_144
@@ -907,12 +926,8 @@ def inventory(
             host=_host(record, units.get(session_id), plans), timers=_timers(session_id),
             environment=_process_environment(entry.pid), worker_owner=DirectorOwner(kind="director", session_id=worker_owners[session_id]) if session_id in worker_owners else NoDirector(kind="no director")))
 
-    folders = dict.fromkeys(session["cwd"] for session in found if isinstance(session["cwd"], str))
-    if len(folders) > 1:
-        with ThreadPoolExecutor(max_workers=4) as pool:
-            checkouts = dict(zip(folders, pool.map(_checkout, folders), strict=True))
-    else:
-        checkouts = {folder: _checkout(folder) for folder in folders}
+    folders = list(dict.fromkeys(session["cwd"] for session in found if isinstance(session["cwd"], str)))
+    checkouts = _checkouts(folders)
     for session in found:
         folder = session["cwd"]
         if isinstance(folder, str):
