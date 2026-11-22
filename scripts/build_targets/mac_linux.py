@@ -1,7 +1,7 @@
 """Run the gate in the Mac's Linux guest.
 
-Release the claim after the guest confirms that it wrote the cancel record under the run lock.
-If the guest is unreachable, hold the claim and retry until the guest can prove the run ended.
+Hold the claim until the guest proves the run ended or the proof wait expires.
+At expiry, fail the route. The guest keeps its run lock until the run ends.
 If the gate parent and module supervisor die, a descendant can keep the lock and prevent proof.
 Without a signal handler, Python can raise KeyboardInterrupt at any bytecode. An interrupt outside the protected block acts like process death. The guest timeout still ends the run.
 """
@@ -23,7 +23,7 @@ import signal
 import subprocess
 import sys
 import tarfile
-from time import sleep
+from time import monotonic, sleep
 from typing import Literal, TypedDict, cast
 from urllib.parse import urlsplit
 from uuid import uuid4
@@ -83,6 +83,7 @@ class GuestSettings:
     guest_user: str
     jobs: int
     run_time_limit_seconds: int
+    end_proof_wait_seconds: int
 
     @property
     def guest_timeout_seconds(self) -> int:
@@ -107,13 +108,16 @@ def read_settings(registry: conf.ConfigRead) -> GuestSettings:
     user = settings.text('guest.user', recover_invalid=False)
     jobs = settings.value('test.jobs', int, recover_invalid=False)
     limit = settings.value('run.time_limit_seconds', int, recover_invalid=False)
+    proof_wait = settings.value('run.end_proof_wait_seconds', int, recover_invalid=False)
     if len(hops) != 2 or not all(re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]*', host) for host in hops):
         raise GuestUnavailable('ssh.hops must name two SSH aliases')
     if not re.fullmatch(r'[a-z_][a-z0-9_-]*', user):
         raise GuestUnavailable('guest.user must name a Linux user')
     if jobs < 1 or limit < 1:
         raise GuestUnavailable('test.jobs and run.time_limit_seconds must be positive')
-    return GuestSettings((hops[0], hops[1]), user, jobs, limit)
+    if proof_wait < 1:
+        raise GuestUnavailable('run.end_proof_wait_seconds must be positive')
+    return GuestSettings((hops[0], hops[1]), user, jobs, limit, proof_wait)
 
 
 def mac_linux_reservation(_repo: Path, _work: SuiteMode | StepJob,
@@ -512,11 +516,12 @@ class GuestEndPending:
     detail: str
 
 
-def prove_guest_end(settings: GuestSettings, armed: ArmedGuestAttempt) -> GuestEndProven | GuestEndPending:
+def prove_guest_end(settings: GuestSettings, armed: ArmedGuestAttempt, *,
+                    timeout_seconds: float = GUEST_CLEANUP_TIMEOUT_SECONDS) -> GuestEndProven | GuestEndPending:
     try:
         reply = subprocess.run(settings.command(cleanup_shell(settings, armed)), stdin=subprocess.DEVNULL,
                                capture_output=True, text=True, errors='replace',
-                               timeout=GUEST_CLEANUP_TIMEOUT_SECONDS, check=False)
+                               timeout=timeout_seconds, check=False)
     except (OSError, subprocess.TimeoutExpired) as error:
         return GuestEndPending(str(error) or type(error).__name__)
     if reply.returncode == 0 and reply.stdout.strip() == 'ended':
@@ -639,6 +644,7 @@ def run_remote(repo: Path, settings: GuestSettings, source: CandidateSource, req
     stream: subprocess.CompletedProcess[bytes] | None = None
     first_error: BaseException | None = None
     first_failure = ''
+    proof_deadline: float | None = None
     retry_proof = False
     reported_hold = False
     proof_obtained = False
@@ -656,14 +662,21 @@ def run_remote(repo: Path, settings: GuestSettings, source: CandidateSource, req
                         command = settings.command(run_shell(settings, source, len(bootstrap), armed))
                         arguments = ['bash', '-o', 'pipefail', '-c', STREAM_SOURCE, TARGET, prefix, base, header, *command]
                         stream = stream_guest_bundle(repo, arguments, bootstrap, settings.transfer_timeout_seconds)
-                    if retry_proof:
+                    now = monotonic()
+                    if proof_deadline is None:
+                        proof_deadline = now + settings.end_proof_wait_seconds
+                    remaining = proof_deadline - now
+                    if retry_proof and remaining > 0:
                         if not reported_hold:
                             reported_hold = True
                             with suppress(OSError, ValueError):
                                 print(GUEST_END_PENDING_MESSAGE, file=sys.stderr, flush=True)
-                        sleep(SSH_CONNECT_TIMEOUT_SECONDS)
+                        sleep(min(SSH_CONNECT_TIMEOUT_SECONDS, remaining))
+                        remaining = proof_deadline - monotonic()
+                    if remaining <= 0:
+                        break
                     retry_proof = True
-                    proof = prove_guest_end(settings, armed)
+                    proof = prove_guest_end(settings, armed, timeout_seconds=min(GUEST_CLEANUP_TIMEOUT_SECONDS, remaining))
                     if isinstance(proof, GuestEndProven):
                         proof_obtained = True
                     elif not first_failure:
@@ -682,16 +695,24 @@ def run_remote(repo: Path, settings: GuestSettings, source: CandidateSource, req
             if first_error is None or (isinstance(first_error, Exception) and not isinstance(error, Exception)):
                 first_error = error
 
+    diagnostics = stream.stderr.decode(errors='replace') if stream is not None and stream.returncode else ''
+    detail = ' '.join(diagnostics.split())[-1200:]
+    if not proof_obtained:
+        guest = settings.ssh_hops[-1]
+        error = GuestUnavailable(f'guest unreachable: {guest} did not confirm the run ended '
+                                 + f'within {settings.end_proof_wait_seconds} seconds')
+        if detail:
+            error.add_note(detail)
+        raise error
+
     cleanup_detail = 'Guest cleanup: ended' + (f' after {first_failure}' if first_failure else '')
     if first_error is not None:
         first_error.add_note(cleanup_detail)
         raise first_error
     assert stream is not None
     if stream.returncode:
-        diagnostics = stream.stderr.decode(errors='replace')
         if stream.returncode == MISSING_PREREQUISITE_STATUS and MISSING_PREREQUISITE_MESSAGE in diagnostics:
             raise GuestMissingPrerequisite(diagnostics.strip())
-        detail = ' '.join(diagnostics.split())[-1200:]
         raise GuestUnavailable(f'SSH or source stream exited {stream.returncode}: {detail or "no diagnostic"}. '
                                + cleanup_detail)
     result, _, count = stream.stdout.rstrip().rpartition(b'\n')

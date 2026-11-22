@@ -63,6 +63,10 @@ If `enabled.mac-linux=off`, the assigned gate fails and reports the switch.
 The guest test timer uses `run.time_limit_seconds`.
 The guest and SSH deadlines allow extra time for setup, cleanup, and result transfer.
 When the test timer expires, the gate returns the guest's time-limit report.
+After the SSH transfer ends, `run.end_proof_wait_seconds` limits the wait for the guest to prove the run ended.
+The gate holds its Mac claim while it waits. A valid proof lets the gate release the claim.
+If the wait expires, the gate fails with `guest unreachable` and the guest alias from `ssh.hops`.
+The route sends no more cleanup requests. The guest run keeps its lock until it ends.
 If the guest cannot return a result, the gate fails and reports the guest and the reason.
 If the guest returns a failure, the gate reports the guest and the failed jobs.
 A targeted gate can reuse a certified test pass. The guest runs any requested type checks.
