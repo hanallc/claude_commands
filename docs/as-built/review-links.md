@@ -1813,13 +1813,12 @@ The server limits the form to `kill_request_bytes`.
 Both requests require the Tailscale login in `builds_operator_login`.
 The default admits the user ID that owns the untagged local Tailscale node.
 The server checks the socket peer with Tailscale WhoIs.
-The Builds queue verifies the Cargo scope or detached command before it stops a run.
-The server stores each notice under `.review-link-build-kill` in its private state.
-At startup the server checks pending stops.
-The shared stop helper can send signals during recovery.
-For a detached run, the helper uses the run record to stop its scopes and cancel its pass.
-A finished detached record confirms exit.
-The server sends the keyed notice after exit when it has a saved TERM receipt.
+The Builds queue verifies the detached command and its saved scope before it offers Kill.
+The server stores the request time and notice under `.review-link-build-kill` in its private state.
+The server uses the detached run record to request the stop and confirm completion.
+At startup the server resumes pending requests using the saved request time and the run record.
+The server sends one keyed notice after the record shows completion during or after the request second.
+The server reports **Run already ended** without a notice when it confirms completion before the request.
 
 - At start, the server runs `tailscale ip -4` (10 s timeout) and parses the output as IPv4. It creates the root if it is missing and runs the sweep. Then it binds a `ThreadingHTTPServer` to that address and port, and prints `review-links: serving <root> on <address>:<port>`. A failure at start, for example no address or a failed bind, prints one `review-links: <error>` line to stderr, and the server exits 1.
 - The server repeats the address check after `tailscale_check_seconds`, which starts at 60 seconds.

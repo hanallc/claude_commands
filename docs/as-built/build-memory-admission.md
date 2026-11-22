@@ -1817,35 +1817,28 @@ It prints `verify.sh: example-test is removed: examples carry no tests (user, 20
 
 ### Stop a Builds run
 
-The Running table offers **Kill this run** beside a verified natedev Cargo PID.
+The Running table offers **Kill this run** for a verified natedev Cargo run with a detached run record.
 The confirmation shows the row, process tree, progress, and recorded caller.
-The server determines the caller from the reservation's session ID and the current staff record.
+The server identifies the caller from the reservation's session ID and the current staff record.
 
 1. The feed publishes an opaque reference for each eligible reservation.
-2. The console supplies a handle when it can verify the current PID, start identity, staff recipient, and stop route.
-3. The server reads the reservation and process evidence again when the operator confirms.
-4. The server saves the notice and the verified stop route before it requests the stop.
-5. The server calls the stop helper for the verified route.
-6. The helper reports the TERM count before it waits for the scope to end.
-7. The server confirms that the run ended.
-8. The server sends the notice when it has saved a positive TERM count and confirmed exit.
+2. The console supplies a handle for the verified process, recipient and detached stop route.
+3. The server checks the handle and the run record when the operator confirms.
+4. The server reports **Run already ended** without a notice if the run record already shows completion.
+5. For an active run, the server saves the request time, notice and verified stop route.
+6. The server requests the stop through `detached_runs.stop_command` with the record path and reason.
+7. The server reads the run record again before it sends the keyed notice.
 
-Cargo Kill uses the scope identity that the shared stop helper reads from the Cargo process.
-Detached Kill passes the record path and reason to the detached stop helper.
 The detached helper stages the reason and the pass cancellation before TERM.
-Both routes show **Run already ended** when the scope ends with a TERM count of zero.
-A zero count leaves the notice unsent.
-Verify only creates scopes per step, so the console leaves Kill off for Verify.
-The server offers Cargo Kill only when the verified scope contains the known Cargo descendants.
-A restart before the server saves a TERM count shows **Kill not sent; try again** for a Cargo scope.
-The same result applies when the detached record is unfinished or missing.
-The server saves the helper’s confirmation before it sends the notice.
-After a restart, the server resumes a stop that has a TERM receipt and needs exit confirmation.
-Cargo recovery uses the saved scope identity.
-Detached recovery uses the run record to stop its scopes and cancel its pass.
-A finished detached record confirms that the run ended.
-With a saved TERM count, the server sends the notice once.
-Without a saved TERM count, the server shows **Run already ended** and sends no notice.
+The server waits for the detached record to show **finished** before it sends a notice.
+At restart, the server requests the stop again if the record is active and the scope has no exit confirmation.
+For a finished record, it compares the completion time with the saved request time.
+A completion time before the request second gives **Run already ended** with no notice.
+A completion in the request second permits a notice if the record was active when the server accepted the request.
+The server retains a verified handle for the result visibility interval.
+If the live row disappears, the retained handle can report an already ended run.
+A direct Cargo scope without a detached run record has no Kill action.
+Verify still has no Kill action because it creates only step scopes.
 The server retries pending actions every `kill_pending_check_seconds`.
 It retries an unclear delivery result with the saved key.
 A queued or kept message appears as **Message queued**.

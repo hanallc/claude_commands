@@ -1402,13 +1402,12 @@ let killRequest = 0;
 let killRead = false;
 let killConfirmation = null;
 const pendingKills = new Map();
-const KILL_RETRY = "Kill not sent; try again";
 
 function showKillResults() {
   const visible = new Set();
   const statuses = new Map(killInfo.results.map(result => [result.reference, result]));
   for (const [reference, result] of pendingKills) {
-    if (!statuses.has(reference) || statuses.get(reference).stop === KILL_RETRY) statuses.set(reference, result);
+    if (!statuses.has(reference)) statuses.set(reference, result);
   }
   const statusText = result => {
     if (result.stop !== "Stopped") return result.stop;
@@ -1422,7 +1421,7 @@ function showKillResults() {
     const offer = killInfo.offers[reference], status = statuses.get(reference);
     visible.add(reference);
     const oldControl = cell.querySelector("button");
-    const available = offer && (!status || status.stop === KILL_RETRY);
+    const available = offer && !status;
     cell.querySelector(".kill-state")?.remove();
     if (!available) {
       oldControl?.remove();
