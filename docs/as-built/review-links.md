@@ -89,7 +89,8 @@ Each control has one name across the console.
 Use one shared function for a control that appears on multiple pages.
 A console phase reads this section before it starts.
 
-Review and The List open a record in a dialog.
+Review opens a record in a dialog.
+The List expands the record below its row.
 The record dialog and the New item dialog use the same frame.
 Select **Close**, press Esc, or select the backdrop to close the dialog.
 The record stays in the table while its dialog is open.
@@ -644,7 +645,7 @@ A saved capture remains available after the preview expires.
 The server retries a failed attachment and keeps one screenshot on the item.
 After a lost response for a pending capture, Send retries the original payload, draft ID and capture key.
 The dialog keeps any edits for a new Send.
-Review and the List refresh the saved row and keep the current address, scroll position, and focus while the dialog holds edits.
+The Review dialog keeps the current address and focus while it holds edits.
 Select the preview to open the image at full size.
 Send saves the item with the evidence shown in the dialog.
 If the native write fails, the server discards the staged evidence.
@@ -920,10 +921,10 @@ A failed render keeps the last good page and writes one line to stderr.
 Failed renders add no render time.
 A cached Accounts response carries its render failure to the status line.
 
-The table has two swatch columns without a heading.
+The Accounts table has two swatch columns without a heading.
 The account swatch column is between **account** and **left**.
 The role swatch column is between **role** and **next**.
-All named headers sort on click or Enter.
+Select a named header or press Enter to sort.
 The dot and swatch headers have no sort control.
 The arrow sits before a right-aligned label and after a left-aligned label.
 The arrow uses the column gap without adding to the table width.
@@ -987,6 +988,10 @@ It refuses a clear for an empty group.
 The cell then shows the next queued target, or `none`.
 Success clears the cached page and refreshes the `next` cell.
 A refused request returns 400 and a failed write returns 503, each with its reason.
+
+The Roles table has a `next` column after **account**.
+It shows the same target, `none`, `auto` or `unavailable` as text, without a button.
+A role with no selected account shows a dash.
 A failed move shows `<group>: <reason>` in the status line.
 Codex workers keep their own moves; the menu shows no Codex account.
 
@@ -1005,16 +1010,31 @@ The render value's hover text shows the median of at most 10 successful renders.
 
 ### The List page
 
-An open List item uses the same dialog as Review.
-A refresh updates the rows behind the dialog.
-The dialog keeps its reading position until the user selects **Show updates**.
-New linked Review details use the same control.
-The List log keeps its own scroll position.
+Select a List row to expand its detail below the summary.
+A refresh applies the new data immediately.
+The open row keeps its element through a refresh and takes the new summary, data and detail.
+Its focus, draft and text selection stay.
+The List measures the open row before and after an update or a save result, then scrolls by the difference.
+At a scroll limit, it adds space to keep the row in place.
+The List keeps the open row in place while another row changes height during an animation.
+It reserves space below the list before a row shrinks near the bottom.
+User scrolling ends the correction and removes the extra space.
+Scroll input at a limit can release the space above the list without changing the scroll position.
+Closing the row removes the extra space.
+A filter that hides the row closes it.
+If the row closes with an action result, the page notice keeps the result until the row opens again or a new action starts.
+The footer gets fresh counts from the other pages on each refresh.
+The List discards a result if a newer snapshot has replaced its source.
+The open row's log scrolls in its own area.
+On a desktop, the log ends with the details beside it.
+On a narrow page, the log is at most `list_log_max_height_rem` tall, which each render reads.
+A refresh, a save result, a sort or a filter change keeps the log's first visible entry at the same place.
 Opening a List item leaves its unread state unchanged.
-After a lost Park or Remove reply, The List reads and applies the current row state.
-A confirmed action closes the dialog.
-An unconfirmed action leaves the dialog open and offers **Show updates** for changed details.
-If the item leaves The List, the dialog keeps the last detail and disables the actions.
+After a lost Park or Remove reply, The List reads the current row state.
+A confirmed Park or Remove collapses the row.
+An unconfirmed action keeps the row expanded.
+If the current state is unavailable, the row shows the last confirmed state.
+If a refresh removes an open item, its row closes.
 
 `/console/list.html` reads the producer's numbered List records on each request.
 The navigation label is List, and the page title is The List.
@@ -1058,9 +1078,9 @@ The address stores the words as `q` and restores them on reload.
 The List ignores form text that the browser restores without an input event.
 The chip order is All, Needs me, Morty answering, Working, Blocked, and Parked.
 The List excludes Closed records from rows, filters, and counts.
-Parked includes all items with active parking, including items with an unread answer.
-Needs me includes unparked items with an unread answer or an unread delivery release.
-An open question does not change this rule.
+Parked includes items with an active park and no unread answer.
+Needs me includes each item with an unread answer and each unparked item with an unread delivery release.
+An open question does not change these rules.
 Morty answering includes unparked items with an open question and no unread answer.
 Needs me also includes unparked items in Waiting for nate or Delivered with no open question.
 Working includes other unparked items in New or Working.
@@ -1076,17 +1096,17 @@ Search folds case with a pinned Unicode 15.1 table in `search_fold.py`, the same
 In All, each Owner and Producer chip counts matching parked items.
 The “need you” total uses the Needs me chip count.
 A zero-count chip stays visible and dimmed.
+When filters hide every row, the empty row names the filters and offers a reset.
 The chip rows wrap when the available width decreases.
 
-Review and The List use the same item dialog.
-The dialog shows the saved state, status, next step, ETA, and done condition.
+The expanded row shows the saved state, status, next step, ETA, and done condition.
 It also shows the questions, answers, actions, and log.
 Open Details in a log row to see its evidence.
 The address identifies the open item or the target of its link.
 Back and Forward can open an item that the table filters hide.
-Close the dialog with Escape, the Close button, or a click outside.
-Opening and closing the dialog preserves the table filters, sort, and scroll position.
-A linked Review card hides the List item until the card closes.
+Select the row again to collapse it.
+Expanding or collapsing a row preserves the table filters and sort order.
+A linked Review card opens over the expanded row.
 The List shows the item count above the table.
 
 A link under Links opens the target item in the console.
@@ -1097,7 +1117,7 @@ The table scrolls to the target and highlights it briefly.
 The table leaves a gap below the sticky status banner when it shows.
 A missing target shows “Item #N is not on the List”.
 A closed target shows “Item #N is closed”.
-The source dialog keeps its form and draft while it shows the target notice.
+The source row keeps its form and draft while it shows the target notice.
 Changing a filter or the sort order clears this notice.
 Back restores the previous filters, open item, and table scroll position.
 
@@ -1134,7 +1154,7 @@ A count of 1 takes the singular, for example “1 change for you”.
 When every linked review is Done, it shows “Reviews done — decide: close, keep or park”.
 A missing review key counts as Done.
 An item without links shows no review line.
-The item dialog repeats the line above its actions and shows each review's shown ID.
+The expanded List row repeats the line above its actions and shows each review's shown ID.
 Only types in `review_page.TYPES` link to Review cards.
 Other types and missing reviews show plain text.
 A review ID opens one card in a dialog on the List.
@@ -1195,19 +1215,11 @@ Parked items also match the word `Parked`.
 The address retains the owner, producer, status chip, unread switch, search, column, and direction.
 
 A row opens to show its latest status, completion condition, item links, and log.
-The record keeps Evidence, and the dialog has no separate Evidence section.
 The log shows its newest entry first.
-On a wide page, the log column fits the height of the left column, including the feedback controls.
-The log entries scroll below the heading when they exceed the available height.
-A short log has no scroll bar.
-On a narrow page, `list_log_max_height_rem` in `config/review_links.conf` limits the height of the entries.
-The setting starts at 16 rem.
-Refresh keeps the first visible log entry at the same offset when new entries arrive.
-Refresh restores open Evidence Details by item and log entry before it restores the scroll position.
-Each Details summary has a stable ID based on its item and log entry so refresh can restore keyboard focus.
-A log at the top stays at the top to show the newest entry.
-The List keeps the position by item while a filter hides the row.
-The log restores that position when the row returns.
+On a wide page, the log is to the right of the current fields.
+On a narrow page, the log is below the current fields.
+A refresh restores open Evidence Details by item and log entry.
+Each Details summary has a stable ID based on its item and log entry.
 Each log writer saves a typed event.
 The table and log use the same format for staff names, local ETAs, and field values.
 The table, log, and Park response show parking times in the user zone.
@@ -1238,7 +1250,7 @@ The Answer event includes the question ID.
 Link and Unlink events include the review keys.
 Evidence cleanup events name the copy that was removed.
 Request receipts stay in the record and are hidden from the log display.
-The dialog shows Remove, Park, and a text box for Ask question and Tell morty when those actions are available.
+The open row shows Remove, Park, and a text box for Ask question and Tell morty when those actions are available.
 The text box shows “Your words for morty about this item” as its placeholder and accessible name.
 Ask question and Tell morty sit below the box at its right edge, beside the send status.
 Both buttons stay disabled until the box contains words.
@@ -1329,7 +1341,7 @@ A new Ask on a Closed item is refused.
 An Ask with a saved request ID can resume its existing attempt.
 A replay after a confirmed failure returns the saved result without sending again.
 After a confirmed failure, Ask requires a new request ID to start a new attempt for the same question.
-An item with active parking stays in Parked when an answer arrives or the user marks it read.
+An item with an active park stays in Parked while it waits for its first answer.
 A signed Unpark request from an earlier page can clear parking while the item waits for an answer.
 That request moves the item to Morty answering.
 An unread answer appears in the panel with the question, both times, and an Unread mark.
@@ -1340,7 +1352,8 @@ A newer update stays unread if it arrives before the read saves.
 After the item is read, the log shows “Question Q<n> — nate” and “Answer — <producer>” at their recorded times.
 Each of these rows has a left bar in the Review question color and a bold Question or Answer label.
 The List and Review use the same question color rule.
-Park until moves the item to Parked and preserves its unread state.
+An unread answer puts the item in Needs me even during an active park.
+Mark read returns the item to Parked if its park is still active.
 The panel clears the question when the log shows it.
 The List uses its local date and time format for questions and answers.
 A newer unread update leaves previously read answers in the log.
@@ -1363,8 +1376,8 @@ A closed item or a question that has an answer requires no send.
 The server clears that claim without a failure notice.
 If the server cannot start the send for another reason, it clears the claim and logs the error.
 Remove closes the item through `the_list.close` with source `the_list.PAGE_SOURCE`.
-Remove sits at the left edge of the dialog above the four-line text box.
-Park and Remove close the dialog after the save.
+Remove sits at the left edge of the open row above the four-line text box.
+Park and Remove collapse the row after the save.
 The table applies the saved state before the next refresh.
 Park, Remove, Tell morty, Ask question, and Mark read show a message if the page cannot confirm the save.
 **Unpark** and **Park** sit at the right edge of the row.
@@ -1398,12 +1411,12 @@ The page shows “Parking time already expired” for an expired time.
 It shows “No active parking time to clear” when the time is absent.
 Both results preserve the parking draft.
 A replay of a successful Unpark reports the original result and any newer active parking time.
-If the dialog stays open after Unpark clears parking, it shows “Unparked”.
+If the row stays open after Unpark clears parking, it shows “Unparked”.
 If clearing parking removes the row from Parked, the page shows “Item #N unparked.”
 The page shows confirmations for hidden rows next to the Show filter.
 It keeps one confirmation per hidden row after overlapping Unpark requests.
 Focus moves from **Unpark** to the Parked filter and brings the filter and confirmation into view.
-If All is active when Unpark saves, the item dialog stays open.
+If All is active when Unpark saves, the row stays open.
 After Unpark, the item's saved state sets its status chip.
 After Park or Unpark saves, the List refreshes the server order even while the item waits for an answer.
 
@@ -1430,7 +1443,7 @@ The request starts without waiting for the animation.
 The page disables all row buttons while the request runs.
 A second press sends no request.
 The page applies the saved state and parking status from the response.
-The page uses the saved parking condition to update the labels in the row and dialog.
+The page uses the saved parking condition to update the labels in the row summary and its open detail.
 A refusal restores the last confirmed item state, parking status, and unread state together.
 The unread state includes the Update sort key.
 If Mark read, Ask question, or Tell morty loses its response, the page restores the unread flag from before the request.
@@ -1444,6 +1457,7 @@ The List uses the same rules as Review for notices above the table.
 If Remove loses its response, the page restores the confirmed row and reports that the save is unconfirmed.
 If a Park retry fails, the List checks the original receipt and reads the current row.
 The List shows the shared failure line if the receipt cannot confirm Park.
+If the List cannot read the receipt, it restores the confirmed row.
 A new action uses a new request ID, even if the previous response did not arrive.
 The page keeps unconfirmed request IDs for actions that support another manual submission.
 An HTTP 5xx response to Ask question leaves the request unconfirmed.
@@ -1489,7 +1503,6 @@ An unread update shows a dot and marks the navigation entry as new.
 The navigation key includes the record ID and update time.
 The page uses `page_refresh_seconds` and the shared refresh helper.
 A refresh retains the search text, selection, focus, open item, and filters.
-The dialog keeps its own scroll position.
 An older response cannot replace a newer response.
 Phone layouts show each row as a card.
 The List uses the published Review snapshot for rows with all their linked records.
@@ -2249,3 +2262,21 @@ The shared script uses the clipboard API when available.
 Plain HTTP pages use a temporary textarea and `execCommand('copy')` when the clipboard API is absent.
 The fallback restores focus and the previous selection.
 One document listener also handles code blocks from page updates.
+
+### Builds queue moves
+
+The Builds page requests a token with `GET /console/builds/queue-move`.
+Move and Kill requests use the shared `builds_operator(peer)` check.
+The check uses the TCP peer and rejects tagged nodes.
+By default, the operator is the owner of the untagged local Tailscale node.
+The console also checks the Tailscale address and Host.
+The JSON POST requires the same Origin and a console token.
+The console limits the request size and time with `build_queue.conf`.
+
+A drop and an Undo each send a request ID, a wait ID, and an order revision.
+A drop also sends a head destination or a neighbor and side.
+An Undo sends the original move ID in addition to the common fields.
+The admission service restores the anchor it saved for that move.
+The console and the admission socket reject fields outside the request type.
+The admission service commits the move on its loop and replays the reply for a repeated request ID.
+The console returns HTTP 409 with the current order when it detects a conflict.
