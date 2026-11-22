@@ -2010,6 +2010,10 @@ def release_removed_folder(path: Path) -> FolderPairRelease:
         return FolderPairRelease.PAIR_KEPT
 
 
+class TemporaryFolderChildrenUnresolved(RuntimeError):
+    """The owner cannot prove that the temporary folder's children are free."""
+
+
 def _finish_temporary(path: Path, directory: int, allocated: os.stat_result, *,
                       descriptor: int, temporary: bool, keep: Callable[[], bool] | None,
                       children: bool) -> None:
@@ -2025,10 +2029,11 @@ def _finish_temporary(path: Path, directory: int, allocated: os.stat_result, *,
             return True
         with ExitStack() as leases:
             try:
-                if _hold_child_leases(path, leases, wait=False) is not None:
-                    return False
-            except (OSError, ValueError):
-                return False
+                refusal = _hold_child_leases(path, leases, wait=False)
+            except (OSError, ValueError) as error:
+                raise TemporaryFolderChildrenUnresolved(f"could not check nested leases in {path}: {error}") from error
+            if refusal is not None:
+                raise TemporaryFolderChildrenUnresolved(f"nested leases or recovery records prevent removal of {path}")
             _remove_folder(path, directory, allocated)
         return True
 
@@ -2083,7 +2088,7 @@ def sweep_temporary_build_folders(parent: Path, *, wait: bool = True) -> None:
 @contextmanager
 def temporary_build_folder(request: UniqueBuildFolder | BuildFolderSpec, *,
                            keep: Callable[[], bool] | None = None, children: bool = False) -> Generator[Path]:
-    """Remove private work on exit. With children, retain the folder if any lease is held."""
+    """Remove private work on exit. With children, raise if a nested lease prevents removal."""
     with ExitStack() as cleanup:
         yield create_build_folder(_TemporaryFolderRequest(request, cleanup, keep, children))
 

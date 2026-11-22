@@ -965,6 +965,17 @@ signal.pause()
                 trial.delete_trial_branches(self.repo, str(self.origin), 'gate-trial', 123, folder)
                 return 0
 
+            def reap_recoverer(child: subprocess.Popen[str]) -> None:
+                try:
+                    child.kill()
+                    _ = child.wait(timeout=stop_seconds + 1)
+                except subprocess.TimeoutExpired:
+                    self.fail('The Git recovery helper did not exit after SIGKILL.')
+                finally:
+                    for stream in (child.stdin, child.stdout, child.stderr):
+                        if stream is not None:
+                            stream.close()
+
             with (ForkChildren() as children, ExitStack() as descriptors,
                   mock.patch.dict(os.environ, {'PATH': str(folder) + os.pathsep + os.environ['PATH']})):
                 controller = children.start(run)
@@ -985,13 +996,13 @@ signal.pause()
                     _ = descriptors.callback(os.close, owner_exit)
                     recoverer = None
                     if event == 'recovery':
-                        recoverer = descriptors.enter_context(subprocess.Popen([sys.executable, '-c',
+                        recoverer = subprocess.Popen([sys.executable, '-c',
                             'import sys\nfrom pathlib import Path\nfrom scripts.aws_target.aws_trial import recover_git\n'
                             + 'print("ready", flush=True)\n'
                             + 'if sys.stdin.readline():\n    recover_git(Path(sys.argv[1]), float(sys.argv[2]), 0.05)',
                             str(record), str(stop_seconds)], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                            stderr=subprocess.PIPE, text=True))
-                        _ = descriptors.callback(recoverer.kill)
+                            stderr=subprocess.PIPE, text=True)
+                        _ = descriptors.callback(reap_recoverer, recoverer)
                         assert recoverer.stdout is not None
                         self.assertTrue(select.select([recoverer.stdout], [], [], TEST_HANG_GUARD_SECS)[0])
                         self.assertEqual(recoverer.stdout.readline(), 'ready\n')

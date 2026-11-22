@@ -65,6 +65,33 @@ class GateProcessStateTests(unittest.TestCase):
         self.assertEqual(saved["folders"], recovery.folders)
         self.assertIs(saved["finished"], True)
 
+    def test_finished_recovery_skips_a_marker_without_search_permission(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="gate-markers-") as temporary:
+            root = Path(temporary)
+            blocked = root / "blocked"
+            available = root / "available"
+            recovery = gate.GateRecovery(root / "finished.json", str(root), os.getpid(), "ended-owner",
+                                        folders=[str(blocked), str(available)], finished=True)
+            recovery.save()
+            for folder in (blocked, available):
+                folder.mkdir()
+                (folder / build_folders.RECOVERY_MARKER).symlink_to(recovery.path)
+            blocked_marker = blocked / build_folders.RECOVERY_MARKER
+            is_symlink = Path.is_symlink
+
+            def check_marker(path: Path) -> bool:
+                if path == blocked_marker:
+                    raise PermissionError(f"fixture denies search in {blocked}")
+                return is_symlink(path)
+
+            with (mock.patch.object(Path, "is_symlink", autospec=True, side_effect=check_marker),
+                  redirect_stdout(io.StringIO()) as report):
+                gate.recover_gate_directory(root)
+            self.assertIn(f"fixture denies search in {blocked}", report.getvalue())
+            self.assertEqual(gate.read_gate_recovery(recovery.path), recovery)
+            self.assertEqual(blocked_marker.readlink(), recovery.path)
+            self.assertFalse((available / build_folders.RECOVERY_MARKER).is_symlink())
+
     def test_process_exit_counts_as_stopped_at_stat_read_or_pidfd_event(self) -> None:
         fixture = GateSuitesFixture()
         for initial_state in (FileNotFoundError(), ProcessLookupError(), "1 (fixture) S"):
@@ -597,20 +624,35 @@ gate.run_suites(Path.cwd(), full=True)
                 self.assertEqual(saved["folders"], [])
         self.assertEqual(list(parent.iterdir()), [])
 
+    @gate_suites("hooks")
     def test_module_cleanup_retains_a_folder_with_a_held_nested_lease(self) -> None:
-        parent = self.root / "held-module"
-        parent.mkdir()
-        with (mock.patch.dict(os.environ, self.environment, clear=True),
-              gate.gate_recovery(self.checkout) as recovery, ExitStack() as holder):
-            with gate.gate_temporary(recovery, "hooks-test_first", parent) as folder:
+        self.supply_jobserver(b"Q")
+        finish = gate.finish_gate_job
+        held: list[Path] = []
+        with mock.patch.dict(os.environ, self.environment, clear=True), ExitStack() as holder:
+            def finish_with_nested_lease(job: gate.RunningGateJob, status: int) -> gate.GateJobResult:
+                folder = job.log.parent
                 spec = build_folders.BuildFolderSpec(kind="tool", parent=folder, purpose="nested", suffix_length=0)
                 nested = holder.enter_context(build_folders.leased_build_folder(spec))
-                output = nested / "output"
-                self.write(output, "the holder owns this file")
-            self.assertEqual(output.read_text(), "the holder owns this file")
+                held.append(nested)
+                self.write(nested / "output", "the holder owns this file")
+                return finish(job, status)
+
+            with (mock.patch.object(gate, "finish_gate_job", side_effect=finish_with_nested_lease),
+                  self.assertRaisesRegex(gate.GateRecoveryUnresolved, "UNRESOLVED:.*nested")):
+                _ = gate.run_suites(self.checkout)
+            [nested] = held
+            folder = nested.parent
+            self.assertEqual((nested / "output").read_text(), "the holder owns this file")
             self.assertEqual(build_folders.build_folder_state(nested), "held")
-            self.assertEqual(recovery.folders, [str(folder)])
-            self.assertEqual((folder / build_folders.RECOVERY_MARKER).readlink(), recovery.path)
+            self.assertEqual(self.jobserver_tokens(), b"")
+            [record_path] = gate.gate_run_directory(self.checkout).glob("*.json")
+            recovery = gate.read_gate_recovery(record_path)
+            assert recovery is not None
+            self.assertFalse(recovery.finished)
+            self.assertEqual(recovery.folders, [str(folder.parent), str(folder)])
+            self.assertEqual([(token.value, token.operation) for token in recovery.tokens], [(b"Q".hex(), "held")])
+            self.assertEqual((folder / build_folders.RECOVERY_MARKER).readlink(), record_path)
 
     def test_gate_keeps_its_folder_and_record_when_removal_refuses(self) -> None:
         parent = self.root / "kept-gate"

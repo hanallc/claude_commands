@@ -927,9 +927,9 @@ class GateRecovery:
         """Release the removal markers that refer to this finished record."""
         for folder in map(Path, self.folders):
             marker = folder / build_folders.RECOVERY_MARKER
-            if not marker.is_symlink():
-                continue
             try:
+                if not marker.is_symlink():
+                    continue
                 with build_folder_lock.folder_parent(folder, folder.parent, create=False) as parent, ExitStack() as leases:
                     lease = build_folders._hold_free_lease(folder, parent, leases, wait=False)  # pyright: ignore[reportPrivateUsage]
                     if not isinstance(lease, build_folders.RefusedRemovalLease) and marker.readlink() == self.path.absolute():
@@ -1307,6 +1307,9 @@ def gate_temporary(recovery: GateRecovery, tool: str, parent: Path) -> Generator
         finally:
             try:
                 cleanup.close()
+            except build_folders.TemporaryFolderChildrenUnresolved as error:
+                recovery.unresolved = True
+                raise GateRecoveryUnresolved(str(error)) from error
             finally:
                 if not recovery.unresolved:
                     check_gate_folder_removal(recovery, folder)
