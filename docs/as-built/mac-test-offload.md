@@ -347,11 +347,11 @@ The remote claim stays available for recovery until the runner confirms cleanup.
   If the log writer cannot start nextest, the runner reports a setup failure.
 - `stream_mac_run` holds a `mac_exit=<n>` marker with a status from 0 to 255.
   Later ordinary output invalidates the held marker.
-  A held marker supplies the test verdict even if SSH ends with an error.
+  A held marker supplies the command verdict even if SSH ends with an error.
   `parse_cleanup` records a missing, malformed, or out-of-range cleanup marker as `CleanupUnconfirmed`.
   `ReportedMacStatus` holds the verdict and the cleanup state.
 - A cleanup timeout preserves the verdict and records unconfirmed cleanup.
-  This applies to the test stream and the cleanup stream after a fetch.
+  This applies to each routed Mac command and to the cleanup stream after a fetch.
   A timeout retains the claim for recovery.
   If a stream ends without a usable cleanup marker, `claimed_run` checks for leftovers.
   In that case, it releases the claim only after `LeftoversEnded`.
@@ -374,7 +374,7 @@ The remote claim stays available for recovery until the runner confirms cleanup.
   Thus a lost hana run does not stop a cargo-liner run or a run under `mirror/hana_other`.
   Cleanup sends TERM, then KILL, then counts again.
   Its SSH call uses `leftover_timeout_s` from `OffloadConfig`.
-  The routed test stream uses that limit from the time it receives the verdict.
+  Each routed Mac command uses that limit from the time it receives the verdict.
   A separate cleanup stream starts the limit before it starts SSH.
   It returns `LeftoversEnded`, `LeftoversRemain`, or `LeftoverCheckFailed`.
   A failed check or a remaining process keeps the remote claim.

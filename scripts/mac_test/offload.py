@@ -898,7 +898,7 @@ CleanupOutcome = (CleanupDone | CleanupRemovedWithoutFacts | CleanupFailed | Cle
 
 @dataclass(frozen=True)
 class ReportedMacStatus:
-    """The test status printed by the remote command."""
+    """The exit status reported by the remote command."""
 
     status: int
     cleanup: CleanupOutcome = CleanupUnconfirmed()
@@ -920,7 +920,7 @@ class ToolVersionMismatch:
 
 @dataclass(frozen=True)
 class MissingMacStatus:
-    """The remote command ended without a usable test status."""
+    """The remote command ended without a usable exit status."""
 
     detail: str = 'runner sent no final status'
     cleanup: CleanupUnconfirmed | CleanupStreamTimedOut = CleanupUnconfirmed()
@@ -945,7 +945,7 @@ class UnresolvedSlotStartup:
 
 @dataclass(frozen=True)
 class CleanupAfterVerdict:
-    """Start the cleanup deadline when the test sends its verdict."""
+    """Start the cleanup deadline when the command sends its verdict."""
 
     seconds: float
 
@@ -2863,7 +2863,8 @@ def claimed_run(
             running = f"running on {request.target} (Linux, host {probe.hostname})"
         print(f"mac_test: {running}; tree copied in {copy_seconds:.1f} s", flush=True)
         copies.register_remote(request_mirror(config, request, repository))
-        routed_mac_test = not linux and request.verb == "nextest" and isinstance(request.placement, AssignedOffloadRequest)
+        routed_mac_command = not linux and isinstance(request.placement, AssignedOffloadRequest)
+        routed_mac_test = routed_mac_command and request.verb == "nextest"
         if isinstance(request.placement, AssignedOffloadRequest):
             from scripts.build_queue import admission_client, admission_protocol as wire
 
@@ -2916,7 +2917,7 @@ def claimed_run(
             command = fenced_start_command(identity, request.target, command, scope_key=controller.claim_scope_key)
         arguments = [*ssh_prefix(config), command]
         remote_status = (controller.stream_mac_run(arguments, CleanupAfterVerdict(config.leftover_timeout_s))
-                         if routed_mac_test else controller.stream_mac_run(arguments))
+                         if routed_mac_command else controller.stream_mac_run(arguments))
         if isinstance(remote_status, MissingMacStatus) and isinstance(remote_status.cleanup, CleanupStreamTimedOut):
             return MacCleanupUnconfirmed(elapsed_seconds(started), remote_status.detail)
         if isinstance(remote_status, MirrorBusyRefusal):
@@ -2958,7 +2959,7 @@ def claimed_run(
                 copies.remote_use_command(request_mirror(config, request, repository),
                     f"echo mac_exit={remote_status.status}; " + remote_cleanup_command(config, request, repository))]
             cleanup = (controller.stream_mac_run(arguments, CleanupOnly(config.leftover_timeout_s))
-                       if routed_mac_test else controller.stream_mac_run(arguments))
+                       if routed_mac_command else controller.stream_mac_run(arguments))
             remote_status = replace(remote_status, cleanup=(
                 cleanup.cleanup if isinstance(cleanup, (ReportedMacStatus, MissingMacStatus)) else CleanupUnconfirmed()))
         evidence.completion = "confirmed"

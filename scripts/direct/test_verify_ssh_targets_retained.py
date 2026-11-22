@@ -46,7 +46,10 @@ class VerifySshRetainedTests(VerifySshTargetsFixture):
     def test_mac_post_fetch_cleanup_timeout_preserves_the_failed_verdict(self) -> None:
         self.check_lost_mac("post-fetch-cleanup-timeout", status=42)
 
-    def check_lost_mac(self, mode: str, *, status: int = 2) -> None:
+    def test_mac_check_cleanup_timeout_preserves_the_failed_verdict(self) -> None:
+        self.check_lost_mac("cleanup-stream-timeout", status=42, command="check")
+
+    def check_lost_mac(self, mode: str, *, status: int = 2, command: str = "test") -> None:
         self.configure("natedev,mac")
         self.enable_mac()
         settings = self.root / "mac_test.conf"
@@ -64,7 +67,7 @@ class VerifySshRetainedTests(VerifySshTargetsFixture):
             return replies
 
         with mock.patch.object(self.admission.server, "handle_request", side_effect=observe):
-            process = self.start_verify("test", "sample", "--no-cache", extra={
+            process = self.start_verify(command, "sample", "--no-cache", extra={
                 "TEST_SSH_MODES": json.dumps({"mac": mode})})
             try:
                 self.wait_for_path(self.runner_state / "mac-loss-ready", (process,))
@@ -83,6 +86,8 @@ class VerifySshRetainedTests(VerifySshTargetsFixture):
             self.assertNotIn("the Mac does not answer; stop and submit again", errors)
         self.assertEqual(slots_during_authorization, [process.pid])
         self.assertEqual(self.local_runs(), [])
+        if command == "check":
+            self.assertFalse(any(event["args"][:1] == ["check"] for event in self.cargo_events()))
         if mode == "missing-result-after-authorization":
             self.assertEqual(self.attempts(), [])
         else:
