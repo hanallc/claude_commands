@@ -47,7 +47,7 @@ from scripts.buildlog import charts, cost_actions, mac_idle_alert, parse
 from scripts.buildlog.store import host_name
 from scripts.build_queue import progress_profile as progress
 from scripts.build_queue import snapshot_codec as codec
-from scripts.build_queue import cloud_progress, placement
+from scripts.build_queue import cloud_progress, limits_view, placement
 from scripts.build_targets import targets
 from scripts.build_queue.queue_evidence import ci_amount as ci_bytes_text, room_text, service_activity_text, step_labels
 from scripts.build_queue import admission_client, admission_protocol as wire, head_facts, queue_view
@@ -1131,6 +1131,7 @@ class MemoryPage(TypedDict):
     report_version: str
     swap_rows: int
     leftovers: list[LeftoverScope]
+    build_limits: NotRequired[limits_view.BuildLimits]
 
 
 class RetainedReading(MemoryPage):
@@ -2698,7 +2699,8 @@ def memory_status(explanation: admission_records.QueueExplanation, room: admissi
 
 
 def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.UseConfiguredValue.CURRENT,
-            report_version: str = "", holders: TokenHolders | TokenHoldersUnknown = NO_TOKEN_DUMP_YET) -> MemoryPage:
+            report_version: str = "", holders: TokenHolders | TokenHoldersUnknown = NO_TOKEN_DUMP_YET,
+            *, limit_background: limits_view.Background | None = None) -> MemoryPage:
     started = time.perf_counter()
     if isinstance(configuration, conf.UseConfiguredValue):
         configuration = read_configuration()
@@ -2712,7 +2714,10 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
     if not isinstance(captured, admission_records.MemoryRoom) or not isinstance(host, admission_records.HostMemory):
         raise RuntimeError("recorded room unavailable")
     snapshots = target_availability.read_snapshots()
-    slot_roots = conf.read_or_repository("build_folders").values()
+    if limit_background is not None:
+        parsed = limits_view.with_mac_claim_waits(parsed, snapshots)
+    folder_settings = conf.read_or_repository("build_folders")
+    slot_roots = folder_settings.values()
     mac_reading = queue_view.read_mac_builds()
     mac_machine = conf.read_or_repository("machines").words("mac.hosts")[0]
     machine = host_name()
@@ -2981,7 +2986,9 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
         owner = step_page_owner(waiter, labels, ci_runners, members, machine, ci_label=ci_label)
         identity = owner.labels
         cause = waiter.reason.cause if isinstance(waiter.reason, admission_records.HeadAdmissionStatus) else waiter.reason
-        if isinstance(cause, admission_records.BehindHead):
+        if waiter.placement_block is not None:
+            reason = limits_view.placement_reason(waiter.placement_block.reason)
+        elif isinstance(cause, admission_records.BehindHead):
             order = order_holds.get(waiter.pid)
             blocker = (positions.get(order.waiter["pid"], 0) if isinstance(order, admission_records.HeldBehindHead)
                        else admission_records.behind_place(cause, waiting))
@@ -3017,6 +3024,7 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
                         **job_notes(job, names, step=waiter.step, verify=waiter.verify,
                                     ci=bool(ci_label))}
     work_rows: list[RunRow | CloudRunRow | MacBuildRow | MacReadingUnavailableRow] = list(walk)
+    mac_runs: list[tuple[str, str, str]] = []
     mac_status = queue_view.mac_reading_status(mac_reading, explanation.now)
     if mac_status:
         name = QueueRowName.fixed(QueueKind.MAC)
@@ -3038,9 +3046,11 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
             mac_row = mac_work_row(build, mac_reading, identity,
                                    names=names, slot_roots=slot_roots, slot_machine=mac_machine, placed_step=placed)
             work_rows.append(mac_row)
+            mac_runs.append((build.repository, build.session, mac_row["name"]))
     work_rows.sort(key=lambda row: row["started_at"])
     waiting_rows: list[WaitRow | CloudWaitRow] = list(waiters.values())
     model = queue_view.QueueModel(parsed, labels, names=names)
+    limit_cloud_names: dict[wire.Owner, str] = {}
     cloud_slots_used = 0
     cloud_slots = 0
     if isinstance(parsed, wire.CloudQueueRead):
@@ -3101,6 +3111,7 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
                     if isinstance(information.update, queue_view.CloudUpdateLate)
                     and not isinstance(cloud.wait, wire.CloudSlotWait) else "",
                 **job_notes(job, names, step=cloud.identity.step, verify=cloud.identity.verify)}
+            limit_cloud_names[cloud.owner] = values["name"]
             if isinstance(cloud.wait, wire.CloudSlotWait):
                 cloud_waiters[cloud.owner] = {**values, "since": cloud.since, "reason": cloud.wait.text,
                     "runs_on": CLOUD_RUNS_ON, "because": "natedev when AWS cannot start", "targets": ["aws"]}
@@ -3189,6 +3200,13 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
         "report_version": report_version,
         "swap_rows": configuration.swap_rows, "leftovers": leftovers,
     }
+    if limit_background is not None:
+        limit_names = limits_view.QueueNames({place: row["name"] for place, row in waiters.items()},
+            limit_cloud_names, {session: identity.owner_text for session, identity in labels.items()})
+        page["build_limits"] = limits_view.build_limits(parsed, snapshots, limit_names,
+            limits_view.Metric("Memory for builds", gib(captured.cap_use),
+                               gib(captured.cap) if isinstance(captured.cap, int) else None, "GiB"),
+            folder_settings, limit_background, zone, mac_runs)
     page["render_seconds"] = time.perf_counter() - started
     return page
 
@@ -3226,6 +3244,7 @@ def main(argv: Sequence[str]) -> int:
     last_good: MemoryPage | NoGoodReading = NoGoodReading()
     report_version = ""
     next_report_at = 0.0
+    limit_background: limits_view.Background | None = None
     next_mac_at = 0.0
     holders: TokenHolders | TokenHoldersUnknown = NO_TOKEN_DUMP_YET
     next_tokens_at = 0.0
@@ -3237,6 +3256,7 @@ def main(argv: Sequence[str]) -> int:
         now = time.monotonic()
         if now >= next_report_at:
             report = report_file(report_reading(configuration.history_days))
+            limit_background = limits_view.background(time.time(), limit_background)
             if report.version != report_version:
                 # The report goes first, so memory.json never names a report that is not written.
                 write_text_atomic(configuration.output_folder / REPORT_NAME, report.text, new_file_mode=0o644)
@@ -3257,7 +3277,8 @@ def main(argv: Sequence[str]) -> int:
                     holders = TokenHoldersUnknown(refused)
                 # Count from after the request, so slow reads before it never shorten the interval.
                 next_tokens_at = time.monotonic() + configuration.token_dump_seconds
-            payload: MemoryPage | RetainedReading | PageUnavailable = reading(configuration, report_version, holders)
+            payload: MemoryPage | RetainedReading | PageUnavailable = reading(configuration, report_version, holders,
+                                                                               limit_background=limit_background)
             last_good = payload
         except (OSError, ValueError, KeyError, RuntimeError) as error:
             if isinstance(last_good, NoGoodReading):

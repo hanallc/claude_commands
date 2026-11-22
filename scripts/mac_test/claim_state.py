@@ -10,11 +10,16 @@ from datetime import datetime
 from enum import StrEnum
 import fcntl
 import json
+import os
 from pathlib import Path
+import time
 from typing import TYPE_CHECKING, Literal, NotRequired, TypedDict, cast
+from uuid import uuid4
 
 from scripts.build_hold.owning_session import NoOwningSession, OwningSession
 from scripts.build_targets import target_config
+from scripts.lib import process_start
+from scripts.lib.atomic_file import write_text_atomic
 
 if TYPE_CHECKING:
     from scripts.buildlog.transfer_bytes import TransferBytes
@@ -311,6 +316,7 @@ class StatePaths:
         self.claim_watch_lock: Path = directory / "claim_watch.lock"
         self.run: Path = directory / "run.json"
         self.claims: Path = directory / "claims"
+        self.claim_waits: Path = directory / "claim-waits"
         self.block: Path = directory / "block.json"
         self.affinity: Path = directory / "affinity"
 
@@ -467,6 +473,71 @@ def claim_files(paths: StatePaths) -> tuple[Path, ...]:
     except OSError as error:
         raise ClaimStateUnreadable(paths.claims, error) from error
     return (paths.run, *repository_files)
+
+
+@dataclass(frozen=True)
+class ClaimWait:
+    caller: int
+    folder: str
+    name: str
+    session: str
+    episode: str
+    reason: Literal["busy"]
+    since: float
+
+
+@contextmanager
+def record_claim_wait(paths: StatePaths, caller: int, folder: str, name: str,
+                      session: SubmittingSession, episode: str) -> Generator[None, None, None]:
+    """Keep one record for the life of this claim wait."""
+    pid = os.getpid()
+    owner = process_start.process_start(pid)
+    if not isinstance(owner, process_start.Started):
+        yield
+        return
+    path = paths.claim_waits / f"{pid}-{uuid4().hex}.json"
+    try:
+        paths.claim_waits.mkdir(parents=True, exist_ok=True)
+        write_text_atomic(path, json.dumps({"pid": pid, "start": owner.start, "caller": caller,
+            "folder": folder, "name": name, "session": session_id(session), "episode": episode,
+            "reason": "busy", "since": time.time()}, separators=(",", ":")))
+    except OSError:
+        yield
+        return
+    try:
+        yield
+    finally:
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def read_claim_waits(paths: StatePaths) -> tuple[ClaimWait, ...]:
+    """Read live claim waits and remove files whose writers have exited."""
+    waits: list[ClaimWait] = []
+    for path in paths.claim_waits.glob("*.json"):
+        try:
+            row = read_json_object(path)
+            if row is None:
+                continue
+            pid, start = row.get("pid"), row.get("start")
+            if not isinstance(pid, int) or not isinstance(start, str):
+                continue
+            owner = process_start.process_start(pid)
+            if (isinstance(owner, (process_start.Gone, process_start.Zombie))
+                    or isinstance(owner, process_start.Started) and owner.start != start):
+                path.unlink(missing_ok=True)
+                continue
+            caller, since = row.get("caller"), row.get("since")
+            folder, name, session, episode = (row.get(key) for key in ("folder", "name", "session", "episode"))
+            if (isinstance(caller, int) and isinstance(since, (int, float))
+                    and isinstance(folder, str) and isinstance(name, str) and isinstance(session, str)
+                    and isinstance(episode, str) and row.get("reason") == "busy"):
+                waits.append(ClaimWait(caller, folder, name, session, episode, "busy", since))
+        except (StateReadError, OSError):
+            continue
+    return tuple(sorted(waits, key=lambda wait: wait.since))
 
 
 def read_claims(paths: StatePaths) -> tuple[HeldClaim, ...]:

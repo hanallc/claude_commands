@@ -1101,6 +1101,16 @@ class PackageNotRecorded:
 
 
 @dataclass(frozen=True)
+class PlacementBlock:
+    """The queue records the destination and its last observed blocker."""
+
+    provider: Literal["local", "mac", "ssh", "scaler"]
+    target: str
+    reason: str
+    episode: str = ""
+
+
+@dataclass(frozen=True)
 class WaitingStep:
     """The waiting step holds its caller, memory need, wait reason, and run identity."""
     pid: int
@@ -1119,6 +1129,7 @@ class WaitingStep:
     verify: VerifyStep = field(default=NotVerifyCall(), kw_only=True)
     job: StepJob | GateJobNotRecorded = field(default=GATE_JOB_NOT_RECORDED, kw_only=True)
     ci_runner: str = field(default="", kw_only=True)
+    placement_block: PlacementBlock | None = field(default=None, kw_only=True)
 
 
 @dataclass(frozen=True)

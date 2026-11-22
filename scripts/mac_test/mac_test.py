@@ -2071,42 +2071,54 @@ def command_claim(args: CliArguments, paths: StatePaths, *, watch_claim: bool = 
     deadline = time.monotonic() + max(args.wait, 0.0)
     yield_deadline = 0.0
     stopped: set[tuple[int, str]] = set()
-    while True:
-        with locked(paths.lock):
-            attempt = (adopt_wait_claim(args, paths, scope, session=session) if args.from_pid
-                       else claim_once(args, paths, scope, session=session, reserve_wait=not watch_claim, assignment=assignment))
-        if isinstance(attempt, ClaimFinished):
-            if watch_claim and attempt.status in (0, 13):
-                start_claim_watcher(paths)
-            return attempt.status
-        if isinstance(attempt, ClaimHeldByCopy):
-            # Signal outside state.lock, then wait for each copy's runner to
-            # clean up and release; the lock is never held while waiting.
-            if not stopped:
-                yield_deadline = time.monotonic() + copy_yield_seconds()
-            for holder in attempt.holders:
-                if (holder["pid"], holder["proc_start"]) not in stopped:
-                    stopped.add((holder["pid"], holder["proc_start"]))
-                    stop_copy(holder)
-            if time.monotonic() < yield_deadline:
-                time.sleep(0.1)
-                continue
-            busy_run = attempt.holders[0]
-            print(f"busy: {busy_run['what']} since {local_time(busy_run['since'], include_zone=False)}")
-            return 11
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            busy_run = attempt.holder
-            if run_is_kept(busy_run):
-                print(f"busy: leftovers of {busy_run['what']} on {busy_run['remote_host']} since "
-                      + f"{local_time(busy_run['since'], include_zone=False)}")
+    with ExitStack() as wait_record:
+        recorded = False
+
+        def show_wait() -> None:
+            nonlocal recorded
+            if not recorded and paths.platform == "macos":
+                wait_record.enter_context(claim_state.record_claim_wait(
+                    paths, args.pid, args.worktree, args.what, session, args.episode))
+                recorded = True
+
+        while True:
+            with locked(paths.lock):
+                attempt = (adopt_wait_claim(args, paths, scope, session=session) if args.from_pid
+                           else claim_once(args, paths, scope, session=session, reserve_wait=not watch_claim, assignment=assignment))
+            if isinstance(attempt, ClaimFinished):
+                if watch_claim and attempt.status in (0, 13):
+                    start_claim_watcher(paths)
+                return attempt.status
+            if isinstance(attempt, ClaimHeldByCopy):
+                # Signal outside state.lock, then wait for each copy's runner to
+                # clean up and release; the lock is never held while waiting.
+                if not stopped:
+                    yield_deadline = time.monotonic() + copy_yield_seconds()
+                for holder in attempt.holders:
+                    if (holder["pid"], holder["proc_start"]) not in stopped:
+                        stopped.add((holder["pid"], holder["proc_start"]))
+                        stop_copy(holder)
+                if time.monotonic() < yield_deadline:
+                    show_wait()
+                    time.sleep(0.1)
+                    continue
+                busy_run = attempt.holders[0]
+                print(f"busy: {busy_run['what']} since {local_time(busy_run['since'], include_zone=False)}")
                 return 11
-            print(
-                f"busy: {busy_run['what']} since "
-                + f"{local_time(busy_run['since'], include_zone=False)}"
-            )
-            return 11
-        time.sleep(min(2.0, remaining))
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                busy_run = attempt.holder
+                if run_is_kept(busy_run):
+                    print(f"busy: leftovers of {busy_run['what']} on {busy_run['remote_host']} since "
+                          + f"{local_time(busy_run['since'], include_zone=False)}")
+                    return 11
+                print(
+                    f"busy: {busy_run['what']} since "
+                    + f"{local_time(busy_run['since'], include_zone=False)}"
+                )
+                return 11
+            show_wait()
+            time.sleep(min(2.0, remaining))
 
 
 @dataclass(frozen=True)
