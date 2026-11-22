@@ -62,6 +62,11 @@ def repository_key(directory: str) -> str:
     remote = output(["git", "-C", directory, "remote", "get-url", "origin"], directory, GIT_TIMEOUT_S)
     if remote and remote.strip():
         return remote_identity(remote.strip(), directory)
+    return git_root_key(directory)
+
+
+def git_root_key(directory: str) -> str:
+    """Read the history key for a Git repository without an origin."""
     roots = output(["git", "-C", directory, "rev-list", "--max-parents=0", "--reverse", "HEAD"],
                    directory, GIT_TIMEOUT_S)
     return "git-root:" + roots.strip().splitlines()[0] if roots and roots.strip() else store.UNKNOWN_IDENTITY

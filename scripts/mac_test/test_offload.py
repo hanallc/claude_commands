@@ -49,7 +49,7 @@ from scripts.copies import copies
 from scripts.copies.copies_test_support import copies_environment
 from scripts.mac_test.offload_test_commands import install_nextest_log_writer
 from scripts.mac_test.offload_test_support import (
-    OffloadCommandFixture, FILTER, HANA, HANA_COMMAND_PATTERN, split_mac_run_command,
+    CLAIM_STUB, OffloadCommandFixture, FILTER, FIXTURE_MIRROR_ROOT, HANA, HANA_COMMAND_PATTERN, split_mac_run_command,
 )
 from scripts.lib.py_floor_test_support import seed_interpreter_cache
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -534,9 +534,9 @@ class OffloadSettingsTests(unittest.TestCase):
             self.assertEqual(offload.write_result(result, offload.ResultFile(result_path)), 75)
 
         self.assertEqual(claim.call_args_list, [
-            mock.call(controller, config, request, HANA, (1,), mac_repository=claim_state.WHOLE_MAC),
+            mock.call(controller, config, request, HANA, (1,), mac_repository=claim_state.NO_SAVED_MAC_REPOSITORY),
             mock.call(controller, config, replace(request, admission=offload.UnclaimedMacRun()), HANA, (1,),
-                      mac_repository=claim_state.WHOLE_MAC),
+                      mac_repository=claim_state.NO_SAVED_MAC_REPOSITORY),
         ])
         release.assert_called_once_with(controller, request.target)
         self.assertEqual(output.getvalue(), "mac_test: not running on the Mac (state)\n")
@@ -1023,7 +1023,8 @@ class OffloadCommandTests(OffloadCommandFixture):
     def test_waiter_hands_relative_path_claim_to_runner_for_cleanup_only(self) -> None:
         assignment = self.assignment_options(self.repository, "nextest", self.config_path, ())
         retained = self.write_kept_claim(legacy=True)
-        _ = self.claim_file.write_text(json.dumps({**retained, "worktree": "."}))
+        claim_file = self.claim_file.rename(self.claim_file.with_name("saved-legacy.json"))
+        _ = claim_file.write_text(json.dumps({**retained, "worktree": ".", "repo_name": "hana"}))
         reservation = self.root / "reservation"
         identity = self.root / "reservation.identity"
         waiter = str(os.getpid())
@@ -1037,14 +1038,16 @@ class OffloadCommandTests(OffloadCommandFixture):
         target, settings = reservation.read_text().rstrip("\n").split("\t")
         claim_id, episode, attempt, session = identity.read_text().rstrip("\n").split("\t")
 
-        result = self.command(subprocess_cli=True, assigned_adapter=True, settings=Path(settings), runner_options=(
+        missing = self.repository
+        _ = missing.rename(self.root / "former-checkout")
+        result = self.command(repository=missing, subprocess_cli=True, assigned_adapter=True, settings=Path(settings), runner_options=(
             *assignment, "--target", target, "--claim-owner-pid", waiter, "--claim-id", claim_id,
             "--episode", episode, "--attempt", attempt, "--claim-session", session,
         ))
         self.assertEqual(result.returncode, 75, result.stdout)
         self.assertTrue(result.stdout.endswith(f"mac_test: not running on the {target} (busy)\n"), result.stdout)
         self.assert_wire("declined", "busy")
-        self.assertFalse(self.claim_file.exists())
+        self.assertFalse(claim_file.exists())
         cleanup, = self.leftover_events()
         self.assertEqual(self.events(), [cleanup])
         adopted = cleanup.get("claim")
@@ -1053,6 +1056,30 @@ class OffloadCommandTests(OffloadCommandFixture):
         self.assertNotEqual(adopted["pid"], int(waiter))
         self.assertEqual(adopted["claim_id"], retained["claim_id"])
         self.assertEqual(adopted["worktree"], ".")
+        self.assertEqual(adopted["remote_host"], retained["remote_host"])
+        script = cleanup["args"][-1]
+        self.assert_leftover_selectors(script)
+        self.assertNotIn("kill ", script)
+        fixture_commands = ("pgrep() { return 1; }\n"
+                            + f"lsof() {{ printf 'p41\\nn/home/fixture/{FIXTURE_MIRROR_ROOT}/other\\n'; }}\n")
+        counted = subprocess.run(["bash", "-c", fixture_commands + script], check=True, capture_output=True,
+                                 text=True, timeout=5)
+        self.assertEqual(counted.stdout.splitlines(), ["leftovers=0", "rc=0"])
+
+    def test_claim_stub_preserves_the_host_and_worktree_during_cleanup_handoff(self) -> None:
+        kept = self.write_kept_claim(legacy=True)
+        _ = self.claim_file.write_text(json.dumps({**kept, "worktree": "older-path", "cleanup_pending": True}))
+        (self.stub_directory / "finish-claim").touch()
+        result = subprocess.run([sys.executable, "-c", CLAIM_STUB, "claim", "--from-pid", str(kept["pid"]),
+            "--pid", str(os.getpid()), "--what", "new check", "--worktree", str(self.repository),
+            "--remote", "new-mac", "--claim-id", kept["claim_id"], "--episode", kept["episode"],
+            "--attempt", kept["attempt"], "--session", kept["submitting_session"]],
+            cwd=Path(offload.__file__).parents[2], env=self.environment, capture_output=True, text=True, timeout=5)
+        self.assertEqual(result.returncode, 13, result.stderr)
+        self.assertIn(f"leftovers: {kept['remote_host']}\n", result.stdout)
+        saved = self.remote_claim()
+        self.assertEqual((saved["remote_host"], saved["worktree"], saved["pid"]),
+                         (kept["remote_host"], "older-path", os.getpid()))
 
     def test_wait_claim_decline_prints_the_child_status_and_failed_check(self) -> None:
         result = self.command(runner_options=(

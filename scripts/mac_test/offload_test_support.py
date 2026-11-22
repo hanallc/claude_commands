@@ -218,7 +218,7 @@ def main() -> int:
             saved, = (claim for claim in claim_state.read_claims(paths)
                       if claim_state.claim_identity(claim.record) == identity)
             path = saved.path
-            record = {**saved.record, **record}
+            record = {"remote_host": record["remote_host"], **saved.record, "pid": owner_pid, "proc_start": proc_start}
         elif "--mac-repository" in arguments:
             repository = claim_state.mac_repository_record(json.loads(arguments[arguments.index("--mac-repository") + 1]))
             if "--leased-slot" in arguments:
@@ -233,9 +233,12 @@ def main() -> int:
                  "claim_fence=" + claim_state.claim_fence_directory(path, record)]
         if "mac_repository" in record:
             reply.append("mac_repository=" + json.dumps(record["mac_repository"]))
+        elif mirror := claim_state.legacy_mac_mirror_name(record):
+            reply.append("claim_mirror=" + mirror)
         path.parent.mkdir(parents=True, exist_ok=True)
         actions = (root / "state-events").read_text().splitlines()
-        if (os.environ.get("MAC_TEST_TAKEOVER_TWICE") == "1"
+        cleanup_pending = record.get("cleanup_pending", False)
+        if not cleanup_pending and (os.environ.get("MAC_TEST_TAKEOVER_TWICE") == "1"
                 or os.environ.get("MAC_TEST_TAKEOVER_FIRST") == "1" and actions == ["claim"]):
             record["what"] = "older tests"
             record["remote_host"] = "previous-mac"
@@ -243,7 +246,7 @@ def main() -> int:
             print(*reply, sep="\n", flush=True)
             print("leftovers: previous-mac", flush=True)
             return 13
-        takeover = os.environ.get("MAC_TEST_HELD_TAKEOVER") == "1"
+        takeover = not cleanup_pending and os.environ.get("MAC_TEST_HELD_TAKEOVER") == "1"
         if takeover:
             record["what"] = "older tests"
             record["remote_host"] = "previous-mac"
@@ -252,6 +255,9 @@ def main() -> int:
         while not (root / "finish-claim").exists():
             time.sleep(0.01)
         print(*reply, sep="\n", flush=True)
+        if cleanup_pending:
+            print("leftovers: " + record["remote_host"], flush=True)
+            return 13
         if takeover:
             print("leftovers: " + os.environ.get("MAC_TEST_TAKEOVER_REPLY", "reply-mac"), flush=True)
             return 13

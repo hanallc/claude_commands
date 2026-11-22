@@ -335,8 +335,20 @@ def mac_repository_record(value: object) -> MacRepositoryIdentity:
     return MacRepositoryIdentity(key, mirror, file, fence)
 
 
-def saved_mac_repository(record: RunRecord) -> MacRepositoryIdentity | WholeMacScope:
-    return mac_repository_record(record["mac_repository"]) if "mac_repository" in record else WHOLE_MAC
+class NoSavedMacRepository:
+    """The claim has no structured Mac repository identity."""
+
+
+NO_SAVED_MAC_REPOSITORY = NoSavedMacRepository()
+
+
+def saved_mac_repository(record: RunRecord) -> MacRepositoryIdentity | NoSavedMacRepository:
+    return mac_repository_record(record["mac_repository"]) if "mac_repository" in record else NO_SAVED_MAC_REPOSITORY
+
+
+def legacy_mac_mirror_name(record: RunRecord) -> str:
+    name = record.get("repo_name", "")
+    return name if name not in (".", "..") and not any(c in name for c in "/\0\r\n\t") else ""
 
 
 def claim_fence_directory(path: Path, record: RunRecord) -> str:

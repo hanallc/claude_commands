@@ -678,7 +678,8 @@ def command_recover_probe(args: CliArguments) -> int:
                     if not slots:
                         return 0
                     claim = offload.claim_for_run(controller, config, request, repository, tuple(slots),
-                                                  mac_repository=mac_repository)
+                        mac_repository=(mac_repository if isinstance(mac_repository, claim_state.MacRepositoryIdentity)
+                                        else claim_state.NO_SAVED_MAC_REPOSITORY))
                     if not isinstance(claim, offload.FreshMacClaim):
                         return 0
                     try:
@@ -973,9 +974,8 @@ def cleanup_refused_claims(target: SshTarget, args: CliArguments, *, session: Su
         try:
             mirror: offload.MirrorScope = offload.ALL_MIRRORS
             if paths.platform == "macos":
-                saved = claim_state.saved_mac_repository(claim.record)
-                if isinstance(saved, claim_state.MacRepositoryIdentity):
-                    mirror = eligibility.KnownRepository(saved.mirror_name, saved.key)
+                mirror = offload.mac_cleanup_scope(claim_state.saved_mac_repository(claim.record),
+                                                   claim_state.legacy_mac_mirror_name(claim.record))
             else:
                 cleanup_scope = claim.scope if isinstance(claim.scope, claim_state.RepositoryScope) else scope
                 if not isinstance(cleanup_scope, claim_state.RepositoryScope):

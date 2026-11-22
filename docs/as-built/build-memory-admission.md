@@ -532,8 +532,11 @@ The key follows local clone origins to the upstream repository. Git alternates s
 Each claim saves its key, claim file, mirror name, and start fence directory.
 The key determines the file name for a new claim. The mirror name identifies the directory the runner uses.
 The runner, release, cleanup, and execution observer use the saved identity. Handoff retains the reservation file and its start fence.
+A handoff also retains the repository fields of an older claim. It can adopt an exact cleanup claim after the checkout is gone.
 A legacy Mac claim with no key blocks all repositories. Any Mac caller can take the exact claim for cleanup after the saved owner ends.
-If a legacy claim has no saved mirror, cleanup checks for remaining mirror work without stopping any processes.
+Cleanup counts work in the mirror named by a legacy claim. If the claim has no mirror name, cleanup counts work in all mirrors.
+These counts send no process signals.
+The Mac build log and the queue use the same Git root key for history when a repository has no origin.
 Held slots and waiting extras remain in memory. A restart removes them and retains the run's queue place.
 The service replaces this file atomically. Reservation records retain accepted needs, run identities, scope paths, and finalization intent.
 Width and call absence use named variants. `RequestedTestWidth`, `UnspecifiedTestWidth`, and `NoTestWidth` describe the width.

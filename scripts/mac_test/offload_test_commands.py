@@ -132,11 +132,18 @@ if [[ $command == systemd-run ]]; then
     printf '\n' >> "$root/systemd-run.jsonl"
     exit 0
 fi
+claim_file=
+for saved in "$MAC_TEST_STATE_DIR/run.json" "$MAC_TEST_STATE_DIR"/claims/*.json; do
+    [[ -f $saved ]] || continue
+    if [[ -n $claim_file ]]; then
+        printf 'The command fixture has more than one saved claim.\n' >&2
+        exit 1
+    fi
+    claim_file=$saved
+done
 {
     record_command "$@"
-    claim_file=$MAC_TEST_FIXTURE_CLAIM_FILE
-    if [[ ! -f $claim_file ]]; then claim_file=$MAC_TEST_FIXTURE_LEGACY_CLAIM_FILE; fi
-    if [[ -f $claim_file ]]; then
+    if [[ -n $claim_file ]]; then
         IFS= read -r -d '' claim < "$claim_file" || :
         printf ',"claimed":true,"claim":%s' "${claim//$'\n'/}"
     else

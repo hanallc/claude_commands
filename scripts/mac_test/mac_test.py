@@ -10,7 +10,7 @@ except FileNotFoundError:
 import argparse
 from collections.abc import Callable, Generator
 from contextlib import ExitStack, contextmanager, nullcontext
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 import fcntl
@@ -1925,6 +1925,8 @@ def finished_claim(args: CliArguments, record: RunRecord, path: Path, *, adopted
         lines.append("claim_fence=" + claim_state.claim_fence_directory(path, record))
         if "mac_repository" in record:
             lines.append("mac_repository=" + json.dumps(record["mac_repository"]))
+        elif record.get("cleanup_pending") and (mirror := claim_state.legacy_mac_mirror_name(record)):
+            lines.append("claim_mirror=" + mirror)
     slot = (f"slot: {record['slot']}",) if "slot" in record else ()
     if "remote_host" in record and record.get("cleanup_pending"):
         leftovers = f"leftovers: {record['remote_host']}"
@@ -2100,8 +2102,7 @@ def refuse_wait_claim(check: WaitClaimCheck, *, status: Literal[11, 12] = 12) ->
 
 
 def adopt_wait_claim(args: CliArguments, paths: StatePaths, scope: ClaimScope,
-                     *, session: SubmittingSession,
-                     mac_repository: claim_state.MacRepositoryIdentity | WholeMacScope = WHOLE_MAC) -> ClaimAttempt:
+                     *, session: SubmittingSession) -> ClaimAttempt:
     """Transfer a live reservation under the target lock without releasing capacity."""
     start = process_identity.process_start(args.pid)
     if not isinstance(start, process_identity.Started):
@@ -2124,7 +2125,7 @@ def adopt_wait_claim(args: CliArguments, paths: StatePaths, scope: ClaimScope,
         (WaitClaimCheck.OWNER_START, lambda claim:
             process_identity.process_start(args.from_pid) == process_identity.Started(claim.record["proc_start"])),
         (WaitClaimCheck.WORKTREE, lambda claim: (claim.record.get("cleanup_pending") is True
-            and wait_claim_matches(paths, claim, scope, worktree))
+            and (paths.platform == "macos" or wait_claim_matches(paths, claim, scope, worktree)))
             or recorded_worktree_matches(claim.record["worktree"], worktree)),
     )
     for check, matches in checks:
@@ -2156,13 +2157,6 @@ def adopt_wait_claim(args: CliArguments, paths: StatePaths, scope: ClaimScope,
     cleanup_only = record.get("cleanup_pending") is True
     if not cleanup_only:
         record["worktree"] = str(claim_worktree_path(record["worktree"]))
-        if ("mac_repository" not in record and isinstance(mac_repository, claim_state.MacRepositoryIdentity)
-                and claim.path != paths.run):
-            # Keep the reservation file as the fence directory for this handoff.
-            saved = replace(mac_repository, claim_file=claim.path.name, fence_directory=claim.path.stem)
-            record["repo_key"] = saved.key
-            _ = record.setdefault("repo_name", saved.mirror_name)
-            record["mac_repository"] = saved.record()
     write_json(claim.path, record)
     if isinstance(claim.scope, RepositoryScope) and claim.scope.slot and not cleanup_only:
         remember_slot(paths, claim.scope, record)
@@ -2202,10 +2196,10 @@ def command_claim(args: CliArguments, paths: StatePaths, *, watch_claim: bool = 
             raise ValueError("claim requires a remote assignment")
         assignment = saved.assignment
     session = claim_state.submitting_session(session)
-    if paths.platform == "macos":
+    if paths.platform == "macos" and not args.from_pid:
         if args.mac_repository:
             mac_repository = claim_state.mac_repository_record(cast(object, json.loads(args.mac_repository)))
-        elif not args.from_pid and isinstance(mac_repository, claim_state.ResolveMacRepository):
+        elif isinstance(mac_repository, claim_state.ResolveMacRepository):
             mac_repository = claim_state.mac_repository_identity(args.worktree)
     if isinstance(mac_repository, claim_state.ResolveMacRepository):
         mac_repository = WHOLE_MAC
@@ -2221,9 +2215,6 @@ def command_claim(args: CliArguments, paths: StatePaths, *, watch_claim: bool = 
                 print("the assigned Mac repository has changed", file=sys.stderr)
                 return 12
             # Keep the mirror file name for an assignment from an older client.
-            scope = RepositoryScope(scope.name, mac_repository.key, scope.slot)
-        elif (paths.platform == "macos" and isinstance(scope, RepositoryScope) and not scope.key
-              and isinstance(mac_repository, claim_state.MacRepositoryIdentity)):
             scope = RepositoryScope(scope.name, mac_repository.key, scope.slot)
         if not args.from_pid:
             args.episode, args.attempt = assignment.episode, assignment.attempt
@@ -2241,7 +2232,7 @@ def command_claim(args: CliArguments, paths: StatePaths, *, watch_claim: bool = 
     stopped: set[tuple[int, str]] = set()
     while True:
         with locked(paths.lock):
-            attempt = (adopt_wait_claim(args, paths, scope, session=session, mac_repository=mac_repository) if args.from_pid
+            attempt = (adopt_wait_claim(args, paths, scope, session=session) if args.from_pid
                        else claim_once(args, paths, scope, session=session, reserve_wait=not watch_claim,
                                        assignment=assignment, mac_repository=mac_repository))
         if isinstance(attempt, ClaimDenied):

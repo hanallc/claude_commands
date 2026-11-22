@@ -253,6 +253,13 @@ def repository_identity(repo_root: Path) -> RepositoryIdentity:
     return KnownRepository(name) if key == store.UNKNOWN_IDENTITY else KnownRepository(name, key)
 
 
+def mac_history_key(key: str) -> str:
+    """Use the queue history key for a Mac claim without an origin."""
+    if key.startswith("git-dir:"):
+        return repository.git_root_key(str(Path(key.removeprefix("git-dir:")).parent))
+    return key or store.UNKNOWN_IDENTITY
+
+
 def comma_values(value: str) -> set[str]:
     return {item.strip() for item in value.split(",") if item.strip()}
 
@@ -447,7 +454,7 @@ def mac_step_eligibility(config: OffloadConfig | conf.ConfigRead, repo_root: Pat
                          verb: MacVerb, target: str = "", *, kind: str = "",
                          backoff: BackoffState | ReadBackoff = READ_BACKOFF,
                          mac_repository: claim_state.MacRepositoryIdentity | claim_state.WholeMacScope
-                         | claim_state.ResolveMacRepository = claim_state.RESOLVE_MAC_REPOSITORY
+                         | claim_state.ResolveMacRepository | KnownRepository = claim_state.RESOLVE_MAC_REPOSITORY
                          ) -> KnownRepository | IneligibleMacStep:
     """Share repository, package/workspace and backoff rules with eligible --kind."""
     enabled = config.enabled if isinstance(config, OffloadConfig) else config.value("offload", conf.on_off)
@@ -459,7 +466,8 @@ def mac_step_eligibility(config: OffloadConfig | conf.ConfigRead, repo_root: Pat
             mac_repository = claim_state.mac_repository_identity(str(repo_root))
         if isinstance(mac_repository, claim_state.WholeMacScope):
             return IneligibleMacStep("repo")
-        repository = KnownRepository(mac_repository.mirror_name, mac_repository.key)
+        repository = (mac_repository if isinstance(mac_repository, KnownRepository)
+                      else KnownRepository(mac_repository.mirror_name, mac_repository.key))
     else:
         repository = repository_identity(repo_root)
     policy = configured_step_policy(config, platform, repository, repo_root, package, kind or verb_kind(verb))
