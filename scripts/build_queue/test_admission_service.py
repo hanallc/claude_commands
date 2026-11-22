@@ -45,6 +45,7 @@ from scripts.build_hold import override_guard
 
 from scripts.lib import conf
 from scripts.lib import inotify, test_hang_guard
+from scripts.lib.socket_test_support import SOCKET_ROOT_ENV
 from scripts.build_queue.admission_jobs import GateJobNotRecorded, StepJob
 from scripts.lib.user_zone import user_zone
 from scripts.lib.atomic_file import write_text_atomic
@@ -5242,10 +5243,10 @@ class ServiceTests(unittest.TestCase):
             self.assertFalse(fixture.server.reservations)
 
     def test_socket_fixture_works_with_a_long_tmpdir(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="admit-long-", dir="/tmp") as root:
+        with tempfile.TemporaryDirectory() as root:
             long_tmpdir = Path(root) / ("nested-" * 24)
             long_tmpdir.mkdir()
-            with mock.patch.dict(os.environ, {"TMPDIR": str(long_tmpdir)}), \
+            with mock.patch.dict(os.environ, {"TMPDIR": str(long_tmpdir), SOCKET_ROOT_ENV: root}), \
                  mock.patch.object(tempfile, "tempdir", str(long_tmpdir)), \
                  AdmissionFixture() as fixture:
                 self.assertEqual(fixture.root.parent, long_tmpdir)

@@ -21,6 +21,7 @@ from zoneinfo import ZoneInfo
 from scripts.production import gate, land_runs
 from scripts.lib import build_folders
 from scripts.lib.checkout_test_support import write_stdlib_tool
+from scripts.lib.socket_test_support import SOCKET_ROOT_ENV
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lint.memory_test_support import ADMISSION_CONFIG_FIXTURE
 from scripts.production.affected_modules import CertifiedBase, FullSuite
@@ -173,7 +174,7 @@ request_slow_seconds=0.25
 """
     )
     _ = (directory / "build_folders.conf").write_text(
-        f"""roots.system=/tmp
+        f"""roots.system={root}
 roots.temporary=${{TMPDIR}}/builds
 roots.gate={gate}
 roots.build={root / 'build'}
@@ -280,7 +281,7 @@ class MergeGateLedgerTests(MergeGateFixture):
     def fixture_configuration(cls, directory: Path) -> dict[str, str]:
         environment = super().fixture_configuration(directory)
         pin_ledger_settings(directory, directory, Path("/tmp").resolve())
-        return {**environment, "STAFF_CONFIG": str(directory / "staff.conf")}
+        return {**environment, "STAFF_CONFIG": str(directory / "staff.conf"), SOCKET_ROOT_ENV: str(directory)}
 
     @override
     def install_fixture_runner(self) -> None:
