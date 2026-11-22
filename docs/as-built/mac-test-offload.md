@@ -377,7 +377,9 @@ A busy Mac waits in `waiting_mac`. The wait uses a Bash sleep and the current ta
 Each poll reads the runner result again. All other declines refuse the call with exit 2 and name the cause.
 A retry backoff does not refuse at once. `build_targets.py probe-backoff --target mac` probes the Mac one time.
 A pass clears the backoff and the failed probe mark, and the call waits for placement.
-A failed probe refuses the call as unreachable. Movable steps skip the Mac during the backoff, as before.
+A failed probe refuses the call as unreachable.
+For queued steps, the queue probes the Mac during an active backoff.
+A successful probe clears the backoff before the queue checks eligibility.
 A Mac-only call never runs on natedev, takes a local build token, enters memory admission, or starts a copy watcher.
 TERM, INT and HUP end the wait and record the caller's signal.
 

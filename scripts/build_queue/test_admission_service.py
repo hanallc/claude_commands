@@ -1222,6 +1222,39 @@ class LocalHoldPlacementTests(unittest.TestCase):
                     self.assertEqual(probe.call_count, 1)
                     self.assertIsInstance(eligibility.read_backoff(time.time(), "linux"), eligibility.ActiveBackoff)
 
+    def test_good_mac_probe_ends_active_backoff(self) -> None:
+        from scripts.build_queue.test_placement import placement_request
+        from scripts.build_targets import target_config
+        from scripts.mac_test import eligibility, offload
+
+        with AdmissionFixture() as fixture:
+            settings = fixture.root / "mac_test.conf"
+            _ = write_config_fixture(settings, "offload=on\nhost=fixture-mac\nlinux_only.hana=\nprobe_timeout_s=1\n")
+            target = target_config.SshTarget("mac", "macos", settings)
+            request = placement_request(fixture)
+            destination = request.constraints.candidates[0].destination
+            with mock.patch.object(target_config, "read_targets", return_value=(target,)), \
+                 mock.patch.object(eligibility, "repository_identity", return_value=eligibility.KnownRepository("hana")), \
+                 mock.patch.object(eligibility, "state_directory", return_value=fixture.root / "mac-state"), \
+                 mock.patch.object(offload.ProcessController, "capture") as probe:
+                offload.write_backoff(time.time() + 300, target.name)
+                path = eligibility.backoff_path(target.name)
+                deadline = path.read_text()
+                key = fixture.server.host_evidence_key(request, destination)
+                fixture.server.host_requests[key] = request
+
+                probe.return_value = offload.CommandOutput(255, "", "unreachable")
+                unavailable = fixture.server.read_provider_evidence(key)
+                assert isinstance(unavailable, placement.FreshHostEvidence)
+                self.assertEqual(unavailable.eligibility, placement.TemporaryExclusion("backoff"))
+                self.assertEqual(path.read_text(), deadline)
+
+                probe.return_value = offload.CommandOutput(0, "free_gib=1000\nhost=fixture-mac\nrc=0\n", "")
+                available = fixture.server.read_provider_evidence(key)
+                assert isinstance(available, placement.FreshHostEvidence)
+                self.assertEqual(available.eligibility, placement.AllowedHost())
+                self.assertFalse(path.exists())
+
     def test_busy_diagnostic_skips_an_older_kept_claim_and_names_the_live_holder(self) -> None:
         from scripts.build_queue.test_placement import placement_request
         from scripts.build_targets import build_targets, target_config

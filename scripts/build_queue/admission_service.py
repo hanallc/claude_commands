@@ -3345,6 +3345,14 @@ class AdmissionServer:
             return placement.FreshHostEvidence(key, self.clock.now(), "", placement.FixedExclusion("command"))
         else:
             if isinstance(target, target_config.SshTarget):
+                if target.platform == "macos":
+                    from scripts.mac_test import eligibility as ssh_eligibility, offload
+
+                    if isinstance(ssh_eligibility.read_backoff(time.time(), target.name), ssh_eligibility.ActiveBackoff):
+                        probe = offload.probe_reachability(offload.ProcessController(),
+                                                          ssh_eligibility.SshProbeSettings(configuration))
+                        if isinstance(probe, offload.ReachableHost):
+                            offload.record_reachable(target.name)
                 answer = build_targets.ssh_target_eligibility(target, Path(request.constraints.repository),
                     request.constraints.package, kind, target_config.ANY_ELIGIBLE_TARGET,
                     new_step=True, session=key.session, configuration=configuration)
