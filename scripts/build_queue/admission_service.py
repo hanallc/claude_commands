@@ -1727,6 +1727,8 @@ class AdmissionServer:
                        occupied_cargo_folders=occupied, verify_run_counts=self._verify_run_counts())
 
     def persist(self) -> None:
+        if self.stopped:
+            return
         now = self.clock.now()
         live_callers: dict[str, str] = {}
         for key, version in self.caller_versions.items():
@@ -2550,7 +2552,7 @@ class AdmissionServer:
         self.configuration = configuration
         self.pass_stale = False
         if isinstance(self.configuration, gate.UnusableAdmissionConfiguration):
-            if self._reload_if_sources_changed():
+            if self._reload_for_unusable_configuration(self.configuration):
                 return self.configuration
             self._advance_verify_run_waiters(self.configuration)
             self.local_hold_holders.clear()
@@ -4662,11 +4664,15 @@ done
 
     def handle_request(self, request: wire.Request, connection: Connection | NoConnection = NO_CONNECTION
                        ) -> list[wire.Reply]:
+        if self.stopped:
+            return []
         started, cpu_started = self.clock.monotonic(), time.thread_time()
         try:
-            return self._handle_request(request, connection)
+            replies = self._handle_request(request, connection)
+            return [] if self.stopped else replies
         finally:
-            self._log_request_timing(request, started, cpu_started)
+            if not self.stopped:
+                self._log_request_timing(request, started, cpu_started)
 
     def _log_request_timing(self, request: wire.Request, started: float, cpu_started: float) -> None:
         try:
@@ -4701,7 +4707,7 @@ done
             self._prune_verify_run_slots()
             configuration = (self._read_configuration() if isinstance(self.pending_configuration, NoPass)
                              else self.pending_configuration)
-            if isinstance(configuration, gate.UnusableAdmissionConfiguration) and self._reload_if_sources_changed():
+            if self._reload_for_unusable_configuration(configuration):
                 return []
             self._advance_verify_run_waiters(configuration)
             reply = self._verify_run_slot(request, configuration)
@@ -4738,6 +4744,8 @@ done
         if isinstance(request, (wire.ViewRequest, wire.ExplainRequest, wire.MineRequest)):
             if not isinstance(self.pending_configuration, NoPass):
                 _ = self.run_pass()
+            elif self._reload_for_unusable_configuration(self.configuration):
+                return []
             elif self.pass_stale and isinstance(self.last_inputs, records.QueueInputs):
                 if isinstance(self.last_policy, records.AdmissionPolicy):
                     self.last_inputs = self._inputs_with_current_slots(self.last_inputs)
@@ -4865,7 +4873,7 @@ done
 
     def _finish_priority_roster(self) -> None:
         pending = self.pending_priority
-        if not isinstance(pending, PendingPriorityRoster) or not pending.result.done():
+        if self.stopped or not isinstance(pending, PendingPriorityRoster) or not pending.result.done():
             return
         self.pending_priority = NoPendingPriorityRoster()
         self._complete_queue_change(pending.change,
@@ -4873,7 +4881,7 @@ done
         self._continue_queue_changes()
 
     def _continue_queue_changes(self) -> None:
-        while self.queue_changes and isinstance(self.pending_priority, NoPendingPriorityRoster):
+        while not self.stopped and self.queue_changes and isinstance(self.pending_priority, NoPendingPriorityRoster):
             change = self.queue_changes.popleft()
             self._complete_queue_change(change,
                 lambda: self._submit_queue_change(change.request, NO_CONNECTION))
@@ -4889,6 +4897,8 @@ done
                 if connection.socket.fileno() >= 0:
                     self._refuse_connection(connection, str(error))
         else:
+            if self.stopped:
+                return
             self._reply_to_queue_change(change, replies)
 
     def _reply_to_queue_change(self, change: OrderedQueueChange, replies: list[wire.Reply]) -> None:
@@ -4979,7 +4989,7 @@ done
             self._close_connection(waiting.connection)
 
     def _send(self, connection: Connection, reply: wire.Reply) -> None:
-        if connection.finished:
+        if self.stopped or connection.finished:
             return
         connection.sending += self.reply_bytes(reply, version=connection.version)
         connection.finished = not isinstance(reply, (wire.Wait, wire.BuildHistoryReply, wire.VerifyRunSlotWaiting))
@@ -5046,6 +5056,8 @@ done
         self.parked_placements = [item for item in self.parked_placements if item.connection is not connection]
 
     def _disconnect(self, connection: Connection) -> None:
+        if self.stopped:
+            return
         detached = self._detach_admission(connection)
         self._close_connection(connection)
         if detached:
@@ -5074,6 +5086,8 @@ done
         return changed
 
     def _refuse_connection(self, connection: Connection, reason: str) -> None:
+        if self.stopped:
+            return
         self._drop_deferred_requests(connection)
         connection.received = b""
         connection.sending = b""
@@ -5097,16 +5111,21 @@ done
             if persist_change:
                 self.persist()
 
-    def _read_request(self, connection: Connection) -> None:
+    def _refuse_oversized_request(self, limit: int) -> None:
         config = (self.configuration if isinstance(self.pending_configuration, NoPass)
                   else self.pending_configuration)
+        if isinstance(self.last_usable_configuration, NoPass) and isinstance(config, gate.UnusableAdmissionConfiguration):
+            if self._reload_for_unusable_configuration(config):
+                return
+            raise ValueError(config.reason)
+        raise ValueError(f"admission request exceeds {limit} bytes")
+
+    def _read_request(self, connection: Connection) -> None:
         last = self.last_usable_configuration
         request_limit = last.request_max_bytes if isinstance(last, records.MemoryConfig) else wire.CLEANUP_REQUEST_MAX_BYTES
         limit = max(request_limit, wire.CLEANUP_REQUEST_MAX_BYTES)
-        reason = (config.reason if isinstance(config, gate.UnusableAdmissionConfiguration) and isinstance(last, NoPass)
-                  else f"admission request exceeds {limit} bytes")
         if len(connection.received) > limit:
-            raise ValueError(reason)
+            return self._refuse_oversized_request(limit)
         while not connection.finished:
             chunk = connection.socket.recv(min(65536, limit + 1 - len(connection.received)))
             if not chunk:
@@ -5114,7 +5133,7 @@ done
                 return
             connection.received += chunk
             if len(connection.received) > limit:
-                raise ValueError(reason)
+                return self._refuse_oversized_request(limit)
             if b"\n" in connection.received:
                 line, _, tail = connection.received.partition(b"\n")
                 if tail:
@@ -5122,7 +5141,7 @@ done
                 connection.version, request = wire.parse_request_envelope(line)
                 cleanup = isinstance(request, (wire.ReleaseRequest, wire.TokenWaitRequest))
                 if len(line) + 1 > (wire.CLEANUP_REQUEST_MAX_BYTES if cleanup else request_limit):
-                    raise ValueError(reason)
+                    return self._refuse_oversized_request(limit)
                 if not isinstance(request, wire.BuildHistoryRequest):
                     if not (isinstance(connection.request, NoRequest) or _refreshes(connection.request, request)):
                         raise ValueError("one request for admission per connection")
@@ -5145,10 +5164,12 @@ done
                 raise ValueError(f"admission request exceeds {request_limit} bytes")
 
     def _connection_event(self, connection: Connection, events: int) -> None:
+        if self.stopped:
+            return
         try:
             if events & select.EPOLLIN and not connection.finished:
                 self._read_request(connection)
-                if connection.socket.fileno() < 0:
+                if self.stopped or connection.socket.fileno() < 0:
                     return
             # Send the reply before a later admission pass can delay it.
             if connection.sending and events & (select.EPOLLIN | select.EPOLLOUT):
@@ -5216,7 +5237,10 @@ done
                 else "STOPPING=1")
         self.stopped = True
 
-    def _reload_if_sources_changed(self) -> bool:
+    def _reload_for_unusable_configuration(self,
+            configuration: gate.UsableAdmissionConfiguration | gate.UnusableAdmissionConfiguration) -> bool:
+        if not isinstance(configuration, gate.UnusableAdmissionConfiguration):
+            return False
         _ = self._record_source_changes()
         if not self.changed_sources:
             return False
@@ -5295,6 +5319,8 @@ done
             print(f"memory admission: cannot clear outage alert: {error}", file=sys.stderr)
 
     def run_once(self, timeout: float = 0) -> None:
+        if self.stopped:
+            return
         self.start()
         now = self.clock.monotonic()
         due = max(self.next_pass, self._pass_allowed_at())
@@ -5377,8 +5403,9 @@ done
             return
         if self.clock.monotonic() >= self.next_source_check:
             self._check_sources()
-        self._check_outage_alert()
-        _notify("WATCHDOG=1")
+        if not self.stopped:
+            self._check_outage_alert()
+            _notify("WATCHDOG=1")
 
     def _receive_requests(self, ready: dict[int, ConnectionReadiness], listener_ready: bool) -> None:
         readable = [(descriptor, connection) for descriptor, connection in self.connections.items()

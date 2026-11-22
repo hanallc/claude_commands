@@ -1026,8 +1026,10 @@ The main loop clears the outage claim once after `silence_seconds` of continuous
 It uses the last usable configuration and retries a failed clear on a later loop.
 A shorter service start preserves the claim.
 Scheduled source checks start after the first usable configuration read.
-Each pass with an unusable configuration checks the watched sources before it refuses waiters.
+The service checks the watched sources before it returns an unusable configuration error.
 If a source change is pending, the service saves its state and reloads immediately without refusing waiters.
+After the reload decision, the service sends no replies and writes no more queue state.
+Clients can retry unacknowledged priority changes after the service restarts.
 The journal gives the unusable configuration as the reason for skipping the settle interval.
 If no source change is pending, the pass preserves the next scheduled check time.
 With a usable configuration, the service waits for the settle interval before it reloads.

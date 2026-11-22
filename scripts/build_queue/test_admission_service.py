@@ -11,7 +11,8 @@ from scripts.build_queue.scope_activity import LiveBuildRun, NoLiveBuildRun, Sco
 
 from scripts.lint.memory_test_support import admission_configuration_fixture, admission_policy_fixture, fake_memory_readings, write_pressure_reading
 
-from collections.abc import Callable, Generator
+from collections.abc import Callable, Generator, Mapping
+from concurrent.futures import Future
 from contextlib import contextmanager, redirect_stderr, redirect_stdout, suppress
 from dataclasses import replace
 from datetime import UTC, datetime
@@ -2830,6 +2831,42 @@ class AdmissionCallerPersistenceTests(unittest.TestCase):
 
 
 class PendingPriorityTests(unittest.TestCase):
+    def test_priority_reload_keeps_later_changes_queued_without_replying(self) -> None:
+        with AdmissionFixture() as fixture:
+            server = fixture.server
+            first = wire.PrioritySetRequest("set-before-reload", "chosen", "urgent", "director")
+            later = wire.PriorityClearRequest("clear-after-reload", "director")
+            connection_socket, peer = socket.socketpair()
+            with connection_socket, peer:
+                connection = service.Connection(connection_socket)
+                server.epoll.register(connection_socket.fileno(), select.EPOLLIN)
+                labels: Future[Mapping[str, gate.UnitMembership]] = Future()
+                labels.set_result({"worker": UnitLabels("worker", unit="chosen")})
+                server.pending_priority = service.PendingPriorityRoster(service.OrderedQueueChange(first, [connection]), labels)
+                queued = service.OrderedQueueChange(later, [connection])
+                server.queue_changes.append(queued)
+
+                source = fixture.root / "loaded.py"
+                _ = source.write_text("old")
+                stamp = source.stat()
+                server.sources = {source: (stamp.st_ino, stamp.st_mtime_ns)}
+                source.unlink()
+                config = fixture.root / "build_admission.conf"
+                write_memory_config(config, estimate_refresh_seconds="invalid")
+                server.run_once()
+
+                self.assertTrue(server.stopped)
+                self.assertEqual(connection.sending, b"")
+                self.assertEqual(list(server.queue_changes), [queued])
+                saved = service.read_state(fixture.state_dir)
+                self.assertEqual(saved.ledger[first.request_id].reply, wire.Ok())
+                self.assertNotIn(later.request_id, saved.ledger)
+                self.assertIsInstance(saved.priority, records.QueuePriority)
+            write_memory_config(config)
+            fixture.restart()
+            self.assertEqual(fixture.server.handle_request(first), [wire.Ok()])
+            self.assertEqual(fixture.server.handle_request(later), [wire.Ok()])
+
     def test_priority_labels_use_recorded_units_without_reading_transcripts(self) -> None:
         from scripts.message import roster, unit_labels
         from scripts.production import staff
@@ -6536,6 +6573,58 @@ class ServiceTests(unittest.TestCase):
             self.assertFalse(fixture.server.waiters)
             self.assertFalse(fixture.server.stopped)
 
+    def test_cached_configuration_queries_check_sources_before_refusing(self) -> None:
+        for request in (wire.ViewRequest(), wire.ExplainRequest(), wire.MineRequest("fixture")):
+            with self.subTest(request=type(request).__name__), AdmissionFixture() as fixture:
+                server = fixture.server
+                source = fixture.root / "loaded.py"
+                _ = source.write_text("old")
+                stamp = source.stat()
+                server.sources = {source: (stamp.st_ino, stamp.st_mtime_ns)}
+                write_memory_config(fixture.root / "build_admission.conf", estimate_refresh_seconds="invalid")
+                server.run_once()
+                self.assertIsInstance(server.pending_configuration, service.NoPass)
+                refusal, = server.handle_request(request)
+                self.assertIsInstance(refusal, wire.Refused)
+                self.assertFalse(server.stopped)
+
+                source.unlink()
+                self.assertEqual(server.handle_request(request), [])
+                self.assertTrue(server.stopped)
+                self.assertEqual(server.changed_sources, {source})
+
+    def test_connection_reload_keeps_buffered_reply_and_waiter_until_close(self) -> None:
+        for peer_reads in (True, False):
+            with self.subTest(peer_reads=peer_reads), AdmissionFixture() as fixture:
+                server = fixture.server
+                fixture.hold_starts()
+                request = fixture.request()
+                peer = fixture.connect(request)
+                waiting, = peer.replies()
+                self.assertIsInstance(waiting, wire.Wait)
+                connection = server.waiters[request.episode].connection
+                assert isinstance(connection, service.Connection)
+                buffered = server.reply_bytes(waiting, version=connection.version)
+                connection.sending = buffered
+                source = fixture.root / "loaded.py"
+                _ = source.write_text("old")
+                stamp = source.stat()
+                server.sources = {source: (stamp.st_ino, stamp.st_mtime_ns)}
+                source.unlink()
+                write_memory_config(fixture.root / "build_admission.conf", estimate_refresh_seconds="invalid")
+                peer.socket.sendall(wire.encode_request(request).encode())
+                if not peer_reads:
+                    peer.socket.shutdown(socket.SHUT_RD)
+
+                server.run_once()
+
+                self.assertTrue(server.stopped)
+                self.assertEqual(connection.sending, buffered)
+                if peer_reads:
+                    self.assertFalse(select.select([peer.socket], [], [], 0)[0])
+                self.assertIn(request.episode, server.waiters)
+                self.assertEqual(len(service.read_state(fixture.state_dir).places), 1)
+
     def test_source_watch_stops_during_repeated_unusable_configuration_passes(self) -> None:
         with AdmissionFixture() as fixture:
             check_seconds = 1
@@ -6552,13 +6641,20 @@ class ServiceTests(unittest.TestCase):
             server.sources = {source: (stamp.st_ino, stamp.st_mtime_ns)}
 
             write_memory_config(fixture.root / "build_admission.conf", estimate_refresh_seconds="invalid")
-            source.unlink()
-            for _turn in range(int((check_seconds + settle_seconds) / pass_seconds)):
+            deadline = server.next_source_check
+            for _turn in range(int(check_seconds / pass_seconds) - 1):
                 fixture.clock.advance(pass_seconds)
                 server.next_pass = fixture.clock.monotonic()
                 server.run_once(0)
                 self.assertEqual(server.last_pass_started, fixture.clock.monotonic())
                 self.assertIsInstance(server.configuration, gate.UnusableAdmissionConfiguration)
+                self.assertEqual(server.next_source_check, deadline)
+                self.assertFalse(server.stopped)
+
+            source.unlink()
+            for _turn in range(int((check_seconds + settle_seconds) / pass_seconds)):
+                fixture.clock.advance(pass_seconds)
+                server.run_once(0)
                 if server.stopped:
                     break
 
