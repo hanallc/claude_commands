@@ -890,6 +890,8 @@ run() {
     if [[ "$status" != 0 && -n "${BUILDLOG_CHECK_FAILED_FILE:-}" && -f "$BUILDLOG_CHECK_FAILED_FILE" ]]; then
         exit "$status"
     fi
+    # The EXIT trap reads this status: a return with it is a step failure.
+    LAST_STEP_STATUS=$status
     return "$status"
 }
 
@@ -1945,7 +1947,7 @@ if [[ "$CMD" == test ]]; then
     export VERIFY_TEST_ENV_NAMES="${MAC_ENV_NAMES[*]}"
 fi
 RUN_LOG=""
-VERIFY_STOPPED_AT=""
+LAST_STEP_STATUS=""
 RUN_LOG_PIDS=()
 VERDICT_KEY=""
 VERDICT_TREE_KEY=""
@@ -2108,7 +2110,11 @@ start_tree_watch() {
     [[ -z "$TREE_WATCH_PID" ]] || return 0
     TREE_WATCH_DIR="$(verify_helper "$BUILD_FOLDERS_SCRIPT" tool --tool verify-tree --owner-pid "$$")"
     set_verdict_keys --watch-start "$TREE_WATCH_DIR/start"
-    [[ -s "$TREE_WATCH_DIR/start" ]] || { verify_helper "$BUILD_FOLDERS_SCRIPT" remove "$TREE_WATCH_DIR"; TREE_WATCH_DIR=""; return 0; }
+    if [[ ! -s "$TREE_WATCH_DIR/start" ]]; then
+        run_cleanup "tree-watch folder removal" verify_helper "$BUILD_FOLDERS_SCRIPT" remove "$TREE_WATCH_DIR"
+        TREE_WATCH_DIR=""
+        return 0
+    fi
     local scope=()
     if [[ "$CMD" == test ]]; then if [[ -n "${ARGS[0]}" ]]; then scope=(--package "${ARGS[0]}"); fi; fi
     trap 'cancel_tree_run' USR2
@@ -2293,7 +2299,7 @@ forward_mac_runner_signal() {
     if [[ "$signal_name" == INT ]]; then signal_name=TERM; fi
     find_mac_runner_pid
     stop_tree_watch
-    [[ -z "$TREE_WATCH_DIR" ]] || verify_helper "$BUILD_FOLDERS_SCRIPT" remove "$TREE_WATCH_DIR"
+    [[ -z "$TREE_WATCH_DIR" ]] || run_cleanup "tree-watch folder removal" verify_helper "$BUILD_FOLDERS_SCRIPT" remove "$TREE_WATCH_DIR"
     TREE_WATCH_DIR=""
     trap - INT TERM HUP
     if [[ -n "$runner_pid" ]]; then
@@ -3557,8 +3563,7 @@ finish_run() {
         error) lint_failure_is_the_tree && kind=fail ;;
     esac
     note_event "${outcome}" "${RUN_STARTED}" "${wall}" "${build:-0}" 0 "${code}"
-    # A command that failed outside an exit gives no verdict. Its run log stays as the evidence.
-    if [[ -z "${VERIFY_STOPPED_AT}" ]] && { [[ -z "${kind}" || -z "${CACHE_DIR}" ]] || ! cache_record "${kind}" "${repeat}"; }; then
+    if [[ -z "${kind}" || -z "${CACHE_DIR}" ]] || ! cache_record "${kind}" "${repeat}"; then
         rm -f "${RUN_LOG}"
     fi
     RUN_LOG=""
@@ -4368,16 +4373,43 @@ verify_cleanup() {
     remove_step_record
     [[ -z "${VERIFY_HELPER_LOCK:-}" ]] || rm -f -- "$VERIFY_HELPER_LOCK"
 }
+# A failed step returns from run() with the status it recorded, and errexit
+# stops verify.sh at that return. Any other failed command that is not an
+# exit is an unexpected stop, such as a failed helper. It gives no verdict:
+# report it, and keep its run log as stopped.log in the cache folder. Each
+# stop replaces the older log, and finish_run sees no run log to record.
+report_stop() {
+    local command=$1 caller=$2 where kept=""
+    case "$command" in
+        exit|"exit "*) return 0 ;;
+        return|"return "*)
+            [[ "$EXIT_STATUS" != "$LAST_STEP_STATUS" ]] || return 0
+            where=" in $caller"
+            [[ "$caller" != main ]] || where=""
+            ;;
+        *) where=": $command" ;;
+    esac
+    if [[ -n "$RUN_LOG" ]]; then
+        if [[ -n "$CACHE_DIR" ]] && mv -f -- "$RUN_LOG" "$CACHE_DIR/stopped.log"; then
+            kept="; run log kept: $CACHE_DIR/stopped.log"
+        else
+            rm -f -- "$RUN_LOG"
+        fi
+        RUN_LOG=""
+    fi
+    printf 'verify.sh: stopped by a failed command (status %s)%s%s\n' "$EXIT_STATUS" "$where" "$kept" >&2
+}
+
 # EXIT alone would report success for a failed cargo run, so branch on the
 # status the trap receives; a lint failure record keeps it. $2 is the command
 # that ended the shell. An untrapped fatal signal, such as SIGPIPE after a
 # hold stop ends the run-log readers, runs this trap with the status of the
 # last command, often 0. Only an exit command completes a run, so any other
 # command records the run as interrupted (status 128: the signal is
-# unknown here) and writes no pass. A non-zero status from any other command,
-# most often an errexit stop, gives no verdict: the trap names that command,
-# and finish_run keeps the run log and writes no record. Cleanup is best effort: errexit is off, so one
-# failed cleanup command does not end the trap with its status.
+# unknown here) and writes no pass. A failed step reaches this trap as an
+# exit or as the return of run(); report_stop handles every other failed
+# command. Cleanup is best effort: errexit is off, so one failed cleanup
+# command does not end the trap with its status.
 verify_exit() {
     EXIT_STATUS=$1
     set +e
@@ -4388,11 +4420,7 @@ verify_exit() {
     elif (( EXIT_STATUS == 0 )); then
         verify_cleanup completed
     else
-        if [[ "$2" != exit && "$2" != "exit "* ]]; then
-            VERIFY_STOPPED_AT=$2
-            printf 'verify.sh: stopped by a failed command (status %s): %s%s\n' \
-                "$EXIT_STATUS" "$2" "${RUN_LOG:+; run log kept: $RUN_LOG}" >&2
-        fi
+        report_stop "$2" "${FUNCNAME[1]:-main}"
         verify_cleanup error
     fi
     finish_verify_run "$EXIT_STATUS"
@@ -4597,7 +4625,8 @@ run_lint_held_sequence() {
     # Format locally; the Mac judges the resulting tree without fixes.
     lint_copy_begin
     lint_rewrite fmt_cargo --all
-    workspace_taplo
+    # The subshell hides run()'s status, so exit with the step failure here.
+    workspace_taplo || exit "$?"
     lint_copy_return || exit 1
     workspace_taplo --check || exit "$?"
     lint_status=0
