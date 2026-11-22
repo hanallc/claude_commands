@@ -1956,6 +1956,32 @@ class RestartTests(RestartTestCase):
         self.assertEqual(output.getvalue().splitlines(), [
             f"{log_path}  agents stop --all runs in the background. Read its report in this log."])
 
+    def test_parent_rereads_a_late_child_claim_after_enospc(self) -> None:
+        row = self.rows[0]
+        child_report = "agents stop --all: 1 of 1 sessions stopped.\nNothing for you to do.\n"
+
+        def fail_after_child_claim(claim: Path, _content: str) -> bool:
+            self.assertFalse(claim.exists())
+            _ = claim.write_text(f"{os.getpid() + 1}\n")
+            log = claim.with_suffix(".log")
+            with log.open("a") as stream:
+                _ = stream.write(child_report)
+            raise OSError(errno.ENOSPC, "The claim folder is full")
+
+        with (patch.object(restart, "live_rows", return_value=restart.CompleteLiveRows([row])),
+              patch.object(restart, "stop_row") as stop,
+              patch.object(stop_resume, "detach", return_value=self.root) as launch,
+              patch.object(restart, "create_text_atomic", side_effect=fail_after_child_claim) as claim,
+              patch.dict(os.environ, {"CODEX_THREAD_ID": str(row.current_session)}),
+              redirect_stdout(io.StringIO()) as output):
+            self.assertEqual(shutdown.main(["stop", "--all"]), 0)
+        claim.assert_called_once()
+        stop.assert_not_called()
+        log = cast(Path, launch.call_args.kwargs["log"])
+        self.assertEqual(log.read_text(), f"{log}\n{child_report}")
+        self.assertEqual(output.getvalue().splitlines(), [
+            f"{log}  agents stop --all runs in the background. Read its report in this log."])
+
     def test_detached_stop_reports_failed_readiness_in_the_log(self) -> None:
         rows = list(self.rows[:2])
         address = str(self.root / "notify-refused")
@@ -2054,13 +2080,13 @@ class RestartTests(RestartTestCase):
                 self.assert_detached_fault_report(step, "First session error", (), second_detail="Second session error")
         for number in (signal.SIGTERM, signal.SIGQUIT):
             with self.subTest(step="readiness", number=number):
-                self.assert_detached_signal_report(number)
-        for operation in ("stop", "restart"):
-            with self.subTest(step="collection", operation=operation):
-                self.assert_detached_signal_report(signal.SIGTERM, operation=operation)
+                self.assert_detached_signal_report(number, step="readiness")
+        for step in ("claim", "stop", "record save"):
+            with self.subTest(step=step):
+                self.assert_detached_signal_report(signal.SIGTERM, step=step)
 
-    def detached_fault_arguments(self, command: str, *, resuming: bool = False) -> list[str]:
-        rows = self.rows[:2]
+    def detached_fault_arguments(self, command: str, *, resuming: bool = False, count: int = 2) -> list[str]:
+        rows = self.rows[:count]
         data: restart.DetachedReport = {
             "retry": f"{command} --all" if resuming else command,
             "targets": {row.id: row.name for row in rows},
@@ -2071,29 +2097,47 @@ class RestartTests(RestartTestCase):
                 "--parent-report", json.dumps(data)]
 
     def assert_detached_signal_report(self, number: signal.Signals, *,
-                                      operation: Literal["stop", "restart"] | None = None) -> None:
-        path = self.root / f"{number.name}-{operation or 'readiness'}.log"
+                                      step: Literal["claim", "readiness", "stop", "record save"]) -> None:
+        path = self.root / f"{number.name}-{step}.log"
         script = """\
+import errno
 import json
 import os
 import resource
 import runpy
+import signal
 import sys
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
+from pathlib import Path
 from threading import Event
 
 number = int(sys.argv.pop(1))
-operation = sys.argv.pop(1)
+step = sys.argv.pop(1)
 ready_fd = int(sys.argv[sys.argv.index('--ready-fd') + 1])
 write = os.write
 resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
 
-def interrupt():
-    os.kill(os.getpid(), number)
-    raise RuntimeError('The signal did not interrupt the command')
+if step == 'claim':
+    claim = Path(sys.argv[sys.argv.index('--log') + 1]).with_suffix('.claim')
+    link = os.link
+    read_bytes = Path.read_bytes
+
+    def link_claim(source, destination):
+        link(source, destination)
+        if destination == claim:
+            signal.raise_signal(number)
+
+    def read_claim(path):
+        if path == claim:
+            raise OSError(errno.EIO, 'Could not read the claim')
+        return read_bytes(path)
+
+    os.link = link_claim
+    Path.read_bytes = read_claim
 
 def configure_collection():
+    from scripts.agents import shutdown_record
     from scripts.herdr import herdr
     from scripts.production import staff
 
@@ -2104,47 +2148,79 @@ def configure_collection():
                                unit_type=staff.UnitDetails('direct')) for key, name in data['targets'].items())
     record = staff.StaffSnapshot(rows)
     pending = Event()
+    release = Event()
+    launched = []
+    save = shutdown_record.remove_started
 
-    def hold_first(row):
-        if row.id == rows[0].id:
-            pending.set()
-            Event().wait()
+    def hold_task():
+        pending.set()
+        if not release.wait(5):
+            raise RuntimeError('The signal probe did not release the task')
+        if not shutdown_record.active():
+            raise RuntimeError('The activity lock released before the task ended')
 
     def stop_row(row, *args, **kwargs):
-        if operation == 'stop':
-            hold_first(row)
+        if step == 'stop':
+            if row.id == rows[1].id:
+                hold_task()
+            if row.id == rows[2].id:
+                raise RuntimeError('A new stop began after the signal')
         return True
 
     def start_row(row, *args, **kwargs):
-        hold_first(row)
+        if step != 'record save' or row.id != rows[0].id:
+            raise RuntimeError('A new resume began after the signal')
+        launched.append(row.id)
         return ''
+
+    def remove_started(ids):
+        if step == 'record save' and ids == [rows[0].id]:
+            if launched != [rows[0].id]:
+                raise RuntimeError('The resume did not finish before the record save')
+            hold_task()
+        save(ids)
 
     class CollectionPool(ThreadPoolExecutor):
         count = 0
 
         def __init__(self, **kwargs):
-            super().__init__(**kwargs)
             CollectionPool.count += 1
-            self.inject = CollectionPool.count == (1 if operation == 'stop' else 2)
+            self.inject = CollectionPool.count == (1 if step == 'stop' else 2)
+            if self.inject:
+                kwargs['max_workers'] = 1
+            super().__init__(**kwargs)
             self.futures = []
 
         def submit(self, fn, *args):
             future = super().submit(fn, *args)
             if self.inject:
                 self.futures.append(future)
-                if len(self.futures) == 1:
-                    future.result = self.interrupt_collection
-            return future
+                if len(self.futures) == (2 if step == 'stop' else 1):
+                    result = future.result
 
-        def interrupt_collection(self):
-            self.futures[1].result(timeout=5)
-            if not pending.wait(5) or self.futures[0].done():
-                raise RuntimeError('The first session did not remain in progress')
-            interrupt()
+                    def signal_before_result():
+                        try:
+                            if not pending.wait(5) or future.done():
+                                raise RuntimeError('The selected task did not remain in progress')
+                            if self.futures[-1].running() or self.futures[-1].done():
+                                raise RuntimeError('The last task did not remain queued')
+                            if step == 'stop' and not self.futures[0].done():
+                                raise RuntimeError('The first stop did not finish')
+                            signal.raise_signal(number)
+                            if not shutdown_record.active():
+                                raise RuntimeError('The activity lock released after the signal')
+                        finally:
+                            release.set()
+                        return result(timeout=5)
+
+                    future.result = signal_before_result
+            return future
 
     staff.initial_snapshot = lambda: record
     staff.row_operation = lambda *args: nullcontext()
     herdr.restore_server = lambda *args, **kwargs: None
+    herdr.Herdr.sort_tabs = lambda self: None
+    shutdown_record.remove_started = remove_started
     restart._observations = lambda *args: restart.RestartObservations(herdr.CodexConversations({}, ()), {}, frozenset(), {})
     restart.live_rows = lambda *args, **kwargs: restart.CompleteLiveRows(list(rows))
     restart.stop_row = stop_row
@@ -2154,33 +2230,48 @@ def configure_collection():
 def on_ready(fd, data):
     if fd == ready_fd:
         os.write = write
-        if not operation:
-            interrupt()
-        configure_collection()
+        if step == 'readiness':
+            signal.raise_signal(number)
+        elif step in ('stop', 'record save'):
+            configure_collection()
     return write(fd, data)
 
 os.write = on_ready
 runpy.run_module('scripts.agents.restart', run_name='__main__', alter_sys=True)
 """
-        resuming = operation == "restart"
+        resuming = step == "record save"
         command = "agents restart" if resuming else "agents stop --all"
         state = "back" if resuming else "stopped"
+        count = 3 if step == "stop" else 2
+        rows = self.rows[:count]
+        completed = 1 if resuming else 2 if step == "stop" else 0
+        shutdown_record.save([])
         read_fd, ready_fd = os.pipe()
         with os.fdopen(read_fd, "rb"), os.fdopen(ready_fd, "wb"), path.open("ab") as log:
             _ = log.write(f"{path}\n".encode())
             log.flush()
-            result = subprocess.run([sys.executable, "-c", script, str(number), operation or "",
+            result = subprocess.run([sys.executable, "-c", script, str(number), step,
                                      "--log", str(path), "--log-fd", str(log.fileno()), "--ready-fd", str(ready_fd),
-                                     *self.detached_fault_arguments(command, resuming=resuming)],
+                                     *self.detached_fault_arguments(command, resuming=resuming, count=count)],
                                     cwd=Path(restart.__file__).resolve().parents[2],
                                     pass_fds=(ready_fd, log.fileno()), capture_output=True, timeout=10, check=False)
         self.assertEqual(result.returncode, -number, result.stderr.decode())
         self.assertEqual(result.stdout, b"")
         self.assertEqual(result.stderr, b"")
-        detail = f"The detached command received {number.name}"
-        recovery = ("Nate sends this error to the efficiency unit." if operation else
-                    "Nate runs agents stop --all there.")
-        self.assert_detached_fault_log(path, command, state, (1,) if operation else (), (detail, detail), recovery)
+        lines = path.read_text().splitlines()
+        self.assertEqual(lines[0], str(path))
+        self.assertEqual(lines.count(f"{command}: {completed} of {count} sessions {state}."), 1)
+        self.assertIn(f"{command}: The detached command received {number.name}.", lines)
+        for row in rows[:completed]:
+            self.assertIn(f"{row.name}: The session is {state}.", lines)
+        for row in rows[completed:]:
+            retry = f"agents restart --only {row.id}" if resuming else command
+            step_text = f"Nate opens a plain terminal without a staff session. Nate runs {retry} there."
+            self.assertIn(f"{row.name}: not started: the restart was stopped. {step_text}", lines)
+            self.assertIn(f"Nate runs {retry} there.", lines[-1])
+        self.assertFalse(shutdown_record.active())
+        pending = rows[completed:] if resuming else rows[:completed]
+        self.assertEqual(shutdown_record.read(), [str(row.id) for row in pending])
 
     def assert_detached_fault_report(self, step: str, detail: str, completed: tuple[int, ...], *,
                                      second_detail: str | None = None) -> None:
