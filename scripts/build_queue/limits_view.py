@@ -155,6 +155,7 @@ class Cell:
     other: list[str] = field(default_factory=list[str])
     waits: WaitGroups = field(default_factory=dict[str, WaitGroup])
     note: str = ""
+    show_marks: bool = True
 
 
 @dataclass
@@ -368,7 +369,7 @@ class HanaRoute:
 
 @dataclass(frozen=True)
 class AwsRoutes:
-    hana: tuple[HanaRoute, ...] = ()
+    hana: tuple[HanaRoute, ...] | Literal[ReadingState.UNAVAILABLE] = ()
     targets: frozenset[str] = field(default_factory=frozenset[str])
 
 
@@ -380,13 +381,14 @@ def aws_routes() -> AwsRoutes | ReadingState:
     except (OSError, ValueError):
         return ReadingState.UNAVAILABLE
     configured = {target.name: target for target in targets_read}
+    route_read_failed = False
     for name in filter(None, (value.strip() for value in pinned.split(","))):
         if name not in configured:
             try:
                 configured.update((target.name, target) for target in target_config.read_targets(
                     selected=name, configuration=settings, purpose=target_config.RegistryRead.PLACEMENT))
             except (OSError, ValueError):
-                continue
+                route_read_failed = True
     hana: list[HanaRoute] = []
     aws: set[str] = set()
     for target in configured.values():
@@ -401,8 +403,8 @@ def aws_routes() -> AwsRoutes | ReadingState:
                 if isinstance(route, hana_placement.EnabledHanaRoute):
                     hana.append(HanaRoute(target.name, transport, route))
         except (OSError, ValueError, KeyError):
-            continue
-    return AwsRoutes(tuple(hana), frozenset(aws))
+            route_read_failed = True
+    return AwsRoutes(ReadingState.UNAVAILABLE if route_read_failed else tuple(hana), frozenset(aws))
 
 
 def read_hana_occupancy(routes: tuple[HanaRoute, ...]) -> dict[HanaRoute, int | ReadingState]:
@@ -447,10 +449,11 @@ def background(history: frozenset[str] | ReadingState, money: Metric | ReadingSt
                origins: Origins | ReadingState) -> Background:
     """Keep the facts available from each independent source."""
     aws = AwsRoutes() if isinstance(routes, ReadingState) else routes
-    hana = (routes if isinstance(routes, ReadingState) else
+    hana_routes = routes if isinstance(routes, ReadingState) else routes.hana
+    hana = (hana_routes if isinstance(hana_routes, ReadingState) else
             tuple(HanaCapacity(route.settings.repository_key, route.settings.max_steps,
                                occupancy if isinstance(occupancy, ReadingState)
-                               else occupancy.get(route, ReadingState.OMITTED)) for route in routes.hana))
+                               else occupancy.get(route, ReadingState.OMITTED)) for route in hana_routes))
     spend_metric = Metric("money", None, None, "USD", unreadable=money is ReadingState.UNAVAILABLE)
     return Background(history, spend_metric if isinstance(money, ReadingState) else money,
                       cloud_slots, hana, aws.targets,
@@ -460,8 +463,9 @@ def background(history: frozenset[str] | ReadingState, money: Metric | ReadingSt
 def background_once(now: float, reading: records.QueueRead) -> Background:
     """Read the same sources for a one-time page."""
     routes = safe_read(aws_routes)
-    occupancy = (safe_read(lambda: read_hana_occupancy(routes.hana))
-                 if isinstance(routes, AwsRoutes) else ReadingState.OMITTED)
+    hana_routes = routes.hana if isinstance(routes, AwsRoutes) else routes
+    occupancy = (safe_read(lambda: read_hana_occupancy(hana_routes))
+                 if isinstance(hana_routes, tuple) else ReadingState.OMITTED)
     return background(safe_read(lambda: read_history(now)), safe_read(lambda: spending(now)),
                       safe_read(read_cloud_slots), routes, occupancy,
                       safe_read(lambda: Origins().refresh({use.folder for use in active_checkouts(reading)})))
@@ -528,9 +532,10 @@ class LimitsRefresh:
 
         day = datetime.fromtimestamp(wall, UTC).date()
         routes = self.routes.current(now, self.token_interval, aws_routes)
+        hana_routes = routes.hana if isinstance(routes, AwsRoutes) else routes
         occupancy = (self.hana_occupancy.current(now, self.token_interval,
-                      lambda: read_hana_occupancy(routes.hana), key=routes.hana)
-                     if isinstance(routes, AwsRoutes) and routes.hana else ReadingState.OMITTED)
+                      lambda: read_hana_occupancy(hana_routes), key=hana_routes)
+                     if isinstance(hana_routes, tuple) and hana_routes else ReadingState.OMITTED)
         return background(
             self.history.current(now, self.report_interval, lambda: read_history(wall)),
             self.money.current(now, self.report_interval, lambda: spending(wall), key=day),
@@ -773,6 +778,7 @@ def build_limits(reading: records.QueueRead, snapshots: target_availability.Snap
 
     cloud_slots = saved.cloud_slots
     cloud_used = cloud_waiting = 0
+    cloud_origin_missing = False
     if isinstance(reading, wire.CloudQueueRead) and reading.cloud:
         cloud_slots = reading.cloud_slots
         for cloud in reading.cloud:
@@ -783,16 +789,19 @@ def build_limits(reading: records.QueueRead, snapshots: target_availability.Snap
                 continue
             cloud_used += 1
             origin = origins.resolve("", cloud.identity.folder)
-            if name := short_name(origin):
-                cell = row(name).aws
-                if isinstance(saved.hana, ReadingState):
-                    continue
-                cell.policy = CellPolicy.NO_LIMIT
-                cell.other_used += 1
-                label = clean_label(cloud_names.get(cloud.owner, ""), cloud.identity.unit, name)
-                if label:
-                    cell.other.append(label)
-                cell.note = PAGE_WORDS["uses_cloud"]
+            name = short_name(origin)
+            if not name:
+                cloud_origin_missing = True
+                continue
+            cell = row(name).aws
+            if isinstance(saved.hana, ReadingState):
+                continue
+            cell.policy = CellPolicy.NO_LIMIT
+            cell.other_used += 1
+            label = clean_label(cloud_names.get(cloud.owner, ""), cloud.identity.unit, name)
+            if label:
+                cell.other.append(label)
+            cell.note = PAGE_WORDS["uses_cloud"]
 
     # Every Hana target uses the same AWS lifecycle controller.
     hana = () if isinstance(saved.hana, ReadingState) else tuple(dict.fromkeys(saved.hana))
@@ -850,6 +859,15 @@ def build_limits(reading: records.QueueRead, snapshots: target_availability.Snap
                 cell.other_used = 0
             if cell.used or cell.limit is not None or cell.waits or cell.runs or cell.other_used:
                 item.quiet = False
+        if unattributed and item.natedev.policy is CellPolicy.NO_LIMIT:
+            item.natedev.used = None
+            item.natedev.runs.clear()
+        if cloud_origin_missing:
+            item.aws.used = None
+            item.aws.runs.clear()
+            item.aws.other_used = 0
+            item.aws.other.clear()
+            item.aws.show_marks = item.aws.limit is None
 
     room = explanation.room
     memory_used = room.cap_use / records.GIB if isinstance(room, records.MemoryRoom) else None

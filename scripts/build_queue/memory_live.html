@@ -1314,14 +1314,14 @@ function limitWaits(waits) {
   }).join("");
 }
 function limitCell(cell, words) {
-  const {limit, used, runs, merge_above, other, other_used, waits, note, policy} = cell;
+  const {limit, used, runs, merge_above, other, other_used, waits, note, policy, show_marks = true} = cell;
   let count = "";
   if (limit != null) {
     count = limitWords(words, used == null ? "limit" : "count", {used, limit});
   } else if (used) {
     count = limitWords(words, "running", {count: used});
   }
-  const marks = limitPlaces(used, limit, Math.max(0, (used ?? 0) - merge_above.length), 0, merge_above.length);
+  const marks = show_marks ? limitPlaces(used, limit, Math.max(0, (used ?? 0) - merge_above.length), 0, merge_above.length) : "";
   const noLimit = limit == null && policy === "no_limit"
     ? `<span class="build-limit-note">${count ? " · " : ""}${esc(words.no_limit)}</span>` : "";
   let contents = count ? `<div class="build-limit-count num">${marks}<span>${esc(count)}${noLimit}</span></div>` : noLimit;

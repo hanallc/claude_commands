@@ -27,6 +27,7 @@ from scripts.build_queue.scope_activity import LiveBuildRun
 from scripts.build_targets import target_config
 from scripts.build_targets.execution_transport import HanaControlTransport
 from scripts.buildlog import repository, store
+from scripts.lib import conf
 from scripts.lib.git_test_support import commit_repository, fixture_git_environment
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.mac_test import claim_state
@@ -156,10 +157,18 @@ class BuildLimitsTests(unittest.TestCase):
         cell = project_row.natedev
         self.assertEqual((cell.used, cell.limit, cell.runs, cell.merge_above), (2, 1, ["regular"], ["merge-owner"]))
         self.assertEqual(wait_names(cell.waits), {"1 run waits because the run limit for project on natedev is full.": ["Run limit"]})
-        self.assertIsNone(quiet.natedev.limit)
-        self.assertEqual(quiet.natedev.used, 0)
+        self.assertEqual(quiet.natedev, limits_view.Cell(policy=limits_view.CellPolicy.NO_LIMIT))
         self.assertEqual(shown.natedev.unattributed, 1)
         self.assertEqual(shown.natedev.waits, {})
+        with self.subTest(origin="unresolved natedev run"):
+            check_quiet: records.Reservation = {
+                **fixture_reservation(106, 0, step="check"), "repo": "quiet",
+                "repo_identity": "https://example.invalid/team/quiet", "unit": "quiet-check",
+            }
+            running = show(replace(queue, explanation=replace(explanation,
+                decided_from=replace(explanation.decided_from, reservations=(*reservations, check_quiet)))))
+            self.assertEqual(running.natedev.unattributed, 1)
+            self.assertEqual(next(row.natedev for row in running.repositories if row.name == "quiet"), quiet.natedev)
         unbound = show(replace(queue, view=replace(queue.view, waiting=unbound_waits),
             explanation=replace(explanation,
                 decided_from=replace(explanation.decided_from, reservations=(*reservations, unbound_reservation)))))
@@ -439,10 +448,12 @@ class BuildLimitsTests(unittest.TestCase):
             self.assertIs(limits_view.hana_use("fixture", transport, policy), limits_view.ReadingState.OMITTED)
 
         route = limits_view.HanaRoute("fixture", transport, policy)
-        routes = limits_view.AwsRoutes((route,), frozenset({"fixture"}))
+        hana_routes = (route,)
+        routes = limits_view.AwsRoutes(hana_routes, frozenset({"fixture"}))
         refresh = limits_view.LimitsRefresh(10, 10)
         refresh.routes.sample = limits_view.SourceSample(routes, 19, None)
-        refresh.hana_occupancy.sample = limits_view.SourceSample({route: 1}, 0, routes.hana)
+        occupancy: dict[limits_view.HanaRoute, int | limits_view.ReadingState] = {route: 1}
+        refresh.hana_occupancy.sample = limits_view.SourceSample(occupancy, 0, hana_routes)
         refresh.hana_occupancy.pending = Future()
         with mock.patch.object(Thread, "start"):
             shown = refresh.current(head_reading(), 20, 20)
@@ -457,27 +468,59 @@ class BuildLimitsTests(unittest.TestCase):
         cloud_queue = replace(queue, cloud=(gate,))
         origins = limits_view.Origins(resolved={folder: origin})
 
-        def aws_cells(routes: limits_view.AwsRoutes | limits_view.ReadingState,
-                      occupancy: Mapping[limits_view.HanaRoute, int | limits_view.ReadingState]
-                      | limits_view.ReadingState) -> dict[str, limits_view.Cell]:
+        def cloud_limits(routes: limits_view.AwsRoutes | limits_view.ReadingState,
+                         occupancy: Mapping[limits_view.HanaRoute, int | limits_view.ReadingState]
+                         | limits_view.ReadingState, *,
+                         current: wire.CloudQueueRead = cloud_queue) -> limits_view.BuildLimits:
             saved = limits_view.background(frozenset[str](), shown.aws_money, 1, routes, occupancy, origins)
-            limits = limits_view.build_limits(cloud_queue, (), (), {}, {}, saved, UTC)
-            return {row.name: row.aws for row in limits.repositories}
+            return limits_view.build_limits(current, (), (), {}, {}, saved, UTC)
+
+        def hana_cell(limits: limits_view.BuildLimits) -> limits_view.Cell:
+            return next(row.aws for row in limits.repositories if row.name == "hana")
 
         for missing in limits_view.ReadingState:
             with self.subTest(routes=missing):
-                self.assertEqual(aws_cells(missing, missing)["hana"], limits_view.Cell())
-        cloud_only = aws_cells(limits_view.AwsRoutes(), limits_view.ReadingState.OMITTED)["hana"]
+                self.assertEqual(hana_cell(cloud_limits(missing, missing)), limits_view.Cell())
+        cloud_only = hana_cell(cloud_limits(limits_view.AwsRoutes(), limits_view.ReadingState.OMITTED))
         self.assertEqual((cloud_only.policy, cloud_only.used, cloud_only.runs, cloud_only.other_used),
                          (limits_view.CellPolicy.NO_LIMIT, 1, ["hana"], 0))
         for alias_used in (0, 1):
             with self.subTest(alias_used=alias_used):
-                cell = aws_cells(both, {route: 0, alias: alias_used})["hana"]
+                cell = hana_cell(cloud_limits(both, {route: 0, alias: alias_used}))
                 self.assertEqual((cell.used, cell.limit), (0, 1) if alias_used == 0 else (None, None))
                 self.assertEqual(cell.other_used, 1)
         other = replace(alias, settings=replace(policy, repository_key="https://example.invalid/team/other"))
         across_rows = replace(both, hana=(route, other))
-        cells = aws_cells(across_rows, {route: 0, other: 0})
+        across = cloud_limits(across_rows, {route: 0, other: 0})
+        cells = {row.name: row.aws for row in across.repositories}
         for name in ("hana", "other"):
             self.assertEqual((cells[name].policy, cells[name].used, cells[name].limit),
                              (limits_view.CellPolicy.UNRESOLVED, None, None))
+
+        with self.subTest(routes="one unreadable Hana route"):
+            targets = tuple(target_config.SshTarget(name, "linux", transport.settings) for name in (route.target, alias.target))
+            config = conf.ConfigRead("fixture", Path("fixture.conf"), {}, False)
+            with (mock.patch.object(conf, "read", return_value=config),
+                  mock.patch.object(target_config, "read_targets", return_value=targets),
+                  mock.patch.object(target_config, "read_execution_transport", return_value=transport),
+                  mock.patch.object(hana_placement, "read_settings", side_effect=[policy, ValueError("unreadable route")])):
+                partial_routes = limits_view.aws_routes()
+            partial = cloud_limits(partial_routes, {route: 1})
+            self.assertEqual(hana_cell(partial), limits_view.Cell())
+            self.assertEqual(partial.aws.shared[0].used, 1)
+
+        with self.subTest(origin="unresolved AWS run"):
+            unknown = replace(gate, owner=queue.cloud[1].owner, identity=replace(gate.identity, folder=""))
+            current = replace(cloud_queue, cloud=(gate, unknown))
+            for known_routes in (limits_view.AwsRoutes(), routes):
+                hidden = cloud_limits(known_routes, {route: 1}, current=current)
+                cell = hana_cell(hidden)
+                self.assertEqual((cell.used, cell.runs, cell.other_used, cell.other), (None, [], 0, []))
+                self.assertEqual(hidden.aws.shared[0].used, 2)
+                self.assertEqual(cell.limit, 1 if known_routes is routes else None)
+                rendered = test_memory_hover.MemoryHoverTests().page_expression(
+                    "limitCell(data.cell, data.words)",
+                    {"cell": snapshot_codec.snapshot_value(cell), "words": limits_view.PAGE_WORDS}, limits=True)
+                assert isinstance(rendered, str)
+                self.assertNotIn("build-limit-mark", rendered)
+                self.assertNotIn("running", rendered)
