@@ -1827,8 +1827,9 @@ A zero count leaves the notice unsent.
 Verify only creates scopes per step, so the console leaves Kill off for Verify.
 The server offers Cargo Kill only when the verified scope contains the known Cargo descendants.
 A restart before the server saves a TERM count shows **Kill not sent; try again**.
-The action record keeps the notice after the confirmation deadline or a console restart.
-The server checks the saved target every `kill_pending_check_seconds`.
+The server saves the helper’s confirmation before it sends the notice.
+After a restart, an action with a TERM receipt and no confirmation uses the shared stop helper on the saved scope identity.
+The server retries pending actions every `kill_pending_check_seconds`.
 It retries an unclear delivery result with the saved key.
 A queued or kept message appears as **Message queued**.
 The server supplies the first line of the notice.

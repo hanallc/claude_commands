@@ -37,6 +37,11 @@ def confirm_term(_target: kill_action.KillTarget, _reason: str, *, on_term: Call
     return True
 
 
+def unconfirmed_term(_target: kill_action.KillTarget, _reason: str, *, on_term: Callable[[int], None]) -> bool:
+    on_term(1)
+    return False
+
+
 FIXTURE_CARGO = """import os, signal, subprocess, sys
 
 child = subprocess.Popen([sys.executable, "-c", "import signal; signal.pause()"])
@@ -319,15 +324,14 @@ class KillActionTests(unittest.TestCase):
             targets.return_value = {reused.reference: replace(target, candidate=reused)}
             self.assertIsInstance(actions.stop(run.reference, handle, ""), kill_action.NoStopRoute)
             targets.return_value = {run.reference: target}
-            with (patch.object(kill_action, "stop_verified_scope", side_effect=confirm_term),
-                  patch.object(kill_action, "stop_complete") as observe):
-                def confirm(_action: kill_action.SavedKillAction) -> bool:
-                    deliver.assert_not_called()
-                    self.assertEqual(actions.options()[1][0]["stop"], kill_action.StopState.STOPPING)
-                    targets.return_value = {}
-                    return True
+            def confirm(_target: kill_action.KillTarget, _reason: str, *, on_term: Callable[[int], None]) -> bool:
+                on_term(1)
+                deliver.assert_not_called()
+                self.assertEqual(actions.options()[1][0]["stop"], kill_action.StopState.STOPPING)
+                targets.return_value = {}
+                return True
 
-                observe.side_effect = confirm
+            with patch.object(kill_action, "stop_verified_scope", new=confirm):
                 result = actions.stop(run.reference, handle, "Use the next slot.")
                 deliver.assert_called_once()
                 (saved,) = cast(tuple[kill_action.SavedKillAction], deliver.call_args.args)
@@ -339,7 +343,7 @@ class KillActionTests(unittest.TestCase):
             self.assertIsInstance(actions.stop(run.reference, handle, "Again."), kill_action.NoStopRoute)
 
     def test_restart_resumes_a_late_stop_without_losing_the_notice(self) -> None:
-        _ = write_config_fixture(self.root / "review_links.conf", "kill_stop_seconds=0.5\nkill_pending_check_seconds=0.1")
+        _ = write_config_fixture(self.root / "review_links.conf", "kill_pending_check_seconds=0.1")
         run = kill_action.KillCandidate(17, "123", 17, "123", "session", "check", "at", "")
         scope = self.root / "run-fixture.scope"
         scope.mkdir()
@@ -349,8 +353,7 @@ class KillActionTests(unittest.TestCase):
         _ = events.write_text("populated 1\n")
         first = kill_action.KillActions(self.root)
         with (patch.object(kill_action, "live_targets", return_value={run.reference: target}),
-              patch.object(process_stop, "scope_has_ended", side_effect=self.scope_has_ended),
-              patch.object(kill_action, "stop_verified_scope", side_effect=confirm_term) as stop,
+              patch.object(kill_action, "stop_verified_scope", side_effect=unconfirmed_term) as stop,
               patch.object(first, "_start_watch") as watch,
               patch.object(kill_action, "deliver") as send):
             response = first.stop(run.reference, first.handle(target), "Use the next slot.")
@@ -374,7 +377,7 @@ class KillActionTests(unittest.TestCase):
             start(thread)
 
         with (patch.object(threading.Thread, "start", new=record_thread),
-              patch.object(process_stop, "scope_has_ended", side_effect=self.scope_has_ended),
+              patch.object(process_stop, "CGROUP_ROOT", self.root),
               patch.object(kill_action, "stop_verified_scope") as repeated_stop,
               patch.object(kill_action, "deliver", return_value=kill_action.DeliveryState.QUEUED) as send,
               patch.object(kill_action, "live_targets", return_value={})):
@@ -443,7 +446,7 @@ class KillActionTests(unittest.TestCase):
         send.assert_not_called()
 
     def test_detached_restart_waits_for_the_child_and_handles_retirement_once(self) -> None:
-        _ = write_config_fixture(self.root / "review_links.conf", "kill_stop_seconds=0.5\nkill_pending_check_seconds=0.1")
+        _ = write_config_fixture(self.root / "review_links.conf", "kill_pending_check_seconds=0.1")
         folder = self.root / "detached-recorded.scope"
         child = folder / "child"
         child.mkdir(parents=True)
@@ -457,8 +460,7 @@ class KillActionTests(unittest.TestCase):
         target = kill_action.KillTarget(run, route, staff.StaffId("retired"), "founder, a producer", "founder", "producer")
         actions = kill_action.KillActions(self.root)
         with (patch.object(kill_action, "live_targets", return_value={run.reference: target}),
-              patch.object(process_stop, "scope_has_ended", side_effect=self.scope_has_ended),
-              patch.object(kill_action, "stop_verified_scope", side_effect=confirm_term),
+              patch.object(kill_action, "stop_verified_scope", side_effect=unconfirmed_term),
               patch.object(actions, "_start_watch"),
               patch.object(kill_action, "deliver") as send):
             response = actions.stop(run.reference, actions.handle(target), "Use the next slot.")
@@ -472,6 +474,7 @@ class KillActionTests(unittest.TestCase):
         self.assertFalse(route.record.exists())
 
         observed = threading.Event()
+        released = threading.Event()
         workers: list[threading.Thread] = []
         start = threading.Thread.start
 
@@ -479,16 +482,19 @@ class KillActionTests(unittest.TestCase):
             workers.append(thread)
             start(thread)
 
-        def read(saved_scope: process_stop.ScopeIdentity) -> bool:
+        def stop(saved_scope: process_stop.ScopeIdentity, _grace: float, _kill_grace: float, *,
+                 on_term: Callable[[int], None] | None) -> process_stop.ScopeStopReceipt:
             self.assertEqual(saved_scope, scope)
-            empty = self.scope_has_ended(saved_scope)
+            self.assertIsNone(on_term)
             observed.set()
-            return empty
+            self.assertTrue(released.wait(TEST_HANG_GUARD_SECS))
+            self.assertTrue(self.scope_has_ended(saved_scope))
+            return process_stop.ScopeStopReceipt(1)
 
         response_text = "send.py: staff:retired: founder is a retired producer"
         refusal = subprocess.CompletedProcess(["send.py"], 2, "", response_text)
         resumed = kill_action.KillActions(self.root)
-        with (patch.object(process_stop, "scope_has_ended", side_effect=read),
+        with (patch.object(process_stop, "stop_scope", new=stop),
               patch.object(kill_action, "live_targets", return_value={}),
               patch.object(kill_action, "stop_verified_scope") as repeated_stop,
               patch.object(send_budget, "seconds", return_value=1),
@@ -503,6 +509,7 @@ class KillActionTests(unittest.TestCase):
             finally:
                 _ = (child / "cgroup.procs").write_text("")
                 _ = events.write_text("populated 0\n")
+                released.set()
                 for worker in workers:
                     worker.join(TEST_HANG_GUARD_SECS)
             self.assertTrue(all(not worker.is_alive() for worker in workers))
@@ -533,7 +540,6 @@ class KillActionTests(unittest.TestCase):
         with (patch.object(send_budget, "seconds", return_value=1),
               patch.object(subprocess, "run", new=send),
               patch.object(kill_action, "live_targets", return_value={run.reference: target}),
-              patch.object(process_stop, "scope_has_ended", side_effect=self.scope_has_ended),
               patch.object(kill_action, "stop_verified_scope", side_effect=confirm_term),
               patch.object(actions, "_start_watch")):
             _ = actions.stop(run.reference, actions.handle(target), "Use the next slot.")
@@ -585,10 +591,9 @@ class KillActionTests(unittest.TestCase):
 
     def test_only_a_saved_term_count_allows_a_kill_notice(self) -> None:
         _ = write_config_fixture(self.root / "shutdown.conf")
-        _ = write_config_fixture(self.root / "review_links.conf", "kill_stop_seconds=0.5")
         _ = write_config_fixture(self.root / "codex_daemon.conf")
         for detached in (False, True):
-            for scenario in ("natural exit", "restart", "error"):
+            for scenario in ("natural exit", "restart", "error", "reused scope"):
                 with self.subTest(detached=detached, scenario=scenario):
                     self.check_term_receipt(detached, scenario)
 
@@ -598,6 +603,8 @@ class KillActionTests(unittest.TestCase):
         folder.mkdir(parents=True)
         events = folder / "cgroup.events"
         _ = events.write_text("populated 1\n")
+        kill_file = folder / "cgroup.kill"
+        kill_file.touch()
         scope = self.scope_identity(folder)
         run = kill_action.KillCandidate(17, "123", 17, "123", "session", "check", "at", "")
         recipient = staff.StaffId("worker-id")
@@ -631,11 +638,34 @@ class KillActionTests(unittest.TestCase):
                 detached_record = cast(dict[str, object], json.loads(record.read_text()))
                 self.assertEqual(detached_record.get("stop_reason"), saved.message)
             if scenario == "restart":
-                raise Restart
+                if term.call_count == 1:
+                    raise Restart
+                if not kill_file.read_text():
+                    self.assertFalse(self.scope_has_ended(scope))
+                    return False
+                self.assertEqual(kill_file.read_text(), "1\n")
+                _ = events.write_text("populated 0\n")
+                return True
+            if scenario == "reused scope":
+                _ = folder.rename(folder.with_suffix(".old"))
+                folder.mkdir()
+                _ = events.write_text("populated 1\n")
+                return True
             raise process_stop.ScopeStopFailed("fixture failure after TERM")
 
         def start(target_actions: kill_action.KillActions) -> kill_action.KillResult | kill_action.NoStopRoute:
             return target_actions.stop(run.reference, target_actions.handle(target), "")
+
+        def deliver(confirmed: kill_action.SavedKillAction) -> kill_action.DeliveryState:
+            saved = admission_wire.parse_record(journal.read_text(), kill_action.SavedKillAction)
+            self.assertEqual(saved, confirmed)
+            self.assertEqual(saved.stage, kill_action.SendingNotice(kill_action.TermSent(count)))
+            self.assertEqual(saved.scope, scope)
+            if scenario == "reused scope":
+                self.assertEqual(events.read_text(), "populated 1\n")
+            else:
+                self.assertTrue(self.scope_has_ended(scope))
+            return kill_action.DeliveryState.SENT
 
         with (patch.object(process_stop, "CGROUP_ROOT", self.root),
               patch.object(process_stop, "_term_scope", return_value=count) as term,
@@ -644,21 +674,28 @@ class KillActionTests(unittest.TestCase):
               patch.object(kill_action, "stop_route", return_value=route),
               patch.object(kill_action, "live_targets", return_value={run.reference: target}) as targets,
               patch.object(actions, "_start_watch"),
-              patch.object(kill_action, "deliver", return_value=kill_action.DeliveryState.SENT) as send):
+              patch.object(kill_action, "deliver", side_effect=deliver) as send):
             if scenario == "restart":
                 with self.assertRaises(Restart):
                     _ = start(actions)
             else:
                 outcome = start(actions)
                 assert not isinstance(outcome, kill_action.NoStopRoute)
-                expected = kill_action.StopState.UNCONFIRMED if count else kill_action.StopState.ALREADY_ENDED
-                self.assertEqual(outcome["stop"], expected)
+                expected = {
+                    "error": kill_action.StopState.UNCONFIRMED,
+                    "natural exit": kill_action.StopState.ALREADY_ENDED,
+                    "reused scope": kill_action.StopState.STOPPED,
+                }
+                self.assertEqual(outcome["stop"], expected[scenario])
             wait.assert_called_once()
-            send.assert_not_called()
+            if scenario == "reused scope":
+                send.assert_called_once()
+            else:
+                send.assert_not_called()
             if not count and detached:
                 self.assertNotIn("stop_reason", record.read_text())
                 self.assertNotIn("stop_pass_requested", record.read_text())
-            if count:
+            if scenario == "error":
                 _ = events.write_text("populated 0\n")
             targets.return_value = {}
             recovered = kill_action.KillActions(root)
@@ -676,11 +713,14 @@ class KillActionTests(unittest.TestCase):
                     self.assertFalse(worker.is_alive())
                 recovered_again = kill_action.KillActions(root)
                 recovered_again.resume()
-                self.assertEqual(len(workers), int(count > 0))
+                self.assertEqual(len(workers), int(scenario in ("restart", "error")))
             (_, (result,)) = recovered_again.options()
             self.assertEqual(result["stop"],
                              kill_action.StopState.STOPPED if count else kill_action.StopState.ALREADY_ENDED)
-            term.assert_called_once()
+            self.assertEqual(term.call_count, 2 if scenario == "restart" else 1)
+            if scenario == "restart":
+                self.assertEqual(kill_file.read_text(), "1\n")
+                self.assertTrue(self.scope_has_ended(scope))
             self.assertEqual(send.call_count, int(count > 0))
 
 

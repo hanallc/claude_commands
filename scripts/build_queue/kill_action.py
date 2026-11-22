@@ -410,8 +410,10 @@ def notification(run: KillCandidate, at: datetime) -> str:
     return f'nate killed your run "{run.step}" (pid {run.row_pid}) from the Builds page at {at:%H:%M %Z}'
 
 
-def stop_complete(action: SavedKillAction) -> bool:
-    return not isinstance(action.scope, NoLaunchScope) and process_stop.scope_has_ended(action.scope)
+def stop_saved_scope(scope: process_stop.ScopeIdentity, *, on_term: Callable[[int], None] | None = None) -> None:
+    settings = conf.read_or_repository("shutdown")
+    _ = process_stop.stop_scope(scope, settings.whole("STOP_GRACE_SECONDS"),
+                                settings.whole("KILL_GRACE_SECONDS"), on_term=on_term)
 
 
 def stop_verified_scope(target: KillTarget, reason: str, *, on_term: Callable[[int], None]) -> bool:
@@ -424,9 +426,7 @@ def stop_verified_scope(target: KillTarget, reason: str, *, on_term: Callable[[i
     route = target.route
     if isinstance(route, DetachedCommand):
         return detached_runs.stop_command(route.record, reason, check=route_matches, on_term=on_term)
-    settings = conf.read_or_repository("shutdown")
-    _ = process_stop.stop_scope(route.scope, settings.whole("STOP_GRACE_SECONDS"),
-                                settings.whole("KILL_GRACE_SECONDS"), on_term=on_term)
+    stop_saved_scope(route.scope, on_term=on_term)
     return True
 
 
@@ -537,13 +537,18 @@ class KillActions:
         self._save(finished)
         return finished
 
+    def _confirm_stop(self, action: SavedKillAction, receipt: TermSent) -> SavedKillAction:
+        confirmed = replace(action, stage=SendingNotice(receipt))
+        self._save(confirmed)
+        return confirmed
+
     def _advance(self, action: SavedKillAction, retention: float) -> SavedKillAction:
-        """Record each step before proceeding. Recovery only checks or sends."""
+        """Resume the stop or send the notice from the saved stage."""
         if isinstance(action.stage, StopRequested):
             return self._finish(action, {**action.result, "stop": StopState.NOT_SENT}, retention)
-        if isinstance(action.stage, TermSent) and stop_complete(action):
-            action = replace(action, stage=SendingNotice(action.stage))
-            self._save(action)
+        if isinstance(action.stage, TermSent) and not isinstance(action.scope, NoLaunchScope):
+            stop_saved_scope(action.scope)
+            action = self._confirm_stop(action, action.stage)
         if isinstance(action.stage, SendingNotice):
             try:
                 delivery = deliver(action)
@@ -592,8 +597,6 @@ class KillActions:
         if re.fullmatch(r"[0-9a-f]{64}", reference) is None:
             return NoStopRoute()
         settings = conf.read_or_repository("review_links")
-        seconds = settings.number("kill_stop_seconds")
-        sample = settings.number("kill_sample_seconds")
         retention = settings.number("kill_result_seconds")
         run = target.candidate
         at = datetime.now(user_zone())
@@ -636,20 +639,15 @@ class KillActions:
                 if ended:
                     return self._finish(action, {**result, "stop": StopState.ALREADY_ENDED}, retention).result
                 return self._advance(action, retention).result
-            deadline = time.monotonic() + seconds
-            while True:
+            assert isinstance(action.stage, TermSent)
+            if ended:
                 try:
+                    action = self._confirm_stop(action, action.stage)
                     action = self._advance(action, retention)
                 except (OSError, ValueError):
-                    break
+                    action = self._read(reference)
                 if isinstance(action.stage, FinishedStop):
                     return action.result
-                remaining = deadline - time.monotonic()
-                if remaining <= 0 or isinstance(action.stage, SendingNotice):
-                    break
-                time.sleep(min(remaining, sample))
-            # A delivery write can fail after cleanup is saved. Resume the durable state.
-            action = self._read(reference)
             if isinstance(action.stage, TermSent):
                 action = replace(action, result={**result, "stop": StopState.UNCONFIRMED})
                 self._save(action)
