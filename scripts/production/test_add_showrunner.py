@@ -609,6 +609,9 @@ class AddShowrunnerTests(AddShowrunnerFixture):
         self.assertFalse(any(call[2:4] == ["agent", "start"] for call in self.herdr_calls()[len(before):]))
 
     def test_resume_starts_in_the_given_directory_with_the_resume_prompt(self) -> None:
+        doc = self.doc("kid")
+        _ = doc.write_text("".join(line for line in doc.read_text().splitlines(keepends=True)
+                                   if not line.startswith(f"- **{MERGE_CHECKOUT_FIELD}:**")))
         self.starts("cfc4564d-fed3-5803-9a4c-e3119733bb53", registers="kid")
         elsewhere = self.root / "elsewhere"
         elsewhere.mkdir()
