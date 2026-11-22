@@ -12,6 +12,7 @@ import json
 import math
 import os
 import shlex
+import signal
 import socket
 import subprocess
 import sys
@@ -36,6 +37,7 @@ from scripts.message import sessions, codex_daemon, session_records
 from scripts.production import staff, session_staff, worker_admission
 from scripts.accounts import accounts
 from scripts.lib import conf, models_registry, nix_env, operation_deadline, unit_runs, resume_message
+from scripts.lib.atomic_file import create_text_atomic
 from scripts.lib.transcripts import codex_transcript_homes, open_transcript, transcript_paths
 from scripts.agents import member_account, shutdown_record, pane_record
 from scripts.agents.stop_results import StopResult, Stopped, NotRunning, StopFailed, shutdown_state_root
@@ -320,6 +322,11 @@ class BulkReport:
     def failure(self, key: str, name: str, reason: str) -> None:
         self.issues[key] = FollowUp(self.targets.get(key, name), reason, f"Nate runs {self.retry} again.", operator=True)
 
+    def detached_row_failure(self, key: str, error: BaseException) -> None:
+        status = "stopped" if self.command == "agents stop --all" else "back"
+        reason = f"Could not confirm the session is {status}. {_error_reason(error)}"
+        self.issues[key] = FollowUp(self.targets[key], reason, "Nate sends this error to the efficiency unit.", operator=True)
+
     def log_repair_step(self) -> str:
         error = self.log_error
         path = shlex.quote(str(self.log.parent))
@@ -441,11 +448,14 @@ def _create_log(files: ExitStack, path: Path) -> io.FileIO:
     return log
 
 
-def _claim_log(log: Path) -> int | None:
-    try:
-        return os.open(log.with_suffix(".claim"), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    except FileExistsError:
-        return None
+def _claim_log(log: Path) -> bool:
+    return create_text_atomic(log.with_suffix(".claim"), f"{os.getpid()}\n")
+
+
+def _owns_log_claim(log: Path) -> bool:
+    with suppress(OSError):
+        return log.with_suffix(".claim").read_bytes() == f"{os.getpid()}\n".encode("ascii")
+    return False
 
 
 def _write_log(log: io.FileIO, text: str) -> None:
@@ -463,6 +473,16 @@ class DetachedReadinessFailed(OSError):
     """The child could not confirm readiness."""
 
 
+class DetachedSignal(BaseException):
+    def __init__(self, number: signal.Signals) -> None:
+        self.number: signal.Signals = number
+        super().__init__(f"The detached command received {number.name}")
+
+
+class DetachedRowsFailed(Exception):
+    """One or more session results contain unexpected errors."""
+
+
 def _record_stop_plan(report: BulkReport, rows: Iterable[staff.StaffRow]) -> None:
     names = [f"{report.targets[row.id]} ({row.id})" for row in rows]
     header = "\n".join([f"Sessions to stop ({len(names)}).", *names]) + "\n"
@@ -473,7 +493,7 @@ def _record_stop_plan(report: BulkReport, rows: Iterable[staff.StaffRow]) -> Non
         _write_log(log, header)
         os.fsync(log.fileno())
         report.stop_plan_recorded = True
-    except (OSError, ValueError) as error:
+    except (OSError, ValueError, DetachedSignal) as error:
         raise StopPlanWriteFailed(_error_reason(error)) from error
 
 
@@ -1498,21 +1518,22 @@ def _detach_stop(arguments: list[str], selected: list[staff.StaffRow], record: s
         except Exception as error:
             launch_error = error
         try:
-            claim = _claim_log(report.log)
+            claimed = _claim_log(report.log)
         except OSError as error:
-            report.writer = LogWriter.UNKNOWN
-            reason = f"Could not claim the log. {_error_reason(error)}"
-            step = "Nate sends this error to the efficiency unit."
+            detail = f"Could not claim the log. {_error_reason(error)}"
+            if _owns_log_claim(report.log):
+                reason = f"The launcher could not start the detached command. {detail}"
+                step = _plain_terminal_step(report.retry)
+            else:
+                report.writer = LogWriter.UNKNOWN
+                reason = detail
+                step = "Nate sends this error to the efficiency unit."
         else:
-            if claim is None:
+            if not claimed:
                 report.writer = LogWriter.CHILD
                 return 0
             detail = (_launch_failure_reason(launch_error) if launch_error is not None else
                       "The detached process did not claim the log")
-            try:
-                os.close(claim)
-            except OSError as error:
-                detail = f"Could not close the log claim. {_error_reason(error)}"
             reason = f"The launcher could not start the detached command. {detail}"
             step = _plain_terminal_step(report.retry)
 
@@ -1779,7 +1800,7 @@ def _restart(pane_evidence: ExitStack, *, stop_all: bool, dry_run: bool, only: t
             recorded.set()
 
     if stop_all and holders:
-        stop_error: BaseException | None = None
+        stop_failed = False
         recorded = [Event() for _ in range(len(holders) + 1)]
         recorded[0].set()
         with ThreadPoolExecutor(max_workers=min(16, len(holders))) as pool:
@@ -1813,11 +1834,12 @@ def _restart(pane_evidence: ExitStack, *, stop_all: bool, dry_run: bool, only: t
                                                    if child.id in selected_ids)
                     _anomaly(holder, error)
                 except BaseException as error:
-                    if not _DETACHED_CHILD.get():
+                    if report is None or not _DETACHED_CHILD.get() or isinstance(error, DetachedSignal):
                         raise
-                    stop_error = stop_error if stop_error is not None else error
-        if stop_error is not None:
-            raise stop_error
+                    report.detached_row_failure(holder.id, error)
+                    stop_failed = True
+        if stop_failed:
+            raise DetachedRowsFailed("One or more session stops failed")
     if after_stop == AfterStop.KEEP_STOPPED:
         return 0
     changed = {identity for identities in role_changes_by_holder.values() for identity in identities}
@@ -1952,7 +1974,7 @@ def _restart(pane_evidence: ExitStack, *, stop_all: bool, dry_run: bool, only: t
             restarted.add(holder.worktree.path)
 
     failed_starts: list[FailedHolderStart] = []
-    start_error: BaseException | None = None
+    start_failed = False
     if holders:
         with ThreadPoolExecutor(max_workers=min(16, len(holders))) as pool:
             futures = [(holder, present and index == 0,
@@ -1970,12 +1992,16 @@ def _restart(pane_evidence: ExitStack, *, stop_all: bool, dry_run: bool, only: t
                 except errors as error:
                     failed_starts.append(FailedHolderStart(holder, focus, error))
                 except BaseException as error:
-                    if not _DETACHED_CHILD.get():
+                    if report is None or not _DETACHED_CHILD.get() or isinstance(error, DetachedSignal):
                         raise
-                    start_error = start_error if start_error is not None else error
-    if start_error is not None:
+                    report.detached_row_failure(holder.id, error)
+                    start_failed = True
+    if start_failed:
         resume_checks.worker_restores.report()
-        raise start_error
+        for failed in failed_starts:
+            if not isinstance(failed.error, WorkerRestoreIncomplete):
+                _anomaly(failed.holder, failed.error)
+        raise DetachedRowsFailed("One or more session resumes failed")
     for failed in failed_starts:
         holder = failed.holder
         fresh: herdr.LiveConversation | herdr.StoppedConversation | herdr.UnknownConversation
@@ -2054,21 +2080,28 @@ def _save_detached_report(log: io.FileIO, result: str) -> None:
 
 
 def _run_detached_child(action: Callable[[], int], report: BulkReport, log_fd: int, *, dry_run: bool) -> int:
-    claim = None
     result_offset = None
     output = io.StringIO()
     stage = "Could not claim the log"
     step = _plain_terminal_step(report.retry)
+    handlers = ExitStack()
+    received_signal: DetachedSignal | None = None
+    reporting_failure = False
+
+    def interrupt(number: int, _frame: object) -> None:
+        nonlocal received_signal
+        if received_signal is None:
+            received_signal = DetachedSignal(signal.Signals(number))
+            if not reporting_failure:
+                raise received_signal
 
     # Update test_detached_child_reports_each_fault_after_the_claim when you change these steps.
-    # The steps cover claim close, log open, readiness, staff read, plan write and sync, each stop, each resume,
-    # and report write and sync.
     try:
-        claim = _claim_log(report.log)
-        if claim is None:
+        for number in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
+            _ = handlers.callback(signal.signal, number, signal.getsignal(number))
+            _ = signal.signal(number, interrupt)
+        if not _claim_log(report.log):
             return 0
-        stage = "Could not close the log claim"
-        os.close(claim)
 
         stage = f"Could not write the log at {report.log}. The command did not start"
         with io.FileIO(log_fd, "wb", closefd=False) as log:
@@ -2094,11 +2127,14 @@ def _run_detached_child(action: Callable[[], int], report: BulkReport, log_fd: i
             _save_detached_report(log, result)
         return code
     except BaseException as error:
+        reporting_failure = True
+        if isinstance(error, DetachedSignal):
+            received_signal = error
         detail = _error_reason(error)
         if isinstance(error, SystemExit):
             lines = output.getvalue().strip().splitlines()
             detail = lines[-1] if lines else detail
-        if claim is None:
+        if not _owns_log_claim(report.log):
             print(f"{stage} at {report.log}. {detail}", file=sys.stderr, flush=True)
             return 2
         prefix = ""
@@ -2120,6 +2156,10 @@ def _run_detached_child(action: Callable[[], int], report: BulkReport, log_fd: i
                   file=sys.stderr, flush=True)
             print(result, end="", file=sys.stderr, flush=True)
         return 2
+    finally:
+        handlers.close()
+        if received_signal is not None:
+            raise received_signal
 
 
 def main() -> int:
@@ -2163,4 +2203,9 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except DetachedSignal as interruption:
+        _ = signal.signal(interruption.number, signal.SIG_DFL)
+        signal.raise_signal(interruption.number)
+        raise SystemExit(128 + interruption.number)

@@ -2024,6 +2024,7 @@ class RestartTests(RestartTestCase):
     def test_detached_child_reports_each_fault_after_the_claim(self) -> None:
         # Keep these steps in sync with the guard in restart._run_detached_child.
         for step, detail, completed in (
+            ("claim publication", "The claim was interrupted", ()),
             ("claim close", "Input/output error", ()),
             ("log open", "Could not open the log", ()),
             ("readiness", "The readiness check failed", ()),
@@ -2039,24 +2040,71 @@ class RestartTests(RestartTestCase):
         ):
             with self.subTest(step=step):
                 self.assert_detached_fault_report(step, detail, completed)
+        for step in ("stop both", "resume both"):
+            with self.subTest(step=step):
+                self.assert_detached_fault_report(step, "First session error", (), second_detail="Second session error")
+        with self.subTest(step="SIGTERM"):
+            self.assert_detached_signal_report()
 
-    def assert_detached_fault_report(self, step: str, detail: str, completed: tuple[int, ...]) -> None:
+    def detached_fault_arguments(self, command: str, *, resuming: bool = False) -> list[str]:
         rows = self.rows[:2]
-        record = staff.StaffSnapshot(rows)
-        path = self.root / f"{step}.log"
-        resuming = step.startswith("resume")
-        command = "agents restart" if resuming else "agents stop --all"
-        state = "back" if resuming else "stopped"
         data: restart.DetachedReport = {
             "retry": f"{command} --all" if resuming else command,
             "targets": {row.id: row.name for row in rows},
             "units": {row.id: row.name for row in rows},
             "issues": {},
         }
-        arguments = ["restart" if resuming else "stop", "--all", "--only", ",".join(row.id for row in rows),
-                     "--parent-report", json.dumps(data)]
+        return ["restart" if resuming else "stop", "--all", "--only", ",".join(row.id for row in rows),
+                "--parent-report", json.dumps(data)]
+
+    def assert_detached_signal_report(self) -> None:
+        path = self.root / "signal.log"
+        script = """\
+import os
+import runpy
+import signal
+import sys
+
+ready_fd = int(sys.argv[sys.argv.index('--ready-fd') + 1])
+write = os.write
+
+def signal_at_readiness(fd, data):
+    if fd == ready_fd:
+        os.kill(os.getpid(), signal.SIGTERM)
+        raise RuntimeError('SIGTERM did not interrupt the command')
+    return write(fd, data)
+
+os.write = signal_at_readiness
+runpy.run_module('scripts.agents.restart', run_name='__main__', alter_sys=True)
+"""
+        command = "agents stop --all"
+        read_fd, ready_fd = os.pipe()
+        with os.fdopen(read_fd, "rb"), os.fdopen(ready_fd, "wb"), path.open("ab") as log:
+            _ = log.write(f"{path}\n".encode())
+            log.flush()
+            result = subprocess.run([sys.executable, "-c", script, "--log", str(path), "--log-fd", str(log.fileno()),
+                                     "--ready-fd", str(ready_fd), *self.detached_fault_arguments(command)],
+                                    cwd=Path(restart.__file__).resolve().parents[2],
+                                    pass_fds=(ready_fd, log.fileno()), capture_output=True, timeout=10, check=False)
+        self.assertEqual(result.returncode, -signal.SIGTERM, result.stderr.decode())
+        self.assertEqual(result.stdout, b"")
+        self.assertEqual(result.stderr, b"")
+        detail = "The detached command received SIGTERM"
+        self.assert_detached_fault_log(path, command, "stopped", (), (detail, detail),
+                                       "Nate runs agents stop --all there.")
+
+    def assert_detached_fault_report(self, step: str, detail: str, completed: tuple[int, ...], *,
+                                     second_detail: str | None = None) -> None:
+        rows = self.rows[:2]
+        record = staff.StaffSnapshot(rows)
+        path = self.root / f"{step}.log"
+        resuming = step.startswith("resume")
+        command = "agents restart" if resuming else "agents stop --all"
+        state = "back" if resuming else "stopped"
+        arguments = self.detached_fault_arguments(command, resuming=resuming)
         injected = False
         close = os.close
+        link = os.link
         sync = os.fsync
         file_io = io.FileIO
         write = restart._write_log  # pyright: ignore[reportPrivateUsage]
@@ -2072,6 +2120,11 @@ class RestartTests(RestartTestCase):
             if path.with_suffix(".claim").exists():
                 fail_at("claim close", OSError(errno.EIO, "Input/output error"))
 
+        def publish_claim(source: Path, destination: Path) -> None:
+            link(source, destination)
+            if destination == path.with_suffix(".claim"):
+                fail_at("claim publication", KeyboardInterrupt(detail))
+
         def open_log(descriptor: int, mode: str, *, closefd: bool) -> io.FileIO:
             fail_at("log open", OSError(detail))
             return file_io(descriptor, mode, closefd=closefd)
@@ -2083,12 +2136,20 @@ class RestartTests(RestartTestCase):
             fail_at("staff read", OSError(detail))
             return record
 
+        def fail_row(action: str, row: staff.StaffRow) -> None:
+            nonlocal injected
+            index = rows.index(row)
+            if step == f"{action} both":
+                injected = True
+                raise BaseException(detail if index == 0 else second_detail)
+            fail_at(f"{action} {index}", BaseException(detail))
+
         def stop_row(row: staff.StaffRow, *_args: object, **_options: object) -> bool:
-            fail_at(f"stop {rows.index(row)}", BaseException(detail))
+            fail_row("stop", row)
             return True
 
         def start_row(row: staff.StaffRow, *_args: object, **_options: object) -> str:
-            fail_at(f"resume {rows.index(row)}", BaseException(detail))
+            fail_row("resume", row)
             return ""
 
         def write_log(log: io.FileIO, result: str) -> None:
@@ -2106,6 +2167,7 @@ class RestartTests(RestartTestCase):
             sync(descriptor)
 
         with (path.open("ab") as log, patch.object(os, "close", side_effect=close_claim),
+              patch.object(os, "link", side_effect=publish_claim),
               patch.object(io, "FileIO", side_effect=open_log),
               patch.object(restart, "_notify_log_claim", side_effect=ready),
               patch.object(staff, "initial_snapshot", side_effect=snapshot),
@@ -2120,27 +2182,37 @@ class RestartTests(RestartTestCase):
             self.assertEqual(self.detached_stop(path, arguments), 2)
         self.assertTrue(injected)
         self.assertEqual(errors.getvalue(), "")
-        before_stop = {"claim close", "log open", "readiness", "staff read", "plan write", "plan sync"}
+        before_stop = {"claim publication", "claim close", "log open", "readiness", "staff read", "plan write", "plan sync"}
         if step in before_stop:
             stop.assert_not_called()
         self.assertEqual(start.call_count, len(rows) if resuming else 0)
+        self.assertEqual(path.with_suffix(".claim").read_text(), f"{os.getpid()}\n")
+        recovery = ("Nate runs agents stop --all there." if step in before_stop - {"staff read"} else
+                    "Nate sends this error to the efficiency unit.")
+        self.assert_detached_fault_log(path, command, state, completed, (detail, second_detail or detail), recovery)
+
+    def assert_detached_fault_log(self, path: Path, command: str, state: str, completed: tuple[int, ...],
+                                  details: tuple[str, str], recovery: str) -> None:
+        rows = self.rows[:2]
         contents = path.read_text()
         result = contents.splitlines()
+        self.assertEqual(result[0], str(path))
         self.assertNotIn("Partial report", contents)
         count = f"{command}: {len(completed)} of {len(rows)} sessions {state}."
         self.assertEqual(sum(line.startswith(f"{command}: ") and " sessions " in line for line in result), 1)
         self.assertIn(count, result)
-        recovery = ("Nate runs agents stop --all there." if step in before_stop - {"staff read"} else
-                    "Nate sends this error to the efficiency unit.")
         for index, row in enumerate(rows):
             issue, = [line for line in result if line.startswith(f"{row.name}: ")]
             if index in completed:
                 self.assertIn(f"The session is {state}.", issue)
             else:
                 self.assertIn(f"Could not confirm the session is {state}", issue)
-                self.assertIn(detail, issue)
+                self.assertIn(details[index], issue)
                 self.assertIn(recovery, issue)
-        self.assertIn(detail, contents)
+                if details[0] != details[1]:
+                    self.assertNotIn(details[1 - index], issue)
+        for detail in details:
+            self.assertIn(detail, contents)
         self.assertIn(recovery, result[-1])
 
     def test_restart_counts_an_idle_worker_when_its_last_turn_has_no_reply(self) -> None:

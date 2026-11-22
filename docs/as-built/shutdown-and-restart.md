@@ -653,6 +653,7 @@ On macOS, the detached process confirms the claim through a pipe.
 The parent tries to create the same claim file after the launcher returns.
 If the child claims the log, the parent prints one line with the log path and the background status.
 The child writes a failure report if a step fails after it claims the log.
+If SIGKILL or power loss leaves only the log path, run `agents restart` again.
 The failure report names each selected session and records its known result.
 The detached process writes and flushes the full list of sessions before it stops any session.
 If the parent claims the log, it reports the count, the cause, and the step in the terminal and the log.
