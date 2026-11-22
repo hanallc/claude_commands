@@ -1,5 +1,6 @@
 """Exercise guarded deployment with a private AWS executable and no network."""
 from __future__ import annotations
+from scripts.build_targets.target_test_support import mac_target_settings
 from scripts.lint.memory_test_support import write_config_fixture
 
 from collections.abc import Callable, Generator, Mapping, Sequence
@@ -29,6 +30,7 @@ from unittest import mock
 from scripts.aws_target import admin_secrets, aws_cli, aws_target, aws_trial, box, config as aws_config, deploy, gate_box, gate_probe, gpu_size_trial, hana_box, hana_image, hana_render, hana_spend, ledger, plan_identity, plan_run, remote
 from scripts.aws_target.control_test_support import TestClock
 from scripts.aws_target.controller_lock import HanaCommandAccess, account_stack_lock, hana_command_lock
+from scripts.aws_target.hana_image_test_support import guest_digest_fixture
 from scripts.aws_target.ledger_test_support import CostFixture, account_reply, numeric_settings, text_setting, write_hana_config
 from scripts.aws_target.hana_provider import AwsHanaProvider
 from scripts.aws_target.measurement_test_support import DAY, narrow
@@ -447,6 +449,7 @@ class HanaSetupFailureTests(CostFixture):
     @override
     def setUp(self) -> None:
         super().setUp()
+        self.enterContext(guest_digest_fixture(self.root))
         self.clock = TestClock()
         self.workload = write_hana_config()
         self.setup_path = self.state / 'hana/setup.json'
@@ -5109,7 +5112,8 @@ else: raise AssertionError(args)
 
     def test_down_removes_resources_and_preserves_spend_and_other_profiles(self) -> None:
         devices = self.removal_fixture()
-        _ = write_config_fixture(self.root / 'build_targets.conf', 'targets=mac,natedev\n')
+        _ = write_config_fixture(self.root / 'build_targets.conf', defaults=mac_target_settings())
+        _ = write_config_fixture(self.root / 'mac_test.conf', defaults='')
         self.assertEqual([target.name for target in target_config.read_targets()], ['mac', 'natedev'])
         original = self.settings.read_bytes()
         before = ledger.CostLedger(self.state).read_snapshot()

@@ -950,7 +950,7 @@ elif name == 'cargo':
         for args in (['init', '-q'], ['add', '.'], ['-c', 'user.name=Fixture', '-c',
                      'user.email=fixture@example.invalid', 'commit', '-qm', 'Fixture source']):
             _ = subprocess.run(['git', *args], cwd=repo, check=True, capture_output=True, timeout=10)
-        commit = trial.checked(['git', 'rev-parse', 'HEAD'], repo)
+        commit = trial.checked(['git', 'rev-parse', 'HEAD'], repo, environment=dict(os.environ))
         folder = trial.trial_root() / 'trial'
         folder.mkdir(parents=True)
         outside = self.root / 'profile-target'

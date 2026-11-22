@@ -4,6 +4,7 @@ from __future__ import annotations
 import unittest
 from pathlib import Path
 from typing import final
+from scripts.mac_test.config_test_support import MAC_RUN_SETTINGS
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.direct.verify_mac_offload_test_support import VerifyMacOffloadFixture
 
@@ -22,7 +23,7 @@ class VerifyMacConfigurationTests(VerifyMacOffloadFixture):
 
     def test_alternate_target_settings_are_passed_to_runner(self) -> None:
         alternate = self.root / "alternate Mac.conf"
-        _ = write_config_fixture(alternate, f"offload=on\nlinux_only.{self.root.name}=\n", template="mac_test")
+        _ = write_config_fixture(alternate, f"offload=on\nlinux_only.{self.root.name}=\n", defaults=MAC_RUN_SETTINGS)
         config = Path(self.environment["CONF_DIR"]) / "build_targets.conf"
         _ = config.write_text(config.read_text().replace("mac settings.conf", alternate.name))
         result = self.verify("test", "sample", "--filter", "alpha", "--no-cache",

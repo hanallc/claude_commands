@@ -8,12 +8,16 @@ import unittest
 from unittest import mock
 
 from scripts.build_queue import admission_protocol as wire, admission_records as records
-from scripts.build_queue import admission_service, head_stall, memory_feed, queue_snapshot, queue_view
+from scripts.build_queue import admission_service, head_stall, queue_snapshot, queue_view
 from scripts.build_queue.admission_test_support import AdmissionFixture, GIB, only_admitted
 from scripts.build_queue.queue_fixture import write_memory_config
 from scripts.build_queue.test_placement import PlacementFixture, local_candidate, placement_request, publish_candidate
 from scripts.buildlog import store
 from scripts.lint import memory_admit as gate
+from scripts.lint.memory_test_support import fixture_feed_code_settings
+
+with fixture_feed_code_settings():
+    from scripts.build_queue import memory_feed
 
 
 class BuildSpaceTests(unittest.TestCase):

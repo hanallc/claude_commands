@@ -40,6 +40,7 @@ from scripts.lib.atomic_file import write_text_atomic
 def setUpModule() -> None:
     # Session fixtures have no panes unless a test supplies pane evidence.
     _ = unittest.enterModuleContext(mock.patch.object(herdr.Herdr, "panes", return_value=[]))
+    unittest.enterModuleContext(mock.patch.dict(os.environ, {"USER_ZONE": "America/New_York"}))
 
 
 class AddUnitResumeFolderTests(AddUnitTestCase):

@@ -22,6 +22,7 @@ from typing import IO, cast, override
 from unittest import mock
 
 from scripts.lib.socket_test_support import short_socket_directory
+from scripts.lint.memory_test_support import write_config_fixture
 from scripts.message.process_test_support import OwnedTestProcesses
 from scripts.notify import push_texts  # noqa: E402
 from scripts.message import rca  # noqa: E402
@@ -106,6 +107,7 @@ class RcaTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        _ = write_config_fixture(self.root / "rca.conf", defaults="# range: 0.001..\nsend_seconds=300\n")
         self.log = self.root / "sends.jsonl"
         stub = self.root / "send.py"
         _ = stub.write_text(STUB)
@@ -118,7 +120,7 @@ class RcaTests(unittest.TestCase):
         removed = ("CLAUDE_CODE_SESSION_ID", "RCA_TEST_EXIT")
         environment = {key: value for key, value in os.environ.items() if key not in removed and not key.startswith("SHOWRUNNER_")}
         self.enterContext(mock.patch.dict(os.environ, environment | {
-            "RCA_TEST_LOG": str(self.log), "USER_ZONE": "America/Puerto_Rico",
+            "RCA_TEST_LOG": str(self.log), "USER_ZONE": "America/Puerto_Rico", "CONF_DIR": str(self.root),
             "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions"), "NOTIFY_STATE_DIR": str(self.root / "notify")},
             clear=True))
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
@@ -260,7 +262,8 @@ else:
     path.parent.mkdir(parents=True, exist_ok=True)
     stall_watch.save_prompt(path, stall_watch.PromptWait(session_id='owner', created=0, key='owner-key', since=0, alerted=False, tool='tool', retiring=False))
     stall_watch.send_all([stall_watch.Delivery(path, 'prompt-owner',
-        [sys.executable, str(stall_watch.SEND), '--to', 'fake-owner', '--text', 'permission request'])], 60)
+        [sys.executable, str(stall_watch.SEND), '--to', 'fake-owner', '--text', 'permission request'])],
+        60, limits=stall_watch.SenderLimits(90, 2))
     failure = ''
 pathlib.Path(os.environ['OWNER_TEST_RETURN']).write_text(json.dumps({
     'failure': failure, 'delivered': pathlib.Path(os.environ['OWNER_TEST_RECEIPT']).exists()}))
@@ -516,6 +519,7 @@ subprocess.run([sys.executable, '-c',
 
     def test_a_fixed_case_under_silence_leaves_only_its_fixed_push_for_silence_end(self) -> None:
         """The alert and the started push are kept under silence; at its end only the fixed push goes, once."""
+        _ = write_config_fixture(self.root / "send.conf", defaults="# range: 0.001..\nuser_cancel_timeout=3\n")
         with redirect_stdout(io.StringIO()):
             self.assertEqual(silence.on(None, lambda _argv: 0), 0)
         sender = "cargo-liner"
@@ -545,8 +549,8 @@ subprocess.run([sys.executable, '-c',
         with mock.patch.object(rca, "send", side_effect=deliver):
             self.assertEqual(self.quiet(["start", "261023-1", "--owner", "builds"])[0], 0)
             self.assertEqual(len(silence.read_kept()), 2)
-            code, out, _ = self.quiet(["fixed", "261023-1", "--cause", CAUSE, "--fix", FIX, "--commit", "abc"])
-        self.assertEqual(code, 0)
+            code, out, errors = self.quiet(["fixed", "261023-1", "--cause", CAUSE, "--fix", FIX, "--commit", "abc"])
+        self.assertEqual(code, 0, out + errors)
         self.assertIn("dropped 1 kept push\n", out)
         delivered: list[silence.KeptPush] = []
 

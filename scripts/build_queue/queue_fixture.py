@@ -18,7 +18,7 @@ from typing import TYPE_CHECKING, cast
 from scripts.build_queue import snapshot_codec as codec
 from scripts.buildlog import store
 from scripts.lint import memory_admit as gate
-from scripts.lint.memory_test_support import admission_policy_fixture, fake_memory_readings, write_config_fixture
+from scripts.lint.memory_test_support import admission_policy_fixture, fake_memory_readings, write_config_fixture, admission_fixture_settings
 from scripts.build_queue.scope_activity import IdleService, RunningServiceJob, NotServiceSlice, LiveBuildRun
 
 if TYPE_CHECKING:
@@ -66,7 +66,7 @@ STEPS = (
 
 def write_memory_config(path: Path, **changes: str | None) -> None:
     """Write one complete, private memory configuration for admission consumers."""
-    _ = write_config_fixture(path, template="build_admission")
+    _ = write_config_fixture(path, defaults=admission_fixture_settings())
     lines = [line for line in path.read_text().splitlines()
              if not line.startswith("peak_hold_seconds.")
              and (not line.startswith("program_first_peak_gib.")

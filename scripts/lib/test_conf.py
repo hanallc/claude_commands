@@ -33,7 +33,7 @@ class ConfTests(unittest.TestCase):
         self.path = self.directory / "example.conf"
         repository = self.root / "repository-config"
         _ = write_config_fixture(repository / "accounts.conf",
-                                 "usage_stale_minutes=10\nnotes_directory=~/rust/hanadocs/agents\n")
+                                 defaults="# whole: 1..\nusage_stale_minutes=10\nnotes_directory=~/rust/hanadocs/agents\n")
         original = cast(Callable[[str], Path], getattr(conf, "_repository_path"))
 
         def repository_path(stem: str) -> Path:
@@ -708,6 +708,7 @@ conf_reads.record('disabled')
 
     def test_editable_line_keeps_each_dotted_model_key_independent(self) -> None:
         source = self.directory / "statusline.conf"
+        _ = (self.directory / "machines.conf").write_text("aliases=fixture\n", encoding="utf-8")
         keys = ("model.gpt-6", "model.gpt-6.2-sol", "model.gpt-6.2-sol.preview")
         for order in (keys, keys[::-1]):
             with self.subTest(order=order):
@@ -769,22 +770,101 @@ conf_reads.record('disabled')
         self.assertEqual(live.value, Decimal("7.25"))
 
 
+class ShippedChecks(unittest.TestCase):
+    shipped: Path = Path()
+
+    @override
+    def setUp(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.shipped = root / "config"
+        self.shipped.mkdir()
+
+    def test_check_accepts_valid_shipped_values(self) -> None:
+        _ = (self.shipped / "example.conf").write_text("mode=slow\n# whole: 0..9\ncount=4\n")
+        conf.check_shipped(self.shipped)
+
+    def test_check_rejects_a_shipped_value_outside_its_limit(self) -> None:
+        _ = (self.shipped / "example.conf").write_text("[pool]\n# whole: 0..9\ncount=10\n")
+        with self.assertRaises(conf.Unusable) as failure:
+            conf.check_shipped(self.shipped)
+        self.assertEqual(str(failure.exception),
+                         "config/example.conf: count='10': outside range 0..9 (# whole: 0..9).")
+
+    def test_console_duplicate_keys_cross_section_headings(self) -> None:
+        _ = (self.shipped / "console.conf").write_text("owner.default=first\n[other]\nowner.default=second\n")
+        with self.assertRaises(conf.Unusable) as failure:
+            conf.check_shipped(self.shipped)
+        self.assertEqual(str(failure.exception), "config/console.conf: Duplicate key owner.default.")
+
+    def test_model_registry_keys_have_section_scope(self) -> None:
+        source = "[first]\nimpl=one\n[second]\nimpl=two\n"
+        shipped = self.shipped / "models.conf"
+        _ = shipped.write_text(source)
+        conf.check_shipped(self.shipped)
+        _ = shipped.write_text(source + "impl=three\n")
+        with self.assertRaisesRegex(conf.Unusable, r"Duplicate key impl in section second"):
+            conf.check_shipped(self.shipped)
+
+    def test_design_role_keys_use_case_insensitive_section_scope(self) -> None:
+        source = "[first]\nhost=one\n[second]\nHOST=two\n"
+        shipped = self.shipped / "design_roles.conf"
+        _ = shipped.write_text(source)
+        conf.check_shipped(self.shipped)
+        _ = shipped.write_text(source + "host=three\n")
+        with self.assertRaisesRegex(conf.Unusable, r"option 'host' in section 'second' already exists"):
+            conf.check_shipped(self.shipped)
+
+    def test_issue_score_workers_require_a_limit(self) -> None:
+        shipped = self.shipped / "issue_score.conf"
+        source = "workers=8\n"
+        _ = shipped.write_text("# whole: 1..\n" + source)
+        conf.check_shipped(self.shipped)
+        _ = shipped.write_text(source)
+        with self.assertRaisesRegex(conf.Unusable, r"config/issue_score\.conf: workers: Expected .* limit"):
+            conf.check_shipped(self.shipped)
+
+    def test_copy_exemptions_require_a_reason(self) -> None:
+        shipped = self.shipped / "copies.conf"
+        source = "[allow-list]\nallow.example.py="
+        _ = shipped.write_text(source + "Creates the original checkout.\n")
+        conf.check_shipped(self.shipped)
+        _ = shipped.write_text(source + "   # No reason\n")
+        with self.assertRaisesRegex(conf.Unusable, r"config/copies\.conf: allow\.example\.py='': value is empty"):
+            conf.check_shipped(self.shipped)
+
+    def test_context_deferral_allows_phrase_lists_and_requires_one_window(self) -> None:
+        source = "window: 200\naction: act\nmarker: first\nmarker: second\nexclude: hook\n"
+        shipped = self.shipped / "context_deferral.conf"
+        _ = shipped.write_text(source)
+        conf.check_shipped(self.shipped)
+        _ = shipped.write_text(source + "window: 100\n")
+        with self.assertRaises(conf.Unusable) as failure:
+            conf.check_shipped(self.shipped)
+        self.assertEqual(str(failure.exception),
+                         "config/context_deferral.conf: Duplicate key window.")
+
+    def test_context_deferral_rejects_whitespace_before_the_colon(self) -> None:
+        shipped = self.shipped / "context_deferral.conf"
+        _ = shipped.write_text("window : 200\naction: act\nexclude: hook\n")
+        with self.assertRaisesRegex(conf.Unusable, r"config/context_deferral\.conf: Invalid context deferral entry"):
+            conf.check_shipped(self.shipped)
+
+
 class HanaConfigurationTests(unittest.TestCase):
     source: Path = Path(__file__).resolve().parents[2] / "config/hana_aws.conf"
 
     def test_render_configuration_has_no_host_suffixes(self) -> None:
-        settings = conf.settings(self.source.read_text())
-        self.assertTrue(settings)
-        for key in settings:
+        keys = conf.shipped_keys(self.source)
+        self.assertTrue(keys)
+        for key in keys:
             with self.subTest(key=key):
                 self.assertNotIn('.', key)
 
     def test_execution_values_have_no_copies_in_hana_configuration(self) -> None:
-        settings = conf.settings(self.source.read_text())
+        keys = conf.shipped_keys(self.source)
         for key in ('execution_compiler_version', 'execution_shell_timeout_s', 'execution_command_timeout_s'):
-            self.assertNotIn(key, settings)
-        self.assertEqual(sum(line.startswith('free_floor_gib=')
-            for line in self.source.read_text().splitlines()), 1)
+            self.assertNotIn(key, keys)
+        self.assertIn("free_floor_gib", keys)
 
 
 if __name__ == "__main__":

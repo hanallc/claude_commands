@@ -18,10 +18,15 @@ from zoneinfo import ZoneInfo
 
 from scripts.agents.remote import local_machine
 from scripts.lib import atomic_file, conf
+from scripts.lint.memory_test_support import write_config_fixture
 from scripts.message import send_result
 from scripts.production import change_review, delivery_state, investigation, record_store, staff, the_list, update_registration
+from scripts.production.change_review_test_support import (
+    REVIEW_DELIVERY_SETTINGS, REVIEW_DISPLAY_SETTINGS, write_change_review_settings,
+)
 from scripts.production.test_investigation import OWNER, OTHER, RUNNER
 from scripts.review_links import change_page, list_page, question_record, review_items
+from scripts.review_links.test_page_frame import page_status_settings
 
 MORTY = staff.StaffRow(staff.StaffId("536997b5-4415-4cb1-b683-d777e02e9a22"), "producer", "morty", staff.StaffRoot(),
                        current_session=staff.StaffId("20fa30c6-3cad-493a-b74a-0e408a93f865"))
@@ -50,11 +55,18 @@ class TheListTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        configuration = self.root / "config"
+        write_change_review_settings(configuration, self.root)
+        defaults = REVIEW_DELIVERY_SETTINGS + REVIEW_DISPLAY_SETTINGS
+        _ = write_config_fixture(configuration / "review_links.conf", "delivery_pause_seconds=0\n", defaults=defaults)
+        _ = (configuration / "statusline.conf").write_text("")
+        _ = write_config_fixture(configuration / "console.conf", defaults=page_status_settings())
         staff_file = self.root / "staff.json"
         rows = [row.to_json() for row in (MORTY, RUNNER, OWNER, OTHER, BOB)]
         _ = staff_file.write_text(json.dumps({"schema": 1, "rows": rows}))
         self.enterContext(patch.dict(os.environ, {"HOME": str(self.root), "STAFF_FILE": str(staff_file),
             "SHOWRUNNER_STATE_DIR": str(self.root / "state"), "CODEX_THREAD_ID": "",
+            "CONF_DIR": str(configuration), "USER_ZONE": "America/New_York",
             "CLAUDE_CODE_SESSION_ID": MORTY.current_session}))
         _ = self.enterContext(patch.object(the_list, "now", return_value=START))
         _ = self.send_patch.start()

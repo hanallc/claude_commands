@@ -25,6 +25,7 @@ from unittest import mock
 
 from scripts.production import demote_showrunner, promote_showrunner, staff
 from scripts.agents import shutdown, stop_resume, restart_support
+from scripts.agents.test_support import write_machine_config
 from scripts.production.cli_fixture import invoke_cli
 from scripts.herdr import worker_panes
 from scripts.lib import transcripts, unit_runs
@@ -35,6 +36,10 @@ from scripts.lib.transcript_test_support import compressed_copy
 
 
 MISSING_ID = staff.StaffId("s00000000000")
+
+
+def setUpModule() -> None:
+    unittest.enterModuleContext(mock.patch.dict(os.environ, {"USER_ZONE": "America/New_York"}))
 
 
 class StaffCommandTestCase(StaffTestCase):
@@ -2353,7 +2358,9 @@ class StaffTests(StaffCommandTestCase):
         owner_results = [read() for read in reads]
         self.assertCountEqual(staff.find(), [staff.StaffRow.from_json(row) for row in cast(list[object], json.loads(owner_show.stdout))])
         local_file = self.mac_file
-        with self.machine("mac"):
+        configuration = self.root / "mac-config"
+        write_machine_config(configuration)
+        with self.machine("mac"), mock.patch.dict(os.environ, {"CONF_DIR": str(configuration)}):
             for read, expected in zip(reads, owner_results):
                 with self.subTest(read=read):
                     self.assertEqual(read(), expected)

@@ -1,7 +1,9 @@
 """Merge gate suites contracts."""
 
 from __future__ import annotations
-from scripts.lint.memory_test_support import copy_config_fixture, write_config_fixture
+from scripts.agents.test_support import SHUTDOWN_SETTINGS
+from scripts.lint.memory_test_support import seed_config_fixture_folder
+from scripts.message.session_send_test_support import SEND_TIMING_FIXTURES
 
 import unittest
 import fcntl
@@ -27,7 +29,7 @@ from scripts.production import change_review, gate, staff, showrunners
 from scripts.production.staff_test_support import isolated_staff_file, fixture_member
 from scripts.production.gate_modules import GateRefused
 from scripts.production.cli_fixture import invoke_cli
-from scripts.production.gate_test_support import gate_suites, wait_for_file
+from scripts.production.gate_test_support import NIGHTLY_RESULT_SETTINGS, gate_suites, wait_for_file
 from scripts.production.gate_suites_test_support import GateSuitesFixture
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
@@ -394,9 +396,8 @@ class NightlyPushTests(unittest.TestCase):
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         config = self.root / "config"
-        _ = copy_config_fixture(Path(__file__).resolve().parents[2] / "config", config)
-        _ = write_config_fixture(config / "gate.conf",
-            "nightly_result_push=on\nnightly_result_modules=8\nnightly_assign_minutes=30\n")
+        seed_config_fixture_folder(config, {**SEND_TIMING_FIXTURES,
+            "gate.conf": NIGHTLY_RESULT_SETTINGS, "shutdown.conf": SHUTDOWN_SETTINGS})
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
             "HOME": str(self.root), "CONF_DIR": str(config),
             "GATE_STATE_DIR": str(self.root / "state"), "USER_ZONE": "America/New_York"})))

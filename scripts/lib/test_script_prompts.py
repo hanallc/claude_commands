@@ -11,6 +11,15 @@ from typing import cast, override
 from unittest.mock import patch
 
 from scripts.lib import script_prompts  # noqa: E402
+from scripts.lint.memory_test_support import write_config_fixture
+
+
+def script_prompt_settings(max_records: int = 4096) -> str:
+    return f"# whole: 1..\nmax_records={max_records}\n"
+
+
+def write_script_prompt_fixture(configuration: Path, max_records: int = 4096) -> None:
+    _ = write_config_fixture(configuration / "script_prompts.conf", script_prompt_settings(max_records), defaults="")
 
 
 class ScriptPromptTests(unittest.TestCase):
@@ -20,7 +29,7 @@ class ScriptPromptTests(unittest.TestCase):
         self.addCleanup(folder.cleanup)
         configuration = Path(folder.name) / "config"
         configuration.mkdir()
-        _ = (configuration / "script_prompts.conf").write_text("# whole: 1..\nmax_records=4096\n")
+        write_script_prompt_fixture(configuration)
         _ = cast(object, self.enterContext(patch.dict(os.environ, {
             "CONVERSATION_PAUSE_STATE_DIR": folder.name, "CONF_DIR": str(configuration),
             "NOTIFY_STATE_DIR": str(Path(folder.name) / "notify")})))
@@ -51,8 +60,7 @@ class ScriptPromptTests(unittest.TestCase):
         self.assertTrue(script_prompts.typed_by_script("w1:p2", "/resume"))
 
     def test_full_store_removes_the_oldest_record_and_logs_its_cause(self) -> None:
-        configuration = Path(os.environ["CONF_DIR"]) / "script_prompts.conf"
-        _ = configuration.write_text("# whole: 1..\nmax_records=2\n")
+        write_script_prompt_fixture(Path(os.environ["CONF_DIR"]), max_records=2)
         script_prompts.record("w1:p1", "/resume")
         oldest = next(path for path in script_prompts.root().iterdir() if path.name != ".lock")
         os.utime(oldest, (1, 1))

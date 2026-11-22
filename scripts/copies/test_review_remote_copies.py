@@ -37,6 +37,9 @@ from scripts.lib import process_start as process_identity
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.process_group import send_process_group
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.mac_test.config_test_support import MAC_OFFLOAD_SETTINGS, MAC_SWEEP_SETTINGS
+from scripts.lint.config_test_support import SWEEP_FLOOR_SETTINGS
+from scripts.build_targets.target_test_support import mac_target_settings
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.mac_test import eligibility, offload
 from scripts.mac_test import mac_test, claim_state
@@ -656,7 +659,7 @@ with (mock.patch.object(linux_runner, 'prepare_shell', return_value=linux_runner
     def admission(self, *, free_gib: float = 200) -> Generator[tuple[offload.ProcessController,
             eligibility.OffloadConfig, offload.OffloadRequest]]:
         settings = self.root / "target.conf"
-        _ = write_config_fixture(settings, "slots=2\n", template="mac_test")
+        _ = write_config_fixture(settings, "slots=2\n", defaults=MAC_OFFLOAD_SETTINGS)
         target = target_config.SshTarget("linux", "linux", settings)
         config = eligibility.OffloadConfig(True, eligibility.SshConnectionSettings("host", 1, 1),
                                       1, 1, 1, "1", {"slots": "2"})
@@ -745,7 +748,7 @@ with (mock.patch.object(linux_runner, 'prepare_shell', return_value=linux_runner
                 with self.admission() as (controller, config, request):
                     settings = self.root / "target.conf"
                     _ = write_config_fixture(settings, "".join(f"{key}={value}\n" for key, value in values.items()),
-                                             template="mac_test")
+                                             defaults=MAC_OFFLOAD_SETTINGS)
                     empty_config = replace(config, values=values, source=settings)
                     with self.assertRaises(target_config.ConfigError):
                         _ = offload.run_offload(controller, empty_config, request, 0)
@@ -753,7 +756,7 @@ with (mock.patch.object(linux_runner, 'prepare_shell', return_value=linux_runner
     def test_bad_slot_capacity_raises_config_error_in_claims_and_admission(self) -> None:
         with self.admission() as (controller, config, request):
             settings = self.root / "target.conf"
-            _ = write_config_fixture(settings, "slots=bad\n", template="mac_test")
+            _ = write_config_fixture(settings, "slots=bad\n", defaults=MAC_OFFLOAD_SETTINGS)
             bad_config = replace(config, values={**config.values, "slots": "bad"}, source=settings)
             with self.assertRaises(target_config.ConfigError):
                 _ = mac_test.slot_capacity(mac_test.state_paths("linux"), mac_test.RepositoryScope("repository", "key"))
@@ -761,6 +764,9 @@ with (mock.patch.object(linux_runner, 'prepare_shell', return_value=linux_runner
                 _ = offload.run_offload(controller, bad_config, request, 0)
 
     def test_busy_refusal_names_the_session_from_the_unit_owner_chain(self) -> None:
+        configuration = Path(os.environ["CONF_DIR"])
+        _ = write_config_fixture(configuration / "mac_test.conf", defaults=MAC_OFFLOAD_SETTINGS)
+        _ = write_config_fixture(configuration / "build_targets.conf", defaults=mac_target_settings(local=False))
         run = self.root / "unit-run"
         owner = fixture_member("showrunner", name="director-session")
         _ = staff.set_run(owner.id, staff.OpenRun(run))
@@ -837,6 +843,9 @@ with (mock.patch.object(linux_runner, 'prepare_shell', return_value=linux_runner
 
     def test_cancelled_sweep_releases_real_locks_for_admission_and_owner_removal(self) -> None:
         from scripts.mac_test.mirror_root import MacMirrorRoot
+
+        _ = write_config_fixture(conf.path("mac_test"), defaults=MAC_OFFLOAD_SETTINGS + MAC_SWEEP_SETTINGS)
+        _ = write_config_fixture(conf.path("lint"), defaults=SWEEP_FLOOR_SETTINGS)
         mirror = self.mirror_record(path=MacMirrorRoot.read(conf.read("mac_test")).local_path() / "repository")
         self.assertEqual(publish_mirror(mirror), 0)
         entered, cancel = Event(), Event()

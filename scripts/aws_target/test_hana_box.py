@@ -17,6 +17,7 @@ from unittest import mock
 
 from scripts.aws_target import admin_secrets, aws_target, deploy, hana_box, hana_placement, hana_provider, hana_render, hana_replacement_record, hana_spend, ledger
 from scripts.aws_target.control_test_support import TestClock
+from scripts.aws_target.hana_image_test_support import guest_digest_fixture
 from scripts.aws_target.ledger_test_support import CostFixture, HANA_GUEST_RUNTIME_SETTINGS, git_only, text_setting
 from scripts.lib import conf, process_start
 
@@ -171,6 +172,7 @@ class HanaBoxTests(CostFixture):
     @override
     def setUp(self) -> None:
         super().setUp()
+        self.enterContext(guest_digest_fixture(self.root))
         _ = self.enterContext(mock.patch.object(subprocess, 'run', side_effect=git_only))
         self.clock = TestClock()
         self.workload_path = self.root / 'hana_aws.conf'

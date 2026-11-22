@@ -1,7 +1,8 @@
 """Check the shared review records, signed actions and table behavior."""
 from __future__ import annotations
-from scripts.lint.memory_test_support import write_config_fixture
+from scripts.lint.memory_test_support import fixture_feed_code_settings, write_config_fixture
 
+from scripts.production.config_test_support import QUESTION_TITLE_SETTINGS
 from scripts.production.change_review_test_support import pictured_changes
 
 import shutil
@@ -19,10 +20,12 @@ from collections.abc import Generator, Iterator
 from contextlib import contextmanager
 from datetime import datetime, timedelta, tzinfo
 from functools import partial
+from importlib import import_module
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Callable, Self, TextIO, cast
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib import atomic_file, conf, urgency
+from scripts.lib.build_folders_test_support import workspace_folder_settings
 from scripts.lib.user_zone import user_zone
 import unittest
 from dataclasses import replace
@@ -43,11 +46,24 @@ from scripts.production import change_review, change_routing, footer_counts, inv
 from scripts.review_links import change_browser, change_page, console, page_frame, record_table, review_items, review_page
 from scripts.review_links import question_record
 from scripts.review_links import list_page, staff_names, test_change_page
+from scripts.nightly_review.test_candidates import write_nightly_state_fixture
 from scripts.review_links import efficiency_reviews, new_item_dialog, review_actions, review_events, review_later, review_submissions
 from scripts.review_links.test_accounts_page import firefox_probe_results
 from scripts.review_links.test_page_frame import assert_status_states
 from scripts.review_links.test_record_table import save_notice_failures
 from scripts.statusline import counts_row
+
+
+with fixture_feed_code_settings():
+    _ = import_module("scripts.build_queue.memory_feed")
+
+
+ROLE_COLOR_CONFIG = (
+    "role.showrunner=#a379fd\n"
+    "role.unit-director=#ffaf02\n"
+    "role.producer=#90fe42\n"
+    "role.worker=#ff0404\n"
+)
 
 
 def unpack_index(payload: str) -> list[review_page.ReviewIndexEntry]:
@@ -167,17 +183,13 @@ class ReviewPageTests(unittest.TestCase):
 
     def configure_review(self) -> None:
         config = self.fixture.temporary / 'config'
-        _ = write_config_fixture(config / "production.conf", "question_title_max_chars=100\n")
-        _ = write_config_fixture(config / "console.conf",
-            "page.review.url=python:scripts.review_links.review_page:page_url\n"
-            + "page.review.items=python:scripts.review_links.review_page:waiting_items\n"
-            + "page.review.icon=inbox\npage.review.title=Review\n"
-            + "status.round_trip_limit_seconds=1\nstatus.render_limit_seconds=1\n"
-            + "status.reading_delay_seconds=1\nstatus.review.age_limit_seconds=45\n")
-        _ = write_config_fixture(config / "review_links.conf",
-            "review_words_rows=4\nlater_soon_minutes=60\nlater_evening=18:00\n"
-            + "later_evening_until=17:00\nlater_morning=09:00\nlater_week_day=Monday\nlater_week_time=09:00\n")
+        _ = write_config_fixture(config / "production.conf", defaults=QUESTION_TITLE_SETTINGS)
+        _ = write_config_fixture(config / "statusline.conf", defaults=ROLE_COLOR_CONFIG)
+        _ = write_config_fixture(config / "build_folders.conf",
+                                 defaults=workspace_folder_settings(self.fixture.temporary))
         self.root = self.fixture.root
+        _ = write_config_fixture(config / "memory_feed.conf",
+                                 defaults=f"output_folder={self.root / 'builds'}\n")
         _ = change_page.console_folder(self.root)
         self.status = change_page.DeliveryStatus(self.root)
         document = self.fixture.production.read_text()
@@ -674,6 +686,7 @@ window.fetch=(url,options)=>{
 
     def decisions(self) -> tuple[str, str]:
         """File one proposal and one efficiency for the page owner; return their Review keys."""
+        write_nightly_state_fixture(self.fixture.temporary / 'config', self.fixture.temporary)
         folder = self.fixture.temporary / 'decision-proposals'
         folder.mkdir()
         _ = (folder / 'P1.md').write_text('---\nstatus: open\ntags: [proposal]\nstage: backlog\n'
@@ -3573,8 +3586,6 @@ window.fetch=async()=>{reads++;throw new Error('An index filter requested the se
                     else:
                         proposal, efficiency = case.decisions()
                         key = proposal if kind == review_items.ReviewType.PROPOSAL else efficiency
-                        _ = write_config_fixture(case.fixture.temporary / 'config/nightly_review.conf',
-                            'state_folder=nightly-review\n')
                     old_id = ''
                     if wait in ('question', 'validate'):
                         delivery, _ = review_page.submit(case.root, case.body(key, wait, 'Check the old case.'), case.status)
@@ -4029,7 +4040,6 @@ window.fetch=async()=>{reads++;throw new Error('An index filter requested the se
             self.assertEqual(review_later.times()[key], until)
 
     def test_approve_and_decline_close_proposals_and_efficiencies(self) -> None:
-        _ = write_config_fixture(self.fixture.temporary / 'config/nightly_review.conf', 'state_folder=nightly-review\n')
         proposal, efficiency = self.decisions()
         folder = self.fixture.temporary / 'decision-proposals'
         ledger = self.fixture.temporary / 'decision-efficiency.md'

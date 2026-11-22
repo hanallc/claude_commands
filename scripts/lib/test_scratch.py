@@ -31,8 +31,11 @@ from scripts.copies.copies_test_support import copies_environment
 from scripts.production.cli_fixture import ImmutableGitSeed
 from scripts.lib import build_folders, build_slots, cargo_output, copy_record, git_files, process_group, scratch, session_folder, time_limit
 from scripts.lint import sweep
+from scripts.lint.config_test_support import SWEEP_SCAN_SETTINGS
 
 from scripts.lib import conf
+from scripts.lib.build_folders_test_support import workspace_folder_settings
+from scripts.lib.scratch_test_support import write_scratch_settings
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
 from scripts.message import sessions
 from scripts.production import staff
@@ -50,7 +53,11 @@ ROW = "row:cargo-liner-C54"
 def setUpModule() -> None:
     root = Path(tempfile.mkdtemp(prefix="scratch-test-module-")).resolve()
     unittest.addModuleCleanup(shutil.rmtree, root)
-    _ = cast(object, unittest.enterModuleContext(mock.patch.dict(os.environ, config_environment(root))))
+    write_scratch_settings(root, root)
+    _ = write_config_fixture(root / "build_folders.conf", defaults=workspace_folder_settings(root))
+    _ = cast(object, unittest.enterModuleContext(mock.patch.dict(os.environ, {
+        **config_environment(root), "USER_ZONE": "America/New_York",
+    })))
 
 
 class ScratchTests(unittest.TestCase):
@@ -1781,6 +1788,7 @@ assert scratch.removal_mark(path).is_file()
         self.assertGreater(scratch.holds()[str(checkout)]["ended"], 0)
 
     def test_standing_checkout_creates_a_stamped_cache_the_sweep_accepts(self) -> None:
+        _ = write_config_fixture(conf.path("lint"), defaults=SWEEP_SCAN_SETTINGS)
         seed = ImmutableGitSeed.create(self.base, "main", "Scratch tests", "scratch@example.invalid",
                                        {"Cargo.toml": "[workspace]\n", "source.txt": "style source\n"})
         started = time.time()

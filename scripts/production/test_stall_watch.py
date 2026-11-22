@@ -31,6 +31,7 @@ from pathlib import Path
 from typing import ClassVar, cast, override
 from zoneinfo import ZoneInfo
 
+from scripts.production.config_test_support import PROMPT_ALERT_SETTINGS
 from scripts.agents import detached_runs
 from scripts.lib import unit_runs
 from scripts.lib.test_models_registry import write_registry
@@ -40,7 +41,9 @@ from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 from scripts.production import showrunners, staff
 from scripts.agents.remote import local_machine
-from scripts.production.staff_test_support import isolated_staff_file, showrunner_relationship, unit_membership, fixture_member, fixture_runtime_id
+from scripts.production.staff_test_support import (
+    isolated_staff_file, showrunner_relationship, unit_membership, fixture_member, fixture_runtime_id, write_staff_settings,
+)
 from scripts.production import fake_unit_host
 from scripts.production.fake_unit_host import HostedUnit
 from scripts.herdr import fake_herdr
@@ -264,11 +267,10 @@ class StallWatchTests(unittest.TestCase):
         defaults = self.root / "watch-defaults.conf"
         _ = defaults.write_text(WATCH_DEFAULTS)
         _ = self.enterContext(mock.patch.object(stall_watch, "WATCH_DEFAULTS", defaults))
+        _ = write_staff_settings(self.root / "staff.conf", producers=self.root / "producers")
         configuration = {
-            "production": "# range: 0..\nPROMPT_ALERT_SECONDS=60\n",
+            "production": PROMPT_ALERT_SETTINGS,
             "rca": "# range: 0.001..\nsend_seconds=300\n",
-            "staff": ("# range: 0.001..\nOPERATION_LOCK_SECONDS=30\n# range: 0.001..\nREMOTE_SECONDS=20\n"
-                      + f"PRODUCER_WORKSPACE=producers\nPRODUCER_FOLDER_ROOT={self.root / 'producers'}\n"),
             "shutdown": "# range: 5e-324..\nSTART_SECONDS=20\n# range: 5e-324..\nSTAY_SECONDS=10\n",
         }
         for name, contents in configuration.items():

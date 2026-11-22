@@ -16,6 +16,14 @@ from scripts.message import codex_daemon
 if TYPE_CHECKING:
     from scripts.message import roster
 
+CODEX_DAEMON_SETTINGS = """\
+# range: 0.001..
+timeout_seconds=5.0
+# range: 0.001..
+queue_timeout_seconds=30
+agents_slice=app-agents.slice
+"""
+
 RpcMessage = dict[str, object]
 
 

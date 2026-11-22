@@ -39,6 +39,7 @@ from scripts.worktree import worktrees
 
 def setUpModule() -> None:
     _ = unittest.enterModuleContext(oracle_reader())
+    unittest.enterModuleContext(mock.patch.dict(os.environ, {"USER_ZONE": "America/New_York"}))
 
 SCRIPT = Path(add_style.__file__)
 STUB = '''import json

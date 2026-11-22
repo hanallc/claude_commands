@@ -21,6 +21,8 @@ from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 from scripts.lib.socket_test_support import short_socket_directory
+from scripts.lint.memory_test_support import config_environment
+from scripts.production.config_test_support import UNIT_TABLE_SETTINGS
 from scripts.production import fake_unit_host
 from scripts.production import showrunners
 from scripts.production import unit_lookup
@@ -34,6 +36,10 @@ from scripts.agents import remote
 from scripts.production.staff_test_support import fixture_member, isolated_staff_file, unit_membership, showrunner_relationship, fixture_runtime_id, fixture_worker, recorded_showrunner, StaffTestCase
 
 SCRIPT = Path(__file__).with_name("unit_lookup.py")
+
+
+def setUpModule() -> None:
+    unittest.enterModuleContext(mock.patch.dict(os.environ, {"USER_ZONE": "America/New_York"}))
 
 
 class UnitReferenceTests(StaffTestCase):
@@ -1179,8 +1185,12 @@ print(observed.row.id)
                 listing = live_units.read_units("show", check=staff_sources.CodexProcessThreads().check)
                 owner = listing.checked_unit(row.name)
                 self.assertEqual(owner, unit_lookup.checked_unit("show", row.name))
-                rendered = unit_phases.table(listing.units, {}, repository=self.root, census_read=census.Census(
-                    (), (census.CensusSession(row.current_session, "paused"),), ()))
+                settings = config_environment(
+                    self.root / "table-settings", fixtures={"production.conf": UNIT_TABLE_SETTINGS},
+                )
+                with mock.patch.dict(os.environ, settings):
+                    rendered = unit_phases.table(listing.units, {}, repository=self.root, census_read=census.Census(
+                        (), (census.CensusSession(row.current_session, "paused"),), ()))
                 self.assertIn("| trunk | busy |", rendered)
                 self.assertEqual(workers.live_unit_director(run), workers.LiveUnitDirector(row.current_session, pid))
         self.assertEqual(owner, unit_lookup.ProvedLiveUnit(LiveClaude("trunk", row.current_session, "", pid, "busy")))

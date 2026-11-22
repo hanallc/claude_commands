@@ -11,7 +11,7 @@ import os
 import re
 import time
 import subprocess
-from typing import cast
+from typing import cast, override
 from unittest import mock
 import unittest
 
@@ -21,9 +21,16 @@ from scripts.aws_target.ledger_test_support import account_reply, instant
 from scripts.aws_target.control_test_support import AwsReplies
 
 from scripts.buildlog import aws_report, index, report, store
+from scripts.lint.memory_test_support import write_config_fixture
+from scripts.mac_test.config_test_support import MAC_OFFLOAD_SETTINGS
 
 
 class MeasurementTests(MeasurementFixture):
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        _ = write_config_fixture(self.root / "mac_test.conf", defaults=MAC_OFFLOAD_SETTINGS)
+
     def test_missing_charge_tag_refuses_the_guard_before_any_fetch(self) -> None:
         self.seed_cost()
         self.remove("cost_explorer_tag_key")

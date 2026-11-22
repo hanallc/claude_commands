@@ -29,12 +29,49 @@ from scripts.production.staff_test_support import isolated_staff_file, showrunne
 from scripts.lint.memory_test_support import write_config_fixture
 
 
+MACHINE_SETTINGS = """\
+aliases=natedev mac
+# one of: linux, darwin
+natedev.platform=linux
+natedev.hosts=natedev
+# one of: linux, darwin
+mac.platform=darwin
+mac.hosts=Nates-MacBook-Pro-2023
+"""
+
+SHUTDOWN_SETTINGS = """\
+# whole: 1..300
+STOP_GRACE_SECONDS=2
+# whole: 1..300
+KILL_GRACE_SECONDS=5
+# whole: 1..300
+MOVE_STOP_MARGIN_SECONDS=3
+# whole: 0..240
+MOVE_BUILD_WAIT_MINUTES=30
+# whole: 1..300
+MOVE_BUILD_POLL_SECONDS=15
+# whole: 1..10080
+MOVE_ALERT_REPEAT_MINUTES=1440
+# range: 5e-324..
+START_SECONDS=20
+# range: 5e-324..
+OPENING_PROMPT_SECONDS=90
+# range: 5e-324..
+STAY_SECONDS=10
+# range: 0..300
+HOLDER_EXIT_SECONDS=5
+# range: 0..300
+OWN_PANE_SHELL_SECONDS=30
+# range: 0..3600
+RESUME_CHECK_SECONDS=180
+# range: 5e-324..300
+RESUME_CHECK_INTERVAL_SECONDS=5
+"""
+
+
 def write_machine_config(directory: Path) -> None:
     """Set the private workstation routes used by the tests."""
-    directory.mkdir(parents=True, exist_ok=True)
-    _ = write_config_fixture(directory / "machines.conf",
-        "aliases=natedev mac\nnatedev.platform=linux\n"
-        + "mac.platform=darwin\nmac.hosts=Nates-MacBook-Pro-2023\n")
+    _ = write_config_fixture(directory / "machines.conf", MACHINE_SETTINGS, defaults="")
 
 
 class ShutdownSendLeaf(StrEnum):

@@ -16,6 +16,7 @@ from scripts.aws_target import admin_secrets, aws_trial, deploy, hana_box, hana_
 from scripts.aws_target.config import DeploymentSettings
 from scripts.aws_target.control_test_support import TestClock
 from scripts.aws_target.controller_lock import HanaCommandAccess, account_stack_lock, control_lock, hana_command_lock
+from scripts.aws_target.hana_image_test_support import guest_digest_fixture
 from scripts.aws_target.ledger_test_support import CostFixture, text_setting
 from scripts.aws_target.test_hana_box import IDENTITY, FakeProvider, record_lifecycle_image, write_lifecycle_configuration
 from scripts.lib import conf
@@ -94,6 +95,7 @@ class PlanSetupTests(CostFixture):
     @override
     def setUp(self) -> None:
         super().setUp()
+        self.enterContext(guest_digest_fixture(self.root))
         self.region = conf.read(conf.path('hana_aws')).text('region')
         self.credentials_path = self.root / '.config/aws-build/credentials'
         self.credentials_path.parent.mkdir(parents=True)
@@ -711,6 +713,7 @@ class GatePlanTests(CostFixture):
     @override
     def setUp(self) -> None:
         super().setUp()
+        self.enterContext(guest_digest_fixture(self.root))
         self.regions = (GATE_HOME, GATE_REGION)
         with account_stack_lock(self.state):
             pass

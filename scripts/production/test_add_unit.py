@@ -7,6 +7,7 @@ from scripts.production.staff_test_support import unit_membership, fixture_membe
 from scripts.lib import build_folders, names
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.test_names import fixture_names
+from scripts.lib.test_script_prompts import write_script_prompt_fixture
 from scripts.lib.test_models_registry import claude_catalog_environment, write_registry
 from scripts.lib.transcript_test_support import compressed_copy
 
@@ -17,6 +18,7 @@ import shlex
 import socket
 import shutil
 import subprocess
+import tempfile
 import time
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
@@ -26,7 +28,9 @@ from typing import Callable, cast, final, override
 from unittest.mock import call, patch
 from zoneinfo import ZoneInfo
 
+from scripts.lint.memory_test_support import write_config_fixture
 from scripts.production import add_unit
+from scripts.production.config_test_support import UNIT_PORT_SETTINGS
 from scripts.production import unit_lookup
 from scripts.message import sessions
 from scripts.herdr.herdr import HerdrPlace
@@ -42,6 +46,10 @@ LAUNCHED_AT = datetime(2026, 10, 6, 12, tzinfo=ZoneInfo("America/Los_Angeles"))
 
 def setUpModule() -> None:
     configure_test_zone()
+    configuration = Path(unittest.enterModuleContext(tempfile.TemporaryDirectory()))
+    _ = write_config_fixture(configuration / 'production.conf', defaults=UNIT_PORT_SETTINGS)
+    write_script_prompt_fixture(configuration)
+    _ = cast(object, unittest.enterModuleContext(patch.dict(os.environ, {'CONF_DIR': str(configuration)})))
 
     def start_command(client: herdr.Herdr, argv: list[str], kind: str, pane: str,
                       timeout: float) -> subprocess.CompletedProcess[str]:

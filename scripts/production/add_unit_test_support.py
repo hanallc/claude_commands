@@ -207,8 +207,11 @@ def configure_test_zone() -> None:
 
 
 from scripts.production.staff_test_support import (
-    StaffTestCase, fixture_runtime_id, unit_membership,
+    StaffTestCase, fixture_runtime_id, unit_membership, write_staff_settings,
 )
+from scripts.lib.build_folders_test_support import workspace_folder_settings
+from scripts.lib.build_slots_test_support import copy_fixture_settings
+from scripts.lib.test_script_prompts import write_script_prompt_fixture
 
 
 class ObservedUnitLaunch:
@@ -321,14 +324,15 @@ class AddUnitTestCase(ShutdownTestCase):
         self.config = self.root / "home/.claude/config/showrunners.json"
         self.prompt = self.root / "home/.local/state/showrunner/build-followups/prompt.txt"
         home = self.root / "home"
-        (home / ".claude/config").mkdir(parents=True)
-        config_root = self.root / "config"
-        configuration = config_environment(config_root)
-        _ = write_config_fixture(config_root / "build_folders.conf",
-            f"roots.workspace={self.root / 'worktrees'}\nroots.build={self.root / 'build'}\n"
-            + f"roots.build.natedev={self.root / 'build'}\n")
-        copies_config = config_root / "copies.conf"
-        _ = write_config_fixture(copies_config, "# range: 0.001..\ngit_timeout_seconds=10\n")
+        (home / ".claude").mkdir(parents=True)
+        copies = self.config.with_name("copies.conf")
+        _ = write_config_fixture(copies, defaults=copy_fixture_settings(self.root, git_timeout_seconds=10))
+        _ = write_config_fixture(self.config.with_name("build_folders.conf"), f"roots.workspace={self.root / 'worktrees'}\n",
+                                 defaults=workspace_folder_settings(self.root))
+        write_script_prompt_fixture(self.config.parent)
+        staff_config = write_staff_settings(self.config.with_name("staff.conf"), producers=self.root / "producers")
+        configuration = config_environment(self.config.parent)
+        self.enterContext(patch.dict(os.environ, {**configuration, "COPIES_CONFIG": str(copies)}))
         _ = (home / ".claude.json").write_text(
             json.dumps({"oauthAccount": {"emailAddress": "owner@example.com"},
                         "projects": self.trusted_projects()}),
@@ -362,7 +366,6 @@ class AddUnitTestCase(ShutdownTestCase):
         _ = sync_state.touch()
         self.env = {**os.environ, **configuration, "HOME": str(home),
                     "HERDR_PLATFORM": "linux",
-                    "COPIES_CONFIG": str(copies_config),
                     "TOKIO_WORKER_THREADS": "1",
                     "NOTIFIER_SESSIONS_DIR": str(registry),
                     "FAKE_CLAUDE_SOCKET": str(self.root / "claude.sock"),
@@ -376,7 +379,8 @@ class AddUnitTestCase(ShutdownTestCase):
                     "CODEX_CONFIG_FILE": str(codex_config),
                     "CODEX_MODELS_CACHE_FILE": str(codex_cache),
                     "CODEX_CATALOG_SYNC_STATE_FILE": str(sync_state)}
-        self.env["STAFF_FILE"] = str(self.staff.staff_file)
+        self.env.update(CONF_DIR=str(self.config.parent), STAFF_FILE=str(self.staff.staff_file),
+                        STAFF_CONFIG=str(staff_config), COPIES_CONFIG=str(copies))
         socket_path = Path(self.enterContext(short_socket_directory())) / "claude.sock"
         messaging = socket.socket(socket.AF_UNIX)
         self.addCleanup(messaging.close)

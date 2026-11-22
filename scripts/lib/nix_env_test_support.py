@@ -12,10 +12,32 @@ from unittest.mock import patch
 
 from scripts.buildlog.store import host_name
 from scripts.lib.build_slots_test_support import write_private_slot_roots
-from scripts.lint.memory_test_support import copy_config_fixture, write_config_fixture
+from scripts.lib.scratch_test_support import write_scratch_settings
+from scripts.lint.memory_test_support import config_environment, write_config_fixture
 
 ROOT = Path(__file__).resolve().parents[2]
 HELPER = ROOT / "scripts/lib/nix_env.py"
+
+NIX_TEXT_SETTINGS = {
+    "trusted_home_folders": "rust worktrees",
+    "trusted_home_prefix": ".claude",
+    "heal_state_directory": "~/.local/state/nix-heal",
+    "session_directory_glob": ".claude*/sessions",
+}
+NIX_NUMBER_SETTINGS = {
+    "command_timeout_seconds": (600, "0.001.."),
+    "restart_interval_seconds": (3600, "0.."),
+    "relaunch_launch_seconds": (90, "0.."),
+    "relaunch_confirmation_seconds": (30, "0.."),
+    "alert_timeout_seconds": (30, "0.001.."),
+}
+
+
+def nix_fixture_settings() -> str:
+    return ("".join(f"# text: fixture\n{key}={value}\n" for key, value in NIX_TEXT_SETTINGS.items())
+            + "".join(f"# range: {limit}\n{key}={value}\n"
+                      for key, (value, limit) in NIX_NUMBER_SETTINGS.items()))
+
 
 DIRENV = '''import json, os, sys
 from pathlib import Path
@@ -50,10 +72,11 @@ class NixFixture(unittest.TestCase):
         self.bin = self.root / "bin"
         self.bin.mkdir()
         configuration = self.root / "settings"
-        _ = copy_config_fixture(ROOT / "config", configuration)
+        _ = write_config_fixture(configuration / "nix_env.conf", defaults=nix_fixture_settings())
+        _ = write_config_fixture(configuration / "build_steps.conf", defaults="names.integrate=integrate\n")
+        _ = config_environment(configuration)
+        write_scratch_settings(configuration, self.root)
         write_private_slot_roots(configuration / "build_folders.conf", self.root, host_name())
-        _ = write_config_fixture(configuration / "nix_env.conf",
-                                 "trusted_home_folders=rust worktrees\ntrusted_home_prefix=.claude\n")
         self.env = {"CONF_DIR": str(configuration), "HOME": str(self.home), "PATH": str(self.bin) + os.pathsep + os.environ.get("PATH", os.defpath),
                     "XDG_STATE_HOME": str(self.root / "state"),
                     "XDG_CONFIG_HOME": str(self.root / "config"),

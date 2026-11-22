@@ -121,6 +121,8 @@ class MacGateSuitesTests(GateSuitesFixture):
     @override
     def setUp(self) -> None:
         super().setUp()
+        _ = write_config_fixture(Path(self.environment["CONF_DIR"]) / "gate.conf",
+                                 "landing_branches=fixture-landing\n")
         info_exclude = self.checkout / ".git/info/exclude"
         with info_exclude.open("a") as exclusions:
             _ = exclusions.write(f"\n/{mac_gate.MODULE_LIST}\n")

@@ -13,13 +13,14 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
+from scripts.mac_test.config_test_support import MAC_IDLE_SETTINGS
 from scripts.lint.memory_test_support import write_config_fixture
 
 
 def write_idle_config(directory: Path, overrides: str = "") -> Path:
     """Write a complete private configuration with the shared value limits."""
     path = directory / "mac_test.conf"
-    _ = write_config_fixture(path, overrides)
+    _ = write_config_fixture(path, overrides, defaults=MAC_IDLE_SETTINGS)
     return path
 
 

@@ -16,9 +16,10 @@ from unittest import mock
 from scripts.lib.socket_test_support import short_socket_directory
 from scripts.message import codex_daemon
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.lint.memory_test_support import write_config_fixture
 
 
-from scripts.message.codex_test_support import FakeDaemon, receive_frame, reply, send_frame, write_codex_account
+from scripts.message.codex_test_support import CODEX_DAEMON_SETTINGS, FakeDaemon, receive_frame, reply, send_frame, write_codex_account
 
 
 class CodexDaemonTests(unittest.TestCase):
@@ -27,11 +28,14 @@ class CodexDaemonTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(short_socket_directory()))
-        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"HOME": str(self.root)}, clear=True)))
+        config = self.root / "config"
+        _ = write_config_fixture(config / "codex_daemon.conf", defaults=CODEX_DAEMON_SETTINGS)
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
+            "HOME": str(self.root), "CONF_DIR": str(config),
+        }, clear=True)))
 
     def test_queue_default_uses_the_current_configured_timeout(self) -> None:
         config = self.root / "config"
-        config.mkdir()
         daemon = codex_daemon.CodexDaemon(self.root, self.root / "daemon.sock")
         with mock.patch.dict(os.environ, {"CONF_DIR": str(config)}):
             for seconds in (0.15, 0.35):

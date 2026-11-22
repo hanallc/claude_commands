@@ -18,8 +18,10 @@ from typing import ClassVar, cast, override
 from unittest.mock import patch
 
 from scripts.agents import remote, set_model, shutdown, worker_lifecycle
+from scripts.agents.test_support import write_machine_config
 from scripts.herdr import herdr
 from scripts.lib import models_registry
+from scripts.lib.test_script_prompts import write_script_prompt_fixture
 from scripts.message import codex_daemon
 from scripts.production import session_staff, staff, unit_lookup
 
@@ -190,9 +192,8 @@ class SetModelTests(unittest.TestCase):
         (self.root / "last_success").touch()
         config = self.root / "config"
         config.mkdir()
-        source = Path(__file__).resolve().parents[2] / "config"
-        (config / "machines.conf").symlink_to(source / "machines.conf")
-        (config / "script_prompts.conf").symlink_to(source / "script_prompts.conf")
+        write_machine_config(config)
+        write_script_prompt_fixture(config)
         _ = (config / "set_model.conf").write_text(
             "default_effort=high\n"
             + "# range: 0..10\nscreen_wait_seconds=0\n"

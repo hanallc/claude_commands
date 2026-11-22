@@ -20,6 +20,7 @@ from scripts.direct.verify_token_wait_test_support import BOARD, VERIFY, VerifyT
 from scripts.direct.verify_hold_wait_test_support import VerifyHoldWaitFixture, recorded_holders, wait_for_verify_state, wait_rows
 from scripts.direct.verify_lint_scope_test_support import CARGO_STUB, SCRIPTS, TAPLO_STUB
 from scripts.build_queue.admission_test_support import PrivateHostEvidence, caller_admission, caller_provider_controls
+from scripts.mac_test.config_test_support import MAC_RUN_SETTINGS
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.lib.shell_test_support import shell_functions
 from scripts.lib.atomic_file import write_text_atomic
@@ -662,7 +663,7 @@ class VerifyTargetWaitHolderTests(_RecordedHoldWaitFixture):
         claims = Path(self.fixture.environment["MAC_TEST_STATE_DIR"]) / "claims"
         claims.mkdir(parents=True, exist_ok=True)
         settings = Path(self.fixture.environment["MAC_TEST_CONFIG"])
-        _ = write_config_fixture(settings, f"probe_timeout_s={TARGET_PROBE_TIMEOUT_SECONDS}\n", template="mac_test")
+        _ = write_config_fixture(settings, f"probe_timeout_s={TARGET_PROBE_TIMEOUT_SECONDS}\n", defaults=MAC_RUN_SETTINGS)
         local_wait = root / "target-local-wait.py"
         _ = local_wait.write_text(f"""import sys
 sys.path.insert(0, {str(VERIFY.parents[2])!r})
@@ -747,7 +748,7 @@ if "--assignment-file" in arguments:''', 1)
         settings = root / "linux-box.conf"
         _ = write_config_fixture(settings, "offload=on\nhost=fake-linux\nkinds=test,check\nslots=1\n"
                                  + f"probe_timeout_s={TARGET_PROBE_TIMEOUT_SECONDS}\n",
-                                 template="mac_test")
+                                 defaults=MAC_RUN_SETTINGS)
         _ = (root / "build_targets.conf").write_text(
             "targets=linux-box,natedev\nkind.linux-box=ssh\nplatform.linux-box=linux\n"
             + "settings.linux-box=linux-box.conf\nkind.natedev=local\nplatform.natedev=linux\n")

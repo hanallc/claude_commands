@@ -19,11 +19,13 @@ from unittest.mock import Mock, call, patch
 
 from scripts.lib import conf, nix_env
 from scripts.lib.nix_env_test_support import NixFixture
-from scripts.lint.memory_test_support import write_config_fixture
+from scripts.lint.memory_test_support import seed_config_fixture_folder, write_config_fixture
 from scripts.nix_env import heal
 from scripts.agents import stop_resume
+from scripts.agents.test_support import write_machine_config
 from scripts.notify import push_texts
 from scripts.message import sessions
+from scripts.message.session_send_test_support import SEND_TIMING_FIXTURES
 from scripts.whoami import account
 
 
@@ -33,6 +35,10 @@ class HealTests(NixFixture):
     @override
     def setUp(self) -> None:
         super().setUp()
+        configuration = Path(self.env["CONF_DIR"])
+        write_machine_config(configuration)
+        seed_config_fixture_folder(configuration, SEND_TIMING_FIXTURES)
+        self.enterContext(patch.dict(os.environ, {"STAFF_FILE": str(self.root / "staff.json")}))
         _ = self.envrc(self.work)
         self.session = heal.HealSession("fixture", 811, "start-811", "worker", self.work, "idle", self.home / ".claude3")
         _ = self.enterContext(patch.object(heal, "state_directory", return_value=self.root / "journal"))
@@ -45,14 +51,14 @@ class HealTests(NixFixture):
         settings = Path(self.env["CONF_DIR"]) / "nix_env.conf"
         first, second = self.root / "first", self.root / "second"
         second.mkdir()
-        _ = write_config_fixture(settings, f"heal_state_directory={first}\n")
+        _ = write_config_fixture(settings, f"heal_state_directory={first}\n", defaults="")
         real_lock = fcntl.flock
         locked_paths: list[Path] = []
 
         def lock(stream: TextIO, operation: int) -> None:
             real_lock(stream, operation)
             locked_paths.append(Path(cast(str, stream.name)))
-            _ = write_config_fixture(settings, f"heal_state_directory={second}\n")
+            _ = write_config_fixture(settings, f"heal_state_directory={second}\n", defaults="")
 
         def configured_directory() -> Path:
             return Path(conf.read("nix_env").text("heal_state_directory"))
@@ -83,12 +89,12 @@ class HealTests(NixFixture):
         heal.save_history(directory, {self.session.session_id: history})
         settings = Path(self.env["CONF_DIR"]) / "nix_env.conf"
         _ = write_config_fixture(settings,
-            "command_timeout_seconds=550\nrelaunch_launch_seconds=25\nrelaunch_confirmation_seconds=15\n")
+            "command_timeout_seconds=550\nrelaunch_launch_seconds=25\nrelaunch_confirmation_seconds=15\n", defaults="")
         with (patch.object(heal, "list_sessions", return_value=heal.HealSessionRead(())),
               patch.object(time, "time", return_value=1100.0), patch.object(heal, "alert") as alert):
             self.assertEqual(heal.sweep(), 0)
             alert.assert_not_called()
-            _ = write_config_fixture(settings, "command_timeout_seconds=1\n")
+            _ = write_config_fixture(settings, "command_timeout_seconds=1\n", defaults="")
             self.assertEqual(heal.sweep(), 0)
             alert.assert_called_once()
             self.assertIn("waiting for a live replacement", cast(str, alert.call_args.args[-1]))
@@ -126,8 +132,6 @@ class HealTests(NixFixture):
         self.assertEqual(self.direnv_calls(), [])
 
     def test_registry_reads_all_config_dirs_and_retains_unreadable_paths(self) -> None:
-        _ = write_config_fixture(Path(self.env["CONF_DIR"]) / "nix_env.conf",
-                                 "session_directory_glob=.claude*/sessions\n")
         for number, name in enumerate((".claude", ".claude3"), 1):
             directory = self.home / name / "sessions"
             directory.mkdir(parents=True)
@@ -373,7 +377,6 @@ class HealTests(NixFixture):
                 self.assertEqual(self.records()[-1]["reason"], output or f"exit {code}")
 
     def test_broken_replacement_hits_hour_guard_and_pushes_once(self) -> None:
-        _ = write_config_fixture(Path(self.env["CONF_DIR"]) / "nix_env.conf", "restart_interval_seconds=3600\n")
         held, ensure, run = self.install_sweep([self.session])
         held.return_value = ""
         # The command returns but never publishes a healthy replacement.
@@ -610,7 +613,7 @@ class HealTests(NixFixture):
 
     def test_recursive_registry_discovery_keeps_nested_records_and_denied_paths(self) -> None:
         _ = write_config_fixture(Path(self.env["CONF_DIR"]) / "nix_env.conf",
-                                 "session_directory_glob=.claude*/**/sessions\n")
+                                 "session_directory_glob=.claude*/**/sessions\n", defaults="")
         configured = self.root / "configured-sessions"
         configured.mkdir()
         nested = self.home / ".claude3" / "nested" / "account" / "sessions"

@@ -63,7 +63,7 @@ class DailySimplifyTests(NixFixture):
         direct = launcher / "scripts/direct"
         direct.mkdir()
         _ = (direct / "assign_gate.py").write_text("# Admission succeeds in this private fixture.\n")
-        copy_runtime(launcher, configuration=False)
+        copy_runtime(launcher)
         cls.agent_exec = launcher / "scripts/agents/agent_exec.sh"
 
     @override
@@ -91,13 +91,22 @@ class DailySimplifyTests(NixFixture):
         with patch.dict(os.environ, self.env):
             write_claude_account("claude1", "unit@example.invalid", 100,
                                  datetime.now(timezone.utc) + timedelta(days=30))
-        registry = write_registry(self.root / "models.conf", base_text=(ROOT / "config/models.conf").read_text())
+        registry = write_registry(self.root / "models.conf", {
+            "assignments": {"direct.simplify": "claude"},
+            "direct.claude": {"simplify": "opus:high"},
+            "direct.options": {"claude_account.simplify": "caller"},
+        })
         self.env.update({"MODELS_CONFIG_FILE": str(registry), "MODELS_CONFIG_PUBLISH": "0",
                          "CODEX_CATALOG_SYNC_STATE_FILE": str(registry)})
         self.env.update(private_slot_config(self.root, repository="origin").environment)
         settings = Path(self.env["CONF_DIR"])
-        _ = shutil.copytree(ROOT / "config/review", settings / "review", dirs_exist_ok=True)
-        _ = write_config_fixture(settings / "direct.conf", "SIMPLIFY_LENS=on\nSIMPLIFY_FIRST_RUN_BEFORE=2026-11-05T22:50:00-05:00\n")
+        review = settings / "review"
+        review.mkdir(parents=True, exist_ok=True)
+        _ = (review / "simplify.md").write_text("Review the saved diff with these agents: $agents.\n")
+        _ = write_config_fixture(settings / "direct.conf", defaults=(
+            "# one of: on, off\nSIMPLIFY_LENS=on\n"
+            + "SIMPLIFY_FIRST_RUN_BEFORE=2026-11-05T22:50:00-05:00\n"
+            + "SIMPLIFY_AGENTS=reuse simplification efficiency altitude\n"))
         startup = self.root / "startup"
         startup.mkdir()
         _ = (startup / "sitecustomize.py").write_text('''import datetime, os, sys

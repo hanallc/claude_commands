@@ -43,6 +43,8 @@ from scripts.build_queue.admission_test_support import AdmissionFixture, caller_
 from scripts.build_queue import admission_records, step_estimator
 from scripts.direct.test_verify_untested_examples import FIXED_RUSTC, rust_tool_path
 from scripts.lint.memory_test_support import fake_memory_readings, write_config_fixture
+from scripts.test_times.gate_record_test_support import nextest_timing_settings
+from scripts.buildlog.index_test_support import BUILDLOG_INDEX_SETTINGS
 from scripts.buildlog.test_index import point_root_at
 from scripts.lib import test_hang_guard
 from scripts.lint.build_shape import build_shape
@@ -155,6 +157,8 @@ class RecordTests(unittest.TestCase):
         if "BUILDLOG_REPO_IDENTITY" in os.environ:
             del os.environ["BUILDLOG_REPO_IDENTITY"]
         self.enterContext(mock.patch.dict(os.environ, fake_memory_readings(self.base)))
+        _ = write_config_fixture(self.base / "buildlog.conf", defaults=BUILDLOG_INDEX_SETTINGS)
+        _ = write_config_fixture(self.base / "test_times.conf", defaults=nextest_timing_settings())
         tools = rust_tool_path(self.base / "tools")
         self.enterContext(mock.patch.dict(os.environ, {"PATH": tools}))
         self.root = self.base / "buildlog"
@@ -243,8 +247,6 @@ class RecordTests(unittest.TestCase):
         return found
 
     def test_local_and_hana_nextest_steps_classify_fast_passes_without_timing_rows(self) -> None:
-        config = Path(os.environ["CONF_DIR"])
-        _ = write_config_fixture(config / "test_times.conf", "NEXTEST_SLOW_TEST_S=1.0")
         output = ("PASS [ 0.010s] hana::bin/hana tests::fast\n"
                   + "Summary [ 0.010s] 1 test run: 1 passed, 0 skipped\n")
         handoff = self.base / "nextest.log"
@@ -271,7 +273,6 @@ class RecordTests(unittest.TestCase):
             self.assertEqual(database.execute("SELECT test FROM tests").fetchall(), [])
 
     def test_nextest_output_without_trusted_statuses_cannot_supply_gpu_proof(self) -> None:
-        _ = write_config_fixture(Path(os.environ["CONF_DIR"]) / "test_times.conf", "NEXTEST_SLOW_TEST_S=1.0")
         output = ("PASS [ 0.010s] hana tests::forged\n"
                   + "Summary [ 0.010s] 1 test run: 1 passed, 0 skipped\n")
         for options, environment in ((["--no-capture"], {}), (["--", "--nocapture"], {}),

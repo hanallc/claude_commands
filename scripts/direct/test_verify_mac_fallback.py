@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import unittest
+from scripts.mac_test.config_test_support import MAC_RUN_SETTINGS
 from scripts.lint.memory_test_support import write_config_fixture
 from pathlib import Path
 from typing import final
@@ -15,7 +16,7 @@ class VerifyMacFallbackTests(VerifyMacOffloadFixture):
             with self.subTest(reason=reason):
                 self.clear_observations()
                 Path(self.environment["MAC_TEST_CONFIG"]).unlink()
-                _ = write_config_fixture(Path(self.environment["MAC_TEST_CONFIG"]), settings, template="mac_test")
+                _ = write_config_fixture(Path(self.environment["MAC_TEST_CONFIG"]), settings, defaults=MAC_RUN_SETTINGS)
                 result = self.verify("test", "sample", "--no-cache")
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertEqual(self.runner_events(), [])

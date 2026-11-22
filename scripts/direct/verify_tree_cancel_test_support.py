@@ -8,6 +8,7 @@ from scripts.build_queue.admission_test_support import (
 from scripts.build_queue import placement
 from scripts.mac_test import claim_state
 from scripts.direct.verify_mac_offload_test_support import ASSIGNED_RUNNER_SETUP
+from scripts.mac_test.config_test_support import MAC_RUN_SETTINGS
 from scripts.lint.memory_test_support import write_config_fixture
 
 import json
@@ -333,8 +334,8 @@ with (patch.object(detached_runs, "deliver", return_value="private fixture"),
         runner = self.root / "mac-runner.py"
         self.write_tool(runner, MAC_RUNNER)
         self.write_tool(self.root / "stubs/ssh", 'print("free_gib=1000\\nhost=test-mac\\nrc=0")\n')
-        settings = self.root / "mac-settings.conf"
-        _ = write_config_fixture(settings, f"offload=on\nlinux_only.{self.workspace.name}=\n", template="mac_test")
+        settings = self.root / "mac_test.conf"
+        _ = write_config_fixture(settings, f"offload=on\nlinux_only.{self.workspace.name}=\n", defaults=MAC_RUN_SETTINGS)
         targets = self.root / "build_targets.conf"
         order = "natedev,mac" if local_first else "mac,natedev"
         _ = targets.write_text(f"targets={order}\nkind.mac=ssh\nplatform.mac=macos\n"

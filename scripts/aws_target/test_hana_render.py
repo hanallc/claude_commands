@@ -18,12 +18,12 @@ import unittest
 from unittest import mock
 
 from scripts.aws_target import hana_guest, hana_receiver, hana_render, hana_runner
+from scripts.aws_target.hana_image_test_support import stage_runtime_sources
 from scripts.lib import conf
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 ROOT = Path(__file__).resolve().parents[2]
-RUNTIME_LIST = ROOT / 'scripts/aws_target/hana_render.files'
 IMAGE_LIST = ROOT / 'scripts/aws_target/hana_image.files'
 IMAGE_INPUTS = (
     'config/hana_aws.conf',
@@ -47,6 +47,7 @@ UNSHIPPED_IMPORTS = {
     'direct/local_release_wait.py': {'build_targets/build_targets.py', 'build_targets/targets.py', 'build_hold/build_hold.py'},
     'lib/build_folders.py': {'lib/descendants.py'},
     'lib/python_startup/sitecustomize.py': {'lib/testing_folders.py'},
+    'lib/conf.py': {'lib/registry_rows.py'},
     'lib/scratch.py': {'direct/phase_table.py', 'production/proposals_table.py', 'production/unit_lookup.py',
         'production/production_doc.py', 'direct/plan_history.py', 'accounts/__init__.py', 'accounts/accounts.py'},
     'lib/unit_runs.py': {'direct/worker_state.py'},
@@ -79,7 +80,7 @@ class HanaRenderTests(unittest.TestCase):
     def test_listed_files_render_all_guest_names_modes_and_bytes(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             checkout = Path(temporary) / 'checkout'
-            runtime_entries = RUNTIME_LIST.read_text().splitlines()
+            runtime_entries = stage_runtime_sources(checkout)
             image_entries = IMAGE_LIST.read_text().splitlines()
             image_inputs = checkout / 'image-inputs'
             for entries in (runtime_entries, image_entries):
@@ -89,16 +90,13 @@ class HanaRenderTests(unittest.TestCase):
                         relative = Path(entry)
                         self.assertFalse(relative.is_absolute())
                         self.assertNotIn('..', relative.parts)
-            for root, entries in ((image_inputs, (*image_entries, *IMAGE_INPUTS)),
-                                  (checkout, (*runtime_entries, 'config/copies.conf'))):
-                for entry in entries:
-                    destination = root / entry
-                    destination.parent.mkdir(parents=True, exist_ok=True)
-                    if entry.startswith('config/'):
-                        _ = destination.write_text('')
-                    else:
-                        _ = shutil.copyfile(ROOT / entry, destination)
-            _ = shutil.copyfile(RUNTIME_LIST, checkout / RUNTIME_LIST.relative_to(ROOT))
+            for entry in (*image_entries, *IMAGE_INPUTS):
+                destination = image_inputs / entry
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                if entry.startswith('config/'):
+                    _ = destination.write_text('')
+                else:
+                    _ = shutil.copyfile(ROOT / entry, destination)
             targets = image_inputs / 'config/build_targets.conf'
             target_values = ('loopback.shell_timeout_s=7\nloopback.shell_timeout_s.fixture-guest=11\n'
                 + '# range: 1..\nloopback.command_timeout_s.fixture-guest=23\n'

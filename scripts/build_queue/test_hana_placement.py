@@ -26,6 +26,7 @@ from scripts.build_queue.test_placement import (
 from scripts.build_queue.admission_test_support import only_admitted
 from scripts.aws_target import hana_box, hana_execution, hana_placement, hana_placement_adapter, hana_protocol, hana_result, ledger, test_hana_execution
 from scripts.aws_target.control_test_support import TestClock
+from scripts.aws_target.hana_image_test_support import guest_digest_fixture
 from scripts.aws_target.ledger_test_support import install_cost_settings, install_hana_spending_settings, text_setting
 from scripts.aws_target.test_hana_box import FakeProvider, IDENTITY, record_lifecycle_image
 from scripts.aws_target.controller_lock import control_lock
@@ -33,6 +34,7 @@ from scripts.build_targets import target_config
 from scripts.buildlog import store
 from scripts.lib import atomic_file, conf, process_start
 from scripts.lib.test_hang_guard import LauncherHangGuard, TEST_HANG_GUARD_SECS
+from scripts.mac_test.config_test_support import MAC_RUN_SETTINGS
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.mac_test import claim_state, eligibility, mac_test, offload
 
@@ -46,7 +48,7 @@ def hana_target(fixture: PlacementFixture) -> target_config.SshTarget:
 
 def hana_fallback_request(fixture: PlacementFixture, *, include_mac: bool = False) -> wire.PlacementRequest:
     target = hana_target(fixture)
-    _ = write_config_fixture(fixture.root / 'mac_test.conf', 'host=fixture-mac\n')
+    _ = write_config_fixture(fixture.root / 'mac_test.conf', 'host=fixture-mac\n', defaults=MAC_RUN_SETTINGS)
     _ = write_config_fixture(fixture.root / 'build_targets.conf',
         f'targets={target.name},mac,natedev\nkind.{target.name}=ssh\nplatform.{target.name}=linux\n'
         + f'settings.{target.name}={target.settings.name}\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n'
@@ -96,6 +98,7 @@ class HanaQueueTests(unittest.TestCase):
         book.record_inventory(ledger.ResourceInventory(clock.now, (), 'private inventory', True))
         book.observe(ledger.InstanceObservation(clock.now, 'terminated', 'private account inventory'))
         controller.register(IDENTITY)
+        fixture.enter_context(guest_digest_fixture(fixture.root))
         _ = record_lifecycle_image(directory, transport.settings)
         _ = controller.tick()
 
@@ -630,12 +633,14 @@ class HanaQueueTests(unittest.TestCase):
             clock = TestClock()
             directory = fixture.root / 'hana-state'
             provider = FakeProvider(directory, clock)
-            controller = hana_box.HanaController(directory, fixture.root / 'aws_target.conf',
-                target.settings, provider, clock=clock)
+            account = fixture.root / 'aws_target.conf'
+            install_cost_settings(account)
+            controller = hana_box.HanaController(directory, account, target.settings, provider, clock=clock)
             book = ledger.CostLedger(directory)
             book.record_inventory(ledger.ResourceInventory(clock.now, (), 'private inventory', True))
             book.observe(ledger.InstanceObservation(clock.now, 'terminated', 'private account inventory'))
             controller.register(IDENTITY)
+            fixture.enter_context(guest_digest_fixture(fixture.root))
             _ = record_lifecycle_image(directory, target.settings)
 
             _ = fixture.enter_context(mock.patch.object(target_config, 'read_targets', return_value=(target,)))

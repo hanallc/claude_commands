@@ -2875,6 +2875,21 @@ def run_gate_suites(repo: Path, type_dirs: Sequence[str] = (),
                     mode: SuiteMode = SuiteMode.GATE,
                     gate_job: StepJob | GateJobNotRecorded = GATE_JOB_NOT_RECORDED) -> GateRun:
     """Route gates through AWS. Split affected tests between natedev and the Mac."""
+    shipped = repo / "config"
+    try:
+        if shipped.is_dir():
+            conf.check_shipped(shipped)
+            console_file = shipped / "console.conf"
+            if console_file.exists():
+                from scripts.review_links.console import owner_config_problems
+
+                settings = conf.settings(console_file.read_text(encoding="utf-8"))
+                problems = owner_config_problems({key: setting.value for key, setting in settings.items()})
+                if problems:
+                    raise GateRefused("\n".join(f"config/console.conf: {problem}" for problem in problems))
+    except (conf.Unusable, OSError, UnicodeError) as error:
+        raise GateRefused(str(error)) from error
+
     def run_local(types: Sequence[str]) -> GateRun:
         return run_suites(repo, types, module_time_limit_s, source=source, full=full, mode=mode)
 

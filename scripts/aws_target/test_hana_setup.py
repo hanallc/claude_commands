@@ -17,6 +17,7 @@ from unittest import mock
 from scripts.aws_target import aws_cli, deploy, hana_box, hana_image, hana_render, hana_replacement, hana_replacement_record, hana_spend, ledger, plan_run, remote
 from scripts.aws_target.control_test_support import TestClock
 from scripts.aws_target.config import DeploymentSettings
+from scripts.aws_target.hana_image_test_support import guest_digest_fixture
 from scripts.aws_target.ledger_test_support import CostFixture, text_setting, write_hana_config
 from scripts.aws_target.test_hana_box import FakeProvider
 from scripts.aws_target.test_hana_provider import FakeAws, IDENTITY
@@ -208,6 +209,7 @@ class HanaSetupTests(CostFixture):
     @override
     def setUp(self) -> None:
         super().setUp()
+        self.enterContext(guest_digest_fixture(self.root))
         self.clock = TestClock()
         self.workload = write_hana_config()
         book = ledger.CostLedger(self.state)

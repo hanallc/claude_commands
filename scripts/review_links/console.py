@@ -1,7 +1,7 @@
 """Render one navigation shell for the administrative pages."""
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 import html
 import importlib
@@ -13,6 +13,7 @@ from typing import Literal, TypedDict, cast
 from urllib.parse import unquote, urlencode, urlsplit, urlunsplit
 
 from scripts.lib import atomic_file, conf, file_lock
+from scripts.production import staff
 from scripts.production.change_review import ChangeReviewError
 from scripts.production.production_doc import Refusal
 from scripts.review_links import accounts_page, change_page, console_theme, for_you, page_frame, review_link, review_legacy
@@ -77,6 +78,21 @@ class ConsolePage:
     title: str
     destination: AvailablePage | UnavailablePage
     items: ItemsFunction | None = None
+
+
+def owner_config_problems(settings: Mapping[str, str]) -> tuple[str, ...]:
+    """Check the staff IDs for the console pages and the default owner."""
+    default_key = "owner.default"
+    review_key = "page.review.owner"
+    problems: list[str] = []
+    for key in (default_key, *(f"page.{page}.owner" for page in sorted(page_frame.OWNER_PAGES))):
+        try:
+            _ = staff.native_id(settings.get(key, ""))
+        except staff.StaffRefused:
+            problems.append(f"{key}: Expected a staff UUID.")
+    if settings.get(default_key) != settings.get(review_key):
+        problems.append(f"{default_key}: Use the same staff ID as {review_key}.")
+    return tuple(problems)
 
 
 def read_pages() -> tuple[ConsolePage, ...]:

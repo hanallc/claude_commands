@@ -23,6 +23,7 @@ from unittest.mock import patch
 
 from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.review_links import review_link, serve
+from scripts.production.change_review_test_support import REVIEW_SERVER_SETTINGS
 
 
 from typing import cast, override
@@ -34,10 +35,9 @@ TAILSCALE_IP = "100.103.14.30"
 
 def setUpModule() -> None:
     configuration = Path(unittest.enterModuleContext(tempfile.TemporaryDirectory()))
-    _ = write_config_fixture(configuration / "review_links.conf",
-        "server_port=8765\nsnapshot_allocation_tries=10\n")
+    _ = write_config_fixture(configuration / "review_links.conf", defaults=REVIEW_SERVER_SETTINGS)
     _ = write_config_fixture(configuration / "change_review.conf",
-        "review_links_directory=~/.local/share/review-links\n")
+        defaults="review_links_directory=~/.local/share/review-links\n")
     _ = cast(object, unittest.enterModuleContext(patch.dict(os.environ, {"CONF_DIR": str(configuration)})))
 
 

@@ -17,7 +17,8 @@ import unittest
 from unittest import mock
 
 from scripts.lib import land_main, main_publish, main_sync, waiting_rows
-from scripts.lib.main_push_lock_test_support import publish_after_contender
+from scripts.lib.live_settings_test_support import write_live_settings_fixture
+from scripts.lib.main_push_lock_test_support import publish_after_contender, write_push_lock_settings
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
@@ -68,6 +69,8 @@ class PublicationRepository:
         _ = self.git(self.checkout, "config", "user.email", "publish@example.invalid")
         _ = self.git(self.checkout, "remote", "add", "origin", str(self.origin))
         self.config.parent.mkdir()
+        write_push_lock_settings(self.config.parent)
+        write_live_settings_fixture(self.config.parent)
         _ = self.config.write_text("# whole: 1..10\namount=2\n# one of: fast, slow\nmode=fast\n")
         _ = (self.checkout / "other.txt").write_text("original\n")
         _ = self.git(self.checkout, "add", ".")

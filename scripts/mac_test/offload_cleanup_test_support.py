@@ -41,6 +41,7 @@ class SeededCleanupFixture(OffloadCommandFixture):
         self.root: Path = self.seed.root
         _ = shutil.copytree(self.snapshot, self.root, symlinks=True)
         self.addCleanup(shutil.rmtree, self.root)
+        self.use_nextest_settings()
         self.repository: Path = self.seed.repository
         self.unknown_directory: Path = self.seed.unknown_directory
         self.state_directory: Path = self.seed.state_directory

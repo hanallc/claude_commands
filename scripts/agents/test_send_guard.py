@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import os
 import subprocess
+import tempfile
 import unittest
 from collections.abc import Callable
+from pathlib import Path
 from typing import Never, cast, final
 from unittest.mock import patch
 
@@ -12,12 +15,18 @@ from scripts.agents import remote
 from scripts.agents import remote_control
 from scripts.agents import restart_support
 from scripts.agents import shutdown
-from scripts.agents.test_support import ShutdownSendLeaf, ShutdownTestCase
+from scripts.agents.test_support import ShutdownSendLeaf, ShutdownTestCase, write_machine_config
 
 
 LOGIN = "owner@example.com"
 LABEL = "claude2"
 NOW = "2026-10-10T21:00:00+00:00"
+
+
+def setUpModule() -> None:
+    configuration = Path(unittest.enterModuleContext(tempfile.TemporaryDirectory()))
+    write_machine_config(configuration)
+    _ = cast(object, unittest.enterModuleContext(patch.dict(os.environ, {"CONF_DIR": str(configuration)})))
 
 
 @final

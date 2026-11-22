@@ -26,6 +26,29 @@ VERIFY_TEST_ENVIRONMENT = frozenset({
 })
 
 
+VERIFY_TOKEN_SETTINGS = """\
+# whole: 1..
+VERIFY_TOKEN_HOLD_SECONDS=3600
+# whole: 1..
+VERIFY_TOKEN_RENEW_SECONDS=60
+# whole: 1..
+TOKEN_GUARD_ATTEMPTS=200
+# whole: 1..
+TOKEN_GUARD_DELAY_MS=50
+"""
+
+VERIFY_RESULT_SETTINGS = (
+    "# text: space-separated variable names\n"
+    + "VERIFY_RESULT_ENV_NAMES=NO_COLOR CLICOLOR CLICOLOR_FORCE FORCE_COLOR CI TZ LANG LC_ALL LC_COLLATE "
+    + "LC_CTYPE LC_MESSAGES LC_MONETARY LC_NUMERIC LC_TIME LC_ADDRESS LC_IDENTIFICATION LC_MEASUREMENT "
+    + "LC_NAME LC_PAPER LC_TELEPHONE\n"
+    + "# text: space-separated variable prefixes\n"
+    + "VERIFY_RESULT_ENV_PREFIXES=HANA_ WGPU_ BEVY_ INSTA_ TRACE_\n"
+    + "# text: space-separated NAME=value assignments\n"
+    + "VERIFY_TEST_FIXED_ENV=TERM=xterm-256color COLORTERM=truecolor TERM_PROGRAM=verify COLUMNS=80 LINES=24\n"
+)
+
+
 def verify_test_environment() -> dict[str, str]:
     """Read the allowed caller settings and set the fixture locale."""
     environment = {name: value for name, value in os.environ.items() if name in VERIFY_TEST_ENVIRONMENT}

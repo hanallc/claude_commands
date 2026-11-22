@@ -17,7 +17,9 @@ from pathlib import Path
 from typing import Literal, cast, override
 from unittest.mock import patch
 
+from scripts.build_targets.target_test_support import mac_target_settings
 from scripts.lib import berth_board
+from scripts.mac_test.config_test_support import MAC_OFFLOAD_SETTINGS
 from scripts.lint.memory_test_support import config_environment
 from scripts.mac_test import eligibility, fix_return, offload
 from scripts.mac_test.offload_test_commands import write_shell
@@ -112,7 +114,9 @@ class ReturnFixTests(unittest.TestCase):
         remote = self.root / "remote"
         _ = cast(object, self.enterContext(patch.dict(os.environ, {
             **git_environment(),
-            **config_environment(self.root / "configuration"),
+            **config_environment(self.root / "configuration", fixtures={
+                "build_targets.conf": mac_target_settings(), "mac_test.conf": MAC_OFFLOAD_SETTINGS,
+            }),
             "PATH": f"{bin_directory}{os.pathsep}{os.environ['PATH']}",
             "FIX_TEST_DIR": str(self.root), "FIX_TEST_REMOTE": str(remote), "FIX_TEST_RSYNC": real_rsync,
         }, clear=True)))

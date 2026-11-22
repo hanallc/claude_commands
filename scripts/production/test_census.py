@@ -3,11 +3,24 @@ from __future__ import annotations
 
 import json
 import subprocess
+import os
+import tempfile
 import unittest
+from pathlib import Path
+from typing import cast
 from unittest.mock import patch
 
 from scripts.lib import conf
+from scripts.lint.memory_test_support import write_config_fixture
 from scripts.production import census, staff
+from scripts.production.config_test_support import UNIT_TABLE_SETTINGS
+
+
+def setUpModule() -> None:
+    configuration = Path(unittest.enterModuleContext(tempfile.TemporaryDirectory()))
+    _ = write_config_fixture(configuration / "production.conf", defaults=UNIT_TABLE_SETTINGS)
+    _ = cast(object, unittest.enterModuleContext(patch.dict(os.environ, {"CONF_DIR": str(configuration)})))
+
 
 WORKER: dict[str, object] = {
     "staff_id": "handler-impl", "name": "handler-impl", "parent_staff_id": "handler-unit",

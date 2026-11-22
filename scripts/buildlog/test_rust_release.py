@@ -15,6 +15,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import cast, final, override
 from scripts.message import send_budget, session_send
+from scripts.message.session_send_test_support import SEND_TIMING_FIXTURES
+from scripts.lint.memory_test_support import seed_config_fixture_folder
 from unittest import mock
 
 from scripts.buildlog import rust_release
@@ -105,6 +107,13 @@ class RustReleaseTests(unittest.TestCase):
         _ = self.enterContext(mock.patch.object(rust_release, "LINT_CONFIG", self.config))
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"TMPDIR": str(self.scratch)})))
         point_root_at(self, self.root)
+        configuration = Path(os.environ["CONF_DIR"])
+        seed_config_fixture_folder(configuration, {
+            **SEND_TIMING_FIXTURES,
+            "build_steps.conf": "names.toolchain-trial=toolchain trial\n",
+            "notify.conf": "REVIEW_TIMEOUT_SECONDS=60\n",
+        })
+        _ = self.enterContext(mock.patch.object(review, "NOTIFY_CONFIG", configuration / "notify.conf"))
         self.enterContext(mock.patch.dict(os.environ, {"HOME": str(self.scratch)}))
         source = self.scratch / "hana"
         source.mkdir()
@@ -699,13 +708,15 @@ class RustReleaseTests(unittest.TestCase):
         pid = int(pid_file.read_text().strip())
         try:
             for _ in range(20):
-                try:
-                    os.kill(pid, 0)
-                except ProcessLookupError:
+                process = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)],
+                                         capture_output=True, text=True, check=False)
+                self.assertIn(process.returncode, (0, 1), process.stderr)
+                state = process.stdout.strip()
+                if process.returncode == 1 or state.startswith(("Z", "X")):
                     break
                 time.sleep(0.1)
             else:
-                self.fail(f"background sleep {pid} still exists after timeout")
+                self.fail(f"Background sleep {pid} is still running after the timeout.")
         finally:
             try:
                 os.kill(pid, signal.SIGKILL)

@@ -21,6 +21,7 @@ from scripts.buildlog import ci
 from scripts.buildlog import cli
 from scripts.lib import conf, land_main, main_push_lock
 from scripts.lib.land_main import land
+from scripts.lib.main_push_lock_test_support import write_push_lock_settings
 from scripts.buildlog import sync
 from scripts.buildlog import vault_pull
 from scripts.buildlog.health import Machine
@@ -134,6 +135,7 @@ class VaultPullTests(unittest.TestCase):
             _ = self.git(repository, "remote", "set-url", "origin", str(self.github))
         settings = self.folder / "config"
         settings.mkdir()
+        write_push_lock_settings(settings)
         build_targets = settings / "build_targets.conf"
         _ = build_targets.write_text(
             "# whole: 0..10\nvault.lock_retries=2\n# range: 0..5\nvault.lock_retry_delay_s=0\n"
@@ -698,15 +700,13 @@ class VaultPullTests(unittest.TestCase):
         self.assertEqual(len(self.questions()), 10)
 
     def test_vault_retry_delay_limit_stays_below_one_minute(self) -> None:
-        production = Path(__file__).resolve().parents[2] / "config/build_targets.conf"
-        for settings in (production, self.folder / "config/build_targets.conf"):
-            with self.subTest(settings=settings):
-                conf.check(settings, "vault.lock_retries", "10")
-                conf.check(settings, "vault.lock_retry_delay_s", "5")
-                with self.assertRaises(conf.Unusable):
-                    conf.check(settings, "vault.lock_retry_delay_s", "5.1")
-                with self.assertRaises(conf.Unusable):
-                    conf.check(settings, "vault.lock_retries", "11")
+        settings = self.folder / "config/build_targets.conf"
+        conf.check(settings, "vault.lock_retries", "10")
+        conf.check(settings, "vault.lock_retry_delay_s", "5")
+        with self.assertRaises(conf.Unusable):
+            conf.check(settings, "vault.lock_retry_delay_s", "5.1")
+        with self.assertRaises(conf.Unusable):
+            conf.check(settings, "vault.lock_retries", "11")
 
     def test_ignored_file_is_preserved_by_the_real_git_merge(self) -> None:
         _ = self.commit(self.local, {"protected.txt": "incoming\n"})

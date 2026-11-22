@@ -1,5 +1,6 @@
 from __future__ import annotations
-from scripts.lint.memory_test_support import write_config_fixture
+from scripts.lint.memory_test_support import seed_config_fixture_folder, write_config_fixture
+from scripts.message.session_send_test_support import SEND_TIMING_FIXTURES
 
 import json
 import os
@@ -98,9 +99,8 @@ class SettingsFilterTests(unittest.TestCase):
             _ = shutil.copy2(source, self.root / "scripts/settings" / source.name)
         for name in ("conf.sh", "conf_record.sh", "conf.py", "conf_reads.py", "atomic_file.py", "py"):
             _ = shutil.copy2(KEYS.parents[1] / "lib" / name, self.root / "scripts/lib" / name)
-        for name in ("send", "postmaster", "codex_daemon"):
-            _ = write_config_fixture(self.root / "config" / f"{name}.conf")
-        _ = write_config_fixture(self.root / "config/settings.conf", "local_key_notice_to=fixture-owner\n")
+        seed_config_fixture_folder(self.root / "config", SEND_TIMING_FIXTURES)
+        _ = write_config_fixture(self.root / "config/settings.conf", defaults="local_key_notice_to=fixture-owner\n")
         _ = shutil.copy2(KEYS.with_name("local_key_notices.py"), self.root / "scripts/settings/local_key_notices.py")
         for name in ("send_result.py", "send_budget.py", "session_send.py"):
             _ = shutil.copy2(KEYS.parents[1] / "message" / name, self.root / "scripts/message" / name)
@@ -121,7 +121,7 @@ else:
         raise SystemExit(1)
     print("SENT: fixture")
 '''.replace("REAL_SENDER", repr(str(KEYS.parents[1] / "message/send.py"))))
-        copy_runtime(self.root, configuration=False)
+        copy_runtime(self.root)
         self.write_settings({"shared": 1})
         _ = (self.root / ".gitattributes").write_text("settings.json filter=claude-settings\n")
         _ = self.git("init", "-qb", "baseline")

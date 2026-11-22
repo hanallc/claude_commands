@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING, Self, TypedDict, cast, override
 from scripts.build_hold.owning_session import NoOwningSession
 from scripts.lib import process_start as process_identity
 from scripts.production import staff
+from scripts.mac_test.config_test_support import MAC_RUN_SETTINGS
 from scripts.production.staff_test_support import fixture_member, isolated_staff_file
 
 import unittest
@@ -89,14 +90,14 @@ class IsolatedTargetState(unittest.TestCase):
                 + "block_max_hours=48\nblock_warn_minutes=15\n"
                 + "gh_timeout_s=1\nclaim_idle_minutes=15\nclaim_poll_seconds=60\n"
                 + "connect_timeout_s=1\nprobe_timeout_s=1\nunreachable_backoff_s=30\n",
-                template="mac_test",
+                defaults=MAC_RUN_SETTINGS,
             )
             platform = "macos" if name == "mac" else "linux"
             lines.extend((f"kind.{name}=ssh", f"platform.{name}={platform}",
                           f"settings.{name}={settings.name}"))
         lines.extend(("kind.natedev=local", "platform.natedev=linux"))
         _ = self.config.write_text("\n".join(lines) + "\n", encoding="utf-8")
-        _ = write_config_fixture(self.root / "mac_test.conf", "ci_repo=", template="mac_test")
+        _ = write_config_fixture(self.root / "mac_test.conf", "ci_repo=", defaults=MAC_RUN_SETTINGS)
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
             **config_environment(self.root),
             "HOME": str(self.root),
@@ -194,7 +195,7 @@ class TargetStateTests(IsolatedTargetState):
 
     def test_explicit_mac_reads_registry_settings_and_preserves_legacy_settings(self) -> None:
         legacy = self.root / "mac_test.conf"
-        _ = write_config_fixture(legacy, "block_hours=4\nci_repo=", template="mac_test")
+        _ = write_config_fixture(legacy, "block_hours=4\nci_repo=", defaults=MAC_RUN_SETTINGS)
         settings = self.root / "mac.conf"
         _ = settings.write_text(settings.read_text().replace("block_hours=4", "block_hours=1"), encoding="utf-8")
         with mock.patch.dict(os.environ, {"MAC_TEST_CONFIG": str(legacy)}):
@@ -228,7 +229,7 @@ class TargetStateTests(IsolatedTargetState):
 
     def test_explicit_mac_free_now_reads_the_registry_offload_setting(self) -> None:
         legacy = self.root / "mac_test.conf"
-        _ = write_config_fixture(legacy, "offload=on\nci_repo=", template="mac_test")
+        _ = write_config_fixture(legacy, "offload=on\nci_repo=", defaults=MAC_RUN_SETTINGS)
         settings = self.root / "mac.conf"
         _ = settings.write_text(settings.read_text().replace("offload=on", "offload=off"), encoding="utf-8")
         with mock.patch.dict(os.environ, {"MAC_TEST_CONFIG": str(legacy)}):

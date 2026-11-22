@@ -17,6 +17,7 @@ from contextlib import redirect_stderr
 from typing import override, cast
 from unittest import mock
 
+from scripts.copies.copies_test_support import copies_environment
 from scripts.direct import remove_run_scratch, workers
 from scripts.lib import scratch
 from scripts.lib.git_test_support import fixture_git_environment
@@ -35,7 +36,9 @@ class RemoveRunScratchTests(unittest.TestCase):
         root = Path(tempfile.mkdtemp(prefix="run-scratch-fixture-")).resolve()
         self.addCleanup(shutil.rmtree, root)
         self.enterContext(isolated_staff_file(root / "staff.json", {}))
-        environment = fixture_git_environment(root)
+        environment = {**fixture_git_environment(root), **copies_environment(root)}
+        environment["SCRATCH_VISIBLE_ROOT"] = str(root / "repro")
+        environment["STAFF_FILE"] = str(root / "staff.json")
         _ = environment.pop("STAFF_CONFIG", None)
         environment["HOME"] = str(root / "home")
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, environment, clear=True)))

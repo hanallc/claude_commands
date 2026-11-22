@@ -15,6 +15,7 @@ from unittest import mock
 from typing import ClassVar, cast, override
 
 from scripts.copies import copies, copy_guard
+from scripts.lib.build_slots_test_support import copy_fixture_settings
 from scripts.production.cli_fixture import ImmutableGitSeed
 
 
@@ -251,6 +252,9 @@ class CopyGuardTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        configuration = self.root / "copies.conf"
+        _ = configuration.write_text(copy_fixture_settings(self.root), encoding="utf-8")
+        self.enterContext(mock.patch.dict(os.environ, {"COPIES_CONFIG": str(configuration)}))
         self.repo = self.root / "checkout"
         self.seed.copy_to(self.repo, self.root / "origin.git")
 
@@ -304,7 +308,7 @@ class CopyGuardTests(unittest.TestCase):
             f"roots.workspace={workspace}\nroots.build={self.root / 'build'}\n"
             + "# range: 0..1\nlocks.probe_wait_seconds=0.05\n# range: 0.001..1\nlocks.probe_retry_seconds=0.005\n")
         copies_config = config / "copies.conf"
-        _ = copies_config.write_text("# range: 0.001..\ngit_timeout_seconds=5\n")
+        _ = copies_config.write_text(copy_fixture_settings(self.root, git_timeout_seconds=5), encoding="utf-8")
         repository = self.root / "rust/origin"
         repository.parent.mkdir()
         _ = self.repo.rename(repository)

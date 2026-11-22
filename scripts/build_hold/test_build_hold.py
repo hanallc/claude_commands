@@ -436,13 +436,6 @@ class QuietTests(IsolatedBuildHoldTest):
 
 
 class TargetCommandTests(PrivateReleaseBroadcastTest):
-    @override
-    def setUp(self) -> None:
-        super().setUp()
-        self.enterContext(mock.patch.dict(os.environ, {
-            "CONF_DIR": str(SCRIPT.parent.parent.parent / "config"),
-        }))
-
     def test_remote_commands_refuse_without_state_changes(self) -> None:
         for action in ("clear", "drain", "release"):
             for target in ("mac", "aws", "all"):

@@ -13,9 +13,19 @@ from pathlib import Path
 from typing import override
 
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.lint.memory_test_support import write_config_fixture
 
 HOOK = Path(__file__).with_name("stop-context-deferral.py")
-CONFIG = HOOK.parents[2] / "config" / "context_deferral.conf"
+CONTEXT_DEFERRAL_FIXTURE = r"""window: 200
+action: \b(?:I|we)(?: will|['’]ll) (?!not\b)\w+
+marker: \bafter (?:the )?(?:context reset|compaction)\b
+marker: \bonce (?:the )?(?:context compacts|compaction finishes)\b
+marker: \bin (?:the next|a fresh) (?:window|context)\b
+state: (?:^context|\bmy context|\bthe context window)(?: is|['’]s) (?:nearly )?(?:full\b|running out\b)
+later: \blater\b
+later: \bafter the reset\b
+exclude: \bhook\b
+"""
 REASON = "Compaction runs by itself mid-work; do the work now."
 TRUE_HITS = (
     "My context is full; I will finish the work later.",
@@ -78,7 +88,7 @@ class ContextDeferralTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
-        _ = (self.root / "context_deferral.conf").write_bytes(CONFIG.read_bytes())
+        _ = write_config_fixture(self.root / "context_deferral.conf", defaults=CONTEXT_DEFERRAL_FIXTURE)
         self.environment = {**os.environ, "CONF_DIR": str(self.root), "PYTHONDONTWRITEBYTECODE": "1"}
 
     def call(self, **payload: object) -> subprocess.CompletedProcess[str]:
@@ -166,7 +176,7 @@ class ContextDeferralTests(unittest.TestCase):
         path = self.root / "context_deferral.conf"
         path.unlink()
         self.assert_allowed(self.call(last_assistant_message=TRUE_HITS[0]))
-        for content in ("[", "# No patterns.\n", CONFIG.read_text(encoding="utf-8") + "\n[\n"):
+        for content in ("[", "# No patterns.\n", CONTEXT_DEFERRAL_FIXTURE + "\n[\n"):
             _ = path.write_text(content, encoding="utf-8")
             self.assert_allowed(self.call(last_assistant_message=TRUE_HITS[0]))
 
@@ -182,7 +192,7 @@ class ContextDeferralTests(unittest.TestCase):
         result = self.call(last_assistant_message=text)
         self.assertEqual((result.returncode, result.stderr), (2, REASON + "\n"))
         _ = (self.root / "context_deferral.conf").write_text(
-            CONFIG.read_text(encoding="utf-8").replace("window: 200", "window: 20"), encoding="utf-8")
+            CONTEXT_DEFERRAL_FIXTURE.replace("window: 200", "window: 20"), encoding="utf-8")
         self.assert_allowed(self.call(last_assistant_message=text))
 
     def test_an_exclusion_inside_the_region_allows_the_stop(self) -> None:
@@ -191,16 +201,17 @@ class ContextDeferralTests(unittest.TestCase):
         self.assertEqual((result.returncode, result.stderr), (2, REASON + "\n"))
 
     def test_invalid_entries_allow_the_stop_without_output(self) -> None:
-        valid = CONFIG.read_text(encoding="utf-8")
+        valid = CONTEXT_DEFERRAL_FIXTURE
         for content in (valid.replace("window: 200", "window: many"),
                         valid + "\nunknown: text\n", valid + "\nmarker: [\n",
-                        valid + "\nwindow: 20\n", valid.replace("window: 200", "window: 0")):
+                        valid + "\nwindow: 20\n", valid.replace("window: 200", "window: 0"),
+                        valid.replace("window: 200", "window : 200")):
             with self.subTest(content=content):
                 _ = (self.root / "context_deferral.conf").write_text(content, encoding="utf-8")
                 self.assert_allowed(self.call(last_assistant_message=TRUE_HITS[0]))
 
     def test_missing_required_kinds_allow_the_stop_without_output(self) -> None:
-        lines = CONFIG.read_text(encoding="utf-8").splitlines()
+        lines = CONTEXT_DEFERRAL_FIXTURE.splitlines()
         for kind in ("window", "action", "exclude"):
             with self.subTest(kind=kind):
                 _ = (self.root / "context_deferral.conf").write_text(
@@ -208,7 +219,7 @@ class ContextDeferralTests(unittest.TestCase):
                 self.assert_allowed(self.call(last_assistant_message=TRUE_HITS[0]))
 
     def test_absent_phrase_kinds_disable_only_their_rule(self) -> None:
-        lines = CONFIG.read_text(encoding="utf-8").splitlines()
+        lines = CONTEXT_DEFERRAL_FIXTURE.splitlines()
         for kind in ("marker", "state", "later"):
             with self.subTest(kind=kind):
                 _ = (self.root / "context_deferral.conf").write_text(

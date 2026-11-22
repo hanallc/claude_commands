@@ -1,7 +1,7 @@
 """Registration behavior against a private seeded fixture."""
 
 from __future__ import annotations
-from scripts.lint.memory_test_support import config_environment, copy_config_fixture
+from scripts.lint.memory_test_support import config_environment
 
 import json
 import io
@@ -15,7 +15,9 @@ from datetime import datetime
 from typing import IO, cast, final, override
 from unittest import mock
 
+from scripts.copies import copies
 from scripts.production import session_staff, staff, showrunners
+from scripts.production.config_test_support import QUESTION_TITLE_SETTINGS, RENAME_SETTINGS
 from scripts.production.production_doc import read_production
 from scripts.agents import shutdown
 from scripts.agents import remote
@@ -34,6 +36,9 @@ from scripts.review_links import change_browser, change_page
 from scripts.statusline import counts_row
 from scripts.lib import urgency
 from scripts.lint.memory_test_support import write_config_fixture
+from scripts.production.change_review_test_support import (
+    REVIEW_DELIVERY_SETTINGS, REVIEW_DISPLAY_SETTINGS, REVIEW_ENDPOINT_SETTINGS, write_change_review_settings,
+)
 
 
 class ProducerQuestionTests(RegistrationFixture):
@@ -46,9 +51,10 @@ class ProducerQuestionTests(RegistrationFixture):
         listing = self.root / "reviews/change-review - example.md"
         _ = self.doc.write_text(self.doc.read_text() + f"- **Change review:** `{listing}`\n")
         config = self.root / "config"
-        _ = copy_config_fixture(Path(__file__).parents[2] / 'config', config)
+        _ = write_config_fixture(config / "production.conf", defaults=QUESTION_TITLE_SETTINGS)
         settings = config / "review_links.conf"
-        _ = write_config_fixture(settings, "delivery_pause_seconds=0\ndelivery_tries=3\n")
+        _ = write_config_fixture(settings, "delivery_pause_seconds=0\n",
+                                 defaults=REVIEW_ENDPOINT_SETTINGS + REVIEW_DELIVERY_SETTINGS + REVIEW_DISPLAY_SETTINGS)
         self.env.update({"CLAUDE_CODE_SESSION_ID": self.producer.current_session, "CODEX_THREAD_ID": "",
                          "CHANGE_REVIEW_DIR": str(self.root / "reviews"), "REVIEW_LINKS_ROOT": str(self.root / "links"),
                          "CONF_DIR": str(config)})
@@ -331,7 +337,12 @@ class QuestionIdentityTests(RegistrationFixture):
     @override
     def setUp(self) -> None:
         super().setUp()
-        self.env.update(config_environment(self.root / "fixture-config"))
+        configuration = self.root / "fixture-config"
+        self.env.update(config_environment(configuration))
+        _ = write_config_fixture(configuration / "production.conf", defaults=QUESTION_TITLE_SETTINGS + RENAME_SETTINGS)
+        write_change_review_settings(configuration, self.root)
+        _ = write_config_fixture(configuration / "review_links.conf",
+                                 defaults=REVIEW_ENDPOINT_SETTINGS + REVIEW_DELIVERY_SETTINGS)
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, self.env)))
         self.issues = self.root / "issues"
         self.issues.mkdir(exist_ok=True)
@@ -465,6 +476,7 @@ class QuestionIdentityTests(RegistrationFixture):
         with (self.forbid_legacy_question_access(),
               mock.patch.object(tidy_wrapped, "STATE_DIR", self.state / "showrunner"),
               mock.patch.object(tidy_wrapped, "NOTIFIER_STATE_DIR", self.state / "notifier"),
+              mock.patch.object(copies, "remove_trees"),
               redirect_stdout(io.StringIO())):
             result = tidy_wrapped.main([str(self.doc)])
         self.assertEqual(result, 0)
