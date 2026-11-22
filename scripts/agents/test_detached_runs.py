@@ -1196,118 +1196,126 @@ sys.exit(1)
         self.assertEqual(record.get("kind"), "python-tests")
 
     @unittest.skipUnless(process_stop.supported(), "pidfd stop needs Linux")
-    def test_stop_reaches_a_new_session_inside_the_detached_scope(self) -> None:
-        command = [sys.executable, "-c", """import signal
-import subprocess
-import sys
+    def test_scoped_stop_uses_the_launch_record_and_waits_for_the_scope_tree(self) -> None:
+        settings = Path(__file__).resolve().parents[2] / "config/shutdown.conf"
+        _ = (self.root / "config/shutdown.conf").write_text(settings.read_text())
+        for outcome in ("TERM", "KILL", "EPERM", "still populated"):
+            with self.subTest(outcome=outcome), contextlib.ExitStack() as descriptors:
+                path = self.record(["fixture command"])
+                proc = self.root / f"proc-{outcome}"
+                cgroups = self.root / f"cgroups-{outcome}"
+                relative = "/builds.slice/builds-detached.slice/detached-python-tests-r1.scope"
+                scope = cgroups / relative.lstrip("/")
+                child = scope / "child"
+                child.mkdir(parents=True)
+                members = child / "cgroup.procs"
+                events = scope / "cgroup.events"
+                kill = scope / "cgroup.kill"
+                _ = (scope / "cgroup.procs").write_text("701\n")
+                _ = members.write_text("702\n")
+                _ = events.write_text("populated 1\nfrozen 0\n")
+                _ = kill.write_text("0\n")
 
-signal.signal(signal.SIGTERM, lambda number, frame: None)
-child = subprocess.Popen([sys.executable, "-c", "import sys; sys.stdin.read()"],
-                         start_new_session=True)
-print(child.pid, flush=True)
-print(child.wait(), flush=True)
-"""]
-        path = self.record(command)
-        run_id = f"{path.stem}@{self.worker_id}"
-        path = path.rename(path.with_name(f"{run_id}.json"))
-        proc = self.root / "proc"
-        cgroups = self.root / "cgroups"
-        relative = "builds.slice/builds-detached.slice/detached-python-tests-r1.scope"
-        scope = cgroups / relative
-        scope.mkdir(parents=True)
-
-        guard = LauncherHangGuard("stop a child in a new session")
-        leader: subprocess.Popen[str] = subprocess.Popen(
-            command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, start_new_session=True)
-        with leader:
-            assert leader.stdin is not None and leader.stdout is not None
-            try:
-                self.assertTrue(select.select([leader.stdout], [], [], guard.remaining())[0])
-                child = int(cast(str, leader.stdout.readline()))
-                self.assertEqual(os.getsid(child), child)
-                self.assertNotEqual(os.getpgid(child), os.getpgid(leader.pid))
-                for pid in (leader.pid, child):
+                def write_process(pid: int, start: str, location: str) -> None:
                     directory = proc / str(pid)
-                    directory.mkdir(parents=True)
-                    (directory / "stat").symlink_to(Path("/proc") / str(pid) / "stat")
-                    _ = (directory / "cgroup").write_text(f"0::/{relative}\n")
-                _ = (scope / "cgroup.procs").write_text(f"{leader.pid}\n{child}\n")
-                started = process_start.proc_table_start(leader.pid, proc)
-                assert isinstance(started, process_start.Started)
-                self.update_record(path, run_id=run_id, log=str(path.with_suffix(".log")),
-                                   kind="python-tests", command_pid=leader.pid,
-                                   command_group=leader.pid, command_started=started.start)
-                with (patch.dict(os.environ, {"VERIFY_PROC_ROOT": str(proc)}),
-                      patch.object(detached_run_process, "supervisor_match", return_value=True),
-                      patch.object(process_stop, "PROC", proc),
-                      patch.object(process_stop, "CGROUP_ROOT", cgroups)):
-                    self.assertTrue(detached_runs.stop_command(path, "fixture stop"))
-                self.assertTrue(select.select([leader.stdout], [], [], guard.remaining())[0],
-                                "the child did not exit after the stop")
-                self.assertEqual(leader.stdout.readline(), f"{-signal.SIGTERM}\n")
-            finally:
-                leader.stdin.close()
+                    directory.mkdir(parents=True, exist_ok=True)
+                    fields = ["S", "1", str(pid), str(pid), *(["0"] * 15), start]
+                    _ = (directory / "stat").write_text(f"{pid} (test process) " + " ".join(fields))
+                    _ = (directory / "cgroup").write_text(f"0::{location}\n")
 
-    @unittest.skipUnless(process_stop.supported(), "pidfd stop needs Linux")
-    def test_stop_stays_pending_after_the_leader_exits_until_the_scope_ends(self) -> None:
-        path = self.record(["fixture command"])
-        self.update_record(path, command_pid=701, command_group=701, command_started="11",
-                           pane_dispatch_id="")
-        proc = self.root / "proc"
-        cgroups = self.root / "cgroups"
-        relative = "builds.slice/builds-detached.slice/detached-detect-r1.scope"
-        scope = cgroups / relative
-        scope.mkdir(parents=True)
-        members = scope / "cgroup.procs"
-        _ = members.write_text("701\n702\n")
-        for pid, start in ((701, 11), (702, 22)):
-            directory = proc / str(pid)
-            directory.mkdir(parents=True)
-            fields = ["S", "1", str(pid), str(pid), *(["0"] * 15), str(start)]
-            _ = (directory / "stat").write_text(f"{pid} (test process) " + " ".join(fields))
-            _ = (directory / "cgroup").write_text(f"0::/{relative}\n")
-
-        pids: dict[int, int] = {}
-        signals: list[tuple[int, int]] = []
-        with contextlib.ExitStack() as descriptors:
-            def open_pidfd(pid: int) -> int:
-                read, write = os.pipe()
-                _ = descriptors.callback(os.close, write)
-                pids[read] = pid
-                return read
-
-            def record_signal(descriptor: int, number: int) -> None:
-                pid = pids[descriptor]
-                if pid == 701:
-                    (proc / "701" / "stat").unlink()
-                    _ = members.write_text("702\n")
-                    raise ProcessLookupError("the leader exited before TERM")
-                signals.append((pid, number))
-
-            with (patch.dict(os.environ, {"VERIFY_PROC_ROOT": str(proc)}),
-                  patch.object(detached_run_process, "supervisor_match", return_value=True),
-                  patch.object(detached_run_process, "supervises", return_value=False),
-                  patch.object(detached_runs, "_group_is_live", return_value=False),
-                  patch.object(process_stop, "PROC", proc),
-                  patch.object(process_stop, "CGROUP_ROOT", cgroups),
-                  patch.object(os, "pidfd_open", side_effect=open_pidfd),
-                  patch.object(signal, "pidfd_send_signal", side_effect=record_signal)):
-                self.assertTrue(detached_runs.stop_command(path, "first stop"))
-                self.assertEqual(signals, [(702, signal.SIGTERM)])
+                write_process(701, "11", relative)
+                write_process(702, "22", relative + "/child")
+                self.update_record(path, kind="python-tests", command_pid=701, command_group=701,
+                                   command_started="11", pane_dispatch_id="")
+                with (patch.object(process_stop, "PROC", proc),
+                      patch.object(process_stop, "CGROUP_ROOT", cgroups),
+                      patch.object(os, "getpid", return_value=701)):
+                    self.assertEqual(detached_runs.main(["scope-start", str(path)]), 0)
+                published = worker_lifecycle.read_json_object(path)["command_scope"]
+                self.assertEqual(published, {"unit": scope.name, "path": relative,
+                                            "device": scope.stat().st_dev, "inode": scope.stat().st_ino})
+                # The leader is gone and only the child cgroup is populated.
+                (proc / "701" / "stat").unlink()
+                (proc / "701" / "cgroup").unlink()
+                _ = (scope / "cgroup.procs").write_text("")
                 self.update_record(path, exit_code=143)
-                with contextlib.redirect_stderr(io.StringIO()):
-                    self.assertEqual(detached_runs.main(["deliver", str(path)]), 1)
-                self.assertEqual(detached_runs.reap_orphans(str(self.session)), [])
-                self.assertEqual(worker_lifecycle.read_json_object(path)["status"], "running")
-                self.assertEqual(self.sent, [])
-                self.assertTrue(detached_runs.stop_command(path, "repeat stop"))
-                self.assertEqual(signals, [(702, signal.SIGTERM)] * 2)
-                self.assertEqual(worker_lifecycle.read_json_object(path)["stop_reason"], "first stop")
-                _ = members.write_text("")
-                self.assertEqual(detached_runs.main(["deliver", str(path)]), 0)
-        self.assertEqual(worker_lifecycle.read_json_object(path)["status"], "finished")
-        result, = self.sent
-        self.assertIn("Result: STOPPED (exit 143)", result)
+                pids: dict[int, str] = {}
+                terms: list[str] = []
+                now = 0.0
+
+                def open_pidfd(pid: int) -> int:
+                    self.assertEqual(pid, 702)
+                    started = process_start.proc_table_start(pid, proc)
+                    if not isinstance(started, process_start.Started):
+                        raise ProcessLookupError(pid)
+                    read, write = os.pipe()
+                    _ = descriptors.callback(os.close, write)
+                    pids[read] = started.start
+                    return read
+
+                def term(descriptor: int, number: int) -> None:
+                    self.assertEqual(number, signal.SIGTERM)
+                    start = pids[descriptor]
+                    terms.append(start)
+                    self.assertNotIn("stop_reason", worker_lifecycle.read_json_object(path))
+                    if outcome == "EPERM":
+                        raise PermissionError("fixture denies TERM")
+                    if outcome == "TERM":
+                        if start == "22":
+                            write_process(702, "33", relative + "/child")
+                        else:
+                            _ = members.write_text("")
+                            _ = events.write_text("populated 0\nfrozen 0\n")
+
+                def advance(seconds: float) -> None:
+                    nonlocal now
+                    now += seconds
+                    with path.with_suffix(".record.lock").open("a") as lock:
+                        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        self.assertNotIn("stop_reason", worker_lifecycle.read_json_object(path))
+                    if outcome == "KILL" and kill.read_text() == "1\n":
+                        _ = members.write_text("")
+                        _ = events.write_text("populated 0\nfrozen 0\n")
+                    self.assertEqual(detached_runs.reap_orphans(str(self.session)), [])
+
+                write = os.write
+                kill_stat = kill.stat()
+
+                def write_kill(descriptor: int, data: bytes) -> int:
+                    if outcome == "EPERM" and os.path.samestat(os.fstat(descriptor), kill_stat):
+                        raise PermissionError("fixture denies KILL")
+                    return write(descriptor, data)
+
+                def signal_result() -> int:
+                    return detached_runs.main(["stop", "--reason", "fixture stop", str(path)])
+
+                with (patch.object(detached_run_process, "supervisor_match", return_value=True),
+                      patch.object(detached_run_process, "supervises", return_value=False),
+                      patch.object(process_stop, "PROC", proc),
+                      patch.object(process_stop, "CGROUP_ROOT", cgroups),
+                      patch.object(time, "monotonic", side_effect=lambda: now),
+                      patch.object(time, "sleep", side_effect=advance),
+                      patch.object(os, "pidfd_open", side_effect=open_pidfd),
+                      patch.object(signal, "pidfd_send_signal", side_effect=term),
+                      patch.object(os, "write", side_effect=write_kill),
+                      contextlib.redirect_stdout(io.StringIO()) as stdout,
+                      contextlib.redirect_stderr(io.StringIO()) as stderr):
+                    if outcome in ("TERM", "KILL"):
+                        self.assertEqual(signal_result(), 0)
+                        self.assertEqual(detached_runs.main(["deliver", str(path)]), 0)
+                        result = self.sent.pop()
+                        self.assertIn("Result: STOPPED (exit 143)", result)
+                        self.assertIn("Stop reason: fixture stop", result)
+                    else:
+                        self.assertEqual(signal_result(), 1)
+                        self.assertEqual(stdout.getvalue(), "")
+                        self.assertIn("stop failed", stderr.getvalue())
+                        detail = "no TERM signal reached a member" if outcome == "EPERM" else "populated after KILL"
+                        self.assertIn(detail, stderr.getvalue())
+                        self.assertNotIn("stop_reason", worker_lifecycle.read_json_object(path))
+                        self.assertEqual(detached_runs.reap_orphans(str(self.session)), [])
+                self.assertEqual(terms, ["22", "33"] if outcome == "TERM" else ["22"])
+                self.assertEqual(kill.read_text(), "1\n" if outcome in ("KILL", "still populated") else "0\n")
 
     def test_start_rejects_an_unknown_kind(self) -> None:
         with contextlib.redirect_stderr(io.StringIO()) as error, self.assertRaises(SystemExit) as raised:
@@ -1389,7 +1397,8 @@ sys.exit(status)
             tools = self.root / "tools"
             tools.mkdir()
             scope = tools / "systemd-run"
-            _ = scope.write_text('#!/bin/sh\nwhile [ "$1" != "--" ]; do shift; done\nshift\nexec "$@"\n')
+            _ = scope.write_text('#!/bin/sh\nwhile [ "$1" != "--" ]; do shift; done\nshift 4\n'
+                                 + ': > "$1" || exit 125\nshift\nexec "$@"\n')
             scope.chmod(0o755)
             with socket.socket(socket.AF_UNIX) as manager:
                 manager.bind(str(runtime / "systemd/private"))
@@ -1578,8 +1587,7 @@ sys.exit(status)
                   patch.object(detached_runs, "_signal_stopped_command") as send):
                 self.assertTrue(detached_runs.stop_command(path, "new stop"))
             self.assertEqual(checks, 2)
-            send.assert_called_once_with(ANY, detached_runs.CommandGroup(os.getpid(), started.start), signal.SIGTERM,
-                remember_scopes=ANY)
+            send.assert_called_once_with(detached_runs.CommandGroup(os.getpid(), started.start), signal.SIGTERM)
             self.assertTrue(pending_stop.is_file())
 
     def test_failed_stop_sync_leaves_the_original_record_when_rollback_would_fail(self) -> None:
@@ -1783,8 +1791,9 @@ sys.exit(status)
         count = self.root / "count"
         command = ["/bin/sh", "-c", f'echo run >> "{count}"']
         scope = self.session / detached_runs.DETACHED_RUNS_DIR / "r1.scope"
-        # A scope without systemd-run: the same script, so the marker proves the command started.
-        with patch.object(detached_runs, "scope_prefix", return_value=["/bin/sh", "-c", detached_runs.SCOPE_SCRIPT, str(scope)]):
+        # The private launcher writes the marker without starting a systemd scope.
+        marker_script = ': > "$0" || exit 125; exec "$@"'
+        with patch.object(detached_runs, "scope_prefix", return_value=["/bin/sh", "-c", marker_script, str(scope)]):
             record = self.supervise(self.record(command))
         self.assertEqual((record.get("exit_code"), count.read_text(encoding="utf-8")), (0, "run\n"))
         self.assertFalse(scope.exists())
@@ -2785,8 +2794,7 @@ class PaneRunDeliveryTests(unittest.TestCase):
               patch.object(detached_runs, "_signal_stopped_command") as signal_group,
               contextlib.redirect_stdout(io.StringIO())):
             self.assertEqual(detached_runs.main(["stop", "--reason", reason, str(path)]), 0)
-            signal_group.assert_called_once_with(ANY, detached_runs.CommandGroup(DEAD_PID, "private-start"), signal.SIGTERM,
-                remember_scopes=ANY)
+            signal_group.assert_called_once_with(detached_runs.CommandGroup(DEAD_PID, "private-start"), signal.SIGTERM)
         stopped = worker_lifecycle.read_json_object(path)
         self.assertEqual(stopped.get("stop_reason"), reason)
         self.assertIs(stopped.get("self_stop"), True)
@@ -2848,8 +2856,7 @@ class PaneRunDeliveryTests(unittest.TestCase):
             self.assertEqual(detached_runs.main(stop), 0)
             first_stop = path.read_bytes()
             self.assertEqual(detached_runs.main(["stop", "--reason", "A repeat.", str(path)]), 1)
-            signal_group.assert_called_once_with(ANY, detached_runs.CommandGroup(DEAD_PID, "private-start"), signal.SIGTERM,
-                remember_scopes=ANY)
+            signal_group.assert_called_once_with(detached_runs.CommandGroup(DEAD_PID, "private-start"), signal.SIGTERM)
         self.assertEqual(path.read_bytes(), first_stop)
         self.assertIsInstance(progress_history.active_dispatch(row.id, self.run_dir), progress_history.ActiveDispatch)
         saved = cast(detached_runs.RunRecord, json.loads(path.read_text()))
@@ -3565,8 +3572,7 @@ class PaneRunDeliveryTests(unittest.TestCase):
               patch.object(detached_runs, "_signal_stopped_command") as send_group,
               contextlib.redirect_stderr(io.StringIO())):
             self.assertTrue(detached_runs.stop_command(path, reason))
-        send_group.assert_called_once_with(ANY, detached_runs.CommandGroup(DEAD_PID, "private-start"), signal.SIGTERM,
-            remember_scopes=ANY)
+        send_group.assert_called_once_with(detached_runs.CommandGroup(DEAD_PID, "private-start"), signal.SIGTERM)
         self.assertEqual(path.read_bytes(), saved)
 
         identities = frozenset({row.id})
