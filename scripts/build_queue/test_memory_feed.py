@@ -2322,7 +2322,7 @@ process.stdout.write(JSON.stringify({
         with PlacementFixture() as fixture:
             fixture.configure(slot_gap_seconds=60)
             config = fixture.root / "build_admission.conf"
-            _ = config.write_text(config.read_text() + "\nmax_runs.natedev.fixture=0\nmax_runs.exempt_unit=natemerge\n")
+            _ = config.write_text(config.read_text() + f"\nmax_runs.{fixture.server.host}.fixture=0\nmax_runs.exempt_unit=natemerge\n")
             _ = fixture.run_pass()
             fixture.clock.advance(1)
             step = placement_request(fixture)
@@ -2334,7 +2334,7 @@ process.stdout.write(JSON.stringify({
             assert isinstance(reply, wire.PlacementWait) and isinstance(reply.wait, wire.Wait), reply
             reason = reply.wait.reason
             self.assertEqual(reason.cause if isinstance(reason, admission_records.HeadAdmissionStatus) else reason,
-                             admission_records.RunLimitWait(0, 0, "fixture", "natedev"))
+                             admission_records.RunLimitWait(0, 0, "fixture", fixture.server.host))
             view, = fixture.connect(wire.ViewRequest()).replies()
             assert isinstance(view, wire.ViewReply)
             job = targets.RunningJob("nextest fixture", datetime.now(UTC), targets.NotSeenIdle())
