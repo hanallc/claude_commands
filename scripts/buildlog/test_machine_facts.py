@@ -14,7 +14,7 @@ from unittest import mock
 
 from scripts.aws_target import ledger
 from scripts.buildlog import machine_facts
-from scripts.buildlog.machine_facts import MacLink, MachineFacts, ProbeFailed, Probes
+from scripts.buildlog.machine_facts import CommandMissing, MacLink, MachineFacts, ProbeFailed, Probes
 from scripts.buildlog.test_index import use_test_log
 
 
@@ -88,8 +88,15 @@ class MachineFactsTests(unittest.TestCase):
         self.assertEqual(json.loads(self.path.read_text())["written"], 1000.0)
 
     def test_natedev_without_ups_shows_no_battery(self) -> None:
-        self.commands.answers["upsc"] = ProbeFailed("upsc: [Errno 2] No such file or directory: 'upsc'")
+        self.commands.answers["upsc"] = CommandMissing("upsc: [Errno 2] No such file or directory: 'upsc'")
         self.assertIsNone(self.sample()["natedev"]["battery"])
+
+    def test_ups_that_does_not_answer_is_unreadable(self) -> None:
+        for answer in (ProbeFailed("Error: Driver not connected"), "battery.charge: 90\nups.status: OFF\n",
+                       "ups.status: OL\n"):
+            with self.subTest(answer=answer):
+                self.commands.answers["upsc"] = answer
+                self.assertEqual(self.sample()["natedev"]["battery"], "unreadable")
 
     def test_ups_on_battery_is_not_mains(self) -> None:
         self.commands.answers["upsc"] = "battery.charge: 64\nups.status: OB DISCHRG\n"
@@ -109,8 +116,21 @@ class MachineFactsTests(unittest.TestCase):
 
     def test_mac_ssh_failure_keeps_the_link_delay(self) -> None:
         self.commands.answers["ssh"] = ProbeFailed("Permission denied (publickey).")
-        self.assertEqual(self.sample()["mac"], machine_facts.facts("read", link_ms=3.2,
+        self.assertEqual(self.sample()["mac"], machine_facts.facts("load_unreadable", link_ms=3.2,
                                                                     detail="Permission denied (publickey)."))
+
+    def test_name_lookup_past_its_time_limit_is_a_timeout(self) -> None:
+        release = threading.Event()
+
+        def slow_lookup(*_arguments: object, **_options: object) -> list[machine_facts.AddressInfo]:
+            _ = release.wait(5)
+            return []
+
+        try:
+            with mock.patch("socket.getaddrinfo", slow_lookup), self.assertRaises(TimeoutError):
+                _ = machine_facts.connect_ms("mac.example", 22, 0.05)
+        finally:
+            release.set()
 
     def test_aws_box_running_has_no_reading(self) -> None:
         def running(_now: float) -> str:

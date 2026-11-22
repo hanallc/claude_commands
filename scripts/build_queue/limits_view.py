@@ -78,6 +78,7 @@ WORDS: Mapping[str | type[object], str | WaitWords] = {
     "facts_battery": "battery {percent}% ({source})",
     "facts_mains": "mains",
     "facts_on_battery": "on battery",
+    "facts_battery_unreadable": "battery unreadable",
     "facts_unreachable": "link unreachable",
     "facts_no_box": "no box running",
     "facts_box_running": "box running · no link or load reading",
@@ -847,17 +848,20 @@ def facts_line(saved: machine_facts.SavedFacts | None, machine: str, now: float,
     if now - saved["written"] > machine_facts.STALE_SECONDS:
         return PAGE_WORDS["facts_stale"].format(time=datetime.fromtimestamp(saved["written"], zone).strftime("%H:%M"))
     facts = saved["machines"][machine]
-    if facts["state"] != "read":
-        return PAGE_WORDS["facts_" + facts["state"]]
+    state = facts["state"]
+    if state != "read" and state != "load_unreadable":
+        return PAGE_WORDS["facts_" + state]
     parts: list[str] = []
     link_ms = facts["link_ms"]
     if link_ms is not None:
         parts.append(PAGE_WORDS["facts_link"].format(ms="<1" if link_ms < 1 else f"{link_ms:.0f}"))
     load, cpus = facts["load"], facts["cpus"]
-    parts.append(PAGE_WORDS["facts_load"].format(load=f"{load:.1f}", cpus=cpus) if load is not None and cpus is not None
-                 else PAGE_WORDS["facts_load_unreadable"])
+    parts.append(PAGE_WORDS["facts_load"].format(load=f"{load:.1f}", cpus=cpus)
+                 if state == "read" and load is not None and cpus is not None else PAGE_WORDS["facts_load_unreadable"])
     battery = facts["battery"]
-    if battery is not None:
+    if battery == "unreadable":
+        parts.append(PAGE_WORDS["facts_battery_unreadable"])
+    elif battery is not None:
         source = PAGE_WORDS["facts_mains" if battery["mains"] else "facts_on_battery"]
         parts.append(PAGE_WORDS["facts_battery"].format(percent=battery["percent"], source=source))
     return " · ".join(parts)

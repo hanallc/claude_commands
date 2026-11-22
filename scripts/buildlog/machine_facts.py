@@ -11,6 +11,7 @@ import os
 import re
 import socket
 import subprocess
+import threading
 import time
 from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
@@ -33,7 +34,9 @@ MAC_COMMAND = "sysctl -n vm.loadavg hw.ncpu; pmset -g batt"
 VERSION = 1
 MACHINES = ("natedev", "mac", "aws")
 
-FactsState = Literal["read", "unreachable", "no_box", "box_running", "failed"]
+FactsState = Literal["read", "load_unreadable", "unreachable", "no_box", "box_running", "failed"]
+AddressInfo = tuple[socket.AddressFamily, socket.SocketKind, int, str,
+                    tuple[str, int] | tuple[str, int, int, int] | tuple[int, bytes]]
 
 
 class Battery(TypedDict):
@@ -46,7 +49,7 @@ class MachineFacts(TypedDict):
     link_ms: float | None
     load: float | None
     cpus: int | None
-    battery: Battery | None
+    battery: Battery | Literal["unreadable"] | None
     detail: str
 
 
@@ -58,6 +61,10 @@ class SavedFacts(TypedDict):
 
 class ProbeFailed(Exception):
     """A command or connection gave no usable answer."""
+
+
+class CommandMissing(ProbeFailed):
+    """The command is not installed on this machine."""
 
 
 @dataclass(frozen=True)
@@ -75,6 +82,8 @@ def run_command(arguments: Sequence[str], timeout: float) -> str:
     try:
         result = subprocess.run(arguments, stdin=subprocess.DEVNULL, capture_output=True, text=True,
                                 timeout=timeout, check=False)
+    except FileNotFoundError as error:
+        raise CommandMissing(f"{arguments[0]}: {error}") from error
     except (OSError, subprocess.TimeoutExpired, UnicodeError) as error:
         raise ProbeFailed(f"{arguments[0]}: {error}") from error
     if result.returncode != 0:
@@ -82,9 +91,29 @@ def run_command(arguments: Sequence[str], timeout: float) -> str:
     return result.stdout
 
 
+def resolve(host: str, port: int, timeout: float) -> AddressInfo:
+    """Look up the address in a daemon thread, because getaddrinfo has no time limit of its own."""
+    answer: list[AddressInfo | OSError] = []
+
+    def lookup() -> None:
+        try:
+            answer.append(socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)[0])
+        except OSError as error:
+            answer.append(error)
+
+    thread = threading.Thread(target=lookup, name="machine-facts-lookup", daemon=True)
+    thread.start()
+    thread.join(timeout)
+    if not answer:
+        raise TimeoutError(f"name lookup of {host} took more than {timeout:g} s")
+    if isinstance(answer[0], OSError):
+        raise answer[0]
+    return answer[0]
+
+
 def connect_ms(host: str, port: int, timeout: float) -> float:
     """Time one TCP connect after name resolution, so the delay is the link alone."""
-    family, kind, protocol, _, address = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)[0]
+    family, kind, protocol, _, address = resolve(host, port, timeout)
     with socket.socket(family, kind, protocol) as connection:
         connection.settimeout(timeout)
         started = time.perf_counter()
@@ -121,22 +150,23 @@ class Probes:
 
 
 def facts(state: FactsState, *, link_ms: float | None = None, load: float | None = None, cpus: int | None = None,
-          battery: Battery | None = None, detail: str = "") -> MachineFacts:
+          battery: Battery | Literal["unreadable"] | None = None, detail: str = "") -> MachineFacts:
     return {"state": state, "link_ms": link_ms, "load": load, "cpus": cpus, "battery": battery, "detail": detail}
 
 
-def ups_battery(text: str) -> Battery | None:
+def ups_battery(text: str) -> Battery | Literal["unreadable"]:
+    """Read `upsc`; a charge or status that does not say mains or battery is unreadable."""
     values = dict(line.split(": ", 1) for line in text.splitlines() if ": " in line)
     status = values.get("ups.status", "").split()
     try:
         percent = round(float(values["battery.charge"]))
     except (KeyError, ValueError):
-        return None
+        return "unreadable"
     if "OB" in status:
         return {"percent": percent, "mains": False}
     if "OL" in status:
         return {"percent": percent, "mains": True}
-    return None
+    return "unreadable"
 
 
 def natedev_facts(probes: Probes) -> MachineFacts:
@@ -144,11 +174,16 @@ def natedev_facts(probes: Probes) -> MachineFacts:
         load: float | None = float(probes.loadavg.read_text().split()[0])
     except (OSError, ValueError, IndexError):
         load = None
+    battery: Battery | Literal["unreadable"] | None
     try:
         battery = ups_battery(probes.run(["upsc", UPS_NAME], UPS_TIMEOUT_SECONDS))
-    except ProbeFailed:
+    except CommandMissing:
         battery = None
-    return facts("read", load=load, cpus=probes.cpus(), battery=battery)
+    except ProbeFailed:
+        battery = "unreadable"
+    cpus = probes.cpus()
+    state: FactsState = "read" if load is not None and cpus else "load_unreadable"
+    return facts(state, load=load, cpus=cpus, battery=battery)
 
 
 def mac_battery(text: str) -> Battery | None:
@@ -191,7 +226,7 @@ def mac_facts(probes: Probes) -> MachineFacts:
                              link.host, MAC_COMMAND], link.probe_timeout_s)
         load, cpus = mac_load(answer)
     except (ProbeFailed, ValueError) as error:
-        return facts("read", link_ms=link_ms, detail=str(error))
+        return facts("load_unreadable", link_ms=link_ms, detail=str(error))
     return facts("read", link_ms=link_ms, load=load, cpus=cpus, battery=mac_battery(answer))
 
 
@@ -233,7 +268,7 @@ def finite(value: object) -> bool:
 
 
 def valid_battery(value: object) -> bool:
-    if value is None:
+    if value is None or value == "unreadable":
         return True
     if not isinstance(value, dict):
         return False

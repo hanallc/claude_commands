@@ -452,6 +452,7 @@ The feed reads `machine_facts.read_facts(machine_facts.state_path())` once per r
 Examples: natedev `load 52.7/32 · battery 100% (mains)`, Mac `link 3 ms · load 19.6/12 · battery 85% (on battery)`, AWS `no box running`.
 natedev has no link part. A machine without a battery has no battery part.
 A failed TCP connect shows `link unreachable`. A failed SSH command after a good connect shows `link 3 ms · load unreadable`.
+A UPS or Mac battery that `upsc` or `pmset` cannot read shows `battery unreadable`; a machine with no battery shows no battery part.
 A running AWS gate box shows `box running · no link or load reading`, because its security group accepts no inbound connection.
 A probe that cannot start shows `facts unreadable`.
 A missing or invalid file shows `facts not sampled`.

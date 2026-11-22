@@ -926,8 +926,11 @@ class MachineFactsLineTests(unittest.TestCase):
         self.assertEqual(self.line(saved, "natedev"), "load 52.7/32")
         self.assertEqual(self.line(saved, "mac"), "link unreachable")
         self.assertEqual(self.line(saved, "aws"), "facts unreadable")
-        saved["machines"]["mac"] = machine_facts.facts("read", link_ms=0.4, detail="Permission denied (publickey).")
+        saved["machines"]["mac"] = machine_facts.facts("load_unreadable", link_ms=0.4,
+                                                       detail="Permission denied (publickey).")
         self.assertEqual(self.line(saved, "mac"), "link <1 ms · load unreadable")
+        saved["machines"]["natedev"] = machine_facts.facts("read", load=52.71, cpus=32, battery="unreadable")
+        self.assertEqual(self.line(saved, "natedev"), "load 52.7/32 · battery unreadable")
 
     def test_stale_and_missing_facts(self) -> None:
         saved = self.saved(written=datetime(2026, 11, 22, 14, 5, tzinfo=UTC).timestamp())
