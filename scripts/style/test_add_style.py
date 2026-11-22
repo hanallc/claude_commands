@@ -63,6 +63,10 @@ elif name == "launch.py":
     production = (read_new_production(Path(arguments[arguments.index("--doc") + 1]), production_name)
                   if "--doc" in arguments else read_production(production_name))
     doc = production.doc
+    if "--doc" in arguments and os.environ.get("TEST_REQUIRE_ADMISSION"):
+        from scripts.production import production_admission, production_doc
+        production_doc.GUARD_REPOSITORY = Path.cwd()
+        production_admission.require_new_document(production)
     if os.environ.get("TEST_BOOTSTRAP_AT_LAUNCH"):
         Path(os.environ["TEST_BOOTSTRAP_AT_LAUNCH"]).write_text(json.dumps({
             "production": doc.read_text(),
@@ -985,6 +989,106 @@ class AddStyleTests(unittest.TestCase):
         production = read_production("sample-style")
         self.assertEqual((production.checkout, production.merge_branch), (legacy_checkout, "style/main"))
         self.assertFalse(self.checkout.exists())
+
+    def legacy_bootstrap(self) -> tuple[Path, Path, Path]:
+        _ = self.git("worktree", "remove", str(self.checkout))
+        checkout = self.checkout.parent.with_name("sample-style") / "production"
+        _ = self.git("worktree", "add", "-qb", "style/main", str(checkout), self.initial_tip)
+        doc = checkout / "docs" / "sample-style-production.md"
+        log = checkout / "docs" / "custom-style-log.md"
+        plan = checkout / add_style.PLAN_DIRECTORY / "sample-style-custom-unit.md"
+        plan.parent.mkdir(parents=True)
+        _ = plan.write_text("# Saved plan\n\nKeep this scope.\n")
+        _ = log.write_text("# Saved log\n\nKeep this entry.\n")
+        _ = doc.write_text("\n".join([
+            "# Legacy style production", "", "## Production Context", "",
+            f"- **Repository:** {self.repo}", "- **Kind:** style", "- **Branch point:** main",
+            "- **Merge branch:** style/main", f"- **Showrunner checkout:** {checkout}",
+            "- **Log:** docs/custom-style-log.md", f"- **Proposals:** {self.root / 'parent-issues'}",
+            "- **Pilot units:** sample-style-custom", "- **Custom field:** Keep this field.", "",
+            "## Style units", "", "| Unit | Families | Open tickets |", "| --- | --- | --- |",
+            "| sample-style-custom | names, values, types, modules | 2 |", "",
+            "## Custom notes", "", "Keep this note.", "",
+        ]))
+        return doc, log, plan
+
+    def test_legacy_bootstrap_enrolls_and_retries_without_losing_saved_files(self) -> None:
+        legacy, log, plan = self.legacy_bootstrap()
+        checkout = legacy.parent.parent
+        live_log = self.repo / log.relative_to(checkout)
+        before = {path: path.read_bytes() for path in (legacy, log, plan)}
+        registered = self.git("worktree", "list", "--porcelain")
+        self.env["TEST_REQUIRE_ADMISSION"] = "1"
+        self.env["TEST_FAIL_LAUNCH"] = "1"
+
+        failed = self.run_bootstrap(success=False)
+
+        self.assertIn("launch.py exited 2", failed.stderr)
+        enrolled = production_doc.read_new_production(self.doc, "sample-style")
+        self.assertEqual((enrolled.merge_checkout, enrolled.checkout, enrolled.merge_branch, enrolled.log),
+                         (self.repo, checkout, "style/main", live_log))
+        self.assertEqual(live_log.read_bytes(), before[log])
+        self.assertEqual(self.doc.read_text(), legacy.read_text().replace(
+            "- **Showrunner checkout:**", f"- **{MERGE_CHECKOUT_FIELD}:** {self.repo}\n- **Showrunner checkout:**"))
+        self.assertEqual(style_config.read_config(self.doc).assignments,
+                         (style_config.StyleUnitAssignment("sample-style-custom", add_style.FAMILIES, 2),))
+        self.assertFalse(any(row.name == "sample-style" for row in staff.snapshot().find(kind="showrunner")))
+
+        with self.doc.open("a") as document:
+            _ = document.write("Keep this enrolled edit.\n")
+        with live_log.open("a") as log_file:
+            _ = log_file.write("Keep this enrolled log entry.\n")
+        published = self.doc.read_bytes(), live_log.read_bytes()
+        failed_again = self.run_bootstrap(success=False)
+        self.assertIn("launch.py exited 2", failed_again.stderr)
+        self.assertEqual((self.doc.read_bytes(), live_log.read_bytes()), published)
+        del self.env["TEST_FAIL_LAUNCH"]
+
+        _ = self.run_bootstrap()
+
+        self.assertEqual(read_production("sample-style").doc, self.doc)
+        self.assertEqual((self.doc.read_bytes(), live_log.read_bytes()), published)
+        self.assertEqual({path: path.read_bytes() for path in before}, before)
+        self.assertEqual(list(plan.parent.glob("*.md")), [plan])
+        self.assertEqual(self.git("worktree", "list", "--porcelain"), registered)
+        self.assertFalse(self.checkout.exists())
+        launches = [call for call in self.calls() if call["command"] == "launch.py"]
+        self.assertEqual(len(launches), 3)
+        for launch in launches:
+            self.assertIn(str(self.doc), launch["arguments"])
+
+    def test_legacy_bootstrap_refuses_a_conflicting_destination_before_writes(self) -> None:
+        legacy, log, plan = self.legacy_bootstrap()
+        live_log = self.repo / log.relative_to(legacy.parent.parent)
+        tracked = (legacy, log, plan, self.repo / ".git/info/exclude")
+        before = {path: path.read_bytes() for path in tracked}
+        refs = self.git("show-ref")
+        for conflict in (self.doc, live_log):
+            with self.subTest(conflict=conflict):
+                _ = conflict.write_text("Keep this existing file.\n")
+                try:
+                    refused = self.run_bootstrap(success=False)
+                    self.assertEqual(refused.returncode, 2, refused.stdout + refused.stderr)
+                    self.assertIn(str(conflict), refused.stderr)
+                    self.assertEqual(conflict.read_text(), "Keep this existing file.\n")
+                    other = live_log if conflict == self.doc else self.doc
+                    self.assertFalse(other.exists())
+                    self.assertEqual({path: path.read_bytes() for path in tracked}, before)
+                    self.assertEqual(self.git("show-ref"), refs)
+                    self.assertEqual(self.calls(), [])
+                finally:
+                    conflict.unlink()
+
+    def test_registered_legacy_bootstrap_keeps_its_document_without_a_timer(self) -> None:
+        legacy, log, _ = self.legacy_bootstrap()
+        _ = recorded_showrunner("sample-style", legacy)
+        _ = self.run_bootstrap()
+
+        self.assertFalse(self.doc.exists())
+        self.assertFalse((self.repo / log.relative_to(legacy.parent.parent)).exists())
+        self.assertEqual(read_production("sample-style").doc, legacy)
+        launch = next(call for call in self.calls() if call["command"] == "launch.py")
+        self.assertNotIn("--doc", launch["arguments"])
 
     def test_interrupted_bootstrap_rewrites_destination_for_the_next_parent_only(self) -> None:
         self.env["TEST_FAIL_LAUNCH"] = "1"

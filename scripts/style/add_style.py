@@ -12,7 +12,8 @@ import os
 import sqlite3
 import subprocess
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from enum import Enum
 from pathlib import Path
 
 from typing import cast
@@ -20,18 +21,18 @@ from typing import cast
 SCRIPTS = Path(__file__).resolve().parents[1]
 
 from scripts.production import showrunners, staff
-from scripts.lib import build_folders
+from scripts.lib import build_folders, git_files
 from scripts.worktree import worktrees
-from scripts.lib.git_exclude import ensure_excluded
+from scripts.lib.git_exclude import ensure_excluded, require_untracked_ignored
 from scripts.production import showrunner_tree
 from scripts.production.production_names import LIVE_DOCUMENT_SUFFIX, MERGE_CHECKOUT_FIELD
 from scripts.production.add_showrunner import NoEndingTab, herdr_tab_open
 from scripts.herdr import herdr
-from scripts.production.production_doc import Production, Refusal, production_field, read_production, read_new_production, optional_field, FieldPresent
+from scripts.production.production_doc import LegacyProduction, Production, Refusal, production_field, read_production, read_new_production, optional_field, FieldPresent
 
 from scripts.style import rules, style_config
 from scripts.style import style_ledger
-from scripts.lib.atomic_file import write_text_atomic
+from scripts.lib.atomic_file import create_text_atomic, write_text_atomic
 
 FAMILIES: tuple[rules.Family, ...] = ("names", "values", "types", "modules")
 PLAN_DIRECTORY = Path("docs/style-production/units")
@@ -105,6 +106,21 @@ class NoStyleProduction:
         return self.repository / "docs" / f"{self.name}-production{LIVE_DOCUMENT_SUFFIX}"
 
 
+class LegacyStyleEnrollmentNotNeeded(Enum):
+    CURRENT_DOCUMENT = "no legacy files need publication"
+
+
+@dataclass(frozen=True)
+class LegacyStyleEnrollment:
+    relative_log: Path
+    files: tuple[tuple[Path, str], ...]
+
+    def publish(self) -> None:
+        for path, text in self.files:
+            if not create_text_atomic(path, text) and path.read_bytes() != text.encode("utf-8"):
+                raise Refusal(f"{path}: conflicts with the legacy style bootstrap")
+
+
 @dataclass(frozen=True)
 class StyleProduction:
     parent: Production
@@ -117,9 +133,12 @@ class StyleProduction:
     doc: Path
     proposals: str
     merge_tests: tuple[str, ...]
+    enrollment: LegacyStyleEnrollment | LegacyStyleEnrollmentNotNeeded = LegacyStyleEnrollmentNotNeeded.CURRENT_DOCUMENT
 
     @property
     def log(self) -> Path:
+        if isinstance(self.enrollment, LegacyStyleEnrollment):
+            return self.enrollment.relative_log
         return (Path(production_field(self.doc.read_text().splitlines(), "Log")) if self.doc.is_file()
                 else Path("docs") / f"{self.name}-log.md")
 
@@ -300,6 +319,82 @@ def _check_existing(style: StyleProduction) -> bool:
     return style.doc.exists() and style.name in showrunners.timer_names()
 
 
+def _require_bootstrap_destination(path: Path, repository: Path) -> None:
+    if path.resolve() != path or path.is_symlink() or (path.exists() and not path.is_file()):
+        raise Refusal(f"{path}: conflicts with the legacy style bootstrap")
+    parent = next(folder for folder in path.parents if folder.exists())
+    if git_files.locate(parent) != git_files.at(repository):
+        raise Refusal(f"{path}: expected a file in {repository}")
+    relative = path.relative_to(repository).as_posix()
+    require_untracked_ignored(repository, relative, planned_pattern=f"/{relative}")
+
+
+def _enroll_legacy_bootstrap(style: StyleProduction, standing: NoStyleProduction) -> StyleProduction:
+    """Plan publication of the unregistered bootstrap in the main checkout."""
+    from scripts.production.production_admission import require_guard_ready
+
+    if any(row.name == style.name
+           or isinstance(row.doc, (staff.LiveDoc, staff.WrappedDoc))
+           and row.doc.path.resolve() in (style.doc, standing.doc)
+           for row in staff.snapshot().find(kind="showrunner")):
+        raise Refusal(f"{style.name}: the legacy style bootstrap already has a staff row")
+    require_guard_ready()
+    legacy = read_new_production(style.doc, style.name)
+    if (not isinstance(legacy.merge_checkout, LegacyProduction) or legacy.checkout != style.checkout
+            or legacy.doc != style.doc or not worktrees.registered_checkout(style.checkout, style.repository, style.merge_branch)):
+        raise Refusal(f"{style.doc}: expected an unregistered style bootstrap on {style.merge_branch}")
+    main = git_files.at(style.repository)
+    if git_files.head(main) != git_files.OnBranch("main"):
+        raise Refusal(f"{style.repository}: expected the main checkout on main")
+
+    source = style.doc.read_bytes().decode("utf-8")
+    lines = source.splitlines(keepends=True)
+    repository = optional_field(source.splitlines(), "Repository")
+    if isinstance(repository, FieldPresent):
+        declared = production_field(source.splitlines(), "Repository")
+        if Path(declared).expanduser().resolve() != style.repository:
+            raise Refusal(f"{style.doc}: Repository must name {style.repository}")
+    log = legacy.log.resolve()
+    if (legacy.log != log or not log.is_relative_to(style.checkout) or log == style.checkout or log == legacy.doc):
+        raise Refusal(f"{legacy.log}: expected a separate log below {style.checkout}")
+    relative_log = log.relative_to(style.checkout)
+    live_log = style.repository / relative_log
+    if standing.doc == live_log:
+        raise Refusal(f"{live_log}: the live document and log need separate files")
+    for path in (standing.doc, live_log):
+        _require_bootstrap_destination(path, style.repository)
+
+    if standing.doc.is_file():
+        try:
+            enrolled = read_new_production(standing.doc, style.name)
+        except Refusal as error:
+            raise Refusal(f"{standing.doc}: conflicts with the legacy style bootstrap. {error}") from error
+        saved = standing.doc.read_text(encoding="utf-8").splitlines()
+        if (enrolled.merge_checkout != style.repository or enrolled.checkout != style.checkout
+                or enrolled.merge_branch != style.merge_branch or enrolled.log != live_log
+                or optional_field(saved, "Kind") != FieldPresent("style")):
+            raise Refusal(f"{standing.doc}: conflicts with the legacy style bootstrap")
+        _require_branch_point(style, production_field(saved, "Branch point").removeprefix("refs/heads/"))
+        return replace(style, doc=standing.doc)
+
+    files: list[tuple[Path, str]] = []
+    if log.exists():
+        if not log.is_file():
+            raise Refusal(f"{log}: expected a log file")
+        log_text = log.read_bytes().decode("utf-8")
+        if live_log.exists():
+            if live_log.read_bytes() != log_text.encode("utf-8"):
+                raise Refusal(f"{live_log}: conflicts with the legacy style log")
+        else:
+            files.append((live_log, log_text))
+
+    index = next(index for index, line in enumerate(lines) if line.startswith("- **Showrunner checkout:**"))
+    newline = "\r\n" if lines[index].endswith("\r\n") else "\n"
+    lines.insert(index, f"- **{MERGE_CHECKOUT_FIELD}:** {style.repository}{newline}")
+    files.append((standing.doc, "".join(lines)))
+    return replace(style, doc=standing.doc, enrollment=LegacyStyleEnrollment(relative_log, tuple(files)))
+
+
 def _production_text(style: StyleProduction) -> str:
     return "\n".join([
         f"# Production — {style.name}", "",
@@ -467,7 +562,9 @@ def _steps(style: StyleProduction, existing: bool) -> tuple[str, ...]:
         f"read {style.parent.doc}; repository {style.repository}; Proposals {style.proposals}",
         f"find standing {style.name} under {style.parent.name}; branch point {style.branch_point}",
         f"ensure {style.merge_branch} from {style.branch_tip} and worktree {style.checkout}",
-        (f"set Proposals in existing production doc {style.doc}"
+        (f"publish the legacy production document at {style.doc}"
+         if isinstance(style.enrollment, LegacyStyleEnrollment)
+         else f"set Proposals in existing production doc {style.doc}"
          if style.doc.exists() else f"write missing production doc {style.doc}"),
         f"write missing standing plans for the configured units under {style.checkout / PLAN_DIRECTORY}",
         f"exclude docs/style-production/, {style.doc} and {style.log} in shared info/exclude",
@@ -487,6 +584,8 @@ def main(argv: list[str]) -> int:
         style = _request(cast(str, args.production))
         existing = _check_existing(style)
         standing = standing_style_production(style.repository)
+        if isinstance(standing, NoStyleProduction) and style.doc != standing.doc:
+            style = _enroll_legacy_bootstrap(style, standing)
         if (isinstance(standing, NoStyleProduction) and not (style.checkout / ".git").exists()
                 and not worktrees.pending_checkout(style.checkout, style.repository, style.merge_branch)):
             raise Refusal(f"the serving merge unit must prepare {style.checkout} on {style.merge_branch}")
@@ -514,7 +613,8 @@ def main(argv: list[str]) -> int:
                       worktrees.output_record(repo_word, style.checkout.parent.name, style.checkout.name))
         else:
             layout = worktrees.unit_checkout_output(style.checkout, repo_word, style.name)
-        if not style.doc.is_file() and not style.merge_branch.startswith(LEGACY_STYLE_BRANCH_PREFIX):
+        if (not style.doc.is_file() and not isinstance(style.enrollment, LegacyStyleEnrollment)
+                and not style.merge_branch.startswith(LEGACY_STYLE_BRANCH_PREFIX)):
             _record_branch_point(style)
         _ = worktrees.create_checkout(style.checkout, style.repository, branch, layout, owner=style.name,
                                       allow_empty=True, allow_existing=True)
@@ -522,6 +622,8 @@ def main(argv: list[str]) -> int:
             _attach(style)
             return 0
         _exclude(style)
+        if isinstance(style.enrollment, LegacyStyleEnrollment):
+            style.enrollment.publish()
         _write_missing(style.doc, _production_text(style))
         _update_destination(style)
         config = style_config.read_config(style.doc)
