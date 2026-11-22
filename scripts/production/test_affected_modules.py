@@ -509,6 +509,22 @@ class AffectedModulesTests(unittest.TestCase):
         self.assertEqual({path.name for path in self.selection().modules},
                          {"test_dynamic.py", "test_null.py", "test_older_match.py"})
 
+    def test_unknown_folder_scans_require_a_changed_path(self) -> None:
+        self.add_test("checks/test_dynamic.py", "VALUE = 1\n")
+        self.certify()
+        old = self.config_gate({})
+        rows: list[dict[str, object]] = [
+            {**row, "folder_scans": []} for row in cast(list[dict[str, object]], old["modules"])
+        ]
+        self.record_history({**old, "started_at": "2026-11-01", "modules": rows})
+        self.record_history({**old, "started_at": "2026-11-02", "modules": [
+            row for row in rows if row["module"] != "test_dynamic.py"
+        ]}, host="Mac")
+
+        self.assertEqual(self.selection(), affected.AffectedSelection(self.base, (), ()))
+        self.write("docs/guide.md", "changed\n")
+        self.assertEqual(self.selection().modules, (self.repo / "scripts/checks/test_dynamic.py",))
+
     def test_corrupt_or_missing_mac_snapshot_is_skipped(self) -> None:
         self.add_test("checks/test_local.py", "VALUE = 1\n")
         self.certify()

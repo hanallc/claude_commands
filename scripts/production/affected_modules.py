@@ -937,14 +937,15 @@ def select_affected(repo: Path, base: CertifiedBase | NoCertifiedBase,
         known_folders = recorded.known_modules.get("folder_scans", frozenset())
         known_contents = recorded.known_modules.get("content_reads", frozenset())
         content_changes = {path for path in changed if not path.startswith("config/")}
-        base_blobs = revision_files(repo, base.commit) if known_folders and changed else {}
-        scanned_parents: set[str] = changed_path_parents(repo, changed, set(base_blobs)) if known_folders else set()
+        check_folder_history = bool(changed and known_folders)
+        base_blobs = revision_files(repo, base.commit) if check_folder_history else {}
+        scanned_parents: set[str] = changed_path_parents(repo, changed, set(base_blobs)) if check_folder_history else set()
         retained = source_blobs(paths | dirty, blobs)
         python = {path for path in changed if path.endswith(".py")}
         removed = {path for path in python if not (repo / path).is_file()}
         old_graph: dict[str, set[str]] = {}
         if removed:
-            old_blobs = base_blobs if known_folders else revision_files(repo, base.commit)
+            old_blobs = base_blobs if check_folder_history else revision_files(repo, base.commit)
             old_paths = {path for path in old_blobs if path.endswith(".py")}
             old_graph = graph_for_files(repo, old_paths, old_blobs, set(), cached, worktree=False).imports
             retained.update(source_blobs(old_paths, old_blobs))
@@ -967,7 +968,7 @@ def select_affected(repo: Path, base: CertifiedBase | NoCertifiedBase,
                 or isinstance(config_reads, RecordedConfigReads) and bool(config_reads.stems & configs)
                 or bool(static_configs & configs) or "*" in static_configs
                 or isinstance(reads.content_reads, RecordedContentReads) and bool(reads.content_reads.paths & config_paths))
-            folder_changed = bool(known_folders) and path not in declarations and (path not in known_folders
+            folder_changed = check_folder_history and path not in declarations and (path not in known_folders
                 or isinstance(reads.folder_scans, RecordedFolderScans)
                 and scans_changed_paths(reads.folder_scans, changed, scanned_parents))
             content_changed = bool(content_changes) and bool(known_contents) and (path not in known_contents
