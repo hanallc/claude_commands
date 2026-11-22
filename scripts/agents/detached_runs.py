@@ -98,6 +98,7 @@ class StopFields(TypedDict, total=False):
     stop_reason: str
     stop_pass_requested: Literal[True]
     self_stop: Literal[True]
+    stop_scopes: list[process_stop.ScopeIdentity]
 
 
 class DetachedRunKind(StrEnum):
@@ -279,6 +280,10 @@ def _write_record(path: Path, record: RunRecord) -> RunRecord:
             fields["self_stop"] = current["self_stop"]
         else:
             _ = fields.pop("self_stop", False)
+        if "stop_scopes" in current:
+            fields["stop_scopes"] = current["stop_scopes"]
+        else:
+            _ = fields.pop("stop_scopes", None)
         if not _is_run_record(fields):
             raise SystemExit(f"detached_runs: {path} update is not a run record")
         write_text_atomic(path, json.dumps(fields, indent=2, sort_keys=True))
@@ -306,6 +311,7 @@ def _is_run_record(raw: dict[str, object]) -> TypeGuard[RunRecord]:
                                         "delivery", "ended", "stop_reason"))
                     and ("delivered_at" not in raw or type(raw["delivered_at"]) in (int, float))
                     and ("completion_pending" not in raw or isinstance(raw["completion_pending"], bool))
+                    and ("stop_scopes" not in raw or process_stop.scope_identities(raw["stop_scopes"]))
                     and all(key not in raw or raw[key] is True
                             for key in ("stop_pass_requested", "self_stop", "orphan_result_superseded", "push_alert_attempted"))
                     and ("pane_dispatch_id" not in raw or isinstance(pane_dispatch, str)
@@ -328,6 +334,11 @@ def _read_stop_fields(path: Path, run_id: object) -> StopFields:
         fields["stop_pass_requested"] = True
     if saved.get("self_stop") is True:
         fields["self_stop"] = True
+    if "stop_scopes" in saved:
+        scopes = saved["stop_scopes"]
+        if not process_stop.scope_identities(scopes):
+            raise worker_lifecycle.WorkerStateUnreadable(path, "invalid stop scopes")
+        fields["stop_scopes"] = scopes
     return fields
 
 
@@ -352,6 +363,11 @@ def _recover_staged_pane_stop(path: Path, record: RunRecord) -> RunRecord:
     _ = staged.replace(path.with_suffix(CONFIRMED_STOP_SUFFIX))
     atomic_file.sync_folder(path.parent)
     return {**record, **fields}
+
+
+def _write_staged_stop(path: Path, stopping: Mapping[str, object]) -> None:
+    write_text_atomic(path.with_suffix(STAGED_STOP_SUFFIX), json.dumps(stopping, indent=2, sort_keys=True),
+                      new_file_mode=path.stat().st_mode & 0o777)
 
 
 def stop_with_reason(
@@ -381,8 +397,7 @@ def stop_with_reason(
         signaled = False
         try:
             try:
-                write_text_atomic(staged, json.dumps(stopping, indent=2, sort_keys=True),
-                                  new_file_mode=path.stat().st_mode & 0o777)
+                _write_staged_stop(path, stopping)
                 command = verify_group()
                 if isinstance(command, CommandGroupUnverified):
                     return False
@@ -431,7 +446,10 @@ def command_group(path: Path) -> CommandGroup | None:
     return None
 
 
-def _signal_stopped_command(record: Mapping[str, object], command: CommandGroup, number: int) -> None:
+def _signal_stopped_command(
+    record: Mapping[str, object], command: CommandGroup, number: int,
+    *, remember_scopes: Callable[[list[process_stop.ScopeIdentity]], None],
+) -> None:
     """Use the detached command's launcher scope when it exists."""
     identity = record.get("run_id")
     kind = record.get("kind", DetachedRunKind.DETECT)
@@ -439,12 +457,24 @@ def _signal_stopped_command(record: Mapping[str, object], command: CommandGroup,
     if (isinstance(identity, str) and identity and "/" not in identity
             and isinstance(kind, str) and kind in tuple(DetachedRunKind)):
         scope = _command_scope_unit(kind, identity)
-    process_stop.stop_command_tree(process_stop.ProcessLifetime(command.group, command.started), scope, number)
+    process_stop.stop_command_tree(process_stop.ProcessLifetime(command.group, command.started), scope, number,
+                                   remember_scopes=remember_scopes)
 
 
 def stop_verified_command(path: Path, reason: str, expected: CommandGroup) -> bool:
     """Stop only the published command that the caller previously verified."""
     return stop_command(path, reason, expected=expected)
+
+
+def _repeat_scope_stop(path: Path, expected: CommandGroup) -> bool:
+    with record_lock(path):
+        try:
+            record = _read_record(path)
+        except SystemExit:
+            return False
+        record = _recover_staged_pane_stop(path, record)
+        return (record.get("stop_pass_requested") is True and command_group(path) == expected
+                and process_stop.stop_saved_scopes(record.get("stop_scopes", []), signal.SIGTERM))
 
 
 def stop_command(path: Path, reason: str, *, expected: CommandGroup | None = None) -> bool:
@@ -454,6 +484,8 @@ def stop_command(path: Path, reason: str, *, expected: CommandGroup | None = Non
     record = worker_lifecycle.read_json_object(path)
     supervisor = _integer(record.get("pid"))
     starting_command = command_group(path) if expected is None else expected
+    if starting_command is None:
+        return False
 
     def verify_group() -> CommandGroup | CommandGroupUnverified:
         command = command_group(path)
@@ -463,17 +495,24 @@ def stop_command(path: Path, reason: str, *, expected: CommandGroup | None = Non
             return CommandGroupUnverified()
         return command
 
+    def remember_scopes(scopes: list[process_stop.ScopeIdentity]) -> None:
+        stopping = worker_lifecycle.read_json_object(path.with_suffix(STAGED_STOP_SUFFIX))
+        stopping["stop_scopes"] = scopes
+        _write_staged_stop(path, stopping)
+
     def signal_command(group: int, number: int) -> None:
-        if starting_command is None or group != starting_command.group:
+        if group != starting_command.group:
             raise ProcessLookupError("the command changed")
-        _signal_stopped_command(record, starting_command, number)
+        _signal_stopped_command(record, starting_command, number, remember_scopes=remember_scopes)
 
     try:
-        return stop_with_reason(path, reason, verify_group=verify_group,
-                                signal_group=signal_command, stop_pass=True,
-                                self_stop=_stop_caller_is_owner(record.get("staff_id"), os.environ))
+        if stop_with_reason(path, reason, verify_group=verify_group,
+                            signal_group=signal_command, stop_pass=True,
+                            self_stop=_stop_caller_is_owner(record.get("staff_id"), os.environ)):
+            return True
     except ProcessLookupError:
         return False
+    return _repeat_scope_stop(path, starting_command)
 
 
 def seat_name(session_dir: str, name: str) -> str:
@@ -548,6 +587,8 @@ def _orphaned(path: Path, raw: Mapping[str, object], now: float) -> bool:
 
 
 def _command_has_ended(raw: Mapping[str, object], pid: int) -> bool:
+    if not _stop_scopes_have_ended(raw):
+        return False
     command = _saved_process(raw.get("command_pid"), raw.get("command_started"))
     if isinstance(command, (process_start.Started, process_start.Unreadable)):
         return False
@@ -570,6 +611,13 @@ def _command_has_ended(raw: Mapping[str, object], pid: int) -> bool:
         except OSError:
             return False
     return not owns_group or not _group_is_live(pid)
+
+
+def _stop_scopes_have_ended(raw: Mapping[str, object]) -> bool:
+    if "stop_scopes" not in raw:
+        return True
+    scopes = raw["stop_scopes"]
+    return process_stop.scope_identities(scopes) and process_stop.scopes_have_ended(scopes)
 
 
 def _stopped_group_has_ended(record: RunRecord) -> bool:
@@ -672,6 +720,8 @@ def _reap_orphans_locked(runs: Path, worker: str = "") -> OrphanReapResult:
                 if record["status"] != "running":
                     continue
                 record = _recover_staged_pane_stop(path, record)
+                if not _stop_scopes_have_ended(record):
+                    continue
             newer = any(other.get("worker") == record["worker"] and other.get("command") == record["command"]
                         and other.get("staff_id") == record["staff_id"]
                         and _number(other.get("started_at"), 0.0) > record["started_at"]
@@ -1891,7 +1941,7 @@ def command_supervise(args: argparse.Namespace) -> int:
         finished_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
         record.update(exit_code=exit_code, finished_at=finished_at)
         record = _write_record(record_path, record)
-        # Other members of the command group can remain after its leader exits.
+        # Scope and group members can remain after the command leader exits.
         while record.get("stop_pass_requested") and not _stopped_group_has_ended(record):
             time.sleep(0.25)
         delivery_exit = deliver_in_fresh_process(record_path)

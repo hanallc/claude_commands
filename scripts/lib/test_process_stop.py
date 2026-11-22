@@ -9,7 +9,7 @@ from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import patch
 
-from scripts.lib import process_stop
+from scripts.lib import process_start, process_stop
 
 
 LEADER = process_stop.ProcessLifetime(701, "11")
@@ -130,4 +130,22 @@ class ProcessStopTests(unittest.TestCase):
             write_process(fixture.proc, 703, 33, cgroup=relative, session=703)
             signals = fixture.stop(UNIT, signal.SIGTERM)
             self.assertEqual(kill_file.read_text(), "0\n")
+            self.assertCountEqual(signals, [(pid, signal.SIGTERM) for pid in (701, 702, 703)])
+
+    def test_term_reaches_a_child_that_joins_between_membership_reads(self) -> None:
+        with TemporaryDirectory() as folder:
+            fixture = StopFixture(Path(folder))
+            relative, kill_file = fixture.scope("runs", 701, 702)
+            _ = (fixture.proc / "701" / "cgroup").write_text(f"0::{relative}\n")
+            write_process(fixture.proc, 702, 22, cgroup=relative, session=702)
+            write_process(fixture.proc, 703, 33, cgroup=relative, session=703)
+            read_start = process_start.proc_table_start
+
+            def join_during_pin(pid: int, proc: Path) -> process_start.ProcessStart:
+                if pid == 702:
+                    _ = kill_file.with_name("cgroup.procs").write_text("701\n702\n703\n")
+                return read_start(pid, proc)
+
+            with patch.object(process_start, "proc_table_start", side_effect=join_during_pin):
+                signals = fixture.stop(UNIT, signal.SIGTERM)
             self.assertCountEqual(signals, [(pid, signal.SIGTERM) for pid in (701, 702, 703)])
