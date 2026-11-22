@@ -875,67 +875,73 @@ class GateRecovery:
             self.scope = ""
             self.save()
         self.recover_tokens()
-        check_gate_folder_leases(self)
-        for folder in self.folders:
-            report_retained_gate_folder(folder, "the gate owner ended")
-        if self.rollback:
-            repo = Path(self.repo)
-            with gate_operation_lock(repo) as descriptor, ExitStack() as cleanup:
-                try:
-                    fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                except BlockingIOError:
-                    print(f"Recovered gate {self.pid}: rollback waits for the live gate in {repo}", flush=True)
-                    return
-                rollback_deadline = time.monotonic() + config.program_stop_seconds
-                try:
-                    _ = cleanup.enter_context(scratch.copy_lock(repo, deadline=rollback_deadline))
-                except scratch.ScratchError as error:
-                    raise GateRecoveryUnresolved(f"{error} in {repo}") from error
-                self.rollback_deadline = rollback_deadline
-                try:
-                    head = checked_git(repo, "rev-parse", "HEAD")
-                    matches = head in (self.rollback, self.rollback_head)
-                    if not matches and self.rollback_head in ("", self.rollback) and self.rollback_source:
-                        parents = checked_git(repo, "rev-list", "--parents", "-n", "1", head).split()[1:]
-                        matches = parents == [self.rollback, self.rollback_source]
-                    if not matches:
-                        raise GateRollbackMismatch(
-                            f"gate recovery kept {self.path}: HEAD {head} differs from the recorded merge")
-                    rollback_merge(repo, self.rollback)
-                    self.rollback = ""
-                    self.rollback_head = ""
-                    self.rollback_source = ""
-                    self.save()
-                finally:
-                    self.rollback_deadline = None
-            print(f"Recovered gate {self.pid}: merge undone, not pushed", flush=True)
-        if not self.tokens:
-            self.finish()
+        with ExitStack() as leases:
+            check_gate_folder_leases(self, leases)
+            for folder in self.folders:
+                report_retained_gate_folder(folder, "the gate owner ended")
+            if self.rollback:
+                repo = Path(self.repo)
+                with gate_operation_lock(repo) as descriptor, ExitStack() as cleanup:
+                    try:
+                        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    except BlockingIOError:
+                        print(f"Recovered gate {self.pid}: rollback waits for the live gate in {repo}", flush=True)
+                        return
+                    rollback_deadline = time.monotonic() + config.program_stop_seconds
+                    try:
+                        _ = cleanup.enter_context(scratch.copy_lock(repo, deadline=rollback_deadline))
+                    except scratch.ScratchError as error:
+                        raise GateRecoveryUnresolved(f"{error} in {repo}") from error
+                    self.rollback_deadline = rollback_deadline
+                    try:
+                        head = checked_git(repo, "rev-parse", "HEAD")
+                        matches = head in (self.rollback, self.rollback_head)
+                        if not matches and self.rollback_head in ("", self.rollback) and self.rollback_source:
+                            parents = checked_git(repo, "rev-list", "--parents", "-n", "1", head).split()[1:]
+                            matches = parents == [self.rollback, self.rollback_source]
+                        if not matches:
+                            raise GateRollbackMismatch(
+                                f"gate recovery kept {self.path}: HEAD {head} differs from the recorded merge")
+                        rollback_merge(repo, self.rollback)
+                        self.rollback = ""
+                        self.rollback_head = ""
+                        self.rollback_source = ""
+                        self.save()
+                    finally:
+                        self.rollback_deadline = None
+                print(f"Recovered gate {self.pid}: merge undone, not pushed", flush=True)
+            if self.tokens:
+                return
+            self.save_finished()
+        self.release_folder_markers()
 
     def finish(self) -> None:
+        self.save_finished()
+        self.release_folder_markers()
+
+    def save_finished(self) -> None:
         """Keep the recovery record when it names retained folders."""
         if self.folders:
             self.finished = True
             self.save()
-            self.release_folder_markers()
         else:
             self.path.unlink(missing_ok=True)
 
     def release_folder_markers(self) -> None:
         """Release the removal markers that refer to this finished record."""
         for folder in map(Path, self.folders):
-            marker = folder / build_folders.RECOVERY_MARKER
-            try:
-                if not marker.is_symlink():
+            for marker in gate_folder_markers(folder):
+                try:
+                    if not marker.is_symlink():
+                        continue
+                    with build_folder_lock.folder_parent(folder, folder.parent, create=False) as parent, ExitStack() as leases:
+                        lease = build_folders._hold_free_lease(folder, parent, leases, wait=False)  # pyright: ignore[reportPrivateUsage]
+                        if not isinstance(lease, build_folders.RefusedRemovalLease) and marker.readlink() == self.path.absolute():
+                            marker.unlink()
+                except FileNotFoundError:
                     continue
-                with build_folder_lock.folder_parent(folder, folder.parent, create=False) as parent, ExitStack() as leases:
-                    lease = build_folders._hold_free_lease(folder, parent, leases, wait=False)  # pyright: ignore[reportPrivateUsage]
-                    if not isinstance(lease, build_folders.RefusedRemovalLease) and marker.readlink() == self.path.absolute():
-                        marker.unlink()
-            except FileNotFoundError:
-                continue
-            except (OSError, ValueError) as error:
-                report_gate_recovery(self.path, error)
+                except (OSError, ValueError) as error:
+                    report_gate_recovery(self.path, error)
 
 
 def report_retained_gate_folder(folder: str, reason: str) -> None:
@@ -963,27 +969,30 @@ def prove_scope_empty(scope: Path, deadline: float, sample_seconds: float) -> No
         raise GateRecoveryUnresolved(str(error).removeprefix("UNRESOLVED: ")) from error
 
 
-def check_gate_folder_leases(recovery: GateRecovery) -> None:
-    """Check the recorded folders for live lease holders before returning capacity."""
+def gate_folder_markers(folder: Path) -> tuple[Path, Path]:
+    return folder / build_folders.RECOVERY_MARKER, build_folders.recovery_marker_sidecar(folder)
+
+
+def check_gate_folder_leases(recovery: GateRecovery, leases: ExitStack) -> None:
+    """Hold the recorded folder leases until the caller saves the finished record."""
     paths = {Path(folder) for folder in recovery.folders}
-    with ExitStack() as leases:
-        for path in sorted(paths):
+    for path in sorted(paths):
+        try:
             try:
-                try:
-                    parent = leases.enter_context(build_folder_lock.folder_parent(path, path.parent, create=False))
-                except FileNotFoundError:
-                    continue
-                lease = build_folders._hold_free_lease(path, parent, leases, wait=False, create=True)  # pyright: ignore[reportPrivateUsage]
-                marker = path / build_folders.RECOVERY_MARKER
-                if (not isinstance(lease, build_folders.HeldFolderRemovalLease)
-                        or marker.is_symlink() and marker.readlink() != recovery.path.absolute()):
-                    raise GateRecoveryUnresolved(f"gate recovery kept held folder {path}")
-                refusal = build_folders._hold_child_leases(  # pyright: ignore[reportPrivateUsage]
-                    path, leases, wait=False, separately_checked=paths)
-                if refusal is not None:
-                    raise GateRecoveryUnresolved(f"gate recovery kept held leases or recovery records in {path}")
-            except (OSError, ValueError) as error:
-                raise GateRecoveryUnresolved(f"gate recovery could not check {path}: {error}") from error
+                parent = leases.enter_context(build_folder_lock.folder_parent(path, path.parent, create=False))
+            except FileNotFoundError:
+                continue
+            lease = build_folders._hold_free_lease(path, parent, leases, wait=False, create=True)  # pyright: ignore[reportPrivateUsage]
+            if (not isinstance(lease, build_folders.HeldFolderRemovalLease)
+                    or any(marker.is_symlink() and marker.readlink() != recovery.path.absolute()
+                           for marker in gate_folder_markers(path))):
+                raise GateRecoveryUnresolved(f"gate recovery kept held folder {path}")
+            refusal = build_folders._hold_child_leases(  # pyright: ignore[reportPrivateUsage]
+                path, leases, wait=False, separately_checked=paths)
+            if refusal is not None:
+                raise GateRecoveryUnresolved(f"gate recovery kept held leases or recovery records in {path}")
+        except (OSError, ValueError) as error:
+            raise GateRecoveryUnresolved(f"gate recovery could not check {path}: {error}") from error
 
 
 class GateRollbackMismatch(GateRefused):

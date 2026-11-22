@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import unittest
-from contextlib import ExitStack, redirect_stderr, redirect_stdout
+from contextlib import ExitStack, redirect_stderr, redirect_stdout, suppress
 from dataclasses import asdict, replace
+import errno
 import fcntl
 import io
 import json
@@ -506,6 +507,42 @@ sys.stdin.read(1)
             self.assertTrue(build_folders.reclaim_build_folder(parent, wait=False))
             self.assertFalse(parent.exists())
 
+    def test_recovery_holds_nested_lease_until_finished_record_is_saved(self) -> None:
+        folder = self.root / "recorded-work"
+        folder.mkdir()
+        lock = folder / "nested.lock"
+        marker = folder / build_folders.RECOVERY_MARKER
+        save = gate.GateRecovery.save
+        attempts: list[bool] = []
+
+        def compete_at_save(record: gate.GateRecovery) -> None:
+            if record.finished:
+                saved = gate.read_gate_recovery(record.path)
+                assert saved is not None
+                self.assertFalse(saved.finished)
+                try:
+                    fcntl.flock(holder, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    attempts.append(False)
+                else:
+                    attempts.append(True)
+            save(record)
+
+        with mock.patch.dict(os.environ, self.environment, clear=True), lock.open("xb") as holder:
+            directory = gate.gate_run_directory(self.checkout)
+            recovery = gate.GateRecovery(directory / "dead.json", str(self.checkout),
+                                         os.getpid(), "ended-owner", folders=[str(folder)])
+            recovery.save()
+            marker.symlink_to(recovery.path)
+            with mock.patch.object(gate.GateRecovery, "save", autospec=True, side_effect=compete_at_save):
+                gate.recover_gate_directory(directory)
+            self.assertEqual(attempts, [False])
+            saved = gate.read_gate_recovery(recovery.path)
+            assert saved is not None
+            self.assertTrue(saved.finished)
+            self.assertFalse(marker.is_symlink())
+            fcntl.flock(holder, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
     @gate_suites("hooks")
     def test_both_gate_modes_recover_the_private_run_record(self) -> None:
         with mock.patch.dict(os.environ, self.environment, clear=True):
@@ -695,6 +732,38 @@ gate.run_suites(Path.cwd(), full=True)
                     self.assertIs(saved["finished"], False)
                     self.assertEqual((folder / build_folders.RECOVERY_MARKER).readlink(), recovery.path)
 
+    def test_child_removal_error_keeps_the_recovery_marker(self) -> None:
+        unlink = os.unlink
+
+        def fail_child(name: str, *, dir_fd: int | None = None) -> None:
+            if name == "blocked-child":
+                # Force the order where recursive removal visits the marker first.
+                with suppress(FileNotFoundError):
+                    unlink(build_folders.RECOVERY_MARKER, dir_fd=dir_fd)
+                raise OSError(errno.EIO, "fixture cannot remove the child", name)
+            unlink(name, dir_fd=dir_fd)
+
+        with mock.patch.dict(os.environ, self.environment, clear=True):
+            with (self.assertRaisesRegex(gate.GateRecoveryUnresolved, "fixture cannot remove the child"),
+                  gate.gate_recovery(self.checkout) as recovery,
+                  mock.patch.object(os, "unlink", side_effect=fail_child),
+                  gate.gate_temporary(recovery, "merge-gate", self.root) as folder):
+                self.write(folder / "blocked-child", "keep")
+            self.assertEqual((folder / "blocked-child").read_text(), "keep")
+            marker = folder / build_folders.RECOVERY_MARKER
+            retained_marker = build_folders.recovery_marker_sidecar(folder)
+            self.assertEqual(marker.readlink(), recovery.path)
+            self.assertEqual(retained_marker.readlink(), recovery.path)
+            saved = gate.read_gate_recovery(recovery.path)
+            assert saved is not None
+            self.assertFalse(saved.finished)
+            marker.unlink()
+            self.assertFalse(build_folders.reclaim_build_folder(folder, wait=False))
+            with mock.patch.object(gate, "process_start", return_value=Zombie("ended-owner")):
+                gate.recover_gate_directory(recovery.path.parent)
+            self.assertFalse(retained_marker.is_symlink())
+            self.assertTrue(build_folders.reclaim_build_folder(folder, wait=False))
+
     def assert_unresolved_folder_cleanup(self, folders: list[Path]) -> gate.GateRecovery:
         [record_path] = gate.gate_run_directory(self.checkout).glob("*.json")
         recovery = gate.read_gate_recovery(record_path)
@@ -727,8 +796,8 @@ gate.run_suites(Path.cwd(), full=True)
             self.assertFalse(lock.with_suffix("").exists())
             self.assertFalse(lock.with_suffix(".lease.json").exists())
             recovery = self.assert_unresolved_folder_cleanup([lock.parent.parent, lock.parent])
-            with self.assertRaises(gate.GateRecoveryUnresolved):
-                gate.check_gate_folder_leases(recovery)
+            with self.assertRaises(gate.GateRecoveryUnresolved), ExitStack() as leases:
+                gate.check_gate_folder_leases(recovery, leases)
 
     @gate_suites("hooks", "lib")
     def test_top_level_lease_keeps_folder_and_record_after_modules_finish(self) -> None:

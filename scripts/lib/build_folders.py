@@ -1561,7 +1561,8 @@ def _remove_failed_allocation(path: Path, directory: int, allocated: os.stat_res
         _unlink_metadata(path, directory)
 
 
-def _remove_folder(path: Path, directory: int, allocated: os.stat_result) -> None:
+def _remove_folder(path: Path, directory: int, allocated: os.stat_result, *,
+                   preserve_recovery: bool = False) -> None:
     def repair(function: object, name: str, error: BaseException) -> None:
         if not isinstance(error, PermissionError):
             raise error
@@ -1584,7 +1585,27 @@ def _remove_folder(path: Path, directory: int, allocated: os.stat_result) -> Non
     if os.path.samestat(current, allocated):
         if not may_remove_build_path(path):
             raise PermissionError(f"{path}: retain the protected build folder")
-        shutil.rmtree(path.name, dir_fd=directory, onexc=repair)
+        if not preserve_recovery:
+            shutil.rmtree(path.name, dir_fd=directory, onexc=repair)
+            return
+        marker = str(Path(path.name) / RECOVERY_MARKER)
+        retained_marker = recovery_marker_sidecar(path).name
+        try:
+            os.link(marker, retained_marker, src_dir_fd=directory, dst_dir_fd=directory, follow_symlinks=False)
+        except FileNotFoundError:
+            shutil.rmtree(path.name, dir_fd=directory, onexc=repair)
+            return
+        # Keep the recovery link outside the tree until recursive removal succeeds.
+        try:
+            shutil.rmtree(path.name, dir_fd=directory, onexc=repair)
+        except BaseException:
+            if _folder_exists(path, directory):
+                with suppress(FileExistsError):
+                    os.link(retained_marker, marker, src_dir_fd=directory, dst_dir_fd=directory, follow_symlinks=False)
+            raise
+        finally:
+            if not _folder_exists(path, directory):
+                os.unlink(retained_marker, dir_fd=directory)
 
 
 def _folder_exists(path: Path, directory: int) -> bool:
@@ -1773,22 +1794,29 @@ def _legacy_program_recovery_pending() -> bool:
     return False
 
 
-def _recovery_marker_present(directory: int) -> bool:
+def recovery_marker_sidecar(path: Path) -> Path:
+    """Locate the recovery link that survives recursive removal."""
+    return path.with_name(path.name + RECOVERY_MARKER)
+
+
+def _recovery_marker_present(name: str, directory: int) -> bool:
     """A linked marker keeps the folder while its recovery record exists."""
     try:
-        _ = os.stat(RECOVERY_MARKER, dir_fd=directory)
+        _ = os.stat(name, dir_fd=directory)
     except FileNotFoundError:
         return False
     return True
 
 
 def _folder_needs_recovery(folder: str, directory: int) -> bool:
-    return (_recovery_marker_present(directory)
+    return (_recovery_marker_present(RECOVERY_MARKER, directory)
             or (gate_recovery_folder(folder) and _folder_exists(Path("run.json"), directory))
             or (_folder_exists(Path(QUEUE_PROGRAM_SIDECAR), directory) and _legacy_program_recovery_pending()))
 
 
 def _recovery_record_present(folder: str, directory: int) -> bool:
+    if _recovery_marker_present(recovery_marker_sidecar(Path(folder)).name, directory):
+        return True
     try:
         descriptor = os.open(folder, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=directory)
     except (FileNotFoundError, NotADirectoryError):
@@ -1815,6 +1843,10 @@ def _hold_child_leases(path: Path, stack: ExitStack, *, wait: bool = True,
         if current != path and has_record and _folder_needs_recovery(folder, directory):
             return RefusedRemovalLease()
         for name in files:
+            stem = name.removesuffix(RECOVERY_MARKER)
+            if stem and stem != name and current / stem not in separately_checked:
+                if _recovery_marker_present(name, directory):
+                    return RefusedRemovalLease()
             stem = name.removesuffix(".lock")
             if stem != name and current / stem not in separately_checked:
                 info = os.stat(name, dir_fd=directory, follow_symlinks=False)
@@ -2036,7 +2068,7 @@ def _finish_temporary(path: Path, directory: int, allocated: os.stat_result, *,
         with ExitStack() as leases:
             if _hold_child_leases(path, leases, wait=False) is not None:
                 return False
-            _remove_folder(path, directory, allocated)
+            _remove_folder(path, directory, allocated, preserve_recovery=True)
         return True
 
     try:
