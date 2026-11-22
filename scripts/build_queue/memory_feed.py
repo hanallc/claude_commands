@@ -841,11 +841,14 @@ def step_name_parts(step: admission_records.RunningStep | admission_records.Wait
     return staff_names.owned_step_parts(names, step.step, identity.unit, identity.role, ci=ci, current=current)
 
 
-def step_key(row: RunRow | WaitRow | MacBuildRow | MacReadingUnavailableRow | CloudWorkRow) -> str:
+def step_key(row: RunRow | WaitRow | MacBuildRow | MacReadingUnavailableRow | CloudWorkRow, *,
+             placement_episode: str = "") -> str:
     """Keep a process identity across changes to memory, labels, and queue order."""
     # An idle or unreadable CI row has no pid or start time; its cgroup tells two CI rows apart.
     identity = [row.get("machine") or "natedev", row.get("kind", "local"), row["pid"],
                 row.get("started_at", row.get("since", 0)), row.get("group", ""), row.get("ci_cgroup", "")]
+    if placement_episode:
+        identity.append(placement_episode)
     return hashlib.sha256(json.dumps(codec.snapshot_value(identity)).encode()).hexdigest()[:24]
 
 
@@ -3028,7 +3031,7 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
                         **job_notes(job, names, step=waiter.step, verify=waiter.verify,
                                     ci=bool(ci_label))}
     work_rows: list[RunRow | CloudRunRow | MacBuildRow | MacReadingUnavailableRow] = list(walk)
-    mac_runs: list[tuple[str, str, str]] = []
+    mac_runs: list[tuple[queue_view.MacBuild, str]] = []
     mac_status = queue_view.mac_reading_status(mac_reading, explanation.now)
     if mac_status:
         name = QueueRowName.fixed(QueueKind.MAC)
@@ -3050,7 +3053,7 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
             mac_row = mac_work_row(build, mac_reading, identity,
                                    names=names, slot_roots=slot_roots, slot_machine=mac_machine, placed_step=placed)
             work_rows.append(mac_row)
-            mac_runs.append((build.repository, build.session, mac_row["name"]))
+            mac_runs.append((build, mac_row["name"]))
     work_rows.sort(key=lambda row: row["started_at"])
     model = queue_view.QueueModel(parsed, labels, names=names)
     limit_cloud_names: dict[wire.Owner, str] = {}
@@ -3153,8 +3156,12 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
                 if isinstance(explanation.head, admission_records.HeadExplanation) and explanation.head.decision.state == "hold":
                     waiting_row["head_room"] = head_room(explanation.head.room, explanation.room, ram)
                 break
-    for step_row in (*work_rows, *waiting_rows):
-        step_row["key"] = step_key(step_row)
+    for wait_row, visible in zip(waiting_rows, visible_waits, strict=True):
+        source = visible.source
+        episode = source.step.episode if isinstance(source, queue_view.WaitingBuild) else ""
+        wait_row["key"] = step_key(wait_row, placement_episode=episode)
+    for running_row in work_rows:
+        running_row["key"] = step_key(running_row)
     pressure = explanation.decided_from.pressure
     policy = explanation.policy.pressure
     # Without the recorded builds and CI swap, the page reads host swap now instead of failing.

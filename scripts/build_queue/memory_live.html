@@ -81,6 +81,10 @@ __PAGE_FRAME_STYLE__
 .build-limit-metric { margin-top: 5px; font-weight: 400; }
 .build-limit-metric > :last-child { margin-left: auto; }
 .build-limit-track { width: 44px; height: 6px; overflow: hidden; border-radius: 3px; background: var(--line); }
+@media (min-width: 1280px) {
+  .build-limit-metric:has(> .build-limit-track) { flex-wrap: nowrap; white-space: nowrap; }
+  .build-limit-track { flex: 0 1 44px; min-width: 4px; }
+}
 .build-limit-track > i { display: block; height: 100%; background: var(--used); }
 .build-limit-track.below > i { background: var(--cap); }
 .build-limit-marks { display: inline-flex; flex-wrap: wrap; gap: 3px; align-items: center; }
@@ -1294,7 +1298,7 @@ function limitWaits(waits) {
       <span>${names.length} waiting · ${esc(reason)}</span></div>${limitNames(names)}</div>`).join("");
 }
 function limitCell(cell) {
-  const {available, limit, used, runs, exempt, other, waits, budgets, note} = cell;
+  const {available, limit, used, runs, exempt, other, other_note, waits, budgets, note} = cell;
   let contents;
   if (available === false) contents = '<span class="build-limit-note">Does not run here</span>';
   else if (available == null) contents = '<span class="build-limit-note">State unavailable</span>';
@@ -1305,7 +1309,7 @@ function limitCell(cell) {
     contents = `<div class="build-limit-count num">${marks}<span>${esc(count)}</span></div>${limitNames(runs)}`;
   }
   if (exempt.length) contents += `<div class="build-limit-note">Merge runs above the limit</div>${limitNames(exempt)}`;
-  if (other.length) contents += `<div class="build-limit-note">${other.length} other running</div>${limitNames(other)}`;
+  if (other.length) contents += `<div class="build-limit-note">${esc(other_note || `${other.length} other running`)}</div>${limitNames(other)}`;
   if (note) contents += `<div class="build-limit-note">${esc(note)}</div>`;
   return `${contents}${budgets.map(metric => limitMetric(metric, metric.qualifier === "maximum")).join("")}${limitWaits(waits)}`;
 }

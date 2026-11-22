@@ -607,6 +607,7 @@ class ServiceState:
     assignments: dict[str, records.SavedPlacementAssignment] = field(default_factory=dict)
     current_assignments: dict[str, str] = field(default_factory=dict)
     pending_cloud_groups: dict[str, PendingCloudGroup] = field(default_factory=dict)
+    placement_refusals: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -1503,6 +1504,7 @@ class AdmissionServer:
         self.build_history_generation: int = 0
         self.ledger: ReplayLedger = ReplayLedger({})
         self.placement_requests: dict[str, wire.PlacementRequest] = {}
+        self.placement_refusals: dict[str, str] = {}
         self.pending_coordinators: dict[placement.SubmittingOwner, PendingCoordinatorEvidence] = {}
         self.assignments: dict[str, records.SavedPlacementAssignment] = {}
         self.current_assignments: dict[str, str] = {}
@@ -1647,6 +1649,7 @@ class AdmissionServer:
                 for key, request in state.placement_requests.items()}
             self.assignments = state.assignments
             self.current_assignments = state.current_assignments
+            self.placement_refusals = state.placement_refusals
             self.pending_cloud_groups = state.pending_cloud_groups
         self.persist()
         for episode, record in list(self.reservations.items()):
@@ -1721,7 +1724,8 @@ class AdmissionServer:
             self._prune_ended_placements(now - self.last_usable_configuration.ended_placement_seconds)
         state = ServiceState(self.reservations, self.places, self.ledger, self.spacing, self.priority,
             self.build_history_generation, self.run_places, self.caller_versions, self.lifecycle_outbox,
-            self.placement_requests, self.assignments, self.current_assignments, self.pending_cloud_groups)
+            self.placement_requests, self.assignments, self.current_assignments, self.pending_cloud_groups,
+            self.placement_refusals)
         encodings: dict[tuple[str, str], DurableRecordEncoding] = {}
         changed = False
 
@@ -2752,6 +2756,8 @@ class AdmissionServer:
 
     def _placement_refusal(self, request: wire.PlacementRequest) -> str | None:
         """Return the terminal refusal for a request without a current assignment."""
+        if (refusal := self.placement_refusals.get(request.episode)) is not None:
+            return refusal
         candidates = self.placement_eligibility.get(request.episode, ())
         selection = request.constraints.selection
         if isinstance(selection, placement.MacOnlyHost):
@@ -3399,6 +3405,7 @@ done
                             if saved.assignment.episode not in ended}
         for episode in ended:
             _ = self.placement_requests.pop(episode, None)
+            _ = self.placement_refusals.pop(episode, None)
             _ = self.prerequisites.pop(episode, None)
             _ = self.placement_eligibility.pop(episode, None)
             self._remove_waiter(self.waiters.get(episode))
@@ -3589,7 +3596,8 @@ done
         return wire.DispatchStatus(saved.assignment, state, saved.permission, reason, saved.retry)
 
     def _placement_waiting(self, request: wire.PlacementRequest) -> bool:
-        if not self._placement_owner_live(request.owner) or request.episode in self.current_assignments:
+        if (request.episode in self.placement_refusals or request.episode in self.current_assignments
+                or not self._placement_owner_live(request.owner)):
             return False
         return not any(saved.assignment.episode == request.episode
             and isinstance(saved.state, placement.ClosedAssignment)
@@ -3919,6 +3927,13 @@ done
             return self._placement_status(terminal[-1].assignment)
         candidates = self.placement_eligibility.get(request.episode, ())
         if (refusal := self._placement_refusal(request)) is not None:
+            if request.episode not in self.placement_refusals:
+                self.placement_refusals[request.episode] = refusal
+                self.active_placement_waits.discard(request.episode)
+                self._remove_waiter(self.waiters.get(request.episode), claim_disposition=WaiterClaimDisposition.RETURN)
+                self._prune_host_evidence()
+                self.persist()
+                self.next_pass = self.clock.monotonic()
             return wire.DispatchStatus(placement.UnknownAssignment(request.episode, ""),
                 placement.ClosedAssignment(refusal), placement.NoLaunchPermission(refusal),
                 refusal, placement.DoNotRetry(refusal))
@@ -4373,7 +4388,7 @@ done
                             self.clock.now()))
                     else:
                         self._close_placement(saved, "cancelled", placement.DoNotRetry(request.reason))
-                elif saved is None:
+                elif saved is None and request.episode not in self.placement_refusals:
                     _ = self.placement_requests.pop(request.episode, None)
                     self._remove_waiter(self.waiters.get(request.episode),
                                         claim_disposition=WaiterClaimDisposition.RETURN)

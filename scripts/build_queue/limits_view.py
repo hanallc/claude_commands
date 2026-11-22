@@ -54,6 +54,7 @@ class Cell:
     runs: list[str] = field(default_factory=list[str])
     exempt: list[str] = field(default_factory=list[str])
     other: list[str] = field(default_factory=list[str])
+    other_note: str = ""
     waits: dict[str, list[str]] = field(default_factory=dict[str, list[str]])
     budgets: tuple[Metric, ...] = ()
     note: str = ""
@@ -571,7 +572,7 @@ def claim_name(record: claim_state.RunRecord, names: QueueNames) -> str:
 
 def build_limits(reading: records.QueueRead, snapshots: target_availability.Snapshots, names: QueueNames,
                  memory: Metric, folders: conf.ConfigRead, saved: Background, zone: tzinfo,
-                 mac_runs: Sequence[tuple[str, str, str]], mac_disk_free: float | None = None) -> BuildLimits:
+                 mac_runs: Sequence[tuple[queue_view.MacBuild, str]], mac_disk_free: float | None = None) -> BuildLimits:
     explanation = reading.explanation
     inputs = explanation.decided_from
     policy = explanation.policy.repository_runs
@@ -588,6 +589,8 @@ def build_limits(reading: records.QueueRead, snapshots: target_availability.Snap
     unplaced: dict[str, list[str]] = {}
     origins = saved.origins
     mac_claims = mac.claims if mac is not None else ()
+    mac_claims_unavailable = mac is None or any(isinstance(state, targets.StateUnreadable)
+                                                for state in mac.states)
     whole_mac = False
     claimed: set[str] = set()
     repositories_with_claims: set[str] = set()
@@ -644,6 +647,7 @@ def build_limits(reading: records.QueueRead, snapshots: target_availability.Snap
         kept = mac_test.run_is_kept(record)
         if not active and not kept:
             continue
+        claimed.add(f'{record["episode"]}/{record["attempt"]}')
         if isinstance(claim.scope, claim_state.WholeMacScope):
             whole_mac = True
             continue
@@ -657,11 +661,12 @@ def build_limits(reading: records.QueueRead, snapshots: target_availability.Snap
             cell.runs.append(claim_name(record, names))
         else:
             cell.note = "Claim held for cleanup"
-        if session := record.get("holder_session", ""):
-            claimed.add(session)
-    for project, session, label in mac_runs:
-        if session not in claimed and (origin := known_origin(project)):
-            row(origin).mac.other.append(label)
+    for build, label in mac_runs:
+        matched = build.gate_label is queue_view.MacGateLabel.PLACEMENT and build.gate_placement in claimed
+        if not matched and (origin := known_origin(build.repository)):
+            cell = row(origin).mac
+            cell.other.append(label)
+            cell.other_note = "Claim status unavailable" if mac_claims_unavailable else "No matching claim"
 
     switch = cloud_gate.launch_switch(conf.read("cloud_gate"))
     aws_state = ("On" if switch is cloud_gate.CloudGateSwitch.ON or hana is not None else
@@ -743,7 +748,7 @@ def build_limits(reading: records.QueueRead, snapshots: target_availability.Snap
             if whole_mac:
                 cell.used = max(1, cell.used or 0)
                 cell.note = "Whole Mac claimed"
-            elif mac is None or any(isinstance(state, targets.StateUnreadable) for state in mac.states):
+            elif mac_claims_unavailable:
                 cell.used = None
         elif cell.waits:
             cell.used = None
