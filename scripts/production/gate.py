@@ -115,6 +115,7 @@ from scripts.build_queue.queue_place import (  # noqa: E402
 
 DEFAULT_MAX_RUNNING_JOBS = max(1, (os.cpu_count() or 2) // 2)
 TEST_HERDR_BIN = "/nonexistent/herdr"
+GATE_MODULE_TEMP_DIR = "GATE_MODULE_TEMP_DIR"
 # The largest measured module was 0.52 GiB; this includes the 1.2 growth margin.
 UNRECORDED_MODULE_RESERVATION_MIB = 640
 # A module still running this long is killed and the run is red: a hung module holds every gate
@@ -1125,6 +1126,7 @@ raise SystemExit(99)
         executable.chmod(0o755)
     cargo = str(root / "target")
     return {**environment, "TMPDIR": str(root), "PYTHONDONTWRITEBYTECODE": "1",
+            GATE_MODULE_TEMP_DIR: str(root),
             "CARGO_TARGET_DIR": cargo, "CARGO_BUILD_BUILD_DIR": cargo,
             "HERDR_BIN": TEST_HERDR_BIN,
             "STAFF_FILE": str(root / "staff.json"),
@@ -1409,6 +1411,16 @@ def module_runner(repo: Path) -> Path:
     return runner
 
 
+def _gate_job_parent() -> Path:
+    """Keep jobs below the module folder that the outer gate removes."""
+    root = build_folders.configured_gate_root()
+    if inherited_module := os.environ.get(GATE_MODULE_TEMP_DIR):
+        module = Path(inherited_module).resolve()
+        if module.is_relative_to(root.resolve()):
+            return module
+    return root
+
+
 def gate_test_parent(tmpfs: Path) -> Path:
     """Return the parent of the merge gate test fixtures."""
     return tmpfs / "merge-gate-tests"
@@ -1460,7 +1472,7 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
             raise GateRefused('selected modules are absent from the tested tree')
         modules = [(suite, path) for suite, path in modules if str(path.relative_to(repo)) in paths]
     runner = module_runner(repo)
-    tmpfs = build_folders.configured_gate_root()
+    tmpfs = _gate_job_parent()
     if not tmpfs.is_dir() or not os.access(tmpfs, os.W_OK):
         raise GateRefused(f"the test runner requires a writable gate folder at {tmpfs}")
     report_retained_gate_test_folders(tmpfs)
