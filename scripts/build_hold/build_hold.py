@@ -25,6 +25,7 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime, time as ClockTime, timezone
+from enum import Enum, auto
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, NotRequired, Protocol, TextIO, TypedDict, cast, get_args
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -436,6 +437,14 @@ class ClaimsUnreadable:
     reason: str
 
 
+class PidNamespaceRelation(Enum):
+    """Describe the process PID namespace relative to the auditor."""
+
+    SAME = auto()
+    DIFFERENT = auto()
+    UNREADABLE = auto()
+
+
 @dataclass(frozen=True)
 class AuditProcess:
     identity: ProcessIdentity
@@ -449,10 +458,16 @@ class AuditProcess:
     tty_nr: int = 0
     executable: str = ""
     desktop_app: bool = False
+    pid_namespace: PidNamespaceRelation = PidNamespaceRelation.UNREADABLE
 
 
 @dataclass(frozen=True)
 class FullBuildAudit:
+    pass
+
+
+@dataclass(frozen=True)
+class DrainBuildAudit:
     pass
 
 
@@ -462,6 +477,7 @@ class HoldBuildCandidates:
 
 
 FULL_BUILD_AUDIT = FullBuildAudit()
+DRAIN_BUILD_AUDIT = DrainBuildAudit()
 SYSTEM_CGROUP_ROOT = Path("/sys/fs/cgroup")
 
 
@@ -479,10 +495,10 @@ class AuditedBuild:
 
 
 def read_audit_processes(
-    proc_root: Path, selection: FullBuildAudit | HoldBuildCandidates = FULL_BUILD_AUDIT,
+    proc_root: Path, selection: FullBuildAudit | DrainBuildAudit | HoldBuildCandidates = FULL_BUILD_AUDIT,
     cgroup_root: Path = SYSTEM_CGROUP_ROOT,
 ) -> dict[int, AuditProcess]:
-    """Read the table once; an enforcer reads details only for candidates and ancestors."""
+    """Read process details for the selected audit. Only the drain reads PID namespaces."""
     processes: dict[int, AuditProcess] = {}
     desktop_pids: set[int] = set()
     if isinstance(selection, HoldBuildCandidates):
@@ -518,13 +534,19 @@ def read_audit_processes(
                                       uid, tty_nr, executable, pid in desktop_pids)
     details: set[int] = set()
     for pid, process in processes.items():
-        if (isinstance(selection, FullBuildAudit) or process.uid == selection.uid and
+        if (not isinstance(selection, HoldBuildCandidates) or process.uid == selection.uid and
                 any(name in AUDIT_COMMANDS | {"pytest", "py.test", "sccache", "bash", "sh", "dash", "zsh",
                                              "verify.sh", "merge_gate.py", "gate.py", "clippy-driver", "rust-analyzer",
                                              "basedpyright", "node", "nodejs"}
                     or name.startswith("python") for name in (process.command, process.executable))):
             details.add(pid)
             details.update(parent.identity.pid for parent in audit_ancestors(process, processes))
+    auditor_namespace = None
+    if isinstance(selection, DrainBuildAudit):
+        try:
+            auditor_namespace = (proc_root / "self/ns/pid").readlink()
+        except OSError:
+            pass
     for pid in details:
         process = processes[pid]
         directory = proc_root / str(pid)
@@ -542,8 +564,16 @@ def read_audit_processes(
             cwd = str((directory / "cwd").readlink())
         except OSError:
             cwd = ""
+        pid_namespace = PidNamespaceRelation.UNREADABLE
+        if auditor_namespace is not None:
+            try:
+                namespace = (directory / "ns/pid").readlink()
+                pid_namespace = (PidNamespaceRelation.SAME if namespace == auditor_namespace
+                                 else PidNamespaceRelation.DIFFERENT)
+            except OSError:
+                pass
         in_build_scope = False
-        if isinstance(selection, FullBuildAudit):
+        if not isinstance(selection, HoldBuildCandidates):
             try:
                 in_build_scope = any("/builds.slice/" in line
                                      and "/builds.slice/builds-detached.slice/" not in line
@@ -555,7 +585,7 @@ def read_audit_processes(
             continue
         processes[pid] = AuditProcess(process.identity, process.parent_pid, process.command, argv, cwd,
                                       environment, in_build_scope, process.uid, process.tty_nr,
-                                      process.executable, process.desktop_app)
+                                      process.executable, process.desktop_app, pid_namespace=pid_namespace)
     return processes
 
 

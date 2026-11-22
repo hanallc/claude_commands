@@ -111,6 +111,67 @@ class HoldEnforcerTests(unittest.TestCase):
         assert isinstance(unassigned, tuple)
         self.assertIsInstance(unassigned[0], hold_enforcer.WaitingRun)
 
+    def test_drain_classifies_verify_by_pid_namespace(self) -> None:
+        own = self.proc / "self/ns/pid"
+        own.parent.mkdir(parents=True)
+        own.symlink_to("pid:[4026531836]")
+        process = self.process(700, "bash", argv=("/bin/bash", "/fixture/scripts/direct/verify.sh", "test"),
+                               session="gate-owner")
+        namespace = process / "ns/pid"
+        namespace.parent.mkdir()
+        cases = (
+            ("pid:[4026532000]", build_hold.PidNamespaceRelation.DIFFERENT, False),
+            ("pid:[4026531836]", build_hold.PidNamespaceRelation.SAME, True),
+            (None, build_hold.PidNamespaceRelation.UNREADABLE, True),
+        )
+        for target, relation, waiting in cases:
+            with self.subTest(relation=relation):
+                namespace.unlink(missing_ok=True)
+                if target is not None:
+                    namespace.symlink_to(target)
+                table = build_hold.read_audit_processes(self.proc, build_hold.DRAIN_BUILD_AUDIT)
+                self.assertIs(table[700].pid_namespace, relation)
+                runs = hold_enforcer.classify_drain_runs(table, frozenset(), build_hold.LiveClaims(frozenset()))
+                if waiting:
+                    self.assertEqual(runs, (hold_enforcer.WaitingRun(table[700], OwningSession("gate-owner")),))
+                else:
+                    self.assertEqual(runs, ())
+
+    def test_drain_with_unreadable_claims_skips_a_gate_in_another_pid_namespace(self) -> None:
+        for pid in (700, 701):
+            _ = self.process(pid, "bash", argv=("bash", "verify.sh", "test"), session="gate-owner")
+        table = self.table()
+        table[700] = replace(table[700], pid_namespace=build_hold.PidNamespaceRelation.DIFFERENT)
+
+        with mock.patch.object(hold_enforcer, "admitted_processes", return_value=frozenset()), \
+             redirect_stderr(io.StringIO()):
+            kept = hold_enforcer.working_gates(table, build_hold.ClaimsUnreadable("private claims are damaged"))
+        self.assertEqual(kept, (table[701].identity,))
+
+    def test_regular_enforcement_protects_a_suite_runner_in_another_pid_namespace(self) -> None:
+        own = self.proc / "self/ns/pid"
+        own.parent.mkdir(parents=True)
+        own.symlink_to("pid:[4026531836]")
+        runner = self.process(700, "python3", argv=("python3", "/fixture/scripts/production/gate.py", "--tests-only"),
+                              session="other")
+        namespace = runner / "ns/pid"
+        namespace.parent.mkdir()
+        namespace.symlink_to("pid:[4026532000]")
+
+        with mock.patch.object(Path, "readlink", autospec=True, side_effect=Path.readlink) as readlink:
+            _ = build_hold.read_audit_processes(self.proc)
+            decisions = self.decisions()
+        self.assertNotIn(mock.call(own), readlink.call_args_list)
+        self.assertNotIn(mock.call(namespace), readlink.call_args_list)
+        decision, = decisions
+        self.assertIsInstance(decision, hold_enforcer.AllowedBuild)
+
+        table = build_hold.read_audit_processes(self.proc, build_hold.DRAIN_BUILD_AUDIT)
+        self.assertIs(table[700].pid_namespace, build_hold.PidNamespaceRelation.DIFFERENT)
+        holders = build_hold.natedev_holds(self.holders).in_force
+        decision, = hold_enforcer.decide_builds(table, holders, self.uid, 999, frozenset())
+        self.assertIsInstance(decision, hold_enforcer.AllowedBuild)
+
     def hana_claim(self) -> tuple[target_config.SshTarget, claim_state.StatePaths]:
         _ = self.process(700, 'bash', argv=('bash', 'verify.sh', 'check'), session='other')
         _ = self.process(701, 'python3', parent=700, argv=('python3', 'offload.py', 'check'))
