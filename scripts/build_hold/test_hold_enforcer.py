@@ -504,7 +504,7 @@ class HoldEnforcerTests(unittest.TestCase):
         def stop(run: hold_enforcer.WaitingRun, holder: build_hold.Holder,
                  processes: Mapping[int, build_hold.AuditProcess], proc_root: Path, *,
                  signal_process: Callable[[int, int], None] = os.kill,
-                 ) -> hold_enforcer.StoppedRun | hold_enforcer.RunIdentityChanged | hold_enforcer.RunStopUnavailable:
+                 ) -> hold_enforcer.StoppedRun | hold_enforcer.RunIdentityChanged:
             _ = signal_process
             return original_stop(run, holder, processes, proc_root,
                 signal_process=lambda pid, signum: signals.append((pid, signum)))
@@ -977,7 +977,7 @@ class HoldEnforcerTests(unittest.TestCase):
         failure = SystemExit if interrupted else process_stop.SliceStopFailed
         detail = "fixture hold exited before commit" if interrupted else "cannot read cgroup.events"
 
-        def stop() -> hold_enforcer.StoppedRun | hold_enforcer.RunIdentityChanged | hold_enforcer.RunStopUnavailable:
+        def stop() -> hold_enforcer.StoppedRun | hold_enforcer.RunIdentityChanged:
             return hold_enforcer.stop_waiting_run(
                 waiting, holder, table, self.proc,
                 signal_process=lambda pid, signum: self.fail(f"unexpected process signal {pid} {signum}"),
@@ -1021,7 +1021,7 @@ class HoldEnforcerTests(unittest.TestCase):
         self.assertEqual(events.read_text(), "populated 1\n")
         self.assertEqual(record.read_bytes(), original)
 
-    def test_waiting_run_stop_reports_unavailable_and_checks_an_alternate_table(self) -> None:
+    def test_waiting_run_stop_checks_identity_without_pidfds(self) -> None:
         pid = 10
         _ = self.process(pid, "bash", argv=("bash", "verify.sh", "check"))
         table = self.table()
@@ -1032,32 +1032,35 @@ class HoldEnforcerTests(unittest.TestCase):
 
         with ExitStack() as stack:
             _ = stack.enter_context(mock.patch.object(sys, "platform", "darwin"))
+            _ = stack.enter_context(mock.patch.object(build_hold, "PROC_ROOT", self.proc))
             for module, name in ((os, "pidfd_open"), (signal, "pidfd_send_signal")):
                 if hasattr(module, name):
                     _ = stack.enter_context(mock.patch.object(module, name))
                     delattr(module, name)
             read = stack.enter_context(mock.patch.object(build_hold, "process_start_time", wraps=read_identity))
-            with self.subTest(table="native"):
-                result = hold_enforcer.stop_waiting_run(
-                    run, holder, table, build_hold.PROC_ROOT, signal_process=send_term)
-                self.assertEqual(result, hold_enforcer.RunStopUnavailable(
-                    run, "the natedev hold requires a Linux process table"))
-                read.assert_not_called()
-                send_term.assert_not_called()
-
-            with self.subTest(table="alternate", identity="reused"):
+            with self.subTest(identity="reused"):
                 _ = self.process(pid, "editor", start=12_000)
                 result = hold_enforcer.stop_waiting_run(run, holder, table, self.proc, signal_process=send_term)
                 self.assertEqual(result, hold_enforcer.RunIdentityChanged(run))
                 read.assert_called_once_with(pid, self.proc)
                 send_term.assert_not_called()
 
-            with self.subTest(table="alternate", identity="current"):
+            with self.subTest(identity="current"):
                 _ = self.process(pid, "bash", argv=("bash", "verify.sh", "check"))
                 result = hold_enforcer.stop_waiting_run(run, holder, table, self.proc, signal_process=send_term)
                 self.assertEqual(result, hold_enforcer.StoppedRun(run))
                 send_term.assert_called_once_with(pid, signal.SIGTERM)
                 self.assertEqual(self.rows()[-1]["stop_status"], "stopped")
+
+    def test_clear_reports_a_missing_process_table(self) -> None:
+        missing = self.root / "missing-proc"
+        with (mock.patch.object(sys, "platform", "darwin"),
+              mock.patch.object(hold_enforcer, "stop_queued_runs") as stop,
+              redirect_stderr(io.StringIO()) as errors):
+            hold_enforcer.clear_queued_runs(missing)
+        self.assertIn("Clear unavailable:", errors.getvalue())
+        self.assertIn(str(missing), errors.getvalue())
+        stop.assert_not_called()
 
     def test_drain_skips_a_reused_pid_before_a_stop(self) -> None:
         _ = self.process(10, "bash", argv=("bash", "verify.sh", "check"), session="gate-owner")
