@@ -513,6 +513,19 @@ class ReviewLinksServerTests(unittest.TestCase):
 
         image = base64.b64decode(PNG)
 
+        def sent_message(delivery: change_page.MessageDelivery, status: change_page.DeliveryStatus) -> str:
+            assert isinstance(delivery.page, change_page.ReviewMessagePage)
+            reply = delivery.page.saved.get("scoped_reply")
+            assert reply is not None
+            prefix, separator, command = delivery.message.rpartition("\n")
+            self.assertEqual(command, change_page.reply_command(reply["key"]))
+            proof = review_submissions.current_reply_proof(reply["key"])
+            token = reply_tokens.derive(proof)
+            self.assertNotIn(token, delivery.message)
+            record = status.path(delivery.page, delivery.row).read_text(encoding="utf-8")
+            self.assertNotIn(token, record)
+            return prefix + separator + change_page.reply_command(reply["key"], token)
+
         def capture_body(request: new_item_dialog.NewItemRequest) -> tuple[str, bytes]:
             capture_key = self.server.page_captures.start()
             self.assertTrue(capture_key)
@@ -602,7 +615,8 @@ class ReviewLinksServerTests(unittest.TestCase):
                         self.assertTrue(delivered_id)
                         delivery, = deliveries
                         send.assert_called_once_with(
-                            f"session:{later_owner.current_session}", change_page.SENDER, delivery.message,
+                            f"session:{later_owner.current_session}", change_page.SENDER,
+                            sent_message(delivery, case.status),
                             key=change_page.review_delivery_key(delivery.page.review_list, delivery.row, delivery.attempt),
                             recipient_key=later_owner.id)
                         attach.assert_called_once()
@@ -726,7 +740,7 @@ class ReviewLinksServerTests(unittest.TestCase):
                     sent_to = later_owner if later_owner is not None else target
                     delivery, = deliveries
                     send.assert_called_once_with(
-                        f"session:{sent_to.current_session}", change_page.SENDER, delivery.message,
+                        f"session:{sent_to.current_session}", change_page.SENDER, sent_message(delivery, case.status),
                         key=change_page.review_delivery_key(delivery.page.review_list, delivery.row, delivery.attempt),
                         recipient_key=sent_to.id)
                     attach.assert_called_once()

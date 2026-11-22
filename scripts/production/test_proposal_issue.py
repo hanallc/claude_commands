@@ -93,13 +93,14 @@ class ProposalIssueTests(unittest.TestCase):
         _ = original.write_text(VAULT_ISSUE)
         self.assertEqual(proposal_issue.number([original], date(2026, 11, 17)), ["number a proposal.md: P1"])
         recipient = next(row.id for row in staff.snapshot().rows if row.name == "hana")
-        details = new_item_dialog.ReviewSubmission("request-1", "a" * 64, new_item_dialog.NoEvidence(), (), "a" * 43)
+        token = "r" + "b" * 42
+        details = new_item_dialog.ReviewSubmission("request-1", "a" * 64, new_item_dialog.NoEvidence(), (), token)
         issue = proposal_issue.file_review_proposal(folder, recipient, "Next proposal", "Words",
                                                     "hana answers this", details)
         self.assertEqual(issue.value("proposal_id"), "P2")
         note = issue.path.read_text(encoding="utf-8")
-        self.assertNotIn(details.reply_token, note)
-        self.assertIn(details.reply_token_sha256, note)
+        self.assertNotIn(token, note)
+        self.assertIn(reply_tokens.digest(token), note)
         self.assertEqual(proposal_issue.number([issue.path], date(2026, 11, 17)), ["number next proposal.md: P2"])
         archive = self.root / proposal_issue.ARCHIVE
         archive.mkdir(parents=True)
