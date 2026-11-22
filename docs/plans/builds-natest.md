@@ -1234,3 +1234,17 @@ Ordered after the red main repair and the guard repair (builds). It does not mov
 - **Files:** `scripts/mac_test/mac_gate.py`; its test module; the as-built doc that describes Mac gate cleanup.
 - **Workers:** 1 writer.
 - **Acceptance gate:** fixtures: an attempt with a receipt and a kept checkout clears its journal and stops a live recorded group; an attempt whose folder is gone clears its journal; the Mac gate test module passes in one tests-only gate (Mac part through the queue); basedpyright zero on changed files; one blind review.
+
+### Phase 427 — a Mac run under a block it does not hold waits for the block end  · status: todo
+**Depends on:** none
+
+#### Work Order
+- **Goal:** `scripts/mac_test/mac_queue_run.py --kind run` honors the mac_test block. builds 23:02: two devtools Mac runs (idlepanes2 at 22:57, verifytoken at 23:00) started under the builds block for item 191 run 2; the file has no block read.
+- **Spec:**
+  1. Before a `--kind run` starts its remote command, read the Mac block with the reader that `mac_test.py` and the gate use (`read_block` / `blocking_claim_block` / `free_now` in `scripts/mac_test/mac_test.py`). Copy no block logic.
+  2. A run under a block that its session does not hold follows the behavior `mac_test.py` claims and the gate already use for the same case: wait for the block end with one wait line, or end with one clear refusal that names the holder and reason. Pick the one those callers use; state the choice in the commit.
+  3. A run by the block holder starts as before. Other kinds (`shot`, `install`, `probe`) keep their current behavior unless the same callers treat them the same way.
+  4. No config key changes.
+- **Files:** `scripts/mac_test/mac_queue_run.py`; its test module; the as-built doc that describes Mac queue runs.
+- **Workers:** 1 writer.
+- **Acceptance gate:** fixtures: a run under another holder's block waits (or refuses) with one line and starts no remote command; a holder's run starts; no block starts as before; the changed test modules pass in one tests-only gate (Mac part through the queue); basedpyright zero on changed files; one blind review.
