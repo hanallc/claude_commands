@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Literal, NamedTuple, TypedDict, cast
 
 from scripts.build_queue import admission_client, admission_wire, placement
+from scripts.build_queue.first_step import gate_targets
 from scripts.copies import copies
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.build_steps import (CLAIM_FAILURE_SUFFIX, GATE_SCRIPTS, MAC_LINUX_NO_ANSWER,
@@ -118,8 +119,16 @@ def test_steps(production: ProductionDocument, paths: tuple[str, ...],
 
 
 def run_test_command(command: list[str], folder: Path, *, raise_start_errors: bool = False) -> subprocess.CompletedProcess[str]:
+    locks = copies.COMMAND_LOCKS.get()
+    submitted = command
+    targets = gate_targets(command)
+    if targets:
+        scripts = Path(__file__).resolve().parents[1]
+        submitted = [str(scripts / "lib/py"), str(scripts / "copies/copies.py"), "gate-step",
+                     "--repo", str(folder.resolve()), "--targets", ",".join(targets),
+                     *(word for fd in locks for word in ("--lease-fd", str(fd))), "--", *command]
     try:
-        return subprocess.run(command, cwd=folder, capture_output=True, text=True, check=False, pass_fds=copies.COMMAND_LOCKS.get())
+        return subprocess.run(submitted, cwd=folder, capture_output=True, text=True, check=False, pass_fds=locks)
     except OSError as error:
         if raise_start_errors:
             raise

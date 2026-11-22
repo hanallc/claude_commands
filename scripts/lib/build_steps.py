@@ -219,9 +219,10 @@ def _verify_step(arguments: Sequence[str]) -> StepJob | OtherCommand:
 
 
 def copies_run_command(argv: Sequence[str]) -> CopiesRunCommand | OtherCommand:
-    """Find the command after the copies.py run options."""
+    """Read the command that the copies.py process supervises."""
     program = parse_command_program(argv)
-    if isinstance(program, OtherCommand) or program[0] != "copies.py" or not program[1] or program[1][0] != "run":
+    if (isinstance(program, OtherCommand) or program[0] != "copies.py"
+            or not program[1] or program[1][0] not in ("run", "gate-step")):
         return OTHER_COMMAND
     arguments = program[1]
     if "--" not in arguments:
@@ -267,7 +268,7 @@ def live_process_arguments(process: Path, start_time: str) -> list[str] | Comman
 
 
 def gate_job_from_process(step: str, process: Path, *, start_time: str = "") -> StepJob | OtherCommand | CommandUnreadable:
-    """Read the gate job from its process or the copies.py caller."""
+    """Read the gate job from the gate process or its copies.py supervisor."""
     expected = GATE_PROGRAMS.get(step, ())
     if not expected:
         return OTHER_COMMAND
