@@ -6,7 +6,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 from contextlib import contextmanager, redirect_stdout, redirect_stderr
-from collections.abc import Callable, Generator
+from collections.abc import Callable, Generator, Mapping
 import io
 import json
 import fcntl
@@ -495,7 +495,7 @@ class MacTestCommandTests(NotificationGuardedTestCase):
 
         def run(command: list[str], *, capture_output: bool = False, text: bool = False,
                 check: bool = False, timeout: float | None = None, cwd: str | Path | None = None,
-                stdin: int | None = None, stdout: int | None = None,
+                env: Mapping[str, str] | None = None, stdin: int | None = None, stdout: int | None = None,
                 stderr: int | None = None) -> subprocess.CompletedProcess[str]:
             script = self.bin_directory / command[0]
             stub_arguments = command[1:]
@@ -516,9 +516,9 @@ class MacTestCommandTests(NotificationGuardedTestCase):
                     _ = runpy.run_path(str(script), run_name="__main__")
                     return 0
 
-                return invoke_cli(module, main, stub_arguments, dict(os.environ), self.root)
+                return invoke_cli(module, main, stub_arguments, os.environ if env is None else env, self.root)
             return real_run(command, capture_output=capture_output, text=text, check=check,
-                            timeout=timeout, cwd=cwd, stdin=stdin, stdout=stdout, stderr=stderr)
+                            timeout=timeout, cwd=cwd, env=env, stdin=stdin, stdout=stdout, stderr=stderr)
 
         with (mock.patch.object(subprocess, "run", side_effect=run),
               mock.patch.object(mac_test, "start_hold_recorder", side_effect=record)):
