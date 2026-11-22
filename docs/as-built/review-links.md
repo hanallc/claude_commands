@@ -874,7 +874,7 @@ Working includes other unparked items in New or Working.
 Blocked includes other unparked items in Blocked or Paused.
 All includes every open item, including parked items and Done items.
 The State cell shows the parking end time or delivery condition under the saved state.
-The Unread only switch shows and counts unread items and rows that stay open after an answer is read.
+The Unread only switch shows and counts unread items.
 Each chip count reflects the words box and the filters in the other rows.
 In All, each Owner and Producer chip counts matching parked items.
 The “need you” total uses the Needs me chip count.
@@ -1097,7 +1097,7 @@ Column sort buttons keep focus through refresh.
 A waiting row shows “The producer will answer.”
 The panel shows each open question with its asked time and the linked review cards.
 An actively parked waiting row shows the parking condition and Unpark.
-A waiting row with an unread delivery release shows Mark read.
+A waiting row with an unread answer or delivery release shows Mark read.
 The waiting row keeps its log after Ask saves.
 A link opens a filtered-out question or read item in a separate section and preserves the current filters.
 The section does not change the results count.
@@ -1127,20 +1127,14 @@ A signed Unpark request from an earlier page can clear parking while the item wa
 That request moves the item to Morty answering and shows its confirmation next to Show.
 An unread answer appears in the panel with the question, both times, and an Unread mark.
 Mark read clears the signed update shown by the form.
-Opening an individual row with an unread answer uses the same signed read operation.
-The List sends this request after the text of each unread answer enters the viewport while the row is open.
-This rule also applies to direct links and to answers that appear in linked details after refresh.
-The tab and console frame must also be visible.
+Opening a row leaves its unread state and status chip unchanged.
+This rule also applies to direct links, refreshes, and reloads.
 A newer update stays unread if it arrives before the read saves.
-With Unread only on, the row can stay visible after this read.
-The row counts toward its matching Owner and Producer chips and the selected Show chip.
-Closing the row or changing Show ends this exception.
-Changing the Unread only switch ends this exception.
 After the item is read, the log shows “Question Q<n> — nate” and “Answer — <producer>” at their recorded times.
 Each of these rows has a left bar in the Review question color and a bold Question or Answer label.
 The List and Review use the same question color rule.
-The answer puts the item in Needs me until the user reads it.
-The item keeps its parking time.
+An unread answer puts an unparked item in Needs me.
+Park until moves the item to Parked and preserves its unread state.
 The panel clears the question when the log shows it.
 The List uses its local date and time format for questions and answers.
 A newer unread update leaves previously read answers in the log.

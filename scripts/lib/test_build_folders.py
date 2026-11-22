@@ -4,7 +4,9 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 from collections.abc import Callable, Generator
 import os
+import errno
 import fcntl
+import io
 import json
 import select
 import signal
@@ -15,13 +17,14 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from typing import Never, cast, override
 from unittest import mock
-from contextlib import contextmanager, nullcontext
+from contextlib import AbstractContextManager, contextmanager, nullcontext, redirect_stdout
 
-from scripts.lib import build_folder_lock, build_folders as folders, conf, copy_record, scratch, unit_runs, process_group
-from scripts.lint.memory_test_support import config_environment, write_config_fixture
+from scripts.lib import build_folder_lock, build_folders as folders, conf, copy_record, git_files, scratch, unit_runs, process_group
+from scripts.lint.memory_test_support import ADMISSION_CONFIG_FIXTURE, config_environment, write_config_fixture
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.git_test_support import commit_repository, fixture_git_environment
 
@@ -29,6 +32,502 @@ from scripts.lib.git_test_support import commit_repository, fixture_git_environm
 def _release_folder(path: Path) -> None:
     release = cast(Callable[[Path], None], getattr(folders, "_release_build_folder"))
     release(path)
+
+
+class FolderFormTests(unittest.TestCase):
+    root: Path = Path()
+    config: Path = Path()
+
+    @override
+    def setUp(self) -> None:
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        self.config = self.root / "build_folders.conf"
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
+            "CONF_DIR": str(self.root),
+            "HOME": str(self.root),
+            copy_record.ROOT_ENV: str(self.root / "scratch"),
+            copy_record.COPIES_ENV: str(self.root / "legacy-workspaces"),
+            scratch.HOLDS_ENV: str(self.root / "holds.json"),
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_CONFIG_NOSYSTEM": "1",
+        })))
+        _ = cast(object, self.enterContext(mock.patch("socket.gethostname", return_value="natedev")))
+        self.write_config()
+        _ = (self.root / "copies.conf").write_text("# range: 5e-324..\ngit_timeout_seconds=10\n")
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
+            "COPIES_CONFIG": str(self.root / "copies.conf"),
+        })))
+
+    def write_config(self, *, alias: str = "claude", machine_root: str = "disk") -> None:
+        _ = self.config.write_text(
+            "roots.workspace=~/worktrees\nroots.build=~/build\n"
+            + f"roots.build.natedev=~/{machine_root}\nrepo_word.claude_commands={alias}\n"
+            + "# whole: 1..\nfolders.unused_days=2\n# range: 0..60\nlocks.probe_wait_seconds=0.25\n"
+            + "# range: 0.001..1\nlocks.probe_retry_seconds=0.005\n",
+            encoding="utf-8",
+        )
+
+    def set_origin(self, url: str) -> None:
+        _ = subprocess.run(
+            ["git", "-C", str(self.root), "config", "remote.origin.url", url],
+            check=True, capture_output=True, timeout=10,
+        )
+
+    def init_repository(self) -> None:
+        _ = subprocess.run(
+            ["git", "init", "-q", str(self.root)], check=True, capture_output=True, timeout=10,
+        )
+
+    def test_repo_word_reads_the_origin_and_current_alias(self) -> None:
+        self.init_repository()
+        for url, word in (
+            ("https://example.invalid/example/hana.git", "hana"),
+            ("ssh://git@example.invalid:2222/example/bevy_brp.git/", "bevy_brp"),
+            ("git@example.invalid:project.git", "project"),
+            ("git@[::1]:example/cargo-liner.git", "cargo-liner"),
+            ("file:///source/local.git", "local"),
+            ("/source/repo.with.dots.git", "repo.with.dots"),
+        ):
+            with self.subTest(url=url):
+                self.set_origin(url)
+                self.assertEqual(folders.repo_word(self.root), word)
+        self.set_origin("git@example.invalid:tools/claude_commands.git")
+        self.assertEqual(folders.repo_word(self.root), "claude")
+        self.write_config(alias="tools")
+        self.assertEqual(folders.repo_word(self.root), "tools")
+
+    def test_repo_word_refuses_missing_or_invalid_names(self) -> None:
+        self.init_repository()
+        with self.assertRaises(folders.InvalidFolderForm):
+            _ = folders.repo_word(self.root)
+        self.set_origin("https://example.invalid/")
+        with self.assertRaises(folders.InvalidFolderForm):
+            _ = folders.repo_word(self.root)
+        self.set_origin("https://example.invalid/claude_commands.git")
+        self.write_config(alias="../tools")
+        with self.assertRaises(folders.InvalidFolderForm):
+            _ = folders.repo_word(self.root)
+
+    def test_repo_word_uses_the_configured_git_timeout(self) -> None:
+        with mock.patch.object(subprocess, "run", return_value=subprocess.CompletedProcess(
+                [], 0, stdout="git@example.invalid:team/widget.git\n")) as git:
+            self.assertEqual(folders.repo_word(self.root), "widget")
+        self.assertEqual(git.call_args.kwargs["timeout"], 10)
+
+    def test_held_copy_reports_kernel_identity_and_missing_or_partial_lease(self) -> None:
+        from scripts.lib import build_slots, process_start
+
+        self.init_repository()
+        self.set_origin("git@example.invalid:team/claude_commands.git")
+        _ = subprocess.run(["git", "-C", str(self.root), "-c", "user.name=Test",
+                            "-c", "user.email=test@example.invalid", "commit", "--allow-empty", "-qm", "first"],
+                           check=True, capture_output=True, timeout=10)
+        with build_slots.take_copy(self.root, "HEAD", showrunner="tools", unit="proof",
+                                   work="test", purpose="test all") as copied:
+            self.assertEqual(copied.path, folders.copy_path("claude", "proof", 1))
+            lease, = folders.held_folder_leases()
+            self.assertIsInstance(lease, folders.KnownFolderLease)
+            assert isinstance(lease, folders.KnownFolderLease)
+            self.assertEqual(lease.pid, os.getpid())
+            started = process_start.process_start(lease.pid)
+            self.assertIsInstance(started, process_start.Started)
+            assert isinstance(started, process_start.Started)
+            self.assertEqual(lease.process_start, started.start)
+            self.assertEqual(lease.repository, "claude")
+            self.assertEqual(lease.unit, "proof")
+            self.assertLessEqual(lease.start_time, lease.last_use)
+            sidecar = folders.lease_path(copied.path)
+            saved = sidecar.read_text()
+            try:
+                sidecar.unlink()
+                self.assertEqual([type(row) for row in folders.held_folder_leases()], [folders.UnknownFolderLease])
+                _ = sidecar.write_text('{"pid": 1}\n')
+                self.assertEqual([type(row) for row in folders.held_folder_leases()], [folders.UnknownFolderLease])
+            finally:
+                _ = sidecar.write_text(saved)
+        self.assertEqual(list(folders.held_folder_leases()), [])
+
+    def test_free_copy_with_a_damaged_lease_is_unknown(self) -> None:
+        from scripts.lib import build_slots
+
+        self.init_repository()
+        self.set_origin("git@example.invalid:team/widget.git")
+        _ = (self.root / "source.txt").write_text("source")
+        revision = commit_repository(self.root, "source", "source.txt")
+        with build_slots.take_copy(self.root, revision, showrunner="tools", unit="proof",
+                                   work="test", purpose="test hold") as copy:
+            lease = folders.lease_path(copy.path)
+        self.assertEqual(list(folders.held_folder_leases()), [])
+        lease.unlink()
+        for fields in ("", "{invalid", '{"pid": 1}'):
+            with self.subTest(fields=fields):
+                if fields:
+                    _ = lease.write_text(fields)
+                with mock.patch.object(folders, "_settings", wraps=cast(Callable[[], conf.ConfigRead], getattr(folders, "_settings"))) as settings:
+                    state, = folders.held_folder_leases()
+                self.assertIsInstance(state, folders.UnknownFolderLease)
+                self.assertEqual(state.path, copy.path)
+                settings.assert_called_once()
+
+    def test_reuse_retains_a_copy_with_a_changed_git_back_pointer(self) -> None:
+        from scripts.lib import build_slots
+
+        self.init_repository()
+        self.set_origin("git@example.invalid:team/widget.git")
+        _ = (self.root / "source.txt").write_text("source")
+        revision = commit_repository(self.root, "source", "source.txt")
+
+        def take() -> AbstractContextManager[build_slots.LeasedCopy]:
+            return build_slots.take_copy(self.root, revision, showrunner="tools", unit="proof",
+                                         work="test", purpose="test reuse")
+
+        with take() as first:
+            git = git_files.at(first.path).git_dir
+        pointer = git / "gitdir"
+        _ = pointer.write_text(str(self.root / ".git") + "\n")
+        index_lock = git / "index.lock"
+        index_lock.touch()
+        with take() as second:
+            self.assertEqual(second.number, 2)
+        self.assertTrue(first.path.exists())
+        self.assertTrue(index_lock.exists())
+
+    def test_interrupted_preparation_keeps_the_copy_eligible_for_expiry(self) -> None:
+        from scripts.lib import build_slots
+
+        self.init_repository()
+        self.set_origin("git@example.invalid:team/widget.git")
+        _ = write_config_fixture(self.root / "scratch.conf", "repo_depth=3\n")
+        _ = (self.root / "source.txt").write_text("source")
+        revision = commit_repository(self.root, "source", "source.txt")
+
+        def take(unit: str) -> AbstractContextManager[build_slots.LeasedCopy]:
+            return build_slots.take_copy(self.root, revision, showrunner="tools", unit=unit,
+                                         work="test", purpose="test preparation")
+
+        for existing in (False, True):
+            with self.subTest(existing=existing):
+                unit = "existing" if existing else "new"
+                path = folders.copy_path("widget", unit, 1)
+                if existing:
+                    with take(unit) as first:
+                        self.assertEqual(first.path, path)
+                    module, name = build_slots, "_exclude_slot_target"
+                else:
+                    module, name = folders, "_copy_identity_fields"
+                before = folders.numbered_copy_record(path)
+                failure = mock.patch.object(module, name, side_effect=OSError("interrupted"))
+                with failure, self.assertRaisesRegex(OSError, "interrupted"), take(unit):
+                    self.fail("the interrupted copy was ready")
+                fields = folders.folder_lease_fields(path)
+                self.assertIs(fields["ready"], False)
+                source = folders.numbered_copy_record(path)
+                self.assertIsInstance(source, folders.NumberedCopySource)
+                if existing:
+                    self.assertEqual(before, source)
+                else:
+                    self.assertNotIn("git_directory", fields)
+                    self.assertFalse((path / folders.COPY_USE_STAMP).exists())
+                with folders.numbered_copy_use_lease(path) as unreadied:
+                    self.assertIsInstance(unreadied, folders.NumberedCopyUseRefused)
+                self.assertTrue(folders.expired_folder(path, cutoff=time.time() + 1))
+                self.assertTrue(path.exists())
+
+    def test_sweep_retains_a_nested_mount_or_unreadable_table(self) -> None:
+        from scripts.lint import sweep
+
+        path = folders.main_output_path("widget")
+        nested = path / "mount with spaces"
+        nested.mkdir(parents=True)
+        stamp = path / folders.COPY_USE_STAMP
+        stamp.touch()
+        os.utime(stamp, (0, 0))
+        _ = (self.root / "lint.conf").write_text("sweep_max_tree_depth=2\n")
+        lint = conf.read("lint")
+        for platform, reader in (("linux", "_linux_mount_points"), ("darwin", "_mac_mount_points")):
+            for points in ((Path("/"), nested), (), OSError("mount table unavailable")):
+                with (self.subTest(platform=platform, points=points),
+                      mock.patch("scripts.lib.build_folders.sys.platform", platform),
+                      mock.patch.object(folders, reader) as read):
+                    if isinstance(points, OSError):
+                        read.side_effect = points
+                    else:
+                        read.return_value = points
+                    self.assertEqual(sweep.sweep_unused_folders(False, now=time.time(), lint_settings=lint), 0)
+                    self.assertTrue(nested.is_dir())
+
+    def test_copy_with_an_unreadable_lock_is_unknown(self) -> None:
+        path = folders.copy_path("claude", "proof", 1)
+        path.mkdir(parents=True)
+        path.with_suffix(".lock").symlink_to(self.root / "absent")
+        lease, = folders.held_folder_leases()
+        self.assertIsInstance(lease, folders.UnknownFolderLease)
+        self.assertEqual(lease.path, path)
+
+    def test_copy_reuses_an_existing_number_before_a_gap_and_keeps_output(self) -> None:
+        from scripts.lib import build_slots
+
+        self.init_repository()
+        self.set_origin("git@example.invalid:team/widget.git")
+
+        def commit(text: str) -> str:
+            _ = (self.root / "version.txt").write_text(text)
+            command = ["git", "-C", str(self.root)]
+            _ = subprocess.run([*command, "add", "version.txt"], check=True, capture_output=True, timeout=10)
+            _ = subprocess.run([*command, "-c", "user.name=Test", "-c", "user.email=test@example.invalid",
+                                "commit", "-qm", text], check=True, capture_output=True, timeout=10)
+            return subprocess.run([*command, "rev-parse", "HEAD"], check=True, capture_output=True,
+                                  text=True, timeout=10).stdout.strip()
+
+        first = commit("one")
+        second = commit("two")
+
+        def take(revision: str) -> AbstractContextManager[build_slots.LeasedCopy]:
+            return build_slots.take_copy(self.root, revision, showrunner="tools", unit="proof",
+                                         work="test", purpose="test all")
+
+        with take(first) as one, take(first) as two:
+            self.assertEqual((one.number, two.number), (1, 2))
+            _ = (two.cargo_dir / "artifact").write_text("keep")
+        self.assertTrue(folders.expired_folder(one.path, cutoff=time.time() + 10))
+        self.assertTrue(one.path.is_dir())
+        _ = subprocess.run(["git", "worktree", "remove", "--force", str(one.path)],
+                           cwd=self.root, check=True, capture_output=True)
+        folders.lease_path(one.path).unlink()
+        one.path.with_suffix(".lock").unlink()
+        with take(second) as reused:
+            self.assertEqual(reused.path, two.path)
+            self.assertEqual((reused.path / "version.txt").read_text(), "two")
+            self.assertEqual((reused.cargo_dir / "artifact").read_text(), "keep")
+            with take(second) as gap:
+                self.assertEqual(gap.number, 1)
+                self.assertEqual(gap.env["CARGO_TARGET_DIR"], str(gap.cargo_dir))
+                self.assertEqual(gap.env["CARGO_BUILD_BUILD_DIR"], str(gap.cargo_dir))
+
+    def test_natedev_uses_the_legacy_scratch_override(self) -> None:
+        with self.config.open("a", encoding="utf-8") as config:
+            _ = config.write("roots.scratch=~/scratch\nroots.scratch.natedev=~/legacy-scratch\n")
+        with mock.patch.dict(os.environ):
+            _ = os.environ.pop(copy_record.ROOT_ENV)
+            self.assertEqual(copy_record.root(), self.root / "legacy-scratch")
+
+    def test_report_is_the_default_folder_check(self) -> None:
+        config = self.root / "defaults/build_folders.conf"
+        config.parent.mkdir()
+        _ = write_config_fixture(config)
+        self.assertEqual(conf.read(config).text("folders.check"), "report")
+
+    def test_mark_folder_use_stamps_main_and_worktree_output(self) -> None:
+        for path in (folders.main_output_path("widget"), folders.output_path("widget", "unit", "tests")):
+            path.mkdir(parents=True)
+            clock = path / folders.COPY_USE_STAMP
+            now = time.time() - 1
+            with folders.folder_removal_lease(path, create=True):
+                folders.mark_folder_use(path)
+            self.assertGreater(clock.stat().st_mtime, now)
+
+    def test_numbered_copy_record_and_envrc_require_the_original_checkout(self) -> None:
+        from scripts.lib import build_slots
+
+        self.init_repository()
+        self.set_origin("git@example.invalid:team/widget.git")
+        _ = (self.root / ".envrc").write_text("export FIXTURE=one\n")
+        revision = commit_repository(self.root, "source", ".envrc")
+        with build_slots.take_copy(self.root, revision, showrunner="tools", unit="proof",
+                                    work="test", purpose="test envrc") as copy:
+            record = folders.numbered_copy_record(copy.path)
+            assert isinstance(record, folders.NumberedCopySource)
+            self.assertEqual((record.source, record.commit), (self.root, revision))
+            with folders.numbered_copy_use_lease(copy.path) as reader:
+                assert isinstance(reader, folders.NumberedCopyUseLease)
+                self.assertEqual(reader.source, record)
+                self.assertTrue(reader.pass_fds)
+            self.assertFalse(build_slots.remove_copy(record))
+            envrc = copy.path / ".envrc"
+            self.assertEqual(build_slots.numbered_copy_envrc(envrc, trusted_source=lambda source: source == self.root),
+                             build_slots.NumberedCopyEnvrc.TRUSTED)
+            self.assertEqual(build_slots.numbered_copy_envrc(envrc, trusted_source=lambda _: False),
+                             build_slots.NumberedCopyEnvrc.NEEDS_APPROVAL)
+            _ = envrc.write_text("export FIXTURE=changed\n")
+            self.assertEqual(build_slots.numbered_copy_envrc(envrc, trusted_source=lambda _: True),
+                             build_slots.NumberedCopyEnvrc.NEEDS_APPROVAL)
+            envrc.unlink()
+            envrc.symlink_to(self.root / ".envrc")
+            self.assertEqual(build_slots.numbered_copy_envrc(envrc, trusted_source=lambda _: True),
+                             build_slots.NumberedCopyEnvrc.NEEDS_APPROVAL)
+        _ = copy.path.rename(copy.path.with_name("old"))
+        copy.path.mkdir()
+        self.assertIsInstance(folders.numbered_copy_record(copy.path), folders.UnreadableNumberedCopySource)
+        self.assertFalse(build_slots.remove_copy(record))
+
+    def test_copy_removal_keeps_borrowers_and_resumes_after_git_deletes_the_checkout(self) -> None:
+        from scripts.lib import build_slots
+        from scripts.lint import sweep
+
+        self.init_repository()
+        self.set_origin("git@example.invalid:team/widget.git")
+        _ = (self.root / "source.txt").write_text("checkout\n")
+        revision = commit_repository(self.root, "source", "source.txt")
+        with build_slots.take_copy(self.root, revision, showrunner="tools", unit="proof",
+                                    work="test", purpose="test removal") as copy:
+            _ = (copy.cargo_dir / "warm").write_text("warm")
+        record = folders.numbered_copy_record(copy.path)
+        assert isinstance(record, folders.NumberedCopySource)
+        borrower = copy_record.copies_root() / "widget-legacy/borrower"
+        borrower.mkdir(parents=True)
+        _ = (borrower / copy_record.RECORD).write_text(json.dumps({
+            "task": "gate:borrower", "borrows_from": str(copy.path / ".git"),
+        }))
+        self.assertFalse(build_slots.remove_copy(record))
+        self.assertTrue((copy.cargo_dir / "warm").exists())
+        shutil.rmtree(borrower)
+
+        with folders.folder_removal_lease(copy.path):
+            folders.mark_numbered_copy_removal(record)
+            shutil.rmtree(copy.path)
+        self.assertTrue(record.git_directory.is_dir())
+        pending, = folders.numbered_copy_records()
+        self.assertIsInstance(pending, folders.NumberedCopyRemovalPending)
+        with build_slots.take_copy(self.root, revision, showrunner="tools", unit="proof",
+                                    work="test", purpose="test removal") as other:
+            self.assertEqual(other.number, 2)
+        _ = (self.root / "lint.conf").write_text("sweep_max_tree_depth=2\n")
+        lint = conf.read("lint")
+        self.assertEqual(sweep.sweep_unused_folders(True, now=time.time(), lint_settings=lint), 0)
+        self.assertTrue(record.git_directory.is_dir())
+        self.assertEqual(sweep.sweep_unused_folders(False, now=time.time(), lint_settings=lint), 0)
+        self.assertTrue(record.git_directory.exists())
+        self.assertTrue(folders.lease_path(copy.path).exists())
+        self.assertTrue(other.path.is_dir())
+
+    def test_unused_pass_keeps_live_copies_ci_and_other_top_entries(self) -> None:
+        from scripts.lint import sweep
+
+        lint = self.root / "lint.conf"
+        _ = lint.write_text("sweep_max_tree_depth=2\n")
+        now = 300000.0
+        main = folders.main_output_path("widget")
+        old = folders.output_path("widget", "gone", "old")
+        recent = folders.output_path("widget", "active", "recent")
+        busy = folders.copy_path("widget", "active", 1)
+        ci = folders.ci_path("widget", 1)
+        unexpected = folders.build_root() / "unexpected"
+        odd = folders.build_root() / "odd"
+        outside = self.root / "outside"
+        outside.mkdir()
+        for path in (main, old, recent, busy, ci, unexpected):
+            path.mkdir(parents=True)
+            stamp = path / folders.COPY_USE_STAMP
+            stamp.touch()
+            os.utime(stamp, (0, 0) if path != recent else (now, now))
+        odd.symlink_to(outside, target_is_directory=True)
+        with busy.with_suffix(".lock").open("w") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            settings = conf.read(lint)
+            with redirect_stdout(io.StringIO()) as output:
+                self.assertEqual(sweep.sweep_unused_folders(False, now=now, lint_settings=settings), 0)
+            self.assertIn(f"kept for a manual removal list: {main}", output.getvalue())
+            self.assertIn(f"kept for a manual removal list: {old}", output.getvalue())
+            for path in (recent, busy, ci, unexpected, odd):
+                self.assertNotIn(f"kept for a manual removal list: {path}", output.getvalue())
+        self.assertTrue(main.is_dir())
+        self.assertTrue(old.is_dir())
+        for kept in (recent, busy, ci, unexpected, outside):
+            self.assertTrue(kept.is_dir())
+
+    def test_paths_use_the_current_roots(self) -> None:
+        self.assertEqual(folders.worktree_path("hana", "demo", "try-2"),
+                         self.root / "worktrees/hana/demo/try-2")
+        self.assertEqual(folders.unit_folder("hana", "demo"), self.root / "disk/hana/demo")
+        self.assertEqual(folders.output_path("hana", "demo", "try-2"), self.root / "disk/hana/demo/try-2")
+        self.assertEqual(folders.copy_path("hana", "demo", 1), self.root / "disk/hana/demo/1")
+        self.assertEqual(folders.main_output_path("hana"), self.root / "disk/hana/main")
+        self.assertEqual(folders.ci_path("hana", 2), self.root / "disk/hana/ci/2")
+        self.write_config(machine_root="new-disk")
+        self.assertEqual(folders.unit_folder("hana", "demo"), self.root / "new-disk/hana/demo")
+        self.assertIsInstance(folders.parse_form(self.root / "disk/hana/demo/try-2"), folders.OutsideFolderLayout)
+
+    def test_mac_uses_the_common_build_root(self) -> None:
+        with mock.patch("socket.gethostname", return_value="Nates-MacBook-Pro-2023.local"):
+            path = folders.output_path("hana", "demo", "mac")
+            self.assertEqual(path, self.root / "build/hana/demo/mac")
+            self.assertEqual(folders.parse_form(path), folders.WorktreeOutput("hana", "demo", "mac"))
+
+    def test_paths_refuse_invalid_components_and_numbers(self) -> None:
+        for name in ("", ".", "..", "parent/child", "/absolute", "bad\x00name", "probe.lock", "probe.lease.json"):
+            with self.subTest(name=name):
+                with self.assertRaises(folders.InvalidFolderForm):
+                    _ = folders.main_output_path(name)
+                with self.assertRaises(folders.InvalidFolderForm):
+                    _ = folders.unit_folder("hana", name)
+                with self.assertRaises(folders.InvalidFolderForm):
+                    _ = folders.output_path("hana", "demo", name)
+        for unit in ("main", "ci"):
+            with self.subTest(unit=unit), self.assertRaises(folders.InvalidFolderForm):
+                _ = folders.worktree_path("hana", unit, "demo")
+        for name in ("3", "03", "0"):
+            with self.subTest(name=name), self.assertRaises(folders.InvalidFolderForm):
+                _ = folders.output_path("hana", "demo", name)
+        for number in (0, -1, True):
+            with self.subTest(number=number):
+                with self.assertRaises(folders.InvalidFolderForm):
+                    _ = folders.copy_path("hana", "demo", number)
+                with self.assertRaises(folders.InvalidFolderForm):
+                    _ = folders.ci_path("hana", number)
+
+    def test_removal_keeps_the_build_root_and_a_repository_owned_by_another_user(self) -> None:
+        root = folders.build_root()
+        repository = root / "hana"
+        repository.mkdir(parents=True)
+        self.assertFalse(folders.may_remove_build_path(root))
+        self.assertTrue(folders.may_remove_build_path(repository))
+        with mock.patch.object(os, "geteuid", return_value=repository.stat().st_uid + 1):
+            self.assertFalse(folders.may_remove_build_path(repository))
+            self.assertFalse(folders.remove_build_folder(repository, repository.rmdir))
+        self.assertTrue(repository.is_dir())
+
+    def test_parse_form_recognizes_only_complete_forms(self) -> None:
+        forms: dict[Path, folders.FolderForm] = {
+            folders.output_path("hana", "demo", "try-2"): folders.WorktreeOutput("hana", "demo", "try-2"),
+            folders.copy_path("hana", "demo", 2): folders.BuildCopy("hana", "demo", 2),
+            folders.main_output_path("hana"): folders.MainOutput("hana"),
+            folders.ci_path("hana", 3): folders.CiOutput("hana", 3),
+        }
+        for path, form in forms.items():
+            with self.subTest(path=path):
+                self.assertEqual(folders.parse_form(path), form)
+                self.assertIsInstance(folders.parse_form(path / "target"), folders.InvalidFolderComponents)
+        for relative in ("", "hana", "hana/demo", "hana/ci", "hana/ci/name", "hana/ci/0",
+                         "hana/demo/01", "hana-demo/2", "hana/demo/probe.lock", "hana/demo/probe.lease.json",
+                         "hana/demo/probe.lease.json.0123456789abcdef.tmp"):
+            with self.subTest(relative=relative):
+                self.assertIsInstance(folders.parse_form(self.root / "disk" / relative), folders.InvalidFolderComponents)
+        self.assertIsInstance(folders.parse_form(self.root / "outside/hana/demo/2"), folders.OutsideFolderLayout)
+
+    def test_parse_form_resolves_the_root_and_the_path(self) -> None:
+        physical = self.root / "physical"
+        target = physical / "hana/demo/work"
+        target.mkdir(parents=True)
+        (self.root / "disk").symlink_to(physical, target_is_directory=True)
+        source_link = self.root / "target"
+        source_link.symlink_to(target, target_is_directory=True)
+        self.assertEqual(folders.parse_form(source_link), folders.WorktreeOutput("hana", "demo", "work"))
+
+        escape = physical / "hana/demo/escape"
+        escape.symlink_to(self.root / "outside/hana/demo/work", target_is_directory=True)
+        self.assertIsInstance(folders.parse_form(escape), folders.OutsideFolderLayout)
+        loop = physical / "hana/demo/loop"
+        loop.symlink_to(loop, target_is_directory=True)
+        result = folders.parse_form(loop)
+        assert isinstance(result, folders.UnverifiedFolderPath), result
+        self.assertEqual(result.error.errno, errno.ELOOP)
+        for name in ("work.lock", "work.lease.json", "work.lease.json.0123456789abcdef.tmp"):
+            with self.subTest(name=name):
+                sidecar = physical / "hana/demo" / name
+                sidecar.symlink_to(target, target_is_directory=True)
+                self.assertIsInstance(folders.parse_form(sidecar), folders.InvalidFolderComponents)
+                with self.assertRaises(folders.InvalidFolderForm):
+                    _ = folders.output_path("hana", "demo", name)
 
 
 class BuildFolderTests(unittest.TestCase):
@@ -53,7 +552,7 @@ class BuildFolderTests(unittest.TestCase):
         }, clear=True)))
         _ = write_config_fixture(config / "build_folders.conf",
             "patterns.temporary={repository}/{owner}-{purpose}-{suffix}\npatterns.gate={purpose}-{suffix}\n"
-            + "patterns.standing={repository}/{owner}-gate{suffix}\npatterns.editable={repository}-{owner}/{purpose}\n"
+            + "patterns.standing={repository}/{owner}-gate{suffix}\n"
             + "patterns.mirror={repository}/{owner}-s{slot}\npatterns.target={purpose}\npatterns.shell-cache={repository}\n"
             + "patterns.scratch={purpose}-{suffix}\npatterns.legacy-unique={purpose}{suffix}\n"
             + "patterns.legacy-stable={purpose}\nnames.repository_key_length=8\n"
@@ -190,9 +689,9 @@ os.execv(os.environ['EDITABLE_REAL_GIT'], [os.environ['EDITABLE_REAL_GIT'], *arg
                         _ = folders.create_build_folder(request)
                 if scenario == "during":
                     self.assertEqual(injected, [branch])
-                self.assertFalse(path.exists())
-                self.assertFalse(path.with_name(path.name + ".lock").exists())
-                self.assertFalse(path.with_name(path.name + ".lease.json").exists())
+                self.assertTrue(path.is_dir())
+                self.assertEqual(list(path.iterdir()), [])
+                self.assertEqual(folders.build_folder_state(path), "free")
                 self.assertEqual(subprocess.check_output(["git", "-C", str(source), "rev-parse", "--verify",
                                                          f"refs/heads/{branch}"], text=True).strip(), tip)
 
@@ -214,7 +713,7 @@ os.execv(os.environ['EDITABLE_REAL_GIT'], [os.environ['EDITABLE_REAL_GIT'], *arg
                 self.assertEqual((source / "untracked.txt").read_text(), "keep untracked work\n")
                 self.assertEqual(folders.build_folder_state(source), "free")
 
-    def test_failed_editable_git_releases_the_path_for_a_retry(self) -> None:
+    def test_failed_editable_clone_can_retry_and_the_linked_checkout_is_retained(self) -> None:
         source, tip, bare = self.editable_source()
         for remote in (False, True):
             with self.subTest(remote=remote):
@@ -225,8 +724,11 @@ os.execv(os.environ['EDITABLE_REAL_GIT'], [os.environ['EDITABLE_REAL_GIT'], *arg
                 with self.assertRaisesRegex(OSError, str(path)) as caught:
                     _ = folders.create_build_folder(failed)
                 self.assertIn("missing-ref", str(caught.exception))
-                self.assertFalse(path.exists())
+                self.assertEqual(path.exists(), not remote)
                 self.assertEqual(folders.build_folder_state(path), "free")
+                if not remote:
+                    self.assertEqual(list(path.iterdir()), [])
+                    path = self.root / "linked-retry"
                 retry: folders.EditableRepositoryRequest = (
                     folders.RemoteEditableRepository(path, bare.as_uri(), "main", 1) if remote else
                     folders.LinkedEditableRepository(path, source, folders.NewWorktreeBranch("retry", tip)))
@@ -251,7 +753,7 @@ os.execv(os.environ['EDITABLE_REAL_GIT'], [os.environ['EDITABLE_REAL_GIT'], *arg
         self.assertFalse(recovery.with_name(recovery.name + ".lock").exists())
         self.assertFalse(recovery.with_name(recovery.name + ".lease.json").exists())
 
-    def test_failed_worktree_creation_removes_only_its_unchanged_new_branch(self) -> None:
+    def test_failed_worktree_creation_retains_the_path_and_branch(self) -> None:
         source, tip, _ = self.editable_source()
         _ = (source / "source.txt").write_text("later source\n")
         later = commit_repository(source, "later")
@@ -270,21 +772,13 @@ os.execv(os.environ['EDITABLE_REAL_GIT'], [os.environ['EDITABLE_REAL_GIT'], *arg
                 request = folders.LinkedEditableRepository(path, source, selection)
                 with self.assertRaisesRegex(OSError, str(path)):
                     _ = folders.create_build_folder(request)
-                self.assertFalse(path.exists())
-                self.assertFalse(path.with_name(path.name + ".lock").exists())
-                self.assertFalse(path.with_name(path.name + ".lease.json").exists())
+                self.assertTrue(path.is_dir())
+                self.assertEqual(folders.build_folder_state(path), "free")
                 trees = subprocess.check_output(["git", "-C", str(source), "worktree", "list", "--porcelain"], text=True)
-                self.assertNotIn(str(path), trees)
-                actual = subprocess.run(["git", "-C", str(source), "show-ref", "--verify", f"refs/heads/{branch}"],
-                                        capture_output=True, text=True)
-                if scenario == "new":
-                    self.assertNotEqual(actual.returncode, 0)
-                    hook.unlink()
-                    self.assertEqual(folders.create_build_folder(request), path)
-                    self.assertEqual(subprocess.check_output(["git", "-C", str(path), "rev-parse", "HEAD"], text=True).strip(), tip)
-                else:
-                    self.assertEqual(actual.returncode, 0, actual.stderr)
-                    self.assertEqual(actual.stdout.split()[0], later if scenario == "moved" else tip)
+                self.assertEqual(str(path) in trees, scenario != "occupied-branch")
+                actual = subprocess.check_output(
+                    ["git", "-C", str(source), "rev-parse", "--verify", f"refs/heads/{branch}"], text=True)
+                self.assertEqual(actual.strip(), later if scenario == "moved" else tip)
 
     def test_failed_clone_without_head_removes_its_folder_and_preserves_the_git_error(self) -> None:
         _, _, bare = self.editable_source()
@@ -1752,13 +2246,11 @@ assert not loaded, loaded
         self.assertEqual(environment, {"CONF_DIR": str(config.parent),
                                        "BUILD_TARGETS_CONFIG": str(config.parent / "build_targets.conf")})
         sources = Path(__file__).resolve().parents[2] / "config"
+        admission = config.parent / ADMISSION_CONFIG_FIXTURE.name
+        self.assertEqual(conf.read(admission).values(), conf.read(ADMISSION_CONFIG_FIXTURE).values())
         for source in sources.glob("*.conf"):
-            private = config.parent / source.name
-            if source.name == "build_admission.conf":
-                shipped = conf.read(source).values()
-                self.assertEqual(conf.read(private).values(), shipped | {"min_pass_gap_seconds": "0"})
-            else:
-                self.assertEqual(private.read_bytes(), source.read_bytes())
+            if source.name != ADMISSION_CONFIG_FIXTURE.name:
+                self.assertEqual((config.parent / source.name).read_bytes(), source.read_bytes())
         _ = write_config_fixture(config, "prefixes.admit-test=admit-test-\nroots.system=/tmp\n")
         original = config.read_text()
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, environment)))
@@ -2049,7 +2541,7 @@ os._exit(0)
         self.assertEqual((held / "kept").read_text(), "x")
 
     def test_an_error_in_the_tool_run_is_not_taken_as_a_name_clash(self) -> None:
-        with self.assertRaises(FileExistsError), folders.tool_folder("merge-gate"):
+        with self.assertRaises(FileExistsError), folders.tool_folder("gate"):
             raise FileExistsError("from the tool")
         self.assertEqual(list(self.root.iterdir()), [])
 

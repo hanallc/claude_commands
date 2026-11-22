@@ -24,11 +24,37 @@ from scripts.whoami.agent_accounts import Quota, Report
 from scripts.whoami import usage_store
 from scripts.whoami.agent_notes import local_reset
 from scripts.accounts import accounts, moves, next_moves, role_map
-from scripts.notify.user_action import ActionRequired
+from scripts.message import send_budget
+from scripts.message.send_result import SEND_ABSENT_EXIT, SEND_CLOSED_EXIT
+from scripts.notify import review
+from scripts.notify.push_texts import RenderedPush
+from scripts.notify.user_action import ActionRequired, NoActionRequired
 from scripts.whoami.quota_alert_test_support import Notes, REAL_RECIPIENTS, REAL_TELL_USER, REGISTRY as REGISTRY, running
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 setUpModule = support.setUpModule
+
+
+class RecipientFailureTests(unittest.TestCase):
+    def test_relay_reports_an_absent_or_closed_recipient(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        _ = (root / "accounts.conf").write_text(
+            "# whole: 1..\nquota_relay_timeout_seconds=10\n", encoding="utf-8")
+        with (mock.patch.dict(os.environ, {"CONF_DIR": str(root)}),
+              mock.patch.object(send_budget, "seconds", return_value=10.0)):
+            for code, header in ((SEND_ABSENT_EXIT, "ABSENT"), (SEND_CLOSED_EXIT, "CLOSED")):
+                reply = subprocess.CompletedProcess([], code, f"{header}: fixture unavailable", "")
+                with self.subTest(header=header), mock.patch.object(subprocess, "run", return_value=reply):
+                    self.assertEqual(quota_alert.relay("fixture", "message", None), f"stdout: {reply.stdout}")
+
+    def test_user_push_reports_an_absent_or_closed_recipient(self) -> None:
+        push = RenderedPush("fixture", "fixture", "note", "Fixture", NoActionRequired(), "Fixture", {})
+        with (mock.patch.object(review, "user_send_seconds", return_value=5.0),
+              mock.patch.object(send_budget, "user_seconds", return_value=5.0)):
+            for code, header in ((SEND_ABSENT_EXIT, "ABSENT"), (SEND_CLOSED_EXIT, "CLOSED")):
+                reply = subprocess.CompletedProcess([], code, f"{header}: fixture unavailable", "")
+                with self.subTest(header=header), mock.patch.object(subprocess, "run", return_value=reply):
+                    self.assertEqual(quota_alert.tell_user(push), quota_alert.PushFailed(f"stdout: {reply.stdout}"))
 
 
 def write_settings(config: quota_alert.Config) -> None:
