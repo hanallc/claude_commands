@@ -1,7 +1,7 @@
 """Stop an exact Linux process lifetime or its dedicated command tree."""
 from __future__ import annotations
 
-from collections.abc import Generator
+from collections.abc import Generator, Mapping
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 import fcntl
@@ -123,6 +123,12 @@ def _read_cgroup_file(directory: int, name: str) -> bytes:
 
 
 DETACHED_SLICE_ENV = "DETACHED_RUN_SLICE"
+
+
+def scope_slice_args(default: str = "", *, environment: Mapping[str, str] = os.environ) -> list[str]:
+    """Use the detached run slice or the caller's usual slice."""
+    name = environment.get(DETACHED_SLICE_ENV) or default
+    return [f"--slice={name}"] if name else []
 
 
 def _is_run_slice_path(path: Path) -> bool:
@@ -270,9 +276,10 @@ def _in_slice(process: ProcessLifetime, scope: RunSliceIdentity) -> bool:
 def _term_slice(directory: int, scope: RunSliceIdentity) -> None:
     try:
         members = _cgroup_processes(directory)
-    except (OSError, ValueError) as error:
+    except (OSError, ValueError):
+        # The event file still controls escalation when the member scan fails.
         _check_saved_slice(scope)
-        raise SliceStopFailed(f"cannot read slice members: {error}") from error
+        return
     for process in members:
         try:
             with pin_process(process) as descriptor:

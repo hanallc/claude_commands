@@ -714,8 +714,9 @@ On natedev, the launcher starts the command scope in `builds-detached-<id>.slice
 The slice name uses the run ID without dashes.
 Each run slice is under `builds-detached.slice`, which is under `builds.slice`.
 The limits and anonymous memory totals of `builds.slice` include the nested scopes.
+The queue charges each unowned scope inside a run slice.
 The launcher saves the run slice identity and exports `DETACHED_RUN_SLICE` before it starts the command.
-Module, admission program, and shell build step scopes use that slice when the variable is set.
+The scope launchers use the run slice when the variable is set.
 Transient services keep their usual placement.
 `detached_runs.py start` requires `systemd-run --scope` or `systemd-run --user --scope` when the program is `systemd-run`.
 Other `systemd-run` forms return exit 2.
@@ -732,6 +733,8 @@ The record saves the command's process group as `command_group`.
 5. Confirm that the slice's `cgroup.events` reports `populated 0` or that the kernel removed the empty slice.
 
 An unreadable slice, a replacement directory, or a slice that stays populated after KILL produces an error.
+The record stays running until the supervisor or recovery can confirm that the slice is empty.
+Startup recovery resumes a saved stop even if the supervisor still runs.
 A run without a saved slice can receive a legacy group TERM, which reports an unconfirmed stop.
 The stop requires Linux pidfd support.
 After a normal command exit, the supervisor gives the slice members the stop grace to exit.

@@ -2966,6 +2966,21 @@ def service_job_state(workers: Iterable[int], processes: dict[int, ProcessIdenti
     return UnmatchedServiceJob(started_at)
 
 
+def build_scope_charge_groups(directory: Path) -> Iterable[Path]:
+    """Read through detached slice containers to the scopes that use memory."""
+    try:
+        children = list(directory.iterdir())
+    except OSError:
+        return
+    for child in children:
+        if (child.name == "builds-detached.slice"
+                or (directory.name == "builds-detached.slice" and child.name.startswith("builds-detached-")
+                    and child.suffix == ".slice")):
+            yield from build_scope_charge_groups(child)
+        else:
+            yield child
+
+
 def unowned_slice_memory(rows: list[Reservation], processes: dict[int, ProcessIdentity], proc: Path,
                          *, activity_reader: ScopeActivityReader | None = None,
                          ci_memory_slice: str = "", waiters: Sequence[Waiter] = ()) -> tuple[UnownedSliceMemory, ...]:
@@ -2984,18 +2999,13 @@ def unowned_slice_memory(rows: list[Reservation], processes: dict[int, ProcessId
             tree_pids.update(process_tree({row["pid"]: row["start_time"]}, processes))
     result: list[UnownedSliceMemory] = []
     activity_reader = activity_reader or ScopeActivityReader(processes, proc)
-    try:
-        children = list(directory.iterdir())
-    except OSError:
-        children = []
+    children = list(build_scope_charge_groups(directory))
     ci_group = ci_slice_cgroup(ci_memory_slice) if ci_memory_slice else ReadingUnavailable("CI slice not configured")
     ci_groups = (ci_group,) if isinstance(ci_group, Path) else ()
     if ci_memory_slice and isinstance(ci_group, ReadingUnavailable):
         result.append(UnownedSliceMemory(0, pid=PidNotRecorded(), owner=ci_memory_slice, diagnostic=ci_group.reason))
     children.extend(group for group in ci_groups if group not in children)
     for child in children:
-        if child.name == "builds-detached.slice":
-            continue
         required = child in ci_groups
         if not required and (child in owned or child.name == "sccache.service" or not child.is_dir()):
             continue

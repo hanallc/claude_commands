@@ -98,9 +98,9 @@ def suite_scope_prefix() -> list[str]:
 
 def probe_scope_prefix() -> list[str]:
     """Check whether the user manager can start a separate program scope."""
-    slice_name = os.environ.get(process_stop.DETACHED_SLICE_ENV) or "builds.slice"
+    slice_args = process_stop.scope_slice_args("builds.slice")
     prefix = ["systemd-run", "--user", "--scope", "--quiet", "--collect",
-              "--expand-environment=no", f"--slice={slice_name}", "--"]
+              "--expand-environment=no", *slice_args, "--"]
     try:
         probe = subprocess.run([*prefix, "true"], stdin=subprocess.DEVNULL,
                                capture_output=True, timeout=10, check=False)
@@ -110,7 +110,7 @@ def probe_scope_prefix() -> list[str]:
     if probe.returncode:
         print(f"Module scope skipped: probe failed (exit {probe.returncode})", flush=True)
         return []
-    print(f"Module scope: {slice_name}", flush=True)
+    print(f"Module scope: {slice_args[0].removeprefix('--slice=')}", flush=True)
     return prefix
 
 

@@ -6968,16 +6968,34 @@ class CiSliceMemoryTests(unittest.TestCase):
         self.assertEqual(gate.unowned_slice_memory([], {}, self.proc), ())
 
 
-    def test_detached_slice_excludes_its_scopes_without_hiding_a_build_sibling(self) -> None:
+    def test_queue_charges_unowned_scopes_inside_detached_slices(self) -> None:
         builds = Path(os.environ["BUILDLOG_BUILDS_CGROUP"])
         detached = builds / "builds-detached.slice"
+        run_slice = detached / "builds-detached-r1.slice"
         write_scope(detached, current=4 * GIB, anonymous=4 * GIB)
-        write_scope(detached / "python.scope", members=(123,), current=3 * GIB, anonymous=3 * GIB)
-        write_scope(detached / "python.scope/child.scope", current=GIB, anonymous=GIB)
+        write_scope(run_slice, current=4 * GIB, anonymous=4 * GIB)
+        owned = run_slice / "owned.scope"
+        write_scope(owned, current=GIB, anonymous=GIB)
+        unowned = run_slice / "unowned.scope"
+        write_scope(unowned, members=(123,), current=3 * GIB, anonymous=3 * GIB)
         sibling = builds / "build.scope"
         write_scope(sibling, current=2 * GIB, anonymous=2 * GIB)
-        readings = gate.unowned_slice_memory([], gate.process_table(self.proc), self.proc)
-        self.assertEqual([(reading.cgroup, reading.bytes) for reading in readings], [(str(sibling), 2 * GIB)])
+        sidecar = self.root / "owned.scope.path"
+        _ = sidecar.write_text(str(owned))
+        reservation = fixture_reservation(234, GIB)
+        reservation["sidecar"] = str(sidecar)
+        processes = gate.process_table(self.proc)
+        unowned_readings = gate.unowned_slice_memory([reservation], processes, self.proc)
+        self.assertEqual({reading.cgroup: reading.bytes for reading in unowned_readings},
+                         {str(unowned): 3 * GIB, str(sibling): 2 * GIB})
+        policy = admission_policy_fixture()
+        readings = gate.QueueSnapshotReadings(processes, {}, admission_records.HostMemory(20 * GIB, 64 * GIB),
+            admission_records.NoPressureHold(), admission_records.ReadyToStart(), [], policy=policy)
+        owned_memory = gate.process_memory(gate.PopulatedStepScope(owned), self.proc)
+        inputs = gate.build_queue_inputs([], [(reservation, owned_memory)], readings, NOW_EPOCH,
+                                         unowned=unowned_readings)
+        result = gate.queue_read_from(inputs, policy)
+        self.assertEqual(result.explanation.totals.charged, 6 * GIB)
 
 
     def test_unreadable_or_invalid_ci_stat_records_a_diagnostic(self) -> None:

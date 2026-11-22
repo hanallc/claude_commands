@@ -1231,7 +1231,8 @@ sys.exit(1)
 
     @unittest.skipUnless(process_stop.supported(), "pidfd stop needs Linux")
     def test_slice_stop_waits_for_nested_step_scopes(self) -> None:
-        for outcome in ("TERM", "KILL", "EPERM", "still populated", "natural", "unreadable", "missing", "replaced"):
+        for outcome in ("TERM", "KILL", "scan error", "resume", "EPERM", "still populated",
+                        "natural", "unreadable", "missing", "replaced"):
             with self.subTest(outcome=outcome), contextlib.ExitStack() as descriptors:
                 path = self.record(["fixture command"])
                 proc = self.root / f"proc-{outcome}"
@@ -1277,6 +1278,10 @@ sys.exit(1)
                 (proc / "701" / "cgroup").unlink()
                 _ = (command_scope / "cgroup.procs").write_text("")
                 self.update_record(path, exit_code=143)
+                if outcome == "scan error":
+                    _ = (step / "cgroup.procs").write_text("unreadable\n")
+                if outcome == "resume":
+                    self.update_record(path, stop_reason="fixture stop", stop_pass_requested=True)
                 now = 0.0
 
                 def open_pidfd(pid: int) -> int:
@@ -1292,7 +1297,7 @@ sys.exit(1)
                     self.assertEqual(kill.read_text(), "0\n")
                     if outcome == "EPERM":
                         raise PermissionError("fixture denies TERM")
-                    if outcome in ("natural", "TERM"):
+                    if outcome in ("natural", "TERM", "unreadable"):
                         _ = events.write_text("populated 0\n")
 
                 def advance(_descriptor: int, seconds: float) -> None:
@@ -1300,9 +1305,8 @@ sys.exit(1)
                     now += seconds
                     with path.with_suffix(".record.lock").open("a") as lock:
                         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                    if outcome == "KILL" and kill.read_text() == "1\n":
+                    if outcome in ("KILL", "scan error", "resume") and kill.read_text() == "1\n":
                         _ = events.write_text("populated 0\n")
-                    self.assertEqual(detached_runs.reap_orphans(str(self.session)), [])
 
                 write = os.write
                 kill_stat = kill.stat()
@@ -1345,18 +1349,33 @@ sys.exit(1)
                         with patch.object(detached_runs, "_run", return_value=0):
                             status = detached_runs.main(["supervise", str(path)])
                         self.assertEqual(status, 0 if outcome == "natural" else 1)
-                        result = self.sent.pop()
                         if outcome == "natural":
+                            result = self.sent.pop()
                             self.assertIn("Result: PASS (exit 0)", result)
                             self.assertIn("the supervisor stopped processes that remained in the run slice", result)
                         else:
-                            self.assertIn("Result: FAIL (cleanup; exit 0)", result)
-                            self.assertIn("cannot read cgroup.events", result)
+                            saved = worker_lifecycle.read_json_object(path)
+                            self.assertEqual(saved["status"], "running")
+                            self.assertEqual(saved["exit_code"], 0)
+                            self.assertIn("cannot read cgroup.events", str(saved["scope_error"]))
+                            self.assertEqual(detached_runs.main(["deliver", str(path)]), 1)
+                            self.assertEqual(self.sent, [])
                             send_term.assert_not_called()
+                            _ = events.write_text("populated 1\n")
+                            self.assertEqual(detached_runs.main(["stop", "--reason", "fixture stop", str(path)]), 0)
+                            self.assertTrue(process_stop.slice_has_ended(published))
+                            self.assertEqual(detached_runs.main(["deliver", str(path)]), 0)
+                            self.assertIn("Result: STOPPED (exit 0)", self.sent.pop())
                         continue
                     args = ["stop", "--reason", "fixture stop", str(path)]
-                    if outcome in ("TERM", "KILL"):
-                        self.assertEqual(detached_runs.main(args), 0)
+                    if outcome in ("TERM", "KILL", "scan error", "resume"):
+                        if outcome == "resume":
+                            with patch.object(detached_run_process, "supervises", return_value=True):
+                                self.assertEqual(detached_runs.reap_orphans(str(self.session)), [])
+                            self.assertEqual(kill.read_text(), "1\n")
+                            self.assertTrue(process_stop.slice_has_ended(published))
+                        else:
+                            self.assertEqual(detached_runs.main(args), 0)
                         self.assertEqual(detached_runs.main(args), 0)
                         self.assertTrue(process_stop.slice_has_ended(published))
                         self.assertEqual(detached_runs.main(["deliver", str(path)]), 0)
@@ -1369,9 +1388,12 @@ sys.exit(1)
                         self.assertEqual(saved["stop_reason"], "fixture stop")
                         self.assertIs(saved["stop_pass_requested"], True)
                         self.assertIn(detail, str(saved["scope_error"]))
-                        self.assertEqual(detached_runs.reap_orphans(str(self.session)), [])
-                send_term.assert_called_once_with(ANY, signal.SIGTERM)
-                self.assertEqual(kill.read_text(), "1\n" if outcome in ("KILL", "still populated") else "0\n")
+                if outcome == "scan error":
+                    send_term.assert_not_called()
+                else:
+                    send_term.assert_called_once_with(ANY, signal.SIGTERM)
+                killed = outcome in ("KILL", "scan error", "resume", "still populated")
+                self.assertEqual(kill.read_text(), "1\n" if killed else "0\n")
 
     def test_start_rejects_an_unknown_kind(self) -> None:
         with contextlib.redirect_stderr(io.StringIO()) as error, self.assertRaises(SystemExit) as raised:

@@ -481,7 +481,7 @@ def _scope_stop_graces() -> tuple[float, float]:
 
 def _stop_slice_command(
     path: Path, reason: str, run_slice: process_stop.RunSliceIdentity, *,
-    check: Callable[[], bool], stop_pass: bool,
+    check: Callable[[], bool], stop_pass: bool, resume: bool = False,
 ) -> bool:
     grace, kill_grace = _scope_stop_graces()
     with _scope_stop_lock(path) as acquired:
@@ -492,12 +492,18 @@ def _stop_slice_command(
                 record = _read_record(path)
                 if record.get("command_slice") != run_slice or record["status"] != "running" or not check():
                     return False
+                pending = record.get("stop_reason") or record.get("scope_error")
+                if resume and not pending:
+                    return False
                 ended = process_stop.slice_has_ended(run_slice)
-                if ended and not record.get("stop_reason"):
+                if ended and not pending:
                     return False
                 stopping = record.copy()
-                _ = stopping.setdefault("stop_reason", reason)
-                if stop_pass and not stopping.get("stop_pass_requested"):
+                if not ended and reason:
+                    _ = stopping.setdefault("stop_reason", reason)
+                if not ended and not stopping.get("stop_reason"):
+                    stopping["slice_leftovers"] = True
+                if stop_pass and stopping.get("stop_reason") and not stopping.get("stop_pass_requested"):
                     stopping["stop_pass_requested"] = True
                     if _stop_caller_is_owner(stopping["staff_id"], os.environ):
                         stopping["self_stop"] = True
@@ -538,8 +544,6 @@ def stop_command(
         if not process_stop.is_slice_identity(run_slice):
             raise process_stop.SliceStopFailed("the saved run slice is invalid")
         return _stop_slice_command(path, reason, run_slice, check=check, stop_pass=stop_pass)
-    if "command_scope" in record and record.get("scope_end_proved") is not True:
-        raise process_stop.SliceStopFailed("the old run has no dedicated slice")
     starting_command = _recorded_group(record)
     if starting_command is None or record.get("status") != "running":
         return False
@@ -639,12 +643,14 @@ def _orphaned(path: Path, raw: Mapping[str, object], now: float) -> bool:
     pid = _integer(raw.get("pid"))
     if pid > 0:
         return not detached_run_process.supervises(pid, path) and _command_has_ended(raw, pid)
+    if _has_saved_cgroup(raw):
+        return _command_has_ended(raw, pid)
     started = _number(raw.get("started_at"), now)
     return now - started >= DETACHED_RUN_START_GRACE_SECS
 
 
 def _has_saved_cgroup(raw: Mapping[str, object]) -> bool:
-    return "command_slice" in raw or "command_scope" in raw
+    return "command_slice" in raw
 
 
 def _command_has_ended(raw: Mapping[str, object], pid: int) -> bool:
@@ -654,9 +660,6 @@ def _command_has_ended(raw: Mapping[str, object], pid: int) -> bool:
             return process_stop.is_slice_identity(run_slice) and process_stop.slice_has_ended(run_slice)
         except process_stop.SliceStopFailed:
             return False
-    if "command_scope" in raw:
-        # Use the completion proof that the old supervisor saved for an old run.
-        return raw.get("scope_end_proved") is True
     command = _saved_process(raw.get("command_pid"), raw.get("command_started"))
     if isinstance(command, (process_start.Started, process_start.Unreadable)):
         return False
@@ -771,6 +774,11 @@ def _reap_orphans_locked(runs: Path, worker: str = "") -> OrphanReapResult:
             continue
         if raw["status"] != "running":
             continue
+        if (run_slice := raw.get("command_slice")) and (raw.get("stop_reason") or raw.get("scope_error")):
+            try:
+                _ = _stop_slice_command(path, "", run_slice, check=lambda: True, stop_pass=False, resume=True)
+            except process_stop.SliceStopFailed as error:
+                print(f"detached_runs: {path.stem}: stop recovery failed: {error}", file=sys.stderr)
         if raw["pid"] > 0 and detached_run_process.supervises(raw["pid"], path):
             continue
         try:
@@ -817,6 +825,8 @@ def _finish_record(path: Path, record: RunRecord) -> CompletionReplay:
                 return _replay_completion(path, current)
             if current.get("completion_pending") is False or current.get("delivery"):
                 return CompletionReplay.HANDLED
+        if _has_saved_cgroup(current) and not _command_has_ended(current, current["pid"]):
+            return CompletionReplay.RETRY
         record["completion_pending"] = True
         record = _write_record(path, record)
         return _replay_completion(path, record)
@@ -1827,6 +1837,9 @@ def _retry_failed_push(path: Path) -> None:
 def command_deliver(args: argparse.Namespace) -> int:
     record_path = Path(str(getattr(args, "record", ""))).resolve()
     record = _read_record(record_path)
+    if _has_saved_cgroup(record) and not _command_has_ended(record, record["pid"]):
+        print(f"detached_runs: {record['run_id']}: the run slice has no confirmed end", file=sys.stderr)
+        return 1
     if record.get("stop_pass_requested") and record["status"] != "finished" and not record.get("scope_error"):
         if "exit_code" not in record:
             print(f"detached_runs: {record['run_id']}: the stopped command has no confirmed exit", file=sys.stderr)
@@ -1884,7 +1897,7 @@ def scope_prefix(log: Path, environment: dict[str, str], *,
         return []
     scope = _command_scope_unit(kind, log.stem)
     return ["systemd-run", "--user", "--scope", "--quiet", "--collect", "--expand-environment=no",
-            f"--slice={scope.slice}", f"--unit={scope.unit}",
+            *process_stop.scope_slice_args(scope.slice, environment={}), f"--unit={scope.unit}",
             "--", sys.executable, "-IS", "-c", SCOPE_SCRIPT, str(Path(__file__).resolve().parents[2]),
             scope.slice, scope.unit]
 
@@ -2055,6 +2068,9 @@ def command_supervise(args: argparse.Namespace) -> int:
         record = _write_record(record_path, record)
         if run_slice := record.get("command_slice"):
             record = _finish_command_slice(record_path, run_slice)
+            if error := record.get("scope_error"):
+                print(f"detached_runs: {record['run_id']}: slice cleanup failed: {error}", file=sys.stderr)
+                return 1
         elif record.get("stop_pass_requested") and not _stopped_group_has_ended(record):
             grace, kill_grace = _scope_stop_graces()
             deadline = time.monotonic() + grace + kill_grace
