@@ -14,7 +14,7 @@ import json
 from pathlib import Path
 from subprocess import SubprocessError
 import sys
-from typing import TYPE_CHECKING, Literal, NotRequired, Self, TypedDict, cast, override
+from typing import TYPE_CHECKING, Final, Literal, NotRequired, Self, TypedDict, cast, override
 from uuid import uuid4
 
 from scripts.build_hold.owning_session import NoOwningSession, OwningSession
@@ -528,6 +528,8 @@ class NoSavedMacRepository:
 
 NO_SAVED_MAC_REPOSITORY = NoSavedMacRepository()
 LEGACY_WAIT_CLAIM_RELEASED = 14
+MAC_HISTORY_KEY_UNAVAILABLE: Final = "history_key_unavailable"
+MAC_HISTORY_KEY_UNAVAILABLE_STATUS = 15
 
 
 SavedMacRepository = MacRepositoryIdentity | CleanupOnlyMacRepository | NoSavedMacRepository

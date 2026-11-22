@@ -42,6 +42,7 @@ from scripts.build_targets.target_config import ANY_ELIGIBLE_TARGET, LOCAL_CALLE
 SUBMITTING_SESSION = OwningSession("submitting-session")
 ALLOWED_HOST = placement.AllowedHost()
 HANA_REPOSITORY = "https://github.com/hanallc/hana"
+FIXTURE_MAC_SCOPE = RepositoryScope("hana")
 
 
 class PlacementFixture(AdmissionFixture):
@@ -70,7 +71,7 @@ class PlacementFixture(AdmissionFixture):
 
 
 def placement_request(fixture: AdmissionFixture, *, session: placement.SubmittingSession = SUBMITTING_SESSION,
-                      since: float | None = None, scope: RepositoryScope = RepositoryScope("hana")) -> wire.PlacementRequest:
+                      since: float | None = None, scope: RepositoryScope = FIXTURE_MAC_SCOPE) -> wire.PlacementRequest:
     local = fixture.request(since=since)
     local = replace(local, run=wire.RunIdentity(local.owner.pid, local.owner.start_time))
     destination = placement.PlacementDestination("mac", "mac", "fixture-mac", scope)
