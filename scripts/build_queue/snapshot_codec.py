@@ -71,9 +71,56 @@ def record_field_names(schema: type) -> tuple[str, ...]:
     return tuple(member.name for member in fields(schema))
 
 
+def _record_fields(value: object) -> dict[str, object]:
+    return cast(dict[str, object], value) if isinstance(value, dict) else {}
+
+
+def _invalid_mac_watcher_fence(value: object) -> bool:
+    from scripts.build_queue.admission_wire import MacRunWatcherFence
+
+    try:
+        _ = parse_snapshot_value(value, MacRunWatcherFence)
+    except (ValueError, TypeError, KeyError):
+        return True
+    return False
+
+
+def _recover_mac_watcher_slot(record: dict[str, object]) -> dict[str, object]:
+    """Keep the claim if either copy of the watcher evidence is invalid."""
+    provider = _record_fields(record.get("provider"))
+    provider_fence = _record_fields(provider.get("watcher_fence"))
+    settlement = _record_fields(record.get("settlement"))
+    operation = _record_fields(settlement.get("operation"))
+    if not (
+        (provider_fence.get("kind") == "MacRunWatcherFence" and "boot" in provider_fence
+         and _invalid_mac_watcher_fence(provider_fence))
+        or (operation.get("kind") == "MacWatcherSettlementPending" and "fence" in operation
+            and _invalid_mac_watcher_fence(operation["fence"]))
+    ):
+        return record
+
+    claim = _record_fields(provider.get("claim"))
+    if claim.get("kind") != "RunProviderClaimReference":
+        binding = _record_fields(_record_fields(operation.get("fence")).get("binding"))
+        claim = _record_fields(binding.get("claim"))
+    if claim.get("kind") != "RunProviderClaimReference":
+        return record
+
+    recovered = {**record, "settlement": {
+        "kind": "SettlementPending",
+        "reason": settlement.get("reason", "saved Mac watcher evidence is invalid"),
+        "operation": {"kind": "MacWatcherHandoffUnconfirmed", "claim": claim},
+    }}
+    if provider.get("kind") == "RemoteRunProvider":
+        recovered["provider"] = {**provider, "watcher_fence": {"kind": "MacRunWatcherFenceUnrecorded"}}
+    return recovered
+
+
 def wire_record(schema: type, record: dict[str, object], *, writing: bool) -> dict[str, object]:
     """Keep existing wire fields compatible with the pinned client."""
     if not writing and schema.__module__ == "scripts.build_queue.admission_wire":
+        if schema.__name__ == "VerifyRunSlot":
+            record = _recover_mac_watcher_slot(record)
         if schema.__name__ == "RemoteRunProvider":
             if "start_fence_id" in record:
                 record = {**record, "claim": {"kind": "LegacyAttemptBoundRunClaim",

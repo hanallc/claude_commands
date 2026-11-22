@@ -137,6 +137,10 @@ class MacRunWatcherFence:
     binding: placement.RunCommandBinding
     boot: MacBootIdentity
 
+    def __post_init__(self) -> None:
+        if not self.binding.start_fence_id.strip():
+            raise ValueError("a Mac watcher needs a start fence ID")
+
 
 @dataclass(frozen=True)
 class MacRunWatcherBootUnrecorded:
@@ -254,6 +258,11 @@ class VerifyRunSlot:
     settlement: RunOpen | SettlementPending = field(default=RunOpen(), kw_only=True)
     launch: RunLaunchState = field(default=RunLaunchUnrecorded(), kw_only=True)
     generation: VerifyRunGeneration | RunGenerationUnrecorded = field(default=RunGenerationUnrecorded(), kw_only=True)
+
+    @property
+    def holds_mac_watcher_claim(self) -> bool:
+        return isinstance(self.settlement, SettlementPending) and isinstance(
+            self.settlement.operation, (MacWatcherSettlementPending, MacWatcherHandoffUnconfirmed))
 
     @property
     def run_key(self) -> str:

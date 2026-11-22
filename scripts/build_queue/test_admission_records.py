@@ -118,6 +118,22 @@ class RunRecordCodecTests(unittest.TestCase):
                 with self.subTest(source="snapshot"), self.assertRaises(ValueError):
                     _ = wire.parse_record(wire.encode_record(saved), wire.MacWatcherSettlementPending)
 
+    def test_mac_watcher_handoff_rejects_a_blank_start_fence(self) -> None:
+        scope = RepositoryScope("fixture", "fixture-key", 2)
+        claim = placement.RunProviderClaimReference("mac", "mac", scope, "run-claim", "run-a", "placement-a")
+        command = wire.RunCommandAttempt("nextest-step", "nextest-attempt")
+        boot = wire.MacBootIdentity("mac-hardware-id", "mac-boot-id", 100_000_000)
+        for fence_id in ("", " "):
+            binding = placement.RunCommandBinding(claim, fence_id)
+            with self.subTest(fence_id=fence_id, source="constructor"), self.assertRaises(ValueError):
+                _ = wire.MacRunWatcherFence(command, binding, boot)
+
+            saved = {"kind": "MacWatcherSettlementPending", "fence": {
+                "kind": "MacRunWatcherFence", "command": command, "binding": binding, "boot": boot,
+            }}
+            with self.subTest(fence_id=fence_id, source="snapshot"), self.assertRaises(ValueError):
+                _ = wire.parse_record(wire.encode_record(saved), wire.MacWatcherSettlementPending)
+
     def test_legacy_mac_watcher_handoff_keeps_the_claim_without_release_authority(self) -> None:
         scope = RepositoryScope("fixture", "fixture-key", 2)
         claim = placement.RunProviderClaimReference("mac", "mac", scope, "run-claim", "run-a", "placement-a")

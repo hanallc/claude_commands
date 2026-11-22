@@ -1983,7 +1983,7 @@ class AdmissionServer:
         for key, slot in list(self.verify_run_slots.items()):
             if owner_may_be_live(self.proc.owner_start(slot.owner.pid), slot.owner.start_time):
                 self._watch_owner(slot.owner)
-            else:
+            elif not slot.holds_mac_watcher_claim:
                 del self.verify_run_slots[key]
 
     def _verify_run_owners(self) -> dict[str, frozenset[str]]:
@@ -1994,7 +1994,8 @@ class AdmissionServer:
 
     def _finish_verify_grant(self, reservation: str, *, started: bool) -> None:
         for key, slot in self.verify_run_slots.items():
-            if not isinstance(slot.use, PendingVerifyGrants) or reservation not in slot.use.reservations:
+            if (slot.holds_mac_watcher_claim or not isinstance(slot.use, PendingVerifyGrants)
+                    or reservation not in slot.use.reservations):
                 continue
             remaining = slot.use.reservations - {reservation}
             if started:
@@ -2132,7 +2133,7 @@ class AdmissionServer:
         if owner_exit is not None:
             owner = owner_exit.owner
             for key, slot in tuple(self.verify_run_slots.items()):
-                if slot.owner == owner:
+                if slot.owner == owner and not slot.holds_mac_watcher_claim:
                     del self.verify_run_slots[key]
         for key, place in list(self.places.items()):
             ended = owner_exit is not None and owner_exit.owner == place.owner

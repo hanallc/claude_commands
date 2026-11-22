@@ -8091,6 +8091,59 @@ class VerifyRunSlotTests(unittest.TestCase):
             fixture.restart()
             self.assertEqual(list(fixture.server.verify_run_slots.values()), [granted])
 
+    def test_restart_keeps_the_unconfirmed_mac_claim_and_the_other_verify_slot(self) -> None:
+        from scripts.build_queue.test_placement import PlacementFixture, placement_request
+        from scripts.build_targets.execution_transport import SshCommandTransport
+
+        for invalid_record in ("provider", "settlement"):
+            with self.subTest(invalid_record=invalid_record), PlacementFixture() as fixture:
+                self.configure(fixture, 1)
+                local = self.verify_step(fixture)
+                fixture.release(self.grant(fixture, local).grant)
+                good, = fixture.server.verify_run_slots.values()
+
+                request = placement_request(fixture)
+                candidate, = request.constraints.candidates
+                owner = wire.Owner(request.owner.pid, request.owner.start_time)
+                generation = status_wire.VerifyRunGeneration("placement-a", owner)
+                claim = placement.RunProviderClaimReference("mac", "mac", candidate.destination.scope,
+                    "run-claim", request.episode, generation.id)
+                command = status_wire.RunCommandAttempt("nextest-step", "nextest-attempt")
+                binding = placement.RunCommandBinding(claim, "nextest-fence")
+                boot = status_wire.MacBootIdentity("mac-hardware-id", "mac-boot-id", 100_000_000)
+                fence = status_wire.MacRunWatcherFence(command, binding, boot)
+                provider = status_wire.RemoteRunProvider("fixture-mac", SshCommandTransport(fixture.root / "mac.conf"),
+                    claim, placement.ClaimHolderIdentity(fixture.server.host, owner.pid, owner.start_time),
+                    watcher_fence=fence)
+                lost = status_wire.VerifyRunSlot("fixture", owner, destination=candidate.destination,
+                    provider=provider, generation=generation, launch=status_wire.RunLaunched(),
+                    settlement=status_wire.SettlementPending("Mac lost", status_wire.MacWatcherSettlementPending(fence)))
+                raw = wire.parse_record(wire.encode_record(lost), dict[str, object])
+                if invalid_record == "provider":
+                    provider_fields = cast(dict[str, object], raw["provider"])
+                    saved_fence = cast(dict[str, object], provider_fields["watcher_fence"])
+                    cast(dict[str, object], saved_fence["boot"])["boot_id"] = ""
+                else:
+                    settlement_fields = cast(dict[str, object], raw["settlement"])
+                    operation = cast(dict[str, object], settlement_fields["operation"])
+                    saved_fence = cast(dict[str, object], operation["fence"])
+                    cast(dict[str, object], saved_fence["binding"])["start_fence_id"] = ""
+
+                fixture.server.close()
+                state = wire.parse_record(fixture.state_text(), dict[str, object])
+                cast(dict[str, object], state["verify_run_slots"])[lost.key] = raw
+                _ = (fixture.state_dir / "state.json").write_text(wire.encode_record(state))
+                fixture.restart()
+
+                recovered = replace(lost, provider=replace(provider, watcher_fence=status_wire.MacRunWatcherFenceUnrecorded()),
+                    settlement=status_wire.SettlementPending("Mac lost", status_wire.MacWatcherHandoffUnconfirmed(claim)))
+                expected = {good.key: good, lost.key: recovered}
+                self.assertEqual(fixture.server.verify_run_slots, expected)
+                fixture.end_owner(owner)
+                self.assertEqual(fixture.server.verify_run_slots, expected)
+                fixture.restart()
+                self.assertEqual(fixture.server.verify_run_slots, expected)
+
     def test_exempt_verify_runs_locally_without_taking_a_slot(self) -> None:
         from scripts.build_queue.test_placement import PlacementFixture
 
