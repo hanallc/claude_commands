@@ -173,6 +173,23 @@ class MemoryFeedTests(unittest.TestCase):
     output: Path = Path()
     configuration: Path = Path()
 
+    def test_outside_queue_marks_a_login_shell_that_execs_a_script(self) -> None:
+        owners = memory_feed.FeedStaff(write_outside_queue_fixture(self.root))
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, outside_queue_fixture_groups(self.root))))
+        inputs = captured_reading().explanation.decided_from
+        process = self.root / "proc/8102"
+        stat = process / "stat"
+        _ = stat.write_bytes(stat.read_bytes().replace(b"(fixture ) command)", b"(bash)", 1))
+        cmdline = process / "cmdline"
+        _ = cmdline.write_text("/bin/bash\0--login\0--norc\0")
+        self.assertEqual(memory_feed.outside_queue_processes(inputs, owners), [])
+
+        _ = cmdline.write_text("/bin/bash\0/fixture/long-build.sh\0")
+        rows = memory_feed.outside_queue_processes(inputs, owners)
+        self.assertEqual(rows, [
+            {"pid": 8102, "unit": "queue", "owner": "test", "command": "long-build.sh", "cpu_seconds": 136.0},
+        ])
+
     def test_cpu_time_marks_only_unadmitted_command_trees_over_the_limit(self) -> None:
         staff_members = write_outside_queue_fixture(self.root)
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, outside_queue_fixture_groups(self.root))))
@@ -233,10 +250,12 @@ class MemoryFeedTests(unittest.TestCase):
             self.assertEqual(memory_feed.outside_queue_processes(inputs, owners), outside)
             self.assertEqual(text_reads[cpu_stat], 2)
         self.assertEqual([(row["pid"], row["owner"], row["cpu_seconds"]) for row in outside], [(8102, "builds", 151.5)])
-        self.assertEqual(byte_reads[self.root / "proc/8102/environ"], 1)
+        self.assertEqual(byte_reads[self.root / "proc/8102/environ"], 2)
         self.assertEqual(byte_reads[cmdline], 2)
         self.assertEqual(byte_reads[self.root / "proc/8105/cmdline"], 2)
-        self.assertEqual(byte_reads[self.root / "proc/8107/cmdline"], 0)
+        self.assertEqual(byte_reads[self.root / "proc/8107/cmdline"], 2)
+        self.assertEqual(byte_reads[self.root / "proc/8107/environ"], 0)
+        self.assertEqual(byte_reads[self.root / "proc/8101/environ"], 0)
         self.assertEqual(byte_reads[self.root / "proc/8102/stat"], 2)
 
         reservation = fixture_reservation(8105, admission_records.GIB)
@@ -272,16 +291,15 @@ class MemoryFeedTests(unittest.TestCase):
         self.assertEqual(memory_feed.outside_queue_processes(inputs, owners), outside)
 
         environ = self.root / "proc/8102/environ"
-        _ = cmdline.write_text("/bin/python3\0/fixture/detached_exec.py\0")
         _ = environ.write_text("BUILDLOG_OWNER_STAFF_ID=test-worker\0")
         byte_reads.clear()
         with mock.patch.object(Path, "read_bytes", new=count_bytes):
             rows = memory_feed.outside_queue_processes(inputs, owners)
             self.assertEqual(memory_feed.outside_queue_processes(inputs, owners), rows)
         self.assertEqual([(row["pid"], row["command"], row["owner"]) for row in rows],
-                         [(8102, "detached_exec.py", "test")])
+                         [(8102, "targeted_test.py", "test")])
         self.assertEqual(byte_reads[cmdline], 2)
-        self.assertEqual(byte_reads[environ], 1)
+        self.assertEqual(byte_reads[environ], 2)
 
     def test_each_reading_shares_current_staff_role_names_with_the_page(self) -> None:
         runner = staff.StaffRow(staff.StaffId("fixture-runner"), "showrunner", "fixture-runner", staff.StaffRoot(),

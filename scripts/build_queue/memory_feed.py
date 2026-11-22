@@ -2436,13 +2436,11 @@ def configured_cpu_limit(path: Path, _stamp: conf.ConfigurationStamp | None) -> 
 class OutsideProcess:
     parent: int
     start: str
-    name: bytes
     zombie: bool
 
 
-def outside_process_stat(pid: int) -> tuple[bytes, list[bytes]]:
-    name, fields = (PROC / str(pid) / "stat").read_bytes().rsplit(b") ", 1)
-    return name.partition(b" (")[2], fields.split()
+def outside_process_stat(pid: int) -> list[bytes]:
+    return (PROC / str(pid) / "stat").read_bytes().rsplit(b") ", 1)[1].split()
 
 
 def outside_process_table() -> dict[int, OutsideProcess]:
@@ -2453,9 +2451,9 @@ def outside_process_table() -> dict[int, OutsideProcess]:
             continue
         pid = int(name)
         try:
-            program, fields = outside_process_stat(pid)
+            fields = outside_process_stat(pid)
             if fields[0] not in (b"X", b"x"):
-                processes[pid] = OutsideProcess(int(fields[1]), fields[19].decode(), program, fields[0] == b"Z")
+                processes[pid] = OutsideProcess(int(fields[1]), fields[19].decode(), fields[0] == b"Z")
         except (OSError, ValueError, IndexError):
             continue
     return processes
@@ -2464,7 +2462,7 @@ def outside_process_table() -> dict[int, OutsideProcess]:
 def process_cpu_ticks(pid: int, start: str) -> int:
     """Read CPU ticks for this process and the children it reaped."""
     try:
-        _, fields = outside_process_stat(pid)
+        fields = outside_process_stat(pid)
         if fields[0] not in (b"X", b"x") and fields[19].decode() == start:
             return sum(int(value) for value in fields[11:15])
     except (OSError, ValueError, IndexError):
@@ -2476,16 +2474,6 @@ DETACHED_OWNER_KEY = "BUILDLOG_OWNER_STAFF_ID"
 SESSION_OWNER_KEYS = ("CODEX_THREAD_ID", "CLAUDE_CODE_SESSION_ID", "STAFF_ID")
 
 
-@dataclass
-class OutsideProcessMetadata:
-    name: bytes
-    command: tuple[str, ...] | None = None
-    owners: dict[str, str] | None = None
-
-
-OUTSIDE_PROCESS_METADATA: dict[tuple[Path, int, str], OutsideProcessMetadata] = {}
-
-
 def is_agent_command(command: Sequence[str]) -> bool:
     return bool(command) and (is_claude_process(command) or is_codex_process(command)
                               or Path(command[0]).name == "codex-real")
@@ -2493,22 +2481,17 @@ def is_agent_command(command: Sequence[str]) -> bool:
 
 @final
 class OutsideQueueScan:
-    """Read current placement and reuse metadata for each process lifetime."""
+    """Read current placement for one feed refresh."""
 
     def __init__(self, inputs: admission_records.QueueInputs, processes: dict[int, OutsideProcess],
                  staff_members: FeedStaff, builds: Path) -> None:
         self.processes = processes
         self.staff_members = staff_members
         self.builds = builds
-        self.commands_read: set[int] = set()
         self.groups: dict[int, Path | None] = {}
         self.children: dict[int, list[int]] = {}
         for pid, process in processes.items():
             self.children.setdefault(process.parent, []).append(pid)
-        for key in tuple(OUTSIDE_PROCESS_METADATA):
-            root, pid, start = key
-            if root != PROC or (process := processes.get(pid)) is None or process.start != start:
-                del OUTSIDE_PROCESS_METADATA[key]
         self.admitted_scopes = {source.directory for step in inputs.running if gate.running_has_reservation(step)
                                 and isinstance(step.measured, admission_records.MeasuredMemory)
                                 and isinstance(source := step.measured.anonymous_source, admission_records.ScopeSource)}
@@ -2521,46 +2504,28 @@ class OutsideQueueScan:
                 self.admitted.add(pid)
                 pending.extend(self.children.get(pid, ()))
 
-    def metadata(self, pid: int) -> OutsideProcessMetadata:
-        process = self.processes[pid]
-        key = (PROC, pid, process.start)
-        if key not in OUTSIDE_PROCESS_METADATA:
-            OUTSIDE_PROCESS_METADATA[key] = OutsideProcessMetadata(process.name)
-        return OUTSIDE_PROCESS_METADATA[key]
-
-    def command(self, pid: int, *, refresh: bool = False) -> tuple[str, ...]:
-        process = self.processes[pid]
-        if process.zombie:
-            return ()
-        evidence = self.metadata(pid)
-        if evidence.command is None or evidence.name != process.name or (refresh and pid not in self.commands_read):
+    def scope_commands(self, scope: Path, pids: Iterable[int]) -> dict[int, tuple[str, ...]]:
+        """Read arguments for live candidates in this scope."""
+        commands: dict[int, tuple[str, ...]] = {}
+        for pid in pids:
+            if self.processes[pid].zombie or self.has_admission((pid,), self.admitted_scopes):
+                continue
+            if (group := self.group(pid)) is not None and not group.is_relative_to(scope):
+                continue
             try:
                 line = read_proc_text(PROC / str(pid) / "cmdline").removesuffix("\0")
-                command = tuple(line.split("\0")) if line else ()
+                commands[pid] = tuple(line.split("\0")) if line else ()
             except OSError:
-                command = ()
-            if evidence.command != command or evidence.name != process.name:
-                evidence.owners = None
-            evidence.command = command
-            evidence.name = process.name
-            self.commands_read.add(pid)
-        return evidence.command
+                commands[pid] = ()
+        return commands
 
-    def refresh_tree_commands(self, pids: Iterable[int]) -> None:
-        """Refresh command lines once for the live processes in a marked tree."""
-        for pid in pids:
-            _ = self.command(pid, refresh=True)
-
-    def owner(self, pids: Iterable[int], *, detached: bool = False) -> unit_labels.UnitLabels | None:
-        keys = (DETACHED_OWNER_KEY, *SESSION_OWNER_KEYS) if detached else SESSION_OWNER_KEYS
+    def owner(self, pids: Iterable[int], keys: tuple[str, ...] = SESSION_OWNER_KEYS) -> unit_labels.UnitLabels | None:
         for pid in pids:
             if self.processes[pid].zombie:
                 continue
-            evidence = self.metadata(pid)
-            if evidence.owners is None:
-                evidence.owners = environment_values(PROC / str(pid) / "environ", (DETACHED_OWNER_KEY, *SESSION_OWNER_KEYS))
+            owners = environment_values(PROC / str(pid) / "environ", keys)
             for key in keys:
-                if reference := evidence.owners.get(key):
+                if reference := owners.get(key):
                     member = self.staff_members.members.by_member_reference(reference)
                     if member is not None and (labels := self.staff_members.labels.get(member.current_session)) is not None:
                         return labels
@@ -2572,9 +2537,6 @@ class OutsideQueueScan:
             visited.add(pid)
             yield pid
             pid = self.processes[pid].parent
-
-    def scope_owner(self, pids: set[int]) -> unit_labels.UnitLabels | None:
-        return self.owner(pid for pid in sorted(pids) if is_agent_command(self.command(pid)))
 
     def group(self, pid: int) -> Path | None:
         if pid not in self.groups:
@@ -2639,14 +2601,16 @@ def outside_agent_rows(scope: Path, scan: OutsideQueueScan, limit: float, ticks_
     """Measure outside command trees in an agent scope."""
     rows: list[OutsideQueueProcess] = []
     pids = outside_scope_pids(scope, scan.processes)
+    commands = scan.scope_commands(scope, pids)
     pending = [pid for pid in sorted(pids) if scan.processes[pid].parent not in pids]
-    scope_owners = (pid for pid in sorted(pids) if is_agent_command(scan.command(pid)))
+    scope_owners = (pid for pid in sorted(commands) if is_agent_command(commands[pid]))
     owner = None
     while pending:
         pid = pending.pop()
-        if pid in seen:
+        if pid in seen or pid not in commands:
             continue
-        if is_outside_tree_wrapper(scan.command(pid)):
+        command = commands[pid]
+        if is_outside_tree_wrapper(command):
             seen.add(pid)
             pending.extend(child for child in scan.children.get(pid, ()) if child in pids)
             continue
@@ -2656,16 +2620,10 @@ def outside_agent_rows(scope: Path, scan: OutsideQueueScan, limit: float, ticks_
         # Read parents first so a child reaped during this scan cannot count twice.
         seconds = sum(process_cpu_ticks(child, scan.processes[child].start) for child in tree) / ticks_per_second
         if seconds > limit:
-            scan.refresh_tree_commands(tree)
-            command = scan.command(pid)
-            if is_outside_tree_wrapper(command):
-                seen.difference_update(tree)
-                seen.add(pid)
-                pending.extend(child for child in scan.children.get(pid, ()) if child in pids)
-                continue
             if owner is None:
                 owner = scan.owner(scope_owners)
-            rows.append(outside_queue_row(pid, command, owner or scan.owner(scan.ancestors(pid)), seconds))
+            caller = owner or scan.owner(scan.ancestors(pid), (DETACHED_OWNER_KEY, *SESSION_OWNER_KEYS))
+            rows.append(outside_queue_row(pid, command, caller, seconds))
     return rows
 
 
@@ -2694,10 +2652,11 @@ def outside_detached_row(scope: Path, scan: OutsideQueueScan, limit: float) -> O
     nested = {admitted for admitted in scan.admitted_scopes if admitted.is_relative_to(scope)}
     if scan.has_admission(pids, nested):
         return None
-    scan.refresh_tree_commands(pids)
-    for pid in sorted(pids, key=lambda item: (scan.processes[item].parent in pids, item)):
-        if command := scan.command(pid):
-            owner = scan.scope_owner(pids) or scan.owner(scan.ancestors(pid), detached=True)
+    commands = scan.scope_commands(scope, pids)
+    for pid in sorted(commands, key=lambda item: (scan.processes[item].parent in pids, item)):
+        if command := commands[pid]:
+            scope_owner = scan.owner(member for member in sorted(commands) if is_agent_command(commands[member]))
+            owner = scope_owner or scan.owner(scan.ancestors(pid), (DETACHED_OWNER_KEY, *SESSION_OWNER_KEYS))
             return outside_queue_row(pid, command, owner, seconds)
     return None
 
