@@ -158,6 +158,11 @@ NO_RUN = NoRun()
 
 
 @dataclass(frozen=True)
+class SessionNotSent:
+    """A client from before the session field sent no owning session."""
+
+
+@dataclass(frozen=True)
 class AdmitRequest(CallerCode):
     """The request holds the command, caller, run, and memory profile for admission."""
     episode: str
@@ -176,7 +181,7 @@ class AdmitRequest(CallerCode):
     place: LocalPlace | CloudPlace = LocalPlace()
     route: target_config.StepRoute = field(default_factory=lambda: records.DIRECT_CARGO, kw_only=True)
     # The session that owns the run; a natedev hold of this session does not hold the step.
-    session: OwningSession | NoOwningSession = field(default=NoOwningSession(), kw_only=True)
+    session: OwningSession | NoOwningSession | SessionNotSent = field(default=SessionNotSent(), kw_only=True)
 
 
 @dataclass(frozen=True)

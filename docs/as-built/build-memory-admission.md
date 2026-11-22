@@ -1303,11 +1303,13 @@ Status derives `draining (N runs left)` or `held` from matching live keep entrie
 Status and the enforcer report list only live keep entries.
 A reused PID does not count when its start time differs.
 Status names each queued or running local CI placement and its state start time from existing admission records.
-Each admission pass applies the same hold and lineage check to every local waiter, CI requests included.
+On natedev, each admission pass applies the same hold and lineage check to every local step waiter (`AdmitRequest`), CI requests included.
+App launches (`LaunchRequest`) are not held; the enforcer does not stop them either.
 The check uses the waiter's process lineage and the session that owns its run, so the holder's own steps and kept runs still start.
 The client sends that owning session (`owning_session()`) in `AdmitRequest.session`; a worker in the holder's run is not held.
-A request without the field falls back to the session in its queue row.
+A request from an older client has `SessionNotSent` and falls back to the session in its queue row.
 The service finds the own hold key once for each session in a pass.
+An unreadable staff record gives no own hold key for that pass, so the step waits.
 A waiter that joined before the hold is held too; the check runs at each pass, not only when the waiter joins.
 A held waiter keeps its place, gets a `NatedevHeld` wait and starts at the release in its order.
 A held waiter claims no between-steps slot and gives back a slot it claimed, so that slot can expire during the hold.

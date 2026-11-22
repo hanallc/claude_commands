@@ -2470,7 +2470,7 @@ class RunnerAuthorizationTests(unittest.TestCase):
         # CI run 43737288332 refused four steps 60 s into the fps hold on 2026-11-15.
         held = records.NatedevHeld("fps", "Phase 3 timing")
         for priority_source in ("existing", "request"):
-            with self.subTest(priority_source=priority_source), AdmissionFixture() as fixture, fixture.loop_turn():
+            with self.subTest(priority_source=priority_source), mock.patch.object(store, "host_name", return_value="natedev"), AdmissionFixture() as fixture, fixture.loop_turn():
                 directory = fixture.root / "holders"
                 directory.mkdir()
                 _ = (directory / "fps").write_text(json.dumps({"holder": "fps", "since": "2026-11-15T12:00:00+00:00",
@@ -2505,7 +2505,7 @@ class RunnerAuthorizationTests(unittest.TestCase):
         # fps drain 2026-11-22 17:33: a smoke step that joined at 14:12 started in the hold, and the enforcer ended it.
         from scripts.build_hold import build_hold
 
-        with AdmissionFixture() as fixture, fixture.loop_turn():
+        with mock.patch.object(store, "host_name", return_value="natedev"), AdmissionFixture() as fixture, fixture.loop_turn():
             directory = fixture.root / "holders"
             directory.mkdir()
             fixture.hold_starts()
@@ -2540,7 +2540,7 @@ class RunnerAuthorizationTests(unittest.TestCase):
 
     def test_a_step_of_the_holders_own_run_starts_in_the_hold(self) -> None:
         # A worker in the run has its own session; the run's owning session holds natedev.
-        with AdmissionFixture() as fixture, fixture.loop_turn():
+        with mock.patch.object(store, "host_name", return_value="natedev"), AdmissionFixture() as fixture, fixture.loop_turn():
             directory = fixture.root / "holders"
             directory.mkdir()
             fixture.hold_starts()
@@ -2557,7 +2557,7 @@ class RunnerAuthorizationTests(unittest.TestCase):
             self.assertIn(worker.episode, fixture.server.reservations)
 
     def test_a_held_step_gives_back_its_runs_slot_between_steps(self) -> None:
-        with AdmissionFixture() as fixture:
+        with mock.patch.object(store, "host_name", return_value="natedev"), AdmissionFixture() as fixture:
             directory = fixture.root / "holders"
             directory.mkdir()
             run = fixture.run_owner()
@@ -2576,6 +2576,59 @@ class RunnerAuthorizationTests(unittest.TestCase):
             _ = fixture.run_pass()
             self.assertIsInstance(fixture.server.slots[first.reservation], records.BetweenStepsSlot)
             self.assertIsInstance(fixture.server.waiters[head.episode].continuation_claim, service.NoContinuationClaim)
+
+    def test_a_plain_step_starts_while_the_hold_state_is_unreadable(self) -> None:
+        # The enforcer stays the guard; a ReadingUnavailable wait would end the step at the client.
+        for host in ("natedev", "mac"):
+            with (self.subTest(host=host), mock.patch.object(store, "host_name", return_value=host),
+                  AdmissionFixture() as fixture, fixture.loop_turn()):
+                _ = (fixture.root / "holders").write_text("not a folder")
+                fixture.free(9 * GIB)
+                fixture.allow_next_start()
+                _ = only_admitted(fixture.server.handle_request(fixture.request()))
+
+    def test_a_mac_service_does_not_hold_for_a_natedev_hold(self) -> None:
+        with mock.patch.object(store, "host_name", return_value="mac"), AdmissionFixture() as fixture, fixture.loop_turn():
+            directory = fixture.root / "holders"
+            directory.mkdir()
+            _ = (directory / "fps").write_text(json.dumps({
+                "holder": "fps", "since": "2026-11-22T22:33:19+00:00", "for": "a traced timeline",
+                "release_eta": "unknown", "keep": []}))
+            fixture.free(9 * GIB)
+            fixture.allow_next_start()
+            _ = only_admitted(fixture.server.handle_request(fixture.request()))
+
+    def test_an_unreadable_staff_record_holds_the_step_and_the_pass_goes_on(self) -> None:
+        from scripts.build_targets import build_targets
+
+        with (mock.patch.object(store, "host_name", return_value="natedev"), AdmissionFixture() as fixture,
+              fixture.loop_turn(), mock.patch.object(build_targets, "own_hold_key", side_effect=OSError("staff record"))):
+            directory = fixture.root / "holders"
+            directory.mkdir()
+            _ = (directory / "fps-run").write_text(json.dumps({
+                "holder": "fps-run", "since": "2026-11-22T22:33:19+00:00", "for": "a traced timeline",
+                "release_eta": "unknown", "keep": []}))
+            fixture.free(9 * GIB)
+            fixture.allow_next_start()
+            step = replace(fixture.request(), session=OwningSession("fps-run"))
+            reply, = fixture.server.handle_request(step)
+            self.assertIsInstance(reply, wire.Wait)
+            self.assertEqual(fixture.server.local_holds[step.episode], records.NatedevHeld("fps-run", "a traced timeline"))
+
+    def test_no_hold_in_force_reads_no_process_lineage(self) -> None:
+        from scripts.build_targets import build_targets
+
+        with (mock.patch.object(store, "host_name", return_value="natedev"), AdmissionFixture() as fixture,
+              fixture.loop_turn(), mock.patch.object(build_targets, "read_caller_lineage",
+                                                     side_effect=AssertionError("lineage read with no hold"))):
+            (fixture.root / "holders").mkdir()
+            fixture.hold_starts()
+            self.assertIsInstance(fixture.server.handle_request(fixture.request())[0], wire.Wait)
+            write_pressure_reading(fixture.root / "pressure")
+            fixture.free(9 * GIB)
+            fixture.allow_next_start()
+            _ = fixture.server.run_pass()
+            self.assertTrue(fixture.server.reservations)
 
     def test_service_estimate_refreshes_history_and_replays_without_a_caller_run(self) -> None:
         with AdmissionFixture() as fixture, fixture.loop_turn():

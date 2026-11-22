@@ -2001,6 +2001,8 @@ class AdmissionServer:
 
     def _local_hold_reasons(self) -> dict[str, records.NatedevHeld | records.ReadingUnavailable]:
         """Hold each local waiter that a natedev hold applies to, at each pass."""
+        if self.host != "natedev":
+            return {}
         waiting = {episode: item for episode, item in self.waiters.items()
                    if isinstance(item.request, wire.AdmitRequest) and isinstance(item.request.place, wire.LocalPlace)}
         if not waiting:
@@ -2024,11 +2026,16 @@ class AdmissionServer:
             if not isinstance(request, wire.AdmitRequest):
                 continue
             session = request.session
-            if isinstance(session, NoOwningSession) and (session_id := item.row.get("session_id", "")):
-                # A client from before the session field names only its own session.
-                session = OwningSession(session_id)
+            if isinstance(session, wire.SessionNotSent):
+                # An older client names only its own session, in its queue row.
+                session_id = item.row.get("session_id", "")
+                session = OwningSession(session_id) if session_id else NoOwningSession()
             if session not in own_keys:
-                own_keys[session] = build_targets.own_hold_key(session, directory)
+                try:
+                    own_keys[session] = build_targets.own_hold_key(session, directory)
+                except OSError:
+                    # The staff record is unreadable: no hold is the step's own, so the step waits.
+                    own_keys[session] = ""
             owner = request.owner
             lineage = build_targets.read_caller_lineage(self.proc.path, owner.pid, owner.start_time)
             blocking = build_targets.blocking_hold(holds, own_keys[session], lineage)

@@ -160,10 +160,16 @@ class ProtocolTests(unittest.TestCase):
 
     def test_the_owning_session_survives_the_request_wire(self) -> None:
         with AdmissionFixture() as fixture:
-            for session in (OwningSession("fps-run"), NoOwningSession()):
+            for session in (OwningSession("fps-run"), NoOwningSession(), wire.SessionNotSent()):
                 with self.subTest(session=session):
                     request = replace(fixture.request(), session=session)
                     self.assertEqual(wire.parse_request(wire.encode_request(request)), request)
+            older = cast(dict[str, dict[str, object]], json.loads(wire.encode_request(
+                replace(fixture.request(), session=OwningSession("fps-run")))))
+            del older["data"]["session"]
+            parsed = wire.parse_request(json.dumps(older))
+            assert isinstance(parsed, wire.AdmitRequest)
+            self.assertEqual(parsed.session, wire.SessionNotSent())
 
     def test_placement_exchanges_preserve_identity_without_replaying_authority(self) -> None:
         from scripts.build_queue.test_placement import placement_request, coordinator_holder
