@@ -1015,8 +1015,8 @@ class VerifyMirrorWaitTests(verify_mac_offload_test_support.VerifyMacOffloadFixt
     def test_verify_waits_and_names_the_busy_mirror_session(self) -> None:
         _ = self.routing_fixture()
         git = self.bin_directory / "git"
-        origin = """if [[ "$*" == *' config --local --includes --null --get-regexp '* ]]; then
-    printf '%s\\n%s\\0' remote.origin.url 'https://fixture.invalid/case.git'
+        origin = """if [[ "$*" == *' config --includes --null --show-scope --get-regexp '* ]]; then
+    printf 'local\\0%s\\n%s\\0' remote.origin.url 'https://fixture.invalid/case.git'
     exit 0
 fi
 """

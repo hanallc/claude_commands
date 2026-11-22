@@ -139,7 +139,7 @@ def mac_source_repository(worktree: str, common: str) -> MacSourceRepository | U
 
 def _relative_origin_directory(common: Path, worktree: str) -> str | UnrecordedSourceCheckout:
     # Resolve relative origins from the primary checkout.
-    configured = _shared_git_config(common, "--default", str(common.parent), "--get", "core.worktree")
+    configured = _git_config(common, "--local", "--includes", "--default", str(common.parent), "--get", "core.worktree")
     configured.check_returncode()
     directory = (common / configured.stdout.removesuffix("\n")).resolve()
     try:
@@ -154,30 +154,75 @@ def _relative_origin_directory(common: Path, worktree: str) -> str | UnrecordedS
     return UnrecordedSourceCheckout()
 
 
-def _shared_git_config(common: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
-    """Read Git configuration and included files from the shared repository."""
-    environment = {**os.environ, "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_COUNT": "0"}
+def _git_config(common: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
+    """Read Git configuration from the shared Git directory."""
+    environment = {**os.environ, "GIT_CONFIG_COUNT": "0"}
     for name in ("GIT_COMMON_DIR", "GIT_WORK_TREE", "GIT_CONFIG", "GIT_CONFIG_PARAMETERS"):
         _ = environment.pop(name, None)
     return subprocess.run(
-        ["git", "--git-dir", str(common), "config", "--local", "--includes", *arguments],
+        ["git", "--git-dir", str(common), "config", *arguments],
         cwd=common, env=environment, capture_output=True, text=True, timeout=GIT_TIMEOUT_S, stdin=subprocess.DEVNULL,
     )
 
 
-def _mac_origin(common: Path) -> str:
-    result = _shared_git_config(common, "--null", "--get-regexp", r"^(remote\.origin\.url|url\..*\.insteadof)$")
+def _mac_rewrites_without_worktree(common: Path) -> str:
+    from tempfile import NamedTemporaryFile
+
+    paths: list[str] = []
+    for variable in ("GIT_CONFIG_SYSTEM", "GIT_CONFIG_GLOBAL"):
+        result = subprocess.run(
+            ["git", "--git-dir", os.devnull, "var", variable], cwd=common, capture_output=True,
+            text=True, timeout=GIT_TIMEOUT_S, stdin=subprocess.DEVNULL,
+        )
+        if result.returncode != 1:
+            result.check_returncode()
+            paths.extend(result.stdout.removesuffix("\n").split("\n"))
+    paths.append(str(common / "config"))
+
+    # The config must support a second read for hasconfig includes.
+    with NamedTemporaryFile(mode="w", encoding="utf-8") as configuration:
+        _ = configuration.write("[include]\n")
+        for path in paths:
+            escaped = str(common / path).replace("\\", "\\\\").replace('"', '\\"')
+            _ = configuration.write(f' path = "{escaped}"\n')
+        configuration.flush()
+        result = _git_config(common, "--file", configuration.name, "--includes", "--null",
+                             "--show-scope", "--get-regexp", r"^url\..*\.insteadof$")
     if result.returncode == 1:
         return ""
     result.check_returncode()
+    return result.stdout
+
+
+def _mac_origin(common: Path) -> str:
     urls: list[str] = []
+    if (common / "config.worktree").exists():
+        # A worktree origin can activate a conditional include in another scope.
+        result = _git_config(common, "--local", "--includes", "--null", "--get-all", "remote.origin.url")
+        if result.returncode == 1:
+            return ""
+        result.check_returncode()
+        urls.append(result.stdout.split("\0", 1)[0])
+        fields = _mac_rewrites_without_worktree(common).split("\0")
+        scopes = ("command",)
+    else:
+        result = _git_config(common, "--includes", "--null", "--show-scope",
+                             "--get-regexp", r"^(remote\.origin\.url|url\..*\.insteadof)$")
+        if result.returncode == 1:
+            return ""
+        result.check_returncode()
+        fields = result.stdout.split("\0")
+        scopes = ("system", "global", "local")
     rewrites: dict[str, list[str]] = {}
-    for entry in result.stdout.split("\0"):
+    for scope, entry in zip(fields[::2], fields[1::2]):
+        if scope not in scopes:
+            continue
         key, separator, value = entry.partition("\n")
         if not separator:
             continue
         if key == "remote.origin.url":
-            urls.append(value)
+            if scope == "local":
+                urls.append(value)
         else:
             base = key.removeprefix("url.").removesuffix(".insteadof")
             rewrites.setdefault(base, []).append(value)

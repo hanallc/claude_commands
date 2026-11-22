@@ -516,6 +516,10 @@ def retired_mac_reservation_path(paths: StatePaths, identity: ClaimIdentity) -> 
     return paths.retired_reservations / pending_start_key(identity)
 
 
+class UnrecordedReservationPath:
+    """The waiter or an older proof has no saved reservation path."""
+
+
 @dataclass(frozen=True)
 class RetiredMacReservation:
     """The saved permission for the original waiter to retry a retired reservation."""
@@ -525,6 +529,7 @@ class RetiredMacReservation:
     proc_start: str
     submitting_session: str
     worktree: str
+    reservation: Path | UnrecordedReservationPath
 
 
 class NoSavedRetryPermission:
@@ -539,11 +544,16 @@ def read_retired_mac_reservation(
 ) -> RetiredMacReservation | NoSavedRetryPermission:
     """Read the saved retry permission for this claim identity."""
     path = retired_mac_reservation_path(paths, identity)
-    record = read_run(path)
-    if isinstance(record, NoRun) or "remote_host" in record or claim_identity(record) != identity:
+    values = read_json_object(path)
+    if values is None:
         return NO_SAVED_RETRY_PERMISSION
+    record = decode_run(values, path)
+    if "remote_host" in record or claim_identity(record) != identity:
+        return NO_SAVED_RETRY_PERMISSION
+    reservation = (paths.directory / reservation_file(values, "reservation_file", path)
+                   if "reservation_file" in values else UnrecordedReservationPath())
     return RetiredMacReservation(path, record["pid"], record["proc_start"], record["submitting_session"],
-                                 record["worktree"])
+                                 record["worktree"], reservation)
 
 
 def claim_owner_ended(record: RunRecord) -> bool:
@@ -586,7 +596,7 @@ def retire_replaced_reservation(paths: StatePaths, replacement: Path, record: Ru
             proof.parent.mkdir(parents=True, exist_ok=True)
             # Keep the reservation identity if the writer stops before the replacement commits.
             _ = old.pop("mac_repository", None)
-            write_text_atomic(proof, json.dumps(old) + "\n")
+            write_text_atomic(proof, json.dumps({**old, "reservation_file": replaced["file"]}) + "\n")
         path.unlink(missing_ok=True)
     except OSError as error:
         raise ReservationRetirementError(path, error) from error
@@ -695,8 +705,10 @@ def read_json_object(path: Path) -> dict[str, object] | None:
 
 def read_run(path: Path) -> RunState:
     values = read_json_object(path)
-    if values is None:
-        return NO_RUN
+    return NO_RUN if values is None else decode_run(values, path)
+
+
+def decode_run(values: dict[str, object], path: Path) -> RunRecord:
     pid = values.get("pid")
     proc_start = values.get("proc_start")
     what = values.get("what")
@@ -787,11 +799,7 @@ def read_replaced_reservation(value: object, path: Path) -> ReplacedMacReservati
     if not isinstance(value, dict):
         raise StateReadError(f"{path} has an invalid replaced reservation")
     fields = cast(dict[str, object], value)
-    file = required_string(fields, "file", path)
-    relative = Path(file)
-    if file != "run.json" and (len(relative.parts) != 2 or relative.parts[0] != "claims"
-                               or relative.suffix != ".json" or str(relative) != file):
-        raise StateReadError(f"{path} has an invalid replaced reservation file")
+    file = reservation_file(fields, "file", path)
     if "fingerprint" in fields:
         fingerprint = required_string(fields, "fingerprint", path)
         if len(fingerprint) != 64 or any(character not in "0123456789abcdef" for character in fingerprint):
@@ -805,6 +813,15 @@ def read_replaced_reservation(value: object, path: Path) -> ReplacedMacReservati
             required_string(fields, "attempt", path), pid, required_string(fields, "proc_start", path),
             required_string(fields, "since", path))
     return {"file": file, "fingerprint": fingerprint}
+
+
+def reservation_file(fields: dict[str, object], field: str, path: Path) -> str:
+    file = required_string(fields, field, path)
+    relative = Path(file)
+    if file != "run.json" and (len(relative.parts) != 2 or relative.parts[0] != "claims"
+                               or relative.suffix != ".json" or str(relative) != file):
+        raise StateReadError(f"{path} has an invalid reservation file")
+    return file
 
 
 def aware_timestamp(value: object, path: Path, field: str) -> datetime:
@@ -873,6 +890,26 @@ def claim_files(paths: StatePaths) -> tuple[Path, ...]:
     except OSError as error:
         raise ClaimStateUnreadable(paths.claims, error) from error
     return (paths.run, *repository_files)
+
+
+def read_wait_reservations(
+    paths: StatePaths, identity: ClaimIdentity, reservation: Path | UnrecordedReservationPath,
+) -> Generator[tuple[Path, ProcessBoundClaim], None, None]:
+    """Read the exact local reservation for release."""
+    for path in (reservation,) if isinstance(reservation, Path) else claim_files(paths):
+        try:
+            values = read_json_object(path)
+        except StateReadError:
+            if isinstance(reservation, Path):
+                raise
+            continue
+        if (values is None or "remote_host" in values
+                or (values.get("claim_id"), values.get("episode"), values.get("attempt"))
+                != (identity.claim_id, identity.episode, identity.attempt)):
+            continue
+        record = decode_run(values, path)
+        assert "remote_host" not in record
+        yield path, record
 
 
 def read_claims(paths: StatePaths) -> tuple[HeldClaim, ...]:

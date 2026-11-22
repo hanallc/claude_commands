@@ -51,6 +51,11 @@ class MacRunTests(unittest.TestCase):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name)
+        self.enterContext(mock.patch.dict(os.environ, {
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_CONFIG_SYSTEM": os.devnull,
+            "GIT_CONFIG_NOSYSTEM": "0",
+        }))
         self.repo = self.repository(".claude")
         _ = subprocess.run(["git", "-C", str(self.repo), "-c", "user.name=Fixture",
                             "-c", "user.email=fixture@example.invalid", "-c", "core.hooksPath=/dev/null",
@@ -421,6 +426,13 @@ sys.exit(71)
         ):
             worktree = ["git", "-C", str(checkout), "config", "--worktree"]
             _ = subprocess.run([*worktree, key, origin], check=True)
+            _ = subprocess.run([*worktree, "remote.origin.url", "https://worktree.invalid/team/hana"], check=True)
+        global_config = self.root / "global.gitconfig"
+        _ = global_config.write_text('[includeIf "hasconfig:remote.*.url:https://worktree.invalid/**"]\n'
+                                     + ' path = worktree-alias.gitconfig\n')
+        _ = (self.root / "worktree-alias.gitconfig").write_text(
+            f'[url "https://fixture.invalid/worktree.git"]\n insteadOf = {origin}\n')
+        self.enterContext(mock.patch.dict(os.environ, {"GIT_CONFIG_GLOBAL": str(global_config)}))
 
         native = self.native_claim(self.repo)
         self.assertEqual(mac_test.command_claim(native, self.paths, watch_claim=False), 0)
@@ -432,6 +444,34 @@ sys.exit(71)
                         self.fail("A worktree override bypassed the repository limit")
                 self.assertEqual(claim_state.target_claim_scope(self.paths, str(checkout)),
                                  claim_state.RepositoryScope(".claude", REPOSITORY_KEY))
+
+    def test_mac_capacity_shares_global_alias_and_ssh_https_origins(self) -> None:
+        for scope in ("GLOBAL", "SYSTEM"):
+            config = self.root / scope
+            _ = config.write_text(f'[url "git@github.com:"]\n insteadOf = {scope.lower()}:\n')
+            self.enterContext(mock.patch.dict(os.environ, {f"GIT_CONFIG_{scope}": str(config)}))
+        upstream = self.repository("hana", origin="https://github.com/team/hana")
+        native = self.native_claim(upstream)
+        self.assertEqual(mac_test.command_claim(native, self.paths, watch_claim=False), 0)
+        self.addCleanup(mac_test.command_release, native, self.paths)
+        for name, origin in (
+            ("global-alias", "global:team/hana.git"),
+            ("worktree-global-alias", "global:team/hana.git"),
+            ("worktree-system-alias", "system:team/hana.git"),
+            ("scp-url", "git@github.com:team/hana.git"),
+            ("ssh-url", "ssh://git@github.com:22/team/hana.git"),
+        ):
+            with self.subTest(checkout=name):
+                checkout = self.repository(name, origin=origin)
+                if name.startswith("worktree-"):
+                    git = ["git", "-C", str(checkout), "config"]
+                    _ = subprocess.run([*git, "--local", "extensions.worktreeConfig", "true"], check=True)
+                    _ = subprocess.run([*git, "--worktree", "url.git@worktree.invalid:.insteadOf", origin], check=True)
+                self.assertEqual(claim_state.target_claim_scope(self.paths, str(checkout)),
+                                 claim_state.RepositoryScope(name, "https://github.com/team/hana"))
+                with self.assertRaisesRegex(mac_run.MacRunRefused, "busy with native Mac run"):
+                    with mac_run.held(checkout, "mac", SuiteMode.GATE, GATE_JOB_NOT_RECORDED):
+                        self.fail("An alias bypassed the repository limit")
 
     def test_separate_git_directory_with_a_relative_origin_shares_capacity(self) -> None:
         separate = self.root / "separate"
@@ -755,6 +795,9 @@ sys.exit(71)
     def test_release_wait_revokes_a_retry_with_an_unreadable_process_start(self) -> None:
         self.exercise_interrupted_replacement(("release-unreadable", "release-before-unlink"))
 
+    def test_release_wait_revokes_a_retry_with_an_unrelated_damaged_claim(self) -> None:
+        self.exercise_interrupted_replacement(("release-with-damaged-claim",))
+
     def test_sweep_removes_a_retry_proof_when_the_waiter_ends(self) -> None:
         self.exercise_interrupted_replacement(("waiter-ended",))
 
@@ -906,19 +949,32 @@ with patch.object(Path, "unlink", interrupt_unlink), patch.object(mac_test, "wri
                             self.assertEqual(mac_test.live_claims(self.paths), ())
                         self.assertEqual(proof.exists(), isinstance(start, process_identity.Unreadable))
                     continue
-                if recovery in ("release-wait", "release-unreadable", "release-before-unlink"):
+                if recovery in ("release-wait", "release-unreadable", "release-before-unlink",
+                                "release-with-damaged-claim"):
                     proof = claim_state.retired_mac_reservation_path(self.paths, identity)
                     self.assertTrue(proof.exists())
-                    self.assertEqual(old_path.exists(), recovery == "release-before-unlink")
+                    self.assertEqual(old_path.exists(), recovery in ("release-before-unlink", "release-with-damaged-claim"))
+                    if recovery == "release-unreadable":
+                        saved_proof = cast(dict[str, object], json.loads(proof.read_text()))
+                        _ = saved_proof.pop("reservation_file")
+                        _ = proof.write_text(json.dumps(saved_proof))
                     with mock.patch.object(claim_state, "submitting_session", return_value=OwningSession("other")):
                         self.assertEqual(build_targets.command_release_wait(waiting.pid, identity=identity), 0)
                     self.assertTrue(proof.exists())
                     start = (process_identity.Started(reserved.record["proc_start"]) if recovery == "release-wait"
                              else process_identity.Unreadable("fixture"))
-                    with mock.patch.object(process_identity, "process_start", return_value=start):
+                    damaged = self.paths.claims / "unrelated.json"
+                    if recovery == "release-with-damaged-claim":
+                        _ = damaged.write_text("{")
+                    with (mock.patch.object(process_identity, "process_start", return_value=start),
+                          mock.patch.object(claim_state, "read_json_object", wraps=claim_state.read_json_object) as reads):
                         self.assertEqual(build_targets.command_release_wait(waiting.pid, identity=identity), 0)
                     self.assertIsInstance(claim_state.read_retired_mac_reservation(self.paths, identity),
                                           claim_state.NoSavedRetryPermission)
+                    if recovery == "release-with-damaged-claim":
+                        self.assertEqual(reads.call_args_list, [mock.call(proof), mock.call(old_path)])
+                        self.assertEqual(damaged.read_text(), "{")
+                        damaged.unlink()
                     child = subprocess.run([sys.executable, "-c", script, "none", str(old_path), *command[2:]],
                                            capture_output=True, text=True, timeout=5)
                     self.assertEqual(child.returncode, 12, child.stdout + child.stderr)
