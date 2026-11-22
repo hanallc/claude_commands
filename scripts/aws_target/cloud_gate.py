@@ -864,6 +864,8 @@ class GateWorker:
         interruption_confirmed = False
         result_seen_at: int | _ResultNotReceived = _RESULT_NOT_RECEIVED
         try:
+            # Read the wait before any launch, so a bad value costs no box.
+            unreachable_wait_s = target_config.unreachable_wait_seconds(conf.read_or_repository('build_targets'))
             self.reconcile()
             previous = next((row for row in self.book.read_snapshot().gate_reservations if row.attempt == attempt), None)
             if previous is not None and isinstance(previous.state, (ledger.GateAbsent, ledger.GateTerminated)):
@@ -917,8 +919,9 @@ class GateWorker:
                 downloaded_log_etag = ''
                 instance_check_s = settings().whole('instance_check_s')
                 next_instance_check = time.monotonic()
-                # The box pushes gate.log every log_push_s; no new log for this long means it is unreachable.
-                unreachable_wait_s = target_config.unreachable_wait_seconds(conf.read_or_repository('build_targets'))
+                # The box pushes gate.log every log_push_s; no new log for unreachable_wait_s means it is unreachable.
+                # A paired trial pauses the pushes while it measures, so only the EC2 state shows that it lives.
+                watch_silence = request.get('task') != 'paired'
                 seen_log_etag = ''
                 last_answer = time.monotonic()
                 while self.clock() < ledger.instant(request, 'expires'):
@@ -953,7 +956,7 @@ class GateWorker:
                         if log_etag != seen_log_etag:
                             seen_log_etag = log_etag
                             last_answer = now
-                        else:
+                        elif watch_silence:
                             silent_s = now - last_answer
                         if boot_error_key in etags and self.download(bucket, boot_error_key, folder / 'boot-error.json'):
                             reason = ledger.text(read(folder / 'boot-error.json'), 'error')
@@ -993,8 +996,10 @@ class GateWorker:
                                 deadline = began + limit if limit else float('inf')
                         s3_outage.reset()
                     except subprocess.TimeoutExpired:
-                        pass
+                        # Time when S3 cannot be read is not silence from the box.
+                        last_answer = now
                     except AwsUnavailable as error:
+                        last_answer = now
                         if not s3_outage.retry_after_failure(error, self.clock()):
                             raise
                     if ec2_error is not None:
