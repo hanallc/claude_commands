@@ -123,6 +123,25 @@ class PaneAstraReviewTests(HeldRolePaneCase):
             "--prompt", str(self.panes.command_case.prompt), "--reply-file", str(run / "review.md")],
             os.environ.copy(), ROOT)
 
+    def test_named_review_refuses_an_unreadable_staff_reread(self) -> None:
+        case = self.panes.command_case
+        begin = assign.execute_herdr
+
+        def lose_staff(args: assign.Arguments, run: Path, phase: str, prompt: Path,
+                       role: str, paths: list[str], environment: dict[str, str]) -> int:
+            with patch.object(staff, "local_snapshot", side_effect=staff.StaffUnreadable("private reread failure")):
+                return begin(args, run, phase, prompt, role, paths, environment)
+
+        submitted = case.agent.submitted.copy()
+        with patch.object(assign, "execute_herdr", side_effect=lose_staff):
+            result = invoke_cli(assign, assign.main, ["--role", "review",
+                "--to", "models-review-adversary", "--lens", "adversary", "--phase", "8",
+                "--session-dir", str(case.run_dir), "--cwd", str(self.panes.root), "--prompt", str(case.prompt)],
+                os.environ.copy(), ROOT)
+        self.assertEqual(result.returncode, 3, result.stdout + result.stderr)
+        self.assertIn("staff: review: not opened: private reread failure", result.stderr)
+        self.assertEqual(case.agent.submitted, submitted)
+
     def test_named_review_done_records_the_status_style_and_one_notice(self) -> None:
         write_text_atomic(Path(os.environ["LINT_CONFIG_FILE"]), "style_review=on\n")
         project = self.panes.root / "project"

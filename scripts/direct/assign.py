@@ -565,20 +565,23 @@ def post_launch_board(artifacts: staff_worker.CompletionArtifacts, slot: str, ki
 def execute_herdr(args: Arguments, run: Path, phase: str, prompt: Path,
                   role: str, paths: list[str], env: dict[str, str]) -> int:
     """Send the assignment through the shared worker command."""
-    owner = worker_admission.parent(staff.local_snapshot(), run=run)
-    artifacts = staff_worker.CompletionArtifacts(owner, run)
-    enrolled = artifacts.protected
-    if enrolled:
-        if refusal := worker_panes.review_role_refusal(owner, cast(staff.WorkerRole, role)):
-            refuse(refusal.reason)
-        try:
-            progress_history.check_assigned_review_launch(run, phase, prompt, args.lens)
-        except staff.StaffUnreadable as error:
-            print(f"staff: review: not opened: {error}".replace("\n", " "), file=sys.stderr)
-            return 3
-        except (OSError, ValueError, SystemExit) as error:
-            refuse(str(error))
-    else:
+    try:
+        owner = worker_admission.parent(staff.local_snapshot(), run=run)
+        artifacts = staff_worker.CompletionArtifacts(owner, run)
+        enrolled = artifacts.protected
+        if enrolled:
+            if refusal := worker_panes.review_role_refusal(owner, cast(staff.WorkerRole, role)):
+                refuse(refusal.reason)
+            try:
+                progress_history.check_assigned_review_launch(run, phase, prompt, args.lens)
+            except staff.StaffUnreadable:
+                raise
+            except (OSError, ValueError, SystemExit) as error:
+                refuse(str(error))
+    except staff.StaffUnreadable as error:
+        print(f"staff: {role}: not opened: {error}".replace("\n", " "), file=sys.stderr)
+        return 3
+    if not enrolled:
         check = [PYTHON, PASS_RECORD, "check-launch", "--session-dir", str(run), "--pass-kind", role,
                  "--phase-id", phase, "--prompt-file", str(prompt), "--fix-cause", args.fix_cause]
         if args.lens:
