@@ -221,6 +221,24 @@
 
 set -euo pipefail
 
+RUN_LOG_PIDS=()
+RUN_LOG_STDERR_SAVED=0
+quiet_dead_run_log() {
+    if [[ ${RUN_LOG_STDERR_SAVED:-0} == 0 ]]; then
+        exec 80>&2 || exec 80>/dev/null
+        RUN_LOG_STDERR_SAVED=1
+    fi
+    local pid
+    for pid in "${RUN_LOG_PIDS[@]}"; do
+        if ! kill -0 "$pid" 2>/dev/null; then
+            exec 2>/dev/null
+            break
+        fi
+    done
+}
+# Reserve fd 80 before doc_checkout can use it for a lease.
+quiet_dead_run_log
+
 usage() {
     sed -n '/^# Usage:$/,/^# End usage\./{
         /^# End usage\./d
@@ -1934,7 +1952,6 @@ if [[ "$CMD" == test ]]; then
     export VERIFY_TEST_ENV_NAMES="${MAC_ENV_NAMES[*]}"
 fi
 RUN_LOG=""
-RUN_LOG_PIDS=()
 VERDICT_KEY=""
 VERDICT_TREE_KEY=""
 CLIPPY_FIX_LIMIT_REACHED=0
@@ -4260,9 +4277,7 @@ run_log_tee() {
 start_run_log() {
     exec > >(run_log_tee)
     RUN_LOG_PIDS+=("$!")
-    exec 80>&2
-    RUN_LOG_STDERR=80
-    exec 2> >(run_log_tee >&2)
+    exec 2> >(run_log_tee >&80)
     RUN_LOG_PIDS+=("$!")
 }
 
@@ -4371,14 +4386,13 @@ verify_cleanup() {
 # unknown here) and writes no pass. Cleanup is best effort: errexit is off,
 # so one failed cleanup command does not end the trap with its status.
 verify_exit() {
+    quiet_dead_run_log
     EXIT_STATUS=$1
     set +e
     local outcome=error
     if (( EXIT_STATUS == 0 )) && [[ "$2" != exit && "$2" != "exit "* ]]; then
         EXIT_STATUS=128
         outcome=interrupted
-        # The run-log reader can stop before cleanup releases the token.
-        exec 80>&"${RUN_LOG_STDERR:-2}" 2>/dev/null
         interrupt_hold_wait
     elif (( EXIT_STATUS == 0 )); then
         outcome=completed
@@ -4395,6 +4409,7 @@ verify_exit() {
 }
 trap 'verify_exit "$?" "$BASH_COMMAND"' EXIT
 verify_interrupted() {
+    quiet_dead_run_log
     trap - EXIT
     # A process-group stop can deliver the same signal more than once.
     # Ignore later signals until cleanup removes this call's records.

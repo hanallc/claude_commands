@@ -91,7 +91,7 @@ class VerifyHoldWaitTests(VerifyHoldWaitFixture):
         # Use the signal bindings from Verify with its handler.
         signal_bindings = after_handler.split("\nif ", 1)[0]
         harness = (
-            shell_functions(VERIFY, "placement_once", "interrupt_hold_wait")
+            shell_functions(VERIFY, "placement_once", "interrupt_hold_wait", "quiet_dead_run_log")
             + interrupted + signal_bindings + "\n"
             + r'''
 set -eu
@@ -102,6 +102,7 @@ PLACEMENT_EPISODE=fixture PLACEMENT_SINCE=0 PLACEMENT_SOURCE_KEY=fixture PLACEME
 PLACEMENT_ASSIGNMENT_FILE=$HOLD_WAIT_DIR/assignment PLACEMENT_GRANT_FILE=$HOLD_WAIT_DIR/grant
 PLACEMENT_COMMAND=()
 HOLD_WAITER_PID="" RUN_STEP_PID="" BUILDLOG_HOLD_WAITER_FILE=""
+RUN_LOG_PIDS=()
 unset BUILDLOG_FIRST_STEP_REQUEST BUILDLOG_FIRST_STEP_ASSIGNMENT
 exec 7<&0 8<>"$HOLD_WAIT_DIR/placement-ready"
 
@@ -153,21 +154,29 @@ placement_once
         self.assertEqual(status, 130)
         self.assertFalse(Path(f"/proc/{placement_pid}").exists())
 
-    def interrupted_exit_command(self, token: Path) -> list[str]:
-        harness = shell_functions(VERIFY, "run_log_tee", "start_run_log", "verify_exit") + r'''
+    def verify_exit_command(self, token: Path, action: str) -> list[str]:
+        harness = shell_functions(
+            VERIFY, "quiet_dead_run_log", "run_log_tee", "start_run_log", "stop_interrupted_run_log",
+            "verify_exit", "verify_interrupted",
+        ) + r'''
 RUN_LOG=$1 RUN_LOG_PIDS=() CMD=test held_token=$2 VERIFY_START_DIR=$3
+RUN_STEP_PID=""
 PY=$VERIFY_START_DIR/../lib/py
-interrupt_hold_wait() { :; }
+interrupt_hold_wait() { printf 'hold diagnostic\n' >&2; }
+release_token() { rm -- "$held_token"; }
 verify_cleanup() {
-    rm -- "$held_token"
+    printf 'cleanup diagnostic\n' >&2
+    release_token
     printf '%s\n' "$1"
 }
 finish_verify_run() { :; }
+quiet_dead_run_log
 start_run_log
-exec 2>/dev/null
-verify_exit 0 'printf output'
 '''
-        return ["bash", "-c", harness, "test", str(self.fixture.root / "run.log"), str(token), str(VERIFY.parent)]
+        return ["bash", "-c", harness + action, "test", str(self.fixture.root / "run.log"), str(token), str(VERIFY.parent)]
+
+    def interrupted_exit_command(self, token: Path) -> list[str]:
+        return self.verify_exit_command(token, "exec 2>/dev/null\nverify_exit 0 'printf output'\n")
 
     def test_exit_reports_interruption_when_the_log_cannot_report(self) -> None:
         token = self.fixture.root / "held-token"
@@ -190,16 +199,41 @@ verify_exit 0 'printf output'
         self.assertEqual(result.stdout, "interrupted\n")
         self.assertFalse(token.exists())
 
+    def assert_dead_run_log_releases_token(self, command: str, status: int) -> None:
+        token = self.fixture.root / "held-token"
+        token.touch()
+        action = r'''
+reader_pid=${RUN_LOG_PIDS[1]}
+kill -KILL "$reader_pid" || exit 90
+wait "$reader_pid" 2>/dev/null || true
+if kill -0 "$reader_pid" 2>/dev/null; then exit 91; fi
+trap 'verify_exit "$?" "$BASH_COMMAND"' EXIT
+trap 'verify_interrupted 15' TERM
+''' + command
+        result = subprocess.run(self.verify_exit_command(token, action), env=verify_test_environment(),
+                                capture_output=True, text=True, check=False, timeout=SIGNAL_EXIT_SECONDS)
+        self.assertEqual(result.returncode, status, result.stdout + result.stderr)
+        self.assertFalse(token.exists(), result.stdout + result.stderr)
+
+    def test_nonzero_exit_releases_token_after_log_reader_dies(self) -> None:
+        self.assert_dead_run_log_releases_token("exit 23", 23)
+
+    def test_term_releases_token_after_log_reader_dies(self) -> None:
+        self.assert_dead_run_log_releases_token('kill -TERM "$$"', 143)
+
     def test_hup_reaps_log_readers_when_the_output_pipe_is_full(self) -> None:
         # Fill the consumer's pipe before starting verify's real log helpers.
         # No consumer drains it until after shutdown, so EOF on tee's input
         # cannot finish a pending output write.
         with full_output_pipe() as write_fd:
             log = self.fixture.root / "blocked-run.log"
-            harness = shell_functions(VERIFY, "run_log_tee", "start_run_log", "stop_interrupted_run_log") + r'''
+            harness = shell_functions(
+                VERIFY, "quiet_dead_run_log", "run_log_tee", "start_run_log", "stop_interrupted_run_log",
+            ) + r'''
 RUN_LOG=$1 RUN_LOG_PIDS=()
 trap 'stop_interrupted_run_log; exit 129' HUP
 exec 3>&2
+quiet_dead_run_log
 start_run_log
 printf '%8192s' x
 printf '%s\n' "${RUN_LOG_PIDS[*]}" >&3
