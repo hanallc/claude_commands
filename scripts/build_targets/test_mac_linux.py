@@ -73,7 +73,7 @@ if probe:
 assert 'mkdir -p -- "$checkout/.git"' in shell
 assert 'O_NOFOLLOW' in shell
 assert 'EPOCHREALTIME' not in shell
-assert f'timeout --signal=KILL {os.environ["FIXTURE_RUN_SECONDS"]} bash' in shell
+assert f'timeout --signal=KILL {os.environ["FIXTURE_RUN_SECONDS"]} python3' in shell
 payload = sys.stdin.buffer.read()
 offset = re.search(r'^head -c ([0-9]+) [|] tar', shell, re.M)
 assert offset
@@ -369,6 +369,48 @@ fi
     def run_lock(self) -> Path:
         return self.guest_home / '.claude' / mac_linux.RUN_LOCK_PATH
 
+    def test_cleanup_cancels_an_attempt_before_it_takes_the_lock(self) -> None:
+        git = self.run_lock().parent
+        git.mkdir(parents=True)
+        boot = Path('/proc/sys/kernel/random/boot_id').read_text().strip()
+        expired = time.clock_gettime_ns(time.CLOCK_BOOTTIME) - (mac_linux.SSH_CONNECT_TIMEOUT_SECONDS + 1) * 10**9
+        old_record = git / f'{mac_linux.CANCEL_RECORD_PREFIX}.{boot}.{expired}.old-fixture'
+        outside = self.root / 'outside-cancel-record'
+        _ = outside.write_text('keep this file\n')
+        old_record.symlink_to(outside)
+        settings = mac_linux.read_settings(conf.read(self.registry))
+        attempt = 'delayed-fixture'
+        proof = mac_linux.prove_guest_end(settings, attempt)
+        self.assertIs(proof.status, mac_linux.GuestEndStatus.ENDED)
+        self.assertEqual(len(list(git.glob(f'{mac_linux.CANCEL_RECORD_PREFIX}.*.{attempt}'))), 1)
+        self.assertFalse(old_record.is_symlink())
+        self.assertEqual(outside.read_text(), 'keep this file\n')
+
+        source = mac_linux.candidate_source(self.repo, ALL_MODULES)
+        shell = mac_linux.run_shell(settings, source, 0, attempt)
+        run = subprocess.run(['bash', '-c', shell], env={**os.environ, 'HOME': str(self.guest_home)},
+                             stdin=subprocess.DEVNULL, capture_output=True, text=True, check=False,
+                             timeout=6, start_new_session=True)
+        self.assertNotEqual(run.returncode, 0)
+        self.assertIn('attempt was cancelled', run.stderr)
+        self.assertEqual(self.run_lock().read_bytes(), b'')
+        self.assertFalse((git / 'HEAD').exists())
+        self.assertFalse((self.guest_home / 'build').exists())
+
+    def test_run_refuses_an_ssh_session_older_than_the_launch_window(self) -> None:
+        settings = mac_linux.read_settings(conf.read(self.registry))
+        source = mac_linux.candidate_source(self.repo, ALL_MODULES)
+        with patch.object(mac_linux, 'SSH_CONNECT_TIMEOUT_SECONDS', 1):
+            shell = mac_linux.run_shell(settings, source, 0, 'old-session-fixture')
+        launch = 'import os, sys, time; time.sleep(1.2); os.execvp("bash", ["bash", "-c", sys.argv[1]])'
+        run = subprocess.run([sys.executable, '-I', '-S', '-c', launch, shell],
+                             env={**os.environ, 'HOME': str(self.guest_home)}, stdin=subprocess.DEVNULL,
+                             capture_output=True, text=True, check=False, timeout=6, start_new_session=True)
+        self.assertNotEqual(run.returncode, 0)
+        self.assertIn('SSH session exceeded the launch window', run.stderr)
+        self.assertEqual(self.run_lock().read_bytes(), b'')
+        self.assertFalse((self.run_lock().parent / 'HEAD').exists())
+
     def test_disconnect_before_take_copy_kills_the_run_and_proves_end(self) -> None:
         result = self.route('disconnect-before-copy')
         self.assertIn('SSH or source stream exited 255', str(result))
@@ -378,19 +420,22 @@ fi
         self.assertEqual(self.trace.read_text().splitlines(), ['probe', 'run', 'cleanup'])
 
     def test_cleanup_ssh_failure_keeps_the_reservation_through_the_second_proof(self) -> None:
+        launch_window = 2
+
         @contextmanager
         def reservation(*_args: object) -> Generator[None]:
             started = time.monotonic()
             try:
                 yield
             finally:
-                self.assertGreaterEqual(time.monotonic() - started, 4 + mac_linux.GUEST_KILL_GRACE_SECONDS)
+                self.assertGreaterEqual(time.monotonic() - started, launch_window + 4 + mac_linux.GUEST_KILL_GRACE_SECONDS)
                 self.assertEqual(self.trace.read_text().splitlines(), ['probe', 'run', 'cleanup', 'cleanup'])
                 self.assertEqual(subprocess.call(['flock', '-x', '-n', self.run_lock(), 'true']), 0)
 
         configuration = self.registry.with_name('mac_linux.conf')
         _ = configuration.write_text(configuration.read_text().replace('seconds=7', 'seconds=4'))
         with (patch.dict(os.environ, {'FIXTURE_CLEANUP_FAILURE': 'once', 'FIXTURE_RUN_SECONDS': '4'}),
+              patch.object(mac_linux, 'SSH_CONNECT_TIMEOUT_SECONDS', launch_window),
               patch.object(mac_linux, 'mac_linux_reservation', reservation)):
             result = self.route('disconnect-before-copy')
         self.assertIn('fixture cleanup SSH refused the connection', str(result))
@@ -412,6 +457,7 @@ fi
 
     def test_unreachable_guest_uses_the_bound_after_late_ssh_ends(self) -> None:
         duration = 3
+        launch_window = 2
 
         @contextmanager
         def reservation(*_args: object) -> Generator[None]:
@@ -419,13 +465,15 @@ fi
                 yield
             finally:
                 ssh_ended_at = float(self.trace.with_name('ssh-ended').read_text())
-                self.assertGreaterEqual(time.monotonic() - ssh_ended_at, duration + mac_linux.GUEST_KILL_GRACE_SECONDS)
+                self.assertGreaterEqual(time.monotonic() - ssh_ended_at,
+                                        launch_window + duration + mac_linux.GUEST_KILL_GRACE_SECONDS)
                 self.assertEqual(self.trace.read_text().splitlines(), ['probe', 'run', 'cleanup', 'cleanup'])
 
         configuration = self.registry.with_name('mac_linux.conf')
         _ = configuration.write_text(configuration.read_text().replace('seconds=7', f'seconds={duration}'))
         with (patch.dict(os.environ, {'FIXTURE_CLEANUP_FAILURE': 'always', 'FIXTURE_RUN_SECONDS': str(duration),
                                      'FIXTURE_SSH_LAUNCH_DELAY': '1'}),
+              patch.object(mac_linux, 'SSH_CONNECT_TIMEOUT_SECONDS', launch_window),
               patch.object(mac_linux, 'mac_linux_reservation', reservation)):
             reason = self.route('disconnect-before-copy')
         self.assertIn('fixture cleanup SSH refused the connection', str(reason))
@@ -462,7 +510,8 @@ fi
                 return proof
 
             def after_bound(settings: mac_linux.GuestSettings, attempt: str, _ended_at: float) -> mac_linux.GuestEndProof:
-                return finish_guest_run(settings, attempt, time.monotonic() - settings.run_time_limit_seconds - 1)
+                before_bound = time.monotonic() - settings.run_time_limit_seconds - mac_linux.SSH_CONNECT_TIMEOUT_SECONDS
+                return finish_guest_run(settings, attempt, before_bound - 1)
 
             with (patch.object(mac_linux, 'mac_linux_reservation', reservation),
                   patch.object(mac_linux, 'prove_guest_end', prove),
@@ -472,6 +521,38 @@ fi
         self.assertIn('Guest cleanup: ended', str(result))
         self.assertEqual(self.trace.read_text().splitlines(), ['probe', 'run', 'cleanup', 'cleanup', 'cleanup'])
         self.assertEqual(log.getvalue().splitlines(), ['Mac Linux guest run not proven ended; the Mac claim stays held'])
+
+    def test_broken_stderr_keeps_the_reservation_until_proof(self) -> None:
+        events: list[str] = []
+        prove_guest_end = mac_linux.prove_guest_end
+
+        class ClosedStderr(StringIO):
+            @override
+            def write(self, message: str) -> int:
+                events.append('stderr failed')
+                raise BrokenPipeError(message)
+
+        def prove(settings: mac_linux.GuestSettings, attempt: str) -> mac_linux.GuestEndProof:
+            if events == ['reserved']:
+                events.append('pending')
+                return mac_linux.GuestEndProof(mac_linux.GuestEndStatus.PENDING, 'fixture cleanup pending')
+            proof = prove_guest_end(settings, attempt)
+            events.append(proof.status.value)
+            return proof
+
+        @contextmanager
+        def reservation(*_args: object) -> Generator[None]:
+            events.append('reserved')
+            try:
+                yield
+            finally:
+                events.append('released')
+
+        with (patch.object(mac_linux, 'mac_linux_reservation', reservation),
+              patch.object(mac_linux, 'prove_guest_end', prove), redirect_stderr(ClosedStderr())):
+            result = self.route()
+        self.assertIsInstance(result, GateRun)
+        self.assertEqual(events, ['reserved', 'pending', 'stderr failed', 'ended', 'released'])
 
     def test_reachable_cleanup_error_or_unexpected_reply_is_pending(self) -> None:
         settings = mac_linux.read_settings(conf.read(self.registry))

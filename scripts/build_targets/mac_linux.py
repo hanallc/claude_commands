@@ -1,4 +1,7 @@
-"""Run the gate in the Mac's Linux guest."""
+"""Run the gate in the Mac's Linux guest.
+
+If the gate parent and module supervisor die, an escaped descendant can retain the lock and keep the claim held (GUEST_END_PENDING_MESSAGE).
+"""
 from __future__ import annotations
 
 from collections.abc import Generator
@@ -31,8 +34,9 @@ from scripts.production.gate_routes import AllModules, GateJobKind, GateRun, Mod
 
 TARGET = 'mac-linux'
 ORIGIN_MAIN = 'refs/remotes/origin/main'
+SSH_CONNECT_TIMEOUT_SECONDS = 8
 SSH = ('ssh', '-T', '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=yes', '-o', 'ForwardAgent=no',
-       '-o', 'ConnectTimeout=8', '-o', 'ServerAliveInterval=15', '-o', 'ServerAliveCountMax=2')
+       '-o', f'ConnectTimeout={SSH_CONNECT_TIMEOUT_SECONDS}', '-o', 'ServerAliveInterval=15', '-o', 'ServerAliveCountMax=2')
 # Give SSH time to connect and return the result.
 TRANSFER_ALLOWANCE_SECONDS = 120
 GUEST_REF_TIMEOUT_SECONDS = 30
@@ -42,8 +46,10 @@ GUEST_PROOF_RETRY_SECONDS = 0.1
 MISSING_PREREQUISITE_STATUS = 75
 MISSING_PREREQUISITE_MESSAGE = 'Repository lacks these prerequisite commits:'
 GUEST_END_PENDING_STATUS = 76
+GUEST_END_PENDING_MESSAGE = 'Mac Linux guest run not proven ended; the Mac claim stays held'
 RUN_LOCK_PATH = '.git/mac-linux-run.lock'
 RUN_LOCK_FD = 9
+CANCEL_RECORD_PREFIX = 'mac-linux-cancel'
 
 
 class GuestUnavailable(RuntimeError):
@@ -225,8 +231,11 @@ import os
 import stat
 import sys
 
-path, number, shell = sys.argv[1:]
+path, number, shell, mode = sys.argv[1:]
 try:
+    if mode == 'run':
+        with open(f'/proc/{os.getsid(0)}/stat', encoding='utf-8') as session:
+            start_ticks = session.read().rsplit(')', 1)[1].split()[19]
     if os.path.islink(path):
         raise OSError('The guest run lock must not be a symlink.')
     directory, name = os.path.split(path)
@@ -246,12 +255,63 @@ if lock == descriptor:
 else:
     os.dup2(lock, descriptor)
     os.close(lock)
+command = ['bash', '-c', shell]
+if mode == 'run':
+    command = ['setsid', '--wait', *command, 'mac-linux-run', start_ticks]
+os.execvp(command[0], command)
+'''
+
+
+def open_run_lock_command(descriptor: int, shell: str, mode: Literal['run', 'cleanup']) -> str:
+    return shlex.join(('python3', '-I', '-S', '-c', OPEN_RUN_LOCK, RUN_LOCK_PATH, str(descriptor), shell, mode))
+
+
+GUEST_CANCEL_RECORDS = '''\
+import os
+import sys
+import time
+
+mode, prefix, attempt, window, lock_name, descriptor, *arguments = sys.argv[1:]
+if not attempt or any(character not in '0123456789abcdefghijklmnopqrstuvwxyz-' for character in attempt):
+    sys.exit('The guest attempt ID is invalid.')
+window_ns = int(window) * 10**9
+with open('/proc/sys/kernel/random/boot_id', encoding='ascii') as identity:
+    boot_id = identity.read().strip()
+git = os.open('.git', os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+lock = int(descriptor)
+path_stat = os.stat(lock_name, dir_fd=git, follow_symlinks=False)
+if not os.path.samestat(os.fstat(lock), path_stat):
+    sys.exit('The guest run lock path changed.')
+if mode == 'cancel':
+    now = time.clock_gettime_ns(time.CLOCK_BOOTTIME)
+    record = f'{prefix}.{boot_id}.{now}.{attempt}'
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+    os.close(os.open(record, flags, 0o600, dir_fd=git))
+    # An older session cannot start after the launch window.
+    for name in os.listdir(git):
+        fields = name.split('.')
+        if len(fields) == 4 and fields[0] == prefix and fields[2].isdecimal() and name != record:
+            _, boot, written, owner = fields
+            if boot != boot_id or now - int(written) >= window_ns or owner == attempt:
+                os.unlink(name, dir_fd=git)
+    sys.exit(0)
+
+start_ticks, group, shell = arguments
+if any(name.startswith(f'{prefix}.{boot_id}.') and name.endswith(f'.{attempt}') for name in os.listdir(git)):
+    sys.exit('The guest attempt was cancelled.')
+started = int(start_ticks) * 10**9 // os.sysconf('SC_CLK_TCK')
+if time.clock_gettime_ns(time.CLOCK_BOOTTIME) - started >= window_ns:
+    sys.exit('The guest SSH session exceeded the launch window.')
+os.close(git)
+os.ftruncate(lock, 0)
+os.write(lock, f'{group} {attempt}\\n'.encode('ascii'))
 os.execvp('bash', ['bash', '-c', shell])
 '''
 
 
-def open_run_lock_command(descriptor: int, shell: str) -> str:
-    return shlex.join(('python3', '-I', '-S', '-c', OPEN_RUN_LOCK, RUN_LOCK_PATH, str(descriptor), shell))
+def guest_attempt_command(mode: Literal['start', 'cancel'], attempt: str, descriptor: int) -> str:
+    return shlex.join(('python3', '-I', '-S', '-c', GUEST_CANCEL_RECORDS, mode, CANCEL_RECORD_PREFIX, attempt,
+                       str(SSH_CONNECT_TIMEOUT_SECONDS), Path(RUN_LOCK_PATH).name, str(descriptor)))
 
 
 def run_shell(settings: GuestSettings, source: CandidateSource, bootstrap_bytes: int, attempt: str) -> str:
@@ -305,29 +365,24 @@ printf 'update refs/heads/main %s\\nupdate {ORIGIN_MAIN} %s\\n' "$origin_main" "
 git reset --hard -q "$origin_main"
 umask 022
 ./scripts/lib/py "$bootstrap/runner.py" "$bootstrap/request.json"'''
+    start = guest_attempt_command('start', attempt, RUN_LOCK_FD)
     locked_run = f'''set -euo pipefail
 flock -x -n {RUN_LOCK_FD} || {{ printf 'The guest run lock is held.\\n' >&2; exit 1; }}
-lock="/proc/$$/fd/{RUN_LOCK_FD}"
-if [[ -L {RUN_LOCK_PATH} || ! "$lock" -ef {RUN_LOCK_PATH} ]]; then
-    printf 'The guest run lock path changed.\\n' >&2
-    exit 1
-fi
-printf '%s %s\\n' "$BASHPID" {shlex.quote(attempt)} > "$lock"
-exec timeout --signal=KILL {settings.run_time_limit_seconds} bash -c {shlex.quote(checkout)}'''
+exec timeout --signal=KILL {settings.run_time_limit_seconds} {start} "$1" "$BASHPID" {shlex.quote(checkout)}'''
     return guest_shell(settings) + f'''
 umask 077
 mkdir -p -- "$checkout/.git"
 cd "$checkout"
-exec setsid --wait {open_run_lock_command(RUN_LOCK_FD, locked_run)}'''
+exec {open_run_lock_command(RUN_LOCK_FD, locked_run, 'run')}'''
 
 
 def cleanup_shell(settings: GuestSettings, attempt: str) -> str:
+    cancel = guest_attempt_command('cancel', attempt, 8)
     cleanup = f'''set -euo pipefail
 lock="/proc/$$/fd/8"
 prove_end() {{
     flock -x -n 8 || return 1
-    if [[ -L {RUN_LOCK_PATH} || ! "$lock" -ef {RUN_LOCK_PATH} ]]; then
-        printf 'The guest run lock path changed.\\n' >&2
+    if ! {cancel}; then
         exit {GUEST_END_PENDING_STATUS}
     fi
     printf 'ended\\n'
@@ -354,7 +409,7 @@ exit {GUEST_END_PENDING_STATUS}'''
 umask 077
 mkdir -p -- "$checkout/.git"
 cd "$checkout"
-exec {open_run_lock_command(8, cleanup)}'''
+exec {open_run_lock_command(8, cleanup, 'cleanup')}'''
 
 
 class GuestEndStatus(StrEnum):
@@ -385,7 +440,7 @@ def prove_guest_end(settings: GuestSettings, attempt: str) -> GuestEndProof:
 
 
 def finish_guest_run(settings: GuestSettings, attempt: str, ssh_ended_at: float) -> GuestEndProof:
-    bound = ssh_ended_at + settings.run_time_limit_seconds + GUEST_KILL_GRACE_SECONDS
+    bound = ssh_ended_at + SSH_CONNECT_TIMEOUT_SECONDS + settings.run_time_limit_seconds + GUEST_KILL_GRACE_SECONDS
     first_failure = ''
     interruption: KeyboardInterrupt | None = None
     while True:
@@ -401,7 +456,8 @@ def finish_guest_run(settings: GuestSettings, attempt: str, ssh_ended_at: float)
                 break
             if not first_failure:
                 first_failure = proof.detail
-                print('Mac Linux guest run not proven ended; the Mac claim stays held', file=sys.stderr, flush=True)
+                with suppress(OSError, ValueError):
+                    print(GUEST_END_PENDING_MESSAGE, file=sys.stderr, flush=True)
             time.sleep(remaining if proof.status is GuestEndStatus.UNREACHABLE else GUEST_PROOF_RETRY_SECONDS)
         except KeyboardInterrupt as error:
             interruption = error
