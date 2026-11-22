@@ -9,6 +9,8 @@ import os
 import signal
 import time
 import unittest
+from collections.abc import Generator
+from contextlib import contextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import cast, override
@@ -28,6 +30,19 @@ from scripts.direct.verify_hold_wait_test_support import (
 
 SIGNAL_EXIT_SECONDS = 5
 _SIGNAL_FIXTURE_PARENT = Path("/dev/shm") if Path("/dev/shm").is_dir() else None
+
+
+@contextmanager
+def full_output_pipe() -> Generator[int]:
+    read_fd, write_fd = os.pipe()
+    try:
+        contents = b"x" * fcntl.fcntl(write_fd, fcntl.F_GETPIPE_SZ)
+        written = os.write(write_fd, contents)
+        assert written == len(contents)
+        yield write_fd
+    finally:
+        os.close(read_fd)
+        os.close(write_fd)
 
 
 class VerifyHoldWaitTests(VerifyHoldWaitFixture):
@@ -138,14 +153,48 @@ placement_once
         self.assertEqual(status, 130)
         self.assertFalse(Path(f"/proc/{placement_pid}").exists())
 
+    def interrupted_exit_command(self, token: Path) -> list[str]:
+        harness = shell_functions(VERIFY, "run_log_tee", "start_run_log", "verify_exit") + r'''
+RUN_LOG=$1 RUN_LOG_PIDS=() CMD=test held_token=$2 VERIFY_START_DIR=$3
+PY=$VERIFY_START_DIR/../lib/py
+interrupt_hold_wait() { :; }
+verify_cleanup() {
+    rm -- "$held_token"
+    printf '%s\n' "$1"
+}
+finish_verify_run() { :; }
+start_run_log
+exec 2>/dev/null
+verify_exit 0 'printf output'
+'''
+        return ["bash", "-c", harness, "test", str(self.fixture.root / "run.log"), str(token), str(VERIFY.parent)]
+
+    def test_exit_reports_interruption_when_the_log_cannot_report(self) -> None:
+        token = self.fixture.root / "held-token"
+        token.touch()
+        result = subprocess.run(self.interrupted_exit_command(token),
+                                env=verify_test_environment(), capture_output=True, text=True,
+                                check=False, timeout=SIGNAL_EXIT_SECONDS)
+        self.assertEqual(result.returncode, 128, result.stdout + result.stderr)
+        self.assertEqual(result.stdout, "interrupted\n")
+        self.assertEqual(result.stderr, "verify.sh: interrupted before test completed (status 128).\n")
+
+    def test_interrupted_exit_finishes_with_full_stderr(self) -> None:
+        token = self.fixture.root / "held-token"
+        token.touch()
+        with full_output_pipe() as write_fd:
+            result = subprocess.run(self.interrupted_exit_command(token), env=verify_test_environment(),
+                                    stdout=subprocess.PIPE, stderr=write_fd, text=True,
+                                    check=False, timeout=SIGNAL_EXIT_SECONDS)
+        self.assertEqual(result.returncode, 128, result.stdout)
+        self.assertEqual(result.stdout, "interrupted\n")
+        self.assertFalse(token.exists())
+
     def test_hup_reaps_log_readers_when_the_output_pipe_is_full(self) -> None:
         # Fill the consumer's pipe before starting verify's real log helpers.
         # No consumer drains it until after shutdown, so EOF on tee's input
         # cannot finish a pending output write.
-        read_fd, write_fd = os.pipe()
-        try:
-            capacity = fcntl.fcntl(write_fd, fcntl.F_GETPIPE_SZ)
-            _ = os.write(write_fd, b"x" * capacity)
+        with full_output_pipe() as write_fd:
             log = self.fixture.root / "blocked-run.log"
             harness = shell_functions(VERIFY, "run_log_tee", "start_run_log", "stop_interrupted_run_log") + r'''
 RUN_LOG=$1 RUN_LOG_PIDS=()
@@ -174,9 +223,6 @@ read -r command
                     except ProcessLookupError:
                         pass
                     _ = process.communicate(timeout=5)
-        finally:
-            os.close(read_fd)
-            os.close(write_fd)
 
     def test_interrupted_verification_removes_its_registered_call(self) -> None:
         self.hold()

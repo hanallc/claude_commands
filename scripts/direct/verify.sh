@@ -2086,9 +2086,19 @@ cancel_tree_run() {
     if [[ -s "$TREE_WATCH_DIR/fired.path" ]]; then changed_path=" ($(< "$TREE_WATCH_DIR/fired.path"))"; fi
     printf 'verify.sh: cancelled — the tree changed while %s ran%s, so this result would be stale. Resubmit the %s when your edits are done.\n' "$CMD" "$changed_path" "$CMD" >&2
     note_event cancelled "${RUN_STARTED}" "$(( SECONDS - RUN_STARTED ))" "" 0 "$TREE_CHANGED_STATUS"
-    verify_helper "$BUILD_FOLDERS_SCRIPT" remove "$TREE_WATCH_DIR"
-    TREE_WATCH_DIR=""
     exit "$TREE_CHANGED_STATUS"
+}
+
+remove_tree_watch() {
+    [[ -n "$TREE_WATCH_DIR" ]] || return 0
+    local folder="$TREE_WATCH_DIR" remove_status=0
+    TREE_WATCH_DIR=""
+    verify_helper "$BUILD_FOLDERS_SCRIPT" remove "$folder" || remove_status=$?
+    # Status 1 leaves the folder for collection. Status 2 already has a diagnostic.
+    if (( remove_status > 2 )); then
+        printf 'verify.sh: cannot remove the tree watch folder %s (status %s).\n' "$folder" "$remove_status" >&2
+    fi
+    return 0
 }
 
 start_tree_watch() {
@@ -2096,7 +2106,7 @@ start_tree_watch() {
     [[ -z "$TREE_WATCH_PID" ]] || return 0
     TREE_WATCH_DIR="$(verify_helper "$BUILD_FOLDERS_SCRIPT" tool --tool verify-tree --owner-pid "$$")"
     set_verdict_keys --watch-start "$TREE_WATCH_DIR/start"
-    [[ -s "$TREE_WATCH_DIR/start" ]] || { verify_helper "$BUILD_FOLDERS_SCRIPT" remove "$TREE_WATCH_DIR"; TREE_WATCH_DIR=""; return 0; }
+    [[ -s "$TREE_WATCH_DIR/start" ]] || { remove_tree_watch; return 0; }
     local scope=()
     if [[ "$CMD" == test ]]; then if [[ -n "${ARGS[0]}" ]]; then scope=(--package "${ARGS[0]}"); fi; fi
     trap 'cancel_tree_run' USR2
@@ -2108,8 +2118,7 @@ start_tree_watch() {
 finish_tree_watch() {
     stop_tree_watch
     cancel_tree_run
-    [[ -z "$TREE_WATCH_DIR" ]] || verify_helper "$BUILD_FOLDERS_SCRIPT" remove "$TREE_WATCH_DIR"
-    TREE_WATCH_DIR=""
+    remove_tree_watch
 }
 
 # Match the checkout selection for Python on standard input.
@@ -4251,6 +4260,7 @@ run_log_tee() {
 start_run_log() {
     exec > >(run_log_tee)
     RUN_LOG_PIDS+=("$!")
+    exec {RUN_LOG_STDERR}>&2
     exec 2> >(run_log_tee >&2)
     RUN_LOG_PIDS+=("$!")
 }
@@ -4316,8 +4326,7 @@ verify_cleanup() {
     if [[ -n "${DOC_COPY_OWNER_PID:-}" ]]; then step_close_checkout stop; fi
     if [[ -n "${COPY_RUN_WATCH_PID:-}" ]]; then collect_child "$COPY_RUN_WATCH_PID" TERM; fi
     stop_tree_watch
-    [[ -z "$TREE_WATCH_DIR" ]] || verify_helper "$BUILD_FOLDERS_SCRIPT" remove "$TREE_WATCH_DIR"
-    TREE_WATCH_DIR=""
+    remove_tree_watch
     lint_copy_drop
     if [[ "$STEP_RECORD_ACTIVE" == 1 ]]; then
         publish_step_state waiting_hold || true
@@ -4363,16 +4372,23 @@ verify_cleanup() {
 verify_exit() {
     EXIT_STATUS=$1
     set +e
+    local outcome=error
     if (( EXIT_STATUS == 0 )) && [[ "$2" != exit && "$2" != "exit "* ]]; then
         EXIT_STATUS=128
+        outcome=interrupted
+        trap '' PIPE
         interrupt_hold_wait
-        verify_cleanup interrupted
     elif (( EXIT_STATUS == 0 )); then
-        verify_cleanup completed
-    else
-        verify_cleanup error
+        outcome=completed
     fi
+    verify_cleanup "$outcome"
     finish_verify_run "$EXIT_STATUS"
+    if [[ "$outcome" == interrupted ]]; then
+        # A full stderr pipe must not delay release of the source snapshot lease.
+        VERIFY_PY_HELPER=VERIFY_EXIT_DIAGNOSTIC "$PY" "$VERIFY_START_DIR/../lib/time_limit.py" 1 0 \
+            printf 'verify.sh: interrupted before %s completed (status %s).\n' "$CMD" "$EXIT_STATUS" \
+            >&"${RUN_LOG_STDERR:-2}" 2>/dev/null
+    fi
     exit "$EXIT_STATUS"
 }
 trap 'verify_exit "$?" "$BASH_COMMAND"' EXIT
