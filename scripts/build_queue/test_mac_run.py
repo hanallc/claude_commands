@@ -2,7 +2,7 @@
 from collections.abc import Callable, Generator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack, contextmanager, redirect_stderr, redirect_stdout
-from dataclasses import replace
+from dataclasses import dataclass, replace
 import errno
 import fcntl
 from io import StringIO
@@ -15,7 +15,7 @@ import sys
 import tempfile
 from threading import Event
 import time
-from typing import cast, final, override
+from typing import TypedDict, cast, final, override
 import unittest
 from unittest import mock
 
@@ -25,7 +25,7 @@ from scripts.build_queue.admission_records import RepositoryIdentity
 from scripts.build_queue import admission_wire as wire
 from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, StepJob
 from scripts.buildlog import repository, store, sync as buildlog_sync
-from scripts.build_targets import build_targets, target_config
+from scripts.build_targets import build_targets, mac_linux, target_config
 from scripts.copies import copies
 from scripts.direct import phase_wait_holder
 from scripts.lib import conf, process_start as process_identity
@@ -36,6 +36,46 @@ from scripts.production.gate_routes import SuiteMode
 ORIGIN = "https://github.com/hanallc/claude_commands.git"
 REPOSITORY_KEY = ORIGIN.removesuffix(".git")
 HANA_ORIGIN = "https://fixture.invalid/team/hana.git"
+
+
+class FixtureArmedGuestRecord(TypedDict):
+    attempt: str
+    boot_id: str
+    deadline_ns: int
+    machine_id: str
+
+
+@dataclass(frozen=True)
+class FixtureArmedGuestAttempt:
+    attempt: str
+    boot_id: str
+    deadline_ns: int
+    machine_id: str
+
+    def to_record(self) -> FixtureArmedGuestRecord:
+        return {"attempt": self.attempt, "boot_id": self.boot_id,
+                "deadline_ns": self.deadline_ns, "machine_id": self.machine_id}
+
+    @classmethod
+    def from_record(cls, record: FixtureArmedGuestRecord) -> "FixtureArmedGuestAttempt":
+        try:
+            return cls(**record)
+        except TypeError as error:
+            raise ValueError("The armed guest record is invalid") from error
+
+
+ARMED_GUEST_RECORD: FixtureArmedGuestRecord = {
+    "attempt": "fixture-guest",
+    "boot_id": "e68d2026-ec82-4b04-bb90-67d1481df9e3",
+    "deadline_ns": 123,
+    "machine_id": "c2b039b345b84686bfe5d660ab70caba",
+}
+
+
+class FixtureGuestEndUnproven(mac_linux.GuestUnavailable):
+    def __init__(self, message: str, armed: FixtureArmedGuestAttempt) -> None:
+        self.armed: FixtureArmedGuestAttempt = armed
+        super().__init__(message)
 
 
 @final
@@ -81,6 +121,9 @@ class MacRunTests(unittest.TestCase):
         _ = self.enterContext(mock.patch.object(copies, "remote_registry", return_value=self.root / "remote-registry"))
         _ = self.enterContext(redirect_stdout(StringIO()))
         self.paths = claim_state.state_paths("mac")
+        if not hasattr(mac_linux, "prove_kept_guest_end"):
+            _ = self.enterContext(mock.patch.object(mac_linux, "ArmedGuestAttempt", FixtureArmedGuestAttempt))
+            _ = self.enterContext(mock.patch.object(mac_linux, "GuestEndUnproven", FixtureGuestEndUnproven, create=True))
 
     def repository(self, name: str, *, origin: str = "") -> Path:
         path = self.root / name
@@ -103,13 +146,13 @@ class MacRunTests(unittest.TestCase):
 
     def test_guest_and_native_share_one_claim_and_another_repository_can_run(self) -> None:
         with ExitStack() as guest:
-            _ = guest.enter_context(mac_run.held(self.checkout, "mac", SuiteMode.GATE, StepJob("test-all")))
+            _ = guest.enter_context(mac_run.held(self.checkout, "mac", SuiteMode.GATE, StepJob("test-all"), attempt="fixture-attempt"))
             claim, = claim_state.read_claims(self.paths)
             self.assertEqual(claim.scope, claim_state.RepositoryScope("checkout", REPOSITORY_KEY, 1))
             self.assertEqual(claim.record["what"], "mac-linux test-all")
             self.assertEqual(claim.record["worktree"], str(self.checkout))
             with self.assertRaisesRegex(mac_run.MacRunRefused, "busy with mac-linux test-all"):
-                with mac_run.held(self.checkout, "mac", SuiteMode.GATE, GATE_JOB_NOT_RECORDED):
+                with mac_run.held(self.checkout, "mac", SuiteMode.GATE, GATE_JOB_NOT_RECORDED, attempt="fixture-attempt"):
                     self.fail("A second guest run took the same place")
 
             other = self.native_claim(self.repository("hana"))
@@ -131,7 +174,7 @@ class MacRunTests(unittest.TestCase):
             waited.assert_called_once()
 
         with self.assertRaisesRegex(mac_run.MacRunRefused, "busy with native Mac run"):
-            with mac_run.held(self.checkout, "mac", SuiteMode.GATE, GATE_JOB_NOT_RECORDED):
+            with mac_run.held(self.checkout, "mac", SuiteMode.GATE, GATE_JOB_NOT_RECORDED, attempt="fixture-attempt"):
                 self.fail("The guest took the native run's place")
         self.assertEqual(mac_test.command_release(native, self.paths), 0)
         self.assertEqual(claim_state.read_claims(self.paths), ())
@@ -151,7 +194,7 @@ class MacRunTests(unittest.TestCase):
         self.assertEqual(mac_test.free_now(self.paths, settings, self.checkout, mac_kind=mac_test.MacClaimKind.GUEST),
                          "busy")
         with self.assertRaisesRegex(mac_run.MacRunRefused, "busy with native Mac run"):
-            with mac_run.held(self.checkout, "mac", SuiteMode.GATE, GATE_JOB_NOT_RECORDED):
+            with mac_run.held(self.checkout, "mac", SuiteMode.GATE, GATE_JOB_NOT_RECORDED, attempt="fixture-attempt"):
                 self.fail("The quoted origin bypassed the native claim")
 
     def test_legacy_claim_blocks_native_and_guest_claims_with_or_without_its_checkout(self) -> None:
@@ -183,7 +226,7 @@ class MacRunTests(unittest.TestCase):
                 self.assertEqual(mac_test.free_now(self.paths, settings, other, mac_kind=mac_test.MacClaimKind.GUEST),
                                  "busy")
                 with self.assertRaisesRegex(mac_run.MacRunRefused, "busy with native Mac run"):
-                    with mac_run.held(other, "mac", SuiteMode.GATE, GATE_JOB_NOT_RECORDED):
+                    with mac_run.held(other, "mac", SuiteMode.GATE, GATE_JOB_NOT_RECORDED, attempt="fixture-attempt"):
                         self.fail("The guest bypassed the saved claim")
                 self.assertEqual(path.read_bytes(), saved)
         self.assertEqual(mac_test.command_release(old, self.paths), 0)
@@ -198,7 +241,7 @@ class MacRunTests(unittest.TestCase):
             placement.PlacementDestination("mac", "mac", "fixture-mac", old_scope),
             execution_identity.SourceKeyUnavailable("The fixture has no source key"),
             placement.SubmittingOwner("fixture-host", waiting.pid, start.start), NoOwningSession(), 0)
-        with mac_run.held(self.checkout, "mac", SuiteMode.GATE, GATE_JOB_NOT_RECORDED):
+        with mac_run.held(self.checkout, "mac", SuiteMode.GATE, GATE_JOB_NOT_RECORDED, attempt="fixture-attempt"):
             self.assertEqual(mac_test.command_claim(waiting, self.paths, watch_claim=False, assignment=assignment), 11)
 
         resolve = repository.mac_source_repository
@@ -403,11 +446,11 @@ sys.exit(71)
                                 str(worktree)], check=True)
         scopes = tuple(claim_state.target_claim_scope(self.paths, str(path)) for path in worktrees)
         self.assertEqual(scopes, (claim_state.RepositoryScope(".claude", REPOSITORY_KEY),) * 2)
-        with mac_run.held(worktrees[0], "mac", SuiteMode.GATE, GATE_JOB_NOT_RECORDED):
+        with mac_run.held(worktrees[0], "mac", SuiteMode.GATE, GATE_JOB_NOT_RECORDED, attempt="fixture-attempt"):
             with self.assertRaisesRegex(mac_run.MacRunRefused, "busy with mac-linux"):
-                with mac_run.held(worktrees[1], "mac", SuiteMode.GATE, GATE_JOB_NOT_RECORDED):
+                with mac_run.held(worktrees[1], "mac", SuiteMode.GATE, GATE_JOB_NOT_RECORDED, attempt="fixture-attempt"):
                     self.fail("The second guest took the shared slot")
-        with mac_run.held(worktrees[1], "mac", SuiteMode.GATE, GATE_JOB_NOT_RECORDED):
+        with mac_run.held(worktrees[1], "mac", SuiteMode.GATE, GATE_JOB_NOT_RECORDED, attempt="fixture-attempt"):
             self.assertEqual(len(claim_state.read_claims(self.paths)), 1)
 
     def test_mac_local_origins_follow_the_upstream_repository(self) -> None:
@@ -424,7 +467,7 @@ sys.exit(71)
         self.assertEqual(mac_test.command_claim(native, self.paths, watch_claim=False), 0)
         self.addCleanup(mac_test.command_release, native, self.paths)
         with self.assertRaises(mac_run.MacRunRefused), mac_run.held(
-                self.checkout, "mac", SuiteMode.GATE, GATE_JOB_NOT_RECORDED):
+                self.checkout, "mac", SuiteMode.GATE, GATE_JOB_NOT_RECORDED, attempt="fixture-attempt"):
             self.fail("The clone exceeded the repository limit")
 
     def test_mac_capacity_uses_only_the_shared_git_origin_and_rewrites(self) -> None:
@@ -457,7 +500,7 @@ sys.exit(71)
         for checkout in (self.checkout, linked):
             with self.subTest(checkout=checkout.name):
                 with self.assertRaisesRegex(mac_run.MacRunRefused, "busy with native Mac run"):
-                    with mac_run.held(checkout, "mac", SuiteMode.GATE, GATE_JOB_NOT_RECORDED):
+                    with mac_run.held(checkout, "mac", SuiteMode.GATE, GATE_JOB_NOT_RECORDED, attempt="fixture-attempt"):
                         self.fail("A worktree override bypassed the repository limit")
                 self.assertEqual(claim_state.target_claim_scope(self.paths, str(checkout)),
                                  claim_state.RepositoryScope(".claude", REPOSITORY_KEY))
@@ -488,7 +531,7 @@ sys.exit(71)
                 self.assertEqual(claim_state.target_claim_scope(self.paths, str(checkout)),
                                  claim_state.RepositoryScope(name, "https://github.com/team/hana"))
                 with self.assertRaisesRegex(mac_run.MacRunRefused, "busy with native Mac run"):
-                    with mac_run.held(checkout, "mac", SuiteMode.GATE, GATE_JOB_NOT_RECORDED):
+                    with mac_run.held(checkout, "mac", SuiteMode.GATE, GATE_JOB_NOT_RECORDED, attempt="fixture-attempt"):
                         self.fail("An alias bypassed the repository limit")
 
     def test_separate_git_directory_with_a_relative_origin_shares_capacity(self) -> None:
@@ -513,13 +556,13 @@ sys.exit(71)
                 self.assertEqual(claim_state.target_claim_scope(self.paths, str(checkout)),
                                  claim_state.RepositoryScope(".claude", REPOSITORY_KEY))
                 with self.assertRaisesRegex(mac_run.MacRunRefused, "busy with native Mac run"):
-                    with mac_run.held(checkout, "mac", SuiteMode.GATE, GATE_JOB_NOT_RECORDED):
+                    with mac_run.held(checkout, "mac", SuiteMode.GATE, GATE_JOB_NOT_RECORDED, attempt="fixture-attempt"):
                         self.fail("The guest took the native run's place")
 
         _ = subprocess.run(["git", "-C", str(separate), "config", "--unset", "core.worktree"], check=True)
         for checkout in (separate, self.checkout):
             with self.assertRaisesRegex(mac_run.MacRunRefused, "busy with native Mac run"):
-                with mac_run.held(checkout, "mac", SuiteMode.GATE, GATE_JOB_NOT_RECORDED):
+                with mac_run.held(checkout, "mac", SuiteMode.GATE, GATE_JOB_NOT_RECORDED, attempt="fixture-attempt"):
                     self.fail("A clone took the origin repository's slot")
         self.assertEqual(mac_test.command_release(native, self.paths), 0)
         config = eligibility.OffloadConfig(True, eligibility.SshConnectionSettings("fixture-mac", 1, 1),
@@ -531,12 +574,12 @@ sys.exit(71)
             self.assertEqual(eligibility.mac_step_eligibility(config, checkout, "hana", "nextest", "mac"),
                              eligibility.IneligibleMacStep("repo"))
         linked_claim = self.native_claim(linked)
-        with mac_run.held(separate, "mac", SuiteMode.GATE, GATE_JOB_NOT_RECORDED):
+        with mac_run.held(separate, "mac", SuiteMode.GATE, GATE_JOB_NOT_RECORDED, attempt="fixture-attempt"):
             self.assertEqual(mac_test.command_claim(linked_claim, self.paths, watch_claim=False), 11)
         self.assertEqual(mac_test.command_claim(linked_claim, self.paths, watch_claim=False), 0)
         self.addCleanup(mac_test.command_release, linked_claim, self.paths)
         with self.assertRaisesRegex(mac_run.MacRunRefused, "busy with native Mac run"):
-            with mac_run.held(self.repo, "mac", SuiteMode.GATE, GATE_JOB_NOT_RECORDED):
+            with mac_run.held(self.repo, "mac", SuiteMode.GATE, GATE_JOB_NOT_RECORDED, attempt="fixture-attempt"):
                 self.fail("The origin repository bypassed the whole-Mac claim")
 
     def test_mac_origin_takes_precedence_over_borrowed_objects(self) -> None:
@@ -772,7 +815,7 @@ sys.exit(71)
         def claim_guest() -> None:
             self.assertTrue(retiring.wait(3))
             with self.assertRaisesRegex(mac_run.MacRunRefused, "busy with replacement"):
-                with mac_run.held(self.checkout, "mac", SuiteMode.GATE, GATE_JOB_NOT_RECORDED):
+                with mac_run.held(self.checkout, "mac", SuiteMode.GATE, GATE_JOB_NOT_RECORDED, attempt="fixture-attempt"):
                     self.fail("The guest took the shared slot")
 
         def retire(path: Path, missing_ok: bool = False) -> None:
@@ -1876,7 +1919,7 @@ with patch.object(Path, "unlink", interrupt_unlink), patch.object(Path, "replace
     def test_guest_refuses_a_mirror_name_with_a_tab_before_writing_state(self) -> None:
         checkout = self.repository("with\ta-tab")
         with self.assertRaises(mac_run.MacRunRefused):
-            with mac_run.held(checkout, "mac", SuiteMode.GATE, GATE_JOB_NOT_RECORDED):
+            with mac_run.held(checkout, "mac", SuiteMode.GATE, GATE_JOB_NOT_RECORDED, attempt="fixture-attempt"):
                 self.fail("The guest used an invalid mirror name")
         self.assertFalse(self.paths.directory.exists())
 
@@ -1889,14 +1932,14 @@ with patch.object(Path, "unlink", interrupt_unlink), patch.object(Path, "replace
 
         self.assertEqual(mac_test.free_now(self.paths, settings, self.checkout, mac_kind=mac_test.MacClaimKind.GUEST),
                          "free")
-        with mac_run.held(self.checkout, "mac", SuiteMode.GATE, GATE_JOB_NOT_RECORDED):
+        with mac_run.held(self.checkout, "mac", SuiteMode.GATE, GATE_JOB_NOT_RECORDED, attempt="fixture-attempt"):
             self.assertEqual({claim.scope for claim in claim_state.read_claims(self.paths)},
                              {claim_state.RepositoryScope(".claude", REPOSITORY_KEY),
                               claim_state.RepositoryScope("checkout", "git-dir:" + str(self.checkout / ".git"), 1)})
             self.assertEqual(mac_test.free_now(self.paths, settings, self.checkout, mac_kind=mac_test.MacClaimKind.GUEST),
                              "busy")
             with self.assertRaises(mac_run.MacRunRefused):
-                with mac_run.held(self.checkout, "mac", SuiteMode.GATE, GATE_JOB_NOT_RECORDED):
+                with mac_run.held(self.checkout, "mac", SuiteMode.GATE, GATE_JOB_NOT_RECORDED, attempt="fixture-attempt"):
                     self.fail("The guest exceeded the checkout's limit")
 
     def test_guest_probe_checks_failed_mac_probe(self) -> None:
@@ -1923,7 +1966,7 @@ with patch.object(Path, "unlink", interrupt_unlink), patch.object(Path, "replace
 
                 if first == "native":
                     start_native()
-                _ = claims.enter_context(mac_run.held(self.checkout, "mac", SuiteMode.GATE, GATE_JOB_NOT_RECORDED))
+                _ = claims.enter_context(mac_run.held(self.checkout, "mac", SuiteMode.GATE, GATE_JOB_NOT_RECORDED, attempt="fixture-attempt"))
                 if first == "guest":
                     guest, = claim_state.read_claims(self.paths)
                     self.assertEqual(guest.scope, claim_state.RepositoryScope("checkout", REPOSITORY_KEY, 2))
@@ -1931,7 +1974,7 @@ with patch.object(Path, "unlink", interrupt_unlink), patch.object(Path, "replace
                 self.assertEqual({claim.scope for claim in claim_state.read_claims(self.paths)},
                                  {scope, claim_state.RepositoryScope("checkout", REPOSITORY_KEY, 2)})
                 with self.assertRaises(mac_run.MacRunRefused):
-                    with mac_run.held(self.checkout, "mac", SuiteMode.GATE, GATE_JOB_NOT_RECORDED):
+                    with mac_run.held(self.checkout, "mac", SuiteMode.GATE, GATE_JOB_NOT_RECORDED, attempt="fixture-attempt"):
                         self.fail("A third run exceeded the configured limit")
             self.assertEqual(claim_state.read_claims(self.paths), ())
 
@@ -1942,7 +1985,7 @@ with patch.object(Path, "unlink", interrupt_unlink), patch.object(Path, "replace
             with self.subTest(ends_first=ends_first), ExitStack() as claims:
                 guests = [claims.enter_context(ExitStack()) for _ in range(2)]
                 for guest in guests:
-                    _ = guest.enter_context(mac_run.held(self.checkout, "mac", SuiteMode.GATE, GATE_JOB_NOT_RECORDED))
+                    _ = guest.enter_context(mac_run.held(self.checkout, "mac", SuiteMode.GATE, GATE_JOB_NOT_RECORDED, attempt="fixture-attempt"))
                 self.assertEqual({claim.scope for claim in claim_state.read_claims(self.paths)},
                                  {claim_state.RepositoryScope("checkout", REPOSITORY_KEY, slot) for slot in (1, 2)})
                 native = self.native_claim(self.checkout)
@@ -1960,7 +2003,7 @@ with patch.object(Path, "unlink", interrupt_unlink), patch.object(Path, "replace
                 self.assertEqual(mac_test.free_now(self.paths, settings, self.checkout), "busy")
                 self.assertEqual(mac_test.free_now(self.paths, settings, self.checkout, mac_kind=mac_test.MacClaimKind.GUEST),
                                  "free")
-                with mac_run.held(self.checkout, "mac", SuiteMode.GATE, GATE_JOB_NOT_RECORDED):
+                with mac_run.held(self.checkout, "mac", SuiteMode.GATE, GATE_JOB_NOT_RECORDED, attempt="fixture-attempt"):
                     self.assertEqual(len(claim_state.read_claims(self.paths)), 2)
             self.assertEqual(claim_state.read_claims(self.paths), ())
 
@@ -1973,7 +2016,7 @@ with patch.object(Path, "unlink", interrupt_unlink), patch.object(Path, "replace
         original, = claim_state.read_claims(self.paths)
         original_data = original.path.read_bytes()
 
-        with mac_run.held(self.repository("hana", origin=HANA_ORIGIN), "mac", SuiteMode.GATE, GATE_JOB_NOT_RECORDED):
+        with mac_run.held(self.repository("hana", origin=HANA_ORIGIN), "mac", SuiteMode.GATE, GATE_JOB_NOT_RECORDED, attempt="fixture-attempt"):
             claims = {claim.scope: claim for claim in claim_state.read_claims(self.paths)}
             numbered, = [claim for scope, claim in claims.items()
                          if isinstance(scope, claim_state.RepositoryScope) and scope.name == "hana" and scope.slot == 2]
@@ -1986,7 +2029,7 @@ with patch.object(Path, "unlink", interrupt_unlink), patch.object(Path, "replace
         with (self.root / "build_folders.conf").open("a") as settings:
             _ = settings.write("# whole: 1..\nslots.fixture-mac.hana.max=2\n")
         other = self.native_claim(self.repository("hana.slot-2"))
-        with mac_run.held(self.repository("hana", origin=HANA_ORIGIN), "mac", SuiteMode.GATE, GATE_JOB_NOT_RECORDED):
+        with mac_run.held(self.repository("hana", origin=HANA_ORIGIN), "mac", SuiteMode.GATE, GATE_JOB_NOT_RECORDED, attempt="fixture-attempt"):
             claim, = claim_state.read_claims(self.paths)
             legacy = claim.path.with_name("hana.slot-2.json")
             record = claim.record.copy()
@@ -2006,12 +2049,12 @@ with patch.object(Path, "unlink", interrupt_unlink), patch.object(Path, "replace
         _ = self.paths.block.write_text("invalid block\n")
         output = StringIO()
         with redirect_stdout(output), self.assertRaisesRegex(mac_run.MacRunRefused, "state unreadable"):
-            with mac_run.held(self.checkout, "mac", SuiteMode.GATE, GATE_JOB_NOT_RECORDED):
+            with mac_run.held(self.checkout, "mac", SuiteMode.GATE, GATE_JOB_NOT_RECORDED, attempt="fixture-attempt"):
                 self.fail("A guest started with unreadable state")
         self.assertEqual(output.getvalue(), "")
 
     def test_mac_activity_watcher_leaves_guest_claim_for_its_holder(self) -> None:
-        with mac_run.held(self.checkout, "mac", SuiteMode.GATE, GATE_JOB_NOT_RECORDED):
+        with mac_run.held(self.checkout, "mac", SuiteMode.GATE, GATE_JOB_NOT_RECORDED, attempt="fixture-attempt"):
             claim, = claim_state.read_claims(self.paths)
             config = mac_test.MacTestConfig("", "", "", "", 1, 1, 1, 1, 1)
             with mock.patch.object(mac_test, "check_mac_activity", return_value=mac_test.MacIdle()) as probe:
@@ -2020,17 +2063,128 @@ with patch.object(Path, "unlink", interrupt_unlink), patch.object(Path, "replace
             self.assertEqual(claim_state.read_claims(self.paths), (claim,))
         self.assertEqual(claim_state.read_claims(self.paths), ())
 
+    def keep_guest_claim(self) -> claim_state.HeldClaim:
+        armed = mac_linux.ArmedGuestAttempt.from_record(ARMED_GUEST_RECORD)
+        failure = mac_linux.GuestEndUnproven("The guest end is unproven", armed)
+        with self.assertRaises(mac_linux.GuestEndUnproven) as raised:
+            with mac_run.held(self.checkout, "mac", SuiteMode.GATE, GATE_JOB_NOT_RECORDED,
+                              attempt=ARMED_GUEST_RECORD["attempt"]):
+                raise failure
+        self.assertIs(raised.exception, failure)
+        claim, = claim_state.read_claims(self.paths)
+        self.assertEqual(claim.record.get("guest_armed"), ARMED_GUEST_RECORD)
+        return claim
+
+    def test_guest_claim_records_the_attempt_and_releases_on_other_exits(self) -> None:
+        def run() -> None:
+            with mac_run.held(self.checkout, "mac", SuiteMode.GATE, GATE_JOB_NOT_RECORDED, attempt="given-attempt"):
+                claim, = claim_state.read_claims(self.paths)
+                identity = claim_state.claim_identity(claim.record)
+                self.assertTrue(identity.claim_id.startswith(mac_test.MAC_LINUX_CLAIM_ID_PREFIX))
+                self.assertEqual(identity.attempt, "given-attempt")
+                if failure:
+                    raise RuntimeError("fixture run failed")
+
+        for failure in (False, True):
+            with self.subTest(failure=failure):
+                if failure:
+                    with self.assertRaisesRegex(RuntimeError, "fixture run failed"):
+                        run()
+                else:
+                    run()
+                self.assertEqual(claim_state.read_claims(self.paths), ())
+
+    def test_unproven_guest_claim_blocks_the_next_guest_attempt(self) -> None:
+        claim = self.keep_guest_claim()
+        with mock.patch.object(mac_linux, "prove_kept_guest_end", create=True,
+                               return_value=mac_linux.GuestEndPending("guest offline")) as prove:
+            with self.assertRaisesRegex(mac_run.MacRunRefused, "needs cleanup.*guest offline"):
+                with mac_run.held(self.checkout, "mac", SuiteMode.GATE, GATE_JOB_NOT_RECORDED, attempt="next-guest"):
+                    self.fail("The next guest started without proof")
+        prove.assert_called_once_with(mac_linux.ArmedGuestAttempt.from_record(ARMED_GUEST_RECORD))
+        self.assertEqual(claim_state.read_claims(self.paths), (claim,))
+
+    def test_generic_cleanup_and_takeover_keep_guest_claim_after_owner_ends(self) -> None:
+        claim = self.keep_guest_claim()
+        with mock.patch.object(process_identity, "process_start", return_value=process_identity.Started("new-start")):
+            with claim_state.locked(self.paths.lock):
+                self.assertEqual(mac_test.live_claims(self.paths), (claim,))
+            identity = claim_state.claim_identity(claim.record)
+            self.assertEqual(tuple(claim_state.read_wait_reservations(self.paths, identity, claim.path)), ())
+            self.assertIsInstance(mac_test.release_exact_claims(self.paths, claim.record["pid"], identity, ""),
+                                  mac_test.ClaimReleaseRefused)
+            waiting = self.native_claim(self.checkout)
+            waiting.remote = "fixture-mac"
+            self.assertEqual(mac_test.command_claim(waiting, self.paths, watch_claim=False), 11)
+        self.assertEqual(claim_state.read_claims(self.paths), (claim,))
+
+    def test_proven_guest_end_releases_the_exact_claim_once(self) -> None:
+        _ = self.keep_guest_claim()
+
+        def prove(armed: mac_linux.ArmedGuestAttempt) -> mac_linux.GuestEndProven:
+            self.assertEqual(armed.to_record(), ARMED_GUEST_RECORD)
+            self.assertEqual(claim_state.coordination_depth.get(), 0)
+            return mac_linux.GuestEndProven()
+
+        with mock.patch.object(mac_linux, "prove_kept_guest_end", side_effect=prove, create=True) as checked:
+            with self.assertRaisesRegex(mac_run.MacRunRefused, "needs cleanup"):
+                with mac_run.held(self.checkout, "mac", SuiteMode.GATE, GATE_JOB_NOT_RECORDED, attempt="refused"):
+                    self.fail("Cleanup granted permission for the refused attempt")
+            self.assertEqual(claim_state.read_claims(self.paths), ())
+            with mac_run.held(self.checkout, "mac", SuiteMode.GATE, GATE_JOB_NOT_RECORDED, attempt="after-proof"):
+                self.assertEqual(len(claim_state.read_claims(self.paths)), 1)
+        checked.assert_called_once_with(mac_linux.ArmedGuestAttempt.from_record(ARMED_GUEST_RECORD))
+
+    def test_unreadable_guest_proof_keeps_the_claim(self) -> None:
+        claim = self.keep_guest_claim()
+        with mock.patch.object(mac_linux, "prove_kept_guest_end", create=True,
+                               side_effect=OSError("cannot read proof")) as prove:
+            with self.assertRaisesRegex(mac_run.MacRunRefused, "needs cleanup.*cannot read proof"):
+                with mac_run.held(self.checkout, "mac", SuiteMode.GATE, GATE_JOB_NOT_RECORDED, attempt="next-guest"):
+                    self.fail("The next guest started without a readable proof")
+        prove.assert_called_once_with(mac_linux.ArmedGuestAttempt.from_record(ARMED_GUEST_RECORD))
+        self.assertEqual(claim_state.read_claims(self.paths), (claim,))
+
+    def test_unreadable_armed_guest_record_keeps_the_claim(self) -> None:
+        claim = self.keep_guest_claim()
+        damaged = {**claim.record, "guest_armed": {"attempt": ARMED_GUEST_RECORD["attempt"]}}
+        mac_test.write_json(claim.path, damaged)
+        with mock.patch.object(mac_linux, "prove_kept_guest_end", create=True) as prove:
+            with self.assertRaisesRegex(mac_run.MacRunRefused, "needs cleanup"):
+                with mac_run.held(self.checkout, "mac", SuiteMode.GATE, GATE_JOB_NOT_RECORDED, attempt="next-guest"):
+                    self.fail("The guest started with an unreadable armed record")
+        prove.assert_not_called()
+        saved, = claim_state.read_claims(self.paths)
+        self.assertEqual(saved.record, damaged)
+
+    def test_guest_proof_does_not_release_a_reused_slot(self) -> None:
+        claim = self.keep_guest_claim()
+        replacement = {**claim.record, "claim_id": "replacement", "attempt": "new-attempt"}
+        del replacement["guest_armed"]
+
+        def prove(_armed: mac_linux.ArmedGuestAttempt) -> mac_linux.GuestEndProven:
+            with claim_state.locked(self.paths.lock):
+                mac_test.write_json(claim.path, replacement)
+            return mac_linux.GuestEndProven()
+
+        with mock.patch.object(mac_linux, "prove_kept_guest_end", side_effect=prove, create=True):
+            with self.assertRaisesRegex(mac_run.MacRunRefused, "needs cleanup"):
+                with mac_run.held(self.checkout, "mac", SuiteMode.GATE, GATE_JOB_NOT_RECORDED, attempt="refused"):
+                    self.fail("Cleanup granted permission for the refused attempt")
+        saved, = claim_state.read_claims(self.paths)
+        self.assertEqual(saved.record, replacement)
+
     def test_release_errors_reach_the_caller_after_the_guest_run(self) -> None:
         refused = mac_test.ClaimReleaseRefused("the exact claim changed during cleanup")
         with mock.patch.object(mac_test, "release_exact_claims", return_value=refused):
             with self.assertRaisesRegex(RuntimeError, refused.reason):
-                with mac_run.held(self.checkout, "mac", StepJob("test-affected"), GATE_JOB_NOT_RECORDED):
+                with mac_run.held(self.checkout, "mac", StepJob("test-affected"), GATE_JOB_NOT_RECORDED, attempt="fixture-attempt"):
                     self.assertEqual(len(claim_state.read_claims(self.paths)), 1)
 
     def test_release_error_preserves_the_guest_error(self) -> None:
         refused = mac_test.ClaimReleaseRefused("the exact claim changed during cleanup")
         with mock.patch.object(mac_test, "release_exact_claims", return_value=refused):
             with self.assertRaisesRegex(ValueError, "guest failed") as failed:
-                with mac_run.held(self.checkout, "mac", StepJob("test-affected"), GATE_JOB_NOT_RECORDED):
+                with mac_run.held(self.checkout, "mac", StepJob("test-affected"), GATE_JOB_NOT_RECORDED, attempt="fixture-attempt"):
                     raise ValueError("guest failed")
         self.assertEqual(failed.exception.__notes__, [f"Mac claim release failed: {refused.reason}"])

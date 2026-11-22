@@ -36,6 +36,7 @@ from scripts.build_hold import override_guard
 from scripts.mac_test import claim_state
 from scripts.mac_test.claim_state import (
     WaitClaimCheck,
+    MAC_LINUX_CLAIM_ID_PREFIX as MAC_LINUX_CLAIM_ID_PREFIX,
     claim_worktree_path,
     recorded_worktree_matches,
     CiSwitch as CiSwitch,
@@ -104,7 +105,6 @@ if TYPE_CHECKING:
     from scripts.mac_test import eligibility
 
 MESSAGE_TIMEOUT_S = 30.0
-MAC_LINUX_CLAIM_ID_PREFIX = "mac-linux-"
 
 
 @dataclass(frozen=True)
@@ -122,6 +122,13 @@ class ClaimDenied:
     status: int
     reason: str
     to_stderr: bool = False
+
+
+@dataclass(frozen=True, kw_only=True)
+class GuestClaimNeedsCleanup(ClaimDenied):
+    """The guest claim requires proof before it can release its place."""
+
+    claim: HeldClaim
 
 
 @dataclass(frozen=True)
@@ -699,7 +706,7 @@ def message_time(instant: datetime) -> str:
 
 
 def run_is_live(run: RunRecord) -> bool:
-    if "remote_host" in run:
+    if "remote_host" in run or run["claim_id"].startswith(MAC_LINUX_CLAIM_ID_PREFIX):
         return True
     return ("wait_released" not in run
             and process_identity.process_start(run["pid"]) == process_identity.Started(run["proc_start"]))
@@ -713,6 +720,34 @@ def claim_owner(run: RunRecord) -> tuple[claim_state.ClaimIdentity, int, str, st
 def run_is_kept(run: RunRecord) -> TypeGuard[RemoteJobClaim]:
     return "remote_host" in run and ("replaced_reservation" in run
         or process_identity.process_start(run["pid"]) != process_identity.Started(run["proc_start"]))
+
+
+def guest_claim_needs_cleanup(run: RunRecord) -> bool:
+    return (run["claim_id"].startswith(MAC_LINUX_CLAIM_ID_PREFIX)
+            and ("guest_armed" in run
+                 or process_identity.process_start(run["pid"]) != process_identity.Started(run["proc_start"])))
+
+
+def cleanup_kept_guest_claim(paths: StatePaths, claim: HeldClaim) -> str:
+    """Return the cleanup result after checking the exact saved guest attempt."""
+    from scripts.build_targets import mac_linux
+
+    record = claim.record
+    if "remote_host" in record or "guest_armed" not in record:
+        return "the armed guest record is missing"
+    try:
+        armed = mac_linux.ArmedGuestAttempt.from_record(record["guest_armed"])
+        proof = mac_linux.prove_kept_guest_end(armed)
+        if isinstance(proof, mac_linux.GuestEndPending):
+            return proof.detail
+        if isinstance(proof, mac_linux.GuestEndProven):
+            with locked(paths.lock):
+                if read_run(claim.path) == record:
+                    claim.path.unlink()
+            return "the guest end is proven"
+    except (mac_linux.GuestUnavailable, OSError, ValueError) as error:
+        return str(error)
+    return "the guest end is unproven"
 
 
 def recoverable_kept_claim(run: RunRecord) -> TypeGuard[RemoteJobClaim]:
@@ -2140,6 +2175,11 @@ def claim_once(args: CliArguments, paths: StatePaths, scope: ClaimScope,
         return blocked_claim(block)
     owner = session
     if overlapping:
+        if mac_kind is MacClaimKind.GUEST:
+            for claim in overlapping:
+                if guest_claim_needs_cleanup(claim.record):
+                    return GuestClaimNeedsCleanup(13, f"{paths.target} needs cleanup before the run can start",
+                                                  claim=claim)
         # A test copy gives way to any new step; a copy never replaces a copy.
         if not args.copy and all(claim_scope_matches(paths, claim, scope) and copy_gives_way(claim.record)
                                  for claim in overlapping):
@@ -2276,6 +2316,8 @@ def adopt_wait_claim(args: CliArguments, paths: StatePaths, scope: ClaimScope,
         return refuse_wait_claim(WaitClaimCheck.REMOTE_MISSING)
     owners, _ = claim_state.sweep_mac_replacements(paths, read_claims(paths))
     identity = claim_state.ClaimIdentity(args.claim_id, args.episode, args.attempt)
+    if identity.claim_id.startswith(MAC_LINUX_CLAIM_ID_PREFIX):
+        return refuse_wait_claim(WaitClaimCheck.NO_RESERVATION)
     worktree = claim_worktree_path(args.worktree)
     if (paths.platform == "macos" and args.retire_wait
             and not any(claim_state.claim_identity(claim.record) == identity for claim in owners)):
@@ -2547,6 +2589,8 @@ def release_exact_claims(
             except StateReadError:
                 continue
             if isinstance(record, dict) and record["pid"] == pid and claim_state.claim_identity(record) == identity:
+                if guest_claim_needs_cleanup(record):
+                    return ClaimReleaseRefused("the guest claim needs proof of its end")
                 owned.append((path, record))
     transfers: list[transfer_bytes.TransferBytes] = []
     retired: set[Path] = set()
@@ -2597,6 +2641,8 @@ def release_exact_claims(
                 current = read_run(path)
                 if isinstance(current, NoRun) or claim_owner(current) != claim_owner(record):
                     return ClaimReleaseRefused("the exact claim changed during cleanup")
+                if guest_claim_needs_cleanup(current):
+                    return ClaimReleaseRefused("the guest claim needs proof of its end")
                 try:
                     retired.update(claim_state.retire_replaced_reservation(paths, path, current))
                 except claim_state.ReservationRetirementError as error:

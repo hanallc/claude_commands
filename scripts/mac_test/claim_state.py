@@ -23,10 +23,12 @@ from scripts.lib import process_start as process_identity
 from scripts.lib.atomic_file import write_text_atomic
 
 if TYPE_CHECKING:
+    from scripts.build_targets.mac_linux import ArmedGuestRecord
     from scripts.buildlog.transfer_bytes import TransferBytes
 
 
 SubmittingSession = OwningSession | NoOwningSession
+MAC_LINUX_CLAIM_ID_PREFIX = "mac-linux-"
 
 
 CiSwitch = Literal[
@@ -262,9 +264,10 @@ class ClaimOwnerRecord(TypedDict):
 
 
 class ProcessBoundClaim(ClaimOwnerRecord):
-    """The local process holds capacity until it releases the claim or ends."""
+    """Store a claim with a local owner."""
 
     wait_released: NotRequired[Literal[True]]
+    guest_armed: NotRequired[ArmedGuestRecord]
 
 
 class ReplacedMacReservation(TypedDict):
@@ -851,6 +854,13 @@ def decode_run(values: dict[str, object], path: Path, *, moved_from_claim: bool 
         if (not moved_from_claim and saved.claim_file != path.name) or saved.key != record.get("repo_key"):
             raise StateReadError(f"{path} has a mismatched Mac repository identity")
         record["mac_repository"] = saved.record()
+    if "guest_armed" in values:
+        armed = values["guest_armed"]
+        if (not identity.claim_id.startswith(MAC_LINUX_CLAIM_ID_PREFIX)
+                or "remote_host" in values or "wait_released" in values
+                or not isinstance(armed, dict)):
+            raise StateReadError(f"{path} has an invalid armed guest record")
+        record["guest_armed"] = cast("ArmedGuestRecord", armed)
     if "remote_host" not in values:
         if "wait_released" in values:
             if values["wait_released"] is not True:
@@ -1157,6 +1167,8 @@ def read_wait_reservations(
     paths: StatePaths, identity: ClaimIdentity, reservation: Path | UnrecordedReservationPath,
 ) -> Generator[WaitReservation, None, None]:
     """Read the exact local reservation for release."""
+    if identity.claim_id.startswith(MAC_LINUX_CLAIM_ID_PREFIX):
+        return
     expected = (identity.claim_id, identity.episode, identity.attempt)
     unreadable: StateReadError | None = None
     found = False
