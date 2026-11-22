@@ -1555,13 +1555,15 @@ def mirror_busy_refusal(detail: str) -> MirrorBusyRefusal | NoMirrorBusyRefusal:
 PROBE_RESULT_LOCK_NAME = "probe-result.lock"
 
 
-def write_backoff(until: float, target: str = "mac", *, wait: bool = True) -> None:
+def write_backoff(until: float, target: str = "mac", *, wait: bool = True, strict: bool = False) -> None:
+    """Write the backoff record. A strict write reports file errors."""
     path = eligibility.backoff_path(target)
     try:
         with claim_state.locked(path.parent / PROBE_RESULT_LOCK_NAME, wait=wait):
             write_text_atomic(path, f"{until:.6f}\n", new_file_mode=0o600)
     except OSError:
-        return
+        if strict:
+            raise
 
 
 def ssh_options(config: SshConnectionSettings | eligibility.SshProbeSettings | OffloadConfig) -> list[str]:
