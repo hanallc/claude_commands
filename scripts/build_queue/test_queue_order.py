@@ -525,6 +525,50 @@ class QueueMoveTests(unittest.TestCase):
             self.assertEqual(ids(undo.line), [first, second, third, pinned, fourth])
             self.assertEqual(fixture.server.queue_pins, ((first, 0), (pinned, 3)))
 
+    def test_grant_publishes_the_order_used_to_confirm_moves_after_restart(self) -> None:
+        with AdmissionFixture() as fixture:
+            fixture.free(0)
+            fixture.hold_starts()
+            absent, first, middle, last = [fixture.request(since=fixture.clock.now() + offset)
+                                           for offset in range(4)]
+            for request in (absent, first, middle, last):
+                self.assertIsInstance(fixture.server.handle_request(request)[0], wire.Wait)
+            _, first_id, middle_id, last_id = ids(move_line(fixture))
+
+            fixture.restart()
+            for request in (first, middle, last):
+                self.assertIsInstance(fixture.server.handle_request(request)[0], wire.Wait)
+            self.assertNotIn(absent.episode, fixture.server.waiters)
+            line = move_line(fixture)
+            self.assertEqual(ids(line), [first_id, middle_id, last_id])
+            moved, = fixture.server.handle_request(wire.QueueMoveRequest(
+                "place-last-second", last_id, line.revision, wire.QueueDrop(middle_id, "before")))
+            assert isinstance(moved, wire.QueueMoved)
+            self.assertEqual(ids(moved.line), [first_id, last_id, middle_id])
+
+            fixture.free(60 * GIB)
+            write_pressure_reading(fixture.root / "pressure")
+            fixture.allow_next_start()
+            _ = fixture.run_pass()
+            self.assertEqual(set(fixture.server.reservations), {first.episode})
+            view, = fixture.server.handle_request(wire.ViewRequest())
+            assert isinstance(view, wire.ViewReply)
+            self.assertEqual([row.pid for row in view.reading.view.waiting], [last.owner.pid, middle.owner.pid])
+            published = view.reading.view.move_line
+            assert isinstance(published, records.QueueMoveLine)
+            self.assertEqual(ids(published), [last_id, middle_id])
+            for position, request in enumerate((last, middle), 1):
+                reply = fixture.server.waiters[request.episode].last_reply
+                assert isinstance(reply, wire.Wait)
+                self.assertEqual(reply.position, position)
+            snapshot = queue_snapshot.read_queue_snapshot(fixture.state_dir)
+            assert isinstance(snapshot, queue_snapshot.QueueSnapshot)
+            self.assertEqual([row["pid"] for _, row in snapshot.inputs.ordered], [last.owner.pid, middle.owner.pid])
+            moved, = fixture.server.handle_request(wire.QueueMoveRequest(
+                "confirm-published-order", middle_id, published.revision, wire.QueueDrop(last_id, "before")))
+            assert isinstance(moved, wire.QueueMoved)
+            self.assertEqual(ids(moved.line), [middle_id, last_id])
+
     def test_departure_behind_an_absent_pin_keeps_its_place_after_restart(self) -> None:
         with PlacementFixture() as fixture:
             fixture.free(0)

@@ -365,8 +365,6 @@ class WaiterPlace:
     order_since: float | OrderNotStarted = field(default_factory=OrderNotStarted, kw_only=True)
     queue_identity: records.QueueLifeIdentity = field(kw_only=True)
     move_id: str = field(default="", kw_only=True)
-    ci_runner: str = field(default="", kw_only=True)
-    run: wire.RunIdentity | wire.NoRun = field(default=wire.NO_RUN, kw_only=True)
 
 
 def waiter_place(row: records.Waiter, episode: str) -> WaiterPlace:
@@ -374,7 +372,7 @@ def waiter_place(row: records.Waiter, episode: str) -> WaiterPlace:
     return WaiterPlace(wire.Owner(row["pid"], row["start_time"]), row["since"], episode,
         row.get("priority_since", OrderNotStarted()), row.get("token_left_at", TokenNotLeft()),
         order_since=row.get("order_since", row["since"]), queue_identity=gate.queue_life_identity(row),
-        move_id=row.get("move_id", ""), ci_runner=row.get("ci_runner", ""))
+        move_id=row.get("move_id", ""))
 
 
 @dataclass(frozen=True)
@@ -1275,6 +1273,7 @@ class AdmissionPassInputs:
     """Keep the local inputs and the queue order that includes held CI waiters."""
     local: records.QueueInputs
     queue_order: list[tuple[Path, records.RankedWaiter]]
+    ranked_waiters: list[tuple[Path, records.RankedWaiter]]
 
 
 QueueChange = wire.PrioritySetRequest | wire.PriorityClearRequest
@@ -1890,8 +1889,8 @@ class AdmissionServer:
                 reasons[episode] = records.NatedevHeld(blocking.name, blocking.purpose)
         return reasons
 
-    def _ordered_waiters(self, *, include_absent: bool = False) -> list[tuple[Path, records.RankedWaiter]]:
-        """Collect the rows that can appear in the queue order."""
+    def _ordered_waiters(self) -> list[tuple[Path, records.RankedWaiter]]:
+        """Collect the present queue rows."""
         rows: list[tuple[Path, records.RankedWaiter]] = []
         for waiting in self.waiters.values():
             if isinstance(waiting.request, wire.AdmitRequest) and isinstance(waiting.request.place, wire.CloudPlace):
@@ -1905,35 +1904,35 @@ class AdmissionServer:
                 continue
             row = gate.rank_waiter(self._placement_row(request), records.NormalOrder())
             rows.append((self.state_dir / records.waiter_owner(row), row))
-        if include_absent:
-            present = {row.get("move_id") for _, row in rows}
-            for key, place in self.places.items():
-                if not place.move_id or place.move_id in present:
-                    continue
-                row = gate.rank_waiter({**place.queue_identity, "need": 0, "move_id": place.move_id,
-                                        "ci_runner": place.ci_runner}, records.NormalOrder())
-                since = place.order_since if isinstance(place.order_since, float) else place.since
-                row["order_since"] = self._run_order_since(since, place.run)
-                rows.append((self.state_dir / key, row))
         return rows
 
     @staticmethod
     def _priority_name(row: records.Waiter) -> str:
         return row.get("ci_runner") or row.get("unit", "")
 
-    def _queue_order(self, *, include_absent: bool = False
-                     ) -> tuple[list[tuple[Path, records.RankedWaiter]], records.QueuePriority | records.NoQueuePriority]:
-        """Sort all queue rows before applying pins or filtering for a reader."""
-        rows = self._ordered_waiters(include_absent=include_absent)
+    def _queue_order(self) -> list[tuple[Path, records.RankedWaiter]]:
+        return self._apply_queue_pins(self._ranked_waiters())
+
+    def _ranked_waiters(self) -> list[tuple[Path, records.RankedWaiter]]:
+        rows = self._ordered_waiters()
         if isinstance(self.priority, records.QueuePriority):
-            rows = self._rank_priority_waiters(rows, self.priority)
-        else:
-            rows = gate.sort_waiters(rows)
-        if self.queue_pins:
-            tracked = {row_id: (path, row) for path, row in rows if (row_id := row.get("move_id"))}
-            moved = iter(tracked[row_id] for row_id in pinned_order(list(tracked), self.queue_pins))
-            rows = [next(moved) if row.get("move_id") else (path, row) for path, row in rows]
-        return rows, self.priority
+            return self._rank_priority_waiters(rows, self.priority)
+        return gate.sort_waiters(rows)
+
+    def _apply_queue_pins(self, rows: list[tuple[Path, records.RankedWaiter]]) -> list[tuple[Path, records.RankedWaiter]]:
+        if not self.queue_pins:
+            return rows
+        tracked = {row_id: (path, row) for path, row in rows if (row_id := row.get("move_id"))}
+        moved = iter(tracked[row_id] for row_id in pinned_order(list(tracked), self.queue_pins))
+        return [next(moved) if row.get("move_id") else (path, row) for path, row in rows]
+
+    def _remaining_queue_order(self, ranked: list[tuple[Path, records.RankedWaiter]]
+                               ) -> list[tuple[Path, records.RankedWaiter]]:
+        """Apply the current pins to the surviving rows with the pass ranks."""
+        waiting = {records.waiter_owner(item.row) for item in self.waiters.values()}
+        waiting.update(records.run_owner(request.owner.pid, request.owner.start_time)
+                       for request in self.placement_requests.values() if self._placement_waiting(request))
+        return self._apply_queue_pins([(path, row) for path, row in ranked if records.waiter_owner(row) in waiting])
 
     def _rank_priority_waiters(self, rows: list[tuple[Path, records.RankedWaiter]], priority: records.QueuePriority
                                ) -> list[tuple[Path, records.RankedWaiter]]:
@@ -2243,7 +2242,8 @@ class AdmissionServer:
         readings = gate.QueueSnapshotReadings(dict(evidence.processes), {}, evidence.host,
             pressure, self.spacing, list(evidence.compilers), policy=config.policy)
         self._prune_runs()
-        ordered, priority = self._queue_order()
+        ranked = self._ranked_waiters()
+        ordered = self._apply_queue_pins(ranked)
         unowned = self._unowned_memory(evidence, [row for row, _memory in memories])
         pending_remote_starts = frozenset(records.waiter_owner(waiting.row)
             for episode, key in self.current_assignments.items()
@@ -2269,7 +2269,7 @@ class AdmissionServer:
         exempt = frozenset(records.waiter_owner(row) for _, row in local_rows
             if (session := row.get("session_id", "")) in labels
             and gate.queue_unit(row.get("unit", ""), session, labels) == limits.exempt_unit)
-        inputs = gate.build_queue_inputs(local_rows, memories, readings, now, priority, unowned)
+        inputs = gate.build_queue_inputs(local_rows, memories, readings, now, self.priority, unowned)
         inputs = replace(inputs, pending_remote_starts=pending_remote_starts & local_owners, local_waits=local_waits,
                          local_machine=self.host, run_limit_exempt_owners=exempt)
         represented = {(step.run.pid, step.run.start_time) for step in inputs.running
@@ -2284,7 +2284,7 @@ class AdmissionServer:
             self.next_progress_sweep = self.clock.monotonic() + config.running_pass_seconds
         local = self._progress_inputs(self._inputs_with_current_slots(inputs, ordered), dict(evidence.processes),
                                       config.policy, profile_rank, profile_share)
-        return AdmissionPassInputs(local, ordered)
+        return AdmissionPassInputs(local, ordered, ranked)
 
     def _unowned_memory(self, evidence: SystemEvidence, rows: list[records.Reservation]
                         ) -> tuple[records.UnownedSliceMemory, ...]:
@@ -2600,7 +2600,8 @@ class AdmissionServer:
             self.spacing = proposed.spacing
             self._admit([waiting], config, self.configuration.peak_history_share_percent, cargo_folder=cargo_folder)
         self.persist()
-        self._publish_replies(captured.queue_order, ci_holds=ci_holds)
+        remaining_order = self._remaining_queue_order(captured.ranked_waiters)
+        self._publish_replies(remaining_order, ci_holds=ci_holds)
         assert isinstance(self.published, PublishedReplies)
         waiting_steps = self.published.view.reading.view.waiting
         positions = self.published.wait_positions
@@ -2636,7 +2637,7 @@ class AdmissionServer:
             self.next_pass = self.clock.monotonic()
         remaining = {owner for owner, episode in by_owner.items() if episode in self.waiters}
         snapshot_owners = (inputs.waiter_orders.keys() | held_owners) & remaining
-        ordered = [(path, row) for path, row in captured.queue_order if records.waiter_owner(row) in snapshot_owners]
+        ordered = [(path, row) for path, row in remaining_order if records.waiter_owner(row) in snapshot_owners]
         try:
             queue_snapshot.write_queue_snapshot(self.state_dir,
                 replace(inputs, ordered=ordered, spacing=self.spacing,
@@ -2860,8 +2861,6 @@ class AdmissionServer:
         routed = {records.run_owner(request.owner.pid, request.owner.start_time): request
                   for request in self.placement_requests.values()
                   if request.episode in self.waiters or self._placement_waiting(request)}
-        waiting = {records.waiter_owner(item.row) for item in self.waiters.values()} | routed.keys()
-        ordered = [(path, row) for path, row in ordered if records.waiter_owner(row) in waiting]
         visible: list[records.WaitingStep] = []
         positions: dict[str, int] = {}
         for position, (path, row) in enumerate(ordered, 1):
@@ -2920,8 +2919,7 @@ class AdmissionServer:
             return
         key = _place_key(request.owner, row["since"])
         previous = self.places.get(key)
-        place = replace(waiter_place(row, request.episode),
-                        run=wire.NO_RUN if isinstance(request, wire.LaunchRequest) else request.run)
+        place = waiter_place(row, request.episode)
         if previous is not None:
             if previous.episode == request.episode:
                 place = replace(place, queue_identity=previous.queue_identity)
@@ -2940,12 +2938,12 @@ class AdmissionServer:
     def _depart_queue_id(self, row_id: str) -> None:
         if not self.queue_pins:
             return
-        rows, _ = self._queue_order(include_absent=True)
-        order = [member for _, row in rows if (member := row.get("move_id"))]
-        positions = {member: index for index, member in enumerate(order)}
-        departed = positions[row_id]
+        rows = self._queue_order()
+        positions = {member: index for index, (_, row) in enumerate(rows) if (member := row.get("move_id"))}
+        departed = positions.get(row_id)
         self._set_queue_pins(tuple(
-            (member, place - 1 if place > 0 and departed < positions[member] else place)
+            (member, place - 1 if place > 0 and departed is not None
+             and (position := positions.get(member)) is not None and departed < position else place)
             for member, place in self.queue_pins if member != row_id))
 
     def _end_move(self, waiting: WaitingAdmission) -> None:
@@ -4602,7 +4600,7 @@ done
                 self.persist()
                 self.next_pass = self.clock.monotonic()
         if not self.pass_stale:
-            self._publish_replies(self._queue_order()[0])
+            self._publish_replies(self._queue_order())
         return [self._placement_status(assignment, check_lifetime=False)]
 
     def _authorize(self, request: wire.Request, uid: int) -> str:
@@ -4751,7 +4749,7 @@ done
                 _ = self.run_pass()
             elif self.pass_stale and isinstance(self.last_inputs, records.QueueInputs):
                 self._prune_runs()
-                ordered, _ = self._queue_order()
+                ordered = self._queue_order()
                 if isinstance(self.last_policy, records.AdmissionPolicy):
                     self.last_inputs = self._refresh_pass_slots(self.last_inputs, ordered)
                     self.last_result = gate.admission_pass(self.last_inputs, self.last_inputs.now, self.last_policy)
@@ -4842,7 +4840,7 @@ done
             if (isinstance(self.last_inputs, records.QueueInputs)
                     and isinstance(self.last_policy, records.AdmissionPolicy)):
                 self._prune_runs()
-                ordered, _ = self._queue_order()
+                ordered = self._queue_order()
                 self.last_inputs = self._refresh_pass_slots(self.last_inputs, ordered)
                 self.pass_stale = True
             self.next_pass = self.clock.monotonic()
@@ -4865,7 +4863,7 @@ done
             return [previous.reply]
         if isinstance(self.configuration, gate.UnusableAdmissionConfiguration):
             return [wire.Refused(self.configuration.reason)]
-        rows, _ = self._queue_order()
+        rows = self._queue_order()
         line = self._current_move_line(rows, self._movable_wait_ids(check_owners=True))
         undo = None
         if isinstance(destination := request.destination, wire.QueueUndo):

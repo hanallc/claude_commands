@@ -2378,18 +2378,18 @@ A refresh keeps the ID.
 The service saves pins in `state.json` when a move completes.
 A pin records the request ID and the number of rows ahead.
 Each confirmed move sets the place of every visible pin to its confirmed position.
-If an absent pin occupies a confirmed place, the service moves it to the next free place.
+If a saved pin for an absent request matches a confirmed place, the service saves the next free place for its return.
 The service applies pins after it sorts the waits.
 It inserts present pinned waits in place order and clamps each insertion to the end.
 Placement, memory admission, and continuation claims filter the same queue order.
 The page, client replies, and the head-stall snapshot also filter that order.
+The service publishes the order after it grants starts.
 When run times tie, the earlier step arrival comes first. PID breaks a tie in step arrival.
 A confirmed move or Undo changes queue order only.
 A drag can return a waiting row's unstarted slot claim, as a bump does.
-A request that starts or ends removes one place from pins behind it in the full order.
-The full order includes absent requests and applies their pins.
-An absent step keeps its run identity to recover the run's saved queue time.
-The service keeps a pin while a request is temporarily absent.
+A departure moves pins behind it one place forward in the visible order.
+An absent request does not count in this adjustment.
+The service saves an absent request's pin so the request can recover its place when it returns.
 A request that starts or ends loses its own pin.
 Both hosts use the visible order for normal steps.
 When placement preparation sees a remote start, it ends the startup hold and removes the local waiter.
