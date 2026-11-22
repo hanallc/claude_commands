@@ -1195,6 +1195,26 @@ class UnrecordableTestTree:
     dirty_paths: tuple[str, ...] = ()
 
 
+@dataclass(frozen=True)
+class RoutedGateTree:
+    repo: Path
+    tree: str
+
+
+@dataclass(frozen=True)
+class NoRoutedGateTree:
+    """The caller did not bind the gate to a tree."""
+
+
+ACTIVE_ROUTED_GATE_TREE: ContextVar[RoutedGateTree | NoRoutedGateTree] = ContextVar(
+    "routed_gate_tree", default=NoRoutedGateTree())
+
+
+def matches_routed_gate_tree(repo: Path, tree: str) -> bool:
+    expected = ACTIVE_ROUTED_GATE_TREE.get()
+    return isinstance(expected, NoRoutedGateTree) or expected.repo != repo or expected.tree == tree
+
+
 def clean_test_tree(repo: Path) -> CleanTestTree | UnrecordableTestTree:
     try:
         paths = sorted(affected_modules.dirty_paths(repo))
@@ -1202,7 +1222,8 @@ def clean_test_tree(repo: Path) -> CleanTestTree | UnrecordableTestTree:
         raise GateRefused(str(error)) from error
     if paths:
         return UnrecordableTestTree("checkout is dirty", tuple(paths))
-    return CleanTestTree(checked_git(repo, "rev-parse", "HEAD^{tree}"), checked_git(repo, "rev-parse", "HEAD"))
+    commit = checked_git(repo, "rev-parse", "HEAD")
+    return CleanTestTree(checked_git(repo, "rev-parse", f"{commit}^{{tree}}"), commit)
 
 
 @dataclass
@@ -1252,7 +1273,7 @@ class PassedTreeLedger:
         return records
 
     def reuse(self, *, report: bool = True) -> bool:
-        if isinstance(self.tree, UnrecordableTestTree):
+        if isinstance(self.tree, UnrecordableTestTree) or not matches_routed_gate_tree(self.repo, self.tree.tree):
             return False
         try:
             for record in reversed(self.records()):
@@ -1282,12 +1303,14 @@ class PassedTreeLedger:
             self.report_error(error)
         return NoCertifiedBase()
 
-    def record_pass(self, selection: AffectedSelection | FullSuite) -> None:
-        if self.unavailable or isinstance(self.tree, UnrecordableTestTree):
+    def record_pass(self, selection: AffectedSelection | FullSuite, *,
+                    discovered: Sequence[tuple[str, Path]] = ()) -> None:
+        if (self.unavailable or isinstance(self.tree, UnrecordableTestTree)
+                or not matches_routed_gate_tree(self.repo, self.tree.tree)):
             return
         try:
-            # A changed HEAD or a test that leaves edits must not certify a
-            # tree that differs from the clean tree at the start of the run.
+            if discovered and list(discovered) != discover_test_modules(self.repo):
+                return
             ending = clean_test_tree(self.repo)
             if not isinstance(ending, CleanTestTree) or ending.tree != self.tree.tree:
                 return
@@ -1449,31 +1472,15 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
     absent = [name for name in type_dirs if not (repo / name).exists()]
     if absent:
         raise GateRefused(f"type dirs not found under {repo}: {', '.join(absent)}")
-    modules = discover_test_modules(repo)
-    if not modules:
-        raise GateRefused("the test list is empty")
-    module_count = len(modules)
-    if isinstance(selected, SelectedModules):
-        paths = set(selected.paths)
-        discovered = {str(path.relative_to(repo)) for _, path in modules}
-        if not paths <= discovered:
-            raise GateRefused('selected modules are absent from the tested tree')
-        modules = [(suite, path) for suite, path in modules if str(path.relative_to(repo)) in paths]
     runner = module_runner(repo)
     tmpfs = build_folders.tmpfs_temporary_parent()
     if not tmpfs.is_dir() or not os.access(tmpfs, os.W_OK):
         raise GateRefused(f"the test runner requires a writable gate folder at {tmpfs}")
     report_retained_gate_test_folders(tmpfs)
     hold = BuildHoldWait() if shared else None
+    tested_tree: CleanTestTree | UnrecordableTestTree = UnrecordableTestTree("whole machine")
     if hold is not None:
         hold.wait_until_free()
-    suites = sorted({suite for suite, _ in modules})
-    ledger: PassedTreeLedger | None = None
-    required: FullSuite | NoFullRunRequired = NoFullRunRequired()
-    reused = False
-    selection: AffectedSelection | FullSuite | SelectedModules = (
-        selected if isinstance(selected, SelectedModules) else FullSuite("whole machine"))
-    if shared:
         try:
             tested_tree = clean_test_tree(repo)
         except (GateRefused, OSError) as error:
@@ -1481,6 +1488,22 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
             print(f"Test tree unavailable; tests cannot be reused or recorded: {str(error).replace(chr(10), '; ')}", flush=True)
         if isinstance(tested_tree, UnrecordableTestTree) and tested_tree.dirty_paths:
             print(f"Dirty checkout: {len(tested_tree.dirty_paths)} paths", flush=True)
+    discovered = modules = discover_test_modules(repo)
+    if not modules:
+        raise GateRefused("the test list is empty")
+    module_count = len(modules)
+    if isinstance(selected, SelectedModules):
+        paths = set(selected.paths)
+        if not paths <= {str(path.relative_to(repo)) for _, path in modules}:
+            raise GateRefused('selected modules are absent from the tested tree')
+        modules = [(suite, path) for suite, path in modules if str(path.relative_to(repo)) in paths]
+    suites = sorted({suite for suite, _ in modules})
+    ledger: PassedTreeLedger | None = None
+    required: FullSuite | NoFullRunRequired = NoFullRunRequired()
+    reused = False
+    selection: AffectedSelection | FullSuite | SelectedModules = (
+        selected if isinstance(selected, SelectedModules) else FullSuite("whole machine"))
+    if shared:
         ledger = PassedTreeLedger(repo, source, tested_tree, suites)
         if isinstance(selected, AllModules):
             required = full_required() if mode is SuiteMode.GATE else NoFullRunRequired()
@@ -1840,7 +1863,7 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
     print(f"Most CPU: {cpu_jobs}; total {sum(run_cpu.values()):.2f} s", flush=True)
     print(f"One-minute load: start={starting_load:.2f} max={maximum_load:.2f} end={ending_load:.2f}", flush=True)
     if run.passed and not reused and ledger is not None and not isinstance(selection, SelectedModules):
-        ledger.record_pass(selection)
+        ledger.record_pass(selection, discovered=discovered)
         if isinstance(required, FullSuite):
             (gate_state_dir() / "full-required").unlink(missing_ok=True)
     return run
@@ -2885,15 +2908,27 @@ def run_gate_suites(repo: Path, type_dirs: Sequence[str] = (),
                           mode=mode, selected=SelectedModules(paths))
 
     def run_cloud(selection: AllModules | TreeSelection) -> GateRun:
-        outcome = cloud.route(repo, mode=mode, full=full, module_time_limit_s=module_time_limit_s,
-                              selected=selection, gate_job=gate_job)
-        if isinstance(outcome, str):
-            print('Cloud gate uses natedev: ' + outcome, flush=True)
-            return run_local(type_dirs)
-        if not type_dirs or outcome.time_limit_report:
-            return outcome
-        local = run_local_subset((), type_dirs)
-        return combine_gate_runs(outcome, local, seconds=outcome.seconds + local.seconds)
+        try:
+            tree = cloud.working_tree(repo)[0] if isinstance(selection, AllModules) else selection.tree
+            token = ACTIVE_ROUTED_GATE_TREE.set(RoutedGateTree(repo, tree))
+            try:
+                outcome = cloud.route(repo, mode=mode, full=full, module_time_limit_s=module_time_limit_s,
+                                      selected=selection, gate_job=gate_job)
+                if isinstance(outcome, str):
+                    print('Cloud gate uses natedev: ' + outcome, flush=True)
+                    run = run_local(type_dirs)
+                elif type_dirs and not outcome.time_limit_report:
+                    local = run_local_subset((), type_dirs)
+                    run = combine_gate_runs(outcome, local, seconds=outcome.seconds + local.seconds)
+                else:
+                    run = outcome
+                if cloud.working_tree(repo)[0] != tree:
+                    raise GateRefused("The checkout changed during the gate")
+            finally:
+                ACTIVE_ROUTED_GATE_TREE.reset(token)
+        except affected_modules.GraphError as error:
+            raise GateRefused(str(error)) from error
+        return run
 
     absent = [name for name in type_dirs if not (repo / name).exists()]
     if absent:
@@ -2920,7 +2955,7 @@ def run_gate_suites(repo: Path, type_dirs: Sequence[str] = (),
         if isinstance(selection, AffectedSelection) and not selection.modules:
             if type_dirs:
                 return run_local(type_dirs)
-            ledger.record_pass(selection)
+            ledger.record_pass(selection, discovered=modules)
             record_gate_run(ledger, (), (), {}, {}, started_at=time.time(), wall_s=0.0,
                             hold_wait_s=0.0, selection=selection, reused=False, reason="", status=0,
                             max_jobs=0, peak_mib=0.0, cap_mib=0.0, aborted=False, mode=mode)

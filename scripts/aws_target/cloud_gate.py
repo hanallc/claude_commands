@@ -1189,12 +1189,19 @@ def create_source_bundle(repo: Path, bundle: Path, commits: Sequence[str], *, ex
             _ = gate.checked_git(repo, 'update-ref', '-d', ref)
 
 
+def require_selected_tree(repo: Path, tree: str, selected: gate.AllModules | gate.TreeSelection) -> None:
+    if ((isinstance(selected, gate.TreeSelection) and tree != selected.tree)
+            or not gate.matches_routed_gate_tree(repo, tree)):
+        raise GateRefused('The checkout changed after the test selection')
+
+
 def prepare_request(repo: Path, folder: Path, mode: gate.SuiteMode, limit: float, *,
                     selected: gate.AllModules | gate.TreeSelection = gate.ALL_MODULES) -> dict[str, object]:
     head = gate.checked_git(repo, 'rev-parse', 'HEAD')
     tree, dirty = working_tree(repo)
-    if isinstance(selected, gate.TreeSelection) and tree != selected.tree:
-        raise GateRefused('The checkout changed after the test selection')
+    require_selected_tree(repo, tree, selected)
+    if not dirty and gate.checked_git(repo, 'rev-parse', f'{head}^{{tree}}') != tree:
+        raise GateRefused('The checkout changed during cloud request preparation')
     commit = gate.checked_git(repo, 'commit-tree', tree, '-p', head, '-m', 'Cloud gate snapshot') if dirty else head
     modules = discover_test_modules(repo)
     if isinstance(selected, gate.TreeSelection):
@@ -1299,6 +1306,7 @@ def run_cloud(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit
         if not current.exists() and not deployment_path.exists():
             return LocalFallback('image or stack is absent')
         tree, _dirty = working_tree(repo)
+        require_selected_tree(repo, tree, selected)
         previous = read(current) if current.exists() else {}
         identity: dict[str, object] = {'tree': tree, 'commit': gate.checked_git(repo, 'rev-parse', 'HEAD'),
                                       'mode': mode.wire, 'full': full, 'module_time_limit_s': module_time_limit_s,

@@ -3392,6 +3392,40 @@ class CloudRouteTests(CloudGateHangGuard, CostFixture):
         self.assertEqual([row['id'] for row in store.locked_rows(store.host_file('aws', 0))], ['gate-' + folder.name])
         self.assertEqual(cloud_gate.read(folder / 'imported.json')['id'], 'gate-' + folder.name)
 
+    def test_all_module_gate_refuses_a_saved_result_for_a_transient_tree(self) -> None:
+        changed = self.repo / 'transient.txt'
+        _ = changed.write_text('temporary checkout change\n')
+        folder = self._unimported_gate()
+        changed.unlink()
+        (self.state / 'gate-deployment.json').unlink()
+        service = mock.Mock(side_effect=AssertionError('A saved result needs no service'))
+        local = gate.GateRun((), 1, 0, selection_certified=True)
+
+        def route_changed_tree(*_arguments: object, **_options: object) -> gate.GateRun | str:
+            _ = changed.write_text('temporary checkout change\n')
+            try:
+                outcome = cloud_gate.run(self.repo, mode=gate.SuiteMode.GATE, full=False,
+                                         module_time_limit_s=1800, service=service)
+                return outcome.run if isinstance(outcome, cloud_gate.CloudCompleted) else outcome.reason
+            finally:
+                changed.unlink()
+
+        with (mock.patch.object(cloud_gate, 'route', side_effect=route_changed_tree),
+              mock.patch.object(gate, 'run_suites', return_value=local), redirect_stdout(StringIO())):
+            run = gate.run_gate_suites(self.repo)
+
+        self.assertIs(run, local)
+        self.assertFalse((folder / 'imported.json').exists())
+        service.assert_not_called()
+
+        _ = changed.write_text('temporary checkout change\n')
+        with (mock.patch.object(cloud_gate, 'service_command', side_effect=AssertionError('The result is saved')),
+              mock.patch.object(gate, 'run_suites', side_effect=AssertionError('The saved result matches')),
+              redirect_stdout(StringIO())):
+            run = gate.run_gate_suites(self.repo)
+        self.assertTrue(run.passed)
+        self.assertTrue((folder / 'imported.json').is_file())
+
     def test_complete_imported_gate_starts_a_new_attempt(self) -> None:
         folder = self._unimported_gate()
         cloud_gate.import_record(folder, cloud_gate.read(folder / cloud_gate.RESULT_FILE))
