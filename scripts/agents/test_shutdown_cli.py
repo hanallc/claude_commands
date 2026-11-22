@@ -138,13 +138,14 @@ class AgentsUsageTests(unittest.TestCase):
         self.assertEqual(errors, "")
         self.assertEqual([line.split()[1] for line in output.splitlines()[1:]],
                          ["help", "status", "pause", "exit", "pause", "resume", "resume", "resume", "retire", "rename", "move",
-                          "restart", "stop", "remove-stray", "transfer", "add-producer", "set-model"])
+                          "reboot", "restart", "stop", "remove-stray", "transfer", "add-producer", "set-model"])
         self.assertIn("resume NAME", output)
         self.assertIn("resume PRODUCER --resend-opening-prompt", output)
         self.assertIn("transfer NAME [--model MODEL --effort EFFORT]", output)
         self.assertIn("add-producer NAME [--model MODEL] [--effort EFFORT] [--job TEXT]", output)
         self.assertIn("set-model ROLE MODEL [EFFORT]", output)
         self.assertIn("retire NAME [--to PRODUCER]", output)
+        self.assertIn("reboot [--dry-run]", output)
         self.assertIn("stop SESSION", output)
         self.assertIn("remove-stray NAME SESSION", output)
         self.assertIn("[ACCOUNT]", output)

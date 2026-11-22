@@ -326,6 +326,7 @@ class RelayMismatch(TypedDict):
     to: str | None
     to_truncated: bool
     text_difference: NotRequired[RelayTextDifference]
+    summary_changed: NotRequired[bool]
 
 
 class SocketRecoveryAttempt(TypedDict):
@@ -3518,10 +3519,12 @@ class RelayRecipientWrite:
         default_factory=RelayRequestNotForwarded)
 
 
-def _log_relay_mismatch(target: object, sent: object, approved: str) -> None:
+def _log_relay_mismatch(target: object, sent: object, approved: str, *, summary_changed: bool) -> None:
     target_limit = 256
     record = RelayMismatch(time=now().isoformat(), to=target[:target_limit] if isinstance(target, str) else None,
                            to_truncated=len(as_str(target)) > target_limit)
+    if summary_changed:
+        record["summary_changed"] = True
     if sent != approved:
         sent_text = as_str(sent)
         first = next((index for index, (before, after) in enumerate(zip(approved, sent_text)) if before != after),
@@ -3535,9 +3538,9 @@ def _log_relay_mismatch(target: object, sent: object, approved: str) -> None:
         print(f"message relay mismatch log: {error}", file=sys.stderr)
 
 
-def read_relay(observed: RelayTransportResponse, text: str, *,
+def read_relay(observed: RelayTransportResponse, text: str, *, summary: str | None = None,
                review_delivery: bool = False) -> CheckedRelayAcceptance | Result:
-    """Check the approved call, its result, and the proxy forward together."""
+    """Check the proxy write and the result for the approved tool ID."""
     events = [as_dict(loads(line)) for line in observed.stdout.splitlines()]
     sends = [part for event in events if event.get("type") == "assistant"
              for value in as_list(as_dict(event.get("message")).get("content"))
@@ -3545,8 +3548,9 @@ def read_relay(observed: RelayTransportResponse, text: str, *,
     for call in sends:
         inputs = as_dict(call.get("input"))
         target, sent = inputs.get("to"), inputs.get("message")
-        if target != observed.target or sent != text:
-            _log_relay_mismatch(target, sent, text)
+        summary_changed = summary is not None and inputs.get("summary") != summary
+        if target != observed.target or sent != text or summary_changed:
+            _log_relay_mismatch(target, sent, text, summary_changed=summary_changed)
     forward = observed.forward
     if isinstance(forward, RefusedRelayRequest):
         return forward
@@ -3567,12 +3571,15 @@ def read_relay(observed: RelayTransportResponse, text: str, *,
             return _unaccepted_relay(forward, f"{len(sends)} SendMessage calls")
         call = forwarded_calls[0]
     inputs = as_dict(call.get("input"))
-    if inputs.get("to") != observed.target or inputs.get("message") != text:
+    changed = (inputs.get("to") != observed.target or inputs.get("message") != text
+               or (summary is not None and inputs.get("summary") != summary))
+    tool_id = as_str(call.get("id"))
+    approved_forward = forward == RelayRequestForwarded(tool_id, text)
+    if changed and not approved_forward:
         reason = "SendMessage used a different target or payload"
         if isinstance(forward, RelayRequestNotForwarded):
             return RefusedRelayRequest("refused", reason)
         return _unaccepted_relay(forward, reason)
-    tool_id = as_str(call.get("id"))
     results = [part for event in events if event.get("type") == "user"
                for value in as_list(as_dict(event.get("message")).get("content"))
                if (part := as_dict(value)).get("type") == "tool_result" and part.get("tool_use_id") == tool_id]
@@ -3581,15 +3588,17 @@ def read_relay(observed: RelayTransportResponse, text: str, *,
     result = results[0]
     answer = result_text(result.get("content"))
     success = as_dict(loads(answer)).get("success")
-    if review_delivery and success is False and forward == RelayRequestForwarded(tool_id, text):
+    if review_delivery and success is False and approved_forward:
         return Result("failed", describe(answer) or "SendMessage rejected the message")
     if result.get("is_error") is True or success is not True:
         rejected = result.get("is_error") is True or success is False
         return _unaccepted_relay(forward, describe(answer) or "SendMessage did not confirm success",
                                  queue_if_unsent=rejected)
-    if forward != RelayRequestForwarded(tool_id, text):
+    if not approved_forward:
         return _unaccepted_relay(forward, "SendMessage has no matching completed proxy forward")
     detail = f"mode {mode}; verbatim; {describe(answer)}"
+    if changed:
+        detail += "; guard set the approved input"
     if len(sends) > 1:
         detail += f"; forwarded 1 of {len(sends)} SendMessage calls"
     return CheckedRelayAcceptance(tool_id, detail)
@@ -3633,11 +3642,16 @@ try:
     event = json.load(sys.stdin)
     inputs = event["tool_input"]
     tool_id = event["tool_use_id"]
-    if (event["tool_name"] != "SendMessage" or not isinstance(tool_id, str) or not tool_id
-            or any(inputs.get(key) != value for key, value in required.items())):
+    if event["tool_name"] != "SendMessage" or not isinstance(tool_id, str) or not tool_id:
         raise ValueError("unexpected SendMessage input")
+    output = json.dumps({"hookSpecificOutput": {
+        "hookEventName": "PreToolUse",
+        "permissionDecision": "allow",
+        "updatedInput": {**inputs, **required},
+    }})
     with Path(sys.argv[2]).open("x") as approval:
         approval.write(tool_id)
+    print(output)
 except Exception:
     sys.exit(2)
 """
@@ -4242,7 +4256,8 @@ def relay(message: Message, timeout: float) -> Result:
         write_atomic(raw, out + err)
     except OSError as error:
         print(f"message relay log: {error}", file=sys.stderr)
-    result = read_relay(observed, agent_text(message, via_relay=True), review_delivery=message.review_delivery)
+    result = read_relay(observed, agent_text(message, via_relay=True), summary=quote_sender_lines(message.summary),
+                        review_delivery=message.review_delivery)
     if isinstance(result, CheckedRelayAcceptance):
         return Result("sent", result.detail)
     if code is None:
