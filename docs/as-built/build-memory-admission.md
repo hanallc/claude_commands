@@ -2362,23 +2362,25 @@ Cloud waits have their own order.
 The admission service gives each wait an ID.
 The saved place binds the ID to the owner PID, process start time, original arrival time, and episode.
 A refresh keeps the ID.
-The first confirmed move saves the full order in `state.json`.
-The service skips an absent wait but keeps its entry until the request starts or ends.
-A returning wait uses its saved entry.
-A new wait joins after the last saved entry in its priority group, even if that entry is absent.
-The first wait in a group joins before the first lower-priority entry, if there is one.
-A bump or clear moves the affected undragged waits to the end of their new group.
-Dragged waits keep their slots.
+The service saves a pin in `state.json` when a move completes.
+The pin records the request ID and the number of rows ahead.
+The service sorts unpinned waits in priority group order.
+It inserts present pinned waits in place order and clamps each insertion to the end.
+Pins at the same place use their saved order.
+A request that starts or ends removes one place from pins behind it.
+The service keeps a pin while a request is temporarily absent.
+A request that starts or ends loses its own pin.
 Both hosts use the visible order for normal steps.
 Only starts that the local preview selects can pass a new remote startup hold.
-The table includes remote-only waits in the saved order.
+The table includes remote-only waits in queue order.
 The table identifies waits that a build hold blocks.
 Speculative Mac copy rows show the newest-first rule.
-A refusal before launch keeps the saved entry and any active local startup claim.
+A refusal before launch keeps the pin and any active local startup claim.
 
 The service checks the order revision for all rows, including rows without handles.
 Its replay ledger records the reply with the new order.
-Undo restores the row between its old neighbors if they still define the destination.
+Undo restores the previous pin if the move still applies.
+Without a pin, the wait returns to its current priority group.
 A conflict supplies the current order.
 The page requires a complete move list before it enables another move.
 The page shows an unnamed wait as “Build step.”

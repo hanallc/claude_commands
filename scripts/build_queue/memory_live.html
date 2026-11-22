@@ -1407,10 +1407,7 @@ function queueReading(d) {
   const members = new Map(queueReply.line.members.map(member => [member.row_id, member]));
   if (rows.size !== members.size || [...rows.keys()].some(id => !members.has(id)))
     return {...d, queueReady:false};
-  const ordered = queueReply.line.members.flatMap(member => {
-    const row = rows.get(member.row_id);
-    return row ? [{...row, move:member}] : [];
-  });
+  const ordered = queueReply.line.members.map(member => ({...rows.get(member.row_id), move:member}));
   let index = 0;
   return {...d, move_revision:queueReply.line.revision,
     waiters:d.waiters.map(row => members.has(row.move?.row_id) ? ordered[index++] : row)};
