@@ -1985,9 +1985,10 @@ sys.exit(status)
               patch.object(os, "setsid"),
               patch.object(os, "killpg") as send,
               patch.object(time, "sleep", side_effect=save_status) as sleep,
-              patch.object(detached_runs, "_group_is_live", side_effect=AssertionError("the group ID was reused")),
+              patch.object(detached_runs, "_group_is_live", side_effect=[True]) as scan,
               patch.object(detached_runs, "_replay_completion", return_value=detached_runs.CompletionReplay.HANDLED)):
             self.assertEqual(detached_runs.main(["supervisor-gone", str(path)]), 0)
+        scan.assert_called_once_with(leader)
         send.assert_called_once_with(leader, signal.SIGTERM)
         sleep.assert_called_once_with(0.05)
         saved = worker_lifecycle.read_json_object(path)
@@ -2016,6 +2017,20 @@ sys.exit(status)
                 events: list[str] = []
                 left_group = False
                 descendants_live = case != "leader unreadable after the group exits"
+                record_locked = False
+                scan_lock_states: list[bool] = []
+                record_lock = detached_runs.record_lock
+
+                @contextlib.contextmanager
+                def track_record_lock(record_path: Path) -> Generator[None]:
+                    nonlocal record_locked
+                    with record_lock(record_path):
+                        previous = record_locked
+                        record_locked = record_locked or record_path == path
+                        try:
+                            yield
+                        finally:
+                            record_locked = previous
 
                 def read_group() -> int:
                     if left_group:
@@ -2042,12 +2057,15 @@ sys.exit(status)
 
                 def group_is_live(group_id: int, **_options: object) -> bool:
                     self.assertEqual(group_id, leader)
+                    if "send TERM" not in events:
+                        scan_lock_states.append(record_locked)
                     return descendants_live
 
                 with (self.darwin_without_pidfds(),
                       patch.object(process_start, "process_start", side_effect=read_start),
                       patch.object(detached_run_process, "supervisor_match", return_value=False),
                       patch.object(detached_runs, "_scope_stop_graces", return_value=(2.0, 2.0)),
+                      patch.object(detached_runs, "record_lock", side_effect=track_record_lock),
                       patch.object(os, "getpgrp", side_effect=read_group),
                       patch.object(os, "setsid", side_effect=leave_group),
                       patch.object(os, "killpg", side_effect=send_term),
@@ -2060,6 +2078,8 @@ sys.exit(status)
                 if expect_term:
                     expected.append("send TERM")
                 self.assertEqual(events, expected)
+                if isinstance(after, process_start.Unreadable):
+                    self.assertEqual(scan_lock_states, [False])
                 saved = worker_lifecycle.read_json_object(path)
                 self.assertEqual(saved.get("status"), status)
                 if expect_term:
@@ -2090,6 +2110,8 @@ sys.exit(status)
                 def ps(argv: list[str], *, timeout: float, **_options: object) -> subprocess.CompletedProcess[str]:
                     nonlocal now
                     if not signaled:
+                        if argv[1] == "-A":
+                            return subprocess.CompletedProcess(argv, 0, f"{leader} S\n", "")
                         return subprocess.CompletedProcess(argv, 0, started + " S\n", "")
                     reads.append((argv[1], timeout))
                     if case == "group read uses the remaining grace" and argv[1] == "-p":

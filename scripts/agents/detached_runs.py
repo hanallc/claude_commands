@@ -2261,6 +2261,8 @@ def _wait_for_group(command: CommandGroup, deadline: float) -> None:
 
 def _stop_watched_group(path: Path, watched: CommandGroup) -> None:
     """Send TERM to the group that the watcher just left."""
+    group_is_live = _group_is_live(watched.group)
+
     def verify_group() -> CommandGroup | CommandGroupUnverified:
         record = worker_lifecycle.read_json_object(path)
         if record.get("status") != "running" or _has_saved_cgroup(record) or _recorded_group(record) != watched:
@@ -2268,7 +2270,7 @@ def _stop_watched_group(path: Path, watched: CommandGroup) -> None:
         leader = _saved_process(watched.group, watched.started)
         if isinstance(leader, SavedProcessIdReused):
             return CommandGroupUnverified()
-        if isinstance(leader, process_start.Unreadable) and not _group_is_live(watched.group):
+        if isinstance(leader, process_start.Unreadable) and not group_is_live:
             return CommandGroupUnverified()
         return watched
 

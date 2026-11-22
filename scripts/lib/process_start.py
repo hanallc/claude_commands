@@ -74,7 +74,7 @@ def process_start_format() -> str:
 
 @dataclass(frozen=True)
 class ProcessReadDeadline:
-    """A process read must finish within this monotonic deadline."""
+    """Check this monotonic deadline before a read and use it to limit the ps timeout."""
 
     at: float
 
@@ -98,7 +98,7 @@ def ps_read_timeout(budget: ProcessReadBudget) -> float:
 
 
 def process_start(pid: int, *, budget: ProcessReadBudget = STANDARD_PROCESS_READ_BUDGET) -> ProcessStart:
-    """Read the process start within the read budget."""
+    """Check the budget before reading the start and use it to limit the ps timeout."""
     timeout = ps_read_timeout(budget)
     if timeout <= 0:
         return Unreadable("the process read reached its deadline")
