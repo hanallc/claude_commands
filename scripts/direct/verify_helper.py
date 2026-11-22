@@ -79,12 +79,16 @@ def source_stamp(path: str) -> SourceStamp | MissingSource:
     return SourceStamp(status.st_mtime_ns, status.st_size, status.st_ino)
 
 
+def module_attributes(module: ModuleType) -> dict[str, object]:
+    """Read the attributes of a module without executing a lazy module."""
+    return cast(dict[str, object], object.__getattribute__(module, "__dict__"))
+
+
 def module_source_path(module: object) -> str:
     """Read the source path without executing a lazy module."""
     if not isinstance(module, ModuleType):
         return ""
-    attributes = cast(dict[str, object], object.__getattribute__(module, "__dict__"))
-    path = attributes.get("__file__")
+    path = module_attributes(module).get("__file__")
     return path if isinstance(path, str) else ""
 
 
@@ -134,10 +138,8 @@ class LoadedSources:
                 del sys.modules[name]
                 parent, _, child = name.rpartition(".")
                 package = sys.modules.get(parent)
-                if isinstance(package, ModuleType):
-                    attributes = cast(dict[str, object], object.__getattribute__(package, "__dict__"))
-                    if attributes.get(child) is module:
-                        del attributes[child]
+                if isinstance(package, ModuleType) and module_attributes(package).get(child) is module:
+                    del module_attributes(package)[child]
         programs.clear()
         self.stamps.clear()
         importlib.invalidate_caches()
