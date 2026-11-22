@@ -16,9 +16,11 @@ from threading import Event
 from typing import cast, override
 from unittest.mock import patch
 
+from scripts.lib.git_test_support import fixture_git_environment
 from scripts.maintenance import agent_notes_job as job
 from scripts.maintenance import vault_commit
-from scripts.maintenance.settings import Part, Schedule, settings
+from scripts.maintenance.settings import InvalidPartSchedule, Part, Schedule, settings
+from scripts.maintenance.test_vault_save import job_config_fixture
 from scripts.production.staff_test_support import isolated_staff_file, unit_membership
 
 
@@ -33,9 +35,10 @@ class JobTests(unittest.TestCase):
         self.root = Path(temporary.name)
         self.config = self.root / "job.toml"
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
-        _ = self.config.write_text((job.ROOT / "config/agent_notes.toml").read_text())
+        _ = self.config.write_text(job_config_fixture())
         self.enterContext(patch.dict(os.environ, {
-            "XDG_STATE_HOME": str(self.root), "AGENT_NOTES_JOB_CONFIG": str(self.config)}))
+            **fixture_git_environment(self.root),
+            "XDG_STATE_HOME": str(self.root), "AGENT_NOTES_JOB_CONFIG": str(self.config)}, clear=True))
 
     def test_refusal_part_hands_moves_to_the_detached_batch_before_stopping(self) -> None:
         from scripts.accounts import refusal_watch, moves
@@ -91,7 +94,9 @@ class JobTests(unittest.TestCase):
             if name in (Part.QUOTA, Part.PACER):
                 self.assertTrue(notes_done.is_set())
             if name is Part.VAULT:
-                self.assertEqual(finished, set(Part) - {Part.VAULT})
+                self.assertEqual(finished, set(Part) - {Part.VAULT, Part.VAULT_SAVE})
+            if name is Part.VAULT_SAVE:
+                self.assertEqual(finished, set(Part) - {Part.VAULT_SAVE})
             finished.add(name)
             if name is Part.NOTES:
                 notes_done.set()
@@ -283,14 +288,39 @@ class JobTests(unittest.TestCase):
         self.assertEqual(settings().parts[Part.NOTES], Schedule(120, 0.5))
         def result(part: Part, _cadence: Schedule, _deadline: float) -> job.PartResult:
             return job.PartResult(part, job.Outcome.SUCCESS, 0, 0)
-        with patch.object(job, "run_part", side_effect=result):
+        with patch.object(job, "run_part", side_effect=result), patch.object(time, "time", return_value=1000):
             _ = job.run_job()
-        fast = ["interval_seconds = 0.000000001" if line.startswith("interval_seconds = ") else line
-                for line in original.splitlines()]
-        _ = self.config.write_text("\n".join(fast) + "\n")
-        with patch.object(job, "run_part", side_effect=result) as run:
+        _ = self.config.write_text(original.replace("interval_seconds = 120", "interval_seconds = 1")
+                                   .replace("interval_seconds = 180", "interval_seconds = 61"))
+        with patch.object(job, "run_part", side_effect=result) as run, patch.object(time, "time", return_value=1061):
             _ = job.run_job()
         self.assertEqual(run.call_count, len(Part))
+
+    def test_vault_save_validates_interval(self) -> None:
+        original = self.config.read_text()
+        for invalid in (59, 3601):
+            with self.subTest(interval=invalid):
+                _ = self.config.write_text(original.replace("interval_seconds = 180", f"interval_seconds = {invalid}"))
+                self.assertEqual(settings().parts[Part.VAULT_SAVE], InvalidPartSchedule(
+                    "Invalid [parts.vault_save] schedule. parts.vault_save.interval_seconds must be from 60 through 3600"
+                ))
+        _ = self.config.write_text(original.replace("interval_seconds = 180\ntimeout_seconds = 30",
+                                                 "interval_seconds = 73\ntimeout_seconds = 150"))
+        with patch.object(job, "run_part") as run:
+            def complete(part: Part, _cadence: Schedule, _deadline: float) -> job.PartResult:
+                return job.PartResult(part, job.Outcome.SUCCESS, 0, 0)
+
+            run.side_effect = complete
+            with patch.object(time, "time", return_value=2000):
+                _ = job.run_job()
+            run.reset_mock()
+            with patch.object(time, "time", return_value=2072):
+                _ = job.run_job()
+            run.assert_not_called()
+            with patch.object(time, "time", return_value=2073):
+                _ = job.run_job()
+            run.assert_called_once()
+            self.assertEqual(run.call_args.args[:2], (Part.VAULT_SAVE, Schedule(73, 150)))
 
     def test_an_invalid_part_schedule_leaves_other_parts_running(self) -> None:
         original = self.config.read_text()
@@ -302,8 +332,8 @@ class JobTests(unittest.TestCase):
             with self.subTest(part=invalid):
                 header = f"\n[parts.{invalid.value}]\n"
                 before, _, after = original.partition(header)
-                next_section = after.index("\n[")
-                _ = self.config.write_text(before + header + "interval_seconds = 0\n" + after[next_section:])
+                _, next_header, rest = after.partition("\n[")
+                _ = self.config.write_text(before + header + "interval_seconds = 0\n" + next_header + rest)
                 with (patch.dict(os.environ, {"XDG_STATE_HOME": str(self.root / invalid.value)}),
                       patch.object(job, "run_part", side_effect=launch) as run):
                     results = {result.part: result for result in job.run_job()}

@@ -20,6 +20,7 @@ class Part(str, Enum):
     PRUNE = "prune"
     FOLDER_SIZE = "folder_size"
     VAULT = "vault"
+    VAULT_SAVE = "vault_save"
 
 
 @dataclass(frozen=True)
@@ -71,7 +72,10 @@ def schedule(value: object) -> Schedule:
 
 def part_schedule(part: Part, value: object) -> Schedule | InvalidPartSchedule:
     try:
-        return schedule(value)
+        cadence = schedule(value)
+        if part is Part.VAULT_SAVE and not 60 <= cadence.interval_seconds <= 3600:
+            raise ValueError("parts.vault_save.interval_seconds must be from 60 through 3600")
+        return cadence
     except (ValueError, OverflowError) as error:
         return InvalidPartSchedule(f"Invalid [parts.{part.value}] schedule. {error}")
 

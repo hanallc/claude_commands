@@ -85,10 +85,11 @@ def run_job() -> list[PartResult]:
             if result.outcome is Outcome.SUCCESS:
                 history.record(result.part.value, time.time())
 
-        # Quota and the pacer read completed notes; the vault follows all writers.
+        # Quota and the pacer read completed notes. The vault parts follow the writers.
+        vault_parts = (Part.VAULT, Part.VAULT_SAVE)
         with ThreadPoolExecutor(max_workers=len(Part)) as pool:
             tasks = {part: pool.submit(run_part, part, cadence, deadline)
-                     for part, cadence in due.items() if part not in (Part.QUOTA, Part.PACER, Part.VAULT)}
+                     for part, cadence in due.items() if part not in (Part.QUOTA, Part.PACER, *vault_parts)}
             def after_notes(part: Part) -> PartResult:
                 if Part.NOTES in tasks:
                     _ = tasks[Part.NOTES].result()
@@ -98,8 +99,9 @@ def run_job() -> list[PartResult]:
                     tasks[part] = pool.submit(after_notes, part)
             for task in as_completed(tasks.values()):
                 record(task.result())
-        if Part.VAULT in due:
-            record(run_part(Part.VAULT, due[Part.VAULT], deadline))
+        for part in vault_parts:
+            if part in due:
+                record(run_part(part, due[part], deadline))
         return [results.get(part, PartResult(part, Outcome.NOT_DUE, 0, 0)) for part in Part]
 
 
@@ -187,6 +189,10 @@ def _perform(part: Part) -> int:
     elif part is Part.FOLDER_SIZE:
         from scripts.maintenance import folder_size
         folder_size.run()
+    elif part is Part.VAULT_SAVE:
+        from scripts.maintenance.vault_save import main
+
+        return main([])
     else:
         from scripts.maintenance import vault_commit
         vault = Path.home() / "rust/hanadocs"
