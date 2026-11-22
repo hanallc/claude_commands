@@ -559,6 +559,7 @@ class MacRunTests(unittest.TestCase):
                     self.assertEqual(len(claim_calls), 1)
                     run.assert_called_once()
                     fresh, = claim_state.read_claims(self.paths)
+                    self.assertNotIn("replaced_reservation", fresh.record)
                     saved = claim_state.saved_mac_repository(fresh.record)
                     assert isinstance(saved, claim_state.MacRepositoryIdentity)
                     self.assertEqual(saved.mirror_name, "source-b" if changed else ".claude")
@@ -631,11 +632,20 @@ class MacRunTests(unittest.TestCase):
         runner.claim_id, runner.episode, runner.attempt = fresh.record["claim_id"], fresh.record["episode"], fresh.record["attempt"]
         self.assertEqual(mac_test.command_release(runner, self.paths), 0)
 
-    def test_interrupted_replacement_retires_the_wait_reservation(self) -> None:
-        self.exercise_interrupted_replacement(("inspect", "retry", "release"))
+    def test_interrupted_replacement_retires_both_records_and_retries(self) -> None:
+        self.exercise_interrupted_replacement(("retry", "inspect"))
 
-    def test_status_keeps_an_interrupted_replacement_available_to_the_wait_owner(self) -> None:
-        self.exercise_interrupted_replacement(("status-direct", "status-assigned"))
+    def test_status_and_sweep_retire_an_interrupted_replacement(self) -> None:
+        self.exercise_interrupted_replacement(("status", "sweep"))
+
+    def test_a_second_interruption_allows_a_fresh_retry(self) -> None:
+        self.exercise_interrupted_replacement(("second-interruption",))
+
+    def test_a_retry_uses_a_new_fence_after_settlement(self) -> None:
+        self.exercise_interrupted_replacement(("settled-fence",))
+
+    def test_status_keeps_an_older_replacement_with_a_pending_start(self) -> None:
+        self.exercise_interrupted_replacement(("legacy-pending",))
 
     def test_failed_retirement_keeps_the_reservation_and_allows_an_unrelated_claim(self) -> None:
         self.exercise_interrupted_replacement(("unlink-error",))
@@ -647,21 +657,28 @@ from pathlib import Path
 import sys
 from unittest.mock import patch
 
-from scripts.mac_test import mac_test
+from scripts.mac_test import claim_state, mac_test
 
-path = Path(sys.argv[1])
+checkpoint = sys.argv[1]
+old = Path(sys.argv[2])
 args = mac_test.parser().parse_args(sys.argv[3:], namespace=mac_test.CliArguments())
-if sys.argv[2] == "ended-owner":
-    args.pid = os.getpid()
+paths = mac_test.state_paths("mac")
 unlink = Path.unlink
+write_json = mac_test.write_json
 
-def interrupt(self, *args, **kwargs):
-    if self == path:
+def interrupt_unlink(self, *args, **kwargs):
+    if checkpoint == "retire" and self == old:
         os._exit(71)
     return unlink(self, *args, **kwargs)
 
-with patch.object(Path, "unlink", interrupt):
-    sys.exit(mac_test.command_claim(args, mac_test.state_paths("mac"), watch_claim=False, session=args.session))
+def interrupt_write(path, record):
+    if checkpoint == "fresh-write" and "remote_host" in record:
+        assert not claim_state.read_claims(paths)
+        os._exit(72)
+    return write_json(path, record)
+
+with patch.object(Path, "unlink", interrupt_unlink), patch.object(mac_test, "write_json", interrupt_write):
+    sys.exit(mac_test.command_claim(args, paths, watch_claim=False, session=args.session))
 """
         resolved = claim_state.mac_repository_identity(str(self.checkout))
         assert isinstance(resolved, claim_state.ResolvedMacMirror)
@@ -674,111 +691,136 @@ with patch.object(Path, "unlink", interrupt):
         for recovery in recoveries:
             with self.subTest(recovery=recovery):
                 waiting = self.native_claim(self.checkout)
-                if recovery == "release":
-                    waiting.episode, waiting.attempt = "episode", "attempt"
-                    waiting.claim_id = execution_identity.assigned_claim_id(waiting.episode, waiting.attempt)
                 reservation = saved if recovery == "unlink-error" else claim_state.WHOLE_MAC
                 self.assertEqual(mac_test.command_claim(waiting, self.paths, watch_claim=False,
                                                        mac_repository=reservation), 0)
                 reserved, = claim_state.read_claims(self.paths)
                 old_path = reserved.path
-                if recovery == "release":
-                    self.paths.claims.mkdir(exist_ok=True)
-                    old_path = old_path.rename(self.paths.claims / "zz-legacy.json")
-                elif recovery == "unlink-error":
+                if recovery == "unlink-error":
                     old_path = old_path.rename(self.paths.claims / "legacy.json")
                     incomplete = reserved.record.copy()
                     del incomplete["mac_repository"]
                     mac_test.write_json(old_path, incomplete)
-                reserved, = claim_state.read_claims(self.paths)
-                self.assertEqual(reserved.path, old_path)
                 identity = claim_state.claim_identity(reserved.record)
                 scope = claim_state.RepositoryScope(saved.mirror_name, saved.key)
-                assigned = placement.PlacementAssignment("episode", "attempt",
+                assignment = placement.PlacementAssignment("episode", "attempt",
                     placement.PlacementDestination("mac", "mac", "fixture-mac", scope),
                     execution_identity.SourceKeyUnavailable("The fixture has no source key"),
                     placement.SubmittingOwner("fixture-host", waiting.pid, reserved.record["proc_start"]),
                     NoOwningSession(), 0)
-                route = (offload.DirectOffloadRequest() if recovery == "status-direct"
-                         else offload.AssignedOffloadRequest(assigned))
+                route = (offload.DirectOffloadRequest() if recovery in ("status", "second-interruption")
+                         else offload.AssignedOffloadRequest(assignment))
                 request = offload.OffloadRequest(self.checkout, "hana", "test", offload.NO_RESULT_FILE, (),
                     "verify", "", target="mac", placement=route,
                     admission=offload.MacClaimFromWait(waiting.pid, identity, NoOwningSession()))
                 command = offload.claim_arguments(request, config, retire_wait=True, mac_repository=saved)
-                owner = "current-owner" if recovery in ("inspect", "release") else "ended-owner"
-                child = subprocess.run([sys.executable, "-c", script, str(reserved.path), owner, *command[2:]],
+                child = subprocess.run([sys.executable, "-c", script, "retire", str(old_path), *command[2:]],
                                        capture_output=True, text=True, timeout=5)
                 self.assertEqual(child.returncode, 71, child.stdout + child.stderr)
-                self.assertEqual(len(claim_state.read_claims(self.paths)), 2)
-                if recovery.startswith("status-"):
-                    self.check_replacement_after_status(request, config, reserved.path, script)
-                    continue
+                self.assertTrue(old_path.exists())
+                abandoned, = (claim for claim in claim_state.read_claims(self.paths) if claim.path != old_path)
+                self.assertIn("replaced_reservation", abandoned.record)
                 if recovery == "unlink-error":
-                    self.check_unrelated_acquisition_after_failed_retirement(reserved.path)
+                    self.check_unrelated_acquisition_after_failed_retirement(old_path)
                     continue
-                expected = claim_state.ClaimIdentity(execution_identity.assigned_claim_id(assigned.episode, assigned.attempt),
-                                                     assigned.episode, assigned.attempt)
-                if recovery == "inspect":
-                    controller = offload.ProcessController()
-                    controller.placement = request.placement
+                if recovery == "legacy-pending":
+                    self.check_legacy_pending_replacement(reserved, abandoned)
+                    continue
+                if recovery == "status":
+                    status_config = mac_test.MacTestConfig("", "", "", "", 1, 0, 1, 1, 1)
+                    self.assertEqual(mac_test.command_status(self.paths, status_config), 0)
+                elif recovery == "sweep":
+                    with claim_state.locked(self.paths.lock):
+                        self.assertEqual(mac_test.live_claims(self.paths), ())
+                elif recovery == "inspect":
+                    inspector = offload.ProcessController()
+                    inspector.placement = request.placement
                     inspection = offload.LocalClaimAttempt()
-                    controller.inspect_claim(inspection, expected)
-                    self.assertIsInstance(inspection.answer, offload.FreshMacClaim)
-                    self.assertEqual(controller.claim_identity, expected)
-                elif recovery == "retry":
-                    retry = mac_test.parser().parse_args(command[2:], namespace=mac_test.CliArguments())
-                    self.assertEqual(mac_test.command_claim(retry, self.paths, watch_claim=False), 13)
-                release = mac_test.CliArguments()
-                release.pid = os.getpid()
-                release.claim_id, release.episode, release.attempt = expected.claim_id, expected.episode, expected.attempt
-                if recovery == "release":
-                    self.assertEqual(mac_test.command_release(release, self.paths), 0)
+                    inspector.inspect_claim(inspection, claim_state.claim_identity(abandoned.record))
+                    self.assertIsInstance(inspection.answer, offload.MacClaimNotConfirmed)
+                    self.assertEqual(inspector.claim_identity, claim_state.NO_CLAIM_IDENTITY)
+                elif recovery == "second-interruption":
+                    child = subprocess.run([sys.executable, "-c", script, "fresh-write", str(old_path), *command[2:]],
+                                           capture_output=True, text=True, timeout=5)
+                    self.assertEqual(child.returncode, 72, child.stdout + child.stderr)
+                if recovery in ("status", "sweep", "inspect", "second-interruption"):
                     self.assertEqual(claim_state.read_claims(self.paths), ())
-                    continue
-                kept, = claim_state.read_claims(self.paths)
-                self.assertFalse(reserved.path.exists())
-                self.assertEqual(claim_state.claim_identity(kept.record), expected)
-                if recovery == "retry":
-                    self.assertTrue(kept.record.get("cleanup_pending"))
-                    self.assertEqual(kept.record["pid"], os.getpid())
-                self.assertEqual(mac_test.command_release(release, self.paths), 0)
+                self.check_replacement_retry(request, config, old_path, abandoned, script, recovery == "settled-fence")
 
-    def check_replacement_after_status(self, request: offload.OffloadRequest, config: eligibility.OffloadConfig,
-                                       old_path: Path, script: str) -> None:
-        before = next(claim for claim in claim_state.read_claims(self.paths) if claim.path != old_path)
+    def check_legacy_pending_replacement(self, reserved: claim_state.HeldClaim,
+                                         replacement: claim_state.HeldClaim) -> None:
+        old = reserved.record
+        record = dict(replacement.record)
+        saved = claim_state.saved_mac_repository(replacement.record)
+        assert isinstance(saved, claim_state.MacRepositoryIdentity)
+        scope = saved.claim_file.removesuffix(".json")
+        record["mac_repository"] = replace(saved, fence_generation="").record()
+        record["replaced_reservation"] = {
+            **{key: old[key] for key in ("claim_id", "episode", "attempt", "pid", "proc_start", "since")},
+            "file": str(reserved.path.relative_to(self.paths.directory)),
+        }
+        mac_test.write_json(replacement.path, record)
+        identity = claim_state.claim_identity(replacement.record)
+        pending = offload.pending_start_path(self.paths.target, identity, scope_key=scope)
+        pending.parent.mkdir()
+        _ = pending.write_text(offload.pending_start_key(identity))
         status_config = mac_test.MacTestConfig("", "", "", "", 1, 0, 1, 1, 1)
         self.assertEqual(mac_test.command_status(self.paths, status_config), 0)
-        self.assertFalse(old_path.exists())
-        self.assertEqual(claim_state.read_claims(self.paths), (before,))
+        self.assertFalse(reserved.path.exists())
+        kept, = claim_state.read_claims(self.paths)
+        self.assertEqual(kept.path, replacement.path)
+        self.assertNotIn("replaced_reservation", kept.record)
+        self.assertEqual(claim_state.claim_identity(kept.record), identity)
+        self.assertTrue(pending.exists())
+
+    def check_replacement_retry(self, request: offload.OffloadRequest, config: eligibility.OffloadConfig,
+                                old_path: Path, abandoned: claim_state.HeldClaim, script: str, settle: bool) -> None:
+        old_identity = claim_state.claim_identity(abandoned.record)
+        old_scope = claim_state.claim_fence_scope_key(abandoned.path, abandoned.record)
+        old_fence = self.root / offload.start_fence_relative(old_identity, "mac", scope_key=old_scope).with_suffix(".lock")
+        if settle:
+            old_fence.parent.mkdir(parents=True)
+            old_fence.touch()
+            old_fence.unlink()
+
         controller = offload.ProcessController()
         original_arguments = offload.claim_arguments
 
         def private_claim(*args: object, **kwargs: object) -> list[str]:
             make_arguments = cast(Callable[..., list[str]], original_arguments)
             command = make_arguments(*args, **kwargs)
-            return [sys.executable, "-c", script, "", "current-owner", *command[2:]]
+            return [sys.executable, "-c", script, "none", str(old_path), *command[2:]]
 
-        def release(command: list[str]) -> offload.CommandOutput:
-            args = mac_test.parser().parse_args(command[2:], namespace=mac_test.CliArguments())
-            return offload.CommandOutput(mac_test.command_release(args, self.paths), "", "")
-
-        def run(_controller: offload.ProcessController, *_args: object) -> offload.PassedOnMac:
-            check.assert_called_once()
-            claim, = claim_state.read_claims(self.paths)
-            self.assertFalse(claim.record.get("cleanup_pending"))
-            self.assertEqual(claim.record["pid"], os.getpid())
-            return offload.PassedOnMac(1)
-
-        with mock.patch.object(offload, "claim_arguments", side_effect=private_claim), \
-                mock.patch.object(controller, "capture", side_effect=release), \
-                mock.patch.object(offload, "check_current_leftovers", return_value=offload.LeftoversEnded()) as check, \
-                mock.patch.object(offload, "claimed_run", side_effect=run) as launched:
+        with (
+            mock.patch.object(offload, "claim_arguments", side_effect=private_claim),
+            mock.patch.object(offload, "check_current_leftovers") as cleanup,
+            mock.patch.object(offload, "claimed_run", return_value=offload.PassedOnMac(1)) as launched,
+        ):
             result = offload.run_offload(controller, config, request, time.monotonic())
         self.assertIsInstance(result, offload.PassedOnMac)
-        check.assert_called_once()
+        cleanup.assert_not_called()
         launched.assert_called_once()
-        identity = controller.claim_identity
-        assert isinstance(identity, claim_state.ClaimIdentity)
+        fresh, = claim_state.read_claims(self.paths)
+        self.assertFalse(old_path.exists())
+        self.assertNotIn("replaced_reservation", fresh.record)
+        self.assertFalse(fresh.record.get("cleanup_pending"))
+        self.assertEqual(fresh.record["pid"], os.getpid())
+        self.assertEqual(fresh.path, abandoned.path)
+        identity = claim_state.claim_identity(fresh.record)
+        self.assertEqual(controller.claim_identity, identity)
+        if isinstance(request.placement, offload.AssignedOffloadRequest):
+            self.assertEqual(identity, old_identity)
+        else:
+            self.assertNotEqual(identity, old_identity)
+        new_scope = claim_state.claim_fence_scope_key(fresh.path, fresh.record)
+        self.assertNotEqual(new_scope, old_scope)
+        self.assertEqual(controller.claim_scope_key, new_scope)
+        new_fence = self.root / offload.start_fence_relative(identity, "mac", scope_key=new_scope).with_suffix(".lock")
+        self.assertNotEqual(old_fence, new_fence)
+        if settle:
+            self.assertEqual(old_fence.parent, new_fence.parent)
+            new_fence.touch()
+            self.assertFalse(old_fence.exists())
         args = mac_test.CliArguments()
         args.pid = os.getpid()
         args.claim_id, args.episode, args.attempt = identity.claim_id, identity.episode, identity.attempt
@@ -921,8 +963,10 @@ with patch.object(Path, "unlink", interrupt):
         saved = claim_state.saved_mac_repository(held.record)
         assert isinstance(saved, claim_state.MacRepositoryIdentity)
         stem = claim_state.mac_claim_stem(REPOSITORY_KEY, 0)
-        self.assertEqual((saved.mirror_name, saved.key, held.path.name, saved.fence_directory),
-                         (self.repo.name, REPOSITORY_KEY, f"{stem}.json", stem))
+        self.assertEqual((saved.mirror_name, saved.key, held.path.name),
+                         (self.repo.name, REPOSITORY_KEY, f"{stem}.json"))
+        self.assertEqual(saved.fence_directory, stem)
+        self.assertTrue(saved.fence_generation)
         self.assertEqual(saved.history_key, str(self.repo))
         self.assertEqual(controller.attempt_evidence.repository_key, saved.history_key)
         self.assertEqual(origin_reads, [str(self.repo)])

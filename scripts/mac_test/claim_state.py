@@ -13,11 +13,15 @@ from hashlib import sha256
 import json
 from pathlib import Path
 from subprocess import SubprocessError
+import sys
 from typing import TYPE_CHECKING, Literal, NotRequired, Self, TypedDict, cast, override
+from uuid import uuid4
 
 from scripts.build_hold.owning_session import NoOwningSession, OwningSession
 from scripts.buildlog import store
 from scripts.build_targets import target_config
+from scripts.lib import process_start as process_identity
+from scripts.lib.atomic_file import write_text_atomic
 
 if TYPE_CHECKING:
     from scripts.buildlog.transfer_bytes import TransferBytes
@@ -251,21 +255,19 @@ class ProcessBoundClaim(ClaimOwnerRecord):
 
 
 class ReplacedMacReservation(TypedDict):
-    """Identify the local reservation that a remote claim replaces."""
+    """Identify the exact local reservation to remove."""
 
-    claim_id: str
-    episode: str
-    attempt: str
-    pid: int
-    proc_start: str
-    since: str
     file: str
+    fingerprint: str
 
 
 def replaced_reservation(record: ProcessBoundClaim, path: Path, paths: StatePaths) -> ReplacedMacReservation:
-    return {"claim_id": record["claim_id"], "episode": record["episode"], "attempt": record["attempt"],
-            "pid": record["pid"], "proc_start": record["proc_start"], "since": record["since"],
-            "file": str(path.relative_to(paths.directory))}
+    return {"file": str(path.relative_to(paths.directory)), "fingerprint": _reservation_fingerprint(
+        record["claim_id"], record["episode"], record["attempt"], record["pid"], record["proc_start"], record["since"])}
+
+
+def _reservation_fingerprint(claim_id: str, episode: str, attempt: str, pid: int, start: str, since: str) -> str:
+    return sha256(json.dumps((claim_id, episode, attempt, pid, start, since)).encode()).hexdigest()
 
 
 class RemoteJobClaim(ClaimOwnerRecord):
@@ -312,6 +314,7 @@ class MacRepositoryRecord(TypedDict):
     mirror_name: str
     claim_file: str
     fence_directory: str
+    fence_generation: NotRequired[str]
     history_key: NotRequired[str]
 
 
@@ -323,14 +326,25 @@ class MacMirrorIdentity:
     mirror_name: str
     claim_file: str
     fence_directory: str
+    fence_generation: str = field(default="", kw_only=True)
 
     def for_slot(self, slot: int) -> Self:
         fence = mac_claim_stem(self.key, slot)
-        return replace(self, claim_file=f"{fence}.json", fence_directory=fence)
+        return replace(self, claim_file=f"{fence}.json", fence_directory=fence, fence_generation="")
+
+    def for_remote_claim(self) -> Self:
+        return replace(self, fence_generation=uuid4().hex)
+
+    def fence_scope_key(self) -> str:
+        """Include the generation in the key for a remote claim."""
+        return f"{self.fence_directory}/{self.fence_generation}" if self.fence_generation else self.fence_directory
 
     def record(self) -> MacRepositoryRecord:
-        return {"key": self.key, "mirror_name": self.mirror_name,
-                "claim_file": self.claim_file, "fence_directory": self.fence_directory}
+        record: MacRepositoryRecord = {"key": self.key, "mirror_name": self.mirror_name,
+                                      "claim_file": self.claim_file, "fence_directory": self.fence_directory}
+        if self.fence_generation:
+            record["fence_generation"] = self.fence_generation
+        return record
 
 
 @dataclass(frozen=True)
@@ -380,6 +394,22 @@ def valid_mac_path_component(value: object) -> bool:
             and not any(character in value for character in "/\0\r\n\t"))
 
 
+def pending_start_key(identity: ClaimIdentity) -> str:
+    """Name the fence for one exact provider claim."""
+    return sha256(json.dumps([identity.claim_id, identity.episode, identity.attempt]).encode()).hexdigest()
+
+
+def start_fence_name(identity: ClaimIdentity, scope_key: str) -> str:
+    _, _, generation = scope_key.partition("/")
+    key = pending_start_key(identity)
+    return f"{key}-{generation}" if generation else key
+
+
+def claim_pending_start(paths: StatePaths, path: Path, record: RunRecord) -> Path:
+    name = start_fence_name(claim_identity(record), claim_fence_scope_key(path, record))
+    return paths.directory / "pending-starts" / name
+
+
 def mac_repository_record(value: object) -> MacRepositoryIdentity | CleanupOnlyMacRepository:
     if not isinstance(value, dict):
         raise StateReadError("invalid Mac repository identity")
@@ -393,12 +423,16 @@ def mac_repository_record(value: object) -> MacRepositoryIdentity | CleanupOnlyM
     assert isinstance(mirror, str) and isinstance(file, str) and isinstance(fence, str)
     if file != f"{fence}.json":
         raise StateReadError("the Mac claim file and fence directory differ")
+    generation = fields.get("fence_generation", "")
+    if (not isinstance(generation, str) or ("fence_generation" in fields
+            and (len(generation) != 32 or any(character not in "0123456789abcdef" for character in generation)))):
+        raise StateReadError("invalid Mac fence generation")
     history_key = fields.get("history_key", store.UNKNOWN_IDENTITY)
     if not isinstance(history_key, str) or not history_key:
         raise StateReadError("invalid Mac history key")
     if history_key == store.UNKNOWN_IDENTITY:
-        return CleanupOnlyMacRepository(key, mirror, file, fence)
-    return MacRepositoryIdentity(key, mirror, file, fence, history_key)
+        return CleanupOnlyMacRepository(key, mirror, file, fence, fence_generation=generation)
+    return MacRepositoryIdentity(key, mirror, file, fence, history_key, fence_generation=generation)
 
 
 class NoSavedMacRepository:
@@ -416,9 +450,9 @@ def saved_mac_repository(record: RunRecord) -> SavedMacRepository:
     return mac_repository_record(record["mac_repository"]) if "mac_repository" in record else NO_SAVED_MAC_REPOSITORY
 
 
-def claim_fence_directory(path: Path, record: RunRecord) -> str:
+def claim_fence_scope_key(path: Path, record: RunRecord) -> str:
     saved = saved_mac_repository(record)
-    return saved.fence_directory if isinstance(saved, MacMirrorIdentity) else path.stem
+    return saved.fence_scope_key() if isinstance(saved, MacMirrorIdentity) else path.stem
 
 
 @dataclass(frozen=True)
@@ -440,21 +474,8 @@ class HeldClaim:
         return False
 
 
-def mac_wait_replacements(
-    claims: tuple[HeldClaim, ...], identity: ClaimIdentity, pid: int, session: SubmittingSession, worktree: Path,
-) -> tuple[HeldClaim, ...]:
-    """Find replacements that record the original wait owner and checkout."""
-    return tuple(claim for claim in claims
-                 if "remote_host" in claim.record
-                 and (old := claim.record.get("replaced_reservation")) is not None
-                 and ClaimIdentity(old["claim_id"], old["episode"], old["attempt"]) == identity and old["pid"] == pid
-                 and claim.record["submitting_session"] == session_id(session)
-                 and recorded_worktree_matches(claim.record["worktree"], worktree)
-                 and isinstance(saved_mac_repository(claim.record), MacRepositoryIdentity))
-
-
 class ReservationRetirementError(OSError):
-    """The original reservation could not be removed."""
+    """A file for the interrupted replacement could not be removed."""
 
     def __init__(self, path: Path, error: OSError) -> None:
         super().__init__(f"cannot retire Mac reservation {path}: {error}")
@@ -480,6 +501,48 @@ def retire_replaced_reservation(paths: StatePaths, replacement: Path, record: Ru
     except OSError as error:
         raise ReservationRetirementError(path, error) from error
     return (path,)
+
+
+def sweep_mac_replacements(paths: StatePaths, claims: tuple[HeldClaim, ...]) -> tuple[tuple[HeldClaim, ...], set[Path]]:
+    """Remove incomplete replacements under the provider lock."""
+    if paths.platform != "macos":
+        return claims, set()
+    retired: set[Path] = set()
+    retained: set[Path] = set()
+    current: list[HeldClaim] = []
+    for claim in claims:
+        record = claim.record
+        if "remote_host" not in record or "replaced_reservation" not in record:
+            current.append(claim)
+            continue
+        pending = claim_pending_start(paths, claim.path, record).exists()
+        legacy = "/" not in claim_fence_scope_key(claim.path, record)
+        if legacy and not pending:
+            # Older runners kept this marker after launch.
+            owner = process_identity.process_start(record["pid"])
+            if isinstance(owner, process_identity.Unreadable) or owner == process_identity.Started(record["proc_start"]):
+                current.append(claim)
+                continue
+        try:
+            retired.update(retire_replaced_reservation(paths, claim.path, record))
+            if pending:
+                if legacy:
+                    completed = record.copy()
+                    del completed["replaced_reservation"]
+                    write_text_atomic(claim.path, json.dumps(completed) + "\n")
+                    claim = HeldClaim(claim.scope, claim.path, completed)
+                current.append(claim)
+                continue
+            claim.path.unlink(missing_ok=True)
+            retired.add(claim.path)
+        except ReservationRetirementError as error:
+            print(str(error), file=sys.stderr)
+            retained.add(error.path)
+            current.append(claim)
+        except OSError as error:
+            print(str(ReservationRetirementError(claim.path, error)), file=sys.stderr)
+            current.append(claim)
+    return tuple(claim for claim in current if claim.path not in retired), retained
 
 
 class NoRun:
@@ -631,23 +694,24 @@ def read_replaced_reservation(value: object, path: Path) -> ReplacedMacReservati
     if not isinstance(value, dict):
         raise StateReadError(f"{path} has an invalid replaced reservation")
     fields = cast(dict[str, object], value)
-    pid = fields.get("pid")
-    if type(pid) is not int:
-        raise StateReadError(f"{path} has an invalid replaced reservation pid")
     file = required_string(fields, "file", path)
     relative = Path(file)
     if file != "run.json" and (len(relative.parts) != 2 or relative.parts[0] != "claims"
                                or relative.suffix != ".json" or str(relative) != file):
         raise StateReadError(f"{path} has an invalid replaced reservation file")
-    return {
-        "claim_id": required_string(fields, "claim_id", path),
-        "episode": required_string(fields, "episode", path),
-        "attempt": required_string(fields, "attempt", path),
-        "pid": pid,
-        "proc_start": required_string(fields, "proc_start", path),
-        "since": required_string(fields, "since", path),
-        "file": file,
-    }
+    if "fingerprint" in fields:
+        fingerprint = required_string(fields, "fingerprint", path)
+        if len(fingerprint) != 64 or any(character not in "0123456789abcdef" for character in fingerprint):
+            raise StateReadError(f"{path} has an invalid replaced reservation fingerprint")
+    else:
+        pid = fields.get("pid")
+        if type(pid) is not int:
+            raise StateReadError(f"{path} has an invalid replaced reservation pid")
+        fingerprint = _reservation_fingerprint(
+            required_string(fields, "claim_id", path), required_string(fields, "episode", path),
+            required_string(fields, "attempt", path), pid, required_string(fields, "proc_start", path),
+            required_string(fields, "since", path))
+    return {"file": file, "fingerprint": fingerprint}
 
 
 def aware_timestamp(value: object, path: Path, field: str) -> datetime:

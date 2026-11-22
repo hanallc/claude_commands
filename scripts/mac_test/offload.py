@@ -15,7 +15,6 @@ from enum import Enum
 from functools import partial
 from importlib import import_module
 import fcntl
-import hashlib
 import json
 import math
 import os
@@ -40,6 +39,7 @@ from scripts.aws_target import hana_protocol
 from scripts.build_hold.owning_session import NoOwningSession, OwningSession
 from scripts.mac_test import claim_state
 from scripts.mac_test.claim_state import WAIT_CLAIM_CHECK_PREFIX, WaitClaimCheck, claim_worktree_path
+from scripts.mac_test.claim_state import pending_start_key as pending_start_key
 if TYPE_CHECKING:
     from scripts.build_queue import admission_records as records, placement
 else:
@@ -533,19 +533,16 @@ class StartUnsettled:
     leftovers: LeftoverCheckResult
 
 
-def pending_start_key(identity: claim_state.ClaimIdentity) -> str:
-    """Name the fence for one exact provider claim."""
-    return hashlib.sha256(json.dumps([identity.claim_id, identity.episode, identity.attempt]).encode()).hexdigest()
-
-
-def pending_start_path(target: str, identity: claim_state.ClaimIdentity) -> Path:
-    return claim_state.state_paths(target).directory / "pending-starts" / pending_start_key(identity)
+def pending_start_path(target: str, identity: claim_state.ClaimIdentity, *, scope_key: str = "run") -> Path:
+    name = claim_state.start_fence_name(identity, scope_key)
+    return claim_state.state_paths(target).directory / "pending-starts" / name
 
 
 def start_fence_relative(identity: claim_state.ClaimIdentity, target: str, *, scope_key: str = "run") -> Path:
     state = (Path(".local/state/mac-test") if target in ("", "mac")
              else Path(".local/state/build-targets") / target)
-    return state / "dispatch-fences" / scope_key / pending_start_key(identity)
+    scope, _, _ = scope_key.partition("/")
+    return state / "dispatch-fences" / scope / claim_state.start_fence_name(identity, scope_key)
 
 
 def clean_start_fences_command(identity: claim_state.ClaimIdentity, target: str, *, scope_key: str = "run") -> str:
@@ -1062,8 +1059,8 @@ class ProcessController:
                         if line.startswith("mac_repository="):
                             self.mac_repository = claim_state.mac_repository_record(
                                 cast(object, json.loads(line.removeprefix("mac_repository="))))
-                            self.claim_scope_key = self.mac_repository.fence_directory
-                elif answer.status != claim_state.LEGACY_WAIT_CLAIM_RELEASED and isinstance(self.placement, AssignedOffloadRequest):
+                            self.claim_scope_key = self.mac_repository.fence_scope_key()
+                elif answer.status not in (10, 11, 12, claim_state.LEGACY_WAIT_CLAIM_RELEASED):
                     self.inspect_claim(attempt, expected)
         finally:
             if isinstance(attempt.process, RunningProcess) and attempt.process.process.poll() is None:
@@ -1085,26 +1082,25 @@ class ProcessController:
         assigned = self.placement.assignment
         paths = claim_state.state_paths(assigned.destination.target)
         with claim_state.locked(paths.lock):
-            for held in claim_state.read_claims(paths):
+            claims, _ = claim_state.sweep_mac_replacements(paths, claim_state.read_claims(paths))
+            for held in claims:
                 record = held.record
                 scope = assigned.destination.scope
                 matches = (held.matches_mac_assignment_scope(scope) if paths.platform == "macos" else held.scope == scope)
                 if paths.platform == "macos" and record.get("cleanup_pending") and not record.get("repo_key"):
                     matches = True
-                if (claim_state.claim_identity(record) != expected or not matches
+                if ("replaced_reservation" in record or claim_state.claim_identity(record) != expected or not matches
                         or record["pid"] != os.getpid()
                         or record["submitting_session"] != claim_state.session_id(assigned.session)):
                     continue
                 start = process_identity.process_start(os.getpid())
                 if not isinstance(start, process_identity.Started) or start.start != record["proc_start"]:
                     continue
-                try:
-                    _ = claim_state.retire_replaced_reservation(paths, held.path, record)
-                except claim_state.ReservationRetirementError as error:
-                    attempt.answer = MacClaimNotConfirmed("state", "", f"{error}\n")
-                    return
+                if (paths.platform == "macos" and not record.get("cleanup_pending")
+                        and claim_state.claim_pending_start(paths, held.path, record).exists()):
+                    continue
                 self.claim_identity = expected
-                self.claim_scope_key = claim_state.claim_fence_directory(held.path, record)
+                self.claim_scope_key = claim_state.claim_fence_scope_key(held.path, record)
                 self.mac_repository = claim_state.saved_mac_repository(record)
                 if "remote_host" in record and record.get("cleanup_pending"):
                     attempt.answer = TakenOverMacClaim(record["remote_host"], record.get("slot", 1))
@@ -1219,7 +1215,7 @@ class ProcessController:
                 if (isinstance(identity, claim_state.ClaimIdentity)
                         and marker == "dispatch_start_settled=" + pending_start_key(identity)):
                     self.pending = SettledDispatchOperations()
-                    pending_start_path(self.claim_target, identity).unlink(missing_ok=True)
+                    pending_start_path(self.claim_target, identity, scope_key=self.claim_scope_key).unlink(missing_ok=True)
                     if not isinstance(status, ReportedMacStatus):
                         self.attempt_evidence.execution = execution_identity.ExecutionNotStarted()
                     continue
@@ -1639,7 +1635,7 @@ def release_claim(controller: ProcessController, target: str = "") -> ClaimRelea
                 controller.attempt_evidence.traffic.transfers.extend(transfers)
 
     if isinstance(result, CommandOutput) and result.status == 0:
-        pending_start_path(target, identity).unlink(missing_ok=True)
+        pending_start_path(target, identity, scope_key=controller.claim_scope_key).unlink(missing_ok=True)
         return ClaimReleaseConfirmed()
     return ClaimReleaseUnconfirmed("the provider did not confirm exact release")
 
@@ -1892,7 +1888,7 @@ def probe_mac(
         timeout_s = config.probe_timeout_s
     identity = controller.claim_identity
     if isinstance(identity, claim_state.ClaimIdentity):
-        path = pending_start_path(target, identity)
+        path = pending_start_path(target, identity, scope_key=controller.claim_scope_key)
         path.parent.mkdir(parents=True, exist_ok=True)
         write_text_atomic(path, pending_start_key(identity))
         script = ("(\n" + script + "\n)\nprobe_status=$?\n"
@@ -2584,7 +2580,7 @@ def settle_pending_start(controller: ProcessController, config: OffloadConfig, h
     if (isinstance(observed.result, LeftoversEnded)
             and "dispatch_start_settled=" + pending_start_key(identity) in observed.output.splitlines()):
         controller.pending = SettledDispatchOperations()
-        pending_start_path(target, identity).unlink(missing_ok=True)
+        pending_start_path(target, identity, scope_key=controller.claim_scope_key).unlink(missing_ok=True)
         return StartSettled(observed.result)
     return StartUnsettled("the original remote start has not settled", observed.result)
 
@@ -2682,7 +2678,7 @@ def claim_for_run(
         controller.complete_claim(claim_arguments(request, config, leased_slots, retire_wait=retire_wait,
                                                   mac_repository=mac_repository), attempt)
         if isinstance(controller.claim_identity, claim_state.ClaimIdentity):
-            if pending_start_path(request.target, controller.claim_identity).exists():
+            if pending_start_path(request.target, controller.claim_identity, scope_key=controller.claim_scope_key).exists():
                 controller.pending = PendingStartOperation()
         if isinstance(request.placement, AssignedOffloadRequest) and isinstance(controller.claim_identity, claim_state.ClaimIdentity):
             assigned = request.placement.assignment
@@ -3378,34 +3374,26 @@ def run_offload(
                 claims = claim_state.read_claims(paths)
             except claim_state.StateReadError:
                 return declined("state", started)
-            replacements = claim_state.mac_wait_replacements(claims, admission.identity, admission.owner_pid,
-                                                              admission.submitting_session, request.repo_root)
-            if len(replacements) > 1:
-                return declined("state", started)
-            held = replacements[0] if replacements else next((claim for claim in claims
+            held = next((claim for claim in claims
                 if claim_state.claim_identity(claim.record) == admission.identity
-                and claim.record["pid"] == admission.owner_pid), None)
-            saved = claim_state.saved_mac_repository(held.record) if held is not None else claim_state.NO_SAVED_MAC_REPOSITORY
-            if (not replacements and held is not None and not held.record.get("cleanup_pending")
-                    and isinstance(saved, claim_state.MacRepositoryIdentity)):
-                policy_repository = saved
-                controller.attempt_evidence.repository_key = saved.history_key
-            elif held is not None and "remote_host" not in held.record:
-                retire_wait = True
+                and "replaced_reservation" not in claim.record), None)
+            if held is None:
+                request = replace(request, admission=UnclaimedMacRun())
             else:
-                host = held.record["remote_host"] if held is not None and "remote_host" in held.record else config.host
-                replacement = (claim_state.claim_identity(replacements[0].record) if replacements
-                               else claim_state.NO_CLAIM_IDENTITY)
-                cleanup = adopt_wait_for_cleanup(controller, config, request, saved, host, started,
-                                                 replacement=replacement)
-                if isinstance(cleanup, ClaimReleaseConfirmed):
-                    if (isinstance(request.placement, AssignedOffloadRequest)
-                            and isinstance(replacement, claim_state.NoClaimIdentity)):
+                saved = claim_state.saved_mac_repository(held.record)
+                if isinstance(saved, claim_state.MacRepositoryIdentity) and not held.record.get("cleanup_pending"):
+                    policy_repository = saved
+                    controller.attempt_evidence.repository_key = saved.history_key
+                elif "remote_host" not in held.record:
+                    retire_wait = True
+                else:
+                    cleanup = adopt_wait_for_cleanup(controller, config, request, saved, held.record["remote_host"], started)
+                    if not isinstance(cleanup, ClaimReleaseConfirmed):
+                        return cleanup
+                    if isinstance(request.placement, AssignedOffloadRequest):
                         return BusyMacDecline(LostRunLeftovers(), elapsed_seconds(started))
                     cleanup_takeover = False
-                else:
-                    return cleanup
-                request = replace(request, admission=UnclaimedMacRun())
+                    request = replace(request, admission=UnclaimedMacRun())
         if retire_wait or isinstance(request.admission, UnclaimedMacRun):
             resolved = claim_state.mac_repository_identity(str(request.repo_root))
             if isinstance(resolved, claim_state.WholeMacScope):
@@ -3499,8 +3487,7 @@ def cleanup_taken_over_claim(controller: ProcessController, config: OffloadConfi
 
 def adopt_wait_for_cleanup(controller: ProcessController, config: OffloadConfig, request: OffloadRequest,
                            saved: claim_state.SavedMacRepository,
-                           host: str, started: float, *,
-                           replacement: claim_state.ClaimIdentity | claim_state.NoClaimIdentity = claim_state.NO_CLAIM_IDENTITY,
+                           host: str, started: float,
                            ) -> ClaimReleaseConfirmed | BusyMacDecline | DeclinedMacRun:
     from scripts.copies import copies
 
@@ -3512,8 +3499,6 @@ def adopt_wait_for_cleanup(controller: ProcessController, config: OffloadConfig,
                 return claim_refusal(controller, request, claim, started, claim_from_wait=True)
             if isinstance(claim, (TakenOverMacClaim, TakeoverHostUnreadable)):
                 if isinstance(claim, TakenOverMacClaim) and (claim.host != host or controller.mac_repository != saved):
-                    return declined("state", started)
-                if isinstance(replacement, claim_state.ClaimIdentity) and controller.claim_identity != replacement:
                     return declined("state", started)
                 return cleanup_taken_over_claim(controller, config, request, claim, repository, started)
             return declined("state", started)

@@ -230,7 +230,7 @@ def main() -> int:
         if "--copy" in arguments:
             record["copy"] = True
         reply = ["claim_identity=" + json.dumps(identity_words),
-                 "claim_fence=" + claim_state.claim_fence_directory(path, record)]
+                 "claim_fence=" + claim_state.claim_fence_scope_key(path, record)]
         if "mac_repository" in record:
             reply.append("mac_repository=" + json.dumps(record["mac_repository"]))
         path.parent.mkdir(parents=True, exist_ok=True)

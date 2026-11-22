@@ -269,7 +269,7 @@ if isinstance(claim, claim_state.NoRun):
     raise AssertionError(f"Cannot settle a missing claim: {path}")
 command = offload.start_fence_command(
     claim_state.claim_identity(claim), "mac", settle=True,
-    scope_key=claim_state.claim_fence_directory(path, claim),
+    scope_key=claim_state.claim_fence_scope_key(path, claim),
 )
 raise SystemExit(subprocess.run(["/bin/bash", "-c", command], check=False).returncode)
 ''') + r'''

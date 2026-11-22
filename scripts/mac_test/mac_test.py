@@ -687,12 +687,13 @@ def claim_owner(run: RunRecord) -> tuple[claim_state.ClaimIdentity, int, str, st
 
 
 def run_is_kept(run: RunRecord) -> TypeGuard[RemoteJobClaim]:
-    return "remote_host" in run and process_identity.process_start(run["pid"]) != process_identity.Started(run["proc_start"])
+    return "remote_host" in run and ("replaced_reservation" in run
+        or process_identity.process_start(run["pid"]) != process_identity.Started(run["proc_start"]))
 
 
 def recoverable_kept_claim(run: RunRecord) -> TypeGuard[RemoteJobClaim]:
     """Require proof that the saved owner of the remote claim ended."""
-    if "remote_host" not in run:
+    if "remote_host" not in run or "replaced_reservation" in run:
         return False
     owner = process_identity.process_start(run["pid"])
     return not isinstance(owner, process_identity.Unreadable) and owner != process_identity.Started(run["proc_start"])
@@ -708,7 +709,8 @@ def copy_gives_way(run: RunRecord) -> bool:
 
     A kept copy claim holds leftovers like any other kept claim and never gives way.
     """
-    return run.get("copy") is True and process_identity.process_start(run["pid"]) == process_identity.Started(run["proc_start"])
+    return ("replaced_reservation" not in run and run.get("copy") is True
+            and process_identity.process_start(run["pid"]) == process_identity.Started(run["proc_start"]))
 
 
 def claim_scope(worktree: str) -> ClaimScope:
@@ -876,26 +878,12 @@ def remember_slot(paths: StatePaths, scope: RepositoryScope, record: RunRecord) 
 
 def live_claims(paths: StatePaths) -> tuple[HeldClaim, ...]:
     """Read every claim and remove each one whose owner has ended."""
-    from scripts.mac_test import offload
-
-    claims = read_claims(paths)
-    retired: set[Path] = set()
-    retained: set[Path] = set()
-    if paths.platform == "macos":
-        for claim in claims:
-            try:
-                retired.update(claim_state.retire_replaced_reservation(paths, claim.path, claim.record))
-            except claim_state.ReservationRetirementError as error:
-                print(str(error), file=sys.stderr)
-                retained.add(error.path)
+    claims, retained = claim_state.sweep_mac_replacements(paths, read_claims(paths))
     live: list[HeldClaim] = []
     for claim in claims:
-        if claim.path in retired:
-            continue
         if claim.path in retained or run_is_live(claim.record):
             live.append(claim)
-        elif offload.pending_start_path(paths.target, claim_state.ClaimIdentity(
-                claim.record["claim_id"], claim.record["episode"], claim.record["attempt"])).exists():
+        elif claim_state.claim_pending_start(paths, claim.path, claim.record).exists():
             release = CliArguments()
             release.pid, release.target = claim.record["pid"], paths.target
             release.claim_id = claim.record["claim_id"]
@@ -1979,7 +1967,7 @@ def finished_claim(args: CliArguments, record: RunRecord, path: Path, *, adopted
         identity = claim_state.claim_identity(record)
         lines.append("claim_identity=" + json.dumps({"claim_id": identity.claim_id,
                      "episode": identity.episode, "attempt": identity.attempt}))
-        lines.append("claim_fence=" + claim_state.claim_fence_directory(path, record))
+        lines.append("claim_fence=" + claim_state.claim_fence_scope_key(path, record))
         if "mac_repository" in record:
             lines.append("mac_repository=" + json.dumps(record["mac_repository"]))
     slot = (f"slot: {record['slot']}",) if "slot" in record else ()
@@ -1992,6 +1980,8 @@ def finished_claim(args: CliArguments, record: RunRecord, path: Path, *, adopted
 def take_over_kept_claim(args: CliArguments, claim: HeldClaim, kept: RemoteJobClaim,
                          *, session: SubmittingSession) -> ClaimAttempt:
     """Transfer cleanup ownership without granting permission to run."""
+    if "replaced_reservation" in kept:
+        return ClaimBusy(kept)
     proc_start = process_identity.process_start(args.pid)
     if not isinstance(proc_start, process_identity.Started):
         return ClaimDenied(1, f"cannot claim: process {args.pid} is not running", to_stderr=True)
@@ -2035,7 +2025,7 @@ def claim_once(args: CliArguments, paths: StatePaths, scope: ClaimScope,
         return ClaimDenied(12, f"state unreadable: {paths.block}")
     for claim in overlapping:
         record = claim.record
-        if ("remote_host" in record and record.get("cleanup_pending")
+        if ("remote_host" in record and "replaced_reservation" not in record and record.get("cleanup_pending")
                 and record["pid"] == args.pid and claim_state.claim_identity(record) == identity
                 and not run_is_kept(record)
                 and (not args.leased_slots or record.get("slot", 1) in args.leased_slots)):
@@ -2134,6 +2124,8 @@ def claim_once(args: CliArguments, paths: StatePaths, scope: ClaimScope,
     path = claim_path(paths, scope)
     if isinstance(mac_repository, claim_state.MacMirrorIdentity) and isinstance(scope, RepositoryScope):
         selected_repository = mac_repository.for_slot(scope.slot)
+        if "remote_host" in claimed:
+            selected_repository = selected_repository.for_remote_claim()
         claimed["mac_repository"] = selected_repository.record()
         path = paths.claims / selected_repository.claim_file
     for claim in claims:
@@ -2143,11 +2135,17 @@ def claim_once(args: CliArguments, paths: StatePaths, scope: ClaimScope,
     # Keep the old reservation until the replacement is visible.
     write_json(path, claimed)
     if isinstance(replaces, _VerifiedMacReservation):
+        assert "remote_host" in claimed
         try:
             _ = claim_state.retire_replaced_reservation(paths, path, claimed)
         except claim_state.ReservationRetirementError as error:
-            path.unlink()
+            try:
+                path.unlink(missing_ok=True)
+            except OSError as unlink_error:
+                print(str(claim_state.ReservationRetirementError(path, unlink_error)), file=sys.stderr)
             return ClaimDenied(12, str(error), to_stderr=True)
+        del claimed["replaced_reservation"]
+        write_json(path, claimed)
     if paths.platform == "linux" and isinstance(scope, RepositoryScope) and scope.slot:
         remember_slot(paths, scope, claimed)
     return finished_claim(args, claimed, path)
@@ -2175,31 +2173,28 @@ def refuse_wait_claim(check: WaitClaimCheck, *, status: Literal[11, 12] = 12) ->
     return ClaimDenied(status, check.diagnostic, to_stderr=True)
 
 
-def recover_wait_replacement(
-    args: CliArguments, paths: StatePaths, scope: ClaimScope, claim: HeldClaim,
+def replace_incomplete_wait_claim(
+    args: CliArguments, paths: StatePaths, scope: ClaimScope,
     assignment: placement.PlacementAssignment | UnassignedClaim, session: SubmittingSession,
-    start: process_identity.Started,
+    repository: claim_state.MacRepositoryIdentity | claim_state.CleanupOnlyMacRepository | WholeMacScope,
+    replaces: _VerifiedMacReservation | _KeepOtherReservations,
 ) -> ClaimAttempt:
-    """Transfer only cleanup ownership of the exact replacement."""
-    record = claim.record
-    assert "remote_host" in record and "replaced_reservation" in record
-    old = record["replaced_reservation"]
-    if process_identity.process_start(args.from_pid) != process_identity.Started(old["proc_start"]):
-        return refuse_wait_claim(WaitClaimCheck.OWNER_START)
+    """Acquire a Mac claim under the execution lease."""
+    if not isinstance(repository, claim_state.MacRepositoryIdentity):
+        return ClaimDenied(12, "the replacement Mac claim needs a repository and history key")
+    if isinstance(assignment, UnassignedClaim):
+        scope = RepositoryScope(repository.mirror_name, repository.key)
+    elif not isinstance(scope, RepositoryScope) or scope.key != repository.key:
+        if isinstance(replaces, _VerifiedMacReservation):
+            replaces.path.unlink()
+        return ClaimFinished(claim_state.LEGACY_WAIT_CLAIM_RELEASED, ("legacy reservation released",))
+    replacement = copy(args)
+    replacement.claim_id, replacement.episode, replacement.attempt = "", args.retire_wait, ""
     if not isinstance(assignment, UnassignedClaim):
-        expected = claim_state.ClaimIdentity(execution_identity.assigned_claim_id(assignment.episode, assignment.attempt),
-                                             assignment.episode, assignment.attempt)
-        if claim_state.claim_identity(record) != expected or not claim.matches_mac_assignment_scope(scope):
-            return refuse_wait_claim(WaitClaimCheck.SCOPE)
-    try:
-        _ = claim_state.retire_replaced_reservation(paths, claim.path, record)
-    except claim_state.ReservationRetirementError as error:
-        return ClaimDenied(12, str(error), to_stderr=True)
-    if recoverable_kept_claim(record):
-        return take_over_kept_claim(args, claim, record, session=session)
-    if record.get("cleanup_pending") and record["pid"] == args.pid and record["proc_start"] == start.start:
-        return finished_claim(args, record, claim.path, adopted=True)
-    return ClaimBusy(record)
+        replacement.episode, replacement.attempt = assignment.episode, assignment.attempt
+        replacement.claim_id = execution_identity.assigned_claim_id(assignment.episode, assignment.attempt)
+    return claim_once(replacement, paths, scope, session=session, assignment=assignment,
+                      mac_repository=repository, replaces=replaces)
 
 
 def adopt_wait_claim(args: CliArguments, paths: StatePaths, scope: ClaimScope,
@@ -2213,17 +2208,15 @@ def adopt_wait_claim(args: CliArguments, paths: StatePaths, scope: ClaimScope,
         return refuse_wait_claim(WaitClaimCheck.RUNNER_START)
     if not isinstance(args.remote, str):
         return refuse_wait_claim(WaitClaimCheck.REMOTE_MISSING)
-    owners = read_claims(paths)
+    owners, _ = claim_state.sweep_mac_replacements(paths, read_claims(paths))
+    identity = claim_state.ClaimIdentity(args.claim_id, args.episode, args.attempt)
+    if (paths.platform == "macos" and args.retire_wait
+            and not any(claim_state.claim_identity(claim.record) == identity for claim in owners)):
+        return replace_incomplete_wait_claim(args, paths, scope, assignment, session, mac_repository,
+                                             _KEEP_OTHER_RESERVATIONS)
     if not owners:
         return refuse_wait_claim(WaitClaimCheck.NO_RESERVATION)
-    identity = claim_state.ClaimIdentity(args.claim_id, args.episode, args.attempt)
     worktree = claim_worktree_path(args.worktree)
-    if paths.platform == "macos":
-        replacements = claim_state.mac_wait_replacements(owners, identity, args.from_pid, session, worktree)
-        if len(replacements) == 1:
-            return recover_wait_replacement(args, paths, scope, replacements[0], assignment, session, start)
-        if replacements:
-            return refuse_wait_claim(WaitClaimCheck.RESERVATION_COUNT)
     checks: tuple[tuple[WaitClaimCheck, Callable[[HeldClaim], bool]], ...] = (
         (WaitClaimCheck.IDENTITY, lambda claim: claim_state.claim_identity(claim.record) == identity),
         (WaitClaimCheck.SCOPE, lambda claim: wait_claim_matches(paths, claim, scope, worktree)
@@ -2231,7 +2224,8 @@ def adopt_wait_claim(args: CliArguments, paths: StatePaths, scope: ClaimScope,
                 and (isinstance(scope, WholeMacScope) or claim.matches_mac_assignment_scope(scope)))),
         (WaitClaimCheck.PID, lambda claim: claim.record["pid"] == args.from_pid),
         (WaitClaimCheck.SESSION, lambda claim: claim.record["submitting_session"] == claim_state.session_id(session)),
-        (WaitClaimCheck.REMOTE_HOST, lambda claim: "remote_host" not in claim.record or claim.record.get("cleanup_pending") is True),
+        (WaitClaimCheck.REMOTE_HOST, lambda claim: "remote_host" not in claim.record
+            or ("replaced_reservation" not in claim.record and claim.record.get("cleanup_pending") is True)),
         (WaitClaimCheck.OWNER_START, lambda claim:
             process_identity.process_start(args.from_pid) == process_identity.Started(claim.record["proc_start"])),
         (WaitClaimCheck.WORKTREE, lambda claim: (claim.record.get("cleanup_pending") is True
@@ -2264,27 +2258,15 @@ def adopt_wait_claim(args: CliArguments, paths: StatePaths, scope: ClaimScope,
         if paths.platform == "macos" and not isinstance(saved, claim_state.MacRepositoryIdentity):
             if not args.retire_wait:
                 return ClaimDenied(12, "the Mac reservation needs retirement under the execution lease")
-            if not isinstance(mac_repository, claim_state.MacRepositoryIdentity):
-                return ClaimDenied(12, "the replacement Mac claim needs a repository and history key")
-            if isinstance(assignment, UnassignedClaim):
-                replacement_scope = RepositoryScope(mac_repository.mirror_name, mac_repository.key)
-            elif isinstance(scope, RepositoryScope) and scope.key == mac_repository.key:
-                replacement_scope = scope
-            else:
-                claim.path.unlink()
-                return ClaimFinished(claim_state.LEGACY_WAIT_CLAIM_RELEASED, ("legacy reservation released",))
-            replacement = copy(args)
-            replacement.claim_id, replacement.episode, replacement.attempt = "", args.retire_wait, ""
-            if not isinstance(assignment, UnassignedClaim):
-                replacement.episode, replacement.attempt = assignment.episode, assignment.attempt
-                replacement.claim_id = execution_identity.assigned_claim_id(assignment.episode, assignment.attempt)
-            return claim_once(replacement, paths, replacement_scope, session=session, assignment=assignment,
-                              mac_repository=mac_repository, replaces=_VerifiedMacReservation(claim.path, claim.record))
+            return replace_incomplete_wait_claim(args, paths, scope, assignment, session, mac_repository,
+                                                 _VerifiedMacReservation(claim.path, claim.record))
     record: RemoteJobClaim
     if "remote_host" in claim.record:
         record = {**claim.record}
     else:
         record = {**claim.record, "remote_host": args.remote}
+        if paths.platform == "macos" and isinstance(saved, claim_state.MacRepositoryIdentity):
+            record["mac_repository"] = saved.for_remote_claim().record()
     record["pid"] = args.pid
     record["proc_start"] = start.start
     cleanup_only = record.get("cleanup_pending") is True
@@ -2483,7 +2465,7 @@ def release_exact_claims(
                     return ClaimReleaseRefused("the cleanup lease is busy")
                 except copies.CopyError as error:
                     return ClaimReleaseRefused(f"the cleanup lease is unavailable: {error}")
-            pending = offload.pending_start_path(paths.target, identity)
+            pending = claim_state.claim_pending_start(paths, path, record)
             fence_pending = pending.exists()
             count_legacy = (paths.platform == "macos" and isinstance(saved, claim_state.NoSavedMacRepository)
                             and isinstance(remote_work, EndStoppedWork))
@@ -2502,7 +2484,7 @@ def release_exact_claims(
                     command = ""
                 if fence_pending:
                     command += offload.start_fence_command(identity, paths.target, settle=True,
-                        scope_key=claim_state.claim_fence_directory(path, record)) + "\n"
+                        scope_key=claim_state.claim_fence_scope_key(path, record)) + "\n"
                 if isinstance(remote_work, KeepRemoteWork):
                     command += "printf 'leftovers=0\\nrc=0\\n'\n"
                 observed = offload.read_leftovers(connection, record["remote_host"], command, paths.target)
