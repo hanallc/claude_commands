@@ -457,7 +457,7 @@ def _scope_stop_graces() -> tuple[float, float]:
 
 def _finish_slice_stop(
     path: Path, run_slice: process_stop.RunSliceIdentity, *, ended: bool,
-    grace: float, kill_grace: float, cleanup: bool = False,
+    grace: float, kill_grace: float, cleanup: bool = False, commit_synced: bool = False,
 ) -> None:
     """Confirm the end of an authorized stop under the stop lock."""
     if not ended:
@@ -467,6 +467,8 @@ def _finish_slice_stop(
                 if not record.get("slice_leftovers"):
                     record["slice_leftovers"] = True
                     write_text_atomic(path, json.dumps(record, indent=2, sort_keys=True))
+        elif not commit_synced:
+            atomic_file.sync_folder(path.parent)
         process_stop.stop_slice(run_slice, grace, kill_grace)
     with record_lock(path):
         record = _read_record(path)
@@ -517,14 +519,16 @@ def _stop_slice_command(
             record = _read_record_if_present(path)
             if record is None or record.get("command_slice") != run_slice or record["status"] != "running" or not check():
                 return False
-            if not record.get("stop_pass_requested"):
+            recovered_commit = bool(record.get("stop_pass_requested"))
+            if not recovered_commit:
                 if ended:
                     return False
                 record.update(stop_reason=reason, stop_pass_requested=True)
                 if stop_notice_id:
                     record["stop_notice_id"] = stop_notice_id
                 write_text_atomic(path, json.dumps(record, indent=2, sort_keys=True))
-        _finish_slice_stop(path, run_slice, ended=ended, grace=grace, kill_grace=kill_grace)
+        _finish_slice_stop(path, run_slice, ended=ended, grace=grace, kill_grace=kill_grace,
+                           commit_synced=not recovered_commit)
     return True
 
 
@@ -580,13 +584,14 @@ def stop_command(
 
 def acknowledge_stop_notice(path: Path, notice_id: str) -> None:
     """Release notice evidence after a saved notice or confirmed abandonment."""
-    if not notice_id or worker_lifecycle.read_json_object(path).get("stop_notice_id") != notice_id:
-        return
-    with record_lock(path):
-        record = _read_record_if_present(path)
-        if record is not None and record.get("stop_notice_id") == notice_id:
-            del record["stop_notice_id"]
-            write_text_atomic(path, json.dumps(record, indent=2, sort_keys=True))
+    if notice_id and worker_lifecycle.read_json_object(path).get("stop_notice_id") == notice_id:
+        with record_lock(path):
+            record = _read_record_if_present(path)
+            if record is not None and record.get("stop_notice_id") == notice_id:
+                del record["stop_notice_id"]
+                write_text_atomic(path, json.dumps(record, indent=2, sort_keys=True))
+                return
+    atomic_file.sync_folder(path.parent)
 
 
 def seat_name(session_dir: str, name: str) -> str:
@@ -792,8 +797,9 @@ def _reap_orphans_locked(runs: Path, worker: str = "") -> OrphanReapResult:
                 raw.get("stop_pass_requested") or (raw.get("slice_cleanup_pending") and not supervisor_alive)):
             try:
                 _resume_slice_stop(path, run_slice, allow_cleanup=not supervisor_alive)
-            except process_stop.SliceStopFailed as error:
+            except OSError as error:
                 print(f"detached_runs: {path.stem}: stop recovery failed: {error}", file=sys.stderr)
+                continue
         if supervisor_alive:
             continue
         try:
@@ -2143,7 +2149,7 @@ def command_supervisor_gone(args: argparse.Namespace) -> int:
 
     try:
         _ = stop_command(path, SUPERVISOR_GONE_REASON, check=supervisor_is_gone, stop_pass=False, retry_slice_read=True)
-    except process_stop.SliceStopFailed as error:
+    except OSError as error:
         print(f"detached_runs: {path.stem}: stop failed: {error}", file=sys.stderr)
         return 1
     record = _read_record(path)
@@ -2181,7 +2187,7 @@ def command_stop(args: argparse.Namespace) -> int:
         if stop_command(path, str(getattr(args, "reason", ""))):
             print(f"stopped {path.stem}: its result comes from the supervisor")
             return 0
-    except process_stop.SliceStopFailed as error:
+    except OSError as error:
         print(f"detached_runs: {path.stem}: stop failed: {error}", file=sys.stderr)
         return 1
     raw = worker_lifecycle.read_json_object(path)

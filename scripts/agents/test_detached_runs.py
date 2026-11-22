@@ -779,6 +779,21 @@ class DetachedRunsTests(unittest.TestCase):
         self.assertEqual(detached_runs.prune_finished(path.parent), [path.stem])
         self.assertEqual(self.run_files(path.stem), [])
 
+    def test_acknowledgment_retries_the_sync_when_the_notice_id_is_absent(self) -> None:
+        path = self.finished_run("stop-notice", stop_notice_id="notice", stop_pass_requested=True,
+                                 stop_reason="fixture stop")
+        with patch.object(atomic_file, "sync_folder", side_effect=OSError("fixture directory sync failed")) as sync:
+            with self.assertRaises(atomic_file.AtomicDurabilityUnconfirmed):
+                detached_runs.acknowledge_stop_notice(path, "notice")
+            saved = path.read_bytes()
+            self.assertNotIn("stop_notice_id", worker_lifecycle.read_json_object(path))
+            with self.assertRaisesRegex(OSError, "fixture directory sync failed"):
+                detached_runs.acknowledge_stop_notice(path, "notice")
+            self.assertEqual(path.read_bytes(), saved)
+        self.assertEqual(sync.call_args_list, [call(path.parent), call(path.parent)])
+        detached_runs.acknowledge_stop_notice(path, "notice")
+        self.assertEqual(path.read_bytes(), saved)
+
     def test_prune_keeps_a_delivered_result_until_the_saved_stage_completes(self) -> None:
         opened = time.time()
         self.set_pass("completed", opened)
@@ -1481,6 +1496,45 @@ sys.exit(1)
         settings.assert_not_called()
         lock.assert_not_called()
         self.assertEqual(path.read_bytes(), original)
+
+    @unittest.skipUnless(process_stop.supported(), "pidfd stop needs Linux")
+    def test_retry_and_reaper_sync_the_saved_stop_before_signaling(self) -> None:
+        path, cgroups, events = self.record_populated_slice()
+        original = path.read_bytes()
+        reason = "Stop the private command."
+
+        def end_slice(_slice: process_stop.RunSliceIdentity, _grace: float, _kill_grace: float) -> None:
+            _ = events.write_text("populated 0\n")
+
+        for recovery in ("retry", "reaper"):
+            with (self.subTest(recovery=recovery),
+                  patch.object(process_stop, "CGROUP_ROOT", cgroups),
+                  patch.object(detached_run_process, "supervises", return_value=False),
+                  patch.object(process_stop, "stop_slice", side_effect=end_slice) as stop):
+                _ = path.write_bytes(original)
+                _ = events.write_text("populated 1\n")
+                with patch.object(atomic_file, "sync_folder", side_effect=OSError("fixture directory sync failed")) as sync:
+                    with self.assertRaises(atomic_file.AtomicDurabilityUnconfirmed):
+                        _ = detached_runs.stop_command(path, reason)
+                    saved = path.read_bytes()
+                    self.assertEqual(worker_lifecycle.read_json_object(path)["stop_reason"], reason)
+                    if recovery == "retry":
+                        with self.assertRaisesRegex(OSError, "fixture directory sync failed"):
+                            _ = detached_runs.stop_command(path, reason)
+                    else:
+                        with contextlib.redirect_stderr(io.StringIO()) as errors:
+                            self.assertEqual(detached_runs.reap_orphans(str(self.session)), [])
+                        self.assertIn("fixture directory sync failed", errors.getvalue())
+                    self.assertEqual(sync.call_args_list, [call(path.parent), call(path.parent)])
+                    self.assertEqual(path.read_bytes(), saved)
+                    self.assertEqual(events.read_text(), "populated 1\n")
+                    stop.assert_not_called()
+                if recovery == "retry":
+                    self.assertTrue(detached_runs.stop_command(path, reason))
+                else:
+                    self.assertEqual(detached_runs.reap_orphans(str(self.session)), [path.stem])
+                stop.assert_called_once()
+                self.assertEqual(events.read_text(), "populated 0\n")
 
     @unittest.skipUnless(process_stop.supported(), "pidfd stop needs Linux")
     def test_stop_refuses_when_prune_removes_the_run_during_a_lock_wait(self) -> None:

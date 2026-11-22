@@ -741,6 +741,8 @@ The record stays running until the supervisor or recovery can confirm that the s
 The supervisor saves the exit code and cleanup intent before it releases the watcher.
 The run record saves `finished_at` when it records the confirmed end of the slice.
 The caller saves the stop commit before it sends a signal. The stop commit is final.
+Recovery syncs the record directory before it signals a slice for a saved stop commit.
+A sync error leaves the record available for another attempt.
 A read error before the commit leaves the run record unchanged.
 After supervisor loss, the watcher retries slice reads within the stop grace.
 The hold enforcer checks the active holder set again after it acquires the stop lock.
@@ -751,6 +753,7 @@ The stop commit saves the notice ID in the run record.
 Pruning keeps a finished run while its notice ID is present.
 Builds acknowledges the notice ID after it saves `SendingNotice` or confirms that the action was abandoned.
 Builds recovery uses the saved run path to acknowledge notices after either event.
+An acknowledgment confirms the run directory sync even when the notice ID is absent.
 An acknowledgment error does not block notice delivery.
 After acknowledgment, the usual pruning rules apply.
 A run that ends by itself just after the stop commit reports as stopped.
