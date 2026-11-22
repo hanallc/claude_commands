@@ -137,6 +137,35 @@ def queue_fixture(root: Path, ssh_source: str = SSH) -> dict[str, str]:
 
 
 class QueueRunTests(unittest.TestCase):
+    def test_stop_remote_fails_when_ssh_stalls(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            stalled_stop = SSH.replace('    print("mac_stopped=4567", flush=True)',
+                '    import select\n    select.select([], [], [], 2)\n    print("mac_stopped=4567", flush=True)')
+            environment = queue_fixture(root, stalled_stop)
+            _ = write_config_fixture(root / "config/mac_gate.conf", "terminate_grace_seconds=0.2\n")
+            _ = write_config_fixture(root / "config/mac_test.conf", "probe_timeout_s=0.3\n")
+            placement = mac_queue_run.MacPlacement("fake-mac", "episode", "attempt")
+            remote = mac_queue_run.RemoteRun(mac_queue_run.RemoteState.LIVE, 4567)
+            with mock.patch.dict(os.environ, environment, clear=True):
+                self.assertFalse(mac_queue_run.stop_remote(placement, remote))
+            self.assertIn("signal_group TERM", (root / "stop").read_text())
+
+    def test_remote_run_exits_when_the_mac_stops_answering(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            lost_link = SSH.replace('print("mac_group=4567", flush=True)',
+                'if "ServerAliveInterval=15" in sys.argv and "ServerAliveCountMax=3" in sys.argv:\n'
+                + '    raise SystemExit(255)\n'
+                + 'print("mac_group=4567", flush=True)')
+            environment = queue_fixture(root, lost_link)
+            result = subprocess.run(self.command(root), env=environment, capture_output=True,
+                                    text=True, timeout=TEST_HANG_GUARD_SECS)
+            self.assertEqual(result.returncode, 255, result.stdout + result.stderr)
+            self.assertIn("the Mac returned no exit status", result.stderr)
+            self.assertIn("the queue ends it when this run ends", result.stderr)
+            self.assertEqual([event[0] for event in self.events(root)], ["place-step"])
+
     def command(self, root: Path, kind: str = "shot") -> list[str]:
         return [sys.executable, "-m", "scripts.mac_test.mac_queue_run", "--what", "camera shot", "--kind", kind,
                 "--package", "hana", "--worktree", str(root), "--cwd", "/Mac scratch/checkout", "--",

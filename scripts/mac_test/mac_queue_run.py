@@ -38,7 +38,7 @@ from scripts.build_hold.owning_session import NoOwningSession, OwningSession, ow
 from scripts.build_queue import admission_wire as wire
 from scripts.lib import conf, process_group
 from scripts.lib.atomic_file import write_text_atomic
-from scripts.mac_test import claim_state, mac_test
+from scripts.mac_test import claim_state, eligibility, mac_test, offload
 
 
 def admission_command() -> list[str]:
@@ -139,7 +139,8 @@ def remote_command(placement: MacPlacement, cwd: str, argv: list[str], on_close:
     # Ten polls a second while the group ends.
     grace_polls = max(1, math.ceil(conf.read("mac_gate").number("terminate_grace_seconds") * 10))
     wrapper = remote_wrapper(work, on_close, grace_polls, owned_close=owned_close)
-    return ["ssh", "-o", "BatchMode=yes", placement.host, "/bin/zsh -c " + shlex.quote(wrapper)]
+    settings = eligibility.SshProbeSettings(conf.read("mac_test"))
+    return ["ssh", *offload.ssh_options(settings), placement.host, "/bin/zsh -c " + shlex.quote(wrapper)]
 
 
 class RemoteState(Enum):
@@ -168,9 +169,13 @@ groups=$(ps -axo pgid=) || exit 1
 if printf '%s\\n' "$groups" | grep -Eq "^[[:space:]]*$group[[:space:]]*$"; then exit 1; fi
 printf 'mac_stopped=%s\\n' "$group"
 """
-    result = subprocess.run(["ssh", "-o", "BatchMode=yes", placement.host,
-                             "/bin/zsh -c " + shlex.quote(script)], capture_output=True, text=True)
-    return result.returncode == 0 and result.stdout.strip() == f"mac_stopped={remote.group}"
+    settings = eligibility.SshProbeSettings(conf.read("mac_test"))
+    result = offload.ProcessController().capture(
+        ["ssh", *offload.ssh_options(settings), placement.host, "/bin/zsh -c " + shlex.quote(script)],
+        offload.CommandTimeLimit(grace + settings.probe_timeout_s),
+    )
+    return (isinstance(result, offload.CommandOutput) and result.status == 0
+            and result.stdout.strip() == f"mac_stopped={remote.group}")
 
 
 def stop_command(process: subprocess.Popen[str] | subprocess.Popen[bytes]) -> None:

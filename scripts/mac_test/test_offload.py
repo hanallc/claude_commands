@@ -44,6 +44,7 @@ else:
     from scripts.buildlog import record as buildlog_record
     from scripts.buildlog import store as buildlog_store
 from scripts.lib import conf, session_folder
+from scripts.lib.checkout_test_support import write_stdlib_tool
 from scripts.production.cli_fixture import invoke_cli
 from scripts.copies import copies
 from scripts.copies.copies_test_support import copies_environment
@@ -1013,6 +1014,82 @@ class VerifyMirrorWaitTests(verify_mac_offload_test_support.VerifyMacOffloadFixt
 
 
 class OffloadCommandTests(OffloadCommandFixture):
+    def test_stalled_transfers_report_failure(self) -> None:
+        self.config.update({"copy_stall_timeout_s": "1", "probe_timeout_s": "0.5"})
+        self.sync_config()
+        for program in ("rsync", "ssh"):
+            executable = self.bin_directory / program
+            executable.unlink()
+            write_stdlib_tool(executable, r"""
+import os
+from pathlib import Path
+import select
+import sys
+
+name = Path(sys.argv[0]).name
+arguments = sys.argv[1:]
+if name == "ssh" and "fetch_kib=" in arguments[-1]:
+    print("fetch_kib=12\nrc=0")
+    raise SystemExit(0)
+Path(os.environ["TRANSFER_MARKER"]).write_text(name)
+for argument in arguments:
+    if argument.startswith("--timeout="):
+        timeout = int(argument.split("=", 1)[1])
+        if 0 < timeout <= 1:
+            select.select([], [], [], timeout)
+            print("I/O timeout", file=sys.stderr)
+            raise SystemExit(30)
+select.select([], [], [], 2)
+""")
+        marker = self.root / "transfer"
+        environment = {**self.environment, "TRANSFER_MARKER": str(marker)}
+        with mock.patch.dict(os.environ, environment, clear=True):
+            config = eligibility.read_config(self.config_path)
+            request = offload.OffloadRequest(
+                self.repository, "hana", "timeout", offload.NO_RESULT_FILE, (), owner="verify",
+                holder_session="fixture", fetch=offload.FetchFolder("output"))
+            for operation, expected_program in (
+                ("scripts", "rsync"), ("stamp", "ssh"), ("mirror", "rsync"), ("fetch", "rsync"),
+            ):
+                with self.subTest(operation=operation):
+                    marker.unlink(missing_ok=True)
+                    controller = offload.ProcessController()
+                    if operation in ("scripts", "stamp"):
+                        self.check_stalled_script_transfer(controller, config, stamp=operation == "stamp")
+                    elif operation == "mirror":
+                        self.assertFalse(offload.copy_tree(controller, config, request, HANA))
+                        self.assertIn("I/O timeout", controller.copy_failure_detail)
+                    else:
+                        self.assertEqual(offload.fetch_folder(controller, config, request, HANA),
+                                         offload.FetchFailed("the folder copy from the Mac failed"))
+                        self.assertEqual(list((self.state_directory / "fetched").iterdir()), [])
+                    self.assertEqual(marker.read_text(), expected_program)
+
+    def check_stalled_script_transfer(
+        self, controller: offload.ProcessController, config: eligibility.OffloadConfig, *, stamp: bool,
+    ) -> None:
+        capture = controller.capture
+
+        def capture_transfer(arguments: Sequence[str],
+                             deadline: offload.CommandDeadline) -> offload.CapturedCommandResult:
+            if arguments[0] == "git":
+                if "ls-files" in arguments:
+                    return offload.CommandOutput(0, "scripts/mac_test/linux_runner.py\0", "")
+                if "rev-parse" in arguments:
+                    return offload.CommandOutput(0, "fixture-commit\n", "")
+                return offload.CommandOutput(0, "", "")
+            if stamp and arguments[0] == "rsync":
+                return offload.CommandOutput(0, "", "")
+            return capture(arguments, deadline)
+
+        parity: offload.PublicToolParity = {"rustc": "fixture", "nextest": "fixture",
+                                           "mend": "fixture", "scripts_commit": "fixture-commit"}
+        with (mock.patch.object(controller, "capture", side_effect=capture_transfer),
+              mock.patch.object(offload, "expected_linux_parity", return_value=parity)):
+            self.assertFalse(offload.copy_tracked_scripts(controller, config))
+        detail = "copy: ssh: timed out" if stamp else "copy: rsync: I/O timeout"
+        self.assertEqual(controller.copy_failure_detail, detail)
+
     def test_waiter_hands_relative_path_claim_to_runner_for_cleanup_only(self) -> None:
         assignment = self.assignment_options(self.repository, "nextest", self.config_path, ())
         retained = self.write_kept_claim()
@@ -1864,6 +1941,7 @@ class OffloadCommandTests(OffloadCommandFixture):
                 "-e",
                 "ssh -o BatchMode=yes -o ConnectTimeout=6 "
                 + "-o ServerAliveInterval=15 -o ServerAliveCountMax=3",
+                "--timeout=60",
                 f"{self.repository}/",
                 "mac:.local/state/mac-test/test-mirror/hana/",
             ],

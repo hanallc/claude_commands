@@ -1087,7 +1087,9 @@ class ProcessController:
         deadline: CommandDeadline = NO_COMMAND_TIME_LIMIT,
     ) -> CapturedCommandResult:
         if arguments[0] == "rsync":
-            arguments = [*arguments[:2], "--stats", *arguments[2:]]
+            stall_seconds = conf.read("mac_test").value("copy_stall_timeout_s", conf.positive_whole)
+            arguments = [*arguments[:2], "--stats", *arguments[2:-2],
+                         f"--timeout={stall_seconds}", *arguments[-2:]]
         try:
             process = subprocess.Popen(
                 arguments,
@@ -1798,7 +1800,7 @@ def copy_tracked_scripts(controller: ProcessController, config: OffloadConfig) -
         return False
     stamp = controller.capture_copy([*ssh_prefix(config),
         "printf '%s\\n' " + shlex.quote(commit.stdout.strip())
-        + ' > "$HOME/.claude/.build-target-script-commit"'])
+        + ' > "$HOME/.claude/.build-target-script-commit"'], CommandTimeLimit(config.probe_timeout_s))
     return isinstance(stamp, CommandOutput) and stamp.status == 0
 
 
