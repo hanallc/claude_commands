@@ -1342,7 +1342,7 @@ def _no_fault(_stage: str) -> None:
     pass
 
 
-def _place_key(owner: wire.Owner, since: float) -> str:
+def _place_key(owner: wire.Owner | placement.SubmittingOwner, since: float) -> str:
     return f"{records.run_owner(owner.pid, owner.start_time)}:{since:.17g}"
 
 
@@ -1957,9 +1957,12 @@ class AdmissionServer:
 
     def _current_move_line(self, rows: list[tuple[Path, records.RankedWaiter]],
                            movable: set[str]) -> records.QueueMoveLine:
-        members = tuple(records.QueueMoveMember(row_id, movable=row_id in movable)
-                        for _, row in rows if (row_id := row.get("move_id")))
-        return self._revise_move_line(members)
+        members: list[records.QueueMoveMember] = []
+        for _, row in rows:
+            row_id = row.get("move_id")
+            assert row_id
+            members.append(records.QueueMoveMember(row_id, movable=row_id in movable))
+        return self._revise_move_line(tuple(members))
 
     def _revise_move_line(self, members: tuple[records.QueueMoveMember, ...]) -> records.QueueMoveLine:
         if members != self.move_line.members:
@@ -2911,14 +2914,14 @@ class AdmissionServer:
         return wire.encode_reply(reply).encode()
 
 
-    def _save_place(self, request: wire.AdmitRequest | wire.LaunchRequest, row: records.Waiter,
-                    *, run: wire.RunIdentity | wire.NoRun = wire.NO_RUN) -> None:
+    def _save_place(self, request: wire.AdmitRequest | wire.LaunchRequest | wire.PlacementRequest,
+                    row: records.Waiter) -> None:
         if isinstance(request, wire.AdmitRequest) and isinstance(request.place, wire.CloudPlace):
             return
         key = _place_key(request.owner, row["since"])
         previous = self.places.get(key)
         place = replace(waiter_place(row, request.episode),
-                        run=request.run if isinstance(request, wire.AdmitRequest) else run)
+                        run=wire.NO_RUN if isinstance(request, wire.LaunchRequest) else request.run)
         if previous is not None:
             if previous.episode == request.episode:
                 place = replace(place, queue_identity=previous.queue_identity)
@@ -3886,7 +3889,7 @@ done
             self.local_hold_holders[request.episode] = local_holder
             admission = self._placement_admission(request)
             row = self._placement_row(request)
-            self._save_place(admission, row, run=request.run)
+            self._save_place(request, row)
             if isinstance(admission, wire.AdmitRequest):
                 prepared.add(request.episode)
                 previous = self.waiters.get(request.episode)
@@ -4321,15 +4324,9 @@ done
                          retry: placement.RetryDecision) -> None:
         assignment = saved.assignment
         key = execution_identity.attempt_key(assignment.episode, assignment.attempt)
+        self._remove_waiter(self.waiters.get(assignment.episode))
         current = self.current_assignments.get(assignment.episode) == key
         request = self.placement_requests.get(assignment.episode)
-        report = saved.terminal_report
-        refused_before_launch = (isinstance(report, placement.TerminalAttemptReport)
-            and isinstance(report.outcome, BeforeLaunchRefusal) and reason == report.outcome.reason)
-        keep_local_wait = (current and refused_before_launch and request is not None
-            and isinstance(saved.remote_start_hold, records.RemoteStartHold) and self._can_hold_local_place(request))
-        if current and not keep_local_wait:
-            self._remove_waiter(self.waiters.get(assignment.episode))
         if current:
             if request is not None:
                 saved = self._end_remote_start_hold(request, saved)
@@ -4337,6 +4334,8 @@ done
                     self._end_placement_rank(request)
             del self.current_assignments[assignment.episode]
         self.assignments[key] = replace(saved, state=placement.ClosedAssignment(reason), retry=retry)
+        if current and request is not None and self._placement_waiting(request):
+            self._save_place(request, self._placement_row(request))
         self._prune_host_evidence()
         self.persist()
         self.next_pass = self.clock.monotonic()
@@ -4520,6 +4519,8 @@ done
             self.placement_requests[request.episode] = request
             if previous is None:
                 self.prerequisites[request.episode] = request.prerequisite
+            if self._placement_waiting(request):
+                self._save_place(request, self._placement_row(request))
             self._watch_owner(request.owner)
             self.persist()
             if isinstance(connection, Connection) and not self._pass_gap_open():
@@ -4573,13 +4574,6 @@ done
                 and request.claim.provider == assignment.destination.provider
                 and request.claim.target == assignment.destination.target and request.claim.scope == assignment.destination.scope):
             self.execution_evidence[key] = request.evidence
-            if ((isinstance(request.evidence, execution_identity.ObservedExecution)
-                    or isinstance(request.outcome, placement.AttemptCompleted))
-                    and self.current_assignments.get(assignment.episode) == key
-                    and (submitted := self.placement_requests.get(assignment.episode)) is not None):
-                self._end_placement_rank(submitted)
-                saved = self._end_remote_start_hold(submitted, saved)
-                self.assignments[key] = saved
             outcome = request.outcome
             if (isinstance(outcome, (placement.AttemptCompleted, placement.AttemptDeclined, placement.AttemptCancelled))
                     or isinstance(outcome, BeforeLaunchRefusal)

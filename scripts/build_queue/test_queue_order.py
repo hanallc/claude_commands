@@ -12,7 +12,10 @@ from unittest.mock import patch
 from scripts.build_queue import admission_protocol as wire
 from scripts.build_queue import admission_records as records, execution_identity, head_stall, placement, queue_snapshot
 from scripts.build_queue.admission_test_support import AdmissionFixture, GIB
-from scripts.build_queue.test_placement import PlacementFixture, assignment_for, local_candidate, placement_request, publish_candidate
+from scripts.build_queue.test_placement import (
+    PlacementFixture, adopt_assignment, assignment_for, consume_permission, local_candidate,
+    placement_request, publish_candidate,
+)
 from scripts.build_hold import build_hold
 from scripts.build_targets import build_targets
 from scripts.lint import memory_admit as gate
@@ -179,7 +182,7 @@ class QueueMoveTests(unittest.TestCase):
             self.assertEqual(fixture.queue_pids(), [bumped.owner.pid, continuation.owner.pid])
             self.assertEqual(result.policy.returned_claims, {grant.reservation})
 
-    def test_a_parked_placement_stays_ahead_when_preparation_assigns_its_id(self) -> None:
+    def test_a_parked_placement_stays_ahead_when_the_pass_prepares_it(self) -> None:
         with PlacementFixture() as fixture:
             run = fixture.run_owner()
             running = fixture.request(run=run, need=4 * GIB)
@@ -212,6 +215,40 @@ class QueueMoveTests(unittest.TestCase):
             self.assertFalse(fixture.server.reservations)
             self.assertEqual(fixture.queue_pids(), [head.owner.pid, continuation.owner.pid])
             self.assertEqual(result.policy.returned_claims, {grant.reservation})
+
+    def test_a_parked_placement_invalidates_the_previous_move_revision(self) -> None:
+        with PlacementFixture() as fixture:
+            fixture.free(0)
+            fixture.hold_starts()
+            now = fixture.clock.now()
+            first, second = [fixture.request(since=now + offset) for offset in (0, 2)]
+            for request in (first, second):
+                self.assertIsInstance(fixture.server.handle_request(request)[0], wire.Wait)
+            fixture.configure(min_pass_gap_seconds=0.25)
+            _ = fixture.run_pass()
+            line = move_line(fixture)
+            first_member, second_member = line.members
+            middle = placement_request(fixture, since=now + 1)
+            middle = replace(middle, prerequisite=placement.TokenNotRequired(), constraints=replace(
+                middle.constraints, candidates=(local_candidate(fixture),)))
+            peer = fixture.connect(middle)
+            self.assertEqual(peer.replies(), [])
+            self.assertNotIn(middle.episode, fixture.server.waiters)
+
+            conflict, = fixture.server.handle_request(wire.QueueMoveRequest(
+                "move-during-gap", second_member.row_id, line.revision, wire.QueueDrop(first_member.row_id, "before")))
+            assert isinstance(conflict, wire.QueueMoveConflict)
+            self.assertNotEqual(line.revision, conflict.line.revision)
+            first_row, parked_row, second_row = conflict.line.members
+            self.assertEqual((first_row, second_row), (first_member, second_member))
+            self.assertFalse(parked_row.movable)
+            self.assertFalse(fixture.server.queue_pins)
+
+            fixture.clock.advance(0.25)
+            _ = fixture.run_pass()
+            self.assertIsInstance(peer.replies()[0], wire.PlacementWait)
+            current = move_line(fixture)
+            self.assertEqual(current.members, (first_member, replace(parked_row, movable=True), second_member))
 
     def test_a_dragged_head_starts_when_the_pass_returns_the_blocked_claim(self) -> None:
         with AdmissionFixture() as fixture:
@@ -1140,7 +1177,7 @@ class QueueMoveTests(unittest.TestCase):
             self.assertIs(table[held.owner.pid].get("fits"), False)
             self.assertEqual(table[copy.owner.pid].get("order_note"), "Newest eligible copy starts first")
 
-    def test_hana_refusal_before_launch_keeps_the_local_claim(self) -> None:
+    def test_hana_refusal_before_launch_removes_the_waiter_and_claim(self) -> None:
         from scripts.build_queue.test_hana_placement import hana_fallback_request
 
         with PlacementFixture() as fixture:
@@ -1160,7 +1197,8 @@ class QueueMoveTests(unittest.TestCase):
                 placement.DispatchPathSettled()))
             assert isinstance(refused, wire.DispatchStatus)
             self.assertEqual(refused.state, placement.ClosedAssignment(placement.HANA_IMAGE_STALE))
-            self.assertEqual(fixture.server.slots[slot], claim)
+            self.assertNotIn(request.episode, fixture.server.waiters)
+            self.assertNotIn(slot, fixture.server.slots)
 
             fixture.allow_next_start()
             write_pressure_reading(fixture.root / "pressure")
@@ -1169,7 +1207,7 @@ class QueueMoveTests(unittest.TestCase):
             assert isinstance(granted, wire.LocalPlacementGranted)
             self.assertEqual(granted.assignment.episode, assignment.episode)
 
-    def test_new_mac_hold_blocks_an_unselected_local_waiter_and_keeps_its_claim(self) -> None:
+    def test_mac_startup_keeps_its_claim_until_the_refusal_removes_the_waiter(self) -> None:
         with PlacementFixture() as fixture:
             run = fixture.run_owner()
             slot_key = fixture.finish_step(fixture.request(run=run, need=4 * GIB)).reservation
@@ -1206,10 +1244,44 @@ class QueueMoveTests(unittest.TestCase):
             refused, = fixture.server.handle_request(wire.ClaimFailure("mac-busy", remote, "busy"))
             assert isinstance(refused, wire.DispatchStatus)
             self.assertEqual(refused.state, placement.ClosedAssignment("busy"))
-            self.assertEqual(fixture.server.slots[slot_key], claim)
+            self.assertNotIn(head.episode, fixture.server.waiters)
+            self.assertNotIn(slot_key, fixture.server.slots)
             _ = fixture.run_pass()
             self.assertEqual(set(fixture.caller_reservations()), {head.episode})
             self.assertIsInstance(fixture.server.handle_request(later)[0], wire.PlacementWait)
+
+    def test_remote_start_report_leaves_a_released_slot_for_the_local_sibling(self) -> None:
+        with PlacementFixture() as fixture:
+            run = fixture.run_owner()
+            running = fixture.request(run=run, need=4 * GIB)
+            grant, = fixture.server.handle_request(running)
+            assert isinstance(grant, wire.Admitted)
+            fixture.free(0)
+            fixture.hold_starts()
+            head = placement_request(fixture, since=running.since - 1)
+            _ = publish_candidate(fixture, head)
+            head = replace(head, run=run, prerequisite=placement.TokenNotRequired(), constraints=replace(
+                head.constraints, candidates=(*head.constraints.candidates, local_candidate(fixture))))
+            remote = assignment_for(fixture, head)
+            self.assertEqual(remote.destination.provider, "mac")
+            sibling = fixture.request(run=run, need=4 * GIB, since=running.since + 1)
+            self.assertIsInstance(fixture.server.handle_request(sibling)[0], wire.Wait)
+            reference = adopt_assignment(fixture, head, remote)
+            authorized, = fixture.server.handle_request(consume_permission("authorize-mac", remote, reference))
+            self.assertIsInstance(authorized, wire.FirstAuthorization)
+            execution = execution_identity.ProcessExecution(remote.destination.host, "host-generation-a", 700001, "start")
+            report, = fixture.server.handle_request(wire.ExecutionReport("mac-started", remote, reference,
+                execution_identity.ObservedExecution(execution), placement.AttemptRunning()))
+            self.assertIsInstance(report, wire.DispatchStatus)
+            self.assertIn(head.episode, fixture.server.waiters)
+
+            fixture.release(grant)
+            slot = fixture.server.slots[grant.reservation]
+            assert isinstance(slot, records.ContinuationSlot)
+            self.assertEqual(slot.owner, records.run_owner(sibling.owner.pid, sibling.owner.start_time))
+            _ = fixture.run_pass()
+            self.assertNotIn(head.episode, fixture.server.waiters)
+            self.assertEqual(set(fixture.server.reservations), {sibling.episode})
 
     def test_mac_startup_keeps_its_hold_without_a_move_across_it(self) -> None:
         for unrelated_move in (False, True):

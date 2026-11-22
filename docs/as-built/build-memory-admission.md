@@ -2372,7 +2372,7 @@ The numbers show queue positions.
 The policy still checks eligibility before each start.
 Cloud waits have their own order.
 
-The admission service gives each wait an ID.
+The admission service gives each wait an ID when it enters the queue.
 The saved place binds the ID to the owner PID, process start time, original arrival time, and episode.
 A refresh keeps the ID.
 The service saves pins in `state.json` when a move completes.
@@ -2392,11 +2392,11 @@ An absent step keeps its run identity to recover the run's saved queue time.
 The service keeps a pin while a request is temporarily absent.
 A request that starts or ends loses its own pin.
 Both hosts use the visible order for normal steps.
-A remote startup hold keeps its place in the local order until the hold ends.
+When placement preparation sees a remote start, it ends the startup hold and removes the local waiter.
 The table includes remote-only waits in queue order.
 The table identifies waits that a build hold blocks.
 Speculative Mac copy rows show the newest-first rule.
-A refusal before launch keeps the pin and any active local startup claim.
+A refusal before launch keeps the pin. Closing the attempt removes the local waiter and drops its slot claim.
 
 The service checks the order revision for all rows, including rows without handles.
 Its replay ledger records the reply with the new order and one Undo destination.
