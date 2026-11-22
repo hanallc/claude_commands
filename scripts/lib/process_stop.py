@@ -63,6 +63,7 @@ class _ScopeRemoved(FileNotFoundError):
 @dataclass(frozen=True)
 class ScopeStopReceipt:
     term_reached: int
+    hook_error: BaseException | None = None
 
 
 def supported() -> bool:
@@ -352,7 +353,10 @@ def stop_scope(
     on_term: Callable[[int], None] | None = None,
 ) -> ScopeStopReceipt:
     """Report the TERM count before the exit wait."""
-    return stop_scopes((scope,), grace, kill_grace, on_term=on_term)
+    receipt = stop_scopes((scope,), grace, kill_grace, on_term=on_term)
+    if receipt.hook_error is not None:
+        raise receipt.hook_error
+    return receipt
 
 
 @dataclass(frozen=True)
@@ -367,27 +371,41 @@ class _ScopeAwaitingExit:
 def stop_scopes(
     scopes: tuple[ScopeIdentity, ...], grace: float, kill_grace: float, *,
     on_term: Callable[[int], None] | None = None,
+    next_scopes: Callable[[], tuple[ScopeIdentity, ...]] | None = None,
 ) -> ScopeStopReceipt:
-    """Report one total after all TERM sends and before any exit wait."""
-    pending: list[_ScopeAwaitingExit] = []
+    """Report the first batch's TERM count before the exit wait.
+
+    Return a hook error after cleanup so the caller can save the result.
+    """
     errors: list[tuple[str, ScopeStopFailed]] = []
-    with ExitStack() as opened:
-        for scope in scopes:
-            deadline = time.monotonic() + grace
-            try:
-                directory, events = opened.enter_context(_scope_events(scope))
-                if not _scope_is_empty(scope, events):
-                    reached = _term_scope(directory, scope, deadline)
-                    pending.append(_ScopeAwaitingExit(scope, directory, events, reached, deadline))
-            except _ScopeRemoved:
-                continue
-            except ScopeStopFailed as error:
-                errors.append((scope["unit"], error))
-        total = sum(item.term_reached for item in pending)
-        try:
-            if on_term is not None:
-                on_term(total)
-        finally:
+    hook_error: BaseException | None = None
+    term_reached = 0
+    reported = 0
+    scope_count = 0
+    report = on_term
+    while True:
+        scope_count += len(scopes)
+        with ExitStack() as opened:
+            pending: list[_ScopeAwaitingExit] = []
+            for scope in scopes:
+                deadline = time.monotonic() + grace
+                try:
+                    directory, events = opened.enter_context(_scope_events(scope))
+                    if not _scope_is_empty(scope, events):
+                        reached = _term_scope(directory, scope, deadline)
+                        pending.append(_ScopeAwaitingExit(scope, directory, events, reached, deadline))
+                except _ScopeRemoved:
+                    continue
+                except ScopeStopFailed as error:
+                    errors.append((scope["unit"], error))
+            term_reached += sum(item.term_reached for item in pending)
+            if report is not None:
+                reported = term_reached
+                try:
+                    report(reported)
+                except BaseException as error:
+                    hook_error = error
+                report = None
             for item in pending:
                 try:
                     _finish_scope_stop(item, kill_grace, require_term=on_term is not None)
@@ -395,11 +413,22 @@ def stop_scopes(
                     continue
                 except ScopeStopFailed as error:
                     errors.append((item.scope["unit"], error))
+        if next_scopes is None:
+            break
+        try:
+            scopes = next_scopes()
+        except ScopeStopFailed as error:
+            errors.append(("scope discovery", error))
+            break
+        if not scopes:
+            break
     if errors:
-        if len(scopes) == 1:
-            raise errors[0][1]
-        raise ScopeStopFailed("; ".join(f"{unit}: {error}" for unit, error in errors))
-    return ScopeStopReceipt(total)
+        cleanup_error = (errors[0][1] if scope_count <= 1 and len(errors) == 1 else
+                         ScopeStopFailed("; ".join(f"{unit}: {error}" for unit, error in errors)))
+        if hook_error is not None:
+            raise cleanup_error from hook_error
+        raise cleanup_error
+    return ScopeStopReceipt(reported if on_term is not None else term_reached, hook_error)
 
 
 def _finish_scope_stop(item: _ScopeAwaitingExit, kill_grace: float, *, require_term: bool) -> None:

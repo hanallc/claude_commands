@@ -1379,7 +1379,7 @@ sys.exit(1)
                         self.assertIn(detail, stderr.getvalue())
                         saved = worker_lifecycle.read_json_object(path)
                         self.assertEqual(saved["stop_reason"], "fixture stop")
-                        self.assertNotIn("stop_pass_requested", saved)
+                        self.assertIs(saved["stop_pass_requested"], True)
                         self.assertIn(detail, str(saved["scope_error"]))
                         self.assertIn("Result: FAIL (cleanup; exit 143)",
                                       detached_runs.result_text(cast(detached_runs.RunRecord, cast(object, saved)),
@@ -1392,7 +1392,7 @@ sys.exit(1)
     @unittest.skipUnless(process_stop.supported(), "pidfd stop needs Linux")
     def test_stop_reports_term_before_the_scope_exit_wait(self) -> None:
         for route in ("scope", "detached", "detached moved"):
-            for outcome in ("ends", "empty", "removed", "wait fails"):
+            for outcome in ("ends", "empty", "removed", "wait fails", "hook and cleanup fail"):
                 with self.subTest(route=route, outcome=outcome):
                     path = self.record(["fixture command"])
                     cgroups = self.root / f"cgroups-{route}-{outcome}"
@@ -1411,28 +1411,42 @@ sys.exit(1)
                             events = scope / "cgroup.events"
                             _ = events.write_text("populated 0\n" if outcome == "empty" else "populated 1\n")
                             event_paths[events.stat().st_ino] = events
+                            _ = (scope / "cgroup.kill").write_text("0\n")
                     self.update_record(path, command_scope=identities[0])
                     if route == "detached moved":
                         self.update_record(path, moved_scope=identities[1])
                     original = path.read_bytes()
                     order: list[tuple[str, int]] = []
+                    now = 0.0
+                    hook_error = OSError("fixture could not save the receipt")
 
                     def term(_directory: int, scope: process_stop.ScopeIdentity, _deadline: float) -> int:
-                        self.assertEqual(path.read_bytes(), original)
+                        if route == "scope":
+                            self.assertEqual(path.read_bytes(), original)
+                        else:
+                            saved = worker_lifecycle.read_json_object(path)
+                            self.assertEqual(saved["stop_reason"], "fixture stop")
+                            self.assertIs(saved["stop_pass_requested"], True)
                         count = 2 if scope["unit"] == "fixture.scope" else 3
                         order.append(("TERM", count))
                         return count
 
                     def on_term(count: int) -> None:
                         order.append(("receipt", count))
+                        if outcome == "hook and cleanup fail":
+                            raise hook_error
 
-                    def exit_wait(descriptor: int, _seconds: float) -> None:
+                    def exit_wait(descriptor: int, seconds: float) -> None:
+                        nonlocal now
                         order.append(("wait", 0))
                         if route != "scope":
                             self.assertEqual(worker_lifecycle.read_json_object(path)["stop_reason"], "fixture stop")
                         if outcome == "wait fails":
                             raise process_stop.ScopeStopFailed("fixture wait failed")
-                        _ = event_paths[os.fstat(descriptor).st_ino].write_text("populated 0\n")
+                        if outcome == "hook and cleanup fail":
+                            now += seconds
+                        else:
+                            _ = event_paths[os.fstat(descriptor).st_ino].write_text("populated 0\n")
 
                     def stop() -> None:
                         if route == "scope":
@@ -1443,23 +1457,105 @@ sys.exit(1)
 
                     with (patch.object(process_stop, "CGROUP_ROOT", cgroups),
                           patch.object(process_stop, "_term_scope", side_effect=term),
+                          patch.object(time, "monotonic", side_effect=lambda: now),
                           patch.object(process_stop, "_wait_scope_event", side_effect=exit_wait)):
                         if outcome == "wait fails":
                             with self.assertRaisesRegex(process_stop.ScopeStopFailed, "fixture wait failed"):
                                 stop()
+                        elif outcome == "hook and cleanup fail":
+                            with self.assertRaisesRegex(process_stop.ScopeStopFailed, "remains populated after KILL"
+                                                        ) as raised:
+                                stop()
+                            self.assertIs(raised.exception.__cause__, hook_error)
+                            for events in event_paths.values():
+                                self.assertEqual(events.with_name("cgroup.kill").read_text(), "1\n")
+                            if route != "scope":
+                                saved = worker_lifecycle.read_json_object(path)
+                                self.assertEqual(saved["scope_error"], str(raised.exception))
+                                self.assertNotIn("scope_end_proved", saved)
                         else:
                             stop()
 
+                    wait = [("wait", 0)]
+                    if outcome == "hook and cleanup fail" and route == "detached moved":
+                        # The first KILL grace also runs past the second scope's TERM deadline.
+                        wait *= 2
                     if outcome in ("empty", "removed"):
                         self.assertEqual(order, [("receipt", 0)])
                         self.assertEqual(path.read_bytes(), original)
                     else:
-                        expected = ([("TERM", 2), ("TERM", 3), ("receipt", 5), ("wait", 0), ("wait", 0)]
-                                    if route == "detached moved" else [("TERM", 2), ("receipt", 2), ("wait", 0)])
+                        if route == "detached moved":
+                            expected = [("TERM", 2), ("TERM", 3), ("receipt", 5), *wait, ("wait", 0)]
+                        else:
+                            expected = [("TERM", 2), ("receipt", 2), *wait]
+                            if outcome == "hook and cleanup fail":
+                                expected.append(("wait", 0))
                         self.assertEqual(order, expected)
                         if route != "scope":
                             saved = worker_lifecycle.read_json_object(path)
                             self.assertEqual(saved.get("scope_end_proved"), True if outcome == "ends" else None)
+
+    @unittest.skipUnless(process_stop.supported(), "pidfd stop needs Linux")
+    def test_stop_follows_each_scope_move_before_saving_completion(self) -> None:
+        path = self.record(["systemd-run", "--user", "--scope", "--", "fixture-command"])
+        cgroups = self.root / "cgroups"
+        scopes: list[process_stop.ScopeIdentity] = []
+        events_by_unit: dict[str, Path] = {}
+        units_by_inode: dict[int, str] = {}
+        for name in ("original.scope", "first-move.scope", "second-move.scope"):
+            folder = cgroups / "builds.slice" / name
+            folder.mkdir(parents=True)
+            stat = folder.stat()
+            scopes.append({"unit": name, "path": f"/builds.slice/{name}", "device": stat.st_dev, "inode": stat.st_ino})
+            events = folder / "cgroup.events"
+            _ = events.write_text("populated 1\n")
+            events_by_unit[name] = events
+            units_by_inode[events.stat().st_ino] = name
+        self.update_record(path, command_scope=scopes[0], command_group=DEAD_PID, command_started="fixture-start")
+        current = 0
+        order: list[str] = []
+        reason = "stop the moving command"
+
+        def moved(leader: process_stop.ProcessLifetime, original: process_stop.ScopeIdentity
+                  ) -> process_stop.ScopeIdentity | None:
+            self.assertEqual(leader, process_stop.ProcessLifetime(DEAD_PID, "fixture-start"))
+            self.assertEqual(original, scopes[0])
+            order.append(f"read: {scopes[current]['unit']}")
+            return scopes[current] if current else None
+
+        def term(_directory: int, scope: process_stop.ScopeIdentity, _deadline: float) -> int:
+            name = scope["unit"]
+            order.append(f"TERM: {name}")
+            saved = worker_lifecycle.read_json_object(path)
+            self.assertEqual(saved["stop_reason"], reason)
+            self.assertIs(saved["stop_pass_requested"], True)
+            self.assertNotIn("scope_end_proved", saved)
+            if name != scopes[0]["unit"]:
+                self.assertEqual(saved["moved_scope"], scope)
+            return 1
+
+        def exit_wait(descriptor: int, _seconds: float) -> None:
+            nonlocal current
+            name = units_by_inode[os.fstat(descriptor).st_ino]
+            order.append(f"wait: {name}")
+            _ = events_by_unit[name].write_text("populated 0\n")
+            current = min(current + 1, len(scopes) - 1)
+
+        def receipt(count: int) -> None:
+            order.append(f"receipt: {count}")
+
+        with (patch.object(process_stop, "CGROUP_ROOT", cgroups),
+              patch.object(process_stop, "moved_command_scope", side_effect=moved),
+              patch.object(process_stop, "_term_scope", side_effect=term),
+              patch.object(process_stop, "_wait_scope_event", side_effect=exit_wait)):
+            self.assertTrue(detached_runs.stop_command(path, reason, on_term=receipt))
+            self.assertTrue(all(process_stop.scope_has_ended(scope) for scope in scopes))
+        self.assertEqual(order, [
+            "read: original.scope", "TERM: original.scope", "receipt: 1", "wait: original.scope",
+            "read: first-move.scope", "TERM: first-move.scope", "wait: first-move.scope",
+            "read: second-move.scope", "TERM: second-move.scope", "wait: second-move.scope", "read: second-move.scope",
+        ])
+        self.assertIs(worker_lifecycle.read_json_object(path)["scope_end_proved"], True)
 
     def test_start_rejects_an_unknown_kind(self) -> None:
         with contextlib.redirect_stderr(io.StringIO()) as error, self.assertRaises(SystemExit) as raised:
@@ -3029,6 +3125,12 @@ class PaneRunDeliveryTests(unittest.TestCase):
             _ = events.write_text("populated 0\n")
             return 1
 
+        hook_error = OSError("cannot save the receipt")
+
+        def fail_receipt(count: int) -> None:
+            self.assertEqual(count, 1)
+            raise hook_error
+
         director = self.fixture.parent
         exact = Path(os.environ["NOTIFIER_SESSIONS_DIR"]) / f"{os.getpid()}.json"
         _ = self.fixture.session_record(director.current_session, director.name).replace(exact)
@@ -3036,7 +3138,9 @@ class PaneRunDeliveryTests(unittest.TestCase):
         _ = self.enterContext(patch.object(process_stop, "CGROUP_ROOT", cgroups))
         with (patch.dict(os.environ, {"CODEX_THREAD_ID": "", "CLAUDE_CODE_SESSION_ID": row.current_session}),
               patch.object(process_stop, "_term_scope", side_effect=finish_scope) as term):
-            self.assertTrue(detached_runs.stop_command(path, reason))
+            with self.assertRaises(OSError) as raised:
+                _ = detached_runs.stop_command(path, reason, on_term=fail_receipt)
+            self.assertIs(raised.exception, hook_error)
             first_stop = path.read_bytes()
             self.assertTrue(detached_runs.stop_command(path, "A repeat."))
             term.assert_called_once()

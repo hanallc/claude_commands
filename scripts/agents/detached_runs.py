@@ -483,6 +483,10 @@ def _scope_stop_graces() -> tuple[float, float]:
     return float(settings.text("STOP_GRACE_SECONDS")), float(settings.text("KILL_GRACE_SECONDS"))
 
 
+def _scopes_have_ended(scopes: Sequence[process_stop.ScopeIdentity]) -> bool:
+    return all(process_stop.scope_has_ended(scope) for scope in scopes)
+
+
 def _stop_scoped_command(
     path: Path, reason: str, scope: process_stop.ScopeIdentity, *,
     check: Callable[[], bool], stop_pass: bool, on_term: Callable[[int], None] | None,
@@ -491,76 +495,81 @@ def _stop_scoped_command(
     with _scope_stop_lock(path) as acquired:
         if not acquired:
             return False
+
+        staged = False
+
+        def stage(record: RunRecord, scopes: tuple[process_stop.ScopeIdentity, ...]) -> None:
+            nonlocal staged
+            record["command_scope"] = scope
+            if scopes and scopes[-1] != scope:
+                record["moved_scope"] = scopes[-1]
+            _ = record.setdefault("stop_reason", reason)
+            if stop_pass:
+                record["stop_pass_requested"] = True
+                if not staged and _stop_caller_is_owner(record["staff_id"], os.environ):
+                    record["self_stop"] = True
+            _ = record.pop("scope_end_proved", None)
+            write_text_atomic(path, json.dumps(record, indent=2, sort_keys=True))
+            staged = True
+
         with record_lock(path):
             record = _read_record(path)
-            if record.get("command_scope", scope) != scope:
+            if record.get("command_scope", scope) != scope or not check():
                 return False
-            allowed = check()
-            if not allowed and on_term is None:
-                return False
-            previous = record.copy()
-            record["command_scope"] = scope
             scopes = _command_scopes(record, scope)
-            if len(scopes) > 1:
-                record["moved_scope"] = scopes[-1]
-            ended = _command_has_ended(record, record["pid"])
-            if on_term is None:
-                if ended:
-                    if record["status"] == "finished" or not record.get("stop_reason"):
-                        return False
-                    if record.get("scope_end_proved") and record.get("stop_pass_requested"):
-                        return True
-                _ = record.setdefault("stop_reason", reason)
-                write_text_atomic(path, json.dumps(record, indent=2, sort_keys=True))
+            ended = False
+            with contextlib.suppress(process_stop.ScopeStopFailed):
+                ended = _scopes_have_ended(scopes)
+            prior_stop = record["status"] == "running" and bool(record.get("stop_reason"))
+            if not ended or (prior_stop and (not record.get("scope_end_proved")
+                                             or (stop_pass and not record.get("stop_pass_requested")))):
+                previous = record.copy()
+                stage(record, scopes)
                 if not check():
                     write_text_atomic(path, json.dumps(previous, indent=2, sort_keys=True))
                     return False
-            elif not allowed and not ended:
-                return False
 
-        if ended and on_term is not None:
-            on_term(0)
-            return True
+        seen = list(scopes)
 
-        def report_term(count: int) -> None:
-            assert on_term is not None
-            on_term(count)
-            if not count:
-                return
+        def next_scopes() -> tuple[process_stop.ScopeIdentity, ...]:
             with record_lock(path):
                 current = _read_record(path)
-                if current.get("command_scope") != scope:
-                    return
-                _ = current.setdefault("stop_reason", reason)
-                if len(scopes) > 1:
-                    current["moved_scope"] = scopes[-1]
-                write_text_atomic(path, json.dumps(current, indent=2, sort_keys=True))
+                if current.get("command_scope", scope) != scope:
+                    raise process_stop.ScopeStopFailed("the saved command scope changed during the stop")
+                new = tuple(item for item in _command_scopes(current, scope) if item not in seen)
+                if new:
+                    stage(current, new)
+                    seen.extend(new)
+                return new
 
-        term_reached = 0
+        hook_error: BaseException | None = None
         try:
-            if not ended:
-                hook = report_term if on_term is not None else None
-                term_reached = process_stop.stop_scopes(scopes, grace, kill_grace, on_term=hook).term_reached
+            receipt = process_stop.stop_scopes(() if ended else scopes, grace, kill_grace,
+                                               on_term=on_term, next_scopes=next_scopes)
+            hook_error = receipt.hook_error
+            if not _scopes_have_ended(seen):
+                raise process_stop.ScopeStopFailed("a command scope became populated again during the stop")
         except process_stop.ScopeStopFailed as error:
             with record_lock(path):
                 record = _read_record(path)
-                record["scope_error"] = str(error)
-                write_text_atomic(path, json.dumps(record, indent=2, sort_keys=True))
+                if record.get("command_scope", scope) == scope:
+                    record["scope_error"] = str(error)
+                    _ = record.pop("scope_end_proved", None)
+                    write_text_atomic(path, json.dumps(record, indent=2, sort_keys=True))
+            if hook_error is not None:
+                raise error from hook_error
             raise
-        if on_term is not None and not term_reached:
-            return True
-        with record_lock(path):
-            record = _read_record(path)
-            if record.get("command_scope") != scope:
-                return False
-            record["scope_end_proved"] = True
-            _ = record.pop("scope_error", None)
-            if stop_pass:
-                record["stop_pass_requested"] = True
-                if _stop_caller_is_owner(record["staff_id"], os.environ):
-                    record["self_stop"] = True
-            write_text_atomic(path, json.dumps(record, indent=2, sort_keys=True))
-        return True
+        if staged:
+            with record_lock(path):
+                record = _read_record(path)
+                if record.get("command_scope") != scope:
+                    raise process_stop.ScopeStopFailed("the saved command scope changed during the stop") from hook_error
+                record["scope_end_proved"] = True
+                _ = record.pop("scope_error", None)
+                write_text_atomic(path, json.dumps(record, indent=2, sort_keys=True))
+        if hook_error is not None:
+            raise hook_error
+        return staged or prior_stop or on_term is not None
 
 
 def stop_command(
@@ -694,8 +703,7 @@ def _command_has_ended(raw: Mapping[str, object], pid: int) -> bool:
         if raw.get("scope_end_proved") is True:
             return True
         try:
-            return process_stop.is_scope_identity(scope) and all(
-                process_stop.scope_has_ended(item) for item in _command_scopes(raw, scope))
+            return process_stop.is_scope_identity(scope) and _scopes_have_ended(_command_scopes(raw, scope))
         except process_stop.ScopeStopFailed:
             return False
     command = _saved_process(raw.get("command_pid"), raw.get("command_started"))

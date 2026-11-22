@@ -722,12 +722,14 @@ The launcher uses one process for scope publication and command startup.
 On natedev, five samples of the former helper took 179–294 ms elapsed and 161–183 ms CPU.
 Five samples of the replacement guard took 63–131 ms elapsed and 52–65 ms CPU.
 The samples used private records outside the expected scope and measured the launch check.
-`detached_runs.py stop` saves the stop reason before it sends TERM.
+`detached_runs.py stop` saves the stop reason and any pass cancellation request before it sends TERM.
 It sends TERM through individual pidfds to verified members of the saved scope tree.
-The optional callback reports the total TERM count once, after all TERM sends and before any exit wait.
+The optional callback reports the TERM count for the initial scopes once, before the exit wait.
 Empty and removed scopes contribute zero to the total.
-If the callback raises, the stop completes the exit wait and any KILL attempt before it raises the callback error.
-It also checks the scope of a verified leader that runs a nested systemd scope.
+After each stop, it checks for a new scope of the verified leader.
+It stops each new scope before it saves completion.
+If the callback raises, the stop saves the cleanup result before it raises the error.
+If cleanup also fails, the cleanup error includes the callback error as its cause.
 It uses `cgroup.kill` after the stop grace if the scope stays populated.
 A failed scope kill reports a stop error if the scope stays populated.
 A verified empty scope or removal of its directory proves the run ended.
