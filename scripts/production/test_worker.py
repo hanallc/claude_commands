@@ -707,14 +707,15 @@ class WorkerCommandTests(unittest.TestCase):
         record.update(exit_code=0, pane_dispatch_id="")
         atomic_file.write_text_atomic(path, json.dumps(record))
         runs = {str(self.fixture.parent.current_session): [str(self.run_dir), str(previous)]}
-        with (patch.object(detached_runs, "_alert_director"),
-              patch.object(detached_runs, "submit_finished_worker_result",
-                           return_value=detached_runs.WorkerResultReplay.SUBMITTED) as replay,
+        _ = write_config_fixture(self.fixture.root / "conf/postmaster.conf")
+        before = len(self.fixture.prompts())
+        with (self.fixture.record_codex_prompt(row, opened.pane), patch.object(detached_runs, "_alert_director"),
               redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as errors):
             self.assertEqual(worker.restore(self.fixture.parent.id, runs=runs), worker.ExitCode.OK)
         self.assertEqual(errors.getvalue(), "")
-        replay.assert_called_once()
-        self.assertEqual(replay.call_args.args[0], previous)
+        prompt, = self.fixture.prompts()[before:]
+        self.assertIn("Detached run: other-check", prompt[3].splitlines())
+        self.assertIs(worker_lifecycle.read_json_object(path)["worker_received"], True)
         self.assertEqual(self.reply.read_text().rstrip(), reply)
         completion = progress_history.hook_completion(worker_panes.worker_pass(row, self.run_dir))
         self.assertIsInstance(completion, progress_history.HookCompletion)

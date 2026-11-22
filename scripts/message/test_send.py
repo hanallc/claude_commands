@@ -8746,6 +8746,33 @@ class PaneWorkerMessageTests(unittest.TestCase):
                 self.assertEqual(output.getvalue(), f"REFUSED: {row.name}: {detail}\nSEND_OUTCOME: worker_refused\n")
                 self.assertEqual(world.commands, [])
 
+    def test_worker_refusal_outcome_covers_a_native_target_change_in_the_same_pane(self) -> None:
+        from scripts.herdr import herdr
+
+        row = self.row
+        _ = self.accept_pass(row)
+        world = self.fixture.world
+        pane = "w1:p1"
+        replacement = fixture_runtime_id("replacement-worker-target")
+        prompt = world.prompt
+
+        def replace_target(target_pane: str, text: str, *, target: str, proof: herdr.SubmitStarts | herdr.SubmitUnproved,
+                           on_submission: Callable[[], object]) -> None:
+            self.assertEqual((target_pane, target), (pane, row.current_session))
+            world.activate(replacement, pane, "claude")
+            prompt(target_pane, text, target=target, proof=proof, on_submission=on_submission)
+
+        address = f"worker:{self.fixture.parent.name}/{row.name}"
+        with (mock.patch.object(world, "prompt", side_effect=replace_target) as submit,
+              redirect_stdout(io.StringIO()) as output):
+            code = send.main(["--here", "--to", address, "--text", "Continue the work."])
+        submit.assert_called_once()
+        self.assertEqual(code, 2, output.getvalue())
+        self.assertIn("does not run session", output.getvalue())
+        self.assertEqual(output.getvalue().splitlines()[-1], "SEND_OUTCOME: worker_refused")
+        self.assertEqual(self.fixture.prompts(), [])
+        self.assertEqual(send.pending(f"staff:{self.fixture.parent.id}"), "")
+
     def test_roster_problem_is_silent_while_a_usable_worker_still_succeeds(self) -> None:
         instance = self.accept_pass(self.row)
         with (mock.patch.object(roster, "roster", return_value=roster.Roster([], ["one run was unreadable"])),

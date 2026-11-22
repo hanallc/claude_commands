@@ -176,6 +176,10 @@ class HerdrCommandNotStarted(HerdrFailure):
     """The transport command did not start."""
 
 
+class HerdrPromptTargetRefused(HerdrCommandNotStarted):
+    """The prompt target did not pass the check before input."""
+
+
 @dataclass
 class TrackedPromptSubmission:
     """Check readiness and record whether the prompt may have sent input."""
@@ -3296,11 +3300,15 @@ class Herdr:
                on_submission: Callable[[], object] = lambda: None) -> None:
         """Send input only to the selected session."""
         if not target:
-            raise HerdrFailure(f"{pane}: would send keys without a named target session")
+            raise HerdrPromptTargetRefused(f"{pane}: would send keys without a named target session")
         row = self.pane_row(pane)
-        if not check_target(target, action="keys", place=HerdrPlace(self.session, pane), text=text,
-                            pane_info=row, client=self):
-            raise HerdrFailure(f"{pane}: would send keys to an unproved target instead of session {target}")
+        try:
+            proved = check_target(target, action="keys", place=HerdrPlace(self.session, pane), text=text,
+                                  pane_info=row, client=self)
+        except HerdrFailure as error:
+            raise HerdrPromptTargetRefused(str(error), error.code) from error
+        if not proved:
+            raise HerdrPromptTargetRefused(f"{pane}: would send keys to an unproved target instead of session {target}")
         _ = on_submission()
         prepared = _prepare_prompt(pane, text)
         transport_started = True

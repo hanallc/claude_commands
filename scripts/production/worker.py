@@ -324,6 +324,7 @@ def dispatch_receipt(row: staff.StaffRow, line: str, dispatch_id: str, *,
     if isinstance(pane_pass, progress_history.StoppedPassReceipt):
         live = [record for record in live if detached_runs.result_in_pass(record, pane_pass.instance_id, since=None)]
     else:
+        passed: dict[str, object] | None = None
         if isinstance(pane_pass, worker_panes.PassDetachedResults):
             since, instance = pane_pass.started_at, pane_pass.instance_id
         else:
@@ -333,6 +334,13 @@ def dispatch_receipt(row: staff.StaffRow, line: str, dispatch_id: str, *,
         live = [record for record in live if detached_runs.result_in_pass(record, instance, since=since)]
         deliveries, other_passes = detached_runs.worker_results(directory, row, since=since,
             pane_dispatch_id=instance, received_runs=transcript.received_runs)
+        if isinstance(reply, DispatchAwaitingReply) and isinstance(reply.matching_done, DispatchComplete):
+            # A completed pass can only reopen for a result from its run.
+            unmatched = set(reply.runs).difference(deliveries, other_passes, (record["run_id"] for record in live))
+            if unmatched:
+                saved = passed if passed is not None else worker_panes.worker_pass(row, run)
+                if saved.get("instance_id") == instance and saved.get("status") == "completed":
+                    other_passes.update(unmatched)
         if isinstance(reply, DispatchAwaitingReply) and other_passes.intersection(reply.runs):
             transcript = transcript_receipt(records(), prompt, done, other_pass_results=frozenset(other_passes))
             recovered = transcript.receipt

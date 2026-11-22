@@ -5300,7 +5300,7 @@ def _deliver_worker_answer(parent: staff.StaffId, row: staff.StaffRow, text: str
             client.prompt(state.pane, checked.text, target=str(state.row.current_session),
                           proof=herdr.SubmitStarts(int(timeout * 1000)), on_submission=submission)
             return PaneTextDelivered("sent", f"worker {row.name} at {state.pane}")
-    except _WorkerInputRefused as error:
+    except (_WorkerInputRefused, herdr.HerdrPromptTargetRefused) as error:
         return WorkerMessageRefused("refused", f"{row.name}: {error}")
     except (herdr_types.HerdrFailure, OSError, ValueError, subprocess.SubprocessError,
             staff.StaffRefused, recorder_state.OldRecorderState) as error:
