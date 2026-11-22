@@ -8286,15 +8286,16 @@ with patch.object(fcntl, "flock", admission):
             self.assertEqual(owners.refused, [])
 
     def test_explicit_phase_checkout_stays_selected_after_the_staff_folder_moves(self) -> None:
-        run = self.start_run("phase-checkout", 40_000, unit_owned=True)
-        self.start_numbered_phase(run, "4a", 40_010)
-        row = unit_runs.run_owner(self.read_state(run), staff.snapshot())
-        assert isinstance(row, staff.StaffRow)
         source = self.model_phase_source()
         _ = subprocess.run(["git", "init", "-q", str(source)], capture_output=True, check=True)
         _ = subprocess.run(["git", "-C", str(source), "-c", "user.name=Test",
                             "-c", "user.email=test@example.invalid", "commit", "--allow-empty", "-qm", "phase"],
                            capture_output=True, check=True)
+        self.working_dir = make_fixture_worktree(source, "reservation", "home")
+        run = self.start_run("phase-checkout", 40_000, unit_owned=True)
+        self.start_numbered_phase(run, "4a", 40_010)
+        row = unit_runs.run_owner(self.read_state(run), staff.snapshot())
+        assert isinstance(row, staff.StaffRow)
         checkout = make_fixture_worktree(source, "reservation", "p4a")
         with redirect_stdout(io.StringIO()):
             self.assertEqual(phase_reservation.main([
@@ -8350,6 +8351,7 @@ with patch.object(fcntl, "flock", admission):
              "commit", "--allow-empty", "-qm", "phase baseline"],
             check=True, capture_output=True, timeout=TEST_HANG_GUARD_SECS,
         )
+        self.working_dir = make_fixture_worktree(source, "reservation", "home")
         checkout = make_fixture_worktree(source, "reservation", "p57c")
         for name, extra in (("retry-57c", ()),
                             ("retry-backfilled-57c", ("--started-at", "1970-01-01T11:06:45+00:00"))):

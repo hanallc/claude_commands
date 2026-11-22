@@ -431,15 +431,13 @@ def _require_model_worktree(root: Path, home: _PhaseRunHome) -> None:
         raise StateRefused(f"{root}: {error}. {fix}") from error
 
 
-def _record_worktree(directory: Path, root: Path) -> None:
+def _record_worktree(directory: Path, root: Path, home: _PhaseRunHome) -> None:
     """Verify the checkout before recording a separate checkout."""
-    home = _phase_run_home(directory)
-    _require_model_worktree(root, home)
-    directory.mkdir(parents=True, exist_ok=True)
     if root == home.root.resolve():
         (directory / WORKTREE_FILE).unlink(missing_ok=True)
-    else:
-        write_text_atomic(directory / WORKTREE_FILE, str(root) + "\n")
+        return
+    _require_model_worktree(root, home)
+    write_text_atomic(directory / WORKTREE_FILE, str(root) + "\n")
 
 
 def _record_baselines(directory: Path, root: Path) -> None:
@@ -985,20 +983,20 @@ def _claim_command(args: argparse.Namespace) -> int:
     directory = phase_directory(session_dir, cast(str, args.phase))
     requested = Path(cast(str, args.repo))
     try:
-        if (directory / WORKTREE_FILE).is_file() or (directory / BASELINE_FILE).is_file():
+        home = _phase_run_home(directory)
+        _require_model_worktree(home.root.resolve(), home)
+        if (directory / WORKTREE_FILE).is_file():
             recorded = phase_worktree(directory).root
             if recorded.is_dir():
                 requested = recorded
+        elif (directory / BASELINE_FILE).is_file() and home.root.is_dir():
+            requested = home.root
         root = repository_root(requested)
         if root is None:
-            if (session_dir / unit_runs.STATE_FILE).is_file():
-                home = home_worktree(directory).resolve()
-                if requested.resolve().is_relative_to(home):
-                    raise StateRefused(f"{requested}: no Git checkout. {MOVE_UNIT_HOME}")
             print("phase reservation: no repository or no files to claim; still awaiting first touch")
             return 0
         root = root.resolve()
-        _record_worktree(directory, root)
+        _record_worktree(directory, root, home)
         _record_baselines(directory, root)
     except (StateRefused, OSError) as refused:
         print(f"phase_reservation: {refused}", file=sys.stderr)

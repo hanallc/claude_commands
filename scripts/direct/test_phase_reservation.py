@@ -147,14 +147,18 @@ class WorktreeAttributionTests(unittest.TestCase):
         self.assertFalse((directory / phase_reservation.WORKTREE_FILE).exists())
         self.assertFalse((directory / phase_reservation.BASELINE_FILE).exists())
 
-    def assert_model_worktree_refused(self, phase: str, path: Path, reason: str) -> None:
+    def assert_claim_refused(self, phase: str, path: Path) -> str:
         code, errors = self.claim(phase, path)
-        self.assertEqual(code, 2)
-        self.assertIn(str(path), errors)
-        self.assertIn(reason, errors)
+        self.assertEqual(code, 2, errors)
         directory = phase_reservation.phase_directory(self.session, phase)
         self.assertFalse((directory / phase_reservation.WORKTREE_FILE).exists())
         self.assertFalse((directory / phase_reservation.BASELINE_FILE).exists())
+        return errors
+
+    def assert_model_worktree_refused(self, phase: str, path: Path, reason: str) -> None:
+        errors = self.assert_claim_refused(phase, path)
+        self.assertIn(str(path), errors)
+        self.assertIn(reason, errors)
 
     def test_claim_refuses_a_model_path_clone_without_a_record(self) -> None:
         clone = self.second.with_name("p3")
@@ -187,25 +191,34 @@ class WorktreeAttributionTests(unittest.TestCase):
         self.assert_model_worktree_refused(
             "1", self.main, "Move the unit home into the worktree model by the showrunner's order.")
 
+    def test_claim_refuses_an_off_model_home_with_a_valid_separate_checkout(self) -> None:
+        row = next(row for row in staff.snapshot().rows if row.kind == "unit")
+        _ = staff.set_worktree(row.id, staff.PresentWorktree("natedev", self.main), expected=row.worktree)
+        errors = self.assert_claim_refused("1", self.second)
+        self.assertIn(str(self.main), errors)
+        self.assertIn(phase_reservation.MOVE_UNIT_HOME, errors)
+
     def test_claim_refuses_a_home_without_a_git_checkout(self) -> None:
         home = self.session.parent / "non-git-home"
         subdirectory = home / "src"
         subdirectory.mkdir(parents=True)
         row = next(row for row in staff.snapshot().rows if row.kind == "unit")
         _ = staff.set_worktree(row.id, staff.PresentWorktree("natedev", home), expected=row.worktree)
-        reason = "no Git checkout. Move the unit home into the worktree model by the showrunner's order."
         for requested in (home, subdirectory):
             with self.subTest(requested=requested):
-                self.assert_model_worktree_refused("1", requested, reason)
+                errors = self.assert_claim_refused("1", requested)
+                self.assertIn(str(home), errors)
+                self.assertIn(phase_reservation.MOVE_UNIT_HOME, errors)
 
     def test_claim_refuses_a_non_git_path_when_the_run_owner_is_unavailable(self) -> None:
         _ = (self.session / plan_history.STATE_FILENAME).write_text("{}")
-        code, errors = self.claim("1", self.session)
-        self.assertEqual(code, 2)
+        errors = self.assert_claim_refused("1", self.session)
         self.assertIn(f"phase_reservation: {self.session}: run owner is unavailable", errors)
-        directory = phase_reservation.phase_directory(self.session, "1")
-        self.assertFalse((directory / phase_reservation.WORKTREE_FILE).exists())
-        self.assertFalse((directory / phase_reservation.BASELINE_FILE).exists())
+
+    def test_claim_refuses_a_non_git_path_when_the_run_state_is_missing(self) -> None:
+        (self.session / plan_history.STATE_FILENAME).unlink()
+        errors = self.assert_claim_refused("1", self.session)
+        self.assertIn(f"phase_reservation: {self.session}: run owner is unavailable", errors)
 
     def test_claim_uses_the_model_home_without_a_phase_worktree_file(self) -> None:
         directory = phase_reservation.phase_directory(self.session, "1")
