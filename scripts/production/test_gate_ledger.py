@@ -173,7 +173,7 @@ request_slow_seconds=0.25
 """
     )
     _ = (directory / "build_folders.conf").write_text(
-        f"""roots.system=/tmp
+        f"""roots.system={root}
 roots.temporary=${{TMPDIR}}/builds
 roots.gate={gate}
 roots.build={root / 'build'}

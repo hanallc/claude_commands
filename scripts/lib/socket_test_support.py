@@ -1,43 +1,38 @@
-"""Private Unix socket paths whose length does not depend on TMPDIR."""
+"""Give each Unix socket fixture a private folder with a short path."""
 from __future__ import annotations
 
-import socket
 import os
-from contextlib import ExitStack
-from types import TracebackType
-
-from scripts.lib import build_folders, conf
-from scripts.lint.memory_test_support import config_environment
+import socket
+import sys
+import tempfile
 from pathlib import Path
+from types import TracebackType
 from typing import override
 
 
-# The socket folders' own parent under the configured system root.
-PARENT = "test-sockets"
-# Each process sweeps a parent once: parallel test runs hold many folders there.
-_swept: set[Path] = set()
+UNIX_SOCKET_PATH_LIMIT = 103 if sys.platform == "darwin" else 107
+LONGEST_SOCKET_SUFFIX = ".codex2/app-server-control/app-server-control.sock"
+FALLBACK_SOCKET_ROOT = Path("/tmp")
 
 
-def socket_parent() -> Path:
-    """Return the parent; the first call in a process removes the free folders killed runs left."""
-    parent = Path(conf.read_or_repository("build_folders").text("roots.system")) / PARENT
-    parent.mkdir(mode=0o700, exist_ok=True)
-    if parent not in _swept:
-        _swept.add(parent)
-        build_folders.sweep_temporary_build_folders(parent, wait=False)
-    return parent
+def socket_parent(prefix: str = "s") -> Path:
+    """Use the temporary directory if the longest fixture socket path fits."""
+    parent = Path(tempfile.gettempdir())
+    # tempfile.mkdtemp adds eight characters to the prefix.
+    longest_path = parent / (prefix + "xxxxxxxx") / LONGEST_SOCKET_SUFFIX
+    return parent if len(os.fsencode(longest_path)) <= UNIX_SOCKET_PATH_LIMIT else FALLBACK_SOCKET_ROOT
 
 
 class ShortSocketDirectory:
-    """Keep a short socket folder in its own parent under the configured system root."""
+    """Remove the private socket folder when the fixture closes."""
 
     def __init__(self, prefix: str) -> None:
-        if configuration := os.environ.get("CONF_DIR"):
-            _ = config_environment(Path(configuration))
-        self._lifetime: ExitStack = ExitStack()
-        folder = self._lifetime.enter_context(build_folders.temporary_build_folder(
-            build_folders.UniqueBuildFolder(prefix, build_folders.ExplicitBuildParent(socket_parent()))))
-        self.name: str = str(folder)
+        short_prefix = prefix[:1]
+        parent = socket_parent(short_prefix)
+        self._folder: tempfile.TemporaryDirectory[str] = tempfile.TemporaryDirectory(
+            dir=parent, prefix=short_prefix)
+        # Keep relative fixture paths short for bind and connect.
+        self.name: str = str(parent / Path(self._folder.name).name)
 
     def __enter__(self) -> str:
         return self.name
@@ -47,11 +42,11 @@ class ShortSocketDirectory:
         self.cleanup()
 
     def cleanup(self) -> None:
-        self._lifetime.close()
+        self._folder.cleanup()
 
 
-def short_socket_directory(prefix: str = "test-sock-") -> ShortSocketDirectory:
-    """Own a private socket folder; use its context or register cleanup."""
+def short_socket_directory(prefix: str = "s") -> ShortSocketDirectory:
+    """Own a private socket folder for the fixture."""
     return ShortSocketDirectory(prefix)
 
 

@@ -317,12 +317,14 @@ def _last_change(path: Path, limits: FolderScanLimits, *,
 
 
 def bound_sockets(table: str = UNIX_SOCKETS) -> frozenset[str] | None:
-    """The path of every unix socket a live process binds, or None where the table cannot be read."""
+    """Read live Unix socket paths. Return None if the table is unavailable."""
     try:
-        lines = Path(table).read_text(encoding="utf-8", errors="replace").splitlines()[1:]
+        with Path(table).open(encoding="utf-8", errors="replace", newline="\n") as source:
+            _ = next(source, "")
+            return frozenset(parts[7] for line in source
+                             if len(parts := line.removesuffix("\n").split(None, 7)) == 8 and parts[7].startswith("/"))
     except OSError:
         return None
-    return frozenset(parts[7] for line in lines if len(parts := line.split()) >= 8 and parts[7].startswith("/"))
 
 
 def live_socket(path: Path, bound: frozenset[str] | None) -> bool:
