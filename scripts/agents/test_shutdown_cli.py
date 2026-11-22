@@ -3191,6 +3191,7 @@ class ProductionRenameTests(support.ProductionRenameFixture):
             self.write(source, legacy.read_text().replace(
                 f"- **Showrunner checkout:** `{self.checkout}`",
                 f"- **Showrunner checkout:** `{integration}`\n"
+                + f"- **Repository:** `{self.checkout}`\n"
                 + f"- **{MERGE_CHECKOUT_FIELD}:** `{self.checkout}`"))
             if form == "migrated":
                 production_admission.record_verified_move(read_production(owner), source)
