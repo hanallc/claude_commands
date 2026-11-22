@@ -77,6 +77,8 @@ __PAGE_FRAME_STYLE__
 .build-limits-table .quiet th, .build-limits-table .quiet td { padding-block: 6px; }
 .build-limits-table .quiet th { font-weight: 400; }
 .build-limit-state { display: inline-block; margin-left: .55em; color: var(--ink-2); font-size: .8em; font-weight: 400; }
+.build-limit-slot + .build-limit-slot { margin-top: 8px; }
+.build-limit-slot > strong { overflow-wrap: anywhere; }
 .build-limit-metric, .build-limit-count { display: flex; flex-wrap: wrap; gap: 4px 8px; align-items: center; }
 .build-limit-metric { margin-top: 5px; font-weight: 400; }
 .build-limit-metric > :last-child { margin-left: auto; }
@@ -1324,13 +1326,18 @@ function renderBuildLimits(limits) {
     <span class="build-limit-state">${esc(data.state)}</span>
     ${data.shared.map(metric => limitMetric(metric)).join("")}
     ${data.claims ? `<div class="build-limit-note">${data.claims} ${data.claims === 1 ? "claim" : "claims"}</div>` : ""}
-    ${limitNames(data.runs ?? [])}${limitWaits(data.waits)}</th>`).join("");
+    ${limitNames(data.runs ?? [])}
+    ${data.other?.length ? `<div class="build-limit-note">${esc(data.other_note)}</div>${limitNames(data.other)}` : ""}
+    ${limitWaits(data.waits)}</th>`).join("");
   const rows = limits.repositories.map(row => {
-    const cells = [row.natedev, row.mac, row.aws];
+    const slots = row.mac_slots ?? [];
+    const cells = [row.natedev, row.mac, row.aws, ...slots.map(slot => slot.cell)];
     const pending = limitWaits(row.unplaced);
     const quiet = cells.every(cell => !cell.runs.length && !cell.exempt.length && !cell.other.length);
+    const mac = slots.length ? slots.map(slot => `<div class="build-limit-slot">
+      <strong>${esc(slot.name)}</strong>${limitCell(slot.cell)}</div>`).join("") : limitCell(row.mac);
     return `<tr${quiet ? ' class="quiet"' : ""}><th scope="row">${esc(row.name)}${pending}</th>
-      ${cells.map(cell => `<td>${limitCell(cell)}</td>`).join("")}</tr>`;
+      <td>${limitCell(row.natedev)}</td><td>${mac}</td><td>${limitCell(row.aws)}</td></tr>`;
   }).join("");
   const legend = [["run", "A run that is in progress"], ["free", "A free place"], ["line", "The limit"],
     ["merge", "A merge run above the limit"], ["wait", "A run that waits"]];

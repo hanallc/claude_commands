@@ -81,6 +81,14 @@ class BuildLimitsTests(unittest.TestCase):
                 self.assertEqual(history.origins.resolve("", unseen), "")
                 self.assertIn(unseen, history.origins.active_folders)
                 self.assertEqual(lookup.call_count, 4)
+            claude_checkout = root / ".claude"
+            claude_checkout.mkdir()
+            git(claude_checkout, "init", "-q")
+            git(claude_checkout, "remote", "add", "origin", "https://example.invalid/claude_commands")
+            _ = history.origins.resolve("", str(claude_checkout), read_checkout=True)
+            with mock.patch.object(repository, "repo_name", return_value="workspace"), mock.patch.object(
+                    repository, "git_common_dir", return_value=None):
+                self.assertIs(claim_state.checkout_claim_scope(str(workspace), "macos"), claim_state.WHOLE_MAC)
             saved = limits_view.Background(history, limits_view.Metric("Money today", 8, 25, "USD"),
                                            limits_view.Metric("Money today", 2, 5, "USD"), origins=history.origins)
             gate_source = workspace / "scripts/production/gate_routes.py"
@@ -128,7 +136,7 @@ class BuildLimitsTests(unittest.TestCase):
             self.assertTrue(stale_saved.history_stale)
             self.assertIs(stale_saved.history, history)
             self.assertEqual(stale_saved.aws_money, failed.aws_money)
-            self.assertEqual(stale_saved.origins.mac_scopes, history.origins.mac_scopes)
+            self.assertEqual(stale_saved.origins.mac_folders, history.origins.mac_folders)
             refresh.pending = Future()
             refresh.pending.set_result(updated)
             self.assertIs(refresh.current(14, 60), updated)
@@ -138,9 +146,16 @@ class BuildLimitsTests(unittest.TestCase):
             _ = (root / "build_admission.conf").write_text(
                 "[disk]\n# whole: 1..\nfree_floor_gib=31\n[]\n# whole: 1..\ncloud_gate_slots=4\n")
             _ = (root / "cloud_gate.conf").write_text("enabled=on\n")
-            _ = (root / "mac_test.conf").write_text("offload=on\nlinux_only..claude=\nlinux_only.workspace=\nlinux_only.tools=\n" +
-                                                   "# range: 1..\nmac_budget_gib=18\n# range: 1..\nmac_budget_gib.workspace=27\n" +
-                                                   "# range: 1..\nfree_floor_gib=100\n")
+            mac_file = root / "mac_test.conf"
+            mac_settings = (
+                "offload=on\nhost=fixture-mac\nlinux_only..claude=\nlinux_only.workspace=\nlinux_only.tools=\n"
+                "# range: 1..\nconnect_timeout_s=6\n# range: 1..\nleftover_timeout_s=10\n"
+                "# range: 1..\nprobe_timeout_s=15\n# range: 1..\nunreachable_backoff_s=30\n"
+                "# range: 1..\nmirror_busy_backoff_s=10\n# whole: 1..\nabandoned_session_minutes=9\n"
+                "# range: 1..\nmac_budget_gib=18\n# range: 1..\ntarget_budget_gib=21\n"
+                "# range: 1..\nmac_budget_gib.workspace=27\n# range: 1..\nmac_budget_gib.tools=88\n"
+                "# range: 1..\nfree_floor_gib=100\n")
+            _ = mac_file.write_text(mac_settings)
             _ = (root / "build_folders.conf").write_text(f"roots.slot_cargo={root}\n")
             baseline = reading.explanation
             policy = replace(baseline.policy,
@@ -327,11 +342,38 @@ class BuildLimitsTests(unittest.TestCase):
                 self.assertEqual(history.origins.resolve("", str(tools_checkout), read_checkout=True), tools_origin)
                 tools_background = replace(saved, history=replace(history, machines={**history.machines, tools_origin: {"mac"}}))
                 unrelated = replace(held, scope=claim_state.RepositoryScope("tools"), record=unknown_claim)
+                unclaimed_run = replace(unknown_run, pid=23, gate_placement="another-episode/attempt-1")
                 tools_limits = limits_view.build_limits(current, (replace(mac, claims=(unrelated,)), hana), names,
-                    memory, folders, tools_background, UTC, ((unknown_run, "tools run"),))
+                    memory, folders, tools_background, UTC, ((unknown_run, "tools run"), (unclaimed_run, "other run")))
                 self.assertEqual(tools_limits.mac.runs, ("tools run",))
+                self.assertEqual(tools_limits.mac.other, ("other run",))
+                self.assertTrue(all(not row.mac.other for row in tools_limits.repositories))
                 tools_cell = next(row.mac for row in tools_limits.repositories if row.name == "tools")
-                self.assertEqual((tools_cell.used, tools_cell.limit, tools_cell.runs), (0, 1, []))
+                self.assertFalse(tools_cell.available)
+                self.assertIsNone(tools_cell.limit)
+                self.assertEqual(tools_cell.budgets, ())
+
+                _ = mac_file.write_text(mac_settings + (
+                    "linux_only.tools-local=\nlinux_only.tools-ci=\n# range: 1..\nmac_budget_gib.tools-local=29\n"))
+                second_checkout = root / "tools-ci"
+                second_checkout.mkdir()
+                git(second_checkout, "init", "-q")
+                git(second_checkout, "remote", "add", "origin", tools_origin)
+                _ = history.origins.resolve("", str(second_checkout), read_checkout=True)
+                tools_claim = replace(held, scope=claim_state.RepositoryScope("tools-local"),
+                                      record={**claim, "worktree": str(tools_checkout)})
+                mac_wait = next(entry for entry in names.waits if entry.name == "mac wait").source
+                assert isinstance(mac_wait, queue_view.WaitingBuild)
+                tools_wait = replace(mac_wait, step=replace(mac_wait.step, folder=str(tools_checkout)))
+                multi_names = replace(names, waits=(*names.waits, limits_view.VisibleWait(tools_wait, "tools wait")))
+                multi = limits_view.build_limits(current, (replace(mac, claims=(tools_claim,)), hana), multi_names,
+                    memory, folders, tools_background, UTC, ())
+                tools = next(row for row in multi.repositories if row.name == "tools")
+                self.assertEqual([(slot.name, slot.cell.used, slot.cell.limit, slot.cell.budgets[0].limit)
+                                  for slot in tools.mac_slots], [("tools-ci", 0, 1, 21), ("tools-local", 1, 1, 29)])
+                self.assertEqual([slot.cell.runs for slot in tools.mac_slots], [[], ["nextest"]])
+                self.assertEqual([slot.cell.waits for slot in tools.mac_slots], [{}, {"Limit full": ["tools wait"]}])
+                self.assertEqual(tools.mac.waits, {})
                 unreadable = replace(mac, states=(targets.StateUnreadable("Cannot read fixture claims"),), claims=())
                 claim_status = limits_view.build_limits(current, (unreadable, hana), names, memory,
                                                        folders, saved, UTC, mac_runs)
@@ -357,7 +399,7 @@ class BuildLimitsTests(unittest.TestCase):
             self.assertEqual(rows["workspace"].mac.used, 1)
             self.assertEqual(rows["workspace"].mac.other, ["other attempt"])
             self.assertEqual(rows["workspace"].mac.other_note, "No matching claim")
-            self.assertEqual(rows["claude_commands"].mac.budgets[0].limit, 18)
+            self.assertEqual(rows["claude_commands"].mac.budgets[0].limit, 21)
             self.assertEqual(result.mac.state, f"Held until {until:%H:%M UTC}")
             self.assertEqual(result.natedev.shared[-1], limits_view.Metric("Free disk", 20, 31, "GiB", "minimum"))
             self.assertEqual(result.aws.shared[0], limits_view.Metric("Cloud gates", 0, 4))

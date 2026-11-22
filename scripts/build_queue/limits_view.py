@@ -22,7 +22,7 @@ from scripts.buildlog import charts, repository, store
 from scripts.lib import conf, git_files
 from scripts.lib.build_slots import slot_cargo_root
 from scripts.lint.memory_admit import gpu_test_reservation, repository_run_owner
-from scripts.mac_test import claim_state, mac_test
+from scripts.mac_test import claim_state, eligibility, mac_test
 from scripts.production import gate
 
 Machine = Literal["natedev", "mac", "aws"]
@@ -46,6 +46,8 @@ class MachineLimits:
     waits: dict[str, list[str]] = field(default_factory=dict[str, list[str]])
     claims: int = 0
     runs: tuple[str, ...] = ()
+    other: tuple[str, ...] = ()
+    other_note: str = ""
 
 
 @dataclass
@@ -62,6 +64,12 @@ class Cell:
     note: str = ""
 
 
+@dataclass(frozen=True)
+class MacSlot:
+    name: str
+    cell: Cell
+
+
 @dataclass
 class RepositoryRow:
     name: str
@@ -69,15 +77,7 @@ class RepositoryRow:
     mac: Cell = field(default_factory=Cell)
     aws: Cell = field(default_factory=Cell)
     unplaced: dict[str, list[str]] = field(default_factory=dict[str, list[str]])
-
-    def cell(self, machine: Machine) -> Cell:
-        match machine:
-            case "natedev":
-                return self.natedev
-            case "mac":
-                return self.mac
-            case "aws":
-                return self.aws
+    mac_slots: tuple[MacSlot, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -118,8 +118,8 @@ class Origins:
     aliases: dict[str, str] = field(default_factory=dict[str, str])
     identities: dict[str, str] = field(default_factory=dict[str, str])
     active_folders: set[str] = field(default_factory=set[str])
-    mac_scopes: dict[str, set[claim_state.RepositoryScope]] = field(
-        default_factory=dict[str, set[claim_state.RepositoryScope]])
+    mac_folders: dict[str, claim_state.RepositoryScope] = field(
+        default_factory=dict[str, claim_state.RepositoryScope])
 
     def key(self, identity: str) -> str:
         if identity not in self.identities:
@@ -142,11 +142,7 @@ class Origins:
             return ""
         if read_checkout:
             if folder not in self.folders:
-                origin = self.folders[folder] = self.read(folder)
-                if origin:
-                    scope = claim_state.checkout_claim_scope(folder, "macos")
-                    if isinstance(scope, claim_state.RepositoryScope):
-                        self.mac_scopes.setdefault(origin, set()).add(scope)
+                self.folders[folder] = self.read(folder)
         else:
             self.active_folders.add(folder)
         return self.canonical(self.folders.get(folder, ""))
@@ -156,6 +152,9 @@ class Origins:
             checkout = git_files.locate(Path(folder))
         except (git_files.GitFilesError, OSError):
             return ""
+        scope = claim_state.checkout_claim_scope(folder, "macos")
+        if isinstance(scope, claim_state.RepositoryScope):
+            self.mac_folders[folder] = scope
         if checkout.common_dir not in self.common:
             self.common[checkout.common_dir] = ""
             remote = repository.output(["git", "config", "--includes", "--file", str(checkout.common_dir / "config"),
@@ -357,34 +356,20 @@ def local_limits(reading: records.QueueRead, memory: Metric, folders: conf.Confi
     return tuple(metrics)
 
 
-@dataclass(frozen=True)
-class MacPolicy:
-    repositories: frozenset[str]
-    overrides: frozenset[str]
-    settings: conf.ConfigRead
-
-
-def mac_policy(snapshot: targets.TargetSnapshot | None) -> MacPolicy | None:
+def mac_configuration(snapshot: targets.TargetSnapshot | None) -> eligibility.OffloadConfig | None:
     if snapshot is None or not isinstance(snapshot.target, target_config.SshTarget):
         return None
-    settings = conf.read(snapshot.target.settings)
     try:
-        values = settings.values()
-        allowed = frozenset(key.removeprefix("linux_only.") for key in values if key.startswith("linux_only."))
-        overrides = frozenset(key.removeprefix("mac_budget_gib.") for key in values
-                              if key.startswith("mac_budget_gib."))
-        return MacPolicy(allowed if settings.value("offload", conf.on_off) else frozenset(), overrides, settings)
+        return eligibility.read_config(snapshot.target.settings)
     except conf.Unusable:
         return None
 
 
-def mac_budget(policy: MacPolicy, names: set[str]) -> Metric:
-    settings = policy.settings
+def mac_budget(config: eligibility.OffloadConfig, scope: claim_state.RepositoryScope) -> Metric:
     try:
-        configured = settings.values(*(f"mac_budget_gib.{name}" for name in sorted(names)))
-        override = next(iter(configured), "")
-        maximum = settings.number(override or "mac_budget_gib")
-    except conf.Unusable:
+        value = config.values.get(f"mac_budget_gib.{scope.name}", config.default_target_budget_gib)
+        maximum = float(conf.decimal(value))
+    except ValueError:
         maximum = None
     return Metric("Build folder", None, maximum, "GiB", "maximum")
 
@@ -589,8 +574,9 @@ def build_limits(reading: records.QueueRead, snapshots: target_availability.Snap
     mac = next((snap for snap in found if snap.target.platform == "macos"), None)
     local = next((snap for snap in found if isinstance(snap.target, target_config.LocalTarget)), None)
     mac_name = mac.target.name if mac is not None else "mac"
+    mac_paths = claim_state.StatePaths(target_config.ssh_target_state_directory(mac_name), mac_name)
     aws_targets = aws_placement_targets(found)
-    mac_settings = mac_policy(mac)
+    mac_config = mac_configuration(mac)
     hana = hana_route(found)
     history = saved.history.machines if isinstance(saved.history, RecentRepositories) else {}
     rows = {origin: RepositoryRow(origin_name(origin)) for origin in history}
@@ -603,12 +589,11 @@ def build_limits(reading: records.QueueRead, snapshots: target_availability.Snap
     whole_mac = False
     shared_mac_claims = 0
     shared_mac_runs: list[str] = []
+    shared_mac_other: list[str] = []
+    mac_other_note = "Claim status unavailable" if mac_claims_unavailable else "No matching claim"
     mac_claim_scopes: list[claim_state.RepositoryScope] = []
-    mac_scopes: dict[str, set[claim_state.RepositoryScope]] = {}
-    for origin, scopes in origins.mac_scopes.items():
-        mac_scopes.setdefault(origins.canonical(origin), set()).update(scopes)
+    mac_cells: dict[str, dict[str, Cell]] = {}
     claimed: set[str] = set()
-    repositories_with_claims: set[str] = set()
     cloud_repositories: set[str] = set()
     local_runs: set[str] = set()
 
@@ -617,20 +602,27 @@ def build_limits(reading: records.QueueRead, snapshots: target_availability.Snap
             rows[origin] = RepositoryRow(origin_name(origin))
         return rows[origin]
 
+    def mac_cell(origin: str, scope: claim_state.RepositoryScope) -> Cell:
+        cells = mac_cells.setdefault(origin, {})
+        if scope.name not in cells:
+            cells[scope.name] = Cell()
+        return cells[scope.name]
+
+    def mac_cell_for_folder(folder: str, recorded_project: str = "") -> Cell | None:
+        project = origins.resolve("", folder) or recorded_project
+        scope = origins.mac_folders.get(folder)
+        if project and scope is not None:
+            _ = row(project)
+            return mac_cell(project, scope)
+        return None
+
+    for folder, scope in origins.mac_folders.items():
+        if project := origins.folders.get(folder):
+            _ = mac_cell(origins.canonical(project), scope)
+
     def known_origin(name: str) -> str:
-        if name == ".claude":
-            name = "claude_commands"
         matches = [origin for origin, current in rows.items() if current.name == name]
         return matches[0] if len(matches) == 1 else ""
-
-    def record_wait(origin: str, machine: Machine | None, reason: str, name: str) -> None:
-        if machine is None:
-            waits = row(origin).unplaced if origin else unplaced
-        elif origin:
-            waits = row(origin).cell(machine).waits
-        else:
-            waits = shared[machine]
-        waits.setdefault(reason, []).append(name)
 
     for reservation in sorted(inputs.reservations, key=lambda item: item["step"] not in records.REPOSITORY_RUN_STEPS):
         owner = repository_run_owner(reservation)
@@ -674,13 +666,13 @@ def build_limits(reading: records.QueueRead, snapshots: target_availability.Snap
             whole_mac = True
             shared_mac_claims += 1
             for build, label in matching:
-                if project := origins.resolve("", build.folder):
-                    row(project).mac.runs.append(label)
-                    repositories_with_claims.add(project)
+                if (cell := mac_cell_for_folder(build.folder)) is not None:
+                    cell.runs.append(label)
                 else:
                     shared_mac_runs.append(label)
             continue
         mac_claim_scopes.append(claim.scope)
+        _ = origins.resolve("", record["worktree"])
         project = origins.resolve(claim.scope.key, record["worktree"])
         if not project:
             shared_mac_claims += 1
@@ -688,8 +680,8 @@ def build_limits(reading: records.QueueRead, snapshots: target_availability.Snap
             if first and not matching and not kept:
                 shared_mac_runs.append(claim_name(record, names))
             continue
-        mac_scopes.setdefault(project, set()).add(claim.scope)
-        cell = row(project).mac
+        _ = row(project)
+        cell = mac_cell(project, claim.scope)
         if kept:
             cell.runs.extend(label for _, label in matching)
             cell.note = "Claim held for cleanup"
@@ -697,10 +689,13 @@ def build_limits(reading: records.QueueRead, snapshots: target_availability.Snap
             cell.runs.append(claim_name(record, names))
     for build, label in mac_runs:
         matched = build.gate_label is queue_view.MacGateLabel.PLACEMENT and build.gate_placement in claimed
-        if not matched and (origin := known_origin(build.repository)):
-            cell = row(origin).mac
+        if matched:
+            continue
+        if (cell := mac_cell_for_folder(build.folder)) is not None:
             cell.other.append(label)
-            cell.other_note = "Claim status unavailable" if mac_claims_unavailable else "No matching claim"
+            cell.other_note = mac_other_note
+        else:
+            shared_mac_other.append(label)
 
     switch = cloud_gate.launch_switch(conf.read("cloud_gate"))
     aws_state = ("On" if switch is cloud_gate.CloudGateSwitch.ON or hana is not None else
@@ -732,7 +727,7 @@ def build_limits(reading: records.QueueRead, snapshots: target_availability.Snap
             if isinstance(entry.wait, wire.CloudSlotWait):
                 reason = ("Waiting for launch" if isinstance(entry.wait.state, ReservedCloudSlot) else
                           "Gate limit full" if entry.wait.used >= entry.wait.slots else "Waiting for cloud slots")
-                record_wait("", "aws", reason, visible.name)
+                shared["aws"].setdefault(reason, []).append(visible.name)
             continue
         step = entry.step
         item = order[entry.position - 1][1] if entry.position <= len(order) else None
@@ -746,10 +741,20 @@ def build_limits(reading: records.QueueRead, snapshots: target_availability.Snap
             if not project:
                 reason = f"{cause.repository} run limit full"
         elif (reason == "Machine held"
-              or machine == "natedev" and reason in ("Memory", "Disk floor", "GPU limit full", "Cargo token")
-              or machine == "mac" and (reason == "Disk floor" or reason == "Limit full" and whole_mac)):
+              or machine == "natedev" and reason in ("Memory", "Disk floor", "GPU limit full", "Cargo token")):
             project = ""
-        record_wait(project, machine, reason, visible.name)
+        if machine == "mac":
+            slot = (mac_cell_for_folder(step.folder, project) if reason not in ("Machine held", "Disk floor")
+                    and not (whole_mac and reason == "Limit full") else None)
+            waits = slot.waits if slot is not None else shared["mac"]
+        elif machine is None:
+            waits = row(project).unplaced if project else unplaced
+        elif project:
+            current = row(project)
+            waits = current.natedev.waits if machine == "natedev" else current.aws.waits
+        else:
+            waits = shared[machine]
+        waits.setdefault(reason, []).append(visible.name)
 
     if hana is not None and (origin := origins.resolve(hana.repository)) in rows:
         cell = row(origin).aws
@@ -769,29 +774,34 @@ def build_limits(reading: records.QueueRead, snapshots: target_availability.Snap
         name = current.name
         current.natedev.limit = policy.by_machine_and_repository.get(f"{inputs.local_machine}.{name}")
         current.natedev.used = len(current.natedev.runs) + len(current.natedev.exempt)
-        mac_names = {name, ".claude"} if name == "claude_commands" else {name}
-        mac_allowed = (bool(mac_names & mac_settings.repositories) if mac_settings is not None else None)
-        cell = current.mac
-        scope_claimed = any(mac_test.scopes_overlap(claim_scope, checkout_scope)
-                            for claim_scope in mac_claim_scopes for checkout_scope in mac_scopes.get(origin, ()))
-        if scope_claimed or origin in repositories_with_claims or cell.other or cell.waits:
-            mac_allowed = True
-        cell.available = mac_allowed if not cell.waits else True
-        if mac_settings is not None and (mac_allowed or mac_names & mac_settings.overrides):
-            cell.budgets = (mac_budget(mac_settings, mac_names),)
-        if mac_allowed:
-            cell.limit = 1
-            if whole_mac:
-                cell.used = max(1, cell.used or 0)
-                cell.note = "Whole Mac claimed"
-            elif scope_claimed:
-                cell.used = max(1, cell.used or 0)
-                if not cell.runs:
-                    cell.note = cell.note or "Mac slot claimed"
-            elif mac_claims_unavailable:
-                cell.used = None
-        elif cell.waits:
-            cell.used = None
+        slots = mac_cells.get(origin, {})
+        shown_slots: list[MacSlot] = []
+        for scope_name, slot in sorted(slots.items()):
+            scope = claim_state.RepositoryScope(scope_name)
+            scope_claimed = any(mac_test.scopes_overlap(claim_scope, scope) for claim_scope in mac_claim_scopes)
+            # A check reads the checkout policy without applying package exclusions.
+            enabled = (mac_config is not None and mac_config.enabled and isinstance(
+                eligibility.linux_only_policy(mac_config, eligibility.KnownRepository(scope_name), Path(), "", "check"),
+                eligibility.KnownRepository))
+            has_slot = enabled or scope_claimed or bool(slot.runs)
+            if not has_slot and not (slot.other or slot.waits):
+                continue
+            slot.available = True if has_slot else None if mac_config is None else False
+            if has_slot:
+                slot.limit = mac_test.slot_capacity(mac_paths, scope)
+                slot.used = slot.limit if whole_mac or scope_claimed else None if mac_claims_unavailable else 0
+                if whole_mac:
+                    slot.note = "Whole Mac claimed"
+                elif scope_claimed and not slot.runs:
+                    slot.note = slot.note or "Mac slot claimed"
+                if mac_config is not None:
+                    slot.budgets = (mac_budget(mac_config, scope),)
+            shown_slots.append(MacSlot(scope_name, slot))
+        if len(shown_slots) == 1:
+            current.mac = shown_slots[0].cell
+        else:
+            current.mac.available = None if not slots or mac_config is None else False
+            current.mac_slots = tuple(shown_slots)
         cell = current.aws
         has_cloud = origin in cloud_repositories or saved.cloud_routes.get(origin) is True
         if cell.limit is None:
@@ -813,7 +823,7 @@ def build_limits(reading: records.QueueRead, snapshots: target_availability.Snap
             pass
     return BuildLimits(MachineLimits(target_state(local, zone), local_limits(reading, memory, folders), shared["natedev"]),
                        MachineLimits(target_state(mac, zone), mac_shared, shared["mac"], shared_mac_claims,
-                                     tuple(shared_mac_runs)),
+                                     tuple(shared_mac_runs), tuple(shared_mac_other), mac_other_note),
                        MachineLimits(aws_state, (Metric("Cloud gates", cloud_used, cloud_limit), saved.aws_money),
                                      shared["aws"]),
                        ordered, isinstance(saved.history, charts.IndexUnavailable), unplaced, saved.history_stale)

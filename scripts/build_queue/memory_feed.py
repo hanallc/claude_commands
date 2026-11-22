@@ -3265,9 +3265,11 @@ class LimitsRefresh:
                 if (isinstance(current.history, charts.IndexUnavailable) and previous is not None
                         and isinstance(previous.history, limits_view.RecentRepositories)):
                     current.origins.aliases.update(previous.history.origins.aliases)
-                    current.origins.folders = {**previous.history.origins.folders, **current.origins.folders}
-                    for origin, scopes in previous.history.origins.mac_scopes.items():
-                        current.origins.mac_scopes.setdefault(origin, set()).update(scopes)
+                    for folder, origin in previous.history.origins.folders.items():
+                        if folder not in current.origins.folders:
+                            current.origins.folders[folder] = origin
+                            if (scope := previous.history.origins.mac_folders.get(folder)) is not None:
+                                current.origins.mac_folders[folder] = scope
                     current = replace(current, history=previous.history, cloud_routes=previous.cloud_routes,
                                       history_stale=True)
                 self.saved = current
