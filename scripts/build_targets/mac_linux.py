@@ -2,9 +2,8 @@
 from __future__ import annotations
 
 from collections.abc import Generator
-from contextlib import AbstractContextManager, contextmanager, nullcontext, redirect_stdout
+from contextlib import AbstractContextManager, contextmanager, nullcontext, redirect_stdout, suppress
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from enum import StrEnum
 from io import BytesIO
 import json
@@ -39,6 +38,7 @@ TRANSFER_ALLOWANCE_SECONDS = 120
 GUEST_REF_TIMEOUT_SECONDS = 30
 GUEST_KILL_GRACE_SECONDS = 3
 GUEST_CLEANUP_TIMEOUT_SECONDS = 25
+GUEST_PROOF_RETRY_SECONDS = 0.1
 MISSING_PREREQUISITE_STATUS = 75
 MISSING_PREREQUISITE_MESSAGE = 'Repository lacks these prerequisite commits:'
 GUEST_END_PENDING_STATUS = 76
@@ -220,26 +220,41 @@ fi'''
     return GuestMain(commit)
 
 
-@dataclass(frozen=True)
-class GuestRunDeadline:
-    """Give the guest and the reservation the same deadline."""
+OPEN_RUN_LOCK = '''\
+import os
+import stat
+import sys
 
-    utc_microseconds: int
-    monotonic: float
+path, number, shell = sys.argv[1:]
+try:
+    if os.path.islink(path):
+        raise OSError('The guest run lock must not be a symlink.')
+    directory, name = os.path.split(path)
+    parent = os.open(directory, os.O_RDONLY | os.O_NOFOLLOW | os.O_DIRECTORY)
+    flags = os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK
+    try:
+        lock = os.open(name, flags, 0o600, dir_fd=parent)
+    finally:
+        os.close(parent)
+    if not stat.S_ISREG(os.fstat(lock).st_mode):
+        raise OSError('The guest run lock must be a regular file.')
+except OSError as error:
+    sys.exit(str(error))
+descriptor = int(number)
+if lock == descriptor:
+    os.set_inheritable(lock, True)
+else:
+    os.dup2(lock, descriptor)
+    os.close(lock)
+os.execvp('bash', ['bash', '-c', shell])
+'''
 
-    @classmethod
-    def from_now(cls, seconds: int) -> GuestRunDeadline:
-        return cls(time.time_ns() // 1000 + seconds * 1_000_000, time.monotonic() + seconds)
 
-    def wait_past_kill_grace(self) -> str:
-        bound = self.monotonic + GUEST_KILL_GRACE_SECONDS
-        time.sleep(max(0, bound - time.monotonic()))
-        utc_bound = self.utc_microseconds / 1_000_000 + GUEST_KILL_GRACE_SECONDS
-        return datetime.fromtimestamp(utc_bound, timezone.utc).isoformat(timespec='milliseconds')
+def open_run_lock_command(descriptor: int, shell: str) -> str:
+    return shlex.join(('python3', '-I', '-S', '-c', OPEN_RUN_LOCK, RUN_LOCK_PATH, str(descriptor), shell))
 
 
-def run_shell(settings: GuestSettings, source: CandidateSource, bootstrap_bytes: int, attempt: str,
-              deadline: GuestRunDeadline) -> str:
+def run_shell(settings: GuestSettings, source: CandidateSource, bootstrap_bytes: int, attempt: str) -> str:
     object_format = 'sha256' if len(source.commit) == 64 else 'sha1'
     checkout = f'''set -euo pipefail
 if [ ! -f .git/mac-linux-owned ]; then
@@ -291,57 +306,38 @@ git reset --hard -q "$origin_main"
 umask 022
 ./scripts/lib/py "$bootstrap/runner.py" "$bootstrap/request.json"'''
     locked_run = f'''set -euo pipefail
-exec {RUN_LOCK_FD}<> {RUN_LOCK_PATH}
 flock -x -n {RUN_LOCK_FD} || {{ printf 'The guest run lock is held.\\n' >&2; exit 1; }}
-now=${{EPOCHREALTIME/./}}
-remaining=$(({deadline.utc_microseconds} - now))
-if (( remaining <= 0 )); then
-    printf 'The guest run deadline passed before launch.\\n' >&2
-    exit 124
+lock="/proc/$$/fd/{RUN_LOCK_FD}"
+if [[ -L {RUN_LOCK_PATH} || ! "$lock" -ef {RUN_LOCK_PATH} ]]; then
+    printf 'The guest run lock path changed.\\n' >&2
+    exit 1
 fi
-limit={settings.run_time_limit_seconds * 1_000_000}
-if (( remaining > limit )); then
-    remaining=$limit
-fi
-printf '%s %s\\n' "$BASHPID" {shlex.quote(attempt)} > {RUN_LOCK_PATH}
-printf -v duration '%d.%06d' "$((remaining / 1000000))" "$((remaining % 1000000))"
-exec timeout --signal=KILL "$duration" bash -c {shlex.quote(checkout)}'''
+printf '%s %s\\n' "$BASHPID" {shlex.quote(attempt)} > "$lock"
+exec timeout --signal=KILL {settings.run_time_limit_seconds} bash -c {shlex.quote(checkout)}'''
     return guest_shell(settings) + f'''
 umask 077
 mkdir -p -- "$checkout/.git"
 cd "$checkout"
-status=0
-setsid --wait bash -c {shlex.quote(locked_run)} || status=$?
-if (( status != 0 && status != {MISSING_PREREQUISITE_STATUS} )); then
-    exit "$status"
-fi
-exec 8< {RUN_LOCK_PATH}
-flock -x -n 8 || {{ printf 'The guest run lock is still held.\\n' >&2; exit 1; }}
-exit "$status"'''
+exec setsid --wait {open_run_lock_command(RUN_LOCK_FD, locked_run)}'''
 
 
-def cleanup_shell(settings: GuestSettings, attempt: str, deadline: GuestRunDeadline) -> str:
-    return guest_shell(settings) + f'''
-umask 077
-mkdir -p -- "$checkout/.git"
-cd "$checkout"
-exec 8<> {RUN_LOCK_PATH}
+def cleanup_shell(settings: GuestSettings, attempt: str) -> str:
+    cleanup = f'''set -euo pipefail
+lock="/proc/$$/fd/8"
 prove_end() {{
     flock -x -n 8 || return 1
-    read -r group owner < {RUN_LOCK_PATH} || :
-    now=${{EPOCHREALTIME/./}}
-    if [[ "$owner" != {shlex.quote(attempt)} ]] && (( now < {deadline.utc_microseconds} )); then
-        printf 'The guest run has no lock record.\\n' >&2
+    if [[ -L {RUN_LOCK_PATH} || ! "$lock" -ef {RUN_LOCK_PATH} ]]; then
+        printf 'The guest run lock path changed.\\n' >&2
         exit {GUEST_END_PENDING_STATUS}
     fi
     printf 'ended\\n'
     exit 0
 }}
 prove_end || :
-read -r group owner < {RUN_LOCK_PATH} || :
+read -r group owner < "$lock" || :
 if [[ "$owner" == {shlex.quote(attempt)} ]]; then
     if [[ "$group" =~ ^[1-9][0-9]{{0,9}}$ ]] && (( group > 1 && group <= 2147483647 )); then
-        if [[ /proc/$group/fd/{RUN_LOCK_FD} -ef {RUN_LOCK_PATH} ]]; then
+        if [[ /proc/$group/fd/{RUN_LOCK_FD} -ef "$lock" ]]; then
             kill -KILL -- "-$group" 2>/dev/null || :
         fi
     else
@@ -354,6 +350,11 @@ done
 prove_end || :
 printf 'The guest run lock is still held.\\n' >&2
 exit {GUEST_END_PENDING_STATUS}'''
+    return guest_shell(settings) + f'''
+umask 077
+mkdir -p -- "$checkout/.git"
+cd "$checkout"
+exec {open_run_lock_command(8, cleanup)}'''
 
 
 class GuestEndStatus(StrEnum):
@@ -368,36 +369,46 @@ class GuestEndProof:
     detail: str = ''
 
 
-def prove_guest_end(settings: GuestSettings, attempt: str, deadline: GuestRunDeadline) -> GuestEndProof:
+def prove_guest_end(settings: GuestSettings, attempt: str) -> GuestEndProof:
     try:
-        reply = subprocess.run(settings.command(cleanup_shell(settings, attempt, deadline)), stdin=subprocess.DEVNULL,
+        reply = subprocess.run(settings.command(cleanup_shell(settings, attempt)), stdin=subprocess.DEVNULL,
                                capture_output=True, text=True, errors='replace',
                                timeout=GUEST_CLEANUP_TIMEOUT_SECONDS, check=False)
     except (OSError, subprocess.TimeoutExpired) as error:
-        return GuestEndProof(GuestEndStatus.UNREACHABLE, str(error))
+        return GuestEndProof(GuestEndStatus.PENDING, str(error))
     if reply.returncode == 0 and reply.stdout.strip() == 'ended':
         return GuestEndProof(GuestEndStatus.ENDED)
-    status = GuestEndStatus.PENDING if reply.returncode == GUEST_END_PENDING_STATUS else GuestEndStatus.UNREACHABLE
+    # OpenSSH reports a connection timeout with status 255.
+    status = GuestEndStatus.UNREACHABLE if reply.returncode == 255 else GuestEndStatus.PENDING
     reason = reply.stderr.strip() or f'cleanup SSH exited {reply.returncode}'
     return GuestEndProof(status, reason)
 
 
-def failed_guest_run(settings: GuestSettings, attempt: str, deadline: GuestRunDeadline,
-                     detail: str) -> GuestUnavailable:
-    proof = prove_guest_end(settings, attempt, deadline)
-    if proof.status is GuestEndStatus.ENDED:
-        return GuestUnavailable(f'{detail}. Guest cleanup: ended')
-    first_failure = proof.detail
-    bound = deadline.wait_past_kill_grace()
-    proof = prove_guest_end(settings, attempt, deadline)
-    # A reachable guest with a held lock still needs proof.
-    while proof.status is GuestEndStatus.PENDING:
-        time.sleep(0.1)
-        proof = prove_guest_end(settings, attempt, deadline)
-    if proof.status is GuestEndStatus.ENDED:
-        return GuestUnavailable(f'{detail}. Guest cleanup: {first_failure}. Guest cleanup after the deadline: ended')
-    return GuestUnavailable(f'{detail}. Guest cleanup: {proof.detail}. '
-                            + f'guest unreachable; its own timeout bound passed at {bound}')
+def finish_guest_run(settings: GuestSettings, attempt: str, ssh_ended_at: float) -> GuestEndProof:
+    bound = ssh_ended_at + settings.run_time_limit_seconds + GUEST_KILL_GRACE_SECONDS
+    first_failure = ''
+    interruption: KeyboardInterrupt | None = None
+    while True:
+        try:
+            proof = prove_guest_end(settings, attempt)
+            if proof.status is GuestEndStatus.ENDED:
+                detail = 'Guest cleanup: ended' + (f' after {first_failure}' if first_failure else '')
+                break
+            remaining = bound - time.monotonic()
+            if proof.status is GuestEndStatus.UNREACHABLE and remaining <= 0:
+                detail = (f'Guest cleanup: {proof.detail}. guest unreachable; '
+                          + f'its own timeout bound passed at {bound:.3f} on the caller monotonic clock')
+                break
+            if not first_failure:
+                first_failure = proof.detail
+                print('Mac Linux guest run not proven ended; the Mac claim stays held', file=sys.stderr, flush=True)
+            time.sleep(remaining if proof.status is GuestEndStatus.UNREACHABLE else GUEST_PROOF_RETRY_SECONDS)
+        except KeyboardInterrupt as error:
+            interruption = error
+    if interruption is not None:
+        interruption.add_note(detail)
+        raise interruption
+    return GuestEndProof(proof.status, detail)
 
 
 class BundleForm(StrEnum):
@@ -498,8 +509,8 @@ def run_remote(repo: Path, settings: GuestSettings, source: CandidateSource, req
         form, reason = BundleForm.FIRST, bundle.reason
     timeout = settings.transfer_timeout_seconds
     transport = uuid4().hex
-    deadline = GuestRunDeadline.from_now(settings.run_time_limit_seconds)
-    command = settings.command(run_shell(settings, source, len(bootstrap), transport, deadline))
+    command = settings.command(run_shell(settings, source, len(bootstrap), transport))
+    stream_error: BaseException | None = None
     try:
         with subprocess.Popen(['bash', '-o', 'pipefail', '-c', STREAM_SOURCE, TARGET, prefix, base, header,
                                *command], cwd=repo, stdin=subprocess.PIPE,
@@ -507,20 +518,35 @@ def run_remote(repo: Path, settings: GuestSettings, source: CandidateSource, req
             try:
                 output, errors = stream.communicate(bootstrap, timeout=timeout)
             except BaseException:
-                try:
-                    os.killpg(stream.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
+                while True:
+                    try:
+                        with suppress(ProcessLookupError):
+                            os.killpg(stream.pid, signal.SIGKILL)
+                        _ = stream.wait()
+                        break
+                    except KeyboardInterrupt:
+                        continue
                 raise
-    except subprocess.TimeoutExpired as error:
-        raise failed_guest_run(settings, transport, deadline, f'SSH or guest run exceeded {timeout} seconds') from error
+    except BaseException as error:
+        stream_error = error
+        raise
+    finally:
+        # The source stream shell waits for SSH before it exits.
+        proof = finish_guest_run(settings, transport, time.monotonic())
+        if isinstance(stream_error, subprocess.TimeoutExpired):
+            raise GuestUnavailable(f'SSH or guest run exceeded {timeout} seconds. {proof.detail}') from stream_error
+        if stream_error is not None:
+            stream_error.add_note(proof.detail)
     if stream.returncode:
         diagnostics = errors.decode(errors='replace')
-        if stream.returncode == MISSING_PREREQUISITE_STATUS and MISSING_PREREQUISITE_MESSAGE in diagnostics:
+        if (proof.status is GuestEndStatus.ENDED and stream.returncode == MISSING_PREREQUISITE_STATUS
+                and MISSING_PREREQUISITE_MESSAGE in diagnostics):
             raise GuestMissingPrerequisite(diagnostics.strip())
         detail = ' '.join(diagnostics.split())[-1200:]
-        raise failed_guest_run(settings, transport, deadline,
-                               f'SSH or source stream exited {stream.returncode}: {detail or "no diagnostic"}')
+        raise GuestUnavailable(f'SSH or source stream exited {stream.returncode}: {detail or "no diagnostic"}. '
+                               + proof.detail)
+    if proof.status is GuestEndStatus.UNREACHABLE:
+        raise GuestUnavailable(proof.detail)
     result, _, count = output.rstrip().rpartition(b'\n')
     return GuestReply(result.decode('utf-8'), int(count) - len(bootstrap), form, reason)
 
@@ -605,7 +631,8 @@ def route(repo: Path, *, mode: SuiteMode, full: bool, module_time_limit_s: float
         return run
     except (GuestUnavailable, OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError,
             GateRefused, affected_modules.GraphError) as error:
-        return f'{TARGET}: {error}'
+        notes = cast(list[str], getattr(error, '__notes__', []))
+        return f'{TARGET}: ' + ' '.join((str(error), *notes))
 
 
 def run_guest(request_path: Path) -> int:
