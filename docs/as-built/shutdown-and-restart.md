@@ -650,6 +650,7 @@ On Linux, the detached process confirms the claim to `systemd-run`.
 On macOS, the detached process confirms the claim through a pipe.
 The parent tries to create the same claim file after the launcher returns.
 If the child claims the log, the parent prints one line with the log path and the background status.
+The child writes the report if its readiness check fails.
 The detached process writes and flushes the full list of sessions before it stops any session.
 If the parent claims the log, it reports the count, the cause, and the step in the terminal and the log.
 A child that starts after the parent claims the log exits without stopping any session.

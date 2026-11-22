@@ -353,15 +353,15 @@ class BulkReport:
         } for key, issue in self.issues.items()}
         data: DetachedReport = {
             "retry": self.retry,
-            "targets": {key: name for key, name in self.targets.items() if key in self.issues},
-            "units": {key: unit for key, unit in self.units.items() if key in self.issues},
+            "targets": self.targets,
+            "units": self.units,
             "issues": issues,
         }
         return json.dumps(data)
 
     def receive(self, data: DetachedReport) -> None:
         self.retry = data["retry"]
-        self.targets.update(data["targets"])
+        self.targets.update((key, name) for key, name in data["targets"].items() if key in data["issues"])
         self.units.update(data["units"])
         self.issues.update({key: FollowUp(**issue) for key, issue in data["issues"].items()})
         self.inherited.update(self.issues)
@@ -404,15 +404,8 @@ class BulkReport:
         return lines
 
 
-@dataclass(frozen=True)
-class DetachedLog:
-    path: Path
-    descriptor: int
-
-
 _BULK_REPORT: ContextVar[BulkReport | None] = ContextVar("_BULK_REPORT", default=None)
-_DETACHED_LOG: ContextVar[DetachedLog | None] = ContextVar("_DETACHED_LOG", default=None)
-_DETACHED_REPORT: ContextVar[DetachedReport | None] = ContextVar("_DETACHED_REPORT", default=None)
+_DETACHED_CHILD: ContextVar[bool] = ContextVar("_DETACHED_CHILD", default=False)
 
 
 def _retry_command(arguments: list[str]) -> str:
@@ -453,6 +446,10 @@ class StopPlanWriteFailed(Exception):
     """The child could not save the stop plan."""
 
 
+class DetachedReadinessFailed(OSError):
+    """The child could not confirm readiness."""
+
+
 def _record_stop_plan(report: BulkReport, rows: Iterable[staff.StaffRow]) -> None:
     names = [f"{report.targets[row.id]} ({row.id})" for row in rows]
     header = "\n".join([f"Sessions to stop ({len(names)}).", *names]) + "\n"
@@ -470,72 +467,108 @@ def _background_status(command: str) -> str:
     return f"{command} runs in the background. Read its report in this log."
 
 
+def _plain_terminal_step(retry: str) -> str:
+    return f"Nate opens a plain terminal without a staff session. Nate runs {retry} there."
+
+
+def _detached_failure(report: BulkReport, data: DetachedReport | None, reason: str, step: str) -> None:
+    if data is not None:
+        for key, name in data["targets"].items():
+            _ = report.targets.setdefault(key, name)
+    pending = report.targets.keys() - report.completed - report.issues.keys()
+    for key in pending:
+        report.issues[key] = FollowUp(report.targets[key], reason, step, operator=True)
+    if not pending:
+        report.issues["detached"] = FollowUp(report.command, reason, step, operator=True)
+
+
 def run_command(action: Callable[[], int], arguments: list[str], *, stop: bool = False, dry_run: bool = False) -> int:
     """Write the command output to the terminal and the same log."""
-    detached = _DETACHED_LOG.get()
-    path = detached.path if detached is not None else (
-        shutdown_state_root() / "logs" / f"{'stop' if stop else 'restart'}-{uuid4().hex}.log")
+    if _DETACHED_CHILD.get():
+        return action()
+    path = shutdown_state_root() / "logs" / f"{'stop' if stop else 'restart'}-{uuid4().hex}.log"
     report = BulkReport(path, "agents stop --all" if stop else "agents restart", _retry_command(arguments))
-    if (data := _DETACHED_REPORT.get()) is not None:
-        report.receive(data)
-    with ExitStack() as files:
-        try:
-            if detached is None:
-                log = _create_log(files, path)
-                # Show the path before the child can stop the caller.
-                print(path, end="", flush=True)
-            else:
-                log = files.enter_context(io.FileIO(detached.descriptor, "wb", closefd=False))
-                _ = log.seek(0, os.SEEK_END)
-            report.log_stream = log
-        except (OSError, ValueError) as error:
-            if detached is not None:
-                print(f"Could not write the log at {path}. The command did not start.", file=sys.stderr, flush=True)
-                return 2
-            log = None
-            report.log_error = error
-            print(f"Could not write the log at {path}. {_error_reason(error)}", flush=True)
+    return _run_reported_command(action, report, dry_run=dry_run)
 
+
+def _run_reported_command(action: Callable[[], int], report: BulkReport, *, dry_run: bool = False,
+                          log_fd: int | None = None, data: DetachedReport | None = None) -> int:
+    path = report.log
+    detached = log_fd is not None
+    with ExitStack() as files:
         token = _BULK_REPORT.set(report)
+        child_token = _DETACHED_CHILD.set(detached)
         output = io.StringIO()
+        code = 2
+        failure = ""
+        step = "Nate sends this error to the efficiency unit."
+        prefix = ""
         try:
+            try:
+                if log_fd is None:
+                    report.log_stream = _create_log(files, path)
+                    # Show the path before the child can stop the caller.
+                    print(path, end="", flush=True)
+                else:
+                    log = files.enter_context(io.FileIO(log_fd, "wb", closefd=False))
+                    _ = log.seek(0, os.SEEK_END)
+                    report.log_stream = log
+            except (OSError, ValueError) as error:
+                if detached:
+                    raise StopPlanWriteFailed(_error_reason(error)) from error
+                report.log_error = error
+                print(f"Could not write the log at {path}. {_error_reason(error)}", flush=True)
             with redirect_stdout(output), redirect_stderr(output):
                 code = action()
-        except StopPlanWriteFailed as error:
-            print(f"Could not write the log at {path}. The command did not start. {error}",
-                  file=sys.stderr, flush=True)
-            return 2
         except UnknownAccountName as error:
-            report.issues[""] = FollowUp(report.command, _error_reason(error),
-                "Nate selects an available account.", operator=True)
-            code = 2
-        except (OSError, ValueError, conf.Unusable, staff.StaffRefused, herdr_types.HerdrFailure,
-                subprocess.SubprocessError) as error:
-            report.failure("", report.command, _error_reason(error))
-            code = 2
+            report.issues[""] = FollowUp(report.command, _error_reason(error), "Nate selects an available account.", operator=True)
+        except (Exception, SystemExit, KeyboardInterrupt) as error:
+            if detached:
+                failure = _error_reason(error)
+                if isinstance(error, StopPlanWriteFailed):
+                    failure = f"Could not write the log at {path}. The command did not start. {failure}"
+                    # Start the report on a new line if the stop plan has a partial write.
+                    prefix = "\n" if report.log_stream is not None else ""
+                if isinstance(error, (DetachedReadinessFailed, StopPlanWriteFailed)):
+                    step = _plain_terminal_step(report.retry)
+                if isinstance(error, SystemExit):
+                    lines = output.getvalue().strip().splitlines()
+                    failure = lines[-1] if lines else failure
+            elif isinstance(error, (OSError, ValueError, conf.Unusable, staff.StaffRefused,
+                                    herdr_types.HerdrFailure, subprocess.SubprocessError)):
+                report.failure("", report.command, _error_reason(error))
+            else:
+                raise
         finally:
+            _DETACHED_CHILD.reset(child_token)
             _BULK_REPORT.reset(token)
+        log = report.log_stream
         if report.writer is LogWriter.CHILD:
             print(f"  {_background_status(report.command)}", flush=True)
             return code
-        if detached is None and log is not None:
+        if not detached and log is not None:
             print(flush=True)
-        if code and not report.issues:
+        if detached and (failure or (code and report.issues.keys() <= report.inherited)):
+            reason = failure or _error_reason(output.getvalue().strip() or "Could not complete the command")
+            _detached_failure(report, data, reason, step)
+        elif code and not report.issues:
             report.failure("", report.command, "Could not complete the command")
-        result = "\n".join(report.lines(dry_run=dry_run)) + "\n"
+        result = prefix + "\n".join(report.lines(dry_run=dry_run)) + "\n"
         if log is not None and report.writer is LogWriter.LOCAL:
             try:
                 _write_log(log, result)
-                if detached is not None:
+                if detached:
                     os.fsync(log.fileno())
             except (OSError, ValueError) as error:
                 print(f"Could not finish writing the log at {path}. {_error_reason(error)}",
                       file=sys.stderr, flush=True)
-                if detached is not None:
+                if detached:
                     print(result, end="", file=sys.stderr, flush=True)
                     return code or 2
-        if detached is None:
+        if not detached:
             print(result, end="", flush=True)
+        elif log is None:
+            print(result, end="", file=sys.stderr, flush=True)
         return code
 
 
@@ -1516,7 +1549,7 @@ def _detach_stop(arguments: list[str], selected: list[staff.StaffRow], record: s
             detail = (_launch_failure_reason(launch_error) if launch_error is not None else
                       "The detached process did not claim the log")
             reason = f"The launcher could not start the detached command. {detail}"
-            step = f"Nate opens a plain terminal without a staff session. Nate runs {report.retry} there."
+            step = _plain_terminal_step(report.retry)
 
     for row in selected:
         report.issues[row.id] = FollowUp(report.targets[row.id], reason, step, operator=True)
@@ -1711,7 +1744,7 @@ def _restart(pane_evidence: ExitStack, *, stop_all: bool, dry_run: bool, only: t
                 worker_policies[row.id] = policy
         omit_refused_workers(refused_workers)
 
-    if report is not None and _DETACHED_LOG.get() is not None and stop_all:
+    if report is not None and _DETACHED_CHILD.get() and stop_all:
         _record_stop_plan(report, (row for row in selected if row.id not in refused_workers))
     if stop_all and after_stop is AfterStop.KEEP_STOPPED and not only and isinstance(account, AllRestartAccounts):
         prune_live_rows(reading)
@@ -2023,7 +2056,7 @@ def _notify_log_claim(ready_fd: int | None, *, systemd: bool) -> None:
     if systemd:
         address = os.environ.pop("NOTIFY_SOCKET", "")
         if not address:
-            raise OSError("The systemd readiness socket is unavailable")
+            raise OSError("The systemd readiness socket is unavailable because NOTIFY_SOCKET is missing")
         with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as notifier:
             notifier.connect("\0" + address[1:] if address.startswith("@") else address)
             _ = notifier.send(b"READY=1")
@@ -2042,24 +2075,31 @@ def main() -> int:
     _ = parser.add_argument("--parent-report", type=json.loads)
     options, arguments = parser.parse_known_args()
     log = cast(Path, options.log)
+    data = cast(DetachedReport | None, options.parent_report)
+    stop = arguments[:1] == ["stop"]
+    report = BulkReport(log, "agents stop --all" if stop else "agents restart", _retry_command(arguments))
+    if data is not None:
+        report.receive(data)
     try:
         if not _claim_log(log):
             return 0
-        _notify_log_claim(cast(int | None, options.ready_fd), systemd=cast(bool, options.notify_systemd))
     except OSError as error:
-        print(f"Could not confirm the log claim at {log}. {_error_reason(error)}", file=sys.stderr, flush=True)
+        print(f"Could not claim the log at {log}. {_error_reason(error)}", file=sys.stderr, flush=True)
         return 2
 
-    command = cast(AgentsCommand, cast(object, import_module("scripts.agents.shutdown")))
-    _ = os.environ.pop("CLAUDE_CODE_SESSION_ID", None)
-    _ = os.environ.pop("CODEX_THREAD_ID", None)
-    token = _DETACHED_LOG.set(DetachedLog(log, cast(int, options.log_fd)))
-    data_token = _DETACHED_REPORT.set(cast(DetachedReport | None, options.parent_report))
-    try:
+    def action() -> int:
+        try:
+            _notify_log_claim(cast(int | None, options.ready_fd), systemd=cast(bool, options.notify_systemd))
+        except (OSError, ValueError) as error:
+            detail = error.strerror if isinstance(error, OSError) else None
+            raise DetachedReadinessFailed(
+                f"Could not confirm the detached process is ready. {detail or _error_reason(error)}") from error
+        command = cast(AgentsCommand, cast(object, import_module("scripts.agents.shutdown")))
+        _ = os.environ.pop("CLAUDE_CODE_SESSION_ID", None)
+        _ = os.environ.pop("CODEX_THREAD_ID", None)
         return command.main(arguments)
-    finally:
-        _DETACHED_REPORT.reset(data_token)
-        _DETACHED_LOG.reset(token)
+
+    return _run_reported_command(action, report, dry_run="--dry-run" in arguments, log_fd=cast(int, options.log_fd), data=data)
 
 
 if __name__ == "__main__":

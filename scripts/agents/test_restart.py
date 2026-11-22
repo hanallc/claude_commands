@@ -32,8 +32,9 @@ from typing import Literal, cast, override
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from enum import Enum
+from types import SimpleNamespace
 from uuid import NAMESPACE_URL, uuid5
-from unittest.mock import call, patch
+from unittest.mock import Mock, call, patch
 
 from scripts.agents import inventory
 from scripts.herdr import herdr, pane_launch, turn_end, worker_panes
@@ -1789,6 +1790,8 @@ class RestartTests(RestartTestCase):
         class ShortLog(io.FileIO):
             @override
             def write(self, b: object, /) -> int | None:
+                if self.tell():
+                    return 0
                 return super().write(bytes(memoryview(cast(bytes, b))[:1]))
 
         with (path.open("wb") as log, patch.object(io, "FileIO", ShortLog),
@@ -1945,6 +1948,55 @@ class RestartTests(RestartTestCase):
         self.assertIn(b"agents stop --all: 1 of 1 sessions stopped.", written)
         self.assertEqual(output.getvalue().splitlines(), [
             f"{log_path}  agents stop --all runs in the background. Read its report in this log."])
+
+    def test_detached_stop_reports_failed_readiness_in_the_log(self) -> None:
+        rows = list(self.rows[:2])
+        address = str(self.root / "notify-refused")
+        saved = ["earlier"]
+        shutdown_record.save(saved)
+        for refused, reason in ((False, "NOTIFY_SOCKET is missing"), (True, "Connection refused")):
+            with self.subTest(reason=reason):
+                def launch(arguments: list[str], _task: str, *, log: Path, log_fd: int, **_options: object) -> Path:
+                    connect = Mock(side_effect=ConnectionRefusedError(errno.ECONNREFUSED, reason))
+                    send = Mock()
+                    notifier = nullcontext(SimpleNamespace(connect=connect, send=send))
+                    with (patch.dict(os.environ), patch.object(socket, "socket", return_value=notifier) as factory,
+                          os.fdopen(os.dup(log_fd), "ab") as stream):
+                        _ = os.environ.pop("NOTIFY_SOCKET", None)
+                        if refused:
+                            os.environ["NOTIFY_SOCKET"] = address
+                        self.inherited_log = stream.fileno()
+                        self.assertEqual(self.detached_stop(log, [*arguments, "--notify-systemd"]), 2)
+                        if refused:
+                            connect.assert_called_once_with(address)
+                            send.assert_not_called()
+                        else:
+                            factory.assert_not_called()
+                    raise subprocess.CalledProcessError(1, ["systemd-run"])
+
+                with (patch.object(restart, "live_rows", return_value=restart.CompleteLiveRows(rows)) as discover,
+                      patch.object(restart, "stop_row") as stop,
+                      patch.dict(os.environ, {"CODEX_THREAD_ID": str(rows[0].current_session)}),
+                      patch.object(stop_resume, "detach", side_effect=launch) as launcher,
+                      redirect_stdout(io.StringIO()) as output):
+                    self.assertEqual(shutdown.main(["stop", "--all"]), 0)
+                stop.assert_not_called()
+                discover.assert_called_once()
+                self.assertEqual(shutdown_record.read(), saved)
+                path = cast(Path, launcher.call_args.kwargs["log"])
+                self.assertTrue(path.with_suffix(".claim").exists())
+                self.assertEqual(output.getvalue().splitlines(), [
+                    f"{path}  agents stop --all runs in the background. Read its report in this log."])
+                header, count, *issues, summary = path.read_text().splitlines()
+                self.assertEqual(header, str(path))
+                self.assertEqual(count, "agents stop --all: 0 of 2 sessions stopped.")
+                self.assertEqual([issue.partition(":")[0] for issue in issues], sorted(row.name for row in rows))
+                step = "Nate opens a plain terminal without a staff session. Nate runs agents stop --all there."
+                for issue in issues:
+                    self.assertIn("Could not confirm the detached process is ready.", issue)
+                    self.assertIn(reason, issue)
+                    self.assertIn(step, issue)
+                self.assertIn(step, summary)
 
     def test_late_child_exits_when_the_parent_claimed_the_log(self) -> None:
         row = self.rows[0]
@@ -4265,7 +4317,8 @@ class RestartTests(RestartTestCase):
         arguments = cast(list[str], detached.call_args.args[0])
         self.assertEqual(arguments[:-1], ["stop", "--all", "--only", ",".join(selected), "--parent-report"])
         self.assertEqual(json.loads(arguments[-1]), {
-            "retry": "agents stop --all", "targets": {}, "units": {}, "issues": {}})
+            "retry": "agents stop --all", "targets": {row.id: row.name for row in self.rows},
+            "units": {row.id: row.name for row in self.rows}, "issues": {}})
         self.assertEqual(shutdown_record.read(), ["earlier"])
         self.assertEqual((self.stops, self.launches), ([], []))
 
