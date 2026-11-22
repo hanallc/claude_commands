@@ -28,6 +28,7 @@ from scripts.direct.verify_hold_wait_test_support import (
 )
 
 
+INVOKE = VERIFY.parent.parent / "lint/invoke.sh"
 SIGNAL_EXIT_SECONDS = 5
 _SIGNAL_FIXTURE_PARENT = Path("/dev/shm") if Path("/dev/shm").is_dir() else None
 
@@ -155,8 +156,8 @@ placement_once
         self.assertFalse(Path(f"/proc/{placement_pid}").exists())
 
     def verify_exit_command(self, token: Path, action: str) -> list[str]:
-        harness = shell_functions(
-            VERIFY, "save_verify_exit_stderr", "close_verify_exit_stderr", "finish_exit_diagnostics",
+        harness = shell_functions(INVOKE, "close_verify_exit_stderr") + shell_functions(
+            VERIFY, "save_verify_exit_stderr", "finish_exit_diagnostics",
             "run_log_tee", "start_run_log", "stop_interrupted_run_log",
             "verify_exit", "verify_interrupted",
         ) + r'''
@@ -204,6 +205,34 @@ finish_verify_run() { :; }
         self.assertEqual(result.returncode, 128, result.stdout)
         self.assertFalse(token.exists())
         self.assertFalse((self.fixture.root / "run.log.exit-diagnostics").exists())
+
+    def test_stderr_closes_while_a_step_child_is_still_running(self) -> None:
+        cargo = self.fixture.bin_directory / "cargo"
+        cargo.rename(cargo.with_name("cargo-original"))
+        release = self.fixture.runner_state / "detached-release"
+        started = self.fixture.runner_state / "detached-pid"
+        os.mkfifo(release)
+        self.fixture.write_executable(cargo, r"""#!/usr/bin/env bash
+if [[ "$1" == check ]]; then
+    (
+        printf '%s\n' "$BASHPID" > "$TEST_RUNNER_STATE/detached-pid"
+        read -r unused < "$TEST_RUNNER_STATE/detached-release"
+    ) </dev/null >/dev/null 2>&1 &
+fi
+exec "${0%/*}/cargo-original" "$@"
+""")
+        process = self.start("check", "sample", "--local", "needs the local test fixture")
+        release_fd = os.open(release, os.O_RDWR)
+        try:
+            pid = wait_for_pid(started, processes=(process,))
+            output, errors = process.communicate(timeout=SIGNAL_EXIT_SECONDS)
+            self.assertEqual(process.returncode, 0, output + errors)
+            os.kill(pid, 0)
+        finally:
+            try:
+                _ = os.write(release_fd, b"go\n")
+            finally:
+                os.close(release_fd)
 
     def test_exit_and_term_release_token_when_diagnostics_cannot_open(self) -> None:
         setup = r'''
@@ -271,7 +300,7 @@ kill -TERM "$$"
         with full_output_pipe() as write_fd:
             log = self.fixture.root / "blocked-run.log"
             harness = shell_functions(
-                VERIFY, "close_verify_exit_stderr", "run_log_tee", "start_run_log", "stop_interrupted_run_log",
+                VERIFY, "run_log_tee", "start_run_log", "stop_interrupted_run_log",
             ) + r'''
 RUN_LOG=$1 RUN_LOG_PIDS=()
 trap 'stop_interrupted_run_log; exit 129' HUP

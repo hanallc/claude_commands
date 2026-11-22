@@ -619,6 +619,7 @@ verify_helper() {
         return 0
     fi
     (
+    [[ -z "${VERIFY_EXIT_STDERR_FD:-}" ]] || close_verify_exit_stderr
     if [[ "${1:-}" == --stdin ]]; then
         shift
         set -- 1 "$@"
@@ -769,7 +770,10 @@ VERIFY_METADATA_SCRIPT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/verify_met
 FINAL_PASS_START=""
 finish_verify_run() {
     if [[ -n "$FINAL_PASS_START" ]]; then
-        env -u BUILDLOG_CALL_ID "$PY" "$FINAL_PASS_SCRIPT" finish "${BASH_SOURCE[0]}" "$FINAL_PASS_START" "$1" "${FINAL_FEATURES:-}" || true
+        (
+            [[ -z "${VERIFY_EXIT_STDERR_FD:-}" ]] || close_verify_exit_stderr
+            exec env -u BUILDLOG_CALL_ID "$PY" "$FINAL_PASS_SCRIPT" finish "${BASH_SOURCE[0]}" "$FINAL_PASS_START" "$1" "${FINAL_FEATURES:-}"
+        ) || true
         FINAL_PASS_START=""
     fi
     if [[ -n "${UNIT_DETACHED_RECORD:-}" ]]; then
@@ -982,6 +986,8 @@ run_step() {
         [[ $- != *m* ]] || monitor=1
         set -m
         (
+            # The step and all of its children use the run output streams.
+            [[ -z "${VERIFY_EXIT_STDERR_FD:-}" ]] || close_verify_exit_stderr
             set +m
             if (
                 step_token_before=${TOKEN_HELD:-0}
@@ -1149,13 +1155,19 @@ read_metadata() {
     if [[ -n "${GATE_METADATA:-}" ]]; then
         printf '%s\n' "$GATE_METADATA"
     else
-        cargo metadata --no-deps --format-version 1
+        (
+            [[ -z "${VERIFY_EXIT_STDERR_FD:-}" ]] || close_verify_exit_stderr
+            cargo metadata --no-deps --format-version 1
+        )
     fi
 }
 
 set_gate_metadata() {
     export BUILDLOG_OUTPUT_ROOTS=""
-    GATE_METADATA="$(cargo metadata --no-deps --format-version 1)" || { GATE_METADATA=""; return 1; }
+    GATE_METADATA="$(
+        [[ -z "${VERIFY_EXIT_STDERR_FD:-}" ]] || close_verify_exit_stderr
+        cargo metadata --no-deps --format-version 1
+    )" || { GATE_METADATA=""; return 1; }
     BUILDLOG_OUTPUT_ROOTS="$(verify_helper --stdin "$VERIFY_START_DIR/../buildlog/step_context.py" output-roots \
         <<< "$GATE_METADATA" 2>/dev/null)" || BUILDLOG_OUTPUT_ROOTS=""
 }
@@ -2110,8 +2122,11 @@ start_tree_watch() {
     local scope=()
     if [[ "$CMD" == test ]]; then if [[ -n "${ARGS[0]}" ]]; then scope=(--package "${ARGS[0]}"); fi; fi
     trap 'cancel_tree_run' USR2
-    "$PY" "$TREE_WATCH_SCRIPT" "$TREE_WATCH_DIR/start" "$TREE_WATCH_DIR/fired" "$$" --signal-parent \
-        ${scope[@]+"${scope[@]}"} -- <<< "$GATE_METADATA" >/dev/null 2>&1 &
+    (
+        [[ -z "${VERIFY_EXIT_STDERR_FD:-}" ]] || close_verify_exit_stderr
+        exec "$PY" "$TREE_WATCH_SCRIPT" "$TREE_WATCH_DIR/start" "$TREE_WATCH_DIR/fired" "$$" --signal-parent \
+            ${scope[@]+"${scope[@]}"} --
+    ) <<< "$GATE_METADATA" >/dev/null 2>&1 &
     TREE_WATCH_PID=$!
 }
 
@@ -2128,7 +2143,10 @@ doc_staged_helper() {
     while :; do
         if [[ -f "${folder%/}/scripts/lib/py" ]]; then
             if [[ "$folder" != "${VERIFY_START_DIR%/*/*}" ]]; then
-                VERIFY_PY_HELPER=DOC_STEP_PY "$PY" - "$script" "$@" < "$script"
+                (
+                    [[ -z "${VERIFY_EXIT_STDERR_FD:-}" ]] || close_verify_exit_stderr
+                    VERIFY_PY_HELPER=DOC_STEP_PY exec "$PY" - "$script" "$@" < "$script"
+                )
                 return
             fi
             break
@@ -2162,6 +2180,7 @@ with copies.remote_step_source(Path(sys.argv[2]), sys.argv[3], Path(sys.argv[4])
     sys.stdin.read(1)
 '
     coproc DOC_COPY {
+        [[ -z "${VERIFY_EXIT_STDERR_FD:-}" ]] || close_verify_exit_stderr
         if [[ -n "$ssh_caller" ]]; then
             VERIFY_PY_HELPER=SSH_SOURCE_PY exec "$PY" -c "$ssh_source_py" "$STEP_COPIES_SCRIPT" "$top" "$tree" "$ssh_caller"
         fi
@@ -2424,6 +2443,7 @@ runpy.run_path(sys.argv[0], run_name="__main__")
     MAC_RUNNER_PRIOR_JOB=${!:-}
     MAC_RUNNER_LAUNCHING=1
     (
+        [[ -z "${VERIFY_EXIT_STDERR_FD:-}" ]] || close_verify_exit_stderr
         if [[ -n "$MAC_SOURCE_ROOT" && "$runner_root" == "$MAC_SOURCE_ROOT" ]]; then
             if [[ "$runner" != /* ]]; then runner=$PWD/$runner; fi
             cd -- "$runner_root" || exit $?
@@ -2433,7 +2453,13 @@ runpy.run_path(sys.argv[0], run_name="__main__")
         fi
         VERIFY_PY_HELPER=VERIFY_MAC_ENV_PY exec "$PY" -c "$VERIFY_MAC_ENV_PY" "$runner" "${runner_args[@]}" \
             3< <(printf '%s\0' "${VERIFY_MAC_ENVIRONMENT[@]}")
-    ) > >(tee -a /dev/fd/9) 2> >(tee -a /dev/fd/9 >&2) &
+    ) > >(
+        [[ -z "${VERIFY_EXIT_STDERR_FD:-}" ]] || close_verify_exit_stderr
+        exec tee -a /dev/fd/9
+    ) 2> >(
+        [[ -z "${VERIFY_EXIT_STDERR_FD:-}" ]] || close_verify_exit_stderr
+        exec tee -a /dev/fd/9 >&2
+    ) &
     MAC_RUNNER_PID=$!
     MAC_RUNNER_LAUNCHING=0
     if wait "$MAC_RUNNER_PID"; then
@@ -3046,15 +3072,21 @@ wait_for_placement() {
     if [[ "$PHASE_RESOURCE_WAIT" != "natedev:build hold" ]] && build_hold_nothing_held; then
         wait_target=assignment
     fi
-    "$PY" "$LOCAL_RELEASE_WAIT_SCRIPT" "${BUILD_TARGETS_POLL_S:-15}" "$BUILDLOG_CALL_ID" \
-        "$PLACEMENT_EPISODE" "$wait_kind" "$wait_target" &
+    (
+        [[ -z "${VERIFY_EXIT_STDERR_FD:-}" ]] || close_verify_exit_stderr
+        exec "$PY" "$LOCAL_RELEASE_WAIT_SCRIPT" "${BUILD_TARGETS_POLL_S:-15}" "$BUILDLOG_CALL_ID" \
+            "$PLACEMENT_EPISODE" "$wait_kind" "$wait_target"
+    ) &
     HOLD_WAITER_PID=$!
     wait "$HOLD_WAITER_PID" || true
     HOLD_WAITER_PID=""
 }
 
 wait_for_claim_recovery() {
-    sleep "${BUILD_TARGETS_POLL_S:-15}" &
+    (
+        [[ -z "${VERIFY_EXIT_STDERR_FD:-}" ]] || close_verify_exit_stderr
+        exec sleep "${BUILD_TARGETS_POLL_S:-15}"
+    ) &
     HOLD_WAITER_PID=$!
     wait "$HOLD_WAITER_PID" || true
     HOLD_WAITER_PID=""
@@ -3285,7 +3317,10 @@ start_copy_watch() {
     if [[ "$FILTER_RUN" -eq 1 ]]; then
         watch_args+=(--filter-run)
     fi
-    "$PY" "$MAC_COPY_WATCH" "${watch_args[@]}" -- "${NEXTEST_ARGS[@]}" &
+    (
+        [[ -z "${VERIFY_EXIT_STDERR_FD:-}" ]] || close_verify_exit_stderr
+        exec "$PY" "$MAC_COPY_WATCH" "${watch_args[@]}" -- "${NEXTEST_ARGS[@]}"
+    ) &
     COPY_WATCH_PID=$!
 }
 
@@ -3902,8 +3937,11 @@ acquire_token() {
         if (( TOKEN_WAITERS_AHEAD == 0 )); then
             # Two tries 3 s apart, then the queue is read again.
             pause=1
-            bash "${BOARD_HELPER}" acquire "${BOARD_DIR}" "${BOARD_SLOT}" cargo \
-                --pid $$ --hold "$TOKEN_HOLD_S" --wait 3 >/dev/null 2>&1 &
+            (
+                [[ -z "${VERIFY_EXIT_STDERR_FD:-}" ]] || close_verify_exit_stderr
+                exec bash "${BOARD_HELPER}" acquire "${BOARD_DIR}" "${BOARD_SLOT}" cargo \
+                    --pid $$ --hold "$TOKEN_HOLD_S" --wait 3
+            ) >/dev/null 2>&1 &
             TOKEN_WAITER_PID=$!
             status=0
             wait "$TOKEN_WAITER_PID" || status=$?
@@ -3962,7 +4000,6 @@ fi
 # This also covers the first instant of a step, when a killed verify cannot
 # leave a command that a periodic process scan has not found yet.
 STEP_OWNER_PY='
-from contextlib import suppress
 import fcntl
 import json
 import os
@@ -3986,11 +4023,6 @@ def identity(pid):
     if not isinstance(result, Started):
         raise RuntimeError("cannot read the step owner start")
     return result.start
-
-exit_stderr_fd = os.environ.pop("VERIFY_EXIT_STDERR_FD", "")
-if exit_stderr_fd.isdecimal() and int(exit_stderr_fd) >= 74:
-    with suppress(OSError):
-        os.close(int(exit_stderr_fd))
 
 child = os.fork()
 if child:
@@ -4064,6 +4096,7 @@ start_token_renewer() {
     renew_token || return 1
     local renew_parent=${BASHPID:-$$}
     (
+        [[ -z "${VERIFY_EXIT_STDERR_FD:-}" ]] || close_verify_exit_stderr
         local renew_sleep_pid="" renew_previous_pid="" renew_sleep_starting=0
         # Bash can retain pipeline jobs that this subshell cannot wait for.
         # Stop and collect only the sleep that this renewer started.
@@ -4112,7 +4145,6 @@ buildlog_exec() {
         fi
         VERIFY_TOKEN_LOST_FILE="${HOLD_WAIT_DIR:+$HOLD_WAIT_DIR/token-lost}" \
             VERIFY_PY_HELPER=STEP_OWNER_PY buildlog_exec_unowned env \
-                VERIFY_EXIT_STDERR_FD="${VERIFY_EXIT_STDERR_FD:-}" \
                 VERIFY_PROCESS_GROUP_LIB="$(dirname -- "${STEP_RECORD_SCRIPT:-$BOARD_HELPER}")/../lib" "$PY" -c "$STEP_OWNER_PY" \
                 "${BOARD_DIR}/locks/cargo.d" "$$" "$@" || step_status=$?
         stop_token_renewer
@@ -4218,24 +4250,25 @@ refresh_test_build_inputs() {
 TEST_BUILD_INPUTS_READY=0
 
 eval "$(declare -f build_hold_wait_local | sed '1s/build_hold_wait_local/build_hold_wait_local_only/')"
+
 build_hold_wait_local() {
-    local status=0
+    local status=0 held_before=${TOKEN_HELD:-0}
     if ! build_hold_applies || build_hold_nothing_held; then
         return 0
     fi
     step_state waiting_hold
     phase_wait_start hold "build hold"
-    # A step without the token (before the first take, or after a Mac trip) only waits.
-    if [[ "${TOKEN_HELD:-0}" -ne 1 ]]; then
-        build_hold_wait_local_only "$@" || status=$?
-        phase_wait_finish hold
+    if [[ "$held_before" == 1 ]]; then release_token || return $?; fi
+    (
+        [[ -z "${VERIFY_EXIT_STDERR_FD:-}" ]] || close_verify_exit_stderr
+        build_hold_wait_local_only "$@"
+    ) || status=$?
+    phase_wait_finish hold
+    if [[ "$held_before" != 1 ]]; then
         if [[ "${status:-0}" -ne 0 ]]; then return "$status"; fi
         if [[ "$TEST_BUILD_INPUTS_READY" == 1 ]]; then refresh_test_build_inputs; fi
         return 0
     fi
-    release_token || return $?
-    build_hold_wait_local_only "$@" || status=$?
-    phase_wait_finish hold
     [[ "$status" == 0 ]] || return "$status"
     acquire_token || return $?
     record_token_wait
@@ -4272,14 +4305,8 @@ save_verify_exit_stderr() {
     } 1>&2 2>/dev/null || true
 }
 
-close_verify_exit_stderr() {
-    if [[ ${VERIFY_EXIT_STDERR_FD:-} =~ ^[1-9][0-9]+$ ]]; then
-        eval "exec $VERIFY_EXIT_STDERR_FD>&-"
-    fi
-}
-
 run_log_tee() {
-    close_verify_exit_stderr
+    [[ -z "${VERIFY_EXIT_STDERR_FD:-}" ]] || close_verify_exit_stderr
     # Keep readers alive while verify_interrupted stops the step and records its result.
     # An early reader exit can cause SIGPIPE during cleanup.
     trap '' INT TERM HUP
@@ -4465,7 +4492,7 @@ trap 'verify_interrupted 15' TERM
 trap 'verify_interrupted 1' HUP
 if [[ -n "${COPIES_RUN_PID:-}" ]]; then
     (
-        close_verify_exit_stderr
+        [[ -z "${VERIFY_EXIT_STDERR_FD:-}" ]] || close_verify_exit_stderr
         exec "$PY" "$STEP_COPIES_SCRIPT" watch-owner --pid "$COPIES_RUN_PID" --verify-pid "$$"
     ) &
     COPY_RUN_WATCH_PID=$!
@@ -4930,13 +4957,16 @@ case "$CMD" in
         ;;
     final)
         if [[ -n "$PINNED_TARGET" || "$MAC_ONLY" == 1 || "$LOCAL_ONLY" == 1 ]]; then
-            VERIFY_PY_HELPER=FINAL_CLEAN_TREE_PY "$PY" -c '
+            (
+                [[ -z "${VERIFY_EXIT_STDERR_FD:-}" ]] || close_verify_exit_stderr
+                VERIFY_PY_HELPER=FINAL_CLEAN_TREE_PY exec "$PY" -c '
 from pathlib import Path
 import sys
 with open(Path(sys.argv[1]).resolve().parent / "lib/package_root.py") as package_root: exec(package_root.read(), {"__file__": package_root.name})
 from scripts.direct.final_pass import clean_tree
 clean_tree()
-' "${FINAL_PASS_SCRIPT%/*}" || exit 2
+' "${FINAL_PASS_SCRIPT%/*}"
+            ) || exit 2
         fi
         [[ $# -eq 0 ]] || { command_help final >&2; exit 2; }
         FINAL_FEATURES="$(merge_dev_features "")"
