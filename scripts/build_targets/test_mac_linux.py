@@ -23,7 +23,7 @@ from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, GateJobNot
 from scripts.build_targets import mac_linux
 from scripts.lib import build_folders, conf
 from scripts.production import gate
-from scripts.production.gate_routes import ALL_MODULES, AllModules, GateRun, ModuleCoverage, SuiteMode, TreeSelection
+from scripts.production.gate_routes import ALL_MODULES, AllModules, GateJobKind, GateRun, ModuleCoverage, SuiteMode, TreeSelection
 
 
 SSH_FIXTURE = '''import os
@@ -124,7 +124,8 @@ from time import sleep
 
 from scripts.copies import copies
 from scripts.production.gate_modules import discover_test_modules
-from scripts.production.gate_routes import GateJobResult, GateRun, SelectedModules, SuiteMode
+from scripts.production.gate_routes import GateJobKind, GateJobResult, GateRun, SelectedModules, SuiteMode
+from scripts.test_times.gate_record import TYPE_CHECK_JOB
 
 
 def checked_git(repo, *args):
@@ -135,7 +136,7 @@ def WholeMachine(*, gate_parent):
     return gate_parent
 
 
-def run_suites(repo, *, full, mode, machine, selected, module_time_limit_s, time_limit):
+def run_suites(repo, *, type_dirs, full, mode, machine, selected, module_time_limit_s, time_limit):
     guest = Path(os.environ['FIXTURE_GUEST_HOME'])
     assert repo == guest / 'build/claude' / os.environ['FIXTURE_EXPECTED_UNIT'] / '1', repo
     assert Path.home().is_relative_to(repo / 'target')
@@ -188,7 +189,26 @@ def run_suites(repo, *, full, mode, machine, selected, module_time_limit_s, time
     jobs = tuple(GateJobResult(suite, path.name, int(scenario == 'red'), 1.3, 'fixture module output',
                                cpu_seconds=1.0, times=dict(timing, skipped=int(path.name == 'test_second.py')),
                                peak_mib=22) for suite, path in paths)
+    if type_dirs:
+        result = subprocess.run([os.environ['GATE_BASEDPYRIGHT'], *type_dirs], cwd=repo,
+                                capture_output=True, text=True)
+        jobs += (GateJobResult(*TYPE_CHECK_JOB, result.returncode, 0, result.stdout + result.stderr,
+                               kind=GateJobKind.TYPE_CHECK),)
     return GateRun(jobs, 2.0, 30, selection_certified=isinstance(selected, SelectedModules), executions=jobs)
+'''
+
+
+TYPE_CHECK_FIXTURE = '''import os
+from pathlib import Path
+import sys
+
+repo = Path.cwd()
+state = Path(os.environ['GATE_STATE_DIR'])
+assert state.parent == Path(os.environ['TMPDIR']).parent
+assert state.is_relative_to(repo / 'target')
+state.mkdir()
+paths = [str(Path(path).relative_to(repo)) for path in sys.argv[1:]]
+print('Type check: ' + ', '.join(paths))
 '''
 
 
@@ -239,6 +259,8 @@ class MacLinuxRouteTests(unittest.TestCase):
         binaries.mkdir()
         self.executable(binaries / 'ssh', f'#!{sys.executable} -B\n' + SSH_FIXTURE)
         (binaries / 'chromium').symlink_to(sys.executable)
+        self.executable(binaries / 'basedpyright', f'#!{sys.executable} -B\n' + TYPE_CHECK_FIXTURE)
+        (binaries / 'uv').symlink_to(sys.executable)
         config = self.root / 'config'
         config.mkdir()
         self.registry = config / 'build_targets.conf'
@@ -252,6 +274,7 @@ class MacLinuxRouteTests(unittest.TestCase):
             encoding='utf-8')
         _ = cast(object, self.enterContext(patch.dict(os.environ, {
             'CONF_DIR': str(config), 'PATH': str(binaries) + os.pathsep + os.environ['PATH'],
+            'GATE_BASEDPYRIGHT': str(binaries / 'basedpyright'), 'GATE_UV': str(binaries / 'uv'),
             'FIXTURE_SSH_TRACE': str(self.trace), 'FIXTURE_GUEST_HOME': str(self.guest_home),
             'FIXTURE_SOURCE_BYTES': str(self.root / 'source.bytes'),
             'FIXTURE_BUNDLE_FORMS': str(self.root / 'bundle.forms'),
@@ -307,7 +330,8 @@ fi
         return subprocess.check_output(['git', *args], cwd=folder, text=True, timeout=10).strip()
 
     def route(self, scenario: str = 'pass', selected: AllModules | TreeSelection = ALL_MODULES,
-              gate_job: StepJob | GateJobNotRecorded = GATE_JOB_NOT_RECORDED) -> GateRun | str:
+              gate_job: StepJob | GateJobNotRecorded = GATE_JOB_NOT_RECORDED, *,
+              type_dirs: tuple[str, ...] = ()) -> GateRun | str:
         mode = SuiteMode.GATE if isinstance(selected, AllModules) else SuiteMode.TARGETED
         temporary_directory = tempfile.TemporaryDirectory
 
@@ -320,7 +344,7 @@ fi
               patch.object(tempfile, 'TemporaryDirectory', snapshot_index),
               patch.object(tempfile, 'TemporaryFile', side_effect=AssertionError('Keep the bootstrap in memory.'))):
             result = mac_linux.route(self.repo, mode=mode, full=mode is SuiteMode.GATE, selected=selected,
-                                     module_time_limit_s=3, gate_job=gate_job)
+                                     module_time_limit_s=3, gate_job=gate_job, type_dirs=type_dirs)
         self.assertEqual(self.git('for-each-ref', 'refs/mac-linux'), '')
         return result
 
@@ -885,6 +909,28 @@ fi
         self.assertTrue(result.passed)
         self.assertEqual(result.coverage, ModuleCoverage.SUBSET)
         self.assertEqual([job.module for job in result.jobs], ['test_second.py'])
+        self.assert_guest_clean('probe', 'arm', 'run', 'cleanup')
+
+    def test_guest_runs_type_checks_with_the_selected_tests(self) -> None:
+        tree = self.git('rev-parse', 'HEAD^{tree}')
+        result = self.route(selected=TreeSelection(('scripts/fixture/test_second.py',), tree),
+                            type_dirs=('scripts/fixture', str(self.repo / 'scripts/lib')))
+        assert isinstance(result, mac_linux.MacLinuxGateRun), result
+        self.assertTrue(result.passed, result.jobs)
+        module, types = result.jobs
+        self.assertEqual((module.kind, module.module), (GateJobKind.TEST_MODULE, 'test_second.py'))
+        self.assertIs(types.kind, GateJobKind.TYPE_CHECK)
+        self.assertEqual(types.output, 'Type check: scripts/fixture, scripts/lib\n')
+        self.assertEqual(result.module_skips, {'scripts/fixture/test_second.py': 1})
+        self.assert_guest_clean('probe', 'arm', 'run', 'cleanup')
+
+    def test_guest_refuses_when_the_type_check_tool_is_missing(self) -> None:
+        missing = self.root / 'missing-basedpyright'
+        with patch.dict(os.environ, {'GATE_BASEDPYRIGHT': str(missing)}):
+            result = self.route(type_dirs=('scripts',))
+        assert isinstance(result, str), result
+        self.assertIn(f'The guest cannot find the type-check tool {missing}', result)
+        self.assertIn('Guest cleanup: ended', result)
         self.assert_guest_clean('probe', 'arm', 'run', 'cleanup')
 
     def test_dirty_modules_are_included_in_the_snapshot(self) -> None:

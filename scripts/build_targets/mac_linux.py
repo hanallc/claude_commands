@@ -7,7 +7,7 @@ Without a signal handler, Python can raise KeyboardInterrupt at any bytecode. An
 """
 from __future__ import annotations
 
-from collections.abc import Generator
+from collections.abc import Generator, Sequence
 from contextlib import AbstractContextManager, contextmanager, nullcontext, redirect_stdout, suppress
 from dataclasses import dataclass
 from enum import StrEnum
@@ -33,6 +33,7 @@ from scripts.build_queue.admission_jobs import GateJobNotRecorded, StepJob
 from scripts.lib import build_folders, conf, process_group
 from scripts.production.gate_modules import GateRefused, discover_test_modules
 from scripts.production.gate_routes import AllModules, GateJobKind, GateRun, ModuleCoverage, SuiteMode, TreeSelection
+from scripts.test_times.gate_record import TYPE_CHECK_JOB
 
 
 TARGET = 'mac-linux'
@@ -136,6 +137,7 @@ class GuestRequest(TypedDict):
     mode: str
     full: bool
     selection: list[str] | Literal['all']
+    type_dirs: list[str]
     module_time_limit_s: float
     run_time_limit_seconds: int
     jobs: int
@@ -728,13 +730,17 @@ def completed_run(reply: GuestReply, request: GuestRequest, source: CandidateSou
         if row.get(key) != request[key]:
             raise GuestUnavailable(f'the guest result has a different {key}')
     run = gate_box.decode_run(row['gate'])
-    modules = tuple(f'scripts/{job.suite}/{job.module}' for job in run.jobs)
-    if (len(modules) != len(source.modules) or frozenset(modules) != source.modules
-            or any(job.kind is not GateJobKind.TEST_MODULE for job in run.jobs)):
+    test_jobs = tuple(job for job in run.jobs if job.kind is GateJobKind.TEST_MODULE)
+    modules = tuple(f'scripts/{job.suite}/{job.module}' for job in test_jobs)
+    if len(modules) != len(source.modules) or frozenset(modules) != source.modules:
         raise GuestUnavailable('the guest result has a different module list')
+    type_jobs = tuple((job.kind, job.suite, job.module) for job in run.jobs if job.kind is not GateJobKind.TEST_MODULE)
+    expected = ((GateJobKind.TYPE_CHECK, *TYPE_CHECK_JOB),) if request['type_dirs'] else ()
+    if type_jobs != expected:
+        raise GuestUnavailable('the guest result has a different type-check job list')
     if row.get('verdict') != ('pass' if run.passed else 'fail'):
         raise GuestUnavailable('the guest result has an invalid verdict')
-    skips = {path: job.times['skipped'] for path, job in zip(modules, run.jobs, strict=True)
+    skips = {path: job.times['skipped'] for path, job in zip(modules, test_jobs, strict=True)
              if isinstance(job.times, dict)}
     return MacLinuxGateRun(run.jobs, run.seconds, run.peak_memory_mib, run.tests_reused, run.selection_certified,
                            run.executions, run.time_limit_report, coverage=source.coverage,
@@ -743,7 +749,8 @@ def completed_run(reply: GuestReply, request: GuestRequest, source: CandidateSou
 
 
 def route(repo: Path, *, mode: SuiteMode, full: bool, module_time_limit_s: float,
-          selected: AllModules | TreeSelection, gate_job: StepJob | GateJobNotRecorded) -> GateRun | str:
+          selected: AllModules | TreeSelection, gate_job: StepJob | GateJobNotRecorded,
+          type_dirs: Sequence[str] = ()) -> GateRun | str:
     """Return the guest gate result or a reason for the natedev fallback."""
     from scripts.aws_target import cloud_gate
     from scripts.build_queue.admission_client import step_identity
@@ -763,9 +770,11 @@ def route(repo: Path, *, mode: SuiteMode, full: bool, module_time_limit_s: float
         if not unit:
             raise GuestUnavailable('the gate has no owner unit for a numbered copy')
         source = candidate_source(repo, selected)
+        relative_type_dirs = [(repo / name).resolve().relative_to(repo).as_posix() for name in type_dirs]
         request = GuestRequest(attempt=uuid4().hex, commit=source.commit, tree=source.tree,
                                origin_main=source.origin_main, mode=mode.wire, full=full,
                                selection=list(selected.paths) if isinstance(selected, TreeSelection) else 'all',
+                               type_dirs=relative_type_dirs,
                                module_time_limit_s=module_time_limit_s, run_time_limit_seconds=settings.run_time_limit_seconds,
                                jobs=settings.jobs, unit=unit)
         with mac_linux_reservation(repo, mode, gate_job):
@@ -807,6 +816,8 @@ def run_guest(request_path: Path) -> int:
                            'XDG_CACHE_HOME': str(home / '.cache'), 'TMPDIR': str(tmp),
                            'CARGO_HOME': str(home / '.cargo'), 'RUSTUP_HOME': str(home / '.rustup'),
                            'PATH': str(binaries) + os.pathsep + os.environ['PATH']}
+            if request['type_dirs']:
+                environment['GATE_STATE_DIR'] = str(runtime / 'gate-state')
             # The -c entry selects the numbered copy as the Python checkout.
             command = ['./scripts/lib/py', '-X', f'cpu_count={request["jobs"]}',
                        '-c', 'import runpy, sys; runpy.run_path(sys.argv[1], run_name="__main__")',
@@ -833,6 +844,14 @@ def run_copy(request_path: Path) -> None:
     request = guest_request(request_path)
     if os.cpu_count() != request['jobs']:
         raise GuestUnavailable(f'The guest Python did not set the CPU count to {request["jobs"]}.')
+    type_dirs = tuple((repo / name).resolve() for name in request['type_dirs'])
+    if any(not path.is_relative_to(repo) for path in type_dirs):
+        raise GuestUnavailable('A type-check path leaves the numbered copy.')
+    if type_dirs:
+        for key, program in (('GATE_BASEDPYRIGHT', 'basedpyright'), ('GATE_UV', 'uv')):
+            tool = os.environ.get(key, program)
+            if shutil.which(tool) is None:
+                raise GuestUnavailable(f'The guest cannot find the type-check tool {tool}.')
     descriptors = (int(os.environ[build_folders.NUMBERED_COPY_LOCK_ENV]), RUN_LOCK_FD)
     refs = subprocess.check_output(['git', 'rev-parse', 'HEAD', ORIGIN_MAIN, 'HEAD^{tree}'], cwd=repo,
                                    text=True, pass_fds=descriptors).splitlines()
@@ -846,7 +865,8 @@ def run_copy(request_path: Path) -> None:
     token = copies.COMMAND_LOCKS.set(descriptors)
     try:
         with build_folders.inherit_build_lock(RUN_LOCK_FD), redirect_stdout(sys.stderr):
-            run = gate.run_suites(repo, full=request['full'], mode=SuiteMode(request['mode']), machine=machine,
+            run = gate.run_suites(repo, type_dirs=tuple(map(str, type_dirs)), full=request['full'],
+                                  mode=SuiteMode(request['mode']), machine=machine,
                                   selected=ALL_MODULES if selection == 'all' else SelectedModules(tuple(selection)),
                                   module_time_limit_s=request['module_time_limit_s'],
                                   time_limit=GateTimeLimit(request['run_time_limit_seconds']))
