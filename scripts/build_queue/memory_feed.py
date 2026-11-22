@@ -2489,6 +2489,7 @@ class OutsideQueueScan:
         self.staff_members = staff_members
         self.builds = builds
         self.groups: dict[int, Path | None] = {}
+        self.owner_labels: dict[int, dict[str, unit_labels.UnitLabels]] = {}
         self.children: dict[int, list[int]] = {}
         for pid, process in processes.items():
             self.children.setdefault(process.parent, []).append(pid)
@@ -2519,17 +2520,37 @@ class OutsideQueueScan:
                 commands[pid] = ()
         return commands
 
+    def read_owner_labels(self, pid: int) -> dict[str, unit_labels.UnitLabels]:
+        labels_by_key: dict[str, unit_labels.UnitLabels] = {}
+        owners = environment_values(PROC / str(pid) / "environ", (DETACHED_OWNER_KEY, *SESSION_OWNER_KEYS))
+        for key, reference in owners.items():
+            if reference and (member := self.staff_members.members.by_member_reference(reference)) is not None:
+                if (labels := self.staff_members.labels.get(member.current_session)) is not None:
+                    labels_by_key[key] = labels
+        return labels_by_key
+
     def owner(self, pids: Iterable[int], keys: tuple[str, ...] = SESSION_OWNER_KEYS) -> unit_labels.UnitLabels | None:
         for pid in pids:
             if self.processes[pid].zombie:
                 continue
-            owners = environment_values(PROC / str(pid) / "environ", keys)
+            if pid not in self.owner_labels:
+                self.owner_labels[pid] = self.read_owner_labels(pid)
             for key in keys:
-                if reference := owners.get(key):
-                    member = self.staff_members.members.by_member_reference(reference)
-                    if member is not None and (labels := self.staff_members.labels.get(member.current_session)) is not None:
-                        return labels
+                if (labels := self.owner_labels[pid].get(key)) is not None:
+                    return labels
         return None
+
+    def parent_first(self, pids: set[int]) -> Iterable[int]:
+        """Visit every member, with its parent first if the parent is also a member."""
+        visited: set[int] = set()
+        for member in sorted(pids, reverse=True):
+            branch: list[int] = []
+            pid = member
+            while pid in pids and pid not in visited:
+                visited.add(pid)
+                branch.append(pid)
+                pid = self.processes[pid].parent
+            yield from reversed(branch)
 
     def ancestors(self, pid: int) -> Iterable[int]:
         visited: set[int] = set()
@@ -2602,17 +2623,14 @@ def outside_agent_rows(scope: Path, scan: OutsideQueueScan, limit: float, ticks_
     rows: list[OutsideQueueProcess] = []
     pids = outside_scope_pids(scope, scan.processes)
     commands = scan.scope_commands(scope, pids)
-    pending = [pid for pid in sorted(pids) if scan.processes[pid].parent not in pids]
     scope_owners = (pid for pid in sorted(commands) if is_agent_command(commands[pid]))
     owner = None
-    while pending:
-        pid = pending.pop()
+    for pid in scan.parent_first(pids):
         if pid in seen or pid not in commands:
             continue
         command = commands[pid]
         if is_outside_tree_wrapper(command):
             seen.add(pid)
-            pending.extend(child for child in scan.children.get(pid, ()) if child in pids)
             continue
         tree = scan.agent_tree(pid, seen)
         if scan.has_admission(tree, scan.admitted_scopes):

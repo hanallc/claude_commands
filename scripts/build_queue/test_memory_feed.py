@@ -129,7 +129,7 @@ def leftover_step(minutes: int, *, small: bool = False, members: tuple[ScopeProc
                             memory, pid=minutes, started_at=started_at)
 
 
-def write_outside_queue_fixture(root: Path) -> staff.StaffSnapshot:
+def write_outside_queue_fixture(root: Path, *, siblings: tuple[int, ...] = ()) -> staff.StaffSnapshot:
     """Write process trees and staff for a private CPU time reading."""
     _ = write_config_fixture(root / "test_times.conf",
         "[direct_test]\n# whole: 1..\ndirect_test.time_limit_seconds=120\n")
@@ -149,6 +149,7 @@ def write_outside_queue_fixture(root: Path) -> staff.StaffSnapshot:
         (8104, "S", 8101, "/bin/rustc", (80, 40, 0, 0)),
         (8105, "S", 8102, "/bin/python3", (0, 0, 0, 0)),
         (8107, "S", 8101, "/bin/pytest", (19, 0, 0, 0)),
+        *((pid, "S", 8101, "/bin/pytest", (121, 0, 0, 0)) for pid in siblings),
     ):
         process = root / "proc" / str(pid)
         write_process(process.parent, pid, parent=parent)
@@ -158,7 +159,7 @@ def write_outside_queue_fixture(root: Path) -> staff.StaffSnapshot:
         _ = (process / "cgroup").write_text(f"0::/{scope}\n")
     _ = (root / "proc/8101/environ").write_text("CODEX_THREAD_ID=worker-session\0")
     _ = (root / "proc/8102/environ").write_text("BUILDLOG_OWNER_STAFF_ID=builds\0")
-    write_scope(root / "cgroup" / scope, members=(8100, 8101, 8102, 8104, 8105, 8107))
+    write_scope(root / "cgroup" / scope, members=(8100, 8101, 8102, 8104, 8105, 8107, *siblings))
     write_scope(root / "cgroup/user/builds.slice")
     return staff.StaffSnapshot((runner, director, worker))
 
@@ -172,6 +173,43 @@ class MemoryFeedTests(unittest.TestCase):
     root: Path = Path()
     output: Path = Path()
     configuration: Path = Path()
+
+    def test_outside_queue_reads_each_shared_ancestor_environment_once(self) -> None:
+        siblings = tuple(range(8200, 8212))
+        owners = memory_feed.FeedStaff(write_outside_queue_fixture(self.root, siblings=siblings))
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, outside_queue_fixture_groups(self.root))))
+        shell_env = self.root / "proc/8100/environ"
+        agent_env = self.root / "proc/8101/environ"
+        _ = shell_env.write_text("BUILDLOG_OWNER_STAFF_ID=test-worker\0")
+        _ = agent_env.write_text("CODEX_THREAD_ID=unknown-session\0")
+        reads: Counter[Path] = Counter()
+        read_bytes = Path.read_bytes
+
+        def count_bytes(path: Path) -> bytes:
+            if path.name == "environ":
+                reads[path] += 1
+            return read_bytes(path)
+
+        inputs = captured_reading().explanation.decided_from
+        with mock.patch.object(Path, "read_bytes", new=count_bytes):
+            rows = memory_feed.outside_queue_processes(inputs, owners)
+
+        self.assertEqual([(row["pid"], row["owner"]) for row in rows if row["pid"] in siblings],
+                         [(pid, "test") for pid in siblings])
+        self.assertEqual(reads[agent_env], 1)
+        self.assertEqual(reads[shell_env], 1)
+        self.assertEqual(max(reads.values()), 1)
+
+    def test_outside_queue_scans_a_child_after_its_parent_leaves_the_scope(self) -> None:
+        owners = memory_feed.FeedStaff(write_outside_queue_fixture(self.root, siblings=(8200,)))
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, outside_queue_fixture_groups(self.root))))
+        # The membership file still lists the parent, but the parent's cgroup has changed.
+        _ = (self.root / "proc/8101/cgroup").write_text("0::/user/app.slice/other.scope\n")
+
+        rows = memory_feed.outside_queue_processes(captured_reading().explanation.decided_from, owners)
+
+        self.assertEqual([(row["pid"], row["command"], row["cpu_seconds"]) for row in rows],
+                         [(8102, "targeted_test.py", 136.0), (8200, "pytest", 121.0)])
 
     def test_outside_queue_marks_a_login_shell_that_execs_a_script(self) -> None:
         owners = memory_feed.FeedStaff(write_outside_queue_fixture(self.root))
