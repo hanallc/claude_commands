@@ -51,7 +51,10 @@ from scripts.build_queue.admission_test_support import queue_decision, Admission
 from scripts.build_queue.queue_fixture import write_memory_config as write_memory_config, fixture_queue_inputs, fixture_reservation, write_process, write_scope, ci_step
 from scripts.direct.verify_examples_test_support import SeededExampleWorkspaceFixture, VERIFY, workspace_metadata
 from scripts.lint.build_shape import BuildShape, CompiledCrates, build_shape
-from scripts.lint.memory_test_support import fake_memory_readings, gate_isolation_environment, write_config_fixture, commit_config_fixture
+from scripts.lint.memory_test_support import (
+    commit_config_fixture, fake_memory_readings, gate_isolation_environment, memory_gate_shell_environment,
+    write_config_fixture,
+)
 from scripts.buildlog import store
 from scripts.buildlog import record as buildlog_record
 from scripts.buildlog import index as file_marks
@@ -4166,7 +4169,7 @@ class LiveMemoryTripwireTests(MemoryQueueFixture):
                 with fixture.serving():
                     result = subprocess.run(
                         ["bash", "-c", 'source "$1"; buildlog_wait_for_memory', "test", str(MEMORY_GATE)],
-                        env=dict(os.environ), capture_output=True, text=True,
+                        env=memory_gate_shell_environment(), capture_output=True, text=True,
                         check=False, timeout=test_hang_guard.TEST_HANG_GUARD_SECS,
                     )
                 self.assertEqual(result.returncode, 2, result.stderr)
@@ -5269,7 +5272,7 @@ class ShellTests(unittest.TestCase):
         command = 'set -e; source "$1"; shift; ' + body
         return subprocess.run(["bash", "-c", command, "test", str(MEMORY_GATE),
                                *([] if launch else ["/bin/true"])],
-            env={**os.environ, "BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": "",
+            env={**memory_gate_shell_environment(), "BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": "",
                  "BUILD_HOLD_DIR": str(self.admission.root / "holders"),
                  "BUILD_HOLD_RELEASE_DIR": str(self.admission.root / "releases"),
                  "UNIT_RUN_DIR": "",
@@ -5628,7 +5631,7 @@ class QueueLeaveTests(unittest.TestCase):
             + "from scripts.build_queue.admission_records import RequestedTestWidth\n"
             + "from scripts.build_queue.admission_service import read_state\n"
             + f"record, = read_state(Path({str(self.admission.state_dir)!r})).reservations.values()\n"
-            + "reservation_id, _, _ = os.environ['BUILDLOG_RESERVED_STEP'].split('\\t')\n"
+            + "reservation_id = os.environ['BUILDLOG_RESERVED_STEP'].split('\\t', 1)[0]\n"
             + "assert record.reservation_id == reservation_id\n"
             + "width = record.test_width\nassert isinstance(width, RequestedTestWidth)\n"
             + "print(json.dumps({'test_threads': width.threads}))\n")

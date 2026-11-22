@@ -17,7 +17,7 @@ from typing import cast
 from unittest.mock import patch
 from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.lib.nix_env_test_support import NixFixture
-from scripts.lint.memory_test_support import config_environment, write_config_fixture
+from scripts.lint.memory_test_support import config_environment, memory_gate_shell_environment, write_config_fixture
 from scripts.lib import test_hang_guard
 from scripts.copies import copies
 from scripts.style import bulk_run
@@ -412,7 +412,7 @@ buildlog_sample_anon "$1" "$2" "$$"
                 ["bash", "-c", 'source "$1"; parent=$BASHPID; buildlog_sample_anon "$2" "$3" "$parent" & printf "%s\\n" "$!"; wait',
                  "sampler-test", str(INVOKE), str(root / "scope.cgroup"), str(root / "maximum")],
                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
-                env={**os.environ,
+                env={**memory_gate_shell_environment(),
                      "BUILD_HOLD_DIR": str(root / "holders"),
                      "BUILD_HOLD_RELEASE_DIR": str(root / "release"),
                      "STAFF_FILE": str(root / "staff.json"),
@@ -475,7 +475,7 @@ buildlog_sample_anon "$1" "$2" "$$"
             result = subprocess.run(
                 ["bash", "-c", shell, "sidecar-test", str(INVOKE), command],
                 capture_output=True, text=True, check=False,
-                env={**os.environ,
+                env={**memory_gate_shell_environment(),
                      "BUILD_HOLD_DIR": str(root / "holders"),
                      "BUILD_HOLD_RELEASE_DIR": str(root / "release"),
                      "STAFF_FILE": str(root / "staff.json"),
@@ -537,9 +537,10 @@ invoke_sweep() {
 sweep_after_step test-step
 """
             with ((root / "planning").open("w") as planning, (root / "validation").open("w") as validation,
-                  patch.dict(os.environ, {**configuration, "HOME": directory, "TMPDIR": directory,
+                  patch.dict(os.environ, {**memory_gate_shell_environment(), **configuration,
+                                         "HOME": directory, "TMPDIR": directory,
                                          "XDG_RUNTIME_DIR": str(runtime), "BUILD_HOLD_DIR": str(root / "hold"),
-                                         "LINT_INVOKE_SOURCED": "", "LINT_SKIP_SWEEP": ""})):
+                                         "LINT_INVOKE_SOURCED": "", "LINT_SKIP_SWEEP": ""}, clear=True)):
                 leases = (planning.fileno(), validation.fileno())
                 token = copies.COMMAND_LOCKS.set(leases)
                 try:
@@ -571,7 +572,7 @@ sweep_after_step test-step
                 ["bash", "-c", f'source "$1"; {SWEEP_STAND_IN}; sweep_after_step test-step', "sweep-test", str(INVOKE)],
                 cwd=root, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                 pass_fds=(writer,),
-                env={**os.environ, **environment, "HOME": directory, "TMPDIR": directory,
+                env={**memory_gate_shell_environment(), **environment, "HOME": directory, "TMPDIR": directory,
                      "BUILD_HOLD_DIR": str(root / "holders"),
                      "PATH": f"{tools}{os.pathsep}{os.environ['PATH']}",
                      "XDG_RUNTIME_DIR": str(root / "runtime"), "LINT_INVOKE_SOURCED": "",
@@ -711,7 +712,7 @@ sweep_after_step() { :; }
     ) -> subprocess.CompletedProcess[str]:
         command = ["bash", "-c", 'set -euo pipefail; source "$1"; shift; ' + shell,
                    "admission-test", str(INVOKE), *arguments]
-        isolated = {**os.environ,
+        isolated = {**memory_gate_shell_environment(),
                  "HOME": str(root), "TMPDIR": str(root),
                  "BUILDLOG_DIR": str(root / "buildlog"),
                  "BUILD_HOLD_DIR": str(root / "holders"),

@@ -165,8 +165,12 @@ buildlog_step_compiles() {
 buildlog_exec() {
     local BUILDLOG_RESERVED_STEP="${BUILDLOG_RESERVED_STEP:-}"
     if [[ -n "${BUILDLOG_MEM_RESERVATION:-}" ]]; then
-        printf -v BUILDLOG_RESERVED_STEP '%s\t%s\t%s' "$BUILDLOG_MEM_RESERVATION" \
-            "${BUILDLOG_MEM_RESERVATION%%-*}" "${BUILDLOG_MEM_MAX_PATH%/*}"
+        local socket_path="${ADMISSION_SOCKET:-}" step_directory
+        if [[ -n "$socket_path" && "$socket_path" != /* ]] && step_directory=$(pwd -P); then
+            socket_path="$step_directory/$socket_path"
+        fi
+        printf -v BUILDLOG_RESERVED_STEP '%s\t%s\t%s\t%s' "$BUILDLOG_MEM_RESERVATION" \
+            "${BUILDLOG_MEM_RESERVATION%%-*}" "${BUILDLOG_MEM_MAX_PATH%/*}" "$socket_path"
         export BUILDLOG_RESERVED_STEP
     fi
     if [[ -z "${BUILDLOG_PEAK:-}" ]]; then
