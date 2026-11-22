@@ -890,6 +890,7 @@ class MergeGateSuitesTests(GateSuitesFixture):
         self.assertEqual(starts, [("hooks", "test_first.py"), ("hooks", "test_first.py"), ("lib", "test_second.py")])
         self.assertEqual(checkpoint_gate.red_names(["gate.py"], output.getvalue()), frozenset({"hooks/test_first.py"}))
 
+    @gate_suites("lib", "hooks")
     def test_named_modules_report_red_without_a_ledger_or_gate_record(self) -> None:
         self.write(self.checkout / "scripts/hooks/test_first.py", SUITE_MODULE
                    + "\n\nclass Red(unittest.TestCase):\n    def test_red(self):\n        self.fail('red')\n")
