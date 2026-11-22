@@ -1,16 +1,151 @@
-"""Fixture workers use private account folders and remain visible to readers."""
+"""Test private account folders and the staff owner fixture."""
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
+import select
+import signal
+import socket
 import subprocess
 import sys
 import tempfile
 import textwrap
 import unittest
+from collections.abc import Callable, Generator
+from contextlib import contextmanager, suppress
+from typing import TextIO, cast, final, override
+
+from scripts.lib import process_group
+from scripts.lint.memory_test_support import config_environment
 
 
 CHECKOUT = Path(__file__).resolve().parents[2]
+OWNER_EXIT_SECONDS = 5
+OWNER_START_SECONDS = 20
+OWNER_PARENT = '''
+import sys
+from pathlib import Path
+from scripts.production.staff_test_support import SharedStaffOwner
+
+owner = SharedStaffOwner(Path(sys.argv[1]))
+try:
+    print(owner.port, owner.pid, flush=True)
+    sys.stdin.read()
+finally:
+    owner.close()
+'''
+BLOCKED_REQUEST = '''
+import os
+import socket
+import sys
+
+with socket.create_connection(("127.0.0.1", int(sys.argv[1]))) as connection:
+    connection.sendall(f"{os.getpid()}\\n".encode())
+    connection.recv(1)
+'''
+
+
+@contextmanager
+def watch_exit(pid: int) -> Generator[Callable[[], bool]]:
+    """Watch the process before sending a signal."""
+    if sys.platform == "darwin":
+        queue = select.kqueue()
+        try:
+            _ = queue.control([select.kevent(pid, select.KQ_FILTER_PROC,
+                               select.KQ_EV_ADD | select.KQ_EV_ONESHOT, select.KQ_NOTE_EXIT)], 0)
+            yield lambda: bool(queue.control(None, 1, OWNER_EXIT_SECONDS))
+        finally:
+            queue.close()
+        return
+    descriptor = os.pidfd_open(pid)
+    try:
+        yield lambda: bool(select.select([descriptor], [], [], OWNER_EXIT_SECONDS)[0])
+    finally:
+        os.close(descriptor)
+
+
+@final
+class SharedStaffOwnerTests(unittest.TestCase):
+    root: Path = Path()
+    environment: dict[str, str] = {}
+
+    @override
+    def setUp(self) -> None:
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.environment = {
+            **config_environment(self.root / "config"),
+            "HOME": str(self.root),
+            "PATH": os.defpath,
+            "STAFF_CONFIG": str(self.root / "config/staff.conf"),
+            "STAFF_FILE": str(self.root / "staff.json"),
+            "STAFF_TEST_CHECKOUT": str(CHECKOUT),
+            "STAFF_TEST_OWNER_FILE": str(self.root / "staff.json"),
+            "STAFF_TEST_OWNER_SOURCE": str(self.root / "sources"),
+            "TMPDIR": str(self.root),
+        }
+
+    @contextmanager
+    def owner(self) -> Generator[tuple[subprocess.Popen[str], int, int]]:
+        with subprocess.Popen([sys.executable, "-c", OWNER_PARENT, str(self.root)], cwd=CHECKOUT,
+                              env=self.environment, stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True) as parent:
+            output = cast(TextIO, parent.stdout)
+            owner_pid = None
+            try:
+                self.assertTrue(select.select([output], [], [], OWNER_START_SECONDS)[0],
+                                "The parent did not report the owner port and pid")
+                port, owner_pid = map(int, output.readline().split())
+                self.assertGreater(owner_pid, 1)
+                yield parent, port, owner_pid
+            except BaseException:
+                if owner_pid is not None and owner_pid > 1:
+                    with suppress(ProcessLookupError):
+                        process_group.send_process_group(owner_pid, signal.SIGKILL)
+                raise
+            finally:
+                if parent.returncode is None:
+                    parent.kill()
+
+    @contextmanager
+    def request(self, port: int, script: Path, *arguments: str) -> Generator[socket.socket]:
+        payload = dict(arguments=[str(script), *arguments], environment=self.environment,
+                       directory=str(self.root), stdin="")
+        with socket.create_connection(("127.0.0.1", port), timeout=OWNER_START_SECONDS) as connection:
+            connection.sendall(json.dumps(payload).encode() + b"\n")
+            yield connection
+
+    def test_killed_parent_stops_owner_and_active_request(self) -> None:
+        script = self.root / "blocked-request.py"
+        _ = script.write_text(BLOCKED_REQUEST)
+        with self.owner() as (parent, port, owner_pid), socket.socket() as listener:
+            listener.bind(("127.0.0.1", 0))
+            listener.listen()
+            listener.settimeout(OWNER_START_SECONDS)
+            notice_port = cast(tuple[str, int], listener.getsockname())[1]
+            with self.request(port, script, str(notice_port)):
+                peer = listener.accept()[0]
+                with peer, peer.makefile("rb") as channel:
+                    peer.settimeout(OWNER_START_SECONDS)
+                    request_pid = int(channel.readline())
+                    with watch_exit(owner_pid) as owner_exited, watch_exit(request_pid) as request_exited:
+                        parent.kill()
+                        _ = parent.communicate(timeout=OWNER_EXIT_SECONDS)
+                        self.assertEqual(parent.returncode, -signal.SIGKILL)
+                        self.assertTrue(owner_exited(), "The staff owner survived its parent")
+                        self.assertTrue(request_exited(), "The request survived the staff owner")
+
+    def test_close_stops_owner_after_a_request(self) -> None:
+        script = self.root / "echo-request.py"
+        _ = script.write_text('print("fixture request")\n')
+        with self.owner() as (parent, port, owner_pid), watch_exit(owner_pid) as owner_exited:
+            with self.request(port, script) as connection, connection.makefile("rb") as channel:
+                result = cast(dict[str, object], json.loads(channel.readline()))
+                self.assertEqual(result, {"status": 0, "stdout": "fixture request\n", "stderr": ""})
+            _ = parent.communicate(timeout=OWNER_EXIT_SECONDS)
+            self.assertEqual(parent.returncode, 0)
+            self.assertTrue(owner_exited(), "The staff owner survived close()")
+
+
 PREPARE = '''
 import os
 from pathlib import Path

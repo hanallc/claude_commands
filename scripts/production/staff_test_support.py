@@ -16,7 +16,6 @@ from subprocess import Popen as start_staff_owner
 from subprocess import run as run_fixture_git
 import sys
 import tempfile
-import time
 import traceback
 import unittest
 from collections.abc import Generator
@@ -732,36 +731,56 @@ def run_staff_owner_request(connection: socket.socket, request: StaffOwnerReques
 STAFF_OWNER_SERVER = r'''
 import json
 import os
+import select
+import signal
 import socket
 import sys
+from contextlib import suppress
 from pathlib import Path
 
 with open(Path(os.environ['STAFF_TEST_CHECKOUT']) / "scripts/lib/package_root.py") as package_root:
     exec(package_root.read(), {"__file__": package_root.name})
-children = []
-with socket.socket() as listener:
-    listener.bind(('127.0.0.1', 0))
-    listener.listen()
-    print(listener.getsockname()[1], flush=True)
-    while True:
-        with listener.accept()[0] as connection:
-            with connection.makefile('rb') as channel:
-                request = json.loads(channel.readline())
-            if request is None:
+from scripts.production.staff_test_support import run_staff_owner_request
+from scripts.production import staff_sources
+
+children = set()
+try:
+    with socket.socket() as listener:
+        listener.bind(('127.0.0.1', 0))
+        listener.listen()
+        listener.setblocking(False)
+        print(listener.getsockname()[1], flush=True)
+        while True:
+            ready, _, _ = select.select([sys.stdin, listener], [], [])
+            # The test never writes to the pipe. Readiness means end of file.
+            if sys.stdin in ready:
                 break
-            from scripts.production.staff_test_support import run_staff_owner_request
-            from scripts.production import staff_sources
-            pid = os.fork()
-            if pid == 0:
-                listener.close()
-                try:
-                    run_staff_owner_request(connection, request)
-                finally:
-                    connection.close()
-                    os._exit(0)
-            children.append(pid)
-for pid in children:
-    os.waitpid(pid, 0)
+            try:
+                connection, _ = listener.accept()
+            except BlockingIOError:
+                continue
+            with connection:
+                children = {pid for pid in children if os.waitpid(pid, os.WNOHANG)[0] == 0}
+                pid = os.fork()
+                if pid == 0:
+                    try:
+                        listener.close()
+                        sys.stdin.close()
+                        connection.setblocking(True)
+                        with connection.makefile('rb') as channel:
+                            line = channel.readline()
+                        if line:
+                            run_staff_owner_request(connection, json.loads(line))
+                    finally:
+                        connection.close()
+                        os._exit(0)
+                children.add(pid)
+finally:
+    for pid in children:
+        with suppress(ProcessLookupError):
+            os.kill(pid, signal.SIGKILL)
+    for pid in children:
+        os.waitpid(pid, 0)
 '''
 
 
@@ -771,6 +790,7 @@ class SharedStaffOwner:
     def __init__(self, root: Path) -> None:
         self.root: Path = root
         self.lifetime: ExitStack = ExitStack()
+        self.pid: int | None = None
 
     @cached_property
     def port(self) -> str:
@@ -780,18 +800,16 @@ class SharedStaffOwner:
         process = self.lifetime.enter_context(start_staff_owner(
             [sys.executable, str(script)], cwd=self.root,
             env={**os.environ, "TMPDIR": str(self.root)},
-            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=errors, text=True,
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=errors, text=True,
             start_new_session=True,
         ))
-        port = cast(TextIO, process.stdout).readline().strip()
+        self.pid = process.pid
 
         def stop() -> None:
-            deadline = time.monotonic() + TEST_HANG_GUARD_SECS
+            cast(TextIO, process.stdin).close()
             try:
-                with socket.create_connection(("127.0.0.1", int(port)), timeout=TEST_HANG_GUARD_SECS) as connection:
-                    connection.sendall(b"null\n")
-                _ = process.wait(timeout=max(0, deadline - time.monotonic()))
-            except (OSError, subprocess.TimeoutExpired):
+                _ = process.wait(timeout=TEST_HANG_GUARD_SECS)
+            except subprocess.TimeoutExpired:
                 try:
                     process_group.send_process_group(process.pid, signal.SIGKILL)
                 except ProcessLookupError:
@@ -799,6 +817,9 @@ class SharedStaffOwner:
                 _ = process.wait()
 
         _ = self.lifetime.callback(stop)
+        port = cast(TextIO, process.stdout).readline().strip()
+        if not port:
+            raise RuntimeError(f"The staff owner did not report its port. See {errors.name}.")
         return port
 
     def close(self) -> None:
