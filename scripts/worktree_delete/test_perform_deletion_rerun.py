@@ -235,7 +235,6 @@ class ProtectedDeletionTests(unittest.TestCase):
         _ = git(repo, "remote", "add", "origin", str(origin))
         _ = git(repo, "worktree", "add", "-qb", "integration", str(tree))
         _ = git(repo, "push", "-q", "origin", "main", "integration")
-        _ = git(repo, "remote", "set-head", "origin", "main")
         doc = repo / "fixture-production-live.md"
         enrolled_document(doc, repo, tree, "integration")
         local = staff_remote.local_machine()
@@ -265,9 +264,10 @@ class ProtectedDeletionTests(unittest.TestCase):
             return subprocess.run(["bash", str(self.scripts / script), str(worktree), *arguments], cwd=checkout,
                                   capture_output=True, text=True, check=False)
 
-        pattern = ("for-each-ref", "--format=%(refname) %(objectname)")
+        pattern = ("for-each-ref", "--format=%(refname) %(objectname) %(symref)")
         protected_repos = (repo, origin, other_origin)
         protected_refs = tuple(git(folder, *pattern) for folder in protected_repos)
+        self.assertNotIn("refs/remotes/origin/HEAD", protected_refs[0])
         staff_file = self.root / "staff.json"
         for index, (case, confirmed, refusal) in enumerate((
                 ("local worktree", False, "protected production"),
@@ -324,7 +324,9 @@ class ProtectedDeletionTests(unittest.TestCase):
                     _ = staff_file.write_bytes(staff_bytes)
                 if case == "missing staff record":
                     staff_file.unlink()
+                refs_before_validation = git(checkout, *pattern)
                 validation = attempt(checkout, worktree, "worktree_delete_validation.sh")
+                self.assertEqual(git(checkout, *pattern), refs_before_validation)
                 kept = bool(refusal)
                 self.assertEqual(validation.returncode, int(kept), validation.stdout + validation.stderr)
                 options = [protected_preview] if protected_preview else []

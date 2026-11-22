@@ -444,11 +444,10 @@ def only_target_merges(record: WorktreeRecord) -> bool:
     return True
 
 
-def landed(record: WorktreeRecord) -> Landed | NotLanded:
+def landed(record: WorktreeRecord, target: str) -> Landed | NotLanded:
     repo = Path(record.repo)
     if not has_branch(repo, record.branch):
         return Landed()
-    target = f"refs/remotes/origin/{record.merge_branch}"
     branch = f"refs/heads/{record.branch}"
     ancestor = git(repo, "merge-base", "--is-ancestor", branch, target, check=False)
     if ancestor.returncode == 0:
@@ -577,6 +576,37 @@ def check_origin_landing(record: WorktreeRecord, origin: CheckedOriginTip) -> Ch
     return origin
 
 
+@dataclass(frozen=True)
+class CleanupLandingTarget:
+    branch: str
+    commit: str
+
+
+def origin_cleanup_tip(repo: Path, ref: str) -> CleanupLandingTarget:
+    """Read the landing target and fetch its commit without changing refs."""
+    result = git(repo, "ls-remote", "--exit-code", "--symref", "origin", ref, check=False)
+    if result.returncode == 2:
+        reason = "origin default branch is missing" if ref == "HEAD" else f"{ref}: origin branch is missing"
+        raise Refused(1, reason)
+    if result.returncode:
+        raise Refused(1, failure_detail(result))
+    target = ref
+    tip = ""
+    for line in result.stdout.splitlines():
+        value, _, name = line.partition("\t")
+        if name == ref:
+            if value.startswith("ref: "):
+                target = value.removeprefix("ref: ")
+            else:
+                tip = value
+    if not target.startswith("refs/heads/") or not tip:
+        raise Refused(1, f"{ref}: origin did not advertise a branch commit")
+    if git(repo, "cat-file", "-e", f"{tip}^{{commit}}", check=False).returncode != 0:
+        _ = git(repo, "-c", "remote.origin.followRemoteHEAD=never", "fetch", "--no-tags", "--no-prune",
+                "--no-write-fetch-head", "--refmap=", "origin", tip)
+    return CleanupLandingTarget(target.removeprefix("refs/heads/"), tip)
+
+
 def check_local_cleanup(path: Path) -> tuple[CheckedLocalTip, WorktreeRecord] | Kept:
     head = git(path, "symbolic-ref", "--quiet", "--short", "HEAD", check=False)
     if head.returncode not in (0, 1):
@@ -586,7 +616,6 @@ def check_local_cleanup(path: Path) -> tuple[CheckedLocalTip, WorktreeRecord] | 
         production_doc.require_removable_checkout(path, path, branch)
     except production_doc.ProductionPathsError as error:
         return Kept(path, str(error))
-    _ = git(path, "fetch", "--no-prune", "origin")
     dirty = git(path, "status", "--porcelain").stdout
     if dirty:
         return Kept(path, "dirty worktree: " + " ".join(dirty.splitlines()))
@@ -599,19 +628,16 @@ def check_local_cleanup(path: Path) -> tuple[CheckedLocalTip, WorktreeRecord] | 
     try:
         record = read_record(record_file(path))
     except FileNotFoundError:
-        default = git(repo, "symbolic-ref", "--quiet", "refs/remotes/origin/HEAD", check=False)
-        if default.returncode == 1:
-            raise Refused(1, "origin default branch is missing")
-        if default.returncode:
-            raise Refused(1, default.stderr.strip())
-        target = default.stdout.strip()
-        base = git(repo, "merge-base", f"refs/heads/{branch}", target).stdout.strip()
-        record = new_record(path, branch, repo, base, "", target.removeprefix("refs/remotes/origin/"))
-    if Path(record.repo).resolve() != repo or Path(record.path).resolve() != path or record.branch != branch:
-        return Kept(path, "the worktree does not match its record")
-    if record.stage is MakeStage.MAKING:
-        return Kept(path, "worktree creation is incomplete")
-    result = landed(record)
+        target = origin_cleanup_tip(repo, "HEAD")
+        base = git(repo, "merge-base", f"refs/heads/{branch}", target.commit).stdout.strip()
+        record = new_record(path, branch, repo, base, "", target.branch)
+    else:
+        if Path(record.repo).resolve() != repo or Path(record.path).resolve() != path or record.branch != branch:
+            return Kept(path, "the worktree does not match its record")
+        if record.stage is MakeStage.MAKING:
+            return Kept(path, "worktree creation is incomplete")
+        target = origin_cleanup_tip(repo, f"refs/heads/{record.merge_branch}")
+    result = landed(record, target.commit)
     if isinstance(result, NotLanded):
         return Kept(path, "work has not landed: " + " ".join((*result.commits, *result.paths)))
     if local_branch_tip(repo, branch) != local:
@@ -706,7 +732,7 @@ def end_record(record: WorktreeRecord, snapshot: staff.StaffSnapshot) -> Ended |
     if has_branch(repo, record.branch) and only_target_merges(record):
         return Kept(path, "only merges of the target outside it")
     local = local_branch_tip(repo, record.branch)
-    result = landed(record)
+    result = landed(record, f"refs/remotes/origin/{record.merge_branch}")
     if isinstance(result, NotLanded):
         detail = "\n".join((*result.commits, *result.paths))
         return Kept(path, f"work has not landed: {detail}")
