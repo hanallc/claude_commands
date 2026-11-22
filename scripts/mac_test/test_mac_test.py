@@ -400,6 +400,9 @@ class MacTestCommandTests(NotificationGuardedTestCase):
             "PLAN_DELEGATE_BOARD_DIR": "", "PLAN_DELEGATE_SESSION_DIR": "",
             "BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": "",
         }
+        _ = write_config_fixture(self.root / "build_folders.conf",
+                                 "slots.Nates-MacBook-Pro-2023.hana.max=1\n"
+                                 + "slots.Nates-MacBook-Pro-2023.cargo-liner.max=1\n")
         self.environment.update(interpreter_cache_environment(self.root / "cache"))
         self.children = []
         child_lifetime = self.root / "child-lifetime"

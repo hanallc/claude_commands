@@ -524,6 +524,9 @@ Evidence expires after the existing waiting poll interval plus the target probe 
 Stale evidence prevents a new decision that needs it; it never releases a provider claim.
 Mac and SSH records retain their claim id, episode, attempt and submitting session through adoption.
 Release compares the exact claim identity under the provider lock.
+The Mac claim count reads `slots.<Mac host>.<repo>.max` in `build_folders.conf` or the host's `default_max`.
+The mac-linux gate shares the claude_commands repository claim count with native Mac runs.
+Mac mirror work keeps the unnumbered claim file.
 The provider keeps its existing repository scopes and cleanup policy.
 Held slots and waiting extras remain in memory. A restart removes them and retains the run's queue place.
 The service replaces this file atomically. Reservation records retain accepted needs, run identities, scope paths, and finalization intent.

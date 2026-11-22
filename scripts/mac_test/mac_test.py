@@ -101,6 +101,7 @@ if TYPE_CHECKING:
     from scripts.mac_test import eligibility
 
 MESSAGE_TIMEOUT_S = 30.0
+MAC_LINUX_CLAIM_ID_PREFIX = "mac-linux-"
 
 
 @dataclass(frozen=True)
@@ -703,12 +704,47 @@ def scopes_overlap(first: ClaimScope, second: ClaimScope) -> bool:
 
 def slot_capacity(paths: StatePaths, scope: ClaimScope, *,
                   configuration: conf.ConfigRead | conf.UseConfiguredValue = conf.UseConfiguredValue.CURRENT) -> int:
-    if target_config.uses_legacy_mac_layout(paths.platform) or isinstance(scope, WholeMacScope):
+    if isinstance(scope, WholeMacScope):
         return 1
+    if paths.platform == "macos":
+        from scripts.lib.build_slots import configured_maximum
+
+        hosts = conf.read_or_repository("machines").words("mac.hosts")
+        if not hosts:
+            raise ConfigError("machines.conf: mac.hosts needs a host name")
+        # The legacy .claude claim uses the claude_commands build folder pool.
+        repository = "claude_commands" if scope.name == ".claude" else scope.name
+        maximum = configured_maximum(conf.read_or_repository("build_folders"), hosts[0], repository)
+        if maximum < 1:
+            raise ConfigError(f"build_folders.conf: {repository} on {hosts[0]} needs a positive slot limit")
+        return maximum
     settings = conf.read(config_path(paths.target)) if isinstance(configuration, conf.UseConfiguredValue) else configuration
     missing = (target_config.MissingSlotCapacity.REQUIRE_CONFIGURED if scope.key
                else target_config.MissingSlotCapacity.SINGLE_SLOT)
     return target_config.slot_capacity(settings, scope.name, missing=missing)
+
+
+@dataclass(frozen=True)
+class MacClaimSlot:
+    number: int
+
+
+@dataclass(frozen=True)
+class MacClaimSlotsBusy:
+    pass
+
+
+def mac_claim_slot(claims: tuple[HeldClaim, ...], capacity: int, *, use_mirror: bool) -> MacClaimSlot | MacClaimSlotsBusy:
+    """Choose a free place among the claims for this repository."""
+    if len(claims) >= capacity or any(isinstance(claim.scope, WholeMacScope) for claim in claims):
+        return MacClaimSlotsBusy()
+    slots = {claim.scope.slot for claim in claims if isinstance(claim.scope, RepositoryScope)}
+    # Mac mirror work uses the unnumbered claim. Other work can use the extra places.
+    if 0 not in slots:
+        return MacClaimSlot(0)
+    if not use_mirror:
+        return MacClaimSlot(next(number for number in range(2, capacity + 1) if number not in slots))
+    return MacClaimSlotsBusy()
 
 
 def affinity_path(paths: StatePaths, scope: RepositoryScope) -> Path:
@@ -1447,6 +1483,10 @@ def claim_watch_pass(paths: StatePaths, config: MacTestConfig) -> bool:
 
     with locked(paths.lock):
         claims = tuple(claim for claim in read_claims(paths) if run_is_live(claim.record))
+    if paths.platform == "macos":
+        # The Mac activity probe cannot see guest work. The guest holder releases its claim.
+        claims = tuple(claim for claim in claims
+                       if "remote_host" in claim.record or not claim.record["claim_id"].startswith(MAC_LINUX_CLAIM_ID_PREFIX))
     if not claims:
         return False
     if paths.platform == "linux":
@@ -1850,6 +1890,17 @@ def claim_once(args: CliArguments, paths: StatePaths, scope: ClaimScope,
             if "slot" in record:
                 print(f"slot: {record['slot']}")
             return ClaimFinished(13)
+    if paths.platform == "macos" and isinstance(scope, RepositoryScope) and isinstance(block, NoMacBlock):
+        try:
+            capacity = slot_capacity(paths, scope)
+        except (OSError, ConfigError) as error:
+            print(f"state unreadable: {error}")
+            return ClaimFinished(12)
+        use_mirror = isinstance(args.remote, str) or reserve_wait or not isinstance(assignment, UnassignedClaim)
+        slot = mac_claim_slot(overlapping, capacity, use_mirror=use_mirror)
+        if isinstance(slot, MacClaimSlot):
+            scope = RepositoryScope(scope.name, scope.key, slot.number)
+            overlapping = ()
     if (isinstance(assignment, UnassignedClaim)
             and not target_config.uses_legacy_mac_layout(paths.platform) and isinstance(scope, RepositoryScope)):
         try:
@@ -1929,7 +1980,7 @@ def claim_once(args: CliArguments, paths: StatePaths, scope: ClaimScope,
     path.parent.mkdir(parents=True, exist_ok=True)
     write_json(path, claimed)
     print_claim_identity(args, claimed)
-    if isinstance(scope, RepositoryScope) and scope.slot:
+    if paths.platform == "linux" and isinstance(scope, RepositoryScope) and scope.slot:
         remember_slot(paths, scope, claimed)
     print("claimed")
     if isinstance(scope, RepositoryScope) and scope.slot:
@@ -2248,10 +2299,19 @@ def free_now(
             if isinstance(error, conf.Unusable) and isinstance(configuration, conf.ConfigRead):
                 raise
             return "state"
-    held = all(any(
-        scopes_overlap(claim.scope, candidate) and run_holds_work(claim.record)
-        and (copy or not copy_gives_way(claim.record)) for claim in claims
-    ) for candidate in scopes)
+    if paths.platform == "macos" and isinstance(scope, RepositoryScope):
+        try:
+            capacity = slot_capacity(paths, scope)
+        except (OSError, ConfigError):
+            return "state"
+        overlapping = tuple(claim for claim in claims if scopes_overlap(claim.scope, scope)
+                            and run_holds_work(claim.record) and (copy or not copy_gives_way(claim.record)))
+        held = isinstance(mac_claim_slot(overlapping, capacity, use_mirror=True), MacClaimSlotsBusy)
+    else:
+        held = all(any(
+            scopes_overlap(claim.scope, candidate) and run_holds_work(claim.record)
+            and (copy or not copy_gives_way(claim.record)) for claim in claims
+        ) for candidate in scopes)
     if held:
         return "busy"
     if isinstance(eligibility.read_failed_probe(paths.target), eligibility.FailedProbe):
