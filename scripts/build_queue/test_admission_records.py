@@ -57,7 +57,8 @@ class RunRecordCodecTests(unittest.TestCase):
         destination = placement.PlacementDestination("mac", "mac", "mac-host", scope, 2)
         claim = placement.RunProviderClaimReference("mac", "mac", scope, "run-claim", "run-a", "placement-a")
         command = wire.RunCommandAttempt("nextest-step", "nextest-attempt")
-        fence = wire.MacRunWatcherFence(command, placement.RunCommandBinding(claim, "nextest-fence"))
+        boot = wire.MacBootIdentity("mac-hardware-id", "mac-boot-id", 100_000_000)
+        fence = wire.MacRunWatcherFence(command, placement.RunCommandBinding(claim, "nextest-fence"), boot)
         generation = wire.VerifyRunGeneration("placement-a", wire.Owner(124, "4201"))
         provider = wire.RemoteRunProvider("original-mac",
             SshCommandTransport(Path("/fixture/mac.conf")), claim,
@@ -66,13 +67,51 @@ class RunRecordCodecTests(unittest.TestCase):
             (wire.RunClaimAcquisitionPending(claim), wire.RunNeverLaunched()),
             (wire.RunCommandSettlementPending(command), wire.RunLaunched()),
             (wire.RunClaimReleasePending(claim), wire.RunLaunched()),
-            (wire.MacWatcherSettlementPending(claim), wire.RunLaunched()),
+            (wire.MacWatcherSettlementPending(fence), wire.RunLaunched()),
         ):
             with self.subTest(operation=operation):
                 slot = wire.VerifyRunSlot("fixture", wire.Owner(123, "4200"), destination=destination,
                     provider=provider, settlement=wire.SettlementPending("run ended", operation),
                     launch=launch, generation=generation)
                 self.assertEqual(wire.parse_record(wire.encode_record(slot), wire.VerifyRunSlot), slot)
+
+        receipt = wire.MacWatcherReleaseReceipt(fence, 103.0)
+        self.assertEqual(wire.parse_record(wire.encode_record(receipt), wire.MacWatcherReleaseReceipt), receipt)
+
+        for unconfirmed in (
+            wire.MacRunWatcherFenceUnrecorded(),
+            wire.MacRunWatcherBootUnrecorded(command, fence.binding),
+        ):
+            with self.subTest(unconfirmed=unconfirmed):
+                raw = {"kind": "MacWatcherSettlementPending", "fence": unconfirmed}
+                with self.assertRaises(ValueError):
+                    _ = wire.parse_record(wire.encode_record(raw), wire.MacWatcherSettlementPending)
+
+    def test_legacy_mac_watcher_handoff_keeps_the_claim_without_release_authority(self) -> None:
+        scope = RepositoryScope("fixture", "fixture-key", 2)
+        claim = placement.RunProviderClaimReference("mac", "mac", scope, "run-claim", "run-a", "placement-a")
+        command = wire.RunCommandAttempt("nextest-step", "nextest-attempt")
+        binding = placement.RunCommandBinding(claim, "nextest-fence")
+        transport = SshCommandTransport(Path("/fixture/mac.conf"))
+        holder = placement.ClaimHolderIdentity("natedev", 124, "4201")
+        old = {
+            "kind": "VerifyRunSlot",
+            "repository": "fixture",
+            "owner": wire.Owner(123, "4200"),
+            "destination": placement.PlacementDestination("mac", "mac", "mac-host", scope, 2),
+            "provider": {"kind": "RemoteRunProvider", "endpoint": "original-mac", "transport": transport,
+                         "claim": claim, "holder": holder,
+                         "watcher_fence": {"kind": "MacRunWatcherFence", "command": command, "binding": binding}},
+            "settlement": {"kind": "SettlementPending", "reason": "lost Mac",
+                           "operation": {"kind": "MacWatcherSettlementPending", "claim": claim}},
+        }
+
+        slot = wire.parse_record(wire.encode_record(old), wire.VerifyRunSlot)
+
+        self.assertEqual(slot.provider, wire.RemoteRunProvider("original-mac", transport, claim, holder,
+            watcher_fence=wire.MacRunWatcherBootUnrecorded(command, binding)))
+        self.assertEqual(slot.settlement, wire.SettlementPending("lost Mac", wire.MacWatcherHandoffUnconfirmed(claim)))
+        self.assertEqual(wire.parse_record(wire.encode_record(slot), wire.VerifyRunSlot), slot)
 
     def test_legacy_remote_slot_preserves_the_attempt_claim_and_fence(self) -> None:
         scope = RepositoryScope("fixture", "fixture-key", 2)

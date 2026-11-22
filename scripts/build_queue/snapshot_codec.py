@@ -73,10 +73,22 @@ def record_field_names(schema: type) -> tuple[str, ...]:
 
 def wire_record(schema: type, record: dict[str, object], *, writing: bool) -> dict[str, object]:
     """Keep existing wire fields compatible with the pinned client."""
-    if (not writing and schema.__module__ == "scripts.build_queue.admission_wire"
-            and schema.__name__ == "RemoteRunProvider" and "start_fence_id" in record):
-        return {**record, "claim": {"kind": "LegacyAttemptBoundRunClaim",
-            "reference": record["claim"], "start_fence_id": record["start_fence_id"]}}
+    if not writing and schema.__module__ == "scripts.build_queue.admission_wire":
+        if schema.__name__ == "RemoteRunProvider":
+            if "start_fence_id" in record:
+                record = {**record, "claim": {"kind": "LegacyAttemptBoundRunClaim",
+                    "reference": record["claim"], "start_fence_id": record["start_fence_id"]}}
+            fence = record.get("watcher_fence")
+            if isinstance(fence, dict):
+                facts = cast(dict[str, object], fence)
+                if facts.get("kind") == "MacRunWatcherFence" and "boot" not in facts:
+                    record = {**record, "watcher_fence": {**facts, "kind": "MacRunWatcherBootUnrecorded"}}
+        if schema.__name__ == "SettlementPending":
+            operation = record.get("operation")
+            if isinstance(operation, dict):
+                facts = cast(dict[str, object], operation)
+                if facts.get("kind") == "MacWatcherSettlementPending" and "claim" in facts and "fence" not in facts:
+                    record = {**record, "operation": {"kind": "MacWatcherHandoffUnconfirmed", "claim": facts["claim"]}}
     if writing and "job" in record and record["job"] == {"kind": "GateJobNotRecorded"}:
         del record["job"]
     if (schema.__module__ == "scripts.build_queue.placement"

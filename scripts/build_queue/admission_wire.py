@@ -117,8 +117,24 @@ class RunCommandAttempt:
 
 
 @dataclass(frozen=True)
+class MacBootIdentity:
+    """The hardware identity, boot UUID and boot time identify one Mac boot."""
+    hardware_id: str
+    boot_id: str
+    boot_at_us: int
+
+
+@dataclass(frozen=True)
 class MacRunWatcherFence:
-    """The watcher record identifies the exact command, run claim and start fence."""
+    """The watcher record identifies the exact command, run claim, boot and fence."""
+    command: RunCommandAttempt
+    binding: placement.RunCommandBinding
+    boot: MacBootIdentity
+
+
+@dataclass(frozen=True)
+class MacRunWatcherBootUnrecorded:
+    """The older record identifies a command fence without a Mac boot."""
     command: RunCommandAttempt
     binding: placement.RunCommandBinding
 
@@ -135,7 +151,7 @@ class RemoteRunProvider:
     transport: ExecutionTransport
     claim: placement.RunProviderClaimReference | LegacyAttemptBoundRunClaim
     holder: placement.ClaimHolderIdentity
-    watcher_fence: MacRunWatcherFence | MacRunWatcherFenceUnrecorded = field(
+    watcher_fence: MacRunWatcherFence | MacRunWatcherBootUnrecorded | MacRunWatcherFenceUnrecorded = field(
         default=MacRunWatcherFenceUnrecorded(), kw_only=True)
 
 
@@ -167,8 +183,21 @@ class RunClaimReleasePending:
 
 @dataclass(frozen=True)
 class MacWatcherSettlementPending:
-    """Only the watcher can release this lost claim. Use the saved provider fence."""
+    """Only the watcher can release the claim for this exact boot and command fence."""
+    fence: MacRunWatcherFence
+
+
+@dataclass(frozen=True)
+class MacWatcherHandoffUnconfirmed:
+    """The lost claim lacks the boot or fence evidence for watcher release."""
     claim: placement.RunProviderClaimReference
+
+
+@dataclass(frozen=True)
+class MacWatcherReleaseReceipt:
+    """The watcher saves its confirmation for this exact fence before removing the claim."""
+    fence: MacRunWatcherFence
+    confirmed_at: float
 
 
 @dataclass(frozen=True)
@@ -181,7 +210,7 @@ class SettlementPending:
     """The run is closing and holds its place until this operation settles."""
     reason: str
     operation: (RunClaimAcquisitionPending | RunCommandSettlementPending | RunClaimReleasePending
-                | MacWatcherSettlementPending)
+                | MacWatcherSettlementPending | MacWatcherHandoffUnconfirmed)
 
 
 @dataclass(frozen=True)
