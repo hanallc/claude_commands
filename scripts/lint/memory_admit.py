@@ -2136,7 +2136,8 @@ def admission_walk(inputs: QueueInputs, ordered: list[tuple[Path, RankedWaiter]]
         run_owner = verify_owner if verify_owner is not None else repository_run_owner(row)
         exempt = bool(limits.exempt_unit and
                       (row.get("unit") == limits.exempt_unit or owner in inputs.run_limit_exempt_owners))
-        follows_run_limit = runs is not None and not exempt and (verify_owner is None or run_owner not in runs)
+        # A run that already holds a place does not wait behind a new run of its repository (rule 7).
+        follows_run_limit = runs is not None and not exempt and run_owner not in runs
         run_wait: records.RunLimitFree | records.RunLimitWait = records.RunLimitFree()
         if (follows_run_limit and isinstance(limit, records.RepositoryRunLimit)
                 and runs is not None and run_owner not in runs and len(runs) >= limit.maximum):
@@ -2202,10 +2203,12 @@ def admission_walk(inputs: QueueInputs, ordered: list[tuple[Path, RankedWaiter]]
         elif local or folder_busy:
             if folder_busy and isinstance(first_folder_wait, NoWaiter):
                 first_folder_wait = records.stored_waiter(row)
-            # A hold that comes only from a run limit applies to that repository.
-            if ready and not folder_busy and isinstance(gpu_wait, GpuSlotFree) and (
+            # A row behind a run-limit row of its own repository cannot start before that row. It
+            # stays inside that repository also when it is not ready, because a held row gets no
+            # EstimateExpired reason and so does not refresh its estimate (rule 8).
+            if not folder_busy and isinstance(gpu_wait, GpuSlotFree) and (
                     records.waiter_owner(order_hold.waiter) in run_limit_waiters
-                    if isinstance(order_hold, HeldBehindHead) else isinstance(run_wait, records.RunLimitWait)):
+                    if isinstance(order_hold, HeldBehindHead) else ready and isinstance(run_wait, records.RunLimitWait)):
                 run_limit_waiters[owner] = repository
                 _ = first_held_by_run_limit.setdefault(repository, row)
             else:
