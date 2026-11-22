@@ -29,7 +29,7 @@ from scripts.notify import pushover
 from scripts.notify import review
 from scripts.notify import reply_asks
 from scripts.notify import push_texts
-from scripts.notify import push_reference
+from scripts.notify import push_reference, text_asks
 from scripts.notify.push_test_support import registered_send
 from scripts.notify.user_action import ActionRequired, NoActionRequired, SessionLine, first_line
 
@@ -1066,6 +1066,88 @@ class LocalReviewTests(unittest.TestCase):
         self.assertEqual(saved["test"]["typical"]["sha256"], push_texts.fingerprint(entry))
         self.assertFalse(pushover.LOG_FILE.exists())
         self.assertFalse((self.root / "state/held").exists())
+
+    def test_texts_ask_shows_every_example_and_saves_the_ask(self) -> None:
+        entry = push_texts.PushText("test", "script", "note", "Finished", push_texts.NoActionNeeded(),
+            "Checked {version}.", (push_texts.PushExample("first", {"version": "1"}),
+                                   push_texts.PushExample("second", {"version": "2"})), purpose="Test.")
+        with (mock.patch.object(push_texts, "catalog", return_value=(entry,)),
+              mock.patch.dict(os.environ, {"HERDR_PANE_ID": "w1:p2", "CLAUDE_CODE_SESSION_ID": "session-1"}),
+              mock.patch.object(review, "texts", side_effect=AssertionError("review ran")),
+              redirect_stdout(io.StringIO()) as output):
+            self.assertEqual(review.main(["texts", "--ask", "--id", entry.id]), 0)
+        self.assertIn("Checked 1.", output.getvalue())
+        self.assertIn("Checked 2.", output.getvalue())
+        path = self.root / "state/text-asks/w1:p2.json"
+        ask = cast(dict[str, str], json.loads(path.read_text()))
+        self.assertEqual((ask["text_id"], ask["session"], ask["fingerprint"]),
+                         (entry.id, "session-1", push_texts.fingerprint(entry)))
+        self.assertIsNotNone(datetime.fromisoformat(ask["time"]).tzinfo)
+
+    def test_texts_ask_clears_the_previous_request_if_the_save_fails(self) -> None:
+        entry = push_texts.PushText("test", "script", "note", "Finished", push_texts.NoActionNeeded(),
+            "The check passed.", (push_texts.PushExample("example", {}),), purpose="Test.")
+        pane, session = "w1:p2", "session-1"
+        text_asks.open_ask("previous", "previous-digest", session, pane, datetime.now(timezone.utc))
+        path = self.root / "state/text-asks/w1:p2.json"
+        self.assertTrue(path.exists())
+        with (mock.patch.object(push_texts, "catalog", return_value=(entry,)),
+              mock.patch.dict(os.environ, {"HERDR_PANE_ID": pane, "CLAUDE_CODE_SESSION_ID": session}),
+              mock.patch.object(text_asks, "write_text_atomic", side_effect=OSError("save failed")),
+              redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as error):
+            self.assertEqual(review.main(["texts", "--ask", "--id", entry.id]), 2)
+        self.assertEqual(output.getvalue(), "")
+        self.assertIn("save failed", error.getvalue())
+        self.assertFalse(path.exists())
+
+    def test_texts_ask_requires_a_herdr_pane_and_a_session_id(self) -> None:
+        for pane, session in (("", "session-1"), ("w1:p2", "")):
+            with (self.subTest(pane=pane, session=session),
+                  mock.patch.dict(os.environ, {"HERDR_PANE_ID": pane, "CLAUDE_CODE_SESSION_ID": session}),
+                  redirect_stderr(io.StringIO()) as output):
+                self.assertEqual(review.main(["texts", "--ask", "--id", "test"]), 2)
+                self.assertIn("requires a herdr pane and a Claude session ID", output.getvalue())
+
+    def test_texts_approves_a_matching_user_prompt_and_reviews_a_changed_text(self) -> None:
+        entry = push_texts.PushText("test", "script", "note", "Finished", push_texts.NoActionNeeded(),
+            "The check passed.", (push_texts.PushExample("first", {}), push_texts.PushExample("second", {})),
+            purpose="Test.")
+        pane, session, words = "w1:p2", "session-1", "yes i approve it"
+        now = datetime(2026, 11, 21, 12, tzinfo=timezone.utc)
+        digest = push_texts.fingerprint(entry)
+        config = self.root / "ask-config"
+        config.mkdir()
+        _ = (config / "notify.conf").write_text("# range: 1..60\nTEXT_ASK_MINUTES=7\n", encoding="utf-8")
+        with (mock.patch.dict(os.environ, {"CONF_DIR": str(config),
+                                         "CONVERSATION_PAUSE_STATE_DIR": str(self.root / "pause")}),
+              mock.patch.object(text_asks, "read_pane",
+                                return_value={"focused": True, "agent_session": {"value": session}})):
+            text_asks.open_ask(entry.id, digest, session, pane, now - timedelta(seconds=1))
+            self.assertIsInstance(text_asks.answer(session, pane, words, True, now), text_asks.Approved)
+
+        approvals = self.root / "reviewed.json"
+        changed = replace(entry, title="All checks finished")
+        changed_draft = review.Draft("script", "0", changed.title, NoActionRequired(), changed.body, False)
+        runner = FakeReviewer(verdict(changed_draft))
+        with (mock.patch.object(push_texts, "REVIEWED_FILE", approvals),
+              mock.patch.object(push_texts, "catalog", return_value=(entry,)) as catalog,
+              redirect_stdout(io.StringIO()) as output):
+            self.assertEqual(review.texts([entry.id], True, runner=runner), 0)
+            self.assertFalse(runner.calls)
+            self.assertIn(words, output.getvalue())
+            saved = review.text_approvals(cast(object, json.loads(approvals.read_text())))
+            self.assertEqual(set(saved[entry.id]), {"first", "second"})
+            for approval in saved[entry.id].values():
+                self.assertEqual(approval, {"sha256": digest, "time": now.isoformat(), "objections": [],
+                    "reviewer": f"user-prompt: {words} ({session}, {now.isoformat()})"})
+
+            catalog.return_value = (changed,)
+            self.assertEqual(review.texts([entry.id], True, runner=runner), 0)
+        self.assertEqual(len([item for item in runner.calls if Path(item.argv[0]).name == "claude"]), 2)
+        saved = review.text_approvals(cast(object, json.loads(approvals.read_text())))
+        for approval in saved[entry.id].values():
+            self.assertEqual(approval["sha256"], push_texts.fingerprint(changed))
+            self.assertFalse(approval["reviewer"].startswith("user-prompt:"))
 
     def test_user_spec_approves_original_text_and_keeps_ask_objections_and_existing_approvals(self) -> None:
         entry = push_texts.PushText("test", "shutdown", "decision", "Owner remote-control is off",
