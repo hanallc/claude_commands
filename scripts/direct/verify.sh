@@ -4498,14 +4498,16 @@ verify_exit() {
         local exit_output=""
         # Keep result messages on stdout and release resources before writing to the pipe.
         exit_output="$(mktemp "${TMPDIR:-/tmp}/verify-result.XXXXXX" 2>/dev/null)" || exit_output=""
-        {
+        [[ -n "$exit_output" ]] && {
             verify_cleanup "$outcome"
             finish_verify_run "$EXIT_STATUS"
             :
-        } >>"${exit_output:-/dev/null}" || {
-            verify_cleanup "$outcome" >/dev/null
-            finish_verify_run "$EXIT_STATUS" >/dev/null
+        } >>"$exit_output" || {
+            verify_cleanup "$outcome"
+            finish_verify_run "$EXIT_STATUS"
         }
+        # Cleanup is complete. Keep its status if a signal arrives during replay.
+        trap ':' INT TERM HUP
         if [[ -n "$exit_output" ]]; then
             if [[ -s "$exit_output" ]]; then
                 VERIFY_PY_HELPER=VERIFY_EXIT_DIAGNOSTIC "$PY" "$VERIFY_START_DIR/../lib/time_limit.py" 1 0 \

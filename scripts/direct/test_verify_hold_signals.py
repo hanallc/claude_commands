@@ -228,6 +228,45 @@ finish_verify_run() { :; }
         self.assertEqual(result.stderr, "cleanup diagnostic\n")
         self.assertFalse(token.exists())
 
+    def test_normal_exit_does_not_repeat_cleanup_on_term_during_replay(self) -> None:
+        token = self.fixture.root / "held-token"
+        token.touch()
+        action = r'''
+trap 'verify_interrupted 15' TERM
+finish_verify_run() { printf 'recorded %s\n' "$1"; }
+real_py=$PY
+replay_helper() {
+    if [[ "${!#}" == */verify-result.* ]]; then
+        [[ ! -e "$held_token" ]] || exit 90
+        kill -TERM "$BASHPID"
+    fi
+    "$real_py" "$@"
+}
+PY=replay_helper
+verify_exit 23 'exit 23'
+'''
+        result = subprocess.run(self.verify_exit_command(token, action),
+                                env=verify_test_environment(), capture_output=True, text=True,
+                                check=False, timeout=SIGNAL_EXIT_SECONDS)
+        self.assertEqual(result.returncode, 23, result.stdout + result.stderr)
+        self.assertEqual(result.stdout, "error\nrecorded 23\n")
+        self.assertEqual(result.stderr, "cleanup diagnostic\n")
+        self.assertFalse(token.exists())
+
+    def test_normal_exit_keeps_stdout_when_the_result_buffer_fails(self) -> None:
+        for fail_mktemp in ("return 1", 'printf "%s/child\\n" "$held_token"'):
+            with self.subTest(fail_mktemp=fail_mktemp):
+                token = self.fixture.root / "held-token"
+                token.touch()
+                action = f"mktemp() {{ {fail_mktemp}; }}\nverify_exit 0 exit"
+                result = subprocess.run(self.verify_exit_command(token, action),
+                                        env=verify_test_environment(), capture_output=True, text=True,
+                                        check=False, timeout=SIGNAL_EXIT_SECONDS)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(result.stdout, "completed\n")
+                self.assertEqual(result.stderr.count("cleanup diagnostic\n"), 1, result.stderr)
+                self.assertFalse(token.exists())
+
     def test_stderr_closes_while_a_step_child_is_still_running(self) -> None:
         cargo = self.fixture.bin_directory / "cargo"
         cargo.rename(cargo.with_name("cargo-original"))
