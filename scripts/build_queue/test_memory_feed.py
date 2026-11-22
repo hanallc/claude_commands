@@ -11,9 +11,9 @@ import io
 import os
 import re
 from collections import Counter
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterator
 from contextlib import redirect_stdout
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from http.client import HTTPConnection
 from pathlib import Path
@@ -128,7 +128,6 @@ class GatePlacementWaiter(admission_records.WaitingStep):
 
 @dataclass(frozen=True)
 class GatePlacementStep(admission_records.RunningStep):
-    confirmed_guest_run: Mapping[str, str] = field(default_factory=dict[str, str])
     placement_candidates: tuple[placement.CandidateEligibility, ...] = ()
 
 
@@ -576,7 +575,7 @@ class MemoryFeedTests(unittest.TestCase):
             pid=8200, started_at=now - 30, assignment_host="guest-ssh-name", mac_placement="episode/placement-attempt",
             job=StepJob("gate"), confirmed_guest_run={"target": "mac-linux", "attempt": "guest-attempt"},
             placement_candidates=gate_candidates(placement.AllowedHost()))
-        pending = replace(guest, pid=8201, mac_placement="pending/placement-attempt", confirmed_guest_run={},
+        pending = replace(guest, pid=8201, mac_placement="pending/placement-attempt", confirmed_guest_run=None,
                           execution=execution_identity.ExecutionEvidenceUnavailable("guest has no start record", now))
         running = (guest, pending)
         explained = tuple(admission_records.ExplainedRunningStep(step, admission_records.AdmissionTimeNotRecorded(),
