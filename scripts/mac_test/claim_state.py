@@ -406,9 +406,34 @@ def start_fence_name(identity: ClaimIdentity, scope_key: str) -> str:
     return f"{key}-{generation}" if generation else key
 
 
+def pending_start_path(paths: StatePaths, identity: ClaimIdentity, *, scope_key: str = "run") -> Path:
+    return paths.directory / "pending-starts" / start_fence_name(identity, scope_key)
+
+
+def pending_start_exists(paths: StatePaths, identity: ClaimIdentity) -> bool:
+    """Check all generations when only the claim identity is known."""
+    legacy = pending_start_path(paths, identity)
+    if legacy.exists():
+        return True
+    if paths.platform != "macos":
+        return False
+    try:
+        for path in legacy.parent.iterdir():
+            key, _, generation = path.name.partition("-")
+            if key == legacy.name and valid_fence_generation(generation):
+                return True
+    except FileNotFoundError:
+        pass
+    return False
+
+
 def claim_pending_start(paths: StatePaths, path: Path, record: RunRecord) -> Path:
-    name = start_fence_name(claim_identity(record), claim_fence_scope_key(path, record))
-    return paths.directory / "pending-starts" / name
+    return pending_start_path(paths, claim_identity(record), scope_key=claim_fence_scope_key(path, record))
+
+
+def valid_fence_generation(generation: object) -> bool:
+    return (isinstance(generation, str) and len(generation) == 32
+            and all(character in "0123456789abcdef" for character in generation))
 
 
 def mac_repository_record(value: object) -> MacRepositoryIdentity | CleanupOnlyMacRepository:
@@ -425,8 +450,7 @@ def mac_repository_record(value: object) -> MacRepositoryIdentity | CleanupOnlyM
     if file != f"{fence}.json":
         raise StateReadError("the Mac claim file and fence directory differ")
     generation = fields.get("fence_generation", "")
-    if (not isinstance(generation, str) or ("fence_generation" in fields
-            and (len(generation) != 32 or any(character not in "0123456789abcdef" for character in generation)))):
+    if not isinstance(generation, str) or ("fence_generation" in fields and not valid_fence_generation(generation)):
         raise StateReadError("invalid Mac fence generation")
     history_key = fields.get("history_key", store.UNKNOWN_IDENTITY)
     if not isinstance(history_key, str) or not history_key:

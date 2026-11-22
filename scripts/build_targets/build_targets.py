@@ -1255,10 +1255,7 @@ def command_release_wait(pid: int, *,
                         and claim.record["submitting_session"] == claim_state.session_id(session)
                         and claim_state.claim_identity(claim.record) == identity
                         and "remote_host" not in claim.record):
-                    from scripts.mac_test import offload
-
-                    exact = claim_state.ClaimIdentity(claim.record["claim_id"], claim.record["episode"], claim.record["attempt"])
-                    if offload.pending_start_path(target.name, exact).exists():
+                    if claim_state.claim_pending_start(paths, claim.path, claim.record).exists():
                         fenced.append(claim)
                     else:
                         claim.path.unlink(missing_ok=True)

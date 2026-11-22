@@ -406,7 +406,7 @@ sys.exit(71)
 
     def test_separate_git_directory_with_a_relative_origin_shares_capacity(self) -> None:
         separate = self.root / "separate"
-        metadata = self.root / "metadata" / "git" / "repo.git"
+        metadata = self.root / "metadata" / "hana" / "repo.git"
         metadata.parent.mkdir(parents=True)
         _ = subprocess.run(["git", "clone", "-q", "--separate-git-dir", str(metadata),
                             str(self.repo), str(separate)], check=True)
@@ -414,8 +414,10 @@ sys.exit(71)
             _ = subprocess.run(["git", "-C", str(checkout), "remote", "set-url", "origin", origin], check=True)
 
         linked = self.root / "linked" / "worktree"
+        peer = self.root / "peer" / "worktree"
         _ = subprocess.run(["git", "-C", str(separate), "config", "core.worktree", str(separate)], check=True)
         _ = subprocess.run(["git", "-C", str(separate), "worktree", "add", "-q", "--detach", str(linked)], check=True)
+        _ = subprocess.run(["git", "-C", str(separate), "worktree", "add", "-q", "--detach", str(peer)], check=True)
         native = self.native_claim(self.repo)
         self.assertEqual(mac_test.command_claim(native, self.paths, watch_claim=False), 0)
         self.addCleanup(mac_test.command_release, native, self.paths)
@@ -427,13 +429,22 @@ sys.exit(71)
                     with mac_run.held(checkout, "mac", SuiteMode.GATE, GATE_JOB_NOT_RECORDED):
                         self.fail("The guest took the native run's place")
 
+        self.assertEqual(mac_test.command_release(native, self.paths), 0)
         _ = subprocess.run(["git", "-C", str(separate), "config", "--unset", "core.worktree"], check=True)
         self.assertEqual(claim_state.target_claim_scope(self.paths, str(separate)),
                          claim_state.RepositoryScope(".claude", REPOSITORY_KEY))
-        self.assertEqual(claim_state.target_claim_scope(self.paths, str(linked)), claim_state.WHOLE_MAC)
-        with self.assertRaises(mac_run.MacRunRefused), mac_run.held(
-                linked, "mac", SuiteMode.GATE, GATE_JOB_NOT_RECORDED):
-            self.fail("The linked checkout acquired a slot without a source checkout")
+        config = eligibility.OffloadConfig(True, eligibility.SshConnectionSettings("fixture-mac", 1, 1),
+                                           1, 1, 1, "1", {"linux_only.hana": ""})
+        key = f"git-dir:{metadata}"
+        for checkout in (linked, peer):
+            self.assertEqual(eligibility.mac_step_eligibility(config, checkout, "hana", "nextest", "mac"),
+                             eligibility.KnownRepository("hana", key))
+        native = self.native_claim(linked)
+        self.assertEqual(mac_test.command_claim(native, self.paths, watch_claim=False), 0)
+        self.addCleanup(mac_test.command_release, native, self.paths)
+        with self.assertRaisesRegex(mac_run.MacRunRefused, "busy with native Mac run"):
+            with mac_run.held(peer, "mac", SuiteMode.GATE, GATE_JOB_NOT_RECORDED):
+                self.fail("The second linked checkout took the shared slot")
 
     def test_mac_origin_takes_precedence_over_borrowed_objects(self) -> None:
         other = self.root / "other"
@@ -697,6 +708,9 @@ sys.exit(71)
     def test_lost_replacement_reply_recovers_the_completed_claim(self) -> None:
         self.exercise_interrupted_replacement(("lost-reply",))
 
+    def test_retry_cleans_a_committed_replacement_after_the_owner_dies(self) -> None:
+        self.exercise_interrupted_replacement(("committed",))
+
     def test_status_and_sweep_retire_an_interrupted_replacement(self) -> None:
         self.exercise_interrupted_replacement(("status", "sweep"))
 
@@ -726,6 +740,8 @@ from scripts.mac_test import claim_state, mac_test
 checkpoint = sys.argv[1]
 old = Path(sys.argv[2])
 args = mac_test.parser().parse_args(sys.argv[3:], namespace=mac_test.CliArguments())
+if checkpoint == "committed":
+    args.pid = os.getpid()
 paths = mac_test.state_paths("mac")
 unlink = Path.unlink
 write_json = mac_test.write_json
@@ -739,7 +755,9 @@ def interrupt_write(path, record):
     if checkpoint == "fresh-write" and "remote_host" in record:
         assert not claim_state.read_claims(paths)
         os._exit(72)
-    return write_json(path, record)
+    write_json(path, record)
+    if checkpoint == "committed" and "remote_host" in record and "replaced_reservation" not in record:
+        os._exit(73)
 
 with patch.object(Path, "unlink", interrupt_unlink), patch.object(mac_test, "write_json", interrupt_write):
     if checkpoint == "lost-reply":
@@ -758,6 +776,9 @@ with patch.object(Path, "unlink", interrupt_unlink), patch.object(mac_test, "wri
         for recovery in recoveries:
             with self.subTest(recovery=recovery):
                 waiting = self.native_claim(self.checkout)
+                if recovery == "committed":
+                    waiting.episode, waiting.attempt = "episode", "attempt"
+                    waiting.claim_id = execution_identity.assigned_claim_id(waiting.episode, waiting.attempt)
                 reservation = saved if recovery == "unlink-error" else claim_state.WHOLE_MAC
                 self.assertEqual(mac_test.command_claim(waiting, self.paths, watch_claim=False,
                                                        mac_repository=reservation), 0)
@@ -781,8 +802,19 @@ with patch.object(Path, "unlink", interrupt_unlink), patch.object(mac_test, "wri
                     "verify", "", target="mac", placement=route,
                     admission=offload.MacClaimFromWait(waiting.pid, identity, NoOwningSession()))
                 command = offload.claim_arguments(request, config, retire_wait=True, mac_repository=saved)
-                child = subprocess.run([sys.executable, "-c", script, "retire", str(old_path), *command[2:]],
+                checkpoint = "committed" if recovery == "committed" else "retire"
+                child = subprocess.run([sys.executable, "-c", script, checkpoint, str(old_path), *command[2:]],
                                        capture_output=True, text=True, timeout=5)
+                if recovery == "committed":
+                    self.assertEqual(child.returncode, 73, child.stdout + child.stderr)
+                    self.assertFalse(old_path.exists())
+                    completed, = claim_state.read_claims(self.paths)
+                    self.assertNotIn("replaced_reservation", completed.record)
+                    self.assertEqual(claim_state.claim_identity(completed.record), identity)
+                    self.assertNotEqual(completed.record["pid"], waiting.pid)
+                    self.assertTrue(mac_test.recoverable_kept_claim(completed.record))
+                    self.check_committed_replacement_retry(request, assignment, config, completed, script)
+                    continue
                 self.assertEqual(child.returncode, 71, child.stdout + child.stderr)
                 self.assertTrue(old_path.exists())
                 abandoned, = (claim for claim in claim_state.read_claims(self.paths) if claim.path != old_path)
@@ -814,6 +846,37 @@ with patch.object(Path, "unlink", interrupt_unlink), patch.object(mac_test, "wri
                     self.assertEqual(claim_state.read_claims(self.paths), ())
                 self.check_replacement_retry(request, config, old_path, abandoned, script,
                                              settle=recovery == "settled-fence", lose_reply=recovery == "lost-reply")
+
+    def check_committed_replacement_retry(self, request: offload.OffloadRequest,
+                                          assignment: placement.PlacementAssignment,
+                                          config: eligibility.OffloadConfig, completed: claim_state.HeldClaim,
+                                          script: str) -> None:
+        original_arguments = offload.claim_arguments
+
+        def private_claim(*args: object, **kwargs: object) -> list[str]:
+            command = cast(Callable[..., list[str]], original_arguments)(*args, **kwargs)
+            self.assertNotIn("--from-pid", command)
+            return [sys.executable, "-c", script, "none", str(completed.path), *command[2:]]
+
+        with (
+            mock.patch.object(offload, "claim_arguments", side_effect=private_claim),
+            mock.patch.object(offload, "check_current_leftovers", return_value=offload.LeftoversEnded()) as cleanup,
+            mock.patch.object(offload, "claimed_run", return_value=offload.PassedOnMac(1)) as launched,
+        ):
+            result = offload.run_offload(offload.ProcessController(), config, request, time.monotonic())
+            self.assertIsInstance(result, offload.BusyMacDecline)
+            self.assertFalse(completed.path.exists())
+            cleanup.assert_called_once()
+            launched.assert_not_called()
+            fresh = offload.AssignedOffloadRequest(replace(assignment, attempt="fresh-attempt"))
+            result = offload.run_offload(offload.ProcessController(), config,
+                                         replace(request, placement=fresh), time.monotonic())
+            self.assertIsInstance(result, offload.PassedOnMac)
+            launched.assert_called_once()
+        running, = claim_state.read_claims(self.paths)
+        self.assertEqual(running.record["attempt"], "fresh-attempt")
+        self.assertNotEqual(claim_state.claim_fence_scope_key(running.path, running.record),
+                            claim_state.claim_fence_scope_key(completed.path, completed.record))
 
     def check_legacy_pending_replacement(self, reserved: claim_state.HeldClaim,
                                          replacement: claim_state.HeldClaim) -> None:

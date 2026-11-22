@@ -223,7 +223,7 @@ class PlacementStatusTests(unittest.TestCase):
         )
         from scripts.mac_test import claim_state, offload
 
-        for blocker in ("live holder", "pending start"):
+        for blocker in ("live holder", "pending start", "pending start with generation"):
             with self.subTest(blocker=blocker), PlacementFixture() as fixture:
                 request = placement_request(fixture)
                 _ = publish_candidate(fixture, request)
@@ -231,10 +231,12 @@ class PlacementStatusTests(unittest.TestCase):
                 claim = adopt_assignment(fixture, request, assignment)
                 self.assertEqual(fixture.server.handle_request(consume_permission("consume-current", assignment, claim)),
                     [wire.FirstAuthorization(assignment, claim)])
-                if blocker == "pending start":
+                pending: Path | None = None
+                if blocker != "live holder":
                     fixture.proc.kill(wire.Owner(request.owner.pid, request.owner.start_time))
                     identity = claim_state.ClaimIdentity(claim.claim_id, claim.episode, claim.attempt)
-                    pending = offload.pending_start_path(assignment.destination.target, identity)
+                    scope_key = "run" if blocker == "pending start" else "mirror/" + "a" * 32
+                    pending = offload.pending_start_path(assignment.destination.target, identity, scope_key=scope_key)
                     pending.parent.mkdir(parents=True, exist_ok=True)
                     _ = pending.write_text("pending startup\n")
                 fixture.clock.advance(1)
@@ -248,6 +250,14 @@ class PlacementStatusTests(unittest.TestCase):
                 if blocker == "live holder":
                     waiting, = fixture.server.handle_request(request)
                     self.assertIsInstance(waiting, wire.PlacementWait)
+                if blocker == "pending start with generation":
+                    assert pending is not None
+                    key = execution_identity.attempt_key(assignment.episode, assignment.attempt)
+                    _ = fixture.run_pass()
+                    self.assertEqual(fixture.server.current_assignments[assignment.episode], key)
+                    pending.unlink()
+                    _ = fixture.run_pass()
+                    self.assertEqual(fixture.server.assignments[key].state, placement.ClosedAssignment("lost"))
 
     def test_a_kept_claim_frees_its_assignment_when_holder_and_owner_end(self) -> None:
         from scripts.build_queue.test_placement import (

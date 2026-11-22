@@ -3420,7 +3420,7 @@ done
                 and not self._placement_owner_live(saved.assignment.owner))
 
     def _start_pending(self, saved: records.SavedPlacementAssignment) -> bool:
-        from scripts.mac_test import claim_state, offload
+        from scripts.mac_test import claim_state
 
         provider = saved.provider
         from scripts.aws_target import hana_placement
@@ -3484,8 +3484,9 @@ done
         identity = claim_state.ClaimIdentity(provider.claim_id, provider.episode, provider.attempt)
         with conf.report_key_changes():
             try:
-                return offload.pending_start_path(saved.assignment.destination.target, identity).exists()
-            except conf.Unusable:
+                return claim_state.pending_start_exists(
+                    claim_state.state_paths(saved.assignment.destination.target), identity)
+            except (OSError, conf.Unusable):
                 return True
 
     def _recovered_hana_dispatch(self, saved: records.SavedPlacementAssignment) -> wire.ExecutionReport | placement.NoTerminalReport:

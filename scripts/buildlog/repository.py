@@ -111,6 +111,10 @@ class MacSourceRepository:
     checkout_origin: str = field(repr=False)
 
 
+class UnrecordedSourceCheckout:
+    """Git gives the shared metadata path without the main checkout path."""
+
+
 def mac_source_repository(worktree: str, common: str) -> MacSourceRepository:
     """Follow local clone origins from the checkout to the source repository."""
     checkout_origin = _mac_origin(worktree)
@@ -119,7 +123,10 @@ def mac_source_repository(worktree: str, common: str) -> MacSourceRepository:
     seen = {common}
     while origin:
         if _relative_local_origin(origin):
-            directory = _relative_origin_directory(directory)
+            source_directory = _relative_origin_directory(directory)
+            if isinstance(source_directory, UnrecordedSourceCheckout):
+                break
+            directory = source_directory
         source = _local_origin_checkout(origin, directory)
         if source is None or str(source.common_dir) in seen:
             return MacSourceRepository(common, remote_identity(origin, directory), checkout_origin)
@@ -130,7 +137,7 @@ def mac_source_repository(worktree: str, common: str) -> MacSourceRepository:
     return MacSourceRepository(common, "git-dir:" + common, checkout_origin)
 
 
-def _relative_origin_directory(directory: str) -> str:
+def _relative_origin_directory(directory: str) -> str | UnrecordedSourceCheckout:
     checkout = git_files.locate(Path(directory))
     if checkout.git_dir == checkout.common_dir:
         return str(checkout.toplevel)
@@ -138,11 +145,12 @@ def _relative_origin_directory(directory: str) -> str:
 
     try:
         source = git_files.at(source_checkout(checkout.toplevel))
+    except git_files.NotACheckout:
+        return UnrecordedSourceCheckout()
     except SlotGitFailure as error:
         raise ValueError(str(error)) from error
-    # Git can report the separate metadata directory when it lacks the main checkout path.
     if source.git_dir != checkout.common_dir or source.common_dir != checkout.common_dir:
-        raise ValueError(f"{directory}: Git does not identify the source checkout")
+        return UnrecordedSourceCheckout()
     return str(source.toplevel)
 
 

@@ -534,8 +534,7 @@ class StartUnsettled:
 
 
 def pending_start_path(target: str, identity: claim_state.ClaimIdentity, *, scope_key: str = "run") -> Path:
-    name = claim_state.start_fence_name(identity, scope_key)
-    return claim_state.state_paths(target).directory / "pending-starts" / name
+    return claim_state.pending_start_path(claim_state.state_paths(target), identity, scope_key=scope_key)
 
 
 def start_fence_relative(identity: claim_state.ClaimIdentity, target: str, *, scope_key: str = "run") -> Path:
@@ -3383,7 +3382,11 @@ def run_offload(
                 return declined("state", started)
             held = next((claim for claim in claims
                 if claim_state.claim_identity(claim.record) == admission.identity
-                and "replaced_reservation" not in claim.record), None)
+                and "replaced_reservation" not in claim.record
+                and ("remote_host" not in claim.record
+                     or (claim.record.get("cleanup_pending") and claim.record["pid"] == admission.owner_pid
+                         and process_identity.process_start(admission.owner_pid)
+                         == process_identity.Started(claim.record["proc_start"])))), None)
             if held is None:
                 request = replace(request, admission=UnclaimedMacRun())
             else:
