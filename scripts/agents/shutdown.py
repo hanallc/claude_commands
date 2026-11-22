@@ -1329,13 +1329,13 @@ def retirement_members(unit: RetiringUnit, record: staff.StaffSnapshot) -> list[
     return [unit.staff_member, *record.find(kind="worker", parent=unit.staff_member.id)]
 
 def retirement_remove(unit: RetiringUnit, *, settings: conf.ConfigRead) -> list[str]:
+    if not unit.branch and not os.path.lexists(unit.worktree):
+        return []
     try:
         require_removable_checkout(unit.worktree, unit.production.checkout, unit.branch)
     except ProductionPathsError as error:
         return [str(error)]
     failed: list[str] = []
-    if not unit.branch and not os.path.lexists(unit.worktree):
-        return failed
     try:
         layout = worktrees.worktree_output(unit.worktree)
         worktrees.remove_git_checkout(unit.worktree, unit.production.checkout, force=True, retain_record=True)
