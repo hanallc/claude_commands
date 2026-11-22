@@ -542,7 +542,7 @@ def stop_command(
     path: Path, reason: str, *, check: Callable[[], bool] = lambda: True,
     stop_pass: bool = True, signal_group: Callable[[int, int], None] | None = None,
 ) -> bool:
-    """Stop the recorded command and keep the supervisor alive to record the result."""
+    """Request a stop and return true only after scope confirmation."""
     if not process_stop.supported():
         return False
     record = worker_lifecycle.read_json_object(path)
@@ -566,7 +566,8 @@ def stop_command(
         if (command is None or command != starting_command
                 or "command_scope" in worker_lifecycle.read_json_object(path)
                 or not check()
-                or (stop_pass and detached_run_process.supervisor_match(supervisor, path) is not True)
+                or (stop_pass and detached_run_process.supervisor_match(supervisor, path) is not True
+                    and not isinstance(process_start.process_start(supervisor), (process_start.Gone, process_start.Zombie)))
                 or (signal_group is None and process_start.process_start(command.group)
                     != process_start.Started(command.started))):
             return CommandGroupUnverified()
@@ -894,7 +895,8 @@ def _complete_stopped_run(path: Path, record: RunRecord) -> str:
                 if raw.get("staff_id") != record["staff_id"]:
                     continue
                 if raw.get("status") == "running" and not _orphaned(other, raw, now) or (
-                        raw.get("status") == "finished" and raw.get("stop_pass_requested") is True
+                        raw.get("status") == "finished"
+                        and ("command_scope" in raw or raw.get("stop_pass_requested") is True)
                         and not _command_has_ended(raw, _integer(raw.get("pid")))):
                     yield worker_panes.Kept(f"another detached run can still be live: {other.stem}")
                     return
@@ -1000,7 +1002,8 @@ def _prune_finished_locked(runs: Path) -> list[str]:
         with record_lock(path):
             current = worker_lifecycle.read_json_object(path)
             if (current.get("run_id") != run_id or current.get("status") != "finished"
-                    or current.get("completion_pending") or _worker_result_pending(str(current.get("delivery", "")))):
+                    or current.get("completion_pending") or _worker_result_pending(str(current.get("delivery", "")))
+                    or ("command_scope" in current and not _command_has_ended(current, _integer(current.get("pid"))))):
                 continue
             for name in _RUN_FILES:
                 (runs / name.format(run_id)).unlink(missing_ok=True)
