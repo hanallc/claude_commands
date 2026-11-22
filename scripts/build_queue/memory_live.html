@@ -809,7 +809,7 @@ function becauseRows(reason, parts) {
     : [field('Because', ''), {...field('', reason, 'long'), valueParts:parts}];
 }
 function routeFields(row) {
-  return [field('Runs on', row.kind === 'cloud' ? 'AWS' : row.runs_on || ''),
+  return [field('Runs on', row.runs_on || (row.kind === 'cloud' ? 'AWS' : '')),
     ...(row.runs_on === 'natedev or Mac' ? [] : becauseRows(row.because || '', row.because_parts))];
 }
 function progressRows(row) {
@@ -851,7 +851,9 @@ function stepTooltip(key, data) {
   if (row.priority_entries?.length) rows.push(staffField('Priority', row.priority_entries.map(entry => entry.unit)));
   if (waiting) {
     if (row.place) rows.push(field('Place in line', row.place));
-    rows.push(field('Waits for', row.kind === 'cloud' ? 'AWS slot' : row.why || 'its turn'), ...routeFields(row));
+    const waitReason = row.kind === 'cloud'
+      ? (row.runs_on && row.runs_on !== 'AWS' ? row.reason : 'AWS slot') : row.why || 'its turn';
+    rows.push(field('Waits for', waitReason), ...routeFields(row));
     if (row.why === 'build space') rows.push(field('Reason', row.reason));
     if (row.kind !== 'cloud') {
       let free = row.free ?? queueCapMemory(data).free / GIB;
@@ -883,7 +885,8 @@ function stepTooltip(key, data) {
       rows.push(...groupRows(need));
     }
   } else {
-    const machine = macRow(row) ? 'Mac' : row.kind === 'cloud' ? 'AWS' : row.machine || 'natedev';
+    const machine = macRow(row) ? 'Mac' : row.kind === 'cloud' && (!row.machine || row.machine === 'aws')
+      ? 'AWS' : row.machine || 'natedev';
     rows.push(field('Runs on', machine));
     if (row.kind === 'cloud') {
       if (row.activity) rows.push(field('Status', row.activity));
@@ -1393,7 +1396,7 @@ function renderWalk(d) {
   rows.push(`<div class="walk-chart-head queue-head"><span class="queue-title section-head" title="${esc(title)}"><span>${titleHtml}</span><span> (${waitingCount})</span></span></div>`);
   let localPosition = 0;
   d.waiters.forEach((w, i) => {
-    const place = w.kind === "cloud" ? "cloud" : String(++localPosition);
+    const place = w.kind === "cloud" ? (w.runs_on && w.runs_on !== "AWS" ? "—" : "cloud") : String(++localPosition);
     const tip = `wait:${w.key}`;
     cells(place, w.name, ago(w.since, d.read_at), rowUnit(w), w.pid, w.machine ? [w.machine] : w.targets || [], null, tip, w.verify?.verb, `wait${i === 0 ? " wait-first" : ""}`);
     const note = ["build space", "the build in the same Cargo folder"].includes(w.why) ? w.reason : "";

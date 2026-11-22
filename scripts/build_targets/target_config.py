@@ -31,11 +31,24 @@ class LocalTarget:
 
 
 @dataclass(frozen=True)
+class DedicatedHost:
+    """The target does not share another target's claim."""
+
+
+@dataclass(frozen=True)
+class SharedHost:
+    """The target shares the named target's capacity."""
+
+    name: str
+
+
+@dataclass(frozen=True)
 class SshTarget:
     """The SSH target holds its name, platform, and settings path."""
     name: str
     platform: Platform
     settings: Path
+    shared_host: SharedHost | DedicatedHost = DedicatedHost()
 
 
 Target = LocalTarget | SshTarget
@@ -242,7 +255,30 @@ def _read_target(config: conf.ConfigRead, name: str, purpose: RegistryRead) -> T
         raise ConfigError(f"{key}: settings file does not exist: {settings}")
     if name == "aws" or settings.name == "aws_target.conf":
         raise ConfigError("The permanent AWS builder was removed; use cloud gates")
-    return SshTarget(name, platform, settings)
+    host_key = f"host.{name}"
+    host = config.value(host_key, str) if host_key in config.values() else ""
+    if host:
+        names = _registry_value(config, "targets", _target_names, purpose)
+        if host == name or host not in (*names, *pinned_target_names(config)):
+            raise ConfigError(f"{host_key}: expected another configured target, got {host!r}")
+        _ = _registry_value(config, f"kind.{host}", _target_kind, purpose)
+        _ = _registry_value(config, f"platform.{host}", _target_platform, purpose)
+    return SshTarget(name, platform, settings, SharedHost(host) if host else DedicatedHost())
+
+
+def registry_configuration(path: Path | None = None) -> conf.ConfigRead:
+    registry = conf.path("build_targets") if path is None else path
+    current = COMMAND_CONFIGURATION.get()
+    if isinstance(current, CommandConfiguration):
+        if registry not in current.configurations:
+            current.configurations[registry] = conf.read(registry)
+        return current.configurations[registry]
+    return conf.read(registry)
+
+
+def pinned_target_names(configuration: conf.ConfigRead) -> frozenset[str]:
+    pinned = configuration.value("pinned_targets", str, default="", allow_blank=True)
+    return frozenset(name for part in pinned.split(",") if (name := part.strip()))
 
 
 def read_targets(path: Path | None = None, *, selected: str = "", target_name: str = "",
@@ -253,19 +289,10 @@ def read_targets(path: Path | None = None, *, selected: str = "", target_name: s
         raise ConfigError("expected one selected target")
     selected = selected or target_name
     if isinstance(configuration, conf.UseConfiguredValue):
-        registry = conf.path("build_targets") if path is None else path
-        current = COMMAND_CONFIGURATION.get()
-        if isinstance(current, CommandConfiguration):
-            if registry not in current.configurations:
-                current.configurations[registry] = conf.read(registry)
-            configuration = current.configurations[registry]
-        else:
-            configuration = conf.read(registry)
+        configuration = registry_configuration(path)
     names = _registry_value(configuration, "targets", _target_names, purpose)
-    if selected and selected not in names:
-        pinned = configuration.value("pinned_targets", str, default="", allow_blank=True)
-        if any(name.strip() == selected for name in pinned.split(",")):
-            names = (selected,)
+    if selected and selected not in names and selected in pinned_target_names(configuration):
+        names = (selected,)
     targets: list[Target] = []
     for name in names:
         if selected and name != selected:

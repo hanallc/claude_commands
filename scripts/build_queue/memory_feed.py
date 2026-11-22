@@ -1008,7 +1008,7 @@ class CloudWorkRow(RowQueueNotes, NamedQueueRow):
     unit: str
     pid: int | admission_records.PidNotRecorded
     detail: str
-    machine: Literal["aws", ""]
+    machine: str
     vcpus: int | queue_view.UnknownCpuCount
     state: str
     status: str
@@ -3048,12 +3048,20 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
         rows = queue_view.cloud_rows(model)
         with staff.supplied_snapshot(staff_display.members):
             cloud_labels = model.cloud_labels
-        cloud_slots_used = sum(isinstance(row.wait, admission_records.ReadyForAdmission)
-            or isinstance(row.wait.state, ReservedCloudSlot) for row in rows)
-        interval = queue_view.cloud_push_interval()
+        cloud_slots_used = sum(row.place.target == "aws" and (isinstance(row.wait, admission_records.ReadyForAdmission)
+            or isinstance(row.wait.state, ReservedCloudSlot)) for row in rows)
+        guest_interval = queue_view.CloudPushIntervalUnavailable("the guest has no AWS push interval")
+        interval = queue_view.cloud_push_interval() if any(row.place.target == "aws" for row in rows) else guest_interval
         cloud_waiters: dict[wire.Owner, CloudWaitRow] = {}
         for cloud in rows:
-            information = queue_view.cloud_work(cloud, explanation.now, parsed.cloud_gate_stale_pushes, interval)
+            target = cloud.place.target
+            runs_on = CLOUD_RUNS_ON if target == "aws" else target
+            information = queue_view.cloud_work(cloud, explanation.now, parsed.cloud_gate_stale_pushes,
+                                                interval if target == "aws" else guest_interval)
+            if (target != "aws" and not isinstance(cloud.wait, wire.CloudSlotWait)
+                    and isinstance(cloud.progress, cloud_progress.NoCloudProgress)):
+                information = replace(information, state="running" if isinstance(cloud.counter, progress.ProgressCounter)
+                                      else "starting")
             recorded = cloud.identity
             member = members.labels_for(recorded.session_id, machine, Path(recorded.folder))
             current = next((label for label in (
@@ -3088,7 +3096,7 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
                 **call_notes(cloud.identity.verify, cloud.identity.step,
                              "" if isinstance(cloud.identity.verify, admission_records.VerifyCall)
                              else recorded_process_call(cloud.owner.pid, cloud.owner.start_time)),
-                "detail": identity.unit, "machine": "" if isinstance(cloud.wait, wire.CloudSlotWait) else "aws",
+                "detail": identity.unit, "machine": "" if isinstance(cloud.wait, wire.CloudSlotWait) else target,
                 "vcpus": information.vcpus,
                 "state": information.state, "status": plain([queue_view.cloud_page_status(cloud, information)]),
                 "activity": (cloud.progress.stage if isinstance(cloud.progress, cloud_progress.CloudProgress) and cloud.progress.stage
@@ -3103,7 +3111,7 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
                 **job_notes(job, names, step=cloud.identity.step, verify=cloud.identity.verify)}
             if isinstance(cloud.wait, wire.CloudSlotWait):
                 cloud_waiters[cloud.owner] = {**values, "since": cloud.since, "reason": cloud.wait.text,
-                    "runs_on": CLOUD_RUNS_ON, "because": "natedev when AWS cannot start", "targets": ["aws"]}
+                    "runs_on": runs_on, "because": f"natedev when {runs_on} cannot start", "targets": [target]}
             else:
                 work_rows.append({**values, "started_at": cloud.started_at or cloud.since})
         work_rows.sort(key=lambda row: row["started_at"])

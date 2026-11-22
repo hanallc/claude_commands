@@ -3285,6 +3285,21 @@ process.stdout.write(JSON.stringify({
                     self.assertEqual([row["pid"] for row in running], [first.owner.pid])
                     self.assertEqual([row["pid"] for row in queued], [waiting.owner.pid])
 
+    def test_whole_run_rows_show_the_guest_with_no_local_charge(self) -> None:
+        reading = whole_run_reading(reservation_reading())
+        with (mock.patch.object(admission_client, "view", return_value=reading),
+              mock.patch.object(memory_feed, "host_name", return_value="fixture")):
+            page = memory_feed.reading()
+        running, = (cast(memory_feed.CloudRunRow, row) for row in page["walk"] if row.get("kind") == "cloud")
+        waiting, = (row for row in page["waiters"] if row.get("kind") == "cloud")
+        self.assertEqual(running["machine"], "mac-linux")
+        self.assertEqual(running["started_at"], reading.cloud[0].started_at)
+        self.assertIn("7 of 12 modules", running["status"])
+        self.assertEqual(waiting.get("targets"), ["mac-linux"])
+        self.assertEqual(waiting["reason"], "mac-linux runs one whole run at a time")
+        self.assertEqual(page["cloud_slots_used"], 0)
+        self.assertNotIn("reserved", running)
+
     def test_project_names_follow_the_queue_formatter_for_running_and_waiting_steps(self) -> None:
         for raw_step, project, folder, expected in (
             ("nextest", "known-project", "/fixture", "known-project nextest"),
@@ -3898,6 +3913,17 @@ def write_user_slices(user: Path, *, agents: bool = True, guarantee: str = "2147
         _ = (agents_slice / "memory.swap.current").write_text(f"{4 * gib}\n")
 
 
+def whole_run_reading(reading: admission_records.QueueRead) -> wire.CloudQueueRead:
+    cloud = cloud_reading(reading)
+    running, waiting = cloud.cloud
+    place = wire.CloudPlace("mac-linux")
+    return replace(cloud, cloud=(
+        replace(running, place=place, identity=replace(running.identity, job=StepJob("gate", "queue")),
+                progress=cloud_progress.NoCloudProgress()),
+        replace(waiting, place=place, wait=wire.CloudSlotWait(1, 1, target=place.target)),
+    ))
+
+
 def write_browser_fixture(folder: Path) -> None:
     """Publish private feed readings for the browser proof."""
     fixture = MemoryFeedTests()
@@ -3955,6 +3981,7 @@ def write_browser_fixture(folder: Path) -> None:
             "[cloud_gate]\n# range: 5e-324..\nlog_push_s=5\n")
         cloud = cloud_reading(with_wait_reason(base, admission_records.StartSpacingWait(110)))
         readings["cloud"] = cloud
+        readings["whole_run"] = whole_run_reading(base)
         first = cloud.cloud[0]
         assert isinstance(first.progress, cloud_progress.CloudProgress)
         for name, stage, region, zone in (

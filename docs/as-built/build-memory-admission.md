@@ -2360,3 +2360,16 @@ Session TMPDIRs and unit session folders remain for later session commands.
 
 `verify.sh` shares one Python process across synchronous helper calls.
 See [Synchronous verify helpers](build-targets.md#synchronous-verify-helpers) for the protocol, process exceptions, recovery, and trace format.
+
+## Whole runs on mac-linux
+
+Only an explicit route can select `mac-linux`.
+The queue grants one whole-run reservation per target in arrival order.
+A whole-run reservation uses zero bytes of natedev memory.
+The guest takes one whole-Mac claim on the target named by `host.mac-linux`.
+The claim waits for Mac jobs to end and excludes new Mac jobs.
+A Mac block refuses the claim.
+The claim uses the caller's process identity.
+The caller ends the guest work before it releases the claim.
+The caller releases the Mac claim before it releases the reservation.
+The Builds page shows the guest target, owner, step, start age, and recorded progress.

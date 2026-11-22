@@ -448,6 +448,10 @@ def fixed_remote_candidates(
     provider: Literal["mac", "ssh"] = "mac" if target.platform == "macos" else "ssh"
     policy: placement.AllowedHost | placement.FixedExclusion = placement.AllowedHost()
     try:
+        if not isinstance(rule, NatedevOnly) and pin_required(target, selection):
+            destination = placement.PlacementDestination(provider, target.name, target.name, claim_state.WHOLE_MAC)
+            policy = placement.FixedExclusion(f"This target requires --target {target.name}")
+            return (placement.PlacementCandidate(destination, policy, settings),)
         configuration = conf.read(target.settings)
         transport = target_config.read_execution_transport(target, configuration=configuration)
         if isinstance(transport, HanaGpuNextestTransport):
@@ -455,8 +459,6 @@ def fixed_remote_candidates(
                      if isinstance(repository, eligibility.KnownRepository) else claim_state.WHOLE_MAC)
             if isinstance(rule, NatedevOnly):
                 policy = placement.FixedExclusion(rule.reason)
-            elif not isinstance(selection, Pinned) or selection.target != target.name:
-                policy = placement.FixedExclusion('This target requires --target hana-gpu')
             else:
                 policy = hana_placement_adapter.gpu_step(transport,
                     repository.key if isinstance(repository, eligibility.KnownRepository) else '',
@@ -768,6 +770,13 @@ def mac_target_eligibility(target: LocalTarget | SshTarget, repo_root: Path,
     return EligibleTarget(target)
 
 
+def pin_required(target: SshTarget, selection: TargetSelection) -> bool:
+    from scripts.build_targets import target_config
+
+    return (not (isinstance(selection, Pinned) and selection.target == target.name)
+            and target.name in target_config.pinned_target_names(target_config.registry_configuration()))
+
+
 def ssh_target_eligibility(target: SshTarget, repo_root: Path, package: str,
                            kind: StepKind, routing: Routing, *, selection: TargetSelection = ROUTED, new_step: bool = False,
                            configuration: conf.ConfigRead | conf.UseConfiguredValue = conf.UseConfiguredValue.CURRENT,
@@ -781,6 +790,8 @@ def ssh_target_eligibility(target: SshTarget, repo_root: Path, package: str,
     from scripts.aws_target import hana_placement, hana_placement_adapter
     from scripts.build_targets import target_config
 
+    if not isinstance(routing, LocalRequired) and pin_required(target, selection):
+        return ExcludedTarget(target, f"This target requires --target {target.name}")
     settings = conf.read(target.settings) if isinstance(configuration, conf.UseConfiguredValue) else configuration
     transport = target_config.read_execution_transport(target, configuration=settings)
     if isinstance(transport, HanaGpuNextestTransport):
@@ -788,8 +799,6 @@ def ssh_target_eligibility(target: SshTarget, repo_root: Path, package: str,
 
         if isinstance(routing, LocalRequired):
             return ExcludedTarget(target, routing.reason)
-        if not isinstance(selection, Pinned) or selection.target != target.name:
-            return ExcludedTarget(target, 'This target requires --target hana-gpu')
         identity = eligibility.repository_identity(repo_root)
         policy = hana_placement_adapter.gpu_step(transport,
             identity.key if isinstance(identity, eligibility.KnownRepository) else '',
