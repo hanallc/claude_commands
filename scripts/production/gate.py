@@ -822,6 +822,7 @@ class GateRecovery:
     def recover(self) -> None:
         """Stop recorded groups, return tokens, and undo the merge."""
         if self.finished:
+            self.release_folder_markers()
             return
         config = admission_records.read_memory_config()
         started = time.monotonic()
@@ -890,16 +891,18 @@ class GateRecovery:
                 rollback_deadline = time.monotonic() + config.program_stop_seconds
                 try:
                     _ = cleanup.enter_context(scratch.copy_lock(repo, deadline=rollback_deadline))
-                except scratch.CopyLockTimeout as error:
+                except scratch.ScratchError as error:
                     raise GateRecoveryUnresolved(f"{error} in {repo}") from error
                 self.rollback_deadline = rollback_deadline
                 try:
                     head = checked_git(repo, "rev-parse", "HEAD")
-                    if head not in (self.rollback, self.rollback_head):
+                    matches = head in (self.rollback, self.rollback_head)
+                    if not matches and self.rollback_head in ("", self.rollback) and self.rollback_source:
                         parents = checked_git(repo, "rev-list", "--parents", "-n", "1", head).split()[1:]
-                        if parents != [self.rollback, self.rollback_source]:
-                            raise GateRollbackMismatch(
-                                f"gate recovery kept {self.path}: HEAD {head} differs from the recorded merge")
+                        matches = parents == [self.rollback, self.rollback_source]
+                    if not matches:
+                        raise GateRollbackMismatch(
+                            f"gate recovery kept {self.path}: HEAD {head} differs from the recorded merge")
                     rollback_merge(repo, self.rollback)
                     self.rollback = ""
                     self.rollback_head = ""
@@ -916,8 +919,25 @@ class GateRecovery:
         if self.folders:
             self.finished = True
             self.save()
+            self.release_folder_markers()
         else:
             self.path.unlink(missing_ok=True)
+
+    def release_folder_markers(self) -> None:
+        """Release the removal markers that refer to this finished record."""
+        for folder in map(Path, self.folders):
+            marker = folder / build_folders.RECOVERY_MARKER
+            if not marker.is_symlink():
+                continue
+            try:
+                with build_folder_lock.folder_parent(folder, folder.parent, create=False) as parent, ExitStack() as leases:
+                    lease = build_folders._hold_free_lease(folder, parent, leases, wait=False)  # pyright: ignore[reportPrivateUsage]
+                    if not isinstance(lease, build_folders.RefusedRemovalLease) and marker.readlink() == self.path.absolute():
+                        marker.unlink()
+            except FileNotFoundError:
+                continue
+            except (OSError, ValueError) as error:
+                report_gate_recovery(self.path, error)
 
 
 def report_retained_gate_folder(folder: str, reason: str) -> None:
@@ -1170,14 +1190,15 @@ def recover_gate_record(path: Path) -> None:
     except GateRecordError as error:
         report_gate_recovery(path, error)
         return
-    if recovery is None or recovery.finished:
+    if recovery is None:
         return
-    owner = process_start(recovery.pid)
-    if isinstance(owner, Unreadable):
-        report_gate_recovery(recovery.path, f"cannot read gate owner {recovery.pid}")
-        return
-    if isinstance(owner, Started) and owner.start == recovery.start:
-        return
+    if not recovery.finished:
+        owner = process_start(recovery.pid)
+        if isinstance(owner, Unreadable):
+            report_gate_recovery(recovery.path, f"cannot read gate owner {recovery.pid}")
+            return
+        if isinstance(owner, Started) and owner.start == recovery.start:
+            return
     active = ACTIVE_GATE_RECOVERY.set(recovery)
     try:
         recovery.recover()
@@ -1275,7 +1296,8 @@ def private_gate_recovery(repo: Path, parent: Path) -> Generator[GateRecovery]:
 def gate_temporary(recovery: GateRecovery, tool: str, parent: Path) -> Generator[Path]:
     with ExitStack() as cleanup:
         request = build_folders.UniqueBuildFolder(f"{tool}-", build_folders.ExplicitBuildParent(parent))
-        folder = cleanup.enter_context(build_folders.temporary_build_folder(request, keep=lambda: recovery.unresolved))
+        folder = cleanup.enter_context(build_folders.temporary_build_folder(
+            request, keep=lambda: recovery.unresolved, children=True))
         try:
             recovery.folders.append(str(folder))
             recovery.save()

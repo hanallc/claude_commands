@@ -983,7 +983,18 @@ signal.pause()
                     owner = ledger.instant(saved, 'owner')
                     owner_exit = os.pidfd_open(owner)
                     _ = descriptors.callback(os.close, owner_exit)
+                    recoverer = None
                     if event == 'recovery':
+                        recoverer = descriptors.enter_context(subprocess.Popen([sys.executable, '-c',
+                            'import sys\nfrom pathlib import Path\nfrom scripts.aws_target.aws_trial import recover_git\n'
+                            + 'print("ready", flush=True)\n'
+                            + 'if sys.stdin.readline():\n    recover_git(Path(sys.argv[1]), float(sys.argv[2]), 0.05)',
+                            str(record), str(stop_seconds)], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, text=True))
+                        _ = descriptors.callback(recoverer.kill)
+                        assert recoverer.stdout is not None
+                        self.assertTrue(select.select([recoverer.stdout], [], [], TEST_HANG_GUARD_SECS)[0])
+                        self.assertEqual(recoverer.stdout.readline(), 'ready\n')
                         os.kill(owner, signal.SIGSTOP)
                         os.kill(controller.pid, signal.SIGTERM)
                         os.kill(owner, signal.SIGKILL)
@@ -994,12 +1005,9 @@ signal.pause()
                         os.kill(controller.pid, signal.SIGTERM)
                     if event == 'interrupt':
                         os.kill(controller.pid, signal.SIGINT)
-                    if event == 'recovery':
-                        recovery = subprocess.run([sys.executable, '-c',
-                            'import sys\nfrom pathlib import Path\nfrom scripts.aws_target.aws_trial import recover_git\n'
-                            + 'recover_git(Path(sys.argv[1]), float(sys.argv[2]), 0.05)', str(record), str(stop_seconds)],
-                            capture_output=True, text=True, timeout=max(0, deadline - time.monotonic()))
-                        self.assertEqual(recovery.returncode, 0, recovery.stderr)
+                    if recoverer is not None:
+                        _, errors = recoverer.communicate('recover\n', timeout=max(0, deadline - time.monotonic()))
+                        self.assertEqual(recoverer.returncode, 0, errors)
                     for exit_fd in (*exits, owner_exit):
                         self.assertTrue(select.select([exit_fd], [], [], max(0, deadline - time.monotonic()))[0])
                     self.assertLessEqual(time.monotonic(), deadline)

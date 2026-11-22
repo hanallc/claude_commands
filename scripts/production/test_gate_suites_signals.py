@@ -5,6 +5,7 @@ from __future__ import annotations
 import unittest
 from contextlib import ExitStack, redirect_stderr, redirect_stdout
 from dataclasses import asdict, replace
+import fcntl
 import io
 import json
 import os
@@ -393,6 +394,46 @@ sys.stdin.read(1)
             os.close(reader)
             os.close(writer)
 
+    def test_recovery_refuses_an_amended_merge_with_the_same_parents(self) -> None:
+        with mock.patch.dict(os.environ, self.environment, clear=True):
+            _ = self.git(self.checkout, "merge", "--no-ff", "--no-edit", self.checkpoint)
+            merged = self.git(self.checkout, "rev-parse", "HEAD")
+            record = gate.gate_run_directory(self.checkout) / "amended.json"
+            recovery = gate.GateRecovery(record, str(self.checkout), os.getpid(), "ended-owner",
+                                        rollback=self.base, rollback_head=merged, rollback_source=self.checkpoint)
+            recovery.save()
+            _ = self.git(self.checkout, "commit", "--amend", "-m", "Amend the gate merge")
+            amended = self.git(self.checkout, "rev-parse", "HEAD")
+            self.assertNotEqual(amended, merged)
+            self.assertEqual(self.git(self.checkout, "show", "-s", "--format=%P", amended),
+                             self.git(self.checkout, "show", "-s", "--format=%P", merged))
+            with self.assertRaisesRegex(gate.GateRollbackMismatch, "differs from the recorded merge"):
+                gate.recover_gate_directory(record.parent)
+            self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), amended)
+            self.assertEqual(gate.read_gate_recovery(record), recovery)
+            recovery.rollback_head = self.base
+            recovery.save()
+            gate.recover_gate_directory(record.parent)
+            self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), self.base)
+            self.assertFalse(record.exists())
+
+    def test_busy_numbered_copy_does_not_block_other_gate_recovery(self) -> None:
+        with mock.patch.dict(os.environ, self.environment, clear=True):
+            copy = build_folders.copy_path("fixture", "unit", 1)
+            copy.mkdir(parents=True)
+            directory = gate.gate_run_directory(copy)
+            first = gate.GateRecovery(directory / "first.json", str(copy), os.getpid(), "ended-owner",
+                                      rollback=self.base)
+            second = gate.GateRecovery(directory / "second.json", str(copy), os.getpid(), "ended-owner")
+            first.save()
+            second.save()
+            with (copy.with_suffix(".lock").open("w") as holder, redirect_stdout(io.StringIO()) as output):
+                fcntl.flock(holder, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                gate.recover_shared_gate_runs()
+            self.assertIn("numbered copy is busy", output.getvalue())
+            self.assertEqual(gate.read_gate_recovery(first.path), first)
+            self.assertFalse(second.path.exists())
+
     def test_held_nested_lease_keeps_folders_and_slot_and_allows_other_recovery(self) -> None:
         self.supply_jobserver(b"Q")
         with mock.patch.dict(os.environ, self.environment, clear=True):
@@ -409,7 +450,8 @@ sys.stdin.read(1)
             first.tokens.append(first.token(descriptor, os.read(descriptor, 1)))
             first.save()
             second.save()
-            (parent / build_folders.RECOVERY_MARKER).symlink_to(first.path)
+            marker = parent / build_folders.RECOVERY_MARKER
+            marker.symlink_to(first.path)
             nested = build_folders.BuildFolderSpec(kind="tool", parent=parent, purpose="nested", suffix_length=0)
             with build_folders.leased_build_folder(nested) as holder:
                 output = io.StringIO()
@@ -419,6 +461,7 @@ sys.stdin.read(1)
                     self.assertTrue(first.path.is_file())
                     self.assertFalse(second.path.exists())
                     self.assertEqual(self.jobserver_tokens(), b"")
+            self.assertFalse(build_folders.reclaim_build_folder(parent, wait=False))
             with gate.gate_recovery(self.checkout):
                 self.assertTrue(parent.is_dir())
                 saved = gate.read_gate_recovery(first.path)
@@ -426,6 +469,11 @@ sys.stdin.read(1)
                 self.assertTrue(saved.finished)
                 self.assertEqual(saved.folders, [str(parent)])
                 self.assertEqual(self.jobserver_tokens(), b"Q")
+                self.assertFalse(marker.is_symlink())
+            marker.symlink_to(first.path)
+            gate.recover_gate_directory(first.path.parent)
+            self.assertTrue(build_folders.reclaim_build_folder(parent, wait=False))
+            self.assertFalse(parent.exists())
 
     @gate_suites("hooks")
     def test_both_gate_modes_recover_the_private_run_record(self) -> None:
@@ -482,8 +530,8 @@ MergeGateFixture.setUpClass()
 allocate = build_folders.temporary_build_folder
 
 @contextmanager
-def hold_nested_gate(request):
-    with allocate(request) as folder:
+def hold_nested_gate(request, **options):
+    with allocate(request, **options) as folder:
         Path({str(record)!r}).write_text(json.dumps([
             str(MergeGateFixture.fixture_root.parent), str(folder)]))
         signal.pause()
@@ -548,6 +596,21 @@ gate.run_suites(Path.cwd(), full=True)
                 saved = cast(dict[str, object], json.loads(recovery.path.read_text()))
                 self.assertEqual(saved["folders"], [])
         self.assertEqual(list(parent.iterdir()), [])
+
+    def test_module_cleanup_retains_a_folder_with_a_held_nested_lease(self) -> None:
+        parent = self.root / "held-module"
+        parent.mkdir()
+        with (mock.patch.dict(os.environ, self.environment, clear=True),
+              gate.gate_recovery(self.checkout) as recovery, ExitStack() as holder):
+            with gate.gate_temporary(recovery, "hooks-test_first", parent) as folder:
+                spec = build_folders.BuildFolderSpec(kind="tool", parent=folder, purpose="nested", suffix_length=0)
+                nested = holder.enter_context(build_folders.leased_build_folder(spec))
+                output = nested / "output"
+                self.write(output, "the holder owns this file")
+            self.assertEqual(output.read_text(), "the holder owns this file")
+            self.assertEqual(build_folders.build_folder_state(nested), "held")
+            self.assertEqual(recovery.folders, [str(folder)])
+            self.assertEqual((folder / build_folders.RECOVERY_MARKER).readlink(), recovery.path)
 
     def test_gate_keeps_its_folder_and_record_when_removal_refuses(self) -> None:
         parent = self.root / "kept-gate"

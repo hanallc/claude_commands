@@ -1310,6 +1310,7 @@ class _TemporaryFolderRequest:
     request: UniqueBuildFolder | BuildFolderSpec
     cleanup: ExitStack
     keep: Callable[[], bool] | None
+    children: bool
 
 
 def _request_spec(request: BuildFolderRequest | BuildFolderSpec | _TemporaryFolderRequest) -> BuildFolderSpec:
@@ -1518,7 +1519,8 @@ def _create_build_folder(request: BuildFolderRequest | BuildFolderSpec | _Tempor
                     _locks[descriptor] = path
                     if isinstance(request, _TemporaryFolderRequest):
                         _ = request.cleanup.callback(_finish_temporary, path, directory, allocated,
-                                                     descriptor=descriptor, temporary=not stable, keep=request.keep)
+                                                     descriptor=descriptor, temporary=not stable, keep=request.keep,
+                                                     children=request.children)
                     return path
                 except BaseException:
                     _ = _locks.pop(descriptor, None)
@@ -1799,21 +1801,22 @@ def _recovery_record_present(folder: str, directory: int) -> bool:
 
 def _hold_child_leases(path: Path, stack: ExitStack, *, wait: bool = True,
                        probe_fds: list[int] | None = None) -> RefusedRemovalLease | None:
-    """Hold every lease lock below the path. Return a refusal if a lock prevents removal."""
+    """Hold leases below the path. Refuse removal for a held lock or pending recovery."""
     def unreadable(error: OSError) -> None:
         if not isinstance(error, FileNotFoundError):
             raise error
 
     for top, folders, files, directory in os.fwalk(path, follow_symlinks=False, onerror=unreadable):
-        folder = Path(top).name
+        current = Path(top)
+        folder = current.name
         has_record = (RECOVERY_MARKER in files or QUEUE_PROGRAM_SIDECAR in files
                       or ("run.json" in files and gate_recovery_folder(folder)))
-        if has_record and _folder_needs_recovery(folder, directory):
+        if current != path and has_record and _folder_needs_recovery(folder, directory):
             return RefusedRemovalLease()
         for name in files:
             stem = name.removesuffix(".lock")
             if stem != name and (stem in folders or stem + ".lease.json" in files):
-                lease = _hold_free_lease(Path(top) / stem, directory, stack, wait=wait)
+                lease = _hold_free_lease(current / stem, directory, stack, wait=wait)
                 if isinstance(lease, RefusedRemovalLease):
                     return lease
                 if probe_fds is not None and isinstance(lease, HeldFolderRemovalLease):
@@ -2008,14 +2011,28 @@ def release_removed_folder(path: Path) -> FolderPairRelease:
 
 
 def _finish_temporary(path: Path, directory: int, allocated: os.stat_result, *,
-                      descriptor: int, temporary: bool, keep: Callable[[], bool] | None) -> None:
+                      descriptor: int, temporary: bool, keep: Callable[[], bool] | None,
+                      children: bool) -> None:
     if _locks.get(descriptor) != path:
         return
     _release_build_folder(path, descriptor=descriptor)
     if keep is not None and keep():
         return
-    _ = remove_build_folder(path, lambda: _remove_folder(path, directory, allocated),
-                            temporary=temporary, dir_fd=directory)
+
+    def cleanup() -> bool:
+        if not children:
+            _remove_folder(path, directory, allocated)
+            return True
+        with ExitStack() as leases:
+            try:
+                if _hold_child_leases(path, leases, wait=False) is not None:
+                    return False
+            except (OSError, ValueError):
+                return False
+            _remove_folder(path, directory, allocated)
+        return True
+
+    _ = remove_build_folder(path, cleanup, temporary=temporary, dir_fd=directory, wait=not children)
 
 
 def _remove_free(path: Path, directory: int, *, wait: bool) -> bool:
@@ -2065,10 +2082,10 @@ def sweep_temporary_build_folders(parent: Path, *, wait: bool = True) -> None:
 
 @contextmanager
 def temporary_build_folder(request: UniqueBuildFolder | BuildFolderSpec, *,
-                           keep: Callable[[], bool] | None = None) -> Generator[Path]:
-    """Remove private work after the caller ends, including interrupted callers."""
+                           keep: Callable[[], bool] | None = None, children: bool = False) -> Generator[Path]:
+    """Remove private work on exit. With children, retain the folder if any lease is held."""
     with ExitStack() as cleanup:
-        yield create_build_folder(_TemporaryFolderRequest(request, cleanup, keep))
+        yield create_build_folder(_TemporaryFolderRequest(request, cleanup, keep, children))
 
 
 def _claim_tool_folder(tool: str, parent: Path | None, allocate: Callable[[BuildFolderSpec], Path], *,
