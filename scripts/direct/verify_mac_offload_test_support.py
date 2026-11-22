@@ -1363,6 +1363,7 @@ class VerifyMacOffloadFixture(unittest.TestCase):
             "release_token", "stop_token_renewer",
             "step_state", "publish_step_state", "lint_code_files", "tree_key", "set_verdict_keys", "after_tree_change",
             "start_tree_watch", "finish_tree_watch", "stop_tree_watch", "cancel_tree_run",
+            "defer_tree_watch_cleanup", "cleanup_tree_watch_folders",
             "record_mac_pass", "cache_record", "user_clock", "finish_mac_pass", "note_event",
             "collect_hold_wait", "collect_routing_wait", "phase_wait_start", "phase_wait_holder_flags", "phase_wait_finish", "phase_wait_finish_all",
             "finish_hold_wait", "release_wait_claim", "step_can_retry", "remote_step_kind",
@@ -1415,6 +1416,7 @@ LOCAL_RELEASE_WAIT_SCRIPT=${VERIFY_LOCAL_RELEASE_WAIT_SCRIPT:-$HOME/.claude/scri
 STEP_RECORD_ACTIVE=0 STEP_WRITES_TREE=0 STEP_RUNS_ON=any_target
 STEP_TARGET_TABLE=$(printf 'mac\teligible\t-\t%s\tmacos' "$MAC_TEST_CONFIG")
 TREE_WATCH_PID="" TREE_WATCH_DIR="" RUN_STEP_PID="" RUN_LOG=""
+TREE_WATCH_CLEANUP_DIRS=()
 VERDICT_KEY="" VERDICT_TREE_KEY="" CALL_NOTED=0
 BUILDLOG_MAC="" BUILDLOG_MAC_REASON="" BUILDLOG_MAC_HOLDER="" BUILDLOG_MAC_S=""
 BUILDLOG_MAC_COPY="" BUILDLOG_MAC_COPY_S="" BUILDLOG_MAC_COPY_COUNT="" BUILDLOG_MAC_COPY_NATEDEV_S=""
@@ -1422,7 +1424,7 @@ DOC_REPO_TOP=$PACKAGE_ROOT
 BOARD_HELPER=$TEST_REAL_DIRECT/board.sh BOARD_DIR=$UNIT_RUN_DIR BOARD_SLOT=direct
 TOKEN_USED=0 TOKEN_HELD=0 TOKEN_RENEWER_PID="" TOKEN_WAITED=0
 VERIFY_MONOTONIC_OFFSET_US=0
-trap 'finish_tree_watch; finish_hold_wait; release_token' EXIT
+trap 'stop_tree_watch; defer_tree_watch_cleanup; cleanup_tree_watch_folders; finish_hold_wait; release_token' EXIT
 '''
         invoke = 'source "$TEST_REAL_DIRECT/../lint/invoke.sh"\n'
         _ = script.write_text(invoke + functions + setup + '\neval "$1"\n', encoding="utf-8")

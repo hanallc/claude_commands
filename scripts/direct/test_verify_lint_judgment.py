@@ -127,6 +127,7 @@ class VerifyLintJudgmentTests(VerifyLintJudgmentFixture):
         functions = shell_functions(
             VERIFY, "collect_child", "verify_helper", "first_judgment_permits_repair", "read_metadata", "load_metadata", "workspace_taplo",
             "lint_code_files", "tree_key", "set_verdict_keys", "after_tree_change", "stop_tree_watch", "cancel_tree_run",
+            "defer_tree_watch_cleanup", "cleanup_tree_watch_folders",
             "start_tree_watch", "finish_tree_watch", "run_lint_judgment", "run_lint_held_sequence", "run_lint_sequence",
             "lint_copy_begin", "lint_rewrite", "lint_copy_return", "lint_copy_drop", "lint_fix_tree_key",
         )
@@ -163,6 +164,7 @@ FILTER_RUN=0
 TREE_CHANGED_STATUS=77
 TREE_WATCH_PID=""
 TREE_WATCH_DIR=""
+TREE_WATCH_CLEANUP_DIRS=()
 HOLD_WAIT_DIR="$PACKAGE_ROOT/hold-wait"
 mkdir -p "$HOLD_WAIT_DIR"
 export BUILDLOG_HOLD_WAITER_FILE="$HOLD_WAIT_DIR/waiter"
@@ -171,7 +173,7 @@ TREE_WATCH_SCRIPT="$HOME/.claude/scripts/direct/tree_watch.py"
 FIX_RETURN_SCRIPT="$HOME/.claude/scripts/mac_test/fix_return.py"
 BUILD_FOLDERS_SCRIPT="$HOME/.claude/scripts/lib/build_folders.py"
 GATE_METADATA="$TEST_METADATA"
-trap 'stop_tree_watch' EXIT
+trap 'stop_tree_watch; defer_tree_watch_cleanup; cleanup_tree_watch_folders' EXIT
 '''
         if held_clippy_failure:
             script += f"TEST_LINT_MEMORY_JUDGMENT={int(memory_judgment)}\n"

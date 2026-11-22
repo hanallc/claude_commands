@@ -21,7 +21,7 @@ import time
 import unittest
 from typing import Never, cast, override
 from unittest import mock
-from contextlib import AbstractContextManager, contextmanager, nullcontext, redirect_stdout
+from contextlib import AbstractContextManager, contextmanager, nullcontext, redirect_stderr, redirect_stdout
 
 from scripts.lib import build_folder_lock, build_folders as folders, conf, copy_record, git_files, scratch, unit_runs, process_group
 from scripts.lint.memory_test_support import ADMISSION_CONFIG_FIXTURE, config_environment, write_config_fixture
@@ -1571,6 +1571,27 @@ locks.probe_retry_seconds=0.005
         with self.assertRaises(FileNotFoundError):
             _ = folders.remove_build_folder(path, lambda: shutil.rmtree(path))
         self.assertFalse(path.with_suffix(".lock").exists())
+
+    def test_remove_command_reports_replaced_lock(self) -> None:
+        path = self.root / "tree"
+        path.mkdir()
+        lock = path.with_suffix(".lock")
+        lock_current = build_folder_lock.lock_current
+
+        def replace_lock(folder: Path, directory: int, descriptor: int) -> bool:
+            _ = lock.rename(self.root / "former.lock")
+            lock.touch()
+            return lock_current(folder, directory, descriptor)
+
+        with (mock.patch.object(build_folder_lock, "lock_current", side_effect=replace_lock),
+              redirect_stderr(errors := io.StringIO())):
+            self.assertEqual(folders.main(["remove", str(path)]), 1)
+
+        self.assertEqual(errors.getvalue().splitlines(), [
+            f"build folders: {path}: the build folder lock was removed or replaced before cleanup",
+        ])
+        self.assertTrue(path.is_dir())
+        self.assertTrue(lock.is_file())
 
     def test_release_removed_folder_only_releases_a_free_pair_for_an_absent_path(self) -> None:
         outcome = folders.FolderPairRelease

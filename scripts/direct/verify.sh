@@ -1935,6 +1935,7 @@ if [[ "$CMD" == test ]]; then
 fi
 RUN_LOG=""
 RUN_LOG_PIDS=()
+RUN_LOG_ORIGINAL_STDERR=2
 VERDICT_KEY=""
 VERDICT_TREE_KEY=""
 CLIPPY_FIX_LIMIT_REACHED=0
@@ -2028,6 +2029,7 @@ set_verdict_keys() {
 TREE_CHANGED_STATUS=77
 TREE_WATCH_PID=""
 TREE_WATCH_DIR=""
+TREE_WATCH_CLEANUP_DIRS=()
 
 after_tree_change() {
     [[ -n "$TREE_WATCH_DIR" && -s "$TREE_WATCH_DIR/fired" ]]
@@ -2037,6 +2039,42 @@ stop_tree_watch() {
     if [[ -n "$TREE_WATCH_PID" ]]; then
         collect_child "$TREE_WATCH_PID" TERM
         TREE_WATCH_PID=""
+    fi
+}
+
+defer_tree_watch_cleanup() {
+    [[ -n "$TREE_WATCH_DIR" ]] || return 0
+    TREE_WATCH_CLEANUP_DIRS+=("$TREE_WATCH_DIR")
+    TREE_WATCH_DIR=""
+}
+
+cleanup_tree_watch_folders() {
+    local folder cause status diagnostics=""
+    for folder in ${TREE_WATCH_CLEANUP_DIRS[@]+"${TREE_WATCH_CLEANUP_DIRS[@]}"}; do
+        if cause="$(verify_helper "$BUILD_FOLDERS_SCRIPT" remove "$folder" 2>&1)"; then
+            continue
+        else
+            status=$?
+        fi
+        cause="${cause:-$folder: build folder removal gave no diagnostic}"
+        diagnostics+="verify.sh: cleanup failed: ${cause//$'\n'/ } (status $status)"$'\n'
+    done
+    TREE_WATCH_CLEANUP_DIRS=()
+    if [[ -n "$diagnostics" ]]; then
+        # Let Verify exit even when the caller cannot read the diagnostic.
+        VERIFY_PY_HELPER=CLEANUP_DIAGNOSTIC_PY "$PY" -S -c '
+import os
+import signal
+import sys
+
+signal.signal(signal.SIGALRM, signal.SIG_DFL)
+signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGALRM})
+signal.alarm(1)
+try:
+    os.write(1, os.fsencode(sys.argv[1]))
+except OSError:
+    pass
+' "$diagnostics" </dev/null >&"${RUN_LOG_ORIGINAL_STDERR:-2}" 2>/dev/null &
     fi
 }
 
@@ -2086,8 +2124,6 @@ cancel_tree_run() {
     if [[ -s "$TREE_WATCH_DIR/fired.path" ]]; then changed_path=" ($(< "$TREE_WATCH_DIR/fired.path"))"; fi
     printf 'verify.sh: cancelled — the tree changed while %s ran%s, so this result would be stale. Resubmit the %s when your edits are done.\n' "$CMD" "$changed_path" "$CMD" >&2
     note_event cancelled "${RUN_STARTED}" "$(( SECONDS - RUN_STARTED ))" "" 0 "$TREE_CHANGED_STATUS"
-    verify_helper "$BUILD_FOLDERS_SCRIPT" remove "$TREE_WATCH_DIR"
-    TREE_WATCH_DIR=""
     exit "$TREE_CHANGED_STATUS"
 }
 
@@ -2096,7 +2132,7 @@ start_tree_watch() {
     [[ -z "$TREE_WATCH_PID" ]] || return 0
     TREE_WATCH_DIR="$(verify_helper "$BUILD_FOLDERS_SCRIPT" tool --tool verify-tree --owner-pid "$$")"
     set_verdict_keys --watch-start "$TREE_WATCH_DIR/start"
-    [[ -s "$TREE_WATCH_DIR/start" ]] || { verify_helper "$BUILD_FOLDERS_SCRIPT" remove "$TREE_WATCH_DIR"; TREE_WATCH_DIR=""; return 0; }
+    [[ -s "$TREE_WATCH_DIR/start" ]] || { defer_tree_watch_cleanup; return 0; }
     local scope=()
     if [[ "$CMD" == test ]]; then if [[ -n "${ARGS[0]}" ]]; then scope=(--package "${ARGS[0]}"); fi; fi
     trap 'cancel_tree_run' USR2
@@ -2108,8 +2144,7 @@ start_tree_watch() {
 finish_tree_watch() {
     stop_tree_watch
     cancel_tree_run
-    [[ -z "$TREE_WATCH_DIR" ]] || verify_helper "$BUILD_FOLDERS_SCRIPT" remove "$TREE_WATCH_DIR"
-    TREE_WATCH_DIR=""
+    defer_tree_watch_cleanup
 }
 
 # Match the checkout selection for Python on standard input.
@@ -2277,12 +2312,12 @@ LINT_COPY_ARGS=()
 
 forward_mac_runner_signal() {
     local signal_name=$1 exit_status=$2 runner_pid
+    trap '' USR2
     # TERM stops the child even while Bash ignores INT.
     if [[ "$signal_name" == INT ]]; then signal_name=TERM; fi
     find_mac_runner_pid
     stop_tree_watch
-    [[ -z "$TREE_WATCH_DIR" ]] || verify_helper "$BUILD_FOLDERS_SCRIPT" remove "$TREE_WATCH_DIR"
-    TREE_WATCH_DIR=""
+    defer_tree_watch_cleanup
     trap - INT TERM HUP
     if [[ -n "$runner_pid" ]]; then
         collect_child "$runner_pid" "$signal_name"
@@ -4249,6 +4284,9 @@ run_log_tee() {
 }
 
 start_run_log() {
+    # Keep cleanup diagnostics on the caller's stderr.
+    exec 75>&2 || exec 75>/dev/null
+    RUN_LOG_ORIGINAL_STDERR=75
     exec > >(run_log_tee)
     RUN_LOG_PIDS+=("$!")
     exec 2> >(run_log_tee >&2)
@@ -4316,8 +4354,7 @@ verify_cleanup() {
     if [[ -n "${DOC_COPY_OWNER_PID:-}" ]]; then step_close_checkout stop; fi
     if [[ -n "${COPY_RUN_WATCH_PID:-}" ]]; then collect_child "$COPY_RUN_WATCH_PID" TERM; fi
     stop_tree_watch
-    [[ -z "$TREE_WATCH_DIR" ]] || verify_helper "$BUILD_FOLDERS_SCRIPT" remove "$TREE_WATCH_DIR"
-    TREE_WATCH_DIR=""
+    defer_tree_watch_cleanup
     lint_copy_drop
     if [[ "$STEP_RECORD_ACTIVE" == 1 ]]; then
         publish_step_state waiting_hold || true
@@ -4350,6 +4387,8 @@ verify_cleanup() {
             --reason "verify ended" >/dev/null 2>&1 || true
     fi
     remove_step_record
+    finish_verify_run "$EXIT_STATUS"
+    cleanup_tree_watch_folders
     [[ -z "${VERIFY_HELPER_LOCK:-}" ]] || rm -f -- "$VERIFY_HELPER_LOCK"
 }
 # EXIT alone would report success for a failed cargo run, so branch on the
@@ -4372,7 +4411,6 @@ verify_exit() {
     else
         verify_cleanup error
     fi
-    finish_verify_run "$EXIT_STATUS"
     exit "$EXIT_STATUS"
 }
 trap 'verify_exit "$?" "$BASH_COMMAND"' EXIT
@@ -4390,7 +4428,6 @@ verify_interrupted() {
         RUN_STEP_PID=""
     fi
     verify_cleanup interrupted
-    finish_verify_run "$EXIT_STATUS"
     stop_interrupted_run_log
     if [[ "${TOKEN_WAIT_INTERRUPTED:-0}" == 1 ]]; then
         trap - INT TERM HUP

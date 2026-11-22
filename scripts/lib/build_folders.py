@@ -1757,38 +1757,73 @@ def slot_build_folder(spec: BuildFolderSpec) -> Generator[Path]:
             _release_build_folder(path)
 
 
-def remove_build_folder(path: Path, cleanup: Callable[[], object], *, temporary: bool = True,
-                        dir_fd: int | None = None, wait: bool = True) -> bool:
-    """Run cleanup under the free folder's lock, then remove temporary metadata."""
+class _BuildFolderRemoval(Enum):
+    REMOVED = "removed the build folder"
+    PROTECTED = "retain the protected build folder"
+    LOCK_HELD = "the build folder lock is held"
+    LOCK_CHANGED = "the build folder lock was removed or replaced before cleanup"
+    CLEANUP_REFUSED = "the removal callback declined cleanup"
+    FOLDER_PRESENT = "the folder still exists after cleanup"
+
+
+def _remove_build_folder(path: Path, cleanup: Callable[[], object], *, temporary: bool = True,
+                         dir_fd: int | None = None, wait: bool = True) -> _BuildFolderRemoval:
     if not may_remove_build_path(path):
-        return False
+        return _BuildFolderRemoval.PROTECTED
     with ExitStack() as parents:
         try:
             directory = dir_fd if dir_fd is not None else parents.enter_context(
                 build_folder_lock.folder_parent(path, path.parent, create=False))
         except FileNotFoundError:
             # An absent parent has no folder or metadata to lock.
-            return cleanup() is not False
+            return _BuildFolderRemoval.CLEANUP_REFUSED if cleanup() is False else _BuildFolderRemoval.REMOVED
         descriptor = build_folder_lock.open_lock(path, directory, create=True)
         try:
             if not _take_lock(descriptor, fcntl.LOCK_EX, wait=wait):
-                return False
+                return _BuildFolderRemoval.LOCK_HELD
             if not build_folder_lock.lock_current(path, directory, descriptor):
-                return False
+                return _BuildFolderRemoval.LOCK_CHANGED
             try:
                 if cleanup() is False:
-                    return False
+                    return _BuildFolderRemoval.CLEANUP_REFUSED
             except FileNotFoundError:
                 if temporary and not _folder_exists(path, directory):
                     _unlink_metadata(path, directory)
                 raise
             if _folder_exists(path, directory):
-                return False
+                return _BuildFolderRemoval.FOLDER_PRESENT
             if temporary:
                 _unlink_metadata(path, directory)
-            return True
+            return _BuildFolderRemoval.REMOVED
         finally:
             os.close(descriptor)
+
+
+def remove_build_folder(path: Path, cleanup: Callable[[], object], *, temporary: bool = True,
+                        dir_fd: int | None = None, wait: bool = True) -> bool:
+    """Run cleanup under the free folder's lock, then remove temporary metadata."""
+    return _remove_build_folder(path, cleanup, temporary=temporary, dir_fd=dir_fd, wait=wait) is _BuildFolderRemoval.REMOVED
+
+
+def _remove_build_folder_command(path: Path) -> int:
+    def cleanup() -> None:
+        with suppress(FileNotFoundError):
+            shutil.rmtree(path)
+
+    try:
+        if may_remove_build_path(path):
+            _release_build_folder(path)
+            outcome = _remove_build_folder(path, cleanup)
+        else:
+            outcome = _BuildFolderRemoval.PROTECTED
+    except (OSError, ValueError) as error:
+        cause = str(error)
+    else:
+        if outcome is _BuildFolderRemoval.REMOVED:
+            return 0
+        cause = outcome.value
+    print(" ".join(f"build folders: {path}: {cause}".splitlines()), file=sys.stderr)
+    return 1
 
 
 def expired_folder(path: Path, *, cutoff: float) -> bool:
@@ -2149,16 +2184,7 @@ def main(argv: Sequence[str]) -> int:
                                      owner_pid=cast(int, args.owner_pid)))
             return 0
         if command == "remove":
-            path = cast(Path, args.path)
-            if not may_remove_build_path(path):
-                raise PermissionError(f"{path}: retain the protected build folder")
-            _release_build_folder(path)
-            def cleanup() -> None:
-                try:
-                    shutil.rmtree(path)
-                except FileNotFoundError:
-                    pass
-            return 0 if remove_build_folder(path, cleanup) else 1
+            return _remove_build_folder_command(cast(Path, args.path))
         if command == "run-temp-path":
             from scripts.lib import unit_runs
 

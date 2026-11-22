@@ -1,11 +1,14 @@
 """Check request isolation and recovery through real helper processes."""
 from __future__ import annotations
 
+from contextlib import suppress
+import fcntl
 import json
 import os
 from pathlib import Path
 import select
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
@@ -164,6 +167,220 @@ def main():
         self.assertEqual(errors, "fixture diagnostic\n")
         status, output, errors = self.request(process, "next", "next input", "next")
         self.assertEqual((status, output["value"], output["leak"]), (0, "next", None))
+
+    def tree_watch_cleanup_script(self) -> str:
+        return shell_functions(
+            DIRECT / "verify.sh", "after_tree_change", "stop_tree_watch", "defer_tree_watch_cleanup",
+            "cleanup_tree_watch_folders", "cancel_tree_run", "start_tree_watch", "finish_tree_watch",
+            "find_mac_runner_pid", "forward_mac_runner_signal", "run_log_tee", "start_run_log",
+            "stop_interrupted_run_log", "build_seconds", "cache_record", "lint_failure_is_the_tree",
+            "finish_run", "verify_cleanup", "verify_exit", "verify_interrupted",
+        ) + r'''
+set -euo pipefail
+root=$1
+PY=$2
+CMD=test VERIFY_PACKAGE=sample COMMAND_ARGS=()
+BUILD_FOLDERS_SCRIPT=build_folders.py
+TREE_CHANGED_STATUS=77 TREE_WATCH_PID="" TREE_WATCH_DIR=""
+TREE_WATCH_CLEANUP_DIRS=()
+STEP_RECORD_ACTIVE=0 ACTIVITY_ACTIVE=0 HOLD_WAIT_DIR=""
+RUN_LOG="$root/run.log" CACHE_DIR="$root/cache" RUN_STARTED=$SECONDS
+RUN_LOG_PIDS=()
+VERDICT_KEY=fixture VERDICT_TREE_KEY=""
+mkdir -p "$CACHE_DIR" "$root/watch-without-key" "$root/watch"
+: > "$RUN_LOG"
+tree_key() { printf 'fixture\n'; }
+set_verdict_keys() { :; }
+user_clock() { printf 'fixture time\n'; }
+note_event() {
+    [[ -e "$root/call-result" ]] || printf '%s %s\n' "$1" "$6" > "$root/call-result"
+}
+verify_helper() {
+    [[ "$1" == "$BUILD_FOLDERS_SCRIPT" ]] || return 98
+    if [[ "$2" == tool ]]; then
+        printf '%s\n' "$root/watch-without-key"
+        return 0
+    fi
+    if [[ "$2" != remove || ! -s "$root/call-result" || ! -s "$root/exit-status" ]]; then
+        printf 'cleanup ran before the result was recorded\n' >&2
+        return 99
+    fi
+    if grep -qx 'ran 0' "$root/call-result" && ! grep -qx 'status=0' "$CACHE_DIR/fixture.pass"; then
+        printf 'cleanup ran before the pass was cached\n' >&2
+        return 99
+    fi
+    printf '%s\n' "$3" >> "$root/removals"
+    printf 'build folders: %s: the build folder lock was removed or replaced before cleanup\n' "$3" >&2
+    return 1
+}
+lint_copy_drop() { :; }
+stop_copy_watch() { :; }
+interrupt_hold_wait() { :; }
+apply_placement_outcome() { :; }
+finish_hold_wait() { :; }
+release_token() { :; }
+release_wait_claim() { :; }
+remove_step_record() { :; }
+finish_verify_run() { printf '%s\n' "$1" > "$root/exit-status"; }
+trap 'verify_exit "$?" "$BASH_COMMAND"' EXIT
+'''
+
+    def test_tree_watch_cleanup_failure_preserves_the_pass_record_and_log(self) -> None:
+        script = self.tree_watch_cleanup_script() + r'''
+start_run_log
+if [[ "$3" == open ]]; then
+    printf 'tests passed\n' >&2
+else
+    printf 'tests passed\n'
+fi
+IFS= read -r command
+[[ "$command" == exit ]]
+start_tree_watch
+TREE_WATCH_DIR="$root/watch"
+finish_tree_watch
+exit 0
+'''
+        for stderr_open in (True, False):
+            with self.subTest(stderr_open=stderr_open):
+                root = self.root / ("open" if stderr_open else "closed")
+                read_fd, write_fd = os.pipe()
+                os.close(read_fd)
+                with os.fdopen(write_fd, "wb") as broken_pipe, subprocess.Popen(
+                    ["bash", "-c", script, "tree-watch-cleanup", str(root), sys.executable, root.name],
+                    env=verify_test_environment(), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE if stderr_open else broken_pipe, text=True,
+                ) as process:
+                    ready_output = process.stderr if stderr_open else process.stdout
+                    assert ready_output is not None
+                    ready, _, _ = select.select([ready_output], [], [], TEST_HANG_GUARD_SECS)
+                    self.assertTrue(ready, "tee did not forward the test result")
+                    self.assertEqual(ready_output.readline(), "tests passed\n")
+                    try:
+                        _, errors = process.communicate("exit\n", timeout=TEST_HANG_GUARD_SECS)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        raise
+                    self.assertEqual(process.returncode, 0, errors)
+                paths = [root / "watch-without-key", root / "watch"]
+                self.assertEqual((root / "removals").read_text().splitlines(), [str(path) for path in paths])
+                if stderr_open:
+                    assert errors is not None
+                    cause = "the build folder lock was removed or replaced before cleanup"
+                    self.assertEqual(errors.splitlines(), [
+                        f"verify.sh: cleanup failed: build folders: {path}: {cause} (status 1)"
+                        for path in paths
+                    ])
+                self.assertEqual((root / "call-result").read_text(), "ran 0\n")
+                self.assertEqual((root / "exit-status").read_text(), "0\n")
+                self.assertEqual((root / "cache/fixture.log").read_text(), "tests passed\n")
+                self.assertEqual(list((root / "cache").glob("*.fail")), [])
+
+    @unittest.skipUnless(sys.platform == "linux", "Requires the Linux pipe capacity query.")
+    def test_full_stderr_pipe_does_not_block_interrupted_tree_watch_cleanup(self) -> None:
+        script = self.tree_watch_cleanup_script() + r'''
+RUN_STEP_PID=""
+TREE_WATCH_DIR="$root/watch"
+trap 'verify_interrupted 1' HUP
+start_run_log
+printf 'test output\n' >&2
+kill -HUP "$$"
+exit 99
+'''
+        read_fd, write_fd = os.pipe()
+        with os.fdopen(read_fd, "rb") as stderr_reader, os.fdopen(write_fd, "wb") as stderr_writer:
+            capacity = fcntl.fcntl(write_fd, fcntl.F_GETPIPE_SZ)
+            self.assertEqual(os.write(write_fd, b"x" * capacity), capacity)
+            previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGALRM})
+            try:
+                process = subprocess.Popen(
+                    ["bash", "-c", script, "tree-watch-hup", str(self.root), sys.executable],
+                    env=verify_test_environment(), stdout=subprocess.DEVNULL, stderr=stderr_writer,
+                    start_new_session=True,
+                )
+            finally:
+                _ = signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+            with process:
+                try:
+                    self.assertEqual(process.wait(timeout=10), 129)
+                    self.assertTrue(os.get_blocking(write_fd))
+                    stderr_writer.close()
+                    # Hangup means that no process still holds the write end.
+                    poller = select.poll()
+                    poller.register(stderr_reader, select.POLLHUP)
+                    self.assertEqual(poller.poll(5000), [(read_fd, select.POLLHUP)],
+                                     "The diagnostic writer still holds stderr.")
+                finally:
+                    with suppress(ProcessLookupError):
+                        os.killpg(process.pid, signal.SIGKILL)
+        self.assertEqual((self.root / "call-result").read_text(), "interrupted 129\n")
+        self.assertEqual((self.root / "exit-status").read_text(), "129\n")
+        self.assertEqual((self.root / "removals").read_text(), f"{self.root / 'watch'}\n")
+
+    def test_tree_watch_cleanup_preserves_stderr_socket_flags(self) -> None:
+        script = self.tree_watch_cleanup_script() + r'''
+interpreter=$PY
+inspect_cleanup_write() {
+    "$interpreter" -S -c '
+import os
+import sys
+
+record, source, *arguments = sys.argv[1:]
+write = os.write
+
+def inspect_write(fd, message):
+    with open(record, "w", encoding="utf-8") as flags:
+        flags.write(f"{os.get_blocking(fd)}\n")
+    return write(fd, message)
+
+os.write = inspect_write
+sys.argv = ["-c", *arguments]
+exec(source)
+' "$root/stderr-blocking" "$3" "${@:4}"
+}
+PY=inspect_cleanup_write
+TREE_WATCH_DIR="$root/watch"
+exit 0
+'''
+        reader, writer = socket.socketpair()
+        with reader, writer:
+            result = subprocess.run(
+                ["bash", "-c", script, "tree-watch-socket", str(self.root), sys.executable],
+                env=verify_test_environment(), stdout=subprocess.DEVNULL, stderr=writer.fileno(),
+                timeout=TEST_HANG_GUARD_SECS,
+            )
+            self.assertEqual(result.returncode, 0)
+            reader.settimeout(10)
+            with reader.makefile("r", encoding="utf-8") as diagnostics:
+                self.assertIn("(status 1)", diagnostics.readline())
+            self.assertTrue(os.get_blocking(writer.fileno()))
+        self.assertEqual((self.root / "stderr-blocking").read_text(), "True\n")
+
+    def test_late_tree_watch_signal_preserves_mac_interruption(self) -> None:
+        script = self.tree_watch_cleanup_script() + r'''
+TREE_WATCH_DIR="$root/watch"
+TREE_WATCH_PID=998
+MAC_RUNNER_PID=999 MAC_RUNNER_LAUNCHING=0
+MAC_RESULT_FILE="" MAC_LOG_FILE=""
+collect_child() {
+    if [[ "$1" == 999 && "$2" == TERM ]]; then
+        printf 'changed\n' > "$root/watch/fired"
+        kill -USR2 "$$"
+    fi
+}
+trap 'cancel_tree_run' USR2
+trap 'forward_mac_runner_signal TERM 143' TERM
+kill -TERM "$$"
+exit 99
+'''
+        result = subprocess.run(["bash", "-c", script, "tree-watch-mac-term", str(self.root), sys.executable],
+                                env=verify_test_environment(), capture_output=True, text=True,
+                                timeout=TEST_HANG_GUARD_SECS)
+        self.assertEqual(result.returncode, 143, result.stderr)
+        self.assertEqual((self.root / "watch/fired").read_text(), "changed\n")
+        self.assertEqual((self.root / "call-result").read_text(), "interrupted 143\n")
+        self.assertEqual((self.root / "exit-status").read_text(), "143\n")
+        self.assertEqual((self.root / "removals").read_text(), f"{self.root / 'watch'}\n")
+        self.assertIn(f"verify.sh: cleanup failed: build folders: {self.root / 'watch'}:", result.stderr)
 
     def test_shell_environment_matches_env_for_exported_values(self) -> None:
         _ = self.program.write_text('''import json, os
