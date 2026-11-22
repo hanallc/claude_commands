@@ -111,24 +111,14 @@ As built (checkpoint 74dd0dc24e on `natedev-postmaster-relaylog`, which contains
 - A write failure prints one line to stderr and never blocks the relay. The outcome, the printed line and the exit code stay the same.
 - Tests: rows in `scripts/message/test_send.py` read `relay_mismatches(state)`. As-built: `docs/as-built/session-roster.md`.
 
-### Phase 5 — Hooks without a signal handler  · status: todo
+### Phase 5 — Hooks without a signal handler  · status: done
 
-The code is on branch `natedev-postmaster-nosig` (worktree `~/worktrees/claude/natedev-postmaster/nosig`, from origin/main 6401c0f801).
+As built (checkpoint 416bb6a5f4 on `natedev-postmaster-nosig`, which contains main as of 00:37 EST):
 
-#### Work Order
-
-
-**Goal:** The two conversation-pause hooks install no signal handler and keep the same behavior.
-
-Order from the showrunner (no-signal-handlers rule; sdlc verify inventory on main 06586b2227): "Remove the signal handler and keep the same behavior without it. One small change. Add no other guard or check."
-
-Sites: `scripts/hooks/stop-conversation-pause.py:73` and `scripts/hooks/user-prompt-submit-conversation-pause.py:95`. Each sets `signal.signal(signal.SIGALRM, budget_spent)` and `signal.alarm(budget)` around the `conversation_pause` work, and raises `HookBudgetSpent` when `CONVERSATION_PAUSE_HOOK_BUDGET` seconds pass.
-
-1. Read how main already removed signal handlers elsewhere, and use the same idiom: commit `ab7d6d35e7` on `origin/nosighook` (`scripts/hooks/hook_dispatch.py`), and `5194d0d463` on `origin/devtools-nosiggate`. Read them with `git -C <worktree> show <hash>`.
-2. Replace the SIGALRM budget in both hooks. Keep the budget value, the env override, the give-up result and its message, and what the hook prints and returns when the budget is spent.
-3. Share one helper if both hooks need the same code. Do not copy it twice.
-4. Tests: keep the existing budget tests passing in meaning; change an assertion only where it names the signal mechanism, and name each change in your reply. Add a row that proves no signal handler is installed.
-5. As-built: correct any doc line that names SIGALRM for these hooks.
+- `scripts/hooks/stop-conversation-pause.py` and `scripts/hooks/user-prompt-submit-conversation-pause.py` install no signal handler. Each `__main__` calls `main(budgeted=True)`; direct calls to `main()` run in the caller's process.
+- `scripts/hooks/hook_budget.py` (standard library only) starts the deadline before the hook imports `conversation_pause`. It forks a `setsid` supervisor, which forks the worker. The supervisor ends the worker group through `scripts/lib/process_group.send_process_group` at the deadline or when the hook's owner pipe closes, and removes the worker's `.scheduled-prompts-<supervisor>-<worker>-*` temporary files.
+- At the deadline the hook prints `conversation-pause: HookBudgetSpent: gave up after N seconds` and exits 0, as before. `CONVERSATION_PAUSE_HOOK_BUDGET` still sets the budget (default 5 s).
+- Tests: `scripts/hooks/test_conversation_pause_processes.py` (no signal handler, stalled import, temporary-file cleanup, killed hook ends its worker). As-built: `docs/as-built/conversation-pause.md`.
 
 ## Acceptance gate
 
