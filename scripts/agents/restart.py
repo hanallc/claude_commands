@@ -17,9 +17,9 @@ import socket
 import subprocess
 import sys
 import time
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping
 from contextlib import ExitStack, nullcontext, redirect_stderr, redirect_stdout, suppress
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextvars import ContextVar, copy_context
 from threading import Event
 from dataclasses import dataclass, field, replace
@@ -27,7 +27,7 @@ from enum import Enum
 from functools import partial
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, Protocol, TypedDict, cast
+from typing import TYPE_CHECKING, Literal, Protocol, TypedDict, TypeVar, cast
 from importlib import import_module
 from uuid import uuid4
 
@@ -63,6 +63,7 @@ class AllRestartAccounts:
 ALL_RESTART_ACCOUNTS = AllRestartAccounts()
 NO_RESTART_MESSAGE = herdr.NoOpeningPrompt()
 DEFAULT_RESTART_CAUSE = "agents restart ran"
+NO_UNCONFIRMED: frozenset[staff.StaffId] = frozenset()
 
 
 def account_matches(kind: Literal["claude", "codex"], environment: dict[str, str],
@@ -376,13 +377,16 @@ class BulkReport:
         self.issues.update({key: FollowUp(**issue) for key, issue in data["issues"].items()})
         self.inherited.update(self.issues)
 
-    def lines(self, *, dry_run: bool = False, failure: FollowUp | None = None) -> list[str]:
+    def lines(self, *, dry_run: bool = False, failure: FollowUp | None = None,
+              unconfirmed: frozenset[staff.StaffId] = NO_UNCONFIRMED) -> list[str]:
         status = "stopped" if self.command == "agents stop --all" else "back"
         targets = self.targets.keys() if self.fixed_targets is None else self.fixed_targets
-        completed = targets & self.completed
+        completed = (targets & self.completed) - unconfirmed
         suffix = " (dry run)" if dry_run else ""
         lines = [f"{self.command}: {len(completed)} of {len(targets)} sessions {status}{suffix}.", *self.preview]
         issues = dict(self.issues)
+        for key in unconfirmed:
+            _ = issues.pop(key, None)
         missing = targets - completed - issues.keys()
         if failure is not None:
             if not missing and failure not in issues.values():
@@ -410,9 +414,10 @@ class BulkReport:
             actions.append("The affected directors run worker.py restore.")
         if any(item.director_check for item in issues.values()):
             actions.append("The affected directors check the continuation message.")
+        inherited = self.inherited - unconfirmed
         operator_steps = dict.fromkeys(item.step for key, item in issues.items()
-                                       if item.operator and key not in self.inherited)
-        pending = sum(item.operator for key, item in issues.items() if key not in self.inherited)
+                                       if item.operator and key not in inherited)
+        pending = sum(item.operator for key, item in issues.items() if key not in inherited)
         if pending and not units:
             count = "1 item needs a step" if pending == 1 else f"{pending} items need a step"
             actions.append(f"{count}: {' '.join(operator_steps)}")
@@ -421,13 +426,14 @@ class BulkReport:
         elif actions and not any(item.operator for item in issues.values()):
             actions.append("Nate has no step.")
         actions.extend(f"{item.name}: {item.step}" for item in sorted(
-            (item for key, item in issues.items() if key in self.inherited), key=lambda issue: issue.name))
+            (item for key, item in issues.items() if key in inherited), key=lambda issue: issue.name))
         lines.append(" ".join(actions) or "Nothing for you to do.")
         return lines
 
 
 _BULK_REPORT: ContextVar[BulkReport | None] = ContextVar("_BULK_REPORT", default=None)
 _DETACHED_CHILD: ContextVar[bool] = ContextVar("_DETACHED_CHILD", default=False)
+_CAPTURE_RESTART_RESULTS: ContextVar[Callable[[], None] | None] = ContextVar("_CAPTURE_RESTART_RESULTS", default=None)
 
 
 def _retry_command(arguments: list[str]) -> str:
@@ -449,7 +455,10 @@ def _create_log(files: ExitStack, path: Path) -> io.FileIO:
 
 
 def _claim_log(log: Path) -> bool:
-    return create_text_atomic(log.with_suffix(".claim"), f"{os.getpid()}\n")
+    path = log.with_suffix(".claim")
+    if path.exists():
+        return False
+    return create_text_atomic(path, f"{os.getpid()}\n")
 
 
 def _owns_log_claim(log: Path) -> bool:
@@ -476,11 +485,65 @@ class DetachedReadinessFailed(OSError):
 class DetachedSignal(BaseException):
     def __init__(self, number: signal.Signals) -> None:
         self.number: signal.Signals = number
+        self.unconfirmed: frozenset[staff.StaffId] = frozenset()
         super().__init__(f"The detached command received {number.name}")
 
 
 class DetachedRowsFailed(Exception):
     """One or more session results contain unexpected errors."""
+
+
+@dataclass(frozen=True)
+class RestartTaskFailed:
+    error: BaseException
+
+
+_Result = TypeVar("_Result")
+
+
+def _collect_restart_results(jobs: Mapping[staff.StaffId, Callable[[], _Result]],
+                             record: Callable[[staff.StaffId, _Result | RestartTaskFailed], None]) -> None:
+    finished: dict[staff.StaffId, _Result | RestartTaskFailed] = {}
+    interrupted_results: dict[staff.StaffId, _Result | RestartTaskFailed] | None = None
+    recorded: set[staff.StaffId] = set()
+
+    def capture() -> None:
+        nonlocal interrupted_results
+        interrupted_results = finished.copy()
+
+    def run(identity: staff.StaffId, job: Callable[[], _Result]) -> _Result | RestartTaskFailed:
+        result: _Result | RestartTaskFailed
+        try:
+            result = job()
+        except BaseException as error:
+            result = RestartTaskFailed(error)
+        # Publish the result as soon as the session task ends.
+        finished[identity] = result
+        return result
+
+    pool = ThreadPoolExecutor(max_workers=min(16, len(jobs)))
+    interrupted = False
+    capture_token = _CAPTURE_RESTART_RESULTS.set(capture)
+    try:
+        futures: dict[staff.StaffId, Future[_Result | RestartTaskFailed]] = {}
+        for identity, job in jobs.items():
+            futures[identity] = pool.submit(copy_context().run, run, identity, job)
+        for identity, future in futures.items():
+            record(identity, future.result())
+            recorded.add(identity)
+    except DetachedSignal as error:
+        interrupted = True
+        pool.shutdown(wait=False, cancel_futures=True)
+        results = interrupted_results if interrupted_results is not None else finished.copy()
+        error.unconfirmed = frozenset(jobs.keys() - results.keys())
+        for identity, result in results.items():
+            if identity not in recorded:
+                record(identity, result)
+        raise
+    finally:
+        _CAPTURE_RESTART_RESULTS.reset(capture_token)
+        if not interrupted:
+            pool.shutdown()
 
 
 def _record_stop_plan(report: BulkReport, rows: Iterable[staff.StaffRow]) -> None:
@@ -564,10 +627,12 @@ class WorkerRestoreReports:
         _owner, result = attempt
         return result.restored | (result.skipped.keys() - result.failures.keys())
 
-    def report(self) -> None:
+    def report(self, *, unconfirmed: frozenset[staff.StaffId] = NO_UNCONFIRMED) -> None:
         owners: dict[staff.StaffId, staff.StaffRow] = {}
         scopes: dict[staff.StaffId, dict[staff.StaffId, RestoreReport]] = {}
-        for scope, (owner, result) in self.attempts.items():
+        for scope, (owner, result) in self.attempts.copy().items():
+            if scope in unconfirmed:
+                continue
             owners[owner.id] = owner
             scopes.setdefault(owner.id, {})[scope] = result
         for owner in sorted(owners.values(), key=lambda row: (row.name, row.id)):
@@ -1803,41 +1868,47 @@ def _restart(pane_evidence: ExitStack, *, stop_all: bool, dry_run: bool, only: t
         stop_failed = False
         recorded = [Event() for _ in range(len(holders) + 1)]
         recorded[0].set()
-        with ThreadPoolExecutor(max_workers=min(16, len(holders))) as pool:
-            futures = [(holder, pool.submit(copy_context().run, stop_holder, holder, recorded[index], recorded[index + 1]))
-                       for index, holder in enumerate(tuple(holders.values()))]
-            for holder, future in futures:
-                try:
-                    stopped, workers = future.result()
-                    unconfirmed_workers.update(workers)
+        stopping = holders.copy()
+        stop_jobs = {holder.id: partial(stop_holder, holder, recorded[index], recorded[index + 1])
+                     for index, holder in enumerate(stopping.values())}
+
+        def record_stop(identity: staff.StaffId, result: tuple[bool, tuple[staff.StaffId, ...]] | RestartTaskFailed) -> None:
+            nonlocal stop_failed
+            holder = stopping[identity]
+            try:
+                if isinstance(result, RestartTaskFailed):
+                    raise result.error
+                stopped, workers = result
+                unconfirmed_workers.update(workers)
+                if not stopped:
+                    unconfirmed.add(identity)
+                if report is not None and after_stop is AfterStop.KEEP_STOPPED:
+                    unresolved = set(workers)
                     if not stopped:
-                        unconfirmed.add(holder.id)
-                    if report is not None and after_stop is AfterStop.KEEP_STOPPED:
-                        unresolved = set(workers)
-                        if not stopped:
-                            unresolved.add(holder.id)
-                        for member in members_by_holder[holder.id]:
-                            if staff.StaffId(member) not in unresolved:
-                                report.finish(member)
-                except staff.StaffRefused as error:
-                    _ = holders.pop(holder.id)
-                    _anomaly(holder, error)
-                    if report is not None:
-                        for member in members_by_holder[holder.id]:
-                            if member != holder.id:
-                                report.failure(member, report.targets[member],
-                                    f"Could not lock all rows in {holder.name}")
-                except errors as error:
-                    unconfirmed.add(holder.id)
-                    if holder.id in observed.pane_owners:
-                        unconfirmed_workers.update(child.id for child in record.find(kind="worker", parent=holder.id)
-                                                   if child.id in selected_ids)
-                    _anomaly(holder, error)
-                except BaseException as error:
-                    if report is None or not _DETACHED_CHILD.get() or isinstance(error, DetachedSignal):
-                        raise
-                    report.detached_row_failure(holder.id, error)
-                    stop_failed = True
+                        unresolved.add(identity)
+                    for member in members_by_holder[identity]:
+                        if staff.StaffId(member) not in unresolved:
+                            report.finish(member)
+            except staff.StaffRefused as error:
+                _ = holders.pop(identity, None)
+                _anomaly(holder, error)
+                if report is not None:
+                    for member in members_by_holder[identity]:
+                        if member != identity:
+                            report.failure(member, report.targets[member], f"Could not lock all rows in {holder.name}")
+            except errors as error:
+                unconfirmed.add(identity)
+                if identity in observed.pane_owners:
+                    unconfirmed_workers.update(child.id for child in record.find(kind="worker", parent=identity)
+                                               if child.id in selected_ids)
+                _anomaly(holder, error)
+            except BaseException as error:
+                if report is None or not _DETACHED_CHILD.get() or isinstance(error, DetachedSignal):
+                    raise
+                report.detached_row_failure(identity, error)
+                stop_failed = True
+
+        _collect_restart_results(stop_jobs, record_stop)
         if stop_failed:
             raise DetachedRowsFailed("One or more session stops failed")
     if after_stop == AfterStop.KEEP_STOPPED:
@@ -1879,6 +1950,17 @@ def _restart(pane_evidence: ExitStack, *, stop_all: bool, dry_run: bool, only: t
     resume_policies = {record.rows_by_id[identity].current_session: policy
                        for identity, policy in worker_policies.items() if identity not in blocked_workers}
     record_save_failures: dict[str, str] = {}
+
+    def report_record_save_failures(unconfirmed: frozenset[staff.StaffId] = NO_UNCONFIRMED) -> None:
+        if report is None:
+            return
+        step = "Nate sends this error to the efficiency unit."
+        for member, reason in record_save_failures.copy().items():
+            if member in unconfirmed:
+                continue
+            issue = report.issues.get(member)
+            report.issues[member] = (FollowUp(report.targets[member], reason, step, operator=True) if issue is None else
+                replace(issue, reason=f"{issue.reason.rstrip('.')}. {reason}", step=f"{issue.step} {step}", operator=True))
 
     def remove_started(holder: staff.StaffRow, *, started_holder: bool) -> None:
         resolved = resume_checks.worker_restores.resolved(holder.id)
@@ -1976,26 +2058,39 @@ def _restart(pane_evidence: ExitStack, *, stop_all: bool, dry_run: bool, only: t
     failed_starts: list[FailedHolderStart] = []
     start_failed = False
     if holders:
-        with ThreadPoolExecutor(max_workers=min(16, len(holders))) as pool:
-            futures = [(holder, present and index == 0,
-                        pool.submit(copy_context().run, start_holder, holder, present and index == 0))
-                       for index, holder in enumerate(holders.values())]
-            for holder, focus, future in futures:
-                try:
-                    record_start(holder, future.result())
-                except ClaudeTrustWriteFailed:
-                    exit_code = 1
-                    if report is not None:
-                        report.failure(holder.id, holder.name, "Could not write the account trust record")
-                except staff.StaffRefused as error:
-                    _anomaly(holder, error)
-                except errors as error:
-                    failed_starts.append(FailedHolderStart(holder, focus, error))
-                except BaseException as error:
-                    if report is None or not _DETACHED_CHILD.get() or isinstance(error, DetachedSignal):
-                        raise
-                    report.detached_row_failure(holder.id, error)
-                    start_failed = True
+        focused = next(iter(holders)) if present else None
+        start_jobs = {holder.id: partial(start_holder, holder, holder.id == focused) for holder in holders.values()}
+
+        def finish_start(identity: staff.StaffId, result: RestartDisposition | RestartTaskFailed) -> None:
+            nonlocal exit_code, start_failed
+            holder = holders[identity]
+            try:
+                if isinstance(result, RestartTaskFailed):
+                    raise result.error
+                record_start(holder, result)
+            except ClaudeTrustWriteFailed:
+                exit_code = 1
+                if report is not None:
+                    report.failure(identity, holder.name, "Could not write the account trust record")
+            except staff.StaffRefused as error:
+                _anomaly(holder, error)
+            except errors as error:
+                failed_starts.append(FailedHolderStart(holder, identity == focused, error))
+            except BaseException as error:
+                if report is None or not _DETACHED_CHILD.get() or isinstance(error, DetachedSignal):
+                    raise
+                report.detached_row_failure(identity, error)
+                start_failed = True
+
+        try:
+            _collect_restart_results(start_jobs, finish_start)
+        except DetachedSignal as error:
+            resume_checks.worker_restores.report(unconfirmed=error.unconfirmed)
+            for failed in failed_starts:
+                if not isinstance(failed.error, WorkerRestoreIncomplete):
+                    _anomaly(failed.holder, failed.error)
+            report_record_save_failures(error.unconfirmed)
+            raise
     if start_failed:
         resume_checks.worker_restores.report()
         for failed in failed_starts:
@@ -2049,12 +2144,7 @@ def _restart(pane_evidence: ExitStack, *, stop_all: bool, dry_run: bool, only: t
         except (OSError, ValueError, RuntimeError, subprocess.SubprocessError, worktrees.Refused) as error:
             print(f"restart: kept old worktree links: {_error_reason(error)}", file=sys.stderr)
     resume_checks.report()
-    if report is not None:
-        step = "Nate sends this error to the efficiency unit."
-        for member, reason in record_save_failures.items():
-            issue = report.issues.get(member)
-            report.issues[member] = (FollowUp(report.targets[member], reason, step, operator=True) if issue is None else
-                replace(issue, reason=f"{issue.reason.rstrip('.')}. {reason}", step=f"{issue.step} {step}", operator=True))
+    report_record_save_failures()
     return exit_code
 
 
@@ -2080,6 +2170,7 @@ def _save_detached_report(log: io.FileIO, result: str) -> None:
 
 
 def _run_detached_child(action: Callable[[], int], report: BulkReport, log_fd: int, *, dry_run: bool) -> int:
+    claimed = False
     result_offset = None
     output = io.StringIO()
     stage = "Could not claim the log"
@@ -2093,14 +2184,18 @@ def _run_detached_child(action: Callable[[], int], report: BulkReport, log_fd: i
         if received_signal is None:
             received_signal = DetachedSignal(signal.Signals(number))
             if not reporting_failure:
+                capture = _CAPTURE_RESTART_RESULTS.get()
+                if capture is not None:
+                    capture()
                 raise received_signal
 
     # Update test_detached_child_reports_each_fault_after_the_claim when you change these steps.
     try:
-        for number in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
+        for number in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT, signal.SIGQUIT):
             _ = handlers.callback(signal.signal, number, signal.getsignal(number))
             _ = signal.signal(number, interrupt)
-        if not _claim_log(report.log):
+        claimed = _claim_log(report.log)
+        if not claimed:
             return 0
 
         stage = f"Could not write the log at {report.log}. The command did not start"
@@ -2134,17 +2229,18 @@ def _run_detached_child(action: Callable[[], int], report: BulkReport, log_fd: i
         if isinstance(error, SystemExit):
             lines = output.getvalue().strip().splitlines()
             detail = lines[-1] if lines else detail
-        if not _owns_log_claim(report.log):
+        if not claimed and not _owns_log_claim(report.log):
             print(f"{stage} at {report.log}. {detail}", file=sys.stderr, flush=True)
             return 2
         prefix = ""
         if isinstance(error, StopPlanWriteFailed):
             stage = f"Could not write the log at {report.log}. The command did not start"
             prefix = "\n"
-        if report.stop_plan_recorded or result_offset is not None:
+        unconfirmed = error.unconfirmed if isinstance(error, DetachedSignal) else NO_UNCONFIRMED
+        if report.stop_plan_recorded or result_offset is not None or unconfirmed:
             step = "Nate sends this error to the efficiency unit."
         failure = FollowUp(report.command, f"{stage}. {detail}", step, operator=True)
-        result = prefix + "\n".join(report.lines(dry_run=dry_run, failure=failure)) + "\n"
+        result = prefix + "\n".join(report.lines(dry_run=dry_run, failure=failure, unconfirmed=unconfirmed)) + "\n"
         try:
             with io.FileIO(log_fd, "wb", closefd=False) as log:
                 if result_offset is not None:

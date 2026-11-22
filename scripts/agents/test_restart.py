@@ -51,7 +51,7 @@ from scripts.agents import member_account, shutdown_record, stop_resume, pane_re
 from scripts.lib import conf, file_lock, unit_runs, resume_message
 from scripts.lib.transcript_test_support import compressed_copy
 from scripts.lib.test_models_registry import claude_catalog_environment, write_registry
-from scripts.lib.atomic_file import write_text_atomic
+from scripts.lib.atomic_file import create_text_atomic, write_text_atomic
 from scripts.production.staff_test_support import fixture_member
 from scripts.herdr.fake_herdr import herdr_listener
 from scripts.direct import pass_record, progress_history
@@ -1907,7 +1907,7 @@ class RestartTests(RestartTestCase):
 
     def test_self_stop_keeps_the_child_report_after_each_launcher_result(self) -> None:
         row = self.rows[0]
-        for outcome in ("exit 0", "signal", "timeout"):
+        for outcome in ("exit 0", "signal", "timeout", "full disk"):
             with self.subTest(outcome=outcome):
                 self.assert_child_report_survives_launcher(outcome, row)
 
@@ -1915,6 +1915,11 @@ class RestartTests(RestartTestCase):
         log_path = Path()
         written = b""
         notification = self.root / f"notify-{outcome}"
+
+        def create_claim(path: Path, content: str) -> bool:
+            if outcome == "full disk" and path.exists():
+                raise OSError(errno.ENOSPC, "The claim folder is full")
+            return create_text_atomic(path, content)
 
         def launch(argv: list[str], **_options: object) -> subprocess.CompletedProcess[str]:
             nonlocal log_path, written
@@ -1939,11 +1944,13 @@ class RestartTests(RestartTestCase):
               patch.object(restart, "live_rows", return_value=restart.CompleteLiveRows([row])),
               patch.object(restart, "stop_row", return_value=True) as stop,
               patch.dict(os.environ, {"CODEX_THREAD_ID": str(row.current_session)}),
+              patch.object(restart, "create_text_atomic", side_effect=create_claim) as create,
               patch.object(subprocess, "run", side_effect=launch), redirect_stdout(io.StringIO()) as output):
             notifier.bind(str(notification))
             notifier.setblocking(False)
             self.assertEqual(shutdown.main(["stop", "--all"]), 0)
         stop.assert_called_once()
+        create.assert_called_once()
         self.assertEqual(log_path.read_bytes(), written)
         self.assertIn(b"agents stop --all: 1 of 1 sessions stopped.", written)
         self.assertEqual(output.getvalue().splitlines(), [
@@ -2026,6 +2033,8 @@ class RestartTests(RestartTestCase):
         for step, detail, completed in (
             ("claim publication", "The claim was interrupted", ()),
             ("claim close", "Input/output error", ()),
+            ("claim read", "Readiness failed with an unreadable claim", ()),
+            ("claim read and log write", "Readiness failed with an unreadable claim", ()),
             ("log open", "Could not open the log", ()),
             ("readiness", "The readiness check failed", ()),
             ("staff read", "The staff record is unreadable", ()),
@@ -2043,8 +2052,12 @@ class RestartTests(RestartTestCase):
         for step in ("stop both", "resume both"):
             with self.subTest(step=step):
                 self.assert_detached_fault_report(step, "First session error", (), second_detail="Second session error")
-        with self.subTest(step="SIGTERM"):
-            self.assert_detached_signal_report()
+        for number in (signal.SIGTERM, signal.SIGQUIT):
+            with self.subTest(step="readiness", number=number):
+                self.assert_detached_signal_report(number)
+        for operation in ("stop", "restart"):
+            with self.subTest(step="collection", operation=operation):
+                self.assert_detached_signal_report(signal.SIGTERM, operation=operation)
 
     def detached_fault_arguments(self, command: str, *, resuming: bool = False) -> list[str]:
         rows = self.rows[:2]
@@ -2057,41 +2070,117 @@ class RestartTests(RestartTestCase):
         return ["restart" if resuming else "stop", "--all", "--only", ",".join(row.id for row in rows),
                 "--parent-report", json.dumps(data)]
 
-    def assert_detached_signal_report(self) -> None:
-        path = self.root / "signal.log"
+    def assert_detached_signal_report(self, number: signal.Signals, *,
+                                      operation: Literal["stop", "restart"] | None = None) -> None:
+        path = self.root / f"{number.name}-{operation or 'readiness'}.log"
         script = """\
+import json
 import os
+import resource
 import runpy
-import signal
 import sys
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
+from threading import Event
 
+number = int(sys.argv.pop(1))
+operation = sys.argv.pop(1)
 ready_fd = int(sys.argv[sys.argv.index('--ready-fd') + 1])
 write = os.write
+resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
 
-def signal_at_readiness(fd, data):
+def interrupt():
+    os.kill(os.getpid(), number)
+    raise RuntimeError('The signal did not interrupt the command')
+
+def configure_collection():
+    from scripts.herdr import herdr
+    from scripts.production import staff
+
+    restart = sys.modules['scripts.agents.restart']
+    data = json.loads(sys.argv[sys.argv.index('--parent-report') + 1])
+    rows = tuple(staff.StaffRow(staff.StaffId(key), 'unit', name, staff.StaffRoot(),
+                               current_session=staff.StaffId(f'conversation-{key}'),
+                               unit_type=staff.UnitDetails('direct')) for key, name in data['targets'].items())
+    record = staff.StaffSnapshot(rows)
+    pending = Event()
+
+    def hold_first(row):
+        if row.id == rows[0].id:
+            pending.set()
+            Event().wait()
+
+    def stop_row(row, *args, **kwargs):
+        if operation == 'stop':
+            hold_first(row)
+        return True
+
+    def start_row(row, *args, **kwargs):
+        hold_first(row)
+        return ''
+
+    class CollectionPool(ThreadPoolExecutor):
+        count = 0
+
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            CollectionPool.count += 1
+            self.inject = CollectionPool.count == (1 if operation == 'stop' else 2)
+            self.futures = []
+
+        def submit(self, fn, *args):
+            future = super().submit(fn, *args)
+            if self.inject:
+                self.futures.append(future)
+                if len(self.futures) == 1:
+                    future.result = self.interrupt_collection
+            return future
+
+        def interrupt_collection(self):
+            self.futures[1].result(timeout=5)
+            if not pending.wait(5) or self.futures[0].done():
+                raise RuntimeError('The first session did not remain in progress')
+            interrupt()
+
+    staff.initial_snapshot = lambda: record
+    staff.row_operation = lambda *args: nullcontext()
+    herdr.restore_server = lambda *args, **kwargs: None
+    restart._observations = lambda *args: restart.RestartObservations(herdr.CodexConversations({}, ()), {}, frozenset(), {})
+    restart.live_rows = lambda *args, **kwargs: restart.CompleteLiveRows(list(rows))
+    restart.stop_row = stop_row
+    restart.start_row = start_row
+    restart.ThreadPoolExecutor = CollectionPool
+
+def on_ready(fd, data):
     if fd == ready_fd:
-        os.kill(os.getpid(), signal.SIGTERM)
-        raise RuntimeError('SIGTERM did not interrupt the command')
+        os.write = write
+        if not operation:
+            interrupt()
+        configure_collection()
     return write(fd, data)
 
-os.write = signal_at_readiness
+os.write = on_ready
 runpy.run_module('scripts.agents.restart', run_name='__main__', alter_sys=True)
 """
-        command = "agents stop --all"
+        resuming = operation == "restart"
+        command = "agents restart" if resuming else "agents stop --all"
+        state = "back" if resuming else "stopped"
         read_fd, ready_fd = os.pipe()
         with os.fdopen(read_fd, "rb"), os.fdopen(ready_fd, "wb"), path.open("ab") as log:
             _ = log.write(f"{path}\n".encode())
             log.flush()
-            result = subprocess.run([sys.executable, "-c", script, "--log", str(path), "--log-fd", str(log.fileno()),
-                                     "--ready-fd", str(ready_fd), *self.detached_fault_arguments(command)],
+            result = subprocess.run([sys.executable, "-c", script, str(number), operation or "",
+                                     "--log", str(path), "--log-fd", str(log.fileno()), "--ready-fd", str(ready_fd),
+                                     *self.detached_fault_arguments(command, resuming=resuming)],
                                     cwd=Path(restart.__file__).resolve().parents[2],
                                     pass_fds=(ready_fd, log.fileno()), capture_output=True, timeout=10, check=False)
-        self.assertEqual(result.returncode, -signal.SIGTERM, result.stderr.decode())
+        self.assertEqual(result.returncode, -number, result.stderr.decode())
         self.assertEqual(result.stdout, b"")
         self.assertEqual(result.stderr, b"")
-        detail = "The detached command received SIGTERM"
-        self.assert_detached_fault_log(path, command, "stopped", (), (detail, detail),
-                                       "Nate runs agents stop --all there.")
+        detail = f"The detached command received {number.name}"
+        recovery = ("Nate sends this error to the efficiency unit." if operation else
+                    "Nate runs agents stop --all there.")
+        self.assert_detached_fault_log(path, command, state, (1,) if operation else (), (detail, detail), recovery)
 
     def assert_detached_fault_report(self, step: str, detail: str, completed: tuple[int, ...], *,
                                      second_detail: str | None = None) -> None:
@@ -2107,6 +2196,7 @@ runpy.run_module('scripts.agents.restart', run_name='__main__', alter_sys=True)
         link = os.link
         sync = os.fsync
         file_io = io.FileIO
+        read_bytes = Path.read_bytes
         write = restart._write_log  # pyright: ignore[reportPrivateUsage]
 
         def fail_at(check: str, error: BaseException) -> None:
@@ -2129,7 +2219,14 @@ runpy.run_module('scripts.agents.restart', run_name='__main__', alter_sys=True)
             fail_at("log open", OSError(detail))
             return file_io(descriptor, mode, closefd=closefd)
 
+        def read_file(target: Path) -> bytes:
+            if step.startswith("claim read") and target == path.with_suffix(".claim"):
+                raise OSError(errno.EIO, "Could not read the claim")
+            return read_bytes(target)
+
         def ready(*_args: object, **_options: object) -> None:
+            if step.startswith("claim read"):
+                fail_at(step, OSError(detail))
             fail_at("readiness", SystemExit(detail))
 
         def snapshot() -> staff.StaffSnapshot:
@@ -2153,6 +2250,8 @@ runpy.run_module('scripts.agents.restart', run_name='__main__', alter_sys=True)
             return ""
 
         def write_log(log: io.FileIO, result: str) -> None:
+            if step == "claim read and log write":
+                raise OSError(errno.EIO, "Could not save the report")
             if result.startswith("Sessions to stop"):
                 fail_at("plan write", OSError(detail))
             elif step == "report write" and not injected:
@@ -2168,6 +2267,7 @@ runpy.run_module('scripts.agents.restart', run_name='__main__', alter_sys=True)
 
         with (path.open("ab") as log, patch.object(os, "close", side_effect=close_claim),
               patch.object(os, "link", side_effect=publish_claim),
+              patch.object(Path, "read_bytes", read_file),
               patch.object(io, "FileIO", side_effect=open_log),
               patch.object(restart, "_notify_log_claim", side_effect=ready),
               patch.object(staff, "initial_snapshot", side_effect=snapshot),
@@ -2181,20 +2281,31 @@ runpy.run_module('scripts.agents.restart', run_name='__main__', alter_sys=True)
             self.inherited_log = log.fileno()
             self.assertEqual(self.detached_stop(path, arguments), 2)
         self.assertTrue(injected)
-        self.assertEqual(errors.getvalue(), "")
-        before_stop = {"claim publication", "claim close", "log open", "readiness", "staff read", "plan write", "plan sync"}
+        contents = path.read_text()
+        if step == "claim read and log write":
+            error_line, _, result = errors.getvalue().partition("\n")
+            self.assertIn(f"Could not finish writing the log at {path}", error_line)
+            self.assertIn("Could not save the report", error_line)
+            self.assertEqual(contents, f"{path}\n")
+            contents += result
+        else:
+            self.assertEqual(errors.getvalue(), "")
+        before_stop = {"claim publication", "claim close", "claim read", "claim read and log write",
+                       "log open", "readiness", "staff read", "plan write", "plan sync"}
         if step in before_stop:
             stop.assert_not_called()
         self.assertEqual(start.call_count, len(rows) if resuming else 0)
         self.assertEqual(path.with_suffix(".claim").read_text(), f"{os.getpid()}\n")
         recovery = ("Nate runs agents stop --all there." if step in before_stop - {"staff read"} else
                     "Nate sends this error to the efficiency unit.")
-        self.assert_detached_fault_log(path, command, state, completed, (detail, second_detail or detail), recovery)
+        self.assert_detached_fault_log(path, command, state, completed, (detail, second_detail or detail), recovery,
+                                       contents=contents)
 
     def assert_detached_fault_log(self, path: Path, command: str, state: str, completed: tuple[int, ...],
-                                  details: tuple[str, str], recovery: str) -> None:
+                                  details: tuple[str, str], recovery: str, *, contents: str | None = None) -> None:
         rows = self.rows[:2]
-        contents = path.read_text()
+        if contents is None:
+            contents = path.read_text()
         result = contents.splitlines()
         self.assertEqual(result[0], str(path))
         self.assertNotIn("Partial report", contents)
