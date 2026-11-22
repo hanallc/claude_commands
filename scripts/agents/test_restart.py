@@ -1540,6 +1540,7 @@ class RestartTests(RestartTestCase):
             worker_panes.OpenWorker(good, "w1:p1", "terminal", herdr.AgentStatus.WORKING),
             worker_panes.UncertainWorker(bad, reason)]
         with (patch.object(staff, "initial_snapshot", return_value=record),
+              patch.object(staff, "authority_snapshot", return_value=record),
               patch.object(worker, "_read_workers", return_value=worker.PaneWorkerStates(states, [run])),
               patch.object(worker_panes, "worker_run", return_value=run)):
             for number in range(30):
@@ -1571,7 +1572,7 @@ class RestartTests(RestartTestCase):
         for index, size in enumerate(history_sizes):
             name = f"unit-{index:02}"
             owner = replace(self.rows[0], id=staff.StaffId(name), name=name, current_session=staff.StaffId(f"director-{index}"))
-            ready, waiting = (replace(self.rows[1], kind="worker", name=label, id=staff.StaffId(f"{name}-{label}"),
+            ready, waiting = (replace(self.rows[1], kind="worker", name=label, id=staff.StaffId(f"row-{name}-{label}"),
                                       current_session=staff.StaffId(f"{name}-{label}-session"), unit_type=staff.NotUnit(),
                                       role=staff.KnownWorkerRole("impl"), parent=staff.ReportsTo(owner.id))
                               for label in ("ready", "waiting"))
@@ -1638,6 +1639,7 @@ class RestartTests(RestartTestCase):
 
         for arguments in (["restart"], ["stop", "--all"]):
             with (patch.object(staff, "initial_snapshot", return_value=record),
+                  patch.object(staff, "authority_snapshot", return_value=record),
                   patch.object(staff, "row_operation", side_effect=locked_row),
                   patch.object(herdr, "read_conversation", side_effect=conversation),
                   patch.object(restart.DirectorResumeCheck, "progress", return_value=restart.ResumeCheckState.RESUMED),
@@ -1663,7 +1665,7 @@ class RestartTests(RestartTestCase):
                 self.assertLessEqual(len(combined), len(rows) + 5)
             lines = output.getvalue().splitlines()
             with self.subTest(command=arguments[0], output_kind="report"):
-                self.assertEqual(len(lines), 23)
+                self.assertEqual(len(lines), 23, output.getvalue())
                 self.assertEqual(Path(lines[0]).read_text(), output.getvalue())
                 self.assertEqual(errors.getvalue(), "")
                 self.assertIn("41 of 61 sessions " + ("back" if arguments == ["restart"] else "stopped"), lines[1])
