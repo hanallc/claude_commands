@@ -363,6 +363,11 @@ try {
               await refreshKill();
               return [document.querySelector('.kill-state').textContent, document.querySelectorAll('.kill-run').length];
             })()`),['Run already ended',0]);
+            killResults = [{...killedResult,delivery:''}];
+            assert.equal(await evaluate(`(async () => {
+              await refreshKill();
+              return document.querySelector('.kill-state').textContent;
+            })()`),'Killed by you at 19:41 EST · Message pending');
             killResults = [];
             await evaluate(`refreshKill()`);
             await evaluate(`document.querySelector('#kill-submit').click()`);

@@ -1823,18 +1823,16 @@ The server identifies the caller from the reservation's session ID and the curre
 
 1. The feed publishes an opaque reference for each eligible reservation.
 2. The console supplies a handle for the verified process, recipient and detached stop route.
-3. The server checks the handle and the run record when the operator confirms.
-4. The server reports **Run already ended** without a notice if the run record already shows completion.
-5. For an active run, the server saves the request time, notice and verified stop route.
+3. The server checks the handle and reads the run record when the operator confirms.
+4. The server reports **Run already ended** if the record shows completion or is missing on that read.
+5. If the record shows an active run, the server saves the accepted request, notice and verified stop route.
 6. The server requests the stop through `detached_runs.stop_command` with the record path and reason.
-7. The server reads the run record again before it sends the keyed notice.
+7. The server saves **Stopped** before it sends the keyed notice.
 
 The detached helper stages the reason and the pass cancellation before TERM.
-The server waits for the detached record to show **finished** before it sends a notice.
+After acceptance, a completion stamp, a status other than running, or a missing record permits the notice.
 At restart, the server requests the stop again if the record is active and the scope has no exit confirmation.
-For a finished record, it compares the completion time with the saved request time.
-A completion time before the request second gives **Run already ended** with no notice.
-A completion in the request second permits a notice if the record was active when the server accepted the request.
+If the server saved **Stopped**, it resumes only pending delivery.
 The server retains a verified handle for the result visibility interval.
 If the live row disappears, the retained handle can report an already ended run.
 A direct Cargo scope without a detached run record has no Kill action.

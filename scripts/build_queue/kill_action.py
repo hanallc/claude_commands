@@ -126,16 +126,14 @@ def program(pid: int, processes: dict[int, memory_admit.ProcessIdentity]) -> str
 
 def detached_launch_scope(value: object) -> process_stop.ScopeIdentity | None:
     """Decode the scope that the detached launcher saved at startup."""
-    match value:
-        case {"unit": str(unit), "path": str(name), "device": int(device), "inode": int(inode)}:
-            path = Path(name)
-            if (type(device) is int and device >= 0 and type(inode) is int and inode > 0
-                    and path.is_absolute() and ".." not in path.parts
-                    and path.parent.name == "builds-detached.slice" and path.name == unit
-                    and unit.endswith(".scope")):
-                return {"unit": unit, "path": name, "device": device, "inode": inode}
-        case _:
-            pass
+    if process_stop.is_scope_identity(value):
+        path = Path(value["path"])
+        unit = value["unit"]
+        if (value["device"] >= 0 and value["inode"] > 0
+                and path.is_absolute() and ".." not in path.parts
+                and path.parent.name == "builds-detached.slice" and path.name == unit
+                and unit.endswith(".scope")):
+            return value
     return None
 
 
@@ -294,7 +292,7 @@ class StopRequested:
 
 @dataclass(frozen=True)
 class SendingNotice:
-    """The finished run record permits the keyed notice."""
+    """The run ended after acceptance. The notice is pending."""
 
 
 @dataclass(frozen=True)
@@ -313,7 +311,6 @@ class SavedKillAction:
     message: str
     stage: StopRequested | SendingNotice | FinishedStop
     route: DetachedCommand
-    requested_at: int
 
 
 def notification(run: KillCandidate, at: datetime) -> str:
@@ -327,22 +324,23 @@ class RunningDetachedRun:
 
 @dataclass(frozen=True)
 class EndedDetachedRun:
-    finished_at: float
+    """The record shows completion or was pruned."""
 
 
 def detached_run_state(route: DetachedCommand, recipient: staff.StaffId) -> RunningDetachedRun | EndedDetachedRun:
-    record = worker_lifecycle.read_json_object(route.record)
+    try:
+        raw = cast(object, json.loads(route.record.read_text(encoding="utf-8")))
+    except FileNotFoundError:
+        return EndedDetachedRun()
+    if not isinstance(raw, dict):
+        raise ValueError("the detached run record is not an object")
+    record = cast(dict[str, object], raw)
     if (record.get("run_id") != route.record.stem or record.get("staff_id") != recipient
             or detached_launch_scope(record.get("command_scope")) != route.scope):
         raise ValueError("the detached run record changed identity")
-    if record.get("status") == "running":
-        return RunningDetachedRun(record.get("scope_end_proved") is True)
-    if record.get("status") != "finished" or not isinstance(stamp := record.get("finished_at"), str):
-        raise ValueError("the detached run record has no valid completion time")
-    ended = datetime.fromisoformat(stamp)
-    if ended.utcoffset() is None:
-        raise ValueError("the detached run completion time has no time zone")
-    return EndedDetachedRun(ended.timestamp())
+    if "finished_at" in record or record.get("status") != "running":
+        return EndedDetachedRun()
+    return RunningDetachedRun(record.get("scope_end_proved") is True)
 
 
 def stop_verified_scope(target: KillTarget, reason: str) -> bool:
@@ -487,9 +485,7 @@ class KillActions:
                     self._save(action)
             if isinstance(state, RunningDetachedRun):
                 return action
-            if state.finished_at < action.requested_at:
-                return self._finish(action, {**action.result, "stop": StopState.ALREADY_ENDED}, retention)
-            action = replace(action, stage=SendingNotice())
+            action = replace(action, stage=SendingNotice(), result={**action.result, "stop": StopState.STOPPED})
             self._save(action)
         if isinstance(action.stage, SendingNotice):
             try:
@@ -498,7 +494,7 @@ class KillActions:
                 return action
             if isinstance(delivery, RetryNotice):
                 return action
-            return self._finish(action, {**action.result, "stop": StopState.STOPPED, "delivery": delivery}, retention)
+            return self._finish(action, {**action.result, "delivery": delivery}, retention)
         return action
 
     def _watch(self, reference: str, sample: float, retention: float) -> None:
@@ -537,15 +533,11 @@ class KillActions:
     def stop(self, reference: str, handle: str, words: str) -> KillResult | NoStopRoute:
         if re.fullmatch(r"[0-9a-f]{64}", reference) is None:
             return NoStopRoute()
-        current = live_targets().get(reference)
-        if current is not None:
-            target = current
-        else:
-            with self._lock:
-                offered = self._offers.get(reference)
-            if offered is None or offered.expires_at <= time.time():
-                return NoStopRoute()
-            target = offered.target
+        with self._lock:
+            offered = self._offers.get(reference)
+        if offered is None or offered.expires_at <= time.time():
+            return NoStopRoute()
+        target = offered.target
         if not hmac.compare_digest(self.handle(target), handle):
             return NoStopRoute()
         settings = conf.read_or_repository("review_links")
@@ -560,8 +552,11 @@ class KillActions:
                 if not isinstance(previous.stage, FinishedStop) or previous.stage.visible_until > time.time():
                     return NoStopRoute()
             state = detached_run_state(target.route, target.recipient)
-            if current is None and isinstance(state, RunningDetachedRun):
-                return NoStopRoute()
+            if isinstance(state, RunningDetachedRun):
+                current = live_targets().get(reference)
+                if (current is None or self.handle(current) != handle) and isinstance(
+                        detached_run_state(target.route, target.recipient), RunningDetachedRun):
+                    return NoStopRoute()
             at = datetime.now(user_zone())
             message = notification(run, at)
             result: KillResult = {"reference": reference, "step": run.step, "pid": run.row_pid,
@@ -569,9 +564,8 @@ class KillActions:
                                   "time": at.strftime("%H:%M %Z"), "recipient_name": target.recipient_name,
                                   "recipient_role": target.recipient_role}
             body = f"{message}\n{words}" if words else message
-            # The supervisor records finish times in whole seconds.
             action = SavedKillAction(secrets.token_hex(16), run, result, target.recipient, body, StopRequested(),
-                                     target.route, int(at.timestamp()))
+                                     target.route)
             if isinstance(state, EndedDetachedRun):
                 return self._finish(action, {**result, "stop": StopState.ALREADY_ENDED}, retention).result
             self._save(action)

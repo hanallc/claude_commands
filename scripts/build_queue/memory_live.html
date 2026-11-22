@@ -1413,7 +1413,8 @@ function showKillResults() {
     if (result.stop !== "Stopped") return result.stop;
     const delivery = result.delivery === "Message sent" ? `${result.recipient_role} ${result.recipient_name} informed`
       : result.delivery === "Message queued" ? `Message queued for ${result.recipient_role} ${result.recipient_name}`
-      : `Message failed for ${result.recipient_role} ${result.recipient_name}`;
+      : result.delivery === "Message failed" ? `Message failed for ${result.recipient_role} ${result.recipient_name}`
+      : "Message pending";
     return `Killed by you at ${result.time} · ${delivery}`;
   };
   for (const cell of document.querySelectorAll("td.pid[data-kill-ref]")) {

@@ -228,7 +228,7 @@ class KillActionTests(unittest.TestCase):
                 deliver.assert_not_called()
                 self.assertEqual(actions.options()[1][0]["stop"], kill_action.StopState.STOPPING)
                 saved = self.saved_action(target)
-                self.assertEqual(saved.requested_at, int(at.timestamp()))
+                self.assertIsInstance(saved.stage, kill_action.StopRequested)
                 self.write_run(target, status="finished", finished_at=at.isoformat(timespec="seconds"))
                 targets.return_value = {}
                 return False
@@ -245,35 +245,66 @@ class KillActionTests(unittest.TestCase):
             self.assertEqual(actions.options(), ({}, [result]))
             self.assertIsInstance(actions.stop(run.reference, handle, "Again."), kill_action.NoStopRoute)
 
-    def test_run_ended_before_the_request_has_no_notice(self) -> None:
+    def test_first_read_accepts_no_stop_for_ended_or_pruned_runs(self) -> None:
+        at = datetime(2026, 11, 18, 19, 41, 0, 900_000, tzinfo=ZoneInfo("UTC"))
+
+        class FixtureClock(datetime):
+            @classmethod
+            @override
+            def now(cls, tz: tzinfo | None = None) -> datetime:
+                return at.astimezone(tz)
+
+        for status in ("running", "finished", "pruned"):
+            with self.subTest(status=status), tempfile.TemporaryDirectory(dir=self.root) as folder:
+                with patch.object(self, "root", Path(folder)):
+                    target = self.detached_target()
+                    reference = target.candidate.reference
+                    actions = kill_action.KillActions(self.root)
+                    with (patch.object(kill_action, "datetime", FixtureClock),
+                          patch.object(kill_action, "live_targets", return_value={reference: target}) as targets,
+                          patch.object(detached_runs, "stop_command") as stop,
+                          patch.object(kill_action, "deliver") as send):
+                        offers, _ = actions.options()
+                        targets.return_value = {}
+                        handle = offers[reference]["handle"]
+                        self.assertIsInstance(actions.stop(reference, handle, ""), kill_action.NoStopRoute)
+                        if status == "pruned":
+                            target.route.record.unlink()
+                        else:
+                            self.write_run(target, status=status, finished_at=at.isoformat(timespec="seconds"))
+                        outcome = actions.stop(reference, handle, "")
+                        self.assertNotIsInstance(outcome, kill_action.NoStopRoute)
+                        self.assertEqual(actions.options(), ({}, [outcome]))
+                    saved = self.saved_action(target)
+                    self.assertEqual((saved.result["stop"], saved.result["delivery"]),
+                                     (kill_action.StopState.ALREADY_ENDED, kill_action.DeliveryState.PENDING))
+                    self.assertIsInstance(saved.stage, kill_action.FinishedStop)
+                    stop.assert_not_called()
+                    send.assert_not_called()
+
+    def test_completion_during_route_check_keeps_the_first_read(self) -> None:
         target = self.detached_target()
         reference = target.candidate.reference
         actions = kill_action.KillActions(self.root)
-        with (patch.object(kill_action, "live_targets", return_value={reference: target}) as targets,
-              patch.object(detached_runs, "stop_command") as stop,
-              patch.object(kill_action, "deliver") as send):
+
+        def finish() -> dict[str, kill_action.KillTarget]:
+            self.write_run(target, status="finished")
+            return {}
+
+        with patch.object(kill_action, "live_targets", return_value={reference: target}):
             offers, _ = actions.options()
-            targets.return_value = {}
-            handle = offers[reference]["handle"]
-            self.assertIsInstance(actions.stop(reference, handle, ""), kill_action.NoStopRoute)
-            self.write_run(target, status="finished", finished_at=datetime.now().astimezone().isoformat(timespec="seconds"))
-            outcome = actions.stop(reference, handle, "")
-            self.assertNotIsInstance(outcome, kill_action.NoStopRoute)
-            self.assertEqual(actions.options(), ({}, [outcome]))
+        with (patch.object(kill_action, "live_targets", side_effect=finish),
+              patch.object(detached_runs, "stop_command") as stop,
+              patch.object(kill_action, "deliver", return_value=kill_action.DeliveryState.SENT) as send):
+            outcome = actions.stop(reference, offers[reference]["handle"], "")
         saved = self.saved_action(target)
+        self.assertEqual(outcome, saved.result)
         self.assertEqual((saved.result["stop"], saved.result["delivery"]),
-                         (kill_action.StopState.ALREADY_ENDED, kill_action.DeliveryState.PENDING))
-        self.assertIsInstance(saved.stage, kill_action.FinishedStop)
+                         (kill_action.StopState.STOPPED, kill_action.DeliveryState.SENT))
         stop.assert_not_called()
-        send.assert_not_called()
+        send.assert_called_once()
 
-    def test_restart_uses_the_saved_request_time_to_classify_the_finished_run(self) -> None:
-        for offset in (-1, 1):
-            with self.subTest(offset=offset), tempfile.TemporaryDirectory(dir=self.root) as folder:
-                with patch.object(self, "root", Path(folder)):
-                    self.check_finished_run_after_restart(offset)
-
-    def check_finished_run_after_restart(self, offset: int) -> None:
+    def test_restart_sends_once_after_the_accepted_record_is_pruned(self) -> None:
         target = self.detached_target()
         reference = target.candidate.reference
         actions = kill_action.KillActions(self.root)
@@ -282,26 +313,23 @@ class KillActionTests(unittest.TestCase):
             pass
 
         with (patch.object(kill_action, "live_targets", return_value={reference: target}),
-              patch.object(kill_action, "stop_verified_scope", side_effect=Restart), self.assertRaises(Restart)):
-            _ = actions.stop(reference, actions.handle(target), "Wait for release.")
+              patch.object(kill_action, "stop_verified_scope", side_effect=Restart)):
+            offers, _ = actions.options()
+            with self.assertRaises(Restart):
+                _ = actions.stop(reference, offers[reference]["handle"], "Wait for release.")
         saved = self.saved_action(target)
         self.assertIsInstance(saved.stage, kill_action.StopRequested)
         self.assertEqual(saved.route, target.route)
         self.assertTrue(saved.message.endswith("\nWait for release."))
-        finished_at = datetime.fromtimestamp(saved.requested_at + offset, tz=ZoneInfo("UTC"))
-        self.write_run(target, status="finished", finished_at=finished_at.isoformat(timespec="seconds"))
+        target.route.record.unlink()
         with (patch.object(detached_runs, "stop_command") as stop,
               patch.object(kill_action, "deliver", return_value=kill_action.DeliveryState.SENT) as send):
             result = self.resume()
         stop.assert_not_called()
-        if offset < 0:
-            send.assert_not_called()
-            self.assertEqual((result["stop"], result["delivery"]),
-                             (kill_action.StopState.ALREADY_ENDED, kill_action.DeliveryState.PENDING))
-        else:
-            send.assert_called_once_with(replace(saved, stage=kill_action.SendingNotice()))
-            self.assertEqual((result["stop"], result["delivery"]),
-                             (kill_action.StopState.STOPPED, kill_action.DeliveryState.SENT))
+        send.assert_called_once_with(replace(saved, stage=kill_action.SendingNotice(),
+                                             result={**saved.result, "stop": kill_action.StopState.STOPPED}))
+        self.assertEqual((result["stop"], result["delivery"]),
+                         (kill_action.StopState.STOPPED, kill_action.DeliveryState.SENT))
 
     def test_restart_requests_stop_again_for_the_saved_running_record(self) -> None:
         target = self.detached_target()
@@ -311,7 +339,8 @@ class KillActionTests(unittest.TestCase):
               patch.object(kill_action, "stop_verified_scope", return_value=False) as first_stop,
               patch.object(actions, "_start_watch") as watch,
               patch.object(kill_action, "deliver") as send):
-            outcome = actions.stop(reference, actions.handle(target), "Use the next slot.")
+            offers, _ = actions.options()
+            outcome = actions.stop(reference, offers[reference]["handle"], "Use the next slot.")
         self.assertNotIsInstance(outcome, kill_action.NoStopRoute)
         saved = self.saved_action(target)
         self.assertEqual(saved.result["stop"], kill_action.StopState.UNCONFIRMED)
@@ -324,15 +353,15 @@ class KillActionTests(unittest.TestCase):
             self.assertEqual(reason, saved.message.partition("\n")[0])
             self.assertTrue(check())
             send.assert_not_called()
-            finished_at = datetime.fromtimestamp(saved.requested_at + 1, tz=ZoneInfo("UTC"))
-            self.write_run(target, status="finished", finished_at=finished_at.isoformat(timespec="seconds"))
+            self.write_run(target, status="finished")
             return True
 
         with (patch.object(detached_runs, "stop_command", side_effect=stop) as requested,
               patch.object(kill_action, "deliver", return_value=kill_action.DeliveryState.QUEUED) as send):
             result = self.resume()
         requested.assert_called_once_with(target.route.record, saved.message.partition("\n")[0], check=ANY)
-        send.assert_called_once_with(replace(saved, stage=kill_action.SendingNotice()))
+        send.assert_called_once_with(replace(saved, stage=kill_action.SendingNotice(),
+                                             result={**saved.result, "stop": kill_action.StopState.STOPPED}))
         self.assertEqual((result["stop"], result["delivery"]),
                          (kill_action.StopState.STOPPED, kill_action.DeliveryState.QUEUED))
 
@@ -369,7 +398,8 @@ class KillActionTests(unittest.TestCase):
               patch.object(memory_admit, "process_table", return_value={}),
               patch.object(kill_action, "stop_route", return_value=target.route),
               patch.object(actions, "_start_watch"), patch.object(kill_action, "deliver") as send):
-            _ = actions.stop(reference, actions.handle(target), "")
+            offers, _ = actions.options()
+            _ = actions.stop(reference, offers[reference]["handle"], "")
         send_term.assert_called_once_with(ANY, scope)
         self.assertEqual(freeze.read_text(), "0\n")
         record = cast(dict[str, object], json.loads(target.route.record.read_text()))
@@ -377,8 +407,7 @@ class KillActionTests(unittest.TestCase):
         send.assert_not_called()
         saved = self.saved_action(target)
         self.assertEqual(saved.result["stop"], kill_action.StopState.STOPPING)
-        ended = datetime.fromtimestamp(saved.requested_at + 1, tz=ZoneInfo("UTC"))
-        self.write_run(target, status="finished", finished_at=ended.isoformat(timespec="seconds"))
+        self.write_run(target, status="finished")
         response = subprocess.CompletedProcess(["send.py"], 2, "", "send.py: fixture: retired producer")
         with (patch.object(detached_runs, "stop_command") as retry,
               patch.object(send_budget, "seconds", return_value=1),
@@ -395,11 +424,11 @@ class KillActionTests(unittest.TestCase):
         actions = kill_action.KillActions(self.root)
         attempts: list[list[str]] = []
 
-        def stop(_target: kill_action.KillTarget, _reason: str) -> bool:
-            saved = self.saved_action(target)
-            finished_at = datetime.fromtimestamp(saved.requested_at + 1, tz=ZoneInfo("UTC"))
-            self.write_run(target, status="finished", finished_at=finished_at.isoformat(timespec="seconds"))
-            return True
+        def stop(current: kill_action.KillTarget, reason: str) -> bool:
+            self.assertEqual(current, target)
+            self.assertEqual(reason, self.saved_action(target).message.partition("\n")[0])
+            self.write_run(target, status="finished")
+            return False
 
         def send(argv: list[str], **_options: object) -> subprocess.CompletedProcess[str]:
             attempts.append(argv)
@@ -411,9 +440,12 @@ class KillActionTests(unittest.TestCase):
               patch.object(kill_action, "live_targets", return_value={reference: target}),
               patch.object(kill_action, "stop_verified_scope", side_effect=stop),
               patch.object(actions, "_start_watch")):
-            _ = actions.stop(reference, actions.handle(target), "Use the next slot.")
+            offers, _ = actions.options()
+            _ = actions.stop(reference, offers[reference]["handle"], "Use the next slot.")
             saved = self.saved_action(target)
             self.assertIsInstance(saved.stage, kill_action.SendingNotice)
+            self.assertEqual((saved.result["stop"], saved.result["delivery"]),
+                             (kill_action.StopState.STOPPED, kill_action.DeliveryState.PENDING))
             self.assertEqual(len(attempts), 1)
             result = self.resume()
         self.assertEqual((result["stop"], result["delivery"]),
