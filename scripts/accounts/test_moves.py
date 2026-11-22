@@ -38,13 +38,13 @@ class SingleSessionMoveNoticeTests(unittest.TestCase):
     def setUp(self) -> None:
         self.home = Path(self.enterContext(tempfile.TemporaryDirectory()))
         _ = self.enterContext(scratch_account_home(self.home, {}, clear=True))
+        _ = self.enterContext(staff.supplied_snapshot(staff.StaffSnapshot(())))
 
     def move_lines(self, kind: Literal["unit", "showrunner", "top-level"], target: str, *, dry_run: bool) -> list[str]:
         owner = inventory.ListedSession("session-alpha", 123, "fixture-start", "alpha", kind,
                                         self.home / ".claude1", "fixture-login", "fixture", "")
         checked = accounts.MoveTargetReady(accounts.NamedAccount(target, self.home / ("." + target)))
-        with (patch.object(accounts, "import_module", return_value=inventory),
-              patch.object(inventory, "listing", return_value=[owner]),
+        with (patch.object(inventory, "listing", return_value=[owner]),
               patch.object(accounts, "check_move_target", return_value=checked),
               patch.object(accounts, "session_account_label", return_value="claude1"),
               patch.object(accounts, "group_accounts", return_value=accounts.GroupAccounts(

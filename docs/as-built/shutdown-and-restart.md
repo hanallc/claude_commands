@@ -206,6 +206,9 @@ The batch omits busy members from both the self-move and build handoffs.
 Each attempt reads the member's live account while it holds the row lock.
 The batch reads the current role map for a group move.
 A single-session move uses the explicit account.
+The command refuses a by-hand single-session move when the target differs from the member's selected Claude group account.
+This rule applies to live and stopped members.
+The refusal shows how to move the group.
 The batch keeps a member running when its live account matches the target.
 The batch checks the Claude destination again after build waits and before it writes a request or sends a stop signal.
 The destination needs a matching local sign-in, an access or refresh token, and a future refresh expiry.

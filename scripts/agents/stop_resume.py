@@ -961,7 +961,8 @@ def stop(session: str, kind: str = "", *, deadline: float = math.inf,
         return StopFailed(session, reason if "deadline passed" in reason else f"deadline passed; {reason}")
 
 
-def _stop_staff_row(record: StaffSnapshot, reference: str) -> StaffRow | None:
+def staff_row_for_reference(record: StaffSnapshot, reference: str) -> StaffRow | None:
+    """Resolve a staff ID, a current session ID, or a unique name."""
     row = record.by_member_reference(reference)
     if row is not None:
         return row
@@ -979,7 +980,7 @@ def _stop_recorded(session: str, kind: str = "", *,
         record = staff.initial_snapshot()
     except (OSError, ValueError):
         record = staff.StaffSnapshot(())
-    row = _stop_staff_row(record, session)
+    row = staff_row_for_reference(record, session)
     before = None
     if row is not None and row.kind == "worker":
         worker = session_staff.worker_backend(record, row.id)
@@ -1074,7 +1075,7 @@ def stop_target(session: str) -> str | SessionNotFound | StopFailed:
         except (OSError, ValueError) as error:
             print(f"{session}: staff anomaly: {error}", file=sys.stderr)
             record = staff.StaffSnapshot(())
-        member = _stop_staff_row(record, session)
+        member = staff_row_for_reference(record, session)
         if member is not None:
             return member.current_session
         registry = sessions.read_registry()
@@ -1125,7 +1126,7 @@ def _stop(session: str, kind: str = "", *,
             return target
         if isinstance(pinned, MoveStopTarget):
             record = staff.initial_snapshot()
-            row = _stop_staff_row(record, session)
+            row = staff_row_for_reference(record, session)
             if (target != pinned.identity or
                     (isinstance(pinned.member.owner, pane_launch.StaffLaunchReference)
                      and (row is None or row.id != pinned.member.owner.id or row.current_session != target))
@@ -2345,10 +2346,7 @@ def _staff_move_member(identity: staff.StaffId, record: StaffSnapshot) -> Resolv
 
 def _batch_member(reference: str, record: StaffSnapshot,
                   entries: Mapping[str, pane_record.PaneLaunch]) -> ResolvedMoveMember:
-    if (row := record.by_member_reference(reference)) is None:
-        named = [row for row in record.rows if row.name == reference]
-        row = named[0] if len(named) == 1 else None
-    if row is not None:
+    if (row := staff_row_for_reference(record, reference)) is not None:
         return ResolvedMoveMember(pane_launch.StaffLaunchReference(row.id), record.qualified_name(row))
     named = pane_launch.named_references(reference, record, entries)
     if len(named) == 1 and isinstance(native := next(iter(named)), pane_launch.NativeLaunchReference):

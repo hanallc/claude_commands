@@ -34,7 +34,7 @@ from importlib import import_module
 from typing import TYPE_CHECKING, Literal, Self, cast, final, override
 from unittest.mock import ANY, Mock, call, patch
 
-from scripts.lib import conf, transcripts
+from scripts.lib import conf, models_registry, transcripts
 from scripts.lib.transcript_test_support import compressed_copy
 from scripts.accounts.home_test_support import scratch_account_home
 from scripts.lint.memory_test_support import write_config_fixture
@@ -1327,6 +1327,138 @@ class RefusalWatchTests(unittest.TestCase):
         self.assertTrue(any("late: Claude is up on claude3" in line for line in watcher_output))
         self.assertCountEqual(stopped, ["direct", "late"])
         self.assertCountEqual(resumed, ["direct", "late"])
+
+    def assert_single_session_move_refused(self, row: staff.StaffRow, *references: str,
+                                          group: accounts.ClaudeGroup = "showrunners") -> None:
+        reason = (f"{row.name} is in the {group} group, which is on claude1; the watcher moves it back. "
+                  f"Move the group: agents move {group} claude3")
+        with (patch.object(accounts, "check_move_target") as checked,
+              patch.object(accounts, "move_sessions") as moved,
+              patch.object(stop_resume, "_stop") as stop,
+              patch.object(stop_resume, "_resume_move") as resume):
+            for reference in references:
+                for dry_run in (False, True):
+                    options = ["--dry-run"] if dry_run else []
+                    with (self.subTest(reference=reference, dry_run=dry_run),
+                          redirect_stdout(io.StringIO()) as output,
+                          redirect_stderr(io.StringIO()) as error):
+                        self.assertEqual(accounts.main(["move", reference, "claude3", *options]), 1)
+                        self.assertEqual(output.getvalue(), "")
+                        self.assertEqual(error.getvalue(), reason + "\n")
+        checked.assert_not_called()
+        moved.assert_not_called()
+        stop.assert_not_called()
+        resume.assert_not_called()
+        self.assertFalse(moves.store_file().exists())
+
+    def test_single_session_move_refuses_a_member_off_the_selected_group_account(self) -> None:
+        _ = self.groups(showrunners="claude1")
+        _ = self.enterContext(staff_test_support.isolated_staff_file(self.home / "staff.json", {}))
+        row = staff_test_support.fixture_member("showrunner", name="runner")
+        owner = self.owner(row.current_session, host="herdr")
+        for label in ("claude1", "claude3"):
+            with self.subTest(source=label):
+                directory = str(accounts.account_dir(label))
+                owner["config_dir"] = directory
+                self.assert_single_session_move_refused(row, row.current_session, row.id, row.name)
+                self.assertEqual(owner.get("config_dir"), directory)
+
+    def test_single_session_move_refuses_a_live_member_without_a_config_directory(self) -> None:
+        _ = self.groups(showrunners="claude1")
+        _ = self.enterContext(staff_test_support.isolated_staff_file(self.home / "staff.json", {}))
+        row = staff_test_support.fixture_member("showrunner", name="runner")
+        owner = self.owner(row.current_session, host="herdr")
+        _ = owner.pop("config_dir", None)
+        self.assertEqual(self.listing(), [])
+        self.assertEqual([entry["sessionId"] for entry in sessions.live_sessions()], [row.current_session])
+        self.assert_single_session_move_refused(row, row.current_session, row.name)
+
+    def test_single_session_move_refuses_a_stopped_member_with_a_saved_pane(self) -> None:
+        _ = self.groups(showrunners="claude1")
+        _ = self.enterContext(staff_test_support.isolated_staff_file(self.home / "staff.json", {}))
+        row = staff_test_support.fixture_member("showrunner", name="runner")
+        launch = pane_record.launch("w1:p1", row.current_session, str(self.home),
+                                   {"CLAUDE_CONFIG_DIR": str(accounts.account_dir("claude1"))}, ["claude"])
+        pane_record.save("fixture", {"w1:p1": launch}, record=self.membership())
+        before = pane_record.record_path("fixture").read_bytes()
+        self.assertEqual(sessions.live_sessions(), [])
+        self.assert_single_session_move_refused(row, row.id, row.current_session, row.name)
+        self.assertEqual(pane_record.record_path("fixture").read_bytes(), before)
+
+    def test_single_session_move_refuses_an_unreadable_staff_record(self) -> None:
+        record = self.home / "staff.json"
+        _ = self.enterContext(staff_test_support.isolated_staff_file(record, {}))
+        _ = record.write_text("[]", encoding="utf-8")
+        with (patch.object(accounts, "check_move_target") as checked,
+              patch.object(accounts, "move_sessions") as moved):
+            result = accounts.move("runner", "claude3")
+        self.assertEqual(result, accounts.MoveRefused("staff record must be an object"))
+        checked.assert_not_called()
+        moved.assert_not_called()
+
+    def assert_single_session_move_restarts(self, owner: inventory.Session) -> None:
+        identity = owner["session_id"]
+        with (patch.object(stop_resume, "move_sessions", new=move_live_sessions),
+              patch.object(staff, "initial_snapshot", side_effect=self.membership),
+              patch.object(pane_launch, "current_kind", return_value="claude"),
+              patch.object(stop_resume, "_tab_of", side_effect=stop_resume.SessionNotFound),
+              patch.object(stop_resume, "_record_launches"),
+              patch.object(stop_resume, "_retire_prompt"),
+              patch.object(stop_resume, "running_on_account", return_value=sessions.SessionNotLive()),
+              patch.object(stop_resume, "_stop", return_value=stop_resume.NotRunning(identity)) as stop,
+              patch.object(stop_resume, "_resume_move",
+                           return_value=stop_resume.ClaudeUp(identity, "w1:p1", "claude3")) as resume):
+            self.assertEqual(accounts.main(["move", identity, "claude3"]), 0)
+        stop.assert_called_once_with(identity)
+        resume.assert_called_once()
+        self.assertEqual(resume.call_args.args[:2], (identity, "claude3"))
+        self.assertEqual([entry["kind"] for entry in moves.read_moves()], ["requested", "confirmed"])
+
+    def test_single_session_move_runs_to_the_selected_group_account(self) -> None:
+        _ = self.groups(showrunners="claude3")
+        self.assert_single_session_move_restarts(self.owner("runner", host="herdr"))
+
+    def test_single_session_move_runs_for_an_ungrouped_session(self) -> None:
+        _ = self.groups(showrunners="claude1")
+        _ = self.owner("runner", host="herdr")
+        self.assert_single_session_move_restarts(self.owner("personal"))
+
+    def test_single_session_move_refuses_a_claude_producer_off_the_selected_account(self) -> None:
+        _ = accounts.set_group_account("producers", "claude1", why="fixture selection", now=NOW)
+        _ = self.enterContext(staff_test_support.isolated_staff_file(self.home / "staff.json", {}))
+        row = staff_test_support.fixture_member("producer", name="producer")
+        _ = self.owner(row.current_session)
+        settings = models_registry.LaunchSettings("claude", "fixture-model", "high", "")
+        with patch.object(models_registry, "launch_settings", return_value=settings):
+            self.assert_single_session_move_refused(row, row.name, group="producers")
+
+    def test_single_session_move_keeps_the_codex_producer_account_family_error(self) -> None:
+        _ = accounts.set_group_account("producers", "claude1", why="fixture selection", now=NOW)
+        _ = self.enterContext(staff_test_support.isolated_staff_file(self.home / "staff.json", {}))
+        row = staff_test_support.fixture_member("producer", name="producer")
+        settings = models_registry.LaunchSettings("codex", "fixture-model", "high", "")
+        ready = accounts.MoveTargetReady(accounts.NamedAccount("claude3", self.home / ".claude3"))
+        failure = stop_resume.StopFailed(row.current_session, "accounts: claude3 is not a codexN label")
+        with (patch.object(models_registry, "launch_settings", return_value=settings),
+              patch.object(accounts, "check_move_target", return_value=ready),
+              patch.object(stop_resume, "move_sessions", return_value=[failure]) as moved,
+              redirect_stdout(io.StringIO()) as output,
+              redirect_stderr(io.StringIO()) as error):
+            self.assertEqual(accounts.main(["move", row.name, "claude3"]), 1)
+        moved.assert_called_once()
+        self.assertEqual(output.getvalue(), "")
+        self.assertEqual(error.getvalue(), f"{row.name}: not moved: {failure.reason}\n")
+
+    def test_single_session_move_runs_for_a_producer_without_a_selected_label(self) -> None:
+        _ = self.groups(showrunners="claude1")
+        _ = self.enterContext(staff_test_support.isolated_staff_file(self.home / "staff.json", {}))
+        row = staff_test_support.fixture_member("producer", name="producer")
+        _ = self.owner(row.current_session)
+        outcome = stop_resume.ClaudeUp(row.current_session, "w1:p1", "claude3")
+        with patch.object(accounts, "move_sessions", return_value=(outcome,)) as moved:
+            self.assertEqual(accounts.main(["move", row.current_session, "claude3"]), 0)
+        moved.assert_called_once()
+        self.assertEqual(moved.call_args.args, ((row.current_session,), "claude3"))
 
     def test_direct_group_moves_report_a_busy_member_while_the_watcher_holds_its_row(self) -> None:
         _ = self.groups(units="claude3")

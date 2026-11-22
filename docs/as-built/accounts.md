@@ -310,7 +310,10 @@ An in-progress result from another move keeps the refusal pending.
 The watcher saves the decision ID before it requests the move.
 A retry uses that decision ID when only some members still need to move.
 A single-session move uses the explicit account.
-If the group uses a different account, the command reports the return to that account at the next resume.
+The command refuses a by-hand single-session move when the target differs from the member's selected Claude group account.
+This rule applies to live and stopped members.
+Dry runs report the same refusal.
+Use `agents move <group> <target>` to select the account and move the group.
 The move path creates no ready mark, conductor, follow command, or cancellation step.
 
 `TranscriptRefusal`, `ProofRefusal`, and `NoSessionRefusal` distinguish provider evidence from a test assumption and absence.

@@ -2348,7 +2348,7 @@ def group_transition(group: ClaudeGroup) -> GroupTransition | NoGroupTransition:
     return GroupTransition(selection["move_id"], origin, role_map.selection_reason(selection))
 
 
-def session_group(session: Session | ListedSession) -> ClaudeGroup | Literal["ungrouped"]:
+def session_group(session: Session | ListedSession | staff.StaffRow) -> ClaudeGroup | Literal["ungrouped"]:
     kind = session["kind"] if isinstance(session, dict) else session.kind
     if kind == "unit":
         return "units"
@@ -3506,6 +3506,30 @@ def session_on_account(session: ListedSession | LiveGroupMember, label: str) -> 
     return _label_is(label, "claude") and session.config_dir == claude_account_dir(label)
 
 
+@dataclass(frozen=True)
+class SingleSessionMoveAllowed:
+    """The requested account passes the group selection check."""
+
+
+def _check_single_session_group(record: staff.StaffSnapshot, reference: str, target: str) -> SingleSessionMoveAllowed | MoveRefused:
+    resolve = cast("Callable[[staff.StaffSnapshot, str], staff.StaffRow | None]",
+                   import_module("scripts.agents.stop_resume").staff_row_for_reference)
+    row = resolve(record, reference)
+    if row is None or (group := session_group(row)) == "ungrouped":
+        return SingleSessionMoveAllowed()
+    label = group_accounts().get(group, GROUP_NOT_CONFIGURED)
+    if not isinstance(label, str) or not _label_is(label, "claude") or label == target:
+        return SingleSessionMoveAllowed()
+    if group == "producers":
+        settings = producer_settings(row)
+        if not isinstance(settings, models_registry.LaunchSettings) or settings.kind != "claude":
+            return SingleSessionMoveAllowed()
+    name = " ".join(row.name.splitlines()).strip() or row.current_session
+    return MoveRefused(
+        f"{name} is in the {group} group, which is on {label}; the watcher moves it back. "
+        + f"Move the group: agents move {group} {target}")
+
+
 @overload
 def move(session: str, target: str, *, dry_run: Literal[False] = False, why: str = "", alerts: MoveAlerts = "user", account_config: conf.ConfigRead | ReadCurrentAccountSettings = CURRENT_ACCOUNT_SETTINGS) -> MoveStarted | MoveStartFailed | MoveRefused: ...
 
@@ -3519,7 +3543,9 @@ def move(session: str, target: str, *, dry_run: bool, why: str = "", alerts: Mov
 
 
 def move(session: str, target: str, *, dry_run: bool = False, why: str = "", alerts: MoveAlerts = "user", account_config: conf.ConfigRead | ReadCurrentAccountSettings = CURRENT_ACCOUNT_SETTINGS) -> MoveStarted | MoveStartFailed | MoveDryRun | MoveRefused:
-    """Skip an owner on the target; check quota before moving another owner."""
+    """Check the selected group account and quota before moving an owner."""
+    from scripts.production import staff
+
     account_config = read_account_settings(account_config)
     del alerts
     target = note_file.canonical_label(target)
@@ -3529,8 +3555,10 @@ def move(session: str, target: str, *, dry_run: bool = False, why: str = "", ale
         inventory = import_module("scripts.agents.inventory")
     try:
         refuse_default(target)
+        record = staff.initial_snapshot()
         try:
-            live = inventory.listing()
+            with staff.supplied_snapshot(record):
+                live = inventory.listing()
         except (inventory.InvalidInventory, OSError, ValueError):
             checked = check_move_target(target, datetime.now(timezone.utc), repair=not dry_run, account_config=account_config)
             if isinstance(checked, MoveRefused):
@@ -3539,6 +3567,11 @@ def move(session: str, target: str, *, dry_run: bool = False, why: str = "", ale
         matches = [item for item in live if item.session_id == session]
         if not matches:
             matches = [item for item in live if item.name == session]
+        if len(matches) <= 1 and _label_is(target, "claude"):
+            reference = matches[0].session_id if matches else session
+            group_check = _check_single_session_group(record, reference, target)
+            if isinstance(group_check, MoveRefused):
+                return group_check
         if len(matches) == 1 and session_account_label(matches[0]) == target:
             owner = matches[0]
             line = f"{owner.name}: already on {target}"
