@@ -25,6 +25,8 @@ from unittest import mock
 from scripts.build_queue import execution_identity
 from scripts.build_targets import build_targets
 from scripts.direct import verify_mac_offload_test_support
+from scripts.build_targets.target_test_support import mac_target_settings
+from scripts.mac_test.config_test_support import MAC_RUN_SETTINGS
 from scripts.lint.memory_test_support import config_environment, write_config_fixture, write_config_fault, commit_config_fixture
 
 from scripts.mac_test import eligibility, fix_return, nextest_log, offload, claim_state
@@ -49,7 +51,8 @@ from scripts.copies import copies
 from scripts.copies.copies_test_support import copies_environment
 from scripts.mac_test.offload_test_commands import install_nextest_log_writer
 from scripts.mac_test.offload_test_support import (
-    OffloadCommandFixture, FILTER, HANA, HANA_COMMAND_PATTERN, split_mac_run_command,
+    OffloadCommandFixture, FILTER, HANA, HANA_COMMAND_PATTERN, nextest_settings,
+    split_mac_run_command, write_nextest_settings,
 )
 from scripts.lib.py_floor_test_support import seed_interpreter_cache
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -387,8 +390,10 @@ class CompletedRunSyncTests(unittest.TestCase):
                 raise OSError("fixture exchange failure")
             return 0
 
+        environment = copies_environment(root)
+        _ = write_config_fixture(Path(environment["CONF_DIR"]) / "mac_test.conf", defaults=MAC_RUN_SETTINGS)
         with (
-            mock.patch.dict(os.environ, copies_environment(root)),
+            mock.patch.dict(os.environ, environment),
             mock.patch.object(eligibility, "configured_ssh_target", return_value=configured),
             mock.patch.object(offload, "expected_linux_parity", return_value={}),
             mock.patch.object(offload, "copy_tracked_scripts", return_value=True),
@@ -496,12 +501,15 @@ class OffloadSettingsTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        defaults = write_nextest_settings(self.root / "nextest-defaults.conf")
+        _ = cast(object, self.enterContext(mock.patch.object(nextest_log, "DEFAULT_SETTINGS", defaults)))
         self.settings = self.root / "mac_test.conf"
         _ = write_config_fixture(self.settings,
             "offload=on\nhost=mac\nmirror_root=~/.local/state/mac-test/test-mirror\n"
             + "linux_only.cargo-liner=\nmac_budget_gib=24\nconnect_timeout_s=6\n"
-            + "probe_timeout_s=15\nleftover_timeout_s=10\nunreachable_backoff_s=300\nfree_floor_gib=100\n")
-        _ = write_config_fixture(self.root / "build_targets.conf", "platform.mac=macos\n")
+            + "probe_timeout_s=15\nleftover_timeout_s=10\nunreachable_backoff_s=300\nfree_floor_gib=100\n",
+            defaults=MAC_RUN_SETTINGS + nextest_settings())
+        _ = write_config_fixture(self.root / "build_targets.conf", defaults=mac_target_settings())
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
             **config_environment(self.root),
             **copies_environment(self.root),
@@ -607,14 +615,14 @@ class OffloadSettingsTests(unittest.TestCase):
                 _ = eligibility.ssh_target_state_directory(target)
 
     def test_explicit_settings_path_controls_every_offload_field(self) -> None:
-        _ = write_config_fixture(self.settings, "mirror_busy_backoff_s=37\n", template="mac_test")
+        _ = write_config_fixture(self.settings, "mirror_busy_backoff_s=37\n", defaults=MAC_RUN_SETTINGS)
         for filename, budget_key in (("other-mac.conf", "mac_budget_gib"),
                                      ("linux.conf", "target_budget_gib")):
             with self.subTest(settings=filename):
                 settings = self.root / filename
                 _ = write_config_fixture(settings, "offload=on\nhost=other-mac\nconnect_timeout_s=2\nprobe_timeout_s=3\n"
                     + f"unreachable_backoff_s=4\nfree_floor_gib=5\n{budget_key}=6\n"
-                    + "mac_budget_gib.hana=7\nlinux_only.hana=local-package\nmirror_busy_backoff_s=91\n", template="mac_test")
+                    + "mac_budget_gib.hana=7\nlinux_only.hana=local-package\nmirror_busy_backoff_s=91\n", defaults=MAC_RUN_SETTINGS)
                 config = eligibility.read_config(settings)
                 self.assertTrue(config.enabled)
                 self.assertEqual(config.host, "other-mac")
@@ -685,7 +693,7 @@ class OffloadSettingsTests(unittest.TestCase):
         self.assertEqual(config.host, "mac")
 
     def test_no_argument_config_reader_uses_conf_dir(self) -> None:
-        _ = write_config_fixture(self.settings, "host=environment-mac\nprobe_timeout_s=7\n", template="mac_test")
+        _ = write_config_fixture(self.settings, "host=environment-mac\nprobe_timeout_s=7\n", defaults=MAC_RUN_SETTINGS)
         config = eligibility.read_config()
         self.assertEqual(config.host, "environment-mac")
         self.assertEqual(config.probe_timeout_s, 7)
@@ -713,7 +721,7 @@ class OffloadSettingsTests(unittest.TestCase):
             _ = eligibility.read_config(unknown)
 
     def test_reachability_probe_runs_only_a_read_only_remote_command(self) -> None:
-        _ = write_config_fixture(self.settings, "host=other-mac\nconnect_timeout_s=2\nprobe_timeout_s=3\n", template="mac_test")
+        _ = write_config_fixture(self.settings, "host=other-mac\nconnect_timeout_s=2\nprobe_timeout_s=3\n", defaults=MAC_RUN_SETTINGS)
         config = eligibility.read_config(self.settings)
         controller = offload.ProcessController()
         calls: list[tuple[list[str], offload.CommandDeadline]] = []
@@ -809,18 +817,18 @@ class OffloadSettingsTests(unittest.TestCase):
     @mock.patch("subprocess.run", new=RUN_SUBPROCESS)
     @mock.patch("subprocess.Popen", new=START_SUBPROCESS)
     def test_leftover_check_uses_configured_timeout_and_reports_it(self) -> None:
-        _ = write_config_fixture(self.settings, "leftover_timeout_s=0.125\n", template="mac_test")
+        _ = write_config_fixture(self.settings, "leftover_timeout_s=0.125\n", defaults=MAC_RUN_SETTINGS)
         config = eligibility.read_config(self.settings)
         with mock.patch.object(subprocess, "run", side_effect=subprocess.TimeoutExpired("ssh", 0.125)) as run:
             result = offload.check_leftovers(config.connection, "kept-host", HANA)
         self.assertEqual(run.call_args.kwargs["timeout"], 0.125)
         self.assertEqual(result, offload.LeftoverCheckFailed("SSH leftover check timed out after 0.125 s"))
         self.settings.unlink()
-        _ = write_config_fixture(self.settings, "leftover_timeout_s=10\n")
+        _ = write_config_fixture(self.settings, "leftover_timeout_s=10\n", defaults=MAC_RUN_SETTINGS)
         commit_config_fixture(self.settings)
         for value in ("bad", "0", "-1", "nan", "inf"):
             with self.subTest(value=value):
-                _ = write_config_fixture(self.settings, f"leftover_timeout_s={value}\n", template="mac_test")
+                _ = write_config_fixture(self.settings, f"leftover_timeout_s={value}\n", defaults=MAC_RUN_SETTINGS)
                 warning = io.StringIO()
                 with redirect_stderr(warning):
                     self.assertEqual(eligibility.read_config(self.settings).leftover_timeout_s, 10)
@@ -834,11 +842,10 @@ class OffloadSettingsTests(unittest.TestCase):
 
     def test_probe_that_cannot_start_reports_its_limit_through_run(self) -> None:
         from scripts.build_queue import admission_protocol as wire, placement
-        from scripts.build_queue.admission_test_support import AdmissionFixture
         from scripts.build_queue import admission_records as records
         from scripts.build_hold.owning_session import NoOwningSession
 
-        _ = write_config_fixture(self.settings, "offload=on\nlinux_only.hana=\nprobe_timeout_s=2.5\n", template="mac_test")
+        _ = write_config_fixture(self.settings, "offload=on\nlinux_only.hana=\nprobe_timeout_s=2.5\n", defaults=MAC_RUN_SETTINGS)
         fixture = self.enterContext(AdmissionFixture(root=self.root))
         start = records.process_start_time(os.getpid())
         assert start is not None
@@ -901,7 +908,9 @@ class OffloadSettingsTests(unittest.TestCase):
 @final
 class MacPlacementWaitTests(unittest.TestCase):
     def test_a_mac_copy_waits_for_the_mac_while_its_local_parent_holds_memory(self) -> None:
-        with AdmissionFixture() as fixture:
+        from scripts.build_queue.test_placement import PlacementFixture
+
+        with PlacementFixture() as fixture:
             owner = fixture.fixture_owner(4094003, "35916506")
             run = wire.RunIdentity(owner.pid, owner.start_time)
             parent = fixture.request(need=14912008192, owner=owner,
@@ -1192,11 +1201,11 @@ class OffloadCommandTests(OffloadCommandFixture):
         alternate = self.root / "alternate settings.conf"
         values = {**self.config, "host": "alternate-mac", "mac_budget_gib.hana": "8"}
         _ = write_config_fixture(alternate, "".join(f"{key}={value}\n" for key, value in values.items()),
-                                 template="mac_test")
+                                 defaults=MAC_RUN_SETTINGS)
         self.config["offload"] = "off"
         self.sync_config()
         linux_settings = self.root / "linux.conf"
-        _ = write_config_fixture(linux_settings, "offload=on\nhost=fixture-linux\nkinds=test\n", template="mac_test")
+        _ = write_config_fixture(linux_settings, "offload=on\nhost=fixture-linux\nkinds=test\n", defaults=MAC_RUN_SETTINGS)
         registry = self.root / "build_targets.conf"
         _ = registry.write_text("targets=mac,builder\nkind.mac=ssh\nplatform.mac=macos\n"
             + f"settings.mac={alternate}\nkind.builder=ssh\nplatform.builder=linux\nsettings.builder={linux_settings}\n")

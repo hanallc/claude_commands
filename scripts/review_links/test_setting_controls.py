@@ -6,6 +6,7 @@ import unittest
 
 from scripts.review_links import console_theme, page_frame, setting_controls
 from scripts.review_links.test_accounts_page import firefox_probe_results
+from scripts.review_links.test_page_frame import status_configuration
 
 
 def cost_limit(value: str, live: str) -> str:
@@ -153,6 +154,7 @@ class SettingControlsTests(unittest.TestCase):
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for the shared controls.")
     def test_go_confirms_cancels_saves_and_reports_a_refusal(self) -> None:
+        self.enterContext(status_configuration())
         markup = page_frame.template(
             '<!doctype html><html lang="en"><head><meta charset="utf-8"><style>' + console_theme.TOKENS
             + '</style>__PAGE_SETTING_CONTROLS__</head><body>' + cost_limit("1.50", "1.00") + budget() + go() + GO_PROBE + '</body></html>',

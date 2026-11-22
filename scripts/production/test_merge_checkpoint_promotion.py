@@ -37,7 +37,10 @@ from scripts.production.production_doc import Production, ProductionDocument
 # Importable once merge_checkpoint has put scripts/lib on the path.
 
 
-from scripts.production.merge_checkpoint_test_support import DELIVERS, MergeCheckpointFixture, STARTED, STUB, TRIAL, configure_test_environment
+from scripts.production.merge_checkpoint_test_support import (
+    DELIVERS, MergeCheckpointFixture, STARTED, STUB, TRIAL, checkpoint_pull_settings, configure_test_environment,
+)
+from scripts.lint.memory_test_support import write_config_fixture
 
 
 MERGED_AT = datetime(2026, 10, 6, 12, tzinfo=ZoneInfo("America/Los_Angeles"))
@@ -961,7 +964,7 @@ with lock.open("a") as held:
 
     def test_mac_pull_retries_once_then_succeeds(self) -> None:
         config = self.root / "merge_checkpoint.conf"
-        _ = config.write_text("# whole: 1..\nMAC_PULL_TRIES=3\n# range: 0..\nMAC_PULL_RETRY_SECONDS=0\n")
+        _ = write_config_fixture(config, defaults=checkpoint_pull_settings())
         self.env["CONF_DIR"] = str(Path(config).parent)
         self.promotions = str(self.promote) + ", mac " + str(self.root / "mac-installed")
         self.production_doc()
@@ -979,7 +982,7 @@ with lock.open("a") as held:
 
     def test_mac_pull_stops_after_configured_tries_with_the_last_failure(self) -> None:
         config = self.root / "merge_checkpoint.conf"
-        _ = config.write_text("# whole: 1..\nMAC_PULL_TRIES=2\n# range: 0..\nMAC_PULL_RETRY_SECONDS=0\n")
+        _ = write_config_fixture(config, "MAC_PULL_TRIES=2\n", defaults=checkpoint_pull_settings())
         self.env["CONF_DIR"] = str(Path(config).parent)
         self.promotions = str(self.promote) + ", mac " + str(self.root / "mac-installed")
         self.production_doc()

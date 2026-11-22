@@ -25,11 +25,13 @@ import unittest
 from unittest import mock
 
 from scripts.build_queue import execution_identity
+from scripts.agents.test_support import write_machine_config
 from scripts.accounts import outage_alerts
 from scripts.message import send_result
 from scripts.message import roster
 from scripts.message.session_send import session_send_argv
-from scripts.message.session_send_test_support import forbid_real_sender
+from scripts.lint.config_test_support import LINT_SENDER_SETTINGS
+from scripts.message.session_send_test_support import SEND_TIMING_FIXTURES, forbid_real_sender
 from scripts.message.codex_test_support import FakeDaemon, receive_frame, reply, write_codex_account
 from scripts.lib.socket_test_support import short_socket_directory
 from scripts.lib.test_hang_guard import LauncherHangGuard
@@ -50,7 +52,12 @@ from scripts.build_queue.admission_test_support import (
 )
 from scripts.build_queue.queue_fixture import QueueFixture, write_memory_config
 from scripts.build_queue.test_snapshot_codec import service_snapshot
-from scripts.lint.memory_test_support import commit_config_fixture, config_environment, write_config_fixture, write_pressure_reading
+from scripts.accounts.home_test_support import ACCOUNT_OUTAGE_SETTINGS
+from scripts.mac_test.config_test_support import MAC_RUN_SETTINGS
+from scripts.lint.memory_test_support import (
+    commit_config_fixture, config_environment, fixture_feed_code_settings, seed_config_fixture_folder,
+    write_config_fixture, write_pressure_reading,
+)
 
 WAIT = wait_reply(records.NeedsMemory(), 1, "head", "free memory")
 EXPIRED = wait_reply(records.EstimateExpired(1), 1, "head", "estimate expired")
@@ -88,6 +95,7 @@ def await_private_socket(fixture: AdmissionFixture, reader: socket.socket, timeo
 
 def setUpModule() -> None:
     forbid_real_sender()
+    _ = cast(object, unittest.enterModuleContext(mock.patch.dict(os.environ, {"USER_ZONE": "UTC"})))
 
 
 class ClientTests(unittest.TestCase):
@@ -448,8 +456,12 @@ class ClientTests(unittest.TestCase):
                 "ROSTER_RUN_ROOT": str(root / "runs"), "HERDR_PROC": str(root / "proc"),
                 "DESIGN_ROLES_STATE": str(root / "roles"), "XDG_STATE_HOME": str(root / "state"),
                 **config_environment(root / "config")}
+            seed_config_fixture_folder(root / "config", {
+                **SEND_TIMING_FIXTURES, "lint.conf": LINT_SENDER_SETTINGS,
+            })
+            write_machine_config(root / "config")
             direct_config = root / "config/direct.conf"
-            _ = direct_config.write_text(direct_config.read_text())
+            _ = direct_config.write_text("# Worker settings.\n")
             received: list[dict[str, object]] = []
 
             def receive(connection: socket.socket) -> None:
@@ -493,7 +505,7 @@ class ClientTests(unittest.TestCase):
                 with FakeDaemon(address, receive, repeat=True):
                     result = subprocess.run(command, input=message, text=True, capture_output=True,
                         env=child_environment, timeout=30, check=False)
-            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             outcome = send_result.send_outcome(result.returncode, result.stdout)
             self.assertIsInstance(outcome, send_result.ConfirmedSendOutcome)
             assert isinstance(outcome, send_result.ConfirmedSendOutcome)
@@ -643,14 +655,16 @@ class ClientTests(unittest.TestCase):
                  AdmissionFixture() as fixture, mock.patch.object(client, "CLOCK", fixture.clock):
                 if execution_target == "mac-kept-claim":
                     fixture.configure(remote_start_hold_seconds=hold_seconds)
+                targets = "targets=natedev\n"
+                settings = "kind.natedev=local\nplatform.natedev=linux\n"
                 if execution_target != "local":
                     _ = subprocess.run(["git", "init", "-q", str(fixture.root)], capture_output=True, check=True)
                     _ = (fixture.root / "Cargo.toml").write_text('[package]\nname="sample"\nversion="0.1.0"\n')
                     _ = write_config_fixture(fixture.root / "mac_test.conf",
-                        f"offload=on\nlinux_only.{fixture.root.name}=\n", template="mac_test")
-                    _ = (fixture.root / "build_targets.conf").write_text(
-                        "targets=natedev,mac\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n"
-                        + "kind.natedev=local\nplatform.natedev=linux\n")
+                        f"offload=on\nlinux_only.{fixture.root.name}=\n", defaults=MAC_RUN_SETTINGS)
+                    targets = "targets=natedev,mac\n"
+                    settings += "kind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n"
+                _ = (fixture.root / "build_targets.conf").write_text(targets + settings)
                 occupied = fixture.occupy_host()
                 fixture.free(0)
                 request = fixture.request()
@@ -859,7 +873,7 @@ class ClientTests(unittest.TestCase):
                 _ = subprocess.run(["git", "init", "-q", str(fixture.root)], capture_output=True, check=True)
                 _ = (fixture.root / "Cargo.toml").write_text('[package]\nname="sample"\nversion="0.1.0"\n')
                 _ = write_config_fixture(fixture.root / "mac_test.conf",
-                    f"offload=on\nlinux_only.{fixture.root.name}=\n", template="mac_test")
+                    f"offload=on\nlinux_only.{fixture.root.name}=\n", defaults=MAC_RUN_SETTINGS)
                 _ = (fixture.root / "build_targets.conf").write_text(
                     "targets=mac,natedev\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n"
                     + "kind.natedev=local\nplatform.natedev=linux\n")
@@ -924,15 +938,17 @@ class ClientTests(unittest.TestCase):
                     self.assertEqual(client.constrained_step_route(pinned, constraints), pinned)
 
     def test_final_waiter_records_its_fixed_local_route(self) -> None:
-        from scripts.build_queue import placement
-        from scripts.build_queue import target_availability, memory_feed
+        from scripts.build_queue import placement, target_availability
         from datetime import UTC
+
+        with fixture_feed_code_settings():
+            from scripts.build_queue import memory_feed
 
         with AdmissionFixture() as fixture:
             _ = subprocess.run(["git", "init", "-q", str(fixture.root)], capture_output=True, check=True)
             _ = (fixture.root / "Cargo.toml").write_text('[package]\nname="sample"\nversion="0.1.0"\n')
             _ = write_config_fixture(fixture.root / "mac_test.conf",
-                f"offload=on\nlinux_only.{fixture.root.name}=\n", template="mac_test")
+                f"offload=on\nlinux_only.{fixture.root.name}=\n", defaults=MAC_RUN_SETTINGS)
             _ = (fixture.root / "build_targets.conf").write_text(
                 "targets=mac,natedev\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n"
                 + "kind.natedev=local\nplatform.natedev=linux\n")
@@ -970,7 +986,7 @@ class ClientTests(unittest.TestCase):
             _ = subprocess.run(["git", "init", "-q", str(fixture.root)], capture_output=True, check=True)
             _ = (fixture.root / "Cargo.toml").write_text('[package]\nname="sample"\nversion="0.1.0"\n')
             _ = write_config_fixture(fixture.root / "mac_test.conf",
-                f"offload=on\nlinux_only.{fixture.root.name}=\n", template="mac_test")
+                f"offload=on\nlinux_only.{fixture.root.name}=\n", defaults=MAC_RUN_SETTINGS)
             _ = (fixture.root / "build_targets.conf").write_text(
                 "targets=mac,natedev\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n"
                 + "kind.natedev=local\nplatform.natedev=linux\n")
@@ -1002,7 +1018,7 @@ class ClientTests(unittest.TestCase):
                 _ = subprocess.run(["git", "init", "-q", str(fixture.root)], capture_output=True, check=True)
                 _ = (fixture.root / "Cargo.toml").write_text('[package]\nname="sample"\nversion="0.1.0"\n')
                 _ = write_config_fixture(fixture.root / "mac_test.conf",
-                    f"offload=on\nlinux_only.{fixture.root.name}=\n", template="mac_test")
+                    f"offload=on\nlinux_only.{fixture.root.name}=\n", defaults=MAC_RUN_SETTINGS)
                 _ = (fixture.root / "build_targets.conf").write_text(
                     "targets=mac\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n")
                 request = fixture.request(step="check")
@@ -1865,6 +1881,7 @@ class ClientTests(unittest.TestCase):
 
     def test_down_alert_sends_once_until_a_restart_runs_for_the_silence_interval(self) -> None:
         with AdmissionFixture() as fixture:
+            seed_config_fixture_folder(fixture.root, {**SEND_TIMING_FIXTURES, "accounts.conf": ACCOUNT_OUTAGE_SETTINGS})
             fixture.clock.epoch = time.time()
             fixture.configure(silence_seconds=10, reconnect_seconds=1)
             commands: list[tuple[list[str], str]] = []
@@ -1918,6 +1935,7 @@ class ClientTests(unittest.TestCase):
             ("refused", "refused", False), ("retry", "retry", False))
         for session, phone, retained in cases:
             with self.subTest(session=session, phone=phone), AdmissionFixture() as fixture:
+                seed_config_fixture_folder(fixture.root, SEND_TIMING_FIXTURES)
                 fixture.configure(silence_seconds=2, reconnect_seconds=1)
                 replies = [subprocess.CompletedProcess([], send_result.EXIT[outcome],
                     f"{outcome.upper()}: stub delivery\n", "") for outcome in (session, phone)]

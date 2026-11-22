@@ -22,6 +22,7 @@ from typing import cast, override
 from scripts.lib import copy_record, scratch, session_folder, session_move
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.transcript_test_support import compressed_copy
+from scripts.lib.scratch_test_support import write_scratch_settings
 from scripts.lint.memory_test_support import config_environment
 from scripts.message import session_records
 from scripts.production import staff
@@ -44,6 +45,7 @@ class SessionMoveTests(unittest.TestCase):
         self.scratch_root = self.base / "scratch"
         self.holds = self.base / "holds.json"
         self.claude = f"claude-{os.getuid()}"
+        write_scratch_settings(self.base / "config", self.base)
         for path in (self.root, self.former, self.scratch_root):
             path.mkdir(parents=True)
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {

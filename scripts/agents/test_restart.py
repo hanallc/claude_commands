@@ -1,7 +1,10 @@
 """Restart staff rows without a session journal."""
 from __future__ import annotations
 
+from scripts.direct.assign_launcher_test_support import ASSIGNMENT_SETTINGS
+from scripts.lib.build_folders_test_support import workspace_folder_settings
 from scripts.lint.memory_test_support import write_config_fixture
+from scripts.message.codex_test_support import CODEX_DAEMON_SETTINGS
 
 from scripts.agents import remote
 from scripts.herdr import herdr_types
@@ -48,10 +51,10 @@ from scripts.lib import conf, file_lock, unit_runs, resume_message
 from scripts.lib.transcript_test_support import compressed_copy
 from scripts.lib.test_models_registry import claude_catalog_environment, write_registry
 from scripts.lib.atomic_file import write_text_atomic
-from scripts.production.staff_test_support import fixture_member
+from scripts.production.staff_test_support import fixture_member, write_staff_settings
 from scripts.herdr.fake_herdr import herdr_listener
 from scripts.direct import progress_history
-from scripts.agents.test_support import ShutdownTestCase, registry_confirmation
+from scripts.agents.test_support import SHUTDOWN_SETTINGS, ShutdownTestCase, registry_confirmation
 from scripts.lib.script_envelope import script_prompt
 
 LAUNCH_PREPARED_AGENT = herdr.launch_prepared_agent
@@ -618,8 +621,11 @@ class RecordedResumeTests(RestartTestCase):
     def setUp(self) -> None:
         super().setUp()
         configuration = Path(self.enterContext(tempfile.TemporaryDirectory()))
-        for source in (Path(__file__).resolve().parents[2] / "config").glob("*.conf"):
-            _ = write_config_fixture(configuration / source.name)
+        _ = write_config_fixture(configuration / "build_folders.conf",
+                                 defaults=workspace_folder_settings(configuration))
+        _ = write_staff_settings(configuration / "staff.conf", producers=configuration / "producers")
+        _ = write_config_fixture(configuration / "shutdown.conf", defaults=SHUTDOWN_SETTINGS)
+        _ = write_config_fixture(configuration / "codex_daemon.conf", defaults=CODEX_DAEMON_SETTINGS)
         _ = cast(object, self.enterContext(patch.dict(os.environ, {"CONF_DIR": str(configuration)})))
 
     folder: Path = Path("/tmp/recorded-resume")
@@ -774,8 +780,12 @@ class MixedRestartTests(ShutdownTestCase):
             "MODELS_CONFIG_FILE": str(root / "conf/models.conf"), "MODELS_CONFIG_PUBLISH": "0",
             "CODEX_THREAD_ID": "", "CLAUDE_CODE_SESSION_ID": ""}
         _ = cast(object, fixture.enter_context(patch.dict(os.environ, environment)))
-        for source in (Path(__file__).resolve().parents[2] / "config").glob("*.conf"):
-            _ = write_config_fixture(root / 'conf' / source.name)
+        _ = write_config_fixture(root / "conf/build_folders.conf",
+                                 defaults=workspace_folder_settings(root))
+        _ = write_staff_settings(root / "conf/staff.conf", producers=root / "producers")
+        _ = write_config_fixture(root / "conf/shutdown.conf", defaults=SHUTDOWN_SETTINGS)
+        _ = write_config_fixture(root / "conf/direct.conf", defaults=ASSIGNMENT_SETTINGS["direct"])
+        _ = write_config_fixture(root / "conf/codex_daemon.conf", defaults=CODEX_DAEMON_SETTINGS)
         registry = root / "conf/models.conf"
         invalid_role = role_case in ("selected", "owner", "owner-lock")
         if invalid_role:
@@ -1272,10 +1282,12 @@ class RestartTests(RestartTestCase):
     def setUp(self) -> None:
         super().setUp()
         configuration = Path(self.enterContext(tempfile.TemporaryDirectory()))
-        for source in (Path(__file__).resolve().parents[2] / "config").glob("*.conf"):
-            _ = write_config_fixture(configuration / source.name)
+        _ = write_config_fixture(configuration / "build_folders.conf",
+                                 defaults=workspace_folder_settings(configuration))
         _ = cast(object, self.enterContext(patch.dict(os.environ, {"CONF_DIR": str(configuration)})))
-        _ = write_config_fixture(configuration / "staff.conf", "PRODUCER_WORKSPACE=producers\n")
+        _ = write_staff_settings(configuration / "staff.conf", producers=configuration / "producers")
+        _ = write_config_fixture(configuration / "shutdown.conf", defaults=SHUTDOWN_SETTINGS)
+        _ = write_config_fixture(configuration / "codex_daemon.conf", defaults=CODEX_DAEMON_SETTINGS)
         _ = write_registry(configuration / "models.conf", {"producers": {
             "unit-0": "claude:opus:max", "probe-codex": "codex:gpt-test:high",
             "morty": "claude:opus:max", "TEST-agent": "claude:opus:max",
@@ -1288,6 +1300,7 @@ class RestartTests(RestartTestCase):
             "projects": {str(self.root): {"hasTrustDialogAccepted": True}},
         }))
         _ = cast(object, self.enterContext(patch.dict(os.environ, {"SHUTDOWN_STATE_DIR": str(self.root),
+                                                     "AGENT_NOTES_DIR": str(self.root / "notes"),
                                                      "XDG_STATE_HOME": str(self.root), "HOME": str(self.root),
                                                      "CODEX_HOME": str(self.root / ".codex"),
                                                      "CLAUDE_CONFIG_DIR": str(config)})))
@@ -4020,8 +4033,12 @@ class RetainedSplitRestartTests(RestartTestCase):
         self.addCleanup(fixture.doCleanups)
         root = fixture.root
         config = root / "conf"
-        for source in (Path(__file__).resolve().parents[2] / "config").glob("*.conf"):
-            _ = write_config_fixture(config / source.name)
+        _ = write_config_fixture(config / "build_folders.conf",
+                                 defaults=workspace_folder_settings(root))
+        _ = write_staff_settings(config / "staff.conf", producers=root / "producers")
+        _ = write_config_fixture(config / "shutdown.conf", defaults=SHUTDOWN_SETTINGS)
+        _ = write_config_fixture(config / "direct.conf", defaults=ASSIGNMENT_SETTINGS["direct"])
+        _ = write_config_fixture(config / "codex_daemon.conf", defaults=CODEX_DAEMON_SETTINGS)
         write_text_atomic(config / "models.conf", registry_text())
         _ = cast(object, self.enterContext(patch.dict(os.environ, {"CONF_DIR": str(config),
             "MODELS_CONFIG_FILE": str(config / "models.conf"), "MODELS_CONFIG_PUBLISH": "0",

@@ -8,6 +8,7 @@ from typing import cast
 
 from scripts.direct import verify_ssh_targets_test_support as support
 from scripts.direct.verify_ssh_targets_test_support import VerifySshTargetsFixture
+from scripts.mac_test.config_test_support import MAC_RUN_SETTINGS
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.build_queue.admission_test_support import caller_provider_controls
 
@@ -51,7 +52,7 @@ class VerifySshRetryTests(VerifySshTargetsFixture):
         _ = registry.write_text(registry.read_text()
                                 + "kind.mac2=ssh\nplatform.mac2=macos\nsettings.mac2=mac2.conf\n")
         _ = write_config_fixture(self.root / "mac2.conf", (self.root / "mac_test.conf").read_text(),
-                                 template="mac_test")
+                                 defaults=MAC_RUN_SETTINGS)
         state = Path(self.environment["MAC_TEST_STATE_DIR"])
         state.mkdir(parents=True, exist_ok=True)
         _ = (state / "unreachable_until").write_text(str(10**12))

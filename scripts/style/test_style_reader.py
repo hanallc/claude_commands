@@ -12,8 +12,9 @@ import unittest
 from typing import cast, override
 from unittest.mock import patch
 
-from scripts.style import declarations, style_plan, style_reader, style_reader_oracle
-from scripts.style.style_reader_test_support import oracle_reader
+from scripts.lint.memory_test_support import write_config_fixture
+from scripts.style import declarations, style_config, style_plan, style_reader, style_reader_oracle
+from scripts.style.style_reader_test_support import oracle_reader, style_reader_settings
 
 
 class ReaderClientTests(unittest.TestCase):
@@ -93,8 +94,7 @@ class ReaderClientTests(unittest.TestCase):
             with self.subTest(binary="shared oracle"):
                 configuration = root / "config"
                 configuration.mkdir()
-                _ = (configuration / "style_reader.conf").write_text(
-                    "# whole: 1..\nprotocol=7\n# text:\nminimum_version=2.3.4\n")
+                _ = write_config_fixture(configuration / "style_reader.conf", defaults=style_reader_settings())
                 self.addCleanup(style_reader.reset_reader_cache)
                 with patch.dict(os.environ, {"CONF_DIR": str(configuration)}), oracle_reader() as oracle:
                     self.assertEqual(style_reader.reader_binary(), oracle)
@@ -132,9 +132,8 @@ class InstalledReaderTests(unittest.TestCase):
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         (self.root / "bin").mkdir()
         self.calls = self.root / "calls"
-        _ = (self.root / "style_reader.conf").write_text(
-            "# one of: python, rust\nreader=rust\n# whole: 1..\nprotocol=7\n"
-            + "# text:\nminimum_version=2.3.4\n")
+        _ = write_config_fixture(self.root / "style_reader.conf",
+                                 defaults=style_reader_settings(style_config.ReaderSource.RUST))
         _ = cast(object, self.enterContext(patch.dict(os.environ, {
             "CONF_DIR": str(self.root), "PATH": str(self.root / "bin")})))
         _ = os.environ.pop("STYLE_READER_BINARY", None)

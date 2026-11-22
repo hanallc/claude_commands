@@ -11,7 +11,6 @@ import json
 import re
 import sys
 from bisect import bisect_left, bisect_right
-from dataclasses import dataclass
 from typing import TypedDict, cast
 
 from scripts.lib import conf
@@ -31,34 +30,6 @@ NON_PROSE = re.compile(
 class StopPayload(TypedDict, total=False):
     last_assistant_message: str
     stop_hook_active: bool
-
-
-@dataclass(frozen=True)
-class DeferralRules:
-    window: int
-    phrases: dict[str, re.Pattern[str]]
-
-
-def read_rules() -> DeferralRules:
-    groups: dict[str, list[str]] = {}
-    for line in conf.path("context_deferral").read_text(encoding="utf-8").splitlines():
-        line = line.partition("#")[0].strip()
-        if not line:
-            continue
-        kind, separator, value = line.partition(":")
-        value = value.strip()
-        if not separator or kind not in ("window", "action", "marker", "state", "later", "exclude") or not value:
-            raise ValueError("Invalid context deferral entry")
-        groups.setdefault(kind, []).append(value)
-    if any(kind not in groups for kind in ("window", "action", "exclude")) or len(groups["window"]) != 1:
-        raise ValueError("Missing or repeated context deferral setting")
-    window = int(groups.pop("window")[0])
-    if window <= 0:
-        raise ValueError("The context deferral window must be positive")
-    return DeferralRules(window, {
-        kind: re.compile("|".join(f"(?:{value})" for value in values), re.IGNORECASE)
-        for kind, values in groups.items()
-    })
 
 
 def prose(text: str) -> str:
@@ -81,7 +52,7 @@ def neighbors(matches: list[re.Match[str]], action: re.Match[str]) -> list[re.Ma
     return [matches[index] for index in (before, after - 1, after) if 0 <= index < len(matches)]
 
 
-def blocks(text: str, rules: DeferralRules) -> bool:
+def blocks(text: str, rules: conf.DeferralRules) -> bool:
     matches = {kind: list(pattern.finditer(text)) for kind, pattern in rules.phrases.items()}
     markers = matches.get("marker", [])
     states = matches.get("state", [])
@@ -115,7 +86,8 @@ def main() -> None:
     text = payload.get("last_assistant_message", "")
     if not text:
         return
-    if blocks(prose(text), read_rules()):
+    source = conf.path("context_deferral").read_text(encoding="utf-8")
+    if blocks(prose(text), conf.parse_context_deferral(source)):
         print(REASON, file=sys.stderr)
         raise SystemExit(2)
 

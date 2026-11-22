@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from scripts.lint.memory_test_support import write_config_fixture
+from scripts.lib.build_slots_test_support import copy_fixture_settings
 
 import io
 import json
@@ -193,7 +194,7 @@ class CodexHookInstallerTests(unittest.TestCase):
             "PATH": str(bin_dir),
         }
         copies_config = self.root / "fixture-config/copies.conf"
-        _ = write_config_fixture(copies_config, "guard_timeout_seconds=10\n")
+        _ = write_config_fixture(copies_config, defaults=copy_fixture_settings(self.root))
         self.environment["COPIES_CONFIG"] = str(copies_config)
         _ = self.environment.pop("CODEX_BIN", None)
         _ = self.environment.pop("STUB_DISABLED", None)
@@ -690,7 +691,8 @@ class CodexHookInstallerTests(unittest.TestCase):
         self.environment["COPIES_CONFIG"] = str(directory / "copies.conf")
         for seconds, expected, user_seconds, user_expected in ((10.0, 10, 5.0, 5), (10.25, 11, 5.25, 6)):
             with self.subTest(seconds=seconds):
-                _ = write_config_fixture(directory / "copies.conf", f"guard_timeout_seconds={seconds}\n")
+                _ = write_config_fixture(directory / "copies.conf", f"guard_timeout_seconds={seconds}\n",
+                                         defaults=copy_fixture_settings(self.root))
                 handler = {"type": "command", "command": GUARD_COMMAND, "timeout": seconds}
                 user_handler = {"type": "command", "command": "user-hook", "timeout": user_seconds,
                                 "statusMessage": "Running the user hook"}

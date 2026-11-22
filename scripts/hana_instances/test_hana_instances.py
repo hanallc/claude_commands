@@ -43,6 +43,16 @@ sleep() {
 }
 '''
 
+INSTANCE_SETTINGS = """\
+exempt_ports=31000,31001
+# range: 0..
+test_max_hours=2.5
+# range: 0..
+unlabelled_max_minutes=7
+# range: 0..
+stop_grace_seconds=0.125
+"""
+
 
 class HanaInstancesTests(unittest.TestCase):
     root: Path = Path()
@@ -78,10 +88,7 @@ class HanaInstancesTests(unittest.TestCase):
         self.mac_environment_failure = False
         _ = (self.root / "remote-identity").write_text(MAC_STARTED)
         self.config = self.root / "config/hana_instances.conf"
-        _ = write_config_fixture(self.config,
-            "exempt_ports=31000,31001\ntest_max_hours=2.5\n"
-            + "unlabelled_max_minutes=7\nstop_grace_seconds=0.125\n"
-        )
+        _ = write_config_fixture(self.config, defaults=INSTANCE_SETTINGS)
         self.mac_config = self.config.parent / "mac_test.conf"
         _ = write_config_fixture(self.mac_config, "host=private-mac\nconnect_timeout_s=2\nprobe_timeout_s=3\n")
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, config_environment(self.config.parent))))
@@ -90,7 +97,8 @@ class HanaInstancesTests(unittest.TestCase):
 
     def test_config_folder_selects_limits_and_exempt_ports_at_use(self) -> None:
         other = self.root / "other-config"
-        _ = write_config_fixture(other / "hana_instances.conf", "exempt_ports=32000\ntest_max_hours=3.75\n")
+        _ = write_config_fixture(other / "hana_instances.conf", "exempt_ports=32000\ntest_max_hours=3.75\n",
+                                 defaults=INSTANCE_SETTINGS)
         with mock.patch.dict(os.environ, config_environment(other)):
             config = hana_instances.read_config()
         self.assertEqual(config.exempt_ports, frozenset({32000}))

@@ -43,7 +43,7 @@ from scripts.build_hold.owning_session import NoOwningSession, OwningSession
 from scripts.build_targets import build_targets
 from scripts.build_queue.queue_fixture import blocking_slot, fixture_reservation, write_process, write_scope
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS, LauncherHangGuard
-from scripts.lib.socket_test_support import short_socket_directory
+from scripts.lib.socket_test_support import SYSTEM_SOCKET_ROOT, short_socket_directory
 
 NOW = datetime(2026, 10, 31, 12, tzinfo=UTC).timestamp()
 GIB = records.GIB
@@ -369,7 +369,7 @@ class AdmissionFixture(ExitStack):
         self.temporary.mkdir(parents=True, exist_ok=True)
         # AF_UNIX addresses have a small byte limit; TMPDIR may be a deep merge checkout.
         self.socket_dir: Path = Path(self.enter_context(
-            short_socket_directory()))
+            short_socket_directory(system_root=SYSTEM_SOCKET_ROOT)))
         self.state_dir: Path = (log_dir if log_dir is not None else self.root / "log") / "admission"
         self.state_dir.mkdir(parents=True, exist_ok=True)
         self.socket_path: Path = self.socket_dir / "admission.sock"

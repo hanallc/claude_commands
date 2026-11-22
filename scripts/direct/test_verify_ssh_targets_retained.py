@@ -19,6 +19,7 @@ from scripts.build_queue import admission_protocol as wire, placement
 from scripts.build_queue.admission_test_support import caller_provider_controls
 from scripts.direct import verify_ssh_targets_test_support as support
 from scripts.direct.verify_ssh_targets_test_support import VerifySshTargetsFixture
+from scripts.mac_test.config_test_support import MAC_RUN_SETTINGS
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.lib.process_start_test_support import process_reader
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -77,7 +78,7 @@ if output_size:
         _ = write_config_fixture(self.root / "linux_target.conf",
                                  (self.root / "linux_target.conf").read_text()
                                  + f"slots={old_capacity}\nslots.hana={old_capacity}\n",
-                                 template="mac_test")
+                                 defaults=MAC_RUN_SETTINGS)
         paths: list[Path] = []
         with mock.patch.dict(os.environ, self.environment), \
              mock.patch.object(Path, "home", return_value=self.home), \
@@ -95,7 +96,7 @@ if output_size:
         self.assertEqual(len(paths), old_capacity)
         # The current step has one slot. The other old claim remains outside current capacity.
         settings = self.root / "linux_target.conf"
-        _ = write_config_fixture(settings, settings.read_text() + "slots=1\nslots.hana=1\n", template="mac_test")
+        _ = write_config_fixture(settings, settings.read_text() + "slots=1\nslots.hana=1\n", defaults=MAC_RUN_SETTINGS)
         return paths
 
     def test_queue_retry_cleans_retained_slots_after_their_owners_exit(self) -> None:

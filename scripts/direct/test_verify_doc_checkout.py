@@ -16,7 +16,6 @@ from unittest import mock
 
 from scripts.build_queue import execution_identity
 from scripts.build_queue import admission_protocol as wire, admission_service as service
-from scripts.build_queue.memory_feed import FeedStaff
 from scripts.agents.remote import local_machine
 from scripts.buildlog import treekey
 from scripts.build_queue.admission_test_support import caller_admission
@@ -25,9 +24,13 @@ from scripts.direct.verify_mac_offload_test_support import processes_carrying, r
 from scripts.direct.wait_for_test_state import wait_for_pid, wait_until
 from scripts.lib import build_folders, build_slots
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
-from scripts.lint.memory_test_support import write_pressure_reading
+from scripts.lint.memory_test_support import fixture_feed_code_settings, write_pressure_reading
 from scripts.production import staff
 from scripts.production.staff_test_support import build_fixture_sessions, fixture_member, isolated_staff_file
+
+
+with fixture_feed_code_settings():
+    from scripts.build_queue.memory_feed import FeedStaff
 
 
 DOC_COMMAND = ("bash", str(VERIFY), "doc")

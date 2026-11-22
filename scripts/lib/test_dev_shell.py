@@ -16,6 +16,7 @@ from typing import final, override
 from scripts.build_hold.override_guard import require_checkout
 from scripts.lib import dev_shell
 from scripts.lib.shell_test_support import shell_functions
+from scripts.lint.memory_test_support import write_config_fixture
 
 require_checkout(Path(__file__))
 
@@ -48,7 +49,11 @@ class DevShellTests(unittest.TestCase):
         nix = folder / "nix"
         _ = nix.write_text(FAKE_NIX)
         nix.chmod(0o755)
+        configuration = self.root / "configuration"
+        _ = write_config_fixture(configuration / "dev_shell.conf",
+                                 defaults="selector=default\ncache=fixture-cache\n# range: 1..60\ntimeout_s=5\n")
         self.environment = {**os.environ, "HOME": str(self.root / "home"), "STORE": STORE,
+                            "CONF_DIR": str(configuration),
                             "PATH": f"{folder}:{os.environ['PATH']}", "NIX_CALLS": str(self.root / "calls")}
 
     def program_path(self, **extra: str) -> subprocess.CompletedProcess[str]:

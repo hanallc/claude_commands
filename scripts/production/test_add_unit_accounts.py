@@ -6,6 +6,7 @@ import argparse
 import io
 import json
 import os
+import shutil
 import unittest
 from contextlib import redirect_stderr
 from pathlib import Path
@@ -114,7 +115,7 @@ class AddUnitAccountsTests(AddUnitTestCase):
 
     def test_named_unit_account_paths_are_literal_pane_environment_values(self) -> None:
         home = self.root / "home with 'quotes' $()"
-        _ = Path(self.env["HOME"]).rename(home)
+        _ = shutil.copytree(self.env["HOME"], home)
         self.env["HOME"] = str(home)
         self.env["NOTIFIER_SESSIONS_DIR"] = str(home / ".claude/sessions")
         self.env["CLAUDE_CONFIG_DIR"] = str(self.root / "caller account")

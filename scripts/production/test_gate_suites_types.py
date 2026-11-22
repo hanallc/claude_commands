@@ -1,7 +1,9 @@
 """Merge gate suites contracts."""
 
 from __future__ import annotations
-from scripts.lint.memory_test_support import copy_config_fixture, write_config_fixture
+from scripts.agents.test_support import SHUTDOWN_SETTINGS
+from scripts.lint.memory_test_support import seed_config_fixture_folder
+from scripts.message.session_send_test_support import SEND_TIMING_FIXTURES
 
 import unittest
 import fcntl
@@ -23,11 +25,12 @@ from scripts.agents import remote
 from scripts.copies import copies
 from scripts.direct import progress_history
 from scripts.lib import build_folders
+from scripts.notify import review
 from scripts.production import change_review, gate, staff, showrunners
 from scripts.production.staff_test_support import isolated_staff_file, fixture_member
 from scripts.production.gate_modules import GateRefused
 from scripts.production.cli_fixture import invoke_cli
-from scripts.production.gate_test_support import gate_suites, wait_for_file
+from scripts.production.gate_test_support import NIGHTLY_RESULT_SETTINGS, gate_suites, wait_for_file
 from scripts.production.gate_suites_test_support import GateSuitesFixture
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
@@ -394,9 +397,10 @@ class NightlyPushTests(unittest.TestCase):
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         config = self.root / "config"
-        _ = copy_config_fixture(Path(__file__).resolve().parents[2] / "config", config)
-        _ = write_config_fixture(config / "gate.conf",
-            "nightly_result_push=on\nnightly_result_modules=8\nnightly_assign_minutes=30\n")
+        seed_config_fixture_folder(config, {**SEND_TIMING_FIXTURES,
+            "gate.conf": NIGHTLY_RESULT_SETTINGS, "shutdown.conf": SHUTDOWN_SETTINGS,
+            "notify.conf": "REVIEW_TIMEOUT_SECONDS=60\n"})
+        _ = self.enterContext(mock.patch.object(review, "NOTIFY_CONFIG", config / "notify.conf"))
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
             "HOME": str(self.root), "CONF_DIR": str(config),
             "GATE_STATE_DIR": str(self.root / "state"), "USER_ZONE": "America/New_York"})))
@@ -419,6 +423,21 @@ class NightlyPushTests(unittest.TestCase):
 
     def nightly(self) -> int:
         return gate.nightly(gate.GateArguments(repo=str(self.root), merge_branch="main", unit="fixture-merge"))
+
+    def test_nightly_rejects_invalid_shipped_configuration_before_the_suite(self) -> None:
+        _ = (self.root / "config/example.conf").write_text("# whole: 1..9\ncount=10\n")
+        marker = self.root / "state/full-required"
+        marker.parent.mkdir()
+        _ = marker.write_text("older marker\n")
+        passed = gate.GateRun((gate.GateJobResult("hooks", "test_first.py", 0, 0, ""),), 0, 0)
+        with (self.execution(passed),
+              mock.patch.object(gate, "run_suites", return_value=passed) as suite,
+              redirect_stdout(io.StringIO()) as output):
+            self.assertEqual(self.nightly(), 1)
+
+        suite.assert_not_called()
+        self.assertIn("config/example.conf: count='10': outside range 1..9", output.getvalue())
+        self.assertIn("runner/suite-run", marker.read_text())
 
     def test_nightly_push_describes_the_run_and_limits_failed_modules(self) -> None:
         good = gate.GateJobResult("message", "test_send.py", 0, 0, "")

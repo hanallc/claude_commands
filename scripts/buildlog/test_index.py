@@ -18,6 +18,8 @@ from typing import cast, override
 from unittest import mock
 
 from scripts.buildlog import index
+from scripts.buildlog.index_test_support import BUILDLOG_INDEX_SETTINGS, BUILDLOG_TARGET_SETTINGS
+from scripts.mac_test.config_test_support import MAC_CONNECTION_SETTINGS
 from scripts.buildlog.cgroup_test_support import CPU, GIB, ZRAM_READING, slice_reading
 from scripts.buildlog import parse
 from scripts.buildlog import store
@@ -26,9 +28,10 @@ from scripts.buildlog import record as recorder
 from scripts.buildlog import step_outputs
 from scripts.lib import test_hang_guard
 from scripts.lib import conf
-from scripts.lint.memory_test_support import config_environment, write_config_fixture
+from scripts.lint.memory_test_support import config_environment, seed_config_fixture_folder, write_config_fixture
 from scripts.lint import sweep
-from scripts.test_times.gate_record_test_support import gate_run
+from scripts.lint.config_test_support import SWEEP_SCAN_SETTINGS
+from scripts.test_times.gate_record_test_support import gate_run, nextest_timing_settings
 from scripts.buildlog.record import TARGET_DIR_UNSET
 from scripts.buildlog.store import UNKNOWN_IDENTITY
 
@@ -185,7 +188,12 @@ def point_root_at(test: unittest.TestCase, root: Path) -> None:
     """Override the suite's temporary log root for this test only."""
     previous = os.environ.get("BUILDLOG_DIR")
     os.environ["BUILDLOG_DIR"] = str(root)
-    _ = cast(object, test.enterContext(mock.patch.dict(os.environ, config_environment(root.parent / "config"))))
+    configuration = root.parent / "config"
+    _ = write_config_fixture(configuration / "buildlog.conf", defaults=BUILDLOG_INDEX_SETTINGS)
+    seed_config_fixture_folder(configuration, {"build_targets.conf": BUILDLOG_TARGET_SETTINGS,
+                                            "mac_test.conf": MAC_CONNECTION_SETTINGS})
+    _ = write_config_fixture(configuration / "test_times.conf", defaults=nextest_timing_settings())
+    _ = cast(object, test.enterContext(mock.patch.dict(os.environ, config_environment(configuration))))
     _ = cast(object, test.enterContext(mock.patch.dict(os.environ, {name: str(root / name) for name in COORDINATION_VARIABLES})))
 
     def restore() -> None:
@@ -285,7 +293,7 @@ def encode(record: Record) -> bytes:
 
 def configure_cleanup(test: unittest.TestCase, root: Path) -> Path:
     config = root.parent / "config"
-    _ = write_config_fixture(config / "buildlog.conf")
+    _ = write_config_fixture(config / "buildlog.conf", defaults=BUILDLOG_INDEX_SETTINGS)
     test.enterContext(mock.patch.dict(os.environ, {"CONF_DIR": str(config)}))
     return config
 
@@ -691,7 +699,7 @@ class IndexTests(unittest.TestCase):
 
     def test_mac_nextest_rows_use_the_call_repository_from_local_steps_or_ssh_attempts(self) -> None:
         config = configure_cleanup(self, self.root)
-        _ = write_config_fixture(config / "test_times.conf", "NEXTEST_SLOW_TEST_S=1.0")
+        _ = write_config_fixture(config / "test_times.conf", nextest_timing_settings(), defaults="")
         identity = "https://github.com/example/hana"
         facts = parse.log_facts("nextest", "        PASS [ 2.000s] hana tests::slow\n")
         mac_file = self.root / "Mac" / "2026-10.jsonl"
@@ -823,7 +831,7 @@ class IndexTests(unittest.TestCase):
             (1.25, {"tests::above_higher_boundary", "tests::failed", "tests::retried", "tests::reported_slow"}),
         ):
             with self.subTest(threshold=threshold):
-                _ = write_config_fixture(config / "test_times.conf", f"NEXTEST_SLOW_TEST_S={threshold}")
+                _ = write_config_fixture(config / "test_times.conf", nextest_timing_settings(threshold), defaults="")
                 tests = parse.test_results(lines).timing_rows
                 self.assertEqual({test["test"] for test in tests}, expected)
                 self.write(self.host_file, step("threshold", step="nextest", tests=tests))
@@ -832,7 +840,7 @@ class IndexTests(unittest.TestCase):
 
     def test_fast_passes_get_a_gpu_class_only_with_proof(self) -> None:
         config = configure_cleanup(self, self.root)
-        _ = write_config_fixture(config / "test_times.conf", "NEXTEST_SLOW_TEST_S=1.0")
+        _ = write_config_fixture(config / "test_times.conf", nextest_timing_settings(), defaults="")
         _ = write_config_fixture(config / "buildlog.conf", "INDEX_SPILL_PAGES=65536\nINDEX_TOUCH_MINUTES=60")
         passed = "PASS [ 0.010s] hana tests::fast\n"
         summary = "Summary [ 0.010s] 1 test run: 1 passed, 0 skipped\n"
@@ -1053,7 +1061,7 @@ Summary [ 0.020s] 2 tests run: 2 passed, 1 skipped
 
     def test_steps_without_output_pairs_do_not_add_recorded_cargo_mappings(self) -> None:
         config = configure_cleanup(self, self.root)
-        _ = write_config_fixture(config / "lint.conf")
+        _ = write_config_fixture(config / "lint.conf", defaults=SWEEP_SCAN_SETTINGS)
         self.enterContext(mock.patch.dict(os.environ, {"LINT_SWEEP_STATE_DIR": str(self.root / "sweep-state")}))
         override = self.root / "override-output"
         plain = self.root / "plain-output"

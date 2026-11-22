@@ -5,6 +5,7 @@ from __future__ import annotations
 from scripts.lint.memory_test_support import write_config_fixture
 
 from scripts.lib.python_startup.sitecustomize import STARTUP_FILES
+from scripts.lib.nix_env_test_support import nix_fixture_settings
 
 from scripts.agents import remote
 
@@ -28,6 +29,7 @@ from unittest import mock
 from scripts.nightly_review import nightly_review
 from scripts.whoami import account
 from scripts.accounts import accounts
+from scripts.accounts.home_test_support import ACCOUNT_HOME_SETTINGS
 from scripts.production import showrunners, staff, fake_showrunner, session_staff, unit_config
 from scripts.message import session_records, sessions
 from scripts.production.staff_test_support import (isolated_staff_file, isolated_source_readers,
@@ -74,12 +76,15 @@ class NightlyReviewTests(unittest.TestCase):
         self.root = Path(directory.name)
         configuration = self.root / "config"
         configuration.mkdir()
-        for stem in ("nightly_review", "accounts", "nix_env"):
-            _ = write_config_fixture(configuration / f'{stem}.conf')
+        _ = write_config_fixture(configuration / "accounts.conf", defaults=ACCOUNT_HOME_SETTINGS)
+        _ = write_config_fixture(configuration / "nix_env.conf", defaults=nix_fixture_settings())
         _ = write_config_fixture(configuration / "nightly_review.conf",
-                                 "review_modes=config rust messages\ncommand_path=~/.claude/commands/nightly_review.md\n"
-                                 + "title_characters=90\nmessage_sample_rows=20\nstate_folder=nightly-review\n"
-                                 + "sample_timeout_overhead_seconds=15\nprimary_showrunner_name=natedev\n")
+                                 defaults="review_modes=config rust messages\n"
+                                 + "command_path=~/.claude/commands/nightly_review.md\n"
+                                 + "sessions_directory=~/.claude/sessions\nprimary_showrunner_name=natedev\n"
+                                 + "# whole: 1..\nmessage_sample_rows=20\n"
+                                 + "# range: 0..\nsample_timeout_overhead_seconds=15\n"
+                                 + "# range: 0..\nmessage_history_hours=24\n")
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"CONF_DIR": str(configuration)})))
         home = self.root / "home"
         (home / ".claude").mkdir(parents=True)

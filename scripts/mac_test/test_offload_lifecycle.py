@@ -20,6 +20,7 @@ from unittest import mock
 from collections.abc import Sequence
 from scripts.mac_test import offload, mac_test, claim_state
 from scripts.mac_test.offload_test_support import OffloadCommandFixture
+from scripts.mac_test.config_test_support import MAC_CLAIM_SETTINGS, MAC_IDLE_SETTINGS, MAC_OFFLOAD_SETTINGS
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
 # The fixture loads offload's sibling script paths before the tree-key import.
 from scripts.buildlog import treekey
@@ -195,7 +196,7 @@ class PendingDispatchTests(unittest.TestCase):
                         + "kind.linux=ssh\nplatform.linux=linux\nsettings.linux=linux_target.conf\n")
                     settings = root / ("mac_test.conf" if target == "mac" else "linux_target.conf")
                     for name in ("mac_test.conf", "linux_target.conf"):
-                        _ = write_config_fixture(root / name, "offload=on\nhost=private-host\n", template="mac_test")
+                        _ = write_config_fixture(root / name, "offload=on\nhost=private-host\n", defaults=MAC_OFFLOAD_SETTINGS + MAC_CLAIM_SETTINGS + MAC_IDLE_SETTINGS)
                     identity = claim_state.ClaimIdentity("cleanup-claim", "cleanup-episode", "cleanup-attempt")
                     prepared = subprocess.run(["bash", "-c", offload.prepare_start_fence_command(identity, target)],
                         cwd=root, env=environment, capture_output=True, text=True, check=False, timeout=5)

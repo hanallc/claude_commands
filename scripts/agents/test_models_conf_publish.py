@@ -20,7 +20,7 @@ from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.lib import models_registry, atomic_file, registry_rows  # noqa: E402
 from scripts.lib.test_models_registry import ExactRows, registry_text, write_registry  # noqa: E402
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS  # noqa: E402
-from scripts.lib.main_push_lock_test_support import publish_after_contender
+from scripts.lib.main_push_lock_test_support import publish_after_contender, write_push_lock_settings
 
 AGENTS = Path(__file__).resolve().parent
 REPO = AGENTS.parents[1]
@@ -85,7 +85,10 @@ class RegistryFixture(unittest.TestCase):
         self.registry = self.root / relative_path
         self.registry.parent.mkdir(parents=True, exist_ok=True)
         _ = write_registry(self.registry, base_text=DEFAULTS)
+        configuration = self.root / "settings"
+        write_push_lock_settings(configuration)
         self.environment = {**os.environ, **interpreter_cache_environment(self.root / "cache"), "HOME": str(self.home),
+                            "CONF_DIR": str(configuration),
                             "MODELS_CONFIG_FILE": str(self.registry),
                             "MODELS_CONFIG_PUBLISH": "1" if publishing else "0",
                             "MODELS_CONFIG_TIER_ONLY": "1", "CODEX_CONFIG_FILE": str(self.root / "codex.toml"),

@@ -31,6 +31,9 @@ from scripts.copies.workspace_test_support import registered_workspace
 from scripts.lib import build_folders
 from scripts.copies.copies_test_support import copies_environment, fake_remote_removal, publish_mirror
 from scripts.copies.remote_test_support import local_remote_transport
+from scripts.lint.memory_test_support import seed_config_fixture_folder
+from scripts.production.change_review_test_support import REVIEW_DELIVERY_SETTINGS
+from scripts.production.config_test_support import QUESTION_TITLE_SETTINGS
 from scripts.review_links import change_browser, change_page, new_item_dialog, review_items, review_submissions
 
 SCRIPT = Path(__file__).with_name("tidy_wrapped.py")
@@ -52,8 +55,13 @@ class TidyWrappedTests(unittest.TestCase):
         self.state = self.root / "showrunner"
         self.notifier = self.root / "notifier"
         self.notifier.mkdir()
+        environment = copies_environment(self.root)
+        seed_config_fixture_folder(Path(environment["CONF_DIR"]), {
+            "production.conf": QUESTION_TITLE_SETTINGS,
+            "review_links.conf": REVIEW_DELIVERY_SETTINGS,
+        })
         self.enterContext(mock.patch.dict(os.environ, {
-            **copies_environment(self.root), "HERDR_BIN": "/nonexistent/herdr",
+            **environment, "HERDR_BIN": "/nonexistent/herdr", "USER_ZONE": "America/New_York",
         }))
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
 

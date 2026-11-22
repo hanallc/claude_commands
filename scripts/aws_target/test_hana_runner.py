@@ -32,6 +32,7 @@ from scripts.build_queue import execution_identity
 from scripts.aws_target import hana_protocol, hana_render
 from scripts.aws_target import hana_guest as guest, hana_receiver as receiver
 from scripts.aws_target import hana_result, hana_runner as runner, hana_source as source
+from scripts.aws_target.hana_image_test_support import stage_runtime_sources
 from scripts.aws_target.hana_placement import HanaHostGeneration
 from scripts.aws_target.hana_result import HanaAttemptKey, LogicalStepLink
 from scripts.aws_target.ledger_test_support import override_fixture_settings
@@ -520,8 +521,11 @@ with mock.patch('socket.gethostname', return_value='aws-hana'):
         self.assertFalse(cargo.exists() or shell.exists())
 
     def test_isolated_runtime_writes_a_refusal_for_input_import_and_runtime_errors(self) -> None:
+        checkout = self.root / 'runtime-checkout'
+        _ = shutil.copytree(self.fixture.runtime_checkout / 'config', checkout / 'config')
+        _ = stage_runtime_sources(checkout)
         runtime = self.root / 'runtime'
-        for file in hana_render.runtime_files(Path(__file__).resolve().parents[2], self.fixture.configuration):
+        for file in hana_render.runtime_files(checkout, self.fixture.configuration):
             path = runtime / file.path
             path.parent.mkdir(parents=True, exist_ok=True)
             _ = path.write_bytes(file.content)

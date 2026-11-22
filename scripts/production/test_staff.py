@@ -25,9 +25,13 @@ from unittest import mock
 
 from scripts.production import demote_showrunner, promote_showrunner, staff
 from scripts.agents import shutdown, stop_resume, restart_support
+from scripts.agents.test_support import write_machine_config
 from scripts.production.cli_fixture import invoke_cli
 from scripts.herdr import worker_panes
 from scripts.lib import transcripts, unit_runs
+from scripts.lib.build_folders_test_support import temporary_folder_settings
+from scripts.lib.socket_test_support import SYSTEM_SOCKET_ROOT
+from scripts.lint.memory_test_support import config_environment
 from scripts.message import sessions, session_records
 from scripts.production.staff_test_support import CHECKOUT, STAFF_SCRIPT, StaffTestCase, isolated_staff_file
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -37,13 +41,21 @@ from scripts.lib.transcript_test_support import compressed_copy
 MISSING_ID = staff.StaffId("s00000000000")
 
 
+def setUpModule() -> None:
+    unittest.enterModuleContext(mock.patch.dict(os.environ, {"USER_ZONE": "America/New_York"}))
+
+
 class StaffCommandTestCase(StaffTestCase):
     """Run local CLI logic with the real parser, handlers, and private state."""
 
     @override
     def setUp(self) -> None:
         super().setUp()
+        configuration = config_environment(self.root / "settings", fixtures={
+            "build_folders.conf": temporary_folder_settings(self.root, system_root=SYSTEM_SOCKET_ROOT),
+        })
         _ = self.enterContext(cast(AbstractContextManager[object], mock.patch.dict(os.environ, {
+            **configuration,
             "ROSTER_RUN_ROOT": str(self.root / "unit"),
             "UNIT_RUN_ROOT": str(self.root / "unit"),
             "SCRATCH_ROOT": str(self.root / "scratch"),
@@ -2353,7 +2365,9 @@ class StaffTests(StaffCommandTestCase):
         owner_results = [read() for read in reads]
         self.assertCountEqual(staff.find(), [staff.StaffRow.from_json(row) for row in cast(list[object], json.loads(owner_show.stdout))])
         local_file = self.mac_file
-        with self.machine("mac"):
+        configuration = self.root / "mac-config"
+        write_machine_config(configuration)
+        with self.machine("mac"), mock.patch.dict(os.environ, {"CONF_DIR": str(configuration)}):
             for read, expected in zip(reads, owner_results):
                 with self.subTest(read=read):
                     self.assertEqual(read(), expected)
@@ -2498,6 +2512,7 @@ class StaffTests(StaffCommandTestCase):
                 self.assertEqual(lines[row.id].split()[2], path)
 
     def test_mac_write_waits_for_owner_operation_lock(self) -> None:
+        write_machine_config(Path(os.environ["CONF_DIR"]))
         _, unit, _ = self.tree()
         destination = fixture_member("showrunner", name="other")
         lock = self.staff_file.parent / "operation.lock"

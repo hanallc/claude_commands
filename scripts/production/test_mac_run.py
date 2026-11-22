@@ -23,12 +23,18 @@ from scripts.lib.git_test_support import fixture_git_environment
 from scripts.copies import copies
 from scripts.copies.copies_test_support import copies_environment
 from scripts.direct.wait_for_test_state import wait_until
+from scripts.hana_shot.hana_shot_test_support import SHOT_ENDPOINT_SETTINGS, SMOKE_SETTINGS
+from scripts.mac_test.config_test_support import MAC_RUN_SETTINGS
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
 from scripts.lib.process_group import send_process_group
 from scripts.lib.py_floor_test_support import seed_interpreter_cache
+from scripts.lib.scratch_test_support import write_scratch_settings
+from scripts.build_targets.target_test_support import mac_target_settings
 from scripts.lib.shell_test_support import shell_functions
+from scripts.production.config_test_support import UNIT_PORT_SETTINGS
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.mac_test import floor_claims
+from scripts.mac_test.offload_test_support import mac_queue_settings
 from scripts.production.cli_fixture import ImmutableGitSeed
 
 
@@ -37,8 +43,9 @@ SCRIPT = Path(__file__).with_name("mac_run.sh")
 MAC_TEST = SCRIPT.parent.parent / "mac_test" / "mac_test.py"
 SHA = "1234567890abcdef1234567890abcdef12345678"
 MAC_RUN_CONFIG = {
-    "mac_run_host": "natemccoy@mac",
+    "mac_run_host": "fixture@mac",
     "mac_run_port": "15710",
+    "mac_run_hold_seconds": "60",
     "mac_run_log": "/tmp/mac_run_hana.log",
     "mac_run_launch": "/tmp/mac_run_hana.command",
     "mac_run_status": "/tmp/mac_run_hana.status",
@@ -246,7 +253,7 @@ if args[0] == "place-step":
     assignment = json.dumps({"episode": option("--episode"), "attempt": identity["attempt"]})
     Path(option("--assignment-file")).write_text(assignment)
     (state / "assigned").write_text(assignment)
-    print("\t".join(("mac", "mac", "natemccoy@mac", "0", option("--episode"), identity["attempt"])))
+    print("\t".join(("mac", "mac", "fixture@mac", "0", option("--episode"), identity["attempt"])))
 elif receipt.exists():
     saved = json.loads(receipt.read_text())
     identity = saved["identity"]
@@ -297,7 +304,7 @@ class MacRunTests(unittest.TestCase):
         cls.addClassCleanup(temporary.cleanup)
         cls.helper_home = Path(temporary.name)
         _ = copy_helpers(cls.helper_home, *COPY_HELPERS, "scripts/hana_instances", "scripts/accounts",
-                         "scripts/whoami", "scripts/notify", "scripts/maintenance", "config")
+                         "scripts/whoami", "scripts/notify", "scripts/maintenance")
 
     def __init__(self, methodName: str = "runTest") -> None:
         super().__init__(methodName)
@@ -322,7 +329,6 @@ class MacRunTests(unittest.TestCase):
         installed.mkdir(parents=True)
         helpers = self.helper_home / ".claude"
         (installed / "scripts").symlink_to(helpers / "scripts", target_is_directory=True)
-        _ = shutil.copytree(helpers / "config", installed / "config", symlinks=True)
         self.state_directory = self.root / "mac-test-state"
         self.stub_state = self.root / "stub-state"
         self.stub_state.mkdir()
@@ -331,16 +337,17 @@ class MacRunTests(unittest.TestCase):
         self.repository = self.root / "repo"
         self.repository.mkdir()
         self.config_path = self.root / "config/mac_test.conf"
+        write_scratch_settings(self.config_path.parent, self.root)
         self.temp_directory = self.root / "tmp"
         self.temp_directory.mkdir()
         _ = write_config_fixture(self.config_path, "ci_repo=\nconnect_timeout_s=6\n"
-                                 + "block_hours=4\nblock_max_hours=48\nclaim_poll_seconds=60\n")
+                                 + "block_hours=4\nblock_max_hours=48\nclaim_poll_seconds=60\n", defaults=MAC_RUN_SETTINGS)
         self.write_production_config()
+        _ = write_config_fixture(self.config_path.parent / "build_targets.conf", defaults=mac_target_settings())
         queue = self.root / "fake-queue.py"
         _ = queue.write_text(QUEUE_STUB)
         _ = write_config_fixture(self.root / "config/mac_gate.conf",
-            "admission_client_command=" + shlex.join([str(SCRIPT.parents[1] / "lib/py"), str(queue)])
-            + "\nterminate_grace_seconds=3\n")
+                                 defaults=mac_queue_settings([str(SCRIPT.parents[1] / "lib/py"), str(queue)]))
         copies_config = self.config_path.parent / "copies.conf"
         _ = write_config_fixture(copies_config, f"remote_registry={self.root / 'mirrors'}\n"
                                  + "owner.verify=verify\n"
@@ -381,7 +388,7 @@ class MacRunTests(unittest.TestCase):
     def write_production_config(self, **overrides: str) -> None:
         settings = MAC_RUN_CONFIG | overrides
         _ = write_config_fixture(self.config_path.parent / "production.conf",
-            "".join(f"{name}={value}\n" for name, value in settings.items())
+            "".join(f"{name}={value}\n" for name, value in settings.items()), defaults=UNIT_PORT_SETTINGS
         )
 
     def write_executable(self, path: Path, source: str) -> None:
@@ -568,12 +575,9 @@ class MacRunTests(unittest.TestCase):
         self.assert_claim_released()
 
     def test_smoke_uses_the_shared_refused_port_and_host(self) -> None:
-        self.write_production_config(
-            smoke_ready_seconds="300", smoke_exit_seconds="30", smoke_connect_seconds="1",
-            smoke_call_seconds="5", smoke_signal_grace_seconds="2", smoke_poll_seconds="1",
-        )
+        _ = write_config_fixture(self.root / "config/production.conf", SMOKE_SETTINGS, defaults="")
         _ = write_config_fixture(self.root / "config/hana_shot.conf",
-                                 "refused_port=17461\nhost=192.0.2.46\n")
+                                 "refused_port=17461\nhost=192.0.2.46\n", defaults=SHOT_ENDPOINT_SETTINGS)
         script = SCRIPT.with_name("smoke_launch.sh")
 
         def smoke(port: str) -> subprocess.CompletedProcess[str]:
@@ -858,7 +862,7 @@ cleanup_mac_run
             self.assertEqual(len(before_local), 1)
             self.assertEqual(len(before_remote), 1)
             self.assertEqual(before_local[0]["path"], before_remote[0]["path"])
-            self.assertEqual(before_local[0]["host"], "natemccoy@mac")
+            self.assertEqual(before_local[0]["host"], "fixture@mac")
             self.assertEqual(before_remote[0]["host"], "localhost")
             with mock.patch.dict(os.environ, {"COPIES_CONFIG": local_environment["COPIES_CONFIG"]}):
                 prepare_cleanup(Path(str(before_local[0]["path"])))

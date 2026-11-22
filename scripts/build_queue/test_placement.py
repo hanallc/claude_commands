@@ -21,7 +21,10 @@ from unittest import mock
 from typing import TextIO, cast, override
 
 from scripts.build_queue import execution_identity
-from scripts.aws_target import hana_placement as hana
+from scripts.aws_target import hana_box, hana_placement as hana
+from scripts.aws_target.hana_image_test_support import guest_digest_fixture
+from scripts.aws_target.ledger_test_support import install_cost_settings, write_hana_config
+from scripts.aws_target.test_hana_box import record_lifecycle_image
 from scripts.build_hold.owning_session import NoOwningSession, OwningSession
 from scripts.build_queue import admission_protocol as wire, admission_records as records, admission_service as service, placement
 from scripts.build_queue import admission_client as client, queue_snapshot
@@ -29,6 +32,8 @@ from scripts.build_queue import snapshot_codec as codec
 from scripts.build_queue.admission_test_support import AdmissionFixture, ObservedAdmissionServer, only_admitted, GIB
 from scripts.mac_test.claim_state import RepositoryScope, WholeMacScope
 from scripts.mac_test import claim_state, eligibility, mac_test, offload
+from scripts.build_targets.target_test_support import mac_target_settings
+from scripts.mac_test.config_test_support import MAC_RUN_SETTINGS
 from scripts.lint.memory_test_support import write_config_fixture, write_pressure_reading
 from scripts.lint import memory_admit as gate
 from scripts.message.unit_labels import UnitLabels
@@ -52,6 +57,9 @@ class PlacementFixture(AdmissionFixture):
     def __init__(self) -> None:
         self.provider_evidence: dict[placement.HostEvidenceKey, placement.HostEvidence] = {}
         super().__init__()
+        _ = (self.root / "build_targets.conf").write_text(mac_target_settings())
+        _ = write_config_fixture(self.root / "mac_test.conf", "host=fixture-mac\nlinux_only.hana=\n",
+                                 defaults=MAC_RUN_SETTINGS)
 
     @override
     def read_provider(self, key: placement.HostEvidenceKey) -> placement.HostEvidence:
@@ -116,11 +124,26 @@ def assignment_for(fixture: AdmissionFixture, request: wire.PlacementRequest) ->
     return reply.assignment
 
 
+def write_hana_route_settings(path: Path, repository: str = HANA_REPOSITORY) -> None:
+    _ = write_config_fixture(path, f"""\
+enabled=on
+execution_transport=hana-control
+host=aws-hana
+repository_identity={repository}
+kinds=check,lint
+# whole: 1..1
+max_steps=1
+# whole: 1..
+free_floor_gib=30
+""", defaults="")
+
+
 def hana_policy_request(fixture: PlacementFixture) -> tuple[wire.PlacementRequest, hana.HanaControlTransport]:
     repository = fixture.root / "hana"
     repository.mkdir()
     settings = fixture.root / "hana_aws.conf"
-    _ = write_config_fixture(settings, f"enabled=on\nrepository_identity={HANA_REPOSITORY}\n")
+    _ = write_hana_config(settings)
+    write_hana_route_settings(settings)
     _ = (fixture.root / "build_targets.conf").write_text(
         "targets=hana-aws\nkind.hana-aws=ssh\nplatform.hana-aws=linux\nsettings.hana-aws=hana_aws.conf\n")
     scope = RepositoryScope("hana", HANA_REPOSITORY, 1)
@@ -1128,7 +1151,7 @@ class PlacementTests(unittest.TestCase):
         for reason in ("off", "repo", "command"):
             with self.subTest(reason=reason), PlacementFixture() as fixture:
                 settings = fixture.root / "provider.conf"
-                _ = write_config_fixture(settings, template="mac_test")
+                _ = write_config_fixture(settings, defaults=MAC_RUN_SETTINGS)
                 request = placement_request(fixture)
                 candidate = replace(request.constraints.candidates[0],
                     settings=placement.ExplicitProviderSettings(settings))
@@ -1148,7 +1171,7 @@ class PlacementTests(unittest.TestCase):
                 assert isinstance(reply, wire.DispatchStatus)
                 self.assertEqual(reply.retry, placement.DoNotRetry(reason))
 
-                _ = write_config_fixture(settings, "probe_timeout_s=16\n", template="mac_test")
+                _ = write_config_fixture(settings, "probe_timeout_s=16\n", defaults=MAC_RUN_SETTINGS)
                 fixture.clock.advance(1)
                 current_evidence = publish_candidate(fixture, request)
                 self.assertNotEqual(original_evidence.key.configuration_generation,
@@ -1193,14 +1216,14 @@ class PlacementTests(unittest.TestCase):
     def test_enabling_the_route_before_the_refusal_report_permits_a_retry(self) -> None:
         with PlacementFixture() as fixture:
             settings = fixture.root / "provider.conf"
-            _ = write_config_fixture(settings, "offload=off\n", template="mac_test")
+            _ = write_config_fixture(settings, "offload=off\n", defaults=MAC_RUN_SETTINGS)
             request = placement_request(fixture)
             candidate = replace(request.constraints.candidates[0], settings=placement.ExplicitProviderSettings(settings))
             request = replace(request, constraints=replace(request.constraints, candidates=(candidate,)))
             original = publish_candidate(fixture, request)
             assigned = assignment_for(fixture, request)
             fixture.restart()
-            _ = write_config_fixture(settings, "offload=on\n", template="mac_test")
+            _ = write_config_fixture(settings, "offload=on\n", defaults=MAC_RUN_SETTINGS)
             self.assertIsInstance(fixture.server.handle_request(
                 wire.ClaimFailure("delayed-off-refusal", assigned, "off"))[0], wire.DispatchStatus)
             enabled = publish_candidate(fixture, request)
@@ -1221,7 +1244,7 @@ class PlacementTests(unittest.TestCase):
             original = publish_candidate(fixture, request)
             assigned = assignment_for(fixture, request)
 
-            _ = write_config_fixture(settings, "enabled=off\n")
+            _ = write_config_fixture(settings, "enabled=off\n", defaults="")
             disabled_key = fixture.server.host_evidence_key(request, assigned.destination)
             self.assertNotEqual(disabled_key.configuration_generation, original.key.configuration_generation)
 
@@ -1251,7 +1274,7 @@ class PlacementTests(unittest.TestCase):
 
             def disable_hana(settings: hana.HanaControlTransport, repository: str, kind: str
                              ) -> hana.HanaStepRefused | hana.EnabledHanaRoute:
-                _ = write_config_fixture(settings.settings, "enabled=off\n")
+                _ = write_config_fixture(settings.settings, "enabled=off\n", defaults="")
                 return policy(settings, repository, kind)
 
             with mock.patch.object(service.HostEvidenceWorker, "dispatch_pending", return_value=False):
@@ -1277,7 +1300,7 @@ class PlacementTests(unittest.TestCase):
     def test_settled_repo_decline_waits_for_a_settings_change(self) -> None:
         with PlacementFixture() as fixture:
             settings = fixture.root / "provider.conf"
-            _ = write_config_fixture(settings, template="mac_test")
+            _ = write_config_fixture(settings, defaults=MAC_RUN_SETTINGS)
             request = placement_request(fixture)
             candidate = replace(request.constraints.candidates[0], settings=placement.ExplicitProviderSettings(settings))
             request = replace(request, constraints=replace(request.constraints, candidates=(candidate,)))
@@ -1299,7 +1322,7 @@ class PlacementTests(unittest.TestCase):
                     self.assertNotIn(assigned.episode, fixture.server.current_assignments)
                 if pass_number == 0:
                     fixture.restart()
-            _ = write_config_fixture(settings, "linux_only.hana=\n", template="mac_test")
+            _ = write_config_fixture(settings, "linux_only.hana=\n", defaults=MAC_RUN_SETTINGS)
             _ = publish_candidate(fixture, request)
             _ = fixture.run_pass()
             replacement = assignment_for(fixture, request)
@@ -1309,7 +1332,7 @@ class PlacementTests(unittest.TestCase):
     def test_a_settings_read_error_does_not_interrupt_a_refusal_report(self) -> None:
         with PlacementFixture() as fixture:
             settings = fixture.root / "provider.conf"
-            _ = write_config_fixture(settings, template="mac_test")
+            _ = write_config_fixture(settings, defaults=MAC_RUN_SETTINGS)
             request = placement_request(fixture)
             candidate = replace(request.constraints.candidates[0], settings=placement.ExplicitProviderSettings(settings))
             request = replace(request, constraints=replace(request.constraints, candidates=(candidate,)))
@@ -1454,7 +1477,7 @@ class PlacementTests(unittest.TestCase):
                             capture_output=True, check=True, timeout=TEST_HANG_GUARD_SECS)
                         settings = fixture.root / "mac_test.conf"
                         _ = write_config_fixture(settings,
-                            "offload=on\nlinux_only.hana=\nmac_skip.hana=\n", template="mac_test")
+                            "offload=on\nlinux_only.hana=\nmac_skip.hana=\n", defaults=MAC_RUN_SETTINGS)
                         args = mac_test.CliArguments()
                         args.pid, args.worktree, args.what = coordinator.pid, str(repository), "nextest hana"
                         args.repo_root, args.package, args.settings = str(repository), "hana", str(settings)
@@ -1610,7 +1633,7 @@ with mock.patch.object(subprocess, "run", side_effect=private_transport), \
                 _ = (fixture.root / "build_targets.conf").write_text(
                     "targets=box\nkind.box=ssh\nplatform.box=linux\nsettings.box=box.conf\n")
                 _ = write_config_fixture(fixture.root / "box.conf",
-                    "offload=on\nhost=fixture-box\nkinds=test,lint,check,doc,build\nslots=2\n", template="mac_test")
+                    "offload=on\nhost=fixture-box\nkinds=test,lint,check,doc,build\nslots=2\n", defaults=MAC_RUN_SETTINGS)
                 request = placement_request(fixture)
                 assert isinstance(request.profile, records.StepProfile)
                 destination = placement.PlacementDestination("ssh", "box", "fixture-box", RepositoryScope("hana"))
@@ -1644,7 +1667,7 @@ with mock.patch.object(subprocess, "run", side_effect=private_transport), \
             + "kind.healthy=ssh\nplatform.healthy=linux\nsettings.healthy=mac_test.conf\n")
         settings = fixture.root / "target.conf"
         _ = write_config_fixture(settings, "host=fixture\nexecution_transport=ssh\n"
-                                 + "probe_timeout_s=10\nslots=1\nkinds=check\n", template="mac_test")
+                                 + "probe_timeout_s=10\nslots=1\nkinds=check\n", defaults=MAC_RUN_SETTINGS)
         repository = fixture.root / "hana"
         (repository / ".git").mkdir(parents=True)
         request = placement_request(fixture)
@@ -1702,7 +1725,7 @@ with mock.patch.object(subprocess, "run", side_effect=private_transport), \
             registered, request, destination = self.target_settings_fixture(fixture)
             _ = registered.write_text("execution_transport=broken\n")
             settings = fixture.root / "explicit.conf"
-            _ = write_config_fixture(settings, "enabled=on\n", template="hana_aws")
+            write_hana_route_settings(settings)
             candidate = placement.PlacementCandidate(destination, settings=placement.ExplicitProviderSettings(settings))
             request = replace(request, constraints=replace(request.constraints, candidates=(candidate,)))
             before = fixture.server.host_evidence_key(request, destination)
@@ -1783,29 +1806,28 @@ with mock.patch.object(subprocess, "run", side_effect=private_transport), \
             read.assert_not_called()
 
     def idle_hana(self, fixture: PlacementFixture) -> tuple[Path, wire.PlacementRequest]:
-        from scripts.aws_target import hana_box
-        from scripts.aws_target.test_hana_box import record_lifecycle_image
-
         settings, request, _destination = self.target_settings_fixture(fixture)
-        settings.unlink()
-        _ = write_config_fixture(settings, "enabled=on\nrepository_identity=https://github.com/example/hana\n",
-                                 template="hana_aws")
+        _ = write_hana_config(settings)
+        repository = "https://github.com/example/hana"
+        write_hana_route_settings(settings, repository)
+        _ = write_config_fixture(settings, "# whole: 1..5\npreview_max_age_s=2\n", defaults="")
         assert isinstance(request.profile, records.StepProfile)
         request = replace(request, profile=replace(request.profile, step="check"),
             constraints=replace(request.constraints, command=("cargo", "check")))
         account = fixture.root / "aws_target.conf"
-        _ = write_config_fixture(account, template="aws_target")
+        install_cost_settings(account)
         controller = hana_box.HanaController(fixture.root / "hana-state", account, settings,
                                              hana_box.ProviderNotInstalled())
         identity = hana_box.DeploymentIdentity("fixture", "box", "spot", "us-east-2")
         controller.register(identity)
+        fixture.enter_context(guest_digest_fixture(fixture.root))
         _ = record_lifecycle_image(controller.directory, settings, identity=identity)
         from scripts.aws_target import hana_placement_adapter
         from scripts.mac_test import eligibility
 
         _ = fixture.enter_context(mock.patch.object(hana_placement_adapter, "controller_for", return_value=controller))
         _ = fixture.enter_context(mock.patch.object(eligibility, "repository_identity",
-            return_value=eligibility.KnownRepository("hana", "https://github.com/example/hana")))
+            return_value=eligibility.KnownRepository("hana", repository)))
         return settings, request
 
     def test_hana_probe_keeps_the_workload_used_to_select_transport(self) -> None:
@@ -1824,7 +1846,7 @@ with mock.patch.object(subprocess, "run", side_effect=private_transport), \
                               ) -> hana.ExecutionTransport:
                 transport = read_transport(target, configuration=configuration)
                 if isinstance(transport, hana.HanaControlTransport):
-                    _ = write_config_fixture(settings, "execution_transport=ssh\nguard_grace_seconds=59\n")
+                    _ = write_config_fixture(settings, "execution_transport=ssh\nguard_grace_seconds=59\n", defaults="")
                 return transport
 
             with (mock.patch.object(target_config, "read_execution_transport", side_effect=edit_workload) as read,
@@ -1839,7 +1861,7 @@ with mock.patch.object(subprocess, "run", side_effect=private_transport), \
         with PlacementFixture() as fixture, redirect_stderr(io.StringIO()):
             settings, request = self.idle_hana(fixture)
             duplicate = "c7a.4xlarge,c7a.4xlarge"
-            _ = write_config_fixture(settings, f"fallback_instance_types={duplicate}\n")
+            _ = write_config_fixture(settings, f"fallback_instance_types={duplicate}\n", defaults="")
 
             evidence = self.read_target(fixture, request)
 
@@ -2246,7 +2268,7 @@ with mock.patch.object(subprocess, "run", side_effect=private_transport), \
                 _ = (fixture.root / "build_targets.conf").write_text(
                     f"targets=box\nkind.box=ssh\nplatform.box={platform}\nsettings.box=box.conf\n")
                 _ = write_config_fixture(fixture.root / "box.conf",
-                    "offload=on\nhost=fixture-box\nkinds=test,lint,check,doc,build\nslots=2\n", template="mac_test")
+                    "offload=on\nhost=fixture-box\nkinds=test,lint,check,doc,build\nslots=2\n", defaults=MAC_RUN_SETTINGS)
                 request = placement_request(fixture)
                 assert isinstance(request.profile, records.StepProfile)
                 destination = placement.PlacementDestination("ssh", "box", "fixture-box", RepositoryScope("hana"))
@@ -2305,7 +2327,7 @@ with mock.patch.object(subprocess, "run", side_effect=private_transport), \
             _ = (fixture.root / "build_targets.conf").write_text(
                 "targets=box\nkind.box=ssh\nplatform.box=macos\nsettings.box=box.conf\n")
             _ = write_config_fixture(fixture.root / "box.conf",
-                "offload=on\nhost=fixture-box\nkinds=test,lint,check,doc,build\nslots=2\n", template="mac_test")
+                "offload=on\nhost=fixture-box\nkinds=test,lint,check,doc,build\nslots=2\n", defaults=MAC_RUN_SETTINGS)
             request = placement_request(fixture)
             destination = placement.PlacementDestination("ssh", "box", "fixture-box", RepositoryScope("hana"))
             request = replace(request, constraints=replace(request.constraints, repository=str(repository),
@@ -2634,7 +2656,7 @@ class MacOrderTests(unittest.TestCase):
 
     def mac_order(self, fixture: PlacementFixture) -> MacOrder:
         fixture.configure(waiting_pass_seconds=1)
-        _ = write_config_fixture(fixture.root / "mac_test.conf", "probe_timeout_s=5\n", template="mac_test")
+        _ = write_config_fixture(fixture.root / "mac_test.conf", "probe_timeout_s=5\n", defaults=MAC_RUN_SETTINGS)
         _ = fixture.run_pass()
         older = placement_request(fixture, since=fixture.clock.now() - 60)
         older_key = self.provide(fixture, older, placement.TemporaryExclusion("busy"))
@@ -2717,7 +2739,7 @@ class MacOrderTests(unittest.TestCase):
             with (self.subTest(refusal=refusal), PlacementFixture() as fixture,
                   mock.patch.object(service, "HostEvidenceWorker", ManualEvidenceWorker)):
                 fixture.configure(waiting_pass_seconds=1)
-                _ = write_config_fixture(fixture.root / "mac_test.conf", "probe_timeout_s=5\n", template="mac_test")
+                _ = write_config_fixture(fixture.root / "mac_test.conf", "probe_timeout_s=5\n", defaults=MAC_RUN_SETTINGS)
                 fixture.free(0)
                 fixture.hold_starts()
                 _ = fixture.run_pass()

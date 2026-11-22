@@ -25,7 +25,16 @@ from unittest import mock
 
 from scripts.lib.descendants import adopt_descendants
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.lint.memory_test_support import config_environment, write_config_fixture
 from scripts.test_times import module_cost, task_cpu
+
+
+def setUpModule() -> None:
+    root = Path(unittest.enterModuleContext(tempfile.TemporaryDirectory()))
+    _ = write_config_fixture(root / "test_times.conf", defaults=(
+        "# range: 0.001..\nMODULE_COST_STAGE_TIMEOUT_S=30\n"
+        + "# range: 0..\nMODULE_COST_LEFTOVER_S=2\n"))
+    _ = cast(object, unittest.enterModuleContext(mock.patch.dict(os.environ, config_environment(root))))
 
 
 class ModuleCostTests(unittest.TestCase):

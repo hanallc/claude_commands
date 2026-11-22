@@ -23,7 +23,7 @@ from scripts.buildlog import index
 from scripts.buildlog import width_trial as trial
 from scripts.buildlog.test_index import configure_cleanup, encode, step, use_test_log
 
-from scripts.lint.memory_test_support import write_config_fixture
+from scripts.lint.memory_test_support import install_admission_fixture
 
 use_test_log()
 
@@ -95,7 +95,7 @@ class WidthTrialTests(unittest.TestCase):
 
     def test_report_builds_a_missing_index_from_records_in_the_selected_root(self) -> None:
         config = configure_cleanup(self, self.root)
-        _ = write_config_fixture(config / "build_admission.conf")
+        install_admission_fixture(config)
         self.index.unlink()
         selected = self.root / "selected"
         records = selected / "natedev" / "2026-10.jsonl"

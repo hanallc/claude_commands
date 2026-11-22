@@ -17,11 +17,14 @@ from unittest import mock
 
 from scripts.buildlog import store
 from scripts.build_hold import build_hold
-from scripts.lint.memory_test_support import write_config_fixture
+from scripts.lint.config_test_support import LINT_TOOL_SETTINGS
+from scripts.lib.build_folders_test_support import workspace_folder_settings
+from scripts.lint.memory_test_support import install_admission_fixture, write_config_fixture
 from scripts.production import gate
 from scripts.production.gate_modules import GateRefused
-from scripts.production.gate_test_support import MergeGateFixture, SUITE_MODULE, gate_suites
+from scripts.production.gate_test_support import GATE_TEST_SETTINGS, MergeGateFixture, SUITE_MODULE, gate_suites
 from scripts.test_times import gate_record
+from scripts.test_times.gate_record_test_support import gate_timing_settings
 
 
 # The fixture reports fixed durations through unittest's duration hook.
@@ -61,11 +64,11 @@ class MergeGateTestTimesTests(MergeGateFixture):
         super().setUp()
         config = self.root / "config"
         self.environment["CONF_DIR"] = str(config)
-        _ = write_config_fixture(config / "build_admission.conf")
-        _ = write_config_fixture(config / "build_folders.conf")
-        _ = write_config_fixture(config / "gate.conf")
-        _ = write_config_fixture(config / "lint.conf")
-        _ = write_config_fixture(config / "test_times.conf", "SLOW_TEST_S=1.0")
+        install_admission_fixture(config)
+        _ = write_config_fixture(config / "build_folders.conf", defaults=workspace_folder_settings(self.root))
+        _ = write_config_fixture(config / "gate.conf", defaults=GATE_TEST_SETTINGS)
+        _ = write_config_fixture(config / "lint.conf", defaults=LINT_TOOL_SETTINGS)
+        _ = write_config_fixture(config / "test_times.conf", defaults=gate_timing_settings(slow_test_s=1.0))
 
     def only_record(self) -> gate_record.GateRunRecord:
         records = self.gate_run_records()

@@ -16,6 +16,7 @@ from datetime import datetime, timedelta, timezone
 from functools import cache
 from pathlib import Path
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
+from scripts.message.session_send_test_support import POSTMASTER_SETTINGS
 from typing import Literal, cast, override
 from unittest.mock import patch
 
@@ -123,8 +124,7 @@ class PostmasterTests(unittest.TestCase):
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         configuration = Path(self.enterContext(tempfile.TemporaryDirectory()))
         environment = config_environment(configuration)
-        _ = write_config_fixture(configuration / "postmaster.conf",
-            "wait_seconds=3.0\nheartbeat_max_age_seconds=2.0\npoll_seconds=0.05\n")
+        _ = write_config_fixture(configuration / "postmaster.conf", defaults=POSTMASTER_SETTINGS)
         _ = cast(object, self.enterContext(patch.dict(os.environ, environment)))
         self.state = self.root / "message"
         self.directory = self.state / "postmaster"

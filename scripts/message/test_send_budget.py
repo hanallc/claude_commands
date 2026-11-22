@@ -8,16 +8,12 @@ import unittest
 from unittest.mock import patch
 
 from scripts.message import send_budget
-from scripts.lint.memory_test_support import write_config_fixture
+from scripts.message.session_send_test_support import SEND_TIMING_FIXTURES
+from scripts.lint.memory_test_support import seed_config_fixture_folder
 
 
 def write_configs(directory: Path) -> None:
-    _ = write_config_fixture(directory / "send.conf",
-        "delivery_timeout=40\nkill_grace=10\nremote_transport_seconds=30\ncaller_margin_seconds=15\n"
-        + "waits_review_seconds=30\nuser_cancel_timeout=30\ncheck_timeout=20\n")
-    _ = write_config_fixture(directory / "postmaster.conf",
-                             "wait_seconds=3.0\nclaim_grace_seconds=15.0\n")
-    _ = write_config_fixture(directory / "codex_daemon.conf", "timeout_seconds=5.0\n")
+    seed_config_fixture_folder(directory, SEND_TIMING_FIXTURES)
 
 
 class SendBudgetTests(unittest.TestCase):

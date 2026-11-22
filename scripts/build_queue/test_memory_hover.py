@@ -3,22 +3,29 @@ from __future__ import annotations
 from scripts.build_queue import admission_records
 
 import json
+import os
 from html.parser import HTMLParser
 from pathlib import Path
 import shutil
 import subprocess
+import tempfile
 import unittest
+from unittest import mock
 from xml.etree import ElementTree
-from typing import cast
+from typing import cast, override
 from scripts.lint import memory_admit as gate
-from scripts.build_queue import memory_feed, progress_profile as progress
+from scripts.build_queue import progress_profile as progress
 from scripts.build_queue import test_memory_feed
-from scripts.lint.memory_test_support import admission_policy_fixture
+from scripts.lint.memory_test_support import admission_policy_fixture, fixture_feed_code_settings
 from scripts.lint import test_memory_admit as memory_tests
 from scripts.lib import test_hang_guard
 from scripts.review_links import page_frame
 from scripts.production import staff
 from scripts.review_links import staff_names
+
+with fixture_feed_code_settings():
+    from scripts.build_queue import memory_feed
+
 GIB = admission_records.GIB
 MIB = 1024 ** 2
 RAM_FIXTURE: dict[str, object] = {
@@ -39,6 +46,12 @@ SWAP_FIXTURE: dict[str, object] = {"used_bytes": 3 * GIB, "capacity_bytes": 8 * 
 
 
 class MemoryHoverTests(unittest.TestCase):
+    @override
+    def setUp(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        test_memory_feed.MemoryFeedTests.configure(root)
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"CONF_DIR": str(root), "USER_ZONE": "UTC"})))
+
     def test_decoded_work_names_match_the_table_chart_and_hover(self) -> None:
         fixture = test_memory_feed.MemoryFeedTests()
         self.addCleanup(fixture.doCleanups)

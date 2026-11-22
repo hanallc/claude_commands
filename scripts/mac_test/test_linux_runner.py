@@ -21,14 +21,20 @@ import unittest
 from unittest import mock
 
 from scripts.lib import process_stat, removal_guard
+from scripts.lib.build_folders_test_support import workspace_folder_settings
+from scripts.lib.checkout_test_support import seed_test_configuration
 from scripts.lib.helper_tree_test_support import COPY_HELPERS, copy_helpers
+from scripts.lib.nix_env_test_support import nix_fixture_settings
 
 from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.copies.copies_test_support import copies_environment
+from scripts.lib.build_slots_test_support import copy_fixture_settings
 from scripts.mac_test import eligibility, claim_state, linux_runner, mac_test, offload, test_target_slots
 from scripts.mac_test.offload_test_commands import WORKSPACE_SWEEP_SETTINGS, WorkspaceSweepFixture
 from scripts.mac_test.offload_test_support import mirror_use_payload
+from scripts.lib.helper_tree_test_support import VERIFY_RESULT_SETTINGS
+from scripts.mac_test.config_test_support import MAC_RUN_SETTINGS
 from scripts.lint.memory_test_support import write_config_fixture
 
 
@@ -197,10 +203,11 @@ class LinuxShellTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="linux-runner-")))
+        _ = write_config_fixture(self.root / "build_folders.conf", defaults=workspace_folder_settings(self.root))
         self.source = self.root / "rust/phase-copy"
         self.source.mkdir(parents=True)
         self.settings = self.root / "linux.conf"
-        _ = write_config_fixture(self.root / "mac_test.conf", template="mac_test")
+        _ = write_config_fixture(self.root / "mac_test.conf", defaults=MAC_RUN_SETTINGS)
         _ = write_config_fixture(self.settings,
             "offload=on\nhost=fake-linux\nkinds=test,check,doc\nslots=2\n"
             + "free_floor_gib=10\nbuild_budget_gib=32\ntarget_budget_gib=24\n"
@@ -208,7 +215,7 @@ class LinuxShellTests(unittest.TestCase):
             + "devshell.hana=ci\ndevshell.phase-copy=wrong\nskip.hana=test(gpu)\n"
             + "devshell=default\nshell_cache=.local/state/build-target/shells\n"
             + f"shell_timeout_s={TEST_HANG_GUARD_SECS}\n",
-            template="mac_test",
+            defaults=MAC_RUN_SETTINGS,
         )
         registry = self.root / "build_targets.conf"
         _ = registry.write_text(
@@ -398,7 +405,7 @@ class LinuxShellTests(unittest.TestCase):
         self.assertEqual(event["environment"].get("TEST_SHELL_PROOF"), "loaded")
 
     def test_forwarded_test_environment_survives_the_development_shell(self) -> None:
-        _ = write_config_fixture(self.root / "direct.conf")
+        _ = write_config_fixture(self.root / "direct.conf", defaults=VERIFY_RESULT_SETTINGS)
         values = {"NO_COLOR": "1", "TERM": "xterm-256color", "COLORTERM": "truecolor",
                   "TERM_PROGRAM": "verify", "COLUMNS": "80", "LINES": "24"}
         self.environment.update(copies_environment(self.root))
@@ -1751,6 +1758,7 @@ class LinuxCopyTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="linux-copy-")))
+        _ = write_config_fixture(self.root / "build_folders.conf", defaults=workspace_folder_settings(self.root))
         self.source = self.root / "source"
         self.source.mkdir()
         self.destination = self.root / "received"
@@ -1761,8 +1769,8 @@ class LinuxCopyTests(unittest.TestCase):
         _ = self.git("config", "user.email", "fixture@example.invalid")
         registry = self.root / "build_targets.conf"
         _ = registry.write_text("targets=linux\nkind.linux=ssh\nplatform.linux=linux\nsettings.linux=linux.conf\n")
-        _ = write_config_fixture(self.root / "mac_test.conf", template="mac_test")
-        _ = write_config_fixture(self.root / "linux.conf", "host=fake-linux\noffload=on\n", template="mac_test")
+        _ = write_config_fixture(self.root / "mac_test.conf", defaults=MAC_RUN_SETTINGS)
+        _ = write_config_fixture(self.root / "linux.conf", "host=fake-linux\noffload=on\n", defaults=MAC_RUN_SETTINGS)
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
             "BUILD_TARGETS_CONFIG": str(registry), "CONF_DIR": str(self.root),
         })))
@@ -1807,7 +1815,8 @@ class LinuxCopyTests(unittest.TestCase):
         _ = self.write_source("src/lib.rs", "first source\n")
         remote_home = self.root / "remote-home"
         remote_home.mkdir()
-        _ = copy_helpers(remote_home, *COPY_HELPERS, "config")
+        scripts = copy_helpers(remote_home, *COPY_HELPERS)
+        seed_test_configuration(scripts.parent, {"copies.conf": copy_fixture_settings(remote_home, git_timeout_seconds=10)})
         ssh = self.root / "ssh"
         _ = ssh.write_text('#!/bin/bash\nwhile [[ $1 == -o ]]; do shift 2; done\n'
                            + '[[ $1 == natedev ]] && exit 255\n'
@@ -1943,6 +1952,8 @@ class LinuxDispatchTests(unittest.TestCase):
     def setUp(self) -> None:
         self.addCleanup(self.fixture.doCleanups)
         self.fixture.setUp()
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"USER_ZONE": "America/New_York"})))
+        _ = write_config_fixture(self.fixture.root / "nix_env.conf", defaults=nix_fixture_settings())
         self.source = self.fixture.repository("rust/phase-copy", "https://example.com/team/hana.git")
         for name in ("flake.nix", "flake.lock", "nix/shell.nix", "src/main.rs"):
             path = self.source / name

@@ -15,6 +15,7 @@ from pathlib import Path
 from dataclasses import dataclass
 from typing import cast
 from unittest.mock import patch
+from scripts.lib.build_folders_test_support import temporary_folder_settings
 from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.lib.nix_env_test_support import NixFixture
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
@@ -565,7 +566,8 @@ sweep_after_step test-step
             os.mkfifo(release)
             configuration = root / "config"
             environment = config_environment(configuration)
-            _ = write_config_fixture(configuration / "build_folders.conf", "patterns.legacy-stable={purpose}\n")
+            _ = write_config_fixture(configuration / "build_folders.conf", "patterns.legacy-stable={purpose}\n",
+                                     defaults=temporary_folder_settings(root))
             reader, writer = os.pipe()
             process = subprocess.Popen(
                 ["bash", "-c", f'source "$1"; {SWEEP_STAND_IN}; sweep_after_step test-step', "sweep-test", str(INVOKE)],

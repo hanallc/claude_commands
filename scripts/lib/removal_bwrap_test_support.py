@@ -7,24 +7,20 @@ from enum import Enum
 from pathlib import Path
 import json
 import os
-import shlex
 import shutil
 import subprocess
 import sys
 import sysconfig
 
-from scripts.lib import conf
+from scripts.lib.build_folders_test_support import workspace_folder_settings
+from scripts.lib.scratch_test_support import write_scratch_settings
+from scripts.lint.config_test_support import FOLDER_AUDIT_SETTINGS, SWEEP_SCAN_SETTINGS, TMP_SWEEP_SETTINGS
+from scripts.lint.memory_test_support import write_config_fixture
+from scripts.mac_test.config_test_support import MAC_OFFLOAD_SETTINGS
 
 LINUX_PRIVATE_PATHS = tuple(Path(name) for name in ("/home", "/tmp", "/build", "/session", "/dev/shm", "/var/tmp"))
 LINUX_CHECKOUT = Path("/home/removal-source")
 MAC_BACKEND = Path("/usr/bin/sandbox-exec")
-CONFIG_ROOT_KEYS = frozenset(("sweep_floor_roots", "sweep_ci_targets", "folder_state_dir",
-                              "visible_root", "holds_file"))
-ROOT_CONFIGS = ("build_folders.conf", "lint.conf", "mac_test.conf", "scratch.conf")
-
-
-def is_declared_root(key: str) -> bool:
-    return key.startswith("roots.") or key.partition(".")[0] in CONFIG_ROOT_KEYS
 
 
 def mac_profile(private: Path, checkout: Path) -> str:
@@ -113,9 +109,22 @@ class RemovalSandbox:
         for path in (self.build, self.temporary, self.home / ".claude" / "sessions"):
             self.host_path(path).mkdir(parents=True, exist_ok=True)
         config = self.host_path(self.home / "config")
-        _ = shutil.copytree(self.checkout / "config", config)
+        templates = " ".join(f"{self.build}/{form}" for form in (
+            "<repo>/<unit>/<short>", "<repo>/<unit>/<number>", "<repo>/ci/<number>",
+            "<repo>/<unit>", "<repo>", "<repo>/main",
+        ))
+        _ = write_config_fixture(config / "build_folders.conf", f"""\
+roots.system={self.temporary}
+roots.temporary={self.temporary}
+roots.build={self.build}
+removal.path_templates={templates}
+""", defaults=workspace_folder_settings(self.home))
+        _ = write_config_fixture(config / "lint.conf",
+                                 defaults=FOLDER_AUDIT_SETTINGS + SWEEP_SCAN_SETTINGS + TMP_SWEEP_SETTINGS)
+        write_scratch_settings(config, self.home)
         if sys.platform == "darwin":
-            self.configure_mac(config)
+            _ = write_config_fixture(config / "mac_test.conf", defaults=MAC_OFFLOAD_SETTINGS)
+            self.configure_mac()
         else:
             (self.fixture / LINUX_CHECKOUT.relative_to("/")).mkdir()
         producer = "11111111-1111-4111-8111-111111111111"
@@ -129,24 +138,7 @@ class RemovalSandbox:
         ]}))
         _ = self.outside.write_text("outside the removal fixture\n")
 
-    def configure_mac(self, config: Path) -> None:
-        for name in ROOT_CONFIGS:
-            path = config / name
-            source = path.read_text()
-            lines: list[str] = []
-            for line in source.splitlines():
-                key, _, value = line.partition("=")
-                if is_declared_root(key):
-                    private = " ".join(str(self.private_root(word)) for word in shlex.split(value))
-                    line = f"{key}={private}"
-                lines.append(line)
-            if name == "build_folders.conf":
-                templates = next(
-                    setting.value for key, setting in conf.settings(source).items()
-                    if key.startswith("removal.path_templates.") and setting.value.startswith("~/build/")
-                )
-                lines.append(f"removal.path_templates={templates}")
-            _ = path.write_text("\n".join(lines) + "\n")
+    def configure_mac(self) -> None:
         fixture_bin = self.fixture / "bin"
         fixture_bin.mkdir()
         commands = {
@@ -167,18 +159,6 @@ printf '1 0 launchd\n%s 1 %s\n' "$PPID" "$REMOVAL_PROOF_CALLER_ARGS"
             _ = path.write_text(script)
             path.chmod(0o700)
         _ = (self.fixture / "removal.sb").write_text(mac_profile(self.fixture, self.checkout))
-
-    def private_root(self, word: str) -> Path:
-        if word.startswith("~/"):
-            return self.home / word.removeprefix("~/")
-        path = Path(word.replace("${TMPDIR}", str(self.temporary)))
-        if path.is_relative_to(self.temporary):
-            return path
-        if path.is_relative_to("/build"):
-            return self.build / path.relative_to("/build")
-        if path.is_relative_to("/tmp"):
-            return self.temporary / path.relative_to("/tmp")
-        return self.fixture / path.as_posix().lstrip("/")
 
     def python(self, *arguments: str) -> subprocess.CompletedProcess[str]:
         """Run one Python command in the platform sandbox."""

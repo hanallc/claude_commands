@@ -37,7 +37,9 @@ if TYPE_CHECKING:
     from scripts.production.gate_modules import discover_test_modules
     from scripts.test_times import gate_record, show
     from scripts.test_times.gate_record import GateRun, ModuleRun, TestTime
-    from scripts.test_times.gate_record_test_support import fixture_executions, gate_run, remove_run_measurements
+    from scripts.test_times.gate_record_test_support import (
+        fixture_executions, gate_run, gate_timing_settings, nextest_timing_settings, remove_run_measurements,
+    )
 else:
     from scripts.test_times import gate_record, show
     from scripts.buildlog import parse, record, repository, store
@@ -47,7 +49,9 @@ else:
     from scripts.lint.memory_test_support import write_config_fixture
     from scripts.production.gate_modules import discover_test_modules
     from scripts.test_times.gate_record import GateRun, ModuleRun, TestTime
-    from scripts.test_times.gate_record_test_support import fixture_executions, gate_run, remove_run_measurements
+    from scripts.test_times.gate_record_test_support import (
+        fixture_executions, gate_run, gate_timing_settings, nextest_timing_settings, remove_run_measurements,
+    )
 
 EPOCH = datetime(2026, 11, 3, 14, 30, tzinfo=UTC).timestamp()
 HOST = store.host_name()
@@ -191,10 +195,11 @@ class TestTimesTests(unittest.TestCase):
             "BUILD_TARGETS_STATE_DIR": str(self.root / "targets"),
         }))
         _ = configure_cleanup(self, self.log)
-        _ = write_config_fixture(self.config / "test_times.conf",
-                                 "TOP_RUNS=3\nTOP_CHECKOUT=~/.claude\nTOP_MAX_AGE_DAYS=7\nNEXTEST_SLOW_TEST_S=1.0\n"
-                                 + "TREND_SETTLE_MINUTES=45\n")
-        _ = write_config_fixture(self.config / "buildlog.conf")
+        _ = write_config_fixture(self.config / "test_times.conf", defaults=(
+            gate_timing_settings(top_runs=3) + nextest_timing_settings()
+            + f"TOP_CHECKOUT=~/.claude\nTOP_AWS_CHECKOUT={self.root / 'cloud-checkout'}\n"
+            + "# whole: 1..\nTOP_MAX_AGE_DAYS=7\n# whole: 1..\nTREND_DAYS=8\n"
+            + "# range: 0..\nTREND_SETTLE_MINUTES=45\n"))
         _ = self.enterContext(mock.patch.object(show, "datetime", ReportTime))
         for name in ("test_alpha.py", "test_beta.py", "test_missing.py"):
             path = self.repo / "scripts" / "tools" / name
@@ -361,7 +366,7 @@ with socket.socket(fileno=int(sys.argv[2])) as event, index.update_lock():
             event.sendall(b"F")
 
     def test_report_keeps_index_only_rows_after_an_exclusive_lock_exceeds_the_read_wait(self) -> None:
-        _ = write_config_fixture(self.config / "buildlog.conf", "INDEX_READ_WAIT_SECONDS=0.05")
+        _ = write_config_fixture(self.config / "buildlog.conf", "INDEX_READ_WAIT_SECONDS=0.05", defaults="")
         self.write_run([module_run("test_alpha.py", 8.0)])
         _ = show.index.update()
         with closing(sqlite3.connect(index_path_in(self.log))) as connection, connection:
@@ -415,7 +420,7 @@ with socket.socket(fileno=int(sys.argv[2])) as event, index.update_lock():
                     _ = writer.communicate(timeout=TEST_HANG_GUARD_SECS)
 
     def test_report_waits_for_an_exclusive_lock_taken_after_index_selection(self) -> None:
-        _ = write_config_fixture(self.config / "buildlog.conf", "INDEX_READ_WAIT_SECONDS=0.01")
+        _ = write_config_fixture(self.config / "buildlog.conf", "INDEX_READ_WAIT_SECONDS=0.01", defaults="")
         self.write_run([module_run("test_alpha.py", 8.0)])
         _ = show.index.update()
         select_index = show.index.complete_gate_index_in

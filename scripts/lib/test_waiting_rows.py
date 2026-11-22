@@ -19,6 +19,8 @@ from unittest import mock
 
 from scripts.lib import conf, live_settings, main_publish, main_sync, waiting_rows
 from scripts.lib.atomic_file import write_text_atomic
+from scripts.lib.live_settings_test_support import write_live_settings_fixture
+from scripts.lib.main_push_lock_test_support import write_push_lock_settings
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.test_main_publish import pending_rows
 
@@ -47,6 +49,8 @@ class WaitingRowsTests(unittest.TestCase):
         os.environ["CONF_DIR"] = str(self.checkout / "config")
         self.run_git(self.root, "clone", "-q", str(origin), str(self.checkout))
         (self.checkout / "config").mkdir()
+        write_push_lock_settings(self.checkout / "config")
+        write_live_settings_fixture(self.checkout / "config")
         _ = (self.checkout / "config/example.conf").write_text(SETTINGS)
         _ = (self.checkout / "config/models.conf").write_text(REGISTRY)
         _ = (self.checkout / "config/statusline.conf").write_text(STATUSLINE)

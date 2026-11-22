@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
-from scripts.lib.helper_tree_test_support import VERIFY_HELPERS, copy_helpers, verify_test_environment
+from scripts.lib.helper_tree_test_support import (
+    VERIFY_HELPERS, VERIFY_RESULT_SETTINGS, VERIFY_TOKEN_SETTINGS, copy_helpers, verify_test_environment,
+)
 
 from scripts.build_queue.admission_test_support import caller_admission
 from scripts.lib.py_floor_test_support import seed_interpreter_cache
 
-from scripts.lint.memory_test_support import config_environment, write_pressure_reading
+from scripts.build_targets.target_test_support import LOCAL_TARGET_SETTINGS
+from scripts.lint.memory_test_support import config_environment, write_config_fixture, write_pressure_reading
 
 import json
 import os
@@ -178,6 +181,9 @@ esac
         # This workspace's memory fixture must not inherit the host's PSI.
         pressure = self.root / "memory-pressure"
         write_pressure_reading(pressure)
+        _ = write_config_fixture(self.root / "build_targets.conf", defaults=LOCAL_TARGET_SETTINGS)
+        _ = write_config_fixture(self.root / "direct.conf",
+                                 defaults=VERIFY_TOKEN_SETTINGS + VERIFY_RESULT_SETTINGS)
         self.environment = {
             **verify_test_environment(),
             "PATH": tool_path,

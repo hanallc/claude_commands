@@ -7,7 +7,9 @@ from scripts.production import checkpoint_gate
 from scripts.agents import remote
 from scripts.agents.remote import local_machine
 
-from scripts.production.staff_test_support import fixture_runtime_id, isolated_staff_file, unit_membership, recorded_showrunner
+from scripts.production.staff_test_support import (
+    fixture_runtime_id, isolated_staff_file, unit_membership, recorded_showrunner, write_staff_settings,
+)
 from scripts.production import staff
 
 import json
@@ -33,7 +35,8 @@ from scripts.lib.git_test_support import fixture_git_environment
 from scripts.lint.memory_test_support import write_config_fixture
 
 from scripts.production.merge_checkpoint_test_support import (
-    DELIVERS, REAL_MERGE_TESTS, STARTED, STUB, TRIAL, MergeCheckpointFixture, configure_test_environment,
+    DELIVERS, REAL_MERGE_TESTS, STARTED, STUB, TRIAL, MergeCheckpointFixture, checkpoint_pull_settings,
+    configure_test_environment,
 )
 
 MAC_RECOVERY = ("{ [ ! -f scripts/lib/waiting_rows.py ] || "
@@ -121,10 +124,8 @@ class CheckpointTestFolderTests(unittest.TestCase):
 @final
 class MergeCheckpointTests(MergeCheckpointFixture):
     def test_successful_push_lists_landed_worktrees_and_keeps_dirty_worktrees(self) -> None:
-        checkout = Path(__file__).resolve().parents[2]
         records = self.root / "worktree-records"
-        config = self.root / "staff.conf"
-        _ = config.write_text((checkout / "config/staff.conf").read_text())
+        config = write_staff_settings(self.root / "staff.conf", producers=self.root / "producers")
         self.env.update({"WORKTREES_STATE_DIR": str(records), "STAFF_CONFIG": str(config)})
         _ = self.git("remote", "set-head", "origin", "production")
         checkpoint = self.checkpoint()
@@ -1176,8 +1177,7 @@ class MacPromotionPathTests(unittest.TestCase):
                                    + f"sys.exit({code})\n")
                 ssh.chmod(0o755)
                 config = state / "merge_checkpoint.conf"
-                _ = config.write_text("# whole: 1..\nMAC_PULL_TRIES=2\n"
-                                      + "# range: 0..\nMAC_PULL_RETRY_SECONDS=0\n")
+                _ = write_config_fixture(config, defaults=checkpoint_pull_settings(2))
                 with mock.patch.dict(os.environ, {"ZONE_STATE": str(state / "zone"), "CONF_DIR": folder,
                                                   "PATH": folder + os.pathsep + os.environ["PATH"]}):
                     waiting = main_publish.PendingMacPull("zone", text, "2026-11-08", "earlier failure")
@@ -1223,8 +1223,7 @@ if (state / "offline").exists():
 print("mac: fixture - sent" if "broadcast.py" in sys.argv[-1] else "rc=0")
 ''')
                 ssh.chmod(0o755)
-                _ = (state / "merge_checkpoint.conf").write_text(
-                    "# whole: 1..\nMAC_PULL_TRIES=1\n# range: 0..\nMAC_PULL_RETRY_SECONDS=0\n")
+                _ = write_config_fixture(state / "merge_checkpoint.conf", defaults=checkpoint_pull_settings(1))
                 offline = state / "offline"
                 offline.touch()
                 targets = ((PurePosixPath("~/custom checkout"), state / "first-source"),

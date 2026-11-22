@@ -33,7 +33,9 @@ from scripts.buildlog.test_launches import CLI
 from scripts.buildlog.test_memory_window import configured_host_cli, configured_local_host
 
 from scripts.direct.test_verify_untested_examples import FIXED_RUSTC
+from scripts.lint.memory_test_support import write_config_fixture
 from scripts.production.staff_test_support import build_fixture_sessions
+from scripts.test_times.gate_record_test_support import nextest_timing_settings
 
 
 class RecorderStopped(BaseException):
@@ -88,8 +90,10 @@ class RecordRerunTests(unittest.TestCase):
         self.addCleanup(self.fixture.doCleanups)
         self.fixture.setUp()
         _ = self.enterContext(mock.patch.object(store, "host_name", side_effect=configured_local_host))
+        configuration = self.fixture.base / "config"
+        _ = write_config_fixture(configuration / "test_times.conf", defaults=nextest_timing_settings())
         environment = self.fixture.environment(
-            **mac_natedev_environment(self.fixture.base / "config"),
+            **mac_natedev_environment(configuration),
             BUILDLOG_TRANSCRIPTS=str(self.fixture.base / "transcripts"),
             BUILDLOG_CALLER="verify",
             BUILDLOG_CALL_ID=record_tests.CALL_ID,

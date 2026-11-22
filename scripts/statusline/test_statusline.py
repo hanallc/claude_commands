@@ -35,6 +35,7 @@ from scripts.production.issues import ALL_FIELDS, Issue
 from scripts.rebuild import need
 from scripts.hooks import review_hold_delivery
 from scripts.message import review_hold
+from scripts.message.session_send_test_support import SEND_SETTINGS
 from scripts.review_links import for_you
 from scripts.agents import remote
 from scripts.statusline import adhoc_items, assignment, counts_row, rebuild_row
@@ -488,8 +489,8 @@ class ForYouStatusTests(unittest.TestCase):
     def test_mac_default_uses_the_console_peers_tailscale_address(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            _ = write_config_fixture(root / "console.conf", "for_you.host=fixture-console\n")
-            _ = write_config_fixture(root / "review_links.conf", "server_port=8765\n")
+            _ = write_config_fixture(root / "console.conf", defaults="# text: nonempty name\nfor_you.host=fixture-console\n")
+            _ = write_config_fixture(root / "review_links.conf", defaults="# whole: 1..65535\nserver_port=8765\n")
             response = Mock(status=200, read=Mock(return_value=b'{"available":true,"count":3}'))
             connection = Mock(getresponse=Mock(return_value=response))
             with (patch.dict(os.environ, {"CONF_DIR": directory}, clear=True),
@@ -531,9 +532,10 @@ class ForYouStatusTests(unittest.TestCase):
             config = home / "config"
             command = fixture_command(home)
             seed_rebuild_cache(home, config / "statusline.conf")
-            _ = write_config_fixture(config / "console.conf", "for_you.host=fixture-console\n")
+            _ = write_config_fixture(config / "console.conf", defaults="# text: nonempty name\nfor_you.host=fixture-console\n")
             with ThreadingHTTPServer(("127.0.0.1", 0), ConsoleHost) as server:
-                _ = write_config_fixture(config / "review_links.conf", f"server_port={server.server_port}\n")
+                _ = write_config_fixture(config / "review_links.conf",
+                                         defaults=f"# whole: 1..65535\nserver_port={server.server_port}\n")
                 env = {**SHELL_ENVIRONMENT, "HOME": directory, "CONF_DIR": str(config), "STATUSLINE_SYSTEM": "Darwin",
                        "FOR_YOU_ACTIONS_DIR": str(fixture_actions(home)),
                        "PATH": str(tools) + os.pathsep + os.environ["PATH"]}
@@ -658,7 +660,7 @@ class AdhocItemsTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             config = Path(directory) / "config"
             config.mkdir()
-            _ = write_config_fixture(config / "send.conf", "review_hold=on\nreview_hold_idle_minutes=30")
+            _ = write_config_fixture(config / "send.conf", "review_hold=on\n", defaults=SEND_SETTINGS)
             env = {"HOME": directory, "CONF_DIR": str(config), "USER_ZONE": "America/New_York",
                    "CLAUDE_CODE_SESSION_ID": "review-session"}
             first = datetime(2026, 11, 19, 17, 5, tzinfo=timezone.utc).timestamp()
@@ -684,7 +686,7 @@ class AdhocItemsTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             config = Path(directory) / "config"
             config.mkdir()
-            _ = write_config_fixture(config / "send.conf", "review_hold=on\nreview_hold_idle_minutes=30")
+            _ = write_config_fixture(config / "send.conf", "review_hold=on\n", defaults=SEND_SETTINGS)
             with patch.dict(os.environ, {"HOME": directory, "CONF_DIR": str(config), "USER_ZONE": "UTC"}):
                 repo = Path(adhoc_items.__file__).parents[2]
                 settings = cast(dict[str, object], json.loads((repo / "settings.json").read_text()))
@@ -1245,7 +1247,7 @@ class RoleTests(ConfiguredShellTests):
         scripts.mkdir(parents=True)
         for name in ("statusline.sh", "statusline.jq", "assignment.py"):
             _ = (scripts / name).write_text((PROGRAM.parent / name).read_text(encoding="utf-8"), encoding="utf-8")
-        copy_runtime(self.home, configuration=False)
+        copy_runtime(self.home)
         command = CONSOLE_HOST_SHELL + f'statusline="{scripts}"; . "$statusline/statusline.sh"'
         payload = {**limits({"used_percentage": 95}, {"used_percentage": 90}),
                    "context_window": ContextWindow(total_input_tokens=90_000, context_window_size=100_000)}
@@ -1323,7 +1325,7 @@ class CountsRowTests(ConfiguredShellTests):
         lists.mkdir(exist_ok=True)
         links.mkdir(exist_ok=True)
         _ = write_config_fixture(configuration / "change_review.conf",
-                                 f"lists_directory={lists}\nreview_links_directory={links}\n")
+                                 defaults=f"lists_directory={lists}\nreview_links_directory={links}\n")
 
     def questions(self, *items: OutstandingItem) -> None:
         folder = self.home / ".local/state/showrunner" / OWNER.id / "questions"

@@ -20,12 +20,18 @@ from unittest import mock
 from zoneinfo import ZoneInfo
 from scripts.production import gate, land_runs
 from scripts.lib import build_folders
+from scripts.lib.build_slots_test_support import copy_fixture_settings
 from scripts.lib.checkout_test_support import write_stdlib_tool
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lint.memory_test_support import ADMISSION_CONFIG_FIXTURE
+from scripts.message.codex_test_support import CODEX_DAEMON_SETTINGS
+from scripts.message.session_send_test_support import POSTMASTER_SETTINGS, SEND_SETTINGS
 from scripts.production.affected_modules import CertifiedBase, FullSuite
+from scripts.production.staff_test_support import write_staff_settings
 from scripts.buildlog.store import host_name
-from scripts.production.gate_test_support import FIXTURE_FOLDERS, GATE_TEST_SETTINGS, MergeGateFixture, gate_suites
+from scripts.buildlog.index_test_support import BUILDLOG_INDEX_SETTINGS
+from scripts.production.gate_test_support import (FIXTURE_FOLDERS, GATE_TEST_SETTINGS,
+                                                      NIGHTLY_RESULT_SETTINGS, MergeGateFixture, gate_suites)
 
 
 # Run the same fixture test in one child. The suite tests cover the full runner.
@@ -60,24 +66,10 @@ print("0 errors, 0 warnings, 0 notes")
 
 
 LEDGER_SETTINGS = {
-    "buildlog": """# whole: 1..
-INDEX_SPILL_PAGES=65536
-# range: 0..
-INDEX_TOUCH_MINUTES=60
-""",
-    "codex_daemon": "# range: 0.001..\ntimeout_seconds=5\n",
-    "gate": GATE_TEST_SETTINGS + """# one of: on, off
-nightly_result_push=on
-# whole: 1..
-nightly_result_modules=8
-# whole: 1..
-nightly_assign_minutes=30
-""",
-    "postmaster": """# range: 0.001..
-claim_grace_seconds=15
-# range: 0.001..
-wait_seconds=3
-""",
+    "buildlog": BUILDLOG_INDEX_SETTINGS,
+    "codex_daemon": CODEX_DAEMON_SETTINGS,
+    "gate": GATE_TEST_SETTINGS + NIGHTLY_RESULT_SETTINGS,
+    "postmaster": POSTMASTER_SETTINGS,
     "scratch": """# whole: 1..
 default_life_seconds=86400
 # whole: 1..
@@ -90,24 +82,7 @@ record_lock_attempts=3
 # whole: 1..
 removal_remote_timeout_seconds=30
 """,
-    "send": """# range: 0.001..
-caller_margin_seconds=15
-# range: 0.001..
-delivery_timeout=40
-# range: 0.001..
-kill_grace=10
-# range: 0.001..
-remote_transport_seconds=30
-# range: 0.001..
-waits_review_seconds=30
-""",
-    "staff": """# range: 0.001..
-OPERATION_LOCK_SECONDS=30
-# range: 0.001..
-REMOTE_SECONDS=20
-PRODUCER_WORKSPACE=producers
-PRODUCER_FOLDER_ROOT=~/rust/hanadocs
-""",
+    "send": SEND_SETTINGS,
     "test_times": """# whole: 1..
 GATE_FAILURE_LOG_KIB=64
 # range: 0..
@@ -146,6 +121,7 @@ changes.default=no branch
 def pin_ledger_settings(directory: Path, root: Path, gate: Path) -> None:
     """Give the gate and admission caller fixed settings in their private folders."""
     directory.mkdir(parents=True, exist_ok=True)
+    _ = write_staff_settings(directory / "staff.conf", producers=root / "producers")
     for stem, contents in LEDGER_SETTINGS.items():
         _ = (directory / f"{stem}.conf").write_text(contents)
     _ = (directory / "build_admission.conf").write_text(
@@ -228,18 +204,7 @@ seed.max_gib=24
 seed.min_free_gib=350
 """
     )
-    _ = (directory / "copies.conf").write_text(
-        f"""remote_registry={root / 'remote-mirrors'}
-wait_seconds=0.01
-# range: 5e-324..
-git_timeout_seconds=10
-guard_timeout_seconds=10
-guard_choice_limit=32
-owner.nightly=nightly
-owner.style=style
-owner.verify=verify
-"""
-    )
+    _ = (directory / "copies.conf").write_text(copy_fixture_settings(root, git_timeout_seconds=10))
 
 
 @final

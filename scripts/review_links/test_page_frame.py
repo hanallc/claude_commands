@@ -20,7 +20,9 @@ from typing import cast, override
 
 from scripts.review_links import console, page_frame, review_submissions, serve
 from scripts.lib import conf
+from scripts.lint.memory_test_support import write_config_fixture
 from scripts.production import staff
+from scripts.production.change_review_test_support import REVIEW_REFRESH_SETTINGS
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 NO_DATA_FILE: dict[str, object] = {}
@@ -34,25 +36,54 @@ STATUS_PAGES = (
     ("list", "List", "list-checks", "The List", 45),
     ("review", "Review", "inbox", "Review", 45),
 )
+PAGE_MODULES = {
+    "accounts": "scripts.review_links.accounts_page",
+    "aws": "scripts.aws_target.aws_page",
+    "aws_machines": "scripts.aws_target.machines_page",
+    "builds": "scripts.build_queue.memory_feed",
+    "disks": "scripts.disks.disks_page",
+    "images": "scripts.review_links.images",
+    "list": "scripts.review_links.list_page",
+    "review": "scripts.review_links.review_page",
+}
+PAGE_ITEMS = {"images": "waiting_images", "list": "waiting_updates", "review": "waiting_items"}
+CONSOLE_OWNER = "00000000-0000-4000-8000-000000000021"
+
+
+def page_status_settings() -> str:
+    """Set common timing limits and each page's age limit."""
+    timers = {
+        "round_trip_limit_seconds": 1,
+        "render_limit_seconds": 1,
+        "reading_delay_seconds": 1,
+    }
+    timers.update({f"{name}.age_limit_seconds": age for name, _, _, _, age in STATUS_PAGES})
+    return "".join(f"# range: 0.001..86400\nstatus.{key}={value}\n" for key, value in timers.items())
+
+
+def console_settings() -> str:
+    """Give console tests private page routes and owner IDs."""
+    blocks: list[str] = []
+    for page, label, icon, title, _age in STATUS_PAGES:
+        prefix = f"page.{page}"
+        module = PAGE_MODULES[page]
+        fields = [f"{prefix}.label={label}", f"{prefix}.icon={icon}", f"{prefix}.title={title}",
+                  f"{prefix}.url=python:{module}:page_url", f"{prefix}.owner={CONSOLE_OWNER}"]
+        if item_reader := PAGE_ITEMS.get(page):
+            fields.append(f"{prefix}.items=python:{module}:{item_reader}")
+        blocks.append("\n".join(fields))
+    blocks.append("rebuilds.url=python:scripts.review_links.change_page:rebuilds_url\n"
+                  + f"page.rebuilds.owner={CONSOLE_OWNER}\nowner.default={CONSOLE_OWNER}")
+    blocks.append(page_status_settings().rstrip())
+    return "\n\n".join(blocks) + "\n"
 
 
 @contextmanager
 def status_configuration() -> Generator[None]:
     with tempfile.TemporaryDirectory(prefix="page-status-config-") as temporary:
         root = Path(temporary)
-        pages = "".join(
-            f"page.{name}.label={label}\npage.{name}.icon={icon}\npage.{name}.title={title}\n"
-            + f"# range: 0.001..86400\nstatus.{name}.age_limit_seconds={age}\n"
-            for name, label, icon, title, age in STATUS_PAGES
-        )
-        _ = (root / "console.conf").write_text(
-            "# range: 0.001..86400\nstatus.round_trip_limit_seconds=1\n"
-            + "# range: 0.001..86400\nstatus.render_limit_seconds=1\n"
-            + "# range: 0.001..86400\nstatus.reading_delay_seconds=1\n"
-            + pages)
-        _ = (root / "review_links.conf").write_text(
-            "# range: 5..300\npage_refresh_seconds=15\n"
-            + "# range: 0.5..60\nframe_retry_seconds=2\n")
+        _ = write_config_fixture(root / "console.conf", defaults=console_settings())
+        _ = write_config_fixture(root / "review_links.conf", defaults=REVIEW_REFRESH_SETTINGS)
         with patch.dict(os.environ, {"CONF_DIR": temporary, "USER_ZONE": "America/New_York"}):
             yield
 
@@ -82,7 +113,8 @@ class PageStatusTests(unittest.TestCase):
     def test_page_owner_uses_current_name_and_parent_chain(self) -> None:
         root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         config = root / "console.conf"
-        _ = config.write_text("page.list.owner=owner\nowner.default=default\n", encoding="utf-8")
+        _ = write_config_fixture(config, defaults="page.list.owner=owner\nowner.default=default\n")
+        _ = write_config_fixture(root / "statusline.conf", defaults="role.showrunner=teal\n")
         document = root / "remote" / "production.md"
         live = staff.LiveDoc("natedev", document)
         parent = staff.StaffRow(staff.StaffId("parent"), "showrunner", "Nearest", staff.STAFF_ROOT,
@@ -115,9 +147,8 @@ class PageStatusTests(unittest.TestCase):
                 assert_component_states(self, page_frame.title(page.title(), page))
 
     def test_only_the_configured_status_pages_have_age_limits(self) -> None:
-        path = Path(__file__).resolve().parents[2] / "config" / "console.conf"
-        limits = set(re.findall(r"(?m)^[ \t]*(status\.[^\s=]+\.age_limit_seconds)[ \t]*=",
-                                path.read_text(encoding="utf-8")))
+        keys = conf.shipped_keys(Path(__file__).resolve().parents[2] / "config/console.conf")
+        limits = {key for key in keys if key.startswith("status.") and key.endswith(".age_limit_seconds")}
         self.assertEqual(limits, {f"status.{name}.age_limit_seconds" for name, *_ in STATUS_PAGES})
 
     def test_age_uses_seconds_then_whole_minutes_on_every_page(self) -> None:

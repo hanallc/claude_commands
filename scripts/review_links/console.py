@@ -16,6 +16,7 @@ from scripts.lib import atomic_file, conf, file_lock
 from scripts.production.change_review import ChangeReviewError
 from scripts.production.production_doc import Refusal
 from scripts.review_links import accounts_page, change_page, console_theme, for_you, page_frame, review_link, review_legacy
+from scripts.review_links.console_owners import owner_config_problems as owner_config_problems
 
 PHONE_QUERY = "(max-width:680px)"
 

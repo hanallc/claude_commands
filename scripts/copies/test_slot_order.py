@@ -36,9 +36,12 @@ from scripts.disks import slots
 from scripts.direct.verify_mac_offload_test_support import VerifyMacOffloadFixture, reap
 from scripts.direct.wait_for_test_state import wait_for_pid, wait_until
 from scripts.lib import build_folders, build_slots, conf, copy_record, nix_env
+from scripts.lib.helper_tree_test_support import VERIFY_RESULT_SETTINGS, VERIFY_TOKEN_SETTINGS
+from scripts.lib.nix_env_test_support import nix_fixture_settings
 from scripts.build_queue.admission_jobs import StepJob
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.shell_test_support import shell_functions
+from scripts.mac_test.config_test_support import MAC_RUN_SETTINGS
 from scripts.lint.memory_test_support import fake_memory_readings, write_config_fixture, write_pressure_reading
 from scripts.production.cli_fixture import ImmutableGitSeed, locked_environment
 from scripts.production.staff_test_support import build_fixture_sessions, fixture_member, isolated_staff_file
@@ -126,6 +129,9 @@ class SlotOrderTests(unittest.TestCase):
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="slot-order-"))).resolve()
         environment = {**copies_environment(self.root, repository="origin"), **build_fixture_sessions("")}
+        _ = write_config_fixture(Path(environment["CONF_DIR"]) / "build_folders.conf",
+                                 "# one of: off, report, enforce\nfolders.check=report\n"
+                                 + "# whole: 1..\nfolders.unused_days=7\n")
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, environment)))
         self.queue = self.enterContext(AdmissionFixture(root=Path(environment["CONF_DIR"])))
         self.queue.clock.epoch = time.time()
@@ -714,8 +720,13 @@ placement_once
             "SCRATCH_ROOT", "SCRATCH_COPIES_ROOT", "SCRATCH_HOLDS", "STAFF_FILE")},
             "ADMISSION_SOCKET": str(self.queue.socket_path), "UNIT_RUN_DIR": "", "UNIT_SESSION_DIR": "",
             "LINT_SKIP_SWEEP": "1"}
-        _ = shutil.copy2(tools.root / "build_targets.conf", Path(environment["CONF_DIR"]) / "build_targets.conf")
-        _ = shutil.copy2(tools.root / "mac settings.conf", Path(environment["CONF_DIR"]) / "mac settings.conf")
+        configuration = Path(environment["CONF_DIR"])
+        _ = write_config_fixture(configuration / "direct.conf",
+                                 defaults=VERIFY_TOKEN_SETTINGS + VERIFY_RESULT_SETTINGS)
+        _ = write_config_fixture(configuration / "mac_test.conf", defaults=MAC_RUN_SETTINGS)
+        _ = shutil.copy2(tools.root / "build_targets.conf", configuration / "build_targets.conf")
+        _ = shutil.copy2(tools.root / "mac settings.conf", configuration / "mac settings.conf")
+
         def provider(key: placement.HostEvidenceKey) -> placement.HostEvidence:
             if key.destination.provider == "local":
                 return placement.FreshHostEvidence(key, self.queue.clock.now(), "", placement.AllowedHost())
@@ -1367,7 +1378,7 @@ placement_once
         remote_tmp.mkdir()
         config = Path(environment["CONF_DIR"])
         _ = write_config_fixture(config / "linux.conf", "offload=on\nhost=fake-linux\nslots=1\nkinds=check,doc\n",
-                                 template="mac_test")
+                                 defaults=MAC_RUN_SETTINGS)
         targets = config / "build_targets.conf"
         _ = targets.write_text(targets.read_text().replace("targets=mac,natedev", "targets=mac,peer,natedev")
             + "kind.peer=ssh\nplatform.peer=linux\nsettings.peer=linux.conf\n")
@@ -1493,7 +1504,8 @@ placement_once
                     case_environment["TEST_REMOTE_ASSIGNMENT"] = "1"
                 if linux:
                     trusted_folder = other.name if mismatch else tools.root.name if trusted else "other-repository"
-                    _ = write_config_fixture(config / "nix_env.conf", f"trusted_home_folders={trusted_folder}\n")
+                    _ = write_config_fixture(config / "nix_env.conf", f"trusted_home_folders={trusted_folder}\n",
+                                             defaults=nix_fixture_settings())
                     case_environment.update(HOME=str(self.root), TMPDIR=str(remote_tmp),
                                             TEST_TRUST_CALLER=str(other if mismatch else tools.root))
                     ready.touch()

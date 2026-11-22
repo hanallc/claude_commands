@@ -14,9 +14,12 @@ from typing import cast, override
 from unittest.mock import patch
 from urllib.parse import urlencode
 
-from scripts.review_links.test_page_frame import assert_status_states
+from scripts.review_links.test_page_frame import assert_status_states, console_settings
 from scripts.review_links.test_staff_names import without_role_colors
 from scripts.production import investigation, staff
+from scripts.production.change_review_test_support import (
+    REVIEW_REFRESH_SETTINGS, ROLE_COLOR_CONFIG, write_change_review_settings,
+)
 from scripts.review_links import console, investigations_page, page_frame
 
 RUNNER = staff.StaffRow(staff.StaffId("a0882376-677b-4da5-adbb-f11db9146021"), "showrunner", "Alpha", staff.StaffRoot(),
@@ -42,9 +45,10 @@ class InvestigationsPageTests(unittest.TestCase):
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="investigations-page-test-")))
         config = self.root / "config"
         config.mkdir()
-        for name in ("console", "change_review"):
-            _ = write_config_fixture(config / f"{name}.conf")
-        _ = write_config_fixture(config / "review_links.conf", "page_refresh_seconds=15\n")
+        _ = write_config_fixture(config / "console.conf", defaults=console_settings())
+        write_change_review_settings(config, self.root)
+        _ = write_config_fixture(config / "review_links.conf", defaults=REVIEW_REFRESH_SETTINGS)
+        _ = write_config_fixture(config / "statusline.conf", defaults=ROLE_COLOR_CONFIG)
         _ = cast(object, self.enterContext(patch.dict(os.environ, {
             "CONF_DIR": str(config), "SHOWRUNNER_STATE_DIR": str(self.root / "state"),
             "STAFF_FILE": str(self.root / "staff.json"), "USER_ZONE": "America/New_York",

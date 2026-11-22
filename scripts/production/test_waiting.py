@@ -34,7 +34,7 @@ from typing import ClassVar, TextIO, cast, final, override
 from unittest import mock
 from zoneinfo import ZoneInfo
 
-from scripts.lib.socket_test_support import short_socket_directory
+from scripts.lib.socket_test_support import SYSTEM_SOCKET_ROOT, short_socket_directory
 from scripts.lib.git_exclude import ensure_excluded
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.process_group import send_process_group
@@ -296,7 +296,8 @@ class WaitingTests(unittest.TestCase):
 
     def claude(self, name: str, pane: str) -> None:
         """Record a live Claude called `name` in the fixture pane."""
-        path = Path(self.enterContext(short_socket_directory())) / f"claude-{pane.removeprefix("w").split(":")[0]}.sock"
+        directory = Path(self.enterContext(short_socket_directory(system_root=SYSTEM_SOCKET_ROOT)))
+        path = directory / f"claude-{pane.removeprefix("w").split(":")[0]}.sock"
         if not path.exists():
             held = socket.socket(socket.AF_UNIX)
             held.bind(str(path))

@@ -2,17 +2,17 @@
 
 from contextlib import closing
 import os
-from pathlib import Path
 import socket
-import shutil
 import sqlite3
 import subprocess
 from typing import cast, final, override
 from unittest.mock import patch
 
+from scripts.lint.memory_test_support import config_environment, write_config_fixture
 from scripts.production.staff_test_support import isolated_staff_file, recorded_showrunner, recorded_unit
 from scripts.style import git_process, refill_measure, style_config, style_ledger
 from scripts.style.style_plan_test_support import StylePlanFixture, install_unconfigured_board
+from scripts.style.style_reader_test_support import style_reader_settings
 
 
 @final
@@ -61,12 +61,10 @@ class RefillMeasureTests(StylePlanFixture):
         with closing(sqlite3.connect(database)) as source:
             original = tuple(source.iterdump())
         config_folder = self.root / "measure-config"
-        config_folder.mkdir()
-        current = Path(os.environ.get("CONF_DIR", str(Path(__file__).resolve().parents[2] / "config")))
-        for path in current.glob("*.conf"):
-            _ = shutil.copy2(path, config_folder / path.name)
+        _ = config_environment(config_folder)
         self.enterContext(patch.dict(os.environ, {"CONF_DIR": str(config_folder)}))
         config = config_folder / "style_reader.conf"
+        _ = write_config_fixture(config, defaults=style_reader_settings(style_config.ReaderSource.RUST))
         original_switch = config.read_text()
         reports: list[dict[str, object]] = []
         try:

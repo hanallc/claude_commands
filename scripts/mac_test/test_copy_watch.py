@@ -28,6 +28,8 @@ from scripts.lib import process_start as process_identity
 
 from scripts.mac_test import eligibility, copy_watch
 from scripts.direct import step_record
+from scripts.build_targets.target_test_support import mac_target_settings
+from scripts.mac_test.config_test_support import MAC_RUN_SETTINGS
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
 from scripts.lib import test_hang_guard
 from scripts.build_queue.admission_test_support import caller_admission, private_provider_evidence
@@ -407,7 +409,8 @@ class CopyWatchProcessTests(unittest.TestCase):
         self.runner = self.root / "runner.py"
         _ = self.runner.write_text(RUNNER_STUB)
         _ = (self.root / "step.py").write_text(STEP_STUB)
-        _ = write_config_fixture(self.root / "mac_test.conf", "offload=on\nlinux_only.repo=\n")
+        _ = write_config_fixture(self.root / "mac_test.conf", "offload=on\nlinux_only.repo=\n", defaults=MAC_RUN_SETTINGS)
+        _ = write_config_fixture(self.root / "build_targets.conf", defaults=mac_target_settings())
         busy: ClaimRecord = {
             "claim_id": "busy-claim", "episode": "busy-episode", "attempt": "busy-attempt", "submitting_session": "",
             "pid": os.getpid(),

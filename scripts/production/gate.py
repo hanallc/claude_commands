@@ -2795,6 +2795,7 @@ def nightly(args: GateArguments) -> int:
         with copies.standing(unit, repo, copies.CommittedSource(commit), step="test-nightly") as clone:
             tree = checked_git(clone, "rev-parse", "HEAD^{tree}")
             try:
+                check_gate_configuration(clone)
                 run = run_suites(clone, NIGHTLY_TYPE_DIRS,
                                  module_time_limit_s=args.module_time_limit_s, full=True)
             except (GateRefused, OSError, subprocess.SubprocessError) as error:
@@ -2869,12 +2870,32 @@ def combine_gate_runs(first: GateRun, second: GateRun, *, seconds: float) -> Gat
                    time_limit_report=reports)
 
 
+def check_gate_configuration(repo: Path) -> None:
+    """Check the shipped configuration before the gate runs any tests."""
+    shipped = repo / "config"
+    try:
+        if shipped.is_dir():
+            conf.check_shipped(shipped)
+            console_file = shipped / "console.conf"
+            if console_file.exists():
+                from scripts.review_links.console_owners import owner_config_problems
+
+                settings = conf.settings(console_file.read_text(encoding="utf-8"))
+                problems = owner_config_problems({key: setting.value for key, setting in settings.items()})
+                if problems:
+                    raise GateRefused("\n".join(f"config/console.conf: {problem}" for problem in problems))
+    except (conf.Unusable, OSError, UnicodeError) as error:
+        raise GateRefused(str(error)) from error
+
+
 def run_gate_suites(repo: Path, type_dirs: Sequence[str] = (),
                     module_time_limit_s: float = DEFAULT_MODULE_TIME_LIMIT_S, *,
                     source: Literal["tests-only", "checkpoint"] = "tests-only", full: bool = False,
                     mode: SuiteMode = SuiteMode.GATE,
                     gate_job: StepJob | GateJobNotRecorded = GATE_JOB_NOT_RECORDED) -> GateRun:
     """Route gates through AWS. Split affected tests between natedev and the Mac."""
+    check_gate_configuration(repo)
+
     def run_local(types: Sequence[str]) -> GateRun:
         return run_suites(repo, types, module_time_limit_s, source=source, full=full, mode=mode)
 

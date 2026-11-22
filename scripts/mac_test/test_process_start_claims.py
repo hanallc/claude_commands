@@ -23,6 +23,7 @@ from scripts.build_queue import placement, admission_protocol as wire
 from scripts.build_queue.test_placement import (
     PlacementFixture, placement_request, publish_candidate, assignment_for, coordinator_holder,
 )
+from scripts.mac_test.config_test_support import MAC_CLAIM_SETTINGS, MAC_OFFLOAD_SETTINGS
 from scripts.lint.memory_test_support import write_config_fixture
 
 
@@ -259,7 +260,7 @@ class ClaimProcessStartTests(unittest.TestCase):
                 _ = (fixture.root / "build_targets.conf").write_text(
                     "targets=mac,box\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n"
                     + "kind.box=ssh\nplatform.box=linux\nsettings.box=box.conf\n")
-                _ = write_config_fixture(fixture.root / "box.conf", "offload=on\nslots=2\n", template="mac_test")
+                _ = write_config_fixture(fixture.root / "box.conf", "offload=on\nslots=2\n", defaults=MAC_OFFLOAD_SETTINGS + MAC_CLAIM_SETTINGS)
                 paths = mac_test.StatePaths(fixture.root / "provider", target,
                     platform="macos" if provider == "mac" else "linux")
                 assignments: list[placement.PlacementAssignment] = []

@@ -18,16 +18,63 @@ from scripts.lib.conf import UseConfiguredValue
 from scripts.issue_score import apply_labels, blind, client, decide, evaluate, questions, records, score_issues, vault
 
 
-CONFIG_DIR = Path(__file__).resolve().parents[2] / "config"
+SHIPPED_CONFIG = Path(__file__).resolve().parents[2] / "config/issue_score.conf"
+SCORING_FIELDS = ("backlog_goal", "backlog_alignment", "backlog_impact", "category", "area")
 
-FIXTURE_VALUES = {
-    "workers": "8", "model": "jev-1.14.0", "input_usd_per_million": "0.042",
-    "threshold.backlog_goal": "0.40", "threshold.backlog_alignment": "0.40",
-    "threshold.backlog_impact": "0.40", "threshold.category": "0.90", "threshold.area": "0.3",
-    "evidence_present": "0.7", "evidence_absent": "0.3", "split_probability": "0.25",
-    "body_character_limit": "24000", "endpoint": "https://api.typesafe.ai/v1/systemone",
-    "max_attempts": "5", "request_timeout": "120", "retry_backoff_base": "2.0",
-}
+
+def scoring_fixture(folder: Path) -> str:
+    return f"""\
+# whole: 1..
+workers=8
+# text: model
+model=jev-1.14.0
+# range: 0..
+input_usd_per_million=0.042
+# range: 0..
+budget_usd=20
+# range: 0..1
+threshold.backlog_goal=0.40
+# range: 0..1
+threshold.backlog_alignment=0.40
+# range: 0..1
+threshold.backlog_impact=0.40
+# range: 0..1
+threshold.category=0.90
+# range: 0..1
+threshold.area=0.3
+# range: 0..1
+evidence_present=0.7
+# range: 0..1
+evidence_absent=0.3
+# range: 0..1
+split_probability=0.25
+# whole: 1..
+body_character_limit=24000
+# text: endpoint
+endpoint=https://api.typesafe.ai/v1/systemone
+# whole: 1..
+max_attempts=5
+# range: 5e-324..
+request_timeout=120
+# range: 5e-324..
+retry_backoff_base=2
+# text: private path
+spend_ledger={folder / "spend.jsonl"}
+# text: private path
+state_dir={folder / "state"}
+# text: private path
+vault_root={folder / "vault"}
+# text: private path
+style_rules_root={folder / "style"}
+# whole: 0..
+title_only_character_limit=200
+# whole: 1..
+disagreement_count=20
+# whole: 1..
+reliability_bucket_count=5
+# whole: 1..
+blind_sample_count=7
+""" + "".join(f"# range: 0..1\nerror_target.{field}=0.1\n" for field in SCORING_FIELDS)
 
 
 class ConfiguredTestCase(unittest.TestCase):
@@ -42,19 +89,15 @@ class ConfiguredTestCase(unittest.TestCase):
         """Create private settings and select them for the rest of this test."""
         folder = Path(self.enterContext(tempfile.TemporaryDirectory()))
         path = folder / "issue_score.conf"
-        self.change_configuration(path, **{**FIXTURE_VALUES, **changes})
+        _ = write_config_fixture(path, defaults=scoring_fixture(folder))
+        if changes:
+            self.change_configuration(path, **changes)
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"CONF_DIR": str(folder)})))
         return path
 
     def change_configuration(self, path: Path, **changes: str) -> None:
         """Change the private settings through the shared configuration writer."""
-        _ = write_config_fixture(path, "\n".join(f"{key}={value}" for key, value in changes.items()))
-        lines = path.read_text(encoding="utf-8").splitlines()
-        for key, value in changes.items():
-            index, _ = conf.effective_line(path, key)
-            if index > 0 and lines[index - 1].startswith("# one of:"):
-                lines[index - 1] = f"# one of: {value}"
-        _ = path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        _ = write_config_fixture(path, "\n".join(f"{key}={value}" for key, value in changes.items()), defaults="")
 
 
 @contextmanager
@@ -66,18 +109,18 @@ def patch_thresholds(**policies: questions.ThresholdOutcome) -> Generator[None]:
 
 
 class ConfigurationTests(ConfiguredTestCase):
-    def test_each_shipped_key_reads_without_recovery_and_has_a_valid_limit(self) -> None:
-        scoring_config = conf.read(CONFIG_DIR / "issue_score.conf")
-        path = CONFIG_DIR / "issue_score.conf"
+    def test_each_fixed_key_reads_without_recovery_and_has_a_valid_limit(self) -> None:
+        path = conf.path("issue_score")
+        scoring_config = conf.read(path)
         lines = path.read_text(encoding="utf-8").splitlines()
         settings = conf.read(path).values()
-        self.assertTrue(settings)
+        self.assertEqual(set(settings), conf.shipped_keys(SHIPPED_CONFIG))
         for key, value in settings.items():
             with self.subTest(key=key):
                 index, _ = conf.effective_line(path, key)
                 self.assertGreater(index, 0)
                 limit = lines[index - 1]
-                self.assertTrue(limit.startswith(("# whole:", "# range:", "# one of:")), limit)
+                self.assertTrue(limit.startswith(("# whole:", "# range:", "# text:")), limit)
                 warnings = io.StringIO()
                 with redirect_stderr(warnings):
                     conf.check(path, key, value)
@@ -132,13 +175,13 @@ class ConfigurationTests(ConfiguredTestCase):
             "title_only_character_limit": (evaluate.title_only_character_limit, "40", 40),
             "disagreement_count": (evaluate.disagreement_count, "3", 3),
         }
-        for field in ("backlog_goal", "backlog_alignment", "backlog_impact", "category", "area"):
+        for field in SCORING_FIELDS:
             readers[f"threshold.{field}"] = (
                 lambda field=field: questions.thresholds()[field], "0.51",
                 questions.MinimumGap(.51) if field == "area" else questions.Supported(.51),
             )
             readers[f"error_target.{field}"] = (lambda field=field: questions.error_targets()[field], "0.2", .2)
-        self.assertEqual(set(readers), set(conf.read(CONFIG_DIR / "issue_score.conf").values()))
+        self.assertEqual(set(readers), conf.shipped_keys(SHIPPED_CONFIG))
         for key, (read, replacement, expected) in readers.items():
             with self.subTest(key=key):
                 initial = "private-initial" if isinstance(expected, (str, Path)) else "1"

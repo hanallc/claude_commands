@@ -17,15 +17,25 @@ from typing import Literal, cast, override
 from unittest.mock import patch
 
 from scripts.aws_target import aws_page, machines_page
-from scripts.build_queue import memory_feed
 from scripts.disks import disks_page
 from scripts.lib import conf
-from scripts.lint.memory_test_support import write_config_fixture
+from scripts.lint.memory_test_support import config_environment, fixture_feed_code_settings, write_config_fixture
 from scripts.production import investigation, staff
+from scripts.production.change_review_test_support import (
+    REVIEW_ENDPOINT_SETTINGS, REVIEW_REFRESH_SETTINGS, write_change_review_settings,
+)
 from scripts.production.change_routing import UnavailableProduction
 from scripts.review_links import (
     change_browser, change_page, console, for_you, investigations_page, page_frame, record_table, review_link,
 )
+from scripts.review_links.test_page_frame import console_settings
+
+
+with fixture_feed_code_settings():
+    from scripts.build_queue import memory_feed
+
+
+CONSOLE_LINK_SETTINGS = REVIEW_ENDPOINT_SETTINGS + REVIEW_REFRESH_SETTINGS
 
 
 class ConsoleMarkup(HTMLParser):
@@ -51,28 +61,13 @@ class ConsoleTests(unittest.TestCase):
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="console-test-")))
         self.configuration = self.root / "config"
-        self.configuration.mkdir()
-        for stem in ("console", "review_links", "change_review"):
-            _ = shutil.copyfile(Path(__file__).resolve().parents[2] / f"config/{stem}.conf",
-                                self.configuration / f"{stem}.conf")
-        _ = write_config_fixture(self.configuration / "console.conf",
-            "page.accounts.label=Accounts\npage.accounts.title=Accounts\npage.accounts.icon=users\n"
-            + "page.accounts.url=python:scripts.review_links.accounts_page:page_url\n"
-            + "page.aws.label=AWS\npage.aws.title=AWS\npage.aws.icon=cloud\n"
-            + "page.aws.url=python:scripts.aws_target.aws_page:page_url\n"
-            + "page.builds.icon=hammer\npage.builds.label=Builds\npage.builds.title=Builds\n"
-            + "page.builds.url=python:scripts.build_queue.memory_feed:page_url\n"
-            + "page.disks.label=Disks\npage.disks.title=Disks\npage.disks.icon=hard-drive\n"
-            + "page.disks.url=python:scripts.disks.disks_page:page_url\n"
-            + "page.images.label=Images\npage.images.title=Images\npage.images.icon=image\n"
-            + "page.images.url=python:scripts.review_links.images:page_url\n"
-            + "page.list.label=List\npage.list.icon=list-checks\npage.list.title=The List\n"
-            + "page.list.url=python:scripts.review_links.list_page:page_url\n"
-            + "page.review.label=Review\npage.review.icon=inbox\npage.review.title=Review\n"
-            + "page.review.url=python:scripts.review_links.review_page:page_url\n"
-            + "rebuilds.url=python:scripts.review_links.change_page:rebuilds_url\n")
+        environment = config_environment(self.configuration, fixtures={
+            "console.conf": console_settings(),
+            "review_links.conf": CONSOLE_LINK_SETTINGS,
+        })
+        write_change_review_settings(self.configuration, self.root)
         _ = cast(object, self.enterContext(patch.dict(os.environ, {
-            "CONF_DIR": str(self.configuration), "REVIEW_LINKS_ROOT": str(self.root / "snapshots"),
+            **environment, "REVIEW_LINKS_ROOT": str(self.root / "snapshots"),
             "REVIEW_LINKS_HOST": "127.0.0.1", "STAFF_FILE": str(self.root / "staff.json"),
             "SHOWRUNNER_STATE_DIR": str(self.root / "state")})))
 
@@ -160,15 +155,22 @@ class ConsoleTests(unittest.TestCase):
         self.assertIn('.workspace{flex:1;width:100%}', source)
         self.assertIn("mobileToggle.setAttribute('aria-expanded', String(!value))", source)
 
-    def test_repository_config_names_staff_for_every_console_page(self) -> None:
-        path = Path(__file__).resolve().parents[2] / "config" / "console.conf"
-        settings = conf.read(path).values()
+    def test_fixture_config_names_staff_for_every_console_page(self) -> None:
+        settings = conf.read("console").values()
         pages = {key.split(".")[1] for key in settings if key.startswith("page.") and key.endswith(".url")}
         self.assertEqual(pages | {"rebuilds"}, page_frame.OWNER_PAGES)
-        for page in page_frame.OWNER_PAGES:
-            with self.subTest(page=page):
-                self.assertRegex(settings[f"page.{page}.owner"], r"^[a-f0-9-]{36}$")
-        self.assertEqual(settings["owner.default"], settings["page.review.owner"])
+        self.assertEqual(console.owner_config_problems(settings), ())
+
+    def test_console_owner_problems_name_invalid_missing_and_distinct_ids(self) -> None:
+        settings = conf.read("console").values()
+        settings["page.aws.owner"] = "-" * 36
+        settings["owner.default"] = "12345678-1234-1234-1234-123456789012"
+        del settings["page.list.owner"]
+        self.assertEqual(console.owner_config_problems(settings), (
+            "page.aws.owner: Expected a staff UUID.",
+            "page.list.owner: Expected a staff UUID.",
+            "owner.default: Use the same staff ID as page.review.owner.",
+        ))
 
     def test_builds_url_resolves_from_its_public_function(self) -> None:
         folder = self.root / "snapshots/builds"
@@ -213,7 +215,7 @@ class ConsoleTests(unittest.TestCase):
 
     def test_url_functions_cannot_put_an_external_page_in_the_frame(self) -> None:
         port = 8123
-        _ = write_config_fixture(self.configuration / "review_links.conf", f"server_port={port}\n")
+        _ = write_config_fixture(self.configuration / "review_links.conf", f"server_port={port}\n", defaults="")
         for path in ("https://example.invalid/page", "//example.invalid/page", "/../outside", "/%2e%2e/outside",
                      "http://127.0.0.1:1/page", f"https://127.0.0.1:{port}/page"):
             with self.subTest(path=path), patch.object(memory_feed, "page_url", return_value=path, create=True):
@@ -322,12 +324,13 @@ class ForYouNotifierTests(unittest.TestCase):
 
 def assert_notifier_browser(case: unittest.TestCase, width: int) -> None:
     'Exercise the real shell with controlled reads, timers, and clipboard writes.'
-    settings = Path(__file__).resolve().parents[2] / "config"
     pages = (console.ConsolePage("list", "List", "list-checks", "The List", console.AvailablePage("/page")),
              console.ConsolePage("review", "Review", "inbox", "Review", console.AvailablePage("/console/review.html")),
              console.ConsolePage("accounts", "Accounts", "users", "Accounts", console.AvailablePage("/accounts")))
-    with patch.dict(os.environ, {"CONF_DIR": str(settings)}):
-        source = console.render(pages, console.UnavailablePage()).decode()
+    with tempfile.TemporaryDirectory() as directory:
+        environment = config_environment(Path(directory), fixtures={"review_links.conf": CONSOLE_LINK_SETTINGS})
+        with patch.dict(os.environ, environment):
+            source = console.render(pages, console.UnavailablePage()).decode()
     setup = r'''<script>
 const nativeFetch=window.fetch.bind(window),timers=new Map();
 let mode='failed',reads=0,visibility='visible',copied='',finishRead;

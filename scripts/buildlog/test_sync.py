@@ -29,7 +29,6 @@ from scripts.buildlog import store
 from scripts.buildlog import sync, vault_pull
 from scripts.buildlog.test_index import point_root_at
 from scripts.lib import test_hang_guard
-from scripts.lint.memory_test_support import config_environment
 
 
 def setUpModule() -> None:
@@ -46,12 +45,9 @@ class SyncTests(unittest.TestCase):
     def setUp(self) -> None:
         temporary = self.enterContext(tempfile.TemporaryDirectory())
         self.root = Path(temporary) / "buildlog"
-        _ = self.enterContext(mock.patch.object(store, "host_name", side_effect=lambda: record.local_step_identity().hosts[0]))
         point_root_at(self, self.root)
-        self.enterContext(mock.patch.dict(os.environ, {
-            **config_environment(Path(temporary)),
-            "HOME": temporary, "BUILDLOG_PEER": "test-mac",
-        }))
+        _ = self.enterContext(mock.patch.object(store, "host_name", side_effect=lambda: record.local_step_identity().hosts[0]))
+        self.enterContext(mock.patch.dict(os.environ, {"HOME": temporary, "BUILDLOG_PEER": "test-mac"}))
         self.commands = []
         self.responses = []
         _ = self.enterContext(mock.patch.object(subprocess, "run", new=self.fake_run))

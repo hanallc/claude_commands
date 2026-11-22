@@ -24,6 +24,7 @@ from zoneinfo import ZoneInfo
 
 from scripts.buildlog import cli
 from scripts.buildlog import index
+from scripts.buildlog.index_test_support import BUILDLOG_INDEX_SETTINGS
 from scripts.buildlog import mac_idle, mac_idle_alert, sample
 from scripts.mac_test import eligibility, offload, mac_test
 from scripts.build_queue import admission_protocol as wire, admission_client
@@ -31,8 +32,10 @@ from scripts.build_queue.admission_test_support import AdmissionFixture, caller_
 from scripts.buildlog.mac_idle_test_support import NotificationGuardedTestCase, NotificationTransportBlocked, PrivateSenderAcceptance, private_sender_acceptance
 from scripts.direct import step_record
 from scripts.lib import conf
-from scripts.lint.memory_test_support import write_config_fixture, fake_memory_readings
+from scripts.mac_test.config_test_support import MAC_IDLE_SETTINGS
+from scripts.lint.memory_test_support import fake_memory_readings, seed_config_fixture_folder, write_config_fixture
 from scripts.message import send
+from scripts.message.session_send_test_support import SEND_TIMING_FIXTURES
 from scripts.buildlog.test_index import use_test_log
 from scripts.direct.verify_mac_memory_retry_test_support import VerifyMacMemoryRetryFixture
 from scripts.lib.process_group import send_process_group
@@ -57,6 +60,8 @@ class MacIdleTests(NotificationGuardedTestCase):
     def setUp(self) -> None:
         super().setUp()
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        seed_config_fixture_folder(self.root, SEND_TIMING_FIXTURES)
+        _ = write_config_fixture(self.root / "buildlog.conf", defaults=BUILDLOG_INDEX_SETTINGS)
         self.paths = mac_idle.MacIdlePaths(self.root / "watch", self.root / "mac", self.root / "buildlog/admission",
                                         self.root / "proc")
         self.enterContext(mock.patch.dict(os.environ, {
@@ -74,7 +79,7 @@ class MacIdleTests(NotificationGuardedTestCase):
             "UNIT_RUN_DIR": str(self.root / "unit"),
         }))
         _ = write_config_fixture(self.root / "mac_test.conf",
-                                 "alert_seconds=180\npush_seconds=600\nstale_seconds=300\n")
+                                 "alert_seconds=180\npush_seconds=600\nstale_seconds=300\n", defaults=MAC_IDLE_SETTINGS)
         self.paths.proc.mkdir()
         self.paths.mac_state.mkdir()
         self.paths.admission.mkdir(parents=True)
@@ -591,7 +596,7 @@ done
                     _ = mac_test.read_config()
 
     def test_repair_text_uses_configured_idle_threshold(self) -> None:
-        _ = write_config_fixture(self.root / "mac_test.conf", "alert_seconds=42\n")
+        _ = write_config_fixture(self.root / "mac_test.conf", "alert_seconds=42\n", defaults=MAC_IDLE_SETTINGS)
         message = mac_idle.repair_message(self.call, "idle_with_waiter")
         self.assertIn("at least 42 seconds", message)
         self.assertNotIn("3 minutes", message)

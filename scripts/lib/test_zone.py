@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """zone.py: resolve a place to a zone, write it live on both machines, tell every session, then publish it."""
 from __future__ import annotations
-from scripts.lint.memory_test_support import write_config_fixture
 
 import io
 import json
@@ -20,6 +19,8 @@ from typing import cast, override
 from unittest import mock
 
 from scripts.lib import live_settings, main_publish, zone, user_zone
+from scripts.lib.live_settings_test_support import write_live_settings_fixture
+from scripts.lib.main_push_lock_test_support import write_push_lock_settings
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 SCRIPT = Path(__file__).with_name("zone.py")
@@ -121,10 +122,10 @@ class SetTests(unittest.TestCase):
             _ = self.git(self.checkout, *arguments)
         (self.checkout / "config").mkdir()
         _ = (self.checkout / "config/user_zone.conf").write_text(CONF_TEXT, encoding="utf-8")
-        _ = write_config_fixture(self.checkout / "config/live_settings.conf",
-            "fetch_seconds=10\nmac_pull_seconds=20\nmac_write_seconds=10\npush_seconds=10\n")
+        write_push_lock_settings(self.checkout / "config")
+        write_live_settings_fixture(self.checkout / "config")
         _ = (self.checkout / "other.txt").write_text("work in progress\n", encoding="utf-8")
-        _ = self.git(self.checkout, "add", "config/user_zone.conf", "config/live_settings.conf")
+        _ = self.git(self.checkout, "add", "config/user_zone.conf", "config/live_settings.conf", "config/main_push_lock.conf")
         _ = self.git(self.checkout, "commit", "-q", "-m", "start")
         _ = self.git(self.checkout, "push", "-q", "origin", "main")
 

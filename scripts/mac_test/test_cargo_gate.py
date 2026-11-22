@@ -86,8 +86,9 @@ class CargoGateTests(unittest.TestCase):
                           + ' kill -0 "$2" 2>/dev/null || exit 1\n print "Mon Nov  9 12:00:00 2026"\nelse\n /bin/ps "$@"\nfi\n')
         ps.chmod(0o755)
         _ = write_config_fixture(root / "config/mac_gate.conf",
-            "placement_check_command=" + shlex.join([sys.executable, str(check)])
-            + "\nplacement_check_timeout_seconds=1\nplacement_recheck_seconds=15\nrefusal_exit_code=125\n")
+            defaults="placement_check_command=" + shlex.join([sys.executable, str(check)])
+            + "\n# whole: 1..\nplacement_check_timeout_seconds=1\n"
+            + "# whole: 1..\nplacement_recheck_seconds=15\n# whole: 1..255\nrefusal_exit_code=125\n")
         ssh = fake / "ssh"
         _ = ssh.write_text(f"#!{sys.executable}\n" + "import json, os, sys\nfrom pathlib import Path\n"
             + "root = Path(os.environ['GATE_TEST_ROOT'])\n"
@@ -112,7 +113,7 @@ class CargoGateTests(unittest.TestCase):
             environment = self.fixture(root)
             copied = copy_helpers(root, "scripts/mac_test")
             gate_bin = copied / "mac_test/cargo_gate/bin"
-            _ = write_config_fixture(root / "config/mac_gate.conf", "refusal_exit_code=83\n")
+            _ = write_config_fixture(root / "config/mac_gate.conf", "refusal_exit_code=83\n", defaults="")
             environment.update(CLAUDECODE="1", GATE_TEST_BIN=str(gate_bin),
                                PATH=os.pathsep.join((str(gate_bin), str(root / "fake"), str(root / "real"),
                                                     "/usr/bin", "/bin")))
@@ -139,7 +140,7 @@ class CargoGateTests(unittest.TestCase):
                         _ = write_config_fixture(root / "config/mac_gate.conf",
                             "placement_check_command=ssh -o BatchMode=yes -o ConnectTimeout=6 natedev "
                             + "'~/.claude/scripts/lib/py ~/.claude/scripts/build_queue/admission_client.py placement-status'\n"
-                            + "placement_check_timeout_seconds=1\n")
+                            + "placement_check_timeout_seconds=1\n", defaults="")
                         environment.update(SSH_CONNECTION="fake", MAC_PLACEMENT="episode/attempt")
                     if not readable:
                         (root / "config/mac_gate.conf").unlink()

@@ -19,9 +19,16 @@ from pathlib import Path
 from typing import ClassVar, cast, override
 from unittest import mock
 
+from scripts.accounts.home_test_support import (
+    ACCOUNT_HOME_SETTINGS, ACCOUNT_STATUS_SETTINGS, ACCOUNT_WORKER_MODE_SETTINGS,
+)
 from scripts.lib.py_floor_test_support import interpreter_cache_environment
-from scripts.lint.memory_test_support import config_environment, write_config_fixture
+from scripts.agents.test_support import write_machine_config
+from scripts.lint.memory_test_support import config_environment, seed_config_fixture_folder, write_config_fixture
 from scripts.message import session_send
+from scripts.message.session_send_test_support import SEND_TIMING_FIXTURES
+from scripts.notify import review
+from scripts.production.change_review_test_support import ROLE_COLOR_CONFIG
 from scripts.lib.test_models_registry import ExactRows, registry_text, write_registry
 from scripts.whoami.credit_accounts_test_support import hold_credit_accounts, set_credits
 from scripts.whoami.account_test_support import create_claude_account
@@ -124,18 +131,20 @@ def setUpModule() -> None:
     _ = unittest.enterModuleContext(mock.patch.object(role_map, "ssh_role_map", side_effect=AssertionError("unexpected ssh")))
     root = Path(unittest.enterModuleContext(tempfile.TemporaryDirectory())).resolve()
     _ = unittest.enterModuleContext(mock.patch.object(showrunners, "NOTIFIER_STATE_DIR", root))
+    config = root / "notify.conf"
+    _ = write_config_fixture(config, defaults="REVIEW_TIMEOUT_SECONDS=60\n")
+    _ = unittest.enterModuleContext(mock.patch.object(review, "NOTIFY_CONFIG", config))
 
 
 def fixture_configuration(root: Path) -> dict[str, str]:
-    """Copy the config and set the worker-mode messages that these tests assert."""
+    """Set private delivery settings and worker-mode messages."""
     configuration = root / "config"
     environment = config_environment(configuration)
-    _ = write_config_fixture(configuration / "accounts.conf",
-        "no_worker_mode_on=Codex workers have no capacity. Send no assign. Do your current work yourself: "
-        + "write the code, run the tests and do the reviews directly. Keep to this rule until the workers-back notice arrives.\n"
-        + "no_worker_mode_off=Codex workers are up again. Use workers again. This notice ends no-worker mode.\n"
-        + "no_worker_mode_fyi=morty dwight\nusage_stale_minutes=10\nrefusal_reset_wait_minutes=20\n"
-        + "half_point_pace_minutes=30\nhold_default_minutes=40\n")
+    write_machine_config(configuration)
+    seed_config_fixture_folder(configuration, SEND_TIMING_FIXTURES)
+    _ = write_config_fixture(configuration / "statusline.conf", defaults=ROLE_COLOR_CONFIG)
+    _ = write_config_fixture(configuration / "accounts.conf", defaults=(
+        ACCOUNT_HOME_SETTINGS + ACCOUNT_STATUS_SETTINGS + ACCOUNT_WORKER_MODE_SETTINGS))
     return environment
 
 

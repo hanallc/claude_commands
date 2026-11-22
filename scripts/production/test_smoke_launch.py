@@ -11,6 +11,8 @@ import unittest
 from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.git_test_support import commit_repository
+from scripts.hana_shot.hana_shot_test_support import SHOT_ENDPOINT_SETTINGS, SMOKE_SETTINGS
+from scripts.lint.memory_test_support import write_config_fixture
 
 
 COMMAND = Path(__file__).with_name("smoke_launch.sh")
@@ -40,9 +42,13 @@ class SmokeLaunchTests(unittest.TestCase):
 
             records = root / "commands.tsv"
             target = root / "missing target"
+            configuration = root / "config"
+            _ = write_config_fixture(configuration / "production.conf", defaults=SMOKE_SETTINGS)
+            _ = write_config_fixture(configuration / "hana_shot.conf", defaults=SHOT_ENDPOINT_SETTINGS)
             environment = {
                 "PATH": str(programs),
                 "HOME": str(home),
+                "CONF_DIR": str(configuration),
                 **interpreter_cache_environment(root / "cache"),
                 "USER_ZONE": "UTC",
                 "GIT_CONFIG_NOSYSTEM": "1",

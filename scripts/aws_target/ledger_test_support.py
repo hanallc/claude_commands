@@ -13,7 +13,7 @@ from typing import cast, override
 import unittest
 from unittest import mock
 
-from scripts.lint.memory_test_support import config_environment
+from scripts.lint.memory_test_support import config_environment, seed_config_fixture_folder
 from scripts.lib import conf
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.aws_target import ledger
@@ -186,6 +186,7 @@ def install_aws_fixture_settings(folder: Path) -> None:
     install_cost_settings(folder / 'aws_target.conf')
     write_gate_config(folder / 'cloud_gate.conf')
     _ = write_hana_config(folder / 'hana_aws.conf')
+    seed_config_fixture_folder(folder, {"build_steps.conf": "names.gate=gate\n"})
 
 
 def install_hana_spending_settings(path: Path) -> None:

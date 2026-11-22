@@ -1,6 +1,5 @@
 """Tests for each unit's staff name, phase and task."""
 from __future__ import annotations
-from scripts.lint.memory_test_support import copy_config_fixture
 
 from scripts.lint.memory_test_support import write_config_fixture
 
@@ -27,6 +26,10 @@ from unittest.mock import ANY, Mock, call, patch
 
 
 from scripts.production import census, display_cells, land_queue, land_runs, live_units, unit_queue
+from scripts.build_targets.target_test_support import LOCAL_TARGET_SETTINGS
+from scripts.production.config_test_support import UNIT_ANOMALY_SETTINGS, UNIT_TABLE_SETTINGS
+from scripts.agents.test_support import SHUTDOWN_SETTINGS
+from scripts.direct.findings_test_support import STANDARD_CONFIG
 from scripts.accounts import session_state
 from scripts.lib import conf, unit_runs
 from scripts.lib.git_test_support import commit_repository, write_fixture_git_config
@@ -50,6 +53,10 @@ from scripts.direct import phase_table
 from scripts.direct import plan_history, progress_history, recorder_state
 from scripts.direct.findings_test_support import invoke_findings
 from scripts.direct.recorder_fixture import invoke_recorder
+
+
+def setUpModule() -> None:
+    unittest.enterModuleContext(patch.dict(os.environ, {"USER_ZONE": "America/New_York"}))
 
 
 def unit(name: str, claude: unit_lookup.Claude | None, *, activity: str = "") -> live_units.LiveUnit:
@@ -154,7 +161,8 @@ class UnitPhasesTests(unittest.TestCase):
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         _ = self.enterContext(patch.object(unit_runs, "RUN_ROOT", self.root / "runs"))
         config = self.root / "table-conf"
-        _ = cast(object, copy_config_fixture(Path(__file__).resolve().parents[2] / 'config', config))
+        _ = write_config_fixture(config / "production.conf", defaults=UNIT_TABLE_SETTINGS + UNIT_ANOMALY_SETTINGS)
+        _ = write_config_fixture(config / "build_targets.conf", defaults=LOCAL_TARGET_SETTINGS)
         _ = cast(object, self.enterContext(patch.dict(os.environ, {"CONF_DIR": str(config)})))
         _ = self.enterContext(patch("socket.gethostname", return_value="natedev"))
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
@@ -437,6 +445,9 @@ class UnitPhasesTests(unittest.TestCase):
         }
         refusal = (f"Recorder state {state} has the old shape from before the 11-19 conversion and cannot be read. "
                    + "No converter remains.\n")
+        configuration = self.root / "table-conf"
+        _ = write_config_fixture(configuration / "direct.conf", defaults=STANDARD_CONFIG)
+        _ = write_config_fixture(configuration / "shutdown.conf", defaults=SHUTDOWN_SETTINGS)
         environment = {**os.environ, "HOME": str(self.root), "UNIT_NOW_EPOCH": "200",
                        "PHASE_TABLE_VAULT": str(self.root / "absent-vault")}
         session_args = ["--session-dir", str(run)]
@@ -2634,7 +2645,7 @@ class UnitPhasesTests(unittest.TestCase):
 
     def test_anomaly_keys_follow_the_joined_text_and_use_the_configured_window(self) -> None:
         config = self.root / "table-conf/production.conf"
-        _ = write_config_fixture(config, "units_anomaly_repeat_minutes=2.5\n")
+        _ = write_config_fixture(config, "units_anomaly_repeat_minutes=2.5\n", defaults=UNIT_ANOMALY_SETTINGS)
         messages = (("anomaly: census took longer than 10 s", "anomaly: café unreadable"),
                     ("anomaly: census took longer than 10 s", "anomaly: café unreadable"),
                     ("anomaly: census took longer than 11 s", "anomaly: café unreadable"))
@@ -2678,7 +2689,7 @@ class UnitPhasesTests(unittest.TestCase):
         config = self.root / "config"
         config.mkdir()
         _ = write_config_fixture(config / "production.conf",
-                                 "UNIT_ANOMALIES_TO=fixture-director\nunits_anomaly_repeat_minutes=60\n")
+                                 defaults=UNIT_TABLE_SETTINGS + UNIT_ANOMALY_SETTINGS)
         def observed(*, record: staff.StaffSnapshot, running: object = None) -> tuple[session_staff.LabeledSession, ...]:
             self.assertEqual(record.by_id(member.id), member)
             self.assertIsNone(running)

@@ -4,11 +4,12 @@
 from __future__ import annotations
 
 from scripts.lib.checkout_test_support import python_tool_source
+from scripts.lint.memory_test_support import seed_config_fixture_folder
+from scripts.message.session_send_test_support import SEND_TIMING_FIXTURES
 
 import io
 import json
 import os
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -75,7 +76,7 @@ class SilenceTests(unittest.TestCase):
     def test_nightly_result_without_herdr_keeps_only_the_newest_result_until_silence_ends(self) -> None:
         root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         checkout = Path(__file__).resolve().parents[2]
-        _ = shutil.copytree(checkout / "config", root / "config")
+        seed_config_fixture_folder(root / "config", SEND_TIMING_FIXTURES)
         keys = root / "keys"
         _ = keys.write_text("PUSHOVER_USER=fixture\nPUSHOVER_TOKEN=fixture\n")
         posted = root / "posted.jsonl"

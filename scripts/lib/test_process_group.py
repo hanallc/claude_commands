@@ -25,7 +25,7 @@ from unittest.mock import MagicMock, patch
 
 from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.lib import process_group
-from scripts.lib.helper_tree_test_support import verify_test_environment
+from scripts.lib.helper_tree_test_support import VERIFY_TOKEN_SETTINGS, verify_test_environment
 from scripts.lib.shell_test_support import refusing_bash_startup
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lint.memory_test_support import config_environment
@@ -236,7 +236,8 @@ class ShellProcessGroupTests(PrivateGroupFixture):
         copy_startup(self.root)
         home = self.root / "home"
         home.mkdir()
-        self.fixture_environment = {**config_environment(self.root / "config"),
+        configuration = config_environment(self.root / "config", fixtures={"direct.conf": VERIFY_TOKEN_SETTINGS})
+        self.fixture_environment = {**configuration,
                                     "HOME": str(home), **interpreter_cache_environment(self.root / "cache"),
                                     "VERIFY_PROCESS_GROUP_LIB": str(self.root / "scripts/lib")}
 

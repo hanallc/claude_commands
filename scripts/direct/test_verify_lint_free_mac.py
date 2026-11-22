@@ -11,6 +11,7 @@ from scripts.build_queue import admission_protocol as wire, placement
 from scripts.direct.verify_hold_wait_test_support import VerifyHoldTools
 from scripts.direct.verify_lint_scope_test_support import CARGO_STUB, SCRIPTS, TAPLO_STUB, write_fixture_cargo_mend
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.mac_test.config_test_support import MAC_RUN_SETTINGS
 from scripts.lint.memory_test_support import write_config_fixture
 
 
@@ -193,7 +194,7 @@ if arguments[:1] == ["mend"]:
     def test_linux_only_workspace_lint_leaves_memory_for_the_mac(self) -> None:
         # Only the Mac compiles macOS code, so a lint ignores linux_only and the Mac judges the whole workspace.
         settings = Path(self.environment["MAC_TEST_CONFIG"])
-        _ = write_config_fixture(settings, f"offload=on\nlinux_only.{self.root.name}=sample\n", template="mac_test")
+        _ = write_config_fixture(settings, f"offload=on\nlinux_only.{self.root.name}=sample\n", defaults=MAC_RUN_SETTINGS)
         process = self.queued_lint()
         output = self.finish_lint(process)
         self.assertIn("another machine is free after", output)

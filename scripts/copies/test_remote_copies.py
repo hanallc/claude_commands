@@ -32,7 +32,9 @@ from scripts.copies.remote_test_support import local_remote_transport, warm_clai
 from scripts.lib import conf, file_lock, scratch
 from scripts.lib.py_floor_test_support import seed_interpreter_cache
 from scripts.lib.atomic_file import write_text_atomic
+from scripts.lint.memory_test_support import write_config_fixture
 from scripts.mac_test import floor_claims, mac_gate
+from scripts.mac_test.config_test_support import MAC_OFFLOAD_SETTINGS
 from scripts.lint import tmp_sweep
 from scripts.production.cli_fixture import ImmutableGitSeed
 from scripts.production import staff
@@ -653,6 +655,7 @@ class RemoteCopiesTests(unittest.TestCase):
     def test_remote_kind_covers_mac_linux_and_named_peer(self) -> None:
         from scripts.mac_test import eligibility, offload
         from scripts.build_targets import target_config
+        _ = write_config_fixture(conf.path("mac_test"), defaults=MAC_OFFLOAD_SETTINGS)
         targets: tuple[tuple[str, target_config.Platform], ...] = (("mac", "macos"), ("linux", "linux"), ("peer", "linux"))
         for name, platform in targets:
             with self.subTest(target=name), mock.patch.object(eligibility, "configured_ssh_target",
@@ -841,8 +844,8 @@ exec(compile(program, '<remote-probe>', 'exec'))
         self.assertEqual(floor_claims.read_mirror_record(self.mirror / floor_claims.MIRROR_RECORD)["kind"], "remote-mirror")
 
     def test_allow_list_keeps_only_original_copy_makers(self) -> None:
-        settings = conf.read(Path(__file__).resolve().parents[2] / "config/copies.conf").values()
-        entries = {key.removeprefix("allow.") for key in settings if key.startswith("allow.")}
+        keys = conf.shipped_keys(Path(__file__).resolve().parents[2] / "config/copies.conf")
+        entries = {key.removeprefix("allow.") for key in keys if key.startswith("allow.")}
         self.assertEqual(entries, {"copies/copies.py", "production/add_unit.py", "agents/shutdown.py",
             "style/add_style.py", "worktree/make_worktree.sh", "worktree/worktrees.py",
             "bevy_migration_plan/bevy_migration_ensure_repo.sh", "lib/build_folders.py"})

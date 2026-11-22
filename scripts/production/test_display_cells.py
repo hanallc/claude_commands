@@ -1,10 +1,22 @@
 """Tests for complete cells in tables that use native Markdown wrapping."""
 from __future__ import annotations
 
+import os
+import tempfile
 import unittest
+from pathlib import Path
+from typing import cast
+from unittest.mock import patch
 
-from scripts.lib import conf
 from scripts.production import claude_table_layout, display_cells
+from scripts.production.config_test_support import UNIT_TABLE_SETTINGS
+
+
+def setUpModule() -> None:
+    configuration = Path(unittest.enterModuleContext(tempfile.TemporaryDirectory()))
+    _ = (configuration / "production.conf").write_text(UNIT_TABLE_SETTINGS)
+    _ = cast(object, unittest.enterModuleContext(patch.dict(os.environ, {"CONF_DIR": str(configuration)})))
+
 
 
 class WrappedTableTests(unittest.TestCase):
@@ -25,10 +37,9 @@ class WrappedTableTests(unittest.TestCase):
                     for column, original in enumerate(originals, 1):
                         restored = " ".join(row[column] for row in selected if row[column])
                         self.assertEqual(restored.replace(" ", ""), original.replace(" ", ""))
-                settings = conf.read_or_repository("production")
-                width = settings.whole("units_table_floor_columns") - claude_table_layout.REPLY_INDENT
+                width = 120 - claude_table_layout.REPLY_INDENT
                 fitted = claude_table_layout.fit(titles, rows, width)
-                self.assertTrue(fitted.keeps_table(titles, rows, width, settings.whole("units_table_cell_lines")))
+                self.assertTrue(fitted.keeps_table(titles, rows, width, 4))
 
     def test_a_kept_column_stays_when_every_cell_is_empty(self) -> None:
         titles, rows = display_cells.wrapped(("Unit", "Notes", "Workers"), [("one", "—", "—")], keep=(2,))

@@ -26,8 +26,9 @@ from scripts.buildlog.store import host_name
 from scripts.lib import build_folders, build_slots, conf, zone
 from scripts.direct.wait_for_test_state import wait_until
 from scripts.lib.test_hang_guard import LauncherHangGuard, TEST_HANG_GUARD_SECS
+from scripts.production.merge_checkpoint_test_support import MergeCheckpointFixture, checkpoint_pull_settings
 from scripts.lint.memory_test_support import write_config_fixture
-from scripts.production.merge_checkpoint_test_support import MergeCheckpointFixture
+from scripts.lib.main_push_lock_test_support import write_push_lock_settings
 from scripts.production import fast_track, merge_checkpoint
 from scripts.production.cli_fixture import invoke_cli, process_boundary, process_boundary_for_case
 
@@ -381,10 +382,8 @@ owner.verify=verify
 """,
         )
         _ = (config / "build_steps.conf").write_text("names.fast-track=fast track\n")
-        _ = (config / "main_push_lock.conf").write_text("# whole: 1..\nrecord_days=14\n")
-        _ = (config / "merge_checkpoint.conf").write_text(
-            "# whole: 1..\nMAC_PULL_TRIES=3\n# range: 0..\nMAC_PULL_RETRY_SECONDS=0\n",
-        )
+        write_push_lock_settings(config)
+        _ = write_config_fixture(config / "merge_checkpoint.conf", defaults=checkpoint_pull_settings())
 
     def save_config(self) -> None:
         lines: list[str] = []

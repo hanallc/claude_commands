@@ -7,6 +7,7 @@ from scripts.production.staff_test_support import unit_membership, fixture_membe
 from scripts.lib import build_folders, names
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.test_names import fixture_names
+from scripts.lib.test_script_prompts import write_script_prompt_fixture
 from scripts.lib.test_models_registry import claude_catalog_environment, write_registry
 from scripts.lib.transcript_test_support import compressed_copy
 
@@ -17,6 +18,7 @@ import shlex
 import socket
 import shutil
 import subprocess
+import tempfile
 import time
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
@@ -42,6 +44,9 @@ LAUNCHED_AT = datetime(2026, 10, 6, 12, tzinfo=ZoneInfo("America/Los_Angeles"))
 
 def setUpModule() -> None:
     configure_test_zone()
+    configuration = Path(unittest.enterModuleContext(tempfile.TemporaryDirectory()))
+    write_script_prompt_fixture(configuration)
+    _ = cast(object, unittest.enterModuleContext(patch.dict(os.environ, {'CONF_DIR': str(configuration)})))
 
     def start_command(client: herdr.Herdr, argv: list[str], kind: str, pane: str,
                       timeout: float) -> subprocess.CompletedProcess[str]:
@@ -411,7 +416,7 @@ class AddUnitLaunchTests(AddUnitTestCase):
         assert isinstance(saved, unit_config.UnitConfig)
         self.assertIsInstance(saved.port, unit_config.AppPort)
         assert isinstance(saved.port, unit_config.AppPort)
-        settings = conf.read("production")
+        settings = conf.read(self.config.with_name("production.conf"))
         self.assertGreaterEqual(saved.port.number, settings.whole("unit_port_first"))
         self.assertLessEqual(saved.port.number, settings.whole("unit_port_last"))
 
