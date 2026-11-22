@@ -38,8 +38,11 @@ LAUNCHD_WRITE = re.compile(
 
 ALLOWED_DESTINATIONS = {
     ("agents/com.natemccoy.codex-agent-catalog-sync.plist", "StandardErrorPath /tmp/codex-agent-catalog-sync/launchd.stderr.log"): "Launchd writes the catalog sync log.",
+    ("berth/install/install.sh", "mktemp /tmp}/cargo-berth-install.XXXXXX"): "Writes under the caller's TMPDIR; the fallback is roots.system.",
     ("claude_to_codex/com.natemccoy.claude-to-codex-sync.plist", "StandardOutPath /tmp/claude-to-codex-sync/launchd.stdout.log"): "Launchd writes the sync output.",
     ("claude_to_codex/com.natemccoy.claude-to-codex-sync.plist", "StandardErrorPath /tmp/claude-to-codex-sync/launchd.stderr.log"): "Launchd writes the sync errors.",
+    ("direct/verify.sh", "mktemp /tmp}}/step-output.XXXXXX"): "Writes under the caller's TMPDIR; the fallback is roots.system.",
+    ("direct/verify.sh", "mktemp /tmp}}/clippy.XXXXXX"): "Writes under the caller's TMPDIR; the fallback is roots.system.",
     ("lint/memory_gate.sh", "mktemp /tmp}/hold-check.XXXXXX"): "Memory admission stores diagnostic output.",
     ("prioritize/com.natemccoy.hanadocs-prioritize.plist", "StandardOutPath /tmp/hanadocs-prioritize/launchd.stdout.log"): "Launchd writes the watcher output.",
     ("prioritize/com.natemccoy.hanadocs-prioritize.plist", "StandardErrorPath /tmp/hanadocs-prioritize/launchd.stderr.log"): "Launchd writes the watcher errors.",
@@ -58,7 +61,10 @@ INDIRECT_DESTINATIONS = {
     ('lib/session_folder.py', 'FORMER_ROOT = Path("/tmp/claude/session")'): 'The managed session folder root supplies restore paths.',
     ('lib/unit_runs.py', 'RUN_ROOT = Path(os.environ.get("SCRATCH_ROOT") or "/tmp/claude/scratch").parent / "unit"'): 'The managed unit run root supplies the fallback for run folders.',
     ('lib/unit_runs.py', 'ASTRA_RUN_ROOT = Path(os.environ.get("ASTRA_REVIEW_DIR") or "/tmp/claude/astra")'): 'Astra creates review run folders under this runtime root.',
+    ('lint/invoke.sh', 'BUILDLOG_PEAK="${TMPDIR:-/tmp}/buildlog.$$.$RANDOM.peak"'): "Writes under the caller's TMPDIR; the fallback is roots.system.",
+    ('lint/invoke.sh', 'held="${TMPDIR:-/tmp}/buildlog.$$.$RANDOM$RANDOM.log"'): "Writes under the caller's TMPDIR; the fallback is roots.system.",
     ('lint/invoke.sh', 'LINT_NEXTEST_WIDTH_FILE="${TMPDIR:-/tmp}/nextest_tokens.'): 'The nextest processes share the width file.',
+    ('lint/invoke.sh', 'log="${TMPDIR:-/tmp}/lint_invoke.$$.$RANDOM.log"'): "Writes under the caller's TMPDIR; the fallback is roots.system.",
     ('lint/invoke.sh', 'parent="${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}"'): 'The sweep stores the previous run time.',
     ('message/send.py', 'with TemporaryDirectory(prefix="claude-send-", dir="/tmp")'): 'The sender uses a short Unix socket path.',
     ('prioritize/install_watcher.sh', 'STATE_DIR="/tmp/hanadocs-prioritize"'): 'The installer prepares the watcher state folder.',

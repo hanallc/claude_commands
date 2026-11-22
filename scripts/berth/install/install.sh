@@ -30,14 +30,12 @@ mkdir -p -- "$binary_directory" || {
     exit 1
 }
 
-folder_tools="$(cd -- "${BASH_SOURCE[0]%/*}/../../lib" && pwd)" || exit 1
-staging_directory=$("$folder_tools/py" "$folder_tools/build_folders.py" tool \
-    --tool cargo-berth-install --owner-pid "$$") || {
+staging_directory=$(mktemp -d "${TMPDIR:-/tmp}/cargo-berth-install.XXXXXX") || {
     printf 'cargo-berth install failed during staging-directory creation\n' >&2
     exit 1
 }
 cleanup_staging() {
-    "$folder_tools/py" "$folder_tools/build_folders.py" remove "$staging_directory"
+    rm -rf -- "$staging_directory"
 }
 trap cleanup_staging EXIT HUP INT TERM
 
@@ -60,7 +58,7 @@ rollback_installation() {
             rm -f -- "$binary_path"
         fi
     fi
-    cleanup_staging
+    rm -rf -- "$staging_directory"
 }
 trap rollback_installation EXIT HUP INT TERM
 
