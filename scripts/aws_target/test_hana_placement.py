@@ -34,7 +34,7 @@ from scripts.build_hold.owning_session import OwningSession
 
 
 REPOSITORY = Path(__file__).resolve().parents[2]
-KEY = 'https://github.com/natepiano/hana'
+KEY = 'https://github.com/hanallc/hana'
 PREVIEW_SECONDS = 2
 
 

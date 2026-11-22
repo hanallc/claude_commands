@@ -28,16 +28,18 @@ def _cadence() -> Schedule:
 
 def upkeep() -> None:
     from scripts.accounts import accounts
-    from scripts.agents import stop_resume
+    from scripts.agents import shutdown_record, stop_resume
     from scripts.herdr import detection_rules, herdr
-    from scripts.production import merge_gate
+    from scripts.production import gate
     from scripts.production.gate_modules import GateRefused
 
     try:
-        _ = merge_gate.check_nightly_assignments()
+        _ = gate.check_nightly_assignments()
     except (GateRefused, OSError, ValueError, subprocess.SubprocessError) as error:
         print(f"herdr-upkeep: nightly result check: {error}", file=sys.stderr)
 
+    if shutdown_record.active():
+        return
     cadence = _cadence()
     deadline = min(time.monotonic() + cadence.timeout_seconds,
                    float(os.environ.get("HERDR_UPKEEP_DEADLINE", "inf")))
@@ -54,13 +56,20 @@ def upkeep() -> None:
             producers = producers[offset:] + producers[:offset]
         start_seconds = conf.read("shutdown").number("START_SECONDS")
         for row in producers:
+            if shutdown_record.active():
+                break
             if time.monotonic() >= deadline:
                 print("herdr-upkeep: producer budget ended; retry remaining producers next run", file=sys.stderr)
                 break
             try:
                 with operation_deadline.within(min(deadline, time.monotonic() + start_seconds)):
-                    result = stop_resume.resume(str(row.id))
-                if isinstance(result, stop_resume.ResumeFailed):
+                    result = stop_resume.resume_for_upkeep(row.id)
+                if result is None:
+                    break
+                if isinstance(result, stop_resume.StoppedOnPurpose):
+                    print(f"herdr-upkeep: {result.name}: stopped on purpose; agents resume brings it back",
+                          file=sys.stderr)
+                elif isinstance(result, stop_resume.ResumeFailed):
                     print(f"herdr-upkeep: {row.name}: {result.reason}", file=sys.stderr)
                 elif isinstance(result, stop_resume.SessionNotFound):
                     print(f"herdr-upkeep: {row.name}: session not found", file=sys.stderr)

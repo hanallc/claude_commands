@@ -37,9 +37,9 @@ The [launch-name policy](shutdown-and-restart.md#launch-names) supplies current 
 
 ## Pane restore
 
-- Each entry also holds `flags_read` (false when the hook found no Claude argv) and `ended`. `scripts/hooks/session-end-pane-record.py` sets `ended` at
-  SessionEnd for any reason but `other`: `/exit` and logout mark it, a signal at a reboot or a
-  crash does not. An end only marks the entry of the same conversation.
+- Each entry holds `flags_read` and `ended`.
+  A false `flags_read` means that the recorder could not read the agent arguments.
+  A true `ended` marks a saved conversation that stopped.
 - `pane_record.py seed [--session NAME]` writes the entry of each proved foreground owner.
   It reads the owner's arguments and folder from `pane process-info`.
   For Claude, it reads the environment and the conversation id in `<config>/sessions/<pid>.json`.
@@ -47,11 +47,6 @@ The [launch-name policy](shutdown-and-restart.md#launch-names) supplies current 
   For Codex, it uses the proved owner's native conversation.
 - `session_staff.py repair` recovers a missing Claude launch only when its PID and native identity match the proved foreground owner.
   A Claude child cannot replace its Codex parent's retained launch.
-- `scripts/agents/pane_restore.py [--session NAME] [--dry-run]` first starts or adopts the shared server.
-  It resumes staff rows through `restart.start_row`.
-  For a worker row, `start_row` resumes only that worker through `worker.restore` with the worker launch policy and the saved account. An idle worker prints `<name>: closed; its next assign resumes it` and stays closed.
-  It resumes saved panes without staff rows through `herdr.launch_agent`.
-  A pane without a saved entry or a staff row stays open.
 - Restore keeps live conversations.
   The saved-pane path checks occupancy before it starts a launch.
   The launch and close paths check ownership separately.
@@ -90,22 +85,12 @@ The [launch-name policy](shutdown-and-restart.md#launch-names) supplies current 
   workspaces. Restoring into an existing server leaves focus and startup workspaces alone.
 - On natedev, `herdr-agents.service` is a transient unit that `systemd-run` creates.
   The upkeep timer restores producers through shared resume.
-  It does not run `pane_restore.py`.
 - The herdr startup path adopts an answering server. Otherwise it starts one with
   `systemd-run` on Linux. On the Mac it starts the server directly from a desktop
   session, or opens an attach window to start it from a non-desktop session.
   Herdr can replay saved pane commands when its configuration allows agent restore.
   Claude commands wrapped by `lib/relaunch.py` recover the matching conversation's
   session labels and resume note. This is separate from `agents restart`.
-- `pane_restore.py` is an explicit command for staff rows and saved panes without staff rows.
-  No service invokes it automatically.
-
-Settings entry for the user, one more SessionEnd item:
-
-```json
-{"hooks": [{"type": "command", "command": "\"$HOME/.claude/scripts/lib/py\" \"$HOME/.claude/scripts/hooks/session-end-pane-record.py\""}]}
-```
-
 - The Mac has no `/proc`. There `pane_record` reads a parent with `ps -o ppid= -p <pid>`, and the
   arguments and environment from the kernel's KERN_PROCARGS2 record (`account.kern_procargs2`,
   split by `account.procargs2_parts`). On both machines an environment keeps only
@@ -154,10 +139,10 @@ Each upkeep run uses this order:
 1. Restore or adopt the shared herdr server.
 2. Save the shared layout.
 3. Refresh the detection rules.
-4. Resume each selected producer through `stop_resume.resume(str(row.id))`.
+4. Check and resume each selected producer through `stop_resume.resume_for_upkeep(row.id)`.
 
 `accounts.producer_upkeep_members()` reads the local staff snapshot.
-It selects active, local, unpaused producers from both families, without exit requests.
+It selects local, unpaused producers from both families, including producers with exit holds.
 Absent staff returns `()`.
 One `accounts.settings_report_scope()` covers the operation.
 Invalid producer settings exclude that producer and produce one warning per operation.
@@ -166,7 +151,7 @@ Each producer has its own tab in the configured `PRODUCER_WORKSPACE`, normally `
 Resume uses its current conversation, current `[producers]` settings, and family account.
 A live producer starts nothing.
 A paused producer stays stopped.
-An exit request also excludes the producer from upkeep.
+The resume path checks exit and pause holds under the producer's row lock.
 Upkeep does not admit a configured name that has no staff row.
 The [first-start contract](shutdown-and-restart.md#producer-launch-and-admission) defines admission.
 
@@ -185,7 +170,6 @@ After a herdr restart, upkeep restores missing producers through this same path.
 After a reboot, the timer provides the same recovery when the user service starts.
 On natedev, the NixOS upkeep module starts with a graphical login.
 Recovery before login requires `users.users.${username}.linger = true` and `nate.jobs.herdr-upkeep.needsDesktop = false`.
-No service automatically invokes the explicit `pane_restore.py` command for all saved panes.
 
 Claude launches write folder trust in the target account before the process starts.
 The write uses the repository trust key, or the folder itself outside a repository.

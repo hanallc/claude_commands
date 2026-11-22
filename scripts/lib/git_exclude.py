@@ -29,11 +29,15 @@ def require_untracked(checkout: Path, path: str) -> None:
         raise ExcludeRefused(f"{checkout / path}: cannot check tracked files: {tracked.stderr.strip()}")
 
 
-def _exclude_path(checkout: Path) -> Path:
+def _common_dir(checkout: Path) -> Path:
     try:
-        return git_files.locate(checkout).common_dir / "info" / "exclude"
+        return git_files.locate(checkout).common_dir
     except git_files.GitFilesError as error:
         raise ExcludeRefused(f"{checkout}: cannot find git exclude file: {error}") from error
+
+
+def exclude_lock_path(common_dir: Path) -> Path:
+    return common_dir / "info" / "exclude.lock"
 
 
 def _read_exclude(exclude: Path) -> str:
@@ -56,7 +60,7 @@ def require_untracked_ignored(checkout: Path, path: str, *, planned_pattern: str
     if planned_pattern:
         if planned_pattern != f"/{path}" or any(character in path for character in "\r\n*?[\\"):
             raise ExcludeRefused(f"{checkout}: cannot preview exclude pattern {planned_pattern!r}")
-        existing = _read_exclude(_exclude_path(checkout))
+        existing = _read_exclude(_common_dir(checkout) / "info" / "exclude")
         if _with_entry(existing, planned_pattern) == existing:
             # The writer keeps these rules unchanged, including later negations.
             planned_pattern = ""
@@ -84,10 +88,11 @@ def ensure_excluded(checkout: Path, pattern: str) -> None:
         raise ExcludeRefused(f"{checkout}: invalid exclude pattern {pattern!r}")
     path = pattern.removeprefix("/")
     require_untracked(checkout, path)
-    exclude = _exclude_path(checkout)
+    common_dir = _common_dir(checkout)
+    exclude = common_dir / "info" / "exclude"
     try:
         exclude.parent.mkdir(parents=True, exist_ok=True)
-        with exclude.with_name("exclude.lock").open("a", encoding="utf-8") as lock:
+        with exclude_lock_path(common_dir).open("a", encoding="utf-8") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
             existing = _read_exclude(exclude)
             planned = _with_entry(existing, pattern)

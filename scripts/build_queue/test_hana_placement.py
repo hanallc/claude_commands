@@ -615,7 +615,7 @@ class HanaQueueTests(unittest.TestCase):
         with PlacementFixture() as fixture, mock.patch.object(service, 'HostEvidenceWorker', ManualEvidenceWorker):
             target = hana_target(fixture)
             install_hana_spending_settings(target.settings)
-            repo_key = 'https://github.com/natepiano/hana'
+            repo_key = 'https://github.com/hanallc/hana'
             with target.settings.open('a') as settings:
                 _ = settings.write(f'execution_transport=hana-control\nrepository_identity={repo_key}\nkinds=check,lint\n'
                                    + '# whole: 1..\nmax_steps=1\n')

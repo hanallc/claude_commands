@@ -116,6 +116,29 @@ class NumberedRecordsTests(unittest.TestCase):
                 [registered, root / owner / "questions"],
             )
 
+    def test_f099_allocation_refuses_a_missing_named_production_document(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.enterContext(patch.dict(os.environ, {"SHOWRUNNER_STATE_DIR": str(root / "state")}))
+        owner = staff.StaffId("fixture")
+        document = root / "checkout" / "production.md"
+        folder = root / "legacy-proposals"
+        folder.mkdir()
+        legacy = folder / "legacy.md"
+        _ = legacy.write_text("P8")
+        row = staff.StaffRow(owner, "showrunner", "fixture", staff.StaffRoot(), current_session=owner,
+                             doc=staff.LiveDoc(local_machine(), document))
+        _ = self.enterContext(patch.object(staff, "initial_snapshot", return_value=staff.StaffSnapshot((row,))))
+        sequence = root / "state" / "record-ids" / "proposal.water"
+        with record_store.record_numbers(record_store.RecordKind.PROPOSAL, Path.read_text) as numbers:
+            with self.assertRaisesRegex(record_store.RecordAllocationRefused, "production.md"):
+                _ = numbers.next_id()
+            self.assertFalse(sequence.exists())
+            self.assertEqual(legacy.read_text(), "P8")
+
+            document.parent.mkdir()
+            _ = document.write_text(f"- **Proposals:** {folder}\n")
+            self.assertEqual(numbers.next_id(), "P9")
+
     def test_unicode_separators_stay_inside_a_header_field(self) -> None:
         with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {"SHOWRUNNER_STATE_DIR": directory}):
             store = record_store.NumberedRecords(staff.StaffId("fixture"), "records", "R", "record", ValueError)

@@ -344,17 +344,17 @@ class FolderFormTests(unittest.TestCase):
                 self.assertTrue(reader.pass_fds)
             self.assertFalse(build_slots.remove_copy(record))
             envrc = copy.path / ".envrc"
-            self.assertEqual(build_slots.numbered_copy_envrc(envrc, trusted_source=lambda source: source == self.root),
-                             build_slots.NumberedCopyEnvrc.TRUSTED)
-            self.assertEqual(build_slots.numbered_copy_envrc(envrc, trusted_source=lambda _: False),
-                             build_slots.NumberedCopyEnvrc.NEEDS_APPROVAL)
+            self.assertEqual(folders.numbered_copy_envrc(envrc, trusted_source=lambda source: source == self.root),
+                             folders.NumberedCopyEnvrc.TRUSTED)
+            self.assertEqual(folders.numbered_copy_envrc(envrc, trusted_source=lambda _: False),
+                             folders.NumberedCopyEnvrc.NEEDS_APPROVAL)
             _ = envrc.write_text("export FIXTURE=changed\n")
-            self.assertEqual(build_slots.numbered_copy_envrc(envrc, trusted_source=lambda _: True),
-                             build_slots.NumberedCopyEnvrc.NEEDS_APPROVAL)
+            self.assertEqual(folders.numbered_copy_envrc(envrc, trusted_source=lambda _: True),
+                             folders.NumberedCopyEnvrc.NEEDS_APPROVAL)
             envrc.unlink()
             envrc.symlink_to(self.root / ".envrc")
-            self.assertEqual(build_slots.numbered_copy_envrc(envrc, trusted_source=lambda _: True),
-                             build_slots.NumberedCopyEnvrc.NEEDS_APPROVAL)
+            self.assertEqual(folders.numbered_copy_envrc(envrc, trusted_source=lambda _: True),
+                             folders.NumberedCopyEnvrc.NEEDS_APPROVAL)
         _ = copy.path.rename(copy.path.with_name("old"))
         copy.path.mkdir()
         self.assertIsInstance(folders.numbered_copy_record(copy.path), folders.UnreadableNumberedCopySource)
@@ -452,6 +452,16 @@ class FolderFormTests(unittest.TestCase):
             path = folders.output_path("hana", "demo", "mac")
             self.assertEqual(path, self.root / "build/hana/demo/mac")
             self.assertEqual(folders.parse_form(path), folders.WorktreeOutput("hana", "demo", "mac"))
+
+    def test_ci_folders_list_only_numbered_directories_in_number_order(self) -> None:
+        self.assertEqual(folders.ci_folders("hana"), [])
+        parent = self.root / "disk/hana/ci"
+        for name in ("10", "2", "0", "03", "-1", "３", "old"):
+            (parent / name).mkdir(parents=True)
+        (parent / "4").touch()
+        (parent / "5").symlink_to(parent / "2", target_is_directory=True)
+        (parent / "6.lock").touch()
+        self.assertEqual(folders.ci_folders("hana"), [(2, parent / "2"), (10, parent / "10")])
 
     def test_paths_refuse_invalid_components_and_numbers(self) -> None:
         for name in ("", ".", "..", "parent/child", "/absolute", "bad\x00name", "probe.lock", "probe.lease.json"):
@@ -553,7 +563,7 @@ class BuildFolderTests(unittest.TestCase):
         _ = write_config_fixture(config / "build_folders.conf",
             "patterns.temporary={repository}/{owner}-{purpose}-{suffix}\npatterns.gate={purpose}-{suffix}\n"
             + "patterns.standing={repository}/{owner}-gate{suffix}\n"
-            + "patterns.mirror={repository}/{owner}-s{slot}\npatterns.target={purpose}\npatterns.shell-cache={repository}\n"
+            + "patterns.target={purpose}\n"
             + "patterns.scratch={purpose}-{suffix}\npatterns.legacy-unique={purpose}{suffix}\n"
             + "patterns.legacy-stable={purpose}\nnames.repository_key_length=8\n"
             + "patterns.tool={purpose}{suffix}\npatterns.named={showrunner}-{unit}/{work}-{purpose}\n"
@@ -1184,7 +1194,7 @@ def interrupt():
             assert signal.getsignal(signal.SIGINT) is signal.default_int_handler
         os.kill(os.getpid(), signal.SIGINT)
 flock, mkdir, lease, fstat, remove = fcntl.flock, os.mkdir, getattr(f, '_write_lease'), os.fstat, shutil.rmtree
-unlink, remove_folder = os.unlink, getattr(f, '_remove_folder')
+unlink, remove_folder = os.unlink, f.remove_folder
 def lock_step(fd, mode):
     result = flock(fd, mode)
     if mode == fcntl.LOCK_EX | fcntl.LOCK_NB:
@@ -1226,7 +1236,7 @@ patches = {'lock': mock.patch.object(fcntl, 'flock', side_effect=lock_step),
            'lease': mock.patch.object(f, '_write_lease', side_effect=lease_step),
            'fstat': mock.patch.object(os, 'fstat', side_effect=fstat_step),
            'publish': mock.patch.object(f, '_locks', PublishStep()),
-           'folder_removed': mock.patch.object(f, '_remove_folder', side_effect=folder_removed),
+           'folder_removed': mock.patch.object(f, 'remove_folder', side_effect=folder_removed),
            'lease_removed': mock.patch.object(os, 'unlink', side_effect=unlink_step),
            'lock_removed': mock.patch.object(os, 'unlink', side_effect=unlink_step),
            'removal': mock.patch.object(shutil, 'rmtree', side_effect=removal_step)}
@@ -1910,7 +1920,7 @@ assert not loaded, loaded
     @unittest.skipUnless(Path("/dev/shm").is_dir() and os.access("/dev/shm", os.W_OK),
                          "the memory filesystem is unavailable")
     def test_explicit_parent_allocates_under_a_private_dev_shm_parent(self) -> None:
-        with tempfile.TemporaryDirectory(dir=folders.tmpfs_temporary_parent()) as temporary:
+        with tempfile.TemporaryDirectory(dir="/dev/shm") as temporary:
             parent = Path(temporary)
             with folders.temporary_build_folder(folders.UniqueBuildFolder(
                     "merge-gate-", folders.ExplicitBuildParent(parent))) as name:
@@ -2206,7 +2216,7 @@ assert not loaded, loaded
         cases: list[tuple[folders.BuildFolderKind, str]] = [
             ("temporary", "hana-key/unit-proof-abcdef"), ("gate", "proof-abcdef"),
             ("standing", "hana-key/unit-gate"), ("editable", "hana-key-unit/proof"),
-            ("mirror", "hana-key/unit-s3"), ("target", "proof"), ("shell-cache", "hana-key"),
+            ("mirror", "hana-key/unit-s3"), ("target", "proof"),
         ]
         for kind, expected in cases:
             with self.subTest(kind=kind):
