@@ -1850,8 +1850,11 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
             if isinstance(result, ClaudeUp):
                 return replace(result, elapsed_seconds=monotonic() - began, start_state=ClaudeStartState.STARTED)
             return ResumeFailed(identity, "session did not start") if isinstance(result, sessions.SessionNotLive) else result
+        from scripts.worktree import worktrees
+
         entry = entry.copy()
         entry["session_id"] = identity
+        entry["cwd"] = str(worktrees.moved_launch_folder(Path(entry["cwd"])))
         entry["environment"] = names.environment(entry)
 
         source = pane_launch.config_home(entry, record=names.tab_record)
