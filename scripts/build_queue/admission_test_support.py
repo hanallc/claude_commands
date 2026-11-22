@@ -274,6 +274,9 @@ class TestProcesses:
         start = self.fixture_owners[pid] if pid in self.fixture_owners else records.process_start_time(pid)
         return service.OwnerProcessGone() if start is None else service.LiveOwnerIdentity(start)
 
+    def owner_process(self, pid: int) -> service.OwnerProcessReading:
+        return service.linux_owner_process(pid, Path("/proc"))
+
     def pidfd(self, pid: int) -> int:
         return os.pidfd_open(os.getpid() if pid in self.fixture_owners else pid)
 

@@ -1306,6 +1306,7 @@ placement_once
             STEP_TARGET_TABLE='' MAC_ONLY=0 MAC_PASSED=0
             PLACEMENT_COMMAND=(cargo nextest run)
             release_token() { :; }
+            admit_verify_run() { :; }
             check_routing_hold() { :; }
             collect_routing_wait() { :; }
             placement_once() {

@@ -1138,6 +1138,7 @@ def start_gate_job(suite: str, path: Path, argv: Sequence[str], repo: Path,
 
 def test_module_environment(root: Path, environment: dict[str, str]) -> dict[str, str]:
     """Give a module a private build log and tripwires for tools and live memory."""
+    root = root.absolute()
     buildlog = root / "buildlog"
     buildlog.mkdir()
     tools = root / "build-tool-tripwires"
@@ -1156,6 +1157,7 @@ raise SystemExit(99)
         executable.chmod(0o755)
     cargo = str(root / "target")
     return {**environment, "TMPDIR": str(root), "PYTHONDONTWRITEBYTECODE": "1",
+            "MERGE_GATE_MODULE_DIR": str(root),
             "CARGO_TARGET_DIR": cargo, "CARGO_BUILD_BUILD_DIR": cargo,
             "HERDR_BIN": TEST_HERDR_BIN,
             "STAFF_FILE": str(root / "staff.json"),
@@ -1195,8 +1197,10 @@ def finish_gate_job(job: RunningGateJob, status: int) -> GateJobResult:
         captured += f"\n{job.module}: a test read live memory {detail}\n"
     times = (gate_record.TimingNotApplicable() if job.kind is GateJobKind.TYPE_CHECK
              else gate_record.read_module_times(job.log.parent / "test-times.json"))
-    shutil.rmtree(job.log.parent)
-    job.folder_cleanup.close()
+    try:
+        build_folders.remove_folder(job.log.parent)
+    finally:
+        job.folder_cleanup.close()
     if job.killed_for:
         captured = f"{job.killed_for}\n{captured}"
     # Python 3.13 returns 5 for empty helper modules; import errors still return 1.

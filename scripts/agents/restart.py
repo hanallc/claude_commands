@@ -1896,6 +1896,22 @@ def _restart(pane_evidence: ExitStack, *, stop_all: bool, dry_run: bool, only: t
                 shutdown_record.update(started=[], pending=[member for member in saved_by_holder[holder.id]
                                         if staff.StaffId(member) not in changed])
                 recorded.set()
+                previous_hold: staff.Paused | staff.Active | None = None
+                if after_stop is AfterStop.KEEP_STOPPED and holder.kind == "producer":
+                    try:
+                        current = staff.initial_snapshot().rows_by_id.get(holder.id)
+                        if current is None:
+                            raise staff.StaffNotFound(holder.id)
+                        if (current.kind != "producer" or current.current_session != holder.current_session
+                                or current.worktree != holder.worktree):
+                            raise ValueError("the producer changed before the stop")
+                        if not isinstance(current.exited, staff.Exited):
+                            _ = staff.exit(str(holder.id), "agents stop --all ran")
+                            previous_hold = current.paused
+                    except (OSError, ValueError, staff.StaffRefused, staff.StaffNotFound) as error:
+                        _anomaly(holder, f"Could not save the exit hold. {_error_reason(error)}")
+                        shutdown_record.remove_started([str(holder.id)])
+                        return False, ()
                 workers: tuple[staff.StaffId, ...] = ()
                 if worker_scope is WorkerRestartScope.FOLLOW_OWNER and holder.kind in ("unit", "showrunner"):
                     failures: dict[staff.StaffId, str] = {}
@@ -1911,6 +1927,8 @@ def _restart(pane_evidence: ExitStack, *, stop_all: bool, dry_run: bool, only: t
                                     report.failure(identity, row.name, failures[identity])
                 stopped = stop_row(holder, client, codex=observed.codex)
                 if not stopped and holder.kind != "worker":
+                    if previous_hold is not None:
+                        _ = staff.set_hold(str(holder.id), previous_hold)
                     shutdown_record.remove_started([str(holder.id)])
                 return stopped, workers
         finally:
@@ -2028,6 +2046,9 @@ def _restart(pane_evidence: ExitStack, *, stop_all: bool, dry_run: bool, only: t
                 replace(issue, reason=f"{issue.reason.rstrip('.')}. {reason}", step=f"{issue.step} {step}", operator=True))
 
     def remove_started(holder: staff.StaffRow, *, started_holder: bool) -> None:
+        if (started_holder and holder.kind == "producer"
+                and (isinstance(holder.exited, staff.Exited) or isinstance(holder.paused, staff.Paused))):
+            _ = staff.resume(str(holder.id))
         resolved = resume_checks.worker_restores.resolved(holder.id)
         done = [member for member in members_by_holder[holder.id]
                 if (member_id := staff.StaffId(member)) not in blocked_workers
@@ -2102,7 +2123,7 @@ def _restart(pane_evidence: ExitStack, *, stop_all: bool, dry_run: bool, only: t
                         remove_started(holder, started_holder=False)
                         raise
                     print(f"{current.name}: unchanged")
-                    remove_started(holder, started_holder=True)
+                    remove_started(current, started_holder=True)
                     return RestartDisposition.RESTORED
             facts = session_staff.RowResolver(current_record)
             opening = (herdr.OpeningPrompt(resume_message.resume_message(why, workers=resume_message.worker_mode()))
@@ -2122,7 +2143,7 @@ def _restart(pane_evidence: ExitStack, *, stop_all: bool, dry_run: bool, only: t
             except WorkerRestoreIncomplete:
                 remove_started(holder, started_holder=False)
                 raise
-            remove_started(holder, started_holder=True)
+            remove_started(current, started_holder=True)
             return RestartDisposition.STARTED if pane else RestartDisposition.RESTORED
 
     restarted: set[Path] = set()

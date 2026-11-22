@@ -479,7 +479,8 @@ def local_document(row: staff.StaffRow | None) -> Path | None:
 
 
 def staff_store_folders(kind: RecordKind, *, members: staff.StaffSnapshot | None = None,
-                        covered_owner: staff.StaffId | None = None) -> Iterator[Path]:
+                        covered_owner: staff.StaffId | None = None,
+                        require_existing_document: bool = False) -> Iterator[Path]:
     """Find store roots for owners whose folders the caller still needs."""
     if members is None:
         if kind is RecordKind.INVESTIGATION:
@@ -493,7 +494,8 @@ def staff_store_folders(kind: RecordKind, *, members: staff.StaffSnapshot | None
     owners = store_owners(kind, members, strict=True)
     for owner, row in owners.items():
         if owner != covered_owner:
-            yield from known_folders(kind, owner, document=local_document(row), strict=True)
+            yield from known_folders(kind, owner, document=local_document(row), strict=True,
+                                     require_existing_document=require_existing_document)
 
 
 def _legacy_high_water(kind: RecordKind) -> int:
@@ -528,6 +530,10 @@ def keep_file_on_error(path: Path) -> Generator[None]:
         raise
 
 
+class RecordAllocationRefused(OSError):
+    """The allocator could not check all native record folders."""
+
+
 class OccupiedRecordPath(OSError):
     """Another writer published at the destination first."""
 
@@ -552,7 +558,13 @@ class LockedRecordNumbers:
     def floor(self, *folders: Path, covered_owner: staff.StaffId | None = None) -> int:
         """Read all stores. The supplied folders include the covered owner's roots."""
         if self.scanned_floor < 0:
-            folders += tuple(staff_store_folders(self.kind, covered_owner=covered_owner))
+            try:
+                folders += tuple(staff_store_folders(self.kind, covered_owner=covered_owner,
+                                                     require_existing_document=True))
+            except staff.StaffUnreadable:
+                raise
+            except OSError as error:
+                raise RecordAllocationRefused(f"Cannot check the record folders. {error}") from error
             self.scanned_floor = max(_legacy_high_water(self.kind),
                                      max((self.number(self.read_id(path))
                                           for path in stored_paths(folders, strict=True)), default=0))
@@ -569,19 +581,21 @@ class LockedRecordNumbers:
 
     @contextmanager
     def write(self, path: Path, identity: str, owner: staff.StaffId, *,
-              folder: Path | None = None, new_record: bool = False) -> Generator[None]:
-        """Reserve the ID before the native write. Restore its bytes if the write fails."""
+              folder: Path | None = None, new_record: bool = False,
+              before_write: Callable[[], None] = lambda: None) -> Generator[None]:
+        """Read the registry before the callback. Reserve the ID before publication."""
         try:
             root = (path.parent if folder is None else folder).resolve()
             ceiling = self.number(identity)
-            if ceiling > self.high_water:
-                sequence = _sequence_path(self.kind)
-                write_text_atomic(sequence, f"{ceiling}\n")
-                sync_folder(sequence.parent.parent)
-                self.high_water = ceiling
             registry = _folder_registry(owner, self.kind)
             folders = _registered_folders(registry)
             with keep_file_on_error(registry):
+                before_write()
+                if ceiling > self.high_water:
+                    sequence = _sequence_path(self.kind)
+                    write_text_atomic(sequence, f"{ceiling}\n")
+                    sync_folder(sequence.parent.parent)
+                    self.high_water = ceiling
                 if root not in folders:
                     write_text_atomic(registry, json.dumps(list(map(str, (*folders, root)))) + "\n")
                     sync_folder(registry.parent.parent)

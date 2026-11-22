@@ -337,6 +337,8 @@ def _deliver_saved(session: str, at: float, emit: Callable[[str], None], record_
             state = _read_state(count, path)
             if not (state.messages or state.reserved):
                 return
+            if _hold_open(count, state, at, conf.read("send")):
+                return
             held = _reserve(path, _end_review(path, state), delivery)
         _emit_saved(count, path, held, at, emit, record_keys)
 

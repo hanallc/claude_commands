@@ -110,7 +110,14 @@ def main() -> None:
                 print(f"review hold: {error}", file=sys.stderr)
             else:
                 if kept:
-                    print(json.dumps({"decision": "block", "reason": "Kept for the end of the review."}), flush=True)
+                    print(json.dumps({
+                        "decision": "block",
+                        "reason": "Kept for the end of the review.",
+                        "hookSpecificOutput": {
+                            "hookEventName": "UserPromptSubmit",
+                            "suppressOriginalPrompt": True,
+                        },
+                    }), flush=True)
                     return
         if source is conversation_pause.PromptSource.SCHEDULED:
             conversation_pause.consume_scheduled_prompt(session_id, prompt)
