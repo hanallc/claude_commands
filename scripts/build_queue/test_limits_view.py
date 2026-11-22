@@ -14,7 +14,8 @@ from pathlib import Path
 from unittest import mock
 
 from scripts.aws_target import hana_box, hana_placement
-from scripts.build_queue import admission_protocol as wire, admission_records as records, limits_view, memory_feed, queue_view
+from scripts.build_queue import admission_protocol as wire, admission_records as records, limits_view, memory_feed
+from scripts.build_queue import queue_view, target_availability
 from scripts.build_queue.admission_wire import ReservedCloudSlot
 from scripts.build_queue.cloud_progress import NoCloudProgress
 from scripts.build_queue.progress_profile import NoCounter
@@ -75,13 +76,30 @@ class BuildLimitsTests(unittest.TestCase):
             origins = limits_view.Origins()
             with mock.patch.object(repository, "output", wraps=repository.output) as git_read:
                 history = limits_view.recent_steps(index, now, origins)
-                self.assertEqual(git_read.call_count, 5)
-            self.assertEqual(origins.folders[str(scratch)], primary)
-            mac_snapshot, corrupt_snapshot = self.read_mac_fixture(root, scratch)
-            mac_names = {name for names in origins.names.values() for name in names}
-            mac = limits_view.read_mac((mac_snapshot,), mac_names)
-            corrupt_mac = limits_view.read_mac((corrupt_snapshot,), mac_names)
+                self.assertEqual(git_read.call_count, 6)
+            self.assertEqual(origins.resolve("", str(scratch)), primary)
+            mac_snapshot, mac, whole_mac, bad_block, bad_claims = self.read_mac_fixture(root, scratch, origins)
             assert mac is not None
+            assert whole_mac is not None
+            assert bad_block is not None
+            assert bad_claims is not None
+            worktree_config = scratch / ".git" / "config"
+            config_stamp = worktree_config.stat()
+            prior = limits_view.Origins()
+            self.assertEqual(prior.read(str(scratch), origins), primary)
+            git(scratch, "remote", "set-url", "origin", secondary)
+            os.utime(worktree_config, ns=(config_stamp.st_atime_ns, config_stamp.st_mtime_ns))
+            self.assertNotEqual(worktree_config.stat().st_ino, config_stamp.st_ino)
+            updated = limits_view.Origins()
+            changed_mac = limits_view.read_mac((mac_snapshot,), prior)
+            assert changed_mac is not None
+            self.assertIn(secondary, [claim.origin for claim in changed_mac.claims])
+            self.assertEqual(updated.read(str(scratch), prior), secondary)
+            git(scratch, "remote", "remove", "origin")
+            no_origin = limits_view.read_mac((mac_snapshot,), updated)
+            assert no_origin is not None
+            self.assertCountEqual([claim.origin for claim in no_origin.claims],
+                                  ["", "https://example.invalid/team/cleanup"])
         policy = records.RepositoryRunLimits({"natedev.project": 1, "natedev.other": 2}, "merge-owner")
         reservations = (
             {**fixture_reservation(101, 0, step="gate"), "repo": "project", "repo_identity": primary, "unit": "regular"},
@@ -142,7 +160,7 @@ class BuildLimitsTests(unittest.TestCase):
         self.assertEqual((hana_row.aws.used, hana_row.aws.limit), (None, 1))
         self.assertEqual(shown.mac.state, "Held until 13:00 UTC")
         self.assertEqual(shown.mac.shared, ())
-        self.assertEqual(shown.mac.unattributed, 1)
+        self.assertEqual(shown.mac.unattributed, 0)
         self.assertEqual(shown.mac.waits, {"This run waits while a step starts on another machine.": ["Mac wait", ""]})
         self.assertEqual((project_row.mac.used, project_row.mac.limit, project_row.mac.runs), (1, 1, ["Mac build"]))
         self.assertEqual((cleanup.mac.used, cleanup.mac.limit, cleanup.mac.runs), (1, 1, []))
@@ -166,10 +184,20 @@ class BuildLimitsTests(unittest.TestCase):
         idle_mac = limits_view.build_limits(reading, (mac_snapshot,), (), {}, {}, saved, UTC, mac=replace(mac, claims=()))
         self.assertEqual([(row.owner, row.mac.used, row.mac.limit) for row in idle_mac.repositories if row.name == "project"],
                          [("other", 0, 1), ("team", None, None)])
-        corrupt = limits_view.build_limits(queue, (corrupt_snapshot,), waits, cloud_names, {}, saved, UTC, mac=corrupt_mac)
+        self.assertFalse(bad_claims.claims_readable)
+        corrupt = limits_view.build_limits(queue, (), waits, cloud_names, {}, saved, UTC, mac=bad_claims)
         self.assertEqual(corrupt.mac.state, "Not available")
         self.assertEqual(corrupt.mac.waits, shown.mac.waits)
         self.assertTrue(all(row.mac == limits_view.Cell() for row in corrupt.repositories))
+        self.assertTrue(bad_block.claims_readable)
+        unreadable = limits_view.build_limits(queue, (), waits, cloud_names, {}, saved, UTC, mac=bad_block)
+        self.assertEqual(unreadable.mac.state, "Not available")
+        self.assertEqual([(row.name, row.mac.used) for row in unreadable.repositories if row.mac.used is not None],
+                         [("cleanup", 1), ("project", 1), ("quiet", 0)])
+        whole = limits_view.build_limits(queue, (), waits, cloud_names, {}, saved, UTC, mac=whole_mac)
+        self.assertEqual(whole.mac.unattributed, 1)
+        self.assertTrue(all(row.mac.limit is None and row.mac.used != 0 for row in whole.repositories))
+        self.assertEqual(sum(row.mac.used or 0 for row in whole.repositories), 2)
         self.check_mac_expiry(mac_snapshot, mac, saved)
         within_limit = replace(queue, explanation=replace(explanation,
             policy=replace(explanation.policy, repository_runs=records.RepositoryRunLimits({"natedev.project": 2}, "merge-owner"))))
@@ -182,20 +210,30 @@ class BuildLimitsTests(unittest.TestCase):
     def check_mac_expiry(self, snapshot: targets.TargetSnapshot, mac: limits_view.MacReading,
                          saved: limits_view.Background) -> None:
         refresher = memory_feed.TargetRefresh()
-        local = targets.TargetSnapshot(target_config.LocalTarget("natedev", "linux"), (targets.Free(),),
-                                       (), snapshot.backoff)
+        local = replace(snapshot, target=target_config.LocalTarget("natedev", "linux"), claims=())
         reading = memory_feed.TargetReading((local, snapshot), mac)
         refresher.saved = (10.0, reading)
         pending: Future[tuple[float, memory_feed.TargetReading]] = Future()
         refresher.pending = pending
         self.assertIs(refresher.current(13.9, 2.0, saved), reading)
         expired = refresher.current(14.0, 2.0, saved)
-        self.assertEqual(expired, memory_feed.TargetReading((local,), limits_view.MacReading("mac", None)))
+        self.assertEqual(expired.mac, limits_view.MacReading("mac", None))
+        self.assertIsInstance(expired.snapshots, tuple)
+        assert isinstance(expired.snapshots, tuple)
+        self.assertEqual([item.target for item in expired.snapshots], [local.target, snapshot.target])
+        self.assertTrue(all(not item.claims and isinstance(item.states[0], targets.StateUnreadable)
+                            for item in expired.snapshots))
+        routes = target_availability.MacRoutes(expired.snapshots, {}, UTC)
+        self.assertTrue(routes.is_mac("mac"))
+        self.assertIsInstance(routes.route_fit(target_config.MAC_ONLY, "check", "", ""),
+                              target_availability.FitUnreadable)
         pending.set_result((14.0, reading))
         refresher.next_at = 16.0
         self.assertIs(refresher.current(14.1, 2.0, saved), reading)
 
-    def read_mac_fixture(self, root: Path, scratch: Path) -> tuple[targets.TargetSnapshot, targets.TargetSnapshot]:
+    def read_mac_fixture(self, root: Path, scratch: Path, origins: limits_view.Origins) -> tuple[
+            targets.TargetSnapshot, limits_view.MacReading | None, limits_view.MacReading | None,
+            limits_view.MacReading | None, limits_view.MacReading | None]:
         settings = root / "mac.conf"
         _ = settings.write_text(
             "# range: 1..1000\nfree_floor_gib=47\nlinux_only.project=linux_package\nlinux_only.mac-quiet=\n",
@@ -218,12 +256,11 @@ class BuildLimitsTests(unittest.TestCase):
             "since": since.isoformat(), "repo_name": "project", "repo_key": "", "remote_host": "fixture-host"}
         mac_test.write_json(claims / "e5870be3.json", saved)
         mac_test.write_json(claims / "copied-record.json", saved)
-        cleanup: claim_state.RemoteJobClaim = {**saved, "claim_id": "cleanup", "pid": 2**30,
+        cleanup: claim_state.RemoteJobClaim = {**saved, "claim_id": "cleanup", "cleanup_pending": True,
             "submitting_session": "cleanup", "repo_name": "cleanup", "repo_key": "https://example.invalid/team/cleanup"}
         mac_test.write_json(claims / "cleanup.json", cleanup)
         other: claim_state.RemoteJobClaim = {**saved, "claim_id": "whole-claim", "worktree": "private relative folder"}
         del other["repo_name"], other["repo_key"]
-        mac_test.write_json(state / "run.json", other)
         dead: claim_state.ProcessBoundClaim = {"claim_id": "dead", "episode": "episode", "attempt": "attempt",
             "submitting_session": "", "pid": 2**30, "proc_start": "", "what": "check", "worktree": str(scratch),
             "since": since.isoformat(), "repo_name": "project", "repo_key": ""}
@@ -233,11 +270,22 @@ class BuildLimitsTests(unittest.TestCase):
               mock.patch.object(targets, "utc_now", return_value=since)):
             target = target_config.configured_ssh_target("mac")
             snapshot = targets.ssh_target_snapshot(target)
+            mac = limits_view.read_mac((snapshot,), origins)
+            _ = (state / "block.json").write_text("{", encoding="utf-8")
+            unreadable_block = targets.ssh_target_snapshot(target)
+            bad_block = limits_view.read_mac((unreadable_block,), origins)
+            mac_test.write_block(state / "block.json", block)
+            mac_test.write_json(state / "run.json", other)
+            whole_snapshot = targets.ssh_target_snapshot(target)
+            whole_mac = limits_view.read_mac((whole_snapshot,), origins)
             _ = (claims / "corrupt.json").write_text("{", encoding="utf-8")
             corrupt = targets.ssh_target_snapshot(target)
+            bad_claims = limits_view.read_mac((corrupt,), origins)
         self.assertIsInstance(snapshot.states[0], targets.Held, str(snapshot.states[0]))
+        self.assertIsInstance(unreadable_block.states[0], targets.StateUnreadable)
         self.assertIsInstance(corrupt.states[0], targets.StateUnreadable)
-        return snapshot, corrupt
+        self.assertTrue(mac_test.run_holds_work(cleanup))
+        return snapshot, mac, whole_mac, bad_block, bad_claims
 
     def check_hana_claim(self, origin: str) -> None:
         transport = HanaControlTransport(Path("private-hana.conf"), "fixture-host")

@@ -18,7 +18,7 @@ from scripts.build_queue.slot_wait import public_queue_text
 from scripts.build_targets import target_config, targets
 from scripts.build_targets.execution_transport import HanaControlTransport, HanaGpuNextestTransport
 from scripts.buildlog import charts, repository, store
-from scripts.lib import conf
+from scripts.lib import conf, git_files
 from scripts.lint.memory_admit import gpu_test_reservation, repository_run_owner, reserved_repository_runs
 from scripts.mac_test import claim_state, eligibility, mac_test
 
@@ -145,8 +145,7 @@ class BuildLimits:
 class MacClaim:
     scope: claim_state.ClaimScope
     limit: int
-    key: str
-    folder: str
+    origin: str
     working_session: str
 
 
@@ -156,9 +155,10 @@ class MacReading:
     state: targets.TargetState | None
     claims: tuple[MacClaim, ...] = ()
     limits: Mapping[str, int] = field(default_factory=dict[str, int])
+    claims_readable: bool = False
 
 
-def read_mac(snapshots: target_availability.Snapshots, names: Iterable[str]) -> MacReading | None:
+def read_mac(snapshots: target_availability.Snapshots, origins: Origins | None) -> MacReading | None:
     """Resolve Mac claims and repository limits before the feed uses them."""
     if isinstance(snapshots, target_availability.SnapshotsUnreadable):
         return None
@@ -169,12 +169,18 @@ def read_mac(snapshots: target_availability.Snapshots, names: Iterable[str]) -> 
     else:
         return None
     state = snapshot.states[0]
-    if isinstance(state, targets.StateUnreadable):
-        return MacReading(target.name, state)
     paths = claim_state.StatePaths(target_config.ssh_target_state_directory(target.name), target.name,
                                   registry_selected=True, platform=target.platform)
+    recorded_claims = snapshot.claims
+    if not recorded_claims and isinstance(state, targets.StateUnreadable):
+        # Main returns no claims if the claim read fails. Check this read separately.
+        try:
+            recorded_claims = claim_state.read_claims(paths)
+        except (OSError, UnicodeError, claim_state.StateReadError):
+            return MacReading(target.name, state)
+    checkout_origins = Origins()
     claims: dict[claim_state.ClaimIdentity, MacClaim] = {}
-    for claim in snapshot.claims:
+    for claim in recorded_claims:
         record = claim.record
         identity = claim_state.claim_identity(record)
         if identity in claims or not mac_test.run_is_live(record):
@@ -182,11 +188,15 @@ def read_mac(snapshots: target_availability.Snapshots, names: Iterable[str]) -> 
         # The legacy Mac admits a checkout with a name-only scope.
         scope = (claim_state.RepositoryScope(claim.scope.name)
                  if isinstance(claim.scope, claim_state.RepositoryScope) else claim.scope)
-        session = record["submitting_session"] if mac_test.run_holds_work(record) else ""
-        claims[identity] = MacClaim(scope, mac_test.slot_capacity(paths, scope),
-                                    record.get("repo_key", ""), record["worktree"], session)
+        origin = ""
+        if isinstance(scope, claim_state.RepositoryScope):
+            origin = recorded_origin(record.get("repo_key", "")) or checkout_origins.read(record["worktree"], origins)
+        session = (record["submitting_session"]
+                   if not record.get("cleanup_pending") and mac_test.run_holds_work(record) else "")
+        claims[identity] = MacClaim(scope, mac_test.slot_capacity(paths, scope), origin, session)
     settings = conf.read(target.settings)
     limits: dict[str, int] = {}
+    names = {name for names in origins.names.values() for name in names} if origins is not None else set[str]()
     for name in names:
         # A check reads the repository rule without testing workspace packages.
         try:
@@ -195,7 +205,7 @@ def read_mac(snapshots: target_availability.Snapshots, names: Iterable[str]) -> 
                 limits[name] = mac_test.slot_capacity(paths, claim_state.RepositoryScope(name), configuration=settings)
         except conf.Unusable:
             continue
-    return MacReading(target.name, state, tuple(claims.values()), limits)
+    return MacReading(target.name, state, tuple(claims.values()), limits, claims_readable=True)
 
 
 def recorded_origin(identity: str) -> str:
@@ -208,11 +218,43 @@ def recorded_origin(identity: str) -> str:
         return ""
 
 
+@dataclass(frozen=True)
+class OriginReading:
+    checkout: Path
+    config: Path
+    stamp: tuple[int, int, int]
+    remote: str | Path
+
+
+def checkout_origin(folder: Path, earlier: OriginReading | None, *,
+                    local_remote: bool) -> OriginReading | None:
+    try:
+        checkout = git_files.at(folder) if local_remote else git_files.locate(folder)
+        config = checkout.common_dir / "config"
+        status = config.stat()
+        stamp = (status.st_dev, status.st_ino, status.st_mtime_ns)
+        if (earlier is not None and earlier.checkout == checkout.toplevel
+                and earlier.config == config and earlier.stamp == stamp):
+            return earlier
+        value = repository.output(
+            ["git", "config", "--no-includes", "--file", str(config), "--get", "remote.origin.url"],
+            str(folder), repository.GIT_TIMEOUT_S)
+        if not value or not (remote := value.strip()):
+            return None
+        identity = repository.remote_identity(remote, str(folder))
+        if identity.startswith("/"):
+            local_path = urlsplit(remote).path if remote.startswith("file:") else remote
+            return OriginReading(checkout.toplevel, config, stamp, (folder / Path(local_path).expanduser()).resolve())
+        return OriginReading(checkout.toplevel, config, stamp, recorded_origin(identity))
+    except (OSError, ValueError, RuntimeError):
+        return None
+
+
 @dataclass
 class Origins:
-    folders: dict[str, str] = field(default_factory=dict[str, str])
+    folders: dict[Path, OriginReading | None] = field(default_factory=dict[Path, OriginReading | None])
+    resolved: dict[str, str] = field(default_factory=dict[str, str])
     active_folders: set[str] = field(default_factory=set[str])
-    sources: dict[str, str] = field(default_factory=dict[str, str])
     names: dict[str, set[str]] = field(default_factory=dict[str, set[str]])
 
     def resolve(self, identity: str, folder: str) -> str:
@@ -221,38 +263,39 @@ class Origins:
             return origin
         if identity.startswith("/"):
             self.active_folders.add(identity)
-            if origin := self.folders.get(identity):
+            if origin := self.resolved.get(identity):
                 return origin
         if not folder.startswith("/"):
             return ""
         self.active_folders.add(folder)
-        return self.folders.get(folder, "")
+        return self.resolved.get(folder, "")
 
-    def read(self, folder: str) -> str:
-        """Cache the origin of a checkout and its source Git folder."""
+    def read(self, folder: str, earlier: Origins | None = None) -> str:
+        """Read at most three checkout configs along the origin chain."""
         if not folder.startswith("/"):
             return ""
-        if folder in self.folders:
-            return self.folders[folder]
-        self.folders[folder] = ""
-        if not Path(folder).is_dir() or (common := repository.git_common_dir(folder)) is None:
-            return ""
-        source = repository.source_git_dir(common)
-        if source not in self.sources:
-            remote = repository.output(
-                ["git", "config", "--includes", "--file", str(Path(source) / "config"), "--get", "remote.origin.url"],
-                folder, repository.GIT_TIMEOUT_S)
-            try:
-                self.sources[source] = recorded_origin(repository.remote_identity(remote.strip(), folder)) if remote else ""
-            except ValueError:
-                self.sources[source] = ""
-            if (origin := self.sources[source]) and (name := repository.repo_name(folder)):
-                self.names.setdefault(origin, set()).add(name)
-        self.folders[folder] = self.sources[source]
-        return self.folders[folder]
+        if folder in self.resolved:
+            return self.resolved[folder]
+        self.resolved[folder] = ""
+        path = Path(folder)
+        for depth in range(3):
+            if path not in self.folders:
+                prior = earlier.folders.get(path) if earlier is not None else None
+                self.folders[path] = checkout_origin(path, prior, local_remote=depth > 0)
+            entry = self.folders[path]
+            if entry is None or (depth and path != entry.checkout):
+                break
+            if isinstance(entry.remote, str):
+                if entry.remote:
+                    self.resolved[folder] = entry.remote
+                    self.names.setdefault(entry.remote, set()).add(entry.config.parent.parent.name)
+                break
+            path = entry.remote
+        return self.resolved[folder]
 
 
-def recent_steps(connection: sqlite3.Connection, now: float, origins: Origins) -> frozenset[str]:
+def recent_steps(connection: sqlite3.Connection, now: float, origins: Origins,
+                 earlier: Origins | None = None) -> frozenset[str]:
     """Collect the source origins of the build steps in the last 30 days."""
     rows = cast(Iterable[tuple[object, object]], connection.execute(
         """SELECT DISTINCT repo_identity, repo_path FROM steps WHERE started_at >= ? AND started_at <= ?""",
@@ -261,8 +304,8 @@ def recent_steps(connection: sqlite3.Connection, now: float, origins: Origins) -
     for identity, path in rows:
         key = identity if isinstance(identity, str) else ""
         folder = path if isinstance(path, str) else ""
-        origin = recorded_origin(key) or origins.read(key)
-        checkout_origin = origins.read(folder)
+        origin = recorded_origin(key) or origins.read(key, earlier)
+        checkout_origin = origins.read(folder, earlier)
         if origin or checkout_origin:
             history.add(origin or checkout_origin)
     return frozenset(history)
@@ -370,15 +413,15 @@ def spending(now: float) -> Metric:
     return Metric("money", used, limit, "USD", qualifier, unreadable=unreadable)
 
 
-def background(now: float, active_folders: Sequence[str] = ()) -> Background:
+def background(now: float, active_folders: Sequence[str] = (), earlier: Origins | None = None) -> Background:
     """Read saved sources at the report interval."""
     origins = Origins()
     try:
-        history = charts.read_index(lambda connection: recent_steps(connection, now, origins))
+        history = charts.read_index(lambda connection: recent_steps(connection, now, origins, earlier))
     except (OSError, ValueError) as error:
         history = charts.IndexUnavailable(str(error))
     for folder in active_folders:
-        _ = origins.read(folder)
+        _ = origins.read(folder, earlier)
     settings = conf.read("build_admission")
     try:
         cloud_slots = settings.whole("cloud_gate_slots")
@@ -463,6 +506,7 @@ def mac_state(mac: MacReading | None, snapshots: target_availability.Snapshots, 
 def place_mac_counts(mac: MacReading, rows: Sequence[tuple[str, RepositoryRow]],
                      claims: Mapping[claim_state.ClaimScope, Sequence[tuple[str, MacClaim]]],
                      origins: Origins, names: Mapping[str, str]) -> None:
+    show_free = mac.claims_readable and not any(isinstance(claim.scope, claim_state.WholeMacScope) for claim in mac.claims)
     positions = {origin: index for index, (origin, _) in enumerate(rows)}
     for group in claims.values():
         known_claims = [(origin, claim) for origin, claim in group if origin]
@@ -471,10 +515,13 @@ def place_mac_counts(mac: MacReading, rows: Sequence[tuple[str, RepositoryRow]],
         owner = min((origin for origin, _ in known_claims), key=positions.__getitem__)
         cell = rows[positions[owner]][1].mac
         cell.used = (cell.used or 0) + len(known_claims)
-        cell.limit = (cell.limit or 0) + known_claims[0][1].limit
+        if show_free:
+            cell.limit = (cell.limit or 0) + known_claims[0][1].limit
         cell.runs.extend(name for _, claim in known_claims
                          if claim.working_session and (name := names.get(claim.working_session)))
 
+    if not show_free:
+        return
     used_scopes = {scope.name for scope in claims if isinstance(scope, claim_state.RepositoryScope)}
     for origin, row in rows:
         if row.mac.used:
@@ -517,7 +564,7 @@ def build_limits(reading: records.QueueRead, snapshots: target_availability.Snap
     mac_unattributed = 0
     if mac is not None:
         for claim in mac.claims:
-            origin = origins.resolve(claim.key, claim.folder)
+            origin = claim.origin
             mac_claims.setdefault(claim.scope, []).append((origin, claim))
             if origin:
                 _ = row(origin)
@@ -673,7 +720,7 @@ def build_limits(reading: records.QueueRead, snapshots: target_availability.Snap
     def page_order(item: RepositoryRow) -> tuple[bool, str, str]:
         return item.quiet, item.name.casefold(), item.owner.casefold()
 
-    if mac is not None and mac.state is not None and not isinstance(mac.state, targets.StateUnreadable):
+    if mac is not None:
         place_mac_counts(mac, sorted(rows.items(), key=lambda pair: page_order(pair[1])), mac_claims, origins, names)
         for item in rows.values():
             if item.mac.used:

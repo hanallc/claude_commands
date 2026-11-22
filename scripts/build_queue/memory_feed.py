@@ -76,6 +76,7 @@ from scripts.lib import conf
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.proc_text import read_proc_text
 from scripts.lib.user_zone import user_zone
+from scripts.mac_test import eligibility
 from scripts.review_links import console_theme, page_frame, review_link
 from scripts.review_links import staff_names
 
@@ -2705,17 +2706,18 @@ class TargetReading:
     snapshots: target_availability.Snapshots
     mac: limits_view.MacReading | None = None
 
-    def without_mac_facts(self) -> TargetReading:
+    def expired(self) -> TargetReading:
         snapshots = self.snapshots
         if isinstance(snapshots, tuple):
-            snapshots = tuple(snapshot for snapshot in snapshots if snapshot.target.platform != "macos")
+            state = targets.StateUnreadable("target reading expired")
+            snapshots = tuple(targets.TargetSnapshot(snapshot.target, (state,), (), eligibility.NO_BACKOFF)
+                              for snapshot in snapshots)
         return TargetReading(snapshots, limits_view.MacReading(self.mac.target, None) if self.mac else None)
 
 
 def read_targets(background: limits_view.Background | None = None) -> TargetReading:
     snapshots = target_availability.read_snapshots()
-    names = {name for names in background.origins.names.values() for name in names} if background else ()
-    return TargetReading(snapshots, limits_view.read_mac(snapshots, names))
+    return TargetReading(snapshots, limits_view.read_mac(snapshots, background.origins if background else None))
 
 
 def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.UseConfiguredValue.CURRENT,
@@ -3251,9 +3253,10 @@ def notify_unplaced_mac_runs(reading: queue_view.MacBuildReading, notified: set[
         notified.update((run.pid, run.started_at) for run in new_runs)
 
 
-def refresh_limits(result: Future[limits_view.Background], now: float, active_folders: tuple[str, ...]) -> None:
+def refresh_limits(result: Future[limits_view.Background], now: float, active_folders: tuple[str, ...],
+                   earlier: limits_view.Origins | None) -> None:
     try:
-        result.set_result(limits_view.background(now, active_folders))
+        result.set_result(limits_view.background(now, active_folders, earlier))
     except (OSError, ValueError, KeyError, RuntimeError) as error:
         result.set_exception(error)
 
@@ -3279,8 +3282,9 @@ class LimitsRefresh:
             self.pending = None
         if self.pending is None and now >= self.next_at:
             self.pending = Future()
-            folders = tuple(self.saved.origins.active_folders) if self.saved is not None else ()
-            Thread(target=refresh_limits, args=(self.pending, time.time(), folders),
+            origins = self.saved.origins if self.saved is not None else None
+            folders = tuple(origins.active_folders) if origins is not None else ()
+            Thread(target=refresh_limits, args=(self.pending, time.time(), folders, origins),
                    name="build-limits-refresh", daemon=True).start()
             self.next_at = now + interval
         return self.saved
@@ -3315,7 +3319,7 @@ class TargetRefresh:
         if self.saved is None:
             return TargetReading(())
         started, reading = self.saved
-        return reading if now - started < 2 * interval else reading.without_mac_facts()
+        return reading if now - started < 2 * interval else reading.expired()
 
 
 def main(argv: Sequence[str]) -> int:
