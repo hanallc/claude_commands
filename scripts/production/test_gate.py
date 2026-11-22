@@ -14,9 +14,9 @@ import io
 import os
 from pathlib import Path
 import re
-import subprocess
+from collections.abc import Generator
 from typing import cast, final, override
-from contextlib import AbstractContextManager, redirect_stdout
+from contextlib import AbstractContextManager, contextmanager, redirect_stdout
 from datetime import UTC, datetime, tzinfo
 from unittest import mock
 from scripts.lib import scratch
@@ -179,80 +179,110 @@ class MergeGateCheckpointTests(MergeGateFixture):
                 self.assertEqual(file.read_text(), "concurrent change\n")
                 self.assert_not_pushed()
 
-    def test_rollback_keeps_commits_made_on_either_side_of_the_ref_update(self) -> None:
-        git = gate.git
-        for when in ("before", "after"):
-            state = self.state / when
-            with self.subTest(when=when), mock.patch.dict(self.environment, GATE_STATE_DIR=str(state)):
-                checkout = self.root / when
-                _ = self.git(self.root, "clone", "-q", "--branch", "integration", str(self.origin), str(checkout))
-                file = checkout / "concurrent.txt"
-                changed_head = ""
+    def test_rollback_keeps_a_commit_made_before_rollback_starts(self) -> None:
+        file = self.checkout / "concurrent.txt"
+        changed_head = ""
 
-                def commit() -> None:
-                    nonlocal changed_head
-                    self.write(file, "concurrent change\n")
-                    changed_head = self.commit(checkout, "concurrent change")
+        def fail_after_commit(repo: Path, *_arguments: object, **_keywords: object) -> gate.GateRun:
+            nonlocal changed_head
+            self.write(file, "concurrent change\n")
+            changed_head = self.commit(repo, "concurrent change")
+            raise GateRefused("fixture suite failure")
 
-                def change_at_ref_update(repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
-                    if args[:1] != ("update-ref",) or args[-3:-1] != ("HEAD", self.base):
-                        return git(repo, *args)
-                    if when == "before":
-                        commit()
-                    result = git(repo, *args)
-                    if when == "after":
-                        self.assertEqual(result.returncode, 0, result.stderr)
-                        commit()
-                    return result
-
-                with mock.patch.object(gate, "run_gate_suites", side_effect=GateRefused("fixture suite failure")), \
-                        mock.patch.object(gate, "git", side_effect=change_at_ref_update):
-                    result = self.run_gate("--repo", str(checkout))
-                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
-                self.assertEqual(self.git(checkout, "rev-parse", "HEAD"), changed_head)
-                self.assertIn(changed_head, result.stderr)
-                self.assertEqual(file.read_text(), "concurrent change\n")
-                self.assertEqual((checkout / "unit.txt").read_text(), "checkpoint\n")
-                self.assertEqual(self.git(checkout, "status", "--porcelain"), "")
-
-                with mock.patch.dict(os.environ, self.environment, clear=True), \
-                        mock.patch.object(gate, "process_start", return_value=Gone()):
-                    with self.assertRaisesRegex(GateRefused, f"rollback kept HEAD {changed_head}"):
-                        gate.recover_gate_directory(gate.gate_run_directory(checkout))
-                self.assertEqual(self.git(checkout, "rev-parse", "HEAD"), changed_head)
-                self.assertEqual(self.git(checkout, "status", "--porcelain"), "")
-                self.assert_not_pushed()
-
-    def test_recovery_finishes_the_tree_update_after_an_interrupted_rollback(self) -> None:
-        git = gate.git
-        file = self.checkout / "unit.txt"
-
-        def interrupt_after_ref_update(repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
-            result = git(repo, *args)
-            if args[:1] == ("update-ref",) and args[-3:-1] == ("HEAD", self.base):
-                self.assertEqual(result.returncode, 0, result.stderr)
-                raise KeyboardInterrupt("fixture stop after the ref update")
-            return result
-
-        with mock.patch.object(gate, "run_gate_suites", side_effect=GateRefused("fixture suite failure")), \
-                mock.patch.object(gate, "git", side_effect=interrupt_after_ref_update):
+        with mock.patch.object(gate, "run_gate_suites", side_effect=fail_after_commit):
             result = self.run_gate()
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
-        self.assertIn("fixture stop after the ref update", result.stderr)
-        self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), self.base)
-        self.assertEqual(file.read_text(), "checkpoint\n")
-        self.assertEqual(self.git(self.checkout, "show", ":unit.txt"), "checkpoint")
+        self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), changed_head)
+        self.assertIn(changed_head, result.stderr)
+        self.assertEqual(file.read_text(), "concurrent change\n")
+        self.assertEqual((self.checkout / "unit.txt").read_text(), "checkpoint\n")
+        self.assertEqual(self.git(self.checkout, "status", "--porcelain"), "")
 
         with mock.patch.dict(os.environ, self.environment, clear=True), \
                 mock.patch.object(gate, "process_start", return_value=Gone()):
-            directory = gate.gate_run_directory(self.checkout)
-            self.assertEqual(len(list(directory.glob("*.json"))), 1)
-            gate.recover_gate_directory(directory)
-            self.assertEqual(list(directory.glob("*.json")), [])
-        self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), self.base)
-        self.assertFalse(file.exists())
+            with self.assertRaisesRegex(GateRefused, f"rollback kept HEAD {changed_head}"):
+                gate.recover_gate_directory(gate.gate_run_directory(self.checkout))
+        self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), changed_head)
         self.assertEqual(self.git(self.checkout, "status", "--porcelain"), "")
         self.assert_not_pushed()
+
+    def test_rollback_restores_the_index_before_a_competing_commit_can_land(self) -> None:
+        hook = self.checkout / ".git/hooks/reference-transaction"
+        attempts = self.checkout / ".git/rollback-commit-attempts"
+        self.write(hook, f'''#!/bin/sh
+matches=$(awk '$2 == "{self.base}" && ($3 == "HEAD" || $3 == "refs/heads/integration") {{ print $3 }}')
+case "$1" in
+prepared|committed)
+    if [ -n "$matches" ]; then
+        git commit --allow-empty -qm 'concurrent change' >/dev/null 2>&1
+        printf '%s %s\\n' "$1" "$?" >> .git/rollback-commit-attempts
+    fi
+    ;;
+esac
+exit 0
+''')
+        hook.chmod(0o755)
+
+        with mock.patch.object(gate, "run_gate_suites", side_effect=GateRefused("fixture suite failure")):
+            result = self.run_gate()
+
+        self.assertEqual(attempts.read_text().splitlines(), ["prepared 128", "committed 0"])
+        self.assertEqual(self.git(self.checkout, "ls-tree", "HEAD", "--", "unit.txt"), "",
+                         "The competing commit contains the rejected checkpoint.")
+        self.assertEqual(self.git(self.checkout, "ls-files", "--", "unit.txt"), "")
+        self.assertFalse((self.checkout / "unit.txt").exists())
+        self.assertEqual(self.git(self.checkout, "log", "-1", "--format=%s"), "concurrent change")
+        self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD^"), self.base)
+        self.assertEqual(self.git(self.checkout, "status", "--porcelain"), "")
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("merge undone, not pushed", result.stderr)
+        self.assert_not_pushed()
+
+    def test_recovery_finishes_rollback_on_either_side_of_the_ref_commit(self) -> None:
+        hold = gate.hold_rollback_head
+        for when in ("before", "after"):
+            state = self.state / when
+            with self.subTest(when=when), mock.patch.dict(self.environment, GATE_STATE_DIR=str(state)):
+                checkout = self.root / f"rollback-{when}"
+                _ = self.git(self.root, "clone", "-q", "--branch", "integration", str(self.origin), str(checkout))
+                merged = ""
+                injected = False
+
+                def fail_suites(repo: Path, *_arguments: object, **_keywords: object) -> gate.GateRun:
+                    nonlocal merged
+                    merged = self.git(repo, "rev-parse", "HEAD")
+                    raise GateRefused("fixture suite failure")
+
+                @contextmanager
+                def interrupt_ref_commit(repo: Path, baseline: str, head: str) -> Generator[None]:
+                    nonlocal injected
+                    with hold(repo, baseline, head):
+                        yield
+                        if when == "before":
+                            injected = True
+                            raise KeyboardInterrupt("fixture stop before the ref commit")
+                    injected = True
+                    raise KeyboardInterrupt("fixture stop after the ref commit")
+
+                with mock.patch.object(gate, "run_gate_suites", side_effect=fail_suites), \
+                        mock.patch.object(gate, "hold_rollback_head", side_effect=interrupt_ref_commit):
+                    result = self.run_gate("--repo", str(checkout))
+                self.assertTrue(injected)
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertIn(f"fixture stop {when} the ref commit", result.stderr)
+                self.assertEqual(self.git(checkout, "rev-parse", "HEAD"), merged if when == "before" else self.base)
+                self.assertEqual(self.git(checkout, "ls-files", "--", "unit.txt"), "")
+                self.assertFalse((checkout / "unit.txt").exists())
+
+                with mock.patch.dict(os.environ, self.environment, clear=True), \
+                        mock.patch.object(gate, "process_start", return_value=Gone()):
+                    directory = gate.gate_run_directory(checkout)
+                    self.assertEqual(len(list(directory.glob("*.json"))), 1)
+                    gate.recover_gate_directory(directory)
+                    self.assertEqual(list(directory.glob("*.json")), [])
+                self.assertEqual(self.git(checkout, "rev-parse", "HEAD"), self.base)
+                self.assertEqual(self.git(checkout, "status", "--porcelain"), "")
+                self.assert_not_pushed()
 
     def test_checkpoint_retries_its_merge_after_a_stop_before_push(self) -> None:
         with mock.patch.object(promotion, "push_integration", side_effect=GateRefused("injected stop before push")):

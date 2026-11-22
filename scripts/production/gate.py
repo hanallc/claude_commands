@@ -2134,29 +2134,44 @@ def promote_mac(args: GateArguments, main_repo: Path, published: promotion.Publi
 
 
 @contextmanager
-def hold_rollback_head(repo: Path, baseline: str) -> Generator[None]:
-    """Hold Git's ref locks while the index and worktree change."""
-    with subprocess.Popen(["git", "update-ref", "--stdin"], cwd=repo, stdin=subprocess.PIPE,
+def hold_rollback_head(repo: Path, baseline: str, head: str) -> Generator[None]:
+    """Prepare the ref change and commit it after the tree update."""
+    operation = f"verify HEAD {baseline}" if head == baseline else f"update HEAD {baseline} {head}"
+    with subprocess.Popen(["git", "update-ref", "-m", "gate rollback", "--stdin"], cwd=repo, stdin=subprocess.PIPE,
                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
                           errors="replace", pass_fds=copies.COMMAND_LOCKS.get()) as transaction:
-        assert transaction.stdin is not None
+        input_stream = transaction.stdin
+        assert input_stream is not None
         output = cast(TextIO, transaction.stdout)
-        try:
+
+        def reply(commands: str) -> str:
             with suppress(BrokenPipeError):
-                _ = transaction.stdin.write(f"start\nverify HEAD {baseline}\nprepare\n")
-                transaction.stdin.flush()
-            response = output.readline()
+                _ = input_stream.write(commands + "\n")
+                input_stream.flush()
+            return output.readline()
+
+        action = "prepare"
+        try:
+            response = reply("start")
             if response == "start: ok\n":
-                response = output.readline()
+                response = reply(f"{operation}\nprepare")
             if response == "prepare: ok\n":
-                yield
-                return
+                try:
+                    yield
+                except BaseException as error:
+                    aborted = reply("abort")
+                    if aborted != "abort: ok\n":
+                        error.add_note(f"Git did not confirm the rollback abort. {aborted.strip()}")
+                    raise
+                action = "commit"
+                response = reply("commit")
+                if response == "commit: ok\n":
+                    return
         finally:
             with suppress(BrokenPipeError):
-                transaction.stdin.close()
+                input_stream.close()
         detail = (response + output.read()).strip()
-    head = checked_git(repo, "rev-parse", "HEAD")
-    raise GateRefused(f"rollback kept HEAD {head}: cannot hold the baseline {baseline}: {detail}")
+    raise rollback_failure(repo, head, f"cannot {action} the rollback ref transaction: {detail}")
 
 
 def rollback_failure(repo: Path, merged: str, detail: str) -> GateRefused:
@@ -2181,15 +2196,11 @@ def rollback_merge(repo: Path, baseline: str, *, checkpoint: str = "", recorded_
                               != [baseline, checkpoint]):
             raise GateRefused(f"rollback kept HEAD {head}: it differs from the gate merge")
     merged = recorded_merge or head
-    if head != baseline:
-        # Keep the source tree in the record in case recovery resumes at the baseline.
-        if isinstance(recovery, GateRecovery) and recovery.rollback_head != merged:
-            recovery.rollback_head = merged
-            recovery.save()
-        swapped = git(repo, "update-ref", "-m", "gate rollback", "HEAD", baseline, merged)
-        if swapped.returncode:
-            raise rollback_failure(repo, merged, f"cannot move HEAD: {failure_detail(swapped)}")
-    with hold_rollback_head(repo, baseline):
+    # Keep the source tree in the record until the ref transaction ends.
+    if head != baseline and isinstance(recovery, GateRecovery) and recovery.rollback_head != merged:
+        recovery.rollback_head = merged
+        recovery.save()
+    with hold_rollback_head(repo, baseline, head):
         pending = git(repo, "rev-parse", "--verify", "MERGE_HEAD")
         if pending.returncode == 0:
             if pending.stdout.strip() != checkpoint or git(repo, "rev-parse", "--verify", "MERGE_AUTOSTASH").returncode == 0:
