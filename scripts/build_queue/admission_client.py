@@ -952,7 +952,9 @@ def _control_reply(request: wire.Request, retry: AcquisitionRetry,
                     retry.unreachable_deadline = (CLOCK.monotonic() + configuration.unreachable_limit_seconds
                         if isinstance(configuration, wire.AcquisitionTiming) else float("inf"))
                     if isinstance(reply, wire.Refused):
-                        return reply if generation_query or placement_control else refuse(reply.reason)
+                        if generation_query or placement_control:
+                            return reply
+                        return refuse(reply.reason, checker=isinstance(request, wire.VerifyRunSlotRequest))
                     if isinstance(request, wire.VerifyRunSlotRequest):
                         if isinstance(reply, wire.Ok):
                             return reply
@@ -1481,7 +1483,7 @@ def _take_verify_run_slot(pid: int, cwd: str, placement_episode: str) -> int:
     name = repository.name if isinstance(repository, records.RepositoryIdentity) else Path(cwd).name
     request = wire.VerifyRunSlotRequest(wire.Owner(pid, start), name, identity.session_id, identity.unit,
         worktree=cwd, verify=verify_call(), placement_episode=placement_episode)
-    reply = _call(request, lambda waiting: None, configuration=wire.PROTOCOL_ACQUISITION_TIMING)
+    reply = _call(request, lambda waiting: None)
     return 0 if isinstance(reply, wire.Ok) else 2
 
 
