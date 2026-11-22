@@ -661,23 +661,31 @@ class RosterTests(unittest.TestCase):
         owner = fixture_member("producer", name="free-claude", runtime_id=identity)
         registered = sessions.addressed(f"session:{identity}", sessions.live_sessions())
         assert registered is not None
+        worker = next(row for row in staff.find(kind="worker") if row.name == "alpha-impl")
         started = send.now()
-        targets = ("free-claude", f"session:{identity}", f"uds:{registered['messagingSocketPath']}")
-        for target in targets:
+        for target, previous, skip_scan in (
+            (owner.name, f"staff:{owner.id}", True),
+            (f"session:{identity}", f"session:{identity}", True),
+            (f"uds:{registered['messagingSocketPath']}", f"session:{identity}", False),
+            (f"codex:{worker.current_session}", f"staff:{worker.id}", True),
+        ):
             registry = mock.Mock(wraps=sessions.read_registry)
             with self.subTest(target=target):
-                previous = f"staff:{owner.id}" if target == owner.name else f"session:{identity}"
                 _ = (state / "keys.json").write_text(json.dumps({"notice": {"last": {previous: started.isoformat()}}}))
-                options = send.parse(["--here", "--to", target, "--from", "fixture", "--text", "Notice",
+                options = send.parse(["--to", target, "--from", "fixture", "--text", "Notice",
                                       "--key", "notice", "--repeat-minutes", "30"])
                 with (mock.patch.object(send, "STATE", state),
                       mock.patch.object(send, "now", return_value=started),
                       mock.patch.object(codex_daemon, "loaded_sessions", return_value=self._daemon_sessions()),
                       mock.patch.object(sessions, "read_registry", registry),
+                      mock.patch.object(process_table, "snapshot", wraps=process_table.snapshot) as scan,
+                      mock.patch.object(roster, "peer_roster", side_effect=AssertionError("local recipient has a route")),
                       mock.patch.object(send, "relay", return_value=send.Result("sent", "fixture")) as relay):
                     self.assertEqual(send.send(options).outcome, "skipped")
                 registry.assert_called_once_with()
                 relay.assert_not_called()
+                if skip_scan:
+                    scan.assert_not_called()
 
 
     def test_fast_labels_agree_with_full_roster_for_live_claude_sessions(self) -> None:
