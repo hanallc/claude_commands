@@ -14,6 +14,7 @@ import io
 import os
 from pathlib import Path
 import re
+import sys
 from collections.abc import Generator
 from typing import cast, final, override
 from contextlib import AbstractContextManager, contextmanager, redirect_stdout
@@ -67,6 +68,24 @@ class MergeGateCheckpointTests(MergeGateFixture):
         self.environment["CLAUDE_CODE_SESSION_ID"] = runner.current_session
         unit = fixture_unit_location(runner, "fixture", self.unit)
         return unit.id
+
+    def install_rollback_prepare_hook(self, body: str) -> Path:
+        hook = self.checkout / ".git/hooks/reference-transaction"
+        marker = self.checkout / ".git/rollback-prepare"
+        self.write(hook, f'''#!{sys.executable}
+import sys
+from pathlib import Path
+
+rows = [line.split() for line in sys.stdin]
+merge = next((old for old, new, ref in rows
+              if new == {self.base!r} and ref in ("HEAD", "refs/heads/integration")), "")
+if sys.argv[1] != "prepared" or not merge:
+    raise SystemExit(0)
+Path({str(marker)!r}).write_text(merge)
+{body}
+''')
+        hook.chmod(0o755)
+        return marker
 
     def test_checkout_holds_a_shared_copy_lock_through_suites_and_releases_it_on_error(self) -> None:
         copies = self.root / "copies"
@@ -236,6 +255,36 @@ exit 0
         self.assertEqual(self.git(self.checkout, "status", "--porcelain"), "")
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertIn("merge undone, not pushed", result.stderr)
+        self.assert_not_pushed()
+
+    def test_rollback_completes_when_the_prepare_hook_writes_large_diagnostics(self) -> None:
+        marker = self.install_rollback_prepare_hook('sys.stderr.write("x" * (256 * 1024) + "\\n")')
+        result = self.run_gate(own_process=True, preamble='''\
+def fail_suites(*args, **kwargs):
+    raise gate.GateRefused("fixture suite failure")
+
+gate.run_gate_suites = fail_suites
+''')
+        self.assertTrue(marker.is_file(), result.stderr[-512:])
+        self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), self.base)
+        self.assertEqual(self.git(self.checkout, "status", "--porcelain"), "")
+        self.assertEqual(result.returncode, 1, result.stderr[-512:])
+        self.assertIn("fixture suite failure; merge undone, not pushed", result.stderr[-512:])
+        self.assert_not_pushed()
+
+    def test_rollback_refusal_includes_the_prepare_hook_diagnostic(self) -> None:
+        message = "fixture prepare hook refused rollback"
+        marker = self.install_rollback_prepare_hook(f"print({message!r}, file=sys.stderr)\nraise SystemExit(1)")
+        with mock.patch.object(gate, "run_gate_suites", side_effect=GateRefused("fixture suite failure")):
+            result = self.run_gate()
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertTrue(marker.is_file(), result.stderr)
+        self.assertIn(message, result.stderr)
+        self.assertIn("cannot prepare the rollback ref transaction", result.stderr)
+        merged = marker.read_text()
+        self.assertEqual(self.git(self.checkout, "rev-list", "--parents", "-n", "1", "HEAD").split(),
+                         [merged, self.base, self.checkpoint])
+        self.assertEqual(self.git(self.checkout, "status", "--porcelain"), "")
         self.assert_not_pushed()
 
     def test_recovery_finishes_rollback_on_either_side_of_the_ref_commit(self) -> None:

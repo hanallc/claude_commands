@@ -2137,40 +2137,44 @@ def promote_mac(args: GateArguments, main_repo: Path, published: promotion.Publi
 def hold_rollback_head(repo: Path, baseline: str, head: str) -> Generator[None]:
     """Prepare the ref change and commit it after the tree update."""
     operation = f"verify HEAD {baseline}" if head == baseline else f"update HEAD {baseline} {head}"
-    with subprocess.Popen(["git", "update-ref", "-m", "gate rollback", "--stdin"], cwd=repo, stdin=subprocess.PIPE,
-                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-                          errors="replace", pass_fds=copies.COMMAND_LOCKS.get()) as transaction:
-        input_stream = transaction.stdin
-        assert input_stream is not None
-        output = cast(TextIO, transaction.stdout)
+    with tempfile.TemporaryFile(mode="w+t", encoding="utf-8", errors="replace") as errors:
+        with subprocess.Popen(["git", "update-ref", "-m", "gate rollback", "--stdin"], cwd=repo, stdin=subprocess.PIPE,
+                              stdout=subprocess.PIPE, stderr=errors, text=True,
+                              errors="replace", pass_fds=copies.COMMAND_LOCKS.get()) as transaction:
+            input_stream = transaction.stdin
+            assert input_stream is not None
+            output = cast(TextIO, transaction.stdout)
 
-        def reply(commands: str) -> str:
-            with suppress(BrokenPipeError):
-                _ = input_stream.write(commands + "\n")
-                input_stream.flush()
-            return output.readline()
+            def reply(commands: str) -> str:
+                with suppress(BrokenPipeError):
+                    _ = input_stream.write(commands + "\n")
+                    input_stream.flush()
+                return output.readline()
 
-        action = "prepare"
-        try:
-            response = reply("start")
-            if response == "start: ok\n":
-                response = reply(f"{operation}\nprepare")
-            if response == "prepare: ok\n":
-                try:
-                    yield
-                except BaseException as error:
-                    aborted = reply("abort")
-                    if aborted != "abort: ok\n":
-                        error.add_note(f"Git did not confirm the rollback abort. {aborted.strip()}")
-                    raise
-                action = "commit"
-                response = reply("commit")
-                if response == "commit: ok\n":
-                    return
-        finally:
-            with suppress(BrokenPipeError):
-                input_stream.close()
-        detail = (response + output.read()).strip()
+            action = "prepare"
+            try:
+                response = reply("start")
+                if response == "start: ok\n":
+                    response = reply(f"{operation}\nprepare")
+                if response == "prepare: ok\n":
+                    try:
+                        yield
+                    except BaseException as error:
+                        aborted = reply("abort")
+                        if aborted != "abort: ok\n":
+                            error.add_note(f"Git did not confirm the rollback abort. {aborted.strip()}")
+                        raise
+                    action = "commit"
+                    response = reply("commit")
+                    if response == "commit: ok\n":
+                        return
+            finally:
+                # Git aborts an open transaction at EOF.
+                with suppress(BrokenPipeError):
+                    input_stream.close()
+            response = (response + output.read()).strip()
+        _ = errors.seek(0)
+        detail = "\n".join(part for part in (response, errors.read().strip()) if part)
     raise rollback_failure(repo, head, f"cannot {action} the rollback ref transaction: {detail}")
 
 
