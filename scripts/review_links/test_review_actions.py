@@ -7,6 +7,7 @@ from unittest.mock import patch
 from urllib.parse import urlencode
 from uuid import uuid4
 
+from scripts.lib.fixture_test_support import set_up_fixture
 from scripts.agents.remote import local_machine
 from scripts.production import investigation, staff, update_registration
 from scripts.production import test_waiting_why as fixtures
@@ -18,9 +19,7 @@ class WaitingActionTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
-        self.fixture = fixtures.WaitingWhyTests('runTest')
-        self.addCleanup(self.fixture.doCleanups)
-        self.fixture.setUp()
+        self.fixture = set_up_fixture(self.addCleanup, fixtures.WaitingWhyTests('runTest'))
 
     def test_user_question_automatically_stores_its_text_for_each_type(self) -> None:
         doc = self.fixture.fixture.production

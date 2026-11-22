@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import cast, override
 from unittest.mock import patch
 
+from scripts.lib.fixture_test_support import set_up_fixture
 from scripts.agents import codex_test_support as codex_fixture
 from scripts.astra import astra_review  # noqa: E402
 from scripts.astra import astra_roles, astra_work, design_roles  # noqa: E402
@@ -62,8 +63,7 @@ class AstraReviewTests(StaffTestCase):
     @override
     def setUp(self) -> None:
         super().setUp()
-        self.fixture.setUp()
-        self.addCleanup(self.fixture.doCleanups)
+        _ = set_up_fixture(self.addCleanup, self.fixture)
         self.root = self.fixture.fixture.root
         self.router.setup(self, self.root)
         self.fixture.agent.consultations(self)
