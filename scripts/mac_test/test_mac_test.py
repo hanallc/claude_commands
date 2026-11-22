@@ -1247,7 +1247,11 @@ finally:
     def repository(self, name: str) -> Path:
         """Create a Git repository without an origin."""
         directory = self.root / "repositories" / name
-        _ = subprocess.run(["git", "init", "-q", str(directory)], check=True)
+        _ = subprocess.run(["git", "init", "-q", str(directory)], env=self.environment, check=True)
+        _ = subprocess.run(["git", "-C", str(directory), "-c", "user.name=Fixture",
+                            "-c", "user.email=fixture@example.invalid", "-c", "core.hooksPath=/dev/null",
+                            "commit", "-qm", "Fixture", "--no-gpg-sign", "--allow-empty"],
+                           env=self.environment, check=True)
         return directory
 
     def repository_claim(self, name: str) -> RunState:
