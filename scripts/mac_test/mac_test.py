@@ -2060,6 +2060,7 @@ def take_over_kept_claim(args: CliArguments, claim: HeldClaim, kept: RemoteJobCl
 
 def claim_once(args: CliArguments, paths: StatePaths, scope: ClaimScope,
                *, session: SubmittingSession, reserve_wait: bool = False,
+               allow_historyless_wait: bool = False,
                assignment: placement.PlacementAssignment | UnassignedClaim = UNASSIGNED_CLAIM,
                mac_kind: MacClaimKind = MacClaimKind.MIRROR,
                mac_repository: claim_state.MacRepositoryIdentity | claim_state.CleanupOnlyMacRepository
@@ -2148,15 +2149,16 @@ def claim_once(args: CliArguments, paths: StatePaths, scope: ClaimScope,
     if not isinstance(block, NoMacBlock):
         return blocked_claim(block)
     owner = session
-    if overlapping:
-        # A test copy gives way to any new step; a copy never replaces a copy.
-        if not args.copy and all(claim_scope_matches(paths, claim, scope) and copy_gives_way(claim.record)
-                                 for claim in overlapping):
-            return ClaimHeldByCopy(tuple(claim.record for claim in overlapping))
+    # A copy gives way to new work. It keeps the slot when the new request is a copy.
+    if overlapping and (args.copy or not all(claim_scope_matches(paths, claim, scope) and copy_gives_way(claim.record)
+                                              for claim in overlapping)):
         return ClaimBusy(overlapping[0].record)
-    if (paths.platform == "macos" and (isinstance(args.remote, str) or mac_kind is MacClaimKind.GUEST)
+    if (paths.platform == "macos" and (isinstance(args.remote, str) or mac_kind is MacClaimKind.GUEST
+            or (isinstance(scope, RepositoryScope) and not allow_historyless_wait))
             and not isinstance(mac_repository, claim_state.MacRepositoryIdentity)):
-        return ClaimDenied(12, "the Mac work claim needs a saved repository and history key")
+        return ClaimDenied(claim_state.MAC_HISTORY_KEY_UNAVAILABLE_STATUS, claim_state.MAC_HISTORY_KEY_UNAVAILABLE)
+    if overlapping:
+        return ClaimHeldByCopy(tuple(claim.record for claim in overlapping))
     proc_start = process_identity.process_start(args.pid)
     if not isinstance(proc_start, process_identity.Started):
         return ClaimDenied(1, f"cannot claim: process {args.pid} is not running", to_stderr=True)
@@ -2398,10 +2400,11 @@ def command_claim_wait(args: CliArguments, paths: StatePaths, *, kind: str = "",
     args.what = f"{args.verb} {args.package or 'workspace'}"
     saved = mac_repository.claim_repository() if isinstance(mac_repository, claim_state.ResolvedMacMirror) else WHOLE_MAC
     return command_claim(args, paths, watch_claim=False, session=session, assignment=assignment,
-                         mac_repository=saved)
+                         mac_repository=saved, allow_historyless_wait=True)
 
 
 def command_claim(args: CliArguments, paths: StatePaths, *, watch_claim: bool = True,
+                  allow_historyless_wait: bool = False,
                   session: SubmittingSession | claim_state.CallingSession = claim_state.CALLING_SESSION,
                   assignment: placement.PlacementAssignment | UnassignedClaim = UNASSIGNED_CLAIM,
                   mac_repository: claim_state.MacRepositoryIdentity | claim_state.CleanupOnlyMacRepository
@@ -2435,8 +2438,10 @@ def command_claim(args: CliArguments, paths: StatePaths, *, watch_claim: bool = 
         if destination.provider == "ssh" and (not isinstance(scope, RepositoryScope) or scope.slot != destination.slot):
             return 12
         if paths.platform == "macos" and isinstance(scope, RepositoryScope) and not args.from_pid:
-            if (not isinstance(mac_repository, claim_state.MacMirrorIdentity)
-                    or (scope.key and claim_state.mac_claim_key(scope.key) != claim_state.mac_claim_key(mac_repository.key))):
+            if not isinstance(mac_repository, claim_state.MacMirrorIdentity):
+                print(claim_state.MAC_HISTORY_KEY_UNAVAILABLE)
+                return claim_state.MAC_HISTORY_KEY_UNAVAILABLE_STATUS
+            if scope.key and claim_state.mac_claim_key(scope.key) != claim_state.mac_claim_key(mac_repository.key):
                 print("the assigned Mac repository has changed", file=sys.stderr)
                 return 12
             # Keep the mirror file name for an assignment from an older client.
@@ -2452,6 +2457,10 @@ def command_claim(args: CliArguments, paths: StatePaths, *, watch_claim: bool = 
         scope = RepositoryScope(mac_repository.mirror_name, mac_repository.key)
     else:
         scope = WHOLE_MAC
+    if (paths.platform == "macos" and not args.from_pid and isinstance(scope, WholeMacScope)
+            and (isinstance(mac_repository, claim_state.MacMirrorIdentity) or claim_state.has_mac_worktree(args.worktree))):
+        print(claim_state.MAC_HISTORY_KEY_UNAVAILABLE)
+        return claim_state.MAC_HISTORY_KEY_UNAVAILABLE_STATUS
     deadline = time.monotonic() + max(args.wait, 0.0)
     yield_deadline = 0.0
     stopped: set[tuple[int, str]] = set()
@@ -2460,6 +2469,7 @@ def command_claim(args: CliArguments, paths: StatePaths, *, watch_claim: bool = 
             attempt = (adopt_wait_claim(args, paths, scope, session=session, assignment=assignment,
                                         mac_repository=mac_repository) if args.from_pid
                        else claim_once(args, paths, scope, session=session, reserve_wait=not watch_claim,
+                                       allow_historyless_wait=allow_historyless_wait,
                                        assignment=assignment, mac_repository=mac_repository))
         if isinstance(attempt, ClaimDenied):
             print(attempt.reason, file=sys.stderr if attempt.to_stderr else sys.stdout)
