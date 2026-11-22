@@ -600,13 +600,10 @@ function isSelected(item){return !keys.size || keys.has(item.dataset.key);}
 function canRevealLinked(item,selection){
  return item.dataset.key===revealedLinkedItem || options.revealLinked?.(item.dataset,selection);
 }
-function matches(item,selection,counts,allowExpanded=false){
+function matches(item,selection,counts){
  if(!isSelected(item)) return false;
  if(!options.filterValues) return options.visible(item.dataset,selection);
- const data=item.dataset;
- const activeValues=options.filterValues(data,selection.query,selection);
- const expanded=!activeValues && allowExpanded && opened.has(data.key) && options.expandedSelection?.(data,selection);
- const values=activeValues || (expanded && options.filterValues(data,expanded.query,expanded));
+ const values=options.filterValues(item.dataset,selection.query,selection);
  if(!values) return false;
  const selected={show:selection.show,owner:selection.owner,...selection.filters};
  const excluded=Object.entries(values).filter(([name,choices])=>
@@ -614,10 +611,8 @@ function matches(item,selection,counts,allowExpanded=false){
  // A record counts for a row when it matches every other row.
  if(counts && excluded.length<2){
   for(const [name,choices] of Object.entries(values)){
-   // A change to Show ends the exception for an open read row.
-   const sameShow=expanded && name==='show';
-   if(excluded.length && (excluded[0][0]!==name || sameShow)) continue;
-   const chipValues=sameShow ? [selection.show] : ['all',...choices.map(choice=>filterChipValue(name,choice))];
+   if(excluded.length && excluded[0][0]!==name) continue;
+   const chipValues=['all',...choices.map(choice=>filterChipValue(name,choice))];
    for(const value of chipValues)
     counts[name][value]=(counts[name][value] ?? 0)+1;
   }
@@ -713,7 +708,7 @@ function applyRows(write,{animate=false,dismissMissingItem=false,normalizeOwner=
   if(linkedSection) linkedSection.hidden=!linked && !leavingLinked;
   items.forEach(item=>{
    const expanded=opened.has(item.dataset.key);
-   const matched=matches(item,active,counts,item!==linked);
+   const matched=matches(item,active,counts);
    const showRow=matched || item===linked,wasShown=!item.hidden;
    if(motion && wasShown && !showRow) animateRow(item.parentElement,item,false);
    item.hidden=!showRow;if(matched) count++;
@@ -830,7 +825,6 @@ function jump(key,{pushPlace=true,focusTarget=true,keepMatchingFilters=false,pre
  row.dataset.recordHighlight='';
  highlightedRow=row;
  highlightTimer=setTimeout(()=>row.removeAttribute('data-record-highlight'),1200);
- options.itemOpened?.(mountedTarget);
 }
 function openCard(key){
  for(const previous of opened) measured.delete(previous);
@@ -884,7 +878,6 @@ function bind(){
   const key=item.dataset.key,expanded=!opened.has(key);
   if(expanded) openCard(key);else closeCard(key,false);
   apply(true,{animate:true});
-  if(expanded && !item.hidden) options.itemOpened?.(item);
  });
  content.querySelectorAll('[data-type-chip]').forEach(button=>button.addEventListener('click',()=>{
   type=button.dataset.typeChip;changeFilter();

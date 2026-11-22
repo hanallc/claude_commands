@@ -29,6 +29,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
+from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, NamedTuple, NotRequired, Protocol, TypedDict, cast
 
@@ -44,9 +45,9 @@ from scripts.lib import conf, models_registry  # noqa: E402
 from scripts.lib.user_zone import user_zone
 from scripts.whoami import agent_accounts
 from scripts.accounts import moves, next_moves, refusals, role_map
-from scripts.whoami import quota_state, usage_store
+from scripts.whoami import quota_state, run_out, usage_store
 
-from scripts.notify import review
+from scripts.notify import review, silence
 
 from scripts.whoami.note_file import reset_time
 from scripts.whoami.agent_accounts import (ClaudeAccountsInUse, CodexHomeSource, Report,
@@ -55,7 +56,6 @@ from scripts.whoami.agent_accounts import (ClaudeAccountsInUse, CodexHomeSource,
 
 if TYPE_CHECKING:
     from scripts.notify.push_texts import RenderedPush
-    from scripts.whoami import run_out
     from scripts.accounts import accounts
     from scripts.accounts.accounts import CodexWorkersAccount
 
@@ -430,9 +430,20 @@ class CodexZeroEpisode(TypedDict):
     credits_off_fallback: NotRequired[Literal["waiting_for_next_entry"]]
 
 
+class ClaudeExpiryAttempt(TypedDict):
+    weekly_reset: str
+    attempted_at: str
+
+
+class PreviousClaudeExpiryDelivery(TypedDict):
+    weekly_reset: str
+    delivered_at: str
+
+
 class State(TypedDict):
     # Account label ("codex1") -> its open episode.
     episodes: dict[str, Episode]
+    claude_expiry: NotRequired[dict[str, ClaudeExpiryAttempt]]
     codex_zero: NotRequired[dict[str, CodexZeroEpisode]]
     refusal_notices: NotRequired[dict[str, RefusalNotice]]
     fallback: CodexQuotaFallback
@@ -458,6 +469,7 @@ class StoredFallback(TypedDict):
 
 class StoredState(TypedDict):
     episodes: dict[str, Episode]
+    claude_expiry: NotRequired[dict[str, ClaudeExpiryAttempt | PreviousClaudeExpiryDelivery]]
     codex_zero: NotRequired[dict[str, CodexZeroEpisode]]
     refusal_notices: NotRequired[dict[str, RefusalNotice]]
     switch: NotRequired[StoredFallback]
@@ -523,6 +535,8 @@ def _stored_fallback(fallback: AccountCodexQuotaFallback | UnknownOwnerCodexQuot
 
 def _stored_state(state: State) -> StoredState:
     saved = StoredState(episodes=state["episodes"])
+    if expiry_attempts := state.get("claude_expiry"):
+        saved["claude_expiry"] = {label: attempt for label, attempt in expiry_attempts.items()}
     if "no_worker_mode" in state:
         saved["no_worker_mode"] = state["no_worker_mode"]
     if "codex_zero" in state:
@@ -768,6 +782,13 @@ def state_file() -> Generator[State]:
         try:
             saved = cast(StoredState, json.loads(STATE.read_text(encoding="utf-8")))
             state = State(episodes={note_file.canonical_label(label): episode for label, episode in saved.get("episodes", {}).items()}, fallback=_read_fallback(saved.get("switch")))
+            if "claude_expiry" in saved:
+                state["claude_expiry"] = {
+                    note_file.canonical_label(label): ClaudeExpiryAttempt(
+                        weekly_reset=attempt["weekly_reset"],
+                        attempted_at=attempt["attempted_at"] if "attempted_at" in attempt else attempt["delivered_at"])
+                    for label, attempt in saved["claude_expiry"].items()
+                }
             if "codex_zero" in saved:
                 state["codex_zero"] = {note_file.canonical_label(label): episode for label, episode in saved["codex_zero"].items()}
                 for episode in state["codex_zero"].values():
@@ -1224,29 +1245,45 @@ def credit_line(note: AgentNote) -> str:
         return f"No credit balance is reported for {name}."
 
 
+def _claude_move_groups(roles: tuple[str, ...]) -> set[str]:
+    aliases = {"unit": "units", "unit directors": "units", "units": "units",
+               "showrunner": "showrunners", "showrunners": "showrunners"}
+    return {aliases[role] for role in roles if role in aliases}
+
+
+def _claude_moves_cover(account: str, groups: set[str]) -> bool:
+    if not groups:
+        return False
+    entries = next_moves.read_next_moves()
+    history = role_map.recorded_auto_moves(role_map.groups_file().with_name("roles.jsonl"))
+    if not isinstance(history, role_map.RecordedAutoMoves):
+        return False
+    heads: dict[str, next_moves.ClaudeGroupMove] = {}
+    for entry in entries:
+        if isinstance(entry, next_moves.ClaudeGroupMove) and entry.id not in history.entry_ids:
+            _ = heads.setdefault(entry.group, entry)
+    return groups <= {group for group, head in heads.items() if head.to != account}
+
+
+def _claude_quota_sender() -> bool:
+    return socket.gethostname().split(".", 1)[0] == role_map.ROLE_MAP_HOST
+
+
 def claude_next_move_push(note: AgentNote, selection: ClaudeAccountsInUse) -> QuotaNotice:
     """A phone reminder only when an in-use account has an uncovered group."""
     from scripts.notify.push_texts import render
 
-    aliases = {"unit": "units", "unit directors": "units", "units": "units",
-               "showrunner": "showrunners", "showrunners": "showrunners"}
-    groups = {aliases[role] for role in claude_roles(note, selection) if role in aliases}
+    if not _claude_quota_sender():
+        return QuotaStatusNote(note.label, "only natedev sends Claude quota pushes")
+    groups = _claude_move_groups(claude_roles(note, selection))
     if not groups:
         return QuotaStatusNote(note.label, "no Claude group uses this account")
     try:
-        heads: dict[str, next_moves.ClaudeGroupMove] = {}
-        for entry in next_moves.read_next_moves():
-            if isinstance(entry, next_moves.ClaudeGroupMove):
-                _ = heads.setdefault(entry.group, entry)
-        covered: set[str] = ({group for group, head in heads.items() if head.to != note.label}
-                   if isinstance(role_map.recorded_auto_moves(role_map.groups_file().with_name("roles.jsonl")),
-                                 role_map.RecordedAutoMoves) else set())
+        if _claude_moves_cover(note.label, groups):
+            return QuotaStatusNote(note.label, "what happens next is set up")
     except next_moves.NextMoveError as error:
         return QuotaStatusNote(note.label, str(error))
-    if groups <= covered:
-        return QuotaStatusNote(note.label, "what happens next is set up")
-    return UserPush(note.label, render("quota.claude_next_move", account=note.label,
-                                      remaining=percent(note)))
+    return UserPush(note.label, render("quota.claude_next_move", account=note.label, remaining=percent(note)))
 
 
 def codex_next_move_push(note: AgentNote, fallback: CodexQuotaFallback = NO_CODEX_QUOTA_FALLBACK,
@@ -1671,7 +1708,7 @@ def relay(recipient: str, text: str, key: str | None) -> str | None:
                 return " ".join(f"QUEUED: {outcome.header.detail}".split())
             case "retry":
                 return " ".join(f"RETRY: {outcome.header.detail}".split())
-            case "failed" | "refused" | "held" | "pending":
+            case "failed" | "refused" | "held" | "pending" | "closed" | "absent":
                 pass
     return " ".join(failure_detail(done).split())
 
@@ -1686,13 +1723,27 @@ class PushFailed:
     why: str
 
 
-PushDelivery = PushSent | PushFailed
+@dataclass(frozen=True)
+class PushUnconfirmed:
+    why: str
+
+
+PushDelivery = PushSent | PushFailed | PushUnconfirmed
+
+
+def _push_outcome(delivery: PushDelivery) -> str:
+    if isinstance(delivery, PushSent):
+        return "sent"
+    if isinstance(delivery, PushUnconfirmed):
+        return f"delivery unconfirmed: {delivery.why}"
+    return f"not delivered: {delivery.why}"
 
 
 def tell_user(push: RenderedPush) -> PushDelivery:
     """Convert the sender process result into the user delivery state."""
     from scripts.notify.push_texts import user_send_argv
 
+    expiry = push.id == "quota.claude_expiry"
     user_send_timeout = review.user_send_seconds()
     command = user_send_argv(push, timeout=user_send_timeout)
     try:
@@ -1700,17 +1751,26 @@ def tell_user(push: RenderedPush) -> PushDelivery:
                               timeout=send_budget.user_seconds(user_send_timeout),
                               check=False)
     except (subprocess.TimeoutExpired, OSError) as error:
-        return PushFailed(str(error))
+        return PushUnconfirmed(str(error)) if expiry else PushFailed(str(error))
     outcome = send_result.send_outcome(done.returncode, done.stdout)
+    why = " ".join(failure_detail(done).split())
     if isinstance(outcome, send_result.ConfirmedSendOutcome):
         match outcome.header.outcome:
-            case "sent" | "skipped" | "kept" | "replaced":
+            case "sent":
                 return PushSent()
+            case "refused" | "held":
+                return PushFailed(why)
+            case "skipped" | "replaced":
+                return PushFailed(why) if expiry else PushSent()
+            case "kept":
+                if not expiry:
+                    return PushSent()
             case "retry":
-                return PushFailed(" ".join(f"RETRY: {outcome.header.detail}".split()))
-            case "queued" | "failed" | "refused" | "held" | "pending":
+                if not expiry:
+                    return PushFailed(" ".join(f"RETRY: {outcome.header.detail}".split()))
+            case "queued" | "failed" | "pending" | "closed" | "absent":
                 pass
-    return PushFailed(" ".join(failure_detail(done).split()))
+    return PushUnconfirmed(why) if expiry else PushFailed(why)
 
 
 def deliver(jobs: list[Job]) -> list[str | None]:
@@ -2080,9 +2140,136 @@ def _codex_zero_alert(config: Config, readings: CodexAlertPassReadings, now: dat
             if (isinstance(delivery, PushSent) and episode is not None
                     and episode["since"] == since and episode.get(field) == "due"):
                 episode[field] = stamp
-        outcome = "sent" if isinstance(delivery, PushSent) else f"not delivered: {delivery.why}"
-        log.append(f"quota {field} {push.name} -> user: {outcome}")
+        log.append(f"quota {field} {push.name} -> user: {_push_outcome(delivery)}")
     return log
+
+
+@dataclass(frozen=True)
+class ClaudeExpirySchedule:
+    lead: timedelta
+    repeat: timedelta
+
+
+class NoClaudeExpirySchedule(Enum):
+    CONFIGURED = "no usable expiry settings"
+
+
+def _claude_expiry_schedule() -> ClaudeExpirySchedule | NoClaudeExpirySchedule:
+    settings = conf.read(CONFIG)
+    keys = ("claude_expiry.alert_hours", "claude_expiry.repeat_hours")
+    if isinstance(settings.settings, dict) and not any(settings.effective_key(key) in settings.settings for key in keys):
+        return NoClaudeExpirySchedule.CONFIGURED
+    try:
+        lead, repeat = (settings.whole(key) for key in keys)
+        if not (1 <= lead <= 168 and 1 <= repeat <= 168):
+            raise ValueError("expiry hours must be between 1 and 168")
+    except ValueError as error:
+        print(f"quota-alert: Claude expiry settings unavailable: {error}", file=sys.stderr)
+        return NoClaudeExpirySchedule.CONFIGURED
+    return ClaudeExpirySchedule(timedelta(hours=lead), timedelta(hours=repeat))
+
+
+WEEKLY_EMPTY_FORMAT = "%a %m-%d %H:%M %Z"
+
+
+@dataclass(frozen=True)
+class WeeklyForecast:
+    used_per_hour: float
+    empty_at: datetime | None
+    lasts_to_deadline: bool
+
+
+def weekly_forecast(readings: list[run_out.Reading], now: datetime,
+                    reset: datetime | None, *, current: run_out.Reading) -> WeeklyForecast | None:
+    """Estimate weekly use from readings in the current window."""
+    if not now - run_out.MAX_GAP <= current.at <= now or not 0 <= current.used_percent < 100:
+        return None
+    latest = next((reading for reading in reversed(readings) if reading.at <= current.at), None)
+    if latest is None or now - latest.at > run_out.MAX_GAP:
+        return None
+    start = reset - timedelta(weeks=1) if reset is not None else None
+    if (reset is not None and reset <= now) or (start is not None and current.at < start):
+        return None
+    readings = [reading for reading in readings
+                if (start is None or start <= reading.at) and reading.at < current.at] + [current]
+    # A refill can start a new window before the scheduled reset.
+    for end in range(len(readings) - 1, 0, -1):
+        if readings[end].used_percent < readings[end - 1].used_percent:
+            readings = readings[end:]
+            break
+    rate = run_out.weighted_rate(readings, current.at.timestamp())
+    if rate is None or not math.isfinite(rate) or rate <= 0:
+        return None
+    seconds = (100 - current.used_percent) / rate
+    empty_at = None
+    lasts_to_deadline = reset is not None and seconds >= (reset - current.at).total_seconds()
+    if reset is not None and not lasts_to_deadline and (now - current.at).total_seconds() < seconds:
+        empty_at = current.at + timedelta(seconds=seconds)
+    return WeeklyForecast(rate * 3600, empty_at, lasts_to_deadline)
+
+
+def _expiry_current_reading(note: AgentNote, readings: list[run_out.Reading],
+                            now: datetime, left: float) -> run_out.Reading | None:
+    observed = reset_time(note.get("weekly_usage_checked_at"))
+    if isinstance(observed, note_file.InvalidReset):
+        return None
+    cutoff = observed.value if isinstance(observed, note_file.KnownReset) else now
+    latest = next((reading for reading in reversed(readings) if reading.at <= cutoff), None)
+    # The log retains more precision than the note for the same observation.
+    if (latest is not None and (isinstance(observed, note_file.NoResetKnown) or latest.at == cutoff)
+            and math.isclose(left, 100 - latest.used_percent, rel_tol=5e-6)):
+        return latest
+    if isinstance(observed, note_file.KnownReset):
+        return run_out.Reading(observed.value, 100 - left)
+    return None
+
+
+def _expiry_attempt_time() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _send_claude_expiry(note: AgentNote, readings: list[run_out.Reading],
+                        now: datetime, schedule: ClaudeExpirySchedule) -> list[str]:
+    from scripts.notify.push_texts import render
+
+    left, reset = note_file.remaining(note), reset_time(note.get("resets"))
+    if (not note_file.in_use(note) or not isinstance(reset, note_file.KnownReset) or reset.value <= now
+            or left is None or not 0 < left <= 100):
+        return []
+    current = _expiry_current_reading(note, readings, now, left)
+    if current is None:
+        return []
+    forecast = weekly_forecast(readings, now, reset.value, current=current)
+    if forecast is None or forecast.empty_at is None or forecast.empty_at >= now + schedule.lead:
+        return []
+    label = note.label
+    try:
+        if _claude_moves_cover(label, _claude_move_groups(note.get_list("role"))):
+            return []
+    except next_moves.NextMoveError:
+        return []
+    if silence.active():
+        return []
+    display = forecast.empty_at.astimezone(user_zone()).strftime(WEEKLY_EMPTY_FORMAT)
+    push = render("quota.claude_expiry", account=label, empty_at=display)
+    with state_file() as state:
+        at = _expiry_attempt_time()
+        attempts = state.setdefault("claude_expiry", {})
+        previous = attempts.get(label)
+        if previous is not None and reset_time(previous["weekly_reset"]) == reset:
+            last = reset_time(previous["attempted_at"])
+            if isinstance(last, note_file.KnownReset) and at < last.value + schedule.repeat:
+                return []
+        attempt = ClaudeExpiryAttempt(weekly_reset=reset.value.isoformat(), attempted_at=at.isoformat())
+        attempts[label] = attempt
+    delivery = tell_user(push)
+    # For expiry pushes, PushFailed means the sender confirmed that it did not post.
+    if isinstance(delivery, PushFailed):
+        with state_file() as state:
+            attempts = state.get("claude_expiry", {})
+            if attempts.get(label) == attempt:
+                del attempts[label]
+    return [f"quota Claude expiry {label} -> user: {_push_outcome(delivery)}"]
 
 
 def _alert_for_saved_readings(notes: list[AgentNote], now: datetime, selection: ClaudeAccountsInUse,
@@ -2125,8 +2312,14 @@ def _alert_for_saved_readings(notes: list[AgentNote], now: datetime, selection: 
                     log.append(f"quota status {name}: {push.text}")
     if isinstance(back, SwitchBack):
         log.append(f"switch to claude undone: {back.describe()}")
+    schedule = _claude_expiry_schedule() if _claude_quota_sender() else NoClaudeExpirySchedule.CONFIGURED
     with ThreadPoolExecutor() as pool:
         push_futures = [pool.submit(tell_user, push.rendered) for push in pushes]
+        expiry_futures = []
+        if isinstance(schedule, ClaudeExpirySchedule) and not silence.active():
+            readings = run_out.read_readings(run_out.READINGS_LOG)
+            expiry_futures = [pool.submit(_send_claude_expiry, note, readings.get(note.label, []), now, schedule)
+                              for note in notes if note.tool == "claude"]
         push_deliveries = [future.result() for future in push_futures]
     if pushes:
         with state_file() as state:
@@ -2136,6 +2329,8 @@ def _alert_for_saved_readings(notes: list[AgentNote], now: datetime, selection: 
                     episode["push"] = stamp
                 outcome = "sent" if isinstance(delivery, PushSent) else f"not delivered: {delivery.why}"
                 log.append(f"quota push {push.name} -> user: {outcome}")
+    for future in expiry_futures:
+        log.extend(future.result())
     return log
 
 
@@ -2433,9 +2628,8 @@ def _route_refusal(notes: list[AgentNote], refusing_account: agent_accounts.Refu
         log.append(f"quota status {quota_notice.name}: {quota_notice.text}")
     else:
         push_delivery = tell_user(quota_notice.rendered)
-        log.append(f"quota refusal {name} -> user: " + (
-            "sent" if isinstance(push_delivery, PushSent) else f"not delivered: {push_delivery.why}"))
-        if isinstance(push_delivery, PushFailed):
+        log.append(f"quota refusal {name} -> user: {_push_outcome(push_delivery)}")
+        if not isinstance(push_delivery, PushSent):
             return RoutedRefusal(log, outcome)
     with state_file() as state:
         notices = state.setdefault("refusal_notices", {})

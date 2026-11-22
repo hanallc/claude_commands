@@ -34,13 +34,14 @@ from scripts.agents import test_stop_resume, worker_lifecycle
 from scripts.direct import progress_history
 from scripts.copies import copies
 from scripts.copies import remote_test_support
+from scripts.copies.workspace_test_support import registered_workspace
 from scripts.copies.copies_test_support import fake_remote_removal, publish_mirror
 from scripts.copies.remote_test_support import local_remote_transport
 from scripts.herdr import herdr, pane_launch, worker_panes
 from scripts.herdr.herdr import HerdrPlace
 from scripts.herdr.test_worker_panes import PaneWorld
 from scripts.lib import (
-    atomic_file, build_folder_lock, build_folders, build_slots_test_support, conf, process_group, process_start,
+    atomic_file, build_folder_lock, build_folders, build_slots, build_slots_test_support, conf, git_files, process_group, process_start,
     socket_test_support, unit_runs,
 )
 from scripts.lib.atomic_file import write_text_atomic
@@ -68,6 +69,7 @@ from scripts.production.staff_test_support import (
 )
 from scripts.agents import shutdown, remote, stop_resume, restart, pane_record as staff_pane_record, pane_record, producer_transfer
 from scripts.agents.stop_results import StopResult
+from scripts.worktree import worktrees
 
 from scripts.production import rename_test_support as support
 from scripts.production.rename_test_support import (
@@ -265,6 +267,11 @@ roots.temporary=${TMPDIR}/builds
 roots.gate=/tmp
 roots.session=~/session
 roots.workspace=~/worktrees
+roots.scratch=~/scratch
+roots.copies=~/copies
+roots.build=~/build
+# one of: report, enforce
+folders.check=report
 patterns.temporary={repository}/{owner}-{purpose}-{suffix}
 patterns.tool={purpose}{suffix}
 patterns.legacy-unique={purpose}{suffix}
@@ -289,7 +296,9 @@ prefixes.copies-index=copies-index-
     "copies": """\
 remote_registry=~/remote-mirrors
 wait_seconds=0.01
+# range: 5e-324..
 git_timeout_seconds=10
+# range: 5e-324..
 guard_timeout_seconds=10
 guard_choice_limit=32
 owner.verify=verify
@@ -352,12 +361,12 @@ caller_margin_seconds=15
 remote_transport_seconds=30
 """,
     "build_steps": """\
-names.targeted-test=targeted test
-names.merge-gate=gate
+names.test-affected=test affected
+names.gate=gate
 names.integrate=integrate
 names.test-all=test all
 names.test-modules=test named
-prose.merge-gate=the gate
+prose.gate=the gate
 prose.build=release build
 owned.default={unit} {step}
 owned.showrunner-default=showrunner {step}
@@ -691,8 +700,10 @@ class RetireUnitTests(ShutdownRepositoryFixture):
         _ = staff.set_worktree(self.unit_staff_id, staff.PresentWorktree(remote.local_machine(), director), expected=staff.PresentWorktree(remote.local_machine(), self.worktree))
         code, output = self.retire()
         self.assertEqual(code, 0, output)
-        self.assertFalse(director.exists())
+        self.assertTrue(director.is_dir())
         self.assertTrue(self.worktree.exists())
+        self.assertIn(f"kept for a manual removal list: {director}", output)
+        self.assertNotIn(f"kept for a manual removal list: {self.worktree}", output)
         row = staff.snapshot().by_id(self.unit_staff_id)
         self.assertIsNotNone(row)
         assert row is not None
@@ -728,7 +739,7 @@ class RetireUnitTests(ShutdownRepositoryFixture):
             with copies.standing("other-unit", self.checkout, copies.CommittedSource("HEAD")) as other:
                 other_cache = (other / "target").resolve().parent
             self.assertNotEqual(tree, other)
-        with copies.workspace(
+        with registered_workspace(
             str(self.unit_staff_id), self.checkout, "HEAD", name="worker", branch="worker", task="gate:retire-worker",
         ) as workspace:
             pass
@@ -779,7 +790,7 @@ class RetireUnitTests(ShutdownRepositoryFixture):
         self.assertEqual(build_folders.build_folder_state(tree), "free")
         code, output = self.retire()
         self.assertEqual(code, 0, output)
-        self.assertFalse(self.worktree.exists())
+        self.assertTrue(self.worktree.is_dir())
         self.assertEqual(build_folders.build_folder_state(tree), "free")
 
     def assert_slot_held(self, path: Path) -> None:
@@ -795,7 +806,7 @@ class RetireUnitTests(ShutdownRepositoryFixture):
             self.assertNotIn("busy", output)
             self.assert_slot_held(tree)
             self.assertTrue(tree.exists())
-        self.assertFalse(self.worktree.exists())
+        self.assertTrue(self.worktree.is_dir())
 
     def test_retirement_retry_removes_a_tree_kept_while_busy(self) -> None:
         with copies.standing(str(self.unit_staff_id), self.checkout, copies.CommittedSource("HEAD")) as tree:
@@ -809,6 +820,106 @@ class RetireUnitTests(ShutdownRepositoryFixture):
         self.assertTrue(tree.exists())
         self.assertEqual(build_folders.build_folder_state(tree), "free")
 
+    def park_without_worktree(self) -> None:
+        row = staff.by_id(self.unit_staff_id)
+        assert row is not None
+        _ = git(self.checkout, "worktree", "remove", "--force", str(self.worktree))
+        _ = staff.set_worktree(row.id, staff.RemovedWorktree(remote.local_machine(), self.worktree,
+            staff.ParkedBranch("alpha-branch")), expected=row.worktree)
+
+    def test_recovery_recreates_the_checkout_after_manual_removal(self) -> None:
+        base = git(self.checkout, "rev-parse", "main")
+        record = worktrees.new_record(self.worktree, "alpha-branch", self.checkout, base, "alpha", "main")
+        record_path = worktrees.record_file(self.worktree)
+        worktrees.write_record(record)
+        code, output = self.retire()
+        self.assertEqual(code, 0, output)
+        self.assertTrue(self.worktree.is_dir())
+        _ = git(self.checkout, "worktree", "remove", "--force", str(self.worktree))
+        code, output = self.retire()
+        self.assertEqual(code, 0, output)
+        self.assertEqual(git(self.checkout, "branch", "--list", "alpha-branch"), "")
+        self.assertEqual(worktrees.read_record(record_path), record)
+
+        unit = shutdown.recovery_find_unit("alpha", str(self.unit_staff_id))
+        assert isinstance(unit, shutdown.RetiredUnitRecovery)
+        self.assertEqual(shutdown.recovery_refusals(unit), [])
+        with redirect_stdout(io.StringIO()):
+            shutdown.recovery_make_worktree(unit)
+
+        self.assertEqual(git(self.worktree, "branch", "--show-current"), record.branch)
+        self.assertEqual(git(self.worktree, "rev-parse", "HEAD"), base)
+        layout = worktrees.output_record("origin", "alpha", "worktree")
+        self.assertEqual(worktrees.read_record(record_path), replace(record, layout=layout))
+        self.assertEqual((self.worktree / "target").readlink(), layout.output)
+
+    def test_retirement_refuses_a_rebase_in_the_main_checkout(self) -> None:
+        branch = "refs/heads/alpha-branch"
+        tip = git(self.checkout, "rev-parse", branch)
+        _ = git(self.checkout, "checkout", "--detach", tip)
+        state = Path(git(self.checkout, "rev-parse", "--absolute-git-dir")) / "rebase-merge"
+        state.mkdir()
+        write_text_atomic(state / "head-name", branch + "\n")
+        code, output = self.retire()
+        self.assertEqual(code, 1, output)
+        self.assertIn(f"branch alpha-branch is rebasing in {self.checkout}", output)
+        self.assertTrue(self.worktree.is_dir())
+        self.assertEqual(git(self.root / "origin.git", "rev-parse", branch), tip)
+        self.assertEqual(self.calls, [])
+
+    def test_retirement_retry_refuses_a_rebase_after_the_unit_checkout_is_absent(self) -> None:
+        self.park_without_worktree()
+        branch = "refs/heads/alpha-branch"
+        tip = git(self.checkout, "rev-parse", branch)
+        other = self.root / "rebasing-worktree"
+        _ = git(self.checkout, "worktree", "add", "--detach", str(other), tip)
+        state = Path(git(other, "rev-parse", "--absolute-git-dir")) / "rebase-apply"
+        state.mkdir()
+        write_text_atomic(state / "head-name", branch + "\n")
+        code, output = self.retire()
+        self.assertEqual(code, 1, output)
+        self.assertIn(f"branch alpha-branch is rebasing in {other}", output)
+        self.assertEqual(git(self.root / "origin.git", "rev-parse", branch), tip)
+        self.assertEqual(self.calls, [])
+
+    def test_retirement_ignores_a_stale_linked_checkout_on_another_branch(self) -> None:
+        stale = self.root / "stale"
+        _ = git(self.checkout, "worktree", "add", "-b", "other-branch", str(stale), "main")
+        (stale / ".git").unlink()
+        listed = git(self.checkout, "worktree", "list", "--porcelain")
+        self.assertIn(f"worktree {stale}\n", listed)
+        self.assertIn("branch refs/heads/other-branch", listed)
+        code, output = self.retire()
+        self.assertEqual(code, 0, output)
+        self.assertTrue(stale.is_dir())
+
+    def test_retirement_retry_preserves_the_remote_branch_if_local_deletion_fails(self) -> None:
+        self.park_without_worktree()
+        branch = "refs/heads/alpha-branch"
+        tip = git(self.checkout, "rev-parse", branch)
+        _ = git(self.checkout, "checkout", "alpha-branch")
+        code, output = self.retire()
+        self.assertEqual(code, 1, output)
+        self.assertIn("cannot delete branch 'alpha-branch' used by worktree", output)
+        self.assertEqual(git(self.checkout, "rev-parse", branch), tip)
+        self.assertEqual(git(self.root / "origin.git", "rev-parse", branch), tip)
+
+    def test_retirement_refuses_a_failed_worktree_scan_before_inspecting_git_files(self) -> None:
+        def fail_scan(argv: list[str], cwd: Path | None = None, *,
+                      settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT
+                      ) -> subprocess.CompletedProcess[str]:
+            if argv[3:] == ["worktree", "list", "--porcelain", "-z"]:
+                self.assertIsInstance(settings, conf.ConfigRead)
+                return subprocess.CompletedProcess(argv, 128, f"worktree {self.root}\0\0", "scan failed")
+            return self.fake_run(argv, cwd=cwd, settings=settings)
+
+        with mock.patch.object(shutdown, "retirement_run", side_effect=fail_scan):
+            code, output = self.retire()
+        self.assertEqual(code, 1, output)
+        self.assertIn("retire: cannot list Git worktrees: scan failed", output)
+        self.assertTrue(self.worktree.is_dir())
+        self.assertEqual(self.calls, [])
+
 
     def test_one_retirement_shares_settings_through_validation_and_cleanup(self) -> None:
         with mock.patch.object(conf, "read", wraps=conf.read) as reads:
@@ -816,7 +927,7 @@ class RetireUnitTests(ShutdownRepositoryFixture):
         self.assertEqual(code, 0, output)
         self.assertEqual([call.args[0] for call in reads.call_args_list if call.args[0] == "production"],
                          ["production"])
-        self.assertFalse(self.worktree.exists())
+        self.assertTrue(self.worktree.is_dir())
 
     def test_external_command_reads_current_settings_for_the_named_request(self) -> None:
         with mock.patch.object(conf, "read", wraps=conf.read) as reads:
@@ -1124,8 +1235,8 @@ class RetireUnitTests(ShutdownRepositoryFixture):
 
 
     def test_retirement_without_saved_work_still_records_the_staff_identity(self) -> None:
-        for step, machine in (("complete", "natedev"), ("staff", "natedev"), ("worktree", "natedev"),
-                              ("local branch", "natedev"), ("origin branch", "natedev"), ("local branch", "mac")):
+        for step, machine in (("complete", "natedev"), ("staff", "natedev"),
+                              ("retention", "natedev"), ("retention", "mac")):
             with self.subTest(step=step, machine=machine):
                 case = RetireUnitTests()
                 case.setUp()
@@ -1136,7 +1247,7 @@ class RetireUnitTests(ShutdownRepositoryFixture):
                         _ = case.enterContext(case.staff.machine("mac"))
                         _ = case.enterContext(mock.patch.object(shutdown, "local_machine", return_value="mac"))
                         self.assertFalse(staff.is_owner())
-                    run, publish = shutdown.retirement_run, staff.set_worktree
+                    retain, publish = shutdown.retirement_remove, staff.set_worktree
 
                     def publish_retirement(identity: staff.StaffId, value: staff.PresentWorktree | staff.RemovedWorktree, *,
                                            expected: staff.PresentWorktree | staff.RemovedWorktree | staff.WorktreeUnfilled) -> staff.StaffRow:
@@ -1145,18 +1256,16 @@ class RetireUnitTests(ShutdownRepositoryFixture):
                             raise SystemExit(91)
                         return result
 
-                    def run_step(argv: list[str], cwd: Path | None = None, *,
-                                 settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT) -> subprocess.CompletedProcess[str]:
-                        result = run(argv, cwd=cwd, settings=settings)
-                        if result.returncode == 0 and ((step == "worktree" and argv[3:5] == ["worktree", "remove"])
-                                or (step == "local branch" and argv[3:5] == ["branch", "-D"])
-                                or (step == "origin branch" and argv[3:6] == ["push", "-q", "origin"])):
+                    def retain_worktree(selected: shutdown.RetiringUnit, *,
+                                        settings: conf.ConfigRead) -> list[str]:
+                        failures = retain(selected, settings=settings)
+                        if step == "retention" and not failures:
                             raise SystemExit(91)
-                        return result
+                        return failures
 
                     if step != "complete":
                         with (mock.patch.object(staff, "set_worktree", side_effect=publish_retirement),
-                              mock.patch.object(shutdown, "retirement_run", side_effect=run_step),
+                              mock.patch.object(shutdown, "retirement_remove", side_effect=retain_worktree),
                               self.assertRaises(SystemExit) as stopped):
                             _ = case.retire()
                         self.assertEqual(stopped.exception.code, 91)
@@ -1164,9 +1273,10 @@ class RetireUnitTests(ShutdownRepositoryFixture):
                     self.assertEqual(code, 0, output)
                     self.assertEqual(staff.by_id(unit.id), replace(unit, worktree=staff.RemovedWorktree(
                         remote.local_machine(), case.worktree, staff.ParkedBranch("alpha-branch"))))
-                    self.assertEqual(git(case.checkout, "worktree", "list", "--porcelain").count(str(case.worktree)), 0)
-                    self.assertEqual(git(case.checkout, "branch", "--list", "alpha-branch"), "")
-                    self.assertEqual(git(case.checkout, "ls-remote", "--heads", "origin", "alpha-branch"), "")
+                    self.assertIn(str(case.worktree), git(case.checkout, "worktree", "list", "--porcelain"))
+                    self.assertIn("alpha-branch", git(case.checkout, "branch", "--list", "alpha-branch"))
+                    published = git(case.checkout, "ls-remote", "--heads", "origin", "alpha-branch")
+                    self.assertIn("refs/heads/alpha-branch", published)
                     self.assertEqual(git(case.checkout, "ls-remote", "origin", f"refs/retired/{unit.id}"), "")
                 finally:
                     case.doCleanups()
@@ -1292,7 +1402,7 @@ class RetireUnitTests(ShutdownRepositoryFixture):
                     close = case.pane_world.close_retained_pane
                     def close_last(identity: str, *, terminal: str = "") -> bool:
                         case.assertEqual(remote.local_machine(), machine)
-                        case.assertFalse(case.worktree.exists())
+                        case.assertTrue(case.worktree.is_dir())
                         case.assertIsInstance(case.unit_worktree(), staff.RemovedWorktree)
                         return close(identity, terminal=terminal)
                     remove = shutdown.retirement_remove
@@ -1322,7 +1432,7 @@ class RetireUnitTests(ShutdownRepositoryFixture):
                             case.assertEqual(output.count("anomaly:"), 1, output)
                             case.assertIn("alpha:w1:p1: foreground work keeps the pane open", output)
                             case.assertIn("w1:p1", case.pane_world.locations)
-                        case.assertFalse(case.worktree.exists())
+                        case.assertTrue(case.worktree.is_dir())
                         case.assertIsInstance(case.unit_worktree(), staff.RemovedWorktree)
                     else:
                         if removal_fails:
@@ -1380,7 +1490,7 @@ class RetireUnitTests(ShutdownRepositoryFixture):
                     case.assertEqual(output.count("anomaly:"), 1, output)
                     case.assertIn("alpha:w1:p1: pane close failed", output)
                     case.assertIn("terminal identity changed", output)
-                    case.assertFalse(case.worktree.exists())
+                    case.assertTrue(case.worktree.is_dir())
                     case.assertIsInstance(case.unit_worktree(), staff.RemovedWorktree)
                 finally:
                     case.doCleanups()
@@ -1623,9 +1733,9 @@ class RetireUnitTests(ShutdownRepositoryFixture):
                 assert row is not None
                 case.assertEqual(row.current_session, DIRECTOR)
                 case.assertEqual(git(case.checkout, "status", "--porcelain", "--untracked-files=no"), "")
-                case.assertFalse(case.worktree.exists())
-                case.assertEqual(git(case.checkout, "branch", "--list", "alpha-branch"), "")
-                case.assertEqual(git(case.checkout, "ls-remote", "--heads", "origin", "alpha-branch"), "")
+                case.assertTrue(case.worktree.is_dir())
+                case.assertIn("alpha-branch", git(case.checkout, "branch", "--list", "alpha-branch"))
+                case.assertIn("refs/heads/alpha-branch", git(case.checkout, "ls-remote", "--heads", "origin", "alpha-branch"))
 
 
     def test_remote_retirement_retries_failed_steps_without_retiring_the_staff_row(self) -> None:
@@ -1700,7 +1810,7 @@ class RetireUnitTests(ShutdownRepositoryFixture):
                     case.assertNotIn("alpha retired", output)
                     case.assertEqual(staff.by_id(row.id), row)
                     case.assertIsInstance(unit_config.read_parked(row.id, cleanup=False), unit_config.ConfigMissing)
-                    case.assertEqual(case.worktree.exists(), failure not in ("branch", "origin"))
+                    case.assertEqual(case.worktree.exists(), failure != "origin")
                     journal = case.root / "remote-shutdown/retire-worktrees" / f"{row.id}.json"
                     if failure == "origin":
                         commit = git(case.checkout, "commit-tree", "main^{tree}", "-p", "main", "-m", "unmerged remote work")
@@ -1714,7 +1824,7 @@ class RetireUnitTests(ShutdownRepositoryFixture):
                         _ = git(case.checkout, "merge", "-q", "--ff-only", commit)
                     code, output = case.retire()
                     case.assertEqual(code, 0, output)
-                    case.assertFalse(case.worktree.exists())
+                    case.assertEqual(case.worktree.is_dir(), failure != "origin")
                     case.assertEqual(case.unit_worktree(), staff.RemovedWorktree("mac", case.worktree, staff.ParkedBranch("alpha-branch")))
                     case.assertFalse(journal.exists())
                     before = case.stops()
@@ -1743,19 +1853,19 @@ class RetireUnitTests(ShutdownRepositoryFixture):
         row = staff.by_id(self.unit_staff_id)
         assert row is not None
         self.assertEqual(row.current_session, DIRECTOR)
-        self.assertFalse(self.worktree.exists())
+        self.assertTrue(self.worktree.is_dir())
         self.assertEqual((transcript.read_bytes(), transcript.stat().st_mtime_ns), before)
 
 
-    def test_retirement_removes_a_worktree_with_only_the_project_started_line(self) -> None:
+    def test_retirement_keeps_a_worktree_with_only_the_project_started_line(self) -> None:
         plan = self.worktree / "work.txt"
         _ = plan.write_text(plan.read_text() + "- **Project started:** 2026-10-18T22:00:00-04:00\n")
         code, output = self.retire()
         self.assertEqual(code, 0, output)
-        self.assertFalse(self.worktree.exists())
+        self.assertTrue(self.worktree.is_dir())
         self.assertEqual(self.unit_worktree(), staff.RemovedWorktree(remote.local_machine(), self.worktree, staff.ParkedBranch("alpha-branch")))
 
-    def test_retirement_releases_the_pair_when_the_lock_is_free(self) -> None:
+    def test_retirement_retains_the_worktree_lock_and_lease(self) -> None:
         for held in (False, True):
             with self.subTest(held=held):
                 case = RetireUnitTests()
@@ -1771,11 +1881,11 @@ class RetireUnitTests(ShutdownRepositoryFixture):
                         code, output = case.retire()
 
                     self.assertEqual(code, 0, output)
-                    self.assertFalse(case.worktree.exists())
+                    self.assertTrue(case.worktree.is_dir())
                     self.assertIsInstance(case.unit_worktree(), staff.RemovedWorktree)
-                    self.assertEqual(lease.exists(), held)
-                    self.assertEqual(lock.exists(), held)
-                    self.assertEqual(output.count("Worktree pair kept"), int(held))
+                    self.assertEqual(lease.read_text(), "{}\n")
+                    self.assertTrue(lock.is_file())
+                    self.assertIn(f"kept for a manual removal list: {case.worktree}", output)
                 finally:
                     case.doCleanups()
 
@@ -1923,7 +2033,7 @@ class ResumeUnitTests(ShutdownRepositoryFixture):
         unit = shutdown.recovery_find_unit("alpha", "alpha")
         assert isinstance(unit, shutdown.RetiredUnitRecovery)
         self.assertEqual(unit.branch, row.name)
-        command = shutdown.recovery_launch_command(replace(unit, name="stale-table"))
+        command = shutdown.recovery_launch_command(replace(unit, branch="parked-branch"))
         self.assertEqual(command[command.index("--production") + 2], row.name)
         self.assertEqual(command[command.index("--resume") + 1], row.current_session)
         self.assertNotIn("STAFF_ID", " ".join(command))
@@ -2102,7 +2212,7 @@ class ResumeUnitTests(ShutdownRepositoryFixture):
         _ = self.enterContext(mock.patch.object(sessions, "config_dirs", lambda: [retirement.config]))
         _ = self.enterContext(mock.patch.object(session_records, "config_dirs", lambda: [retirement.config]))
         unit = next(row for row in staff.find(kind="unit") if row.name == "alpha")
-        tip = git(retirement.checkout, "rev-parse", "main")
+        tip = git(retirement.worktree, "rev-parse", "HEAD")
         code, output = retirement.retire()
         self.assertEqual(code, 0, output)
         self.assertEqual(staff.by_id(unit.id), replace(unit, worktree=staff.RemovedWorktree(remote.local_machine(), retirement.worktree, staff.ParkedBranch("alpha-branch"))))
@@ -2307,8 +2417,8 @@ class ResumeUnitTests(ShutdownRepositoryFixture):
         code, output = self.resume()
         self.assertEqual(code, 1, output)
         self.assertIn("checkout failed", output)
-        self.assertFalse(self.worktree.exists())
-        self.assertEqual(git(self.checkout, "branch", "--list", "alpha"), "")
+        self.assertTrue(self.worktree.is_dir())
+        self.assertEqual(git(self.worktree, "branch", "--show-current"), "alpha")
         self.assertEqual(self.calls, [])
         hook.unlink()
         self.assert_resumed(*self.resume())
@@ -3635,6 +3745,121 @@ class UnitRenameTests(UnitRenameFixture):
         self.assertEqual(renamed.name, "gamma")
         self.assertEqual(renamed.worktree, staff.PresentWorktree("natedev", self.rust / "claude-demo-gamma"))
         self.assertEqual(self.git("branch", "--show-current", cwd=self.rust / "claude-demo-gamma"), "demo-gamma")
+
+    def test_rename_waits_for_a_named_output_and_keeps_a_held_numbered_copy(self) -> None:
+        self.assert_managed_unit_rename(hold_numbered_copy=True)
+
+    def test_idle_rename_moves_the_worktree_and_existing_output(self) -> None:
+        self.assert_managed_unit_rename(hold_numbered_copy=False)
+
+    def assert_managed_unit_rename(self, *, hold_numbered_copy: bool) -> None:
+        row = next(row for row in staff.find(kind="unit") if row.name == "alpha")
+        source_root, build_root = self.home / "worktrees", self.root / "build"
+        self.write(Path(self.env["CONF_DIR"]) / "build_folders.conf",
+                   f"roots.workspace={source_root}\nroots.build={build_root}\nroots.scratch={self.root / 'scratch'}\n"
+                   + "# range: 0..1\nlocks.probe_wait_seconds=0\n"
+                   + "# range: 0.001..1\nlocks.probe_retry_seconds=0.01\n")
+        self.env["WORKTREES_STATE_DIR"] = str(self.root / "worktree-records")
+        source = source_root / "origin/alpha/director"
+        source.parent.mkdir(parents=True)
+        _ = self.git("worktree", "move", str(self.rust / "claude-demo-alpha"), str(source))
+        _ = self.git("branch", "-m", "alpha-director", cwd=source)
+        other = source.with_name("review")
+        _ = self.git("worktree", "add", "-b", "alpha-review", str(other))
+        output = build_root / "origin/alpha"
+        self.write(output / "director/artifact", "director")
+        self.write(output / "review/artifact", "review")
+        self.env["COPIES_CONFIG"] = str(Path(self.env["CONF_DIR"]) / "copies.conf")
+        with mock.patch.dict(os.environ, self.env, clear=True):
+            with build_slots.take_copy(self.checkout, "HEAD", showrunner="demo", unit="alpha",
+                                       work="rename", purpose="fixture") as copy:
+                self.assertEqual(copy.path, output / "1")
+                copy_git = git_files.at(copy.path).git_dir
+                self.write(copy.path / "target/artifact", "numbered copy")
+        copy_lock = output / "1.lock"
+        for checkout in (source, other):
+            (checkout / "target").symlink_to(output / checkout.name)
+        alias = source_root / "alpha-legacy"
+        internal = source.with_name("legacy")
+        internal.symlink_to(source, target_is_directory=True)
+        alias.symlink_to(internal, target_is_directory=True)
+        with mock.patch.dict(os.environ, self.env):
+            record = worktrees.new_record(source, "alpha-director", worktrees.main_checkout(source), "base",
+                                          "alpha", "demo")
+            worktrees.write_record(replace(record, layout=worktrees.output_record("origin", "alpha", "director")))
+            identity = worktrees.FolderIdentity.read(source)
+            for former, target, stage in ((internal, source, worktrees.MoveStage.PLANNED),
+                                          (alias, internal, worktrees.MoveStage.FINISHED)):
+                moved = worktrees.WorktreeMove(former, target, "origin", "alpha", "director",
+                                               worktrees.MoveOutput.LIVE_UNIT)
+                worktrees.write_move(worktrees.MoveJournal(
+                    moved, identity, identity, "", git_files.at(source).git_dir, (), stage))
+        row = staff.set_worktree(row.id, staff.PresentWorktree("natedev", source), expected=row.worktree)
+        destination = source_root / "origin/gamma/director"
+        new_output = build_root / "origin/gamma"
+        finish_rename = unit_move.finish_rename
+
+        def finish_with_lock(current: staff.StaffRow, pending: unit_move.PendingRename) -> bool:
+            journal = unit_move.rename_move_path(current.id)
+            self.assertTrue(journal.is_file())
+            finished = finish_rename(current, pending)
+            self.assertTrue(finished)
+            self.assertFalse(journal.exists())
+            with self.assertRaises(BlockingIOError), build_folders.unit_allocation_lock(output, exclusive=False):
+                self.fail("Copy allocation acquired the old unit lock during rename.")
+            return finished
+
+        with (RenameDisplays(row).installed(),
+              mock.patch.object(unit_move, "finish_rename", side_effect=finish_with_lock) as finish):
+            if hold_numbered_copy:
+                with (output / "director.lock").open("a") as lock:
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    blocked = self.invoke(["rename", "alpha", "gamma"])
+                    self.assertEqual(blocked.returncode, 1)
+                    self.assertIn("Rerun when idle", blocked.stderr)
+                    self.assertTrue(source.is_dir())
+                    self.assertFalse(new_output.exists())
+                    self.assertTrue((copy.path / "target/artifact").is_file())
+            with copy_lock.open("r+") as lock:
+                if hold_numbered_copy:
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                result = self.invoke(["rename", "alpha", "gamma"])
+            self.assert_ok(result)
+            self.assertIn(f"kept for a manual removal list: {copy.path}", result.stderr)
+            finish.assert_called_once()
+        renamed = staff.by_id(row.id)
+        assert renamed is not None
+        self.assertEqual(renamed.worktree, staff.PresentWorktree("natedev", destination))
+        self.assertEqual(list(source.parent.iterdir()), [])
+        self.assertEqual((copy.path / "target/artifact").read_text(), "numbered copy")
+        self.assertTrue(copy_lock.is_file())
+        self.assertTrue((output / "1.lease.json").is_file())
+        self.assertFalse((output / "director").exists())
+        self.assertFalse((output / "review").exists())
+        self.assertEqual(self.git("branch", "--show-current", cwd=destination), "gamma-director")
+        moved_review = destination.with_name("review")
+        self.assertEqual(self.git("branch", "--show-current", cwd=moved_review), "alpha-review")
+        for checkout in (destination, moved_review):
+            self.assertEqual((checkout / "target").readlink(), new_output / checkout.name)
+            self.assertEqual((checkout / "target/artifact").read_text(), checkout.name)
+        new_internal = destination.with_name(internal.name)
+        self.assertEqual(alias.readlink(), new_internal)
+        self.assertEqual(new_internal.readlink(), destination)
+        self.assertEqual(alias.resolve(), destination)
+        self.assertFalse((new_output / "1").exists())
+        self.assertFalse((new_output / copy_lock.name).exists())
+        self.assertEqual(git_files.at(copy.path).git_dir, copy_git)
+        with mock.patch.dict(os.environ, self.env):
+            self.assertEqual(worktrees.read_record(worktrees.record_file(destination)).branch, "gamma-director")
+            journal = worktrees.read_move(worktrees.move_file(alias))
+            self.assertEqual((journal.move.new, journal.move.unit), (new_internal, "gamma"))
+            self.assertFalse(worktrees.move_file(internal).exists())
+            journal = worktrees.read_move(worktrees.move_file(new_internal))
+            self.assertEqual((journal.move.old, journal.move.new), (new_internal, destination))
+            self.assertEqual(journal.stage, worktrees.MoveStage.PLANNED)
+            self.assertEqual(worktrees.worktree_output(destination),
+                             worktrees.output_record("origin", "gamma", "director"))
+            self.assertFalse(worktrees.record_file(source).exists())
 
     def test_bare_unit_rename_rerun_keeps_the_callers_unit_and_leaves_the_foreign_unit_unchanged(self) -> None:
         parent = next(row for row in staff.find(kind="showrunner") if row.name == "demo")

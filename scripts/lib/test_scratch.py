@@ -31,7 +31,7 @@ from scripts.accounts import accounts
 from scripts.copies import copies
 from scripts.copies.copies_test_support import copies_environment
 from scripts.production.cli_fixture import ImmutableGitSeed
-from scripts.lib import build_folders, cargo_output, copy_record, git_files, process_group, scratch, session_folder, time_limit
+from scripts.lib import build_folders, build_slots, cargo_output, copy_record, git_files, process_group, scratch, session_folder, time_limit
 from scripts.lint import sweep
 
 from scripts.lib import conf
@@ -60,13 +60,16 @@ class ScratchTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
-        self.base = Path(tempfile.mkdtemp(prefix="scratch-test-case-")).resolve()
-        self.addCleanup(shutil.rmtree, self.base)
+        self.base = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
         environment = {key: value for key, value in os.environ.items()
                        if not key.startswith("GIT_") and key not in ("BASH_ENV", "STAFF_CONFIG")}
+        fixture = copies_environment(self.base)
+        _ = write_config_fixture(Path(fixture["CONF_DIR"]) / "build_folders.conf",
+            f"roots.build={self.base / 'build'}\nroots.build.natedev={self.base / 'build'}\n"
+            + f"roots.workspace={self.base / 'worktrees'}\n")
         self.enterContext(mock.patch.dict(os.environ, {
             **environment,
-            **copies_environment(self.base),
+            **fixture,
             "HOME": str(self.base),
             copy_record.ROOT_ENV: str(self.base / "scratch"), scratch.VISIBLE_ROOT_ENV: str(self.base / "repro"),
             scratch.HOLDS_ENV: str(self.base / "holds.json"), copy_record.COPIES_ENV: str(self.base / "copies"),
@@ -2220,6 +2223,23 @@ print(scratch.target('gate:proof', 'tree', False))
                 assert isinstance(state, scratch.Unknown)
                 self.assertIn(str(candidate / copy_record.RECORD), state.reason)
 
+    def test_an_unrecorded_shared_clone_in_a_second_pair_keeps_its_source(self) -> None:
+        root = copy_record.worktree_root()
+        source = root / "known-pair/source"
+        borrower = root / "unrecorded-pair/borrower"
+        source.mkdir(parents=True)
+        borrower.parent.mkdir()
+        self.git(source, "init", "-q")
+        self.git(source, "commit", "--allow-empty", "-qm", "source")
+        scratch.atomic_record(source / copy_record.RECORD, {"task": ROW})
+        self.git(root, "clone", "--shared", str(source), str(borrower))
+        with mock.patch.dict(os.environ, {copy_record.COPIES_ENV: str(root)}):
+            self.assertEqual(list(scratch.legacy_copy_pairs(root)), [source.parent])
+            self.assertIn(borrower, list(scratch.registered_copy_paths()))
+            result = scratch.end(ROW)
+        self.assertEqual(result, [scratch.KeptFolder(source, f"task {ROW} ended")])
+        self.assertTrue((source / ".git/objects").is_dir())
+
     def test_unreadable_git_metadata_keeps_a_possible_borrowed_source(self) -> None:
         source = self.copy("source", task="until:2000-01-01T0000Z")
         candidate = self.ordinary_worktree() / "candidate"
@@ -3023,6 +3043,90 @@ print(scratch.target('gate:proof', 'tree', False))
         self.assertGreater(scratch.holds()[str(held)]["ended"], 0)
         with self.assertRaises(scratch.ScratchError):
             _ = scratch.end("invalid-task", keep=lambda path: True)
+
+    def test_scratch_removal_keeps_a_managed_worktree_and_numbered_copy(self) -> None:
+        source_root = copy_record.worktree_root()
+        self.enterContext(mock.patch.dict(os.environ, {copy_record.COPIES_ENV: str(source_root)}))
+        workspace = build_folders.worktree_path("hana", "demo", "edit")
+        output = build_folders.output_path("hana", "demo", "edit")
+        numbered = build_folders.copy_path("hana", "demo", 1)
+        legacy = source_root / "old-pair/old-copy"
+        for path in (workspace, output, numbered, legacy):
+            path.mkdir(parents=True)
+        scratch.atomic_record(legacy / copy_record.RECORD, {"task": "gate:legacy"})
+        self.assertEqual(list(scratch.legacy_copy_pairs(source_root)), [legacy.parent])
+        self.assertEqual(copy_record.copy_folder(legacy / "src"), legacy)
+        self.assertIsNone(copy_record.copy_folder(workspace))
+        self.assertIsNone(copy_record.copy_folder(numbered))
+        (workspace / "target").symlink_to(output, target_is_directory=True)
+        alias = self.base / "old-worktree"
+        alias.symlink_to(workspace, target_is_directory=True)
+        for path in (workspace, workspace.parent, numbered, alias):
+            self.assertIsInstance(scratch.remove_folder(path), scratch.KeptFolder)
+            self.assertTrue(path.is_dir())
+        with self.assertRaisesRegex(scratch.ScratchError, "worktrees.py make"):
+            _ = scratch.adopt(workspace, ROW)
+        self.assertTrue((workspace / "target").is_symlink())
+        self.assertTrue(output.is_dir())
+
+    def numbered_copy_source(self) -> Path:
+        source = self.base / "source"
+        source.mkdir()
+        self.git(source, "init", "-q")
+        self.git(source, "remote", "add", "origin", str(self.base / "unused-origin/source"))
+        self.git(source, "commit", "--allow-empty", "-qm", "source")
+        return source
+
+    def test_a_numbered_copy_keeps_its_source_and_uses_its_own_lease(self) -> None:
+        source = self.numbered_copy_source()
+        with build_slots.take_copy(source, "HEAD", showrunner="maker", unit="demo", work="test",
+                                   purpose="test lease") as copy:
+            with scratch.copy_lock(copy.path):
+                self.assertEqual(build_folders.build_folder_state(copy.path), "held")
+            with self.assertRaisesRegex(scratch.ScratchError, "copy lease owns this record"):
+                _ = scratch.update_record(copy.path, lambda _: {"task": ROW})
+            for held in (copy.path, copy.path / "target"):
+                with self.assertRaisesRegex(scratch.ScratchError, "the numbered copy lease owns its lifetime"):
+                    _ = scratch.hold(held, ROW, "explicit cleanup")
+            self.assertIsInstance(scratch.remove_folder(copy.path), scratch.KeptFolder)
+        with scratch.copy_lock(copy.path):
+            self.assertEqual(build_folders.build_folder_state(copy.path), "held")
+        kept = scratch.remove_folder(source)
+        self.assertIsInstance(kept, scratch.KeptFolder)
+        assert isinstance(kept, scratch.KeptFolder)
+        self.assertIn(str(copy.path), kept.reason)
+        with scratch.locked_holds() as holds:
+            holds[str(copy.path)] = scratch.Hold(task=ROW, maker="old owner", reason="old hold", made=0.0, ended=0.0)
+            scratch.write_holds(holds)
+        ended = scratch.end(ROW)
+        self.assertEqual(ended, [scratch.KeptFolder(copy.path, f"task {ROW} ended")])
+        self.assertTrue(copy.path.exists())
+        self.assertEqual(scratch.remove_folder(copy.path),
+                         scratch.KeptFolder(copy.path, "the numbered copy requires manual review"))
+        self.assertTrue(copy.path.exists())
+        self.assertTrue((source / ".git/objects").is_dir())
+
+    def test_an_unreadable_numbered_copy_keeps_git_sources(self) -> None:
+        source = self.numbered_copy_source()
+        with build_slots.take_copy(source, "HEAD", showrunner="maker", unit="demo", work="test",
+                                   purpose="test lease") as copy:
+            pass
+        _ = copy.path.with_name(copy.path.name + ".lease.json").write_text("invalid")
+        kept = scratch.remove_folder(source)
+        self.assertIsInstance(kept, scratch.KeptFolder)
+        assert isinstance(kept, scratch.KeptFolder)
+        self.assertIn("cannot check numbered copy source", kept.reason)
+        self.assertTrue((source / ".git/objects").is_dir())
+
+    def test_task_end_keeps_a_managed_checkout(self) -> None:
+        workspace = build_folders.worktree_path("hana", "demo", "edit")
+        workspace.mkdir(parents=True)
+        _ = scratch.hold(workspace, ROW, "keep the managed checkout")
+        data = workspace / "saved"
+        _ = data.write_text("keep")
+        self.assertEqual(scratch.end(ROW), [scratch.KeptFolder(workspace, f"task {ROW} ended")])
+        self.assertEqual(data.read_text(), "keep")
+        self.assertGreater(scratch.holds()[str(workspace)]["ended"], 0)
 
     def test_adopt_moves_a_loose_folder_in(self) -> None:
         loose = self.base / "rust" / "c54demo"

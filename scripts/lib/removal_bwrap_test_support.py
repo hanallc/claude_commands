@@ -141,9 +141,11 @@ class RemovalSandbox:
                     line = f"{key}={private}"
                 lines.append(line)
             if name == "build_folders.conf":
-                forms = next(setting.value for key, setting in conf.settings(source).items()
-                             if key.startswith("removal.forms.") and setting.value.startswith("~/build/"))
-                lines.append(f"removal.forms={forms}")
+                templates = next(
+                    setting.value for key, setting in conf.settings(source).items()
+                    if key.startswith("removal.path_templates.") and setting.value.startswith("~/build/")
+                )
+                lines.append(f"removal.path_templates={templates}")
             _ = path.write_text("\n".join(lines) + "\n")
         fixture_bin = self.fixture / "bin"
         fixture_bin.mkdir()

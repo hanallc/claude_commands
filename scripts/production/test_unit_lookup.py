@@ -1394,6 +1394,19 @@ print(observed.row.id)
         _ = self.record("second", worktree, 2.0, "phase_started", "run_finished")
         self.assertIs(unit_lookup.run_state(worktree), UnitState.RUN_FINISHED)
 
+    def test_run_state_uses_the_real_path_for_a_saved_worktree_alias(self) -> None:
+        current, old = self.root / "current", self.root / "old"
+        current.mkdir()
+        old.symlink_to(current, target_is_directory=True)
+        _ = self.record("old-path", current, 1.0, "run_finished")
+        row = staff.snapshot().unit_by_worktree(remote.local_machine(), current)
+        assert row is not None
+        _ = staff.set_worktree(row.id, staff.PresentWorktree(remote.local_machine(), old), expected=row.worktree)
+        states = unit_lookup.read_run_states()
+        self.assertEqual(set(states.records), {str(current)})
+        self.assertIs(states.state(old), UnitState.RUN_FINISHED)
+        self.assertIs(states.state(current), UnitState.RUN_FINISHED)
+
     def test_run_records_that_cannot_be_read_are_an_error_not_a_state(self) -> None:
         (self.root / "history/runs/unreadable.jsonl").mkdir(parents=True)
         with self.assertRaises(OSError):

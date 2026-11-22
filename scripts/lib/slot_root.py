@@ -1,8 +1,4 @@
-"""Read the machine's repository slot root.
-
-This module imports only configuration and the host name, so a low-level module can test for a slot
-without the slot pool and its queue imports.
-"""
+"""Read the AWS slot root until AWS uses numbered copies."""
 
 from __future__ import annotations
 

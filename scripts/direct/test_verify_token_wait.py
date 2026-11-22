@@ -123,7 +123,6 @@ trap observe_admission DEBUG
         # A session dir alone makes this a director's run, which takes the token.
         environment = {name: value for name, value in self.environment.items()
                        if name != "UNIT_SESSION_DIR"}
-        # Use a warm build directory so Cargo seeding stays outside this test.
         environment["CARGO_BUILD_BUILD_DIR"] = environment["CARGO_TARGET_DIR"]
         result = self.verify(environment)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)

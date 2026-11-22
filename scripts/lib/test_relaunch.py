@@ -141,17 +141,25 @@ class RelaunchTests(ShutdownTestCase):
     def waiting_child(self) -> str:
         return (
             "import os,time; from pathlib import Path; "
+            "Path('child-pid').write_text(str(os.getpid())); "
             "Path('ready.tmp').write_text(str(os.getppid())); os.replace('ready.tmp', 'ready'); "
             "\nwhile not Path('release').exists(): time.sleep(.01)\n"
+            "Path('released').touch()\n"
             "raise SystemExit(7)"
         )
 
-    def request(self, pid: int) -> Path:
+    def request(self, pid: int, *, previous_child: int | None = None) -> Path:
         destination = self.root / "next cwd"
         destination.mkdir(exist_ok=True)
         output = self.root / "observation.json"
+        check_reaped = "" if previous_child is None else (
+            f"try:\n os.getpgid({previous_child})\n"
+            "except ProcessLookupError:\n pass\n"
+            "else:\n raise AssertionError('the original child still exists')\n"
+        )
         child = (
-            "import json,os; from pathlib import Path; "
+            "import json,os; from pathlib import Path\n"
+            f"{check_reaped}"
             f"Path({str(output)!r}).write_text(json.dumps({{'parent':os.getppid(),"
             "'process_group':os.getpgrp(),"
             "'cwd':os.getcwd(),'marker':os.environ.get('RELAUNCH_MARKER',''),"
@@ -470,46 +478,51 @@ class RelaunchTests(ShutdownTestCase):
         self.assertIn("no restart came; this window is free\n", stdout)
         self.assertFalse(hold.exists())
 
-    def test_terminal_interrupts_do_not_kill_the_supervisor(self) -> None:
-        for terminal_signal in (signal.SIGINT, signal.SIGQUIT, signal.SIGTSTP):
-            with self.subTest(signal=terminal_signal):
-                (self.root / "ready").unlink(missing_ok=True)
-                (self.root / "release").unlink(missing_ok=True)
-                process = self.start(self.waiting_child())
-                self.wait_for_file(self.root / "ready", process)
-                os.kill(process.pid, terminal_signal)
-                request = self.request(process.pid)
-                (self.root / "release").touch()
-                self.assert_relaunched(process, request)
+    def test_supervisor_interrupt_allows_a_restart_after_the_child_exits(self) -> None:
+        process = self.start(self.waiting_child())
+        self.wait_for_file(self.root / "ready", process)
+        previous_child = int((self.root / "child-pid").read_text())
+        request = self.request(process.pid, previous_child=previous_child)
+        os.kill(process.pid, signal.SIGINT)
+        assert process.stdout is not None
+        with selectors.DefaultSelector() as selector:
+            _ = selector.register(process.stdout, selectors.EVENT_READ)
+            self.assertFalse(selector.select(timeout=1), "restart began before the child was released")
+        self.assertTrue(request.exists())
+        (self.root / "release").touch()
+        self.assert_relaunched(process, request)
+        self.assertTrue((self.root / "released").exists())
 
-    def test_termination_and_hangup_are_forwarded_to_the_child(self) -> None:
-        for forwarded in (signal.SIGTERM, signal.SIGHUP):
-            with self.subTest(signal=forwarded):
-                (self.root / "ready").unlink(missing_ok=True)
-                received = self.root / "received"
-                received.unlink(missing_ok=True)
-                child = (
-                    "import signal,time; from pathlib import Path\n"
-                    "def received(number,frame):\n"
-                    " Path('received').write_text(str(number)); raise SystemExit(19)\n"
-                    "signal.signal(signal.SIGTERM,received); signal.signal(signal.SIGHUP,received)\n"
-                    "Path('ready').touch()\nwhile True: time.sleep(.01)\n"
-                )
-                process = self.start(child)
-                self.wait_for_file(self.root / "ready", process)
-                os.kill(process.pid, forwarded)
-                _, stderr = process.communicate(timeout=TEST_HANG_GUARD_SECS)
-                self.assertEqual(process.returncode, 19, stderr)
-                self.assertEqual(received.read_text(), str(forwarded))
+    def test_group_hangup_ends_the_supervisor_and_child(self) -> None:
+        process = self.start(self.waiting_child())
+        self.wait_for_file(self.root / "ready", process)
+        request = self.request(process.pid)
+        send_process_group(process.pid, signal.SIGHUP)
+        # The child keeps both output pipes open until it exits.
+        _, stderr = process.communicate(timeout=TEST_HANG_GUARD_SECS)
+        self.assertEqual(process.returncode, -signal.SIGHUP, stderr)
+        self.assertFalse((self.root / "released").exists())
+        self.assertTrue(request.exists())
+
+    def test_supervisor_pid_term_leaves_the_child_running(self) -> None:
+        process = self.start(self.waiting_child())
+        self.wait_for_file(self.root / "ready", process)
+        request = self.request(process.pid)
+        os.kill(process.pid, signal.SIGTERM)
+        self.assertEqual(process.wait(timeout=TEST_HANG_GUARD_SECS), -signal.SIGTERM)
+        (self.root / "release").touch()
+        _, stderr = process.communicate(timeout=TEST_HANG_GUARD_SECS)
+        self.assertTrue((self.root / "released").exists(), stderr)
+        self.assertTrue(request.exists())
 
     def test_terminal_group_interrupt_reaches_child_and_supervisor_can_relaunch(self) -> None:
         child = (
             "import os,signal,time; from pathlib import Path\n"
-            "def interrupted(number,frame):\n"
-            " Path('interrupted').write_text(str(number)); raise SystemExit(17)\n"
-            "signal.signal(signal.SIGINT,interrupted)\n"
-            "Path('ready.tmp').write_text(str(os.getpgrp())); os.replace('ready.tmp', 'ready')\n"
-            "while True: time.sleep(.01)\n"
+            "try:\n"
+            " Path('ready.tmp').write_text(str(os.getpgrp())); os.replace('ready.tmp', 'ready')\n"
+            " while True: time.sleep(.01)\n"
+            "except KeyboardInterrupt:\n"
+            " Path('interrupted').write_text(str(signal.SIGINT)); raise SystemExit(17)\n"
         )
         process = self.start(child)
         self.wait_for_file(self.root / "ready", process)

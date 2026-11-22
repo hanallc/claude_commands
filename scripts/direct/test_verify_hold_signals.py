@@ -29,7 +29,7 @@ from scripts.direct.verify_hold_wait_test_support import (
 
 
 SIGNAL_EXIT_SECONDS = 5
-_SIGNAL_FIXTURE_PARENT = Path("/dev/shm")
+_SIGNAL_FIXTURE_PARENT = Path("/dev/shm") if Path("/dev/shm").is_dir() else None
 
 
 class VerifyHoldWaitTests(VerifyHoldWaitFixture):

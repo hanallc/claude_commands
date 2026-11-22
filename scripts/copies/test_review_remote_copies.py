@@ -29,6 +29,7 @@ from scripts.build_hold.owning_session import NoOwningSession
 from scripts.production import staff
 from scripts.production.staff_test_support import fixture_member, isolated_staff_file
 from scripts.copies import copies
+from scripts.copies.workspace_test_support import registered_workspace
 from scripts.lib.build_slots_test_support import private_slot_config
 from scripts.copies.copies_test_support import mirror_arguments, publish_mirror
 from scripts.copies.remote_test_support import local_remote_transport, warm_claim_servers
@@ -636,7 +637,7 @@ with (mock.patch.object(linux_runner, 'prepare_shell', return_value=linux_runner
     def test_workspace_repairs_a_stale_lock_and_a_damaged_index(self) -> None:
         for damaged in (False, True):
             with self.subTest(damaged=damaged):
-                with copies.workspace("alpha", self.source, "HEAD", name="repaired", branch="worker") as tree:
+                with registered_workspace("alpha", self.source, "HEAD", name="repaired", branch="worker") as tree:
                     cache = (tree / "target").resolve()
                     _ = (tree / ".git/index.lock").write_text("stopped writer")
                     if damaged:
@@ -646,7 +647,7 @@ with (mock.patch.object(linux_runner, 'prepare_shell', return_value=linux_runner
                     _ = copies.git(tree, "read-tree", "HEAD")
                     self.assertEqual((tree / "source.txt").read_text(), "content\n")
                 self.assertTrue(tree.exists())
-                with copies.workspace("alpha", self.source, "HEAD", name="repaired", branch="worker") as reused:
+                with registered_workspace("alpha", self.source, "HEAD", name="repaired", branch="worker") as reused:
                     self.assertEqual(reused, tree)
                     self.assertEqual((reused / "target").resolve(), cache)
                     self.assertEqual((reused / "source.txt").read_text(), "content\n")
