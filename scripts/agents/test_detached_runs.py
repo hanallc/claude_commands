@@ -6,6 +6,7 @@ from scripts.direct import pass_record as pass_recorder
 from scripts.lint.memory_test_support import write_config_fixture
 
 import contextlib
+import errno
 import fcntl
 import hashlib
 import io
@@ -1275,14 +1276,6 @@ def fixture_sleep(delay):
     global clock, reported
     if command_pid is not None and not reported:
         reported = True
-        if command_mode == 'suspend':
-            guard = LauncherHangGuard('fixture command stops')
-            while True:
-                state = run(['ps', '-p', str(command_pid), '-o', 'stat='], capture_output=True,
-                            text=True, check=True, timeout=guard.remaining()).stdout.strip()
-                if state.startswith('T'):
-                    break
-                time.sleep(0.01)
         row = dict(role='supervisor', group=os.getpgrp(), dispositions_unchanged=dispositions() == initial_dispositions,
                    masks_unchanged=masks() == initial_masks)
         with socket.socket(socket.AF_UNIX) as connection:
@@ -1302,6 +1295,16 @@ def fixture_sleep(delay):
         if attempts:
             time.sleep(delay)
 def fixture_wait_for_command(*args, **kwargs):
+    if command_mode == 'suspend':
+        # Read the stop before the supervisor can consume it on Darwin.
+        assert command_pid is not None
+        guard = LauncherHangGuard('fixture command stops')
+        while True:
+            pid, status = os.waitpid(command_pid, os.WUNTRACED | os.WNOHANG)
+            if pid:
+                break
+            time.sleep(min(0.01, guard.remaining()))
+        assert os.WIFSTOPPED(status) and os.WSTOPSIG(status) == signal.SIGSTOP
     # Subprocess waits use the real clock.
     fixture_clock = SimpleNamespace(monotonic=fixture_time, sleep=fixture_sleep)
     with patch.object(detached_runs, 'time', fixture_clock):
@@ -1355,20 +1358,40 @@ with (patch.object(detached_runs, '_wait_for_command', fixture_wait_for_command)
             # The watcher reports the result text over the socket instead of sending it.
             # It reports after its reap finishes, so the test reads the finished record.
             watcher = self.root / "watcher.py"
-            _ = watcher.write_text(f"""import json, os, socket, sys
+            _ = watcher.write_text(f"""import errno, json, os, socket, sys
 sys.path.insert(0, {str(Path(__file__).resolve().parents[2])!r})
+from pathlib import Path
 from unittest.mock import patch
 from scripts.agents import detached_runs
+from scripts.lib import process_start
+command = detached_runs.command_group(Path(sys.argv[-1]))
+assert command is not None
+read_start = process_start.process_start
+reap = detached_runs.reap_orphans
+leader_reads = []
+reads_before_reap = []
 texts = []
+def read_identity(pid):
+    if sys.platform != 'linux' or pid != command.group:
+        return read_start(pid)
+    state = read_start(pid) if leader_reads else process_start.Unreadable('fixture unreadable identity')
+    leader_reads.append(type(state).__name__)
+    return state
+def reap_orphans(directory):
+    reads_before_reap[:] = leader_reads
+    return reap(directory)
 def deliver(record, result):
     texts.append(detached_runs.result_text(record, result))
     return 'fixture delivery'
-with (patch.object(detached_runs, 'deliver', deliver),
+with (patch.object(os, 'pidfd_open', side_effect=OSError(errno.ENOSYS, 'fixture pidfd unavailable'), create=True),
+      patch.object(process_start, 'process_start', read_identity),
+      patch.object(detached_runs, 'reap_orphans', reap_orphans),
+      patch.object(detached_runs, 'deliver', deliver),
       patch.object(detached_runs, '_complete_worker_dispatch', lambda record: None)):
     status = detached_runs.main(sys.argv[1:])
 with socket.socket(socket.AF_UNIX) as connection:
     connection.connect(os.environ["FIXTURE_READY_SOCKET"])
-    row = dict(role='delivery', verb=sys.argv[1], text=chr(10).join(texts))
+    row = dict(role='delivery', verb=sys.argv[1], text=chr(10).join(texts), leader_reads=reads_before_reap)
     connection.sendall((json.dumps(row) + chr(10)).encode())
 sys.exit(status)
 """)
@@ -1514,6 +1537,11 @@ sys.exit(status)
                                 self.assertEqual(delivered["scan_failures"], 2)
                         else:
                             self.assertEqual(delivered["verb"], "supervisor-gone")
+                            if sys.platform.startswith("linux"):
+                                reads = cast(list[str], delivered["leader_reads"])
+                                self.assertGreaterEqual(len(reads), 2)
+                                self.assertEqual(reads[0], "Unreadable")
+                                self.assertIn(reads[-1], ("Gone", "Zombie"))
                             self.assertIn("Result: STOPPED (no exit status)", str(delivered["text"]))
                             self.assertIn(f"Stop reason: {detached_runs.SUPERVISOR_GONE_REASON}",
                                           str(delivered["text"]))
@@ -1565,21 +1593,35 @@ sys.exit(status)
     def test_escalation_accepts_eperm_only_when_the_group_has_ended(self) -> None:
         wait_for_command = cast(Callable[[subprocess.Popen[bytes], IO[bytes], Path, float, float,
                                           Callable[[], bool]], int], getattr(detached_runs, "_wait_for_command"))
-        for state, stderr, ended in (("Z", "", True), ("T", "", False), ("Z", "fixture scan failure", False)):
-            with self.subTest(state=state, stderr=stderr):
+        cases = (("Z", "", False, True), ("T", "", False, False),
+                 ("Z", "fixture scan failure", False, False), ("Z", "", True, False))
+        for state, stderr, changed, ended in cases:
+            with self.subTest(state=state, stderr=stderr, changed=changed):
                 path = self.record(["fixture command"])
                 self.update_record(path, command_pid=DEAD_PID, command_group=DEAD_PID,
                                    stop_reason="fixture stop", stop_requested_at=1.0)
                 reap_leader = MagicMock(return_value=-signal.SIGTERM)
                 child = MagicMock(spec=subprocess.Popen, pid=DEAD_PID, wait=reap_leader)
                 listing = subprocess.CompletedProcess(["ps"], 0, f"{DEAD_PID} {state}\n", stderr)
+
+                def scan_group(*_arguments: object, **_options: object) -> subprocess.CompletedProcess[str]:
+                    with path.with_suffix(".record.lock").open("a") as lock:
+                        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        if changed:
+                            self.update_record(path, command_started="another start")
+                    return listing
+
                 with (io.BytesIO() as gate,
-                      patch.object(subprocess, "run", return_value=listing),
+                      patch.object(subprocess, "run", side_effect=scan_group),
                       patch.object(process_group, "send_process_group", side_effect=PermissionError) as send,
                       patch.object(time, "monotonic", return_value=2.0)):
                     if ended:
                         self.assertEqual(wait_for_command(child, gate, path, 1, 2, lambda: True), -signal.SIGTERM)
                         reap_leader.assert_called_once_with()
+                    elif changed:
+                        with self.assertRaisesRegex(SystemExit, "the stopped command record changed"):
+                            _ = wait_for_command(child, gate, path, 1, 2, lambda: True)
+                        reap_leader.assert_not_called()
                     else:
                         with self.assertRaises(PermissionError):
                             _ = wait_for_command(child, gate, path, 1, 2, lambda: True)
@@ -1588,6 +1630,37 @@ sys.exit(status)
                 record = worker_lifecycle.read_json_object(path)
                 self.assertNotIn("stop_escalated", record)
                 self.assertEqual(record.get("stop_group_end"), "confirmed" if ended else None)
+
+    @unittest.skipUnless(sys.platform == "linux", "pidfd leader wait requires Linux")
+    def test_supervisor_gone_reaps_after_pidfd_open_fails(self) -> None:
+        started = "fixture start"
+        zombie = process_start.Zombie(started)
+        gone = process_start.Gone()
+        cases = ((OSError(errno.ENOSYS, "pidfd unavailable"), [process_start.Started(started), zombie, zombie]),
+                 (ProcessLookupError(errno.ESRCH, "leader already exited"), [gone, gone]))
+        for error, identities in cases:
+            with self.subTest(errno=error.errno):
+                path = self.record(["fixture command"])
+                self.update_record(path, command_pid=DEAD_PID, command_group=DEAD_PID, command_started=started)
+                with (patch.object(os, "setsid"),
+                      patch.object(os, "pidfd_open", side_effect=error, create=True) as open_pid,
+                      patch.object(process_start, "process_start", side_effect=identities) as read_identity,
+                      patch.object(detached_runs, "_group_is_live", side_effect=[True, False]),
+                      patch.object(detached_run_process, "supervises", return_value=False),
+                      patch.object(detached_runs, "_replay_completion", return_value=detached_runs.CompletionReplay.HANDLED),
+                      patch.object(process_group, "send_process_group") as send,
+                      patch.object(time, "sleep") as pause):
+                    self.assertEqual(detached_runs.main(["supervisor-gone", str(path)]), 0)
+                send.assert_called_once_with(DEAD_PID, signal.SIGTERM)
+                open_pid.assert_called_once_with(DEAD_PID)
+                self.assertEqual(read_identity.call_args_list, [call(DEAD_PID)] * len(identities))
+                if error.errno == errno.ENOSYS:
+                    pause.assert_called_once_with(detached_runs.STOPPED_GROUP_CHECK_SECONDS)
+                else:
+                    pause.assert_not_called()
+                record = worker_lifecycle.read_json_object(path)
+                self.assertEqual((record["status"], record.get("ended")), ("finished", "supervisor gone"))
+                self.assertEqual(record.get("stop_reason"), detached_runs.SUPERVISOR_GONE_REASON)
 
     @unittest.skipUnless(sys.platform == "linux", "pidfd leader wait requires Linux")
     def test_wait_for_leader_with_pidfd(self) -> None:

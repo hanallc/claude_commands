@@ -3131,7 +3131,7 @@ class WorkerCommandTests(unittest.TestCase):
                 record = staff.snapshot()
                 only_first = replace(record, rows=tuple(row for row in record.rows if row.id != second.row.id))
                 expected = "impl" if work in ("damaged other worker", "damaged other unit") else "impl2"
-                folder_held = work == "missing supervised record"
+                folder_held = work in ("damaged own run", "missing supervised record")
                 with (patch.object(detached_run_process, "supervisor_records", return_value=supervisors) as supervised,
                       patch.object(worker_lifecycle, "read_json_object", wraps=worker_lifecycle.read_json_object) as reads,
                       redirect_stderr(io.StringIO()) as errors):
@@ -3163,7 +3163,7 @@ class WorkerCommandTests(unittest.TestCase):
                                     self.assertEqual(selected["work"], "busy")
                                     if unknown and not scope:
                                         self.assertEqual(selected["state"], "ProcessUnknownWorker")
-                    if folder_held or work == "damaged own run":
+                    if folder_held:
                         self.assertEqual(len(errors.getvalue().splitlines()), 1)
                         self.assertIn(str(damaged), errors.getvalue())
                         supervised.return_value = {}

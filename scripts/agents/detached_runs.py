@@ -1171,6 +1171,8 @@ def _read_live_runs(paths: Sequence[Path], owns: Callable[[dict[str, object]], b
                 else:
                     found.append(cast(RunRecord, cast(object, raw)))
         except (OSError, ValueError) as error:
+            if staff_names is not None and path in supervised_paths:
+                affected = identities
             errors.append(LiveRunReadError(path, error, affected))
     return LiveRunEvidence(tuple(found), tuple(errors))
 
@@ -1859,6 +1861,7 @@ def _wait_for_command(child: subprocess.Popen[bytes], gate: IO[bytes], path: Pat
     """Escalate a stop before observing exit. Reap only after the group ends."""
     last_unstopped_check = time.monotonic()
     leader_has_exited = False
+    denied: PermissionError | None = None
     while True:
         delay = STOPPED_GROUP_CHECK_SECONDS
         with record_lock(path):
@@ -1883,16 +1886,27 @@ def _wait_for_command(child: subprocess.Popen[bytes], gate: IO[bytes], path: Pat
                             process_group.send_process_group(child.pid, signal.SIGKILL)
                         except ProcessLookupError:
                             pass
-                        except PermissionError:
-                            # Darwin can deny a signal to a group with only zombies.
-                            if _group_is_live(child.pid):
-                                raise
+                        except PermissionError as error:
+                            denied = error
                         else:
                             record["stop_escalated"] = True
                             write_text_atomic(path, json.dumps(record, indent=2, sort_keys=True))
                     break
                 delay = min(delay, remaining)
         time.sleep(delay)
+
+    if denied is not None:
+        # Darwin can deny a signal to a group with only zombies.
+        group_live = _group_is_live(child.pid)
+        with record_lock(path):
+            current = _read_record(path)
+            if (current["status"] != "running" or not _was_stopped(current)
+                    or current.get("command_pid") != child.pid or current.get("command_group") != child.pid
+                    or current.get("command_started") != record.get("command_started")):
+                _send_gate_line(gate, b"done\n")
+                raise SystemExit(f"detached_runs: {path}: the stopped command record changed")
+            if group_live and not current.get("stop_escalated"):
+                raise denied
 
     alert_at = time.monotonic() + alert_after
     alerted = False
@@ -2109,12 +2123,21 @@ def _wait_for_leader_kqueue(command: CommandGroup) -> None:
 
 
 def _wait_for_leader_pidfd(command: CommandGroup) -> None:
-    pidfd_open = cast(Callable[[int], int], getattr(os, "pidfd_open"))
-    leader = pidfd_open(command.group)
+    try:
+        pidfd_open = cast(Callable[[int], int], getattr(os, "pidfd_open"))
+        leader = pidfd_open(command.group)
+    except (AttributeError, OSError):
+        _wait_for_leader_exit(command, _retry_leader_identity)
+        return
     try:
         _wait_for_leader_exit(command, lambda timeout: bool(select.select([leader], [], [], timeout)[0]))
     finally:
         os.close(leader)
+
+
+def _retry_leader_identity(timeout: float | None) -> bool:
+    time.sleep(STOPPED_GROUP_CHECK_SECONDS if timeout is None else timeout)
+    return False
 
 
 def _wait_for_leader_exit(command: CommandGroup, wait_for_exit: Callable[[float | None], bool]) -> None:
@@ -2123,8 +2146,10 @@ def _wait_for_leader_exit(command: CommandGroup, wait_for_exit: Callable[[float 
     while True:
         identity = _saved_process(command.group, command.started)
         if isinstance(identity, process_start.Started):
-            _ = wait_for_exit(None)
-            return
+            if wait_for_exit(None):
+                return
+            deadline = time.monotonic() + LEADER_IDENTITY_TIMEOUT_SECONDS
+            continue
         if not isinstance(identity, process_start.Unreadable):
             return
         remaining = deadline - time.monotonic()
