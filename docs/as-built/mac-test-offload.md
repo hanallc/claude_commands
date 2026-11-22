@@ -26,6 +26,20 @@ The same episode can receive a Mac assignment after disk evidence recovers.
 The live step record keeps diagnostic disk evidence.
 Standalone fixed local callers retain their existing local admission path.
 
+`mac_queue_run.py --kind run` checks the Mac block before placement, before remote preparation, and before the remote command.
+The run uses the holding unit's session for the block check and the placement request.
+Workers of that unit can start a run during its block.
+A run that waits for another session's block prints one line with the holder and reason.
+The run returns any placement before it waits for the block to clear.
+The wait can lift an expired block through the Mac block expiry procedure.
+A failed CI restore keeps the block in place.
+`--no-wait` reports the block and exits with status 78.
+`mac_run.sh` exits with status 9 for a foreign block or unreadable coordination state.
+It also exits with status 9 when the queue reports that the Mac is busy or blocked.
+It retries other placement waits, including waits for host evidence, queue position, or memory.
+It prints the claim refusal or queue diagnostic and returns any placement before exit.
+Other queue runs retry a busy reply unless they use `--no-wait`.
+
 Doc uses a snapshot of the staged tree.
 After success, verify writes a doc pass record if the staged tree still matches the snapshot.
 The Mac runner uses the original repository identity and copies the snapshot from `--source-root`.
@@ -430,6 +444,8 @@ Use `mac_gate.py run <repo> <output> --module <path>` to run a named module on t
 
 An active Mac gate uses the lifecycle script that started the run.
 Its close hook stops the attempt with the script uploaded to the Mac during preparation.
+Each preparation records its own Mac attempt directory.
+A retry uses a fresh directory even if cleanup retains the previous checkout.
 When a later queue run finds an ended gate, it calls the installed natedev lifecycle script.
 The saved script name identifies the callback.
 The current callback invokes the installed Mac gate script to stop the attempt.

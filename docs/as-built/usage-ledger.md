@@ -386,17 +386,6 @@ Until that threshold, no OFF result is saved; on 2026-11-09 the director n was 8
 - **Verdict.** `Weighted usage per checkpointed phase: before …; after …; <change>` compares the whole `Before` window with the last `After` piece, with notes for different weight versions, unweighted turns left out, and the Mac's freshness (`Mac as of <time>` or `Mac never read in full`). It is the last line, after the `Sources` block from `usage_report.sources(db, UTC)`.
 - **Switches.** A switch is a change of the account holding the `workers` role (`accounts.CODEX_ROLE`) in `account_role_changes`, read by `store_switch_history(db) -> RoleSwitchHistory(start, switches)`. Readings before the stored history begins still count reading-label changes. `credits_per_day` sums each account's own decreases.
 
-### Compaction replay: `scripts/usage/compaction_replay.py`
-
-`~/.claude/scripts/lib/py -m scripts.usage.compaction_replay [--db PATH] [--since DAY] [--until DAY] [--follow-up-prompt TOKENS]` replays stored Codex threads under other compaction limits, to set `UNIT_COMPACT_ABOVE_TOKENS`. Defaults: the collector's store, follow-up prompt 11,000 tokens. `--since` and `--until` are read in the user's zone and select whole threads by their first request.
-
-- Covered: `codex` threads with a compaction and a request, every request of which has a weight entry. A thread's requests, in `(at, turn_key)` order, are cut into segments at each compaction; a request at the same instant as a compaction stays in the earlier segment.
-- `RULES`: `LimitRule` at 100,000, 150,000, 200,000 and 250,000; `NeverRule()`; `NewWorkerRule()` (limit 100,000, and a new worker when the kept size is over 90,000).
-- `fit_segments(threads) -> FittedLine(intercept, slope) | FitUnavailable(reason)`: least squares of the next segment's first size on the previous segment's last size. `FittedLine.kept` is never under 0.
-- `boundary_outcome(rule, fit, end, first_size, prompt) -> CarriedOn | Compacted | NewWorker`. A carried segment's first request costs `end` at the cached weight, the prompt, and its stored output; a compacted or new-worker one costs its start size and that output. Each later request costs its stored weighted tokens plus `max(difference, -cache_read)` at the cached weight. A thread's first segment costs what is stored under every rule.
-- Output: covered counts, the fit line, the median first-request size, the exclusion line, the rule table (`simulated compactions`, `new workers`, `weighted tokens`, `change against limit 100,000`, `requests over 272,000`), stored weighted tokens, threads left out by reason, rows of size 0 skipped, and requests held at the cache-read floor per rule. With no fit it prints `fit unavailable: <reason>` and no table, exit 0.
-- Refusals print one `compaction_replay: <reason>` line, nothing on stdout, and leave the store's bytes unchanged: exit 2 for bounds (`invalid bounds; …`) and a prompt that is negative, NaN or infinite; exit 1 for an older store, a non-database file and a missing path.
-
 ### Waste watch: `scripts/usage/waste_watch.py`
 
 `scripts/lib/py scripts/usage/waste_watch.py [--db PATH] [--production-docs DIR] [--dry-run] [--now ISO]` runs after each successful collector pass.
@@ -450,7 +439,6 @@ The hourly pass lives outside this repository, in `/etc/nixos/modules/linux/usag
 | `scripts/usage/outcomes.py` | Checkpoints and their mapping, readings, baseline readings, account role changes; `default_sources`, `repositories` |
 | `scripts/usage/weights.py` | `MODEL_WEIGHTS`, `weights_at`, `sql_weights`, `register` |
 | `scripts/usage/usage_report.py` | Metric, dimension and outcome registries; `open_read_store`, `check_store_version`, `sources` |
-| `scripts/usage/compaction_replay.py` | Compaction-limit replay |
 | `scripts/whoami/worker_usage.py` | Codex before/after worker readout over the store |
 | `scripts/lib/user_zone.py`, `config/user_zone.conf` | The zone report bounds and times are read in |
 | `scripts/direct/prepare_session.sh`, `scripts/direct/claude_worker.py`, `scripts/production/update_registration.py`, `scripts/direct/review.sh` | Role writers |
@@ -573,12 +561,14 @@ The shared `modules/common/transcript-retention.nix` in the nixos repo schedules
 
 `scripts/lib/transcripts.py` owns the seekable binary reader for both forms.
 Decompression uses zstd and temporary disk storage rather than holding the transcript in memory.
-Usage collection, context economy, screenshot reports, model study, reply review, nightly review, Codex pacing, inventory, and build-launch collection use it.
+Usage collection, context economy, and screenshot reports use it.
+Reply review, nightly review, and Codex pacing use it.
+Inventory and build-launch collection also use it.
 The folder audit uses it for transcript discovery, creation commands, and session start times.
 The screenshot report sends the same reader source to the Mac.
 The hana_shot report reads timing records rather than transcripts and needs no change.
 `usage/rollouts.py` already parses supplied streams and needs no reader change.
-Model-study reports, usage outcomes, and screenshot episode reports read saved measurements and need no transcript change.
+Usage outcomes and screenshot episode reports read saved measurements.
 Active hooks, `production/worker_admission.py`, and worker lifecycle readers retain plain reads.
 Recent worker transcripts stay plain through the age rule.
 `message/sessions.py` and `message/rca.py` locate active sessions and do not parse historical transcripts.
