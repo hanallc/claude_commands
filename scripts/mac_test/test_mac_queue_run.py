@@ -306,6 +306,64 @@ if sys.argv[1] == "prepare":
                     restore.assert_not_called()
                     hold.assert_called_once()
 
+    def test_two_waiters_keep_waiting_after_one_failed_ci_restore(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            environment = {**queue_fixture(root), "CLAUDE_CODE_SESSION_ID": "first-waiter"}
+            block = Path(environment["MAC_TEST_STATE_DIR"]) / "block.json"
+            block.parent.mkdir()
+            self.write_block(block, expired=True, ci="off_by_this_block")
+            _ = write_config_fixture(root / "config/mac_test.conf", "ci_repo=fixture/project\n")
+            args = self.command(root, "run")[3:]
+            first_waits = second_waits = 0
+            second_output = io.StringIO()
+            restores = [mac_test.GhFailure("fixture CI error"), mac_test.GhAnswer("")]
+
+            def check_wait() -> None:
+                self.assertTrue(block.is_file())
+                self.assertFalse((root / "events").exists())
+                restore.assert_called_once()
+
+            def wait_second() -> None:
+                nonlocal second_waits
+                second_waits += 1
+                check_wait()
+                if second_waits == 2:
+                    unblock = mac_test.CliArguments()
+                    unblock.holder = "fixture-holder"
+                    with redirect_stdout(io.StringIO()):
+                        self.assertEqual(mac_test.command_unblock(
+                            unblock, mac_test.state_paths(), mac_test.read_config()), 0)
+
+            def wait_first() -> None:
+                nonlocal first_waits
+                first_waits += 1
+                check_wait()
+                if first_waits == 2:
+                    with (mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "second-waiter"}),
+                          mock.patch.object(mac_queue_run, "wait_to_retry", side_effect=wait_second),
+                          redirect_stdout(second_output)):
+                        self.assertEqual(mac_queue_run.main(args), 0)
+
+            with (mock.patch.dict(os.environ, environment, clear=True),
+                  mock.patch.object(mac_test, "switch_ci_back", side_effect=restores) as restore,
+                  mock.patch.object(mac_test, "send_to_block_recipients") as send,
+                  mock.patch.object(mac_test, "record_hold_event"),
+                  mock.patch.object(mac_test, "skipped_ci_runs", return_value=""),
+                  mock.patch.object(mac_queue_run, "wait_to_retry", side_effect=wait_first),
+                  redirect_stdout(io.StringIO()) as first_output):
+                self.assertEqual(mac_queue_run.main(args), 0)
+            self.assertEqual((first_waits, second_waits), (2, 2))
+            self.assertEqual(restore.call_count, 2)
+            send.assert_called_once()
+            self.assertFalse(block.exists())
+            self.assertFalse((block.parent / "block-lift-failure.json").exists())
+            for output in (first_output, second_output):
+                self.assertEqual(output.getvalue().splitlines(), [
+                    "Waiting for the Mac block held by fixture-holder: fixture work needs the Mac",
+                    "Mac output", "mac_exit=0",
+                ])
+
     def test_installed_run_refuses_a_mac_state_override_before_placement(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
