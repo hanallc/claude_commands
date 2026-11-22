@@ -517,13 +517,17 @@ def finish_step(path: Path, status: int, reason: str = "", *,
     if not isinstance(prerequisite, KeepPlacementPrerequisite):
         _ = report_prerequisite(wire.PrerequisiteReport(uuid.uuid4().hex,
             reply.assignment.episode, reply.assignment.owner, prerequisite))
-    _ = release(reply.grant.reservation, status, reply.grant.cleanup_timing)
+    if not reason:
+        _ = release(reply.grant.reservation, status, reply.grant.cleanup_timing)
     result = report_execution(wire.ExecutionReport(uuid.uuid4().hex, reply.assignment, placement.NoProviderClaim(),
         execution_identity.ExecutionNotStarted() if reason else execution_identity.ExecutionEvidenceUnavailable("the local command has ended", CLOCK.now()),
         placement.PrelaunchRefused(reason) if reason else placement.AttemptCompleted(status),
         placement.DispatchPathSettled()))
     if result.assignment != reply.assignment or result.state != placement.ClosedAssignment(reason or "completed"):
         raise wire.AdmissionUnavailable("the service did not confirm the end of the local attempt")
+    if reason:
+        # An older service can close the attempt without releasing its grant.
+        _ = release(reply.grant.reservation, status, reply.grant.cleanup_timing)
     return result
 
 

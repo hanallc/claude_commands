@@ -1316,18 +1316,19 @@ A value of zero holds new runs on that machine.
 `max_runs.natedev.cargo-liner` permits one cargo-liner Verify run at a time on natedev.
 Verify asks for placement first and takes no slot before it.
 A Verify run takes its natedev repository slot with its first local memory grant, in the same admission decision.
-The slot belongs to the outer Verify process and ends when that process exits, so the run keeps its place between steps.
+The slot belongs to the outer Verify process.
+If the caller returns all local grants before any step starts, the service releases the slot.
+After a local step starts, the run keeps its place between steps until the outer Verify process exits.
 Later local steps of the run reuse the slot.
 A child Verify uses a live ancestor Verify's slot for the same repository.
 The service verifies each process in that chain by PID, start time, and parent PID.
 A run that only waits, a run placed on the Mac or AWS, and the exempt unit take no natedev slot.
 A run that waits only for its repository limit holds back no step of another repository.
-A Mac step counts against `max_runs.mac.<repository>` when that key exists; no such key exists today.
 The service saves slots with their local grant and restores the owner watches after restart.
 Local `gate` and `test-affected` runs count while they hold a reservation.
 `max_runs.natedev.claude_commands` permits two concurrent runs and applies this rule to the repository's `gate` and `test-affected` steps.
 The admission service uses the Git repository name when a gate profile supplies an absolute path.
-The unit in `max_runs.exempt_unit` can start above the limit. Its runs use slots.
+The unit in `max_runs.exempt_unit` can start above the limit. Its gate reservations count toward the limit.
 The Builds page shows the count, limit, repository, and machine for a run-limit wait, and each machine the run can use.
 The snapshot codec writes the gate wait as `BehindHead` with a `_run_limit` field, and current readers restore it.
 An existing CI reservation continues when the enforcer cannot stop its account.

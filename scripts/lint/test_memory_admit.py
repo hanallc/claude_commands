@@ -6311,6 +6311,13 @@ class QueueExplanationTests(MemoryQueueFixture):
                          admission_records.RunLimitWait(2, 2, "hana", "natedev"))
         self.assertIsInstance(peer.admission, gate.ProposedAdmission)
 
+        path, waiter = inputs.ordered[1]
+        oversized = replace(inputs, ordered=[inputs.ordered[0], (path, {**waiter, "need": 70 * GIB})])
+        capped, peer = gate.admission_pass(oversized, oversized.now, policy).rows
+        self.assertEqual(capped.decision.run_limit, admission_records.RunLimitWait(2, 2, "hana", "natedev"))
+        self.assertIsInstance(peer.admission, gate.ProposedAdmission)
+        self.assertIsInstance(peer.decision.room.basis, admission_records.StartsAlone)
+
     def test_pass_is_pure_and_ignores_reader_environment_and_clock(self) -> None:
         _ = self.waiting(300, 4 * GIB, 1)
         _ = self.waiting(400, 5 * GIB, 0)
