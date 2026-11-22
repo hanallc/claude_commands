@@ -204,15 +204,27 @@ class RemoteEntryTests(unittest.TestCase):
         if not isinstance(start, process_identity.Started):
             self.fail("The test process has no start identity")
         paths.claims.mkdir(parents=True)
-        _ = (paths.claims / "repository.json").write_text(json.dumps({
+        record = {
             "claim_id": "live-copy-claim", "episode": "copy-episode", "attempt": "copy-attempt",
             "submitting_session": "",
             "pid": os.getpid(), "proc_start": start.start, "what": "tests", "worktree": str(self.source),
             "since": "2026-11-05T12:00:00+00:00", "repo_name": "repository", "repo_key": "",
-        }))
-        with self.assertRaisesRegex(copies.CopyError, "busy"):
-            copies.remove_trees("alpha")
-        self.assertTrue(self.mirror.exists())
+        }
+        key = "https://fixture.invalid/team/repository"
+        stem = claim_state.mac_claim_stem(key, 0)
+        identity = claim_state.CleanupOnlyMacRepository(key, "repository", f"{stem}.json", stem)
+        for name, fields in (
+            ("repository.json", record),
+            (identity.claim_file, {**record, "repo_name": "alias", "repo_key": key,
+                                  "mac_repository": identity.record()}),
+        ):
+            with self.subTest(claim_file=name):
+                path = paths.claims / name
+                _ = path.write_text(json.dumps(fields))
+                with self.assertRaisesRegex(copies.CopyError, "busy"):
+                    copies.remove_trees("alpha")
+                self.assertTrue(self.mirror.exists())
+                path.unlink()
 
     def test_configured_symlink_parent_permits_copy_and_removal(self) -> None:
         actual = self.root / "actual"
@@ -822,9 +834,9 @@ with (mock.patch.object(linux_runner, 'prepare_shell', return_value=linux_runner
             args.pid, args.worktree, args.what, args.target = os.getpid(), str(self.source), "reserved", "linux"
             paths = mac_test.state_paths("linux")
             scope = mac_test.RepositoryScope("repository", "key")
-            with mac_test.locked(paths.lock), redirect_stdout(io.StringIO()):
+            with mac_test.locked(paths.lock):
                 first = mac_test.claim_once(args, paths, scope, session=NoOwningSession(), reserve_wait=True)
-            self.assertEqual(first, mac_test.ClaimFinished(0))
+            self.assertEqual(first, mac_test.ClaimFinished(0, ("claimed", "slot: 1")))
             reservation, = mac_test.read_claims(paths)
             request = replace(request, admission=offload.MacClaimFromWait(
                 os.getpid(), claim_state.claim_identity(reservation.record), NoOwningSession()))
