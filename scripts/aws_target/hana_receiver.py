@@ -133,7 +133,7 @@ class GuestCommandSupervisor:
                        arguments[0], '--quiet', '--pipe', '--property=ExitType=main',
                        f'--property=EnvironmentFile={RUNNER_ENVIRONMENT}',
                        f'--property=RuntimeMaxSec={self.settings.command_timeout_s:g}',
-                       f'--property=TemporaryFileSystem={hana_payload.PAYLOAD_MOUNT}:'
+                       f'--property=TemporaryFileSystem={hana_payload.payload_mount(guest.RUNNER_HOME)}:'
                        + f'mode=1777,nodev,nosuid,size={self.settings.source_max_bytes}',
                        f'--property=TimeoutStopSec={self.timeout_s}',
                        '--unit=' + command_unit(directory),

@@ -111,7 +111,8 @@ class HanaReceiverSettingsTests(unittest.TestCase):
             self.assertIn('--property=ExitType=main', arguments)
             self.assertNotIn('--property=ExitType=cgroup', arguments)
             self.assertIn('--uid=hana-runner', arguments)
-            self.assertIn('--property=TemporaryFileSystem=/run/hana-payload:mode=1777,nodev,nosuid,size=1048576', arguments)
+            self.assertIn('--property=TemporaryFileSystem=/var/lib/hana/runner/rust/hana/.git/hana-payload:'
+                          + 'mode=1777,nodev,nosuid,size=1048576', arguments)
             self.assertEqual(arguments[arguments.index('--') + 1:],
                              [*hana_receiver.BOOTSTRAP_COMMAND, '1048576', '120', '23'])
             self.assertEqual(json.loads((directory / 'input').read_bytes()),
@@ -186,6 +187,7 @@ import sys
 args = dict(zip(sys.argv[1::2], sys.argv[2::2], strict=True))
 source = os.pread(int(args['--bundle-fd']), int(args['--bundle-size']), int(args['--bundle-offset']))
 assert source == b'fixture source bundle'
+assert Path(__file__).is_relative_to(Path.home() / 'rust/hana/.git/hana-payload')
 assert sys.stdin.buffer.read() == Path(os.environ['FIXTURE_INPUT']).read_bytes()
 policy = (Path(os.environ['CONF_DIR']) / 'build_folders.conf').read_text()
 assert 'roots.build=/fixture/build' in policy
@@ -219,7 +221,7 @@ print(args['--command-timeout-s'])
                     if label in ('archive failed', 'wrong digest'):
                         payload = b'not a tar archive'
                     request = request_for(b'different archive' if label == 'wrong digest' else payload)
-                    command, content, env = bootstrap_fixture(root, root, payload, request)
+                    command, content, env = bootstrap_fixture(root, payload, request)
                     if label == 'download failed':
                         (root / 'payload.tar').unlink()
                     completed = subprocess.run(command, input=content, capture_output=True, timeout=10,
@@ -251,8 +253,8 @@ print(args['--command-timeout-s'])
             self.skipTest('A Linux systemd user manager is required')
         with tempfile.TemporaryDirectory() as temporary, socket.socket(socket.AF_UNIX) as listener:
             root = Path(temporary)
-            mount = root / 'payload'
-            mount.mkdir()
+            home = root / 'home'
+            mount = hana_payload.payload_mount(home)
             write_policy(root / 'policy.conf', root / 'slots')
             address = root / 'ready.sock'
             listener.bind(str(address))
@@ -270,7 +272,7 @@ with socket.socket(socket.AF_UNIX) as connection:
                 ('runtime/runner.py', runner, tarfile.REGTYPE),
                 ('runtime/abi', f'{hana_protocol.RUNTIME_ABI}\n'.encode(), tarfile.REGTYPE),
                 ('runtime/config/build_folders.conf', b'patterns.slot=fixture\n', tarfile.REGTYPE))
-            bootstrap, _, _ = bootstrap_fixture(root, mount, payload, request_for(payload))
+            bootstrap, _, _ = bootstrap_fixture(root, payload, request_for(payload))
             launch = ['systemd-run', '--user', '--wait', '--collect', '--property=PrivateUsers=yes',
                       '--property=KillSignal=SIGKILL',
                       f'--setenv=PATH={root}:{os.environ["PATH"]}',
@@ -285,8 +287,8 @@ with socket.socket(socket.AF_UNIX) as connection:
             bash = shutil.which('bash')
             assert bash is not None
             environment_path = root / 'environment'
-            environment_path.touch()
-            with (mock.patch.object(hana_payload, 'PAYLOAD_MOUNT', mount),
+            _ = environment_path.write_text(f'HOME={home}\n')
+            with (mock.patch.object(hana_guest, 'RUNNER_HOME', home),
                   mock.patch.object(hana_receiver, 'RUNNER_ENVIRONMENT', environment_path),
                   mock.patch.object(hana_receiver, 'CAPTURE_COMMAND', (bash, *hana_receiver.CAPTURE_COMMAND[1:]))):
                 refusal = supervisor.start_source_update(request_for(payload), command_dir, launch)
@@ -309,7 +311,7 @@ def write_policy(path: Path, build_root: Path) -> None:
         + '# range: 0..\nlocks.probe_wait_seconds=0\n# range: 0..\nlocks.probe_retry_seconds=0.005\n')
 
 
-def bootstrap_fixture(root: Path, mount: Path, payload: bytes, request: hana_protocol.HanaExecutionRequest,
+def bootstrap_fixture(root: Path, payload: bytes, request: hana_protocol.HanaExecutionRequest,
                       *, action: str = 'execute') -> tuple[list[str], bytes, dict[str, str]]:
     _ = (root / 'payload.tar').write_bytes(payload)
     curl = root / 'curl'
@@ -319,18 +321,19 @@ def bootstrap_fixture(root: Path, mount: Path, payload: bytes, request: hana_pro
     content = hana_protocol.encode_document({'action': action, 'output_max_bytes': 32,
                                              'request': hana_protocol.request_fields(request)})
     _ = (root / 'input').write_bytes(content)
+    home = root / 'home'
+    hana_payload.payload_mount(home).mkdir(parents=True, exist_ok=True)
     command = [sys.executable, '-c', '''
 from pathlib import Path
 import sys
-sys.path.insert(0, sys.argv[3])
+sys.path.insert(0, sys.argv[2])
 from scripts.aws_target import hana_payload
 
 root = Path(sys.argv[1])
 hana_payload.IMAGE_SLOT_POLICY = root / 'policy.conf'
-hana_payload.PAYLOAD_MOUNT = Path(sys.argv[2])
 raise SystemExit(hana_payload.main(1048576, 7, 23.5))
-''', str(root), str(mount), str(Path(__file__).resolve().parents[2])]
-    env = {**os.environ, 'HOME': str(root / 'home'), 'PATH': str(root) + ':' + os.environ['PATH'],
+''', str(root), str(Path(__file__).resolve().parents[2])]
+    env = {**os.environ, 'HOME': str(home), 'PATH': str(root) + ':' + os.environ['PATH'],
            'FIXTURE_INPUT': str(root / 'input'),
            'FIXTURE_ARCHIVE': str(root / 'payload.tar')}
     return command, content, env

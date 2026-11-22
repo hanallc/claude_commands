@@ -11,10 +11,13 @@ The build root is `/build` on natedev and `~/build` on the Mac and the Hana AWS 
 | Worktree | `~/worktrees/<repo>/<unit>/<short-name>` | `target` links to the worktree output. |
 | Worktree output | `/build/<repo>/<unit>/<short-name>` | The folder holds intermediate and final output. |
 | Numbered copy | `/build/<repo>/<unit>/<number>` | The copy holds the fixed source and a real `target` folder. |
-| Main output | `/build/<repo>/main` | `target` in the main checkout links here. |
+| Main output | `/build/<repo>/main` | Local main checkouts link `target` here. The Hana guest creates no main checkout `target` link. |
 | CI | `/build/<repo>/ci/<number>` | Each number has a runner folder that also holds the runner's home. |
 
 The main checkouts stay at `~/rust/<repo>` and `~/.claude`. The repo word is the last part of the Git origin path without the `.git` suffix. The local alias for `claude_commands` is `claude`. The path has no showrunner component.
+
+The Hana guest stores its shell cache under `<build root>/hana/main/shells`.
+Each numbered copy uses its own real `target` directory.
 
 The unit word names the unit. Use a unit word for only one active unit. A new unit can reuse a retired unit's word. The folder rules reserve `main` and `ci`.
 

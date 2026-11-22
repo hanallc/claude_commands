@@ -20,10 +20,14 @@ from scripts.aws_target import hana_protocol
 
 
 IMAGE_SLOT_POLICY = Path('/var/lib/hana-runtime/config/build_folders.conf')
-PAYLOAD_MOUNT = Path('/run/hana-payload')
 BUILD_ROOT_KEY = 'roots.build'
 PROBE_WAIT_KEY = 'locks.probe_wait_seconds'
 PROBE_RETRY_KEY = 'locks.probe_retry_seconds'
+
+
+def payload_mount(home: Path) -> Path:
+    """Locate the command unit's runtime mount in the main checkout."""
+    return hana_protocol.main_checkout(home) / '.git' / 'hana-payload'
 
 
 @dataclass(frozen=True)
@@ -164,10 +168,10 @@ def main(max_bytes: int, download_timeout_s: int, command_timeout_s: float) -> i
         action = selected
         request = hana_protocol.decode_request(json.dumps(fields['request']).encode())
         policy = read_slot_policy(IMAGE_SLOT_POLICY)
-        checkout = hana_protocol.main_checkout(Path.home())
-        checkout.mkdir(parents=True, exist_ok=True)
+        home = Path.home()
+        checkout = hana_protocol.main_checkout(home)
         with (tempfile.TemporaryFile(dir=checkout) as archive,
-              tempfile.TemporaryDirectory(dir=PAYLOAD_MOUNT) as workspace,
+              tempfile.TemporaryDirectory(dir=payload_mount(home)) as workspace,
               os.fdopen(os.dup(sys.stdout.fileno()), 'wb') as report_start):
             download_payload(request.manifest.bundle_url, archive, max_bytes, download_timeout_s)
             runtime = Path(workspace) / 'runtime'
@@ -179,7 +183,7 @@ def main(max_bytes: int, download_timeout_s: int, command_timeout_s: float) -> i
                 '--bundle-fd', str(archive.fileno()), '--bundle-offset', str(bundle.offset),
                 '--bundle-size', str(bundle.size), '--command-timeout-s', str(command_timeout_s),
                 '--build-start-fd', str(start_fd)],
-                input=content, env={**os.environ, 'CONF_DIR': str(configuration)},
+                input=content, env={**os.environ, 'CONF_DIR': str(configuration), 'TMPDIR': workspace},
                 pass_fds=(archive.fileno(), start_fd), check=False)
             if result.returncode == 0:
                 return 0

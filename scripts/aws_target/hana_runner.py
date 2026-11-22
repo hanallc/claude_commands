@@ -76,9 +76,7 @@ def materialize_and_run(request: hana_protocol.HanaExecutionRequest, verified_bu
                 return hana_protocol.HanaExecutionRefused('MissingBasis: ' + json.dumps(
                     {'repository': leased.repository, 'commits': leased.commits}, separators=(',', ':')))
             execution = linux_runner.LeasedSlotExecution(leased.copy, leased.descriptors)
-            output = build_folders.main_output_path(leased.copy.repository)
-            with build_folders.leased_build_folder(build_folders.StableOwnerFolder(
-                    output.name, build_folders.ExplicitBuildParent(output.parent), mode=0o700)) as main:
+            with build_folders.leased_build_folder(build_folders.MainOutput(leased.copy.repository)) as main:
                 build_folders.mark_folder_use(main)
                 shell = linux_runner.prepare_shell(leased.path, main / 'shells', settings.shell, settings.shell_timeout_s,
                     pass_fds=linux_runner.execution_descriptors())

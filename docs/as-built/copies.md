@@ -20,8 +20,11 @@ A run can still wait for normal build admission.
 The AWS gate uses its separate slot path.
 
 The Hana AWS guest uses its main checkout at `~/rust/hana` for bundle fetches.
-The sender stages the bundle in the source repository's common Git directory.
-The guest stages the payload inside the main checkout and the bundle inside its Git directory.
+The sender accepts the main checkout or a model worktree linked to it.
+The sender stages the capture index, Git bundle, and archive in the main checkout's Git directory.
+The guest downloads the archive inside the main checkout.
+The guest stages the runtime in a per-command mount at `~/rust/hana/.git/hana-payload`.
+The guest stages the verified bundle inside the main checkout's Git directory.
 The runner takes the assigned copy number under `~/build/hana/aws-hana`.
 The receiver probes that numbered copy's lock before it reports lease release.
 The shell cache lives at `~/build/hana/main/shells`.

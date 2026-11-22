@@ -147,7 +147,6 @@ class HanaRunnerTests(unittest.TestCase):
         self.binaries = self.root / 'bin'
         self.binaries.mkdir()
         home = self.root / 'home'
-        home.mkdir()
         self.enterContext(mock.patch.dict(os.environ, {'HOME': str(home),
             'RUSTUP_HOME': str(home / '.rustup'), 'CARGO_HOME': str(home / '.cargo'),
             'PATH': str(self.binaries) + os.pathsep + os.environ['PATH']}))
@@ -196,6 +195,7 @@ class HanaRunnerTests(unittest.TestCase):
             paths=self.paths, clock=lambda: 1000, uptime=lambda: 10)
 
     def test_exact_command_keeps_cargo_environment_and_compiler_failure_result(self) -> None:
+        override_fixture_settings(self.fixture.pool_settings, 'patterns.legacy-stable=other-{purpose}\n')
         with tempfile.TemporaryFile() as marker:
             outcome = self.run_request(self.request, build_start_fd=marker.fileno())
             _ = marker.seek(0)
@@ -507,7 +507,7 @@ with mock.patch('socket.gethostname', return_value='aws-hana'):
               for name in ('build_folders.conf', 'hana_aws.conf', 'copies.conf')),
         )
         request = replace(self.request, manifest=replace(self.manifest, bundle_sha256=hashlib.sha256(payload).hexdigest()))
-        bootstrap, content, env = receiver_tests.bootstrap_fixture(bootstrap_root, bootstrap_root, payload, request,
+        bootstrap, content, env = receiver_tests.bootstrap_fixture(bootstrap_root, payload, request,
                                                                   action='source-update')
         result = subprocess.run(bootstrap, input=content, capture_output=True, timeout=TEST_HANG_GUARD_SECS,
                                 check=False, env=env)

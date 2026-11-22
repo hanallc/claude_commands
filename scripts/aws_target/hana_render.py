@@ -32,7 +32,7 @@ IMAGE_SETTINGS = {
     'build_folders': COPY_POLICY_KEYS,
 }
 IMAGE_FILE_LIST = Path('scripts/aws_target/hana_image.files')
-RUNTIME_FILE_LIST = Path('scripts/aws_target/hana_render.files')
+RUNTIME_FILE_LIST = Path('scripts/aws_target/hana_runtime.files')
 RUNNER_ENTRY = Path('scripts/aws_target/hana_runner_entry.py')
 
 
@@ -179,7 +179,7 @@ def guest_files(checkout: Path, configuration: Path | conf.ConfigRead, device: P
     root_setting = slot_config[hana_payload.BUILD_ROOT_KEY]
     root = Path(root_setting.value)
     if root_setting.value.startswith('~/'):
-        root = hana_guest.DATA / 'runner' / root.relative_to('~')
+        root = hana_guest.RUNNER_HOME / root.relative_to('~')
     if not root.is_absolute() or '..' in root.parts:
         raise ValueError(f'{folders}: The Hana build root must resolve to an absolute path.')
     slot_config[hana_payload.BUILD_ROOT_KEY] = replace(root_setting, value=str(root))

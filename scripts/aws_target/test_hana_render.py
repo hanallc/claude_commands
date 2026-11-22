@@ -23,17 +23,9 @@ from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 ROOT = Path(__file__).resolve().parents[2]
-RUNTIME_LIST = ROOT / 'scripts/aws_target/hana_render.files'
+RUNTIME_LIST = ROOT / hana_render.RUNTIME_FILE_LIST
 IMAGE_LIST = ROOT / 'scripts/aws_target/hana_image.files'
-IMAGE_INPUTS = (
-    'config/hana_aws.conf',
-    'config/build_targets.conf',
-    'config/build_folders.conf',
-    'scripts/aws_target/hana_image.files',
-    'scripts/aws_target/hana_render.py',
-    'scripts/lib/conf.py',
-    'scripts/lib/conf_reads.py',
-)
+RENDER_LIST = ROOT / 'scripts/aws_target/hana_render.files'
 
 # The guest does not ship these imports for host operations, tests, and type annotations.
 UNSHIPPED_IMPORTS = {
@@ -81,15 +73,16 @@ class HanaRenderTests(unittest.TestCase):
             checkout = Path(temporary) / 'checkout'
             runtime_entries = RUNTIME_LIST.read_text().splitlines()
             image_entries = IMAGE_LIST.read_text().splitlines()
+            render_entries = RENDER_LIST.read_text().splitlines()
             image_inputs = checkout / 'image-inputs'
-            for entries in (runtime_entries, image_entries):
+            for entries in (runtime_entries, image_entries, render_entries):
                 self.assertEqual(len(entries), len(set(entries)))
                 for entry in entries:
                     with self.subTest(entry=entry):
                         relative = Path(entry)
                         self.assertFalse(relative.is_absolute())
                         self.assertNotIn('..', relative.parts)
-            for root, entries in ((image_inputs, (*image_entries, *IMAGE_INPUTS)),
+            for root, entries in ((image_inputs, render_entries),
                                   (checkout, (*runtime_entries, 'config/copies.conf'))):
                 for entry in entries:
                     destination = root / entry

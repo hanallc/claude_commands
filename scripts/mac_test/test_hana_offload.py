@@ -673,8 +673,10 @@ route_test
                 self.assertEqual((result.word, result.reason), ('hana_command_admission_refused', reason))
 
     def checkout_with_ignored_path(self) -> Path:
-        checkout = self.root / 'checkout'
-        checkout.mkdir()
+        home = self.root / 'home'
+        self.enterContext(mock.patch.dict(os.environ, {'HOME': str(home)}))
+        checkout = hana_protocol.main_checkout(home)
+        checkout.mkdir(parents=True)
         _ = copies.git(checkout, 'init', '--quiet')
         _ = (checkout / '.gitignore').write_text('refused.rs\n')
         return checkout

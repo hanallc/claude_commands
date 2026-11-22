@@ -212,21 +212,22 @@ NixOS supplies `hana-tools.service`, the runner environment, the compiler versio
 The NixOS build runs the renderer from its pinned `claude-commands` input.
 The NixOS image requires these integration changes.
 
-1. Update the `claude-commands` pin to include the per-run runtime change.
-2. Include the paths listed in `scripts/aws_target/hana_image.files` and these seven files in the renderer input filter.
-   - `config/build_folders.conf`
-   - `config/build_targets.conf`
-   - `config/hana_aws.conf`
-   - `scripts/aws_target/hana_image.files`
-   - `scripts/aws_target/hana_render.py`
-   - `scripts/lib/conf.py`
-   - `scripts/lib/conf_reads.py`
+1. Update the `claude-commands` pin to include runtime ABI 2 and the Hana folder changes.
+2. Use `scripts/aws_target/hana_render.files` as the renderer input filter.
 3. Install the rendered `runtime/` at `/var/lib/hana-runtime`.
-4. Append the approved roots and capacity to the rendered `runtime/config/build_folders.conf`.
-5. Put the approved `# whole:` limit directly above each capacity setting.
-6. Give the bootstrap write access to `/var/lib/hana/tmp`.
-7. Provide Python 3.13 or newer for the bootstrap.
-8. Remove `CONF_DIR` from `runner-environment`.
+4. Append the approved capacity block below to the rendered `runtime/config/build_folders.conf`.
+5. Create `~/rust/hana/.git/hana-payload` with the runner's ownership after the data mount.
+6. Give the runner write access to `~/rust/hana` and the rendered build root, normally `~/build`.
+7. Remove the old slot, Cargo, mirror, shell, and temporary root settings and directory creation.
+8. Provide Python 3.13 or newer for the bootstrap.
+9. Remove `CONF_DIR` and `TMPDIR` from `runner-environment`.
+
+```ini
+# whole: 1..
+slots.aws-hana.hana.max=1
+# whole: 1..
+slots.aws-hana.hana.max_bytes=137438953472
+```
 
 Root and the bootstrap read the installed `build_folders.conf`.
 User data supplies the boot descriptor and signed control access.
@@ -1619,6 +1620,8 @@ The image sets the maximum file size and `source_download_timeout_s` (120 second
 `hana_source.materialize` verifies Git prerequisites, checks the advertised commit, and fetches verified objects.
 The guest retains its main checkout at `~/rust/hana` on the data disk.
 The bootstrap downloads the payload inside the main checkout.
+The bootstrap extracts the runtime under `~/rust/hana/.git/hana-payload`.
+Systemd mounts that path as a bounded filesystem for each command.
 The runner stages the verified bundle in the main checkout's Git directory.
 `build_slots.take_copy` takes the assigned number under `~/build/hana/aws-hana`.
 The maker rescues source edits before reset and retains Cargo output within the configured size limit.
@@ -1627,7 +1630,7 @@ The shell cache lives at `~/build/hana/main/shells`.
 
 The guest must use host name `aws-hana`.
 The image selects `roots.build` for the guest and expands `~/` against the runner's home.
-Admission requires `slots.aws-hana.hana.max` and `slots.aws-hana.hana.max_bytes`.
+Admission requires a `# whole:` limit above each of `slots.aws-hana.hana.max` and `slots.aws-hana.hana.max_bytes`.
 The image supplies these values and includes Git, curl, and Python.
 The per-run runtime supplies the source, copy maker, rescue, and configuration modules.
 The runner retains the numbered copy lock through command execution.
@@ -1685,7 +1688,7 @@ An interrupt during completion reporting can change the exit status, so the call
 ## Hana runtime per run
 
 The sender packages its runner files and the full or delta Git bundle in one uncompressed archive.
-`scripts/aws_target/hana_render.files` lists the Python files for the run.
+`scripts/aws_target/hana_runtime.files` lists the Python files for the run.
 The archive also holds the runner entry point, resolved config, and the runtime ABI marker.
 The existing conditional PUT sends the archive once.
 The signed GET and SHA-256 cover the entire archive.
@@ -1701,6 +1704,7 @@ The image bootstrap verifies the payload and its ABI inside the unprivileged com
 It gives the runner the verified local Git bundle.
 The runner reads the per-run shell, disk floor, Git timeout, environment rules, and maker settings.
 The bootstrap applies the image's approved roots, slot capacity, and probe timing.
+It uses the command's runtime workspace for `TMPDIR`.
 The runner uses the image's command timeout.
 The runner sends the reason for an expected refusal.
 If an exception escapes the runner, the entry point sends a refusal that names the exception class.
