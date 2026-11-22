@@ -1126,10 +1126,10 @@ raise SystemExit(99)
         executable.chmod(0o755)
     cargo = str(root / "target")
     return {**environment, "TMPDIR": str(root), "PYTHONDONTWRITEBYTECODE": "1",
-            GATE_MODULE_TEMP_DIR: str(root),
             "CARGO_TARGET_DIR": cargo, "CARGO_BUILD_BUILD_DIR": cargo,
             "HERDR_BIN": TEST_HERDR_BIN,
             "STAFF_FILE": str(root / "staff.json"),
+            GATE_MODULE_TEMP_DIR: str(root),
             "HERDR_PANE_RECORD_DIR": str(root / "herdr-panes"),
             "BUILDLOG_DIR": str(buildlog),
             session_folder.ROOT_ENV: str(root / "session"),
