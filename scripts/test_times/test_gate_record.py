@@ -561,9 +561,11 @@ class GateRecordTests(unittest.TestCase):
 
         latest_path = gate_record.latest_module_reads_path(store.host_name())
         previous = latest_path.read_bytes()
-        self.assertEqual(gate_record.read_latest_module_reads(), {
-            "scripts/scripts/test_example.py": gate_record.module_read_record(["limits"], [], ["docs/guide.md"]),
-        })
+        module_path = "scripts/scripts/test_example.py"
+        self.assertEqual(gate_record.read_latest_module_reads(), gate_record.ModuleReadHistory(
+            {module_path: gate_record.module_read_record(["limits"], [], ["docs/guide.md"])},
+            {field: frozenset({module_path}) for field in gate_record.READ_FIELDS},
+        ))
         run["started_at"] = "2030-01-01"
         run["modules"][0].update(config_reads=["ignored"], folder_scans=["/"], content_reads=[])
         for selection, aborted in (("full", True), ("affected", False)):

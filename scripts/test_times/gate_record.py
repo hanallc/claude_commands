@@ -301,8 +301,20 @@ def latest_module_reads_path(host: str) -> Path:
     return store.root() / host / LATEST_MODULE_READS_NAME
 
 
-def read_latest_module_reads() -> dict[str, ModuleReadRecord] | LocalModuleReadsUnavailable:
-    """Combine the local snapshot with snapshots from peers."""
+@dataclass(frozen=True)
+class ModuleReadHistory:
+    """Keep positive evidence from all hosts and coverage from the newest snapshots."""
+
+    positive_reads: dict[str, ModuleReadRecord]
+    known_modules: dict[ReadField, frozenset[str]]
+
+
+def _snapshot_order(snapshot: GateReadSnapshot) -> tuple[str, str]:
+    return snapshot["started_at"], snapshot["run_id"]
+
+
+def read_latest_module_reads() -> ModuleReadHistory | LocalModuleReadsUnavailable:
+    """Combine positive reads and use the newest snapshot for coverage."""
     local_path = latest_module_reads_path(store.host_name())
     try:
         local = _read_snapshots(local_path)
@@ -311,16 +323,22 @@ def read_latest_module_reads() -> dict[str, ModuleReadRecord] | LocalModuleReads
     if not local:
         return LocalModuleReadsUnavailable()
 
+    newest = local.copy()
     reads_by_module: dict[str, dict[ReadField, list[str]]] = {}
     for snapshots in chain((local,), _peer_snapshots(local_path)):
         for field, snapshot in snapshots.items():
+            if field not in newest or _snapshot_order(snapshot) > _snapshot_order(newest[field]):
+                newest[field] = snapshot
             for module, reads in snapshot["modules"].items():
                 fields = reads_by_module.setdefault(module, {})
                 if reads is not None:
                     fields.setdefault(field, []).extend(reads)
-    return {module: module_read_record(fields.get("config_reads"), fields.get("folder_scans"),
-                                      fields.get("content_reads"))
-            for module, fields in reads_by_module.items()}
+    return ModuleReadHistory(
+        {module: module_read_record(fields.get("config_reads"), fields.get("folder_scans"),
+                                    fields.get("content_reads")) for module, fields in reads_by_module.items()},
+        {field: frozenset(module for module, reads in snapshot["modules"].items() if reads is not None)
+         for field, snapshot in newest.items()},
+    )
 
 
 def _peer_snapshots(local_path: Path) -> Iterator[dict[ReadField, GateReadSnapshot]]:
@@ -386,8 +404,7 @@ def _publish_read_snapshots(host: str, candidates: Mapping[ReadField, GateReadSn
         except (FileNotFoundError, ValueError, RecursionError):
             snapshots = {}
         newer: dict[ReadField, GateReadSnapshot] = {field: candidate for field, candidate in candidates.items()
-                 if field not in snapshots or (candidate["started_at"], candidate["run_id"])
-                 > (snapshots[field]["started_at"], snapshots[field]["run_id"])}
+                 if field not in snapshots or _snapshot_order(candidate) > _snapshot_order(snapshots[field])}
         if newer:
             snapshots.update(newer)
             write_text_atomic(path, json.dumps(snapshots, separators=(",", ":")) + "\n")

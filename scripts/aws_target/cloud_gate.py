@@ -1162,8 +1162,13 @@ def import_record(folder: Path, row: dict[str, object]) -> None:
             store.append_locked(handle, record)
         else:
             record = appended.row
-    gate_record.update_latest_module_reads(record, transferred_modules, host=store.host_name())
     gate_record.update_recent_times(record)
+    try:
+        gate_record.update_latest_module_reads(record, transferred_modules, host=store.host_name())
+    except (OSError, ValueError, RecursionError) as error:
+        detail = ' '.join(str(error).splitlines())
+        print(f'latest module reads not written: {detail}', file=sys.stderr)
+        return
     from scripts.buildlog.record import keep_result
     imported: dict[str, object] = {'id': record_id}
     try:

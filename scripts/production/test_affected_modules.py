@@ -438,8 +438,12 @@ class AffectedModulesTests(unittest.TestCase):
             gate_record.seed_latest_module_reads(connection)
         oracle = {name: gate_record.module_read_record(fields.get("config_reads"),
                   fields.get("folder_scans"), fields.get("content_reads")) for name, fields in expected.items()}
-        self.assertEqual(published, oracle)
-        self.assertEqual(affected.latest_module_reads(), oracle)
+        history = gate_record.ModuleReadHistory(
+            oracle, {field: frozenset(name for name, fields in expected.items() if field in fields)
+                     for field in gate_record.READ_FIELDS},
+        )
+        self.assertEqual(published, history)
+        self.assertEqual(affected.latest_module_reads(), history)
 
     def test_missing_empty_or_corrupt_local_snapshot_requests_every_module(self) -> None:
         self.add_test("checks/test_dynamic.py", "VALUE = 1\n")
@@ -482,8 +486,28 @@ class AffectedModulesTests(unittest.TestCase):
         self.record_history(self.config_gate({"test_mac.py": ["limits"]}), host="Mac")
         self.assertEqual({path.name for path in self.selection().modules}, {"test_local.py", "test_mac.py"})
         reads = affected.latest_module_reads()
-        assert isinstance(reads, dict)
-        self.assertEqual(reads["scripts/checks/test_mac.py"], gate_record.module_read_record(["limits", "tools"], None, None))
+        assert isinstance(reads, gate_record.ModuleReadHistory)
+        self.assertEqual(reads.positive_reads["scripts/checks/test_mac.py"],
+                         gate_record.module_read_record(["limits", "tools"], None, None))
+
+    def test_newest_host_snapshot_decides_unknown_content_reads(self) -> None:
+        for name in ("dynamic", "null", "older_match", "empty"):
+            self.add_test(f"checks/test_{name}.py", "VALUE = 1\n")
+        self.certify()
+        old = self.config_gate({})
+        rows = cast(list[dict[str, object]], old["modules"])
+        change = "docs/guide.md"
+        self.record_history({**old, "started_at": "2026-11-01", "modules": [
+            {**row, "content_reads": [change] if row["module"] == "test_older_match.py" else []} for row in rows
+        ]})
+        self.record_history({**old, "started_at": "2026-11-02", "modules": [
+            {**row, "content_reads": None if row["module"] == "test_null.py" else []}
+            for row in rows if row["module"] != "test_dynamic.py"
+        ]}, host="Mac")
+
+        self.write(change, "changed\n")
+        self.assertEqual({path.name for path in self.selection().modules},
+                         {"test_dynamic.py", "test_null.py", "test_older_match.py"})
 
     def test_corrupt_or_missing_mac_snapshot_is_skipped(self) -> None:
         self.add_test("checks/test_local.py", "VALUE = 1\n")

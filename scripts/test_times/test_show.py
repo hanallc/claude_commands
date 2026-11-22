@@ -265,9 +265,11 @@ class TestTimesTests(unittest.TestCase):
             self.assertIn("Recent gate time keys:", output)
             snapshots = self.log.glob(f"*/{gate_record.LATEST_MODULE_READS_NAME}")
             self.assertEqual({path.parent.name for path in snapshots}, {"natedev", "Mac"})
-            self.assertEqual(gate_record.read_latest_module_reads(), {
-                "scripts/tools/test_alpha.py": gate_record.module_read_record(["limits", "tools"], [], ["docs/guide.md"]),
-            })
+            module_path = "scripts/tools/test_alpha.py"
+            self.assertEqual(gate_record.read_latest_module_reads(), gate_record.ModuleReadHistory(
+                {module_path: gate_record.module_read_record(["limits", "tools"], [], ["docs/guide.md"])},
+                {field: frozenset({module_path}) for field in gate_record.READ_FIELDS},
+            ))
             local = gate_record.latest_module_reads_path("natedev").read_text()
             peer = gate_record.latest_module_reads_path("Mac").read_text()
             self.assertIn('"run_id":"linux"', local)

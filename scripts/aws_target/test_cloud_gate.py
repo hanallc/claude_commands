@@ -2180,21 +2180,40 @@ with (mock.patch.object(cloud_gate, 'AwsCli', return_value=api),
             self.assertEqual(module['wall_s'], reads['wall_s'])
             self.assertEqual(module['peak_mib'], reads['peak_mib'])
             self.assertEqual(module['status'], reads['status'])
-        self.assertEqual(gate_record.read_latest_module_reads(), {
-            'scripts/fixture/test_ok.py': gate_record.module_read_record(['limits'], ['docs/'], []),
-        })
+        module_path = 'scripts/fixture/test_ok.py'
+        self.assertEqual(gate_record.read_latest_module_reads(), gate_record.ModuleReadHistory(
+            {module_path: gate_record.module_read_record(['limits'], ['docs/'], [])},
+            {field: frozenset({module_path}) for field in gate_record.READ_FIELDS},
+        ))
 
-    def test_cloud_snapshot_write_failure_keeps_payload_for_retry(self) -> None:
-        result = self.result()
+    def test_cloud_snapshot_write_failure_keeps_aws_verdict_and_payload(self) -> None:
+        result = self.result(status=1)
         outgoing = ledger.mapping(result['record'])
         ledger.rows(outgoing, 'modules')[0]['config_reads'] = ['limits']
         payload = self.folder / cloud_gate.RESULT_FILE
         marker = self.folder / 'imported.json'
         snapshot = gate_record.latest_module_reads_path(store.host_name())
         cloud_gate.save(payload, result)
-        with mock.patch.object(gate_record, 'write_text_atomic', side_effect=OSError('fixture snapshot write failed')):
-            with self.assertRaisesRegex(OSError, 'fixture snapshot write failed'):
-                cloud_gate.import_record(self.folder, result)
+        cloud_gate.save(self.folder / 'outcome.json', {'status': 'complete', 'result_file': cloud_gate.RESULT_FILE})
+        _ = (self.folder / 'gate.log').write_text('fixture AWS test failed\n')
+        request = {**self.request, 'head': 'commit'}
+
+        def completed_cloud(repo: Path, **_options: object) -> cloud_gate.LocalFallback | cloud_gate.CloudCompleted:
+            return cloud_gate.run_service(repo, self.folder, request, (), lambda _command: 0)
+
+        with (mock.patch.object(gate_record, 'write_text_atomic', side_effect=OSError('fixture snapshot write failed')),
+              mock.patch.object(cloud_gate, 'run_cloud', side_effect=completed_cloud),
+              mock.patch.object(cloud_gate, 'append_launch') as fallback,
+              mock.patch.object(gate, 'checked_git', return_value='commit'),
+              mock.patch.object(gate, 'run_suites', side_effect=AssertionError('The local runner must not start')) as local,
+              redirect_stderr(StringIO()) as errors, redirect_stdout(StringIO()) as output):
+            remote = gate.run_gate_suites(self.root)
+        local.assert_not_called()
+        fallback.assert_not_called()
+        self.assertEqual(remote, gate_box.decode_run(result['gate']))
+        self.assertFalse(remote.passed)
+        self.assertEqual(errors.getvalue(), 'latest module reads not written: fixture snapshot write failed\n')
+        self.assertEqual(output.getvalue(), 'fixture AWS test failed\n')
         self.assertFalse(marker.exists())
         self.assertFalse(snapshot.exists())
         self.assertEqual(cloud_gate.read(payload), result)
@@ -2204,9 +2223,11 @@ with (mock.patch.object(cloud_gate, 'AwsCli', return_value=api),
         self.assertFalse(payload.exists())
         rows = list(store.locked_rows(store.host_file(store.CLOUD_GATE_PLACE, self.now)))
         self.assertEqual([row['id'] for row in rows], ['gate-attempt'])
-        self.assertEqual(gate_record.read_latest_module_reads(), {
-            'scripts/fixture/test_ok.py': gate_record.module_read_record(['limits'], None, None),
-        })
+        module_path = 'scripts/fixture/test_ok.py'
+        self.assertEqual(gate_record.read_latest_module_reads(), gate_record.ModuleReadHistory(
+            {module_path: gate_record.module_read_record(['limits'], None, None)},
+            {'config_reads': frozenset({module_path})},
+        ))
 
     def test_first_import_skips_existing_rows(self) -> None:
         destination = store.host_file('aws', self.now)
