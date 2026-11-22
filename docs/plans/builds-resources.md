@@ -3129,6 +3129,7 @@ Each removal below is off until the bubblewrap proof is on main and nate gives h
 3. Phase 181: six sites keep a folder from an earlier run and print the kept line (merge gate recovery, the Mac lint-copy return, Hana shot shutdown, scratch task end, selection capture, session end).
 4. Phase 180: `gpu_size_trial.py:460` `new_trial` keeps earlier trial folders. At the re-arm it removes them again, with a marker file check that prepare writes (aws, 2026-11-20 10:15 EST; bob, 10:16 EST).
 5. The masked timers: disk-floor, tmp sweep, folder-audit, transcript-retention, tmpfiles-clean.
+6. Phase 185 (bob, 2026-11-21 09:11 EST): the Mac lint-copy close removes a copy when the caller gives the allocation id that the copy's claim wrote. Today the close needs the claim in memory, and the verify helper loses it, so live runs keep about 2 copies each (about 325 MB each, under `<target>/package`).
 
 ### Phase 178 — One removal guard: the guard and the sweeps (item 152)  · status: done
 **Source:** builds for bob, item 152, 2026-11-19 20:26 EST. Row `c29ac97f5` in batch bb181f on main `cfa095c714`.
@@ -3206,9 +3207,85 @@ Work Order:
 - One merge of main `aacad65c6` into `f86816c9b`. It resolves the conflicts in `add_unit.py`, `test_verify_doc_checkout.py` and `test_slot_order.py`.
 - The commit holds the bb15 rows 178 and 181 under it, so it lands after bb15.
 
-### Phase 185 — The lint copy close proves its claim on disk (item 152 live issue)  · status: in progress
-**Source:** builds, 2026-11-21 09:00 EST: run 20261121T084352-3507509-bef1 started on the old `verify.sh` and failed on the new `return-copy` (`--allocation-id` required).
+### Phase 185 — return-copy works for a run that crosses an update (item 152 live issue)  · status: in progress
+**Source:** builds, 2026-11-21 09:00 EST: run 20261121T084352-3507509-bef1 started on the old `verify.sh` and failed on the new `return-copy` (`--allocation-id` required). bob 09:11 EST: no removal by the id on disk.
 
-- `return-copy` without `--allocation-id` (a caller from before the update) returns the changes and keeps the copy for the manual list.
-- Close removes a copy when the caller gives the allocation id that the copy's claim wrote. The in-process claim list goes: the verify helper drops loaded modules on a tree update, so every live copy leaked (about 325 MB each).
-- `drop-copy` takes `--allocation-id`; `verify.sh` passes it.
+- `return-copy` without `--allocation-id` (a caller from before the update) returns the changes, keeps the copy and prints the manual list line.
+- The close stays as on main: it removes only a copy that the in-process claim list holds.
+- The removal by the allocation id on disk joins the removals to arm again, after the bubblewrap proof and nate's word.
+- `docs/as-built/removal-by-hand.md` (bob, 2026-11-21 09:25 EST): the procedure for a removal by hand. Four checks, one yes per path, one record line per removal. It applies after nate answers who gives the yes; the hold of 09:19 EST stays until then.
+
+### Phase 186 — a live lint run keeps its lint-copy claim (item 152)  · status: in progress
+**Source:** builds, 2026-11-21 09:25 EST (go after the 143 row). Stacked on phase 185 `bc157b8eb`.
+
+- In live runs since 08:57 EST, every lint copy was kept, even with no source change during the run. The copy is taken, the run waits for memory admission, and the drop then finds no claim in memory.
+- Find the cause by test through `verify_helper.py` with the real call sequence. Fix it at the cause, so the claim survives between helper calls in one run.
+- No new removal path, no removal by an id on disk, no config change.
+
+### Phase 143z — The move pass keeps numbered build copies (item 143)  · status: in progress
+**Source:** resources, 2026-11-21 14:01 EST, from the live dry run on main e0a5e1e082: the pass plans to move the new-model copies /build/hana/hana-merges/1 and /2 (in use) to ~/worktrees/hana/errors/p1 and p2. Built on main merged with 143w-b, so both go on the line as one row.
+**Merge line:** `9c6dc62959` (branch builds-resources-143z-m6401) in batch bb143y, sent 2026-11-21 19:27 EST. Not on main yet.
+
+- `_migration_skip` keeps every numbered copy that `build_folders` knows; legacy /build/claude/scratch worktrees still move.
+
+### Phase 143u — Remote verify runs use one script version (item 143)  · status: todo
+Source: 143y F001 and an Astra review (2026-11-21 15:24). 143y pins the natedev side only.
+- Bind the run's script snapshot once to a remote executor for each host. Every run-owned SSH command and rsync receiver goes through it.
+- The Mac gate gets the placement identity as structured data over the natedev transport, not as caller text.
+- Reserve the snapshot folder inside the existing mirror, safe from `rsync --delete` and from source comparison.
+- Settlement runs without the remote copy, and keeps the claim until the process check confirms settlement.
+- No new Mac folder, no Mac setting change, no new removal tool.
+
+### Phase 143v — A cleanup failure never reads as a failed test (item 143)  · status: in progress
+Source: builds 2026-11-21 14:30, from the lfo 44eu trace.
+**State:** bullets 1-3 and 5 reviewed (PASS) in commit `74a9821df6` on main 6401c0f801. The affected tests run after the full test hold ends. Bullet 4 waits for bb143y on main.
+- `build_folders.py` remove prints the cause when it fails; today line 2161 returns 1 with no message.
+- `verify.sh` finish_tree_watch writes the pass record first. It then reports a cleanup failure on its own line, with its own status.
+- Tests: a removal that fails after a passed run keeps the pass record and prints the cleanup cause.
+- 143y F017: an attached run that is cancelled can lose the retention notice in the tee pipe (verify.sh:469, :4430, :4565). Write the notice so the cancellation cannot drop it.
+- The cleanup message names the cause, for example a lock lost after a script install during the run, so units see a false fail for what it is. Cases: lfo 44eu and hana inspectors v20261121T181454-174488-6851 (step 0, call 1).
+
+### Phase 143y — One script version for each verify.sh run (item 143)  · status: in progress
+**Merge line:** `87c3742af4` (branch builds-resources-143y-m355) in batch bb143y, sent 2026-11-21 18:01 EST. Not on main yet.
+**Source:** builds, 2026-11-21 13:48 EST: a verify.sh run queued before the 13:39 install of 143 called the new copies.py with the old `--capacity-file` argument and failed; hana's g45 suite lost its queue place. Cause: verify.sh keeps its own text but runs helpers from the live `~/.claude/scripts`.
+
+- verify.sh copies `scripts/` at the installed commit into a folder the run owns, then runs itself and every helper from that copy.
+- The run that owns the copy removes it when it ends; a detached run takes the ownership.
+- A dirty scripts tree or a failed copy runs as today and prints one line.
+
+### Phase 143x — Repair the bb143 gate red (item 143)  · status: todo
+**Source:** builds, 2026-11-21 13:00 EST: bb143 red; 4 modules are 143's (test_aws_trial guest, test_doc_routing, test_disks_page, test_perform_deletion_rerun). Repair on a merge of main 94e07d22c4 into the 143 tip.
+
+### Phase 143w — Restore the worktree short name in the move pass and add_style (item 143)  · status: todo
+**Source:** resources, 2026-11-21 11:40 EST, from the switch dry run of `f91a74ef81`: the migration fallback names 37 unit worktrees `director`, and `add_style.py` still uses `production`. nate (via bob, 2026-11-19 21:54 and 21:56 EST): `worktree` replaces both.
+
+- One name, `worktrees.UNIT_WORKTREE_NAME`, for the migration fallback and for style productions (path, output, new branch `<style>-worktree`). Existing branches keep their names.
+- Tests and as-built lines follow. Proof: the switch dry run shows no `/director` move.
+
+### Phase 187 — test_target_availability writes its own build_targets.conf  · status: in progress
+**Source:** builds, 2026-11-21 10:34 EST: verify found that `scripts/build_queue/test_target_availability.py` reads `build_targets.conf` from HOME on main `262952c406`, so it fails in a private home.
+
+- Each test writes its own fixture config (phase 147 rule). Proof: the module passes with an empty private HOME.
+
+### Phase diskred — test_disk ignores the host SCCACHE_DIR  · status: done
+**Source:** builds, 2026-11-21 19:50 EST: base red at `scripts/buildlog/test_disk.py:730`. On main `4ab2262145` (bbfast, 22:12 EST) as `9b98021e11`.
+
+- `setUp` removes `SCCACHE_DIR`, so `snapshot()` never scans the host cache. Proof: the module passes all 26 tests.
+
+### Phase runcap — At most 2 claude_commands runs on natedev  · status: in progress
+**Source:** nate via bob via builds, 2026-11-21 20:04 EST (fast-track). Branch builds-resources-runcap `3b7c9d38fc` (with the runcapfix repair); line row bbruncap, first after the restart.
+
+- `max_runs.natedev.claude_commands=2` in `build_admission.conf`. natemerge runs count, and are never held (`max_runs_exempt_unit=natemerge`).
+- A run held only by the limit never holds other work.
+- runcapfix (bbfast red, 21:52 EST): a legacy gate profile path maps to the Git repository name.
+
+### Phase runcap2 — Gate test runs go through admission  · status: in progress
+**Source:** builds, 2026-11-21 20:25 EST: `gate.py --tests-only --module` skips admission. Commit `f02d4d2e66` (reviewed, not pushed). Its tests run after the full test hold ends.
+
+### Phase runhana — One run limit reader for every repository  · status: in progress
+**Source:** nate via bob via builds, 2026-11-21 21:28 EST. Built on runcap.
+
+- One reader for all `max_runs.*`; a whole number, 0 or more; 0 means no run starts.
+- Gate steps count while they hold a reservation. Cargo steps count from the run start to the run end; one `verify.sh` call is one run.
+- A step of a started run never waits behind a row held only by its own limit.
+- Out of scope: other repositories' values, the Mac part, exceptions.
