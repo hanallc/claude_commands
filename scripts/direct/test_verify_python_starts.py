@@ -15,6 +15,7 @@ from typing import override
 import unittest
 from unittest import mock
 
+from scripts.lib.fixture_test_support import register_fixture_class_cleanup, set_up_fixture
 from scripts.lib.git_test_support import commit_repository
 from scripts.lib.shell_test_support import shell_function
 from scripts.lib.helper_tree_test_support import verify_test_environment
@@ -36,7 +37,7 @@ class VerifyPythonStartsTests(VerifyLintCacheFixture):
         self.assert_lint_start_count(self)
         self.assert_ssh_helper_calls()
 
-    def test_detached_lint_with_file_stderr_runs_slot_request_in_the_helper(self) -> None:
+    def test_detached_lint_with_file_stderr_places_steps_without_a_slot_request(self) -> None:
         trace = self.root / "detached-starts.tsv"
         log = self.root / "detached.log"
         with log.open("ab") as output:
@@ -45,7 +46,8 @@ class VerifyPythonStartsTests(VerifyLintCacheFixture):
                 stdout=output, stderr=subprocess.STDOUT, timeout=TEST_HANG_GUARD_SECS, check=False)
         self.assertEqual(result.returncode, 0, log.read_text())
         calls = [line.split("\t") for line in trace.with_suffix(".tsv.calls").read_text().splitlines()]
-        self.assertEqual(sum(call[:2] == ["admission_client.py", "verify-run-slot"] for call in calls), 1)
+        self.assertIn(["build-targets.py", "assigned-info"], [call[:2] for call in calls])
+        self.assertNotIn(["admission_client.py", "verify-run-slot"], [call[:2] for call in calls])
 
     def assert_lint_start_count(self, fixture: VerifyLintCacheFixture) -> None:
         _ = fixture.enable_cache()
@@ -77,14 +79,13 @@ class VerifyPythonStartsTests(VerifyLintCacheFixture):
         calls = [line.split("\t") for line in Path(str(trace) + ".calls").read_text().splitlines()]
         in_helper = Counter(call[0] for call in calls)
         self.assertEqual((counts["dev_features.py"], in_helper["dev_features.py"]), (0, 1), rows)
-        self.assertEqual(sum(call[:2] == ["admission_client.py", "verify-run-slot"] for call in calls), 1)
+        self.assertNotIn(["admission_client.py", "verify-run-slot"], [call[:2] for call in calls])
 
     def assert_ssh_helper_calls(self) -> None:
         for target, mode in (("unknown", "passed"), ("linux", "disk")):
             with self.subTest(target=target, mode=mode):
-                routing = VerifySshTargetsFixture()
-                routing.setUp()
-                try:
+                with ExitStack() as cleanup:
+                    routing = set_up_fixture(cleanup.callback, VerifySshTargetsFixture())
                     routing.configure("natedev,linux")
                     routing_trace = routing.root / "routing-python.tsv"
                     detached_record = routing.root / "detached.json"
@@ -102,8 +103,6 @@ class VerifyPythonStartsTests(VerifyLintCacheFixture):
                     for program in ("build_targets.py", "build_folders.py", "detached_runs.py"):
                         self.assertGreater(calls[program], 0, (target, program, entries, calls))
                         self.assertEqual(entries[program], 0, (target, program, entries, calls))
-                finally:
-                    routing.doCleanups()
 
     def test_caller_settings_leave_lint_starts_and_ssh_verification_unchanged(self) -> None:
         caller = Path(self.enterContext(tempfile.TemporaryDirectory()))
@@ -125,17 +124,13 @@ class VerifyPythonStartsTests(VerifyLintCacheFixture):
         }
         with mock.patch.dict(os.environ, {**variables, "LANG": "POSIX", "LC_ALL": "POSIX"}):
             with self.subTest(fixture="lint"):
-                lint = VerifyLintCacheFixture()
-                self.addCleanup(lint.doCleanups)
-                lint.setUp()
+                lint = set_up_fixture(self.addCleanup, VerifyLintCacheFixture())
                 self.assert_lint_start_count(lint)
                 self.assertFalse(variables.keys() & lint.environment.keys())
                 self.assertEqual((lint.environment["LANG"], lint.environment["LC_ALL"]), ("C", "C"))
 
             with self.subTest(fixture="nested SSH"):
-                routing = VerifySshTargetsFixture()
-                self.addCleanup(routing.doCleanups)
-                routing.setUp()
+                routing = set_up_fixture(self.addCleanup, VerifySshTargetsFixture())
                 routing.configure("linux,natedev")
                 result = routing.verify("test", "sample", "--target", "linux")
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -240,11 +235,8 @@ class VerifyOutputRootsTests(unittest.TestCase):
         _ = hook.write_text(': > "${BASH_SOURCE[0]}.ran"\n')
         environment = {**verify_test_environment(), "BASH_ENV": str(hook)}
         with mock.patch.dict(os.environ, environment, clear=True), ExitStack() as fixture_context:
-            _ = fixture_context.callback(PairedTreeKeyTests.doClassCleanups)
-            PairedTreeKeyTests.setUpClass()
-            paired = PairedTreeKeyTests()
-            _ = fixture_context.callback(paired.doCleanups)
-            paired.setUp()
+            register_fixture_class_cleanup(fixture_context.callback, PairedTreeKeyTests).setUpClass()
+            paired = set_up_fixture(fixture_context.callback, PairedTreeKeyTests())
             paired.assert_pair("test", "sample")
         self.assertFalse(hook.with_suffix(".sh.ran").exists())
 

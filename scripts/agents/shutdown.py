@@ -23,6 +23,7 @@ def _usage() -> str:
   agents retire NAME [--to PRODUCER]
   agents rename OLD NEW [--to-doc PATH] [--to-branch NAME]
   agents move SESSION_OR_GROUP ACCOUNT [--dry-run] [--why TEXT]
+  agents reboot [--dry-run]
   agents restart [ACCOUNT] [--all] [--dry-run] [--only ID[,ID...]] [--here]
   agents stop SESSION [--dry-run] | --all [--dry-run] [--only ID[,ID...]] [--account ACCOUNT]
   agents remove-stray NAME SESSION
@@ -44,7 +45,7 @@ import subprocess
 import time
 from dataclasses import dataclass, replace
 from enum import Enum
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import ExitStack, redirect_stderr, redirect_stdout
 from io import StringIO
 from zoneinfo import ZoneInfo
 from datetime import datetime
@@ -629,6 +630,8 @@ def main(argv: list[str] | None = None) -> int:
     _ = command.add_argument("target", metavar="ACCOUNT")
     _ = command.add_argument("--dry-run", action="store_true")
     _ = command.add_argument("--why", default="")
+    command = commands.add_parser("reboot")
+    _ = command.add_argument("--dry-run", action="store_true")
     command = commands.add_parser("restart")
     _ = command.add_argument("--why", default=restart.DEFAULT_RESTART_CAUSE)
     _ = command.add_argument("--all", action="store_true")
@@ -655,7 +658,10 @@ def main(argv: list[str] | None = None) -> int:
             return set_model.run(options.role, options.model, options.effort)
         except (OSError, ValueError, conf.Unusable, staff.StaffRefused) as error:
             return set_model.report_error(error)
+    locks = ExitStack()
     try:
+        if options.command in ("resume", "restart", "add-producer", "transfer", "move") and not options.dry_run:
+            locks.enter_context(herdr.reboot_lock())
         if options.command == "resume" and options.resend_opening_prompt:
             if options.production or options.retired:
                 raise ValueError("--resend-opening-prompt needs one producer name and an active pane")
@@ -666,6 +672,10 @@ def main(argv: list[str] | None = None) -> int:
             return producer_transfer.transfer(options.producer, model=options.model, effort=options.effort)
         if options.command == "add-producer":
             return producer_lifecycle.add(options.producer, model=options.model, effort=options.effort, job=options.job)
+        if options.command == "reboot":
+            from scripts.agents import reboot
+
+            return reboot.run(dry_run=options.dry_run)
         if options.command == "stop" and options.all:
             selection = restart.BulkCommand("stop", account=options.account, all_rows=True,
                 only=tuple(item for item in options.only.split(",") if item), dry_run=options.dry_run)
@@ -767,6 +777,9 @@ def main(argv: list[str] | None = None) -> int:
         result = (stop_resume.stop_producer(target.id, "agents stop ran", deadline=deadline)
                   if target is not None and target.kind == "producer" else stop_resume.stop(options.session, deadline=deadline))
         return max(_result_code(result), int(bool(unresolved)))
+    except herdr.RebootLockBusy as error:
+        print(error, file=sys.stderr)
+        return 1
     except staff.StaffRefused as error:
         print(f"shutdown: StaffRefused: {error}", file=sys.stderr)
         return 2
@@ -774,6 +787,8 @@ def main(argv: list[str] | None = None) -> int:
             herdr_types.HerdrFailure) as error:
         print(f"shutdown: {error}", file=sys.stderr)
         return 2
+    finally:
+        locks.close()
 
 
 SCRIPTS = Path(__file__).resolve().parent.parent
@@ -1184,8 +1199,39 @@ def retirement_rebase(unit: RetiringUnit, *, settings: conf.ConfigRead) -> Path 
     return None
 
 
+def _merge_leaves_target_tree_unchanged(unit: RetiringUnit, ref: str, merge_ref: str,
+                                        *, settings: conf.ConfigRead) -> bool:
+    """Check that a merge of the branch leaves the merge tree unchanged."""
+    branch = retirement_git(unit, "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}", settings=settings)
+    if branch.returncode:
+        raise OSError(f"cannot resolve commit {ref}: {retirement_failure(branch)}")
+    target = retirement_git(unit, "rev-parse", "--verify", "--quiet", f"{merge_ref}^{{commit}}", settings=settings)
+    if target.returncode:
+        raise OSError(f"cannot resolve commit {merge_ref}: {retirement_failure(target)}")
+    drivers = retirement_git(unit, "config", "--get-regexp", r"^merge\..+\.driver$", settings=settings)
+    if drivers.returncode == 0:
+        return False
+    if drivers.returncode != 1:
+        raise OSError(retirement_failure(drivers))
+
+    target_commit = target.stdout.strip()
+    merged = retirement_git(unit, "merge-tree", "--write-tree", target_commit, branch.stdout.strip(), settings=settings)
+    merged_tree = merged.stdout.partition("\n")[0]
+    if merged.returncode:
+        if merged.returncode == 1 and merged_tree:
+            conflict_tree = retirement_git(unit, "rev-parse", "--verify", "--quiet", "--end-of-options",
+                                           f"{merged_tree}^{{tree}}", settings=settings)
+            if conflict_tree.returncode == 0 and conflict_tree.stdout.strip() == merged_tree:
+                return False
+        raise OSError(retirement_failure(merged))
+    current = retirement_git(unit, "rev-parse", f"{target_commit}^{{tree}}", settings=settings)
+    if current.returncode:
+        raise OSError(retirement_failure(current))
+    return bool(merged_tree) and merged_tree == current.stdout.strip()
+
+
 def retirement_refusals(unit: RetiringUnit, *, settings: conf.ConfigRead, check_absent_branch: bool = False) -> list[str]:
-    """Keep uncommitted work and commits outside the merge branch."""
+    """Keep uncommitted work and branch content missing from the merge branch."""
     present = unit.worktree.is_dir()
     if unit.branch and (rebasing := retirement_rebase(unit, settings=settings)) is not None:
         return [f"branch {unit.branch} is rebasing in {rebasing}"]
@@ -1205,11 +1251,13 @@ def retirement_refusals(unit: RetiringUnit, *, settings: conf.ConfigRead, check_
     merge_refs = retirement_branch_commits(unit, unit.production.merge_branch, settings=settings)
     if not merge_refs:
         raise OSError(f"merge branch {unit.production.merge_branch} is absent from origin and this clone")
+    # The fetched origin commit comes last when origin has the branch.
+    merge_target = merge_refs[-1]
     for ref in refs:
         commits = retirement_git(unit, "rev-list", "--no-merges", ref, "--not", *merge_refs, settings=settings)
         if commits.returncode:
             raise OSError(retirement_failure(commits))
-        if commits.stdout.strip():
+        if commits.stdout.strip() and not _merge_leaves_target_tree_unchanged(unit, ref, merge_target, settings=settings):
             found.append(f"unmerged commits on {unit.branch or ref}: {commits.stdout.splitlines()[0]}")
             break
     return found
