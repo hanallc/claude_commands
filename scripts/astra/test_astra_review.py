@@ -407,6 +407,11 @@ class AstraReviewTests(StaffTestCase):
                     paths = EnrolledPaths(main, main / "production.md", main / "LOG.md", main / "notes", integration)
                     owner = fixture_member("showrunner", name="astra-showrunner",
                                            doc=staff.LiveDoc(remote.local_machine(), paths.live_doc))
+                    _ = paths.live_doc.write_text("# Production\n")
+                    source, _ = transcript_fixture(owner, staff.CodexBackend(Path.home() / ".codex"))
+                    with source.open("a") as output:
+                        _ = output.write(json.dumps({"type": "turn_context", "payload": {
+                            "model": "gpt-main", "effort": "high"}}) + "\n")
                     self.fixture.fixture.parent_id = owner.id
                     reviewed_run.mkdir(parents=True)
                     owner = staff.set_run(owner.id, staff.OpenRun(reviewed_run))
@@ -447,11 +452,13 @@ class AstraReviewTests(StaffTestCase):
                     self.assertEqual(ended.returncode, 0, ended.stderr)
                     self.assertIsNone(unit_runs.open_run(owner.current_session))
                     self.assertFalse(state_file.exists())
-                    self.assertFalse(cache.exists())
+                    self.assertTrue(cache.is_dir())
+                    self.assertIn(f"kept for a manual removal list: {cache}", ended.stderr)
                     _ = staff.set_run(owner.id, staff.OpenRun(reviewed_run))
                     restarted = invoke_recorder(start_run, self.environment, self.root)
                     self.assertEqual(restarted.returncode, 0, restarted.stderr)
-                    phase = invoke_recorder(["start-phase", "--session-dir", str(reviewed_run), "--phase-id", "review"],
+                    phase = invoke_recorder(["start-phase", "--session-dir", str(reviewed_run),
+                                             "--phase-id", "review", "--phase-title", "Review"],
                                             self.environment, self.root)
                     self.assertEqual(phase.returncode, 0, phase.stderr)
                     closed = invoke_recorder(["finish-run", "--session-dir", str(reviewed_run), "--status", "stopped"],
@@ -680,6 +687,9 @@ class AstraReviewTests(StaffTestCase):
         record = staff.snapshot()
         owner = record.parent_of(self.fixture.fixture.parent)
         assert owner is not None
+        doc = self.root / "showrunner-production.md"
+        _ = doc.write_text("# Production\n")
+        owner = staff.set_doc(owner.id, staff.LiveDoc(remote.local_machine(), doc))
         self.environment["CODEX_THREAD_ID"] = str(owner.current_session)
         source, _ = transcript_fixture(owner, staff.CodexBackend(Path.home() / ".codex"))
         with source.open("a") as output:

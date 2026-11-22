@@ -27,7 +27,7 @@ from unittest.mock import patch
 
 from scripts.astra import astra_roles  # noqa: E402
 from scripts.accounts import role_map  # noqa: E402
-from scripts.agents import worker_lifecycle  # noqa: E402
+from scripts.agents import remote, worker_lifecycle  # noqa: E402
 from scripts.astra import astra_review, astra_work, design_roles  # noqa: E402
 from scripts.direct import progress_history, recorder_state
 from scripts.astra.design_role_test_support import HeldRolePaneCase, write_empty_binding_record
@@ -234,6 +234,9 @@ class HeldRolePaneTests(HeldRolePaneCase):
         parent = staff.snapshot().parent_of(self.panes.command_case.fixture.parent)
         if parent is None:
             self.fail("fixture has no showrunner")
+        doc = self.panes.root / "showrunner-production.md"
+        write_text_atomic(doc, "# Production\n")
+        parent = staff.set_doc(parent.id, staff.LiveDoc(remote.local_machine(), doc))
         transcript = Path.home() / ".claude/projects/fixture" / f"{parent.current_session}.jsonl"
         write_text_atomic(transcript, json.dumps({"type": "assistant", "message": {"model": "fixture"},
                                                  "effort": "high"}) + "\n")
