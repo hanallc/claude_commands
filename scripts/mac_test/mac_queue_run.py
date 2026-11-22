@@ -258,8 +258,10 @@ def clean_ended_runs(environment: dict[str, str]) -> None:
                 saved = cast(SavedRun, json.loads(record.read_text()))
                 try:
                     script, phase = ended_run_callback(saved["lifecycle_script"])
-                    status = run_callback(str(script), phase, directory / "argv.json",
-                                          saved["arguments"], {**environment, "MAC_QUEUE_HOST": saved["host"]})
+                    argv_file = directory / "argv.json"
+                    with lifecycle_mirror_lease(argv_file, saved["host"]):
+                        status = run_callback(str(script), phase, argv_file, saved["arguments"],
+                                              {**environment, "MAC_QUEUE_HOST": saved["host"]})
                 except OSError as error:
                     print(f"mac queue: cleanup of an ended run failed: {error}; kept {directory}", file=sys.stderr)
                     continue
@@ -281,6 +283,25 @@ def ended_run_callback(saved_script: str) -> tuple[Path, str]:
     if name == "mac_run.sh":
         return installed / "scripts/production/mac_run.sh", "cleanup"
     return Path(saved_script), "cleanup"
+
+
+@contextlib.contextmanager
+def lifecycle_mirror_lease(argv_file: Path, host: str) -> Generator[None]:
+    """Keep the prepared mirror under the shared host lease through cleanup."""
+    try:
+        path = Path(argv_file.with_suffix(".json.lease").read_text().strip())
+    except FileNotFoundError:
+        yield
+        return
+
+    from scripts.copies import copies
+
+    with contextlib.ExitStack() as lease:
+        try:
+            lease.enter_context(copies.remote_mirror_lease(host, path))
+        except copies.CopyError as error:
+            raise OSError(str(error)) from error
+        yield
 
 
 class Arguments(argparse.Namespace):
@@ -307,17 +328,16 @@ def run(args: Arguments) -> int:
     original_command = command.copy()
     status = 1
     remote = RemoteRun()
-    prepared = False
     placement = MacPlacement("", episode, "")
     receipts = Path.home() / RECEIPTS
     receipts.mkdir(parents=True, exist_ok=True, mode=0o700)
     assignment_file = receipts / (episode + ".json")
     _ = assignment_file.write_text(json.dumps({"episode": episode, "pid": pid}))
     assignment_file.chmod(0o600)
-    with run_directory(episode) as directory, contextlib.ExitStack() as ssh:
+    with run_directory(episode) as directory, contextlib.ExitStack() as mirror, contextlib.ExitStack() as ssh:
         argv_file = directory / "argv.json"
         callback_environment = dict(os.environ)
-        lease_descriptor = -1
+        cleanup_leased = False
         try:
             while True:
                 code, output = capture_command(admission_command() + placement_arguments(episode, since, pid,
@@ -338,17 +358,16 @@ def run(args: Arguments) -> int:
                     saved: SavedRun = {"lifecycle_script": args.lifecycle_script, "arguments": original_command,
                                        "host": placement.host}
                     write_text_atomic(directory / "run.json", json.dumps(saved))
-                    prepared = True
-                    status = run_callback(args.lifecycle_script, "prepare", argv_file, original_command,
-                                          callback_environment, interrupt_prepare=args.owned_close)
+                    try:
+                        status = run_callback(args.lifecycle_script, "prepare", argv_file, original_command,
+                                              callback_environment, interrupt_prepare=args.owned_close)
+                    finally:
+                        mirror.enter_context(lifecycle_mirror_lease(argv_file, placement.host))
+                        cleanup_leased = True
                     if status == 0:
                         command = cast(list[str], json.loads(argv_file.read_text()))
                         close_path = argv_file.with_suffix(".json.close")
                         on_close = close_path.read_text() if close_path.exists() else ""
-                        lease_path = argv_file.with_suffix(".json.lease")
-                        if lease_path.exists():
-                            lease_descriptor = os.open(lease_path.read_text().strip(), os.O_WRONLY | os.O_CREAT, 0o600)
-                            fcntl.flock(lease_descriptor, fcntl.LOCK_EX)
                 else:
                     status = 0
                 if status == 0:
@@ -370,7 +389,7 @@ def run(args: Arguments) -> int:
                     safe = stop_remote(placement, remote)
                 except OSError:
                     safe = False
-            if prepared and (safe or args.owned_close):
+            if cleanup_leased and (safe or args.owned_close):
                 try:
                     cleanup_status = run_callback(args.lifecycle_script, "cleanup", argv_file, original_command, callback_environment)
                 except OSError as error:
@@ -386,8 +405,7 @@ def run(args: Arguments) -> int:
                     (directory / "run.json").unlink()
             # Owned cleanup uses the close hook while SSH still holds its input open.
             ssh.close()
-            if lease_descriptor >= 0:
-                os.close(lease_descriptor)
+            mirror.close()
             # A Mac placement has no local grant, so the run returns it with a cancel that names the result.
             reason = (f"the Mac run ended with status {status}" if remote.state != RemoteState.NOT_STARTED
                       else "the Mac run did not start")

@@ -587,7 +587,6 @@ def recorded_step_kind(step: str) -> StepKind | KindNotOffloaded:
 def step_policy(target: LocalTarget | SshTarget, repo_root: Path, package: str, kind: StepKind, *,
                 backoff: eligibility.BackoffState | eligibility.ReadBackoff,
                 configuration: conf.ConfigRead | conf.UseConfiguredValue = conf.UseConfiguredValue.CURRENT,
-                mac_scope: claim_state.ClaimScope | claim_state.ResolveMacRepository = claim_state.RESOLVE_MAC_REPOSITORY,
                 ) -> eligibility.KnownRepository | ExcludedTarget:
     """Read the Mac policy for one step: repository, linux_only packages and backoff. Run no remote command."""
     from scripts.mac_test import eligibility
@@ -595,16 +594,14 @@ def step_policy(target: LocalTarget | SshTarget, repo_root: Path, package: str, 
     config = (configuration if isinstance(configuration, conf.ConfigRead)
               else eligibility.read_config(target.settings) if isinstance(target, SshTarget) else eligibility.read_config())
     name = target.name if isinstance(target, SshTarget) else "mac"
-    mac_repository = (eligibility.KnownRepository(mac_scope.name, mac_scope.key)
-                      if isinstance(mac_scope, claim_state.RepositoryScope) else mac_scope)
     first, *rest = eligibility.remote_step_kinds(kind)
     repository = eligibility.mac_step_eligibility(config, repo_root, package,
-        remote_verb(cast(StepKind, first)), name, kind=first, backoff=backoff, mac_repository=mac_repository)
+        remote_verb(cast(StepKind, first)), name, kind=first, backoff=backoff)
     if isinstance(repository, eligibility.IneligibleMacStep):
         return ExcludedTarget(target, repository.reason)
     for step in rest:
         policy = eligibility.mac_step_eligibility(config, repo_root, package,
-            remote_verb(cast(StepKind, step)), name, kind=step, backoff=backoff, mac_repository=mac_repository)
+            remote_verb(cast(StepKind, step)), name, kind=step, backoff=backoff)
         if isinstance(policy, eligibility.IneligibleMacStep):
             return ExcludedTarget(target, policy.reason)
     return repository
@@ -652,6 +649,9 @@ def command_recover_probe(args: CliArguments) -> int:
             mac_repository = claim_state.mac_repository_identity(args.repo_root)
             if isinstance(mac_repository, claim_state.WholeMacScope):
                 return 0
+            mac_repository = mac_repository.with_history(Path(args.repo_root))
+            if not mac_repository.has_history_key:
+                return 0
             repository = eligibility.KnownRepository(mac_repository.mirror_name, mac_repository.key)
         else:
             repository = eligibility.repository_identity(Path(args.repo_root))
@@ -687,7 +687,8 @@ def command_recover_probe(args: CliArguments) -> int:
                         return 0
                     try:
                         saved = controller.mac_repository
-                        if target.platform == "macos" and isinstance(saved, claim_state.NoSavedMacRepository):
+                        if target.platform == "macos" and (
+                                isinstance(saved, claim_state.NoSavedMacRepository) or not saved.has_history_key):
                             return 0
                         if isinstance(saved, claim_state.MacRepositoryIdentity):
                             if saved.mirror_name != repository.name:
@@ -751,7 +752,7 @@ def mac_target_eligibility(target: LocalTarget | SshTarget, repo_root: Path,
                   else eligibility.read_config(target.settings) if isinstance(target, SshTarget) else eligibility.read_config())
         name = target.name if isinstance(target, SshTarget) else "mac"
         repository = step_policy(target, repo_root, package, kind, backoff=eligibility.READ_BACKOFF,
-                                 configuration=configuration, mac_scope=mac_scope)
+                                 configuration=configuration)
         if isinstance(repository, ExcludedTarget):
             return repository
         if isinstance(answer, CapacityNotRead):

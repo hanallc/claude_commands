@@ -306,6 +306,10 @@ class MacRepositoryIdentity:
     fence_directory: str
     history_key: str = store.UNKNOWN_IDENTITY
 
+    @property
+    def has_history_key(self) -> bool:
+        return self.history_key != store.UNKNOWN_IDENTITY
+
     def with_history(self, worktree: Path) -> MacRepositoryIdentity:
         from scripts.buildlog import repository
 
@@ -318,7 +322,7 @@ class MacRepositoryIdentity:
     def record(self) -> MacRepositoryRecord:
         record: MacRepositoryRecord = {"key": self.key, "mirror_name": self.mirror_name,
                                        "claim_file": self.claim_file, "fence_directory": self.fence_directory}
-        if self.history_key != store.UNKNOWN_IDENTITY:
+        if self.has_history_key:
             record["history_key"] = self.history_key
         return record
 

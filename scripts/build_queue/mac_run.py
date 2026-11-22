@@ -29,6 +29,9 @@ def held(repo: Path, target: str, work: SuiteMode | StepJob,
     repository = claim_state.mac_repository_identity(worktree)
     if not isinstance(repository, claim_state.MacRepositoryIdentity):
         raise MacRunRefused(f"{repo} has no repository for the Mac claim")
+    repository = repository.with_history(repo)
+    if not repository.has_history_key:
+        raise MacRunRefused(f"{repo} has no history key for the Mac claim")
     scope = claim_state.RepositoryScope(repository.mirror_name, repository.key)
     if isinstance(work, StepJob):
         step = work.step

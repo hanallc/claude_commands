@@ -341,6 +341,10 @@ class OffloadCommandFixture(unittest.TestCase):
         self.assertEqual(
             initialized.returncode, 0, initialized.stdout + initialized.stderr
         )
+        _ = subprocess.run(["git", "-C", str(self.repository),
+                            "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
+                            "-c", "core.hooksPath=/dev/null", "commit", "-qm", "Fixture",
+                            "--no-gpg-sign", "--allow-empty"], check=True)
         paths = claim_state.StatePaths(self.state_directory, "mac")
         repository = self.mac_repository()
         self.claim_file = paths.claims / repository.claim_file
@@ -780,7 +784,7 @@ raise SystemExit(offload.main())
         repository = claim_state.mac_repository_identity(str(self.repository))
         if not isinstance(repository, claim_state.MacRepositoryIdentity):
             self.fail(f"The fixture repository has no Mac identity: {self.repository}")
-        return repository
+        return repository.with_history(self.repository)
 
     def write_kept_claim(self, host: str = "previous-mac", *, legacy: bool = False) -> RemoteClaimRecord:
         self.claim_file = Path(self.environment[

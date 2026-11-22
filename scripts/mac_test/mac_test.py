@@ -2039,6 +2039,9 @@ def claim_once(args: CliArguments, paths: StatePaths, scope: ClaimScope,
                                  for claim in overlapping):
             return ClaimHeldByCopy(tuple(claim.record for claim in overlapping))
         return ClaimBusy(overlapping[0].record)
+    if paths.platform == "macos" and isinstance(args.remote, str) and (
+            not isinstance(mac_repository, claim_state.MacRepositoryIdentity) or not mac_repository.has_history_key):
+        return ClaimDenied(12, "the Mac work claim needs a saved repository and history key")
     proc_start = process_identity.process_start(args.pid)
     if not isinstance(proc_start, process_identity.Started):
         return ClaimDenied(1, f"cannot claim: process {args.pid} is not running", to_stderr=True)
@@ -2148,7 +2151,9 @@ def adopt_wait_claim(args: CliArguments, paths: StatePaths, scope: ClaimScope,
             return refuse_wait_claim(WaitClaimCheck.BLOCK_STATE)
         if not isinstance(block, NoMacBlock):
             return blocked_claim(block)
-        if paths.platform == "macos" and "mac_repository" not in claim.record:
+        saved = claim_state.saved_mac_repository(claim.record)
+        if paths.platform == "macos" and (
+                isinstance(saved, claim_state.NoSavedMacRepository) or not saved.has_history_key):
             claim.path.unlink()
             return ClaimFinished(claim_state.LEGACY_WAIT_CLAIM_RELEASED, ("legacy reservation released",))
     record: RemoteJobClaim
@@ -2207,6 +2212,8 @@ def command_claim(args: CliArguments, paths: StatePaths, *, watch_claim: bool = 
             mac_repository = claim_state.mac_repository_record(cast(object, json.loads(args.mac_repository)))
         elif isinstance(mac_repository, claim_state.ResolveMacRepository):
             mac_repository = claim_state.mac_repository_identity(args.worktree)
+            if isinstance(mac_repository, claim_state.MacRepositoryIdentity):
+                mac_repository = mac_repository.with_history(Path(args.worktree))
     if isinstance(mac_repository, claim_state.ResolveMacRepository):
         mac_repository = WHOLE_MAC
     if not isinstance(assignment, UnassignedClaim):

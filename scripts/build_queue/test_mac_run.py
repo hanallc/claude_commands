@@ -22,8 +22,8 @@ from scripts.buildlog import repository
 from scripts.build_targets import build_targets, target_config
 from scripts.copies import copies
 from scripts.direct import phase_wait_holder
-from scripts.lib import process_start as process_identity
-from scripts.mac_test import claim_state, eligibility, mac_test, offload
+from scripts.lib import conf, process_start as process_identity
+from scripts.mac_test import claim_state, eligibility, mac_queue_run, mac_test, offload
 from scripts.production.gate_routes import SuiteMode
 
 
@@ -261,11 +261,18 @@ class MacRunTests(unittest.TestCase):
             return offload.LeftoverObservation(offload.parse_leftover_check(result.stdout), result.stdout)
 
         with mock.patch.object(eligibility, "read_connection_settings", return_value=eligibility.SshConnectionSettings(
-                "replacement-mac", 1, 1)), mock.patch.object(offload, "read_leftovers", side_effect=local_ssh):
+                "replacement-mac", 1, 1)), mock.patch.object(offload, "read_leftovers", side_effect=local_ssh) as check:
             args = build_targets.CliArguments()
             args.pid, args.repo_root = owner.pid, str(self.repo)
-            build_targets.cleanup_refused_claims(target_config.SshTarget("mac", "macos", config), args,
-                                               session=NoOwningSession())
+            target = target_config.SshTarget("mac", "macos", config)
+            before = held.path.read_bytes()
+            with copies.remote_host_lease("fixture-mac", exclusive=True), \
+                    mock.patch.object(mac_test, "command_release") as release:
+                build_targets.cleanup_refused_claims(target, args, session=NoOwningSession())
+            check.assert_not_called()
+            release.assert_not_called()
+            self.assertEqual(held.path.read_bytes(), before)
+            build_targets.cleanup_refused_claims(target, args, session=NoOwningSession())
         self.assertTrue(marker.exists())
         self.assertEqual(claim_state.read_claims(self.paths), ())
 
@@ -383,17 +390,26 @@ class MacRunTests(unittest.TestCase):
         source_b = self.repository("source-b")
         remote = ["git", "-C", str(self.checkout), "remote", "set-url", "origin"]
         resolve = claim_state.mac_repository_identity
-        for assigned, changed in ((True, True), (False, True), (True, False)):
-            with self.subTest(assigned=assigned, changed=changed):
+        self.addCleanup(step_estimator.clear_git_identity_cache)
+        cases = ((True, True, False), (False, True, False), (True, False, False), (False, False, True))
+        for assigned, changed, structured in cases:
+            with self.subTest(assigned=assigned, changed=changed, structured=structured):
                 _ = subprocess.run([*remote, str(self.repo)], check=True)
                 waiting = self.native_claim(self.checkout)
                 self.assertEqual(mac_test.command_claim(waiting, self.paths, watch_claim=False), 0)
                 reserved, = claim_state.read_claims(self.paths)
-                legacy = reserved.path.with_name("legacy.json")
                 record = reserved.record.copy()
-                _ = record.pop("mac_repository")
+                if structured:
+                    legacy = reserved.path
+                    assert "mac_repository" in record
+                    saved_record = record["mac_repository"].copy()
+                    _ = saved_record.pop("history_key")
+                    record["mac_repository"] = saved_record
+                else:
+                    legacy = reserved.path.with_name("legacy.json")
+                    _ = record.pop("mac_repository")
+                    reserved.path.unlink()
                 mac_test.write_json(legacy, record)
-                reserved.path.unlink()
                 identity = claim_state.claim_identity(record)
                 assignment = placement.PlacementAssignment(identity.episode, identity.attempt,
                     placement.PlacementDestination("mac", "mac", "fixture-mac", reserved.scope),
@@ -407,6 +423,9 @@ class MacRunTests(unittest.TestCase):
                                                    1, 1, 1, "1", {"linux_only.source-b": "", "linux_only..claude": ""})
                 if changed:
                     _ = subprocess.run([*remote, str(source_b)], check=True)
+                step_estimator.clear_git_identity_cache()
+                queue_repository, _ = step_estimator.git_identity(["cargo", "check"], str(self.checkout))
+                assert isinstance(queue_repository, RepositoryIdentity)
 
                 launch = cast(Callable[..., object], subprocess.Popen)
 
@@ -433,8 +452,10 @@ class MacRunTests(unittest.TestCase):
                         mock.patch.object(repository, "repo_name", side_effect=AssertionError("Do not resolve legacy policy")), \
                         mock.patch.object(copies, "remote_lease") as lease, \
                         mock.patch.object(offload, "claimed_run", return_value=offload.PassedOnMac(1)) as run:
-                    result = offload.run_offload(offload.ProcessController(), config, request, time.monotonic())
-                self.assertFalse(legacy.exists())
+                    controller = offload.ProcessController()
+                    result = offload.run_offload(controller, config, request, time.monotonic())
+                if not structured:
+                    self.assertFalse(legacy.exists())
                 if assigned and changed:
                     assert isinstance(result, offload.DeclinedMacRun)
                     self.assertEqual(result.reason, "source_changed")
@@ -448,6 +469,8 @@ class MacRunTests(unittest.TestCase):
                     saved = claim_state.saved_mac_repository(fresh.record)
                     assert isinstance(saved, claim_state.MacRepositoryIdentity)
                     self.assertEqual(saved.mirror_name, "source-b" if changed else ".claude")
+                    self.assertEqual(saved.history_key, queue_repository.key)
+                    self.assertEqual(controller.attempt_evidence.repository_key, queue_repository.key)
                     fresh_identity = claim_state.claim_identity(fresh.record)
                     if not assigned:
                         self.assertNotEqual(fresh_identity, identity)
@@ -509,7 +532,7 @@ class MacRunTests(unittest.TestCase):
                         mock.patch.object(offload, "check_current_leftovers", return_value=offload.LeftoversEnded()) as check, \
                         mock.patch.object(controller, "capture", side_effect=release) as release_child, \
                         mock.patch.object(offload, "claimed_run", return_value=offload.PassedOnMac(1)) as run:
-                    with copies.remote_lease(old_mirror), copies.remote_lease(live_mirror):
+                    with copies.remote_host_lease("old-mac", exclusive=True), copies.remote_lease(live_mirror):
                         self.assertIsInstance(offload.run_offload(controller, config, request, time.monotonic()),
                                               offload.BusyMacDecline)
                     take.assert_not_called()
@@ -522,6 +545,15 @@ class MacRunTests(unittest.TestCase):
                     check.assert_called_once_with(config, "old-mac", offload.ALL_MIRRORS if legacy else repo, "mac", 1)
                     release_child.assert_called_once()
                     run.assert_called_once()
+
+    def test_new_remote_claim_refuses_an_identity_without_history(self) -> None:
+        args = self.native_claim(self.checkout)
+        args.remote = "fixture-mac"
+        identity = claim_state.mac_repository_identity(str(self.checkout))
+        assert isinstance(identity, claim_state.MacRepositoryIdentity)
+        self.assertEqual(mac_test.command_claim(
+            args, self.paths, watch_claim=False, mac_repository=identity), 12)
+        self.assertEqual(claim_state.read_claims(self.paths), ())
 
     def test_fresh_takeover_waits_for_the_previous_hosts_cleanup_lease(self) -> None:
         with (self.root / "mac_test.conf").open("a") as settings:
@@ -702,6 +734,58 @@ class MacRunTests(unittest.TestCase):
         self.assertEqual(mac_test.free_now(self.paths, settings, self.checkout), "busy")
         with mock.patch.object(repository, "mac_source_repository", side_effect=AssertionError("Use the assigned scope")):
             self.assertEqual(mac_test.free_now(self.paths, settings, self.checkout, mac_scope=assigned_scope), "free")
+
+    def test_assigned_mac_policy_uses_the_current_checkout(self) -> None:
+        assigned = claim_state.RepositoryScope("retired-mirror", REPOSITORY_KEY)
+        settings = self.root / "mac_test.conf"
+        with settings.open("a") as output:
+            _ = output.write("linux_only.checkout=local-tests\n")
+        target = target_config.SshTarget("mac", "macos", settings)
+        configuration = conf.read(settings)
+        self.assertEqual(build_targets.mac_target_eligibility(
+            target, self.checkout, "hana", "test", target_config.ANY_ELIGIBLE_TARGET,
+            answer="bad", mac_scope=assigned, configuration=configuration), target_config.EligibleTarget(target))
+        self.assertEqual(build_targets.mac_target_eligibility(
+            target, self.checkout, "local-tests", "test", target_config.ANY_ELIGIBLE_TARGET,
+            answer="bad", mac_scope=assigned, configuration=configuration), target_config.ExcludedTarget(target, "linux_only"))
+
+    def test_shell_mirror_refuses_to_run_or_clean_up_during_host_lease(self) -> None:
+        mirror = copies.RemoteMirror("fixture", copies.SelectedRepository("checkout"),
+                                     "fixture-mac", "/fixture/checkout", "fixture-session")
+        copies.register_remote(mirror)
+        args = mac_queue_run.Arguments()
+        args.worktree, args.lifecycle_script, args.argv = self.checkout, "fixture-callback", ["true"]
+        args.no_wait = True
+
+        def callback(_script: str, phase: str, argv_file: Path, _argv: list[str],
+                     _environment: dict[str, str], **_options: object) -> int:
+            if phase == "prepare":
+                _ = argv_file.write_text('["true"]')
+                _ = argv_file.with_suffix(".json.lease").write_text(str(copies.remote_lease_path(mirror)))
+            else:
+                self.assertEqual(phase, "cleanup")
+                with self.assertRaises(copies.BusyRemoteHost), copies.remote_host_lease(mirror.host, exclusive=True):
+                    self.fail("Shell cleanup did not hold the host lease")
+                with self.assertRaises(copies.BusyRemoteMirror), copies.remote_lease(mirror):
+                    self.fail("Shell cleanup did not hold the mirror lease")
+            return 0
+
+        run_process = subprocess.CompletedProcess(["fixture-admission"], 0, stdout="")
+        with mock.patch.object(Path, "home", return_value=self.root), \
+                mock.patch.object(mac_queue_run, "admission_command", return_value=["fixture-admission"]), \
+                mock.patch.object(mac_queue_run, "capture_command",
+                                  return_value=(0, "a\tb\tfixture-mac\td\tepisode\tattempt")), \
+                mock.patch.object(mac_queue_run, "run_callback", side_effect=callback) as lifecycle, \
+                mock.patch.object(mac_queue_run, "stream_remote") as run, \
+                mock.patch.object(subprocess, "run", return_value=run_process):
+            with copies.remote_host_lease(mirror.host, exclusive=True):
+                self.assertEqual(mac_queue_run.run(args), 2)
+                mac_queue_run.clean_ended_runs({})
+            run.assert_not_called()
+            self.assertEqual([call.args[1] for call in lifecycle.call_args_list], ["prepare"])
+            mac_queue_run.clean_ended_runs({})
+            self.assertEqual([call.args[1] for call in lifecycle.call_args_list], ["prepare", "cleanup"])
+            self.assertEqual(list((self.root / mac_queue_run.RUNS).iterdir()), [])
 
     def test_guest_refuses_a_mirror_name_with_a_tab_before_writing_state(self) -> None:
         checkout = self.repository("with\ta-tab")

@@ -1929,15 +1929,39 @@ def remote_host_lease(host: str, *, exclusive: bool) -> Generator[None]:
 @contextmanager
 def remote_lease(mirror: RemoteMirror) -> Generator[None]:
     """Take the mirror lease before admission, claims and record locks."""
-    with (
-        remote_host_lease(mirror.host, exclusive=False),
-        file_lock.exclusive(remote_lease_path(mirror), wait=False) as state,
-    ):
+    with _remote_mirror_lock(mirror.host, remote_lease_path(mirror)) as state:
         if state is file_lock.LockResult.BUSY:
             record = remote_record_path(mirror)
             session = read_remote_mirror(record).session if record.exists() else mirror.session
             raise BusyRemoteMirror(f"{mirror.host}:{mirror.path}: busy; held by session {session}")
         yield
+
+
+@contextmanager
+def remote_mirror_lease(host: str, path: Path) -> Generator[None]:
+    """Take the lease named in a shell run's sidecar."""
+    if (path.parent != remote_registry() or path.suffix != ".lease" or len(path.stem) != 64
+            or any(character not in "0123456789abcdef" for character in path.stem)):
+        raise CopyError(f"{path}: invalid remote mirror lease path")
+    with _remote_mirror_lock(host, path) as state:
+        if state is file_lock.LockResult.BUSY:
+            raise BusyRemoteMirror(f"{path}: the mirror lease is busy")
+        record = path.with_suffix(".json")
+        if record.exists():
+            mirror = read_remote_mirror(record)
+            if mirror.host != host or remote_lease_path(mirror) != path:
+                raise CopyError(f"{path}: the lease does not match the registered mirror")
+        yield
+
+
+@contextmanager
+def _remote_mirror_lock(host: str, path: Path) -> Generator[file_lock.LockResult]:
+    """Take the same host and mirror leases for shell and Python callers."""
+    with (
+        remote_host_lease(host, exclusive=False),
+        file_lock.exclusive(path, wait=False) as state,
+    ):
+        yield state
 
 
 def path_missing_command(path: str) -> str:

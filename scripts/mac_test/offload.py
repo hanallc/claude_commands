@@ -3370,7 +3370,8 @@ def run_offload(
             except claim_state.StateReadError:
                 return declined("state", started)
             saved = claim_state.saved_mac_repository(held.record) if held is not None else claim_state.NO_SAVED_MAC_REPOSITORY
-            if held is not None and not held.record.get("cleanup_pending") and isinstance(saved, claim_state.MacRepositoryIdentity):
+            if (held is not None and not held.record.get("cleanup_pending")
+                    and isinstance(saved, claim_state.MacRepositoryIdentity) and saved.has_history_key):
                 policy_repository = saved
                 controller.attempt_evidence.repository_key = saved.history_key
             else:
@@ -3396,6 +3397,8 @@ def run_offload(
                     return DeclinedMacRun("source_changed", elapsed_seconds(started),
                                           "the current repository differs from the retired reservation's assignment")
             mac_repository = policy_repository = resolved.with_history(request.repo_root)
+            if not mac_repository.has_history_key:
+                return declined("repo" if config.enabled else "off", started)
             controller.attempt_evidence.repository_key = mac_repository.history_key
     decision = eligibility.mac_step_eligibility(config, request.repo_root, request.package, request.verb,
                                                request.target, kind=request.kind, mac_repository=policy_repository)
@@ -3496,7 +3499,6 @@ def adopt_wait_for_cleanup(controller: ProcessController, config: OffloadConfig,
                 if isinstance(claim, TakenOverMacClaim) and (claim.host != host or controller.mac_repository != saved):
                     return declined("state", started)
                 return cleanup_taken_over_claim(controller, config, request, claim, repository, started)
-            _ = release_claim(controller, request.target)
             return declined("state", started)
     except copies.BusyRemoteMirror:
         return BusyMacDecline(LostRunLeftovers(), elapsed_seconds(started))
@@ -3566,7 +3568,7 @@ def leased_offload(controller: ProcessController, config: OffloadConfig, request
         _ = release_claim(controller, request.target)
         return BusyMacDecline(LostRunLeftovers(), elapsed_seconds(started))
     saved = controller.mac_repository
-    if not linux and isinstance(saved, claim_state.NoSavedMacRepository):
+    if not linux and (isinstance(saved, claim_state.NoSavedMacRepository) or not saved.has_history_key):
         _ = release_claim(controller, request.target)
         return declined("state", started)
     if isinstance(saved, claim_state.MacRepositoryIdentity):

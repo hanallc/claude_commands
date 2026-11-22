@@ -859,10 +859,10 @@ finally:
     def kept_claim(self, host: str = "previous-mac") -> RunState:
         owner = self.start_child()
         claimed = self.command("claim", "--pid", str(owner.pid), "--what", "older tests",
-                               "--worktree", str(self.root / "older"), "--remote", host)
+                               "--worktree", str(self.root / "older"))
         self.assert_command(claimed, 0, "claimed\n")
-        record = self.run_state()
-        self.assertEqual(record.get("remote_host"), host)
+        record: RunState = {**self.run_state(), "remote_host": host}
+        mac_test.write_json(self.state_directory / "run.json", dict(record))
         self.stop_child(owner)
         return record
 
