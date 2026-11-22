@@ -777,6 +777,13 @@ class Result(NamedTuple):
     receiver: str = ""
 
 
+class RepeatGuardHeld(Result):
+    """The repeat guard took responsibility for the owner notice."""
+
+
+REPEAT_GUARD_REPORT = "SEND_HOLD: repeat-guard"
+
+
 class PaneTextDelivered(Result):
     """The observed worker pane accepted the text input."""
 
@@ -4606,6 +4613,10 @@ def remote(message: Message, host: str, options: Options) -> Result:
     command = ["ssh", "-o", "BatchMode=yes", host, f"{'CLAUDE_PID= ' if message.to == USER else ''}{REMOTE} {shlex.join(forwarded)}"]
     code, out, err = run(command, message.text, send_budget.remote_seconds(options.timeout))
     receiver, err = recipient_report(err)
+    error_lines = err.splitlines()
+    repeat_guard_held = REPEAT_GUARD_REPORT in error_lines
+    if repeat_guard_held:
+        err = "\n".join(line for line in error_lines if line != REPEAT_GUARD_REPORT)
     failure: FailureText = NO_FAILED_PUSH
     if message.to == USER and "send.py: failed push JSON: " in err:
         if isinstance(options.action, NoUserRecipient):
@@ -4622,6 +4633,8 @@ def remote(message: Message, host: str, options: Options) -> Result:
     detail = parsed.detail
     if parsed.payload:
         detail += "\n" + parsed.payload
+    if parsed.outcome == "held" and repeat_guard_held:
+        return RepeatGuardHeld("held", f"on {host}: {detail}", failure, receiver)
     return Result(parsed.outcome, f"on {host}: {detail}", failure, receiver)
 
 
@@ -5529,7 +5542,7 @@ def _send_with_review(options: Options, membership: staff.StaffSnapshot, review_
     elif isinstance(claim_result, RepeatPending):
         new_message_result = Result("retry" if options.review_delivery else "pending", claim_result.reason)
     elif guarded.held:
-        new_message_result = Result("held", f"repeat guard: copy {guarded.copies} held; owner notice queued")
+        new_message_result = RepeatGuardHeld("held", f"repeat guard: copy {guarded.copies} held; owner notice queued")
     elif review_error:
         new_message_result = Result("failed", review_error)
     elif isinstance(review_route, review_hold.AlreadyKeptForReview):
@@ -5888,6 +5901,8 @@ def main(argv: list[str]) -> int:
             outcome = ("pending" if options.review_delivery and isinstance(result, UncertainRelayDelivery)
                        else result.outcome)
             print(f"{outcome.upper()}: {result.detail}")
+            if options.report_recipient and isinstance(result, RepeatGuardHeld):
+                print(REPEAT_GUARD_REPORT, file=sys.stderr)
             if outcome == "failed" and options.to.startswith("uds:"):
                 print(f"send.py: {result.detail}", file=sys.stderr)
             if isinstance(result.failure, FailedPush):

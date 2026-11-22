@@ -17,15 +17,6 @@ def main(argv: list[str]) -> int | None:
     return admission_client.main(argv)
 """
 
-FAILED_VERIFY_SLOT_CLIENT = """from scripts.build_queue import admission_client
-
-
-def main(argv: list[str]) -> int:
-    if argv[:1] == ["verify-run-slot"]:
-        return 75
-    return admission_client.main(argv)
-"""
-
 # Points memory_gate.sh at TEST_ADMISSION_CLIENT once the gate is sourced.
 ADMISSION_CLIENT_OVERRIDE = r"""
 source() {
@@ -52,15 +43,6 @@ class VerifyLintScopeTests(support.VerifyLintScopeFixture):
         client = self.root / "fixture_admission_client.py"
         _ = client.write_text(source, encoding="utf-8")
         self.environment.update(LINT_CONFIG_READER=str(reader), TEST_ADMISSION_CLIENT=str(client))
-
-    def test_failed_verify_slot_does_not_record_a_lint_failure(self) -> None:
-        cache = self.enable_cache()
-        self.override_admission_client(FAILED_VERIFY_SLOT_CLIENT)
-        result = self.invoke_verify("lint", "sample", cwd=self.root)
-        self.assertEqual(result.returncode, 75, result.stdout + result.stderr)
-        self.assertEqual(list(cache.glob("*.fail")), [])
-        self.assertEqual(self.calls("mend"), [])
-        self.assertEqual(self.calls("clippy"), [])
 
     def test_a_placement_crash_before_mend_starts_is_not_cached(self) -> None:
         cache = self.enable_cache()

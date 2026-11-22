@@ -27,13 +27,27 @@ import re
 import subprocess
 import sys
 from dataclasses import dataclass
+from pathlib import Path
 from typing import cast
 
+from scripts.lib.main_push_lock import main_push_lock
 from scripts.maintenance.settings import settings
-def git(repo: str, *args: str) -> subprocess.CompletedProcess[str]:
+
+
+VAULT_FSYNC = "core.fsync=committed"
+
+
+def git_bytes(repo: str, *args: str, input_data: bytes | None = None,
+              env: dict[str, str] | None = None) -> subprocess.CompletedProcess[bytes]:
     # Literal pathspecs: note names hold spaces and could hold glob characters.
-    command = ["git", "-C", repo, "--literal-pathspecs", *args]
-    return subprocess.run(command, capture_output=True, text=True, timeout=settings().vault_git_seconds)
+    command = ["git", "-C", repo, "-c", VAULT_FSYNC, "--literal-pathspecs", *args]
+    return subprocess.run(command, input=input_data, capture_output=True, env=env, timeout=settings().vault_git_seconds)
+
+
+def git(repo: str, *args: str) -> subprocess.CompletedProcess[str]:
+    result = git_bytes(repo, *args)
+    return subprocess.CompletedProcess(cast(list[str], result.args), result.returncode,
+                                       os.fsdecode(result.stdout), os.fsdecode(result.stderr))
 
 
 @dataclass(frozen=True)
@@ -111,11 +125,15 @@ def main(argv: list[str] | None = None) -> int:
         print(f"{job}: not committed, {os.path.dirname(paths[0])} is not in a git repo", file=sys.stderr)
         return 0
     repo = os.path.realpath(top.stdout.strip())
-    rels = changed(repo, [os.path.relpath(p, repo) for p in paths], patterns)
-    if not rels:
-        print(f"{job}: nothing to commit beyond timestamps")
-        return 0
-    _ = commit(repo, job, rels)
+    try:
+        with main_push_lock(Path(repo), job, wait=False):
+            rels = changed(repo, [os.path.relpath(p, repo) for p in paths], patterns)
+            if not rels:
+                print(f"{job}: nothing to commit beyond timestamps")
+                return 0
+            _ = commit(repo, job, rels)
+    except BlockingIOError:
+        print(f"{job}: vault lock is busy, next run retries", file=sys.stderr)
     return 0
 
 
