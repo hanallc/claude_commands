@@ -151,10 +151,11 @@ Settings entry for the user, one more SessionEnd item:
 
 Each upkeep run uses this order:
 
-1. Restore or adopt the shared herdr server.
-2. Save the shared layout.
-3. Refresh the detection rules.
-4. Resume each selected producer through `stop_resume.resume(str(row.id))`.
+1. Check nightly assignments with `gate.check_nightly_assignments()`.
+2. Restore or adopt the shared herdr server.
+3. Save the shared layout.
+4. Refresh the detection rules.
+5. Resume each selected producer through `stop_resume.resume(str(row.id))`.
 
 `accounts.producer_upkeep_members()` reads the local staff snapshot.
 It selects active, local, unpaused producers from both families, without exit requests.

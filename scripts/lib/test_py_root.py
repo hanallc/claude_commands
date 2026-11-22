@@ -53,7 +53,7 @@ def selected_suite(repo, *args, **kwargs):
     return gate.run_suites(repo, machine=gate.WholeMachine(),
         selected=gate.SelectedModules(('scripts/build_targets/test_copy_imports.py',)),
         mode=kwargs['mode'])
-sys.argv = [str(root / 'scripts/production/targeted_test.py'), '--repo', str(root)]
+sys.argv = [str(root / 'scripts/production/gate.py'), '--affected', '--repo', str(root)]
 with mock.patch.object(gate, 'run_gate_suites', side_effect=selected_suite):
     try:
         runpy.run_path(sys.argv[0], run_name='__main__')
