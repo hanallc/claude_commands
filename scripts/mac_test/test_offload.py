@@ -1016,6 +1016,18 @@ class BusyHolderTests(unittest.TestCase):
 
 @final
 class VerifyMirrorWaitTests(verify_mac_offload_test_support.VerifyMacOffloadFixture):
+    def test_unreadable_history_ends_verify_without_a_retry(self) -> None:
+        git = self.bin_directory / "git"
+        source = git.read_text().replace("#!/bin/bash\n",
+            '#!/bin/bash\nif [[ " $* " == *" rev-list "* ]]; then exit 1; fi\n', 1)
+        self.write_executable(git, source)
+        result = self.verify("test", "sample", "--filter", "alpha", "--no-cache",
+                             extra={"VERIFY_MAC_RUNNER": str(offload.__file__)})
+        output = result.stdout + result.stderr
+        self.assertEqual(result.returncode, 15, output)
+        self.assertEqual(output.count("history_key_unavailable"), 1, output)
+        self.assertEqual(self.local_runs(), [])
+
     def test_verify_waits_and_names_the_busy_mirror_session(self) -> None:
         _ = self.routing_fixture()
         git = self.bin_directory / "git"
