@@ -3,15 +3,18 @@ from __future__ import annotations
 
 import sqlite3
 from collections import Counter
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
+from concurrent.futures import Future
 from dataclasses import dataclass, field
-from datetime import UTC, datetime, tzinfo
+from datetime import UTC, date, datetime, tzinfo
+from enum import Enum, StrEnum
+from threading import Thread
 from pathlib import Path
-from typing import Literal, cast
+from typing import Literal, cast, final
 from urllib.parse import urlsplit
 
 from scripts.aws_target import config as aws_config, hana_box, hana_placement, spend
-from scripts.build_queue import admission_protocol as wire, admission_records as records, execution_identity
+from scripts.build_queue import admission_protocol as wire, admission_records as records
 from scripts.build_queue import placement, queue_view, target_availability
 from scripts.build_queue.admission_wire import ReservedCloudSlot
 from scripts.build_queue.slot_wait import public_queue_text
@@ -22,7 +25,13 @@ from scripts.lib import conf, git_files
 from scripts.lint.memory_admit import gpu_test_reservation, repository_run_owner, reserved_repository_runs
 from scripts.mac_test import claim_state, eligibility, mac_test
 
-WORDS: Mapping[str | type[object], str] = {
+@dataclass(frozen=True)
+class WaitWords:
+    one: str
+    many: str
+
+
+WORDS: Mapping[str | type[object], str | WaitWords] = {
     "title": "Build limits",
     "table": "Build limits by repository and machine",
     "repository": "Repository",
@@ -32,22 +41,21 @@ WORDS: Mapping[str | type[object], str] = {
     "not_available": "Not available",
     "count": "{used} of {limit}",
     "limit": "Limit {limit}",
+    "limit_set": "Limit set",
     "no_limit": "No limit",
     "running": "{count} running",
     "occupied": "{count} in use",
     "other_running": "{count} other running",
     "merge_above": "A merge run above the limit",
     "policy_key": "{name} run limit",
-    "shared_policy": "Shared {name} run limit",
+    "repository_run_limit": "Repository run limit",
     "uses_cloud": "Uses the AWS places",
-    "stale_history": "Build history is stale.",
     "memory": "Memory for builds",
     "gpu": "GPU tests",
     "disk": "Free disk",
     "cloud": "Places",
     "money": "Money today",
     "minimum_value": "{used} · {limit} minimum",
-    "minimum_only": "{limit} minimum",
     "gib_value": "{value} GiB",
     "money_value": "${value}",
     "bill": "bill",
@@ -58,33 +66,66 @@ WORDS: Mapping[str | type[object], str] = {
     "held": "Held",
     "held_until": "Held until {time}",
     "unreachable": "Unreachable",
-    "waiting": "{count} waiting",
     "legend_run": "A run that is in progress",
     "legend_free": "A free place",
     "legend_line": "The limit",
     "legend_wait": "A run that waits",
-    records.TokenWaitingWaiter: "The run waits for permission to continue its Cargo work.",
-    records.EstimateExpired: "The queue needs a new memory estimate before this run can start.",
-    records.ReadingUnavailable: "The queue cannot check whether this run can start.",
-    records.NatedevHeld: "This run waits for the hold on natedev to end.",
-    records.MemoryPressure: "This run waits while other work on the machine needs memory.",
-    records.PressureUnavailable: "The queue cannot check whether other work on the machine needs memory.",
-    records.StartSpacingWait: "This run waits briefly because another step just started.",
-    records.BuildSpaceUnreadable: "The queue cannot check how much space is free on the build disk.",
-    records.BuildSpaceLow: "The build disk has less free space than the queue requires.",
-    placement.CargoFolderWait: "This run waits for another build to release the same build folder.",
-    records.NeedsMemory: "This run needs more free memory to start.",
-    records.GpuSlotWait: "All GPU test places are in use.",
-    records.RunLimitWait: "The run limit for {repository} on {machine} is full.",
-    records.BehindHead: "This run waits behind an earlier step in the queue.",
-    "remote_start": "This run waits while a step starts on another machine.",
-    records.ReadyForAdmission: "The queue can start this run at its next check.",
-    wire.CloudSlotWait: "This run waits for a place on AWS.",
-    ReservedCloudSlot: "This run has a place on AWS and waits for its machine to start.",
+    records.TokenWaitingWaiter: WaitWords("1 run waits for permission to continue its Cargo work.",
+        "{count} runs wait for permission to continue their Cargo work."),
+    records.EstimateExpired: WaitWords("1 run waits because the queue needs a new memory estimate before it can start.",
+        "{count} runs wait because the queue needs new memory estimates before they can start."),
+    records.ReadingUnavailable: WaitWords("1 run waits because the queue cannot check whether it can start.",
+        "{count} runs wait because the queue cannot check whether they can start."),
+    records.NatedevHeld: WaitWords("1 run waits for the hold on natedev to end.",
+        "{count} runs wait for the hold on natedev to end."),
+    records.MemoryPressure: WaitWords("1 run waits while other work on the machine needs memory.",
+        "{count} runs wait while other work on the machine needs memory."),
+    records.PressureUnavailable: WaitWords("1 run waits because the queue cannot check whether other work needs memory.",
+        "{count} runs wait because the queue cannot check whether other work needs memory."),
+    records.StartSpacingWait: WaitWords("1 run waits briefly because another step just started.",
+        "{count} runs wait briefly because another step just started."),
+    records.BuildSpaceUnreadable: WaitWords("1 run waits because the queue cannot check how much space is free on the build disk.",
+        "{count} runs wait because the queue cannot check how much space is free on the build disk."),
+    records.BuildSpaceLow: WaitWords("1 run waits because the build disk has less free space than the queue requires.",
+        "{count} runs wait because the build disk has less free space than the queue requires."),
+    placement.CargoFolderWait: WaitWords("1 run waits for another build to release the same build folder.",
+        "{count} runs wait for another build to release the same build folder."),
+    records.NeedsMemory: WaitWords("1 run needs more free memory to start.", "{count} runs need more free memory to start."),
+    records.GpuSlotWait: WaitWords("1 run waits because all GPU test places are in use.",
+        "{count} runs wait because all GPU test places are in use."),
+    records.RunLimitWait: WaitWords("1 run waits because the run limit for {repository} on {machine} is full.",
+        "{count} runs wait because the run limit for {repository} on {machine} is full."),
+    "run_limit_full": WaitWords("1 run waits because the repository run limit is full.",
+        "{count} runs wait because the repository run limit is full."),
+    records.BehindHead: WaitWords("1 run waits behind an earlier step in the queue.",
+        "{count} runs wait behind an earlier step in the queue."),
+    "remote_start": WaitWords("1 run waits while a step starts on another machine.",
+        "{count} runs wait while a step starts on another machine."),
+    records.ReadyForAdmission: WaitWords("1 run can start at the queue's next check.",
+        "{count} runs can start at the queue's next check."),
+    wire.CloudSlotWait: WaitWords("1 run waits for a place on AWS.", "{count} runs wait for a place on AWS."),
+    ReservedCloudSlot: WaitWords("1 run has a place on AWS and waits for its machine to start.",
+        "{count} runs have a place on AWS and wait for their machines to start."),
+    "wait": WaitWords("1 run waits.", "{count} runs wait."),
 }
-PAGE_WORDS = {key: text for key, text in WORDS.items() if isinstance(key, str)}
+PAGE_WORDS = {key: text for key, text in WORDS.items() if isinstance(key, str) and isinstance(text, str)}
+WAIT_WORDS = {key: text for key, text in WORDS.items() if isinstance(text, WaitWords)}
 
 HISTORY_SECONDS = 30 * 24 * 60 * 60
+
+
+class ReadingState(Enum):
+    OMITTED = "omitted"
+    UNAVAILABLE = "unavailable"
+
+
+@dataclass(frozen=True)
+class WaitGroup:
+    words: WaitWords
+    names: list[str] = field(default_factory=list[str])
+
+
+type WaitGroups = dict[str, WaitGroup]
 
 
 @dataclass(frozen=True)
@@ -94,8 +135,16 @@ class Metric:
     limit: float | None
     unit: Literal["", "GiB", "USD"] = ""
     qualifier: str = ""
-    waits: Mapping[str, list[str]] = field(default_factory=dict[str, list[str]])
+    waits: Mapping[str, WaitGroup] = field(default_factory=dict[str, WaitGroup])
     unreadable: bool = False
+    reserved_waiting: int = 0
+    exempt_runs: int = 0
+
+
+class CellPolicy(StrEnum):
+    UNRESOLVED = "unresolved"
+    CONFIGURED = "configured"
+    NO_LIMIT = "no_limit"
 
 
 @dataclass
@@ -103,18 +152,18 @@ class Cell:
     limit: int | None = None
     used: int | None = None
     other_used: int = 0
-    has_limit_key: bool = False
+    policy: CellPolicy = CellPolicy.UNRESOLVED
     runs: list[str] = field(default_factory=list[str])
     merge_above: list[str] = field(default_factory=list[str])
     other: list[str] = field(default_factory=list[str])
-    waits: dict[str, list[str]] = field(default_factory=dict[str, list[str]])
+    waits: WaitGroups = field(default_factory=dict[str, WaitGroup])
     note: str = ""
+    show_marks: bool = True
 
 
 @dataclass
 class RepositoryRow:
     name: str
-    owner: str = ""
     quiet: bool = True
     natedev: Cell = field(default_factory=Cell)
     mac: Cell = field(default_factory=Cell)
@@ -125,7 +174,7 @@ class RepositoryRow:
 class MachineLimits:
     state: str
     shared: tuple[Metric, ...]
-    waits: dict[str, list[str]]
+    waits: WaitGroups
     unattributed: int = 0
 
 
@@ -136,76 +185,8 @@ class BuildLimits:
     aws: MachineLimits
     repositories: tuple[RepositoryRow, ...]
     history_unavailable: bool
-    history_stale: bool
-    unplaced: dict[str, list[str]]
+    unplaced: WaitGroups
     words: Mapping[str, str] = field(default_factory=lambda: PAGE_WORDS)
-
-
-@dataclass(frozen=True)
-class MacClaim:
-    scope: claim_state.ClaimScope
-    limit: int
-    origin: str
-    working_session: str
-
-
-@dataclass(frozen=True)
-class MacReading:
-    target: str
-    state: targets.TargetState | None
-    claims: tuple[MacClaim, ...] = ()
-    limits: Mapping[str, int] = field(default_factory=dict[str, int])
-    claims_readable: bool = False
-
-
-def read_mac(snapshots: target_availability.Snapshots, origins: Origins | None) -> MacReading | None:
-    """Resolve Mac claims and repository limits before the feed uses them."""
-    if isinstance(snapshots, target_availability.SnapshotsUnreadable):
-        return None
-    for snapshot in snapshots:
-        target = snapshot.target
-        if isinstance(target, target_config.SshTarget) and target.platform == "macos":
-            break
-    else:
-        return None
-    state = snapshot.states[0]
-    paths = claim_state.StatePaths(target_config.ssh_target_state_directory(target.name), target.name,
-                                  registry_selected=True, platform=target.platform)
-    recorded_claims = snapshot.claims
-    if not recorded_claims and isinstance(state, targets.StateUnreadable):
-        # Main returns no claims if the claim read fails. Check this read separately.
-        try:
-            recorded_claims = claim_state.read_claims(paths)
-        except (OSError, UnicodeError, claim_state.StateReadError):
-            return MacReading(target.name, state)
-    checkout_origins = Origins()
-    claims: dict[claim_state.ClaimIdentity, MacClaim] = {}
-    for claim in recorded_claims:
-        record = claim.record
-        identity = claim_state.claim_identity(record)
-        if identity in claims or not mac_test.run_is_live(record):
-            continue
-        # The legacy Mac admits a checkout with a name-only scope.
-        scope = (claim_state.RepositoryScope(claim.scope.name)
-                 if isinstance(claim.scope, claim_state.RepositoryScope) else claim.scope)
-        origin = ""
-        if isinstance(scope, claim_state.RepositoryScope):
-            origin = recorded_origin(record.get("repo_key", "")) or checkout_origins.read(record["worktree"], origins)
-        session = (record["submitting_session"]
-                   if not record.get("cleanup_pending") and mac_test.run_holds_work(record) else "")
-        claims[identity] = MacClaim(scope, mac_test.slot_capacity(paths, scope), origin, session)
-    settings = conf.read(target.settings)
-    limits: dict[str, int] = {}
-    names = {name for names in origins.names.values() for name in names} if origins is not None else set[str]()
-    for name in names:
-        # A check reads the repository rule without testing workspace packages.
-        try:
-            policy = eligibility.linux_only_policy(settings, eligibility.KnownRepository(name), Path(), "", "check")
-            if isinstance(policy, eligibility.KnownRepository):
-                limits[name] = mac_test.slot_capacity(paths, claim_state.RepositoryScope(name), configuration=settings)
-        except conf.Unusable:
-            continue
-    return MacReading(target.name, state, tuple(claims.values()), limits, claims_readable=True)
 
 
 def recorded_origin(identity: str) -> str:
@@ -222,7 +203,9 @@ def recorded_origin(identity: str) -> str:
 class OriginReading:
     checkout: Path
     config: Path
-    stamp: tuple[int, int, int]
+    device: int
+    inode: int
+    modified_ns: int
     remote: str | Path
 
 
@@ -232,120 +215,148 @@ def checkout_origin(folder: Path, earlier: OriginReading | None, *,
         checkout = git_files.at(folder) if local_remote else git_files.locate(folder)
         config = checkout.common_dir / "config"
         status = config.stat()
-        stamp = (status.st_dev, status.st_ino, status.st_mtime_ns)
         if (earlier is not None and earlier.checkout == checkout.toplevel
-                and earlier.config == config and earlier.stamp == stamp):
+                and earlier.config == config and earlier.device == status.st_dev
+                and earlier.inode == status.st_ino and earlier.modified_ns == status.st_mtime_ns):
             return earlier
         value = repository.output(
             ["git", "config", "--no-includes", "--file", str(config), "--get", "remote.origin.url"],
             str(folder), repository.GIT_TIMEOUT_S)
-        if not value or not (remote := value.strip()):
+        if value is None:
             return None
-        identity = repository.remote_identity(remote, str(folder))
+        remote = value.strip()
+        identity = repository.remote_identity(remote, str(folder)) if remote else ""
+        destination: str | Path
         if identity.startswith("/"):
             local_path = urlsplit(remote).path if remote.startswith("file:") else remote
-            return OriginReading(checkout.toplevel, config, stamp, (folder / Path(local_path).expanduser()).resolve())
-        return OriginReading(checkout.toplevel, config, stamp, recorded_origin(identity))
+            destination = (folder / Path(local_path).expanduser()).resolve()
+        else:
+            destination = recorded_origin(identity)
+        return OriginReading(checkout.toplevel, config, status.st_dev, status.st_ino, status.st_mtime_ns, destination)
     except (OSError, ValueError, RuntimeError):
         return None
 
 
-@dataclass
+@dataclass(frozen=True)
 class Origins:
-    folders: dict[Path, OriginReading | None] = field(default_factory=dict[Path, OriginReading | None])
-    resolved: dict[str, str] = field(default_factory=dict[str, str])
-    active_folders: set[str] = field(default_factory=set[str])
-    names: dict[str, set[str]] = field(default_factory=dict[str, set[str]])
+    folders: Mapping[Path, OriginReading] = field(default_factory=dict[Path, OriginReading])
+    resolved: Mapping[str, str] = field(default_factory=dict[str, str])
+    source_names: Mapping[str, set[str]] = field(default_factory=dict[str, set[str]])
 
     def resolve(self, identity: str, folder: str) -> str:
-        """Use a recorded origin or an origin from the last refresh."""
-        if origin := recorded_origin(identity):
-            return origin
-        if identity.startswith("/"):
-            self.active_folders.add(identity)
-            if origin := self.resolved.get(identity):
-                return origin
-        if not folder.startswith("/"):
-            return ""
-        self.active_folders.add(folder)
-        return self.resolved.get(folder, "")
+        """Use the recorded origin or the checkout's own origin."""
+        return recorded_origin(identity) or self.resolved.get(identity) or self.resolved.get(folder, "")
 
-    def read(self, folder: str, earlier: Origins | None = None) -> str:
-        """Read at most three checkout configs along the origin chain."""
-        if not folder.startswith("/"):
-            return ""
-        if folder in self.resolved:
-            return self.resolved[folder]
-        self.resolved[folder] = ""
-        path = Path(folder)
-        for depth in range(3):
-            if path not in self.folders:
-                prior = earlier.folders.get(path) if earlier is not None else None
-                self.folders[path] = checkout_origin(path, prior, local_remote=depth > 0)
-            entry = self.folders[path]
-            if entry is None or (depth and path != entry.checkout):
-                break
-            if isinstance(entry.remote, str):
-                if entry.remote:
-                    self.resolved[folder] = entry.remote
-                    self.names.setdefault(entry.remote, set()).add(entry.config.parent.parent.name)
-                break
-            path = entry.remote
-        return self.resolved[folder]
+    def refresh(self, folders: Iterable[str]) -> Origins:
+        """Read each checkout config and reuse values for unchanged files."""
+        found: dict[Path, OriginReading] = {}
+        resolved: dict[str, str] = {}
+        source_names: dict[str, set[str]] = {}
+        for folder in folders:
+            path = Path(folder)
+            if not path.is_absolute():
+                continue
+            for depth in range(3):
+                entry = found.get(path)
+                if entry is None:
+                    entry = checkout_origin(path, self.folders.get(path), local_remote=depth > 0)
+                    if entry is None:
+                        break
+                    found[path] = entry
+                if depth and path != entry.checkout:
+                    break
+                if isinstance(entry.remote, str):
+                    resolved[folder] = entry.remote
+                    if entry.remote:
+                        source_names.setdefault(entry.remote, set()).add(entry.config.parent.parent.name)
+                    break
+                path = entry.remote
+        return Origins(found, resolved, source_names)
 
 
-def recent_steps(connection: sqlite3.Connection, now: float, origins: Origins,
-                 earlier: Origins | None = None) -> frozenset[str]:
-    """Collect the source origins of the build steps in the last 30 days."""
-    rows = cast(Iterable[tuple[object, object]], connection.execute(
-        """SELECT DISTINCT repo_identity, repo_path FROM steps WHERE started_at >= ? AND started_at <= ?""",
+@dataclass(frozen=True)
+class CheckoutUse:
+    folder: str
+    owner: wire.Owner
+    reservation: str = ""
+
+
+@dataclass(frozen=True)
+class WaitingCheckout:
+    folder: str
+    pid: int
+    since: float
+
+
+def waiting_cause(step: records.WaitingStep) -> records.WaitReason:
+    return step.reason.cause if isinstance(step.reason, records.HeadAdmissionStatus) else step.reason
+
+
+def active_checkouts(reading: records.QueueRead) -> frozenset[CheckoutUse | WaitingCheckout]:
+    inputs = reading.explanation.decided_from
+    checkouts: set[CheckoutUse | WaitingCheckout] = {
+        CheckoutUse(item["worktree"], wire.Owner(item["pid"], item["start_time"]),
+                    item.get("reservation_id", item["admitted_at"]))
+        for item in inputs.reservations if item["worktree"]
+    }
+    for step in reading.view.waiting:
+        reason = waiting_cause(step)
+        if isinstance(reason, records.RunLimitWait) and reason.machine == inputs.local_machine and step.folder:
+            checkouts.add(WaitingCheckout(step.folder, step.pid, step.since))
+    if isinstance(reading, wire.CloudQueueRead):
+        checkouts.update(CheckoutUse(row.identity.folder, row.owner) for row in reading.cloud if row.identity.folder)
+    return frozenset(checkouts)
+
+
+def recent_steps(connection: sqlite3.Connection, now: float) -> frozenset[str]:
+    """Collect the origins recorded by build steps in the last 30 days."""
+    rows = cast(Iterable[tuple[object]], connection.execute(
+        """SELECT DISTINCT repo_identity FROM steps WHERE started_at >= ? AND started_at <= ?""",
         (store.utc_iso(now - HISTORY_SECONDS), store.utc_iso(now))))
-    history: set[str] = set()
-    for identity, path in rows:
-        key = identity if isinstance(identity, str) else ""
-        folder = path if isinstance(path, str) else ""
-        origin = recorded_origin(key) or origins.read(key, earlier)
-        checkout_origin = origins.read(folder, earlier)
-        if origin or checkout_origin:
-            history.add(origin or checkout_origin)
-    return frozenset(history)
+    return frozenset(origin for (identity,) in rows
+                     if isinstance(identity, str) and (origin := recorded_origin(identity)))
+
+
+def read_history(now: float) -> frozenset[str] | ReadingState:
+    history = charts.read_index(lambda connection: recent_steps(connection, now))
+    return ReadingState.UNAVAILABLE if isinstance(history, charts.IndexUnavailable) else history
 
 
 @dataclass(frozen=True)
 class HanaCapacity:
     repository: str
-    host: str
     limit: int
-    used: int | None
+    used: int | ReadingState
 
 
 @dataclass(frozen=True)
 class Background:
-    history: frozenset[str] | charts.IndexUnavailable
+    history: frozenset[str] | ReadingState
     aws_money: Metric
-    cloud_slots: int | None = None
-    disk_floor: int | None = None
-    hana: tuple[HanaCapacity, ...] = ()
+    cloud_slots: int | ReadingState = ReadingState.OMITTED
+    hana: tuple[HanaCapacity, ...] | ReadingState = ReadingState.OMITTED
     aws_targets: frozenset[str] = field(default_factory=frozenset[str])
     origins: Origins = field(default_factory=Origins)
-    history_stale: bool = False
 
 
-def hana_use(target: str, transport: HanaControlTransport, policy: hana_placement.EnabledHanaRoute) -> int | None:
-    """Count claims when the lifecycle and target records identify the same work."""
+def hana_use(target: str, transport: HanaControlTransport, policy: hana_placement.EnabledHanaRoute) -> int | ReadingState:
+    """Count claims when both reads agree on the same work and host boot."""
     try:
         controller = hana_placement.controller_for(transport, read_only=True)
+        paths = claim_state.state_paths(target)
         lifecycle = controller.read_saved_lifecycle()
-        claims = claim_state.read_claims(claim_state.state_paths(target))
-    except (OSError, ValueError, KeyError, TypeError):
-        return None
+        claims = claim_state.read_claims(paths)
+        if lifecycle != controller.read_saved_lifecycle() or claims != claim_state.read_claims(paths):
+            return ReadingState.OMITTED
+    except (OSError, ValueError, KeyError, TypeError, claim_state.StateReadError):
+        return ReadingState.UNAVAILABLE
     if not isinstance(lifecycle, hana_box.HanaLifecycleEvidence):
-        return None
+        return ReadingState.OMITTED
     recorded = {claim.execution for claim in lifecycle.claims}
     if not recorded and not claims:
         return 0
     if not isinstance(lifecycle.boot, hana_box.VerifiedBoot):
-        return None
+        return ReadingState.OMITTED
     generation = hana_placement.generation_text(hana_placement.HanaHostGeneration(
         lifecycle.deployment.deployment, lifecycle.boot.start_token, lifecycle.boot.boot_id))
     matched: set[str] = set()
@@ -353,27 +364,41 @@ def hana_use(target: str, transport: HanaControlTransport, policy: hana_placemen
         if (not isinstance(claim.scope, claim_state.RepositoryScope) or claim.scope.key != policy.repository_key
                 or claim.record.get("remote_host") != transport.host
                 or claim.record.get("instance_generation") != generation):
-            return None
+            return ReadingState.OMITTED
         matched.add(claim.record["claim_id"])
-    return len(matched) if matched == recorded else None
+    return len(matched) if matched == recorded else ReadingState.OMITTED
 
 
-def aws_routes() -> tuple[tuple[HanaCapacity, ...], frozenset[str]]:
+@dataclass(frozen=True)
+class HanaRoute:
+    target: str
+    transport: HanaControlTransport
+    settings: hana_placement.EnabledHanaRoute
+
+
+@dataclass(frozen=True)
+class AwsRoutes:
+    hana: tuple[HanaRoute, ...] | Literal[ReadingState.UNAVAILABLE] = ()
+    targets: frozenset[str] = field(default_factory=frozenset[str])
+
+
+def aws_routes() -> AwsRoutes | ReadingState:
     try:
         settings = conf.read("build_targets")
         targets_read = target_config.read_targets(configuration=settings, purpose=target_config.RegistryRead.PLACEMENT)
         pinned = settings.value("pinned_targets", str, default="", allow_blank=True)
     except (OSError, ValueError):
-        return (), frozenset()
+        return ReadingState.UNAVAILABLE
     configured = {target.name: target for target in targets_read}
+    route_read_failed = False
     for name in filter(None, (value.strip() for value in pinned.split(","))):
         if name not in configured:
             try:
                 configured.update((target.name, target) for target in target_config.read_targets(
                     selected=name, configuration=settings, purpose=target_config.RegistryRead.PLACEMENT))
             except (OSError, ValueError):
-                continue
-    hana: list[HanaCapacity] = []
+                route_read_failed = True
+    hana: list[HanaRoute] = []
     aws: set[str] = set()
     for target in configured.values():
         if not isinstance(target, target_config.SshTarget) or target.platform != "linux":
@@ -385,11 +410,14 @@ def aws_routes() -> tuple[tuple[HanaCapacity, ...], frozenset[str]]:
             if isinstance(transport, HanaControlTransport):
                 route = hana_placement.read_settings(conf.read(transport.settings))
                 if isinstance(route, hana_placement.EnabledHanaRoute):
-                    hana.append(HanaCapacity(route.repository_key, transport.host, route.max_steps,
-                                            hana_use(target.name, transport, route)))
+                    hana.append(HanaRoute(target.name, transport, route))
         except (OSError, ValueError, KeyError):
-            continue
-    return tuple(hana), frozenset(aws)
+            route_read_failed = True
+    return AwsRoutes(ReadingState.UNAVAILABLE if route_read_failed else tuple(hana), frozenset(aws))
+
+
+def read_hana_occupancy(routes: tuple[HanaRoute, ...]) -> dict[HanaRoute, int | ReadingState]:
+    return {route: hana_use(route.target, route.transport, route.settings) for route in routes}
 
 
 def spending(now: float) -> Metric:
@@ -413,31 +441,235 @@ def spending(now: float) -> Metric:
     return Metric("money", used, limit, "USD", qualifier, unreadable=unreadable)
 
 
-def background(now: float, active_folders: Sequence[str] = (), earlier: Origins | None = None) -> Background:
-    """Read saved sources at the report interval."""
-    origins = Origins()
+def read_cloud_slots() -> int:
+    return conf.read("build_admission").whole("cloud_gate_slots")
+
+
+def safe_read[T](read: Callable[[], T]) -> T | ReadingState:
     try:
-        history = charts.read_index(lambda connection: recent_steps(connection, now, origins, earlier))
-    except (OSError, ValueError) as error:
-        history = charts.IndexUnavailable(str(error))
-    for folder in active_folders:
-        _ = origins.read(folder, earlier)
-    settings = conf.read("build_admission")
-    try:
-        cloud_slots = settings.whole("cloud_gate_slots")
-    except conf.Unusable:
-        cloud_slots = None
-    try:
-        disk_floor = settings.whole("free_floor_gib")
-    except conf.Unusable:
-        disk_floor = None
-    hana, aws = aws_routes()
-    return Background(history, spending(now), cloud_slots, disk_floor, hana, aws, origins)
+        return read()
+    except (OSError, ValueError, KeyError, RuntimeError, sqlite3.Error):
+        return ReadingState.UNAVAILABLE
+
+
+def background(history: frozenset[str] | ReadingState, money: Metric | ReadingState,
+               cloud_slots: int | ReadingState, routes: AwsRoutes | ReadingState,
+               occupancy: Mapping[HanaRoute, int | ReadingState] | ReadingState,
+               origins: Origins | ReadingState) -> Background:
+    """Keep the facts available from each independent source."""
+    aws = AwsRoutes() if isinstance(routes, ReadingState) else routes
+    hana_routes = routes if isinstance(routes, ReadingState) else routes.hana
+    hana = (hana_routes if isinstance(hana_routes, ReadingState) else
+            tuple(HanaCapacity(route.settings.repository_key, route.settings.max_steps,
+                               occupancy if isinstance(occupancy, ReadingState)
+                               else occupancy.get(route, ReadingState.OMITTED)) for route in hana_routes))
+    spend_metric = Metric("money", None, None, "USD", unreadable=money is ReadingState.UNAVAILABLE)
+    return Background(history, spend_metric if isinstance(money, ReadingState) else money,
+                      cloud_slots, hana, aws.targets,
+                      Origins() if isinstance(origins, ReadingState) else origins)
+
+
+def background_once(now: float, reading: records.QueueRead) -> Background:
+    """Read the same sources for a one-time page."""
+    routes = safe_read(aws_routes)
+    hana_routes = routes.hana if isinstance(routes, AwsRoutes) else routes
+    occupancy = (safe_read(lambda: read_hana_occupancy(hana_routes))
+                 if isinstance(hana_routes, tuple) else ReadingState.OMITTED)
+    return background(safe_read(lambda: read_history(now)), safe_read(lambda: spending(now)),
+                      safe_read(read_cloud_slots), routes, occupancy,
+                      safe_read(lambda: Origins().refresh({use.folder for use in active_checkouts(reading)})))
+
+
+type RefreshKey = date | frozenset[CheckoutUse | WaitingCheckout] | tuple[HanaRoute, ...] | targets.TargetSnapshot
+
+
+@dataclass(frozen=True)
+class SourceSample[T]:
+    value: T | ReadingState
+    started_at: float
+    key: RefreshKey | None
+
+
+class SourceCache[T]:
+    def __init__(self) -> None:
+        self.sample: SourceSample[T] | None = None
+        self.pending: Future[SourceSample[T]] | None = None
+
+    def refresh(self, result: Future[SourceSample[T]], read: Callable[[], T | ReadingState],
+                started_at: float, key: RefreshKey | None) -> None:
+        result.set_result(SourceSample(safe_read(read), started_at, key))
+
+    def reusable(self) -> T | ReadingState:
+        return ReadingState.OMITTED if self.sample is None else self.sample.value
+
+    def current(self, now: float, interval: float, read: Callable[[], T | ReadingState], *,
+                key: RefreshKey | None = None) -> T | ReadingState:
+        if self.pending is not None and self.pending.done():
+            self.sample = self.pending.result()
+            self.pending = None
+        same_key = self.sample is not None and self.sample.key == key
+        age = now - self.sample.started_at if self.sample is not None else float("inf")
+        if self.pending is None and (not same_key or age >= interval):
+            result: Future[SourceSample[T]] = Future()
+            self.pending = result
+            Thread(target=self.refresh, args=(result, read, now, key),
+                   name="build-limits-refresh", daemon=True).start()
+        if same_key and age < interval * 2:
+            return self.reusable()
+        return ReadingState.OMITTED
+
+
+@final
+class LimitsRefresh:
+    def __init__(self, report_interval: float, token_interval: float) -> None:
+        self.report_interval = report_interval
+        self.token_interval = token_interval
+        self.history = SourceCache[frozenset[str]]()
+        self.money = SourceCache[Metric]()
+        self.cloud_slots = SourceCache[int]()
+        self.routes = SourceCache[AwsRoutes]()
+        self.hana_occupancy = SourceCache[dict[HanaRoute, int | ReadingState]]()
+        self.origins = SourceCache[Origins]()
+
+    def current(self, reading: records.QueueRead, now: float, wall: float) -> Background:
+        checkouts = active_checkouts(reading)
+
+        def read_origins() -> Origins:
+            previous = self.origins.reusable()
+            cache = previous if isinstance(previous, Origins) else Origins()
+            return cache.refresh({use.folder for use in checkouts})
+
+        day = datetime.fromtimestamp(wall, UTC).date()
+        routes = self.routes.current(now, self.token_interval, aws_routes)
+        hana_routes = routes.hana if isinstance(routes, AwsRoutes) else routes
+        occupancy = (self.hana_occupancy.current(now, self.token_interval,
+                      lambda: read_hana_occupancy(hana_routes), key=hana_routes)
+                     if isinstance(hana_routes, tuple) and hana_routes else ReadingState.OMITTED)
+        return background(
+            self.history.current(now, self.report_interval, lambda: read_history(wall)),
+            self.money.current(now, self.report_interval, lambda: spending(wall), key=day),
+            self.cloud_slots.current(now, self.report_interval, read_cloud_slots),
+            routes, occupancy,
+            self.origins.current(now, self.token_interval, read_origins, key=checkouts))
+
+
+@dataclass(frozen=True)
+class MacClaim:
+    scope: claim_state.ClaimScope
+    limit: int
+    origin: str
+    working_session: str
+
+
+@dataclass(frozen=True)
+class MacReading:
+    claims: tuple[MacClaim, ...] = ()
+    limits: Mapping[str, Mapping[str, int]] = field(default_factory=dict[str, Mapping[str, int]])
+    claim_origins: Origins = field(default_factory=Origins)
+    claims_readable: bool = False
+
+
+def mac_snapshot(snapshots: target_availability.Snapshots) -> targets.TargetSnapshot | None:
+    if isinstance(snapshots, tuple):
+        return next((snapshot for snapshot in snapshots
+                     if isinstance(snapshot.target, target_config.SshTarget) and snapshot.target.platform == "macos"), None)
+    return None
+
+
+def read_mac_origins(now: float, earlier: Origins) -> Origins | ReadingState:
+    """Find checkout names for the Mac policy from recent build steps."""
+    def read_paths(connection: sqlite3.Connection) -> tuple[str, ...]:
+        rows = cast(Iterable[tuple[object]], connection.execute(
+            """SELECT DISTINCT repo_path FROM steps WHERE started_at >= ? AND started_at <= ?""",
+            (store.utc_iso(now - HISTORY_SECONDS), store.utc_iso(now))))
+        return tuple(path for path, in rows if isinstance(path, str) and path.startswith("/"))
+
+    paths = charts.read_index(read_paths)
+    return ReadingState.UNAVAILABLE if isinstance(paths, charts.IndexUnavailable) else earlier.refresh(paths)
+
+
+def read_mac(snapshot: targets.TargetSnapshot, origins: Origins, earlier: Origins) -> MacReading:
+    """Read claim and policy facts for one configured Mac."""
+    target = snapshot.target
+    assert isinstance(target, target_config.SshTarget)
+    state = snapshot.states[0]
+    paths = claim_state.StatePaths(target_config.ssh_target_state_directory(target.name), target.name,
+                                  registry_selected=True, platform=target.platform)
+    recorded = snapshot.claims
+    if not recorded and isinstance(state, targets.StateUnreadable):
+        # Read claims separately when the snapshot cannot identify the failed read.
+        try:
+            recorded = claim_state.read_claims(paths)
+        except (OSError, UnicodeError, claim_state.StateReadError):
+            return MacReading()
+    live: dict[claim_state.ClaimIdentity, claim_state.HeldClaim] = {}
+    for claim in recorded:
+        identity = claim_state.claim_identity(claim.record)
+        if identity not in live and mac_test.run_is_live(claim.record):
+            live[identity] = claim
+    checkout_origins = earlier.refresh({claim.record["worktree"] for claim in live.values()
+        if isinstance(claim.scope, claim_state.RepositoryScope) and not recorded_origin(claim.record.get("repo_key", ""))})
+    claims: list[MacClaim] = []
+    for claim in live.values():
+        record = claim.record
+        scope = claim.scope
+        origin = ""
+        if isinstance(scope, claim_state.RepositoryScope):
+            # The Mac admits a checkout under a scope that uses only its name.
+            scope = claim_state.RepositoryScope(scope.name)
+            origin = recorded_origin(record.get("repo_key", "")) or checkout_origins.resolve("", record["worktree"])
+        session = (record["submitting_session"]
+                   if not record.get("cleanup_pending") and mac_test.run_holds_work(record) else "")
+        claims.append(MacClaim(scope, mac_test.slot_capacity(paths, scope), origin, session))
+    configured: dict[str, int] = {}
+    limits: dict[str, dict[str, int]] = {}
+    if origins.source_names:
+        settings = conf.read(target.settings)
+        for name in {name for names in origins.source_names.values() for name in names}:
+            try:
+                policy = eligibility.linux_only_policy(settings, eligibility.KnownRepository(name), Path(), "", "check")
+                if isinstance(policy, eligibility.KnownRepository):
+                    configured[name] = mac_test.slot_capacity(paths, claim_state.RepositoryScope(name), configuration=settings)
+            except conf.Unusable:
+                continue
+        for origin, names in origins.source_names.items():
+            if name := short_name(origin):
+                limits.setdefault(name, {}).update((scope, configured[scope]) for scope in names if scope in configured)
+    return MacReading(tuple(claims), limits, checkout_origins, claims_readable=True)
+
+
+@final
+class MacRefresh:
+    def __init__(self, report_interval: float, feed_interval: float) -> None:
+        self.report_interval = report_interval
+        self.feed_interval = feed_interval
+        self.origins = SourceCache[Origins]()
+        self.facts = SourceCache[MacReading]()
+
+    def current(self, snapshots: target_availability.Snapshots, now: float, wall: float,
+                *, once: bool) -> MacReading | None:
+        snapshot = mac_snapshot(snapshots)
+        if snapshot is None:
+            return None
+
+        def read_origins() -> Origins | ReadingState:
+            earlier = self.origins.reusable()
+            return read_mac_origins(wall, earlier if isinstance(earlier, Origins) else Origins())
+
+        origins = safe_read(read_origins) if once else self.origins.current(now, self.report_interval, read_origins)
+
+        def read_facts() -> MacReading:
+            earlier = self.facts.reusable()
+            return read_mac(snapshot, origins if isinstance(origins, Origins) else Origins(),
+                            earlier.claim_origins if isinstance(earlier, MacReading) else Origins())
+
+        facts = safe_read(read_facts) if once else self.facts.current(now, self.feed_interval, read_facts, key=snapshot)
+        return facts if isinstance(facts, MacReading) else None
 
 
 @dataclass(frozen=True)
 class VisibleWait:
-    source: queue_view.WaitingBuild | wire.CloudRow
+    source: queue_view.WaitingBuild | wire.CloudRow | wire.RepositorySlotRow
     name: str
 
 
@@ -451,21 +683,54 @@ def visible_waits(model: queue_view.QueueModel, local_names: Mapping[int, str],
         elif isinstance(entry, wire.CloudRow):
             name = cloud_names.get(entry.owner, "")
         else:
-            continue
-        waits.append(VisibleWait(entry, name))
+            name = entry.identity.unit or entry.identity.name
+        waits.append(VisibleWait(entry, clean_label(name)))
     return tuple(waits)
 
 
-def wait_text(reason: records.WaitReason | wire.CloudSlotWait) -> str:
-    if isinstance(reason, records.HeadAdmissionStatus):
-        reason = reason.cause
+def clean_label(*candidates: str) -> str:
+    """Keep a usable label without exposing a path."""
+    return next((label for candidate in candidates if (label := public_queue_text(candidate))
+                 and "/" not in label and "\\" not in label), "")
+
+
+def short_name(origin: str) -> str:
+    return clean_label(origin.rsplit("/", 1)[-1])
+
+
+def policy_label(key: str) -> str:
+    """Show the key when it is a name or a public origin."""
+    if ":" not in key and key != store.UNKNOWN_IDENTITY:
+        return clean_label(key)
+    return recorded_origin(key).removeprefix("https://")
+
+
+def wait_words(reason: records.WaitReason | wire.CloudSlotWait) -> WaitWords:
     if isinstance(reason, records.RunLimitWait):
-        return WORDS[records.RunLimitWait].format(repository=reason.repository, machine=reason.machine)
+        name = policy_label(reason.repository)
+        machine = clean_label(reason.machine)
+        if name and machine:
+            words = WAIT_WORDS[records.RunLimitWait]
+            return WaitWords(words.one.format(repository=name, machine=machine),
+                             words.many.format(repository=name, machine=machine, count="{count}"))
+        return WAIT_WORDS["run_limit_full"]
     if isinstance(reason, records.BehindHead) and reason.head_name == "remote startup":
-        return WORDS["remote_start"]
+        return WAIT_WORDS["remote_start"]
     if isinstance(reason, wire.CloudSlotWait) and isinstance(reason.state, ReservedCloudSlot):
-        return WORDS[ReservedCloudSlot]
-    return WORDS.get(type(reason), "")
+        return WAIT_WORDS[ReservedCloudSlot]
+    return WAIT_WORDS.get(type(reason), WAIT_WORDS["wait"])
+
+
+def add_wait(groups: WaitGroups, words: WaitWords, name: str, *, policy_index: int = 0) -> None:
+    heading_key = f"{policy_index}:{words.one}" if policy_index else words.one
+    groups.setdefault(heading_key, WaitGroup(words)).names.append(name)
+
+
+@dataclass(frozen=True)
+class LocalPolicyWait:
+    reason: records.RunLimitWait
+    repository: str
+    name: str
 
 
 def local_state(snapshots: target_availability.Snapshots, machine: str, active: bool, zone: tzinfo) -> str:
@@ -476,62 +741,77 @@ def local_state(snapshots: target_availability.Snapshots, machine: str, active: 
             for state in snapshot.states:
                 if isinstance(state, targets.Held):
                     if isinstance(state.end, (targets.ExpiresAt, targets.ReleaseEstimated)):
-                        return WORDS["held_until"].format(time=targets.clock(state.end.when, zone))
-                    return WORDS["held"]
+                        return PAGE_WORDS["held_until"].format(time=targets.clock(state.end.when, zone))
+                    return PAGE_WORDS["held"]
                 if isinstance(state, targets.Unreachable):
-                    return WORDS["unreachable"]
+                    return PAGE_WORDS["unreachable"]
                 if isinstance(state, targets.StateUnreadable):
-                    return WORDS["not_available"]
+                    return PAGE_WORDS["not_available"]
             if active or any(isinstance(state, targets.Running) for state in snapshot.states):
-                return WORDS["in_use"]
-            return WORDS["free"] if any(isinstance(state, targets.Free) for state in snapshot.states) else ""
+                return PAGE_WORDS["in_use"]
+            return PAGE_WORDS["free"] if any(isinstance(state, targets.Free) for state in snapshot.states) else ""
     if active:
-        return WORDS["in_use"]
-    return WORDS["not_available"] if isinstance(snapshots, target_availability.SnapshotsUnreadable) else ""
+        return PAGE_WORDS["in_use"]
+    return PAGE_WORDS["not_available"] if isinstance(snapshots, target_availability.SnapshotsUnreadable) else ""
 
 
-def mac_state(mac: MacReading | None, snapshots: target_availability.Snapshots, zone: tzinfo) -> str:
-    if mac is None:
-        return WORDS["not_available"] if isinstance(snapshots, target_availability.SnapshotsUnreadable) else ""
-    state = mac.state
+def mac_state(snapshots: target_availability.Snapshots, zone: tzinfo) -> str:
+    if isinstance(snapshots, target_availability.SnapshotsUnreadable):
+        return PAGE_WORDS["not_available"]
+    snapshot = mac_snapshot(snapshots)
+    if snapshot is None:
+        return ""
+    state = snapshot.states[0]
     if isinstance(state, targets.Held):
         if isinstance(state.end, targets.ExpiresAt):
-            return WORDS["held_until"].format(time=targets.clock(state.end.when, zone))
-        return WORDS["held"]
+            return PAGE_WORDS["held_until"].format(time=targets.clock(state.end.when, zone))
+        return PAGE_WORDS["held"]
     if isinstance(state, targets.StateUnreadable):
-        return WORDS["not_available"]
-    return WORDS["on"] if isinstance(state, (targets.Free, targets.Running)) else ""
+        return PAGE_WORDS["not_available"]
+    return PAGE_WORDS["on"] if isinstance(state, (targets.Free, targets.Running)) else ""
 
 
-def place_mac_counts(mac: MacReading, rows: Sequence[tuple[str, RepositoryRow]],
-                     claims: Mapping[claim_state.ClaimScope, Sequence[tuple[str, MacClaim]]],
-                     origins: Origins, names: Mapping[str, str]) -> None:
-    show_free = mac.claims_readable and not any(isinstance(claim.scope, claim_state.WholeMacScope) for claim in mac.claims)
-    positions = {origin: index for index, (origin, _) in enumerate(rows)}
-    for group in claims.values():
-        known_claims = [(origin, claim) for origin, claim in group if origin]
-        if not known_claims:
-            continue
-        owner = min((origin for origin, _ in known_claims), key=positions.__getitem__)
-        cell = rows[positions[owner]][1].mac
-        cell.used = (cell.used or 0) + len(known_claims)
-        if show_free:
-            cell.limit = (cell.limit or 0) + known_claims[0][1].limit
-        cell.runs.extend(name for _, claim in known_claims
-                         if claim.working_session and (name := names.get(claim.working_session)))
+def place_mac_counts(mac: MacReading, rows: dict[str, RepositoryRow], names: Mapping[str, str]) -> int:
+    """Put each confirmed claim in its repository row or in the heading."""
+    by_row: dict[str, list[MacClaim]] = {}
+    scope_use: Counter[claim_state.ClaimScope] = Counter()
+    unattributed = 0
+    show_free = mac.claims_readable
+    for claim in mac.claims:
+        scope_use[claim.scope] += 1
+        if isinstance(claim.scope, claim_state.RepositoryScope) and (name := short_name(claim.origin)):
+            by_row.setdefault(name, []).append(claim)
+        else:
+            unattributed += 1
+            if isinstance(claim.scope, claim_state.WholeMacScope):
+                show_free = False
 
-    if not show_free:
-        return
-    used_scopes = {scope.name for scope in claims if isinstance(scope, claim_state.RepositoryScope)}
-    for origin, row in rows:
-        if row.mac.used:
-            continue
-        configured = origins.names.get(origin, set()) & mac.limits.keys()
-        if len(configured) == 1:
-            name, = configured
-            if name not in used_scopes:
-                row.mac.used, row.mac.limit = 0, mac.limits[name]
-                used_scopes.add(name)
+    for name, claims in by_row.items():
+        if name not in rows:
+            rows[name] = RepositoryRow(name)
+        row = rows[name]
+        row.quiet = False
+        row.mac.used = len(claims)
+        row.mac.runs.extend(label for claim in claims
+                            if claim.working_session and (label := clean_label(names.get(claim.working_session, ""))))
+        first = claims[0]
+        if (show_free and isinstance(first.scope, claim_state.RepositoryScope)
+                and not (mac.limits.get(name, {}).keys() - {first.scope.name})
+                and all(claim.scope == first.scope and claim.limit == first.limit for claim in claims)
+                and scope_use[first.scope] == len(claims) <= first.limit):
+            row.mac.limit = first.limit
+            row.mac.policy = CellPolicy.CONFIGURED
+
+    if show_free:
+        scope_rows = Counter(scope for name, scopes in mac.limits.items() if name in rows for scope in scopes)
+        for name, scopes in mac.limits.items():
+            if name not in rows or name in by_row or len(scopes) != 1:
+                continue
+            (scope, limit), = scopes.items()
+            if scope_rows[scope] == 1 and not scope_use[claim_state.RepositoryScope(scope)]:
+                cell = rows[name].mac
+                cell.used, cell.limit, cell.policy = 0, limit, CellPolicy.CONFIGURED
+    return unattributed
 
 
 def build_limits(reading: records.QueueRead, snapshots: target_availability.Snapshots,
@@ -542,190 +822,239 @@ def build_limits(reading: records.QueueRead, snapshots: target_availability.Snap
     inputs = explanation.decided_from
     policy = explanation.policy.repository_runs
     local = inputs.local_machine
+    prefix = local + "."
+    local_limits = {key.removeprefix(prefix): limit for key, limit in policy.by_machine_and_repository.items()
+                    if key.startswith(prefix)}
     origins = saved.origins
     history = saved.history if isinstance(saved.history, frozenset) else ()
     rows: dict[str, RepositoryRow] = {}
-    local_waits: dict[str, list[str]] = {}
-    mac_waits: dict[str, list[str]] = {}
-    aws_waits: dict[str, list[str]] = {}
-    unplaced: dict[str, list[str]] = {}
-    metric_waits: dict[str, dict[str, list[str]]] = {}
-    policy_rows: dict[str, set[str]] = {}
-    unbound_waits: dict[str, dict[str, list[str]]] = {}
-    mac_claims: dict[claim_state.ClaimScope, list[tuple[str, MacClaim]]] = {}
+    local_waits: WaitGroups = {}
+    mac_waits: WaitGroups = {}
+    aws_waits: WaitGroups = {}
+    unplaced: WaitGroups = {}
+    metric_waits: dict[str, WaitGroups] = {}
+    keys_by_row: dict[str, set[str]] = {}
+    unresolved_policy = False
+    run_labels: dict[tuple[str, str], tuple[str, str]] = {}
+    mac_targets = (frozenset(snapshot.target.name for snapshot in snapshots if snapshot.target.platform == "macos")
+                   if isinstance(snapshots, tuple) else frozenset[str]())
 
-    def row(origin: str) -> RepositoryRow:
-        if origin not in rows:
-            rows[origin] = RepositoryRow(origin.rsplit("/", 1)[-1])
-        return rows[origin]
+    def row(name: str) -> RepositoryRow:
+        if name not in rows:
+            rows[name] = RepositoryRow(name)
+        return rows[name]
+
+    def observe_local(origin: str, repository_key: str = "") -> str:
+        nonlocal unresolved_policy
+        name = short_name(origin)
+        if name:
+            keys = keys_by_row.setdefault(name, set())
+            if repository_key in local_limits:
+                keys.add(repository_key)
+            _ = row(name)
+        elif repository_key in local_limits:
+            # The checkout can match any row, even one with a known key.
+            unresolved_policy = True
+        return name
+
+    def remote_wait(machine: str) -> WaitGroups:
+        return aws_waits if machine in saved.aws_targets else unplaced
+
+    for key in local_limits:
+        origin = recorded_origin(key)
+        name = short_name(origin) if origin else policy_label(key)
+        if name:
+            keys_by_row.setdefault(name, set()).add(key)
 
     for origin in history:
-        _ = row(origin)
-    mac_unattributed = 0
-    if mac is not None:
-        for claim in mac.claims:
-            origin = claim.origin
-            mac_claims.setdefault(claim.scope, []).append((origin, claim))
-            if origin:
-                _ = row(origin)
-            else:
-                mac_unattributed += 1
-    prefix = local + "."
-    seen: set[str] = set()
+        _ = observe_local(origin)
+
+    occupancy = reserved_repository_runs(inputs, policy)
+    seen = {owner for owners in occupancy.values() for owner in owners}
+    limited_owners = frozenset(seen)
     unattributed = 0
-    for reservation in sorted(inputs.reservations, key=lambda item: item["step"] not in records.REPOSITORY_RUN_STEPS):
+    for reservation in inputs.reservations:
         owner = repository_run_owner(reservation)
-        if owner in seen:
-            continue
-        seen.add(owner)
         waiter = reservation.get("queue_waiter")
-        step = reservation["step"]
-        repo = reservation["repo"] if waiter is None else waiter.get("repository_name", reservation["repo"])
-        identity = reservation.get("repo_identity") or recorded_origin(reservation["repo"])
-        if waiter is not None:
-            identity = waiter.get("repo_identity") or identity
-        origin = origins.resolve(identity, reservation["worktree"])
-        if not origin:
-            unattributed += 1
-            continue
-        cell = row(origin).natedev
-        if prefix + repo in policy.by_machine_and_repository:
-            cell.has_limit_key = True
-            policy_rows.setdefault(repo, set()).add(origin)
+        waiting_origin = recorded_origin(waiter.get("repo_identity", "")) if waiter is not None else ""
+        reserved_origin = recorded_origin(reservation.get("repo_identity", ""))
+        origin = ""
+        if not (waiting_origin and reserved_origin and waiting_origin != reserved_origin):
+            identity = waiting_origin or reserved_origin or recorded_origin(reservation["repo"])
+            origin = origins.resolve(identity, reservation["worktree"])
         recorded_unit = reservation.get("unit", "") or (waiter.get("unit", "") if waiter is not None else "")
         session = waiter.get("session_id", "") if waiter is not None else reservation.get("session_id", "")
         session_name = waiter.get("session_name", "") if waiter is not None else reservation.get("session_name", "")
-        label = recorded_unit or names.get(session) or public_queue_text(session_name) or step
-        if policy.for_step(local, repo, step):
-            cell.used = (cell.used or 0) + 1
-            if label:
-                cell.runs.append(label)
-            if recorded_unit and recorded_unit == policy.exempt_unit:
-                cell.merge_above.append(recorded_unit)
-        else:
-            cell.other_used += 1
-            if label:
-                cell.other.append(label)
-    ordered = {(item["pid"], item["since"]): item for _, item in reading.ordered}
+        repository_name = waiter.get("repository_name", reservation["repo"]) if waiter is not None else reservation["repo"]
+        name = observe_local(origin, repository_name)
+        if owner in limited_owners:
+            if policy.for_step(local, repository_name, reservation["step"]):
+                _ = run_labels.setdefault((repository_name, owner),
+                    (clean_label(recorded_unit, names.get(session, ""), session_name), recorded_unit))
+            continue
+        if owner in seen:
+            continue
+        seen.add(owner)
+        if not name:
+            unattributed += 1
+            continue
+        cell = row(name).natedev
+        cell.other_used += 1
+        if label := clean_label(recorded_unit, names.get(session, ""), session_name, name):
+            cell.other.append(label)
+
+    repository_wait_counts: dict[str, set[tuple[int, int]]] = {}
+    policy_wait_indices: dict[str, int] = {}
+    local_policy_waits: list[LocalPolicyWait] = []
+    gpu_wait_counts: set[tuple[int, int]] = set()
+    waiting_origins = {(waiter["pid"], waiter["since"]): origin for _, waiter in reading.ordered
+                       if (origin := recorded_origin(waiter.get("repo_identity", "")))}
+
+    def record_wait(destination: WaitGroups, reason: records.WaitReason, name: str) -> None:
+        # Keep each policy group separate without publishing private keys.
+        policy_index = (policy_wait_indices.setdefault(reason.repository, len(policy_wait_indices) + 1)
+                        if isinstance(reason, records.RunLimitWait) else 0)
+        add_wait(destination, wait_words(reason), name, policy_index=policy_index)
+
     for visible in waits:
         entry = visible.source
         if isinstance(entry, wire.CloudRow):
             if isinstance(entry.wait, wire.CloudSlotWait):
-                metric_waits.setdefault("cloud", {}).setdefault(wait_text(entry.wait), []).append(visible.name)
+                add_wait(metric_waits.setdefault("cloud", {}), wait_words(entry.wait), visible.name)
+            continue
+        if isinstance(entry, wire.RepositorySlotRow):
+            destination = (mac_waits if entry.machine in mac_targets
+                           else local_waits if entry.machine == local else remote_wait(entry.machine))
+            add_wait(destination, WAIT_WORDS["wait"], visible.name)
             continue
         step = entry.step
-        reason = step.reason.cause if isinstance(step.reason, records.HeadAdmissionStatus) else step.reason
-        if (isinstance(step.route, target_config.MacOnly)
-                or mac is not None and isinstance(step.route, target_config.PinnedTarget)
-                and step.route.target == mac.target):
-            destination = mac_waits
+        pinned = step.route.target if isinstance(step.route, target_config.PinnedTarget) else local
+        reason = waiting_cause(step)
+        if isinstance(step.route, target_config.MacOnly) or pinned in mac_targets:
+            record_wait(mac_waits, reason, visible.name)
+            continue
+        if pinned != local:
+            destination = remote_wait(pinned)
         elif isinstance(reason, records.RunLimitWait) and reason.machine == local:
-            waiter = ordered.get((step.pid, step.since))
-            key = origins.resolve(waiter.get("repo_identity", "") if waiter is not None else "", step.folder)
-            if key:
-                policy_rows.setdefault(reason.repository, set()).add(key)
-                cell = row(key).natedev
-                cell.has_limit_key = True
-                destination = cell.waits
-            else:
-                destination = unbound_waits.setdefault(reason.repository, {})
-        elif isinstance(step.route, target_config.PinnedTarget) and step.route.target in saved.aws_targets:
-            destination = aws_waits
-        elif isinstance(step.route, target_config.PinnedTarget) and step.route.target != local:
-            destination = unplaced
+            repository_wait_counts.setdefault(reason.repository, set()).add((reason.used, reason.limit))
+            recorded = waiting_origins.get((step.pid, step.since), "")
+            checkout = origins.resolve("", step.folder)
+            origin = "" if recorded and checkout and recorded != checkout else recorded or checkout
+            name = observe_local(origin, reason.repository)
+            local_policy_waits.append(LocalPolicyWait(reason, name, visible.name))
+            continue
         elif isinstance(reason, (records.BuildSpaceLow, records.BuildSpaceUnreadable)):
             destination = metric_waits.setdefault("disk", {})
         elif isinstance(reason, records.GpuSlotWait):
+            gpu_wait_counts.add((reason.used, reason.slots))
             destination = metric_waits.setdefault("gpu", {})
         elif isinstance(reason, (records.NeedsMemory, records.MemoryPressure, records.PressureUnavailable)):
             destination = metric_waits.setdefault("memory", {})
         else:
             destination = local_waits
-        destination.setdefault(wait_text(reason), []).append(visible.name)
+        record_wait(destination, reason, visible.name)
 
-    occupancy = reserved_repository_runs(inputs, policy)
-    ambiguous = Counter(origin for bound in policy_rows.values() for origin in bound)
-    unbound: list[Metric] = []
-    for key, limit in policy.by_machine_and_repository.items():
-        if not key.startswith(prefix):
-            continue
-        name = key.removeprefix(prefix)
-        bound = {origin for origin in policy_rows.get(name, ()) if ambiguous[origin] == 1}
-        used = len(occupancy.get(name, ()))
-        waits_without_origin = unbound_waits.pop(name, {})
-        if not bound or waits_without_origin:
-            unbound.append(Metric(WORDS["policy_key"].format(name=name), used, limit, waits=waits_without_origin))
-        for origin in bound:
-            cell = rows[origin].natedev
-            cell.limit = limit
-            cell.used = used
-            if len(bound) > 1:
-                cell.note = WORDS["shared_policy"].format(name=name)
-            if used <= limit:
-                cell.merge_above.clear()
-            for unit in cell.merge_above:
-                cell.runs.remove(unit)
-    for group in unbound_waits.values():
-        for text, waiting in group.items():
-            local_waits.setdefault(text, []).extend(waiting)
+    bindings = Counter(key for keys in keys_by_row.values() for key in keys)
+    bound_rows = {key: name for name, keys in keys_by_row.items() for key in keys if bindings[key] == 1}
+    for waiting in local_policy_waits:
+        destination = (row(waiting.repository).natedev.waits
+                       if waiting.repository and not unresolved_policy else local_waits)
+        record_wait(destination, waiting.reason, waiting.name)
 
     cloud_slots = saved.cloud_slots
-    cloud_used = 0
-    cloud_recorded = isinstance(reading, wire.CloudQueueRead) and bool(reading.cloud)
+    cloud_used = cloud_waiting = 0
+    cloud_origin_missing = False
     if isinstance(reading, wire.CloudQueueRead) and reading.cloud:
         cloud_slots = reading.cloud_slots
         for cloud in reading.cloud:
             if isinstance(cloud.wait, wire.CloudSlotWait):
-                cloud_used += isinstance(cloud.wait.state, ReservedCloudSlot)
+                if isinstance(cloud.wait.state, ReservedCloudSlot):
+                    cloud_used += 1
+                    cloud_waiting += 1
                 continue
             cloud_used += 1
-            if origin := origins.resolve("", cloud.identity.folder):
-                cell = row(origin).aws
-                cell.other_used += 1
-                label = cloud_names.get(cloud.owner) or cloud.identity.unit or cloud.identity.step
-                if label:
-                    cell.other.append(label)
-                cell.note = WORDS["uses_cloud"]
+            origin = origins.resolve("", cloud.identity.folder)
+            name = short_name(origin)
+            if not name:
+                cloud_origin_missing = True
+                continue
+            cell = row(name).aws
+            if isinstance(saved.hana, ReadingState):
+                continue
+            cell.policy = CellPolicy.NO_LIMIT
+            cell.other_used += 1
+            label = clean_label(cloud_names.get(cloud.owner, ""), cloud.identity.unit, name)
+            if label:
+                cell.other.append(label)
+            cell.note = PAGE_WORDS["uses_cloud"]
 
-    aws_unattributed: set[int] = set()
-    for hana in saved.hana:
-        if origin := origins.resolve(hana.repository, ""):
-            cell = row(origin).aws
-            cell.limit, cell.used = hana.limit, hana.used
-            for index, run in enumerate(reading.view.running):
-                if (run.assignment_host != hana.host or not run.started_at
-                        or not isinstance(run.execution, execution_identity.ObservedExecution)):
-                    continue
-                run_origin = origins.resolve("", run.folder)
-                if not run_origin:
-                    aws_unattributed.add(index)
-                if run_origin == origin and (label := run.unit or names.get(run.session_id) or run.step):
-                    cell.runs.append(label)
+    # Every Hana target uses the same AWS lifecycle controller.
+    hana = () if isinstance(saved.hana, ReadingState) else tuple(dict.fromkeys(saved.hana))
+    for capacity in hana:
+        if name := short_name(recorded_origin(capacity.repository)):
+            cell = row(name).aws
+            if len(hana) != 1:
+                cell.policy = CellPolicy.UNRESOLVED
+                continue
+            cell.policy = CellPolicy.CONFIGURED
+            cell.limit = capacity.limit
+            cell.used = capacity.used if isinstance(capacity.used, int) else None
+            if capacity.used is ReadingState.UNAVAILABLE:
+                cell.note = PAGE_WORDS["not_available"]
 
-    counts = Counter(item.name for item in rows.values())
-    for origin, item in rows.items():
-        if counts[item.name] > 1:
-            namespace = urlsplit(origin).path.strip("/").split("/")[:-1]
-            item.owner = "/".join(namespace)
+    shared: list[Metric] = []
+    for repository_key, limit in local_limits.items():
+        owners = occupancy.get(repository_key, set[str]())
+        used = len(owners)
+        wait_counts = repository_wait_counts.get(repository_key)
+        if wait_counts and wait_counts != {(used, limit)}:
+            continue
+        runs: list[str] = []
+        merge_above: list[str] = []
+        for owner in sorted(owners):
+            label, recorded_unit = run_labels.get((repository_key, owner), ("", ""))
+            if used > limit and recorded_unit and recorded_unit == policy.exempt_unit:
+                merge_above.append(label)
+            elif label:
+                runs.append(label)
+        if used - limit > len(merge_above):
+            continue
+        name = bound_rows.get(repository_key, "")
+        if unresolved_policy or name not in rows or len(keys_by_row[name]) > 1:
+            key_label = policy_label(repository_key)
+            label = PAGE_WORDS["policy_key"].format(name=key_label) if key_label else PAGE_WORDS["repository_run_limit"]
+            shared.append(Metric(label, used, limit, exempt_runs=len(merge_above)))
+            continue
+        cell = rows[name].natedev
+        cell.limit, cell.used = limit, used
+        cell.runs, cell.merge_above = runs, merge_above
+
+    for name, item in rows.items():
+        if name in keys_by_row and not unresolved_policy:
+            item.natedev.policy = CellPolicy.CONFIGURED if keys_by_row[name] else CellPolicy.NO_LIMIT
+        if unresolved_policy and item.natedev.other_used:
+            unattributed += item.natedev.other_used
+            item.natedev.other_used = 0
+            item.natedev.other.clear()
         for cell in (item.natedev, item.aws):
-            if cell.limit is None:
+            if cell.policy is CellPolicy.NO_LIMIT:
                 cell.runs.extend(cell.other)
-                cell.used = (cell.used or 0) + cell.other_used
+                cell.used = cell.other_used
                 cell.other.clear()
                 cell.other_used = 0
-                cell.merge_above.clear()
             if cell.used or cell.limit is not None or cell.waits or cell.runs or cell.other_used:
                 item.quiet = False
+        if unattributed and item.natedev.policy is CellPolicy.NO_LIMIT:
+            item.natedev.used = None
+            item.natedev.runs.clear()
+        if cloud_origin_missing:
+            item.aws.used = None
+            item.aws.runs.clear()
+            item.aws.other_used = 0
+            item.aws.other.clear()
+            item.aws.show_marks = item.aws.limit is None
 
-    def page_order(item: RepositoryRow) -> tuple[bool, str, str]:
-        return item.quiet, item.name.casefold(), item.owner.casefold()
-
-    if mac is not None:
-        place_mac_counts(mac, sorted(rows.items(), key=lambda pair: page_order(pair[1])), mac_claims, origins, names)
-        for item in rows.values():
-            if item.mac.used:
-                item.quiet = False
-
+    mac_unattributed = place_mac_counts(mac, rows, names) if mac is not None else 0
     room = explanation.room
     memory_used = room.cap_use / records.GIB if isinstance(room, records.MemoryRoom) else None
     memory_cap = room.cap / records.GIB if isinstance(room, records.MemoryRoom) and isinstance(room.cap, int) else None
@@ -733,18 +1062,26 @@ def build_limits(reading: records.QueueRead, snapshots: target_availability.Snap
                      unreadable=isinstance(room, records.ReadingUnavailable))]
     gpu = explanation.policy.gpu_tests
     if gpu.repositories or "gpu" in metric_waits:
-        used = sum(gpu_test_reservation(item, gpu) for item in inputs.reservations) if gpu.repositories else None
-        limits.append(Metric("gpu", used, gpu.slots if gpu.repositories else None, waits=metric_waits.get("gpu", {})))
+        gpu_used = sum(gpu_test_reservation(item, gpu) for item in inputs.reservations)
+        counts_agree = not gpu_wait_counts or gpu_wait_counts == {(gpu_used, gpu.slots)}
+        gpu_readable = bool(gpu.repositories) and counts_agree
+        limits.append(Metric("gpu", gpu_used if gpu_readable else None, gpu.slots if gpu_readable else None,
+                             waits=metric_waits.get("gpu", {})))
     disk = inputs.build_space
-    limits.append(Metric("disk", disk.free_gib if isinstance(disk, records.BuildSpaceLow) else None,
-                         disk.floor_gib if isinstance(disk, records.BuildSpaceLow) else saved.disk_floor, "GiB", "minimum", metric_waits.get("disk", {}),
-                         unreadable=isinstance(disk, records.BuildSpaceUnreadable)))
-    aws_state = WORDS["in_use"] if cloud_used or any(hana.used for hana in saved.hana) else ""
-    cloud = Metric("cloud", cloud_used, cloud_slots, waits=metric_waits.get("cloud", {}),
-                   unreadable=cloud_slots is None and not cloud_recorded)
+    disk_waits = metric_waits.get("disk", {})
+    if isinstance(disk, records.BuildSpaceLow):
+        limits.append(Metric("disk", disk.free_gib, disk.floor_gib, "GiB", "minimum", disk_waits))
+    elif disk_waits:
+        limits.append(Metric("disk", None, None, waits=disk_waits))
+    aws_active = cloud_used or any(isinstance(capacity.used, int) and capacity.used for capacity in hana)
+    aws_state = (PAGE_WORDS["in_use"] if aws_active else
+                 PAGE_WORDS["not_available"] if saved.hana is ReadingState.UNAVAILABLE else "")
+    cloud = Metric("cloud", cloud_used if isinstance(cloud_slots, int) else None,
+                   cloud_slots if isinstance(cloud_slots, int) else None, waits=metric_waits.get("cloud", {}),
+                   unreadable=cloud_slots is ReadingState.UNAVAILABLE, reserved_waiting=cloud_waiting)
     return BuildLimits(MachineLimits(local_state(snapshots, local, bool(inputs.reservations), zone),
-                                    (*limits, *unbound), local_waits, unattributed),
-                       MachineLimits(mac_state(mac, snapshots, zone), (), mac_waits, mac_unattributed),
-                       MachineLimits(aws_state, (cloud, saved.aws_money), aws_waits, len(aws_unattributed)),
-                       tuple(sorted(rows.values(), key=page_order)),
-                       isinstance(saved.history, charts.IndexUnavailable), saved.history_stale, unplaced)
+                                    (*limits, *shared), local_waits, unattributed),
+                       MachineLimits(mac_state(snapshots, zone), (), mac_waits, mac_unattributed),
+                       MachineLimits(aws_state, (cloud, saved.aws_money), aws_waits),
+                       tuple(sorted(rows.values(), key=lambda item: (item.quiet, item.name.casefold()))),
+                       saved.history is ReadingState.UNAVAILABLE, unplaced)

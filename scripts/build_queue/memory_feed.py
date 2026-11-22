@@ -17,12 +17,10 @@ import subprocess
 import sys
 import time
 from collections import Counter
-from collections.abc import Mapping, Sequence
-from concurrent.futures import Future
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from enum import Enum, auto
 from pathlib import Path
-from threading import Thread
 from typing import TYPE_CHECKING, Literal, NotRequired, TypedDict, assert_never, overload
 
 
@@ -76,7 +74,6 @@ from scripts.lib import conf
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.proc_text import read_proc_text
 from scripts.lib.user_zone import user_zone
-from scripts.mac_test import eligibility
 from scripts.review_links import console_theme, page_frame, review_link
 from scripts.review_links import staff_names
 
@@ -2701,29 +2698,10 @@ def memory_status(explanation: admission_records.QueueExplanation, room: admissi
             "next_need_bytes": check.need, "check_room_bytes": check.room}
 
 
-@dataclass(frozen=True)
-class TargetReading:
-    snapshots: target_availability.Snapshots
-    mac: limits_view.MacReading | None = None
-
-    def expired(self) -> TargetReading:
-        snapshots = self.snapshots
-        if isinstance(snapshots, tuple):
-            state = targets.StateUnreadable("target reading expired")
-            snapshots = tuple(targets.TargetSnapshot(snapshot.target, (state,), (), eligibility.NO_BACKOFF)
-                              for snapshot in snapshots)
-        return TargetReading(snapshots, limits_view.MacReading(self.mac.target, None) if self.mac else None)
-
-
-def read_targets(background: limits_view.Background | None = None) -> TargetReading:
-    snapshots = target_availability.read_snapshots()
-    return TargetReading(snapshots, limits_view.read_mac(snapshots, background.origins if background else None))
-
-
 def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.UseConfiguredValue.CURRENT,
             report_version: str = "", holders: TokenHolders | TokenHoldersUnknown = NO_TOKEN_DUMP_YET,
-            *, limit_background: limits_view.Background | None = None,
-            target_reading: TargetReading | None = None) -> MemoryPage:
+            *, limit_source: Callable[[admission_records.QueueRead], limits_view.Background] | None = None,
+            mac_source: Callable[[target_availability.Snapshots], limits_view.MacReading | None] | None = None) -> MemoryPage:
     started = time.perf_counter()
     if isinstance(configuration, conf.UseConfiguredValue):
         configuration = read_configuration()
@@ -2736,10 +2714,8 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
     host = explanation.decided_from.host
     if not isinstance(captured, admission_records.MemoryRoom) or not isinstance(host, admission_records.HostMemory):
         raise RuntimeError("recorded room unavailable")
-    if target_reading is None:
-        target_reading = TargetReading(target_availability.read_snapshots())
-    snapshots = target_reading.snapshots
-    mac = target_reading.mac
+    snapshots = target_availability.read_snapshots()
+    mac = mac_source(snapshots) if mac_source is not None else None
     mac_sessions = [claim.working_session for claim in mac.claims if claim.working_session] if mac else []
     slot_roots = conf.read_or_repository("build_folders").values()
     mac_reading = queue_view.read_mac_builds()
@@ -3140,12 +3116,10 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
         work_rows.sort(key=lambda row: row["started_at"])
     visible_waits = limits_view.visible_waits(model, {place: row["name"] for place, row in waiters.items()},
                                               {owner: row["name"] for owner, row in cloud_waiters.items()})
-    waiting_rows: list[WaitRow | CloudWaitRow] = []
-    for visible in visible_waits:
-        entry = visible.source
-        wait_row = cloud_waiters.get(entry.owner) if isinstance(entry, wire.CloudRow) else waiters.get(entry.position)
-        if wait_row is not None:
-            waiting_rows.append(wait_row)
+    waiting_rows: list[WaitRow | CloudWaitRow] = [
+        named_wait for visible in visible_waits
+        if (named_wait := (cloud_waiters.get(entry.owner) if isinstance(entry := visible.source, wire.CloudRow) else
+                           waiters.get(entry.position) if isinstance(entry, queue_view.WaitingBuild) else None)) is not None]
     unmatched_priority_text = ""
     unmatched_priority_entries: list[admission_records.PriorityEntry] = []
     queued_priority_units: list[str] = []
@@ -3223,9 +3197,9 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
         "report_version": report_version,
         "swap_rows": configuration.swap_rows, "leftovers": leftovers,
     }
-    if limit_background is not None:
+    if limit_source is not None:
         page["build_limits"] = limits_view.build_limits(parsed, snapshots, visible_waits, limit_cloud_names,
-            {session: identity.owner_text for session, identity in labels.items()}, limit_background, zone, mac=mac)
+            {session: identity.owner_text for session, identity in labels.items()}, limit_source(parsed), zone, mac=mac)
     page["render_seconds"] = time.perf_counter() - started
     return page
 
@@ -3253,75 +3227,6 @@ def notify_unplaced_mac_runs(reading: queue_view.MacBuildReading, notified: set[
         notified.update((run.pid, run.started_at) for run in new_runs)
 
 
-def refresh_limits(result: Future[limits_view.Background], now: float, active_folders: tuple[str, ...],
-                   earlier: limits_view.Origins | None) -> None:
-    try:
-        result.set_result(limits_view.background(now, active_folders, earlier))
-    except (OSError, ValueError, KeyError, RuntimeError) as error:
-        result.set_exception(error)
-
-
-class LimitsRefresh:
-    def __init__(self) -> None:
-        self.saved: limits_view.Background | None = None
-        self.pending: Future[limits_view.Background] | None = None
-        self.next_at: float = 0.0
-
-    def current(self, now: float, interval: float) -> limits_view.Background | None:
-        if self.pending is not None and self.pending.done():
-            try:
-                current = self.pending.result()
-                previous = self.saved
-                if isinstance(current.history, charts.IndexUnavailable) and previous is not None and isinstance(previous.history, frozenset):
-                    current = replace(current, history=previous.history, history_stale=True)
-                self.saved = current
-            except (OSError, ValueError, KeyError, RuntimeError) as error:
-                print(f"Build limits refresh failed: {error}", file=sys.stderr)
-                if self.saved is not None:
-                    self.saved = replace(self.saved, history_stale=True)
-            self.pending = None
-        if self.pending is None and now >= self.next_at:
-            self.pending = Future()
-            origins = self.saved.origins if self.saved is not None else None
-            folders = tuple(origins.active_folders) if origins is not None else ()
-            Thread(target=refresh_limits, args=(self.pending, time.time(), folders, origins),
-                   name="build-limits-refresh", daemon=True).start()
-            self.next_at = now + interval
-        return self.saved
-
-
-def refresh_targets(result: Future[tuple[float, TargetReading]], started: float,
-                    background: limits_view.Background | None) -> None:
-    try:
-        result.set_result((started, read_targets(background)))
-    except (OSError, ValueError, KeyError, RuntimeError) as error:
-        result.set_exception(error)
-
-
-class TargetRefresh:
-    def __init__(self) -> None:
-        self.saved: tuple[float, TargetReading] | None = None
-        self.pending: Future[tuple[float, TargetReading]] | None = None
-        self.next_at: float = 0.0
-
-    def current(self, now: float, interval: float, background: limits_view.Background | None) -> TargetReading:
-        if self.pending is not None and self.pending.done():
-            try:
-                self.saved = self.pending.result()
-            except (OSError, ValueError, KeyError, RuntimeError) as error:
-                print(f"Target refresh failed: {error}", file=sys.stderr)
-            self.pending = None
-        if self.pending is None and now >= self.next_at:
-            self.pending = Future()
-            self.next_at = now + interval
-            Thread(target=refresh_targets, args=(self.pending, now, background),
-                   name="build-target-refresh", daemon=True).start()
-        if self.saved is None:
-            return TargetReading(())
-        started, reading = self.saved
-        return reading if now - started < 2 * interval else reading.expired()
-
-
 def main(argv: Sequence[str]) -> int:
     args = page_arguments(argv)
     if args.command == "link":
@@ -3332,8 +3237,18 @@ def main(argv: Sequence[str]) -> int:
     last_good: MemoryPage | NoGoodReading = NoGoodReading()
     report_version = ""
     next_report_at = 0.0
-    limit_refresh = LimitsRefresh()
-    target_refresh = TargetRefresh()
+    limit_refresh = limits_view.LimitsRefresh(configuration.report_refresh_seconds, configuration.token_dump_seconds)
+    mac_refresh = limits_view.MacRefresh(configuration.report_refresh_seconds, configuration.interval_seconds)
+
+    def limit_source(reading: admission_records.QueueRead) -> limits_view.Background:
+        wall = time.time()
+        if args.once:
+            return limits_view.background_once(wall, reading)
+        return limit_refresh.current(reading, time.monotonic(), wall)
+
+    def mac_source(snapshots: target_availability.Snapshots) -> limits_view.MacReading | None:
+        return mac_refresh.current(snapshots, time.monotonic(), time.time(), once=args.once)
+
     next_mac_at = 0.0
     holders: TokenHolders | TokenHoldersUnknown = NO_TOKEN_DUMP_YET
     next_tokens_at = 0.0
@@ -3351,8 +3266,6 @@ def main(argv: Sequence[str]) -> int:
                 report_version = report.version
             next_report_at = now + configuration.report_refresh_seconds
         try:
-            limit_background = (limits_view.background(time.time()) if args.once else
-                                limit_refresh.current(now, configuration.report_refresh_seconds))
             if now >= next_mac_at:
                 queue_view.refresh_mac_builds()
                 if not args.once:
@@ -3367,10 +3280,8 @@ def main(argv: Sequence[str]) -> int:
                     holders = TokenHoldersUnknown(refused)
                 # Count from after the request, so slow reads before it never shorten the interval.
                 next_tokens_at = time.monotonic() + configuration.token_dump_seconds
-            target_reading = (read_targets(limit_background) if args.once else
-                              target_refresh.current(time.monotonic(), configuration.interval_seconds, limit_background))
             payload: MemoryPage | RetainedReading | PageUnavailable = reading(configuration, report_version, holders,
-                limit_background=limit_background, target_reading=target_reading)
+                limit_source=limit_source, mac_source=mac_source)
             last_good = payload
         except (OSError, ValueError, KeyError, RuntimeError) as error:
             if isinstance(last_good, NoGoodReading):

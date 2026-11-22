@@ -957,17 +957,21 @@ process.stdout.write(JSON.stringify(steps));
             ["ignored", 2, False], ["foreign", 2, False], ["resumed", 4, True],
             ["input, textarea, select, button, summary, [contenteditable]"]])
 
-    def page_expression(self, expression: str, data: object, *, walk: bool = False, swap: bool = False) -> object:
+    def page_expression(self, expression: str, data: object, *, walk: bool = False, swap: bool = False,
+                        limits: bool = False) -> object:
         html = Path(memory_feed.__file__).with_name("memory_live.html").read_text()
         functions = html[html.index("function field("):html.index("const tip =")]
         constants = ""
         if walk:
             functions += html[html.index("function renderWalk(d)"):html.index("function fitAxisLabels()")]
+        if limits:
+            functions += html[html.index("function limitMarks("):html.index('$("build-limits").addEventListener')]
+        if walk or limits:
             functions += html[html.index("function esc(s)"):html.index("const consoleHidden =")]
             constants += """
 const elements = new Map();
 const $ = id => {
-  if (!elements.has(id)) elements.set(id, {style: {}, classList: {toggle() {}}});
+  if (!elements.has(id)) elements.set(id, {style: {}, classList: {toggle() {}}, open: true, querySelector: () => ({})});
   return elements.get(id);
 };
 function fitLabels() {}

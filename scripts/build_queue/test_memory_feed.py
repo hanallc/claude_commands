@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from scripts.review_links.test_page_frame import assert_status_states
-from scripts.build_queue import admission_records, admission_service, placement, queue_evidence, slot_wait
+from scripts.build_queue import admission_records, admission_service, limits_view, placement, queue_evidence, slot_wait
 from scripts.build_queue import snapshot_codec as codec
 from scripts.build_queue.test_queue_view import with_converted_executions
 
@@ -2652,6 +2652,9 @@ process.stdout.write(JSON.stringify({
         snapshots = (targets.TargetSnapshot(SshTarget("mac", "macos", self.root / "mac.conf"), (block,), (), eligibility.NO_BACKOFF),
                      targets.TargetSnapshot(LocalTarget("natedev", "linux"), (targets.Free(),), (), eligibility.NO_BACKOFF))
         labels = {"mac-owner": unit_labels.UnitLabels("director", "hana", "research")}
+        background = limits_view.Background(frozenset({"https://example.invalid/team/hana"}),
+                                            limits_view.Metric("money", None, None, "USD"))
+        mac = limits_view.MacReading(limits={"hana": {"hana": 1}}, claims_readable=True)
         for admission_error, expected in (("", ""), ("fixture down", "MAC IDLE WATCH: admission query failed: fixture down.")):
             with self.subTest(admission_error=admission_error):
                 path = write_idle_alert(self.root / "mac-idle", now)
@@ -2663,8 +2666,13 @@ process.stdout.write(JSON.stringify({
                      mock.patch.object(target_availability, "read_snapshots", return_value=snapshots), \
                      mock.patch.object(unit_labels, "unit_labels_for", return_value=labels), \
                      mock.patch.object(build_targets, "step_policy", return_value=eligibility.KnownRepository("hana")):
-                    page = memory_feed.reading()
+                    page = memory_feed.reading(limit_source=lambda _: background, mac_source=lambda _: mac)
                 self.assertEqual(page["mac_idle_alert"], expected)
+                limits = page.get("build_limits")
+                assert limits is not None
+                self.assertEqual(limits.mac.state, "Held")
+                self.assertEqual([(row.name, row.mac.used, row.mac.limit) for row in limits.repositories],
+                                 [("hana", 0, 1)])
                 self.assertEqual(page["targets"], [{"target": "mac", "state": "Blocked", "reason": "P15 F11 L0 run",
                     "holder": "research", "unit": "research", "showrunner": "hana", "since": "since " + since.strftime("%H:%M UTC"),
                     "until": "until released"}])

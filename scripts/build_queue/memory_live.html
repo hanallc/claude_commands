@@ -69,12 +69,11 @@ __PAGE_FRAME_STYLE__
 .legend-box > summary .name { font-weight: 600; color: var(--ink-2); }
 #build-limits > summary .name { color: var(--ink); }
 .build-limits-scroll { overflow-x: auto; margin-top: 9px; }
-.build-limits-table { width: 100%; min-width: 910px; border-collapse: collapse; table-layout: fixed; font-size: .875rem; }
+.build-limits-table { width: 100%; min-width: 720px; border-collapse: collapse; table-layout: fixed; font-size: .875rem; }
 .build-limits-table th, .build-limits-table td { padding: 11px 14px; border: 1px solid var(--line); text-align: left; vertical-align: top; }
 .build-limits-table thead th { background: color-mix(in srgb, var(--line) 25%, var(--card)); }
 .build-limits-table thead th:first-child { width: 17%; }
 .build-limits-table tbody th { font-weight: 600; overflow-wrap: anywhere; }
-.build-limits-table tbody th small { display: block; color: var(--ink-2); font-weight: 400; }
 .build-limits-table .quiet th, .build-limits-table .quiet td { padding-block: 6px; }
 .build-limits-table .quiet th { font-weight: 400; }
 .build-limit-state { display: inline-block; margin-left: .55em; color: var(--ink-2); font-size: .8em; font-weight: 400; }
@@ -1270,64 +1269,69 @@ function limitMarks(kind, count = 1) {
   const marks = `<span class="build-limit-mark ${kind}" aria-hidden="true"></span>`.repeat(shown);
   return marks + (count > shown ? '<span aria-hidden="true">…</span>' : "");
 }
-function limitPlaces(used, limit, runs) {
+function limitPlaces(used, limit, runs, waiting = 0, exempt = 0) {
   const free = Number.isInteger(limit) && Number.isInteger(used) ? Math.max(0, limit - used) : 0;
-  return `<span class="build-limit-marks">${limitMarks("run", runs)}${limitMarks("free", free)}
-    ${limit == null ? "" : limitMarks("line")}</span>`;
+  return `<span class="build-limit-marks">${limitMarks("run", runs)}${limitMarks("wait", waiting)}${limitMarks("free", free)}
+    ${limit == null ? "" : limitMarks("line")}${limitMarks("merge", exempt)}</span>`;
 }
 function limitWords(words, key, values = {}) {
   return words[key].replace(/\{(\w+)\}/g, (_, name) => values[name]);
 }
 function limitMetric(metric, words) {
-  const {label, used, limit, unit, qualifier, unreadable} = metric;
+  const {label, used, limit, unit, qualifier, unreadable, reserved_waiting = 0, exempt_runs = 0} = metric;
   const amount = value => unit === "USD" ? limitWords(words, "money_value", {value: value.toFixed(2)})
     : unit === "GiB" ? limitWords(words, "gib_value", {value: f1(value)}) : String(value);
   const current = used == null ? (unreadable ? words.not_available : "") : amount(used);
   const limitText = limit == null ? "" : amount(limit);
   let text = current;
-  if (limitText && qualifier === "minimum")
-    text = limitWords(words, current ? "minimum_value" : "minimum_only", {used: current, limit: limitText});
+  if (qualifier === "minimum")
+    text = current && limitText ? limitWords(words, "minimum_value", {used: current, limit: limitText}) : "";
   else if (limitText)
     text = limitWords(words, used == null ? "limit" : "count", {used: current, limit: limitText});
   if (unreadable && used == null && limitText && qualifier !== "minimum") text += ` · ${words.not_available}`;
   const bar = used != null && limit > 0 && unit
     ? `<span class="build-limit-track${qualifier === "minimum" && used < limit ? " below" : ""}" aria-hidden="true">
       <i style="width:${Math.min(100, Math.max(0, used / limit * 100))}%"></i></span>` : "";
-  const places = unit || limit == null ? "" : limitPlaces(used, limit, used ?? 0);
+  const places = unit || limit == null ? "" : limitPlaces(
+    used, limit, (used ?? 0) - reserved_waiting - exempt_runs, reserved_waiting, exempt_runs);
   const note = qualifier && qualifier !== "minimum" ? ` · ${esc(words[qualifier])}` : "";
   const detail = text ? `<div class="build-limit-metric"><span>${esc(words[label] ?? label)}${note}</span>
     ${bar || places}<span class="num">${esc(text)}</span></div>` : "";
-  return detail + limitWaits(metric.waits, words);
+  return detail + limitWaits(metric.waits);
 }
 function limitNames(names) {
   const shown = names.filter(Boolean);
   return shown.length ? `<span class="build-limit-names">${shown.map(name =>
     `<span class="build-limit-name">${staffName(name)}</span>`).join("")}</span>` : "";
 }
-function limitWaits(waits, words) {
-  return Object.entries(waits).map(([reason, names]) => `<div class="build-limit-wait" data-wait-count="${names.length}">
-    ${reason ? `<div>${esc(reason)}</div>` : ""}
-    <div class="build-limit-count"><span class="build-limit-marks">${limitMarks("wait", names.length)}</span>
-      <span>${esc(limitWords(words, "waiting", {count: names.length}))}</span></div>${limitNames(names)}</div>`).join("");
+function limitWaits(waits) {
+  return Object.values(waits).map(({words: reason, names}) => {
+    const count = names.length;
+    const heading = count === 1 ? reason.one : reason.many.replace("{count}", count);
+    return `<div class="build-limit-wait" data-wait-count="${count}">
+      <div class="build-limit-count"><span class="build-limit-marks">${limitMarks("wait", count)}</span>
+        <span>${esc(heading)}</span></div>${limitNames(names)}</div>`;
+  }).join("");
 }
 function limitCell(cell, words, isMac) {
-  const {limit, used, runs, merge_above, other, other_used, waits, note} = cell;
+  const {limit, used, runs, merge_above, other, other_used, waits, note, policy, show_marks = true} = cell;
   let count = "";
   if (limit != null) {
     count = limitWords(words, used == null ? "limit" : "count", {used, limit});
-  } else if (used || runs.length || Object.keys(waits).length) {
-    count = used ? limitWords(words, isMac ? "occupied" : "running", {count: used}) : "";
-    if (!isMac && !cell.has_limit_key) count += count ? ` · ${words.no_limit}` : words.no_limit;
+  } else if (used) {
+    count = limitWords(words, isMac ? "occupied" : "running", {count: used});
   }
-  const marks = limitPlaces(used, limit, Math.max(0, (used ?? 0) - merge_above.length));
-  let contents = count ? `<div class="build-limit-count num">${marks}
-    ${merge_above.length ? `<span class="build-limit-marks">${limitMarks("merge", merge_above.length)}</span>` : ""}
-    <span>${esc(count)}</span></div>` : "";
+  const marks = show_marks ? limitPlaces(used, limit, Math.max(0, (used ?? 0) - merge_above.length), 0, merge_above.length) : "";
+  const noLimit = limit == null && policy === "no_limit"
+    ? `<span class="build-limit-note">${count ? " · " : ""}${esc(words.no_limit)}</span>` : "";
+  let contents = count ? `<div class="build-limit-count num">${marks}<span>${esc(count)}${noLimit}</span></div>` : noLimit;
   contents += limitNames(runs);
   if (merge_above.length) contents += limitNames(merge_above);
   if (other_used) contents += `<div class="build-limit-note">${esc(limitWords(words, "other_running", {count: other_used}))}</div>${limitNames(other)}`;
   if (note) contents += `<div class="build-limit-note">${esc(note)}</div>`;
-  return contents + limitWaits(waits, words);
+  const details = contents + limitWaits(waits);
+  return details || (policy === "configured"
+    ? `<span class="build-limit-note">${esc(words.limit_set)}</span>` : "");
 }
 let lastBuildLimitsHtml = "";
 function renderBuildLimits(limits) {
@@ -1338,7 +1342,7 @@ function renderBuildLimits(limits) {
   section.querySelector("summary .name").textContent = words.title;
   if (!section.open) return;
   const container = $("build-limits-content");
-  const machines = [["natedev", words.local], ["mac", words.mac], ["aws", words.aws]].filter(([key]) => limits[key]);
+  const machines = [["natedev", words.local], ["mac", words.mac], ["aws", words.aws]];
   const headings = machines.map(([key, name]) => {
     const data = limits[key];
     return `<th scope="col">${esc(name)}
@@ -1348,18 +1352,17 @@ function renderBuildLimits(limits) {
         <span>${esc(limitWords(words, "occupied", {count: data.unattributed}))}</span></div>`
       : `<div class="build-limit-note">${esc(limitWords(words, "other_running", {count: data.unattributed}))}</div>`}
     ${data.shared.map(metric => limitMetric(metric, words)).join("")}
-    ${limitWaits(data.waits, words)}</th>`;
+    ${limitWaits(data.waits)}</th>`;
   }).join("");
   const rows = limits.repositories.map(row =>
-    `<tr${row.quiet ? ' class="quiet"' : ""}><th scope="row">${esc(row.name)}${row.owner ? `<small>${esc(row.owner)}</small>` : ""}</th>
+    `<tr${row.quiet ? ' class="quiet"' : ""}><th scope="row">${esc(row.name)}</th>
       ${machines.map(([key]) => `<td>${limitCell(row[key], words, key === "mac")}</td>`).join("")}</tr>`).join("");
   const legend = [["run", "legend_run"], ["free", "legend_free"], ["line", "legend_line"],
     ["merge", "merge_above"], ["wait", "legend_wait"]];
   const html = `<div class="build-limits-scroll"><table class="build-limits-table" aria-label="${esc(words.table)}">
     <thead><tr><th scope="col">${esc(words.repository)}</th>${headings}</tr></thead><tbody>${rows}</tbody></table></div>
-    ${limitWaits(limits.unplaced, words)}
-    ${limits.history_stale || limits.history_unavailable
-      ? `<p class="build-limit-note">${esc(limits.history_stale ? words.stale_history : words.not_available)}</p>` : ""}
+    ${limitWaits(limits.unplaced)}
+    ${limits.history_unavailable ? `<p class="build-limit-note">${esc(words.not_available)}</p>` : ""}
     <div class="build-limit-legend">${legend.map(([kind, word]) => `<span>${limitMarks(kind)}${esc(words[word])}</span>`).join("")}</div>`;
   if (lastBuildLimitsHtml === html) return;
   const scrollLeft = container.querySelector(".build-limits-scroll")?.scrollLeft ?? 0;
