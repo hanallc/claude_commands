@@ -48,6 +48,7 @@ BROWSER_DRAFT_ID = re.compile(r"r6-[0-9a-f]{32}")
 LEGACY_DRAFT_BINDING = re.compile(r"(r2-[0-9a-f]{32})-.+")
 BROWSER_DRAFT_BINDING = re.compile(r"(r6-[0-9a-f]{32})-.+")
 PAGE_SCREENSHOT = ImageReference("000000000000", "image.png")
+CAPTURE_FINISHED = "page-capture-finished"
 
 
 def is_draft_id(value: object) -> bool:
@@ -1549,6 +1550,8 @@ def _submit(request: NewItemRequest, *, members: staff.StaffSnapshot | None,
             atomic_file.sync_folder(alias.parent)
             return previous
     state = request.page_state
+    pending_capture = (isinstance(capture_intent, new_item_dialog.DeferredCaptureIntent)
+                       and isinstance(capture_intent.request, new_item_dialog.PageCaptureRequest))
     missing_capture = capture_requested and isinstance(screenshot, new_item_dialog.NoPageScreenshot)
     unverified = refusal is not None or missing_capture
     if refusal is None and (missing_capture or isinstance(screenshot, new_item_dialog.FiledPageScreenshot)):
@@ -1572,8 +1575,7 @@ def _submit(request: NewItemRequest, *, members: staff.StaffSnapshot | None,
             evidence = NoEvidence()
         if state is not None:
             state = replace(state, viewport=screenshot.viewport, include_screenshot=True)
-    elif state is not None and (isinstance(capture_intent, new_item_dialog.DeferredCaptureIntent)
-                                or not (legacy_draft or list_draft)):
+    elif state is not None and (pending_capture or not (legacy_draft or list_draft)):
         state = replace(state, viewport=None, include_screenshot=False)
     request = replace(request, kind=kind, evidence=evidence, page_state=state)
     try:
@@ -1685,7 +1687,7 @@ def _submit(request: NewItemRequest, *, members: staff.StaffSnapshot | None,
                                                     browser_token_digest=token_digest,
                                                     has_capture_intent=isinstance(capture_intent,
                                                                                  new_item_dialog.DeferredCaptureIntent))
-                if list_draft and saved.has_capture_intent:
+                if (list_draft or legacy_list_draft) and saved.has_capture_intent:
                     _write_location(_request_folder(submitted_draft_id) / "list-capture-target.json", saved)
                 _write_location(pending_file, saved)
                 _stage_initial_delivery(folder, address, initial_delivery)
@@ -1740,8 +1742,63 @@ def scoped_submission(scoped: ScopedSubmissionKey, *, members: staff.StaffSnapsh
     with _locked_request(address, members) as lookup:
         located = lookup.native
         if not isinstance(located, LocatedSubmission) or located.destination.id != scoped.item_id:
+            if isinstance(lookup.hint, UnreadableRequestFile):
+                raise lookup.hint.error
             raise SavedSubmissionMissing("The sent item does not exist.")
         yield located
+
+
+def _capture_marker_name(key: str) -> str:
+    return f"{CAPTURE_FINISHED}-{hashlib.sha256(key.encode('ascii')).hexdigest()}"
+
+
+def _capture_folder_finished(folder: Path) -> bool:
+    return (folder / CAPTURE_FINISHED).is_file() or any(
+        marker.is_file() for marker in folder.glob(f"{CAPTURE_FINISHED}-*"))
+
+
+def capture_finished(target: ScopedSubmissionKey) -> bool:
+    return _capture_folder_finished(_request_folder(target.request_id))
+
+
+def capture_key_finished(key: str) -> bool:
+    """Find the finished capture for a browser draft key."""
+    draft = key[:35]
+    if not new_item_dialog.capture_key_matches_draft(key, draft):
+        return False
+    folder = _request_folder(draft)
+    name = _capture_marker_name(key)
+    expected = (key + "\n").encode("ascii")
+    if not DRAFT_ID.fullmatch(draft):
+        if (folder / name).is_file():
+            return True
+        try:
+            return (folder / CAPTURE_FINISHED).read_bytes() == expected
+        except FileNotFoundError:
+            return False
+
+    def matches(candidate: Path) -> bool:
+        try:
+            return (candidate / name).is_file() or (candidate / CAPTURE_FINISHED).read_bytes() == expected
+        except OSError:
+            return False
+
+    try:
+        target = _read_request_file(folder / "list-capture-target.json", draft)
+    except (OSError, ValueError):
+        target = _NO_REQUEST_FILE
+    located = _request_folder(target.request_id) if isinstance(target, NativeSubmissionDestination) else folder
+    if matches(located):
+        return True
+
+    # A legacy draft lookup can point to a later filing.
+    return any(candidate != located and matches(candidate) for candidate in folder.parent.glob("r[45]-*"))
+
+
+def mark_capture_finished(target: ScopedSubmissionKey, key: str) -> None:
+    """Record that the attachment and Bug case need no more work."""
+    path = _request_folder(target.request_id) / _capture_marker_name(key)
+    atomic_file.write_text_atomic(path, "", new_file_mode=0o600)
 
 
 def committed_page_captures() -> Iterator[tuple[ScopedSubmissionKey, new_item_dialog.DeferredCaptureIntent, bool]]:
@@ -1750,6 +1807,8 @@ def committed_page_captures() -> Iterator[tuple[ScopedSubmissionKey, new_item_di
         if not folder.name.startswith(("r2-", "r4-", "r5-", "r6-")) or not folder.is_dir():
             continue
         try:
+            if _capture_folder_finished(folder):
+                continue
             hint = _read_location_hint(folder)
             if not isinstance(hint, NativeSubmissionDestination) or not hint.has_capture_intent:
                 continue
@@ -1917,8 +1976,8 @@ def save_bug_page_state(saved: NativeSubmissionDestination, item_key: str, reque
 
 
 def record_deferred_bug_screenshot(target: new_item_dialog.ScopedSubmissionKey,
-                                   viewport: new_item_dialog.PageViewport) -> None:
-    """Reconcile the Bug case with the screenshot on the native record."""
+                                   viewport: new_item_dialog.PageViewport | new_item_dialog.NoPageScreenshot) -> None:
+    """Save the Bug case and reconcile any screenshot on the native record."""
     if target.kind != SubmissionKind.BUG:
         return
     with scoped_submission(target) as located:
@@ -1927,6 +1986,8 @@ def record_deferred_bug_screenshot(target: new_item_dialog.ScopedSubmissionKey,
         saved = located.destination
     item_key = f"investigation/{saved.owner}/{saved.id}"
     _ = save_bug_page_state(saved, item_key, None, lambda _page, _state: False)
+    if isinstance(viewport, new_item_dialog.NoPageScreenshot):
+        return
     path = review_link.review_root() / "page-states" / (target.request_id + ".json")
     with exclusive(_request_folder(target.request_id) / ".page-state.lock"):
         record = cast(dict[str, object], json.loads(path.read_text(encoding="utf-8")))

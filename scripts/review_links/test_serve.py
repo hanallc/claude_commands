@@ -1930,13 +1930,25 @@ class ReviewLinksServerTests(unittest.TestCase):
             deliver.assert_called_once()
 
     def test_deferred_capture_failure_keeps_the_item_and_page_data(self) -> None:
-        _, cache, request = self.page_bug_fixture()
+        from scripts.review_links.test_review_submissions import PNG
+
+        folder, cache, request = self.page_bug_fixture()
+        assert request.page_state is not None
+        list_state = replace(request.page_state, include_screenshot=True,
+                             url=f"http://127.0.0.1:{self.port}{list_page.PAGE_PATH}")
         _ = write_config_fixture(conf.path("console"), f"page.list.owner={request.recipient_id}\n")
         with (patch.object(change_page, "send_to_staff") as deliver,
+              patch.object(shutil, "which", side_effect=fake_firefox),
+              patch.object(serve, "page_screenshot", return_value=base64.b64decode(PNG)) as screenshot,
               patch.object(self.server, "launch_page_capture") as launch):
             for page, prefix, kind, path in (
                     ("review", "r6-", new_item_dialog.SubmissionKind.BUG, review_page.PAGE_PATH),
-                    ("list", "r2-", new_item_dialog.SubmissionKind.INVESTIGATION, list_page.PAGE_PATH)):
+                    ("list", "r2-", new_item_dialog.SubmissionKind.INVESTIGATION, list_page.PAGE_PATH),
+                    ("list", "r2-", new_item_dialog.SubmissionKind.BUG, list_page.PAGE_PATH)):
+                list_bug = page == "list" and kind == new_item_dialog.SubmissionKind.BUG
+                state = request.page_state if page == "review" else None
+                if list_bug:
+                    state = list_state
                 other_page = list_page.PAGE_PATH if page == "review" else review_page.PAGE_PATH
                 for failure, capture in (
                         ("viewport", asdict(replace(FIXTURE_CAPTURE, place=path, width=239))),
@@ -1944,10 +1956,11 @@ class ReviewLinksServerTests(unittest.TestCase):
                         ("invalid address", asdict(replace(FIXTURE_CAPTURE, place="//example.invalid"))),
                         ("different page", asdict(replace(FIXTURE_CAPTURE, place=other_page))),
                         ("invalid capture object", "invalid")):
-                    with self.subTest(page=page, failure=failure):
+                    if list_bug and failure not in ("viewport", "long address"):
+                        continue
+                    with self.subTest(page=page, kind=kind, failure=failure):
                         attempt = replace(request, page=page, kind=kind, request_id=prefix + uuid4().hex,
-                                          words=f"Report the {failure}.",
-                                          page_state=request.page_state if page == "review" else None)
+                                          words=f"Report the {failure}.", page_state=state)
                         key = attempt.request_id + uuid4().hex
                         body = json.dumps({**asdict(attempt), "token": self.server.new_item_token, "capture_key": key,
                                            "defer_capture": capture}).encode()
@@ -1960,6 +1973,13 @@ class ReviewLinksServerTests(unittest.TestCase):
                         self.assertEqual(details.capture_intent, new_item_dialog.DeferredCaptureIntent(
                             key, attempt.request_id, new_item_dialog.UnavailableCapture.UNAVAILABLE))
                         self.assertEqual(self.page_capture_preview(key).status, 404)
+                        if list_bug:
+                            self.assertEqual(details.page_state, list_state)
+                            path = folder / (details.request_id + ".json")
+                            case = cast(dict[str, object], json.loads(path.read_text()))
+                            data = cast(dict[str, object], case["page_data"])
+                            self.assertEqual(data["rows"], [["Item", "State"]])
+                            self.assertIsNone(case["screenshot"])
                         retry = self.new_item_http(body, finished=True)
                         self.assertEqual(retry.status, 200, retry.body)
                         confirmed = cast(dict[str, str], json.loads(retry.body))
@@ -1967,8 +1987,269 @@ class ReviewLinksServerTests(unittest.TestCase):
                         if page == "list":
                             self.assertEqual(confirmed["list_key"], saved["list_key"])
             launch.assert_not_called()
-            self.assertEqual(deliver.call_count, 10)
-            self.assertEqual(len(the_list.records(request.recipient_id)), 5)
+            screenshot.assert_not_called()
+            self.assertEqual(deliver.call_count, 12)
+            self.assertEqual(len(the_list.records(request.recipient_id)), 7)
+
+    def file_deferred_page_capture(self, request: new_item_dialog.NewItemRequest,
+                                   capture: new_item_dialog.PageCaptureRequest = FIXTURE_CAPTURE
+                                   ) -> tuple[str, new_item_dialog.ScopedSubmissionKey]:
+        server = self.server
+        key = request.request_id + uuid4().hex
+        body = json.dumps({**asdict(request), "token": server.new_item_token, "capture_key": key,
+                           "defer_capture": asdict(capture)}).encode()
+        response = self.new_item_http(body, finished=True)
+        self.assertEqual(response.status, 200, response.body)
+        target = server.page_captures.target(key)
+        assert isinstance(target, new_item_dialog.ScopedSubmissionKey)
+        return key, target
+
+    def test_capture_store_keeps_only_unfinished_work_after_several_sends_and_restart(self) -> None:
+        from scripts.review_links.test_review_submissions import PNG
+
+        folder, cache, request = self.page_bug_fixture()
+        server = self.server
+        store = self.root / serve.PAGE_CAPTURE_FOLDER
+        url = f"http://127.0.0.1:{self.port}{FIXTURE_CAPTURE.place}"
+        image = base64.b64decode(PNG)
+
+        with (patch.object(change_page, "send_to_staff"),
+              patch.object(shutil, "which", side_effect=fake_firefox),
+              patch.object(server, "launch_page_capture", return_value=True) as launch,
+              patch.object(serve, "page_screenshot", return_value=image)):
+            attached, attached_target = self.file_deferred_page_capture(
+                replace(request, request_id="r6-" + uuid4().hex, words="Attach the screenshot."))
+            server.capture_page(attached, "/test/firefox", url, FIXTURE_CAPTURE)
+            unavailable, unavailable_target = self.file_deferred_page_capture(
+                replace(request, request_id="r6-" + uuid4().hex, words="The capture fails."))
+            with patch.object(serve, "page_screenshot", side_effect=OSError("Firefox failed")):
+                server.capture_page(unavailable, "/test/firefox", url, FIXTURE_CAPTURE)
+            unfinished, unfinished_target = self.file_deferred_page_capture(
+                replace(request, request_id="r6-" + uuid4().hex, words="The capture is still pending."))
+            server.capture_slot.release()
+
+            for target, expected in ((attached_target, review_submissions.PAGE_SCREENSHOT.id),
+                                     (unavailable_target, None), (unfinished_target, None)):
+                path = folder / (target.request_id + ".json")
+                case = cast(dict[str, object], json.loads(path.read_text()))
+                self.assertEqual(case["screenshot"], expected)
+            self.assertEqual(len(cache.get().records), 3)
+            self.assertEqual(server.page_captures.target(unfinished), unfinished_target)
+            self.assertEqual({path.name for path in store.iterdir()}, {unfinished})
+            for key in (attached, unavailable):
+                self.assertEqual(server.page_captures.target(key), new_item_dialog.NoBoundCaptureTarget.UNBOUND)
+
+            restored = serve.PageCaptures(store)
+            launch.reset_mock()
+            with (patch.object(server, "page_captures", restored),
+                  patch.object(server, "process_committed_capture", wraps=server.process_committed_capture) as recover):
+                server.recover_page_captures()
+                recover.assert_called_once()
+                self.assertEqual(recover.call_args.args[0], unfinished_target)
+                launch.assert_called_once_with(unfinished, "/test/firefox", FIXTURE_CAPTURE, queued=True)
+                self.assertEqual({path.name for path in store.iterdir()}, {unfinished})
+
+    def test_unreadable_receipt_keeps_the_unattached_capture_for_retry(self) -> None:
+        from scripts.review_links.test_review_submissions import PNG
+
+        _, _, request = self.page_bug_fixture()
+        server = self.server
+        image = base64.b64decode(PNG)
+        with (patch.object(change_page, "send_to_staff"),
+              patch.object(shutil, "which", side_effect=fake_firefox),
+              patch.object(server, "launch_page_capture", return_value=True),
+              patch.object(serve, "page_screenshot", return_value=image) as screenshot):
+            key, target = self.file_deferred_page_capture(replace(request, request_id="r6-" + uuid4().hex))
+            with review_submissions.scoped_submission(target) as located:
+                images = review_submissions.image_folder(located.details)
+            receipt = images.parent / "receipt.json"
+            contents = receipt.read_bytes()
+            _ = receipt.write_text("invalid receipt", encoding="utf-8")
+            try:
+                with patch.object(review_submissions, "_search_native_stores",
+                                  return_value=review_submissions.NoNativeSubmission()):
+                    server.capture_page(key, "/test/firefox", f"http://127.0.0.1:{self.port}{FIXTURE_CAPTURE.place}",
+                                        FIXTURE_CAPTURE)
+                    proof = self.root / serve.PAGE_CAPTURE_FOLDER / key
+                    self.assertTrue(proof.read_bytes().endswith(image))
+                    self.assertFalse(review_submissions.capture_finished(target))
+            finally:
+                _ = receipt.write_bytes(contents)
+
+            with patch.object(server, "launch_bound_attachment", side_effect=server.finish_bound_capture):
+                server.retry_page_attachments()
+            self.assertFalse(proof.exists())
+            self.assertTrue(review_submissions.capture_finished(target))
+            reference = review_submissions.PAGE_SCREENSHOT
+            self.assertEqual((images / reference.id / reference.file).read_bytes(), image)
+            screenshot.assert_called_once()
+
+    def test_late_capture_post_does_not_restart_a_pruned_key(self) -> None:
+        from scripts.review_links.test_review_submissions import PNG
+
+        _, _, request = self.page_bug_fixture()
+        _ = write_config_fixture(conf.path("console"), f"page.list.owner={request.recipient_id}\n")
+        server = self.server
+        image = base64.b64decode(PNG)
+        store = self.root / serve.PAGE_CAPTURE_FOLDER
+        with (patch.object(change_page, "send_to_staff"),
+              patch.object(shutil, "which", side_effect=fake_firefox),
+              patch.object(server, "launch_page_capture", return_value=True) as launch,
+              patch.object(serve, "page_screenshot", return_value=image)):
+            for page, prefix, place in (("review", "r6-", FIXTURE_CAPTURE.place),
+                                        ("list", "r6-", list_page.PAGE_PATH),
+                                        ("list", "r2-", list_page.PAGE_PATH)):
+                with self.subTest(page=page, prefix=prefix):
+                    attempt = replace(request, page=page, request_id=prefix + uuid4().hex, page_state=None)
+                    capture = replace(FIXTURE_CAPTURE, place=place)
+                    key, _ = self.file_deferred_page_capture(attempt, capture)
+                    server.capture_page(key, "/test/firefox", f"http://127.0.0.1:{self.port}{place}", capture)
+                    self.assertFalse((store / key).exists())
+                    start = json.dumps({"token": server.new_item_token, "capture_key": key,
+                                        "page_capture": asdict(capture)}).encode()
+                    launch.reset_mock()
+                    self.assertEqual(self.new_item_http(start, finished=True).status, 202)
+                    with patch.object(server, "page_captures", serve.PageCaptures(store)):
+                        self.assertEqual(self.new_item_http(start, finished=True).status, 202)
+                    launch.assert_not_called()
+                    self.assertFalse((store / key).exists())
+
+    def test_late_legacy_list_capture_post_does_not_restart_without_a_lookup(self) -> None:
+        from scripts.review_links.test_review_submissions import PNG
+
+        _, _, request = self.page_bug_fixture()
+        _ = write_config_fixture(conf.path("console"), f"page.list.owner={request.recipient_id}\n")
+        request = replace(request, page="list", page_state=None)
+        capture = replace(FIXTURE_CAPTURE, place=list_page.PAGE_PATH)
+        server = self.server
+        store = self.root / serve.PAGE_CAPTURE_FOLDER
+        with (patch.object(change_page, "send_to_staff"),
+              patch.object(shutil, "which", side_effect=fake_firefox),
+              patch.object(server, "launch_page_capture", return_value=True) as launch,
+              patch.object(serve, "page_screenshot", return_value=base64.b64decode(PNG))):
+            key, target = self.file_deferred_page_capture(request, capture)
+            with review_submissions.scoped_submission(target) as located:
+                attachments = review_submissions.image_folder(located.details).parent.parent
+            (attachments / request.request_id / "list-capture-target.json").unlink()
+            server.capture_page(key, "/test/firefox", f"http://127.0.0.1:{self.port}{capture.place}", capture)
+            self.assertTrue(review_submissions.capture_finished(target))
+            self.assertFalse((store / key).exists())
+
+            start = json.dumps({"token": server.new_item_token, "capture_key": key,
+                                "page_capture": asdict(capture)}).encode()
+            launch.reset_mock()
+            with patch.object(server, "page_captures", serve.PageCaptures(store)):
+                self.assertEqual(self.new_item_http(start, finished=True).status, 202)
+            launch.assert_not_called()
+            self.assertFalse((store / key).exists())
+
+    def test_late_legacy_list_capture_post_finds_an_older_filing(self) -> None:
+        from scripts.review_links.test_review_submissions import PNG
+
+        _, _, request = self.page_bug_fixture()
+        _ = write_config_fixture(conf.path("console"), f"page.list.owner={request.recipient_id}\n")
+        request = replace(request, page="list", page_state=None)
+        capture = replace(FIXTURE_CAPTURE, place=list_page.PAGE_PATH)
+        server = self.server
+        url = f"http://127.0.0.1:{self.port}{capture.place}"
+        with (patch.object(change_page, "send_to_staff"),
+              patch.object(shutil, "which", side_effect=fake_firefox),
+              patch.object(server, "launch_page_capture", return_value=True) as launch,
+              patch.object(serve, "page_screenshot", return_value=base64.b64decode(PNG))):
+            key, target = self.file_deferred_page_capture(request, capture)
+            with review_submissions.scoped_submission(target) as located:
+                folder = review_submissions.image_folder(located.details).parent
+            lookup = folder.parent / request.request_id / "list-capture-target.json"
+            lookup.unlink()
+            server.capture_page(key, "/test/firefox", url, capture)
+            marker, = folder.glob(f"{review_submissions.CAPTURE_FINISHED}-*")
+            marker.unlink()
+            _ = (folder / review_submissions.CAPTURE_FINISHED).write_text(key + "\n", encoding="ascii")
+            self.assertTrue(review_submissions.capture_finished(target))
+
+            later_key, later_target = self.file_deferred_page_capture(
+                replace(request, words="Report a different problem."), capture)
+            self.assertNotEqual(later_target, target)
+            self.assertTrue(lookup.is_file())
+            server.capture_page(later_key, "/test/firefox", url, capture)
+
+            start = json.dumps({"token": server.new_item_token, "capture_key": key,
+                                "page_capture": asdict(capture)}).encode()
+            launch.reset_mock()
+            self.assertEqual(self.new_item_http(start, finished=True).status, 202)
+            launch.assert_not_called()
+            self.assertFalse((self.root / serve.PAGE_CAPTURE_FOLDER / key).exists())
+
+            new_key = request.request_id + uuid4().hex
+            start = json.dumps({"token": server.new_item_token, "capture_key": new_key,
+                                "page_capture": asdict(capture)}).encode()
+            self.assertEqual(self.new_item_http(start, finished=True).status, 202)
+            launch.assert_called_once_with(new_key, "/test/firefox", capture, queued=False)
+
+    def test_late_legacy_list_capture_post_does_not_restart_with_an_unreadable_marker(self) -> None:
+        from scripts.review_links.test_review_submissions import PNG
+
+        _, _, request = self.page_bug_fixture()
+        _ = write_config_fixture(conf.path("console"), f"page.list.owner={request.recipient_id}\n")
+        request = replace(request, page="list", page_state=None)
+        capture = replace(FIXTURE_CAPTURE, place=list_page.PAGE_PATH)
+        server = self.server
+        store = self.root / serve.PAGE_CAPTURE_FOLDER
+        with (patch.object(change_page, "send_to_staff"),
+              patch.object(shutil, "which", side_effect=fake_firefox),
+              patch.object(server, "launch_page_capture", return_value=True) as launch,
+              patch.object(serve, "page_screenshot", return_value=base64.b64decode(PNG))):
+            key, target = self.file_deferred_page_capture(request, capture)
+            with review_submissions.scoped_submission(target) as located:
+                folder = review_submissions.image_folder(located.details).parent
+            (folder.parent / request.request_id / "list-capture-target.json").unlink()
+            server.capture_page(key, "/test/firefox", f"http://127.0.0.1:{self.port}{capture.place}", capture)
+            marker, = folder.glob(f"{review_submissions.CAPTURE_FINISHED}*")
+            self.assertFalse((store / key).exists())
+            read_bytes = Path.read_bytes
+
+            def read(path: Path) -> bytes:
+                if path == marker:
+                    raise PermissionError("The completion marker is unreadable.")
+                return read_bytes(path)
+
+            start = json.dumps({"token": server.new_item_token, "capture_key": key,
+                                "page_capture": asdict(capture)}).encode()
+            launch.reset_mock()
+            with (patch.object(server, "page_captures", serve.PageCaptures(store)),
+                  patch.object(Path, "read_bytes", autospec=True, side_effect=read)):
+                response = self.new_item_http(start, finished=True)
+            self.assertEqual(response.status, 202, response.body)
+            launch.assert_not_called()
+            self.assertFalse((store / key).exists())
+
+    def test_unreadable_completion_marker_does_not_block_an_unfinished_capture(self) -> None:
+        _, _, request = self.page_bug_fixture()
+        _ = write_config_fixture(conf.path("console"), f"page.list.owner={request.recipient_id}\n")
+        attachments = self.root.parent / "attachments"
+        _ = write_config_fixture(conf.path("review_links"), f"review_attachments_root={attachments}\n")
+        folder = attachments / ("r5-" + "a" * 64 + "-bug-" + request.recipient_id)
+        folder.mkdir(parents=True)
+        marker = folder / review_submissions.CAPTURE_FINISHED
+        _ = marker.write_text("r2-" + "b" * 64 + "\n", encoding="ascii")
+        read_bytes = Path.read_bytes
+
+        def read(path: Path) -> bytes:
+            if path == marker:
+                raise PermissionError("The completion marker is unreadable.")
+            return read_bytes(path)
+
+        key = request.request_id + uuid4().hex
+        capture = replace(FIXTURE_CAPTURE, place=list_page.PAGE_PATH)
+        start = json.dumps({"token": self.server.new_item_token, "capture_key": key,
+                            "page_capture": asdict(capture)}).encode()
+        with (patch.object(Path, "read_bytes", autospec=True, side_effect=read) as read_marker,
+              patch.object(shutil, "which", side_effect=fake_firefox),
+              patch.object(self.server, "launch_page_capture", return_value=True) as launch):
+            response = self.new_item_http(start, finished=True)
+        self.assertEqual(response.status, 202, response.body)
+        read_marker.assert_any_call(marker)
+        launch.assert_called_once_with(key, "/test/firefox", capture, queued=False)
 
     def test_restart_finds_capture_intent_before_a_lookup_or_receipt_exists(self) -> None:
         from scripts.review_links.test_review_submissions import PNG
