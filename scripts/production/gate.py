@@ -91,7 +91,7 @@ from scripts.production.gate_routes import (
     GateJobKind as GateJobKind, GateJobResult as GateJobResult, GateRun as GateRun,
     MacGateCancellation as MacGateCancellation, MacGateExcludeFileMissing as MacGateExcludeFileMissing,
     MacGateExclusions as MacGateExclusions, ModuleCoverage, SelectedModules as SelectedModules,
-    SuiteMode as SuiteMode, TreeSelection as TreeSelection,
+    SuiteMode as SuiteMode, TreeSelection as TreeSelection, WholeGateRoute,
 )
 from scripts.production import mac_gate_process
 from scripts.production.affected_modules import (  # noqa: E402
@@ -106,7 +106,7 @@ from scripts.lib.user_zone import user_zone  # noqa: E402
 from scripts.lib.process_failure import failure_detail  # noqa: E402
 from scripts.lib import scratch  # noqa: E402
 from scripts.test_times import gate_record
-from scripts.build_queue import admission_records  # noqa: E402
+from scripts.build_queue import admission_records, admission_wire  # noqa: E402
 from scripts.build_queue import progress_profile
 from scripts.build_queue.admission_client import AdmissionHoldCheck  # noqa: E402
 from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, GateJobNotRecorded, StepJob
@@ -2929,12 +2929,27 @@ def combine_gate_runs(first: GateRun, second: GateRun, *, seconds: float) -> Gat
                    time_limit_report=reports)
 
 
+def mac_linux_gate_placed() -> bool:
+    """Check that the enabled Mac Linux guest has the queue assignment."""
+    path = os.environ.get("BUILDLOG_PLACEMENT_FILE")
+    if not path:
+        return False
+    try:
+        if not conf.read("build_targets").value("enabled.mac-linux", conf.on_off,
+                                               default=False, recover_invalid=False):
+            return False
+        placement = admission_wire.read_assignment(Path(path))
+    except (OSError, ValueError, admission_wire.AdmissionUnavailable):
+        return False
+    return placement.assignment.destination.target == "mac-linux"
+
+
 def run_gate_suites(repo: Path, type_dirs: Sequence[str] = (),
                     module_time_limit_s: float = DEFAULT_MODULE_TIME_LIMIT_S, *,
                     source: Literal["tests-only", "checkpoint"] = "tests-only", full: bool = False,
                     mode: SuiteMode = SuiteMode.GATE,
                     gate_job: StepJob | GateJobNotRecorded = GATE_JOB_NOT_RECORDED) -> GateRun:
-    """Route gates through AWS. Split affected tests between natedev and the Mac."""
+    """Route the whole test selection to the Mac Linux guest, AWS, or natedev."""
     def run_local(types: Sequence[str]) -> GateRun:
         return run_suites(repo, types, module_time_limit_s, source=source, full=full, mode=mode)
 
@@ -2944,22 +2959,37 @@ def run_gate_suites(repo: Path, type_dirs: Sequence[str] = (),
         return run_suites(repo, types, module_time_limit_s, source=source, full=full,
                           mode=mode, selected=SelectedModules(paths))
 
-    def run_cloud(selection: AllModules | TreeSelection) -> GateRun:
-        outcome = cloud.route(repo, mode=mode, full=full, module_time_limit_s=module_time_limit_s,
-                              selected=selection, gate_job=gate_job)
-        if isinstance(outcome, str):
-            print('Cloud gate uses natedev: ' + outcome, flush=True)
-            return run_local(type_dirs)
+    def finish_remote(outcome: GateRun) -> GateRun:
         if not type_dirs or outcome.time_limit_report:
             return outcome
         local = run_local_subset((), type_dirs)
         return combine_gate_runs(outcome, local, seconds=outcome.seconds + local.seconds)
 
+    def attempt(route: WholeGateRoute, selection: AllModules | TreeSelection) -> GateRun | str:
+        return route.route(repo, mode=mode, full=full, module_time_limit_s=module_time_limit_s,
+                           selected=selection, gate_job=gate_job)
+
+    def run_cloud(selection: AllModules | TreeSelection) -> GateRun:
+        outcome = attempt(cloud, selection)
+        if isinstance(outcome, str):
+            print('Cloud gate uses natedev: ' + outcome, flush=True)
+            return run_local(type_dirs)
+        return finish_remote(outcome)
+
+    def run_whole_gate(selection: AllModules | TreeSelection) -> GateRun:
+        if mac_linux_gate_placed():
+            guest = cast(WholeGateRoute, cast(object, import_module("scripts.build_targets.mac_linux")))
+            outcome = attempt(guest, selection)
+            if isinstance(outcome, GateRun):
+                return finish_remote(outcome)
+            print('Mac Linux gate falls back: ' + outcome, flush=True)
+        return run_cloud(selection)
+
     absent = [name for name in type_dirs if not (repo / name).exists()]
     if absent:
         raise GateRefused(f"type dirs not found under {repo}: {', '.join(absent)}")
     if mode is SuiteMode.GATE:
-        return run_cloud(ALL_MODULES)
+        return run_whole_gate(ALL_MODULES)
 
     selected: AllModules | TreeSelection = ALL_MODULES
     whole_suite = full
@@ -2987,7 +3017,7 @@ def run_gate_suites(repo: Path, type_dirs: Sequence[str] = (),
             return GateRun((), 0.0, 0.0, selection_certified=True)
 
     # Nate ordered the Mac split off on 2026-11-21.
-    return run_cloud(selected)
+    return run_whole_gate(selected)
 
     mac_module = mac_gate_process.MAC_GATE_MODULE  # pyright: ignore[reportUnreachable]
     try:
