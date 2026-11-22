@@ -641,20 +641,28 @@ class StyleLedgerRecordsTests(LedgerTestCase):
         with closing(sqlite3.connect(ledger.database)) as writer:
             _ = writer.execute("BEGIN IMMEDIATE")
             connect = sqlite3.connect
-            busy_budgets: list[tuple[int]] = []
+            busy_budgets: list[int] = []
+
+            def observe_timeout(action: int, pragma: str | None, value: str | None,
+                                _schema: str | None, _trigger: str | None) -> int:
+                if action == sqlite3.SQLITE_PRAGMA and pragma == "busy_timeout" and value is not None:
+                    busy_budgets.append(int(value))
+                return sqlite3.SQLITE_OK
 
             def observe_connect(database: str, *, uri: bool, timeout: float) -> sqlite3.Connection:
                 connection = connect(database, uri=uri, timeout=timeout)
-                busy_budgets.append(cast(tuple[int], connection.execute("PRAGMA busy_timeout").fetchone()))
+                connection.set_authorizer(observe_timeout)
                 return connection
 
+            deadline = style_ledger.SplitDeadline(0.05, 0.05 / 60, lambda: 0.0)
+            attempted = style_ledger.RecordedSplit(1, 2, 3, 4, "2026-10-28T12:00:00+00:00")
             with (mock.patch.object(sqlite3, "connect", side_effect=observe_connect),
-                  self.assertRaisesRegex(sqlite3.OperationalError, "database is locked")):
-                style_ledger.record_split(self.repo, "names",
-                                          style_ledger.RecordedSplit(1, 2, 3, 4, "2026-10-28T12:00:00+00:00"),
-                                          busy_timeout_seconds=0.05)
+                  self.assertRaises(style_ledger.SplitTimedOut) as caught):
+                style_ledger.record_split_at(ledger.database, "names", attempted, deadline=deadline)
             writer.rollback()
-        self.assertEqual(busy_budgets, [(50,)])
+        self.assertIsInstance(caught.exception.__cause__, sqlite3.OperationalError)
+        self.assertEqual(str(caught.exception.__cause__), "database is locked")
+        self.assertEqual(busy_budgets, [50])
         self.assertEqual(self.refill_result(ledger.database), before)
 
     def test_a_later_split_preserves_the_refill_and_a_refill_preserves_the_split(self) -> None:

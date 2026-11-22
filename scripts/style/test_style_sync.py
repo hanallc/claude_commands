@@ -2,9 +2,6 @@
 
 from __future__ import annotations
 
-from scripts.lib.process_supervisor import launch as launch_process
-
-import errno
 import fcntl
 import io
 import json
@@ -16,43 +13,39 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
-import time
 import threading
-from concurrent.futures import ThreadPoolExecutor
+import time
 import unittest
-from collections.abc import Callable
-from contextlib import closing, redirect_stderr, redirect_stdout, suppress
+from collections.abc import Callable, Generator
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing, contextmanager, redirect_stderr, redirect_stdout, suppress
 from pathlib import Path
 from types import ModuleType
-
 from typing import ClassVar, TypedDict, cast, final, override
 from unittest import mock
 
-from scripts.style import style_sync
-from scripts.style import style_plan
-from scripts.style.style_child_test_support import unqueued_style_children
-from scripts.style.add_style import NoStyleProduction, standing_style_production
 from scripts.copies import copies
 from scripts.copies.copies_test_support import copies_environment
-from scripts.lib import scratch
-from scripts.style import style_ledger
-from scripts.style import style_rules
-from scripts.lib import build_folders
+from scripts.direct import test_verify_lint_scope as verify_fixture
+from scripts.lib import build_folders, scratch
+from scripts.lib.cargo_output_test_support import fake_cargo_output_roots
 from scripts.lib.process_group import send_process_group
-from scripts.production import showrunners, staff
-from scripts.production.cli_fixture import invoke_cli
-from scripts.style.style_plan_test_support import run_style_command
-from scripts.production.staff_test_support import fixture_unit_location, recorded_showrunner
-from scripts.style.ledger_test_support import style_staff_fixture, style_unit_id, ticket_owner_id, write_style_units
-from scripts.style.style_config import StyleUnitAssignment
+from scripts.lib.process_supervisor import ManagedProcess
+from scripts.lib.process_supervisor import launch as launch_process
+from scripts.lib.py_floor_test_support import interpreter_cache_environment
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.lint.memory_test_support import write_config_fixture
 from scripts.message import send_budget, session_send
 from scripts.message.test_send_budget import write_configs
-from scripts.lint.memory_test_support import write_config_fixture
-from scripts.direct import test_verify_lint_scope as verify_fixture
-from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
-from scripts.lib.cargo_output_test_support import fake_cargo_output_roots
-from scripts.lib.py_floor_test_support import interpreter_cache_environment
-
+from scripts.production import showrunners, staff
+from scripts.production.cli_fixture import invoke_cli
+from scripts.production.staff_test_support import fixture_unit_location, recorded_showrunner
+from scripts.style import style_ledger, style_plan, style_rules, style_sync
+from scripts.style.add_style import NoStyleProduction, standing_style_production
+from scripts.style.ledger_test_support import style_staff_fixture, style_unit_id, ticket_owner_id, write_style_units
+from scripts.style.style_child_test_support import unqueued_style_children
+from scripts.style.style_config import StyleUnitAssignment
+from scripts.style.style_plan_test_support import run_style_command
 from scripts.style.style_reader_test_support import oracle_reader
 
 
@@ -93,21 +86,27 @@ warning: prefer a type
 CLEAN_LINT = ''.join(f"style-lint: {tool} start\nstyle-lint: {tool} passed\n"
                      for tool in ("mend", "rustfmt", "clippy"))
 
+TEST_CHILD_STOP_SECONDS = 0.5
+
 # Runs the lint in its own process, so a signal takes the real path through style_sync.
-LINT_DRIVER = '''import sys
+LINT_DRIVER = f'''import sys
 from pathlib import Path
 from scripts.style import style_sync
 style_sync.VERIFY = Path(sys.argv[1])
 style_sync.LINT_TEMP_PARENT = Path(sys.argv[2])
-style_sync.CHILD_STOP_SECONDS = 0.5
+style_sync.CHILD_STOP_SECONDS = {TEST_CHILD_STOP_SECONDS}
 style_sync.gate_owner = lambda repo: "sample-style"
-raise SystemExit(style_sync.main(sys.argv[3:]))
 '''
 
 
-def running(pid: int) -> bool:
+def process_state(pid: int) -> str:
     state = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True, check=False)
-    return state.returncode == 0 and not state.stdout.strip().startswith("Z")
+    return state.stdout.strip() if state.returncode == 0 else ""
+
+
+def running(pid: int) -> bool:
+    state = process_state(pid)
+    return bool(state) and not state.startswith("Z")
 
 
 def wait_until(condition: Callable[[], bool], seconds: float) -> bool:
@@ -945,14 +944,15 @@ if arguments[:2] == ["+nightly", "fmt"] and "--version" not in arguments:
                               + f'test "$CARGO_BUILD_BUILD_DIR" = "{snapshot / "target"}" || exit 4\n'
                               + f'test "$CARGO_TARGET_DIR" = "{snapshot / "target"}" || exit 5\n'
                               + f"cp {metadata}/{style_sync.VERIFIER_FILE} {self.root / 'verifier-seen'}\n"
-                              + f"echo $$ > {self.root / 'verify-pid'}\ncat <<'OUTPUT'\n" + CLEAN_LINT + "OUTPUT\n")
+                              + f'ps -o pgid= -p "$$" > {self.root / "verify-group"}\ncat <<\'OUTPUT\'\n'
+                              + CLEAN_LINT + "OUTPUT\n")
         with mock.patch.object(style_sync, "VERIFY", verify), redirect_stdout(io.StringIO()):
             self.assertEqual(style_sync.main(["lint", "--repo", str(self.repo), "--checkout", str(self.repo),
                                               "--tip", self.tip]), 0)
         self.assertEqual(cast(object, json.loads((self.root / "owner-seen").read_text())), {
             "owner": os.getpid(), "repo": self.git("rev-parse", "--path-format=absolute", "--git-common-dir"),
         })
-        self.assertEqual((self.root / "verifier-seen").read_text(), (self.root / "verify-pid").read_text().strip())
+        self.assertEqual((self.root / "verifier-seen").read_text(), (self.root / "verify-group").read_text().strip())
         self.assertTrue((snapshot / "target" / scratch.USE_STAMP).is_file())
         self.assertEqual(list(self.lint_temp.iterdir()), [])
         with closing(sqlite3.connect(self.root / "state/sample/ledger.sqlite")) as connection:
@@ -984,6 +984,17 @@ if arguments[:2] == ["+nightly", "fmt"] and "--version" not in arguments:
                 redirect_stderr(output):
             code = style_sync.main(["lint", "--repo", str(self.repo), "--checkout", str(self.repo), "--tip", self.tip])
         return code, output.getvalue()
+
+    @contextmanager
+    def git_stub(self, body: str) -> Generator[None]:
+        real_git = shutil.which("git")
+        assert real_git is not None
+        stub = self.root / "bin/git"
+        stub.parent.mkdir(exist_ok=True)
+        _ = stub.write_text("#!/bin/bash\n" + body + f'exec {shlex.quote(real_git)} "$@"\n')
+        stub.chmod(0o755)
+        with mock.patch.dict(os.environ, PATH=f"{stub.parent}{os.pathsep}{os.environ['PATH']}"):
+            yield
 
     def stale_dir(self, name: str, owner: int | None, *, registered: bool, verifier_group: int = 0) -> Path:
         directory = self.lint_temp / f"{style_sync.lint_prefix()}{name}"
@@ -1136,75 +1147,309 @@ with tree.with_name(tree.name + '.lock').open('r+') as lock:
 
     def running_group(self) -> int:
         group = self.enterContext(launch_process(["sleep", "60"]))
-        self.addCleanup(group.wait)
-        self.addCleanup(group.kill)
         return group.pid
 
-    def test_a_stop_signal_during_verify_removes_the_checkout_stops_its_processes_and_exits_with_the_signal(
-            self) -> None:
+    @contextmanager
+    def lint_driver(self, verify: Path, *, setup: str = "", keeper_setup: str = "",
+                    capture_stdout: bool = False) -> Generator[ManagedProcess[str]]:
+        if keeper_setup:
+            setup += f'''
+import subprocess
+
+launch = subprocess.Popen
+
+def launch_keeper_fixture(command, **options):
+    if command[1:3] == ["-m", "scripts.style.lint_keeper"]:
+        command = [command[0], "-c", {keeper_setup!r}, *command[3:]]
+    return launch(command, **options)
+
+subprocess.Popen = launch_keeper_fixture
+'''
         driver = self.root / "lint_driver.py"
-        _ = driver.write_text(LINT_DRIVER)
-        original_worktrees = self.git("worktree", "list", "--porcelain")
-        cases = ((signal.SIGTERM, ""), (signal.SIGHUP, ""), (signal.SIGTERM, "trap '' TERM\n"))
-        for signum, trap in cases:
-            with self.subTest(signal=signum.name, ignores_term=bool(trap)):
-                pids = self.root / f"pids-{signum.name}-{bool(trap)}"
-                verify = self.root / "verify.sh"
-                _ = verify.write_text(f"#!/bin/bash\n{trap}sleep 300 &\n"
-                                      + f'echo "$$ $!" > {pids}.part && mv {pids}.part {pids}\nwait\n')
-                process = subprocess.Popen(
-                    [str(Path(style_sync.__file__).resolve().parents[1] / "lib" / "py"), str(driver), str(verify), str(self.lint_temp),
-                     "lint", "--repo", str(self.repo), "--checkout", str(self.repo), "--tip", self.tip],
-                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        _ = driver.write_text(LINT_DRIVER + setup + "raise SystemExit(style_sync.main(sys.argv[3:]))\n")
+        python = Path(style_sync.__file__).resolve().parents[1] / "lib" / "py"
+        # Keep the guardian open until the test checks the keeper's cleanup.
+        process = self.enterContext(launch_process(
+            [str(python), str(driver), str(verify), str(self.lint_temp), "lint", "--repo", str(self.repo),
+             "--checkout", str(self.repo), "--tip", self.tip],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE if capture_stdout else subprocess.DEVNULL,
+            stderr=subprocess.PIPE, text=True,
+        ))
+        try:
+            yield process
+        finally:
+            if process.poll() is None:
+                process.kill()
+                _ = process.wait(timeout=TEST_HANG_GUARD_SECS)
+
+    def wait_for_lint_marker(self, process: ManagedProcess[str], marker: Path) -> None:
+        self.assertTrue(wait_until(lambda: marker.exists() or process.poll() is not None, TEST_HANG_GUARD_SECS),
+                        f"Lint did not reach {marker.name}")
+        if not marker.exists():
+            _, stderr = process.communicate(timeout=TEST_HANG_GUARD_SECS)
+            self.fail(f"Lint ended before {marker.name}: {stderr}")
+
+    def assert_lint_slot_and_folder_released(self) -> None:
+        self.assertTrue(wait_until(lambda: not list(self.lint_temp.iterdir()), TEST_HANG_GUARD_SECS),
+                        list(self.lint_temp.iterdir()))
+        slot = self.standing_target().parent
+        self.assertTrue(wait_until(lambda: build_folders.build_folder_state(slot) == "free", TEST_HANG_GUARD_SECS),
+                        f"Lint still holds the slot at {slot}")
+
+    def assert_stopped_lint_releases_resources(self, original_worktrees: str) -> None:
+        self.assert_lint_slot_and_folder_released()
+        self.assertEqual(self.git("worktree", "list", "--porcelain"), self.worktrees_with_copy(original_worktrees))
+
+    def test_lint_returns_the_verifier_result_and_removes_its_background_child(self) -> None:
+        marker = shlex.quote(str(self.root / "background-verifier-child"))
+        verify = self.clean_verify(
+            "sleep 300 &\n"
+            + f'printf "%s %s\\n" "$!" "$(ps -o pgid= -p "$!")" > {marker}.part\n'
+            + f"mv {marker}.part {marker}\n"
+            + "printf '%s\\n' 'verifier output before exit'\nprintf '%s\\n' 'verifier error before exit' >&2\nexit 1\n"
+        )
+        with self.lint_driver(verify, capture_stdout=True) as caller:
+            pids = self.root / "background-verifier-child"
+            self.wait_for_lint_marker(caller, pids)
+            child, group = (int(pid) for pid in pids.read_text().split())
+            self.addCleanup(kill_group, group)
+            # Start the bound after the verifier starts. The checkout can take longer.
+            stdout, stderr = caller.communicate(timeout=15)
+        self.assertEqual(caller.returncode, 1, stderr)
+        self.assertIn("verifier output before exit\n", stdout)
+        self.assertIn("verifier error before exit\n", stdout)
+        self.assertFalse(running(child))
+        self.assertFalse(group_running(group))
+        self.assert_lint_slot_and_folder_released()
+
+    def test_stopping_lint_during_slot_checkout_or_final_status_stops_git_and_releases_resources(self) -> None:
+        slot = self.standing_target().parent
+        for step, command in (("checkout", "checkout --force --detach"), ("status", "status --porcelain --")):
+            with self.subTest(step=step):
+                marker = self.root / f"blocked-git-{step}"
+                quoted_marker = shlex.quote(str(marker))
+                block = (
+                    f'if [[ "$1" == -C && "$2" == {shlex.quote(str(slot))} && " $* " == *" {command} "* ]]; then\n'
+                    + f'  printf "%s\\n" "$$" > {quoted_marker}.part\n  mv {quoted_marker}.part {quoted_marker}\n'
+                    + f"  exec sleep {2 * TEST_HANG_GUARD_SECS}\nfi\n"
                 )
-                try:
-                    self.assertTrue(wait_until(lambda: pids.exists() or process.poll() is not None, TEST_HANG_GUARD_SECS))
-                    self.addCleanup(kill_group, int(pids.read_text().split()[0]))
+                with self.git_stub(block), self.lint_driver(self.clean_verify()) as caller:
+                    self.wait_for_lint_marker(caller, marker)
+                    git_pid = int(marker.read_text())
+                    try:
+                        self.assertTrue(running(git_pid))
+                        self.assertEqual(build_folders.build_folder_state(slot), "held")
+                        self.assertTrue(any(path.is_dir() for path in self.lint_temp.iterdir()))
+                        group = os.getpgid(git_pid)
+                        caller.terminate()
+                        _ = caller.wait(timeout=TEST_HANG_GUARD_SECS)
+                        self.assertTrue(wait_until(lambda: not running(git_pid) and not group_running(group),
+                                                   TEST_HANG_GUARD_SECS),
+                                        f"The Git group still runs after the lint caller stopped during {step}")
+                        self.assert_lint_slot_and_folder_released()
+                    finally:
+                        if running(git_pid):
+                            with suppress(ProcessLookupError):
+                                os.kill(git_pid, signal.SIGKILL)
+
+    def test_stop_signals_remove_the_lint_dir_release_the_slot_and_end_verifier_processes(self) -> None:
+        original_worktrees = self.git("worktree", "list", "--porcelain")
+        cases = ((signal.SIGTERM, False), (signal.SIGHUP, False), (signal.SIGINT, False),
+                 (signal.SIGTERM, True), (signal.SIGKILL, False))
+        for signum, pause_grandchild in cases:
+            with self.subTest(signal=signum.name, pause_grandchild=pause_grandchild):
+                pids = self.root / f"pids-{signum.name}-{pause_grandchild}"
+                pause = 'kill -STOP "$!" || exit 1\n' if pause_grandchild else ""
+                verify = self.clean_verify("sleep 300 &\n" + pause
+                                           + f'echo "$$ $!" > {pids}.part && mv {pids}.part {pids}\nwait\n')
+                with self.lint_driver(verify) as process:
+                    self.wait_for_lint_marker(process, pids)
+                    child, grandchild = (int(pid) for pid in pids.read_text().split())
+                    self.addCleanup(kill_group, os.getpgid(child))
+                    self.assertEqual(build_folders.build_folder_state(self.standing_target().parent), "held")
                     process.send_signal(signum)
-                    _, stderr = process.communicate(timeout=TEST_HANG_GUARD_SECS)
-                finally:
-                    if process.poll() is None:
-                        process.kill()
-                        _ = process.communicate()
-                self.assertEqual(process.returncode, 128 + signum, stderr)
-                self.assertIn(f"lint stopped by {signum.name}", stderr)
-                self.assertEqual(list(self.lint_temp.iterdir()), [])
-                self.assertEqual(self.git("worktree", "list", "--porcelain"), self.worktrees_with_copy(original_worktrees))
-                child, grandchild = (int(pid) for pid in pids.read_text().split())
+                    _ = process.wait(timeout=TEST_HANG_GUARD_SECS)
+                self.assert_stopped_lint_releases_resources(original_worktrees)
                 self.assertTrue(wait_until(lambda: not running(child) and not running(grandchild), TEST_HANG_GUARD_SECS))
 
-    def test_a_stop_signal_during_cleanup_raises_after_the_cleanup_ends_and_handlers_are_restored(self) -> None:
-        previous = signal.getsignal(signal.SIGTERM)
-        cleanup_ended = False
-        with self.assertRaises(style_sync.LintStopped) as stopped:
-            with style_sync.stop_signals_raise(), style_sync.signal_mask(signal.SIG_BLOCK):
-                os.kill(os.getpid(), signal.SIGTERM)
-                time.sleep(0.1)
-                cleanup_ended = True
-        self.assertTrue(cleanup_ended)
-        self.assertEqual(stopped.exception.signum, signal.SIGTERM)
-        self.assertEqual(signal.getsignal(signal.SIGTERM), previous)
+    def test_a_stopped_verifier_is_killed_after_the_term_grace_period(self) -> None:
+        original_worktrees = self.git("worktree", "list", "--porcelain")
+        verifier_pid = self.root / "verifier-pid"
+        signals = self.root / "verifier-signals"
+        keeper_setup = f'''
+import os
+import sys
+import time
+from contextlib import suppress
+from pathlib import Path
+from scripts.lib import process_group
+from scripts.style import lint_keeper
 
+send = process_group.send_process_group
+
+def record_verifier_signal(group, signum):
+    verifier_pid = Path({str(verifier_pid)!r})
+    with suppress(FileNotFoundError, ProcessLookupError):
+        if group == os.getpgid(int(verifier_pid.read_text())):
+            with Path({str(signals)!r}).open("a") as trace:
+                print(int(signum), time.monotonic(), file=trace)
+    send(group, signum)
+
+process_group.send_process_group = record_verifier_signal
+raise SystemExit(lint_keeper.main(sys.argv[1:]))
+'''
+        verify = self.clean_verify(f'echo "$$" > {verifier_pid}.part && mv {verifier_pid}.part {verifier_pid}\n'
+                                  + "sleep 300 &\nwait\n")
+        with self.lint_driver(verify, keeper_setup=keeper_setup) as process:
+            self.wait_for_lint_marker(process, verifier_pid)
+            verifier = int(verifier_pid.read_text())
+            group = os.getpgid(verifier)
+            self.addCleanup(kill_group, group)
+            os.kill(verifier, signal.SIGSTOP)
+            self.assertTrue(wait_until(lambda: process_state(verifier).startswith("T"), TEST_HANG_GUARD_SECS))
+            process.terminate()
+            _ = process.wait(timeout=TEST_HANG_GUARD_SECS)
+        self.assert_stopped_lint_releases_resources(original_worktrees)
+        self.assertTrue(wait_until(lambda: not group_running(group), TEST_HANG_GUARD_SECS))
+        term, killed = (line.split() for line in signals.read_text().splitlines())
+        self.assertEqual(int(term[0]), signal.SIGTERM)
+        self.assertEqual(int(killed[0]), signal.SIGKILL)
+        self.assertGreaterEqual(float(killed[1]) - float(term[1]), TEST_CHILD_STOP_SECONDS)
+
+    def test_stopping_the_caller_inside_verifier_launch_ends_the_whole_group(self) -> None:
+        original_worktrees = self.git("worktree", "list", "--porcelain")
+        started = self.root / "verify-started"
+        launched = self.root / "verify-group"
+        verify = self.clean_verify(f"sleep 300 &\ntouch {started}\nwait\n")
+        keeper_setup = f'''
+import os
+import select
+import subprocess
+import sys
+from pathlib import Path
+from scripts.style import lint_keeper
+
+launch = subprocess.Popen
+
+def pause_inside_verifier_launch(command, *arguments, **options):
+    child = launch(command, *arguments, **options)
+    if {str(verify)!r} in command:
+        group = Path({str(launched)!r})
+        partial = group.with_suffix(".part")
+        partial.write_text(str(os.getpgid(child.pid)))
+        partial.replace(group)
+        select.select([], [], [], {2 * TEST_HANG_GUARD_SECS})
+        raise RuntimeError("The fixture expected the caller to stop during launch")
+    return child
+
+subprocess.Popen = pause_inside_verifier_launch
+raise SystemExit(lint_keeper.main(sys.argv[1:]))
+'''
+        with self.lint_driver(verify, keeper_setup=keeper_setup) as process:
+            self.wait_for_lint_marker(process, launched)
+            group = int(launched.read_text())
+            self.addCleanup(kill_group, group)
+            self.wait_for_lint_marker(process, started)
+            self.assertTrue(group_running(group))
+            process.terminate()
+            _ = process.wait(timeout=TEST_HANG_GUARD_SECS)
+        self.assert_stopped_lint_releases_resources(original_worktrees)
+        self.assertTrue(wait_until(lambda: not group_running(group), TEST_HANG_GUARD_SECS))
 
     def test_a_stop_signal_right_after_the_dir_is_made_still_removes_it(self) -> None:
-        make_dir = build_folders.create_build_folder
+        allocated = self.root / "lint-allocated"
+        keeper_setup = f'''
+import sys
+from contextlib import contextmanager
+from pathlib import Path
+from scripts.lib import build_folders
+from scripts.style import lint_keeper
 
-        def make_dir_then_signal(request: build_folders.BuildFolderRequest) -> Path:
-            made = make_dir(request)
-            self.assertTrue(made.with_name(made.name + ".lock").is_file())
-            record = cast(dict[str, object], json.loads(made.with_name(made.name + ".lease.json").read_text()))
-            self.assertEqual(record["pid"], os.getpid())
-            os.kill(os.getpid(), signal.SIGTERM)
-            return made
+temporary_build_folder = build_folders.temporary_build_folder
 
-        output = io.StringIO()
-        with mock.patch.object(build_folders, "create_build_folder", make_dir_then_signal), \
-                mock.patch.object(style_sync, "VERIFY", self.clean_verify()), \
-                redirect_stdout(output), redirect_stderr(output):
-            code = style_sync.main(["lint", "--repo", str(self.repo), "--checkout", str(self.repo), "--tip", self.tip])
-        self.assertEqual(code, 128 + signal.SIGTERM, output.getvalue())
-        self.assertEqual(list(self.lint_temp.iterdir()), [])
+@contextmanager
+def pause_after_allocation(request):
+    with temporary_build_folder(request) as directory:
+        Path({str(allocated)!r}).touch()
+        sys.stdin.read()
+        yield directory
 
+build_folders.temporary_build_folder = pause_after_allocation
+raise SystemExit(lint_keeper.main(sys.argv[1:]))
+'''
+        with self.lint_driver(self.clean_verify(), keeper_setup=keeper_setup) as process:
+            self.wait_for_lint_marker(process, allocated)
+            [directory] = [path for path in self.lint_temp.iterdir() if path.is_dir()]
+            self.assertFalse((directory / style_sync.OWNER_FILE).exists())
+            self.assertFalse((directory / "checkout").is_symlink())
+            self.assertEqual(build_folders.build_folder_state(directory), "held")
+            process.terminate()
+            _ = process.wait(timeout=TEST_HANG_GUARD_SECS)
+        self.assert_lint_slot_and_folder_released()
+
+    def test_lint_keeper_holds_the_directory_lease_before_verification(self) -> None:
+        original_worktrees = self.git("worktree", "list", "--porcelain")
+        ready = self.root / "lint-ready"
+        setup = f'''
+def pause_before_verify(session):
+    if session.read() != "ready\\n":
+        raise RuntimeError("Lint keeper did not prepare the directory")
+    Path({str(ready)!r}).touch()
+    sys.stdin.read()
+    raise RuntimeError("The fixture expected a stop before verification")
+
+style_sync.verify_lint = pause_before_verify
+'''
+        with self.lint_driver(self.clean_verify(), setup=setup) as process:
+            self.wait_for_lint_marker(process, ready)
+            [directory] = [path for path in self.lint_temp.iterdir() if path.is_dir()]
+            self.assertTrue(directory.with_name(directory.name + ".lock").is_file())
+            lease_path = directory.with_name(directory.name + ".lease.json")
+            lease = cast(dict[str, object], json.loads(lease_path.read_text()))
+            self.assertEqual(set(lease), {"showrunner", "unit", "work", "purpose", "pid", "start_time"})
+            self.assertIsInstance(lease["start_time"], str)
+            self.assertTrue(running(cast(int, lease["pid"])))
+            self.assertEqual(build_folders.build_folder_state(directory), "held")
+            self.assertEqual(style_sync.OwnerRecord.read(directory).owner, process.pid)
+            self.assertTrue((directory / "checkout").resolve().is_relative_to(self.root.resolve()))
+            self.assertFalse((directory / style_sync.VERIFIER_FILE).exists())
+            process.terminate()
+            _ = process.wait(timeout=TEST_HANG_GUARD_SECS)
+        self.assert_stopped_lint_releases_resources(original_worktrees)
+
+    def test_stopping_the_caller_during_cleanup_still_releases_the_slot_and_removes_the_dir(self) -> None:
+        original_worktrees = self.git("worktree", "list", "--porcelain")
+        entered = self.root / "lint-cleanup"
+        keeper_setup = f'''
+import os
+import signal
+import sys
+from contextlib import contextmanager
+from pathlib import Path
+from scripts.lib import build_folders
+from scripts.style import lint_keeper
+
+temporary_build_folder = build_folders.temporary_build_folder
+
+@contextmanager
+def stop_during_cleanup(request):
+    with temporary_build_folder(request) as directory:
+        try:
+            yield directory
+        finally:
+            caller = int(sys.argv[1])
+            if os.getppid() != caller:
+                raise RuntimeError("Lint caller ended before cleanup")
+            os.kill(caller, signal.SIGTERM)
+            Path({str(entered)!r}).touch()
+
+build_folders.temporary_build_folder = stop_during_cleanup
+raise SystemExit(lint_keeper.main(sys.argv[1:]))
+'''
+        with self.lint_driver(self.clean_verify(), keeper_setup=keeper_setup) as process:
+            self.wait_for_lint_marker(process, entered)
+            _ = process.wait(timeout=TEST_HANG_GUARD_SECS)
+        self.assert_stopped_lint_releases_resources(original_worktrees)
 
     def test_standing_checkout_remains_registered_in_the_source(self) -> None:
         original_worktrees = self.git("worktree", "list", "--porcelain")
@@ -1340,16 +1585,15 @@ with tree.with_name(tree.name + '.lock').open('r+') as lock:
 
     def test_lint_folder_cleanup_needs_no_git_registration_read(self) -> None:
         original_worktrees = self.git("worktree", "list", "--porcelain")
-        real_git = style_sync.git
-
-        def git_launch_fails_in_cleanup(repo: Path, *arguments: str) -> str:
-            if arguments[:2] == ("worktree", "list"):
-                raise BlockingIOError(errno.EAGAIN, os.strerror(errno.EAGAIN), "git")
-            return real_git(repo, *arguments)
-
-        with mock.patch.object(style_sync, "git", git_launch_fails_in_cleanup):
-            code, output = self.run_lint()
-        self.assertEqual(code, 0, output)
+        verifier_ran = self.root / "verify-ran"
+        refused = self.root / "refused-git-registration-read"
+        refuse = (f'if [[ -e {shlex.quote(str(verifier_ran))} && " $* " == *" worktree list "* ]]; then\n'
+                  + f"  touch {shlex.quote(str(refused))}\n  exit 75\nfi\n")
+        with self.git_stub(refuse), self.lint_driver(self.clean_verify(f"touch {shlex.quote(str(verifier_ran))}\n")) as process:
+            _, stderr = process.communicate(timeout=TEST_HANG_GUARD_SECS)
+        self.assertEqual(process.returncode, 0, stderr)
+        self.assertTrue(verifier_ran.exists())
+        self.assertFalse(refused.exists())
         self.assertEqual(list(self.lint_temp.iterdir()), [])
         self.assertEqual(self.git("worktree", "list", "--porcelain"), self.worktrees_with_copy(original_worktrees))
         self.assertTrue((self.standing_target().parent / ".git").is_file())
@@ -1361,84 +1605,21 @@ with tree.with_name(tree.name + '.lock').open('r+') as lock:
                 _ = style_sync.lint(self.repo, self.repo, self.tip)
         self.assertEqual(list(self.lint_temp.iterdir()), [])
 
-    def test_a_stop_signal_right_after_verify_starts_stops_it_and_cleans_up(self) -> None:
-        real_popen = cast(Callable[..., subprocess.Popen[str]], subprocess.Popen)
-        verifiers: list[int] = []
-        started = self.root / "verify-started"
-
-        def popen_then_signal(*arguments: object, **options: object) -> subprocess.Popen[str]:
-            child = real_popen(*arguments, **options)
-            if cast(list[str], arguments[0])[:1] == ["sh"]:
-                verifiers.append(child.pid)
-                self.addCleanup(kill_group, child.pid)
-                # verify.sh is running, so only a stop removes its group.
-                self.assertTrue(wait_until(started.exists, TEST_HANG_GUARD_SECS))
-                os.kill(os.getpid(), signal.SIGTERM)
-            return child
-
-        output = io.StringIO()
-        with mock.patch.object(subprocess, "Popen", side_effect=popen_then_signal), \
-                mock.patch.object(style_sync, "VERIFY", self.clean_verify(f"sleep 300 &\ntouch {started}\nwait\n")), \
-                redirect_stdout(output), redirect_stderr(output):
-            code = style_sync.main(["lint", "--repo", str(self.repo), "--checkout", str(self.repo), "--tip", self.tip])
-        self.assertEqual(code, 128 + signal.SIGTERM, output.getvalue())
-        self.assertEqual(len(verifiers), 1)
-        self.assertTrue(wait_until(lambda: not group_running(verifiers[0]), TEST_HANG_GUARD_SECS))
-        self.assertEqual(list(self.lint_temp.iterdir()), [])
-
-    def test_after_a_sigkill_of_the_owner_the_sweep_keeps_the_dir_until_its_verifier_ends(self) -> None:
-        driver = self.root / "lint_driver.py"
-        _ = driver.write_text(LINT_DRIVER)
-        original_worktrees = self.git("worktree", "list", "--porcelain")
-        verifier = self.root / "verifier"
-        verify = self.clean_verify(f'sleep 300 &\necho "$$" > {verifier}.part && mv {verifier}.part {verifier}\nwait\n')
-        process = subprocess.Popen(
-            [str(Path(style_sync.__file__).resolve().parents[1] / "lib" / "py"), str(driver), str(verify), str(self.lint_temp),
-             "lint", "--repo", str(self.repo), "--checkout", str(self.repo), "--tip", self.tip],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        )
-        try:
-            self.assertTrue(wait_until(lambda: verifier.exists() or process.poll() is not None, TEST_HANG_GUARD_SECS))
-        finally:
-            process.kill()
-            _ = process.wait()
-        group = int(verifier.read_text())
-        self.addCleanup(kill_group, group)
-        [directory] = [path for path in self.lint_temp.iterdir() if path.is_dir()]
-        lock = directory.with_name(directory.name + ".lock")
-        lease_path = directory.with_name(directory.name + ".lease.json")
-        self.assertTrue(lock.is_file())
-        lease = cast(dict[str, object], json.loads(lease_path.read_text()))
-        self.assertEqual(set(lease), {"showrunner", "unit", "work", "purpose", "pid", "start_time"})
-        self.assertEqual(lease["pid"], process.pid)
-        self.assertIsInstance(lease["start_time"], str)
-        self.assertEqual(build_folders.build_folder_state(directory), "free")
-        copy = (directory / "checkout").resolve()
-        self.assertEqual(copy, self.standing_target().parent)
-        self.assertEqual(build_folders.build_folder_state(copy), "held")
-        with redirect_stdout(io.StringIO()):
-            style_sync.sweep_stale_lint_dirs()
-        self.assertTrue((directory / "checkout").exists())
-        kill_group(group)
-        self.assertTrue(wait_until(lambda: not group_running(group), TEST_HANG_GUARD_SECS))
-        self.assertEqual(build_folders.build_folder_state(copy), "free")
-        with redirect_stdout(io.StringIO()):
-            style_sync.sweep_stale_lint_dirs()
-        self.assertEqual(list(self.lint_temp.iterdir()), [])
-        self.assertEqual(self.git("worktree", "list", "--porcelain"), self.worktrees_with_copy(original_worktrees))
-
     def test_a_verifier_wrapper_whose_owner_is_gone_exits_before_verify_starts(self) -> None:
         directory = self.root / "wrapper"
         directory.mkdir()
         started = self.root / "verify-started"
-        with mock.patch.object(style_sync, "VERIFY", self.clean_verify(f"touch {started}\n")):
-            ended = subprocess.run(style_sync.verifier_command(directory, ended_pid()), capture_output=True, check=False)
+        verify = self.clean_verify(f"touch {started}\n")
+        with launch_process(style_sync.verifier_command(directory, ended_pid(), verify=verify),
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE) as ended:
+            _ = ended.communicate(timeout=TEST_HANG_GUARD_SECS)
             self.assertNotEqual(ended.returncode, 0)
-            self.assertTrue((directory / style_sync.VERIFIER_FILE).exists())
-            self.assertFalse(started.exists())
-            running_owner = subprocess.run(style_sync.verifier_command(directory, os.getpid()),
-                                           capture_output=True, check=False)
-        self.assertEqual(running_owner.returncode, 0)
+        self.assertTrue((directory / style_sync.VERIFIER_FILE).exists())
+        self.assertFalse(started.exists())
+        with launch_process(style_sync.verifier_command(directory, os.getpid(), verify=verify),
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE) as running_owner:
+            _, stderr = running_owner.communicate(timeout=TEST_HANG_GUARD_SECS)
+            self.assertEqual(running_owner.returncode, 0, stderr)
         self.assertTrue(started.exists())
 
     def test_the_sweep_never_follows_a_checkout_link_or_a_lint_dir_link(self) -> None:
@@ -1461,18 +1642,6 @@ with tree.with_name(tree.name + '.lock').open('r+') as lock:
         self.assertEqual((planted_target / "kept").read_text(), "kept\n")
         self.assertTrue((planted_target / style_sync.OWNER_FILE).exists())
         self.assertEqual(list(self.lint_temp.iterdir()), [planted])
-
-    def test_verify_starts_with_the_stop_signals_unblocked(self) -> None:
-        mask = self.root / "sigblk"
-        # Reading /proc/$$ from a pipeline samples Bash's temporary fork mask, not the
-        # mask inherited by a lint tool. Query the actual tool child's own mask instead.
-        probe = ("import signal; from pathlib import Path; "
-                 "blocked = signal.pthread_sigmask(signal.SIG_BLOCK, set()); "
-                 f"Path({str(mask)!r}).write_text(str(sum(1 << (s - 1) for s in blocked)))")
-        code, output = self.run_lint(shlex.join([str(Path(__file__).resolve().parents[1] / "lib/py"), "-c", probe]) + "\n")
-        self.assertEqual(code, 0, output)
-        held = sum(1 << (signum - 1) for signum in style_sync.HELD_SIGNALS)
-        self.assertEqual(int(mask.read_text()) & held, 0)
 
     def handoff_checkpoint(self) -> str:
         _ = self.git("switch", "-qc", "style/main")
