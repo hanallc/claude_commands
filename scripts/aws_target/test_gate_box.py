@@ -384,7 +384,6 @@ with mock.patch.object(gate, 'process_memory_mib'):
                     + '    return SimpleNamespace(passed=True, jobs=(), seconds=1, peak_memory_mib=0)\n')
                 _ = (repo / 'scripts/aws_target/gate_box.py').write_text(
                     'import json\nfrom pathlib import Path\nfrom typing import cast\n'
-                    + 'from scripts.production import merge_gate\n'
                     + f'GUEST_TRANSFERS = {gate_box.GUEST_TRANSFERS!r}\n'
                     + f'PAIRED_GUEST = {gate_box.PAIRED_GUEST!r}\n'
                     + f'CANDIDATE_GUEST = {gate_box.CANDIDATE_GUEST!r}\n'
