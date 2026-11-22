@@ -1191,7 +1191,7 @@ Ordered after the red main repair and the guard repair (builds). It does not mov
   1. Table rows on a fixture history: lists removed from every record; the latest-reads file holds the newest lists; `latest_module_reads` returns the same result before and after; the index reads no file again after the step.
   2. A dry run on natedev states the bytes before and after.
 
-### Phase 424 — a test run folder leaves room for a 108-byte socket path  · status: todo
+### Phase 424 — a test run folder leaves room for a 108-byte socket path  · status: done (main d3a477bfcb)
 **Depends on:** none
 
 #### Work Order
@@ -1206,7 +1206,7 @@ Ordered after the red main repair and the guard repair (builds). It does not mov
 - **Workers:** 1 writer.
 - **Acceptance gate:** the failing modules named above pass in one tests-only gate; the budget test passes; basedpyright zero errors and warnings on changed files; one blind review.
 
-### Phase 425 — a failed recovery of another checkout's gate record does not stop every gate  · status: todo
+### Phase 425 — a failed recovery of another checkout's gate record does not stop every gate  · status: done (main d3a477bfcb)
 **Depends on:** none
 
 #### Work Order
@@ -1220,7 +1220,7 @@ Ordered after the red main repair and the guard repair (builds). It does not mov
 - **Workers:** 1 writer.
 - **Acceptance gate:** fixtures: a refusing record in another checkout is reported and kept while the gate runs; a refusing record in the own checkout still refuses; the recovery test module passes in one tests-only gate; basedpyright zero on changed files; one blind review.
 
-### Phase 426 — an ended Mac gate attempt with a receipt clears its journal  · status: todo
+### Phase 426 — an ended Mac gate attempt with a receipt clears its journal  · status: done (main d3a477bfcb)
 **Depends on:** none
 **Blocked by:** nate's 22:35 session restart (builds 22:13: start after the restart)
 
@@ -1235,7 +1235,7 @@ Ordered after the red main repair and the guard repair (builds). It does not mov
 - **Workers:** 1 writer.
 - **Acceptance gate:** fixtures: an attempt with a receipt and a kept checkout clears its journal and stops a live recorded group; an attempt whose folder is gone clears its journal; the Mac gate test module passes in one tests-only gate (Mac part through the queue); basedpyright zero on changed files; one blind review.
 
-### Phase 427 — a Mac run under a block it does not hold waits for the block end  · status: todo
+### Phase 427 — a Mac run under a block it does not hold waits for the block end  · status: done (main d3a477bfcb)
 **Depends on:** none
 
 #### Work Order
@@ -1249,7 +1249,7 @@ Ordered after the red main repair and the guard repair (builds). It does not mov
 - **Workers:** 1 writer.
 - **Acceptance gate:** fixtures: a run under another holder's block waits (or refuses) with one line and starts no remote command; a holder's run starts; no block starts as before; the changed test modules pass in one tests-only gate (Mac part through the queue); basedpyright zero on changed files; one blind review.
 
-### Phase 428 — a stopped test run leaves no active-runs record  · status: todo
+### Phase 428 — a stopped test run leaves no active-runs record  · status: done (main d3a477bfcb)
 **Depends on:** Phase 425
 
 #### Work Order
@@ -1329,7 +1329,7 @@ Ordered after the red main repair and the guard repair (builds). It does not mov
 - **Workers:** 1 writer.
 - **Acceptance gate:** the modules that read the two fixtures pass in tests-only gates after the builds go; one blind review.
 
-### Phase 434 — mac_run.sh exits 9 for a busy Mac or a damaged claim  · status: todo
+### Phase 434 — mac_run.sh exits 9 for a busy Mac or a damaged claim  · status: done (main d3a477bfcb)
 **Depends on:** Phase 424, Phase 427 (builds 03:03: start after both rows are sent)
 
 #### Work Order
@@ -1343,7 +1343,7 @@ Ordered after the red main repair and the guard repair (builds). It does not mov
 - **Workers:** 1 writer.
 - **Acceptance gate:** fixtures for busy and damaged run.json exit 9 and start no remote command; the changed modules pass in tests-only gates after the builds go; basedpyright zero on changed files; one blind review.
 
-### Phase 435 — module_cost.py imports the gate module by its real name  · status: todo
+### Phase 435 — module_cost.py imports the gate module by its real name  · status: done (main d3a477bfcb)
 **Depends on:** none
 
 #### Work Order
@@ -1369,3 +1369,54 @@ Ordered after the red main repair and the guard repair (builds). It does not mov
 - **Files:** `scripts/production/test_worker.py`, `scripts/agents/test_detached_runs.py`, `config/mac_gate_modules.txt`.
 - **Workers:** 1 writer.
 - **Acceptance gate:** both modules pass on the Mac through the queue (director runs them) and on natedev in the affected run; basedpyright zero on changed files; one blind review.
+
+### Phase 437 — mac_gate.py run takes --module  · status: todo
+**Depends on:** none
+
+#### Work Order
+- **Goal:** builds 06:17: `mac_gate.py run <repo> <output> --module <path> [--module <path> ...]` runs only the named test modules on the Mac. It uses the same clone, the same Mac queue and the same result file as a full run. This is the model route for a Mac test of one commit (memory: nothing outside the build folders model).
+- **Spec:**
+  1. Add a repeatable `--module` option (`action='append'`, default none) to the `run` subparser in `scripts/mac_test/mac_gate.py` `main()` (:616). Add the field to `Arguments`.
+  2. With no `--module`, keep `selected=gate.ALL_MODULES`. The current behavior does not change.
+  3. With `--module`, pass `selected=gate.TreeSelection(tuple(paths), tree)` to `run_remote`. Read `tree` with `cloud_gate.working_tree(repo)[0]`, the same reader `prepare_request` checks against (cloud_gate.py:1195). Paths are repository-relative, as `discover_test_modules` gives them.
+  4. `prepare_request` already refuses a path absent from the tree. Do not add a second check.
+  5. A named module runs even when `config/mac_gate_modules.txt` lists it. The list applies only to the full run.
+  6. Update the `run` help text and one line in `docs/as-built/mac-test-offload.md`.
+- **Files:** `scripts/mac_test/mac_gate.py`, `scripts/mac_test/test_mac_gate.py`, `docs/as-built/mac-test-offload.md`.
+- **Workers:** 1 writer (small change).
+- **Acceptance gate:** a test in `test_mac_gate.py` proves both forms reach `run_remote` with the right `selected` (patch `run_remote`); basedpyright zero on changed files; one blind review; affected run green.
+
+### Phase 438 — the merge_gate.py shim and its old names are gone  · status: todo
+**Depends on:** none
+
+#### Work Order
+- **Goal:** items 110 and 170, gate rename chunk 6 (docs/plans/gate-rename.md): `gate.py` is the only gate entry point. The thin `scripts/production/merge_gate.py`, its matcher names and the `MERGE_GATE_PARENT_PID` read are gone.
+- **Facts (main d3a477bfcb, 08:15):**
+  1. Live users of the old name: `commands/unit/merge.md:126` (gate worker runs `merge_gate.py --checkout . --tests-only`), `commands/showrunner/produce.md:502` (`merge_gate.py nightly-assigned`). A merge_checkpoint batch at 08:07 still started `merge_gate.py --tests-only`.
+  2. Matchers: `build_hold/build_hold.py:539`, `build_queue/admission_code.py:12`, `build_queue/admission_service.py:5244`, `hooks/pre-tool-use-build-hold-guard.sh:6`, `lib/build_steps.py:122`, `lib/suite_runners.py:6`, `production/checkpoint_gate.py:141`, `aws_target/cloud_gate.py:1240`.
+  3. `lib/python_startup/sitecustomize.py:234-237` reads `MERGE_GATE_PARENT_PID`. `production/gate.py:1942` falls back to `config/merge_gate.conf`. `config/merge_gate.conf` is a link to `gate.conf`; `config/README.md:84` names it.
+- **Spec:**
+  1. Switch both command docs to `gate.py`. Find every other caller that starts `merge_gate.py` (scripts, commands, config, hooks); switch each.
+  2. Delete `scripts/production/merge_gate.py`. Remove `merge_gate.py` and `merge_gate` from every matcher in fact 2. Remove the `MERGE_GATE_PARENT_PID` read and the `merge_gate.conf` fallback. Delete the `config/merge_gate.conf` link and its README line.
+  3. `config/settings-orders.json` key `merge_gate`: if `waiting_rows.py` reads stems from it, move the entry to `gate`; else leave it and say why.
+  4. Do not change `targeted_test.py` (live entry point), `config/fast_track.conf` refused_paths, or the key `merge_gate_governor_gib` (value and key changes need the user's go). Name them in the reply.
+  5. `scripts/production/gate_rename_deploy/`: leave the deploy tool unless it imports the shim; say which.
+  6. Update tests that name the old file or matcher. Update live as-built docs that name `merge_gate.py` as an entry point. Old plan docs stay.
+- **Files:** the files in facts 1-3, their tests, live as-built docs.
+- **Workers:** 1 writer.
+- **Acceptance gate:** `git grep -nE 'merge_gate\.py|MERGE_GATE_PARENT_PID'` in scripts/, config/, commands/, hooks/ finds nothing outside tests that prove the old name is refused; basedpyright zero on changed files; one blind review; affected run green. Merge only when no live process runs `merge_gate.py` (builds confirms natemerge's batch command uses gate.py).
+
+### Phase 439 — a Mac gate run removes its scratch clone at its end  · status: todo
+**Depends on:** none
+
+#### Work Order
+- **Goal:** builds 08:51 EST: a hana Mac gate run of 11-18 (task `gate:mac-run-64baa5ef`) left its scratch clone `/private/tmp/claude/scratch/gate-mac-run-64baa5ef66-1574123-hana-5ecb56` (46 GiB) on the Mac. `mac_run.sh` must end its task, and remove the clone, at the run end. Find why it did not, and fix the cause at its source.
+- **Spec:**
+  1. Read the Mac task record and logs for `gate:mac-run-64baa5ef` (read only; ssh mac). Find the run's end path: normal exit, signal, ssh drop, timeout, or a natedev-side stop.
+  2. Read `mac_run.sh` and the code that makes and removes the scratch clone and ends the task. Name the path that skips the removal.
+  3. Fix that path so each run end (exit, error, signal, lost caller) removes its clone and ends its task. A Mac run is not started for this; prove with a test that drives the path.
+  4. Do not remove the left clone by hand; tell the director its path and size. Builds decides.
+  5. Mac cargo, rustc and nextest only through verify.sh and the build queue. No config key change.
+- **Files:** `scripts/production/mac_run.sh` and the scratch and task code it calls; their tests.
+- **Workers:** 1 writer.
+- **Acceptance gate:** the cause is named with evidence; a test proves the clone is removed and the task ends on that path; basedpyright zero on changed files; `bash -n`; one blind review; affected run green.
