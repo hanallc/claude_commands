@@ -353,20 +353,19 @@ class RunnerCompletionTests(unittest.TestCase):
         arguments = ["ssh", "fixture", "true"]
         controller = offload.ProcessController()
         with io.BytesIO() as stdout, io.BytesIO() as stderr:
-            process = mock.Mock(stdout=stdout, stderr=stderr)
-            process.communicate.side_effect = [subprocess.TimeoutExpired(arguments, 1, b"partial"), (b"partial", b"")]
-
             def reap() -> int:
                 self.assertTrue(stdout.closed)
                 self.assertTrue(stderr.closed)
                 return -9
 
-            process.wait.side_effect = reap
+            communicate = mock.Mock(side_effect=[subprocess.TimeoutExpired(arguments, 1, b"partial"), (b"partial", b"")])
+            wait = mock.Mock(side_effect=reap)
+            process = mock.Mock(stdout=stdout, stderr=stderr, communicate=communicate, wait=wait)
             with mock.patch.object(subprocess, "Popen", return_value=process):
                 result = controller.capture(arguments, offload.CommandTimeLimit(1))
             self.assertIsInstance(result, offload.CommandTimedOut)
-            process.communicate.assert_called_once_with(timeout=1)
-            process.wait.assert_called_once_with()
+            communicate.assert_called_once_with(timeout=1)
+            wait.assert_called_once_with()
             self.assertFalse(controller.attempt_evidence.traffic.transfers[0]["complete"])
 
     def test_release_deadline_stops_the_helpers_ssh_child(self) -> None:

@@ -1193,7 +1193,7 @@ class ProcessController:
                     if pipe is not None:
                         pipe.close()
                 _ = process.wait()
-                self.observe_command(arguments, error.output or b"", error.stderr or b"")
+                self.observe_command(arguments, error.stdout or b"", error.stderr or b"")
                 if arguments[0] in ("ssh", "rsync"):
                     self.attempt_evidence.traffic.transfers[-1]["complete"] = False
                 return COMMAND_TIMED_OUT

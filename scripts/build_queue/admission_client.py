@@ -1937,6 +1937,7 @@ class ClientArguments(argparse.Namespace):
     sidecar: str = ""
     shell_state: Path | None = None
     wait_events: bool = False
+    launch_only: bool = False
     argv: list[str] = []
     episode: str = ""
     attempt: str = ""

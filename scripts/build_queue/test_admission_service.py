@@ -11,7 +11,7 @@ from scripts.build_queue.scope_activity import LiveBuildRun, NoLiveBuildRun, Sco
 
 from scripts.lint.memory_test_support import admission_configuration_fixture, admission_policy_fixture, fake_memory_readings, write_pressure_reading
 
-from collections.abc import Callable, Generator
+from collections.abc import Callable, Generator, Sequence
 from contextlib import contextmanager, redirect_stderr, redirect_stdout, suppress
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
@@ -32,8 +32,11 @@ import time
 import types
 import subprocess
 import unittest
-from typing import cast, override
+from typing import TYPE_CHECKING, cast, override
 from unittest import mock
+
+if TYPE_CHECKING:
+    from scripts.mac_test import offload
 
 from scripts.lint.memory_test_support import write_config_fixture, commit_config_fixture
 from scripts.lint import memory_admit as gate
@@ -917,12 +920,28 @@ class StateCheckTests(unittest.TestCase):
                 self.assertEqual(service.read_state(fixture.state_dir), old)
 
 
+class MacProbe:
+    """Answer the Mac probe command in the test and count the calls."""
+
+    def __init__(self) -> None:
+        self.answer: Callable[[Sequence[str]], offload.CapturedCommandResult] | None = None
+        self.call_count: int = 0
+
+    def reply(self, output: offload.CapturedCommandResult) -> None:
+        self.answer = lambda _arguments: output
+
+    def capture(self, arguments: Sequence[str], _deadline: object = None) -> offload.CapturedCommandResult:
+        self.call_count += 1
+        assert self.answer is not None, "the Mac probe has no answer"
+        return self.answer(arguments)
+
+
 @dataclass(frozen=True)
 class MacBackoffTestFixture:
     admission: AdmissionFixture
     backoff: Path
     key: placement.HostEvidenceKey
-    probe: mock.Mock
+    probe: MacProbe
 
     def eligibility(self) -> placement.HostEligibility:
         evidence = self.admission.server.read_provider_evidence(self.key)
@@ -1247,10 +1266,11 @@ class LocalHoldPlacementTests(unittest.TestCase):
             target = target_config.SshTarget("mac", "macos", settings)
             request = placement_request(fixture)
             destination = request.constraints.candidates[0].destination
+            probe = MacProbe()
             with (mock.patch.object(target_config, "read_targets", return_value=(target,)),
                   mock.patch.object(eligibility, "repository_identity", return_value=eligibility.KnownRepository("hana")),
                   mock.patch.object(eligibility, "state_directory", return_value=fixture.root / "mac-state"),
-                  mock.patch.object(offload.ProcessController, "capture") as probe):
+                  mock.patch.object(offload.ProcessController, "capture", probe.capture)):
                 offload.write_backoff(time.time() + 300, target.name)
                 key = fixture.server.host_evidence_key(request, destination)
                 fixture.server.host_requests[key] = request
@@ -1261,12 +1281,12 @@ class LocalHoldPlacementTests(unittest.TestCase):
 
         with self.mac_backoff_fixture() as fixture:
             deadline = fixture.backoff.read_text()
-            fixture.probe.return_value = offload.CommandOutput(255, "", "unreachable")
+            fixture.probe.reply(offload.CommandOutput(255, "", "unreachable"))
             self.assertEqual(fixture.eligibility(), placement.TemporaryExclusion("backoff"))
             self.assertEqual(fixture.backoff.read_text(), deadline)
 
             fixture.admission.clock.advance(60)
-            fixture.probe.return_value = offload.CommandOutput(0, "free_gib=1000\nhost=fixture-mac\nrc=0\n", "")
+            fixture.probe.reply(offload.CommandOutput(0, "free_gib=1000\nhost=fixture-mac\nrc=0\n", ""))
             self.assertEqual(fixture.eligibility(), placement.AllowedHost())
             self.assertFalse(fixture.backoff.exists())
 
@@ -1276,11 +1296,11 @@ class LocalHoldPlacementTests(unittest.TestCase):
         with self.mac_backoff_fixture() as fixture:
             newer_deadline = time.time() + 600
 
-            def answer(*_arguments: object) -> offload.CommandOutput:
+            def answer(_arguments: Sequence[str]) -> offload.CommandOutput:
                 offload.write_backoff(newer_deadline)
                 return offload.CommandOutput(0, "free_gib=1000\nhost=fixture-mac\nrc=0\n", "")
 
-            fixture.probe.side_effect = answer
+            fixture.probe.answer = answer
             self.assertEqual(fixture.eligibility(), placement.TemporaryExclusion("backoff"))
             self.assertEqual(fixture.backoff.read_text().strip(), f"{newer_deadline:.6f}")
 
@@ -1293,12 +1313,12 @@ class LocalHoldPlacementTests(unittest.TestCase):
             request = server.host_requests[fixture.key]
             server.host_requests[other] = replace(request, constraints=replace(request.constraints, package=other.package))
 
-            def answer(arguments: tuple[str, ...], _deadline: offload.CommandDeadline) -> offload.CommandOutput:
+            def answer(arguments: Sequence[str]) -> offload.CommandOutput:
                 if arguments[-1] == "true":
                     return offload.CommandOutput(0, "", "")
                 return offload.CommandOutput(255, "", "the full probe failed")
 
-            fixture.probe.side_effect = answer
+            fixture.probe.answer = answer
             _ = fixture.eligibility()
             _ = server.read_provider_evidence(other)
             self.assertEqual(fixture.probe.call_count, 1)
@@ -1311,7 +1331,7 @@ class LocalHoldPlacementTests(unittest.TestCase):
         from scripts.mac_test import claim_state, offload
 
         with self.mac_backoff_fixture() as fixture:
-            fixture.probe.return_value = offload.CommandOutput(0, "free_gib=1000\nhost=fixture-mac\nrc=0\n", "")
+            fixture.probe.reply(offload.CommandOutput(0, "free_gib=1000\nhost=fixture-mac\nrc=0\n", ""))
             deadline = fixture.backoff.read_text()
             with claim_state.locked(fixture.backoff.parent / "probe-result.lock"):
                 self.assertEqual(fixture.eligibility(), placement.TemporaryExclusion("backoff"))
