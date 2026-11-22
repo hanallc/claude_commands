@@ -262,7 +262,16 @@ It reads the retained finding's kind to select the duplicate kind.
 ### Bootstrap: `add_style.py` and the production format
 
 - `add_style.py --production <showrunner name> --model <m> --effort <e> [--pilot <unit>[=<crate>,...]]... [--check]`, run by the repo's main showrunner (`commands/showrunner/add_style.md`).
-- `_request` derives everything from the parent doc: main checkout through `--git-common-dir` on `**Repository:**`; showrunner name `<repo>-style`; branch point = parent merge branch; style merge branch `style/<branch point with / as ->`; checkout `<repo parent>/<repo>-style`; doc `docs/<repo>-style-production.md`. A missing `**Proposals:**` refuses.
+- `_request` reads the repository, branch point, and Proposals field from the parent document.
+  It finds the main checkout with `--git-common-dir`.
+  A new style production uses `~/worktrees/<repo>/<repo>-style/worktree` and branch `<repo>-style-worktree`.
+  Its document is `docs/<repo>-style-production.md` in that checkout.
+  An existing style production keeps the branch in its document.
+  A retry can finish a checkout that still uses the old `production` short name.
+  A retry refuses a different branch point before it changes the checkout.
+  Before it creates a checkout, bootstrap saves the branch point in the Git branch description.
+  For an older checkout without a document, bootstrap reads the branch point from the `style/` branch name.
+  A missing Proposals field causes a refusal.
 - `standing_style_production(repo_dir)` returns `StandingStyleProduction` or `NoStyleProduction`.
   The record holds `checkout`, `doc`, `name` and `branch_point`.
   It finds style showrunner documents and parent documents with configured direct units.
@@ -557,7 +566,7 @@ It assigns each finding to its first matching category in `_select_phase` order:
 The counts sum to the approved count.
 The declaration reader can project a proved move in memory without writing it.
 
-`style_ledger.RecordedSplit(ready, changed, structure, other, measured_at)` holds a completed scan. `NoSplitRecorded()` means no completed scan exists; zero counts still mean a real scan. `measured_at` is the UTC ISO time with offset at which the scan started. At the end, inside the time limit, `split` calls `record_split(repo, unit, split, busy_timeout_seconds=min(BUSY_TIMEOUT_SECONDS, deadline.remaining_seconds()))`. It uses a short connection to set only `split_at` and the four counts. `split_time_limit` yields a frozen `SplitDeadline(at, timeout_minutes)` on `time.monotonic()`; `remaining_seconds()` raises the alarm's `TimeoutError` (`time limit of N min reached`) when no time is left. The busy timeout has its own limit because a Python SIGALRM handler cannot run while sqlite3 waits in its C busy handler: with the alarm alone, a write on a locked ledger could run up to 30 s past the limit. A write that reaches the deadline rolls back. `record_split`'s keyword `busy_timeout_seconds` defaults to `BUSY_TIMEOUT_SECONDS` (30 s), and `record_refill` and every other caller keep that value. A first split inserts `at=''` and `outcome=''`, which the report reads as no refill record. A timeout or error writes nothing and keeps the last split. The command prints `split <unit>: <cause>` to stderr and exits 1. Success prints `<unit>: <ready>/<changed>/<structure>/<other> in <m> min` and exits 0; minutes have two decimal places.
+`style_ledger.RecordedSplit(ready, changed, structure, other, measured_at)` holds a completed scan. `NoSplitRecorded()` means no completed scan exists; zero counts still mean a real scan. `measured_at` is the UTC ISO time with offset at which the scan started. `split_time_limit` yields a frozen `SplitDeadline(at, timeout_minutes)` on `time.monotonic()` and installs no signal handler; `remaining_seconds()` raises `SplitTimedOut`, a `TimeoutError` (`time limit of N min reached`), when no time is left. `bounded_split_measurement` forks a keeper in a new session. The keeper owns a temporary `style-split-*` folder and starts the scan in a worker process group. The worker resolves the ledger path and runs the read-only scan, so no Git call runs after the deadline. The keeper waits on the caller pipe and the worker pipe only until the deadline. At the deadline, or when the caller ends, the keeper stops the worker group and its adopted children and deletes the folder. At the end, inside the time limit, `split` calls `style_ledger.record_split_at(database, unit, split, deadline=deadline)` with the resolved path. It uses a short connection to set only `split_at` and the four counts. The writer sets the SQLite busy timeout to the time that remains, at most `BUSY_TIMEOUT_SECONDS` (30 s), and opens the transaction with `BEGIN EXCLUSIVE`. The ledger uses rollback journaling, so the exclusive lock covers the insert and the commit, and neither waits for a lock. A lock wait that reaches the deadline raises the timeout and writes nothing. The deadline is checked before the commit starts. After that, the commit result is the result: a commit that ends after the deadline reports success. Any SQLite error other than a lock wait that reaches the deadline keeps its own cause, before or after the commit starts. `record_split(repo, unit, split)` resolves the ledger and writes with the `BUSY_TIMEOUT_SECONDS` busy timeout; `record_refill` and every other caller keep that limit. A first split inserts `at=''` and `outcome=''`, which the report reads as no refill record. A timeout or error writes nothing and keeps the last split. The command prints `split <unit>: <cause>` to stderr and exits 1. Success prints `<unit>: <ready>/<changed>/<structure>/<other> in <m> min` and exits 0; minutes have two decimal places.
 
 The Units report's style table has columns Unit, Ticket, Step, ETA, Findings built, Last 24 h and Findings left. The three finding columns align right; text columns align left. Counts use thousands commas. Unit names the session; Ticket describes its work, or shows `idle (<HH:MM>)` with a refill time and `idle` without a refill. Step describes the current activity: writing the ticket's count of files, sites or findings, fixing review findings, reviewing or testing. A more specific activity, including its host, takes precedence. An assigned ticket with no open step says `starting <ticket work>`, such as `starting 17 files`. A checkpointed ticket with no open step says `waiting for the showrunner to merge`; an idle unit shows `idle — <refill outcome>` or `idle` without a refill. The full outcome appears only in Step, including any sync wait reason. ETA shows the recorded clock time in the user's zone, or `—`. Findings built shows the total built count; Last 24 h shows the count built in the last 24 hours.
 
@@ -645,10 +654,15 @@ Its status controls the sequence:
 - Exit 0 means clean.
 - Exit 1 means diagnostics or a failed tool; continue.
 - Exit 2 means an error; stop.
-- Exit 128 plus the signal means SIGTERM or SIGHUP; stop.
+- SIGTERM, SIGHUP or SIGINT ends the command by the default signal action; stop.
 
-Every exit it can catch stops the `verify.sh` process group and releases the standing checkout.
-It also deletes temporary supervision metadata.
+The command installs no signal handler.
+A keeper child, `lint_keeper.py`, runs in its own session and holds the lint folder.
+It enters the standing checkout, runs `verify.sh` with its output in a temporary file, and reads the final Git status.
+It sends the result back through a pipe.
+When `verify.sh` exits, the keeper stops what remains of its process group before it releases the checkout.
+When the lint command ends for any cause, the keeper sees the pipe close.
+The keeper then stops the `verify.sh` process group and the children it adopted, deletes the lint folder and releases the checkout.
 Each `style-sync-lint-*` folder holds `owner.json` with the owner PID and the repository's Git directory.
 It also holds `verifier.pgid`, written before `verify.sh` starts, and only while the owner runs.
 The sweep never follows a link.
@@ -721,6 +735,7 @@ It skips both the ledger command and the acknowledgment.
 Use `/showrunner:units` for each unit's ticket, step, ETA, and finding counts.
 
 - `coverage_report.py --repo R [--rule <id or unique stem> | --crate <dir or package>]` (`/showrunner:style_report [rule|crate]` runs it for each style production at or below the caller). Header from `summary_of(repo rows)`: `<showrunner name> — synced <branch point> <tip> at HH:MM <zone>, <n> files (+<d> since yesterday)`; `Rules done: <d> of <t> (<n> by lint) · cells current <p>% · open · stale · awaiting merge · held`; the unclassified line; `Waiting to merge back: ...`; table `| Rule | Tier | Current | Stale | Open | Awaiting merge | Held | Done |` (classified tier A-D only; `#uncovered` folded in; stem, or full id when two rules share a stem); `Since last report: ...`. `rule_counts(WholeRepository())` runs once, plus `rule_counts(CrateCoverage(crate))` under `--crate`. `--rule` adds open tickets; `--crate` adds the oldest open ticket.
+  Without a staff registration, the report skips both style branch names when it finds the branch point.
 - Snapshot `ReportSnapshot(rules, proposals, files_by_day)` is written atomically to `ledger.database.parent / "last_report.json"`; `previous_report -> FirstReport | PreviousReport`.
 
 ### Style decisions (proposals)

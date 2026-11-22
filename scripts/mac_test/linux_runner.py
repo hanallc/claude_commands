@@ -199,7 +199,7 @@ def run_slot(execution: LeasedSlotExecution, argv: tuple[str, ...], environment:
     if min(shutil.disk_usage(slot.path).free, shutil.disk_usage(slot.cargo_dir).free) < free_floor_gib * 1024**3:
         raise ValueError('The command lacks the required free disk space')
     with build_folders.temporary_build_folder(build_folders.UniqueBuildFolder(
-            '.leased-step-', build_folders.ExplicitBuildParent(slot.path))) as stage:
+            '.leased-step-', build_folders.ExplicitBuildParent(slot.cargo_dir))) as stage:
         started = stage / 'started'
         report_start = f"printf '\\n' >&{build_start_fd} || exit 75\n" if build_start_fd >= 0 else ''
         close_report = f' {build_start_fd}>&-' if build_start_fd >= 0 else ''
