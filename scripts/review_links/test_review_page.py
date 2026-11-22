@@ -2966,7 +2966,7 @@ window.fetch=async(url,options)=>{
   search('gate');
   check(counts('[data-filter-row="show"] [data-filter-value]')==='1|0|1|0' && ownerChip('').textContent==='All 1',
    'All counts combine the words, owner, type and Show filters.');
-  search('');chooseOwner('');type('').click();show('open').click();await flush();await flush();
+  search('');chooseOwner('');type('all').click();show('open').click();await flush();await flush();
   type('change').click();
   check(counts('[data-filter-row="show"] [data-filter-value]')==='2|2|0|0','Show counts use the selected type.');
   search('Numbered');
@@ -5670,8 +5670,10 @@ window.fetch=async(_url,options={})=>{
   check(laterMenu.hidden && laterMenu.querySelector('[data-later-custom]').hidden && document.activeElement===laterToggle,
     'Escape closes the menu and returns focus to Later');
   laterToggle.click();
-  const search=document.getElementById('list-search');
+  const search=document.getElementById('list-search'),previous=document.activeElement;
   search.focus();
+  // Firefox screenshot mode moves focus without sending focus events.
+  if(!document.hasFocus()) previous.dispatchEvent(new FocusEvent('focusout',{bubbles:true,relatedTarget:search}));
   check(laterMenu.hidden && document.activeElement===search && !dateTimePickerOpen(fresh),
     'Focus outside Later closes the menu and releases the refresh hold');
   Date.now=()=>Date.parse('2026-11-23T04:59:00Z');
@@ -5884,6 +5886,7 @@ window.fetch=async(_url,options={})=>{
   check(style.color===errorColor && style.borderTopColor===errorColor,'An invalid time uses the console error color');
   type('1730');
   save.focus();
+  if(!document.hasFocus()) field.dispatchEvent(new FocusEvent('blur',{relatedTarget:save}));
   check(field.value==='17:30' && field.getAttribute('aria-invalid')==='false' && !save.disabled && !posts.length,
    'Moving from Time to Save formats 17:30 and enables Save');
   field.focus();key('Enter');
@@ -6061,8 +6064,12 @@ window.fetch=async()=>({ok:true,text:async()=>MARKUP});
   const form=await readyReviewCard(row);
   const template=document.createElement('template');
   template.innerHTML=EXPECTED;
+  const rendered=row.cloneNode(true);
+  // The picker adds the suggestion list ID when it binds the form.
+  rendered.querySelector('[data-later-time]').removeAttribute('aria-controls');
+  rendered.querySelector('[data-later-times]').removeAttribute('id');
   for(const selector of ['[data-review-body]','.list-log','.review-actions']){
-   if(row.querySelector(selector).innerHTML!==template.content.querySelector(selector).innerHTML)
+   if(rendered.querySelector(selector).innerHTML!==template.content.querySelector(selector).innerHTML)
     failures.push('Review and the single card draw different '+selector+'.');
   }
   if(!form.elements.revision.value) failures.push('The Review action has no revision.');

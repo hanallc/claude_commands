@@ -536,7 +536,8 @@ function filterSelection(name){
   return {
    set(value,fallback='all'){
     const stored=isStaffChipFilter(name) ? encodeIdentity(value) : value;
-    return filterValue(filterControl.select(row,filterChipValue(name,stored),{allowHidden:true,fallback}));
+    const allowHidden=name!=='show' || Boolean(options.selectShow);
+    return filterValue(filterControl.select(row,filterChipValue(name,stored),{allowHidden,fallback}));
    },
    bind(change){filterControl.bind(row,value=>change(filterValue(value)));},
    setCounts(counts){filterControl.setCounts(row,counts);}
@@ -698,9 +699,10 @@ function showRowActionFailure(item,submission,label,message){
  if(submission===latestSubmission) latestActionFailure={key,message:label+': '+message};
  const status=item.querySelector('[data-send-status]');
  if(status) showActionFailure(status,message);
+ const mountedBefore=mounted.get(key);
  apply(false,{animate:true});
  const restored=mounted.get(key);
- if(restored && restored!==item && !matchMedia('(prefers-reduced-motion: reduce)').matches){
+ if(restored && restored!==item && restored!==mountedBefore && !matchMedia('(prefers-reduced-motion: reduce)').matches){
   animateRow(content.querySelector('table'),restored,true,item);
  }
 }

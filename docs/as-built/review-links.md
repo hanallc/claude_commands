@@ -891,9 +891,9 @@ The address stores the words as `q` and restores them on reload.
 The List ignores form text that the browser restores without an input event.
 The chip order is All, Needs me, Morty answering, Working, Blocked, and Parked.
 The List excludes Closed records from rows, filters, and counts.
-An item with an unread answer belongs to Needs me even if parking is active.
-Parked includes the other items with active parking.
-An unread delivery release belongs to Needs me even if the question remains open.
+Parked includes all items with active parking, including items with an unread answer.
+Needs me includes unparked items with an unread answer or an unread delivery release.
+An open question does not change this rule.
 Morty answering includes unparked items with an open question and no unread answer.
 Needs me also includes unparked items in Waiting for nate or Delivered with no open question.
 Working includes other unparked items in New or Working.
@@ -1153,7 +1153,7 @@ A new Ask on a Closed item is refused.
 An Ask with a saved request ID can resume its existing attempt.
 A replay after a confirmed failure returns the saved result without sending again.
 After a confirmed failure, Ask requires a new request ID to start a new attempt for the same question.
-An item with active parking returns to Parked after the user reads its answer.
+An item with active parking stays in Parked when an answer arrives or the user marks it read.
 A signed Unpark request from an earlier page can clear parking while the item waits for an answer.
 That request moves the item to Morty answering.
 An unread answer appears in the panel with the question, both times, and an Unread mark.
@@ -1164,7 +1164,6 @@ A newer update stays unread if it arrives before the read saves.
 After the item is read, the log shows “Question Q<n> — nate” and “Answer — <producer>” at their recorded times.
 Each of these rows has a left bar in the Review question color and a bold Question or Answer label.
 The List and Review use the same question color rule.
-An unread answer puts an unparked item in Needs me.
 Park until moves the item to Parked and preserves its unread state.
 The panel clears the question when the log shows it.
 The List uses its local date and time format for questions and answers.

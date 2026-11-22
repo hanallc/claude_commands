@@ -2375,7 +2375,7 @@ result.textContent=JSON.stringify(failures);document.body.append(result);
         body = list_page.render(self.root / "reviews").decode()
         owners = body.split('data-filter-row="owner"', 1)[1].split('</div>', 1)[0]
         for label in (str(missing), "nate", "Not recorded"):
-            self.assertIn('>' + label + '<b>1</b></button>', owners)
+            self.assertIn('>' + label + ' <b>1</b></button>', owners)
         _ = (self.root / "staff.json").write_text('{"schema":1,"rows":[]}')
         self.assertEqual(len(list_page.records()), 3)
 
@@ -5799,7 +5799,7 @@ const change=async path=>{
   checkNeedsMe('Changing the Show filter keeps the unread item in Needs me.');
   await open('needs-me',key);
   checkNeedsMe('Reloading the open item keeps it unread in Needs me.');
-  check(await act('read')==='Marked read','The explicit Mark read action saves.');
+  check(await act('read')==='','Mark read saves without action status.');
   check(row().hidden && !hasDot() &&
    frame.contentDocument.getElementById('filter-show-needs-me').dataset.filterCount==='0' &&
    frame.contentDocument.querySelector('[data-list-count]').textContent==='0 of 2 items shown · 0 need you · 1 unread',
@@ -6321,7 +6321,7 @@ window.fetch=async(_path,options={})=>{
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
     def test_shared_page_status_uses_the_real_list_loader(self) -> None:
-        _ = self.fixture_items()
+        _ = self.add("Check the List loader")
 
         def screenshot(arguments: list[str], **_options: object) -> subprocess.CompletedProcess[str]:
             path = Path(arguments[arguments.index("--screenshot") + 1])
@@ -6329,7 +6329,7 @@ window.fetch=async(_path,options={})=>{
             return self.firefox_view(arguments[-1], path, int(width), int(height))
 
         with patch("scripts.review_links.test_page_frame.subprocess", SimpleNamespace(run=screenshot)):
-            assert_status_states(self, list_page.render(self.root / "reviews").decode(), 15)
+            assert_status_states(self, list_page.render(self.root / "reviews", include_counts=False).decode(), 15)
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
     def test_browser_sort_filters_hash_refresh_open_rows_and_phone_cards(self) -> None:
@@ -6444,7 +6444,7 @@ for(const [number,label] of [['1','builds'],['2','-unit']]){
  const row=document.querySelector('[data-number="'+number+'"]'),id=row.dataset.owner;
  for(const name of ['owner','producer']){
   const chip=document.querySelector('[data-filter-row="'+name+'"] [data-filter-value="staff:'+id+'"]');
-  if(chip.textContent!==label+'1') failures.push('The '+name+' chip shows '+label+' and its count.');
+  if(chip.textContent!==label+' 1') failures.push('The '+name+' chip shows '+label+' and its count.');
   chip.click();
  }
  const place=new URLSearchParams(location.hash.slice(1));
@@ -6641,7 +6641,7 @@ try{
   return .2126*r+.7152*g+.0722*b;
  };
  show('working');select('owner',OWNER);select('producer',MORTY);
- check(pressed('owner').textContent==='sdlc1' && pressed('producer').textContent==='morty1',
+ check(pressed('owner').textContent==='sdlc 1' && pressed('producer').textContent==='morty 1',
   'The selected staff chips show the names and counts.');
  for(const themeName of ['light','dark']){
   document.documentElement.dataset.theme=themeName;

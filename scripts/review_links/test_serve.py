@@ -2501,7 +2501,7 @@ class ReviewLinksServerTests(unittest.TestCase):
             self.assertNotIn(b'value="works"', body)
             self.assertNotIn(b'data-later-toggle', body.split(b'</template>', 1)[0])
         self.assertEqual(missing.status, 404)
-        self.assertIn(b'role="status"', missing.body)
+        self.assertIn(b'role="alert"', missing.body)
 
     def test_review_recovery_isolates_unreadable_lists_and_releases_locks_before_cleanup(self) -> None:
         case = self.review_fixture(changes=3)
@@ -3270,8 +3270,8 @@ class ReviewLinksServerTests(unittest.TestCase):
 
         visible, chips = self.list_filter_markup("?q=parked")
         self.assertEqual(visible, ["1"])
-        self.assertEqual(chips["show", "needs-me"], ("false", "1"))
-        self.assertEqual(chips["show", "parked"], ("false", "0"))
+        self.assertEqual(chips["show", "needs-me"], ("false", "0"))
+        self.assertEqual(chips["show", "parked"], ("false", "1"))
 
     def test_list_drops_a_missing_linked_item_before_counting(self) -> None:
         self.add_list_filter_items()
