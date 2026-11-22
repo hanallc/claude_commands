@@ -16,6 +16,7 @@ from scripts.production import staff
 from scripts.production.staff_test_support import fixture_runtime_id
 from typing import NamedTuple, cast, override
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.hooks.test_showrunner_guard import AGENT_REASON, GuardFixture
 
 
 from scripts.copies.test_copy_guard import argv_policy_cases, repair_policy_cases, shell_policy_cases, unresolved_policy_cases
@@ -860,6 +861,36 @@ class CopyGuardDispatchTests(IsolatedHookTests):
                 })
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertNotIn("copies.py run", result.stderr)
+
+
+class ShowrunnerGuardDispatchTests(GuardFixture):
+    def test_fixture_registration_delivers_guard_decisions_for_matching_tools(self) -> None:
+        target = self.main / "commands/new.md"
+        cases: tuple[tuple[str, dict[str, object]], ...] = (
+            ("Edit", {"file_path": str(target)}),
+            ("Write", {"file_path": str(target)}),
+            ("NotebookEdit", {"notebook_path": str(target.with_suffix(".ipynb"))}),
+            ("MultiEdit", {"file_path": str(target), "edits": []}),
+            ("Bash", {"command": "git add source.py"}),
+            ("Agent", {"subagent_type": "Explore"}),
+        )
+        for tool, fields in cases:
+            with self.subTest(tool=tool):
+                reason = self.assert_deny(self.run_front("dispatch", tool, fields))
+                if tool == "Agent":
+                    self.assertIn(AGENT_REASON, reason)
+        self.assert_allow(self.run_front("dispatch", "Read", {"file_path": str(target)}))
+        self.assert_unknown(self.run_front("dispatch", "Bash", {}), "target")
+        with self.subTest(other_hook="refuses"):
+            _ = (self.root / "refusing_hook.py").write_text(
+                "import sys\nprint('fixture hook refuses', file=sys.stderr)\nraise SystemExit(2)\n"
+            )
+            result = self.run_front("dispatch with refusal", "Bash", {})
+            self.assertEqual((result.returncode, result.stdout), (2, ""), result.stderr)
+            self.assertIn("fixture hook refuses", result.stderr.splitlines())
+            diagnostics = [line for line in result.stderr.splitlines() if line.startswith("showrunner guard:")]
+            self.assertEqual(len(diagnostics), 1, result.stderr)
+            self.assertRegex(diagnostics[0], r"^showrunner guard: unknown target: .+$")
 
 
 if __name__ == "__main__":

@@ -4,10 +4,15 @@ from __future__ import annotations
 
 from scripts.lint.memory_test_support import write_config_fixture
 
+import base64
+import hashlib
 import io
 import json
 import os
+import re
 import shlex
+import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -20,6 +25,7 @@ from unittest import mock
 from scripts.copies.test_copy_guard import argv_policy_cases, repair_policy_cases, shell_policy_cases, unresolved_policy_cases
 
 from scripts.hooks import codex_hooks
+from scripts.hooks.test_showrunner_guard import GuardFixture, STUB as BASE_STUB
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.production.cli_fixture import invoke_cli, process_boundary, process_boundary_for_case
 
@@ -61,105 +67,118 @@ LIFECYCLE_GROUPS = {"SessionStart": [STE_GROUP, QUEUE_GROUP], "SubagentStart": [
                     "PreCompact": [COMPACTION_GROUP], "UserPromptSubmit": [CLEAR_TURN_GROUP],
                     "PostCompact": [CLEAR_END_GROUP], "Stop": [TURN_END_GROUP]}
 
-STUB = r'''#!__PYTHON__
-import hashlib
-import json
-import os
-import re
-import sys
+
+INTERRUPTED_REMOVAL = """import os, runpy, signal, sys
 from pathlib import Path
+from scripts.lib import atomic_file
 
-state_file = Path(os.environ["STUB_STATE"])
-hooks_file = Path(os.environ["CODEX_HOME"]) / "hooks.json"
+stop_point, journal_name, registry_name, *installer = sys.argv[1:]
+journal = Path(journal_name)
+registry = Path(registry_name)
+write_text_atomic = atomic_file.write_text_atomic
+sync_folder = atomic_file.sync_folder
+latest_registry = registry.read_bytes()
+journal_writes = 0
+registry_writes = 0
+journal_stop = {"after journal write": 1, "after normalization journal": 1, "after migration journal": 2}
+registry_stop = {"after registry replacement": 1, "after normalization replacement": 1, "after final replacement": 2}
 
-def load_state():
-    if state_file.exists():
-        return json.loads(state_file.read_text())
-    return {"trust": {}, "calls": []}
+def stop_installer():
+    os.kill(os.getpid(), signal.SIGKILL)
 
-def save_state(state):
-    state_file.write_text(json.dumps(state))
+def write_then_stop(path, *args, **kwargs):
+    global journal_writes
+    write_text_atomic(path, *args, **kwargs)
+    if path == journal:
+        journal_writes += 1
+        if journal_writes == journal_stop.get(stop_point):
+            stop_installer()
+    if stop_point == "after recovery record" and path.name.startswith(".codex-hooks-install-recovery-"):
+        stop_installer()
 
-def hooks_list(state):
-    if not hooks_file.exists():
-        return {"data": [{"hooks": []}]}
-    config = json.loads(hooks_file.read_text())
-    for kind in ("warnings", "errors"):
-        message = os.environ.get("STUB_LIST_" + kind.upper())
-        if message:
-            return {"data": [{"hooks": [], kind: [message]}]}
-    entries = []
-    for event, groups in config.get("hooks", {}).items():
-        for group_index, group in enumerate(groups):
-            matcher = group.get("matcher", "")
-            for handler_index, handler in enumerate(group.get("hooks", [])):
-                if "timeout" in handler and type(handler["timeout"]) is not int:
-                    return {"data": [{"hooks": [], "warnings": [
-                        f"failed to parse hooks config {hooks_file}: invalid type: map, expected u64"
-                    ], "errors": []}]}
-                event_key = re.sub(r"(?<!^)(?=[A-Z])", "_", event).lower()
-                key = f"{hooks_file}:{event_key}:{group_index}:{handler_index}"
-                material = json.dumps([event, matcher, handler], sort_keys=True)
-                current_hash = hashlib.sha256(material.encode()).hexdigest()
-                recorded_hash = state["trust"].get(key)
-                status = ("untrusted" if recorded_hash is None else
-                          "trusted" if recorded_hash == current_hash else "modified")
-                entries.append({
-                    "key": key, "eventName": event[:1].lower() + event[1:],
-                    "matcher": None if event in ("UserPromptSubmit", "Stop") else matcher,
-                    "handlerType": handler.get("type"),
-                    "command": handler.get("command"),
-                    "timeoutSec": handler.get("timeout"),
-                    "sourcePath": str(hooks_file),
-                    "currentHash": current_hash, "trustStatus": status,
-                    "enabled": os.environ.get("STUB_DISABLED") != "1" and
-                               os.environ.get("STUB_DISABLED_COMMAND") != handler.get("command"),
-                })
-                if os.environ.get("STUB_CHANGED_COMMAND") == handler.get("command"):
-                    entries[-1][os.environ["STUB_LIST_FIELD"]] = json.loads(os.environ["STUB_LIST_VALUE"])
-    return {"data": [{"hooks": entries, "warnings": [], "errors": []}]}
+def sync_then_stop(folder):
+    global latest_registry, registry_writes
+    sync_folder(folder)
+    if folder == registry.parent:
+        content = registry.read_bytes()
+        if content != latest_registry:
+            latest_registry = content
+            registry_writes += 1
+            if registry_writes == registry_stop[stop_point]:
+                stop_installer()
 
-state = load_state()
-state.setdefault("trust", {})
-state.setdefault("calls", [])
-state["argv"] = sys.argv[1:]
-state["cwd"] = os.getcwd()
-state["codex_home"] = os.environ["CODEX_HOME"]
-save_state(state)
-for line in sys.stdin:
-    request = json.loads(line)
-    if "id" not in request:
-        continue
-    method = request.get("method")
-    params = request.get("params", {})
-    state = load_state()
-    state["calls"].append({"method": method, "params": params})
-    save_state(state)
-    if method == "initialize":
-        result = {"userAgent": "stub"}
-    elif method == "hooks/list":
-        result = hooks_list(state)
-    elif method == "config/batchWrite":
-        if os.environ.get("STUB_REFUSE") == "1":
+def stop_before_unlink(event, args):
+    if event == "os.remove" and args[0] == journal_name:
+        stop_installer()
+
+if stop_point.startswith("after trust write"):
+    os.environ["STUB_INTERRUPT_INSTALLER"] = str(os.getpid())
+    if ":" in stop_point:
+        _, home, write = stop_point.split(":")
+        os.environ["STUB_INTERRUPT_HOME"] = home
+        os.environ["STUB_INTERRUPT_WRITE"] = write
+elif stop_point == "before journal removal":
+    sys.addaudithook(stop_before_unlink)
+elif stop_point in registry_stop:
+    atomic_file.sync_folder = sync_then_stop
+else:
+    atomic_file.write_text_atomic = write_then_stop
+
+sys.argv = installer
+runpy.run_path(installer[0], run_name="__main__")
+"""
+
+STUB = BASE_STUB.replace(
+    '    user_config = str(hooks_file.with_name("config.toml"))',
+    '''    for key in state.get("disabled", []):
+        config["hooks"]["state"].setdefault(key, {})["enabled"] = False
+    for key, fields in state.get("extra_settings", {}).items():
+        config["hooks"]["state"].setdefault(key, {}).update(fields)
+    user_config = str(hooks_file.with_name("config.toml"))''',
+).replace(
+    '            else:\n                state["trust"][key] = value["trusted_hash"]',
+    '''            elif "trusted_hash" in value:
+                state["trust"][key] = value["trusted_hash"]
+            else:
+                state["trust"].pop(key, None)
+            if value is None or value.get("enabled") is not False:
+                if key in state.get("disabled", []):
+                    state["disabled"].remove(key)
+            elif key not in state.setdefault("disabled", []):
+                state["disabled"].append(key)
+            extras = state.setdefault("extra_settings", {})
+            fields = {field: setting for field, setting in (value or {}).items()
+                      if field not in ("enabled", "trusted_hash")}
+            if fields:
+                extras[key] = fields
+            else:
+                extras.pop(key, None)''',
+).replace(
+    '"enabled": os.environ.get("STUB_DISABLED") != "1" and',
+    '"enabled": key not in state.get("disabled", []) and os.environ.get("STUB_DISABLED") != "1" and',
+).replace(
+    '        if installer_pid == str(os.getppid()):',
+    '''        write_count = sum(call["method"] == "config/batchWrite" for call in state["calls"])
+        target = os.environ.get("STUB_INTERRUPT_WRITE")
+        if (installer_pid == str(os.getppid()) and os.environ.get("STUB_INTERRUPT_HOME", home) == home
+                and (target is None or write_count == int(target))):''',
+)
+
+RECOVERY_STUB = STUB.replace(
+    '        result = read_config(state, params)',
+    '''        if os.environ.get("STUB_FAILED_READ") == home:
             print(json.dumps({"id": request["id"], "error": {
-                "code": -32602, "message": "invalid config key: hooks.state"
+                "code": -32602, "message": "fixture config read failed"
             }}), flush=True)
             continue
-        edits = params["edits"]
-        for edit in edits:
-            if edit["keyPath"] != "hooks.state" or edit["mergeStrategy"] != "upsert":
-                raise RuntimeError("unexpected trust edit")
-            for key, value in edit["value"].items():
-                state["trust"][key] = value["trusted_hash"]
-        save_state(state)
-        result = {}
-    else:
-        print(json.dumps({"id": request["id"], "error": {
-            "code": -32601, "message": "unknown method: " + str(method)
-        }}), flush=True)
-        continue
-    print(json.dumps({"id": request["id"], "result": result}), flush=True)
-'''
+        result = read_config(state, params)''',
+).replace(
+    '        write_trust(state, params["edits"])',
+    '''        if os.environ.get("STUB_UNSAVED_WRITE") != home:
+            write_trust(state, params["edits"])
+        if os.environ.get("STUB_COVERAGE_HOME") == home:
+            state["trust"][os.environ["STUB_COVERAGE_KEY"]] = "added after planning"''',
+)
 
 
 class CodexHookInstallerTests(unittest.TestCase):
@@ -478,9 +497,11 @@ class CodexHookInstallerTests(unittest.TestCase):
         self.assertEqual((hold["eventName"], hold["matcher"], hold["trustStatus"], hold["enabled"]),
                          ("preToolUse", "Bash", "trusted", True))
 
-    def test_cleanup_preserves_trusted_custom_handlers_at_new_keys_in_one_batch(self) -> None:
+    def test_cleanup_preserves_trusted_custom_handlers_at_new_keys(self) -> None:
         installed = self.run_installer("install")
         self.assertEqual(installed.returncode, 0, installed.stdout + installed.stderr)
+        installed_registry = self.hooks_file.read_bytes()
+        installed_trust = self.trust()
         self.add_retired_custom_group("custom-post")
         self.add_retired_custom_group("custom-pre", "PreToolUse")
         trusted = self.trust()
@@ -499,16 +520,25 @@ class CodexHookInstallerTests(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         writes = [call for call in self.calls() if call["method"] == "config/batchWrite"]
-        self.assertEqual(len(writes), 1)
-        params = cast(dict[str, object], writes[0]["params"])
-        edits = cast(list[dict[str, object]], params["edits"])
+        self.assertEqual(len(writes), 2)
         expected = {
-            f"{self.hooks_file}:post_tool_use:2:0": {"trusted_hash": custom_hashes["custom-post"]},
-            f"{self.hooks_file}:pre_tool_use:3:0": {"trusted_hash": custom_hashes["custom-pre"]},
+            f"{self.hooks_file}:post_tool_use:2:0": custom_hashes["custom-post"],
+            f"{self.hooks_file}:pre_tool_use:3:0": custom_hashes["custom-pre"],
         }
-        self.assertEqual(edits, [{"keyPath": "hooks.state", "value": expected, "mergeStrategy": "upsert"}])
-        self.assertEqual(params["reloadUserConfig"], True)
+        cleaned = {key for key, value in trusted.items() if value in custom_hashes.values()}
+        staged, final = (cast(dict[str, object], write["params"]) for write in writes)
+        self.assertEqual(staged["reloadUserConfig"], True)
+        self.assertEqual(final["reloadUserConfig"], True)
+        expected_stage = {key: {"enabled": False} for key in expected.keys() | cleaned}
+        expected_final = {**dict.fromkeys(cleaned), **{key: {"trusted_hash": value} for key, value in expected.items()}}
+        for params, values in ((staged, expected_stage), (final, expected_final)):
+            edits = cast(list[dict[str, object]], params["edits"])
+            self.assertCountEqual(edits, [
+                {"keyPath": f"hooks.state.{json.dumps(key)}", "value": value, "mergeStrategy": "replace"}
+                for key, value in values.items()
+            ])
         self.assertEqual(set(self.trust()) - set(trusted), set(expected))
+        self.assertEqual(set(trusted) - self.trust().keys(), cleaned)
         for entry in self.listed_handlers():
             if entry["command"] in custom_hashes:
                 self.assertEqual(entry["trustStatus"], "trusted")
@@ -517,6 +547,440 @@ class CodexHookInstallerTests(unittest.TestCase):
         repeated = self.run_installer("install")
         self.assertEqual(repeated.returncode, 0, repeated.stdout + repeated.stderr)
         self.assertEqual([call["method"] for call in self.calls()], ["initialize", "hooks/list"])
+
+        with self.subTest(scenario="interrupted installation in shared homes"):
+            _ = self.hooks_file.write_bytes(installed_registry)
+            self.save_trust(installed_trust)
+            self.assert_interrupted_install_migration()
+
+    def assert_interrupted_install_migration(self) -> None:
+        self.add_retired_custom_group("custom duplicate")
+        self.add_retired_custom_group("custom control")
+        initial = cast(dict[str, dict[str, list[dict[str, object]]]], json.loads(self.hooks_file.read_text()))
+        group = cast(list[object], initial["hooks"]["PostToolUse"][2]["hooks"])
+        group.append(group[-1])
+        original_registry = json.dumps(initial)
+        _ = self.hooks_file.write_text(original_registry)
+
+        linked_home = self.home / ".codex2"
+        linked_home.mkdir()
+        (linked_home / "hooks.json").symlink_to(self.hooks_file)
+        linked_state = self.root / "linked-state.json"
+        self.environment["STUB_ACCOUNT_STATES"] = json.dumps({str(linked_home): str(linked_state)})
+        journal = self.hooks_file.with_name(".codex-hooks-install.json")
+        cases = ((self.codex_home, self.state_file, 1), (linked_home, linked_state, 2))
+        initial_trust: dict[Path, dict[str, str]] = {}
+        expected_active: dict[Path, dict[str, str | None]] = {}
+        berth_hashes: dict[Path, str] = {}
+        for home, state_file, trusted_duplicate in cases:
+            with mock.patch.object(self, "codex_home", home):
+                entries = {entry["key"]: cast(str, entry["currentHash"]) for entry in self.listed_handlers()}
+            prefix = f"{home / 'hooks.json'}:post_tool_use"
+            stale_slot, first, second = (f"{prefix}:2:{index}" for index in range(3))
+            control = f"{prefix}:3:1"
+            duplicate = (first, second)[trusted_duplicate - 1]
+            berth_hashes[state_file] = entries[f"{home / 'hooks.json'}:pre_tool_use:0:0"]
+            initial_trust[state_file] = {
+                **(self.trust() if home == self.codex_home else {}),
+                stale_slot: entries[stale_slot], duplicate: entries[duplicate], control: entries[control],
+            }
+            expected_active[state_file] = {
+                stale_slot: entries[duplicate] if trusted_duplicate == 1 else None,
+                first: entries[duplicate] if trusted_duplicate == 2 else None,
+                f"{prefix}:3:0": entries[control],
+            }
+
+        retired = {"type": "command", "command": RETIRED_COMMAND, "timeout": 99}
+        managed = {"type": "command", "command": BERTH_COMMAND, "timeout": 29.5}
+        initial["hooks"]["PreToolUse"][0]["hooks"] = [retired, managed]
+        handlers = cast(list[dict[str, object]], initial["hooks"]["PostToolUse"][3]["hooks"])
+        handlers[1]["timeout"] = 20.5
+        fractional_registry = json.dumps(initial)
+        fractional_trust: dict[Path, dict[str, str]] = {}
+        expected_fractional: dict[Path, dict[str, str | None]] = {}
+        for home, state_file, _ in cases:
+            prefix = f"{home / 'hooks.json'}:pre_tool_use:0"
+            fractional_trust[state_file] = {**initial_trust[state_file], f"{prefix}:1": berth_hashes[state_file]}
+            expected_fractional[state_file] = {**expected_active[state_file], f"{prefix}:0": berth_hashes[state_file]}
+
+        unchanged_stages = ("after journal write", "after registry replacement", "after trust write",
+                            "before journal removal")
+        normalized_stages = ("after normalization journal", "after normalization replacement", "after migration journal",
+                             "after final replacement", "after trust write", "before journal removal")
+        for normalize, stop_points in ((False, unchanged_stages), (True, normalized_stages)):
+            for stop_point in stop_points:
+                for retry in ("install", "remove-showrunner-guard"):
+                    with self.subTest(normalize=normalize, stop_point=stop_point, retry=retry):
+                        journal.unlink(missing_ok=True)
+                        starting_registry = fractional_registry if normalize else original_registry
+                        _ = self.hooks_file.write_text(starting_registry)
+                        starting_trust = fractional_trust if normalize else initial_trust
+                        expected_trust = expected_fractional if normalize else expected_active
+                        for _, state_file, _ in cases:
+                            _ = state_file.write_text(json.dumps({"trust": starting_trust[state_file]}))
+                        stopped = subprocess.run(
+                            [sys.executable, "-c", INTERRUPTED_REMOVAL, stop_point,
+                             str(journal), str(self.hooks_file), str(INSTALLER), "install"],
+                            env=self.environment, text=True, capture_output=True, check=False,
+                            cwd=INSTALLER.resolve().parents[2], timeout=TEST_HANG_GUARD_SECS,
+                        )
+                        self.assertEqual(stopped.returncode, -signal.SIGKILL, stopped.stdout + stopped.stderr)
+                        self.assertTrue(journal.read_bytes())
+                        if stop_point == "after normalization journal":
+                            self.assertEqual(self.hooks_file.read_text(), starting_registry)
+                        if stop_point in {"after normalization replacement", "after migration journal"}:
+                            self.assertEqual(self.groups("PreToolUse")[0]["hooks"], [retired, {**managed, "timeout": 30}])
+                            self.assertEqual(self.groups()[3]["hooks"], [retired, {
+                                "type": "command", "command": "custom control", "timeout": 21}])
+                        if stop_point == "before journal removal":
+                            self.assert_install_migration(expected_trust)
+                        recovered = self.run_installer(retry)
+                        self.assertEqual(recovered.returncode, 0, recovered.stdout + recovered.stderr)
+                        self.assert_install_migration(expected_trust)
+                        if normalize:
+                            self.assertEqual(self.groups("PreToolUse")[0]["hooks"], [{**managed, "timeout": 30}])
+                            for home, _, _ in cases:
+                                with mock.patch.object(self, "codex_home", home):
+                                    entries = self.listed_handlers()
+                                control = next(entry for entry in entries if entry["command"] == "custom control")
+                                self.assertEqual((control["timeoutSec"], control["trustStatus"]), (21, "modified"))
+                        with self.assertRaises(FileNotFoundError):
+                            _ = journal.read_bytes()
+
+        with self.subTest(retry="refuse an RPC acknowledgment without saved trust"):
+            _ = self.hooks_file.write_text(original_registry)
+            for state_file, trust in initial_trust.items():
+                _ = state_file.write_text(json.dumps({"trust": trust}))
+            executable = self.root / "bin/codex"
+            original_stub = executable.read_text()
+            silent_stub = original_stub.replace('        write_trust(state, params["edits"])', "        pass")
+            self.assertNotEqual(original_stub, silent_stub)
+            _ = executable.write_text(silent_stub)
+            try:
+                refused = self.run_installer("install")
+            finally:
+                _ = executable.write_text(original_stub)
+            self.assertEqual(refused.returncode, 1, refused.stdout + refused.stderr)
+            self.assertIn("saved hook trust does not match the journal", refused.stderr)
+            self.assertEqual(len(refused.stderr.splitlines()), 1)
+            self.assertTrue(journal.read_bytes())
+            recovered = self.run_installer("remove-showrunner-guard")
+            self.assertEqual(recovered.returncode, 0, recovered.stdout + recovered.stderr)
+            self.assert_install_migration(expected_active)
+            with self.assertRaises(FileNotFoundError):
+                _ = journal.read_bytes()
+
+        self.assert_complete_disabled_migration(linked_home, journal)
+        self.assert_staged_disabled_migration(linked_home)
+        self.assert_late_alias_recovery()
+
+    def assert_complete_disabled_migration(self, alias: Path, journal: Path) -> None:
+        alias_config = alias / "config.toml"
+        alias_config.symlink_to(self.codex_home / "config.toml")
+        alias_registry = alias / "hooks.json"
+        states = self.environment["STUB_ACCOUNT_STATES"]
+        self.environment["STUB_ACCOUNT_STATES"] = json.dumps({str(alias): str(self.state_file)})
+        _ = (self.root / "bin/codex").write_text(RECOVERY_STUB.replace("__PYTHON__", sys.executable))
+        custom = {"type": "command", "command": "explicitly disabled custom", "timeout": 20}
+        original = json.dumps({"hooks": {"PostToolUse": [{"matcher": "apply_patch", "hooks": [
+            {"type": "command", "command": RETIRED_COMMAND, "timeout": 99}, custom,
+        ]}]}})
+        source = [f"{registry}:post_tool_use:0:1" for registry in (self.hooks_file, alias_registry)]
+        destination = [f"{registry}:post_tool_use:0:0" for registry in (self.hooks_file, alias_registry)]
+        stale = [f"{registry}:post_tool_use:97:0" for registry in (self.hooks_file, alias_registry)]
+        unrelated = f"{self.root / 'other-hooks.json'}:stop:0:0"
+        initial = {"trust": {unrelated: "other registry hash", **dict.fromkeys(stale, "stale hash")}, "disabled": source}
+        for stop_point in ("after journal write", "after registry replacement", "after trust write", "before journal removal"):
+            for retry in ("install", "remove-showrunner-guard"):
+                with self.subTest(complete_disabled_move=stop_point, retry=retry):
+                    journal.unlink(missing_ok=True)
+                    _ = self.hooks_file.write_text(original)
+                    _ = self.state_file.write_text(json.dumps(initial))
+                    stopped = subprocess.run(
+                        [sys.executable, "-c", INTERRUPTED_REMOVAL, stop_point,
+                         str(journal), str(self.hooks_file), str(INSTALLER), "install"],
+                        env=self.environment, text=True, capture_output=True, check=False,
+                        cwd=INSTALLER.resolve().parents[2], timeout=TEST_HANG_GUARD_SECS,
+                    )
+                    self.assertEqual(stopped.returncode, -signal.SIGKILL, stopped.stdout + stopped.stderr)
+                    if stop_point == "after journal write":
+                        recorded = cast(dict[str, object], json.loads(journal.read_text()))
+                        groups = cast(dict[str, dict[str, list[str]]], recorded["configs"])
+                        groups[str(self.codex_home / "config.toml")]["homes"].reverse()
+                        _ = journal.write_text(json.dumps(recorded))
+                        saved_journal = journal.read_bytes()
+                        for problem, text in (
+                            ("conflict", "saved hook setting conflicts with the journal"),
+                            ("uncovered", "uncovered hook setting"),
+                            ("config changes", "hook or trust destination changed"),
+                        ):
+                            with self.subTest(problem=problem):
+                                trust = cast(dict[str, str], initial["trust"]).copy()
+                                if problem == "conflict":
+                                    trust[stale[0]] = "different hash"
+                                elif problem == "uncovered":
+                                    trust[f"{alias_registry}:post_tool_use:98:0"] = "new hash"
+                                else:
+                                    alias_config.unlink()
+                                    alias_config.symlink_to(self.root / "other-config.toml")
+                                _ = self.state_file.write_text(json.dumps({**initial, "trust": trust}))
+                                try:
+                                    refused = self.run_installer(retry)
+                                    self.assertEqual(refused.returncode, 1, refused.stdout + refused.stderr)
+                                    self.assertIn(text, refused.stderr)
+                                    self.assertEqual(journal.read_bytes(), saved_journal)
+                                    self.assertEqual(self.hooks_file.read_text(), original)
+                                    self.assertEqual(self.trust(), trust)
+                                finally:
+                                    if problem == "config changes":
+                                        alias_config.unlink()
+                                        alias_config.symlink_to(self.codex_home / "config.toml")
+                                    _ = self.state_file.write_text(json.dumps(initial))
+                                    _ = self.hooks_file.write_text(original)
+                                    _ = journal.write_bytes(saved_journal)
+                    result = self.run_installer(retry)
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    managed: set[str] = set()
+                    for home, key in zip((self.codex_home, alias), destination):
+                        with mock.patch.object(self, "codex_home", home):
+                            entries = self.listed_handlers()
+                        matching = next(entry for entry in entries if entry["command"] == custom["command"])
+                        self.assertEqual((matching["key"], matching["trustStatus"], matching["enabled"]),
+                                         (key, "untrusted", False))
+                        commands = {hook.command for hook in codex_hooks.HOOKS}
+                        managed.update(cast(str, entry["key"]) for entry in entries if entry["command"] in commands)
+                    state = self.state()
+                    self.assertCountEqual(cast(list[str], state["disabled"]), destination)
+                    self.assertEqual({key: value for key, value in self.trust().items() if key not in managed},
+                                     {unrelated: "other registry hash"})
+                    with self.assertRaises(FileNotFoundError):
+                        _ = journal.read_bytes()
+        alias_config.unlink()
+        self.environment["STUB_ACCOUNT_STATES"] = states
+
+    def assert_staged_disabled_migration(self, alias: Path) -> None:
+        linked_state = self.root / "staged-linked-state.json"
+        homes = ((self.codex_home, self.state_file), (alias, linked_state))
+        self.environment["STUB_ACCOUNT_STATES"] = json.dumps({str(alias): str(linked_state)})
+        handler = {"type": "command", "command": "custom identical handler", "timeout": 20}
+        group = {"matcher": "apply_patch", "hooks": [handler, handler]}
+        _ = self.hooks_file.write_text(json.dumps({"hooks": {"PostToolUse": [group]}}))
+        handler_hash = cast(str, self.listed_handlers()[0]["currentHash"])
+        for operation in ("install", "remove-showrunner-guard"):
+            install = operation == "install"
+            marker = self.hooks_file.with_name(".codex-hooks-install.json" if install else ".showrunner-guard-removal.json")
+            removable = ({"type": "command", "command": RETIRED_COMMAND, "timeout": 99}
+                         if install else self.guard_handler("post"))
+            original = json.dumps({"hooks": {"PostToolUse": [{**group, "hooks": [removable, handler, handler]}]}})
+            for boundary, staged_count, published, final_count in (
+                ("after journal write", 0, False, 0),
+                ("version 6 before replacement", 0, False, 0),
+                (f"after trust write:{self.codex_home}:1", 1, False, 0),
+                (f"after trust write:{alias}:1", 2, False, 0),
+                ("after registry replacement", 2, True, 0),
+                (f"after trust write:{self.codex_home}:2", 2, True, 1),
+                (f"after trust write:{alias}:2", 2, True, 2),
+                ("before journal removal", 2, True, 2),
+            ):
+                for retry in ("install", "remove-showrunner-guard"):
+                    with self.subTest(staged_registry=operation, boundary=boundary, retry=retry):
+                        marker.unlink(missing_ok=True)
+                        _ = self.hooks_file.write_text(original)
+                        for index, (home, config_state) in enumerate(homes):
+                            slot = f"{home / 'hooks.json'}:post_tool_use:0:{index + 1}"
+                            _ = config_state.write_text(json.dumps({"trust": {slot: handler_hash}, "disabled": [slot]}))
+                        upgrade = boundary == "version 6 before replacement"
+                        stop_point = "after journal write" if upgrade else boundary
+                        stopped = subprocess.run(
+                            [sys.executable, "-c", INTERRUPTED_REMOVAL, stop_point,
+                             str(marker), str(self.hooks_file), str(INSTALLER), operation],
+                            env=self.environment, text=True, capture_output=True, check=False,
+                            cwd=INSTALLER.resolve().parents[2], timeout=TEST_HANG_GUARD_SECS,
+                        )
+                        self.assertEqual(stopped.returncode, -signal.SIGKILL, stopped.stdout + stopped.stderr)
+                        self.assertEqual(self.hooks_file.read_text() != original, published)
+                        self.assert_staged_settings(homes, handler_hash, staged_count, final_count)
+                        if upgrade:
+                            record = cast(dict[str, object], json.loads(marker.read_text()))
+                            record["version"] = 6
+                            for plan in cast(dict[str, dict[str, object]], record["configs"]).values():
+                                settings = cast(dict[str, dict[str, object]], plan["settings"])
+                                for values in settings.values():
+                                    _ = values.pop("staged", None)
+                            _ = marker.write_text(json.dumps(record))
+                        recovered = self.run_installer(retry)
+                        self.assertEqual(recovered.returncode, 0, recovered.stdout + recovered.stderr)
+                        self.assert_staged_settings(homes, handler_hash, 2, 2)
+                        with self.assertRaises(FileNotFoundError):
+                            _ = marker.read_bytes()
+
+    def assert_staged_settings(
+        self, homes: tuple[tuple[Path, Path], ...], handler_hash: str, staged_count: int, final_count: int,
+    ) -> None:
+        for index, (home, config_state) in enumerate(homes):
+            state = cast(dict[str, object], json.loads(config_state.read_text()))
+            keys = [f"{home / 'hooks.json'}:post_tool_use:0:{slot}" for slot in range(3)]
+            trust = cast(dict[str, str], state["trust"])
+            actual = {key: trust[key] for key in keys if key in trust}
+            if index < final_count:
+                self.assertEqual(actual, {keys[index]: handler_hash})
+                self.assertCountEqual(cast(list[str], state["disabled"]), [keys[index]])
+            elif index < staged_count:
+                self.assertEqual(actual, {})
+                canonical = [f"{self.hooks_file}:post_tool_use:0:{slot}" for slot in range(3)] if index else []
+                self.assertCountEqual(cast(list[str], state["disabled"]), keys + canonical)
+            else:
+                self.assertEqual(actual, {keys[index + 1]: handler_hash})
+                self.assertCountEqual(cast(list[str], state["disabled"]), [keys[index + 1]])
+
+    def assert_late_alias_recovery(self) -> None:
+        (self.home / ".codex2" / "hooks.json").unlink()
+        alias = self.home / ".codex3"
+        alias.mkdir()
+        alias_registry = alias / "hooks.json"
+        alias_config = alias / "config.toml"
+        alias_state = self.root / "late-alias-state.json"
+        states = cast(dict[str, str], json.loads(self.environment["STUB_ACCOUNT_STATES"]))
+        _ = (self.root / "bin/codex").write_text(RECOVERY_STUB.replace("__PYTHON__", sys.executable))
+        custom = {"type": "command", "command": "late alias custom", "timeout": 20}
+        matcher = "apply_patch"
+        main_key = f"{self.hooks_file}:post_tool_use:0:0"
+        new_key = f"{alias_registry}:post_tool_use:0:0"
+        old_key = f"{alias_registry}:post_tool_use:0:1"
+        other_key = f"{self.root / 'other-hooks.json'}:stop:0:0"
+        old_guard = self.guard_handler("post")
+        retired = {"type": "command", "command": RETIRED_COMMAND, "timeout": 99}
+        for version, change, published, extra in (
+            (2, "install", False, ""), (2, "install", True, ""),
+            (2, "remove-showrunner-guard", False, ""), (2, "remove-showrunner-guard", True, ""),
+            (3, "install", True, ""),
+            (4, "install", True, "shared config"),
+            (2, "install", False, "disabled move"),
+            (2, "install", True, "canonical without new homes"),
+        ):
+            for retry in ("install", "remove-showrunner-guard"):
+                with self.subTest(late_alias_version=version, change=change, registry_published=published,
+                                  extra=extra, retry=retry):
+                    alias_registry.unlink(missing_ok=True)
+                    alias_config.unlink(missing_ok=True)
+                    shared = extra == "shared config"
+                    disabled = extra == "disabled move"
+                    second_file = self.state_file if shared else alias_state
+                    self.environment["STUB_ACCOUNT_STATES"] = json.dumps({**states, str(alias): str(second_file)})
+                    if shared:
+                        alias_config.symlink_to(self.codex_home / "config.toml")
+                    for name in (".codex-hooks-install.json", ".showrunner-guard-removal.json"):
+                        self.hooks_file.with_name(name).unlink(missing_ok=True)
+                    _ = self.hooks_file.write_text(json.dumps({"hooks": {"PostToolUse": [
+                        {"matcher": matcher, "hooks": [custom]},
+                    ]}}))
+                    if version == 3:
+                        installed = self.run_installer("install")
+                        self.assertEqual(installed.returncode, 0, installed.stdout + installed.stderr)
+                    replacement = self.hooks_file.read_text()
+                    listed = next(entry for entry in self.listed_handlers() if entry["command"] == custom["command"])
+                    handler_hash = cast(str, listed["currentHash"])
+                    removed = retired if change == "install" else old_guard
+                    previous = replacement.replace('"timeout": 20', '"timeout": 19.5', 1)
+                    if version in (2, 4):
+                        previous = json.dumps({"hooks": {"PostToolUse": [
+                            {"matcher": matcher, "hooks": [removed, custom]},
+                        ]}})
+                    current = replacement if published else previous
+                    _ = self.hooks_file.write_text(current)
+                    _ = self.state_file.write_text(json.dumps({"trust": {}}))
+                    marker = self.hooks_file.with_name(".codex-hooks-install.json" if change == "install"
+                                                       else ".showrunner-guard-removal.json")
+                    record: dict[str, object] = {
+                        "version": version, "original_hash": hashlib.sha256(previous.encode()).hexdigest(),
+                        "registry": replacement,
+                    }
+                    if version == 3:
+                        record.update({"path": str(self.hooks_file), "homes": [str(self.codex_home)]})
+                    elif version == 4:
+                        record["trust"] = [{
+                            "home": str(self.codex_home), "config": str(self.codex_home / "config.toml"),
+                            "retained": [], "unproved": {},
+                            "edits": {main_key: None, new_key: {"trusted_hash": handler_hash}},
+                        }]
+                    else:
+                        record["trust"] = [{
+                            "home": str(self.codex_home), "config": str(self.codex_home / "config.toml"),
+                            "retained": [{"old_key": f"{self.hooks_file}:post_tool_use:0:1",
+                                          "destination_key": main_key, "handler_hash": handler_hash, "trust": None}],
+                            "obsolete_keys": [] if change == "install" else [f"{self.hooks_file}:post_tool_use:0:1"],
+                        }]
+                    _ = marker.write_text(json.dumps(record))
+                    alias_registry.symlink_to(self.hooks_file)
+                    saved_key = new_key if published else old_key
+                    canonical_old = f"{self.hooks_file}:post_tool_use:0:1"
+                    stale = f"{alias_registry}:post_tool_use:73:0"
+                    state = {"trust": {saved_key: handler_hash, other_key: "other-source-hash"}}
+                    if shared:
+                        state["trust"][stale] = "old alias hash"
+                    canonical_stale = f"{self.hooks_file}:post_tool_use:79:0"
+                    if disabled or extra == "canonical without new homes":
+                        retained = [{"old_key": old_key, "destination_key": new_key,
+                                     "handler_hash": handler_hash, "trust": None}] if disabled else []
+                        records = cast(list[object], record["trust"])
+                        records.append({"home": str(alias), "config": str(alias_config),
+                                        "retained": retained, "obsolete_keys": []})
+                        _ = marker.write_text(json.dumps(record))
+                    if extra == "canonical without new homes":
+                        state["trust"][canonical_stale] = "old canonical hash"
+                    _ = second_file.write_text(json.dumps({
+                        **state, "disabled": [old_key, canonical_old] if disabled else [],
+                    }))
+                    if version == 3:
+                        with mock.patch.dict(self.environment, {"STUB_FAILED_READ": str(alias)}):
+                            failed = self.run_installer(retry)
+                        self.assertEqual(failed.returncode, 1, failed.stdout + failed.stderr)
+                        self.assertIn("fixture config read failed", failed.stderr)
+                        self.assertTrue(marker.read_bytes())
+                    result = self.run_installer(retry)
+                    if version != 3:
+                        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                        self.assertEqual(result.stdout, "")
+                        self.assertIn("legacy journal lacks complete before and after values", result.stderr)
+                        self.assertEqual(json.loads(marker.read_text()), record)
+                        self.assertEqual(self.hooks_file.read_text(), current)
+                        for home, state_file in ((self.codex_home, self.state_file), (alias, second_file)):
+                            with mock.patch.object(self, "codex_home", home):
+                                entry = next(item for item in self.listed_handlers() if item["command"] == custom["command"])
+                            suffix = ":0" if published else ":1"
+                            self.assertEqual((entry["key"], entry["trustStatus"], entry["enabled"]),
+                                             (f"{home / 'hooks.json'}:post_tool_use:0{suffix}", "untrusted",
+                                              not (disabled and home == alias)))
+                            saved = cast(dict[str, object], json.loads(state_file.read_text()))
+                            expected_trust = {other_key: "other-source-hash"} if home == alias or shared else {}
+                            self.assertEqual(saved["trust"], expected_trust)
+                            if home == alias:
+                                self.assertEqual(saved["disabled"], [old_key, canonical_old] if disabled else [])
+                        continue
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    for home, state_file, key, status in (
+                        (self.codex_home, self.state_file, main_key, "untrusted"),
+                        (alias, second_file, new_key, "trusted"),
+                    ):
+                        with mock.patch.object(self, "codex_home", home):
+                            entry = next(entry for entry in self.listed_handlers() if entry["command"] == custom["command"])
+                        self.assertEqual((entry["key"], entry["trustStatus"]), (key, status))
+                        saved = cast(dict[str, dict[str, str]], json.loads(state_file.read_text()))["trust"]
+                        self.assertEqual(saved.get(key), handler_hash if status == "trusted" else None)
+                        if home == alias:
+                            self.assertEqual(saved[other_key], "other-source-hash")
+                    with self.assertRaises(FileNotFoundError):
+                        _ = marker.read_bytes()
+
+    def assert_install_migration(self, expected_active: dict[Path, dict[str, str | None]]) -> None:
+        groups = self.groups()
+        commands = [[cast(dict[str, object], handler)["command"] for handler in cast(list[object], group["hooks"])]
+                    for group in groups[2:]]
+        self.assertEqual(commands, [["custom duplicate", "custom duplicate"], ["custom control"]])
+        for state_file, expected in expected_active.items():
+            with self.subTest(state_file=state_file.name):
+                state = cast(dict[str, dict[str, str]], json.loads(state_file.read_text()))
+                self.assertEqual({key: state["trust"].get(key) for key in expected}, expected)
 
     def test_cleanup_leaves_untrusted_custom_sibling_untrusted(self) -> None:
         installed = self.run_installer("install")
@@ -529,7 +993,7 @@ class CodexHookInstallerTests(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(self.trust(), trusted)
-        self.assertNotIn("config/batchWrite", [call["method"] for call in self.calls()])
+        self.assertEqual([call["method"] for call in self.calls()].count("config/batchWrite"), 2)
         custom = next(entry for entry in self.listed_handlers() if entry["command"] == "custom-untrusted")
         self.assertEqual(custom["key"], f"{self.hooks_file}:post_tool_use:2:0")
         self.assertEqual(custom["trustStatus"], "untrusted")
@@ -547,8 +1011,8 @@ class CodexHookInstallerTests(unittest.TestCase):
         result = self.run_installer("install")
 
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual(self.trust(), trusted)
-        self.assertNotIn("config/batchWrite", [call["method"] for call in self.calls()])
+        self.assertEqual(self.trust(), {key: value for key, value in trusted.items() if key != custom["key"]})
+        self.assertEqual([call["method"] for call in self.calls()].count("config/batchWrite"), 2)
         moved = next(entry for entry in self.listed_handlers() if entry["command"] == "custom-disabled")
         self.assertEqual(moved["key"], f"{self.hooks_file}:post_tool_use:2:0")
         self.assertEqual(moved["trustStatus"], "untrusted")
@@ -688,15 +1152,18 @@ class CodexHookInstallerTests(unittest.TestCase):
         directory = self.root / "config"
         directory.mkdir()
         self.environment["COPIES_CONFIG"] = str(directory / "copies.conf")
-        for seconds, expected, user_seconds, user_expected in ((10.0, 10, 5.0, 5), (10.25, 11, 5.25, 6)):
-            with self.subTest(seconds=seconds):
+        for seconds, expected, user_seconds, user_expected, retire in (
+            (10.0, 10, 5.0, 5, False), (10.25, 11, 5.25, 6, False), (10.25, 11, 5.25, 6, True),
+        ):
+            with self.subTest(seconds=seconds, retire=retire):
                 _ = write_config_fixture(directory / "copies.conf", f"guard_timeout_seconds={seconds}\n")
                 handler = {"type": "command", "command": GUARD_COMMAND, "timeout": seconds}
                 user_handler = {"type": "command", "command": "user-hook", "timeout": user_seconds,
                                 "statusMessage": "Running the user hook"}
+                retired = [{"type": "command", "command": RETIRED_COMMAND}] if retire else []
                 _ = self.hooks_file.write_text(json.dumps({"hooks": {
-                    "PreToolUse": [{"matcher": "Bash", "hooks": [handler]}],
-                    "PostToolUse": [{"matcher": "Edit|Write", "hooks": [user_handler]}],
+                    "PreToolUse": [{"matcher": "Bash", "hooks": [*retired, handler]}],
+                    "PostToolUse": [{"matcher": "Edit|Write", "hooks": [*retired, user_handler]}],
                 }}))
                 self.state_file.unlink(missing_ok=True)
                 before = self.run_installer("check")
@@ -804,10 +1271,12 @@ class CodexHookInstallerTests(unittest.TestCase):
         self.assertEqual(repaired.returncode, 0, repaired.stdout + repaired.stderr)
         self.assertEqual(self.groups("SessionStart"), [STE_GROUP, QUEUE_GROUP])
         writes = [call for call in self.calls() if call["method"] == "config/batchWrite"]
-        self.assertEqual(len(writes), 1)
-        params = cast(dict[str, object], writes[0]["params"])
+        self.assertEqual(len(writes), 2)
+        params = cast(dict[str, object], writes[-1]["params"])
         edits = cast(list[dict[str, object]], params["edits"])
-        self.assertEqual(list(cast(dict[str, object], edits[0]["value"])), [restored_key])
+        self.assertCountEqual([edit["keyPath"] for edit in edits], [
+            f"hooks.state.{json.dumps(restored_key)}", f"hooks.state.{json.dumps(restored_key[:-1] + '1')}",
+        ])
         self.assertEqual(self.trust()[restored_key], trust[f"{self.hooks_file}:session_start:0:1"])
 
     def test_modified_entry_is_trusted_again(self) -> None:
@@ -970,6 +1439,736 @@ class CodexHookInstallerTests(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         self.assertEqual(result.stdout, "")
         self.assertEqual(result.stderr.strip(), "codex hooks: install: config/batchWrite: invalid config key: hooks.state")
+
+    def test_remove_showrunner_guard_retains_other_hooks_and_their_trust(self) -> None:
+        pre = self.guard_handler("pre")
+        post = self.guard_handler("post")
+        custom = {"type": "command", "command": "custom apply_patch", "timeout": 10}
+        untrusted = {"type": "command", "command": "custom Bash", "timeout": 10}
+        mention = {"type": "command", "command": "echo pre-tool-use-showrunner-guard-codex.py", "timeout": 10}
+        initial_hooks = json.dumps({"hooks": {
+            "PreToolUse": [{"matcher": "Bash", "hooks": [pre]},
+                           {"matcher": "apply_patch", "hooks": [pre, custom]},
+                           {"matcher": "Bash", "hooks": [untrusted]}],
+            "PostToolUse": [{"matcher": "apply_patch", "hooks": [post, FN_HANDLER, mention]}],
+        }})
+        _ = self.hooks_file.write_text(initial_hooks)
+        other_source = f"{self.root / 'other-hooks.json'}:pre_tool_use:0:0"
+        initial_trust = {cast(str, entry["key"]): cast(str, entry["currentHash"])
+                         for entry in self.listed_handlers() if entry["command"] != untrusted["command"]}
+        starting_trust = {**initial_trust, other_source: "other-source-hash"}
+        registry = self.hooks_file.resolve()
+        journal = registry.with_name(".showrunner-guard-removal.json")
+        for stop_point, install_before_retry, verify_identity in (
+            ("uninterrupted", False, False),
+            ("after journal write", False, False),
+            ("after trust write", False, False),
+            ("after registry replacement", False, False),
+            ("before journal removal", False, False),
+            ("after trust write", True, False),
+            ("after journal write", True, True),
+            ("after trust write", True, True),
+            ("after registry replacement", True, True),
+            ("before journal removal", True, True),
+        ):
+            with self.subTest(stop_point=stop_point, install_before_retry=install_before_retry,
+                              verify_identity=verify_identity):
+                journal.unlink(missing_ok=True)
+                _ = self.hooks_file.write_text(initial_hooks)
+                self.save_trust(starting_trust)
+                if stop_point != "uninterrupted":
+                    result = subprocess.run(
+                        [sys.executable, "-c", INTERRUPTED_REMOVAL, stop_point,
+                         str(journal), str(registry), str(INSTALLER), "remove-showrunner-guard"],
+                        env=self.environment, text=True, capture_output=True, check=False,
+                        cwd=INSTALLER.resolve().parents[2], timeout=TEST_HANG_GUARD_SECS,
+                    )
+                    self.assertEqual(result.returncode, -signal.SIGKILL, result.stdout + result.stderr)
+                    self.assertTrue(journal.read_bytes())
+                    if stop_point in ("after journal write", "after trust write"):
+                        self.assertEqual(registry.read_text(), initial_hooks)
+                    else:
+                        self.assertNotEqual(registry.read_text(), initial_hooks)
+                    if stop_point == "after journal write":
+                        self.assertEqual(self.trust(), starting_trust)
+                    else:
+                        self.assertNotEqual(self.trust(), starting_trust)
+                if stop_point == "before journal removal":
+                    expected_custom = next(value for key, value in initial_trust.items()
+                                           if key.endswith(":pre_tool_use:1:1"))
+                    self.assertEqual(self.trust()[f"{registry}:pre_tool_use:0:0"], expected_custom)
+                    self.assertEqual(self.groups("PreToolUse"), [{"matcher": "apply_patch", "hooks": [custom]},
+                                                                 {"matcher": "Bash", "hooks": [untrusted]}])
+                if verify_identity:
+                    trust_before_retry = self.trust()
+                    registry_before_retry = registry.read_bytes()
+                    with mock.patch.dict(self.environment, {"STUB_CHANGED_COMMAND": cast(str, custom["command"]),
+                                                            "STUB_LIST_FIELD": "currentHash",
+                                                            "STUB_LIST_VALUE": '"different hash"'}):
+                        refused = self.run_installer("install")
+                    self.assertEqual(refused.returncode, 1, refused.stdout + refused.stderr)
+                    self.assertIn("retained hook is missing or has a different identity", refused.stderr)
+                    self.assertEqual(len(refused.stderr.splitlines()), 1)
+                    self.assertEqual(self.trust(), trust_before_retry)
+                    self.assertEqual(registry.read_bytes(), registry_before_retry)
+                    self.assertTrue(journal.read_bytes())
+                if install_before_retry:
+                    result = self.run_installer("install")
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    with self.subTest(step="install resolves the removal journal"):
+                        with self.assertRaises(FileNotFoundError):
+                            _ = journal.read_bytes()
+                result = self.run_installer("remove-showrunner-guard")
+
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                if not install_before_retry:
+                    self.assertEqual(self.groups("PreToolUse"), [{"matcher": "apply_patch", "hooks": [custom]},
+                                                                 {"matcher": "Bash", "hooks": [untrusted]}])
+                    self.assertEqual(self.groups("PostToolUse"),
+                                     [{"matcher": "apply_patch", "hooks": [FN_HANDLER, mention]}])
+                retained = self.listed_handlers()
+                expected_retained = {custom["command"]: "trusted", untrusted["command"]: "untrusted",
+                                     FN_COMMAND: "trusted", mention["command"]: "trusted"}
+                if install_before_retry:
+                    result = self.run_installer("check")
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertTrue({pre["command"], post["command"]}.isdisjoint(
+                        entry["command"] for entry in retained))
+                    retained_trust = {entry["command"]: entry["trustStatus"] for entry in retained
+                                      if entry["command"] in expected_retained}
+                else:
+                    retained_trust = {entry["command"]: entry["trustStatus"] for entry in retained}
+                self.assertEqual(retained_trust, expected_retained)
+                self.assertEqual(self.trust(), {
+                    other_source: "other-source-hash",
+                    **{cast(str, entry["key"]): cast(str, entry["currentHash"])
+                       for entry in retained if entry["trustStatus"] == "trusted"},
+                })
+                with self.assertRaises(FileNotFoundError):
+                    _ = journal.read_bytes()
+
+        self.assert_shared_legacy_removal()
+        self.assert_legacy_install_recovery()
+
+    def assert_shared_legacy_removal(self) -> None:
+        alias = self.home / ".codex4"
+        alias.mkdir()
+        alias_registry = alias / "hooks.json"
+        alias_registry.symlink_to(self.hooks_file)
+        config = self.codex_home / "config.toml"
+        (alias / "config.toml").symlink_to(config)
+        self.environment["STUB_ACCOUNT_STATES"] = json.dumps({str(alias): str(self.state_file)})
+        custom = {"type": "command", "command": "legacy removal custom", "timeout": 11}
+        replacement = json.dumps({"hooks": {"PostToolUse": [{"matcher": "apply_patch", "hooks": [custom]}]}})
+        original = json.dumps({"hooks": {"PostToolUse": [
+            {"matcher": "apply_patch", "hooks": [self.guard_handler("post"), custom]},
+        ]}})
+        _ = self.hooks_file.write_text(replacement)
+        listed = next(entry for entry in self.listed_handlers() if entry["command"] == custom["command"])
+        handler_hash = cast(str, listed["currentHash"])
+        primary_new, alias_new = (f"{registry}:post_tool_use:0:0" for registry in (self.hooks_file, alias_registry))
+        primary_old, alias_old = (f"{registry}:post_tool_use:0:1" for registry in (self.hooks_file, alias_registry))
+        unrelated = f"{self.root / 'other-hooks.json'}:stop:0:0"
+        foreign = self.root / "other-hooks.json"
+        marker = self.hooks_file.with_name(".showrunner-guard-removal.json")
+        for stage, representative, published, entries in (
+            ("original", self.codex_home, False, {primary_old: handler_hash, alias_old: handler_hash}),
+            ("partial writes", self.codex_home, False, {primary_old: handler_hash, alias_new: handler_hash}),
+            ("replacement", self.codex_home, True, {primary_new: handler_hash, alias_new: handler_hash}),
+            ("replacement with alias first", alias, True, {primary_new: handler_hash, alias_new: handler_hash}),
+            ("saved revocation before saved proof", self.codex_home, True, {primary_new: handler_hash}),
+            ("alias changes registry", self.codex_home, True, {primary_new: handler_hash}),
+        ):
+            for retry in ("install", "remove-showrunner-guard"):
+                with self.subTest(shared_legacy_removal=stage, retry=retry):
+                    current = replacement if published else original
+                    _ = self.hooks_file.write_text(current)
+                    starting_trust = {**entries, unrelated: "unrelated hash"}
+                    self.save_trust(starting_trust)
+                    proof: dict[str, object] = {
+                        "home": str(representative), "config": str(config), "edits": {
+                            primary_old: None, alias_old: None, primary_new: {"trusted_hash": handler_hash},
+                            alias_new: {"trusted_hash": handler_hash},
+                        },
+                    }
+                    trust: list[dict[str, object]] = [proof]
+                    version = 1
+                    if stage == "saved revocation before saved proof":
+                        version = 4
+                        trust = [
+                            {"home": str(alias), "config": str(config), "retained": [],
+                             "edits": {alias_new: None}, "unproved": {alias_new: {"trusted_hash": handler_hash}}},
+                            {**proof, "retained": [], "unproved": {}},
+                        ]
+                    _ = marker.write_text(json.dumps({
+                        "version": version, "original_hash": hashlib.sha256(original.encode()).hexdigest(),
+                        "registry": replacement, "trust": trust,
+                    }))
+                    saved_journal = marker.read_bytes()
+                    changed = stage == "alias changes registry"
+                    if changed:
+                        _ = foreign.write_text(replacement)
+                        alias_registry.unlink()
+                        alias_registry.symlink_to(foreign)
+                    for attempt in range(2):
+                        try:
+                            recovered = self.run_installer(retry)
+                        finally:
+                            if changed:
+                                alias_registry.unlink()
+                                alias_registry.symlink_to(self.hooks_file)
+                        self.assertEqual(recovered.returncode, 1,
+                                         f"Attempt {attempt + 1}\n{recovered.stdout}{recovered.stderr}")
+                        self.assertEqual(recovered.stdout, "")
+                        self.assertEqual(marker.read_bytes(), saved_journal)
+                        self.assertEqual(self.hooks_file.read_text(), current)
+                        if changed:
+                            self.assertIn("hook or trust destination changed", recovered.stderr)
+                            self.assertEqual(self.trust(), starting_trust)
+                            self.assertEqual(foreign.read_text(), replacement)
+                            break
+                        self.assertIn("legacy journal lacks complete before and after values", recovered.stderr)
+                        suffix = "0" if published else "1"
+                        for home in (self.codex_home, alias):
+                            with mock.patch.object(self, "codex_home", home):
+                                listed = next(entry for entry in self.listed_handlers()
+                                              if entry["command"] == custom["command"])
+                            self.assertEqual((listed["key"], listed["trustStatus"], listed["enabled"]),
+                                             (f"{home / 'hooks.json'}:post_tool_use:0:{suffix}", "untrusted", True))
+                        self.assertEqual(self.trust(), {unrelated: "unrelated hash"})
+        self.assert_scoped_legacy_revocation(alias, marker)
+        alias_registry.unlink()
+        marker.unlink(missing_ok=True)
+
+    def assert_scoped_legacy_revocation(self, alias: Path, marker: Path) -> None:
+        other = self.home / ".codex5"
+        other.mkdir()
+        (other / "hooks.json").symlink_to(self.hooks_file)
+        other_state = self.root / "second-revocation.json"
+        self.environment["STUB_ACCOUNT_STATES"] = json.dumps({
+            str(alias): str(self.state_file), str(other): str(other_state),
+        })
+        keep = {"type": "command", "command": "unchanged sibling", "timeout": 11}
+        moved = {**keep, "command": "moved sibling"}
+        stop = {**keep, "command": "unchanged stop"}
+        group = {"matcher": "apply_patch"}
+        original = json.dumps({"hooks": {
+            "PostToolUse": [{**group, "hooks": [keep, self.guard_handler("post"), moved]}],
+            "Stop": [{"hooks": [stop]}],
+        }})
+        replacement = json.dumps({"hooks": {
+            "PostToolUse": [{**group, "hooks": [keep, moved]}],
+            "Stop": [{"hooks": [stop]}],
+        }})
+        registries = (self.hooks_file, alias / "hooks.json", other / "hooks.json")
+        source, destination, stable, stop_keys, stale = (
+            [f"{registry}:{slot}" for registry in registries]
+            for slot in ("post_tool_use:0:2", "post_tool_use:0:1", "post_tool_use:0:0",
+                         "stop:0:0", "post_tool_use:97:0")
+        )
+        record = {
+            "version": 1, "original_hash": hashlib.sha256(original.encode()).hexdigest(), "registry": replacement,
+            "trust": [{"home": str(self.codex_home), "config": str(self.codex_home / "config.toml"),
+                       "edits": {source[0]: None, destination[0]: {"trusted_hash": "moved hash"}}}],
+        }
+        for scenario, current, active in (
+            ("original registry", original, source),
+            ("published registry", replacement, destination),
+            ("partial revocation", original, source),
+        ):
+            for retry in ("install", "remove-showrunner-guard"):
+                with self.subTest(legacy_revocation=scenario, retry=retry):
+                    for archive in self.codex_home.glob(".codex-hooks-install-recovery-legacy-*.json"):
+                        archive.unlink()
+                    _ = self.hooks_file.write_text(current)
+                    _ = marker.write_text(json.dumps(record))
+                    saved_marker = marker.read_bytes()
+                    hashes = {entry["command"]: cast(str, entry["currentHash"]) for entry in self.listed_handlers()}
+                    retained = {key: hashes[stop["command"]] for key in stop_keys}
+                    if current == original:
+                        retained.update({key: hashes[keep["command"]] for key in stable})
+                    for indexes, state_file in (((0, 1), self.state_file), ((2,), other_state)):
+                        scope = {active[index]: hashes[moved["command"]] for index in indexes}
+                        scope.update({stale[index]: "outdated trust" for index in indexes})
+                        preserved = {key: value for key, value in retained.items()
+                                     if any(key.startswith(f"{registries[index]}:") for index in indexes)}
+                        _ = state_file.write_text(json.dumps({
+                            "trust": {**preserved, **scope},
+                            "disabled": [key for index in indexes for key in (active[index], stop_keys[index])],
+                            "extra_settings": {
+                                key: {"fixture": "keep this field"}
+                                for index in indexes for key in (active[index], stop_keys[index])
+                            },
+                        }))
+                    if scenario == "partial revocation":
+                        stopped = subprocess.run(
+                            [sys.executable, "-c", INTERRUPTED_REMOVAL, f"after trust write:{self.codex_home}:1",
+                             str(marker), str(self.hooks_file), str(INSTALLER), retry],
+                            env=self.environment, text=True, capture_output=True, check=False,
+                            cwd=INSTALLER.resolve().parents[2], timeout=TEST_HANG_GUARD_SECS,
+                        )
+                        self.assertEqual(stopped.returncode, -signal.SIGKILL, stopped.stdout + stopped.stderr)
+                        self.assertEqual(self.trust(), {key: retained[key] for key in (*stable[:2], *stop_keys[:2])})
+                        secondary = cast(dict[str, dict[str, object]], json.loads(other_state.read_text()))
+                        self.assertEqual(secondary["trust"][active[2]], hashes[moved["command"]])
+                        self.assertEqual(secondary["trust"][stale[2]], "outdated trust")
+                    for attempt in range(2):
+                        result = self.run_installer(retry)
+                        self.assertEqual(result.returncode, 1, f"Attempt {attempt + 1}\n{result.stdout}{result.stderr}")
+                        self.assertIn("legacy journal lacks complete before and after values", result.stderr)
+                        self.assertEqual(marker.read_bytes(), saved_marker)
+                        self.assertEqual(self.hooks_file.read_text(), current)
+                        for indexes, state_file in (((0, 1), self.state_file), ((2,), other_state)):
+                            state = cast(dict[str, object], json.loads(state_file.read_text()))
+                            self.assertEqual(state["trust"], {
+                                key: value for key, value in retained.items()
+                                if any(key.startswith(f"{registries[index]}:") for index in indexes)
+                            })
+                            self.assertCountEqual(cast(list[str], state["disabled"]), [
+                                key for index in indexes for key in (active[index], stop_keys[index])
+                            ])
+                            self.assertEqual(state["extra_settings"], {
+                                key: {"fixture": "keep this field"}
+                                for index in indexes for key in (active[index], stop_keys[index])
+                            })
+                    archive, = self.codex_home.glob(".codex-hooks-install-recovery-legacy-*.json")
+                    saved = cast(dict[str, object], json.loads(archive.read_text()))
+                    archived = cast(dict[str, dict[str, object]], saved["revoked"])
+                    self.assertEqual({key for config in archived.values() for key in config}, {*active, *stale})
+        configs = ((self.codex_home, self.state_file, registries[1]), (other, other_state, registries[2]))
+        cases = (
+            ("config-local Stop", 0, False, False),
+            ("config-local Stop reversed", 1, False, False),
+            ("config-local aliases", 0, True, False),
+            ("config-local partial retry", 1, True, True),
+        )
+        for scenario, affected, use_aliases, interrupt in cases:
+            for current, active_key in ((original, source[0]), (replacement, destination[0])):
+                for retry in ("install", "remove-showrunner-guard"):
+                    with self.subTest(legacy_v5=scenario, published=current == replacement, retry=retry):
+                        for archive in self.codex_home.glob(".codex-hooks-install-recovery-legacy-*.json"):
+                            archive.unlink()
+                        _ = self.hooks_file.write_text(current)
+                        hashes = {entry["command"]: cast(str, entry["currentHash"]) for entry in self.listed_handlers()}
+                        moved_hash = hashes[moved["command"]]
+                        plans: dict[str, object] = {}
+                        expected_revoked: dict[str, dict[str, dict[str, object]]] = {}
+                        expected_preserved: dict[str, dict[str, dict[str, object]]] = {}
+                        initial_trust: dict[Path, dict[str, str]] = {}
+                        final_states: dict[Path, dict[str, object]] = {}
+                        for index, (home, state_file, registry_alias) in enumerate(configs):
+                            config = str(home / "config.toml")
+                            revoked_settings: dict[str, dict[str, object]] = {active_key: {"trusted_hash": moved_hash}}
+                            stop_spellings = [stop_keys[0]]
+                            if use_aliases:
+                                stop_spellings.append(f"{registry_alias}:stop:0:0")
+                            extra = {"fixture": f"saved value for {home.name}"}
+                            stop_settings: dict[str, dict[str, object]] = {
+                                key: {"trusted_hash": hashes[stop["command"]], "enabled": False, **extra}
+                                for key in stop_spellings
+                            }
+                            edits: dict[str, object] = {source[0]: None, destination[0]: {"trusted_hash": moved_hash}}
+                            if index == affected:
+                                edits[stop_spellings[-1]] = None
+                                revoked_settings.update(stop_settings)
+                            known_homes = [str(home), str(alias)] if index == 0 else [str(home)]
+                            plans[config] = {
+                                "registry": str(self.hooks_file), "homes": known_homes, "edits": edits,
+                                "retained": {}, "unproved": {}, "audit": [],
+                            }
+                            expected_revoked[config] = revoked_settings
+                            expected_preserved[config] = stop_settings if index != affected else {}
+                            stop_trust = dict.fromkeys(stop_spellings, hashes[stop["command"]])
+                            initial_trust[state_file] = {active_key: moved_hash, **stop_trust}
+                            final_states[state_file] = {
+                                "trust": stop_trust if index != affected else {},
+                                "disabled": stop_spellings, "extra_settings": dict.fromkeys(stop_spellings, extra),
+                            }
+                            _ = state_file.write_text(json.dumps({
+                                **final_states[state_file], "trust": initial_trust[state_file],
+                            }))
+                        journal = {
+                            "version": 5, "original_hash": hashlib.sha256(original.encode()).hexdigest(),
+                            "registry": replacement, "configs": plans,
+                        }
+                        _ = marker.write_text(json.dumps(journal))
+                        saved_marker = marker.read_bytes()
+                        if interrupt:
+                            stopped = subprocess.run(
+                                [sys.executable, "-c", INTERRUPTED_REMOVAL, f"after trust write:{self.codex_home}:1",
+                                 str(marker), str(self.hooks_file), str(INSTALLER), retry],
+                                env=self.environment, text=True, capture_output=True, check=False,
+                                cwd=INSTALLER.resolve().parents[2], timeout=TEST_HANG_GUARD_SECS,
+                            )
+                            self.assertEqual(stopped.returncode, -signal.SIGKILL, stopped.stdout + stopped.stderr)
+                            self.assertEqual(self.trust(), final_states[self.state_file]["trust"])
+                            secondary = cast(dict[str, object], json.loads(other_state.read_text()))
+                            self.assertEqual(secondary["trust"], initial_trust[other_state])
+                        next_retry = "remove-showrunner-guard" if retry == "install" else "install"
+                        archived_bytes = b""
+                        for command in (retry, next_retry):
+                            result = self.run_installer(command)
+                            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                            self.assertIn("legacy journal lacks complete before and after values", result.stderr)
+                            self.assertEqual(marker.read_bytes(), saved_marker)
+                            self.assertEqual(self.hooks_file.read_text(), current)
+                            for _, state_file, _ in configs:
+                                state = cast(dict[str, object], json.loads(state_file.read_text()))
+                                self.assertEqual({field: state[field] for field in final_states[state_file]},
+                                                 final_states[state_file])
+                            archive, = self.codex_home.glob(".codex-hooks-install-recovery-legacy-*.json")
+                            evidence = cast(dict[str, object], json.loads(archive.read_text()))
+                            self.assertEqual(evidence["revoked"], expected_revoked)
+                            self.assertEqual(evidence["preserved"], expected_preserved)
+                            if archived_bytes:
+                                self.assertEqual(archive.read_bytes(), archived_bytes)
+                            archived_bytes = archive.read_bytes()
+        (other / "hooks.json").unlink()
+
+    def assert_legacy_install_recovery(self) -> None:
+        retired = {"type": "command", "command": RETIRED_COMMAND, "timeout": 99}
+        unique = {"type": "command", "command": "custom unique", "timeout": 15}
+        duplicate = {**unique, "command": "custom ambiguous"}
+        post = self.guard_handler("post")
+        original = json.dumps({"hooks": {"PostToolUse": [
+            {"matcher": "apply_patch", "hooks": [retired, unique]},
+            {"matcher": "apply_patch", "hooks": [retired, duplicate, duplicate]},
+            {"matcher": "apply_patch", "hooks": [post]},
+        ]}})
+        replacement = json.dumps({"hooks": {"PostToolUse": [
+            {"matcher": "apply_patch", "hooks": [unique]},
+            {"matcher": "apply_patch", "hooks": [duplicate, duplicate]},
+            {"matcher": "apply_patch", "hooks": [post]},
+        ]}})
+        _ = self.hooks_file.write_text(original)
+        entries = {entry["key"]: entry for entry in self.listed_handlers()}
+        unique_slot = f"{self.hooks_file}:post_tool_use:0"
+        duplicate_slot = f"{self.hooks_file}:post_tool_use:1"
+        unique_hash = cast(str, entries[f"{unique_slot}:1"]["currentHash"])
+        duplicate_hash = cast(str, entries[f"{duplicate_slot}:1"]["currentHash"])
+        initial = {f"{unique_slot}:1": unique_hash, f"{duplicate_slot}:1": duplicate_hash,
+                   f"{duplicate_slot}:0": duplicate_hash}
+        self.save_trust(initial)
+        record: dict[str, object] = {
+            "version": 1, "home": str(self.codex_home), "config": str(self.codex_home / "config.toml"),
+            "original_hash": hashlib.sha256(original.encode()).hexdigest(),
+            "registry_hash": hashlib.sha256(replacement.encode()).hexdigest(),
+            "trust": [entry for entry in self.listed_handlers() if entry["trustStatus"] == "trusted"],
+        }
+        journal = self.hooks_file.with_name(".codex-hooks-install.json")
+        for name, current, retry in (
+            ("original", original, "remove-showrunner-guard"),
+            ("replaced", replacement, "install"),
+            ("replaced", replacement, "remove-showrunner-guard"),
+            ("archived", replacement, "remove-showrunner-guard"),
+            ("unrelated", replacement + "\n", "install"),
+            ("unrelated", replacement + "\n", "remove-showrunner-guard"),
+            ("retargeted config", original, "install"),
+        ):
+            with self.subTest(legacy=name, retry=retry):
+                for evidence in self.codex_home.glob(".codex-hooks-install-recovery-*.json"):
+                    evidence.unlink()
+                _ = self.hooks_file.write_text(current)
+                self.save_trust(initial)
+                recorded = {**record, "config": str(self.root / "wrong.toml")} if name == "retargeted config" else record
+                _ = journal.write_text(json.dumps(recorded))
+                if name == "archived":
+                    stopped = subprocess.run(
+                        [sys.executable, "-c", INTERRUPTED_REMOVAL, "after recovery record",
+                         str(journal), str(self.hooks_file), str(INSTALLER), "install"],
+                        env=self.environment, text=True, capture_output=True, check=False,
+                        cwd=INSTALLER.resolve().parents[2], timeout=TEST_HANG_GUARD_SECS,
+                    )
+                    self.assertEqual(stopped.returncode, -signal.SIGKILL, stopped.stdout + stopped.stderr)
+                    self.assertEqual(json.loads(journal.read_text()), record)
+                    self.assertEqual(self.trust(), initial)
+                result = self.run_installer(retry)
+                if name in {"unrelated", "retargeted config"}:
+                    self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                    reason = ("registry matches neither legacy install hash" if name == "unrelated"
+                              else "hook or trust destination changed")
+                    self.assertIn(reason, result.stderr)
+                    self.assertEqual(self.hooks_file.read_text(), current)
+                    self.assertEqual(self.trust(), initial)
+                    self.assertEqual(json.loads(journal.read_text()), recorded)
+                    continue
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertEqual(result.stdout, "")
+                self.assertIn("legacy journal lacks complete before and after values", result.stderr)
+                self.assertEqual(self.hooks_file.read_text(), current)
+                self.assertEqual(self.trust(), {})
+                self.assertEqual(json.loads(journal.read_text()), record)
+                self.assertEqual([(entry["command"], entry["trustStatus"]) for entry in self.listed_handlers()
+                                  if entry["command"] != RETIRED_COMMAND],
+                                 [(unique["command"], "untrusted"), (duplicate["command"], "untrusted"),
+                                  (duplicate["command"], "untrusted"), (post["command"], "untrusted")])
+                evidence, = self.codex_home.glob(".codex-hooks-install-recovery-*.json")
+                saved = cast(dict[str, object], json.loads(evidence.read_text()))
+                self.assertEqual(saved["journal"], record)
+                self.assertEqual(saved["revoked"], {
+                    str(self.codex_home / "config.toml"): {key: {"trusted_hash": value} for key, value in initial.items()},
+                })
+
+        self.assert_shared_legacy_recovery(journal, original, replacement, record, initial, unique_hash, duplicate_hash)
+
+    def assert_shared_legacy_recovery(
+        self, journal: Path, original: str, replacement: str, record: dict[str, object],
+        initial: dict[str, str], unique_hash: str, duplicate_hash: str,
+    ) -> None:
+        linked_home = self.home / ".codex2"
+        linked_home.mkdir()
+        linked_hooks = linked_home / "hooks.json"
+        linked_hooks.symlink_to(self.hooks_file)
+        linked_state = self.root / "legacy-linked-state.json"
+        linked_config = linked_home / "config.toml"
+        executable = self.root / "bin/codex"
+        _ = executable.write_text(RECOVERY_STUB.replace("__PYTHON__", sys.executable))
+        shared_config = self.codex_home / "config.toml"
+        other_key = f"{self.root / 'other-hooks.json'}:stop:0:0"
+        for scenario, stop_point, fault in (
+            ("original", "", ""),
+            ("separate configs", "", ""),
+            ("shared config", "", ""),
+            ("canonical and alias keys", "", ""),
+            ("saved evidence", "after recovery record", ""),
+            ("between home writes", "after trust write", ""),
+            ("before removal", "before journal removal", ""),
+            ("second read fails", "", "STUB_FAILED_READ"),
+            ("second write is unsaved", "", "STUB_UNSAVED_WRITE"),
+            ("second config changes", "after recovery record", "retarget"),
+            ("new trust before verification", "", "new trust"),
+        ):
+            for retry in ("install", "remove-showrunner-guard"):
+                with self.subTest(shared_legacy=scenario, retry=retry):
+                    for evidence in self.codex_home.glob(".codex-hooks-install-recovery-*.json"):
+                        evidence.unlink()
+                    linked_config.unlink(missing_ok=True)
+                    if scenario == "shared config":
+                        linked_config.symlink_to(shared_config)
+                    current = original if scenario == "original" else replacement
+                    _ = self.hooks_file.write_text(current)
+                    _ = journal.write_text(json.dumps(record))
+                    second_file = self.state_file if scenario == "shared config" else linked_state
+                    self.environment["STUB_ACCOUNT_STATES"] = json.dumps({str(linked_home): str(second_file)})
+                    first_prefix = f"{self.hooks_file}:post_tool_use"
+                    second_prefix = f"{linked_hooks}:post_tool_use"
+                    first_stale = f"{first_prefix}:88:0"
+                    second_stale = f"{second_prefix}:88:0"
+                    canonical_only = {f"{first_prefix}:94:0": "old canonical hash", f"{first_prefix}:0:0": unique_hash}
+                    added_key = f"{first_prefix}:95:0"
+                    disabled = f"{second_prefix}:0:0"
+                    first = {**initial, other_key: "other-source-hash"}
+                    second = {other_key: "other-source-hash"}
+                    if scenario == "original":
+                        second[f"{second_prefix}:1:2"] = duplicate_hash
+                    else:
+                        first[first_stale] = "old-first-hash"
+                        second.update({second_stale: "old-second-hash", f"{second_prefix}:1:0": duplicate_hash,
+                                       disabled: unique_hash})
+                        if scenario == "canonical and alias keys":
+                            second.update(canonical_only)
+                    if second_file == self.state_file:
+                        first.update(second)
+                    _ = self.state_file.write_text(json.dumps({"trust": first,
+                                                               "disabled": [disabled] if second_file == self.state_file else []}))
+                    if second_file != self.state_file:
+                        _ = second_file.write_text(json.dumps({"trust": second,
+                                                               "disabled": [] if scenario == "original" else [disabled]}))
+                    if stop_point:
+                        stopped = subprocess.run(
+                            [sys.executable, "-c", INTERRUPTED_REMOVAL, stop_point,
+                             str(journal), str(self.hooks_file), str(INSTALLER), retry],
+                            env=self.environment, text=True, capture_output=True, check=False,
+                            cwd=INSTALLER.resolve().parents[2], timeout=TEST_HANG_GUARD_SECS,
+                        )
+                        if stop_point == "before journal removal":
+                            self.assertEqual(stopped.returncode, 1, stopped.stdout + stopped.stderr)
+                            self.assertIn("legacy journal lacks complete before and after values", stopped.stderr)
+                            self.assertEqual(json.loads(journal.read_text()), record)
+                        else:
+                            self.assertEqual(stopped.returncode, -signal.SIGKILL, stopped.stdout + stopped.stderr)
+                    if fault:
+                        if fault == "retarget":
+                            linked_config.symlink_to(self.root / "other-config.toml")
+                            try:
+                                refused = self.run_installer(retry)
+                            finally:
+                                linked_config.unlink()
+                            reason = "hook or trust destination changed"
+                        elif fault == "new trust":
+                            with mock.patch.dict(self.environment, {"STUB_COVERAGE_HOME": str(linked_home),
+                                                                    "STUB_COVERAGE_KEY": added_key}):
+                                refused = self.run_installer(retry)
+                            reason = "uncovered hook trust"
+                        else:
+                            with mock.patch.dict(self.environment, {fault: str(linked_home)}):
+                                refused = self.run_installer(retry)
+                            reason = ("fixture config read failed" if fault == "STUB_FAILED_READ"
+                                      else "saved hook trust does not match the journal")
+                        self.assertEqual(refused.returncode, 1, refused.stdout + refused.stderr)
+                        self.assertIn(reason, refused.stderr)
+                        self.assertTrue(journal.read_bytes())
+                        failed_state = cast(dict[str, dict[str, object]], json.loads(second_file.read_text()))
+                        if fault == "new trust":
+                            self.assertEqual(failed_state["trust"][added_key], "added after planning")
+                        else:
+                            self.assertEqual(failed_state["trust"][second_stale], "old-second-hash")
+                    recovered = self.run_installer(retry)
+                    self.assertEqual(recovered.returncode, 1, recovered.stdout + recovered.stderr)
+                    self.assertEqual(recovered.stdout, "")
+                    self.assertIn("legacy journal lacks complete before and after values", recovered.stderr)
+                    self.assertEqual(self.hooks_file.read_text(), current)
+                    for home, state_file, stale in ((self.codex_home, self.state_file, first_stale),
+                                                    (linked_home, second_file, second_stale)):
+                        with mock.patch.object(self, "codex_home", home):
+                            entries = self.listed_handlers()
+                        status = [(entry["trustStatus"], entry["enabled"]) for entry in entries
+                                  if entry["command"] in {"custom unique", "custom ambiguous"}]
+                        primary = home == self.codex_home
+                        expected = [("untrusted", True), ("untrusted", True), ("untrusted", True)]
+                        if scenario != "original" and not primary:
+                            expected[0] = ("untrusted", False)
+                        self.assertEqual(status, expected, home)
+                        state = cast(dict[str, object], json.loads(state_file.read_text()))
+                        trust = cast(dict[str, str], state["trust"])
+                        self.assertNotIn(stale, trust)
+                        self.assertEqual(trust, {other_key: "other-source-hash"})
+                        if scenario == "canonical and alias keys" and not primary:
+                            self.assertEqual(state["disabled"], [disabled])
+                        for entry in entries:
+                            if entry["command"] in {"custom unique", "custom ambiguous"}:
+                                key = cast(str, entry["key"])
+                                expected_hash = entry["currentHash"] if entry["trustStatus"] == "trusted" else None
+                                self.assertEqual(trust.get(key), expected_hash)
+                    archive, = self.codex_home.glob(".codex-hooks-install-recovery-*.json")
+                    evidence = cast(dict[str, object], json.loads(archive.read_text()))
+                    if fault == "new trust":
+                        second[added_key] = "added after planning"
+                    revoked: dict[str, dict[str, object]] = {
+                        str(shared_config): {key: {"trusted_hash": value} for key, value in first.items() if key != other_key},
+                    }
+                    config = str(shared_config if second_file == self.state_file else linked_config)
+                    revoked.setdefault(config, {}).update(
+                        (key, {"trusted_hash": value, **({"enabled": False} if key == disabled else {})})
+                        for key, value in second.items() if key != other_key
+                    )
+                    self.assertEqual(evidence["revoked"], revoked)
+                    self.assertEqual(json.loads(journal.read_text()), record)
+
+    def guard_handler(self, event_prefix: str) -> dict[str, object]:
+        command = ('"$HOME/.claude/scripts/lib/py" '
+                   f'"$HOME/.claude/scripts/hooks/{event_prefix}-tool-use-showrunner-guard-codex.py"')
+        return {"type": "command", "command": command, "timeout": 20}
+
+    def test_remove_showrunner_guard_keeps_trust_in_each_home_that_shares_hooks(self) -> None:
+        linked_home = self.home / ".codex2"
+        linked_home.mkdir()
+        linked_hooks = linked_home / "hooks.json"
+        linked_hooks.symlink_to(self.hooks_file)
+        linked_state = self.root / "linked-state.json"
+        self.environment["STUB_ACCOUNT_STATES"] = json.dumps({str(linked_home): str(linked_state)})
+        _ = self.hooks_file.write_text(json.dumps({"hooks": {"PostToolUse": [
+            {"matcher": "apply_patch", "hooks": [self.guard_handler("post"), FN_HANDLER]},
+        ]}}))
+        for home, state_file in ((self.codex_home, self.state_file), (linked_home, linked_state)):
+            with mock.patch.object(self, "codex_home", home):
+                entries = self.listed_handlers()
+            _ = state_file.write_text(json.dumps({"trust": {entry["key"]: entry["currentHash"] for entry in entries}}))
+
+        result = self.run_installer("remove-showrunner-guard")
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(os.readlink(linked_hooks), str(self.hooks_file))
+        for home in (self.codex_home, linked_home):
+            with self.subTest(home=home), mock.patch.object(self, "codex_home", home):
+                self.assertEqual([(entry["command"], entry["trustStatus"]) for entry in self.listed_handlers()],
+                                 [(FN_COMMAND, "trusted")])
+
+    def test_remove_showrunner_guard_continues_after_an_invalid_registry(self) -> None:
+        invalid = self.home / ".codex"
+        invalid.mkdir()
+        invalid_hooks = invalid / "hooks.json"
+        initial_hooks = json.dumps({"hooks": {"PostToolUse": [
+            {"matcher": "apply_patch", "hooks": [self.guard_handler("post"), FN_HANDLER]},
+        ]}})
+        for invalid_kind in ("malformed JSON", "named pipe"):
+            with self.subTest(invalid_registry=invalid_kind):
+                _ = self.hooks_file.write_text(initial_hooks)
+                invalid_hooks.unlink(missing_ok=True)
+                if invalid_kind == "named pipe":
+                    os.mkfifo(invalid_hooks)
+                    try:
+                        result = subprocess.run(
+                            [sys.executable, str(INSTALLER), "remove-showrunner-guard"],
+                            env=self.environment, text=True, capture_output=True, check=False, timeout=10,
+                        )
+                    except subprocess.TimeoutExpired:
+                        self.fail("Removal blocked on a named pipe before processing the valid registry.")
+                    self.assertTrue(stat.S_ISFIFO(invalid_hooks.stat().st_mode))
+                else:
+                    _ = invalid_hooks.write_text("{\n")
+                    result = self.run_installer("remove-showrunner-guard")
+                    self.assertEqual(invalid_hooks.read_text(), "{\n")
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertEqual(sum(str(invalid_hooks) in line for line in result.stderr.splitlines()), 1, result.stderr)
+                self.assertEqual(self.groups(), [{"matcher": "apply_patch", "hooks": [FN_HANDLER]}])
+
+    def test_remove_showrunner_guard_includes_the_numbered_home_for_the_default_login(self) -> None:
+        default = self.home / ".codex"
+        default.mkdir()
+        numbered = self.home / ".codex2"
+        numbered.mkdir()
+        login = "fixture@example.invalid"
+        claims = base64.urlsafe_b64encode(json.dumps({"email": login}).encode()).decode()
+        _ = (default / "auth.json").write_text(json.dumps({"tokens": {"id_token": f"x.{claims}.y"}}))
+        notes = self.root / "notes"
+        notes.mkdir()
+        _ = (notes / "codex2.md").write_text(f"---\nlogin: {login}\n---\n")
+        self.environment["AGENT_NOTES_DIR"] = str(notes)
+        registry = numbered / "hooks.json"
+        initial_hooks = json.dumps({"hooks": {"PostToolUse": [
+            {"matcher": "apply_patch", "hooks": [self.guard_handler("post"), FN_HANDLER]},
+        ]}})
+        for explicit_home in (self.codex_home, numbered):
+            with self.subTest(explicit_home=explicit_home):
+                self.environment["CODEX_HOME"] = str(explicit_home)
+                _ = registry.write_text(initial_hooks)
+
+                result = self.run_installer("remove-showrunner-guard")
+
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(cast(object, json.loads(registry.read_text())), {
+                    "hooks": {"PostToolUse": [{"matcher": "apply_patch", "hooks": [FN_HANDLER]}]},
+                })
+
+
+class ShowrunnerGuardCodexTests(GuardFixture):
+    def run_registered_guard(self, tool: str, fields: dict[str, object]) -> subprocess.CompletedProcess[str]:
+        fixture_hooks = (codex_hooks.SHOWRUNNER_GUARD,)
+        hook = next(hook for hook in fixture_hooks if hook.event == "PreToolUse" and re.fullmatch(hook.matcher, tool))
+        path = shlex.split(hook.command)[-1].replace("$HOME/.claude", str(INSTALLER.resolve().parents[2]))
+        return self.run_front(path, tool, fields, cwd=self.root)
+
+    def test_fixture_registration_guards_bash_and_all_patch_headers(self) -> None:
+        target = "home/.claude/target.txt"
+        outside = "outside/target.txt"
+        cases = (
+            ("add", f"*** Add File: {target}\n+fixture", target),
+            ("delete", f"*** Delete File: {target}", target),
+            ("move destination", f"*** Update File: {outside}\n*** Move to: {target}\n@@\n-old\n+new", target),
+            ("move source", f"*** Update File: {target}\n*** Move to: {outside}\n@@\n-old\n+new", target),
+            ("later target", f"*** Add File: {outside}\n+fixture\n*** Delete File: {target}", target),
+            ("outside", f"*** Add File: {outside}\n+fixture", ""),
+        )
+        for case, body, protected in cases:
+            with self.subTest(case=case):
+                result = self.run_registered_guard("apply_patch", {"command": f"*** Begin Patch\n{body}\n*** End Patch\n"})
+                if protected:
+                    self.assertIn(str(self.root / protected), self.assert_deny(result))
+                else:
+                    self.assert_allow(result)
+        command = shlex.join(["git", "-C", str(self.main), "add", "target.txt"])
+        _ = self.assert_deny(self.run_registered_guard("Bash", {"command": command}))
 
 
 if __name__ == "__main__":

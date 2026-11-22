@@ -80,6 +80,23 @@ class CopyPolicyHook:
 
 
 @dataclass(frozen=True)
+class ShowrunnerGuardHook:
+    """The dispatcher gives the guard time to report its own policy deadline."""
+
+    filename: str = "showrunner_guard.py"
+    matcher: str = "Bash|Edit|Write|NotebookEdit|MultiEdit|Agent"
+
+    @property
+    def timeout(self) -> float:
+        from scripts.hooks.showrunner_guard import hook_timeout
+
+        return hook_timeout()
+
+
+SHOWRUNNER_GUARD = ShowrunnerGuardHook()
+
+
+@dataclass(frozen=True)
 class HookResult:
     filename: str
     exit_code: int
@@ -414,12 +431,16 @@ def _merge_permissions(specifics: Sequence[dict[str, object]], merged: dict[str,
 
 def combine_results(event: str, results: Sequence[HookResult]) -> DispatchResult:
     """Combine script outcomes using the explicit policy in this module's docstring."""
+    guard_reports = [
+        line for result in results if result.filename == SHOWRUNNER_GUARD.filename and result.exit_code == 0
+        for line in result.stderr.splitlines() if line.startswith("showrunner guard: unknown ")
+    ]
     refusals = [result.stderr.rstrip("\n") for result in results if result.exit_code == 2]
     if refusals:
-        return DispatchResult(2, "", "\n\n".join(refusals))
+        return DispatchResult(2, "", "\n\n".join((*refusals, *guard_reports)))
     documents: list[dict[str, object]] = []
     names: list[str] = []
-    debug: list[str] = []
+    debug = guard_reports
     for result in results:
         invalid = False
         document: dict[str, object] = {}

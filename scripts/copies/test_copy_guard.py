@@ -9,12 +9,13 @@ import os
 from pathlib import Path
 import shlex
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest import mock
 from typing import ClassVar, cast, override
 
-from scripts.copies import copies, copy_guard
+from scripts.copies import copies, copy_guard, shell_syntax
 from scripts.production.cli_fixture import ImmutableGitSeed
 
 
@@ -121,6 +122,7 @@ class RecordedPolicyCase:
     provenance: str
     command: str | list[str]
     expected: str
+    command_visits: tuple[tuple[str, ...], ...] = ()
 
 
 def ordinary_agent_corpus() -> tuple[RecordedPolicyCase, ...]:
@@ -232,8 +234,162 @@ def invocation_semantic_cases() -> tuple[RecordedPolicyCase, ...]:
                  for name, command, expected in programs)
 
 
+def heredoc_policy_cases() -> tuple[RecordedPolicyCase, ...]:
+    body = "$X\n" * 4096
+    budget_reason = "unresolved relevant operation: the shell target scan reached its work limit"
+    closed_reason = "unresolved relevant operation: interpreter stdin is closed"
+    interpreter = f"bash -s 3<<DOC 0<&3\n{body}DOC"
+    python = ("import subprocess; subprocess.run(['bash', '-c', 'bash -s 0<&-']); "
+              f"subprocess.run(['bash', '-c', {interpreter!r}])")
+    cases: tuple[tuple[str, str | list[str], str], ...] = (
+        ("heredoc-data-needs-no-render", f"cat <<DOC\n{body}DOC", ""),
+        ("heredoc-data-keeps-earlier-refusal", f"git clone source destination; cat <<DOC\n{body}DOC", "git clone"),
+        ("heredoc-interpreter-render-limit", interpreter, budget_reason),
+        ("heredoc-refusal-before-render-limit", f"bash -s <<DOC\n$(git clone source destination)\n{body}DOC", "git clone"),
+        ("heredoc-unresolved-before-render-limit", f"bash -s <<DOC\n$(bash -s 0<&-)\n{body}DOC", closed_reason),
+        ("python-nested-heredoc-budget", ["python3", "-c", python], closed_reason),
+        ("heredoc-quoted-delimiter", "python3 - <<'DOC'\n# $(git clone source destination)\npass\nDOC", ""),
+        ("heredoc-escaped-dollar", "python3 - <<DOC\n# \\$(git clone source destination)\npass\nDOC", ""),
+        ("heredoc-tabs-and-mixed-text",
+         "python3 - <<-DOC\n\timport subprocess\n" + "\tsubprocess.run(['git', 'clone', '$X', 'destination'])\n\tDOC",
+         "git clone"),
+    )
+    return tuple(RecordedPolicyCase(name, "generated heredoc inspection", command, expected)
+                 for name, command, expected in cases)
+
+
+def completed_shell_policy_cases(padding: int) -> tuple[RecordedPolicyCase, ...]:
+    cases = (
+        ("completed-nested-refusal", "bash -c 'git clone a b'", "git clone"),
+        ("completed-nested-unresolved", "bash -c 'bash -s 0<&-'",
+         "unresolved relevant operation: interpreter stdin is closed"),
+        ("completed-harmless-prefix", "bash -c true",
+         "unresolved relevant operation: the shell target scan reached its work limit"),
+        ("completed-after-syntax-error", ")\nbash -c 'git clone a b'", "git clone"),
+        ("completed-compound-state", """if true; then script='git clone a b'; else script='git status'; fi; bash -c "$script" """,
+         "git clone"),
+        ("completed-recovered-heredoc", ")\nbash -s <<'DOC'; printf marker\ngit clone a b\nDOC", "git clone"),
+    )
+    body = "x" * padding + "\nLATE"
+    budget_reason = "unresolved relevant operation: the shell target scan reached its work limit"
+    closed_stdin = "unresolved relevant operation: interpreter stdin is closed"
+    heredocs = (
+        ("completed-heredoc-refusal", "bash -s first <<'DOC'; cat <<'LATE'\ngit clone a b\nDOC", "git clone"),
+        ("completed-heredoc-unresolved", "bash -s first <<'DOC'; cat <<'LATE'\nbash -s 0<&-\nDOC", closed_stdin),
+        ("completed-heredoc-harmless", "bash -s first <<'DOC'; cat <<'LATE'\ntrue\nDOC", budget_reason),
+        ("completed-heredoc-two-inputs",
+         "bash -s first <<'START' <<'DOC'; cat <<'LATE'\n# data\nSTART\ngit clone a b\nDOC", "git clone"),
+        ("completed-heredoc-pipeline",
+         "printf pipe | bash -s first <<'DOC'; cat <<'LATE'\ngit clone a b\nDOC", "git clone"),
+        ("completed-heredoc-compound",
+         "{ bash -s first <<'DOC'; }; cat <<'LATE'\ngit clone a b\nDOC", "git clone"),
+        ("completed-heredoc-before-compound",
+         "bash -s first <<'DOC'; { cat <<'LATE'\ngit clone a b\nDOC", "git clone"),
+    )
+    bounded = tuple((name, f"{source}\n# " + "x" * padding, expected) for name, source, expected in cases)
+    with_heredocs = tuple(
+        (name, f"{source}\n{body}" + ("\n}" if name == "completed-heredoc-before-compound" else ""), expected)
+        for name, source, expected in heredocs
+    )
+    return tuple(RecordedPolicyCase(name, "completed shell inspection", f"printf once; {source}", expected)
+                 for name, source, expected in (*bounded, *with_heredocs))
+
+
+def malformed_shell_policy_cases() -> tuple[RecordedPolicyCase, ...]:
+    closed_stdin = "unresolved relevant operation: interpreter stdin is closed"
+    cases = (
+        ("refusal-before-malformed", "bash -c 'git clone a b'; )", "git clone"),
+        ("harmless-before-malformed", r"echo $'\q'; git status", ""),
+        ("malformed-heredoc-before-closing-operator", "cat <<DOC; git clone a b; )\n", "git clone"),
+        ("malformed-before-refusal", r"echo $'\q'; bash -c 'git clone a b'", "git clone"),
+        ("parser-error-same-line", ") git clone a b", "git clone"),
+        ("parser-error-consumed-compound", "(git clone a b", "git clone"),
+        ("completed-before-parser-error", "git clone a b )", "git clone"),
+        ("lexer-then-parser-error", r"echo $'\q'; ) git clone a b", "git clone"),
+        ("parser-error-before-heredoc", ") bash -s <<'DOC'\ngit clone a b\nDOC", "git clone"),
+        ("recovery-before-budget-limit", ") git clone a b\n# " + "x" * 140_000, "git clone"),
+    )
+    clone = ("git", "clone", "a", "b")
+    inline_owner = ("bash", "-c", "git clone a b")
+    stdin_owner = ("bash", "-s")
+    inline = "bash -c 'git clone a b' <<EOF"
+    unfinished = "\ngit clone ignored destination"
+    complete = "\ngit clone a b\nDOC"
+    nested = "bash -s 0<&-"
+    nested_owner = ("bash", "-c", nested)
+    nested_recovery = ") " + nested
+    python = 'import subprocess; subprocess.run("bash -s 0<&-", shell=True)'
+    long_script = "git clone a b; # " + "x" * 180
+    separators = (
+        ("trailing-pipe", nested + " |"),
+        ("leading-pipe", "| " + nested),
+        ("pipe-before-semicolon", nested + " | ;"),
+    )
+    nested_separators = tuple(
+        (f"{name}-{location}", source, closed_stdin, (owner, stdin_owner))
+        for name, command in separators
+        for location, source, owner in (
+            ("shell", shlex.join(("bash", "-c", command)), ("bash", "-c", command)),
+            ("substitution", f"echo $({command})", ("echo", shell_syntax.UNKNOWN_VALUE)),
+            ("backticks", f"echo `{command}`", ("echo", shell_syntax.UNKNOWN_VALUE)),
+            ("heredoc", f"cat <<DOC\n$({command})\nDOC", ("cat",)),
+        )
+    )
+    visit_cases = (
+        *((name, source, closed_stdin, (stdin_owner,)) for name, source in separators),
+        *nested_separators,
+        ("trailing-pipe-and", nested + " |&", closed_stdin, (stdin_owner,)),
+        ("double-pipe-operator", nested + " | |&", closed_stdin, (stdin_owner,)),
+        ("pipe-before-newline", nested + " |\n", closed_stdin, (stdin_owner,)),
+        ("pipe-before-close-paren", f"({nested} |)", closed_stdin, (stdin_owner,)),
+        ("pipe-before-close-brace", f"{{ {nested} | }}", closed_stdin, (stdin_owner,)),
+        ("pipe-before-fi", f"if true; then {nested} | fi", closed_stdin, (("true",), stdin_owner, ("true",))),
+        ("pipe-before-done", f"while true; do {nested} | done", closed_stdin, (("true",), stdin_owner)),
+        ("pipe-before-esac", f"case x in x) {nested} | esac", closed_stdin, (stdin_owner,)),
+        ("array-with-pending-heredoc", "bash -s <<'EOF' 0<&- values=(\nitem\n)\nEOF", closed_stdin,
+         (("bash", "-s", "values=" + shell_syntax.UNKNOWN_VALUE),)),
+        ("unclosed-array", nested + " values=(", "", (stdin_owner,)),
+        ("quoted-embedded-segment", nested + " ${x:-'$('}", "", (stdin_owner,)),
+        ("unterminated-heredoc-inline-eof", inline, "git clone", (inline_owner, clone)),
+        ("unterminated-heredoc-inline-body", inline + unfinished, "git clone", (inline_owner, clone)),
+        ("unterminated-heredoc-stdin-body", "bash -s <<EOF" + unfinished, "", (stdin_owner,)),
+        ("unterminated-heredoc-expansion", "cat <<EOF\n$(git clone a b)", "", (("cat",),)),
+        ("parser-error-before-unterminated-heredoc", ") " + inline, "git clone", (inline_owner, clone)),
+        ("complete-heredoc-before-incomplete", "bash -s <<DOC 3<<EOF" + complete + unfinished,
+         "git clone", (stdin_owner, clone)),
+        ("incomplete-heredoc-replaces-complete", "bash -s <<DOC <<EOF" + complete + unfinished,
+         "", (stdin_owner,)),
+        ("delimited-heredoc-with-invalid-expansion", "bash -s <<DOC\ngit clone a b\n# $(\nDOC",
+         "git clone", (stdin_owner, clone)),
+        ("unterminated-heredoc-closed-stdin", "bash -s <<EOF 0<&-\nplain text", "", (stdin_owner,)),
+        ("recovered-buffered-unresolved", nested + " )", "", (stdin_owner,)),
+        ("recovered-unresolved-before-refusal", nested_recovery + "; git clone a b", "git clone", (stdin_owner, clone)),
+        ("unresolved-before-malformed", nested + "; )", closed_stdin, (stdin_owner,)),
+        ("recovered-nested-unresolved", ") " + shlex.join(nested_owner), "", (nested_owner, stdin_owner)),
+        ("recovered-substitution-unresolved", f") echo $({nested})", "",
+         (("echo", shell_syntax.UNKNOWN_VALUE), stdin_owner)),
+        ("recovered-python-unresolved", ") " + shlex.join(("python3", "-c", python)), "",
+         (("python3", "-c", python), stdin_owner)),
+        ("nested-recovery-restores-parent", shlex.join(("bash", "-c", nested_recovery)) + "; " + nested,
+         closed_stdin, (("bash", "-c", nested_recovery), stdin_owner, stdin_owner)),
+        ("complete-heredoc-expansion-error-unresolved", f"bash -s <<DOC\n{nested}\n# $(\nDOC",
+         "", (stdin_owner, stdin_owner)),
+        ("dropped-unresolved-before-budget", ") " + shlex.join(nested_owner) + "\n# " + "x" * 600,
+         "", (nested_owner, stdin_owner)),
+        ("recovered-refusal-before-nested-budget", ") " + shlex.join(("bash", "-c", long_script)),
+         "git clone", (("bash", "-c", long_script), clone)),
+    )
+    return (
+        *(RecordedPolicyCase(name, "completed shell inspection", source, expected)
+          for name, source, expected in cases),
+        *(RecordedPolicyCase(name, "completed shell inspection", source, expected, visits)
+          for name, source, expected, visits in visit_cases),
+    )
+
+
 def repair_policy_cases() -> tuple[RecordedPolicyCase, ...]:
-    return ordinary_agent_corpus() + invocation_semantic_cases()
+    return (ordinary_agent_corpus() + invocation_semantic_cases() + heredoc_policy_cases()
+            + completed_shell_policy_cases(140_000) + malformed_shell_policy_cases())
 
 
 class CopyGuardTests(unittest.TestCase):
@@ -331,6 +487,138 @@ class CopyGuardTests(unittest.TestCase):
                 command = wrapper.format(maker)
                 with self.subTest(command=command):
                     self.assertIn("copies.py run", copy_guard.refusal(command, self.root))
+
+    def test_substitution_and_recovery_use_bounded_parser_work(self) -> None:
+        def inspect(source: str) -> tuple[str, int, int]:
+            advance = shell_syntax.Lexer.advance
+            expansion = shell_syntax.Lexer.expansion
+            traversed = 0
+            substitutions = 0
+
+            def count_chars(lexer: shell_syntax.Lexer, count: int = 1) -> str:
+                nonlocal traversed
+                text = advance(lexer, count)
+                traversed += len(text)
+                return text
+
+            def count_substitutions(lexer: shell_syntax.Lexer, *, process: bool = True) -> (
+                shell_syntax.Literal | shell_syntax.Parameter | shell_syntax.Execution
+            ):
+                nonlocal substitutions
+                if lexer.source.startswith("$(", lexer.position):
+                    substitutions += 1
+                return expansion(lexer, process=process)
+
+            with (mock.patch.object(shell_syntax.Lexer, "advance", count_chars),
+                  mock.patch.object(shell_syntax.Lexer, "expansion", count_substitutions)):
+                reason = copy_guard.refusal(source, self.root)
+            return reason, traversed, substitutions
+
+        for depth in (3, 4, 5):
+            command = "git clone source destination"
+            for _ in range(depth):
+                command = f'echo "$({command})"'
+            for source in (command, f'{command}; echo "unterminated'):
+                with self.subTest(depth=depth, recovery=source != command):
+                    reason, traversed, _ = inspect(source)
+                    self.assertTrue(reason.startswith("git clone:"), reason)
+                    self.assertLessEqual(traversed, 2 * len(source))
+
+            with self.subTest(depth=depth, heredoc=True):
+                template = f"<<DOC\n# $({command})\nDOC"
+                data = f"cat {template}"
+                program = f"python3 - {template}"
+                data_reason, data_chars, data_substitutions = inspect(data)
+                program_reason, program_chars, program_substitutions = inspect(program)
+                self.assertTrue(program_reason.startswith("git clone:"), program_reason)
+                self.assertEqual(program_reason, data_reason)
+                self.assertEqual(program_chars - len(program), data_chars - len(data))
+                self.assertEqual(program_substitutions, data_substitutions)
+                self.assertEqual(program_substitutions, depth + 1)
+
+        inspect_command = copy_guard.ShellPolicy.command
+        visited: list[tuple[str, ...]] = []
+
+        def visit(policy: copy_guard.ShellPolicy, command: shell_syntax.SimpleCommand) -> copy_guard.PolicyOutcome:
+            visited.append(tuple(word.literal().text for word in command.words))
+            return inspect_command(policy, command)
+
+        for case in completed_shell_policy_cases(600):
+            with self.subTest(case=case.name, budget=512):
+                visited.clear()
+                inspection = copy_guard.CopyInspection(budget=shell_syntax.ShellBudget(512))
+                with (mock.patch.object(copy_guard.ShellPolicy, "command", visit),
+                      self.assertRaises(shell_syntax.ShellWorkLimit) as limit):
+                    _ = copy_guard.inspect_shell(cast(str, case.command), self.root, inspection=inspection)
+                outcome = inspection.exhausted(limit.exception)
+                if case.expected.startswith("unresolved relevant operation: "):
+                    self.assertEqual(outcome, copy_guard.UnresolvedOperation(
+                        case.expected.removeprefix("unresolved relevant operation: ")))
+                else:
+                    self.assertEqual(outcome, copy_guard.ForbiddenOperation(case.expected))
+                    self.assertEqual(visited.count(("git", "clone", "a", "b")), 1)
+                    self.assertEqual(inspection.outcome, outcome)
+                self.assertEqual(visited.count(("printf", "once")), 1)
+                if case.name.startswith("completed-heredoc-"):
+                    self.assertEqual(visited.count(("bash", "-s", "first")), 1)
+
+        for case in malformed_shell_policy_cases():
+            if case.name not in {"parser-error-before-heredoc", "recovery-before-budget-limit"}:
+                continue
+            with self.subTest(case=case.name):
+                visited.clear()
+                with mock.patch.object(copy_guard.ShellPolicy, "command", visit):
+                    outcome = copy_guard.inspect_shell(cast(str, case.command), self.root)
+                self.assertEqual(outcome, copy_guard.ForbiddenOperation(case.expected))
+                self.assertEqual(visited.count(("git", "clone", "a", "b")), 1)
+                if case.name == "parser-error-before-heredoc":
+                    self.assertEqual(visited.count(("bash", "-s")), 1)
+
+        before_visit: list[copy_guard.PolicyOutcome] = []
+        work_limit = copy_guard.UnresolvedOperation("the shell target scan reached its work limit")
+        budget_expectations = {
+            "dropped-unresolved-before-budget": (copy_guard.NoForbiddenOperation(), work_limit),
+            "recovered-refusal-before-nested-budget": (copy_guard.ForbiddenOperation("git clone"),
+                                                       copy_guard.ForbiddenOperation("git clone")),
+        }
+
+        def visit_with_parent(policy: copy_guard.ShellPolicy, command: shell_syntax.SimpleCommand) -> copy_guard.PolicyOutcome:
+            self.assertIs(policy.inspection.budget, inspection.budget)
+            before_visit.append(inspection.outcome)
+            return visit(policy, command)
+
+        for case in malformed_shell_policy_cases():
+            if not case.command_visits:
+                continue
+            with self.subTest(case=case.name):
+                visited.clear()
+                before_visit.clear()
+                source = cast(str, case.command)
+                with mock.patch.object(copy_guard.ShellPolicy, "command", visit_with_parent):
+                    if case.name in budget_expectations:
+                        inspection = copy_guard.CopyInspection(budget=shell_syntax.ShellBudget(512))
+                        retained, expected = budget_expectations[case.name]
+                        with self.assertRaises(shell_syntax.ShellWorkLimit) as limit:
+                            _ = copy_guard.inspect_shell(source, self.root, inspection=inspection)
+                        self.assertEqual(inspection.outcome, retained)
+                        outcome = inspection.exhausted(limit.exception)
+                    else:
+                        inspection = copy_guard.CopyInspection()
+                        outcome = copy_guard.inspect_shell(source, self.root, inspection=inspection)
+                        expected = (copy_guard.UnresolvedOperation(case.expected.removeprefix("unresolved relevant operation: "))
+                                    if case.expected.startswith("unresolved relevant operation: ")
+                                    else copy_guard.ForbiddenOperation(case.expected) if case.expected
+                                    else copy_guard.NoForbiddenOperation())
+                owner, *program = case.command_visits
+                if owner in program:
+                    self.assertEqual(visited, [owner, *program])
+                else:
+                    self.assertEqual(visited.count(owner), 1)
+                    self.assertEqual([command for command in visited if command != owner], program)
+                self.assertEqual(outcome, expected)
+                self.assertEqual(inspection.outcome, expected)
+                if case.name in {"recovered-unresolved-before-refusal", "nested-recovery-restores-parent"}:
+                    self.assertEqual(before_visit[-1], copy_guard.NoForbiddenOperation())
 
     def test_conditional_cd_and_assignment_do_not_hide_the_real_repository_source(self) -> None:
         ordinary = self.root / "documents"
@@ -1050,8 +1338,14 @@ git_at(repo, "show", "clone")
     def test_recorded_agent_commands_and_semantic_boundaries_have_exact_outcomes(self) -> None:
         for case in repair_policy_cases():
             with self.subTest(case=case.name, provenance=case.provenance):
-                reason = copy_guard.hook_refusal(json.dumps({
-                    "tool_name": "Bash", "tool_input": {"command": case.command}, "cwd": str(self.root)}))
+                payload = json.dumps({
+                    "tool_name": "Bash", "tool_input": {"command": case.command}, "cwd": str(self.root)})
+                if case.provenance in {"generated heredoc inspection", "completed shell inspection"}:
+                    result = subprocess.run([sys.executable, copy_guard.__file__], input=payload, text=True,
+                                            capture_output=True, check=False, timeout=10)
+                    self.assertEqual(result.returncode, 2 if case.expected else 0, result.stderr)
+                    self.assertNotIn("Traceback", result.stderr)
+                reason = copy_guard.hook_refusal(payload)
                 self.assertEqual(reason.split(": " + copy_guard.REFUSAL, 1)[0] if reason else "", case.expected)
                 command = shlex.join(case.command) if isinstance(case.command, list) else case.command
                 outcome = copy_guard.inspect_shell(command, self.root)

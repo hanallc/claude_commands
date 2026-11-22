@@ -80,6 +80,19 @@ class UnresolvedOperation:
 PolicyOutcome = NoForbiddenOperation | ForbiddenOperation | UnresolvedOperation
 
 
+@dataclass
+class CopyInspection:
+    budget: syntax.ShellBudget = field(default_factory=syntax.ShellBudget)
+    outcome: PolicyOutcome = field(default_factory=NoForbiddenOperation)
+
+    def record(self, outcome: PolicyOutcome) -> PolicyOutcome:
+        self.outcome = _prefer(self.outcome, outcome)
+        return outcome
+
+    def exhausted(self, error: syntax.ShellWorkLimit) -> PolicyOutcome:
+        return self.record(_prefer(self.outcome, UnresolvedOperation(str(error))))
+
+
 @dataclass(frozen=True)
 class KnownArgument:
     text: str
@@ -193,7 +206,12 @@ class UnknownProgramInput:
     reason: str
 
 
-ProgramInput = LiteralProgramInput | ExpandedProgramInput | ProgramWithChoiceTexts | UnknownProgramInput
+@dataclass(frozen=True)
+class ParsedHereDocument:
+    document: syntax.HereDocument
+
+
+ProgramInput = LiteralProgramInput | ExpandedProgramInput | ProgramWithChoiceTexts | UnknownProgramInput | ParsedHereDocument
 UNAVAILABLE_STDIN = UnknownProgramInput("cannot resolve interpreter stdin")
 
 
@@ -351,43 +369,66 @@ def _tree_making_text(text: str) -> bool:
 
 
 def inspect_invocation(words: list[Argument], cwd: Path, *, static: bool,
-                       stdin: ProgramInput = UNAVAILABLE_STDIN) -> PolicyOutcome:
-    """One decoder for shell commands, tool argv and Python subprocess vectors."""
+                       stdin: ProgramInput = UNAVAILABLE_STDIN,
+                       inspection: CopyInspection | None = None) -> PolicyOutcome:
+    """Inspect shell commands, tool argv, or Python subprocess vectors."""
+    active = CopyInspection() if inspection is None else inspection
+    try:
+        return active.record(_inspect_invocation(words, cwd, static=static, stdin=stdin, inspection=active))
+    except syntax.ShellWorkLimit as error:
+        if inspection is not None:
+            raise
+        return active.exhausted(error)
+
+
+def _inspect_invocation(words: list[Argument], cwd: Path, *, static: bool,
+                        stdin: ProgramInput, inspection: CopyInspection) -> PolicyOutcome:
     if any(isinstance(argument, ArgumentChoices) for argument in words):
         outcome: PolicyOutcome = NoForbiddenOperation()
         for vector in _choice_vectors(tuple(words)):
-            outcome = _prefer(outcome, inspect_invocation(list(vector), cwd, static=static, stdin=stdin))
+            outcome = _prefer(outcome, inspect_invocation(list(vector), cwd, static=static, stdin=stdin,
+                                                         inspection=inspection))
         return outcome
     actual = _unwrap(words)
-    operation = _operation(actual, cwd, static=static)
+    operation = inspection.record(_operation(actual, cwd, static=static))
     if _copies_command(actual):
         return operation
     invocation = decode_invocation(actual)
     if isinstance(invocation, (ScriptProgram, NoProgramInvocation, OrdinaryInvocation)):
         return operation
     source = stdin if isinstance(invocation, StdinProgram) else invocation.source
+    if isinstance(source, ParsedHereDocument):
+        document = source.document
+        if document.state is not syntax.HereDocumentState.COMPLETE:
+            source = LiteralProgramInput("")
+        elif document.generated:
+            source = ExpandedProgramInput(syntax.expanded_text(document, inspection.budget))
+        else:
+            source = LiteralProgramInput(document.body)
     if isinstance(source, UnknownProgramInput):
         # Static abstract shell helpers are checked at concrete call sites.
         return operation if static else _prefer(operation, UnresolvedOperation(source.reason))
     choices: PolicyOutcome = NoForbiddenOperation()
     if isinstance(source, ProgramWithChoiceTexts) and any(
             _tree_making_text(text) for text in (source.text, *source.choice_texts)):
-        choices = UnresolvedOperation("cannot resolve interpreter program choices")
+        choices = inspection.record(UnresolvedOperation("cannot resolve interpreter program choices"))
     if invocation.language == "shell":
-        parsed = inspect_shell(source.text, cwd, static=static)
+        parsed = inspect_shell(source.text, cwd, static=static, inspection=inspection)
     else:
-        try:
-            tree = ast.parse(source.text)
-        except SyntaxError:
-            if isinstance(source, (ExpandedProgramInput, ProgramWithChoiceTexts)) and _tree_making_text(source.text):
-                return _prefer(operation, UnresolvedOperation("cannot parse Python program"))
-            return _prefer(operation, choices)
-        parsed: PolicyOutcome = NoForbiddenOperation()
-        for finding in PythonPolicy(cwd / "<python-command>", static=static).scan(tree):
-            result: PolicyOutcome = (UnresolvedOperation(finding.operation.removeprefix("unresolved relevant operation: "))
-                                     if finding.operation.startswith("unresolved relevant operation: ")
-                                     else ForbiddenOperation(finding.operation))
-            parsed = _prefer(parsed, result)
+        with inspection.budget.nested():
+            inspection.budget.charge(len(source.text))
+            try:
+                tree = ast.parse(source.text)
+            except SyntaxError:
+                if isinstance(source, (ExpandedProgramInput, ProgramWithChoiceTexts)) and _tree_making_text(source.text):
+                    return _prefer(operation, UnresolvedOperation("cannot parse Python program"))
+                return _prefer(operation, choices)
+            parsed: PolicyOutcome = NoForbiddenOperation()
+            for finding in PythonPolicy(cwd / "<python-command>", static=static, inspection=inspection).scan(tree):
+                result: PolicyOutcome = (UnresolvedOperation(finding.operation.removeprefix("unresolved relevant operation: "))
+                                         if finding.operation.startswith("unresolved relevant operation: ")
+                                         else ForbiddenOperation(finding.operation))
+                parsed = _prefer(parsed, result)
     return _prefer(operation, _prefer(parsed, choices))
 
 
@@ -546,6 +587,7 @@ class ShellPolicy:
     static: bool
     variables: dict[str, tuple[Argument, ...]]
     directories: set[Path]
+    inspection: CopyInspection
 
     def expand(self, word: syntax.Word) -> list[Argument]:
         value = word.literal()
@@ -595,10 +637,10 @@ class ShellPolicy:
             programs = ((segment.program,) if isinstance(segment, syntax.Execution)
                         else segment.programs if isinstance(segment, syntax.Parameter) else ())
             for program in programs:
-                outcome = _prefer(outcome, self.program(program))
+                outcome = self.inspection.record(_prefer(outcome, self.program(program)))
             if isinstance(segment, syntax.ArrayElements):
                 for element in segment.words:
-                    outcome = _prefer(outcome, self.expansions(element))
+                    outcome = self.inspection.record(_prefer(outcome, self.expansions(element)))
         return outcome
 
     def assignment(self, word: syntax.Word) -> bool:
@@ -622,15 +664,15 @@ class ShellPolicy:
         outcome: PolicyOutcome = NoForbiddenOperation()
         words: list[Argument] = []
         for word in command.words:
-            outcome = _prefer(outcome, self.expansions(word))
+            outcome = self.inspection.record(_prefer(outcome, self.expansions(word)))
             if not words and self.assignment(word):
                 continue
             words.extend(self.expand(word))
         for redirect in command.redirects:
-            outcome = _prefer(outcome, self.expansions(redirect.target))
+            outcome = self.inspection.record(_prefer(outcome, self.expansions(redirect.target)))
             if isinstance(redirect.document, syntax.HereDocument):
                 for program in redirect.document.expansions:
-                    outcome = _prefer(outcome, self.program(program))
+                    outcome = self.inspection.record(_prefer(outcome, self.program(program)))
         actual = _unwrap(words)
         if actual and _text(actual[0]) == "cd" and len(actual) == 2 and isinstance(actual[1], KnownArgument):
             self.directories.update(directory / actual[1].text for directory in tuple(self.directories))
@@ -640,8 +682,7 @@ class ShellPolicy:
         inputs: dict[int, ProgramInput] = {0: UNAVAILABLE_STDIN}
         for redirect in command.redirects:
             if isinstance(redirect.document, syntax.HereDocument):
-                inputs[redirect.descriptor] = (ExpandedProgramInput(syntax.expanded_text(redirect.document.body))
-                                               if redirect.document.generated else LiteralProgramInput(redirect.document.body))
+                inputs[redirect.descriptor] = ParsedHereDocument(redirect.document)
             elif redirect.operator == "<<<":
                 values = self.expand(redirect.target)
                 inputs[redirect.descriptor] = (_program_input(values[0]) if len(values) == 1
@@ -663,7 +704,9 @@ class ShellPolicy:
                 if redirect.operator in {"&>", "&>>"}:
                     inputs[2] = inputs[redirect.descriptor]
         for directory in self.directories:
-            outcome = _prefer(outcome, inspect_invocation(actual, directory, static=self.static, stdin=inputs[0]))
+            result = inspect_invocation(actual, directory, static=self.static, stdin=inputs[0],
+                                        inspection=self.inspection)
+            outcome = self.inspection.record(_prefer(outcome, result))
         return outcome
 
     def program(self, program: syntax.Program) -> PolicyOutcome:
@@ -671,26 +714,26 @@ class ShellPolicy:
         for command in program.commands:
             if isinstance(command, syntax.Compound):
                 for word in command.headers:
-                    outcome = _prefer(outcome, self.expansions(word))
+                    outcome = self.inspection.record(_prefer(outcome, self.expansions(word)))
                 previous = dict(self.variables)
                 if command.kind == "alternatives":
                     branches: list[dict[str, tuple[Argument, ...]]] = []
                     for branch in command.body.commands:
                         self.variables = dict(previous)
-                        outcome = _prefer(outcome, self.program(syntax.Program((branch,))))
+                        outcome = self.inspection.record(_prefer(outcome, self.program(syntax.Program((branch,)))))
                         branches.append(dict(self.variables))
                     self.merge_branches(branches)
                     continue
                 if command.kind == "function" and self.static:
                     self.variables["@"] = (ForwardedArguments("function argv"),)
                     self.variables["*"] = (ForwardedArguments("function argv"),)
-                outcome = _prefer(outcome, self.program(command.body))
+                outcome = self.inspection.record(_prefer(outcome, self.program(command.body)))
                 if command.kind == "function":
                     self.variables = previous
                 elif command.kind in {"for", "loop"}:
                     self.merge_branches([previous, self.variables])
             else:
-                outcome = _prefer(outcome, self.command(command))
+                outcome = self.inspection.record(_prefer(outcome, self.command(command)))
         return outcome
 
     def merge_branches(self, branches: list[dict[str, tuple[Argument, ...]]]) -> None:
@@ -699,17 +742,44 @@ class ShellPolicy:
             choices = tuple(dict.fromkeys(branch.get(key, (UnknownArgument(key),)) for branch in branches))
             self.variables[key] = _merged_arguments(choices, key)
 
-    def parse(self, source: str) -> PolicyOutcome:
+    def inspect_recovered(self, command: syntax.SimpleCommand | syntax.Compound) -> PolicyOutcome:
+        parent = self.inspection
+        child = CopyInspection(budget=parent.budget)
+        self.inspection = child
         try:
-            return self.program(syntax.parse(source))
-        except (syntax.ShellSyntaxError, RecursionError, OSError):
-            parsed = self.program(syntax.readable_program(source))
-            return parsed if isinstance(parsed, ForbiddenOperation) else NoForbiddenOperation()
+            _ = self.program(syntax.Program((command,)))
+        finally:
+            self.inspection = parent
+            if isinstance(child.outcome, ForbiddenOperation):
+                _ = parent.record(child.outcome)
+        return child.outcome if isinstance(child.outcome, ForbiddenOperation) else NoForbiddenOperation()
+
+    def parse(self, source: str) -> PolicyOutcome:
+        outcome: PolicyOutcome = NoForbiddenOperation()
+
+        def consume(command: syntax.SimpleCommand | syntax.Compound, phase: syntax.CommandDeliveryPhase) -> None:
+            nonlocal outcome
+            # Keep unresolved results delivered before the error as an exception to main's recovery rule.
+            result = (self.inspect_recovered(command) if phase is syntax.CommandDeliveryPhase.RECOVERY
+                      else self.program(syntax.Program((command,))))
+            outcome = self.inspection.record(_prefer(outcome, result))
+
+        syntax.readable_program(source, self.inspection.budget, consume)
+        return outcome
 
 
-def inspect_shell(command: str, cwd: Path, *, static: bool = False) -> PolicyOutcome:
-    policy = ShellPolicy(cwd, static, {key: (KnownArgument(value),) for key, value in os.environ.items()}, {cwd})
-    return policy.parse(command)
+def inspect_shell(command: str, cwd: Path, *, static: bool = False,
+                  inspection: CopyInspection | None = None) -> PolicyOutcome:
+    active = CopyInspection() if inspection is None else inspection
+    variables: dict[str, tuple[Argument, ...]] = {key: (KnownArgument(value),) for key, value in os.environ.items()}
+    policy = ShellPolicy(cwd, static, variables, {cwd}, active)
+    try:
+        with active.budget.nested():
+            return active.record(policy.parse(command))
+    except syntax.ShellWorkLimit as error:
+        if inspection is not None:
+            raise
+        return active.exhausted(error)
 
 
 def _first_operation(command: str, cwd: Path, *, static: bool = False) -> str:
@@ -940,8 +1010,9 @@ class DeferredFunction:
 
 
 class PythonPolicy:
-    def __init__(self, path: Path, *, static: bool = True) -> None:
+    def __init__(self, path: Path, *, static: bool = True, inspection: CopyInspection | None = None) -> None:
         self.static: bool = static
+        self.inspection: CopyInspection | None = inspection
         self.path: Path = path
         self.found: list[TreeCreation] = []
         self.module_bindings: dict[str, PythonValue] = {}
@@ -978,7 +1049,8 @@ class PythonPolicy:
                                      else ScalarValue(UnknownArgument(parameter)))
             rest = node.args[len(signature.parameters):]
             values[signature.vararg] = _python_value(ast.List(elts=list(rest)), bindings)
-            return inspect_invocation(_argv(_python_value(signature.expression, values)), self.path.parent, static=self.static)
+            return inspect_invocation(_argv(_python_value(signature.expression, values)), self.path.parent,
+                                      static=self.static, inspection=self.inspection)
         if name in RUNNERS and arguments:
             value = _python_value(arguments[0], bindings)
             shell = name == "system" or any(keyword.arg == "shell" and isinstance(keyword.value, ast.Constant)
@@ -986,13 +1058,15 @@ class PythonPolicy:
             outcome: PolicyOutcome = NoForbiddenOperation()
             for alternative in _possibilities(value):
                 if shell and isinstance(alternative, ScalarValue) and isinstance(alternative.argument, (KnownArgument, UnknownArgument)):
-                    outcome = _prefer(outcome, inspect_shell(alternative.argument.text, self.path.parent, static=self.static))
+                    result = inspect_shell(alternative.argument.text, self.path.parent, static=self.static,
+                                           inspection=self.inspection)
+                    outcome = _prefer(outcome, result)
                 elif isinstance(alternative, ArgumentVector):
                     input_node = next((keyword.value for keyword in node.keywords if keyword.arg == "input"), None)
                     input_value = _python_value(input_node, bindings) if input_node is not None else ScalarValue(UnknownArgument("stdin"))
                     source = _program_input(input_value.argument) if isinstance(input_value, ScalarValue) else UNAVAILABLE_STDIN
                     outcome = _prefer(outcome, inspect_invocation(list(alternative.arguments), self.path.parent,
-                                                                 static=self.static, stdin=source))
+                                                                 static=self.static, stdin=source, inspection=self.inspection))
             return outcome
         return NoForbiddenOperation()
 
@@ -1002,6 +1076,8 @@ class PythonPolicy:
                 if isinstance(value, FunctionBinding):
                     self.enqueue(value.function, self.execution(value.function))
             outcome = self.call(node, bindings, helpers)
+            if self.inspection is not None:
+                _ = self.inspection.record(outcome)
             if not isinstance(outcome, NoForbiddenOperation):
                 self.found.append(TreeCreation(self.path, node.lineno, _description(outcome)))
         for child in ast.iter_child_nodes(node):
