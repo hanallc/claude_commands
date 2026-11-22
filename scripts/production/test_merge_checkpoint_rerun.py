@@ -132,7 +132,7 @@ class CheckpointRerunTests(MergeCheckpointFixture):
                 partial = interruption == "before beta merge" or beta_already_published
                 published = interruption == "published before validator exit"
                 rollback_fails = interruption == "rollback fails"
-                self.env["MERGE_GATE_STATE_DIR"] = str(self.root / "merge-gate")
+                self.env["GATE_STATE_DIR"] = str(self.root / "merge-gate")
                 path = "src/shared.toml"
                 middle = "".join(f"key{index} = {index}\n" for index in range(12))
                 self.write(self.checkout, path, f"alpha = 0\n{middle}beta = 0\n")
