@@ -1,4 +1,7 @@
-"""Store the recent passing wall times used for gate deadlines."""
+"""Store the recent passing wall times used for gate deadlines.
+
+The file keeps TOP_RUNS samples per key. Run `show.py seed-gate-times` after you raise TOP_RUNS.
+"""
 
 from __future__ import annotations
 
@@ -86,9 +89,9 @@ def _read(path: Path) -> RecentGateTimes:
         if not isinstance(data, dict):
             raise ValueError("expected a timing object")
         fields = cast(dict[str, object], data)
-        return {"full": _groups(fields["full"]), "modules": _groups(fields["modules"])}
-    except (OSError, ValueError, KeyError, OverflowError, RecursionError):
-        return {"full": {}, "modules": {}}
+        return {"full": _groups(fields.get("full")), "modules": _groups(fields.get("modules"))}
+    except (OverflowError, RecursionError) as error:
+        raise ValueError("invalid timing file") from error
 
 
 def _sample_order(sample: WallSample) -> tuple[str, str, int]:
@@ -100,7 +103,10 @@ def _merge(samples: RecentGateTimes, count: int) -> int:
     path = _path()
     path.parent.mkdir(parents=True, exist_ok=True)
     with file_lock.exclusive(path.with_suffix(".lock")):
-        current = _read(path)
+        try:
+            current: RecentGateTimes = _read(path)
+        except (FileNotFoundError, ValueError):
+            current = {"full": {}, "modules": {}}
         for group in ("full", "modules"):
             for key in current[group].keys() | samples[group].keys():
                 by_attempt = {_sample_order(row): row
@@ -159,7 +165,10 @@ def read_time_limit(vcpus: int, modules: Sequence[str], jobs: int,
     """Use the newest passing walls for the requested hardware and work."""
     factor = conf.read("gate").number("GATE_TIME_LIMIT_FACTOR")
     count = conf.read("test_times").whole("TOP_RUNS")
-    samples = _read(_path())
+    try:
+        samples: RecentGateTimes = _read(_path())
+    except (OSError, ValueError):
+        samples = {"full": {}, "modules": {}}
     if not targeted:
         walls = [row.wall_s for row in samples["full"].get(f"{vcpus}/{jobs}", ())[:count]]
         if walls:

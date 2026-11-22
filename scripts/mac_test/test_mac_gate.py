@@ -68,8 +68,6 @@ if case == 'cleanup-refused':
 
 row = {key: request[key] for key in ('attempt', 'tree', 'commit')}
 row['gate'] = json.loads(Path(os.environ['MAC_GATE_RESULT']).read_text())
-if case == 'timed':
-    row.update(started_at='2026-01-01T00:00:00Z', vcpus=12)
 if case in ('attempt', 'commit', 'tree'):
     row[case] = 'wrong'
 if case == 'modules':
@@ -294,21 +292,6 @@ class MacGateTests(unittest.TestCase):
                 assert isinstance(result, gate.GateRun), result
                 self.assertEqual(result.jobs, (job,))
                 self.assertEqual(result.passed, status == 0)
-
-    def test_validated_mac_result_updates_only_passing_module_times(self) -> None:
-        _ = write_config_fixture(self.root / 'gate.conf', 'GATE_TIME_LIMIT_FACTOR=2')
-        _ = write_config_fixture(self.root / 'test_times.conf', 'TOP_RUNS=5')
-        with mock.patch.dict(os.environ, {'CONF_DIR': str(self.root), 'BUILDLOG_DIR': str(self.root / 'buildlog')}):
-            for status in (1, 0):
-                with self.subTest(status=status):
-                    result = self.run_case('timed', module_job('one', status=status))
-                    assert isinstance(result, gate.GateRun), result
-                    limit = gate.read_time_limit(12, ('fixture/test_one.py',), 2, True)
-                    if status:
-                        self.assertIsInstance(limit, gate_record.NoGateTimeLimit)
-                    else:
-                        self.assertEqual(limit, gate_record.GateTimeLimit(0.2))
-            self.assertIsInstance(gate.read_time_limit(12, (), 12, False), gate_record.NoGateTimeLimit)
 
     def test_queue_failure_uses_natedev(self) -> None:
         for case, reason in (('status', 'status 23'), ('timeout', 'exceeded'),

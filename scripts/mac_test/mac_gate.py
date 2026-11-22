@@ -453,30 +453,13 @@ def run_guest_modules(folder: Path, repo: Path, *, full: bool) -> dict[str, obje
     if (commit, tree) != (request['commit'], request['tree']):
         raise GateRefused('The Mac checkout differs from the requested source')
     timings = gate.read_measures(folder / 'module_seconds.json')
-    started_at = store.utc_iso(time.time())
     with redirect_stdout(sys.stderr):
         run = gate.run_suites(repo, full=full, mode=gate.SuiteMode(ledger.text(request, 'mode')),
                               machine=gate.WholeMachine(timings),
                               module_time_limit_s=float(cast(float, request['module_time_limit_s'])),
                               time_limit=gate_record.NoGateTimeLimit('the Mac queue call has a time limit'),
                               selected=gate.SelectedModules(tuple(cast(list[str], request['modules']))))
-    return {'attempt': request['attempt'], 'commit': commit, 'tree': tree, 'gate': gate_box.encode_run(run),
-            'started_at': started_at, 'vcpus': os.cpu_count() or 1}
-
-
-def record_recent_times(row: dict[str, object], run: gate.GateRun) -> None:
-    """Keep the passing Mac module walls under the guest's vCPU count."""
-    if not run.passed or 'started_at' not in row or 'vcpus' not in row:
-        return
-    try:
-        # Every Mac result describes an explicit module assignment.
-        gate_record.update_recent_times({
-            'id': 'mac-' + ledger.text(row, 'attempt'), 'started_at': row['started_at'], 'vcpus': row['vcpus'],
-            'status': 0, 'aborted': False, 'selection': 'subset',
-            'modules': gate_record.module_runs(gate_box.execution_records(run), float('inf')),
-        })
-    except Exception as error:
-        gate_record.report_not_written(error)
+    return {'attempt': request['attempt'], 'commit': commit, 'tree': tree, 'gate': gate_box.encode_run(run)}
 
 
 def run_remote(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit_s: float,
@@ -534,7 +517,6 @@ def run_remote(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limi
             row = ledger.mapping(cast(object, json.loads(results[0])))
             run = cloud_gate.decode_requested_run(row, request)
             cloud_gate.validate_run_modules(run, request)
-            record_recent_times(row, run)
             return MacGateResult(row, run)
     except subprocess.TimeoutExpired:
         return f'The Mac queue call exceeded {MAC_TIME_LIMIT_S:g} seconds'

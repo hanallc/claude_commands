@@ -183,6 +183,35 @@ class GateRecordTests(unittest.TestCase):
                 limit = recent_gate_times.read_time_limit(8, (), 2, False)
                 self.assertIsInstance(limit, gate_record.NoGateTimeLimit)
 
+    def test_read_error_disables_the_limit_and_preserves_the_file(self) -> None:
+        run = {**gate_run(), "id": "first", "status": 0, "vcpus": 8, "selection": "full"}
+        recent_gate_times.update_recent_times(run)
+        contents = self.recent_path.read_bytes()
+        run.update(id="newer", wall_s=30)
+        read_text = Path.read_text
+
+        def read_with_error(path: Path, encoding: str | None = None) -> str:
+            if path == self.recent_path:
+                raise PermissionError("cannot read the timing file")
+            return read_text(path, encoding=encoding)
+
+        stderr = io.StringIO()
+        with (mock.patch.object(Path, "read_text", autospec=True, side_effect=read_with_error),
+              redirect_stderr(stderr)):
+            limit = recent_gate_times.read_time_limit(8, (), 2, False)
+            self.assertIsInstance(limit, gate_record.NoGateTimeLimit)
+            recent_gate_times.update_recent_times(run)
+
+        self.assertEqual(stderr.getvalue(), "recent gate times not written: cannot read the timing file\n")
+        self.assertEqual(self.recent_path.read_bytes(), contents)
+
+    def test_update_replaces_a_corrupt_timing_file(self) -> None:
+        self.recent_path.parent.mkdir()
+        _ = self.recent_path.write_text("{")
+        run = {**gate_run(), "id": "first", "status": 0, "vcpus": 8, "selection": "full"}
+        recent_gate_times.update_recent_times(run)
+        self.assertEqual(recent_gate_times.read_time_limit(8, (), 2, False), gate_record.GateTimeLimit(10))
+
     def test_passing_record_updates_times_and_a_failed_update_keeps_the_record(self) -> None:
         run = gate_run()
         run.update(status=0, vcpus=8, selection="full")
