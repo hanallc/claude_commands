@@ -26,7 +26,7 @@ import unittest
 from collections.abc import Callable, Generator, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack, contextmanager, redirect_stderr, redirect_stdout
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, field, replace
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from functools import partial
@@ -77,6 +77,7 @@ class HttpReply:
     status: int
     content_type: str
     body: bytes
+    headers: dict[str, str] = field(default_factory=dict[str, str], compare=False)
 
 
 def fake_firefox(tool: str) -> str | None:
@@ -742,13 +743,26 @@ class ReviewLinksServerTests(unittest.TestCase):
         missing = self.request(placement_disk.PAGE_PATH)
         self.assertEqual(missing.status, 503, missing.body)
         self.assertIn(b"The Placement disk POC page is not available.", missing.body)
+        # The real page has an empty scene main and its heading in the panel after it.
         for heading in (b"First draft", b"Second draft"):
             with self.subTest(heading=heading):
-                _ = poc.write_bytes(change_page.document("<h1>" + heading.decode() + "</h1>"))
+                _ = poc.write_bytes(b'<!doctype html><html><head><title>POC</title></head><body><main id="stage"></main>'
+                                    + b'<aside id="panel"><h1>' + heading + b'</h1></aside></body></html>')
                 response = self.request(placement_disk.PAGE_PATH)
                 self.assertEqual(response.status, 200, response.body)
-                self.assertIn(heading, response.body)
+                self.assertNotIn("content-security-policy", response.headers)
+                self.assertIn(b'<main id="stage"></main>', response.body)
+                self.assertIn(b'<aside id="panel"><div class="page-heading"><h1>' + heading + b'</h1>', response.body)
                 self.assertIn(b'data-page-owner="placement_disk"', response.body)
+
+    def test_placement_disk_file_expands_the_home_folder(self) -> None:
+        home = self.root.parent / "home"
+        _ = write_config_fixture(conf.path("console"), "placement_disk.file=~/poc/page.html\n")
+        with patch.dict(os.environ, {"HOME": str(home)}):
+            self.assertEqual(placement_disk.source(), home / "poc" / "page.html")
+        _ = write_config_fixture(conf.path("console"), "placement_disk.file=~no-such-user-fixture/page.html\n")
+        with self.assertRaises(ValueError):
+            _ = placement_disk.source()
 
     def test_page_owner_dialog_accepts_a_proposal_for_the_page_owner(self) -> None:
         case = self.review_fixture()
@@ -3138,7 +3152,7 @@ class ReviewLinksServerTests(unittest.TestCase):
             connection.request("GET", path)
             response = connection.getresponse()
             headers = {name.lower(): value for name, value in response.getheaders()}
-            return HttpReply(response.status, headers.get("content-type", ""), response.read())
+            return HttpReply(response.status, headers.get("content-type", ""), response.read(), headers)
         finally:
             connection.close()
 

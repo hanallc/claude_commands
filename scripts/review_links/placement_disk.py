@@ -17,7 +17,10 @@ def page_url() -> str:
 
 def source() -> Path:
     """The page file named by placement_disk.file in config/console.conf."""
-    return Path(conf.read("console").text("placement_disk.file")).expanduser()
+    try:
+        return Path(conf.read("console").text("placement_disk.file")).expanduser()
+    except RuntimeError as error:
+        raise ValueError(f"placement_disk.file: {error}") from error
 
 
 def render() -> bytes:

@@ -163,7 +163,8 @@ Its title is **Hana console**, followed by the selected page title.
 
 The left navigation has icons and labels for Accounts, AWS, AWS Machines, Builds, Disks, Images, List, Review and Placement disk POC.
 The desktop has no top bar: each page shows its title once, as its own heading.
-Every page uses `page_frame.STYLE`.
+Every page uses `page_frame.STYLE`, except the Placement disk POC page.
+That page is a standalone document with its own layout and styles, and it has no status line.
 Each page centers its main column in the console frame, with a maximum width of 1124px.
 A page whose `main` has the `page-wide` class uses the full pane width instead; the Builds page is the only one.
 The title starts 32px from the top and left edges of that column.
@@ -1557,7 +1558,7 @@ It is the last navigation entry, with the label `Placement disk POC` and the `to
 The server reads the HTML file named by `placement_disk.file` in `config/console.conf` on each request.
 It does not copy the file, so an edit to the file shows after a page refresh.
 The server adds the page owner control at the first `<h1>` after `<main>`.
-When the file is missing or unreadable, the server returns 503 with `The Placement disk POC page is not available.`
+When the file is missing or unreadable, or the `~` path names an unknown user, the server returns 503 with `The Placement disk POC page is not available.`
 The page loads three.js from cdnjs. Served page documents send no Content-Security-Policy, so the load works in the console frame.
 
 ### Rebuilds page
@@ -2180,7 +2181,7 @@ The alert guard uses only the configured folder.
 `REVIEW_LINKS_ROOT` overrides the delivery folder.
 The page, the footer and `/next` use these same folder readers.
 
-The server reads `placement_disk.file` in `config/console.conf` on each Placement disk POC request.
+`placement_disk.file` in `config/console.conf` names the Placement disk POC file; see [Placement disk POC page](#placement-disk-poc-page).
 A `~` at the start of the path expands to the home folder.
 
 
