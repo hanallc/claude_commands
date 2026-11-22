@@ -47,7 +47,7 @@ class DiskTests(unittest.TestCase):
             "LINT_SWEEP_STATE_DIR": str(root / "sweep"), "USER_ZONE": "America/New_York",
             copy_record.ROOT_ENV: str(root / "tmp" / "scratch"),
         }))
-        # snapshot() walks SCCACHE_DIR as one more folder; the host's real cache must stay out of the test.
+        # Keep the host cache out of fixture snapshots.
         _ = os.environ.pop("SCCACHE_DIR", None)
         _ = (root / "buildlog.conf").write_text(
             "# whole: 1..\nDISK_WALK_MINUTES=60\n# whole: 0..23\nDISK_WALK_HOUR=3\n")
@@ -221,8 +221,7 @@ class DiskTests(unittest.TestCase):
                 return filesystem.FilesystemUsage(60, 140, 200, "2:1", "cargo-device")
             return filesystem.FilesystemUsage(20, 80, 100, "1:1", "root-device")
 
-        with mock.patch.dict(os.environ, {"SCCACHE_DIR": ""}), \
-             mock.patch.object(disk, "FOLDERS", [("checkout", str(checkout))]), \
+        with mock.patch.object(disk, "FOLDERS", [("checkout", str(checkout))]), \
              mock.patch.object(disk, "read_floor", return_value=None), \
              mock.patch.object(os, "stat", side_effect=device_stat), \
              mock.patch.object(filesystem, "filesystem_usage", side_effect=usage):
@@ -364,14 +363,13 @@ class DiskTests(unittest.TestCase):
             events.append("usage")
             return filesystem.FilesystemUsage(used=500, free=600)
 
-        # Folders under "/" share its device whatever the cwd is; the run's own sccache and Cargo outputs stay out.
-        environment = {key: value for key, value in os.environ.items() if key != "SCCACHE_DIR"}
+        # Folders under "/" share its device regardless of the working directory.
         for label, previous, hour in (("none", None, 15), ("old shape", old, 15), ("old full", full, 3)):
             clock = mock.Mock(return_value=datetime(2026, 10, 4, hour, tzinfo=user_zone()))
             with (
                 self.subTest(previous=label),
                 mock.patch.object(disk, "FOLDERS", [("first", "/first"), ("second", "/second")]),
-                mock.patch.dict(os.environ, {**environment, copy_record.ROOT_ENV: "/first/scratch"}, clear=True),
+                mock.patch.dict(os.environ, {copy_record.ROOT_ENV: "/first/scratch"}),
                 mock.patch.object(disk, "mapped_output_paths", return_value=([], [])),
                 mock.patch.object(disk, "read_floor", return_value=None),
                 mock.patch.object(disk, "read_snapshot", return_value=previous),
@@ -675,6 +673,7 @@ class DiskTests(unittest.TestCase):
             mock.patch.object(time, "time", return_value=began.timestamp()) as timestamp,
         ):
             first = disk.snapshot()
+            self.assertNotIn("sccache", [row["label"] for row in first["rows"]])
             gone: disk.FilesystemCapacity = {
                 "path": str(root / "gone"), "device": "9:9", "device_name": "old device", "used": 7, "free": 8,
             }
