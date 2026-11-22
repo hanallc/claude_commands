@@ -43,8 +43,8 @@ from scripts.lint.memory_test_support import config_environment, write_config_fi
 from scripts.lib import test_hang_guard
 
 FIXTURE_STATUS = "\n".join((
-    "mac: free",
-    "natedev: free",
+    "mac: no hold",
+    "natedev: no hold",
     "",
 ))
 
@@ -344,7 +344,7 @@ class StatusTests(IsolatedBuildTargetTest):
                         code = build_targets.command_status()
                     first = f"\033[1;31m{expected}\033[0m" if terminal else expected
                     self.assertEqual((code, errors.getvalue()), (0, ""))
-                    self.assertEqual(output.getvalue(), first + "\nnatedev: free\n")
+                    self.assertEqual(output.getvalue(), first + "\nnatedev: no hold\n")
 
     def test_stale_mac_reading_prints_before_target_status(self) -> None:
         _ = write_idle_alert(self.root / "mac-idle", NOW.timestamp(), written_age=301)
@@ -355,14 +355,47 @@ class StatusTests(IsolatedBuildTargetTest):
             code, output, errors = self.capture_status()
         self.assertEqual((code, errors), (0, ""))
         self.assertEqual(output.splitlines(), [
-            "MAC IDLE WATCH: no reading since 13:54; check buildlog-sample.timer.", "natedev: free",
+            "MAC IDLE WATCH: no reading since 13:54; check buildlog-sample.timer.", "natedev: no hold",
         ])
 
     def test_status_fields_remove_control_characters(self) -> None:
-        self.assertEqual(build_targets.format_state("ma\x1bc\n", targets.Free()), "mac: free")
+        self.assertEqual(build_targets.format_state("ma\x1bc\n", targets.Free()), "mac: no hold")
 
-    def test_free_line(self) -> None:
-        self.assertEqual(build_targets.format_state("natedev", targets.Free()), "natedev: free")
+    def test_no_hold_line(self) -> None:
+        self.assertEqual(build_targets.format_state("natedev", targets.Free()), "natedev: no hold")
+
+    def test_no_hold_status_reads_natedev_waiters_once(self) -> None:
+        from scripts.build_queue import admission_records, queue_snapshot
+        from scripts.lint.memory_test_support import admission_policy_fixture
+
+        directory = self.root / "buildlog" / "admission"
+        directory.mkdir(parents=True)
+        now = NOW.timestamp()
+        policy = admission_policy_fixture()
+        cases = (
+            (0, now, "natedev: no hold"),
+            (1, now, "natedev: no hold · 1 run waits, oldest 90 min"),
+            (16, now, "natedev: no hold · 16 runs wait, oldest 90 min"),
+            (16, now - 3600, "natedev: no hold"),
+        )
+        for count, written_at, line in cases:
+            with self.subTest(count=count, written_at=written_at):
+                ordered: list[tuple[Path, admission_records.Waiter]] = []
+                for index in reversed(range(count)):
+                    row: admission_records.Waiter = {
+                        "pid": index + 1, "start_time": str(index + 1), "need": admission_records.GIB,
+                        "since": now - 90 * 60 + 60 * index,
+                    }
+                    ordered.append((directory / f"{index}.waiting", row))
+                inputs = admission_records.QueueInputs(ordered, (), (), admission_records.ReadingUnavailable(),
+                    admission_records.NO_PRESSURE_HOLD, admission_records.ReadyToStart(), written_at)
+                queue_snapshot.write_queue_snapshot(directory, inputs, policy)
+                with (mock.patch.dict(os.environ, {"CONF_DIR": str(self.root)}),
+                      mock.patch.object(time, "time", return_value=now),
+                      mock.patch.object(queue_snapshot, "read_queue_snapshot",
+                                        wraps=queue_snapshot.read_queue_snapshot) as read):
+                    self.assertEqual(self.capture_status(), (0, f"mac: no hold\n{line}\n", ""))
+                read.assert_called_once_with(directory)
 
     def test_running_line_uses_local_zone(self) -> None:
         since = datetime(2026, 10, 11, 20, 20, tzinfo=timezone.utc)
@@ -395,7 +428,7 @@ class StatusTests(IsolatedBuildTargetTest):
             code, output, errors = self.capture_claim_status("inspector-session")
         self.assertEqual((code, errors), (0, ""))
         self.assertEqual(output,
-            "mac: running nextest hana since 13:05 PDT (showrunner hana, unit inspectors)\nnatedev: free\n")
+            "mac: running nextest hana since 13:05 PDT (showrunner hana, unit inspectors)\nnatedev: no hold\n")
         lookup.assert_called_once()
         self.assertEqual(set(cast(Iterable[str], lookup.call_args.args[0])), {"inspector-session"})
         full.assert_not_called()
@@ -403,7 +436,7 @@ class StatusTests(IsolatedBuildTargetTest):
     def test_unknown_claim_holder_preserves_running_text(self) -> None:
         with mock.patch.object(roster, "unit_labels_for", return_value={}):
             result = self.capture_claim_status("unknown-session")
-        self.assertEqual(result, (0, "mac: running nextest hana since 13:05 PDT\nnatedev: free\n", ""))
+        self.assertEqual(result, (0, "mac: running nextest hana since 13:05 PDT\nnatedev: no hold\n", ""))
 
     def test_stale_claim_with_same_description_and_time_cannot_replace_live_holder(self) -> None:
         for name, holder, started in (
@@ -435,13 +468,13 @@ class StatusTests(IsolatedBuildTargetTest):
     def test_claim_without_holder_session_does_not_read_labels(self) -> None:
         with mock.patch.object(roster, "unit_labels_for") as lookup:
             result = self.capture_claim_status()
-        self.assertEqual(result, (0, "mac: running nextest hana since 13:05 PDT\nnatedev: free\n", ""))
+        self.assertEqual(result, (0, "mac: running nextest hana since 13:05 PDT\nnatedev: no hold\n", ""))
         lookup.assert_not_called()
 
     def test_failed_claim_label_lookup_preserves_successful_status(self) -> None:
         with mock.patch.object(roster, "unit_labels_for", side_effect=RuntimeError("broken registry")):
             result = self.capture_claim_status("inspector-session")
-        self.assertEqual(result, (0, "mac: running nextest hana since 13:05 PDT\nnatedev: free\n", ""))
+        self.assertEqual(result, (0, "mac: running nextest hana since 13:05 PDT\nnatedev: no hold\n", ""))
 
     def test_named_hold_uses_the_same_labels_after_since(self) -> None:
         self.write_holder()
@@ -481,10 +514,13 @@ class StatusTests(IsolatedBuildTargetTest):
         for start in (process_identity.Gone(), process_identity.Started("reused-pid-start")):
             with self.subTest(start=start), mock.patch.dict(os.environ, {"CONF_DIR": str(config.parent)}), \
                  mock.patch.object(process_identity, "process_start", return_value=start):
-                self.assertEqual(self.capture_status(), (0, "mac: free · 1 claim kept for cleanup\nnatedev: free\n", ""))
+                self.assertEqual(self.capture_status(), (0, "mac: no hold · 1 claim kept for cleanup\nnatedev: no hold\n", ""))
             self.assertEqual(path.read_bytes(), before)
 
-    def test_free_status_counts_kept_claims_without_changing_them(self) -> None:
+    def test_no_hold_status_counts_kept_claims_without_changing_them(self) -> None:
+        from scripts.build_queue import queue_snapshot
+
+        read = self.enterContext(mock.patch.object(queue_snapshot, "read_queue_snapshot"))
         config = self.write_config("targets=mac\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n")
         before: dict[Path, bytes] = {}
         (self.mac_state / "claims").mkdir(parents=True, exist_ok=True)
@@ -499,8 +535,9 @@ class StatusTests(IsolatedBuildTargetTest):
             with self.subTest(count=count), mock.patch.dict(os.environ, {"CONF_DIR": str(config.parent)}), \
                  mock.patch.object(process_identity, "process_start", return_value=process_identity.Gone()):
                 noun = "claim" if count == 1 else "claims"
-                self.assertEqual(self.capture_status(), (0, f"mac: free · {count} {noun} kept for cleanup\n", ""))
+                self.assertEqual(self.capture_status(), (0, f"mac: no hold · {count} {noun} kept for cleanup\n", ""))
             self.assertEqual({path: path.read_bytes() for path in before}, before)
+        read.assert_not_called()
 
     def test_mac_running_status_adds_idle_since_from_claim(self) -> None:
         self.write_claim()
@@ -516,7 +553,7 @@ class StatusTests(IsolatedBuildTargetTest):
              mock.patch.object(process_identity, "process_start", return_value=process_identity.Started("test-run-start")):
             code, output, errors = self.capture_status()
         self.assertEqual((code, errors), (0, ""))
-        self.assertEqual(output, "mac: running nextest hana since 13:05 PDT, idle since 13:20\nnatedev: free\n")
+        self.assertEqual(output, "mac: running nextest hana since 13:05 PDT, idle since 13:20\nnatedev: no hold\n")
 
     def test_mac_running_status_lists_every_repository_claim(self) -> None:
         later = SINCE + timedelta(minutes=10)
@@ -537,7 +574,7 @@ class StatusTests(IsolatedBuildTargetTest):
         self.assertEqual(
             output,
             "mac: running nextest hana since 13:05 PDT; "
-            + "running nextest cargo-liner since 13:15 PDT, idle since 13:20\nnatedev: free\n",
+            + "running nextest cargo-liner since 13:15 PDT, idle since 13:20\nnatedev: no hold\n",
         )
 
     def test_mac_running_status_without_idle_time_keeps_existing_line(self) -> None:
@@ -664,7 +701,7 @@ class StatusTests(IsolatedBuildTargetTest):
         with mock.patch.dict(os.environ, {"CONF_DIR": str(Path(config).parent)}):
             self.assertEqual(self.capture_status(), (
                 0,
-                "natedev: free\nmac: held by hana since 13:05 PDT until 15:05 PDT — render checks\n",
+                "natedev: no hold\nmac: held by hana since 13:05 PDT until 15:05 PDT — render checks\n",
                 "",
             ))
 
@@ -722,7 +759,7 @@ class StatusTests(IsolatedBuildTargetTest):
             ):
                 with mock.patch.object(offload, "probe_reachability", side_effect=unavailable):
                     self.assertEqual(self.capture_status(probe=True), (
-                        0, "mac: unreachable — SSH probe failed for test-mac\nnatedev: free\n", "",
+                        0, "mac: unreachable — SSH probe failed for test-mac\nnatedev: no hold\n", "",
                     ))
         self.assertEqual(calls, ["test-mac"])
 

@@ -269,7 +269,7 @@ def format_state(name: str, state: TargetState,
         from scripts.buildlog.mac_idle_alert import kept_claims_text
 
         suffix = f" · {kept_claims_text(state.kept_claims)}" if state.kept_claims else ""
-        return f"{name}: free{suffix}"
+        return f"{name}: no hold{suffix}"
     if isinstance(state, Running):
         return f"{name}: " + "; ".join(running_job_text(job, labels) for job in state.jobs)
     if isinstance(state, Unreachable):
@@ -303,13 +303,32 @@ def probe_target(target: SshTarget) -> TargetState:
     return target_state(target)
 
 
+def natedev_wait_suffix(now: float) -> str:
+    from scripts.build_queue import queue_snapshot
+    from scripts.buildlog import store
+
+    snapshot = queue_snapshot.read_queue_snapshot(store.root() / "admission")
+    if not isinstance(snapshot, queue_snapshot.QueueSnapshot) or not snapshot.inputs.ordered:
+        return ""
+    try:
+        freshest = conf.read_or_repository("build_admission").number("silence_seconds")
+    except conf.Unusable:
+        return ""
+    if now - snapshot.written_at > freshest:
+        return ""
+    waiting = snapshot.inputs.ordered
+    count = len(waiting)
+    oldest = min(row["since"] for _, row in waiting)
+    minutes = int(max(0, now - oldest) // 60)
+    runs = "1 run waits" if count == 1 else f"{count} runs wait"
+    return f" · {runs}, oldest {minutes} min"
+
+
 def command_status(probe: bool = False) -> int:
-
-
     from scripts.buildlog import mac_idle_alert
     from scripts.lib.user_zone import user_zone
     from scripts.message import roster
-    from scripts.build_targets.targets import Held, HolderSession, Running
+    from scripts.build_targets.targets import Free, Held, HolderSession, Running
 
     try:
         targets = read_targets()
@@ -334,11 +353,13 @@ def command_status(probe: bool = False) -> int:
     except Exception:
         identities = {}
     labels = {state: identities[session_id] for state, session_id in holders.items() if session_id in identities}
-    alert = mac_idle_alert.alert_line(mac_idle_alert.state_dir() / "alert.json", time.time(), user_zone())
+    now = time.time()
+    alert = mac_idle_alert.alert_line(mac_idle_alert.state_dir() / "alert.json", now, user_zone())
     if alert is not None:
         print(f"\033[1;31m{alert}\033[0m" if sys.stdout.isatty() else alert)
     for name, state in states:
-        print(format_state(name, state, labels))
+        wait = natedev_wait_suffix(now) if name == "natedev" and isinstance(state, Free) else ""
+        print(format_state(name, state, labels) + wait)
     return 0
 
 
