@@ -34,15 +34,11 @@ class NoShownOwner:
     """There is no staff name to show in the page heading."""
 
 
-def with_owner(content: bytes, page: str, owner: staff.StaffRow | NoShownOwner, members: staff.StaffSnapshot,
-               dialog: Callable[[], str], *,
-               recipient: str | OwnerNewItem = OwnerNewItem.FOR_SHOWN_OWNER) -> bytes:
-    """Add the shared owner control to one served console document."""
+def owner_control(page: str, owner: staff.StaffRow | NoShownOwner, members: staff.StaffSnapshot, *,
+                  recipient: str | OwnerNewItem = OwnerNewItem.FOR_SHOWN_OWNER) -> str:
+    """Render the owner name and its New item button."""
     from scripts.review_links import staff_names
 
-    main = re.search(rb"<main(?=[\s>])[^>]*>", content)
-    if main is None or b'data-page-owner="' in content:
-        return content
     name = ""
     if isinstance(owner, staff.StaffRow):
         rendered = staff_names.StaffNames(members).html(owner.id, owner.name)
@@ -57,7 +53,17 @@ def with_owner(content: bytes, page: str, owner: staff.StaffRow | NoShownOwner, 
         label = html.escape(label, quote=True)
         button = (f'<button type="button" data-owner-new aria-label="{label}" title="{label}">'
                   + icon_svg("message-circle-question") + '</button>')
-    control = (f'<div class="page-owner" data-page-owner="{page}">' + name + button + '</div>').encode()
+    return f'<div class="page-owner" data-page-owner="{page}">' + name + button + '</div>'
+
+
+def with_owner(content: bytes, page: str, owner: staff.StaffRow | NoShownOwner, members: staff.StaffSnapshot,
+               dialog: Callable[[], str], *,
+               recipient: str | OwnerNewItem = OwnerNewItem.FOR_SHOWN_OWNER) -> bytes:
+    """Add the shared owner control to one served console document."""
+    main = re.search(rb"<main(?=[\s>])[^>]*>", content)
+    if main is None or b'data-page-owner="' in content:
+        return content
+    control = owner_control(page, owner, members, recipient=recipient).encode()
     actions = HEADING_ACTIONS.encode()
     heading = TITLE_ELEMENT.search(content, main.end())
     if heading is not None:
@@ -75,7 +81,7 @@ def with_owner(content: bytes, page: str, owner: staff.StaffRow | NoShownOwner, 
     if row_style not in content:
         style = b'<style>' + row_style + b'</style>' + style
     content = content.replace(b'</head>', style + b'</head>', 1)
-    if button:
+    if recipient is not OwnerNewItem.UNAVAILABLE:
         markup = dialog()
         if CONSOLE_DIALOG_ASSETS.encode() in content:
             markup = markup.replace(CONSOLE_DIALOG_ASSETS, '', 1)

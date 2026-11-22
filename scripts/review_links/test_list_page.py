@@ -7,6 +7,7 @@ import io
 import json
 import os
 import re
+import shlex
 import select
 import shutil
 import signal
@@ -655,7 +656,7 @@ document.body.append(result);
         self.assertIn('<span class="warning">Check overdue Nov 16 12:00 EST</span>', check)
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for browser checks")
-    def test_browser_new_item_opens_the_dialog_and_reveals_the_saved_row(self) -> None:
+    def test_browser_new_item_refreshes_without_opening_a_row(self) -> None:
         root = self.root / "reviews"
         _ = self.add("An existing List item")
         initial = page_frame.with_owner(list_page.render(root, include_counts=False), "list", MORTY,
@@ -718,13 +719,18 @@ window.fetch=async (path,options={})=>{
  const reply=__ROW_REPLY__;
  finishRowSave(Response.json(reply.body,{status:reply.status}));
  const row=()=>document.querySelector('[data-list-item][data-key="'+CSS.escape(created)+'"]');
- await until(document.body,()=>row() && !row().hidden && recordIsOpen(row()));
+ await until(document.body,row);
+ check(row().hidden && !recordIsOpen(row()),'Send preserves the search and keeps the new row closed.');
+ check(!new URLSearchParams(location.hash.slice(1)).has('jump'),'Send adds no jump to the address.');
  check(reads===1,'The New item save refreshes the List once after the row save ends.');
  check(!dialog.open,'Send closes the dialog.');
  const saved=requests.find(([,body])=>body?.words);
  check(saved?.[0]==='/console/review/new-item' && saved[1].recipient_id===owner && saved[1].page==='list',
        'Send uses the shared endpoint and the selected List owner.');
- check(row().textContent.includes('A new List item'),'The filtered List reveals the saved row.');
+ document.querySelector('#list-search').value='';
+ document.querySelector('#list-search').dispatchEvent(new Event('input',{bubbles:true}));
+ row().querySelector('.list-toggle').click();
+ check(recordIsOpen(row()),'A click opens the row.');
  const result=document.createElement('p');result.id='probe-results';result.textContent=JSON.stringify(failures);
  document.body.append(result);
 })();
@@ -758,7 +764,7 @@ window.fetch=async (path,options={})=>{
  }
  sends.push(payload);
  if(sends.length===1) throw new TypeError('The response was lost.');
- return Response.json({id:'Q1',key:'fixture-review-key',list_key:savedKey});
+ return Response.json({id:'Q1',key:'fixture-review-key'});
 };
 </script>""".replace("__KEY__", json.dumps(list_page.ListRecord(MORTY.id, item).key)).replace(
             "__OWNER__", json.dumps(MORTY.id)).replace("__FRESH__", json.dumps(fresh).replace("<", r"\u003c"))
@@ -2444,7 +2450,7 @@ result.textContent=JSON.stringify(failures);document.body.append(result);
 
     def test_feedback_button_belongs_to_the_words_box_and_starts_disabled(self) -> None:
         item = self.add("Explain this item")
-        form = list_page.feedback_form(list_page.ListRecord(MORTY.id, item), "fixture-secret")
+        form = list_page.feedback_form(list_page.ListRecord(MORTY.id, item), "fixture-secret", keeper_name=MORTY.name)
         actions, words = form.split('</div>', 1)
         self.assertNotIn('value="tell"', actions)
         self.assertNotIn('<label for="words-', words)
@@ -2912,7 +2918,7 @@ window.fetch=(url,options)=>{
     def fields(self, item: the_list.ListItem, action: str, **changes: str) -> dict[str, str]:
         folder = change_page.console_folder(self.root / "reviews")
         secret = change_browser.browser_manifest(folder)[0]
-        form = list_page.feedback_form(list_page.ListRecord(MORTY.id, item), secret)
+        form = list_page.feedback_form(list_page.ListRecord(MORTY.id, item), secret, keeper_name=MORTY.name)
         fields = dict(re.findall(r'<input type="hidden" name="([^"]+)" value="([^"]*)">', form))
         return {**fields, "action": action, "words": "", "until": "", **changes}
 
@@ -6244,6 +6250,62 @@ window.fetch=async(path,options={})=>{
                 assert notice is not None
                 self.assertEqual(''.join(notice.itertext()), text + ", 13:00 EST")
                 self.assertEqual(tuple(span.text for span in notice.findall('span')), colored)
+
+    def test_signed_actions_use_the_keeper_of_each_visible_item(self) -> None:
+        root = self.root / "reviews"
+        for keeper in (DWIGHT.id, OTHER.id, staff.StaffId("missing-keeper")):
+            with self.subTest(keeper=keeper):
+                item = the_list.add(keeper, "Read the legacy List item", owner=keeper, source="nate", changes={})
+                markup = list_page.render(root, include_counts=False).decode()
+                self.assertIn(f'data-key="{keeper}/{item.id}"', markup)
+                member = staff.local_snapshot().by_id(keeper)
+                keeper_name = member.name if member is not None else "the record keeper"
+                self.assertIn(f'Tell {keeper_name}</button>', markup)
+
+                def submit(action: str, *, words: str = "", until: str = "") -> list_page.ListActionSubmission:
+                    current = the_list.load(keeper, item.id)
+                    request, token = list_page.signed_item_request(
+                        list_page.ListRecord(keeper, current), list_page.form_secret(root))
+                    return list_page.submit(root, urlencode(dict(
+                        keeper=keeper, id=item.id, request=request, token=token, action=action, words=words,
+                        until=until)))
+
+                self.assertIsInstance(submit("read"), change_page.NoMessageDelivery)
+                self.assertIs(the_list.load(keeper, item.id).unread_since, the_list.NoTimestamp.UNSET)
+                told = submit("tell", words="Read this result.")
+                assert isinstance(told, list_page.ListFeedbackDelivery)
+                self.assertEqual(told.keeper, keeper)
+                parked = submit("park", until="2026-12-03")
+                assert isinstance(parked, list_page.ListFeedbackDelivery)
+                self.assertEqual(parked.keeper, keeper)
+                unparked = submit("unpark")
+                assert isinstance(unparked, list_page.ListUnparkSubmission)
+                self.assertIs(unparked.outcome, list_page.UnparkOutcome.CLEARED)
+                asked = submit("question", words="Which check passed?")
+                assert isinstance(asked, list_page.ListQuestionDelivery)
+                self.assertEqual(asked.delivery.recipients, (keeper,))
+                self.assertEqual(the_list.load(keeper, item.id).questions[0].words, "Which check passed?")
+                if member is not None and member.kind == "producer":
+                    with patch.object(change_page, "send_question", return_value=question_outcome()) as send:
+                        list_page.deliver(asked)
+                    attempt = change_page.read_question_attempt(asked.status.path(asked.delivery.page, asked.delivery.row))
+                    send.assert_called_once_with(keeper, attempt.message, attempt.message_id)
+                    command = attempt.message.split("Answer with this command: ", 1)[1].splitlines()[0]
+                    arguments = ["The smoke test passed." if word == "<answer>" else word
+                                 for word in shlex.split(command)[2:]]
+                    with (patch.object(staff, "caller_identity", return_value=member.current_session),
+                          redirect_stdout(io.StringIO())):
+                        self.assertEqual(the_list.main(arguments), 0)
+                    answered = the_list.load(keeper, item.id)
+                    answer = answered.questions[0].answer
+                    assert isinstance(answer, question_record.Answer)
+                    self.assertEqual(answer.text, "The smoke test passed.")
+                    self.assertEqual(answered.log[-1].source, member.name)
+                    self.assertEqual(answered.unread_since, NOW)
+                removed = submit("remove")
+                assert isinstance(removed, list_page.ListFeedbackDelivery)
+                self.assertEqual(removed.keeper, keeper)
+                self.assertIs(the_list.load(keeper, item.id).state, the_list.ItemState.CLOSED)
 
     def test_signed_feedback_logs_words_and_uses_the_shared_sender(self) -> None:
         root = self.root / "reviews"

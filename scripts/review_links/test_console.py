@@ -26,6 +26,7 @@ from scripts.production.change_routing import UnavailableProduction
 from scripts.review_links import (
     change_browser, change_page, console, for_you, investigations_page, page_frame, record_table, review_link,
 )
+from scripts.review_links.test_accounts_page import firefox_probe_results
 
 
 class ConsoleMarkup(HTMLParser):
@@ -87,6 +88,68 @@ class ConsoleTests(unittest.TestCase):
         self.assertIsInstance(pages[aws + 1].destination, console.UnavailablePage)
         source = console.render(pages, console.UnavailablePage()).decode()
         self.assertIn('data-page="aws_machines" data-url="" data-title="AWS Machines" aria-label="AWS Machines — Not available"', source)
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for the owner dialog.")
+    def test_unavailable_aws_machines_opens_new_item_for_builds(self) -> None:
+        builds = staff.StaffRow(staff.StaffId("builds-staff"), "showrunner", "builds", staff.STAFF_ROOT,
+                                current_session=staff.StaffId("builds-session"),
+                                doc=staff.LiveDoc("natedev", self.root / "production.md"))
+        aws = staff.StaffRow(staff.StaffId("aws-staff"), "unit", "aws", staff.ReportsTo(builds.id),
+                             current_session=staff.StaffId("aws-session"),
+                             unit_type=staff.UnitDetails("direct"))
+        _ = write_config_fixture(self.configuration / "console.conf",
+                                 f"page.aws_machines.owner={aws.id}\npage.builds.owner={builds.id}\n")
+        pages = (console.ConsolePage("aws_machines", "AWS Machines", "server", "AWS Machines", console.UnavailablePage()),
+                 console.ConsolePage("builds", "Builds", "hammer", "Builds", console.UnavailablePage()))
+        with patch.object(staff, "local_snapshot", return_value=staff.StaffSnapshot((aws, builds))):
+            source = console.render(pages, console.UnavailablePage())
+        probe = b"""<script>
+(async()=>{
+ const failures=[], check=(ok,message)=>{if(!ok) failures.push(message);};
+ const realFetch=window.fetch.bind(window), requests=[], captures=[];
+ window.fetch=async (input, options)=>{
+  const route=new URL(input, location.href);
+  if(route.pathname==='/console/review/new-item' && route.search) {
+   requests.push(route.search);
+   return Response.json({token:'fixture',page_owner:'builds-staff',
+                         recipients:[{id:'builds-staff',name:'builds'}]});
+  }
+  if(route.pathname==='/console/review/new-item' && options?.method==='POST') {
+   captures.push(options.body);
+  }
+  return Response.json({}, {status:400});
+ };
+ try {
+  const pane=document.querySelector('#page-unavailable');
+  const control=pane.querySelector('[data-page-owner="aws_machines"]');
+  const button=control.querySelector('[data-owner-new]');
+  check(!pane.hidden && pane.textContent.includes('Not available'), 'The unavailable notice is visible.');
+  check(control.getClientRects().length && control.querySelector('.page-owner-name').textContent==='aws',
+        'The unavailable page shows its configured owner.');
+  check(button.getAttribute('aria-label')==='New item for builds', 'The button names the configured route.');
+  const dialog=document.querySelector('#review-new-item'), recipients=dialog.querySelector('[data-recipients]');
+  const loaded=new Promise(resolve=>{
+   const observer=new MutationObserver(()=>{if(recipients.firstChild){observer.disconnect();resolve();}});
+   observer.observe(recipients,{childList:true});
+  });
+  button.click();
+  check(dialog.open, 'The owner button opens the shared dialog.');
+  await loaded;
+  check(requests.join()==='?page=aws_machines' && recipients.querySelector('input:checked')?.value==='builds-staff',
+        'The dialog requests the AWS Machines owner and selects builds.');
+  const screenshot=dialog.querySelector('[name=include_page]');
+  check(!screenshot.getClientRects().length && !screenshot.checked,
+        'The unavailable page offers no screenshot.');
+  check(dialog.querySelector('[data-capture-slot]').hidden && captures.length===0,
+        'The unavailable page starts no capture.');
+  dialog.querySelector('[data-close]').click();
+  document.querySelector('[data-page=builds]').click();
+  check(!control.getClientRects().length && pane.querySelector('[data-page-owner=builds]').getClientRects().length,
+        'The owner changes with the selected unavailable page.');
+ } catch(error) {failures.push(String(error));}
+ await realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
+})();</script>"""
+        self.assertEqual(firefox_probe_results(source.replace(b"</body>", probe + b"</body>")), [[]])
 
     def test_publication_reuses_the_changes_link_and_inlines_only_local_icons(self) -> None:
         output = self.root / "snapshots/aws"

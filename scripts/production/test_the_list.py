@@ -705,8 +705,9 @@ class TheListTests(unittest.TestCase):
                 with self.subTest(command=name):
                     self.assertEqual(self.command(name, *args, "--source", "dwight"),
                                      (1, "", f"the_list: only morty can run {name}\n"))
-            self.assertEqual(self.command("answer", item.id, "--question", "Q1", "--text", "Answer"),
-                             (1, "", "the_list: only morty can run answer\n"))
+            self.assertEqual(self.command("answer", item.id, "--question", "Q1", "--text", "Answer",
+                                          "--keeper", MORTY.id),
+                             (1, "", "the_list: only the record keeper or morty can answer\n"))
         self.assertEqual(the_list.records(MORTY.id), [item])
         self.assertEqual(self.notices, [])
 
@@ -1085,6 +1086,24 @@ class TheListTests(unittest.TestCase):
         assert isinstance(answer, question_record.Answer)
         self.assertEqual(answer.text, text)
         self.assertEqual(saved.unread_since, START)
+
+    def test_morty_can_select_the_keeper_when_list_ids_match(self) -> None:
+        first = self.add(number=1)
+        second = the_list.add(OTHER.id, "Check the second item", owner=RUNNER.id, source="nate", number=1, changes={})
+        status = change_page.DeliveryStatus(self.root / "reviews")
+        for keeper, item in ((MORTY.id, first), (OTHER.id, second)):
+            _ = the_list.ask_question(keeper, item.id,
+                                      the_list.PageRequest("ask", "question", "Which check passed?"), status)
+        first_open = the_list.load(MORTY.id, first.id)
+        self.assertEqual(self.command("answer", second.id, "--question", "Q1", "--text", "The second check.",
+                                      "--keeper", OTHER.id),
+                         (0, f"answered {second.id} Q1\n", ""))
+        self.assertEqual(the_list.load(MORTY.id, first.id), first_open)
+        saved = the_list.load(OTHER.id, second.id)
+        answer = saved.questions[0].answer
+        assert isinstance(answer, question_record.Answer)
+        self.assertEqual(answer.text, "The second check.")
+        self.assertEqual(saved.log[-1].source, MORTY.name)
 
     def test_close_clears_unread_and_reopen_marks_a_new_update(self) -> None:
         item = self.add()

@@ -109,6 +109,24 @@ class PageStatusTests(unittest.TestCase):
         self.assertEqual(page.count(b'<dialog id="review-new-item"'), 1)
         self.assertEqual(page_frame.with_owner(page, "list", owner, rows, lambda: self.fail("The dialog already exists.")), page)
 
+    def test_list_owner_setting_keeps_morty_in_new_item_recipients(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.enterContext(patch.dict(os.environ, {"CONF_DIR": str(root)}))
+        config = conf.path("console")
+        self.assertEqual(config, root / "console.conf")
+        repository = Path(__file__).resolve().parents[2] / "config" / "console.conf"
+        identity = staff.StaffId(conf.read(repository).text("page.list.owner"))
+        morty = staff.StaffRow(identity, "producer", "morty", staff.STAFF_ROOT,
+                               current_session=staff.StaffId("current-morty-session"),
+                               doc=staff.LiveDoc("natedev", config.parent / "missing.md"))
+        members = staff.StaffSnapshot((morty,))
+        with patch.object(review_submissions, "local_machine", return_value="natedev"):
+            _ = config.write_text("page.list.owner=producer-staff\n", encoding="utf-8")
+            self.assertEqual(review_submissions.recipient_options(members), [])
+            _ = config.write_text(f"page.list.owner={identity}\n", encoding="utf-8")
+            self.assertEqual(review_submissions.recipient_options(members),
+                             [{"id": identity, "name": "morty", "proposal": False}])
+
     def test_accounts_shows_the_configured_owner_and_names_the_route(self) -> None:
         root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         config = root / "console.conf"

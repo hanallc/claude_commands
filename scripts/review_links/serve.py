@@ -1688,8 +1688,6 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                 edited = isinstance(saved, review_submissions.EditedSubmission)
                 response = {"id": saved.id, "key": created.key, "version": created.version}
                 on_list = bool(list_draft_id) or isinstance(request, new_item_dialog.NewItemRequest) and request.page == "list"
-                if on_list:
-                    response["list_key"] = list_page.add_submission(created).key
                 if list_draft_id and edited:
                     request = None
                     screenshot = new_item_dialog.NO_PAGE_SCREENSHOT

@@ -532,11 +532,11 @@ class ReviewLinksServerTests(unittest.TestCase):
             self.assertEqual(response.status, 409, response.body)
             replay = cast(dict[str, str], json.loads(response.body))
             self.assertEqual((replay["code"], replay["id"]), ("already_filed", saved["id"]))
-            self.assertEqual((replay["key"], replay["list_key"]), (saved["key"], saved["list_key"]))
+            self.assertEqual(replay["key"], saved["key"])
 
         self.assertEqual(cache.get().records[cast(str, saved["key"])].owner, other.id)
         self.assertEqual(len(investigation.records(other.id)), 1)
-        self.assertEqual(len(the_list.records(other.id)), 1)
+        self.assertEqual(the_list.records(other.id), [])
         self.assertEqual(investigation.records(owner.id), [])
         self.assertEqual(the_list.records(owner.id), [])
 
@@ -579,12 +579,10 @@ class ReviewLinksServerTests(unittest.TestCase):
             self.assertEqual(invalid_reply.status, 409, invalid_reply.body)
             for reply in (edited_reply, invalid_reply):
                 result = cast(dict[str, str], json.loads(reply.body))
-                self.assertEqual((result["id"], result["key"], result["list_key"]),
-                                 (saved["id"], saved["key"], saved["list_key"]))
+                self.assertEqual((result["id"], result["key"]), (saved["id"], saved["key"]))
         original, = investigation.records(owner.id)
-        row, = the_list.records(owner.id)
         self.assertEqual(original.question, request.words)
-        self.assertEqual(row.reviews, (saved["key"],))
+        self.assertEqual(the_list.records(owner.id), [])
 
     def test_concurrent_list_sends_of_one_draft_file_one_item(self) -> None:
         case = self.review_fixture()
@@ -617,16 +615,15 @@ class ReviewLinksServerTests(unittest.TestCase):
             _ = completed.wait()
         self.assertEqual(sorted((first.status, second.status)), [200, 409])
         first_fields, second_fields = (cast(dict[str, str], json.loads(reply.body)) for reply in (first, second))
-        for field in ("id", "key", "list_key"):
+        for field in ("id", "key"):
             self.assertEqual(first_fields[field], second_fields[field])
         conflict = first_fields if first.status == 409 else second_fields
         self.assertEqual(conflict["code"], "already_filed")
         original, = investigation.records(owner.id)
-        row, = the_list.records(owner.id)
         self.assertEqual(original.id, first_fields["id"])
-        self.assertEqual(row.reviews, (first_fields["key"],))
+        self.assertEqual(the_list.records(owner.id), [])
 
-    def test_list_retry_recovers_the_missing_row_after_the_capture_expires(self) -> None:
+    def test_list_retry_recovers_delivery_after_the_capture_expires(self) -> None:
         from scripts.review_links.test_review_submissions import PNG
 
         case = self.review_fixture()
@@ -645,7 +642,7 @@ class ReviewLinksServerTests(unittest.TestCase):
         with (patch.object(server, "review_cache", cache),
               patch.object(server, "delivery_status", case.status),
               patch.object(change_page, "send_to_staff") as deliver):
-            with patch.object(list_page, "add_submission", side_effect=OSError("List row write stopped.")):
+            with patch.object(review_actions, "prepare_submission_delivery", side_effect=OSError("Delivery setup stopped.")):
                 failed = self.new_item_http(body, finished=True)
             self.assertEqual(failed.status, 503, failed.body)
             original, = investigation.records(owner.id)
@@ -658,9 +655,8 @@ class ReviewLinksServerTests(unittest.TestCase):
                 self.assertEqual(saved["code"], "already_filed")
             deliver.assert_called_once()
 
-        row, = the_list.records(owner.id)
         self.assertEqual(saved["id"], original.id)
-        self.assertEqual(row.reviews, (saved["key"],))
+        self.assertEqual(the_list.records(owner.id), [])
         self.assertEqual(investigation.records(owner.id), [original])
         self.assertEqual(self.request(review_page.ATTACHMENT_PATH + "?" + urlencode(
             {"key": saved["key"], "id": review_submissions.PAGE_SCREENSHOT.id})),
@@ -807,14 +803,15 @@ class ReviewLinksServerTests(unittest.TestCase):
               patch.object(self.server, "delivery_status", case.status),
               capture_sender("send_message") as send):
             cases = (
-                (new_item_dialog.SubmissionKind.QUESTION, review_items.ReviewType.QUESTION),
-                (new_item_dialog.SubmissionKind.INVESTIGATION, review_items.ReviewType.INVESTIGATION),
-                (new_item_dialog.SubmissionKind.BUG, review_items.ReviewType.BUG),
+                (new_item_dialog.SubmissionKind.QUESTION, review_items.ReviewType.QUESTION, morty),
+                (new_item_dialog.SubmissionKind.INVESTIGATION, review_items.ReviewType.INVESTIGATION, morty),
+                (new_item_dialog.SubmissionKind.BUG, review_items.ReviewType.BUG, morty),
+                (new_item_dialog.SubmissionKind.BUG, review_items.ReviewType.BUG, default),
             )
-            for kind, review_type in cases:
-                with self.subTest(kind=kind):
+            for kind, review_type, recipient in cases:
+                with self.subTest(kind=kind, recipient=recipient.name):
                     send.reset_mock()
-                    request = replace(case.submission_request(kind, morty.id), page="list")
+                    request = replace(case.submission_request(kind, recipient.id), page="list")
                     if kind != new_item_dialog.SubmissionKind.BUG:
                         request = replace(request, request_id="r2-" + uuid4().hex)
                     body = self.new_item_body(request)
@@ -822,20 +819,16 @@ class ReviewLinksServerTests(unittest.TestCase):
                     self.assertEqual(response.status, 200, response.body)
                     saved = cast(dict[str, str], json.loads(response.body))
                     item = cache.get().records[saved["key"]]
-                    self.assertEqual((item.owner, item.type), (morty.id, review_type))
-                    keeper, list_id = saved["list_key"].split("/", 1)
-                    self.assertEqual(keeper, morty.id)
-                    listed = the_list.load(morty.id, list_id)
-                    self.assertEqual((listed.owner, listed.producer, listed.reviews), (morty.id, morty.id, (item.key,)))
-                    self.assertIn(listed.title.encode(), self.request(list_page.PAGE_PATH).body)
+                    self.assertEqual((item.owner, item.type), (recipient.id, review_type))
                     retry = self.new_item_http(body, finished=True)
                     self.assertEqual(retry.status, 200, retry.body)
                     repeated = cast(dict[str, str], json.loads(retry.body))
                     self.assertEqual(repeated, saved | {"version": repeated["version"]})
-                    self.assertEqual(sum(row.evidence == listed.evidence for row in the_list.records(morty.id)), 1)
-                    send.assert_called_once_with(f"session:{morty.current_session}", change_page.SENDER, ANY)
+                    self.assertEqual(the_list.records(recipient.id, include_closed=True), [])
+                    self.assertNotIn("list_key", saved)
+                    send.assert_called_once_with(f"session:{recipient.current_session}", change_page.SENDER, ANY)
 
-    def test_list_draft_retries_after_a_failed_link(self) -> None:
+    def test_list_draft_retries_after_failed_delivery_setup(self) -> None:
         from scripts.review_links.test_review_submissions import PNG
 
         image = base64.b64decode(PNG)
@@ -899,7 +892,8 @@ class ReviewLinksServerTests(unittest.TestCase):
                       patch.object(change_page, "deliver", record_delivery),
                       patch.object(change_page, "send_message") as send,
                       patch.object(image_store, "register_file", wraps=image_store.register_file) as register):
-                    with patch.object(the_list, "link", side_effect=OSError("The List link is unavailable.")):
+                    with patch.object(review_actions, "prepare_submission_delivery",
+                                      side_effect=OSError("Delivery setup stopped.")):
                         self.assertEqual(self.new_item_http(body, finished=True).status, 503)
                     original, = update_registration.question_records_for_owner(owner.id, strict=True)
                     send.assert_not_called()
@@ -1022,9 +1016,7 @@ class ReviewLinksServerTests(unittest.TestCase):
                                 update_registration.question_records_for_owner(owner.id, strict=True), [])
                             self.assertEqual(the_list.records(owner.id), [])
 
-                    listed, = the_list.records(target.id)
-                    self.assertEqual(saved["list_key"], f"{target.id}/{listed.id}")
-                    self.assertEqual((listed.owner, listed.reviews), (target.id, (item.key,)))
+                    self.assertEqual(the_list.records(target.id), [])
                     self.assertEqual(origin.images, (review_submissions.PAGE_SCREENSHOT,))
                     attachment = urlencode({"key": saved["key"], "id": review_submissions.PAGE_SCREENSHOT.id})
                     self.assertEqual(self.request(review_page.ATTACHMENT_PATH + "?" + attachment).body, image)
@@ -1895,7 +1887,7 @@ class ReviewLinksServerTests(unittest.TestCase):
         image = base64.b64decode(PNG)
 
         def lose_first_reply(active: serve.ReviewLinksHandler, status: int, fields: Mapping[str, object]) -> None:
-            if active.path == review_page.NEW_ITEM_PATH and status == 200 and "list_key" in fields and not lost:
+            if active.path == review_page.NEW_ITEM_PATH and status == 200 and "key" in fields and not lost:
                 lost.update(fields)
                 active.close_connection = True
                 return
@@ -1913,12 +1905,12 @@ class ReviewLinksServerTests(unittest.TestCase):
             retry = self.new_item_http(body, finished=True)
             self.assertEqual(retry.status, 200, retry.body)
             confirmed = cast(dict[str, str], json.loads(retry.body))
-            self.assertEqual((confirmed["key"], confirmed["list_key"]), (lost["key"], lost["list_key"]))
+            self.assertEqual(confirmed["key"], lost["key"])
             changed = json.dumps({**asdict(attempt), "token": token, "capture_key": key,
                                   "defer_capture": asdict(page_capture), "words": "Changed after Send."}).encode()
             replay = self.new_item_http(changed, finished=True)
             self.assertEqual(replay.status, 409, replay.body)
-            self.assertEqual(json.loads(replay.body)["list_key"], confirmed["list_key"])
+            self.assertEqual(json.loads(replay.body)["key"], confirmed["key"])
             launch.assert_called_once_with(key, "/test/firefox", page_capture, queued=False)
             server.capture_page(key, "/test/firefox", url, page_capture)
             attachment = self.request(review_page.ATTACHMENT_PATH + "?" + urlencode(
@@ -1926,7 +1918,7 @@ class ReviewLinksServerTests(unittest.TestCase):
             self.assertEqual(attachment, HttpReply(200, "image/png", image))
             self.assertEqual(len(cache.get().records), 1)
             self.assertEqual(len(investigation.records(request.recipient_id)), 1)
-            self.assertEqual(len(the_list.records(request.recipient_id)), 1)
+            self.assertEqual(the_list.records(request.recipient_id), [])
             deliver.assert_called_once()
 
     def test_deferred_capture_failure_keeps_the_item_and_page_data(self) -> None:
@@ -1964,11 +1956,9 @@ class ReviewLinksServerTests(unittest.TestCase):
                         self.assertEqual(retry.status, 200, retry.body)
                         confirmed = cast(dict[str, str], json.loads(retry.body))
                         self.assertEqual((confirmed["id"], confirmed["key"]), (saved["id"], saved["key"]))
-                        if page == "list":
-                            self.assertEqual(confirmed["list_key"], saved["list_key"])
             launch.assert_not_called()
             self.assertEqual(deliver.call_count, 10)
-            self.assertEqual(len(the_list.records(request.recipient_id)), 5)
+            self.assertEqual(the_list.records(request.recipient_id), [])
 
     def test_restart_finds_capture_intent_before_a_lookup_or_receipt_exists(self) -> None:
         from scripts.review_links.test_review_submissions import PNG
@@ -2244,7 +2234,7 @@ class ReviewLinksServerTests(unittest.TestCase):
             retry = self.new_item_http(json.dumps(fields).encode(), finished=True)
             self.assertEqual(retry.status, 200, retry.body)
             saved = cast(dict[str, str], json.loads(retry.body))
-            for name in ("id", "key", "list_key"):
+            for name in ("id", "key"):
                 self.assertEqual(saved[name], lost[name])
             self.assertEqual(self.page_capture_preview(capture_key).status, 404)
             with server.page_captures.for_filing(capture_key) as capture:
@@ -2252,7 +2242,7 @@ class ReviewLinksServerTests(unittest.TestCase):
                     new_item_dialog.PageScreenshot(image, viewport).digest))
             deliver.assert_called_once()
         self.assertEqual(len(investigation.records(owner.id)), 1)
-        self.assertEqual(len(the_list.records(owner.id)), 1)
+        self.assertEqual(the_list.records(owner.id), [])
         self.assertEqual(self.request(review_page.ATTACHMENT_PATH + "?" + urlencode(
             {"key": key, "id": review_submissions.PAGE_SCREENSHOT.id})), preview)
 
@@ -2294,10 +2284,9 @@ class ReviewLinksServerTests(unittest.TestCase):
                 retry = send(first_image)
                 self.assertEqual(retry.status, 200, retry.body)
                 self.assertEqual(json.loads(retry.body)["key"], fields["key"])
-                self.assertEqual(json.loads(retry.body)["list_key"], fields["list_key"])
             deliver.assert_called_once()
         self.assertEqual(len(investigation.records(owner.id)), 1)
-        self.assertEqual(len(the_list.records(owner.id)), 1)
+        self.assertEqual(the_list.records(owner.id), [])
         attachment = self.request(review_page.ATTACHMENT_PATH + "?" + urlencode(
             {"key": fields["key"], "id": review_submissions.PAGE_SCREENSHOT.id}))
         self.assertEqual(attachment, HttpReply(200, "image/png", second_image))
