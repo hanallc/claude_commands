@@ -10,7 +10,7 @@ The daily build report (`buildlog report [day]`) shows four costs:
 1. The Rebuilds section groups compile time by crate count and compares nextest compile time with test time.
 2. A temporary table compares daily test build time with fixed baselines.
 3. The `scratch (temp folders)` row groups builds in temporary folders across callers.
-4. The Disk table shows space for `~/rust`, `/tmp`, two CI runners, other files, and free space against the sweep's floor.
+4. The Disk table shows space for fixed folders and the current Hana CI runners. It also shows disk capacity.
 
 The buildlog tests write to a temporary log and do not scan real disks.
 They do not add records to the real build log.
@@ -24,7 +24,7 @@ They do not add records to the real build log.
 | `scripts/direct/verify.sh` | `take_test_targets` reads the saved metadata answer into `TEST_SELECTION`; the `test` arm uses that selection. |
 | `scripts/direct/verify_metadata.py` | Answers `test-targets` from the call's saved Cargo metadata. |
 | `scripts/buildlog/report.py` | `report()` assembles the day. `rebuilds_section` with the rebuild-bin constants, `PACKAGE_PATTERN`, `KnownCrateStep`, `RebuildTiming`, `PackageRebuilds`, `rebuild_bin`, `known_crate_steps`, `rebuild_timings`, `rebuild_rows`, `whole_percent`, `nextest_rebuild_lines`, `rebuild_package`, `package_rebuild_rows`; `SCRATCH`, `GROUP_AS_SCRATCH`, `SCRATCH_LABEL`, `kind_section`, `summary` for scratch rows; `test_builds_section`; `disk_section`. |
-| `scripts/buildlog/disk.py` | The Disk rows (`FOLDERS`), the walk (`measure`), the floor (`read_floor`, `InvalidFloor`), the snapshot file, and the directories outside the build caches that the disk-floor alerts read (`docs/as-built/build-memory-admission.md`). |
+| `scripts/buildlog/disk.py` | Disk folders (`scanned_folders`), disk measurement (`measure`), the disk floor (`read_floor`), and the snapshot file. Disk floor alerts use the snapshot's directory sizes outside the build caches. |
 | `scripts/buildlog/filesystem.py` | `FilesystemUsage` and `filesystem_usage(path)`, shared by `disk.py` and the 60 s sample. |
 | `scripts/buildlog/index.py` | `build_keys(argv) -> CargoBuildKey \| NonCargoBuild` and the step build-key columns (Rebuilds section). |
 | `scripts/buildlog/cli.py` | `buildlog disk`, listed in the usage docstring. |
@@ -122,11 +122,11 @@ The walk is too slow for report time, so a job measures and the report reads.
 
 **Measuring.** `buildlog disk` runs `disk.write_snapshot(disk.snapshot())` and prints nothing on success. `snapshot()` reads the floor first. Without a newer walk request, `snapshot()` walks when no full previous snapshot exists. Otherwise, it walks when the last walk is at least `DISK_WALK_MINUTES` old and the hour is `DISK_WALK_HOUR` in the user's zone. Other runs refresh free and used space only and set `capacity_measured_at`. Folder freshness uses `measured_at`; a capacity refresh does not refresh folder sizes. A large unnamed fall requests one walk through `disk-walk-request.json`. A request newer than the last walk permits a walk outside the configured hour. The request needs recent floor records with the same held roots and filesystem. The floor sweep deletes the request after it sends the folder growth follow-up. `write_snapshot` writes `<store.root()>/disk.json.tmp` and renames it over `disk.json` (`store.DISK_NAME`). A malformed floor raises `InvalidFloor` before any walk. The command prints `buildlog disk: <key> in <config> must be a non-negative number of GiB` to stderr. It exits 1 and keeps the previous `disk.json`.
 
-```python
-FOLDERS = [("~/rust", "~/rust"), ("/tmp", "/tmp"),
-           ("CI runner 1", "/var/lib/hana-ci/hana-linux-1"),
-           ("CI runner 2", "/var/lib/hana-ci/hana-linux-2")]
+`FOLDERS` holds the fixed rows for `~/rust`, `~/.local/state`, and `/tmp`.
+`scanned_folders()` uses `build_folders.ci_folders("hana")` to list numbered folders under `<build root>/hana/ci`.
+It adds one row named `CI runner <N>` per folder, in number order.
 
+```python
 class DiskRow(TypedDict):
     label: str
     bytes: int
@@ -134,7 +134,7 @@ class DiskRow(TypedDict):
 class MeasuredDiskSnapshot(TypedDict):
     measured_at: str     # store.utc_iso, stamped after the walk
     host: str            # store.host_name(), the short name
-    rows: list[DiskRow]  # FOLDERS order
+    rows: list[DiskRow]  # Measurement order
     used: int
     free: int
     floor: int | None    # bytes; None when lint.conf sets none
@@ -146,7 +146,10 @@ def measure(folders: list[tuple[str, str]], usage: Callable[[], FilesystemUsage]
             previous: PreviousOutsideMeasurement = NO_EARLIER_OUTSIDE_MEASUREMENT) -> MeasuredDiskSnapshot
 ```
 
-`DiskSnapshot`, what `read_snapshot` returns, has the same keys with the last three `NotRequired`, so a `disk.json` written before they existed still reads. The Disk table uses only the first six; the three outside-cache keys (directories one and two levels under each `FOLDERS` entry holding at least 1 GiB outside cargo target dirs, with growth since `previous_measured_at`) serve the disk-floor alerts in `scripts/lint/sweep.py` (`docs/as-built/build-memory-admission.md`).
+`read_snapshot` returns a `DiskSnapshot` and can read older snapshots that lack the last three fields above.
+The disk floor alerts in `scripts/lint/sweep.py` use these three fields.
+They track growth since `previous_measured_at` for directories one or two levels below a measured folder.
+The snapshot includes these directories when they hold at least 1 GiB outside Cargo target directories.
 
 `measure` expands `~` and walks the rows in order with one `seen: set[sweep.InodeKey]` passed to every `sweep.directory_blocks(path, seen)` call, then measures the outside-cache directories, then calls `usage()` once, then stamps `measured_at`. A row's size is allocated blocks (`st_blocks * 512`, symlinks not followed), each `(st_dev, st_ino)` counted once across all rows: a file hard-linked into two rows counts in the first. `directory_blocks` skips any directory or entry it cannot read; called without `seen`, it counts per directory, as the sweep's own doc-index sizing does.
 
@@ -185,14 +188,14 @@ Folder sizes measured by the buildlog disk job at 03:14 EDT; free and used space
 
 ## Invariants
 
-- A test never reaches `~/.local/state/buildlog` and never walks the real disks. The suite needs no `BUILDLOG_DIR` from its caller; importing `test_index` sets it. Disk tests hand `measure` fake trees and run `snapshot()` only with `FOLDERS`, the walk and `filesystem_usage` patched.
+- Disk tests use a temporary build root for CI discovery. They pass temporary trees to `measure` and replace the fixed folders for tests of `snapshot()`.
 - A new `test_*.py` imports `test_index` or calls `use_test_log()`; `LogIsolationTests` fails until it does.
 - `store.py` carries no test-only default location.
 - `verify.sh test` builds under `--workspace`, never `-p <pkg>`. The selection decides what builds; `-E 'package(<pkg>)'` and the `--filter` union decide what runs.
 - The package's integration tests stay in its test build.
 - A temp-folder step is counted, never dropped: one scratch row per kind, and in every summary.
 - The report never walks the disk; it reads `disk.json` only. `buildlog disk` is its one writer and replaces it by rename, so a reader sees a whole snapshot, old or new.
-- Every inode counts once across all Disk rows, in `FOLDERS` order, through one shared `seen`; `other` is used minus the rows, clamped at zero.
+- The measurement counts each inode once across all Disk rows. When the report shows `other`, it subtracts the rows from used space and applies a minimum of zero.
 - `disk.json` stays at the log root beside `sync.json`. `buildlog sync` pushes only this host's folder and natedev's `ci/`, and pulls only the `record.SYNC_HOSTS` folders, so the snapshot never reaches the Mac, and the Mac's report has no Disk section.
 - `report.py` keeps one style: `table()`, `seconds()`, `count()`, `gib()`. Times carry their zone, and their date when not today.
 - Nothing sits directly under a report table but its one `Source:` line, which carries any explanation of the table: the Waiting, both Rebuilds, the Power profile and both Tests per edit tables have that line, and so does any new table; every other table ends at the next blank line (Memory pressure and Test builds put their `Source:` line under the heading, above the table).
@@ -253,7 +256,7 @@ Folder sizes measured by the buildlog disk job at 03:14 EDT; free and used space
 - **Usage read once, after the walk.** It puts used as close to the rows in time as the walk allows, and `measured_at` marks when the numbers were complete.
 - **Floor read before the walk.** A malformed lint.conf fails in milliseconds instead of after a minute's walk, and the last good snapshot stays.
 - **Reuse the sweep's walk and config reader.** One block counter and one lint.conf parser; the floor shown is the one the sweep enforces, against free measured the same way (`f_bavail`).
-- **These four rows.** They are where builds write: worktrees and their targets under `~/rust`, scratch clones and session folders under `/tmp`, and the two CI runners' trees. Everything else is `other`.
+- **CI runner rows.** The build folder model supplies these rows so the report follows changes to the runner folders.
 - **natedev only.** The user scoped the Disk table to natedev; the Mac is not measured.
 
 
