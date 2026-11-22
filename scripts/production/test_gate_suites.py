@@ -21,7 +21,7 @@ from unittest import mock
 from scripts.build_queue.admission_jobs import GateJobNotRecorded, StepJob
 from scripts.production import affected_modules, checkpoint_gate, gate, targeted_test
 from scripts.lint.memory_test_support import write_config_fixture
-from scripts.lib import process_group
+from scripts.lib import git_index, process_group
 from scripts.test_times import gate_record
 from scripts.production.gate_modules import GateRefused, discover_test_modules, test_module_name
 from scripts.production.gate_test_support import SUITE_MODULE, gate_suites, install_test_runner, wait_for_file
@@ -377,21 +377,23 @@ class MergeGateSuitesTests(GateSuitesFixture):
         self.assertEqual(self.pass_records(), before)
 
     @gate_suites("hooks")
-    def test_empty_selection_history_keeps_the_validated_commit(self) -> None:
+    def test_empty_selection_history_keeps_the_validated_commit_and_branch(self) -> None:
         from scripts.aws_target import cloud_gate
 
         head = self.git(self.checkout, "rev-parse", "HEAD")
         tree = self.git(self.checkout, "rev-parse", "HEAD^{tree}")
+        branch = self.git(self.checkout, "branch", "--show-current")
         self.write(self.checkout / "subject.txt", "contents of the second commit\n")
         second = self.commit(self.checkout, "Change the subject")
         _ = self.git(self.checkout, "reset", "--hard", head)
+        _ = self.git(self.checkout, "branch", "after-validation", second)
         selection = affected_modules.AffectedSelection(
             affected_modules.CertifiedBase(head, "2026-01-15T00:00:00+00:00"), (), ())
         append_pass = gate.PassedTreeLedger.append_pass
 
         def move_head_after_validation(ledger: gate.PassedTreeLedger, passed: gate.ValidatedTestPass) -> None:
             append_pass(ledger, passed)
-            _ = self.git(self.checkout, "reset", "--hard", second)
+            _ = self.git(self.checkout, "checkout", "after-validation")
 
         with (mock.patch.dict(os.environ, self.environment),
               mock.patch.object(cloud_gate, "route") as route,
@@ -403,8 +405,9 @@ class MergeGateSuitesTests(GateSuitesFixture):
             route.assert_not_called()
 
         self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), second)
+        self.assertEqual(self.git(self.checkout, "branch", "--show-current"), "after-validation")
         record, = self.gate_run_records()
-        self.assertEqual((record["sha"], record["tree"], record["status"]), (head, tree, 0))
+        self.assertEqual((record["sha"], record["tree"], record["branch"], record["status"]), (head, tree, branch, 0))
 
     @gate_suites("hooks")
     def test_cloud_fallback_records_no_pass_when_the_checkout_changes_during_the_hold(self) -> None:
@@ -560,6 +563,35 @@ class MergeGateSuitesTests(GateSuitesFixture):
 
         self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), head)
         self.assertEqual(self.git(self.checkout, "status", "--porcelain"), "M subject.txt")
+        self.assertEqual(self.pass_records(), [])
+
+    @gate_suites("hooks")
+    def test_cloud_fallback_publishes_no_pass_when_the_index_changes_during_the_final_read(self) -> None:
+        from scripts.aws_target import cloud_gate
+
+        added = "ignored.txt"
+        self.write(self.checkout / ".git/info/exclude", f"/{added}\n")
+        self.write(self.checkout / added, "ignored until staged\n")
+        private_copy = git_index.private_copy
+
+        def stage_and_restore_after_copy(source: Path, destination: Path) -> None:
+            if copy.call_count != 2:
+                private_copy(source, destination)
+                return
+            self.write(self.checkout / "subject.txt", "edited before the index copy\n")
+            private_copy(source, destination)
+            _ = self.git(self.checkout, "add", "-f", added)
+            _ = self.git(self.checkout, "restore", "subject.txt")
+
+        with (mock.patch.dict(os.environ, self.environment),
+              mock.patch.object(cloud_gate, "route", return_value="fixture cloud unavailable"),
+              mock.patch.object(git_index, "private_copy", side_effect=stage_and_restore_after_copy) as copy,
+              contextlib.redirect_stdout(io.StringIO())):
+            with self.assertRaisesRegex(GateRefused, "^The Git index changed during the checkout read$"):
+                _ = gate.run_gate_suites(self.checkout)
+            self.assertEqual(copy.call_count, 2)
+
+        self.assertEqual(self.git(self.checkout, "status", "--porcelain"), f"A  {added}")
         self.assertEqual(self.pass_records(), [])
 
     @gate_suites("hooks")

@@ -1187,6 +1187,7 @@ def finish_gate_job(job: RunningGateJob, status: int) -> GateJobResult:
 class CleanTestTree:
     tree: str
     commit: str
+    branch: str
 
 
 @dataclass(frozen=True)
@@ -1244,8 +1245,9 @@ def clean_test_tree(repo: Path) -> CleanTestTree | UnrecordableTestTree:
 
 
 def head_test_tree(repo: Path) -> CleanTestTree:
-    commit, tree = checked_git(repo, "show", "-s", "--no-show-signature", "--format=%H%n%T", "HEAD").splitlines()
-    return CleanTestTree(tree, commit)
+    ref = checked_git(repo, "rev-parse", "--symbolic-full-name", "HEAD")
+    commit, tree = checked_git(repo, "show", "-s", "--no-show-signature", "--format=%H%n%T", ref).splitlines()
+    return CleanTestTree(tree, commit, ref.removeprefix("refs/heads/"))
 
 
 @dataclass(frozen=True)
@@ -1484,8 +1486,7 @@ def record_gate_run(ledger: PassedTreeLedger, executions: Sequence[GateJobResult
         ]
         tested = ledger.tree
         if isinstance(tested, CleanTestTree):
-            sha = tested.commit
-            branch = checked_git(ledger.repo, "rev-parse", "--abbrev-ref", "HEAD")
+            sha, branch = tested.commit, tested.branch
         else:
             sha, branch = checked_git(ledger.repo, "rev-parse", "HEAD", "--abbrev-ref", "HEAD").splitlines()
         run: gate_record.GateRun = {

@@ -1161,21 +1161,58 @@ def import_record(folder: Path, row: dict[str, object]) -> None:
             gate_record.report_not_written(error)
 
 
+@dataclass(frozen=True)
+class MissingGateIndex:
+    """The checkout has no index file."""
+
+
+@dataclass(frozen=True)
+class GateIndexStamp:
+    device: int
+    inode: int
+    changed_ns: int
+    modified_ns: int
+
+    @classmethod
+    def read(cls, path: Path) -> GateIndexStamp | MissingGateIndex:
+        try:
+            info = path.stat()
+        except FileNotFoundError:
+            return MissingGateIndex()
+        return cls(info.st_dev, info.st_ino, info.st_ctime_ns, info.st_mtime_ns)
+
+
+@contextmanager
+def stable_gate_index(source: Path) -> Generator[Path]:
+    def contents(path: Path) -> bytes:
+        with suppress(FileNotFoundError):
+            return path.read_bytes()
+        return b''
+
+    with tempfile.TemporaryDirectory(prefix='cloud-gate-index-') as temporary:
+        index = Path(temporary) / 'index'
+        stamp = GateIndexStamp.read(source)
+        # Keep the stat cache and its timestamp for Git's racy-entry check.
+        with suppress(FileNotFoundError):
+            git_index.private_copy(source, index)
+        copied = contents(index)
+        yield index
+        if contents(source) != copied or GateIndexStamp.read(source) != stamp:
+            raise GateRefused('The Git index changed during the checkout read')
+
+
 def working_tree(repo: Path) -> tuple[str, set[str]]:
     head, index_path = gate.checked_git(
         repo, 'rev-parse', '--path-format=absolute', 'HEAD^{tree}', '--git-path', 'index').split('\n', 1)
     routed = gate.routed_gate_tree(repo)
     bound = routed.tree if isinstance(routed, gate.RoutedGateTree) else head
-    with tempfile.TemporaryDirectory(prefix='cloud-gate-index-') as temporary:
-        def git(index: Path, *arguments: str, input: bytes = b'') -> bytes:
-            environment = {**os.environ, 'GIT_INDEX_FILE': str(index)}
-            return subprocess.run(['git', *arguments], cwd=repo, env=environment, input=input,
-                                  check=True, capture_output=True).stdout
 
-        index = Path(temporary) / 'index'
-        # Keep the stat cache and its timestamp for Git's racy-entry check.
-        with suppress(FileNotFoundError):
-            git_index.private_copy(Path(index_path), index)
+    def git(index: Path, *arguments: str, input: bytes = b'') -> bytes:
+        environment = {**os.environ, 'GIT_INDEX_FILE': str(index)}
+        return subprocess.run(['git', *arguments], cwd=repo, env=environment, input=input,
+                              check=True, capture_output=True).stdout
+
+    with stable_gate_index(Path(index_path)) as index:
         index_changes = git(index, 'diff-index', '--cached', '--no-renames', '--ignore-submodules=none',
                             '--name-status', '-z', head)
         files = git(index, 'ls-files', '-v', '-z', '--cached', '--modified', '--others', '--exclude-standard')
@@ -1188,7 +1225,7 @@ def working_tree(repo: Path) -> tuple[str, set[str]]:
         if bound != head or b'D' in staged[::2] or skipped:
             # Keep removed paths and read files that the copied index marks to skip.
             entries = git(index, 'ls-files', '--stage', '-z')
-            index = Path(temporary) / 'working'
+            index = index.with_name('working')
             _ = git(index, 'read-tree', bound, head)
             _ = git(index, 'update-index', '--replace', '-z', '--index-info', input=entries)
         _ = git(index, 'add', '-A')
