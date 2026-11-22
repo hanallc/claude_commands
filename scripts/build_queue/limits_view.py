@@ -74,6 +74,7 @@ WORDS: Mapping[str | type[object], str] = {
     records.NeedsMemory: "This run needs more free memory to start.",
     records.GpuSlotWait: "All GPU test places are in use.",
     records.RunLimitWait: "The run limit for {repository} on {machine} is full.",
+    "run_limit_full": "The repository run limit is full.",
     records.BehindHead: "This run waits behind an earlier step in the queue.",
     "remote_start": "This run waits while a step starts on another machine.",
     records.ReadyForAdmission: "The queue can start this run at its next check.",
@@ -475,9 +476,11 @@ def wait_text(reason: records.WaitReason | wire.CloudSlotWait, origin: str = "")
     if isinstance(reason, records.HeadAdmissionStatus):
         reason = reason.cause
     if isinstance(reason, records.RunLimitWait):
-        name = short_name(origin)
+        name = short_name(origin) or clean_label(reason.repository)
         machine = clean_label(reason.machine)
-        return WORDS[records.RunLimitWait].format(repository=name, machine=machine) if name and machine else ""
+        if name and machine:
+            return WORDS[records.RunLimitWait].format(repository=name, machine=machine)
+        return WORDS["run_limit_full"]
     if isinstance(reason, records.BehindHead) and reason.head_name == "remote startup":
         return WORDS["remote_start"]
     if isinstance(reason, wire.CloudSlotWait) and isinstance(reason.state, ReservedCloudSlot):
@@ -579,7 +582,11 @@ def build_limits(reading: records.QueueRead, snapshots: target_availability.Snap
         if label := clean_label(recorded_unit, names.get(session, ""), session_name, short_name(origin)):
             cell.other.append(label)
 
-    ordered = {(item["pid"], item["since"]): item for _, item in reading.ordered}
+    bindings = Counter(origin for bound in policy_rows.values() for origin in bound)
+    bound_origins = {
+        key: origin for key, bound in policy_rows.items() if len(bound) == 1
+        for origin in bound if bindings[origin] == 1
+    }
     for visible in waits:
         entry = visible.source
         if isinstance(entry, wire.CloudRow):
@@ -600,13 +607,8 @@ def build_limits(reading: records.QueueRead, snapshots: target_availability.Snap
         if pinned != local:
             destination = remote_wait(pinned)
         elif isinstance(reason, records.RunLimitWait) and reason.machine == local:
-            waiter = ordered.get((step.pid, step.since))
-            origin = recorded_origin(waiter.get("repo_identity", "")) if waiter is not None else ""
-            if short_name(origin) and policy.for_step(local, reason.repository, step.step):
-                bind(reason.repository, origin)
-                destination = row(origin).natedev.waits
-            else:
-                destination = local_waits
+            origin = bound_origins.get(reason.repository, "")
+            destination = row(origin).natedev.waits if origin else local_waits
         elif isinstance(reason, (records.BuildSpaceLow, records.BuildSpaceUnreadable)):
             destination = metric_waits.setdefault("disk", {})
         elif isinstance(reason, records.GpuSlotWait):
@@ -617,7 +619,6 @@ def build_limits(reading: records.QueueRead, snapshots: target_availability.Snap
             destination = local_waits
         destination.setdefault(wait_text(step.reason, origin), []).append(visible.name)
 
-    bindings = Counter(origin for bound in policy_rows.values() for origin in bound)
     shared: list[Metric] = []
     counted: set[str] = set()
     prefix = local + "."
@@ -629,8 +630,8 @@ def build_limits(reading: records.QueueRead, snapshots: target_availability.Snap
         owners = occupancy.get(repository_key, set[str]()) - counted
         used = len(owners)
         counted.update(owners)
-        origin = next(iter(bound)) if len(bound) == 1 else ""
-        if not origin or bindings[origin] != 1:
+        origin = bound_origins.get(repository_key, "")
+        if not origin:
             labels = {short_name(candidate) for candidate in bound}
             name = next(iter(labels)) if len(labels) == 1 else clean_label(repository_key)
             label = WORDS["policy_key"].format(name=name) if name else WORDS["repository_run_limit"]

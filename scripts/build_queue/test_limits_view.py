@@ -106,6 +106,8 @@ class BuildLimitsTests(unittest.TestCase):
                                 records.RunLimitWait(1, 2, hidden_key, "natedev")),
             records.WaitingStep(10, "", "", "check", "", now, 0, records.ReadyForAdmission(),
                                 route=target_config.PinnedTarget("other-target")),
+            records.WaitingStep(11, "", "", "gate", "", now, 0,
+                                records.RunLimitWait(1, 1, "unmatched", "natedev")),
         )
         cloud = tuple(wire.CloudRow(wire.Owner(pid, str(pid)), wire.Identity("", "", "gate", "", ""), wire.CloudPlace("aws"),
             now, 0, NoCloudProgress(), NoCounter(), reason) for pid, reason in (
@@ -113,11 +115,11 @@ class BuildLimitsTests(unittest.TestCase):
                 (7, wire.CloudSlotWait(1, 4, ReservedCloudSlot())),
             ))
         ranked: records.RankedWaiter = {"pid": 1, "start_time": "1", "since": now, "need": 0,
-                                        "repo_identity": primary, "order": records.NormalOrder()}
+                                        "order": records.NormalOrder()}
         queue = wire.CloudQueueRead(replace(reading.view, waiting=waiting), explanation, [(Path("one"), ranked)],
                                     cloud=cloud, cloud_slots=4, cloud_gate_stale_pushes=1)
         names = {1: "Run limit", 2: "Disk wait", 3: "Memory wait", 4: "AWS target wait", 5: "Mac wait",
-                 7: "/private/caller", 8: "Unplaced wait"}
+                 7: "/private/caller", 8: "Unplaced wait", 9: "Unbound wait"}
         cloud_names = {cloud[0].owner: "Cloud wait", cloud[1].owner: "Starting wait"}
         waits = limits_view.visible_waits(queue_view.QueueModel(queue, {}), names, cloud_names)
         saved = limits_view.Background(history, limits_view.Metric("money", 2, 5, "USD", "estimate"),
@@ -140,7 +142,10 @@ class BuildLimitsTests(unittest.TestCase):
         self.assertEqual(shown.natedev.unattributed, 1)
         self.assertEqual([(metric.label, metric.used, metric.limit) for metric in shown.natedev.shared[-2:]],
                          [("Repository run limit", 1, 2), ("unmatched run limit", 0, 1)])
-        self.assertEqual(shown.natedev.waits, {"": [""]})
+        self.assertEqual(shown.natedev.waits, {
+            "The repository run limit is full.": [""],
+            "The run limit for unmatched on natedev is full.": ["Unbound wait"],
+        })
         self.assertEqual((hana_row.aws.used, hana_row.aws.limit), (None, 1))
         self.assertEqual(next(metric for metric in shown.natedev.shared if metric.label == "disk").waits,
                          {"The build disk has less free space than the queue requires.": ["Disk wait"]})
@@ -160,9 +165,11 @@ class BuildLimitsTests(unittest.TestCase):
         self.assertFalse(any(metric.label == "disk" for metric in idle.natedev.shared))
         copy_only = replace(queue, explanation=replace(explanation,
             decided_from=replace(explanation.decided_from, reservations=reservations[1:2])))
-        copy_limits = limits_view.build_limits(copy_only, (), (), {}, {}, saved, UTC)
+        copy_limits = limits_view.build_limits(copy_only, (), waits, cloud_names, {}, saved, UTC)
         copy_cell = next(row.natedev for row in copy_limits.repositories if row.owner == "team · example.invalid")
         self.assertEqual((copy_cell.used, copy_cell.limit, copy_cell.runs), (1, 1, ["merge-owner"]))
+        self.assertEqual(copy_cell.waits, cell.waits)
+        self.assertEqual(copy_limits.natedev.waits, shown.natedev.waits)
         within_limit = replace(queue, explanation=replace(explanation,
             policy=replace(explanation.policy, repository_runs=records.RepositoryRunLimits({"natedev.project": 2}, "merge-owner"))))
         within = limits_view.build_limits(within_limit, (), waits, cloud_names, {}, saved, UTC)
