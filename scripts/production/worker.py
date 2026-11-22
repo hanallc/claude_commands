@@ -2547,8 +2547,8 @@ def restore(parent: StaffId, *, record: staff.StaffSnapshot | None = None,
     outcome = ExitCode.OK
     launch_account = ((worker_panes.DestinationWorkerAccount(account) if account else
                        worker_panes.ConfiguredWorkerAccount.CURRENT) if isinstance(account, str) else account)
-    observed = _read_workers(holder, record, scanned=runs)
-    states = observed.states if only == "all" else [state for state in observed.states if state.row.id in only]
+    observed = _read_workers(holder, record, only=only, scanned=runs)
+    states = observed.states
     workers_held = quota_state.no_worker_mode()
     held_runs = list(dict.fromkeys(path.resolve() for path in observed.runs))
     selected_workers = tuple(dict.fromkeys(state.row.name for state in states
@@ -2611,10 +2611,21 @@ def restore(parent: StaffId, *, record: staff.StaffSnapshot | None = None,
                             or current.current_session != previous.row.current_session or current_holder is None):
                         failed(previous.row, "The worker changed before restore")
                         continue
+                    run = worker_panes.worker_run(current, record=current_record, scanned=runs)
+                    passed = worker_panes.worker_pass(current, run, record=current_record)
+                    parked = progress_history.parked_worker_pass(passed)
                     herdr.refresh_restore_pane_evidence()
-                    selection = worker_panes.SelectedWorkerRows(frozenset({current.id}))
-                    refreshed = worker_panes.observe_parents([current_holder], current_record, selection=selection)
-                    refreshed_state = next(iter(refreshed[parent]), None)
+                    selected_row = worker_panes.SelectedWorkerRows(frozenset({current.id}))
+                    selection: worker_panes.SelectedWorkerRows | Literal["by_name"] = selected_row
+                    if only == "all":
+                        refreshed = worker_panes.observe(parent, current_record)
+                    elif parked:
+                        refreshed = worker_panes.observe_parents(
+                            [current_holder], current_record, selection=selected_row)[parent]
+                    else:
+                        refreshed = worker_panes.observe_selected(parent, current_record, [worker_name])
+                        selection = "by_name"
+                    refreshed_state = next((pane for pane in refreshed if pane.row.id == current.id), None)
                     if refreshed_state is None:
                         failed(previous.row, "The worker was not observed during restore")
                         continue
@@ -2622,15 +2633,12 @@ def restore(parent: StaffId, *, record: staff.StaffSnapshot | None = None,
                     if isinstance(state, (worker_panes.ProcessUnknownWorker, worker_panes.UncertainWorker)):
                         failed(state.row, state.reason)
                         continue
-                    run = worker_panes.worker_run(state.row, record=current_record, scanned=runs)
                     plan = _resume_needed(state, (run, *held_runs))
                     if isinstance(plan, DispatchEvidenceUnknown):
                         failed(state.row, plan.reason, notice=f"anomaly: {name}: {plan.reason}")
                         continue
-                    passed = worker_panes.worker_pass(state.row, run, record=current_record)
                     recovery = CompletionRecovery.NO_PENDING_NOTICE
-                    if (plan is None or progress_history.parked_worker_pass(passed)
-                            or passed.get("status") == "canceled" or state.row.id in reaped_panes):
+                    if plan is None or parked or passed.get("status") == "canceled" or state.row.id in reaped_panes:
                         recovery = completion_notices.recover_completion(state.row, current_holder, run, hold,
                                                                          record=current_record)
                     if recovery is CompletionRecovery.RECOVERED:
@@ -2641,7 +2649,7 @@ def restore(parent: StaffId, *, record: staff.StaffSnapshot | None = None,
                     if recovery is CompletionRecovery.WAITING_ON_REAP:
                         failed(state.row, recovery.value, notice=f"{name}: {recovery.value}")
                         continue
-                    if recovery is not CompletionRecovery.PENDING_CLOSE and progress_history.parked_worker_pass(passed):
+                    if recovery is not CompletionRecovery.PENDING_CLOSE and parked:
                         current = worker_panes.observe_worker(parent, state.row, staff.snapshot())
                         if isinstance(current, worker_panes.ClosedWorker):
                             continue

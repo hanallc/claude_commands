@@ -1141,7 +1141,9 @@ def _recover_pass(event: WorkerEvent, row: staff.StaffRow, run: Path, passed: di
 
     receipt = worker.dispatch_receipt(row, delivery.line, delivery.completion_id, run=run,
                                       require_transcript=require_transcript, verify=verify)
-    if not isinstance(receipt, worker.DispatchComplete) or stage_one:
+    if (not isinstance(receipt, worker.DispatchComplete) or stage_one
+            or (event.kind == EventKind.TURN_END and not isinstance(event.native_stop, dict)
+                and receipt.reply != event.reply)):
         return receipt
     path = Path(delivery.reply_file)
     worker.save_reply(path, receipt.reply)
@@ -1407,7 +1409,6 @@ def _handle_locked(event: WorkerEvent,
         if (event.kind == EventKind.TURN_END and (not reply or reply != event.reply)
                 and not isinstance(event.native_stop, dict)
                 and not isinstance(turn_cursor, worker.TranscriptCursor)
-                and not isinstance(receipt, worker.DispatchComplete)
                 and not (isinstance(receipt, worker.DispatchWaitingForRuns) and
                          isinstance(receipt.reply, (worker.DispatchComplete, worker.DispatchAwaitingReply)))
                 and not (needs_verification and isinstance(receipt, worker.DispatchAwaitingReply))

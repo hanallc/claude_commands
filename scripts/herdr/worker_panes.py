@@ -1470,8 +1470,7 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
         return StartRefused(StartRefusal.BUSY_ROLE_CHANGE, "the worker changed before startup")
 
     def read_evidence(membership: staff.StaffSnapshot) -> PaneEvidence:
-        if isinstance(selection, SelectedWorkerRows):
-            herdr.refresh_restore_pane_evidence()
+        herdr.refresh_restore_pane_evidence()
         return _evidence(owner.id, membership, client, selection=selection)
 
     evidence = read_evidence(record)

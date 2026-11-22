@@ -52,7 +52,6 @@ from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.cancellation import CANCELLATION_SIGNALS
 from scripts.message import send_budget
 from scripts.production import staff, worker_admission
-from scripts.usage import rollouts
 
 if TYPE_CHECKING:
     from scripts.accounts.session_state import RunEvidence
@@ -1119,9 +1118,12 @@ class ResultDoneEvidence(Protocol):
 def run_finish_time(record: RunRecord) -> float | RunFinishedBefore | RunFinishTimeUnknown:
     """Read the finish time without assuming precision in old records."""
     value = record.get("finished_at", "")
-    at = rollouts.parse_timestamp(value)
-    if at is None:
+    try:
+        at = datetime.fromisoformat(value)
+    except ValueError:
         return RunFinishTimeUnknown.UNRECORDED
+    if at.tzinfo is None:
+        at = at.replace(tzinfo=timezone.utc)
     # Old records truncate to seconds.
     return at.timestamp() if value[19:20] == "." else RunFinishedBefore(at.timestamp() + 1)
 
