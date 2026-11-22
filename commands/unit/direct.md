@@ -171,7 +171,7 @@ Other prompts carry the Three Gods and Type Design Contract under <WritePromptCo
 <CoreContract>
 - Never modify unrelated files. The unit director creates a separate worktree with `worktrees.py make <repo word> <unit> <short-name>`.
   The unit's staff row keeps its home worktree. The run record keeps the worker's checkout.
-  When the work ends, run `worktrees.py remove <path>`.
+  When the work ends, run `~/.claude/scripts/lib/py ~/.claude/scripts/worktree/worktrees.py remove <path>`.
   Send the reported paths to the showrunner as a removal list.
   In the home worktree, create only the branch that <PushCheckpoint/> pushes.
   Never switch to an existing branch.

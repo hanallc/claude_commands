@@ -28,7 +28,7 @@ A short name is one nonempty path component. It must contain a character other t
 - A phase that runs beside the current phase uses a model worktree.
   The director creates it with `worktrees.py make <repo word> <unit> p<phase id>`.
   The director uses a distinct short name `p<phase id>` for each phase.
-  The director runs `worktrees.py remove <path>` after the checkpoint reaches origin.
+  The director runs `~/.claude/scripts/lib/py ~/.claude/scripts/worktree/worktrees.py remove <path>` after the checkpoint reaches origin.
   The director sends the reported checkout and output paths to the showrunner as a removal list.
   `phase_reservation.py claim` accepts the unit's home worktree or a model worktree.
   The command records the path only for a separate model worktree.
@@ -36,7 +36,7 @@ A short name is one nonempty path component. It must contain a character other t
   It updates the worktree and staff records, adds a link at the old path, and links the Claude transcript folders.
   A retry resumes from the move record.
   A managed unit rename uses `unit_folder_rename` to move the unit's source and build folders together.
-- `worktrees.py remove <path>` reports the checkout and its assigned output for manual removal.
+- `~/.claude/scripts/lib/py ~/.claude/scripts/worktree/worktrees.py remove <path>` reports the checkout and its assigned output for manual removal.
   `worktrees.py retire <unit>` removes that unit's named outputs and numbered copies across the build root.
   A held lock prevents removal of its folder.
 - `worktrees.py migrate --list <file> --dry-run` prints the plan without writing files.

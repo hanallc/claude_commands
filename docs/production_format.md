@@ -327,7 +327,7 @@ A run that stopped, failed, or waits on a decision has no finish in its record, 
    Give each independent phase its own berth reservation and checkpoint
    (`/showrunner:produce` → Rules, parallel by default).
    Use `worktrees.py make <repo word> <unit> p<phase id>` for a phase that runs beside the current phase.
-   Run `worktrees.py remove <path>` after its checkpoint reaches origin.
+   Run `~/.claude/scripts/lib/py ~/.claude/scripts/worktree/worktrees.py remove <path>` after its checkpoint reaches origin.
    Send the reported checkout and output paths to the showrunner as a removal list.
    Use a distinct short name `p<phase id>` for each phase.
    A phase better run as its own unit goes to the showrunner as a proposed split

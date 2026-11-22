@@ -214,7 +214,7 @@ The failure does not prevent pointer cleanup.
 A busy repository copy can remain through the separate `copies.py remove` step.
 
 The director creates a model worktree for a parallel phase or trial project.
-The director runs `worktrees.py remove <path>` after the checkpoint reaches origin.
+The director runs `~/.claude/scripts/lib/py ~/.claude/scripts/worktree/worktrees.py remove <path>` after the checkpoint reaches origin.
 The director sends the reported paths to the showrunner as a removal list.
 Workers use numbered copies for tests and proofs that need source copies.
 Run `~/.claude/scripts/lib/py ~/.claude/scripts/lib/build_slots.py run --source <worktree> --commit <hash> --showrunner <name> --unit <unit> --work <word> --purpose <word> -- <command>`.

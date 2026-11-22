@@ -49,7 +49,7 @@ Run these steps in order for each completed loop or verbose phase:
    Retain pane workers and their native conversations under <LongLivedWorkers/>.
    Then run <RecordPhaseCompletion/>, including `finish-phase` and deletion of the
    inactive reservation state file before the next phase writes its own.
-   After the checkpoint reaches origin, run `worktrees.py remove <path>` for the phase's separate model worktree.
+   After the checkpoint reaches origin, run `~/.claude/scripts/lib/py ~/.claude/scripts/worktree/worktrees.py remove <path>`.
    Send the reported checkout and output paths to the showrunner as a removal list.
    Use a distinct short name `p<phase id>` for each phase.
 6. **Next launch.** In loop mode or an active auto window with a next phase,
