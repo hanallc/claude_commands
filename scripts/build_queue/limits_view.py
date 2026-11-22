@@ -21,7 +21,7 @@ from scripts.build_queue.slot_wait import public_queue_text
 from scripts.build_targets import target_config, targets
 from scripts.build_targets.execution_transport import HanaControlTransport, HanaGpuNextestTransport
 from scripts.buildlog import charts, repository, store
-from scripts.lib import conf
+from scripts.lib import conf, git_files
 from scripts.lint.memory_admit import gpu_test_reservation, repository_run_owner, reserved_repository_runs
 from scripts.mac_test import claim_state
 
@@ -39,6 +39,7 @@ WORDS: Mapping[str | type[object], str] = {
     "other_running": "{count} other running",
     "merge_above": "A merge run above the limit",
     "policy_key": "{name} run limit",
+    "repository_run_limit": "Repository run limit",
     "uses_cloud": "Uses the AWS places",
     "memory": "Memory for builds",
     "gpu": "GPU tests",
@@ -46,7 +47,6 @@ WORDS: Mapping[str | type[object], str] = {
     "cloud": "Places",
     "money": "Money today",
     "minimum_value": "{used} · {limit} minimum",
-    "minimum_only": "{limit} minimum",
     "gib_value": "{value} GiB",
     "money_value": "${value}",
     "bill": "bill",
@@ -154,50 +154,68 @@ def recorded_origin(identity: str) -> str:
 
 @dataclass(frozen=True)
 class OriginReading:
+    checkout: Path
     config: Path
     modified_ns: int
-    origin: str
+    remote: str | Path
+
+
+def checkout_origin(folder: Path, earlier: OriginReading | None, *,
+                    local_remote: bool) -> OriginReading | None:
+    try:
+        checkout = git_files.at(folder) if local_remote else git_files.locate(folder)
+        config = checkout.common_dir / "config"
+        modified_ns = config.stat().st_mtime_ns
+        if (earlier is not None and earlier.checkout == checkout.toplevel
+                and earlier.config == config and earlier.modified_ns == modified_ns):
+            return earlier
+        value = repository.output(
+            ["git", "config", "--no-includes", "--file", str(config), "--get", "remote.origin.url"],
+            str(folder), repository.GIT_TIMEOUT_S)
+        if value is None:
+            return None
+        remote = value.strip()
+        identity = repository.remote_identity(remote, str(folder)) if remote else ""
+        if identity.startswith("/"):
+            local_path = urlsplit(remote).path if remote.startswith("file:") else remote
+            destination = (folder / Path(local_path).expanduser()).resolve()
+            return OriginReading(checkout.toplevel, config, modified_ns, destination)
+        return OriginReading(checkout.toplevel, config, modified_ns, recorded_origin(identity))
+    except (OSError, ValueError, RuntimeError):
+        return None
 
 
 @dataclass(frozen=True)
 class Origins:
-    folders: Mapping[str, OriginReading] = field(default_factory=dict[str, OriginReading])
+    folders: Mapping[Path, OriginReading] = field(default_factory=dict[Path, OriginReading])
+    resolved: Mapping[str, str] = field(default_factory=dict[str, str])
 
     def resolve(self, identity: str, folder: str) -> str:
         """Use the recorded origin or the checkout's own origin."""
-        if origin := recorded_origin(identity):
-            return origin
-        for path in (identity, folder):
-            if path in self.folders:
-                return self.folders[path].origin
-        return ""
+        return recorded_origin(identity) or self.resolved.get(identity) or self.resolved.get(folder, "")
 
     def refresh(self, folders: Iterable[str]) -> Origins:
         """Read each checkout config and reuse values for unchanged files."""
-        found: dict[str, OriginReading] = {}
+        found: dict[Path, OriginReading] = {}
+        resolved: dict[str, str] = {}
         for folder in folders:
-            if not folder.startswith("/") or (common := repository.git_common_dir(folder)) is None:
+            path = Path(folder)
+            if not path.is_absolute():
                 continue
-            config = Path(common) / "config"
-            try:
-                modified_ns = config.stat().st_mtime_ns
-            except OSError:
-                continue
-            earlier = self.folders.get(folder)
-            if earlier is not None and earlier.config == config and earlier.modified_ns == modified_ns:
-                found[folder] = earlier
-                continue
-            remote = repository.output(
-                ["git", "config", "--no-includes", "--file", str(config), "--get", "remote.origin.url"],
-                folder, repository.GIT_TIMEOUT_S)
-            if remote is None:
-                continue
-            try:
-                origin = recorded_origin(repository.remote_identity(remote.strip(), folder))
-            except ValueError:
-                continue
-            found[folder] = OriginReading(config, modified_ns, origin)
-        return Origins(found)
+            for depth in range(3):
+                entry = found.get(path)
+                if entry is None:
+                    entry = checkout_origin(path, self.folders.get(path), local_remote=depth > 0)
+                    if entry is None:
+                        break
+                    found[path] = entry
+                if depth and path != entry.checkout:
+                    break
+                if isinstance(entry.remote, str):
+                    resolved[folder] = entry.remote
+                    break
+                path = entry.remote
+        return Origins(found, resolved)
 
 
 def active_folders(reading: records.QueueRead) -> frozenset[str]:
@@ -233,7 +251,6 @@ class Background:
     history: frozenset[str] | ReadingState
     aws_money: Metric
     cloud_slots: int | ReadingState = ReadingState.OMITTED
-    disk_floor: int | ReadingState = ReadingState.OMITTED
     hana: tuple[HanaCapacity, ...] = ()
     aws_targets: frozenset[str] = field(default_factory=frozenset[str])
     origins: Origins = field(default_factory=Origins)
@@ -331,22 +348,8 @@ def spending(now: float) -> Metric:
     return Metric("money", used, limit, "USD", qualifier, unreadable=unreadable)
 
 
-@dataclass(frozen=True)
-class SharedSettings:
-    cloud_slots: int | ReadingState = ReadingState.OMITTED
-    disk_floor: int | ReadingState = ReadingState.OMITTED
-
-
-def read_settings() -> SharedSettings:
-    settings = conf.read("build_admission")
-
-    def whole(key: str) -> int | ReadingState:
-        try:
-            return settings.whole(key)
-        except conf.Unusable:
-            return ReadingState.UNAVAILABLE
-
-    return SharedSettings(whole("cloud_gate_slots"), whole("free_floor_gib"))
+def read_cloud_slots() -> int:
+    return conf.read("build_admission").whole("cloud_gate_slots")
 
 
 def safe_read[T](read: Callable[[], T]) -> T | ReadingState:
@@ -357,14 +360,13 @@ def safe_read[T](read: Callable[[], T]) -> T | ReadingState:
 
 
 def background(history: frozenset[str] | ReadingState, money: Metric | ReadingState,
-               settings: SharedSettings | ReadingState, routes: AwsRoutes | ReadingState,
+               cloud_slots: int | ReadingState, routes: AwsRoutes | ReadingState,
                origins: Origins | ReadingState) -> Background:
     """Keep the facts available from each independent source."""
-    shared = SharedSettings(settings, settings) if isinstance(settings, ReadingState) else settings
     aws = AwsRoutes() if isinstance(routes, ReadingState) else routes
     spend_metric = Metric("money", None, None, "USD", unreadable=money is ReadingState.UNAVAILABLE)
     return Background(history, spend_metric if isinstance(money, ReadingState) else money,
-                      shared.cloud_slots, shared.disk_floor, aws.hana, aws.targets,
+                      cloud_slots, aws.hana, aws.targets,
                       Origins() if isinstance(origins, ReadingState) else origins,
                       routes is ReadingState.UNAVAILABLE)
 
@@ -372,7 +374,7 @@ def background(history: frozenset[str] | ReadingState, money: Metric | ReadingSt
 def background_once(now: float, reading: records.QueueRead) -> Background:
     """Read the same sources for a one-time page."""
     return background(safe_read(lambda: read_history(now)), safe_read(lambda: spending(now)),
-                      safe_read(read_settings), safe_read(aws_routes),
+                      safe_read(read_cloud_slots), safe_read(aws_routes),
                       safe_read(lambda: Origins().refresh(active_folders(reading))))
 
 
@@ -419,7 +421,7 @@ class LimitsRefresh:
         self.token_interval = token_interval
         self.history = SourceCache[frozenset[str]]()
         self.money = SourceCache[Metric]()
-        self.settings = SourceCache[SharedSettings]()
+        self.cloud_slots = SourceCache[int]()
         self.routes = SourceCache[AwsRoutes]()
         self.origins = SourceCache[Origins]()
 
@@ -433,7 +435,7 @@ class LimitsRefresh:
         return background(
             self.history.current(now, self.report_interval, lambda: read_history(wall)),
             self.money.current(now, self.report_interval, lambda: spending(wall), day=day),
-            self.settings.current(now, self.report_interval, read_settings),
+            self.cloud_slots.current(now, self.report_interval, read_cloud_slots),
             self.routes.current(now, self.token_interval, aws_routes),
             self.origins.current(now, self.token_interval, read_origins))
 
@@ -554,6 +556,7 @@ def build_limits(reading: records.QueueRead, snapshots: target_availability.Snap
         step = reservation["step"]
         identity = (recorded_origin(waiter.get("repo_identity", "")) if waiter is not None else "")
         identity = identity or recorded_origin(reservation.get("repo_identity", "")) or recorded_origin(reservation["repo"])
+        origin = origins.resolve(identity, reservation["worktree"])
         recorded_unit = reservation.get("unit", "") or (waiter.get("unit", "") if waiter is not None else "")
         session = waiter.get("session_id", "") if waiter is not None else reservation.get("session_id", "")
         session_name = waiter.get("session_name", "") if waiter is not None else reservation.get("session_name", "")
@@ -561,14 +564,13 @@ def build_limits(reading: records.QueueRead, snapshots: target_availability.Snap
             if any(policy.for_step(local, key, step) for key in keys_by_owner[owner]):
                 keys = keys_by_owner[owner]
                 if len(keys) == 1:
-                    bind(keys[0], identity)
+                    bind(keys[0], origin)
                 if owner not in run_labels:
                     run_labels[owner] = clean_label(recorded_unit, names.get(session, ""), session_name), recorded_unit
             continue
         if owner in seen:
             continue
         seen.add(owner)
-        origin = origins.resolve(identity, reservation["worktree"])
         if not short_name(origin):
             unattributed += 1
             continue
@@ -630,7 +632,8 @@ def build_limits(reading: records.QueueRead, snapshots: target_availability.Snap
         origin = next(iter(bound)) if len(bound) == 1 else ""
         if not origin or bindings[origin] != 1:
             labels = {short_name(candidate) for candidate in bound}
-            label = WORDS["policy_key"].format(name=next(iter(labels))) if len(labels) == 1 else ""
+            name = next(iter(labels)) if len(labels) == 1 else clean_label(repository_key)
+            label = WORDS["policy_key"].format(name=name) if name else WORDS["repository_run_limit"]
             shared.append(Metric(label, used, limit))
             continue
         cell = row(origin).natedev
@@ -702,12 +705,11 @@ def build_limits(reading: records.QueueRead, snapshots: target_availability.Snap
         used = sum(gpu_test_reservation(item, gpu) for item in inputs.reservations) if gpu.repositories else None
         limits.append(Metric("gpu", used, gpu.slots if gpu.repositories else None, waits=metric_waits.get("gpu", {})))
     disk = inputs.build_space
-    disk_floor = saved.disk_floor if isinstance(saved.disk_floor, int) else None
-    limits.append(Metric("disk", disk.free_gib if isinstance(disk, records.BuildSpaceLow) else None,
-                         disk.floor_gib if isinstance(disk, records.BuildSpaceLow) else disk_floor,
-                         "GiB", "minimum", metric_waits.get("disk", {}),
-                         unreadable=isinstance(disk, records.BuildSpaceUnreadable)
-                         or saved.disk_floor is ReadingState.UNAVAILABLE and not isinstance(disk, records.BuildSpaceLow)))
+    disk_waits = metric_waits.get("disk", {})
+    if isinstance(disk, records.BuildSpaceLow):
+        limits.append(Metric("disk", disk.free_gib, disk.floor_gib, "GiB", "minimum", disk_waits))
+    elif disk_waits:
+        limits.append(Metric("disk", None, None, waits=disk_waits))
     aws_active = cloud_used or any(isinstance(hana.used, int) and hana.used for hana in saved.hana)
     aws_state = WORDS["in_use"] if aws_active else WORDS["not_available"] if saved.aws_routes_unavailable else ""
     cloud = Metric("cloud", cloud_used if isinstance(cloud_slots, int) else None,

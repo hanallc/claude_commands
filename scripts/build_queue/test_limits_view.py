@@ -39,6 +39,7 @@ class BuildLimitsTests(unittest.TestCase):
             source = root / "source"
             source.mkdir()
             scratch = root / "scratch"
+            copied = root / "copied"
             env = fixture_git_environment(root)
 
             def git(folder: Path, *args: str) -> None:
@@ -49,6 +50,7 @@ class BuildLimitsTests(unittest.TestCase):
             git(source, "remote", "add", "origin", "git@example.invalid:team/project.git")
             _ = commit_repository(source, "Fixture", allow_empty=True, env=env)
             git(root, "clone", "-q", "--shared", str(source), str(scratch))
+            git(root, "clone", "-q", "--shared", str(scratch), str(copied))
             git(scratch, "remote", "set-url", "origin", fork)
             _ = index.execute("CREATE TABLE steps (repo_identity TEXT, repo_path TEXT, started_at TEXT)")
             _ = index.executemany("INSERT INTO steps VALUES (?, ?, ?)", [
@@ -69,16 +71,24 @@ class BuildLimitsTests(unittest.TestCase):
                 self.assertEqual(origins.resolve(primary, str(scratch)), primary)
                 self.assertEqual(origins.refresh((str(scratch),)), origins)
                 self.assertEqual(git_read.call_count, 1)
-                git(scratch, "remote", "set-url", "origin", primary)
-                self.assertEqual(origins.refresh((str(scratch),)).resolve("", str(scratch)), primary)
-                self.assertEqual(git_read.call_count, 2)
+                git(scratch, "remote", "set-url", "origin", str(source))
+                copies = (str(copied), str(scratch))
+                origins = origins.refresh(copies)
+                self.assertEqual(origins.resolve("", str(copied)), primary)
+                self.assertEqual(origins.refresh(copies), origins)
+                self.assertEqual(git_read.call_count, 4)
+                git(source, "remote", "set-url", "origin", fork)
+                self.assertEqual(origins.refresh(copies).resolve("", str(copied)), fork)
+                self.assertEqual(git_read.call_count, 5)
         hidden_key = "/private/policy-key"
-        policy = records.RepositoryRunLimits({"natedev.project": 1, f"natedev.{hidden_key}": 2}, "merge-owner")
+        policy = records.RepositoryRunLimits({
+            "natedev.project": 1, f"natedev.{hidden_key}": 2, "natedev.unmatched": 1,
+        }, "merge-owner")
         reservations = (
             {**fixture_reservation(101, 0, step="gate"), "repo": "project", "repo_identity": primary, "unit": "regular"},
-            {**fixture_reservation(102, 0, step="gate", folder=str(scratch)), "repo": "project", "unit": "merge-owner"},
+            {**fixture_reservation(102, 0, step="gate", folder=str(copied)), "repo": "project", "unit": "merge-owner"},
             {**fixture_reservation(103, 0, step="check", folder=str(root / "unknown")), "repo": "scratch"},
-            {**fixture_reservation(104, 0, step="gate", folder=str(scratch)), "repo": hidden_key},
+            {**fixture_reservation(104, 0, step="gate", folder=str(root / "unknown")), "repo": hidden_key},
         )
         explanation = replace(reading.explanation,
             policy=replace(reading.explanation.policy, repository_runs=policy),
@@ -128,8 +138,8 @@ class BuildLimitsTests(unittest.TestCase):
         self.assertIsNone(quiet.natedev.limit)
         self.assertEqual(spare_project.natedev.used, 0)
         self.assertEqual(shown.natedev.unattributed, 1)
-        self.assertEqual((shown.natedev.shared[-1].label, shown.natedev.shared[-1].used,
-                          shown.natedev.shared[-1].limit), ("", 1, 2))
+        self.assertEqual([(metric.label, metric.used, metric.limit) for metric in shown.natedev.shared[-2:]],
+                         [("Repository run limit", 1, 2), ("unmatched run limit", 0, 1)])
         self.assertEqual(shown.natedev.waits, {"": [""]})
         self.assertEqual((hana_row.aws.used, hana_row.aws.limit), (None, 1))
         self.assertEqual(next(metric for metric in shown.natedev.shared if metric.label == "disk").waits,
@@ -147,7 +157,12 @@ class BuildLimitsTests(unittest.TestCase):
         idle = limits_view.build_limits(reading, (), (), {}, {}, saved, UTC)
         self.assertEqual((idle.aws.shared[0].used, idle.aws.shared[0].limit), (0, 9))
         self.assertEqual(idle.aws.state, "")
-        self.assertIsNone(next(metric for metric in idle.natedev.shared if metric.label == "disk").used)
+        self.assertFalse(any(metric.label == "disk" for metric in idle.natedev.shared))
+        copy_only = replace(queue, explanation=replace(explanation,
+            decided_from=replace(explanation.decided_from, reservations=reservations[1:2])))
+        copy_limits = limits_view.build_limits(copy_only, (), (), {}, {}, saved, UTC)
+        copy_cell = next(row.natedev for row in copy_limits.repositories if row.owner == "team · example.invalid")
+        self.assertEqual((copy_cell.used, copy_cell.limit, copy_cell.runs), (1, 1, ["merge-owner"]))
         within_limit = replace(queue, explanation=replace(explanation,
             policy=replace(explanation.policy, repository_runs=records.RepositoryRunLimits({"natedev.project": 2}, "merge-owner"))))
         within = limits_view.build_limits(within_limit, (), waits, cloud_names, {}, saved, UTC)

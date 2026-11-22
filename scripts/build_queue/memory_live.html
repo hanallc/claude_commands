@@ -1285,8 +1285,8 @@ function limitMetric(metric, words) {
   const current = used == null ? (unreadable ? words.not_available : "") : amount(used);
   const limitText = limit == null ? "" : amount(limit);
   let text = current;
-  if (limitText && qualifier === "minimum")
-    text = limitWords(words, current ? "minimum_value" : "minimum_only", {used: current, limit: limitText});
+  if (qualifier === "minimum")
+    text = current && limitText ? limitWords(words, "minimum_value", {used: current, limit: limitText}) : "";
   else if (limitText)
     text = limitWords(words, used == null ? "limit" : "count", {used: current, limit: limitText});
   if (unreadable && used == null && limitText && qualifier !== "minimum") text += ` · ${words.not_available}`;
