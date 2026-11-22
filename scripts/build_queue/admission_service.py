@@ -2918,8 +2918,6 @@ class AdmissionServer:
             explanation=replace(reading.explanation, running=(*reading.explanation.running, *explained)))
 
     def _local_occupancy(self, inputs: records.QueueInputs) -> records.LocalAdmissionOccupancy:
-        evidence = self.system_evidence
-        assert isinstance(evidence, SystemEvidence)
         captured = {row.get("reservation_id"): row for row in inputs.reservations}
         reservations: list[records.Reservation] = []
         for record in self.reservations.values():
@@ -2927,10 +2925,14 @@ class AdmissionServer:
                 continue
             row = captured.get(record.reservation_id)
             if row is None:
-                row = local_reservation_row(record, evidence)
+                row = reservation_row(record)
+                # Admission used the waiter owner when it granted this reservation.
+                build_run = record.queue_waiter.get("build_run")
+                if build_run is not None:
+                    row["build_run"] = build_run
                 resolve_reservation_repository(row, record)
             reservations.append(row)
-        return records.LocalAdmissionOccupancy(tuple(reservations), self._verify_run_counts())
+        return records.LocalAdmissionOccupancy(tuple(reservations), self._verify_run_owners())
 
     def _publish_replies(self) -> None:
         if (not isinstance(self.configuration, gate.UsableAdmissionConfiguration)

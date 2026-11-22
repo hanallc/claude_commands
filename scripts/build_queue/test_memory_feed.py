@@ -1294,8 +1294,12 @@ process.stdout.write(JSON.stringify({
         report_calls_per_cycle: list[int] = []
         with (mock.patch.object(admission_client, "view", return_value=captured_reading()) as queue,
               mock.patch.object(charts, "page_data", return_value=report_fixture()) as provider,
-              # Each cycle reads the clock once, then once more after its token dump request.
-              mock.patch.object(time, "monotonic", side_effect=[0.0, 0.0, 100.0, 100.0, 301.0, 301.0]),
+              # Each cycle reads the clock for the loop, token dump, Mac source, and limits source.
+              mock.patch.object(time, "monotonic", side_effect=(
+                  0.0, 0.0, 0.0, 0.0,
+                  100.0, 100.0, 100.0, 100.0,
+                  301.0, 301.0, 301.0, 301.0,
+              )) as clock,
               mock.patch.object(time, "sleep", side_effect=[None, None, FeedStopped]),
               mock.patch.object(memory_feed, "write_text_atomic", wraps=atomic_file.write_text_atomic) as write):
             def view() -> admission_records.QueueRead:
@@ -1306,6 +1310,7 @@ process.stdout.write(JSON.stringify({
             with self.assertRaises(FeedStopped):
                 _ = memory_feed.main([])
         self.assertEqual(queue.call_count, 3)
+        self.assertEqual(clock.call_count, 12)
         self.assertEqual(report_calls_per_cycle, [1, 1, 2])
         self.assertEqual(provider.call_args_list, [mock.call(7, n=3), mock.call(7, n=3)])
         # The second report read has the same text, so only the first one writes report.json.
@@ -1342,11 +1347,17 @@ process.stdout.write(JSON.stringify({
 
                 with (mock.patch.object(admission_client, "view", return_value=captured_reading()),
                       mock.patch.object(queue_view, "refresh_mac_builds", side_effect=refresh),
-                      mock.patch.object(time, "monotonic", side_effect=[0.0, 0.0, 29.0, 29.0, 30.0]),
+                      mock.patch.object(time, "monotonic", side_effect=(
+                          0.0, 0.0, 0.0, 0.0,
+                          29.0, 29.0, 29.0, 29.0,
+                          # The third cycle has no token dump request.
+                          30.0, 30.0, 30.0,
+                      )) as clock,
                       mock.patch.object(time, "sleep", side_effect=after_cycle)):
                     with self.assertRaises(FeedStopped):
                         _ = memory_feed.main([])
                 self.assertEqual(published, expected)
+                self.assertEqual(clock.call_count, 11)
 
     def test_token_dump_requests_keep_the_interval_after_slow_reads(self) -> None:
         clock = [0.0]

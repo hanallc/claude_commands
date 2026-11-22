@@ -43,11 +43,11 @@ def wait_names(groups: Mapping[str, limits_view.WaitGroup]) -> dict[str, list[st
 class BuildLimitsTests(unittest.TestCase):
     hana_origin: str = "https://example.invalid/team/hana"
 
-    def configure_hana(self, fixture: AdmissionFixture) -> None:
+    def configure_hana(self, fixture: AdmissionFixture, *, maximum: int = 2) -> None:
         config = fixture.root / "build_admission.conf"
         write_memory_config(config, gpu_test_repositories="hana", gpu_test_slots="2")
         _ = config.write_text(config.read_text() +
-            f"\nmax_runs.{fixture.server.host}.hana=2\nmax_runs.exempt_unit=natemerge\n")
+            f"\nmax_runs.{fixture.server.host}.hana={maximum}\nmax_runs.exempt_unit=natemerge\n")
 
     def hana_request(self, fixture: AdmissionFixture, step: str = "gate") -> wire.AdmitRequest:
         request = fixture.request(need=0, step=step)
@@ -62,9 +62,9 @@ class BuildLimitsTests(unittest.TestCase):
     def test_counts_include_starts_granted_in_the_published_pass(self) -> None:
         with AdmissionFixture() as fixture:
             self.configure_hana(fixture)
-            verify = fixture.proc.spawn()
-            self.assertEqual(fixture.server.handle_request(wire.VerifyRunSlotRequest(verify, "hana", "")), [wire.Ok()])
-            _ = only_admitted(fixture.server.handle_request(self.hana_request(fixture, "test")))
+            verify = self.hana_request(fixture, "test")
+            verify = replace(verify, identity=replace(verify.identity, verify=records.VerifyCall("test", "verify test", 1, 1)))
+            _ = only_admitted(fixture.server.handle_request(verify))
             fixture.allow_next_start()
             grant = only_admitted(fixture.server.handle_request(self.hana_request(fixture)))
             reply, = fixture.server.handle_request(wire.ViewRequest())
@@ -75,6 +75,22 @@ class BuildLimitsTests(unittest.TestCase):
                 [row.get("reservation_id") for row in reply.reading.explanation.decided_from.reservations])
             cell = self.hana_cell(reply.reading)
             self.assertEqual((cell.used, cell.limit, cell.verify_used), (2, 2, 1))
+            self.assertEqual(cell.gpu, limits_view.Metric("gpu", 2, 2))
+
+    def test_one_build_with_a_gate_and_a_verify_slot_counts_once(self) -> None:
+        with AdmissionFixture() as fixture:
+            self.configure_hana(fixture, maximum=1)
+            verify = self.hana_request(fixture, "test")
+            verify = replace(verify, identity=replace(verify.identity, verify=records.VerifyCall("test", "verify test", 1, 1)))
+            _ = only_admitted(fixture.server.handle_request(verify))
+            fixture.allow_next_start()
+            gate_request = self.hana_request(fixture)
+            gate_request = replace(gate_request, run=wire.RunIdentity(verify.owner.pid, verify.owner.start_time))
+            _ = only_admitted(fixture.server.handle_request(gate_request))
+            reply, = fixture.server.handle_request(wire.ViewRequest())
+            assert isinstance(reply, wire.ViewReply)
+            cell = self.hana_cell(reply.reading)
+            self.assertEqual((cell.used, cell.limit, cell.verify_used), (1, 1, 1))
             self.assertEqual(cell.gpu, limits_view.Metric("gpu", 2, 2))
 
     def test_release_refresh_does_not_count_a_recomputed_start(self) -> None:
@@ -135,6 +151,37 @@ class BuildLimitsTests(unittest.TestCase):
             assert isinstance(reply, wire.ViewReply)
             cell = self.hana_cell(reply.reading)
             self.assertEqual((cell.used, cell.limit), (1, 2))
+            self.assertEqual(cell.gpu, limits_view.Metric("gpu", 2, 2))
+
+    def test_new_grant_keeps_the_waiter_build_owner_after_reparenting(self) -> None:
+        with AdmissionFixture() as fixture:
+            self.configure_hana(fixture, maximum=1)
+            run = fixture.run_owner()
+            _ = (fixture.proc.path / str(run.pid) / "environ").write_bytes(
+                f"BUILDLOG_RUN={run.pid}:{run.start_time}\0".encode())
+            first = self.hana_request(fixture)
+            write_process(fixture.proc.path, first.owner.pid, parent=run.pid, start=first.owner.start_time)
+            _ = only_admitted(fixture.server.handle_request(first))
+            fixture.allow_next_start()
+            fixture.hold_starts()
+            second = self.hana_request(fixture, "test-affected")
+            write_process(fixture.proc.path, second.owner.pid, parent=run.pid, start=second.owner.start_time)
+            wait, = fixture.server.handle_request(second)
+            self.assertIsInstance(wait, wire.Wait)
+            write_process(fixture.proc.path, second.owner.pid, start=second.owner.start_time)
+            fixture.free(60 * records.GIB)
+            _ = fixture.run_pass()
+            self.assertIn(second.episode, fixture.server.reservations)
+            reply, = fixture.server.handle_request(wire.ViewRequest())
+            assert isinstance(reply, wire.ViewReply)
+            occupancy = reply.reading.explanation.local_occupancy
+            assert occupancy is not None
+            row = next(row for row in occupancy.reservations if row["pid"] == second.owner.pid)
+            build_run = row.get("build_run")
+            assert isinstance(build_run, LiveBuildRun)
+            self.assertEqual((build_run.pid, build_run.start_time), (run.pid, run.start_time))
+            cell = self.hana_cell(reply.reading)
+            self.assertEqual((cell.used, cell.limit), (1, 1))
             self.assertEqual(cell.gpu, limits_view.Metric("gpu", 2, 2))
 
     def test_old_reply_shows_restart_note_without_a_count_or_null(self) -> None:
@@ -438,7 +485,7 @@ class BuildLimitsTests(unittest.TestCase):
             explanation=replace(within_limit.explanation,
                 policy=replace(within_limit.explanation.policy, gpu_tests=gpu,
                     repository_runs=records.RepositoryRunLimits({"natedev.hana": 2})),
-                local_occupancy=records.LocalAdmissionOccupancy(gpu_runs, {"hana": 2})))
+                local_occupancy=records.LocalAdmissionOccupancy(gpu_runs, {"hana": frozenset({"501-501", "502-502"})})))
         wait_limits = show(with_verify)
         wait_cell = next(row.natedev for row in wait_limits.repositories if row.name == "hana")
         self.assertEqual((wait_cell.used, wait_cell.limit, wait_cell.verify_used), (2, 2, 2))

@@ -1322,10 +1322,10 @@ StartSpacing = ReadyToStart | NextStartAt
 
 @dataclass(frozen=True)
 class LocalAdmissionOccupancy:
-    """The service captures these counts after it grants starts."""
+    """The service captures these reservations and owners after it grants starts."""
 
     reservations: tuple[Reservation, ...]
-    verify_run_counts: Mapping[str, int]
+    verify_run_owners: Mapping[str, frozenset[str]]
 
 
 @dataclass(frozen=True)

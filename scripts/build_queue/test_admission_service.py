@@ -1687,11 +1687,10 @@ class ProcessRunEvidenceTests(unittest.TestCase):
 
 
 class ReplyPublicationTests(unittest.TestCase):
-    def test_view_captures_granted_local_reservations_and_verify_counts(self) -> None:
+    def test_view_captures_granted_local_reservations_and_verify_owners(self) -> None:
         with AdmissionFixture() as fixture:
-            verify = fixture.proc.spawn()
-            self.assertEqual(fixture.server.handle_request(wire.VerifyRunSlotRequest(verify, "fixture", "")), [wire.Ok()])
-            request = fixture.request(need=0, step="gate")
+            request = fixture.request(need=0, step="test")
+            request = replace(request, identity=replace(request.identity, verify=records.VerifyCall("test", "verify test", 1, 1)))
             grant = only_admitted(fixture.server.handle_request(request))
             reply, = fixture.server.handle_request(wire.ViewRequest())
             assert isinstance(reply, wire.ViewReply)
@@ -1703,7 +1702,8 @@ class ReplyPublicationTests(unittest.TestCase):
             row, = occupancy.reservations
             self.assertEqual(row["pid"], request.owner.pid)
             self.assertEqual(row.get("reservation_id"), grant.reservation)
-            self.assertEqual(occupancy.verify_run_counts, {"fixture": 1})
+            owner = records.run_owner(request.owner.pid, request.owner.start_time)
+            self.assertEqual(occupancy.verify_run_owners, {"fixture": frozenset({owner})})
 
     def test_view_and_explain_reuse_the_bytes_of_the_completed_pass(self) -> None:
         with AdmissionFixture() as fixture:

@@ -835,7 +835,7 @@ def build_limits(reading: records.QueueRead, snapshots: target_availability.Snap
     occupancy = explanation.local_occupancy
     inputs = replace(explanation.decided_from,
         reservations=occupancy.reservations if occupancy is not None else (),
-        verify_run_counts=occupancy.verify_run_counts if occupancy is not None else {})
+        verify_run_owners=occupancy.verify_run_owners if occupancy is not None else {})
     local_note = PAGE_WORDS["admission_restart"] if occupancy is None else ""
     policy = explanation.policy.repository_runs
     local = inputs.local_machine
@@ -885,14 +885,14 @@ def build_limits(reading: records.QueueRead, snapshots: target_availability.Snap
         name = short_name(origin) if origin else policy_label(key)
         if name:
             keys_by_row.setdefault(name, set()).add(key)
-            if inputs.verify_run_counts.get(key):
+            if inputs.verify_run_owners.get(key):
                 _ = row(name)
 
     for origin in history:
         _ = observe_local(origin)
 
     repository_runs = reserved_repository_runs(inputs, policy)
-    seen = {owner for owners in repository_runs.values() for owner in owners}
+    seen = {owner for key in local_limits for owner in repository_runs.get(key, ())}
     limited_owners = frozenset(seen)
     unattributed = 0
     for reservation in inputs.reservations:
@@ -1046,8 +1046,8 @@ def build_limits(reading: records.QueueRead, snapshots: target_availability.Snap
     shared: list[Metric] = []
     for repository_key, limit in local_limits.items():
         owners = repository_runs.get(repository_key, set[str]())
-        verify_used = inputs.verify_run_counts.get(repository_key, 0)
-        used = len(owners) + verify_used
+        verify_used = len(inputs.verify_run_owners.get(repository_key, ()))
+        used = len(owners)
         count = None if occupancy is None else used
         runs: list[str] = []
         merge_above: list[str] = []
