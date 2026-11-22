@@ -16,12 +16,13 @@ import io
 import json
 import shlex
 import os
+import re
 from pathlib import Path
 import subprocess
 import sys
 import time
 from threading import Event
-from collections.abc import Callable, Generator, Mapping, Sequence
+from collections.abc import Callable, Generator, Iterable, Mapping, Sequence
 from contextlib import ExitStack, contextmanager, redirect_stderr
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
@@ -33,6 +34,7 @@ from typing import TYPE_CHECKING, Protocol, Literal, cast, final
 from scripts.herdr import herdr, pane_launch
 from scripts.herdr import herdr_types
 from scripts.lib import conf, models_registry, nix_env, unit_runs
+from scripts.lib.transcripts import uncompressed_path
 from scripts.whoami import quota_state
 from scripts.production import staff, worker_admission
 from scripts.agents import detached_run_process, pane_record, shutdown_record, worker_lifecycle
@@ -774,6 +776,48 @@ def _worker_passes_in(row: staff.StaffRow, fields: dict[str, object],
 def dispatch_role(row: staff.StaffRow) -> WorkerRole | WorkerRoleUnavailable:
     """Read the worker role from its staff row."""
     return row.role.value if isinstance(row.role, staff.KnownWorkerRole) else WorkerRoleUnavailable("dispatch role is unavailable")
+
+
+class NoTranscriptTurn(Enum):
+    UNRECORDED = "no verified turn after the dispatch prompt"
+
+
+@dataclass(frozen=True)
+class TranscriptCursor:
+    """Identify a boundary within one transcript stream."""
+
+    stream: str
+    position: int
+    prefix: str
+
+    def at_or_after(self, boundary: TranscriptCursor) -> bool:
+        return self.stream == boundary.stream and self.position >= boundary.position
+
+    @classmethod
+    def from_json(cls, value: object) -> TranscriptCursor | NoTranscriptTurn:
+        if not isinstance(value, dict):
+            return NoTranscriptTurn.UNRECORDED
+        fields = cast(dict[str, object], value)
+        stream, position, prefix = fields.get("stream"), fields.get("position"), fields.get("prefix")
+        if (not isinstance(stream, str) or not stream or not isinstance(position, int) or isinstance(position, bool)
+                or position < 1 or not isinstance(prefix, str) or not re.fullmatch(r"[a-f0-9]{64}", prefix)):
+            return NoTranscriptTurn.UNRECORDED
+        return cls(stream, position, prefix)
+
+
+def transcript_stream(row: staff.StaffRow, source: Path) -> str:
+    return f"{row.current_session}:{uncompressed_path(source.resolve())}"
+
+
+def transcript_record_cursors[T: str | dict[str, object] | worker_admission.TornTranscriptRecord](
+    entries: Iterable[T], stream: str,
+) -> Generator[tuple[T, TranscriptCursor]]:
+    """Identify each record by its position and the hash of the transcript prefix."""
+    prefix = hashlib.sha256()
+    for position, entry in enumerate(entries, 1):
+        data = None if isinstance(entry, worker_admission.TornTranscriptRecord) else entry
+        prefix.update(json.dumps(data, sort_keys=True).encode() + b"\n")
+        yield entry, TranscriptCursor(stream, position, prefix.hexdigest())
 
 
 def _transcript_messages(row: staff.StaffRow) -> list[str] | Kept:

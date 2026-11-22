@@ -2548,16 +2548,24 @@ class TurnEndTests(unittest.TestCase):
         self.case.fixture.world.locations[pane]["agent_status"] = "working"
         with detached_runs.record_lock(path):
             atomic_file.write_text_atomic(path, json.dumps(record))
-        self.case.agent.complete(pane)
-        done = self.case.agent.replies[-1]
         deferred = order.startswith("result still deferred") or order == "legacy record"
-        if not deferred:
-            message = detached_runs.result_message(record, detached_runs.command_result(record))
-            self.case.agent.append(pane, "user", f"Detached run: {name}\n{message}")
+        if deferred:
+            self.case.agent.complete(pane)
+        else:
+            send_input = self.case.fixture.world.run
+
+            def accept_result(*arguments: str, deadline: float = math.inf) -> str:
+                if arguments[:3] == ("agent", "prompt", pane):
+                    self.case.agent.complete(pane)
+                    self.case.agent.append(pane, "user", arguments[3])
+                return send_input(*arguments, deadline=deadline)
+
+            self.case.fixture.world.locations[pane]["agent_status"] = "idle"
+            with patch.object(self.case.fixture.world, "run", new=accept_result):
+                self.assertEqual(detached_runs.deliver(record, detached_runs.command_result(record)),
+                                 f"sent: worker {name} at {pane}")
             self.case.agent.append(pane, "assistant", "I already recorded that check.")
-            record.update(delivery=f"sent: worker {name} at {pane}", delivered_at=datetime.now().timestamp())
-            with detached_runs.record_lock(path):
-                atomic_file.write_text_atomic(path, json.dumps(record))
+        done = self.case.agent.replies[-1]
         self.case.fixture.world.locations[pane]["agent_status"] = "done"
         submissions = list(self.case.agent.submitted)
         notices = len(self.case.agent.notices)
@@ -3021,13 +3029,23 @@ class TurnEndTests(unittest.TestCase):
             "run_id": log.stem, "worker": row.name, "staff_id": row.id, "status": "finished",
             "started_at": 0, "pid": 0, "command": ["true"], "label": "private verification",
             "log": str(log), "session_dir": str(run), "director_dir": str(run), "done_message_file": "",
-            "pane_dispatch_id": "earlier-pass", "delivery": f"sent: worker {row.name} at {pane}",
+            "pane_dispatch_id": "earlier-pass", "delivery": "deferred: worker is working",
             "exit_code": 0, "finished_at": datetime.now(timezone.utc).isoformat(),
         }
-        message = detached_runs.result_message(record, detached_runs.CompletedCommand(0))
         atomic_file.write_text_atomic(log.with_suffix(".json"), json.dumps(record))
-        self.case.agent.complete(pane)
-        self.case.agent.append(pane, "user", f"Detached run: {log.stem}\n{message}")
+        send_input = self.case.fixture.world.run
+
+        def accept_result(*arguments: str, deadline: float = math.inf) -> str:
+            if arguments[:3] == ("agent", "prompt", pane):
+                self.case.agent.complete(pane)
+                self.case.agent.append(pane, "user", arguments[3])
+            return send_input(*arguments, deadline=deadline)
+
+        self.case.fixture.world.locations[pane]["agent_status"] = "idle"
+        with (patch.object(worker_panes, "worker_pass", return_value={**passed, "instance_id": "earlier-pass"}),
+              patch.object(self.case.fixture.world, "run", new=accept_result)):
+            self.assertEqual(detached_runs.deliver(record, detached_runs.CompletedCommand(0)),
+                             f"sent: worker {row.name} at {pane}")
         self.case.agent.append(pane, "assistant", "The earlier check passed.")
         atomic_file.write_text_atomic(ready, "ready\n")
 

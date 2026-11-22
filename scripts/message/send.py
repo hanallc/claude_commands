@@ -135,7 +135,7 @@ import socket
 import subprocess
 import sys
 import time
-from collections.abc import Callable, Generator, Mapping
+from collections.abc import Callable, Generator, Iterator, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack, contextmanager, suppress
 from dataclasses import asdict, dataclass, field, replace
@@ -173,6 +173,7 @@ from scripts.message import postmaster  # noqa: E402
 from scripts.message import codex_daemon  # noqa: E402
 if TYPE_CHECKING:
     from scripts.message import roster
+    from scripts.herdr import worker_panes
     from scripts.accounts import accounts
     from scripts.whoami.account import named_account_environment
 from scripts.notify import push_texts  # noqa: E402
@@ -5155,6 +5156,105 @@ class WorkerResultReceipt:
                    for entry in worker_admission.transcript_entries(source, set()))
 
 
+@dataclass(frozen=True)
+class WorkerResultSubmission(WorkerResultReceipt):
+    """Require a new transcript occurrence for this submission."""
+
+
+class NoResultTranscript(Enum):
+    UNRECORDED = "the selected session does not have a transcript"
+
+
+def _result_transcript_source(worker: staff.StaffRow, membership: staff.StaffSnapshot
+                              ) -> Path | NoResultTranscript:
+    from scripts.production import worker_admission
+
+    backend = membership.backends.get(worker.id, staff.BACKEND_UNAVAILABLE)
+    if isinstance(backend, staff.BackendUnavailable):
+        raise ValueError("worker transcript backend is unavailable")
+    try:
+        return worker_admission.transcript_source(worker, backend)
+    except ValueError as error:
+        if str(error) != "no source transcript found":
+            raise
+        return NoResultTranscript.UNRECORDED
+
+
+def _result_transcript_cursors(source: Path, stream: str
+                               ) -> Iterator[tuple[dict[str, object], worker_panes.TranscriptCursor]]:
+    from scripts.herdr import worker_panes
+    from scripts.production import worker_admission
+
+    records = worker_admission.transcript_records(
+        source, boundary=worker_admission.TranscriptRecordBoundary.COMPLETE_LINES_WITH_TAIL)
+    for entry, cursor in worker_panes.transcript_record_cursors(records, stream):
+        if isinstance(entry, worker_admission.TornTranscriptRecord):
+            raise ValueError("worker transcript has incomplete records")
+        yield entry, cursor
+
+
+def _result_submission_boundary(worker: staff.StaffRow, membership: staff.StaffSnapshot
+                                ) -> worker_panes.TranscriptCursor | NoResultTranscript:
+    from scripts.herdr import worker_panes
+
+    source = _result_transcript_source(worker, membership)
+    if isinstance(source, NoResultTranscript):
+        return source
+    stream = worker_panes.transcript_stream(worker, source)
+    boundary = worker_panes.TranscriptCursor(stream, 0, hashlib.sha256().hexdigest())
+    for _, boundary in _result_transcript_cursors(source, stream):
+        pass
+    return boundary
+
+
+@dataclass(frozen=True)
+class WorkerResultSubmitted:
+    """The selected session records the result input after the submission boundary."""
+
+    worker: staff.StaffId
+    session: staff.StaffId
+    pane: str
+    name: str
+    cursor: worker_panes.TranscriptCursor
+    outcome: Literal["sent"] = field(init=False, default="sent")
+
+    @property
+    def detail(self) -> str:
+        return f"worker {self.name} at {self.pane}"
+
+
+def _confirm_worker_result(worker: staff.StaffRow, pane: str, text: str,
+                           boundary: worker_panes.TranscriptCursor | NoResultTranscript,
+                           ) -> WorkerResultSubmitted | WorkerResultUnconfirmed:
+    from scripts.herdr import worker_panes
+    from scripts.lib.script_envelope import script_prompt
+    from scripts.production import worker_admission
+
+    membership = staff.local_snapshot()
+    current = membership.by_id(worker.id)
+    if current is None or current.current_session != worker.current_session:
+        return WorkerResultUnconfirmed("retry", "the worker session changed after submission")
+    missing = WorkerResultUnconfirmed("retry", "the worker transcript has no result receipt")
+    source = _result_transcript_source(current, membership)
+    if isinstance(source, NoResultTranscript):
+        return missing
+    stream = worker_panes.transcript_stream(current, source)
+    if isinstance(boundary, worker_panes.TranscriptCursor) and boundary.stream != stream:
+        return missing
+    beyond_boundary = isinstance(boundary, NoResultTranscript) or boundary.position == 0
+    expected = "user:\n" + script_prompt(text).rstrip()
+    found: list[worker_panes.TranscriptCursor] = []
+    for entry, cursor in _result_transcript_cursors(source, stream):
+        if beyond_boundary and entry.get("isMeta") is not True:
+            if worker_admission.transcript_entry(entry, set()).rstrip() == expected:
+                found.append(cursor)
+        if cursor == boundary:
+            beyond_boundary = True
+    if len(found) != 1:
+        return missing
+    return WorkerResultSubmitted(worker.id, worker.current_session, pane, worker.name, found[0])
+
+
 class OrdinaryWorkerMessage(Enum):
     SEND = "send a message without a detached run receipt"
 
@@ -5163,7 +5263,7 @@ def deliver_worker_text(worker: staff.StaffRow, membership: staff.StaffSnapshot,
                         sender: str, timeout: float, reason: str = "",
                         receipt: WorkerResultReceipt | OrdinaryWorkerMessage = OrdinaryWorkerMessage.SEND,
                         selection: RecipientSelection | NoFixedStaffLookup = NO_FIXED_STAFF_LOOKUP,
-                        review_text: str = "", allow_holder_fallback: bool = True, skip_closed: bool = False) -> Result | BlockedWorkerResult:
+                        review_text: str = "", allow_holder_fallback: bool = True, skip_closed: bool = False) -> Result | BlockedWorkerResult | WorkerResultSubmitted:
     """Deliver to a proved pane or retain the message through its holder."""
     from scripts.herdr import worker_panes
     from scripts.herdr import herdr
@@ -5183,15 +5283,21 @@ def deliver_worker_text(worker: staff.StaffRow, membership: staff.StaffSnapshot,
         state = next((item for item in worker_panes.observe(holder.id, membership) if item.row.id == worker.id), None)
         if isinstance(state, worker_panes.OpenWorker):
             attempting_input = False
+            boundary: worker_panes.TranscriptCursor | NoResultTranscript = NoResultTranscript.UNRECORDED
             ordinary_states = (herdr.AgentStatus.WORKING, herdr.AgentStatus.IDLE, herdr.AgentStatus.DONE)
 
             def require_idle() -> None:
-                nonlocal attempting_input
+                nonlocal attempting_input, boundary
                 readiness = prompt_client.readiness(state.pane)
                 if not (readiness["agent_status"].idle and readiness["interactive_ready"]):
                     raise herdr_types.HerdrFailure("worker is not ready for input")
                 assert isinstance(receipt, WorkerResultReceipt)
                 _ = receipt.before_input()
+                if isinstance(receipt, WorkerResultSubmission):
+                    try:
+                        boundary = _result_submission_boundary(worker, membership)
+                    except (OSError, ValueError) as error:
+                        raise herdr_types.HerdrFailure(f"worker transcript is unavailable: {error}") from error
                 attempting_input = True
 
             def check_message_status() -> None:
@@ -5244,9 +5350,11 @@ def deliver_worker_text(worker: staff.StaffRow, membership: staff.StaffSnapshot,
                         raise
                 if isinstance(receipt, WorkerResultReceipt):
                     try:
+                        if isinstance(receipt, WorkerResultSubmission):
+                            return _confirm_worker_result(worker, state.pane, review_text or text, boundary)
                         if receipt.received(worker, membership):
                             return PaneTextDelivered("sent", f"worker {worker.name} at {state.pane}")
-                    except (OSError, ValueError) as error:
+                    except (OSError, ValueError, staff.StaffUnreadable) as error:
                         reason = f"worker transcript is unavailable: {error}"
                     return WorkerResultUnconfirmed("retry", reason or "the worker transcript has no result receipt")
             else:

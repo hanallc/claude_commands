@@ -1317,18 +1317,16 @@ def _handle_locked(event: WorkerEvent,
                             else detached_runs.WorkerResultInput.TYPE)
             parked = progress_history.parked_worker_pass(passed)
             resume = (lambda: worker.restore_parked_worker(row, parent.id, hold)) if parked else detached_runs.ParkedWorkerDelivery.DEFER
-            def record_submission(result: detached_runs.ConfirmedPaneResult) -> None:
-                worker.record_reaped_result(row, run, instance, stage, result)
-
             replay = detached_runs.submit_finished_worker_result(
-                run, row, worker_input=worker_input, resume_parked=resume, pane_dispatch_id=instance, input_lock=hold,
-                on_submission=record_submission)
-            if replay == detached_runs.WorkerResultReplay.SUBMITTED:
-                if parked:
-                    _ = progress_history.record_worker_park(run, row.id, instance, delivery.completion_id,
-                                                           launch=progress_history.ClearWorkerPark.MARKER)
+                run, row, worker_input=worker_input, resume_parked=resume, input_lock=hold)
+            if isinstance(replay, detached_runs.ConfirmedPaneResult):
+                if replay.ownership is detached_runs.ResultPassOwnership.CURRENT:
+                    worker.record_reaped_result(row, run, instance, stage, replay)
+                    if parked:
+                        _ = progress_history.record_worker_park(run, row.id, instance, delivery.completion_id,
+                                                               launch=progress_history.ClearWorkerPark.MARKER)
                 return TurnOutcome.SUBMITTED
-            if replay == detached_runs.WorkerResultReplay.RETRY:
+            if replay in (detached_runs.WorkerResultReplay.RETRY, detached_runs.WorkerResultReplay.DUPLICATE):
                 return TurnOutcome.RETRY_EVIDENCE
         if not instance:
             return ignore_turn("no active dispatch or recoverable completion exists")

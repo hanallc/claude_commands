@@ -593,7 +593,7 @@ class WorkerCommandTests(unittest.TestCase):
         run: detached_runs.RunRecord = {
             "run_id": "orphan", "status": "running", "session_dir": str(self.run_dir),
             "worker": opened.row.name, "staff_id": opened.row.id, "label": "fixture gate",
-            "command": ["true"], "log": str(folder / "orphan.log"), "started_at": 1,
+            "command": ["true"], "log": str(folder / "orphan.log"), "started_at": time.time(),
             "pid": 2 ** 22 + 12345, "director_dir": str(self.run_dir), "done_message_file": "",
         }
         atomic_file.write_text_atomic(path, json.dumps(run))
@@ -666,7 +666,7 @@ class WorkerCommandTests(unittest.TestCase):
             return result
 
         with (patch.object(world, "run", side_effect=record_input),
-              patch.object(detached_runs, "deliver", wraps=detached_runs.deliver) as deliver,
+              patch.object(send, "deliver_worker_text", wraps=send.deliver_worker_text) as deliver,
               patch.object(unit_runs, "held", return_value=[str(self.run_dir)]),
               patch.object(worker, "_resume_launcher", return_value=worker.ExitCode.OK)):
             code, _, errors = self.command("restore")
@@ -833,7 +833,8 @@ class WorkerCommandTests(unittest.TestCase):
     def test_restore_resumes_a_stopped_busy_worker_with_live_runs_and_exact_context(self) -> None:
         self.assert_restore_live_run(active=True)
         for cause in ("saved deferral", "orphan", "unidentified at reap", "unidentified at startup",
-                      "assignment changes after reap", "pane closes during recovery"):
+                      "assignment changes after reap", "pane closes during recovery",
+                      "legacy result without the prompt", "result with unknown ownership"):
             with self.subTest(parked_result=cause):
                 case = WorkerCommandTests("runTest")
                 case.setUp()
@@ -866,6 +867,15 @@ class WorkerCommandTests(unittest.TestCase):
             self.assertEqual(self.finish(name), turn_end.TurnOutcome.WAITING_ON_RUNS)
             self.assertNotIn(pane, self.fixture.world.locations)
         record["exit_code"] = 0
+        if cause in ("legacy result without the prompt", "result with unknown ownership"):
+            if cause == "legacy result without the prompt":
+                del record["pane_dispatch_id"]
+            else:
+                record["pane_dispatch_id"] = {"unavailable": "the fixture could not read the pass"}
+            backend = staff.backend(row)
+            assert isinstance(backend, staff.CodexBackend)
+            transcript = worker_admission.transcript_source(row, backend)
+            atomic_file.write_text_atomic(transcript, "")
         if cause != "orphan":
             record.update(status="finished", completion_pending=True,
                           finished_at=datetime.now(timezone.utc).isoformat(timespec="microseconds"))
@@ -932,6 +942,10 @@ class WorkerCommandTests(unittest.TestCase):
             resumed.append(plan)
             return worker.ExitCode.OK
 
+        def record_resume(_member: staff.StaffRow, plan: worker.WorkerResume) -> worker.ExitCode:
+            resumed.append(plan)
+            return worker.ExitCode.OK
+
         report = worker.RestoreReport()
         with (ExitStack() as context, patch.object(self.fixture.world, "run", side_effect=accept_result),
               patch.object(agent_accounts, "codex_account_home",
@@ -943,6 +957,8 @@ class WorkerCommandTests(unittest.TestCase):
             if cause == "assignment changes after reap":
                 _ = context.enter_context(patch.object(detached_runs, "reap_orphans", new=replace_after_reap))
                 _ = context.enter_context(patch.object(worker, "_resume_launcher", new=capture_resume))
+            if cause in ("legacy result without the prompt", "result with unknown ownership"):
+                _ = context.enter_context(patch.object(worker, "_resume_launcher", new=record_resume))
             if cause == "pane closes during recovery":
                 self.fixture.world.add(row, pane, family="codex")
                 self.fixture.world.locations[pane]["agent_status"] = "working"
@@ -962,6 +978,16 @@ class WorkerCommandTests(unittest.TestCase):
                              progress_history.parked_worker_launch(parked_before))
             self.assertNotIn(pane, self.fixture.world.locations)
             return
+        if cause in ("legacy result without the prompt", "result with unknown ownership"):
+            self.assertEqual(resumed, [])
+        if cause == "result with unknown ownership":
+            self.assertIs(outcome, worker.ExitCode.UNCERTAIN)
+            self.assertIn("result delivery is uncertain", report.failures[row.id][1])
+            self.assertEqual(len(self.fixture.world.launches), launches)
+            self.assertEqual(started_panes, {})
+            self.assertEqual(received, [])
+            self.assertTrue(progress_history.parked_worker_pass(worker_panes.worker_pass(row, self.run_dir)))
+            return
         if cause.startswith("unidentified"):
             self.assertIs(outcome, worker.ExitCode.UNCERTAIN)
             self.assertEqual(len(self.fixture.world.launches), launches)
@@ -973,6 +999,9 @@ class WorkerCommandTests(unittest.TestCase):
         self.assertEqual(received, [started_panes[row.id]])
         self.assertEqual(self.fixture.world.requests[-1][2]["CODEX_HOME"], str(target_home))
         self.assertEqual(self.agent.row(started_panes[row.id]).current_session, row.current_session)
+        if cause == "legacy result without the prompt":
+            self.assertEqual(report.restored, {row.id})
+            self.assertIn("worker_result_receipt", worker_lifecycle.read_json_object(path))
 
     def assert_restore_live_run(self, *, active: bool) -> None:
         from scripts.whoami import agent_accounts

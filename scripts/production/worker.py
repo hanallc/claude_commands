@@ -38,12 +38,15 @@ from scripts.herdr import herdr_types, pane_launch
 from scripts.accounts import accounts, session_state
 from scripts.direct import progress_history, recorder_state
 from scripts.herdr import worker_panes
+from scripts.herdr.worker_panes import (
+    NoTranscriptTurn as NoTranscriptTurn, TranscriptCursor as TranscriptCursor, transcript_stream as transcript_stream,
+)
 from scripts.usage import rollouts
 from scripts.lib import atomic_file, conf, file_lock, models_registry, unit_runs
-from scripts.lib.transcripts import open_transcript, uncompressed_path
+from scripts.lib.transcripts import open_transcript
 from scripts.lib.resume_message import BusyPass, IdleWorker, NoOwnPass, NO_OWN_PASS, PaneWorkerResume, ResumeWorkers, Unavailable, launcher_prompt, resume_message
 from scripts.lib.resume_message import UnsubmittedAssignment as UnsubmittedAssignment
-from scripts.lib.script_envelope import script_prompt
+from scripts.lib.script_envelope import SCRIPT_ENVELOPE_END, SCRIPT_ENVELOPE_START, script_prompt
 from scripts.production import display_cells, session_staff, staff, worker_admission
 from scripts.whoami import quota_state
 
@@ -53,33 +56,6 @@ StaffId = staff.StaffId
 WorkerName = staff.WorkerName
 WorkerRole = staff.WorkerRole
 ExitCode = worker_panes.ExitCode
-
-
-class NoTranscriptTurn(Enum):
-    UNRECORDED = "no verified turn after the dispatch prompt"
-
-
-@dataclass(frozen=True)
-class TranscriptCursor:
-    """Identify a record within one transcript stream."""
-
-    stream: str
-    position: int
-    prefix: str
-
-    def at_or_after(self, boundary: TranscriptCursor) -> bool:
-        return self.stream == boundary.stream and self.position >= boundary.position
-
-    @classmethod
-    def from_json(cls, value: object) -> TranscriptCursor | NoTranscriptTurn:
-        if not isinstance(value, dict):
-            return NoTranscriptTurn.UNRECORDED
-        fields = cast(dict[str, object], value)
-        stream, position, prefix = fields.get("stream"), fields.get("position"), fields.get("prefix")
-        if (not isinstance(stream, str) or not stream or not isinstance(position, int) or isinstance(position, bool)
-                or position < 1 or not isinstance(prefix, str) or not re.fullmatch(r"[a-f0-9]{64}", prefix)):
-            return NoTranscriptTurn.UNRECORDED
-        return cls(stream, position, prefix)
 
 
 @dataclass(frozen=True)
@@ -143,11 +119,17 @@ class DispatchSubmitted:
 
 
 @dataclass(frozen=True)
+class TranscriptInputMessage:
+    cursor: TranscriptCursor
+    text: str
+
+
+@dataclass(frozen=True)
 class TranscriptResultReply:
     """A result message and its reply in the same transcript turn."""
 
     run_id: str
-    message: TranscriptTurn
+    message: TranscriptInputMessage
     reply: TranscriptTurn
 
 
@@ -286,7 +268,7 @@ class _TranscriptReceiptState:
         self.received: set[str] = set()
         self.cursor: TranscriptCursor | NoMatchingDone = NoMatchingDone.UNRECORDED
         self.results_before_done: frozenset[str] = frozenset()
-        self.result_message: TranscriptTurn | NoTranscriptTurn = NoTranscriptTurn.UNRECORDED
+        self.result_message: TranscriptInputMessage | NoTranscriptTurn = NoTranscriptTurn.UNRECORDED
         self.result_replies: list[TranscriptResultReply] = []
         self.latest_reply: TranscriptCursor | NoTranscriptTurn = NoTranscriptTurn.UNRECORDED
         self.reply: DispatchSubmitted | DispatchComplete | DispatchAwaitingReply = DispatchSubmitted()
@@ -302,7 +284,10 @@ class _TranscriptReceiptState:
         self.received.update(results.difference(self.other_pass_results))
         self.latest_reply = NoTranscriptTurn.UNRECORDED
         self.result_message = NoTranscriptTurn.UNRECORDED
-        first, _, body = text.partition("\n")
+        content = text
+        if text.startswith(SCRIPT_ENVELOPE_START) and text.endswith(SCRIPT_ENVELOPE_END):
+            content = text.removeprefix(SCRIPT_ENVELOPE_START).removesuffix(SCRIPT_ENVELOPE_END).strip()
+        first, _, body = content.partition("\n")
         assignment = ("Read the unchanged prompt file" in text and any(instruction in text for instruction in (
             "End your final reply with DONE ", "End your final reply with this line alone: DONE ")))
         if (self.second_stage and self.completion_id != self.second_stage
@@ -329,7 +314,7 @@ class _TranscriptReceiptState:
         elif self.submitted:
             if (self.responding and isinstance(self.cursor, TranscriptCursor) and isinstance(cursor, TranscriptCursor)
                     and first.startswith("Detached run: ") and body.strip()):
-                self.result_message = TranscriptTurn(cursor, text)
+                self.result_message = TranscriptInputMessage(cursor, content)
             results.difference_update(self.other_pass_results)
             if not self.responding:
                 results.intersection_update(self.late_result_ids)
@@ -372,8 +357,8 @@ class _TranscriptReceiptState:
             return
         if isinstance(cursor, TranscriptCursor):
             self.latest_reply = cursor
-            if isinstance(self.result_message, TranscriptTurn):
-                run_id = self.result_message.reply.partition("\n")[0].removeprefix("Detached run: ")
+            if isinstance(self.result_message, TranscriptInputMessage):
+                run_id = self.result_message.text.partition("\n")[0].removeprefix("Detached run: ")
                 self.result_replies.append(TranscriptResultReply(run_id, self.result_message, TranscriptTurn(cursor, text)))
         if isinstance(self.reply, DispatchAwaitingReply):
             self.reply = replace(self.reply, last_reply=text)
@@ -414,18 +399,14 @@ def _read_transcript(entries: Iterable[str | dict[str, object] | worker_admissio
                      *states: _TranscriptReceiptState, stream: str = "",
                      previous: tuple[TranscriptCursor, ...] = (),
                      ) -> tuple[str, frozenset[TranscriptCursor]]:
-    prefix = hashlib.sha256()
-    checkpoints = {cursor.position for cursor in previous if cursor.stream == stream}
+    checkpoints = set(previous)
     matched: set[TranscriptCursor] = set()
     try:
-        for position, entry in enumerate(entries, 1):
-            if stream:
-                data = None if isinstance(entry, worker_admission.TornTranscriptRecord) else entry
-                prefix.update(json.dumps(data, sort_keys=True).encode() + b"\n")
-                if position in checkpoints:
-                    checkpoint = TranscriptCursor(stream, position, prefix.hexdigest())
-                    if checkpoint in previous:
-                        matched.add(checkpoint)
+        records = (worker_panes.transcript_record_cursors(entries, stream) if stream else
+                   ((entry, NoMatchingDone.UNRECORDED) for entry in entries))
+        for entry, cursor in records:
+            if isinstance(cursor, TranscriptCursor) and cursor in checkpoints:
+                matched.add(cursor)
             if isinstance(entry, worker_admission.TornTranscriptRecord):
                 for state in states:
                     state.incomplete = True
@@ -439,13 +420,11 @@ def _read_transcript(entries: Iterable[str | dict[str, object] | worker_admissio
                 timestamp = entry.get("timestamp")
                 fields = entry
                 entry = worker_admission.transcript_entry(fields, set())
-                if not entry and stream and _transcript_turn_boundary(fields):
-                    cursor = TranscriptCursor(stream, position, prefix.hexdigest())
+                if not entry and isinstance(cursor, TranscriptCursor) and _transcript_turn_boundary(fields):
                     for state in states:
                         state.turn_ended(cursor)
             if not entry.startswith(("user:\n", "assistant:\n")):
                 continue
-            cursor = TranscriptCursor(stream, position, prefix.hexdigest()) if stream else NoMatchingDone.UNRECORDED
             if entry.startswith("user:\n"):
                 message = entry.removeprefix("user:\n")
                 for state in states:
@@ -504,10 +483,6 @@ def consultation_reply(client: herdr.Herdr, pane: str, source: Path, question: s
 
 class CurrentPanePass(Enum):
     CURRENT = "read the current pane pass"
-
-
-def transcript_stream(row: staff.StaffRow, source: Path) -> str:
-    return f"{row.current_session}:{uncompressed_path(source.resolve())}"
 
 
 def _dispatch_transcript(
@@ -689,14 +664,7 @@ def read_result_done_evidence(
 
 def result_done_coverage(row: staff.StaffRow, passed: dict[str, object], record: detached_runs.RunRecord,
                          ) -> detached_runs.ResultDoneCoverage | detached_runs.ResultTranscriptUnknown:
-    """Check the saved prompt and DONE before delivering a run result."""
-    instance = passed.get("instance_id")
-    linked = record.get("pane_dispatch_id")
-    started = passed.get("started_at")
-    belongs_to_pass = (linked == instance if linked is not None else
-                       isinstance(started, (int, float)) and record["started_at"] >= started)
-    if not isinstance(instance, str) or not instance or not belongs_to_pass:
-        return detached_runs.ResultDoneCoverage.NEEDS_DELIVERY
+    """Check the saved prompt and DONE for a result that belongs to this pass."""
     verified = read_result_done_evidence(Path(record["session_dir"]), row, passed)
     if isinstance(verified, VerifiedPassDone):
         return verified.covers_run(record, detached_runs.run_finish_time(record))
@@ -708,24 +676,23 @@ def _prove_result_delivery(directory: Path, row: staff.StaffRow, passed: dict[st
                            ) -> ResultDeliveryProof | NoResultDeliveryProof:
     if done.cursor != transcript.cursor or not transcript.result_replies:
         return NoResultDeliveryProof.UNVERIFIED
-    instance = passed.get("instance_id")
     started = passed.get("started_at")
     records = {record["run_id"]: record for record in detached_runs.confirmed_worker_results(
         directory, row, {candidate.run_id for candidate in transcript.result_replies})}
     for candidate in reversed(transcript.result_replies):
         record = records.get(candidate.run_id)
-        if record is None or not _done_covers_run(done.done_at, record, detached_runs.run_finish_time(record)):
+        if (record is None or candidate.message.cursor != TranscriptCursor.from_json(record.get("worker_result_receipt"))
+                or not _done_covers_run(done.done_at, record, detached_runs.run_finish_time(record))):
             continue
-        linked = record.get("pane_dispatch_id")
-        if linked == instance and candidate.reply.cursor == transcript.latest_reply:
+        ownership = detached_runs.result_pass_ownership(record, row, directory.parent, passed)
+        if ownership is detached_runs.ResultPassOwnership.CURRENT and candidate.reply.cursor == transcript.latest_reply:
             assignment = ResultAssignment.CURRENT
-        elif (detached_runs.result_is_from_another_pass(record, instance)
+        elif (ownership is detached_runs.ResultPassOwnership.OTHER_PASS
               and isinstance(started, (int, float)) and record["started_at"] < started):
             assignment = ResultAssignment.EARLIER
         else:
             continue
-        if detached_runs.matches_worker_result_message(record, candidate.message.reply):
-            return ResultDeliveryProof(done.cursor, candidate, assignment)
+        return ResultDeliveryProof(done.cursor, candidate, assignment)
     return NoResultDeliveryProof.UNVERIFIED
 
 
@@ -2553,16 +2520,15 @@ def _restore_worker_pane(parent: StaffId, row: staff.StaffRow, hold: worker_pane
 class ReapedWorkerResult:
     """Reap opened the pane and submitted a result for this assignment."""
 
-    worker: StaffId
-    session: StaffId
     run: Path
     instance: str
     stage: str
     submission: detached_runs.ConfirmedPaneResult
 
     def matches(self, pane: worker_panes.OpenWorker, run: Path, passed: dict[str, object]) -> bool:
-        return (self.worker == pane.row.id and self.session == pane.row.current_session
-                and self.submission.pane == pane.pane and self.run == run.resolve()
+        receipt = self.submission.receipt
+        return (receipt.worker == pane.row.id and receipt.session == pane.row.current_session
+                and receipt.pane == pane.pane and self.run == run.resolve()
                 and passed.get("status") in ("active", "refused") and passed.get("instance_id") == self.instance
                 and pass_recorder.dispatch_delivery(passed).completion_id == self.stage)
 
@@ -2590,10 +2556,11 @@ def record_reaped_result(row: staff.StaffRow, run: Path, instance: str, stage: s
                          submission: detached_runs.ConfirmedPaneResult) -> None:
     """Keep a result receipt only for the pane this restore opened."""
     request = _parked_restore_request.get()
+    receipt = submission.receipt
     if (isinstance(request, ParkedRestoreRequest) and stage
-            and request.started_panes.get(row.id) == submission.pane):
-        request.delivered[row.id] = ReapedWorkerResult(
-            row.id, row.current_session, run.resolve(), instance, stage, submission)
+            and row.id == receipt.worker and row.current_session == receipt.session
+            and request.started_panes.get(row.id) == receipt.pane):
+        request.delivered[row.id] = ReapedWorkerResult(run.resolve(), instance, stage, submission)
 
 
 def restore_parked_worker(row: staff.StaffRow, parent: StaffId, hold: worker_panes.WorkerLockHold) -> bool:
@@ -2752,6 +2719,9 @@ def restore(parent: StaffId, *, record: staff.StaffSnapshot | None = None,
                     state = refreshed_state
                     if isinstance(state, (worker_panes.ProcessUnknownWorker, worker_panes.UncertainWorker)):
                         failed(state.row, state.reason)
+                        continue
+                    if reason := detached_runs.unresolved_worker_result(run, current, passed):
+                        failed(state.row, reason, notice=f"anomaly: {name}: {reason}")
                         continue
                     # A result delivery can reopen the pane before restore checks the transcript.
                     recover_first = parked or passed.get("status") == "canceled" or state.row.id in reaped_panes
