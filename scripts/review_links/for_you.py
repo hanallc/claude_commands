@@ -51,6 +51,8 @@ class ForYouRow:
     completion: Literal["manual", "automatic"]
     evidence: str
     requests: tuple[RebuildRequest, ...] = ()
+    open_requests: tuple[RebuildRequest, ...] = ()
+    system_difference: str = ""
 
 
 @dataclass(frozen=True)
@@ -230,14 +232,16 @@ def read(config: Path = rebuild_row.DEFAULT_CONFIG, *,
         current = active if active else completed
         reason = "\n".join(f"{request.reason} Requester: {request.requested_by or 'Not recorded'}. "
                            + f"Concerns: {request.concerns or 'Not recorded'}." for request in current)
-        if machine in compared:
-            reason = (reason + "\n" if reason else "") + "The running system differs from the configured system."
+        system_difference = "The running system differs from the configured system." if machine in compared else ""
+        if system_difference:
+            reason = (reason + "\n" if reason else "") + system_difference
         rows.append(ForYouRow(
             f"rebuild/{machine}", "rebuild", f"Rebuild {machine}", "rebuild", machine, working_directories.get(machine, ""),
             ", ".join(dict.fromkeys(request.requested_by for request in current if request.requested_by)),
             reason, "; ".join(dict.fromkeys(request.waits for request in active)) or "Not recorded",
             requests[0].created_at if requests else "", status, "automatic",
-            "\n".join(request.evidence for request in completed), requests))
+            "\n".join(request.evidence for request in completed), requests,
+            open_requests=active, system_difference=system_difference))
     return ForYouSnapshot(tuple(rows), tuple(unavailable))
 
 

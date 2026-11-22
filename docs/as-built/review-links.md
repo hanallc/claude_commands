@@ -319,8 +319,14 @@ The collapsed rail keeps an icon and badge.
 The phone header keeps a compact button.
 The nonmodal panel shows every open action in source order.
 Each entry shows its machine, reason, command, and a Copy button.
-The machine line adds the requester after a dot when a requester exists.
-The reason appears below the machine line and keeps its line breaks.
+A rebuild's machine line shows only the machine.
+An action's machine line adds the requester after a dot when a requester exists.
+An action shows its reason below the machine line.
+A rebuild shows up to three reasons from open requests in order from newest to oldest.
+Matching reasons share one line with a count and the newest requester's name and age.
+The line shortens long reasons and shows the full text on hover.
+Show more expands the list in place. A long list scrolls inside the entry.
+The system difference appears once below the list when it applies.
 When the panel reaches its height limit, the entries scroll below the header and note.
 Escape closes the panel and focuses the visible For you button.
 

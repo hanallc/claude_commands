@@ -4,6 +4,7 @@ from __future__ import annotations
 from html.parser import HTMLParser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from dataclasses import replace
+from datetime import datetime
 import subprocess
 import threading
 import json
@@ -294,9 +295,17 @@ class ForYouNotifierTests(unittest.TestCase):
                                  status, "manual", "")
 
     def test_notifier_counts_and_returns_every_open_row_in_order(self) -> None:
-        rebuild_reason = "The running system differs from the configured system."
+        difference = "The running system differs from the configured system."
+        requests = tuple(for_you.RebuildRequest("mac", reason, "builds", "Console review",
+                                              f"2026-11-21T12:0{index}:00+00:00", "", "")
+                         for index, reason in enumerate((
+                             "Apply settings.", "Refresh certificates.", "Update packages.",
+                             "Enable the service.", "Apply settings.",
+                         )))
+        completed = replace(requests[0], reason="Apply older settings.", evidence="Switch recorded.")
         rows = (self.action(), replace(self.action("rebuild/mac"), kind="rebuild", machine="mac", requested_by="",
-                                       reason=rebuild_reason),
+                                       reason="Apply settings.\n" + difference, requests=(completed, *requests),
+                                       open_requests=requests, system_difference=difference),
                 replace(self.action("action/done"), status="done"), self.action("action/third"))
         snapshot = for_you.ForYouSnapshot(rows, ())
         with patch.object(for_you, "read", return_value=snapshot):
@@ -309,7 +318,14 @@ class ForYouNotifierTests(unittest.TestCase):
         self.assertEqual(result["entries"][1]["machine"], "mac")
         self.assertEqual(result["entries"][1]["requested_by"], "")
         self.assertEqual(result["entries"][0]["reason"], "Login needs your browser.")
-        self.assertEqual(result["entries"][1]["reason"], rebuild_reason)
+        self.assertEqual(result["entries"][0]["requests"], [])
+        self.assertEqual(result["entries"][1]["reason"], "")
+        self.assertEqual(result["entries"][1]["system_difference"], difference)
+        self.assertEqual(result["entries"][1]["requests"], [
+            {"reason": request.reason, "requested_by": request.requested_by,
+             "created_at": datetime.fromisoformat(request.created_at).timestamp()}
+            for request in requests
+        ])
         self.assertEqual(console.for_you_count(snapshot), {"available": True, "count": 3})
         for entry in result["entries"]:
             self.assertNotIn("href", entry)
@@ -343,8 +359,13 @@ let accountsQuota={level:'urgent',name:'Urgent: 4% left'};
 Object.defineProperty(document,'visibilityState',{get:()=>visibility});
 window.setInterval=(run,ms)=>{const id=timers.size+1;timers.set(id,{run,ms});return id;};
 window.clearInterval=id=>timers.delete(id);
+const request=(reason,requested_by,minutes)=>({reason,requested_by,created_at:Date.now()/1000-minutes*60});
+const longReason='Keep the changes that update the console settings and add the new machine configuration for the next restart.';
+const difference='The running system differs from the configured system.';
 const entries=[{key:'rebuild/natedev',kind:'rebuild',title:'Apply the new console settings',command:'rebuild',
- machine:'natedev',requested_by:'watcher',reason:'Apply the settings.\nThe running system differs from the configured system.'},
+ machine:'natedev',requested_by:'watcher, builds, sdlc',system_difference:difference,requests:[
+  request(longReason,'sdlc',40),request('Update packages.','builds',15),request('Enable the service.','builds',25),
+  request(longReason,'watcher',5),request('Refresh certificates.','sdlc',12)]},
  {key:'action/demo',kind:'action',title:'Restore GitHub access',command:'github-warmup',machine:'mac',requested_by:'sdlc',
   reason:'Login needs your browser.'}];
 Object.defineProperty(navigator,'clipboard',{value:{writeText:async text=>{copied=text;}}});
@@ -376,13 +397,39 @@ try{
  check(!panel.hidden && trigger.getAttribute('aria-expanded')==='true','the button opens the panel');
  check(trigger.textContent.includes('2') && panel.querySelectorAll('article').length===2,'the count and two entries appear');
  const machineLines=()=>[...panel.querySelectorAll('[data-entry-machine]')].map(line=>line.textContent);
- check(machineLines().join('|')==='natedev · watcher|mac · sdlc','rebuild and action entries name their requesters');
- const reasons=[...panel.querySelectorAll('[data-entry-reason]')];
- check(reasons.length===2 && reasons.every((reason,index)=>reason.textContent===entries[index].reason),
-  'rebuild and action entries show their reasons');
- check(reasons.every(reason=>getComputedStyle(reason).whiteSpace==='pre-line' &&
-  reason.previousElementSibling.matches('[data-entry-machine]') && reason.nextElementSibling.matches('.code-block')),
-  'the reasons keep line breaks and appear between the machine and command');
+ check(machineLines().join('|')==='natedev|mac · sdlc','only the action adds its requester to the machine line');
+ const requestList=()=>panel.querySelector('[data-key="rebuild/natedev"] [data-rebuild-requests]');
+ const requestToggle=()=>panel.querySelector('[data-key="rebuild/natedev"] [data-request-toggle]');
+ const visibleRequests=()=>[...requestList().querySelectorAll('li:not([hidden])')];
+ const lines=visibleRequests();
+ check(lines.map(line=>line.querySelector('[data-request-text]').textContent).join('|')===
+  [longReason,'Refresh certificates.','Update packages.'].join('|'),'the newest three groups show first');
+ check(lines[0]?.querySelector('[data-request-count]').textContent.trim()==='×2' &&
+  lines[0]?.querySelector('[data-request-by]').textContent===' · watcher' &&
+  lines[0]?.querySelector('time').textContent==='5 min','the group shows its count, newest requester and age');
+ const longText=lines[0]?.querySelector('[data-request-text]');
+ check(lines[0]?.title===longReason && getComputedStyle(longText).textOverflow==='ellipsis' &&
+  longText.scrollWidth>longText.clientWidth && getComputedStyle(longText).whiteSpace==='nowrap',
+  'the long reason uses one line and has a full title');
+ check(requestToggle().textContent==='Show 1 more','five requests form four groups');
+ entries[0].requests.push(request('Apply the proxy setting.','sdlc',35));
+ dispatchEvent(new Event('focus'));await flush();
+ const showMore=requestToggle();
+ check(showMore.matches('button') && showMore.textContent==='Show 2 more' &&
+  showMore.getAttribute('aria-expanded')==='false' && showMore.getAttribute('aria-controls')===requestList().id,
+  'six requests form five groups with an accessible disclosure button');
+ showMore.click();
+ check(showMore.textContent==='Show less' && showMore.getAttribute('aria-expanded')==='true' &&
+  visibleRequests().length===5 && requestList().tabIndex===0 && getComputedStyle(requestList()).overflowY==='auto' &&
+  getComputedStyle(requestList()).maxHeight!=='none','expansion shows all groups in a bounded list');
+ showMore.click();
+ check(showMore.textContent==='Show 2 more' && showMore.getAttribute('aria-expanded')==='false' &&
+  visibleRequests().length===3,'the button restores the preview');
+ check(panel.querySelectorAll('[data-system-difference]').length===1 &&
+  panel.querySelector('[data-system-difference]').textContent===difference &&
+  showMore.nextElementSibling.matches('[data-system-difference]'),'the difference appears once after the list');
+ check(panel.querySelector('[data-entry-reason]').textContent===entries[1].reason,'the action shows its reason');
+ check(requestList().scrollWidth===requestList().clientWidth,'the reasons fit the available width');
  check(panel.getBoundingClientRect().right<=innerWidth && panel.getBoundingClientRect().left>=0,'the panel fits the viewport');
  check(document.documentElement.scrollWidth===innerWidth,'the shell has no horizontal overflow');
  const copy=panel.querySelector('[data-copy-code]');copy.focus();copy.click();await flush();
@@ -485,9 +532,33 @@ try{
  check(trigger.dataset.state==='unavailable' && trigger.querySelector('b').textContent==='?',
   'an unavailable count replaces a known zero');
  mode='good';dispatchEvent(new Event('focus'));await flush();
- entries[0].requested_by='';entries[0].reason='';dispatchEvent(new Event('focus'));await flush();
- check(machineLines().join('|')==='natedev|mac · sdlc','a rebuild without a requester shows the machine alone');
- check(!panel.querySelector('[data-key="rebuild/natedev"] [data-entry-reason]'),'an empty reason leaves no element');
+ entries[0].requests.push(...Array.from({length:8},(_,index)=>request('Earlier request '+index,'builds',60+index)));
+ dispatchEvent(new Event('focus'));await flush();
+ panel.style.maxHeight='300px';
+ requestToggle().click();
+ const expandedList=requestList(),panelEntries=panel.querySelector('[data-for-you-entries]');
+ expandedList.scrollTop=40;
+ panelEntries.scrollTop=40;
+ const listScrollTop=expandedList.scrollTop,panelScrollTop=panelEntries.scrollTop;
+ check(listScrollTop>0 && panelScrollTop>0,'the expanded list and panel have scrolled');
+ entries[1].reason='The browser login expired.';
+ dispatchEvent(new Event('focus'));await flush();
+ check(panel.querySelector('[data-entry-reason]').textContent===entries[1].reason,'the action update is visible');
+ check(requestList()===expandedList && requestToggle().getAttribute('aria-expanded')==='true' &&
+  requestList().scrollTop===listScrollTop && panelEntries.scrollTop===panelScrollTop,
+  'an action refresh reuses the expanded rebuild list and preserves both scroll positions');
+ entries[0].requests.push(request('One more rebuild request.','sdlc',90));
+ dispatchEvent(new Event('focus'));await flush();
+ check(requestList().lastElementChild.title==='One more rebuild request.' &&
+  requestToggle().getAttribute('aria-expanded')==='true' && requestList().scrollTop===listScrollTop &&
+  panelEntries.scrollTop===panelScrollTop,'a rebuild refresh restores the expanded list and both scroll positions');
+ panel.style.removeProperty('max-height');
+ entries[0].requests=[];entries[1].requested_by='';entries[1].reason='';
+ dispatchEvent(new Event('focus'));await flush();
+ check(machineLines().join('|')==='natedev|mac','an action without a requester shows the machine alone');
+ check(requestList().hidden && requestToggle().hidden && panel.querySelector('[data-system-difference]').textContent===difference,
+  'a rebuild with no requests shows only the difference');
+ check(!panel.querySelector('[data-entry-reason]'),'an empty action reason leaves no element');
  check(!panel.querySelector('a,footer'),'the panel has no card or footer links');
  const url=new URL(location.href);
  check(url.searchParams.get('page')==='list' && url.searchParams.get('at.list')==='/page?filter=mine' &&
