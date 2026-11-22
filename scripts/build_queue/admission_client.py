@@ -33,6 +33,7 @@ from scripts.build_queue import admission_code, placement, snapshot_codec
 from scripts.build_queue import admission_wire as status_wire
 from scripts.build_queue.admission_wire import read_assignment as read_assignment
 from scripts.build_queue.admission_wire import write_assignment as write_assignment
+from scripts.build_hold import owning_session
 from scripts.build_hold.shared_state_defaults import DEFAULT_ADMISSION_SOCKET
 from scripts.build_targets import target_config
 from scripts.direct import step_selection
@@ -1866,7 +1867,7 @@ def step_request(argv: list[str], cwd: str, owner: wire.Owner, since: float, sid
         identity,
         records.CallRecord(call) if call else records.NoCallRecord(), width_value_typed, estimate.profile,
         isinstance(estimate.cache, records.FreshTest), float(os.environ.get("BUILDLOG_MEM_TOKEN_BACK_AT", "0")), run,
-        route=records.direct_cargo_route())
+        route=records.direct_cargo_route(), session=owning_session.owning_session())
 
 
 def write_shell_grant(path: Path, grant: wire.Admitted | wire.LaunchAdmitted, elapsed: int) -> None:

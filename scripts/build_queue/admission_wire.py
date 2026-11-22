@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 from stat import S_ISREG
 from scripts.build_queue import execution_identity
+from scripts.build_hold.owning_session import NoOwningSession, OwningSession
 from scripts.build_hold.shared_state_defaults import DEFAULT_ADMISSION_SOCKET as DEFAULT_ADMISSION_SOCKET
 from typing import TYPE_CHECKING, Literal, TypeVar, cast
 
@@ -174,6 +175,8 @@ class AdmitRequest(CallerCode):
     run: RunIdentity | NoRun = NO_RUN
     place: LocalPlace | CloudPlace = LocalPlace()
     route: target_config.StepRoute = field(default_factory=lambda: records.DIRECT_CARGO, kw_only=True)
+    # The session that owns the run; a natedev hold of this session does not hold the step.
+    session: OwningSession | NoOwningSession = field(default=NoOwningSession(), kw_only=True)
 
 
 @dataclass(frozen=True)

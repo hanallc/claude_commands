@@ -8,6 +8,7 @@ from scripts.build_queue import snapshot_codec as codec
 from scripts.build_queue.admission_protocol_v1_fixture import parse_request as decode_legacy
 
 from scripts.lint.memory_test_support import admission_policy_fixture, memory_gate_shell_environment
+from scripts.build_hold.owning_session import NoOwningSession, OwningSession
 
 from contextlib import redirect_stderr
 from dataclasses import replace
@@ -156,6 +157,13 @@ class ProtocolTests(unittest.TestCase):
                         envelope = cast(dict[str, object], json.loads(wire.encode_request(request)))
                         envelope["v"] = version
                         self.assertEqual(wire.parse_request_envelope(json.dumps(envelope)), (version, request))
+
+    def test_the_owning_session_survives_the_request_wire(self) -> None:
+        with AdmissionFixture() as fixture:
+            for session in (OwningSession("fps-run"), NoOwningSession()):
+                with self.subTest(session=session):
+                    request = replace(fixture.request(), session=session)
+                    self.assertEqual(wire.parse_request(wire.encode_request(request)), request)
 
     def test_placement_exchanges_preserve_identity_without_replaying_authority(self) -> None:
         from scripts.build_queue.test_placement import placement_request, coordinator_holder

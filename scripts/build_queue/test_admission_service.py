@@ -42,6 +42,7 @@ from scripts.accounts import outage_alerts
 from scripts.buildlog import store
 from scripts.buildlog import record as buildlog_record
 from scripts.build_hold import override_guard
+from scripts.build_hold.owning_session import OwningSession
 
 from scripts.lib import conf
 from scripts.lib import inotify, test_hang_guard
@@ -2536,6 +2537,45 @@ class RunnerAuthorizationTests(unittest.TestCase):
                 _ = fixture.server.run_pass()
             self.assertIn(older.episode, fixture.server.reservations)
             self.assertIn(newer.episode, fixture.server.waiters)
+
+    def test_a_step_of_the_holders_own_run_starts_in_the_hold(self) -> None:
+        # A worker in the run has its own session; the run's owning session holds natedev.
+        with AdmissionFixture() as fixture, fixture.loop_turn():
+            directory = fixture.root / "holders"
+            directory.mkdir()
+            fixture.hold_starts()
+            worker = replace(fixture.request(), session=OwningSession("fps-run"))
+            self.assertIsInstance(fixture.server.handle_request(worker)[0], wire.Wait)
+            self.assertNotEqual(fixture.server.waiters[worker.episode].row.get("session_id"), "fps-run")
+            _ = (directory / "fps-run").write_text(json.dumps({
+                "holder": "fps-run", "since": "2026-11-22T22:33:19+00:00", "for": "a traced timeline",
+                "release_eta": "unknown", "keep": []}))
+            write_pressure_reading(fixture.root / "pressure")
+            fixture.free(9 * GIB)
+            fixture.allow_next_start()
+            _ = fixture.server.run_pass()
+            self.assertIn(worker.episode, fixture.server.reservations)
+
+    def test_a_held_step_gives_back_its_runs_slot_between_steps(self) -> None:
+        with AdmissionFixture() as fixture:
+            directory = fixture.root / "holders"
+            directory.mkdir()
+            run = fixture.run_owner()
+            first = only_admitted(fixture.server.handle_request(fixture.request(run=run, need=6 * GIB)))
+            fixture.allow_next_start()
+            other = only_admitted(fixture.server.handle_request(fixture.request(run=fixture.run_owner(), need=GIB)))
+            fixture.release(first)
+            fixture.release(other)
+            fixture.free(11 * GIB)
+            head = fixture.request(run=run, need=16 * GIB)
+            self.assertIsInstance(fixture.server.handle_request(head)[0], wire.Wait)
+            self.assertIsInstance(fixture.server.slots[first.reservation], records.ContinuationSlot)
+            _ = (directory / "fps").write_text(json.dumps({
+                "holder": "fps", "since": "2026-11-22T22:33:19+00:00", "for": "a traced timeline",
+                "release_eta": "unknown", "keep": []}))
+            _ = fixture.run_pass()
+            self.assertIsInstance(fixture.server.slots[first.reservation], records.BetweenStepsSlot)
+            self.assertIsInstance(fixture.server.waiters[head.episode].continuation_claim, service.NoContinuationClaim)
 
     def test_service_estimate_refreshes_history_and_replays_without_a_caller_run(self) -> None:
         with AdmissionFixture() as fixture, fixture.loop_turn():
