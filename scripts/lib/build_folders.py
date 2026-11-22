@@ -1646,18 +1646,22 @@ def _empty_editable_destination(path: Path, parent: int, expected: os.stat_resul
 
 def _remove_failed_allocation(path: Path, directory: int, allocated: os.stat_result | None) -> None:
     if allocated is not None:
-        _remove_folder(path, directory, allocated)
+        remove_folder(path, directory, allocated)
     if not _folder_exists(path, directory):
         _unlink_metadata(path, directory)
 
 
-def _remove_folder(path: Path, directory: int, allocated: os.stat_result) -> None:
+def remove_folder(path: Path, directory: int | None = None, allocated: os.stat_result | None = None) -> None:
+    """Remove an owned folder and repair permissions when removal needs it."""
+    removal_path = path if directory is None else Path(path.name)
+    name = os.fspath(removal_path)
+
     def repair(function: object, name: str, error: BaseException) -> None:
         if not isinstance(error, PermissionError):
             raise error
         entry = Path(name)
         for candidate in (entry.parent, entry):
-            if not candidate.is_relative_to(path.name):
+            if not candidate.is_relative_to(removal_path):
                 continue
             inode = os.stat(candidate, dir_fd=directory, follow_symlinks=False)
             if inode.st_uid == os.geteuid() and not stat.S_ISLNK(inode.st_mode):
@@ -1668,13 +1672,14 @@ def _remove_folder(path: Path, directory: int, allocated: os.stat_result) -> Non
             _ = cast(Callable[..., object], function)(name, dir_fd=directory)
 
     try:
-        current = os.stat(path.name, dir_fd=directory, follow_symlinks=False)
+        current = os.stat(name, dir_fd=directory, follow_symlinks=False)
     except FileNotFoundError:
         return
-    if os.path.samestat(current, allocated):
-        if not may_remove_build_path(path):
-            raise PermissionError(f"{path}: retain the protected build folder")
-        shutil.rmtree(path.name, dir_fd=directory, onexc=repair)
+    if allocated is not None and not os.path.samestat(current, allocated):
+        return
+    if not may_remove_build_path(path):
+        raise PermissionError(f"{path}: retain the protected build folder")
+    shutil.rmtree(name, dir_fd=directory, onexc=repair)
 
 
 def _folder_exists(path: Path, directory: int) -> bool:
@@ -2027,7 +2032,7 @@ def _finish_temporary(path: Path, directory: int, allocated: os.stat_result, *,
     if _locks.get(descriptor) != path:
         return
     _release_build_folder(path, descriptor=descriptor)
-    _ = remove_build_folder(path, lambda: _remove_folder(path, directory, allocated),
+    _ = remove_build_folder(path, lambda: remove_folder(path, directory, allocated),
                             temporary=temporary, dir_fd=directory)
 
 
@@ -2045,7 +2050,7 @@ def _remove_free(path: Path, directory: int, *, wait: bool) -> bool:
                     return False
             except OSError:
                 return False
-            _remove_folder(path, directory, allocated)
+            remove_folder(path, directory, allocated)
         return True
 
     return remove_build_folder(path, cleanup, dir_fd=directory, wait=wait)
