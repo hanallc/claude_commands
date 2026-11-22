@@ -892,12 +892,11 @@ class HoldEnforcerTests(unittest.TestCase):
                 table = self.table()
                 stopped_before = len([row for row in self.rows() if row["action"] == "stopped"])
 
-                def stop_scope(saved_scope: process_stop.ScopeIdentity, _grace: float,
-                               _kill_grace: float) -> process_stop.ScopeStopReceipt:
+                def send_term(_directory: int, saved_scope: process_stop.ScopeIdentity, _deadline: float) -> int:
                     self.assertEqual(saved_scope, identity)
                     self.assertEqual(len([row for row in self.rows() if row["action"] == "stopped"]), stopped_before)
                     _ = events.write_text("populated 0\n")
-                    return process_stop.ScopeStopReceipt(1)
+                    return 1
 
                 def run(command: list[str], _environment: dict[str, str], _log: Path) -> int:
                     self.assertEqual(command, scoped_command)
@@ -916,7 +915,7 @@ class HoldEnforcerTests(unittest.TestCase):
                 with (isolated_staff_file(self.root / "staff.json", {}),
                       mock.patch.dict(os.environ, {"BUILDLOG_SCOPE": "0"}),
                       mock.patch.object(process_stop, "CGROUP_ROOT", cgroups),
-                      mock.patch.object(process_stop, "stop_scope", side_effect=stop_scope),
+                      mock.patch.object(process_stop, "_term_scope", side_effect=send_term),
                       mock.patch.object(detached_runs, "_scope_stop_graces", return_value=(2.0, 5.0)),
                       mock.patch.object(detached_runs, "_run", side_effect=run),
                       mock.patch.object(detached_runs, "deliver_in_fresh_process", return_value=0)):

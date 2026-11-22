@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Generator
-from contextlib import contextmanager, suppress
+from contextlib import ExitStack, contextmanager, suppress
 from dataclasses import dataclass
 import fcntl
 import json
@@ -352,35 +352,72 @@ def stop_scope(
     on_term: Callable[[int], None] | None = None,
 ) -> ScopeStopReceipt:
     """Report the TERM count before the exit wait."""
-    deadline = time.monotonic() + grace
-    reached: int | None = None
-    with suppress(_ScopeRemoved), _scope_events(scope) as (directory, events):
-        empty = _scope_is_empty(scope, events)
-        reached = 0 if empty else _term_scope(directory, scope, deadline)
-        if on_term is not None:
-            on_term(reached)
-        if empty or _scope_ends_on(scope, events, deadline):
-            return ScopeStopReceipt(reached)
-        if not reached and on_term is not None:
-            raise ScopeStopFailed("no TERM signal reached a member of the populated scope")
-        try:
-            descriptor = os.open("cgroup.kill", os.O_WRONLY | os.O_NOFOLLOW, dir_fd=directory)
+    return stop_scopes((scope,), grace, kill_grace, on_term=on_term)
+
+
+@dataclass(frozen=True)
+class _ScopeAwaitingExit:
+    scope: ScopeIdentity
+    directory: int
+    events: int
+    term_reached: int
+    term_deadline: float
+
+
+def stop_scopes(
+    scopes: tuple[ScopeIdentity, ...], grace: float, kill_grace: float, *,
+    on_term: Callable[[int], None] | None = None,
+) -> ScopeStopReceipt:
+    """Report one total after all TERM sends and before any exit wait."""
+    pending: list[_ScopeAwaitingExit] = []
+    errors: list[tuple[str, ScopeStopFailed]] = []
+    with ExitStack() as opened:
+        for scope in scopes:
+            deadline = time.monotonic() + grace
             try:
-                _ = os.write(descriptor, b"1\n")
-            finally:
-                os.close(descriptor)
-        except OSError as error:
-            if _scope_is_empty(scope, events):
-                return ScopeStopReceipt(reached)
-            detail = "" if reached else "no TERM signal reached a member. "
-            raise ScopeStopFailed(f"{detail}cgroup.kill failed: {error}") from error
-        if not _scope_ends_on(scope, events, time.monotonic() + kill_grace):
-            raise ScopeStopFailed("the scope remains populated after KILL")
-    if reached is not None:
-        return ScopeStopReceipt(reached)
-    if on_term is not None:
-        on_term(0)
-    return ScopeStopReceipt(0)
+                directory, events = opened.enter_context(_scope_events(scope))
+                if not _scope_is_empty(scope, events):
+                    reached = _term_scope(directory, scope, deadline)
+                    pending.append(_ScopeAwaitingExit(scope, directory, events, reached, deadline))
+            except _ScopeRemoved:
+                continue
+            except ScopeStopFailed as error:
+                errors.append((scope["unit"], error))
+        total = sum(item.term_reached for item in pending)
+        if on_term is not None:
+            on_term(total)
+        for item in pending:
+            try:
+                _finish_scope_stop(item, kill_grace, require_term=on_term is not None)
+            except _ScopeRemoved:
+                continue
+            except ScopeStopFailed as error:
+                errors.append((item.scope["unit"], error))
+    if errors:
+        if len(scopes) == 1:
+            raise errors[0][1]
+        raise ScopeStopFailed("; ".join(f"{unit}: {error}" for unit, error in errors))
+    return ScopeStopReceipt(total)
+
+
+def _finish_scope_stop(item: _ScopeAwaitingExit, kill_grace: float, *, require_term: bool) -> None:
+    if _scope_ends_on(item.scope, item.events, item.term_deadline):
+        return
+    if require_term and not item.term_reached:
+        raise ScopeStopFailed("no TERM signal reached a member of the populated scope")
+    try:
+        descriptor = os.open("cgroup.kill", os.O_WRONLY | os.O_NOFOLLOW, dir_fd=item.directory)
+        try:
+            _ = os.write(descriptor, b"1\n")
+        finally:
+            os.close(descriptor)
+    except OSError as error:
+        if _scope_is_empty(item.scope, item.events):
+            return
+        detail = "" if item.term_reached else "no TERM signal reached a member. "
+        raise ScopeStopFailed(f"{detail}cgroup.kill failed: {error}") from error
+    if not _scope_ends_on(item.scope, item.events, time.monotonic() + kill_grace):
+        raise ScopeStopFailed("the scope remains populated after KILL")
 
 
 def stop_group(leader: ProcessLifetime, number: int) -> None:

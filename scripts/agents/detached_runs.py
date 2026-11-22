@@ -522,16 +522,11 @@ def _stop_scoped_command(
             on_term(0)
             return True
 
-        term_sent = False
-
         def report_term(count: int) -> None:
-            nonlocal term_sent
-            if on_term is None:
-                return
+            assert on_term is not None
             on_term(count)
-            if not count or term_sent:
+            if not count:
                 return
-            term_sent = True
             with record_lock(path):
                 current = _read_record(path)
                 if current.get("command_scope") != scope:
@@ -541,26 +536,18 @@ def _stop_scoped_command(
                     current["moved_scope"] = scopes[-1]
                 write_text_atomic(path, json.dumps(current, indent=2, sort_keys=True))
 
+        term_reached = 0
         try:
-            errors: list[str] = []
             if not ended:
-                for item in scopes:
-                    try:
-                        if on_term is None:
-                            _ = process_stop.stop_scope(item, grace, kill_grace)
-                        else:
-                            _ = process_stop.stop_scope(item, grace, kill_grace, on_term=report_term)
-                    except process_stop.ScopeStopFailed as error:
-                        errors.append(f"{item['unit']}: {error}")
-            if errors:
-                raise process_stop.ScopeStopFailed("; ".join(errors))
+                hook = report_term if on_term is not None else None
+                term_reached = process_stop.stop_scopes(scopes, grace, kill_grace, on_term=hook).term_reached
         except process_stop.ScopeStopFailed as error:
             with record_lock(path):
                 record = _read_record(path)
                 record["scope_error"] = str(error)
                 write_text_atomic(path, json.dumps(record, indent=2, sort_keys=True))
             raise
-        if on_term is not None and not term_sent:
+        if on_term is not None and not term_reached:
             return True
         with record_lock(path):
             record = _read_record(path)
@@ -581,7 +568,7 @@ def stop_command(
     stop_pass: bool = True, signal_group: Callable[[int, int], None] | None = None,
     on_term: Callable[[int], None] | None = None,
 ) -> bool:
-    """Confirm scope completion. Report each scope's TERM count before its exit wait."""
+    """Confirm scope completion. Report one TERM count before any exit wait."""
     if not process_stop.supported():
         return False
     record = worker_lifecycle.read_json_object(path)

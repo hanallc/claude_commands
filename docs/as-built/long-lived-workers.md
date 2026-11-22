@@ -723,8 +723,8 @@ Five samples of the replacement guard took 63–131 ms elapsed and 52–65 ms CP
 The samples used private records outside the expected scope and measured the launch check.
 `detached_runs.py stop` saves the stop reason before it sends TERM.
 It sends TERM through individual pidfds to verified members of the saved scope tree.
-Callers can request a TERM count before the exit wait.
-An empty or removed scope gives a count of zero.
+The optional callback reports the total TERM count once, after all TERM sends and before any exit wait.
+Empty and removed scopes contribute zero to the total.
 It also checks the scope of a verified leader that runs a nested systemd scope.
 It uses `cgroup.kill` after the stop grace if the scope stays populated.
 A failed scope kill reports a stop error if the scope stays populated.
