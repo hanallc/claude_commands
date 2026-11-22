@@ -5,11 +5,13 @@ from __future__ import annotations
 from scripts.style.ledger_test_support import ticket_owner_id
 
 import unittest
+from contextlib import ExitStack
 from dataclasses import replace
 from unittest import mock
 from typing import cast, final
 
 
+from scripts.lib.fixture_test_support import clean_up_fixture, set_up_fixture
 from scripts.style import refill_findings, style_ledger, style_plan
 
 from scripts.style.style_plan_test_support import StylePlanFixture
@@ -98,30 +100,26 @@ class StylePlanTests(StylePlanFixture):
                                                     'mod terminal {\n    #[path = "startup_tests.rs"]\n    mod startup_tests;\n}\n')
         output = self.refill_with_busy("crates/alpha/src/lib.rs")
         self.assertIn(f"waiting {issue}: {self.ledger().named_held([finding])[0].path} edits crates/alpha/src/lib.rs, busy (1 finding)\n", output)
-        self.doCleanups()
+        clean_up_fixture(self)
         for owner, filename in (("crates/alpha/src/lib.rs", "other_tests.rs"),
                                 ("crates/beta/src/lib.rs", "other_tests.rs"),
                                 ("crates/beta/src/lib.rs", "startup_tests.rs")):
-            with self.subTest(owner=owner, filename=filename):
-                case = StylePlanTests(methodName="runTest")
-                case.setUp()
-                try:
-                    issue, finding = case.owned_module_decision(
-                        "crates/alpha/src/terminal/startup_tests.rs", owner,
-                        f'mod terminal {{\n    #[path = "{filename}"]\n    mod other_tests;\n}}\n'
-                        + "pub fn startup_tests() {}\n")
-                    output = case.refill_with_busy(owner)
-                    if filename == "startup_tests.rs":
-                        case.assertIn(f"waiting {issue}: crates/alpha/src/terminal/startup_tests.rs edits {owner}, busy (1 finding)\n",
-                                      output)
-                        case.assertIsInstance(case.ledger().proposal_findings(issue)[0].build_ticket, style_ledger.NoBuildTicket)
-                    else:
-                        case.assertNotIn("waiting", output)
-                        ticket = case.ledger().ticket_open(ticket_owner_id("names"))[0]
-                        case.assertEqual((ticket["files"], ticket["finding_ids"]),
-                                         (["crates/alpha/src/terminal/startup_tests.rs"], [finding]))
-                finally:
-                    case.doCleanups()
+            with self.subTest(owner=owner, filename=filename), ExitStack() as scope:
+                case = set_up_fixture(scope.callback, StylePlanTests(methodName="runTest"))
+                issue, finding = case.owned_module_decision(
+                    "crates/alpha/src/terminal/startup_tests.rs", owner,
+                    f'mod terminal {{\n    #[path = "{filename}"]\n    mod other_tests;\n}}\n'
+                    + "pub fn startup_tests() {}\n")
+                output = case.refill_with_busy(owner)
+                if filename == "startup_tests.rs":
+                    case.assertIn(f"waiting {issue}: crates/alpha/src/terminal/startup_tests.rs edits {owner}, busy (1 finding)\n",
+                                  output)
+                    case.assertIsInstance(case.ledger().proposal_findings(issue)[0].build_ticket, style_ledger.NoBuildTicket)
+                else:
+                    case.assertNotIn("waiting", output)
+                    ticket = case.ledger().ticket_open(ticket_owner_id("names"))[0]
+                    case.assertEqual((ticket["files"], ticket["finding_ids"]),
+                                     (["crates/alpha/src/terminal/startup_tests.rs"], [finding]))
 
     def test_decision_refill_holds_a_restructure_whose_owner_has_a_cfg_attr_path(self) -> None:
         issue, finding = self.owned_module_decision("crates/alpha/src/terminal/startup_tests.rs", "crates/alpha/src/terminal.rs",

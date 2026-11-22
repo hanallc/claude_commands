@@ -76,6 +76,8 @@ class MoveSummary:
 
     def keep_live(self, source: Path, reason: LiveSource, *, journaled: bool) -> None:
         kept(source, reason)
+        if journaled:
+            print(f"session_move: live copy pending at {source}", file=sys.stderr, flush=True)
         self.kept_live += 1
         self.live_copy_pending |= journaled
 
@@ -1819,6 +1821,9 @@ def move_candidates(roots: MoveRoots, root_fd: int, names: DestinationNames, hol
             except LiveSource as error:
                 summary.keep_live(pending.move.source, error, journaled=True)
                 return
+            except (MoveRefused, OSError):
+                print(f"session_move: saved copy failed at {pending.move.source}", file=sys.stderr, flush=True)
+                raise
             sources.discard(pending.move.source)
 
     eligible = sources - blocked
@@ -1843,6 +1848,8 @@ def move_candidates(roots: MoveRoots, root_fd: int, names: DestinationNames, hol
             else:
                 kept(leaf.source, error)
                 summary.refused_other += 1
+            if isinstance(error, CopyWriteFailed):
+                print(f"session_move: copy write failed at {leaf.source}", file=sys.stderr, flush=True)
             if isinstance(error, (JournaledLiveSource, CopyWriteFailed)):
                 return
 

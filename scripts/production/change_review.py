@@ -42,7 +42,7 @@ from typing import TypeVar, cast
 from zoneinfo import ZoneInfo
 
 from scripts.lib.atomic_file import AtomicDurabilityUnconfirmed, prepared_replacement, sync_folder, write_text_atomic  # noqa: E402
-from scripts.lib import build_folders, conf, scratch, unit_runs  # noqa: E402
+from scripts.lib import build_folders, conf, main_push_lock, scratch, unit_runs  # noqa: E402
 from scripts.direct.progress_history import load_events  # noqa: E402
 from scripts.lib import urgency, file_lock  # noqa: E402
 from scripts.lib.user_zone import user_zone  # noqa: E402
@@ -617,29 +617,30 @@ def _commit(paths: Sequence[Path], what: str, *, report_warning: Callable[[str],
             return
         root = Path(checked("rev-parse", "--show-toplevel"))
         folder = root
-        blobs = [(str(path.resolve().relative_to(root)),
-                  checked("hash-object", "-w", "--path", str(path.resolve().relative_to(root)), "--", str(path.resolve())))
-                 for path in paths]
-        subject = f"change-review: {what}"
-        with build_folders.tool_folder("change-review-index") as temporary:
-            index = temporary / "index"
-            environment = {**os.environ, "GIT_INDEX_FILE": str(index)}
-            for attempt in range(5):
-                head = git("rev-parse", "--verify", "-q", "HEAD").stdout.strip()
-                _ = checked("read-tree", head if head else "--empty", env=environment)
-                for name, blob in blobs:
-                    _ = checked("update-index", "--add", "--cacheinfo", f"100644,{blob},{name}", env=environment)
-                tree = checked("write-tree", env=environment)
-                if head and tree == checked("rev-parse", head + "^{tree}"):
-                    return
-                for name, blob in blobs:
-                    _ = checked("update-index", "--add", "--cacheinfo", f"100644,{blob},{name}")
-                commit = checked("commit-tree", tree, *(["-p", head] if head else []), "-m", subject)
-                updated = git("update-ref", "-m", subject, "HEAD", commit, head or "0" * len(commit))
-                if not updated.returncode:
-                    return
-                if attempt == 4 or git("rev-parse", "--verify", "-q", "HEAD").stdout.strip() == head:
-                    raise ChangeReviewError(updated.stderr.strip() or "git update-ref failed")
+        with main_push_lock.main_push_lock(root, "change-review", wait=False):
+            blobs = [(str(path.resolve().relative_to(root)),
+                      checked("hash-object", "-w", "--path", str(path.resolve().relative_to(root)), "--", str(path.resolve())))
+                     for path in paths]
+            subject = f"change-review: {what}"
+            with build_folders.tool_folder("change-review-index") as temporary:
+                index = temporary / "index"
+                environment = {**os.environ, "GIT_INDEX_FILE": str(index)}
+                for attempt in range(5):
+                    head = git("rev-parse", "--verify", "-q", "HEAD").stdout.strip()
+                    _ = checked("read-tree", head if head else "--empty", env=environment)
+                    for name, blob in blobs:
+                        _ = checked("update-index", "--add", "--cacheinfo", f"100644,{blob},{name}", env=environment)
+                    tree = checked("write-tree", env=environment)
+                    if head and tree == checked("rev-parse", head + "^{tree}"):
+                        return
+                    for name, blob in blobs:
+                        _ = checked("update-index", "--add", "--cacheinfo", f"100644,{blob},{name}")
+                    commit = checked("commit-tree", tree, *(["-p", head] if head else []), "-m", subject)
+                    updated = git("update-ref", "-m", subject, "HEAD", commit, head or "0" * len(commit))
+                    if not updated.returncode:
+                        return
+                    if attempt == 4 or git("rev-parse", "--verify", "-q", "HEAD").stdout.strip() == head:
+                        raise ChangeReviewError(updated.stderr.strip() or "git update-ref failed")
     except (ChangeReviewError, OSError) as error:
         reason = next(iter(str(error).splitlines()), type(error).__name__)
         report_warning(f"change review: {paths[0]} written but not committed: {reason}; the next write commits it")
