@@ -4380,7 +4380,8 @@ finish_exit_diagnostics() {
 # unknown here) and writes no pass. Cleanup is best effort: errexit is off,
 # so one failed cleanup command does not end the trap with its status.
 verify_exit() {
-    exec 2>>"${exit_diagnostics:-/dev/null}"
+    exec 2>/dev/null
+    exec 2>>"${exit_diagnostics:-/dev/null}" || true
     EXIT_STATUS=$1
     set +e
     local outcome=error
@@ -4403,7 +4404,8 @@ verify_exit() {
 exit_diagnostics="$(mktemp "${TMPDIR:-/tmp}/verify-exit.XXXXXX" 2>/dev/null)" || exit_diagnostics=""
 trap 'verify_exit "$?" "$BASH_COMMAND"' EXIT
 verify_interrupted() {
-    exec 2>>"${exit_diagnostics:-/dev/null}"
+    exec 2>/dev/null
+    exec 2>>"${exit_diagnostics:-/dev/null}" || true
     trap - EXIT
     # A process-group stop can deliver the same signal more than once.
     # Ignore later signals until cleanup removes this call's records.

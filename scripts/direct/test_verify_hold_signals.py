@@ -200,6 +200,24 @@ finish_verify_run() { :; }
         self.assertEqual(result.returncode, 128, result.stderr)
         self.assertFalse(token.exists())
 
+    def test_exit_and_term_release_token_when_diagnostics_cannot_open(self) -> None:
+        setup = r'''
+set -e
+exit_diagnostics="$exit_diagnostics/child"
+trap 'verify_exit "$?" "$BASH_COMMAND"' EXIT
+trap 'verify_interrupted 15' TERM
+'''
+        for action, status in (("exit 23", 23), ('kill -TERM "$$"', 143)):
+            with self.subTest(status=status):
+                token = self.fixture.root / "held-token"
+                token.touch()
+                with full_output_pipe() as write_fd:
+                    result = subprocess.run(self.verify_exit_command(token, setup + action),
+                                            env=verify_test_environment(), stdout=subprocess.PIPE,
+                                            stderr=write_fd, text=True, check=False, timeout=SIGNAL_EXIT_SECONDS)
+                self.assertEqual(result.returncode, status, result.stdout)
+                self.assertFalse(token.exists())
+
     def assert_dead_run_log_releases_token(self, command: str, status: int) -> None:
         token = self.fixture.root / "held-token"
         token.touch()
