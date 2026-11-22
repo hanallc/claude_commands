@@ -41,7 +41,6 @@ from scripts.buildlog import store
 from scripts.lib.boot_identity import boot_identity
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.user_zone import user_zone
-from scripts.lib.process_group import send_process_group
 
 
 def ci_placement_lines(proc_root: Path) -> list[str]:
@@ -407,7 +406,7 @@ def notice_recipients(
 def stop_waiting_run(
     run: WaitingRun, holder: build_hold.Holder, processes: Mapping[int, build_hold.AuditProcess], proc_root: Path,
     *, signal_process: Callable[[int, int], None] = os.kill,
-    signal_group: Callable[[int, int], None] = send_process_group,
+    signal_group: Callable[[int, int], None] | None = None,
     supervisor_args: Callable[[int, Path], tuple[str, ...]] = supervisor_args,
 ) -> StoppedRun | RunIdentityChanged:
     """Check process identities before TERM and record each stopped gate."""
@@ -436,41 +435,46 @@ def stop_waiting_run(
                 or not supervisor_matches(supervisor_args(supervisor.pid, proc_root), detached.path, detached.supervisor.cwd)):
             return RunIdentityChanged(run)
     classification: build_hold.BuildClass = "other_session" if isinstance(run.owner, OwningSession) else "no_session"
-    record_build(build_hold.AuditedBuild(process, run.owner, classification, ()), holder, proc_root, "stopped",
-                 stopped_run=identity)
+    audited = build_hold.AuditedBuild(process, run.owner, classification, ())
+    if isinstance(detached, NoDetachedRun):
+        record_build(audited, holder, proc_root, "stopped", stopped_run=identity)
     reason = f"stopped for {holder.purpose}; run again after the release"
 
     def gate_is_current() -> bool:
         return build_hold.process_start_time(identity.pid, proc_root) == identity.start_time
 
-    def verify_group(run: DetachedRun) -> detached_runs.CommandGroup | detached_runs.CommandGroupUnverified:
+    def verify_gate(run: DetachedRun) -> bool:
         supervisor = run.supervisor.identity
         command = detached_runs.command_group(run.path)
-        if (command is not None and gate_is_current()
+        return (gate_is_current()
                 and build_hold.process_start_time(supervisor.pid, proc_root) == supervisor.start_time
-                and build_hold.process_start_time(command.group, proc_root) == command.started):
-            return command
-        return detached_runs.CommandGroupUnverified()
+                and (signal_group is None or (command is not None
+                     and build_hold.process_start_time(command.group, proc_root) == command.started)))
 
     try:
         agent = build_hold.run_agent(process, build_hold.audit_ancestors(process, processes))
         for recipient in notice_recipients(run.owner, agent):
             _ = build_hold.register_wait(recipient)
         if isinstance(detached, DetachedRun):
-            sent = detached_runs.stop_with_reason(
-                detached.path, reason, verify_group=lambda: verify_group(detached), signal_group=signal_group)
+            sent = detached_runs.stop_command(detached.path, reason, check=lambda: verify_gate(detached),
+                                              stop_pass=False, signal_group=signal_group)
         else:
             sent = gate_is_current()
             if sent:
                 signal_process(identity.pid, signal.SIGTERM)
         if not sent:
-            set_stop_status(holder, identity, "not_stopped")
+            if isinstance(detached, NoDetachedRun):
+                set_stop_status(holder, identity, "not_stopped")
             return RunIdentityChanged(run)
+        if isinstance(detached, DetachedRun):
+            record_build(audited, holder, proc_root, "stopped", stopped_run=identity)
     except ProcessLookupError:
-        set_stop_status(holder, identity, "not_stopped")
+        if isinstance(detached, NoDetachedRun):
+            set_stop_status(holder, identity, "not_stopped")
         return RunIdentityChanged(run)
     except BaseException:
-        set_stop_status(holder, identity, "not_stopped")
+        if isinstance(detached, NoDetachedRun):
+            set_stop_status(holder, identity, "not_stopped")
         raise
     set_stop_status(holder, identity, "stopped")
     if isinstance(detached, NoDetachedRun):

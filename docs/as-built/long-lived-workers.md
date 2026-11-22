@@ -716,14 +716,24 @@ If `env` uses another option, the guard refuses the start when a later argument 
 To limit memory, use `systemd-run --user --scope --collect -q -p MemoryMax=<cap> -- <command>`.
 The record saves the command's process group as `command_group`.
 The supervisor installs no signal handler.
-`detached_runs.py stop` checks the supervisor and command leader identity.
-It stages the stop reason and sends TERM through the leader's Linux pidfd.
-It sends TERM through individual pidfds to verified members of the run's scope and original process group.
-The stop helper uses `cgroup.kill` only for KILL after it verifies scope membership in the open cgroup directory.
-If a scope kill fails, the helper sends KILL through the pinned pidfds for that scope.
-A child that calls `setsid()` outside the run's scope receives no signal from this stop.
+The launcher records the verified scope before it execs the command.
+The launcher uses one process for scope publication and command startup.
+On natedev, five samples of the former helper took 179–294 ms elapsed and 161–183 ms CPU.
+Five samples of the replacement guard took 63–131 ms elapsed and 52–65 ms CPU.
+The samples used private records outside the expected scope and measured the launch check.
+`detached_runs.py stop` saves the stop reason before it sends TERM.
+It sends TERM through individual pidfds to verified members of the saved scope tree.
+It also checks the scope of a verified leader that runs a nested systemd scope.
+It uses `cgroup.kill` after the stop grace if the scope stays populated.
+A failed scope kill reports a stop error if the scope stays populated.
+A verified empty scope proves the stop. A missing or replaced scope reports an error without a saved proof.
+A legacy group TERM without a verified scope reports an unconfirmed stop.
+A separate session in the saved scope receives the same stop signals.
+After a normal exit, the supervisor gives scope members the stop grace to exit.
+The supervisor stops any remaining scope members and includes their scope and PIDs in the result.
+An unreadable scope produces a cleanup error result.
 The explicit stop requires Linux pidfd support.
-A build hold stop checks the supervisor and command leader identity and stages the stop reason before it sends TERM to the group.
+A build hold records a detached run as stopped after the same scope stop confirms the end.
 The supervisor stays alive to record the exit status and deliver the result.
 A run with a saved stop reason reports `STOPPED` and includes the reason.
 The result includes the command's exit status.

@@ -29,6 +29,7 @@ from scripts.agents import detached_runs
 from scripts.build_targets import target_config
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
 from scripts.mac_test import claim_state
+from scripts.lib import process_stop
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.production.staff_test_support import fixture_member, isolated_staff_file
 from scripts.production import staff
@@ -747,14 +748,14 @@ class HoldEnforcerTests(unittest.TestCase):
                     for pid in (20, 21, 30):
                         shutil.rmtree(self.proc / str(pid))
 
-    def test_drain_records_stop_and_owner_before_signalling_and_cancels_a_changed_identity(self) -> None:
+    def test_drain_does_not_record_an_unconfirmed_stop_and_cancels_a_changed_identity(self) -> None:
         record = self.root / "detached-run.json"
         _ = self.process(100, "python3", start=10_000,
                          argv=("python3", "detached_runs.py", "supervise", str(record)))
         holder, = build_hold.natedev_holds(self.holders).in_force
         record_build = hold_enforcer.record_build
         for outcome in ("shared holders", "shared releases", "shared run record",
-                        "record failure", "identity change", "no command group", "stopped"):
+                        "identity change", "no command group", "unconfirmed"):
             with self.subTest(outcome=outcome):
                 record = (self.root / ".local/state/build-hold-enforcer/run.json"
                           if outcome == "shared run record" else self.root / "detached-run.json")
@@ -776,8 +777,6 @@ class HoldEnforcerTests(unittest.TestCase):
                               action: Literal["audit", "stopped"], *,
                               stopped_run: build_hold.ProcessIdentity | hold_enforcer.NoStoppedRun) -> None:
                     events.append("record")
-                    if outcome == "record failure":
-                        raise OSError("private stop record is full")
                     record_build(build, holder, proc_root, action, stopped_run=stopped_run)
 
                 def stage_reason(path: Path, text: str, *, new_file_mode: int | None = None) -> None:
@@ -787,9 +786,8 @@ class HoldEnforcerTests(unittest.TestCase):
 
                 def signal_group(pid: int, signum: int) -> None:
                     signals.append((pid, signum))
-                    self.assertEqual(events, ["record"])
-                    self.assertEqual([row["stopped_run"] for row in self.rows() if row["action"] == "stopped"],
-                                     [{"pid": 10, "proc_start": "11000"}])
+                    self.assertEqual(events, [])
+                    self.assertEqual([row for row in self.rows() if row["action"] == "stopped"], [])
                     cycle = build_hold.read_cycle()
                     assert not isinstance(cycle, build_hold.NoCycle)
                     self.assertIn("gate-owner", cycle["recipients"])
@@ -816,25 +814,18 @@ class HoldEnforcerTests(unittest.TestCase):
                         self.assertEqual(record.read_bytes(), before)
                         self.assertEqual(self.rows(), rows)
                         continue
-                    elif outcome == "record failure":
-                        with self.assertRaisesRegex(OSError, "private stop record is full"):
-                            _ = hold_enforcer.stop_waiting_run(
-                                run, holder, table, self.proc, signal_group=signal_group,
-                                signal_process=lambda pid, signum: self.fail(f"unexpected signal {pid} {signum}"),
-                                supervisor_args=lambda pid, proc_root: ("python3", "detached_runs.py", "supervise", str(record)),
-                            )
                     else:
                         result = hold_enforcer.stop_waiting_run(
                             run, holder, table, self.proc, signal_group=signal_group,
                             signal_process=lambda pid, signum: self.fail(f"unexpected signal {pid} {signum}"),
                             supervisor_args=lambda pid, proc_root: ("python3", "detached_runs.py", "supervise", str(record)),
                         )
-                        expected = hold_enforcer.StoppedRun if outcome == "stopped" else hold_enforcer.RunIdentityChanged
-                        self.assertIsInstance(result, expected)
-                if outcome == "stopped":
+                        self.assertIsInstance(result, hold_enforcer.RunIdentityChanged)
+                if outcome == "unconfirmed":
                     self.assertEqual(signals, [(10, signal.SIGTERM)])
                     saved = cast(dict[str, object], json.loads(record.read_text()))
                     self.assertEqual(saved["stop_reason"], "stopped for timed test; run again after the release")
+                    self.assertIn("without a verified scope", str(saved["scope_error"]))
                 else:
                     self.assertEqual(signals, [])
                     self.assertEqual([row for row in self.rows() if row["action"] == "stopped"], [])
@@ -885,9 +876,28 @@ class HoldEnforcerTests(unittest.TestCase):
             with self.subTest(exit_code=exit_code):
                 record = runs / f"scoped-run-{exit_code}.json"
                 self.write_detached_run(record, command_started=True, command=scoped_command)
+                cgroups = self.root / "cgroups"
+                scope = cgroups / f"builds.slice/hold-{exit_code}.scope"
+                scope.mkdir(parents=True)
+                events = scope / "cgroup.events"
+                _ = events.write_text("populated 1\n")
+                stat = scope.stat()
+                identity: process_stop.ScopeIdentity = {"unit": scope.name, "path": f"/builds.slice/{scope.name}",
+                                                       "device": stat.st_dev, "inode": stat.st_ino}
+                saved = cast(dict[str, object], json.loads(record.read_text()))
+                saved["command_scope"] = identity
+                write_text_atomic(record, json.dumps(saved))
                 _ = self.process(100, "python3", start=10_000,
                                  argv=("python3", "detached_runs.py", "supervise", str(record)))
                 table = self.table()
+                stopped_before = len([row for row in self.rows() if row["action"] == "stopped"])
+
+                def stop_scope(saved_scope: process_stop.ScopeIdentity, _grace: float,
+                               _kill_grace: float) -> process_stop.ScopeStopReceipt:
+                    self.assertEqual(saved_scope, identity)
+                    self.assertEqual(len([row for row in self.rows() if row["action"] == "stopped"]), stopped_before)
+                    _ = events.write_text("populated 0\n")
+                    return process_stop.ScopeStopReceipt(1)
 
                 def run(command: list[str], _environment: dict[str, str], _log: Path) -> int:
                     self.assertEqual(command, scoped_command)
@@ -899,11 +909,15 @@ class HoldEnforcerTests(unittest.TestCase):
                         signal_process=lambda pid, signum: self.fail(f"unexpected process signal {pid} {signum}"),
                     )
                     self.assertIsInstance(stop, hold_enforcer.StoppedRun)
-                    self.assertEqual(signals, [(10, signal.SIGTERM)])
+                    self.assertEqual(signals, [])
+                    self.assertTrue(process_stop.scope_has_ended(identity))
                     return exit_code
 
                 with (isolated_staff_file(self.root / "staff.json", {}),
                       mock.patch.dict(os.environ, {"BUILDLOG_SCOPE": "0"}),
+                      mock.patch.object(process_stop, "CGROUP_ROOT", cgroups),
+                      mock.patch.object(process_stop, "stop_scope", side_effect=stop_scope),
+                      mock.patch.object(detached_runs, "_scope_stop_graces", return_value=(2.0, 5.0)),
                       mock.patch.object(detached_runs, "_run", side_effect=run),
                       mock.patch.object(detached_runs, "deliver_in_fresh_process", return_value=0)):
                     self.assertEqual(detached_runs.main(["supervise", str(record)]), 0)
@@ -984,7 +998,7 @@ class HoldEnforcerTests(unittest.TestCase):
                     )
                 self.assertIn(100, inspected)
                 if current:
-                    self.assertIsInstance(result, hold_enforcer.StoppedRun)
+                    self.assertIsInstance(result, hold_enforcer.RunIdentityChanged)
                     self.assertEqual(signals, [(10, signal.SIGTERM)])
                     saved = cast(dict[str, object], json.loads(record.read_text()))
                     self.assertEqual(saved["stop_reason"], "stopped for timed test; run again after the release")

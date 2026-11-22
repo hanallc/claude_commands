@@ -111,7 +111,7 @@ class DetachedRunsTests(unittest.TestCase):
                                                         "BUILDLOG_SCOPE": "0"}))
         config = self.root / "config"
         config.mkdir()
-        for name in ("detached_runs", "send", "postmaster", "codex_daemon", "direct"):
+        for name in ("detached_runs", "send", "postmaster", "codex_daemon", "direct", "shutdown"):
             _ = (config / f"{name}.conf").write_text(
                 (Path(__file__).resolve().parents[2] / f"config/{name}.conf").read_text())
         self.stack.enter_context(patch.dict(os.environ, {"CONF_DIR": str(config)}))
@@ -1153,20 +1153,22 @@ sys.exit(1)
     def test_scope_prefix_needs_a_user_manager_and_honours_the_off_switch(self) -> None:
         runtime = Path(self.stack.enter_context(short_socket_directory())) / "runtime"
         (runtime / "systemd").mkdir(parents=True)
-        marker = self.root / "r1.scope"
+        log = self.root / "r1.log"
         on = {"XDG_RUNTIME_DIR": str(runtime)}
         with patch("shutil.which", return_value="/bin/systemd-run"):
-            self.assertEqual(detached_runs.scope_prefix(marker, on), [])
+            self.assertEqual(detached_runs.scope_prefix(log, on), [])
             with socket.socket(socket.AF_UNIX) as manager:
                 manager.bind(str(runtime / "systemd" / "private"))
-                prefix = detached_runs.scope_prefix(marker, on)
-                self.assertEqual(detached_runs.scope_prefix(marker, {**on, "BUILDLOG_SCOPE": "0"}), [])
+                prefix = detached_runs.scope_prefix(log, on)
+                self.assertEqual(detached_runs.scope_prefix(log, {**on, "BUILDLOG_SCOPE": "0"}), [])
         self.assertEqual(prefix[:2], ["systemd-run", "--user"])
         self.assertIn("--slice=builds-detached.slice", prefix)
         self.assertIn("--unit=detached-detect-r1.scope", prefix)
-        self.assertEqual(prefix[-4:], ["/bin/sh", "-c", detached_runs.SCOPE_SCRIPT, str(marker)])
+        self.assertEqual(prefix[-7:], [sys.executable, "-IS", "-c", detached_runs.SCOPE_SCRIPT,
+                                      str(Path(__file__).resolve().parents[2]),
+                                      "builds-detached.slice", "detached-detect-r1.scope"])
         with patch("shutil.which", return_value=None):
-            self.assertEqual(detached_runs.scope_prefix(marker, on), [])
+            self.assertEqual(detached_runs.scope_prefix(log, on), [])
 
     def test_declared_test_kind_names_the_scope_and_stays_in_the_record(self) -> None:
         runtime = Path(self.stack.enter_context(short_socket_directory())) / "runtime"
@@ -1181,10 +1183,12 @@ sys.exit(1)
         run_id, separator, staff_id = path.stem.partition("@")
         self.assertEqual((separator, staff_id), ("@", self.worker_id))
 
-        def run(command: list[str], _environment: dict[str, str], log: Path) -> int:
+        def run(command: list[str], _environment: dict[str, str], _log: Path) -> int:
             self.assertIn(f"--unit=detached-python-tests-{run_id}.scope", command)
             self.assertEqual(command[-4:], ["env", "PYTHONPATH=.", "sh", "tests.sh"])
-            log.with_suffix(".scope").touch()
+            unit = f"detached-python-tests-{run_id}.scope"
+            self.update_record(path, command_scope={"unit": unit, "path": f"/builds.slice/{unit}",
+                                                    "device": 0, "inode": 1}, scope_end_proved=True)
             return 0
 
         with (socket.socket(socket.AF_UNIX) as manager,
@@ -1197,14 +1201,14 @@ sys.exit(1)
 
     @unittest.skipUnless(process_stop.supported(), "pidfd stop needs Linux")
     def test_scoped_stop_uses_the_launch_record_and_waits_for_the_scope_tree(self) -> None:
-        settings = Path(__file__).resolve().parents[2] / "config/shutdown.conf"
-        _ = (self.root / "config/shutdown.conf").write_text(settings.read_text())
-        for outcome in ("TERM", "KILL", "EPERM", "still populated"):
+        for outcome in ("TERM", "KILL", "EPERM", "still populated", "natural", "unreadable",
+                        "missing", "replaced", "receipt"):
             with self.subTest(outcome=outcome), contextlib.ExitStack() as descriptors:
                 path = self.record(["fixture command"])
                 proc = self.root / f"proc-{outcome}"
                 cgroups = self.root / f"cgroups-{outcome}"
-                relative = "/builds.slice/builds-detached.slice/detached-python-tests-r1.scope"
+                slice_name = "builds.slice" if outcome == "natural" else "builds-detached.slice"
+                relative = f"/builds.slice/{slice_name}/detached-python-tests-r1.scope"
                 scope = cgroups / relative.lstrip("/")
                 child = scope / "child"
                 child.mkdir(parents=True)
@@ -1227,10 +1231,15 @@ sys.exit(1)
                 write_process(702, "22", relative + "/child")
                 self.update_record(path, kind="python-tests", command_pid=701, command_group=701,
                                    command_started="11", pane_dispatch_id="")
-                with (patch.object(process_stop, "PROC", proc),
-                      patch.object(process_stop, "CGROUP_ROOT", cgroups),
-                      patch.object(os, "getpid", return_value=701)):
-                    self.assertEqual(detached_runs.main(["scope-start", str(path)]), 0)
+                root = Path(__file__).resolve().parents[2]
+                setup = "\n".join(("import os, sys", "from pathlib import Path", f"sys.path.insert(0, {str(root)!r})",
+                                   "from scripts.lib import process_stop", f"process_stop.PROC = Path({str(proc)!r})",
+                                   f"process_stop.CGROUP_ROOT = Path({str(cgroups)!r})", "os.getpid = lambda: 701", ""))
+                launch = subprocess.run(
+                    [sys.executable, "-IS", "-c", setup + detached_runs.SCOPE_SCRIPT, str(root),
+                     slice_name, scope.name, "true"],
+                    env={**os.environ, "UNIT_DETACHED_RECORD": str(path)}, check=False, capture_output=True, timeout=2)
+                self.assertEqual(launch.returncode, 0, launch.stderr)
                 published = worker_lifecycle.read_json_object(path)["command_scope"]
                 self.assertEqual(published, {"unit": scope.name, "path": relative,
                                             "device": scope.stat().st_dev, "inode": scope.stat().st_ino})
@@ -1257,7 +1266,8 @@ sys.exit(1)
                     self.assertEqual(number, signal.SIGTERM)
                     start = pids[descriptor]
                     terms.append(start)
-                    self.assertNotIn("stop_reason", worker_lifecycle.read_json_object(path))
+                    reason = None if outcome in ("natural", "receipt") else "fixture stop"
+                    self.assertEqual(worker_lifecycle.read_json_object(path).get("stop_reason"), reason)
                     if outcome == "EPERM":
                         raise PermissionError("fixture denies TERM")
                     if outcome == "TERM":
@@ -1266,13 +1276,17 @@ sys.exit(1)
                         else:
                             _ = members.write_text("")
                             _ = events.write_text("populated 0\nfrozen 0\n")
+                    if outcome in ("natural", "receipt"):
+                        _ = members.write_text("")
+                        _ = events.write_text("populated 0\nfrozen 0\n")
 
-                def advance(seconds: float) -> None:
+                def advance(_descriptor: int, seconds: float) -> None:
                     nonlocal now
                     now += seconds
                     with path.with_suffix(".record.lock").open("a") as lock:
                         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                        self.assertNotIn("stop_reason", worker_lifecycle.read_json_object(path))
+                        reason = None if outcome == "natural" else "fixture stop"
+                        self.assertEqual(worker_lifecycle.read_json_object(path).get("stop_reason"), reason)
                     if outcome == "KILL" and kill.read_text() == "1\n":
                         _ = members.write_text("")
                         _ = events.write_text("populated 0\nfrozen 0\n")
@@ -1294,13 +1308,44 @@ sys.exit(1)
                       patch.object(process_stop, "PROC", proc),
                       patch.object(process_stop, "CGROUP_ROOT", cgroups),
                       patch.object(time, "monotonic", side_effect=lambda: now),
-                      patch.object(time, "sleep", side_effect=advance),
+                      patch.object(process_stop, "_wait_scope_event", side_effect=advance),
                       patch.object(os, "pidfd_open", side_effect=open_pidfd),
                       patch.object(signal, "pidfd_send_signal", side_effect=term),
                       patch.object(os, "write", side_effect=write_kill),
                       contextlib.redirect_stdout(io.StringIO()) as stdout,
                       contextlib.redirect_stderr(io.StringIO()) as stderr):
-                    if outcome in ("TERM", "KILL"):
+                    if outcome in ("missing", "replaced"):
+                        _ = scope.rename(scope.with_name(scope.name + ".old"))
+                        if outcome == "replaced":
+                            scope.mkdir()
+                            _ = (scope / "cgroup.events").write_text("populated 0\n")
+                        if not process_stop.is_scope_identity(published):
+                            self.fail("the launcher did not save its scope")
+                        with self.assertRaisesRegex(process_stop.ScopeStopFailed, "cannot open command scope"):
+                            _ = process_stop.scope_has_ended(published)
+                        continue
+                    if outcome == "receipt":
+                        if not process_stop.is_scope_identity(published):
+                            self.fail("the launcher did not save its scope")
+                        self.assertEqual(process_stop.stop_scope(published, 2, 2).term_reached, 1)
+                        self.assertEqual(terms, ["22"])
+                        continue
+                    if outcome in ("natural", "unreadable"):
+                        if outcome == "unreadable":
+                            events.unlink()
+                        with patch.object(detached_runs, "_run", return_value=0):
+                            status = detached_runs.main(["supervise", str(path)])
+                        self.assertEqual(status, 0 if outcome == "natural" else 1)
+                        result = self.sent.pop()
+                        if outcome == "natural":
+                            self.assertIn("Result: PASS (exit 0)", result)
+                            self.assertIn(f"Scope leftovers: {scope.name} (PIDs 702)", result)
+                        else:
+                            self.assertIn("Result: FAIL (cleanup; exit 0)", result)
+                            self.assertIn("cannot read cgroup.events", result)
+                            self.assertEqual(now, 0.0)
+                    elif outcome in ("TERM", "KILL"):
+                        self.assertEqual(signal_result(), 0)
                         self.assertEqual(signal_result(), 0)
                         self.assertEqual(detached_runs.main(["deliver", str(path)]), 0)
                         result = self.sent.pop()
@@ -1312,9 +1357,16 @@ sys.exit(1)
                         self.assertIn("stop failed", stderr.getvalue())
                         detail = "no TERM signal reached a member" if outcome == "EPERM" else "populated after KILL"
                         self.assertIn(detail, stderr.getvalue())
-                        self.assertNotIn("stop_reason", worker_lifecycle.read_json_object(path))
+                        saved = worker_lifecycle.read_json_object(path)
+                        self.assertEqual(saved["stop_reason"], "fixture stop")
+                        self.assertNotIn("stop_pass_requested", saved)
+                        self.assertIn(detail, str(saved["scope_error"]))
+                        self.assertIn("Result: FAIL (cleanup; exit 143)",
+                                      detached_runs.result_text(cast(detached_runs.RunRecord, cast(object, saved)),
+                                                                detached_runs.CompletedCommand(143)))
                         self.assertEqual(detached_runs.reap_orphans(str(self.session)), [])
-                self.assertEqual(terms, ["22", "33"] if outcome == "TERM" else ["22"])
+                expected_terms = {"TERM": ["22", "33"], "unreadable": []}
+                self.assertEqual(terms, expected_terms.get(outcome, ["22"]))
                 self.assertEqual(kill.read_text(), "1\n" if outcome in ("KILL", "still populated") else "0\n")
 
     def test_start_rejects_an_unknown_kind(self) -> None:
@@ -1325,7 +1377,7 @@ sys.exit(1)
 
     # On 2026-11-17 a director sent TERM to a lint run's supervisor group. The supervisor died and its
     # verify.sh ran on for 3 hours with the cargo token. Each supervisor end now stops the command group.
-    def test_stop_ends_the_command_group_and_the_supervisor_delivers_the_result(self) -> None:
+    def test_legacy_group_stop_delivers_an_unconfirmed_result(self) -> None:
         child_source = """import json, os, socket, sys
 with socket.socket(socket.AF_UNIX) as connection:
     connection.connect(sys.argv[1])
@@ -1396,15 +1448,11 @@ sys.exit(status)
             (runtime / "systemd").mkdir(parents=True)
             tools = self.root / "tools"
             tools.mkdir()
-            scope = tools / "systemd-run"
-            _ = scope.write_text('#!/bin/sh\nwhile [ "$1" != "--" ]; do shift; done\nshift 4\n'
-                                 + ': > "$1" || exit 125\nshift\nexec "$@"\n')
-            scope.chmod(0o755)
             with socket.socket(socket.AF_UNIX) as manager:
                 manager.bind(str(runtime / "systemd/private"))
                 stopped = 128 + signal.SIGTERM
                 cases: tuple[tuple[bool, signal.Signals | None], ...] = (
-                    (False, None), (True, None), (False, signal.SIGTERM), (False, signal.SIGKILL))
+                    (False, None), (False, signal.SIGTERM), (False, signal.SIGKILL))
                 for scoped, cancel in cases:
                     with self.subTest(scoped=scoped, cancel=cancel), socket.socket(socket.AF_UNIX) as ready:
                         guard = LauncherHangGuard("detached process group stop")
@@ -1451,9 +1499,8 @@ sys.exit(status)
                                 self.assertEqual(process_start.process_start(supervisor.pid),
                                                  process_start.Started(saved.get("supervisor_started", "")))
                                 self.assertEqual(saved.get("command_pid"), command_pid)
-                                self.assertEqual(path.with_suffix(".scope").exists(), scoped)
                                 if cancel is None:
-                                    self.assertTrue(detached_runs.stop_command(path, reason))
+                                    self.assertFalse(detached_runs.stop_command(path, reason))
                                 else:
                                     # The signal reaches the supervisor group only; the watcher stops the command.
                                     process_group.send_process_group(supervisor.pid, cancel)
@@ -1461,7 +1508,7 @@ sys.exit(status)
                                 self.assertEqual(command_connection.recv(1), b"")
                                 _, delivered = accept()
                                 self.assertEqual(supervisor.wait(timeout=guard.remaining()),
-                                                 0 if cancel is None else -cancel)
+                                                 1 if cancel is None else -cancel)
                             finally:
                                 for group in (supervisor.pid, command_pid):
                                     with contextlib.suppress(ProcessLookupError, ValueError):
@@ -1471,18 +1518,17 @@ sys.exit(status)
                         record = cast(detached_runs.RunRecord, json.loads(path.read_text()))
                         if cancel is None:
                             self.assertEqual(delivered["verb"], "deliver")
-                            self.assertIn(f"Result: STOPPED (exit {stopped})", str(delivered["text"]))
+                            self.assertIn(f"Result: FAIL (cleanup; exit {stopped})", str(delivered["text"]))
                             self.assertIn(f"Stop reason: {reason}", str(delivered["text"]))
                             self.assertEqual((record["status"], record.get("exit_code"), record.get("ended")),
                                              ("finished", stopped, None))
                         else:
                             self.assertEqual(delivered["verb"], "supervisor-gone")
-                            self.assertIn("Result: STOPPED (no exit status)", str(delivered["text"]))
+                            self.assertIn("Result: FAIL (cleanup; no exit status)", str(delivered["text"]))
                             self.assertIn(f"Stop reason: {detached_runs.SUPERVISOR_GONE_REASON}",
                                           str(delivered["text"]))
                             self.assertEqual((record["status"], record.get("exit_code"), record.get("ended")),
                                              ("finished", None, "supervisor gone"))
-                        self.assertFalse(path.with_suffix(".scope").exists())
                         self.assertEqual(detached_runs.reap_orphans(str(self.session)), [])
 
     def test_stop_refuses_a_record_without_a_current_command_group(self) -> None:
@@ -1542,8 +1588,8 @@ sys.exit(status)
                     return True
                 staged = cast(dict[str, object], json.loads(staged_stop.read_text()))
                 self.assertEqual(staged["stop_reason"], "new stop")
-                self.assertIs(staged.get("stop_pass_requested"), True)
-                self.assertTrue(pending_stop.is_file())
+                self.assertIn("without a verified scope", str(staged["scope_error"]))
+                self.assertFalse(pending_stop.exists())
                 return False
 
             with (patch.object(detached_run_process, "supervisor_match", side_effect=same_supervisor) as observe,
@@ -1585,10 +1631,10 @@ sys.exit(status)
                   patch.object(process_start, "process_start", side_effect=check_start),
                   patch.object(worker_lifecycle, "read_json_object", side_effect=read_before_signal),
                   patch.object(detached_runs, "_signal_stopped_command") as send):
-                self.assertTrue(detached_runs.stop_command(path, "new stop"))
+                self.assertFalse(detached_runs.stop_command(path, "new stop"))
             self.assertEqual(checks, 2)
             send.assert_called_once_with(detached_runs.CommandGroup(os.getpid(), started.start), signal.SIGTERM)
-            self.assertTrue(pending_stop.is_file())
+            self.assertFalse(pending_stop.exists())
 
     def test_failed_stop_sync_leaves_the_original_record_when_rollback_would_fail(self) -> None:
         path = self.record(["fixture command"])
@@ -1790,16 +1836,23 @@ sys.exit(status)
     def test_a_scope_runs_the_command_once_and_a_failed_scope_runs_it_plainly(self) -> None:
         count = self.root / "count"
         command = ["/bin/sh", "-c", f'echo run >> "{count}"']
-        scope = self.session / detached_runs.DETACHED_RUNS_DIR / "r1.scope"
-        # The private launcher writes the marker without starting a systemd scope.
-        marker_script = ': > "$0" || exit 125; exec "$@"'
-        with patch.object(detached_runs, "scope_prefix", return_value=["/bin/sh", "-c", marker_script, str(scope)]):
-            record = self.supervise(self.record(command))
+        path = self.record(command)
+        scope = {"unit": "fixture.scope", "path": "/builds.slice/fixture.scope", "device": 0, "inode": 1}
+
+        def run(_command: list[str], _environment: dict[str, str], _log: Path) -> int:
+            self.update_record(path, command_scope=scope, scope_end_proved=True)
+            _ = count.write_text("run\n")
+            return 0
+
+        with (patch.object(detached_runs, "scope_prefix", return_value=["fixture-scope"]),
+              patch.object(detached_runs, "_run", side_effect=run) as launch):
+            record = self.supervise(path)
+        launch.assert_called_once_with(["fixture-scope", *command], ANY, path.with_suffix(".log"))
         self.assertEqual((record.get("exit_code"), count.read_text(encoding="utf-8")), (0, "run\n"))
-        self.assertFalse(scope.exists())
+        self.assertEqual(record.get("command_scope"), scope)
         count.unlink()
         (session_staff.inbox_path(self.worker_id)).unlink()
-        # A scope that fails before the command starts leaves no marker.
+        # A failed launcher publishes no scope.
         with patch.object(detached_runs, "scope_prefix", return_value=["/bin/sh", "-c", "exit 1", "scope"]):
             record = self.supervise(self.record(command))
         self.assertEqual((record.get("exit_code"), count.read_text(encoding="utf-8")), (0, "run\n"))
@@ -2331,7 +2384,7 @@ class PaneRunDeliveryTests(unittest.TestCase):
         self.defer_transcript = False
         self.pending_transcripts = []
         config = self.fixture.root / "conf"
-        for name in ("detached_runs", "send", "postmaster", "codex_daemon"):
+        for name in ("detached_runs", "send", "postmaster", "codex_daemon", "shutdown"):
             write_text_atomic(config / f"{name}.conf",
                               (Path(__file__).resolve().parents[2] / f"config/{name}.conf").read_text())
         for name, keys in (("send", {"delivery_timeout", "kill_grace", "remote_transport_seconds",
@@ -2393,6 +2446,19 @@ class PaneRunDeliveryTests(unittest.TestCase):
                 "director_dir": str(self.run_dir), "done_message_file": ""}
         write_text_atomic(log.with_suffix(".json"), json.dumps(record))
         return record
+
+    def record_confirmed_group_stop(
+        self, path: Path, reason: str, *, self_stop: bool = False,
+        signal_group: Callable[[detached_runs.CommandGroup, int], None] = lambda _group, _signal: None,
+    ) -> bool:
+        """Create the confirmed group record used by the delivery fixtures."""
+        group = detached_runs.command_group(path)
+        if group is None:
+            self.fail("the fixture has no command group")
+        return detached_runs.stop_with_reason(
+            path, reason, verify_group=lambda: group,
+            signal_group=lambda pid, number: signal_group(detached_runs.CommandGroup(pid, group.started), number),
+            stop_pass=True, self_stop=self_stop)
 
     def assert_holder_result(self, record: detached_runs.RunRecord, reason: str) -> None:
         result = detached_runs.deliver(record, detached_runs.CompletedCommand(1))
@@ -2793,7 +2859,8 @@ class PaneRunDeliveryTests(unittest.TestCase):
               patch.object(process_start, "process_start", return_value=process_start.Started("private-start")),
               patch.object(detached_runs, "_signal_stopped_command") as signal_group,
               contextlib.redirect_stdout(io.StringIO())):
-            self.assertEqual(detached_runs.main(["stop", "--reason", reason, str(path)]), 0)
+            self.assertTrue(self.record_confirmed_group_stop(
+                path, reason, self_stop=True, signal_group=signal_group))
             signal_group.assert_called_once_with(detached_runs.CommandGroup(DEAD_PID, "private-start"), signal.SIGTERM)
         stopped = worker_lifecycle.read_json_object(path)
         self.assertEqual(stopped.get("stop_reason"), reason)
@@ -2843,7 +2910,6 @@ class PaneRunDeliveryTests(unittest.TestCase):
         path = Path(record["log"]).with_suffix(".json")
         write_text_atomic(path, json.dumps(record))
         reason = "Stop the private command."
-        stop = ["stop", "--reason", reason, str(path)]
         director = self.fixture.parent
         exact = Path(os.environ["NOTIFIER_SESSIONS_DIR"]) / f"{os.getpid()}.json"
         _ = self.fixture.session_record(director.current_session, director.name).replace(exact)
@@ -2853,9 +2919,10 @@ class PaneRunDeliveryTests(unittest.TestCase):
               patch.object(process_start, "process_start", return_value=process_start.Started("private-start")),
               patch.object(detached_runs, "_signal_stopped_command") as signal_group,
               contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO())):
-            self.assertEqual(detached_runs.main(stop), 0)
+            self.assertTrue(self.record_confirmed_group_stop(
+                path, reason, signal_group=signal_group))
             first_stop = path.read_bytes()
-            self.assertEqual(detached_runs.main(["stop", "--reason", "A repeat.", str(path)]), 1)
+            self.assertFalse(self.record_confirmed_group_stop(path, "A repeat."))
             signal_group.assert_called_once_with(detached_runs.CommandGroup(DEAD_PID, "private-start"), signal.SIGTERM)
         self.assertEqual(path.read_bytes(), first_stop)
         self.assertIsInstance(progress_history.active_dispatch(row.id, self.run_dir), progress_history.ActiveDispatch)
@@ -2885,7 +2952,7 @@ class PaneRunDeliveryTests(unittest.TestCase):
         self.assertEqual(detached_runs.main(["deliver", str(path)]), 0)
         final_record = path.read_bytes()
         with contextlib.redirect_stderr(io.StringIO()):
-            self.assertEqual(detached_runs.main(stop), 1)
+            self.assertFalse(self.record_confirmed_group_stop(path, reason))
         self.assertEqual(path.read_bytes(), final_record)
         self.assertFalse(reply.exists())
         self.assertEqual(self.inputs, [])
@@ -2914,7 +2981,7 @@ class PaneRunDeliveryTests(unittest.TestCase):
                       patch.object(process_start, "process_start", return_value=process_start.Started("private-start")),
                       patch.object(detached_runs, "_signal_stopped_command"),
                       contextlib.redirect_stdout(io.StringIO())):
-                    self.assertEqual(detached_runs.main(["stop", "--reason", "Private stop.", str(path)]), 0)
+                    self.assertTrue(self.record_confirmed_group_stop(path, "Private stop."))
                 saved = cast(detached_runs.RunRecord, json.loads(path.read_text()))
                 saved["exit_code"] = 143
                 write_text_atomic(path, json.dumps(saved))
@@ -3369,7 +3436,7 @@ class PaneRunDeliveryTests(unittest.TestCase):
               patch.object(process_start, "process_start", return_value=process_start.Started("private-start")),
               patch.object(detached_runs, "_signal_stopped_command"),
               contextlib.redirect_stdout(io.StringIO())):
-            self.assertEqual(detached_runs.main(["stop", "--reason", "Private stop.", str(path)]), 0)
+            self.assertTrue(self.record_confirmed_group_stop(path, "Private stop."))
 
         group_live = True
 
@@ -3440,7 +3507,7 @@ class PaneRunDeliveryTests(unittest.TestCase):
               patch.object(process_start, "process_start", return_value=process_start.Started("private-start")),
               patch.object(detached_runs, "_signal_stopped_command"),
               contextlib.redirect_stdout(io.StringIO())):
-            self.assertEqual(detached_runs.main(["stop", "--reason", "Private stop.", str(path)]), 0)
+            self.assertTrue(self.record_confirmed_group_stop(path, "Private stop."))
         event = turn_end.WorkerEvent(str(row.current_session), reply=result)
         with patch.object(detached_run_process, "supervises", return_value=False):
             with (patch.object(detached_runs, "_group_is_live", return_value=True),
@@ -3571,7 +3638,8 @@ class PaneRunDeliveryTests(unittest.TestCase):
               patch.object(process_start, "process_start", return_value=process_start.Started("private-start")),
               patch.object(detached_runs, "_signal_stopped_command") as send_group,
               contextlib.redirect_stderr(io.StringIO())):
-            self.assertTrue(detached_runs.stop_command(path, reason))
+            self.assertTrue(self.record_confirmed_group_stop(
+                path, reason, signal_group=send_group))
         send_group.assert_called_once_with(detached_runs.CommandGroup(DEAD_PID, "private-start"), signal.SIGTERM)
         self.assertEqual(path.read_bytes(), saved)
 
@@ -3752,14 +3820,15 @@ class PaneRunDeliveryTests(unittest.TestCase):
         path = Path(record["log"]).with_suffix(".json")
 
         def assert_owner(owner: staff.StaffId, environment: dict[str, str], expected: bool) -> None:
-            write_text_atomic(path, json.dumps({**record, "staff_id": owner}))
+            scope = {"unit": "fixture.scope", "path": "/builds.slice/fixture.scope", "device": 0, "inode": 1}
+            write_text_atomic(path, json.dumps({**record, "staff_id": owner, "command_scope": scope,
+                                               "scope_end_proved": True, "stop_reason": "Stop the check."}))
             exports = {"CLAUDE_CODE_SESSION_ID": "", "CODEX_THREAD_ID": "", **environment}
-            with (patch.dict(os.environ, exports),
-                  patch.object(detached_runs, "stop_with_reason", return_value=True) as stop):
+            with patch.dict(os.environ, exports):
                 self.assertTrue(detached_runs.stop_command(path, "Stop the check."))
-            stop.assert_called_once_with(path, "Stop the check.", verify_group=ANY,
-                                         signal_group=ANY, stop_pass=True,
-                                         self_stop=expected)
+            saved = worker_lifecycle.read_json_object(path)
+            self.assertIs(saved["stop_pass_requested"], True)
+            self.assertIs(saved.get("self_stop", False), expected)
 
         cases = (
             ("native caller", row.current_session, "", "", row.id, True),

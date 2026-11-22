@@ -4,14 +4,17 @@ from __future__ import annotations
 from collections.abc import Generator
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
+import fcntl
+import json
 import os
 from pathlib import Path
+import select
 import signal
 import sys
 import time
-from typing import TypeGuard, TypedDict
+from typing import TypeGuard, TypedDict, cast
 
-from scripts.lib import process_start
+from scripts.lib import atomic_file, process_start
 
 
 PROC = Path("/proc")
@@ -51,6 +54,11 @@ def is_scope_identity(value: object) -> TypeGuard[ScopeIdentity]:
 
 class ScopeStopFailed(OSError):
     """The stop could not confirm an empty scope."""
+
+
+@dataclass(frozen=True)
+class ScopeStopReceipt:
+    term_reached: int
 
 
 def supported() -> bool:
@@ -118,7 +126,8 @@ def _read_cgroup_file(directory: int, name: str) -> bytes:
 def command_scope(pid: int, scope: ScopeUnit) -> ScopeIdentity:
     """Read the dedicated scope while the launcher is inside it."""
     path = _cgroup_path(pid)
-    if not path.is_absolute() or ".." in path.parts or path.name != scope.unit or path.parent.name != scope.slice:
+    if (not path.is_absolute() or ".." in path.parts or path.name != scope.unit
+            or not scope.unit.endswith(".scope") or path.parent.name != scope.slice):
         raise ValueError("the command did not enter its dedicated scope")
     directory = _open_directory(CGROUP_ROOT / path.relative_to("/"))
     try:
@@ -129,10 +138,65 @@ def command_scope(pid: int, scope: ScopeUnit) -> ScopeIdentity:
         os.close(directory)
 
 
+def publish_command_scope(record: Path, scope: ScopeUnit) -> None:
+    """Save the launcher's scope before it execs the command."""
+    with record.with_suffix(".record.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        fields = cast(dict[str, object], json.loads(record.read_text()))
+        if fields.get("run_id") != record.stem or fields.get("status") != "running" or fields.get("stop_reason"):
+            raise ValueError("the run is no longer starting")
+        fields["command_scope"] = command_scope(os.getpid(), scope)
+        atomic_file.write_text_atomic(record, json.dumps(fields, indent=2, sort_keys=True))
+
+
+def launch_in_scope(record: Path, scope: ScopeUnit, command: list[str]) -> int:
+    try:
+        publish_command_scope(record, scope)
+    except (OSError, ValueError) as error:
+        print(f"detached_runs: command scope did not start: {error}", file=sys.stderr)
+        return 125
+    try:
+        os.execvp(command[0], command)
+    except OSError as error:
+        print(f"detached_runs: command did not start: {error}", file=sys.stderr)
+        return 127
+
+
+def legacy_command_scope(leader: ProcessLifetime, unit: ScopeUnit) -> ScopeIdentity | None:
+    """Verify an old scope through a member of the original command group."""
+    with suppress(OSError):
+        with pin_process(leader):
+            for member in (leader, *_members(leader.pid)):
+                with suppress(OSError, ValueError):
+                    with pin_process(member):
+                        scope = command_scope(member.pid, unit)
+                        _require_live(member)
+                        _require_live(leader)
+                        return scope
+    return None
+
+
+def moved_command_scope(leader: ProcessLifetime, original: ScopeIdentity) -> ScopeIdentity | None:
+    """Verify a new scope under the same user manager."""
+    with suppress(OSError, ValueError):
+        with pin_process(leader):
+            current = _cgroup_path(leader.pid)
+            previous = Path(original["path"])
+            manager = f"user@{os.getuid()}.service"
+            owner = next((parent for parent in previous.parents if parent.name == manager), None)
+            if (owner is None or not current.is_relative_to(owner) or current == previous
+                    or ".." in current.parts or not current.name.endswith(".scope")):
+                return None
+            scope = command_scope(leader.pid, ScopeUnit(current.parent.name, current.name))
+            _require_live(leader)
+            return scope
+    return None
+
+
 def _open_saved_scope(scope: ScopeIdentity) -> int:
     path = Path(scope["path"])
     if (not path.is_absolute() or ".." in path.parts or path.name != scope["unit"]
-            or path.parent.name != "builds-detached.slice" or not path.name.endswith(".scope")):
+            or not path.name.endswith(".scope")):
         raise ValueError("invalid command scope path")
     directory = _open_directory(CGROUP_ROOT / path.relative_to("/"))
     if _directory_identity(scope["unit"], path, directory) != scope:
@@ -143,19 +207,39 @@ def _open_saved_scope(scope: ScopeIdentity) -> int:
 
 def scope_has_ended(scope: ScopeIdentity) -> bool:
     """Use the kernel event for the full scope tree."""
+    with _scope_events(scope) as (_, descriptor):
+        return _scope_is_empty(descriptor)
+
+
+@contextmanager
+def _scope_events(scope: ScopeIdentity) -> Generator[tuple[int, int]]:
     try:
         directory = _open_saved_scope(scope)
-    except FileNotFoundError:
-        # The kernel removes a cgroup only after its tree is empty.
-        return True
-    except (OSError, ValueError):
-        return False
+    except (OSError, ValueError) as error:
+        raise ScopeStopFailed(f"cannot open command scope: {error}") from error
     try:
-        return b"populated 0" in _read_cgroup_file(directory, "cgroup.events").splitlines()
-    except OSError:
-        return False
+        try:
+            descriptor = os.open("cgroup.events", os.O_RDONLY | os.O_NOFOLLOW, dir_fd=directory)
+        except OSError as error:
+            raise ScopeStopFailed(f"cannot read cgroup.events: {error}") from error
+        try:
+            yield directory, descriptor
+        finally:
+            os.close(descriptor)
     finally:
         os.close(directory)
+
+
+def _scope_is_empty(descriptor: int) -> bool:
+    try:
+        lines = os.pread(descriptor, 4096, 0).splitlines()
+        if b"populated 0" in lines:
+            return True
+        if b"populated 1" in lines:
+            return False
+        raise ValueError("no populated field in cgroup.events")
+    except (OSError, ValueError) as error:
+        raise ScopeStopFailed(f"cannot read cgroup.events: {error}") from error
 
 
 def _scope_pids(directory: int) -> set[int]:
@@ -191,11 +275,14 @@ def _in_scope(process: ProcessLifetime, scope: ScopeIdentity) -> bool:
     return False
 
 
-def _term_scope(directory: int, scope: ScopeIdentity, deadline: float) -> bool:
+def _term_scope(directory: int, scope: ScopeIdentity, deadline: float) -> int:
     seen: set[ProcessLifetime] = set()
-    reached = False
+    reached = 0
     while time.monotonic() < deadline:
-        members = _scope_processes(directory) - seen
+        try:
+            members = _scope_processes(directory) - seen
+        except (OSError, ValueError):
+            break
         if not members:
             break
         for process in members:
@@ -205,37 +292,56 @@ def _term_scope(directory: int, scope: ScopeIdentity, deadline: float) -> bool:
                 with pin_process(process) as descriptor:
                     if _in_scope(process, scope):
                         signal.pidfd_send_signal(descriptor, signal.SIGTERM)
-                        reached = True
+                        reached += 1
             except OSError:
                 continue
         seen.update(members)
     return reached
 
 
-def _scope_ends_by(scope: ScopeIdentity, deadline: float) -> bool:
-    while not scope_has_ended(scope):
+def scope_ends_by(scope: ScopeIdentity, deadline: float) -> bool:
+    with _scope_events(scope) as (_, descriptor):
+        return _scope_ends_on(descriptor, deadline)
+
+
+def _wait_scope_event(descriptor: int, seconds: float) -> None:
+    events = select.poll()
+    events.register(descriptor, select.POLLPRI)
+    _ = events.poll(seconds * 1000)
+
+
+def _scope_ends_on(descriptor: int, deadline: float) -> bool:
+    while not _scope_is_empty(descriptor):
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             return False
-        time.sleep(min(0.05, remaining))
+        _wait_scope_event(descriptor, remaining)
     return True
 
 
-def stop_scope(scope: ScopeIdentity, grace: float, kill_grace: float) -> None:
-    """Send TERM, then use cgroup.kill if the scope stays populated."""
-    deadline = time.monotonic() + grace
+def scope_member_pids(scope: ScopeIdentity) -> list[int]:
+    """List the live process IDs in the scope tree."""
     try:
         directory = _open_saved_scope(scope)
     except FileNotFoundError:
-        return
-    except (OSError, ValueError) as error:
-        raise ScopeStopFailed(str(error)) from error
+        return []
     try:
-        reached = False
-        with suppress(OSError):
-            reached = _term_scope(directory, scope, deadline)
-        if _scope_ends_by(scope, deadline):
-            return
+        return sorted({process.pid for process in _scope_processes(directory)})
+    finally:
+        os.close(directory)
+
+
+def stop_scope(scope: ScopeIdentity, grace: float, kill_grace: float) -> ScopeStopReceipt:
+    """Send TERM, then use cgroup.kill if the scope stays populated."""
+    deadline = time.monotonic() + grace
+    with _scope_events(scope) as (directory, events):
+        if _scope_is_empty(events):
+            return ScopeStopReceipt(0)
+        reached = _term_scope(directory, scope, deadline)
+        if _scope_ends_on(events, deadline):
+            if not reached:
+                raise ScopeStopFailed("no TERM signal reached a member of the populated scope")
+            return ScopeStopReceipt(reached)
         try:
             descriptor = os.open("cgroup.kill", os.O_WRONLY | os.O_NOFOLLOW, dir_fd=directory)
             try:
@@ -243,14 +349,13 @@ def stop_scope(scope: ScopeIdentity, grace: float, kill_grace: float) -> None:
             finally:
                 os.close(descriptor)
         except OSError as error:
-            if scope_has_ended(scope):
-                return
+            if reached and _scope_is_empty(events):
+                return ScopeStopReceipt(reached)
             detail = "" if reached else "no TERM signal reached a member. "
             raise ScopeStopFailed(f"{detail}cgroup.kill failed: {error}") from error
-        if not _scope_ends_by(scope, time.monotonic() + kill_grace):
+        if not _scope_ends_on(events, time.monotonic() + kill_grace):
             raise ScopeStopFailed("the scope remains populated after KILL")
-    finally:
-        os.close(directory)
+        return ScopeStopReceipt(reached)
 
 
 def stop_group(leader: ProcessLifetime, number: int) -> None:
