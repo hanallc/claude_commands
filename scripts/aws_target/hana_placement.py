@@ -4,6 +4,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 import hashlib
 from pathlib import Path
+from importlib import import_module
+
 from scripts.build_targets.execution_transport import (
     ExecutionTransport as ExecutionTransport, SshCommandTransport as SshCommandTransport,
     HanaControlTransport as HanaControlTransport, HanaGpuNextestTransport,
@@ -161,7 +163,6 @@ class _PlacementAdapter(Protocol):
 
 
 def _adapter() -> _PlacementAdapter:
-    from importlib import import_module
     return cast(_PlacementAdapter, cast(object, import_module('scripts.aws_target.hana_placement_adapter')))
 
 
@@ -241,6 +242,5 @@ def run_gpu_assignment(assignment: placement.PlacementAssignment, repo: Path, pa
 def __getattr__(name: str) -> object:
     """Load lifecycle projection types only when a backend requests them."""
     if name in ('HanaLifecycleEvidence', 'HanaUnprovisioned', 'HanaLifecycleUnavailable', 'HanaResourcesHeld'):
-        from importlib import import_module
         return cast(object, getattr(import_module('scripts.aws_target.hana_box'), name))
     raise AttributeError(name)

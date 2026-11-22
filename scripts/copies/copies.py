@@ -446,11 +446,6 @@ def guard_choice_limit() -> int:
     return limit
 
 
-def unit_owner(name: str) -> str:
-    """Keep the recorded unit name and append one unit suffix."""
-    return name.removesuffix("-unit") + "-unit"
-
-
 def source_owner(source: Path) -> str:
     """Use the standing checkout owner, copy owner or staff owner."""
     for active in reversed(ACTIVE_GATES.get()):
@@ -2043,11 +2038,6 @@ def remote_use_command(mirror: RemoteMirror, command: str) -> str:
     return remote_copies_command("mirror-use", mirror, "--", "sh", "-c", command)
 
 
-def inherited_mirror_descriptors() -> tuple[int, ...]:
-    """Carry the mirror lease through a remote Python entry point."""
-    return tuple(int(value) for value in os.environ.get("COPIES_MIRROR_LEASE_FDS", "").split(",") if value)
-
-
 def mirror_probe_setup(path: str) -> str:
     """Create a marked probe copy through the registered remote kind."""
     program = "\n".join((
@@ -2614,7 +2604,7 @@ def mirror_run(args: CopyArguments) -> int:
         command = command_tail(args.command)
         if not command:
             raise CopyError("remote mirror requires a command")
-        environment = {**os.environ, "COPIES_MIRROR_LEASE_FDS": ",".join(map(str, COMMAND_LOCKS.get()))}
+        environment = {**os.environ, floor_claims.MIRROR_LEASE_FDS_ENV: ",".join(map(str, COMMAND_LOCKS.get()))}
         answer = subprocess.run(command, pass_fds=COMMAND_LOCKS.get(), env=environment)
         return answer.returncode
 

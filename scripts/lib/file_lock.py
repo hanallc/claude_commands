@@ -4,6 +4,7 @@ from __future__ import annotations
 import fcntl
 import os
 import stat
+import time
 from collections.abc import Generator
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -15,6 +16,21 @@ from typing import Literal
 PROC_LOCKS = "/proc/locks"
 # Read again because the kernel can omit a line when another lock ends.
 PROC_LOCKS_READS = 3
+LOCK_RETRY_S = 0.01
+
+
+def acquire_exclusive_with_timeout(descriptor: int, timeout_s: float) -> bool:
+    """Try the lock once more at the end of the wait."""
+    deadline = time.monotonic() + timeout_s
+    while True:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return True
+        except BlockingIOError:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            time.sleep(min(remaining, LOCK_RETRY_S))
 
 
 class LockResult(Enum):

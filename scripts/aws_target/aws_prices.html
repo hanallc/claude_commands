@@ -6,6 +6,7 @@
 <title>AWS</title>
 <style>
 /*__CONSOLE_THEME__*/
+__STEP_TIP_STYLE__
 :root {
   /* The color scale of a price column, as in a spreadsheet: the cheapest, the median and the most expensive. */
   --scale-low: #57bb8a; --scale-mid: #ffffff; --scale-high: #e67c73;
@@ -95,8 +96,22 @@ td.dearest, tbody tr:hover td.dearest { background: var(--dearest); color: var(-
 .tile-usd { font-size: 1.6rem; font-weight: 700; font-variant-numeric: tabular-nums; }
 .tile-note { color: var(--ink-3); font-size: 0.82rem; }
 #spend .note { margin-top: 12px; }
+#bill-refusals { position: relative; width: fit-content; }
+#bill-refusal-summary { padding: 0; border: 0; background: none; color: inherit; font: inherit;
+  text-align: left; text-decoration: underline dotted; text-underline-offset: 3px; cursor: help; }
+#bill-refusal-tip { display: none; position: absolute; z-index: 10; inset-inline-start: 0; inset-block-start: 100%;
+  grid-template-columns: max-content minmax(0, 1fr); min-width: 0;
+  max-width: min(24rem, calc(100vw - 80px)); }
+#bill-refusal-tip dd { white-space: normal; overflow-wrap: anywhere; }
+#bill-refusals:not([data-dismissed]):is(:hover, :focus-within) #bill-refusal-tip { display: grid; }
 #quota-help, #hours details { margin-top: 10px; font-size: 0.86rem; }
 #quota-help summary, #hours summary { font-weight: 600; cursor: pointer; }
+#hours .hours-difference { color: var(--warning); }
+#hours .hours-no-difference { color: color-mix(in srgb, var(--accent) 80%, var(--ink)); }
+@media (max-width: 560px) {
+  #hours th, #hours td { padding-inline: 2px; white-space: normal; overflow-wrap: anywhere; }
+  #hours thead th span { white-space: normal; }
+}
 #quota-help li + li { margin-top: 4px; }
 #quota-help a { color: var(--ink); overflow-wrap: anywhere; }
 #quota-help p { margin: 0; color: var(--ink-2); }
@@ -113,6 +128,10 @@ __PAGE_TITLE__
   <h2>Spend <span class="unit">(USD)</span></h2>
   <div class="tiles" id="spend-tiles"></div>
   <p class="note" id="spend-note"></p>
+  <div class="note" id="bill-refusals" hidden>
+    <button type="button" id="bill-refusal-summary" aria-describedby="bill-refusal-tip"></button>
+    <dl class="tip" id="bill-refusal-tip" role="tooltip" aria-label="Refused AWS bills by UTC day"></dl>
+  </div>
   <div id="settled-notes"></div>
 </section>
 <nav class="regions" aria-label="AWS table filters">
@@ -165,10 +184,17 @@ __PAGE_TITLE__
 <script>
 "use strict";
 __PAGE_REFRESH_SCRIPT__
+const RUN_SCOPE_ALIASES = new Map([["merge-gate", "gate"], ["targeted-test", "test-affected"]]);
+
+function canonicalRunScope(scope) {
+  return RUN_SCOPE_ALIASES.get(scope) ?? scope;
+}
+
 function readAwsPage(page) {
   const prices = JSON.parse(page.getElementById("aws-prices-data").textContent);
   const gateTime = JSON.parse(page.getElementById("aws-gate-time-data").textContent);
-  return {...prices, regions: gateTime.regions, gateTimePrice: gateTime.table};
+  const runs = prices.runs.map(entry => ({...entry, scope: canonicalRunScope(entry.scope)}));
+  return {...prices, runs, regions: gateTime.regions, gateTimePrice: gateTime.table};
 }
 let data = readAwsPage(document);
 const REGIONS_KEY = "aws-prices-regions";
@@ -176,16 +202,14 @@ const NOTHING_SHOWN = "Nothing to show in the chosen regions.";
 const NO_REGION = "No region chosen.";
 const NOT_SOLD = "Not sold here";
 const SVG = "http://www.w3.org/2000/svg";
-const SHOW = [["spot", "Spot price", "Spot", "USD/h"], ["cost", costViewLabel(), "Gate", "USD"],
+const SHOW = [["spot", "Spot price", "Spot", "USD/h"], ["cost", costViewLabel(), null, "USD"],
               ["quota", "Quota", "Fit", "boxes"]];
 const TYPES = [["standard", "Standard"], ["gpu", "GPU"]];
-const RUN_SCOPE_ALIASES = new Map([["merge-gate", "gate"], ["targeted-test", "test-affected"]]);
 const query = new URLSearchParams(location.search);
 let shown = new Set(data.regions);
 const measures = new Set(query.has("show") ? query.get("show").split(",") : SHOW.map(([key]) => key));
 let types = query.get("types") === "gpu" ? "gpu" : "standard";
-const savedScope = query.get("runs");
-let scope = RUN_SCOPE_ALIASES.get(savedScope) ?? savedScope;
+let scope = canonicalRunScope(query.get("runs"));
 
 function element(tag, text, className) {
   const node = document.createElement(tag);
@@ -365,6 +389,16 @@ function drawLaunchState() {
 }
 drawLaunchState();
 
+const billRefusals = document.getElementById("bill-refusals");
+const billRefusalSummary = document.getElementById("bill-refusal-summary");
+const billRefusalTip = document.getElementById("bill-refusal-tip");
+for (const event of ["pointerenter", "focusin"]) {
+  billRefusals.addEventListener(event, () => billRefusals.removeAttribute("data-dismissed"));
+}
+addEventListener("keydown", event => {
+  if (event.key === "Escape") billRefusals.setAttribute("data-dismissed", "");
+});
+
 function drawSpend() {
   const tiles = data.spend.tiles.map(tile => {
     const box = element("div", undefined, "tile");
@@ -373,6 +407,15 @@ function drawSpend() {
   });
   document.getElementById("spend-tiles").replaceChildren(...tiles);
   document.getElementById("spend-note").textContent = data.spend.unavailable || data.spend.forecast;
+  const refused = data.spend.refused_bills ?? [];
+  billRefusals.hidden = refused.length === 0;
+  const days = new Set(refused.flatMap(record => record.days));
+  const records = refused.length === 1 ? "record" : "records";
+  const estimate = days.size === 1 ? "that day shows our estimate" : "those days show our estimate";
+  billRefusalSummary.textContent = refused.length === 0 ? "" : `${refused.length} AWS bill ${records} refused; ${estimate}.`;
+  billRefusalTip.replaceChildren(...refused.flatMap(record => [
+    element("dt", record.days.join(", ")), element("dd", record.reason)
+  ]));
   const settled = (data.settled_notes ?? []).map(note => element("p", note, "note"));
   document.getElementById("settled-notes").replaceChildren(...settled);
 }
@@ -396,9 +439,13 @@ function priceHeader(row, name, unit, className) {
   return cell;
 }
 
-function costViewLabel() {
+function gateStepName() {
   const gateCosts = data.runs.find(entry => entry.scope === "gate");
-  return "Cost per " + (gateCosts?.noun ?? "gate");
+  return gateCosts?.noun ?? "gate";
+}
+
+function costViewLabel() {
+  return "Cost per " + gateStepName();
 }
 
 function priceCell(row, source, rowIndex, column, className, marks) {
@@ -487,8 +534,10 @@ function drawPrices() {
   runsChips.hidden = document.getElementById("runs-label").hidden = !measures.has("cost");
   const group = types === "gpu" ? 1 : 0;
   const quota = data.quotas[group];
-  // The snapshot gives Spot, Gate and quota tables the same region and type order.
+  // The price and quota tables share the same region and type order.
   const tables = {spot: data.prices[group], cost: scopeCosts().prices[0], quota};
+  const gateName = gateStepName();
+  const gateGridLabel = gateName.charAt(0).toUpperCase() + gateName.slice(1);
   const sources = SHOW.filter(([key]) => measures.has(key) && (group === 0 || key !== "cost"))
     .map(([key, , label, unit]) => {
       const table = tables[key];
@@ -496,7 +545,7 @@ function drawPrices() {
       const marks = key === "quota" ? undefined : {
         ...scaleCells(table, {columns: columns.slice(1), rows}), notSold: new Set(table.not_sold.map(String))
       };
-      return {table, label, unit, marks};
+      return {table, label: label ?? gateGridLabel, unit, marks};
     });
   const regionRows = new Map(quota.rows.map(([region], index) => [region, index]));
   const visibleRegions = new Set(data.regions.filter(region => shown.has(region) && regionRows.has(region)));
@@ -559,41 +608,77 @@ function drawScope() {
   fill(document.getElementById("launched"), costs.launched);
 }
 
-function hoursTable(rows) {
-  const headers = ["type", "region", "AWS billed", "our records", "difference"];
-  const hasReserved = rows.some(row => row.cells[5] !== "—");
-  if (hasReserved) headers.push("Hana reserved");
-  const table = tableElement([{
-    headers, right: headers.map((_header, index) => index).slice(2),
-    rows: rows.map(row => row.cells), region_axis: "type-region-rows",
+function hoursText(tenths) {
+  return (tenths / 10).toFixed(1);
+}
+
+function signedHoursText(tenths) {
+  return (tenths > 0 ? "+" : "") + hoursText(tenths);
+}
+
+function hoursTable(rows, totals, hasReserved, kinds) {
+  const headers = ["Instance type", "Region", "AWS billed (hours)", "Our records (hours)",
+    "AWS minus our records (hours)"];
+  const differenceColumn = headers.length - 1;
+  if (hasReserved) headers.push("Reserved for Hana (hours)");
+  const cells = rows.map(row => {
+    const line = [row.size, row.region, hoursText(row.billed_tenths),
+      hoursText(row.recorded_tenths), signedHoursText(row.billed_tenths - row.recorded_tenths)];
+    if (hasReserved) line.push(row.hana_reserved_tenths === undefined ? "—" : hoursText(row.hana_reserved_tenths));
+    return line;
+  });
+  const wrap = tableElement([{
+    headers, right: headers.map((_header, index) => index).slice(2), rows: cells, region_axis: "type-region-rows",
   }], false);
+  const table = wrap.querySelector("table");
   if (hasReserved) {
     table.querySelector("thead th:last-child").title =
       "The check adds these hours reserved for Hana in this region to our recorded hours when it checks for a higher bill.";
   }
-  return table;
+  const total = table.createTFoot().insertRow();
+  const label = element("th", "Total");
+  label.colSpan = 2;
+  label.scope = "row";
+  const difference = element("td", signedHoursText(totals.difference), "n");
+  if (kinds) {
+    for (const [index, row] of rows.entries()) {
+      table.tBodies[0].rows[index].cells[differenceColumn].classList.add(`hours-${row.difference_kind}`);
+    }
+    const kind = kinds.by_tenths[totals.difference] ?? kinds.default;
+    difference.classList.add(`hours-${kind}`);
+  }
+  total.append(label, element("td", hoursText(totals.billed), "n"), element("td", hoursText(totals.recorded), "n"),
+    difference);
+  if (hasReserved) total.appendChild(element("td", "—", "n"));
+  return wrap;
 }
 
-function hoursAnswer(compared, higherBills, limitPercent) {
-  const difference = rows => {
-    const tenths = Math.abs(rows.reduce((total, row) => total + row.difference_tenths, 0));
-    return tenths ? `${(tenths / 10).toFixed(1)} hours` : "less than 0.1 hours";
-  };
-  const rowCount = rows => `${rows.length} ${rows.length === 1 ? "row" : "rows"}`;
-  if (higherBills.length) {
-    return `Yes. AWS billed ${difference(higherBills)} more than our records, in ${rowCount(higherBills)}.`;
-  }
-  const lowerBills = compared.filter(row => row.limit_result === "lower_bill");
-  const total = key => compared.reduce((hours, row) => hours + row[key], 0).toFixed(1);
-  const billed = total("billed");
-  const recorded = total("recorded");
-  const answer = lowerBills.length
-    ? `No. AWS billed ${difference(lowerBills)} less than our records, in ${rowCount(lowerBills)}.`
-    : `No. AWS billed ${billed} hours and our records show ${recorded} hours.`;
-  if (Number(billed) > Number(recorded)) {
-    return answer + ` No row is more than ${limitPercent} above the sum of its recorded hours and the hours reserved for Hana.`;
-  }
-  return answer;
+function hoursTotals(rows) {
+  const billed = rows.reduce((total, row) => total + row.billed_tenths, 0);
+  const recorded = rows.reduce((total, row) => total + row.recorded_tenths, 0);
+  return { billed, recorded, difference: billed - recorded };
+}
+
+function hoursAnswer(totals) {
+  const billed = hoursText(totals.billed);
+  if (totals.difference === 0) return `No. AWS billed the same hours as our records (${billed}).`;
+  const recorded = hoursText(totals.recorded);
+  const difference = hoursText(Math.abs(totals.difference));
+  return totals.difference > 0
+    ? `Yes. AWS billed ${difference} hours more than our records (${billed} against ${recorded}).`
+    : `No. AWS billed ${difference} hours less than our records (${billed} against ${recorded}).`;
+}
+
+function hoursLimitCheck(rows, percent) {
+  const higher = rows.filter(row => row.limit_result === "higher_bill").length;
+  const lower = rows.filter(row => row.limit_result === "lower_bill").length;
+  const subject = count => count === 1 ? "1 row is" : `${count} rows are`;
+  const upperBound = higher === 0
+    ? `No row is more than ${percent} above its recorded hours plus the hours reserved for Hana.`
+    : `${subject(higher)} more than ${percent} above ${higher === 1 ? "its" : "their"} recorded hours plus the hours reserved for Hana.`;
+  const lowerBound = lower === 0 ? ""
+    : ` ${subject(lower)} more than ${percent} below ${lower === 1 ? "its" : "their"} recorded hours.`;
+  return upperBound + lowerBound;
 }
 
 function drawHours() {
@@ -605,20 +690,39 @@ function drawHours() {
     return;
   }
   const rows = data.hours.rows.filter(row => shown.has(row.region));
-  const compared = rows.filter(row => row.kind === "compared");
   if (!rows.length) {
     section.appendChild(element("p", "There are no machine hours to compare in the selected regions.", "answer"));
     return;
   }
-  const higherBills = compared.filter(row => row.limit_result === "higher_bill");
-  const answer = compared.length ? hoursAnswer(compared, higherBills, data.hours.limit_percent)
-    : "No AWS bill is available yet for the recorded hours.";
+  const totals = hoursTotals(rows);
+  const answer = hoursAnswer(totals) + " " + hoursLimitCheck(rows, data.hours.limit_percent);
   section.appendChild(element("p", answer, "answer"));
-  if (higherBills.length) section.appendChild(hoursTable(higherBills));
+  const firstDay = rows.reduce((day, row) => row.first_utc_day < day ? row.first_utc_day : day, rows[0].first_utc_day);
+  const lastDay = rows.reduce((day, row) => row.last_utc_day > day ? row.last_utc_day : day, rows[0].last_utc_day);
+  const date = new Intl.DateTimeFormat("en-US", {dateStyle: "medium", timeZone: "UTC"});
+  const span = date.formatRange(new Date(firstDay), new Date(lastDay));
+  section.appendChild(element("p", `Bills compared ${span} (UTC).`, "note"));
+  const hasReserved = rows.some(row => row.hana_reserved_tenths !== undefined);
+  const kinds = data.hours.difference_kinds;
+  const content = [hoursTable(rows, totals, hasReserved, kinds)];
+  if (kinds) {
+    const legend = element("p", undefined, "note hours-legend");
+    legend.append(element("span", "Yellow: AWS and our records differ.", "hours-difference"), " ",
+      element("span", "Blue: they agree.", "hours-no-difference"));
+    content.push(legend);
+  }
+  content.push(element("p", "A positive difference means AWS billed more than our records.", "note"));
+  if (hasReserved) {
+    content.push(element("p", "Hours reserved for Hana can appear on several rows for the same region.", "note"));
+  }
+  if (rows.length <= data.hours.open_row_limit) {
+    section.append(...content);
+    return;
+  }
   const details = element("details");
   details.open = wasOpen;
   details.addEventListener("toggle", markOverflow);
-  details.append(element("summary", `All rows (${rows.length})`), hoursTable(rows));
+  details.append(element("summary", `All rows (${rows.length})`), ...content);
   section.appendChild(details);
 }
 

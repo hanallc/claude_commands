@@ -34,9 +34,10 @@ from scripts.aws_target.aws_cli import AwsExecutor, aws_error_code, execute_comm
 from scripts.aws_target.aws_target import AwsCli, AwsUnavailable, control_lock, largest_gate_vcpus, spot_quota
 from scripts.aws_target.config import SpendingSettings, gate_deployment, read_settings
 from scripts.build_targets.target_config import ssh_target_state_directory
-from scripts.lib import conf
+from scripts.lib import conf, process_start
 from scripts.production import gate
 from scripts.production.gate_modules import GateRefused
+from scripts.mac_test import claim_state
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -1169,8 +1170,6 @@ def gpu_service_name(trial: str) -> str:
 
 def confirm_assigned_gpu_service(trial: str) -> None:
     """Retain the exact live claim before the service can launch a box."""
-    from scripts.lib import process_start
-    from scripts.mac_test import claim_state
 
     paths = claim_state.StatePaths(ssh_target_state_directory('hana-gpu'), 'hana-gpu', platform='linux')
     with claim_state.locked(paths.lock):
@@ -1187,8 +1186,6 @@ def confirm_assigned_gpu_service(trial: str) -> None:
 
 
 def assigned_gpu_cleanup_pending(trial: str) -> bool:
-    from scripts.mac_test import claim_state
-
     paths = claim_state.StatePaths(ssh_target_state_directory('hana-gpu'), 'hana-gpu', platform='linux')
     with claim_state.locked(paths.lock):
         return any(held.record['claim_id'] == trial and held.record.get('cleanup_pending')

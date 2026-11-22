@@ -26,7 +26,9 @@ from contextlib import contextmanager
 from datetime import UTC, datetime
 from enum import Enum
 from pathlib import Path
-from typing import BinaryIO, TypedDict, cast
+from typing import BinaryIO, Literal, TypedDict, cast
+
+from scripts.lib import file_lock
 
 
 UNKNOWN_IDENTITY = "unknown"
@@ -44,6 +46,12 @@ DISK_NAME = "disk.json"
 DISK_WALK_REQUEST_NAME = "disk-walk-request.json"
 DEFAULT_ROOT_DISPLAY = "~/.local/state/buildlog"
 ERRORS_DISPLAY_PATH = f"{DEFAULT_ROOT_DISPLAY}/{ERRORS_NAME}"
+
+type AppendLockWait = float | Literal["blocking"]
+
+
+class AppendLockWaitExpired(TimeoutError):
+    """The wait expired before the append lock was acquired."""
 
 
 def root() -> Path:
@@ -245,13 +253,21 @@ def read_last_whole_row_end(path: Path) -> int:
         return 0
 
 
+def _take_append_lock(fd: int, path: Path, timeout_s: AppendLockWait) -> None:
+    if timeout_s == "blocking":
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        return
+    if not file_lock.acquire_exclusive_with_timeout(fd, timeout_s):
+        raise AppendLockWaitExpired(f"The append lock wait for {path.name} exceeded {timeout_s:g} s")
+
+
 @contextmanager
-def locked_append(path: Path) -> Generator[BinaryIO]:
+def locked_append(path: Path, *, lock_timeout_s: AppendLockWait = "blocking") -> Generator[BinaryIO]:
     """Keep tail repair, any recovery scan and publication under one file lock."""
     path.parent.mkdir(parents=True, exist_ok=True)
     fd = os.open(path, os.O_RDWR | os.O_APPEND | os.O_CREAT, 0o644)
     with os.fdopen(fd, "r+b", buffering=0) as handle:
-        fcntl.flock(fd, fcntl.LOCK_EX)
+        _take_append_lock(fd, path, lock_timeout_s)
         end = last_whole_row_end(handle)
         if end != os.fstat(fd).st_size:
             os.ftruncate(fd, end)
