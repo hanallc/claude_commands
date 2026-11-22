@@ -109,6 +109,82 @@ class PageStatusTests(unittest.TestCase):
         self.assertEqual(page.count(b'<dialog id="review-new-item"'), 1)
         self.assertEqual(page_frame.with_owner(page, "list", owner, rows, lambda: self.fail("The dialog already exists.")), page)
 
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required to check the owner button position.")
+    def test_page_owner_stays_visible_above_a_long_open_row(self) -> None:
+        from scripts.review_links import change_page, record_table
+        from scripts.review_links.test_accounts_page import firefox_probe_results
+
+        owner = staff.StaffRow(staff.StaffId("owner"), "showrunner", "Page owner", staff.STAFF_ROOT,
+                               current_session=staff.StaffId("session-owner"))
+        detail = "".join(f'<p>Open row line {index}</p>' for index in range(60))
+        table = ('<div data-test-list><input id="list-search"><div id="list-owner"></div><div id="list-show"></div>'
+                 + '<div class="list-table"><table><tbody><tr><td style="height:800px">Above the item</td></tr></tbody>'
+                 + '<tbody data-list-item data-key="open" data-order="1"><tr class="list-row">'
+                 + '<td><button class="list-toggle" aria-expanded="true">Open row</button></td></tr>'
+                 + f'<tr data-detail><td style="text-align:right">{detail}</td></tr></tbody></table>'
+                 + '<p data-empty hidden>No items</p></div></div>')
+        content = record_table.STYLE + page_frame.title("The List", "list") + table
+        markup = change_page.document(content + '<script>' + record_table.SCRIPT + '</script>', "The List")
+        page = page_frame.with_owner(markup, "list", owner, staff.StaffSnapshot((owner,)), lambda: "")
+        probe = b'''<script>
+(async()=>{
+ const failures=[];
+ const check=(ok,message)=>{if(!ok) failures.push(message);};
+ try{
+  frameElement.style.height='800px';
+  const button=document.querySelector('[data-owner-new]');
+  const title=document.querySelector('h1'), banner=document.querySelector('[data-page-status]');
+  const table=document.querySelector('table'), row=table.querySelector('.list-row');
+  const detail=document.querySelector('[data-detail]');
+  banner.dataset.state='Late';
+  banner.querySelector('[data-status-word]').textContent='Late';
+  const reason=banner.querySelector('[data-status-reason]');
+  reason.hidden=false;
+  reason.textContent='The feed has stopped.';
+  reason.style.flexBasis='100%';
+  const view=createRecordTable({content:()=>document.querySelector('[data-test-list]'),
+   shows:['all'],defaultShow:'all',visible:()=>true,applied:()=>{detail.hidden=false;}});
+  const painted=()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));
+  const intersects=(a,b)=>a.left<b.right && b.left<a.right && a.top<b.bottom && b.top<a.bottom;
+  for(const width of [1400,320]){
+   const verify=(ok,message)=>check(ok,width+' px: '+message);
+   frameElement.style.width=width+'px';
+   scrollTo({top:0,behavior:'instant'});
+   await painted();
+   const first=button.getBoundingClientRect();
+   scrollTo({top:document.scrollingElement.scrollHeight,behavior:'instant'});
+   await painted();
+   const last=button.getBoundingClientRect(), status=banner.getBoundingClientRect();
+   verify(innerWidth===width && scrollY>innerHeight && scrollY===document.scrollingElement.scrollHeight-innerHeight,
+    'The page scrolls to the bottom of the long row.');
+   const state=banner.querySelector('.page-status-state').getBoundingClientRect();
+   verify(status.top===0 && reason.getBoundingClientRect().top>=state.bottom,'The sticky status spans two lines.');
+   verify(last.top===first.top && last.right===first.right && last.left>=table.getBoundingClientRect().right && last.right<=innerWidth
+    && last.top>=status.bottom && last.bottom<=innerHeight,'The button stays at the top right below the status.');
+   verify(title.getBoundingClientRect().bottom<=0,'The page title scrolls away.');
+   const x=(last.left+last.right)/2,y=(last.top+last.bottom)/2;
+   verify(detail.getBoundingClientRect().top<y && detail.getBoundingClientRect().bottom>y,
+    'The open row scrolls beside the button.');
+   verify(button.contains(document.elementFromPoint(x,last.top+1))
+    && button.contains(document.elementFromPoint(x,last.bottom-1)),'The whole button is clickable.');
+   const text=document.createTreeWalker(table,NodeFilter.SHOW_TEXT), range=document.createRange();
+   let covered=false;
+   while(!covered && text.nextNode()){
+    range.selectNodeContents(text.currentNode);
+    covered=[...range.getClientRects()].some(box=>intersects(box,last));
+   }
+   verify(!covered,'Table text stays clear of the button.');
+   verify(view.revealMatchingItem('open'),'The item jump finds the row.');
+   await painted();
+   verify(document.activeElement===row.querySelector('button') && row.getBoundingClientRect().top>=
+    Math.max(banner.getBoundingClientRect().bottom,button.getBoundingClientRect().bottom),
+    'The item jump focuses the row below the status and button.');
+  }
+ }catch(error){failures.push(String(error));}
+ await fetch('/results',{method:'POST',body:JSON.stringify(failures)});
+})();</script>'''
+        self.assertEqual(firefox_probe_results(page.replace(b'</body>', probe + b'</body>')), [[]])
+
     def test_accounts_shows_the_configured_owner_and_names_the_route(self) -> None:
         root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         config = root / "console.conf"

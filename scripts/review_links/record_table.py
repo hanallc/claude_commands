@@ -1128,8 +1128,9 @@ function jump(key,{pushPlace=true,focusTarget=true,keepMatchingFilters=false,pre
  highlightedRow?.removeAttribute('data-record-highlight');
  clearTimeout(highlightTimer);
  const banner=document.querySelector('[data-page-status]');
- const bannerHeight=banner && getComputedStyle(banner).position==='sticky' ? banner.getBoundingClientRect().height : 0;
- row.style.scrollMarginTop=(bannerHeight+16)+'px';
+ const inset=typeof positionPageOwner==='function' ? positionPageOwner() :
+  banner && getComputedStyle(banner).position==='sticky' ? banner.getBoundingClientRect().height : 0;
+ row.style.scrollMarginTop=(inset+16)+'px';
  if(!dialog) row.querySelector('.list-toggle').focus({preventScroll:true});
  row.scrollIntoView({block:'start',behavior:'instant'});
  row.dataset.recordHighlight='';

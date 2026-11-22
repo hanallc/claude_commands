@@ -55,8 +55,8 @@ def with_owner(content: bytes, page: str, owner: staff.StaffRow | NoShownOwner, 
         elif not isinstance(recipient, OwnerNewItem):
             label = f"New item for {recipient}"
         label = html.escape(label, quote=True)
-        button = (f'<button type="button" data-owner-new aria-label="{label}" title="{label}">'
-                  + icon_svg("message-circle-question") + '</button>')
+        button = (f'<span class="page-owner-slot"><button type="button" data-owner-new aria-label="{label}" title="{label}">'
+                  + icon_svg("message-circle-question") + '</button></span>')
     control = (f'<div class="page-owner" data-page-owner="{page}">' + name + button + '</div>').encode()
     actions = HEADING_ACTIONS.encode()
     heading = TITLE_ELEMENT.search(content, main.end())
@@ -69,7 +69,7 @@ def with_owner(content: bytes, page: str, owner: staff.StaffRow | NoShownOwner, 
     if head is not None:
         content = content[:head.end()] + PAGE_SCRIPT_ERRORS.encode() + content[head.end():]
     row_style = HEADING_STYLE.encode()
-    style = OWNER_STYLE.encode()
+    style = (OWNER_STYLE + (OWNER_POSITION if button else "")).encode()
     if BUTTON_STATES.encode() not in content:
         style = b'<style>' + BUTTON_STATES.encode() + b'</style>' + style
     if row_style not in content:
@@ -90,12 +90,45 @@ HEADING_STYLE = ('.page-heading{display:flex;align-items:center;flex-wrap:wrap;g
 
 
 OWNER_STYLE = """<style>
+@media(max-width:560px){
+main:has([data-owner-new]){--page-owner-space:44px;border-inline-end:var(--page-owner-space) solid transparent}
+:is(.page-heading,main>.page-heading-actions):has([data-owner-new]){
+width:calc(100% + var(--page-owner-space));flex-basis:calc(100% + var(--page-owner-space));max-width:none}}
 .page-owner{display:flex;align-items:center;gap:8px;min-width:0;font:600 14px/1.4 system-ui,sans-serif}
 .page-owner-name{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.page-owner-slot{display:block;flex:none;width:36px;height:36px}
 .page-owner button{display:grid;place-items:center;flex:none;width:36px;height:36px;min-height:36px;
 margin:0;padding:7px;background:var(--card);color:var(--ink-2);border:1px solid var(--line);border-radius:8px;cursor:pointer}
+.page-owner-slot button{position:fixed;left:var(--page-owner-slot-left);z-index:19}
 .page-owner svg{width:18px;height:18px}
+@media(width>560px){
+.page-owner-slot button{left:auto;right:2px;width:28px;padding-inline:4px}}
 </style>"""
+
+
+OWNER_POSITION = """<script>
+function positionPageOwner(){
+ const button=document.querySelector('[data-owner-new]');
+ const slot=button.parentElement.getBoundingClientRect();
+ const banner=document.querySelector('[data-page-status]');
+ const bannerHeight=banner && getComputedStyle(banner).position==='sticky' ? banner.getBoundingClientRect().height : 0;
+ const pageTop=parseFloat(getComputedStyle(button.closest('main')).paddingTop);
+ const top=Math.max(slot.top,pageTop,bannerHeight);
+ button.style.setProperty('--page-owner-slot-left',slot.left+'px');
+ button.style.top=top+'px';
+ return top+slot.height;
+}
+document.addEventListener('DOMContentLoaded',()=>{
+ const slot=document.querySelector('.page-owner-slot');
+ const banner=document.querySelector('[data-page-status]');
+ const resize=new ResizeObserver(positionPageOwner);
+ resize.observe(slot.closest('main'));
+ if(banner) resize.observe(banner);
+ addEventListener('resize',positionPageOwner);
+ addEventListener('scroll',positionPageOwner,{passive:true});
+ positionPageOwner();
+},{once:true});
+</script>"""
 
 
 PAGE_SCRIPT_ERRORS = r"""<script>(() => {

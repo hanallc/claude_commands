@@ -173,6 +173,10 @@ Cards and form controls keep their page styles.
 Every page uses the shared background and text colors.
 The status line has the same background as the page.
 The frame reserves scrollbar space, so short and long pages keep the same column position.
+The New item button stays at the top right during scrolling, below any sticky status banner.
+The button uses the existing right gutter on wide pages.
+Narrow pages reserve a strip to the right of the content.
+An item jump places the focused row below both the banner and the button.
 The shared `.page-status` line follows the title.
 It shows the state, data time, round trip and server render time, in that order.
 Live uses `radio` and `--room`; Reading uses `loader-circle` and `--accent`.

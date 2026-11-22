@@ -1645,6 +1645,31 @@ class ImagePairTests(ImagesFixture):
         self.assertLess(page.index(before), page.index(after))
         self.assertIn("The counts now match.", page)
 
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
+    def test_image_pair_stays_side_by_side_at_1024_pixels(self) -> None:
+        from scripts.review_links.test_accounts_page import firefox_probe_results
+
+        _ = self.register_pair()
+        owner = self.owner
+        assert owner is not None
+        page = page_frame.with_owner(images.render(self.status), "images", owner,
+                                     staff.StaffSnapshot((owner,)), lambda: "")
+        probe = b'''<script>
+(async()=>{
+ const failures=[];
+ try{
+  frameElement.style.width='1024px';
+  await new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));
+  const [before,after]=[...document.querySelectorAll('.image-pair figure')].map(figure=>figure.getBoundingClientRect());
+  if(innerWidth!==1024 || before.width===0 || after.width===0 ||
+     before.top!==after.top || before.right>=after.left){
+   failures.push('The Images pair must fit side by side at 1024 px.');
+  }
+ }catch(error){failures.push(String(error));}
+ await fetch('/results',{method:'POST',body:JSON.stringify(failures)});
+})();</script>'''
+        self.assertEqual(firefox_probe_results(page.replace(b'</body>', probe + b'</body>')), [[]])
+
     def test_pair_feedback_names_the_before_and_after_images(self) -> None:
         record = self.register_pair()
         token = images.request_token(images.console_token(self.root), record["id"])
