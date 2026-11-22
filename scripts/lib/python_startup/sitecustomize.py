@@ -415,30 +415,44 @@ def _verified_gate() -> bool:
 def _begin_direct_test() -> None:
     if _verified_gate():
         return
+    from contextlib import AbstractContextManager, nullcontext
     from pathlib import Path
+    from typing import cast
+
+    linux = sys.platform == "linux"
+    # An older checkout can predate the private test folder.
+    checkout = Path(sys.modules["_devtools_checkout"].__path__[0])
+    has_test_folder = (checkout / "scripts/lib/testing_folders.py").is_file()
+    if not (linux or has_test_folder):
+        return
 
     from scripts.lib import conf
 
-    try:
-        if sys.platform == "linux":
-            settings = conf.read("test_times")
-            limit = settings.origin(_DIRECT_TEST_LIMIT_KEY, conf.positive_whole)
-            if isinstance(limit, conf.UnavailableValue):
-                # The enforcing hook can come from a newer checkout than the test.
-                template = Path(__file__).resolve().parents[3] / "config/test_times.conf"
-                seconds = conf.read(template).value(_DIRECT_TEST_LIMIT_KEY, conf.positive_whole)
-            else:
-                seconds = limit.value
-            unit = _direct_test_unit(_cgroup(os.getpid()))
-            if unit:
-                _verify_direct_test_scope(unit, seconds)
-            else:
-                _adopt_direct_test_scope(seconds)
-        # An older checkout can predate the private test folder.
-        if Path(sys.modules["_devtools_checkout"].__path__[0], "scripts/lib/testing_folders.py").is_file():
-            from scripts.lib.testing_folders import start_test_run
+    # Older checkouts may lack the recorder or this API.
+    recorder = sys.modules.get("scripts.lib.conf_reads")
+    without_recording = cast(Callable[[], AbstractContextManager[None]],
+                             getattr(recorder, "without_recording", nullcontext))
 
-            start_test_run()
+    try:
+        with without_recording():
+            if linux:
+                settings = conf.read("test_times")
+                limit = settings.origin(_DIRECT_TEST_LIMIT_KEY, conf.positive_whole)
+                if isinstance(limit, conf.UnavailableValue):
+                    # The enforcing hook can come from a newer checkout than the test.
+                    template = Path(__file__).resolve().parents[3] / "config/test_times.conf"
+                    seconds = conf.read(template).value(_DIRECT_TEST_LIMIT_KEY, conf.positive_whole)
+                else:
+                    seconds = limit.value
+                unit = _direct_test_unit(_cgroup(os.getpid()))
+                if unit:
+                    _verify_direct_test_scope(unit, seconds)
+                else:
+                    _adopt_direct_test_scope(seconds)
+            if has_test_folder:
+                from scripts.lib.testing_folders import start_test_run
+
+                start_test_run()
     except (OSError, conf.Unusable, ValueError) as error:
         print(f"direct test: {error}", file=sys.stderr, flush=True)
         raise SystemExit(1) from None

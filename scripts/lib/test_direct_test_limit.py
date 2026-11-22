@@ -150,6 +150,73 @@ class DirectTestLimitTests(unittest.TestCase):
         self.assertEqual(result.stdout, "done\n")
         self.assertFalse((self.root / "test-runs").exists())
 
+    def test_setup_records_a_config_read_from_another_thread(self) -> None:
+        log = self.root / "config-reads"
+        self.environment["CONF_READ_LOG"] = str(log)
+        result = self.invoke(sys.executable, "-c", """
+import threading
+import unittest
+from unittest.mock import patch
+
+from scripts.lib import conf, testing_folders
+
+start_test_run = testing_folders.start_test_run
+
+def start_with_reader():
+    reader = threading.Thread(target=conf.read, args=("parallel",))
+    reader.start()
+    reader.join()
+    start_test_run()
+
+with patch.object(testing_folders, "start_test_run", start_with_reader):
+    unittest.defaultTestLoader.loadTestsFromName("direct_case.Example.test_short")
+""")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("parallel", log.read_text().splitlines() if log.exists() else [])
+
+    def test_failed_setup_preserves_the_child_config_log(self) -> None:
+        log = self.root / "config-reads"
+        _ = self.environment.pop("CONF_READ_LOG", None)
+        result = self.invoke(sys.executable, "-c", """
+import os
+import subprocess
+import sys
+import unittest
+from unittest.mock import patch
+
+from scripts.lib import conf, testing_folders
+
+conf.read("before")
+os.environ["CONF_READ_LOG"] = sys.argv[1]
+with patch.object(testing_folders, "start_test_run", side_effect=OSError("setup failed")):
+    try:
+        unittest.defaultTestLoader.loadTestsFromName("direct_case.Example.test_short")
+    except SystemExit as error:
+        assert error.code == 1
+    else:
+        raise AssertionError("Setup did not fail")
+
+subprocess.run([sys.executable, "-c", "from scripts.lib import conf; conf.read('child')"], check=True)
+""", str(log))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("setup failed", result.stderr)
+        self.assertEqual(log.read_text().splitlines() if log.exists() else [], ["child"])
+
+    def test_macos_checkout_without_a_test_folder_needs_no_config_recorder(self) -> None:
+        library = self.root / "scripts/lib"
+        library.mkdir(parents=True)
+        (library / "py").touch()
+        _ = (library / "conf.py").write_text("# Configuration reader from an older checkout.\n")
+        result = self.invoke(sys.executable, "-c", """
+import sys
+import unittest
+
+sys.platform = "darwin"
+unittest.defaultTestLoader.loadTestsFromName("direct_case.Example.test_short")
+assert "scripts.lib.conf_reads" not in sys.modules
+""")
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_two_startup_hooks_share_one_direct_limit(self) -> None:
         copy = self.root / "copy"
         copy_test_runner(copy)
