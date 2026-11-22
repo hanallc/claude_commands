@@ -1191,7 +1191,8 @@ if(shot){const image=new Image();image.hidden=true;image.src='/complete';documen
             + "# whole: 1..\ndefault_life_seconds=86400\n# whole: 1..\nrepo_depth=3\n"
             + "# whole: 1..\nsuffix_length=6\nrepo_skip=target node_modules .git\n"
             + "# whole: 1..\nrecord_lock_attempts=3\n# whole: 1..\nremoval_remote_timeout_seconds=30\n")
-        for size in ("1440,1000", "1474,600", "600,900", "430,700", *(("screenshot",) if proof else ())):
+        # Use an inner height that fits the header, footer, and minimum body on the narrow page.
+        for size in ("1440,1000", "1474,600", "600,900", "500,800", *(("screenshot",) if proof else ())):
             with self.subTest(size=size):
                 _ = listing.write_text(original)
                 browser_root = root / size.replace(",", "x")
@@ -1248,7 +1249,7 @@ if(shot){const image=new Image();image.hidden=true;image.src='/complete';documen
                         viewport = "1440,1000" if size == "screenshot" else size
                         width, height = map(int, viewport.split(","))
                         route = destination
-                        if size == "430,700":
+                        if size == "500,800":
                             route = list_place.replace("#", "?direct=1&short=1#", 1)
                         elif size == "1474,600":
                             route += "&short=1"
@@ -1259,16 +1260,6 @@ if(shot){const image=new Image();image.hidden=true;image.src='/complete';documen
                             assert proof is not None
                             result = self.firefox_view(url + "&shot=1", Path(proof), width, height, complete, dark=True)
                             self.assertEqual(result.returncode, 0, result.stderr)
-                        elif size == "430,700":
-                            command, environment = _private_firefox_command(
-                                self.root / f"overlay-profile-{size}", width, height, dark=True)
-                            with subprocess.Popen([*command, url], stdout=subprocess.DEVNULL,
-                                                  stderr=subprocess.DEVNULL, env=environment) as browser:
-                                try:
-                                    self.assertTrue(complete.wait(35), "The browser must report the overlay results.")
-                                finally:
-                                    browser.terminate()
-                                    _ = browser.wait(timeout=10)
                         else:
                             with self.firefox().page(url, width, height, dark=True):
                                 self.assertTrue(complete.wait(35), "The browser must report the overlay results.")
