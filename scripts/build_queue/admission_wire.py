@@ -91,13 +91,19 @@ class LocalRunProvider:
 
 
 @dataclass(frozen=True)
+class LegacyAttemptBoundRunClaim:
+    """The old claim and fence identify an attempt without continuation authority."""
+    reference: placement.ProviderClaimReference
+    start_fence_id: str
+
+
+@dataclass(frozen=True)
 class RemoteRunProvider:
     """The saved endpoint and claim identify the provider that must settle the run."""
     endpoint: str
     transport: ExecutionTransport
-    claim: placement.ProviderClaimReference
+    claim: placement.RunProviderClaimReference | LegacyAttemptBoundRunClaim
     holder: placement.ClaimHolderIdentity
-    start_fence_id: str
 
 
 @dataclass(frozen=True)
@@ -118,7 +124,7 @@ class RunCommandAttempt:
 @dataclass(frozen=True)
 class RunClaimAcquisitionPending:
     """The provider has yet to confirm whether this exact claim was acquired."""
-    claim: placement.ProviderClaimReference
+    claim: placement.RunProviderClaimReference | placement.ProviderClaimReference
 
 
 @dataclass(frozen=True)
@@ -130,7 +136,7 @@ class RunCommandSettlementPending:
 @dataclass(frozen=True)
 class RunClaimReleasePending:
     """The provider has yet to confirm release of this exact claim."""
-    claim: placement.ProviderClaimReference
+    claim: placement.RunProviderClaimReference | placement.ProviderClaimReference
 
 
 @dataclass(frozen=True)

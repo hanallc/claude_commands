@@ -103,6 +103,8 @@ class SavedPlacementAssignment:
         placement.UnknownAssignedSettingsGeneration())
     refusal_settings: RefusalSettings | NoRefusalSettings = NoRefusalSettings()
     remote_start_hold: RemoteStartHold | RemoteStartHoldUnrecorded | RemoteStartHoldEnded = RemoteStartHoldUnrecorded()
+    run_command: placement.RunCommandBinding | placement.NoRunCommandBinding = field(
+        default=placement.NoRunCommandBinding(), kw_only=True)
 
 
 @dataclass(frozen=True)

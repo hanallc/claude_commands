@@ -8,7 +8,8 @@ import unittest
 from unittest.mock import patch
 
 from scripts.build_queue import admission_records as records
-from scripts.build_queue import admission_wire as wire, placement
+from scripts.build_queue import admission_wire as wire, execution_identity, placement
+from scripts.build_hold.owning_session import NoOwningSession
 from scripts.build_targets.execution_transport import SshCommandTransport
 from scripts.mac_test.claim_state import RepositoryScope, WHOLE_MAC
 
@@ -52,10 +53,10 @@ class RunRecordCodecTests(unittest.TestCase):
     def test_remote_settlement_retains_the_provider_and_the_exact_operation(self) -> None:
         scope = RepositoryScope("fixture", "fixture-key", 2)
         destination = placement.PlacementDestination("mac", "mac", "mac-host", scope, 2)
-        claim = placement.ProviderClaimReference("mac", "mac", scope, "run-claim", "run-a", "placement-a")
+        claim = placement.RunProviderClaimReference("mac", "mac", scope, "run-claim", "run-a", "placement-a")
         provider = wire.RemoteRunProvider("original-mac",
             SshCommandTransport(Path("/fixture/mac.conf")), claim,
-            placement.ClaimHolderIdentity("natedev", 123, "4200"), "outer-start-fence")
+            placement.ClaimHolderIdentity("natedev", 123, "4200"))
         command = wire.RunCommandAttempt("nextest-step", "nextest-attempt")
         for operation, launch in (
             (wire.RunClaimAcquisitionPending(claim), wire.RunNeverLaunched()),
@@ -66,6 +67,49 @@ class RunRecordCodecTests(unittest.TestCase):
                 slot = wire.VerifyRunSlot("fixture", wire.Owner(123, "4200"), destination=destination,
                     provider=provider, settlement=wire.SettlementPending("cancelled", operation), launch=launch)
                 self.assertEqual(wire.parse_record(wire.encode_record(slot), wire.VerifyRunSlot), slot)
+
+    def test_legacy_remote_slot_preserves_the_attempt_claim_and_fence(self) -> None:
+        scope = RepositoryScope("fixture", "fixture-key", 2)
+        claim = placement.ProviderClaimReference("mac", "mac", scope, "old-claim", "run-a", "old-attempt")
+        transport = SshCommandTransport(Path("/fixture/mac.conf"))
+        holder = placement.ClaimHolderIdentity("natedev", 123, "4200")
+        settlement = wire.SettlementPending("cancelled", wire.RunClaimReleasePending(claim))
+        old = {
+            "kind": "VerifyRunSlot",
+            "repository": "fixture",
+            "owner": wire.Owner(123, "4200"),
+            "destination": placement.PlacementDestination("mac", "mac", "mac-host", scope, 2),
+            "provider": {"kind": "RemoteRunProvider", "endpoint": "original-mac", "transport": transport,
+                         "holder": holder, "claim": claim, "start_fence_id": "old-fence"},
+            "settlement": settlement,
+        }
+
+        slot = wire.parse_record(wire.encode_record(old), wire.VerifyRunSlot)
+
+        self.assertEqual(slot.provider, wire.RemoteRunProvider("original-mac", transport,
+            wire.LegacyAttemptBoundRunClaim(claim, "old-fence"), holder))
+        self.assertEqual(slot.settlement, settlement)
+        self.assertEqual(wire.parse_record(wire.encode_record(slot), wire.VerifyRunSlot), slot)
+
+    def test_two_commands_preserve_one_run_claim_and_distinct_permissions_and_fences(self) -> None:
+        scope = RepositoryScope("fixture", "fixture-key", 2)
+        destination = placement.PlacementDestination("mac", "mac", "mac-host", scope, 2)
+        claim = placement.RunProviderClaimReference("mac", "mac", scope, "run-claim", "run-a", "placement-a")
+        assignment = placement.PlacementAssignment("check-step", "check-attempt", destination,
+            execution_identity.SourceKeyKnown("source"), placement.SubmittingOwner("natedev", 123, "4200"),
+            NoOwningSession(), 100.0)
+        check = records.SavedPlacementAssignment(assignment, permission=placement.PermissionConsumed(101.0),
+            run_command=placement.RunCommandBinding(claim, "check-fence"))
+        nextest = records.SavedPlacementAssignment(replace(assignment, episode="nextest-step", attempt="nextest-attempt"),
+            run_command=placement.RunCommandBinding(claim, "nextest-fence"))
+
+        saved = {"check": check, "nextest": nextest}
+        self.assertEqual(wire.parse_record(wire.encode_record(saved), dict[str, records.SavedPlacementAssignment]), saved)
+
+        old = wire.parse_record(wire.encode_record(check), dict[str, object])
+        del old["run_command"]
+        self.assertEqual(wire.parse_record(wire.encode_record(old), records.SavedPlacementAssignment),
+            replace(check, run_command=placement.NoRunCommandBinding()))
 
     def test_the_run_request_preserves_the_set_of_named_machines(self) -> None:
         owner = placement.SubmittingOwner("natedev", 123, "4200")

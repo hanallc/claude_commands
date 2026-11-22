@@ -364,6 +364,29 @@ class ProviderClaimReference:
 
 
 @dataclass(frozen=True)
+class RunProviderClaimReference:
+    """The claim covers one placement generation of the whole run."""
+    provider: Literal["mac", "ssh", "scaler"]
+    target: str
+    scope: ClaimScope
+    claim_id: str
+    run_episode: str
+    generation: str
+
+
+@dataclass(frozen=True)
+class RunCommandBinding:
+    """The command assignment uses this run claim and its own start fence."""
+    claim: RunProviderClaimReference
+    start_fence_id: str
+
+
+@dataclass(frozen=True)
+class NoRunCommandBinding:
+    """The command assignment has no binding to a whole-run claim."""
+
+
+@dataclass(frozen=True)
 class NoProviderClaim:
     """The assignment has no provider claim."""
 

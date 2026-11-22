@@ -73,6 +73,10 @@ def record_field_names(schema: type) -> tuple[str, ...]:
 
 def wire_record(schema: type, record: dict[str, object], *, writing: bool) -> dict[str, object]:
     """Keep existing wire fields compatible with the pinned client."""
+    if (not writing and schema.__module__ == "scripts.build_queue.admission_wire"
+            and schema.__name__ == "RemoteRunProvider" and "start_fence_id" in record):
+        return {**record, "claim": {"kind": "LegacyAttemptBoundRunClaim",
+            "reference": record["claim"], "start_fence_id": record["start_fence_id"]}}
     if writing and "job" in record and record["job"] == {"kind": "GateJobNotRecorded"}:
         del record["job"]
     if (schema.__module__ == "scripts.build_queue.placement"
