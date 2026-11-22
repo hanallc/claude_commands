@@ -14,6 +14,8 @@ import subprocess
 import sys
 import time
 import tomllib
+from collections.abc import Generator
+from contextlib import contextmanager
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -77,14 +79,24 @@ def upkeep() -> None:
                 print(f"herdr-upkeep: {row.name}: {error}", file=sys.stderr)
 
 
-def run_job() -> int:
-    cadence = _cadence()
+@contextmanager
+def upkeep_lock(*, blocking: bool) -> Generator[Path | None]:
+    """Use the timer's job lock to hold upkeep work."""
     directory = Path(os.environ.get("XDG_STATE_HOME", str(Path.home() / ".local/state"))) / "herdr-upkeep"
     directory.mkdir(parents=True, exist_ok=True)
     with (directory / "lock").open("a") as lock:
         try:
-            fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX if blocking else fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
+            yield None
+        else:
+            yield directory
+
+
+def run_job() -> int:
+    cadence = _cadence()
+    with upkeep_lock(blocking=False) as directory:
+        if directory is None:
             print("herdr-upkeep: already running; exit 0")
             return 0
         completed = directory / "completed"

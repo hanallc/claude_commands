@@ -554,6 +554,10 @@ The configured platform selects the mirror layout and slot protocol.
 Each SSH target names its platform and settings file.
 Natedev reads the SSH host from each active target's settings file before each record exchange.
 
+`unreachable_wait_seconds` is one value for every machine that the queue sends a run to.
+A run on a machine that does not answer for this many seconds ends as failed with the reason `unreachable`.
+Today only the `mac-linux` route reads it. The allowed whole numbers are 1 through 86400.
+
 `sync.hosts.<target>` lists host directory names for synchronized records.
 This mapping supplies all allowed host names, including recorder health aliases.
 The Mac mapping includes its explicit legacy host aliases, including `macbook`.

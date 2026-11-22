@@ -374,6 +374,7 @@ The first step creates one `RunPlace` with its arrival time and its `Owner`.
 The service sets `order_since` on snapshot row copies from the run place.
 It uses the earlier of the run time and the step arrival time.
 Durable waiter records retain only the step arrival time.
+An absent wait retains its run identity so it can use the run place while it exists.
 Each step retains its own `since` for reconnects, waiting age, token reacquisition, and AWS eligibility.
 Each step also retains its own owner, episode, and reservation.
 Queue priority remains the first ordering field.
@@ -405,7 +406,7 @@ The first two minutes use the same calculation. A run never counts its use twice
 The display shows zero room for a shortfall. The cap explanation shows the shortfall.
 These readings never reduce a promise from history.
 
-Waiting runs follow priority, first run arrival, and PID order.
+Waiting steps follow priority, first run arrival, step arrival, and PID order.
 A younger run starts only when its need fits after the first run's need remains protected.
 The first run can start despite insufficient room when no admitted run or held slot remains.
 Readable host memory, clear readable pressure, and a current estimate remain necessary.
@@ -2079,7 +2080,7 @@ Room equals free memory minus `safety_gib` and run keep-asides. The safety is 3 
 The cap equals our swap-backed use plus CI use plus free memory minus safety. It does not limit an estimate.
 The first two minutes use the same formula. Use and kept bytes never count the need twice.
 
-The first eligible run follows queue priority, first run arrival, and PID.
+The first eligible step follows queue priority, first run arrival, step arrival, and PID.
 A younger run starts only if its need fits room minus the first run's need.
 Pressure or unreadable pressure holds new starts and extra memory only while it lasts.
 An unreadable pressure file shows `pressure unreadable: <path>` with a short error or `incomplete` when available.
@@ -2112,7 +2113,7 @@ An incomplete CI template uses the generic CI label.
 The feed omits unusable parts from step titles.
 The wait subject joins the usable repository and step names. It shows `build` when both names are unusable.
 The Builds page uses the names and hover titles from the feed.
-A continuation within the slot bypasses order, spacing, and pressure.
+A continuation within the slot bypasses spacing and pressure.
 A larger continuation holds the slot and requests only its extra memory before new runs.
 A closed connection frees its claim. An idle slot expires or ends with its verified run owner.
 Repeated release cannot recreate a slot. A standalone request has no reusable slot.
@@ -2379,3 +2380,59 @@ Session TMPDIRs and unit session folders remain for later session commands.
 
 `verify.sh` shares one Python process across synchronous helper calls.
 See [Synchronous verify helpers](build-targets.md#synchronous-verify-helpers) for the protocol, process exceptions, recovery, and trace format.
+
+### Move a waiting step
+
+A drag acts like a bump: main's claim rules run on the shared order.
+
+Use the three-line handle on the Builds page to move a natedev wait to any place in the list.
+To use the keyboard, press Space on the handle, press an arrow key, then press Enter.
+Press Escape to cancel.
+The numbers show queue positions.
+The policy still checks eligibility before each start.
+Cloud waits have their own order.
+
+The admission service gives each wait an ID when it enters the queue.
+The saved place binds the ID to the owner PID, process start time, original arrival time, and episode.
+A refresh keeps the ID.
+The service saves pins in `state.json` when a move completes.
+A pin records the wait ID and an anchor.
+The anchor identifies the row directly ahead or the head of the queue.
+The service applies the usual priority and arrival rules to all saved waits.
+It then places each pinned wait directly after its anchor.
+A move gives the moved row a new anchor and keeps its former successor in place.
+Absent and unnamed waits stay in the full order.
+The page omits waits with no name source.
+Placement, memory admission, and continuation claims use the eligible rows in this order.
+The head-stall snapshot uses the order of local waits.
+The grant pass shows a newly granted row in Waiting without a move handle.
+The first pass that counts its reservation shows the row in Running and includes the memory charge.
+When run times tie, the earlier step arrival comes first. PID breaks a tie in step arrival.
+A confirmed move or Undo changes queue order only.
+A drag can return a waiting row's unstarted slot claim, as a bump does.
+A departing row loses its pin.
+A row anchored to the departing row inherits its anchor or its predecessor in the full order.
+A local reservation keeps its saved place until the service sees processes in its scope.
+The first reading clears the saved place for a direct reservation without a scope file.
+A placement retry before launch keeps its place.
+Both hosts use the visible order for normal steps.
+When placement preparation sees a remote start, it ends the startup hold and removes the local waiter.
+The table includes remote-only waits in queue order.
+The table identifies waits that a build hold blocks.
+Speculative Mac copy rows show the newest-first rule.
+A speculative Mac copy waits for placement outside the table while its parent holds local memory.
+A refusal before launch keeps the pin. Closing the attempt removes the local waiter and drops its slot claim.
+
+The service checks the order revision for all rows, including rows without handles.
+The replay ledger records the reply and the anchor from before the move.
+Undo restores the step to that anchor in the full order.
+The anchor is the head or the row that directly preceded the step.
+If that row left the full order, the service refuses Undo.
+Undo saves pins as a new move.
+A conflict supplies the current order. If the revision changed, the page waits for a fresh reading.
+A move sends the drop target.
+A drop above the first shown row uses the head anchor, ahead of unnamed and absent waits.
+Other drops use their neighbor in the full order.
+An Undo request identifies the move to restore. The service reads the saved anchor from the replay ledger.
+The page applies the confirmed order to the rows it shows.
+The confirmation uses the table numbers, including the places of waits without handles.
