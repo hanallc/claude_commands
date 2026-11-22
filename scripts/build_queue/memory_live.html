@@ -1397,27 +1397,21 @@ function queueGrip(row, ready) {
     <svg aria-hidden="true" viewBox="0 0 24 24"><path d="M4 6h16M4 12h16M4 18h16"/></svg></button>`;
 }
 
-function shownQueueMembers(line, reading) {
-  const hidden = new Set(reading.hidden_move_ids || []);
-  return line.members.filter(member => !hidden.has(member.row_id));
-}
-
 function queueReading(d) {
   if (!queueReply || !d.move_revision) return d;
   if (!queueReply.previousRevisions.includes(d.move_revision)) {
     queueReply = null;
     return d;
   }
+  if (queueReply.conflict) return {...d, queueReady:false};
   const rows = new Map(d.waiters.filter(row => row.move).map(row => [row.move.row_id, row]));
-  const shown = shownQueueMembers(queueReply.line, d);
-  const members = new Map(shown.map(member => [member.row_id, member]));
-  if (rows.size !== members.size || [...rows.keys()].some(id => !members.has(id)) ||
-      rows.size + (d.hidden_move_ids?.length || 0) !== queueReply.line.members.length)
-    return {...d, queueReady:false};
+  const shown = queueReply.line.members.filter(member => rows.has(member.row_id));
+  if (shown.length !== rows.size) return {...d, queueReady:false};
+  const shownIds = new Set(shown.map(member => member.row_id));
   const ordered = shown.map(member => ({...rows.get(member.row_id), move:member}));
   let index = 0;
   return {...d, move_revision:queueReply.line.revision,
-    waiters:d.waiters.map(row => members.has(row.move?.row_id) ? ordered[index++] : row)};
+    waiters:d.waiters.map(row => shownIds.has(row.move?.row_id) ? ordered[index++] : row)};
 }
 
 function showQueue(d) {
@@ -1479,24 +1473,32 @@ function queuePlace(reading, id, revision) {
   return reading.waiters.filter(row => row.kind !== "cloud").findIndex(row => row.move?.row_id === id) + 1;
 }
 
+function queueUndoDestination(reading, id) {
+  const rows = reading.waiters.filter(row => row.move);
+  const place = rows.findIndex(row => row.move.row_id === id);
+  const next = rows[place + 1];
+  if (next) return {kind:"QueueDrop", neighbor:next.move.row_id, side:"before"};
+  return {kind:"QueueDrop", neighbor:rows[place - 1].move.row_id, side:"after"};
+}
+
 async function sendQueueMove(row, reading, destination, id = queueRequestId()) {
   const revision = reading.move_revision;
   if (queueSending) return;
   queueSending = true;
   const undo = destination.kind === "QueueUndo";
+  const undoDestination = undo ? undefined : queueUndoDestination(reading, row.move.row_id);
   const previousRevisions = queueReply?.line.revision === revision
     ? [...queueReply.previousRevisions, revision] : [revision];
   queueMessage(undo ? "Restoring the queue place…" : "Saving the queue place…");
   try {
     const response = await fetch(queueMovePath, {method:"POST", headers:{"Content-Type":"application/json"},
       body:JSON.stringify({request_id:id, row_id:row.move.row_id, revision, destination,
-        hidden_move_ids:reading.hidden_move_ids, token:queueAccess.token})});
+        undo_destination:undoDestination, token:queueAccess.token})});
     const result = await response.json();
     if (response.status === 409) {
-      queueReply = {line:result.line, previousRevisions};
+      if (result.line.revision !== revision) queueReply = {line:result.line, previousRevisions, conflict:true};
       queueMessage(result.reason);
     } else if (response.ok) {
-      const current = queueReading(latest);
       queueReply = {line:result.line, previousRevisions};
       queueHighlight = row.move.row_id;
       clearTimeout(queueHighlightTimer);
@@ -1507,11 +1509,7 @@ async function sendQueueMove(row, reading, destination, id = queueRequestId()) {
       const {unit, step} = row.title ?? olderStepTitle(row);
       const label = [ownerText(unit), publicText(step)].filter(Boolean).join(" · ");
       const updated = queueReading(latest);
-      const currentRows = current.waiters.filter(item => item.kind !== "cloud");
-      const shown = shownQueueMembers(result.line, reading);
-      const confirmed = current.move_revision === result.line.revision && currentRows.length === shown.length &&
-        currentRows.every((item, index) => item.move?.row_id === shown[index].row_id);
-      const from = queuePlace(current, row.move.row_id, revision) || (confirmed ? result.old_place : 0);
+      const from = queuePlace(reading, row.move.row_id, revision);
       const to = queuePlace(updated, row.move.row_id, result.line.revision);
       queueMessage(from && to ? `${label} moved from ${from} to ${to}` : `${label} moved`,
         undo ? null : {label:"Undo", run:() => {
@@ -1519,6 +1517,10 @@ async function sendQueueMove(row, reading, destination, id = queueRequestId()) {
           if (current.queueReady === false || !current.move_revision || !current.waiters.some(item =>
             item.move?.row_id === row.move.row_id && item.move.movable !== false)) {
             queueMessage("Undo not available");
+            return;
+          }
+          if (!current.waiters.some(item => item.move?.row_id === undoDestination.neighbor)) {
+            queueMessage("The old neighbor left the queue.");
             return;
           }
           void sendQueueMove(row, current, {kind:"QueueUndo", move_request_id:id});

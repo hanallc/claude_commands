@@ -2386,15 +2386,15 @@ Absent and unnamed waits stay in the full order.
 The page omits waits with no name source.
 Placement, memory admission, and continuation claims use the eligible rows in this order.
 The head-stall snapshot uses the order of local waits.
-The page, client positions, and move validation include granted rows until the service sees them start.
-A granted row keeps its place and has no move handle.
+The grant pass shows a newly granted row in Waiting without a move handle.
+The first pass that counts its reservation shows the row in Running and includes the memory charge.
 When run times tie, the earlier step arrival comes first. PID breaks a tie in step arrival.
 A confirmed move or Undo changes queue order only.
 A drag can return a waiting row's unstarted slot claim, as a bump does.
 A departing row loses its pin.
 A row anchored to the departing row inherits its anchor or its predecessor in the full order.
-A local reservation leaves the queue when the service sees processes in its scope.
-For a direct reservation without a scope file, the first reading of the reservation ends the wait.
+A local reservation keeps its saved place until the service sees processes in its scope.
+The first reading clears the saved place for a direct reservation without a scope file.
 A placement retry before launch keeps its place.
 Both hosts use the visible order for normal steps.
 When placement preparation sees a remote start, it ends the startup hold and removes the local waiter.
@@ -2409,7 +2409,8 @@ Undo moves the step before its former next shown neighbor.
 If the step was last, Undo moves it after its former previous shown neighbor.
 If that neighbor left the queue, the service refuses Undo.
 Undo uses the current queue order and saves pins as a new move.
-A conflict supplies the current order.
-The page matches the service order to the shown and hidden wait IDs before it enables a move.
-Move requests include the hidden wait IDs. A drop can use a hidden wait as its anchor.
-The confirmation uses the current table numbers, including the places of waits without handles.
+A conflict supplies the current order. If the revision changed, the page waits for a fresh reading.
+A move sends the drop target and the former shown neighbor for Undo.
+The service uses the full order to anchor the drop.
+The page applies the confirmed order to the rows it shows.
+The confirmation uses the table numbers, including the places of waits without handles.

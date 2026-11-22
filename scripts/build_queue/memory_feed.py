@@ -1117,7 +1117,6 @@ class MemoryPage(TypedDict):
     walk: list[RunRow | CloudRunRow | MacBuildRow | MacReadingUnavailableRow]
     waiters: list[WaitRow | CloudWaitRow]
     move_revision: NotRequired[str]
-    hidden_move_ids: NotRequired[list[str]]
     swap_by: list[SwapRow]
     priority_text: str
     queued_priority_units: list[str]
@@ -2980,7 +2979,7 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
     move_line = parsed.view.move_line
     move_members = ({member.row_id: member for member in move_line.members}
                     if isinstance(move_line, admission_records.QueueMoveLine) else {})
-    hidden_move_ids: list[str] = []
+    matched_move_ids: set[str] = set()
     positions = {waiter.pid: place for place, waiter in enumerate(waiting, 1)}
     for place, waiter in enumerate(waiting, 1):
         check = checks.get(waiter.pid)
@@ -3015,9 +3014,9 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
             _, ordered_waiter = parsed.ordered[place - 1]
             if (ordered_waiter["pid"], ordered_waiter["since"]) == (waiter.pid, waiter.since):
                 member = move_members.get(ordered_waiter.get("move_id", ""))
+        if member is not None:
+            matched_move_ids.add(member.row_id)
         if isinstance(named, NoNamedStep):
-            if member is not None:
-                hidden_move_ids.append(member.row_id)
             continue
         notes: TargetNotes = {"runs_on": target_text, "targets": list(targets), "mac_text": ""} if targets else (
             NO_TARGET_NOTES if ci_label else target_notes(waiter.route, routes, waiter.step, waiter.folder, waiter.package))
@@ -3220,11 +3219,9 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
     }
     shown_move_ids = {row["move"].row_id for row in waiting_rows if "move" in row}
     if (any(move_members[row_id].movable for row_id in shown_move_ids)
-            and shown_move_ids.union(hidden_move_ids) == move_members.keys()
+            and matched_move_ids == move_members.keys()
             and isinstance(move_line, admission_records.QueueMoveLine)):
         page["move_revision"] = move_line.revision
-        if hidden_move_ids:
-            page["hidden_move_ids"] = hidden_move_ids
     page["render_seconds"] = time.perf_counter() - started
     return page
 

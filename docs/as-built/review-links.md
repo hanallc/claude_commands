@@ -2026,6 +2026,6 @@ The console limits the request size and time with `build_queue.conf`.
 
 The POST sends a request ID, a wait ID, an order revision, and a destination.
 The destination names a neighbor and a side, or the request ID of the move to undo.
-The POST includes hidden wait IDs when the page omits unnamed waits.
+A drop also sends the former shown neighbor and side for Undo.
 The admission service commits the move on its loop and replays the reply for a repeated request ID.
 The console returns HTTP 409 with the current order when it detects a conflict.

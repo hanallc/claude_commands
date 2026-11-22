@@ -1959,7 +1959,12 @@ class AdmissionServer:
     def _visible_queue_order(self, ordered: list[tuple[Path, records.RankedWaiter]]
                              ) -> list[tuple[Path, records.RankedWaiter]]:
         visible = {waiting.row.get("move_id") for waiting in self.waiters.values()}
+        reservations = self.last_inputs.reservations if isinstance(self.last_inputs, records.QueueInputs) else ()
+        counted = {row.get("reservation_id") for row in reservations}
         for record in self.reservations.values():
+            if record.reservation_id in counted:
+                # The pass already shows this grant in Running.
+                continue
             place = self.places.get(_place_key(record.owner, record.queue_waiter["since"]))
             if place is not None and place.episode == record.episode and place.move_id:
                 visible.add(place.move_id)
@@ -4931,12 +4936,10 @@ done
         moving = by_id.get(request.row_id)
         destination = request.destination
         undo = isinstance(destination, wire.QueueUndo)
-        hidden = set(request.hidden_move_ids)
-        if (moving is None or not moving.movable or request.revision != line.revision
-                or moving.row_id in hidden or not hidden <= by_id.keys()):
+        if moving is None or not moving.movable or request.revision != line.revision:
             return unavailable if undo else changed
         row_id = moving.row_id
-        order = [member_id for member_id in by_id if member_id not in hidden]
+        order = list(by_id)
         old_index = order.index(row_id)
         del order[old_index]
         if isinstance(destination, wire.QueueUndo):
@@ -4945,8 +4948,12 @@ done
             destination = saved.undo_destination
         if destination.neighbor not in order:
             return wire.QueueMoveConflict(line, "The old neighbor left the queue.") if undo else changed
-        undo_destination = (wire.QueueDrop(order[old_index], "before") if old_index < len(order)
-                            else wire.QueueDrop(order[-1], "after"))
+        undo_destination = request.undo_destination
+        if undo_destination is None:
+            undo_destination = (wire.QueueDrop(order[old_index], "before") if old_index < len(order)
+                                else wire.QueueDrop(order[-1], "after"))
+        elif undo_destination.neighbor not in order:
+            return unavailable if undo else changed
         place = order.index(destination.neighbor) + int(destination.side == "after")
         updated = line
         if place != old_index:

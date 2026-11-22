@@ -574,33 +574,62 @@ class QueueMoveTests(unittest.TestCase):
             self.assertEqual(move_line(fixture), moved.line)
             self.assertEqual(ids(moved.line), [first, pinned, last, middle])
 
-    def test_hidden_waits_keep_anchors_and_stay_out_of_move_positions(self) -> None:
+    def test_move_and_undo_anchor_to_the_full_order_next_to_an_unnamed_wait(self) -> None:
         with AdmissionFixture() as fixture:
             fixture.free(0)
             fixture.hold_starts()
-            for index in range(4):
+            for index in range(5):
                 request = fixture.request(since=fixture.clock.now() + index)
                 self.assertIsInstance(fixture.server.handle_request(request)[0], wire.Wait)
             line = move_line(fixture)
-            first, hidden, third, last = ids(line)
+            first, hidden, third, hidden_tail, last = ids(line)
             moved, = fixture.server.handle_request(wire.QueueMoveRequest(
-                "move-hidden", last, line.revision, wire.QueueDrop(third, "before"), hidden_move_ids=(hidden,)))
+                "move-hidden", last, line.revision, wire.QueueDrop(third, "before"),
+                undo_destination=wire.QueueDrop(third, "after")))
             assert isinstance(moved, wire.QueueMoved)
-            self.assertEqual((moved.old_place, moved.new_place), (3, 2))
-            self.assertEqual(ids(moved.line), [first, hidden, last, third])
+            self.assertEqual(ids(moved.line), [first, hidden, last, third, hidden_tail])
+            self.assertEqual(moved.undo_destination, wire.QueueDrop(third, "after"))
             self.assertEqual(fixture.server.queue_pins, (QueuePin(last, QueueRowAnchor(hidden)),))
             self.assertEqual(move_line(fixture), moved.line)
 
             lifted, = fixture.server.handle_request(wire.QueueMoveRequest(
-                "move-to-head", last, moved.line.revision, wire.QueueDrop(first, "before"), hidden_move_ids=(hidden,)))
+                "move-to-head", last, moved.line.revision, wire.QueueDrop(first, "before"),
+                undo_destination=wire.QueueDrop(third, "before")))
             assert isinstance(lifted, wire.QueueMoved)
-            self.assertEqual((lifted.old_place, lifted.new_place), (2, 1))
             self.assertEqual(lifted.undo_destination, wire.QueueDrop(third, "before"))
             undone, = fixture.server.handle_request(wire.QueueMoveRequest(
-                "undo-hidden", last, lifted.line.revision, wire.QueueUndo("move-to-head"), hidden_move_ids=(hidden,)))
+                "undo-hidden", last, lifted.line.revision, wire.QueueUndo("move-to-head")))
             assert isinstance(undone, wire.QueueMoved)
-            self.assertEqual(ids(undone.line), [first, hidden, last, third])
+            self.assertEqual(ids(undone.line), [first, hidden, last, third, hidden_tail])
             self.assertEqual(fixture.server.queue_pins, (QueuePin(last, QueueRowAnchor(hidden)),))
+
+    def test_unstarted_scoped_grant_shows_once_and_keeps_its_memory_charge(self) -> None:
+        from scripts.build_queue import admission_client, memory_feed
+        from scripts.build_queue.test_memory_feed import MemoryFeedTests
+
+        with AdmissionFixture() as fixture:
+            request = fixture.request()
+            request = replace(request, sidecar=str(fixture.scope(request.owner, members=())))
+            grant, = fixture.server.handle_request(request)
+            assert isinstance(grant, wire.Admitted)
+            self.assertEqual(fixture.queue_pids(), [request.owner.pid])
+
+            _ = fixture.run_pass()
+            reply, = fixture.server.handle_request(wire.ViewRequest())
+            assert isinstance(reply, wire.ViewReply)
+            self.assertEqual(fixture.queue_pids(), [])
+            running, = [entry for entry in reply.reading.explanation.running if entry.step.pid == request.owner.pid]
+            self.assertEqual(running.charged, grant.need)
+            feed = MemoryFeedTests()
+            feed.setUp()
+            try:
+                with patch.object(admission_client, "view", return_value=reply.reading):
+                    page = memory_feed.reading()
+            finally:
+                _ = feed.doCleanups()
+            row, = [item for item in page["walk"] if item["pid"] == request.owner.pid]
+            self.assertEqual(row.get("counted"), grant.need / GIB)
+            self.assertFalse(any(item["pid"] == request.owner.pid for item in page["waiters"]))
 
     def test_grant_publishes_the_order_used_to_confirm_moves_after_restart(self) -> None:
         with AdmissionFixture() as fixture:
@@ -634,7 +663,8 @@ class QueueMoveTests(unittest.TestCase):
             self.assertEqual(line.members[0], records.QueueMoveMember(first_id, movable=False))
             fixture.hold_starts()
             waiting = fixture.run_pass()
-            self.assertEqual(move_line(fixture), line)
+            line = move_line(fixture)
+            self.assertEqual(ids(line), [last_id, middle_id])
             self.assertEqual([entry.owner for entry in waiting.rows],
                              [records.run_owner(request.owner.pid, request.owner.start_time)
                               for request in (last, middle)])

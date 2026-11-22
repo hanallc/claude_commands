@@ -3866,7 +3866,6 @@ process.stdout.write(JSON.stringify({
                                ordered=[(self.root / "unnamed", unnamed_row), *reading.ordered])):
             named = memory_feed.reading()
         self.assertEqual(named.get("move_revision"), line.revision)
-        self.assertEqual(named.get("hidden_move_ids"), [unnamed_member.row_id])
         shown, = named["waiters"]
         self.assertEqual(shown["name"], rows[0]["name"])
         self.assertEqual(shown.get("move"), member)

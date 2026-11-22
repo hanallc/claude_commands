@@ -1415,12 +1415,16 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             if not self.valid_request_token(fields.pop("token", None)):
                 self.json_response(403, {"reason": "The queue move token expired. Refresh Builds."})
                 return
-            if fields.keys() - {"hidden_move_ids"} != {"request_id", "row_id", "revision", "destination"}:
+            if fields.keys() - {"undo_destination"} != {"request_id", "row_id", "revision", "destination"}:
                 raise ValueError("Send a request ID, row, revision and destination.")
             request = admission.parse_record(json.dumps({**fields, "kind": "QueueMoveRequest"}), admission.QueueMoveRequest)
             other_id = (request.destination.neighbor if isinstance(request.destination, admission.QueueDrop)
                         else request.destination.move_request_id)
-            identities = (request.request_id, request.row_id, other_id, request.revision, *request.hidden_move_ids)
+            identities = (request.request_id, request.row_id, other_id, request.revision)
+            if request.undo_destination is not None:
+                if isinstance(request.destination, admission.QueueUndo):
+                    raise ValueError("Undo uses the saved destination.")
+                identities = (*identities, request.undo_destination.neighbor)
             if any(not re.fullmatch(r"[0-9a-f]{32}", key) for key in identities):
                 raise ValueError("Invalid queue move identity.")
         except (ValueError, TypeError, TimeoutError, RecursionError) as error:

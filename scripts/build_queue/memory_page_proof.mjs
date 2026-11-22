@@ -171,11 +171,15 @@ try {
       const {revision, row_id, destination} = request;
       const rows = queueFixture.waiters;
       const ordered = rows.filter(row => row.move);
-      const hidden = queueFixture.hidden_move_ids.map(row_id => ({row_id}));
-      const line = () => ({revision:queueFixture.move_revision,
-        members:[...hidden, ...ordered.map(row => row.move)]});
+      const line = () => {
+        const members = ordered.map(row => row.move);
+        members.splice(1, 0, {row_id:'unnamed-wait'});
+        return {revision:queueFixture.move_revision, members};
+      };
       if (revision !== queueFixture.move_revision) return json(409, {reason:'The queue changed.', line:line()});
-      assert.deepEqual(request.hidden_move_ids, queueFixture.hidden_move_ids);
+      const keys = ['destination', 'request_id', 'revision', 'row_id', 'token'];
+      if (destination.kind === 'QueueDrop') keys.push('undo_destination');
+      assert.deepEqual(Object.keys(request).sort(), keys);
       const index = ordered.findIndex(row => row.move.row_id === row_id);
       const after = ordered[index + 1]?.move.row_id;
       const before = ordered[index - 1]?.move.row_id;
@@ -189,9 +193,13 @@ try {
       ordered.splice(next, 0, row);
       let place = 0;
       queueFixture.waiters = rows.map(item => item.move ? ordered[place++] : item);
-      undoDrops.set(request.request_id, after ? {neighbor:after, side:'before'} : {neighbor:before, side:'after'});
+      if (destination.kind === 'QueueDrop') {
+        assert.deepEqual(request.undo_destination, {kind:'QueueDrop',
+          neighbor:after || before, side:after ? 'before' : 'after'});
+        undoDrops.set(request.request_id, request.undo_destination);
+      }
       queueFixture.move_revision += '1';
-      return json(200, {line:line(), old_place:index + 1, new_place:next + 1});
+      return json(200, {line:line()});
     }
     const isData = req.url.startsWith('/memory.json'), isReport = req.url.startsWith('/report.json');
     res.writeHead(200, {'Content-Type':isData || isReport ? 'application/json' : 'text/html; charset=utf-8'});
@@ -463,7 +471,6 @@ try {
         const template = readings.spacing.waiters.find(row => row.kind !== 'cloud');
         const units = ['natemerge', 'unit-board', 'aws', 'postmaster', 'typesafe'];
         queueFixture = {...structuredClone(readings.spacing), move_revision:'fixture',
-          hidden_move_ids:['unnamed-wait'],
           waiters:units.map((unit, index) => ({...template, key:unit, unit, detail:unit,
             name:queueDragProof ? 'test affected' : `${unit} test affected`, title:{unit, step:'test affected'},
             showrunner:['sdlc','sdlc','builds','natedev','natedev'][index],

@@ -315,7 +315,7 @@ class QueueMoveRequest(CallerCode):
     row_id: str
     revision: str
     destination: QueueDrop | QueueUndo
-    hidden_move_ids: tuple[str, ...] = field(default=(), kw_only=True)
+    undo_destination: QueueDrop | None = field(default=None, kw_only=True)
 
 
 @dataclass(frozen=True)
