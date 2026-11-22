@@ -88,6 +88,19 @@ def deliver_in_fixture(path: Path) -> int:
     return detached_runs.main(["deliver", str(path)])
 
 
+def private_scope(cgroups: Path, unit: str) -> tuple[process_stop.ScopeIdentity, Path]:
+    folder = cgroups / "builds.slice" / unit
+    folder.mkdir(parents=True)
+    stat = folder.stat()
+    identity: process_stop.ScopeIdentity = {
+        "unit": unit, "path": f"/builds.slice/{unit}", "device": stat.st_dev, "inode": stat.st_ino,
+    }
+    events = folder / "cgroup.events"
+    _ = events.write_text("populated 1\n")
+    _ = (folder / "cgroup.kill").write_text("0\n")
+    return identity, events
+
+
 class DetachedRunsTests(unittest.TestCase):
     root: Path  # pyright: ignore[reportUninitializedInstanceVariable]
     session: Path  # pyright: ignore[reportUninitializedInstanceVariable]
@@ -1414,7 +1427,7 @@ sys.exit(1)
                             _ = (scope / "cgroup.kill").write_text("0\n")
                     self.update_record(path, command_scope=identities[0])
                     if route == "detached moved":
-                        self.update_record(path, moved_scope=identities[1])
+                        self.update_record(path, moved_scopes=identities[1:])
                     original = path.read_bytes()
                     order: list[tuple[str, int]] = []
                     now = 0.0
@@ -1502,44 +1515,53 @@ sys.exit(1)
         scopes: list[process_stop.ScopeIdentity] = []
         events_by_unit: dict[str, Path] = {}
         units_by_inode: dict[int, str] = {}
-        for name in ("original.scope", "first-move.scope", "second-move.scope"):
-            folder = cgroups / "builds.slice" / name
-            folder.mkdir(parents=True)
-            stat = folder.stat()
-            scopes.append({"unit": name, "path": f"/builds.slice/{name}", "device": stat.st_dev, "inode": stat.st_ino})
-            events = folder / "cgroup.events"
-            _ = events.write_text("populated 1\n")
+        for name in ("original.scope", "first-move.scope", "second-move.scope", "late-move.scope"):
+            scope, events = private_scope(cgroups, name)
+            scopes.append(scope)
             events_by_unit[name] = events
             units_by_inode[events.stat().st_ino] = name
         self.update_record(path, command_scope=scopes[0], command_group=DEAD_PID, command_started="fixture-start")
         current = 0
+        now = 0.0
         order: list[str] = []
         reason = "stop the moving command"
+        late_kill = events_by_unit["late-move.scope"].with_name("cgroup.kill")
 
         def moved(leader: process_stop.ProcessLifetime, original: process_stop.ScopeIdentity
                   ) -> process_stop.ScopeIdentity | None:
+            nonlocal current
             self.assertEqual(leader, process_stop.ProcessLifetime(DEAD_PID, "fixture-start"))
             self.assertEqual(original, scopes[0])
             order.append(f"read: {scopes[current]['unit']}")
-            return scopes[current] if current else None
+            if current:
+                return scopes[current]
+            current = 1
+            _ = events_by_unit[original["unit"]].write_text("populated 0\n")
+            return None
 
         def term(_directory: int, scope: process_stop.ScopeIdentity, _deadline: float) -> int:
+            nonlocal current
             name = scope["unit"]
             order.append(f"TERM: {name}")
             saved = worker_lifecycle.read_json_object(path)
             self.assertEqual(saved["stop_reason"], reason)
             self.assertIs(saved["stop_pass_requested"], True)
             self.assertNotIn("scope_end_proved", saved)
-            if name != scopes[0]["unit"]:
-                self.assertEqual(saved["moved_scope"], scope)
+            self.assertEqual(saved["moved_scopes"], scopes[1:current + 1])
+            if name == "first-move.scope":
+                current = 2
             return 1
 
-        def exit_wait(descriptor: int, _seconds: float) -> None:
-            nonlocal current
+        def exit_wait(descriptor: int, seconds: float) -> None:
+            nonlocal current, now
             name = units_by_inode[os.fstat(descriptor).st_ino]
             order.append(f"wait: {name}")
+            if name == "late-move.scope" and late_kill.read_text() == "0\n":
+                now += seconds
+                return
             _ = events_by_unit[name].write_text("populated 0\n")
-            current = min(current + 1, len(scopes) - 1)
+            if name == "first-move.scope":
+                current = 3
 
         def receipt(count: int) -> None:
             order.append(f"receipt: {count}")
@@ -1547,15 +1569,77 @@ sys.exit(1)
         with (patch.object(process_stop, "CGROUP_ROOT", cgroups),
               patch.object(process_stop, "moved_command_scope", side_effect=moved),
               patch.object(process_stop, "_term_scope", side_effect=term),
-              patch.object(process_stop, "_wait_scope_event", side_effect=exit_wait)):
+              patch.object(process_stop, "_wait_scope_event", side_effect=exit_wait),
+              patch.object(time, "monotonic", side_effect=lambda: now)):
             self.assertTrue(detached_runs.stop_command(path, reason, on_term=receipt))
             self.assertTrue(all(process_stop.scope_has_ended(scope) for scope in scopes))
         self.assertEqual(order, [
-            "read: original.scope", "TERM: original.scope", "receipt: 1", "wait: original.scope",
-            "read: first-move.scope", "TERM: first-move.scope", "wait: first-move.scope",
-            "read: second-move.scope", "TERM: second-move.scope", "wait: second-move.scope", "read: second-move.scope",
+            "read: original.scope", "read: first-move.scope", "TERM: first-move.scope",
+            "read: second-move.scope", "TERM: second-move.scope", "read: second-move.scope",
+            "receipt: 2", "wait: first-move.scope", "read: late-move.scope", "TERM: late-move.scope",
+            "read: late-move.scope", "wait: second-move.scope", "read: late-move.scope",
+            "wait: late-move.scope", "wait: late-move.scope", "read: late-move.scope",
         ])
+        self.assertEqual(late_kill.read_text(), "1\n")
         self.assertIs(worker_lifecycle.read_json_object(path)["scope_end_proved"], True)
+
+    @unittest.skipUnless(process_stop.supported(), "pidfd stop needs Linux")
+    def test_stop_retry_keeps_an_earlier_scope_that_survived_kill(self) -> None:
+        path = self.record(["systemd-run", "--user", "--scope", "--", "fixture-command"])
+        cgroups = self.root / "cgroups"
+        original, original_events = private_scope(cgroups, "original.scope")
+        earlier, earlier_events = private_scope(cgroups, "earlier.scope")
+        later, later_events = private_scope(cgroups, "later.scope")
+        _ = original_events.write_text("populated 0\n")
+        self.update_record(path, command_scope=original, moved_scopes=[earlier],
+                           command_group=DEAD_PID, command_started="fixture-start")
+        earlier_inode = earlier_events.stat().st_ino
+        now = 0.0
+        moved = False
+        signals: list[process_stop.ScopeIdentity] = []
+        retry = False
+
+        def term(_directory: int, scope: process_stop.ScopeIdentity, _deadline: float) -> int:
+            signals.append(scope)
+            if scope == later:
+                _ = later_events.write_text("populated 0\n")
+            elif retry:
+                _ = earlier_events.write_text("populated 0\n")
+            return 1
+
+        def exit_wait(descriptor: int, seconds: float) -> None:
+            nonlocal moved, now
+            self.assertEqual(os.fstat(descriptor).st_ino, earlier_inode)
+            moved = True
+            now += seconds
+
+        def read_moved(leader: process_stop.ProcessLifetime, scope: process_stop.ScopeIdentity
+                       ) -> process_stop.ScopeIdentity | None:
+            self.assertEqual(leader, process_stop.ProcessLifetime(DEAD_PID, "fixture-start"))
+            self.assertEqual(scope, original)
+            return later if moved else None
+
+        with (patch.object(process_stop, "CGROUP_ROOT", cgroups),
+              patch.object(process_stop, "moved_command_scope", side_effect=read_moved),
+              patch.object(process_stop, "_term_scope", side_effect=term),
+              patch.object(process_stop, "_wait_scope_event", side_effect=exit_wait),
+              patch.object(time, "monotonic", side_effect=lambda: now)):
+            with self.assertRaisesRegex(process_stop.ScopeStopFailed, "earlier.scope: the scope remains populated"):
+                _ = detached_runs.stop_command(path, "fixture stop")
+            self.assertEqual(earlier_events.with_name("cgroup.kill").read_text(), "1\n")
+            self.assertEqual(signals, [earlier, later])
+            saved = worker_lifecycle.read_json_object(path)
+            self.assertEqual(saved["moved_scopes"], [earlier, later])
+            self.assertNotIn("scope_end_proved", saved)
+
+            moved = False
+            retry = True
+            self.assertTrue(detached_runs.stop_command(path, "fixture retry"))
+        self.assertEqual(signals, [earlier, later, earlier])
+        saved = worker_lifecycle.read_json_object(path)
+        self.assertEqual(saved["moved_scopes"], [earlier, later])
+        self.assertIs(saved["scope_end_proved"], True)
+        self.assertNotIn("scope_error", saved)
 
     def test_start_rejects_an_unknown_kind(self) -> None:
         with contextlib.redirect_stderr(io.StringIO()) as error, self.assertRaises(SystemExit) as raised:
@@ -3130,6 +3214,15 @@ class PaneRunDeliveryTests(unittest.TestCase):
         def fail_receipt(count: int) -> None:
             self.assertEqual(count, 1)
             raise hook_error
+
+        if not process_stop.supported():
+            original = path.read_bytes()
+            with patch.object(process_stop, "_term_scope") as term:
+                self.assertFalse(detached_runs.stop_command(path, reason, on_term=fail_receipt))
+                term.assert_not_called()
+            self.assertEqual(path.read_bytes(), original)
+            self.assertIsInstance(progress_history.active_dispatch(row.id, self.run_dir), progress_history.ActiveDispatch)
+            return
 
         director = self.fixture.parent
         exact = Path(os.environ["NOTIFIER_SESSIONS_DIR"]) / f"{os.getpid()}.json"

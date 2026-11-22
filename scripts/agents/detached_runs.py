@@ -131,7 +131,7 @@ class RunRecord(StopFields):
     command_group: NotRequired[int]
     command_started: NotRequired[str]
     command_scope: NotRequired[process_stop.ScopeIdentity]
-    moved_scope: NotRequired[process_stop.ScopeIdentity]
+    moved_scopes: NotRequired[list[process_stop.ScopeIdentity]]
     scope_end_proved: NotRequired[Literal[True]]
     scope_leftovers: NotRequired[str]
     director_dir: str
@@ -277,6 +277,8 @@ def _write_record(path: Path, record: RunRecord) -> RunRecord:
             fields.update(current)
         if delivery := current.get("delivery"):
             fields["delivery"] = delivery
+        if "moved_scopes" in current:
+            fields["moved_scopes"] = current["moved_scopes"]
         if "stop_reason" in current:
             fields["stop_reason"] = current["stop_reason"]
         else:
@@ -295,6 +297,10 @@ def _write_record(path: Path, record: RunRecord) -> RunRecord:
         if fields["status"] == "finished" and fields.get("stop_pass_requested"):
             path.with_suffix(PENDING_STOP_SUFFIX).unlink(missing_ok=True)
         return fields
+
+
+def _is_scope_list(value: object) -> TypeGuard[list[process_stop.ScopeIdentity]]:
+    return isinstance(value, list) and all(process_stop.is_scope_identity(item) for item in cast(list[object], value))
 
 
 def _is_run_record(raw: dict[str, object]) -> TypeGuard[RunRecord]:
@@ -316,8 +322,8 @@ def _is_run_record(raw: dict[str, object]) -> TypeGuard[RunRecord]:
                                         "delivery", "ended", "stop_reason", "scope_leftovers", "scope_error"))
                     and ("delivered_at" not in raw or type(raw["delivered_at"]) in (int, float))
                     and ("completion_pending" not in raw or isinstance(raw["completion_pending"], bool))
-                    and all(key not in raw or process_stop.is_scope_identity(raw[key])
-                            for key in ("command_scope", "moved_scope"))
+                    and ("command_scope" not in raw or process_stop.is_scope_identity(raw["command_scope"]))
+                    and ("moved_scopes" not in raw or _is_scope_list(raw["moved_scopes"]))
                     and all(key not in raw or raw[key] is True
                             for key in ("stop_pass_requested", "self_stop", "orphan_result_superseded",
                                         "push_alert_attempted", "scope_end_proved"))
@@ -498,25 +504,26 @@ def _stop_scoped_command(
 
         staged = False
 
-        def stage(record: RunRecord, scopes: tuple[process_stop.ScopeIdentity, ...]) -> None:
+        def save_scopes(record: RunRecord, scopes: Sequence[process_stop.ScopeIdentity], *, request_stop: bool) -> None:
             nonlocal staged
             record["command_scope"] = scope
-            if scopes and scopes[-1] != scope:
-                record["moved_scope"] = scopes[-1]
-            _ = record.setdefault("stop_reason", reason)
-            if stop_pass:
-                record["stop_pass_requested"] = True
-                if not staged and _stop_caller_is_owner(record["staff_id"], os.environ):
-                    record["self_stop"] = True
-            _ = record.pop("scope_end_proved", None)
+            if len(scopes) > 1:
+                record["moved_scopes"] = list(scopes[1:])
+            if request_stop:
+                _ = record.setdefault("stop_reason", reason)
+                if stop_pass:
+                    record["stop_pass_requested"] = True
+                    if not staged and _stop_caller_is_owner(record["staff_id"], os.environ):
+                        record["self_stop"] = True
+                _ = record.pop("scope_end_proved", None)
+                staged = True
             write_text_atomic(path, json.dumps(record, indent=2, sort_keys=True))
-            staged = True
 
         with record_lock(path):
             record = _read_record(path)
             if record.get("command_scope", scope) != scope or not check():
                 return False
-            scopes = _command_scopes(record, scope)
+            scopes = list(_command_scopes(record, scope))
             ended = False
             with contextlib.suppress(process_stop.ScopeStopFailed):
                 ended = _scopes_have_ended(scopes)
@@ -524,30 +531,30 @@ def _stop_scoped_command(
             if not ended or (prior_stop and (not record.get("scope_end_proved")
                                              or (stop_pass and not record.get("stop_pass_requested")))):
                 previous = record.copy()
-                stage(record, scopes)
+                save_scopes(record, scopes, request_stop=True)
                 if not check():
                     write_text_atomic(path, json.dumps(previous, indent=2, sort_keys=True))
                     return False
-
-        seen = list(scopes)
+            elif scopes[1:] != record.get("moved_scopes", []):
+                save_scopes(record, scopes, request_stop=False)
 
         def next_scopes() -> tuple[process_stop.ScopeIdentity, ...]:
             with record_lock(path):
                 current = _read_record(path)
                 if current.get("command_scope", scope) != scope:
                     raise process_stop.ScopeStopFailed("the saved command scope changed during the stop")
-                new = tuple(item for item in _command_scopes(current, scope) if item not in seen)
+                new = tuple(item for item in _command_scopes(current, scope) if item not in scopes)
                 if new:
-                    stage(current, new)
-                    seen.extend(new)
+                    save_scopes(current, (*scopes, *new), request_stop=True)
+                    scopes.extend(new)
                 return new
 
         hook_error: BaseException | None = None
         try:
-            receipt = process_stop.stop_scopes(() if ended else scopes, grace, kill_grace,
+            receipt = process_stop.stop_scopes(() if ended else tuple(scopes), grace, kill_grace,
                                                on_term=on_term, next_scopes=next_scopes)
             hook_error = receipt.hook_error
-            if not _scopes_have_ended(seen):
+            if not _scopes_have_ended(scopes):
                 raise process_stop.ScopeStopFailed("a command scope became populated again during the stop")
         except process_stop.ScopeStopFailed as error:
             with record_lock(path):
@@ -1348,8 +1355,10 @@ def _uses_unsupported_systemd_run(command: list[str]) -> bool:
 
 
 def _command_scopes(raw: Mapping[str, object], scope: process_stop.ScopeIdentity) -> tuple[process_stop.ScopeIdentity, ...]:
-    recorded = raw.get("moved_scope")
-    scopes = (scope, recorded) if process_stop.is_scope_identity(recorded) and recorded != scope else (scope,)
+    recorded = raw.get("moved_scopes", [])
+    if not _is_scope_list(recorded):
+        raise process_stop.ScopeStopFailed("the saved moved scopes are invalid")
+    scopes = (scope, *recorded)
     command = raw.get("command")
     group, started = _integer(raw.get("command_group")), raw.get("command_started")
     if not isinstance(command, list) or not isinstance(started, str) or group <= 1:
@@ -2045,13 +2054,18 @@ def _finish_command_scope(path: Path, scope: process_stop.ScopeIdentity) -> RunR
             if not record.get("scope_end_proved"):
                 for item in _command_scopes(record, scope):
                     try:
-                        if not process_stop.scope_ends_by(item, deadline):
-                            members = process_stop.scope_member_pids(item)
-                            leftovers.append(f"{item['unit']} (PIDs {', '.join(map(str, members))})"
-                                             if members else item["unit"])
-                            _ = process_stop.stop_scope(item, grace, kill_grace)
+                        if process_stop.scope_ends_by(item, deadline):
+                            continue
+                        members = process_stop.scope_member_pids(item)
                     except (OSError, ValueError) as error:
                         errors.append(f"{item['unit']}: {error}")
+                        continue
+                    leftovers.append(f"{item['unit']} (PIDs {', '.join(map(str, members))})"
+                                     if members else item["unit"])
+                    try:
+                        _ = process_stop.stop_scope(item, grace, kill_grace)
+                    except (OSError, ValueError) as error:
+                        errors.append(str(error))
         except (OSError, ValueError) as error:
             errors.append(str(error))
         with record_lock(path):

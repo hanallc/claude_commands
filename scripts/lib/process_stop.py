@@ -1,6 +1,7 @@
 """Stop an exact Linux process lifetime or its dedicated command tree."""
 from __future__ import annotations
 
+from collections import deque
 from collections.abc import Callable, Generator
 from contextlib import ExitStack, contextmanager, suppress
 from dataclasses import dataclass
@@ -373,58 +374,61 @@ def stop_scopes(
     on_term: Callable[[int], None] | None = None,
     next_scopes: Callable[[], tuple[ScopeIdentity, ...]] | None = None,
 ) -> ScopeStopReceipt:
-    """Report the first batch's TERM count before the exit wait.
+    """Report the TERM count after discovery finds no new scopes.
 
     Return a hook error after cleanup so the caller can save the result.
     """
-    errors: list[tuple[str, ScopeStopFailed]] = []
+    errors: list[str] = []
     hook_error: BaseException | None = None
     term_reached = 0
-    reported = 0
-    scope_count = 0
-    report = on_term
-    while True:
-        scope_count += len(scopes)
-        with ExitStack() as opened:
-            pending: list[_ScopeAwaitingExit] = []
-            for scope in scopes:
-                deadline = time.monotonic() + grace
+    with ExitStack() as opened:
+        pending: deque[_ScopeAwaitingExit] = deque()
+
+        def term_new_scopes(batch: tuple[ScopeIdentity, ...]) -> None:
+            nonlocal term_reached
+            while True:
+                for scope in batch:
+                    deadline = time.monotonic() + grace
+                    try:
+                        directory, events = opened.enter_context(_scope_events(scope))
+                        if not _scope_is_empty(scope, events):
+                            reached = _term_scope(directory, scope, deadline)
+                            term_reached += reached
+                            pending.append(_ScopeAwaitingExit(scope, directory, events, reached, deadline))
+                    except _ScopeRemoved:
+                        continue
+                    except ScopeStopFailed as error:
+                        errors.append(f"{scope['unit']}: {error}")
+                if next_scopes is None:
+                    return
                 try:
-                    directory, events = opened.enter_context(_scope_events(scope))
-                    if not _scope_is_empty(scope, events):
-                        reached = _term_scope(directory, scope, deadline)
-                        pending.append(_ScopeAwaitingExit(scope, directory, events, reached, deadline))
-                except _ScopeRemoved:
-                    continue
-                except ScopeStopFailed as error:
-                    errors.append((scope["unit"], error))
-            term_reached += sum(item.term_reached for item in pending)
-            if report is not None:
-                reported = term_reached
-                try:
-                    report(reported)
-                except BaseException as error:
-                    hook_error = error
-                report = None
-            for item in pending:
-                try:
-                    _finish_scope_stop(item, kill_grace, require_term=on_term is not None)
-                except _ScopeRemoved:
-                    continue
-                except ScopeStopFailed as error:
-                    errors.append((item.scope["unit"], error))
-        if next_scopes is None:
-            break
-        try:
-            scopes = next_scopes()
-        except ScopeStopFailed as error:
-            errors.append(("scope discovery", error))
-            break
-        if not scopes:
-            break
+                    batch = next_scopes()
+                except (OSError, ValueError) as error:
+                    errors.append(f"scope discovery: {error}")
+                    return
+                if not batch:
+                    return
+
+        term_new_scopes(scopes)
+        reported = term_reached
+        if on_term is not None:
+            try:
+                on_term(reported)
+            except BaseException as error:
+                hook_error = error
+            if not pending:
+                term_new_scopes(())
+        while pending:
+            item = pending.popleft()
+            try:
+                _finish_scope_stop(item, kill_grace, require_term=on_term is not None)
+            except _ScopeRemoved:
+                pass
+            except ScopeStopFailed as error:
+                errors.append(f"{item.scope['unit']}: {error}")
+            term_new_scopes(())
     if errors:
-        cleanup_error = (errors[0][1] if scope_count <= 1 and len(errors) == 1 else
-                         ScopeStopFailed("; ".join(f"{unit}: {error}" for unit, error in errors)))
+        cleanup_error = ScopeStopFailed("; ".join(errors))
         if hook_error is not None:
             raise cleanup_error from hook_error
         raise cleanup_error

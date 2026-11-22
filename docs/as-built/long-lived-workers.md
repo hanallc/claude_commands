@@ -724,10 +724,13 @@ Five samples of the replacement guard took 63–131 ms elapsed and 52–65 ms CP
 The samples used private records outside the expected scope and measured the launch check.
 `detached_runs.py stop` saves the stop reason and any pass cancellation request before it sends TERM.
 It sends TERM through individual pidfds to verified members of the saved scope tree.
-The optional callback reports the TERM count for the initial scopes once, before the exit wait.
-Empty and removed scopes contribute zero to the total.
-After each stop, it checks for a new scope of the verified leader.
-It stops each new scope before it saves completion.
+It saves each newly found scope before it sends TERM to that scope.
+It checks for new scopes after each round of TERM.
+The optional callback reports one TERM count when a check finds no new scopes.
+The exit wait starts after the callback.
+It also stops scopes that it finds during the exit wait.
+It saves completion only when every saved scope is empty or removed.
+A retry uses the full set of saved scopes.
 If the callback raises, the stop saves the cleanup result before it raises the error.
 If cleanup also fails, the cleanup error includes the callback error as its cause.
 It uses `cgroup.kill` after the stop grace if the scope stays populated.
