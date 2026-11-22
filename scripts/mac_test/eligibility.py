@@ -18,6 +18,9 @@ from scripts.lib import conf
 from scripts.mac_test import cargo_manifest
 
 
+MAC_LINUX_TARGET = "mac-linux"
+
+
 MacVerb = Literal["nextest", "check", "clippy", "mend-check", "mend-fix", "doc", "build"]
 
 
@@ -197,7 +200,23 @@ def config_path() -> Path:
 
 def configured_ssh_target(target: str) -> target_config.SshTarget:
     """Resolve an SSH target before access to its coordination state."""
+    if target == MAC_LINUX_TARGET:
+        return mac_linux_target(conf.read("build_targets"))
     return target_config.configured_ssh_target(target)
+
+
+def mac_linux_target(registry: conf.ConfigRead) -> target_config.SshTarget:
+    """Read the guest registration for the gate."""
+    target = MAC_LINUX_TARGET
+    if (registry.text(f"kind.{target}", recover_invalid=False) != "ssh"
+            or registry.text(f"platform.{target}", recover_invalid=False) != "linux"):
+        raise conf.Unusable(f"{target} must use SSH and the Linux platform")
+    settings = Path(registry.text(f"settings.{target}", recover_invalid=False)).expanduser()
+    return target_config.SshTarget(target, "linux", registry.source.parent / settings)
+
+
+def mac_linux_enabled(registry: conf.ConfigRead) -> bool:
+    return registry.value(f"enabled.{MAC_LINUX_TARGET}", conf.on_off, recover_invalid=False)
 
 
 def ssh_target_state_directory(target: str) -> Path:
@@ -258,7 +277,8 @@ def comma_values(value: str) -> set[str]:
 
 
 def backoff_path(target: str = "mac") -> Path:
-    return state_directory(target) / "unreachable_until"
+    directory = ssh_target_state_directory(target) if target == MAC_LINUX_TARGET else state_directory(target)
+    return directory / "unreachable_until"
 
 
 def read_backoff(now: float, target: str = "mac", *, strict: bool = False) -> BackoffState:

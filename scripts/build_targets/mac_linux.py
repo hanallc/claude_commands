@@ -1,13 +1,13 @@
 """Run the gate in the Mac's Linux guest.
 
-Release the claim after the guest confirms that it wrote the cancel record under the run lock.
-If the guest is unreachable, hold the claim and retry until the guest can prove the run ended.
+Wait for proof that the guest run ended.
+If the wait expires, fail the route. The guest keeps its run lock until the run ends.
 If the gate parent and module supervisor die, a descendant can keep the lock and prevent proof.
 Without a signal handler, Python can raise KeyboardInterrupt at any bytecode. An interrupt outside the protected block acts like process death. The guest timeout still ends the run.
 """
 from __future__ import annotations
 
-from collections.abc import Generator
+from collections.abc import Generator, Sequence
 from contextlib import AbstractContextManager, contextmanager, nullcontext, redirect_stdout, suppress
 from dataclasses import dataclass
 from enum import StrEnum
@@ -23,7 +23,7 @@ import signal
 import subprocess
 import sys
 import tarfile
-from time import sleep
+from time import monotonic, sleep, time
 from typing import Literal, TypedDict, cast
 from urllib.parse import urlsplit
 from uuid import uuid4
@@ -31,11 +31,15 @@ from uuid import uuid4
 from scripts.aws_target import gate_box, ledger
 from scripts.build_queue.admission_jobs import GateJobNotRecorded, StepJob
 from scripts.lib import build_folders, conf, process_group
+from scripts.mac_test import eligibility
 from scripts.production.gate_modules import GateRefused, discover_test_modules
 from scripts.production.gate_routes import AllModules, GateJobKind, GateRun, ModuleCoverage, SuiteMode, TreeSelection
+from scripts.test_times.gate_record import TYPE_CHECK_JOB
 
 
-TARGET = 'mac-linux'
+TARGET = eligibility.MAC_LINUX_TARGET
+UNREACHABLE_WAIT_KEY = 'unreachable_wait_seconds'
+MAX_UNREACHABLE_WAIT_SECONDS = 86400
 ORIGIN_MAIN = 'refs/remotes/origin/main'
 SSH_CONNECT_TIMEOUT_SECONDS = 8
 SSH = ('ssh', '-T', '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=yes', '-o', 'ForwardAgent=no',
@@ -48,7 +52,6 @@ GUEST_CLEANUP_TIMEOUT_SECONDS = 25
 MISSING_PREREQUISITE_STATUS = 75
 MISSING_PREREQUISITE_MESSAGE = 'Repository lacks these prerequisite commits:'
 GUEST_END_PENDING_STATUS = 76
-GUEST_END_PENDING_MESSAGE = 'Mac Linux guest run not proven ended; the Mac claim stays held'
 RUN_LOCK_PATH = '.git/mac-linux-run.lock'
 RUN_LOCK_FD = 9
 ARM_RECORD_PREFIX = 'mac-linux-armed'
@@ -71,17 +74,13 @@ class GuestRepositoryRefused(GuestUnavailable):
         super().__init__(f'the Mac Linux guest accepts claude_commands, but the source repository is {repository}')
 
 
-class GuestSwitch(StrEnum):
-    ON = 'on'
-    OFF = 'off'
-
-
 @dataclass(frozen=True)
 class GuestSettings:
     ssh_hops: tuple[str, str]
     guest_user: str
     jobs: int
     run_time_limit_seconds: int
+    unreachable_wait_seconds: int
 
     @property
     def guest_timeout_seconds(self) -> int:
@@ -96,28 +95,32 @@ class GuestSettings:
         return (*SSH, mac, shlex.join((*SSH, '-l', self.guest_user, guest, shlex.join(('bash', '-c', shell)))))
 
 
+def _unreachable_wait_seconds(value: str) -> int:
+    seconds = conf.positive_whole(value)
+    if seconds > MAX_UNREACHABLE_WAIT_SECONDS:
+        raise ValueError(f'expected at most {MAX_UNREACHABLE_WAIT_SECONDS} seconds')
+    return seconds
+
+
 def read_settings(registry: conf.ConfigRead) -> GuestSettings:
-    if (registry.text(f'kind.{TARGET}', recover_invalid=False) != 'ssh'
-            or registry.text(f'platform.{TARGET}', recover_invalid=False) != 'linux'):
-        raise GuestUnavailable(f'{TARGET} must use SSH and the Linux platform')
-    settings_file = Path(registry.text(f'settings.{TARGET}', recover_invalid=False)).expanduser()
-    settings = conf.read(registry.source.parent / settings_file)
+    settings = conf.read(eligibility.mac_linux_target(registry).settings)
     hops = settings.value('ssh.hops', str.split, recover_invalid=False)
     user = settings.text('guest.user', recover_invalid=False)
     jobs = settings.value('test.jobs', int, recover_invalid=False)
     limit = settings.value('run.time_limit_seconds', int, recover_invalid=False)
+    proof_wait = registry.value(UNREACHABLE_WAIT_KEY, _unreachable_wait_seconds, recover_invalid=False)
     if len(hops) != 2 or not all(re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]*', host) for host in hops):
         raise GuestUnavailable('ssh.hops must name two SSH aliases')
     if not re.fullmatch(r'[a-z_][a-z0-9_-]*', user):
         raise GuestUnavailable('guest.user must name a Linux user')
     if jobs < 1 or limit < 1:
         raise GuestUnavailable('test.jobs and run.time_limit_seconds must be positive')
-    return GuestSettings((hops[0], hops[1]), user, jobs, limit)
+    return GuestSettings((hops[0], hops[1]), user, jobs, limit, proof_wait)
 
 
 def mac_linux_reservation(_repo: Path, _work: SuiteMode | StepJob,
                           _gate_job: StepJob | GateJobNotRecorded) -> AbstractContextManager[None]:
-    """Keep the reservation through the guest attempt.
+    """Provide the reservation context that item 191 B3 will implement.
 
     B3 adds scripts.build_queue.mac_run.held(repo, 'mac', work, gate_job).
     The context manager takes the native claude_commands repository claim on the Mac.
@@ -136,6 +139,7 @@ class GuestRequest(TypedDict):
     mode: str
     full: bool
     selection: list[str] | Literal['all']
+    type_dirs: list[str]
     module_time_limit_s: float
     run_time_limit_seconds: int
     jobs: int
@@ -225,6 +229,10 @@ class GuestMain:
 
 def read_guest_main(settings: GuestSettings) -> GuestMain | EmptyGuestMain:
     shell = guest_shell(settings) + '''
+if ! command -v bwrap >/dev/null 2>&1; then
+    printf 'bwrap is absent from the guest PATH.\\n' >&2
+    exit 127
+fi
 if [ -f "$checkout/.git/HEAD" ]; then
     git -C "$checkout" rev-parse --verify --quiet refs/heads/main || test "$?" -eq 1
 fi'''
@@ -510,11 +518,15 @@ class GuestEndPending:
     detail: str
 
 
-def prove_guest_end(settings: GuestSettings, armed: ArmedGuestAttempt) -> GuestEndProven | GuestEndPending:
+def prove_guest_end(settings: GuestSettings, armed: ArmedGuestAttempt, *,
+                    proof_deadline: float = math.inf) -> GuestEndProven | GuestEndPending:
     try:
-        reply = subprocess.run(settings.command(cleanup_shell(settings, armed)), stdin=subprocess.DEVNULL,
-                               capture_output=True, text=True, errors='replace',
-                               timeout=GUEST_CLEANUP_TIMEOUT_SECONDS, check=False)
+        command = settings.command(cleanup_shell(settings, armed))
+        remaining = proof_deadline - monotonic()
+        if remaining <= 0:
+            return GuestEndPending('The proof deadline expired before cleanup SSH.')
+        reply = subprocess.run(command, stdin=subprocess.DEVNULL, capture_output=True, text=True, errors='replace',
+                               timeout=min(GUEST_CLEANUP_TIMEOUT_SECONDS, remaining), check=False)
     except (OSError, subprocess.TimeoutExpired) as error:
         return GuestEndPending(str(error) or type(error).__name__)
     if reply.returncode == 0 and reply.stdout.strip() == 'ended':
@@ -637,8 +649,8 @@ def run_remote(repo: Path, settings: GuestSettings, source: CandidateSource, req
     stream: subprocess.CompletedProcess[bytes] | None = None
     first_error: BaseException | None = None
     first_failure = ''
+    proof_deadline: float | None = None
     retry_proof = False
-    reported_hold = False
     proof_obtained = False
 
     while True:
@@ -654,14 +666,20 @@ def run_remote(repo: Path, settings: GuestSettings, source: CandidateSource, req
                         command = settings.command(run_shell(settings, source, len(bootstrap), armed))
                         arguments = ['bash', '-o', 'pipefail', '-c', STREAM_SOURCE, TARGET, prefix, base, header, *command]
                         stream = stream_guest_bundle(repo, arguments, bootstrap, settings.transfer_timeout_seconds)
+                    now = monotonic()
+                    if proof_deadline is None:
+                        proof_deadline = now + settings.unreachable_wait_seconds
+                    remaining = proof_deadline - now
+                    if remaining <= 0:
+                        break
                     if retry_proof:
-                        if not reported_hold:
-                            reported_hold = True
-                            with suppress(OSError, ValueError):
-                                print(GUEST_END_PENDING_MESSAGE, file=sys.stderr, flush=True)
-                        sleep(SSH_CONNECT_TIMEOUT_SECONDS)
+                        sleep(min(SSH_CONNECT_TIMEOUT_SECONDS, remaining))
+                        if monotonic() >= proof_deadline:
+                            break
                     retry_proof = True
-                    proof = prove_guest_end(settings, armed)
+                    proof = prove_guest_end(settings, armed, proof_deadline=proof_deadline)
+                    if monotonic() >= proof_deadline:
+                        break
                     if isinstance(proof, GuestEndProven):
                         proof_obtained = True
                     elif not first_failure:
@@ -680,16 +698,24 @@ def run_remote(repo: Path, settings: GuestSettings, source: CandidateSource, req
             if first_error is None or (isinstance(first_error, Exception) and not isinstance(error, Exception)):
                 first_error = error
 
+    diagnostics = stream.stderr.decode(errors='replace') if stream is not None and stream.returncode else ''
+    detail = ' '.join(diagnostics.split())[-1200:]
+    if not proof_obtained:
+        guest = settings.ssh_hops[-1]
+        error = GuestUnavailable(f'guest unreachable: {guest} did not confirm the run ended '
+                                 + f'within {settings.unreachable_wait_seconds} seconds ({UNREACHABLE_WAIT_KEY})')
+        if detail:
+            error.add_note(detail)
+        raise error
+
     cleanup_detail = 'Guest cleanup: ended' + (f' after {first_failure}' if first_failure else '')
     if first_error is not None:
         first_error.add_note(cleanup_detail)
         raise first_error
     assert stream is not None
     if stream.returncode:
-        diagnostics = stream.stderr.decode(errors='replace')
         if stream.returncode == MISSING_PREREQUISITE_STATUS and MISSING_PREREQUISITE_MESSAGE in diagnostics:
             raise GuestMissingPrerequisite(diagnostics.strip())
-        detail = ' '.join(diagnostics.split())[-1200:]
         raise GuestUnavailable(f'SSH or source stream exited {stream.returncode}: {detail or "no diagnostic"}. '
                                + cleanup_detail)
     result, _, count = stream.stdout.rstrip().rpartition(b'\n')
@@ -697,7 +723,17 @@ def run_remote(repo: Path, settings: GuestSettings, source: CandidateSource, req
 
 
 def transfer_source(repo: Path, settings: GuestSettings, source: CandidateSource, request: GuestRequest) -> GuestReply:
-    guest = read_guest_main(settings)
+    try:
+        guest = read_guest_main(settings)
+    except (GuestUnavailable, OSError, subprocess.SubprocessError) as error:
+        from scripts.mac_test import offload
+
+        try:
+            delay = conf.read('mac_test').number('unreachable_backoff_s')
+            offload.write_backoff(time() + delay, TARGET, strict=True)
+        except (conf.Unusable, OSError) as backoff_error:
+            error.add_note(f'Cannot record the {TARGET} backoff: {backoff_error}')
+        raise
     with bundle_refs(repo, source, request['attempt']) as prefix:
         if isinstance(guest, EmptyGuestMain):
             reason = BundleReason.FIRST_RUN
@@ -728,13 +764,17 @@ def completed_run(reply: GuestReply, request: GuestRequest, source: CandidateSou
         if row.get(key) != request[key]:
             raise GuestUnavailable(f'the guest result has a different {key}')
     run = gate_box.decode_run(row['gate'])
-    modules = tuple(f'scripts/{job.suite}/{job.module}' for job in run.jobs)
-    if (len(modules) != len(source.modules) or frozenset(modules) != source.modules
-            or any(job.kind is not GateJobKind.TEST_MODULE for job in run.jobs)):
+    test_jobs = tuple(job for job in run.jobs if job.kind is GateJobKind.TEST_MODULE)
+    modules = tuple(f'scripts/{job.suite}/{job.module}' for job in test_jobs)
+    if len(modules) != len(source.modules) or frozenset(modules) != source.modules:
         raise GuestUnavailable('the guest result has a different module list')
+    type_jobs = tuple((job.kind, job.suite, job.module) for job in run.jobs if job.kind is not GateJobKind.TEST_MODULE)
+    expected = ((GateJobKind.TYPE_CHECK, *TYPE_CHECK_JOB),) if request['type_dirs'] else ()
+    if type_jobs != expected:
+        raise GuestUnavailable('the guest result has a different type-check job list')
     if row.get('verdict') != ('pass' if run.passed else 'fail'):
         raise GuestUnavailable('the guest result has an invalid verdict')
-    skips = {path: job.times['skipped'] for path, job in zip(modules, run.jobs, strict=True)
+    skips = {path: job.times['skipped'] for path, job in zip(modules, test_jobs, strict=True)
              if isinstance(job.times, dict)}
     return MacLinuxGateRun(run.jobs, run.seconds, run.peak_memory_mib, run.tests_reused, run.selection_certified,
                            run.executions, run.time_limit_report, coverage=source.coverage,
@@ -743,17 +783,20 @@ def completed_run(reply: GuestReply, request: GuestRequest, source: CandidateSou
 
 
 def route(repo: Path, *, mode: SuiteMode, full: bool, module_time_limit_s: float,
-          selected: AllModules | TreeSelection, gate_job: StepJob | GateJobNotRecorded) -> GateRun | str:
-    """Return the guest gate result or a reason for the natedev fallback."""
+          selected: AllModules | TreeSelection, gate_job: StepJob | GateJobNotRecorded,
+          type_dirs: Sequence[str] = ()) -> GateRun | str:
+    """Return the guest gate result or the reason the guest route failed."""
     from scripts.aws_target import cloud_gate
     from scripts.build_queue.admission_client import step_identity
     from scripts.production import affected_modules, gate
 
     try:
         registry = conf.read('build_targets')
-        if registry.value(f'enabled.{TARGET}', GuestSwitch, recover_invalid=False) is GuestSwitch.OFF:
+        if not eligibility.mac_linux_enabled(registry):
             return f'{TARGET} is off (build_targets.conf enabled.{TARGET}=off)'
         settings = read_settings(registry)
+        if isinstance(eligibility.read_backoff(time(), TARGET), eligibility.ActiveBackoff):
+            return f'{TARGET}: guest unreachable during retry backoff'
         if not math.isfinite(module_time_limit_s) or module_time_limit_s <= 0:
             raise GuestUnavailable('the module time limit must be positive and finite')
         repo = repo.resolve()
@@ -763,9 +806,11 @@ def route(repo: Path, *, mode: SuiteMode, full: bool, module_time_limit_s: float
         if not unit:
             raise GuestUnavailable('the gate has no owner unit for a numbered copy')
         source = candidate_source(repo, selected)
+        relative_type_dirs = [(repo / name).resolve().relative_to(repo).as_posix() for name in type_dirs]
         request = GuestRequest(attempt=uuid4().hex, commit=source.commit, tree=source.tree,
                                origin_main=source.origin_main, mode=mode.wire, full=full,
                                selection=list(selected.paths) if isinstance(selected, TreeSelection) else 'all',
+                               type_dirs=relative_type_dirs,
                                module_time_limit_s=module_time_limit_s, run_time_limit_seconds=settings.run_time_limit_seconds,
                                jobs=settings.jobs, unit=unit)
         with mac_linux_reservation(repo, mode, gate_job):
@@ -778,6 +823,12 @@ def route(repo: Path, *, mode: SuiteMode, full: bool, module_time_limit_s: float
             GateRefused, affected_modules.GraphError) as error:
         notes = cast(list[str], getattr(error, '__notes__', []))
         return f'{TARGET}: ' + ' '.join((str(error), *notes))
+
+
+def sandboxed_suite_command(tmp: Path, command: Sequence[str]) -> list[str]:
+    # Mount the guest root before mounting proc for the new PID namespace.
+    return ['bwrap', '--die-with-parent', '--unshare-pid', '--dev-bind', '/', '/',
+            '--proc', '/proc', '--bind', str(tmp), '/tmp', '--tmpfs', '/dev/shm', '--', *command]
 
 
 def run_guest(request_path: Path) -> int:
@@ -807,13 +858,16 @@ def run_guest(request_path: Path) -> int:
                            'XDG_CACHE_HOME': str(home / '.cache'), 'TMPDIR': str(tmp),
                            'CARGO_HOME': str(home / '.cargo'), 'RUSTUP_HOME': str(home / '.rustup'),
                            'PATH': str(binaries) + os.pathsep + os.environ['PATH']}
+            if request['type_dirs']:
+                environment['GATE_STATE_DIR'] = str(runtime / 'gate-state')
             # The -c entry selects the numbered copy as the Python checkout.
             command = ['./scripts/lib/py', '-X', f'cpu_count={request["jobs"]}',
                        '-c', 'import runpy, sys; runpy.run_path(sys.argv[1], run_name="__main__")',
                        str(Path(__file__).resolve()), str(request_path), '--run-copy']
             if shutil.which('dbus-run-session'):
                 command[:0] = ['dbus-run-session', '--']
-            return subprocess.run(command, cwd=copy.path, env=environment, stdin=subprocess.DEVNULL, check=False,
+            return subprocess.run(sandboxed_suite_command(tmp, command), cwd=copy.path, env=environment,
+                                  stdin=subprocess.DEVNULL, check=False,
                                   pass_fds=build_folders.held_build_folder_descriptors()).returncode
 
 
@@ -833,6 +887,14 @@ def run_copy(request_path: Path) -> None:
     request = guest_request(request_path)
     if os.cpu_count() != request['jobs']:
         raise GuestUnavailable(f'The guest Python did not set the CPU count to {request["jobs"]}.')
+    type_dirs = tuple((repo / name).resolve() for name in request['type_dirs'])
+    if any(not path.is_relative_to(repo) for path in type_dirs):
+        raise GuestUnavailable('A type-check path leaves the numbered copy.')
+    if type_dirs:
+        for key, program in (('GATE_BASEDPYRIGHT', 'basedpyright'), ('GATE_UV', 'uv')):
+            tool = os.environ.get(key, program)
+            if shutil.which(tool) is None:
+                raise GuestUnavailable(f'The guest cannot find the type-check tool {tool}.')
     descriptors = (int(os.environ[build_folders.NUMBERED_COPY_LOCK_ENV]), RUN_LOCK_FD)
     refs = subprocess.check_output(['git', 'rev-parse', 'HEAD', ORIGIN_MAIN, 'HEAD^{tree}'], cwd=repo,
                                    text=True, pass_fds=descriptors).splitlines()
@@ -846,7 +908,8 @@ def run_copy(request_path: Path) -> None:
     token = copies.COMMAND_LOCKS.set(descriptors)
     try:
         with build_folders.inherit_build_lock(RUN_LOCK_FD), redirect_stdout(sys.stderr):
-            run = gate.run_suites(repo, full=request['full'], mode=SuiteMode(request['mode']), machine=machine,
+            run = gate.run_suites(repo, type_dirs=tuple(map(str, type_dirs)), full=request['full'],
+                                  mode=SuiteMode(request['mode']), machine=machine,
                                   selected=ALL_MODULES if selection == 'all' else SelectedModules(tuple(selection)),
                                   module_time_limit_s=request['module_time_limit_s'],
                                   time_limit=GateTimeLimit(request['run_time_limit_seconds']))
