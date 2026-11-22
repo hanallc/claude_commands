@@ -118,6 +118,12 @@ class TurnEndTests(unittest.TestCase):
         self.case.setUp()
         self.addCleanup(self.case.doCleanups)
 
+    def _copy_detached_run_config(self) -> None:
+        source = Path(__file__).resolve().parents[2] / "config"
+        config = self.case.fixture.root / "conf"
+        for name in ("detached_runs.conf", "postmaster.conf", "codex_daemon.conf"):
+            _ = shutil.copyfile(source / name, config / name)
+
     def test_native_hook_inputs_complete_each_family_once_and_close_its_pane(self) -> None:
         cases = [(family, close, "current") for family in ("codex", "claude")
                  for close in ("closed", "setup", "outside")]
@@ -1368,10 +1374,7 @@ class TurnEndTests(unittest.TestCase):
         self.assertEqual(sum(": done; reply " in message for message in self.case.agent.notices), 1)
 
     def test_a_detached_result_reaches_the_idle_worker_in_both_completion_orders(self) -> None:
-        source = Path(__file__).resolve().parents[2] / "config"
-        config = self.case.fixture.root / "conf"
-        for name in ("detached_runs.conf", "postmaster.conf", "codex_daemon.conf"):
-            _ = shutil.copyfile(source / name, config / name)
+        self._copy_detached_run_config()
         cases = ((True, False, False), (False, False, False), (True, True, False), (True, True, True))
         for finishes_during_turn, self_stop, transcript_unavailable in cases:
             with self.subTest(finishes_during_turn=finishes_during_turn, self_stop=self_stop,
@@ -1502,6 +1505,7 @@ class TurnEndTests(unittest.TestCase):
                     self.assertNotIn(pane, self.case.fixture.world.locations)
 
     def test_supervisor_sends_the_notice_after_the_command_changes_completion_sources(self) -> None:
+        self._copy_detached_run_config()
         status = self.case.run_dir / "completion.status"
         self.assertIs(worker.dispatch(self.case.fixture.parent.id, staff.WorkerName.parse("impl"), "impl",
             self.case.prompt, session_dir=self.case.run_dir, slot="impl", phase="8", kind="impl",
@@ -1561,6 +1565,7 @@ class TurnEndTests(unittest.TestCase):
         self.assertNotIn(pane, self.case.fixture.world.locations)
 
     def test_reap_retries_completion_after_the_transcript_becomes_readable(self) -> None:
+        self._copy_detached_run_config()
         self.assertIs(self.case.dispatch(), worker.DispatchSubmission.SUBMITTED)
         pane = self.case.agent.submitted[-1][0]
         row = self.case.agent.row(pane)
@@ -1586,10 +1591,7 @@ class TurnEndTests(unittest.TestCase):
         self.assertEqual(len(self.case.agent.notices), 1)
 
     def test_a_torn_final_reply_keeps_run_completion_pending_after_receipt_recovery(self) -> None:
-        config = self.case.fixture.root / "conf"
-        source = Path(__file__).resolve().parents[2] / "config"
-        for name in ("detached_runs.conf", "postmaster.conf", "codex_daemon.conf"):
-            _ = shutil.copyfile(source / name, config / name)
+        self._copy_detached_run_config()
         self.case.agent.finish_after = 1
         self.assertIs(self.case.dispatch(), worker.DispatchSubmission.SUBMITTED)
         pane = self.case.agent.submitted[-1][0]
