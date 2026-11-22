@@ -54,10 +54,14 @@ buildlog query "SELECT module, module_started_at, module_ended_at FROM gate_modu
 
 ## Whole gate route
 
-The Mac Linux guest runs the whole test selection when `enabled.mac-linux=on` and the queue assigns the gate to `mac-linux`.
 The gate reads the target from the bounded assignment file at `BUILDLOG_PLACEMENT_FILE`.
 The assignment must match the gate's placement episode and submitting process.
 The queue must confirm that the saved attempt is current.
+If the gate cannot verify a supplied assignment, it reports the reason and starts no runner.
+An assignment to `natedev` runs the gate on natedev.
+An assignment to `aws` runs the gate in AWS and reports a cloud refusal as a failure.
+The AWS route refuses assigned gates that request type checks.
+An assignment to `mac-linux` runs the whole test selection in the Mac Linux guest when `enabled.mac-linux=on`.
 The gate reads the guest switch after it confirms the `mac-linux` assignment.
 If `enabled.mac-linux=off`, the assigned gate fails and reports the switch.
 The guest test timer uses `run.time_limit_seconds`.
@@ -75,9 +79,10 @@ If the wait expires, the gate fails with `guest unreachable` and the guest alias
 The route sends no more cleanup requests. The guest run keeps its lock until it ends.
 If the guest cannot return a result, the gate fails and reports the guest and the reason.
 If the guest returns a failure, the gate reports the guest and the failed jobs.
-A targeted gate can reuse a certified test pass. The guest runs any requested type checks.
-The gate uses the cloud route when it has no current `mac-linux` assignment and needs to run the test selection.
-If the cloud route returns a fallback reason, natedev runs the selection.
+A targeted gate can reuse a certified test pass. The guest runs any requested type checks on the Mac.
+When `BUILDLOG_PLACEMENT_FILE` is unset, the gate tries AWS first if it needs to run the test selection.
+If AWS refuses that unassigned run, natedev runs the selection.
+A current assignment to an unsupported target fails and reports the target.
 
 ## Cloud gate route
 
