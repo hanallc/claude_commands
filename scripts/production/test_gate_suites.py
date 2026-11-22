@@ -418,6 +418,90 @@ class MergeGateSuitesTests(GateSuitesFixture):
         self.assertEqual(self.pass_records(), [])
         self.assertEqual(marker.read_text(), notice)
 
+    @gate_suites("hooks")
+    def test_cloud_fallback_refuses_an_unreadable_tree_at_pass_publication(self) -> None:
+        from scripts.aws_target import cloud_gate
+
+        tested = gate.clean_test_tree(self.checkout)
+        for ledger_unavailable in (False, True):
+            with (self.subTest(ledger_unavailable=ledger_unavailable),
+                  mock.patch.dict(os.environ, self.environment),
+                  mock.patch.object(cloud_gate, "route", return_value="fixture cloud unavailable"),
+                  mock.patch.object(gate, "clean_test_tree", side_effect=[
+                      tested, GateRefused("fixture publication tree read failed")]),
+                  contextlib.redirect_stdout(io.StringIO()) as output):
+                if ledger_unavailable:
+                    unavailable = self.state / "unreadable-pass-ledger"
+                    self.write(unavailable, "The ledger directory is a file.\n")
+                    os.environ["GATE_PASSED_DIR"] = str(unavailable)
+                with self.assertRaisesRegex(GateRefused, "^fixture publication tree read failed$"):
+                    _ = gate.run_gate_suites(self.checkout)
+                self.assertEqual("Test pass ledger unavailable" in output.getvalue(), ledger_unavailable)
+        self.assertEqual(self.pass_records(), [])
+
+    @gate_suites("hooks")
+    def test_cloud_fallback_keeps_the_marker_when_the_pass_append_fails(self) -> None:
+        from scripts.aws_target import cloud_gate
+
+        marker, notice = self.write_nightly_red_marker()
+        path = Path(self.environment["GATE_PASSED_DIR"]) / "passed-trees.jsonl"
+        path.mkdir(parents=True)
+        with (mock.patch.dict(os.environ, self.environment),
+              mock.patch.object(cloud_gate, "route", return_value="fixture cloud unavailable"),
+              contextlib.redirect_stdout(io.StringIO()) as output):
+            self.assertTrue(gate.run_gate_suites(self.checkout).passed)
+            self.assertIn(f"Is a directory: '{path}'", output.getvalue())
+            self.assertEqual(marker.read_text(), notice)
+            self.assertEqual(list(path.iterdir()), [])
+
+            modules = discover_test_modules(self.checkout)
+            with (mock.patch.object(gate, "discover_test_modules", side_effect=[
+                      modules, OSError("fixture coverage read failed")]),
+                  self.assertRaisesRegex(GateRefused, "^fixture coverage read failed$")):
+                _ = gate.run_gate_suites(self.checkout)
+
+            self.assertEqual(marker.read_text(), notice)
+            self.assertEqual(list(path.iterdir()), [])
+
+    @gate_suites("hooks")
+    def test_cloud_fallback_accepts_matching_clean_dirty_and_index_only_sources(self) -> None:
+        from scripts.aws_target import cloud_gate
+
+        subject = self.checkout / "subject.txt"
+        finish = gate.finish_gate_job
+
+        def stage_other_contents(job: gate.RunningGateJob, status: int) -> gate.GateJobResult:
+            completed = finish(job, status)
+            blob = self.git(self.checkout, "rev-parse", "HEAD:scripts/hooks/test_first.py")
+            _ = self.git(self.checkout, "update-index", "--cacheinfo", f"100644,{blob},subject.txt")
+            return completed
+
+        with (mock.patch.dict(os.environ, self.environment),
+              mock.patch.object(cloud_gate, "route", return_value="fixture cloud unavailable"),
+              contextlib.redirect_stdout(io.StringIO())):
+            clean_tree, dirty = cloud_gate.working_tree(self.checkout)
+            self.assertEqual(dirty, set())
+            self.assertTrue(gate.run_gate_suites(self.checkout, full=True).passed)
+            original, = self.pass_records()
+            self.assertEqual(original["tree"], clean_tree)
+
+            self.write(subject, "working contents stay dirty throughout the gate\n")
+            dirty_tree, dirty = cloud_gate.working_tree(self.checkout)
+            self.assertNotEqual(dirty_tree, clean_tree)
+            self.assertEqual(dirty, {"subject.txt"})
+            self.assertTrue(gate.run_gate_suites(self.checkout, full=True).passed)
+            self.assertEqual(self.pass_records(), [original])
+            _ = self.git(self.checkout, "restore", "subject.txt")
+
+            marker, notice = self.write_nightly_red_marker()
+            with mock.patch.object(gate, "finish_gate_job", side_effect=stage_other_contents):
+                self.assertTrue(gate.run_gate_suites(self.checkout, full=True).passed)
+            self.assertEqual(cloud_gate.working_tree(self.checkout), (clean_tree, {"subject.txt"}))
+            self.assertEqual(self.git(self.checkout, "diff", "--cached", "--name-only"), "subject.txt")
+            self.assertTrue(gate.run_gate_suites(self.checkout, full=True).passed)
+            self.assertEqual(marker.read_text(), notice)
+            self.assertEqual(self.pass_records(), [original])
+
     @gate_suites("hooks", "direct")
     def test_whole_machine_orders_modules_from_supplied_times_without_writing_them(self) -> None:
         path = self.state / "module_seconds.json"

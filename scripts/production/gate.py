@@ -1221,6 +1221,13 @@ def matches_routed_gate_tree(repo: Path, tree: str) -> bool:
     return isinstance(expected, NoRoutedGateTree) or expected.repo != repo or expected.tree == tree
 
 
+def routed_source_tree(cloud: CloudGateRoute, repo: Path) -> str:
+    try:
+        return cloud.working_tree(repo)[0]
+    except (affected_modules.GraphError, OSError, ValueError, subprocess.CalledProcessError) as error:
+        raise GateRefused(str(error)) from error
+
+
 def clean_test_tree(repo: Path) -> CleanTestTree | UnrecordableTestTree:
     try:
         paths = sorted(affected_modules.dirty_paths(repo))
@@ -1238,6 +1245,13 @@ class NoFullRunRequired:
 
 
 NO_FULL_RUN_REQUIRED = NoFullRunRequired()
+
+
+@dataclass(frozen=True)
+class ValidatedTestPass:
+    tree: CleanTestTree
+    selection: AffectedSelection | FullSuite
+    required: FullSuite | NoFullRunRequired
 
 
 @dataclass
@@ -1320,39 +1334,27 @@ class PassedTreeLedger:
     def record_pass(self, selection: AffectedSelection | FullSuite, *,
                     discovered: Sequence[tuple[str, Path]] = (),
                     required: FullSuite | NoFullRunRequired = NO_FULL_RUN_REQUIRED) -> None:
-        if self.unavailable or isinstance(self.tree, UnrecordableTestTree):
+        PendingTestPass(self, selection, discovered, required).publish_local()
+
+    def append_pass(self, passed: ValidatedTestPass) -> None:
+        if self.unavailable:
             return
         try:
-            modules_match = not discovered or list(discovered) == discover_test_modules(self.repo)
-            ending = clean_test_tree(self.repo)
-        except (GateRefused, OSError, ValueError) as error:
-            self.report_error(error)
-            return
-        if (not isinstance(ending, CleanTestTree) or ending.tree != self.tree.tree
-                or not matches_routed_gate_tree(self.repo, self.tree.tree)):
-            routed = ACTIVE_ROUTED_GATE_TREE.get()
-            if isinstance(routed, RoutedGateTree) and routed.repo == self.repo:
-                raise GateRefused("The checkout changed during the gate")
-            return
-        if not modules_match:
-            return
-        try:
-            record = {"tree": self.tree.tree, "commit": self.tree.commit,
+            record = {"tree": passed.tree.tree, "commit": passed.tree.commit,
                       "at": datetime.now(UTC).isoformat(), "host": host_name(),
                       "checkout": str(self.repo.resolve()), "suites": self.suites, "source": self.source,
-                      "kind": "full" if isinstance(selection, FullSuite) else "affected"}
-            if isinstance(selection, FullSuite):
-                record["reason"] = selection.reason
+                      "kind": "full" if isinstance(passed.selection, FullSuite) else "affected"}
+            if isinstance(passed.selection, FullSuite):
+                record["reason"] = passed.selection.reason
             self.path.parent.mkdir(parents=True, exist_ok=True)
             with self.path.open("a", encoding="utf-8") as ledger:
                 line = (json.dumps(record) + "\n").encode("utf-8")
                 if os.write(ledger.fileno(), line) != len(line):
                     raise OSError("incomplete test pass write")
-        except (GateRefused, OSError, ValueError) as error:
+            if isinstance(passed.required, FullSuite):
+                (gate_state_dir() / "full-required").unlink(missing_ok=True)
+        except (OSError, ValueError) as error:
             self.report_error(error)
-            return
-        if isinstance(required, FullSuite):
-            (gate_state_dir() / "full-required").unlink(missing_ok=True)
 
 
 @dataclass(frozen=True)
@@ -1362,8 +1364,38 @@ class PendingTestPass:
     discovered: Sequence[tuple[str, Path]]
     required: FullSuite | NoFullRunRequired
 
-    def publish(self) -> None:
-        self.ledger.record_pass(self.selection, discovered=self.discovered, required=self.required)
+    def observe_checkout(self) -> tuple[CleanTestTree | UnrecordableTestTree, bool]:
+        repo = self.ledger.repo
+        modules_match = not self.discovered or list(self.discovered) == discover_test_modules(repo)
+        return clean_test_tree(repo), modules_match
+
+    def publish_if_eligible(self, ending: CleanTestTree | UnrecordableTestTree, modules_match: bool) -> None:
+        tested = self.ledger.tree
+        if (modules_match and isinstance(tested, CleanTestTree) and isinstance(ending, CleanTestTree)
+                and tested.tree == ending.tree):
+            self.ledger.append_pass(ValidatedTestPass(tested, self.selection, self.required))
+
+    def publish_local(self) -> None:
+        if self.ledger.unavailable or isinstance(self.ledger.tree, UnrecordableTestTree):
+            return
+        try:
+            ending, modules_match = self.observe_checkout()
+        except (GateRefused, OSError, ValueError) as error:
+            self.ledger.report_error(error)
+            return
+        self.publish_if_eligible(ending, modules_match)
+
+    def finalize_routed(self, cloud: CloudGateRoute, expected_tree: str) -> None:
+        try:
+            ending, modules_match = self.observe_checkout()
+        except (OSError, ValueError) as error:
+            raise GateRefused(str(error)) from error
+        ending_tree = (ending.tree if isinstance(ending, CleanTestTree)
+                       else routed_source_tree(cloud, self.ledger.repo))
+        tested = self.ledger.tree
+        if ending_tree != expected_tree or (isinstance(tested, CleanTestTree) and tested.tree != expected_tree):
+            raise GateRefused("The checkout changed during the gate")
+        self.publish_if_eligible(ending, modules_match)
 
 
 def full_required() -> FullSuite | NoFullRunRequired:
@@ -1900,7 +1932,7 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
         if isinstance(routed, RoutedGateTree) and routed.repo == repo:
             routed.pending_pass = pending_pass
         else:
-            pending_pass.publish()
+            pending_pass.publish_local()
     return run
 
 
@@ -2944,7 +2976,7 @@ def run_gate_suites(repo: Path, type_dirs: Sequence[str] = (),
 
     def run_cloud(selection: AllModules | TreeSelection) -> GateRun:
         try:
-            tree = cloud.working_tree(repo)[0] if isinstance(selection, AllModules) else selection.tree
+            tree = routed_source_tree(cloud, repo) if isinstance(selection, AllModules) else selection.tree
             routed = RoutedGateTree(repo, tree)
             token = ACTIVE_ROUTED_GATE_TREE.set(routed)
             try:
@@ -2958,10 +2990,10 @@ def run_gate_suites(repo: Path, type_dirs: Sequence[str] = (),
                     run = combine_gate_runs(outcome, local, seconds=outcome.seconds + local.seconds)
                 else:
                     run = outcome
-                if cloud.working_tree(repo)[0] != tree:
+                if routed_source_tree(cloud, repo) != tree:
                     raise GateRefused("The checkout changed during the gate")
                 if isinstance(routed.pending_pass, PendingTestPass):
-                    routed.pending_pass.publish()
+                    routed.pending_pass.finalize_routed(cloud, tree)
             finally:
                 ACTIVE_ROUTED_GATE_TREE.reset(token)
         except affected_modules.GraphError as error:
