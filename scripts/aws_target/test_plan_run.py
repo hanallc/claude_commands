@@ -16,7 +16,7 @@ from scripts.aws_target import admin_secrets, aws_trial, deploy, hana_box, hana_
 from scripts.aws_target.config import DeploymentSettings
 from scripts.aws_target.control_test_support import TestClock
 from scripts.aws_target.controller_lock import HanaCommandAccess, account_stack_lock, control_lock, hana_command_lock
-from scripts.aws_target.ledger_test_support import CostFixture, text_setting
+from scripts.aws_target.ledger_test_support import CostFixture, text_setting, set_hana_switch
 from scripts.aws_target.test_hana_box import IDENTITY, FakeProvider, record_lifecycle_image, write_lifecycle_configuration
 from scripts.lib import conf
 from scripts.lib.file_lock import LockResult
@@ -368,7 +368,7 @@ class PlanSetupTests(CostFixture):
 
     def test_plan_blocks_claims_after_the_idle_check_and_through_the_last_simulation(self) -> None:
         workload = conf.path('hana_aws')
-        text_setting(workload, 'enabled', 'on')
+        set_hana_switch(self.root, 'on')
         self.prepare_hana()
         controller = hana_box.HanaController(self.state, self.settings, workload, hana_box.ProviderNotInstalled())
         blocked: list[str] = []
@@ -418,7 +418,7 @@ class PlanSetupTests(CostFixture):
 
     def test_claimed_box_refuses_without_waiting_or_creating_a_change_set(self) -> None:
         workload = conf.path('hana_aws')
-        text_setting(workload, 'enabled', 'on')
+        set_hana_switch(self.root, 'on')
         self.prepare_hana()
         controller = hana_box.HanaController(self.state, self.settings, workload, hana_box.ProviderNotInstalled())
         with mock.patch.object(controller, 'image_is_current', return_value=True):

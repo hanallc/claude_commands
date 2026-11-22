@@ -13,9 +13,10 @@ from pathlib import Path
 from typing import TYPE_CHECKING, TypedDict, final
 
 from scripts.build_queue.admission_records import PackageNotRecorded, RunningStep, WaitingStep
-from scripts.build_targets import build_targets, targets
-from scripts.build_targets.target_config import ConfigError, ExcludedTarget, SshTarget, StepRoute, LocalRequired, PinnedTarget, MacOnly
+from scripts.build_targets import build_targets, machine_switch, targets
+from scripts.build_targets.target_config import MAC_DISABLED_REASON, ConfigError, ExcludedTarget, SshTarget, StepRoute, LocalRequired, PinnedTarget, MacOnly
 from scripts.direct import step_record
+from scripts.lib import conf
 from scripts.message import unit_labels
 
 if TYPE_CHECKING:
@@ -40,6 +41,7 @@ class SnapshotsUnreadable:
 
 
 Snapshots = tuple[targets.TargetSnapshot, ...] | SnapshotsUnreadable
+NO_DISABLED_MAC_TARGETS: frozenset[str] = frozenset()
 
 
 def read_snapshots() -> Snapshots:
@@ -48,6 +50,23 @@ def read_snapshots() -> Snapshots:
         return targets.target_snapshots()
     except (ConfigError, OSError, UnicodeError) as error:
         return SnapshotsUnreadable(str(error))
+
+
+def read_disabled_mac_targets() -> frozenset[str]:
+    """Read the Mac switch and target names from the same registry."""
+    settings = conf.read("build_targets").settings
+    if not isinstance(settings, dict):
+        return NO_DISABLED_MAC_TARGETS
+    values = {name: setting.value for name, setting in settings.items()}
+    try:
+        switch = machine_switch.read(machine_switch.Machine.MAC, values)
+    except machine_switch.MachineSwitchError:
+        return NO_DISABLED_MAC_TARGETS
+    if switch is machine_switch.MachineSwitch.ON:
+        return NO_DISABLED_MAC_TARGETS
+    return frozenset({"mac", *(name.removeprefix("platform.")
+                               for name, value in values.items()
+                               if name.startswith("platform.") and value == "macos")})
 
 
 def holder_sessions(snapshots: Snapshots) -> list[str]:
@@ -92,7 +111,7 @@ def unavailable_row(target: str, reason: str) -> TargetRow:
 
 DYNAMIC_REASONS = frozenset({"backoff", "state"})
 # Plain words for the static Mac exclusions; other reasons show as recorded.
-EXCLUSION_TEXT = {"off": "Mac offload is off", "repo": "this repository does not run on the Mac"}
+EXCLUSION_TEXT = {"off": MAC_DISABLED_REASON, "repo": "this repository does not run on the Mac"}
 
 
 @dataclass(frozen=True)
@@ -132,7 +151,9 @@ def mac_reason(fit: TargetFit | NoMacTarget) -> str:
 class MacRoutes:
     """Say, for each natedev step, whether it may run on the Mac, and why not."""
 
-    def __init__(self, snapshots: Snapshots, labels: Mapping[str, unit_labels.UnitLabels], zone: tzinfo) -> None:
+    def __init__(self, snapshots: Snapshots, labels: Mapping[str, unit_labels.UnitLabels], zone: tzinfo,
+                 *, disabled_mac_targets: frozenset[str] = NO_DISABLED_MAC_TARGETS) -> None:
+        self.disabled_mac_targets: frozenset[str] = disabled_mac_targets
         self.mac: targets.TargetSnapshot | NoMacTarget | SnapshotsUnreadable = (
             snapshots if isinstance(snapshots, SnapshotsUnreadable)
             else next((snapshot for snapshot in snapshots if snapshot.target.platform == "macos"), NoMacTarget()))
@@ -147,7 +168,9 @@ class MacRoutes:
 
     def route_fit(self, route: StepRoute, step: str, folder: str,
                   package: str | PackageNotRecorded) -> TargetFit | NoMacTarget:
-        """Apply the recorded route before the target policy and state."""
+        """Apply the switch and route before the target policy and state."""
+        if self.mac_disabled_for(route):
+            return NotAllowed(MAC_DISABLED_REASON)
         if isinstance(route, LocalRequired):
             reason = route.reason
             if reason == "step writes the tree":
@@ -207,9 +230,15 @@ class MacRoutes:
             self.policies[key] = fit
         return self.policies[key]
 
+    def mac_disabled_for(self, route: StepRoute) -> bool:
+        """Check whether the switch excludes the Mac from this route."""
+        return bool(self.disabled_mac_targets) and not isinstance(route, LocalRequired) and (
+            not isinstance(route, PinnedTarget) or self.is_mac(route.target))
+
     def is_mac(self, target: str) -> bool:
         """Say whether a pinned target name is the Mac target."""
-        return isinstance(self.mac, targets.TargetSnapshot) and self.mac.target.name == target
+        return target in self.disabled_mac_targets or (
+            isinstance(self.mac, targets.TargetSnapshot) and self.mac.target.name == target)
 
     def blocked(self) -> bool:
         """The Mac card shows the block, so the idle alert omits its copy."""

@@ -42,7 +42,7 @@ class HanaGuestTests(unittest.TestCase):
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.config_path = self.root / 'hana_aws.conf'
-        _ = self.config_path.write_text('''enabled=off
+        _ = self.config_path.write_text('''\
 # whole: 1..
 guard_grace_seconds=60
 # whole: 1..
@@ -56,7 +56,7 @@ step_memory_gib=24
 # whole: 1..
 mount_timeout_seconds=15
 ''')
-        self.settings = guest.read_settings(conf.read(self.config_path))
+        self.settings = guest.read_settings(conf.read(self.config_path), enabled=False)
         self.paths = guest.GuestPaths(self.root / 'state', self.root / 'boot-id')
         self.paths.directory.mkdir()
         _ = self.paths.boot_id.write_text(self.boot_id)
@@ -92,7 +92,7 @@ mount_timeout_seconds=15
         with (mock.patch('socket.gethostname', return_value='testhost'),
               mock.patch.object(conf, '_committed_files', return_value=iter((committed,))),
               redirect_stderr(io.StringIO()) as warnings):
-            settings = guest.read_settings(conf.read(self.config_path))
+            settings = guest.read_settings(conf.read(self.config_path), enabled=False)
 
         self.assertEqual(settings.guard_grace_seconds, self.settings.guard_grace_seconds)
         self.assertIn(f"{self.config_path}: guard_grace_seconds='0'", warnings.getvalue())
@@ -297,7 +297,7 @@ mount_timeout_seconds=15
         self.assertEqual(json.loads(files['safety.json'].content), asdict(self.settings))
         _ = self.config_path.write_text(self.config_path.read_text().replace('watchdog_check_seconds=10',
                                                                             'watchdog_check_seconds=11'))
-        settings = guest.read_settings(conf.read(self.config_path))
+        settings = guest.read_settings(conf.read(self.config_path), enabled=False)
         self.assertEqual(settings.watchdog_check_seconds, 11)
 
     def test_far_future_expiry_grants_no_permission(self) -> None:

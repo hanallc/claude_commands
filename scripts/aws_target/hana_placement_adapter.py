@@ -13,6 +13,8 @@ import sys
 import time
 from typing import TYPE_CHECKING, cast
 
+from scripts.build_targets import machine_switch
+
 from scripts.aws_target import gpu_size_trial, hana_box as box, hana_execution, hana_spend, ledger
 from scripts.aws_target.hana_placement import (
     ExecutionTransport, HanaControlTransport, HanaHostGeneration,
@@ -60,7 +62,7 @@ def read_settings(configuration: conf.ConfigRead) -> HanaRouteSettings:
             raise ValueError('Hana permits only check and lint judgments')
         return cast('tuple[placement.CommandKind, ...]', kinds)
 
-    if not configuration.value('enabled', conf.on_off):
+    if machine_switch.read(machine_switch.Machine.HANA_AWS) is machine_switch.MachineSwitch.OFF:
         return DisabledHanaRoute()
     key = configuration.value('repository_identity', repository_key)
     kinds = configuration.value('kinds', permitted_kinds)
@@ -480,7 +482,7 @@ def gpu_setup(transport: HanaGpuNextestTransport, *, configuration: conf.ConfigR
 
     try:
         settings = conf.read(transport.settings) if configuration is None else configuration
-        if settings.text('hana_gpu_route_enabled') != 'on':
+        if machine_switch.read(machine_switch.Machine.HANA_GPU) is machine_switch.MachineSwitch.OFF:
             return HanaStepRefused(GPU_SETUP_REQUIRED)
         sizes = tuple(settings.words('hana_gpu_instance_types'))
         record = claim_state.read_json_object(ssh_target_state_directory('aws') / 'gate-deployment.json')

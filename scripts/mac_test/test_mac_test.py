@@ -972,7 +972,6 @@ finally:
                 self.assertFalse((self.state_directory / "run.json").exists())
 
     def test_a_memory_wait_reservation_cannot_transfer_after_another_session_blocks_the_mac(self) -> None:
-        self.write_config(offload="on")
         waiter = self.start_child()
         runner = self.start_child()
         claimed = self.command("claim", "--pid", str(waiter.pid),
@@ -988,7 +987,6 @@ finally:
         self.assertEqual(self.run_state(), before)
 
     def test_free_now_reads_past_own_block_to_free_or_busy(self) -> None:
-        self.write_config(offload="on")
         _ = self.write_block(session=fixture_runtime_id("session-a"), free_message={"kind": "not_needed"})
         environment = self.unit_environment(fixture_runtime_id("session-a"))
         self.assert_command(self.command("free-now", environment=environment), 0, "free\n")
@@ -1190,9 +1188,9 @@ finally:
         self.assertEqual(path.read_bytes(), before)
 
     def test_free_now_answers_from_local_state_alone(self) -> None:
-        self.write_config(offload="off")
+        _ = write_config_fixture(self.root / "build_targets.conf", "enabled.mac=off\n")
         self.assert_command(self.command("free-now"), 1, "off\n")
-        self.write_config(offload="on")
+        _ = write_config_fixture(self.root / "build_targets.conf", "enabled.mac=on\n")
         self.assert_command(self.command("free-now"), 0, "free\n")
 
         owner = self.start_child()
@@ -1218,9 +1216,10 @@ finally:
         (self.state_directory / "block.json").unlink()
 
         settings = self.root / "off.conf"
-        _ = write_config_fixture(settings, "offload=off\n", template="mac_test")
+        _ = write_config_fixture(settings, template="mac_test")
+        _ = write_config_fixture(self.root / "build_targets.conf", "enabled.mac=off\n")
         self.assert_command(self.command("free-now", "--settings", str(settings)), 1, "off\n")
-        self.assert_command(self.command("free-now"), 0, "free\n")
+        self.assert_command(self.command("free-now"), 1, "off\n")
         self.assertEqual(self.logged_arguments("gh"), [])
 
     def test_claim_reports_damaged_block_state(self) -> None:
@@ -1324,7 +1323,6 @@ finally:
     def test_free_now_answers_for_the_named_repository(self) -> None:
         hana, liner = self.repository("hana"), self.repository("cargo-liner")
         (hana / "crates").mkdir()
-        self.write_config(offload="on")
         path = self.state_directory / "mirror-busy-hana.until"
         path.parent.mkdir(parents=True, exist_ok=True)
         for value, answer in ((str(time.time() + 120), "busy"), (str(time.time() - 1), "free"),
@@ -1360,7 +1358,7 @@ finally:
 
     def test_copy_claim_record_status_and_free_now(self) -> None:
         hana = self.repository("hana")
-        self.write_config(offload="on", ci_repo="")
+        self.write_config(ci_repo="")
         owner = self.start_child()
         self.assert_command(self.copy_claim(owner.pid, hana), 0, "claimed\n")
         record = cast(dict[str, object], json.loads((self.state_directory / "claims" / "hana.json").read_text()))
@@ -1441,7 +1439,6 @@ finally:
 
     def test_machine_wide_record_holds_the_repository_its_worktree_is_in(self) -> None:
         hana, liner = self.repository("hana"), self.repository("cargo-liner")
-        self.write_config(offload="on")
         owner, other = self.start_child(), self.start_child()
         record = self.write_machine_wide_record(owner.pid, hana)
         legacy = self.state_directory / "run.json"
@@ -1458,7 +1455,6 @@ finally:
 
     def test_machine_wide_record_outside_any_repository_holds_every_repository(self) -> None:
         hana, liner = self.repository("hana"), self.repository("cargo-liner")
-        self.write_config(offload="on")
         owner, other = self.start_child(), self.start_child()
         record = self.write_machine_wide_record(owner.pid, self.root / "elsewhere")
         legacy = self.state_directory / "run.json"

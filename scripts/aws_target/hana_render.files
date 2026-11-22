@@ -11,6 +11,7 @@ scripts/aws_target/hana_receiver.py
 scripts/aws_target/hana_render.py
 scripts/aws_target/hana_result.py
 scripts/build_queue/execution_identity.py
+scripts/build_targets/machine_switch.py
 scripts/lib/build_folder_lock.py
 scripts/lib/conf.py
 scripts/lib/conf_reads.py

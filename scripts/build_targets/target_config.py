@@ -11,6 +11,7 @@ from pathlib import Path
 import os
 import re
 from typing import Literal
+from scripts.build_targets import machine_switch
 from scripts.build_targets.execution_transport import (
     ExecutionTransport, HanaControlTransport, HanaGpuNextestTransport, SshCommandTransport,
 )
@@ -21,6 +22,7 @@ from scripts.lib import conf
 
 
 Platform = Literal["linux", "macos"]
+MAC_DISABLED_REASON = "enabled.mac is off"
 
 
 @dataclass(frozen=True)
@@ -118,6 +120,11 @@ class CommandConfiguration:
 
     configurations: dict[Path, conf.ConfigRead] = field(default_factory=dict)
 
+    def read(self, path: Path) -> conf.ConfigRead:
+        if path not in self.configurations:
+            self.configurations[path] = conf.read(path)
+        return self.configurations[path]
+
 
 COMMAND_CONFIGURATION: ContextVar[LiveConfiguration | CommandConfiguration] = ContextVar(
     "build_target_command_configuration", default=LiveConfiguration.CURRENT)
@@ -131,6 +138,14 @@ def command_configuration() -> Generator[None]:
         yield
     finally:
         COMMAND_CONFIGURATION.reset(token)
+
+
+def read_machine_switch(machine: machine_switch.Machine) -> machine_switch.MachineSwitch:
+    """Use the same registry snapshot for target and switch reads in a command."""
+    current = COMMAND_CONFIGURATION.get()
+    if isinstance(current, CommandConfiguration):
+        return machine_switch.read(machine, current.read(conf.path("build_targets")))
+    return machine_switch.read(machine)
 
 
 class MissingSlotCapacity(Enum):
@@ -261,12 +276,7 @@ def read_targets(path: Path | None = None, *, selected: str = "", target_name: s
     if isinstance(configuration, conf.UseConfiguredValue):
         registry = conf.path("build_targets") if path is None else path
         current = COMMAND_CONFIGURATION.get()
-        if isinstance(current, CommandConfiguration):
-            if registry not in current.configurations:
-                current.configurations[registry] = conf.read(registry)
-            configuration = current.configurations[registry]
-        else:
-            configuration = conf.read(registry)
+        configuration = current.read(registry) if isinstance(current, CommandConfiguration) else conf.read(registry)
     names = _registry_value(configuration, "targets", _target_names, purpose)
     if selected and selected not in names and selected in pinned_target_names(configuration):
         names = (selected,)

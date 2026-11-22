@@ -364,12 +364,12 @@ function drawLaunchState() {
   section.dataset.kind = state.kind;
   if (state.kind === "off") {
     section.querySelector("p").replaceChildren(
-      element("strong", "Cloud gates are off"), " (cloud_gate.conf enabled=off). Gates run on natedev.");
+      element("strong", "Cloud gates are off"), " (build_targets.conf enabled.aws-gate=off). Gates run on natedev.");
     return;
   }
   if (state.kind === "invalid") {
     section.querySelector("p").replaceChildren(
-      element("strong", "cloud_gate.conf enabled is not valid."), " Gates run on natedev.");
+      element("strong", "build_targets.conf enabled.aws-gate is not valid."), " Gates run on natedev.");
     return;
   }
   const last = state.last_good_at === undefined ? "" : launchTime.format(state.last_good_at * 1000);

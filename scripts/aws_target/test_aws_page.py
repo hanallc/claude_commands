@@ -968,23 +968,23 @@ class AwsCombinedTableTests(PageCostFixture):
         self.assertEqual(unescape(marker[1]), 'passed')
 
     def test_disabled_cloud_gates_replace_the_launch_status(self) -> None:
-        self.configure_gate('enabled=off')
+        ledger_test_support.override_fixture_settings(self.root / 'build_targets.conf', 'enabled.aws-gate=off')
         self.run_browser_checks('', """
     const block = document.getElementById("launch-state");
     check(block.dataset.kind === "off", "Disabled cloud gate state");
-    check(block.innerText === "Cloud gates are off (cloud_gate.conf enabled=off). Gates run on natedev.",
+    check(block.innerText === "Cloud gates are off (build_targets.conf enabled.aws-gate=off). Gates run on natedev.",
           "The disabled state explains where gates run");
 """, blocked=True)
 
     def test_invalid_cloud_gate_switch_keeps_the_other_page_blocks(self) -> None:
-        self.configure_gate('enabled=invalid')
+        ledger_test_support.override_fixture_settings(self.root / 'build_targets.conf', 'enabled.aws-gate=invalid')
         at = ledger_test_support.instant('2026-01-15T11:59:00Z')
         with ledger.CostLedger(self.state).transaction() as evidence:
             evidence.observations.append(ledger.InstanceObservation(at, 'stopped', 'fixture'))
             evidence.inventories.append(ledger.ResourceInventory(at, (), 'fixture', builder_removed=True))
         self.run_browser_checks('?show=quota', """
     const block = document.getElementById("launch-state");
-    check(block.innerText === "cloud_gate.conf enabled is not valid. Gates run on natedev.",
+    check(block.innerText === "build_targets.conf enabled.aws-gate is not valid. Gates run on natedev.",
           "The invalid switch explains where gates run");
     check(document.querySelectorAll("#spend-tiles .tile").length === 3, "Spend still renders");
     check(document.querySelector("#price-table tbody tr"), "Quotas still render");

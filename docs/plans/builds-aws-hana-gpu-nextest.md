@@ -131,6 +131,6 @@ Cancellation stops the assigned service and runs its cleanup.
 A settled infrastructure refusal releases the slot.
 The pinned caller sees the cause and exits with status 2.
 
-The route starts disabled. Set `hana_gpu_route_enabled=on` after the gate setup GPU probe succeeds.
+Set `enabled.hana-gpu=on` in `build_targets.conf` after the gate setup GPU probe succeeds.
 The route also checks the gate deployment record for the configured GPU types.
 The live pinned run remains the proof for target order changes.

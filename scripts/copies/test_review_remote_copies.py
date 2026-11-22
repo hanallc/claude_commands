@@ -658,7 +658,7 @@ with (mock.patch.object(linux_runner, 'prepare_shell', return_value=linux_runner
         settings = self.root / "target.conf"
         _ = write_config_fixture(settings, "slots=2\n", template="mac_test")
         target = target_config.SshTarget("linux", "linux", settings)
-        config = eligibility.OffloadConfig(True, eligibility.SshConnectionSettings("host", 1, 1),
+        config = eligibility.OffloadConfig(eligibility.SshConnectionSettings("host", 1, 1),
                                       1, 1, 1, "1", {"slots": "2"})
         request = offload.OffloadRequest(self.source, "package", "call", offload.NO_RESULT_FILE, (),
                                         target="linux", owner="new-owner", holder_session="new-session")

@@ -29,7 +29,7 @@ from unittest import TestCase, mock
 from scripts.aws_target import admin_secrets, aws_cli, aws_target, aws_trial, box, config as aws_config, deploy, gate_box, gate_probe, gpu_size_trial, hana_box, hana_image, hana_render, hana_spend, ledger, plan_identity, plan_run, remote, teardown
 from scripts.aws_target.control_test_support import TestClock
 from scripts.aws_target.controller_lock import HanaCommandAccess, account_stack_lock, hana_command_lock
-from scripts.aws_target.ledger_test_support import CostFixture, account_reply, numeric_settings, text_setting, write_hana_config
+from scripts.aws_target.ledger_test_support import CostFixture, account_reply, numeric_settings, text_setting, write_hana_config, set_hana_switch
 from scripts.aws_target.hana_provider import AwsHanaProvider
 from scripts.aws_target.measurement_test_support import DAY, narrow
 from scripts.aws_target.test_box import SYSTEM, FakeTailnet, write_aws_claim
@@ -1077,7 +1077,7 @@ class HanaSetupFailureTests(CostFixture):
         subject = deploy.Deployment(self.settings, self.state, self.root / 'output',
                                     execute=scaler, clock=self.clock, notify=lambda _event: True)
         if current_guest_image:
-            text_setting(self.workload, 'enabled', 'on')
+            set_hana_switch(self.root, 'on')
         # Exercise the policy update path separately from the existing box preflight.
         _ = self.enterContext(mock.patch.object(subject, '_hana_root_replacement', return_value=False))
         prepared = subject.prepare_hana()

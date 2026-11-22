@@ -36,6 +36,7 @@ import uuid
 from scripts.build_hold import override_guard
 from scripts.build_hold.owning_session import NoOwningSession, OwningSession, owning_session
 from scripts.build_queue import admission_wire as wire
+from scripts.build_queue import placement
 from scripts.lib import conf, process_group
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.mac_test import claim_state, mac_test
@@ -62,12 +63,13 @@ def parse_placement(output: str) -> MacPlacement:
 
 def placement_arguments(episode: str, since: float, pid: int, worktree: Path, package: str,
                         kind: str, source_key: str, session: str, assignment_file: Path,
-                        argv: list[str], *, wait_events: bool) -> list[str]:
+                        argv: list[str], origin: placement.MacCommandOrigin, *, wait_events: bool) -> list[str]:
     return ["place-step", "--once", *(("--wait-events",) if wait_events else ()),
         "--episode", episode, "--since", str(since),
         "--pid", str(pid), "--repo-root", str(worktree), "--package", package, "--kind", kind,
         "--source-key", source_key, "--session-id", session, "--target", "mac",
-        "--assignment-file", str(assignment_file), "--token", "none", "--", *argv]
+        "--assignment-file", str(assignment_file), "--token", "none",
+        *(("--manual",) if isinstance(origin, placement.ManualMacCommand) else ()), "--", *argv]
 
 
 @dataclass(frozen=True)
@@ -313,6 +315,7 @@ def ended_run_callback(saved_script: str) -> tuple[Path, str]:
 class Arguments(argparse.Namespace):
     what: str = ""
     kind: str = ""
+    mac_origin: placement.MacCommandOrigin = placement.PlacedMacWork()
     package: str = ""
     worktree: Path = Path()
     cwd: str = ""
@@ -406,7 +409,7 @@ def run_attempt(
     block: claim_state.MacBlockState | mac_test.ClaimFinished = mac_test.NO_MAC_BLOCK
     remote = RemoteRun()
     prepared = False
-    placement = MacPlacement("", episode, "")
+    assigned = MacPlacement("", episode, "")
     receipts = Path.home() / RECEIPTS
     receipts.mkdir(parents=True, exist_ok=True, mode=0o700)
     assignment_file = receipts / (episode + ".json")
@@ -421,7 +424,7 @@ def run_attempt(
             while True:
                 code, output, errors = capture_command(admission_command() + placement_arguments(episode, since, pid,
                     args.worktree, args.package, args.kind, source_key, claim_state.session_id(owner),
-                    assignment_file, command, wait_events=not mac_run), capture_stderr=mac_run)
+                    assignment_file, command, args.mac_origin, wait_events=not mac_run), capture_stderr=mac_run)
                 if code in (0, MAC_BUSY_STATUS):
                     block = blocking_run(args, owner)
                 if errors and (code != MAC_BUSY_STATUS or isinstance(block, claim_state.NoMacBlock)):
@@ -446,14 +449,14 @@ def run_attempt(
                     print(output, end="", flush=True)
                 status = MAC_RUN_REFUSED_STATUS if args.lifecycle_script and code in (10, 11, 12) else code
             else:
-                placement = parse_placement(output)
-                callback_environment["MAC_QUEUE_HOST"] = placement.host
+                assigned = parse_placement(output)
+                callback_environment["MAC_QUEUE_HOST"] = assigned.host
                 clean_ended_runs(callback_environment)
                 block = blocking_run(args, owner)
                 on_close = ""
                 if isinstance(block, claim_state.NoMacBlock) and args.lifecycle_script:
                     saved: SavedRun = {"lifecycle_script": args.lifecycle_script, "arguments": original_command,
-                                       "host": placement.host}
+                                       "host": assigned.host}
                     write_text_atomic(directory / "run.json", json.dumps(saved))
                     prepared = True
                     status = run_callback(args.lifecycle_script, "prepare", argv_file, original_command,
@@ -475,7 +478,7 @@ def run_attempt(
                         status = 1
                         if args.owned_close and not on_close:
                             raise ValueError("the run needs a close hook")
-                        status = stream_remote(remote_command(placement, args.cwd, command, on_close,
+                        status = stream_remote(remote_command(assigned, args.cwd, command, on_close,
                                                               owned_close=args.owned_close), remote, ssh)
             if isinstance(block, mac_test.ClaimFinished):
                 status = MAC_RUN_REFUSED_STATUS
@@ -488,7 +491,7 @@ def run_attempt(
             safe = remote.state != RemoteState.LIVE
             if not safe and not args.owned_close:
                 try:
-                    safe = stop_remote(placement, remote)
+                    safe = stop_remote(assigned, remote)
                 except OSError:
                     safe = False
             if prepared and (safe or args.owned_close):
@@ -626,7 +629,10 @@ def main(argv: list[str] | None = None) -> int:
         return watch_caller(int(words[1]), int(words[2]))
     parser = argparse.ArgumentParser(description=__doc__)
     _ = parser.add_argument("--what", required=True)
-    _ = parser.add_argument("--kind", choices=("shot", "install", "probe", "run"), required=True)
+    _ = parser.add_argument("--kind", choices=placement.MAC_RUN_KINDS, required=True)
+    _ = parser.add_argument("--manual", dest="mac_origin", action="store_const",
+                            const=placement.ManualMacCommand(), default=placement.PlacedMacWork(),
+                            help="Mark a command that a person requests on the Mac.")
     _ = parser.add_argument("--package", required=True)
     _ = parser.add_argument("--worktree", type=Path, default=Path.cwd())
     _ = parser.add_argument("--cwd", default="")

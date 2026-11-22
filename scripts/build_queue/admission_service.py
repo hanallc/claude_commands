@@ -1234,6 +1234,7 @@ class DeferredOwnerRequest:
 class ParkedPlacement:
     """A placement request whose reply waits for the next pass."""
     request: wire.PlacementRequest
+    requested_constraints: placement.PlacementConstraints
     connection: Connection
 
 
@@ -1473,6 +1474,11 @@ def episode_constraints(first: placement.PlacementConstraints,
     if isinstance(first.command_kind, placement.CommandKindNotSent):
         return replace(first, command_kind=later.command_kind)
     return first
+
+
+def coordinator_runs_mac_command(request: wire.PlacementRequest, destination: placement.PlacementDestination) -> bool:
+    """The coordinator runs these Mac commands without an adapter claim."""
+    return destination.provider == "mac" and request.constraints.command_kind in placement.MAC_RUN_KINDS
 
 
 class AdmissionServer:
@@ -2403,7 +2409,7 @@ class AdmissionServer:
         parked, self.parked_placements = self.parked_placements, []
         for item in parked:
             if not item.connection.finished and item.connection.socket.fileno() >= 0:
-                self._send(item.connection, self._placement_reply(item.request,
+                self._send(item.connection, self._placement_reply(item.request, item.requested_constraints,
                     self.local_hold_holders.get(item.request.episode, placement.ResourceHolderUnknown())))
 
     def _pass(self, configuration: gate.UsableAdmissionConfiguration | gate.UnusableAdmissionConfiguration
@@ -2977,7 +2983,7 @@ class AdmissionServer:
             request.constraints.command, generation, request.constraints.repository,
             request.constraints.package, request.profile.step, settings,
             request.owner if destination.provider == "local" else placement.NoLocalHoldOwner(),
-            request.constraints.command_kind)
+            request.constraints.command_kind, request.constraints.mac_origin)
 
     def _host_probe_timeout(self, key: placement.HostEvidenceKey) -> float:
         from scripts.aws_target import hana_placement
@@ -3179,7 +3185,9 @@ class AdmissionServer:
         sent = request.constraints.command_kind
         kind = recorded_step_kind(request.profile.step) if isinstance(sent, placement.CommandKindNotSent) else sent
         eligibility: placement.HostEligibility
-        if build_targets.mac_run_bypasses_repository_policy(target, kind):
+        mac_command = build_targets.mac_run_bypasses_repository_policy(target, kind)
+        if mac_command:
+            # The Mac command still needs capacity and an assignment.
             eligibility = placement.AllowedHost()
         elif kind not in placement.STEP_COMMAND_KINDS:
             # The target can never run this command, so a pinned step refuses at once.
@@ -3199,10 +3207,12 @@ class AdmissionServer:
         # Routing keeps a busy Mac eligible so a step can wait for it. Placement must wait too,
         # or each pass makes a new attempt that the Mac refuses as busy.
         if (isinstance(eligibility, placement.AllowedHost) and isinstance(target, target_config.SshTarget)
-                and target.platform == "macos"
-                and mac_test.free_now(paths, target.settings, Path(request.constraints.repository),
-                                      session=key.session, configuration=configuration) == "busy"):
-            eligibility = placement.TemporaryExclusion("busy")
+                and target.platform == "macos"):
+            capacity = mac_test.free_now(paths, target.settings, Path(request.constraints.repository),
+                session=key.session, configuration=configuration,
+                origin=key.mac_origin if mac_command else placement.PlacedMacWork())
+            if capacity in ("busy", "off"):
+                eligibility = placement.TemporaryExclusion(capacity)
         adopted: list[placement.AdoptedProviderClaim] = []
         cleanup: list[placement.RetainedCleanupClaim] = []
         executions: list[tuple[placement.ProviderClaimReference, execution_identity.ExecutionEvidence]] = []
@@ -3690,7 +3700,9 @@ done
             saved = self.assignments.get(key)
             if not self._placement_owner_live(request.owner):
                 if saved is not None:
-                    if isinstance(saved.permission, placement.PermissionAvailable) and not self._start_pending(saved):
+                    if ((isinstance(saved.permission, placement.PermissionAvailable)
+                         or self._mac_launch_source(saved) == "coordinator")
+                            and not self._start_pending(saved)):
                         self._close_placement(saved, "cancelled", placement.DoNotRetry("coordinator ended"))
                     else:
                         self.assignments[key] = self._end_remote_start_hold(request, saved)
@@ -3729,14 +3741,32 @@ done
         hold = (records.RemoteStartHold(self.clock.now() + remote_start_hold_seconds)
                 if destination.provider != "local" and self._can_hold_local_place(request)
                 else records.RemoteStartHoldUnrecorded())
+        source: records.MacLaunchSource = "unrecorded"
+        if destination.provider == "mac":
+            source = "coordinator" if coordinator_runs_mac_command(request, destination) else "adapter"
         self.assignments[key] = records.SavedPlacementAssignment(assignment,
             assigned_settings_generation=placement.AssignedSettingsGeneration(evidence_key.configuration_generation),
-            remote_start_hold=hold)
+            remote_start_hold=hold, mac_launch_source=source)
         self.current_assignments[request.episode] = key
         return assignment
 
-    def _placement_reply(self, request: wire.PlacementRequest, local_holder: placement.ResourceHolder
-                         ) -> wire.Assignment | wire.LocalPlacementGranted | wire.PlacementWait | wire.DispatchStatus:
+    def _mac_launch_source(self, saved: records.SavedPlacementAssignment) -> records.MacLaunchSource:
+        """Recover the source of an older Mac assignment when the saved state identifies it."""
+        if saved.mac_launch_source != "unrecorded" or saved.assignment.destination.provider != "mac":
+            return saved.mac_launch_source
+        if isinstance(saved.provider, placement.ProviderClaimReference):
+            return "adapter"
+        if isinstance(saved.permission, placement.PermissionConsumed):
+            return "coordinator"
+        submitted = self.placement_requests.get(saved.assignment.episode)
+        if submitted is not None and not coordinator_runs_mac_command(submitted, saved.assignment.destination):
+            return "adapter"
+        # An old request could add a coordinator kind after an adapter assignment.
+        return "unrecorded"
+
+    def _placement_reply(self, request: wire.PlacementRequest, requested_constraints: placement.PlacementConstraints,
+                         local_holder: placement.ResourceHolder
+                         ) -> wire.Assignment | wire.LocalPlacementGranted | wire.PlacementWait | wire.DispatchStatus | wire.Refused:
         diagnostics = tuple(evidence.provider_diagnostic
             for candidate in self.placement_eligibility.get(request.episode, ())
             if candidate.destination.provider != "local" and isinstance(candidate.eligibility, placement.TemporaryExclusion)
@@ -3801,7 +3831,29 @@ done
                 replay = self.ledger[request.episode]
                 assert isinstance(replay.reply, wire.Admitted)
                 return wire.LocalPlacementGranted(saved.assignment, replay.reply, diagnostics, disk_exclusions, stale_hana)
-            if isinstance(saved.permission, placement.PermissionConsumed):
+            source = saved.mac_launch_source
+            matches_saved_launch = (request.owner == saved.assignment.owner
+                and requested_constraints.source_key == saved.assignment.source_key
+                and requested_constraints.command == request.constraints.command
+                and requested_constraints.command_kind == request.constraints.command_kind)
+            # Use the saved permission for a matching request from main.
+            legacy_mac_retry_changed = (saved.assignment.destination.provider == "mac"
+                and source == "unrecorded" and not matches_saved_launch)
+            if source == "coordinator":
+                if not matches_saved_launch or requested_constraints.command_kind not in placement.MAC_RUN_KINDS:
+                    return wire.Refused("Mac launch request changed its owner, source or command")
+                if isinstance(saved.permission, placement.PermissionAvailable):
+                    if not isinstance(saved.terminal_report, placement.NoTerminalReport):
+                        return self._placement_status(saved.assignment, "the attempt has a terminal report")
+                    refusal = self._mac_launch_refusal(request, saved)
+                    if isinstance(refusal, wire.DispatchStatus):
+                        return refusal
+                    # Save permission before the coordinator receives the assignment.
+                    key = execution_identity.attempt_key(saved.assignment.episode, saved.assignment.attempt)
+                    self.assignments[key] = replace(saved, permission=placement.PermissionConsumed(self.clock.now()))
+                    self.persist()
+            elif (isinstance(saved.permission, placement.PermissionConsumed) or legacy_mac_retry_changed
+                    or source == "adapter" and requested_constraints.command_kind in placement.MAC_RUN_KINDS):
                 return wire.PlacementWait(request.episode, request.since, 1,
                     self.placement_eligibility.get(request.episode, ()),
                     provider_diagnostics=diagnostics, mac_disk_exclusions=disk_exclusions,
@@ -4051,6 +4103,26 @@ done
                 return True
         return False
 
+    def _mac_launch_refusal(self, request: wire.PlacementRequest, saved: records.SavedPlacementAssignment
+                            ) -> wire.DispatchStatus | placement.AllowedHost:
+        """Check the live switch at first launch authorization."""
+        destination = saved.assignment.destination
+        if destination.provider != "mac" or (self._mac_launch_source(saved) == "coordinator"
+                and isinstance(request.constraints.mac_origin, placement.ManualMacCommand)):
+            return placement.AllowedHost()
+        from scripts.build_targets import machine_switch
+
+        try:
+            switch = machine_switch.read(machine_switch.Machine.MAC)
+        except machine_switch.MachineSwitchError as error:
+            reason, detail = "state", str(error)
+        else:
+            if switch is machine_switch.MachineSwitch.ON:
+                return placement.AllowedHost()
+            reason, detail = "off", target_config.MAC_DISABLED_REASON
+        self._close_placement(saved, reason, placement.RetryAt(self.clock.now()))
+        return self._placement_status(saved.assignment, detail, check_lifetime=False)
+
     def _consume_permission(self, request: wire.ConsumePermission) -> wire.FirstAuthorization | wire.DispatchStatus:
         assignment = request.assignment
         key = execution_identity.attempt_key(assignment.episode, assignment.attempt)
@@ -4065,6 +4137,8 @@ done
             return self._placement_status(assignment, "the attempt is no longer current")
         if isinstance(saved.permission, placement.PermissionConsumed):
             return self._placement_status(assignment, "launch permission was already consumed")
+        if assignment.destination.provider == "mac" and self._mac_launch_source(saved) != "adapter":
+            return self._placement_status(assignment, "the Mac assignment does not authorize an adapter claim")
         if not isinstance(saved.terminal_report, placement.NoTerminalReport):
             return self._placement_status(assignment, 'the attempt has a terminal report')
         submitted = self.placement_requests.get(assignment.episode)
@@ -4079,6 +4153,9 @@ done
             return self._placement_status(assignment, "claim does not match the assignment")
         if not isinstance(request.holder, placement.ClaimHolderIdentity) or not self._holder_matches(assignment.owner, request.holder):
             return self._placement_status(assignment, "claim holder is not a live coordinator descendant")
+        refusal = self._mac_launch_refusal(submitted, saved)
+        if isinstance(refusal, wire.DispatchStatus):
+            return refusal
         from scripts.aws_target import hana_placement
         from scripts.mac_test.claim_state import RepositoryScope
         if isinstance(destination.scope, RepositoryScope) and destination.scope.slot != destination.slot and destination.provider == "ssh":
@@ -4268,7 +4345,8 @@ done
             else:
                 saved = self.assignments.get(self.current_assignments.get(request.episode, ""))
                 if saved is not None and (isinstance(saved.permission, placement.PermissionAvailable)
-                        or saved.assignment.destination.provider == "local"):
+                        or saved.assignment.destination.provider == "local"
+                        or self._mac_launch_source(saved) == "coordinator"):
                     if saved.assignment.destination.provider == "local" and request.episode in self.reservations:
                         reservation = self.reservations[request.episode]
                         with retry_cleanup(Path(reservation.path)):
@@ -4309,8 +4387,14 @@ done
             if previous is not None and (previous.owner != request.owner or previous.since != request.since
                     or previous.run != request.run or previous.purpose != request.purpose):
                 return [wire.Refused("placement episode changed its owner, start, run or purpose")]
+            requested_constraints = request.constraints
             if previous is not None:
-                request = replace(request, constraints=episode_constraints(previous.constraints, request.constraints))
+                saved = self.assignments.get(self.current_assignments.get(request.episode, ""))
+                constraints = previous.constraints
+                # Keep the original evidence key while the Mac assignment is current.
+                if saved is None or saved.assignment.destination.provider != "mac":
+                    constraints = episode_constraints(constraints, requested_constraints)
+                request = replace(request, constraints=constraints)
             elif (isinstance(folder := request.constraints.cargo_folder, placement.CargoFolder)
                     and any(candidate.destination.provider == "local" for candidate in request.constraints.candidates)):
                 try:
@@ -4324,7 +4408,7 @@ done
                     and isinstance(self.pending_configuration, NoPass) and not self.pass_stale
                     and isinstance(self.last_result, gate.PassResult)
                     and self.clock.monotonic() < self.next_pass):
-                return [self._placement_reply(request,
+                return [self._placement_reply(request, requested_constraints,
                     self.local_hold_holders.get(request.episode, placement.ResourceHolderUnknown()))]
             self.placement_requests[request.episode] = request
             if previous is None:
@@ -4332,19 +4416,20 @@ done
             self._watch_owner(request.owner)
             self.persist()
             if isinstance(connection, Connection) and not self._pass_gap_open():
-                self.parked_placements.append(ParkedPlacement(request, connection))
+                self.parked_placements.append(ParkedPlacement(request, requested_constraints, connection))
                 self.next_pass = min(self.next_pass, self.clock.monotonic())
                 return []
             _ = self.run_pass()
-            return [self._placement_reply(request,
+            return [self._placement_reply(request, requested_constraints,
                 self.local_hold_holders.get(request.episode, placement.ResourceHolderUnknown()))]
         assignment = request.assignment
         key = execution_identity.attempt_key(assignment.episode, assignment.attempt)
         saved = self.assignments.get(key)
         if saved is None or saved.assignment != assignment:
             return [self._placement_status(assignment, check_lifetime=False)]
+        adapter_dispatch = assignment.destination.provider != "mac" or self._mac_launch_source(saved) == "adapter"
         if isinstance(request, wire.ClaimFailure):
-            if (self.current_assignments.get(assignment.episode) == key
+            if (adapter_dispatch and self.current_assignments.get(assignment.episode) == key
                     and isinstance(saved.permission, placement.PermissionAvailable)
                     and isinstance(saved.state, placement.CurrentAssignment)):
                 if isinstance(saved.terminal_report, placement.TerminalAttemptReport):
@@ -4372,7 +4457,7 @@ done
                         terminal = replace(terminal, path=placement.DispatchPathSettled())
                         self._close_placement(replace(refused, terminal_report=terminal), request.reason, retry)
         elif (isinstance(saved.permission, placement.PermissionConsumed) and saved.provider == request.claim
-                or isinstance(saved.permission, placement.PermissionAvailable)
+                or adapter_dispatch and isinstance(saved.permission, placement.PermissionAvailable)
                 and (isinstance(request.outcome, (placement.PrelaunchRefused, execution_identity.HanaCommandAdmissionRefused))
                     or isinstance(request.outcome, placement.AttemptCancelled)
                     and isinstance(saved.terminal_report, placement.TerminalAttemptReport)

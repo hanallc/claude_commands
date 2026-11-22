@@ -79,6 +79,8 @@ def wire_record(schema: type, record: dict[str, object], *, writing: bool) -> di
             and schema.__name__ in ("PlacementAssignment", "PlacementConstraints")):
         source = record.get("source_identity", record.get("source_key"))
         if writing:
+            if record.get("mac_origin") == {"kind": "PlacedMacWork"}:
+                del record["mac_origin"]
             assert isinstance(source, dict)
             identity = cast(dict[str, object], source)
             return {**record, "source_identity": identity, "source_key": identity.get("key", "")}

@@ -586,6 +586,8 @@ def step_policy(target: LocalTarget | SshTarget, repo_root: Path, package: str, 
     """Read the Mac policy for one step: repository, linux_only packages and backoff. Run no remote command."""
     from scripts.mac_test import eligibility
 
+    if not eligibility.placement_enabled(target.platform):
+        return ExcludedTarget(target, "off")
     config = (configuration if isinstance(configuration, conf.ConfigRead)
               else eligibility.read_config(target.settings) if isinstance(target, SshTarget) else eligibility.read_config())
     name = target.name if isinstance(target, SshTarget) else "mac"
@@ -737,7 +739,7 @@ def mac_target_eligibility(target: LocalTarget | SshTarget, repo_root: Path,
         if isinstance(error, conf.Unusable) and isinstance(configuration, conf.ConfigRead):
             raise
         return ExcludedTarget(target, f"state unreadable: {error}")
-    if answer in ("blocked", "backoff"):
+    if answer in ("off", "blocked", "backoff"):
         return ExcludedTarget(target, answer)
     if answer == "bad":
         return EligibleTarget(target)
@@ -865,6 +867,8 @@ def ssh_target_config(target: SshTarget) -> eligibility.OffloadConfig | Excluded
     if isinstance(hana_placement.read_execution_transport(target), (hana_placement.HanaControlTransport, HanaGpuNextestTransport)):
         return ExcludedTarget(target, 'Hana requires an exact queue assignment')
 
+    if not eligibility.placement_enabled(target.platform):
+        return ExcludedTarget(target, "off")
     return eligibility.read_config(target.settings)
 
 
@@ -1073,14 +1077,13 @@ def command_reserve(args: CliArguments) -> int:
                 return 1
             config = ssh_target_config(target)
             if not isinstance(config, ExcludedTarget):
-                if config.enabled:
-                    from scripts.mac_test import mac_test
+                from scripts.mac_test import mac_test
 
-                    paths = mac_test.state_paths(name)
-                    identity = wait_claim_identity(paths, args.repo_root, args.pid, session=session)
-                    if isinstance(identity, claim_state.ClaimIdentity):
-                        publish_wait_reservation(args, target, identity, session)
-                        return 0
+                paths = mac_test.state_paths(name)
+                identity = wait_claim_identity(paths, args.repo_root, args.pid, session=session)
+                if isinstance(identity, claim_state.ClaimIdentity):
+                    publish_wait_reservation(args, target, identity, session)
+                    return 0
         destination.unlink(missing_ok=True)
     if args.kind not in ("test", "check", "doc", "lint", "example", "build", "final"):
         return 1
@@ -1095,8 +1098,6 @@ def command_reserve(args: CliArguments) -> int:
         if isinstance(config, ExcludedTarget):
             if config.reason != "off":
                 cleanup_refused_claims(target, args, session=session)
-            continue
-        if not config.enabled:
             continue
         paths = mac_test.state_paths(target.name)
         identity = wait_claim_identity(paths, args.repo_root, args.pid, session=session)

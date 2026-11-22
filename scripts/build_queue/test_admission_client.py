@@ -647,9 +647,9 @@ class ClientTests(unittest.TestCase):
                     _ = subprocess.run(["git", "init", "-q", str(fixture.root)], capture_output=True, check=True)
                     _ = (fixture.root / "Cargo.toml").write_text('[package]\nname="sample"\nversion="0.1.0"\n')
                     _ = write_config_fixture(fixture.root / "mac_test.conf",
-                        f"offload=on\nlinux_only.{fixture.root.name}=\n", template="mac_test")
+                        f"linux_only.{fixture.root.name}=\n", template="mac_test")
                     _ = (fixture.root / "build_targets.conf").write_text(
-                        "targets=natedev,mac\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n"
+                        "enabled.mac=on\ntargets=natedev,mac\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n"
                         + "kind.natedev=local\nplatform.natedev=linux\n")
                 occupied = fixture.occupy_host()
                 fixture.free(0)
@@ -859,9 +859,9 @@ class ClientTests(unittest.TestCase):
                 _ = subprocess.run(["git", "init", "-q", str(fixture.root)], capture_output=True, check=True)
                 _ = (fixture.root / "Cargo.toml").write_text('[package]\nname="sample"\nversion="0.1.0"\n')
                 _ = write_config_fixture(fixture.root / "mac_test.conf",
-                    f"offload=on\nlinux_only.{fixture.root.name}=\n", template="mac_test")
+                    f"linux_only.{fixture.root.name}=\n", template="mac_test")
                 _ = (fixture.root / "build_targets.conf").write_text(
-                    "targets=mac,natedev\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n"
+                    "enabled.mac=on\ntargets=mac,natedev\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n"
                     + "kind.natedev=local\nplatform.natedev=linux\n")
                 request = fixture.request(step="check")
                 finish_probe = threading.Event()
@@ -932,9 +932,9 @@ class ClientTests(unittest.TestCase):
             _ = subprocess.run(["git", "init", "-q", str(fixture.root)], capture_output=True, check=True)
             _ = (fixture.root / "Cargo.toml").write_text('[package]\nname="sample"\nversion="0.1.0"\n')
             _ = write_config_fixture(fixture.root / "mac_test.conf",
-                f"offload=on\nlinux_only.{fixture.root.name}=\n", template="mac_test")
+                f"linux_only.{fixture.root.name}=\n", template="mac_test")
             _ = (fixture.root / "build_targets.conf").write_text(
-                "targets=mac,natedev\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n"
+                "enabled.mac=on\ntargets=mac,natedev\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n"
                 + "kind.natedev=local\nplatform.natedev=linux\n")
             request = fixture.request(step="check")
             fixture.server.host_probe = lambda key: placement.HostEvidenceUnavailable(
@@ -970,9 +970,9 @@ class ClientTests(unittest.TestCase):
             _ = subprocess.run(["git", "init", "-q", str(fixture.root)], capture_output=True, check=True)
             _ = (fixture.root / "Cargo.toml").write_text('[package]\nname="sample"\nversion="0.1.0"\n')
             _ = write_config_fixture(fixture.root / "mac_test.conf",
-                f"offload=on\nlinux_only.{fixture.root.name}=\n", template="mac_test")
+                f"linux_only.{fixture.root.name}=\n", template="mac_test")
             _ = (fixture.root / "build_targets.conf").write_text(
-                "targets=mac,natedev\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n"
+                "enabled.mac=on\ntargets=mac,natedev\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n"
                 + "kind.natedev=local\nplatform.natedev=linux\n")
             request = fixture.request(step="check")
             fixture.server.host_probe = lambda key: placement.HostEvidenceUnavailable(
@@ -1002,9 +1002,9 @@ class ClientTests(unittest.TestCase):
                 _ = subprocess.run(["git", "init", "-q", str(fixture.root)], capture_output=True, check=True)
                 _ = (fixture.root / "Cargo.toml").write_text('[package]\nname="sample"\nversion="0.1.0"\n')
                 _ = write_config_fixture(fixture.root / "mac_test.conf",
-                    f"offload=on\nlinux_only.{fixture.root.name}=\n", template="mac_test")
+                    f"linux_only.{fixture.root.name}=\n", template="mac_test")
                 _ = (fixture.root / "build_targets.conf").write_text(
-                    "targets=mac\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n")
+                    "enabled.mac=on\ntargets=mac\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n")
                 request = fixture.request(step="check")
                 fixture.server.host_probe = lambda key: placement.HostEvidenceUnavailable(
                     key, fixture.clock.now(), "the test has not published provider evidence")

@@ -105,7 +105,7 @@ class RepositorySlotTests(unittest.TestCase):
         self.common = {}
         self.dead = set()
         settings = (
-            "offload=on\nci_repo=\nblock_hours=4\nblock_max_hours=48\n"
+            "ci_repo=\nblock_hours=4\nblock_max_hours=48\n"
             "mirror_root=~/.local/state/mac-test/test-mirror\n"
             "block_warn_minutes=15\ngh_timeout_s=1\nclaim_idle_minutes=15\n"
             "claim_poll_seconds=60\nconnect_timeout_s=1\nprobe_timeout_s=1\n"
@@ -118,7 +118,7 @@ class RepositorySlotTests(unittest.TestCase):
         _ = write_config_fixture(self.root / "mac_test.conf", "ci_repo=\nmirror_root=~/.local/state/mac-test/test-mirror\n")
         registry = self.root / "build_targets.conf"
         _ = registry.write_text(
-            "targets=mac,linux,natedev\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac.conf\n"
+            "enabled.mac=on\ntargets=mac,linux,natedev\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac.conf\n"
             + "kind.linux=ssh\nplatform.linux=linux\nsettings.linux=linux.conf\n"
             + "kind.natedev=local\nplatform.natedev=linux\n"
         )

@@ -268,6 +268,8 @@ Mac host and SSH settings remain in `mac_test.conf`.
 
 ## mac_test.conf
 
+The `enabled.mac` key in `build_targets.conf` controls placed work on the Mac.
+
 Controls Mac test offload and the `/build:mac` block command. It names the CI
 repository, workflow, job and repository variable; bounds each `gh` call;
 sets the default and maximum block lifetime; and sets the expiry-warning
@@ -296,10 +298,9 @@ The Hana guest reads its execution settings from these sources:
 
 ## aws_target.conf
 
-This file defines the AWS SSH builder target.
-`offload=off` disables builder routing and controller actions unless the external activation record overrides it.
+This file supplies the AWS account settings.
 `build_targets.conf` lists the active SSH targets.
-Cloud gates use `cloud_gate.conf` and `gate-deployment.json`; they do not depend on `offload`.
+Cloud gates use `cloud_gate.conf` and `gate-deployment.json`.
 
 `host=aws-build` names the Tailscale SSH host. `region` selects the AWS region.
 The controller reads the instance ID from `deployment.json`.
@@ -352,7 +353,6 @@ The spending guard requires usable live spending settings through `ConfigRead.or
 A missing or malformed live limit refuses spending, even when committed history supplies a usable value.
 `daily_limit_usd` and `monthly_limit_usd` include `limit_reserve_usd` when the guard compares costs.
 Equality refuses deployment, starts and new admission. `limit_action=drain` rejects new work.
-`offload=off` disables ordinary builder accounting and controller AWS calls when no external activation record overrides it.
 Cloud gates still read account charges and enforce the spending caps.
 
 `accounting_zone` selects day and month boundaries, including clock changes.
@@ -852,7 +852,9 @@ The command edits no tracked file.
 
 ### Cloud gate regions
 
-`cloud_gate.conf` uses `enabled=on` for cloud gates and `enabled=off` to run merge gates and targeted tests on natedev.
+`enabled.aws-gate=off` in `build_targets.conf` sends new gates and affected tests to natedev.
+`enabled.hana-gpu=off` in that file refuses new placed Hana GPU tests.
+`enabled.hana-aws=off` refuses new placed Hana check and lint work.
 `cloud_gate.conf` sets `regions` to all 19 regions of `spot_candidate_regions`.
 The first region must match the home region in `aws_target.conf`.
 The list must contain at least one region and must not repeat a region.

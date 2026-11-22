@@ -45,11 +45,11 @@ class FailedProbeTests(OffloadCommandFixture):
         super().setUp()
         self.linux_settings = self.root / "box.conf"
         _ = write_config_fixture(self.linux_settings,
-            "offload=on\nhost=fake-box\nkinds=test,check,lint,doc,build\nslots=1\nslots.hana=1\n"
+            "host=fake-box\nkinds=test,check,lint,doc,build\nslots=1\nslots.hana=1\n"
             + "shell_timeout_s=2\nparity.rustc=fixture\nparity.nextest=fixture\n"
             + "parity.mend=fixture\nparity.scripts_commit=fixture\n", template="mac_test")
         _ = (self.root / "build_targets.conf").write_text(
-            "targets=mac,natedev,box\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n"
+            "enabled.mac=on\ntargets=mac,natedev,box\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n"
             + "kind.natedev=local\nplatform.natedev=linux\nkind.box=ssh\nplatform.box=linux\nsettings.box=box.conf\n")
         self.environment.update({name: "" for name in (
             "UNIT_RUN_DIR", "UNIT_SESSION_DIR", "UNIT_TEAM_ROLE", "CODEX_THREAD_ID", "CLAUDE_CODE_SESSION_ID")})
@@ -216,7 +216,7 @@ class FailedProbeTests(OffloadCommandFixture):
         self.assertEqual((self.root / "ssh-reservation").read_text(), f"box\t{self.linux_settings}\n")
         self.assertEqual(self.release_reservation(), 0)
 
-    def test_bad_mark_preserves_busy_blocked_and_off_precedence(self) -> None:
+    def test_bad_mark_preserves_busy_and_blocked(self) -> None:
         self.fixture["probe_status"] = 255
         with redirect_stderr(io.StringIO()):
             self.assertIsInstance(self.probe(), offload.UnavailableProbe)
@@ -230,8 +230,9 @@ class FailedProbeTests(OffloadCommandFixture):
             "session": None, "showrunner": None,
             "state": "active", "ci": "not_configured", "free_message": {"kind": "not_needed"}}))
         self.assertEqual(self.free(), "blocked")
-        _ = write_config_fixture(self.linux_settings, "offload=off\n", template="mac_test")
-        self.assertEqual(self.free(), "off")
+        _ = write_config_fixture(self.root / "build_targets.conf", "enabled.mac=off\n")
+        self.assertEqual(self.free(), "blocked")
+        self.assertEqual(self.free("mac"), "off")
 
     def test_reach_error_prints_only_the_last_nonempty_stderr_line(self) -> None:
         self.fixture["probe_status"] = 1
@@ -637,9 +638,9 @@ raise SystemExit("Unexpected remote command: " + command)
 class StepRecoveryTests(VerifyLintScopeFixture):
     def test_each_compiling_lint_command_has_one_placement_episode(self) -> None:
         settings = self.root / "mac_test.conf"
-        _ = write_config_fixture(settings, f"offload=on\nlinux_only.{self.root.name}=\n")
+        _ = write_config_fixture(settings, f"linux_only.{self.root.name}=\n")
         _ = (self.root / "build_targets.conf").write_text(
-            "targets=natedev,mac\nkind.natedev=local\nplatform.natedev=linux\n"
+            "enabled.mac=on\ntargets=natedev,mac\nkind.natedev=local\nplatform.natedev=linux\n"
             + "kind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n")
         state = self.root / "mac-state"
         state.mkdir()
@@ -680,14 +681,14 @@ class StepRecoveryTests(VerifyLintScopeFixture):
         self.assertEqual(list((self.root / "mac-state/claims").glob("*.json")), [])
 
     def test_local_work_finishes_while_a_new_step_recovers_linux(self) -> None:
-        _ = write_config_fixture(self.root / "mac_test.conf", f"offload=on\nlinux_only.{self.root.name}=\n")
+        _ = write_config_fixture(self.root / "mac_test.conf", f"linux_only.{self.root.name}=\n")
         _ = write_config_fixture(self.root / "linux.conf",
-            "offload=on\nhost=fake-linux\nci_repo=\nkinds=test,check,doc,lint\nslots=1\n"
+            "host=fake-linux\nci_repo=\nkinds=test,check,doc,lint\nslots=1\n"
             + "devshell=default\nshell_cache=.local/state/build-target/shells\nshell_timeout_s=2\n"
             + "parity.rustc=fixture\nparity.nextest=fixture\nparity.mend=fixture\n"
             + "parity.scripts_commit=fixture\n", template="mac_test")
         _ = (self.root / "build_targets.conf").write_text(
-            "targets=mac,natedev,linux\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n"
+            "enabled.mac=on\ntargets=mac,natedev,linux\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n"
             + "kind.natedev=local\nplatform.natedev=linux\nkind.linux=ssh\nplatform.linux=linux\nsettings.linux=linux.conf\n")
         state = Path(self.environment["HOME"]) / ".local/state/build-targets/linux"
         state.mkdir(parents=True)

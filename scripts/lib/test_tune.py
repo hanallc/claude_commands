@@ -47,14 +47,13 @@ class TuneTests(PublicationTestCase):
         )
 
     def test_only_a_saved_guest_key_prints_the_hana_image_notice(self) -> None:
-        source = self.repository.checkout / 'hana_aws.conf'
-        _ = source.write_text('host=fixture-hana\nenabled=on\nspot_max_usd_per_hour=0.35\n')
-        for key, saved, expected in (
-            ('host', live_settings.StagedSave('fixture-hana', 1), 1),
-            ('enabled', live_settings.StagedSave('off', 1), 1),
-            ('spot_max_usd_per_hour', live_settings.StagedSave('0.25', 2), 0),
-            ('enabled', live_settings.UnchangedSave(), 0),
+        for file, key, saved, expected in (
+            ('hana_aws', 'host', live_settings.StagedSave('fixture-hana', 1), 1),
+            ('build_targets', 'enabled.hana-aws', live_settings.StagedSave('off', 1), 1),
+            ('hana_aws', 'spot_max_usd_per_hour', live_settings.StagedSave('0.25', 2), 0),
+            ('build_targets', 'enabled.hana-aws', live_settings.UnchangedSave(), 0),
         ):
+            source = self.repository.checkout / f'{file}.conf'
             with (self.subTest(key=key, saved=saved), mock.patch.object(conf, 'path', return_value=source),
                     mock.patch.object(main_publish, 'checkout_of', return_value=self.repository.checkout),
                     mock.patch.object(live_settings, 'stage_save', return_value=saved),
@@ -62,7 +61,7 @@ class TuneTests(PublicationTestCase):
                     mock.patch.object(live_settings, 'start_readers', return_value=[]),
                     mock.patch.object(live_settings, 'write_mac', return_value='Mac updated'),
                     redirect_stdout(io.StringIO()) as output):
-                args = tune.RequestedValueChange(file='hana_aws', key=key, value='on')
+                args = tune.RequestedValueChange(file=file, key=key, value='on')
                 self.assertEqual(tune.change(args), 0)
             self.assertEqual(output.getvalue().splitlines().count(
                 'The Hana image is now stale. Build and register a current Hana image.'), expected)
@@ -91,6 +90,25 @@ class TuneTests(PublicationTestCase):
                 self.assertEqual(self.snapshot(), before)
                 self.assertFalse(self.repository.ssh_log.exists())
                 self.assertFalse((self.repository.root / "state").exists())
+
+    def test_machine_switch_save_edits_only_its_exact_key_and_checks_its_limit(self) -> None:
+        repo = self.repository
+        source = repo.config.with_name("build_targets.conf")
+        original = "# one of: on, off\nenabled.mac=on\nenabled.mac.mac=on\nenabled.hana-aws=off\n"
+        _ = source.write_text(original)
+        _ = repo.git(repo.checkout, "add", "config/build_targets.conf")
+        _ = repo.git(repo.checkout, "commit", "-qm", "Add fixture machine switches")
+        _ = repo.git(repo.checkout, "push", "-q", "origin", "main")
+        for value, status in (("invalid", 2), ("off", 0), ("on", 0)):
+            with self.subTest(value=value):
+                result = self.run_tune("build_targets", "enabled.mac", value,
+                                       "--why", "Change placement", "--user-words", "yes")
+                self.assertEqual(result.returncode, status, result.stdout + result.stderr)
+                if status == 2:
+                    self.assertIn("expected one of on, off", result.stderr)
+                    self.assertEqual(source.read_text(), original)
+                else:
+                    self.assertEqual(source.read_text(), original.replace("enabled.mac=on", f"enabled.mac={value}"))
 
     def test_approved_change_commits_only_its_file_with_reason_and_user_trailer_then_pulls_mac(self) -> None:
         repo = self.repository

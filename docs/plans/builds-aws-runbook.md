@@ -456,7 +456,7 @@ Missing measurements mean `incomplete`.
 Only the user runs these commands.
 Hana setup does not change the merge-gates stack.
 The setup command needs no active target or slot capacity.
-`enabled=on` in `hana_aws.conf` enables placement.
+`enabled.hana-aws=on` in `build_targets.conf` permits placement.
 
 1. Build the reviewed image: `nix build /etc/nixos#nixosConfigurations.aws-hana.config.system.build.images.amazon --out-link RESULT`.
 2. Run `scripts/aws_target/deploy.py hana-image --image RESULT` to read the local image plan.

@@ -25,7 +25,7 @@ from scripts.aws_target import (
 )
 from scripts.aws_target.control_test_support import TestClock
 from scripts.aws_target.controller_lock import HanaCommandAccess, hana_command_lock, control_lock
-from scripts.aws_target.ledger_test_support import CostFixture, git_only, install_hana_spending_settings, text_setting, REAL_RUN
+from scripts.aws_target.ledger_test_support import CostFixture, git_only, install_hana_spending_settings, text_setting, set_hana_switch, REAL_RUN
 from scripts.aws_target.test_hana_box import FakeProvider, IDENTITY, record_lifecycle_image
 from scripts.build_targets import build_targets, target_config
 from scripts.build_queue import admission_protocol as wire, admission_records as records, placement
@@ -158,10 +158,10 @@ class HanaPlacementTests(CostFixture):
             _ = target_config.read_execution_transport(self.target)
 
     def test_disabled_and_wrong_repository_create_no_provider_calls(self) -> None:
-        text_setting(self.workload, 'enabled', 'off')
+        set_hana_switch(self.root, 'off')
         self.assertEqual(hana.fixed_policy(hana.HanaControlTransport(self.workload, 'fixture-hana'), str(self.root), 'check'),
             hana.HanaStepRefused('off'))
-        text_setting(self.workload, 'enabled', 'on')
+        set_hana_switch(self.root, 'on')
         with mock.patch.object(eligibility, 'repository_identity', return_value=eligibility.KnownRepository('hana', 'wrong-origin')):
             self.assertEqual(hana.fixed_policy(hana.HanaControlTransport(self.workload, 'fixture-hana'), str(self.root), 'check'),
                 hana.HanaStepRefused('repo'))
@@ -542,11 +542,12 @@ with hana_command_lock(directory) as access:
         check_start = hana_spend.HanaSpending[hana_spend.PermitSettings].check_start
         checked: list[hana_spend.StartReserved | hana_spend.PermitRefused] = []
 
-        def check(spending: hana_spend.HanaSpending[hana_spend.PermitSettings], now: int, generation: int
+        def check(spending: hana_spend.HanaSpending[hana_spend.PermitSettings], now: int, generation: int, *,
+                  use: hana_spend.PermitUse
                   ) -> hana_spend.StartReserved | hana_spend.PermitRefused:
             self.assertEqual(spending.book.read_snapshot().hana_compute[0].generation, generation)
             self.costs({'daily_limit_usd': '0.01', 'limit_reserve_usd': '0'})
-            result = check_start(spending, now, generation)
+            result = check_start(spending, now, generation, use=use)
             checked.append(result)
             return result
 
@@ -636,7 +637,7 @@ class HanaGpuPlacementTests(CostFixture):
         self.trials = self.root / 'trials'
         gpu_target = target_config.SshTarget('hana-gpu', 'linux', self.gpu_settings)
         _ = self.gpu_settings.write_text(
-            'execution_transport=hana-gpu\nhana_gpu_route_enabled=on\n'
+            'execution_transport=hana-gpu\n'
             + f'hana_gpu_repository={KEY}\nhana_gpu_instance_types=g4dn.2xlarge g6.2xlarge\n'
             + 'hana_gpu_selections=hana_mimesis_tools:shader_variants\n# range: 1..60\napi_timeout_s=30\n')
         self.account_dir.mkdir(parents=True)
@@ -645,7 +646,7 @@ class HanaGpuPlacementTests(CostFixture):
         _ = (self.root / 'build_targets.conf').write_text(
             'targets=natedev\nkind.natedev=local\nplatform.natedev=linux\n'
             + 'pinned_targets=hana-gpu\nkind.hana-gpu=ssh\nplatform.hana-gpu=linux\n'
-            + f'settings.hana-gpu={gpu_target.settings}\n')
+            + f'settings.hana-gpu={gpu_target.settings}\nenabled.hana-gpu=on\n')
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {'CONF_DIR': str(self.root)})))
         _ = self.enterContext(mock.patch.object(eligibility, 'repository_identity',
             return_value=eligibility.KnownRepository('hana', KEY)))
@@ -680,8 +681,12 @@ class HanaGpuPlacementTests(CostFixture):
         _ = self.grants.write_text(json.dumps({'gpu_instance_types': ['g6.2xlarge']}))
         self.assertEqual(self.candidate().eligibility, placement.FixedExclusion(adapter.GPU_SETUP_REQUIRED))
         _ = self.grants.write_text(grants)
-        _ = self.gpu_settings.write_text(self.gpu_settings.read_text().replace('enabled=on', 'enabled=off'))
-        self.assertEqual(self.candidate().eligibility, placement.FixedExclusion(adapter.GPU_SETUP_REQUIRED))
+        registry = self.root / 'build_targets.conf'
+        configured = registry.read_text()
+        for value in ('off', 'invalid', ''):
+            with self.subTest(value=value):
+                _ = registry.write_text(configured.replace('enabled.hana-gpu=on', f'enabled.hana-gpu={value}'))
+                self.assertEqual(self.candidate().eligibility, placement.FixedExclusion(adapter.GPU_SETUP_REQUIRED))
 
     def run_fake_gpu(self, code: int | str, *, confirm_cleanup: bool = True, refuse_start: bool = False,
                      report_unavailable: bool = False, refuse_release: bool = False

@@ -49,12 +49,12 @@ class SshEligibilityTests(unittest.TestCase):
         self.now = instant("2026-01-15T00:00:00+00:00")
         environment = config_environment(self.root)
         _ = (self.root / "build_targets.conf").write_text(
-            "targets=mac,natedev,linux\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n"
+            "enabled.mac=on\ntargets=mac,natedev,linux\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n"
             + "kind.natedev=local\nplatform.natedev=linux\n"
             + "kind.linux=ssh\nplatform.linux=linux\nsettings.linux=linux.conf\n")
-        _ = write_config_fixture(self.root / "mac_test.conf", "offload=on\nlinux_only.hana=linux-part\n")
+        _ = write_config_fixture(self.root / "mac_test.conf", "linux_only.hana=linux-part\n")
         _ = write_config_fixture(self.root / "linux.conf",
-                              "offload=on\nhost=fake-linux\nkinds=test,check,doc\nslots=2\nslots.hana=2\n", template="mac_test")
+                              "host=fake-linux\nkinds=test,check,doc\nslots=2\nslots.hana=2\n", template="mac_test")
         _ = (self.root / "Cargo.toml").write_text('[package]\nname="linux-part"\nversion="0.1.0"\n')
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
             **environment, "HOME": str(self.root), "MAC_TEST_CONFIG": str(self.root / "mac_test.conf"),
@@ -110,7 +110,7 @@ class SshEligibilityTests(unittest.TestCase):
 
     def mac_offload_off(self) -> None:
         # check, lint and doc ignore linux_only, so turn the Mac off to keep these Linux tests from probing it.
-        _ = write_config_fixture(self.root / "mac_test.conf", "offload=off\nlinux_only.hana=linux-part\n")
+        _ = write_config_fixture(self.root / "build_targets.conf", "enabled.mac=off\n")
 
     def linux(self, kind: str = "test", local: bool = False) -> list[str]:
         return next(row for row in self.answer(kind, local) if row[0] == "linux")
@@ -140,7 +140,7 @@ class SshEligibilityTests(unittest.TestCase):
 
 
     def test_a_mac_block_stops_a_memory_wait_from_reusing_its_reservation(self) -> None:
-        _ = write_config_fixture(self.root / "mac_test.conf", "offload=on\nlinux_only.hana=\n")
+        _ = write_config_fixture(self.root / "mac_test.conf", "linux_only.hana=\n")
         self.assertEqual(self.reserve("mac"), 0)
         paths = mac_test.state_paths("mac")
         claim, = mac_test.read_claims(paths)
@@ -209,7 +209,7 @@ class SshEligibilityTests(unittest.TestCase):
 
     def add_spare_target(self) -> None:
         _ = write_config_fixture(self.root / "spare.conf",
-                                 "offload=on\nhost=fake-spare\nkinds=test,check,doc\n", template="mac_test")
+                                 "host=fake-spare\nkinds=test,check,doc\n", template="mac_test")
         table = self.root / "build_targets.conf"
         _ = table.write_text(table.read_text().replace("targets=mac,natedev,linux", "targets=mac,natedev,linux,spare")
                              + "kind.spare=ssh\nplatform.spare=linux\nsettings.spare=spare.conf\n")
@@ -249,7 +249,7 @@ class SshEligibilityTests(unittest.TestCase):
         self.assertEqual(mac_test.read_claims(mac_test.state_paths("linux")), ())
 
     def test_busy_mac_recovery_keeps_the_existing_reserve_status(self) -> None:
-        _ = write_config_fixture(self.root / "mac_test.conf", "offload=on\nlinux_only.hana=\n")
+        _ = write_config_fixture(self.root / "mac_test.conf", "linux_only.hana=\n")
         self.assertEqual(self.reserve("mac", recover_only=True), 11)
         self.assertFalse((self.root / "reservation.tsv").exists())
 
@@ -307,7 +307,7 @@ class SshEligibilityTests(unittest.TestCase):
     def test_configured_kinds_are_read_on_each_eligibility_check(self) -> None:
         self.mac_offload_off()
         self.assertEqual(self.linux("check")[1], "eligible")
-        _ = write_config_fixture(self.root / "linux.conf", "offload=on\nkinds=test,doc\n")
+        _ = write_config_fixture(self.root / "linux.conf", "kinds=test,doc\n")
         self.assertEqual(self.linux("check")[1], "excluded")
 
     def test_mac_backoff_does_not_exclude_linux_but_linux_backoff_does(self) -> None:

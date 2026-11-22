@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from hashlib import sha256
 import json
@@ -10,6 +11,7 @@ import re
 from typing import cast
 
 from scripts.aws_target import hana_guest, hana_payload, hana_receiver
+from scripts.build_targets import machine_switch
 from scripts.lib import conf
 
 
@@ -17,12 +19,13 @@ CHECKOUT = Path(__file__).resolve().parents[2]
 DATA_DEVICE = Path('/dev/sdf')
 HANA_TARGET_ALIAS_KEY = 'host'
 HANA_IMAGE_KEYS = (
-    'enabled', 'guard_grace_seconds', 'watchdog_check_seconds', 'permit_max_seconds',
+    'guard_grace_seconds', 'watchdog_check_seconds', 'permit_max_seconds',
     'step_cpu_limit', 'step_memory_gib', 'mount_timeout_seconds', 'aws_timeout_s', 'control_poll_seconds',
     'result_transfer_timeout_s', 'source_max_bytes', 'source_download_timeout_s',
 )
 HANA_RUNTIME_KEYS = ('execution_shell', 'free_floor_gib', 'source_git_timeout_s', 'source_allowed_environment')
 COMMAND_TIMEOUT_KEY = 'loopback.command_timeout_s'
+HANA_SWITCH_KEY = f'enabled.{machine_switch.Machine.HANA_AWS.value}'
 SHELL_TIMEOUT_KEY = 'loopback.shell_timeout_s'
 SLOT_PROBE_KEYS = ('locks.probe_wait_seconds', 'locks.probe_retry_seconds')
 COPY_POLICY_KEYS = (hana_payload.BUILD_ROOT_KEY, *SLOT_PROBE_KEYS)
@@ -87,6 +90,8 @@ def affects_guest_config(key: str, configuration: Path) -> bool:
     stem = configuration.stem
     if stem == 'hana_aws' and key == HANA_TARGET_ALIAS_KEY:
         return True
+    if stem == 'build_targets' and key == HANA_SWITCH_KEY:
+        return True
     keys = IMAGE_SETTINGS.get(stem, ())
     if not any(key == base or key.startswith(base + '.') for base in keys):
         return False
@@ -97,7 +102,7 @@ def affects_guest_config(key: str, configuration: Path) -> bool:
     return any(conf.effective_key(settings, base, host_name=alias) == key for base in keys)
 
 
-def guest_host_name(settings: dict[str, conf.Setting]) -> str:
+def guest_host_name(settings: Mapping[str, conf.Setting]) -> str:
     # Select overrides by the Hana target alias.
     host = settings.get(HANA_TARGET_ALIAS_KEY)
     host_name = host.value.partition('.')[0] if host is not None else ''
@@ -106,7 +111,7 @@ def guest_host_name(settings: dict[str, conf.Setting]) -> str:
     return host_name
 
 
-def resolved_config_text(settings: dict[str, conf.Setting], keys: tuple[str, ...], host_name: str) -> str:
+def resolved_config_text(settings: Mapping[str, conf.Setting], keys: tuple[str, ...], host_name: str) -> str:
     selected: dict[str, conf.Setting] = {}
     for key in keys:
         setting = settings.get(conf.effective_key(settings, key, host_name=host_name))
@@ -125,7 +130,7 @@ def config_text(settings: dict[str, conf.Setting]) -> str:
     return '\n'.join(rows) + '\n'
 
 
-def _runtime_defaults(settings: dict[str, conf.Setting], alias: str) -> dict[str, conf.Setting]:
+def _runtime_defaults(settings: Mapping[str, conf.Setting], alias: str) -> dict[str, conf.Setting]:
     rows: dict[str, conf.Setting] = {}
     for key in settings:
         base, _, suffix = key.rpartition('.')
@@ -136,10 +141,10 @@ def _runtime_defaults(settings: dict[str, conf.Setting], alias: str) -> dict[str
     return rows
 
 
-def _workload(configuration: Path | conf.ConfigRead) -> tuple[conf.ConfigRead, dict[str, conf.Setting]]:
+def _workload(configuration: Path | conf.ConfigRead) -> tuple[conf.ConfigRead, Mapping[str, conf.Setting]]:
     workload = conf.read(configuration) if isinstance(configuration, Path) else configuration
     settings = workload.settings
-    if not isinstance(settings, dict):
+    if not isinstance(settings, Mapping):
         raise ValueError(f'{workload.source}: {settings.reason}')
     return workload, settings
 
@@ -162,15 +167,23 @@ def _listed_files(checkout: Path, manifest: Path) -> tuple[RenderedGuestFile, ..
     return tuple(files.values())
 
 
-def guest_files(checkout: Path, configuration: Path | conf.ConfigRead, device: Path) -> tuple[RenderedGuestFile, ...]:
+def guest_files(checkout: Path, configuration: Path | conf.ConfigRead, device: Path, *,
+                switch: machine_switch.MachineSwitch | conf.UseConfiguredValue = conf.UseConfiguredValue.CURRENT
+                ) -> tuple[RenderedGuestFile, ...]:
     """Render the controls and the installed image closure."""
     workload, settings = _workload(configuration)
     alias = guest_host_name(settings)
     image_config = resolved_config_text(settings, HANA_IMAGE_KEYS, alias)
     parsed = _resolved_read(workload.source, image_config, workload)
     targets = checkout / 'config/build_targets.conf'
-    command_config = resolved_config_text(conf.settings(targets.read_text(encoding='utf-8')),
-                                          (COMMAND_TIMEOUT_KEY,), alias)
+    target_settings = conf.settings(targets.read_text(encoding='utf-8'))
+    if isinstance(switch, conf.UseConfiguredValue):
+        try:
+            switch = machine_switch.read(machine_switch.Machine.HANA_AWS,
+                {key: setting.value for key, setting in target_settings.items()})
+        except machine_switch.MachineSwitchError as error:
+            raise machine_switch.MachineSwitchError(targets, error.detail) from error
+    command_config = resolved_config_text(target_settings, (COMMAND_TIMEOUT_KEY,), alias)
     command_timeout = _resolved_read(targets, command_config, workload).value(
         COMMAND_TIMEOUT_KEY, float, recover_invalid=False)
     folders = checkout / 'config/build_folders.conf'
@@ -192,7 +205,8 @@ def guest_files(checkout: Path, configuration: Path | conf.ConfigRead, device: P
         raise ValueError(f'{folders}: {wait_key} must be nonnegative.')
     if float(retry) <= 0:
         raise ValueError(f'{folders}: {retry_key} must be positive.')
-    control = (*hana_guest.render_files(hana_guest.read_settings(parsed, recover_invalid=False), device=device),
+    safety = hana_guest.read_settings(parsed, enabled=switch is machine_switch.MachineSwitch.ON, recover_invalid=False)
+    control = (*hana_guest.render_files(safety, device=device),
                *hana_receiver.render_files(hana_receiver.read_settings(parsed, command_timeout_s=command_timeout)))
     return (
         *(RenderedGuestFile(Path(file.path.name), file.mode, file.content.encode()) for file in control),
@@ -237,8 +251,15 @@ def digest_files(files: tuple[RenderedGuestFile, ...]) -> GuestDigest:
     return GuestDigest(sha256(json.dumps(entries, separators=(',', ':')).encode()).hexdigest())
 
 
-def guest_digest(configuration: Path | conf.ConfigRead, *, checkout: Path = CHECKOUT) -> GuestDigest:
-    return digest_files(guest_files(checkout, configuration, DATA_DEVICE))
+def guest_digest(configuration: Path | conf.ConfigRead, *,
+                 checkout: Path | conf.UseConfiguredValue = conf.UseConfiguredValue.CURRENT,
+                 switch: machine_switch.MachineSwitch | conf.UseConfiguredValue = conf.UseConfiguredValue.CURRENT
+                 ) -> GuestDigest:
+    if isinstance(checkout, conf.UseConfiguredValue):
+        checkout = CHECKOUT
+        if isinstance(switch, conf.UseConfiguredValue):
+            switch = machine_switch.read(machine_switch.Machine.HANA_AWS)
+    return digest_files(guest_files(checkout, configuration, DATA_DEVICE, switch=switch))
 
 
 if __name__ == '__main__':

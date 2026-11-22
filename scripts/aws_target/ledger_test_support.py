@@ -112,10 +112,19 @@ source_allowed_environment=RUST_BACKTRACE
 """
 
 
+def set_hana_switch(folder: Path, value: str) -> None:
+    path = folder / 'build_targets.conf'
+    if not path.exists():
+        folder.mkdir(parents=True, exist_ok=True)
+        _ = path.write_bytes((FIXTURES / path.name).read_bytes())
+    override_fixture_settings(path, f'enabled.hana-aws={value}')
+
+
 def write_hana_config(path: Path | None = None) -> Path:
     """Write fixed setup settings to the test configuration directory."""
     if path is None:
         path = conf.path('hana_aws')
+    set_hana_switch(path.parent, 'off')
     _ = path.write_text((FIXTURES / 'hana_aws.conf').read_text() + HANA_GUEST_RUNTIME_SETTINGS)
     return path
 
@@ -152,7 +161,7 @@ def install_aws_fixture_settings(folder: Path) -> None:
 def install_hana_spending_settings(path: Path) -> None:
     """Enable private Hana spending at the test price."""
     _ = write_hana_config(path)
-    text_setting(path, 'enabled', 'on')
+    set_hana_switch(path.parent, 'on')
     numeric_settings(path, {'spot_max_usd_per_hour': '0.15'})
 
 

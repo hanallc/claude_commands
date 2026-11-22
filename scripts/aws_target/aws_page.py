@@ -26,7 +26,7 @@ from statistics import median
 from typing import Literal, NotRequired, TypedDict
 
 from scripts.aws_target import cloud_gate, config as aws_config, console_help, ledger, quota_requests, run_cost, spend as aws_spend, spot_table
-from scripts.build_targets import target_config
+from scripts.build_targets import machine_switch, target_config
 from scripts.disks.disks_page import shared_step_tip
 from scripts.lib import conf
 from scripts.lib.atomic_file import write_text_atomic
@@ -481,7 +481,7 @@ def utc_spend_data(report: aws_spend.UtcSpendReport) -> SpendData:
 
 def launch_state(records: Sequence[dict[str, object]], gate_switch: cloud_gate.CloudGateSetting) -> LaunchState:
     """Show the switch state or the latest launch evidence."""
-    if gate_switch is cloud_gate.CloudGateSwitch.OFF:
+    if gate_switch is machine_switch.MachineSwitch.OFF:
         return {'kind': 'off'}
     if isinstance(gate_switch, cloud_gate.InvalidCloudGateSwitch):
         return {'kind': 'invalid'}
@@ -621,7 +621,7 @@ def page_data(tables: spot_table.SpotTables, spend: SpendData, now: int,
               placement_readings: Sequence[ledger.SpotPlacementReading] = (), *,
               hours_table_open_row_limit: int,
               launch_records: Sequence[dict[str, object]] = (), settled_notes: Sequence[str] = (),
-              gate_switch: cloud_gate.CloudGateSetting = cloud_gate.CloudGateSwitch.ON) -> PageData:
+              gate_switch: cloud_gate.CloudGateSetting = machine_switch.MachineSwitch.ON) -> PageData:
     # The billed hours table can add a region that is no longer a candidate.
     placement = placement_score_table(tuple(read.region for read in tables.regions), placement_readings, now)
     regions = {row[0] for row in placement.rows} | tables.hours.checked_regions
@@ -747,7 +747,7 @@ def render_report_page(directory: Path, report: aws_spend.UtcSpendReport, starte
                                          evidence=evidence)
     data = page_data(tables, spend, now, evidence.placement_scores, launch_records=launches,
                      hours_table_open_row_limit=configuration.whole('hours_table_open_row_limit'),
-                     settled_notes=settled_amount_notes(watched), gate_switch=cloud_gate.launch_switch(values))
+                     settled_notes=settled_amount_notes(watched), gate_switch=cloud_gate.launch_switch(inputs.machine_registry))
     comparisons = run_cost.gate_comparisons(directory, now, values, configuration, gate_pricing=gate_pricing)
     gate_time_price = table_data(gate_time_price_table(comparisons, inputs.step_names.shown('gate')))
     regions = sorted(set(data['regions']).union(row[0] for row in gate_time_price['rows']), key=region_filter_key)

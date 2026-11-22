@@ -22,7 +22,7 @@ class VerifyMacConfigurationTests(VerifyMacOffloadFixture):
 
     def test_alternate_target_settings_are_passed_to_runner(self) -> None:
         alternate = self.root / "alternate Mac.conf"
-        _ = write_config_fixture(alternate, f"offload=on\nlinux_only.{self.root.name}=\n", template="mac_test")
+        _ = write_config_fixture(alternate, f"linux_only.{self.root.name}=\n", template="mac_test")
         config = Path(self.environment["CONF_DIR"]) / "build_targets.conf"
         _ = config.write_text(config.read_text().replace("mac settings.conf", alternate.name))
         result = self.verify("test", "sample", "--filter", "alpha", "--no-cache",

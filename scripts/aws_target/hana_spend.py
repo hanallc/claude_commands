@@ -5,12 +5,14 @@ from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import datetime
 from decimal import Decimal
+from enum import Enum, auto
 from pathlib import Path
 from threading import Lock
 import time
 from zoneinfo import ZoneInfo
 
 from scripts.aws_target import hana_guest, ledger, remote
+from scripts.build_targets import machine_switch
 from scripts.lib import conf
 
 
@@ -65,13 +67,22 @@ def _read_start_settings(configuration: conf.ConfigRead, *, enabled: bool, permi
         configuration.value('gp3_usd_per_gib_month', _positive_amount), permit_max_seconds)
 
 
-def read_settings(configuration: conf.ConfigRead) -> PermitSettings:
+def read_settings(configuration: conf.ConfigRead, *,
+                  switch: machine_switch.MachineSwitch | conf.UseConfiguredValue = conf.UseConfiguredValue.CURRENT
+                  ) -> PermitSettings:
     """Read spending and guest safety limits before execution."""
-    safety = hana_guest.read_settings(configuration)
+    if isinstance(switch, conf.UseConfiguredValue):
+        switch = machine_switch.read(machine_switch.Machine.HANA_AWS)
+    safety = hana_guest.read_settings(configuration, enabled=switch is machine_switch.MachineSwitch.ON)
     start = _read_start_settings(configuration, enabled=safety.enabled, permit_max_seconds=safety.permit_max_seconds)
     return PermitSettings(start.enabled, start.region, start.instance_type, start.fallback_instance_types,
         start.spot_max_usd_per_hour, start.root_gib, start.data_gib, start.daily_budget_usd,
         start.gp3_usd_per_gib_month, start.permit_max_seconds, safety.guard_grace_seconds)
+
+
+def read_resource_settings(configuration: conf.ConfigRead) -> PermitSettings:
+    """Read spending limits for manual resource commands and reports."""
+    return read_settings(configuration, switch=machine_switch.MachineSwitch.ON)
 
 
 @dataclass(frozen=True)
@@ -83,6 +94,11 @@ class PermitIssued:
 @dataclass(frozen=True)
 class PermitRefused:
     reason: str
+
+
+class PermitUse(Enum):
+    NEW_WORK = auto()
+    ACTIVE_CLAIM = auto()
 
 
 @dataclass(frozen=True)
@@ -123,6 +139,7 @@ def _setup_record_path(book: ledger.CostLedger) -> Path:
 def _preview_inputs(book: ledger.CostLedger, account: Path, workload: Path, lifecycle: Path) -> _PreviewInputs:
     versions: _PreviewInputs = {}
     for path in (book.path, book.launch_history_path, account, workload, lifecycle, _setup_record_path(book),
+                 conf.path('build_targets'),
                  conf.path('cloud_gate'), _REPOSITORY_GATE_CONFIG, *book.bill_paths()):
         try:
             stat = path.stat()
@@ -168,9 +185,9 @@ class _PlacementPreview:
                 return saved.result
             self.cached = _NoPlacementPreview()
             with conf.diagnostics() as configuration_warnings:
-                permit = hana_guest.read_permit_window(configuration)
-                settings = _read_start_settings(configuration, enabled=permit.enabled,
-                                                permit_max_seconds=permit.permit_max_seconds)
+                enabled = machine_switch.read(machine_switch.Machine.HANA_AWS) is machine_switch.MachineSwitch.ON
+                settings = _read_start_settings(configuration, enabled=enabled,
+                                                permit_max_seconds=hana_guest.read_permit_max_seconds(configuration))
                 try:
                     max_age = configuration.whole('preview_max_age_s')
                 except conf.Unusable:
@@ -298,9 +315,10 @@ class HanaSpending[Settings: StartPermitSettings]:
             storage.append(ledger.HanaStorageExposure(now, self.settings.storage_usd_per_month))
         return replace(state, hana_compute=[*compute, proposed], hana_storage=storage), proposed
 
-    def check_start(self, now: int, generation: int) -> StartReserved | PermitRefused:
+    def check_start(self, now: int, generation: int, *, use: PermitUse = PermitUse.NEW_WORK
+                    ) -> StartReserved | PermitRefused:
         """Recheck an existing reservation before a start or permit mutation."""
-        if not self.settings.enabled:
+        if not self.settings.enabled and use is PermitUse.NEW_WORK:
             return PermitRefused('Hana is disabled')
         with self.book.transaction() as state:
             for row in state.hana_compute:
@@ -309,30 +327,35 @@ class HanaSpending[Settings: StartPermitSettings]:
                     return decision if isinstance(decision, PermitRefused) else StartReserved(row)
             return PermitRefused('The start reservation is expired or its generation is old')
 
-    def bind_start(self, now: int, generation: int, boot_id: str) -> PermitIssued | PermitRefused:
+    def bind_start(self, now: int, generation: int, boot_id: str, *, use: PermitUse = PermitUse.NEW_WORK
+                   ) -> PermitIssued | PermitRefused:
         """Authorize an existing reservation after the controller verifies its boot identity."""
         if not boot_id.strip():
             return PermitRefused('The guest boot identity is missing')
-        result = self.check_start(now, generation)
+        result = self.check_start(now, generation, use=use)
         if isinstance(result, PermitRefused):
             return result
         row = result.exposure
         return PermitIssued(hana_guest.WorkPermit(float(row.expires), str(generation), boot_id), row)
 
-    def issue(self, now: int, expires: int, boot_id: str, *, expected_generation: int = 0) -> PermitIssued | PermitRefused:
+    def issue(self, now: int, expires: int, boot_id: str, *, expected_generation: int = 0,
+              use: PermitUse = PermitUse.NEW_WORK) -> PermitIssued | PermitRefused:
         """Reserve a start or renewal before returning its increasing generation."""
         if not boot_id.strip():
             return PermitRefused('The guest boot identity is missing')
-        result = self._reserve_compute(now, expires, expected_generation=expected_generation)
+        result = self._reserve_compute(now, expires, expected_generation=expected_generation, use=use)
         if isinstance(result, PermitRefused):
             return result
         return PermitIssued(hana_guest.WorkPermit(float(expires), str(result.exposure.generation), boot_id), result.exposure)
 
     def _reserve_compute(self, now: int, expires: int, *, expected_generation: int, approved_setup: bool = False,
+                         use: PermitUse = PermitUse.NEW_WORK,
                          before_commit: Callable[[ledger.HanaComputeExposure], None] | None = None
                          ) -> StartReserved | PermitRefused:
-        if not self.settings.enabled and not approved_setup:
+        if not self.settings.enabled and not approved_setup and use is PermitUse.NEW_WORK:
             return PermitRefused('Hana is disabled')
+        if use is PermitUse.ACTIVE_CLAIM and expected_generation <= 0:
+            return PermitRefused('An active claim renewal requires its permit generation')
         if type(now) is not int or type(expires) is not int or now < 0 or not 0 < expires - now <= self.settings.permit_max_seconds:
             return PermitRefused('The permit deadline is outside its renewal window')
         with self.book.transaction() as state:

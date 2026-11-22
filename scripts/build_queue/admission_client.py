@@ -1908,6 +1908,7 @@ class ClientArguments(argparse.Namespace):
     local_reason: str = ""
     mac_only: bool = False
     pinned_refusals: bool = False
+    mac_origin: placement.MacCommandOrigin = placement.PlacedMacWork()
     once: bool = False
     reason: str = ""
     status: int = 0
@@ -2019,7 +2020,7 @@ def _place_step(args: ClientArguments, output: WaitOutput) -> int:
             execution_identity.SourceKeyKnown(args.source_key) if args.source_key else execution_identity.SourceKeyUnavailable("source key is unavailable"),
             routing, selection,
             writes_tree=args.writes_tree)
-        constraints = replace(constraints, cargo_folder=cargo_folder)
+        constraints = replace(constraints, cargo_folder=cargo_folder, mac_origin=args.mac_origin)
         if args.mac_only and not args.writes_tree:
             constraints = replace(constraints, selection=placement.MacOnlyHost())
         prerequisite = (placement.TokenRequired(placement.TokenReadinessUnchecked())
@@ -2095,6 +2096,8 @@ def _place_step(args: ClientArguments, output: WaitOutput) -> int:
                 return _print_placement_refusal(reason)
             if args.mac_only:
                 print("refused\t" + reason)
+            elif args.target == "mac" and reason == "off":
+                print(target_config.MAC_DISABLED_REASON)
             else:
                 print(wire.encode_reply(answer), end="")
             return 2
@@ -2147,6 +2150,8 @@ def main(argv: list[str] | None = None) -> int:
     _ = placement_parser.add_argument("--local-only", action="store_true")
     _ = placement_parser.add_argument("--local-reason", default=os.environ.get("BUILD_QUEUE_LOCAL_REASON", ""))
     _ = placement_parser.add_argument("--mac-only", action="store_true")
+    _ = placement_parser.add_argument("--manual", dest="mac_origin", action="store_const",
+                                      const=placement.ManualMacCommand(), default=placement.PlacedMacWork())
     _ = placement_parser.add_argument("--once", action="store_true")
     _ = placement_parser.add_argument("--wait-events", action="store_true")
     _ = placement_parser.add_argument("--pinned-refusals", action="store_true")

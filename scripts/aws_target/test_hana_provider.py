@@ -737,7 +737,7 @@ class HanaProviderTests(CostFixture):
         boot = self.root / 'boot-id'
         _ = boot.write_text('fixture-boot')
         paths = hana_guest.GuestPaths(folder, boot)
-        settings = hana_guest.read_settings(conf.read(self.workload))
+        settings = hana_guest.read_settings(conf.read(self.workload), enabled=True)
         descriptor: dict[str, object] = {'version': 1, 'deployment': IDENTITY.deployment, 'start_token': 'fixture-start',
             'expires': self.clock.now + conf.read(self.workload).whole('control_url_seconds')}
         control: dict[str, object] = {'deployment': IDENTITY.deployment, 'start_token': 'fixture-start', 'token': 'fixture-token',
@@ -774,6 +774,6 @@ class HanaProviderTests(CostFixture):
                 mock.patch('sys.stdout', new_callable=StringIO) as output:
             self.assertFalse(subject.hana_setup())
         self.assertIn('persistent Spot', output.getvalue())
-        self.assertIn('Hana placement is enabled. This command does not change it.', output.getvalue())
+        self.assertIn('Hana placement stays as configured.', output.getvalue())
         self.assertEqual(self.fake.calls, [])
         self.assertFalse((self.state / 'hana/setup.json').exists())

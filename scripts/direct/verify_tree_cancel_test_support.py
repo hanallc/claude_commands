@@ -334,10 +334,10 @@ with (patch.object(detached_runs, "deliver", return_value="private fixture"),
         self.write_tool(runner, MAC_RUNNER)
         self.write_tool(self.root / "stubs/ssh", 'print("free_gib=1000\\nhost=test-mac\\nrc=0")\n')
         settings = self.root / "mac-settings.conf"
-        _ = write_config_fixture(settings, f"offload=on\nlinux_only.{self.workspace.name}=\n", template="mac_test")
+        _ = write_config_fixture(settings, f"linux_only.{self.workspace.name}=\n", template="mac_test")
         targets = self.root / "build_targets.conf"
         order = "natedev,mac" if local_first else "mac,natedev"
-        _ = targets.write_text(f"targets={order}\nkind.mac=ssh\nplatform.mac=macos\n"
+        _ = targets.write_text(f"enabled.mac=on\ntargets={order}\nkind.mac=ssh\nplatform.mac=macos\n"
                                + f"settings.mac={settings.name}\nkind.natedev=local\nplatform.natedev=linux\n")
         state = self.root / "mac-state"
         self.environment.update({"MAC_TEST_STATE_DIR": str(state), "CONF_DIR": str(settings.parent),

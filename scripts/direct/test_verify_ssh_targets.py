@@ -74,7 +74,7 @@ class SshReservationTests(unittest.TestCase):
     def setUp(self) -> None:
         self.addCleanup(self.fixture.doCleanups)
         self.fixture.setUp()
-        _ = write_config_fixture(self.fixture.root / "linux.conf", "offload=on\nslots=1\nslots.hana=1\n")
+        _ = write_config_fixture(self.fixture.root / "linux.conf", "slots=1\nslots.hana=1\n")
 
     def reserve(self, pid: int) -> tuple[int, Path]:
         path = self.fixture.root / f"reservation-{pid}"
@@ -249,7 +249,7 @@ elif words[0] not in ("release-wait", "register-local", "check-local"):
         config = Path(self.environment["CONF_DIR"]) / "build_targets.conf"
         _ = config.write_text("targets=linux,natedev\nkind.linux=ssh\nplatform.linux=linux\nsettings.linux=linux_target.conf\n"
                               + "kind.natedev=local\nplatform.natedev=linux\n")
-        _ = write_config_fixture(config.parent / "linux_target.conf", "offload=on\nkinds=doc\n", template="mac_test")
+        _ = write_config_fixture(config.parent / "linux_target.conf", "kinds=doc\n", template="mac_test")
         runner = Path(self.environment["VERIFY_MAC_RUNNER"])
         self.environment["TEST_LINUX_DOC_RUN"] = str(self.root / "linux-doc-run")
         self.environment["TEST_PINNED_DOC"] = "1" if pinned else "0"

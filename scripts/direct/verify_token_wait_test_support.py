@@ -447,10 +447,10 @@ esac
         original_provider = admission.server.host_probe
         if wait_status == 75:
             _ = (self.root / "build_targets.conf").write_text(
-                "targets=natedev,mac\nkind.natedev=local\nplatform.natedev=linux\n"
+                "enabled.mac=on\ntargets=natedev,mac\nkind.natedev=local\nplatform.natedev=linux\n"
                 + "kind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac-settings\n")
             _ = write_config_fixture(self.root / "mac-settings",
-                f"offload=on\nlinux_only.{self.root.name}=\n", template="mac_test")
+                f"linux_only.{self.root.name}=\n", template="mac_test")
             from scripts.direct.verify_step_routes_test_support import RUNNER
 
             runner = self.root / "held-mac-runner.py"

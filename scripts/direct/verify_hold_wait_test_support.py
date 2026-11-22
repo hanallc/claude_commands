@@ -481,7 +481,7 @@ exit "$status"
         targets = "natedev" if runs_on == "natedev_only" else "natedev,mac"
         settings = Path(self.fixture.environment["MAC_TEST_CONFIG"])
         _ = (self.fixture.root / "build_targets.conf").write_text(
-            f"targets={targets}\nkind.natedev=local\nplatform.natedev=linux\n"
+            f"enabled.mac=on\ntargets={targets}\nkind.natedev=local\nplatform.natedev=linux\n"
             + f"kind.mac=ssh\nplatform.mac=macos\nsettings.mac={settings.name}\n")
         self.fixture.environment["BUILD_TARGETS_SCRIPT"] = str(TARGETS)
 

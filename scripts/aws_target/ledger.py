@@ -3235,6 +3235,7 @@ class SpendPageInputsNotCaptured:
 @dataclass(frozen=True)
 class SpendPageInputs:
     hana_hours: conf.ConfigRead
+    machine_registry: conf.ConfigRead
     step_names: build_steps.StepNames
     frame_template: str
     step_tip_template: str
@@ -3433,7 +3434,7 @@ def _spend_source_paths(book: CostLedger, at: int, settings_path: Path,
 
         paths.update((conf.path('hana_aws'), _REPOSITORY_HANA_HOURS_SETTINGS, conf.path('console'),
                       _REPOSITORY_CONSOLE_SETTINGS, conf.path('build_steps'), _REPOSITORY_BUILD_STEP_SETTINGS,
-                      SPEND_PAGE_SOURCE, memory_files.PAGE_SOURCE,
+                      conf.path('build_targets'), SPEND_PAGE_SOURCE, memory_files.PAGE_SOURCE,
                       *page_frame.title_source_paths()))
     versions = tuple(SpendSourceVersion(str(path.absolute()), _spend_path_stamp(path)) for path in sorted(paths))
     return _SpendSourcePaths(bills, journal, PageEvidenceRevision(at, versions))
@@ -3532,13 +3533,14 @@ def _captured_ledger(contents: str | SpendFileAbsent, journal: remote.HanaStartJ
     return state
 
 
-def _capture_spend_page(hana: conf.ConfigRead, console: conf.ConfigRead, steps: conf.ConfigRead) -> SpendPageInputs:
+def _capture_spend_page(hana: conf.ConfigRead, console: conf.ConfigRead, steps: conf.ConfigRead,
+                        machine_registry: conf.ConfigRead) -> SpendPageInputs:
     from scripts.build_queue import memory_files
     from scripts.review_links import console_theme, page_frame
 
     source = console_theme.with_theme(SPEND_PAGE_SOURCE.read_text(encoding='utf-8'))
     frame = page_frame.template(source, 'AWS', 'aws', settings=console)
-    return SpendPageInputs(hana, build_steps.read_step_names(steps), frame,
+    return SpendPageInputs(hana, machine_registry, build_steps.read_step_names(steps), frame,
                            memory_files.PAGE_SOURCE.read_text(encoding='utf-8'))
 
 
@@ -3579,7 +3581,8 @@ def capture_spend_evidence(directory: Path, now: int, *, settings_path: Path | N
                 hana = conf.read_or_repository('hana_aws').freeze()
                 console = conf.read_or_repository('console').freeze()
                 steps = conf.read_or_repository('build_steps').freeze()
-                page_inputs = _capture_spend_page(hana, console, steps)
+                machine_registry = conf.read(conf.path('build_targets'), load=conf.read_bytes).freeze_settings()
+                page_inputs = _capture_spend_page(hana, console, steps, machine_registry)
                 configurations = (account, gate, hana, console, steps)
             else:
                 account, gate = account.freeze_settings(), gate.freeze_settings()

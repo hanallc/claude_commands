@@ -170,7 +170,7 @@ class HanaRunnerTests(unittest.TestCase):
         self.paths.directory.mkdir(mode=0o700)
         _ = self.paths.boot_id.write_text('boot')
         self.permit = guest.WorkPermit(1100, '1', 'boot')
-        self.settings = replace(guest.read_settings(self.fixture.configuration), enabled=True)
+        self.settings = guest.read_settings(self.fixture.configuration, enabled=True)
         guest.write_permit(self.settings, self.permit, expected_generation=0, paths=self.paths, clock=lambda: 1000)
         self.descriptor = {'version': 1, 'deployment': 'deployment', 'start_token': 'start', 'expires': 1200}
         self.access = hana_protocol.HanaExecutionAccess(

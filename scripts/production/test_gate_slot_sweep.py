@@ -4,7 +4,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from contextlib import nullcontext, redirect_stderr, redirect_stdout
 import io
-import os
+from itertools import product
 from pathlib import Path
 import select
 import subprocess
@@ -16,7 +16,7 @@ from unittest import mock
 from scripts.copies import copies
 from scripts.lib import scratch
 from scripts.lint import sweep as folder_sweep
-from scripts.lib.build_slots_test_support import private_slot_config
+from scripts.message import send_budget
 from scripts.production import gate, staff
 from scripts.production.gate_modules import GateRefused
 
@@ -75,8 +75,7 @@ class NightlySlotSweepTests(unittest.TestCase):
 
     def test_local_sweep_failure_reports_once_and_keeps_the_nightly_result(self) -> None:
         for status in (0, 1, 75):
-            with self.subTest(status=status), tempfile.TemporaryDirectory() as temporary:
-                config = private_slot_config(Path(temporary), repository="fixture")
+            with self.subTest(status=status):
                 events: list[str] = []
                 notices: list[str] = []
 
@@ -90,6 +89,7 @@ class NightlySlotSweepTests(unittest.TestCase):
                     if argv[1].endswith("nix_env.py"):
                         self.assertEqual(list(argv[2:4]), ["exec", sys.executable])
                         self.assertTrue(argv[4].endswith("mac_queue_run.py"))
+                        self.assertNotIn("--manual", argv)
                         events.append("Mac")
                         self.assertEqual(list(argv[5:13]),
                                          ["--kind", "run", "--what", "Sweep unused Mac build folders", "--package", "claude",
@@ -108,7 +108,7 @@ class NightlySlotSweepTests(unittest.TestCase):
                         notices.append(argv[-1])
                     return subprocess.CompletedProcess(argv, 0, "", "")
 
-                with (mock.patch.dict(os.environ, config.environment),
+                with (mock.patch.object(send_budget, "seconds", return_value=1),
                       mock.patch.object(scratch, "copy_lock", return_value=nullcontext()),
                       mock.patch.object(gate, "nightly", return_value=status),
                       mock.patch.object(folder_sweep, "main", side_effect=sweep),
@@ -121,9 +121,9 @@ class NightlySlotSweepTests(unittest.TestCase):
                 self.assertEqual(output.getvalue().strip(), notices[0])
 
     def test_mac_sweep_failure_reports_once_and_keeps_the_nightly_result(self) -> None:
-        for status in (0, 1, 75):
-            with self.subTest(status=status), tempfile.TemporaryDirectory() as temporary:
-                config = private_slot_config(Path(temporary), repository="fixture")
+        refusals = ("refused\trepo", "enabled.mac is off")
+        for status, refusal in product((0, 1, 75), refusals):
+            with self.subTest(status=status, refusal=refusal):
                 notices: list[str] = []
 
                 def run(argv: Sequence[str], **options: object) -> subprocess.CompletedProcess[str]:
@@ -131,13 +131,14 @@ class NightlySlotSweepTests(unittest.TestCase):
                     if argv[1].endswith("nix_env.py"):
                         self.assertEqual(list(argv[2:4]), ["exec", sys.executable])
                         self.assertTrue(argv[4].endswith("mac_queue_run.py"))
-                        raise subprocess.CalledProcessError(2, argv, output="refused\trepo\n",
+                        self.assertNotIn("--manual", argv)
+                        raise subprocess.CalledProcessError(2, argv, output=refusal + "\n",
                                                             stderr="Mac queue: Sweep unused Mac build folders\n")
                     self.assertTrue(argv[1].endswith("send.py"))
                     notices.append(argv[-1])
                     return subprocess.CompletedProcess(argv, 0, "", "")
 
-                with (mock.patch.dict(os.environ, config.environment),
+                with (mock.patch.object(send_budget, "seconds", return_value=1),
                       mock.patch.object(scratch, "copy_lock", return_value=nullcontext()),
                       mock.patch.object(gate, "nightly", return_value=status),
                       mock.patch.object(folder_sweep, "main", return_value=0) as local,
@@ -147,34 +148,31 @@ class NightlySlotSweepTests(unittest.TestCase):
                 local.assert_called_once_with(["--unused-folders"])
                 self.assertEqual(len(notices), 1)
                 self.assertIn("on Mac failed:", notices[0])
-                self.assertIn("Mac queue: Sweep unused Mac build folders refused\trepo", notices[0])
+                self.assertIn(f"Mac queue: Sweep unused Mac build folders {refusal}", notices[0])
                 self.assertEqual(output.getvalue().strip(), notices[0])
 
     def test_gate_failure_still_sweeps_both_pools(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            config = private_slot_config(Path(temporary), repository="fixture")
-            events: list[str] = []
+        events: list[str] = []
 
-            def nightly(args: gate.GateArguments) -> int:
-                events.append("nightly:" + args.merge_branch)
-                raise GateRefused("gate failed")
+        def nightly(args: gate.GateArguments) -> int:
+            events.append("nightly:" + args.merge_branch)
+            raise GateRefused("gate failed")
 
-            def run(argv: Sequence[str], **options: object) -> subprocess.CompletedProcess[str]:
-                self.assertTrue(options["check"])
-                events.append("Mac")
-                return subprocess.CompletedProcess(argv, 0, "", "")
+        def run(argv: Sequence[str], **options: object) -> subprocess.CompletedProcess[str]:
+            self.assertTrue(options["check"])
+            events.append("Mac")
+            return subprocess.CompletedProcess(argv, 0, "", "")
 
-            def local(arguments: list[str]) -> int:
-                self.assertEqual(arguments, ["--unused-folders"])
-                events.append("local")
-                return 0
+        def local(arguments: list[str]) -> int:
+            self.assertEqual(arguments, ["--unused-folders"])
+            events.append("local")
+            return 0
 
-            with (mock.patch.dict(os.environ, config.environment),
-                  mock.patch.object(scratch, "copy_lock", return_value=nullcontext()),
-                  mock.patch.object(gate, "nightly", side_effect=nightly),
-                  mock.patch.object(folder_sweep, "main", side_effect=local),
-                  mock.patch.object(subprocess, "run", side_effect=run),
-                  redirect_stderr(io.StringIO()) as output):
-                self.assertEqual(gate.main(["--nightly", "--merge-branch", "fixture", "--unit", "fixture-merge"]), 1)
-            self.assertEqual(events, ["nightly:fixture", "local", "Mac"])
-            self.assertIn("gate failed", output.getvalue())
+        with (mock.patch.object(scratch, "copy_lock", return_value=nullcontext()),
+              mock.patch.object(gate, "nightly", side_effect=nightly),
+              mock.patch.object(folder_sweep, "main", side_effect=local),
+              mock.patch.object(subprocess, "run", side_effect=run),
+              redirect_stderr(io.StringIO()) as output):
+            self.assertEqual(gate.main(["--nightly", "--merge-branch", "fixture", "--unit", "fixture-merge"]), 1)
+        self.assertEqual(events, ["nightly:fixture", "local", "Mac"])
+        self.assertIn("gate failed", output.getvalue())
