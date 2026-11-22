@@ -5802,7 +5802,16 @@ class ServiceTests(unittest.TestCase):
                         self.assertEqual(waiting.text, queue_view.reason_phrase(row.reason,
                             gate.queue_read_from(inputs, policy=policy).view.waiting))
                 expected = gate.queue_read_from(inputs, policy=policy)
-                self.assertEqual(fixture.server.handle_request(wire.ViewRequest()), [wire.ViewReply(expected)])
+                viewed, = fixture.server.handle_request(wire.ViewRequest())
+                assert isinstance(viewed, wire.ViewReply)
+                line = viewed.reading.view.move_line
+                assert isinstance(line, records.QueueMoveLine)
+                started = {row.owner for row in starts}
+                self.assertEqual(line.members, tuple(
+                    records.QueueMoveMember(row.get("move_id", ""), movable=records.waiter_owner(row) not in started)
+                    for _, row in expected.ordered))
+                self.assertTrue(line.revision)
+                self.assertEqual(viewed, wire.ViewReply(replace(expected, view=replace(expected.view, move_line=line))))
                 explained = fixture.server.handle_request(wire.ExplainRequest())[0]
                 assert isinstance(explained, wire.ExplainReply)
                 self.assertEqual(explained.explanation.decided_from, inputs)
@@ -5822,11 +5831,16 @@ class ServiceTests(unittest.TestCase):
             projected = gate.queue_read_from_pass(inputs, policy, result)
             self.assertEqual(projected, gate.queue_read_from(inputs, policy))
             with mock.patch.object(gate, "admission_pass", wraps=gate.admission_pass) as walk:
-                viewed = fixture.server.handle_request(wire.ViewRequest())
+                viewed, = fixture.server.handle_request(wire.ViewRequest())
                 explained = fixture.server.handle_request(wire.ExplainRequest())
                 mine = fixture.server.handle_request(wire.MineRequest(request.identity.session_id))
             walk.assert_not_called()
-            self.assertEqual(viewed, [wire.ViewReply(projected)])
+            assert isinstance(viewed, wire.ViewReply)
+            line = viewed.reading.view.move_line
+            assert isinstance(line, records.QueueMoveLine)
+            self.assertEqual(line.members, (records.QueueMoveMember(fixture.server.waiters[request.episode].row.get("move_id", "")),))
+            self.assertTrue(line.revision)
+            self.assertEqual(viewed, wire.ViewReply(replace(projected, view=replace(projected.view, move_line=line))))
             self.assertEqual(explained, [wire.ExplainReply(projected.explanation)])
             own = mine[0]
             assert isinstance(own, wire.MineReply)

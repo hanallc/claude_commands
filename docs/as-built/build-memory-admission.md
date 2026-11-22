@@ -2401,6 +2401,7 @@ When placement preparation sees a remote start, it ends the startup hold and rem
 The table includes remote-only waits in queue order.
 The table identifies waits that a build hold blocks.
 Speculative Mac copy rows show the newest-first rule.
+A speculative Mac copy waits for placement outside the table while its parent holds local memory.
 A refusal before launch keeps the pin. Closing the attempt removes the local waiter and drops its slot claim.
 
 The service checks the order revision for all rows, including rows without handles.

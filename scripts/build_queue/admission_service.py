@@ -2015,6 +2015,17 @@ class AdmissionServer:
             members.append(records.QueueMoveMember(row_id, movable=row_id in movable))
         return self._revise_move_line(tuple(members))
 
+    def _published_queue_order(self, ordered: list[tuple[Path, records.RankedWaiter]]
+                               ) -> list[tuple[Path, records.RankedWaiter]]:
+        # A speculative copy still waits for placement while its parent holds local memory.
+        hidden = {place.move_id for request in self.placement_requests.values()
+                  if isinstance(request.purpose, placement.SpeculativeCopy)
+                  and (parent := self.reservations.get(request.purpose.parent_episode)) is not None
+                  and isinstance(parent.place, wire.LocalPlace)
+                  and (place := self.places.get(_place_key(request.owner, request.since))) is not None
+                  and place.episode == request.episode}
+        return [(path, row) for path, row in ordered if row.get("move_id") not in hidden]
+
     def _revise_move_line(self, members: tuple[records.QueueMoveMember, ...]) -> records.QueueMoveLine:
         if members != self.move_line.members:
             self.move_line = records.QueueMoveLine(uuid.uuid4().hex, members)
@@ -2904,6 +2915,7 @@ class AdmissionServer:
                 or not isinstance(self.last_policy, records.AdmissionPolicy)
                 or not isinstance(self.last_result, gate.PassResult)):
             return
+        ordered = self._published_queue_order(ordered)
         reading = replace(gate.queue_read_from_pass(self.last_inputs, self.last_policy, self.last_result),
                           diagnostics=self.last_diagnostics)
         local = {path: replace(step, verify=row.get("verify", step.verify))
@@ -4923,7 +4935,7 @@ done
         if isinstance(self.configuration, gate.UnusableAdmissionConfiguration):
             return [wire.Refused(self.configuration.reason)]
         full_order = self._full_queue_order(self._ranked_waiters())
-        rows = self._visible_queue_order(full_order)
+        rows = self._published_queue_order(self._visible_queue_order(full_order))
         line = self._current_move_line(rows, self._movable_wait_ids(check_owners=True))
         result = self._move_destination(request, line, [row.get("move_id", "") for _, row in full_order])
         if isinstance(result, wire.QueueMoveConflict):
