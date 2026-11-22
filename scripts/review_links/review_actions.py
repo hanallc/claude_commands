@@ -16,7 +16,7 @@ from scripts.nightly_review import candidates
 from scripts.production import change_review, change_routing, investigation, proposal_issue, staff, update_registration
 from scripts.production.production_doc import Production
 from scripts.review_links import change_page, decision_store, efficiency_reviews, new_item_dialog, review_items, review_later, review_submissions
-from scripts.review_links import question_record
+from scripts.review_links import question_record, reply_tokens
 from scripts.review_links import review_events
 from scripts.review_links.review_events import KeepMark, MarkChange, NoMark, ReviewMark
 
@@ -26,7 +26,10 @@ PY = '~/.claude/scripts/lib/py ~/.claude/scripts/'
 @dataclass(frozen=True)
 class ScopedWait:
     key: str
-    token: str = field(default_factory=new_item_dialog.new_reply_token, repr=False)
+    proof: reply_tokens.ReplyTokenProof = field(default_factory=reply_tokens.mint)
+
+    def command(self) -> change_page.ScopedReplyCommand:
+        return {"key": self.key, "token_sha256": self.proof.sha256}
 
 
 @dataclass(frozen=True)
@@ -176,10 +179,12 @@ def sent_question_action(item: review_items.ReviewItem, record: update_registrat
         'owner':record.owner,'question':item.title,'answer':words if action == 'answer' else '',
         'message':message,'kind':action}
     if isinstance(scoped, ScopedWait):
-        saved['question_id'] = scoped.token
+        command = scoped.command()
+        saved['question_id'] = command['token_sha256']
         saved['question_text'] = words
+        saved['scoped_reply'] = command
         saved['message'] = message.replace(change_page.reply_command(item.key),
-                                           change_page.reply_command(scoped.key, scoped.token))
+                                           change_page.reply_command(scoped.key))
     page = change_page.UserQuestionPage(record.path, document, (record.path.stem,), '', saved)
 
     def save() -> None:
@@ -189,7 +194,7 @@ def sent_question_action(item: review_items.ReviewItem, record: update_registrat
             if item.state == review_items.ReviewState.WAITING:
                 record_superseded(item, action, scope=scope)
             update_registration.review_sent_question(record, scope, action, words,
-                                                    scoped.token if isinstance(scoped, ScopedWait) else '')
+                                                    scoped.proof if isinstance(scoped, ScopedWait) else reply_tokens.MINT_REPLY_PROOF)
 
     delivery = save_delivery(page, record.owner, save, status, change_page.NoQuestion())
     return delivery, {'answer': words, 'question': 'question sent', 'feedback': 'feedback sent'}[action]
@@ -240,14 +245,24 @@ def send(item: review_items.ReviewItem, path: Path, row: str, message: str, save
          scoped: ScopedWait | NoScopedWait = NO_SCOPED_WAIT) -> change_page.MessageDelivery:
     """Save the action and its message under one delivery claim, then deliver it to the owner."""
     question: change_page.NoQuestion | change_page.OpenQuestion = change_page.NoQuestion()
-    if question_text:
-        identity = scoped.token if isinstance(scoped, ScopedWait) else secrets.token_hex(4)
-        key = scoped.key if isinstance(scoped, ScopedWait) else item.key
-        question = change_page.OpenQuestion(identity, question_text, change_page.NoDelivery())
-        message = message.replace(change_page.reply_command(item.key), change_page.reply_command(key, identity))
     saved: change_page.StoredReviewMessage = {'saved':False,'source':str(path),'owner':item.owner,'message':message,'row':row}
+    if question_text:
+        if isinstance(scoped, ScopedWait):
+            command = scoped.command()
+            saved['scoped_reply'] = command
+            identity = command['token_sha256']
+            reply = change_page.reply_command(scoped.key)
+        else:
+            identity = secrets.token_hex(4)
+            reply = change_page.reply_command(item.key, identity)
+        question = change_page.OpenQuestion(identity, question_text, change_page.NoDelivery())
+        saved['message'] = message.replace(change_page.reply_command(item.key), reply)
     page = change_page.ReviewMessagePage(path,path.parent,(row,),'',saved)
     return save_delivery(page, item.owner, save, status, question)
+
+
+class SubmissionDeliveryPending(OSError):
+    """Another request is sending this item."""
 
 
 def prepare_submission_delivery(saved: review_submissions.SavedSubmission, words: str,
@@ -256,9 +271,11 @@ def prepare_submission_delivery(saved: review_submissions.SavedSubmission, words
     """Claim the first message for a published native request."""
     row = saved.request_id
     path = saved.original_path
+    if not saved.awaiting_reply:
+        return change_page.NoMessageDelivery()
     evidence = f"\n\nEvidence in Review\n{evidence_url}" if evidence_url else ""
     message = (f'New {saved.kind} {saved.id} from Review.\n\n{words}{evidence}\n\n'
-               + change_page.reply_command(saved.key, saved.reply_token))
+               + change_page.reply_command(saved.key))
     record: change_page.StoredReviewMessage = {
         'source': str(path), 'row': row, 'saved': True, 'owner': saved.owner,
         'message': message, 'submission_request': row,
@@ -267,21 +284,33 @@ def prepare_submission_delivery(saved: review_submissions.SavedSubmission, words
     with status.locked():
         stored = status.metadata_page(page)
         slots = status.slots(page, row)
-        if isinstance(stored, change_page.ReviewMessagePage) and stored.saved.get('submission_request') == row:
-            page = stored
-            if page.saved.get('submission_delivered'):
-                return change_page.NoMessageDelivery()
         intent = slots.verdict
-        if isinstance(intent, change_page.DeliveryIntent):
-            if status.owns_live_claim(page, row, intent.attempt):
-                return change_page.NoMessageDelivery()
+        if isinstance(intent, change_page.DeliveryIntent) and status.owns_live_claim(page, row, intent.attempt):
+            raise SubmissionDeliveryPending("This item is still sending.")
+        if not isinstance(stored, change_page.ReviewMessagePage) or stored.saved.get('submission_request') != row:
+            stored = page
+        if stored.saved.get('submission_delivered'):
+            return change_page.NoMessageDelivery()
+        saved = review_submissions.renew_legacy_reply(saved)
+        if not saved.awaiting_reply:
+            return change_page.NoMessageDelivery()
+        command: change_page.ScopedReplyCommand = {'key': saved.key, 'token_sha256': saved.details.reply_token_sha256}
+        if stored.saved.get('scoped_reply') == command:
+            page = stored
         else:
+            page = replace(page, saved={**record, 'owner': saved.owner, 'scoped_reply': command})
+            # A new proof changes the message. Give it a new delivery key.
+            intent = change_page.NoDelivery()
+        if not isinstance(intent, change_page.DeliveryIntent):
             recipient = staff.StaffId(page.saved['owner'])
             intent = change_page.DeliveryIntent(secrets.token_hex(), 'verdict', recipients=(recipient,))
+        delivery = change_page.MessageDelivery(page, row, intent.recipients, page.saved['message'], intent.attempt,
+                                               (staff.StaffId(page.saved['owner']),))
+        _ = change_page.outbound_review_message(delivery)
+        if slots.verdict != intent:
             status.write_slots(page, row, slots.updated('verdict', intent))
         status.request_attempts[intent.attempt] = change_page.AttemptOwnership(status.path(page, row), 'claimed')
-    return change_page.MessageDelivery(page, row, intent.recipients, page.saved['message'], intent.attempt,
-                                       (staff.StaffId(page.saved['owner']),))
+    return delivery
 
 
 def save_delivery(page: change_page.ReviewMessagePage | change_page.UserQuestionPage, owner: staff.StaffId,
@@ -330,13 +359,13 @@ def investigation_action(item: review_items.ReviewItem, action: str, words: str,
     def save() -> None:
         if waiting:
             if isinstance(scoped, ScopedWait):
-                _ = investigation.review_action(record.owner, record.id, action, words, reply_token=scoped.token, check=verify_revision)
+                _ = investigation.review_action(record.owner, record.id, action, words, new_reply_proof=scoped.proof, check=verify_revision)
             else:
                 investigation.change_waiting(record, action, words, check=verify_revision)
             with review_items.after_store_write(item.key):
                 record_superseded(item, action)
         elif isinstance(scoped, ScopedWait):
-            _ = investigation.review_action(record.owner, record.id, action, words, reply_token=scoped.token, check=verify_revision)
+            _ = investigation.review_action(record.owner, record.id, action, words, new_reply_proof=scoped.proof, check=verify_revision)
         elif action == 'read':
             _ = investigation.mark_read(record.owner, record.id, words, check=verify_revision)
         else:
@@ -423,7 +452,8 @@ def decision_action(item: review_items.ReviewItem, action: str, words: str,
             else:
                 _ = proposal_issue.record_review(issue, events, mark, day, check=verify_revision,
                                                  waiting_why=words if action == 'question' else '',
-                                                 reply_token=scoped.token if isinstance(scoped, ScopedWait) else '')
+                                                 new_reply_proof=scoped.proof if isinstance(scoped, ScopedWait)
+                                                 else reply_tokens.MINT_REPLY_PROOF)
             if waiting:
                 with review_items.after_store_write(item.key):
                     log_superseded(item, events[0])

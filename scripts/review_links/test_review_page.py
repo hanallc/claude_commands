@@ -43,7 +43,7 @@ from scripts.production import change_review, change_routing, footer_counts, inv
 from scripts.review_links import change_browser, change_page, console, page_frame, record_table, review_items, review_page
 from scripts.review_links import question_record
 from scripts.review_links import list_page, staff_names, test_change_page
-from scripts.review_links import efficiency_reviews, new_item_dialog, review_actions, review_events, review_later, review_submissions
+from scripts.review_links import efficiency_reviews, new_item_dialog, reply_tokens, review_actions, review_events, review_later, review_submissions
 from scripts.review_links.test_accounts_page import firefox_probe_results
 from scripts.review_links.test_page_frame import assert_status_states
 from scripts.review_links.test_record_table import save_notice_failures
@@ -396,7 +396,7 @@ window.fetch=(url,options)=>{
         for kind in investigation.InvestigationKind:
             request = self.submission_request(new_item_dialog.SubmissionKind(kind.value), unit.id)
             origin = new_item_dialog.ReviewSubmission(
-                request.request_id, 'a'*64, request.evidence, (), new_item_dialog.new_reply_token())
+                request.request_id, 'a'*64, request.evidence, (), 'b'*64)
             reports.append(investigation.file(owner.id, request.words, request.words, kind=kind,
                                                waiting_why='The owner checks the report.', submission=origin))
         snapshot = review_page.build_snapshot(self.root)
@@ -3803,7 +3803,7 @@ window.fetch=async()=>{reads++;throw new Error('An index filter requested the se
                 delivery, _ = review_page.submit(self.root, body, self.status, snapshot=snapshot)
                 assert isinstance(delivery, change_page.MessageDelivery)
                 path = self.status.path(delivery.page, delivery.row)
-                original_message = delivery.message
+                original_message = change_page.outbound_review_message(delivery).text
                 write = atomic_file.write_bytes_atomic
                 send = change_page.send_to_staff
                 original_sends = 0
@@ -3878,12 +3878,13 @@ window.fetch=async()=>{reads++;throw new Error('An index filter requested the se
                     if case == "response":
                         current = review_page.build_snapshot(self.root)
                         self.assertEqual(current.records[key].state, review_items.ReviewState.WAITING)
-                        for source in (current, None):
-                            with self.assertRaises(review_items.ReviewRecordChanged):
-                                _ = review_page.submit(self.root, body, self.status, snapshot=source)
-                            replayed = self.status.slots(delivery.page, delivery.row).verdict
-                            assert isinstance(replayed, change_page.DeliveryIntent)
-                            self.assertEqual(replayed.attempt, delivery.attempt)
+                        with patch.object(reply_tokens, 'path', return_value=self.root / 'absent-reply-token.key'):
+                            for source in (current, None):
+                                with self.assertRaises(review_items.ReviewRecordChanged):
+                                    _ = review_page.submit(self.root, body, self.status, snapshot=source)
+                                replayed = self.status.slots(delivery.page, delivery.row).verdict
+                                assert isinstance(replayed, change_page.DeliveryIntent)
+                                self.assertEqual(replayed.attempt, delivery.attempt)
                     change_page.recover_pending(change_page.DeliveryStatus(self.root))
                 send_key = change_page.review_delivery_key(delivery.page.review_list, delivery.row, delivery.attempt)
                 self.assertEqual(seen, [send_key] * 2)

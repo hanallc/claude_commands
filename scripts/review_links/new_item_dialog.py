@@ -1,18 +1,16 @@
 """Render the shared New item dialog."""
 from __future__ import annotations
 
-import hmac
 import json
 import math
 import re
-import secrets
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime
 from enum import StrEnum
 from typing import Literal, cast
 
 from scripts.production import staff
-from scripts.review_links import page_frame
+from scripts.review_links import page_frame, reply_tokens
 
 
 MAX_WORDS_LENGTH = 40_000
@@ -215,10 +213,29 @@ class ReviewSubmission:
     request_digest: str
     evidence: Evidence
     images: tuple[ImageReference, ...]
-    reply_token: str = field(repr=False)
+    reply_token_sha256: str
     page: str = ""
     page_state: BugPageState | None = None
     page_state_data: PageDataEvidence | None = None
+    reply_token_nonce: str = ""
+    legacy_reply_token: str = field(default="", repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        if reply_tokens.valid(self.reply_token_sha256):
+            token = self.reply_token_sha256
+            object.__setattr__(self, "reply_token_sha256", reply_tokens.digest(token))
+            object.__setattr__(self, "legacy_reply_token", token)
+
+    @property
+    def reply_proof(self) -> reply_tokens.ReplyTokenProof:
+        return reply_tokens.ReplyTokenProof(self.reply_token_nonce, self.reply_token_sha256)
+
+    @property
+    def reply_token(self) -> str:
+        return reply_tokens.derive(self.reply_proof) if self.reply_token_nonce else self.legacy_reply_token
+
+    def with_reply_proof(self, proof: reply_tokens.ReplyTokenProof) -> ReviewSubmission:
+        return replace(self, reply_token_sha256=proof.sha256, reply_token_nonce=proof.nonce, legacy_reply_token="")
 
     @property
     def bug_page_data(self) -> PageDataEvidence | None:
@@ -498,6 +515,9 @@ def read_image_reference(value: object) -> ImageReference:
 def stored_submission(details: ReviewSubmission) -> dict[str, object]:
     """Write the submission fields inside the native record."""
     fields = cast(dict[str, object], asdict(details))
+    _ = fields.pop("legacy_reply_token")
+    if not details.reply_token_nonce:
+        _ = fields.pop("reply_token_nonce")
     if details.page_state is None:
         _ = fields.pop("page_state")
     if details.page_state_data is None:
@@ -514,24 +534,49 @@ def read_submission(value: object) -> ReviewSubmission:
     data = read_evidence(row["page_state_data"]) if row.get("page_state_data") is not None else None
     if data is not None and not isinstance(data, PageDataEvidence):
         raise SubmissionError("Invalid page data in Review submission.")
+    digest = row.get("reply_token_sha256")
+    legacy = row.get("reply_token")
+    if digest is None and isinstance(legacy, str) and reply_tokens.valid(legacy):
+        digest = reply_tokens.digest(legacy)
+    if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+        raise SubmissionError("Invalid reply token hash.")
+    nonce = row.get("reply_token_nonce", "")
+    if not isinstance(nonce, str) or nonce and not reply_tokens.valid_nonce(nonce):
+        raise SubmissionError("Invalid reply token nonce.")
     return ReviewSubmission(
         read_request_id(row.get("request_id")), _text(row.get("request_digest"), "Request digest", 64),
         read_evidence(row.get("evidence")), tuple(read_image_reference(image) for image in images),
-        _text(row.get("reply_token"), "Reply token", 43), page, read_bug_page_state(row.get("page_state")), data)
+        digest, page, read_bug_page_state(row.get("page_state")), data, nonce,
+        legacy if isinstance(legacy, str) and reply_tokens.matches(digest, legacy) else "")
+
+
+def hashed_submission_fields(value: dict[str, object], details: ReviewSubmission) -> dict[str, object]:
+    """Replace the legacy token and retain all other submission fields."""
+    if "reply_token" not in value:
+        return value
+    return {("reply_token_sha256" if name == "reply_token" else name):
+            (details.reply_token_sha256 if name == "reply_token" else field)
+            for name, field in value.items() if name != "reply_token" or "reply_token_sha256" not in value}
+
+
+def renewed_submission_fields(value: dict[str, object], proof: reply_tokens.ReplyTokenProof) -> dict[str, object]:
+    """Replace the token proof and preserve the other submission fields."""
+    fields = {**value, "reply_token_sha256": proof.sha256, "reply_token_nonce": proof.nonce}
+    _ = fields.pop("reply_token", None)
+    return fields
 
 
 def decode_submission(value: str) -> SubmissionOrigin:
     return read_submission(cast(object, json.loads(value))) if value else NoReviewSubmission()
 
 
+def matches_reply_token(details: ReviewSubmission, token: str) -> bool:
+    return reply_tokens.matches(details.reply_token_sha256, token)
+
+
 def require_reply_token(details: SubmissionOrigin, token: str) -> None:
-    if not isinstance(details, ReviewSubmission) or not re.fullmatch(r"[A-Za-z0-9_-]{43}", token) or not (
-            hmac.compare_digest(token, details.reply_token)):
+    if not isinstance(details, ReviewSubmission) or not matches_reply_token(details, token):
         raise SubmissionError("The reply token does not match this item.")
-
-
-def new_reply_token() -> str:
-    return "r" + secrets.token_urlsafe(31)
 
 
 def max_base64_size() -> int:

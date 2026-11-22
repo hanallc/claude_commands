@@ -23,7 +23,7 @@ from scripts.production.issues import Issue, frontmatter
 from scripts.production import proposals_folder, record_store, staff, unit_names
 from scripts.production.staff_test_support import fixture_runtime_id
 from scripts.lib.user_zone import user_zone
-from scripts.review_links import new_item_dialog
+from scripts.review_links import new_item_dialog, reply_tokens
 from scripts.review_links.review_events import ReviewMark
 from scripts.style import rules
 
@@ -69,8 +69,11 @@ class ProposalIssueTests(unittest.TestCase):
         home = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.runtime = home / ".local/state/proposal-issue/locks"
         _ = self.enterContext(mock.patch.object(Path, "home", return_value=home))
+        _ = self.enterContext(mock.patch.object(reply_tokens, "platform", "linux"))
         self.enterContext(mock.patch.dict(os.environ, {"USER_ZONE": "America/New_York", "XDG_RUNTIME_DIR": str(self.runtime),
-                                                     "SHOWRUNNER_STATE_DIR": str(home / "showrunners")}))
+                                                     "XDG_STATE_HOME": str(home / "key-state"),
+                                                     "SHOWRUNNER_STATE_DIR": str(home / "showrunners"),
+                                                     "REVIEW_LINKS_ROOT": str(home / "review-links")}))
         members: tuple[tuple[str, staff.Kind], ...] = (
             ("hana", "showrunner"), ("build-report", "unit"), ("u", "unit"),
             ("names", "unit"), ("style", "showrunner"), ("sample-style", "showrunner"))
@@ -94,6 +97,9 @@ class ProposalIssueTests(unittest.TestCase):
         issue = proposal_issue.file_review_proposal(folder, recipient, "Next proposal", "Words",
                                                     "hana answers this", details)
         self.assertEqual(issue.value("proposal_id"), "P2")
+        note = issue.path.read_text(encoding="utf-8")
+        self.assertNotIn(details.reply_token, note)
+        self.assertIn(details.reply_token_sha256, note)
         self.assertEqual(proposal_issue.number([issue.path], date(2026, 11, 17)), ["number next proposal.md: P2"])
         archive = self.root / proposal_issue.ARCHIVE
         archive.mkdir(parents=True)
@@ -117,6 +123,7 @@ class ProposalIssueTests(unittest.TestCase):
         self.assertEqual(approved.value(proposal_issue.REVIEW_MARK_FIELD), "")
         key = new_item_dialog.ScopedSubmissionKey(new_item_dialog.SubmissionKind.PROPOSAL, recipient,
                                                    issue.value("proposal_id"), details.request_id)
+        self.assertFalse(reply_tokens.path().exists())
         with self.assertRaisesRegex(new_item_dialog.SubmissionError, "no longer accepts"):
             _ = proposal_issue.reply_to_submission(issue.path, key, "Stale reply", details.reply_token, owner=key.recipient_id)
 

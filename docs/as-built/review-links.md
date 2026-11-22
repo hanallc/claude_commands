@@ -612,6 +612,45 @@ A Response shows the original Question, the owner's latest answer, its time and 
 The Your words placeholder names **Ask a follow-up** as the action that sends the text.
 The Question waits for that reply, then returns as a Response with the same key.
 Both actions retain the current filters.
+
+#### Reply tokens for New item
+
+The native Question, Proposal, Investigation or Bug stores `review_submission.reply_token_nonce` and
+`review_submission.reply_token_sha256`.
+Each new item or wait gets a random nonce.
+Review derives a 43-character token from the nonce and the shared key with HMAC-SHA256.
+The note stores only the nonce and the SHA-256 hash for this token.
+The reply command hashes its token and compares the hashes in constant time.
+Either machine can verify a reply from the note alone.
+
+Each server stores the 32-byte secret key in `$XDG_STATE_HOME/review-links/reply-token.key` with mode `0600`.
+The default path is `~/.local/state/review-links/reply-token.key`.
+The server creates the key folder with mode `0700`.
+The server rejects a key path inside the served root after it resolves both paths.
+natedev creates the key once when it needs to mint a token.
+On first use, the Mac copies the key from natedev over SSH and checks its size before saving it.
+If another process saves the key first, the Mac reads that file.
+Both servers keep the existing key if they cannot read it or if it has an invalid size.
+New delivery records store the submission key and hash.
+The sender reads the nonce from the note and checks the derived token against the hash before sending it.
+If token derivation fails during delivery, the server records a delivery failure and returns HTTP 503.
+Send uses the transport result even if the server cannot save the delivery failure.
+The dialog shows the error and keeps the draft for another Send.
+A retry after the wait ends returns the existing item without sending another message.
+
+From the repository, run `scripts/lib/py -m scripts.review_links.review_submissions scrub-reply-tokens`.
+The command finds native records in their current folders, former folders and archives.
+It replaces each old `reply_token` field with its SHA-256 hash.
+It changes no other fields and creates no nonce.
+It prints each note it changes.
+A second scrub makes no changes.
+The old token still verifies after the scrub.
+A Send that needs to deliver a legacy wait writes a new nonce and hash.
+A replacement wait also writes a new nonce and hash.
+The old token stops working when the note gets the new hash.
+
+#### Other Review actions
+
 Changes offer Works and Does not work in the closing group.
 Ask showrunner to check, Ask question and Send feedback transfer the change to the showrunner.
 Investigations offer Mark read and Send feedback in that group.

@@ -17,7 +17,7 @@ from urllib.parse import parse_qs, urlsplit
 
 from scripts.agents.remote import local_machine
 from scripts.production import investigation, staff
-from scripts.review_links import console_theme, new_item_dialog, page_frame, review_submissions
+from scripts.review_links import console_theme, new_item_dialog, page_frame, reply_tokens, review_submissions
 from scripts.review_links.test_review_submissions import EVIDENCE, OWNER, PNG, identify_fixture_image
 
 ENDPOINT = "/console/review/new-item"
@@ -582,7 +582,7 @@ class DialogFixture:
 
     def environment(self) -> dict[str, str]:
         return {"SHOWRUNNER_STATE_DIR": str(self.root / "state"), "REVIEW_LINKS_ROOT": str(self.root / "review"),
-                "CONF_DIR": str(self.root / "config")}
+                "XDG_STATE_HOME": str(self.root / "key-state"), "CONF_DIR": str(self.root / "config")}
 
 
 def capture_dialogs(output: Path, fixtures: dict[int, DialogFixture], *, pages: dict[int, bytes] | None = None) -> None:
@@ -668,7 +668,9 @@ def capture_dialogs(output: Path, fixtures: dict[int, DialogFixture], *, pages: 
             try:
                 request = review_submissions.read_request(fields)
                 fixture.posts.append(request)
-                with patch.dict(os.environ, fixture.environment()), patch.object(Path, "home", return_value=fixture.root):
+                with (patch.dict(os.environ, fixture.environment()),
+                      patch.object(Path, "home", return_value=fixture.root),
+                      patch.object(reply_tokens, "platform", "linux")):
                     item = review_submissions.submit(request)
             except review_submissions.SubmissionConflict as error:
                 self.send_json(error.status, {"reason": str(error)})
@@ -706,6 +708,21 @@ def capture_dialogs(output: Path, fixtures: dict[int, DialogFixture], *, pages: 
 
 
 class NewItemDialogTests(unittest.TestCase):
+    def test_legacy_reply_token_has_the_same_digest_as_the_stored_proof(self) -> None:
+        token = "a" * 43
+        details = new_item_dialog.ReviewSubmission("fixture", "b" * 64, new_item_dialog.NoEvidence(), (),
+                                                  reply_tokens.digest(token))
+        fields = new_item_dialog.stored_submission(details)
+        self.assertEqual(fields.get("reply_token_sha256"), reply_tokens.digest(token))
+        self.assertNotIn(token, json.dumps(fields))
+        del fields["reply_token_sha256"]
+        fields["reply_token"] = token
+        restored = new_item_dialog.read_submission(fields)
+        self.assertEqual(restored, details)
+        new_item_dialog.require_reply_token(restored, token)
+        with self.assertRaises(new_item_dialog.SubmissionError):
+            new_item_dialog.require_reply_token(restored, "b" * 43)
+
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for dialog behavior")
     def test_bug_dialog_reports_the_open_page_even_without_a_screenshot(self) -> None:
         temporary = Path(self.enterContext(tempfile.TemporaryDirectory()))
