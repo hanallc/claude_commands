@@ -1143,6 +1143,9 @@ def command_release_wait(pid: int, *,
 
     session = claim_state.submitting_session(session)
     start = process_identity.process_start(pid)
+    if isinstance(start, process_identity.Unreadable):
+        print(f"cannot read claim owner {pid}: {start.reason}", file=sys.stderr)
+        return 2
     if not isinstance(start, process_identity.Started):
         return 0
     for target in read_targets():

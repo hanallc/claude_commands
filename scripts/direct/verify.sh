@@ -917,7 +917,7 @@ run_step() {
     fi
     # A reservation for this call must not cover the next step's local waits.
     if [[ -n "${HOLD_WAIT_DIR:-}" && -s "$HOLD_WAIT_DIR/ssh-reservation" ]]; then
-        release_wait_claim
+        release_wait_claim || return $?
     fi
     local attempt status started ended step_log monitor=0 LINT_REPAIR_REUSED_GRANT=0
     local STEP_WRITES_TREE=0
@@ -2436,7 +2436,8 @@ runpy.run_path(sys.argv[0], run_name="__main__")
     trap - INT TERM HUP
     eval "$caller_traps"
     MAC_RUNNER_PID=""
-    release_wait_claim
+    local claim_release_status=0
+    release_wait_claim || claim_release_status=$?
 
     if result_text="$(verify_helper "$VERIFY_START_DIR/runner_result.py" \
         "$MAC_RESULT_FILE" "$runner_status" "$selected_is_mac")"; then
@@ -2462,6 +2463,13 @@ runpy.run_path(sys.argv[0], run_name="__main__")
         rm -f "$MAC_RESULT_FILE"
     fi
     MAC_RESULT_FILE=""
+
+    if (( claim_release_status != 0 )); then
+        exec 9>&-
+        rm -f "$MAC_LOG_FILE"
+        MAC_LOG_FILE=""
+        return "$claim_release_status"
+    fi
 
     if [[ "$result_usable" == 0 ]]; then
         BUILDLOG_MAC=declined
@@ -2756,13 +2764,26 @@ target_for_settings() {
 
 release_wait_claim() {
     [[ -n "${HOLD_WAIT_DIR:-}" ]] || return 0
-    local claim_id="" episode="" attempt="" claim_session=""
+    [[ -e "$HOLD_WAIT_DIR/ssh-reservation" || -e "$HOLD_WAIT_DIR/ssh-reservation.identity" ]] || return 0
+    local claim_id="" episode="" attempt="" claim_session="" error="" status=0
     if [[ -s "$HOLD_WAIT_DIR/ssh-reservation.identity" ]]; then
-        IFS=$'\t' read -r claim_id episode attempt claim_session < "$HOLD_WAIT_DIR/ssh-reservation.identity"
-        verify_helper "$BUILD_TARGETS_SCRIPT" release-wait --pid $$ --claim-id "$claim_id" \
-            --episode "$episode" --attempt "$attempt" --session "$claim_session" >/dev/null 2>&1 || true
+        IFS=$'\t' read -r claim_id episode attempt claim_session < "$HOLD_WAIT_DIR/ssh-reservation.identity" || true
+    fi
+    if [[ -n "$claim_id" && -n "$episode" && -n "$attempt" ]]; then
+        error="$(verify_helper "$BUILD_TARGETS_SCRIPT" release-wait --pid "$$" --claim-id "$claim_id" \
+            --episode "$episode" --attempt "$attempt" --session "$claim_session" 2>&1 >/dev/null)" || status=$?
+    else
+        status=2
+        error="the exact claim identity is unavailable"
     fi
     rm -f "$HOLD_WAIT_DIR/ssh-reservation" "$HOLD_WAIT_DIR/ssh-reservation.identity"
+    if (( status != 0 )); then
+        error=${error//$'\n'/ }
+        printf 'verify.sh: cannot release SSH claim %s (status %s)%s\n' \
+            "${claim_id:-unknown}" "$status" "${error:+: $error}" >&2
+        build_check_record_failure 'the SSH claim release is unconfirmed'
+        return 2
+    fi
 }
 
 
@@ -2771,7 +2792,7 @@ try_reserved_target() {
     [[ -n "${PLACEMENT_ASSIGNMENT_FILE:-}" && -s "$PLACEMENT_ASSIGNMENT_FILE" ]] || return 2
     [[ "${PLACEMENT_PROVIDER:-local}" != local ]] || return 2
     if [[ "$STEP_ASSIGNED_TARGET" != hana-gpu && ! -f "$MAC_RUNNER" ]]; then
-        release_wait_claim
+        release_wait_claim || return $?
         verify_helper "$BUILDLOG_MEM_ADMIT_SCRIPT" claim-failed --assignment-file "$PLACEMENT_ASSIGNMENT_FILE" \
             --reason runner >/dev/null || return $?
         if [[ "$STEP_ASSIGNED_PLATFORM" == macos ]]; then

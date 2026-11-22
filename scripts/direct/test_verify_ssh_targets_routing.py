@@ -7,7 +7,8 @@ import io
 import json
 import os
 from pathlib import Path
-from typing import cast
+import subprocess
+from typing import TypedDict, cast, override
 from unittest import mock
 
 from scripts.aws_target import hana_placement_adapter as hana
@@ -17,10 +18,99 @@ from scripts.direct.verify_dev_features_test_support import add_dev_features
 from scripts.direct import verify_ssh_targets_test_support as support
 from scripts.build_queue import admission_protocol as wire, admission_service as service, placement
 from scripts.direct.verify_ssh_targets_test_support import VerifySshTargetsFixture
+from scripts.lib.helper_tree_test_support import copy_helpers
 from scripts.mac_test import claim_state, mac_test
 
 
+class ClaimReleaseObservation(TypedDict):
+    identity: list[str]
+    reserved_identity: list[str]
+    remaining: list[str]
+    availability: str
+
+
 class VerifySshRoutingTests(VerifySshTargetsFixture):
+    @override
+    def build_fixture(self) -> None:
+        super().build_fixture()
+        _ = copy_helpers(self.home, "scripts/style/git_process.py", "scripts/review_links")
+
+    def run_prelaunch_mac_refusal(self, *, refuse_release: bool) -> tuple[subprocess.CompletedProcess[str], ClaimReleaseObservation]:
+        self.configure("mac,natedev")
+        self.enable_mac()
+        _ = self.hold_memory()
+        runner = support.SSH_RUNNER.replace(
+            "result = offload.run_offload(controller, config, request, started)",
+            'Path(os.environ["BUILDLOG_MEMINFO"]).write_text("MemAvailable: 268435456 kB\\n")\n'
+            + '    result = offload.DeclinedMacRun("state", 0)',
+        )
+        self.write_executable(self.runner, runner)
+        wrapper = self.root / "observe-release.py"
+        self.write_executable(wrapper, r'''
+import json
+import os
+from pathlib import Path
+import sys
+
+source = Path(os.environ["TEST_SOURCE_REPO"])
+with open(source / "scripts/lib/package_root.py") as package_root:
+    exec(package_root.read(), {"__file__": package_root.name})
+from scripts.mac_test import mac_test
+''' + support.BUILD_TARGETS_STATUS + r'''
+
+def main() -> object:
+    if sys.argv[1] != "release-wait":
+        return build_targets_status()
+    paths = mac_test.state_paths("mac")
+    claim, = mac_test.read_claims(paths)
+    fields = ("claim-id", "episode", "attempt", "session")
+    identity = [sys.argv[sys.argv.index("--" + field) + 1] for field in fields]
+    reserved = [claim.record[field] for field in ("claim_id", "episode", "attempt", "submitting_session")]
+    if os.environ["TEST_REFUSE_CLAIM_RELEASE"] == "1":
+        print("private release refusal", file=sys.stderr)
+        status = 12
+    else:
+        status = build_targets_status()
+    state = Path(os.environ["TEST_RUNNER_STATE"])
+    with (state / "claim-releases.jsonl").open("a") as output:
+        output.write(json.dumps(dict(identity=identity, reserved_identity=reserved,
+            remaining=[current.record["claim_id"] for current in mac_test.read_claims(paths)],
+            availability=mac_test.free_now(paths, state.parent / "mac_test.conf", state.parent))) + "\n")
+    return status
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+''')
+        result = self.verify("test", "sample", "--no-cache", extra={
+            "BUILD_TARGETS_SCRIPT": str(wrapper), "TEST_REFUSE_CLAIM_RELEASE": str(int(refuse_release)),
+        })
+        event, = self.ssh_events()
+        self.assertTrue(event["reserved"])
+        self.assertEqual(event["adopted_claim_ids"], [])
+        self.assertEqual(event["actions"], [])
+        observation_line, = (self.runner_state / "claim-releases.jsonl").read_text().splitlines()
+        observation = cast(ClaimReleaseObservation, json.loads(observation_line))
+        self.assertEqual(observation["identity"], observation["reserved_identity"])
+        self.assertEqual(event["entry_claim_ids"], observation["identity"][:1])
+        return result, observation
+
+    def test_prelaunch_mac_refusal_stops_when_exact_release_fails(self) -> None:
+        result, release = self.run_prelaunch_mac_refusal(refuse_release=True)
+        output = result.stdout + result.stderr
+        self.assertEqual(result.returncode, 2, output)
+        self.assertEqual(self.local_runs(), [])
+        self.assertEqual(release["remaining"], release["identity"][:1])
+        claim_id = release["identity"][0]
+        errors = [line for line in result.stderr.splitlines() if "cannot release SSH claim" in line]
+        self.assertEqual(errors, [f"verify.sh: cannot release SSH claim {claim_id} (status 12): private release refusal"])
+
+    def test_prelaunch_mac_refusal_releases_exact_claim_before_local_fallback(self) -> None:
+        result, release = self.run_prelaunch_mac_refusal(refuse_release=False)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(release["remaining"], [])
+        self.assertEqual(release["availability"], "free")
+        self.assertEqual(len(self.local_runs()), 1)
+
     def test_failed_mac_reservation_keeps_its_episode_for_local_fallback(self) -> None:
         self.configure("mac,natedev")
         self.enable_mac()
