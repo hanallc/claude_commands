@@ -89,7 +89,7 @@ Use `/build:mac block <why>` and `/build:mac unblock` for the Mac.
 The retained remote helpers remain unreachable from these three commands.
 
 `clear` stops existing queued gates and running builds outside the hold's allow rules.
-`drain` keeps existing runs that work until they finish; a run that only waits waits for the release.
+`drain` keeps existing runs that work until they finish, also between their steps; a run that only waits waits for the release.
 Both accept `--keep PID` and require `--release-eta HH:MM --zone IANA`.
 The dated form `YYYY-MM-DDTHH:MM` permits a later date in that zone.
 The release time must be in the future.
