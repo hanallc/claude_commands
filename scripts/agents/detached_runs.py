@@ -1737,7 +1737,8 @@ def deliver_in_fresh_process(record_path: Path) -> int:
 
 
 def _command_scope_unit(kind: str, run_id: str) -> process_stop.ScopeUnit:
-    return process_stop.ScopeUnit("builds-detached.slice", f"detached-{kind}-{run_id}.scope")
+    scope_id = run_id.partition("@")[0]
+    return process_stop.ScopeUnit("builds-detached.slice", f"detached-{kind}-{scope_id}.scope")
 
 
 def scope_prefix(marker: Path, environment: dict[str, str], *,
@@ -1747,8 +1748,7 @@ def scope_prefix(marker: Path, environment: dict[str, str], *,
     if (environment.get("BUILDLOG_SCOPE", "1") == "0" or not runtime
             or not Path(runtime, "systemd", "private").is_socket() or shutil.which("systemd-run") is None):
         return []
-    run_id = marker.stem.partition("@")[0]
-    scope = _command_scope_unit(kind, run_id)
+    scope = _command_scope_unit(kind, marker.stem)
     return ["systemd-run", "--user", "--scope", "--quiet", "--collect", "--expand-environment=no",
             f"--slice={scope.slice}", f"--unit={scope.unit}",
             "--", "/bin/sh", "-c", SCOPE_SCRIPT, str(marker)]

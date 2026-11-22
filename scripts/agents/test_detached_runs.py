@@ -39,7 +39,7 @@ from scripts.agents.detached_runs import deliver_in_fresh_process
 from scripts.buildlog import treekey
 from scripts.build_hold import build_hold, hold_enforcer
 from scripts.direct import progress_history
-from scripts.lib import atomic_file, conf, process_group, process_start, unit_runs
+from scripts.lib import atomic_file, conf, process_group, process_start, process_stop, unit_runs
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.herdr import herdr, herdr_types, turn_end, worker_panes
 from scripts.herdr.worker_panes import worker_run
@@ -1194,6 +1194,59 @@ sys.exit(1)
             manager.bind(str(runtime / "systemd" / "private"))
             record = self.supervise(path)
         self.assertEqual(record.get("kind"), "python-tests")
+
+    @unittest.skipUnless(process_stop.supported(), "pidfd stop needs Linux")
+    def test_stop_reaches_a_new_session_inside_the_detached_scope(self) -> None:
+        command = [sys.executable, "-c", """import signal
+import subprocess
+import sys
+
+signal.signal(signal.SIGTERM, lambda number, frame: None)
+child = subprocess.Popen([sys.executable, "-c", "import sys; sys.stdin.read()"],
+                         start_new_session=True)
+print(child.pid, flush=True)
+print(child.wait(), flush=True)
+"""]
+        path = self.record(command)
+        run_id = f"{path.stem}@{self.worker_id}"
+        path = path.rename(path.with_name(f"{run_id}.json"))
+        proc = self.root / "proc"
+        cgroups = self.root / "cgroups"
+        relative = "builds.slice/builds-detached.slice/detached-python-tests-r1.scope"
+        scope = cgroups / relative
+        scope.mkdir(parents=True)
+
+        guard = LauncherHangGuard("stop a child in a new session")
+        leader: subprocess.Popen[str] = subprocess.Popen(
+            command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, start_new_session=True)
+        with leader:
+            assert leader.stdin is not None and leader.stdout is not None
+            try:
+                self.assertTrue(select.select([leader.stdout], [], [], guard.remaining())[0])
+                child = int(cast(str, leader.stdout.readline()))
+                self.assertEqual(os.getsid(child), child)
+                self.assertNotEqual(os.getpgid(child), os.getpgid(leader.pid))
+                for pid in (leader.pid, child):
+                    directory = proc / str(pid)
+                    directory.mkdir(parents=True)
+                    (directory / "stat").symlink_to(Path("/proc") / str(pid) / "stat")
+                    _ = (directory / "cgroup").write_text(f"0::/{relative}\n")
+                _ = (scope / "cgroup.procs").write_text(f"{leader.pid}\n{child}\n")
+                started = process_start.proc_table_start(leader.pid, proc)
+                assert isinstance(started, process_start.Started)
+                self.update_record(path, run_id=run_id, log=str(path.with_suffix(".log")),
+                                   kind="python-tests", command_pid=leader.pid,
+                                   command_group=leader.pid, command_started=started.start)
+                with (patch.dict(os.environ, {"VERIFY_PROC_ROOT": str(proc)}),
+                      patch.object(detached_run_process, "supervisor_match", return_value=True),
+                      patch.object(process_stop, "PROC", proc),
+                      patch.object(process_stop, "CGROUP_ROOT", cgroups)):
+                    self.assertTrue(detached_runs.stop_command(path, "fixture stop"))
+                self.assertTrue(select.select([leader.stdout], [], [], guard.remaining())[0],
+                                "the child did not exit after the stop")
+                self.assertEqual(leader.stdout.readline(), f"{-signal.SIGTERM}\n")
+            finally:
+                leader.stdin.close()
 
     def test_start_rejects_an_unknown_kind(self) -> None:
         with contextlib.redirect_stderr(io.StringIO()) as error, self.assertRaises(SystemExit) as raised:
