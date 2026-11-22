@@ -1314,7 +1314,7 @@ function limitWaits(waits) {
   }).join("");
 }
 function limitCell(cell, words) {
-  const {limit, used, runs, merge_above, other, other_used, waits, note} = cell;
+  const {limit, used, runs, merge_above, other, other_used, waits, note, policy} = cell;
   let count = "";
   if (limit != null) {
     count = limitWords(words, used == null ? "limit" : "count", {used, limit});
@@ -1322,7 +1322,7 @@ function limitCell(cell, words) {
     count = limitWords(words, "running", {count: used});
   }
   const marks = limitPlaces(used, limit, Math.max(0, (used ?? 0) - merge_above.length), 0, merge_above.length);
-  const noLimit = limit == null && cell.route_proved && !cell.has_limit_key
+  const noLimit = limit == null && policy === "no_limit"
     ? `<span class="build-limit-note">${count ? " · " : ""}${esc(words.no_limit)}</span>` : "";
   let contents = count ? `<div class="build-limit-count num">${marks}<span>${esc(count)}${noLimit}</span></div>` : noLimit;
   contents += limitNames(runs);
@@ -1330,7 +1330,7 @@ function limitCell(cell, words) {
   if (other_used) contents += `<div class="build-limit-note">${esc(limitWords(words, "other_running", {count: other_used}))}</div>${limitNames(other)}`;
   if (note) contents += `<div class="build-limit-note">${esc(note)}</div>`;
   const details = contents + limitWaits(waits);
-  return details || (cell.route_proved && cell.has_limit_key
+  return details || (policy === "configured"
     ? `<span class="build-limit-note">${esc(words.limit_set)}</span>` : "");
 }
 let lastBuildLimitsHtml = "";

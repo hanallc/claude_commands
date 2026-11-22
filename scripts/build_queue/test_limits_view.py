@@ -33,7 +33,7 @@ from scripts.mac_test import claim_state
 
 
 def wait_names(groups: Mapping[str, limits_view.WaitGroup]) -> dict[str, list[str]]:
-    return {heading: group.names for heading, group in groups.items()}
+    return {group.words.one: group.names for group in groups.values()}
 
 
 class BuildLimitsTests(unittest.TestCase):
@@ -246,14 +246,19 @@ class BuildLimitsTests(unittest.TestCase):
             "pid": 502, "start_time": "502", "since": 0, "need": 0, "repository_name": "other",
         }}
 
-        def show(*reservations: records.Reservation) -> limits_view.BuildLimits:
+        def show(*reservations: records.Reservation, waits: tuple[limits_view.VisibleWait, ...] = (),
+                 origins: limits_view.Origins = saved.origins) -> limits_view.BuildLimits:
             reading = replace(queue, explanation=replace(queue.explanation,
                 policy=replace(queue.explanation.policy, repository_runs=policy),
                 decided_from=replace(queue.explanation.decided_from, reservations=reservations)))
-            return limits_view.build_limits(reading, (), (), {}, {}, saved, UTC)
+            return limits_view.build_limits(reading, (), waits, {}, {}, replace(saved, origins=origins), UTC)
 
         def project(shown: limits_view.BuildLimits) -> limits_view.Cell:
             return next(row.natedev for row in shown.repositories if row.name == "project")
+
+        def limit_wait(position: int, key: str, limit: int, name: str) -> limits_view.VisibleWait:
+            step = replace(queue.view.waiting[0], reason=records.RunLimitWait(limit, limit, key, "natedev"))
+            return limits_view.VisibleWait(queue_view.WaitingBuild(position, step), name)
 
         one_key = project(show(first, unrelated))
         self.assertEqual((one_key.used, one_key.limit), (1, 2))
@@ -275,6 +280,35 @@ class BuildLimitsTests(unittest.TestCase):
         meters = {metric.label: (metric.used, metric.limit) for metric in separate.natedev.shared}
         self.assertEqual(meters["project run limit"], (1, 2))
         self.assertEqual(meters["project-local run limit"], (1, 1))
+        alias_check: records.Reservation = {**fork_gate, "step": "check", "repo": "project-local"}
+        checked = show(first, alias_check)
+        self.assertIsNone(project(checked).limit)
+        self.assertEqual(project(checked).other_used, 1)
+        meters = {metric.label: (metric.used, metric.limit) for metric in checked.natedev.shared}
+        self.assertEqual(meters["project run limit"], (1, 2))
+        self.assertEqual(meters["project-local run limit"], (0, 1))
+        alias_gate: records.Reservation = {**fixture_reservation(506, 0, step="gate"), "repo": "project-local",
+                                           "repo_identity": fork}
+        full = project(show(first, fork_gate, alias_gate, waits=(
+            limit_wait(1, "project", 2, "project"), limit_wait(2, "project-local", 1, "project-local"),
+        )))
+        self.assertEqual(wait_names(full.waits), {
+            "1 run waits because the run limit for project on natedev is full.": ["project"],
+            "1 run waits because the run limit for project-local on natedev is full.": ["project-local"],
+        })
+        private = show(first, waits=(
+            limit_wait(1, root_key, 1, "First"), limit_wait(2, root_key + "-other", 1, "Second"),
+        ))
+        self.assertEqual([group.names for group in private.natedev.waits.values()], [["First"], ["Second"]])
+        for known in (False, True):
+            with self.subTest(alias_resolved=known):
+                folder = "/fixture/pending"
+                pending: records.Reservation = {**alias_check, "repo_identity": "", "worktree": folder}
+                origins = limits_view.Origins(resolved={folder: fork} if known else {})
+                quiet = next(row.natedev for row in show(first, pending, origins=origins).repositories
+                             if row.name == "quiet")
+                self.assertIs(quiet.policy, limits_view.CellPolicy.NO_LIMIT if known
+                              else limits_view.CellPolicy.UNRESOLVED)
         for origin in ("", second_origin):
             with self.subTest(origin=origin):
                 conflicting: records.Reservation = {**fixture_reservation(503, 0, step="gate"), "repo": "project",
@@ -293,7 +327,8 @@ class BuildLimitsTests(unittest.TestCase):
         unrestricted = next(row.natedev for row in show({
             **first, "step": "check", "repo": "project-local", "repo_identity": "https://example.invalid/team/upstream",
         }).repositories if row.name == "upstream")
-        self.assertEqual((unrestricted.used, unrestricted.limit, unrestricted.has_limit_key), (1, None, True))
+        self.assertEqual((unrestricted.used, unrestricted.limit, unrestricted.other_used, unrestricted.policy),
+                         (0, 1, 1, limits_view.CellPolicy.CONFIGURED))
 
     def check_page(self, shown: limits_view.BuildLimits) -> None:
         rendered = test_memory_hover.MemoryHoverTests().page_expression(
@@ -309,7 +344,7 @@ class BuildLimitsTests(unittest.TestCase):
         self.assertIsNone(table.find(".//tbody/tr/th/small"))
         quiet = next(row for row in table.findall(".//tbody/tr") if row.findtext("th") == "quiet")
         cells = quiet.findall("td")
-        self.assertEqual(cells[0].findtext("span[@class='build-limit-note']"), "No limit")
+        self.assertEqual("".join(cells[0].itertext()), "")
         self.assertEqual("".join(cells[1].itertext()), "")
 
     def check_cache_expiry(self) -> None:
@@ -362,3 +397,13 @@ class BuildLimitsTests(unittest.TestCase):
             shown = refresh.current(head_reading(), 20, 20)
         self.assertEqual(shown.aws_targets, routes.targets)
         self.assertEqual(shown.hana, (limits_view.HanaCapacity(origin, 1, limits_view.ReadingState.OMITTED),))
+
+        alias = replace(route, target="fixture-alias")
+        both = limits_view.AwsRoutes((route, alias), frozenset({route.target, alias.target}))
+        for alias_used in (0, 1):
+            with self.subTest(alias_used=alias_used):
+                saved = limits_view.background(frozenset[str](), shown.aws_money, 1, both,
+                                               {route: 0, alias: alias_used}, limits_view.Origins())
+                limits = limits_view.build_limits(head_reading(), (), (), {}, {}, saved, UTC)
+                cell = next(row.aws for row in limits.repositories if row.name == "hana")
+                self.assertEqual((cell.used, cell.limit), (0, 1) if alias_used == 0 else (None, None))
