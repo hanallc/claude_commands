@@ -1,10 +1,12 @@
 """Record worktrees and end them during the production merge."""
 from __future__ import annotations
 
+import os
 import sys
 
 if __name__ == "__main__" and "--dry-run" in sys.argv:
     sys.dont_write_bytecode = True
+    _ = os.environ.pop("CONF_READ_LOG", None)
 
 try:
     with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
@@ -16,7 +18,6 @@ from collections.abc import Callable, Generator
 import fcntl
 import hashlib
 import json
-import os
 import re
 import shlex
 import shutil
