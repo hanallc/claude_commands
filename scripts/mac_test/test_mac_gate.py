@@ -508,6 +508,61 @@ print(json.dumps([os.environ["PYTHONPATH"], *sys.argv[1:]]))
         self.assertFalse(temporary.exists())
         self.assertFalse(root.exists())
 
+    def ended_gate_with_group(self, job_pid: int, temporary: Path) -> mac_gate.MacGateRecovery:
+        config = self.root / 'config'
+        _ = write_config_fixture(config / 'mac_gate.conf', 'terminate_grace_seconds=3\n')
+        _ = write_config_fixture(config / 'build_admission.conf', 'program_stop_seconds=5\n')
+        _ = cast(object, self.enterContext(mock.patch.dict(
+            os.environ, {'HOME': str(self.root), 'CONF_DIR': str(config)})))
+        folder = self.root / mac_gate.REMOTE_ROOT / 'mac-gate-fixture'
+        folder.mkdir(parents=True)
+        cloud_gate.save(folder / 'checkout.json', {'path': str(self.repo)})
+        cloud_gate.save(folder / 'task-ended.json', {str(self.repo): 'fixture hold'})
+        guest = self.sleeping_process()
+        owner = process_start(guest.pid)
+        assert isinstance(owner, Started)
+        guest.kill()
+        _ = guest.wait(timeout=TEST_HANG_GUARD_SECS)
+        recovery = mac_gate.MacGateRecovery(folder / 'run.json', str(self.repo), guest.pid, owner.start)
+        recovery.folders.append(str(temporary))
+        recovery.add_group(job_pid)
+        return recovery
+
+    def test_receipt_clears_the_journal_and_stops_a_live_group_with_a_kept_checkout(self) -> None:
+        job = self.sleeping_process()
+        temporary = self.root / 'gate-temporary'
+        temporary.mkdir()
+        recovery = self.ended_gate_with_group(job.pid, temporary)
+        folder = recovery.path.parent
+        self.assertIn(job.pid, recovery.groups)
+        with mock.patch.object(scratch, 'end') as end:
+            with mock.patch.object(mac_gate, 'process_start', return_value=Started('reused')):
+                with self.assertRaisesRegex(GateRefused, 'Cannot prove ownership'):
+                    _ = mac_gate.stop_checkout(folder)
+            self.assertTrue(recovery.path.exists())
+            self.assertIsNone(job.poll())
+            self.assertEqual(mac_gate.stop_checkout(folder), mac_gate.CheckoutCleanup.RETAINED)
+        end.assert_not_called()
+        self.assertEqual(job.wait(timeout=TEST_HANG_GUARD_SECS), -signal.SIGKILL)
+        self.assertFalse(recovery.path.exists())
+        self.assertTrue((folder / 'task-ended.json').is_file())
+        self.assertEqual(mac_gate.read_checkout(folder), self.repo)
+        self.assertTrue(self.repo.is_dir())
+
+    def test_receipt_clears_the_journal_when_the_gate_build_folder_is_gone(self) -> None:
+        job = self.sleeping_process()
+        temporary = self.root / 'absent-gate-temporary'
+        recovery = self.ended_gate_with_group(job.pid, temporary)
+        self.assertFalse(temporary.exists())
+        self.assertTrue(recovery.path.exists())
+        job.kill()
+        _ = job.wait(timeout=TEST_HANG_GUARD_SECS)
+        with mock.patch.object(scratch, 'end') as end:
+            self.assertEqual(mac_gate.stop_checkout(recovery.path.parent), mac_gate.CheckoutCleanup.RETAINED)
+        end.assert_not_called()
+        self.assertFalse(recovery.path.exists())
+        self.assertFalse(temporary.exists())
+
     def test_retained_checkout_keeps_its_registration_until_removal(self) -> None:
         folder = self.root / mac_gate.REMOTE_ROOT / 'mac-gate-fixture'
         folder.mkdir(parents=True)
