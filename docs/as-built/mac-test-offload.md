@@ -34,7 +34,9 @@ The run returns any placement before it waits for the block to clear.
 The wait can lift an expired block through the Mac block expiry procedure.
 A failed CI restore keeps the block in place.
 `--no-wait` reports the block and exits with status 78.
-`mac_run.sh` exits with status 9 for a foreign block, unreadable coordination state, or a busy reply from the queue.
+`mac_run.sh` exits with status 9 for a foreign block or unreadable coordination state.
+It also exits with status 9 when the queue reports that the Mac is busy or blocked.
+It retries other placement waits, including waits for host evidence, queue position, or memory.
 It prints the claim refusal or queue diagnostic and returns any placement before exit.
 Other queue runs retry a busy reply unless they use `--no-wait`.
 

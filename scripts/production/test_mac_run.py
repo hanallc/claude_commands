@@ -234,7 +234,7 @@ def run_mac_test(*arguments):
 
 if args[0] == "place-step":
     wait_reply = os.environ.get("MAC_RUN_QUEUE_WAIT_REPLY")
-    if wait_reply:
+    if wait_reply and not (wait_reply == "pending-evidence" and (state / "wait-reply").exists()):
         from unittest.mock import patch
         from scripts.build_queue import admission_client, admission_wire as wire, placement
         from scripts.mac_test import claim_state
@@ -243,11 +243,17 @@ if args[0] == "place-step":
             raise SystemExit("the runner retried the wait reply")
         (state / "wait-reply").touch()
         episode, since = option("--episode"), float(option("--since"))
-        if wait_reply == "busy":
-            destination = placement.PlacementDestination("ssh", "mac", "natemccoy@mac", claim_state.WHOLE_MAC)
-            eligibility = placement.CandidateEligibility(destination, placement.TemporaryExclusion("busy"))
-            diagnostic = placement.BusyProviderDiagnostic("mac", "unit tests", "2026-11-17T11:00:00+00:00")
-            reply = wire.PlacementWait(episode, since, 1, (eligibility,), provider_diagnostics=(diagnostic,))
+        destination = placement.PlacementDestination("mac", "mac", "natemccoy@mac", claim_state.WHOLE_MAC)
+        if wait_reply in ("busy", "blocked"):
+            eligibility = placement.CandidateEligibility(destination, placement.TemporaryExclusion(wait_reply))
+            diagnostics = ()
+            if wait_reply == "busy":
+                diagnostics = (placement.BusyProviderDiagnostic("mac", "unit tests", "2026-11-17T11:00:00+00:00"),)
+            reply = wire.PlacementWait(episode, since, 1, (eligibility,),
+                wire.PlacementResourceWait("mac", wait_reply), provider_diagnostics=diagnostics)
+        elif wait_reply == "pending-evidence":
+            eligibility = placement.CandidateEligibility(destination, placement.EvidenceNeeded("host evidence is pending"))
+            reply = wire.PlacementWait(episode, since, 1, (eligibility,))
         elif wait_reply == "damaged-claim":
             claim_state.state_paths().run.write_text("damaged\n")
             reply = wire.PlacementWait(episode, since, 1, ())
@@ -608,6 +614,29 @@ class MacRunTests(unittest.TestCase):
         self.assert_no_build_started()
         self.assert_claim_released()
         self.assertEqual(list((self.state_directory / "claims").glob("*.json")), [])
+
+    def test_queue_blocked_reply_exits_nine_without_starting_build(self) -> None:
+        result = self.mac_run(extra={"MAC_RUN_QUEUE_WAIT_REPLY": "blocked"}, timeout=TEST_HANG_GUARD_SECS)
+
+        self.assertEqual(result.returncode, 9, result.stdout + result.stderr)
+        self.assertEqual(result.stdout, "")
+        self.assert_placement_wait_cancelled()
+        self.assert_no_build_started()
+        self.assert_claim_released()
+
+    def test_pending_host_evidence_retries_placement_and_starts_the_build(self) -> None:
+        result = self.mac_run(extra={"MAC_RUN_QUEUE_WAIT_REPLY": "pending-evidence",
+                                     "MAC_TEST_ADVANCE_WAIT": "1"}, timeout=TEST_HANG_GUARD_SECS)
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        queue_events = [cast(list[str], json.loads(line))
+                        for line in (self.stub_state / "queue-events").read_text().splitlines()]
+        self.assertEqual([event[0] for event in queue_events], ["place-step", "place-step", "cancel-placement"])
+        self.assertEqual(queue_events[0], queue_events[1])
+        self.assertTrue(any(event["command"] == "ssh" and "cargo build" in event["args"][-1]
+                            for event in self.events()))
+        self.assertEqual(list((self.home / ".local/state/mac-queue/receipts").iterdir()), [])
+        self.assert_claim_released()
 
     def test_damaged_claim_exits_nine_without_starting_build(self) -> None:
         self.state_directory.mkdir()

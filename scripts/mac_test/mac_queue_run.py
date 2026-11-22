@@ -35,6 +35,7 @@ import uuid
 
 from scripts.build_hold import override_guard
 from scripts.build_hold.owning_session import NoOwningSession, OwningSession, owning_session
+from scripts.build_queue import admission_wire as wire
 from scripts.lib import conf, process_group
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.mac_test import claim_state, mac_test
@@ -61,11 +62,19 @@ def parse_placement(output: str) -> MacPlacement:
 
 def placement_arguments(episode: str, since: float, pid: int, worktree: Path, package: str,
                         kind: str, source_key: str, session: str, assignment_file: Path,
-                        argv: list[str]) -> list[str]:
-    return ["place-step", "--once", "--wait-events", "--episode", episode, "--since", str(since),
+                        argv: list[str], *, wait_events: bool) -> list[str]:
+    return ["place-step", "--once", *(("--wait-events",) if wait_events else ()),
+        "--episode", episode, "--since", str(since),
         "--pid", str(pid), "--repo-root", str(worktree), "--package", package, "--kind", kind,
         "--source-key", source_key, "--session-id", session, "--target", "mac",
         "--assignment-file", str(assignment_file), "--token", "none", "--", *argv]
+
+
+def mac_placement_is_busy_or_blocked(output: str) -> bool:
+    reply = wire.parse_reply(output)
+    return (isinstance(reply, wire.PlacementWait)
+            and isinstance(reply.wait, wire.PlacementResourceWait)
+            and reply.wait.resource == "mac" and reply.wait.reason in ("busy", "blocked"))
 
 
 def remote_wrapper(work: str, on_close: str, grace_polls: int, *, owned_close: bool = False) -> str:
@@ -399,23 +408,27 @@ def run_attempt(
             while True:
                 code, output, errors = capture_command(admission_command() + placement_arguments(episode, since, pid,
                     args.worktree, args.package, args.kind, source_key, claim_state.session_id(owner),
-                    assignment_file, command), capture_stderr=mac_run)
+                    assignment_file, command, wait_events=not mac_run), capture_stderr=mac_run)
                 if code in (0, MAC_BUSY_STATUS):
                     block = blocking_run(args, owner)
-                if code != MAC_BUSY_STATUS or args.no_wait or mac_run or not isinstance(block, claim_state.NoMacBlock):
+                if errors and (code != MAC_BUSY_STATUS or isinstance(block, claim_state.NoMacBlock)):
+                    print(errors, end="", file=sys.stderr, flush=True)
+                mac_refused = (code == MAC_BUSY_STATUS and mac_run and isinstance(block, claim_state.NoMacBlock)
+                               and mac_placement_is_busy_or_blocked(output))
+                if code != MAC_BUSY_STATUS or args.no_wait or mac_refused or not isinstance(block, claim_state.NoMacBlock):
                     break
-                print(output, end="", flush=True)
+                if not mac_run:
+                    print(output, end="", flush=True)
                 wait_to_retry()
-            if errors and (code != MAC_BUSY_STATUS or isinstance(block, claim_state.NoMacBlock)):
-                print(errors, end="", file=sys.stderr, flush=True)
             if not isinstance(block, claim_state.NoMacBlock):
                 status = 0
-            elif code == MAC_BUSY_STATUS and mac_run:
+            elif mac_refused:
                 if not errors:
                     print("waiting for the Mac", file=sys.stderr, flush=True)
                 status = MAC_RUN_REFUSED_STATUS
             elif code:
-                print(output, end="", flush=True)
+                if code != MAC_BUSY_STATUS or not mac_run:
+                    print(output, end="", flush=True)
                 status = MAC_RUN_REFUSED_STATUS if args.lifecycle_script and code in (10, 11, 12) else code
             else:
                 placement = parse_placement(output)
