@@ -245,7 +245,9 @@ class ProgressHistoryTests(unittest.TestCase):
                     "production": "old-production", "unit": "old-unit",
                 })
                 self.assertEqual(identity, progress_history.ProductionUnitIdentity("Example", "unit-a"))
-        parent = recorded_showrunner("Receiving", document)
+        receiving = self.root / "receiving-production.md"
+        _ = receiving.write_text("# Receiving production\n")
+        parent = recorded_showrunner("Receiving", receiving)
         _ = staff.move(member.id, staff.ReportsTo(parent.id))
         self.assertEqual(progress_history.resolve_production_unit({"owner_staff_id": member.id}),
                          progress_history.ProductionUnitIdentity("Receiving", "unit-a"))
@@ -4702,12 +4704,15 @@ with patch.object(fcntl, "flock", admission):
                                        parent=parent.id if kind in ("unit", "worker") else None)
                 run = unit_runs.RUN_ROOT / f"prepared-{kind}"
                 run.mkdir()
-                _ = staff.set_run(owner.id, staff.OpenRun(run))
+                if kind != "worker":
+                    _ = staff.set_run(owner.id, staff.OpenRun(run))
                 _ = self.run_command(
                     "start-run", "--session-dir", str(run), "--working-dir", str(self.working_dir),
                     "--main-family", "codex", "--main-model", "gpt-main", "--main-effort", "xhigh",
                     "--main-session-id", owner.current_session, at=46_000,
                 )
+                if kind == "worker":
+                    _ = staff.clear_run(parent.id, run)
                 for finished_at in (46_200, 46_300):
                     _ = staff.set_run(owner.id, staff.OpenRun(run))
                     _ = self.run_command("finish-run", "--session-dir", str(run),

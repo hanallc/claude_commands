@@ -221,9 +221,11 @@ class StaffRoutingTests(unittest.TestCase):
         assignment = self.router().owner_and_production(listing, {"#": "C1", "Producer": self.unit.id})
         self.assertEqual(assignment.production, doc)
         self.assertEqual(assignment.owner.tab, "child")
-        _ = staff.set_doc(self.top.id, staff.LiveDoc(remote.local_machine(), doc))
+        top_doc = self.root / "top-production.md"
+        _ = top_doc.write_text("# Top")
+        _ = staff.set_doc(self.top.id, staff.LiveDoc(remote.local_machine(), top_doc))
         assignment = self.router().owner_and_production(self.root / "change-review - top.md", {"#": "C2"})
-        self.assertEqual(assignment.production, doc)
+        self.assertEqual(assignment.production, top_doc)
         self.assertEqual(assignment.owner.tab, "top")
 
     def test_an_unset_staff_document_uses_the_supplied_production_document(self) -> None:

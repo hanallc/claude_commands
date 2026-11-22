@@ -3072,8 +3072,7 @@ class WorkerPaneTests(StaffTestCase):
         doc = main / "production-live.md"
         paths = EnrolledPaths(main=main, live_doc=doc, log=main / "LOG.md", notes=main / "notes", integration=integration)
         legacy = fixture_member("showrunner", name="legacy-showrunner")
-        enrolled = fixture_member("showrunner", name="enrolled-showrunner", doc=staff.LiveDoc("natedev", doc),
-                                  worktree=staff.PresentWorktree("natedev", integration))
+        enrolled = fixture_member("showrunner", name="enrolled-showrunner", doc=staff.LiveDoc("natedev", doc))
         self.world.foreground.clear()
         self.world.add(legacy, "w2:p0", workspace="w2", tab="w2:t0")
         self.world.add(enrolled, "w3:p0", workspace="w3", tab="w3:t0")

@@ -3441,6 +3441,7 @@ class WorkerCommandTests(unittest.TestCase):
         paths = EnrolledPaths(main, main / "production-live.md", main / "LOG.md", main / "notes", integration)
         owner = fixture_member("showrunner", name="design-showrunner",
                                doc=staff.LiveDoc("natedev", paths.live_doc))
+        _ = staff.clear_run(self.fixture.parent.id, self.run_dir)
         self.fixture.parent_id = owner.id
         owner = staff.set_run(owner.id, staff.OpenRun(self.run_dir))
         self.fixture.world.add(owner, "w2:p0", workspace="w2", tab="w2:t0")
@@ -3544,9 +3545,10 @@ class WorkerCommandTests(unittest.TestCase):
                     if field == "repeat status":
                         delivery = progress_history.dispatch_delivery(passed)
                         delivery = replace(delivery, actions=replace(delivery.actions, status_file=str(path)))
+                        repeated = {key: value for key, value in passed.items() if key != "assign_status_file"}
                         with self.assertRaises(OSError):
                             _ = turn_end.repeat_completion_notice(row.name, owner, self.run_dir,
-                                {**passed, "delivery": asdict(delivery)})
+                                {**repeated, "delivery": asdict(delivery)})
                     else:
                         actions = progress_history.CompletionActions(
                             summary_file=str(path) if field == "summary_file" else "",
