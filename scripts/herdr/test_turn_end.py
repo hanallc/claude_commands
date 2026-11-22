@@ -704,8 +704,14 @@ class TurnEndTests(unittest.TestCase):
             _ = self.case.finish()
         saved_paths, = run.glob(".*.completion-scratch.json")
         valid = saved_paths.read_text()
-        for invalid in ("{", json.dumps({str(retained): reason, "relative": reason})):
-            with self.subTest(invalid=invalid):
+        oversized = str(retained.parent / ("x" * 512))
+        invalid_records = (
+            ("invalid JSON", "{"),
+            ("relative path", json.dumps({str(retained): reason, "relative": reason})),
+            ("oversized path component", json.dumps({str(retained): reason, oversized: reason})),
+        )
+        for case, invalid in invalid_records:
+            with self.subTest(case=case):
                 atomic_file.write_text_atomic(saved_paths, invalid)
                 with (patch.object(send, "send", wraps=send.send) as transport,
                       patch.object(unit_runs, "report_anomaly") as anomaly):
@@ -719,6 +725,29 @@ class TurnEndTests(unittest.TestCase):
         self.assertEqual(len(self.case.agent.notices), 1)
         self.assertIn(scratch.retained_task_folder_notice(retained, reason), self.case.agent.notices[0])
         self.assertTrue(pass_notices.is_settled(run, instance, "done"))
+
+    def test_hook_recovers_a_saved_completion_with_legacy_scratch_text(self) -> None:
+        self.assertIs(self.case.dispatch(), worker.DispatchSubmission.SUBMITTED)
+        row = self.case.agent.row(self.case.agent.submitted[-1][0])
+        run = self.case.run_dir
+        instance = str(worker_panes.worker_pass(row, run)["instance_id"])
+        retained = self.case.fixture.root / "retained"
+        retained.mkdir()
+        legacy = scratch.retained_task_folder_notice(retained, "The task ended.")
+        diagnostic = "The fixture saved another diagnostic."
+        worker.save_reply(self.case.reply, self.case.agent.replies[-1])
+        progress_history.save_hook_completion(run, instance, progress_history.HookCompletion(
+            turn_end.TurnOutcome.DONE, str(self.case.reply), (legacy, diagnostic)))
+        self.assertIsNone(pass_notices.read(run, instance))
+
+        self.assertIs(self.case.finish(), turn_end.TurnOutcome.DONE)
+        notice, = self.case.agent.notices
+        self.assertNotIn(legacy, notice)
+        self.assertIn(diagnostic, notice)
+        saved = pass_notices.read(run, instance)
+        assert saved is not None
+        self.assertNotIn(legacy, saved.notices["done"].text)
+        self.assertTrue(saved.notices["done"].settled)
 
     def test_retry_omits_legacy_scratch_text_and_preserves_other_details(self) -> None:
         self.assertIs(self.case.dispatch(), worker.DispatchSubmission.SUBMITTED)

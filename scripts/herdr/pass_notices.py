@@ -253,8 +253,11 @@ def _completion_text(run: Path, instance: str, saved_text: str) -> str:
         folder = Path(name)
         if not folder.is_absolute() or not isinstance(reason, str):
             raise worker_lifecycle.WorkerStateUnreadable(path, f"invalid retained folder entry {name!r}")
-        if scratch.retained_folder_exists(folder):
-            lines.append(scratch.retained_task_folder_notice(folder, reason))
+        try:
+            _ = folder.lstat()
+        except FileNotFoundError:
+            continue
+        lines.append(scratch.retained_task_folder_notice(folder, reason))
     return "\n".join(lines)
 
 

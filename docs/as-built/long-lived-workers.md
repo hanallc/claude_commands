@@ -259,13 +259,13 @@ A matching receipt settles the notice without a send.
 A receipt lookup failure leaves the notice pending.
 A repeat-guard hold settles the notice after the guard queues a notice for the owner.
 Peer delivery preserves the repeat-guard hold reason. Other holds leave the notice pending.
-The hook ends `scratch.worker_task(row.id)` before it closes the pane.
-This removes the worker's `scratch.py new --worker` folders and keeps other workers' folders.
+The hook marks `scratch.worker_task(row.id)` ended before it closes the pane.
+The worker's scratch folders remain for manual removal.
 A failed cleanup adds a diagnostic to the director notice and permits pane closure.
 The hook saves each retained scratch path and reason separately from the notice text.
 Each send checks the saved paths and omits confirmed missing folders.
 The notice omits legacy scratch details that have only text.
-A scratch record read or validation failure leaves the notice pending without a send.
+A failure to read or check the saved paths leaves the notice pending without a send.
 `progress_history.complete_dispatch` records both completed passes and failed managed Astra review passes.
 It matches the slot and dispatch instance id before it records an outcome.
 A refused launcher retry retains the existing pass and its run, including a run with one worker.
