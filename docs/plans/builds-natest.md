@@ -1459,3 +1459,18 @@ Ordered after the red main repair and the guard repair (builds). It does not mov
 - **Files:** `scripts/build_hold/hold_enforcer.py`, `scripts/build_hold/build_hold.py`, their tests.
 - **Workers:** the director (no-worker mode); one fresh review.
 - **Acceptance gate:** `--module` runs of the changed tests and their direct importers green; one blind review.
+
+### Phase 443 — a doc-only change selects no checkout copy user  · status: todo
+**Depends on:** item 191 routed run (builds 17:34 EST: after item 191)
+
+#### Work Order
+- **Goal:** builds 17:34 EST. Any changed file, a doc line included, selects 425 of 868 modules: 4772 of 6239 median CPU s (76.5%) of a full run. The cause: `scripts/lib/checkout_test_support.py` `runtime_files()` walks `SOURCE / folder` for `folder in ("scripts", "config")` with `rglob("*")`. `affected_modules` cannot resolve `folder`, so it infers `RepositoryScan(".", "*", recursive=True)` (`affected_modules.py:653`). About 420 modules import that file (24 directly). `accounts/test_accounts.py` has a second inferred whole-repository scan.
+- **Spec:**
+  1. Fix the inference where the defect lives: a loop variable over a literal tuple of strings resolves to each value, so the scan becomes `scripts/**` and `config/**`, not `.`.
+  2. Find the cause of the `accounts/test_accounts.py` whole-repository scan and fix it the same way; a declared `scan_roots` row in `config/gate.conf` is a last resort.
+  3. Print, for the base tree, the count of modules that still infer a scan of `.`; each one left needs a reason in the as-built.
+  4. A test-only change under `scripts/` still matches `scripts/**`, but `runtime_files()` never copies a `test_` file except its four helpers. Measure how many modules a one-line test change then selects; if it stays above 50, send builds a proposal to model the name filter.
+  5. Tests: table rows in the affected-module tests: a loop over a literal tuple gives one scan per value; a doc-only change does not select a `checkout_test_support` importer; a non-test change under `scripts/` still selects it.
+- **Files:** `scripts/production/affected_modules.py`, its tests; `scripts/accounts/test_accounts.py` only if its scan needs a change.
+- **Workers:** the director (no-worker mode) or 1 writer; one fresh review.
+- **Acceptance gate:** a doc-only change selects fewer than 50 modules; a full gate passes (the change alters affected selection). Send builds three numbers (bob, 17:36): the CPU minutes of an affected run before the repair, the CPU minutes after it, and how many affected runs a day pay it.
