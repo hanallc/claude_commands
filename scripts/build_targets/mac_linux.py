@@ -252,6 +252,14 @@ class ArmedGuestAttempt:
     deadline_ns: int
 
 
+class GuestEndUnproven(GuestUnavailable):
+    """The proof wait expired for an armed guest attempt."""
+
+    def __init__(self, message: str, armed: ArmedGuestAttempt) -> None:
+        super().__init__(message)
+        self.armed: ArmedGuestAttempt = armed
+
+
 ARM_ATTEMPT = '''\
 import os
 import sys
@@ -530,6 +538,15 @@ def prove_guest_end(settings: GuestSettings, armed: ArmedGuestAttempt, *,
     return GuestEndPending(reason)
 
 
+def prove_kept_guest_end(armed: ArmedGuestAttempt) -> GuestEndProven | GuestEndPending:
+    """Check whether the guest run for a kept claim has ended."""
+    try:
+        settings = read_settings(conf.read('build_targets'))
+    except (GuestUnavailable, OSError, ValueError) as error:
+        return GuestEndPending(str(error) or type(error).__name__)
+    return prove_guest_end(settings, armed)
+
+
 class BundleForm(StrEnum):
     FIRST = 'first'
     DELTA = 'delta'
@@ -657,7 +674,7 @@ def run_remote(repo: Path, settings: GuestSettings, source: CandidateSource, req
                     break
                 try:
                     if armed is None:
-                        armed = arm_guest(settings, uuid4().hex)
+                        armed = arm_guest(settings, request['attempt'])
                         command = settings.command(run_shell(settings, source, len(bootstrap), armed))
                         arguments = ['bash', '-o', 'pipefail', '-c', STREAM_SOURCE, TARGET, prefix, base, header, *command]
                         stream = stream_guest_bundle(repo, arguments, bootstrap, settings.transfer_timeout_seconds)
@@ -696,9 +713,10 @@ def run_remote(repo: Path, settings: GuestSettings, source: CandidateSource, req
     diagnostics = stream.stderr.decode(errors='replace') if stream is not None and stream.returncode else ''
     detail = ' '.join(diagnostics.split())[-1200:]
     if not proof_obtained:
+        assert armed is not None
         guest = settings.ssh_hops[-1]
-        error = GuestUnavailable(f'guest unreachable: {guest} did not confirm the run ended '
-                                 + f'within {settings.unreachable_wait_seconds} seconds ({UNREACHABLE_WAIT_KEY})')
+        error = GuestEndUnproven(f'guest unreachable: {guest} did not confirm the run ended '
+                                + f'within {settings.unreachable_wait_seconds} seconds ({UNREACHABLE_WAIT_KEY})', armed)
         if detail:
             error.add_note(detail)
         raise error
@@ -731,16 +749,13 @@ def transfer_source(repo: Path, settings: GuestSettings, source: CandidateSource
         raise
     with bundle_refs(repo, source, request['attempt']) as prefix:
         if isinstance(guest, EmptyGuestMain):
-            reason = BundleReason.FIRST_RUN
+            bundle = FullBundle(BundleReason.FIRST_RUN)
         elif subprocess.run(['git', 'cat-file', '-e', f'{guest.commit}^{{commit}}'], cwd=repo,
                             capture_output=True, timeout=TRANSFER_ALLOWANCE_SECONDS, check=False).returncode:
-            reason = BundleReason.SOURCE_LACKS_BASE
+            bundle = FullBundle(BundleReason.SOURCE_LACKS_BASE)
         else:
-            try:
-                return run_remote(repo, settings, source, request, prefix, DeltaBundle(guest.commit))
-            except GuestMissingPrerequisite:
-                reason = BundleReason.GUEST_LACKS_PREREQUISITE
-        return run_remote(repo, settings, source, request, prefix, FullBundle(reason))
+            bundle = DeltaBundle(guest.commit)
+        return run_remote(repo, settings, source, request, prefix, bundle)
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -809,9 +824,17 @@ def route(repo: Path, *, mode: SuiteMode, full: bool, module_time_limit_s: float
                                type_dirs=relative_type_dirs,
                                module_time_limit_s=module_time_limit_s, run_time_limit_seconds=settings.run_time_limit_seconds,
                                jobs=settings.jobs, unit=unit)
-        with mac_linux_reservation(repo, mode, gate_job):
-            reply = transfer_source(repo, settings, source, request)
-            run = completed_run(reply, request, source)
+        try:
+            with mac_linux_reservation(repo, mode, gate_job):
+                reply = transfer_source(repo, settings, source, request)
+                run = completed_run(reply, request, source)
+        except GuestMissingPrerequisite:
+            request = {**request, 'attempt': uuid4().hex}
+            with (mac_linux_reservation(repo, mode, gate_job),
+                  bundle_refs(repo, source, request['attempt']) as prefix):
+                reply = run_remote(repo, settings, source, request, prefix,
+                                   FullBundle(BundleReason.GUEST_LACKS_PREREQUISITE))
+                run = completed_run(reply, request, source)
         if gate.checked_git(repo, 'rev-parse', 'HEAD') != source.head or cloud_gate.working_tree(repo)[0] != source.tree:
             raise GuestUnavailable('the checkout changed during the guest run')
         return run

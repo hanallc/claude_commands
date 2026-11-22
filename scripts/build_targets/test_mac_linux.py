@@ -675,8 +675,20 @@ fi
         _ = configuration.write_text(configuration.read_text().replace(f'{key}=20', f'{key}=2'))
         settings = mac_linux.read_settings(conf.read(self.registry))
         attempts: list[mac_linux.ArmedGuestAttempt] = []
+        unproven: list[mac_linux.GuestUnavailable] = []
         arm_guest = mac_linux.arm_guest
+        reservation = mac_linux.mac_linux_reservation
         now = 0.0
+
+        @contextmanager
+        def record_failure(repo: Path, work: SuiteMode | StepJob,
+                           gate_job: StepJob | GateJobNotRecorded) -> Generator[None]:
+            with reservation(repo, work, gate_job):
+                try:
+                    yield
+                except mac_linux.GuestUnavailable as error:
+                    unproven.append(error)
+                    raise
 
         def record_arm(settings: mac_linux.GuestSettings, attempt: str) -> mac_linux.ArmedGuestAttempt:
             armed = arm_guest(settings, attempt)
@@ -690,6 +702,7 @@ fi
         lock = self.run_lock()
         try:
             with (patch.dict(os.environ, {'FIXTURE_OFFLINE_PROOFS': '1'}),
+                  patch.object(mac_linux, 'mac_linux_reservation', record_failure),
                   patch.object(mac_linux, 'arm_guest', record_arm),
                   patch.object(mac_linux, 'monotonic', lambda: now),
                   patch.object(mac_linux, 'sleep', advance),
@@ -697,6 +710,9 @@ fi
                   patch.object(mac_linux, 'prove_guest_end', wraps=mac_linux.prove_guest_end) as proof):
                 result = self.route('disconnect-before-copy')
                 first, = attempts
+                failure, = unproven
+                assert isinstance(failure, mac_linux.GuestEndUnproven), failure
+                self.assertEqual(failure.armed, first)
                 self.assertIn('guest unreachable: fixture-guest did not confirm the run ended '
                               + f'within 2 seconds ({key})', str(result))
                 self.assertIs(eligibility.read_backoff(time.time(), mac_linux.TARGET), eligibility.NO_BACKOFF)
@@ -851,6 +867,33 @@ fi
 
         with patch.object(subprocess, 'run', side_effect=subprocess.TimeoutExpired('ssh', 1)):
             self.assertIsInstance(mac_linux.prove_guest_end(settings, armed), mac_linux.GuestEndPending)
+
+    def test_kept_guest_end_proof_refuses_unreadable_settings(self) -> None:
+        settings = self.registry.with_name('mac_linux.conf')
+        settings.unlink()
+        settings.mkdir()
+        armed = mac_linux.ArmedGuestAttempt('kept-attempt', 'boot-id', 10)
+        proof = mac_linux.prove_kept_guest_end(armed)
+        assert isinstance(proof, mac_linux.GuestEndPending), proof
+        self.assertIn(str(settings), proof.detail)
+        self.assertIn('Is a directory', proof.detail)
+        self.assert_guest_clean()
+
+    def test_kept_guest_end_proof_uses_the_route_settings_and_exact_attempt(self) -> None:
+        settings = mac_linux.read_settings(conf.read(self.registry))
+        armed = mac_linux.ArmedGuestAttempt('kept-attempt', 'boot-id', 10)
+        command = settings.command(mac_linux.cleanup_shell(settings, armed))
+        for status, stdout, stderr, expected in (
+            (0, 'ended\n', '', mac_linux.GuestEndProven()),
+            (76, '', 'The guest run lock is still held.\n',
+             mac_linux.GuestEndPending('The guest run lock is still held.')),
+        ):
+            with self.subTest(status=status), patch.object(
+                    subprocess, 'run', return_value=subprocess.CompletedProcess(command, status, stdout, stderr)) as ssh:
+                self.assertEqual(mac_linux.prove_kept_guest_end(armed), expected)
+                ssh.assert_called_once_with(command, stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                                            errors='replace', timeout=mac_linux.GUEST_CLEANUP_TIMEOUT_SECONDS,
+                                            check=False)
 
     def test_keyboard_interrupt_proves_the_end_before_release(self) -> None:
         communicate = cast(Callable[[subprocess.Popen[bytes], bytes | None, float | None], tuple[bytes, bytes]],
@@ -1110,9 +1153,23 @@ fi
 
     def test_guest_missing_prerequisite_retries_once_with_a_full_bundle(self) -> None:
         (self.repo / 'scripts/fixture/test_added.py').touch()
-        with patch.dict(os.environ, {'FIXTURE_PROBED_MAIN': self.git('rev-parse', 'origin/main')}):
+        attempts: list[tuple[str, claim_state.ClaimIdentity]] = []
+        paths = claim_state.state_paths('mac')
+        arm = mac_linux.arm_guest
+
+        def record_arm(settings: mac_linux.GuestSettings, attempt: str) -> mac_linux.ArmedGuestAttempt:
+            claim, = claim_state.read_claims(paths)
+            attempts.append((attempt, claim_state.claim_identity(claim.record)))
+            return arm(settings, attempt)
+
+        with (patch.dict(os.environ, {'FIXTURE_PROBED_MAIN': self.git('rev-parse', 'origin/main')}),
+              patch.object(mac_linux, 'arm_guest', record_arm)):
             result = self.route()
         assert isinstance(result, mac_linux.MacLinuxGateRun), result
+        (first_attempt, first_claim), (retry_attempt, retry_claim) = attempts
+        self.assertNotEqual(first_attempt, retry_attempt)
+        self.assertNotEqual(first_claim, retry_claim)
+        self.assertEqual(claim_state.read_claims(paths), ())
         self.assert_bundle(result, mac_linux.BundleForm.FIRST, mac_linux.BundleReason.GUEST_LACKS_PREREQUISITE,
                            'delta', 'first')
         self.assert_guest_clean('probe', 'arm', 'run', 'cleanup', 'arm', 'run', 'cleanup')
