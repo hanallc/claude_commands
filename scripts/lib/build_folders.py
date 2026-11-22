@@ -707,15 +707,33 @@ def _mac_mount_points() -> tuple[Path, ...]:
         _ = cast(None, free(mounts))
 
 
-def _linux_mount_points() -> tuple[Path, ...]:
-    points: list[Path] = []
+@dataclass(frozen=True)
+class LinuxMount:
+    mount_id: int
+    device: bytes
+    root: Path
+    point: Path
+
+
+def _decode_mount_path(value: bytes) -> Path:
+    return Path(os.fsdecode(re.sub(rb"\\([0-7]{3})", lambda match: bytes([int(match[1], 8)]), value)))
+
+
+def linux_mounts() -> tuple[LinuxMount, ...]:
+    mounts: list[LinuxMount] = []
     for line in Path("/proc/self/mountinfo").read_bytes().splitlines():
         fields = line.split()
         if len(fields) < 10 or b"-" not in fields[6:]:
             raise ValueError("invalid Linux mount table entry")
-        decoded = re.sub(rb"\\([0-7]{3})", lambda match: bytes([int(match[1], 8)]), fields[4])
-        points.append(Path(os.fsdecode(decoded)))
-    return tuple(points)
+        root, point = map(_decode_mount_path, fields[3:5])
+        if not root.is_absolute() or not point.is_absolute():
+            raise ValueError("invalid Linux mount path")
+        mounts.append(LinuxMount(int(fields[0]), fields[2], root, point))
+    return tuple(mounts)
+
+
+def _linux_mount_points() -> tuple[Path, ...]:
+    return tuple(mount.point for mount in linux_mounts())
 
 
 def may_remove_build_path(path: Path) -> bool:
@@ -1616,18 +1634,22 @@ def _empty_editable_destination(path: Path, parent: int, expected: os.stat_resul
 
 def _remove_failed_allocation(path: Path, directory: int, allocated: os.stat_result | None) -> None:
     if allocated is not None:
-        _remove_folder(path, directory, allocated)
+        remove_folder(path, directory, allocated)
     if not _folder_exists(path, directory):
         _unlink_metadata(path, directory)
 
 
-def _remove_folder(path: Path, directory: int, allocated: os.stat_result) -> None:
+def remove_folder(path: Path, directory: int | None = None, allocated: os.stat_result | None = None) -> None:
+    """Remove an owned folder and repair permissions when removal needs it."""
+    removal_path = path if directory is None else Path(path.name)
+    name = os.fspath(removal_path)
+
     def repair(function: object, name: str, error: BaseException) -> None:
         if not isinstance(error, PermissionError):
             raise error
         entry = Path(name)
         for candidate in (entry.parent, entry):
-            if not candidate.is_relative_to(path.name):
+            if not candidate.is_relative_to(removal_path):
                 continue
             inode = os.stat(candidate, dir_fd=directory, follow_symlinks=False)
             if inode.st_uid == os.geteuid() and not stat.S_ISLNK(inode.st_mode):
@@ -1638,13 +1660,14 @@ def _remove_folder(path: Path, directory: int, allocated: os.stat_result) -> Non
             _ = cast(Callable[..., object], function)(name, dir_fd=directory)
 
     try:
-        current = os.stat(path.name, dir_fd=directory, follow_symlinks=False)
+        current = os.stat(name, dir_fd=directory, follow_symlinks=False)
     except FileNotFoundError:
         return
-    if os.path.samestat(current, allocated):
-        if not may_remove_build_path(path):
-            raise PermissionError(f"{path}: retain the protected build folder")
-        shutil.rmtree(path.name, dir_fd=directory, onexc=repair)
+    if allocated is not None and not os.path.samestat(current, allocated):
+        return
+    if not may_remove_build_path(path):
+        raise PermissionError(f"{path}: retain the protected build folder")
+    shutil.rmtree(name, dir_fd=directory, onexc=repair)
 
 
 def _folder_exists(path: Path, directory: int) -> bool:
@@ -1997,7 +2020,7 @@ def _finish_temporary(path: Path, directory: int, allocated: os.stat_result, *,
     if _locks.get(descriptor) != path:
         return
     _release_build_folder(path, descriptor=descriptor)
-    _ = remove_build_folder(path, lambda: _remove_folder(path, directory, allocated),
+    _ = remove_build_folder(path, lambda: remove_folder(path, directory, allocated),
                             temporary=temporary, dir_fd=directory)
 
 
@@ -2015,7 +2038,7 @@ def _remove_free(path: Path, directory: int, *, wait: bool) -> bool:
                     return False
             except OSError:
                 return False
-            _remove_folder(path, directory, allocated)
+            remove_folder(path, directory, allocated)
         return True
 
     return remove_build_folder(path, cleanup, dir_fd=directory, wait=wait)
