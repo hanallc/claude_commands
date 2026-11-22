@@ -210,6 +210,35 @@ class WorktreeAttributionTests(unittest.TestCase):
         self.assertIn(f"{foreign}: the checkout is for unit 'other-unit', and the run belongs to 'reservation'", errors)
         self.assertEqual((directory / phase_reservation.WORKTREE_FILE).read_text(), str(legacy) + "\n")
 
+    def test_claim_refuses_a_replacement_outside_git_for_the_legacy_home(self) -> None:
+        directory = phase_reservation.phase_directory(self.session, "2")
+        directory.mkdir(parents=True)
+        worktree_file = directory / phase_reservation.WORKTREE_FILE
+        _ = worktree_file.write_text(str(self.first) + "\n")
+        outside = self.session.parent / "outside-git"
+        outside.mkdir()
+
+        code, errors = self.claim("2", outside)
+
+        self.assertEqual(code, 2)
+        self.assertIn(f"{outside}: --repo does not name a Git checkout", errors)
+        self.assertEqual(worktree_file.read_text(), str(self.first) + "\n")
+        self.assertEqual(self.claim("3", outside), (0, ""))
+
+    def test_claim_tells_a_phase_without_a_reservation_to_clear_its_state(self) -> None:
+        clone = self.session.parent / "phase-2-clone"
+        self.record_clone("2", clone)
+        directory = phase_reservation.phase_directory(self.session, "2")
+        _ = phase_reservation.enroll(directory, "2", "unconfigured")
+
+        code, errors = self.claim("2", self.second)
+
+        self.assertEqual(code, 2)
+        self.assertIn(f"state {phase_reservation.NOT_ENROLLED!r}", errors)
+        self.assertIn("phase_reservation.py clear " + shlex.join(["--session-dir", str(self.session), "--phase", "2"]),
+                      errors)
+        self.assertEqual((directory / phase_reservation.WORKTREE_FILE).read_text(), str(clone) + "\n")
+
     def test_claim_uses_the_unit_word_from_completed_records(self) -> None:
         main = self.session.parent / ".claude"
         _ = subprocess.run(["git", "clone", "-q", str(self.first), str(main)], check=True, capture_output=True,

@@ -482,16 +482,26 @@ def _require_checkout_move(directory: Path) -> None:
         if phase_directory_name(_state_phase(state)) != directory.name:
             return
     kind = _string(state.get("kind")) or "unreadable"
-    if kind != AWAITING_FIRST_TOUCH:
-        raise StateRefused(f"phase {directory.name} has reservation state {kind!r}. "
-                           + "Release the phase reservation, then claim again.")
+    if kind == AWAITING_FIRST_TOUCH:
+        return
+    if kind in HOLDS_RESERVATION:
+        action = "Release the phase reservation, then claim again."
+    elif kind in BOARD_STATES.values():
+        command = shlex.join(["python3", str(Path(__file__).resolve()), "clear",
+                              "--session-dir", str(directory.parent.parent), "--phase", directory.name])
+        action = f"Run {command}, then claim again."
+    else:
+        action = "Check the phase reservation state, then claim again."
+    raise StateRefused(f"phase {directory.name} has reservation state {kind!r}. {action}")
 
 
-def _record_claim_checkout(directory: Path, requested: Path | None) -> Path | None:
+def _record_claim_checkout(directory: Path, requested: Path | None, *, repo_argument: str | None) -> Path | None:
     """Select and record the checkout while the caller holds the phase lock."""
     root = requested
     if _has_recorded_checkout(directory):
         recorded = phase_worktree(directory).root.resolve()
+        if requested is None and repo_argument is not None and Path(repo_argument).resolve() != recorded:
+            raise StateRefused(f"{repo_argument}: --repo does not name a Git checkout")
         recorded_exists = recorded.is_dir()
         if requested is not None and requested != recorded:
             if isinstance(_model_worktree_path(recorded), ValueError):
@@ -1030,12 +1040,14 @@ def _claim_command(args: argparse.Namespace) -> int:
     """
     session_dir = Path(cast(str, args.session_dir))
     directory = phase_directory(session_dir, cast(str, args.phase))
-    requested = repository_root(Path(cast(str, args.repo)))
+    repo_argument = cast(str | None, args.repo)
+    requested = repository_root(Path(repo_argument) if repo_argument is not None else WORKING_DIRECTORY)
     try:
         root = None
         if requested is not None or _has_recorded_checkout(directory):
             with phase_lock(directory):
-                root = _record_claim_checkout(directory, requested.resolve() if requested is not None else None)
+                root = _record_claim_checkout(directory, requested.resolve() if requested is not None else None,
+                                              repo_argument=repo_argument)
     except (StateRefused, OSError) as refused:
         print(f"phase_reservation: {refused}", file=sys.stderr)
         return 2
@@ -1078,7 +1090,7 @@ def main(argv: list[str]) -> int:
     claim = commands.add_parser("claim", help="acquire a phase's reservation over its files before its workers open")
     _ = claim.add_argument("--session-dir", required=True)
     _ = claim.add_argument("--phase", required=True)
-    _ = claim.add_argument("--repo", default=".")
+    _ = claim.add_argument("--repo")
     repair = commands.add_parser("repair", help="restore a lost record from berth's live reservation")
     _ = repair.add_argument("--session-dir", required=True)
     _ = repair.add_argument("--phase", required=True)
