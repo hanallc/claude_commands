@@ -30,7 +30,7 @@ from uuid import uuid4
 
 from scripts.aws_target import gate_box, ledger
 from scripts.build_queue.admission_jobs import GateJobNotRecorded, StepJob
-from scripts.lib import build_folders, conf
+from scripts.lib import build_folders, conf, process_group
 from scripts.production.gate_modules import GateRefused, discover_test_modules
 from scripts.production.gate_routes import AllModules, GateJobKind, GateRun, ModuleCoverage, SuiteMode, TreeSelection
 
@@ -273,7 +273,7 @@ def stop_ssh_process(process: subprocess.Popen[bytes]) -> None:
     while True:
         try:
             with suppress(ProcessLookupError):
-                os.killpg(process.pid, signal.SIGKILL)
+                process_group.send_process_group(process.pid, signal.SIGKILL)
             _ = process.wait()
             return
         except KeyboardInterrupt:
@@ -467,6 +467,9 @@ exec timeout --signal=KILL {settings.guest_timeout_seconds} {start} "$BASHPID" {
 
 def cleanup_shell(settings: GuestSettings, armed: ArmedGuestAttempt) -> str:
     cancel = guest_attempt_command('cancel', armed, 8)
+    # Cleanup can run before the guest has a checkout with scripts.
+    group_helper = Path(process_group.__file__).read_text(encoding='utf-8')
+    send_group = shlex.join(('python3', '-I', '-S', '-c', group_helper))
     cleanup = f'''set -euo pipefail
 lock="/proc/$$/fd/8"
 prove_end() {{
@@ -482,7 +485,7 @@ read -r group owner < "$lock" || :
 if [[ "$owner" == {shlex.quote(armed.attempt)} ]]; then
     if [[ "$group" =~ ^[1-9][0-9]{{0,9}}$ ]] && (( group > 1 && group <= 2147483647 )); then
         if [[ /proc/$group/fd/{RUN_LOCK_FD} -ef "$lock" ]]; then
-            kill -KILL -- "-$group" 2>/dev/null || :
+            {send_group} "$group" KILL 2>/dev/null || :
         fi
     else
         printf 'The guest process group ID is invalid.\\n' >&2
