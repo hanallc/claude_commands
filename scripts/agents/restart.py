@@ -287,6 +287,12 @@ class DetachedReport(TypedDict):
     issues: dict[str, FollowUpFields]
 
 
+class LogHandoff(Enum):
+    LOCAL = "the parent can write the result"
+    PENDING = "the launcher may have started the child"
+    STARTED = "the launcher confirmed the child started"
+
+
 @dataclass
 class BulkReport:
     log: Path
@@ -298,7 +304,7 @@ class BulkReport:
     issues: dict[str, FollowUp] = field(default_factory=dict)
     preview: list[str] = field(default_factory=list)
     inherited: set[str] = field(default_factory=set)
-    deferred: bool = False
+    handoff: LogHandoff = LogHandoff.LOCAL
     log_stream: io.FileIO | None = None
     log_error: OSError | ValueError | None = None
 
@@ -315,14 +321,14 @@ class BulkReport:
         error = self.log_error
         path = shlex.quote(str(self.log.parent))
         cause = error.errno if isinstance(error, OSError) else None
-        if cause in (errno.EACCES, errno.EPERM):
+        if cause == errno.EACCES:
             folder = self.log.parent
             with suppress(OSError):
                 folder = next((parent for parent in self.log.parents if parent.is_dir()), folder)
             repair = f"gives this account write and search access to {shlex.quote(str(folder))}"
             return (f"Nate {repair}. Nate gives this account search access to the parent folders. "
                     f"Then Nate runs {self.retry} again.")
-        elif cause in (errno.EEXIST, errno.ENOTDIR):
+        elif cause == errno.ENOTDIR:
             blocked = None
             with suppress(OSError):
                 blocked = next((parent for parent in self.log.parents if parent.is_file()), None)
@@ -450,6 +456,10 @@ def _record_stop_plan(report: BulkReport, rows: Iterable[staff.StaffRow]) -> Non
         raise StopPlanWriteFailed(_error_reason(error)) from error
 
 
+def _background_status(command: str) -> str:
+    return f"{command} runs in the background. Read its report in this log."
+
+
 def run_command(action: Callable[[], int], arguments: list[str], *, stop: bool = False, dry_run: bool = False) -> int:
     """Write the command output to the terminal and the same log."""
     detached = _DETACHED_LOG.get()
@@ -462,7 +472,8 @@ def run_command(action: Callable[[], int], arguments: list[str], *, stop: bool =
         try:
             if detached is None:
                 log = _create_log(files, path)
-                print(path, flush=True)
+                # Show the path before the child can stop the caller.
+                print(path, end="", flush=True)
             else:
                 log = files.enter_context(io.FileIO(detached.descriptor, "wb", closefd=False))
                 _ = log.seek(0, os.SEEK_END)
@@ -494,23 +505,31 @@ def run_command(action: Callable[[], int], arguments: list[str], *, stop: bool =
             code = 2
         finally:
             _BULK_REPORT.reset(token)
+        if detached is None and log is not None:
+            if report.handoff is LogHandoff.PENDING:
+                notice = ("The launcher could not confirm the start. Read any report in this log."
+                          if code else _background_status(report.command))
+                print(f"  {notice}", flush=True)
+            else:
+                print(flush=True)
+        if report.handoff is not LogHandoff.LOCAL:
+            return code
         if code and not report.issues:
             report.failure("", report.command, "Could not complete the command")
-        if not report.deferred:
-            result = "\n".join(report.lines(dry_run=dry_run)) + "\n"
-            if log is not None:
-                try:
-                    _write_log(log, result)
-                    if detached is not None:
-                        os.fsync(log.fileno())
-                except (OSError, ValueError) as error:
-                    print(f"Could not finish writing the log at {path}. {_error_reason(error)}",
-                          file=sys.stderr, flush=True)
-                    if detached is not None:
-                        print(result, end="", file=sys.stderr, flush=True)
-                        return code or 2
-            if detached is None:
-                print(result, end="", flush=True)
+        result = "\n".join(report.lines(dry_run=dry_run)) + "\n"
+        if log is not None:
+            try:
+                _write_log(log, result)
+                if detached is not None:
+                    os.fsync(log.fileno())
+            except (OSError, ValueError) as error:
+                print(f"Could not finish writing the log at {path}. {_error_reason(error)}",
+                      file=sys.stderr, flush=True)
+                if detached is not None:
+                    print(result, end="", file=sys.stderr, flush=True)
+                    return code or 2
+        if detached is None:
+            print(result, end="", flush=True)
         return code
 
 
@@ -1604,8 +1623,13 @@ def _restart(pane_evidence: ExitStack, *, stop_all: bool, dry_run: bool, only: t
             path = shutdown_state_root() / "logs" / f"restart-{uuid4().hex}.log"
             with ExitStack() as files:
                 stream = _create_log(files, path)
-                log = stop_resume.detach(arguments, "restart", program=Path(__file__).resolve(),
-                                         log=path, log_fd=stream.fileno())
+                try:
+                    log = stop_resume.detach(arguments, "restart", program=Path(__file__).resolve(),
+                                             log=path, log_fd=stream.fileno())
+                except subprocess.TimeoutExpired:
+                    command = "agents stop --all" if after_stop is AfterStop.KEEP_STOPPED else "agents restart"
+                    print(f"{path}  {_background_status(command)}")
+                    return 0
             print(f"restart continues outside this session; log: {log}")
         else:
             if report.log_stream is None:
@@ -1619,20 +1643,24 @@ def _restart(pane_evidence: ExitStack, *, stop_all: bool, dry_run: bool, only: t
                         f"Could not write the log. {reason}", step, operator=True)
                 return 2
             arguments.extend(("--parent-report", report.detach_data()))
+            report.handoff = LogHandoff.PENDING
             try:
                 _ = stop_resume.detach(arguments, "restart", program=Path(__file__).resolve(),
                                        log=report.log, log_fd=report.log_stream.fileno())
-            except (OSError, ValueError, subprocess.SubprocessError) as error:
-                detail = cast(str | None, error.stderr) if isinstance(error, subprocess.CalledProcessError) else None
+            except subprocess.TimeoutExpired:
+                return 0
+            except subprocess.CalledProcessError as error:
+                if error.returncode <= 0:
+                    raise
+                report.handoff = LogHandoff.LOCAL
+                detail = cast(str | None, error.stderr)
                 reason = _error_reason(detail or error)
-                step = ("Nate sends this launcher error to the efficiency unit."
-                        if isinstance(error, subprocess.TimeoutExpired) else
-                        f"Nate opens a plain terminal without a staff session. Nate runs {report.retry} there.")
+                step = f"Nate opens a plain terminal without a staff session. Nate runs {report.retry} there."
                 for row in selected:
                     report.issues[row.id] = FollowUp(report.targets[row.id],
-                        f"Could not confirm the detached launch. {reason}", step, operator=True)
+                        f"The launcher could not start the detached command. {reason}", step, operator=True)
                 return 2
-            report.deferred = True
+            report.handoff = LogHandoff.STARTED
         return 0
     lock_wait = conf.read("shutdown").number("UPKEEP_ROW_WAIT_SECONDS") if holders else 0
     from scripts.herdr.worker_panes import (

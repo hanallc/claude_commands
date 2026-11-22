@@ -1533,6 +1533,8 @@ def restore(parent: StaffId, *, record: staff.StaffSnapshot | None = None,
                     report.run_failures[run] = str(error)
                 outcome = ExitCode.UNCERTAIN
     runs = runs if runs is not None else {str(holder.current_session): [str(path) for path in observed.runs]}
+    pending_completion = (CompletionRecovery.PENDING_CLOSE, CompletionRecovery.WAITING_ON_RUNS,
+                          CompletionRecovery.WAITING_ON_REPLY)
 
     def failed(row: staff.StaffRow, reason: str, code: ExitCode = ExitCode.UNCERTAIN, *,
                notice: str = "") -> None:
@@ -1549,6 +1551,7 @@ def restore(parent: StaffId, *, record: staff.StaffSnapshot | None = None,
             if isinstance(state, (worker_panes.ProcessUnknownWorker, worker_panes.UncertainWorker)):
                 failed(state.row, state.reason)
                 continue
+            resume_sent = False
             try:
                 with worker_panes.worker_lock(parent, WorkerName.parse(name)) as hold, ExitStack() as cleanup:
                     if isinstance(hold, worker_panes.Kept):
@@ -1559,18 +1562,16 @@ def restore(parent: StaffId, *, record: staff.StaffSnapshot | None = None,
                     if isinstance(plan, DispatchEvidenceUnknown):
                         failed(state.row, plan.reason, notice=f"anomaly: {name}: {plan.reason}")
                         continue
-                    recovery = completion_notices.recover_completion(state.row, holder, run, hold, record=record,
-                        pane=KeepCompletedPane.KEEP if isinstance(plan, WorkerResume) else CloseCompletedPane.CLOSE)
-                    if recovery is CompletionRecovery.RECOVERED:
-                        if report is not None:
-                            report.skipped[state.row.id] = "The worker finished its dispatch"
-                        changed = True
-                        continue
-                    if recovery in (CompletionRecovery.PENDING_CLOSE, CompletionRecovery.WAITING_ON_RUNS,
-                                    CompletionRecovery.WAITING_ON_REPLY):
-                        failed(state.row, recovery.value, notice=f"{name}: {recovery.value}")
-                        continue
                     if plan is None:
+                        recovery = completion_notices.recover_completion(state.row, holder, run, hold, record=record)
+                        if recovery is CompletionRecovery.RECOVERED:
+                            if report is not None:
+                                report.skipped[state.row.id] = "The worker finished its dispatch"
+                            changed = True
+                            continue
+                        if recovery in pending_completion:
+                            failed(state.row, recovery.value, notice=f"{name}: {recovery.value}")
+                            continue
                         if isinstance(state, worker_panes.OpenWorker) and not state.status.idle:
                             if report is not None:
                                 report.restored.add(state.row.id)
@@ -1626,14 +1627,22 @@ def restore(parent: StaffId, *, record: staff.StaffSnapshot | None = None,
                     resumed = resume(row, plan)
                     if isinstance(resumed, DispatchEvidenceUnknown):
                         failed(row, resumed.reason, notice=f"anomaly: {name}: {resumed.reason}")
-                    else:
-                        _ = cleanup.pop_all()
-                        if report is not None:
-                            report.restored.add(row.id)
+                        continue
+                    resume_sent = True
+                    _ = cleanup.pop_all()
+                    if report is not None:
+                        report.restored.add(row.id)
+                    recovery = completion_notices.recover_completion(row, holder, run, hold, record=record,
+                                                                     pane=KeepCompletedPane.KEEP)
+                    if report is None and recovery in pending_completion:
+                        print(f"{name}: {recovery.value}", file=sys.stderr)
             except (OSError, ValueError, herdr_types.HerdrFailure, subprocess.SubprocessError,
                     staff.StaffRefused, staff.StaffUnreadable) as error:
                 reason = " ".join(str(error).splitlines()) or type(error).__name__
-                failed(state.row, reason, notice=f"anomaly: {name}: {reason}")
+                if not resume_sent:
+                    failed(state.row, reason, notice=f"anomaly: {name}: {reason}")
+                elif report is None:
+                    print(f"anomaly: {name}: {reason}", file=sys.stderr)
     if report is None:
         if outcome == ExitCode.OK:
             print(f"{holder.name}: workers {'restored' if changed else 'unchanged'}")

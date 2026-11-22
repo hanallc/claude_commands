@@ -1139,7 +1139,7 @@ class WorkerCommandTests(unittest.TestCase):
                 worker_name=name, worker_id=opened.row.id, launcher_command=["assign.sh", name],
                 prompt=self.prompt, kind="impl", lens="")
             dispatches[name] = dispatch
-            line = f"Complete the work. End your reply with DONE {dispatch}."
+            line = f"Complete the work. End your final reply with DONE {dispatch}."
             reply = self.run_dir / f"{name}_reply.md"
             progress_history.save_dispatch_delivery(self.run_dir, dispatch,
                 pass_recorder.DispatchDelivery(line, dispatch, str(reply)))
@@ -1163,7 +1163,10 @@ class WorkerCommandTests(unittest.TestCase):
             return sorted(observe(parent, record), key=lambda state: state.row.name != "impl")
 
         _ = self.enterContext(patch.object(worker_panes, "observe", side_effect=observe_impl_first))
-        code, _, errors = self.command("restore")
+        with patch.object(self.fixture.world, "prompt") as send_resume:
+            code, _, errors = self.command("restore")
+        send_resume.assert_called_once()
+        self.assertEqual(send_resume.call_args.args[0], cm.pane)
         self.assertEqual(code, worker.ExitCode.UNCERTAIN)
         self.assertEqual(errors.splitlines(), ["anomaly: impl: worker transcript has incomplete records",
                                                "cm: a detached run result awaits a matching DONE"])

@@ -646,6 +646,8 @@ The commands keep the full report under `shutdown_state_root()/logs` and retain 
 A command that stops its caller continues in a detached process.
 The detached process writes and flushes the full list of sessions before it stops any session.
 On Linux, `systemd-run` confirms that Python started and gives it access to the open log file.
+After the handoff, only the child writes the report.
+If the launcher times out, the parent prints one line with the log path and the background status.
 If a log write fails after a stop, the child reports the result on stderr and returns a nonzero status.
 The Linux user service sends stderr to the journal.
 Its final line includes the names and steps for unresolved sessions from the first process.
@@ -662,6 +664,7 @@ If there are no steps, the final line says `Nothing for you to do.`
 Restart keeps entries that need another restore attempt.
 Restart reads the dispatch state and live detached runs by worker staff ID.
 Restart counts a worker as back when it needs no resume message or when restart sends the message.
+Restart sends a required resume message before it tries to recover the worker's completion.
 Restart removes only worker entries that it resolves.
 Run `worker.py restore` in the owner session to see completed dispatches in open phases.
 
