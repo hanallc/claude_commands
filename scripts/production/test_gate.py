@@ -19,10 +19,12 @@ import select
 import signal
 import subprocess
 import sys
+import time
 from typing import cast, final, override
 from contextlib import AbstractContextManager, redirect_stdout
 from datetime import UTC, datetime, tzinfo
 from unittest import mock
+from scripts.buildlog import store
 from scripts.direct.wait_for_test_state import wait_until
 from scripts.lib import scratch
 from scripts.lib.process_start import Gone
@@ -729,6 +731,42 @@ class GateRecoveryTests(MergeGateFixture):
                 if process.poll() is None:
                     process.kill()
                     _ = process.communicate(timeout=TEST_HANG_GUARD_SECS)
+
+    @gate_suites("hooks")
+    def test_tests_only_sigterm_leaves_recovery_when_the_append_lock_is_held(self) -> None:
+        self.configure_gate("program_stop_seconds=2\nprogram_sample_seconds=0.05")
+        hold = self.state / "hold-module"
+        self.write(hold, "hold")
+        ready = self.state / "module-held"
+        with mock.patch.dict(os.environ, self.environment):
+            records = gate.gate_run_directory(self.checkout)
+            log = store.host_file(store.host_name(), time.time())
+            stop_seconds = admission_records.read_memory_config().program_stop_seconds
+        command = [*self.gate_command(), "--tests-only", "--full", "--repo", str(self.checkout)]
+        with subprocess.Popen(command, cwd=self.root, env=self.environment, stdin=subprocess.DEVNULL,
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) as process:
+            try:
+                wait_until(lambda: ready.exists() or process.poll() is not None, self.state, processes=(process,))
+                self.assertTrue(ready.is_file())
+                [record] = records.glob(f"{process.pid}-*.json")
+                with store.locked_append(log):
+                    process.send_signal(signal.SIGTERM)
+                    output, errors = process.communicate(timeout=stop_seconds + 1)
+                    self.assertEqual(process.returncode, -signal.SIGTERM, output + errors)
+                self.assertEqual(errors.splitlines().count(
+                    f"gate run not written: the append lock deadline passed for {log}"), 1, errors)
+                saved = cast(dict[str, object], json.loads(record.read_text()))
+                self.assertIs(saved["finished"], False)
+                self.assertEqual(self.gate_run_records(), [])
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                    _ = process.communicate(timeout=TEST_HANG_GUARD_SECS)
+
+        hold.unlink()
+        result = self.run_gate("--tests-only", "--module", "hooks/test_first.py")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertFalse(record.exists())
 
     def test_tests_only_recovers_unfinished_record_and_keeps_finished_record(self) -> None:
         with mock.patch.dict(os.environ, self.environment):

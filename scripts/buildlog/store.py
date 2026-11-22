@@ -275,8 +275,8 @@ def append_locked(handle: BinaryIO, record: object) -> None:
     _write_all(handle.fileno(), data)
 
 
-def append_line(path: Path, record: object) -> None:
-    with locked_append(path) as handle:
+def append_line(path: Path, record: object, *, deadline: float | None = None) -> None:
+    with locked_append(path, deadline=deadline) as handle:
         append_locked(handle, record)
 
 

@@ -1893,7 +1893,7 @@ def record_gate_run(ledger: PassedTreeLedger, executions: Sequence[GateJobResult
                     suite_finished: dict[str, float], *, started_at: float, wall_s: float,
                     hold_wait_s: float, selection: AffectedSelection | FullSuite | SelectedModules, reused: bool,
                     reason: str, status: int, max_jobs: int, peak_mib: float, cap_mib: float,
-                    aborted: bool, mode: SuiteMode) -> None:
+                    aborted: bool, mode: SuiteMode, append_deadline: float | None = None) -> None:
     """Build one gate record without changing the gate verdict."""
     try:
         slow_test_s = gate_record.slow_test_s()
@@ -1930,7 +1930,10 @@ def record_gate_run(ledger: PassedTreeLedger, executions: Sequence[GateJobResult
     except Exception as error:
         gate_record.report_not_written(error)
         return
-    gate_record.write_gate_run(run, recorded_executions)
+    if append_deadline is None:
+        gate_record.write_gate_run(run, recorded_executions)
+    else:
+        gate_record.write_gate_run(run, recorded_executions, append_deadline=append_deadline)
 
 
 def python_shim(repo: Path) -> Path:
@@ -2102,7 +2105,7 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
         return (result.memory_stopped and result.returncode != 0 and not result.tripwire_tripped
                 and memory_reruns.get((result.suite, result.module), 0) < memory_stop_reruns)
 
-    def record(status: int, aborted: bool) -> None:
+    def record(status: int, aborted: bool, *, append_deadline: float | None = None) -> None:
         if ledger is None or hold is None or admission is None:
             return
         waited = hold.waited_s()
@@ -2110,20 +2113,29 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
         record_gate_run(ledger, executions, results, suite_started, suite_finished, started_at=started_at,
                         wall_s=wall_s, hold_wait_s=waited, selection=selection, reused=reused,
                         reason=reason, status=status, max_jobs=max_running_jobs, peak_mib=admission.peak_mib,
-                        cap_mib=admission.governor_mib, aborted=aborted, mode=mode)
+                        cap_mib=admission.governor_mib, aborted=aborted, mode=mode,
+                        append_deadline=append_deadline)
 
     @contextmanager
-    def record_on_abort() -> Generator[None, None, None]:
+    def record_on_abort(recovery: GateRecovery) -> Generator[None, None, None]:
         try:
             yield
         except BaseException:
-            if job_started:
-                record(1, aborted=True)
+            if shared and job_started:
+                append_deadline = recovery.cleanup_deadline
+                try:
+                    if append_deadline is None:
+                        config = admission_records.read_memory_config()
+                        append_deadline = time.monotonic() + bounded_program_stop_seconds(config)
+                    record(1, aborted=True, append_deadline=append_deadline)
+                except store.AppendLockTimeout as error:
+                    recovery.unresolved = True
+                    gate_record.report_not_written(error)
             raise
 
     folder_tool = "g" if mode is SuiteMode.GATE else "t"
     module_number = 0
-    with ((gate_recovery(repo) if shared else private_gate_recovery(repo, tmpfs)) as recovery, record_on_abort(),
+    with ((gate_recovery(repo) if shared else private_gate_recovery(repo, tmpfs)) as recovery, record_on_abort(recovery),
           gate_temporary(recovery, folder_tool, tmpfs) as temporary,
           ExitStack() as module_folders,
           (gate_reservation(repo, temporary, hold, type_dirs=type_dirs, mode=mode) if hold is not None else nullcontext(None)) as reservation,
@@ -2344,6 +2356,11 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
                         progress_profile.clear_counter(reservation.sidecar)
                 if running or pending:
                     time.sleep(0.05)
+        except BaseException:
+            if shared and job_started and recovery.cleanup_deadline is None:
+                config = admission_records.read_memory_config()
+                recovery.cleanup_deadline = time.monotonic() + bounded_program_stop_seconds(config)
+            raise
         finally:
             # Only terminate groups created by this runner. Reap them before tmpfs cleanup.
             try:
