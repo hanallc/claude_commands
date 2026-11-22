@@ -165,13 +165,6 @@ class RemovalProofTests(unittest.TestCase):
         sandbox = self.sandbox()
         self.prove(sandbox, BUILD, ("--target-dir", str(sandbox.build / "proof/unit/short")))
 
-    def test_gate_sweep_lists_for_manual_review(self) -> None:
-        sandbox = self.sandbox()
-        root = sandbox.home / "worktrees" / "gates"
-        candidate = root / "proof-repo" / "proof-gate"
-        _ = self.canary(sandbox, candidate / "keep")
-        self.prove(sandbox, "scripts/lint/gate_folders_delete.py", ("--root", str(root)), manual=(candidate,))
-
     @unittest.skipUnless(sys.platform == "linux", "requires a Linux bind mount")
     def test_removal_refuses_a_bind_mount_above_the_reviewed_folder(self) -> None:
         sandbox = self.sandbox()

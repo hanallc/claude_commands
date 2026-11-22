@@ -6,7 +6,6 @@ from __future__ import annotations
 import io
 import json
 import os
-import signal
 import subprocess
 import sys
 import tempfile
@@ -292,26 +291,25 @@ class LaunchRecordingTests(unittest.TestCase):
         self.assertEqual(imports["after"], imports["before"])
         self.assertIs(imports["record"], False)
 
-    def test_signal_during_recording_shuts_down_the_fake_app_and_removes_launch_state(self) -> None:
+    def test_ctrl_c_during_recording_shuts_down_the_fake_app_and_removes_launch_state(self) -> None:
         recorder_path = str(Path(record.__file__).resolve())
 
         def interrupt_recording(*profile_event: object) -> None:
             frame = cast(FrameType, profile_event[0])
             if (profile_event[1] == "call" and frame.f_code.co_name == "launch"
                     and frame.f_code.co_filename == recorder_path):
-                raise hana_shot.ExitSignal(signal.SIGTERM)
+                raise KeyboardInterrupt
 
         port = 15815
         with self.fake_launch_process(port) as process:
             previous_profile = sys.getprofile()
             try:
                 sys.setprofile(interrupt_recording)
-                with self.assertRaises(hana_shot.ExitSignal) as caught:
+                with self.assertRaises(KeyboardInterrupt):
                     _ = hana_shot.launch(port, str(self.worktree), str(self.binary), purpose=LAUNCH_RECORDING_PURPOSE)
             finally:
                 sys.setprofile(previous_profile)
 
-            self.assertEqual(caught.exception.number, signal.SIGTERM)
             self.assertEqual(process.poll(), 0)
             self.assertFalse(hana_shot.launch_state_path(port).exists())
             self.assertFalse((self.root.parent / f"new-scratch-{port}").exists())

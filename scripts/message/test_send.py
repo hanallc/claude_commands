@@ -4848,13 +4848,14 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
     def test_a_note_to_the_user_with_one_key_has_no_window_without_repeat_minutes(self) -> None:
         note = ["--here", "--to", "user", "--from", "hana", "--summary", "Build done", "--key", "build", "--no-action",
                 "--text", "The build passed."]
-        for extra in ([], ["--through-silence"]):
-            note.extend(extra)
+        for extra in ([], ["--through-silence"], ["--user-asked"]):
             with self.subTest(extra=extra), mock.patch.object(send, "run", return_value=(0, "pushover: sent\n", "")) as channel:
-                self.assertEqual([send.send(send.parse(registered_arguments(note))).outcome for _ in range(2)], ["sent", "sent"])
+                options = send.parse(registered_arguments([*note, *extra]))
+                self.assertEqual([send.send(options).outcome for _ in range(2)], ["sent", "sent"])
             self.assertEqual(channel.call_count, 2)
             command = cast(list[str], channel.call_args.args[0])
-            self.assertEqual("--through-silence" in command, bool(extra))
+            self.assertEqual("--through-silence" in command, "--through-silence" in extra)
+            self.assertEqual("--user-asked" in command, "--user-asked" in extra)
             self.assertEqual(command[command.index("--priority") + 1], "0")
             self.assertNotIn("--repeat-minutes", command)
 
@@ -6638,16 +6639,22 @@ runpy.run_path(sys.argv[0], run_name="__main__")
         self.assertIn("action=log in", commands[0][-1])
 
     def test_pushover_refusal_exits_2_and_keeps_nothing(self) -> None:
-        refused = f"pushover: {REFUSED_BEFORE_SENDING}: priority 2 requires --action"
-        output = io.StringIO()
-        arguments = ["--to", "user", "--from", "test", "--summary", "natedev: disk", "--no-action",
-                     "--text", "full"]
-        with mock.patch.object(send, "run", return_value=(2, "", refused)), redirect_stdout(output):
-            code = registered_main(arguments)
-        self.assertEqual(code, 2)
-        self.assertEqual(output.getvalue(), f"REFUSED: {refused}\n")
-        self.assertEqual(send.pending("user"), "")
-        self.assertEqual(self.log()[0]["outcome"], "refused")
+        cases = (
+            (["--to", "user", "--from", "test", "--summary", "natedev: disk", "--no-action", "--text", "full"],
+             "priority 2 requires --action"),
+            (["--to", "user", "--user-asked", "--text-id", "nixos.ups_replace_battery"],
+             "--user-asked requires --text-id nate.adhoc"),
+        )
+        for index, (arguments, reason) in enumerate(cases):
+            refused = f"pushover: {REFUSED_BEFORE_SENDING}: {reason}"
+            output = io.StringIO()
+            with (self.subTest(reason=reason), mock.patch.object(send, "run", return_value=(2, "", refused)),
+                  redirect_stdout(output)):
+                code = registered_main(arguments)
+            self.assertEqual(code, 2)
+            self.assertEqual(output.getvalue(), f"REFUSED: {refused}\n")
+            self.assertEqual(send.pending("user"), "")
+            self.assertEqual(self.log()[index]["outcome"], "refused")
 
     def test_pushover_exit_2_for_missing_keys_is_failed(self) -> None:
         keys_missing = "pushover: PUSHOVER_USER and PUSHOVER_TOKEN must both be set in /missing/env"
@@ -6941,6 +6948,7 @@ runpy.run_path(sys.argv[0], run_name="__main__")
                                          "--value", "title=work stopped", "--value", f"description={description}"])
                 self.assertEqual(send.wrong_template(options, description), expected)
                 self.assertIsNone(send.wrong_template(options._replace(text_id="quota.paid_credits"), description))
+                self.assertIsNone(send.wrong_template(options._replace(user_asked=True), description))
 
     def paid_credits_arguments(self, *extra: str) -> list[str]:
         values = {"account": "codex2", "machine": "natedev", "credits": "25,345", "refill": "Tue 10-27 02:33 EDT",
@@ -7225,6 +7233,14 @@ runpy.run_path(sys.argv[0], run_name="__main__")
                 marker = send.as_dict(send.loads(self.failure_marker().read_text()))
                 self.assertEqual(marker["fallback"], "Title: Build stopped\nAction: Choose in natedev terminal.\n"
                                  + "Choose whether to retry.\n\nSent by: Build writer · Template: alert.decision")
+        arguments = ["--to", "user", "--machine", "natedev", "--text-id", "nate.adhoc", "--user-asked",
+                     "--through-silence", "--value", "sender=writer", "--value", "title=Build passed",
+                     "--value", "description=You asked to be told when the build passed."]
+        with mock.patch.object(send, "run", return_value=(0, "SENT: to the user\n", "")) as run:
+            self.assertEqual(send.send(send.parse(arguments)).outcome, "sent")
+        forwarded = shlex.split(cast(list[str], run.call_args.args[0])[-1])
+        self.assertIn("--user-asked", forwarded)
+        self.assertIn("--through-silence", forwarded)
         with mock.patch.object(send, "run", return_value=(255, "", "ssh unavailable")):
             result = send.send(send.parse(registered_arguments(self.user_arguments("--machine", "natedev"))))
         self.assertIn(send.UNREVIEWED_FALLBACK, result.detail)
@@ -7398,7 +7414,7 @@ runpy.run_path(sys.argv[0], run_name="__main__")
         self.assertEqual(options.action, send.NoUserRecipient())
 
     def test_action_flags_are_only_for_user_messages(self) -> None:
-        for action in (["--no-action"], ["--action", "reply"], ["--through-silence"]):
+        for action in (["--no-action"], ["--action", "reply"], ["--through-silence"], ["--user-asked"]):
             errors = io.StringIO()
             with self.assertRaises(SystemExit) as raised, mock.patch("sys.stderr", errors):
                 _ = local_options(["--to", "natedev", *action, "--text", "hello"])
