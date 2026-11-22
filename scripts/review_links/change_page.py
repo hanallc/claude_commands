@@ -402,6 +402,7 @@ class QuestionDeliveryTarget:
     title: str
     answer_command: str
     alert_owner: staff.StaffId | None = None
+    initial_recipient: question_record.QuestionRecipient = question_record.DefaultQuestionRecipient.PAGE
 
     def saved(self, question: question_record.Question) -> SavedQuestionDelivery:
         row = f"{self.row}/{question.question_id}"
@@ -749,11 +750,25 @@ def _send_result(delivery: VerifiedQuestionAttempt) -> QuestionAttempt:
 
 
 def _list_question_store(record: QuestionAttempt) -> record_store.NumberedRecords:
-    return record_store.NumberedRecords(record.recipient_id, "list", "L", "list item", ValueError)
+    source = record.source
+    path = Path(source.path)
+    listing = record_store.NumberedRecords(record.recipient_id, "list", "L", "list item", ValueError)
+    try:
+        if listing.path(source.item_id).resolve() == path:
+            return listing
+    except ValueError as error:
+        raise StaleQuestionAttempt("The List question source is unavailable.") from error
+    keepers = [row.id for row in staff.active(staff.snapshot(), "producer") if row.name == "morty"]
+    if len(keepers) != 1:
+        raise StaleQuestionAttempt("The List keeper is unavailable.")
+    listing = replace(listing, owner=keepers[0])
+    if listing.path(source.item_id).resolve() != path:
+        raise StaleQuestionAttempt("The List question source has moved.")
+    return listing
 
 
 def _open_list_question(listing: record_store.NumberedRecords,
-                        record: QuestionAttempt) -> dict[str, str]:
+                        record: QuestionAttempt) -> tuple[dict[str, str], question_record.Question]:
     source = record.source
     path = listing.path(source.item_id)
     if path.resolve() != Path(source.path):
@@ -770,7 +785,11 @@ def _open_list_question(listing: record_store.NumberedRecords,
         raise ValueError("The List question source has a different item ID.")
     if fields["state"] == "Closed":
         raise ClosedQuestionSource("The List question source is Closed.")
-    return fields
+    questions = delivery_state.read_list_questions(fields.get("questions", "[]"))
+    question = _verify_open_question(record, questions)
+    if question.recipient_id(listing.owner) != record.recipient_id:
+        raise StaleQuestionAttempt("The List question has a different recipient.")
+    return fields, question
 
 
 @contextmanager
@@ -788,9 +807,7 @@ def _lock_open_question_source(status: DeliveryStatus, record: QuestionAttempt) 
         return
     listing = _list_question_store(record)
     with listing.locked():
-        fields = _open_list_question(listing, record)
-        questions = delivery_state.read_list_questions(fields.get("questions", "[]"))
-        _ = _verify_open_question(record, questions)
+        _ = _open_list_question(listing, record)
         yield
 
 
@@ -1021,11 +1038,10 @@ def _claim_recovered_page_question(status: DeliveryStatus, record: QuestionAttem
     elif source.row == f"List item {source.item_id.removeprefix('L')}/{source.question_id}":
         listing = _list_question_store(record)
         with listing.locked(), status.locked():
-            fields = _open_list_question(listing, record)
-            questions = delivery_state.read_list_questions(fields.get("questions", "[]"))
+            fields, question = _open_list_question(listing, record)
             target = list_question_target(source_path, fields["id"], int(fields["number"]), fields["title"],
                                           record.recipient_id, alert_owner=staff.StaffId(fields["owner"]))
-            return _recover_saved_question(status, target, record, questions)
+            return _recover_saved_question(status, target, record, (question,))
     return NoMessageDelivery()
 
 
