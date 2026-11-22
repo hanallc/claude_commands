@@ -12,7 +12,7 @@ import time
 from collections.abc import Generator
 from contextlib import contextmanager, redirect_stderr, redirect_stdout, suppress
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, tzinfo
 from enum import IntEnum
 from pathlib import Path
 from threading import Event, Lock, Thread, get_ident
@@ -23,6 +23,7 @@ from scripts.agents import restart, shutdown_record
 from scripts.herdr import herdr, herdr_types
 from scripts.lib import conf
 from scripts.lib.atomic_file import write_text_atomic
+from scripts.lib.user_zone import user_zone
 from scripts.maintenance import herdr_upkeep
 from scripts.production import staff
 
@@ -55,8 +56,9 @@ MOVE_DETAILS = tuple(f"session_move: {prefix}" for prefix in (
 class RunLog(io.TextIOBase):
     """Write each detail line with its time."""
 
-    def __init__(self, file: TextIO) -> None:
+    def __init__(self, file: TextIO, zone: tzinfo) -> None:
         self.file = file
+        self.zone = zone
         self.lock = Lock()
         self.pending: dict[int, str] = {}
 
@@ -80,7 +82,8 @@ class RunLog(io.TextIOBase):
 
     def _write_lines(self, lines: list[str]) -> None:
         for line in lines:
-            _ = self.file.write(f"{datetime.now().astimezone().isoformat(timespec='milliseconds')} {line}\n")
+            stamp = datetime.now(self.zone).isoformat(timespec="milliseconds")
+            _ = self.file.write(f"{stamp} {line}\n")
         if lines:
             self.file.flush()
 
@@ -387,9 +390,10 @@ def run(*, dry_run: bool = False) -> int:
     if not math.isfinite(interval) or interval <= 0:
         raise ValueError("REBOOT_SPINNER_SECONDS must be finite and greater than zero")
     directory.mkdir(parents=True, exist_ok=True)
-    path = directory / f"{datetime.now():%Y%m%dT%H%M%S}-{uuid4().hex}.log"
+    zone = user_zone()
+    path = directory / f"{datetime.now(zone):%Y%m%dT%H%M%S}-{uuid4().hex}.log"
     with path.open("x", encoding="utf-8") as stream:
-        log = RunLog(stream)
+        log = RunLog(stream, zone)
         print(path, file=terminal, flush=True)
         log.line(str(path))
         issues: list[restart.FollowUp] = []

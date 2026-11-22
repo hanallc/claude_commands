@@ -12,6 +12,7 @@ import unittest
 from collections.abc import Generator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
+from datetime import timezone
 from pathlib import Path
 from threading import Event
 from typing import cast, final, override
@@ -340,7 +341,7 @@ else:
 
     def test_concurrent_workers_use_the_report_count_and_total(self) -> None:
         terminal = io.StringIO()
-        display = reboot.StepDisplay(reboot.Step.START, terminal, reboot.RunLog(io.StringIO()))
+        display = reboot.StepDisplay(reboot.Step.START, terminal, reboot.RunLog(io.StringIO(), timezone.utc))
         reporting_first = Event()
         second_ready = Event()
 

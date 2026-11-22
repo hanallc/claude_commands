@@ -4857,7 +4857,6 @@ class HerdrTests(unittest.TestCase):
         with (native_process_commands(11, generations=(weak,)),
               patch.object(herdr, "Herdr", return_value=client),
               patch.object(os, "kill") as signalled,
-              patch.object(herdr, "os", SimpleNamespace(environ=os.environ, getuid=os.getuid, kill=signalled)),
               patch.object(herdr, "start_agent", side_effect=herdr_types.HerdrFailure("start failed"))):
             _ = herdr.launch_prepared_agent("fixture", herdr.SplitPane("parent", "right", 0.5, "worker"),
                 herdr.PreparedAgentEnvironment(self.root, {}), "claude", [],

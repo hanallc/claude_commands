@@ -339,6 +339,7 @@ The shared pane launch builder uses `set_home`.
 | `scripts/agents/pane_record.py` | read | initial_snapshot |
 | `scripts/agents/producer_creation.py` | read | authority_snapshot, is_owner, slot_operation, validate_name, producer_creation_registry; the staff owner reads and updates the creation marker |
 | `scripts/agents/producer_transfer.py` | write | initial_snapshot, runtime_id, native_id, slot_operation, row_operation, transfer_producer |
+| `scripts/agents/reboot.py` | read | initial_snapshot, StaffId, StaffRow. The reboot checks live sessions and identifies saved sessions that still need to start. |
 | `scripts/agents/remote_control.py` | read | initial_snapshot |
 | `scripts/agents/restart.py` | write | initial_snapshot, row_operation, set_home |
 | `scripts/agents/session_types.py` | read | snapshot |
