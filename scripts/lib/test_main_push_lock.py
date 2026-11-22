@@ -32,7 +32,7 @@ class MainPushLockRecordTests(unittest.TestCase):
         self.enterContext(patch.dict(os.environ, {
             "HOME": folder.name, "CONF_DIR": str(self.checkout / "config"),
             "MODELS_CONFIG_FILE": str(self.checkout / "config/models.conf"),
-            "MERGE_GATE_STATE_DIR": str(self.checkout / "land-state"),
+            "GATE_STATE_DIR": str(self.checkout / "land-state"),
             "XDG_STATE_HOME": str(self.checkout / "state"),
         }))
         _ = subprocess.run(["git", "init", "-q", str(self.checkout)], check=True, timeout=30)
@@ -59,7 +59,7 @@ class MainPushLockRecordTests(unittest.TestCase):
         self.assertEqual([line["holder"] for line in self.lines()], ["outer"])
 
     def test_settings_push_leaves_the_line_free_and_nonblocking_admission_returns_busy(self) -> None:
-        with patch.dict(os.environ, {"MERGE_GATE_STATE_DIR": str(self.checkout / "land-state")}):
+        with patch.dict(os.environ, {"GATE_STATE_DIR": str(self.checkout / "land-state")}):
             with main_push_lock.settings_push(self.checkout) as publisher:
                 self.assertIsInstance(publisher, land_queue.SettingsGap)
                 path = self.checkout / "land-state/land_queue.json.lock"

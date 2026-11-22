@@ -115,7 +115,7 @@ class SetTests(unittest.TestCase):
             "USER_ZONE_CONF": str(self.checkout / "config/user_zone.conf"),
             "ZONE_SSH": str(ssh), "ZONE_BROADCAST": str(self.fakes / "broadcast.py"),
             "ZONE_STATE": str(self.root / "state"), "CONF_DIR": str(self.checkout / "config"),
-            "XDG_STATE_HOME": str(self.root / "xdg"), "MERGE_GATE_STATE_DIR": str(self.root / "land-state"),
+            "XDG_STATE_HOME": str(self.root / "xdg"), "GATE_STATE_DIR": str(self.root / "land-state"),
         })
         _ = self.git(self.root, "init", "-q", "--bare", str(origin))
         _ = self.git(self.root, "init", "-q", "-b", "main", str(self.checkout))

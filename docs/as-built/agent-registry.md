@@ -101,7 +101,7 @@ The notes timer starts one detached publisher through `live_settings.publish_wai
 The publisher waits until it can confirm that no land runs.
 `publish_pending(registry)` then commits and pushes the rows that HEAD does not have.
 The publisher records errors in `~/.local/state/merge-gate/settings-publisher.log`.
-If set, `MERGE_GATE_STATE_DIR` sets the log directory.
+If set, `GATE_STATE_DIR` sets the log directory.
 Local integration uses fast-forward only.
 A successful push with failed local reconciliation reports both facts.
 Catalog publication adds models and efforts and advances family targets.

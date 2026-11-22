@@ -52,7 +52,7 @@ class QuotaAlertTests(support.SeededQuotaReminderFixture):
         root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         fixture = {"HOME": str(root), "CONF_DIR": str(root / "config"),
                    "MODELS_CONFIG_FILE": str(root / "config/models.conf"),
-                   "MERGE_GATE_STATE_DIR": str(root / "land"),
+                   "GATE_STATE_DIR": str(root / "land"),
                    "XDG_STATE_HOME": str(root / "state")}
         with (mock.patch.dict(os.environ, fixture),
               mock.patch.object(models_registry, "publish_pending", side_effect=AssertionError("notes ran the publisher")),

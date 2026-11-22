@@ -65,7 +65,7 @@ class PublicationRepository:
             "MODELS_CONFIG_FILE": str(registry),
             "ZONE_SSH": str(self.ssh), "ZONE_STATE": str(root / "state"),
             "SSH_LOG": str(self.ssh_log), "OFFLINE": str(root / "OFFLINE"),
-            "XDG_STATE_HOME": str(root / "xdg"), "MERGE_GATE_STATE_DIR": str(root / "land-state"),
+            "XDG_STATE_HOME": str(root / "xdg"), "GATE_STATE_DIR": str(root / "land-state"),
             "TMPDIR": str(root),
             "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1",
             "GIT_TERMINAL_PROMPT": "0",
@@ -102,7 +102,7 @@ class PublicationRepository:
         return self.ssh_log.read_text().count("git fetch -q --no-write-fetch-head")
 
     def finish_waiter(self) -> None:
-        lock = Path(self.env["MERGE_GATE_STATE_DIR"]) / "settings-waiter.lock"
+        lock = Path(self.env["GATE_STATE_DIR"]) / "settings-waiter.lock"
         self.wait_for_lock(lock)
 
     def wait_for_lock(self, path: Path) -> None:

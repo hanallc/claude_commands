@@ -88,7 +88,7 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         tip = self.git("rev-parse", "HEAD", cwd=self.checkout)
         environment = {**self.env, "CONF_DIR": str(self.promote / "config"), "ZONE_SSH": str(self.bin / "ssh"),
                        "XDG_STATE_HOME": str(self.root / "publication-state"),
-                       "MERGE_GATE_STATE_DIR": str(self.root / "land-state")}
+                       "GATE_STATE_DIR": str(self.root / "land-state")}
         with mock.patch.dict(os.environ, environment, clear=True), redirect_stdout(StringIO()):
             _ = live_settings.stage_save(live_settings.WaitingChange(
                 "example", "amount", "3", "tune(example): approved value"))
