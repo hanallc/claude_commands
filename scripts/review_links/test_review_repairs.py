@@ -736,7 +736,22 @@ window.fetch=async(url,options={})=>{
   const ownerChip=value=>document.querySelector('[data-owner-chip="'+value+'"]');
   const selectedOwner=()=>document.querySelector('[data-owner-chip][aria-pressed="true"]');
   check(selectedOwner()===ownerChip(UNIT_OWNER),'The investigation owner starts selected.');
-  investigation.querySelector('.list-toggle').click();await save(await readyReviewCard(investigation),'read');
+  investigation.querySelector('.list-toggle').click();
+  await readyReviewCard(investigation);
+  const dialog=document.querySelector('#record-item-dialog');
+  const updates=dialog.querySelector('[data-show-record-updates]');
+  const latest=()=>recordDetails(investigation).textContent.includes('The owner checked the next case.');
+  const ready=()=>latest() || !updates.hidden;
+  if(!ready()) await new Promise((resolve,reject)=>{
+   const observer=new MutationObserver(()=>{
+    if(ready()){observer.disconnect();clearTimeout(deadline);resolve();}
+   });
+   const deadline=setTimeout(()=>{observer.disconnect();reject(new Error('The answer did not load.'));},8000);
+   observer.observe(dialog,{childList:true,subtree:true,attributes:true});
+  });
+  if(!latest()) updates.click();
+  check(latest(),'The dialog shows the current answer before marking it read.');
+  await save(await readyReviewCard(investigation),'read');
   await refresh();
   check(selectedOwner().dataset.ownerChip===UNIT_OWNER && selectedOwner().textContent===UNIT_NAME+' 0' &&
     ownerChip('').textContent==='All 0' && counts()[0]===0,

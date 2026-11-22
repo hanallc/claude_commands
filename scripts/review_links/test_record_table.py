@@ -197,6 +197,7 @@ const element=()=>({hidden:false,textContent:'',dataset:{},value:'',
 let notice=null;
 const empty=element();empty.after=value=>{notice=value;};
 const search=element();
+const actionNotices={...element(),children:[]};
 const makeChips=(group,values)=>values.map(value=>{
  const count=element();
  return {...element(),dataset:{[group+'Chip']:value},
@@ -224,7 +225,7 @@ const table={append(){},addEventListener(){},getAttribute:()=> 'Review'};
 const content={
  dataset:{},addEventListener(){},
  querySelector:selector=>({'#list-owner':owner,'#list-show':show,'#list-search':search,
-  '[data-empty]':empty,'table':table,'[data-missing-keys]':notice})[selector],
+  '[data-empty]':empty,'table':table,'[data-missing-keys]':notice,'[data-for-you-notices]':actionNotices})[selector],
  querySelectorAll:selector=>({'[data-list-item]':rows,'[data-owner-chip]':owners,'[data-type-chip]':chips,'[data-show-chip]':shows})[selector] || [],
 };
 const document={createElement:element,getElementById:()=>null};

@@ -561,6 +561,8 @@ class LockedRecordNumbers:
             try:
                 folders += tuple(staff_store_folders(self.kind, covered_owner=covered_owner,
                                                      require_existing_document=True))
+            except staff.StaffUnreadable:
+                raise
             except OSError as error:
                 raise RecordAllocationRefused(f"Cannot check the record folders. {error}") from error
             self.scanned_floor = max(_legacy_high_water(self.kind),

@@ -1515,7 +1515,7 @@ SCRIPT = r'''(() => {
      discardCapture(!onList);
      void renewCapture();
     } else if (onList && (failure?.staleToken || failure instanceof TypeError)) {
-     if (!pendingItem) discardCapture();
+     if (!pendingItem && (failure?.staleToken || !captureSession?.image)) discardCapture();
      const signal = opening.signal;
      const fresh = await loadOptions(signal).catch(() => null);
      if (!signal.aborted && fresh) {

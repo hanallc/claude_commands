@@ -1037,17 +1037,46 @@ class ReviewSubmissionTests(unittest.TestCase):
         self.assertEqual(submissions.submit(payload), saved)
 
     def test_f082_archived_send_retries_find_each_request_before_locking(self) -> None:
-        for kind in (submissions.SubmissionKind.QUESTION, submissions.SubmissionKind.PROPOSAL,
-                     submissions.SubmissionKind.BUG):
-            with self.subTest(kind=kind):
-                payload = request(kind)
+        cases = ((submissions.SubmissionKind.QUESTION, False), (submissions.SubmissionKind.PROPOSAL, False),
+                 (submissions.SubmissionKind.BUG, False), (submissions.SubmissionKind.BUG, True))
+        for kind, transfer in cases:
+            with self.subTest(kind=kind, transfer=transfer):
+                payload = request(kind, "transfer during retry" if transfer else "archive retry")
                 saved = submissions.submit(payload)
                 archive = saved.path.parent / "archive"
                 archive.mkdir(exist_ok=True)
                 archived = saved.path.rename(archive / ("moved " + saved.path.name))
-                with patch.object(investigation, "recipient_locks", side_effect=AssertionError(
-                        "Retry locked before it could return the archived record.")):
-                    self.assertEqual(submissions.submit(payload), replace(saved, path=archived))
+                members = self.wrap_fixture() if transfer else self.members
+                locks = investigation.recipient_locks
+                checked_lookup = False
+                with patch.object(submissions, "locate_native_submission",
+                                  wraps=submissions.locate_native_submission) as locate:
+                    @contextmanager
+                    def lock_after_lookup(*owners: staff.StaffId) -> Generator[None]:
+                        nonlocal checked_lookup
+                        if not checked_lookup:
+                            self.assertEqual(locate.call_count, 1)
+                            checked_lookup = True
+                            if transfer:
+                                self.assertEqual(self.tidy_fixture(members), (0, ""))
+                        with locks(*owners):
+                            yield
+
+                    with patch.object(investigation, "recipient_locks", side_effect=lock_after_lookup):
+                        retry = submissions.submit(payload, members=members)
+                self.assertTrue(checked_lookup)
+                if transfer:
+                    self.assertFalse(archived.exists())
+                else:
+                    self.assertEqual(retry, replace(saved, path=archived))
+                owner = PRODUCER if transfer else saved.owner
+                path = investigation.folder(owner) / saved.path.name if transfer else archived
+                self.assertEqual((retry.key, retry.owner, retry.path), (saved.key, owner, path))
+                receipt = submissions.image_folder(saved).parent / "receipt.json"
+                location = cast(dict[str, str], json.loads(receipt.read_text()))
+                self.assertEqual((location.get("owner", location["recipient"]),
+                                  location["path"], location["original_path"]),
+                                 (owner, str(path), str(saved.path)))
 
     def test_f083_retry_cannot_commit_a_proposal_during_native_rollback(self) -> None:
         payload = request(submissions.SubmissionKind.PROPOSAL)
@@ -1673,8 +1702,10 @@ class ReviewSubmissionTests(unittest.TestCase):
             kinds=(review_items.ReviewType.QUESTION,)) if isinstance(item.source, review_items.QuestionSource)
             and item.source.record.path == legacy)
         assert isinstance(projected.source, review_items.QuestionSource)
-        self.assertEqual(update_registration.open_item_key(projected.source.record), f'question/{OWNER}/Q2')
-        self.assertIn('"review_id": "Q2"', legacy.read_text())
+        self.assertEqual(projected.key, f'question/{OWNER}/Q2.md')
+        self.assertEqual(projected.id, f'{review_items.name(OWNER, self.members)}/Q2')
+        self.assertNotIn('review_id', projected.source.record.item)
+        self.assertEqual(self.question_files(), before)
 
     def test_f046_seed_refuses_unreadable_investigation(self) -> None:
         store = investigation.folder(OWNER)

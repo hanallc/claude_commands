@@ -1158,7 +1158,7 @@ background:var(--ink-2);border-radius:50%}
 .list-parking-actions{display:flex;gap:inherit;margin-inline-start:auto}
 .list-park [data-later-menu] [data-later-preset]{display:block;width:calc(100% - 12px);margin:6px 6px 4px}
 .list-table [data-parked]:not([data-parked="false"]) [data-list-check]{display:none}
-.list-table tbody:has([data-parked-detail]:not([hidden])) .list-row.open [data-parked-note]{display:none}
+.list-table .list-row.open [data-parked-note]{display:none}
 .list-table:has(.list-park>[data-later-menu]:not([hidden]),.list-eta:focus-visible),
 .list-table tbody:has(.list-park>[data-later-menu]:not([hidden]),.list-eta:focus-visible){overflow:visible}
 .list-tell{display:flex;justify-content:flex-end;align-items:center;gap:10px;flex-wrap:wrap}
@@ -1360,6 +1360,7 @@ const tableView=createRecordTable({content:()=>content,
  staffChipFilters:['owner','producer'],
  beforeApply:rememberLogPositions,
  applied:restoreLogPositions,
+ ownsFocus:listOwnsFocus,
  itemTitle:item=>'#'+item.dataset.number+' '+item.querySelector('[data-label="Item"] strong').textContent,
  keepItemOnMissingLink:true,
  rememberItem:item=>{
@@ -1468,7 +1469,7 @@ function bindFeedbackForm(form){
    if(typeof result.item_state==='string') confirmed.state=result.item_state;
    if(confirmed.state==='Closed'){
     closedKeys.add(key);
-    tableView.closeCard(key);
+    if(!metadataOnly) tableView.closeCard(key);
    }
    const unread=result.unread==='true';
    if(['true','false'].includes(result.parked))
@@ -1594,12 +1595,13 @@ function bindFeedbackForm(form){
    retainDraft();
    const stampAtSubmit=draftStamp;
    const request=tableView.startItemRequest(key);
+   item.listRequest=request;
    startListSave();
    const hadFocus=asksQuestion && recordDetails(item).contains(document.activeElement);
    let focusChoice;
    const trackFocus=event=>{if(event.target!==document.body) focusChoice=event.target;};
    if(hadFocus) document.addEventListener('focusin',trackFocus);
-   let saved=false,refused=false,stale=false,nextForm;
+   let saved=false,refused=false,stale=false,focusParkedAfterClose=false,nextForm;
    setCardSubmitting(form,true,recordDetails(item));
    notice.textContent='';
    const clearsUnread=action==='read' || usesWords,unreadBefore=item.dataset.unread,wasVisible=!item.hidden;
@@ -1614,6 +1616,13 @@ function bindFeedbackForm(form){
    const restoreLink=releasesLink ? tableView.releaseLink(key) : undefined;
    const submission=tableView.startAction(item);
    const hidUnread=clearsUnread && wasVisible && item.hidden;
+   const showUnparkResult=result=>{
+    const unparked=result.unpark_outcome==='cleared';
+    const message=unparkMessages[result.unpark_outcome] ?? 'Unpark result unavailable';
+    const label='Item #'+item.dataset.number;
+    const hiddenMessage=unparked ? label+' unparked.' : label+': '+message+'.';
+    tableView.showActionResult(item,submission,label,{kind:'success',message,hiddenMessage});
+   };
    try{
     const response=await fetch(location.pathname,{method:'POST',body:data});
     saved=response.ok;
@@ -1622,8 +1631,14 @@ function bindFeedbackForm(form){
        draftStamp===stampAtSubmit && words.value===attempt.words) words.value='';
     const result=await response.json();
     stale=!tableView.currentItemRequest(request);
-    if(stale) return;
+    if(item.listRequest!==request) return;
     if(!response.ok) throw new Error(result.reason || 'HTTP '+response.status);
+    if(stale){
+     applySavedState(result,{metadataOnly:true});
+     if(action==='unpark') showUnparkResult(result);
+     else tableView.applyAction();
+     return;
+    }
     const closes=parks || action==='remove' || result.detail_closed;
     if(closes){
      nextForm=applySavedState(result,{keepDetailFocus:changesParking,hasDetail:true});
@@ -1655,18 +1670,21 @@ function bindFeedbackForm(form){
      installSavedListDetail(request,revision,text);
     }
     if(action==='unpark'){
-     const unparked=result.unpark_outcome==='cleared';
-     if(unparked) until.value='';
-     const message=unparkMessages[result.unpark_outcome] ?? 'Unpark result unavailable';
-     const label='Item #'+item.dataset.number;
-     const hiddenMessage=unparked ? label+' unparked.' : label+': '+message+'.';
-     tableView.showActionResult(item,submission,label,{kind:'success',message,hiddenMessage});
+     if(result.unpark_outcome==='cleared') until.value='';
+     showUnparkResult(result);
     }else tableView.applyAction();
-    if(wasVisible && item.hidden && tableView.opened.has(key)){tableView.closeCard(key);tableView.apply(false);}
+    if(wasVisible && item.hidden && tableView.opened.has(key)){
+     const focus=document.activeElement;
+     const inside=recordDetails(item).closest('dialog')?.contains(focus);
+     focusParkedAfterClose=focusUnpark && (inside || focus===document.body);
+     tableView.closeCard(key);tableView.apply(false);
+     if(hadFocus && listOwnsFocus() && (inside || focus===document.body)) focusAfterQuestion(item);
+    }
    }catch(error){
     stale=!tableView.currentItemRequest(request);
-    if(stale) return;
+    if(item.listRequest!==request) return;
     if(saved){
+     if(stale) return;
      if(parks || action==='remove'){
       if(action==='remove') closedKeys.add(key);
       tableView.closeCard(key);
@@ -1677,7 +1695,7 @@ function bindFeedbackForm(form){
     }
     const wasHidden=item.hidden;
     let restore=refused || releasesLink,confirmedByReadback=false;
-    if(refused) syncConfirmed();
+    if(refused) syncConfirmed(stale);
     else if(parks || action==='remove'){
      restore=false;
      try{
@@ -1687,23 +1705,23 @@ function bindFeedbackForm(form){
       if(!response.ok) throw new Error('HTTP '+response.status);
       const current=await response.json();
       stale=!tableView.currentItemRequest(request);
-      if(stale) return;
+      if(item.listRequest!==request) return;
       applySavedState(current,{metadataOnly:true});
       restore=confirmed.state!=='Closed' && (!parks || current.park_request_saved===false);
       confirmedByReadback=confirmed.state==='Closed' || current.park_request_saved===true;
       if(confirmedByReadback){
-       tableView.closeCard(key);
+       if(!stale) tableView.closeCard(key);
        tableView.applyAction();
-      }else presentListDetail(item,current);
+      }else if(!stale) presentListDetail(item,current);
      }catch(_){
       stale=!tableView.currentItemRequest(request);
-      if(stale) return;
+      if(item.listRequest!==request) return;
       // Keep the pending row state until a refresh can read the record.
      }
     }else if(clearsUnread) item.dataset.unread=unreadBefore;
     if(restore) restoreLink?.();
     if(!confirmedByReadback){
-     if((refused || hidUnread) && !tableView.opened.size) tableView.openCard(key);
+     if(!stale && (refused || hidUnread) && !tableView.opened.size) tableView.openCard(key);
      const message=(refused ? 'Not saved: ' : 'Save not confirmed: ')+error.message;
      tableView.showActionResult(item,submission,'Item '+item.dataset.number,{kind:'failure',message});
     }
@@ -1720,7 +1738,7 @@ function bindFeedbackForm(form){
       tableView.showDraftCopy(drafts.get(key)?.words,nextForm.elements.words?.type==='textarea');
     }
     if(!stale && focusUnpark && document.hasFocus() &&
-       (document.activeElement===document.body || document.activeElement===unpark)){
+       (focusParkedAfterClose || document.activeElement===document.body || document.activeElement===unpark)){
      const currentUnpark=recordDetails(item).querySelector('[value="unpark"]:not([hidden])');
      const close=recordDetails(item).closest('dialog[open]')?.querySelector('[data-close]');
      const target=saved && item.hidden ? content.querySelector('[data-filter-row="show"] [aria-pressed="true"]')
@@ -1750,7 +1768,8 @@ function bindFeedbackForm(form){
      if(!stale && listOwnsFocus()){
       if(item.hidden && (!focusChoice || recordDetails(item).contains(focusChoice))) focusAfterQuestion(item);
       else if(!focusChoice?.isConnected && !item.hidden && document.activeElement===document.body){
-       const target=!saved && submitter?.matches(':enabled') ? submitter : item.querySelector('.list-toggle');
+       const close=form.closest('dialog[open]')?.querySelector('[data-close]');
+       const target=!saved && submitter?.matches(':enabled') ? submitter : close ?? item.querySelector('.list-toggle');
        target.focus({preventScroll:true});
       }
      }

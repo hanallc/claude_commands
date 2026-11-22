@@ -1860,6 +1860,7 @@ const view=createRecordTable({content:()=>content,
  entries:allEntries,mount:entry=>reviewCardSummary(entry,Number(content.dataset.titleLimit),
   content.querySelector('[data-type-chip="'+entry.type+'"] .review-icon').outerHTML),mounted:()=>loadBodies(),
  focusKey:()=>focusAfterLoad?.key,
+ pinOpenRow:key=>!pendingSaves.has(key),
  unmount:rememberItem,
  rememberItem,
  place:params=>{
@@ -1980,7 +1981,7 @@ function loadBodies(){
   if(row?.dataset.key!==key || !index.has(key) || !needsBody(row)) return;
   const install=text=>{
    const current=view.dialogItem;
-   if(current?.dataset.key!==key || !index.has(key) || !needsBody(current)) return;
+   if(current?.dataset.key!==key || !index.has(key)) return;
    const detail=recordDetails(current);
    const apply=(row,detail)=>applyReviewDetail(key,row,detail,text);
    view.itemError('');
@@ -2076,8 +2077,7 @@ function bindForm(row){
    };
    const fail=reason=>{
     pendingSaves.delete(key);
-    if(view.currentItemRequest(request))
-     view.showActionResult(row,submission,key,{kind:'failure',message:'Not saved: '+reason});
+    view.showActionResult(row,submission,key,{kind:'failure',message:'Not saved: '+reason});
    };
    await saveReviewAction(data,{
    confirmedSave:()=>{
@@ -2088,8 +2088,7 @@ function bindForm(row){
     }
    },
    saved:async result=>{
-    if(!view.currentItemRequest(request)) return;
-    const showOwnDetail=['question','feedback'].includes(outcome) && !result.detail_closed;
+    const showOwnDetail=view.currentItemRequest(request) && ['question','feedback'].includes(outcome) && !result.detail_closed;
     const savedMessage=result.detail_unavailable && !showOwnDetail
      ? {kind:'failure',message:'Saved; the item could not refresh.'}
      : {kind:'success',message:'Saved: '+result.answer};
@@ -2104,7 +2103,6 @@ function bindForm(row){
      if(typeof text==='string' && view.currentItemRequest(request))
       view.installOwnItemResult(request,text,(item,detail)=>applyReviewDetail(key,item,detail,text));
     }
-    if(!view.currentItemRequest(request)) return;
     if(validationQuestion){
      if(result.detail_closed) view.closeCard(key);
      view.showActionResult(row,submission,key,savedMessage);
@@ -2119,7 +2117,6 @@ function bindForm(row){
      question:outcome==='question',
      closes:result.detail_closed ?? (!handed && !['question','later'].includes(outcome)),awaitingSnapshot:true};
     const applySaved=()=>{
-     if(!view.currentItemRequest(request)) return;
      if(!showOwnDetail && (outcome==='later' || !isDeferredLink(key))) view.closeCard(key);
      saved.set(key,marker);savedEntry(key,marker);
      if(marker.closes) storeSavedVerdicts();
@@ -2310,7 +2307,7 @@ function applyReviewIndex(payload){
 }
 bind();
 const pageRefresh=createPageRefresh(refresh,()=>content.dataset.refreshSeconds);
-setInterval(()=>updateHandoffAges(content),5000);
+setInterval(updateHandoffAges,5000);
 document.addEventListener('review-item-saved',()=>{
  const notice=content.querySelector('[data-review-notice]');
  notice.textContent='';notice.hidden=true;

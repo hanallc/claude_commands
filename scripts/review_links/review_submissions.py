@@ -13,7 +13,7 @@ import subprocess
 import sys
 import tempfile
 from collections.abc import Callable, Generator, Iterable, Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime
@@ -1599,10 +1599,18 @@ def _submit(request: NewItemRequest, *, members: staff.StaffSnapshot | None,
                 except OSError:
                     found = NoNativeSubmission()
                 if (isinstance(receipt, NativeSubmissionDestination) and isinstance(found, LocatedSubmission)
-                        and found.destination == receipt):
-                    _check_same_request(receipt, request, payload_hash)
-                    _stage_initial_delivery(folder, address, initial_delivery)
-                    return _complete_receipt(folder, found.destination, receipt, found.record)
+                        and found.destination == replace(receipt, path=found.destination.path)):
+                    destination = found.destination
+                    location_changed = destination.path != receipt.path
+                    with investigation.recipient_locks(receipt.owner) if location_changed else nullcontext():
+                        # Check the receipt and record again under the transfer lock.
+                        if location_changed:
+                            found = (locate_native_submission(address, destination, search_stores=False)
+                                     if _request_hint(address, receipt_only=True) == receipt else NoNativeSubmission())
+                        if isinstance(found, LocatedSubmission) and found.destination == destination:
+                            _check_same_request(receipt, request, payload_hash)
+                            _stage_initial_delivery(folder, address, initial_delivery)
+                            return _complete_receipt(folder, destination, receipt, found.record)
             locked = _locked_request(address, members, for_send=True, page=request.page,
                                      page_recipient=request.page_recipient)
 

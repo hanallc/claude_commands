@@ -2027,6 +2027,7 @@ window.fetch=(url,options)=>{
   draft.elements.later.value='2030-12-01T18:30';draft.elements.later.dispatchEvent(new Event('input'));
   const choiceValue=choice.value,first=[...document.querySelectorAll('[data-list-item]')].map(node=>node.dataset.key);
   close();
+  document.querySelector('#list-search').focus({preventScroll:true});
   scrollTo(0,document.documentElement.scrollHeight);await until(()=>!row(DRAFT_KEY),'the closed draft to leave the window');
   check(document.querySelectorAll('[data-list-item]').length<=100 &&
     [...document.querySelectorAll('[data-list-item]')].some(node=>!first.includes(node.dataset.key)),
@@ -2554,12 +2555,15 @@ return (Math.max(ink, fill) + 0.05) / (Math.min(ink, fill) + 0.05);
 
     def test_reader_projects_states_without_copying_the_records(self) -> None:
         key = self.question()
+        path = self.question_path(key)
+        before = path.read_bytes()
         ready = self.investigation()
         waiting = self.investigation(False)
         items = review_items.read(self.root)
         self.assertEqual({item.type for item in items},{review_items.ReviewType.QUESTION,review_items.ReviewType.CHANGE,review_items.ReviewType.INVESTIGATION})
         question = next(item for item in items if item.key == key)
-        self.assertRegex(question.id,r'^page-owner/Q[1-9][0-9]*$')
+        self.assertEqual(question.id, f'page-owner/{path.stem}')
+        self.assertEqual(path.read_bytes(), before)
         self.assertEqual(question.state,review_items.ReviewState.OPEN)
         states = {item.key:item.state for item in items}
         self.assertEqual(states[f'investigation/{ready.owner}/{ready.id}'],review_items.ReviewState.OPEN)
@@ -6283,7 +6287,7 @@ void fetch('/results',{method:'POST',body:JSON.stringify(hidden && review.datase
         question_item.source.record.item['parts'] = update_registration.QuestionParts(
             ask='Which layout should the page use?',context='Choose a layout.',items=[],
             recommend='',choices=['Compact layout','Wide layout'])
-        update_registration.write_question_record(question_item.source.record)
+        update_registration.write_question_record(question_item.source.record, assign_id=True)
         _ = self.investigation()
         _ = self.investigation(False)
         for _ in range(3):
@@ -6352,7 +6356,7 @@ window.fetch=async(_url,options={})=>{
   const change=rows().find(row=>row.dataset.type==='change');change.querySelector('.list-toggle').click();await readyReviewCard(change);
   check(!recordIsOpen(question),'only one card opens');
   question.querySelector('.list-toggle').click();await readyReviewCard(question);
-  const draftLater=question.querySelector('[name="later"]');draftLater.value='2098-12-31T16:30';
+  const draftLater=recordDetails(question).querySelector('[name="later"]');draftLater.value='2098-12-31T16:30';
   draftLater.dispatchEvent(new Event('change',{bubbles:true}));
   const picked=recordDetails(question).querySelector('input[name=choice]');picked.click();
   const draft=recordDetails(question).querySelector('textarea');draft.value='Keep this draft';draft.dispatchEvent(new Event('input'));
@@ -6364,7 +6368,7 @@ window.fetch=async(_url,options={})=>{
   const refreshedDraft=recordDetails(fresh).querySelector('textarea');
   check(document.activeElement===refreshedDraft && refreshedDraft.selectionStart===2 &&
     refreshedDraft.selectionEnd===7 && refreshedDraft.selectionDirection==='backward','refresh keeps focus and selection');
-  check(fresh.querySelector('[name="later"]').value==='2098-12-31T16:30','F018: refresh keeps the picked Later date and time');
+  check(recordDetails(fresh).querySelector('[name="later"]').value==='2098-12-31T16:30','F018: refresh keeps the picked Later date and time');
   check(recordDetails(fresh).querySelector('input[name=choice]:checked')?.value===picked.value,'F018: refresh keeps the selected choice');
   check(recordDetails(fresh).querySelector('form').elements.row.value===fresh.dataset.key+'-refreshed' &&
     recordDetails(fresh).querySelector('form').elements.token.value.endsWith('-refreshed'),'F018: refresh supplies the row and token');
@@ -6452,7 +6456,7 @@ window.fetch=async(_url,options={})=>{
   check(document.activeElement===menuItems()[0],'ArrowDown moves from the last item to the first');
   dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));await flush();
   check(fresh.isConnected && !laterMenu.hidden,'an open Later menu holds the page refresh');
-  const chooserDraft=fresh.querySelector('[name="later"]');chooserDraft.value='';
+  const chooserDraft=recordDetails(fresh).querySelector('[name="later"]');chooserDraft.value='';
   chooserDraft.dispatchEvent(new Event('input',{bubbles:true}));
   const chooserNow=Date.now;Date.now=()=>Date.parse('2026-11-30T15:00:00Z');
   laterMenu.querySelector('[data-later-choose]').click();
@@ -6465,7 +6469,7 @@ window.fetch=async(_url,options={})=>{
   let submitter='';const watch=event=>{submitter=event.submitter.value;event.preventDefault();event.stopImmediatePropagation();};
   recordDetails(fresh).querySelector('form').addEventListener('submit',watch,{capture:true});
   if(calendar){
-   const wall=()=>fresh.querySelector('[name="later"]').value;
+   const wall=()=>recordDetails(fresh).querySelector('[name="later"]').value;
    const selected=()=>calendar.querySelector('[tabindex="0"]');
    check(wall()==='2026-12-01T09:00' && timeField.value==='09:00',chooserChecks[0]);
    selected().dispatchEvent(new KeyboardEvent('keydown',{key:'ArrowLeft',bubbles:true,cancelable:true}));
@@ -6728,7 +6732,7 @@ Date.now=()=>Date.parse(SCENARIO==='gap' ? '2027-03-13T15:00:00Z' :
 (async()=>{
  const failures=[],check=(ok,label)=>{if(!ok) failures.push(label);};
  const flush=()=>new Promise(resolve=>nativeTimeout(resolve,60));
- const form=()=>document.querySelector('[data-type="question"] form');
+ const form=()=>recordDetails(document.querySelector('[data-type="question"]')).querySelector('[data-review-form]');
  const open=()=>{form().querySelector('[data-later-toggle]').click();form().querySelector('[data-later-choose]').click();};
  const close=()=>form().querySelector('[data-later-time]').dispatchEvent(new KeyboardEvent('keydown',{key:'Escape',bubbles:true}));
  const time=value=>{const field=form().querySelector('[data-later-time]');field.value=value;field.dispatchEvent(new Event('input',{bubbles:true}));};
@@ -6834,7 +6838,7 @@ window.fetch=async()=>({ok:true,text:async()=>MARKUP});
    ['2026-12-08T7',fallback],['2026-12-08T24:00',fallback],['2026-12-08T23:60',fallback],
    ['2026-12-08T',fallback],['2027-02-29T09:00',fallback],['2026-12-08T1730','2026-12-08T17:30']
   ]){
-   const original=row(),wall=original.querySelector('[name="later"]');
+   const original=row(),wall=recordDetails(original).querySelector('[name="later"]');
    wall.value=draft;wall.dispatchEvent(new Event('input',{bubbles:true}));
    dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));
    await new Promise(resolve=>setTimeout(resolve,60));
@@ -6871,7 +6875,7 @@ window.fetch=async()=>({ok:true,text:async()=>MARKUP});
   const template=document.createElement('template');
   template.innerHTML=EXPECTED;
   for(const selector of ['[data-review-body]','.list-log','.review-actions']){
-   if(row.querySelector(selector).innerHTML!==template.content.querySelector(selector).innerHTML)
+   if(recordDetails(row).querySelector(selector).innerHTML!==template.content.querySelector(selector).innerHTML)
     failures.push('Review and the single card draw different '+selector+'.');
   }
   if(!form.elements.revision.value) failures.push('The Review action has no revision.');

@@ -411,7 +411,7 @@ function drawWindow(){
  const focused=focusedRow?.dataset.key || options.focusKey?.();
  const ranges=[[start,end],...motionRanges];
  for(const key of new Set([focused,opened.values().next().value,dialogItem?.dataset.key])){
-  if(!key) continue;
+  if(!key || options.pinOpenRow?.(key)===false) continue;
   const at=entries.findIndex(({data})=>data.key===key);
   if(at>=0) ranges.push([Math.max(0,at-1),Math.min(entries.length,at+2)]);
  }
@@ -597,8 +597,9 @@ function syncItemDialog(){
  if(!key){
   if(!dialogItem) return;
   const previous=dialogItem.dataset.key;
+  const restoreFocus=!dialogSuspended && options.ownsFocus?.()!==false;
   returnItemDetail();dialog.close();
-  if(!dialogSuspended){
+  if(restoreFocus){
    const row=options.mount ? mounted.get(previous) : itemWithKey(previous);
    (row && !row.hidden ? row.querySelector('.list-toggle') : words()).focus({preventScroll:true});
   }
@@ -671,7 +672,8 @@ function mount(data){
  const key=data.key;
  let node=mounted.get(key);
  if(!node){
-  node=!dialogNeedsRecord && dialogItem?.dataset.key===key ? dialogItem : options.mount(data);
+  node=!dialogNeedsRecord && options.pinOpenRow?.(key)!==false && dialogItem?.dataset.key===key
+   ? dialogItem : options.mount(data);
   mounted.set(key,node);resize?.observe(node);
  }
  node.hidden=false;
@@ -889,7 +891,7 @@ function showActionResult(item,submission,label,{kind,message,hiddenMessage}){
  if(status) status.textContent=message;
  apply(false,{animate:true});
  const restored=mounted.get(key);
- if(kind==='failure' && restored && restored!==item && !matchMedia('(prefers-reduced-motion: reduce)').matches){
+ if(kind==='failure' && restored && rowMotion.has(item)){
   animateRow(content.querySelector('table'),restored,true,item);
  }
 }

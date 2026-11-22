@@ -442,29 +442,33 @@ async function sendSaved() {
    pngAvailable = false;
    useLiveSends = true;
    await openOwner();
+   const noScreenshot = dialog.querySelector('[data-fallback]');
+   await whenShown(noScreenshot);
    dialog.querySelector('[name="kind"][value="investigation"]').click();
    type('Keep this draft and its image.');
    paste();
    const preview = dialog.querySelector('[data-previews] img');
    await trySend();
    check(error.textContent === 'The Send response was lost.', 'The page Send files before the response is lost.');
+   const ownerRequest = ownerPosts.findLast(post => post.request_id);
    dialog.querySelector('[data-cancel]').click();
    await open();
+   await whenShown(noScreenshot);
    const previewReply = await originalFetch(preview.src).catch(() => null);
    check(textarea.value === 'Keep this draft and its image.' &&
          dialog.querySelector('[data-previews] img') === preview && previewReply?.ok,
          'Reopen keeps the failed page draft and its pasted image.');
-   const ownerRequest = ownerPosts.at(-1);
    type('Keep this draft and its image after editing.');
    await trySend();
    check(dialog.open && textarea.value === 'Keep this draft and its image after editing.' &&
          error.textContent === 'This item was already filed as I2. Any change after that Send was not sent.',
          'A changed Send reports the first ID and keeps the draft open.');
-   const changedRequest = ownerPosts.at(-1);
+   const changedRequest = ownerPosts.findLast(post => post.request_id);
    check(changedRequest.page === 'builds' && changedRequest.images[0].base64_data === png &&
          changedRequest.request_id === ownerRequest.request_id,
          'The first retry uses the old request ID and the current evidence.');
-   check((await sendSaved()).detail.id === 'I3' && ownerPosts.at(-1).request_id !== ownerRequest.request_id,
+   check((await sendSaved()).detail.id === 'I3' &&
+         ownerPosts.findLast(post => post.request_id).request_id !== ownerRequest.request_id,
          'The next Send uses a new ID and files the retained draft.');
    await openOwner();
    dialog.querySelector('[name="kind"][value="investigation"]').click();
@@ -986,7 +990,8 @@ function enterWords(value) {
   document.querySelector('[data-owner-new]').click();
   type.click();
   enterWords(restored ? 'The words after reload.' : 'Keep the first List Send.');
-  await waitFor(() => !send.disabled && (reloadAfterSend || !shot.hidden));
+  const evidence = reloadAfterSend ? dialog.querySelector('[data-fallback]') : shot;
+  await waitFor(() => !send.disabled && !evidence.hidden);
   send.click();
   await waitFor(sendFinished);
   check(editable(), 'A failed Send leaves the draft editable.');
@@ -1172,7 +1177,7 @@ def capture_dialogs(output: Path, fixtures: dict[int, DialogFixture], *, pages: 
       if(next===widths.length)return;
       const width=widths[next++];
       frame.width=width;frame.height=width<480?844:900;
-      frame.src='/case?width='+width;
+      frame.src='/case/'+width+'?width='+width;
     }};
     addEventListener('message', event=>{{
       if(event.origin===location.origin && event.source===frame.contentWindow && event.data==='finished')load();
@@ -1192,7 +1197,7 @@ def capture_dialogs(output: Path, fixtures: dict[int, DialogFixture], *, pages: 
             self.response(status, "application/json", json.dumps(body).encode())
 
         def fixture(self) -> DialogFixture:
-            width = parse_qs(urlsplit(self.headers["Referer"]).query)["width"][0]
+            width = urlsplit(self.headers["Referer"]).path.removeprefix("/case/")
             return fixtures[int(width)]
 
         def do_GET(self) -> None:
@@ -1214,8 +1219,8 @@ def capture_dialogs(output: Path, fixtures: dict[int, DialogFixture], *, pages: 
                 self.response(204, "image/png", b"")
             elif self.path == "/":
                 self.response(200, "text/html; charset=utf-8", outer)
-            elif self.path.startswith("/case?"):
-                width = int(parse_qs(urlsplit(self.path).query)["width"][0])
+            elif address.path.startswith("/case/"):
+                width = int(address.path.removeprefix("/case/"))
                 self.response(200, "text/html; charset=utf-8", documents[width])
             else:
                 self.response(404, "text/plain", b"Unknown fixture path")
@@ -1294,7 +1299,8 @@ def capture_dialogs(output: Path, fixtures: dict[int, DialogFixture], *, pages: 
             if run.returncode:
                 raise AssertionError(run.stderr)
             if not finished.is_set():
-                raise AssertionError("Firefox did not report its fixture results.")
+                missing = [width for width, fixture in fixtures.items() if not fixture.completed]
+                raise AssertionError(f"Firefox did not report results for dialog fixtures {missing}.")
         finally:
             server.shutdown()
             thread.join(1)

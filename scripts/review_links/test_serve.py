@@ -3871,7 +3871,7 @@ class ReviewLinksServerTests(unittest.TestCase):
               patch.object(self.server, 'delivery_status', case.status),
               patch.object(change_page, 'deliver', side_effect=send)):
             try:
-                code, body = self.post(review_page.PAGE_PATH, request)
+                code, body = self.post(review_page.PAGE_PATH, request, wait_for_delivery=False)
                 self.assertEqual(code, 200, body)
                 result = cast(dict[str, object], json.loads(body))
                 self.assertIn('Which check passed?', cast(str, result['detail_html']))
@@ -4023,11 +4023,11 @@ class ReviewLinksServerTests(unittest.TestCase):
         lines = path.read_text().splitlines(keepends=True)
         index = next(index for index, line in enumerate(lines) if line.startswith('registration: '))
         fields = cast(update_registration.OutstandingItem, json.loads(lines[index].removeprefix('registration: ')))
-        _ = fields.pop('review_id')
+        self.assertNotIn('review_id', fields)
         fields['followup'] = update_registration.PendingFollowup(text='Which layout works?', sent='2026-11-12T12:01')
         lines[index] = 'registration: '+json.dumps(fields)+'\n'
         _ = path.write_text(''.join(lines))
-        (investigation.state_root() / 'record-ids' / 'question.water').unlink()
+        self.assertFalse((investigation.state_root() / 'record-ids' / 'question.water').exists())
         record, = update_registration.selected_question_records([path], (), None)
         identities = update_registration.QuestionStaff.for_record(staff.snapshot())
         native_write = update_registration.write_question_record
@@ -4574,7 +4574,8 @@ class ReviewLinksServerTests(unittest.TestCase):
             with self.subTest(path=path):
                 self.assertEqual(self.request(path).status, 404)
 
-    def post(self, path: str, body: str, *, origin: str = "", headers: Mapping[str, str] | None = None) -> tuple[int, bytes]:
+    def post(self, path: str, body: str, *, origin: str = "", headers: Mapping[str, str] | None = None,
+             wait_for_delivery: bool = True) -> tuple[int, bytes]:
         review_post = path == review_page.PAGE_PATH
         if review_post:
             self.review_post_done.clear()
@@ -4586,7 +4587,7 @@ class ReviewLinksServerTests(unittest.TestCase):
             connection.request("POST", path, body, {**sent, **(headers or {})})
             response = connection.getresponse()
             content = response.read()
-            if review_post:
+            if review_post and wait_for_delivery:
                 self.assertTrue(self.review_post_done.wait(TEST_HANG_GUARD_SECS))
             return response.status, content
         finally:
@@ -6716,7 +6717,17 @@ class ServerCodeHealthTests(unittest.TestCase):
     def test_unchanged_code_keeps_serving_and_reads_settings_only_when_the_check_is_due(self) -> None:
         server = self.start_server()
         server.review_cache.synchronize()
-        with patch.object(conf, "read", wraps=conf.read) as read:
+        service_thread = threading.current_thread()
+        read_config = conf.read
+        read = Mock(wraps=read_config)
+
+        def count_service_reads(source: str | Path, *,
+                                load: Callable[[Path], conf.ConfigurationBytes] | None = None) -> conf.ConfigRead:
+            if threading.current_thread() is service_thread:
+                return cast(conf.ConfigRead, read(source) if load is None else read(source, load=load))
+            return read_config(source, load=load)
+
+        with patch.object(conf, "read", count_service_reads):
             self.elapsed = 104.0
             server.service_actions()
             server.service_actions()
@@ -7041,6 +7052,9 @@ class ReviewLinksConfigTests(unittest.TestCase):
     def test_service_polls_read_settings_only_when_a_check_is_due(self) -> None:
         server = serve.ReviewLinksServer.__new__(serve.ReviewLinksServer)
         server.mode = serve.ServerMode.LIVE
+        server.next_attachment_retry = 105.0
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        server.page_captures = serve.PageCaptures(root / "captures")
         server.next_tailscale_check = 200.0
         server.next_sweep = 300.0
         server.next_code_check = 400.0

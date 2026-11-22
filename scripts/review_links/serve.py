@@ -1595,17 +1595,23 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                     if not browser_draft or not isinstance(draft, str):
                         raise
                     request = new_item_dialog.UnverifiedDraftRetry(draft, error)
-            key = new_item_dialog.read_capture_key(fields["capture_key"]) if "capture_key" in fields else ""
-            if len(key) > 32 or has_capture_metadata:
-                page = fields.get("page")
-                if (not isinstance(draft, str)
-                        or not (review_submissions.is_draft_id(draft) or page == "list"
-                                and review_submissions.DRAFT_ID.fullmatch(draft))
-                        or not new_item_dialog.capture_key_matches_draft(key, draft)):
-                    raise new_item_dialog.SubmissionError("The screenshot belongs to another draft.")
-                if has_capture_metadata and isinstance(page, str) and page in page_frame.OWNER_PAGES:
-                    deferred = new_item_dialog.DeferredCaptureIntent(
-                        key, draft, deferred_capture_request(server.root, page, fields["defer_capture"]))
+            try:
+                key = new_item_dialog.read_capture_key(fields["capture_key"]) if "capture_key" in fields else ""
+                if len(key) > 32 or has_capture_metadata:
+                    page = fields.get("page")
+                    if (not isinstance(draft, str)
+                            or not (review_submissions.is_draft_id(draft) or page == "list"
+                                    and review_submissions.DRAFT_ID.fullmatch(draft))
+                            or not new_item_dialog.capture_key_matches_draft(key, draft)):
+                        raise new_item_dialog.SubmissionError("The screenshot belongs to another draft.")
+                    if has_capture_metadata and isinstance(page, str) and page in page_frame.OWNER_PAGES:
+                        deferred = new_item_dialog.DeferredCaptureIntent(
+                            key, draft, deferred_capture_request(server.root, page, fields["defer_capture"]))
+            except new_item_dialog.SubmissionError as error:
+                if not list_draft_id:
+                    raise
+                # Check for a saved List draft before validating a new capture.
+                key, refusal = "", error
         except (ValueError, RecursionError) as error:
             reason = str(error) if isinstance(error, new_item_dialog.SubmissionError) else "Invalid New item JSON."
             self.json_response(400, {"error": reason})
@@ -1638,6 +1644,8 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                 if list_draft_id:
                     def prepare_list_draft() -> review_submissions.ListDraftFiling:
                         nonlocal request, screenshot
+                        if refusal is not None:
+                            raise refusal
                         item = read_submission()
                         request = item
                         if not key and item.page_state is not None and item.page_state.include_screenshot:
