@@ -1821,9 +1821,10 @@ def resume_workers(parent: StaffId, record: staff.StaffSnapshot) -> ResumeWorker
     scanned = {str(holder.current_session): [str(path) for path in runs]}
     with progress_history.dispatch_reads(record, runs):
         for row in members:
-            role = worker_panes.dispatch_role(row)
-            if enrolled and (not isinstance(role, str) or role not in worker_panes.REVIEW_ROLES):
-                continue
+            if enrolled:
+                role = worker_panes.dispatch_role(row)
+                if not isinstance(role, str) or role not in worker_panes.REVIEW_ROLES:
+                    continue
             run = worker_panes.worker_run(row, record=record, scanned=scanned)
             active = progress_history.active_dispatch(row.id, run)
             if isinstance(active, progress_history.ActiveDispatchUnavailable):
