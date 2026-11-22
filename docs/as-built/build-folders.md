@@ -6,6 +6,11 @@ Editable source lives under `~/worktrees`. Cargo output lives under the configur
 
 The build root is `/build` on natedev and `~/build` on the Mac and the Hana AWS guest. The table uses `/build` for the build root.
 
+The Mac Linux guest uses the default build root `~/build` and the main checkout `~/.claude` for the `gate-runner` user.
+The route holds the Mac claim while it waits for proof that the guest run ended.
+The route releases the claim when it receives proof or the wait reaches the limit in `run.unreachable_wait_seconds`.
+If the wait expires, the gate fails and the guest run keeps its lock until it ends.
+
 | Form | Path | Cargo output |
 | --- | --- | --- |
 | Worktree | `~/worktrees/<repo>/<unit>/<short-name>` | `target` links to the worktree output. |
