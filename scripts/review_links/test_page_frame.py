@@ -228,31 +228,32 @@ setImmediate(()=>{
                               text=True, capture_output=True, timeout=20)
         self.assertEqual((done.returncode, done.stdout.strip()), (0, 'PASS'), done.stderr)
 
-    def test_a_page_can_show_busy_and_failure_without_waiting_for_a_read(self) -> None:
+    def test_a_page_can_set_and_clear_busy_before_a_read(self) -> None:
         options = {"ageLimit": 60, "readingDelay": .2, "roundTripLimit": 1, "renderLimit": 1}
         source = self.environment(json.dumps(options)) + page_frame.REFRESH_SCRIPT + r"""
 (async()=>{
  const check=(ok,reason)=>{if(!ok) throw new Error(reason);};
- const refresh=createPageRefresh(async()=>({readAt:now/1000,renderSeconds:.03}));
- refresh.setStatus('Measuring…');
+ let fail=false;
+ const refresh=createPageRefresh(async()=>{
+  if(fail) throw new Error('The read failed.');
+  return {readAt:now/1000,renderSeconds:.03};
+ });
+ refresh.setBusy('Measuring…');
  check(line.dataset.state==='Paused' && parts.reason.textContent==='Measuring…',
   'Busy status must appear before the first read.');
- refresh.setStatus('','Launch failed.');
- check(line.dataset.state==='Failed' && parts.reason.textContent==='Launch failed.',
-  'A failure must appear without a read.');
+ refresh.setBusy('');
  await refresh.refresh();
- check(line.dataset.state==='Live','A good read must clear the failure.');
+ check(line.dataset.state==='Live','A good read must show Live.');
  now+=61000;refresh.changed();
  check(line.dataset.state==='Late','An unanswered page must become Late.');
- refresh.setStatus('Measuring…');
+ refresh.setBusy('Measuring…');
  check(line.dataset.state==='Paused' && parts.age.textContent==='1 min ago',
   'Busy status must appear at once and keep the data age.');
- refresh.setStatus('','The measure did not finish.');
- refresh.changed();
- check(line.dataset.state==='Failed' && parts.reason.textContent==='The measure did not finish.',
-  'The age clock must keep the failure.');
- refresh.setStatus('');
- check(line.dataset.state==='Live','Clearing the status must clear the busy text and failure.');
+ fail=true;
+ await refresh.refresh();
+ refresh.setBusy('');
+ check(line.dataset.state==='Failed' && parts.reason.textContent==='The read failed.',
+  'Clearing the busy status must preserve a read failure.');
  console.log('PASS');
 })().catch(error=>{console.error(error);process.exitCode=1;});
 """

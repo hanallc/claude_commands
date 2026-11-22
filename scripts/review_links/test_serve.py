@@ -12,6 +12,7 @@ import importlib.util
 import json
 import gzip
 import os
+import re
 import secrets
 import select
 import shlex
@@ -55,7 +56,7 @@ from scripts.production import (
 from scripts.production.production_doc import read_new_production
 from scripts.production.staff_test_support import fixture_member
 from scripts.review_links import test_change_page
-from scripts.review_links import console_tune, new_item_dialog, page_frame, page_question, question_record, review_submissions
+from scripts.review_links import console_tune, new_item_dialog, page_frame, page_question, question_record, record_table, review_submissions
 from scripts.review_links import accounts_page, change_browser, change_page, console, for_you, image_store, images, investigations_page, list_page, review_actions, review_later, review_page, review_items, serve, test_review_page
 from scripts.lib import atomic_file, conf, file_lock, process_start, scratch, urgency
 from scripts.feature_log import feature_log
@@ -1458,7 +1459,7 @@ class ReviewLinksServerTests(unittest.TestCase):
                     state = new_item_dialog.BugPageState(
                         url, None, 2.4, ("Could not load brain.",),
                         (new_item_dialog.PageScriptError("Error", url, 9, 3, "2026-11-18T16:05:00Z"),),
-                        "State Open · Owner builds", False, "Review")
+                        "Show Open · Owner builds", False, "Review")
                     data = new_item_dialog.PageDataEvidence("Review", (("Item", "State"), ("Console", "Open")))
                     request = replace(case.submission_request(new_item_dialog.SubmissionKind.BUG, owner.id),
                                       page="review", request_id="r2-" + uuid4().hex, evidence=data, page_state=state)
@@ -3198,13 +3199,28 @@ class ReviewLinksServerTests(unittest.TestCase):
     def test_review_request_passes_the_selected_show_view(self) -> None:
         snapshot = review_page.build_snapshot(self.review_fixture().root)
         for query, show in (('', 'open'), ('?show=Done', 'Done'), ('?show=all', 'all'),
-                            ('?show=For+you', 'For you'), ('?show=Waiting', 'Waiting')):
-            with self.subTest(show=show), patch.object(review_page.ReviewSnapshotCache,'get',return_value=snapshot), patch.object(
+                            ('?show=For+you', 'For you'), ('?show=Waiting', 'Waiting'),
+                            ('?state=Waiting', 'Waiting'), ('?state=Waiting&show=all', 'all'),
+                            ('?state=Waiting&show=', 'open'), ('?show=&show=Waiting', 'open')):
+            with self.subTest(query=query), patch.object(review_page.ReviewSnapshotCache,'get',return_value=snapshot), patch.object(
                     review_page.ReviewSnapshot,'render',return_value=b'Review') as render:
                 reply = self.request('/console/review.html'+query)
                 self.assertEqual(reply.status, 200)
                 self.assertEqual(reply.body, b'Review')
-                render.assert_called_once_with(show=show)
+                render.assert_called_once_with(show=show, kind='')
+
+    def test_review_initial_html_falls_back_to_open_for_unavailable_show(self) -> None:
+        snapshot = review_page.build_snapshot(self.review_fixture().root)
+        with patch.object(review_page.ReviewSnapshotCache, 'get', return_value=snapshot):
+            for kind in ('', 'investigations', *review_page.TYPES):
+                show = 'Validating' if kind == review_items.ReviewType.RESPONSE else 'Done'
+                with self.subTest(kind=kind, show=show):
+                    query = urlencode({'state': show, 'type': kind})
+                    reply = self.request(review_page.PAGE_PATH+'?'+query)
+                    self.assertEqual(reply.status, 200)
+                    self.assertIn(b'data-show="open"', reply.body)
+                    self.assertIn(b'data-filter-value="open" aria-pressed="true"', reply.body)
+                    self.assertNotIn(f'data-filter-value="{show}" aria-pressed="true"'.encode(), reply.body)
 
     def test_review_snapshot_endpoints_do_not_read_stores_and_use_gzip(self) -> None:
         case = self.review_fixture()
@@ -3216,6 +3232,10 @@ class ReviewLinksServerTests(unittest.TestCase):
         with patch.object(review_page.ReviewSnapshotCache,'get',return_value=snapshot), patch.object(
                 review_items,'read',side_effect=AssertionError('A GET read a store.')), patch.object(
                 staff,'snapshot',side_effect=AssertionError('A GET read staff.')):
+            waiting = self.request(review_page.PAGE_PATH+'?state=Waiting')
+            self.assertEqual(waiting.status, 200)
+            self.assertIn(b'data-show="Waiting"', waiting.body)
+            self.assertIn(b'data-filter-value="Waiting" aria-pressed="true"', waiting.body)
             version=self.request(review_page.PAGE_PATH+'?version=1')
             self.assertEqual(version.status,200)
             self.assertEqual(json.loads(version.body)['version'],snapshot.version)
@@ -3932,7 +3952,7 @@ class ReviewLinksServerTests(unittest.TestCase):
             self.assertNotIn(b'value="works"', body)
             self.assertNotIn(b'data-later-toggle', body.split(b'</template>', 1)[0])
         self.assertEqual(missing.status, 404)
-        self.assertIn(b'role="status"', missing.body)
+        self.assertIn(b'role="alert"', missing.body)
 
     def test_review_recovery_isolates_unreadable_lists_and_releases_locks_before_cleanup(self) -> None:
         case = self.review_fixture(changes=3)
@@ -4782,6 +4802,84 @@ class ReviewLinksServerTests(unittest.TestCase):
                 response = self.request(f"{list_page.PAGE_PATH}?{list_page.COUNTS_QUERY}")
             self.assertEqual((response.status, response.body), (200, footer.encode()))
             counts.assert_called_once()
+
+    def add_list_filter_items(self) -> None:
+        keeper = staff.StaffId("pa")
+        for number, producer, parked, unread in (
+                (1, "pa", True, True), (2, "pb", True, True), (3, "pa", True, False),
+                (4, "pa", False, True), (5, "pb", False, True)):
+            item = the_list.add(keeper, f"Task {number}", owner=the_list.UnassignedOwner.NATE,
+                                source="nate", changes={"producer": staff.StaffId(producer)}, number=number)
+            if parked:
+                _ = the_list.park(keeper, item.id, the_list.ParkUntilDelivered.DELIVERED, source="nate")
+            if not unread:
+                _ = the_list.mark_read(keeper, item.id, source="nate")
+
+    def list_filter_markup(self, query: str = "") -> tuple[list[str], dict[tuple[str, str], tuple[str, str]]]:
+        with patch.object(record_table, "count_filter_row", wraps=record_table.count_filter_row) as count:
+            response = self.request(list_page.PAGE_PATH + query)
+        self.assertEqual(response.status, 200)
+        count.assert_called()
+        markup = response.body.decode()
+        visible = [match[1] for match in re.finditer(
+            r'<tbody data-list-item[^>]+ data-number="([^"]+)"([^>]*)>', markup) if not match[2].endswith(' hidden')]
+        rows = re.finditer(r'<div [^>]*data-filter-row="(owner|producer|show)"[^>]*>(.*?)</div>', markup, re.S)
+        chips = {(row[1], chip[1]): (chip[2], chip[3]) for row in rows for chip in re.finditer(
+            r'<button [^>]*data-filter-value="([^"]+)" aria-pressed="([^"]+)" data-filter-count="([^"]+)"', row[2])}
+        return visible, chips
+
+    def test_list_applies_address_filters_before_javascript_runs(self) -> None:
+        self.add_list_filter_items()
+        visible, chips = self.list_filter_markup("?show=parked&producer=pa&unread=1&q=parked")
+        self.assertEqual(visible, ["1"])
+        self.assertEqual(chips["show", "all"], ("false", "1"))
+        self.assertEqual(chips["show", "parked"], ("true", "1"))
+        self.assertEqual(chips["show", "working"], ("false", "0"))
+        self.assertEqual(chips["producer", "all"], ("false", "2"))
+        self.assertEqual(chips["producer", "staff:pa"], ("true", "1"))
+        self.assertEqual(chips["producer", "staff:pb"], ("false", "1"))
+        self.assertEqual(chips["owner", "all"], ("true", "1"))
+
+    def test_list_search_shows_a_parked_item_with_an_unread_answer_before_javascript_runs(self) -> None:
+        morty = fixture_member("producer", name="morty")
+        item = the_list.add(morty.id, "Check the result", owner=the_list.UnassignedOwner.NATE,
+                            source="nate", changes={}, number=1)
+        _ = the_list.park(morty.id, item.id, the_list.ParkUntilDelivered.DELIVERED, source="nate")
+        _ = the_list.add(morty.id, "Read the next result", owner=the_list.UnassignedOwner.NATE,
+                         source="nate", changes={}, number=2)
+        status = self.server.delivery_status
+        with (patch.object(change_page, "send_question", return_value=question_outcome()),
+              patch.object(staff, "caller_identity", return_value=morty.current_session),
+              redirect_stdout(StringIO())):
+            question = the_list.PageRequest(uuid4().hex, "question", "Which check passed?")
+            change_page.deliver(the_list.ask_question(morty.id, item.id, question, status), status)
+            self.assertEqual(the_list.main(["answer", item.id, "--question", "Q1", "--text", "The gate passed."]), 0)
+
+        visible, chips = self.list_filter_markup("?q=parked")
+        self.assertEqual(visible, ["1"])
+        self.assertEqual(chips["show", "needs-me"], ("false", "0"))
+        self.assertEqual(chips["show", "parked"], ("false", "1"))
+
+    def test_list_drops_a_missing_linked_item_before_counting(self) -> None:
+        self.add_list_filter_items()
+        missing = "pa/L99"
+        for keys, expected, all_count in (
+                ([missing], ["4", "5"], "5"), ([missing, "pa/L4"], ["4"], "1")):
+            with self.subTest(keys=keys):
+                query = urlencode({"show": "working", "key": keys, "item": missing}, doseq=True)
+                visible, chips = self.list_filter_markup("?" + query)
+                self.assertCountEqual(visible, expected)
+                self.assertEqual(chips["show", "all"], ("false", all_count))
+                self.assertEqual(chips["show", "working"], ("true", str(len(expected))))
+
+    def test_list_without_a_query_keeps_the_plain_rows_and_counts(self) -> None:
+        self.add_list_filter_items()
+        visible, chips = self.list_filter_markup()
+        self.assertCountEqual(visible, ["1", "2", "3", "4", "5"])
+        for group in ("owner", "producer", "show"):
+            self.assertEqual(chips[group, "all"], ("true", "5"))
+        self.assertEqual(chips["show", "parked"], ("false", "3"))
+        self.assertEqual(chips["show", "working"], ("false", "2"))
 
     def test_list_reads_a_change_missing_from_a_partial_review_snapshot(self) -> None:
         case = self.review_fixture(changes=1)

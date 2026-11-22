@@ -15,7 +15,8 @@ from urllib.parse import unquote, urlencode, urlsplit, urlunsplit
 from scripts.lib import atomic_file, conf, file_lock
 from scripts.production.change_review import ChangeReviewError
 from scripts.production.production_doc import Refusal
-from scripts.review_links import accounts_page, change_page, console_theme, for_you, page_frame, review_link, review_legacy
+from scripts.review_links import accounts_page, change_page, console_theme, for_you, page_frame, record_table, review_link
+from scripts.review_links import review_legacy
 from scripts.for_you.action import review_place
 
 PHONE_QUERY = "(max-width:680px)"
@@ -296,14 +297,14 @@ def render(pages: tuple[ConsolePage, ...], rebuilds: AvailablePage | Unavailable
         icons = {level: accounts_page.quota_icon(level)
                  for level in (accounts_page.QuotaLevel.WARNING, accounts_page.QuotaLevel.URGENT)}
         notifier = notifier.replace("/* Quota icons. */ {}", json.dumps(icons))
-    content = content.replace("<!-- FOR YOU SCRIPT -->", page_frame.COPY_SCRIPT + notifier)
+    content = content.replace("<!-- FOR YOU SCRIPT -->", page_frame.COPY_SCRIPT + page_frame.ACTION_STATUS_SCRIPT + notifier)
     content = content.replace("<!-- FOR YOU COPY -->", page_frame.COPY_BUTTON)
     content = content.replace("<!-- FOR YOU REBUILD -->", icon_svg("refresh-cw"))
     content = content.replace("<!-- FOR YOU ACTION -->", icon_svg("list-checks"))
     content = content.replace("<!-- CLOSE -->", icon_svg("panel-left-close"))
     content = content.replace("<!-- OPEN -->", icon_svg("panel-left-open"))
     content = content.replace("<!-- MENU -->", icon_svg("menu") + '<span class="new-mark" id="menu-new" hidden>' + new_mark + '</span>')
-    content = content.replace('<script>', '<script>'+REVIEW_PLACE_SCRIPT, 1)
+    content = content.replace('<script>', '<script>'+record_table.PLACE_SCRIPT+REVIEW_PLACE_SCRIPT, 1)
     return content.replace("/* Phone query */", PHONE_QUERY).encode("utf-8")
 
 
@@ -350,7 +351,9 @@ font:14px/1.4 ui-monospace,monospace;white-space:pre-wrap;overflow-wrap:anywhere
 FOR_YOU_SCRIPT = r'''
 function createForYouNotifier(openCard){
  const triggers=[...document.querySelectorAll('[data-for-you-toggle]')],panel=document.getElementById('action-popover');
- const entries=panel.querySelector('[data-for-you-entries]'),note=panel.querySelector('[data-for-you-note]');
+ const entries=panel.querySelector('[data-for-you-entries]');
+ const failure=panel.querySelector('[data-for-you-failure]'),empty=panel.querySelector('[data-for-you-empty]');
+ const summary=panel.querySelector('[data-for-you-summary]');
  let last=null,stale=false,reading=false,completionPending=false,opener=null,displayed='';
  function selectionIntersects(node){
   const selection=getSelection();
@@ -392,8 +395,9 @@ function createForYouNotifier(openCard){
   if(selectionIntersects(panel)) return;
   const heading=panel.querySelector('[data-panel-count]');
   if(heading.textContent!==count) heading.textContent=count;
-  const message=!last ? 'The action count is unavailable.' : stale ? 'Stale. The action read failed.' : last.count===0 ? 'No actions required.' : 'These actions require you now.';
-  if(note.textContent!==message) note.textContent=message;
+  showActionFailure(failure,!last ? 'The action count is unavailable.' : stale ? 'Stale. The action read failed.' : '');
+  empty.hidden=!last || stale || last.count!==0;
+  summary.hidden=!last || stale || last.count===0;
   showEntries(last?.entries ?? []);
  }
  function draw(){
@@ -405,7 +409,7 @@ function createForYouNotifier(openCard){
    if(badge.textContent!==count) badge.textContent=count;
    const label=button.querySelector('[data-for-you-state]');
    const message=state==='stale' ? 'Stale' : state==='unavailable' ? 'Unavailable' : '';
-   if(label.textContent!==message) label.textContent=message;
+   showActionFailure(label,message);
    button.setAttribute('aria-label','For you: '+(last ? count+(stale ? ', stale' : '') : 'Unavailable'));
   }
   drawPanel(count);
@@ -565,7 +569,9 @@ aria-controls="console-nav" aria-expanded="false" aria-label="Open navigation"><
 </div>
 <section id="action-popover" aria-label="For you actions" hidden>
 <header><strong>For you <span data-panel-count>?</span></strong><button type="button" id="close-actions" aria-label="Close actions">×</button></header>
-<p class="panel-note" role="status" data-for-you-note>The action count is unavailable.</p>
+<p class="panel-note" role="status" data-for-you-failure>The action count is unavailable.</p>
+<p class="panel-note" role="status" data-for-you-empty hidden>No actions required.</p>
+<p class="panel-note" data-for-you-summary hidden>These actions require you now.</p>
 <div data-for-you-entries></div>
 <footer><a data-for-you-card href="<!-- FOR YOU LINK -->">Open For you →</a></footer>
 </section>
@@ -745,8 +751,7 @@ aria-controls="console-nav" aria-expanded="false" aria-label="Open navigation"><
     if (kind && reviewEntry) {
       const url=new URL(location.href);
       const previous=new URL((destination ?? url).searchParams.get(placeKey(identity)) || '/console/changes.html',location.origin);
-      const filters=new URLSearchParams(previous.search);
-      for(const [key,value] of new URLSearchParams(previous.hash.slice(1))) filters.set(key,value);
+      const filters=recordPlaceParams(reviewPlaceOptions,previous);
       filters.set('type',kind);legacyReviewPlace(filters,kind);
       url.searchParams.set('at.review','/console/review.html#'+filters);
       openConsolePlace(reviewEntry, url, navigate);

@@ -16,6 +16,7 @@ import tempfile
 import threading
 import time
 import unittest
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from collections.abc import Generator
 from contextlib import ExitStack, contextmanager, redirect_stderr, redirect_stdout, suppress
@@ -43,7 +44,8 @@ from scripts.production import change_review, change_routing, delivery_state, in
 from scripts.production.update_registration import QuestionStaff
 from scripts.review_links import console, list_page, page_frame, serve, staff_names
 from scripts.review_links import change_browser, change_page, new_item_dialog, page_question, question_record
-from scripts.review_links import review_items, review_page
+from scripts.review_links import review_items, review_page, search_fold
+from scripts.review_links.test_accounts_page import firefox_probe_results
 from scripts.review_links.test_change_page import BrowserForms
 from scripts.review_links.test_page_frame import assert_status_states
 from scripts.review_links.test_record_table import save_notice_failures
@@ -445,6 +447,7 @@ class ListPageTests(unittest.TestCase):
             + "# whole: 1..1440\nlater_soon_minutes=60\n"
             + "later_evening=18:00\nlater_evening_until=17:00\nlater_morning=09:00\n"
             + "later_week_day=Monday\nlater_week_time=09:00\n"
+            + "# whole: 1..60\npark_time_step_minutes=15\n"
             + "# range: 5..300\npage_refresh_seconds=15\n# whole: 1..80\nlist_log_max_height_rem=16\n"
             + "# whole: 1..300\npage_request_timeout_seconds=15\n"
             + "# whole: 1..5000\ncard_fade_out_ms=450\n# whole: 1..5000\ncard_fade_in_ms=600\n"
@@ -1251,7 +1254,8 @@ async function inspect(){
  });
  submit('works');
  if(!phone){
-  await changed(card.body,()=>status().startsWith('Saved:'),'the verdict is saved');
+  await changed(dialog,()=>!close.disabled,'the verdict is saved');
+  check(status()==='' && card.querySelector('[data-send-status]').hidden,'The verdict shows no status text.');
   await animationFrames(win);
   check(dialog.open && listReads===0 && row()===before,'The Review save waits for the pending List action.');
   releaseList(new win.Response(JSON.stringify({reason:'The test List action was refused.'}),{status:400}));
@@ -2153,6 +2157,156 @@ document.body.append(result);
         _ = the_list.close(MORTY.id, items[5].id, "The user removed this task.", source="nate")
         return items
 
+    def test_list_publishes_the_first_active_timed_park_deadline(self) -> None:
+        earlier = NOW + timedelta(minutes=2)
+        later = NOW + timedelta(minutes=3)
+        for title, deadline in (("Earlier park", earlier), ("Later park", later)):
+            item = self.add(title)
+            _ = the_list.park(MORTY.id, item.id, deadline, source="nate")
+        closed = self.add("Closed park")
+        _ = the_list.park(MORTY.id, closed.id, NOW + timedelta(minutes=1), source="nate")
+        _ = the_list.close(MORTY.id, closed.id, "The work is closed.", source="nate")
+        delivery = self.add("Park until delivery")
+        _ = the_list.park(MORTY.id, delivery.id, the_list.ParkUntilDelivered.DELIVERED, source="nate")
+
+        root = self.root / "reviews"
+        for moment, deadline in ((NOW, earlier), (earlier, later), (later, None)):
+            with self.subTest(moment=moment), patch.object(time, "time", return_value=moment.timestamp()):
+                markup = list_page.render(root, include_counts=False, query="show=working").decode()
+                page = re.search(r'<div data-list [^>]*>', markup)
+                assert page is not None
+                if deadline is None:
+                    self.assertNotIn("data-park-deadline", page[0])
+                else:
+                    self.assertIn(f'data-park-deadline="{deadline.timestamp()}"', page[0])
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
+    def test_browser_keeps_the_first_paint_rows_and_chip_counts_for_query_filters(self) -> None:
+        upper, lower = "\u1c89", "\u1c8a"
+        for number, character, owner in (
+                (1, upper, OWNER.id), (2, lower, OWNER.id), (3, upper, OTHER.id), (4, upper, OWNER.id)):
+            item = self.add(f"Check \0 {character}", owner=owner, number=number)
+            if number != 4:
+                _ = the_list.park(MORTY.id, item.id, the_list.ParkUntilDelivered.DELIVERED, source="nate")
+            if number == 3:
+                _ = the_list.mark_read(MORTY.id, item.id, source="nate")
+        query = urlencode({"show": "parked", "owner": OWNER.id, "q": f"CHECK \0 {upper}"})
+        fragment = urlencode({"show": "working", "owner": OTHER.id, "q": "unmatched"})
+        key_query = urlencode({"show": "working", "key": f"{MORTY.id}/L4"})
+        key_fragment = urlencode({"key": f"{MORTY.id}/L1"})
+        numbers = ["1", "2"] if search_fold.fold(upper) == search_fold.fold(lower) else ["1"]
+        unread_alias = "show=unread&unread=0"
+        all_rows = ["1", "2", "3", "4"]
+        unread_rows = ["1", "2", "4"]
+        before = r'''<script>
+const [address,firstRows,loadedRows,allCount,firstUnread,loadedUnread]=CASE;
+history.replaceState(null,'',address);
+const snapshot=()=>({
+ rows:[...document.querySelectorAll('[data-list-item]:not([hidden])')].map(row=>row.dataset.number).sort(),
+ chips:[...document.querySelectorAll('[data-filter-count]')].map(chip=>
+  [chip.id,chip.dataset.filterCount,chip.getAttribute('aria-pressed')]),
+ unread:document.querySelector('#list-unread').checked,
+});
+const firstPaint=snapshot();
+</script>'''
+        after = r'''<script>
+const failures=[];
+const check=(ok,message)=>{if(!ok) failures.push(message);};
+const loaded=snapshot();
+check(JSON.stringify(firstPaint.rows)===JSON.stringify(firstRows),'The server shows the matching rows.');
+check(JSON.stringify(loaded.rows)===JSON.stringify(loadedRows),'Script start shows the matching rows.');
+check(firstPaint.unread===firstUnread && loaded.unread===loadedUnread,'Unread has the expected state.');
+if(firstUnread===loadedUnread)
+ check(JSON.stringify(firstPaint)===JSON.stringify(loaded),'Script start keeps the rows and chip counts.');
+check(document.querySelector('#filter-show-all').dataset.filterCount===String(allCount),'The All chip has the expected count.');
+const row=document.querySelector('[data-number="1"]');
+check(JSON.parse(row.dataset.sortValues)[3].includes('\0'),'The Item sort key keeps the null character.');
+void fetch('/results',{method:'POST',body:JSON.stringify(failures)});
+</script>'''
+        script = "<script>" + list_page.SCRIPT
+        for server_query, browser_fragment, first_rows, loaded_rows, all_count, first_unread, loaded_unread in (
+                ("", "", all_rows, all_rows, 4, False, False),
+                (query, fragment, numbers, numbers, len(numbers) + 1, False, False),
+                (query, fragment + "&unread=1", numbers, numbers, len(numbers) + 1, False, True),
+                ("unread=0", "show=unread", all_rows, all_rows, 4, False, False),
+                ("show=parked", unread_alias, ["1", "2", "3"], ["1", "2"], 3, False, True),
+                ("", unread_alias, all_rows, unread_rows, 3, False, True),
+                ("show=unread", "", unread_rows, unread_rows, 3, True, True),
+                (unread_alias, "unread=0", unread_rows, unread_rows, 3, True, True),
+                (key_query, key_fragment, ["4"], ["4"], 1, False, False),
+        ):
+            with self.subTest(query=server_query, fragment=browser_fragment):
+                address = ("?" + server_query if server_query else "") + ("#" + browser_fragment if browser_fragment else "")
+                case = json.dumps((address, first_rows, loaded_rows, all_count, first_unread, loaded_unread))
+                markup = list_page.render(self.root / "reviews", include_counts=False, query=server_query).decode()
+                page = markup.replace(script, before.replace("CASE", case) + script, 1)
+                page = page.replace("</body>", after + "</body>", 1)
+                self.assertEqual(firefox_probe_results(page.encode()), [[]])
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
+    def test_browser_preserves_staff_ids_in_query_filters(self) -> None:
+        owner, producer = staff.StaffId("o\ra"), staff.StaffId("p\rb")
+        for number, owner_id, producer_id in (
+            (1, owner, producer), (2, owner, staff.StaffId("p%0Db")), (3, staff.StaffId("o%0Da"), producer),
+        ):
+            item = self.add(f"Check item {number}", owner=owner_id, number=number)
+            _ = the_list.update(MORTY.id, item.id, {"producer": producer_id}, source="morty")
+        before = r'''<script>
+history.replaceState(null,'',ADDRESS);
+const visible=()=>[...document.querySelectorAll('[data-list-item]:not([hidden])')]
+ .map(row=>row.dataset.number).sort().join();
+const firstPaint=visible();
+</script>'''
+
+        def check_query(query: str, after: str) -> None:
+            markup = list_page.render(self.root / "reviews", include_counts=False, query=query).decode()
+            script = "<script>" + list_page.SCRIPT
+            start = before.replace('ADDRESS', json.dumps(f"?{query}"))
+            page = markup.replace(script, start + script, 1).replace("</body>", after + "</body>", 1)
+            self.assertEqual(firefox_probe_results(page.encode()), [[]])
+
+        after = r'''<script>
+const failures=[],check=(ok,message)=>{if(!ok) failures.push(message);};
+const chip=(name,selection)=>document.querySelector('[data-filter-row="'+name+'"] '+selection);
+check(firstPaint==='1' && visible()===firstPaint,'Both filters keep the first paint row.');
+const ownerChip=chip('owner','[aria-pressed="true"]'),producerChip=chip('producer','[aria-pressed="true"]');
+check(ownerChip.dataset.filterCount==='1' && producerChip.dataset.filterCount==='1',
+ 'Both selected chips show one matching row.');
+chip('owner','[data-filter-value="all"]').click();
+check(visible()==='1,3','The producer filter keeps its carriage return.');
+ownerChip.click();
+chip('producer','[data-filter-value="all"]').click();
+check(visible()==='1,2','The owner filter keeps its carriage return.');
+producerChip.click();
+const place=new URLSearchParams(location.hash.slice(1));
+check(visible()==='1' && place.get('owner')==='o\ra' && place.get('producer')==='p\rb',
+ 'The selected chips write the original IDs to the address.');
+void fetch('/results',{method:'POST',body:JSON.stringify(failures)});
+</script>'''
+        with self.subTest(filter="staff"):
+            check_query(urlencode({"owner": owner, "producer": producer}), after)
+
+        keeper = staff.StaffId("k\r1")
+        for keeper_id in (keeper, staff.StaffId("k%0D1")):
+            _ = the_list.add(keeper_id, "Check the linked item", owner=OTHER.id, number=4,
+                             source="nate", changes={"state": the_list.ItemState.WORKING})
+        key = f"{keeper}/L4"
+        after = r'''<script>
+const failures=[],check=(ok,message)=>{if(!ok) failures.push(message);};
+const row=document.querySelector('[data-list-item]:not([hidden])');
+const working=document.querySelector('[data-filter-row="show"] [aria-pressed="true"]');
+check(firstPaint==='4' && visible()===firstPaint,'The key filter keeps the first paint row.');
+check(row?.dataset.key===KEY && working.dataset.filterCount==='1',
+ 'The selected row keeps its original key and the Working chip counts one row.');
+row?.querySelector('.list-toggle').click();
+const place=new URLSearchParams(location.hash.slice(1));
+check(place.get('item')===KEY && place.getAll('key').join()===KEY,
+ 'The selected row writes the original key to the address.');
+void fetch('/results',{method:'POST',body:JSON.stringify(failures)});
+</script>'''.replace('KEY', json.dumps(key))
+        with self.subTest(filter="key"):
+            check_query(urlencode({"show": "working", "key": key}), after)
+
     def test_records_share_cli_order_and_each_render_reads_current_fields(self) -> None:
         items = self.fixture_items()
         _ = the_list.update(MORTY.id, items[0].id, {"related_to": (106,),
@@ -2169,13 +2323,13 @@ document.body.append(result);
         self.assertEqual([part.split('"', 1)[0] for part in controls.split('data-filter-row="')[1:]],
                          ['owner', 'producer', 'show'])
         shows = controls.split('data-filter-row="show"', 1)[1].split('</div>', 1)[0]
-        self.assertEqual(re.findall(r'data-filter-value="([^"]+)"[^>]*>([^<]+)<b>', shows),
+        self.assertEqual(re.findall(r'data-filter-value="([^"]+)"[^>]*>([^<]+) <b>', shows),
                          [("all", "All"), ("needs-me", "Needs me"), ("morty-answering", "Morty answering"),
                           ("working", "Working"), ("blocked", "Blocked"), ("parked", "Parked")])
         self.assertIn('role="switch" id="list-unread" value="1">Unread only</label>', controls)
         owners = controls.split('data-filter-row="owner"', 1)[1].split('</div>', 1)[0]
         producers = controls.split('data-filter-row="producer"', 1)[1].split('</div>', 1)[0]
-        chip = r'data-filter-value="([^"]+)"[^>]*>([^<]+)<b>(\d+)</b>'
+        chip = r'data-filter-value="([^"]+)"[^>]*>([^<]+) <b>(\d+)</b>'
         self.assertEqual(re.findall(chip, owners),
                          [('all', 'All', '5'), (f'staff:{OTHER.id}', 'builds', '1'), (f'staff:{OWNER.id}', 'sdlc', '4')])
         self.assertEqual(re.findall(chip, producers),
@@ -2438,7 +2592,7 @@ result.textContent=JSON.stringify(failures);document.body.append(result);
         body = list_page.render(self.root / "reviews").decode()
         owners = body.split('data-filter-row="owner"', 1)[1].split('</div>', 1)[0]
         for label in (str(missing), "nate", "Not recorded"):
-            self.assertIn('>' + label + '<b>1</b></button>', owners)
+            self.assertIn('>' + label + ' <b>1</b></button>', owners)
         _ = (self.root / "staff.json").write_text('{"schema":1,"rows":[]}')
         self.assertEqual(len(list_page.records()), 3)
 
@@ -2450,7 +2604,7 @@ result.textContent=JSON.stringify(failures);document.body.append(result);
         self.assertNotIn('<label for="words-', words)
         self.assertIn('placeholder="Your words for morty about this item"', words)
         self.assertIn('aria-label="Your words for morty about this item"', words)
-        self.assertIn('</textarea><div class="list-tell"><span role="status" data-send-status></span>'
+        self.assertIn('</textarea><div class="list-tell"><span role="status" data-send-status hidden></span>'
                       + '<button name="action" value="question" disabled>Ask question</button>'
                       + '<button name="action" value="tell" disabled>Tell morty</button></div>', words)
         self.assertIn("!words.value.trim()", list_page.SCRIPT)
@@ -3118,12 +3272,13 @@ window.fetch=(url,options)=>{
         park = the_list.park
 
         def at_midnight(keeper: staff.StaffId, identity: str, until: the_list.Timestamp, *,
-                        source: str, notice: the_list.PageItemNotice) -> the_list.ListItem:
+                        source: str, notice: the_list.PageItemNotice,
+                        check_deadline: Callable[[datetime], None] | None) -> the_list.ListItem:
             with patch.object(the_list, "now", return_value=midnight):
-                return park(keeper, identity, until, source=source, notice=notice)
+                return park(keeper, identity, until, source=source, notice=notice, check_deadline=check_deadline)
 
         with patch.object(the_list, "park", side_effect=at_midnight):
-            with self.assertRaisesRegex(ValueError, "Choose a future parking date"):
+            with self.assertRaisesRegex(ValueError, r"^Choose a future parking date\.$"):
                 _ = list_page.submit(root, urlencode(fields))
         self.assertEqual(the_list.load(MORTY.id, item.id), item)
 
@@ -3217,8 +3372,9 @@ window.fetch=async(_path,options={})=>{
  const toggle=form.querySelector('[data-later-toggle]');
  check(!form.querySelector('input[type=date]'),'Park has no native date input');
  toggle.click();
+ form.querySelector('[data-later-choose]').click();
  const sheet=form.querySelector('[data-later-custom]');
- check(!sheet.hidden && !sheet.closest('[data-later-menu]').hidden,'Park opens the shared sheet');
+ check(!sheet.hidden && !sheet.closest('[data-later-menu]').hidden,'Pick a date opens the shared sheet');
  check(document.activeElement.dataset.date==='2026-12-03','Focus starts on the selected date');
  sheet.querySelector('[data-date="2026-12-03"]').click();
  const field=sheet.querySelector('[data-later-time]');
@@ -3226,8 +3382,9 @@ window.fetch=async(_path,options={})=>{
  const summary=sheet.querySelector('[data-later-summary]').textContent;
  check(summary==='Parks until Dec 3 19:30 EST','The Park picker shows the short time in the user zone');
  check(!requests.length,'Changing the selection does not submit the form');
- sheet.querySelector('[value="park"]').click();
- check(sheet.hidden && requests.length===1,'Save closes the shared sheet and submits once');
+ field.focus();
+ field.dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',bubbles:true,cancelable:true}));
+ check(sheet.hidden && requests.length===1,'Enter in Time closes the picker and submits once');
  check(requests[0]?.get('action')==='park' && requests[0].get('until')==='2026-12-04T00:30:00.000Z',
   'Save sends the selected instant');
  finishPost({item_state:'Working',parked:'true',parked_until:'Dec 3 19:30 EST'});
@@ -3247,7 +3404,7 @@ window.fetch=async(_path,options={})=>{
  const preset=menu.querySelector('[data-later-preset]');
  toggle.click();
  check(menu.firstElementChild===preset && preset.textContent==='Until delivered','The preset comes first');
- check(!menu.querySelector('[data-later-custom]').hidden,'The date controls stay open below the preset');
+ check(menu.querySelector('[data-later-custom]').hidden,'The date controls wait for Pick a date');
  preset.click();
  check(menu.hidden && requests.length===1,'One click closes the menu and posts once');
  check(requests[0]?.get('action')==='park' && requests[0].get('until')==='delivered','The POST uses the delivery value');
@@ -3263,6 +3420,7 @@ window.fetch=async(_path,options={})=>{
   dialog.querySelector('[data-record-missing]').hidden,'Park closes the dialog without a status message.');
  show('working');
  check(row.hidden,'Working hides the item until delivery');
+ check(status.hidden && !status.textContent,'The hidden parked row leaves no action status.');
  show('parked');
  check(!row.hidden && !form.querySelector('[value="unpark"]').hidden,'Parked shows the item and Unpark');
  check(form.querySelector('[data-parked-detail]').textContent==='Parked until delivered','The panel shows the condition');
@@ -3280,28 +3438,157 @@ window.fetch=async(_path,options={})=>{
         self.browser_waiting_parking_refresh(unpark=False)
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
-    def test_browser_park_preset_skips_menu_navigation(self) -> None:
+    def test_browser_park_menu_supports_keyboard_navigation(self) -> None:
         self.browser_action_sequence(r"""
  const errors=[];
  addEventListener('error',event=>errors.push(event.message));
  const toggle=form.querySelector('[data-later-toggle]');
  toggle.click();
- const preset=form.querySelector('[data-later-preset]');
- preset.focus();
- for(const key of ['ArrowUp','ArrowDown','Home','End']){
+ const choices=[...form.querySelectorAll('[role=menuitem]')];
+ check(document.activeElement===choices[0],'Park focuses the first choice');
+ for(const [key,index] of [['ArrowUp',4],['ArrowDown',0],['End',4],['Home',0]]){
   const event=new KeyboardEvent('keydown',{key,bubbles:true,cancelable:true});
-  preset.dispatchEvent(event);
-  check(!event.defaultPrevented && document.activeElement===preset,'The dialog skips menu navigation for '+key);
+  document.activeElement.dispatchEvent(event);
+  check(event.defaultPrevented && document.activeElement===choices[index],'The menu handles '+key);
  }
+ const words=form.elements.words;
+ words.focus();
+ check(form.querySelector('[data-later-menu]').hidden && toggle.getAttribute('aria-expanded')==='false' &&
+  document.activeElement===words,'Focus outside Park closes the menu');
+ check(!dateTimePickerOpen(form),'Park no longer holds refresh');
  check(errors.length===0,'The keys cause no JavaScript errors');
  check(requests.length===0,'Navigation sends no POST');
 """)
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
+    def test_browser_park_uses_the_click_time_after_midnight(self) -> None:
+        self.browser_action_sequence(r"""
+ let now=Date.parse('2026-11-23T04:59:00Z');
+ Date.now=()=>now;
+ const toggle=form.querySelector('[data-later-toggle]'),menu=form.querySelector('[data-later-menu]');
+ const preset=name=>menu.querySelector('[data-later-preset="'+name+'"]');
+ const list=document.querySelector('[data-list]'),settings=list.dataset.parking;
+ for(const [minutes,label] of [[1,'1 minute'],[90,'90 minutes'],[60,'1 hour'],[120,'2 hours']]){
+  list.dataset.parking=JSON.stringify({...JSON.parse(settings),soon:minutes});
+  toggle.click();
+  check(preset('soon').querySelector('span').textContent===label,'The delay label follows the setting');
+  toggle.click();
+ }
+ list.dataset.parking=JSON.stringify({...JSON.parse(settings),weekDay:3,weekTime:635});
+ toggle.click();
+ check(preset('week').querySelector('small').textContent==='Wed 10:35',
+  'Next week shows the configured weekday and time');
+ toggle.click();
+ list.dataset.parking=settings;
+ toggle.click();
+ const labels=[...menu.querySelectorAll('[role=menuitem] span')].map(label=>label.textContent);
+ check(labels.join('|')==='Until delivered|1 hour|Tomorrow|Next week|Pick a date…','Park shows five choices');
+ check(preset('soon').querySelector('small').textContent==='' &&
+  preset('morning').querySelector('small').textContent==='09:00' &&
+  preset('week').querySelector('small').textContent==='Mon 09:00','The menu shows relative choices');
+ check(!preset('week').hasAttribute('data-at'),'Opening the menu does not resolve a deadline');
+ now=Date.parse('2026-11-23T05:01:00Z');
+ preset('week').click();
+ check(menu.hidden && requests.length===1,'One click after midnight submits the preset');
+ check(requests[0]?.get('action')==='park' && requests[0].get('until')==='2026-11-30T14:00:00.000Z',
+  'Next week uses the day of the click');
+ if(requests.length) {finishPost({parked:'true',parked_until:'Nov 30 09:00 EST'});await flush();}
+""", reduced_motion=True)
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
+    def test_browser_park_attaches_suggestions_to_the_editable_time(self) -> None:
+        self.browser_action_sequence(r"""
+ Date.now=()=>Date.parse('2026-11-23T04:53:00Z');
+ const toggle=form.querySelector('[data-later-toggle]'),choose=form.querySelector('[data-later-choose]');
+ toggle.click();choose.click();
+ const menu=form.querySelector('[data-later-menu]'),time=menu.querySelector('[data-later-time]');
+ const times=menu.querySelector('[data-later-times]');
+ const key=name=>time.dispatchEvent(new KeyboardEvent('keydown',{key:name,bubbles:true,cancelable:true}));
+ check(time.getAttribute('aria-controls')===times.id && times.hidden && !menu.querySelector('select') && !time.form,
+  'The editable Time field controls the list and has no implicit form action');
+ check([...times.children].slice(0,3).map(option=>option.textContent).join()==='00:00,00:15,00:30',
+  'The suggestions start at the next quarter hour across midnight');
+ time.focus();time.value='1937';time.dispatchEvent(new Event('input',{bubbles:true}));
+ check(document.activeElement===time && form.elements.until.value==='2026-11-23T19:37',
+  'The Time field accepts a value between suggestions');
+ menu.querySelector('[data-later-time-choices]').click();
+ check(!times.hidden && document.activeElement===time,'The suggestion button opens the list and keeps Time focused');
+ for(const name of ['ArrowLeft','ArrowRight','Home','End','Tab']){
+  check(key(name),'The page leaves '+name+' to the browser');
+ }
+ key('Escape');
+ check(times.hidden && !menu.hidden && time.value==='1937','Escape closes the list and keeps the typed draft');
+ key('ArrowDown');key('ArrowDown');
+ check(times.querySelector('[aria-selected="true"]')===times.children[1],'ArrowDown marks the second suggestion');
+ key('ArrowUp');
+ check(times.querySelector('[aria-selected="true"]')===times.children[0],'ArrowUp marks the first suggestion');
+ key('ArrowDown');
+ key('Enter');
+ check(times.hidden && !menu.hidden && form.elements.until.value==='2026-11-23T00:15',
+  'Enter in the list updates the draft and closes the list');
+ check(requests.length===0,'Accepting a suggestion sends no request');
+ form.elements.words.focus();
+ check(time.value==='00:15' && menu.hidden,'Focus outside the date picker keeps the time and closes it');
+ toggle.click();choose.click();time.focus();key('Escape');
+ check(menu.hidden && document.activeElement===toggle && requests.length===0,
+  'Escape in Time closes the picker and returns focus to Park');
+""")
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
+    def test_browser_park_preset_retries_once_and_uses_a_fresh_request_for_a_new_click(self) -> None:
+        self.browser_action_sequence(r"""
+ let now=Date.parse('2026-11-23T04:59:00Z');
+ Date.now=()=>now;
+ show('all');
+ const toggle=form.querySelector('[data-later-toggle]'),week=form.querySelector('[data-later-preset="week"]');
+ const words=form.elements.words,notice=form.querySelector('[data-send-status]');
+ words.value='Original words';
+ toggle.click();week.click();
+ const first=requests[0];
+ check(first?.get('until')==='2026-11-23T14:00:00.000Z','The first click sends the deadline');
+ now=Date.parse('2026-11-30T14:01:00Z');
+ words.value='Edited words';words.dispatchEvent(new Event('input',{bubbles:true}));
+ await loseParkPost();
+ const replay=requests[1];
+ check(notice.hidden && !form.querySelector('[value="retry-park"]'),
+  'The pending retry shows no failure line or Retry Park button');
+ check(replay?.toString()===first.toString() && replay.get('words')==='' && words.value==='Edited words',
+  'The automatic retry sends the original request and keeps the edited draft');
+ losePost();await flush();await finishRowMotion();
+ const above=document.querySelector('[data-hidden-action-status]');
+ check(requests.length===2 && !notice.hidden &&
+  notice.textContent==='Save not confirmed: Fixture lost response' && above.hidden,
+  'The final failure shows one notice');
+ toggle.click();
+ check(week.querySelector('small').textContent==='Mon 09:00','Next week stays available as a relative choice');
+ week.click();
+ const second=requests[2];
+ check(requests.length===3 && second.get('request')!==first.get('request') &&
+  second.get('until')==='2026-12-07T14:00:00.000Z' && second.get('words')==='',
+  'A new preset click sends a fresh request with a new deadline');
+ if(second){finishPost({parked:'true',parked_until:'Dec 7 09:00 EST'});await flush();}
+ check(notice.hidden && requests.length===3,'A confirmed save leaves no failure or retry');
+""", reduced_motion=True)
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
+    def test_browser_park_one_hour_starts_at_the_click(self) -> None:
+        self.browser_action_sequence(r"""
+ let now=Date.parse('2026-11-23T04:59:59.500Z');
+ Date.now=()=>now;
+ form.querySelector('[data-later-toggle]').click();
+ now+=1000;
+ form.querySelector('[data-later-preset="soon"]').click();
+ check(requests.length===1 && requests[0].get('until')==='2026-11-23T06:00:00.500Z',
+  'One click parks for one hour from the click across a minute boundary');
+ if(requests.length){finishPost({parked:'true',parked_until:'Nov 23 01:00 EST'});await flush();}
+""", reduced_motion=True)
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
     def test_browser_park_focus_moves_to_the_calendar_when_previous_month_disables(self) -> None:
         self.browser_action_sequence(r"""
  Date.now=()=>Date.parse('2026-11-30T15:00:00Z');
  form.querySelector('[data-later-toggle]').click();
+ form.querySelector('[data-later-choose]').click();
  const previous=form.querySelector('[data-later-month-step="-1"]');
  const grid=form.querySelector('[data-later-grid]');
  previous.focus();
@@ -3313,50 +3600,49 @@ window.fetch=async(_path,options={})=>{
 """)
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
-    def test_browser_retries_the_same_parking_time_after_it_passes(self) -> None:
+    def test_browser_retries_the_same_parking_time_automatically_after_it_passes(self) -> None:
         self.browser_action_sequence(r"""
  let now=Date.parse('2026-12-02T13:00:00Z');
  Date.now=()=>now;
  show('all');
  const toggle=form.querySelector('[data-later-toggle]');
  toggle.click();
+ form.querySelector('[data-later-choose]').click();
  const time=form.querySelector('[data-later-time]'),save=form.querySelector('[value="park"]');
  time.value='1930';time.dispatchEvent(new Event('input',{bubbles:true}));
  save.click();
  const first=requests[0];
  check(first?.get('until')==='2026-12-04T00:30:00.000Z','The first save sends the chosen instant');
- losePost();await flush();
- await finishRowMotion();
  now=Date.parse('2026-12-05T13:00:00Z');
- toggle.click();
- check(time.value==='19:30' && !save.disabled,'The picker retains and enables the expired retry');
- save.click();
- check(requests.length===2 && requests[1].get('request')===first.get('request') &&
-  requests[1].get('until')===first.get('until'),'Save retries the same ID and instant');
+ finishPost({status:503,reason:'The save is unconfirmed.'});
+ await flush();await flush();
+ check(requests.length===2 && requests[1].toString()===first.toString(),
+  'The automatic retry after a service error uses the same ID and instant');
  if(requests.length===2){finishPost({parked:'false',parked_until:''});await flush();}
 """)
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
-    def test_browser_park_refusal_from_enter_restores_focus(self) -> None:
+    def test_browser_park_refusal_restores_focus(self) -> None:
         self.browser_action_sequence(r"""
  Date.now=()=>Date.parse('2026-12-02T13:00:00Z');
  const toggle=form.querySelector('[data-later-toggle]');
  toggle.click();
- const time=form.querySelector('[data-later-time]');
+ form.querySelector('[data-later-choose]').click();
+ const save=form.querySelector('[value="park"]');
  show('working');
- time.focus();
- time.dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',bubbles:true,cancelable:true}));
- check(requests.length===1 && row.hidden,'Enter submits Park and hides the row from Working');
+ save.focus();save.click();
+ check(requests.length===1 && row.hidden,'Save submits Park and hides the row from Working');
  finishPost({reason:'The fixture refuses Park'});
  await flush();
  for(const animation of document.getAnimations()) animation.finish();
  await flush();
  check(!row.hidden && !toggle.disabled && document.activeElement===toggle,
-  'The restored row returns focus to Park until');
+  'The restored row returns focus to Park');
+ check(requests.length===1,'The browser does not retry a refusal');
 """)
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
-    def test_browser_expired_park_retry_keeps_the_calendar_in_the_tab_order(self) -> None:
+    def test_browser_expired_park_draft_keeps_the_calendar_in_the_tab_order(self) -> None:
         self.browser_action_sequence(r"""
  let now=Date.parse('2026-12-02T13:00:00Z');
  Date.now=()=>now;
@@ -3364,28 +3650,32 @@ window.fetch=async(_path,options={})=>{
  const toggle=form.querySelector('[data-later-toggle]'),grid=form.querySelector('[data-later-grid]');
  const save=form.querySelector('[value="park"]');
  toggle.click();
+ form.querySelector('[data-later-choose]').click();
  save.click();
  const first=requests[0];
+ await loseParkPost();
  losePost();await flush();
  for(const animation of document.getAnimations()) animation.finish();
  await flush();
  now=Date.parse('2026-12-15T13:00:00Z');
  toggle.click();
+ form.querySelector('[data-later-choose]').click();
  const entry=grid.querySelector('button:not(:disabled)[tabindex="0"]');
- check(entry?.dataset.date==='2026-12-15','The calendar has an enabled day in the Tab order');
- check(entry===document.activeElement && !save.disabled,'The calendar has focus and Save can retry');
+ check(entry?.dataset.date==='2026-12-16','The calendar selects tomorrow after the draft expires');
+ check(entry===document.activeElement && !save.disabled,'The calendar focuses the date and enables Save');
  document.activeElement.dispatchEvent(new KeyboardEvent('keydown',{key:'Escape',bubbles:true}));
  now=Date.parse('2027-01-02T13:00:00Z');
  toggle.click();
+ form.querySelector('[data-later-choose]').click();
  const nextMonth=grid.querySelector('button:not(:disabled)[tabindex="0"]');
- check(nextMonth?.dataset.date==='2027-01-02','The calendar opens on an enabled month');
+ check(nextMonth?.dataset.date==='2027-01-03','The calendar opens on tomorrow in the new month');
  if(nextMonth){
   nextMonth.dispatchEvent(new KeyboardEvent('keydown',{key:'ArrowRight',bubbles:true,cancelable:true}));
-  check(document.activeElement.dataset.date==='2027-01-03','ArrowRight selects a new date from the focused day');
+  check(document.activeElement.dataset.date==='2027-01-04','ArrowRight selects a new date from the focused day');
   save.click();
-  check(requests[1]?.get('request')!==first.get('request') && requests[1]?.get('until')?.startsWith('2027-01-03'),
+  check(requests[2]?.get('request')!==first.get('request') && requests[2]?.get('until')?.startsWith('2027-01-04'),
    'The new date sends a new request');
-  if(requests.length===2){finishPost({parked:'true'});await flush();}
+  if(requests.length===3){finishPost({parked:'true'});await flush();}
  }
 """)
 
@@ -3394,11 +3684,11 @@ window.fetch=async(_path,options={})=>{
         self.browser_action_sequence(r"""
  Date.now=()=>Date.parse('2026-12-02T13:00:00Z');
  form.querySelector('[data-later-toggle]').click();
- const time=form.querySelector('[data-later-time]');
+ form.querySelector('[data-later-choose]').click();
+ const save=form.querySelector('[value="park"]');
  show('working');
- time.focus();
- time.dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',bubbles:true,cancelable:true}));
- check(requests.length===1 && row.hidden,'Enter submits Park and hides the row from Working');
+ save.focus();save.click();
+ check(requests.length===1 && row.hidden,'Save submits Park and hides the row from Working');
  finishPost({reason:'The fixture refuses Park'});
  await flush();
  const search=document.getElementById('list-search');
@@ -3412,54 +3702,25 @@ window.fetch=async(_path,options={})=>{
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
     def test_browser_reserves_a_lost_park_id_and_updates_the_saved_date_label(self) -> None:
-        item = self.add("Change the parking date")
+        item = self.add("Change the parking date", number=1)
         _ = the_list.park(MORTY.id, item.id, NOW + timedelta(days=2), source="nate")
-        with patch.object(list_page, "counts_strip", return_value=""):
-            markup = list_page.render(self.root / "reviews").decode()
-        setup = '''<script>
-const requests=[];let finishPost,losePost;
-window.fetch=async(_path,options={})=>{
- if(options.method!=='POST') throw new Error('Fixture refresh refused');
- requests.push(new URLSearchParams(options.body));
- return new Promise((resolve,reject)=>{
-  losePost=()=>reject(new Error('Fixture lost response'));
-  finishPost=result=>resolve({ok:!result.reason,status:result.reason ? 400 : 200,
-   json:async()=>({unread:'true',...result})});
- });
-};
-</script>'''
-        probe = '''<script>
-(async()=>{
- const failures=[],check=(ok,name)=>{if(!ok) failures.push(name);};
- const row=document.querySelector('[data-list-item]'),form=recordDetails(row).querySelector('form');
- const submit=action=>{
-  form.requestSubmit(form.querySelector('[value="'+action+'"]'));
-  return requests.at(-1).get('request');
- };
- const flush=()=>new Promise(resolve=>setTimeout(resolve,0));
+        self.browser_action_sequence('''
  const labels=()=>[...row.querySelectorAll('[data-label="State"] small')].map(note=>note.textContent);
- try{
-  row.querySelector('.list-toggle').click();
-  check(labels().join() === 'Parked until Nov 18 13:00 EST','The row starts with one saved time label');
-  form.elements.until.value='2026-12-03';
-  const park=submit('park');losePost();await flush();
-  check(submit('park')===park,'an exact Park retry keeps its request ID');
-  losePost();await flush();
-  check(submit('remove')!==park,'Remove gets a different ID after a lost Park response');
-  finishPost({reason:'Fixture refuses Remove'});await flush();
-  const returning=document.querySelector('[data-record-motion]')?.getAnimations({subtree:true}) ?? [];
-  for(const animation of returning) animation.finish();
-  await Promise.allSettled(returning.map(animation=>animation.finished));
-  form.elements.until.value='2026-12-04';
-  check(submit('park')!==park,'a different Park date gets a different ID');
-  finishPost({item_state:'Working',parked:'true',parked_until:'Dec 5 00:00 EST'});await flush();
-  check(labels().length===1,'a successful Park keeps one date label');
-  check(labels().join()==='Parked until Dec 5 00:00 EST','the label uses the saved date from the response');
- }catch(error){failures.push(String(error));}
- const result=document.createElement('p');result.id='probe-results';result.textContent=JSON.stringify(failures);document.body.append(result);
-})();
-</script>'''
-        self.browser_actions(markup, setup, probe)
+ check(labels().join()==='Parked until Nov 18 13:00 EST','The row starts with one saved time label');
+ form.elements.until.value='2026-12-03';
+ const park=submit('park');
+ await loseParkPost();
+ check(requests[1]?.get('request')===park.id,'The automatic Park retry keeps its request ID');
+ losePost();await flush();await finishRowMotion();
+ check(submit('remove').id!==park.id,'Remove gets a different ID after a lost Park response');
+ finishPost({reason:'Fixture refuses Remove'});await flush();
+ await finishRowMotion();
+ form.elements.until.value='2026-12-04';
+ check(submit('park').id!==park.id,'A different Park date gets a different ID');
+ finishPost({item_state:'Working',parked:'true',parked_until:'Dec 5 00:00 EST'});await flush();
+ check(labels().length===1,'A successful Park keeps one date label');
+ check(labels().join()==='Parked until Dec 5 00:00 EST','The label uses the saved date from the response');
+''', add_item=False)
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
     def test_browser_unpark_controls_layout_and_focus(self) -> None:
@@ -3507,8 +3768,7 @@ window.fetch=async(_path,options={})=>{
  finishPost(SAVED_UNPARK);await flush();
  check(row.hidden && document.activeElement===document.querySelector('#filter-show-parked'),'focus moves to Parked');
  const status=document.querySelector('[data-hidden-action-status][role="status"]');
- check(!status.hidden && status.getClientRects().length>0 && status.textContent==='Item #1 unparked.',
-       'Parked announces which item left');
+ check(!status.hidden && status.textContent==='Item #1 unparked.','Parked confirms Unpark.');
  show('all');
  row.querySelector('.list-toggle').click();
  check(status.hidden,'All shows the confirmation in the row');
@@ -3764,7 +4024,7 @@ window.fetch=async(_path,options={})=>{
 ''', reduced_motion=True, add_item=False)
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
-    def test_browser_brings_parked_filter_and_confirmation_into_view(self) -> None:
+    def test_browser_brings_parked_filter_into_view(self) -> None:
         for number in range(1, 25):
             item = self.add(f"Parked item {number}", number=number)
             _ = the_list.park(MORTY.id, item.id, NOW + timedelta(days=2), source="nate")
@@ -3795,12 +4055,12 @@ window.fetch=async(_path,options={})=>{
  const bounds=filter.getBoundingClientRect();
  const hit=document.elementFromPoint(bounds.left+bounds.width/2,bounds.top+bounds.height/2);
  const screen=JSON.stringify({innerWidth,innerHeight,scrollY,
-  focus:document.activeElement.id,top:bounds.top,statusBottom:status.getBoundingClientRect().bottom,
+  focus:document.activeElement.id,top:bounds.top,
   hit:hit?.outerHTML.slice(0,150),pageStatus:document.querySelector('[data-page-status]').getBoundingClientRect().height});
  check(row.hidden && document.activeElement===filter && withinViewport(filter) && filter.contains(hit),
        'Unpark moves focus and brings the Parked filter into view. '+screen);
  check(withinViewport(status) && status.textContent==='Item #1 unparked.',
-       'Unpark brings the confirmation into the same viewport. '+screen);
+       'The Unpark confirmation is visible. '+screen);
 '''
         for window_size in ((1440, 900), (500, 260)):
             with self.subTest(window_size=window_size):
@@ -3976,6 +4236,57 @@ observer.observe(original.parentNode,{childList:true});
         self.browser_actions(markup, setup, probe)
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
+    def test_browser_keeps_a_deadline_refresh_due_until_the_menu_closes(self) -> None:
+        root = self.root / "reviews"
+        item = self.add("Timed park", number=1)
+        initial = list_page.render(root, include_counts=False).decode()
+        deadline = NOW + timedelta(minutes=1)
+        _ = the_list.park(MORTY.id, item.id, deadline, source="nate")
+        timed = list_page.render(root, include_counts=False).decode()
+        with patch.object(time, "time", return_value=deadline.timestamp()):
+            expired = list_page.render(root, include_counts=False).decode()
+        initial = re.sub(r'data-refresh-seconds="[^"]+"', 'data-refresh-seconds="0"', initial, count=1)
+        setup = r'''<script>
+const replies=[];
+let clock=1000;
+Object.defineProperty(performance,'now',{value:()=>clock});
+window.fetch=()=>new Promise(resolve=>replies.push(resolve));
+</script>'''
+        probe = r'''<script>
+(async()=>{
+ const failures=[],check=(ok,text)=>{if(!ok) failures.push(text);};
+ const [timed,expired]=SNAPSHOTS;
+ const nextTask=()=>new Promise(resolve=>setTimeout(resolve,0));
+ const reply=(index,markup)=>replies[index]?.({ok:true,text:async()=>markup});
+ document.dispatchEvent(new Event('visibilitychange'));
+ clock+=61000;
+ reply(0,timed);
+ await nextTask();await nextTask();
+ check(replies.length===2,'A response that arrives after the deadline requests a refresh at once.');
+ if(replies.length===2){
+  const original=document.querySelector('[data-list]');
+  original.querySelector('.list-toggle').click();
+  const toggle=original.querySelector('[data-later-toggle]');
+  toggle.click();
+  check(toggle.getAttribute('aria-expanded')==='true','The Park menu opens during the request.');
+  reply(1,expired);
+  await nextTask();
+  check(original.isConnected && replies.length===2,'The List keeps the row while the menu is open.');
+  toggle.click();
+  await nextTask();
+  check(replies.length===3,'Closing the menu requests the refresh that the List owes.');
+  reply(2,expired);
+  await nextTask();
+  check(document.querySelector('[data-number="1"]').dataset.parked==='false' && replies.length===3,
+   'The List applies the expired state after one refresh on close.');
+ }
+ const result=document.createElement('p');result.id='probe-results';result.textContent=JSON.stringify(failures);
+ document.body.append(result);
+})();
+</script>'''.replace("SNAPSHOTS", json.dumps((timed, expired)).replace("</", "<\\/"))
+        self.browser_actions(initial, setup, probe, reduced_motion=True)
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
     def test_browser_retries_a_lost_tell_after_a_refused_park(self) -> None:
         self.browser_action_sequence('''
  form.elements.words.value='Tell morty once.';
@@ -4006,15 +4317,21 @@ observer.observe(original.parentNode,{childList:true});
         _ = the_list.reopen(MORTY.id, item.id, source="morty")
         reopened = json.dumps(list_page.render(root, include_counts=False).decode()).replace("</", "<\\/")
         self.browser_action_sequence('''
- form.elements.until.value='2026-12-03';
- const first=submit('park');losePost();await flush();
- await finishRowMotion();
- form.elements.until.value='2026-12-04';
- const second=submit('park');losePost();await flush();
- await finishRowMotion();
- check(first.id!==second.id,'each Park date gets its own request ID');
+ const originalParks=[];
+ for(const date of ['2026-12-03','2026-12-04']){
+  form.elements.until.value=date;
+  const original=submit('park');
+  originalParks.push(original);
+  await loseParkPost();
+  const replay=requests.at(-1);
+  check(replay.get('request')===original.id && replay.get('token')===original.token &&
+   replay.get('until')===date,'Park automatically retries the signed request for '+date);
+  losePost();await flush();await finishRowMotion();
+ }
+ const [first,second]=originalParks;
+ check(first.id!==second.id,'Each Park date gets its own request ID');
  const remove=submit('remove');
- check(remove.id!==second.id,'Remove uses its own request ID');
+ check(!originalParks.some(park=>park.id===remove.id),'Remove uses its own request ID');
  finishPost({item_state:'Closed',parked:'true',unread:'false'});await flush();
  await finishRowMotion();
  const dialog=document.getElementById('record-item-dialog');
@@ -4351,8 +4668,217 @@ observer.observe(original.parentNode,{childList:true});
                     self.assertEqual(list_page.saved_action_state(MORTY.id, item.id, status=status)["waiting_for_answer"], "false")
                     markup = list_page.render(root, include_counts=False, status=status).decode().split('<script>', 1)[0]
                     self.assertRegex(markup, r'<tbody data-list-item[^>]*data-waiting-for-answer="false"[^>]*">')
+                    sections: dict[str, str] = {
+                        match.group(1): match.group(2)
+                        for match in re.finditer(r'<section class="page-question" data-question="(Q[12])">(.*?)</section>',
+                                                 markup, re.DOTALL)}
+                    self.assertEqual(set(sections), {"Q1", "Q2"})
+                    self.assertIn("Question not delivered.", sections["Q1"])
+                    self.assertNotIn("Question not delivered.", sections["Q2"])
                     self.assertEqual(markup.count("Question not delivered."), 1)
                     self.assertNotIn('value="resend-', markup)
+
+    def test_a_malformed_job_id_keeps_sender_exclusion_until_the_lock_releases(self) -> None:
+        root = self.root / "reviews"
+        status = change_page.DeliveryStatus(root)
+        item = self.add("Keep the sender lock")
+        fields = urlencode(self.fields(item, "question", words="Which check finished?"))
+        asked = list_page.submit(root, fields, status)
+        assert isinstance(asked, list_page.ListQuestionDelivery)
+        delivery = asked.delivery
+        assert isinstance(delivery, change_page.PageQuestionSend)
+        assert isinstance(delivery.job, change_page.QuestionJob)
+        path = status.path(delivery.page, delivery.row)
+        claimed = delivery.job.record
+        lock_path = Path(cast(str, delivery.job.lock.name))
+        self.assertEqual(lock_path.name, claimed.attempt_id)
+        lock_path.with_name(path.name).touch()
+        current = the_list.load(MORTY.id, item.id)
+        reopened = change_page.DeliveryStatus(root)
+
+        def send_with_damage(_recipient: staff.StaffId, _message: str, _message_id: str
+                             ) -> tuple[send_result.ConfirmedSendOutcome, str]:
+            with status.locked():
+                sending = change_page.read_question_attempt(path)
+                assert isinstance(sending.owner, delivery_state.QuestionSendOwner)
+                change_page.publish_question_attempt(path, replace(sending, owner=replace(sending.owner, job_id="damaged")))
+            self.assertEqual(list_page.saved_action_state(MORTY.id, item.id, status=reopened)["waiting_for_answer"], "false")
+            body = list_page.render(root, include_counts=False, status=reopened).decode().split("<script>", 1)[0]
+            self.assertIn("Which check finished?", body)
+            self.assertNotIn("Question not delivered.", body)
+            self.assertNotIn('value="resend-Q1"', body)
+            change_page.recover_review_messages(reopened)
+            change_page.recover_deferred_questions(reopened)
+            list_page.deliver(list_page.submit(root, fields, reopened))
+            self.assertTrue(reopened.has_deferred_questions())
+            return question_outcome()
+
+        with (patch.object(change_page, "send_question", side_effect=send_with_damage) as send,
+              redirect_stderr(io.StringIO()), self.assertRaisesRegex(ValueError, "Invalid delivery field job_id")):
+            list_page.deliver(asked)
+        send.assert_called_once_with(MORTY.id, claimed.message, claimed.message_id)
+        with self.assertRaisesRegex(ValueError, "Invalid delivery field job_id"):
+            _ = change_page.read_question_attempt(path)
+        with patch.object(change_page, "send_question", return_value=question_outcome("skipped")) as send:
+            change_page.recover_deferred_questions(reopened)
+            change_page.recover_deferred_questions(reopened)
+            list_page.deliver(list_page.submit(root, fields, reopened))
+        send.assert_called_once_with(MORTY.id, claimed.message, claimed.message_id)
+        self.assertFalse(reopened.has_deferred_questions())
+        saved = change_page.read_question_attempt(path)
+        self.assertIs(saved.state, delivery_state.QuestionSendState.SENT)
+        self.assertEqual(saved.attempt_id, claimed.attempt_id)
+        self.assertEqual(the_list.load(MORTY.id, item.id), current)
+
+    def test_recovery_creates_a_missing_attempt_lock_for_a_damaged_job_id(self) -> None:
+        root = self.root / "reviews"
+        status = change_page.DeliveryStatus(root)
+        item = self.add("Recover without a lock file")
+        asked = list_page.submit(root, urlencode(self.fields(item, "question", words="Which check finished?")), status)
+        assert isinstance(asked, list_page.ListQuestionDelivery)
+        delivery = asked.delivery
+        assert isinstance(delivery, change_page.PageQuestionSend)
+        assert isinstance(delivery.job, change_page.QuestionJob)
+        path = status.path(delivery.page, delivery.row)
+        lock_path = Path(cast(str, delivery.job.lock.name))
+        claimed = delivery.job.record
+        assert isinstance(claimed.owner, delivery_state.QuestionSendOwner)
+        delivery.job.release()
+        lock_path.unlink()
+        with status.locked():
+            change_page.publish_question_attempt(path, replace(
+                claimed, state=delivery_state.QuestionSendState.SENDING, owner=replace(claimed.owner, job_id="damaged")))
+
+        def send_while_locked(_recipient: staff.StaffId, _message: str, _message_id: str
+                              ) -> tuple[send_result.ConfirmedSendOutcome, str]:
+            with file_lock.exclusive(lock_path, wait=False) as lock:
+                self.assertIs(lock, file_lock.LockResult.BUSY)
+            return question_outcome("skipped")
+
+        reopened = change_page.DeliveryStatus(root)
+        with patch.object(change_page, "send_question", side_effect=send_while_locked) as send:
+            change_page.recover_review_messages(reopened)
+        send.assert_called_once_with(MORTY.id, claimed.message, claimed.message_id)
+        self.assertFalse(reopened.has_deferred_questions())
+        saved = change_page.read_question_attempt(path)
+        self.assertIs(saved.state, delivery_state.QuestionSendState.SENT)
+        self.assertEqual(saved.attempt_id, claimed.attempt_id)
+
+    def test_recovery_waits_for_each_sender_lock(self) -> None:
+        root = self.root / "reviews"
+        status = change_page.DeliveryStatus(root)
+        for held in ("row", "job", "attempt"):
+            with self.subTest(held=held):
+                item = self.add(f"Recover with the {held} lock held")
+                fields = self.fields(item, "question", words="Which check finished?")
+                asked = list_page.submit(root, urlencode(fields), status)
+                assert isinstance(asked, list_page.ListQuestionDelivery)
+                delivery = asked.delivery
+                assert isinstance(delivery, change_page.PageQuestionSend)
+                assert isinstance(delivery.job, change_page.QuestionJob)
+                path = status.path(delivery.page, delivery.row)
+                attempt_lock = Path(cast(str, delivery.job.lock.name))
+                claimed = delivery.job.record
+                assert isinstance(claimed.owner, delivery_state.QuestionSendOwner)
+                old_job_id = uuid4().hex + uuid4().hex
+                sending = replace(claimed, state=delivery_state.QuestionSendState.SENDING,
+                                  owner=replace(claimed.owner, job_id=old_job_id))
+                delivery.job.release()
+                with status.locked():
+                    change_page.publish_question_attempt(path, sending)
+                locks = {"row": attempt_lock.with_name(path.name), "job": attempt_lock.with_name(old_job_id),
+                         "attempt": attempt_lock}
+
+                def send_while_locked(_recipient: staff.StaffId, _message: str, _message_id: str
+                                      ) -> tuple[send_result.ConfirmedSendOutcome, str]:
+                    for kind, candidate in locks.items():
+                        with file_lock.exclusive(candidate, wait=False) as lock:
+                            self.assertIs(lock, file_lock.LockResult.BUSY, kind)
+                    return question_outcome("skipped")
+
+                reopened = change_page.DeliveryStatus(root)
+                with patch.object(change_page, "send_question", side_effect=send_while_locked) as send:
+                    with file_lock.exclusive(locks[held]):
+                        change_page.recover_review_messages(reopened)
+                        send.assert_not_called()
+                        self.assertTrue(reopened.has_deferred_questions())
+                        self.assertEqual(change_page.read_question_attempt(path), sending)
+                    change_page.recover_deferred_questions(reopened)
+                    change_page.recover_deferred_questions(reopened)
+                send.assert_called_once_with(MORTY.id, claimed.message, claimed.message_id)
+                self.assertFalse(reopened.has_deferred_questions())
+                saved = change_page.read_question_attempt(path)
+                self.assertIs(saved.state, delivery_state.QuestionSendState.SENT)
+                self.assertEqual(saved.attempt_id, claimed.attempt_id)
+
+    def test_startup_requeues_a_question_when_a_sender_lock_cannot_open(self) -> None:
+        root = self.root / "reviews"
+        status = change_page.DeliveryStatus(root)
+        item = self.add("Recover after a lock error")
+        fields = self.fields(item, "question", words="Which check finished?")
+        asked = list_page.submit(root, urlencode(fields), status)
+        assert isinstance(asked, list_page.ListQuestionDelivery)
+        delivery = asked.delivery
+        assert isinstance(delivery, change_page.PageQuestionSend)
+        assert isinstance(delivery.job, change_page.QuestionJob)
+        path = status.path(delivery.page, delivery.row)
+        claimed = delivery.job.record
+        attempt_lock = Path(cast(str, delivery.job.lock.name))
+        delivery.job.release()
+        attempt_lock.unlink()
+        attempt_lock.mkdir()
+
+        reopened = change_page.DeliveryStatus(root)
+        with (patch.object(change_page, "send_question", return_value=question_outcome()) as send,
+              redirect_stderr(io.StringIO()) as errors):
+            change_page.recover_review_messages(reopened)
+            send.assert_not_called()
+            self.assertTrue(reopened.has_deferred_questions())
+            self.assertEqual(change_page.read_question_attempt(path), claimed)
+            with file_lock.exclusive(attempt_lock.with_name(path.name), wait=False) as lock:
+                self.assertIs(lock, file_lock.LockResult.ACQUIRED)
+            attempt_lock.rmdir()
+            change_page.recover_deferred_questions(reopened)
+        lines = errors.getvalue().splitlines()
+        self.assertEqual(len(lines), 1)
+        self.assertTrue(lines[0].startswith(f"review-links question {delivery.row}: "))
+        self.assertIn(attempt_lock.name, lines[0])
+        send.assert_called_once_with(MORTY.id, claimed.message, claimed.message_id)
+        self.assertFalse(reopened.has_deferred_questions())
+        saved = change_page.read_question_attempt(path)
+        self.assertIs(saved.state, delivery_state.QuestionSendState.SENT)
+        self.assertEqual(saved.attempt_id, claimed.attempt_id)
+
+    def test_a_new_ask_of_the_same_words_starts_an_attempt_after_a_confirmed_failure(self) -> None:
+        root = self.root / "reviews"
+        status = change_page.DeliveryStatus(root)
+        item = self.add("Ask again after a failure")
+        words = "Which check passed?"
+        fields = self.fields(item, "question", words=words)
+        first = list_page.submit(root, urlencode(fields), status)
+        assert isinstance(first, list_page.ListQuestionDelivery)
+        path = status.path(first.delivery.page, first.delivery.row)
+        with (patch.object(change_page, "send_question", return_value=question_outcome("refused", "Producer offline")),
+              patch.object(change_page, "alert_delivery_failures")):
+            list_page.deliver(first)
+        failed = change_page.read_question_attempt(path)
+        self.assertIs(failed.state, delivery_state.QuestionSendState.FAILED)
+        current = the_list.load(MORTY.id, item.id)
+        with patch.object(change_page, "send_question", return_value=question_outcome()) as send:
+            list_page.deliver(list_page.submit(root, urlencode(fields), change_page.DeliveryStatus(root)))
+        send.assert_not_called()
+        self.assertEqual(change_page.read_question_attempt(path), failed)
+        self.assertEqual(the_list.load(MORTY.id, item.id), current)
+        next_fields = self.fields(current, "question", words=words)
+        self.assertNotEqual(next_fields["request"], fields["request"])
+        with patch.object(change_page, "send_question", return_value=question_outcome()) as send:
+            list_page.deliver(list_page.submit(root, urlencode(next_fields), status))
+            list_page.deliver(list_page.submit(root, urlencode(next_fields), status))
+        send.assert_called_once_with(MORTY.id, failed.message, failed.message_id)
+        accepted = change_page.read_question_attempt(path)
+        self.assertIs(accepted.state, delivery_state.QuestionSendState.SENT)
+        self.assertNotEqual(accepted.attempt_id, failed.attempt_id)
+        self.assertEqual(the_list.load(MORTY.id, item.id).questions, current.questions)
 
     def test_recorded_question_failure_takes_priority_when_the_intent_clear_fails(self) -> None:
         root = self.root / "reviews"
@@ -4722,8 +5248,7 @@ observer.observe(original.parentNode,{childList:true});
  await flush();
  check(row.hidden && chip.dataset.filterCount==='0','The waiting item leaves Parked and its count.');
  check(document.activeElement===chip,'The Parked filter receives focus.');
- check(!status.hidden && status.textContent==='Item #1 unparked.',
-  'Show keeps the Unpark confirmation for the waiting item.');
+ check(!status.hidden && status.textContent==='Item #1 unparked.','Parked shows the Unpark confirmation.');
  location.hash=new URLSearchParams({show:'parked',item:row.dataset.key}).toString();
  await flush();
  check(!row.hidden && recordIsOpen(row) &&
@@ -4767,17 +5292,18 @@ observer.observe(original.parentNode,{childList:true});
  readback=key=>{readKey=key;return new Promise(resolve=>{finishReadback=resolve;});};
  form.elements.until.value='2026-12-03';
  const park=submit('park');
+ await loseParkPost();
+ check(requests[1]?.get('request')===park.id && readKey===undefined,'Park retries before reading the item.');
  losePost();await flush();
- check(row.hidden && readKey===row.dataset.key,'Park waits for the current item before restoring the row.');
+ check(row.hidden && readKey===row.dataset.key,'Park reads the current item after both responses are lost.');
  finishReadback({item_state:'Working',unread:'true',parked:'true',parked_until:'Dec 3 00:00 EST',park_request_saved:true});
  await flush();
  check(row.hidden,'The saved Park stays out of Working.');
  show('parked');
  check(!row.hidden && row.querySelector('[data-parked-note]').textContent==='Parked until Dec 3 00:00 EST',
   'Parked shows the saved parking time.');
- row.querySelector('.list-toggle').click();
- check(submit('park').id===park.id,'The exact Park retry uses the original request ID.');
- finishPost({item_state:'Working',parked:'true',parked_until:'Dec 3 00:00 EST'});await flush();
+ check(requests.length===2 && form.querySelector('[data-send-status]').hidden,
+  'A saved receipt confirms Park without another request or failure line.');
  row.querySelector('.list-toggle').click();
  submit('remove');losePost();await flush();
  finishReadback({item_state:'Closed',unread:'false',parked:'true',parked_until:'Dec 3 00:00 EST'});
@@ -4798,6 +5324,7 @@ observer.observe(original.parentNode,{childList:true});
  };
  const park=submit(PARK_ACTION);
  check(row.hidden,'The pending park hides the row from Working.');
+ await loseParkPost();
  losePost();await flush();
  check(readRequest===park.id,'The item read uses the original request ID.');
  const refreshed=document.querySelector('[data-number="1"]');
@@ -4820,21 +5347,31 @@ observer.observe(original.parentNode,{childList:true});
  const action=PARK_ACTION;
  const previous='Nov 17 13:00 EST';
  const until=saved && action==='park-until-delivered' ? 'delivered' : previous;
+ let readReceipt;
  readback=(key,request)=>{
   check(key===row.dataset.key && request===park.id,'The read uses the exact Park request ID.');
-  return {item_state:'Working',unread:'false',parked:'true',parked_until:until,
-   park_request_saved:saved};
+  return new Promise(resolve=>{readReceipt=()=>resolve({item_state:'Working',unread:'false',parked:'true',
+   parked_until:until,park_request_saved:saved});});
  };
  form.elements.until.value='2026-12-03';
  const park=submit(action);
  check(!isLinked(),'Park releases the link at submission.');
- losePost();await flush();
+ await loseParkPost();
+ check(requests[1]?.toString()===requests[0].toString(),'The retry sends the exact Park request.');
+ const notice=form.querySelector('[data-send-status]');
+ const above=document.querySelector('[data-hidden-action-status]');
+ finishPost({status:403,reason:'The fixture refuses the signed request.'});await flush();
+ check(readReceipt && notice.hidden && above.hidden,'A refused retry waits for the receipt before showing a failure.');
+ readReceipt?.();await flush();
  check(isLinked()===!saved,'Only a missing receipt restores the link.');
+ const visible=[...(row.hidden || row.querySelector('[data-detail]').hidden ? [] : [notice]),above]
+  .filter(status=>!status.hidden);
+ check(saved ? visible.length===0 :
+  visible.length===1 && visible[0].textContent.endsWith('Not saved: The fixture refuses the signed request.'),
+  'A refused retry shows one failure line only when the receipt is missing.');
  if(!saved){
   check(row.querySelector('[data-parked-note]').textContent==='Parked until '+previous,
    'The restored row shows the previous saved parking time.');
-  check(submit(action).id===park.id,'The restored row keeps the exact Park request ID.');
-  finishPost({reason:'Fixture refuses Park'});await flush();
  }
 '''.replace('PARK_RECEIPT', json.dumps(saved)).replace('PARK_ACTION', json.dumps(action)),
                                                  reduced_motion=True, add_item=False)
@@ -6068,7 +6605,7 @@ const change=async path=>{
   checkNeedsMe('Changing the Show filter keeps the unread item in Needs me.');
   await open('needs-me',key);
   checkNeedsMe('Reloading the open item keeps it unread in Needs me.');
-  await act('read');
+  check(await act('read')==='','Mark read saves without action status.');
   check(row().hidden && !hasDot() &&
    frame.contentDocument.getElementById('filter-show-needs-me').dataset.filterCount==='0' &&
    frame.contentDocument.querySelector('[data-list-count]').textContent==='0 of 2 items shown · 0 need you · 1 unread',
@@ -6148,6 +6685,7 @@ const change=async path=>{
             with patch.object(list_page, "counts_strip", return_value=""):
                 markup = list_page.render(self.root / "reviews").decode()
         markup = re.sub(r'data-refresh-seconds="[^"]+"', 'data-refresh-seconds="0"', markup, count=1)
+        markup = re.sub(r'data-park-retry-seconds="[^"]+"', 'data-park-retry-seconds="0"', markup, count=1)
         setup = '''<script>
 const requests=[],itemSnapshots=new Map();let finishPost,losePost,failPostBody,refreshMarkup,readback,deliveryPending;
 window.fetch=async(path,options={})=>{
@@ -6186,6 +6724,7 @@ window.fetch=async(path,options={})=>{
  const show=value=>document.querySelector('[data-filter-row="show"] [data-filter-value="'+value+'"]').click();
  const onlyUnread=(on=true)=>{const control=document.getElementById('list-unread');if(control.checked!==on) control.click();};
  const flush=()=>new Promise(resolve=>setTimeout(resolve,0));
+ const loseParkPost=async()=>{losePost();await flush();await flush();};
  const finishRowMotion=async()=>{
   const motions=document.querySelectorAll('[data-record-motion]');
   for(const motion of motions) for(const animation of motion.getAnimations({subtree:true})) animation.finish();
@@ -6227,9 +6766,9 @@ window.fetch=async(path,options={})=>{
 
     def test_delivery_notices_color_staff_names_and_keep_the_recorded_words(self) -> None:
         _ = self.add("Delivery notice")
-        cases: tuple[tuple[the_list.PageFeedback, str, tuple[str, ...]], ...] = (
-            (the_list.PageFeedback("request", "Words"), "sent to morty", ("morty",)),
-            (the_list.PageFeedback("request", "Words", "sent"), "sent to morty", ("morty",)),
+        cases: tuple[tuple[the_list.PageFeedback, str | None, tuple[str, ...]], ...] = (
+            (the_list.PageFeedback("request", "Words"), None, ()),
+            (the_list.PageFeedback("request", "Words", "sent"), None, ()),
             (the_list.PageFeedback("request", "Words", "alerted", "sdlc"), "not sent; sdlc told", ("sdlc",)),
             (the_list.PageFeedback("request", "Words", "alerted", "<unknown>"), "not sent; <unknown> told", ()),
             (the_list.PageFeedback("request", "Words", "alerted"), "not sent; no showrunner for alert", ()),
@@ -6241,6 +6780,9 @@ window.fetch=async(path,options={})=>{
                 body = list_page.render(self.root / "reviews").decode()
                 cell = body.split('<td data-label="Update">', 1)[1].split('</td>', 1)[0]
                 notice = ElementTree.fromstring('<root>' + cell + '</root>').find('small')
+                if text is None:
+                    self.assertIsNone(notice)
+                    continue
                 assert notice is not None
                 self.assertEqual(''.join(notice.itertext()), text + ", 13:00 EST")
                 self.assertEqual(tuple(span.text for span in notice.findall('span')), colored)
@@ -6274,7 +6816,8 @@ window.fetch=async(path,options={})=>{
                     if action == "remove":
                         self.assertNotIn(f'data-key="{MORTY.id}/{item.id}"', body)
                     else:
-                        self.assertIn("sent to morty, 13:00 EST", without_role_colors(body))
+                        update = body.split('<td data-label="Update">', 1)[1].split('</td>', 1)[0]
+                        self.assertNotIn('<small>', update)
                         self.assertIn('data-feedback-form', body)
                         log = body.split('<ol class="list-log">', 1)[1].split("</ol>", 1)[0]
                         self.assertIn("Feedback for morty", log)
@@ -6285,6 +6828,12 @@ window.fetch=async(path,options={})=>{
                     expected = "List page: nate's words for item 106\n" + words if action == "tell" else words
                     self.assertEqual(send.call_args.args[2], expected)
                     item = the_list.load(MORTY.id, item.id)
+                    if action != "remove":
+                        body = list_page.render(root).decode()
+                        update = body.split('<td data-label="Update">', 1)[1].split('</td>', 1)[0]
+                        self.assertNotIn('<small>', update)
+                        log = body.split('<ol class="list-log">', 1)[1].split("</ol>", 1)[0]
+                        self.assertIn("Feedback sent to morty", log)
                     before = send.call_count, item.log
                     list_page.deliver(list_page.submit(root, urlencode(fields)))
                     self.assertEqual((send.call_count, the_list.load(MORTY.id, item.id).log), before)
@@ -6293,7 +6842,6 @@ window.fetch=async(path,options={})=>{
             self.assertEqual((item.title, item.owner, item.next_step), (initial.title, initial.owner, initial.next_step))
             _ = the_list.reopen(MORTY.id, item.id, source="morty")
             _ = the_list.update(MORTY.id, item.id, {"latest_status": "Morty acts."}, source="morty")
-            self.assertNotIn("<small>sent to morty,", without_role_colors(list_page.render(root).decode()))
             good = self.fields(item, "tell", words="Keep it.")
             for body in (urlencode({**good, "token": "bad"}), urlencode(good) + '&id=L2',
                          urlencode({**good, "words": ""}), urlencode({**good, "words": " \t\n "}),
@@ -6584,7 +7132,7 @@ window.fetch=async(_path,options={})=>{
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
     def test_shared_page_status_uses_the_real_list_loader(self) -> None:
-        _ = self.fixture_items()
+        _ = self.add("Check the List loader")
 
         def screenshot(arguments: list[str], **_options: object) -> subprocess.CompletedProcess[str]:
             path = Path(arguments[arguments.index("--screenshot") + 1])
@@ -6592,7 +7140,7 @@ window.fetch=async(_path,options={})=>{
             return self.firefox_view(arguments[-1], path, int(width), int(height))
 
         with patch("scripts.review_links.test_page_frame.subprocess", SimpleNamespace(run=screenshot)):
-            assert_status_states(self, list_page.render(self.root / "reviews").decode(), 15)
+            assert_status_states(self, list_page.render(self.root / "reviews", include_counts=False).decode(), 15)
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
     def test_browser_sort_filters_hash_refresh_open_rows_and_phone_cards(self) -> None:
@@ -6669,9 +7217,9 @@ check(innerWidth>620 ? words.top<producerBox.bottom && words.left>=producerBox.r
  words.top>=producerBox.bottom,'The words box sits beside Producer on desktop and wraps below it on a phone.');
 const allChips=rows.slice(0,2).map(row=>row.querySelector('[data-filter-value="all"]'));
 const staffChips=rows.slice(0,2).map(row=>row.querySelector('[data-filter-value="staff:all"]'));
-check(allChips.every(chip=>chip.textContent==='All16') && staffChips.every(chip=>chip?.textContent==='all1'),
+check(allChips.every(chip=>chip.textContent==='All 16') && staffChips.every(chip=>chip?.textContent==='all 1'),
  'Each staff row has distinct All and all chips with separate counts.');
-check(ownerChips[2].textContent==='builds1' && ownerChips[3].textContent==='builds-support1',
+check(ownerChips[2].textContent==='builds 1' && ownerChips[3].textContent==='builds-support 1',
  'The owner chips omit the suffix and sort by the displayed name.');
 const matchesAllStaff=()=>[...document.querySelectorAll('[data-list-item]:not([hidden])')].map(row=>row.dataset.number).join()==='13';
 staffChips.forEach(chip=>chip.click());
@@ -6707,7 +7255,7 @@ for(const [number,label] of [['1','builds'],['2','-unit']]){
  const row=document.querySelector('[data-number="'+number+'"]'),id=row.dataset.owner;
  for(const name of ['owner','producer']){
   const chip=document.querySelector('[data-filter-row="'+name+'"] [data-filter-value="staff:'+id+'"]');
-  if(chip.textContent!==label+'1') failures.push('The '+name+' chip shows '+label+' and its count.');
+  if(chip.textContent!==label+' 1') failures.push('The '+name+' chip shows '+label+' and its count.');
   chip.click();
  }
  const place=new URLSearchParams(location.hash.slice(1));
@@ -6904,7 +7452,7 @@ try{
   return .2126*r+.7152*g+.0722*b;
  };
  show('working');select('owner',OWNER);select('producer',MORTY);
- check(pressed('owner').textContent==='sdlc1' && pressed('producer').textContent==='morty1',
+ check(pressed('owner').textContent==='sdlc 1' && pressed('producer').textContent==='morty 1',
   'The selected staff chips show the names and counts.');
  for(const themeName of ['light','dark']){
   document.documentElement.dataset.theme=themeName;
@@ -7059,6 +7607,7 @@ try{
   check(form.dataset.sending && !form.querySelector('[data-send-status]').textContent,
    'The pending action disables submission without a status message: '+action);
   await until(()=>!form.dataset.sending,'the '+action+' response');
+  check(!form.querySelector('[data-send-status]').textContent,'The saved action shows no status text.');
   check(posts.at(-1).get('action')===action && posts.at(-1).get('id')==='L106','signed feedback '+action);
   check(posts.at(-1).get('token').length===64,'the form carries its token');
   check(form.elements.request.value!==requestIds.at(-1),'success renews the request without refresh');

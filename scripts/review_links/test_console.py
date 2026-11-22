@@ -370,7 +370,7 @@ try{
  check(panel.getBoundingClientRect().right<=innerWidth && panel.getBoundingClientRect().left>=0,'the panel fits the viewport');
  check(document.documentElement.scrollWidth===innerWidth,'the shell has no horizontal overflow');
  const copy=panel.querySelector('[data-copy-code]');copy.focus();copy.click();await flush();
- check(copied==='rebuild' && copy.getAttribute('aria-label')==='Copied','Copy writes the command');
+ check(copied==='rebuild' && !copy.querySelector('[data-copied-icon]').hasAttribute('hidden'),'Copy writes the command and shows a check');
  const code=panel.querySelector('code'),selection=getSelection(),range=document.createRange();
  range.selectNodeContents(code);selection.removeAllRanges();selection.addRange(range);
  mode='good';dispatchEvent(new Event('focus'));await flush();
@@ -379,7 +379,7 @@ try{
  check(document.activeElement===copy && selection.toString()==='rebuild' && code.textContent==='rebuild','changed entries wait for the focused selection');
  selection.removeAllRanges();trigger.focus();await flush();
  check(panel.querySelector('code').textContent==='rebuild --new','released commands receive the pending refresh');
- const note=panel.querySelector('.panel-note');
+ const note=panel.querySelector('[data-for-you-summary]');
  const crossCode=panel.querySelector('code');
  selection.setBaseAndExtent(note.firstChild,0,crossCode.firstChild,crossCode.textContent.length);
  const selected=selection.toString();
@@ -400,7 +400,7 @@ try{
    selection.anchorNode===start && selection.focusNode===end,result+' preserves the panel count and command selection');
   selection.removeAllRanges();await flush();
   check(heading.textContent===count && panel.querySelectorAll('article').length===0 &&
-   note.textContent===(result==='zero'?'No actions required.':'The action count is unavailable.'),
+   panel.querySelector('.panel-note:not([hidden])').textContent===(result==='zero'?'No actions required.':'The action count is unavailable.'),
    result+' updates the panel after selection ends');
  }
  mode='good';dispatchEvent(new Event('focus'));await flush();
@@ -513,7 +513,8 @@ try{
   const fixture=document.createElement('iframe');
   fixture.style.cssText='position:fixed;left:0;top:0;width:716px;height:800px;border:0';
   const bookmark='/console/?page=investigations&at.investigations='+
-   encodeURIComponent('/console/investigations.html?show=all#showrunner=builds&q=shard');
+   encodeURIComponent('/console/investigations.html?show=all&sort=Age&dir=asc'+
+    '#state=open&showrunner=builds&q=shard&sort=Owner&dir=desc');
   fixture.src=bookmark;
   await new Promise(resolve=>{fixture.addEventListener('load',resolve,{once:true});document.body.append(fixture);});
   const layout=fixture.contentDocument;
@@ -523,6 +524,8 @@ try{
   check(opened.searchParams.get('page')==='review' && filters.get('type')==='investigations' &&
    filters.get('show')==='all' && filters.get('source-owner')==='builds' && filters.get('q')==='shard',
    'the legacy Console bookmark opens the combined filter and preserves its filters');
+  check(filters.get('sort')==='Owner' && filters.get('dir')==='desc',
+   'The legacy tab uses the sort and direction from the fragment.');
   const sidebar=layout.querySelector('.shell'),toggle=layout.querySelector('#nav-toggle');
   const box=layout.querySelector('#action-popover');
   const button=layout.querySelector('.for-you-slot button');

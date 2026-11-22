@@ -731,7 +731,8 @@ def render() -> str:
                          "pageUrlLength": MAX_PAGE_URL_LENGTH})
     body = f'''
    <fieldset><legend>Type</legend><div class="new-item-chips">{chips}</div></fieldset>
-   <fieldset><legend>To</legend><p data-recipients-status role="status" hidden></p>
+   <fieldset><legend>To</legend><p data-recipients-loading role="status" hidden>Loading recipients…</p>
+    <p data-recipients-status role="status" hidden></p>
     <div class="new-item-chips" data-recipients></div>
    </fieldset>
    <textarea name="words" rows="4" maxlength="{MAX_WORDS_LENGTH}" aria-label="Your words"
@@ -824,7 +825,7 @@ STYLE = '''
 #review-new-item .new-item-chip[data-kind="investigation"] { --item-icon: #1cc1b5; }
 #review-new-item .new-item-chip[data-kind="bug"] { --item-icon: #ed876b; }
 #review-new-item .new-item-chip input:not(:checked) + span svg { color: var(--item-icon); }
-#review-new-item [data-recipients-status] { margin: 0; color: var(--ink-2, #c3c2b7); }
+#review-new-item :is([data-recipients-status], [data-recipients-loading]) { margin: 0; color: var(--ink-2, #c3c2b7); }
 #review-new-item textarea {
  display: block; width: 100%; min-width: 0; margin: 0; padding: 10px 12px; resize: vertical;
  border: 1px solid var(--line, #34332f); border-radius: 8px;
@@ -888,7 +889,7 @@ STYLE = '''
 '''
 
 
-SCRIPT = r'''(() => {
+SCRIPT = page_frame.ACTION_STATUS_SCRIPT + r'''(() => {
  const endpoint = '/console/review/new-item';
  const limits = __LIMITS__;
  const dialog = document.querySelector('#review-new-item');
@@ -897,6 +898,7 @@ SCRIPT = r'''(() => {
  const form = dialog.querySelector('form'), body = dialog.querySelector('.new-item-body');
  const recipientChips = dialog.querySelector('[data-recipients]');
  const recipientStatus = dialog.querySelector('[data-recipients-status]');
+ const recipientLoading = dialog.querySelector('[data-recipients-loading]');
  const words = form.elements.words, previews = dialog.querySelector('[data-previews]');
  const includePage = form.elements.include_page, sentDetails = dialog.querySelector('[data-sent-details]');
  const bugStateBox = dialog.querySelector('[data-bug-page-state]');
@@ -927,8 +929,7 @@ SCRIPT = r'''(() => {
  }
 
  function setError(reason) {
-  error.textContent = reason;
-  error.hidden = !reason;
+  showActionFailure(error, reason);
  }
 
  function updateSend() {
@@ -956,10 +957,9 @@ SCRIPT = r'''(() => {
    chip.append(input, face);
    recipientChips.append(chip);
   }
-  recipientStatus.textContent = selectedRecipient === null
+  showActionFailure(recipientStatus, selectedRecipient === null
    ? 'The recipient you chose is not available. Choose a recipient.'
-   : available.length ? '' : 'No recipients are available.';
-  recipientStatus.hidden = !recipientStatus.textContent;
+   : available.length ? '' : 'No recipients are available.');
  }
 
  function editDraft(event) {
@@ -997,11 +997,11 @@ SCRIPT = r'''(() => {
   event.preventDefault();
   const total = [...images.map(image => image.file), ...files].reduce((sum, file) => sum + file.size, 0);
   if (files.some(file => !limits.types.includes(file.type))) {
-   setError('Paste PNG, JPEG, GIF or WebP images.'); return;
+   showActionFailure(error, 'Paste PNG, JPEG, GIF or WebP images.'); return;
   }
   if (images.length + files.length > limits.images || total > limits.totalImageBytes ||
       files.some(file => !file.size || file.size > limits.imageBytes)) {
-   setError('Paste up to four images, at most 5 MiB each and 12 MiB total.'); return;
+   showActionFailure(error, 'Paste up to four images, at most 5 MiB each and 12 MiB total.'); return;
   }
   addImagePreviews(files);
   editDraft();
@@ -1171,18 +1171,18 @@ SCRIPT = r'''(() => {
 
  function collectPageContext() {
   const filters = [];
-  for (const chip of document.querySelectorAll('[data-type-chip],[data-show-chip],[data-owner-chip],[data-filter-value]')) {
+  for (const chip of document.querySelectorAll('[data-filter-row] [data-filter-value]')) {
    if (chip.getAttribute('aria-pressed') !== 'true' || !visible(chip)) continue;
    const group = chip.closest('[role="group"]')?.getAttribute('aria-label');
    if (!group) continue;
    const label = chip.cloneNode(true);
    label.querySelector('b')?.remove();
-   filters.push((group === 'Show' ? 'State' : group) + ' ' + clip(label.textContent));
+   filters.push(group + ' ' + clip(label.textContent));
   }
   const search = document.querySelector('#list-search,[data-filter-words]');
   if (search?.value && visible(search)) filters.push('Search ' + clip(search.value));
   const notices = new Set();
-  const selector = '[data-review-source-notices] li,[data-review-notice],[data-missing-item],.notice,' +
+  const selector = '[data-review-source-notices] li,[data-review-notice],[data-hidden-action-status],[data-missing-item],.notice,' +
                    '[role="alert"],[data-page-status][data-state="Failed"] [data-status-reason]';
   for (const element of document.querySelectorAll(selector)) {
    if (!visible(element)) continue;
@@ -1416,8 +1416,8 @@ SCRIPT = r'''(() => {
    setError('');
    form.elements.kind.value = 'bug';
   }
-  recipientStatus.textContent = 'Loading recipients…';
-  recipientStatus.hidden = false;
+  showActionFailure(recipientStatus);
+  recipientLoading.hidden = false;
   showBugPage();
   showSentDetails();
   updateSend();
@@ -1435,7 +1435,9 @@ SCRIPT = r'''(() => {
    startCapture();
    showSentDetails();
   } catch (failure) {
-   if (!controller.signal.aborted) recipientStatus.textContent = failure.message;
+   if (!controller.signal.aborted) showActionFailure(recipientStatus, failure.message);
+  } finally {
+   if (!controller.signal.aborted) recipientLoading.hidden = true;
   }
  }
 

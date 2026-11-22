@@ -50,7 +50,6 @@ from scripts.review_links.review_link import private_name
 from scripts.statusline import rebuild_row
 from scripts.whoami import usage_store
 
-BRANCHES_DELETING = "Deleting these branches now. The result comes by message."
 # A restart passes the listening socket to the new process in this variable.
 LISTEN_FD = "REVIEW_LINKS_LISTEN_FD"
 # Allow page state and rows in addition to the existing words and image budget.
@@ -980,9 +979,9 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                         include_done = view is review_page.ReviewBodyView.CARD or fields.get('saved') == ['1']
                         content = (snapshot.linked_card(root, key, view=view) if include_done else snapshot.body(key))
                     except LookupError as error:
-                        message = html.escape(str(error))
-                        content = (change_page.document(f'<p role="status">{message}</p>', 'Review card')
-                                   if view is review_page.ReviewBodyView.CARD else message.encode())
+                        message = str(error)
+                        content = (change_page.document(page_frame.action_failure("review-card-failure", message), 'Review card')
+                                   if view is review_page.ReviewBodyView.CARD else html.escape(message).encode())
                         self.review_response(content, 'text/html; charset=utf-8', version=snapshot.version, status=404)
                     else:
                         self.review_response(content, 'text/html; charset=utf-8', version=snapshot.version)
@@ -996,12 +995,15 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                     self.review_response(response.body, 'application/json; charset=utf-8', response.gzip_body)
                     return None
                 else:
-                    content = snapshot.render(show=fields.get('show',['open'])[0])
+                    filters = parse_qs(route.query, keep_blank_values=True)
+                    show = filters.get('show', filters.get('state', ['open']))[0]
+                    kind = filters.get('type', [''])[0]
+                    content = snapshot.render(show=show or 'open', kind=kind)
             except (OSError, ValueError) as error:
                 print(f"review-links review: {error}", file=sys.stderr)
                 self.html_response(503, change_page.document("<p>The Review page is not available.</p>"))
                 return None
-            prepared = snapshot.page_gzip if fields.get('show',['open'])[0]=='open' else b''
+            prepared = snapshot.page_gzip if content is snapshot.page else b''
             owned = owned_document(content, "review")
             if owned is not content or not prepared:
                 prepared = _compressed_review_shell(owned) if accepts_gzip(self.headers.get("Accept-Encoding", "")) else b""
@@ -1021,7 +1023,7 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                     live = server.mode is ServerMode.LIVE
                     reviews = server.list_review_records()
                     content = list_page.render(root, include_counts=live, defer_counts=True,
-                                               status=server.delivery_status,
+                                               status=server.delivery_status, query=route.query,
                                                review_records=(list_page.LinkedReviewRead.AFTER_RENDER
                                                                if live and reviews is list_page.LinkedReviewRead.FROM_DISK
                                                                else reviews))
@@ -1054,20 +1056,15 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         except FileNotFoundError:
             pass
         except branch_page.PageSubmitted:
-            self.html_response(200, change_page.document(f"<p>{branch_page.SUBMITTED}</p>"))
+            self.html_response(200, branch_page.empty_page())
             return None
         except (OSError, ValueError) as error:
             print(f"review-links branches: {error}", file=sys.stderr)
-            self.html_response(503, change_page.document("<p>This branch page is not available.</p>"))
+            self.html_response(503, branch_page.unavailable_page())
             return None
         else:
-            with server.branch_deletions_lock:
-                if branches.folder in server.branch_deletions:
-                    self.html_response(200, change_page.document(f"<p>{BRANCHES_DELETING}</p>"))
-                    return None
             with server.staff_read_scope():
-                content = branch_page.render(branches)
-            self.html_response(200, content)
+                self.branch_response(branches)
             return None
         try:
             change_browser.rebuilds_at(root, self.path)
@@ -1289,18 +1286,18 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             self.disks_measure_post()
             return
         try:
-            branches = branch_page.page_at(server.root, self.path)
+            _ = branch_page.page_at(server.root, self.path)
         except FileNotFoundError:
             pass
         except branch_page.PageSubmitted:
-            self.html_response(200, change_page.document(f"<p>{branch_page.SUBMITTED}</p>"))
+            self.html_response(200, branch_page.empty_page())
             return
         except (OSError, ValueError) as error:
             print(f"review-links branches: {error}", file=sys.stderr)
-            self.html_response(404, change_page.document("<p>This branch page is not available.</p>"))
+            self.html_response(404, branch_page.unavailable_page())
             return
         else:
-            self._write_post(partial(self.delete_branches, branches))
+            self._write_post(self.delete_branches)
             return
         try:
             browser = change_browser.page_at(server.root, self.path)
@@ -1366,16 +1363,28 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             except OSError as error:
                 print(f"review-links delivery status: {error}", file=sys.stderr)
 
-    def delete_branches(self, page: branch_page.BranchPage) -> None:
+    def branch_response(self, page: branch_page.BranchPage, *, status: int = 200, failure: str = "") -> None:
+        action = f"/{page.folder.name}/{branch_page.PAGE_NAME}"
+        self.html_response(status, branch_page.render(page, failure=failure, action=action))
+
+    def delete_branches(self) -> None:
         server = cast(ReviewLinksServer, self.server)
-        with server.branch_deletions_lock:
-            if page.folder in server.branch_deletions:
-                self.html_response(200, change_page.document(f"<p>{BRANCHES_DELETING}</p>"))
-                return
-            if (page.folder / branch_page.USED).exists():
-                self.html_response(200, change_page.document(f"<p>{branch_page.SUBMITTED}</p>"))
-                return
-            server.branch_deletions.add(page.folder)
+        try:
+            with server.branch_deletions_lock:
+                page = branch_page.page_at(server.root, self.path)
+                active = page.folder in server.branch_deletions
+                if not active:
+                    server.branch_deletions.add(page.folder)
+        except branch_page.PageSubmitted:
+            self.html_response(200, branch_page.empty_page())
+            return
+        except (OSError, ValueError) as error:
+            print(f"review-links branches: {error}", file=sys.stderr)
+            self.html_response(503, branch_page.unavailable_page())
+            return
+        if active:
+            self.branch_response(page, status=409, failure="A branch deletion is already in progress.")
+            return
         try:
             self.run_branch_deletion(page)
         finally:
@@ -1390,22 +1399,21 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             body = self.rfile.read(length).decode("utf-8")
             deletion = branch_page.submit(page, body)
         except ValueError as error:
-            self.html_response(400, change_page.document(f"<p>{html.escape(str(error))}</p>"))
+            self.branch_response(page, status=400, failure=str(error))
             return
         except OSError as error:
             print(f"review-links branch delete: {error}", file=sys.stderr)
-            self.html_response(503, change_page.document("<p>The request could not be read. No branches were deleted.</p>"))
+            self.branch_response(page, status=503, failure="The branch request could not be read.")
             return
-        notice = (f"Deleting {len(deletion.selected)} branches. The result and a new link go to "
-                  + f"{deletion.publisher_name} by message.")
+        deleted, failure = branch_page.finish_deletion(deletion)
+        server = cast(ReviewLinksServer, self.server)
         try:
-            self.html_response(200, change_page.document(f"<p>{html.escape(notice)}</p>"))
-            self.wfile.flush()
-        finally:
-            try:
-                branch_page.deliver(deletion)
-            except (OSError, RuntimeError, subprocess.SubprocessError) as error:
-                print(f"review-links branch delivery: {error}", file=sys.stderr)
+            remaining = branch_page.page_at(server.root, self.path)
+        except (OSError, ValueError) as error:
+            print(f"review-links branch results: {error}", file=sys.stderr)
+            self.html_response(503, branch_page.unavailable_page())
+            return
+        self.branch_response(branch_page.without_branches(remaining, deleted), failure=failure)
 
     def browser_answer(self, browser: change_browser.ReviewBrowser) -> None:
         server = cast(ReviewLinksServer, self.server)

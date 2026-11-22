@@ -196,6 +196,7 @@ async function sendSaved() {
          'Reopen keeps the failed draft and its error.');
    check((await sendSaved()).detail.id === 'I1', 'The event reports the saved item ID.');
    check(closeToLauncher(), 'Done closes the confirmation and returns focus.');
+   check(error.hidden && !error.textContent, 'A successful Send shows no failure.');
 
    await open({kind:'question'});
    check(!textarea.value && dialog.querySelector('[data-previews]').hidden, 'Reopen clears the sent draft.');
@@ -613,6 +614,9 @@ async function sendSaved() {
      return json({token:'', page_owner:'list-staff', recipients:[{id:'list-staff',name:'morty'}],
                   send_disabled:'Sending is off on a practice List.'});
     }
+    if (url === '/console/review/new-item?page=accounts') {
+     return json({error:'The recipient service is unavailable.'}, 503);
+    }
     if (url === '/console/review/new-item' && options?.method === 'POST') {
      ownerPosts.push(JSON.parse(options.body));
      return json({});
@@ -629,6 +633,14 @@ async function sendSaved() {
    check(send.disabled && checkbox.closest('label').hidden, 'The practice dialog disables Send and hides capture.');
    send.click();
    check(ownerPosts.length === beforePractice, 'The practice dialog makes no POST.');
+   dialog.querySelector('[data-cancel]').click();
+   await open({page:'accounts',kind:'question'});
+   check(notice.hidden && !notice.textContent, 'The next dialog clears the previous refusal.');
+   const recipientFailure = dialog.querySelector('[data-recipients-status]');
+   check(!recipientFailure.hidden && recipientFailure.textContent === 'The recipient service is unavailable.',
+         'The recipient request failure shows its reason.');
+   check(dialog.querySelector('[data-recipients-loading]').hidden && send.disabled,
+         'A failed request clears loading and leaves Send disabled.');
    dialog.querySelector('[data-cancel]').click();
    window.fetch = originalFetch;
   }
@@ -791,7 +803,7 @@ const send = async () => {
         'The Bug dialog lists the page facts with the evidence it sends.');
   check(dialog.querySelector('[data-kind="proposal"]').getClientRects().length > 0,
         'The owner dialog displays Proposal.');
-  check(state.textContent.includes('Type All · State Open · Owner builds'), 'The dialog shows the selected filters.');
+  check(state.textContent.includes('Type All · Show Open · Owner builds'), 'The dialog shows the selected filters.');
   const address = term('Address');
   check(address?.nextElementSibling.textContent === location.href, 'The Address row shows the full address.');
   check(state.querySelector('[data-visible-text]').textContent === 'Page data and visible text',
@@ -929,9 +941,9 @@ def bug_fixture_page(*, photo: bool = False) -> bytes:
             '<main><div class="page-owner" data-page-owner="review"><span>sdlc</span>'
             f'<button data-owner-new aria-label="New item">{page_frame.icon_svg("message-circle-question")}</button></div>'
             '<h1>Review</h1><p data-page-status data-render-seconds="2.40">Live · render 2.40 s</p>'
-            '<div role="group" aria-label="Type"><button data-type-chip="" aria-pressed="true">All <b>2</b></button></div>'
-            '<div role="group" aria-label="Show"><button data-show-chip="open" aria-pressed="true">Open</button></div>'
-            '<div role="group" aria-label="Owner"><button data-owner-chip="builds" aria-pressed="true">builds</button></div>'
+            '<div role="group" aria-label="Type" data-filter-row="type"><button data-filter-value="all" aria-pressed="true">All <b>2</b></button></div>'
+            '<div role="group" aria-label="Show" data-filter-row="show"><button data-filter-value="open" aria-pressed="true">Open</button></div>'
+            '<div role="group" aria-label="Owner" data-filter-row="owner"><button data-filter-value="staff:builds" aria-pressed="true">builds</button></div>'
             '<p class="notice">Could not load …/brain.</p></main>'
             f'{new_item_dialog.render()}<script>{probe}</script></body></html>').encode()
 
