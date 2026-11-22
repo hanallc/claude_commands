@@ -11,47 +11,41 @@ The guard permits only original worktrees, the external upstream clone, and this
 The CLI converts its flags into these policies.
 
 Staged copies use a private source index and a synthetic commit without changing source refs.
-Each gate takes one detached repository slot through `build_slots.take_slot()`.
-The machine and repository select the pool; the owner does not select its path.
-The caller holds the slot lease through preparation, execution, and result publication.
-The lease keeps the staff id in `unit` and `gate` in `work`; `purpose` names the gated source revision's subject, including merge gates.
-A `<kind>(<slug>): phase <N> — <title>` subject gives `gate · <slug> phase <N> · <title>`; other subjects give `gate · <subject>`, and unreadable subjects give `gate`.
-Identical nested proofs reuse their held slot.
-Other revisions take another free slot or wait in the build queue.
-The configured `slots.wait_seconds` limits that wait.
-The Mac uses a finite kernel-lock wait because it has no admission service.
+Local gates take a detached numbered copy through `build_slots.take_copy()`.
+The repo word and unit select the parent folder under the host's build root.
+`copies.standing()` uses the caller's staff unit name when it finds the staff row.
+The maker takes the lowest free existing number or creates the smallest missing number.
+An identical nested committed proof can reuse its held copy.
+A run can still wait for normal build admission.
+The AWS gate uses its separate slot path.
 
-Acquisition rescues source work before reset.
-Git resets changed files and retains unchanged file times.
-Default final Cargo output stays under the slot's `target/`.
-Acquisition replaces a target symlink with a directory inside the slot.
-Each slot uses its own Git `info/exclude` to hide `target/` from status.
-`CARGO_BUILD_BUILD_DIR` defaults to the slot's separate Cargo directory.
-Explicit caller output settings remain unchanged.
-Nested slots replace the enclosing slot's default directory with their own default.
-This includes a slot directory inherited from an outer gate or slot command in another process.
-An acquisition above its configured size limit deletes generated output once.
-A failed rescue retains the source and output.
-A damaged index is saved as `.rescue-index-*` with source edits in the rescue commit.
-Recovery rebuilds the index before reset.
-A failed rescue restores the damaged index.
-Incomplete slot recovery rescues linked worktrees before deletion.
-The allocator takes the source lock only to create or repair a slot checkout.
-Recovery retains a repository with a different object store.
-Acquisition removes a stale worktree index lock under the slot lease.
-Rust release trials retain Cargo mend output under `target/mend-target`.
-Slot preparation failures raise `CopyError` with command details.
+The caller holds the copy lease through preparation and execution.
+The lease records the source checkout, commit, Git directory identities, and holder.
+Python callers pass the lock descriptor and its environment setting to build and test children.
+The copy becomes free when the kernel lock is free.
 A lease release failure after use raises `PostUseError` and retains the caller error.
 
-`workspace()` keeps a named editable checkout under `roots.workspace`.
-The maker creates its folder, and the caller holds its lease during use.
-Edits and the selected branch remain between uses.
+The maker rescues source work before Git resets the copy to the requested commit.
+Git retains the file times of unchanged files.
+The copy keeps a real `target/` folder and excludes it from Git status.
+The lease environment sets both `CARGO_TARGET_DIR` and `CARGO_BUILD_BUILD_DIR` to that folder.
+A nested copy uses its own Cargo output.
+The maker keeps Cargo output for the next use.
+A failed rescue retains the source and output.
+Recovery moves a damaged index to `.rescue-index-*` while it rebuilds the index and rescues source edits.
+Recovery restores the damaged index if the rescue fails.
+The maker removes a stale worktree index lock under the copy lock.
+Rust release trials retain Cargo mend output under `target/mend-target`.
+Copy preparation failures report the command details.
+
+Use `worktrees.py make <repo> <unit> <short-name>` for a new editable checkout.
+`workspace()` can resume an existing legacy editable copy and hold its lease.
+The resumed workspace retains its edits and branch between uses.
 Removal rescues work under the removal lease and retains the rescue in the source repository.
 The rescue includes clean local branches, tags, and every stash reflog entry.
 When no local source remains, removal exports the rescue into a sibling bare repository named `<workspace-root>-rescues.git`.
 Removal verifies the exported rescue before it deletes the workspace.
-Python callers pass slot lease descriptors to their build and test children.
-`clone()` keeps its task-owned return-a-path API and uses the maker outside the gate root.
+`clone()` keeps its task-owned return-a-path API and uses the maker outside the numbered copy root.
 Its Git children inherit the destination lease and busy lock.
 The saved-work check trusts cached remote-tracking refs when they cover all local commits.
 Otherwise, removal runs `git ls-remote` in the clone once per named remote.
@@ -112,15 +106,16 @@ Recovery leaves the files if the clone is already absent when recovery starts.
 
 The borrow check keeps sources with recorded borrowers or unreadable copy records.
 It checks the copy folders in the registry and the adopted copies in the holds file.
+It also checks numbered copy source records before it removes a Git source.
 It skips an unregistered folder if the folder's parent is directly under the copies root and contains `.git`.
 This exception applies only if the folder contains none of `.git`, `HEAD`, `objects`, or `commondir`.
 The check inspects these entries without following symbolic links.
 
-`copies.py list` reads slot leases and remote mirror rows.
-`copies.py remove` removes owned editable and remote copies; it never removes a shared slot.
-The nightly slot sweep removes old free slots.
-`gates_root()` reads the configured machine slot root without creating it.
-The configuration no longer includes the `copies.root` key.
+`copies.py list` reads numbered copy leases and remote mirror rows.
+`copies.py remove` removes owned legacy editable copies and remote mirrors.
+`gates_root()` reads the configured build root without creating it.
+The two-day sweep lists idle numbered copies with expired use stamps for manual review.
+See [Build folders](build-folders.md#numbered-copies-and-removal) for the lock and removal rules.
 
 `RemoteMirror` records the owner, repository, host, mirror path, and holder session.
 The `remote_registry` key in `config/copies.conf` selects the remote registry.

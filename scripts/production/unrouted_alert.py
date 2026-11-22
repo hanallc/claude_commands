@@ -6,6 +6,7 @@ import json
 import subprocess
 import sys
 import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import cast
 
@@ -22,7 +23,7 @@ def send_message(recipient: str, sender: str, message: str) -> None:
                 return
             case "retry":
                 raise RuntimeError(f"RETRY: {outcome.header.detail}")
-            case "skipped" | "replaced" | "failed" | "refused" | "held" | "pending":
+            case "skipped" | "replaced" | "failed" | "refused" | "held" | "pending" | "closed" | "absent":
                 pass
     raise RuntimeError(error)
 
@@ -36,15 +37,17 @@ def message_outcome(recipient: str, sender: str, message: str, *options: str
             (result.stderr or result.stdout).strip() or "message delivery failed")
 
 
-def notify(root: Path, listing: str, row: dict[str, str], reason: str, candidates: tuple[str, ...]) -> None:
+def notify(root: Path, listing: str, row: dict[str, str], reason: str, candidates: tuple[str, ...], *,
+           still_unrouted: Callable[[], bool]) -> None:
     """Try one alert without waiting for another render's lock."""
     try:
-        _notify(root, listing, row, reason, candidates)
+        _notify(root, listing, row, reason, candidates, still_unrouted)
     except (OSError, RuntimeError, subprocess.SubprocessError, conf.Unusable) as error:
         print("review-links unrouted alert: " + " ".join(str(error).splitlines()), file=sys.stderr)
 
 
-def _notify(root: Path, listing: str, row: dict[str, str], reason: str, candidates: tuple[str, ...]) -> None:
+def _notify(root: Path, listing: str, row: dict[str, str], reason: str, candidates: tuple[str, ...],
+            still_unrouted: Callable[[], bool]) -> None:
     key = hashlib.sha256(json.dumps([listing, row["#"], reason]).encode()).hexdigest()
     folder = root / ".review-link-unrouted"
     folder.mkdir(parents=True, exist_ok=True)
@@ -67,6 +70,8 @@ def _notify(root: Path, listing: str, row: dict[str, str], reason: str, candidat
         now = time.time()
         last = saved.get("last_try")
         if isinstance(last, (int, float)) and now - last < pause.value:
+            return
+        if not still_unrouted():
             return
         atomic_file.write_text_atomic(path, json.dumps({"last_try": now, "sent": False}) + "\n")
         message = "\n".join(("Change review routing needs attention", f"List: {listing}", f"Row: {row['#']}",

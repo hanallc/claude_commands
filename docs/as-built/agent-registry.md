@@ -347,6 +347,30 @@ The output names preserved pinned functions and marks inactive rows.
 Invalid argument counts print usage and return 1.
 `commands/default_models.md` relays the script output and renders resolved rows as a table.
 
+`agents set-model ROLE MODEL [EFFORT]` saves a role default and checks the role's live sessions on both hosts.
+The command never clears composer text.
+It reports each session with unsent text by name so Nate can repair it.
+This narrows spec 6a item 3.
+Herdr cannot read and clear the composer in one step.
+A clear can erase a user keystroke.
+
+The command checks the conversation and terminal immediately before reading the composer.
+If the composer is empty, the command submits the input.
+A keystroke between the check and submission can join the input.
+For Codex, the command checks new transcript entries for mixed input.
+It reads complete rollout records after the offset it saved before submission.
+The latest settings event for the selected thread must match the requested model and effort.
+After a match, the command waits one polling interval.
+It checks the conversation and terminal again, then reads the rollout again from the saved offset.
+The final read must show a match and no new user prompt.
+It reports an unconfirmed change if the evidence conflicts or is missing at the deadline.
+Codex records no command text with a settings change.
+A keystroke in the short window that Codex does not record as a user prompt is not detected.
+An example is an appended valid option such as `--speed=standard`.
+A full check needs a change inside Codex. The showrunner accepted this limit.
+For Claude, the command requires the exact prompt in the pane history.
+The command prints `100 percent` only after the default save and all required pane updates succeed.
+
 ### Consumers
 
 | Consumer | Configuration use |

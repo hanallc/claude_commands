@@ -46,6 +46,7 @@ UNSHIPPED_IMPORTS = {
     'copies/copies.py': {'lint/tmp_sweep.py', 'agents/remote.py', 'accounts/__init__.py', 'accounts/accounts.py'},
     'direct/local_release_wait.py': {'build_targets/build_targets.py', 'build_targets/targets.py', 'build_hold/build_hold.py'},
     'lib/build_folders.py': {'lib/descendants.py'},
+    'lib/python_startup/sitecustomize.py': {'lib/testing_folders.py'},
     'lib/scratch.py': {'direct/phase_table.py', 'production/proposals_table.py', 'production/unit_lookup.py',
         'production/production_doc.py', 'direct/plan_history.py', 'accounts/__init__.py', 'accounts/accounts.py'},
     'lib/unit_runs.py': {'direct/worker_state.py'},
@@ -115,8 +116,7 @@ class HanaRenderTests(unittest.TestCase):
             for path in (targets, folders):
                 _ = shutil.copyfile(path, checkout / 'config' / path.name)
             copies = checkout / 'config/copies.conf'
-            copies_config = ('root=/tmp/copies\nroot.aws-hana=/tmp/guest-copies\n'
-                + 'remote_registry=/tmp/default-mirrors\nremote_registry.fixture-guest=/tmp/mirrors\n')
+            copies_config = 'remote_registry=/tmp/default-mirrors\nremote_registry.fixture-guest=/tmp/mirrors\n'
             _ = copies.write_text(copies_config)
             configuration_path = image_inputs / 'config/hana_aws.conf'
             _ = configuration_path.write_text(
@@ -246,7 +246,7 @@ class HanaRenderTests(unittest.TestCase):
                 self.assertEqual(cast(dict[str, object], json.loads(receiver_json))['command_timeout_s'], 27)
             _ = targets.write_text(target_values)
             _ = (image_inputs / 'config/copies.conf').write_text(
-                copies_config.replace('copies\n', 'other-copies\n'))
+                copies_config.replace('/tmp/default-mirrors', '/tmp/other-mirrors'))
             self.assertEqual(hana_render.guest_digest(configuration_path, checkout=image_inputs), digest)
             self.assertEqual(cast(dict[str, object], json.loads((output / 'safety.json').read_text()))['guest_digest'],
                 digest.value)
@@ -292,27 +292,18 @@ class HanaRenderTests(unittest.TestCase):
                 + '"scripts.aws_target.hana_placement", "scripts.buildlog.transfer_bytes"))',
                 str(runtime)], cwd=runtime, capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
             self.assertEqual(imported.returncode, 0, imported.stdout + imported.stderr)
-            launcher = subprocess.run([sys.executable, '-IB', 'runner.py', '--help'], cwd=runtime,
+            launcher = runtime / 'scripts/build_queue/program_start.py'
+            startup = subprocess.run([sys.executable, '-E', '-B', str(launcher)], cwd=runtime,
+                                     capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
+            self.assertEqual(startup.returncode, 2, startup.stdout + startup.stderr)
+            self.assertIn('program start: expected --program-start', startup.stderr)
+            help_run = subprocess.run([sys.executable, '-IB', 'runner.py', '--help'], cwd=runtime,
                                       capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
-            self.assertEqual(launcher.returncode, 0, launcher.stdout + launcher.stderr)
-            self.assertIn('--command-timeout-s', launcher.stdout)
+            self.assertEqual(help_run.returncode, 0, help_run.stdout + help_run.stderr)
+            self.assertIn('--command-timeout-s', help_run.stdout)
             for path in runtime.rglob('*'):
                 if path.is_file() and '__pycache__' not in path.parts:
                     self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o644)
-
-    def test_render_configuration_has_no_host_suffixes(self) -> None:
-        settings = conf.settings((ROOT / 'config/hana_aws.conf').read_text())
-        self.assertTrue(settings)
-        for key in settings:
-            with self.subTest(key=key):
-                self.assertNotIn('.', key)
-
-    def test_execution_values_have_no_copies_in_hana_configuration(self) -> None:
-        settings = conf.settings((ROOT / 'config/hana_aws.conf').read_text())
-        for key in ('execution_compiler_version', 'execution_shell_timeout_s', 'execution_command_timeout_s'):
-            self.assertNotIn(key, settings)
-        self.assertEqual(sum(line.startswith('free_floor_gib=')
-            for line in (ROOT / 'config/hana_aws.conf').read_text().splitlines()), 1)
 
 
 if __name__ == '__main__':

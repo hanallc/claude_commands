@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from scripts.lib.helper_tree_test_support import VERIFY_HELPERS, copy_helpers
+from scripts.lib.helper_tree_test_support import VERIFY_HELPERS, copy_helpers, verify_test_environment
 
 from scripts.build_queue.admission_test_support import caller_admission
 from scripts.lib.py_floor_test_support import seed_interpreter_cache
@@ -137,7 +137,12 @@ PY
     esac
 fi
 if [ "$1 $2" = "nextest run" ] && [ -n "$EDIT_DURING_TEST" ]; then
+    test_edit_event() {
+        [ -z "$1" ] || python3 "$TEST_EDIT_WAIT" "$1"
+    }
+    test_edit_event "$TEST_EDIT_BEFORE" || exit $?
     printf "// changed during the test run\n" >> "$PACKAGE_ROOT/${EDIT_DURING_TEST_PATH:-src/lib.rs}"
+    test_edit_event "$TEST_EDIT_AFTER" || exit $?
 fi
 case "$1 $2" in
     "mend --version"|"clippy --version"|"+nightly fmt")
@@ -174,11 +179,7 @@ esac
         pressure = self.root / "memory-pressure"
         write_pressure_reading(pressure)
         self.environment = {
-            **{
-                name: value for name, value in os.environ.items()
-                if name not in {"UNIT_RUN_DIR", "UNIT_TEAM_ROLE", "CODEX_THREAD_ID", "CODEX_SESSION_ID"}
-                and not name.startswith("UNIT_DETACHED_")
-            },
+            **verify_test_environment(),
             "PATH": tool_path,
             "HOME": str(self.root),
             "RUSTUP_HOME": str(self.root / "rustup"),
@@ -315,7 +316,6 @@ class SeededExampleWorkspaceFixture(ExampleWorkspaceFixture):
         # The fixture supplies the entire toolchain and 64 GiB of free memory.
         # Host Nix discovery and Python version probing are separate contracts.
         cls.fixture_environment.update({"IN_NIX_SHELL": "pure"})
-        _ = cls.fixture_environment.pop("CLAUDE_PYTHON", None)
         seed_interpreter_cache(builder.root / "cache")
         _ = shutil.copytree(builder.root, cls.fixture_seed, symlinks=True)
         shutil.rmtree(builder.root)
@@ -335,6 +335,34 @@ class SeededExampleWorkspaceFixture(ExampleWorkspaceFixture):
         self.metadata_calls = self.root / "metadata-calls"
         self.environment = self.fixture_environment.copy()
         _ = caller_admission(self, self.root, self.environment)
+
+    def prepare_edit_event(self, marker: str, *, before: bool) -> Path:
+        control = self.root / "edit-order"
+        control.mkdir()
+        self.environment.update({
+            "TEST_EDIT_CONTROL": str(control),
+            "TEST_EDIT_WAIT": str(Path(__file__).with_name("wait_for_test_state.py")),
+            ("TEST_EDIT_BEFORE" if before else "TEST_EDIT_AFTER"): str(control / marker),
+        })
+        return control
+
+    def prepare_edit_after_watch_snapshot(self) -> None:
+        """Let the watcher take one snapshot before the Cargo stub edits the tree."""
+        control = self.prepare_edit_event("watch-read", before=True)
+        _ = (control / "sitecustomize.py").write_text('''
+import os
+from pathlib import Path
+import sys
+import time
+
+if Path(sys.argv[0]).name == "tree_watch.py" and not sys.argv[1].startswith("--"):
+    def stop_after_read(_interval: float) -> None:
+        (Path(os.environ["TEST_EDIT_CONTROL"]) / "watch-read").touch()
+        raise SystemExit(3)
+    time.sleep = stop_after_read
+''')
+        startup = Path(__file__).resolve().parents[1] / "lib/python_startup"
+        self.environment["PYTHONPATH"] = os.pathsep.join((str(startup), str(control)))
 
     def side_by_side_phases(self, edited: str) -> subprocess.CompletedProcess[str]:
         """Test alpha, which depends on gamma, while another phase edits `edited`."""

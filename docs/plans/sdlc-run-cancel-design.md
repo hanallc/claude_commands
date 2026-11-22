@@ -105,9 +105,11 @@ A build hold is separate. Only removal of its holder file ends it
 again (`scripts/direct/verify.sh:2172`). It must not be translated into a phase
 stop, and a phase stop must not release a user's hold.
 
-The low-level command is `detached_runs.py stop --reason "<why>" <record>`. It
-checks the supervisor and the command leader, then sends TERM to the command
-group only. The supervisor records the exit and delivers the stopped result.
+Use `detached_runs.py stop --reason "<why>" <record>` to stop a detached command.
+The command checks the supervisor and the command leader before it sends TERM to the command group.
+The supervisor records the exit status.
+A worker that stops its own run receives the STOPPED result and keeps its pass active.
+A stop from another caller can cancel the owning pass and notify its director.
 A TERM to the supervisor group ends only the supervisor.
 
 ## Design

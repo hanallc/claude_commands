@@ -147,6 +147,10 @@ class StandingCheckpointTests(unittest.TestCase):
             self.write(self.repo / member / "src/lib.rs", "fn value() -> usize {\n    1\n}\n")
         _ = self.git(self.repo, "add", "--all")
         _ = self.git(self.repo, "commit", "-qm", "Initial sources")
+        origin = self.root / "remotes" / self.repo.name
+        _ = self.git(self.repo, "init", "--bare", str(origin))
+        _ = self.git(self.repo, "remote", "add", "origin", str(origin))
+        _ = self.git(self.repo, "push", "-u", "origin", "main")
         self.tip = self.git(self.repo, "rev-parse", "HEAD")
         _ = self.git(self.repo, "worktree", "add", "-q", "-b", "style/main", str(self.style))
         _ = self.git(self.repo, "worktree", "add", "-q", "-b", "sample-style-names", str(self.unit))
@@ -337,10 +341,12 @@ class StandingCheckpointTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "crash"):
                 _ = self.publish(first["id"])
         self.assertEqual(self.git(self.unit, "rev-parse", "HEAD"), before)
-        journal = style_ledger.publication_path(self.unit, "publication.json")
-        pending = cast(dict[str, str], json.loads(journal.read_text()))["commit"]
-        self.assertEqual(self.publish(first["id"]), pending)
-        self.assertFalse(journal.exists())
+        with style_ledger.open_ledger(self.unit) as ledger:
+            pending = ledger.pending_publication(first["branch"])
+        assert isinstance(pending, style_ledger.PendingPublication)
+        self.assertEqual(self.publish(first["id"]), pending.commit)
+        with style_ledger.open_ledger(self.unit) as ledger:
+            self.assertIsInstance(ledger.pending_publication(first["branch"]), style_ledger.NoPendingPublication)
         self.assertEqual(self.git(self.unit, "rev-list", "--count", before + "..HEAD"), "1")
 
     def test_publication_recovers_after_branch_movement_and_releases_at_its_checkpoint(self) -> None:
@@ -362,8 +368,8 @@ class StandingCheckpointTests(unittest.TestCase):
                     with self.assertRaisesRegex(style_ledger.LedgerError, "release pending"):
                         _ = self.publish(next_ticket["id"])
                 self.assertEqual(self.git(self.unit, "rev-parse", "HEAD"), checkpoint)
-                self.assertTrue(style_ledger.publication_path(self.unit, "publication.json").exists())
                 with style_ledger.open_ledger(self.unit) as ledger:
+                    self.assertIsInstance(ledger.pending_publication(first["branch"]), style_ledger.PendingPublication)
                     self.assertEqual(ledger.ticket_get(second["id"])["state"], "assigned")
         released: list[str] = []
         def release(phase_dir: Path, ticket: str, merged: str) -> str:

@@ -109,7 +109,7 @@ The user approved the slot values on 2026-11-12 (relayed by builds). On 2026-11-
 The values live in `config/build_folders.conf` as `slots.<machine>.<repository>.count` and `slots.<machine>.<repository>.max_bytes`.
 They change only through /tune and apply at the next slot take, with no deploy.
 `roots.slots.<machine>` keeps a suitable existing root. Existing `names.*` and `patterns.*` settings stay.
-The cutover on Thu 11-19 deletes `copies.root`, `roots.scratch*`, `roots.copies*` and the `prefixes.*` keys. The delete of `copies.root` needs a separate go from the user.
+The cutover on Thu 11-19 deletes `copies.root`, `roots.scratch*`, `roots.copies*` and the `prefixes.*` keys. The `copies.root` delete is done (deadconf, 11-19); the user's rule covers settings that no code reads.
 Missing required capacity values stop admission with a named config error.
 Tests use explicit private values under the same schema; they do not set production limits.
 The private-config helper supplies test roots and values, not another allocation API or fixture registry.
@@ -189,14 +189,14 @@ The dates are the earliest when each phase starts the hour the phase before it m
 | Phase 7 — remaining fixtures and source test | devtools; each builds unit migrates its own fixtures | Code that merges, one dispatch for each owner and folder | Wed 11-18 | Thu 11-19 morning | **no** |
 | Phase 8 — stall watch and alarm-only sweep | resources (sweep and alarm), devtools (stall watch, folder audit) | Code that merges | Thu 11-19 | Thu 11-19 evening | **no** |
 | Gate folders delete | resources | One-time run on natedev: deletes each `~/worktrees/gates` folder whose lock has no holder | Thu 11-19 | Thu 11-19 | named here only; not in the resources plan |
-| `copies.root` delete | queue (owns `config/copies.conf`) | Code that merges | Thu 11-19, after the user's separate go | Thu 11-19 | yes; waits for the user's go |
+| `copies.root` delete | devtools (deadconf) | Code that merges | done 11-19 | Thu 11-19 | no; the user's rule covers settings that no code reads |
 | Other config key delete | queue (owns `config/build_folders.conf`) | Code that merges: deletes `roots.scratch*`, `roots.copies*`, `prefixes.*` | after Phase 8 merges | Fri 11-20 at the earliest | yes, after Phase 8 |
 
 On `e75b8ec06`, code outside tests still reads each key the cutover deletes:
 
 1. `roots.scratch*` and `roots.copies*`: `scratch.py`, `copy_record.py`, `tmp_sweep.py`, `pre-tool-use-scratch-guard.py`, `shot_report/transcripts.py`. Phases 6 to 8 move them.
 2. `prefixes.*`: `build_folders.py`, `style/crate_run.py`, `style/style_footprint.py`, `step_estimator.py`, `aws_target/ledger.py`, `pre-tool-use-build-hold-guard.py`. Phases 5 and 7 move them.
-3. `copies.root`: no reader. `copies.gates_root()` returns the slot root since Phase 4. Only the user's separate go holds this delete.
+3. `copies.root`: no reader. `copies.gates_root()` returns the slot root since Phase 4. Deleted 11-19 (deadconf).
 
 So the delete of `roots.scratch*`, `roots.copies*` and `prefixes.*` cannot run on Thu 11-19. The gate folders delete and the `copies.root` delete depend on Phase 4 alone. They stay on Thu 11-19.
 
@@ -361,7 +361,7 @@ Devtools owns production gate adapters.
    `copies.workspace()` does not take a slot: it is a named, editable checkout on a branch, and a slot reset would destroy its edits. It becomes an editable maker folder under `roots.workspace`.
    `copies.clone()` keeps its return-a-path API, so it cannot hold a slot lease. It becomes a maker folder outside `~/worktrees/gates`; its callers move to slots in Phase 5 (builds agreed 2026-11-15).
    A full pool waits in the build queue for at most `slots.wait_seconds`, and the run shows in the Queued table.
-8. Point the read-only `copies.gates_root()` users (`rust_release.py` disk check, `lint/sweep.py` floor roots) at the slot root. Delete the `copies.root` key only after the user's separate go.
+8. Point the read-only `copies.gates_root()` users (`rust_release.py` disk check, `lint/sweep.py` floor roots) at the slot root. The `copies.root` key is deleted (deadconf, 11-19).
 9. Add a test that no test writes under the live slot or gate roots.
 
 Resources deletes `~/worktrees/gates` on cutover day, after Phase 4 is on main. It deletes each gate folder only when its lock has no holder.

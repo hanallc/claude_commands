@@ -33,12 +33,13 @@ from scripts.lib.py_floor_test_support import seed_interpreter_cache
 from scripts.production import footer_counts, investigation, session_labels, staff
 from scripts.production.issues import ALL_FIELDS, Issue
 from scripts.rebuild import need
+from scripts.hooks import review_hold_delivery
+from scripts.message import review_hold
 from scripts.review_links import for_you
 from scripts.agents import remote
-from scripts.statusline import adhoc_items, assignment, counts_row, for_you_count, rebuild_row
+from scripts.statusline import adhoc_items, assignment, counts_row, rebuild_row
 
 PROGRAM = Path(__file__).with_name("statusline.jq")
-SHIPPED_COLORS = PROGRAM.parents[2] / "config/statusline.conf"
 CONSOLE_HOST_SHELL = "export STATUSLINE_SYSTEM=Linux; "
 USER_ZONE = ZoneInfo("America/New_York")
 ANSI = re.compile(r"\x1b\[[0-9;]*m")
@@ -74,16 +75,27 @@ def fixture_account_label(label: str, configuration: Path) -> str:
 
 
 def fixture_colors(path: Path) -> Path:
-    """Copy the config and set the colors and thresholds that these tests assert."""
-    _ = write_config_fixture(path, "role.showrunner=purple\nrole.unit-director=yellow\nrole.worker=#ff04a3\n"
-                             + "account.claude1=#53d5fd\naccount.claude2=#cd54f2\naccount.claude3=#ffc800\n"
-                             + "account.claude4=#ff8700\naccount.claude5=#19d772\naccount.codex1=#ff1261\naccount.codex2=#4bf331\n"
-                             + "counts.questions=bright-red\ncounts.proposals=purple\ncounts.adhoc_items=pink\n"
-                             + "counts.changes=bright-cyan\ncounts.efficiency=bright-green\n"
-                             + "level.ok=bright-green\nlevel.warn=bright-yellow\nlevel.alarm=bright-red\n"
-                             + "tokens.warn=80\ntokens.alarm=90\nleft.warn=10\nleft.alarm=5\n",
-                             template="statusline")
+    """Write the colors and thresholds that these tests assert."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _ = path.write_text(
+        "role.showrunner=purple\nrole.unit-director=yellow\nrole.worker=#ff04a3\n"
+        + "role.producer=#90fe42\nrole.astra-designer=mauve\nrole.astra-reviewer=bright-green\n"
+        + "account.claude1=#53d5fd\naccount.claude2=#cd54f2\naccount.claude3=#ffc800\n"
+        + "account.claude4=#ff8700\naccount.claude5=#19d772\naccount.codex1=#ff1261\naccount.codex2=#4bf331\n"
+        + "counts.questions=bright-red\ncounts.proposals=purple\ncounts.adhoc_items=pink\n"
+        + "counts.changes=bright-cyan\ncounts.efficiency=bright-green\n"
+        + "level.ok=bright-green\nlevel.warn=bright-yellow\nlevel.alarm=bright-red\n"
+        + "tokens.warn=80\ntokens.alarm=90\nleft.warn=10\nleft.alarm=5\n", encoding="utf-8")
     return path
+
+
+def fixture_rebuild_settings(cache: str) -> str:
+    return (
+        f"rebuild.cache={cache}\nrebuild.repo=/etc/nixos\nrebuild.ref=main\n"
+        + "rebuild.natedev=natedev\nrebuild.mac=MacBook-Pro\nrebuild.ssh=mac\n"
+        + "rebuild.interval=60\nrebuild.eval_timeout=120\nrebuild.eval_retry_seconds=600\n"
+        + "rebuild.cwd.natedev=/etc/nixos\nrebuild.cwd.mac=~/nixos\n"
+        + "rebuild.generations=~/.local/state/rebuild/generations.log\n")
 
 
 def fixture_command(root: Path, *, rebuild_cache: str = "~/.local/state/showrunner/rebuilds") -> str:
@@ -91,12 +103,9 @@ def fixture_command(root: Path, *, rebuild_cache: str = "~/.local/state/showrunn
     folder = root / "scripts/statusline"
     folder.mkdir(parents=True, exist_ok=True)
     configuration = fixture_colors(root / "config/statusline.conf")
-    _ = write_config_fixture(configuration,
-        f"rebuild.cache={rebuild_cache}\nrebuild.repo=/etc/nixos\nrebuild.ref=main\n"
-        + "rebuild.natedev=natedev\nrebuild.mac=MacBook-Pro\nrebuild.ssh=mac\n"
-        + "rebuild.interval=60\nrebuild.eval_timeout=120\nrebuild.eval_retry_seconds=600\n"
-        + "rebuild.cwd.natedev=/etc/nixos\nrebuild.cwd.mac=~/nixos\n")
-    _ = write_config_fixture(configuration.with_name("user_zone.conf"), f"zone={USER_ZONE.key}\n")
+    with configuration.open("a", encoding="utf-8") as settings:
+        _ = settings.write("# whole: 1..\ncounts.retry_seconds=7\n" + fixture_rebuild_settings(rebuild_cache))
+    _ = configuration.with_name("user_zone.conf").write_text(f"zone={USER_ZONE.key}\n", encoding="utf-8")
     for name in ("statusline.sh", "statusline.jq", "assignment.py", "rebuild_row.py"):
         _ = shutil.copyfile(PROGRAM.parent / name, folder / name)
     for source in PROGRAM.parent.iterdir():
@@ -319,7 +328,7 @@ class ColorTests(unittest.TestCase):
         for index, key in enumerate(conf.read(self.colors).values()):
             if key.startswith(("account.", "role.")):
                 overrides.append(f"{key}=#{index + 1:02x}8050")
-        _ = write_config_fixture(self.colors, "\n".join(overrides))
+        _ = self.colors.write_text("\n".join(overrides) + "\n", encoding="utf-8")
         accounts: list[str] = []
         for key, value in conf.read(self.colors).values().items():
             if not key.startswith(("account.", "role.")):
@@ -341,13 +350,23 @@ class ColorTests(unittest.TestCase):
                 field = status_lines({}, colors=f"account.claude1={color}\n")[1].split(" | ")[0]
                 self.assertRegex(field, r"^\x1b\[[0-9;]+mclaude1\x1b\[0m$")
 
-    def test_shipped_color_values_are_renderable(self) -> None:
-        for key, value in conf.read(SHIPPED_COLORS).values().items():
+    def test_fixture_color_values_are_renderable(self) -> None:
+        for key, value in conf.read(self.colors).values().items():
             if not key.startswith(("role.", "account.", "level.", "counts.")) or key == "counts.retry_seconds":
                 continue
             with self.subTest(key=key):
                 field = status_lines({}, colors=f"account.claude1={value}\n")[1].split(" | ")[0]
                 self.assertRegex(field, r"^\x1b\[[0-9;]+mclaude1\x1b\[0m$")
+
+    def assert_worker_color_renders(self, colors: Path | str) -> None:
+        line = status_lines({"session_id": WORKER.current_session}, colors=colors,
+                            staff_text=staff_text(WORKER))[0]
+        self.assertRegex(line.split(" | ", 1)[0], r"^\x1b\[[0-9;]+mworker\x1b\[0m$")
+
+    def test_worker_color_must_render(self) -> None:
+        self.assert_worker_color_renders(self.colors)
+        with self.assertRaises(AssertionError):
+            self.assert_worker_color_renders("role.worker=invalid-color\n")
 
     def test_token_thresholds_use_the_unrounded_window_percentage(self) -> None:
         for tokens, code in ((79_000, 92), (79_999, 92), (80_000, 93),
@@ -439,8 +458,8 @@ class ColorTests(unittest.TestCase):
                                      + "\x1b[92m\x1b[1m130\x1b[22m efficiency\x1b[0m")
 
 
-    def test_shipped_colors_parse_without_pinning_their_values(self) -> None:
-        self.assertTrue(conf.read(SHIPPED_COLORS).values())
+    def test_fixture_color_config_parses(self) -> None:
+        self.assertTrue(conf.read(self.colors).values())
 
     def test_account_palette_has_distinct_hues(self) -> None:
         eligible = [color for color in new_account.STATUSLINE_PALETTE
@@ -456,16 +475,15 @@ class ColorTests(unittest.TestCase):
 
 class ForYouStatusTests(unittest.TestCase):
     def test_global_count_uses_the_shared_reader_and_refuses_incomplete_sources(self) -> None:
-        config = Path("fixture/statusline.conf")
         row = for_you.ForYouRow("action/fixture", "action", "Restore access", "github-warmup", "mac",
                                 "/fixture", "sdlc", "Login", "Release", "", "open", "manual", "")
         for rows, failures, expected in (((row,), (), "1"), ((), (), "0"),
                                           ((row,), (for_you.UnavailableSource("fixture", "Failed."),), "unavailable")):
             with self.subTest(expected=expected), patch.object(for_you, "read", return_value=for_you.ForYouSnapshot(rows, failures)) as read:
-                self.assertEqual(for_you_count.global_action_count(config), expected)
+                self.assertEqual(for_you.global_action_count(), expected)
                 self.assertEqual(read.call_count, 1)
         with patch.object(for_you, "read", side_effect=OSError("Fixture read failed.")):
-            self.assertEqual(for_you_count.global_action_count(config), "unavailable")
+            self.assertEqual(for_you.global_action_count(), "unavailable")
 
     def test_mac_default_uses_the_console_peers_tailscale_address(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -476,8 +494,8 @@ class ForYouStatusTests(unittest.TestCase):
             connection = Mock(getresponse=Mock(return_value=response))
             with (patch.dict(os.environ, {"CONF_DIR": directory}, clear=True),
                   patch.object(subprocess, "check_output", return_value="100.64.0.42\n") as address,
-                  patch.object(for_you_count, "HTTPConnection", return_value=connection) as connect):
-                self.assertEqual(for_you_count.console_action_count(), "3")
+                  patch.object(for_you, "HTTPConnection", return_value=connection) as connect):
+                self.assertEqual(for_you.console_action_count(), "3")
                 connect.assert_called_once_with("100.64.0.42", 8765, timeout=2)
                 address.assert_called_once_with(
                     ["tailscale", "ip", "-4", "fixture-console"], text=True, stderr=subprocess.DEVNULL, timeout=2)
@@ -534,6 +552,70 @@ class ForYouStatusTests(unittest.TestCase):
             self.assertEqual(unavailable.stdout.splitlines()[-1], "For you: Unavailable")
             self.assertFalse((home / ".local/state/for-you").exists())
 
+    def test_mac_refreshes_a_cache_that_expires_during_the_console_request(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = root / "statusline.conf"
+            cache = root / "rebuild-cache"
+            _ = config.write_text(f"rebuild.cache={cache}\n", encoding="utf-8")
+            _ = cache.write_text("\n9999999999\n", encoding="utf-8")
+
+            def console_count() -> str:
+                _ = cache.write_text("\n0\n", encoding="utf-8")
+                return "3"
+
+            with (patch.dict(os.environ, {"HOME": directory, "STAFF_FILE": os.devnull,
+                                         "STATUSLINE_SYSTEM": "Darwin",
+                                         "REBUILD_NEEDS_DIR": str(root / "needs")}),
+                  patch.object(sys, "argv", ["assignment.py", "-r"]),
+                  patch.object(sys, "stdin", io.StringIO("{}")),
+                  patch.object(rebuild_row, "DEFAULT_CONFIG", config),
+                  patch.object(for_you, "console_action_count", side_effect=console_count) as request,
+                  patch.object(subprocess, "Popen") as refresh,
+                  patch.object(os, "execvp") as render):
+                assignment.main()
+            request.assert_called_once_with()
+            refresh.assert_called_once()
+            self.assertEqual(refresh.call_args.args[0][-3:], ["refresh", "--config", str(config)])
+            render.assert_called_once()
+            arguments = cast(list[str], render.call_args.args[1])
+            self.assertEqual(arguments[arguments.index("for_you") + 1], "3")
+
+    def test_linux_rejects_a_cache_that_expires_during_the_action_store_read(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = root / "statusline.conf"
+            cache = root / "rebuild-cache"
+            _ = config.write_text(fixture_rebuild_settings(str(cache)), encoding="utf-8")
+            environment = {"HOME": directory, "STAFF_FILE": os.devnull, "STATUSLINE_SYSTEM": "Linux",
+                           "REBUILD_NEEDS_DIR": str(root / "needs"), "FOR_YOU_ACTIONS_DIR": str(fixture_actions(root))}
+            for expire, expected in ((False, "0"), (True, "unavailable")):
+                seed_rebuild_cache(root, config, cache=cache)
+
+                def actions() -> tuple[()]:
+                    if expire:
+                        lines = cache.read_text(encoding="utf-8").splitlines()
+                        lines[1] = "0"
+                        _ = cache.write_text("\n".join(lines) + "\n", encoding="utf-8")
+                    return ()
+
+                with (self.subTest(expire=expire), patch.dict(os.environ, environment, clear=True),
+                      patch.object(staff, "snapshot", return_value=staff.StaffSnapshot(())),
+                      patch.object(sys, "argv", ["assignment.py", "-r"]),
+                      patch.object(sys, "stdin", io.StringIO("{}")),
+                      patch.object(rebuild_row, "DEFAULT_CONFIG", config),
+                      patch.object(ActionStore, "list", side_effect=actions) as read,
+                      patch.object(need, "read_needs", wraps=need.read_needs) as needs,
+                      patch.object(subprocess, "Popen") as refresh,
+                      patch.object(os, "execvp") as render):
+                    assignment.main()
+                read.assert_called_once_with()
+                needs.assert_called_once_with()
+                self.assertEqual(refresh.call_count, int(expire))
+                render.assert_called_once()
+                arguments = cast(list[str], render.call_args.args[1])
+                self.assertEqual(arguments[arguments.index("for_you") + 1], expected)
+
     def test_review_and_action_rows_have_separate_counts(self) -> None:
         lines = status_lines({"session_id": "sid"}, counts="sid Review: 1 question, 2 changes, 1 investigation",
                              adhoc="3 adhoc items", for_you="2", rebuild="rebuild mac")
@@ -571,6 +653,66 @@ class AdhocItemsTests(unittest.TestCase):
                         self.assertEqual(path.read_text(encoding="utf-8"), str(remaining))
                     else:
                         self.assertFalse(path.exists())
+
+    def test_zero_prints_one_list_in_sent_order_and_removes_it(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = Path(directory) / "config"
+            config.mkdir()
+            _ = write_config_fixture(config / "send.conf", "review_hold=on\nreview_hold_idle_minutes=30")
+            env = {"HOME": directory, "CONF_DIR": str(config), "USER_ZONE": "America/New_York",
+                   "CLAUDE_CODE_SESSION_ID": "review-session"}
+            first = datetime(2026, 11, 19, 17, 5, tzinfo=timezone.utc).timestamp()
+            with patch.dict(os.environ, env):
+                review_hold.set_count("review-session", 3, first, self.fail,
+                    record_keys=review_hold_delivery.record_keys)
+                for item in (review_hold.ReviewMessage("Pat · build", first + 60, "Second report.", "codex:pat"),
+                             review_hold.ReviewMessage("Lee · test", first, "First report.\nMore detail.", "session:lee")):
+                    with review_hold.route("review-session", item, urgent=False,
+                             record_keys=review_hold_delivery.record_keys) as result:
+                        assert isinstance(result, review_hold.OpenReview)
+                        result.keep(item)
+                command = [sys.executable, str(Path(adhoc_items.__file__)), "0"]
+                result = subprocess.run(command, text=True, capture_output=True, check=True)
+                self.assertEqual(result.stdout, "Messages from the review\n\n"
+                    + "1. Lee · test\n   Sent: 12:05 EST\n   Sender native id: session:lee\n   First report.\n   More detail.\n\n"
+                    + "2. Pat · build\n   Sent: 12:06 EST\n   Sender native id: codex:pat\n   Second report.\n")
+                self.assertEqual(result.stderr, "")
+                again = subprocess.run(command, text=True, capture_output=True, check=True)
+                self.assertEqual(again.stdout + again.stderr, "")
+
+    def test_session_start_recovers_the_saved_list_once_as_hook_context(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = Path(directory) / "config"
+            config.mkdir()
+            _ = write_config_fixture(config / "send.conf", "review_hold=on\nreview_hold_idle_minutes=30")
+            with patch.dict(os.environ, {"HOME": directory, "CONF_DIR": str(config), "USER_ZONE": "UTC"}):
+                repo = Path(adhoc_items.__file__).parents[2]
+                settings = cast(dict[str, object], json.loads((repo / "settings.json").read_text()))
+                hooks = cast(dict[str, list[dict[str, object]]], settings["hooks"])
+                group = next(item for item in hooks["SessionStart"] if item["matcher"] == "startup|resume|clear|compact")
+                registered = cast(list[dict[str, str]], group["hooks"])
+                self.assertTrue(any(command["command"].endswith('/session-start-review-hold.py"')
+                                    for command in registered))
+                at = datetime(2026, 11, 19, 16, 20, tzinfo=timezone.utc).timestamp()
+                review_hold.set_count("review-session", 3, at, self.fail,
+                    record_keys=review_hold_delivery.record_keys)
+                message = review_hold.ReviewMessage("Drew", at, "A saved report.")
+                with review_hold.route("review-session", message, urgent=False,
+                         record_keys=review_hold_delivery.record_keys) as result:
+                    assert isinstance(result, review_hold.OpenReview)
+                    result.keep(message)
+                command = [sys.executable, str(repo / "scripts/hooks/session-start-review-hold.py")]
+                payload = json.dumps({"session_id": "review-session", "source": "resume",
+                                      "hook_event_name": "SessionStart"})
+                reply = subprocess.run(command, input=payload, text=True, capture_output=True, check=True)
+                self.assertEqual(cast(object, json.loads(reply.stdout)), {"hookSpecificOutput": {
+                    "hookEventName": "SessionStart",
+                    "additionalContext": ("Messages from the review\n\n1. Drew\n   Sent: 16:20 UTC\n"
+                                          + "   Sender native id: unavailable\n   A saved report."),
+                }})
+                self.assertEqual(reply.stderr, "")
+                again = subprocess.run(command, input=payload, text=True, capture_output=True, check=True)
+                self.assertEqual(again.stdout + again.stderr, "")
 
     def test_row_omits_invalid_or_nonpositive_counts_and_an_empty_session(self) -> None:
         with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {"HOME": directory}):
@@ -1157,7 +1299,8 @@ class CountsRowTests(ConfiguredShellTests):
         self.home = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.configuration = self.home / "counts-config"
         self.configure_review_sources(self.configuration)
-        _ = write_config_fixture(self.configuration / "statusline.conf", "counts.retry_seconds=7\n")
+        _ = (self.configuration / "statusline.conf").write_text(
+            "# whole: 1..\ncounts.retry_seconds=7\n", encoding="utf-8")
         environment = {"CONF_DIR": str(self.configuration), "USER_ZONE": USER_ZONE.key}
         _ = cast(object, self.enterContext(patch.dict(os.environ, environment)))
         seed_rebuild_cache(self.home, self.runtime / "config/statusline.conf")
@@ -1458,7 +1601,7 @@ class CountsRowTests(ConfiguredShellTests):
                        "NOTIFIER_STATE_DIR": str(self.home / ".local/state/notifier"),
                        "SHOWRUNNER_STATE_DIR": str(self.home / ".local/state/showrunner")}
         with patch.dict(os.environ, environment), \
-                patch.object(assignment, "__file__", str(self.runtime / "scripts/statusline/assignment.py")), \
+                patch.object(rebuild_row, "DEFAULT_CONFIG", self.runtime / "config/statusline.conf"), \
                 patch.object(pane_record, "RECORD_DIR", self.home / "pane-records"), \
                 patch.object(counts_row, "write", wraps=counts_row.write) as refresh, \
                 patch.object(os, "execvp") as render, \
@@ -2216,11 +2359,13 @@ class RebuildRowTests(unittest.TestCase):
             config = Path(directory) / "statusline.conf"
             cache = Path(directory) / "cache"
             _ = config.write_text(f"rebuild.cache={cache}\n", encoding="utf-8")
-            self.assertEqual(rebuild_row.read(config), rebuild_row.RebuildAnswer((), True))
+            self.assertEqual(rebuild_row.read(config),
+                             rebuild_row.RebuildAnswer((), True, needs=()))
             for text in ("invalid\n9999999999\n", "rebuild mac\ninvalid\n"):
                 with self.subTest(text=text):
                     _ = cache.write_text(text, encoding="utf-8")
-                    self.assertEqual(rebuild_row.read(config), rebuild_row.RebuildAnswer((), True))
+                    self.assertEqual(rebuild_row.read(config),
+                                     rebuild_row.RebuildAnswer((), True, needs=()))
 
     def test_stale_cache_keeps_the_answer_for_the_reader_and_command(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

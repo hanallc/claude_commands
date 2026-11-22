@@ -4,11 +4,9 @@ description: Review decisions one at a time.
 
 Use this when the user has just received a long list — recommendations, findings, options, todos — and wants to review them deliberately one by one instead of responding to the whole wall of text.
 
-**Read `~/.claude/docs/user_facing_explanation.md` first and follow it.** It owns
-the principle every rule here derives from — you do the reconstruction, not the
-user — plus the build order, the naming rules, the banned vocabulary, the
-comprehension gate, the choice-line format, and what to do when an explanation
-fails to land. This file adds only what is specific to walking a list.
+**Read `~/.claude/docs/user_facing_explanation.md` first and follow it.**
+Explain how the parts relate so the user can assess each item.
+Follow its build order, naming rules, comprehension gate, choice-line format, and steps for clarifying an item.
 
 **Read `~/.claude/docs/type_design.md` too and follow it.** When an item concerns
 types, APIs, stored state, or optional values, use that contract to evaluate the
@@ -110,7 +108,7 @@ For each item, in order:
 
 Do not ask "continue or add more?" between items — assume continue unless the user volunteers something.
 
-After each terminal choice, including a skip, run `"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/statusline/adhoc_items.py" <remaining>` with the open count.
+After each terminal choice, run `"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/statusline/adhoc_items.py" <remaining>` if items remain.
 Run it again when the user returns to a closed item; include that item in the count.
 
 ### Decision frame
@@ -155,6 +153,7 @@ This is a scaffold, not a demand for headings when a very small item reads more 
 ## Step 5: Wrap up
 
 Run `"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/statusline/adhoc_items.py" 0` when the review ends, including an early end.
+Read the held messages from the command output. The command lists them oldest first.
 
 When every item is done:
 
@@ -164,10 +163,6 @@ When every item is done:
 - Ensure every task has a terminal status.
 
 ## Rules
-
-`~/.claude/docs/user_facing_explanation.md` carries the explanation rules — build
-order, naming, banned vocabulary, comprehension gate, choice format, repair when
-an item does not land. These are the ones specific to walking a list.
 
 - **NEVER run the review as a survey.** No AskUserQuestion, no option chips, no questionnaire UI — for the items themselves or for any step of this workflow. Every item is a succinct summary followed by the inline choice line from Step 4. Keep the technical content, drop the widget.
 - One item at a time. Never present two items in the same turn.

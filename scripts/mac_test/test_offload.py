@@ -17,17 +17,20 @@ import tempfile
 import time
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
-from dataclasses import fields
+from dataclasses import fields, replace
 import io
 from pathlib import Path
 from typing import TYPE_CHECKING, cast, final, override
 from unittest import mock
 from scripts.build_queue import execution_identity
+from scripts.direct import verify_mac_offload_test_support
 from scripts.lint.memory_test_support import config_environment, write_config_fixture, write_config_fault, commit_config_fixture
 
-from scripts.mac_test import eligibility, nextest_log, offload, claim_state
-from scripts.build_queue import admission_client, admission_protocol as wire, placement
-from scripts.build_queue.admission_test_support import caller_admission
+from scripts.mac_test import eligibility, fix_return, nextest_log, offload, claim_state
+from scripts.build_queue import admission_client, admission_protocol as wire, placement, queue_snapshot
+from scripts.build_queue.admission_test_support import AdmissionFixture, caller_admission
+from scripts.build_hold.owning_session import NoOwningSession
+from scripts.build_hold import override_guard
 if TYPE_CHECKING:
     from scripts.lib import copy_record, nix_env, scratch
     from scripts.build_targets import target_config
@@ -254,6 +257,60 @@ class LintVerbTests(unittest.TestCase):
 
 
 class RunnerCompletionTests(unittest.TestCase):
+    def test_missing_stdout_preserves_the_published_result(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "result"
+            request = offload.OffloadRequest(root, "hana", "call", offload.ResultFile(path), (),
+                                             owner="verify", holder_session="fixture",
+                                             fetch=offload.FetchFolder("output"))
+            result = offload.PassedOnMac(1, offload.Fetched(root / "fetched", 12))
+            controller = offload.ProcessController()
+            with mock.patch.object(sys, "stdout", None):
+                status = offload.publish_offload_result(controller, request, result)
+                offload.report_offload_completion(controller, request, result, 0)
+                offload.flush_cli_output()
+            self.assertEqual(status, 0)
+            self.assertIn("fetch=fetched", path.read_text().splitlines())
+
+    def test_missing_stderr_preserves_the_published_result_and_continues_recording(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "result"
+            request = offload.OffloadRequest(root, "hana", "call", offload.ResultFile(path), (),
+                                             owner="verify", holder_session="fixture")
+            result = offload.PassedOnMac(1)
+            controller = offload.ProcessController()
+            controller.pending = offload.PendingHanaOperation()
+            with (mock.patch.object(sys, "stderr", None),
+                  redirect_stdout(io.StringIO()) as output,
+                  mock.patch.object(offload, "report_placement_result", side_effect=OSError),
+                  mock.patch.object(offload, "persist_attempt") as attempt):
+                status = offload.publish_offload_result(controller, request, result)
+                offload.report_offload_completion(controller, request, result, 0)
+                offload.flush_cli_output()
+            self.assertEqual(status, 0)
+            self.assertIn("mac=passed", path.read_text().splitlines())
+            self.assertEqual(output.getvalue(), "")
+            attempt.assert_called_once()
+
+    def test_broken_output_pipe_does_not_change_the_process_exit_status(self) -> None:
+        program = (
+            "from scripts.mac_test.offload import flush_cli_output\n"
+            "print('Mac summary')\n"
+            "flush_cli_output()\n"
+            "raise SystemExit(7)\n"
+        )
+        reader, writer = os.pipe()
+        os.close(reader)
+        environment = {key: value for key, value in os.environ.items() if key != "PYTHONUNBUFFERED"}
+        with os.fdopen(writer, "wb") as pipe:
+            result = subprocess.run([sys.executable, "-c", program], stdout=pipe, stderr=subprocess.PIPE,
+                                    cwd=Path(__file__).resolve().parents[2], env=environment, text=True,
+                                    check=False, timeout=TEST_HANG_GUARD_SECS)
+        self.assertEqual(result.returncode, 7, result.stderr)
+        self.assertEqual(result.stderr, "")
+
     def test_missing_completion_reports_the_runner_exit_without_claiming_link_loss(self) -> None:
         output = io.StringIO()
         with redirect_stdout(output):
@@ -453,6 +510,48 @@ class OffloadSettingsTests(unittest.TestCase):
         _ = self.enterContext(mock.patch.object(Path, "home", return_value=self.root))
         _ = self.enterContext(mock.patch("subprocess.run", side_effect=AssertionError("No external command expected")))
         _ = self.enterContext(mock.patch("subprocess.Popen", side_effect=AssertionError("No external command expected")))
+
+    def test_mac_summary_write_failure_preserves_the_published_result(self) -> None:
+        def place(request: offload.OffloadRequest, *_arguments: object) -> offload.OffloadRequest:
+            return request
+
+        for options, outcome, prefix, field in (
+            (("--fetch", "output"), offload.PassedOnMac(1, offload.Fetched(self.root / "fetched", 12)),
+             "mac_test: fetched", "fetch=fetched"),
+            (("--verb", "mend-fix"), offload.PassedOnMac(1, fix=fix_return.FixNone()),
+             "mac_test: the Mac fix pass passed", "fix=none"),
+        ):
+            with self.subTest(options=options):
+                path = self.root / (field.partition("=")[0] + ".result")
+                argv = ["offload", "run", "--repo-root", str(self.root), "--call-id", "call",
+                        "--result", str(path), *options]
+                file_at_summary: list[str] = []
+
+                def write_output(message: str) -> int:
+                    if message.startswith(prefix):
+                        file_at_summary.append(path.read_text())
+                        raise BrokenPipeError("The fixture cannot print the Mac summary")
+                    return len(message)
+
+                with (mock.patch.object(sys, "argv", argv),
+                      redirect_stdout(io.StringIO()),
+                      mock.patch.object(sys.stdout, "write", side_effect=write_output),
+                      mock.patch.object(override_guard, "refuse_overrides"),
+                      mock.patch.object(copies, "source_owner", return_value="fixture"),
+                      mock.patch.object(offload, "holder_session", return_value="fixture"),
+                      mock.patch.object(offload, "restore_ignored_interrupt_default"),
+                      mock.patch.object(offload, "submit_direct_placement", side_effect=place),
+                      mock.patch.object(offload, "run_offload", return_value=outcome),
+                      mock.patch.object(offload, "report_placement_result") as placement_report,
+                      mock.patch.object(offload, "persist_attempt") as attempt_record):
+                    status = offload.main()
+                self.assertEqual(status, 0)
+                result = path.read_text()
+                self.assertEqual(file_at_summary, [result])
+                self.assertEqual(result.splitlines()[:2], ["mac=passed", "reason="])
+                self.assertIn(field, result.splitlines())
+                placement_report.assert_called_once()
+                attempt_record.assert_called_once()
 
     def test_mac_command_sends_repository_identity_only_when_nonempty(self) -> None:
         config = eligibility.read_config(self.settings)
@@ -773,6 +872,58 @@ class OffloadSettingsTests(unittest.TestCase):
 
 
 @final
+class MacPlacementWaitTests(unittest.TestCase):
+    def test_a_mac_copy_waits_for_the_mac_while_its_local_parent_holds_memory(self) -> None:
+        with AdmissionFixture() as fixture:
+            owner = fixture.fixture_owner(4094003, "35916506")
+            run = wire.RunIdentity(owner.pid, owner.start_time)
+            parent = fixture.request(need=14912008192, owner=owner,
+                                     since=fixture.clock.now() - 3600, run=run)
+            grant, = fixture.server.handle_request(parent)
+            assert isinstance(grant, wire.Admitted)
+
+            child = fixture.fixture_owner(3682121, "36172697")
+            mac = placement.PlacementDestination("mac", "mac", "fixture-mac", claim_state.RepositoryScope("hana"))
+            constraints = placement.PlacementConstraints(execution_identity.SourceKeyKnown("fixture-tree"),
+                ("cargo", "nextest", "run"), str(fixture.root), "hana", NoOwningSession(),
+                (placement.PlacementCandidate(mac),), placement.PinnedHost("mac"))
+            request = wire.PlacementRequest("mac-copy", placement.SubmittingOwner(
+                fixture.server.host, child.pid, child.start_time), fixture.clock.now() - 3100,
+                parent.profile, constraints, identity=parent.identity, run=run,
+                purpose=placement.SpeculativeCopy(parent.episode, parent.since))
+            key = fixture.server.host_evidence_key(request, mac)
+            busy = placement.FreshHostEvidence(key, fixture.clock.now(), "", placement.TemporaryExclusion("busy"))
+            fixture.server.publish_host_evidence(busy)
+
+            reply, = fixture.server.handle_request(request)
+            assert isinstance(reply, wire.PlacementWait)
+            self.assertEqual(reply.wait, wire.PlacementResourceWait("mac", "busy"))
+            snapshot = queue_snapshot.read_queue_snapshot(fixture.state_dir)
+            assert isinstance(snapshot, queue_snapshot.QueueSnapshot)
+            self.assertEqual([row["pid"] for _, row in snapshot.inputs.ordered], [])
+            self.assertEqual([row["pid"] for row in snapshot.inputs.reservations], [owner.pid])
+            view, = fixture.connect(wire.ViewRequest()).replies()
+            assert isinstance(view, wire.ViewReply)
+            self.assertEqual(view.reading.view.waiting, ())
+
+            fixture.allow_next_start()
+            younger = fixture.request(owner=fixture.fixture_owner(1855215, "36200000"))
+            self.assertIsInstance(fixture.server.handle_request(younger)[0], wire.Admitted)
+            self.assertNotIn(request.episode, fixture.server.reservations)
+
+            fixture.server.publish_host_evidence(replace(busy, observed_at=fixture.clock.now(),
+                                                         eligibility=placement.AllowedHost()))
+            assigned, = fixture.server.handle_request(request)
+            assert isinstance(assigned, wire.Assignment)
+            self.assertEqual(assigned.assignment.destination, mac)
+            self.assertEqual(fixture.server.reservations[parent.episode].reservation_id, grant.reservation)
+            self.assertNotIn(request.episode, fixture.server.reservations)
+            snapshot = queue_snapshot.read_queue_snapshot(fixture.state_dir)
+            assert isinstance(snapshot, queue_snapshot.QueueSnapshot)
+            self.assertEqual(snapshot.inputs.ordered, [])
+
+
+@final
 class BusyHolderTests(unittest.TestCase):
     def test_busy_claim_line_keeps_the_job_and_kept_claim_description(self) -> None:
         for what in ("cargo nextest -p hana", "leftovers of cargo test on prior-mac", "job since last week"):
@@ -796,6 +947,23 @@ class BusyHolderTests(unittest.TestCase):
             with redirect_stdout(io.StringIO()):
                 _ = offload.write_result(offload.PassedOnMac(0.5), offload.ResultFile(path))
             self.assertNotIn("holder=", path.read_text())
+
+
+@final
+class VerifyMirrorWaitTests(verify_mac_offload_test_support.VerifyMacOffloadFixture):
+    def test_verify_waits_and_names_the_busy_mirror_session(self) -> None:
+        _ = self.routing_fixture()
+        holder = "last recorded mirror session reader (mirror process check)"
+        self.environment.update({"TEST_FREE_NOW_FREE": "1", "TEST_RUNNER_HOLDER": holder})
+        process = self.start_routing()
+
+        _ = (self.runner_state / "mac-free").write_text("free\n")
+        _ = (self.runner_state / "continue-sleep").write_text("continue\n")
+        result = self.finish_verify(process)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(result.stderr.count(f"verify.sh: Mac holder: {holder}.\n"), 1)
+        self.assertEqual(len(self.runner_events()), 2)
+        self.assertEqual(self.local_runs(), [])
 
 
 class OffloadCommandTests(OffloadCommandFixture):
@@ -1182,6 +1350,7 @@ class OffloadCommandTests(OffloadCommandFixture):
         result = self.command(runner_options=("--target", "mac"), direct_placement=True)
         self.assertEqual(result.returncode, 75, result.stdout)
         self.assert_wire("declined", "busy")
+        self.assertEqual(self.wire_result().get("holder"), "last recorded mirror session grep")
         self.assertNotIn("without a final status", result.stdout)
         self.assertTrue(path.exists())
         self.assertFalse(self.claim_file.exists())
@@ -1224,10 +1393,26 @@ class OffloadCommandTests(OffloadCommandFixture):
         identity = claim_state.ClaimIdentity(claim["claim_id"], claim["episode"], claim["attempt"])
         self.assertIn(offload.pending_start_key(identity), settlement["args"][-1])
 
-        _ = stub.write_text(source.replace("rsync: destination denied", "copies: /mirror/hana: busy; held by session reader"))
-        result = self.command(runner_options=("--target", "mac"))
-        self.assertEqual(result.returncode, 75, result.stdout)
-        self.assertTrue((self.state_directory / "mirror-busy-hana.until").exists())
+        self.assertNotIn("holder", self.wire_result())
+        self.assertFalse((self.state_directory / "mirror-busy-hana.until").exists())
+
+        self.fixture["rsync_status"] = 12
+        self.sync_fixture()
+        backoff = self.state_directory / "mirror-busy-hana.until"
+        for check in ("mirror lease", "mirror process check"):
+            with self.subTest(check=check):
+                _ = stub.write_text(source.replace(
+                    "rsync: destination denied", f"copies: /mirror/hana: busy; held by session reader ({check})",
+                ).replace("code 23", "code 12"))
+                before = len(self.events_for("rsync"))
+                result = self.command(runner_options=("--target", "mac"))
+                self.assertEqual(result.returncode, 75, result.stdout + result.stderr)
+                self.assert_wire("declined", "busy")
+                self.assertEqual(self.wire_result().get("holder"), f"last recorded mirror session reader ({check})")
+                self.assertEqual(len(self.events_for("rsync")), before + 1)
+                self.assertGreater(float(backoff.read_text()), time.time())
+                self.assertFalse(self.claim_file.exists())
+                backoff.unlink()
 
     def test_tracked_script_transfer_keeps_the_failed_command_error(self) -> None:
         controller = offload.ProcessController()

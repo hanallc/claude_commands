@@ -24,7 +24,7 @@ class LandQueueTests(unittest.TestCase):
         self.enterContext(patch.dict(os.environ, {
             "HOME": str(self.root), "CONF_DIR": str(self.root / "config"),
             "MODELS_CONFIG_FILE": str(self.root / "config/models.conf"),
-            "MERGE_GATE_STATE_DIR": str(self.root / "land-state"),
+            "GATE_STATE_DIR": str(self.root / "land-state"),
             "XDG_STATE_HOME": str(self.root / "state"),
         }))
 

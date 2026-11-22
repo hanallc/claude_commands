@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import subprocess
 from typing import cast
+from scripts.lib.helper_tree_test_support import verify_test_environment
 from scripts.direct.verify_token_wait_test_support import VERIFY, BOARD
 from scripts.direct.verify_token_ownership_test_support import VerifyTokenOwnershipFixture
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -31,14 +32,16 @@ class VerifyTokenOwnershipTests(VerifyTokenOwnershipFixture):
 
             _ = (lock / "expires").write_text("0")
             refused = subprocess.run(["bash", str(BOARD), "acquire", str(board), "second",
-                                      "cargo", "--wait", "0"], capture_output=True, text=True,
+                                      "cargo", "--wait", "0"],
+                                      env=verify_test_environment(), capture_output=True, text=True,
                                      check=False, timeout=TEST_HANG_GUARD_SECS)
             self.assertNotEqual(refused.returncode, 0, refused.stdout + refused.stderr)
             self.assertEqual((lock / "holder_pid").read_text(), str(first.pid))
             step_record["start"] = "not-the-running-group"
             _ = (lock / "owned").write_text(json.dumps(step_record))
             second = subprocess.run(["bash", str(BOARD), "acquire", str(board), "second",
-                                     "cargo", "--wait", "0"], capture_output=True, text=True,
+                                     "cargo", "--wait", "0"],
+                                     env=verify_test_environment(), capture_output=True, text=True,
                                     check=False, timeout=TEST_HANG_GUARD_SECS)
             self.assertEqual(second.returncode, 1, second.stdout + second.stderr)
             self.assertEqual((lock / "holder_pid").read_text(), str(first.pid))
@@ -49,10 +52,12 @@ class VerifyTokenOwnershipTests(VerifyTokenOwnershipFixture):
 
             wrong_process_release = subprocess.run(
                 ["bash", str(BOARD), "release", str(board), "first", "cargo", "--pid", "1"],
+                env=verify_test_environment(),
                 capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
             self.assertEqual(wrong_process_release.returncode, 1, wrong_process_release.stderr)
             unowned_release = subprocess.run(
                 ["bash", str(BOARD), "release", str(board), "third", "cargo"],
+                env=verify_test_environment(),
                 capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
             self.assertEqual(unowned_release.returncode, 1, unowned_release.stderr)
 

@@ -27,6 +27,7 @@ from scripts.production.staff_test_support import (
 from scripts.production import investigation, staff, tidy_wrapped, update_registration
 from scripts.production.cli_fixture import ImmutableGitSeed, invoke_cli
 from scripts.copies import copies
+from scripts.copies.workspace_test_support import registered_workspace
 from scripts.lib import build_folders
 from scripts.copies.copies_test_support import copies_environment, fake_remote_removal, publish_mirror
 from scripts.copies.remote_test_support import local_remote_transport
@@ -301,7 +302,7 @@ class TidyWrappedTests(unittest.TestCase):
                                           "cleanup@example.invalid", {"Cargo.toml": "[workspace]\n", "file.txt": "content"}).checkout
         doc = self.doc("done", "wrapped")
         state = self.state_files("done")
-        with copies.workspace(str(self.owner("done").id), source, "HEAD", name="damaged", branch="worker") as tree:
+        with registered_workspace(str(self.owner("done").id), source, "HEAD", name="damaged", branch="worker") as tree:
             pass
         record = tree / copy_record.RECORD
         original = record.read_text()

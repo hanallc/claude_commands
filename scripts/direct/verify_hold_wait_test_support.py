@@ -33,11 +33,13 @@ from unittest import mock
 
 from scripts.build_hold import build_hold
 from scripts.direct.recorder_fixture import invoke_recorder, record_wait_workers
+from scripts.production import staff
 from scripts.production.staff_test_support import fixture_runtime_id
 from scripts.direct.verify_mac_offload_test_support import (
     VerifyMacOffloadFixture, CallRecord, CARGO_STUB, hold_recorder_exits, install_fixed_cargo, wait_for_marker_exit,
 )
-from scripts.direct.local_release_wait import RELEASE_CHANGES, LocalReleaseEvents, local_release_waiter
+from scripts.direct.local_release_wait import RELEASE_CHANGES, LocalReleaseEvents, episode_is_assigned, local_release_waiter
+from scripts.direct.wait_for_test_state import wait_for_file, wait_until
 from scripts.lib import inotify
 from scripts.lib.build_folders_test_support import tool_folders
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -76,6 +78,56 @@ class CallWithHoldWait(CallRecord):
 
 def read_cycle_file(path: Path) -> build_hold.HoldCycle:
     return cast(build_hold.HoldCycle, json.loads(path.read_text()))
+
+
+def wait_rows(session: Path) -> list[dict[str, object]]:
+    """Read the recorder's wait events from its private history."""
+    state = cast(dict[str, object], json.loads((session / "progress_history_state.json").read_text()))
+    return [row for line in Path(cast(str, state["history_file"])).read_text().splitlines(keepends=True)
+            if line.endswith("\n")
+            and str((row := cast(dict[str, object], json.loads(line)))["event_type"]).startswith("wait_")]
+
+
+def recorded_holders(rows: list[dict[str, object]]) -> list[object]:
+    return [row["holder"] for row in rows if row["event_type"] in ("wait_started", "wait_holder_seen")]
+
+
+def wait_for_verify_state(ready: Callable[[], bool], directory: Path, process: subprocess.Popen[str],
+                          what: str) -> None:
+    """Wait for the fixture state or the caller's exit."""
+    wait_until(lambda: ready() or process.poll() is not None, directory, processes=(process,))
+    if not ready():
+        raise AssertionError(f"verify exited {process.returncode} before {what}")
+
+
+def wait_for_target_holder(episode: str) -> None:
+    """Pause when the recorder writes a new holder entry."""
+    root = Path(os.environ["PACKAGE_ROOT"])
+    session = Path(os.environ["UNIT_RUN_DIR"])
+    pauses = int(os.environ["TEST_TARGET_PAUSES"])
+    admission = Path(os.environ["TEST_TARGET_ADMISSION"])
+    snapshot = admission / "queue.json"
+    state = admission / "state.json"
+
+    def snapshot_version() -> tuple[int, int] | None:
+        try:
+            status = snapshot.stat()
+        except FileNotFoundError:
+            return None
+        return status.st_ino, status.st_mtime_ns
+
+    previous = snapshot_version()
+    for number in range(1, pauses + 1):
+        resume = root / f"target-resume-{number}"
+        if resume.exists():
+            continue
+        if len(recorded_holders(wait_rows(session))) >= number:
+            (root / f"target-holder-{number}").touch()
+            wait_for_file(resume)
+            return
+        break
+    # The next pass can publish new provider evidence.
+    wait_until(lambda: snapshot_version() != previous or episode_is_assigned(state, episode), admission)
 
 
 @contextmanager
@@ -434,10 +486,16 @@ exit "$status"
         self.fixture.environment["BUILD_TARGETS_SCRIPT"] = str(TARGETS)
 
     def record_phase(self) -> Path:
+        return self.record_phase_for_worker("fixture-impl")
+
+    def record_phase_for_worker(self, runner_worker: str) -> Path:
         session = self.fixture.root / "unit-run"
-        record_wait_workers(self.fixture.root, session, self.fixture.environment, {"fixture-impl": "thread-impl"})
+        runner = staff.caller_identity()
+        impl = (runner if runner_worker == "fixture-impl" else "") or fixture_runtime_id("thread-impl")
+        record_wait_workers(self.fixture.root, session, self.fixture.environment, {"fixture-impl": "thread-impl"},
+                            runtime_ids={"fixture-impl": impl})
         self.fixture.environment.update({"UNIT_RUN_DIR": str(session), "UNIT_PHASE_ID": "closed-server-phase",
-                                         "UNIT_TEAM_ROLE": "impl", "CODEX_THREAD_ID": fixture_runtime_id("thread-impl"),
+                                         "UNIT_TEAM_ROLE": "impl", "CODEX_THREAD_ID": impl,
                                          "UNIT_PASS_OWNER": "launcher",
                                          "UNIT_HISTORY_DIR": str(self.fixture.root / "history"),
                                          "UNIT_SYNC_WRITES": "0", "CLAUDE_PROBE_SESSION": ""})
@@ -455,10 +513,11 @@ exit "$status"
         return self.fixture.root / "history" / "runs" / f"{session.name}.jsonl"
 
     def assert_wait_follows_worker_thread(self, worker_name: str) -> None:
-        history = self.record_phase()
+        history = self.record_phase_for_worker(worker_name)
         session = Path(self.fixture.environment["UNIT_RUN_DIR"])
+        runner = staff.caller_identity() or fixture_runtime_id("thread-test")
         record_wait_workers(self.fixture.root, session, self.fixture.environment,
-                            {"fixture-impl": "thread-impl", worker_name: "thread-test"})
+                            {worker_name: "thread-test"}, runtime_ids={worker_name: runner})
         for arguments in (
             ["start-phase", "--session-dir", str(session), "--phase-id", "7", "--phase-title", "Test"],
             ["start-pass", "--session-dir", str(session), "--phase-id", "7", "--pass-kind", "test",
@@ -467,7 +526,7 @@ exit "$status"
         ):
             result = invoke_recorder(arguments, {**self.fixture.environment, "UNIT_TEAM_ROLE": "test"}, self.fixture.root)
             self.assertEqual(result.returncode, 0, result.stderr)
-        self.fixture.environment["CODEX_THREAD_ID"] = fixture_runtime_id("thread-test")
+        self.fixture.environment["CODEX_THREAD_ID"] = runner
         self.hold()
         process = self.start("test", "sample", "--local", "worker attribution", "--filter", "smoke")
         self.wait_for_call(process)
@@ -481,7 +540,7 @@ exit "$status"
         for wait in (started, finished):
             self.assertEqual((wait["phase_id"], wait["phase_instance_id"], wait["pass_instance_id"],
                               wait["worker_name"], wait["owner_session"]),
-                             ("7", worker_pass["phase_instance_id"], worker_pass["pass_instance_id"], worker_name, fixture_runtime_id("thread-test")))
+                             ("7", worker_pass["phase_instance_id"], worker_pass["pass_instance_id"], worker_name, runner))
 
     def count_python_starts(self) -> Path:
         starts = self.fixture.root / "python-starts"

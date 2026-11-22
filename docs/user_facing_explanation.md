@@ -18,7 +18,7 @@ have to rebuild themselves:
 
 | Left to them | Prevented by |
 | --- | --- |
-| What a name means | behavior before name; the banned-vocabulary list |
+| What a name means | Describe the behavior before you give the name. |
 | How the pieces relate | state the model before the items |
 | Whether an issue is real | verify it before naming it; only real choices reach the user |
 | Which option is better | exactly one recommendation, with its reason |

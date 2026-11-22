@@ -18,7 +18,7 @@ import time
 import unittest
 import uuid
 from pathlib import Path
-from typing import Literal, NotRequired, TypedDict, cast, override
+from typing import ClassVar, Literal, NotRequired, TypedDict, cast, override
 
 from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.lib import process_start as process_identity
@@ -69,6 +69,7 @@ def assigned_adapter_main() -> int:
         result = offload.run_offload(controller, config, request, started)
     status = offload.write_result(result, request.result, request.last_decline, request.verb,
                                  request.target, controller.attempt_evidence, request.fetch)
+    offload.report_result_details(request, result)
     offload.persist_attempt(request, result, controller.attempt_evidence, started)
     return status
 
@@ -248,6 +249,18 @@ exec(compile(Path(__file__).read_text(), __file__, "exec"), globals())
 
 
 class OffloadCommandFixture(unittest.TestCase):
+    tools_root: ClassVar[Path | None] = None
+
+    @classmethod
+    @override
+    def setUpClass(cls) -> None:
+        super().setUpClass()
+        cls.tools_root = Path(cls.enterClassContext(tempfile.TemporaryDirectory(prefix="offload-tools-")))
+        cls.addClassCleanup(setattr, cls, "tools_root", None)
+
+    def private_tools(self) -> Path:
+        return self.tools_root if self.tools_root is not None else self.root / "tools"
+
     def __init__(self, methodName: str = "runTest") -> None:
         super().__init__(methodName)
         self.root: Path = Path()
@@ -314,6 +327,7 @@ class OffloadCommandFixture(unittest.TestCase):
             (self.bin_directory / name).symlink_to(stub)
         self.config = {
             "mirror_root": "~/" + FIXTURE_MIRROR_ROOT,
+            "mirror_busy_backoff_s": "120",
             "offload": "on",
             "host": "mac",
             "connect_timeout_s": "6",
@@ -379,7 +393,9 @@ class OffloadCommandFixture(unittest.TestCase):
             "BUILD_HOLD_RELEASE_DIR": str(self.root / "release"),
             "STAFF_FILE": str(self.root / "staff.json"),
             "BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": "",
+            "PYTHONPYCACHEPREFIX": str(self.private_tools() / "bytecode"),
         }
+        _ = self.environment.pop("PYTHONDONTWRITEBYTECODE", None)
         self.start_admission()
 
     def start_admission(self) -> None:
@@ -640,11 +656,16 @@ raise SystemExit(offload.main())
         )
 
     def claim_stub_runner(self) -> Path:
-        checkout = self.root / "claim-runner"
-        copy_runtime(checkout)
-        runner_directory = checkout / "scripts/mac_test"
-        self.write_executable(runner_directory / "mac_test.py", CLAIM_STUB)
-        return runner_directory / "offload.py"
+        tools = self.private_tools()
+        checkout = tools / "claim-runner"
+        if not checkout.exists():
+            tools.mkdir(exist_ok=True)
+            with tempfile.TemporaryDirectory(prefix="claim-runner-", dir=tools) as directory:
+                staging = Path(directory) / "checkout"
+                copy_runtime(staging)
+                self.write_executable(staging / "scripts/mac_test/mac_test.py", CLAIM_STUB)
+                _ = staging.rename(checkout)
+        return checkout / "scripts/mac_test/offload.py"
 
     def state_command(self, *arguments: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(

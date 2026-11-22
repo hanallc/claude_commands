@@ -188,7 +188,9 @@ class StyleSyncTests(unittest.TestCase):
             path.parent.mkdir(parents=True, exist_ok=True)
             _ = path.write_text(content)
         _ = shutil.copytree(self.initial_repository / ".git", self.repo / ".git")
+        _ = self.git("remote", "add", "origin", str(self.root / "unused-origin/sample"))
         self.tip = self.git("rev-parse", "HEAD")
+        _ = self.git("update-ref", "refs/remotes/origin/main", self.tip)
         self.doc = self.style / "docs/sample-style-production.md"
         rule_root = self.root / "nate_style"
         (rule_root / "rust").mkdir(parents=True)
@@ -196,7 +198,9 @@ class StyleSyncTests(unittest.TestCase):
             _ = (rule_root / "rust" / f"{tool}.md").write_text(f"---\ntier: A\nmechanism: {tool}\n---\n# {tool}\n")
         environment = copies_environment(self.root)
         _ = write_config_fixture(Path(environment["CONF_DIR"]) / "build_folders.conf",
-            "patterns.legacy-unique={purpose}{suffix}\n")
+            "patterns.legacy-unique={purpose}{suffix}\n"
+            + f"roots.build={self.root / 'build'}\nroots.build.natedev={self.root / 'build'}\n"
+            + f"roots.workspace={self.root / 'worktrees'}\n")
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
             **environment,
             "HOME": str(self.root / "gate-home"),
@@ -253,11 +257,6 @@ class StyleSyncTests(unittest.TestCase):
             def main() -> int:
                 exec(compile(script.read_text(), str(script), "exec"), {**vars(module), "__name__": "__main__"})
                 return 0
-        elif command[:3] == [str(style_sync.PYTHON), str(Path(scratch.__file__)), "cargo-save"]:
-            module = scratch
-
-            def main() -> int:
-                return scratch.main(sys.argv[1:])
         else:
             return run_style_command(self.root, self, command, capture_output=capture_output, text=text,
                                      check=check, cwd=cwd, env=env, stdin=stdin, stdout=stdout, stderr=stderr,
@@ -434,7 +433,6 @@ class StyleSyncTests(unittest.TestCase):
         rule = "global:rust/names.md"
         _ = (self.root / "nate_style/rust/names.md").write_text("---\ntier: C\nfamily: names\ninput_scope: file\n---\n# Names\n")
         run = self.root / "run"
-        journal = style_ledger.publication_path(worktree, "publication.json")
 
         def assign(ticket: str, source: str) -> None:
             with style_ledger.open_ledger(worktree) as ledger:
@@ -445,12 +443,6 @@ class StyleSyncTests(unittest.TestCase):
                 blob = ledger.pinned_rule_texts(ticket)[0].blob
                 ledger.record(rule, source, head, blob, "clean", ticket=ticket, worker="test")
 
-        unlink = Path.unlink
-        def stop_before_journal_removal(path: Path, missing_ok: bool = False) -> None:
-            if path == journal:
-                raise RuntimeError("publication stopped after checkpoint record")
-            unlink(path, missing_ok=missing_ok)
-
         for case, interrupted in (("ordinary merge", False), ("stopped publication", True)):
             with self.subTest(case=case), mock.patch.object(
                     style_plan, "run_verification_step", return_value=subprocess.CompletedProcess([], 0)):
@@ -458,11 +450,12 @@ class StyleSyncTests(unittest.TestCase):
                     ledger.set_tip(self.tip, "main")
                 if interrupted:
                     assign("3001", "src/lib.rs")
-                    with mock.patch.object(Path, "unlink", stop_before_journal_removal):
+                    with mock.patch.object(style_ledger.Ledger, "finish_publication",
+                                           side_effect=RuntimeError("publication stopped after checkpoint record")):
                         with self.assertRaisesRegex(RuntimeError, "publication stopped after checkpoint record"):
                             _ = style_plan.publish_checkpoint(worktree, "3001", run, "1", "First checkpoint\n")
-                    self.assertTrue(journal.exists())
                     with style_ledger.open_ledger(worktree) as ledger:
+                        self.assertIsInstance(ledger.pending_publication("refs/heads/unit-names"), style_ledger.PendingPublication)
                         self.assertEqual(ledger.ticket_get("3001")["state"], "checkpointed")
                     self.assertEqual(style_sync.git(worktree, "status", "--porcelain"), "")
                 _ = (self.repo / "src/lib.rs").write_text(f"fn changed_{int(interrupted)}() {{}}\n")
@@ -480,9 +473,9 @@ class StyleSyncTests(unittest.TestCase):
                     self.assertEqual(connection.execute("SELECT style_branch FROM sync").fetchone(), ("refs/heads/main",))
                 if interrupted:
                     self.assertEqual(style_sync.git(worktree, "merge-base", "HEAD", tip), tip)
-                    self.assertFalse(journal.exists())
                     _ = self.git("merge", "--no-edit", "unit-names")
                     with style_ledger.open_ledger(worktree) as ledger:
+                        self.assertIsInstance(ledger.pending_publication("refs/heads/unit-names"), style_ledger.NoPendingPublication)
                         _ = ledger.ticket_merge("3001")
                     assign("3002", "src/later.rs")
                     checkpoint = style_plan.publish_checkpoint(worktree, "3002", run, "2", "Later checkpoint\n")
@@ -815,6 +808,9 @@ class StyleSyncTests(unittest.TestCase):
 
     def test_linked_worktree_notification_finds_the_same_production(self) -> None:
         self.production()
+        alias = self.root / "former-style"
+        alias.symlink_to(self.style, target_is_directory=True)
+        _ = recorded_showrunner("sample-style", alias / self.doc.relative_to(self.style))
         unit = self.root / "unit"
         _ = self.git("worktree", "add", "-qb", "unit", str(unit))
         self.assertEqual(self.notice(unit), (0, ""))
@@ -928,7 +924,7 @@ if arguments[:2] == ["+nightly", "fmt"] and "--version" not in arguments:
             self.assertEqual(style_sync.main(["lint", "--repo", str(self.repo), "--checkout", str(self.repo),
                                               "--tip", self.tip]), 1)
         self.assertEqual((self.root / "checked-tip").read_text().strip(), self.tip)
-        self.assertEqual(self.git("worktree", "list", "--porcelain"), self.worktrees_with_slot(original_worktrees))
+        self.assertEqual(self.git("worktree", "list", "--porcelain"), self.worktrees_with_copy(original_worktrees))
         with closing(sqlite3.connect(self.root / "state/sample/ledger.sqlite")) as connection:
             rows = cast(list[tuple[str, str, int, str]], connection.execute(
                 "SELECT tool,tip,passed,diagnostics_json FROM lint_runs ORDER BY tool",
@@ -940,8 +936,12 @@ if arguments[:2] == ["+nightly", "fmt"] and "--version" not in arguments:
 
     def test_clean_check_mode_records_all_tools_passing_and_returns_zero(self) -> None:
         verify = self.root / "verify.sh"
+        snapshot = self.standing_target().parent
         metadata = self.lint_temp / f"{style_sync.lint_prefix()}*"
         _ = verify.write_text(f"#!/bin/bash\ncp {metadata}/owner.json {self.root / 'owner-seen'}\n"
+                              + f'test "$PWD" = "{snapshot}" || exit 3\n'
+                              + f'test "$CARGO_BUILD_BUILD_DIR" = "{snapshot / "target"}" || exit 4\n'
+                              + f'test "$CARGO_TARGET_DIR" = "{snapshot / "target"}" || exit 5\n'
                               + f"cp {metadata}/{style_sync.VERIFIER_FILE} {self.root / 'verifier-seen'}\n"
                               + f"echo $$ > {self.root / 'verify-pid'}\ncat <<'OUTPUT'\n" + CLEAN_LINT + "OUTPUT\n")
         with mock.patch.object(style_sync, "VERIFY", verify), redirect_stdout(io.StringIO()):
@@ -951,6 +951,7 @@ if arguments[:2] == ["+nightly", "fmt"] and "--version" not in arguments:
             "owner": os.getpid(), "repo": self.git("rev-parse", "--path-format=absolute", "--git-common-dir"),
         })
         self.assertEqual((self.root / "verifier-seen").read_text(), (self.root / "verify-pid").read_text().strip())
+        self.assertTrue((snapshot / "target" / scratch.USE_STAMP).is_file())
         self.assertEqual(list(self.lint_temp.iterdir()), [])
         with closing(sqlite3.connect(self.root / "state/sample/ledger.sqlite")) as connection:
             rows = cast(list[tuple[str, int, str]], connection.execute(
@@ -994,9 +995,9 @@ if arguments[:2] == ["+nightly", "fmt"] and "--version" not in arguments:
             _ = self.git("worktree", "add", "--detach", str(directory / "checkout"), self.tip)
         return directory
 
-    def worktrees_with_slot(self, original: str) -> str:
-        slot = self.standing_target().parent
-        return original + f"\n\nworktree {slot}\nHEAD {self.tip}\ndetached"
+    def worktrees_with_copy(self, original: str) -> str:
+        copy = self.standing_target().parent
+        return original + f"\n\nworktree {copy}\nHEAD {self.tip}\ndetached"
 
     def test_absent_checkout_keeps_recovery_marks_when_cargo_refuses_cleanup(self) -> None:
         directory = self.stale_dir("cargo-recovery", 0, registered=True)
@@ -1020,7 +1021,7 @@ if arguments[:2] == ["+nightly", "fmt"] and "--version" not in arguments:
         self.assertFalse(directory.exists())
 
     def standing_target(self) -> Path:
-        return copies.gates_root() / f"{self.repo.name}-slot1/target"
+        return build_folders.copy_path("sample", "sample-style", 1) / "target"
 
     def test_standing_target_survives_task_end_and_reuses_artifacts(self) -> None:
         target = self.standing_target()
@@ -1036,10 +1037,10 @@ if arguments[:2] == ["+nightly", "fmt"] and "--version" not in arguments:
     def test_lint_keeps_intermediates_with_the_standing_warm_target(self) -> None:
         target = self.standing_target()
         code, output = self.run_lint(
-            '[[ "$CARGO_BUILD_BUILD_DIR" == "$(realpath target)/intermediates" ]] || exit 2\n'
+            '[[ "$CARGO_BUILD_BUILD_DIR" == "$(realpath target)" ]] || exit 2\n'
             + 'printf warm > "$CARGO_BUILD_BUILD_DIR/intermediate"\n')
         self.assertEqual(code, 0, output)
-        self.assertEqual((target / "intermediates/intermediate").read_text(), "warm")
+        self.assertEqual((target / "intermediate").read_text(), "warm")
         self.assertEqual(list(self.lint_temp.iterdir()), [])
 
     def test_lint_keeps_its_own_warm_target_after_metadata_cleanup(self) -> None:
@@ -1049,10 +1050,11 @@ if arguments[:2] == ["+nightly", "fmt"] and "--version" not in arguments:
         self.assertEqual((target / "artifact").read_text(), "warm")
         self.assertEqual(list(self.lint_temp.iterdir()), [])
         self.assertNotIn(str(target), scratch.holds())
-        # A later checkout uses the same artifacts. No Cargo environment variable is overridden.
+        # The copy overrides the caller's target and reuses the artifacts.
         with mock.patch.dict(os.environ, {"CARGO_TARGET_DIR": "inherited-value"}):
             code, output = self.run_lint(
-                '[[ -d target && ! -L target && $(cat target/artifact) == warm && $CARGO_TARGET_DIR == inherited-value ]] || exit 2\n'
+                '[[ -d target && ! -L target && $(cat target/artifact) == warm ]] || exit 2\n'
+                + '[[ $CARGO_TARGET_DIR == "$(realpath target)" ]] || exit 3\n'
             )
         self.assertEqual(code, 0, output)
         self.assertEqual(list(self.lint_temp.iterdir()), [])
@@ -1077,12 +1079,13 @@ if arguments[:2] == ["+nightly", "fmt"] and "--version" not in arguments:
         observed = self.root / "fallback-checkout"
         with (mock.patch.object(style_sync, "gate_owner", self.resolve_owner),
               mock.patch.object(style_sync, "standing_style_production", return_value=NoStyleProduction(self.repo, "sample-style")),
+              mock.patch.object(staff, "caller_identity", return_value="unregistered-caller"),
               mock.patch.object(showrunners, "own_name", return_value=""),
               mock.patch.object(copies, "fallback_owner", return_value="configured-style")):
             code, output = self.run_lint(f"pwd -P > {observed}\n")
         self.assertEqual(code, 0, output)
         checkout = Path(observed.read_text().strip())
-        self.assertEqual(checkout, copies.gates_root() / f"{self.repo.name}-slot1")
+        self.assertEqual(checkout, build_folders.copy_path("sample", "configured-style", 1))
         self.assertTrue(checkout.exists())
         self.assertEqual(build_folders.build_folder_state(checkout), "free")
         self.assertTrue((checkout / "target").is_dir())
@@ -1107,13 +1110,12 @@ with tree.with_name(tree.name + '.lock').open('r+') as lock:
             self.assertEqual(code, 0, output)
             second = Path(observed.read_text().strip())
             self.assertNotEqual(first, second)
-            self.assertEqual(second.name, f"{self.repo.name}-slot2")
-            second_cache = self.standing_target().parent.with_name(f"{self.repo.name}-slot2")
-            self.assertTrue((second_cache / "target").is_dir())
+            self.assertEqual(second, build_folders.copy_path("sample", "sample-style", 2))
+            self.assertTrue((second / "target").is_dir())
             self.assertTrue(second.exists())
             self.assertEqual(build_folders.build_folder_state(second), "free")
             self.assertTrue((first / ".git").is_file())
-            with second_cache.with_name(second_cache.name + ".lock").open("r+") as lock:
+            with second.with_name(second.name + ".lock").open("r+") as lock:
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 fcntl.flock(lock, fcntl.LOCK_UN)
         with copies.standing("sample-style", self.repo, copies.CommittedSource(self.tip)) as reused:
@@ -1165,7 +1167,7 @@ with tree.with_name(tree.name + '.lock').open('r+') as lock:
                 self.assertEqual(process.returncode, 128 + signum, stderr)
                 self.assertIn(f"lint stopped by {signum.name}", stderr)
                 self.assertEqual(list(self.lint_temp.iterdir()), [])
-                self.assertEqual(self.git("worktree", "list", "--porcelain"), self.worktrees_with_slot(original_worktrees))
+                self.assertEqual(self.git("worktree", "list", "--porcelain"), self.worktrees_with_copy(original_worktrees))
                 child, grandchild = (int(pid) for pid in pids.read_text().split())
                 self.assertTrue(wait_until(lambda: not running(child) and not running(grandchild), TEST_HANG_GUARD_SECS))
 
@@ -1202,7 +1204,7 @@ with tree.with_name(tree.name + '.lock').open('r+') as lock:
         self.assertEqual(list(self.lint_temp.iterdir()), [])
 
 
-    def test_standing_checkout_has_no_registration_in_the_source(self) -> None:
+    def test_standing_checkout_remains_registered_in_the_source(self) -> None:
         original_worktrees = self.git("worktree", "list", "--porcelain")
         observed = self.root / "unregistered-checkout"
         code, output = self.run_lint(f"pwd -P > {observed}\n[[ -f .git ]] || exit 2\n")
@@ -1212,7 +1214,7 @@ with tree.with_name(tree.name + '.lock').open('r+') as lock:
         self.assertEqual(build_folders.build_folder_state(checkout), "free")
         self.assertTrue(self.standing_target().is_dir())
         self.assertTrue((self.standing_target().parent / ".git").is_file())
-        self.assertEqual(self.git("worktree", "list", "--porcelain"), self.worktrees_with_slot(original_worktrees))
+        self.assertEqual(self.git("worktree", "list", "--porcelain"), self.worktrees_with_copy(original_worktrees))
         self.assertEqual(list(self.lint_temp.iterdir()), [])
 
     def test_sweep_removes_only_dead_runs_dirs_with_their_registrations(self) -> None:
@@ -1347,7 +1349,7 @@ with tree.with_name(tree.name + '.lock').open('r+') as lock:
             code, output = self.run_lint()
         self.assertEqual(code, 0, output)
         self.assertEqual(list(self.lint_temp.iterdir()), [])
-        self.assertEqual(self.git("worktree", "list", "--porcelain"), self.worktrees_with_slot(original_worktrees))
+        self.assertEqual(self.git("worktree", "list", "--porcelain"), self.worktrees_with_copy(original_worktrees))
         self.assertTrue((self.standing_target().parent / ".git").is_file())
         self.assertTrue(self.standing_target().is_dir())
 
@@ -1409,17 +1411,19 @@ with tree.with_name(tree.name + '.lock').open('r+') as lock:
         self.assertEqual(lease["pid"], process.pid)
         self.assertIsInstance(lease["start_time"], str)
         self.assertEqual(build_folders.build_folder_state(directory), "free")
-        # The killed owner cannot remove its gate copy; the test folder removes it.
-        self.assertTrue((directory / "checkout").resolve().is_relative_to(self.root.resolve()))
+        copy = (directory / "checkout").resolve()
+        self.assertEqual(copy, self.standing_target().parent)
+        self.assertEqual(build_folders.build_folder_state(copy), "held")
         with redirect_stdout(io.StringIO()):
             style_sync.sweep_stale_lint_dirs()
         self.assertTrue((directory / "checkout").exists())
         kill_group(group)
         self.assertTrue(wait_until(lambda: not group_running(group), TEST_HANG_GUARD_SECS))
+        self.assertEqual(build_folders.build_folder_state(copy), "free")
         with redirect_stdout(io.StringIO()):
             style_sync.sweep_stale_lint_dirs()
         self.assertEqual(list(self.lint_temp.iterdir()), [])
-        self.assertEqual(self.git("worktree", "list", "--porcelain"), self.worktrees_with_slot(original_worktrees))
+        self.assertEqual(self.git("worktree", "list", "--porcelain"), self.worktrees_with_copy(original_worktrees))
 
     def test_a_verifier_wrapper_whose_owner_is_gone_exits_before_verify_starts(self) -> None:
         directory = self.root / "wrapper"
@@ -1578,6 +1582,7 @@ with tree.with_name(tree.name + '.lock').open('r+') as lock:
         self.assertEqual(self.handoff_rows()[0][1], "pending")
         self.assertEqual(self.handoff_notices(), [])
         _ = self.git("merge", "--no-ff", "-qm", "Integrate root handoff", "style/main")
+        _ = self.git("update-ref", "refs/remotes/origin/main", "HEAD")
         code, output = self.resume_handoffs()
         self.assertEqual(code, 0)
         self.assertIn(f"hand-off {checkpoint}: pending -> merged", output)
@@ -1607,6 +1612,7 @@ with tree.with_name(tree.name + '.lock').open('r+') as lock:
             ledger.handoff_send(checkpoint, "parent")
         _ = self.git("merge", "--no-ff", "-qm", "Integrate handoff", "style/main")
         merge = self.git("rev-parse", "HEAD")
+        _ = self.git("update-ref", "refs/remotes/origin/main", merge)
         def acknowledge() -> subprocess.CompletedProcess[str]:
             return subprocess.run([str(style_sync.PYTHON), str(Path(style_ledger.__file__)), "handoff", "merged",
                                    "--repo", str(self.repo), "--checkpoint", checkpoint, "--merge-commit", merge],

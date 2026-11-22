@@ -8,6 +8,9 @@ from pathlib import Path
 
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
+_FIXTURE_NAME = "Test"
+_FIXTURE_EMAIL = "test@example.invalid"
+
 
 def git_fixture_environment() -> dict[str, str]:
     """Keep inherited Git overrides out of disposable repositories."""
@@ -18,8 +21,19 @@ def write_fixture_git_config(directory: Path) -> Path:
     """Write a private Git configuration and return its path."""
     # Disable detached maintenance so Git cannot remove objects during snapshot copies.
     path = directory / "git-config"
-    _ = path.write_text("[maintenance]\n\tauto = false\n", encoding="utf-8")
+    _ = path.write_text(
+        f"[user]\n\tname = {_FIXTURE_NAME}\n\temail = {_FIXTURE_EMAIL}\n"
+        + "[maintenance]\n\tauto = false\n",
+        encoding="utf-8",
+    )
     return path
+
+
+def fixture_git_environment(directory: Path) -> dict[str, str]:
+    """Give fixture commands a private Git configuration and repository lookup."""
+    environment = {name: value for name, value in os.environ.items() if not name.startswith("GIT_")}
+    return {**environment, "GIT_CONFIG_GLOBAL": str(write_fixture_git_config(directory)),
+            "GIT_CONFIG_NOSYSTEM": "1"}
 
 
 def commit_repository(repository: Path, message: str, *paths: str, allow_empty: bool = False,
@@ -27,7 +41,7 @@ def commit_repository(repository: Path, message: str, *paths: str, allow_empty: 
     """Stage selected paths (all by default), commit, and return the new HEAD."""
     for arguments in (
         ["add", "--", *(paths or (".",))],
-        ["-c", "user.name=Test", "-c", "user.email=test@example.invalid",
+        ["-c", f"user.name={_FIXTURE_NAME}", "-c", f"user.email={_FIXTURE_EMAIL}",
          "-c", "commit.gpgsign=false", "commit", *(["--allow-empty"] if allow_empty else []), "-qm", message],
     ):
         _ = subprocess.run(["git", "-C", str(repository), *arguments], check=True,
