@@ -1184,7 +1184,7 @@ background:var(--ink-2);border-radius:50%}
 .list-eta{display:block;position:relative;min-width:0}
 .list-eta-text{display:block;overflow:hidden;white-space:nowrap;text-overflow:ellipsis}
 .list-eta:focus-visible{outline:2px solid currentColor;outline-offset:2px}
-.list-eta-full{display:none;position:absolute;inset-block-start:calc(100% + 4px);inset-inline-end:0;z-index:1;
+.list-eta-full{display:none;position:absolute;inset-block-start:calc(100% + 4px);inset-inline-end:0;z-index:5;
 width:max-content;max-width:min(28rem,calc(100vw - 4rem));padding:6px 8px;background:var(--card);
 border:1px solid var(--line);border-radius:6px;overflow-wrap:anywhere}
 .list-eta:focus-visible .list-eta-full{display:block}
@@ -1749,7 +1749,8 @@ function bindFeedbackForm(form){
       if(saved && item.hidden){
        const status=content.querySelector('[data-hidden-action-status]');
        const top=target.getBoundingClientRect().top;
-       const inset=document.querySelector('[data-page-status]').offsetHeight+12;
+       const inset=(typeof stuckPageHeadingBottom==='function' ? stuckPageHeadingBottom()
+        : document.querySelector('[data-page-status]').offsetHeight)+12;
        if(top<inset || status.getBoundingClientRect().bottom>innerHeight)
         scrollBy({top:Math.floor(top-inset),behavior:'instant'});
       }

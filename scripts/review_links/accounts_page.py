@@ -684,7 +684,7 @@ background:transparent;color:var(--ink-2);cursor:pointer}
 .next-button:focus-visible{background:var(--hover)}
 .next-button svg,.next-minus svg{width:14px;height:14px;vertical-align:middle}
 .move-menu button[aria-checked=true]{background:var(--hover)}
-.move-menu{position:fixed;margin:0;padding:6px;width:max-content;min-width:220px;max-width:calc(100vw - 16px);box-sizing:border-box;
+.move-menu{position:fixed;z-index:5;margin:0;padding:6px;width:max-content;min-width:220px;max-width:calc(100vw - 16px);box-sizing:border-box;
 border:1px solid var(--line);border-radius:10px;background:var(--card);color:var(--ink);box-shadow:0 4px 20px var(--edge);
 font-size:.86rem;font-variant-numeric:tabular-nums}
 .move-menu[hidden]{display:none}
@@ -701,7 +701,7 @@ padding:2px;border:0;border-radius:5px;background:transparent;cursor:pointer}
 .quota-icon:hover{background:var(--hover)}
 .quota-icon[aria-expanded=true]{box-shadow:0 0 0 2px var(--accent)}
 .quota-icon:focus-visible,.quota-panel button:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
-.quota-panel{position:fixed;z-index:1;width:250px;max-width:calc(100vw - 16px);padding:11px 14px;
+.quota-panel{position:fixed;z-index:5;width:250px;max-width:calc(100vw - 16px);padding:11px 14px;
 border:1px solid var(--line);border-radius:11px;background:var(--hover);color:var(--ink);box-shadow:0 4px 20px var(--edge);font-size:.86rem}
 .quota-panel p{color:var(--ink-2);margin:2px 0 10px;font-size:.76rem}
 .quota-panel button{border:0;border-radius:7px;padding:5px 14px;background:var(--filter-selected-bg);

@@ -55,8 +55,8 @@ def with_owner(content: bytes, page: str, owner: staff.StaffRow | NoShownOwner, 
         elif not isinstance(recipient, OwnerNewItem):
             label = f"New item for {recipient}"
         label = html.escape(label, quote=True)
-        button = (f'<span class="page-owner-slot"><button type="button" data-owner-new aria-label="{label}" title="{label}">'
-                  + icon_svg("message-circle-question") + '</button></span>')
+        button = (f'<button type="button" data-owner-new aria-label="{label}" title="{label}">'
+                  + icon_svg("message-circle-question") + '</button>')
     control = (f'<div class="page-owner" data-page-owner="{page}">' + name + button + '</div>').encode()
     actions = HEADING_ACTIONS.encode()
     heading = TITLE_ELEMENT.search(content, main.end())
@@ -69,7 +69,7 @@ def with_owner(content: bytes, page: str, owner: staff.StaffRow | NoShownOwner, 
     if head is not None:
         content = content[:head.end()] + PAGE_SCRIPT_ERRORS.encode() + content[head.end():]
     row_style = HEADING_STYLE.encode()
-    style = (OWNER_STYLE + (OWNER_POSITION if button else "")).encode()
+    style = (OWNER_STYLE + HEADING_POSITION).encode()
     if BUTTON_STATES.encode() not in content:
         style = b'<style>' + BUTTON_STATES.encode() + b'</style>' + style
     if row_style not in content:
@@ -89,44 +89,65 @@ HEADING_STYLE = ('.page-heading{display:flex;align-items:center;flex-wrap:wrap;g
                  + 'max-width:100%;margin-inline-start:auto}')
 
 
+# The stacking order, lowest to highest: page content with its own sticky bars (z-index 3 or lower),
+# the heading row (4), overlays such as tooltips, menus and the Builds paused badge (5 to 10),
+# and the sticky status line (20).
 OWNER_STYLE = """<style>
-@media(max-width:560px){
-main:has([data-owner-new]){--page-owner-space:44px;border-inline-end:var(--page-owner-space) solid transparent}
-:is(.page-heading,main>.page-heading-actions):has([data-owner-new]){
-width:calc(100% + var(--page-owner-space));flex-basis:calc(100% + var(--page-owner-space));max-width:none}}
 .page-owner{display:flex;align-items:center;gap:8px;min-width:0;font:600 14px/1.4 system-ui,sans-serif}
 .page-owner-name{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.page-owner-slot{display:block;flex:none;width:36px;height:36px}
 .page-owner button{display:grid;place-items:center;flex:none;width:36px;height:36px;min-height:36px;
 margin:0;padding:7px;background:var(--card);color:var(--ink-2);border:1px solid var(--line);border-radius:8px;cursor:pointer}
-.page-owner-slot button{position:fixed;left:var(--page-owner-slot-left);z-index:19}
 .page-owner svg{width:18px;height:18px}
-@media(width>560px){
-.page-owner-slot button{left:auto;right:2px;width:28px;padding-inline:4px}}
+:is(.page-heading,main>.page-heading-actions){position:sticky;top:var(--page-heading-top,0px);z-index:4;
+background:var(--bg,Canvas)}
+:is(.page-heading,main>.page-heading-actions)[data-page-heading-stuck]{box-shadow:0 1px 0 var(--line)}
 </style>"""
 
 
-OWNER_POSITION = """<script>
-function positionPageOwner(){
- const button=document.querySelector('[data-owner-new]');
- const slot=button.parentElement.getBoundingClientRect();
+# The heading row sticks at the top. A stuck status line moves it down by the status height.
+# The row moves down only after the status line sticks, so it never moves at scroll zero.
+# A stuck row shows a line under it. The line takes no space, so the layout does not change.
+HEADING_POSITION = """<script>
+function stickyPageStatusHeight(){
  const banner=document.querySelector('[data-page-status]');
- const bannerHeight=banner && getComputedStyle(banner).position==='sticky' ? banner.getBoundingClientRect().height : 0;
- const pageTop=parseFloat(getComputedStyle(button.closest('main')).paddingTop);
- const top=Math.max(slot.top,pageTop,bannerHeight);
- button.style.setProperty('--page-owner-slot-left',slot.left+'px');
- button.style.top=top+'px';
- return top+slot.height;
+ return banner && getComputedStyle(banner).position==='sticky' ? banner.getBoundingClientRect().height : 0;
+}
+function stuckPageHeadingBottom(){
+ const row=document.querySelector('.page-heading,main>.page-heading-actions');
+ return stickyPageStatusHeight()+row.getBoundingClientRect().height;
 }
 document.addEventListener('DOMContentLoaded',()=>{
- const slot=document.querySelector('.page-owner-slot');
+ const root=document.documentElement.style;
+ const row=document.querySelector('.page-heading,main>.page-heading-actions');
  const banner=document.querySelector('[data-page-status]');
- const resize=new ResizeObserver(positionPageOwner);
- resize.observe(slot.closest('main'));
- if(banner) resize.observe(banner);
- addEventListener('resize',positionPageOwner);
- addEventListener('scroll',positionPageOwner,{passive:true});
- positionPageOwner();
+ const set=(name,pixels)=>{if(root.getPropertyValue(name)!==pixels+'px') root.setProperty(name,pixels+'px');};
+ let stuck=null,stuckTop=null;
+ const watchStuck=top=>{
+  if(top===stuckTop) return;
+  stuckTop=top;
+  stuck?.disconnect();
+  // The row is stuck when its sticky top clips it.
+  stuck=new IntersectionObserver(entries=>row.toggleAttribute('data-page-heading-stuck',entries.at(-1).intersectionRatio<1),
+   {root:document,rootMargin:-(top+1)+'px 0px 0px 0px',threshold:1});
+  stuck.observe(row);
+ };
+ const place=()=>{
+  const status=stickyPageStatusHeight(), top=status>0 && banner.getBoundingClientRect().top<1 ? status : 0;
+  set('--page-status-height',status);
+  set('--page-heading-height',row.getBoundingClientRect().height);
+  set('--page-heading-top',top);
+  watchStuck(top);
+ };
+ const resize=new ResizeObserver(place);
+ resize.observe(row);
+ if(banner){
+  resize.observe(banner);
+  // The clock writes the same state each second; only a new state can change the position.
+  new MutationObserver(records=>{if(records.some(record=>record.oldValue!==banner.dataset.state)) place();})
+   .observe(banner,{attributeFilter:['data-state'],attributeOldValue:true});
+  new IntersectionObserver(place,{root:document,rootMargin:'-1px 0px 0px 0px',threshold:1}).observe(banner);
+ }
+ place();
 },{once:true});
 </script>"""
 

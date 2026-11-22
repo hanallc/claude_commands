@@ -5515,8 +5515,7 @@ window.fetch=async(url)=>{
    await new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));
    const t=bounds(title), n=bounds(name), o=bounds(owner), r=bounds(row);
    const beside=Math.abs(center(t)-center(o))<=1;
-   const atRight=width===1280 ? o.left>=r.right && o.right<=document.documentElement.clientWidth :
-    Math.abs(o.right-r.right)<=1;
+   const atRight=Math.abs(o.right-r.right)<=1;
    if(innerWidth!==width || row.querySelectorAll('button').length!==1 || !row.contains(owner) ||
       Math.abs(center(n)-center(o))>1 || o.left<n.right+4 ||
       n.left<r.left-1 || !atRight ||

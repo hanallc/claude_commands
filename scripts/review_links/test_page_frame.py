@@ -24,6 +24,10 @@ from scripts.production import staff
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 NO_DATA_FILE: dict[str, object] = {}
+SCRIPTS = Path(__file__).resolve().parents[1]
+STICKY_HEADING = re.compile(rb':is\(\.page-heading,main>\.page-heading-actions\)\{[^}]*\}')
+PAGE_OWNER = staff.StaffRow(staff.StaffId("owner"), "showrunner", "Page owner", staff.STAFF_ROOT,
+                            current_session=staff.StaffId("session-owner"))
 STATUS_PAGES = (
     ("accounts", "Accounts", "users", "Accounts", 45),
     ("aws", "AWS", "cloud", "AWS", 3900),
@@ -126,6 +130,7 @@ class PageStatusTests(unittest.TestCase):
         content = record_table.STYLE + page_frame.title("The List", "list") + table
         markup = change_page.document(content + '<script>' + record_table.SCRIPT + '</script>', "The List")
         page = page_frame.with_owner(markup, "list", owner, staff.StaffSnapshot((owner,)), lambda: "")
+        reference = json.dumps(main_heading(page).decode()).replace('<', r'\u003c').encode()
         probe = b'''<script>
 (async()=>{
  const failures=[];
@@ -133,8 +138,16 @@ class PageStatusTests(unittest.TestCase):
  try{
   frameElement.style.height='800px';
   const button=document.querySelector('[data-owner-new]');
+  const owner=button.closest('.page-owner'), name=owner.querySelector('.page-owner-name');
+  const heading=document.querySelector('.page-heading');
+  const reference=document.createElement('iframe');
+  reference.style.cssText='position:fixed;left:-10000px;top:0;border:0;height:800px';
+  const referenceReady=new Promise(resolve=>reference.addEventListener('load',resolve,{once:true}));
+  reference.srcdoc=MAIN_PAGE;
+  document.body.append(reference);
+  await referenceReady;
   const title=document.querySelector('h1'), banner=document.querySelector('[data-page-status]');
-  const table=document.querySelector('table'), row=table.querySelector('.list-row');
+  const main=document.querySelector('main'), table=document.querySelector('table'), row=table.querySelector('.list-row');
   const detail=document.querySelector('[data-detail]');
   banner.dataset.state='Late';
   banner.querySelector('[data-status-word]').textContent='Late';
@@ -145,45 +158,167 @@ class PageStatusTests(unittest.TestCase):
   const view=createRecordTable({content:()=>document.querySelector('[data-test-list]'),
    shows:['all'],defaultShow:'all',visible:()=>true,applied:()=>{detail.hidden=false;}});
   const painted=()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));
-  const intersects=(a,b)=>a.left<b.right && b.left<a.right && a.top<b.bottom && b.top<a.bottom;
-  for(const width of [1400,320]){
+  const boxes=doc=>['.page-owner-name','[data-owner-new]'].map(selector=>{
+   const {x,y,width,height}=doc.querySelector(selector).getBoundingClientRect();
+   return [x,y,width,height];
+  });
+  const columns=()=>JSON.stringify([main,table].map(element=>{
+   const {left,width}=element.getBoundingClientRect();
+   return [left,width];
+  }));
+  const bottom=()=>document.scrollingElement.scrollHeight-innerHeight;
+  const line=()=>getComputedStyle(heading).boxShadow, lineColor=getComputedStyle(button).borderTopColor;
+  const opaque=color=>{const parts=color.match(/[0-9.]+/g);return parts!==null && (parts.length===3 || Number(parts[3])===1);};
+  const statusCovered=()=>{
+   const box=banner.getBoundingClientRect(), top=Math.max(box.top,0);
+   return [box.left+2,(box.left+box.right)/2,box.right-2].some(x=>[top+1,(top+box.bottom)/2,box.bottom-1]
+    .some(y=>!banner.contains(document.elementFromPoint(x,y))));
+  };
+  for(const width of [1440,1024,320]){
    const verify=(ok,message)=>check(ok,width+' px: '+message);
    frameElement.style.width=width+'px';
+   reference.style.width=width+'px';
    scrollTo({top:0,behavior:'instant'});
    await painted();
-   const first=button.getBoundingClientRect();
-   scrollTo({top:document.scrollingElement.scrollHeight,behavior:'instant'});
-   await painted();
-   const last=button.getBoundingClientRect(), status=banner.getBoundingClientRect();
-   verify(innerWidth===width && scrollY>innerHeight && scrollY===document.scrollingElement.scrollHeight-innerHeight,
-    'The page scrolls to the bottom of the long row.');
+   const first=JSON.stringify(boxes(document)), layout=columns(), headingHeight=heading.getBoundingClientRect().height;
+   verify(first===JSON.stringify(boxes(reference.contentDocument)),
+    'The name and button match the original heading at scroll zero.');
+   const background=getComputedStyle(heading).backgroundColor;
+   verify(opaque(background) && background===getComputedStyle(document.body).backgroundColor,
+    'The heading row has the opaque page background.');
+   verify(line()==='none' && !heading.hasAttribute('data-page-heading-stuck'),'The heading row has no line at scroll zero.');
+   const statusEnd=Math.ceil(banner.getBoundingClientRect().bottom+headingHeight);
+   for(let top=0;top<=statusEnd;top+=2){
+    scrollTo({top,behavior:'instant'});
+    await painted();
+    if(statusCovered()){verify(false,'The heading row covers the Late status at scroll '+top+'.');break;}
+   }
+   for(const top of [1,Math.floor(bottom()/2),bottom()]){
+    scrollTo({top,behavior:'instant'});
+    await painted();
+    verify(scrollY===top && columns()===layout,'The content keeps its left edge and width at scroll '+top+'.');
+   }
+   const last=owner.getBoundingClientRect(), status=banner.getBoundingClientRect(), headingBox=heading.getBoundingClientRect();
+   const nameBox=name.getBoundingClientRect(), buttonBox=button.getBoundingClientRect();
+   verify(innerWidth===width && scrollY>innerHeight && scrollY===bottom(),'The page scrolls to the bottom of the long row.');
    const state=banner.querySelector('.page-status-state').getBoundingClientRect();
    verify(status.top===0 && reason.getBoundingClientRect().top>=state.bottom,'The sticky status spans two lines.');
-   verify(last.top===first.top && last.right===first.right && last.left>=table.getBoundingClientRect().right && last.right<=innerWidth
-    && last.top>=status.bottom && last.bottom<=innerHeight,'The button stays at the top right below the status.');
-   verify(title.getBoundingClientRect().bottom<=0,'The page title scrolls away.');
-   const x=(last.left+last.right)/2,y=(last.top+last.bottom)/2;
-   verify(detail.getBoundingClientRect().top<y && detail.getBoundingClientRect().bottom>y,
-    'The open row scrolls beside the button.');
-   verify(button.contains(document.elementFromPoint(x,last.top+1))
-    && button.contains(document.elementFromPoint(x,last.bottom-1)),'The whole button is clickable.');
-   const text=document.createTreeWalker(table,NodeFilter.SHOW_TEXT), range=document.createRange();
-   let covered=false;
-   while(!covered && text.nextNode()){
-    range.selectNodeContents(text.currentNode);
-    covered=[...range.getClientRects()].some(box=>intersects(box,last));
+   verify(Math.abs(headingBox.top-status.bottom)<1 && heading.contains(title),'The heading row sticks below the status.');
+   verify(Math.abs(last.right-headingBox.right)<1 && last.top>=status.bottom && last.bottom<=headingBox.bottom
+    && last.bottom<=innerHeight,'The owner stays at the top right below the status.');
+   verify(nameBox.width>0 && Math.abs(buttonBox.left-nameBox.right-8)<0.1 && buttonBox.width===36,
+    'The name stays beside the full button.');
+   verify(detail.getBoundingClientRect().top<headingBox.top,'The open row scrolls under the heading row.');
+   verify(heading.hasAttribute('data-page-heading-stuck') && line().includes(lineColor) && line().includes('0px 1px 0px'),
+    'The stuck heading row shows the header line.');
+   verify(headingBox.height===headingHeight,'The line does not change the heading row height.');
+   let hidden=true;
+   for(let x=Math.ceil(last.left);x<last.right-1;x+=4){
+    for(let y=Math.ceil(last.top);y<last.bottom-1;y+=4){
+     hidden=hidden && heading.contains(document.elementFromPoint(x,y));
+    }
    }
-   verify(!covered,'Table text stays clear of the button.');
+   verify(hidden,'No table text shows under the owner.');
+   const x=(buttonBox.left+buttonBox.right)/2;
+   verify(button.contains(document.elementFromPoint(x,buttonBox.top+1))
+    && button.contains(document.elementFromPoint(x,buttonBox.bottom-1)),'The whole button is clickable.');
+   scrollTo({top:0,behavior:'instant'});
+   await painted();
+   verify(JSON.stringify(boxes(document))===first && line()==='none','The original heading returns at scroll zero.');
    verify(view.revealMatchingItem('open'),'The item jump finds the row.');
    await painted();
-   verify(document.activeElement===row.querySelector('button') && row.getBoundingClientRect().top>=
-    Math.max(banner.getBoundingClientRect().bottom,button.getBoundingClientRect().bottom),
-    'The item jump focuses the row below the status and button.');
+   verify(document.activeElement===row.querySelector('button') && scrollY>0 &&
+    row.getBoundingClientRect().top>=heading.getBoundingClientRect().bottom &&
+    heading.getBoundingClientRect().top>=banner.getBoundingClientRect().bottom,
+    'The item jump from scroll zero focuses the row below the status and the heading row.');
+  }
+ }catch(error){failures.push(String(error));}
+ await fetch('/results',{method:'POST',body:JSON.stringify(failures)});
+})();</script>'''.replace(b'MAIN_PAGE', reference)
+        self.assertEqual(firefox_probe_results(page.replace(b'</body>', probe + b'</body>')), [[]])
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required to check the AWS region filter.")
+    def test_aws_region_filter_sticks_below_the_heading_row(self) -> None:
+        from scripts.review_links import console_theme
+        from scripts.review_links.test_accounts_page import firefox_probe_results
+
+        source = console_theme.with_theme((SCRIPTS / "aws_target" / "aws_prices.html").read_text(encoding="utf-8"))
+        page = (page_frame.template(source, "AWS", "aws").replace("__AWS_QUOTA_HELP__", "", 1)
+                .replace("__AWS_PRICES_DATA__", "null").replace("__AWS_GATE_TIME_DATA__", "null"))
+        markup = page_frame.with_owner(page.encode(), "aws", PAGE_OWNER, staff.StaffSnapshot((PAGE_OWNER,)), lambda: "")
+        probe = b'''<script>
+(async()=>{
+ const failures=[];
+ try{
+  frameElement.style.height='800px';
+  document.querySelector('main').insertAdjacentHTML('beforeend','<div style="height:4000px"></div>');
+  document.querySelector('#geographies').textContent='Geography';
+  const painted=()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));
+  const heading=document.querySelector('.page-heading'), regions=document.querySelector('nav.regions');
+  const banner=document.querySelector('[data-page-status]');
+  for(const state of ['Live','Late']){
+   for(const width of [1440,320]){
+    frameElement.style.width=width+'px';
+    banner.dataset.state=state;
+    scrollTo({top:2000,behavior:'instant'});
+    await painted();
+    const bar=regions.getBoundingClientRect(), row=heading.getBoundingClientRect();
+    const hit=document.elementFromPoint((bar.left+bar.right)/2,bar.top+1);
+    if(scrollY<1000 || Math.abs(bar.top-row.bottom)>=1 || bar.bottom>innerHeight || !regions.contains(hit)){
+     failures.push(width+' px, '+state+': the region filter must stick fully in view below the heading row and take a click at its top.');
+    }
+   }
   }
  }catch(error){failures.push(String(error));}
  await fetch('/results',{method:'POST',body:JSON.stringify(failures)});
 })();</script>'''
-        self.assertEqual(firefox_probe_results(page.replace(b'</body>', probe + b'</body>')), [[]])
+        self.assertEqual(firefox_probe_results(markup.replace(b'</body>', probe + b'</body>')), [[]])
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required to check the Builds paused badge.")
+    def test_builds_paused_badge_matches_main_and_stays_visible(self) -> None:
+        from scripts.review_links import console_theme
+        from scripts.review_links.test_accounts_page import firefox_probe_results
+
+        source = console_theme.with_theme((SCRIPTS / "build_queue" / "memory_live.html").read_text(encoding="utf-8"))
+        page = page_frame.template(source, "Builds", "builds").replace("__MEMORY_FEED_INTERVAL_SECONDS__", "15")
+        markup = page_frame.with_owner(page.encode(), "builds", PAGE_OWNER, staff.StaffSnapshot((PAGE_OWNER,)), lambda: "")
+        # The page stays paused, so the status line does not stick and nothing moves.
+        paused = (b'<script>document.addEventListener("DOMContentLoaded",()=>setPaused(true));</script>'
+                  + b'<style>*,*::before,*::after{animation:none!important;transition:none!important}</style></head>')
+        markup = markup.replace(b'</head>', paused, 1)
+        still = markup.replace(b'<head>', b'<head><script>window.fetch=()=>new Promise(()=>{});</script>', 1)
+        for width in (1440, 320):
+            with self.subTest(width=width):
+                self.assertTrue(firefox_screenshot(still, width, 800) == firefox_screenshot(main_heading(still), width, 800),
+                                "At scroll zero the paused page must match the page without the sticky heading row.")
+        probe = b'''<script>
+(async()=>{
+ const failures=[];
+ try{
+  frameElement.style.height='800px';
+  document.querySelector('main').insertAdjacentHTML('beforeend','<div style="height:4000px"></div>');
+  const painted=()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));
+  const badge=document.querySelector('#paused');
+  // The badge takes no clicks; a hit test with clicks on shows what is drawn on top.
+  badge.style.pointerEvents='auto';
+  for(const width of [1440,320]){
+   frameElement.style.width=width+'px';
+   scrollTo({top:0,behavior:'instant'});
+   await painted();
+   const start=badge.getBoundingClientRect();
+   scrollTo({top:1200,behavior:'instant'});
+   await painted();
+   const box=badge.getBoundingClientRect(), inset=box.height/2;
+   const shown=[box.left+inset,(box.left+box.right)/2,box.right-inset].every(x=>[box.top+2,(box.top+box.bottom)/2,box.bottom-2]
+    .every(y=>badge.contains(document.elementFromPoint(x,y))));
+   if(badge.hidden || scrollY!==1200 || box.top!==start.top || box.height===0 || !shown){
+    failures.push(width+' px: the paused badge must stay in place and in view when the page scrolls.');
+   }
+  }
+ }catch(error){failures.push(String(error));}
+ await fetch('/results',{method:'POST',body:JSON.stringify(failures)});
+})();</script>'''
+        self.assertEqual(firefox_probe_results(markup.replace(b'</body>', probe + b'</body>')), [[]])
 
     def test_accounts_shows_the_configured_owner_and_names_the_route(self) -> None:
         root = Path(self.enterContext(tempfile.TemporaryDirectory()))
@@ -362,6 +497,29 @@ function advanceTime(ms){
 const setInterval=run=>{intervals.set(++id,run);return id;},clearInterval=key=>intervals.delete(key);
 const requestAnimationFrame=run=>run();
 '''
+
+
+def main_heading(page: bytes) -> bytes:
+    """Remove the sticky heading row, so the page shows the heading as it was before."""
+    assert STICKY_HEADING.search(page) is not None
+    return STICKY_HEADING.sub(b'', page.replace(page_frame.HEADING_POSITION.encode(), b'', 1))
+
+
+def firefox_screenshot(page: bytes, width: int, height: int) -> bytes:
+    """Load one page in a headless Firefox window and return its PNG."""
+    with tempfile.TemporaryDirectory(prefix="page-frame-shot-") as temporary:
+        root = Path(temporary)
+        (root / "profile").mkdir()
+        document = root / "page.html"
+        _ = document.write_bytes(page)
+        run = subprocess.run(["firefox", "--headless", "--no-remote", "--profile", str(root / "profile"),
+                              "--window-size", f"{width},{height}", "--screenshot", str(root / "page.png"),
+                              document.as_uri()],
+                             capture_output=True, text=True, timeout=45,
+                             env={**os.environ, "MOZ_HEADLESS_WIDTH": str(width), "MOZ_HEADLESS_HEIGHT": str(height)})
+        if run.returncode:
+            raise AssertionError(run.stderr)
+        return (root / "page.png").read_bytes()
 
 
 def assert_component_states(case: unittest.TestCase, markup: str) -> None:

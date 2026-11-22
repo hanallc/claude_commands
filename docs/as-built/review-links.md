@@ -173,10 +173,20 @@ Cards and form controls keep their page styles.
 Every page uses the shared background and text colors.
 The status line has the same background as the page.
 The frame reserves scrollbar space, so short and long pages keep the same column position.
-The New item button stays at the top right during scrolling, below any sticky status banner.
-The button uses the existing right gutter on wide pages.
-Narrow pages reserve a strip to the right of the content.
-An item jump places the focused row below both the banner and the button.
+The heading row holds the page title, the heading actions, the owner name and the New item button.
+On a page without a title, the actions wrapper holds the owner controls.
+The row is sticky at the top of the page, with an opaque page background, and content scrolls under it.
+After a sticky status banner reaches the top, the row sticks directly below the banner.
+Scrolling never changes the layout of the content, and at scroll zero the row stays in its normal place.
+On a narrow page the row can wrap to more lines.
+While the row is stuck, a thin `--line` box shadow shows under it; the line takes no space, so the layout does not change.
+The AWS region filter sticks directly below the heading row. The Images group index sticks 16 px below it.
+The stacking order, from lowest to highest, is as follows:
+1. Page content, which includes a page's own sticky bars (z-index 3 or lower).
+2. The heading row (z-index 4).
+3. Overlays: tooltips, menus, popovers and the Builds paused badge (z-index 5 to 10).
+4. The sticky Late or Failed status line (z-index 20), so the heading row never covers it.
+An item jump places the focused row below the banner and the heading row.
 The shared `.page-status` line follows the title.
 It shows the state, data time, round trip and server render time, in that order.
 Live uses `radio` and `--room`; Reading uses `loader-circle` and `--accent`.
