@@ -689,8 +689,8 @@ def append_journal_line(descriptor: int, document: str, *, valid_row: Callable[[
     flags = fcntl.fcntl(descriptor, fcntl.F_GETFL)
     _ = fcntl.fcntl(descriptor, fcntl.F_SETFL, flags | os.O_APPEND)
     data = (document + "\n").encode("utf-8")
-    # Remove an interrupted final append before adding a new independent row.
     size = os.lseek(descriptor, 0, os.SEEK_END)
+    torn = b""
     if size:
         tail = os.pread(descriptor, size, 0)
         if not tail.endswith(b"\n"):
@@ -699,9 +699,22 @@ def append_journal_line(descriptor: int, document: str, *, valid_row: Callable[[
                 if not valid_row(cast(object, json.loads(final))):
                     raise ValueError("invalid journal row")
             except (ValueError, UnicodeError):
-                os.ftruncate(descriptor, size - len(final))
+                torn = final
             else:
-                _ = os.write(descriptor, b"\n")
+                data = b"\n" + data
+    start = size - len(torn)
+    if torn:
+        os.ftruncate(descriptor, start)
+    try:
+        _write_journal_bytes(descriptor, data)
+    except OSError:
+        os.ftruncate(descriptor, start)
+        if torn:
+            _write_journal_bytes(descriptor, torn)
+        raise
+
+
+def _write_journal_bytes(descriptor: int, data: bytes) -> None:
     while data:
         count = os.write(descriptor, data)
         if count <= 0:

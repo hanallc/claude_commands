@@ -28,14 +28,6 @@ class FindingAnchor:
 
 @final
 @dataclass(frozen=True)
-class RenameJudgmentSite:
-    """A current coordinate eligible for a new rename proof, never historical continuity."""
-
-    anchor: FindingAnchor
-
-
-@final
-@dataclass(frozen=True)
 class UnchangedSite:
     path: str
     line: int

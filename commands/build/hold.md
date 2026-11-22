@@ -32,11 +32,13 @@ Other CI requests stay queued until release.
 2. Add `--keep <pid>` for an additional run that must continue.
 3. Use `YYYY-MM-DDTHH:MM` instead of `HH:MM` for a later date.
 
-The command keeps existing outermost gates, CI workers, and builds that the enforcer could stop.
+The command keeps CI workers, builds that the enforcer could stop, and outermost gates that hold work.
+A gate holds work when it has a cargo child, an admission reservation, a live Mac or AWS claim, or a remote waiter.
 It publishes the hold and repeats discovery before starting the enforcer.
 The second discovery adds only processes whose boot-relative start ticks do not exceed the publication bound.
 A concurrent release ends the command without restoring the hold.
-Existing queued and running work finishes through the same keep list.
+Kept runs finish.
+A gate that only waits in the queue is not kept: it waits for the release like new work.
 New natedev work waits until explicit release.
 Each 60 seconds, the command prints `draining: N runs remain`.
 Completion prints `drained; natedev stays held until release` and returns 0.
