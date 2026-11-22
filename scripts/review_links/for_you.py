@@ -54,6 +54,8 @@ class ForYouRow:
     requests: tuple[RebuildRequest, ...] = ()
     updated_at: str = ""
     requester_reference: str = ""
+    open_requests: tuple[RebuildRequest, ...] = ()
+    system_difference: str = ""
 
 
 @dataclass(frozen=True)
@@ -66,14 +68,14 @@ class UnavailableSource:
 
 @dataclass(frozen=True)
 class KnownOpenCount:
-    """The complete number of open machine cards and agent actions."""
+    """The complete number of open rebuild rows and agent actions."""
 
     value: int
 
 
 @dataclass(frozen=True)
 class UnavailableOpenCount:
-    """The complete count is unavailable; known_open counts only confirmed open cards."""
+    """The complete count is unavailable; known_open counts only confirmed open rows."""
 
     known_open: int
 
@@ -253,8 +255,7 @@ def read(config: Path | None = None, *,
         unavailable.append(UnavailableSource("completed rebuild needs", str(error)))
 
     compared: tuple[str, ...] = ()
-    comparison_current = False
-    probes = rebuild_row.RunningSystemProbes()
+    current_comparisons: set[str] = set()
     working_directories: dict[str, str] = {}
     try:
         values = rebuild_row.config_values(config)
@@ -265,20 +266,21 @@ def read(config: Path | None = None, *,
             working_directories[machine] = directory
         _ = rebuild_row.RebuildSettings.read(config)
         compared = answer.compared
-        probes = answer.probes
-        comparison_current = (not answer.refresh_due and isinstance(answer.expected, rebuild_row.ExpectedSystems)
-                              and isinstance(answer.failure, rebuild_row.NoEvaluationFailure))
-        if not comparison_current:
+        if answer.refresh_due:
             unavailable.append(UnavailableSource("rebuild comparison", "The comparison is stale or unavailable."))
         else:
             for machine in ("natedev", "mac"):
-                if not probes.succeeded(machine):
+                if not answer.evaluation_current(machine):
+                    unavailable.append(UnavailableSource("rebuild comparison", f"{machine}: the expected system is unavailable."))
+                elif not answer.probes.succeeded(machine):
                     unavailable.append(UnavailableSource("rebuild comparison", f"{machine}: the running system is unavailable."))
+                else:
+                    current_comparisons.add(machine)
     except (OSError, ValueError, KeyError, TypeError) as error:
         unavailable.append(UnavailableSource("rebuild comparison", str(error)))
 
     changes = (rebuild_row.read_compared_changes(config, answer)
-               if include_comparison_reason and comparison_current and compared else {})
+               if include_comparison_reason and current_comparisons.intersection(compared) else {})
     machines = {request.machine for request in (*pending, *history)} | set(compared)
     for machine in sorted(machines):
         active = tuple(request for request in pending if request.machine == machine)
@@ -286,17 +288,20 @@ def read(config: Path | None = None, *,
         requests = tuple(sorted((*active, *completed), key=lambda request: datetime.fromisoformat(request.created_at)))
         status: Literal["open", "done", "unknown"] = (
             "open" if active or machine in compared else "done"
-            if comparison_current and probes.succeeded(machine) and needs_available else "unknown")
+            if machine in current_comparisons and needs_available else "unknown")
         reason = "\n".join(f"{request.reason} Requester: {request.requested_by or 'Not recorded'}. "
                            + f"Concerns: {request.concerns or 'Not recorded'}." for request in active)
+        system_difference = ""
         if include_comparison_reason and machine in compared:
-            reason = (reason + "\n" if reason else "") + _comparison_reason(machine, changes, answer.configured_revision())
+            system_difference = _comparison_reason(machine, changes, answer.configured_revision(machine))
+            reason = (reason + "\n" if reason else "") + system_difference
         rows.append(ForYouRow(
             f"rebuild/{machine}", "rebuild", f"Rebuild {machine}", "rebuild", machine, working_directories.get(machine, ""),
             ", ".join(dict.fromkeys(request.requested_by for request in active if request.requested_by)),
             reason, "; ".join(dict.fromkeys(request.waits for request in active)) or "Not recorded",
             requests[0].created_at if requests else "", status, "automatic",
-            "\n".join(request.evidence for request in completed), requests))
+            "\n".join(request.evidence for request in completed), requests,
+            open_requests=active, system_difference=system_difference))
     return ForYouSnapshot(tuple(rows), tuple(unavailable), answer.machines)
 
 

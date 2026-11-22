@@ -62,16 +62,27 @@ Historical rows use `unknown` when the reader cannot confirm their current state
 
 
 The shell reads `/console/for-you.json` through the shared reader.
-The response contains the complete count and at most two open action entries.
+The response contains the complete count and every open action entry in source order.
 The desktop button uses the approved amber style.
 The collapsed rail keeps the icon and badge.
 The phone header keeps the button visible.
 
-The button opens a nonmodal panel with machine names, copy buttons, and card links.
-Each card link selects Review with `type=for-you`, `show=open`, and the action key.
-The footer opens Review with the reserved parameters and no action key.
-Both links keep other pages’ saved locations.
-The foryou-page phase adds the For you filter and card expansion.
+The button opens a nonmodal panel with machine names, commands, and copy buttons.
+When the panel reaches its height limit, the entries scroll below the header and note.
+A rebuild's machine line shows only the machine.
+An action's machine line adds the requester after a dot when a requester exists.
+An action shows its reason between the machine line and the command.
+A rebuild shows its open requests in the same space, newest first.
+Requests with the same reason share one line with a count and the newest requester's name and age.
+The panel shortens long reasons to one line and shows the full reason on hover.
+The list starts with three reasons at most.
+Show more expands the list in place. A long list scrolls inside the entry.
+The comparison reason appears below the list when the systems differ.
+It lists pending commits when the cached evidence matches the running system and the configured commit.
+A dirty switch shows its local changes and the configured commit.
+The panel footer opens Review with `type=for-you` and `show=open`.
+Each card link adds its stable action key as `item` and expands that card.
+The card and footer links preserve the console query entries for other pages.
 Escape closes the panel and focuses the visible For you button.
 Copy writes the command to the clipboard.
 Copy does not complete the action.

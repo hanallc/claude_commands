@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import datetime
 import html
 import importlib
 import json
@@ -188,15 +189,26 @@ def icon_svg(name: str) -> str:
     return page_frame.icon_svg(name)
 
 
+class ForYouRebuildRequest(TypedDict):
+    """One open rebuild request with its creation time in Unix seconds."""
+
+    reason: str
+    requested_by: str
+    created_at: float
+
+
 class ForYouEntry(TypedDict):
-    """One short action entry with a console card link."""
+    """One open row in the For you panel."""
 
     key: str
-    kind: str
+    kind: Literal["rebuild", "action"]
     title: str
     command: str
     machine: str
     requested_by: str
+    reason: str
+    requests: list[ForYouRebuildRequest]
+    system_difference: str
     href: str
 
 
@@ -208,7 +220,7 @@ class CompleteForYouCount(TypedDict):
 
 
 class CompleteForYouPayload(CompleteForYouCount):
-    """The complete count and at most two short entries."""
+    """The complete count and all open entries."""
 
     entries: list[ForYouEntry]
 
@@ -246,13 +258,15 @@ def for_you_payload() -> ForYouPayload:
     count = for_you_count(snapshot)
     if count["available"] is False:
         return count
-    entries: list[ForYouEntry] = []
-    for row in (row for row in snapshot.rows if row.status == "open"):
-        if len(entries) == 2:
-            break
-        place = review_place(row.key)
-        entries.append({"key": row.key, "kind": row.kind, "title": row.title, "command": row.command,
-                        "machine": row.machine, "requested_by": row.requested_by, "href": place_query("review", place)})
+    entries: list[ForYouEntry] = [
+        {"key": row.key, "kind": row.kind, "title": row.title, "command": row.command,
+         "machine": row.machine, "requested_by": row.requested_by, "reason": row.reason if row.kind == "action" else "",
+         "requests": [{"reason": request.reason, "requested_by": request.requested_by,
+                       "created_at": datetime.fromisoformat(request.created_at).timestamp()}
+                      for request in row.open_requests],
+         "system_difference": row.system_difference, "href": place_query("review", review_place(row.key))}
+        for row in snapshot.rows if row.status == "open"
+    ]
     return {**count, "entries": entries}
 
 
@@ -322,23 +336,35 @@ border:1px solid var(--notice-hover);border-radius:9px;background:var(--notice);
 .collapsed .for-you-button b{position:absolute;top:3px;right:2px;min-width:17px;line-height:17px;font-size:11px;padding:0 3px}
 .collapsed .for-you-button[data-state=stale] b{outline:2px dotted var(--notice-text);outline-offset:2px}
 #action-popover{--popover-left:256px;position:fixed;left:var(--popover-left);bottom:24px;
- width:min(460px,calc(100vw - var(--popover-left) - 12px));max-height:calc(100dvh - 48px);overflow:auto;z-index:10;
+ width:min(460px,calc(100vw - var(--popover-left) - 12px));max-height:calc(100dvh - 48px);z-index:10;
+display:flex;flex-direction:column;overflow:hidden;
 border:1px solid var(--border);border-radius:12px;background:var(--nav);color:var(--text);box-shadow:0 16px 54px #0008}
 .collapsed~#action-popover{--popover-left:84px}
-#action-popover header{display:flex;align-items:center;justify-content:space-between;padding:17px 20px 0;font-size:17px}
+#action-popover header{flex:none;display:flex;align-items:center;justify-content:space-between;padding:17px 20px 0;font-size:17px}
 #action-popover header span{margin-left:5px;color:var(--notice-text)}
 #action-popover header button{background:none;border:0;border-radius:6px;color:var(--muted);font-size:24px;line-height:28px;width:28px;padding:0;cursor:pointer}
-#action-popover .panel-note{margin:5px 20px 14px;font-size:13px;color:var(--muted)}
+#action-popover .panel-note{flex:none;margin:5px 20px 14px;font-size:13px;color:var(--muted)}
+#action-popover [data-for-you-entries]{overflow:auto}
 #action-popover article{padding:18px 20px;border-top:1px solid var(--border)}
 .short-head{display:flex;align-items:center;gap:9px;font-size:14px}.short-head svg{width:17px;height:17px;color:var(--notice-text)}
 .short-head strong{overflow-wrap:anywhere}
-#action-popover article p{margin:5px 0 12px 26px;color:var(--muted);font-size:12px;overflow-wrap:anywhere}
-#action-popover .code-block{margin:0 0 10px}
+#action-popover article p{margin:5px 0 0 26px;color:var(--muted);font-size:12px;overflow-wrap:anywhere}
+#action-popover :is([data-entry-reason],[data-system-difference]){white-space:pre-line}
+.rebuild-requests{list-style:none;margin:5px 0 0 26px;padding:0;font-size:12px}
+.rebuild-requests[data-expanded]{max-height:8rem;overflow:auto}
+.rebuild-requests li{display:flex;align-items:baseline;min-height:20px}
+.rebuild-requests [data-request-text],.rebuild-requests [data-request-by]{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.rebuild-requests [data-request-by]{flex:none;max-width:35%}
+.rebuild-requests [data-request-count],.rebuild-requests [data-request-by],.rebuild-requests .request-age{color:var(--muted);white-space:pre}
+.rebuild-requests [data-request-count],.rebuild-requests .request-age{flex:none}
+.request-toggle{margin:6px 0 0 26px;padding:3px 8px;border:1px solid var(--border);border-radius:5px;
+ background:var(--hover);color:var(--text);font:inherit;font-size:12px;cursor:pointer}
+#action-popover .code-block{margin:12px 0 0}
 #action-popover pre{border:1px solid var(--border);background:var(--page);border-radius:6px;margin:0;padding:12px 48px 12px 13px;
 font:14px/1.4 ui-monospace,monospace;white-space:pre-wrap;overflow-wrap:anywhere}
 #action-popover [data-copy-code]{opacity:1;color:var(--muted)}
 #action-popover a{color:var(--accent);font-size:13px;text-decoration:none}
-#action-popover footer{padding:14px 20px;border-top:1px solid var(--border);background:var(--hover)}
+#action-popover footer{flex:none;padding:14px 20px;border-top:1px solid var(--border);background:var(--hover)}
 .mobile-header .for-you-button{display:none}
 @media /* Phone query */{.for-you-slot{display:none}.mobile-header .for-you-button{display:flex;width:auto;gap:6px;min-height:36px;padding:5px 8px;font-size:12px}
 .mobile-header .for-you-button svg{width:16px;height:16px}.mobile-header .for-you-label{display:inline}
@@ -351,7 +377,9 @@ FOR_YOU_SCRIPT = r'''
 function createForYouNotifier(openCard){
  const triggers=[...document.querySelectorAll('[data-for-you-toggle]')],panel=document.getElementById('action-popover');
  const entries=panel.querySelector('[data-for-you-entries]'),note=panel.querySelector('[data-for-you-note]');
- let last=null,stale=false,reading=false,completionPending=false,opener=null,displayed='';
+ const previewCount=3;
+ let last=null,stale=false,reading=false,completionPending=false,opener=null;
+ let displayed=new Map();
  function selectionIntersects(node){
   const selection=getSelection();
   if(!selection || selection.isCollapsed) return false;
@@ -372,21 +400,99 @@ function createForYouNotifier(openCard){
    link.href=actionURL(link.href).href;
   }
  }
+ function showRequests(article,requests,expanded){
+  const groups=new Map();
+  for(const request of [...requests].sort((a,b)=>b.created_at-a.created_at)){
+   const group=groups.get(request.reason);
+   if(group) group.count++;
+   else groups.set(request.reason,{...request,count:1});
+  }
+  const list=article.querySelector('[data-rebuild-requests]'),toggle=article.querySelector('[data-request-toggle]');
+  const template=document.getElementById('for-you-request').content.firstElementChild;
+  for(const request of groups.values()){
+   const line=template.cloneNode(true),by=request.requested_by || 'Not recorded';
+   line.title=request.reason;
+   line.querySelector('[data-request-text]').textContent=request.reason;
+   const count=line.querySelector('[data-request-count]');
+   count.hidden=request.count===1;
+   count.textContent=' ×'+request.count;
+   const requester=line.querySelector('[data-request-by]');
+   requester.textContent=' · '+by;
+   requester.title=by;
+   line.querySelector('time').dateTime=new Date(request.created_at*1000).toISOString();
+   list.append(line);
+  }
+  list.hidden=groups.size===0;
+  list.id='for-you-requests-'+encodeURIComponent(article.dataset.key);
+  toggle.setAttribute('aria-controls',list.id);
+  const more=groups.size-previewCount;
+  toggle.hidden=more<=0;
+  function setExpanded(open){
+   list.toggleAttribute('data-expanded',open);
+   if(open) list.tabIndex=0;
+   else {
+    list.removeAttribute('tabindex');
+    list.scrollTop=0;
+   }
+   for(const line of [...list.children].slice(previewCount)) line.hidden=!open;
+   toggle.setAttribute('aria-expanded',String(open));
+   toggle.textContent=open ? 'Show less' : 'Show '+more+' more';
+  }
+  setExpanded(expanded && more>0);
+  toggle.addEventListener('click',()=>setExpanded(toggle.getAttribute('aria-expanded')!=='true'));
+ }
+ function updateRequestAges(){
+  const now=Date.now();
+  for(const time of entries.querySelectorAll('.rebuild-requests time')){
+   const minutes=Math.max(0,Math.floor((now-Date.parse(time.dateTime))/60000));
+   const age=minutes>=1440 ? Math.floor(minutes/1440)+' d' : minutes>=60 ? Math.floor(minutes/60)+' h' : minutes+' min';
+   if(time.textContent!==age) time.textContent=age;
+  }
+ }
+ function renderEntry(item,expanded){
+  const article=document.getElementById('for-you-entry').content.firstElementChild.cloneNode(true);
+  article.dataset.key=item.key;
+  article.querySelector('strong').textContent=item.title;
+  article.querySelector('[data-entry-rebuild]').hidden=item.kind!=='rebuild';
+  article.querySelector('[data-entry-action]').hidden=item.kind==='rebuild';
+  const requester=item.kind==='action' && item.requested_by;
+  article.querySelector('[data-entry-machine]').textContent=requester ? item.machine+' · '+requester : item.machine;
+  const reason=article.querySelector('[data-entry-reason]');
+  if(item.reason) reason.textContent=item.reason;
+  else reason.remove();
+  if(item.kind==='rebuild' && item.requests?.length) showRequests(article,item.requests,expanded);
+  const difference=article.querySelector('[data-system-difference]');
+  if(item.system_difference) difference.textContent=item.system_difference;
+  else difference.remove();
+  article.querySelector('code').textContent=item.command;
+  article.querySelector('a').href=actionURL(item.href).href;
+  return article;
+ }
  function showEntries(items){
-  const value=JSON.stringify(items);
-  if(value===displayed || entries.contains(document.activeElement)) return;
-  const nodes=items.map(item=>{
-   const article=document.getElementById('for-you-entry').content.firstElementChild.cloneNode(true);
-   article.dataset.key=item.key;
-   article.querySelector('strong').textContent=item.title;
-   article.querySelector('[data-entry-rebuild]').hidden=item.kind!=='rebuild';
-   article.querySelector('[data-entry-action]').hidden=item.kind==='rebuild';
-   article.querySelector('[data-entry-machine]').textContent=item.machine+' · '+item.requested_by;
-   article.querySelector('code').textContent=item.command;
-   article.querySelector('a').href=actionURL(item.href).href;
-   return article;
-  });
-  entries.replaceChildren(...nodes);displayed=value;
+  if(entries.contains(document.activeElement)) return;
+  const panelScrollTop=entries.scrollTop,expandedList='[data-rebuild-requests][data-expanded]';
+  const next=new Map();
+  for(const item of items){
+   const value=JSON.stringify(item),previous=displayed.get(item.key);
+   const oldList=previous?.article.querySelector(expandedList);
+   const article=previous?.value===value ? previous.article : renderEntry(item,Boolean(oldList));
+   next.set(item.key,{article,value,listScrollTop:oldList?.scrollTop ?? 0});
+  }
+  for(const [key,{article}] of displayed){
+   if(next.get(key)?.article!==article) article.remove();
+  }
+  let index=0;
+  for(const {article} of next.values()){
+   const current=entries.children[index++] ?? null;
+   if(article!==current) entries.insertBefore(article,current);
+  }
+  displayed=next;
+  updateRequestAges();
+  for(const {article,listScrollTop} of displayed.values()){
+   const list=article.querySelector(expandedList);
+   if(list && list.scrollTop!==listScrollTop) list.scrollTop=listScrollTop;
+  }
+  if(entries.scrollTop!==panelScrollTop) entries.scrollTop=panelScrollTop;
  }
  function drawPanel(count){
   if(selectionIntersects(panel)) return;
@@ -571,8 +677,17 @@ aria-controls="console-nav" aria-expanded="false" aria-label="Open navigation"><
 </section>
 <template id="for-you-entry"><article>
 <div class="short-head"><span data-entry-rebuild><!-- FOR YOU REBUILD --></span><span data-entry-action><!-- FOR YOU ACTION --></span><strong></strong></div>
-<p data-entry-machine></p><div class="code-block"><pre><code></code></pre><!-- FOR YOU COPY --></div>
+<p data-entry-machine></p>
+<p data-entry-reason></p>
+<ul class="rebuild-requests" data-rebuild-requests role="list" aria-label="Rebuild requests" hidden></ul>
+<button type="button" class="request-toggle" data-request-toggle aria-expanded="false" hidden></button>
+<p data-system-difference></p>
+<div class="code-block"><pre><code></code></pre><!-- FOR YOU COPY --></div>
 <a data-for-you-card>Open card →</a></article></template>
+<template id="for-you-request"><li>
+<span data-request-text></span><span data-request-count hidden></span><span data-request-by></span>
+<span class="request-age"> · <time></time></span>
+</li></template>
 <script>
 <!-- FOR YOU SCRIPT -->
 (() => {

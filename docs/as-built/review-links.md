@@ -348,10 +348,20 @@ An unavailable live value is `null`.
 The bottom-left `For you` button shows the global action count.
 The collapsed rail keeps an icon and badge.
 The phone header keeps a compact button.
-The nonmodal panel shows two action entries with machine names, copy buttons, and card links.
+The nonmodal panel shows every open action in source order.
+Each entry shows its machine, reason, command, and a Copy button.
+A rebuild's machine line shows only the machine.
+An action's machine line adds the requester after a dot when a requester exists.
+An action shows its reason below the machine line.
+A rebuild shows up to three reasons from open requests in order from newest to oldest.
+Matching reasons share one line with a count and the newest requester's name and age.
+The line shortens long reasons and shows the full text on hover.
+Show more expands the list in place. A long list scrolls inside the entry.
+The comparison reason appears below the list when the systems differ.
+When the panel reaches its height limit, the entries scroll below the header and note.
 The panel footer opens Review with `type=for-you` and `show=open`.
 Each card link adds its stable action key as `item` and expands that card.
-Notifier links preserve the console query entries for other pages.
+The card and footer links preserve the console query entries for other pages.
 Escape closes the panel and focuses the visible For you button.
 
 `/console/for-you.json` reads the shared action reader and uses `Cache-Control: no-store`.

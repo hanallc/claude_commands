@@ -173,8 +173,8 @@ class ActionTests(unittest.TestCase):
         def card_url(key: str) -> str:
             return "http://fixture/review?item=" + key
 
-        with patch.object(action, "card_url", side_effect=card_url), \
-                patch("subprocess.run", side_effect=AssertionError("The filer executed a command.")):
+        with (patch.object(action, "card_url", side_effect=card_url),
+              patch("subprocess.run", side_effect=AssertionError("The filer executed a command."))):
             result, output = self.cli("add", "--title", "Restore access", "--command", "never-run-this",
                                       "--machine", "mac", "--cwd", "/fixture/repo", "--requested-by", "staff-a",
                                       "--reason", "User access", "--waits", "Release", "--concerns", "console",
@@ -185,6 +185,7 @@ class ActionTests(unittest.TestCase):
             result, output = self.cli("list", "--json")
             self.assertEqual(result, 0)
             records = cast(list[dict[str, object]], json.loads(output))
+            self.assertEqual(records[0]["key"], key)
             self.assertEqual(records[0]["command"], "never-run-this")
             self.assertEqual(self.cli("withdraw", "--id", key, "--requested-by", "staff-a", "--reason", "Cancel."),
                              (0, key + "\n"))

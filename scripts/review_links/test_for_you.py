@@ -34,7 +34,8 @@ class ForYouTests(unittest.TestCase):
         self.cache = self.root / "comparison"
         self.config = self.root / "statusline.conf"
         _ = self.config.write_text("\n".join((
-            f"rebuild.repo={self.root / 'nixos'}", "rebuild.ref=main", "rebuild.natedev=natedev", "rebuild.mac=MacBook-Pro",
+            f"rebuild.repo={self.root / 'nixos'}", "rebuild.ref=main", "rebuild.ref.mac=origin/main",
+            "rebuild.natedev=natedev", "rebuild.mac=MacBook-Pro",
             f"rebuild.cwd.natedev={self.root / 'nixos'}", "rebuild.cwd.mac=/fixture/mac/nixos",
             "rebuild.ssh=mac", "rebuild.interval=60", "rebuild.eval_timeout=120", "rebuild.eval_retry_seconds=600",
             f"rebuild.generations={self.root / 'generations.log'}",
@@ -49,8 +50,11 @@ class ForYouTests(unittest.TestCase):
         _ = self.enterContext(patch("subprocess.run", side_effect=AssertionError("The reader executed a command.")))
 
     def write_comparison(self, machines: str = "", due: str = "9999999999") -> None:
-        details = {"commit": "a" * 40, "source": [str(self.root / "nixos"), "main", "natedev", "MacBook-Pro"],
-                   "natedev": "/nix/store/expected-linux", "mac": "/nix/store/expected-mac",
+        commit = "a" * 40
+        details = {"commits": {"natedev": commit, "mac": commit},
+                   "source": [str(self.root / "nixos"), "main", "origin/main", "natedev", "MacBook-Pro"],
+                   "paths": {"natedev": "/nix/store/expected-linux", "mac": "/nix/store/expected-mac"},
+                   "failures": {},
                    "running_system_probes": {"natedev": True, "mac": True}}
         _ = self.cache.write_text(f"{machines}\n{due}\n\n{json.dumps(details)}\n", encoding="utf-8")
 
@@ -178,6 +182,7 @@ class ForYouTests(unittest.TestCase):
         self.assertEqual(row.status, "open")
         self.assertEqual(row.requested_by, "")
         self.assertEqual(row.reason, "Pending commits\n87bbeb2 Update the editor\nb722af7 Update the shell")
+        self.assertEqual(row.system_difference, row.reason)
         self.assertEqual(row.requests[0].reason, "Apply completed settings.")
         self.assertIn("switch 1", row.evidence)
 
@@ -239,16 +244,18 @@ class ForYouTests(unittest.TestCase):
     def test_comparison_uses_only_commits_for_its_running_system_and_configured_revision(self) -> None:
         self.refresh_with_revision_history(f"{'87bbeb2' + '0' * 33}\x1f2026-11-21T12:00:00Z\x1fUpdate the editor\x1f")
         answer = rebuild_row.read(self.config)
-        expected = answer.expected
-        assert isinstance(expected, rebuild_row.ExpectedSystems)
+        evaluations = answer.evaluations
         for comparison in (
             replace(answer, running_paths={"natedev": "/nix/store/another-system"}),
-            replace(answer, expected=replace(expected, commit="b" * 40)),
+            replace(answer, evaluations=replace(evaluations, commits={**evaluations.commits, "natedev": "b" * 40})),
         ):
             with self.subTest(comparison=comparison):
                 row, = for_you.read(self.config, rebuild=comparison).rows
                 self.assertTrue(row.reason.startswith("The running system differs from the configured system."))
                 self.assertNotIn("Update the editor", row.reason)
+        other_machine = replace(evaluations, commits={**evaluations.commits, "mac": "b" * 40})
+        row, = for_you.read(self.config, rebuild=replace(answer, evaluations=other_machine)).rows
+        self.assertIn("Update the editor", row.reason)
 
     def test_stale_comparison_never_proves_completion(self) -> None:
         self.complete_need()
@@ -318,12 +325,30 @@ class ForYouTests(unittest.TestCase):
         self.assertEqual(self.read().open_count, for_you.KnownOpenCount(4))
 
     def test_failed_comparison_evaluation_cannot_prove_completion(self) -> None:
-        self.complete_need()
-        answer = rebuild_row.read(self.config)
-        failed = replace(answer, failure=rebuild_row.EvaluationFailure("a" * 40, (), 1.0))
-        with patch.object(rebuild_row, "read", return_value=failed):
-            snapshot = self.read()
-        self.assertEqual(snapshot.rows[0].status, "unknown")
+        self.complete_need("natedev")
+        self.complete_need("mac")
+        local_commit, mac_commit = "b" * 40, "a" * 40
+        paths = {"natedev": "/nix/store/expected-linux", "mac": "/nix/store/expected-mac"}
+        for failed in ("natedev", "mac"):
+            with self.subTest(failed=failed):
+                self.cache.unlink()
+
+                def run(command: list[str], *, timeout: int = 30) -> str:
+                    _ = timeout
+                    if command[0] == "git":
+                        return local_commit if command[-1] == "main^{commit}" else mac_commit
+                    if command[0] == "nix":
+                        machine = "natedev" if f"?rev={local_commit}" in command[-1] else "mac"
+                        return "" if machine == failed else json.dumps({machine: paths[machine]})
+                    return paths["natedev" if command[0] == "realpath" else "mac"]
+
+                rebuild_row.write(self.config, run, clock=lambda: 9_999_999_900)
+                snapshot = self.read()
+                rows = {row.key: row for row in snapshot.rows}
+                for machine in paths:
+                    self.assertEqual(rows[f"rebuild/{machine}"].status, "unknown" if machine == failed else "done")
+                self.assertEqual(snapshot.unavailable, (for_you.UnavailableSource(
+                    "rebuild comparison", f"{failed}: the expected system is unavailable."),))
 
     def test_failed_ssh_comparison_cannot_prove_mac_completion(self) -> None:
         self.complete_need("mac")
