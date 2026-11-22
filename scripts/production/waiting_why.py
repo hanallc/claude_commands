@@ -19,7 +19,7 @@ from scripts.review_links import decision_store, review_events, review_items, re
 
 def missing(root: Path, members: staff.StaffSnapshot) -> list[str]:
     """Read missing reasons without allocating IDs or changing records."""
-    items = review_items.read(root, members=members, show='Waiting', assign_ids=False)
+    items = review_items.read(root, members=members, show='Waiting')
     return [' | '.join((item.key, item.type.value, ' '.join(item.title.split()),
                         'filed by ' + (review_items.name(item.source_unit, members) if item.source_unit else 'not recorded')))
             for item in sorted(items, key=lambda item: item.key) if not item.waiting_why]
@@ -59,7 +59,7 @@ def main(argv: list[str] | None = None) -> int:
                 print(line)
         else:
             key = cast(str, args.item)
-            found = [item for item in review_items.read(root, members=members, assign_ids=False) if item.key == key]
+            found = [item for item in review_items.read(root, members=members) if item.key == key]
             if len(found) != 1:
                 raise ValueError('The item key must name one Review item.')
             store(found[0], cast(str, args.text))
