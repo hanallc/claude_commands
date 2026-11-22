@@ -17,12 +17,10 @@ import subprocess
 import sys
 import time
 from collections import Counter
-from collections.abc import Mapping, Sequence
-from concurrent.futures import Future
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from enum import Enum, auto
 from pathlib import Path
-from threading import Thread
 from typing import TYPE_CHECKING, Literal, NotRequired, TypedDict, assert_never, overload
 
 
@@ -2702,7 +2700,7 @@ def memory_status(explanation: admission_records.QueueExplanation, room: admissi
 
 def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.UseConfiguredValue.CURRENT,
             report_version: str = "", holders: TokenHolders | TokenHoldersUnknown = NO_TOKEN_DUMP_YET,
-            *, limit_background: limits_view.Background | None = None) -> MemoryPage:
+            *, limit_source: Callable[[admission_records.QueueRead], limits_view.Background] | None = None) -> MemoryPage:
     started = time.perf_counter()
     if isinstance(configuration, conf.UseConfiguredValue):
         configuration = read_configuration()
@@ -3115,8 +3113,9 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
     visible_waits = limits_view.visible_waits(model, {place: row["name"] for place, row in waiters.items()},
                                               {owner: row["name"] for owner, row in cloud_waiters.items()})
     waiting_rows: list[WaitRow | CloudWaitRow] = [
-        cloud_waiters[entry.owner] if isinstance(entry := visible.source, wire.CloudRow) else waiters[entry.position]
-        for visible in visible_waits]
+        named_wait for visible in visible_waits
+        if (named_wait := (cloud_waiters.get(entry.owner) if isinstance(entry := visible.source, wire.CloudRow) else
+                           waiters.get(entry.position) if isinstance(entry, queue_view.WaitingBuild) else None)) is not None]
     unmatched_priority_text = ""
     unmatched_priority_entries: list[admission_records.PriorityEntry] = []
     queued_priority_units: list[str] = []
@@ -3194,9 +3193,9 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
         "report_version": report_version,
         "swap_rows": configuration.swap_rows, "leftovers": leftovers,
     }
-    if limit_background is not None:
+    if limit_source is not None:
         page["build_limits"] = limits_view.build_limits(parsed, snapshots, visible_waits, limit_cloud_names,
-            {session: identity.owner_text for session, identity in labels.items()}, limit_background, zone)
+            {session: identity.owner_text for session, identity in labels.items()}, limit_source(parsed), zone)
     page["render_seconds"] = time.perf_counter() - started
     return page
 
@@ -3224,41 +3223,6 @@ def notify_unplaced_mac_runs(reading: queue_view.MacBuildReading, notified: set[
         notified.update((run.pid, run.started_at) for run in new_runs)
 
 
-def refresh_limits(result: Future[limits_view.Background], now: float, active_folders: tuple[str, ...]) -> None:
-    try:
-        result.set_result(limits_view.background(now, active_folders))
-    except (OSError, ValueError, KeyError, RuntimeError) as error:
-        result.set_exception(error)
-
-
-class LimitsRefresh:
-    def __init__(self) -> None:
-        self.saved: limits_view.Background | None = None
-        self.pending: Future[limits_view.Background] | None = None
-        self.next_at: float = 0.0
-
-    def current(self, now: float, interval: float) -> limits_view.Background | None:
-        if self.pending is not None and self.pending.done():
-            try:
-                current = self.pending.result()
-                previous = self.saved
-                if isinstance(current.history, charts.IndexUnavailable) and previous is not None and isinstance(previous.history, frozenset):
-                    current = replace(current, history=previous.history, history_stale=True)
-                self.saved = current
-            except (OSError, ValueError, KeyError, RuntimeError) as error:
-                print(f"Build limits refresh failed: {error}", file=sys.stderr)
-                if self.saved is not None:
-                    self.saved = replace(self.saved, history_stale=True)
-            self.pending = None
-        if self.pending is None and now >= self.next_at:
-            self.pending = Future()
-            folders = tuple(self.saved.origins.active_folders) if self.saved is not None else ()
-            Thread(target=refresh_limits, args=(self.pending, time.time(), folders),
-                   name="build-limits-refresh", daemon=True).start()
-            self.next_at = now + interval
-        return self.saved
-
-
 def main(argv: Sequence[str]) -> int:
     args = page_arguments(argv)
     if args.command == "link":
@@ -3269,7 +3233,14 @@ def main(argv: Sequence[str]) -> int:
     last_good: MemoryPage | NoGoodReading = NoGoodReading()
     report_version = ""
     next_report_at = 0.0
-    limit_refresh = LimitsRefresh()
+    limit_refresh = limits_view.LimitsRefresh(configuration.report_refresh_seconds, configuration.token_dump_seconds)
+
+    def limit_source(reading: admission_records.QueueRead) -> limits_view.Background:
+        wall = time.time()
+        if args.once:
+            return limits_view.background_once(wall, reading)
+        return limit_refresh.current(reading, time.monotonic(), wall)
+
     next_mac_at = 0.0
     holders: TokenHolders | TokenHoldersUnknown = NO_TOKEN_DUMP_YET
     next_tokens_at = 0.0
@@ -3287,8 +3258,6 @@ def main(argv: Sequence[str]) -> int:
                 report_version = report.version
             next_report_at = now + configuration.report_refresh_seconds
         try:
-            limit_background = (limits_view.background(time.time()) if args.once else
-                                limit_refresh.current(now, configuration.report_refresh_seconds))
             if now >= next_mac_at:
                 queue_view.refresh_mac_builds()
                 if not args.once:
@@ -3304,13 +3273,14 @@ def main(argv: Sequence[str]) -> int:
                 # Count from after the request, so slow reads before it never shorten the interval.
                 next_tokens_at = time.monotonic() + configuration.token_dump_seconds
             payload: MemoryPage | RetainedReading | PageUnavailable = reading(configuration, report_version, holders,
-                                                                               limit_background=limit_background)
+                                                                               limit_source=limit_source)
             last_good = payload
         except (OSError, ValueError, KeyError, RuntimeError) as error:
             if isinstance(last_good, NoGoodReading):
                 payload = {"ok": False, "error": str(error), "read_at": time.time()}
             else:
                 payload = {**last_good, "read_error": str(error), "error_at": time.time()}
+                _ = payload.pop("build_limits", None)
         write_text_atomic(target, page_json(payload), new_file_mode=0o644)
         if args.once:
             return 0
