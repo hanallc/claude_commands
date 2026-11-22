@@ -774,15 +774,19 @@ If command selection failed for a row, report unknown changed paths and include 
 The batch stops at the first failed test command.
 The next queued item can proceed after the batch exits.
 Before publication, the shared stop attempts to restore the starting tip.
-The stop checks HEAD before it changes the checkout.
-Before it queries origin, the stop aborts a main conflict only if the batch started the merge.
-The main merge must start with no open Git operation.
-Before abort, the stop checks the merge target and the index.
-If abort fails or HEAD is already at the starting tip, the stop skips the query and the reset.
-The reset requires origin to match the recorded published tip or the starting tip.
+The batch record lists each row tip.
+The batch adds each main target to the record before Git starts the merge.
+The stop accepts HEAD at the expected tip or at a merge with that first parent and a recorded second parent.
+The batch reads MERGE_HEAD after every merge command.
+A successful command with an open merge stops the batch.
+The stop aborts a merge with a recorded target or an empty or unreadable MERGE_HEAD.
+The stop preserves an open merge to an unrelated target and reports the refusal.
+The stop aborts the merge before it queries origin.
+If abort restores the starting tip, the stop skips the query and reset.
+Without an open merge, the stop runs the reset even at the starting tip to clear merge state.
+A reset that moves HEAD requires origin to match the recorded published tip or the starting tip.
 The stop sends every notice before it writes result records.
 Rollback and result-record errors appear after the notices.
-If the batch cannot establish ownership of an open merge, it preserves the merge and reports the refusal.
 Each run starts a fresh shared test log. Tests after main moves append to the same log.
 Publication rollback checks the live origin before it restores the tip.
 It also removes unpublished formatter commits.

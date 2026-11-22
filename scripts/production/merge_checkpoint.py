@@ -16,7 +16,6 @@ except FileNotFoundError:
 import argparse
 import bisect
 import fcntl
-import hashlib
 import os
 import re
 import shlex
@@ -200,7 +199,8 @@ def merge_lock(checkout: Path, name: str) -> Generator[None]:
 
 
 def git(checkout: Path, *args: str) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(["git", "-C", str(checkout), *args], capture_output=True, text=True, check=False)
+    return subprocess.run(["git", "-C", str(checkout), *args], capture_output=True, text=True,
+                          errors="replace" if args[:1] == ("merge",) else None, check=False)
 
 
 def good(result: subprocess.CompletedProcess[str], step: str) -> str:
@@ -746,6 +746,7 @@ class ResetBatchCheckout:
     start_tip: str
     expected_tip: str
     published_tip: str
+    record: BatchResumeRecord
 
 
 class KeepBatchCheckout(NamedTuple):
@@ -770,7 +771,7 @@ def merge(request: MergeRequest, *, batch_checkout: ResetBatchCheckout | KeepBat
     with build_folders.tool_folder("merge-message") as directory:
         message_path = Path(directory) / f"merge_{short}.msg"
         _ = message_path.write_text(message + "\n", encoding="utf-8")
-        result = git(checkout, "merge", "--no-ff", "-q", "-F", str(message_path), request.commit)
+        result = run_merge_command(checkout, batch_checkout, "merge", "--no-ff", "-q", "-F", str(message_path), request.commit)
     if result.returncode:
         raise checkpoint_gate.Stop("merge", "failed", result.stderr.strip() or "merge failed",
                    "the showrunner will inspect the merge failure")
@@ -889,81 +890,86 @@ def push_origin_matches(production: ProductionDocument, *accepted_tips: str) -> 
     return bool(fields) and fields[0] in accepted_tips
 
 
-def merge_main(production: ProductionDocument, *, batch_stop_owns_rollback: bool = False) -> None:
+def merge_main(production: ProductionDocument, *,
+               batch_checkout: ResetBatchCheckout | KeepBatchCheckout = KEEP_BATCH_CHECKOUT) -> None:
     """Integrate main before the checkpoint selects and runs its tests."""
     checkout = production.checkout
     _ = good(git(checkout, "fetch", "origin", "+refs/heads/main:refs/remotes/origin/main"), "push")
     main = git(checkout, "rev-parse", "refs/remotes/origin/main")
     if main.returncode == 0:
-        merge_main_commit(production, main.stdout.strip(), batch_stop_owns_rollback=batch_stop_owns_rollback)
+        merge_main_commit(production, main.stdout.strip(), batch_checkout=batch_checkout)
 
 
-class OwnedMainConflict(NamedTuple):
-    merge_head: str
-    index_digest: bytes
+class OpenMerge(NamedTuple):
+    targets: frozenset[str]
 
 
-class UnownedMainConflict(NamedTuple):
+class NoOpenMerge(NamedTuple):
     pass
 
 
-UNOWNED_MAIN_CONFLICT = UnownedMainConflict()
-GIT_OPERATION_PATHS = ("MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "rebase-merge", "rebase-apply", "sequencer")
+MERGE_TARGET_ID = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
 
 
-def git_state_path(checkout: Path, name: str) -> Path:
-    return Path(good(git(checkout, "rev-parse", "--path-format=absolute", "--git-path", name), "merge"))
+def merge_head_path(checkout: Path) -> Path:
+    return Path(good(git(checkout, "rev-parse", "--path-format=absolute", "--git-path", "MERGE_HEAD"), "merge"))
 
 
-def git_state_exists(path: Path) -> bool:
+def read_open_merge(path: Path) -> OpenMerge | NoOpenMerge:
     try:
-        _ = path.lstat()
+        targets = path.read_text(encoding="ascii").split()
     except FileNotFoundError:
-        return False
-    return True
+        return NoOpenMerge()
+    except (OSError, UnicodeError):
+        return OpenMerge(frozenset())
+    return OpenMerge(frozenset(target for target in targets if MERGE_TARGET_ID.fullmatch(target)))
 
 
-def merge_index_digest(checkout: Path) -> bytes:
-    return hashlib.sha256(git_state_path(checkout, "index").read_bytes()).digest()
+def run_merge_command(checkout: Path, batch_checkout: ResetBatchCheckout | KeepBatchCheckout,
+                      step: str, *args: str) -> subprocess.CompletedProcess[str]:
+    if isinstance(batch_checkout, KeepBatchCheckout):
+        return git(checkout, "merge", *args)
+    merge_head = merge_head_path(checkout)
+    result = git(checkout, "merge", *args)
+    open_merge = read_open_merge(merge_head)
+    if isinstance(open_merge, OpenMerge) and not result.returncode:
+        raise checkpoint_gate.Stop(step, "failed", "git merge left MERGE_HEAD open",
+                                   "the showrunner will inspect the merge options")
+    return result
 
 
 class MainConflict(checkpoint_gate.Stop):
     """A conflict between main and the unpublished merge tip."""
 
-    def __init__(self, paths: tuple[str, ...], ownership: OwnedMainConflict | UnownedMainConflict) -> None:
-        super().__init__("push", "held", "origin/main conflicts: " + ", ".join(paths),
+    def __init__(self, paths: tuple[str, ...], error: str) -> None:
+        super().__init__("push", "held", f"origin/main conflicts: {', '.join(paths)}; {error}",
                          "merge origin/main into the merge branch, resolve the conflict, and run the push again")
-        self.ownership: OwnedMainConflict | UnownedMainConflict = ownership
 
 
 def merge_main_commit(production: ProductionDocument, main_commit: str, *,
-                      batch_stop_owns_rollback: bool = False) -> None:
+                      batch_checkout: ResetBatchCheckout | KeepBatchCheckout = KEEP_BATCH_CHECKOUT) -> None:
     """Integrate the given main commit without fetching another tip."""
     checkout = production.checkout
-    if git(checkout, "merge-base", "--is-ancestor", main_commit, "HEAD").returncode:
-        started_idle = False
-        if batch_stop_owns_rollback:
-            try:
-                started_idle = not any(git_state_exists(git_state_path(checkout, name)) for name in GIT_OPERATION_PATHS)
-            except (checkpoint_gate.Stop, OSError, ValueError):
-                pass
-        merged = git(checkout, "merge", "--no-ff", "-m",
-                     "Merge origin/main into " + production.merge_branch, main_commit)
-        if merged.returncode:
-            ownership: OwnedMainConflict | UnownedMainConflict = UNOWNED_MAIN_CONFLICT
-            if started_idle:
-                try:
-                    merge_head = git_state_path(checkout, "MERGE_HEAD").read_text().strip()
-                    if merge_head == main_commit:
-                        ownership = OwnedMainConflict(main_commit, merge_index_digest(checkout))
-                except (checkpoint_gate.Stop, OSError, ValueError):
-                    pass
-            conflicts = good(git(checkout, "diff", "--name-only", "--diff-filter=U"), "push")
-            if not batch_stop_owns_rollback:
-                _ = good(git(checkout, "merge", "--abort"), "push")
-            if conflicts:
-                raise MainConflict(tuple(conflicts.splitlines()), ownership)
-            _ = good(merged, "push")
+    if git(checkout, "merge-base", "--is-ancestor", main_commit, "HEAD").returncode == 0:
+        return
+    if isinstance(batch_checkout, ResetBatchCheckout):
+        batch_checkout.record.add_main_target(main_commit)
+    merged = run_merge_command(checkout, batch_checkout, "push", "--no-ff", "-m",
+                               "Merge origin/main into " + production.merge_branch, main_commit)
+    if merged.returncode:
+        try:
+            conflicts = git(checkout, "--no-optional-locks", "diff", "--name-only", "--diff-filter=U")
+        except (OSError, ValueError) as error:
+            if isinstance(batch_checkout, KeepBatchCheckout):
+                raise
+            raise checkpoint_gate.Stop("push", "failed", failure_detail(merged),
+                                       "the showrunner will inspect the failed command") from error
+        if isinstance(batch_checkout, KeepBatchCheckout):
+            _ = good(conflicts, "push")
+            _ = good(git(checkout, "merge", "--abort"), "push")
+        if conflicts.returncode == 0 and conflicts.stdout.strip():
+            raise MainConflict(tuple(conflicts.stdout.strip().splitlines()), failure_detail(merged))
+        _ = good(merged, "push")
 
 
 @contextmanager
@@ -998,7 +1004,7 @@ def prepare_checkpoint(production: ProductionDocument, merge_head: str, *, publi
     checkout = production.checkout
     before_merge_tip = good(git(checkout, "rev-parse", f"{merge_head}^1"), "test")
     with push_rollback(production, before_merge_tip, batch_checkout=batch_checkout):
-        merge_main(production, batch_stop_owns_rollback=isinstance(batch_checkout, ResetBatchCheckout))
+        merge_main(production, batch_checkout=batch_checkout)
         if isinstance(batch_checkout, ResetBatchCheckout):
             batch_checkout.expected_tip = good(git(checkout, "rev-parse", "HEAD"), "test")
     output = good(git(checkout, "diff", "--name-only", published_tip or before_merge_tip, "HEAD"), "test")
@@ -1053,8 +1059,7 @@ def tested_main_push(production: ProductionDocument, tested_tip: str,
                 if git(checkout, "merge-base", "--is-ancestor", main_commit, tested_tip).returncode == 0:
                     break
                 settings_only = settings_commits_only(checkout, main_commit, tested_tip)
-                merge_main_commit(production, main_commit,
-                                  batch_stop_owns_rollback=isinstance(batch_checkout, ResetBatchCheckout))
+                merge_main_commit(production, main_commit, batch_checkout=batch_checkout)
                 tip = good(git(checkout, "rev-parse", "HEAD"), "test")
                 if isinstance(batch_checkout, ResetBatchCheckout):
                     batch_checkout.expected_tip = tip
@@ -1852,10 +1857,20 @@ class BatchResumeRecord:
     path: Path
     checkpoints: tuple[MergeRequest, ...]
     unpublished_checkpoints: tuple[MergeRequest, ...]
+    main_targets: tuple[str, ...] = ()
     retirement_attempted: bool = False
 
-    def contents(self) -> str:
+    def checkpoint_rows(self) -> str:
         return "".join(f"{item.commit}\t{item.batch_argument_line}\n" for item in self.checkpoints)
+
+    def add_main_target(self, target: str) -> None:
+        if target not in self.main_targets:
+            targets = (*self.main_targets, target)
+            write_text_atomic(self.path, self.checkpoint_rows() + "".join(f"main\t{tip}\n" for tip in targets))
+            self.main_targets = targets
+
+    def merge_targets(self) -> frozenset[str]:
+        return frozenset((*self.main_targets, *(row.commit for row in self.checkpoints)))
 
     def retire(self) -> None:
         self.retirement_attempted = True
@@ -1865,31 +1880,32 @@ class BatchResumeRecord:
             checkpoint_gate.report("batch", "warning", f"{self.path}: could not remove the batch record ({error})")
 
 
-def reset_batch(rollback: ResetBatchCheckout, stop: checkpoint_gate.Stop) -> None:
+def reset_batch(rollback: ResetBatchCheckout) -> None:
     """Undo every unpublished merge from the current batch attempt."""
     production = rollback.production
     checkout = production.checkout
+    targets = rollback.record.merge_targets()
     head = good(git(checkout, "rev-parse", "HEAD"), "merge")
     if head != rollback.expected_tip:
-        raise checkpoint_gate.Stop("red", "failed", f"HEAD moved from {rollback.expected_tip}",
-                                   "the showrunner will inspect the merge branch")
-    merge_head = git_state_path(checkout, "MERGE_HEAD")
-    if isinstance(stop, MainConflict) or git_state_exists(merge_head):
-        if not isinstance(stop, MainConflict) or not isinstance(stop.ownership, OwnedMainConflict):
-            raise checkpoint_gate.Stop("merge", "held", "cannot reset an open merge without ownership evidence",
+        parents = good(git(checkout, "show", "-s", "--format=%P", head), "merge").split()
+        if len(parents) != 2 or parents[0] != rollback.expected_tip or parents[1] not in targets:
+            raise checkpoint_gate.Stop("red", "failed", f"HEAD moved from {rollback.expected_tip}",
                                        "the showrunner will inspect the merge branch")
-        if (merge_head.read_text().strip() != stop.ownership.merge_head
-                or merge_index_digest(checkout) != stop.ownership.index_digest):
-            raise checkpoint_gate.Stop("merge", "held", "the main conflict changed. The batch left the merge open",
+    open_merge = read_open_merge(merge_head_path(checkout))
+    if isinstance(open_merge, OpenMerge):
+        if unrelated := open_merge.targets - targets:
+            raise checkpoint_gate.Stop("merge", "held", f"the batch left the operator merge open: {', '.join(sorted(unrelated))}",
                                        "the showrunner will inspect the merge branch")
         _ = good(git(checkout, "merge", "--abort"), "merge")
-        head = good(git(checkout, "rev-parse", "HEAD"), "merge")
+        if good(git(checkout, "rev-parse", "HEAD"), "merge") == rollback.start_tip:
+            return
     if head == rollback.start_tip:
+        _ = good(git(checkout, "reset", "--keep", head), "red")
         return
     if not push_origin_matches(production, rollback.published_tip, rollback.start_tip):
         raise checkpoint_gate.Stop("push", "failed", "origin moved; cannot reset the batch",
                                    "the showrunner will inspect the merge branch")
-    undo_unpushed_merge(production, rollback.expected_tip, rollback.start_tip)
+    undo_unpushed_merge(production, head, rollback.start_tip)
 
 
 class BatchStopNotice(NamedTuple):
@@ -1958,7 +1974,7 @@ def finish_batch_stop(stop: checkpoint_gate.Stop, notices: Iterable[BatchStopNot
     reset_error = ""
     if isinstance(rollback, ResetBatchCheckout):
         try:
-            reset_batch(rollback, stop)
+            reset_batch(rollback)
         except (checkpoint_gate.Stop, OSError, ValueError) as error:
             reset_error = str(error)
 
@@ -2131,7 +2147,7 @@ def resume_merged_items(record: BatchResumeRecord) -> tuple[tuple[MergeRequest, 
         if unpublished and git(checkout, "merge-base", "--is-ancestor", unpublished[0].commit, upstream).returncode == 1:
             start_tip = good(git(checkout, "rev-parse", f"{merged_checkpoint(unpublished[0])}^1"), "merge")
         published_tip = good(git(checkout, "rev-parse", upstream), "merge")
-        rollback = ResetBatchCheckout(production, start_tip, head, published_tip)
+        rollback = ResetBatchCheckout(production, start_tip, head, published_tip, record)
         try:
             resumed = run(request, push_scope=push_scope, batch_rows=pending_rows,
                           batch_checkout=rollback if pending_rows else KEEP_BATCH_CHECKOUT)
@@ -2210,23 +2226,28 @@ def batch_resume_record(requests: tuple[MergeRequest, ...], upstream: str) -> Ge
     checkpoints = resolve_batch_checkpoints(requests)
     sources = unpushed_checkpoint_sources(production, upstream)
     record = BatchResumeRecord(path, checkpoints, tuple(item for item in checkpoints if item.commit in sources))
-    contents = record.contents()
-    if sources:
-        try:
-            saved = path.read_bytes()
-        except FileNotFoundError:
-            saved = b""
-        if saved != contents.encode("utf-8") or sources.isdisjoint(item.commit for item in checkpoints):
-            raise Refusal("unpushed merges do not have a matching batch record; "
-                          + "reset the merge branch to its pushed tip, then start a fresh batch")
+    rows = record.checkpoint_rows()
+    try:
+        saved = path.read_bytes().decode("utf-8")
+    except (FileNotFoundError, UnicodeError):
+        saved = ""
+    main_entries = saved[len(rows):].splitlines()
+    record_matches = saved.startswith(rows) and all(
+        entry.startswith("main\t") and MERGE_TARGET_ID.fullmatch(entry[5:]) for entry in main_entries)
+    if sources and (not record_matches or sources.isdisjoint(row.commit for row in checkpoints)):
+        raise Refusal("unpushed merges do not have a matching batch record; "
+                      + "reset the merge branch to its pushed tip, then start a fresh batch")
+    if record_matches:
+        record.main_targets = tuple(entry.removeprefix("main\t") for entry in main_entries)
     else:
         path.parent.mkdir(parents=True, exist_ok=True)
-        write_text_atomic(path, contents)
+        write_text_atomic(path, rows)
     try:
         yield record
     finally:
         if not record.retirement_attempted and not unpushed_checkpoint_sources(production, upstream):
-            record.retire()
+            if not record.main_targets or isinstance(read_open_merge(merge_head_path(checkout)), NoOpenMerge):
+                record.retire()
 
 
 def run_batch(requests: tuple[MergeRequest, ...]) -> int:
@@ -2254,7 +2275,7 @@ def run_recorded_batch(resume_record: BatchResumeRecord) -> int:
         return resumed
     start_tip = good(git(production.checkout, "rev-parse", "HEAD"), "merge")
     published_tip = good(git(production.checkout, "rev-parse", f"origin/{production.merge_branch}"), "merge")
-    rollback = ResetBatchCheckout(production, start_tip, start_tip, published_tip)
+    rollback = ResetBatchCheckout(production, start_tip, start_tip, published_tip, resume_record)
     first = requests[0]
     log = first.scratch / f"merge_{first.commit[:7]}_test.log"
     log.parent.mkdir(parents=True, exist_ok=True)
