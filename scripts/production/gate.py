@@ -2942,9 +2942,6 @@ def mac_linux_gate_placed(mode: SuiteMode, gate_job: StepJob | GateJobNotRecorde
         saved = admission_wire.read_assignment(Path(path)).assignment
         if saved.destination.target != "mac-linux":
             return False
-        if not conf.read("build_targets").value("enabled.mac-linux", conf.on_off,
-                                               default=False, recover_invalid=False):
-            return False
         if not isinstance(gate_job, StepJob) or saved.episode != os.environ.get("BUILDLOG_PLACEMENT_EPISODE"):
             return False
         owner = saved.owner
@@ -3010,15 +3007,32 @@ def run_gate_suites(repo: Path, type_dirs: Sequence[str] = (),
             guest = cast(MacLinuxGateRoute, cast(object, import_module("scripts.build_targets.mac_linux")))
             outcome = guest.route(repo, mode=mode, full=full, module_time_limit_s=module_time_limit_s,
                                   selected=selection, gate_job=gate_job, type_dirs=type_dirs)
-            if isinstance(outcome, GateRun):
-                return outcome
-            raise MacLinuxGateRefused(f"Mac Linux guest gate failed: {outcome}")
+            if isinstance(outcome, str):
+                raise MacLinuxGateRefused(f"Mac Linux guest gate failed: {outcome}")
+            if not outcome.passed:
+                print("Mac Linux guest gate failed", file=sys.stderr, flush=True)
+                if outcome.time_limit_report:
+                    print(outcome.time_limit_report, file=sys.stderr, flush=True)
+                for job in outcome.jobs:
+                    if job.returncode:
+                        print(f"--- {job.suite}/{job.module} exit={job.returncode} ---\n{job.output}",
+                              file=sys.stderr, flush=True)
+            return outcome
         return run_cloud(selection)
+
+    mac_placed = mac_linux_gate_placed(mode, gate_job)
+    if mac_placed:
+        key = "enabled.mac-linux"
+        try:
+            enabled = conf.read("build_targets").value(key, conf.on_off, default=False, recover_invalid=False)
+        except conf.Unusable as error:
+            raise MacLinuxGateRefused(f"Mac Linux guest gate cannot read build_targets.conf {key}: {error}") from error
+        if not enabled:
+            raise MacLinuxGateRefused(f"Mac Linux guest gate refused with build_targets.conf {key}=off")
 
     absent = [name for name in type_dirs if not (repo / name).exists()]
     if absent:
         raise GateRefused(f"type dirs not found under {repo}: {', '.join(absent)}")
-    mac_placed = mac_linux_gate_placed(mode, gate_job)
     if mode is SuiteMode.GATE:
         return run_whole_gate(ALL_MODULES)
 
@@ -3033,9 +3047,11 @@ def run_gate_suites(repo: Path, type_dirs: Sequence[str] = (),
                        else CleanTestTree(tree, checked_git(repo, "rev-parse", "HEAD")))
         modules = discover_test_modules(repo)
         selection, ledger = select_targeted_modules(repo, tested_tree, modules, source=source)
-        if ledger.reuse(report=False):
-            if mac_placed and type_dirs:
-                return run_whole_gate(TreeSelection((), tree))
+        if ledger.reuse(report=mac_placed and not type_dirs):
+            if mac_placed:
+                if type_dirs:
+                    return run_whole_gate(TreeSelection((), tree))
+                return GateRun((), 0.0, 0.0, tests_reused=True)
             return run_local(type_dirs)
         whole_suite = isinstance(selection, FullSuite)
         paths = selection.modules if isinstance(selection, AffectedSelection) else tuple(path for _, path in modules)
