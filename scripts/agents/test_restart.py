@@ -34,7 +34,7 @@ from datetime import datetime, timedelta, timezone
 from enum import Enum
 from types import SimpleNamespace
 from uuid import NAMESPACE_URL, uuid5
-from unittest.mock import Mock, call, patch
+from unittest.mock import ANY, Mock, call, patch
 
 from scripts.agents import inventory
 from scripts.herdr import herdr, pane_launch, turn_end, worker_panes
@@ -2520,7 +2520,7 @@ runpy.run_module('scripts.agents.restart', run_name='__main__', alter_sys=True)
             self.assertEqual(shutdown.main(["restart"]), 0)
         receipt.assert_called_once_with(child, progress_history.ActiveDispatch(dispatch, ("assign.sh",)))
         send.assert_called_once_with(director.pane_id, resume_message.launcher_prompt(child.id, dispatch, ("assign.sh",)),
-                                     target=str(owner.current_session))
+                                     target=str(owner.current_session), on_submission=ANY)
         self.assertIn("1 of 1 sessions back", output.getvalue())
         self.assertEqual(shutdown_record.read(), [])
 

@@ -29,6 +29,7 @@ from scripts.agents import detached_runs
 from scripts.build_targets import target_config
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
 from scripts.mac_test import claim_state
+from scripts.message import session_send
 from scripts.herdr import worker_panes
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.production.staff_test_support import fixture_member, isolated_staff_file
@@ -1052,6 +1053,27 @@ class HoldEnforcerTests(unittest.TestCase):
         self.assertEqual([entry["delivery"] for entry in build_hold.stopped_run_entries(cycle["entries"]).values()],
                          ["Delivered"] * 4)
 
+    def test_release_routes_a_confirmed_worker_gate_refusal_to_the_director(self) -> None:
+        self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
+        director = fixture_member("showrunner", name="director")
+        worker = fixture_member("worker", name="worker", parent=director.id)
+        address = f"codex:{worker.current_session}"
+        run: build_hold.StoppedRun = {"id": "checks", "label": "checks", "staff_id": str(worker.id), "director_dir": ""}
+        entry = build_hold.new_entry(address, worker.name)
+        membership = staff.initial_snapshot()
+        refusal = subprocess.CompletedProcess([], 2, "REFUSED: worker: no active pass. Use assign.sh for new work.\n", "")
+        accepted = subprocess.CompletedProcess([], 0, "SENT: director\n", "")
+        with mock.patch.object(subprocess, "run", side_effect=[refusal, accepted]) as send:
+            result = build_hold.send_stopped_run_release(entry, run, "released", membership)
+        self.assertIsInstance(result, build_hold.ReleaseDelivered)
+        notice = f"released Restart the stopped run checks for worker. Run ID checks. Session {address}."
+        self.assertEqual(send.call_args_list, [
+            mock.call(session_send.send_argv("--to", address, "--text", notice, "--skip-closed"),
+                      capture_output=True, text=True),
+            mock.call(session_send.send_argv("--to", str(director.id), "--text", notice),
+                      capture_output=True, text=True),
+        ])
+
     def test_release_does_not_forward_a_send_failure(self) -> None:
         self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
         director = fixture_member("showrunner", name="director")
@@ -1171,7 +1193,8 @@ class HoldEnforcerTests(unittest.TestCase):
             self.assertFalse(detached_runs.confirms_hold_stop(record, record.stem, "other-request"))
             if prune:
                 saved = cast(detached_runs.RunRecord, json.loads(record.read_text()))
-                saved.update(status="finished", exit_code=143, started_at=saved["started_at"] - 1)
+                saved.update(status="finished", exit_code=143, started_at=saved["started_at"] - 1,
+                             worker_received=True)
                 write_text_atomic(record, json.dumps(saved))
                 self.write_detached_run(runs / "newer.json", command_started=False)
                 with mock.patch.object(staff, "local_snapshot", return_value=staff.StaffSnapshot(())):

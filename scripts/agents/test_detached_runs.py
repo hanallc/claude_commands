@@ -810,7 +810,7 @@ class DetachedRunsTests(unittest.TestCase):
     def test_start_keeps_an_old_run_when_its_hold_stop_confirmation_cannot_be_copied(self) -> None:
         request_id = "a" * 32
         path = self.finished_run("director-stopped", worker="director", staff_id="",
-                                 exit_code=143, hold_stop_requests=[request_id])
+                                 exit_code=143, hold_stop_requests=[request_id], director_result_delivery="sent: accepted")
         files = self.run_files(path.stem)
         hold_paths = {"BUILD_HOLD_DIR": str(self.root / "holders"),
                       "BUILD_HOLD_RELEASE_DIR": str(self.root / "release")}

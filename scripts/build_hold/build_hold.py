@@ -49,7 +49,7 @@ from scripts.build_hold.shared_state_defaults import (
 from scripts.build_targets.target_config import ConfigError, SshTarget, command_target_name, read_targets
 
 from scripts.message import session_send
-from scripts.message.send_result import SEND_ABSENT_EXIT, SEND_CLOSED_EXIT
+from scripts.message.send_result import ConfirmedSendOutcome, SEND_ABSENT_EXIT, SEND_CLOSED_EXIT, send_outcome
 
 if TYPE_CHECKING:
     from scripts.production import staff
@@ -210,6 +210,11 @@ class ReleaseWorkerClosed:
 @dataclass(frozen=True)
 class ReleaseSendFailed:
     reason: str
+
+
+@dataclass(frozen=True)
+class ReleaseWorkerRefused(ReleaseSendFailed):
+    """The worker gate refused the notice before delivery."""
 
 
 @dataclass(frozen=True)
@@ -1846,6 +1851,10 @@ def send_release_to(entry: ReleaseEntry, address: str, notice: str) -> ReleaseNo
         return ReleaseWorkerClosed()
     if options and result.returncode == SEND_ABSENT_EXIT:
         return RecipientGone()
+    outcome = send_outcome(result.returncode, result.stdout)
+    if (isinstance(outcome, ConfirmedSendOutcome) and outcome.header.outcome == "refused"
+            and outcome.header.detail.endswith(". Use assign.sh for new work.")):
+        return ReleaseWorkerRefused(outcome.header.detail)
     return ReleaseSendFailed(f"send.py: {failure_detail(result)}")
 
 
@@ -1877,7 +1886,7 @@ def send_stopped_run_release(entry: ReleaseEntry, run: StoppedRun, notice: str,
         result = send_release_to(entry, f"codex:{worker.current_session}", notice)
     else:
         result = send_release_to(entry, str(worker.id), notice)
-    if not isinstance(result, (ReleaseWorkerClosed, RecipientGone)):
+    if not isinstance(result, (ReleaseWorkerClosed, ReleaseWorkerRefused, RecipientGone)):
         return result
     if membership is None:
         return ReleaseSendFailed("staff membership is unavailable")

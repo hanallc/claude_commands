@@ -663,6 +663,32 @@ class WorkerCommandTests(unittest.TestCase):
                     self.assertEqual(sum("pane evidence is unknown" in line
                                          for line in errors.getvalue().splitlines()), 1)
 
+    def test_restore_delivers_an_unbound_result_from_another_held_run(self) -> None:
+        opened = self.opened()
+        row, pane = opened.row, opened.pane
+        world = self.fixture.world
+        previous = self.fixture.worker_run("previous", "unit", self.fixture.parent.current_session)
+        path, record = self.detached_record(row, "other-check", run=previous)
+        record.update(exit_code=0, pane_dispatch_id="")
+        atomic_file.write_text_atomic(path, json.dumps(record))
+        _ = write_config_fixture(self.fixture.root / "conf/postmaster.conf")
+        self.assertTrue(world.stop(row, world))
+        runs = {str(self.fixture.parent.current_session): [str(self.run_dir), str(previous)]}
+        self.assertEqual(worker_panes.worker_run(row, scanned=runs), self.run_dir)
+        report = worker.RestoreReport()
+        before = len(self.fixture.prompts())
+        with (self.fixture.record_codex_prompt(row, pane),
+              patch.object(detached_runs, "_alert_director"), redirect_stdout(io.StringIO())):
+            self.assertEqual(worker.restore(self.fixture.parent.id, runs=runs, report=report), worker.ExitCode.OK)
+
+        self.assertEqual(report.restored, {row.id})
+        self.assertEqual(report.skipped, {})
+        self.assertEqual(report.failures, {})
+        prompt, = self.fixture.prompts()[before:]
+        self.assertEqual(prompt[2], pane)
+        self.assertIn("Detached run: other-check", prompt[3].splitlines())
+        self.assertIs(worker_lifecycle.read_json_object(path)["worker_received"], True)
+
     def test_restore_resumes_a_stopped_idle_worker_with_live_runs_and_exact_context(self) -> None:
         self.assert_restore_live_run(active=False)
 
@@ -783,7 +809,7 @@ class WorkerCommandTests(unittest.TestCase):
         record.update(status="running", pid=supervisor)
         atomic_file.write_text_atomic(path, json.dumps(record))
         context = (f"Detached run {opened.row.name} remains live. "
-                   + f"Result: {path}; log: {record['log']}. Read it with: `cat -- {path} {record['log']}`. "
+                   + f"The result is at {path}. The log is at {record['log']}. Run `cat -- {path} {record['log']}`. "
                    + "Its result follows this worker after the move.")
         target = self.fixture.root / ".codex2"
         target.mkdir()
@@ -2253,13 +2279,15 @@ class WorkerCommandTests(unittest.TestCase):
         self.assertEqual(self.agent.submitted, [(pane, line)])
         self.assertEqual(self.agent.waited, [])
 
-    def detached_record(self, row: staff.StaffRow, run_id: str) -> tuple[Path, detached_runs.RunRecord]:
-        directory = self.run_dir / worker_lifecycle.DETACHED_RUNS_DIR
+    def detached_record(self, row: staff.StaffRow, run_id: str, *,
+                        run: Path | None = None) -> tuple[Path, detached_runs.RunRecord]:
+        run = self.run_dir if run is None else run
+        directory = run / worker_lifecycle.DETACHED_RUNS_DIR
         directory.mkdir(exist_ok=True)
         record: detached_runs.RunRecord = {"run_id": run_id, "status": "finished", "worker": row.name,
-            "staff_id": row.id, "session_dir": str(self.run_dir), "label": "private verification", "command": [],
+            "staff_id": row.id, "session_dir": str(run), "label": "private verification", "command": [],
             "log": str(directory / f"{run_id}.log"), "started_at": time.time(), "pid": 0,
-            "director_dir": str(self.run_dir), "done_message_file": ""}
+            "director_dir": str(run), "done_message_file": ""}
         path = directory / f"{run_id}.json"
         path.with_suffix(".record.lock").touch()
         return path, record

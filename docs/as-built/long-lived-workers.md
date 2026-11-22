@@ -521,6 +521,8 @@ An accepted dispatch gets a continuation prompt in the proved worker pane when t
 The pane can prove its native conversation before Herdr reports the session ID.
 Herdr checks the native input target again before it sends the prompt.
 If a finished detached result is pending, restore tries its delivery before it sends a continuation prompt.
+For a worker with no active pass, restore checks every held run folder for pending results without a pass ID.
+If a live run is in a different folder from the active pass, the resume prompt names the director as the notice recipient.
 Delivery requires a receipt in the worker transcript.
 Restore uses the shared dispatch receipt when an active pass waits for a reply to a detached result.
 If the worker received all results and still owes a DONE, restore sends the continuation prompt.
@@ -754,6 +756,8 @@ Each checks the supervisor and the command leader identity before it signals the
 Each stages the stop reason before it sends TERM.
 The supervisor stays alive to record the exit status and deliver the result.
 A run with a saved stop reason reports `STOPPED` and includes the reason.
+When a build hold ends, release sends a restart notice for the stopped run.
+If the worker gate confirms a refusal, release sends the notice to the director.
 The result includes the command's exit status.
 Exits 76 and 77 also include instructions for the next action.
 A self-stop requires a native Claude session record or Codex pane report for the caller.

@@ -1436,7 +1436,7 @@ def _resume_launcher(opened: worker_panes.OpenWorker, resume: WorkerResume, *,
     return ExitCode.OK
 
 
-def _detached_resume_context(row: staff.StaffRow, directories: Iterable[Path]) -> str:
+def _detached_resume_context(row: staff.StaffRow, directories: Iterable[Path], *, active_run: Path | None) -> str:
     lines: list[str] = []
     for directory in dict.fromkeys(directories):
         runs = directory / worker_lifecycle.DETACHED_RUNS_DIR
@@ -1444,8 +1444,11 @@ def _detached_resume_context(row: staff.StaffRow, directories: Iterable[Path]) -
             result = runs / f"{record['run_id']}.json"
             log = record["log"]
             command = shlex.join(["cat", "--", str(result), log])
-            lines.append(f"Detached run {record['run_id']} remains live. Result: {result}; log: {log}. "
-                         + f"Read it with: `{command}`. Its result follows this worker after the move.")
+            route = ("The director receives the result notice because this run is outside the active pass."
+                     if active_run is not None and directory != active_run
+                     else "Its result follows this worker after the move.")
+            lines.append(f"Detached run {record['run_id']} remains live. "
+                         + f"The result is at {result}. The log is at {log}. Run `{command}`. {route}")
     return "\n".join(lines)
 
 
@@ -1453,7 +1456,6 @@ def _resume_needed(state: worker_panes.OpenWorker | worker_panes.StoppedWorker |
                    run: Path, held_runs: Iterable[Path]) -> WorkerResume | DispatchEvidenceUnknown | None:
     """Decide from the recorded dispatches, transcript, pane and live runs."""
     directories = tuple(dict.fromkeys((run, *held_runs)))
-    detached = _detached_resume_context(state.row, directories)
     active: dict[str, tuple[Path, progress_history.ActiveDispatch]] = {}
     record = staff.snapshot()
     with staff.supplied_snapshot(record):
@@ -1469,17 +1471,19 @@ def _resume_needed(state: worker_panes.OpenWorker | worker_panes.StoppedWorker |
     step = resume_step(state.row, dispatch) if dispatch is not None else NO_OWN_PASS
     if isinstance(step, DispatchEvidenceUnknown):
         return step
+    detached = _detached_resume_context(state.row, directories, active_run=dispatch_run if dispatch is not None else None)
     if isinstance(step, NoOwnPass) and dispatch is not None and not detached:
         continuation = _restore_reply_step(state.row, dispatch, dispatch_run, record)
         if isinstance(continuation, BusyPass):
             step = continuation
-    if detached or isinstance(step, UnsubmittedAssignment):
-        return WorkerResume(step, dispatch_run, dispatch, detached)
     already_working = (isinstance(state, worker_panes.OpenWorker)
                        and state.status in (herdr.AgentStatus.WORKING, herdr.AgentStatus.RUNNING))
-    if (isinstance(step, BusyPass) and not already_working
-            or dispatch is None and not already_working and detached_runs.has_unbound_worker_result(run, state.row)):
-        return WorkerResume(step, dispatch_run, dispatch)
+    if dispatch is None and not already_working:
+        for directory in directories:
+            if detached_runs.has_unbound_worker_result(directory, state.row):
+                return WorkerResume(step, directory, detached=detached)
+    if detached or isinstance(step, UnsubmittedAssignment) or (isinstance(step, BusyPass) and not already_working):
+        return WorkerResume(step, dispatch_run, dispatch, detached)
     return None
 
 
