@@ -748,7 +748,12 @@ If pruning removes the run during the lock wait, the stop returns a refusal.
 Builds Kill recovery uses the same locked route check for a first commit.
 It can finish the commit for its action.
 The stop commit saves the notice ID in the run record.
-Pruning keeps that record until Builds saves the pending notice and acknowledges the notice ID.
+Builds saves the pending notice before it sends it.
+Builds saves the delivery result before it acknowledges the notice ID.
+An acknowledgment error does not change the delivery result.
+Pruning keeps a finished run with an unacknowledged notice ID for `review_links.snapshot_retention_seconds`.
+The default is seven days from `finished_at`.
+After that time, the usual pruning rules apply.
 A run that ends by itself just after the stop commit reports as stopped.
 Recovery finishes committed stops and the pending cleanup of runs without a supervisor.
 A run without a saved slice can receive a legacy group TERM, which reports an unconfirmed stop.

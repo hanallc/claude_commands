@@ -764,6 +764,25 @@ class DetachedRunsTests(unittest.TestCase):
             self.assertFalse(path.exists())
             self.assertFalse(pending_stop.exists())
 
+    def test_prune_expires_an_unacknowledged_stop_notice(self) -> None:
+        now = datetime(2026, 11, 22, tzinfo=timezone.utc).timestamp()
+        _ = write_config_fixture(self.root / "config/review_links.conf",
+                                 "# range: 0..\nsnapshot_retention_seconds=60\n")
+        recent = self.finished_run("recent-notice", staff_id="retired-worker", started_at=now - 600,
+                                   finished_at=datetime.fromtimestamp(now - 59, timezone.utc).isoformat(),
+                                   stop_notice_id="recent", stop_pass_requested=True)
+        expired = self.finished_run("expired-notice", staff_id="retired-worker", started_at=now - 600,
+                                    finished_at=datetime.fromtimestamp(now - 61, timezone.utc).isoformat(),
+                                    stop_notice_id="expired", stop_pass_requested=True)
+
+        with patch.object(time, "time", return_value=now) as clock:
+            self.assertEqual(detached_runs.prune_finished(recent.parent), [expired.stem])
+            self.assertEqual(self.run_files(expired.stem), [])
+            self.assertTrue(recent.is_file())
+            clock.return_value = now + 1
+            self.assertEqual(detached_runs.prune_finished(recent.parent), [recent.stem])
+        self.assertEqual(self.run_files(recent.stem), [])
+
     def test_prune_keeps_a_delivered_result_until_the_saved_stage_completes(self) -> None:
         opened = time.time()
         self.set_pass("completed", opened)
@@ -1454,6 +1473,18 @@ sys.exit(1)
         events = scope / "cgroup.events"
         _ = events.write_text("populated 1\n")
         return path, cgroups, events
+
+    @unittest.skipUnless(process_stop.supported(), "pidfd stop needs Linux")
+    def test_empty_stop_reason_refuses_before_configuration_or_lock(self) -> None:
+        path, cgroups, _ = self.record_populated_slice()
+        original = path.read_bytes()
+        with (patch.object(process_stop, "CGROUP_ROOT", cgroups),
+              patch.object(detached_runs, "_scope_stop_graces") as settings,
+              patch.object(detached_runs, "_scope_stop_lock") as lock):
+            self.assertFalse(detached_runs.stop_command(path, ""))
+        settings.assert_not_called()
+        lock.assert_not_called()
+        self.assertEqual(path.read_bytes(), original)
 
     @unittest.skipUnless(process_stop.supported(), "pidfd stop needs Linux")
     def test_stop_refuses_when_prune_removes_the_run_during_a_lock_wait(self) -> None:

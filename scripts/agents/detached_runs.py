@@ -510,7 +510,7 @@ def _stop_slice_command(
     grace, kill_grace = _scope_stop_graces()
     with _scope_stop_lock(path, blocking=True):
         record = _read_record_if_present(path)
-        if record is None or record.get("command_slice") != run_slice or record["status"] != "running" or not reason:
+        if record is None or record.get("command_slice") != run_slice or record["status"] != "running":
             return False
         ended = _read_slice_end(run_slice, retry_seconds=grace if retry_slice_read else 0.0)
         with record_lock(path):
@@ -534,7 +534,7 @@ def stop_command(
     retry_slice_read: bool = False, stop_notice_id: str = "",
 ) -> bool:
     """Request a stop and confirm that the run slice has ended."""
-    if not process_stop.supported():
+    if not reason or not process_stop.supported():
         return False
     record = worker_lifecycle.read_json_object(path)
     supervisor = _integer(record.get("pid"))
@@ -957,6 +957,13 @@ def prune_finished(runs: Path) -> list[str]:
         return _prune_finished_locked(runs)
 
 
+def _finished_time(record: Mapping[str, object]) -> float:
+    if isinstance(stamp := record.get("finished_at"), str):
+        with contextlib.suppress(ValueError, OSError, OverflowError):
+            return datetime.fromisoformat(stamp).timestamp()
+    return _number(record.get("started_at"), 0.0)
+
+
 def _prune_finished_locked(runs: Path) -> list[str]:
     """Delete settled finished runs while the caller holds the admission lock.
 
@@ -976,10 +983,11 @@ def _prune_finished_locked(runs: Path) -> list[str]:
     passes: dict[staff.StaffId, dict[str, object]] = {}
     settled: dict[staff.StaffId, bool] = {}
     removed: list[str] = []
+    now = time.time()
+    notice_cutoff: float | None = None
     for path, raw in records:
         run_id = raw.get("run_id")
         if (raw.get("status") != "finished" or raw.get("completion_pending")
-                or raw.get("stop_notice_id")
                 or _worker_result_pending(str(raw.get("delivery", "")))
                 or not isinstance(run_id, str) or path.name != f"{run_id}.json"):
             continue
@@ -1005,9 +1013,15 @@ def _prune_finished_locked(runs: Path) -> list[str]:
         with record_lock(path):
             current = worker_lifecycle.read_json_object(path)
             if (current.get("run_id") != run_id or current.get("status") != "finished"
-                    or current.get("completion_pending") or current.get("stop_notice_id")
-                    or _worker_result_pending(str(current.get("delivery", "")))
-                    or (_has_saved_cgroup(current) and not _command_has_ended(current, _integer(current.get("pid"))))):
+                    or current.get("completion_pending") or _worker_result_pending(str(current.get("delivery", "")))):
+                continue
+            if current.get("stop_notice_id"):
+                if notice_cutoff is None:
+                    retention = conf.read_or_repository("review_links").number("snapshot_retention_seconds")
+                    notice_cutoff = now - retention
+                if _finished_time(current) > notice_cutoff:
+                    continue
+            if _has_saved_cgroup(current) and not _command_has_ended(current, _integer(current.get("pid"))):
                 continue
             for name in _RUN_FILES:
                 (runs / name.format(run_id)).unlink(missing_ok=True)
