@@ -1369,7 +1369,8 @@ class QueueInputs:
     build_space: BuildSpaceHold | NoBuildSpaceHold = field(default=NoBuildSpaceHold(), kw_only=True)
     local_machine: str = field(default="natedev", kw_only=True)
     run_limit_exempt_owners: frozenset[str] = field(default=frozenset(), kw_only=True)
-    verify_run_counts: Mapping[str, int] = field(default_factory=dict[str, int], kw_only=True)
+    verify_run_owners: Mapping[str, frozenset[str]] = field(default_factory=dict[str, frozenset[str]], kw_only=True)
+    verify_slot_requests: Mapping[str, str] = field(default_factory=dict[str, str], kw_only=True)
 
     def __post_init__(self) -> None:
         orders = {waiter_owner(row): (waiter_priority(row) if isinstance(row.get("order"), (PriorityUnit, NormalOrder))
