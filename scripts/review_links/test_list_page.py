@@ -5373,8 +5373,8 @@ window.fetch=()=>new Promise(resolve=>replies.push(resolve));
  check(readReceipt && notice.hidden && above.hidden,'A refused retry waits for the receipt before showing a failure.');
  readReceipt?.();await flush();
  check(isLinked()===!saved,'Only a missing receipt restores the link.');
- const visible=[...(row.hidden || row.querySelector('[data-detail]').hidden ? [] : [notice]),above]
-  .filter(status=>!status.hidden);
+ const visible=[recordDetails(row).querySelector('[data-send-status]'),above]
+  .filter(status=>status?.getClientRects().length);
  check(saved ? visible.length===0 :
   visible.length===1 && visible[0].textContent.endsWith('Not saved: The fixture refuses the signed request.'),
   'A refused retry shows one failure line only when the receipt is missing.');
