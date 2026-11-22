@@ -528,6 +528,15 @@ def gate_repository_name(step: str, repository_name: str, worktree: str) -> str:
     return repository_name
 
 
+def profile_repository_name(profile: records.StepProfile | records.ProgramProfile) -> str:
+    """Get the repository name used by the run limits."""
+    if isinstance(profile.repository, records.RepositoryIdentity):
+        return profile.repository.name or profile.repo
+    if isinstance(profile, records.ProgramProfile):
+        return gate_repository_name(profile.step, profile.repo, profile.worktree)
+    return profile.repo
+
+
 @dataclass(frozen=True)
 class LiveGrant:
     pass
@@ -613,13 +622,13 @@ class VerifyRunSlot:
     repository: str
     owner: wire.Owner
 
+    @property
+    def run_key(self) -> str:
+        return records.run_owner(self.owner.pid, self.owner.start_time)
 
-@dataclass(frozen=True)
-class WaitingVerifyRun:
-    """Keep a Verify run in the slot queue until its connection ends or it gets a slot."""
-    request: wire.VerifyRunSlotRequest
-    row: records.Waiter
-    reason: records.RunLimitWait
+    @property
+    def key(self) -> str:
+        return f"{self.run_key}:{self.repository}"
 
 
 @dataclass(frozen=True)
@@ -639,6 +648,31 @@ class ServiceState:
     current_assignments: dict[str, str] = field(default_factory=dict)
     pending_cloud_groups: dict[str, PendingCloudGroup] = field(default_factory=dict)
     verify_run_slots: dict[str, VerifyRunSlot] = field(default_factory=dict, kw_only=True)
+
+
+def saved_verify_run_slots(state: ServiceState) -> dict[str, VerifyRunSlot]:
+    """Keep legacy slots only when the state records a local grant."""
+    slots = {key: slot for key, slot in state.verify_run_slots.items() if key == slot.key}
+    if len(slots) == len(state.verify_run_slots):
+        return slots
+    granted: set[VerifyRunSlot] = set()
+    for record in state.reservations.values():
+        if isinstance(record.place, wire.LocalPlace) and "verify" in record.queue_waiter:
+            repository = record.queue_waiter.get("repository_name", record.repo)
+            granted.add(VerifyRunSlot(repository, record.owner))
+            if isinstance(record.run, wire.RunIdentity):
+                granted.add(VerifyRunSlot(repository, wire.Owner(record.run.pid, record.run.start_time)))
+    for saved in state.assignments.values():
+        assignment = saved.assignment
+        request = state.placement_requests.get(assignment.episode)
+        if (assignment.destination.provider == "local" and isinstance(saved.permission, placement.PermissionConsumed)
+                and request is not None and isinstance(request.identity.verify, records.VerifyCall)):
+            repository = profile_repository_name(request.profile)
+            granted.add(VerifyRunSlot(repository, wire.Owner(request.owner.pid, request.owner.start_time)))
+            if isinstance(request.run, wire.RunIdentity):
+                granted.add(VerifyRunSlot(repository, wire.Owner(request.run.pid, request.run.start_time)))
+    slots.update((slot.key, slot) for slot in state.verify_run_slots.values() if slot in granted)
+    return slots
 
 
 @dataclass(frozen=True)
@@ -1522,7 +1556,6 @@ class AdmissionServer:
         self.fault: Callable[[str], None] = fault
         self.socket_path: Path = socket_path if socket_path is not None else wire.admission_socket_path()
         self.waiters: dict[str, WaitingAdmission] = {}
-        self.verify_run_waiters: dict[int, WaitingVerifyRun] = {}
         self.verify_run_slots: dict[str, VerifyRunSlot] = {}
         self.pending_cloud_groups: dict[str, PendingCloudGroup] = {}
         self.reservations: dict[str, ReservationRecord] = {}
@@ -1667,7 +1700,7 @@ class AdmissionServer:
             self.spacing, self.priority = state.spacing, state.priority
             self.build_history_generation = state.build_history_generation
             self.run_places = state.run_places
-            self.verify_run_slots = state.verify_run_slots
+            self.verify_run_slots = saved_verify_run_slots(state)
             self.lifecycle_outbox = state.lifecycle_outbox
             self.caller_versions = state.caller_versions
             self.placement_requests = {
@@ -1725,7 +1758,7 @@ class AdmissionServer:
                 if isinstance(slot, records.ContinuationSlot) and folders.get(slot.owner) in occupied:
                     del self.slots[key]
         return replace(remaining, slots=tuple(self.slots.values()), cargo_folders=folders,
-                       occupied_cargo_folders=occupied, verify_run_counts=self._verify_run_counts())
+                       occupied_cargo_folders=occupied, verify_run_owners=self._verify_run_owners())
 
     def persist(self) -> None:
         now = self.clock.now()
@@ -1845,7 +1878,6 @@ class AdmissionServer:
         owners.update(place.owner for place in self.places.values())
         owners.update(wire.Owner(place.run.pid, place.run.start_time) for place in self.run_places.values())
         owners.update(slot.owner for slot in self.verify_run_slots.values())
-        owners.update(waiting.request.owner for waiting in self.verify_run_waiters.values())
         owners.update(wire.Owner(request.owner.pid, request.owner.start_time)
                       for request in self.placement_requests.values() if request.owner.host == self.host)
         owners.update(self._claim_holders())
@@ -1952,91 +1984,53 @@ class AdmissionServer:
             else:
                 del self.verify_run_slots[key]
 
-    def _verify_run_counts(self) -> dict[str, int]:
-        counts: dict[str, int] = {}
+    def _verify_run_owners(self) -> dict[str, frozenset[str]]:
+        owners: dict[str, set[str]] = {}
         for slot in self.verify_run_slots.values():
-            counts[slot.repository] = counts.get(slot.repository, 0) + 1
-        return counts
+            owners.setdefault(slot.repository, set()).add(slot.run_key)
+        return {repository: frozenset(runs) for repository, runs in owners.items()}
 
-    def _uses_ancestor_verify_slot(self, request: wire.VerifyRunSlotRequest) -> bool:
-        if not any(slot.repository == request.repository for slot in self.verify_run_slots.values()):
-            return False
-        owner = request.owner
+    def _verify_slot_owner(self, request: wire.AdmitRequest, repository: str) -> wire.Owner:
+        owner, run = request.owner, request.run
+        if VerifyRunSlot(repository, owner).key in self.verify_run_slots:
+            return owner
+        inherited = isinstance(run, wire.RunIdentity) and run.pid != owner.pid
+        if not inherited and not any(slot.repository == repository for slot in self.verify_run_slots.values()):
+            return owner
         child = self.proc.owner_process(owner.pid)
         if not isinstance(child, gate.ProcessIdentity) or child.start != owner.start_time:
-            return False
+            return owner
         lineage = {owner.pid: child}
         while child.parent > 0 and child.parent not in lineage:
             pid = child.parent
             parent = self.proc.owner_process(pid)
             if not isinstance(parent, gate.ProcessIdentity) or int(parent.start) > int(child.start):
-                return False
+                break
             lineage[pid] = parent
-            slot = self.verify_run_slots.get(records.run_owner(pid, parent.start))
-            if slot is not None and slot.repository == request.repository:
-                # The second reading checks for a process exit or reparenting during the walk.
-                return all(self.proc.owner_process(pid) == identity for pid, identity in lineage.items())
+            ancestor = VerifyRunSlot(repository, wire.Owner(pid, parent.start))
+            if (ancestor.key in self.verify_run_slots or
+                    isinstance(run, wire.RunIdentity) and run == wire.RunIdentity(pid, parent.start)):
+                # Check for process exit or reparenting during the walk.
+                if all(self.proc.owner_process(pid) == identity for pid, identity in lineage.items()):
+                    return ancestor.owner
+                break
             child = parent
-        return False
+        return owner
 
-    def _verify_run_slot(self, request: wire.VerifyRunSlotRequest,
-                         configuration: gate.UsableAdmissionConfiguration | gate.UnusableAdmissionConfiguration
-                         ) -> wire.Ok | wire.VerifyRunSlotWaiting | wire.Refused:
-        owner = request.owner
-        key = records.run_owner(owner.pid, owner.start_time)
-        if (slot := self.verify_run_slots.get(key)) is not None:
-            return wire.Ok() if slot.repository == request.repository else wire.Refused("Verify run changed repository")
-        if self.proc.owner_start(owner.pid) != LiveOwnerIdentity(owner.start_time):
-            return wire.Refused("Verify process exited before slot admission")
-        if self._uses_ancestor_verify_slot(request):
-            return wire.Ok()
-        if isinstance(configuration, gate.UnusableAdmissionConfiguration):
-            return wire.Refused(configuration.reason)
-        limits = configuration.config.policy.repository_runs
-        limit = limits.for_repository(self.host, request.repository)
-        if isinstance(limit, records.RepositoryRunLimit):
-            gate_runs = {gate.repository_run_owner(reservation_row(record)) for record in self.reservations.values()
-                         if isinstance(record.place, wire.LocalPlace) and record.step in records.REPOSITORY_GATE_STEPS
-                         and record.queue_waiter.get("repository_name", record.repo) == request.repository}
-            used = sum(slot.repository == request.repository for slot in self.verify_run_slots.values()) + len(gate_runs)
-            if used >= limit.maximum:
-                labels: Mapping[str, gate.UnitMembership] = (gate.priority_labels([request.session_id])
-                    if limits.exempt_unit and request.session_id and not request.unit else {})
-                unit = gate.queue_unit(request.unit, request.session_id, labels)
-                if not limits.exempt_unit or unit != limits.exempt_unit:
-                    return wire.VerifyRunSlotWaiting(records.RunLimitWait(
-                        used, limit.maximum, request.repository, self.host))
-        self.verify_run_slots[key] = VerifyRunSlot(request.repository, owner)
-        self._watch_owner(owner)
-        self.persist()
-        return wire.Ok()
-
-    def _advance_verify_run_waiters(self,
-            configuration: gate.UsableAdmissionConfiguration | gate.UnusableAdmissionConfiguration) -> None:
-        for descriptor, waiting in tuple(self.verify_run_waiters.items()):
-            connection = self.connections[descriptor]
-            reply = self._verify_run_slot(waiting.request, configuration)
-            if isinstance(reply, wire.VerifyRunSlotWaiting) and reply.reason != waiting.reason:
-                self.verify_run_waiters[descriptor] = replace(waiting, reason=reply.reason)
-            if not connection.sending or not isinstance(reply, wire.VerifyRunSlotWaiting):
-                self._send(connection, reply)
-
-    def _register_verify_run_wait(self, request: wire.VerifyRunSlotRequest, connection: Connection,
-                                  reason: records.RunLimitWait) -> None:
-        members = records.queue_staff() if request.session_id else records.NO_STAFF_LOOKUP
-        caller = self._stored_caller(request.session_id, "", request.worktree, request.unit, members=members)
-        row: records.Waiter = {"pid": request.owner.pid, "start_time": request.owner.start_time,
-            "since": self.clock.now(), "need": 0, "repository_name": request.repository,
-            "session_id": request.session_id, "session_name": caller.name, "unit": caller.unit,
-            "folder": request.worktree, "step": "verify"}
-        if isinstance(request.verify, records.VerifyCall):
-            row["verify"] = request.verify
-            row["step"] = request.verify.verb
-        if (submitted := self.placement_requests.get(request.placement_episode)) is not None:
-            row["route"] = submitted.route
-        self.verify_run_waiters[connection.socket.fileno()] = WaitingVerifyRun(request, row, reason)
-        self._watch_owner(request.owner)
-        self.next_pass = self.clock.monotonic()
+    def _verify_slot_requests(self, inputs: records.QueueInputs, limits: records.RepositoryRunLimits
+                              ) -> dict[str, VerifyRunSlot]:
+        slots: dict[str, VerifyRunSlot] = {}
+        for waiting in self.waiters.values():
+            row, request = waiting.row, waiting.request
+            owner = records.waiter_owner(row)
+            if (owner not in inputs.waiter_orders or not isinstance(request, wire.AdmitRequest)
+                    or not isinstance(request.place, wire.LocalPlace) or "verify" not in row):
+                continue
+            if limits.exempt_unit and (row.get("unit") == limits.exempt_unit or owner in inputs.run_limit_exempt_owners):
+                continue
+            repository = row.get("repository_name", "")
+            slots[owner] = VerifyRunSlot(repository, self._verify_slot_owner(request, repository))
+        return slots
 
     def _claim_slots(self) -> None:
         claimed = {slot.owner for slot in self.slots.values() if isinstance(slot, records.ContinuationSlot)}
@@ -2122,7 +2116,9 @@ class AdmissionServer:
     def _prune_places(self, owner_exit: OwnerWatch | None = None) -> None:
         if owner_exit is not None:
             owner = owner_exit.owner
-            _ = self.verify_run_slots.pop(records.run_owner(owner.pid, owner.start_time), None)
+            for key, slot in tuple(self.verify_run_slots.items()):
+                if slot.owner == owner:
+                    del self.verify_run_slots[key]
         for key, place in list(self.places.items()):
             ended = owner_exit is not None and owner_exit.owner == place.owner
             if (ended or not self._live(place.owner)) and not any(
@@ -2146,7 +2142,7 @@ class AdmissionServer:
             "fresh_test": isinstance(request, wire.AdmitRequest) and request.fresh_test,
             "need_source": profile.peak.source, "need_runs": profile.peak.count,
             "need_basis": gate.need_basis_record(profile.peak.basis), "test_scope": profile.scope,
-            "repository_name": profile.repo,
+            "repository_name": profile_repository_name(profile),
             "route": request.route if isinstance(request, wire.AdmitRequest) else records.DIRECT_CARGO,
         }
         if isinstance(identity.verify, records.VerifyCall):
@@ -2163,10 +2159,7 @@ class AdmissionServer:
                 row["token_back_at"] = request.token_back_at
         if isinstance(profile.repository, records.RepositoryIdentity):
             row["repo_identity"] = profile.repository.key
-            row["repository_name"] = profile.repository.name or profile.repo
             row["legacy_name"] = profile.repository.legacy_name
-        elif isinstance(profile, records.ProgramProfile):
-            row["repository_name"] = gate_repository_name(profile.step, profile.repo, profile.worktree)
         if isinstance(request, wire.AdmitRequest):
             row["package"] = step_estimator.test_package(list(request.argv))
             row["filters"] = list(step_estimator.test_filters(list(request.argv)))
@@ -2289,8 +2282,8 @@ class AdmissionServer:
         limits = config.policy.repository_runs
         sessions = list(dict.fromkeys(session for _, row in local_rows
             if not row.get("unit") and (session := row.get("session_id", ""))
-            and isinstance(limits.for_step(self.host, row.get("repository_name", ""), row.get("step", "")),
-                           records.RepositoryRunLimit)))
+            and ("verify" in row or isinstance(limits.for_step(
+                self.host, row.get("repository_name", ""), row.get("step", "")), records.RepositoryRunLimit))))
         labels: Mapping[str, gate.UnitMembership] = gate.priority_labels(sessions) if sessions else {}
         exempt = frozenset(records.waiter_owner(row) for _, row in local_rows
             if (session := row.get("session_id", "")) in labels
@@ -2550,7 +2543,6 @@ class AdmissionServer:
         self.configuration = configuration
         self.pass_stale = False
         if isinstance(self.configuration, gate.UnusableAdmissionConfiguration):
-            self._advance_verify_run_waiters(self.configuration)
             self.local_hold_holders.clear()
             self.reading_hold = NoReadingHold()
             self.next_pass = self.next_config_watch_retry
@@ -2586,8 +2578,7 @@ class AdmissionServer:
         self._prepare_placements(evidence_keys, remote_start_hold_seconds)
         captured = self._inputs(config, self.configuration.progress_profile_rank, self.configuration.peak_history_share_percent,
                                 self.configuration.progress_profile_sweep_seconds)
-        self._advance_verify_run_waiters(self.configuration)
-        inputs = replace(captured.local, verify_run_counts=self._verify_run_counts())
+        inputs = replace(captured.local, verify_run_owners=self._verify_run_owners())
         if self.host == "natedev" and (floor := config.free_floor_gib) is not None:
             inputs = replace(inputs, build_space=self.readings.build_space(floor))
         ci_holds = self._ci_hold_reasons()
@@ -2595,6 +2586,8 @@ class AdmissionServer:
         if held_owners:
             inputs = replace(inputs, ordered=[(path, row) for path, row in inputs.ordered
                                              if records.waiter_owner(row) not in held_owners])
+        verify_slots = self._verify_slot_requests(inputs, policy.repository_runs)
+        inputs = replace(inputs, verify_slot_requests={owner: slot.run_key for owner, slot in verify_slots.items()})
         inputs = self._placement_pass(inputs, policy, remote_start_hold_seconds)
         result = gate.admission_pass(inputs, inputs.now, policy)
         for reservation in result.policy.returned_claims:
@@ -2628,7 +2621,8 @@ class AdmissionServer:
                             del self.slots[slot_key]
             proposed = cast(gate.ProposedAdmission, decision.admission)
             self.spacing = proposed.spacing
-            self._admit([waiting], config, self.configuration.peak_history_share_percent, cargo_folder=cargo_folder)
+            self._admit([waiting], config, self.configuration.peak_history_share_percent,
+                        cargo_folder=cargo_folder, verify_slots=verify_slots)
         self.persist()
         waiting_steps = tuple(records.WaitingStep(row["pid"], row.get("session_id", ""), row.get("session_name", ""),
             row.get("step", ""), row.get("folder", ""), row["since"], row["need"], decision.reason, row.get("unit", ""))
@@ -2658,7 +2652,7 @@ class AdmissionServer:
             if waiting.last_reply != reply or inputs.now - waiting.last_sent >= config.wait_reply_seconds:
                 self._deliver(waiting, reply)
                 waiting.last_reply, waiting.last_sent = reply, inputs.now
-        interval = (config.waiting_pass_seconds if self.waiters or self.verify_run_waiters or any(self._placement_waiting(request)
+        interval = (config.waiting_pass_seconds if self.waiters or any(self._placement_waiting(request)
                     for request in self.placement_requests.values()) else config.running_pass_seconds)
         self.next_pass = self.clock.monotonic() + interval
         if starts or cloud_started:
@@ -2775,7 +2769,8 @@ class AdmissionServer:
             size = group.size if isinstance(group, status_wire.CloudGroup) else 1
             if not blocked:
                 if self._cloud_order(waiting) < disconnected and len(members) == size and used + size <= slots:
-                    self._admit(members, config, configuration.peak_history_share_percent, cargo_folder=placement.NoCargoFolder())
+                    self._admit(members, config, configuration.peak_history_share_percent,
+                                cargo_folder=placement.NoCargoFolder(), verify_slots={})
                     used += size
                     started = True
                     continue
@@ -2838,14 +2833,9 @@ class AdmissionServer:
 
     def _placement_reading(self, reading: records.QueueRead) -> records.QueueRead:
         remote: list[records.RunningStep] = []
-        waiting_episodes = {waiting.request.placement_episode for waiting in self.verify_run_waiters.values()}
         for key, saved in self.assignments.items():
             assignment = saved.assignment
             if assignment.destination.provider == "local":
-                continue
-            if (assignment.episode in waiting_episodes
-                    and isinstance(saved.permission, placement.PermissionAvailable)
-                    and isinstance(saved.provider, placement.NoProviderClaim)):
                 continue
             request = self.placement_requests.get(assignment.episode)
             if request is None:
@@ -2902,22 +2892,6 @@ class AdmissionServer:
             reading = replace(reading, view=replace(reading.view, waiting=(*reading.view.waiting, *held_steps)),
                 ordered=[*reading.ordered, *((self.state_dir / records.waiter_owner(self.waiters[episode].row),
                     gate.rank_waiter(self.waiters[episode].row, records.NormalOrder())) for episode in ci_holds)])
-        # Publish slot waits without adding them to memory admission.
-        verify_steps: list[records.WaitingStep] = []
-        verify_order: list[tuple[Path, records.RankedWaiter]] = []
-        published_owners: set[wire.Owner] = set()
-        for waiting_run in self.verify_run_waiters.values():
-            request, row = waiting_run.request, waiting_run.row
-            if request.owner in published_owners:
-                continue
-            published_owners.add(request.owner)
-            verify_steps.append(records.WaitingStep(row["pid"], row.get("session_id", ""), row.get("session_name", ""),
-                row.get("step", ""), row.get("folder", ""), row["since"], row["need"], waiting_run.reason, row.get("unit", ""),
-                project=gate.step_project(request.repository), route=records.waiter_route(row), verify=request.verify))
-            verify_order.append((self.state_dir / records.waiter_owner(row), gate.rank_waiter(row, records.NormalOrder())))
-        if verify_steps:
-            reading = replace(reading, view=replace(reading.view, waiting=(*reading.view.waiting, *verify_steps)),
-                              ordered=[*reading.ordered, *verify_order])
         reading = self._placement_reading(reading)
         reading = self._cloud_reading(reading, self.configuration)
         view = wire.ViewReply(reading)
@@ -3034,7 +3008,8 @@ class AdmissionServer:
         return self._freeze_test_phase_need(record, config, share_percent)
 
     def _admit(self, waiters: list[WaitingAdmission], config: records.MemoryConfig, share_percent: int, *,
-               cargo_folder: placement.CargoFolder | placement.NoCargoFolder) -> None:
+               cargo_folder: placement.CargoFolder | placement.NoCargoFolder,
+               verify_slots: Mapping[str, VerifyRunSlot]) -> None:
         now = self.clock.now()
         prepared = [self._prepare_admission(waiting, now, config, share_percent, cargo_folder) for waiting in waiters]
         replies: list[wire.Admitted | wire.LaunchAdmitted] = []
@@ -3052,6 +3027,10 @@ class AdmissionServer:
                         and records.waiter_owner(candidate.waiter) == records.waiter_owner(waiting.row),
                     max(0.0, now - waiting.row["since"])))
                 self.reservations[request.episode] = admission
+                slot = verify_slots.get(records.waiter_owner(waiting.row))
+                if slot is not None and slot.key not in self.verify_run_slots:
+                    self.verify_run_slots[slot.key] = slot
+                    self._watch_owner(slot.owner)
                 for key, slot in list(self.slots.items()):
                     if isinstance(slot, records.ContinuationSlot) and slot.owner == records.waiter_owner(waiting.row):
                         del self.slots[key]
@@ -3702,6 +3681,40 @@ done
                 return placement.RetryAt(0)
         return retry
 
+    def _mac_run_limit(self, request: wire.PlacementRequest, destination: placement.PlacementDestination
+                       ) -> records.RunLimitFree | records.RunLimitWait:
+        """Count Mac runs that hold launch authorization for this repository."""
+        config = self.last_usable_configuration
+        if (destination.provider != "mac" or not isinstance(request.purpose, placement.NormalStep)
+                or not isinstance(config, records.MemoryConfig)):
+            return records.RunLimitFree()
+        limits = config.policy.repository_runs
+        repository = profile_repository_name(request.profile)
+        limit = limits.for_repository(destination.target, repository)
+        if not isinstance(limit, records.RepositoryRunLimit):
+            return records.RunLimitFree()
+        active = [submitted for key in self.current_assignments.values()
+            if (saved := self.assignments[key]).assignment.destination.provider == "mac"
+            and saved.assignment.destination.target == destination.target
+            and isinstance(saved.permission, placement.PermissionConsumed)
+            and (submitted := self.placement_requests.get(saved.assignment.episode)) is not None
+            and isinstance(submitted.purpose, placement.NormalStep)
+            and profile_repository_name(submitted.profile) == repository
+            and isinstance(self._assignment_state(saved), placement.CurrentAssignment)]
+        sessions = list(dict.fromkeys(item.identity.session_id for item in (*active, request)
+                                     if item.identity.session_id and not item.identity.unit))
+        labels: Mapping[str, gate.UnitMembership] = gate.priority_labels(sessions) if limits.exempt_unit and sessions else {}
+        if limits.exempt_unit:
+            unit = gate.queue_unit(request.identity.unit, request.identity.session_id, labels)
+            if unit == limits.exempt_unit:
+                return records.RunLimitFree()
+            active = [item for item in active
+                      if gate.queue_unit(item.identity.unit, item.identity.session_id, labels) != limits.exempt_unit]
+        owners = {item.owner for item in active}
+        if request.owner not in owners and len(owners) >= limit.maximum:
+            return records.RunLimitWait(len(owners), limit.maximum, repository, destination.target)
+        return records.RunLimitFree()
+
     def _candidate_eligibility(self, request: wire.PlacementRequest, keys: PlacementEvidenceKeys
                                ) -> tuple[tuple[placement.CandidateEligibility, ...], placement.ResourceHolder]:
         result: list[placement.CandidateEligibility] = []
@@ -3745,6 +3758,9 @@ done
                         permitted = placement.TemporaryExclusion("busy")
                     elif evidence.observed_at < max((item[1] for item in retained), default=float("-inf")):
                         permitted = placement.EvidenceNeeded("provider evidence predates the retained claim report")
+            if isinstance(permitted, placement.AllowedHost) and isinstance(
+                    self._mac_run_limit(request, destination), records.RunLimitWait):
+                permitted = placement.TemporaryExclusion("busy")
             result.append(placement.CandidateEligibility(destination, permitted))
         return tuple(result), local_holder
 
@@ -4004,7 +4020,7 @@ done
         if waiting is not None and isinstance(waiting.last_reply, wire.Wait):
             reason = waiting.last_reply.reason
             cause = reason.cause if isinstance(reason, records.HeadAdmissionStatus) else reason
-            if isinstance(cause, placement.CargoFolderWait | records.BuildSpaceHold | records.EstimateExpired):
+            if isinstance(cause, placement.CargoFolderWait | records.BuildSpaceHold | records.EstimateExpired | records.RunLimitWait):
                 return wire.PlacementWait(request.episode, request.since, position, candidates,
                     waiting.last_reply, diagnostics, disk_exclusions, retry_notices)
         if any(isinstance(candidate.eligibility, placement.EvidenceNeeded) for candidate in candidates):
@@ -4278,6 +4294,9 @@ done
                        and claim.session == assignment.session and claim.host == destination.host
                        and claim.generation == evidence.generation for claim in evidence.claims):
                 return self._placement_status(assignment, "the exact claim is not adopted")
+        run_wait = self._mac_run_limit(submitted, destination)
+        if isinstance(run_wait, records.RunLimitWait):
+            return self._placement_status(assignment, records.run_limit_text(run_wait))
         saved = replace(saved, permission=placement.PermissionConsumed(self.clock.now()), provider=reference, holder=request.holder)
         self.assignments[key] = saved
         self._watch_owner(wire.Owner(request.holder.pid, request.holder.start_time))
@@ -4690,17 +4709,8 @@ done
         if isinstance(request, wire.RepositorySlotRequest):
             return [wire.Refused("Repository copy capacity no longer requires admission")]
         if isinstance(request, wire.VerifyRunSlotRequest):
-            if uid != os.getuid():
-                episode = request.placement_episode
-                request = replace(request, unit="", placement_episode=episode if episode.startswith(f"uid:{uid}:") else "")
-            self._prune_verify_run_slots()
-            configuration = (self._read_configuration() if isinstance(self.pending_configuration, NoPass)
-                             else self.pending_configuration)
-            self._advance_verify_run_waiters(configuration)
-            reply = self._verify_run_slot(request, configuration)
-            if isinstance(reply, wire.VerifyRunSlotWaiting) and isinstance(connection, Connection):
-                self._register_verify_run_wait(request, connection, reply.reason)
-            return [reply]
+            # Older clients can still ask. Only a local memory grant takes a slot.
+            return [wire.Ok()]
         if isinstance(connection, Connection):
             self._record_caller_version(request, connection, persist_change=not isinstance(request, wire.ConsumePermission))
         if isinstance(request, wire.PlacementRequest):
@@ -4973,7 +4983,7 @@ done
         if connection.finished:
             return
         connection.sending += self.reply_bytes(reply, version=connection.version)
-        connection.finished = not isinstance(reply, (wire.Wait, wire.BuildHistoryReply, wire.VerifyRunSlotWaiting))
+        connection.finished = not isinstance(reply, (wire.Wait, wire.BuildHistoryReply))
         if connection.finished:
             self._drop_deferred_requests(connection)
         self.epoll.modify(connection.socket.fileno(), select.EPOLLOUT if connection.finished
@@ -5030,8 +5040,6 @@ done
         print(f"memory admission: ready with git revision {revision}", file=sys.stderr)
 
     def _drop_deferred_requests(self, connection: Connection) -> None:
-        if self.verify_run_waiters.pop(connection.socket.fileno(), None) is not None:
-            self.next_pass = min(self.next_pass, self.clock.monotonic())
         self.deferred_requests = [pending for pending in self.deferred_requests
                                   if pending.connection is not connection]
         self.parked_placements = [item for item in self.parked_placements if item.connection is not connection]

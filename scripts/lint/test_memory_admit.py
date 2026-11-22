@@ -6296,6 +6296,21 @@ class QueueExplanationTests(MemoryQueueFixture):
         rows = gate.admission_pass(memory_hold, inputs.now, policy).rows
         self.assertEqual(rows[2].reason, follower.reason)
 
+    def test_verify_waiting_only_for_its_run_limit_does_not_hold_another_repository(self) -> None:
+        _ = self.waiting(300, 2 * GIB, 20, repository_name="hana", step="nextest")
+        _ = self.waiting(400, 2 * GIB, 10, repository_name="claude_commands", step="nextest")
+        snapshot = self.snapshot_inputs()
+        hana, commands = (admission_records.waiter_owner(row) for _, row in snapshot.ordered)
+        inputs = replace(snapshot, host=admission_records.HostMemory(60 * GIB, 60 * GIB),
+            verify_run_owners={"hana": frozenset({"100-100", "200-200"})},
+            verify_slot_requests={hana: hana, commands: commands})
+        policy = replace(admission_policy_fixture(),
+            repository_runs=admission_records.RepositoryRunLimits({"natedev.hana": 2, "natedev.claude_commands": 1}))
+        head, peer = gate.admission_pass(inputs, inputs.now, policy).rows
+        self.assertEqual(cast(admission_records.HeadAdmissionStatus, head.reason).cause,
+                         admission_records.RunLimitWait(2, 2, "hana", "natedev"))
+        self.assertIsInstance(peer.admission, gate.ProposedAdmission)
+
     def test_pass_is_pure_and_ignores_reader_environment_and_clock(self) -> None:
         _ = self.waiting(300, 4 * GIB, 1)
         _ = self.waiting(400, 5 * GIB, 0)

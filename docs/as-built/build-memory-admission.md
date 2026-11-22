@@ -1314,30 +1314,21 @@ An absent key sets no repository run limit.
 A value of zero holds new runs on that machine.
 `max_runs.natedev.hana` permits two concurrent Hana Verify runs on natedev.
 `max_runs.natedev.cargo-liner` permits one cargo-liner Verify run at a time on natedev.
-Verify requests a repository slot for its first compiling Cargo step.
-The request follows detachment, the cache checks, and lint step selection.
-In Mac-only mode Verify checks the cache after it gets an assignment.
-On a cache miss, Verify requests its slot before it claims the Mac.
-The slot belongs to the Verify process and ends when that process exits.
-The service saves grants and restores the owner watches after restart.
+Verify asks for placement first and takes no slot before it.
+A Verify run takes its natedev repository slot with its first local memory grant, in the same admission decision.
+The slot belongs to the outer Verify process and ends when that process exits, so the run keeps its place between steps.
+Later local steps of the run reuse the slot.
 A child Verify uses a live ancestor Verify's slot for the same repository.
 The service verifies each process in that chain by PID, start time, and parent PID.
-Separate Verify calls under the same copy preparation process each request their own slot.
-A run keeps its natedev slot while its steps run on the Mac or AWS.
-The run wait occurs before Cargo memory admission.
-Cargo steps use the existing rules for memory claims and start spacing.
-Copy preparation and commands that only format or read cached results take no run slot.
-Copy preparation can retain its memory during the configured gap before Verify takes a slot.
-The gap is about ten seconds with the current configuration.
+A run that only waits, a run placed on the Mac or AWS, and the exempt unit take no natedev slot.
+A run that waits only for its repository limit holds back no step of another repository.
+A Mac step counts against `max_runs.mac.<repository>` when that key exists; no such key exists today.
+The service saves slots with their local grant and restores the owner watches after restart.
 Local `gate` and `test-affected` runs count while they hold a reservation.
 `max_runs.natedev.claude_commands` permits two concurrent runs and applies this rule to the repository's `gate` and `test-affected` steps.
 The admission service uses the Git repository name when a gate profile supplies an absolute path.
 The unit in `max_runs.exempt_unit` can start above the limit. Its runs use slots.
-Verify prints the count, limit, repository, and machine while it waits.
-The slot request uses the Verify Python helper, including when detached output goes to a file.
-The slot wait ignores the queue leave hooks.
-Slot request failures do not enter the lint cache.
-The Builds page shows these details for Verify runs and gate reservations.
+The Builds page shows the count, limit, repository, and machine for a run-limit wait, and each machine the run can use.
 The snapshot codec writes the gate wait as `BehindHead` with a `_run_limit` field, and current readers restore it.
 An existing CI reservation continues when the enforcer cannot stop its account.
 No process permission changes support these checks.

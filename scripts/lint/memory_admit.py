@@ -2054,8 +2054,8 @@ def repository_run_owner(row: Reservation | Waiter) -> str:
 
 
 def reserved_repository_runs(inputs: QueueInputs, limits: records.RepositoryRunLimits) -> dict[str, set[str]]:
-    """Count distinct runs from the local admission reservations."""
-    runs: dict[str, set[str]] = {}
+    """Count distinct runs from local reservations and Verify slots."""
+    runs = {repository: set(owners) for repository, owners in inputs.verify_run_owners.items()}
     for row in inputs.reservations:
         waiter = row.get("queue_waiter")
         repository = waiter.get("repository_name", row["repo"]) if waiter is not None else row["repo"]
@@ -2130,12 +2130,20 @@ def admission_walk(inputs: QueueInputs, ordered: list[tuple[Path, RankedWaiter]]
         local_route = can_use_natedev(row)
         local = local_route and isinstance(state, QueuedWaiter)
         repository = row.get("repository_name", "")
-        limit = (limits.for_step(inputs.local_machine, repository, row.get("step", ""))
-                 if local and not remote_start_pending else records.NoRepositoryRunLimit())
-        has_run_limit = isinstance(limit, records.RepositoryRunLimit)
-        exempt = bool(has_run_limit and limits.exempt_unit and
+        verify_owner = inputs.verify_slot_requests.get(owner)
+        limit: records.RepositoryRunLimit | records.NoRepositoryRunLimit = records.NoRepositoryRunLimit()
+        if local and not remote_start_pending:
+            limit = (limits.for_repository(inputs.local_machine, repository) if verify_owner is not None
+                     else limits.for_step(inputs.local_machine, repository, row.get("step", "")))
+        runs = repository_runs.setdefault(repository, set()) if isinstance(limit, records.RepositoryRunLimit) else None
+        run_owner = verify_owner if verify_owner is not None else repository_run_owner(row)
+        exempt = bool(limits.exempt_unit and
                       (row.get("unit") == limits.exempt_unit or owner in inputs.run_limit_exempt_owners))
-        follows_run_limit = has_run_limit and not exempt
+        follows_run_limit = runs is not None and not exempt and (verify_owner is None or run_owner not in runs)
+        run_wait: records.RunLimitFree | records.RunLimitWait = records.RunLimitFree()
+        if (follows_run_limit and isinstance(limit, records.RepositoryRunLimit)
+                and runs is not None and run_owner not in runs and len(runs) >= limit.maximum):
+            run_wait = records.RunLimitWait(len(runs), limit.maximum, repository, inputs.local_machine)
         folder = inputs.cargo_folders.get(owner) if local_route else None
         folder_busy = folder in inputs.occupied_cargo_folders
         earlier = first_for_folder.get(folder, NoWaiter()) if folder is not None else NoWaiter()
@@ -2159,13 +2167,6 @@ def admission_walk(inputs: QueueInputs, ordered: list[tuple[Path, RankedWaiter]]
                  and (within or readable and clear and room_passes) and (reused or not spacing))
         gpu_step = gpu.holds(row.get("repository_name", ""), row.get("step", ""))
         gpu_wait = GpuSlotWait(gpu_used, gpu.slots) if gpu_step and gpu_used >= gpu.slots else GpuSlotFree()
-        run_wait: records.RunLimitFree | records.RunLimitWait = records.RunLimitFree()
-        if isinstance(limit, records.RepositoryRunLimit):
-            runs = repository_runs.setdefault(repository, set())
-            run_owner = repository_run_owner(row)
-            used_runs = len(runs) + inputs.verify_run_counts.get(repository, 0)
-            if not exempt and run_owner not in runs and used_runs >= limit.maximum:
-                run_wait = records.RunLimitWait(used_runs, limit.maximum, repository, inputs.local_machine)
         order_hold: NoOrderHold | HeldBehindHead = NoOrderHold()
         ahead = first_held_other_than_gpu if GPU_WAIT_MAY_PASS and not gpu_step else first_held
         if follows_run_limit and (limited := first_held_by_run_limit.get(repository)) is not None:
@@ -2195,8 +2196,8 @@ def admission_walk(inputs: QueueInputs, ordered: list[tuple[Path, RankedWaiter]]
         if can_start:
             remaining += held + released - need
             gpu_used += gpu_step
-            if has_run_limit:
-                repository_runs[repository].add(repository_run_owner(row))
+            if runs is not None:
+                runs.add(run_owner)
             if not reused:
                 new_started = True
         elif local or folder_busy:
