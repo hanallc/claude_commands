@@ -115,21 +115,9 @@ class PageStatusTests(unittest.TestCase):
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required to check the owner button position.")
     def test_page_owner_stays_visible_above_a_long_open_row(self) -> None:
-        from scripts.review_links import change_page, record_table
         from scripts.review_links.test_accounts_page import firefox_probe_results
 
-        owner = staff.StaffRow(staff.StaffId("owner"), "showrunner", "Page owner", staff.STAFF_ROOT,
-                               current_session=staff.StaffId("session-owner"))
-        detail = "".join(f'<p>Open row line {index}</p>' for index in range(60))
-        table = ('<div data-test-list><input id="list-search"><div id="list-owner"></div><div id="list-show"></div>'
-                 + '<div class="list-table"><table><tbody><tr><td style="height:800px">Above the item</td></tr></tbody>'
-                 + '<tbody data-list-item data-key="open" data-order="1"><tr class="list-row">'
-                 + '<td><button class="list-toggle" aria-expanded="true">Open row</button></td></tr>'
-                 + f'<tr data-detail><td style="text-align:right">{detail}</td></tr></tbody></table>'
-                 + '<p data-empty hidden>No items</p></div></div>')
-        content = record_table.STYLE + page_frame.title("The List", "list") + table
-        markup = change_page.document(content + '<script>' + record_table.SCRIPT + '</script>', "The List")
-        page = page_frame.with_owner(markup, "list", owner, staff.StaffSnapshot((owner,)), lambda: "")
+        page = long_open_row_page()
         reference = json.dumps(main_heading(page).decode()).replace('<', r'\u003c').encode()
         probe = b'''<script>
 (async()=>{
@@ -202,10 +190,11 @@ class PageStatusTests(unittest.TestCase):
    const nameBox=name.getBoundingClientRect(), buttonBox=button.getBoundingClientRect();
    verify(innerWidth===width && scrollY>innerHeight && scrollY===bottom(),'The page scrolls to the bottom of the long row.');
    const state=banner.querySelector('.page-status-state').getBoundingClientRect();
-   verify(status.top===0 && reason.getBoundingClientRect().top>=state.bottom,'The sticky status spans two lines.');
-   verify(Math.abs(headingBox.top-status.bottom)<1 && heading.contains(title),'The heading row sticks below the status.');
-   verify(Math.abs(last.right-headingBox.right)<1 && last.top>=status.bottom && last.bottom<=headingBox.bottom
-    && last.bottom<=innerHeight,'The owner stays at the top right below the status.');
+   verify(Math.abs(status.top-headingBox.bottom)<1 && reason.getBoundingClientRect().top>=state.bottom,
+    'The sticky status spans two lines directly below the heading row.');
+   verify(Math.abs(headingBox.top-8)<1 && heading.contains(title),'The heading row sticks 8 px below the top.');
+   verify(Math.abs(last.right-headingBox.right)<1 && last.top>=headingBox.top && last.bottom<=status.top
+    && last.bottom<=innerHeight,'The owner stays at the top right above the status.');
    verify(nameBox.width>0 && Math.abs(buttonBox.left-nameBox.right-8)<0.1 && buttonBox.width===36,
     'The name stays beside the full button.');
    verify(detail.getBoundingClientRect().top<headingBox.top,'The open row scrolls under the heading row.');
@@ -228,14 +217,109 @@ class PageStatusTests(unittest.TestCase):
    verify(view.revealMatchingItem('open'),'The item jump finds the row.');
    await painted();
    verify(document.activeElement===row.querySelector('button') && scrollY>0 &&
-    row.getBoundingClientRect().top>=heading.getBoundingClientRect().bottom &&
-    heading.getBoundingClientRect().top>=banner.getBoundingClientRect().bottom,
-    'The item jump from scroll zero focuses the row below the status and the heading row.');
+    row.getBoundingClientRect().top>=banner.getBoundingClientRect().bottom &&
+    banner.getBoundingClientRect().top>=heading.getBoundingClientRect().bottom,
+    'The item jump from scroll zero focuses the row below the heading row and the status.');
   }
  }catch(error){failures.push(String(error));}
  await fetch('/results',{method:'POST',body:JSON.stringify(failures)});
 })();</script>'''.replace(b'MAIN_PAGE', reference)
         self.assertEqual(firefox_probe_results(page.replace(b'</body>', probe + b'</body>')), [[]])
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required to check the owner under a sticky status.")
+    def test_late_or_failed_status_never_covers_the_owner(self) -> None:
+        from scripts.review_links.test_accounts_page import firefox_probe_results
+
+        probe = b'''<script>
+(async()=>{
+ const failures=[];
+ try{
+  frameElement.style.height='800px';
+  document.querySelector('[data-detail]').hidden=false;
+  const painted=()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));
+  const heading=document.querySelector('.page-heading'), banner=document.querySelector('[data-page-status]');
+  const name=document.querySelector('.page-owner-name'), button=document.querySelector('[data-owner-new]');
+  const main=document.querySelector('main'), table=document.querySelector('table');
+  const reason=banner.querySelector('[data-status-reason]');
+  const bottom=()=>document.scrollingElement.scrollHeight-innerHeight;
+  const space=parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--page-heading-space'));
+  const background=getComputedStyle(document.body).backgroundColor;
+  const opaque=color=>{const parts=color.match(/[0-9.]+/g);return parts!==null && (parts.length===3 || Number(parts[3])===1);};
+  const layout=()=>JSON.stringify([main,table].map(element=>{
+   const {top,left,width}=element.getBoundingClientRect();
+   return [top+scrollY,left,width];
+  }));
+  // A box is clear when it is fully in view and a hit test at its corners and center finds it.
+  const clear=(element,inset)=>{
+   const box=element.getBoundingClientRect();
+   const points=[[box.left+inset,box.top+inset],[box.right-inset,box.top+inset],[box.left+inset,box.bottom-inset],
+    [box.right-inset,box.bottom-inset],[(box.left+box.right)/2,(box.top+box.bottom)/2]];
+   return box.width>0 && box.top>=0 && box.left>=0 && box.bottom<=innerHeight && box.right<=innerWidth
+    && points.every(([x,y])=>element.contains(document.elementFromPoint(x,y)));
+  };
+  const statusShown=()=>{
+   const box=banner.getBoundingClientRect();
+   return box.top>=0 && box.bottom<=innerHeight && [box.left+2,(box.left+box.right)/2,box.right-2]
+    .every(x=>[box.top+1,(box.top+box.bottom)/2,box.bottom-1].every(y=>banner.contains(document.elementFromPoint(x,y))));
+  };
+  const band=()=>getComputedStyle(heading,'::before');
+  for(const [state,text] of [['Late','The feed has stopped.'],['Failed','The read failed with HTTP 502.']]){
+   banner.dataset.state=state;
+   banner.querySelector('[data-status-word]').textContent=state;
+   reason.hidden=false;
+   reason.textContent=text;
+   for(const width of [1440,320]){
+    const found=new Set();
+    const verify=(ok,message,top)=>{
+     if(!ok && !found.has(message)){found.add(message);failures.push(state+', '+width+' px, scroll '+top+': '+message);}
+    };
+    frameElement.style.width=width+'px';
+    scrollTo({top:0,behavior:'instant'});
+    await painted();
+    const start=layout();
+    const positions=[];
+    for(let top=0;top<=200;top+=2) positions.push(top);
+    positions.push(Math.floor(bottom()/2),bottom());
+    let previous=null;
+    for(const top of positions){
+     scrollTo({top,behavior:'instant'});
+     await painted();
+     const row=heading.getBoundingClientRect(), status=banner.getBoundingClientRect();
+     const stuck=heading.hasAttribute('data-page-heading-stuck');
+     verify(scrollY===top && innerWidth===width,'The page scrolls to the position.',top);
+     verify(clear(name,1),'The owner name is fully in view and not covered.',top);
+     verify(clear(button,3),'The New item button is fully in view and not covered.',top);
+     verify(statusShown(),'The status line is fully in view and not covered by the row.',top);
+     verify(row.bottom<=status.top+0.5,'The row stays above the status line.',top);
+     verify(layout()===start,'The content does not move.',top);
+     if(previous){
+      // Each part moves up by at most the scroll distance and never moves down, so nothing steps.
+      const distance=top-previous.top;
+      verify([[row.top,previous.row],[status.top,previous.status]].every(([now,before])=>before-now>=-0.5 && before-now<=distance+0.5),
+       'The row and the status line move by no more than the scroll distance.',top);
+     }
+     previous={top,row:row.top,status:status.top};
+     if(top===0) verify(!stuck && band().content==='none','The row is not stuck and has no space band at scroll zero.',top);
+     if(stuck){
+      verify(Math.abs(row.top-space)<1,'The stuck row is 8 px below the top.',top);
+      const fill=band().backgroundColor;
+      verify(band().content!=='none' && parseFloat(band().height)===space && opaque(fill) && fill===background,
+       'The stuck row has an opaque 8 px band above it.',top);
+      verify(heading.contains(document.elementFromPoint((row.left+row.right)/2,row.top-space/2)),
+       'The band covers the content above the stuck row.',top);
+     }else{
+      verify(band().content==='none','A row that is not stuck has no space band.',top);
+     }
+    }
+    verify(heading.hasAttribute('data-page-heading-stuck') && Math.abs(heading.getBoundingClientRect().top-space)<1
+     && Math.abs(banner.getBoundingClientRect().top-heading.getBoundingClientRect().bottom)<1,
+     'At the bottom the row sticks 8 px below the top and the status line sticks directly below it.',bottom());
+   }
+  }
+ }catch(error){failures.push(String(error));}
+ await fetch('/results',{method:'POST',body:JSON.stringify(failures)});
+})();</script>'''
+        self.assertEqual(firefox_probe_results(long_open_row_page().replace(b'</body>', probe + b'</body>')), [[]])
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required to check the AWS region filter.")
     def test_aws_region_filter_sticks_below_the_heading_row(self) -> None:
@@ -263,9 +347,11 @@ class PageStatusTests(unittest.TestCase):
     scrollTo({top:2000,behavior:'instant'});
     await painted();
     const bar=regions.getBoundingClientRect(), row=heading.getBoundingClientRect();
+    // A Late status line sticks directly below the heading row, so the filter sticks below the status line.
+    const above=state==='Late' ? banner.getBoundingClientRect().bottom : row.bottom;
     const hit=document.elementFromPoint((bar.left+bar.right)/2,bar.top+1);
-    if(scrollY<1000 || Math.abs(bar.top-row.bottom)>=1 || bar.bottom>innerHeight || !regions.contains(hit)){
-     failures.push(width+' px, '+state+': the region filter must stick fully in view below the heading row and take a click at its top.');
+    if(scrollY<1000 || Math.abs(bar.top-above)>=1 || bar.bottom>innerHeight || !regions.contains(hit)){
+     failures.push(width+' px, '+state+': the region filter must stick fully in view below the heading row and the status and take a click at its top.');
     }
    }
   }
@@ -497,6 +583,22 @@ function advanceTime(ms){
 const setInterval=run=>{intervals.set(++id,run);return id;},clearInterval=key=>intervals.delete(key);
 const requestAnimationFrame=run=>run();
 '''
+
+
+def long_open_row_page() -> bytes:
+    """Render a List page whose open row is long enough to scroll far past the heading row."""
+    from scripts.review_links import change_page, record_table
+
+    detail = "".join(f'<p>Open row line {index}</p>' for index in range(60))
+    table = ('<div data-test-list><input id="list-search"><div id="list-owner"></div><div id="list-show"></div>'
+             + '<div class="list-table"><table><tbody><tr><td style="height:800px">Above the item</td></tr></tbody>'
+             + '<tbody data-list-item data-key="open" data-order="1"><tr class="list-row">'
+             + '<td><button class="list-toggle" aria-expanded="true">Open row</button></td></tr>'
+             + f'<tr data-detail><td style="text-align:right">{detail}</td></tr></tbody></table>'
+             + '<p data-empty hidden>No items</p></div></div>')
+    content = record_table.STYLE + page_frame.title("The List", "list") + table
+    markup = change_page.document(content + '<script>' + record_table.SCRIPT + '</script>', "The List")
+    return page_frame.with_owner(markup, "list", PAGE_OWNER, staff.StaffSnapshot((PAGE_OWNER,)), lambda: "")
 
 
 def main_heading(page: bytes) -> bytes:

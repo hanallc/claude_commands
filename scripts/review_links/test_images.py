@@ -1672,6 +1672,10 @@ class ImagePairTests(ImagesFixture):
     failures.push('The Images pair must fit side by side at 1024 px and scroll position '+top+'.');
    }
   }
+  const space=parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--page-heading-space'));
+  if(!heading.hasAttribute('data-page-heading-stuck') || Math.abs(heading.getBoundingClientRect().top-space)>=1){
+   failures.push('At scroll position 800 the heading row must stick at the top.');
+  }
   if(groups.getBoundingClientRect().top<heading.getBoundingClientRect().bottom+16){
    failures.push('The image group index must stick below the heading row.');
   }

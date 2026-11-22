@@ -392,8 +392,10 @@ STYLE = """<style>[hidden]{display:none!important}
 .page-question p{white-space:pre-wrap;overflow-wrap:anywhere}
 @media (max-width:480px){[data-image-form] .review-actions button{font-size:15px;padding:6px 8px}}
 [data-image-layout]{display:grid;grid-template-columns:300px minmax(0,680px);gap:32px;align-items:start}
-[data-image-groups]{position:sticky;top:calc(var(--page-heading-top,0px) + var(--page-heading-height,0px) + 16px);
-max-height:calc(100vh - 32px - var(--page-status-height,0px) - var(--page-heading-height,0px));overflow:auto;display:grid;
+[data-image-groups]{position:sticky;
+top:calc(var(--page-heading-space,0px) + var(--page-heading-height,0px) + var(--page-status-height,0px) + 16px);
+max-height:calc(100vh - 32px - var(--page-status-height,0px) - var(--page-heading-space,0px)
+- var(--page-heading-height,0px));overflow:auto;display:grid;
 grid-template-columns:minmax(0,max-content) max-content max-content;font-size:14px;border:1px solid #8886;border-radius:8px}
 [data-image-groups] a{grid-column:1/-1;display:grid;grid-template-columns:subgrid;cursor:pointer;
 color:inherit;text-decoration:none;overflow-wrap:anywhere}
