@@ -16,7 +16,7 @@ from zoneinfo import ZoneInfo
 from scripts.lib import conf
 from scripts.buildlog import mac_idle_alert
 from scripts.buildlog.test_index import use_test_log
-from scripts.buildlog.mac_idle_test_support import write_idle_alert, write_idle_config
+from scripts.buildlog.mac_idle_test_support import LiveClaim, write_idle_alert, write_idle_config, write_live_mac_state
 from scripts.lint.memory_test_support import commit_config_fixture
 
 
@@ -28,12 +28,13 @@ class SavedAlertTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             config = write_idle_config(Path(directory))
             path = write_idle_alert(Path(directory), 1600)
+            live = write_live_mac_state(Path(directory) / "mac-state")
             row = cast(dict[str, object], json.loads(path.read_text()))
             row["cause"] = "free"
             for waiting, words in ((0, "0 steps wait"), (1, "1 step waits"), (2, "2 steps wait")):
                 for count in (0, 1, 2):
                     with self.subTest(waiting=waiting, kept=count), \
-                         mock.patch.dict(os.environ, {"CONF_DIR": str(config.parent)}):
+                         mock.patch.dict(os.environ, {"CONF_DIR": str(config.parent), "MAC_TEST_STATE_DIR": str(live)}):
                         row["waiting"], row["kept_claims"] = waiting, count
                         _ = path.write_text(json.dumps(row))
                         line = mac_idle_alert.alert_line(path, 1600, ZoneInfo("UTC")) or ""
@@ -73,8 +74,9 @@ class SavedAlertTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             config = write_idle_config(Path(directory))
             path = write_idle_alert(Path(directory), 1600)
+            live = write_live_mac_state(Path(directory) / "mac-state", block=True)
             zone = ZoneInfo("UTC")
-            with mock.patch.dict(os.environ, {"CONF_DIR": str(config.parent)}):
+            with mock.patch.dict(os.environ, {"CONF_DIR": str(config.parent), "MAC_TEST_STATE_DIR": str(live)}):
                 self.assertEqual(mac_idle_alert.alert_line(path, 1600, zone, block=mac_idle_alert.BlockText.OMITTED), None)
                 row = cast(dict[str, object], json.loads(path.read_text()))
                 row["admission_error"] = "socket closed"
@@ -84,6 +86,40 @@ class SavedAlertTests(unittest.TestCase):
                 self.assertEqual(mac_idle_alert.alert_line(path, 1600, zone),
                                  "MAC BLOCKED by research since 00:16 (P15 F11 L0 run): 7 steps wait for the Mac, idle 10 min; "
                                  + "/build:mac unblock clears it; admission query failed: socket closed.")
+
+    def test_a_saved_condition_shows_only_while_the_live_mac_state_agrees(self) -> None:
+        live_states: dict[str, tuple[bool, LiveClaim, float]] = {
+            "free": (False, "none", 0), "blocked": (True, "none", 0), "claim_idle": (False, "idle", 0),
+            "working": (True, "working", 0), "unreachable": (False, "none", 1900), "unreachable_ended": (False, "none", 1500),
+        }
+        saved_states = {
+            "blocked": ("idle", "MAC BLOCKED by research"), "claim_idle": ("idle", "MAC IDLE 10 min"),
+            "free": ("idle", "MAC IDLE 10 min"), "disk": ("idle", "MAC IDLE 10 min"),
+            "unreachable": ("unreachable", "MAC UNREACHABLE until"),
+        }
+        # An ended backoff leaves a free Mac.
+        agreeing = {("blocked", "blocked"), ("claim_idle", "claim_idle"), ("free", "free"), ("disk", "free"),
+                    ("free", "unreachable_ended"), ("disk", "unreachable_ended"), ("unreachable", "unreachable")}
+        with tempfile.TemporaryDirectory() as directory:
+            config = write_idle_config(Path(directory))
+            path = write_idle_alert(Path(directory), 1600)
+            row = cast(dict[str, object], json.loads(path.read_text()))
+            for saved_cause, (state, shown) in saved_states.items():
+                for live_name, (block, claim, until) in live_states.items():
+                    live = write_live_mac_state(Path(directory) / "mac-state", block=block, claim=claim,
+                                                unreachable_until=until)
+                    row.update(state=state, cause="" if state == "unreachable" else saved_cause, until=1900)
+                    for admission_error in ("", "socket closed"):
+                        with self.subTest(saved=saved_cause, live=live_name, admission_error=admission_error), \
+                             mock.patch.dict(os.environ, {"CONF_DIR": str(config.parent), "MAC_TEST_STATE_DIR": str(live)}):
+                            row["admission_error"] = admission_error
+                            _ = path.write_text(json.dumps(row))
+                            line = mac_idle_alert.alert_line(path, 1600, ZoneInfo("UTC"))
+                            if (saved_cause, live_name) in agreeing:
+                                self.assertIn(shown, line or "")
+                            else:
+                                self.assertEqual(line, "MAC IDLE WATCH: admission query failed: socket closed."
+                                                 if admission_error else None)
 
 class MacIdleConfigTests(unittest.TestCase):
     def test_conf_dir_values_apply_without_a_second_read(self) -> None:

@@ -136,7 +136,11 @@ Its default interval is 60 seconds.
 The check writes `~/.local/state/mac-idle/alert.json` on each pass.
 The hub `scripts/buildlog/mac_idle_alert.py` owns the path, record validation, and alert text.
 The views read the saved file and local configuration.
-They make no SSH or recipient lookup calls.
+Before a view shows a `MAC BLOCKED`, `MAC IDLE` or `MAC UNREACHABLE` line, it reads the live Mac state with `mac_idle.mac_work`.
+That read uses only the local block, claim and `unreachable_until` files.
+The view shows the saved line only when the live state and cause agree with the saved reading.
+A saved line that disagrees is stale, and the view shows no Mac condition until the next sample.
+The views make no SSH or recipient lookup calls.
 
 The check counts live steps that can use a Mac.
 It accepts `AnyTarget` records with Mac targets.

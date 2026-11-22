@@ -27,7 +27,7 @@ from typing import Literal, cast, override
 from unittest import mock
 
 from scripts.buildlog import charts, cost_actions, costs, parse
-from scripts.buildlog.mac_idle_test_support import write_idle_alert, write_idle_config
+from scripts.buildlog.mac_idle_test_support import write_idle_alert, write_idle_config, write_live_mac_state
 from scripts.build_queue import admission_client, admission_protocol as wire, cloud_progress, memory_feed, step_estimator, progress_profile, queue_lines, queue_view, queue_snapshot, target_availability
 from scripts.build_queue.admission_wire import ReservedCloudSlot
 from scripts.build_queue.test_queue_view import cloud_reading
@@ -2665,8 +2665,11 @@ process.stdout.write(JSON.stringify({
                     saved = cast(dict[str, object], json.loads(path.read_text()))
                     saved.update(state=state, until=now + 300)
                     _ = path.write_text(json.dumps(saved))
+                live = write_live_mac_state(self.root / "mac-state", block=state == "idle",
+                                            unreachable_until=now + 300 if state == "unreachable" else 0)
                 with mock.patch.object(admission_client, "view", return_value=reading), \
-                     mock.patch.object(time, "time", return_value=now):
+                     mock.patch.object(time, "time", return_value=now), \
+                     mock.patch.dict(os.environ, {"MAC_TEST_STATE_DIR": str(live)}):
                     page = memory_feed.reading()
                 payload = cast(dict[str, object], json.loads(memory_feed.page_json(page)))
                 self.assertEqual(payload["mac_idle_alert"], expected)
@@ -4131,8 +4134,10 @@ def write_browser_fixture(folder: Path) -> None:
             pages["priority"] = json.loads(memory_feed.page_json(memory_feed.reading(configuration)))
         _ = write_idle_config(fixture.root)
         _ = write_idle_alert(fixture.root / "mac-idle", base.explanation.now)
+        live = write_live_mac_state(fixture.root / "mac-state", block=True)
         with mock.patch.object(admission_client, "view", return_value=base), \
-             mock.patch.object(time, "time", return_value=base.explanation.now):
+             mock.patch.object(time, "time", return_value=base.explanation.now), \
+             mock.patch.dict(os.environ, {"MAC_TEST_STATE_DIR": str(live)}):
             pages["mac_idle"] = json.loads(memory_feed.page_json(memory_feed.reading(configuration)))
         (fixture.root / "mac-idle" / "alert.json").unlink()
         for name, report in (("empty_report", report_fixture(empty=True)),
