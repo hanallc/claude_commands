@@ -33,7 +33,7 @@ from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from io import BytesIO
 from pathlib import Path
 from typing import BinaryIO, cast, override
-from urllib.parse import parse_qs, unquote, urlsplit, urlunsplit
+from urllib.parse import SplitResult, parse_qs, unquote, urlsplit, urlunsplit
 
 # Detect file changes before the first stamp, including changes during imports.
 STARTED_NS = time.time_ns()
@@ -45,7 +45,7 @@ from scripts.lib import atomic_file, conf, scratch
 from scripts.lib.file_lock import exclusive
 from scripts.production import change_routing, change_review, staff, tidy_wrapped
 from scripts.review_links import accounts_page, branch_page, change_page, change_browser, console, for_you, image_store, images, investigations_page, list_page, review_items, review_page
-from scripts.review_links import console_tune, new_item_dialog, page_frame, question_record, review_actions, review_link, review_submissions, staff_names
+from scripts.review_links import console_tune, new_item_dialog, page_frame, question_record, review_actions, review_link, review_submissions, send_hold, staff_names
 from scripts.review_links.review_link import private_name
 from scripts.statusline import rebuild_row
 from scripts.whoami import usage_store
@@ -57,6 +57,9 @@ LISTEN_FD = "REVIEW_LINKS_LISTEN_FD"
 MAX_NEW_ITEM_BODY = (4 * ((new_item_dialog.MAX_TOTAL_IMAGE_BYTES + 2) // 3) + 256 * 1024
                      + new_item_dialog.MAX_PAGE_DATA_BYTES + new_item_dialog.MAX_BUG_PAGE_STATE_BYTES)
 QUEUE_MOVE_PATH = "/console/builds/queue-move"
+# A send to one of these pages can wait for Undo. The largest held send is a New item with its images.
+HELD_SEND_PATHS = frozenset((review_page.PAGE_PATH, list_page.PAGE_PATH, images.PAGE_PATH, review_page.NEW_ITEM_PATH))
+HELD_SEND_LIMIT = MAX_NEW_ITEM_BODY
 SCREENSHOT_RELOAD = "Reload the page to send the screenshot."
 STALE_NEW_ITEM_TOKEN = "The New item token expired. Try Send again."
 ATTACHMENT_MEDIA = {f"image.{extension}": media for media, extension in new_item_dialog.IMAGE_FORMATS.items()}
@@ -930,6 +933,9 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         if server.mode is ServerMode.LIST_FIXTURE and route.path != list_page.PAGE_PATH and not fixture_options:
             self.send_error(404)
             return None
+        if route.path.startswith(send_hold.HOLD_PATH + "/"):
+            self.hold_result(route.path.removeprefix(send_hold.HOLD_PATH + "/"))
+            return None
         if route.path == f"/{change_page.CONSOLE_FOLDER}":
             self.redirect(f"/{change_page.CONSOLE_FOLDER}/" + (f"?{route.query}" if route.query else ""))
             return None
@@ -1281,12 +1287,16 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             return
         refusal = self.tailscale_refusal()
         if refusal:
-            if route.path == console_tune.PAGE_PATH:
+            if route.path == console_tune.PAGE_PATH or route.path.startswith(send_hold.HOLD_PATH + "/"):
                 self.json_response(403, {"reason": refusal})
             elif route.path == review_page.NEW_ITEM_PATH:
                 self.json_response(403, {"error": refusal})
             else:
                 self.html_response(403, change_page.document(f"<p>{html.escape(refusal)}</p>"))
+            return
+        if route.path.startswith(send_hold.HOLD_PATH + "/") or (
+                self.headers.get(send_hold.HOLD_HEADER) == "1" and route.path in HELD_SEND_PATHS):
+            self.hold_post(route)
             return
         if route.path == review_page.NEW_ITEM_PATH:
             self._write_post(self.new_item_post)
@@ -2302,9 +2312,54 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         print(f"review-links browser answer: {error}", file=sys.stderr)
         self.json_response(status, {"reason": reason})
 
-    def json_response(self, status: int, fields: Mapping[str, object]) -> None:
+    def hold_post(self, route: SplitResult) -> None:
+        """Hold a marked send for Undo, or undo a held send."""
+        server = cast(ReviewLinksServer, self.server)
+        if not self.same_origin(required=True) or route.query:
+            self.json_response(403, {"reason": "Send from the console page."})
+            return
+        if route.path.startswith(send_hold.HOLD_PATH + "/"):
+            hold_id, _, action = route.path.removeprefix(send_hold.HOLD_PATH + "/").partition("/")
+            if action != "undo" or not send_hold.valid_hold_id(hold_id):
+                self.json_response(404, {"reason": "No such send."})
+                return
+            outcome = server.send_holds.undo(hold_id)
+            status = {send_hold.UndoResult.UNDONE: 200, send_hold.UndoResult.ALREADY_SENT: 409}.get(outcome, 404)
+            self.json_response(status, {"outcome": outcome.value})
+            return
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            length = -1
+        if not 0 < length <= HELD_SEND_LIMIT:
+            self.json_response(400, {"reason": "The send is empty or too large."})
+            return
+        seconds = conf.read("review_links").whole("undo_seconds")
+        hold_id = server.send_holds.hold(route.path, dict(self.headers.items()), self.rfile.read(length), seconds)
+        self.json_response(202, send_hold.held_fields(hold_id, seconds), hold="held")
+
+    def hold_result(self, hold_id: str) -> None:
+        """Answer with the response of a released send, or say that it is still held."""
+        server = cast(ReviewLinksServer, self.server)
+        result = server.send_holds.result(hold_id) if send_hold.valid_hold_id(hold_id) else send_hold.HoldState.MISSING
+        if result is send_hold.HoldState.PENDING:
+            self.json_response(202, {"pending": True}, hold="pending")
+        elif result is send_hold.HoldState.MISSING:
+            self.json_response(404, {"reason": "This send was undone or its result expired."})
+        else:
+            self.send_response(result.status)
+            self.send_header("Content-Type", result.content_type)
+            self.send_header("Content-Length", str(len(result.body)))
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.end_headers()
+            _ = self.wfile.write(result.body)
+
+    def json_response(self, status: int, fields: Mapping[str, object], *, hold: str = "") -> None:
         content = json.dumps(fields).encode("utf-8")
         self.send_response(status)
+        if hold:
+            self.send_header("X-Send-Hold", hold)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(content)))
         self.send_header("Cache-Control", "no-store")
@@ -2386,6 +2441,9 @@ class ReviewLinksServer(ThreadingHTTPServer):
         if mode is ServerMode.LIVE:
             _ = sweep_snapshots(self.root, time.time())
         super().__init__(address, ReviewLinksHandler)
+        self.send_holds: send_hold.Holds = send_hold.Holds(
+            self.store_folder / send_hold.HOLD_FOLDER, send_hold.replay_to(self.bound_address, self.server_port))
+        self.send_holds.recover()
         if mode is ServerMode.LIST_FIXTURE:
             return
         recover_changes = change_page.recover_pending

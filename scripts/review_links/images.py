@@ -479,7 +479,7 @@ function bind(root) {
     sending++;
     try {
       if (!question) await motion.removeCard(card, apply);
-      const response = await fetch(location.pathname, {method: 'POST', body});
+      const response = await heldFetch(location.pathname, {method: 'POST', body});
       if (!response.ok) {
         const reason = await response.json().then(body => body.reason, () => '');
         throw new Error(reason || 'HTTP ' + response.status);
@@ -494,8 +494,10 @@ function bind(root) {
     } catch (error) {
       postFailed = true;
       if (!question) home.insertBefore(card, next?.parentNode === home ? next : null);
-      status.textContent = 'Not sent: ' + error.message;
+      const undone = error instanceof SendUndone;
+      status.textContent = undone ? error.message : 'Not sent: ' + error.message;
       apply();
+      if (undone) form.elements.feedback.focus();
     } finally {
       sending--;
       setCardSubmitting(form, false);

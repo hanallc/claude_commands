@@ -1627,7 +1627,8 @@ function bindFeedbackForm(form){
     tableView.showActionResult(item,submission,label,{kind:'success',message,hiddenMessage});
    };
    try{
-    const response=await fetch(location.pathname,{method:'POST',body:data});
+    // Words wait on the server for Undo; read, park and remove act at once.
+    const response=await (usesWords ? heldFetch : fetch)(location.pathname,{method:'POST',body:data});
     saved=response.ok;
     refused=!response.ok && (response.status<500 || (!asksQuestion && !parks && action!=='remove'));
     if(saved && tableView.currentItemRequest(request) && usesWords &&
@@ -1693,6 +1694,9 @@ function bindFeedbackForm(form){
    }catch(error){
     stale=!tableView.currentItemRequest(request);
     if(item.listRequest!==request) return;
+    // An undone send saved nothing, so the item returns to its state before Send and keeps the words.
+    const undone=error instanceof SendUndone;
+    if(undone) refused=true;
     if(saved){
      if(stale) return;
      tableView.preserveRecordRowTop(()=>{
@@ -1738,8 +1742,8 @@ function bindFeedbackForm(form){
      if(restore) restoreLink?.();
      if(!confirmedByReadback){
       if(!stale && (refused || hidUnread) && !tableView.opened.size) tableView.openCard(key);
-      const message=(refused ? 'Not saved: ' : 'Save not confirmed: ')+error.message;
-      tableView.showActionResult(item,submission,'Item '+item.dataset.number,{kind:'failure',message});
+      const message=undone ? error.message : (refused ? 'Not saved: ' : 'Save not confirmed: ')+error.message;
+      tableView.showActionResult(item,submission,'Item '+item.dataset.number,{kind:undone ? 'success' : 'failure',message});
      }
      // The return animation uses the confirmed sort keys.
      if(refused && wasHidden && !item.hidden) tableView.applyAction();

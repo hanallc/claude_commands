@@ -2026,6 +2026,40 @@ The server returns 403 when the host or origin check fails.
 - Content types: `.html` and `.htm`, in any case, go out as `text/html; charset=utf-8`. A type that Python's `mimetypes` lists under `image/` keeps that type. All other files, `.md`, `.txt`, `.json` and `.pdf` included, go out as `text/plain; charset=utf-8`.
 - Each request writes the standard access line to stderr.
 
+### Undo after Send
+
+A send waits a short time before it leaves, so the user can undo it, as in an email client.
+These sends wait:
+
+1. Review items: each answer except Later and Validate.
+2. The List: Tell and Ask.
+3. Images: Approved, Send Feedback and Ask question.
+4. The New item dialog on each console page.
+
+The browser marks the send with the `X-Undo-Hold: 1` header.
+The server saves the whole request in `<root>/.review-link-holds/<id>.json` and answers 202 with `X-Send-Hold: held`.
+The 202 body gives the hold id and `undo_seconds`.
+Nothing is saved and nothing is sent before the time ends.
+
+The page shows a dark toast with the word Sending, an **Undo** button and a bar at the bottom center of the top page.
+An open modal dialog holds the toast, so the dialog cannot cover it.
+The toast stays clear for the first half of the time and then fades out. The bar becomes shorter over the full time.
+**Undo** posts `/send-hold/<id>/undo`. The server deletes the saved request and answers 200.
+The page then shows "Undone. Edit and send again." and keeps the words, the item and the dialog.
+
+One second after the time ends, the server sends the saved request to its own bound address.
+The normal handler then saves and sends, as for a send that does not wait.
+An undo after that time gets 409, and the send continues.
+The page reads `GET /send-hold/<id>`. The server answers 202 with `X-Send-Hold: pending` until the send ends.
+It then gives the saved response one time, so each page shows its normal result.
+A failed connection to itself gives a 503 result.
+
+Each saved request is a file, so a server restart sends each request it finds when its time ends.
+The server deletes a result that no page reads within 10 minutes.
+A New item that waited through a restart gets the stale token answer, as other sends after a restart do.
+The `.review-link-` prefix keeps the folder private: a GET of a saved request gets 404.
+An undo needs the console host and origin, as other POST requests do.
+
 ### Sweep
 
 `sweep_snapshots(root: Path, now: float) -> int` deletes expired snapshot folders and returns the number deleted.
@@ -2155,6 +2189,7 @@ The scripts read `config/review_links.conf` through `scripts/lib/conf.py` when e
 `snapshot_allocation_tries` limits folder allocation attempts.
 `delivery_tries` and `delivery_pause_seconds` control message attempts.
 `feedback_rows` sets the textarea height from 1 to 20 rows and starts at 5.
+`undo_seconds` sets how long a send waits for Undo, from 1 to 60 seconds, and starts at 10. Each send reads it.
 `review_words_rows` sets the height of the Review page **Your words** box from 1 to 20 rows and starts at 4.
 The `later_*` keys set the Review page Later presets; each render reads them.
 `later_soon_minutes` is 1 to 1440 minutes and starts at 60.

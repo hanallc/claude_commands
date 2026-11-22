@@ -14,7 +14,7 @@ from pathlib import Path
 from scripts.lib import conf
 from scripts.lib.user_zone import user_zone
 from scripts.production import staff
-from scripts.review_links import setting_controls
+from scripts.review_links import send_hold, setting_controls
 
 ICONS = Path(__file__).with_name("lucide")
 QUESTION_WAITING = "The {owner_role} will answer this"
@@ -556,6 +556,84 @@ document.addEventListener('click',event=>{
 })();'''
 
 
+# The server holds a marked send for undo_seconds (send_hold.py). heldFetch shows a fading Undo for that time,
+# as an email client does. Undo throws SendUndone, so the caller keeps the words for an edit.
+# After the time ends, heldFetch returns the response of the real send, so each page keeps its own result code.
+# The Undo shows in the top page, inside an open modal dialog when there is one, so a card frame or a dialog
+# cannot hide it. The card scripts and the New item dialog both load this script, so it defines its two names once.
+HELD_SEND_STYLE = '''
+[data-send-undo-stack]{position:fixed;left:50%;bottom:24px;transform:translateX(-50%);z-index:2147483647;
+display:grid;gap:8px;margin:0;width:max-content;max-width:calc(100vw - 32px)}
+[data-send-undo]{position:relative;display:flex;align-items:center;gap:16px;padding:10px 10px 12px 16px;
+border:1px solid #fff3;border-radius:8px;background:#222;color:#fff;box-shadow:0 4px 16px #0008;
+font:500 14px/20px system-ui,sans-serif;overflow:hidden}
+[data-send-undo] button{padding:4px 10px;border:0;border-radius:4px;background:none;color:#8ab4ff;
+font:600 14px/20px system-ui,sans-serif;cursor:pointer}
+[data-send-undo] button:is(:hover,:focus-visible){background:#fff2}
+[data-send-undo-bar]{position:absolute;left:0;right:0;bottom:0;height:3px;background:#8ab4ff;transform-origin:left}
+'''
+
+HELD_SEND_SCRIPT = (f'window.heldFetch || (() => {{\nconst SEND_HOLD_PATH={json.dumps(send_hold.HOLD_PATH)},'
+                    f'SEND_UNDO_STYLE={json.dumps(HELD_SEND_STYLE)};\n') + r'''class SendUndone extends Error{
+ constructor(){super('Undone. Edit and send again.');this.name='SendUndone';}
+}
+function sendUndoHost(){
+ try{ return window.top.document; }catch{ return document; }
+}
+function showSendUndo(hold,seconds,label){
+ const host=sendUndoHost();
+ if(!host.querySelector('style[data-send-undo-style]')){
+  const style=host.createElement('style');style.dataset.sendUndoStyle='';style.textContent=SEND_UNDO_STYLE;
+  host.head.append(style);
+ }
+ const place=[...host.querySelectorAll('dialog')].filter(dialog=>dialog.matches(':modal')).pop() || host.body;
+ let stack=place.querySelector(':scope>[data-send-undo-stack]');
+ if(!stack){
+  stack=host.createElement('div');stack.dataset.sendUndoStack='';stack.setAttribute('role','status');place.append(stack);
+ }
+ const toast=host.createElement('div'),text=host.createElement('span'),button=host.createElement('button');
+ const bar=host.createElement('div');
+ toast.dataset.sendUndo='';text.textContent=label;button.type='button';button.textContent='Undo';
+ bar.dataset.sendUndoBar='';toast.append(text,button,bar);stack.append(toast);
+ // The Undo stays clear for the first half of the time, then fades out until the send leaves.
+ const timing={duration:seconds*1000,easing:'linear',fill:'forwards'};
+ const fade=toast.animate([{opacity:1},{opacity:1,offset:.5},{opacity:0}],timing);
+ const shrink=bar.animate([{transform:'scaleX(1)'},{transform:'scaleX(0)'}],timing);
+ return new Promise(resolve=>{
+  let done=false;
+  const finish=undone=>{
+   if(done) return;
+   done=true;toast.remove();
+   if(!stack.children.length) stack.remove();
+   resolve(undone);
+  };
+  fade.finished.then(()=>finish(false),()=>{});
+  button.addEventListener('click',async()=>{
+   button.disabled=true;fade.pause();shrink.pause();
+   try{
+    const response=await fetch(SEND_HOLD_PATH+'/'+hold+'/undo',{method:'POST'});
+    finish(response.ok);
+   }catch{
+    finish(false);
+   }
+  });
+ });
+}
+async function heldFetch(url,init={},label='Sending'){
+ const headers=new Headers(init.headers);headers.set('X-Undo-Hold','1');
+ const first=await fetch(url,{...init,headers});
+ if(first.headers.get('X-Send-Hold')!=='held') return first;
+ const {hold,seconds}=await first.json();
+ if(await showSendUndo(hold,seconds,label)) throw new SendUndone();
+ for(;;){
+  const response=await fetch(SEND_HOLD_PATH+'/'+hold,{cache:'no-store'});
+  if(response.headers.get('X-Send-Hold')!=='pending') return response;
+ }
+}
+window.SendUndone=SendUndone;window.heldFetch=heldFetch;
+})();
+'''
+
 CARD_SUBMIT_SCRIPT = r'''function cardSubmitBlocked(form,fading=false){
  return !form.isConnected || Boolean(form.dataset.sending) || fading;
 }
@@ -563,7 +641,7 @@ function setCardSubmitting(form,submitting,controls=form){
  if(submitting) form.dataset.sending='true';else delete form.dataset.sending;
  controls.querySelectorAll('button').forEach(button=>button.disabled=submitting);
 }
-'''
+''' + HELD_SEND_SCRIPT
 
 
 @dataclass(frozen=True)

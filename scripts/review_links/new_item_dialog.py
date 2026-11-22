@@ -769,7 +769,7 @@ def render() -> str:
     dialog = page_frame.console_dialog('review-new-item', 'new-item-title', 'New item', body,
                                        footer=footer, form=True, body_class='new-item-body')
     return (f'<style>{STYLE}{PAGE_STATE_STYLE}</style>{dialog}'
-            f'<script>{SCRIPT.replace("__LIMITS__", limits)}</script>')
+            f'<script>{page_frame.HELD_SEND_SCRIPT}{SCRIPT.replace("__LIMITS__", limits)}</script>')
 
 
 PAGE_STATE_STYLE = '''
@@ -1071,9 +1071,11 @@ SCRIPT = r'''(() => {
   showRecipients();
  }
 
- async function post(payload, keepalive = false) {
-  const response = await fetch(endpoint, {method: 'POST', headers: {'Content-Type': 'application/json'},
-                                          body: JSON.stringify(payload), keepalive});
+ async function post(payload, keepalive = false, held = false) {
+  // A held send shows Undo for a short time; an Undo rejects with SendUndone, and the dialog keeps the item.
+  const send = held ? heldFetch : fetch;
+  const response = await send(endpoint, {method: 'POST', headers: {'Content-Type': 'application/json'},
+                                         body: JSON.stringify(payload), keepalive});
   return responseData(response, 'Could not send this item.');
  }
 
@@ -1484,7 +1486,7 @@ SCRIPT = r'''(() => {
   try {
    const item = await submissionPayload();
    usedPreview = Boolean(item.capture_key && !item.defer_capture);
-   const sendItem = () => post({...item, token});
+   const sendItem = () => post({...item, token}, false, true);
    let result;
    try {
     result = await sendItem();

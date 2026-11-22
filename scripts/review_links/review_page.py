@@ -1652,10 +1652,13 @@ async function recoverReviewRevision(reason,{form,notice,reload,current=()=>true
   refreshError(error);
  }
 }
-async function saveReviewAction(data,{confirmedSave,saved,failed,displayFailed,recover,finished}){
+async function saveReviewAction(data,{confirmedSave,saved,failed,undone=failed,displayFailed,recover,finished}){
  let conflict=false,confirmed=false;
  try{
-  const response=await fetch(location.pathname,{method:'POST',body:data});
+  // An answer to its owner waits on the server for Undo. Later only hides the item and Validate starts a check,
+  // so both act at once.
+  const send=['later','validate'].includes(data.get('outcome')) ? fetch : heldFetch;
+  const response=await send(location.pathname,{method:'POST',body:data});
   conflict=response.status===409;
   confirmed=response.ok;
   if(confirmed) confirmedSave?.();
@@ -1663,7 +1666,8 @@ async function saveReviewAction(data,{confirmedSave,saved,failed,displayFailed,r
   if(!response.ok) throw new Error(result.reason || 'HTTP '+response.status);
   await saved(result);
  }catch(error){
-  if(confirmed) displayFailed();
+  if(error instanceof SendUndone) undone(error.message);
+  else if(confirmed) displayFailed();
   else if(conflict) await recover(error.message);
   else failed(error.message);
  }finally{
@@ -1771,6 +1775,7 @@ function bindCard(row,zone,settings,requestTimeoutSeconds){
     }
    },
    failed:reason=>report('Not saved: '+reason),
+   undone:report,
    displayFailed:()=>report('Saved; the item could not refresh.'),
    recover,
    finished:()=>{if(!saved) busy(false);}
@@ -2164,6 +2169,10 @@ function bindForm(row){
     else applySaved();
    },
    failed:fail,
+   undone:message=>{
+    pendingSaves.delete(key);
+    showResult({kind:'success',message});
+   },
    displayFailed:()=>{
     if(!view.currentItemRequest(request)) return;
     if(closes){

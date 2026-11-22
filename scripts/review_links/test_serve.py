@@ -56,7 +56,7 @@ from scripts.production.production_doc import read_new_production
 from scripts.production.staff_test_support import fixture_member
 from scripts.review_links import test_change_page
 from scripts.review_links import console_tune, new_item_dialog, page_frame, page_question, question_record, review_submissions
-from scripts.review_links import accounts_page, change_browser, change_page, console, for_you, image_store, images, investigations_page, list_page, review_actions, review_later, review_page, review_items, serve, test_review_page
+from scripts.review_links import accounts_page, change_browser, change_page, console, for_you, image_store, images, investigations_page, list_page, review_actions, review_later, review_page, review_items, send_hold, serve, test_review_page
 from scripts.lib import atomic_file, conf, file_lock, process_start, scratch, urgency
 from scripts.feature_log import feature_log
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -775,6 +775,90 @@ class ReviewLinksServerTests(unittest.TestCase):
         filed, = investigation.records(other.id)
         self.assertEqual(filed.question, request.words)
         self.assertEqual(investigation.records(owner.id), [])
+
+    def held_http(self, method: str, path: str, body: bytes | None = None, *,
+                  headers: dict[str, str] | None = None) -> tuple[int, str, dict[str, object]]:
+        """Send one request from the console origin and return its status, hold header, and JSON fields."""
+        host = f"127.0.0.1:{self.port}"
+        connection = HTTPConnection("127.0.0.1", self.port, timeout=TEST_HANG_GUARD_SECS)
+        try:
+            connection.request(method, path, body, {"Host": host, "Origin": f"http://{host}",
+                                                    "Content-Type": "application/json", **(headers or {})})
+            response = connection.getresponse()
+            return (response.status, response.getheader("X-Send-Hold", ""),
+                    cast(dict[str, object], json.loads(response.read() or b"{}")))
+        finally:
+            connection.close()
+
+    def held_new_item(self) -> tuple[test_review_page.ReviewPageTests, staff.StaffRow, bytes]:
+        case = self.review_fixture()
+        owner = case.ready_submission_recipient()
+        other = fixture_member("producer", name="another-recipient")
+        _ = write_config_fixture(conf.path("console"), f"page.review.owner={owner.id}\n")
+        request = replace(case.submission_request(new_item_dialog.SubmissionKind.INVESTIGATION, other.id),
+                          page="review", request_id="r6-" + uuid4().hex,
+                          page_recipient=new_item_dialog.PageRecipient.SELECTED)
+        return case, other, self.new_item_body(request)
+
+    def test_a_held_new_item_waits_for_undo_time_then_files_once(self) -> None:
+        case, other, body = self.held_new_item()
+        _ = write_config_fixture(conf.path("review_links"), "undo_seconds=1\n")
+        cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
+        with (patch.object(self.server, "review_cache", cache),
+              patch.object(self.server, "delivery_status", case.status),
+              patch.object(send_hold, "RELEASE_GRACE_SECONDS", 0.0),
+              capture_sender("send_message") as send):
+            status, hold, fields = self.held_http("POST", review_page.NEW_ITEM_PATH, body,
+                                                  headers={send_hold.HOLD_HEADER: "1"})
+            self.assertEqual((status, hold, fields["seconds"]), (202, "held", 1), fields)
+            hold_id = cast(str, fields["hold"])
+            self.assertEqual(investigation.records(other.id), [])
+            send.assert_not_called()
+            status, hold, fields = self.held_http("GET", f"{send_hold.HOLD_PATH}/{hold_id}")
+            self.assertEqual((status, hold), (200, ""), fields)
+            send.assert_called_once_with(f"session:{other.current_session}", change_page.SENDER, ANY)
+        self.assertIn(cast(str, fields["key"]), cache.get().records)
+        self.assertEqual(len(investigation.records(other.id)), 1)
+        self.assertEqual(self.held_http("GET", f"{send_hold.HOLD_PATH}/{hold_id}")[0], 404)
+        self.assertEqual(self.held_http("POST", f"{send_hold.HOLD_PATH}/{hold_id}/undo")[:2], (404, ""))
+
+    def test_an_undone_new_item_is_never_filed_or_sent(self) -> None:
+        case, other, body = self.held_new_item()
+        cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
+        with (patch.object(self.server, "review_cache", cache),
+              patch.object(self.server, "delivery_status", case.status),
+              capture_sender("send_message") as send):
+            status, _, fields = self.held_http("POST", review_page.NEW_ITEM_PATH, body,
+                                               headers={send_hold.HOLD_HEADER: "1"})
+            self.assertEqual(status, 202, fields)
+            hold_id = cast(str, fields["hold"])
+            undo = f"{send_hold.HOLD_PATH}/{hold_id}/undo"
+            refused = self.held_http("POST", undo, headers={"Origin": "https://elsewhere.invalid"})
+            self.assertEqual(refused[0], 403)
+            self.assertEqual(self.held_http("POST", undo)[::2], (200, {"outcome": "undone"}))
+            self.assertEqual(self.held_http("POST", undo)[::2], (404, {"outcome": "missing"}))
+            self.assertEqual(self.held_http("GET", f"{send_hold.HOLD_PATH}/{hold_id}")[0], 404)
+            send.assert_not_called()
+        self.assertEqual(investigation.records(other.id), [])
+        self.assertEqual(list((self.root / send_hold.HOLD_FOLDER).glob("*.json")), [])
+        self.assertEqual(self.request(f"/{send_hold.HOLD_FOLDER}/{hold_id}.json").status, 404)
+
+    def test_each_console_send_path_holds_a_marked_send_and_no_other_path_does(self) -> None:
+        marked = {send_hold.HOLD_HEADER: "1"}
+        _ = self.enterContext(patch.object(self.server, "verified_tailscale_address", self.server.bound_address))
+        for path in sorted(serve.HELD_SEND_PATHS):
+            with self.subTest(path=path), patch.object(serve.ReviewLinksHandler, "_write_post") as write:
+                status, hold, fields = self.held_http("POST", path, b"outcome=works", headers=marked)
+                self.assertEqual((status, hold), (202, "held"), fields)
+                write.assert_not_called()
+                undo = f"{send_hold.HOLD_PATH}/{fields['hold']}/undo"
+                self.assertEqual(self.held_http("POST", undo)[::2], (200, {"outcome": "undone"}))
+        status, hold, _ = self.held_http("POST", serve.QUEUE_MOVE_PATH, b"{}", headers=marked)
+        self.assertNotEqual((status, hold), (202, "held"))
+        self.assertEqual(self.held_http("POST", review_page.PAGE_PATH + "?x=1", b"words", headers=marked)[0], 403)
+        self.assertEqual(self.held_http("POST", review_page.PAGE_PATH, b"", headers=marked)[0], 400)
+        self.assertEqual(self.held_http("POST", f"{send_hold.HOLD_PATH}/not-an-id/undo")[0], 404)
+        self.assertEqual(list((self.root / send_hold.HOLD_FOLDER).glob("*.json")), [])
 
     def test_list_owner_control_and_sends_use_the_configured_producer(self) -> None:
         case = self.review_fixture()
