@@ -551,6 +551,34 @@ class GateRecordTests(unittest.TestCase):
         self.assertEqual(len(stderr.getvalue().splitlines()), 1, stderr.getvalue())
         self.assertIn("gate run not written:", stderr.getvalue())
 
+    def test_local_gate_keeps_read_lists_out_of_the_gate_record(self) -> None:
+        run = gate_run()
+        run["selection"] = "full"
+        run["modules"][0].update(config_reads=["limits"], folder_scans=[], content_reads=["docs/guide.md"])
+        gate_record.write_gate_run(run, fixture_executions(run))
+
+        latest_path = self.buildlog / gate_record.LATEST_MODULE_READS_NAME
+        previous = latest_path.read_bytes()
+        self.assertEqual(gate_record.read_latest_module_reads(), {
+            "scripts/scripts/test_example.py": gate_record.module_read_record(["limits"], [], ["docs/guide.md"]),
+        })
+        run["started_at"] = "2030-01-01"
+        run["modules"][0].update(config_reads=["ignored"], folder_scans=["/"], content_reads=[])
+        for selection, aborted in (("full", True), ("affected", False)):
+            with self.subTest(selection=selection, aborted=aborted):
+                run.update(selection=selection, aborted=aborted)
+                gate_record.write_gate_run(run, fixture_executions(run))
+                self.assertEqual(latest_path.read_bytes(), previous)
+
+        records = [entry for path in self.buildlog.glob("*/*.jsonl") for entry in store.locked_rows(path)]
+        self.assertEqual(len(records), 3)
+        for record in records:
+            module = cast(list[dict[str, object]], record["modules"])[0]
+            self.assertTrue(module.keys().isdisjoint(gate_record.READ_FIELDS))
+            self.assertEqual(module["wall_s"], run["modules"][0]["wall_s"])
+            self.assertEqual(module["peak_mib"], run["modules"][0]["peak_mib"])
+            self.assertEqual(module["status"], run["modules"][0]["status"])
+
     def test_gate_write_failure_reports_one_line_and_returns(self) -> None:
         _ = self.buildlog.write_text("This file blocks the output directory.\n", encoding="utf-8")
         stderr = io.StringIO()

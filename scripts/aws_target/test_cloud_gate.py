@@ -2162,6 +2162,28 @@ with (mock.patch.object(cloud_gate, 'AwsCli', return_value=api),
         self.assertNotIn('result', cloud_gate.read(self.folder / 'imported.json'))
         reported.assert_called_once()
 
+    def test_cloud_import_keeps_module_reads_only_in_the_latest_read_file(self) -> None:
+        result = self.result()
+        outgoing = ledger.mapping(result['record'])
+        reads = ledger.rows(outgoing, 'modules')[0]
+        reads.update(config_reads=['limits'], folder_scans=['docs/'], content_reads=[])
+        cloud_gate.import_record(self.folder, result)
+        cloud_gate.import_record(self.folder, result)
+
+        destination = store.host_file(store.CLOUD_GATE_PLACE, self.now)
+        saved, = tuple(store.locked_rows(destination))
+        retained = ledger.text(cloud_gate.read(self.folder / 'imported.json'), 'result')
+        retained_result = ledger.mapping(cast(object, json.loads(gzip.decompress((store.root() / retained).read_bytes()))))
+        for record in (saved, ledger.mapping(retained_result['record'])):
+            module, = ledger.rows(record, 'modules')
+            self.assertTrue(module.keys().isdisjoint(gate_record.READ_FIELDS))
+            self.assertEqual(module['wall_s'], reads['wall_s'])
+            self.assertEqual(module['peak_mib'], reads['peak_mib'])
+            self.assertEqual(module['status'], reads['status'])
+        self.assertEqual(gate_record.read_latest_module_reads(), {
+            'scripts/fixture/test_ok.py': gate_record.module_read_record(['limits'], ['docs/'], []),
+        })
+
     def test_first_import_skips_existing_rows(self) -> None:
         destination = store.host_file('aws', self.now)
         destination.parent.mkdir(parents=True)

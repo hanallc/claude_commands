@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import ast
+from contextlib import closing
 from datetime import UTC, datetime
 import json
 import os
@@ -13,7 +14,9 @@ import unittest
 from typing import cast, override
 from unittest import mock
 
+from scripts.buildlog import index
 from scripts.production import affected_modules as affected
+from scripts.test_times import gate_record
 from scripts.test_times.gate_record_test_support import gate_run
 
 
@@ -34,7 +37,6 @@ class AffectedModulesTests(unittest.TestCase):
         self.write(".git/test-config/gate.conf", "# text:\nlanding_branches=main builds natedev sdlc\n"
                    + "# text:\nscan_roots=\n")
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"CONF_DIR": str(self.repo / ".git/test-config")})))
-        self.write(".git/test-config/buildlog.conf", (Path(__file__).resolve().parents[2] / "config/buildlog.conf").read_text())
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"BUILDLOG_DIR": str(self.repo / ".git/buildlog")})))
         self.write(".gitignore", "__pycache__/\n")
         # Ten unrelated modules distinguish direct selection from a full selection.
@@ -65,12 +67,19 @@ class AffectedModulesTests(unittest.TestCase):
         self.base = affected.CertifiedBase(self.commit(), datetime.now(UTC).isoformat())
         self.record_configs({})
 
-    def record_configs(self, reads: dict[str, list[str]]) -> None:
+    def config_gate(self, reads: dict[str, list[str]]) -> dict[str, object]:
         modules = [{"suite": path.parent.name, "module": path.name, "attempt": 1,
                     "config_reads": reads.get(path.name, [])} for path in self.modules]
-        run = {**gate_run(), "kind": "gate_run", "v": 1, "id": "fixture-full", "host": "mac",
-               "selection": "full", "aborted": False, "modules": modules}
-        self.write(".git/buildlog/mac/fixture.jsonl", json.dumps(run) + "\n")
+        return {**gate_run(), "kind": "gate_run", "v": 1, "id": "fixture-full", "host": "mac",
+                "selection": "full", "aborted": False, "modules": modules}
+
+    def record_history(self, *runs: dict[str, object]) -> None:
+        (self.repo / ".git/buildlog" / gate_record.LATEST_MODULE_READS_NAME).unlink(missing_ok=True)
+        for run in runs:
+            gate_record.update_latest_module_reads(run, cast(list[object], run["modules"]))
+
+    def record_configs(self, reads: dict[str, list[str]]) -> None:
+        self.record_history(self.config_gate(reads))
 
     def selection(self) -> affected.AffectedSelection:
         result = affected.select_affected(self.repo, self.base, self.modules, affected.dirty_paths(self.repo))
@@ -89,9 +98,7 @@ class AffectedModulesTests(unittest.TestCase):
         self.add_test("checks/test_named.py", '# config/limits.conf\n')
         self.add_test("checks/test_missing.py", "VALUE = 1\n")
         self.certify()
-        self.record_configs({"test_runtime.py": ["limits"]})
-        log = self.repo / ".git/buildlog/mac/fixture.jsonl"
-        run = cast(dict[str, object], json.loads(log.read_text()))
+        run = self.config_gate({"test_runtime.py": ["limits"]})
         module_rows = cast(list[dict[str, object]], run["modules"])
         for row in module_rows:
             if row["module"] == "test_missing.py":
@@ -100,19 +107,20 @@ class AffectedModulesTests(unittest.TestCase):
                    "modules": [{**row, "config_reads": ["limits"]} for row in module_rows]}
         aborted = {**earlier, "id": "aborted", "started_at": "2030-01-01T00:00:00Z", "aborted": True}
         affected_run = {**aborted, "id": "affected", "aborted": False, "selection": "affected"}
-        _ = log.write_text("".join(json.dumps(row) + "\n" for row in (earlier, run, aborted, affected_run)))
+        self.record_history(earlier, run, aborted, affected_run)
         self.add_test("checks/test_new.py", "VALUE = 1\n")
         self.write("config/limits.conf", "value=two\n")
-        from scripts.buildlog import index
-        with mock.patch.object(index, "read_only", wraps=index.read_only) as reads:
+        with (mock.patch.object(index, "update", side_effect=AssertionError("updated the index")),
+              mock.patch.object(index, "read_only", side_effect=AssertionError("opened the index")),
+              mock.patch.object(index, "update_lock", side_effect=AssertionError("locked the index")),
+              mock.patch.object(sqlite3, "connect", side_effect=AssertionError("opened SQLite"))):
             selected = self.selection()
-        self.assertEqual(reads.call_count, 1)
         self.assertEqual({path.name for path in selected.modules}, {"test_runtime.py", "test_named.py", "test_new.py", "test_missing.py"})
-        with mock.patch.object(index, "read_only", side_effect=sqlite3.OperationalError("unreadable index")):
+        with mock.patch.object(affected, "latest_module_reads", side_effect=PermissionError("unreadable read history")):
             result = affected.select_affected(self.repo, self.base, self.modules, affected.dirty_paths(self.repo))
         self.assertIsInstance(result, affected.FullSuite)
         assert isinstance(result, affected.FullSuite)
-        self.assertIn("unreadable index", result.reason)
+        self.assertIn("unreadable read history", result.reason)
         self.write("config/limits.conf", "value=one\n")
         (self.repo / "scripts/checks/test_new.py").unlink()
         with mock.patch.object(affected, "latest_module_reads", side_effect=AssertionError("No config changed")):
@@ -123,14 +131,12 @@ class AffectedModulesTests(unittest.TestCase):
         self.add_test("checks/test_reader.py", "VALUE = 1\n")
         self.add_test("checks/test_other.py", "VALUE = 1\n")
         self.certify()
-        self.record_configs({"test_reader.py": ["limits"]})
-        log = self.repo / ".git/buildlog/mac/fixture.jsonl"
-        recorded = cast(dict[str, object], json.loads(log.read_text()))
+        recorded = self.config_gate({"test_reader.py": ["limits"]})
         module_rows = cast(list[dict[str, object]], recorded["modules"])
         unrecorded = {**recorded, "id": "newer-unrecorded", "started_at": "2030-01-01T00:00:00Z",
                       "modules": [{key: value for key, value in row.items() if key != "config_reads"}
                                   for row in module_rows]}
-        _ = log.write_text("".join(json.dumps(row) + "\n" for row in (recorded, unrecorded)))
+        self.record_history(recorded, unrecorded)
         self.write("config/limits.conf", "value=two\n")
         self.assertEqual(self.selection().modules, (self.repo / "scripts/checks/test_reader.py",))
 
@@ -158,14 +164,13 @@ class AffectedModulesTests(unittest.TestCase):
                 if removed or label in {"changed file", "changed recursive file", "changed config"}:
                     self.write(path, "base\n")
                 self.certify()
-                log = self.repo / ".git/buildlog/mac/fixture.jsonl"
-                run = cast(dict[str, object], json.loads(log.read_text()))
+                run = self.config_gate({})
                 module_rows = cast(list[dict[str, object]], run["modules"])
                 for row in module_rows:
                     row["folder_scans"] = (["scripts/", "commands/", "docs/"]
                                            if row["module"] == "test_staff_accessors.py" and label == "added accessor"
                                            else folders if row["module"] == "test_folder.py" else [])
-                _ = log.write_text(json.dumps(run) + "\n")
+                self.record_history(run)
                 if removed:
                     (self.repo / path).unlink()
                     if label == "removed directory":
@@ -330,8 +335,7 @@ class AffectedModulesTests(unittest.TestCase):
             with self.subTest(case=label):
                 self.write(path, "VALUE = 1\n")
                 self.certify()
-                log = self.repo / ".git/buildlog/mac/fixture.jsonl"
-                run = cast(dict[str, object], json.loads(log.read_text()))
+                run = self.config_gate({})
                 module_rows = cast(list[dict[str, object]], run["modules"])
                 for row in module_rows:
                     row["folder_scans"] = []
@@ -345,7 +349,7 @@ class AffectedModulesTests(unittest.TestCase):
                             "started_at": "2030-01-01T00:00:00Z",
                             "modules": [{**row, "content_reads": []} for row in module_rows]}
                            for selection, aborted in (("full", True), ("affected", False))]
-                _ = log.write_text("".join(json.dumps(record) + "\n" for record in (run, newer, *ignored)))
+                self.record_history(run, newer, *ignored)
                 if removed:
                     (self.repo / path).unlink()
                 else:
@@ -360,9 +364,7 @@ class AffectedModulesTests(unittest.TestCase):
         self.add_test("checks/test_folder.py", "VALUE = 1\n")
         self.add_test("checks/test_unrecorded.py", "VALUE = 1\n")
         self.certify()
-        self.record_configs({"test_config.py": ["limits"]})
-        log = self.repo / ".git/buildlog/mac/fixture.jsonl"
-        config_gate = cast(dict[str, object], json.loads(log.read_text()))
+        config_gate = self.config_gate({"test_config.py": ["limits"]})
         config_rows = cast(list[dict[str, object]], config_gate["modules"])
         folder_rows = [{key: value for key, value in row.items() if key != "config_reads"} for row in config_rows]
         for row in folder_rows:
@@ -376,11 +378,71 @@ class AffectedModulesTests(unittest.TestCase):
             ignored = {**folder_gate, "id": "ignored", "started_at": "2032-01-01T00:00:00Z",
                        "selection": selection, "aborted": aborted,
                        "modules": [{**row, "folder_scans": ["/"]} for row in folder_rows]}
-            _ = log.write_text("".join(json.dumps(run) + "\n" for run in (config_gate, folder_gate, empty_gate, ignored)))
+            self.record_history(config_gate, folder_gate, empty_gate, ignored)
             self.write("config/limits.conf", "value=two\n")
             self.write("assets/new.txt", "added\n")
             self.assertEqual({module.name for module in self.selection().modules},
                              {"test_config.py", "test_folder.py", "test_unrecorded.py"})
+
+    def test_latest_read_file_matches_the_index(self) -> None:
+        template = {"suite": "checks", "module": "test_read.py", "attempt": 1}
+        full = self.config_gate({})
+        config = {**full, "id": "config", "started_at": "1", "modules": [
+            {**template, "config_reads": ["old"]},
+            {**template, "module": "test_old_only.py", "config_reads": ["old"]},
+        ]}
+        folders = {**full, "id": "folders", "started_at": "2", "modules": [
+            {**template, "folder_scans": ["/", "docs/"]},
+            {**template, "module": "test_missing.py"},
+        ]}
+        contents = {**full, "id": "contents", "started_at": "3", "modules": [
+            {**template, "config_reads": ["old"], "content_reads": [], "status": 0},
+        ]}
+        newest_modules: list[dict[str, object]] = [
+            {**template, "config_reads": ["limits"], "status": 143, "restart": "hold"},
+            {**template, "attempt": 2, "config_reads": ["tools", "limits"], "status": 1},
+            {**template, "module": "test_empty.py", "config_reads": []},
+        ]
+        newest = {**full, "id": "newest", "started_at": "3", "status": 1, "modules": newest_modules}
+        aborted = {**config, "id": "aborted", "started_at": "4", "aborted": True}
+        subset = {**config, "id": "subset", "started_at": "5", "selection": "subset"}
+        unrecorded = {**full, "id": "no-reads", "started_at": "6", "modules": [template]}
+        runs = (newest, contents, subset, config, unrecorded, folders, aborted)
+        self.record_history(*runs)
+
+        expected: dict[str, dict[gate_record.ReadField, list[str]]] = {}
+        with closing(sqlite3.connect(":memory:")) as connection:
+            index.create_schema(connection)
+            for run in runs:
+                index.add_gate_run(connection, run, "fixture")
+            for field in gate_record.READ_FIELDS:
+                newest_id = cast(tuple[str], connection.execute(f"""
+                    SELECT module.run_id FROM gate_modules AS module
+                    JOIN gate_runs AS run ON run.id = module.run_id
+                    WHERE run.selection = 'full' AND run.aborted = 0 AND module.{field} IS NOT NULL
+                    ORDER BY run.started_at DESC, run.id DESC LIMIT 1
+                """).fetchone())[0]
+                rows = cast(list[tuple[str, str, str | None]], connection.execute(
+                    f"SELECT suite, module, {field} FROM gate_modules WHERE run_id = ?", (newest_id,),
+                ).fetchall())
+                for suite, module, values in rows:
+                    fields = expected.setdefault(f"scripts/{suite}/{module}", {})
+                    if values is not None:
+                        fields.setdefault(field, []).extend(cast(list[str], json.loads(values)))
+        self.assertEqual(affected.latest_module_reads(), {
+            name: gate_record.module_read_record(fields.get("config_reads"),
+                fields.get("folder_scans"), fields.get("content_reads"))
+            for name, fields in expected.items()
+        })
+
+    def test_missing_or_corrupt_latest_reads_match_empty_history(self) -> None:
+        relative = ".git/buildlog/" + gate_record.LATEST_MODULE_READS_NAME
+        (self.repo / relative).unlink()
+        self.assertEqual(affected.latest_module_reads(), {})
+        for contents in ("{", "[]", '{"folder_scans":{"started_at":"1","run_id":"x","modules":{"test":4}}}'):
+            with self.subTest(contents=contents):
+                self.write(relative, contents)
+                self.assertEqual(affected.latest_module_reads(), {})
 
     def test_landing_bases_exclude_changes_that_already_passed_the_gate(self) -> None:
         self.write("scripts/landed/subject.py", "VALUE = 1\n")

@@ -1,7 +1,7 @@
 """Read module times and append gate runs to the build log."""
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 import hashlib
 import json
@@ -11,7 +11,9 @@ import sys
 import time
 from typing import Final, Literal, NotRequired, TypedDict, cast, get_args
 
-from scripts.lib import conf
+from scripts.buildlog import store
+from scripts.lib import conf, file_lock
+from scripts.lib.atomic_file import write_text_atomic
 from scripts.test_times.recent_gate_times import (
     GateTimeLimit as GateTimeLimit, NoGateTimeLimit as NoGateTimeLimit, TYPE_CHECK_JOB as TYPE_CHECK_JOB,
     update_recent_times as update_recent_times,
@@ -138,12 +140,16 @@ class NoConfigReadRecord:
     """The module has no usable record of its config reads."""
 
 
+def _read_names(value: object, description: str) -> list[str]:
+    if not isinstance(value, list) or not all(isinstance(name, str) for name in cast(list[object], value)):
+        raise ValueError(f"expected a list of {description}")
+    return cast(list[str], value)
+
+
 def config_read_record(value: object) -> RecordedConfigReads | NoConfigReadRecord:
     if value is None:
         return NoConfigReadRecord()
-    if not isinstance(value, list) or not all(isinstance(stem, str) for stem in cast(list[object], value)):
-        raise ValueError("expected a list of config stems")
-    return RecordedConfigReads(frozenset(cast(list[str], value)))
+    return RecordedConfigReads(frozenset(_read_names(value, "config stems")))
 
 
 @dataclass(frozen=True)
@@ -201,18 +207,14 @@ def module_read_record(configs: object, folders: object, contents: object) -> Mo
     config_record = config_read_record(configs)
     folder_record: RecordedFolderScans | NoFolderScanRecord = NoFolderScanRecord()
     if folders is not None:
-        if not isinstance(folders, list) or not all(isinstance(path, str) for path in cast(list[object], folders)):
-            raise ValueError("expected a list of scanned folders")
         decoded: set[ListedDirectory | RecursiveDirectory | WholeRepository] = set()
-        for path in cast(list[str], folders):
+        for path in _read_names(folders, "scanned folders"):
             decoded.add(WholeRepository() if path == "/" else RecursiveDirectory(path[:-1])
                         if path.endswith("/") else ListedDirectory(path))
         folder_record = RecordedFolderScans(frozenset(decoded))
     content_record: RecordedContentReads | NoContentReadRecord = NoContentReadRecord()
     if contents is not None:
-        if not isinstance(contents, list) or not all(isinstance(path, str) for path in cast(list[object], contents)):
-            raise ValueError("expected a list of repository file reads")
-        content_record = RecordedContentReads(frozenset(cast(list[str], contents)))
+        content_record = RecordedContentReads(frozenset(_read_names(contents, "repository file reads")))
     return ModuleReadRecord(config_record, folder_record, content_record)
 
 
@@ -247,6 +249,123 @@ def _fields(value: object) -> dict[str, object]:
     if not isinstance(value, dict):
         raise ValueError("expected an object")
     return cast(dict[str, object], value)
+
+
+ReadField = Literal["config_reads", "folder_scans", "content_reads"]
+READ_FIELDS: Final[tuple[ReadField, ...]] = ("config_reads", "folder_scans", "content_reads")
+LATEST_MODULE_READS_NAME: Final = "latest-module-reads.json"
+
+
+class GateReadSnapshot(TypedDict):
+    """Store one gate's module reads for one field.
+
+    A null module value means the gate did not record that field for the module.
+    """
+
+    started_at: str
+    run_id: str
+    modules: dict[str, list[str] | None]
+
+
+def _read_snapshots(path: Path) -> dict[ReadField, GateReadSnapshot]:
+    document = _fields(cast(object, json.loads(path.read_text(encoding="utf-8"))))
+    snapshots: dict[ReadField, GateReadSnapshot] = {}
+    if set(document) - set(READ_FIELDS):
+        raise ValueError("unknown module read field")
+    for field in READ_FIELDS:
+        if field not in document:
+            continue
+        snapshot = _fields(document[field])
+        started_at, run_id = snapshot.get("started_at"), snapshot.get("run_id")
+        if not isinstance(started_at, str) or not isinstance(run_id, str):
+            raise ValueError("invalid module read gate identity")
+        modules = {name: None if reads is None else _read_names(reads, field)
+                   for name, reads in _fields(snapshot.get("modules")).items()}
+        if not any(reads is not None for reads in modules.values()):
+            raise ValueError("expected a recorded module read")
+        snapshots[field] = {"started_at": started_at, "run_id": run_id, "modules": modules}
+    return snapshots
+
+
+def read_latest_module_reads() -> dict[str, ModuleReadRecord]:
+    """Read the latest gate recorded for each module read field."""
+    try:
+        snapshots = _read_snapshots(store.root() / LATEST_MODULE_READS_NAME)
+    except (FileNotFoundError, ValueError, RecursionError):
+        return {}
+    configs = snapshots["config_reads"]["modules"] if "config_reads" in snapshots else {}
+    folders = snapshots["folder_scans"]["modules"] if "folder_scans" in snapshots else {}
+    contents = snapshots["content_reads"]["modules"] if "content_reads" in snapshots else {}
+    return {name: module_read_record(configs.get(name), folders.get(name), contents.get(name))
+            for name in configs.keys() | folders.keys() | contents.keys()}
+
+
+def without_module_reads(modules: Sequence[ModuleRun]) -> list[ModuleRun]:
+    """Keep only the module data that belongs in the gate run record."""
+    stripped: list[ModuleRun] = []
+    for module in modules:
+        row = module.copy()
+        _ = row.pop("config_reads", None)
+        _ = row.pop("folder_scans", None)
+        _ = row.pop("content_reads", None)
+        stripped.append(row)
+    return stripped
+
+
+def update_latest_module_reads(record: Mapping[str, object], modules: Sequence[object]) -> None:
+    """Replace each field only when a later full gate recorded it."""
+    started_at, run_id = record.get("started_at"), record.get("id")
+    if (record.get("selection") != "full" or record.get("aborted") != 0
+            or not isinstance(started_at, str) or not isinstance(run_id, str)):
+        return
+    try:
+        module_paths: set[str] = set()
+        reads_by_field: dict[ReadField, dict[str, set[str]]] = {field: {} for field in READ_FIELDS}
+        for module in modules:
+            row = _fields(module)
+            suite, name = row.get("suite"), row.get("module")
+            if not isinstance(suite, str) or not isinstance(name, str):
+                continue
+            path = f"scripts/{suite}/{name}"
+            module_paths.add(path)
+            for field in READ_FIELDS:
+                value = row.get(field)
+                if value is not None:
+                    reads_by_field[field].setdefault(path, set()).update(_read_names(value, field))
+        if not any(reads_by_field.values()):
+            return
+        paths = sorted(module_paths)
+        cache = store.root() / LATEST_MODULE_READS_NAME
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        with file_lock.exclusive(cache.with_suffix(".lock")):
+            try:
+                snapshots = _read_snapshots(cache)
+            except (FileNotFoundError, ValueError, RecursionError):
+                snapshots = {}
+            changed = False
+            for field, reads in reads_by_field.items():
+                if not reads:
+                    continue
+                if field in snapshots:
+                    previous = snapshots[field]
+                    if (started_at, run_id) <= (previous["started_at"], previous["run_id"]):
+                        continue
+                snapshots[field] = {
+                    "started_at": started_at, "run_id": run_id,
+                    "modules": {path: sorted(reads[path]) if path in reads else None for path in paths},
+                }
+                changed = True
+            if changed:
+                write_text_atomic(cache, json.dumps(snapshots, separators=(",", ":")) + "\n")
+    except (OSError, ValueError, RecursionError) as error:
+        detail = " ".join(str(error).splitlines())
+        print(f"latest module reads not written: {detail}", file=sys.stderr)
+
+
+def update_gate_history(record: Mapping[str, object], modules: Sequence[object]) -> None:
+    """Update the files that the next gate reads."""
+    update_recent_times(record)
+    update_latest_module_reads(record, modules)
 
 
 def _seconds(value: object) -> float:
@@ -320,8 +439,6 @@ def slow_test_s() -> float:
 
 def module_runs(executions: Sequence[Execution], slow_test_s: float) -> list[ModuleRun]:
     """Keep each attempt and select its test times with one threshold."""
-    from scripts.buildlog import store
-
     attempts: dict[tuple[str, str], int] = {}
     modules: list[ModuleRun] = []
     for job in executions:
@@ -387,7 +504,7 @@ def write_gate_run(run: GateRun, executions: Sequence[Execution]) -> None:
     """Append one gate record without failing the caller."""
     try:
         # This import keeps gate_record free of an import cycle with index.py.
-        from scripts.buildlog import record, store
+        from scripts.buildlog import record
 
         epoch = time.time()
         host = store.host_name()
@@ -395,8 +512,8 @@ def write_gate_run(run: GateRun, executions: Sequence[Execution]) -> None:
                                 "id": record.new_id(host, epoch), "host": host, **run,
                                 "tests_run": sum(module["tests_run"] for module in run["modules"])}
         keep_failure_logs(entry["id"], host, epoch, run["modules"], executions)
-        store.append_line(store.host_file(host, epoch), entry)
-        update_recent_times(entry)
+        store.append_line(store.host_file(host, epoch), {**entry, "modules": without_module_reads(run["modules"])})
+        update_gate_history(entry, run["modules"])
     except Exception as error:
         report_not_written(error)
 

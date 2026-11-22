@@ -45,7 +45,7 @@ from scripts.build_queue import admission_records
 from scripts.production import affected_modules
 from scripts.production.gate_modules import GateRefused, discover_test_modules
 from scripts.production import gate
-from scripts.test_times import gate_record, recent_gate_times
+from scripts.test_times import gate_record
 
 
 @dataclass(frozen=True)
@@ -1136,7 +1136,10 @@ def _appended_record(marker: Path, handle: BinaryIO, destination: Path,
 
 
 def import_record(folder: Path, row: dict[str, object]) -> None:
-    record = ledger.mapping(row['record'])
+    transferred = ledger.mapping(row['record'])
+    transferred_modules = cast(list[gate_record.ModuleRun], transferred['modules'])
+    modules = gate_record.without_module_reads(transferred_modules)
+    record = {**transferred, 'modules': modules}
     host = ledger.text(record, 'host')
     if not host or Path(host).name != host or host in ('.', '..'):
         raise ValueError('Invalid remote host')
@@ -1154,17 +1157,18 @@ def import_record(folder: Path, row: dict[str, object]) -> None:
             # An older box names the step merge-gate or targeted-test.
             record = {**record, 'step': gate.SuiteMode.step(ledger.text(record, 'step'))}
             run = gate_box.decode_run(row['gate'])
-            gate_record.keep_failure_logs(record_id, store.CLOUD_GATE_PLACE, at,
-                cast(list[gate_record.ModuleRun], record['modules']), gate_box.execution_records(run))
+            gate_record.keep_failure_logs(record_id, store.CLOUD_GATE_PLACE, at, modules,
+                                          gate_box.execution_records(run))
             store.append_locked(handle, record)
         else:
             record = appended.row
-    recent_gate_times.update_recent_times(record)
+    gate_record.update_gate_history(record, transferred_modules)
     from scripts.buildlog.record import keep_result
     imported: dict[str, object] = {'id': record_id}
     try:
         # The result leaves the checkout: a gate copy is a reused slot.
-        imported['result'] = keep_result(json.dumps(row).encode(), store.CLOUD_GATE_PLACE, at, record_id)
+        retained = {**row, 'record': {**transferred, 'modules': modules}}
+        imported['result'] = keep_result(json.dumps(retained).encode(), store.CLOUD_GATE_PLACE, at, record_id)
     except OSError as error:
         gate_record.report_not_written(error)
     save(folder / 'imported.json', imported)

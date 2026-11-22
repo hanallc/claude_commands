@@ -7,7 +7,6 @@ from __future__ import annotations
 import ast
 from collections import defaultdict
 from collections.abc import Iterator, Sequence
-from contextlib import closing
 from dataclasses import dataclass
 from importlib.metadata import packages_distributions
 from io import BytesIO
@@ -16,7 +15,6 @@ import json
 import os
 import posixpath
 import re
-import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -25,8 +23,8 @@ from typing import cast
 from scripts.lib import conf
 from scripts.test_times.gate_record import (
     ListedDirectory, ModuleReadRecord, NoConfigReadRecord, NoContentReadRecord,
-    NoFolderScanRecord, RecordedConfigReads, RecordedContentReads, RecordedFolderScans,
-    RecursiveDirectory, WholeRepository, module_read_record,
+    NoFolderScanRecord, RecordedContentReads, RecordedFolderScans,
+    RecursiveDirectory, WholeRepository, read_latest_module_reads,
 )
 from scripts.production.gate_modules import is_test_module
 from scripts.style.git_process import GitBlob, parse_status_z, parse_tree_listing, read_batch_blob
@@ -720,53 +718,7 @@ def graph_for_files(repo: Path, paths: set[str], blobs: dict[str, str], dirty: s
 
 def latest_module_reads() -> dict[str, ModuleReadRecord]:
     """Read each field from its newest full, non-aborted gate."""
-    from scripts.buildlog import index
-
-    _ = index.update()
-    with closing(index.read_only()) as connection:
-        rows = cast(list[tuple[str, str, str | None, str | None, str | None]], connection.execute(
-            "WITH latest AS (SELECT "
-            + "(SELECT id FROM gate_runs WHERE selection = 'full' AND aborted = 0 "
-            + "AND EXISTS (SELECT 1 FROM gate_modules AS recorded WHERE recorded.run_id = gate_runs.id "
-            + "AND recorded.config_reads IS NOT NULL) ORDER BY started_at DESC, id DESC LIMIT 1) AS config_gate, "
-            + "(SELECT id FROM gate_runs WHERE selection = 'full' AND aborted = 0 "
-            + "AND EXISTS (SELECT 1 FROM gate_modules AS recorded WHERE recorded.run_id = gate_runs.id "
-            + "AND recorded.folder_scans IS NOT NULL) ORDER BY started_at DESC, id DESC LIMIT 1) AS folder_gate, "
-            + "(SELECT id FROM gate_runs WHERE selection = 'full' AND aborted = 0 "
-            + "AND EXISTS (SELECT 1 FROM gate_modules AS recorded WHERE recorded.run_id = gate_runs.id "
-            + "AND recorded.content_reads IS NOT NULL) ORDER BY started_at DESC, id DESC LIMIT 1) AS content_gate) "
-            + "SELECT suite, module, CASE WHEN run_id = config_gate THEN config_reads END, "
-            + "CASE WHEN run_id = folder_gate THEN folder_scans END, "
-            + "CASE WHEN run_id = content_gate THEN content_reads END FROM gate_modules CROSS JOIN latest "
-            + "WHERE run_id = config_gate OR run_id = folder_gate OR run_id = content_gate ORDER BY suite, module, attempt"
-        ).fetchall())
-    recorded: dict[str, ModuleReadRecord] = {}
-    for suite, module, config_json, folder_json, content_json in rows:
-        path = f"scripts/{suite}/{module}"
-        reads = module_read_record(json.loads(config_json) if config_json is not None else None,
-                                   json.loads(folder_json) if folder_json is not None else None,
-                                   json.loads(content_json) if content_json is not None else None)
-        previous = recorded.get(path, ModuleReadRecord(NoConfigReadRecord(), NoFolderScanRecord(), NoContentReadRecord()))
-        configs = previous.config_reads
-        if isinstance(reads.config_reads, RecordedConfigReads):
-            stems = reads.config_reads.stems
-            if isinstance(configs, RecordedConfigReads):
-                stems |= configs.stems
-            configs = RecordedConfigReads(stems)
-        folders = previous.folder_scans
-        if isinstance(reads.folder_scans, RecordedFolderScans):
-            scans = reads.folder_scans.folders
-            if isinstance(folders, RecordedFolderScans):
-                scans |= folders.folders
-            folders = RecordedFolderScans(scans)
-        contents = previous.content_reads
-        if isinstance(reads.content_reads, RecordedContentReads):
-            paths = reads.content_reads.paths
-            if isinstance(contents, RecordedContentReads):
-                paths |= contents.paths
-            contents = RecordedContentReads(paths)
-        recorded[path] = ModuleReadRecord(configs, folders, contents)
-    return recorded
+    return read_latest_module_reads()
 
 
 def changed_path_parents(repo: Path, changed: set[str], base_paths: set[str]) -> set[str]:
@@ -1026,5 +978,5 @@ def select_affected(repo: Path, base: CertifiedBase | NoCertifiedBase,
                 if any(re.search(rf"\b{re.escape(stem)}\b", text) for stem in stems):
                     selected.append(module)
         return AffectedSelection(base, tuple(sorted(changed)), tuple(selected))
-    except (GraphError, OSError, ValueError, SyntaxError, sqlite3.Error) as error:
+    except (GraphError, OSError, ValueError, SyntaxError) as error:
         return FullSuite(f"graph error: {error}")
