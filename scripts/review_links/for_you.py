@@ -148,8 +148,24 @@ def source_paths() -> tuple[Path, ...]:
         return paths
 
 
+def _comparison_reason(machine: str, changes: Mapping[str, rebuild_row.ComparedChanges], configured: str) -> str:
+    change = changes.get(machine)
+    reason = "The running system differs from the configured system."
+    if change is not None:
+        if change.switch_revision.endswith("-dirty"):
+            return (f"The running system has local changes on {change.switch_revision[:7]}. "
+                    f"It differs from the configured revision {configured[:7]}.")
+        if change.commits:
+            return "\n".join(("Pending commits", *(f"{commit.commit[:7]} {commit.reason}" for commit in change.commits)))
+        reason += f" The running revision is {change.switch_revision[:7]}."
+    if configured:
+        reason += f" The configured revision is {configured[:7]}."
+    return reason
+
+
 def read(config: Path | None = None, *,
-         rebuild: rebuild_row.RebuildAnswer | None = None, members: staff.StaffSnapshot | None = None) -> ForYouSnapshot:
+         rebuild: rebuild_row.RebuildAnswer | None = None, members: staff.StaffSnapshot | None = None,
+         include_comparison_reason: bool = True) -> ForYouSnapshot:
     """Project both stores and the comparison cache without running a rebuild or a refresh."""
     config = rebuild_config() if config is None else config
     unavailable: list[UnavailableSource] = []
@@ -241,6 +257,8 @@ def read(config: Path | None = None, *,
     except (OSError, ValueError, KeyError, TypeError) as error:
         unavailable.append(UnavailableSource("rebuild comparison", str(error)))
 
+    changes = (rebuild_row.read_compared_changes(config, answer)
+               if include_comparison_reason and comparison_current and compared else {})
     machines = {request.machine for request in (*pending, *history)} | set(compared)
     for machine in sorted(machines):
         active = tuple(request for request in pending if request.machine == machine)
@@ -249,14 +267,13 @@ def read(config: Path | None = None, *,
         status: Literal["open", "done", "unknown"] = (
             "open" if active or machine in compared else "done"
             if comparison_current and probes.succeeded(machine) and needs_available else "unknown")
-        current = active if active else completed
         reason = "\n".join(f"{request.reason} Requester: {request.requested_by or 'Not recorded'}. "
-                           + f"Concerns: {request.concerns or 'Not recorded'}." for request in current)
-        if machine in compared:
-            reason = (reason + "\n" if reason else "") + "The running system differs from the configured system."
+                           + f"Concerns: {request.concerns or 'Not recorded'}." for request in active)
+        if include_comparison_reason and machine in compared:
+            reason = (reason + "\n" if reason else "") + _comparison_reason(machine, changes, answer.configured_revision())
         rows.append(ForYouRow(
             f"rebuild/{machine}", "rebuild", f"Rebuild {machine}", "rebuild", machine, working_directories.get(machine, ""),
-            ", ".join(dict.fromkeys(request.requested_by for request in current if request.requested_by)),
+            ", ".join(dict.fromkeys(request.requested_by for request in active if request.requested_by)),
             reason, "; ".join(dict.fromkeys(request.waits for request in active)) or "Not recorded",
             requests[0].created_at if requests else "", status, "automatic",
             "\n".join(request.evidence for request in completed), requests))
@@ -266,7 +283,7 @@ def read(config: Path | None = None, *,
 def global_action_count(rebuild: rebuild_row.RebuildAnswer | None = None) -> str:
     """Return a complete action count or an explicit unavailable result."""
     try:
-        count = read(rebuild_row.DEFAULT_CONFIG, rebuild=rebuild).open_count
+        count = read(rebuild_row.DEFAULT_CONFIG, rebuild=rebuild, include_comparison_reason=False).open_count
     except (OSError, ValueError):
         return "unavailable"
     return str(count.value) if isinstance(count, KnownOpenCount) else "unavailable"

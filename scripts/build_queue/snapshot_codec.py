@@ -256,7 +256,9 @@ def legacy_pressure_shape(record: dict[str, object]) -> dict[str, object]:
 GPU_SLOT_SUFFIX = "_gpu_slot"
 NATEDEV_HOLD_SUFFIX = "_natedev_hold"
 CARGO_FOLDER_SUFFIX = "_cargo_folder"
-LEGACY_WAIT_SUFFIXES = (GPU_SLOT_SUFFIX, NATEDEV_HOLD_SUFFIX, CARGO_FOLDER_SUFFIX)
+BUILD_SPACE_SUFFIX = "_build_space"
+RUN_LIMIT_SUFFIX = "_run_limit"
+LEGACY_WAIT_SUFFIXES = (GPU_SLOT_SUFFIX, NATEDEV_HOLD_SUFFIX, CARGO_FOLDER_SUFFIX, BUILD_SPACE_SUFFIX, RUN_LIMIT_SUFFIX)
 
 
 @lru_cache(maxsize=None)
@@ -280,10 +282,15 @@ def legacy_wait_shape(schema: type, record: dict[str, object]) -> dict[str, obje
         wait = cast(dict[str, object], item)
         if wait.get("kind") == "GpuSlotWait":
             head, suffix = f"the GPU test slot ({wait['used']} of {wait['slots']} in use)", GPU_SLOT_SUFFIX
+        elif wait.get("kind") == "RunLimitWait":
+            head = f"{wait['used']} of {wait['limit']} {wait['repository']} runs on {wait['machine']}"
+            suffix = RUN_LIMIT_SUFFIX
         elif wait.get("kind") == "NatedevHeld":
             head, suffix = f"the natedev hold by {wait['holder']} for {wait['purpose']}", NATEDEV_HOLD_SUFFIX
         elif wait.get("kind") == "CargoFolderWait":
             head, suffix = "the build in the same Cargo folder", CARGO_FOLDER_SUFFIX
+        elif wait.get("kind") in ("BuildSpaceLow", "BuildSpaceUnreadable"):
+            head, suffix = "the build space floor", BUILD_SPACE_SUFFIX
         else:
             continue
         shaped[key] = {"kind": "BehindHead", "head_name": head, "joined_at": 0.0, "head_session_id": ""}

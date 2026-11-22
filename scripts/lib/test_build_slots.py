@@ -1,9 +1,11 @@
 """Repository slots retain work, reuse files, and enforce their locks."""
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import AbstractContextManager, redirect_stderr, redirect_stdout
 from collections.abc import Callable, Sequence
 from datetime import UTC, datetime, timedelta
+import fcntl
 import io
 import json
 import os
@@ -14,11 +16,12 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 from typing import cast, override
 import unittest
 from unittest import mock
 
-from scripts.lib import build_folders, build_slots, copy_record, git_rescue, scratch
+from scripts.lib import build_folders, build_slots, copy_record, file_lock, git_rescue, scratch
 from scripts.copies import copies
 from scripts.lib.build_slots_test_support import UseDefaultMaximum, private_slot_config
 from scripts.lib.descendants import adopt_descendants
@@ -318,6 +321,77 @@ class BuildSlotsTests(unittest.TestCase):
             with self.subTest(number=number), self.assertRaises(ValueError), exact(number):
                 self.fail('The request exceeded its configured pool')
         self.assertFalse((self.slot_root / 'widget-slot3').exists())
+
+    def test_two_slots_share_one_git_config_migration(self) -> None:
+        common = self.source / ".git"
+        lock_path = common / "build-copy-config.lock"
+        first_read, resume_first = threading.Event(), threading.Event()
+        git = cast(Callable[..., str], getattr(build_slots, "_git"))
+        flock = fcntl.flock
+
+        def pause_after_read(folder: Path, *arguments: str, pass_fds: Sequence[int] = (),
+                             accepted: tuple[int, ...] = (0,)) -> str:
+            result = git(folder, *arguments, pass_fds=pass_fds, accepted=accepted)
+            if folder == self.slot_root / "widget-slot1" and arguments == ("config", "--local", "--get", "core.bare"):
+                first_read.set()
+                self.assertTrue(resume_first.wait(TEST_HANG_GUARD_SECS), "The second caller did not reach the migration.")
+            return result
+
+        def observe_contention(descriptor: int, mode: int) -> None:
+            # Resume the first caller when the real lock makes the second caller wait.
+            if mode == fcntl.LOCK_EX and lock_path.exists() and os.path.samestat(os.fstat(descriptor), lock_path.stat()):
+                try:
+                    flock(descriptor, mode | fcntl.LOCK_NB)
+                    return
+                except BlockingIOError:
+                    resume_first.set()
+            flock(descriptor, mode)
+
+        def take(number: int) -> Path:
+            with build_slots.take_slot(self.source, self.base, showrunner="builds", unit="queue",
+                    work="proof", purpose="test", selection=build_slots.ExactSlotRequest(number)) as slot:
+                return slot.path
+
+        with (mock.patch.object(build_slots, "_git", side_effect=pause_after_read),
+              mock.patch.object(fcntl, "flock", new=observe_contention),
+              ThreadPoolExecutor(max_workers=1) as worker):
+            first = worker.submit(take, 1)
+            try:
+                self.assertTrue(first_read.wait(TEST_HANG_GUARD_SECS), "The first caller did not read core.bare.")
+                second_path = take(2)
+            finally:
+                resume_first.set()
+            first_path = first.result(timeout=TEST_HANG_GUARD_SECS)
+
+        self.assertEqual((first_path, second_path), (self.slot_root / "widget-slot1", self.slot_root / "widget-slot2"))
+        self.assertEqual(self.git(self.source, "config", "--local", "--get-all", "extensions.worktreeConfig"), "true")
+        self.assertNotIn("core.bare=", self.git(self.source, "config", "--local", "--list"))
+        self.assertEqual(self.git(self.source, "config", "--file", str(common / "config.worktree"),
+                                  "--get-all", "core.bare"), "false")
+
+    def test_git_inherits_the_shared_lock_during_worktree_config_migration(self) -> None:
+        lock_path = self.source / ".git/build-copy-config.lock"
+        git = cast(Callable[..., str], getattr(build_slots, "_git"))
+        locked_commands: list[tuple[str, ...]] = []
+
+        def observe_git(folder: Path, *arguments: str, pass_fds: Sequence[int] = (),
+                        accepted: tuple[int, ...] = (0,)) -> str:
+            if lock_path.exists():
+                contender = file_lock.take_exclusive(lock_path)
+                if isinstance(contender, file_lock.ExclusiveLock):
+                    contender.close()
+                else:
+                    lock_stat = lock_path.stat()
+                    self.assertTrue(any(os.path.samestat(os.fstat(fd), lock_stat) for fd in pass_fds),
+                                    f"Git did not inherit the shared lock: {arguments}")
+                    locked_commands.append(arguments)
+            return git(folder, *arguments, pass_fds=pass_fds, accepted=accepted)
+
+        with mock.patch.object(build_slots, "_git", side_effect=observe_git), self.take():
+            pass
+
+        self.assertIn(("config", "--local", "--unset", "core.bare"), locked_commands)
+        self.assertIn(("config", "--local", "extensions.worktreeConfig", "true"), locked_commands)
 
     def test_repository_limit_uses_own_or_default_maximum_without_output(self) -> None:
         for maximum in (1, UseDefaultMaximum()):
