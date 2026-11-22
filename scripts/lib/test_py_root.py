@@ -42,7 +42,6 @@ def load_tests(loader, tests, pattern):
     return tests
 '''
 COPY_TARGETED_RUN = COPY_IMPORT_AUDIT + '''
-import runpy
 from unittest import mock
 from scripts.production import gate
 root = Path(os.environ['EXPECTED_CHECKOUT'])
@@ -56,7 +55,7 @@ def selected_suite(repo, *args, **kwargs):
 sys.argv = [str(root / 'scripts/production/gate.py'), '--affected', '--repo', str(root)]
 with mock.patch.object(gate, 'run_gate_suites', side_effect=selected_suite):
     try:
-        runpy.run_path(sys.argv[0], run_name='__main__')
+        raise SystemExit(gate.main())
     finally:
         audit()
 '''
