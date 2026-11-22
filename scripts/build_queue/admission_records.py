@@ -103,6 +103,7 @@ class SavedPlacementAssignment:
         placement.UnknownAssignedSettingsGeneration())
     refusal_settings: RefusalSettings | NoRefusalSettings = NoRefusalSettings()
     remote_start_hold: RemoteStartHold | RemoteStartHoldUnrecorded | RemoteStartHoldEnded = RemoteStartHoldUnrecorded()
+    placement_candidates: tuple[placement.CandidateEligibility, ...] = ()
 
 # Historical multiplier for saved dev bases from the Phase 24 replay.
 DEV_HEADROOM = 4.2034275337646125
@@ -1143,6 +1144,13 @@ class WaitingStep:
     placement_candidates: tuple[placement.CandidateEligibility, ...] = field(default=(), kw_only=True)
 
 
+class ConfirmedGuestRun(TypedDict):
+    """Identify a confirmed Mac Linux attempt in a queue reading."""
+
+    target: Literal["mac-linux"]
+    attempt: str
+
+
 @dataclass(frozen=True)
 class RunningStep:
     """The running step holds its caller, memory charge, and execution evidence."""
@@ -1161,6 +1169,7 @@ class RunningStep:
     assignment_host: str = ""
     assignment_target: str = field(default="", kw_only=True)
     placement_candidates: tuple[placement.CandidateEligibility, ...] = field(default=(), kw_only=True)
+    confirmed_guest_run: ConfirmedGuestRun | None = field(default=None, kw_only=True)
     mac_placement: str = field(default="", kw_only=True)
     package: str | PackageNotRecorded = field(default=PackageNotRecorded(), kw_only=True)
     route: StepRoute = field(default=DIRECT_CARGO, kw_only=True)

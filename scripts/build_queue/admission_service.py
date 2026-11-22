@@ -149,6 +149,38 @@ READING_ALERT_KEY = "build-admission-reading"
 PlacementEvidenceKeys = dict[tuple[str, placement.PlacementDestination], placement.HostEvidenceKey | placement.EvidenceNeeded]
 
 
+PLACEMENT_REASON_TEXT = {
+    "mac_linux_off": "the guest is off",
+    "mac_linux_unregistered": "the guest has no queue registration",
+    "mac_linux_settings_unreadable": "the guest settings are unreadable or invalid",
+    "mac_linux_backoff_unreadable": "the guest backoff record is unreadable or invalid",
+    "mac_linux_backoff": "the guest is in retry backoff",
+    "mac_linux_reading_required": "the queue needs a newer guest reading",
+    "mac_linux_no_answer": "the Mac does not answer",
+    "busy": "the target is busy",
+    "off": "the target is off",
+    "disk": "the target needs more disk space",
+    "command": "the target does not support this command",
+    "repo": "the target does not support this repository",
+    "linux_only": "this step runs only on Linux",
+    "offload_exclude": "the target excludes this step",
+}
+
+
+def confirmed_guest_run(assignment: placement.PlacementAssignment,
+                        evidence: execution_identity.ExecutionEvidence) -> records.ConfirmedGuestRun | None:
+    """Use execution evidence that matches the assigned guest and attempt."""
+    destination = assignment.destination
+    if (destination.target != "mac-linux" or destination.provider != "ssh"
+            or not assignment.attempt or not isinstance(evidence, execution_identity.ObservedExecution)):
+        return None
+    identity = evidence.identity
+    matches = (identity.host == destination.host and identity.pid > 0 and bool(identity.start_time)
+               if isinstance(identity, execution_identity.ProcessExecution)
+               else (identity.target, identity.attempt) == (destination.target, assignment.attempt))
+    return {"target": "mac-linux", "attempt": assignment.attempt} if matches else None
+
+
 @dataclass(frozen=True)
 class MacLinuxReadyForProbe:
     """The guest is enabled and its backoff permits a reading."""
@@ -2875,16 +2907,32 @@ class AdmissionServer:
             tuple(rows), slots, cloud_gate_stale_pushes=configuration.cloud_gate_stale_pushes)
 
     def _placement_wait_reading(self, reading: records.QueueRead) -> records.QueueRead:
-        candidates = reading.explanation.decided_from.placement_candidates
+        candidates = dict(reading.explanation.decided_from.placement_candidates)
+        for verify in self.verify_run_waiters.values():
+            episode = verify.request.placement_episode
+            request = self.placement_requests.get(episode)
+            if request is None:
+                continue
+            saved = self.assignments.get(self.current_assignments.get(episode, ""))
+            named = saved.placement_candidates if saved is not None else ()
+            candidates[records.waiter_owner(verify.row)] = named or self._placement_candidate_reading(request)
         if not candidates:
             return reading
-        waiting = [replace(step, placement_candidates=candidates.get(records.waiter_owner(row), ()))
-                   for step, (_, row) in zip(reading.view.waiting, reading.ordered, strict=True)]
+        published = {(step.pid, step.since): named
+                     for step, (_, row) in zip(reading.view.waiting, reading.ordered, strict=True)
+                     if (named := candidates.get(records.waiter_owner(row), ()))}
+
+        def with_candidates(step: records.WaitingStep) -> records.WaitingStep:
+            named = published.get((step.pid, step.since), ())
+            return replace(step, placement_candidates=named) if named else step
+
+        waiting = [with_candidates(step) for step in reading.view.waiting]
         ordered = list(reading.ordered)
         represented = {records.waiter_owner(row) for _, row in ordered}
         for path, row in self._queue_order()[0]:
             owner = records.waiter_owner(row)
-            if owner in represented or owner not in candidates:
+            if owner in represented or not any(candidate.destination.target == "mac-linux"
+                                               for candidate in candidates.get(owner, ())):
                 continue
             represented.add(owner)
             waiting.append(records.WaitingStep(row["pid"], row.get("session_id", ""), row.get("session_name", ""),
@@ -2894,10 +2942,35 @@ class AdmissionServer:
                 route=records.waiter_route(row), verify=row.get("verify", records.NotVerifyCall()),
                 job=row.get("job", GATE_JOB_NOT_RECORDED), placement_candidates=candidates[owner]))
             ordered.append((path, row))
-        return replace(reading, view=replace(reading.view, waiting=tuple(waiting)), ordered=ordered)
+        head, line = reading.explanation.head, reading.explanation.line
+        if isinstance(head, records.HeadExplanation):
+            head = replace(head, waiter=with_candidates(head.waiter))
+        line = replace(line, steps=tuple(replace(entry, waiter=with_candidates(entry.waiter)) for entry in line.steps))
+        return replace(reading, view=replace(reading.view, waiting=tuple(waiting)), ordered=ordered,
+                       explanation=replace(reading.explanation, head=head, line=line))
+
+    def _local_placement_reading(self, reading: records.QueueRead) -> records.QueueRead:
+        candidates: dict[str, tuple[placement.CandidateEligibility, ...]] = {}
+        for episode, record in self.reservations.items():
+            request = self.placement_requests.get(episode)
+            assignment = self.assignments.get(self.current_assignments.get(episode, ""))
+            if (request is not None and assignment is not None
+                    and assignment.assignment.destination.provider == "local"):
+                candidates[record.reservation_id] = assignment.placement_candidates or self._placement_candidate_reading(request)
+        if not candidates:
+            return reading
+        reservations = iter(reading.explanation.decided_from.reservations)
+        running: list[records.RunningStep] = []
+        explained: list[records.ExplainedRunningStep] = []
+        for step, entry in zip(reading.view.running, reading.explanation.running, strict=True):
+            named = candidates.get(next(reservations)["reservation_id"], ()) if gate.running_has_reservation(step) else ()
+            running.append(replace(step, placement_candidates=named) if named else step)
+            explained.append(replace(entry, step=replace(entry.step, placement_candidates=named)) if named else entry)
+        return replace(reading, view=replace(reading.view, running=tuple(running)),
+                       explanation=replace(reading.explanation, running=tuple(explained)))
 
     def _placement_reading(self, reading: records.QueueRead) -> records.QueueRead:
-        reading = self._placement_wait_reading(reading)
+        reading = self._local_placement_reading(self._placement_wait_reading(reading))
         remote: list[records.RunningStep] = []
         waiting_episodes = {waiting.request.placement_episode for waiting in self.verify_run_waiters.values()}
         for key, saved in self.assignments.items():
@@ -2926,6 +2999,10 @@ class AdmissionServer:
                 continue
             identity = request.identity
             guest = assignment.destination.target == "mac-linux"
+            confirmed = (confirmed_guest_run(assignment, evidence)
+                         if isinstance(saved.permission, placement.PermissionConsumed)
+                         and self.current_assignments.get(assignment.episode) == key
+                         and isinstance(saved.state, placement.CurrentAssignment) else None)
             pid: int | records.PidNotRecorded = records.PidNotRecorded()
             if isinstance(evidence, execution_identity.ObservedExecution) and isinstance(evidence.identity, execution_identity.ProcessExecution):
                 pid = evidence.identity.pid
@@ -2935,10 +3012,11 @@ class AdmissionServer:
                 unit=identity.unit, project=gate.step_project(request.profile.repo), execution=evidence,
                 assignment_host=assignment.destination.host, verify=identity.verify,
                 assignment_target=assignment.destination.target if guest else "",
-                placement_candidates=self._guest_candidate_reading(request) if guest else (),
+                placement_candidates=saved.placement_candidates or self._placement_candidate_reading(request),
+                confirmed_guest_run=confirmed,
                 route=request.route if guest else records.DIRECT_CARGO, job=identity.job if guest else GATE_JOB_NOT_RECORDED,
                 mac_placement=f"{assignment.episode}/{assignment.attempt}"
-                    if assignment.destination.provider == "mac" else ""))
+                    if assignment.destination.provider == "mac" or confirmed is not None else ""))
         if not remote:
             return reading
         explained = tuple(records.ExplainedRunningStep(step, records.AdmissionTimeNotRecorded(), 0, 0, 0,
@@ -3998,7 +4076,7 @@ done
                 else records.RemoteStartHoldUnrecorded())
         self.assignments[key] = records.SavedPlacementAssignment(assignment,
             assigned_settings_generation=placement.AssignedSettingsGeneration(evidence_key.configuration_generation),
-            remote_start_hold=hold)
+            remote_start_hold=hold, placement_candidates=self._placement_candidate_reading(request))
         self.current_assignments[request.episode] = key
         return assignment
 
@@ -4150,18 +4228,18 @@ done
                          if isinstance(record.place, wire.LocalPlace)
                          and isinstance(record.cargo_folder, placement.CargoFolder))
 
-    def _guest_candidate_reading(self, request: wire.PlacementRequest) -> tuple[placement.CandidateEligibility, ...]:
-        """Keep the named destinations and their eligibility in a queue reading."""
+    def _placement_candidate_reading(self, request: wire.PlacementRequest) -> tuple[placement.CandidateEligibility, ...]:
+        """Keep the named destinations in order and give their plain reasons."""
         candidates = self.placement_eligibility.get(request.episode)
         if candidates is None:
             candidates = tuple(placement.CandidateEligibility(candidate.destination,
                 placement.EvidenceNeeded("the target reading is unavailable")
                     if isinstance(candidate.eligibility, placement.AllowedHost) else candidate.eligibility)
                 for candidate in request.constraints.candidates)
-        selection = request.constraints.selection
-        if isinstance(selection, placement.PinnedHost):
-            candidates = tuple(candidate for candidate in candidates if candidate.destination.target == selection.target)
-        return candidates if any(candidate.destination.target == "mac-linux" for candidate in candidates) else ()
+        return tuple(replace(candidate, eligibility=replace(state, reason=reason))
+                     if not isinstance(state := candidate.eligibility, placement.AllowedHost)
+                     and (reason := PLACEMENT_REASON_TEXT.get(state.reason)) is not None else candidate
+                     for candidate in candidates)
 
     def _placement_pass(self, inputs: records.QueueInputs, policy: records.AdmissionPolicy,
                         remote_start_hold_seconds: int) -> records.QueueInputs:
@@ -4272,7 +4350,7 @@ done
         self.placement_hold_answers = answers
         local_order = (inputs.waiter_orders.keys() | pending_remote_starts) - removed
         named = {owner: candidates for owner, request in owners.items()
-                 if self._placement_waiting(request) and (candidates := self._guest_candidate_reading(request))}
+                 if self._placement_waiting(request) and (candidates := self._placement_candidate_reading(request))}
         return replace(inputs, ordered=[(path, row) for path, row in ordered
             if records.waiter_owner(row) in local_order], slots=tuple(self.slots.values()), cargo_folders=cargo_folders,
             pending_remote_starts=frozenset(pending_remote_starts), placement_candidates=named)
@@ -4663,7 +4741,9 @@ done
                 and request.claim.episode == assignment.episode and request.claim.attempt == assignment.attempt
                 and request.claim.provider == assignment.destination.provider
                 and request.claim.target == assignment.destination.target and request.claim.scope == assignment.destination.scope):
-            self.execution_evidence[key] = request.evidence
+            if (assignment.destination.target != "mac-linux" or isinstance(saved.permission, placement.PermissionConsumed)
+                    or not isinstance(request.evidence, execution_identity.ObservedExecution)):
+                self.execution_evidence[key] = request.evidence
             outcome = request.outcome
             if (isinstance(outcome, (placement.AttemptCompleted, placement.AttemptDeclined, placement.AttemptCancelled))
                     or isinstance(outcome, (placement.PrelaunchRefused, execution_identity.HanaCommandAdmissionRefused))
