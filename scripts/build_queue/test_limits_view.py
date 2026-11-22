@@ -257,11 +257,13 @@ class BuildLimitsTests(unittest.TestCase):
 
         def show(*reservations: records.Reservation, waits: tuple[limits_view.VisibleWait, ...] = (),
                  origins: limits_view.Origins = saved.origins,
-                 run_limits: records.RepositoryRunLimits = policy) -> limits_view.BuildLimits:
-            reading = replace(queue, explanation=replace(queue.explanation,
+                 run_limits: records.RepositoryRunLimits = policy,
+                 history: frozenset[str] | limits_view.ReadingState = saved.history,
+                 ordered: list[tuple[Path, records.RankedWaiter]] = queue.ordered) -> limits_view.BuildLimits:
+            reading = replace(queue, ordered=ordered, explanation=replace(queue.explanation,
                 policy=replace(queue.explanation.policy, repository_runs=run_limits),
                 decided_from=replace(queue.explanation.decided_from, reservations=reservations)))
-            return limits_view.build_limits(reading, (), waits, {}, {}, replace(saved, origins=origins), UTC)
+            return limits_view.build_limits(reading, (), waits, {}, {}, replace(saved, origins=origins, history=history), UTC)
 
         def project(shown: limits_view.BuildLimits) -> limits_view.Cell:
             return next(row.natedev for row in shown.repositories if row.name == "project")
@@ -285,11 +287,17 @@ class BuildLimitsTests(unittest.TestCase):
         with_history_key = replace(policy, by_machine_and_repository={
             **policy.by_machine_and_repository, f"natedev.{history_key}": 1,
         })
-        historical = show(first, run_limits=with_history_key)
-        self.assertIsNone(project(historical).limit)
-        meters = {metric.label: (metric.used, metric.limit) for metric in historical.natedev.shared}
-        self.assertEqual(meters["project run limit"], (1, 2))
-        self.assertEqual(meters["example.invalid/other/project run limit"], (0, 1))
+        for history in (saved.history, frozenset[str](), limits_view.ReadingState.UNAVAILABLE):
+            with self.subTest(history=history):
+                historical = show(first, run_limits=with_history_key, history=history)
+                self.assertIsNone(project(historical).limit)
+                meters = {metric.label: (metric.used, metric.limit) for metric in historical.natedev.shared}
+                self.assertEqual(meters["project run limit"], (1, 2))
+                self.assertEqual(meters["example.invalid/other/project run limit"], (0, 1))
+        origin_only = records.RepositoryRunLimits({f"natedev.{history_key}": 1})
+        origin_cell = project(show(first, run_limits=origin_only, history=limits_view.ReadingState.OMITTED))
+        self.assertEqual((origin_cell.policy, origin_cell.used, origin_cell.limit),
+                         (limits_view.CellPolicy.CONFIGURED, 0, 1))
 
         folder = queue.view.waiting[0].folder
         wait_only = limit_wait(1, "project-local", 1, "Alias wait", folder=folder)
@@ -305,6 +313,14 @@ class BuildLimitsTests(unittest.TestCase):
         })
         meters = {metric.label: (metric.used, metric.limit) for metric in only_wait.natedev.shared}
         self.assertEqual(meters["project run limit"], (1, 2))
+        ranked: records.RankedWaiter = {**queue.ordered[0][1], "folder": folder, "repo_identity": primary}
+        ordered = [(Path("waiter"), ranked)]
+        recorded = show(first, waits=(wait_only,), ordered=ordered, origins=limits_view.Origins())
+        self.assertEqual(project(recorded).waits, project(only_wait).waits)
+        changed_origin = limits_view.Origins(resolved={folder: second_origin})
+        conflict = show(first, waits=(wait_only,), ordered=ordered, origins=changed_origin)
+        self.assertEqual(conflict.natedev.waits, project(only_wait).waits)
+        self.assertFalse(any(row.natedev.waits for row in conflict.repositories))
         fork_gate: records.Reservation = {**fixture_reservation(505, 0, step="gate"), "repo": "project",
                                           "repo_identity": fork, "unit": "fork-owner"}
         joined = project(show(first, fork_gate))
@@ -363,7 +379,7 @@ class BuildLimitsTests(unittest.TestCase):
             **first, "step": "check", "repo": "project-local", "repo_identity": "https://example.invalid/team/upstream",
         }).repositories if row.name == "upstream")
         self.assertEqual((unrestricted.used, unrestricted.limit, unrestricted.other_used, unrestricted.policy),
-                         (0, 1, 1, limits_view.CellPolicy.CONFIGURED))
+                         (None, None, 1, limits_view.CellPolicy.CONFIGURED))
 
     def check_page(self, shown: limits_view.BuildLimits) -> None:
         rendered = test_memory_hover.MemoryHoverTests().page_expression(
@@ -439,11 +455,29 @@ class BuildLimitsTests(unittest.TestCase):
         gate = replace(queue.cloud[0], wait=records.ReadyForAdmission(),
                        identity=replace(queue.cloud[0].identity, folder=folder))
         cloud_queue = replace(queue, cloud=(gate,))
+        origins = limits_view.Origins(resolved={folder: origin})
+
+        def aws_cells(routes: limits_view.AwsRoutes | limits_view.ReadingState,
+                      occupancy: Mapping[limits_view.HanaRoute, int | limits_view.ReadingState]
+                      | limits_view.ReadingState) -> dict[str, limits_view.Cell]:
+            saved = limits_view.background(frozenset[str](), shown.aws_money, 1, routes, occupancy, origins)
+            limits = limits_view.build_limits(cloud_queue, (), (), {}, {}, saved, UTC)
+            return {row.name: row.aws for row in limits.repositories}
+
+        for missing in limits_view.ReadingState:
+            with self.subTest(routes=missing):
+                self.assertEqual(aws_cells(missing, missing)["hana"], limits_view.Cell())
+        cloud_only = aws_cells(limits_view.AwsRoutes(), limits_view.ReadingState.OMITTED)["hana"]
+        self.assertEqual((cloud_only.policy, cloud_only.used, cloud_only.runs, cloud_only.other_used),
+                         (limits_view.CellPolicy.NO_LIMIT, 1, ["hana"], 0))
         for alias_used in (0, 1):
             with self.subTest(alias_used=alias_used):
-                saved = limits_view.background(frozenset[str](), shown.aws_money, 1, both,
-                                               {route: 0, alias: alias_used}, limits_view.Origins(resolved={folder: origin}))
-                limits = limits_view.build_limits(cloud_queue, (), (), {}, {}, saved, UTC)
-                cell = next(row.aws for row in limits.repositories if row.name == "hana")
+                cell = aws_cells(both, {route: 0, alias: alias_used})["hana"]
                 self.assertEqual((cell.used, cell.limit), (0, 1) if alias_used == 0 else (None, None))
                 self.assertEqual(cell.other_used, 1)
+        other = replace(alias, settings=replace(policy, repository_key="https://example.invalid/team/other"))
+        across_rows = replace(both, hana=(route, other))
+        cells = aws_cells(across_rows, {route: 0, other: 0})
+        for name in ("hana", "other"):
+            self.assertEqual((cells[name].policy, cells[name].used, cells[name].limit),
+                             (limits_view.CellPolicy.UNRESOLVED, None, None))

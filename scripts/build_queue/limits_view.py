@@ -324,10 +324,9 @@ class Background:
     history: frozenset[str] | ReadingState
     aws_money: Metric
     cloud_slots: int | ReadingState = ReadingState.OMITTED
-    hana: tuple[HanaCapacity, ...] = ()
+    hana: tuple[HanaCapacity, ...] | ReadingState = ReadingState.OMITTED
     aws_targets: frozenset[str] = field(default_factory=frozenset[str])
     origins: Origins = field(default_factory=Origins)
-    aws_routes_unavailable: bool = False
 
 
 def hana_use(target: str, transport: HanaControlTransport, policy: hana_placement.EnabledHanaRoute) -> int | ReadingState:
@@ -448,14 +447,14 @@ def background(history: frozenset[str] | ReadingState, money: Metric | ReadingSt
                origins: Origins | ReadingState) -> Background:
     """Keep the facts available from each independent source."""
     aws = AwsRoutes() if isinstance(routes, ReadingState) else routes
-    hana = tuple(HanaCapacity(route.settings.repository_key, route.settings.max_steps,
-                             occupancy if isinstance(occupancy, ReadingState)
-                             else occupancy.get(route, ReadingState.OMITTED)) for route in aws.hana)
+    hana = (routes if isinstance(routes, ReadingState) else
+            tuple(HanaCapacity(route.settings.repository_key, route.settings.max_steps,
+                               occupancy if isinstance(occupancy, ReadingState)
+                               else occupancy.get(route, ReadingState.OMITTED)) for route in routes.hana))
     spend_metric = Metric("money", None, None, "USD", unreadable=money is ReadingState.UNAVAILABLE)
     return Background(history, spend_metric if isinstance(money, ReadingState) else money,
                       cloud_slots, hana, aws.targets,
-                      Origins() if isinstance(origins, ReadingState) else origins,
-                      routes is ReadingState.UNAVAILABLE)
+                      Origins() if isinstance(origins, ReadingState) else origins)
 
 
 def background_once(now: float, reading: records.QueueRead) -> Background:
@@ -661,7 +660,8 @@ def build_limits(reading: records.QueueRead, snapshots: target_availability.Snap
         name = short_name(origin)
         if name:
             keys = keys_by_row.setdefault(name, set())
-            keys.update(key for key in (name, origin, repository_key) if key in local_limits)
+            if repository_key in local_limits:
+                keys.add(repository_key)
             _ = row(name)
         elif repository_key in local_limits:
             # The checkout can match any row, even one with a known key.
@@ -670,6 +670,12 @@ def build_limits(reading: records.QueueRead, snapshots: target_availability.Snap
 
     def remote_wait(machine: str) -> WaitGroups:
         return aws_waits if machine in saved.aws_targets else unplaced
+
+    for key in local_limits:
+        origin = recorded_origin(key)
+        name = short_name(origin) if origin else policy_label(key)
+        if name:
+            keys_by_row.setdefault(name, set()).add(key)
 
     for origin in history:
         _ = observe_local(origin)
@@ -712,6 +718,8 @@ def build_limits(reading: records.QueueRead, snapshots: target_availability.Snap
     policy_wait_indices: dict[str, int] = {}
     local_policy_waits: list[LocalPolicyWait] = []
     gpu_wait_counts: set[tuple[int, int]] = set()
+    waiting_origins = {(waiter["pid"], waiter["since"]): origin for _, waiter in reading.ordered
+                       if (origin := recorded_origin(waiter.get("repo_identity", "")))}
 
     def record_wait(destination: WaitGroups, reason: records.WaitReason, name: str) -> None:
         # Keep each policy group separate without publishing private keys.
@@ -739,7 +747,9 @@ def build_limits(reading: records.QueueRead, snapshots: target_availability.Snap
             destination = remote_wait(pinned)
         elif isinstance(reason, records.RunLimitWait) and reason.machine == local:
             repository_wait_counts.setdefault(reason.repository, set()).add((reason.used, reason.limit))
-            origin = origins.resolve("", step.folder)
+            recorded = waiting_origins.get((step.pid, step.since), "")
+            checkout = origins.resolve("", step.folder)
+            origin = "" if recorded and checkout and recorded != checkout else recorded or checkout
             name = observe_local(origin, reason.repository)
             local_policy_waits.append(LocalPolicyWait(reason, name, visible.name))
             continue
@@ -761,6 +771,43 @@ def build_limits(reading: records.QueueRead, snapshots: target_availability.Snap
                        if waiting.repository and not unresolved_policy else local_waits)
         record_wait(destination, waiting.reason, waiting.name)
 
+    cloud_slots = saved.cloud_slots
+    cloud_used = cloud_waiting = 0
+    if isinstance(reading, wire.CloudQueueRead) and reading.cloud:
+        cloud_slots = reading.cloud_slots
+        for cloud in reading.cloud:
+            if isinstance(cloud.wait, wire.CloudSlotWait):
+                if isinstance(cloud.wait.state, ReservedCloudSlot):
+                    cloud_used += 1
+                    cloud_waiting += 1
+                continue
+            cloud_used += 1
+            origin = origins.resolve("", cloud.identity.folder)
+            if name := short_name(origin):
+                cell = row(name).aws
+                if isinstance(saved.hana, ReadingState):
+                    continue
+                cell.policy = CellPolicy.NO_LIMIT
+                cell.other_used += 1
+                label = clean_label(cloud_names.get(cloud.owner, ""), cloud.identity.unit, name)
+                if label:
+                    cell.other.append(label)
+                cell.note = PAGE_WORDS["uses_cloud"]
+
+    # Every Hana target uses the same AWS lifecycle controller.
+    hana = () if isinstance(saved.hana, ReadingState) else tuple(dict.fromkeys(saved.hana))
+    for capacity in hana:
+        if name := short_name(recorded_origin(capacity.repository)):
+            cell = row(name).aws
+            if len(hana) != 1:
+                cell.policy = CellPolicy.UNRESOLVED
+                continue
+            cell.policy = CellPolicy.CONFIGURED
+            cell.limit = capacity.limit
+            cell.used = capacity.used if isinstance(capacity.used, int) else None
+            if capacity.used is ReadingState.UNAVAILABLE:
+                cell.note = PAGE_WORDS["not_available"]
+
     shared: list[Metric] = []
     for repository_key, limit in local_limits.items():
         owners = occupancy.get(repository_key, set[str]())
@@ -779,67 +826,28 @@ def build_limits(reading: records.QueueRead, snapshots: target_availability.Snap
         if used - limit > len(merge_above):
             continue
         name = bound_rows.get(repository_key, "")
-        if unresolved_policy or not name or len(keys_by_row[name]) > 1:
+        if unresolved_policy or name not in rows or len(keys_by_row[name]) > 1:
             key_label = policy_label(repository_key)
             label = PAGE_WORDS["policy_key"].format(name=key_label) if key_label else PAGE_WORDS["repository_run_limit"]
             shared.append(Metric(label, used, limit, exempt_runs=len(merge_above)))
             continue
-        cell = row(name).natedev
+        cell = rows[name].natedev
         cell.limit, cell.used = limit, used
         cell.runs, cell.merge_above = runs, merge_above
 
-    cloud_slots = saved.cloud_slots
-    cloud_used = cloud_waiting = 0
-    if isinstance(reading, wire.CloudQueueRead) and reading.cloud:
-        cloud_slots = reading.cloud_slots
-        for cloud in reading.cloud:
-            if isinstance(cloud.wait, wire.CloudSlotWait):
-                if isinstance(cloud.wait.state, ReservedCloudSlot):
-                    cloud_used += 1
-                    cloud_waiting += 1
-                continue
-            cloud_used += 1
-            origin = origins.resolve("", cloud.identity.folder)
-            if name := short_name(origin):
-                cell = row(name).aws
-                cell.policy = CellPolicy.NO_LIMIT
-                cell.other_used += 1
-                label = clean_label(cloud_names.get(cloud.owner, ""), cloud.identity.unit, name)
-                if label:
-                    cell.other.append(label)
-                cell.note = PAGE_WORDS["uses_cloud"]
-
-    # Every Hana target uses the same AWS lifecycle controller.
-    hana_by_name: dict[str, set[HanaCapacity]] = {}
-    for capacity in saved.hana:
-        if name := short_name(recorded_origin(capacity.repository)):
-            hana_by_name.setdefault(name, set()).add(capacity)
-    for name, capacities in hana_by_name.items():
-        cell = row(name).aws
-        if len(capacities) != 1:
-            cell.policy = CellPolicy.UNRESOLVED
-            continue
-        capacity = next(iter(capacities))
-        cell.policy = CellPolicy.CONFIGURED
-        cell.limit = capacity.limit
-        cell.used = capacity.used if isinstance(capacity.used, int) else None
-        if capacity.used is ReadingState.UNAVAILABLE:
-            cell.note = PAGE_WORDS["not_available"]
-
     for name, item in rows.items():
-        cell = item.natedev
         if name in keys_by_row and not unresolved_policy:
-            cell.policy = CellPolicy.CONFIGURED if keys_by_row[name] else CellPolicy.NO_LIMIT
-        if cell.policy is CellPolicy.NO_LIMIT:
-            cell.runs.extend(cell.other)
-            cell.used = cell.other_used
-            cell.other.clear()
-            cell.other_used = 0
-        elif unresolved_policy and cell.other_used:
-            unattributed += cell.other_used
-            cell.other_used = 0
-            cell.other.clear()
+            item.natedev.policy = CellPolicy.CONFIGURED if keys_by_row[name] else CellPolicy.NO_LIMIT
+        if unresolved_policy and item.natedev.other_used:
+            unattributed += item.natedev.other_used
+            item.natedev.other_used = 0
+            item.natedev.other.clear()
         for cell in (item.natedev, item.aws):
+            if cell.policy is CellPolicy.NO_LIMIT:
+                cell.runs.extend(cell.other)
+                cell.used = cell.other_used
+                cell.other.clear()
+                cell.other_used = 0
             if cell.used or cell.limit is not None or cell.waits or cell.runs or cell.other_used:
                 item.quiet = False
 
@@ -861,8 +869,9 @@ def build_limits(reading: records.QueueRead, snapshots: target_availability.Snap
         limits.append(Metric("disk", disk.free_gib, disk.floor_gib, "GiB", "minimum", disk_waits))
     elif disk_waits:
         limits.append(Metric("disk", None, None, waits=disk_waits))
-    aws_active = cloud_used or any(isinstance(hana.used, int) and hana.used for hana in saved.hana)
-    aws_state = PAGE_WORDS["in_use"] if aws_active else PAGE_WORDS["not_available"] if saved.aws_routes_unavailable else ""
+    aws_active = cloud_used or any(isinstance(capacity.used, int) and capacity.used for capacity in hana)
+    aws_state = (PAGE_WORDS["in_use"] if aws_active else
+                 PAGE_WORDS["not_available"] if saved.hana is ReadingState.UNAVAILABLE else "")
     cloud = Metric("cloud", cloud_used if isinstance(cloud_slots, int) else None,
                    cloud_slots if isinstance(cloud_slots, int) else None, waits=metric_waits.get("cloud", {}),
                    unreadable=cloud_slots is ReadingState.UNAVAILABLE, reserved_waiting=cloud_waiting)
