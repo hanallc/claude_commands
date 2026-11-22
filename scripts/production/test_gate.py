@@ -18,7 +18,7 @@ from typing import cast, final, override
 from contextlib import AbstractContextManager, redirect_stdout
 from datetime import UTC, datetime, tzinfo
 from unittest import mock
-from scripts.lib import scratch
+from scripts.lib import build_folders, scratch, testing_folders
 from scripts.production import change_review, gate, staff
 from scripts.production.gate_modules import GateRefused
 from scripts.production.test_change_review import ProducerFixture
@@ -255,6 +255,29 @@ class MergeGateCheckpointTests(MergeGateFixture):
         timings = gate.read_measures(self.state / "runner" / "module_seconds.json")
         self.assertEqual(set(timings), {"hooks/test_first.py", "hooks/tests/test_first.py"})
         self.assertEqual(self.pass_records()[0]["suites"], ["hooks"])
+
+    @gate_suites("hooks")
+    def test_gate_and_affected_module_folders_leave_room_for_unix_sockets(self) -> None:
+        prepare = gate.test_module_environment
+        # Chrome uses this suffix below TMPDIR. Include the separator and the final NUL.
+        socket_suffix = Path("com.google.Chrome.123456/SingletonSocket")
+        for flag in ("--tests-only", "--affected"):
+            with self.subTest(mode=flag):
+                socket_paths: list[Path] = []
+
+                def prepare_module(root: Path, environment: dict[str, str]) -> dict[str, str]:
+                    fixture_parent = build_folders.tmpfs_temporary_parent()
+                    with (mock.patch.dict(os.environ, {"TMPDIR": str(root)}),
+                          testing_folders.test_run_folder() as run):
+                        relative_socket = run.relative_to(fixture_parent) / socket_suffix
+                        socket_paths.append(Path("/private/tmp") / relative_socket)
+                    return prepare(root, environment)
+
+                with mock.patch.object(gate, "test_module_environment", side_effect=prepare_module):
+                    result = self.run_gate(flag, "--module", "hooks/test_first.py")
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                socket_path, = socket_paths
+                self.assertLessEqual(len(os.fsencode(socket_path)) + 1, 108, str(socket_path))
 
     def test_folders_without_test_modules_and_cached_files_are_not_suites(self) -> None:
         scripts = self.checkout / "scripts"

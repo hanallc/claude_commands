@@ -1733,7 +1733,10 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
                     suite, path = request.suite, request.path
                     folder_cleanup = ExitStack()
                     _ = module_folders.callback(folder_cleanup.close)
-                    root = folder_cleanup.enter_context(build_folders.tool_folder(f"{suite}-{path.stem}", temporary))
+                    # Leave room for fixture socket paths below TMPDIR.
+                    module_folder = build_folders.BuildFolderSpec(
+                        kind="legacy-unique", parent=temporary, purpose="m", suffix_length=4)
+                    root = folder_cleanup.enter_context(build_folders.temporary_build_folder(module_folder))
                     log = root / "output.log"
                     job_environment = ({**environment, "TMPDIR": str(root)} if request.kind is GateJobKind.TYPE_CHECK
                                        else test_module_environment(root, environment))
