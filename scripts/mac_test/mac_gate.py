@@ -578,20 +578,24 @@ def write_modules(repo: Path, mac_result: Path, natedev_record: Path) -> None:
     if cloud_gate.working_tree(repo)[0] != tree:
         raise GateRefused('The checkout tree differs from the Mac result')
     baseline = natedev_counts(natedev_record, tree)
-    observed = set(baseline)
+    mac_modules: set[str] = set()
     passed: set[str] = set()
     for job in gate_box.decode_run(row['gate']).jobs:
         if job.kind is not gate.GateJobKind.TEST_MODULE:
             continue
         name = f'scripts/{job.suite}/{job.module}'
-        observed.add(name)
+        mac_modules.add(name)
         if (job.returncode == 0 and not job.killed_for
                 and isinstance(job.times, dict)
                 and baseline.get(name) == ModuleCounts(ledger.instant(ledger.mapping(job.times), 'tests_run'),
                                                        ledger.instant(ledger.mapping(job.times), 'skipped'))):
             passed.add(name)
+    checkout_modules = {path.relative_to(repo).as_posix() for _, path in discover_test_modules(repo)}
+    if mac_modules != checkout_modules:
+        raise GateRefused('The Mac result module list differs from the full checkout list')
+    excluded = (mac_modules | baseline.keys()) - passed
     write_text_atomic(repo / MODULE_LIST, MODULE_LIST_HEADER + ''.join(
-        name + '\n' for name in sorted(observed - passed)))
+        name + '\n' for name in sorted(excluded)))
 
 
 @dataclass
