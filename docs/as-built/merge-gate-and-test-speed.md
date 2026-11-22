@@ -595,8 +595,12 @@ The admission, scheduling caches, and rerun rules below apply to `SharedMachine`
   The outer gate removes the nested gate files when it removes the module folder.
   The short names leave room for Unix socket paths below `TMPDIR`.
   The runner reads the output and removes the temporary folder when the job ends.
-  Outside gate jobs, the shared Python bootstrap gives direct unittest and timed runs a maker folder.
-  The bootstrap checks for a gate parent once, at the first unittest load or run.
+  At the first unittest load or run, the bootstrap checks whether the process already runs under a test limit.
+  On Linux, gate descendants use the gate launch proof from the process tree.
+  A descendant in an existing direct test scope uses that scope.
+  A process under a test limit keeps its current folder and reads no configuration for a new limit.
+  Herdr keeps the prepared Python path when it launches an agent from a process under a test limit.
+  The bootstrap gives a new direct test run a maker folder.
   A later `package_root.py` run inside an import selects the checkout only and starts no folder.
   `gate.py --affected` uses the same test-folder context for its outer run.
   These folders use `<inherited TMPDIR>/test-runs/r*`.

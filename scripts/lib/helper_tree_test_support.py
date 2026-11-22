@@ -76,6 +76,17 @@ def copy_helpers(home: Path, *folders: str) -> Path:
             target = Path(os.readlink(source)) if source.is_symlink() else None
             resolved = source.resolve()
             inside = resolved.is_relative_to(SOURCE) and resolved.relative_to(SOURCE) in selected_files
+            if target is not None and resolved.is_dir() and resolved.is_relative_to(SOURCE):
+                directory = resolved.relative_to(SOURCE)
+                destination.mkdir()
+                for member in files:
+                    if member.is_relative_to(directory) and (SOURCE / member).is_file():
+                        copy = destination / member.relative_to(directory)
+                        copy.parent.mkdir(parents=True, exist_ok=True)
+                        _ = shutil.copy2(SOURCE / member, copy)
+                        count += 1
+                        size += copy.stat().st_size
+                continue
             if target is not None and not target.is_absolute() and inside:
                 destination.symlink_to(target)
             else:

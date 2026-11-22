@@ -10,7 +10,7 @@ import unittest
 from typing import override
 
 from scripts.lib.checkout_test_support import copy_test_runner, direct_test_fixture_environment, run_gate_test_fixture
-from scripts.lib.python_startup.sitecustomize import startup_pythonpath
+from scripts.lib.python_startup.sitecustomize import startup_pythonpath, within_test_limit
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
@@ -51,6 +51,37 @@ print("gate source descriptor:", bool(source), flush=True)
 os.environ["PYTHONPATH"] = sys.argv[3]
 os.execv(sys.argv[1], sys.argv[1:])
 """
+NESTED_TEST_PROBE = """
+import os, sys, unittest
+
+def guard(event, arguments):
+    if event == "subprocess.Popen" or event == "open" and str(arguments[0]).endswith(".conf"):
+        raise AssertionError(f"Unexpected setup: {event} {arguments[0]}")
+
+sys.addaudithook(guard)
+unittest.defaultTestLoader.loadTestsFromTestCase(unittest.TestCase)
+assert "PYTHONPATH" not in os.environ
+assert os.environ["TMPDIR"] == sys.argv[1]
+"""
+NESTED_FIXTURE = """
+import os, subprocess
+from pathlib import Path
+
+def run_nested(root, shim, probe, timeout):
+    environment = {name: os.environ[name] for name in (
+        "PATH", "HOME", "CONF_DIR", "PYTHONDONTWRITEBYTECODE", "CLAUDE_DISABLE_DATACLASS_CODE_CACHE")
+        if name in os.environ}
+    environment.update(TMPDIR=str(root), XDG_CACHE_HOME=str(root / "cache"))
+    result = subprocess.run(
+        [shim, "-c", probe, str(root)], env=environment, start_new_session=True,
+        capture_output=True, text=True, check=False, timeout=timeout)
+    assert result.returncode == 0, result.stdout + result.stderr
+"""
+DIRECT_FIXTURE_VARIABLES = (
+    "BUILDLOG_DIR", "CLAUDE_DISABLE_DATACLASS_CODE_CACHE", "CLAUDE_PYTHON", "CONF_DIR", "CONF_READ_LOG",
+    "DBUS_SESSION_BUS_ADDRESS", "GATE_PARENT_PID", "HOME", "PATH", "PYTHONDONTWRITEBYTECODE", "PYTHONPATH",
+    "PYTHONWARNINGS", "TMPDIR", "XDG_CACHE_HOME", "XDG_RUNTIME_DIR",
+)
 
 
 class DirectTestLimitTests(unittest.TestCase):
@@ -70,7 +101,15 @@ class DirectTestLimitTests(unittest.TestCase):
         self.environment["PYTHONPATH"] = startup_pythonpath("")
 
     def invoke(self, *arguments: str) -> subprocess.CompletedProcess[str]:
-        return subprocess.run([*arguments], cwd=self.root, env=self.environment, stdin=subprocess.DEVNULL,
+        command = list(arguments)
+        if sys.platform == "linux" and within_test_limit():
+            # The manager starts the direct fixture outside the parent test's limit.
+            command = ["systemd-run", "--user", "--quiet", "--pipe", "--wait", "--collect",
+                       "--property=Type=exec", f"--property=RuntimeMaxSec={TEST_HANG_GUARD_SECS}s",
+                       f"--working-directory={self.root}",
+                       *(f"--setenv={name}" for name in DIRECT_FIXTURE_VARIABLES if name in self.environment),
+                       "--", *command]
+        return subprocess.run(command, cwd=self.root, env=self.environment, stdin=subprocess.DEVNULL,
                               capture_output=True, timeout=TEST_HANG_GUARD_SECS, text=True, check=False)
 
     def run_case(self, name: str) -> subprocess.CompletedProcess[str]:
@@ -91,12 +130,15 @@ class DirectTestLimitTests(unittest.TestCase):
 
     def test_short_direct_test_preserves_output_and_exit_status(self) -> None:
         self.environment["PYTHONWARNINGS"] = "default"
-        command = [sys.executable, "-m", "unittest", "direct_case.Example.test_short"]
-        with subprocess.Popen(command, cwd=self.root, env=self.environment, stdin=subprocess.DEVNULL,
-                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) as process:
-            stdout, stderr = process.communicate(timeout=TEST_HANG_GUARD_SECS)
-        self.assertEqual(process.returncode, 0, stdout + stderr)
-        self.assertIn(f"pid={process.pid}\n", stdout)
+        result = self.invoke(sys.executable, "-c", """
+import os, runpy
+print(f"entry={os.getpid()}", flush=True)
+runpy.run_module("unittest", run_name="__main__", alter_sys=True)
+""", "direct_case.Example.test_short")
+        stdout, stderr = result.stdout, result.stderr
+        self.assertEqual(result.returncode, 0, stdout + stderr)
+        entry = next(line.removeprefix("entry=") for line in stdout.splitlines() if line.startswith("entry="))
+        self.assertIn(f"pid={entry}\n", stdout)
         self.assertIn("fixture stdout\n", stdout)
         self.assertIn("fixture stderr\n", stderr)
         self.assertNotIn("ResourceWarning", stderr)
@@ -119,6 +161,31 @@ class DirectTestLimitTests(unittest.TestCase):
         self.assertIn("fixture finished", result)
         self.assertNotIn(LIMIT_LINE, result)
         self.assertFalse((self.root / "test-runs").exists())
+
+    @unittest.skipUnless(sys.platform == "linux", "Gate ancestry uses Linux process records")
+    def test_gate_descendant_keeps_its_environment_without_a_second_limit(self) -> None:
+        case = self.root / "test_gate_child.py"
+        shim = str(REPO / "scripts/lib/py")
+        _ = case.write_text(NESTED_FIXTURE + f"""
+import unittest
+class GateChild(unittest.TestCase):
+    def test_child(self):
+        run_nested(Path({str(self.root)!r}), {shim!r}, {NESTED_TEST_PROBE!r}, {TEST_HANG_GUARD_SECS!r})
+""")
+        environment = {**self.environment, "PYTHONPATH": str(self.root)}
+        result = run_gate_test_fixture(case, [shim, str(MODULE_RUN), str(self.root), case.name], environment)
+        self.assertEqual(result.returncode, 0, result.stdout)
+
+    @unittest.skipUnless(sys.platform == "linux", "Direct test scopes use Linux systemd")
+    def test_direct_scope_descendant_keeps_its_environment_without_a_second_limit(self) -> None:
+        shim = str(REPO / "scripts/lib/py")
+        result = self.invoke(sys.executable, "-c", NESTED_FIXTURE + f"""
+import unittest
+unittest.defaultTestLoader.loadTestsFromTestCase(unittest.TestCase)
+assert "claude-direct-test-" in Path("/proc/self/cgroup").read_text()
+run_nested(Path({str(self.root)!r}), {shim!r}, {NESTED_TEST_PROBE!r}, {TEST_HANG_GUARD_SECS!r})
+""")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_live_non_gate_parent_does_not_bypass_the_limit(self) -> None:
         self.environment["GATE_PARENT_PID"] = str(os.getpid())

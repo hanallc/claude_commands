@@ -277,24 +277,28 @@ if TYPE_CHECKING:
                   | VerifiedGateParentWithoutDescriptor | VerifiedGateParentWithDescriptor)
 
 
+def _gate_source_descriptor(raw: str) -> int:
+    return int(raw) if raw.isascii() and raw.isdecimal() and len(raw) <= 10 else -1
+
+
+def _gate_source_stat(parent: str, descriptor: int) -> os.stat_result:
+    path = f"/proc/{parent}/fd/{descriptor}"
+    target = os.readlink(path)
+    if not target.endswith("/scripts/production/gate.py") or not checkout_root(os.path.dirname(target)):
+        raise ValueError("the descriptor does not name a gate source file")
+    return os.stat(path)
+
+
 def _gate_source_identity(parent: str) -> VerifiedGateParentWithDescriptor | UnverifiedGateParent:
     """Check that the gate passed an open descriptor for its source file."""
-    raw = os.environ.get(GATE_PARENT_SOURCE_FD, "")
-    if not raw.isascii() or not raw.isdecimal() or len(raw) > 10:
-        return UnverifiedGateParent()
-    descriptor = int(raw)
+    descriptor = _gate_source_descriptor(os.environ.get(GATE_PARENT_SOURCE_FD, ""))
     if descriptor < 3:
         return UnverifiedGateParent()
     try:
-        parent_file = f"/proc/{parent}/fd/{descriptor}"
-        target = os.readlink(parent_file)
         opened = os.fstat(descriptor)
-        if (target.endswith("/scripts/production/gate.py")
-                and checkout_root(os.path.dirname(target))
-                and stat.S_ISREG(opened.st_mode)
-                and os.path.samestat(os.stat(parent_file), opened)):
+        if stat.S_ISREG(opened.st_mode) and os.path.samestat(_gate_source_stat(parent, descriptor), opened):
             return VerifiedGateParentWithDescriptor(parent, descriptor)
-    except OSError:
+    except (OSError, ValueError):
         pass
     return UnverifiedGateParent()
 
@@ -344,7 +348,7 @@ def _gate_identity() -> GateParent:
 
 
 def _remember_gate(parent: str) -> bool:
-    state = sys.modules["_devtools_checkout"]
+    state = sys.modules.setdefault("_devtools_checkout", ModuleType("_devtools_checkout"))
     if "test_gate_pidfd" not in state.__dict__:
         try:
             state.__dict__["test_gate_pidfd"] = os.pidfd_open(int(parent))
@@ -447,7 +451,8 @@ def _verified_gate() -> bool:
     """Check for a trusted parent or a parent proof that can pass through a fork."""
     import select
 
-    running_gate: object = sys.modules["_devtools_checkout"].__dict__.get("test_gate_pidfd")
+    state = sys.modules.get("_devtools_checkout")
+    running_gate: object = state.__dict__.get("test_gate_pidfd") if state is not None else None
     if isinstance(running_gate, int):
         readable, _, _ = select.select([running_gate], [], [], 0)
         if readable:
@@ -458,8 +463,60 @@ def _verified_gate() -> bool:
     return not isinstance(gate_parent(), UnverifiedGateParent)
 
 
-def _begin_direct_test() -> None:
+def _launching_gate(parent: str, descriptor: int) -> bool:
+    if descriptor >= 3:
+        try:
+            if stat.S_ISREG(_gate_source_stat(parent, descriptor).st_mode):
+                return True
+        except (OSError, ValueError):
+            pass
+    return _gate_command(parent)
+
+
+def _descends_from_gate_module() -> bool:
+    """Use the module's exec environment when a descendant replaces its environment."""
+    pid = os.getppid()
+    while pid > 1:
+        try:
+            with open(f"/proc/{pid}/stat", "rb") as source:
+                fields = source.read().rpartition(b") ")[2].split()
+            parent = int(fields[1])
+            session = int(fields[3])
+        except (OSError, IndexError, ValueError):
+            return False
+        # The gate starts each module in a new session.
+        if pid == session:
+            try:
+                with open(f"/proc/{pid}/environ", "rb") as source:
+                    environment = dict(item.split(b"=", 1) for item in source.read().split(b"\0") if b"=" in item)
+                parent_text = str(parent)
+                expected = environment.get(b"GATE_PARENT_PID") or environment.get(b"MERGE_GATE_PARENT_PID", b"")
+                if expected == parent_text.encode():
+                    raw = environment.get(os.fsencode(GATE_PARENT_SOURCE_FD), b"")
+                    if _launching_gate(parent_text, _gate_source_descriptor(os.fsdecode(raw))):
+                        return True
+            except OSError:
+                pass
+        pid = parent
+    return False
+
+
+def within_test_limit() -> bool:
+    """Identify a gate module or an existing direct test scope."""
     if _verified_gate():
+        return True
+    if sys.platform != "linux":
+        return False
+    try:
+        if _direct_test_unit(_cgroup(os.getpid())):
+            return True
+    except OSError:
+        pass
+    return _descends_from_gate_module()
+
+
+def _begin_direct_test() -> None:
+    if within_test_limit():
         return
     from contextlib import AbstractContextManager, nullcontext
     from pathlib import Path
@@ -490,11 +547,7 @@ def _begin_direct_test() -> None:
                     seconds = conf.read(template).value(_DIRECT_TEST_LIMIT_KEY, conf.positive_whole)
                 else:
                     seconds = limit.value
-                unit = _direct_test_unit(_cgroup(os.getpid()))
-                if unit:
-                    _verify_direct_test_scope(unit, seconds)
-                else:
-                    _adopt_direct_test_scope(seconds)
+                _adopt_direct_test_scope(seconds)
             if has_test_folder:
                 from scripts.lib.testing_folders import start_test_run
 
@@ -514,23 +567,6 @@ def _direct_test_unit(cgroup: str) -> str:
 
     unit = os.path.basename(cgroup)
     return unit if re.fullmatch(_DIRECT_TEST_UNIT_PREFIX + r"[0-9a-f]{32}\.scope", unit) else ""
-
-
-def _verify_direct_test_scope(unit: str, seconds: int) -> None:
-    """Check the inherited scope before it can permit a later test to run."""
-    import re
-    import signal
-    import subprocess
-
-    service = "org.freedesktop.systemd1"
-    path = "/org/freedesktop/systemd1/unit/" + unit.replace("-", "_2d").replace(".", "_2e")
-    result = subprocess.run(["busctl", "--user", "get-property", service, path,
-                             service + ".Scope", "RuntimeMaxUSec", "KillSignal"],
-                            capture_output=True, text=True, check=False)
-    if result.returncode == 0 and (limits := re.fullmatch(r"t ([0-9]+)\ni ([0-9]+)\n", result.stdout)):
-        if 0 < int(limits[1]) <= seconds * 1_000_000 and int(limits[2]) == signal.SIGKILL.value:
-            return
-    raise ValueError("cannot verify the inherited direct test limit")
 
 
 def _start_transient_unit(unit: str, properties: Sequence[Sequence[str]], descriptors: tuple[int, ...]) -> None:
