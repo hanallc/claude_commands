@@ -2579,6 +2579,14 @@ process.stdout.write(JSON.stringify({
             with self.subTest(reason=type(reason).__name__):
                 self.assertEqual(memory_feed.wait_why(reason), expected)
 
+    def test_builds_page_shows_the_repository_run_limit(self) -> None:
+        wait = admission_records.RunLimitWait(2, 2, "claude_commands", "natedev")
+        reading = with_wait_reason(reservation_reading(), wait)
+        with mock.patch.object(admission_client, "view", return_value=reading):
+            page = memory_feed.reading()
+        row = cast(memory_feed.MemoryWaitRow, page["waiters"][0])
+        self.assertEqual(row["why"], "2 of 2 claude_commands runs on natedev")
+
     def test_mac_idle_alert_reaches_the_feed_and_clears_with_the_watch_state(self) -> None:
         _ = write_config_fixture(self.root / "mac_test.conf", "stale_seconds=300\n")
         _ = write_idle_config(self.root)
