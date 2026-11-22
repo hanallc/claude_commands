@@ -445,11 +445,15 @@ class ReviewLinksServerTests(unittest.TestCase):
         case = self.review_fixture()
         owner = case.ready_submission_recipient()
         other = fixture_member("producer", name="another-recipient")
+        builds_doc = self.root / "builds.md"
+        _ = builds_doc.write_text("# Builds\n> **Status: PRODUCTION — running.**\n")
+        builds = fixture_member("showrunner", name="builds", doc=staff.LiveDoc(local_machine(), builds_doc))
+        aws = fixture_member("unit", name="aws", parent=builds.id)
         config = conf.path("console")
-        _ = write_config_fixture(config, f"page.review.owner={owner.id}\n")
+        _ = write_config_fixture(config, f"page.review.owner={owner.id}\npage.aws_machines.owner={aws.id}\n"
+                                 + f"page.list.owner={other.id}\n")
         cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
         with patch.object(self.server, "review_cache", cache):
-            options = self.new_item_http(query="?page=review")
             review = self.request(review_page.PAGE_PATH)
             connection = HTTPConnection("127.0.0.1", self.port, timeout=TEST_HANG_GUARD_SECS)
             self.addCleanup(connection.close)
@@ -460,12 +464,16 @@ class ReviewLinksServerTests(unittest.TestCase):
                     self.assertEqual((response.status, response.getheader("Content-Encoding")), (200, "gzip"))
                     self.assertEqual(gzip.decompress(response.read()), review.body)
                 compress.assert_called_once()
-        fields = cast(dict[str, object], json.loads(options.body))
-        self.assertEqual(options.status, 200)
-        self.assertEqual(fields["page_owner"], owner.id)
-        self.assertCountEqual(cast(list[dict[str, object]], fields["recipients"]),
-                              [{"id": owner.id, "name": owner.name, "proposal": True},
-                               {"id": other.id, "name": other.name, "proposal": False}])
+        expected = [{"id": owner.id, "name": owner.name, "proposal": True},
+                    {"id": builds.id, "name": builds.name, "proposal": False},
+                    {"id": other.id, "name": other.name, "proposal": False}]
+        for page, default in (("review", owner), ("aws_machines", builds), ("list", other)):
+            with self.subTest(page=page):
+                options = self.new_item_http(query=f"?page={page}")
+                fields = cast(dict[str, object], json.loads(options.body))
+                self.assertEqual(options.status, 200)
+                self.assertEqual(fields["page_owner"], default.id)
+                self.assertCountEqual(cast(list[dict[str, object]], fields["recipients"]), expected)
         self.assertEqual(self.new_item_http(query="?page=other").status, 400)
         self.assertEqual(review.status, 200)
         self.assertIn(b'data-page-owner="review"', review.body)

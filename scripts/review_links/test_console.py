@@ -16,6 +16,7 @@ import unittest
 from typing import Literal, cast, override
 from unittest.mock import patch
 
+from scripts.agents.remote import local_machine
 from scripts.aws_target import aws_page, machines_page
 from scripts.build_queue import memory_feed
 from scripts.disks import disks_page
@@ -25,6 +26,7 @@ from scripts.production import investigation, staff
 from scripts.production.change_routing import UnavailableProduction
 from scripts.review_links import (
     change_browser, change_page, console, for_you, investigations_page, page_frame, record_table, review_link,
+    review_submissions,
 )
 from scripts.review_links.test_accounts_page import firefox_probe_results
 
@@ -91,28 +93,47 @@ class ConsoleTests(unittest.TestCase):
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for the owner dialog.")
     def test_unavailable_aws_machines_opens_new_item_for_builds(self) -> None:
+        production = self.root / "builds.md"
+        _ = production.write_text("# Builds\n> **Status: PRODUCTION — running.**\n")
         builds = staff.StaffRow(staff.StaffId("builds-staff"), "showrunner", "builds", staff.STAFF_ROOT,
                                 current_session=staff.StaffId("builds-session"),
-                                doc=staff.LiveDoc("natedev", self.root / "production.md"))
+                                doc=staff.LiveDoc(local_machine(), production))
+        production = self.root / "sdlc.md"
+        _ = production.write_text("# SDLC\n> **Status: PRODUCTION — running.**\n")
+        sdlc = staff.StaffRow(staff.StaffId("sdlc-staff"), "showrunner", "sdlc", staff.STAFF_ROOT,
+                              current_session=staff.StaffId("sdlc-session"),
+                              doc=staff.LiveDoc(local_machine(), production))
+        morty = staff.StaffRow(staff.StaffId("morty-staff"), "producer", "morty", staff.STAFF_ROOT,
+                               current_session=staff.StaffId("morty-session"))
+        dwight = staff.StaffRow(staff.StaffId("dwight-staff"), "producer", "dwight", staff.STAFF_ROOT,
+                                current_session=staff.StaffId("dwight-session"))
         aws = staff.StaffRow(staff.StaffId("aws-staff"), "unit", "aws", staff.ReportsTo(builds.id),
                              current_session=staff.StaffId("aws-session"),
                              unit_type=staff.UnitDetails("direct"))
         _ = write_config_fixture(self.configuration / "console.conf",
-                                 f"page.aws_machines.owner={aws.id}\npage.builds.owner={builds.id}\n")
+                                 f"page.aws_machines.owner={aws.id}\npage.list.owner={morty.id}\n")
         pages = (console.ConsolePage("aws_machines", "AWS Machines", "server", "AWS Machines", console.UnavailablePage()),
-                 console.ConsolePage("builds", "Builds", "hammer", "Builds", console.UnavailablePage()))
-        with patch.object(staff, "local_snapshot", return_value=staff.StaffSnapshot((aws, builds))):
+                 console.ConsolePage("list", "List", "list-checks", "The List", console.UnavailablePage()))
+        members = staff.StaffSnapshot((aws, builds, sdlc, morty, dwight))
+        with patch.object(staff, "local_snapshot", return_value=members):
             source = console.render(pages, console.UnavailablePage())
+        settings = conf.read_or_repository("console")
+        options: dict[str, object] = {}
+        for page in pages:
+            owner = review_submissions.page_owner(page.identity, settings, members)
+            assert isinstance(owner, staff.StaffRow)
+            options[page.identity] = {"token": "fixture", "page_owner": owner.id,
+                                      "recipients": review_submissions.recipient_options(members, owner=owner)}
         probe = b"""<script>
 (async()=>{
  const failures=[], check=(ok,message)=>{if(!ok) failures.push(message);};
  const realFetch=window.fetch.bind(window), requests=[], captures=[];
+ const pageOptions=__PAGE_OPTIONS__;
  window.fetch=async (input, options)=>{
   const route=new URL(input, location.href);
   if(route.pathname==='/console/review/new-item' && route.search) {
    requests.push(route.search);
-   return Response.json({token:'fixture',page_owner:'builds-staff',
-                         recipients:[{id:'builds-staff',name:'builds'}]});
+   return Response.json(pageOptions[route.searchParams.get('page')]);
   }
   if(route.pathname==='/console/review/new-item' && options?.method==='POST') {
    captures.push(options.body);
@@ -128,27 +149,41 @@ class ConsoleTests(unittest.TestCase):
         'The unavailable page shows its configured owner.');
   check(button.getAttribute('aria-label')==='New item for builds', 'The button names the configured route.');
   const dialog=document.querySelector('#review-new-item'), recipients=dialog.querySelector('[data-recipients]');
-  const loaded=new Promise(resolve=>{
+  const loaded=()=>new Promise(resolve=>{
    const observer=new MutationObserver(()=>{if(recipients.firstChild){observer.disconnect();resolve();}});
    observer.observe(recipients,{childList:true});
   });
+  const awsOptions=loaded();
   button.click();
   check(dialog.open, 'The owner button opens the shared dialog.');
-  await loaded;
+  await awsOptions;
   check(requests.join()==='?page=aws_machines' && recipients.querySelector('input:checked')?.value==='builds-staff',
         'The dialog requests the AWS Machines owner and selects builds.');
+  const choices=()=>[...recipients.querySelectorAll('[data-button-face]')].map(chip=>chip.textContent).sort().join();
+  check(choices()==='builds,dwight,morty,sdlc', 'The dialog offers every producer and showrunner.');
   const screenshot=dialog.querySelector('[name=include_page]');
   check(!screenshot.getClientRects().length && !screenshot.checked,
         'The unavailable page offers no screenshot.');
   check(dialog.querySelector('[data-capture-slot]').hidden && captures.length===0,
         'The unavailable page starts no capture.');
+  recipients.querySelector('input[value=dwight-staff]').closest('label').click();
+  check(recipients.querySelector('input:checked')?.value==='dwight-staff',
+        'A producer chip changes the selected recipient.');
   dialog.querySelector('[data-close]').click();
-  document.querySelector('[data-page=builds]').click();
-  check(!control.getClientRects().length && pane.querySelector('[data-page-owner=builds]').getClientRects().length,
+  document.querySelector('[data-page=list]').click();
+  const listOwner=pane.querySelector('[data-page-owner=list]');
+  check(!control.getClientRects().length && listOwner.getClientRects().length,
         'The owner changes with the selected unavailable page.');
+  const listOptions=loaded();
+  listOwner.querySelector('[data-owner-new]').click();
+  await listOptions;
+  check(requests.join()==='?page=aws_machines,?page=list' &&
+        recipients.querySelector('input:checked')?.value==='morty-staff',
+        'The List dialog selects its owner.');
+  check(choices()==='builds,dwight,morty,sdlc', 'The List dialog offers the same recipients.');
  } catch(error) {failures.push(String(error));}
  await realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
-})();</script>"""
+})();</script>""".replace(b"__PAGE_OPTIONS__", json.dumps(options).encode())
         self.assertEqual(firefox_probe_results(source.replace(b"</body>", probe + b"</body>")), [[]])
 
     def test_publication_reuses_the_changes_link_and_inlines_only_local_icons(self) -> None:

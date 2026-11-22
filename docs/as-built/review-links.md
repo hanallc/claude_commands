@@ -105,14 +105,15 @@ An item for a unit goes to its showrunner.
 Showrunner and producer owners receive their items directly.
 The page owner button names the default recipient and opens one shared dialog.
 The dialog offers Bug, Question, Feedback, Proposal, and Investigation.
-For a new draft, the **To** row selects the page owner or the showrunner who receives items for that unit.
-The row offers eligible showrunners and producers from the shared staff reader.
+The **To** row offers chips for all eligible producers and showrunners in the staff record.
+For a new draft, **To** selects the page owner or the showrunner who receives items for that unit.
+On an unavailable AWS Machines page owned by the AWS unit, **To** selects its showrunner, builds.
 The active List producer appears in the row when `page.list.owner` names its staff ID.
 The row can show that producer when its production document is unavailable.
 Send checks the selected recipient again.
 If the page has no default recipient, the button opens the dialog with no recipient selected.
 Select a recipient to enable Send.
-You can select a different recipient.
+Select any other chip to change the recipient.
 Proposal limits the row to recipients with a native proposal folder.
 When the selected recipient becomes unavailable, the dialog clears the selection and disables Send until you choose a recipient.
 Changing the type or reopening a kept draft preserves this empty selection.
