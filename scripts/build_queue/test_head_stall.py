@@ -186,7 +186,7 @@ class FindStallTests(unittest.TestCase):
                 self.assertEqual(head_stall.find_stall(queue, admitted, NOW, LIMIT), head_stall.NoStall())
 
     def test_a_recent_zero_need_start_does_not_hide_the_stall(self) -> None:
-        gate = replace(holder(NOW - 60), step="merge-gate", promise=0)
+        gate = replace(holder(NOW - 60), step="gate", promise=0)
         stall = head_stall.find_stall(snapshot([waiter(NOW - 3600)], (holder(NOW - 3600), gate)), 0.0, NOW, LIMIT)
         assert isinstance(stall, head_stall.HeadStall)
         self.assertEqual([row.step for row in stall.holders], ["check"])

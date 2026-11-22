@@ -195,7 +195,7 @@ TEST_COLUMNS: list[Column] = [
 
 GATE_RUN_COLUMNS: list[Column] = [
     ("vcpus", "INTEGER", "vCPU count; absent for old records"),
-    ("step", "TEXT", "targeted-test or merge-gate; empty for old records"),
+    ("step", "TEXT", "test-affected or gate; empty for old records"),
     ("id", "TEXT PRIMARY KEY", "gate run identity"),
     ("src", "TEXT", "source file"),
     ("host", "TEXT", "host"),
@@ -516,7 +516,7 @@ SSH_ATTEMPT_COLUMNS: list[Column] = [
 
 TABLES: dict[str, tuple[list[Column], str, str]] = {
     "gate_runs": (
-        GATE_RUN_COLUMNS, "", "one row per targeted-test or merge-gate run",
+        GATE_RUN_COLUMNS, "", "one row per test-affected or gate run",
     ),
     "gate_suites": (GATE_SUITE_COLUMNS, "PRIMARY KEY (run_id, suite)", "one row per gate suite"),
     "gate_modules": (
@@ -543,7 +543,7 @@ TABLES: dict[str, tuple[list[Column], str, str]] = {
         "",
         "one row per verify.sh call (its steps carry call_id), and per port-lint call that ran nothing",
     ),
-    "ci_runs": (CI_RUN_COLUMNS, "PRIMARY KEY (run_id, attempt)", "GitHub Actions run attempts of natepiano/hana"),
+    "ci_runs": (CI_RUN_COLUMNS, "PRIMARY KEY (run_id, attempt)", "GitHub Actions run attempts of the hana repository"),
     "ci_jobs": (CI_JOB_COLUMNS, "", "their jobs"),
     "ci_steps": (CI_STEP_COLUMNS, "PRIMARY KEY (job_id, number)", "the jobs' steps"),
     "samples": (SAMPLE_COLUMNS, "", "one 60 s machine memory sample; counters reset on reboot"),

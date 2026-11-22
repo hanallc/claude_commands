@@ -1346,9 +1346,9 @@ class LocalStepName:
 
 
 def local_step_name(step: admission_records.RunningStep | admission_records.WaitingStep, owner: StepPageOwner,
-                    names: StepNames, labels: Mapping[str, unit_labels.UnitLabels], ci_label: str
+                    names: StepNames, labels: Mapping[str, unit_labels.UnitLabels], ci_label: str, job: StepJobReading
                     ) -> LocalStepName | NoNamedStep:
-    if step.step in GATE_STEPS:
+    if step.step in GATE_STEPS and not isinstance(job, StepJob):
         neutral = QueueRowName.owner_only(ci_label) if ci_label else owner.neutral_name()
         return LocalStepName(neutral, neutral, staff_names.text_parts(neutral))
     title = (build_row_step(step.step, step.package, step.project, step.folder, names, kind=QueueKind.CI)
@@ -1531,11 +1531,7 @@ def need_in_next_part(steps: Sequence[admission_records.RunningStep]) -> bool:
                and isinstance(step.measured.window, progress.WindowPeak) for step in steps)
 
 
-WaitCause = Literal["memory", "its turn", "Cargo token", "GPU slot", "build slot", "memory pressure",
-                    "AWS slot", "build hold", "Mac", "build space", "the build in the same Cargo folder"]
-
-
-def wait_why(reason: admission_records.WaitReason) -> WaitCause:
+def wait_why(reason: admission_records.WaitReason) -> str:
     """Name the resource or queue action that a waiter needs."""
     match reason:
         case admission_records.NeedsMemory():
@@ -1554,6 +1550,8 @@ def wait_why(reason: admission_records.WaitReason) -> WaitCause:
             return "build space"
         case admission_records.GpuSlotWait():
             return "GPU slot"
+        case admission_records.RunLimitWait():
+            return admission_records.run_limit_text(reason)
         case admission_records.EstimateExpired():
             return "memory"
         case admission_records.NatedevHeld():
@@ -2826,7 +2824,7 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
             owner = step_page_owner(step, labels, ci_runners, members, machine, ci_label=ci_label,
                                     reservation_caller=reservation_caller)
             shown = replace(step, step=job_step(job, step.step), unit=owner.labels.unit)
-            named = local_step_name(shown, owner, names, labels, ci_label)
+            named = local_step_name(shown, owner, names, labels, ci_label, job)
             if isinstance(named, NoNamedStep):
                 continue
             title_step, display_name, parts = named.title, named.name, named.parts
@@ -2997,7 +2995,7 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
             reason = reason_phrase(waiter.reason, waiting)
         job = NotGateStep() if ci_label else local_job(waiter)
         shown_waiter = replace(waiter, step=job_step(job, waiter.step), unit=identity.unit)
-        named = local_step_name(shown_waiter, owner, names, labels, ci_label)
+        named = local_step_name(shown_waiter, owner, names, labels, ci_label, job)
         if isinstance(named, NoNamedStep):
             continue
         waiters[place] = {**queue_row_labels(named.title, named.name, unit=owner.unit, ci_label=ci_label, caller=owner.caller),
@@ -3070,8 +3068,9 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
             job = cloud.identity.job if isinstance(cloud.identity.job, StepJob) else step_job(
                 cloud.identity.step, cloud.owner.pid, PROC, start_time=cloud.owner.start_time)
             step = job_step(job, cloud.identity.step)
-            if step in GATE_STEPS:
-                title_step = display_name = QueueRowName.owner_only(unit, identity.owner_text)
+            if step in GATE_STEPS and not isinstance(job, StepJob):
+                title_step = display_name = QueueRowName.owner_only(
+                    unit, identity.owner_text, public_owner_name(recorded.name, recorded.session_id))
                 parts = staff_names.text_parts(display_name)
                 if current is not None and not public_owner_name(recorded.name, recorded.session_id):
                     parts = staff_names.owned_step_parts(names, step, unit, identity.role, current=parts)
