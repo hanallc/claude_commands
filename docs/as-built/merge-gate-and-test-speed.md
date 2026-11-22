@@ -259,6 +259,10 @@ The gate keeps that record and checks the remaining records.
 A recovery refusal in the gate's own checkout stops the gate.
 A clean tree with a recorded full pass on this host reuses its test modules.
 Test modules use `builds.slice` scopes when available.
+A descriptor variable name ends in `_FD` or `_FDS`, or contains `_FD_`.
+Gate jobs keep only the descriptor numbers that the gate passes to the child.
+Gate jobs drop the systemd socket count `LISTEN_FDS`.
+On Linux, the gate passes its source descriptor to test modules for interpreter startup.
 After the parallel pass, up to eight failed modules run once more, alone.
 The final test results decide the gate.
 On Linux, `module_run.py` adopts orphaned test processes in a separate parent before it imports test code.
