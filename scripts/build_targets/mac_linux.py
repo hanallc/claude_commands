@@ -515,11 +515,14 @@ class GuestEndPending:
 
 
 def prove_guest_end(settings: GuestSettings, armed: ArmedGuestAttempt, *,
-                    timeout_seconds: float = GUEST_CLEANUP_TIMEOUT_SECONDS) -> GuestEndProven | GuestEndPending:
+                    proof_deadline: float = math.inf) -> GuestEndProven | GuestEndPending:
     try:
-        reply = subprocess.run(settings.command(cleanup_shell(settings, armed)), stdin=subprocess.DEVNULL,
-                               capture_output=True, text=True, errors='replace',
-                               timeout=timeout_seconds, check=False)
+        command = settings.command(cleanup_shell(settings, armed))
+        remaining = proof_deadline - monotonic()
+        if remaining <= 0:
+            return GuestEndPending('The proof deadline expired before cleanup SSH.')
+        reply = subprocess.run(command, stdin=subprocess.DEVNULL, capture_output=True, text=True, errors='replace',
+                               timeout=min(GUEST_CLEANUP_TIMEOUT_SECONDS, remaining), check=False)
     except (OSError, subprocess.TimeoutExpired) as error:
         return GuestEndPending(str(error) or type(error).__name__)
     if reply.returncode == 0 and reply.stdout.strip() == 'ended':
@@ -667,11 +670,10 @@ def run_remote(repo: Path, settings: GuestSettings, source: CandidateSource, req
                         break
                     if retry_proof:
                         sleep(min(SSH_CONNECT_TIMEOUT_SECONDS, remaining))
-                        remaining = proof_deadline - monotonic()
-                        if remaining <= 0:
+                        if monotonic() >= proof_deadline:
                             break
                     retry_proof = True
-                    proof = prove_guest_end(settings, armed, timeout_seconds=min(GUEST_CLEANUP_TIMEOUT_SECONDS, remaining))
+                    proof = prove_guest_end(settings, armed, proof_deadline=proof_deadline)
                     if monotonic() >= proof_deadline:
                         break
                     if isinstance(proof, GuestEndProven):

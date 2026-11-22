@@ -21,7 +21,7 @@ from unittest.mock import call, patch
 
 from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, GateJobNotRecorded, StepJob
 from scripts.build_targets import mac_linux
-from scripts.lib import build_folders, conf
+from scripts.lib import build_folders, conf, process_group
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.mac_test import eligibility, mac_test
 from scripts.production import gate
@@ -576,12 +576,12 @@ fi
 
         def prove(settings: mac_linux.GuestSettings,
                   armed: mac_linux.ArmedGuestAttempt, *,
-                  timeout_seconds: float) -> mac_linux.GuestEndProven | mac_linux.GuestEndPending:
+                  proof_deadline: float) -> mac_linux.GuestEndProven | mac_linux.GuestEndPending:
             self.assertNotIn('released', events)
             cancel = self.run_lock().parent / (
                 f'{mac_linux.CANCEL_RECORD_PREFIX}.{armed.boot_id}.{armed.deadline_ns}.{armed.attempt}')
             self.assertFalse(cancel.exists())
-            proof = prove_guest_end(settings, armed, timeout_seconds=timeout_seconds)
+            proof = prove_guest_end(settings, armed, proof_deadline=proof_deadline)
             if isinstance(proof, mac_linux.GuestEndPending):
                 self.assertIn('fixture cleanup SSH refused the connection', proof.detail)
                 self.assertFalse(cancel.exists())
@@ -633,7 +633,7 @@ fi
                 self.assertIn('guest unreachable: fixture-guest did not confirm the run ended '
                               + f'within 2 seconds ({key})', str(result))
                 self.assertIs(eligibility.read_backoff(time.time(), mac_linux.TARGET), eligibility.NO_BACKOFF)
-                proof.assert_called_once_with(settings, first, timeout_seconds=2.0)
+                proof.assert_called_once_with(settings, first, proof_deadline=2.0)
                 self.assertEqual(now, 2.0)
                 self.assertEqual(self.trace.read_text().splitlines(), ['probe', 'arm', 'run', 'cleanup'])
                 owner = lock.read_text()
@@ -684,8 +684,8 @@ fi
 
             def prove(settings: mac_linux.GuestSettings,
                       armed: mac_linux.ArmedGuestAttempt, *,
-                      timeout_seconds: float) -> mac_linux.GuestEndProven | mac_linux.GuestEndPending:
-                proof = prove_guest_end(settings, armed, timeout_seconds=timeout_seconds)
+                      proof_deadline: float) -> mac_linux.GuestEndProven | mac_linux.GuestEndPending:
+                proof = prove_guest_end(settings, armed, proof_deadline=proof_deadline)
                 proofs.append(proof)
                 if len(proofs) == 2:
                     fcntl.flock(held, fcntl.LOCK_UN)
@@ -716,8 +716,8 @@ fi
             guard = Timer(2.5, os.read, args=(blocked_reader.fileno(), 65536))
 
             def pending(_settings: mac_linux.GuestSettings, _armed: mac_linux.ArmedGuestAttempt, *,
-                        timeout_seconds: float) -> mac_linux.GuestEndPending:
-                self.assertLessEqual(timeout_seconds, 1)
+                        proof_deadline: float) -> mac_linux.GuestEndPending:
+                self.assertLessEqual(proof_deadline - time.monotonic(), 1)
                 if not started:
                     started.append(time.monotonic())
                     guard.start()
@@ -735,14 +735,36 @@ fi
         self.assertIn('guest unreachable: fixture-guest', str(result))
         self.assertLess(returned - first_probe, 1.75)
 
+    def test_local_read_past_the_proof_deadline_starts_no_cleanup_ssh(self) -> None:
+        configuration = self.registry.with_name('mac_linux.conf')
+        key = mac_linux.UNREACHABLE_WAIT_KEY
+        _ = configuration.write_text(configuration.read_text().replace(f'{key}=20', f'{key}=1'))
+        helper = Path(process_group.__file__)
+        read_text = Path.read_text
+        now = 0.0
+
+        def read_with_delay(path: Path, **options: str | None) -> str:
+            nonlocal now
+            contents = read_text(path, **options)
+            if path == helper:
+                now += 1.25
+            return contents
+
+        with (patch.object(Path, 'read_text', read_with_delay),
+              patch.object(mac_linux, 'monotonic', lambda: now)):
+            result = self.route()
+        self.assertEqual(now, 1.25)
+        self.assertIn('guest unreachable: fixture-guest', str(result))
+        self.assert_guest_clean('probe', 'arm', 'run')
+
     def test_proof_received_at_the_deadline_refuses(self) -> None:
         now = 0.0
 
         def late_proof(_settings: mac_linux.GuestSettings, _armed: mac_linux.ArmedGuestAttempt, *,
-                       timeout_seconds: float) -> mac_linux.GuestEndProven:
+                       proof_deadline: float) -> mac_linux.GuestEndProven:
             nonlocal now
-            self.assertEqual(timeout_seconds, 20)
-            now += timeout_seconds
+            self.assertEqual(proof_deadline, 20)
+            now = proof_deadline
             return mac_linux.GuestEndProven()
 
         with (patch.object(mac_linux, 'monotonic', lambda: now),
@@ -807,12 +829,12 @@ fi
 
         def prove(settings: mac_linux.GuestSettings,
                   armed: mac_linux.ArmedGuestAttempt, *,
-                  timeout_seconds: float) -> mac_linux.GuestEndProven | mac_linux.GuestEndPending:
+                  proof_deadline: float) -> mac_linux.GuestEndProven | mac_linux.GuestEndPending:
             if events == ['reserved']:
                 lock_statuses.append(subprocess.call(['flock', '-x', '-n', self.run_lock(), 'true']))
                 events.append('interrupted')
                 raise first_interrupt
-            proof = prove_guest_end(settings, armed, timeout_seconds=timeout_seconds)
+            proof = prove_guest_end(settings, armed, proof_deadline=proof_deadline)
             if isinstance(proof, mac_linux.GuestEndProven):
                 lock_statuses.append(subprocess.call(['flock', '-x', '-n', self.run_lock(), 'true']))
                 events.append('ended')
