@@ -89,6 +89,7 @@ If the move journal is unreadable, the first workers entry still suppresses this
 The title gives the remaining quota and the default outcome.
 For example, “codex2 has 2% left; codex1 next” means workers move to codex1.
 It names paid credits only when the account allows them and no other Codex account has room.
+With no paid credits and no Codex account with room, the title ends “units work alone next”: no-worker mode starts at 0%.
 The reminder says “No action needed.”
 The reminder has no body.
 

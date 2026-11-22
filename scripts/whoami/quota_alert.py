@@ -1366,9 +1366,12 @@ def codex_next_move_push(note: AgentNote, fallback: CodexQuotaFallback = NO_CODE
         return QuotaStatusNote(note.label, "what happens next is set up")
     credits_allowed = isinstance(agent_accounts.codex_credits_setting(note.label), agent_accounts.CreditsOn)
     chosen = _zero_destination(note.label, at, prefer_weekly_room=True, included_only=credits_allowed)
-    destination = chosen.label if isinstance(chosen, accounts.PickedAccount) else "Claude"
-    outcome_title = ("paid credits next" if credits_allowed and isinstance(chosen, accounts.NoAccountWithRoom)
-                     else f"{destination} next")
+    if isinstance(chosen, accounts.PickedAccount):
+        outcome_title = f"{chosen.label} next"
+    elif credits_allowed:
+        outcome_title = "paid credits next"
+    else:
+        outcome_title = "units work alone next"
     return UserPush(note.label, render("quota.codex_next_move", account=note.label,
                                       remaining=percent(note, whole=True), outcome_title=outcome_title))
 

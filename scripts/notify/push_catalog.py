@@ -197,7 +197,7 @@ ENTRIES = (
         "",
         (PushExample("credits_on", {"account": "codex2", "remaining": "<1%", "outcome_title": "paid credits next"}),
          PushExample("credits_off_codex", {"account": "codex2", "remaining": "2%", "outcome_title": "codex1 next"}),
-         PushExample("credits_off_claude", {"account": "codex1", "remaining": "1%", "outcome_title": "Claude next"})),
+         PushExample("credits_off_alone", {"account": "codex1", "remaining": "1%", "outcome_title": "units work alone next"})),
         purpose="A Codex account runs low. Its workers move or spend credits soon."),
     PushText('quota.codex_workers_moved', "quota_alert", "note", '{transition}',
         NoActionNeeded(),

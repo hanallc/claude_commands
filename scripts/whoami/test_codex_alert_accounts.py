@@ -156,7 +156,7 @@ always=director
         # The low account's stored allowance must never make it its own fallback.
         self.save_room(source, 100, reset=self.now + timedelta(hours=1))
         for credits in ("on", "off"):
-            for fallback in ("codex2", "Claude"):
+            for fallback in ("codex2", "alone"):
                 for left in (2, 1, 0, 3):
                     with self.subTest(credits=credits, fallback=fallback, left=left):
                         self.save_room(target, 80 if fallback == "codex2" else 0,
@@ -171,7 +171,8 @@ always=director
                         self.assertIsInstance(push, quota_alert.UserPush)
                         assert isinstance(push, quota_alert.UserPush)
                         rendered = push.rendered
-                        outcome = "paid credits next" if credits == "on" and fallback == "Claude" else f"{fallback} next"
+                        outcome = ("codex2 next" if fallback == "codex2" else "paid credits next" if credits == "on"
+                                   else "units work alone next")
                         self.assertEqual(rendered.values, {
                             "account": "codex1", "remaining": f"{left}%", "outcome_title": outcome,
                         })
@@ -210,7 +211,7 @@ always=director
         expected = {
             "credits_on": ("codex2", "<1%", "paid credits next"),
             "credits_off_codex": ("codex2", "2%", "codex1 next"),
-            "credits_off_claude": ("codex1", "1%", "Claude next"),
+            "credits_off_alone": ("codex1", "1%", "units work alone next"),
         }
         self.assertEqual({example.name for example in entry.examples}, set(expected))
         for example in entry.examples:
