@@ -28,6 +28,7 @@ host, command = sys.argv[-2:]
 if host == 'fixture-mac':
     sys.exit(subprocess.call(['bash', '-c', command]))
 assert host == 'fixture-guest'
+assert sys.argv[-4:-2] == ['-l', os.environ['FIXTURE_GUEST_USER']]
 shell = shlex.split(command)[-1]
 cleanup = 'flock -n -E 75' in shell
 with Path(os.environ['FIXTURE_SSH_TRACE']).open('a') as trace:
@@ -42,7 +43,17 @@ if not cleanup and os.environ['FIXTURE_GUEST_RESULT'] == 'disconnect':
     (home / match[1]).mkdir()
     print('fixture SSH lost its connection during upload', file=sys.stderr)
     sys.exit(255)
-sys.exit(subprocess.call(['bash', '-c', shell], env=dict(os.environ, HOME=str(home))))
+environment = dict(os.environ, HOME=str(home))
+if cleanup:
+    sys.exit(subprocess.call(['bash', '-c', shell], env=environment))
+payload = sys.stdin.buffer.read()
+offset = re.search(r'^head -c ([0-9]+) [|] zstd', shell, re.M)
+assert offset
+bootstrap_bytes = int(offset[1])
+magic = bytes.fromhex('28 b5 2f fd')
+assert payload.startswith(magic) and payload[bootstrap_bytes:].startswith(magic)
+Path(os.environ['FIXTURE_SOURCE_BYTES']).write_text(str(len(payload) - bootstrap_bytes))
+sys.exit(subprocess.run(['bash', '-c', shell], input=payload, env=environment).returncode)
 '''
 
 
@@ -70,17 +81,21 @@ def run_suites(repo, *, full, mode, machine, selected, module_time_limit_s, time
     assert not {'SSH_AUTH_SOCK', 'GH_TOKEN', 'XDG_CONFIG_HOME', 'CONF_DIR'} & os.environ.keys()
     assert os.cpu_count() == 2 and time_limit.seconds == 7 and module_time_limit_s == 3
     assert checked_git(repo, 'show', 'origin/main:history.txt') == 'old source'
-    assert checked_git(repo, 'log', '-1', '--format=%s') in ('candidate', 'Mac Linux gate snapshot')
+    assert checked_git(repo, 'rev-list', '--count', '--all') == '1'
+    head = checked_git(repo, 'rev-parse', 'HEAD')
+    assert checked_git(repo, 'rev-parse', 'main') == head
+    assert checked_git(repo, 'rev-parse', 'origin/main') == head
     assert full == (mode is SuiteMode.GATE)
     print('A guest log line must stay outside the JSON result.')
     scenario = os.environ['FIXTURE_GUEST_RESULT']
     if scenario == 'runner-failure':
         raise RuntimeError('fixture guest runner failed')
-    timing = dict(wall_s=1.3, cpu_s=1.0, tests_s=0.7, tests_run=3, failures=0, errors=0, skipped=1, tests=[])
+    timing = dict(wall_s=1.3, cpu_s=1.0, tests_s=0.7, tests_run=3, failures=0, errors=0, tests=[])
     paths = [(suite, path) for suite, path in discover_test_modules(repo)
              if not isinstance(selected, SelectedModules) or str(path.relative_to(repo)) in selected.paths]
     jobs = tuple(GateJobResult(suite, path.name, int(scenario == 'red'), 1.3, 'fixture module output',
-                               cpu_seconds=1.0, times=timing, peak_mib=22) for suite, path in paths)
+                               cpu_seconds=1.0, times=dict(timing, skipped=int(path.name == 'test_second.py')),
+                               peak_mib=22) for suite, path in paths)
     return GateRun(jobs, 2.0, 30, selection_certified=isinstance(selected, SelectedModules), executions=jobs)
 '''
 
@@ -127,14 +142,17 @@ class MacLinuxRouteTests(unittest.TestCase):
         config.mkdir()
         self.registry = config / 'build_targets.conf'
         _ = self.registry.write_text(
-            'kind.mac-linux=ssh\nplatform.mac-linux=linux\nsettings.mac-linux=mac_linux.conf\nenabled.mac-linux=on\n',
+            'kind.mac-linux=ssh\nplatform.mac-linux=linux\nsettings.mac-linux=mac_linux.conf\n'
+            + 'enabled.mac-linux=on\nhost.mac-linux=fixture-mac\n',
             encoding='utf-8')
         _ = (config / 'mac_linux.conf').write_text(
-            f'ssh_path=fixture-mac fixture-guest\naccount={account}\njobs=2\nrun_time_limit_seconds=7\n',
+            f'ssh.hops=fixture-mac fixture-guest\nguest.user={account}\ntest.jobs=2\n'
+            + 'run.time_limit_seconds=7\ncopy.zstd_level=3\n',
             encoding='utf-8')
         _ = cast(object, self.enterContext(patch.dict(os.environ, {
             'CONF_DIR': str(config), 'PATH': str(binaries) + os.pathsep + os.environ['PATH'],
             'FIXTURE_SSH_TRACE': str(self.trace), 'FIXTURE_GUEST_HOME': str(self.guest_home),
+            'FIXTURE_SOURCE_BYTES': str(self.root / 'source.bytes'),
             'FIXTURE_GUEST_USER': account, 'FIXTURE_GUEST_RESULT': 'pass',
             'GH_TOKEN': 'fixture-token', 'SSH_AUTH_SOCK': str(self.root / 'agent.sock'),
             'XDG_CONFIG_HOME': str(self.root / 'outside-config'),
@@ -147,7 +165,6 @@ class MacLinuxRouteTests(unittest.TestCase):
         _ = self.git('add', '.')
         _ = self.git('commit', '-qm', 'base')
         _ = self.git('remote', 'add', 'origin', 'https://example.test/repo.git')
-        _ = self.git('update-ref', 'refs/remotes/origin/main', 'HEAD')
         for folder in ('config', 'scripts/lib', 'scripts/production', 'scripts/fixture'):
             (self.repo / folder).mkdir(parents=True)
         _ = (self.repo / 'config/fixture.conf').touch()
@@ -193,7 +210,7 @@ class MacLinuxRouteTests(unittest.TestCase):
 
     def test_guest_returns_module_metrics(self) -> None:
         result = self.route()
-        assert isinstance(result, GateRun), result
+        assert isinstance(result, mac_linux.MacLinuxGateRun), result
         self.assertTrue(result.passed)
         self.assertEqual(result.peak_memory_mib, 30)
         self.assertEqual(result.seconds, 2)
@@ -204,6 +221,9 @@ class MacLinuxRouteTests(unittest.TestCase):
                          (0, 1.3, 'fixture module output', 1.0, 22))
         assert isinstance(job.times, dict)
         self.assertEqual(job.times['tests_run'], 3)
+        self.assertEqual(result.compressed_bytes, int((self.root / 'source.bytes').read_text(encoding='utf-8')))
+        self.assertGreater(result.compressed_bytes, 0)
+        self.assertEqual(result.module_skips, {'scripts/fixture/test_first.py': 0, 'scripts/fixture/test_second.py': 1})
         self.assert_guest_clean(['run'])
 
     def test_red_module_returns_a_failed_gate(self) -> None:

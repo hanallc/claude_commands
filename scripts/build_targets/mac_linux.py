@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from contextlib import AbstractContextManager, nullcontext, redirect_stdout
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from enum import StrEnum
 import json
 import math
@@ -14,7 +14,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
-from typing import BinaryIO, Literal, TypedDict, cast
+from typing import Literal, TypedDict, cast
 from urllib.parse import urlsplit
 from uuid import uuid4
 
@@ -45,14 +45,15 @@ class GuestSwitch(StrEnum):
 
 @dataclass(frozen=True)
 class GuestSettings:
-    ssh_path: tuple[str, str]
-    account: str
+    ssh_hops: tuple[str, str]
+    guest_user: str
     jobs: int
     run_time_limit_seconds: int
+    zstd_level: int
 
     def command(self, shell: str) -> tuple[str, ...]:
-        mac, guest = self.ssh_path
-        return (*SSH, mac, shlex.join((*SSH, guest, shlex.join(('bash', '-c', shell)))))
+        mac, guest = self.ssh_hops
+        return (*SSH, mac, shlex.join((*SSH, '-l', self.guest_user, guest, shlex.join(('bash', '-c', shell)))))
 
 
 def read_settings(registry: conf.ConfigRead) -> GuestSettings:
@@ -61,22 +62,31 @@ def read_settings(registry: conf.ConfigRead) -> GuestSettings:
         raise GuestUnavailable(f'{TARGET} must use SSH and the Linux platform')
     settings_file = Path(registry.text(f'settings.{TARGET}', recover_invalid=False)).expanduser()
     settings = conf.read(registry.source.parent / settings_file)
-    ssh_path = settings.value('ssh_path', str.split, recover_invalid=False)
-    account = settings.text('account', recover_invalid=False)
-    jobs = settings.value('jobs', int, recover_invalid=False)
-    limit = settings.value('run_time_limit_seconds', int, recover_invalid=False)
-    if len(ssh_path) != 2 or not all(re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]*', host) for host in ssh_path):
-        raise GuestUnavailable('ssh_path must name two SSH aliases')
-    if not re.fullmatch(r'[a-z_][a-z0-9_-]*', account):
-        raise GuestUnavailable('account must name a Linux user')
+    hops = settings.value('ssh.hops', str.split, recover_invalid=False)
+    user = settings.text('guest.user', recover_invalid=False)
+    jobs = settings.value('test.jobs', int, recover_invalid=False)
+    limit = settings.value('run.time_limit_seconds', int, recover_invalid=False)
+    zstd_level = settings.value('copy.zstd_level', int, recover_invalid=False)
+    if len(hops) != 2 or not all(re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]*', host) for host in hops):
+        raise GuestUnavailable('ssh.hops must name two SSH aliases')
+    if not re.fullmatch(r'[a-z_][a-z0-9_-]*', user):
+        raise GuestUnavailable('guest.user must name a Linux user')
     if jobs < 1 or limit < 1:
-        raise GuestUnavailable('jobs and run_time_limit_seconds must be positive')
-    return GuestSettings((ssh_path[0], ssh_path[1]), account, jobs, limit)
+        raise GuestUnavailable('test.jobs and run.time_limit_seconds must be positive')
+    if not 1 <= zstd_level <= 19:
+        raise GuestUnavailable('copy.zstd_level must be between 1 and 19')
+    return GuestSettings((hops[0], hops[1]), user, jobs, limit, zstd_level)
 
 
-def mac_linux_reservation(_repo: Path, _sidecar: Path, _mode: SuiteMode,
+def mac_linux_reservation(_repo: Path, _work: SuiteMode | StepJob,
                           _gate_job: StepJob | GateJobNotRecorded) -> AbstractContextManager[None]:
-    """Keep the reservation around the guest attempt and its cleanup."""
+    """Keep the reservation around the guest attempt and its cleanup.
+
+    B3 adds scripts.build_queue.whole_run.held(repo: Path, target: str, work: SuiteMode | StepJob, gate_job).
+    The context manager yields WholeRun. Set its integer status as for CloudReservation.status.
+    On whole_run.WholeRunRefused, return str(error) as the route fallback.
+    The whole-Mac claim awaits Nate's approval.
+    """
     # TODO(item 191 B3): Reserve mac-linux through the queue before the guest attempt.
     return nullcontext()
 
@@ -98,7 +108,6 @@ class CandidateSource:
     head: str
     commit: str
     tree: str
-    origin_main: str
     origin_url: str
     modules: frozenset[str]
     coverage: ModuleCoverage
@@ -108,8 +117,6 @@ def candidate_source(repo: Path, selected: AllModules | TreeSelection) -> Candid
     from scripts.aws_target import cloud_gate
     from scripts.production.gate import checked_git
 
-    if checked_git(repo, 'rev-parse', '--is-shallow-repository') != 'false':
-        raise GuestUnavailable('the source checkout needs full Git history')
     head = checked_git(repo, 'rev-parse', 'HEAD')
     tree, dirty = cloud_gate.working_tree(repo)
     paths = frozenset(str(path.relative_to(repo)) for _, path in discover_test_modules(repo))
@@ -120,41 +127,54 @@ def candidate_source(repo: Path, selected: AllModules | TreeSelection) -> Candid
         modules = frozenset(selected.paths)
         if not modules <= paths:
             raise GuestUnavailable('selected modules are absent from the checkout')
-    origin_main = checked_git(repo, 'rev-parse', ORIGIN_MAIN)
     origin_url = checked_git(repo, 'remote', 'get-url', 'origin')
     origin = urlsplit(origin_url)
     if origin.password or origin.query or ('://' in origin_url and origin.username):
         raise GuestUnavailable('the origin URL must contain no credential')
     commit = checked_git(repo, 'commit-tree', tree, '-p', head, '-m', 'Mac Linux gate snapshot') if dirty else head
     coverage = ModuleCoverage.COMPLETE if modules == paths else ModuleCoverage.SUBSET
-    return CandidateSource(head, commit, tree, origin_main, origin_url, modules, coverage)
+    return CandidateSource(head, commit, tree, origin_url, modules, coverage)
 
 
-def write_payload(repo: Path, folder: Path, source: CandidateSource, request: GuestRequest) -> Path:
-    from scripts.aws_target.cloud_gate import create_source_bundle
+@dataclass(frozen=True)
+class CompressedSourceCopy:
+    """Hold the bootstrap frame and the Git archive frame for one SSH copy."""
 
-    bundle = folder / 'source.bundle'
-    create_source_bundle(repo, bundle, (source.commit, source.origin_main))
+    path: Path
+    bootstrap_bytes: int
+    compressed_bytes: int
+
+
+def write_payload(repo: Path, folder: Path, request: GuestRequest, level: int) -> CompressedSourceCopy:
     request_file = folder / 'request.json'
     _ = request_file.write_text(json.dumps(request), encoding='utf-8')
-    payload = folder / 'guest.tar'
-    with tarfile.open(payload, 'w') as stream:
-        stream.add(bundle, arcname='source.bundle')
-        stream.add(request_file, arcname='request.json')
-        stream.add(Path(__file__).resolve(), arcname='runner.py')
-    return payload
+    payload = folder / 'guest.tar.zst'
+    with tempfile.TemporaryFile() as bootstrap, payload.open('wb') as output:
+        with tarfile.open(fileobj=bootstrap, mode='w') as stream:
+            stream.add(request_file, arcname='request.json')
+            stream.add(Path(__file__).resolve(), arcname='runner.py')
+        _ = bootstrap.seek(0)
+        _ = subprocess.run(['zstd', f'-{level}', '-q', '-c'], stdin=bootstrap, stdout=output, check=True)
+        bootstrap_bytes = os.fstat(output.fileno()).st_size
+        archive = subprocess.run(
+            ['bash', '-o', 'pipefail', '-c', 'git archive --format=tar "$1" | zstd "$2" -T0 -q -c',
+             TARGET, request['commit'], f'-{level}'],
+            cwd=repo, stdout=output, stderr=subprocess.PIPE, text=True, check=False)
+        if archive.returncode:
+            raise GuestUnavailable(f'source compression failed: {archive.stderr.strip() or archive.returncode}')
+    return CompressedSourceCopy(payload, bootstrap_bytes, payload.stat().st_size - bootstrap_bytes)
 
 
 def guest_shell(settings: GuestSettings, name: str) -> str:
-    return f'''set -eu
-if [ "$(id -un)" != {shlex.quote(settings.account)} ]; then
-    printf 'Expected SSH account %s.\\n' {shlex.quote(settings.account)} >&2
+    return f'''set -euo pipefail
+if [ "$(id -un)" != {shlex.quote(settings.guest_user)} ]; then
+    printf 'Expected SSH account %s.\\n' {shlex.quote(settings.guest_user)} >&2
     exit 1
 fi
 run="$HOME"/{shlex.quote(name)}'''
 
 
-def run_shell(settings: GuestSettings, name: str, source: CandidateSource) -> str:
+def run_shell(settings: GuestSettings, name: str, source: CandidateSource, bootstrap_bytes: int) -> str:
     return guest_shell(settings, name) + f'''
 umask 077
 mkdir -- "$run"
@@ -162,27 +182,32 @@ trap 'rm -rf -- "$run" || exit 1' EXIT
 cd "$run"
 exec 9> .running
 flock -x 9
-tar -xf -
 mkdir repo home home/.claude runtime bin
+head -c {bootstrap_bytes} | zstd -d -q | tar -xf -
+zstd -d -q | tar -xf - -C repo
 ln -s "$run/repo/config" home/.claude/config
-git -C repo init -q --initial-branch=main
-git -C repo bundle unbundle ../source.bundle >&2
-git -C repo update-ref refs/heads/main {shlex.quote(source.origin_main)}
-git -C repo remote add origin {shlex.quote(source.origin_url)}
-git -C repo update-ref {ORIGIN_MAIN} {shlex.quote(source.origin_main)}
-git -C repo symbolic-ref refs/remotes/origin/HEAD {ORIGIN_MAIN}
-git -C repo checkout -q --detach {shlex.quote(source.commit)}
-rm -- source.bundle
 browser=$(command -v chromium) || {{ printf 'Chromium is absent from the guest PATH.\\n' >&2; exit 127; }}
 ln -s "$browser" bin/google-chrome
 export RUSTUP_HOME="${{RUSTUP_HOME:-$HOME/.rustup}}"
 export HOME="$run/home" XDG_RUNTIME_DIR="$run/runtime" PYTHONUNBUFFERED=1
-export USER={shlex.quote(settings.account)} LOGNAME={shlex.quote(settings.account)}
+export USER={shlex.quote(settings.guest_user)} LOGNAME={shlex.quote(settings.guest_user)}
 export USERNAME="$USER" LNAME="$USER" PATH="$run/bin:$PATH"
 unset DBUS_SESSION_BUS_ADDRESS SSH_AUTH_SOCK SSH_AGENT_PID SUDO_USER SUDO_UID SUDO_GID
 unset XDG_CONFIG_HOME XDG_CACHE_HOME XDG_DATA_HOME XDG_STATE_HOME
 unset GH_CONFIG_DIR GH_TOKEN GITHUB_TOKEN GH_ENTERPRISE_TOKEN GITHUB_ENTERPRISE_TOKEN
 unset CLAUDE_CONFIG_DIR CODEX_HOME CONF_DIR PYTHONPATH PYTHONHOME
+git -C repo init -q --initial-branch=main
+git -C repo -c core.autocrlf=false -c core.filemode=true add --force --all
+tree=$(git -C repo write-tree)
+if [ "$tree" != {shlex.quote(source.tree)} ]; then
+    printf 'The archive tree %s differs from the requested tree.\\n' "$tree" >&2
+    exit 1
+fi
+commit=$(git -C repo -c user.name='Mac Linux gate' -c user.email='mac-linux@localhost' commit-tree "$tree" -m 'Mac Linux gate source')
+git -C repo update-ref refs/heads/main "$commit"
+git -C repo remote add origin {shlex.quote(source.origin_url)}
+git -C repo update-ref {ORIGIN_MAIN} "$commit"
+git -C repo symbolic-ref refs/remotes/origin/HEAD {ORIGIN_MAIN}
 umask 022
 cd repo
 set -- ./scripts/lib/py -X cpu_count={settings.jobs} ../runner.py
@@ -211,11 +236,12 @@ fi'''
     return ''
 
 
-def run_remote(settings: GuestSettings, name: str, source: CandidateSource, payload: BinaryIO) -> str:
+def run_remote(settings: GuestSettings, name: str, source: CandidateSource, copy: CompressedSourceCopy) -> str:
     timeout = settings.run_time_limit_seconds + TRANSFER_ALLOWANCE_SECONDS
     try:
-        reply = subprocess.run(settings.command(run_shell(settings, name, source)), stdin=payload,
-                               capture_output=True, text=True, errors='replace', timeout=timeout, check=False)
+        with copy.path.open('rb') as payload:
+            reply = subprocess.run(settings.command(run_shell(settings, name, source, copy.bootstrap_bytes)), stdin=payload,
+                                   capture_output=True, text=True, errors='replace', timeout=timeout, check=False)
         if reply.returncode:
             detail = ' '.join(reply.stderr.split())[-1200:]
             raise GuestUnavailable(f'SSH or guest runner exited {reply.returncode}: {detail or "no diagnostic"}')
@@ -226,7 +252,15 @@ def run_remote(settings: GuestSettings, name: str, source: CandidateSource, payl
     return reply.stdout
 
 
-def completed_run(text: str, request: GuestRequest, source: CandidateSource) -> GateRun:
+@dataclass(frozen=True, kw_only=True)
+class MacLinuxGateRun(GateRun):
+    """Keep the source size and the skip counts that the guest measured."""
+
+    compressed_bytes: int
+    module_skips: dict[str, int]
+
+
+def completed_run(text: str, request: GuestRequest, source: CandidateSource, compressed_bytes: int) -> MacLinuxGateRun:
     row = ledger.mapping(cast(object, json.loads(text)))
     for key in ('attempt', 'commit', 'tree'):
         if row.get(key) != request[key]:
@@ -238,7 +272,11 @@ def completed_run(text: str, request: GuestRequest, source: CandidateSource) -> 
         raise GuestUnavailable('the guest result has a different module list')
     if row.get('verdict') != ('pass' if run.passed else 'fail'):
         raise GuestUnavailable('the guest result has an invalid verdict')
-    return replace(run, coverage=source.coverage)
+    skips = {path: job.times['skipped'] for path, job in zip(modules, run.jobs, strict=True)
+             if isinstance(job.times, dict)}
+    return MacLinuxGateRun(run.jobs, run.seconds, run.peak_memory_mib, run.tests_reused, run.selection_certified,
+                           run.executions, run.time_limit_report, coverage=source.coverage,
+                           compressed_bytes=compressed_bytes, module_skips=skips)
 
 
 def route(repo: Path, *, mode: SuiteMode, full: bool, module_time_limit_s: float,
@@ -263,10 +301,10 @@ def route(repo: Path, *, mode: SuiteMode, full: bool, module_time_limit_s: float
                                jobs=settings.jobs)
         with tempfile.TemporaryDirectory(prefix=f'{TARGET}-{attempt}-') as temporary:
             folder = Path(temporary)
-            payload = write_payload(repo, folder, source, request)
-            with mac_linux_reservation(repo, folder / 'reservation.cgroup', mode, gate_job):
-                with payload.open('rb') as stream:
-                    run = completed_run(run_remote(settings, f'{TARGET}-{attempt}', source, stream), request, source)
+            copy = write_payload(repo, folder, request, settings.zstd_level)
+            with mac_linux_reservation(repo, mode, gate_job):
+                reply = run_remote(settings, f'{TARGET}-{attempt}', source, copy)
+                run = completed_run(reply, request, source, copy.compressed_bytes)
         if gate.checked_git(repo, 'rev-parse', 'HEAD') != source.head or cloud_gate.working_tree(repo)[0] != source.tree:
             raise GuestUnavailable('the checkout changed during the guest run')
         return run
@@ -285,9 +323,8 @@ def run_guest() -> None:
     request = cast(GuestRequest, json.loads((repo.parent / 'request.json').read_text(encoding='utf-8')))
     if os.cpu_count() != request['jobs']:
         raise GuestUnavailable(f'The guest Python did not set the CPU count to {request["jobs"]}.')
-    commit = gate.checked_git(repo, 'rev-parse', 'HEAD')
     tree = gate.checked_git(repo, 'rev-parse', 'HEAD^{tree}')
-    if (commit, tree) != (request['commit'], request['tree']):
+    if tree != request['tree']:
         raise GuestUnavailable('The guest checkout differs from the request.')
     selection = request['selection']
     with redirect_stdout(sys.stderr):
@@ -295,7 +332,7 @@ def run_guest() -> None:
                               selected=ALL_MODULES if selection == 'all' else SelectedModules(tuple(selection)),
                               module_time_limit_s=request['module_time_limit_s'],
                               time_limit=GateTimeLimit(request['run_time_limit_seconds']))
-    print(json.dumps({'attempt': request['attempt'], 'commit': commit, 'tree': tree,
+    print(json.dumps({'attempt': request['attempt'], 'commit': request['commit'], 'tree': tree,
                       'verdict': 'pass' if run.passed else 'fail', 'gate': gate_box.encode_run(run)}), flush=True)
 
 
