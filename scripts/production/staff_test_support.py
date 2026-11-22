@@ -16,6 +16,7 @@ from subprocess import Popen as start_staff_owner
 from subprocess import run as run_fixture_git
 import sys
 import tempfile
+import time
 import traceback
 import unittest
 from collections.abc import Generator
@@ -747,25 +748,32 @@ with open(Path(os.environ['STAFF_TEST_CHECKOUT']) / "scripts/lib/package_root.py
 from scripts.production.staff_test_support import STAFF_OWNER_PARENT_CHECK_SECONDS, run_staff_owner_request
 from scripts.production import staff_sources
 
+# Report a null request to the owner through the request child's exit status.
+STOP_REQUEST_EXIT_STATUS = 75
+
 def fork_request(listener, connection, notices, wake):
     pid = os.fork()
     if pid:
         return pid
+    status = 0
     try:
         signal.set_wakeup_fd(-1)
         signal.signal(signal.SIGCHLD, signal.SIG_DFL)
         notices.close()
         wake.close()
         listener.close()
-        sys.stdin.close()
         connection.setblocking(True)
         with connection.makefile('rb') as channel:
             line = channel.readline()
         if line:
-            run_staff_owner_request(connection, json.loads(line))
+            request = json.loads(line)
+            if request is None:
+                status = STOP_REQUEST_EXIT_STATUS
+            else:
+                run_staff_owner_request(connection, request)
     finally:
         connection.close()
-        os._exit(0)
+        os._exit(status)
 
 children = set()
 notices, wake = socket.socketpair()
@@ -782,17 +790,20 @@ with notices, wake:
             listener.setblocking(False)
             print(listener.getsockname()[1], flush=True)
             while os.getppid() == parent_pid:
-                children = {pid for pid in children if os.waitpid(pid, os.WNOHANG)[0] == 0}
+                for pid in tuple(children):
+                    finished, status = os.waitpid(pid, os.WNOHANG)
+                    if not finished:
+                        continue
+                    children.remove(pid)
+                    if os.waitstatus_to_exitcode(status) == STOP_REQUEST_EXIT_STATUS:
+                        listener.close()
+                        closing = True
                 if closing and not children:
                     break
-                readers = [notices] if closing else [sys.stdin, listener, notices]
+                readers = [notices] if closing else [listener, notices]
                 ready, _, _ = select.select(readers, [], [], STAFF_OWNER_PARENT_CHECK_SECONDS)
                 if notices in ready:
                     notices.recv(4096)
-                # The test never writes to the pipe. Readiness means end of file.
-                if sys.stdin in ready:
-                    listener.close()
-                    closing = True
                     continue
                 if listener not in ready or os.getppid() != parent_pid:
                     continue
@@ -828,16 +839,21 @@ class SharedStaffOwner:
         process = self.lifetime.enter_context(start_staff_owner(
             [sys.executable, str(script), str(os.getpid())], cwd=self.root,
             env={**os.environ, "TMPDIR": str(self.root)},
-            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=errors, text=True,
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=errors, text=True,
             start_new_session=True,
         ))
         self.pid = process.pid
+        port = ""
 
         def stop() -> None:
-            cast(TextIO, process.stdin).close()
+            deadline = time.monotonic() + TEST_HANG_GUARD_SECS
             try:
-                _ = process.wait(timeout=TEST_HANG_GUARD_SECS)
-            except subprocess.TimeoutExpired:
+                if port:
+                    with socket.create_connection(("127.0.0.1", int(port)), timeout=TEST_HANG_GUARD_SECS) as connection:
+                        connection.settimeout(max(0, deadline - time.monotonic()))
+                        connection.sendall(b"null\n")
+                _ = process.wait(timeout=max(0, deadline - time.monotonic()))
+            except (OSError, subprocess.TimeoutExpired):
                 try:
                     process_group.send_process_group(process.pid, signal.SIGKILL)
                 except ProcessLookupError:

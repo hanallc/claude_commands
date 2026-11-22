@@ -26,6 +26,7 @@ OWNER_START_SECONDS = 20
 OWNER_CLOSE_OBSERVE_SECONDS = 1
 OWNER_PARENT = '''
 import os
+import socket
 import subprocess
 import sys
 from pathlib import Path
@@ -36,26 +37,34 @@ wait_for_owner = subprocess.Popen.wait
 
 def report_close(process, *args, **kwargs):
     if kwargs.get("timeout") is not None:
-        print("pipe closed", flush=True)
+        print("close sent", flush=True)
     return wait_for_owner(process, *args, **kwargs)
 
 owner = SharedStaffOwner(Path(sys.argv[1]))
+keeper_control = None
 try:
     port = owner.port
     keeper_pid = 0
     if sys.argv[2] == "1":
+        keeper_control, held = socket.socketpair()
         keeper_pid = os.fork()
         if keeper_pid == 0:
             os.close(sys.stdout.fileno())
+            keeper_control.close()
             try:
-                sys.stdin.read()
+                held.recv(1)
             finally:
                 os._exit(0)
+        held.close()
     print(port, owner.pid, keeper_pid, flush=True)
-    sys.stdin.read()
+    sys.stdin.readline()
 finally:
     with patch.object(subprocess.Popen, "wait", report_close):
         owner.close()
+if keeper_control is not None:
+    with keeper_control:
+        sys.stdin.read()
+    os.waitpid(keeper_pid, 0)
 '''
 BLOCKED_REQUEST = '''
 import os
@@ -117,8 +126,8 @@ class SharedStaffOwnerTests(unittest.TestCase):
         return output.readline().strip()
 
     @contextmanager
-    def owner(self, *, fork_writer: bool = False) -> Generator[tuple[subprocess.Popen[str], int, int, int]]:
-        command = [sys.executable, "-c", OWNER_PARENT, str(self.root), str(int(fork_writer))]
+    def owner(self, *, fork_child: bool = False) -> Generator[tuple[subprocess.Popen[str], int, int, int]]:
+        command = [sys.executable, "-c", OWNER_PARENT, str(self.root), str(int(fork_child))]
         with subprocess.Popen(command, cwd=CHECKOUT, env=self.environment, stdin=subprocess.PIPE,
                               stdout=subprocess.PIPE, text=True) as parent:
             owner_pid = None
@@ -167,15 +176,18 @@ class SharedStaffOwnerTests(unittest.TestCase):
                 self.assertTrue(owner_exited(OWNER_EXIT_SECONDS), "The staff owner survived its parent")
                 self.assertTrue(request_exited(OWNER_EXIT_SECONDS), "The request survived the staff owner")
 
-    def test_killed_parent_stops_owner_with_inherited_writer(self) -> None:
-        with self.owner(fork_writer=True) as (parent, _, owner_pid, keeper_pid):
+    def test_close_stops_owner_while_forked_child_stays_alive(self) -> None:
+        with self.owner(fork_child=True) as (parent, _, owner_pid, keeper_pid):
             self.assertGreater(keeper_pid, 1)
             with watch_exit(owner_pid) as owner_exited, watch_exit(keeper_pid) as keeper_exited:
-                parent.kill()
-                self.assertEqual(parent.wait(timeout=OWNER_EXIT_SECONDS), -signal.SIGKILL)
-                self.assertTrue(owner_exited(OWNER_EXIT_SECONDS), "The inherited writer kept the staff owner alive")
-                self.assertFalse(keeper_exited(0), "The forked child did not keep the pipe open")
-                cast(TextIO, parent.stdin).close()
+                control = cast(TextIO, parent.stdin)
+                _ = control.write("close\n")
+                control.flush()
+                self.assertEqual(self.parent_line(parent), "close sent")
+                self.assertTrue(owner_exited(OWNER_EXIT_SECONDS), "The forked child kept the staff owner alive")
+                self.assertFalse(keeper_exited(0), "The forked child exited before the staff owner")
+                _ = parent.communicate(timeout=OWNER_EXIT_SECONDS)
+                self.assertEqual(parent.returncode, 0)
                 self.assertTrue(keeper_exited(OWNER_EXIT_SECONDS), "The forked child survived fixture cleanup")
 
     def test_close_lets_an_accepted_request_finish(self) -> None:
@@ -183,7 +195,7 @@ class SharedStaffOwnerTests(unittest.TestCase):
             with self.blocked_request(port) as (connection, peer, request_pid, written):
                 with watch_exit(owner_pid) as owner_exited, watch_exit(request_pid) as request_exited:
                     cast(TextIO, parent.stdin).close()
-                    self.assertEqual(self.parent_line(parent), "pipe closed")
+                    self.assertEqual(self.parent_line(parent), "close sent")
                     self.assertFalse(request_exited(OWNER_CLOSE_OBSERVE_SECONDS),
                                      "Close ended the accepted request")
                     peer.sendall(b"w")
