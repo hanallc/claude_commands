@@ -1531,11 +1531,7 @@ def need_in_next_part(steps: Sequence[admission_records.RunningStep]) -> bool:
                and isinstance(step.measured.window, progress.WindowPeak) for step in steps)
 
 
-WaitCause = Literal["memory", "its turn", "Cargo token", "GPU slot", "build slot", "memory pressure",
-                    "AWS slot", "build hold", "Mac", "build space", "the build in the same Cargo folder"]
-
-
-def wait_why(reason: admission_records.WaitReason) -> WaitCause:
+def wait_why(reason: admission_records.WaitReason) -> str:
     """Name the resource or queue action that a waiter needs."""
     match reason:
         case admission_records.NeedsMemory():
@@ -1554,6 +1550,8 @@ def wait_why(reason: admission_records.WaitReason) -> WaitCause:
             return "build space"
         case admission_records.GpuSlotWait():
             return "GPU slot"
+        case admission_records.RunLimitWait():
+            return admission_records.run_limit_text(reason)
         case admission_records.EstimateExpired():
             return "memory"
         case admission_records.NatedevHeld():

@@ -72,6 +72,7 @@ Shared session folders do not select an account, and these rows never become `Cl
 `BackendUnavailable` names unavailable backend evidence.
 A live Claude session can supply backend evidence before its transcript exists.
 A caller that already read the session registry sets `StaffSnapshot.running_sessions`, and `backends` then reads no registry.
+When several Claude workers need transcript evidence, `backends` scans each projects root once.
 
 `StaffRow.paused` is `Paused(since, by, why)` or `Active()`.
 `StaffRow.exited` is `Exited(since, by, why)` or `Active()`.
