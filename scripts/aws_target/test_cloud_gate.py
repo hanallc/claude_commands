@@ -1999,6 +1999,62 @@ with (mock.patch.object(cloud_gate, 'AwsCli', return_value=api),
         self.assertEqual(outcome['status'], 'complete')
         self.assertGreaterEqual(self.now - started, 90)
 
+    def test_a_paired_trial_that_pauses_its_log_is_not_unreachable(self) -> None:
+        # A paired trial stops its log pushes while it measures; only the EC2 state shows that it lives.
+        _ = write_config_fixture(self.root / 'build_targets.conf', f'{target_config.UNREACHABLE_WAIT_KEY}=30\n')
+        request = self.request
+        request.update(task='paired', base={'commit': 'base', 'tree': 'base-tree'},
+                       changed={'commit': 'commit', 'tree': 'tree'}, module='fixture/test_ok.py', rounds=1)
+        sample = {'module': 'fixture/test_ok.py', 'variant': 'base', 'round': 1, 'cpu_s': 1.0,
+                  'peak_mib': 1.0, 'wall_s': 1.0, 'status': 0, 'tests': 1, 'failures': 0, 'errors': 0,
+                  'instance_type': 'm7a.8xlarge', 'box': ''}
+        self.fake.result = {**request, 'runs': [sample, {**sample, 'variant': 'changed'}], 'verdict': 'pass',
+                            'gate_s': 2.0}
+        cloud_gate.save(self.folder / 'request.json', request)
+        self.fake.has_result = False
+        started = self.now
+
+        def pause(seconds: float) -> None:
+            self.now += seconds
+            self.fake.has_result = self.now - started >= 90
+
+        worker = cloud_gate.GateWorker(AwsCli('build-scaler', 'fixture-region', 1, execute=self.fake),
+            self.book, self.settings, self.folder / 'reservation.cgroup', clock=lambda: self.now, pause=pause)
+        with (mock.patch.object(time, 'monotonic', side_effect=lambda: self.now),
+              redirect_stdout(StringIO())):
+            outcome = worker.execute(self.folder, request, self.deployment)
+        self.assertEqual(outcome['status'], 'complete')
+        self.assertGreaterEqual(self.now - started, 90)
+
+    def test_time_when_s3_cannot_be_read_is_not_silence(self) -> None:
+        _ = write_config_fixture(self.root / 'build_targets.conf', f'{target_config.UNREACHABLE_WAIT_KEY}=30\n')
+        self.fake.has_result = False
+        started = self.now
+
+        def pause(seconds: float) -> None:
+            # S3 lists time out for 60 seconds; the box pushes again after S3 recovers and then sends its result.
+            self.now += seconds
+            elapsed = self.now - started
+            if elapsed < 60:
+                self.fake.read_timeouts = ['list-objects-v2']
+            elif elapsed >= 70:
+                self.fake.log += 'heartbeat\n'
+                self.fake.has_result = elapsed >= 80
+
+        worker = cloud_gate.GateWorker(AwsCli('build-scaler', 'fixture-region', 1, execute=self.fake),
+            self.book, self.settings, self.folder / 'reservation.cgroup', clock=lambda: self.now, pause=pause)
+        with (mock.patch.object(time, 'monotonic', side_effect=lambda: self.now),
+              redirect_stdout(StringIO())):
+            outcome = worker.execute(self.folder, self.request, self.deployment)
+        self.assertEqual(outcome['status'], 'complete')
+
+    def test_a_bad_unreachable_wait_launches_no_box(self) -> None:
+        _ = write_config_fixture(self.root / 'build_targets.conf', f'{target_config.UNREACHABLE_WAIT_KEY}=0\n')
+        outcome = self.execute()
+        self.assertEqual(outcome['status'], 'fallback')
+        self.assertIn(target_config.UNREACHABLE_WAIT_KEY, str(outcome['reason']))
+        self.assertEqual(self.fake.launches, [])
+
     def test_stopped_instance_reports_a_confirmed_spot_interruption(self) -> None:
         self.fake.has_result = False
         self.fake.state = 'shutting-down'
