@@ -1755,7 +1755,8 @@ class AdmissionServer:
 
     def _refresh_pass_slots(self, inputs: records.QueueInputs,
                             ordered: list[tuple[Path, records.RankedWaiter]]) -> records.QueueInputs:
-        local_paths = {path for path, _ in inputs.ordered}
+        waiting_owners = {records.waiter_owner(waiting.row) for waiting in self.waiters.values()}
+        local_paths = {path for path, row in inputs.ordered if records.waiter_owner(row) in waiting_owners}
         inputs = replace(inputs, ordered=[(path, row) for path, row in ordered if path in local_paths])
         return self._inputs_with_current_slots(inputs, ordered)
 
@@ -1938,10 +1939,13 @@ class AdmissionServer:
         present = {row.get("move_id") for _, row in rows}
         for place in self.places.values():
             if place.move_id and place.move_id not in present:
-                row = gate.rank_waiter({**place.queue_identity, "need": 0, "move_id": place.move_id,
-                    "ci_runner": place.ci_runner, "order_since": self._run_order_since(place.since, place.run)},
-                    records.NormalOrder())
-                rows.append((self.state_dir / place.move_id, row))
+                grant = self.reservations.get(place.episode)
+                row: records.Waiter = (grant.queue_waiter if grant is not None else
+                    {**place.queue_identity, "need": 0, "ci_runner": place.ci_runner})
+                ranked = gate.rank_waiter({**row, "move_id": place.move_id,
+                    "order_since": self._run_order_since(place.since, place.run)}, records.NormalOrder())
+                key = records.waiter_owner(row) if grant is not None else place.move_id
+                rows.append((self.state_dir / key, ranked))
         if isinstance(self.priority, records.QueuePriority):
             return self._rank_priority_waiters(rows, self.priority)
         return gate.sort_waiters(rows)
@@ -1955,6 +1959,10 @@ class AdmissionServer:
     def _visible_queue_order(self, ordered: list[tuple[Path, records.RankedWaiter]]
                              ) -> list[tuple[Path, records.RankedWaiter]]:
         visible = {waiting.row.get("move_id") for waiting in self.waiters.values()}
+        for record in self.reservations.values():
+            place = self.places.get(_place_key(record.owner, record.queue_waiter["since"]))
+            if place is not None and place.episode == record.episode and place.move_id:
+                visible.add(place.move_id)
         for request in self.placement_requests.values():
             if request.episode in self.waiters or not self._placement_waiting(request):
                 continue
@@ -2247,7 +2255,9 @@ class AdmissionServer:
             if resolved_name != repository_name:
                 row["queue_waiter"] = {**record.queue_waiter, "repository_name": resolved_name}
             lifetime = evidence.lifetimes.get(episode, gate.LiveOwnerProcess())
-            if isinstance(lifetime, gate.PopulatedStepScope) and episode in self.placement_requests:
+            unscoped_direct = (not record.sidecar and episode not in self.placement_requests
+                               and episode in evidence.lifetimes)
+            if isinstance(lifetime, gate.PopulatedStepScope) or unscoped_direct:
                 self._clear_wait_rank(record.owner, record.queue_waiter["since"], episode)
             if record.episode.startswith("uid:") and isinstance(memory, records.MeasuredMemory):
                 if isinstance(memory.anonymous, records.AnonymousRunUse):
@@ -2628,8 +2638,8 @@ class AdmissionServer:
             self.spacing = proposed.spacing
             self._admit([waiting], config, self.configuration.peak_history_share_percent, cargo_folder=cargo_folder)
         self.persist()
-        remaining_order = self._visible_queue_order(self._full_queue_order(captured.ranked_waiters))
-        self._publish_replies(remaining_order, ci_holds=ci_holds)
+        visible_order = self._visible_queue_order(self._full_queue_order(captured.ranked_waiters))
+        self._publish_replies(visible_order, ci_holds=ci_holds)
         assert isinstance(self.published, PublishedReplies)
         waiting_steps = self.published.view.reading.view.waiting
         positions = self.published.wait_positions
@@ -2665,7 +2675,7 @@ class AdmissionServer:
             self.next_pass = self.clock.monotonic()
         remaining = {owner for owner, episode in by_owner.items() if episode in self.waiters}
         snapshot_owners = (inputs.waiter_orders.keys() | held_owners) & remaining
-        ordered = [(path, row) for path, row in remaining_order if records.waiter_owner(row) in snapshot_owners]
+        ordered = [(path, row) for path, row in visible_order if records.waiter_owner(row) in snapshot_owners]
         try:
             queue_snapshot.write_queue_snapshot(self.state_dir,
                 replace(inputs, ordered=ordered, spacing=self.spacing,
@@ -3109,7 +3119,7 @@ class AdmissionServer:
                 self.ledger[request.episode] = ReplayEntry(reply, LiveGrant())
                 self._watch_owner(request.owner)
             self._save_place(request, waiting.row)
-            if request.episode not in self.placement_requests:
+            if isinstance(admission, wire.LaunchAdmitted):
                 self._end_move(waiting)
             replies.append(reply)
         first = waiters[0].request
@@ -3133,6 +3143,8 @@ class AdmissionServer:
             if isinstance(lifetime, gate.PopulatedStepScope):
                 self._watch_scope(lifetime, episode)
                 return
+            self._clear_wait_rank(record.owner, record.queue_waiter["since"], episode)
+        elif isinstance(ending, ReleaseStatus) and episode not in self.placement_requests:
             self._clear_wait_rank(record.owner, record.queue_waiter["since"], episode)
         ended_at = (step_estimator.epoch(record.finalization["ended_at"])
                     if isinstance(record.finalization, dict) else self.clock.now())

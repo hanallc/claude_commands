@@ -580,6 +580,7 @@ class QueueMoveTests(unittest.TestCase):
             fixture.hold_starts()
             absent, first, middle, last = [fixture.request(since=fixture.clock.now() + offset)
                                            for offset in range(4)]
+            first = replace(first, sidecar=str(fixture.root / f"sample-{first.owner.pid}.cgroup"))
             for request in (absent, first, middle, last):
                 self.assertIsInstance(fixture.server.handle_request(request)[0], wire.Wait)
             _, first_id, middle_id, last_id = ids(move_line(fixture))
@@ -600,6 +601,18 @@ class QueueMoveTests(unittest.TestCase):
             fixture.allow_next_start()
             _ = fixture.run_pass()
             self.assertEqual(set(fixture.server.reservations), {first.episode})
+            self.assertEqual(fixture.queue_pids(), [first.owner.pid, last.owner.pid, middle.owner.pid])
+            line = move_line(fixture)
+            self.assertEqual(line.members[0], records.QueueMoveMember(first_id, movable=False))
+            fixture.hold_starts()
+            waiting = fixture.run_pass()
+            self.assertEqual(move_line(fixture), line)
+            self.assertEqual([entry.owner for entry in waiting.rows],
+                             [records.run_owner(request.owner.pid, request.owner.start_time)
+                              for request in (last, middle)])
+
+            _ = fixture.scope(first.owner)
+            _ = fixture.run_pass()
             view, = fixture.server.handle_request(wire.ViewRequest())
             assert isinstance(view, wire.ViewReply)
             self.assertEqual([row.pid for row in view.reading.view.waiting], [last.owner.pid, middle.owner.pid])
@@ -654,8 +667,10 @@ class QueueMoveTests(unittest.TestCase):
             fixture.free(0)
             fixture.hold_starts()
             first = placement_request(fixture, since=fixture.clock.now() - 10)
+            assert isinstance(first.local, wire.LocalAdmissionContext)
             first = replace(first, prerequisite=placement.TokenNotRequired(),
-                constraints=replace(first.constraints, candidates=(local_candidate(fixture),)))
+                constraints=replace(first.constraints, candidates=(local_candidate(fixture),)),
+                local=replace(first.local, sidecar=str(fixture.root / f"sample-{first.owner.pid}.cgroup")))
             middle = fixture.request(since=fixture.clock.now())
             last = fixture.request(since=fixture.clock.now() + 1)
             _ = fixture.server.handle_request(first)
@@ -672,6 +687,12 @@ class QueueMoveTests(unittest.TestCase):
             fixture.allow_next_start()
             granted, = fixture.server.handle_request(first)
             assert isinstance(granted, wire.LocalPlacementGranted)
+            self.assertEqual(fixture.queue_pids(), [first.owner.pid, last.owner.pid, middle.owner.pid])
+            self.assertEqual(move_line(fixture).members[0], records.QueueMoveMember(first_id, movable=False))
+
+            fixture.hold_starts()
+            _ = fixture.scope(wire.Owner(first.owner.pid, first.owner.start_time))
+            _ = fixture.run_pass()
             published = move_line(fixture)
             self.assertEqual(ids(published), [last_id, middle_id])
             self.assertEqual(fixture.queue_pids(), [last.owner.pid, middle.owner.pid])
@@ -779,6 +800,8 @@ class QueueMoveTests(unittest.TestCase):
             fixture.free(0)
             fixture.hold_starts()
             requests = [fixture.request(since=fixture.clock.now() + index) for index in range(3)]
+            starting = requests[1]
+            requests[1] = replace(starting, sidecar=str(fixture.root / f"sample-{starting.owner.pid}.cgroup"))
             for request in requests:
                 _ = fixture.server.handle_request(request)
             line = move_line(fixture)
@@ -794,6 +817,7 @@ class QueueMoveTests(unittest.TestCase):
             self.assertEqual(ids(move_line(fixture)), [last, first])
             self.assertEqual(fixture.server.queue_pins, (QueuePin(first, QueueRowAnchor(last)),))
             fixture.free(0)
+            _ = fixture.scope(starting.owner)
 
             newcomer = fixture.request(since=fixture.clock.now() + 3)
             _ = fixture.server.handle_request(newcomer)
@@ -833,6 +857,8 @@ class QueueMoveTests(unittest.TestCase):
             fixture.free(0)
             fixture.hold_starts()
             requests = [fixture.request(since=fixture.clock.now() + index) for index in range(5)]
+            starting = requests[-1]
+            requests[-1] = replace(starting, sidecar=str(fixture.root / f"sample-{starting.owner.pid}.cgroup"))
             units = ["natemerge", "urgent", "ordinary", "later-unit", "ordinary"]
             requests = [replace(request, identity=replace(request.identity, unit=unit))
                         for request, unit in zip(requests, units, strict=True)]
@@ -910,6 +936,10 @@ class QueueMoveTests(unittest.TestCase):
             fixture.allow_next_start()
             _ = fixture.run_pass()
             self.assertIn(requests[4].episode, fixture.server.reservations)
+            self.assertEqual(fixture.server.queue_pins, (QueuePin(third, QueueHeadAnchor()),))
+            fixture.hold_starts()
+            _ = fixture.scope(starting.owner)
+            _ = fixture.run_pass()
             self.assertEqual(fixture.server.queue_pins, ())
             remaining = ids(move_line(fixture))
             self.assertNotIn(third, remaining)

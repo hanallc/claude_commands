@@ -2383,15 +2383,18 @@ The service applies the usual priority and arrival rules to all saved waits.
 It then places each pinned wait directly after its anchor.
 A move gives the moved row a new anchor and keeps its former successor in place.
 Absent waits stay in this order until they return or depart.
-Placement, memory admission, and continuation claims use the visible rows in this order.
-The page, client replies, the head-stall snapshot, and move validation also use the visible rows.
-The service publishes the order after it grants starts.
+Placement, memory admission, and continuation claims use the eligible rows in this order.
+The head-stall snapshot uses the order of local waits.
+The page, client positions, and move validation include granted rows until the service sees them start.
+A granted row keeps its place and has no move handle.
 When run times tie, the earlier step arrival comes first. PID breaks a tie in step arrival.
 A confirmed move or Undo changes queue order only.
 A drag can return a waiting row's unstarted slot claim, as a bump does.
 A departing row loses its pin.
 A row anchored to the departing row inherits its anchor or its predecessor in the full order.
-A grant that can still return before launch keeps its place hidden until execution starts or the request ends.
+A local reservation leaves the queue when the service sees processes in its scope.
+For a direct reservation without a scope file, the first reading of the reservation ends the wait.
+A placement retry before launch keeps its place.
 Both hosts use the visible order for normal steps.
 When placement preparation sees a remote start, it ends the startup hold and removes the local waiter.
 The table includes remote-only waits in queue order.
