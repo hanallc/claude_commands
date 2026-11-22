@@ -720,7 +720,7 @@ def read_run(path: Path) -> RunState:
     return NO_RUN if values is None else decode_run(values, path)
 
 
-def decode_run(values: dict[str, object], path: Path) -> RunRecord:
+def decode_run(values: dict[str, object], path: Path, *, moved_from_claim: bool = False) -> RunRecord:
     pid = values.get("pid")
     proc_start = values.get("proc_start")
     what = values.get("what")
@@ -782,7 +782,7 @@ def decode_run(values: dict[str, object], path: Path) -> RunRecord:
             saved = mac_repository_record(values["mac_repository"])
         except StateReadError as error:
             raise StateReadError(f"{path}: {error}") from error
-        if saved.claim_file != path.name or saved.key != record.get("repo_key"):
+        if (not moved_from_claim and saved.claim_file != path.name) or saved.key != record.get("repo_key"):
             raise StateReadError(f"{path} has a mismatched Mac repository identity")
         record["mac_repository"] = saved.record()
     if "remote_host" not in values:
@@ -942,10 +942,6 @@ class WaitReservationLocation:
         return cls(path, claim["pid"], claim["proc_start"], claim["submitting_session"])
 
 
-class ReleasedWaitReservation:
-    """The waiter no longer holds its reservation."""
-
-
 def released_wait_path(paths: StatePaths, identity: ClaimIdentity) -> Path:
     return paths.wait_locations / f"{pending_start_key(identity)}.released"
 
@@ -967,38 +963,96 @@ def save_wait_location(paths: StatePaths, identity: ClaimIdentity, reservation: 
     released_wait_path(paths, identity).unlink(missing_ok=True)
 
 
-def _wait_location_owner(values: dict[str, object], location: Path) -> tuple[int, str]:
+@dataclass(frozen=True)
+class WaiterProcessIdentity:
+    """The process that owned the wait reservation."""
+
+    pid: int
+    proc_start: str
+
+    def ended(self) -> bool:
+        owner = process_identity.process_start(self.pid)
+        return not isinstance(owner, process_identity.Unreadable) and owner != process_identity.Started(self.proc_start)
+
+
+def _wait_location_owner(values: dict[str, object], location: Path) -> WaiterProcessIdentity:
     pid = values.get("pid")
-    if type(pid) is not int:
+    if type(pid) is not int or pid < 1:
         raise StateReadError(f"{location} has an invalid waiter pid")
-    return pid, required_string(values, "proc_start", location)
+    start = values.get("proc_start")
+    if not isinstance(start, str) or not start:
+        raise StateReadError(f"{location} has an invalid waiter proc_start")
+    return WaiterProcessIdentity(pid, start)
 
 
-def read_wait_location(
-    paths: StatePaths, identity: ClaimIdentity,
-) -> WaitReservationLocation | UnrecordedReservationPath | ReleasedWaitReservation:
-    if released_wait_path(paths, identity).exists():
-        return ReleasedWaitReservation()
-    location = paths.wait_locations / pending_start_key(identity)
+class NoWaitRemoval:
+    """Release has no saved removal record for this reservation."""
+
+
+def read_wait_removal(path: Path) -> WaiterProcessIdentity | NoWaitRemoval:
+    """Read the owner from the reservation that release moved to this path."""
+    values = read_json_object(path)
+    if values is None:
+        return NoWaitRemoval()
+    record = decode_run(values, path, moved_from_claim=True)
+    if "remote_host" in record or path.stem != pending_start_key(claim_identity(record)):
+        raise StateReadError(f"{path} has an invalid wait removal record")
+    if "reservation_file" in values:
+        _ = reservation_file(values, "reservation_file", path)
+    return _wait_location_owner(values, path)
+
+
+def read_wait_location(paths: StatePaths, identity: ClaimIdentity) -> WaitReservationLocation | UnrecordedReservationPath:
+    return _read_wait_location(paths, paths.wait_locations / pending_start_key(identity))
+
+
+def _read_wait_location(paths: StatePaths, location: Path) -> WaitReservationLocation | UnrecordedReservationPath:
     values = read_json_object(location)
     if values is None:
         return UnrecordedReservationPath()
-    pid, start = _wait_location_owner(values, location)
-    return WaitReservationLocation(paths.directory / reservation_file(values, "reservation_file", location), pid,
-                                   start, required_string(values, "submitting_session", location))
+    owner = _wait_location_owner(values, location)
+    return WaitReservationLocation(paths.directory / reservation_file(values, "reservation_file", location), owner.pid,
+                                   owner.proc_start, required_string(values, "submitting_session", location))
 
 
-def sweep_wait_locations(paths: StatePaths) -> None:
-    """Keep the reservation location and release record while the waiter lives."""
+def _wait_slot_has_claim(paths: StatePaths, location: Path, live_paths: set[Path]) -> bool:
+    if not live_paths:
+        return False
+    # Keep the removal record while an unknown slot can still hold a claim.
+    try:
+        saved = _read_wait_location(paths, location)
+    except StateReadError:
+        return True
+    return isinstance(saved, UnrecordedReservationPath) or saved.path in live_paths
+
+
+def sweep_wait_locations(paths: StatePaths, live_paths: set[Path]) -> None:
+    """Sweep wait records after the sweep of live claims under the provider lock."""
     key = "[0-9a-f]" * 64
-    for path in (*paths.wait_locations.glob(key), *paths.wait_locations.glob(f"{key}.released")):
+    retained_locations: set[Path] = set()
+    for path in paths.wait_locations.glob(f"{key}.released"):
+        try:
+            try:
+                owner = read_wait_removal(path)
+            except StateReadError as error:
+                location = path.with_suffix("")
+                if _wait_slot_has_claim(paths, location, live_paths):
+                    retained_locations.add(location)
+                else:
+                    path.unlink(missing_ok=True)
+                    print(str(error), file=sys.stderr)
+                continue
+            if isinstance(owner, WaiterProcessIdentity) and owner.ended():
+                path.unlink(missing_ok=True)
+        except OSError as error:
+            print(str(error), file=sys.stderr)
+    for path in paths.wait_locations.glob(key):
+        if path in retained_locations:
+            continue
         try:
             values = read_json_object(path)
-            if values is not None:
-                pid, start = _wait_location_owner(values, path)
-                owner = process_identity.process_start(pid)
-                if not isinstance(owner, process_identity.Unreadable) and owner != process_identity.Started(start):
-                    path.unlink(missing_ok=True)
+            if values is not None and _wait_location_owner(values, path).ended():
+                path.unlink(missing_ok=True)
         except (StateReadError, OSError) as error:
             print(str(error), file=sys.stderr)
 

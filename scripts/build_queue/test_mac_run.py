@@ -897,6 +897,43 @@ sys.exit(71)
                     _ = second.path.write_bytes(original)
                     self.assertEqual(mac_test.command_release(later, paths), 0)
 
+    def test_damaged_wait_removal_is_refused_and_swept_when_its_slot_is_free(self) -> None:
+        waiter = self.native_claim(self.checkout)
+        self.assertEqual(mac_test.command_claim(waiter, self.paths, watch_claim=False), 0)
+        original, = claim_state.read_claims(self.paths)
+        identity = claim_state.claim_identity(original.record)
+        removal = claim_state.released_wait_path(self.paths, identity)
+        self.assertEqual(build_targets.command_release_wait(waiter.pid, identity=identity), 0)
+        self.assertTrue(removal.is_file())
+
+        successor = self.native_claim(self.checkout)
+        successor.claim_id = "successor"
+        self.assertEqual(mac_test.command_claim(successor, self.paths, watch_claim=False), 0)
+        reused, = claim_state.read_claims(self.paths)
+        self.assertEqual(reused.path, original.path)
+        other = self.native_claim(self.repository("hana", origin=HANA_ORIGIN))
+        self.assertEqual(mac_test.command_claim(other, self.paths, watch_claim=False), 0)
+
+        for damaged in ("{", json.dumps({**original.record, "claim_id": "wrong"})):
+            with self.subTest(damaged=damaged):
+                _ = removal.write_text(damaged)
+                with redirect_stderr(StringIO()) as diagnostic:
+                    self.assertEqual(build_targets.command_release_wait(waiter.pid, identity=identity), 1)
+                self.assertIn(str(removal), diagnostic.getvalue())
+                with redirect_stderr(StringIO()) as diagnostic, claim_state.locked(self.paths.lock):
+                    self.assertIn(reused, mac_test.live_claims(self.paths))
+                self.assertEqual(diagnostic.getvalue(), "")
+                self.assertEqual(removal.read_text(), damaged)
+
+        self.assertEqual(mac_test.command_release(successor, self.paths), 0)
+        with redirect_stderr(StringIO()) as diagnostic, claim_state.locked(self.paths.lock):
+            for _ in range(2):
+                remaining, = mac_test.live_claims(self.paths)
+                self.assertEqual(remaining.record["claim_id"], other.claim_id)
+        self.assertIn(str(removal), diagnostic.getvalue())
+        self.assertEqual(len(diagnostic.getvalue().splitlines()), 1)
+        self.assertFalse(removal.exists())
+
     def test_repeated_release_wait_skips_unrelated_damage(self) -> None:
         waiter = self.native_claim(self.checkout)
         self.assertEqual(mac_test.command_claim(waiter, self.paths, watch_claim=False), 0)
@@ -1160,7 +1197,8 @@ with patch.object(Path, "unlink", interrupt_unlink), patch.object(Path, "replace
                     self.assertIsInstance(claim_state.read_retired_mac_reservation(self.paths, identity),
                                           claim_state.NoSavedRetryPermission)
                     if recovery in ("release-with-damaged-claim", "release-with-damaged-location"):
-                        self.assertEqual(reads.call_args_list, [mock.call(proof), mock.call(old_path)])
+                        removal = claim_state.released_wait_path(self.paths, identity)
+                        self.assertEqual(reads.call_args_list, [mock.call(removal), mock.call(proof), mock.call(old_path)])
                         self.assertEqual(build_targets.command_release_wait(waiting.pid, identity=identity), 0)
                     if recovery == "release-with-damaged-claim":
                         self.assertEqual(damaged.read_text(), "{")

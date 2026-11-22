@@ -877,7 +877,6 @@ def remember_slot(paths: StatePaths, scope: RepositoryScope, record: RunRecord) 
 def live_claims(paths: StatePaths) -> tuple[HeldClaim, ...]:
     """Read every claim and remove each one whose owner has ended."""
     claims, retained = claim_state.sweep_mac_replacements(paths, read_claims(paths))
-    claim_state.sweep_wait_locations(paths)
     live: list[HeldClaim] = []
     for claim in claims:
         if claim.path in retained or run_is_live(claim.record):
@@ -894,6 +893,7 @@ def live_claims(paths: StatePaths) -> tuple[HeldClaim, ...]:
                 proof = claim_state.retired_mac_reservation_path(paths, claim_state.claim_identity(claim.record))
                 proof.unlink(missing_ok=True)
             claim.path.unlink(missing_ok=True)
+    claim_state.sweep_wait_locations(paths, {claim.path for claim in live})
     return tuple(live)
 
 

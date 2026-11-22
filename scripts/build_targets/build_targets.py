@@ -1264,6 +1264,10 @@ def command_release_wait(pid: int, *,
             reservation: Path | claim_state.UnrecordedReservationPath = claim_state.UnrecordedReservationPath()
             matched = False
             try:
+                removal = claim_state.read_wait_removal(claim_state.released_wait_path(paths, identity))
+                if isinstance(removal, claim_state.WaiterProcessIdentity):
+                    located = True
+                    continue
                 if paths.platform == "macos":
                     retired = claim_state.read_retired_mac_reservation(paths, identity)
                     if (isinstance(retired, claim_state.RetiredMacReservation)
@@ -1276,9 +1280,6 @@ def command_release_wait(pid: int, *,
                 if release_start is not None or (paths.platform == "macos" and isinstance(start, process_identity.Unreadable)):
                     if isinstance(reservation, claim_state.UnrecordedReservationPath):
                         location = claim_state.read_wait_location(paths, identity)
-                        if isinstance(location, claim_state.ReleasedWaitReservation):
-                            located = True
-                            continue
                         if isinstance(location, claim_state.WaitReservationLocation):
                             if (location.pid != pid or location.submitting_session != session_id
                                     or (release_start is not None and location.proc_start != release_start)):
