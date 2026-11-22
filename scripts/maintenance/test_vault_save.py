@@ -67,7 +67,6 @@ class VaultSaveTests(unittest.TestCase):
         }, clear=True))
         _ = self.git("init", "-q", "-b", "main")
         _ = self.git("init", "-q", "--bare", "-b", "main", repo=self.origin)
-        _ = self.git("config", "core.fsync", "committed")
         self.write(".gitignore", ".obsidian/\nsettings.local.json\n")
         self.write("remove.md", "Delete this note.\n")
         self.write("ux/kept.png", "The fixture represents a tracked image.\n")
@@ -129,6 +128,17 @@ class VaultSaveTests(unittest.TestCase):
         self.assertIn("Saved 7 paths", output)
         changed = self.git_output("diff", "--name-only", "-z", "HEAD^", "HEAD").split(b"\0")[:-1]
         self.assertEqual(set(map(os.fsdecode, changed)), names | {"remove.md"})
+
+    def test_vault_save_passes_fsync_on_the_commit_command(self) -> None:
+        self.write("note.md", "Save this note.\n")
+        with patch.object(subprocess, "run", wraps=subprocess.run) as run:
+            code, _, errors = self.command()
+        self.assertEqual(code, 0, errors)
+        self.assertIn(
+            ["git", "-C", str(self.vault), "-c", "core.fsync=committed", "--literal-pathspecs",
+             "commit", "--only", "-m", vault_save.SUBJECT, "--pathspec-from-file=-", "--pathspec-file-nul"],
+            [call.args[0] for call in run.call_args_list],
+        )
 
     def test_vault_save_honors_ignores_and_keeps_tracked_media(self) -> None:
         for name in (".obsidian/settings.md", "new/.obsidian/state.json", "settings.local.json",
@@ -418,6 +428,19 @@ class VaultSaveTests(unittest.TestCase):
         self.assertEqual(self.git("diff", "--cached", "--name-only"), "later.md")
         self.assertEqual(self.git("show", ":later.md"), "Staged separately.")
         self.assertEqual((self.vault / "later.md").read_text(), "Unstaged edit.\n")
+
+    def test_first_save_reports_the_recovery_command_for_a_failed_hook(self) -> None:
+        self.write("save.md", "First save.\n")
+        self.write(".claude/config/post_push.sh", "exit 9\n")
+        digest = self.scan()
+
+        code, _, errors = self.command("first-save", "commit", digest)
+
+        self.assertEqual(code, 0, errors)
+        commit = self.git("rev-parse", "HEAD")
+        self.assertEqual(self.git("rev-parse", "main", repo=self.origin), commit)
+        self.assertIn("post-push hook: failed (exit 9); rerun:", errors)
+        self.assertIn(f"LANDED_SHA={commit}", errors)
 
     def test_hanadocs_push_retries(self) -> None:
         self.write("save.md", "First save.\n")

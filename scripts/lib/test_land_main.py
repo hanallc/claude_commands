@@ -73,6 +73,22 @@ if [ -f "$TEST_HOOK_FAIL" ]; then exit 9; fi
         self.assertEqual((self.completion().read_bytes(), self.completion().stat().st_mtime_ns), saved)
         self.assertFalse(any("push" in cast(list[str], call.args[0]) for call in commands.call_args_list))
 
+    def test_landing_git_commands_use_only_the_requested_config(self) -> None:
+        config = "core.fsync=committed"
+        for use_config in (True, False):
+            with self.subTest(use_config=use_config):
+                commit = self.next_commit(f"Config {use_config}\n")
+                with mock.patch.object(subprocess, "run", wraps=subprocess.run) as commands:
+                    if use_config:
+                        result = land_main.land(self.repo, commit, git_config=(config,))
+                    else:
+                        result = land_main.land(self.repo, commit)
+                self.assertIsInstance(result.push, land_main.Pushed)
+                prefix = ["git", "-C", str(self.repo), *(["-c", config] if use_config else [])]
+                arguments = [call.args[0] for call in commands.call_args_list]
+                self.assertIn([*prefix, "fetch", "origin", "main"], arguments)
+                self.assertIn([*prefix, "push", "origin", f"{commit}:refs/heads/main"], arguments)
+
     def test_a_failed_hook_keeps_the_cli_successful_and_retries_on_the_same_tip(self) -> None:
         self.install_hook()
         _ = self.write(Path(self.environment["TEST_HOOK_FAIL"]), "fail\n")

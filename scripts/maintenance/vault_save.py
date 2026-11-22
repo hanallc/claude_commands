@@ -17,7 +17,7 @@ from typing import cast
 from scripts.lib import land_main
 from scripts.lib.atomic_file import write_bytes_atomic
 from scripts.lib.main_push_lock import main_push_lock
-from scripts.maintenance.vault_commit import git_bytes
+from scripts.maintenance.vault_commit import VAULT_FSYNC, git_bytes
 
 
 TEXT_SUFFIXES = frozenset(".base .html .js .json .jsonl .md .py .rs .sh .toml .txt .yaml".split())
@@ -434,7 +434,9 @@ def commit_first_save(vault: Path, manifest: Path, manifest_hash: str) -> None:
         write_bytes_atomic(state, f"{manifest_hash}\n{commit}\n".encode("ascii"), mode=0o600)
     # The reviewed entries match main after the ref update or recovery check.
     update_index(vault, review)
-    _ = land_main.land(vault, commit)
+    landed = land_main.land(vault, commit, git_config=(VAULT_FSYNC,))
+    if isinstance(landed.hook, land_main.HookFailed):
+        print(land_main.hook_report(landed.hook), file=sys.stderr)
     if not ancestor(vault, commit, fetch_main(vault)):
         raise SaveError("Origin main does not contain the reviewed commit.")
     manifest.unlink()
@@ -468,8 +470,6 @@ def main(argv: list[str] | None = None) -> int:
         with main_push_lock(vault, "vault-first-save", wait=False):
             if not writable(vault):
                 raise SaveError("Use the first save on main with no Git operation in progress.")
-            if checked(vault, "config", "--get", "core.fsync").strip() != "committed":
-                raise SaveError("Set core.fsync=committed in the vault's Git config.")
             manifest = git_path(vault, "vault-save-manifest.json")
             if args.action == "scan":
                 scan_first_save(vault, manifest)

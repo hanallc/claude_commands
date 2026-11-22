@@ -5,6 +5,7 @@
 Add a `vault_save` part to `agent_notes_job.py` on natedev. Run `vault_save.py` on `~/rust/hanadocs`.
 Run the part after the existing vault part when both are due.
 Run only on `main`. Check for an in-progress Git operation before making a commit.
+Pass `core.fsync=committed` per Git command during the first save and scheduled saves.
 
 1. List changed and deleted tracked paths against `HEAD` and untracked paths from `git ls-files --others --exclude-standard`.
 2. Apply the text rule below at every depth. Keep paths separate with NUL delimiters and use literal Git pathspecs.
@@ -48,7 +49,8 @@ Use `scripts/lib/main_push_lock.py` on the vault. Its `main-push.lock` is in the
 Hold it from Git state checks through the commit in `vault_save.py`, `vault_commit.py`, and `change_review.py`.
 Use the same lock from comparison through index refresh in the prioritization watcher.
 In `vault_pull.py`, take it before the natedev publication fetch and hold it through `land_main.land`.
-Keep any existing job or list lock outermost. The nested `land_main.land` call reuses the vault lock in the same process.
+Keep any existing job or list lock outermost.
+The nested calls to `land_main.land` in `vault_pull.py` and the first save reuse the vault lock in the same process.
 In the Nix push job, use `flock` on the same file before the branch check. Hold it through the run.
 Let the scheduled save defer and retry if the lock is busy.
 
@@ -56,10 +58,9 @@ Let the scheduled save defer and retry if the lock is busy.
 
 Run the first save from the implementation worktree before merge. The scheduled part starts when the code reaches main.
 
-1. Set `core.fsync=committed` in the vault's local Git config.
-2. Run `vault_save.py first-save scan` with `scripts/lib/py`.
-3. Review the manifest, count, and stat.
-4. Run `vault_save.py first-save commit <manifest hash>` with `scripts/lib/py`.
+1. Run `vault_save.py first-save scan` with `scripts/lib/py`.
+2. Review the manifest, count, and stat.
+3. Run `vault_save.py first-save commit <manifest hash>` with `scripts/lib/py`.
 
 Scan takes `main_push_lock` and checks the live index before removing the previous manifest.
 Fetch `origin/main` if the index is clear.

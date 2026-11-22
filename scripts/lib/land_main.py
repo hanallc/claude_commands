@@ -15,6 +15,7 @@ except FileNotFoundError:
     pass
 
 import argparse
+from collections.abc import Sequence
 from dataclasses import dataclass
 import os
 from pathlib import Path
@@ -87,11 +88,14 @@ UNLIMITED_GIT = NoTimeLimit()
 
 
 def land(checkout: Path, commit: str, branch: str = "main", *,
-         time_limit: CommandTimeLimit | NoTimeLimit = UNLIMITED_GIT) -> Landed:
+         time_limit: CommandTimeLimit | NoTimeLimit = UNLIMITED_GIT,
+         git_config: Sequence[str] = ()) -> Landed:
     """Push only a fast-forward and run any pending default-branch hook."""
+    config_options = [argument for setting in git_config for argument in ("-c", setting)]
+
     def git(*arguments: str) -> subprocess.CompletedProcess[str]:
         try:
-            return subprocess.run(["git", "-C", str(checkout), *arguments],
+            return subprocess.run(["git", "-C", str(checkout), *config_options, *arguments],
                                   capture_output=True, text=True, check=False,
                                   timeout=time_limit.seconds if isinstance(time_limit, CommandTimeLimit) else None)
         except subprocess.TimeoutExpired as error:

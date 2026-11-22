@@ -32,10 +32,15 @@ from typing import cast
 
 from scripts.lib.main_push_lock import main_push_lock
 from scripts.maintenance.settings import settings
+
+
+VAULT_FSYNC = "core.fsync=committed"
+
+
 def git_bytes(repo: str, *args: str, input_data: bytes | None = None,
               env: dict[str, str] | None = None) -> subprocess.CompletedProcess[bytes]:
     # Literal pathspecs: note names hold spaces and could hold glob characters.
-    command = ["git", "-C", repo, "--literal-pathspecs", *args]
+    command = ["git", "-C", repo, "-c", VAULT_FSYNC, "--literal-pathspecs", *args]
     return subprocess.run(command, input=input_data, capture_output=True, env=env, timeout=settings().vault_git_seconds)
 
 
