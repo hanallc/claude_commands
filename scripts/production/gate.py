@@ -1127,6 +1127,24 @@ def _gate_program_source() -> BinaryIO:
     return Path(__file__).resolve().open("rb")
 
 
+def _gate_job_environment(environment: Mapping[str, str], leases: tuple[int, ...]) -> dict[str, str]:
+    """Filter descriptor variables with names that end in _FD or _FDS, or contain _FD_."""
+    passed_leases = {str(lease) for lease in leases}
+    job_environment: dict[str, str] = {}
+    for name, value in environment.items():
+        if name in ("LISTEN_FDS", GATE_PARENT_SOURCE_FD):
+            continue
+        if name.endswith("_FDS"):
+            value = ",".join(number for number in value.split(",") if number in passed_leases)
+            if not value:
+                continue
+        elif (name.endswith("_FD") or "_FD_" in name) and value not in passed_leases:
+            continue
+        job_environment[name] = value
+    job_environment["GATE_PARENT_PID"] = str(os.getpid())
+    return job_environment
+
+
 def start_gate_job(suite: str, path: Path, argv: Sequence[str], repo: Path,
                    environment: dict[str, str], log: Path, *,
                    kind: GateJobKind = GateJobKind.TEST_MODULE) -> RunningGateJob:
@@ -1136,8 +1154,8 @@ def start_gate_job(suite: str, path: Path, argv: Sequence[str], repo: Path,
     started_at = time.time()
     try:
         with cancellation.defer_cleanup_signals():
-            job_environment = {**environment, "GATE_PARENT_PID": str(os.getpid())}
             descriptors = copies.COMMAND_LOCKS.get()
+            job_environment = _gate_job_environment(environment, descriptors)
             if sys.platform == "linux" and kind is GateJobKind.TEST_MODULE:
                 descriptor = _gate_program_source().fileno()
                 job_environment[GATE_PARENT_SOURCE_FD] = str(descriptor)
