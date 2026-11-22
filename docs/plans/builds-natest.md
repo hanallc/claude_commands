@@ -1318,3 +1318,13 @@ Ordered after the red main repair and the guard repair (builds). It does not mov
 - **Files:** `scripts/buildlog/test_disk.py`; `scripts/production/test_gate_suites_admission.py`.
 - **Workers:** 1 writer.
 - **Acceptance gate:** the test passes with a live `SCCACHE_DIR` set; the reservation test reads no live pressure file; the module passes in one tests-only gate after the builds go; basedpyright zero on the changed file; one blind review.
+
+### Phase 433 — two test fixtures name hanallc/hana  · status: todo
+**Depends on:** none (builds 01:24: start after 431 and 432)
+
+#### Work Order
+- **Goal:** builds 01:24 (sdlc admin-console review): `config/hana_aws.conf:8` names `hanallc/hana`, but `scripts/aws_target/fixtures/cloud_gate.conf:30` and `scripts/mac_test/test_hana_offload.py:69` still name `natepiano/hana`. Both fixtures name `hanallc/hana`.
+- **Spec:** change the two fixture values; keep every assertion; no product code or config key changes.
+- **Files:** `scripts/aws_target/fixtures/cloud_gate.conf`; `scripts/mac_test/test_hana_offload.py`.
+- **Workers:** 1 writer.
+- **Acceptance gate:** the modules that read the two fixtures pass in tests-only gates after the builds go; one blind review.
