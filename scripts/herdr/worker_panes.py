@@ -328,6 +328,10 @@ class UseRolePolicy(Enum):
     CURRENT = "resolve the role policy"
 
 
+class UseOwnerDirectory(Enum):
+    CURRENT = "use the owner's working directory"
+
+
 @dataclass(frozen=True)
 class LaunchPolicy:
     settings: models_registry.LaunchSettings
@@ -1289,7 +1293,8 @@ def start_or_resume(parent: StaffId, name: WorkerName, role: WorkerRole | Worker
                     account: ConfiguredWorkerAccount | DestinationWorkerAccount | accounts.AccountSelection = ConfiguredWorkerAccount.CURRENT,
                     lock: WorkerLockHold | WorkerLockAtUse = WorkerLockAtUse.ACQUIRE,
                     policy: UseRolePolicy | LaunchPolicy = UseRolePolicy.CURRENT, runs: dict[str, list[str]] | None = None,
-                    codex: herdr.CodexConversations | herdr.CodexLaunchRead = herdr.CodexLaunchRead.CURRENT) -> WorkerStart:
+                    codex: herdr.CodexConversations | herdr.CodexLaunchRead = herdr.CodexLaunchRead.CURRENT,
+                    working_directory: Path | UseOwnerDirectory = UseOwnerDirectory.CURRENT) -> WorkerStart:
     if isinstance(role, WorkerRoleUnavailable):
         return StartRefused(StartRefusal.ROLE_UNAVAILABLE, role.reason)
     if role not in staff.WORKER_ROLES:
@@ -1319,7 +1324,8 @@ def start_or_resume(parent: StaffId, name: WorkerName, role: WorkerRole | Worker
             if not held.active or held.parent != parent or held.name != name:
                 return StartRefused(StartRefusal.BUSY_ROLE_CHANGE, "worker lock does not own this worker")
             with worker_admission.worker_operation(allowed):
-                result = _start_locked(owner, name, role, policy, account, allowed, held, codex, keep_model=keep_model)
+                result = _start_locked(owner, name, role, policy, account, allowed, held, codex,
+                                       keep_model=keep_model, working_directory=working_directory)
                 if isinstance(result, OpenWorker) and result.row.role != staff.KnownWorkerRole(role):
                     return replace(result, row=staff.set_worker_role(result.row.id, staff.KnownWorkerRole(role)))
                 return result
@@ -1367,7 +1373,8 @@ def unpublished_cleanup_text(result: UnpublishedWorker) -> str:
 def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, policy: LaunchPolicy,
                   account: ConfiguredWorkerAccount | DestinationWorkerAccount | accounts.AccountSelection,
                   allowed: worker_admission.WorkerStartAllowed, lock: WorkerLockHold,
-                  codex: herdr.CodexConversations | herdr.CodexLaunchRead, *, keep_model: bool) -> WorkerStart:
+                  codex: herdr.CodexConversations | herdr.CodexLaunchRead, *, keep_model: bool,
+                  working_directory: Path | UseOwnerDirectory) -> WorkerStart:
     started = time.monotonic()
     try:
         settings = conf.read("direct")
@@ -1384,6 +1391,9 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
     row = current.row if current is not None else None
     backend = staff.backend(row) if row is not None else staff.BACKEND_UNAVAILABLE
     switching = not isinstance(backend, staff.BackendUnavailable) and backend.family != policy.settings.kind
+    directory = working_directory
+    if isinstance(directory, UseOwnerDirectory):
+        directory = owner.worktree.path if isinstance(owner.worktree, staff.PresentWorktree) else Path.cwd()
     if row is not None:
         lock.bind(row)
     if isinstance(current, (ProcessUnknownWorker, UncertainWorker)):
@@ -1406,6 +1416,8 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
             except (worker_admission.AdmissionRefused, herdr_types.HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
                 return ProcessUnknownWorker(owner, identity, _text(pane, "terminal_id"), str(error))
             if not isinstance(activity, herdr.PaneAtShell):
+                if isinstance(working_directory, Path) and pane.get("cwd") != str(directory):
+                    return UnpublishedWorker(identity, f"interrupted worker directory differs from {directory}")
                 try:
                     native = (_codex_start_session(client, identity, pane_row=pane) if policy.settings.kind == "codex" else
                               client.native_session(identity, policy.settings.kind, herdr.PROGRAM_TIMEOUT_SECONDS, pane_row=pane))
@@ -1441,10 +1453,12 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
                 return matches
             same_run = True
             same_account = True
+            same_directory = True
             check_run = owner.kind == "unit" and not passed
             if matches:
                 try:
                     pane_row = next(pane for pane in evidence.panes if pane.get("pane_id") == current.pane)
+                    same_directory = isinstance(working_directory, UseOwnerDirectory) or pane_row.get("cwd") == str(directory)
                     launched = client.native_pane_process(current.pane, policy.settings.kind, herdr.PROGRAM_TIMEOUT_SECONDS, pane_row=pane_row)
                 except (herdr_types.HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
                     if passed.get("status") != "active":
@@ -1462,7 +1476,7 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
                     running_home = Path(launched.environment.get(key, default_home)).expanduser().resolve()
                     selected_home = Path(expected.get(key, default_home)).expanduser().resolve()
                     same_account = running_home == selected_home
-            if matches and same_run and same_account:
+            if matches and same_run and same_account and same_directory:
                 _layout(owner.id, evidence)
                 return current
             closable = can_close(current, lock=lock)
@@ -1482,7 +1496,6 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
         environment["UNIT_RUN_DIR"] = str(allowed.run)
     if temporary := os.environ.get("TMPDIR"):
         environment["TMPDIR"] = temporary
-    directory = owner.worktree.path if isinstance(owner.worktree, staff.PresentWorktree) else Path.cwd()
     prepared = herdr.prepare_session_environment(str(row.current_session) if row is not None and not switching else "", str(directory), environment,
                                                frozenset({"STAFF_ID"}))
     if isinstance(prepared, nix_env.Refused):

@@ -516,13 +516,19 @@ def execute_herdr(args: Arguments, run: Path, phase: str, prompt: Path,
         message = style.directory / "prompt.md"
     env["UNIT_RUN_DIR"] = str(run)
     env["UNIT_TEAM_ROLE"] = slot
-    if role != "review" and not assign_claude.claim_phase(run, phase, Path(args.cwd).expanduser().resolve(),
-            log, assign_claude.UnclaimedPhaseStatus.PRESERVE, slot, env):
-        return 1
     command = [PYTHON, str(SCRIPTS / "../production/worker.py"), "assign", role, str(message),
                "--session-dir", str(run), "--phase", phase, "--slot", slot, "--kind", "assign", "--reply", str(reply),
                "--lens", args.lens, "--fix-cause", args.fix_cause,
                "--fix-pass", str(args.pass_number if role == "fix" else 0)]
+    if role != "review":
+        requested = Path(args.cwd).expanduser().resolve()
+        if not assign_claude.claim_phase(run, phase, requested, log,
+                assign_claude.UnclaimedPhaseStatus.PRESERVE, slot, env):
+            return 1
+        directory_for_worker = phase_reservation.claimed_launch_directory(directory, requested)
+        if directory_for_worker != requested:
+            _ = authorized_paths(args, directory_for_worker)
+        command += ["--cwd", str(directory_for_worker)]
     if args.to or args.new_worker:
         command += ["--name", args.to or args.new_worker]
     if args.model or args.effort:

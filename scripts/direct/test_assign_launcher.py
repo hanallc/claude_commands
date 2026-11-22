@@ -17,14 +17,16 @@ from unittest.mock import patch
 from uuid import UUID
 
 from scripts.agents import codex_test_support as codex_fixture
-from scripts.direct import assign, progress_history, recorder_state
+from scripts.direct import assign, phase_reservation, progress_history, recorder_state
 from scripts.direct.assign_claude_test_support import AssignClaudeLauncherFixture
 from scripts.direct.assign_launcher_test_support import ASSIGN, ROOT, HookAssignmentFixture, InProcessAssignment, assignment_helpers, invoke_assignment, read_object
 from scripts.direct.findings_test_support import invoke_findings
+from scripts.direct.test_phase_reservation import make_fixture_worktree
 from scripts.herdr import herdr, turn_end, worker_panes
 from scripts.lib import unit_runs
 from scripts.lint import style_review
 from scripts.lib.atomic_file import write_text_atomic
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.test_models_registry import write_registry
 from scripts.production import staff, test_worker as worker_fixture, worker, worker_admission
 from scripts.production.cli_fixture import invoke_cli
@@ -808,6 +810,22 @@ class AssignLauncherTests(HookAssignmentFixture):
                               check=True, capture_output=True, text=True).stdout
         self.assertEqual((self.session_dir / "phases/3/phase_baseline").read_text(), head)
         self.assertEqual((self.session_dir / "baseline-at-worker-assign").read_text(), head)
+
+    def test_herdr_claim_retry_opens_codex_in_the_recorded_checkout(self) -> None:
+        claimed = make_fixture_worktree(self.project, "fixture", "p7")
+        result = subprocess.run(
+            [sys.executable, phase_reservation.__file__, "claim", "--session-dir", str(self.session_dir),
+             "--phase", "7", "--repo", str(claimed)], capture_output=True, text=True,
+            timeout=TEST_HANG_GUARD_SECS,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        directory = phase_reservation.phase_directory(self.session_dir, "7")
+        self.assertEqual((directory / phase_reservation.WORKTREE_FILE).read_text().strip(), str(claimed))
+        self.native.agent.without_done = True
+        retried = self.launch()
+        self.assertEqual(retried.returncode, 0, retried.stdout + retried.stderr)
+        pane, _ = self.native.agent.submitted[-1]
+        self.assertEqual(self.native.fixture.world.locations[pane]["cwd"], str(claimed))
 
     def test_herdr_assignment_refuses_a_failed_phase_claim_before_the_worker_assignment(self) -> None:
         status = self.session_dir / "phases/3/impl_status"
