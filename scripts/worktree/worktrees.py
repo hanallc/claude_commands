@@ -669,8 +669,11 @@ def create_checkout(path: Path, source: Path,
                     layout: RecordedWorktreeOutput | UnassignedOutput, *,
                     owner: str = "", merge_branch: str = "", allow_empty: bool = False,
                     allow_existing: bool = False, fixed_base: bool = False,
-                    use_recorded_branch: bool = False) -> Path:
-    """Finish a recorded checkout or make one through the shared allocator."""
+                    use_recorded_branch: bool = False, record_adoption: bool = False) -> Path:
+    """Finish a recorded checkout or make one through the shared allocator.
+
+    Unit admission opts in to setting up and recording an existing checkout.
+    """
     path = path.absolute()
     repo = main_checkout(source)
     with move_lock():
@@ -689,6 +692,14 @@ def create_checkout(path: Path, source: Path,
         start = branch.start_point if isinstance(branch, build_folders.NewWorktreeBranch) else f"refs/heads/{branch.name}"
         if record is None:
             if registered and allow_existing:
+                if record_adoption:
+                    if not isinstance(layout, RecordedWorktreeOutput):
+                        raise ValueError(f"{path}: adoption requires a worktree output assignment")
+                    output = checked_output(layout)
+                    base = checkout_base(path, "HEAD")
+                    ensure_target_link(path, output)
+                    record = new_record(path, branch.name, repo, base, owner, merge_branch)
+                    write_record(replace(record, layout=layout))
                 return path
             if exists and not (allow_empty and empty_checkout_path(path)):
                 raise FileExistsError(f"{path}: editable repository destination is occupied")
