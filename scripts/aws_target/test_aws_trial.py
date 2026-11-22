@@ -652,23 +652,33 @@ class Sample(unittest.TestCase):
         _ = trial.checked_git(self.repo, 'push', str(self.origin), self.base + ':' + branch)
         before = self.remote_branches()
         git = trial.checked_git
+        delete = origin_deletion.delete
         for failure in ('list', 'delete'):
             with self.subTest(failure=failure):
                 def refuse_sweep(repo: Path, *arguments: str) -> str:
                     listing = arguments[0] == 'ls-remote' and arguments[-1] == 'refs/heads/gate-trial-*'
-                    deleting = arguments[0] == 'push' and '--delete' in arguments and arguments[-1] == branch
-                    if (failure == 'list' and listing) or (failure == 'delete' and deleting):
+                    if failure == 'list' and listing:
                         raise subprocess.CalledProcessError(1, ['git', *arguments])
                     return git(repo, *arguments)
 
+                def refuse_delete(repo: Path, destination: str, ref: str, expected: str, *, timeout: float
+                                  ) -> origin_deletion.Deleted | origin_deletion.Absent | origin_deletion.Kept:
+                    if failure == 'delete' and ref == branch:
+                        self.assertEqual(expected, self.base)
+                        return origin_deletion.Kept('fixture deletion failed', origin_deletion.RetentionCause.GIT_FAILURE)
+                    return delete(repo, destination, ref, expected, timeout=timeout)
+
                 errors = StringIO()
                 with (mock.patch.object(trial, 'checked_git', side_effect=refuse_sweep),
+                      mock.patch.object(origin_deletion, 'delete', side_effect=refuse_delete),
                       mock.patch.object(time, 'time', return_value=now),
                       mock.patch.object(trial, 'paired_service', return_value=0) as service,
                       redirect_stderr(errors)):
                     self.assertEqual(self.invoke_trial(), 0)
                 service.assert_called_once()
-                self.assertEqual(errors.getvalue().splitlines(), ['paired trial: could not sweep old branches for gate-trial'])
+                notice = ('paired trial: could not sweep old branches for gate-trial' if failure == 'list'
+                          else f'paired trial: kept {branch}: fixture deletion failed')
+                self.assertEqual(errors.getvalue().splitlines(), [notice])
                 self.assertEqual(self.remote_branches(), before)
 
     def test_interrupted_service_deletes_both_trial_branches(self) -> None:
