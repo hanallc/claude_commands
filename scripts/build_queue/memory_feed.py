@@ -1421,8 +1421,8 @@ def mac_build_units(builds: Sequence[queue_view.MacBuild],
         elif (not matches and not sessions and build.origin is queue_view.MacBuildOrigin.NON_CI and
               not any(contains(claim["worktree"], build.folder) for claim in claims)):
             repository_claims = [claim for claim in held_claims
-                                 if isinstance(claim.scope, claim_state.RepositoryScope) and
-                                 claim.scope.name == build.repository]
+                                 if (claim.scope.name if isinstance(claim.scope, claim_state.RepositoryScope)
+                                     else claim.record.get("repo_name")) == build.repository]
             if len(repository_claims) == 1:
                 session = repository_claims[0].record["submitting_session"]
                 if session in labels:
