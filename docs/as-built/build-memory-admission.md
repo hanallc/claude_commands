@@ -2376,21 +2376,22 @@ The admission service gives each wait an ID when it enters the queue.
 The saved place binds the ID to the owner PID, process start time, original arrival time, and episode.
 A refresh keeps the ID.
 The service saves pins in `state.json` when a move completes.
-A pin records the request ID and the number of rows ahead.
-Each confirmed move sets the place of every visible pin to its confirmed position.
-If a saved pin for an absent request matches a confirmed place, the service saves the next free place for its return.
-The service applies pins after it sorts the waits.
-It inserts present pinned waits in place order and clamps each insertion to the end.
-Placement, memory admission, and continuation claims filter the same queue order.
-The page, client replies, and the head-stall snapshot also filter that order.
+A pin records the wait ID and the ID of the row directly ahead.
+A pin at the head records `first`.
+The service applies the usual priority and arrival rules to all saved waits.
+It then places each pinned wait directly after its anchor.
+When the service reads an old state file, it converts position numbers to anchors.
+A move gives the moved row a new anchor and keeps its former successor in place.
+Absent waits stay in this order until they return or depart.
+Placement, memory admission, and continuation claims use the visible rows in this order.
+The page, client replies, the head-stall snapshot, and move validation also use the visible rows.
 The service publishes the order after it grants starts.
 When run times tie, the earlier step arrival comes first. PID breaks a tie in step arrival.
 A confirmed move or Undo changes queue order only.
 A drag can return a waiting row's unstarted slot claim, as a bump does.
-A departure moves pins behind it one place forward in the visible order.
-An absent request does not count in this adjustment.
-The service saves an absent request's pin so the request can recover its place when it returns.
-A request that starts or ends loses its own pin.
+A departing row loses its pin.
+A row anchored to the departing row inherits its anchor or its predecessor in the full order.
+A grant that can still return before launch keeps its place hidden until execution starts or the request ends.
 Both hosts use the visible order for normal steps.
 When placement preparation sees a remote start, it ends the startup hold and removes the local waiter.
 The table includes remote-only waits in queue order.

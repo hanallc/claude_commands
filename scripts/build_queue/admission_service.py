@@ -365,6 +365,7 @@ class WaiterPlace:
     order_since: float | OrderNotStarted = field(default_factory=OrderNotStarted, kw_only=True)
     queue_identity: records.QueueLifeIdentity = field(kw_only=True)
     move_id: str = field(default="", kw_only=True)
+    ci_runner: str = field(default="", kw_only=True)
 
 
 def waiter_place(row: records.Waiter, episode: str) -> WaiterPlace:
@@ -372,7 +373,7 @@ def waiter_place(row: records.Waiter, episode: str) -> WaiterPlace:
     return WaiterPlace(wire.Owner(row["pid"], row["start_time"]), row["since"], episode,
         row.get("priority_since", OrderNotStarted()), row.get("token_left_at", TokenNotLeft()),
         order_since=row.get("order_since", row["since"]), queue_identity=gate.queue_life_identity(row),
-        move_id=row.get("move_id", ""))
+        move_id=row.get("move_id", ""), ci_runner=row.get("ci_runner", ""))
 
 
 @dataclass(frozen=True)
@@ -593,31 +594,32 @@ class PendingCloudGroup:
     group: status_wire.CloudGroup
 
 
-QueuePins = tuple[tuple[str, int], ...]
+QUEUE_FIRST = "first"
+QueuePins = tuple[tuple[str, str], ...]
 
 
 def pinned_order(order: list[str], pins: QueuePins) -> list[str]:
-    present = set(order)
-    pinned = {row_id for row_id, _ in pins}
-    ordered = [row_id for row_id in order if row_id not in pinned]
-    for row_id, place in sorted(pins, key=lambda pin: pin[1]):
-        if row_id in present:
-            ordered.insert(place, row_id)
+    """Follow the pinned rows after each row in the main order."""
+    if not pins:
+        return order
+    members = set(order)
+    followers = {anchor: row_id for row_id, anchor in pins
+                 if row_id in members and (anchor == QUEUE_FIRST or anchor in members)}
+    pinned = set(followers.values())
+    ordered: list[str] = []
+    for anchor in (QUEUE_FIRST, *(row_id for row_id in order if row_id not in pinned)):
+        if anchor != QUEUE_FIRST:
+            ordered.append(anchor)
+        while anchor in followers:
+            anchor = followers.pop(anchor)
+            ordered.append(anchor)
     return ordered
 
 
-def confirmed_pins(order: list[str], pins: dict[str, int]) -> QueuePins:
-    places = {row_id: index for index, row_id in enumerate(order) if row_id in pins}
-    occupied = set(places.values())
-    # If a confirmed place is occupied, move the absent pin to the next free place.
-    for row_id, place in sorted(pins.items(), key=lambda pin: pin[1]):
-        if row_id in places:
-            continue
-        while place in occupied:
-            place += 1
-        places[row_id] = place
-        occupied.add(place)
-    return tuple(sorted(places.items(), key=lambda pin: pin[1]))
+def saved_queue_row(place: WaiterPlace) -> records.RankedWaiter:
+    order_since = place.since if isinstance(place.order_since, OrderNotStarted) else place.order_since
+    return gate.rank_waiter({**place.queue_identity, "need": 0, "order_since": order_since,
+        "move_id": place.move_id, "ci_runner": place.ci_runner}, records.NormalOrder())
 
 
 @dataclass(frozen=True)
@@ -1911,28 +1913,35 @@ class AdmissionServer:
         return row.get("ci_runner") or row.get("unit", "")
 
     def _queue_order(self) -> list[tuple[Path, records.RankedWaiter]]:
-        return self._apply_queue_pins(self._ranked_waiters())
+        return self._visible_queue_order(self._full_queue_order(self._ranked_waiters()))
 
     def _ranked_waiters(self) -> list[tuple[Path, records.RankedWaiter]]:
         rows = self._ordered_waiters()
+        present = {row.get("move_id") for _, row in rows}
+        for place in self.places.values():
+            if place.move_id and place.move_id not in present:
+                row = saved_queue_row(place)
+                rows.append((self.state_dir / place.move_id, row))
         if isinstance(self.priority, records.QueuePriority):
             return self._rank_priority_waiters(rows, self.priority)
         return gate.sort_waiters(rows)
 
-    def _apply_queue_pins(self, rows: list[tuple[Path, records.RankedWaiter]]) -> list[tuple[Path, records.RankedWaiter]]:
-        if not self.queue_pins:
-            return rows
-        tracked = {row_id: (path, row) for path, row in rows if (row_id := row.get("move_id"))}
-        moved = iter(tracked[row_id] for row_id in pinned_order(list(tracked), self.queue_pins))
-        return [next(moved) if row.get("move_id") else (path, row) for path, row in rows]
+    def _full_queue_order(self, ranked: list[tuple[Path, records.RankedWaiter]]
+                          ) -> list[tuple[Path, records.RankedWaiter]]:
+        saved = {place.move_id for place in self.places.values() if place.move_id}
+        rows = {row_id: (path, row) for path, row in ranked if (row_id := row.get("move_id")) in saved}
+        return [rows[row_id] for row_id in pinned_order(list(rows), self.queue_pins)]
 
-    def _remaining_queue_order(self, ranked: list[tuple[Path, records.RankedWaiter]]
-                               ) -> list[tuple[Path, records.RankedWaiter]]:
-        """Apply the current pins to the surviving rows with the pass ranks."""
-        waiting = {records.waiter_owner(item.row) for item in self.waiters.values()}
-        waiting.update(records.run_owner(request.owner.pid, request.owner.start_time)
-                       for request in self.placement_requests.values() if self._placement_waiting(request))
-        return self._apply_queue_pins([(path, row) for path, row in ranked if records.waiter_owner(row) in waiting])
+    def _visible_queue_order(self, ordered: list[tuple[Path, records.RankedWaiter]]
+                             ) -> list[tuple[Path, records.RankedWaiter]]:
+        visible = {waiting.row.get("move_id") for waiting in self.waiters.values()}
+        for request in self.placement_requests.values():
+            if request.episode in self.waiters or not self._placement_waiting(request):
+                continue
+            place = self.places.get(_place_key(request.owner, request.since))
+            if place is not None and place.episode == request.episode:
+                visible.add(place.move_id)
+        return [(path, row) for path, row in ordered if row.get("move_id") in visible]
 
     def _rank_priority_waiters(self, rows: list[tuple[Path, records.RankedWaiter]], priority: records.QueuePriority
                                ) -> list[tuple[Path, records.RankedWaiter]]:
@@ -2243,7 +2252,7 @@ class AdmissionServer:
             pressure, self.spacing, list(evidence.compilers), policy=config.policy)
         self._prune_runs()
         ranked = self._ranked_waiters()
-        ordered = self._apply_queue_pins(ranked)
+        ordered = self._visible_queue_order(self._full_queue_order(ranked))
         unowned = self._unowned_memory(evidence, [row for row, _memory in memories])
         pending_remote_starts = frozenset(records.waiter_owner(waiting.row)
             for episode, key in self.current_assignments.items()
@@ -2600,7 +2609,7 @@ class AdmissionServer:
             self.spacing = proposed.spacing
             self._admit([waiting], config, self.configuration.peak_history_share_percent, cargo_folder=cargo_folder)
         self.persist()
-        remaining_order = self._remaining_queue_order(captured.ranked_waiters)
+        remaining_order = self._visible_queue_order(self._full_queue_order(captured.ranked_waiters))
         self._publish_replies(remaining_order, ci_holds=ci_holds)
         assert isinstance(self.published, PublishedReplies)
         waiting_steps = self.published.view.reading.view.waiting
@@ -2858,9 +2867,9 @@ class AdmissionServer:
         holds = self._ci_hold_reasons() if ci_holds is None else ci_holds
         ci_reasons = {records.waiter_owner(self.waiters[episode].row): reason
                       for episode, reason in holds.items() if episode in self.waiters}
-        routed = {records.run_owner(request.owner.pid, request.owner.start_time): request
-                  for request in self.placement_requests.values()
-                  if request.episode in self.waiters or self._placement_waiting(request)}
+        routed = {place.move_id: request for request in self.placement_requests.values()
+                  if (place := self.places.get(_place_key(request.owner, request.since))) is not None
+                  and place.episode == request.episode}
         visible: list[records.WaitingStep] = []
         positions: dict[str, int] = {}
         for position, (path, row) in enumerate(ordered, 1):
@@ -2869,7 +2878,7 @@ class AdmissionServer:
             if path in local:
                 visible.append(local[path])
                 continue
-            request = routed.get(owner)
+            request = routed.get(row.get("move_id", ""))
             candidates = self.placement_eligibility.get(request.episode, ()) if request is not None else ()
             targets = tuple(dict.fromkeys(item.destination.target for item in candidates
                 if item.destination.provider != "local" and not isinstance(item.eligibility, placement.FixedExclusion)))
@@ -2920,6 +2929,8 @@ class AdmissionServer:
         key = _place_key(request.owner, row["since"])
         previous = self.places.get(key)
         place = waiter_place(row, request.episode)
+        if isinstance(request, (wire.AdmitRequest, wire.PlacementRequest)):
+            place = replace(place, order_since=self._run_order_since(row.get("order_since", row["since"]), request.run))
         if previous is not None:
             if previous.episode == request.episode:
                 place = replace(place, queue_identity=previous.queue_identity)
@@ -2938,13 +2949,15 @@ class AdmissionServer:
     def _depart_queue_id(self, row_id: str) -> None:
         if not self.queue_pins:
             return
-        rows = self._queue_order()
-        positions = {member: index for index, (_, row) in enumerate(rows) if (member := row.get("move_id"))}
-        departed = positions.get(row_id)
-        self._set_queue_pins(tuple(
-            (member, place - 1 if place > 0 and departed is not None
-             and (position := positions.get(member)) is not None and departed < position else place)
-            for member, place in self.queue_pins if member != row_id))
+        pins = dict(self.queue_pins)
+        anchor = pins.pop(row_id, "")
+        if not anchor and row_id in pins.values():
+            order = [row.get("move_id", "") for _, row in self._full_queue_order(self._ranked_waiters())]
+            index = order.index(row_id)
+            anchor = order[index - 1] if index else QUEUE_FIRST
+        if anchor:
+            self._set_queue_pins(tuple((member, anchor if previous == row_id else previous)
+                                       for member, previous in pins.items()))
 
     def _end_move(self, waiting: WaitingAdmission) -> None:
         self._clear_wait_rank(waiting.request.owner, waiting.row["since"], waiting.request.episode)
@@ -4863,21 +4876,23 @@ done
             return [previous.reply]
         if isinstance(self.configuration, gate.UnusableAdmissionConfiguration):
             return [wire.Refused(self.configuration.reason)]
-        rows = self._queue_order()
+        full_order = self._full_queue_order(self._ranked_waiters())
+        rows = self._visible_queue_order(full_order)
         line = self._current_move_line(rows, self._movable_wait_ids(check_owners=True))
         undo = None
         if isinstance(destination := request.destination, wire.QueueUndo):
             saved = self.ledger.get("queue-move:" + destination.move_request_id)
             if saved is not None and isinstance(saved.reply, wire.QueueMoved):
                 undo = saved.reply
-        result = self._move_destination(request, line, undo)
+        result = self._move_destination(request, line, undo,
+                                        [row.get("move_id", "") for _, row in full_order])
         if isinstance(result, wire.QueueMoved):
             self.pass_stale = True
             self.next_pass = self.clock.monotonic()
         return self._mutation_reply(key, result)
 
     def _move_destination(self, request: wire.QueueMoveRequest, line: records.QueueMoveLine,
-                          saved: wire.QueueMoved | None
+                          saved: wire.QueueMoved | None, full_order: list[str]
                           ) -> wire.QueueMoved | wire.QueueMoveConflict:
         changed = wire.QueueMoveConflict(line, "The queue changed. Try the move again.")
         unavailable = wire.QueueMoveConflict(line, "Undo not available")
@@ -4900,13 +4915,27 @@ done
         undo_destination = (wire.QueueDrop(order[old_index], "before") if old_index < len(order)
                             else wire.QueueDrop(order[-1], "after"))
         place = order.index(destination.neighbor) + int(destination.side == "after")
-        pins = dict(self.queue_pins)
         if place != old_index:
-            pins[row_id] = place
+            self._move_pin(row_id, destination, full_order, first=place == 0)
         order.insert(place, row_id)
-        self._set_queue_pins(confirmed_pins(order, pins))
         updated = self._revise_move_line(tuple(by_id[member] for member in order))
         return wire.QueueMoved(row_id, updated, old_index + 1, place + 1, undo_destination)
+
+    def _move_pin(self, row_id: str, destination: wire.QueueDrop, order: list[str], *, first: bool) -> None:
+        pins = dict(self.queue_pins)
+        old_index = order.index(row_id)
+        old_anchor = order[old_index - 1] if old_index else QUEUE_FIRST
+        del order[old_index]
+        if old_index < len(order) and pins.get(order[old_index]) == row_id:
+            pins[order[old_index]] = old_anchor
+
+        index = 0 if first else order.index(destination.neighbor) + int(destination.side == "after")
+        anchor = order[index - 1] if index else QUEUE_FIRST
+        if index < len(order) and pins.get(order[index]) == anchor:
+            pins[order[index]] = row_id
+        pins[row_id] = anchor
+        order.insert(index, row_id)
+        self._set_queue_pins(tuple((member, pins[member]) for member in order if member in pins))
 
     def _submit_queue_change(self, request: QueueChange,
                              connection: Connection | NoConnection) -> list[wire.Reply]:
@@ -5507,6 +5536,25 @@ def read_state(directory: Path) -> ServiceState:
     return parse_service_state((directory / "state.json").read_text())
 
 
+def upgrade_numbered_queue_pins(state: ServiceState, pins: tuple[tuple[str, int], ...]) -> QueuePins:
+    """Recover anchors from the saved order when the state uses position numbers."""
+    rows: list[tuple[Path, records.Waiter]] = []
+    for place in state.places.values():
+        if place.move_id:
+            row = saved_queue_row(place)
+            row["unit"] = place.ci_runner or row.get("unit", "")
+            rows.append((Path(place.move_id), row))
+    ranked, _ = gate.apply_queue_priority(rows, gate.QueueOrderContext(state.priority, {}))
+    pinned = {row_id for row_id, _ in pins}
+    members = {path.name for path, _ in ranked}
+    order = [path.name for path, _ in ranked if path.name not in pinned]
+    for row_id, position in sorted(pins, key=lambda pin: pin[1]):
+        if row_id in members:
+            order.insert(position, row_id)
+    return tuple((row_id, anchor) for anchor, row_id in zip((QUEUE_FIRST, *order), order)
+                 if row_id in pinned)
+
+
 def parse_service_state(text: str, *, warn_missing_folders: bool = False) -> ServiceState:
     def check_placement_shape(value: object) -> None:
         if isinstance(value, list):
@@ -5523,7 +5571,18 @@ def parse_service_state(text: str, *, warn_missing_folders: bool = False) -> Ser
 
     raw_state = cast(dict[str, object], json.loads(text))
     check_placement_shape(raw_state)
-    state = wire.parse_record(text, ServiceState)
+    raw_pins = raw_state.get("queue_pins")
+    pairs = cast(list[object], raw_pins) if isinstance(raw_pins, list) else []
+    first = pairs[0] if pairs else None
+    pair = cast(list[object], first) if isinstance(first, list) else []
+    if len(pair) == 2 and type(pair[1]) is int:
+        schema = tuple[tuple[str, int], ...]
+        pins = cast(tuple[tuple[str, int], ...], codec.parse_snapshot_value(pairs, schema))
+        raw_state["queue_pins"] = []
+        state = wire.parse_record(json.dumps(raw_state), ServiceState)
+        state = replace(state, queue_pins=upgrade_numbered_queue_pins(state, pins))
+    else:
+        state = wire.parse_record(text, ServiceState)
     saved_reservations = cast(dict[str, dict[str, object]], raw_state["reservations"])
     legacy_episodes = {episode for episode, record in saved_reservations.items() if "cargo_folder" not in record}
     if not legacy_episodes:
