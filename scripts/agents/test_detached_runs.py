@@ -1228,16 +1228,16 @@ with socket.socket(socket.AF_UNIX) as connection:
     connection.recv(1)
 """
         # The fake delivery process reports the result text over the socket instead of sending it.
-        supervisor_source = """import json, os, runpy, signal, socket, subprocess, sys, time
+        supervisor_source = """import json, os, signal, socket, subprocess, sys, time
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 from scripts.agents import detached_runs
 from scripts.lib import process_group, process_start
 from scripts.lib.test_hang_guard import LauncherHangGuard
 start = subprocess.Popen.__init__
 run = subprocess.run
-sleep = time.sleep
-monotonic = time.monotonic
+wait_for_command = detached_runs._wait_for_command
 send_group = process_group.send_process_group
 address = os.environ['FIXTURE_READY_SOCKET']
 watcher = os.environ['FIXTURE_WATCHER']
@@ -1270,7 +1270,7 @@ def report(row):
         connection.connect(address)
         connection.sendall((json.dumps(row) + '\\n').encode())
 def fixture_time():
-    return monotonic() if command_mode == 'receive' else clock
+    return time.monotonic() if command_mode == 'receive' else clock
 def fixture_sleep(delay):
     global clock, reported
     if command_pid is not None and not reported:
@@ -1282,7 +1282,7 @@ def fixture_sleep(delay):
                             text=True, check=True, timeout=guard.remaining()).stdout.strip()
                 if state.startswith('T'):
                     break
-                sleep(0.01)
+                time.sleep(0.01)
         row = dict(role='supervisor', group=os.getpgrp(), dispositions_unchanged=dispositions() == initial_dispositions,
                    masks_unchanged=masks() == initial_masks)
         with socket.socket(socket.AF_UNIX) as connection:
@@ -1294,13 +1294,18 @@ def fixture_sleep(delay):
             record = json.loads(Path(sys.argv[-1]).read_text())
             guard = LauncherHangGuard('fixture leader exits')
             while not detached_runs._child_has_exited(command_pid, record['command_started']):
-                sleep(min(0.01, guard.remaining()))
+                time.sleep(min(0.01, guard.remaining()))
     if command_mode == 'receive':
-        sleep(delay)
+        time.sleep(delay)
     else:
         clock += delay
         if attempts:
-            sleep(delay)
+            time.sleep(delay)
+def fixture_wait_for_command(*args, **kwargs):
+    # Subprocess waits use the real clock.
+    fixture_clock = SimpleNamespace(monotonic=fixture_time, sleep=fixture_sleep)
+    with patch.object(detached_runs, 'time', fixture_clock):
+        return wait_for_command(*args, **kwargs)
 def record_signal(group, number):
     if number != signal.SIGKILL:
         return send_group(group, number)
@@ -1336,10 +1341,10 @@ def delivery(arguments, *args, **kwargs):
     with patch.object(detached_runs, 'deliver', send_result):
         status = detached_runs.main(['deliver', str(record_path)])
     return subprocess.CompletedProcess(arguments, status)
-with (patch.object(time, 'sleep', fixture_sleep), patch.object(time, 'monotonic', fixture_time),
+with (patch.object(detached_runs, '_wait_for_command', fixture_wait_for_command),
       patch.object(process_group, 'send_process_group', record_signal), patch.object(subprocess.Popen, '__init__', gate_start),
       patch.object(subprocess, 'run', delivery)):
-    runpy.run_path(detached_runs.__file__, run_name='__main__')
+    sys.exit(detached_runs.main())
 """
         reason = "stopped for timed test; run again after the release"
         requested_at = 0.125
