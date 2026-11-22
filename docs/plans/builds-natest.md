@@ -1276,3 +1276,16 @@ Ordered after the red main repair and the guard repair (builds). It does not mov
 - **Files:** `scripts/mac_test/claim_state.py`; its test module. verify owns `claim_state.py` and reviews the change.
 - **Workers:** 1 writer.
 - **Acceptance gate:** fixtures: a cleanup for a verified repository releases its own legacy claim; a cleanup never releases a relative-path legacy claim with no repository metadata; claim reading keeps the whole-Mac scope for that claim; the changed test module passes in one tests-only gate after the builds go; basedpyright zero on changed files; review by verify.
+
+### Phase 430 — the ledger watch test checks the day edges, not every 5 seconds  · status: todo
+**Depends on:** none
+
+#### Work Order
+- **Goal:** `aws_target/test_ledger.py` drops from 56.1 median CPU s (rank 2, `show.py top` 00:39) to under 5. One test is the whole cost: `SettledChargeWatchTests.test_wider_watch_keeps_the_daily_query_interval_after_nine_days_of_reads` (57.3 s), which calls `refresh_charges` 51,840 times (`range(5, 3 * day + 1, 5)`, test_ledger.py:2021).
+- **Spec:**
+  1. Keep the same claim with the same assertions: after the watch widens to 45 days, the fetch runs once each day and never between. Check the times that can break that claim: the first step, 5 s before and at each day edge, and the last step, for each of the three days. Keep the final `call_args_list` assertion unchanged.
+  2. Change no product code. Check that no other test in the module repeats a dense time sweep; report any with its cost.
+  3. No config key changes; no assertion goes away.
+- **Files:** `scripts/aws_target/test_ledger.py` (aws owns it; aws gets the diff before the hash).
+- **Workers:** 1 writer.
+- **Acceptance gate:** the module passes in one tests-only gate after the builds go; module CPU from the gate record under 5 s; basedpyright zero on the changed file; one blind review.
