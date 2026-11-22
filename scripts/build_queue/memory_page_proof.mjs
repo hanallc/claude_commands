@@ -270,17 +270,17 @@ try {
             section.scrollIntoView({block:'center'});
             const bounds = section.getBoundingClientRect();
             const rows = Array.from(section.querySelectorAll('.outside-queue-row'), row => ({
-              owner:row.querySelector('.detail').textContent,
+              cells:Array.from(row.children, cell => cell.textContent),
               color:row.querySelector('.detail [data-color-text]')?.getAttribute('data-color-text'),
-              mark:row.querySelector('.outside-queue-mark').textContent,
-              cpu:row.querySelector('.num').textContent,
             }));
-            return {rows, visible:!section.hidden, clip:{x:bounds.left+scrollX,y:bounds.top+scrollY,
+            return {heading:section.querySelector('.section-head').textContent,
+              rows, visible:!section.hidden, clip:{x:bounds.left+scrollX,y:bounds.top+scrollY,
               width:bounds.width,height:bounds.height,scale:1}};
           })()`);
           assert.equal(result.visible, true);
-          assert.deepEqual(result.rows, [{owner:'queue · test · targeted_test.py', color:'role.unit-director',
-            mark:'Outside the queue', cpu:'136.0 s CPU'}]);
+          assert.equal(result.heading, 'Tests outside the queue');
+          assert.deepEqual(result.rows, [{cells:['queue · test · targeted_test.py', '136.0 s CPU'],
+            color:'role.unit-director'}]);
           const output = join(folder, 'cpumark-dark.png');
           const pageOutput = join(folder, 'cpumark-page-dark.png');
           if (outsideQueueProof) {
