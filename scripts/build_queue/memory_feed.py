@@ -63,8 +63,7 @@ from scripts.lib.build_steps import CommandUnreadable as CommandUnreadable
 from scripts.build_queue.slot_wait import QueueRowName as QueueRowName
 from scripts.build_queue.slot_wait import (NoNamedStep, QueueKind, command_programs,
                                            public_queue_text, recorded_step, verify_value_options)
-from scripts.build_queue.scope_activity import (LiveBuildRun, NotServiceSlice, RunningServiceJob, ScopeProcesses,
-                                                TrackedDetachedRunRow, in_detached_build_scope)
+from scripts.build_queue.scope_activity import LiveBuildRun, NotServiceSlice, RunningServiceJob, ScopeProcesses
 from scripts.build_queue import admission_records, target_availability
 from scripts.build_queue.memory_files import DATA_NAME, PAGE_NAME, PAGE_SOURCE, configured_output_folder
 from scripts.build_targets import target_config
@@ -1940,9 +1939,10 @@ def read_swap(steps: Sequence[admission_records.RunningStep], labels: Mapping[st
               ) -> SwapReading | SwapUnavailable:
     """Account for host swap in two pools, with disjoint cgroup owners and an explicit difference in each pool."""
     owners: dict[Path, SwapOwner] = {}
+    builds = gate.builds_slice_cgroup()
     for step in steps:
         memory = step.measured
-        if not isinstance(memory, admission_records.MeasuredMemory):
+        if not isinstance(memory, admission_records.MeasuredMemory) or gate.detached_tool_memory(memory, builds):
             continue
         source = memory.anonymous_source
         path: Path
@@ -2547,14 +2547,6 @@ def split_tool_groups(builds: Path, outside: set[Path], excluded: set[Path], cha
     return result
 
 
-def detached_tool_memory(memory: object, builds: Path) -> bool:
-    """Use the tool breakdown for unowned memory in detached scopes."""
-    return (isinstance(memory, admission_records.UnownedSliceMemory)
-            and not memory.diagnostic
-            and isinstance(admission_records.recorded_service_state(memory), NotServiceSlice)
-            and in_detached_build_scope(memory.cgroup, builds))
-
-
 def build_tool_ram(running: Sequence[admission_records.ExplainedRunningStep], queued_use: int,
                    waiters: Sequence[admission_records.RankedWaiter] = ()) -> BuildToolRam:
     """Split the existing tool budget after the queue and service charges."""
@@ -2575,7 +2567,7 @@ def build_tool_ram(running: Sequence[admission_records.ExplainedRunningStep], qu
         if isinstance(memory, admission_records.CompilerServiceMemory):
             path = builds / "sccache.service"
         elif (isinstance(memory, admission_records.UnownedSliceMemory) and memory.cgroup
-              and not memory.diagnostic and not detached_tool_memory(memory, builds)):
+              and not memory.diagnostic and not gate.detached_tool_memory(memory, builds)):
             path = Path(memory.cgroup)
         else:
             continue
@@ -2774,7 +2766,7 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
     builds = gate.builds_slice_cgroup()
     leftovers: list[LeftoverScope] = []
     for step, memory, activity in queue_view.leftover_processes(parsed.view.running):
-        if detached_tool_memory(memory, builds):
+        if gate.detached_tool_memory(memory, builds):
             continue
         identity = labels.get(activity.session_id)
         label = public_owner_name(identity.session, activity.session_id) if identity is not None else ""
@@ -2867,24 +2859,13 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
                         if step is not None else job_notes(job, names, kind="between-steps"))})
     groups: dict[str, list[RunRow]] = {}
     remote_groups: set[str] = set()
-    shown_detached_runs: set[str] = set()
     for entry in explanation.running:
         step = entry.step
         memory = step.measured
-        if not isinstance(memory, (admission_records.RemoteMemoryUnavailable, admission_records.UnownedSliceMemory,
-                                   admission_records.CompilerServiceMemory)):
+        if (not isinstance(memory, (admission_records.RemoteMemoryUnavailable, admission_records.UnownedSliceMemory,
+                                    admission_records.CompilerServiceMemory))
+                or gate.detached_tool_memory(memory, builds)):
             continue
-        if isinstance(memory, admission_records.UnownedSliceMemory) and detached_tool_memory(memory, builds):
-            activity = memory.activity
-            if not isinstance(activity, ScopeProcesses) or not isinstance(tracked := activity.tracked_run_row, TrackedDetachedRunRow):
-                continue
-            run_owner = admission_records.run_owner(tracked.run.pid, tracked.run.start_time)
-            if run_owner in shown_detached_runs or run_owner in by_owner:
-                continue
-            shown_detached_runs.add(run_owner)
-            memory = replace(memory, bytes=tracked.bytes, activity=replace(activity, program=tracked.program))
-            step = replace(step, measured=memory, pid=tracked.run.pid, run=tracked.run, started_at=tracked.run.started_at,
-                           session_id=tracked.session_id, session_name=tracked.session_name, folder=tracked.folder, unit=tracked.unit)
         owner = step_page_owner(step, labels, ci_runners, members, machine, ci_label=recorded_ci_label(step, ci_runners))
         identity = owner.labels
         shown_step = replace(step, unit=identity.unit)

@@ -1588,6 +1588,32 @@ process.stdout.write(JSON.stringify({
         self.assertTrue(all("between steps" in row["detail"] for row in swap.rows if row["kind"] == "owner"))
         self.assertTrue(all(row.get("title_kind") == "staff" for row in swap.rows if row["kind"] == "owner"))
 
+    def test_swap_leaves_detached_tool_scope_remainder_unclassified(self) -> None:
+        gib = admission_records.GIB
+        self.host_swap(8 * gib, 4 * gib)
+        builds = self.cgroup("builds.slice", 4 * gib)
+        detached = "builds.slice/builds-detached.slice"
+        _ = self.cgroup(detached, 4 * gib)
+        parent = self.cgroup(detached + "/tool.scope", 4 * gib)
+        child = self.cgroup(detached + "/tool.scope/cargo.scope", gib)
+        tool = admission_records.RunningStep("tool-owner", "tool owner", "between steps", str(parent), 0,
+            admission_records.UnownedSliceMemory(gib, cgroup=str(parent), pid=700001), pid=700001)
+        cargo = reservation_reading().view.running[0]
+        memory = cargo.measured
+        assert isinstance(memory, admission_records.MeasuredMemory)
+        cargo = replace(cargo, measured=replace(memory, anonymous_source=admission_records.ScopeSource(child, frozenset())))
+        with mock.patch.object(gate, "builds_slice_cgroup", return_value=builds):
+            names = read_step_names()
+            baseline = memory_feed.read_swap((cargo,), {}, 6, names)
+            swap = memory_feed.read_swap((tool, cargo), {}, 6, names)
+        assert isinstance(swap, memory_feed.SwapReading)
+        self.assertEqual(swap, baseline)
+        remainder, = (row for row in swap.rows if row["kind"] == "ungrouped")
+        self.assertEqual((remainder["name"], remainder["bytes"]), ("Unclassified groups", 3 * gib))
+        owner, = (row for row in swap.rows if row["kind"] == "owner")
+        self.assertEqual(owner["bytes"], gib)
+        self.assertEqual(swap.builds_ci, 4 * gib)
+
     def test_swap_small_groups_and_total_use_the_same_current_host_reading(self) -> None:
         self.host_swap(4 * admission_records.GIB, 3 * admission_records.GIB)
         for number in range(3):
@@ -3729,16 +3755,16 @@ process.stdout.write(JSON.stringify({
                                     current=2 * gib, anonymous=2 * gib)
             _ = only_admitted(fixture.server.handle_request(replace(fixture.request(owner=cargo), sidecar=str(sidecar))))
 
-            def page() -> memory_feed.MemoryPage:
+            def page() -> tuple[memory_feed.MemoryPage, admission_records.QueueRead]:
                 _ = fixture.run_pass()
                 reply, = fixture.server.handle_request(wire.ViewRequest())
                 decoded = wire.parse_reply(wire.encode_reply(reply))
                 assert isinstance(decoded, wire.ViewReply)
                 with (mock.patch.object(admission_client, "view", return_value=decoded.reading),
                       mock.patch.object(memory_feed, "PROC", proc)):
-                    return memory_feed.reading()
+                    return memory_feed.reading(), decoded.reading
 
-            before = page()
+            before, _ = page()
             original, = (row for row in before["walk"] if row["pid"] == root.pid)
             original = cast(memory_feed.RunRow, original)
             self.assertEqual((original["name"], original["used"], original["counted"]), ("verify.sh", 1.5, 0.0))
@@ -3746,7 +3772,12 @@ process.stdout.write(JSON.stringify({
             for pid, scope_gib in zip(helper_pids, (1, 2), strict=True):
                 write_scope(run_slice / f"helper-{pid}.scope", members=(pid,),
                             current=scope_gib * gib, anonymous=scope_gib * gib)
-            after = page()
+            after, reading = page()
+            matching = {str(run_slice / f"helper-{pid}.scope") for pid in helper_pids}
+            self.assertEqual({step.measured.cgroup for step in reading.view.running
+                              if isinstance(step.measured, admission_records.UnownedSliceMemory)
+                              and isinstance(step.run, LiveBuildRun) and step.run.pid == root.pid
+                              and step.measured.cgroup}, matching)
             shown, = (row for row in after["walk"] if row["pid"] == root.pid)
             self.assertEqual(shown, original)
             self.assertEqual(after["walk"], before["walk"])
@@ -3754,6 +3785,29 @@ process.stdout.write(JSON.stringify({
             self.assertEqual((ram["queued_builds_bytes"], ram["build_tools_bytes"], ram["other_build_tools_bytes"]),
                              (2 * gib, 3 * gib, 3 * gib))
             self.assertEqual(after["used"], 2.0)
+
+            other = fixture.fixture_owner(700006, "400")
+            other_run = wire.RunIdentity(other.pid, other.start_time)
+            for offset, (pid, scope_gib) in enumerate(zip(helper_pids, (1, 2), strict=True)):
+                owner = fixture.fixture_owner(700007 + offset, str(500 + offset))
+                scope = run_slice / f"helper-{pid}.scope"
+                sidecar = fixture.scope(owner, folder=str(scope.relative_to(fixture.root)), members=(pid,),
+                                        current=scope_gib * gib, anonymous=scope_gib * gib)
+                fixture.allow_next_start()
+                request = fixture.request(owner=owner, run=other_run)
+                _ = only_admitted(fixture.server.handle_request(replace(request, sidecar=str(sidecar))))
+
+            owned, reading = page()
+            self.assertTrue(matching.isdisjoint(step.measured.cgroup for step in reading.view.running
+                                               if isinstance(step.measured, admission_records.UnownedSliceMemory)))
+            self.assertEqual({str(step.measured.anonymous_source.directory) for step in reading.view.running
+                              if isinstance(step.run, LiveBuildRun) and step.run.pid == other.pid
+                              and isinstance(step.measured, admission_records.MeasuredMemory)
+                              and isinstance(step.measured.anonymous_source, admission_records.ScopeSource)}, matching)
+            retained, = (row for row in owned["walk"] if row["pid"] == root.pid)
+            self.assertEqual(retained, original)
+            self.assertEqual(owned["ram"]["queued_builds_bytes"], 5 * gib)
+            self.assertEqual(owned["ram"]["build_tools_bytes"], 0)
 
     def test_registered_and_unregistered_ci_jobs_count_once_without_margin_text(self) -> None:
         for registered, registered_use, unregistered_use, kept in (

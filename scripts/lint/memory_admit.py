@@ -2839,6 +2839,13 @@ def builds_slice_cgroup() -> Path:
     return Path(os.environ.get("BUILDLOG_BUILDS_CGROUP", str(user_manager_cgroup() / "builds.slice")))
 
 
+def detached_tool_memory(memory: StepMemory, builds: Path) -> bool:
+    """Identify an unowned tool scope below the detached builds slice."""
+    return (isinstance(memory, UnownedSliceMemory) and bool(memory.cgroup)
+            and not memory.diagnostic and isinstance(records.recorded_service_state(memory), NotServiceSlice)
+            and Path(memory.cgroup).is_relative_to(builds / "builds-detached.slice"))
+
+
 def desktop_guarantee() -> int | ReadingUnavailable:
     """Read the memory the desktop session keeps protected (session.slice memory.min)."""
     path = user_manager_cgroup() / "session.slice" / "memory.min"
