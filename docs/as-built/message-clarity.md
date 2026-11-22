@@ -191,7 +191,8 @@ The gate permits only an exact match. A missing template id or failed gate check
 | --- | --- |
 | `check --title T (--action A \| --no-action) --text B [--priority N]` | Dry full review (including the second check). Prints the outcome and logs `dry`. Exits 0. A `Session:` line at the start of `--text` is kept. |
 | `replay [--limit N]` | Reviews sent pushes again from `pushover.jsonl`, newest first. Logs `replay`. Posts nothing. |
-| `texts [--id X]… [--approve [--user-spec SOURCE]]` | Dry-reviews every catalog example. Exits 1 if any fails. See the catalog section. |
+| `texts [--id X]… [--approve [--user-spec SOURCE]]` | Reviews each selected example. Uses any current user approval when `--approve` has no `--user-spec`. Exits 1 if any review fails. |
+| `texts --ask --id X` | Prints each example and saves an approval request for the current herdr pane and Claude session. |
 | `sample <transcripts…> [--limit 20] [--since ISO]` | Dry-reviews recent replies. See the nightly section. |
 | `release --identity I -- SOURCE` | Prints one `ReleaseOutcome` word. |
 | `due` | Posts expired holds (legacy, see below). |
@@ -359,7 +360,16 @@ New escalate holds retain their registered template and values.
 - `quota.paid_credits_queued` (agreed with accounts 2026-10-21 under the user's approval): the same title, Action, need and sender rule as `quota.paid_credits`, for when the user queued a workers move. Workers never go to Claude: `Leave on` spends credits until the queued move runs, and `Turn off` stops the workers until it runs. Values: `sender`, `account`, `machine`, `credits`, `refill` (no `next_reset`). `paid_credits_values()` fills its sender, and the paid-credit hold detail names both calls.
 - `scripts/notify/push_texts_reviewed.json` has the form `{text_id: {example_name: {sha256, time, reviewer, objections?}}}`:
   - It is read only through `review.text_approvals()`.
-  - `texts --approve` writes passing examples only.
+  - `texts --approve` writes approvals for examples that pass review or have a current user approval.
+  - `texts --ask --id X` saves one request per pane under `text-asks` in the notify state folder.
+    The command saves the request before it shows the examples. If the save fails, the command clears the request for the pane.
+  - `text_asks.answer()` accepts a typed approval from the focused pane and session that made the request.
+    The request expires after `TEXT_ASK_MINUTES`. The prompt must start with yes, go, ok, approve or approved and contain no negation.
+    The function refuses approval after a script sends printable keys to the pane during the request or within one request time limit before it.
+    The function deletes the request before it saves the user's exact words under `text-approvals`.
+    The prompt hook still needs to call this function before it can record live approvals.
+  - A matching text ID and fingerprint let `texts --approve --id X` skip the reviewer.
+    The command records `user-prompt: <words> (<session>, <time>)` and an empty list of objections for each example.
   - `--approve --user-spec SOURCE` writes every example whatever the verdict. The `reviewer` field is `user-spec: <source>; reviewer: <model>` and `objections` lists `{rule, quote}`. The command still exits 1 when there are objections.
   - Approving an id keeps records only for its current examples.
   - Hand-written user-spec entries use `push_texts.fingerprint(entry)`.
@@ -577,8 +587,8 @@ The user asked for this on 2026-10-23: each permission alert starts a root cause
 
 **Reviewer behaviour:**
 - Without explicit instruction the reviewer repeats the action line at the top of the body. `validate` removes it, along with an `Action: ` prefix on the action.
-- The reviewer is not deterministic and not always stable on its own rewrite. Approve a catalog text only after three passing runs. Example values decide the verdict as much as templates do: names that are unrealistic or contradict each other fail review.
-- Changing a template or an example value invalidates its approval. Rerun `review.py texts --id <id>`, then `--approve`.
+- Reviewer results can vary between runs. For reviewer approval, wait for three passing runs. Use realistic and consistent example values.
+- A change to a template or example value invalidates its approval. Get a new approval for the new fingerprint.
 - `--user-spec` without `--approve`, or with an empty source, is a usage error. The reviewer objects to the user's four-line holdout text on every run, and those objections are recorded, never applied.
 
 **Holds and the gate:**
