@@ -34,6 +34,7 @@ if __name__ == "__main__":
 # The status line imports this module on each refresh. Defer imports for other paths.
 if TYPE_CHECKING:
     import argparse
+    from scripts.accounts import role_map
 
 OWNER_MACHINE = "natedev"
 StaffId = NewType("StaffId", str)
@@ -1477,6 +1478,72 @@ def authority_snapshot() -> StaffSnapshot:
     if not isinstance(value, dict):
         raise StaffUnreadable("staff snapshot must be an object")
     return replace(_snapshot_value(cast(dict[str, object], value)), production=True)
+
+
+@dataclass(frozen=True)
+class PeerStatusAuthority:
+    membership: StaffSnapshot
+    accounts: role_map.RoleMap
+
+    def encode(self) -> str:
+        from scripts.accounts import role_map
+
+        return json.dumps({
+            "staff": self.membership.encode(),
+            "role_map": role_map.encode_role_map(self.accounts),
+        })
+
+
+@dataclass(frozen=True)
+class ReadStatusAuthority:
+    """Read staff and roles from their authorities during status."""
+
+
+def peer_status_authority() -> PeerStatusAuthority | ReadStatusAuthority:
+    """Supply staff and roles from the production staff owner."""
+    from scripts.accounts import role_map
+
+    if _file_override() or not is_owner():
+        return ReadStatusAuthority()
+    try:
+        roles = role_map.read_role_map()
+    except role_map.RoleMapUnavailable:
+        return ReadStatusAuthority()
+    return PeerStatusAuthority(authority_snapshot(), roles)
+
+
+def decode_peer_status_authority(text: str) -> PeerStatusAuthority | ReadStatusAuthority:
+    """Decode the peer's staff and roles together."""
+    from scripts.accounts import role_map
+
+    try:
+        value = _decode(text)
+        if not isinstance(value, dict):
+            return ReadStatusAuthority()
+        document = cast(dict[str, object], value)
+        membership, roles = document.get("staff"), document.get("role_map")
+        if not isinstance(membership, str) or not isinstance(roles, str):
+            return ReadStatusAuthority()
+        accounts = role_map.decode_role_map_strict(roles)
+        fields = _record_fields(membership)
+        record = _snapshot_value(fields)
+    except (OSError, ValueError, RecursionError):
+        return ReadStatusAuthority()
+    if not _clean_parse(fields, record):
+        return ReadStatusAuthority()
+    return PeerStatusAuthority(replace(record, production=True), accounts)
+
+
+@contextmanager
+def status_authority(reading: PeerStatusAuthority | ReadStatusAuthority) -> Generator[None]:
+    """Use the supplied staff and roles for this status command."""
+    from scripts.accounts import role_map
+
+    with ExitStack() as scope:
+        if isinstance(reading, PeerStatusAuthority):
+            _ = scope.enter_context(supplied_snapshot(reading.membership))
+            _ = scope.enter_context(role_map.supplied_role_map(reading.accounts))
+        yield
 
 
 def local_snapshot() -> StaffSnapshot:
