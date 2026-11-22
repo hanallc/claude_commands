@@ -2325,6 +2325,14 @@ class PaneRunDeliveryTests(unittest.TestCase):
         self.notices = []
         self.defer_transcript = False
         self.pending_transcripts = []
+        process_args = detached_run_process.process_args
+
+        def fixture_arguments(pid: int) -> list[str] | detached_run_process.ProcessCommandText | detached_run_process.ProcessArgumentsUnavailable | detached_run_process.ProcessAbsent:
+            if pid == DEAD_PID:
+                return detached_run_process.ProcessAbsent()
+            return process_args(pid)
+
+        _ = self.enterContext(patch.object(detached_run_process, "process_args", side_effect=fixture_arguments))
         config = self.fixture.root / "conf"
         for name in ("detached_runs", "send", "postmaster", "codex_daemon"):
             write_text_atomic(config / f"{name}.conf",

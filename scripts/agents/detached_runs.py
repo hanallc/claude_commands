@@ -820,9 +820,16 @@ def acknowledge_worker_completion(run: Path, row: staff.StaffRow, passed: dict[s
     for record in _registered_runs(runs, row.id):
         delivery = record.get("delivery", "")
         if (record["staff_id"] != row.id or record["status"] != "finished"
-                or record.get("completion_pending") is not True or not delivery
-                or not (record.get("pane_dispatch_id") == instance
-                        or "pane_dispatch_id" not in record and record["started_at"] >= started)):
+                or record.get("completion_pending") is not True or not delivery):
+            continue
+        if result_is_from_another_pass(record, instance):
+            if (_worker_result_pending(delivery) and not _result_push_failed(delivery)
+                    and _save_delivery(runs / f"{record['run_id']}.json", OTHER_PASS_DELIVERY,
+                                       if_current=delivery) == OTHER_PASS_DELIVERY):
+                _clear_completion_pending(runs / f"{record['run_id']}.json")
+            continue
+        if not (record.get("pane_dispatch_id") == instance
+                or "pane_dispatch_id" not in record and record["started_at"] >= started):
             continue
         if _worker_result_pending(delivery):
             if evidence is None:
@@ -1737,7 +1744,8 @@ def deliver(record: RunRecord, result: CommandResult, *,
         return _save_delivery(path, saved if saved.startswith((FAILED_RESULT_PUSH, FAILED_WORKER_SUBMISSION)) else detail)
 
     with _delivery_lock(path):
-        saved = _read_record(path).get("delivery", "")
+        with record_lock(path):
+            saved = _read_record(path).get("delivery", "")
         unconfirmed = saved.startswith(UNCONFIRMED_WORKER_RESULT)
         try:
             membership = staff.snapshot()
@@ -1822,6 +1830,7 @@ def deliver(record: RunRecord, result: CommandResult, *,
             return WorkerResultTarget.PARKED if parked else WorkerResultTarget.PANE
 
         def before_input() -> None:
+            from scripts.direct import recorder_state
             from scripts.herdr import worker_panes
 
             linked = record.get("pane_dispatch_id")
@@ -1839,10 +1848,14 @@ def deliver(record: RunRecord, result: CommandResult, *,
                     current = current_membership.by_id(worker.id)
                     if current is None or current.current_session != worker.current_session:
                         raise _WorkerPassDeliveryBlocked(DEFERRED_WORKER_RESULT + "the worker session changed")
-                    if worker_panes.worker_run(current, record=current_membership) == path.parent.parent:
-                        passed = worker_panes.worker_pass(current, path.parent.parent, record=current_membership)
-                        if result_is_from_another_pass(record, passed.get("instance_id")):
-                            raise _WorkerPassDeliveryBlocked(OTHER_PASS_DELIVERY)
+                    try:
+                        if worker_panes.worker_run(current, record=current_membership) == path.parent.parent:
+                            passed = worker_panes.worker_pass(current, path.parent.parent, record=current_membership)
+                            if result_is_from_another_pass(record, passed.get("instance_id")):
+                                raise _WorkerPassDeliveryBlocked(OTHER_PASS_DELIVERY)
+                    except (OSError, ValueError, recorder_state.OldRecorderState) as error:
+                        raise _WorkerPassDeliveryBlocked(
+                            DEFERRED_WORKER_RESULT + f"worker pass is unavailable: {error}") from error
                 if check_pass() is WorkerResultTarget.DIRECTOR:
                     raise _WorkerPassDeliveryBlocked(DEFERRED_WORKER_RESULT + WorkerResultTarget.DIRECTOR.value)
                 _ = _save_delivery(path, pane_checkpoint)
@@ -1957,7 +1970,7 @@ def submit_finished_worker_result(run: Path, worker: staff.StaffRow, *,
             continue
         other_pass = (result_is_from_another_pass(record, pane_dispatch_id)
                       or not pane_dispatch_id and _result_pass_changed(record))
-        if other_pass and _result_push_failed(record.get("delivery", "")):
+        if _unconfirmed_pass_result(record) or other_pass and _result_push_failed(record.get("delivery", "")):
             continue
         delivery = deliver(record, command_result(record), worker_input=worker_input,
                            resume_parked=resume_parked, input_lock=input_lock)

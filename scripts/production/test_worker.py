@@ -109,10 +109,11 @@ def run_compaction_helper_fixture() -> int:
         record_prompt(line)
         raise OSError("fixture lost the prompt response")
 
-    def refuse_confirmation(run: Path, instance_id: str, completion_id: str) -> None:
+    def refuse_confirmation(run: Path, instance_id: str, completion_id: str, *, worker_thread: str) -> None:
         assert run == Path(arguments[arguments.index("--session-dir") + 1])
         assert instance_id == arguments[arguments.index("--dispatch-id") + 1]
         assert completion_id == arguments[arguments.index("--completion-id") + 1]
+        assert worker_thread
         raise OSError("fixture could not save confirmation")
 
     def notify(options: send.Options, *, membership: staff.StaffSnapshot) -> send.Result:
@@ -436,6 +437,14 @@ class WorkerCommandTests(unittest.TestCase):
         _ = (self.fixture.root / "conf/build_targets.conf").write_text("targets=natedev,mac\nkind.natedev=local\nkind.mac=ssh\n")
         self.fixture.world.binary = "/nonexistent/herdr"
         self.addCleanup(self.fixture.doCleanups)
+        process_args = detached_run_process.process_args
+
+        def fixture_arguments(pid: int) -> list[str] | detached_run_process.ProcessCommandText | detached_run_process.ProcessArgumentsUnavailable | detached_run_process.ProcessAbsent:
+            if pid == 2 ** 22 + 12345:
+                return detached_run_process.ProcessAbsent()
+            return process_args(pid)
+
+        _ = self.enterContext(patch.object(detached_run_process, "process_args", side_effect=fixture_arguments))
         config = self.fixture.root / "conf/direct.conf"
         atomic_file.write_text_atomic(config, config.read_text()
                                       + "# range: 1..600\nWORKER_SETTLE_SECONDS=30\n")
@@ -2485,7 +2494,7 @@ class WorkerCommandTests(unittest.TestCase):
 
             self.assertIsInstance(detached_runs.caller_from_environment(dict(os.environ)), detached_runs.DirectorCaller)
             with patch.object(self.fixture.world, "wait_turn_end", side_effect=publish_during_compaction):
-                self.assertEqual(worker.main(helper), worker.ExitCode.OK)
+                self.assertEqual(worker.main(helper), worker.ExitCode.OK, errors.getvalue())
             admission, = admissions
             self.assertEqual(guard.result(admission), 0, errors.getvalue())
             spawn.assert_called_once()
@@ -4767,6 +4776,7 @@ class WorkerCommandTests(unittest.TestCase):
                 case = WorkerCommandTests("runTest")
                 case.setUp()
                 try:
+                    case.agent.finish_after = 1
                     assignment_thread = current_thread()
                     hook_acquired = Event()
                     release_hook = Event()

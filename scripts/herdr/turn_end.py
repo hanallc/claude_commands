@@ -1255,6 +1255,18 @@ def _handle_locked(event: WorkerEvent,
                          and receipt.outcome in (TurnOutcome.DONE, TurnOutcome.LATE_DONE)
                          or isinstance(receipt, worker.DispatchWaitingForRuns)
                          and isinstance(receipt.reply, worker.DispatchComplete))
+        if isinstance(event.native_stop, dict) and marker != stage and archived_stops:
+            late = _recover_replaced_stops(event, row, run, instance, marker, archived_stops)
+            archived_markers = {archived.completion_id for _, archived in archived_stops}
+            current_reply = verified_done or isinstance(receipt, (worker.DispatchComplete, worker.DispatchAwaitingReply,
+                                                                  worker.DispatchWaitingForRuns)) or (
+                isinstance(receipt, worker.DispatchSubmitted) and isinstance(receipt.turn, worker.TranscriptTurn)
+                and _done_marker(receipt.turn.reply) not in archived_markers)
+            if not current_reply:
+                if isinstance(late, TurnOutcome):
+                    return late
+                if not event.reply and not needs_verification and isinstance(receipt, worker.DispatchSubmitted):
+                    return _ignored(event, "the replacement pass has no transcript reply", row.name)
         if (instance and delivery.line and not recorded_stop and isinstance(event.native_stop, dict)
                 and not verified_done and not isinstance(receipt, worker.DispatchComplete)):
             if not needs_verification:
@@ -1264,13 +1276,6 @@ def _handle_locked(event: WorkerEvent,
             needs_verification = True
         if needs_verification and isinstance(receipt, (worker.DispatchEvidenceUnknown, worker.DispatchNotSubmitted)):
             return TurnOutcome.RETRY_EVIDENCE
-        if isinstance(event.native_stop, dict) and marker != stage:
-            late = _recover_replaced_stops(event, row, run, instance, marker, archived_stops)
-            current_reply = verified_done or isinstance(receipt, (worker.DispatchComplete, worker.DispatchAwaitingReply,
-                                                                  worker.DispatchWaitingForRuns)) or (
-                isinstance(receipt, worker.DispatchSubmitted) and isinstance(receipt.turn, worker.TranscriptTurn))
-            if marker and isinstance(late, TurnOutcome) and not current_reply:
-                return late
         if not verified_done and event.kind in (EventKind.TURN_END, EventKind.RUN_FINISHED):
             worker_input = (detached_runs.WorkerResultInput.TURN_ENDED if event.kind == EventKind.TURN_END
                             else detached_runs.WorkerResultInput.TYPE)
@@ -1342,6 +1347,8 @@ def _handle_locked(event: WorkerEvent,
                 and (not archived_stops or passed.get("submitted_worker_thread") == event.thread_id))
                 ) and passed.get("status") in ("active", "refused")
             if needs_verification:
+                if marker and marker == stage:
+                    return TurnOutcome.RETRY_EVIDENCE
                 if not isinstance(receipt.turn, worker.TranscriptTurn):
                     return TurnOutcome.RETRY_EVIDENCE
                 reply = receipt.turn.reply

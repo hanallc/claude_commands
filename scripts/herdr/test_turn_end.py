@@ -944,9 +944,12 @@ class TurnEndTests(unittest.TestCase):
                 self.assertEqual(len(self.case.agent.submitted), before)
                 if ready_first:
                     if hook_only:
-                        assert isinstance(active, progress_history.ActiveDispatch)
-                        self.case.agent.last_replies[str(row.current_session)] = "The review is complete.\nDONE " + active.instance_id
+                        reply = "The review is complete.\nDONE " + active.instance_id
+                        self.case.agent.last_replies[str(row.current_session)] = reply
                         self.case.fixture.world.locations[pane]["agent_status"] = "done"
+                        self.assertEqual(self.case.finish(name), turn_end.TurnOutcome.IGNORED)
+                        self.assertEqual(len(self.case.agent.submitted), before)
+                        self.case.agent.append(pane, "assistant", reply)
                     else:
                         self.case.agent.complete(pane)
                     self.assertEqual(self.case.finish(name), turn_end.TurnOutcome.SUBMITTED)
@@ -1166,10 +1169,11 @@ class TurnEndTests(unittest.TestCase):
 
         with patch.object(turn_end, "time", SimpleNamespace(time=lambda: 10.0)):
             if case == "empty-then-question":
+                self.append_empty_transcript_turn(transcript, family)
                 with patch.object(worker_admission, "transcript_source", side_effect=OSError("unavailable")):
-                    self.append_empty_transcript_turn(transcript, family)
                     self.native_stop(row, "")
-                    self.case.agent.append(pane, "assistant", b)
+                self.case.agent.append(pane, "assistant", b)
+                with patch.object(worker_admission, "transcript_source", side_effect=OSError("unavailable")):
                     self.native_stop(row, b)
             else:
                 self.case.agent.append(pane, "assistant", a)
@@ -1255,7 +1259,7 @@ class TurnEndTests(unittest.TestCase):
             with patch.object(worker_panes, "worker_pass", return_value=state):
                 _ = decision.send_notice()
             self.assertEqual(len(self.case.agent.notices), notices)
-        with patch.object(progress_history, "dispatch_delivery", return_value=replace(delivery, completion_id="stage-two")):
+        with patch.object(pass_recorder, "dispatch_delivery", return_value=replace(delivery, completion_id="stage-two")):
             _ = decision.send_notice()
         self.assertEqual(len(self.case.agent.notices), notices)
 
@@ -1733,6 +1737,7 @@ class TurnEndTests(unittest.TestCase):
 
     def check_native_done_after_notice(self, family: str, case: str) -> None:
         _ = write_registry(self.case.fixture.root / "conf/models.conf", {"assignments": {"direct": family}})
+        self.case.agent.finish_after = 1
         name = f"{family}-{case.replace(' ', '-')}"
         notices = len(self.case.agent.notices)
         self.assertIs(self.case.dispatch(name), worker.DispatchSubmission.SUBMITTED)
@@ -1741,6 +1746,7 @@ class TurnEndTests(unittest.TestCase):
         backend = staff.backend(row)
         assert isinstance(backend, (staff.ClaudeBackend, staff.CodexBackend))
         self.assertEqual("codex" if isinstance(backend, staff.CodexBackend) else "claude", family)
+        self.case.agent.complete(pane)
         with patch.object(self.case.fixture.world, "close_terminal_pane", return_value=False):
             self.assertEqual(self.case.finish(name), turn_end.TurnOutcome.DONE)
         self.assertIn(pane, self.case.fixture.world.locations)
@@ -1928,10 +1934,8 @@ class TurnEndTests(unittest.TestCase):
         atomic_file.write_text_atomic(transcript, f"{earlier}\n{json.dumps(fields)}\n")
 
     def write_result_retry_config(self) -> None:
-        atomic_file.write_text_atomic(self.case.fixture.root / "conf/detached_runs.conf",
-                                      "# whole: 1..\nRESULT_LINE_CHARS=300\n"
-                                      + "# whole: 1..\nRESULT_TEXT_CHARS=2000\n"
-                                      + "# range: 0.1..60\nRESULT_PUSH_RETRY_SECONDS=5\n")
+        source = Path(__file__).resolve().parents[2] / "config/detached_runs.conf"
+        _ = shutil.copyfile(source, self.case.fixture.root / "conf/detached_runs.conf")
 
     def check_repeated_done_after_native_outage(self, family: str, order: str) -> None:
         _ = write_registry(self.case.fixture.root / "conf/models.conf", {"assignments": {"direct": family}})
