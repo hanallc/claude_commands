@@ -251,8 +251,7 @@ class PaneWorld(herdr.Herdr):
     def process_start(self, pid: int) -> str | None:
         """Read the process generation from the private stat file."""
         if pid in self.processes:
-            with patch.dict(os.environ, {"VERIFY_PROC_ROOT": str(self.process_root)}):
-                observed = process_start.process_start(pid)
+            observed = process_start.proc_table_start(pid, self.process_root)
         else:
             observed = process_start.process_start(pid)
         return observed.start if isinstance(observed, process_start.Started) else None
@@ -263,8 +262,7 @@ class PaneWorld(herdr.Herdr):
         observed_start = process_start.process_start
         def read(pid: int) -> process_start.ProcessStart:
             if pid in self.processes:
-                with patch.dict(os.environ, {"VERIFY_PROC_ROOT": str(self.process_root)}):
-                    return observed_start(pid)
+                return process_start.proc_table_start(pid, self.process_root)
             return observed_start(pid)
         with patch.object(process_start, "process_start", side_effect=read):
             yield

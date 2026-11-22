@@ -8378,6 +8378,7 @@ class PaneWorkerMoveTests(unittest.TestCase):
         _ = cast(object, self.enterContext(patch.dict(os.environ, {
             "CONF_DIR": str(config), "MODELS_CONFIG_FILE": str(registry), "MODELS_CONFIG_PUBLISH": "0",
             "UNIT_RUN_DIR": str(self.run_dir), "XDG_STATE_HOME": str(self.root / "state"),
+            "HERDR_PLATFORM": "linux", "HERDR_PROC": str(self.world.process_root),
         })))
         _ = self.enterContext(patch.object(unit_runs, "RUN_ROOT", self.root / "runs"))
         _ = self.enterContext(patch.object(unit_runs, "FORMER_RUN_ROOT", self.root / "former"))

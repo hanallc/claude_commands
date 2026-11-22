@@ -838,7 +838,9 @@ class TurnEndTests(unittest.TestCase):
             if done:
                 self.assertEqual(detached_runs.reap_orphans(str(self.case.run_dir)), [])
             else:
-                self.assertIs(worker.restore(self.case.fixture.parent.id, only=frozenset({row.id})), worker.ExitCode.OK)
+                with redirect_stderr(io.StringIO()) as errors:
+                    code = worker.restore(self.case.fixture.parent.id, only=frozenset({row.id}))
+                self.assertIs(code, worker.ExitCode.OK, errors.getvalue())
             self.assertEqual(detached_runs.reap_orphans(str(self.case.run_dir)), [])
         if done:
             self.assertEqual(submissions, [])
@@ -859,6 +861,7 @@ class TurnEndTests(unittest.TestCase):
             self.assertEqual(worker_panes.worker_pass(row, self.case.run_dir)["status"], "completed")
             self.assertIs(worker_lifecycle.read_json_object(path).get("completion_pending"), False)
         else:
+            self.assertEqual(len(submissions), 1, worker_lifecycle.read_json_object(path).get("delivery"))
             (target, text), = submissions
             self.assertIn("The final type check passed.", text)
             self.assertEqual(len(self.case.fixture.world.launches), launches + 1)

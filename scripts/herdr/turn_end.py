@@ -1337,6 +1337,14 @@ def _handle_locked(event: WorkerEvent,
             return TurnOutcome.WAITING_ON_REAP
         turn_reply = receipt.reply if isinstance(receipt, worker.DispatchWaitingForRuns) else receipt
         reply = turn_reply.last_reply if isinstance(turn_reply, worker.DispatchAwaitingReply) else turn_reply.reply
+        if (needs_verification and marker and marker == stage and (
+                isinstance(turn_reply, worker.DispatchSubmitted)
+                or isinstance(turn_reply, worker.DispatchAwaitingReply)
+                and isinstance(turn_reply.matching_done, worker.NoMatchingDone))):
+            return TurnOutcome.RETRY_EVIDENCE
+        if (event.kind == EventKind.RUN_FINISHED and isinstance(receipt, worker.DispatchWaitingForRuns)
+                and not receipt.has_live_run and isinstance(turn_reply, worker.DispatchSubmitted) and not reply):
+            return TurnOutcome.WAITING_ON_REPLY
         if (event.kind == EventKind.RUN_FINISHED and not isinstance(receipt, worker.DispatchComplete)
                 and isinstance(state, worker_panes.OpenWorker) and state.status == herdr.AgentStatus.WORKING):
             return TurnOutcome.WAITING_ON_REPLY
@@ -1347,8 +1355,6 @@ def _handle_locked(event: WorkerEvent,
                 and (not archived_stops or passed.get("submitted_worker_thread") == event.thread_id))
                 ) and passed.get("status") in ("active", "refused")
             if needs_verification:
-                if marker and marker == stage:
-                    return TurnOutcome.RETRY_EVIDENCE
                 if not isinstance(receipt.turn, worker.TranscriptTurn):
                     return TurnOutcome.RETRY_EVIDENCE
                 reply = receipt.turn.reply

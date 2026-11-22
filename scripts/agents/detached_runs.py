@@ -823,7 +823,8 @@ def acknowledge_worker_completion(run: Path, row: staff.StaffRow, passed: dict[s
                 or record.get("completion_pending") is not True or not delivery):
             continue
         if result_is_from_another_pass(record, instance):
-            if (_worker_result_pending(delivery) and not _result_push_failed(delivery)
+            if (record.get("self_stop") and record.get("stop_pass_requested")
+                    and delivery.startswith(DEFERRED_WORKER_RESULT)
                     and _save_delivery(runs / f"{record['run_id']}.json", OTHER_PASS_DELIVERY,
                                        if_current=delivery) == OTHER_PASS_DELIVERY):
                 _clear_completion_pending(runs / f"{record['run_id']}.json")

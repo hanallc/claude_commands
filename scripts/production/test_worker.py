@@ -1,7 +1,6 @@
 """Worker commands preserve native identity and use transcripts as dispatch receipts."""
 from __future__ import annotations
 
-import argparse
 from scripts.direct import pass_record as pass_recorder
 
 import io
@@ -440,7 +439,7 @@ class WorkerCommandTests(unittest.TestCase):
         process_args = detached_run_process.process_args
 
         def fixture_arguments(pid: int) -> list[str] | detached_run_process.ProcessCommandText | detached_run_process.ProcessArgumentsUnavailable | detached_run_process.ProcessAbsent:
-            if pid == 2 ** 22 + 12345:
+            if pid in (2 ** 22 + 12345, 2_147_483_647):
                 return detached_run_process.ProcessAbsent()
             return process_args(pid)
 
@@ -2478,8 +2477,9 @@ class WorkerCommandTests(unittest.TestCase):
               patch.object(treekey, "tree_key", return_value="fixture-tree"),
               patch.object(subprocess, "Popen", side_effect=start_process)):
             def publish_during_compaction(pane: str, timeout_ms: int) -> herdr.ObservedAgentState | herdr.WaitTimedOut:
-                admission = executor.submit(detached_runs.command_start, argparse.Namespace(
-                    session_dir=str(self.run_dir), to=current.row.name, command=["--", "fixture-check"]))
+                admission = executor.submit(detached_runs.main, [
+                    "start", "--session-dir", str(self.run_dir), "--to", current.row.name, "--", "fixture-check",
+                ])
                 admissions.append(admission)
                 admission.add_done_callback(lambda _result: attempted.set())
                 guard.event(attempted)

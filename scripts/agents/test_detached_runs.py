@@ -3032,7 +3032,7 @@ class PaneRunDeliveryTests(unittest.TestCase):
             self.assertEqual(detached_runs.reap_orphans(str(self.run_dir)), [])
         if not stale_transcript:
             self.assertIs(worker_lifecycle.read_json_object(path).get("push_alert_attempted"), True)
-        self.assertEqual(len(self.notices[notices:]), 1 if stale_transcript else 2)
+        self.assertEqual(len(self.notices[notices:]), 1 if stale_transcript else 2, self.notices[notices:])
         self.assertEqual(sum("phase 40: done" in text for _, text in self.notices[notices:]), 1)
         self.assertEqual(sum("Result delivery is unconfirmed." in text for _, text in self.notices[notices:]),
                          0 if stale_transcript else 1)
@@ -3461,7 +3461,7 @@ class PaneRunDeliveryTests(unittest.TestCase):
                         agent.append(pane, "user", "Detached run: late-result")
                         if later == "restore with pending reply":
                             with contextlib.redirect_stderr(io.StringIO()) as errors, contextlib.redirect_stdout(io.StringIO()):
-                                self.assertEqual(worker.restore(self.fixture.parent.id), worker.ExitCode.OK)
+                                self.assertEqual(worker.restore(self.fixture.parent.id), worker.ExitCode.OK, errors.getvalue())
                             self.assertEqual(errors.getvalue(), "")
                             self.assertNotIn(pane, self.fixture.world.locations)
                             self.assertEqual(worker_panes.worker_pass(row, self.run_dir)["status"], "canceled")
