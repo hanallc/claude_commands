@@ -415,7 +415,8 @@ def _require_model_worktree(root: Path, owner_unit: str) -> None:
             raise ValueError(
                 f"the checkout does not belong to the main checkout for {repo!r} on its recorded branch {record.branch!r}")
     except (OSError, ValueError, worktrees.Refused) as error:
-        raise StateRefused(f"{root}: {error}. Run worktrees.py make <repo word> <unit> p<phase id>.") from error
+        fix = "Restore the recorded branch, or run worktrees.py make <repo word> <unit> <new short name>."
+        raise StateRefused(f"{root}: {error}. {fix}") from error
 
 
 def _record_worktree(directory: Path, root: Path) -> None:

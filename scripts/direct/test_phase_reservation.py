@@ -45,7 +45,8 @@ def record_unit(test: unittest.TestCase, run: Path, home: Path, phase: str) -> N
 
 def isolate_fixture_git(test: unittest.TestCase, root: Path) -> None:
     """Use the fixture Git environment for direct commands and their children."""
-    environment = fixture_git_environment(root)
+    # Stop repository discovery at the fixture root, even when TMPDIR sits inside a checkout.
+    environment = {**fixture_git_environment(root), "GIT_CEILING_DIRECTORIES": str(root.resolve().parent)}
     _ = test.enterContext(cast(contextlib.AbstractContextManager[object],
                                mock.patch.dict(os.environ, environment, clear=True)))
 
@@ -134,7 +135,7 @@ class WorktreeAttributionTests(unittest.TestCase):
         code, errors = self.claim("3", clone)
         self.assertEqual(code, 2)
         self.assertIn(str(clone), errors)
-        self.assertIn("worktrees.py make <repo word> <unit> p<phase id>", errors)
+        self.assertIn("worktrees.py make <repo word> <unit> <new short name>", errors)
         self.assertFalse((directory / phase_reservation.WORKTREE_FILE).exists())
         self.assertFalse((directory / phase_reservation.BASELINE_FILE).exists())
 
