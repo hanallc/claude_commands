@@ -2,9 +2,8 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Generator
-from contextlib import contextmanager, redirect_stderr
+from contextlib import contextmanager, redirect_stderr, suppress
 import fcntl
-from io import StringIO
 import os
 from pathlib import Path
 import pwd
@@ -13,6 +12,7 @@ import shlex
 import subprocess
 import sys
 import tempfile
+from threading import Timer
 import time
 from types import CodeType
 from typing import cast, override
@@ -21,9 +21,11 @@ from unittest.mock import call, patch
 
 from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, GateJobNotRecorded, StepJob
 from scripts.build_targets import mac_linux
-from scripts.lib import build_folders, conf
+from scripts.lib import build_folders, conf, process_group
+from scripts.lint.memory_test_support import write_config_fixture
+from scripts.mac_test import eligibility, mac_test
 from scripts.production import gate
-from scripts.production.gate_routes import ALL_MODULES, AllModules, GateRun, ModuleCoverage, SuiteMode, TreeSelection
+from scripts.production.gate_routes import ALL_MODULES, AllModules, GateJobKind, GateRun, ModuleCoverage, SuiteMode, TreeSelection
 
 
 SSH_FIXTURE = '''import os
@@ -124,7 +126,8 @@ from time import sleep
 
 from scripts.copies import copies
 from scripts.production.gate_modules import discover_test_modules
-from scripts.production.gate_routes import GateJobResult, GateRun, SelectedModules, SuiteMode
+from scripts.production.gate_routes import GateJobKind, GateJobResult, GateRun, SelectedModules, SuiteMode
+from scripts.test_times.gate_record import TYPE_CHECK_JOB
 
 
 def checked_git(repo, *args):
@@ -135,7 +138,7 @@ def WholeMachine(*, gate_parent):
     return gate_parent
 
 
-def run_suites(repo, *, full, mode, machine, selected, module_time_limit_s, time_limit):
+def run_suites(repo, *, type_dirs, full, mode, machine, selected, module_time_limit_s, time_limit):
     guest = Path(os.environ['FIXTURE_GUEST_HOME'])
     assert repo == guest / 'build/claude' / os.environ['FIXTURE_EXPECTED_UNIT'] / '1', repo
     assert Path.home().is_relative_to(repo / 'target')
@@ -188,7 +191,26 @@ def run_suites(repo, *, full, mode, machine, selected, module_time_limit_s, time
     jobs = tuple(GateJobResult(suite, path.name, int(scenario == 'red'), 1.3, 'fixture module output',
                                cpu_seconds=1.0, times=dict(timing, skipped=int(path.name == 'test_second.py')),
                                peak_mib=22) for suite, path in paths)
+    if type_dirs:
+        result = subprocess.run([os.environ['GATE_BASEDPYRIGHT'], *type_dirs], cwd=repo,
+                                capture_output=True, text=True)
+        jobs += (GateJobResult(*TYPE_CHECK_JOB, result.returncode, 0, result.stdout + result.stderr,
+                               kind=GateJobKind.TYPE_CHECK),)
     return GateRun(jobs, 2.0, 30, selection_certified=isinstance(selected, SelectedModules), executions=jobs)
+'''
+
+
+TYPE_CHECK_FIXTURE = '''import os
+from pathlib import Path
+import sys
+
+repo = Path.cwd()
+state = Path(os.environ['GATE_STATE_DIR'])
+assert state.parent == Path(os.environ['TMPDIR']).parent
+assert state.is_relative_to(repo / 'target')
+state.mkdir()
+paths = [str(Path(path).relative_to(repo)) for path in sys.argv[1:]]
+print('Type check: ' + ', '.join(paths))
 '''
 
 
@@ -239,19 +261,22 @@ class MacLinuxRouteTests(unittest.TestCase):
         binaries.mkdir()
         self.executable(binaries / 'ssh', f'#!{sys.executable} -B\n' + SSH_FIXTURE)
         (binaries / 'chromium').symlink_to(sys.executable)
+        self.executable(binaries / 'basedpyright', f'#!{sys.executable} -B\n' + TYPE_CHECK_FIXTURE)
+        (binaries / 'uv').symlink_to(sys.executable)
         config = self.root / 'config'
         config.mkdir()
         self.registry = config / 'build_targets.conf'
-        _ = self.registry.write_text(
-            'kind.mac-linux=ssh\nplatform.mac-linux=linux\nsettings.mac-linux=mac_linux.conf\n'
-            + 'enabled.mac-linux=on\n',
-            encoding='utf-8')
+        _ = write_config_fixture(self.registry, 'enabled.mac-linux=on\n')
         _ = (config / 'mac_linux.conf').write_text(
             f'ssh.hops=fixture-mac fixture-guest\nguest.user={account}\ntest.jobs=2\n'
-            + 'run.time_limit_seconds=7\n',
+            + f'run.time_limit_seconds=7\n{mac_linux.UNREACHABLE_WAIT_KEY}=20\n',
             encoding='utf-8')
+        _ = write_config_fixture(config / 'mac_test.conf', 'unreachable_backoff_s=30\n')
         _ = cast(object, self.enterContext(patch.dict(os.environ, {
+            'BUILD_TARGETS_STATE_DIR': str(self.root / 'target-state'),
+            'MAC_TEST_STATE_DIR': str(self.root / 'mac-state'),
             'CONF_DIR': str(config), 'PATH': str(binaries) + os.pathsep + os.environ['PATH'],
+            'GATE_BASEDPYRIGHT': str(binaries / 'basedpyright'), 'GATE_UV': str(binaries / 'uv'),
             'FIXTURE_SSH_TRACE': str(self.trace), 'FIXTURE_GUEST_HOME': str(self.guest_home),
             'FIXTURE_SOURCE_BYTES': str(self.root / 'source.bytes'),
             'FIXTURE_BUNDLE_FORMS': str(self.root / 'bundle.forms'),
@@ -307,7 +332,8 @@ fi
         return subprocess.check_output(['git', *args], cwd=folder, text=True, timeout=10).strip()
 
     def route(self, scenario: str = 'pass', selected: AllModules | TreeSelection = ALL_MODULES,
-              gate_job: StepJob | GateJobNotRecorded = GATE_JOB_NOT_RECORDED) -> GateRun | str:
+              gate_job: StepJob | GateJobNotRecorded = GATE_JOB_NOT_RECORDED, *,
+              type_dirs: tuple[str, ...] = ()) -> GateRun | str:
         mode = SuiteMode.GATE if isinstance(selected, AllModules) else SuiteMode.TARGETED
         temporary_directory = tempfile.TemporaryDirectory
 
@@ -320,7 +346,7 @@ fi
               patch.object(tempfile, 'TemporaryDirectory', snapshot_index),
               patch.object(tempfile, 'TemporaryFile', side_effect=AssertionError('Keep the bootstrap in memory.'))):
             result = mac_linux.route(self.repo, mode=mode, full=mode is SuiteMode.GATE, selected=selected,
-                                     module_time_limit_s=3, gate_job=gate_job)
+                                     module_time_limit_s=3, gate_job=gate_job, type_dirs=type_dirs)
         self.assertEqual(self.git('for-each-ref', 'refs/mac-linux'), '')
         return result
 
@@ -344,11 +370,91 @@ fi
         self.assertEqual(self.route(), 'mac-linux is off (build_targets.conf enabled.mac-linux=off)')
         self.assert_guest_clean()
 
-    def test_transport_failure_returns_reason(self) -> None:
-        result = self.route('offline')
+    def test_free_now_reads_the_probe_backoff_for_a_registered_guest(self) -> None:
+        _ = write_config_fixture(self.registry, 'pinned_targets=hana-gpu,mac-linux\n')
+        paths = mac_test.state_paths(mac_linux.TARGET)
+        configuration = self.registry.with_name('mac_linux.conf')
+        self.assertEqual(mac_test.free_now(paths, configuration, self.repo), 'free')
+        now = time.time()
+        with patch.object(mac_linux, 'time', return_value=now):
+            result = self.route('offline')
         self.assertIsInstance(result, str)
         self.assertIn('fixture SSH refused the connection', str(result))
+        self.assertIs(eligibility.read_backoff(now + 29, mac_linux.TARGET), eligibility.ACTIVE_BACKOFF)
+        self.assertIs(eligibility.read_backoff(now + 31, mac_linux.TARGET), eligibility.NO_BACKOFF)
+        self.assertIs(eligibility.read_backoff(now), eligibility.NO_BACKOFF)
+        self.assertEqual(mac_test.free_now(paths, configuration, self.repo), 'backoff')
+        self.assertEqual(self.route(), f'{mac_linux.TARGET}: guest unreachable during retry backoff')
         self.assert_guest_clean('probe')
+
+    def test_route_records_backoff_for_a_guest_outside_the_placement_lists(self) -> None:
+        registry = conf.read(self.registry)
+        for key in ('targets', 'pinned_targets'):
+            self.assertNotIn(mac_linux.TARGET, registry.text(key).split(','))
+
+        now = time.time()
+        with patch.object(mac_linux, 'time', return_value=now):
+            result = self.route('offline')
+            self.assertIn('fixture SSH refused the connection', str(result))
+            backoff = self.root / 'target-state' / mac_linux.TARGET / 'unreachable_until'
+            self.assertAlmostEqual(float(backoff.read_text()), now + 30, places=5)
+            self.assertEqual(self.route(), f'{mac_linux.TARGET}: guest unreachable during retry backoff')
+        self.assert_guest_clean('probe')
+
+    def test_backoff_write_error_keeps_the_probe_failure(self) -> None:
+        _ = (self.root / 'target-state').write_text('This file blocks creation of the state directory.\n')
+        reason = str(self.route('offline'))
+        self.assertIn('fixture SSH refused the connection', reason)
+        self.assertIn(f'Cannot record the {mac_linux.TARGET} backoff:', reason)
+        self.assertIn('Not a directory', reason)
+        self.assert_guest_clean('probe')
+
+    def test_unreachable_wait_refuses_a_missing_key_without_a_committed_value(self) -> None:
+        key = mac_linux.UNREACHABLE_WAIT_KEY
+        settings = mac_linux.read_settings(conf.read(self.registry))
+        self.assertEqual(settings.unreachable_wait_seconds, 20)
+        configuration = self.registry.with_name('mac_linux.conf')
+        _ = configuration.write_text(configuration.read_text().replace(f'{key}=20\n', ''))
+        result = self.route()
+        self.assertIsInstance(result, str)
+        self.assertIn(key, str(result))
+        self.assertIn('key is missing', str(result))
+        self.assert_guest_clean()
+
+    def test_unreachable_wait_uses_the_committed_value_when_the_key_is_missing(self) -> None:
+        configuration = self.repo / 'config/mac_linux.conf'
+        original = self.registry.with_name('mac_linux.conf').read_text()
+        _ = configuration.write_text(original)
+        _ = self.git('add', 'config/mac_linux.conf')
+        _ = self.git('commit', '-qm', 'Add the guest settings')
+        _ = self.registry.write_text(self.registry.read_text().replace(
+            'settings.mac-linux=mac_linux.conf', f'settings.mac-linux={configuration}'))
+        key = mac_linux.UNREACHABLE_WAIT_KEY
+        _ = configuration.write_text(original.replace(f'{key}=20\n', ''))
+        settings = mac_linux.read_settings(conf.read(self.registry))
+        self.assertEqual(settings.unreachable_wait_seconds, 20)
+
+    def test_unreachable_wait_requires_whole_seconds_in_range(self) -> None:
+        key = mac_linux.UNREACHABLE_WAIT_KEY
+        configuration = self.registry.with_name('mac_linux.conf')
+        original = configuration.read_text()
+        for value, reason in (
+            ('0', 'expected a positive whole number'),
+            ('-1', 'expected a positive whole number'),
+            ('1.5', 'expected a whole number'),
+            ('1' + '0' * 309, 'expected at most 86400 seconds'),
+            ('86401', 'expected at most 86400 seconds'),
+        ):
+            with self.subTest(value=value):
+                _ = configuration.write_text(original.replace(f'{key}=20', f'{key}={value}'))
+                result = self.route()
+                self.assertIn(key, str(result))
+                self.assertIn(reason, str(result))
+                self.assert_guest_clean()
+
+        _ = configuration.write_text(original.replace(f'{key}=20', f'{key}=86400'))
+        settings = mac_linux.read_settings(conf.read(self.registry))
+        self.assertEqual(settings.unreachable_wait_seconds, 86400)
 
     def test_other_repository_is_refused_before_ssh(self) -> None:
         _ = self.git('remote', 'set-url', 'origin', 'https://example.test/other-repo.git')
@@ -456,7 +562,7 @@ fi
         self.assertFalse((self.guest_home / 'build').exists())
         self.assertEqual(self.trace.read_text().splitlines(), ['probe', 'arm', 'run', 'cleanup'])
 
-    def test_unreachable_guest_keeps_the_claim_until_proof(self) -> None:
+    def test_unreachable_guest_keeps_the_fixture_reservation_until_proof(self) -> None:
         events: list[str] = []
         prove_guest_end = mac_linux.prove_guest_end
 
@@ -469,12 +575,13 @@ fi
                 events.append('released')
 
         def prove(settings: mac_linux.GuestSettings,
-                  armed: mac_linux.ArmedGuestAttempt) -> mac_linux.GuestEndProven | mac_linux.GuestEndPending:
+                  armed: mac_linux.ArmedGuestAttempt, *,
+                  proof_deadline: float) -> mac_linux.GuestEndProven | mac_linux.GuestEndPending:
             self.assertNotIn('released', events)
             cancel = self.run_lock().parent / (
                 f'{mac_linux.CANCEL_RECORD_PREFIX}.{armed.boot_id}.{armed.deadline_ns}.{armed.attempt}')
             self.assertFalse(cancel.exists())
-            proof = prove_guest_end(settings, armed)
+            proof = prove_guest_end(settings, armed, proof_deadline=proof_deadline)
             if isinstance(proof, mac_linux.GuestEndPending):
                 self.assertIn('fixture cleanup SSH refused the connection', proof.detail)
                 self.assertFalse(cancel.exists())
@@ -488,14 +595,59 @@ fi
         with (patch.dict(os.environ, {'FIXTURE_OFFLINE_PROOFS': '2'}),
               patch.object(mac_linux, 'mac_linux_reservation', reservation),
               patch.object(mac_linux, 'prove_guest_end', prove),
-              patch.object(mac_linux, 'sleep') as retry_delay,
-              redirect_stderr(StringIO()) as log):
+              patch.object(mac_linux, 'sleep') as retry_delay):
             result = self.route('disconnect-before-copy')
         self.assertIn('Guest cleanup: ended after fixture cleanup SSH refused the connection', str(result))
-        self.assertEqual(log.getvalue().splitlines(), ['Mac Linux guest run not proven ended; the Mac claim stays held'])
         self.assertEqual(events, ['reserved', 'unreachable', 'unreachable', 'ended', 'released'])
         self.assertEqual(retry_delay.call_args_list, [call(mac_linux.SSH_CONNECT_TIMEOUT_SECONDS)] * 2)
         self.assertEqual(self.trace.read_text().splitlines(), ['probe', 'arm', 'run', 'cleanup', 'cleanup', 'cleanup'])
+
+    def test_proof_wait_expires_and_a_second_route_cannot_take_the_guest_lock(self) -> None:
+        configuration = self.registry.with_name('mac_linux.conf')
+        key = mac_linux.UNREACHABLE_WAIT_KEY
+        _ = configuration.write_text(configuration.read_text().replace(f'{key}=20', f'{key}=2'))
+        settings = mac_linux.read_settings(conf.read(self.registry))
+        attempts: list[mac_linux.ArmedGuestAttempt] = []
+        arm_guest = mac_linux.arm_guest
+        now = 0.0
+
+        def record_arm(settings: mac_linux.GuestSettings, attempt: str) -> mac_linux.ArmedGuestAttempt:
+            armed = arm_guest(settings, attempt)
+            attempts.append(armed)
+            return armed
+
+        def advance(seconds: float) -> None:
+            nonlocal now
+            now += seconds
+
+        lock = self.run_lock()
+        try:
+            with (patch.dict(os.environ, {'FIXTURE_OFFLINE_PROOFS': '1'}),
+                  patch.object(mac_linux, 'arm_guest', record_arm),
+                  patch.object(mac_linux, 'monotonic', lambda: now),
+                  patch.object(mac_linux, 'sleep', advance),
+                  patch.object(mac_linux, 'GUEST_KILL_GRACE_SECONDS', 0),
+                  patch.object(mac_linux, 'prove_guest_end', wraps=mac_linux.prove_guest_end) as proof):
+                result = self.route('disconnect-before-copy')
+                first, = attempts
+                self.assertIn('guest unreachable: fixture-guest did not confirm the run ended '
+                              + f'within 2 seconds ({key})', str(result))
+                self.assertIs(eligibility.read_backoff(time.time(), mac_linux.TARGET), eligibility.NO_BACKOFF)
+                proof.assert_called_once_with(settings, first, proof_deadline=2.0)
+                self.assertEqual(now, 2.0)
+                self.assertEqual(self.trace.read_text().splitlines(), ['probe', 'arm', 'run', 'cleanup'])
+                owner = lock.read_text()
+                self.assertEqual(owner.split()[1], first.attempt)
+                self.assertEqual(subprocess.call(['flock', '-x', '-n', lock, 'true'], timeout=2), 1)
+
+                self.assertIn('The guest run lock is held', str(self.route()))
+                self.assertEqual(lock.read_text(), owner)
+                self.assertEqual(subprocess.call(['flock', '-x', '-n', lock, 'true'], timeout=2), 1)
+                self.assertFalse((self.guest_home / 'build').exists())
+                self.assertEqual(list(lock.parent.glob(f'{mac_linux.CANCEL_RECORD_PREFIX}.*')), [])
+        finally:
+            if attempts:
+                self.assertIsInstance(mac_linux.prove_guest_end(settings, attempts[0]), mac_linux.GuestEndProven)
 
     def test_cleanup_refuses_an_invalid_group_with_the_lock_held(self) -> None:
         lock = self.run_lock()
@@ -527,12 +679,13 @@ fi
 
         lock = self.run_lock()
         lock.parent.mkdir(parents=True)
-        with lock.open('w') as held, redirect_stderr(StringIO()) as log:
+        with lock.open('w') as held:
             fcntl.flock(held, fcntl.LOCK_EX)
 
             def prove(settings: mac_linux.GuestSettings,
-                      armed: mac_linux.ArmedGuestAttempt) -> mac_linux.GuestEndProven | mac_linux.GuestEndPending:
-                proof = prove_guest_end(settings, armed)
+                      armed: mac_linux.ArmedGuestAttempt, *,
+                      proof_deadline: float) -> mac_linux.GuestEndProven | mac_linux.GuestEndPending:
+                proof = prove_guest_end(settings, armed, proof_deadline=proof_deadline)
                 proofs.append(proof)
                 if len(proofs) == 2:
                     fcntl.flock(held, fcntl.LOCK_UN)
@@ -545,40 +698,79 @@ fi
                 result = self.route()
         self.assertIn('Guest cleanup: ended', str(result))
         self.assertEqual(self.trace.read_text().splitlines(), ['probe', 'arm', 'run', 'cleanup', 'cleanup', 'cleanup'])
-        self.assertEqual(log.getvalue().splitlines(), ['Mac Linux guest run not proven ended; the Mac claim stays held'])
 
-    def test_broken_stderr_keeps_the_reservation_until_proof(self) -> None:
-        events: list[str] = []
-        prove_guest_end = mac_linux.prove_guest_end
+    def test_full_stderr_pipe_does_not_extend_the_proof_wait(self) -> None:
+        configuration = self.registry.with_name('mac_linux.conf')
+        key = mac_linux.UNREACHABLE_WAIT_KEY
+        _ = configuration.write_text(configuration.read_text().replace(f'{key}=20', f'{key}=1'))
+        started: list[float] = []
+        reader, writer = os.pipe()
+        with os.fdopen(reader, 'rb') as blocked_reader, os.fdopen(writer, 'w') as blocked_stderr:
+            os.set_blocking(writer, False)
+            for chunk in (b'x' * 4096, b'x'):
+                with suppress(BlockingIOError):
+                    while True:
+                        _ = os.write(writer, chunk)
+            os.set_blocking(writer, True)
+            # Drain the pipe only if the route stalls.
+            guard = Timer(2.5, os.read, args=(blocked_reader.fileno(), 65536))
 
-        class ClosedStderr(StringIO):
-            @override
-            def write(self, message: str) -> int:
-                events.append('stderr failed')
-                raise BrokenPipeError(message)
-
-        def prove(settings: mac_linux.GuestSettings, armed: mac_linux.ArmedGuestAttempt) -> mac_linux.GuestEndProven | mac_linux.GuestEndPending:
-            if events == ['reserved']:
-                events.append('pending')
+            def pending(_settings: mac_linux.GuestSettings, _armed: mac_linux.ArmedGuestAttempt, *,
+                        proof_deadline: float) -> mac_linux.GuestEndPending:
+                self.assertLessEqual(proof_deadline - time.monotonic(), 1)
+                if not started:
+                    started.append(time.monotonic())
+                    guard.start()
                 return mac_linux.GuestEndPending('fixture cleanup pending')
-            proof = prove_guest_end(settings, armed)
-            events.append('ended' if isinstance(proof, mac_linux.GuestEndProven) else 'pending')
-            return proof
 
-        @contextmanager
-        def reservation(*_args: object) -> Generator[None]:
-            events.append('reserved')
             try:
-                yield
+                with (patch.object(mac_linux, 'prove_guest_end', pending), redirect_stderr(blocked_stderr)):
+                    result = self.route()
+                    returned = time.monotonic()
             finally:
-                events.append('released')
+                if started:
+                    guard.cancel()
+                    guard.join()
+        first_probe, = started
+        self.assertIn('guest unreachable: fixture-guest', str(result))
+        self.assertLess(returned - first_probe, 1.75)
 
-        with (patch.object(mac_linux, 'mac_linux_reservation', reservation),
-              patch.object(mac_linux, 'prove_guest_end', prove),
-              patch.object(mac_linux, 'sleep'), redirect_stderr(ClosedStderr())):
+    def test_local_read_past_the_proof_deadline_starts_no_cleanup_ssh(self) -> None:
+        configuration = self.registry.with_name('mac_linux.conf')
+        key = mac_linux.UNREACHABLE_WAIT_KEY
+        _ = configuration.write_text(configuration.read_text().replace(f'{key}=20', f'{key}=1'))
+        helper = Path(process_group.__file__)
+        read_text = Path.read_text
+        now = 0.0
+
+        def read_with_delay(path: Path, **options: str | None) -> str:
+            nonlocal now
+            contents = read_text(path, **options)
+            if path == helper:
+                now += 1.25
+            return contents
+
+        with (patch.object(Path, 'read_text', read_with_delay),
+              patch.object(mac_linux, 'monotonic', lambda: now)):
             result = self.route()
-        self.assertIsInstance(result, GateRun)
-        self.assertEqual(events, ['reserved', 'pending', 'stderr failed', 'ended', 'released'])
+        self.assertEqual(now, 1.25)
+        self.assertIn('guest unreachable: fixture-guest', str(result))
+        self.assert_guest_clean('probe', 'arm', 'run')
+
+    def test_proof_received_at_the_deadline_refuses(self) -> None:
+        now = 0.0
+
+        def late_proof(_settings: mac_linux.GuestSettings, _armed: mac_linux.ArmedGuestAttempt, *,
+                       proof_deadline: float) -> mac_linux.GuestEndProven:
+            nonlocal now
+            self.assertEqual(proof_deadline, 20)
+            now = proof_deadline
+            return mac_linux.GuestEndProven()
+
+        with (patch.object(mac_linux, 'monotonic', lambda: now),
+              patch.object(mac_linux, 'prove_guest_end', late_proof)):
+            result = self.route()
+        self.assertIn('guest unreachable: fixture-guest', str(result))
 
     def test_cleanup_error_timeout_or_unexpected_reply_is_pending(self) -> None:
         settings = mac_linux.read_settings(conf.read(self.registry))
@@ -621,7 +813,7 @@ fi
               self.assertRaises(KeyboardInterrupt)):
             _ = self.route('interrupted-before-copy')
 
-    def test_interrupt_at_cleanup_entry_keeps_the_claim_until_proof(self) -> None:
+    def test_interrupt_at_cleanup_entry_keeps_the_fixture_reservation_until_proof(self) -> None:
         prove_guest_end = mac_linux.prove_guest_end
         first_interrupt = KeyboardInterrupt('fixture interruption at cleanup entry')
         events: list[str] = []
@@ -636,18 +828,19 @@ fi
                 events.append('released')
 
         def prove(settings: mac_linux.GuestSettings,
-                  armed: mac_linux.ArmedGuestAttempt) -> mac_linux.GuestEndProven | mac_linux.GuestEndPending:
+                  armed: mac_linux.ArmedGuestAttempt, *,
+                  proof_deadline: float) -> mac_linux.GuestEndProven | mac_linux.GuestEndPending:
             if events == ['reserved']:
                 lock_statuses.append(subprocess.call(['flock', '-x', '-n', self.run_lock(), 'true']))
                 events.append('interrupted')
                 raise first_interrupt
-            proof = prove_guest_end(settings, armed)
+            proof = prove_guest_end(settings, armed, proof_deadline=proof_deadline)
             if isinstance(proof, mac_linux.GuestEndProven):
                 lock_statuses.append(subprocess.call(['flock', '-x', '-n', self.run_lock(), 'true']))
                 events.append('ended')
             return proof
 
-        def interrupt_retry(_seconds: int) -> None:
+        def interrupt_retry(_seconds: float) -> None:
             if 'retry interrupted' not in events:
                 events.append('retry interrupted')
                 raise SystemExit('fixture interruption during retry')
@@ -655,16 +848,14 @@ fi
         with (patch.object(mac_linux, 'mac_linux_reservation', reservation),
               patch.object(mac_linux, 'prove_guest_end', prove),
               patch.object(mac_linux, 'sleep', interrupt_retry),
-              redirect_stderr(StringIO()) as log,
               self.assertRaises(KeyboardInterrupt) as raised):
             _ = self.route('disconnect-before-copy')
         self.assertIs(raised.exception, first_interrupt)
         self.assertEqual(events, ['reserved', 'interrupted', 'retry interrupted', 'ended', 'released'])
         self.assertEqual(lock_statuses, [1, 0])
-        self.assertEqual(log.getvalue().splitlines(), [mac_linux.GUEST_END_PENDING_MESSAGE])
         self.assertEqual(self.trace.read_text().splitlines(), ['probe', 'arm', 'run', 'cleanup'])
 
-    def test_interrupt_at_retry_jump_keeps_the_claim_until_proof(self) -> None:
+    def test_interrupt_at_retry_jump_keeps_the_fixture_reservation_until_proof(self) -> None:
         stream_guest_bundle = mac_linux.stream_guest_bundle
         interruption = KeyboardInterrupt('fixture interruption at the retry jump')
         events: list[str] = []
@@ -885,6 +1076,28 @@ fi
         self.assertTrue(result.passed)
         self.assertEqual(result.coverage, ModuleCoverage.SUBSET)
         self.assertEqual([job.module for job in result.jobs], ['test_second.py'])
+        self.assert_guest_clean('probe', 'arm', 'run', 'cleanup')
+
+    def test_guest_runs_type_checks_with_the_selected_tests(self) -> None:
+        tree = self.git('rev-parse', 'HEAD^{tree}')
+        result = self.route(selected=TreeSelection(('scripts/fixture/test_second.py',), tree),
+                            type_dirs=('scripts/fixture', str(self.repo / 'scripts/lib')))
+        assert isinstance(result, mac_linux.MacLinuxGateRun), result
+        self.assertTrue(result.passed, result.jobs)
+        module, types = result.jobs
+        self.assertEqual((module.kind, module.module), (GateJobKind.TEST_MODULE, 'test_second.py'))
+        self.assertIs(types.kind, GateJobKind.TYPE_CHECK)
+        self.assertEqual(types.output, 'Type check: scripts/fixture, scripts/lib\n')
+        self.assertEqual(result.module_skips, {'scripts/fixture/test_second.py': 1})
+        self.assert_guest_clean('probe', 'arm', 'run', 'cleanup')
+
+    def test_guest_refuses_when_the_type_check_tool_is_missing(self) -> None:
+        missing = self.root / 'missing-basedpyright'
+        with patch.dict(os.environ, {'GATE_BASEDPYRIGHT': str(missing)}):
+            result = self.route(type_dirs=('scripts',))
+        assert isinstance(result, str), result
+        self.assertIn(f'The guest cannot find the type-check tool {missing}', result)
+        self.assertIn('Guest cleanup: ended', result)
         self.assert_guest_clean('probe', 'arm', 'run', 'cleanup')
 
     def test_dirty_modules_are_included_in_the_snapshot(self) -> None:
