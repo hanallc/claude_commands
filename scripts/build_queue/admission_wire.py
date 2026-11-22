@@ -323,8 +323,7 @@ class QueueMoved:
     line: records.QueueMoveLine
     old_place: int
     new_place: int
-    old_before: str
-    old_after: str
+    undo_destination: QueueDrop
 
 
 @dataclass(frozen=True)
@@ -717,6 +716,10 @@ def _read_wire_record(record: dict[str, object]) -> dict[str, object]:
     # Phase 33: older clients sent ShapeP90 with a fixed ten-percent share.
     if record.get("kind") == "ShapeP90":
         return {**record, "kind": "ShapeRankedPeak", "share_percent": 10}
+    if record.get("kind") == "QueueMoved" and "old_before" in record and "old_after" in record:
+        before, after = record.pop("old_before"), record.pop("old_after")
+        record["undo_destination"] = {"kind": "QueueDrop", "neighbor": after or before,
+                                      "side": "before" if after else "after"}
     priority = record.get("priority")
     if isinstance(priority, dict):
         record["priority"] = records.upgrade_queue_priority(cast(dict[str, object], priority))

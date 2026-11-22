@@ -405,7 +405,7 @@ The first two minutes use the same calculation. A run never counts its use twice
 The display shows zero room for a shortfall. The cap explanation shows the shortfall.
 These readings never reduce a promise from history.
 
-Waiting runs follow priority, first run arrival, and PID order.
+Waiting steps follow priority, first run arrival, step arrival, and PID order.
 A younger run starts only when its need fits after the first run's need remains protected.
 The first run can start despite insufficient room when no admitted run or held slot remains.
 Readable host memory, clear readable pressure, and a current estimate remain necessary.
@@ -2060,7 +2060,7 @@ Room equals free memory minus `safety_gib` and run keep-asides. The safety is 3 
 The cap equals our swap-backed use plus CI use plus free memory minus safety. It does not limit an estimate.
 The first two minutes use the same formula. Use and kept bytes never count the need twice.
 
-The first eligible run follows queue priority, first run arrival, and PID.
+The first eligible step follows queue priority, first run arrival, step arrival, and PID.
 A younger run starts only if its need fits room minus the first run's need.
 Pressure or unreadable pressure holds new starts and extra memory only while it lasts.
 An unreadable pressure file shows `pressure unreadable: <path>` with a short error or `incomplete` when available.
@@ -2380,8 +2380,9 @@ If an absent pin occupies a confirmed place, the service moves it to the next fr
 The service applies pins after it sorts the waits.
 It inserts present pinned waits in place order and clamps each insertion to the end.
 Placement, memory admission, and continuation claims filter the same queue order.
-The page and the head-stall snapshot also filter that order.
-When two steps in one run have the same queue time, the lower PID comes first.
+The page, client replies, and the head-stall snapshot also filter that order.
+When run times tie, the earlier step arrival comes first. PID breaks a tie in step arrival.
+A move can transfer a continuation claim to an earlier step that fits the slot.
 A request that starts or ends removes one place from pins behind it in the full order.
 The full order includes absent requests and applies their pins.
 An absent step keeps its run identity to recover the run's saved queue time.
@@ -2396,7 +2397,7 @@ Speculative Mac copy rows show the newest-first rule.
 A refusal before launch keeps the pin and any active local startup claim.
 
 The service checks the order revision for all rows, including rows without handles.
-Its replay ledger records the reply with the new order.
+Its replay ledger records the reply with the new order and one Undo destination.
 Undo moves the step before its former next neighbor.
 If the step was last, Undo moves it after its former previous neighbor.
 If that neighbor left the queue, the service refuses Undo.

@@ -66,6 +66,37 @@ class QueueMoveTests(unittest.TestCase):
             _ = fixture.run_pass()
             self.assertEqual(set(fixture.server.reservations), {second.episode})
 
+    def test_move_after_release_transfers_the_claim_and_starts_the_earlier_row(self) -> None:
+        with AdmissionFixture() as fixture:
+            run = fixture.run_owner()
+            running = fixture.request(run=run, need=4 * GIB)
+            grant, = fixture.server.handle_request(running)
+            assert isinstance(grant, wire.Admitted)
+            fixture.server.spacing = records.NextStartAt(fixture.clock.now() + 30)
+            fixture.free(0)
+            fixture.hold_starts()
+            first, second = [fixture.request(run=run, need=4 * GIB, since=running.since + index)
+                             for index in (1, 2)]
+            for request in (first, second):
+                self.assertIsInstance(fixture.server.handle_request(request)[0], wire.Wait)
+            line = move_line(fixture)
+            first_id, second_id = ids(line)
+            fixture.release(grant)
+            claim = fixture.server.slots[grant.reservation]
+            assert isinstance(claim, records.ContinuationSlot)
+            self.assertEqual(claim.owner, records.run_owner(first.owner.pid, first.owner.start_time))
+
+            moved, = fixture.server.handle_request(wire.QueueMoveRequest(
+                "move-after-release", second_id, line.revision, wire.QueueDrop(first_id, "before")))
+            assert isinstance(moved, wire.QueueMoved)
+            claim = fixture.server.slots[grant.reservation]
+            assert isinstance(claim, records.ContinuationSlot)
+            self.assertEqual(claim.owner, records.run_owner(second.owner.pid, second.owner.start_time))
+            _ = fixture.run_pass()
+            self.assertEqual(set(fixture.server.reservations), {second.episode})
+            self.assertEqual(ids(move_line(fixture)), [first_id])
+            self.assertIn(first.episode, fixture.server.waiters)
+
     def test_tail_drag_keeps_held_ci_at_the_head_of_the_saved_snapshot(self) -> None:
         with AdmissionFixture() as fixture:
             running = fixture.request()
@@ -87,10 +118,21 @@ class QueueMoveTests(unittest.TestCase):
                 assert isinstance(moved, wire.QueueMoved)
                 self.assertEqual(moved.line.members, (ci_row, first, third, second))
                 _ = fixture.run_pass()
+                view, = fixture.server.handle_request(wire.ViewRequest())
+                assert isinstance(view, wire.ViewReply)
+                expected = (ci, ordinary[0], ordinary[2], ordinary[1])
+                self.assertEqual([step.pid for step in view.reading.view.waiting],
+                                 [request.owner.pid for request in expected])
+                for position, request in enumerate(expected, 1):
+                    wait = fixture.server.waiters[request.episode].last_reply
+                    assert isinstance(wait, wire.Wait)
+                    self.assertEqual(wait.position, position)
+                    if position > 2:
+                        self.assertEqual(wait.text, "behind #2")
                 snapshot = queue_snapshot.read_queue_snapshot(fixture.state_dir)
                 assert isinstance(snapshot, queue_snapshot.QueueSnapshot)
                 self.assertEqual([row["pid"] for _, row in snapshot.inputs.ordered],
-                                 [request.owner.pid for request in (ci, ordinary[0], ordinary[2], ordinary[1])])
+                                 [request.owner.pid for request in expected])
                 stall = head_stall.find_stall(snapshot, snapshot.written_at, snapshot.written_at + 60, 30)
                 assert isinstance(stall, head_stall.HeadStall)
                 self.assertEqual(stall.pid, ci.owner.pid)
@@ -528,6 +570,17 @@ class QueueMoveTests(unittest.TestCase):
             replacement_line = move_line(fixture)
             self.assertIn(merge, ids(replacement_line))
             self.assertNotIn(ids(replacement_line)[-1], ids(current))
+
+    def test_reads_undo_destinations_from_earlier_replies(self) -> None:
+        line = records.QueueMoveLine("revision", ())
+        for before, after, destination in (("first", "last", wire.QueueDrop("last", "before")),
+                                           ("first", "", wire.QueueDrop("first", "after"))):
+            with self.subTest(destination=destination):
+                moved = wire.QueueMoved("moving", line, 2, 1, destination)
+                record = cast(dict[str, object], json.loads(wire.encode_record(moved)))
+                del record["undo_destination"]
+                record.update(old_before=before, old_after=after)
+                self.assertEqual(wire.parse_record(json.dumps(record), wire.QueueMoved), moved)
 
     def test_undo_uses_only_surviving_neighbors(self) -> None:
         with AdmissionFixture() as fixture:
@@ -1077,30 +1130,35 @@ class QueueMoveTests(unittest.TestCase):
                 self.assertEqual(remote.assignment.destination.provider, "mac")
                 self.assertIsInstance(remote.remote_start_hold, records.RemoteStartHold)
 
-    @unittest.skipUnless(hasattr(wire, "LandingRepositoryKey"), "requires the 44eb landing protection")
     def test_move_preserves_the_landing_test_hold(self) -> None:
-        with (AdmissionFixture(skip_idle_spacing=True) as fixture,
-              patch.dict(os.environ, {"GATE_STATE_DIR": str(fixture.root / "gate-state")}),
-              land_runs.landing(["a" * 40])):
-            for _index in range(2):
-                request = fixture.request()
-                identity = cast(dict[str, object], json.loads(wire.encode_record(request.identity)))
-                identity["landing_repository"] = {
-                    "kind": "LandingRepositoryKey", "key": "https://github.com/natepiano/claude_commands",
-                }
-                request = replace(request, identity=wire.parse_record(json.dumps(identity), wire.Identity))
-                reply, = fixture.server.handle_request(request)
-                assert isinstance(reply, wire.Wait)
-                self.assertEqual(reply.text, "waits for the landing queue")
-            line = move_line(fixture)
-            first, second = ids(line)
-            moved, = fixture.server.handle_request(wire.QueueMoveRequest(
-                "move-held-test", second, line.revision, wire.QueueDrop(first, "before")))
-            assert isinstance(moved, wire.QueueMoved)
+        with (AdmissionFixture() as fixture,
+              patch.dict(os.environ, {"GATE_STATE_DIR": str(fixture.root / "gate-state")})):
+            commit = "a" * 40
+            directory = build_hold.holder_directory()
+            self.assertEqual(directory, fixture.root / "holders")
+            holder = build_hold.HolderIdentity("landing", "landing")
+            reason = records.NatedevHeld("landing", "the landing queue")
+            first, second = [replace(fixture.service_request(), argv=("cargo", "nextest", "run"))
+                             for _ in range(2)]
+            with land_runs.landing([commit]):
+                self.assertIn(commit, land_runs.running_lands())
+                _ = build_hold.write_hold(directory, holder, reason.purpose, build_hold.NoReleaseEta(),
+                                          datetime.fromtimestamp(fixture.clock.now(), UTC))
+                for request in (first, second):
+                    reply, = fixture.server.handle_request(request)
+                    assert isinstance(reply, wire.Wait)
+                    self.assertEqual(reply.reason, reason)
+                line = move_line(fixture)
+                first_id, second_id = ids(line)
+                moved, = fixture.server.handle_request(wire.QueueMoveRequest(
+                    "move-held-test", second_id, line.revision, wire.QueueDrop(first_id, "before")))
+                assert isinstance(moved, wire.QueueMoved)
+                _ = fixture.run_pass()
+                view, = fixture.server.handle_request(wire.ViewRequest())
+                assert isinstance(view, wire.ViewReply)
+                self.assertEqual([(step.pid, step.reason) for step in view.reading.view.waiting],
+                                 [(second.owner.pid, reason), (first.owner.pid, reason)])
+                self.assertFalse(fixture.server.reservations)
+            build_hold.holder_path(directory, holder.key).unlink()
             _ = fixture.run_pass()
-            self.assertEqual(ids(move_line(fixture)), [second, first])
-            view, = fixture.server.handle_request(wire.ViewRequest())
-            assert isinstance(view, wire.ViewReply)
-            self.assertEqual([records.reason_phrase(wait.reason, ()) for wait in view.reading.view.waiting],
-                             ["waits for the landing queue"] * 2)
-            self.assertFalse(fixture.server.reservations)
+            self.assertEqual(set(fixture.server.reservations), {second.episode})
