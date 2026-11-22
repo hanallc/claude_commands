@@ -581,7 +581,8 @@ sweep_after_step test-step
             with patch.dict(os.environ, dict.fromkeys(stale_lease_variables, str(writer))):
                 caller_environment = invoke_test_environment()
             process = subprocess.Popen(
-                ["bash", "-c", f'source "$1"; {SWEEP_STAND_IN}; sweep_after_step test-step', "sweep-test", str(INVOKE)],
+                ["bash", "-c", 'source "$1"; exec 74>&2; VERIFY_EXIT_STDERR_FD=74; '
+                 + SWEEP_STAND_IN + "; sweep_after_step test-step", "sweep-test", str(INVOKE)],
                 cwd=root, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                 pass_fds=(writer,),
                 env={**caller_environment, **environment, "HOME": directory, "TMPDIR": directory,
