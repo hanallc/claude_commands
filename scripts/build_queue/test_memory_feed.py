@@ -2785,12 +2785,14 @@ process.stdout.write(JSON.stringify({
             {"kind": "StepJob", "step": "integrate", "unit": "handler", "branch": "sdlc", "modules": 0}, StepJob)
         assert isinstance(job, StepJob)
         self.assertEqual(job, StepJob("integrate", unit="handler", branch="sdlc"))
-        page = self.gate_job_page("gate", (), job=job, showrunner=True)
-        for rows in (page["walk"], page["waiters"]):
-            row, = [row for row in rows if row.get("kind") == "cloud"]
-            self.assertEqual(row["name"], "showrunner integrate")
-            self.assertEqual(row.get("about"), "Runs a merge or test job")
-            self.assertEqual(row.get("changes"), "sdlc branch")
+        for step in ("gate", "merge-gate"):
+            with self.subTest(step=step):
+                page = self.gate_job_page(step, (), job=job, showrunner=True)
+                for rows in (page["walk"], page["waiters"]):
+                    row, = [row for row in rows if row.get("kind") == "cloud"]
+                    self.assertEqual(row["name"], "showrunner integrate")
+                    self.assertEqual(row.get("about"), "Runs a merge or test job")
+                    self.assertEqual(row.get("changes"), "sdlc branch")
 
     def test_cloud_full_tests_use_the_test_all_name_and_description(self) -> None:
         page = self.gate_job_page("gate", ("python3", "scripts/production/gate.py", "--tests-only", "--full"))
