@@ -4872,6 +4872,30 @@ runpy.run_module('scripts.agents.restart', run_name='__main__', alter_sys=True)
         self.assertEqual(self.launches, [(row.name, herdr.NewTab("producers", row.name))])
         self.assertEqual(shutdown_record.read(), [])
 
+    def test_stop_all_reports_a_failed_hold_write_and_keeps_stopping_other_rows(self) -> None:
+        blocked = fixture_member("producer", name="TEST-agent")
+        ready = fixture_member("producer", name="owner")
+        self.rows = (blocked, ready)
+        self.running = {str(row.current_session) for row in self.rows}
+        save_hold = staff.exit
+
+        def write_hold(reference: str, why: str) -> staff.StaffRow:
+            if reference == blocked.id:
+                raise ValueError("fixture hold write failed")
+            return save_hold(reference, why)
+
+        with (patch.object(staff, "initial_snapshot", side_effect=staff.snapshot),
+              patch.object(staff, "exit", side_effect=write_hold),
+              patch.dict(os.environ, {"USER_ZONE": "UTC"}), redirect_stdout(io.StringIO()) as output):
+            self.assertEqual(shutdown.main(["stop", "--all"]), 0)
+        self.assertEqual(self.stops, [ready.id])
+        self.assertEqual(self.running, {str(blocked.current_session)})
+        self.assertEqual(shutdown_record.read(), [ready.id])
+        self.assertIn(f"{blocked.name}: Could not save the exit hold. fixture hold write failed", output.getvalue())
+        current = staff.snapshot().rows_by_id
+        self.assertIsInstance(current[blocked.id].exited, staff.Active)
+        self.assertIsInstance(current[ready.id].exited, staff.Exited)
+
     def test_stop_all_dry_run_saves_nothing_and_names_each_row_once(self) -> None:
         with redirect_stdout(io.StringIO()) as output:
             self.assertEqual(shutdown.main(["stop", "--all", "--dry-run"]), 0)

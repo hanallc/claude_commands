@@ -154,10 +154,10 @@ Each upkeep run uses this order:
 1. Restore or adopt the shared herdr server.
 2. Save the shared layout.
 3. Refresh the detection rules.
-4. Resume each selected producer through `stop_resume.resume(str(row.id))`.
+4. Check and resume each selected producer through `stop_resume.resume_for_upkeep(row.id)`.
 
 `accounts.producer_upkeep_members()` reads the local staff snapshot.
-It selects active, local, unpaused producers from both families, without exit requests.
+It selects local, unpaused producers from both families, including producers with exit holds.
 Absent staff returns `()`.
 One `accounts.settings_report_scope()` covers the operation.
 Invalid producer settings exclude that producer and produce one warning per operation.
@@ -166,7 +166,7 @@ Each producer has its own tab in the configured `PRODUCER_WORKSPACE`, normally `
 Resume uses its current conversation, current `[producers]` settings, and family account.
 A live producer starts nothing.
 A paused producer stays stopped.
-An exit request also excludes the producer from upkeep.
+The resume path checks exit and pause holds under the producer's row lock.
 Upkeep does not admit a configured name that has no staff row.
 The [first-start contract](shutdown-and-restart.md#producer-launch-and-admission) defines admission.
 

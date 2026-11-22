@@ -970,19 +970,31 @@ def _stop_staff_row(record: StaffSnapshot, reference: str) -> StaffRow | None:
     return matches[0] if len(matches) == 1 else None
 
 
-def stop_producer(identity: StaffId, why: str, *, deadline: float) -> StopResult:
-    """Record a confirmed producer stop under the row lock."""
+def stop_producer(identity: StaffId, why: str, *, deadline: float,
+                  save_exit_after_stop: bool = False) -> StopResult:
+    """Protect an intentional producer stop with a hold under the row lock."""
     with staff.row_operation(identity):
         row = staff.initial_snapshot().rows_by_id.get(identity)
         if row is None or row.kind != "producer":
             return SessionNotFound(identity)
         machine = member_machine(row)
-        if machine and machine != remote.local_machine():
+        if machine and machine != remote.local_machine() and machine != remote.this_machine():
             return StopFailed(str(row.current_session), f"session is on {machine}")
+        new_hold = not isinstance(row.exited, staff.Exited)
+        if new_hold:
+            if save_exit_after_stop:
+                _ = staff.pause(identity, why)
+            else:
+                _ = staff.exit(identity, why)
         result = stop(identity, deadline=deadline)
-        if isinstance(result, (Stopped, NotRunning)) and result.session_id == row.current_session:
-            _ = staff.exit(identity, why)
+        if isinstance(result, (Stopped, NotRunning)) and result.session_id != row.current_session:
+            result = StopFailed(str(row.current_session), "the producer conversation changed before the stop")
+        if isinstance(result, (Stopped, NotRunning)):
             shutdown_record.update(started=[], pending=[identity])
+            if new_hold and save_exit_after_stop:
+                _ = staff.exit(identity, why)
+        elif new_hold:
+            _ = staff.set_hold(identity, row.paused)
         return result
 
 
@@ -1563,7 +1575,7 @@ def resume_for_upkeep(identity: StaffId) -> ResumeResult | StoppedOnPurpose | No
         row = staff.initial_snapshot().rows_by_id.get(identity)
         if row is None or row.kind != "producer":
             return SessionNotFound(identity)
-        if isinstance(row.exited, staff.Exited):
+        if isinstance(row.exited, staff.Exited) or isinstance(row.paused, staff.Paused):
             return StoppedOnPurpose(row.name)
         return resume(identity)
 
