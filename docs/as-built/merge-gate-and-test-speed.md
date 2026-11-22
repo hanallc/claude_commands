@@ -81,6 +81,13 @@ If the wait expires, the gate fails with `guest unreachable` and the guest alias
 The route sends no more cleanup requests.
 The queue currently releases the Mac claim at this deadline. The guest run keeps its lock until it ends.
 The queue's guestkeep change will retain the Mac claim until a later proof.
+If the guest takes no run, the route returns "not started".
+This covers a Mac block or busy Mac claim, an active retry backoff, a failed guest probe and a failed arm step.
+The gate then writes a claim failure next to the assignment file (`<assignment>.claim-failure`) and exits with status 79.
+`copies.py gate-step` owns the original placement request. On status 79 it checks the claim failure, reports it to the queue, and asks for placement again with the same request.
+The new assignment goes into the same file, and the gate runs again on the new machine.
+A failure after the guest armed the run is not placed again: the gate fails.
+`copies.py run` with named gate targets does not place the gate again yet.
 If the guest cannot return a result, the gate fails and reports the guest and the reason.
 If the guest returns a failure, the gate reports the guest and the failed jobs.
 A targeted gate can reuse a certified test pass. The guest runs any requested type checks on the Mac.

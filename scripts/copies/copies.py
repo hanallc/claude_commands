@@ -2634,7 +2634,10 @@ def run_gate_step(args: CopyArguments, command: Sequence[str]) -> int:
         raise CopyError("gate-step requires a gate command and named targets")
     with first_step.admitted_run(command, source, targets=targets) as admitted:
         admitted.handoff(source)
-        result = subprocess.run(command, cwd=source, pass_fds=args.lease_fd, check=False)
+        result = admitted.run_gate(lambda: subprocess.run(command, cwd=source, pass_fds=args.lease_fd,
+                                                          check=False, text=True))
+        if result.stderr:
+            _ = sys.stderr.write(result.stderr)
         return result.returncode if result.returncode >= 0 else 128 - result.returncode
 
 

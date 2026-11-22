@@ -8,19 +8,17 @@ import re
 import shutil
 import subprocess
 import tomllib
-from collections.abc import Callable, Generator, Sequence
+from collections.abc import Generator, Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar
 from datetime import datetime
 from pathlib import Path
 from typing import Literal, NamedTuple, TypedDict, cast
 
-from scripts.build_queue import admission_client, admission_wire, placement
 from scripts.build_queue.first_step import gate_targets
 from scripts.copies import copies
 from scripts.lib.atomic_file import write_text_atomic
-from scripts.lib.build_steps import (CLAIM_FAILURE_SUFFIX, GATE_SCRIPTS, MAC_LINUX_NO_ANSWER,
-                                     MAC_LINUX_PRELAUNCH_REFUSED_STATUS, command_program)
+from scripts.lib.build_steps import GATE_SCRIPTS, MAC_LINUX_PRELAUNCH_REFUSED_STATUS, command_program
 from scripts.lib.process_failure import failure_detail
 from scripts.message import session_send
 from scripts.production import staff
@@ -133,63 +131,6 @@ def run_test_command(command: list[str], folder: Path, *, raise_start_errors: bo
         if raise_start_errors:
             raise
         return subprocess.CompletedProcess(command, 127, "", f"{error}\n")
-
-
-def run_gate_with_placement(
-    run: Callable[[], subprocess.CompletedProcess[str]],
-    assignment_file: Path,
-    request: admission_wire.PlacementRequest,
-    place_again: Callable[[admission_wire.PlacementRequest], None],
-) -> subprocess.CompletedProcess[str]:
-    """Retry a gate within the scope that owns its original placement request.
-
-    The placement callback installs the new assignment before the next run.
-    """
-    while True:
-        result = run()
-        if result.returncode != MAC_LINUX_PRELAUNCH_REFUSED_STATUS:
-            return result
-        try:
-            refusal = read_gate_claim_failure(assignment_file, request)
-            settled = admission_client.claim_failure(refusal)
-            if (settled.assignment != refusal.assignment
-                    or settled.state != placement.ClosedAssignment(refusal.reason)
-                    or not isinstance(settled.permission, placement.PermissionAvailable)
-                    or not isinstance(settled.retry, placement.RetryAt)):
-                raise admission_wire.AdmissionUnavailable("the queue has not settled the Mac guest attempt")
-            destination = refusal.assignment.destination
-            report("placement", "retry", f"{destination.host} ({destination.target}) did not answer. Requesting placement again.")
-            place_again(request)
-            replacement = admission_wire.read_assignment(assignment_file).assignment
-            if (not assignment_matches_request(replacement, request)
-                    or replacement.attempt == refusal.assignment.attempt):
-                raise admission_wire.AdmissionUnavailable("the queue did not provide a replacement assignment")
-        except (OSError, ValueError, admission_wire.AdmissionUnavailable) as error:
-            return subprocess.CompletedProcess(request.constraints.command, result.returncode, "",
-                                               f"Gate placement blocked. {error}\n")
-
-
-def assignment_matches_request(assignment: placement.PlacementAssignment, request: admission_wire.PlacementRequest) -> bool:
-    destination = assignment.destination
-    return (assignment.episode == request.episode and assignment.owner == request.owner
-            and assignment.since == request.since and assignment.source_key == request.constraints.source_key
-            and assignment.session == request.constraints.session
-            and any(candidate.destination.target == destination.target
-                    and candidate.destination.provider == destination.provider
-                    for candidate in request.constraints.candidates))
-
-
-def read_gate_claim_failure(assignment_file: Path, request: admission_wire.PlacementRequest) -> admission_wire.ClaimFailure:
-    assignment = admission_wire.read_assignment(assignment_file).assignment
-    report_file = assignment_file.with_name(assignment_file.name + CLAIM_FAILURE_SUFFIX)
-    refusal = admission_wire.parse_request(report_file.read_bytes())
-    if (not isinstance(refusal, admission_wire.ClaimFailure) or not refusal.request_id
-            or refusal.assignment != assignment or refusal.reason != MAC_LINUX_NO_ANSWER
-            or assignment.destination.provider != "ssh" or assignment.destination.target != "mac-linux"
-            or not isinstance(refusal.claim, placement.NoProviderClaim)
-            or not assignment_matches_request(assignment, request)):
-        raise admission_wire.AdmissionUnavailable("the gate report does not match the Mac guest assignment")
-    return refusal
 
 
 # A nextest failure row: `FAIL [  12.2s] (1012/1067) <binary> <test>`.

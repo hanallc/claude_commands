@@ -42,7 +42,12 @@ class FirstStepTests(unittest.TestCase):
             placement.PlacementDestination("local", "natedev", "fixture-host", claim_state.WHOLE_MAC),
             execution_identity.SourceKeyKnown("source"), placement.SubmittingOwner("fixture-host", 1, "2"),
             NoOwningSession(), position.since)
-        grant = first_step.GatePlacement(wire.LocalPlacementGranted(assignment, PROGRAM_GRANT))
+        profile = records.ProgramProfile("gate", "/fixture", "/fixture",
+            records.HistoryPeakSizing(1, records.FirstProgramPeak(1), 0.0))
+        request = wire.PlacementRequest(position.episode, assignment.owner, position.since, profile,
+            placement.PlacementConstraints(assignment.source_key, ("gate.py",), "/fixture", "", assignment.session,
+                (placement.PlacementCandidate(assignment.destination),)))
+        grant = first_step.GatePlacement(wire.LocalPlacementGranted(assignment, PROGRAM_GRANT), request)
         admitted = first_step.FirstStepAdmission(position, grant, Path("/fixture/assignment.json"))
 
         with (mock.patch.dict(os.environ),

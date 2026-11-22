@@ -414,7 +414,7 @@ fi
 
     def route(self, scenario: str = 'pass', selected: AllModules | TreeSelection = ALL_MODULES,
               gate_job: StepJob | GateJobNotRecorded = GATE_JOB_NOT_RECORDED, *,
-              type_dirs: tuple[str, ...] = ()) -> GateRun | str:
+              type_dirs: tuple[str, ...] = ()) -> GateRun | mac_linux.GuestNotStarted | str:
         mode = SuiteMode.GATE if isinstance(selected, AllModules) else SuiteMode.TARGETED
         temporary_directory = tempfile.TemporaryDirectory
 
@@ -430,6 +430,11 @@ fi
                                      module_time_limit_s=3, gate_job=gate_job, type_dirs=type_dirs)
         self.assertEqual(self.git('for-each-ref', 'refs/mac-linux'), '')
         return result
+
+    def not_started(self, result: GateRun | mac_linux.GuestNotStarted | str) -> str:
+        self.assertIsInstance(result, mac_linux.GuestNotStarted)
+        assert isinstance(result, mac_linux.GuestNotStarted)
+        return result.reason
 
     def assert_guest_clean(self, *events: str) -> None:
         main = self.guest_home / '.claude'
@@ -469,7 +474,7 @@ fi
                     with self.assertRaisesRegex(mac_run.MacRunRefused, 'blocked by .*fixture block'):
                         with mac_run.held(self.repo, 'mac', SuiteMode.GATE, GATE_JOB_NOT_RECORDED):
                             self.fail('The guest acquired a claim during a Mac block.')
-                    self.assertRegex(str(self.route()), r'^mac-linux: not started: blocked by .*fixture block$')
+                    self.assertRegex(self.not_started(self.route()), r'^mac-linux: not started: blocked by .*fixture block$')
                     self.assertEqual(claim_state.read_claims(paths), ())
         self.assertIs(eligibility.read_backoff(time.time(), mac_linux.TARGET), eligibility.NO_BACKOFF)
         self.assert_guest_clean()
@@ -479,7 +484,7 @@ fi
         with mac_run.held(self.repo, 'mac', StepJob('test-all'), GATE_JOB_NOT_RECORDED):
             claims = claim_state.read_claims(paths)
             self.assertEqual(len(claims), 1)
-            self.assertEqual(self.route(), 'mac-linux: not started: mac is busy with mac-linux test-all')
+            self.assertEqual(self.not_started(self.route()), 'mac-linux: not started: mac is busy with mac-linux test-all')
             self.assertEqual(claim_state.read_claims(paths), claims)
         self.assertIs(eligibility.read_backoff(time.time(), mac_linux.TARGET), eligibility.NO_BACKOFF)
         self.assert_guest_clean()
@@ -492,14 +497,13 @@ fi
         self.assertEqual(mac_test.free_now(paths, configuration, self.repo), 'free')
         now = time.time()
         with patch.object(mac_linux, 'time', return_value=now):
-            result = self.route('offline')
-        self.assertIsInstance(result, str)
-        self.assertIn('fixture SSH refused the connection', str(result))
+            result = self.not_started(self.route('offline'))
+        self.assertIn('fixture SSH refused the connection', result)
         self.assertIs(eligibility.read_backoff(now + 29, mac_linux.TARGET), eligibility.ACTIVE_BACKOFF)
         self.assertIs(eligibility.read_backoff(now + 31, mac_linux.TARGET), eligibility.NO_BACKOFF)
         self.assertIs(eligibility.read_backoff(now), eligibility.NO_BACKOFF)
         self.assertEqual(mac_test.free_now(paths, configuration, self.repo), 'backoff')
-        self.assertEqual(self.route(), f'{mac_linux.TARGET}: guest unreachable during retry backoff')
+        self.assertEqual(self.not_started(self.route()), f'{mac_linux.TARGET}: guest unreachable during retry backoff')
         self.assert_guest_clean('probe')
 
     def test_route_records_backoff_for_a_guest_outside_the_placement_lists(self) -> None:
@@ -509,16 +513,16 @@ fi
 
         now = time.time()
         with patch.object(mac_linux, 'time', return_value=now):
-            result = self.route('offline')
-            self.assertIn('fixture SSH refused the connection', str(result))
+            result = self.not_started(self.route('offline'))
+            self.assertIn('fixture SSH refused the connection', result)
             backoff = self.root / 'target-state' / mac_linux.TARGET / 'unreachable_until'
             self.assertAlmostEqual(float(backoff.read_text()), now + 30, places=5)
-            self.assertEqual(self.route(), f'{mac_linux.TARGET}: guest unreachable during retry backoff')
+            self.assertEqual(self.not_started(self.route()), f'{mac_linux.TARGET}: guest unreachable during retry backoff')
         self.assert_guest_clean('probe')
 
     def test_backoff_write_error_keeps_the_probe_failure(self) -> None:
         _ = (self.root / 'target-state').write_text('This file blocks creation of the state directory.\n')
-        reason = str(self.route('offline'))
+        reason = self.not_started(self.route('offline'))
         self.assertIn('fixture SSH refused the connection', reason)
         self.assertIn(f'Cannot record the {mac_linux.TARGET} backoff:', reason)
         self.assertIn('Not a directory', reason)
@@ -577,9 +581,8 @@ fi
             assert executable is not None
             (binaries / name).symlink_to(executable)
         with patch.dict(os.environ, {'FIXTURE_GUEST_PATH': str(binaries)}):
-            result = self.route()
-        self.assertIsInstance(result, str)
-        self.assertIn('bwrap is absent from the guest PATH', str(result))
+            result = self.not_started(self.route())
+        self.assertIn('bwrap is absent from the guest PATH', result)
         self.assert_guest_clean('probe')
         self.assertFalse((self.guest_home / '.claude').exists())
 
