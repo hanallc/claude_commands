@@ -241,10 +241,10 @@ class SystemReadings:
         return gate.read_pressure(host, policy=policy)
 
     def build_space(self, floor: int) -> records.BuildSpaceHold | records.NoBuildSpaceHold:
-        from scripts.lib.build_slots import slot_cargo_root
+        from scripts.lib.build_folders import build_root
 
         try:
-            root = slot_cargo_root(conf.read("build_folders"))
+            root = build_root(settings=conf.read("build_folders"))
             reading = os.statvfs(root)
         except (OSError, conf.Unusable) as error:
             hold = records.BuildSpaceUnreadable(str(error))

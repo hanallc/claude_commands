@@ -26,6 +26,7 @@ entries to the guard's scan. The guard does not read configuration separately.
 `config/build_folders.conf` sets the slot root and pool limits.
 The `slots.wait_seconds` setting limits the wait for a slot.
 The root uses `roots.slots.<machine>`, with `roots.slots` as the default.
+`config/build_folders.conf` sets no slot root for natedev; the AWS image sets its own.
 The limit uses `slots.<machine>.<repository>.max`, with `slots.<machine>.default_max` as the default.
 Owners on the same machine share the pool for a repository.
 Each checkout uses `<slot-root>/<repository>-slot<N>`. The lease records the owner.

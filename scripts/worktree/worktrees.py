@@ -594,30 +594,6 @@ def release_worktree_pair(path: Path) -> None:
         print(f"Worktree pair kept for {str(path)!r}: {result.value}", file=sys.stderr)
 
 
-def _legacy_output(checkout: Path) -> Path | UnassignedOutput:
-    settings = conf.read_or_repository("build_folders").values("roots.slot_cargo", "roots.cargo_paths")
-    cargo_root = settings.get("roots.slot_cargo")
-    mirror_root = settings.get("roots.cargo_paths")
-    if not cargo_root or not mirror_root:
-        return UnassignedOutput()
-    root = Path(os.path.expandvars(cargo_root)).expanduser().resolve()
-    mirror = Path(os.path.expandvars(mirror_root)).expanduser()
-    if not mirror.is_absolute() or not checkout.is_dir() or not checkout.name:
-        return UnassignedOutput()
-    entry = mirror.joinpath(*checkout.parts[1:])
-    output = entry.parent.resolve() / entry.name
-    if root not in output.parents or output.is_symlink() or not output.is_dir():
-        return UnassignedOutput()
-    return output
-
-
-def clean_legacy_output(checkout: Path) -> None:
-    """Report the output assigned by the former Cargo mirror."""
-    output = _legacy_output(checkout)
-    if isinstance(output, Path):
-        report_retained_folder(output, "the legacy checkout ended")
-
-
 def end_record(record: WorktreeRecord, snapshot: staff.StaffSnapshot) -> Ended | Kept:
     from scripts.agents import remote
     from scripts.production import session_staff
@@ -664,8 +640,6 @@ def end_record(record: WorktreeRecord, snapshot: staff.StaffSnapshot) -> Ended |
     if checkout_present:
         if isinstance(record.layout, RecordedWorktreeOutput):
             report_retained_folder(checked_output(record.layout), "the checkout landed")
-        else:
-            clean_legacy_output(path)
         reason = "the checkout landed and requires manual review"
         report_retained_folder(path, reason)
         return Kept(path, reason)
@@ -893,16 +867,11 @@ def remove_git_checkout(path: Path, repository: Path, *, force: bool = False, re
         raise ValueError(f"{path}: cannot remove the main checkout")
     layout = worktree_output(path)
     reason = "the checkout is selected for removal"
-    if isinstance(layout, RecordedWorktreeOutput):
-        output = checked_output(layout)
-        output_reason = reason
-    else:
-        output = _legacy_output(path)
-        output_reason = "the legacy checkout ended"
+    output = checked_output(layout) if isinstance(layout, RecordedWorktreeOutput) else UnassignedOutput()
 
     def report_output() -> None:
         if isinstance(output, Path):
-            report_retained_folder(output, output_reason)
+            report_retained_folder(output, reason)
 
     if before_report is None:
         report_output()

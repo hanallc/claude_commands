@@ -25,6 +25,7 @@ when their `.git`, `commondir`, and `gitdir` back pointer prove registration by
 a repository under a trusted root, using file reads alone.
 Style-sync lint uses `copies.standing` in a repository slot under the machine's configured slot root.
 The `roots.slots` settings in `build_folders.conf` select that root.
+natedev sets no slot root, so no folder there gets slot trust. The AWS image and the Mac set one.
 Slot trust requires a registered worktree and an `.envrc` that matches `HEAD`.
 Forged links still require explicit approval.
 
