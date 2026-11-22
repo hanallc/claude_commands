@@ -19,7 +19,6 @@ import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Never
 
 from scripts.herdr import herdr, pane_launch
 from scripts.message import sessions as native_sessions
@@ -36,6 +35,8 @@ from scripts.lib import names as display_names  # noqa: E402
 
 USAGE = "usage: herdr_sessions.py list [--on <host>] | sort-tabs | attach <name> | focus <name> | attach-remote <host> <name> | start [--name N] [--cwd D] [-- <claude args>] | resume <name> --session-id ID --cwd D [--config-dir D] [--restore] [--prompt-file P] [--attach] [-- <claude args>]"
 REMOTE_LIST_TIMEOUT = 15
+SERVER_RESTORE_TIMEOUT_MS = 90_000
+REMOTE_FOCUS_TIMEOUT = SERVER_RESTORE_TIMEOUT_MS // 1000 + REMOTE_LIST_TIMEOUT
 
 
 @dataclass(frozen=True)
@@ -67,10 +68,28 @@ def _remote_list(host: RemoteHost) -> int:
     return 0
 
 
-def _attach_remote(host: RemoteHost, name: str) -> Never:
-    """Use the remote host's guarded server start and attach to the tab."""
-    os.execvp("ssh", ["ssh", "-t", host.target, "~/.claude/scripts/lib/py",
-                     "~/.claude/scripts/herdr/herdr_sessions.py", "attach", shlex.quote(name)])
+def _attach_remote(host: RemoteHost, name: str) -> int:
+    """Restore the server if needed, focus the tab, and attach with the local client."""
+    try:
+        result = subprocess.run(
+            ["ssh", host.target, "~/.claude/scripts/lib/py",
+             "~/.claude/scripts/herdr/herdr_sessions.py", "focus", shlex.quote(name)],
+            capture_output=True, text=True, check=False, timeout=REMOTE_FOCUS_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired:
+        print(f"herdr_sessions: {host.target}: remote focus timed out after {REMOTE_FOCUS_TIMEOUT} seconds",
+              file=sys.stderr)
+        return 1
+    if result.returncode:
+        reason = " ".join(result.stderr.split()) or "no error message"
+        print(f"herdr_sessions: {host.target}: {reason}", file=sys.stderr)
+        return 1
+    shared = result.stdout.strip()
+    if not shared:
+        print(f"herdr_sessions: {host.target}: remote session is unknown", file=sys.stderr)
+        return 1
+    binary = herdr.herdr_binary()
+    os.execvp(binary, [binary, "--remote", host.target, "--session", shared, "--remote-keybindings", "local"])
 
 
 class LaunchOptions(argparse.Namespace):
@@ -146,7 +165,7 @@ def _launch(verb: str, arguments: list[str]) -> int:
         except OSError as error:
             print(f"herdr_sessions: {options.name}: prompt file is unreadable: {error}", file=sys.stderr)
     shared = herdr.shared_session()
-    _ = herdr.restore_server(shared, 90_000, session_kind=session_kind)
+    _ = herdr.restore_server(shared, SERVER_RESTORE_TIMEOUT_MS, session_kind=session_kind)
     panes = herdr.Herdr(shared).panes()
     record = staff.initial_snapshot()
     entries = pane_launch.read(pane_launch.record_directory() / f"{shared}.json")
@@ -230,7 +249,7 @@ def _main(argv: list[str]) -> int:
         if remote_list:
             return _remote_list(host)
         try:
-            _attach_remote(host, argv[3])
+            return _attach_remote(host, argv[3])
         except OSError as error:
             print(f"herdr_sessions: {host.target}: attach failed: {' '.join(str(error).split())}", file=sys.stderr)
             return 1
@@ -251,7 +270,7 @@ def _main(argv: list[str]) -> int:
         if not any(session["name"] == shared for session in herdr.live_sessions()):
             if argv[1] == "list":
                 return 0
-            _ = herdr.restore_server(shared, 90_000, session_kind=herdr.security_session())
+            _ = herdr.restore_server(shared, SERVER_RESTORE_TIMEOUT_MS, session_kind=herdr.security_session())
         if argv[1] == "sort-tabs":
             for label in herdr.Herdr(shared).sort_tabs().labels:
                 print(f"herdr_sessions: {label}: tab with several panes; order kept")

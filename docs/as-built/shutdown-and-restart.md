@@ -972,6 +972,8 @@ Nested starts in one process use the same open lock file, including starts in th
 The Herdr server start functions take the same shared lock before they can start a server.
 Manual starts through a pane command, `accounts.py exec`, `cli_agent.sh`, or native Herdr can bypass the lock.
 A shell wrapper can start an agent after a resume times out, and a fork without exec can retain the lock.
+All staff tooling shares one `XDG_CONFIG_HOME`, because a process with a different config home locks a different file.
+A slow Ghostty window or pending Linux service can start the server after its shared lock closes and reboot takes the exclusive lock.
 The `agents resume` command holds the lock while it changes staff or recovery records.
 The direct resume API also holds the lock for starts in an existing pane.
 The `agents restart` and `agents move` commands hold the lock while they save restart or move records.

@@ -550,20 +550,59 @@ class HerdrSessionsTests(unittest.TestCase):
             self.assertNotIn("Traceback", error)
         self.assertEqual(self.commands(), [])
 
-    def test_remote_attach_uses_the_hosts_guarded_attach_command(self) -> None:
-        self.respond([], error="local sessions unreadable")
-        with patch.object(os, "execvp", side_effect=SystemExit(0)) as execute:
+    def test_remote_attach_restores_under_lock_then_runs_the_local_client(self) -> None:
+        binary = os.environ["HERDR_BIN"]
+        fixture_run = subprocess.run
+        lock = self.root / "config/herdr/sessions/agents/reboot.lock"
+        name = "writing tools"
+
+        def submit(client: herdr.Herdr) -> subprocess.CompletedProcess[str]:
+            with lock.open("r") as held, self.assertRaises(BlockingIOError):
+                fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self.respond(["agents"], tabs=(name,))
+            replies = cast(dict[str, CommandResponse], json.loads(self.responses.read_text()))
+            replies["--session agents status server"] = {"stdout": "status: running\n", "code": 0}
+            write_text_atomic(self.responses, json.dumps(replies))
+            return subprocess.CompletedProcess(client.argv("server"), 0, "", "")
+
+        def run(command: list[str], *, capture_output: bool, text: bool, check: bool, timeout: float,
+                env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+            if command[0] == binary:
+                return fixture_run(command, capture_output=capture_output, text=True, check=check, timeout=timeout, env=env)
+            self.assertTrue(text)
+            self.assertGreater(timeout, herdr_sessions.SERVER_RESTORE_TIMEOUT_MS / 1000)
+            self.assertEqual(command, ["ssh", "user@mac", "~/.claude/scripts/lib/py",
+                "~/.claude/scripts/herdr/herdr_sessions.py", "focus", "'writing tools'"])
+            code, output, errors = self.call("focus", name)
+            return subprocess.CompletedProcess(command, code, output, errors)
+
+        def attach(_binary: str, _arguments: list[str]) -> None:
+            self.assertEqual(self.commands()[-3:], self.focused("w1:t1"))
+            raise SystemExit(0)
+
+        with (patch.object(subprocess, "run", side_effect=run),
+              patch.object(herdr, "_submit_server", side_effect=submit) as server,
+              patch.object(herdr, "_server_unit_active", return_value=True),
+              patch.object(os, "execvp", side_effect=attach) as execute):
             with self.assertRaises(SystemExit) as replaced:
-                _ = self.call("attach-remote", "user@mac", "writing tools")
+                _ = self.call("attach-remote", "user@mac", name)
         self.assertEqual(replaced.exception.code, 0)
-        execute.assert_called_once_with("ssh", [
-            "ssh", "-t", "user@mac", "~/.claude/scripts/lib/py",
-            "~/.claude/scripts/herdr/herdr_sessions.py", "attach", "'writing tools'",
-        ])
+        server.assert_called_once()
+        execute.assert_called_once_with(binary, [
+            binary, "--remote", "user@mac", "--session", "agents", "--remote-keybindings", "local"])
+
+    def test_remote_attach_stops_when_the_remote_reboot_lock_refuses_focus(self) -> None:
+        diagnostic = "A reboot is running; wait for it to end.\n"
+        with (patch.object(subprocess, "run", return_value=subprocess.CompletedProcess(["ssh"], 1, "", diagnostic)),
+              patch.object(os, "execvp") as execute):
+            self.assertEqual(self.call("attach-remote", "mac", "writing"),
+                             (1, "", f"herdr_sessions: mac: {diagnostic}"))
+        execute.assert_not_called()
         self.assertEqual(self.commands(), [])
 
     def test_remote_attach_exec_failure_names_its_host(self) -> None:
-        with patch.object(os, "execvp", side_effect=OSError("attach failed")):
+        with (patch.object(subprocess, "run", return_value=subprocess.CompletedProcess(["ssh"], 0, "agents\n", "")),
+              patch.object(os, "execvp", side_effect=OSError("attach failed"))):
             self.assertEqual(self.call("attach-remote", "mac", "writing"),
                              (1, "", "herdr_sessions: mac: attach failed: attach failed\n"))
         self.assertEqual(self.commands(), [])

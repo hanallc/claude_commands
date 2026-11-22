@@ -89,7 +89,9 @@ The [launch-name policy](shutdown-and-restart.md#launch-names) supplies current 
   starts one with `systemd-run` on Linux. On the Mac it starts the server directly from a desktop
   session, or opens an attach window to start it from a non-desktop session.
   The standalone attach command connects in client mode after the server is ready.
-  Remote attach runs the same command through SSH on the target host.
+  Remote attach uses SSH to focus the tab on the target host.
+  The focus command uses the shared reboot lock to restore an absent server.
+  After focus succeeds, the local Herdr client attaches with local keybindings.
   Herdr can replay saved pane commands when its configuration allows agent restore.
   Claude commands wrapped by `lib/relaunch.py` recover the matching conversation's
   session labels and resume note. This is separate from `agents restart`.
