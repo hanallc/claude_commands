@@ -1423,8 +1423,7 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                 other_ids = (request.move_request_id,)
             else:
                 request = admission.parse_record(json.dumps(fields), admission.QueueMoveRequest)
-                other_ids = tuple(drop.neighbor for drop in (request.destination, request.undo_destination)
-                                  if isinstance(drop, admission.QueueDrop))
+                other_ids = (request.destination.neighbor,) if isinstance(request.destination, admission.QueueDrop) else ()
             identities = (request.request_id, request.row_id, request.revision, *other_ids)
             if any(not re.fullmatch(r"[0-9a-f]{32}", key) for key in identities):
                 raise ValueError("Invalid queue move identity.")

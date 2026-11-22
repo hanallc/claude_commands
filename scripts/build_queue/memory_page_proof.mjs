@@ -157,7 +157,7 @@ try {
   let queueFixture = null;
   let unnamedPlace = 0;
   let confirmedQueueLine = null;
-  const undoDrops = new Map();
+  const undoAnchors = new Map();
   const server = createServer(async (req, res) => {
     if (req.url === '/console/builds/queue-move') {
       const json = (status, result) => {
@@ -182,15 +182,17 @@ try {
       if (!undo) assert.equal(request.kind, 'QueueMoveRequest');
       assert.deepEqual(Object.keys(request).sort(), undo
         ? ['kind', 'move_request_id', 'request_id', 'revision', 'row_id', 'token']
-        : ['destination', 'kind', 'request_id', 'revision', 'row_id', 'token', 'undo_destination']);
-      const index = ordered.findIndex(row => row.move.row_id === row_id);
-      const after = ordered[index + 1]?.move.row_id;
-      const before = ordered[index - 1]?.move.row_id;
-      const drop = undo ? undoDrops.get(request.move_request_id) : destination;
-      if (!drop || (drop.kind !== 'QueueHeadDrop' && !ordered.some(item => item.move.row_id === drop.neighbor))) {
+        : ['destination', 'kind', 'request_id', 'revision', 'row_id', 'token']);
+      const previous = undoAnchors.get(request.move_request_id);
+      const drop = undo
+        ? previous === null ? {kind:'QueueHeadDrop'} : {kind:'QueueDrop', neighbor:previous, side:'after'}
+        : destination;
+      if (drop.kind !== 'QueueHeadDrop' && !members.some(item => item.row_id === drop.neighbor)) {
         return json(409, {reason:'The old neighbor left the queue.', line:line()});
       }
-      const [member] = members.splice(members.findIndex(item => item.row_id === row_id), 1);
+      const index = members.findIndex(item => item.row_id === row_id);
+      undoAnchors.set(request.request_id, members[index - 1]?.row_id ?? null);
+      const [member] = members.splice(index, 1);
       const next = drop.kind === 'QueueHeadDrop' ? 0
         : members.findIndex(item => item.row_id === drop.neighbor) + (drop.side === 'after' ? 1 : 0);
       members.splice(next, 0, member);
@@ -199,11 +201,6 @@ try {
       const shown = members.filter(item => byId.has(item.row_id)).map(item => byId.get(item.row_id));
       let place = 0;
       queueFixture.waiters = rows.map(item => item.move ? shown[place++] : item);
-      if (!undo) {
-        assert.deepEqual(request.undo_destination, {kind:'QueueDrop',
-          neighbor:after || before, side:after ? 'before' : 'after'});
-        undoDrops.set(request.request_id, request.undo_destination);
-      }
       queueFixture.move_revision += '1';
       confirmedQueueLine = line();
       return json(200, {line:confirmedQueueLine});
@@ -635,6 +632,27 @@ try {
         assert.ok(!(await snapshot()).handles.includes('mac-only'));
         assert.ok(await evaluate(`document.querySelector('.wrow[data-tip="wait:mac-only"]').textContent.includes('Newest eligible copy starts first')`));
         assert.equal(await evaluate(`document.querySelector('.wrow[data-tip="wait:mac-only"] .amounts').textContent`), '');
+
+        unnamedPlace = 1;
+        queueFixture.move_revision += 'head-undo';
+        await evaluate('pageRefresh.refresh(true)');
+        await evaluate(`(() => {
+          const button = document.querySelector('[data-move-id="typesafe"]');
+          button.focus();
+          button.dispatchEvent(new KeyboardEvent('keydown', {key:' ', bubbles:true}));
+          document.activeElement.dispatchEvent(new KeyboardEvent('keydown', {key:'ArrowDown', bubbles:true}));
+          document.activeElement.dispatchEvent(new KeyboardEvent('keydown', {key:'Enter', bubbles:true}));
+          return true;
+        })()`);
+        await waitForLine('typesafe · test affected moved from 1 to 2');
+        assert.deepEqual(confirmedQueueLine.members.slice(0, 3).map(member => member.row_id),
+          ['unnamed-wait', 'natemerge', 'typesafe']);
+        await evaluate("document.querySelector('#queue-action').click(); true");
+        await waitForLine('typesafe · test affected moved from 2 to 1');
+        assert.deepEqual(confirmedQueueLine.members.slice(0, 3).map(member => member.row_id),
+          ['typesafe', 'unnamed-wait', 'natemerge']);
+        assert.deepEqual((await snapshot()).handles.slice(0, 2), ['typesafe', 'natemerge']);
+
         if (queueDragProof) {
           const clip = await evaluate(`(() => {
             const walk = document.querySelector('#walk').getBoundingClientRect();

@@ -1458,8 +1458,7 @@ function finishQueueDrag(commit) {
   const walk = $("walk");
   if (drag.pointer !== null && walk.hasPointerCapture(drag.pointer)) walk.releasePointerCapture(drag.pointer);
   if (commit && drag.destination && drag.rows.indexOf(drag.row) !== drag.reading.waiters.indexOf(drag.row)) {
-    void sendQueueMove(drag.row, drag.reading, {kind:"QueueMoveRequest", destination:drag.destination,
-      undo_destination:queueUndoDestination(drag.reading, drag.row.move.row_id)});
+    void sendQueueMove(drag.row, drag.reading, {kind:"QueueMoveRequest", destination:drag.destination});
   } else {
     queueMessage("");
     if (latest) showQueue(latest);
@@ -1473,14 +1472,6 @@ function queueRequestId() {
 function queuePlace(reading, id, revision) {
   if (reading.queueReady === false || reading.move_revision !== revision) return 0;
   return reading.waiters.filter(row => row.kind !== "cloud").findIndex(row => row.move?.row_id === id) + 1;
-}
-
-function queueUndoDestination(reading, id) {
-  const rows = reading.waiters.filter(row => row.move);
-  const place = rows.findIndex(row => row.move.row_id === id);
-  const next = rows[place + 1];
-  if (next) return {kind:"QueueDrop", neighbor:next.move.row_id, side:"before"};
-  return {kind:"QueueDrop", neighbor:rows[place - 1].move.row_id, side:"after"};
 }
 
 async function sendQueueMove(row, reading, request, id = queueRequestId()) {
@@ -1517,10 +1508,6 @@ async function sendQueueMove(row, reading, request, id = queueRequestId()) {
           if (current.queueReady === false || !current.move_revision || !current.waiters.some(item =>
             item.move?.row_id === row.move.row_id && item.move.movable !== false)) {
             queueMessage("Undo not available");
-            return;
-          }
-          if (!current.waiters.some(item => item.move?.row_id === request.undo_destination.neighbor)) {
-            queueMessage("The old neighbor left the queue.");
             return;
           }
           void sendQueueMove(row, current, {kind:"QueueUndoRequest", move_request_id:id});

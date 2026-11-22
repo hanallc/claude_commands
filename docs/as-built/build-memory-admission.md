@@ -2404,15 +2404,15 @@ Speculative Mac copy rows show the newest-first rule.
 A refusal before launch keeps the pin. Closing the attempt removes the local waiter and drops its slot claim.
 
 The service checks the order revision for all rows, including rows without handles.
-Its replay ledger records the reply with the new order and one Undo destination.
-Undo moves the step before its former next shown neighbor.
-If the step was last, Undo moves it after its former previous shown neighbor.
-If that neighbor left the queue, the service refuses Undo.
-Undo uses the current queue order and saves pins as a new move.
+The replay ledger records the reply and the anchor from before the move.
+Undo restores the step to that anchor in the full order.
+The anchor is the head or the row that directly preceded the step.
+If that row left the full order, the service refuses Undo.
+Undo saves pins as a new move.
 A conflict supplies the current order. If the revision changed, the page waits for a fresh reading.
-A move sends the drop target and the former shown neighbor for Undo.
+A move sends the drop target.
 A drop above the first shown row uses the head anchor, ahead of unnamed and absent waits.
 Other drops use their neighbor in the full order.
-An Undo request identifies the move to restore. The service gets the destination from the saved reply.
+An Undo request identifies the move to restore. The service reads the saved anchor from the replay ledger.
 The page applies the confirmed order to the rows it shows.
 The confirmation uses the table numbers, including the places of waits without handles.
