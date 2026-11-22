@@ -653,7 +653,7 @@ def question_items(members: staff.StaffSnapshot, documents: tuple[Path, ...], *,
     identities = update_registration.QuestionStaff.for_record(members)
     selected = owners or tuple(member for member in members.rows if member.kind == 'producer' or
         member.kind == 'showrunner' and (include_unowned or
-            record_store.local_document(member) in documents))
+            isinstance(member.doc, (staff.LiveDoc, staff.WrappedDoc)) and member.doc.path in documents))
     if isinstance(selection, ExactReviewRecord):
         selected = tuple(member for member in selected if member.id == selection.owner)
     found: list[ReviewItem] = []
@@ -1318,7 +1318,8 @@ def _read_kind(kind: ReviewType, scope: Path | staff.StaffRow, members: staff.St
         owner = scope
     if kind in QUESTION_TYPES:
         owners = (scope,) if isinstance(scope,staff.StaffRow) else tuple(member for member in members.rows
-            if member.kind == 'showrunner' and record_store.local_document(member) in documents)
+            if member.kind == 'showrunner' and isinstance(member.doc, (staff.LiveDoc, staff.WrappedDoc))
+            and member.doc.path in documents)
         return question_items(members,documents,owners=owners,sources=sources,include_unowned=False,states=states,
                               kinds=QUESTION_TYPES if kind == ReviewType.QUESTION else (kind,))
     if kind in INVESTIGATION_TYPES:
