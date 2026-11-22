@@ -33,6 +33,7 @@ from scripts.build_queue import admission_code, placement, snapshot_codec
 from scripts.build_queue import admission_wire as status_wire
 from scripts.build_queue.admission_wire import read_assignment as read_assignment
 from scripts.build_queue.admission_wire import write_assignment as write_assignment
+from scripts.build_hold.shared_state_defaults import DEFAULT_ADMISSION_SOCKET
 from scripts.build_targets import target_config
 from scripts.direct import step_selection
 if TYPE_CHECKING:
@@ -41,7 +42,7 @@ else:
     from scripts.build_queue import admission_wire as wire
 from scripts.build_queue.system_clock import SystemClock
 
-from scripts.lib import conf
+from scripts.lib import conf, process_stat
 from scripts.lib.atomic_file import write_text_atomic
 
 BUILDS_SESSION = "builds"
@@ -743,43 +744,99 @@ def _refused(reason: str, *, checker: bool = False) -> wire.Refused:
     return wire.Refused(reason)
 
 
-def nested_reservation_reason() -> str:
-    """Refuse a child only when the same queue still holds its live parent's reservation.
+RESERVED_STEP_ENV = "BUILDLOG_RESERVED_STEP"
 
-    The holder must match by pid and start time, so a reused pid never refuses a step.
-    """
-    marker = os.environ.get("BUILDLOG_RESERVED_STEP", "")
+
+@dataclass(frozen=True)
+class OuterReservation:
+    reservation: str
+    pid: int
+
+
+@dataclass(frozen=True)
+class NoOuterReservation:
+    pass
+
+
+def cpu_pool_path() -> Path:
+    return Path(os.environ.get("BUILDLOG_JOBSERVER_FIFO", "/dev/steve"))
+
+
+def _has_live_ancestor(owner_pid: int, owner_start: str) -> bool:
+    from scripts.build_queue import admission_records as records
+
+    pid = os.getppid()
+    seen: set[int] = set()
+    child_start = math.inf
+    while pid > 0 and pid not in seen:
+        seen.add(pid)
+        try:
+            fields = process_stat.process_fields(pid)
+            start = fields[19]
+            start_tick = int(start)
+            if start_tick > child_start or records.process_start_time(pid) != start:
+                return False
+            if pid == owner_pid:
+                return start == owner_start
+            pid, child_start = int(fields[1]), start_tick
+        except (OSError, ValueError, IndexError):
+            return False
+    return False
+
+
+def outer_reservation(*, match_cpu_pool: bool = False) -> OuterReservation | NoOuterReservation:
+    """Find the live parent reservation for this queue or the shared CPU pool."""
+    marker = os.environ.get(RESERVED_STEP_ENV, "")
     if not marker:
-        return ""
+        return NoOuterReservation()
     from scripts.build_queue import admission_records as records
     from scripts.buildlog import store
 
     try:
-        reservation, raw_pid, directory = marker.split("\t")
+        reservation, raw_pid, directory, *resources = marker.split("\t")
         pid = int(raw_pid)
-        if not reservation or pid <= 0 or Path(directory).resolve() != (store.root() / "admission").resolve():
-            return ""
+        if not reservation or pid <= 0 or len(resources) > 2:
+            return NoOuterReservation()
+        if resources:
+            socket_path, *cpu_pool = resources
+            parent_socket = Path(socket_path or DEFAULT_ADMISSION_SOCKET)
+            same_queue = parent_socket.is_absolute() and parent_socket.resolve() == wire.admission_socket_path().resolve()
+            same_cpu_pool = match_cpu_pool and cpu_pool == [str(cpu_pool_path().resolve())]
+        else:
+            same_queue = Path(directory).resolve() == (store.root() / "admission").resolve()
+            same_cpu_pool = False
+        if not (same_queue or same_cpu_pool):
+            return NoOuterReservation()
         start = records.process_start_time(pid)
-        if start is None:
-            return ""
+        if start is None or not _has_live_ancestor(pid, start):
+            return NoOuterReservation()
         state = cast(object, json.loads((Path(directory) / "state.json").read_text()))
     except (OSError, ValueError):
-        return ""
+        return NoOuterReservation()
     if not isinstance(state, dict):
-        return ""
+        return NoOuterReservation()
     reservations = cast(dict[str, object], state).get("reservations")
     if not isinstance(reservations, dict):
-        return ""
+        return NoOuterReservation()
     for value in cast(dict[str, object], reservations).values():
         if not isinstance(value, dict):
             continue
         row = cast(dict[str, object], value)
         owner = row.get("owner")
-        if (row.get("reservation_id") == reservation and isinstance(owner, dict)
+        if (row.get("reservation_id") == reservation and row.get("ending") == {"kind": "NotEnding"}
+                and row.get("finalization") == {"kind": "NoFinalizationIntent"}
+                and isinstance(owner, dict)
                 and cast(dict[str, object], owner).get("pid") == pid
                 and cast(dict[str, object], owner).get("start_time") == start):
-            return (f"verify step cannot run inside reserved step {reservation} (pid {pid}); "
-                    + "run it outside the outer step")
+            return OuterReservation(reservation, pid)
+    return NoOuterReservation()
+
+
+def nested_reservation_reason() -> str:
+    outer = outer_reservation()
+    if isinstance(outer, OuterReservation):
+        return (f"verify step cannot run inside reserved step {outer.reservation} (pid {outer.pid}); "
+                + "run it outside the outer step")
     return ""
 
 
