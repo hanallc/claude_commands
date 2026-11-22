@@ -456,14 +456,77 @@ window.fetch=(url,options)=>options?.method==='POST'
             with self.subTest(key=key):
                 self.assertEqual(roles_order[key], order)
 
+    def test_account_roles_list_only_selected_roles_in_role_order(self) -> None:
+        rows = (
+            replace(status_row("claude1"), roles=("units", "producers"), selected_roles=("units", "producers")),
+            status_row("claude2"),
+            replace(status_row("claude3"), roles=("showrunners", "producers"), selected_roles=("showrunners",)),
+        )
+        markup = accounts_page.board(accounts.StatusReading(rows, (), (), timezone.utc, AT))
+        cells = [(match[1] or "", match[2]) for match in
+                 re.finditer(r'<td class="left account-roles"(?: title="([^"]*)")?>(.*?)</td>', markup)]
+        self.assertEqual([(title, re.sub(r"<[^>]+>", "", content)) for title, content in cells],
+                         [("producers, units", "producers, units"), ("", ""), ("showrunners", "showrunners")])
+        self.assertIn('style="color:#d7af00" data-color-text="role.unit-director">units</span>', cells[0][1])
+        orders = rendered_sort_orders(markup, "accounts")
+        self.assertEqual(orders["roles"], [0, 2, 1])
+        self.assertEqual(orders["roles-reverse"], [2, 0, 1])
+
+    def test_account_roles_use_the_first_selected_account_from_the_roles_table(self) -> None:
+        rows = (
+            status_row("claude1"),
+            replace(status_row("claude2"), selected_roles=("units",)),
+            replace(status_row("claude3"), selected_roles=("units",)),
+        )
+        markup = accounts_page.board(accounts.StatusReading(rows, (), (), timezone.utc, AT))
+        titles = [match[1] or "" for match in
+                  re.finditer(r'<td class="left account-roles"(?: title="([^"]*)")?>', markup)]
+        self.assertEqual(titles, ["", "units", ""])
+        roles_table = markup.split('<h2>Roles</h2>', 1)[1]
+        first_account = re.search(r'<div class="role-line"><span[^>]*>([^<]+)</span>', roles_table)
+        self.assertIsNotNone(first_account)
+        assert first_account is not None
+        self.assertEqual(first_account[1], "claude2")
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser behavior")
+    def test_account_roles_clip_long_lists_and_keep_the_full_title(self) -> None:
+        long_roles = ("producers", "regional release coordinators", "units", "workers")
+        rows = (
+            replace(status_row("claude1"), roles=("showrunners",), selected_roles=("showrunners",)),
+            replace(status_row("claude2"), roles=long_roles, selected_roles=long_roles),
+        )
+        reading = accounts.StatusReading(rows, (), (), timezone.utc, AT)
+        with patch.object(accounts, "read_status", return_value=reading):
+            rendered = accounts_page.page().decode()
+        probe = '''<script>
+(async()=>{
+ const failures=[], check=(ok,label)=>{if(!ok) failures.push(label);};
+ try{
+  frameElement.style.width='1280px';
+  const [short,long]=document.querySelectorAll('.accounts-table .account-roles');
+  const style=getComputedStyle(long);
+  check(short.textContent==='showrunners' && short.scrollWidth<=short.clientWidth,
+   'the short role list fits');
+  check(style.whiteSpace==='nowrap' && long.clientHeight===short.clientHeight,
+   'the long role list stays on one line');
+  check(style.overflowX==='hidden' && style.textOverflow==='ellipsis' && long.scrollWidth>long.clientWidth,
+   'the long role list has an ellipsis');
+  check(long.title==='producers, regional release coordinators, units, workers' && long.title===long.textContent,
+   'the title shows the full role list');
+ }catch(error){failures.push(String(error));}
+ await fetch('/results',{method:'POST',body:JSON.stringify(failures)});
+})();</script>'''
+        page = rendered.replace("</body>", probe + "</body>")
+        self.assertEqual(firefox_probe_results(page.encode()), [[]])
+
     def test_each_table_has_its_own_default_and_focusable_sort_headers(self) -> None:
         markup = accounts_page.board(sort_reading())
         self.assertEqual(re.findall(r'data-account-sort="([^"]+)"', markup),
-                         ["account", "left", "used / hour", "empty at", "resets", "credits", "enabled"])
+                         ["account", "left", "roles", "used / hour", "empty at", "resets", "credits", "enabled"])
         self.assertEqual(re.findall(r'data-role-sort="([^"]+)"', markup),
                          ["role", "account", "next", "busy", "idle", "paused", "exited", "total"])
-        self.assertEqual(markup.count('tabindex="0"'), 15)
-        self.assertEqual(markup.count('class="sort-arrow"'), 15)
+        self.assertEqual(markup.count('tabindex="0"'), 16)
+        self.assertEqual(markup.count('class="sort-arrow"'), 16)
         self.assertIn('data-account-sort="account" tabindex="0" aria-sort="ascending"', markup)
         self.assertIn('data-role-sort="role" tabindex="0" aria-sort="ascending"', markup)
 
@@ -511,12 +574,12 @@ window.fetch=(url,options)=>options?.method==='POST'
             with self.subTest(account=row.label):
                 cells = cast(list[str], re.findall(r'<td[^>]*>(.*?)</td>', line, re.S))
                 self.assertIn(f">{row.label}</span>", cells[1])
-                self.assertEqual(re.sub(r"<[^>]+>", "", cells[4]), rate)
-                self.assertEqual(re.sub(r"<[^>]+>", "", cells[5]), empty)
+                self.assertEqual(re.sub(r"<[^>]+>", "", cells[5]), rate)
+                self.assertEqual(re.sub(r"<[^>]+>", "", cells[6]), empty)
                 if row.label == "claude2":
-                    self.assertIn('title="Quota lasts until the weekly reset."', cells[5])
+                    self.assertIn('title="Quota lasts until the weekly reset."', cells[6])
                 if rate == "—":
-                    for cell in cells[4:6]:
+                    for cell in cells[5:7]:
                         self.assertIn('title="No usage rate is available."', cell)
         order = rendered_sort_orders(markup, "accounts")
         self.assertEqual(order["used / hour"], [5, 0, 1, 4, 2, 3])
@@ -1559,8 +1622,10 @@ window.fetch=async()=>{calls++;return {ok:true,text:async()=>FRESH_PAGE};};
   check(!popup.open && calls===1,'a successful save closes the popup and refreshes');
   const roles=[...document.querySelectorAll('[data-color-key="role.unit-director"]')];
   const roleWords=[...document.querySelectorAll('[data-color-text="role.unit-director"]')];
-  check(roles.length===1 && roleWords.length===1 && roleWords[0].textContent==='units' && roleWords[0].style.color==='rgb(215, 175, 0)',
-   'the units row shows one color swatch and label');
+  check(roles.length===1 && roleWords.length===2 &&
+   roleWords.every(word=>word.textContent==='units' && word.style.color==='rgb(215, 175, 0)') &&
+   new Set(roleWords.map(word=>word.closest('table'))).size===2,
+   'one swatch controls the units label in each table');
   roles[0].click();
   check(popup.open && picker.value==='#d7af00' && popup.querySelector('#color-title').textContent==='Change units color',
    'a role swatch opens the picker with the role color');
