@@ -2490,7 +2490,7 @@ runpy.run_path(sys.argv[0], run_name="__main__")
     fi
     MAC_RESULT_FILE=""
 
-    if [[ "$CMD" == test && "$selected_is_mac" == 1 && "$result_usable" == 0 ]]; then
+    if [[ "$selected_is_mac" == 1 && "$result_usable" == 0 ]]; then
         local launch
         launch=$(verify_helper "$BUILDLOG_MEM_ADMIT_SCRIPT" placement-status --launch-only \
             --episode "$PLACEMENT_EPISODE" --attempt "$PLACEMENT_ATTEMPT") || launch=unknown
@@ -2538,7 +2538,7 @@ runpy.run_path(sys.argv[0], run_name="__main__")
             rm -f "$MAC_LOG_FILE"
             MAC_LOG_FILE=""
             export BUILDLOG_TARGET=""
-            if [[ "$CMD" == test && "$selected_is_mac" == 1 && "$result_word" == lost \
+            if [[ "$selected_is_mac" == 1 && "$result_word" == lost \
                     && "$result_reason" == cleanup_unconfirmed ]]; then
                 echo 'verify.sh: the Mac does not answer; stop and submit again' >&2
                 exit 2

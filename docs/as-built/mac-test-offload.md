@@ -302,10 +302,10 @@ Without `--target`, `--settings` selects the configuration.
 
 `write_result` writes `mac`, `reason`, and `seconds` from the typed run outcome.
 A busy result adds `holder`: its known job, `leftovers`, or `unreadable`.
-Verify checks the exact launch permission when a routed Mac test runner gives no usable result.
+Verify checks the exact launch permission when a routed Mac command gives no usable result.
 The check uses the admission query timeout.
 Verify exits with status 2 if the queue consumed launch permission or cannot confirm it.
-Verify also exits with status 2 if the runner reports an unconfirmed Mac cleanup.
+The same exit applies when the runner loses the verdict and cannot confirm Mac cleanup.
 The local Verify place becomes free when Verify exits.
 The remote claim stays available for recovery until the runner confirms cleanup.
 

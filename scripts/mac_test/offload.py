@@ -1486,7 +1486,7 @@ def write_result(
         mac = "lost"
         reason = result.detail if target else ""
         status = 75
-        if (isinstance(destination, ResultFile) and not linux and verb == "nextest"
+        if (isinstance(destination, ResultFile) and not linux
                 and (isinstance(result, MacCleanupUnconfirmed)
                      or evidence is not None and evidence.launch_authorized and evidence.cleanup == "unconfirmed")):
             reason = "cleanup_unconfirmed"
@@ -2864,7 +2864,6 @@ def claimed_run(
         print(f"mac_test: {running}; tree copied in {copy_seconds:.1f} s", flush=True)
         copies.register_remote(request_mirror(config, request, repository))
         routed_mac_command = not linux and isinstance(request.placement, AssignedOffloadRequest)
-        routed_mac_test = routed_mac_command and request.verb == "nextest"
         if isinstance(request.placement, AssignedOffloadRequest):
             from scripts.build_queue import admission_client, admission_protocol as wire
 
@@ -2887,14 +2886,14 @@ def claimed_run(
                     permission = admission_client.consume_permission(wire.ConsumePermission(
                         uuid.uuid4().hex, assignment, reference, holder))
                 except wire.AdmissionUnavailable:
-                    if routed_mac_test:
+                    if routed_mac_command:
                         break
                     evidence.execution = execution_identity.ExecutionEvidenceUnavailable("authorization response unavailable", time.time())
                     return declined("state", started)
                 if isinstance(permission, wire.FirstAuthorization):
                     evidence.launch_authorized = True
                     break
-                if routed_mac_test and isinstance(permission.permission, placement.PermissionConsumed):
+                if routed_mac_command and isinstance(permission.permission, placement.PermissionConsumed):
                     break
                 if (not isinstance(permission.state, placement.CurrentAssignment)
                         or not isinstance(permission.permission, placement.PermissionAvailable)):

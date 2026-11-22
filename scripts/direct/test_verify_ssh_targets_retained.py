@@ -49,6 +49,9 @@ class VerifySshRetainedTests(VerifySshTargetsFixture):
     def test_mac_check_cleanup_timeout_preserves_the_failed_verdict(self) -> None:
         self.check_lost_mac("cleanup-stream-timeout", status=42, command="check")
 
+    def test_lost_mac_check_releases_the_verify_place_and_keeps_the_claim(self) -> None:
+        self.check_lost_mac("lost-cleanup-timeout", command="check")
+
     def check_lost_mac(self, mode: str, *, status: int = 2, command: str = "test") -> None:
         self.configure("natedev,mac")
         self.enable_mac()
