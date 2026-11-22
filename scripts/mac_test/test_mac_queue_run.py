@@ -1,6 +1,8 @@
 """Exercise placement return and SSH routing with executable stand-ins."""
 from __future__ import annotations
 
+from contextlib import redirect_stdout
+import io
 import json
 import os
 from pathlib import Path
@@ -14,6 +16,7 @@ import sys
 import tempfile
 from typing import TextIO, cast
 import unittest
+from unittest import mock
 
 from scripts.direct.wait_for_test_state import wait_until
 from scripts.lib.checkout_test_support import write_stdlib_tool
@@ -42,6 +45,9 @@ if args[0] == "place-step":
     if os.environ.get("FAKE_QUEUE_REFUSE") == "1":
         print("refused\tclosed")
         raise SystemExit(2)
+    pending = root / "block-on-placement.json"
+    if pending.exists():
+        pending.rename(Path(os.environ["MAC_TEST_STATE_DIR"]) / "block.json")
     Path(option("--assignment-file")).write_text(json.dumps({"episode":option("--episode"),"attempt":"attempt"}))
     print("mac\tmac\tfake-mac\t0\t"+option("--episode")+"\tattempt")
 else:
@@ -115,7 +121,8 @@ def queue_fixture(root: Path, ssh_source: str = SSH) -> dict[str, str]:
     _ = ssh.write_text(f"#!{sys.executable}\n" + ssh_source)
     ssh.chmod(0o755)
     environment = {**os.environ, **config_environment(root / "config"), "FAKE_QUEUE_STATE": str(root),
-                   "PATH": str(root) + os.pathsep + os.environ["PATH"], "HOME": str(root)}
+                   "PATH": str(root) + os.pathsep + os.environ["PATH"], "HOME": str(root),
+                   "MAC_TEST_STATE_DIR": str(root / "mac-test"), "STAFF_FILE": str(root / "staff.json")}
     _ = write_config_fixture(root / "config/mac_gate.conf", "admission_client_command="
                              + shlex.join([sys.executable, str(queue)]) + "\n")
     return environment
@@ -129,6 +136,67 @@ class QueueRunTests(unittest.TestCase):
 
     def events(self, root: Path) -> list[list[str]]:
         return [cast(list[str], json.loads(line)) for line in (root / "events").read_text().splitlines()]
+
+    def write_block(self, path: Path) -> None:
+        _ = path.write_text(json.dumps({"holder": "fixture-holder", "session": "holder-session",
+            "for": "fixture work\nneeds the Mac", "state": "active", "since": "2026-11-21T01:00:00+00:00"}))
+
+    def test_run_waits_once_for_another_sessions_block(self) -> None:
+        for block_after_request in (False, True):
+            with self.subTest(block_after_request=block_after_request), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                environment = {**queue_fixture(root), "CODEX_THREAD_ID": "other-session"}
+                block = Path(environment["MAC_TEST_STATE_DIR"]) / "block.json"
+                block.parent.mkdir()
+                self.write_block(root / "block-on-placement.json" if block_after_request else block)
+                previous = ["place-step", "cancel-placement"] if block_after_request else []
+                waits = 0
+
+                def release_after_two_waits() -> None:
+                    nonlocal waits
+                    waits += 1
+                    self.assertTrue(block.is_file())
+                    self.assertFalse((root / "remote").exists())
+                    events = self.events(root) if (root / "events").exists() else []
+                    self.assertEqual([event[0] for event in events], previous)
+                    if waits == 2:
+                        block.unlink()
+
+                with (mock.patch.dict(os.environ, environment, clear=True),
+                      mock.patch.object(mac_queue_run, "wait_to_retry", side_effect=release_after_two_waits),
+                      redirect_stdout(io.StringIO()) as output):
+                    self.assertEqual(mac_queue_run.main(self.command(root, "run")[3:]), 0)
+                self.assertEqual(waits, 2)
+                self.assertEqual(output.getvalue().splitlines(), [
+                    "Waiting for the Mac block held by fixture-holder: fixture work needs the Mac",
+                    "Mac output", "mac_exit=0",
+                ])
+                self.assertTrue((root / "remote").is_file())
+                self.assertEqual([event[0] for event in self.events(root)],
+                                 [*previous, "place-step", "cancel-placement"])
+
+    def test_run_starts_for_the_block_holder(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            environment = {**queue_fixture(root), "CODEX_THREAD_ID": "holder-session"}
+            block = Path(environment["MAC_TEST_STATE_DIR"]) / "block.json"
+            block.parent.mkdir()
+            self.write_block(block)
+            result = subprocess.run(self.command(root, "run"), env=environment, capture_output=True, text=True,
+                                    timeout=TEST_HANG_GUARD_SECS)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(result.stdout.splitlines(), ["Mac output", "mac_exit=0"])
+            self.assertTrue(block.is_file())
+            self.assertTrue((root / "remote").is_file())
+
+    def test_run_starts_without_a_mac_block(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            result = subprocess.run(self.command(root, "run"), env=queue_fixture(root),
+                                    capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(result.stdout.splitlines(), ["Mac output", "mac_exit=0"])
+            self.assertTrue((root / "remote").is_file())
 
     def test_every_run_returns_the_placement_and_keeps_the_mac_status(self) -> None:
         cases = ((0, False, False), (23, False, False), (125, False, False), (2, True, False), (0, False, True), (2, True, True))

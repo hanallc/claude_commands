@@ -26,6 +26,12 @@ The same episode can receive a Mac assignment after disk evidence recovers.
 The live step record keeps diagnostic disk evidence.
 Standalone fixed local callers retain their existing local admission path.
 
+`mac_queue_run.py --kind run` checks the Mac block before placement and before it starts remote work.
+The block holder can start a run.
+Other sessions see one wait line with the holder and reason.
+The run returns any placement before it waits for the block to clear.
+`--no-wait` reports the block and exits with status 78.
+
 Doc uses a snapshot of the staged tree.
 After success, verify writes a doc pass record if the staged tree still matches the snapshot.
 The Mac runner uses the original repository identity and copies the snapshot from `--source-root`.
