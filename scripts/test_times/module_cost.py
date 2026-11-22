@@ -31,7 +31,7 @@ from typing import Literal, TextIO, TypedDict, cast
 from scripts.lib import build_folders, conf
 from scripts.lib.descendants import adopt_descendants
 from scripts.lib.terminal_cells import print_table, seconds
-from scripts.production.merge_gate import test_module_environment
+from scripts.production.gate import test_module_environment
 from scripts.test_times import task_cpu
 
 

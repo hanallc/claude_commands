@@ -6,6 +6,7 @@ from contextlib import nullcontext, redirect_stderr, redirect_stdout
 import io
 import os
 from pathlib import Path
+import select
 import subprocess
 import sys
 import tempfile
@@ -90,11 +91,17 @@ class NightlySlotSweepTests(unittest.TestCase):
                         self.assertEqual(list(argv[2:4]), ["exec", sys.executable])
                         self.assertTrue(argv[4].endswith("mac_queue_run.py"))
                         events.append("Mac")
-                        self.assertEqual(list(argv[5:15]),
+                        self.assertEqual(list(argv[5:13]),
                                          ["--kind", "run", "--what", "Sweep unused Mac build folders", "--package", "claude",
-                                          "--worktree", str(Path(gate.__file__).resolve().parents[2]), "--", "/bin/zsh"])
+                                          "--worktree", str(Path(gate.__file__).resolve().parents[2])])
                         # The nightly runs from $HOME; the Mac queue refuses a worktree that is not a repository.
                         self.assertTrue((Path(argv[12]) / ".git").exists())
+                        self.assertEqual(argv[13], "--caller-fd")
+                        caller = int(argv[14])
+                        self.assertEqual(list(argv[15:17]), ["--", "/bin/zsh"])
+                        self.assertEqual(options["pass_fds"], (caller,))
+                        self.assertIs(options["start_new_session"], True)
+                        self.assertEqual(select.select([caller], [], [], 0)[0], [])
                     else:
                         self.assertTrue(argv[1].endswith("send.py"))
                         self.assertEqual(list(argv[2:6]), ["--to", "builds", "--from", "nightly"])
