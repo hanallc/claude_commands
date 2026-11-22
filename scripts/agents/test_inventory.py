@@ -30,7 +30,7 @@ from scripts.usage import agents_log
 from scripts.agents.test_support import ShutdownTestCase, linux_process_fixture
 from scripts.agents import inventory
 from scripts.whoami import account
-from scripts.herdr import herdr
+from scripts.herdr import herdr, herdr_types
 from scripts.message import session_records, sessions
 from scripts.production import showrunners
 from scripts.agents import status_entry
@@ -995,7 +995,9 @@ elif "comm=" in joined:
         for run in (1, 2):
             with self.subTest(run=run):
                 _ = self.herdr_log.write_text("")
-                found = inventory.inventory(TARGET_LOGIN)
+                with patch.object(herdr, "_process_sessions", wraps=herdr._process_sessions) as scans:  # pyright: ignore[reportPrivateUsage]
+                    found = inventory.inventory(TARGET_LOGIN)
+                self.assertEqual(scans.call_count, 1)
                 hosts = {session["session_id"]: session["host"] for session in found["sessions"]}
                 desktop = hosts[DESKTOP_ID]
                 self.assertEqual(desktop, {"kind": "herdr", "herdr_session": "writing", "pane_id": "w1:p1", "presentation": "detached"})
@@ -1012,11 +1014,34 @@ elif "comm=" in joined:
                 ])
 
     def test_unreadable_herdr_placement_stays_unknown_in_inventory(self) -> None:
-        with patch.object(herdr, "herdr_place_of", return_value=herdr.UnprovedHerdrPlacement("placement denied")):
+        with patch.object(herdr.InventoryPlacementReader, "place", return_value=herdr.UnprovedHerdrPlacement("placement denied")):
             found = inventory.inventory(TARGET_LOGIN)
         desktop = next(session for session in found["sessions"] if session["session_id"] == DESKTOP_ID)
         self.assertEqual(desktop["host"], {"kind": "unknown"})
         self.assertEqual(inventory.parse_inventory(json.dumps(found)), found)
+
+    def test_refusal_watch_reads_each_owner_place_fresh(self) -> None:
+        from scripts.accounts import refusal_watch
+
+        self.herdr_process(71_001, 1, ["/fixture/herdr", "--session", "writing", "server"], {})
+        self.herdr_process(self.director_pid, 71_001, ["/bin/claude"], {"HERDR_PANE_ID": "w1:p1"})
+        self.herdr_process(DESKTOP_PID, 71_001, ["/bin/claude"], {"HERDR_PANE_ID": "w1:p2"})
+        read_panes = herdr.Herdr.panes
+        pane_lists = 0
+
+        def panes(client: herdr.Herdr) -> list[herdr.PaneIdentity]:
+            nonlocal pane_lists
+            self.assertEqual(client.session, "writing")
+            pane_lists += 1
+            if pane_lists > 1:
+                raise herdr_types.HerdrFailure("pane list denied")
+            return read_panes(client)
+
+        with patch.object(inventory, "_unit_sessions", return_value={}), patch.object(herdr.Herdr, "panes", panes):
+            owners = refusal_watch.live_owners(only=frozenset({DIRECTOR_ID, DESKTOP_ID}))
+        self.assertCountEqual([owner["session_id"] for owner in owners], [DIRECTOR_ID, DESKTOP_ID])
+        self.assertEqual([owner["host"]["kind"] for owner in owners], ["herdr", "unknown"])
+        self.assertEqual(pane_lists, 2)
 
     def test_herdr_inventory_records_attached_clients_and_defaults_unreadable_clients_to_detached(self) -> None:
         self.herdr_process(71_001, 1, ["/fixture/herdr", "--session", "writing", "server"], {})

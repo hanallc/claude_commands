@@ -4575,8 +4575,9 @@ class HerdrTests(unittest.TestCase):
         self.configure(["-o", "command=", "-p", str(pid)], command + "\n")
         self.configure(["eww", "-o", "command=", "-p", str(pid)], command + " " + environment + "\n")
 
-    def darwin_sockets(self, text: str) -> None:
-        self.configure(["-n", "-P", "-a", "-U", "-u", str(os.getuid()), "-F", "pfn"], text)
+    def darwin_sockets(self, text: str, *, pids: tuple[int, ...] = ()) -> None:
+        selector = ["-p", ",".join(map(str, pids))] if pids else []
+        self.configure(["-n", "-P", "-a", "-U", "-u", str(os.getuid()), *selector, "-F", "pfn"], text)
 
     def darwin_process_table(self, text: str, *, terminals: Mapping[int, str] | None = None) -> None:
         executables: list[str] = []
@@ -7095,8 +7096,8 @@ class HerdrTests(unittest.TestCase):
                 for process, parent in ((server, 1), (shell, 10), (agent, 11)):
                     _ = (process / "stat").write_text(f"{process.name} (fixture) S {parent} {'0 ' * 17}1\n")
                 self.configure_herdr(pane_list, readable)
-                with herdr.placement_snapshot():
-                    self.assertEqual(herdr.herdr_place_of(12), herdr.HerdrPlace("fixture", "w1:p1"))
+                with herdr.inventory_placement_reader() as reader:
+                    self.assertEqual(reader.place(12), herdr.HerdrPlace("fixture", "w1:p1"))
                     copied = copy_context()
                     if change == "unreadable panes":
                         self.configure_herdr(pane_list, "pane list denied", code=1)
@@ -7104,15 +7105,21 @@ class HerdrTests(unittest.TestCase):
                     elif change == "left server":
                         _ = (shell / "stat").write_text(f"11 (fixture) S 1 {'0 ' * 17}1\n")
                     elif change == "action":
-                        with herdr.process_action():
-                            _ = (shell / "stat").write_text(f"11 (fixture) S 1 {'0 ' * 17}1\n")
+                        _ = (shell / "stat").write_text(f"11 (fixture) S 1 {'0 ' * 17}1\n")
                     elif change == "reused pid":
                         _ = (agent / "stat").write_text(f"12 (fixture) S 11 {'0 ' * 17}2\n")
-                    if change != "copied context":
+                    if change in ("left server", "reused pid"):
+                        self.assertIsInstance(reader.place(12), herdr.UnprovedHerdrPlacement)
+                    elif change == "action":
+                        with (herdr.process_action(),
+                              patch.object(herdr, "_process_sessions", wraps=PROCESS_SESSIONS) as scans):
+                            self.assertIsInstance(reader.place(12), herdr.UnprovedHerdrPlacement)
+                        self.assertEqual(scans.call_count, 1)
+                if change == "unreadable panes":
+                    with herdr.inventory_placement_reader() as reader:
                         with patch.object(herdr, "_process_sessions", wraps=PROCESS_SESSIONS) as scans:
-                            self.assertIsInstance(herdr.herdr_place_of(12), herdr.UnprovedHerdrPlacement)
-                        if change in ("action", "unreadable panes"):
-                            self.assertEqual(scans.call_count, 1)
+                            self.assertIsInstance(reader.place(12), herdr.UnprovedHerdrPlacement)
+                        self.assertEqual(scans.call_count, 1)
                 if change == "copied context":
                     self.configure_herdr(pane_list, "pane list denied", code=1)
                     self.assertIsInstance(herdr.herdr_place_of(12), herdr.UnprovedHerdrPlacement)
@@ -7122,7 +7129,10 @@ class HerdrTests(unittest.TestCase):
         self.darwin()
         uid = os.getuid()
         self.darwin_process_table(f"70 1 {uid} herdr server\n71 70 {uid} zsh\n72 71 {uid} claude\n")
-        self.darwin_sockets(f"p70\nf3\nn{self.root}/config/herdr/sessions/fixture/herdr.sock\n")
+        listener = f"p70\nf3\nn{self.root}/config/herdr/sessions/fixture/herdr.sock\n"
+        self.darwin_sockets(listener)
+        self.darwin_sockets(listener, pids=(70,))
+        self.darwin_environment(71, "zsh", "")
         self.darwin_environment(72, "claude", "HERDR_PANE_ID=w1:p1")
         self.configure_herdr(["pane", "list"], json.dumps({"result": {"panes": [{"pane_id": "w1:p1"}]}}))
         for change in ("parent", "start"):
@@ -7136,13 +7146,93 @@ class HerdrTests(unittest.TestCase):
                     info.pbi_start_tvsec = generations[pid]
                     return info
 
-                with patch.object(herdr, "_darwin_process_bsd_info", read_identity), herdr.placement_snapshot():
-                    self.assertEqual(herdr.herdr_place_of(72), herdr.HerdrPlace("fixture", "w1:p1"))
+                with (patch.object(herdr, "_darwin_process_bsd_info", read_identity),
+                      herdr.inventory_placement_reader() as reader):
+                    self.assertEqual(reader.place(72), herdr.HerdrPlace("fixture", "w1:p1"))
                     if change == "parent":
                         parents[71] = 1
                     else:
                         generations[72] = 2
-                    self.assertIsInstance(herdr.herdr_place_of(72), herdr.UnprovedHerdrPlacement)
+                    self.assertIsInstance(reader.place(72), herdr.UnprovedHerdrPlacement)
+
+    def test_inventory_placement_checks_a_lost_listener_and_a_late_listener(self) -> None:
+        for change in ("lost listener", "late listener"):
+            with self.subTest(change=change):
+                first = 10 if change == "lost listener" else 20
+                starter, late = first + 1, first + 2
+                server = self.process(first, 1, ["herdr", "server"], {})
+                target = self.process(starter, first, ["claude"], {"HERDR_PANE_ID": "w1:p1"})
+                later_server = self.process(late, 1, ["herdr", "server"], {})
+                later_target = self.process(late + 1, late, ["claude"], {"HERDR_PANE_ID": "w1:p2"})
+                for process, parent in ((server, 1), (target, first), (later_server, 1), (later_target, late)):
+                    _ = (process / "stat").write_text(f"{process.name} (fixture) S {parent} {'0 ' * 17}1\n")
+                name = f"server-{first}"
+                self.unix_socket(self.root / f"config/herdr/sessions/{name}/herdr.sock", first)
+                self.socket_fd(server, first)
+                with (patch.object(herdr, "_process_sessions", wraps=PROCESS_SESSIONS) as scans,
+                      herdr.inventory_placement_reader() as reader):
+                    self.assertEqual(reader.place(starter), herdr.HerdrPlace(name, "w1:p1"))
+                    if change == "lost listener":
+                        (server / "fd/3").unlink()
+                        self.assertIsInstance(reader.place(starter), herdr.UnprovedHerdrPlacement)
+                    else:
+                        self.unix_socket(self.root / "config/herdr/sessions/late/herdr.sock", late)
+                        self.socket_fd(later_server, late)
+                        self.assertEqual(reader.place(late + 1), herdr.HerdrPlace("late", "w1:p2"))
+                self.assertEqual(scans.call_count, 1)
+
+    def test_inventory_placement_reuses_the_linux_handoff_scan(self) -> None:
+        server = self.process(10, 1, ["herdr", "server"], {})
+        self.unix_socket(self.root / "config/herdr/sessions/fixture/herdr.sock", 100)
+        self.socket_fd(server, 100)
+        agent = self.process(11, 1, ["claude"], {"HERDR_PANE_ID": "w1:p1"})
+        for process in (server, agent):
+            _ = (process / "stat").write_text(f"{process.name} (fixture) S 1 {'0 ' * 17}1\n")
+            _ = (process / "cgroup").write_text("0::/user.slice/herdr-fixture.service\n")
+        with (patch.object(herdr, "_process_sessions", wraps=PROCESS_SESSIONS) as scans,
+              herdr.inventory_placement_reader() as reader):
+            expected = herdr.HerdrPlace("fixture", "w1:p1")
+            self.assertEqual(reader.place(11), expected)
+            self.assertEqual(reader.place(11), expected)
+            self.assertEqual(scans.call_count, 1)
+            _ = (agent / "cgroup").write_text("0::/user.slice/other.service\n")
+            self.assertIsInstance(reader.place(11), herdr.UnprovedHerdrPlacement)
+            self.assertEqual(scans.call_count, 1)
+
+    def test_inventory_placement_reuses_the_darwin_handoff_scan(self) -> None:
+        self.darwin()
+        uid = os.getuid()
+        self.darwin_process_table(f"70 1 {uid} herdr server\n71 1 {uid} zsh\n72 71 {uid} claude\n")
+        listener = f"p70\nf3\nn{self.root}/config/herdr/sessions/fixture/herdr.sock\n"
+        self.darwin_sockets(listener)
+        self.darwin_sockets(listener, pids=(70,))
+        self.configure_herdr(["pane", "list"], json.dumps({"result": {"panes": [{"pane_id": "w1:p1"}]}}))
+        self.configure_herdr(["pane", "process-info", "--pane", "w1:p1"],
+                             json.dumps({"result": {"process_info": {"shell_pid": 71}}}))
+        self.darwin_environment(71, "zsh", "")
+        self.darwin_environment(72, "claude", "HERDR_PANE_ID=old-pane")
+        generations = {70: 1, 71: 1, 72: 1}
+
+        def read_identity(pid: int) -> herdr._DarwinProcessBSDInfo:  # pyright: ignore[reportPrivateUsage]
+            info = herdr._DarwinProcessBSDInfo()  # pyright: ignore[reportPrivateUsage]
+            info.pbi_ppid = 71 if pid == 72 else 1
+            info.pbi_start_tvsec = generations[pid]
+            return info
+
+        with (patch.object(herdr, "_darwin_process_bsd_info", read_identity),
+              patch.object(herdr, "_darwin_processes", wraps=herdr._darwin_processes) as scans,  # pyright: ignore[reportPrivateUsage]
+              herdr.inventory_placement_reader() as reader):
+            expected = herdr.HerdrPlace("fixture", "w1:p1")
+            self.assertEqual(reader.place(72), expected)
+            self.assertEqual(reader.place(72), expected)
+            self.assertEqual(scans.call_count, 1)
+            arguments = ["pane", "process-info", "--pane", "w1:p1"]
+            self.configure_herdr(arguments, json.dumps({"result": {"process_info": {"shell_pid": 73}}}))
+            self.assertIsInstance(reader.place(72), herdr.UnprovedHerdrPlacement)
+            self.configure_herdr(arguments, json.dumps({"result": {"process_info": {"shell_pid": 71}}}))
+            generations[71] = 2
+            self.assertIsInstance(reader.place(72), herdr.UnprovedHerdrPlacement)
+            self.assertEqual(scans.call_count, 1)
 
     def test_darwin_shared_listener_is_a_placement_scan_failure(self) -> None:
         processes = [herdr._UserProcess(pid, 1, "herdr", herdr.ReadProcessArguments(("herdr",)))  # pyright: ignore[reportPrivateUsage]

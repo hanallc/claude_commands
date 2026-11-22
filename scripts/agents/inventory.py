@@ -548,6 +548,7 @@ def _host(
     session: SessionFile,
     unit: UnitMarks | None,
     plans: dict[str, str],
+    placement: herdr.InventoryPlacementReader,
 ) -> Host:
     session_id = _string(session.get("sessionId"))
     environment = _process_environment(session.get("pid", 0))
@@ -567,9 +568,9 @@ def _host(
             ),
         }
 
-    place = herdr.herdr_place_of(session.get("pid", 0))
+    place = placement.place(session.get("pid", 0))
     if isinstance(place, herdr.HerdrPlace):
-        clients = herdr.attached_clients(place.session)
+        clients = placement.clients(place.session)
         return {"kind": "herdr", "herdr_session": place.session, "pane_id": place.pane,
                 "presentation": "attached window" if isinstance(clients, herdr.ClientsAttached) else "detached"}
     if isinstance(place, herdr.UnprovedHerdrPlacement):
@@ -895,7 +896,6 @@ def all_live_accounts() -> list[Inventory]:
         return list(pool.map(read_account, logins))
 
 
-@herdr.placement_snapshot()
 def inventory(
     login: str,
     only: frozenset[str] = frozenset(),  # pyright: ignore[reportCallInDefaultInitializer]
@@ -926,22 +926,23 @@ def inventory(
         isinstance(entry, ListedSession) and entry.login.casefold() == wanted_login
         for _, entry in candidates
     )
-    units = _unit_sessions(membership) if has_sessions else {}
-    plans = _newest_unit_plans() if has_sessions else {}
     found: list[Session] = []
     unattributed: list[UnattributedSession] = []
 
-    for record, entry in candidates:
-        if not isinstance(entry, ListedSession):
-            unattributed.append(entry)
-            continue
-        if entry.login.casefold() != wanted_login:
-            continue
+    with herdr.inventory_placement_reader() as placement:
+        units = _unit_sessions(membership) if has_sessions else {}
+        plans = _newest_unit_plans() if has_sessions else {}
+        for record, entry in candidates:
+            if not isinstance(entry, ListedSession):
+                unattributed.append(entry)
+                continue
+            if entry.login.casefold() != wanted_login:
+                continue
 
-        session_id = entry.session_id
-        found.append(_session_details(record, entry, directories=run_directories.get(session_id, []),
-            host=_host(record, units.get(session_id), plans), timers=_timers(session_id),
-            environment=_process_environment(entry.pid), worker_owner=DirectorOwner(kind="director", session_id=worker_owners[session_id]) if session_id in worker_owners else NoDirector(kind="no director")))
+            session_id = entry.session_id
+            found.append(_session_details(record, entry, directories=run_directories.get(session_id, []),
+                host=_host(record, units.get(session_id), plans, placement), timers=_timers(session_id),
+                environment=_process_environment(entry.pid), worker_owner=DirectorOwner(kind="director", session_id=worker_owners[session_id]) if session_id in worker_owners else NoDirector(kind="no director")))
 
     folders = list(dict.fromkeys(session["cwd"] for session in found if isinstance(session["cwd"], str)))
     checkouts = _checkouts(folders)
