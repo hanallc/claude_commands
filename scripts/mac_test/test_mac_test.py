@@ -35,7 +35,7 @@ from scripts.lint.memory_test_support import write_config_fixture, commit_config
 
 from scripts.production import staff
 from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, isolated_staff_file
-from scripts.mac_test import mac_test
+from scripts.mac_test import claim_state, mac_test
 from scripts.lib import conf
 from scripts.lib import test_hang_guard
 
@@ -1251,7 +1251,13 @@ finally:
         return directory
 
     def repository_claim(self, name: str) -> RunState:
-        return cast(RunState, json.loads((self.state_directory / "claims" / f"{name}.json").read_text(encoding="utf-8")))
+        path = self.state_directory / "claims" / self.repository_claim_name(name)
+        return cast(RunState, json.loads(path.read_text(encoding="utf-8")))
+
+    def repository_claim_name(self, name: str) -> str:
+        identity = claim_state.mac_repository_identity(str(self.root / "repositories" / name))
+        assert isinstance(identity, claim_state.MacRepositoryIdentity)
+        return identity.claim_file
 
     def claim_in(self, owner: int, what: str, worktree: Path) -> subprocess.CompletedProcess[str]:
         return self.command("claim", "--pid", str(owner), "--what", what, "--worktree", str(worktree))
@@ -1269,7 +1275,7 @@ finally:
         first, second = self.start_child(), self.start_child()
         self.assert_command(self.claim_in(first.pid, "hana tests", hana), 0, "claimed\n")
         self.assert_command(self.claim_in(second.pid, "liner tests", liner), 0, "claimed\n")
-        self.assertEqual(self.claim_names(), ["cargo-liner.json", "hana.json"])
+        self.assertEqual(self.claim_names(), sorted(self.repository_claim_name(name) for name in ("cargo-liner", "hana")))
         self.assertFalse((self.state_directory / "run.json").exists())
         self.assertEqual((self.repository_claim("hana")["pid"], self.repository_claim("hana")["worktree"]),
                          (first.pid, str(hana)))
@@ -1292,7 +1298,7 @@ finally:
         held = self.repository_claim("hana")
         self.assert_command(self.claim_in(second.pid, "more hana tests", hana / "crates"), 11, self.busy_line(held))
         self.assertEqual(self.repository_claim("hana"), held)
-        self.assertEqual(self.claim_names(), ["hana.json"])
+        self.assertEqual(self.claim_names(), [self.repository_claim_name("hana")])
         self.assert_command(self.release_record(held), 0, "")
         competitors = [self.start_command(
             "claim", "--pid", str(owner.pid), "--what", f"episode-{index} tests", "--worktree", str(hana),
@@ -1302,7 +1308,7 @@ finally:
         self.assertEqual(sorted(process.returncode for process in competitors), [0, 11], answers)
         winner = self.repository_claim("hana")
         self.assertEqual(winner["episode"], f"episode-{0 if competitors[0].returncode == 0 else 1}")
-        self.assertEqual(self.claim_names(), ["hana.json"])
+        self.assertEqual(self.claim_names(), [self.repository_claim_name("hana")])
 
     def test_dead_repository_claim_frees_itself(self) -> None:
         hana = self.repository("hana")
@@ -1366,11 +1372,11 @@ finally:
         self.write_config(offload="on", ci_repo="")
         owner = self.start_child()
         self.assert_command(self.copy_claim(owner.pid, hana), 0, "claimed\n")
-        record = cast(dict[str, object], json.loads((self.state_directory / "claims" / "hana.json").read_text()))
-        self.assertIs(record["copy"], True)
+        record = self.repository_claim("hana")
+        self.assertIs(record.get("copy"), True)
         status = self.command("status")
         self.assertEqual(status.stdout.splitlines()[0], f"running: copy of nextest hana ({hana}) since "
-                         + self.local_time(cast(str, record["since"])))
+                         + self.local_time(record["since"]))
         # A copy holds the scope only for another copy.
         self.assert_command(self.command("free-now", "--repo-root", str(hana)), 0, "free\n")
         self.assert_command(self.command("free-now", "--repo-root", str(hana), "--copy"), 1, "busy\n")
@@ -1449,7 +1455,7 @@ finally:
         self.assert_command(self.release_claim(owner.pid), 0, "")
         self.assertFalse(legacy.exists())
         self.assert_command(self.claim_in(other.pid, "liner tests", liner), 0, "claimed\n")
-        self.assertEqual(self.claim_names(), ["cargo-liner.json"])
+        self.assertEqual(self.claim_names(), [self.repository_claim_name("cargo-liner")])
         self.assert_command(self.claim_in(owner.pid, "hana tests", hana), 0, "claimed\n")
 
     def test_machine_wide_record_outside_any_repository_holds_every_repository(self) -> None:

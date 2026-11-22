@@ -1264,14 +1264,22 @@ class LocalHoldPlacementTests(unittest.TestCase):
                 key = fixture.server.host_evidence_key(request, destination)
                 fixture.server.host_requests[key] = request
                 evidence = fixture.server.read_provider_evidence(key)
+                for path, original in originals.items():
+                    self.assertEqual(path.read_bytes(), original)
+                no_key = kept.copy()
+                _ = no_key.pop("repo_key")
+                mac_test.write_json(paths.claims / "older.json", no_key)
+                (paths.claims / "newer.json").unlink()
+                kept_evidence = fixture.server.read_provider_evidence(key)
+            assert isinstance(kept_evidence, placement.FreshHostEvidence)
+            self.assertEqual(kept_evidence.provider_diagnostic,
+                placement.BusyProviderDiagnostic(destination.target, "dead check (kept for cleanup)", kept["since"]))
             assert isinstance(evidence, placement.FreshHostEvidence)
             self.assertEqual(evidence.provider_diagnostic,
                 placement.BusyProviderDiagnostic(destination.target, live["what"], live["since"]))
             self.assertEqual(evidence.holder, placement.ResourceHolderSession("live-holder"))
             self.assertEqual([claim.reference.claim_id for claim in evidence.cleanup_claims], ["older-kept"])
             self.assertEqual([claim.reference.claim_id for claim in evidence.claims], ["newer-live"])
-            for path, original in originals.items():
-                self.assertEqual(path.read_bytes(), original)
 
     def test_a_busy_mac_is_a_busy_exclusion_and_a_free_mac_is_allowed(self) -> None:
         from scripts.build_queue import placement

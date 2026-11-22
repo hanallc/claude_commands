@@ -106,7 +106,7 @@ def mac_source_repository(common: str) -> tuple[str, str]:
             return common, ""
         result.check_returncode()
         origin = result.stdout.strip()
-        source = local_origin_git_dir(origin)
+        source = local_origin_git_dir(origin, os.path.dirname(common))
         if source is None or source in seen:
             return common, origin
         seen.add(source)
@@ -135,9 +135,11 @@ def borrowed_git_dir(common: str) -> str | None:
     return os.path.dirname(os.path.normpath(os.path.join(common, "objects", objects)))
 
 
-def local_origin_git_dir(origin: str) -> str | None:
+def local_origin_git_dir(origin: str, directory: str = "") -> str | None:
     """Return the shared Git folder when origin names a local directory."""
     url = origin.removeprefix("file://")
+    if directory and "://" not in origin and ":" not in url and not os.path.isabs(url):
+        url = os.path.join(directory, url)
     return git_common_dir(url) if os.path.isabs(url) and os.path.isdir(url) else None
 
 

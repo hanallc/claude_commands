@@ -25,7 +25,7 @@ from scripts.mac_test import mac_test
 from scripts.lib import atomic_file
 from scripts.lib import process_start as process_identity
 
-from scripts.mac_test import eligibility, offload
+from scripts.mac_test import claim_state, eligibility, offload
 
 
 from scripts.build_hold.override_guard import require_checkout
@@ -744,7 +744,8 @@ class ReservationTests(IsolatedTargetTest):
                         mock.patch.object(session_owner, "owning_session", return_value=session), \
                         mock.patch.object(process_identity, "process_start", side_effect=process_start), \
                         mock.patch.object(mac_test, "target_claim_scope", return_value=mac_test.WHOLE_MAC), \
-                        mock.patch.object(eligibility, "repository_identity", return_value=eligibility.KnownRepository("hana")), \
+                        mock.patch.object(claim_state, "mac_repository_identity", return_value=claim_state.MacRepositoryIdentity(
+                            "fixture-hana", "hana", "hana.json", "hana")), \
                         mock.patch.object(offload.ProcessController, "capture", return_value=offload.CommandOutput(0, "", "")):
                     with mock.patch.object(atomic_file, "write_text_atomic", side_effect=interrupted_write):
                         with self.assertRaisesRegex(OSError, "publication interrupted"):

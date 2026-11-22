@@ -260,10 +260,12 @@ class RepositorySlotTests(unittest.TestCase):
         paths = mac_test.state_paths("mac")
         for worktree, pid in ((main, 101), (clone, 102)):
             args = self.arguments("mac", worktree, pid)
-            scope = claim_state.target_claim_scope(paths, args.worktree)
+            saved = claim_state.mac_repository_identity(args.worktree)
+            assert isinstance(saved, claim_state.MacRepositoryIdentity)
+            scope = claim_state.RepositoryScope(saved.mirror_name, saved.key)
             with claim_state.locked(paths.lock):
                 result = mac_test.claim_once(args, paths, scope, session=NoOwningSession(),
-                                             mac_kind=mac_test.MacClaimKind.GUEST)
+                                             mac_kind=mac_test.MacClaimKind.GUEST, mac_repository=saved)
             assert isinstance(result, mac_test.ClaimFinished), result
             self.assertEqual(result.status, 0)
 
@@ -589,7 +591,9 @@ class RepositorySlotTests(unittest.TestCase):
         self.assertEqual(offload.remote_mirror(identity, "darwin"), ".local/state/mac-test/test-mirror/project")
         self.assertEqual(self.claim("darwin", root, 101)[0], 0)
         self.assertEqual(self.claim("darwin", root, 102)[0], 11)
-        self.assertTrue((mac_test.state_paths("darwin").claims / "project.json").exists())
+        saved = claim_state.mac_repository_identity(str(root))
+        assert isinstance(saved, claim_state.MacRepositoryIdentity)
+        self.assertTrue((mac_test.state_paths("darwin").claims / saved.claim_file).exists())
         _ = registry.write_text(registry.read_text().replace("platform.mac=macos", "platform.mac=linux"))
 
         self.assertTrue(offload.remote_mirror(identity, "mac", 2).endswith("/mac-s2"))

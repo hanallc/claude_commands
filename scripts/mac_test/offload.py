@@ -378,6 +378,13 @@ class UnresolvedLeftoverCount:
     """Process evidence cannot establish the number of remaining processes."""
 
 
+class ReadAttemptRepository:
+    """Read the repository key when recording a non-Mac attempt."""
+
+
+READ_ATTEMPT_REPOSITORY = ReadAttemptRepository()
+
+
 @dataclass
 class AttemptEvidence:
     """Observed completion and ownership for one SSH attempt."""
@@ -387,6 +394,7 @@ class AttemptEvidence:
     cleanup: Literal["confirmed", "unconfirmed"] = "unconfirmed"
     unresolved_count: int | UnresolvedLeftoverCount = UnresolvedLeftoverCount()
     evidence_at: float = 0.0
+    repository_key: str | ReadAttemptRepository = READ_ATTEMPT_REPOSITORY
     traffic: transfer_bytes.TransferLedger = field(default_factory=transfer_bytes.TransferLedger)
     execution: execution_identity.ExecutionEvidence = field(default_factory=lambda: execution_identity.ExecutionNotStarted())
     launch_authorized: bool = False
@@ -988,6 +996,7 @@ class ProcessController:
         self.claim_settings: Path | DefaultMacSettings = eligibility.DEFAULT_MAC_SETTINGS
         self.claim_target: str = ""
         self.claim_scope_key: str = "run"
+        self.mac_repository: claim_state.MacRepositoryIdentity | claim_state.WholeMacScope = claim_state.WHOLE_MAC
 
     def stop(self) -> None:
         active = self.active
@@ -1043,6 +1052,13 @@ class ProcessController:
                         if isinstance(self.placement, AssignedOffloadRequest) else 0)
                 if answer.status in (0, 13):
                     self.claim_identity = claim_state.reply_claim_identity(stdout)
+                    for line in stdout.splitlines():
+                        if line.startswith("claim_fence="):
+                            self.claim_scope_key = line.removeprefix("claim_fence=")
+                        if line.startswith("mac_repository="):
+                            self.mac_repository = claim_state.mac_repository_record(
+                                cast(object, json.loads(line.removeprefix("mac_repository="))))
+                            self.claim_scope_key = self.mac_repository.fence_directory
                 elif isinstance(self.placement, AssignedOffloadRequest):
                     self.inspect_claim(attempt, expected)
         finally:
@@ -1067,7 +1083,9 @@ class ProcessController:
         with claim_state.locked(paths.lock):
             for held in claim_state.read_claims(paths):
                 record = held.record
-                if (claim_state.claim_identity(record) != expected or held.scope != assigned.destination.scope
+                scope = assigned.destination.scope
+                matches = (held.matches_mac_assignment_scope(scope) if paths.platform == "macos" else held.scope == scope)
+                if (claim_state.claim_identity(record) != expected or not matches
                         or record["pid"] != os.getpid()
                         or record["submitting_session"] != claim_state.session_id(assigned.session)):
                     continue
@@ -1075,6 +1093,8 @@ class ProcessController:
                 if not isinstance(start, process_identity.Started) or start.start != record["proc_start"]:
                     continue
                 self.claim_identity = expected
+                self.claim_scope_key = claim_state.claim_fence_directory(held.path, record)
+                self.mac_repository = claim_state.saved_mac_repository(record)
                 if "remote_host" in record and record.get("cleanup_pending"):
                     attempt.answer = TakenOverMacClaim(record["remote_host"], record.get("slot", 1))
                 elif "remote_host" in record:
@@ -1532,7 +1552,9 @@ def parse_probe(output: str) -> ProbeResult:
     return ProbeSnapshot(free_gib, hostname)
 
 
-def claim_arguments(request: OffloadRequest, config: OffloadConfig, leased_slots: tuple[int, ...] = ()) -> list[str]:
+def claim_arguments(request: OffloadRequest, config: OffloadConfig, leased_slots: tuple[int, ...] = (), *,
+                    mac_repository: claim_state.MacRepositoryIdentity | claim_state.WholeMacScope
+                    = claim_state.WHOLE_MAC) -> list[str]:
     copy_words = ["--copy"] if request.copy else []
     identity = (claim_state.ClaimIdentity(uuid.uuid4().hex, request.call_id, uuid.uuid4().hex)
                 if isinstance(request.admission, UnclaimedMacRun) else request.admission.identity)
@@ -1568,6 +1590,8 @@ def claim_arguments(request: OffloadRequest, config: OffloadConfig, leased_slots
         "--identity", "--session", session,
         *selection,
         *handoff,
+        *(["--mac-repository", json.dumps(mac_repository.record())]
+          if isinstance(mac_repository, claim_state.MacRepositoryIdentity) else []),
         *[word for slot in leased_slots for word in ("--leased-slot", str(slot))],
     ]
 
@@ -2441,7 +2465,14 @@ def mirror_selector_script(scope: MirrorScope, target: str = "mac", slot: int = 
     )
 
 
-def leftover_check_script(repository: KnownRepository, target: str = "mac", slot: int = 1) -> str:
+def leftover_check_script(repository: MirrorScope, target: str = "mac", slot: int = 1) -> str:
+    if isinstance(repository, AllMirrors):
+        # Old claims do not identify their mirror. Count work without stopping other runs.
+        return mirror_selector_script(repository, target, slot) + r'''
+leftover_pids=$(select_leftovers) || exit "$?"
+leftover_count=$(printf '%s\n' "$leftover_pids" | awk 'NF { count++ } END { print count+0 }') || exit 1
+printf 'leftovers=%s\nrc=0\n' "$leftover_count"
+'''
     return mirror_selector_script(repository, target, slot) + r'''
 leftover_pids=$(select_leftovers) || exit "$?"
 printf '%s\n' "$leftover_pids" | while IFS= read -r leftover_pid; do
@@ -2513,14 +2544,14 @@ def read_leftovers(config: SshConnectionSettings, host: str, script: str,
     return LeftoverObservation(answer, result.stdout)
 
 
-def check_leftovers(config: SshConnectionSettings, host: str, repository: KnownRepository,
+def check_leftovers(config: SshConnectionSettings, host: str, repository: MirrorScope,
                    target: str = "mac", slot: int = 1) -> LeftoverCheckResult:
     """End and count one mirror's work on its recorded host."""
     return read_leftovers(config, host, leftover_check_script(repository, target, slot), target).result
 
 
 def settle_pending_start(controller: ProcessController, config: OffloadConfig, host: str,
-                         repository: KnownRepository, target: str = "mac", slot: int = 1
+                         repository: MirrorScope, target: str = "mac", slot: int = 1
                          ) -> StartSettled | StartUnsettled:
     """Keep the claim until the remote fence prevents a delayed start."""
     identity = controller.claim_identity
@@ -2556,7 +2587,7 @@ def report_leftover_check(result: LeftoverCheckResult, request: OffloadRequest) 
 
 
 def check_current_leftovers(
-    config: OffloadConfig, host: str, repository: KnownRepository, target: str = "mac", slot: int = 1,
+    config: OffloadConfig, host: str, repository: MirrorScope, target: str = "mac", slot: int = 1,
 ) -> LeftoverCheckResult:
     """Read the current connection settings before checking retained work."""
     try:
@@ -2571,20 +2602,27 @@ def check_taken_over_claim(
     target: str = "mac",
 ) -> LeftoverCheckResult:
     if isinstance(claim, TakenOverMacClaim):
+        scope: MirrorScope = repository
+        if eligibility.configured_ssh_target(target or "mac").platform == "macos":
+            saved = controller.mac_repository
+            scope = KnownRepository(saved.mirror_name, saved.key) if isinstance(saved, claim_state.MacRepositoryIdentity) else ALL_MIRRORS
         if isinstance(controller.pending, PendingStartOperation):
-            return settle_pending_start(controller, config, claim.host, repository, target, claim.slot).leftovers
-        return check_current_leftovers(config, claim.host, repository, target, claim.slot)
+            return settle_pending_start(controller, config, claim.host, scope, target, claim.slot).leftovers
+        return check_current_leftovers(config, claim.host, scope, target, claim.slot)
     return LeftoverCheckFailed("the kept claim's host could not be read")
 
 
 def claim_for_run(
     controller: ProcessController, config: OffloadConfig, request: OffloadRequest, repository: KnownRepository,
-    leased_slots: tuple[int, ...] = (),
+    leased_slots: tuple[int, ...] = (), *,
+    mac_repository: claim_state.MacRepositoryIdentity | claim_state.WholeMacScope = claim_state.WHOLE_MAC,
 ) -> MacClaimAnswer:
     attempt = LocalClaimAttempt()
     controller.placement = request.placement
     controller.claim_settings = config.source
     controller.claim_target = request.target
+    controller.claim_scope_key = "run"
+    controller.mac_repository = claim_state.WHOLE_MAC
     if isinstance(request.admission, MacClaimFromWait):
         controller.expected_claim = request.admission.identity
     elif isinstance(request.placement, AssignedOffloadRequest):
@@ -2598,26 +2636,16 @@ def claim_for_run(
             assigned.destination.provider, assigned.destination.target, assigned.destination.scope,
             identity.claim_id, identity.episode, identity.attempt)
     try:
-        controller.complete_claim(claim_arguments(request, config, leased_slots), attempt)
-        if isinstance(attempt.answer, (FreshMacClaim, TakenOverMacClaim)):
-            claim_path = cast(Callable[[claim_state.StatePaths, claim_state.ClaimScope], Path],
-                              getattr(import_module("scripts.mac_test.mac_test"), "claim_path"))
-
-            paths = claim_state.state_paths(request.target)
-            scope = (request.placement.assignment.destination.scope
-                     if isinstance(request.placement, AssignedOffloadRequest)
-                     else claim_state.target_claim_scope(paths, str(request.repo_root)))
-            if isinstance(scope, claim_state.RepositoryScope) and not target_config.uses_legacy_mac_layout(paths.platform):
-                scope = replace(scope, slot=attempt.answer.slot)
-            controller.claim_scope_key = claim_path(paths, scope).stem
+        controller.complete_claim(claim_arguments(request, config, leased_slots, mac_repository=mac_repository), attempt)
+        if isinstance(controller.claim_identity, claim_state.ClaimIdentity):
+            if pending_start_path(request.target, controller.claim_identity).exists():
+                controller.pending = PendingStartOperation()
         if isinstance(request.placement, AssignedOffloadRequest) and isinstance(controller.claim_identity, claim_state.ClaimIdentity):
             assigned = request.placement.assignment
             identity = controller.claim_identity
             controller.attempt_evidence.provider = placement.ProviderClaimReference(
                 assigned.destination.provider, assigned.destination.target, assigned.destination.scope,
                 identity.claim_id, identity.episode, identity.attempt)
-            if pending_start_path(request.target, identity).exists():
-                controller.pending = PendingStartOperation()
         if isinstance(attempt.interruption, OffloadInterrupted):
             raise attempt.interruption
         return attempt.answer
@@ -3287,11 +3315,30 @@ def run_offload(
         return run_hana_offload(controller, config, request, started)
     from scripts.copies import copies
 
-    decision = eligibility.mac_step_eligibility(config, request.repo_root, request.package, request.verb, request.target, kind=request.kind)
+    linux = not target_config.uses_legacy_mac_layout(eligibility.configured_ssh_target(request.target or "mac").platform)
+    mac_repository: claim_state.MacRepositoryIdentity | claim_state.WholeMacScope = claim_state.WHOLE_MAC
+    if not linux:
+        controller.attempt_evidence.repository_key = store.UNKNOWN_IDENTITY
+        if isinstance(request.admission, MacClaimFromWait):
+            try:
+                paths = claim_state.state_paths(request.target)
+                for held in claim_state.read_claims(paths):
+                    if (claim_state.claim_identity(held.record) == request.admission.identity
+                            and held.record["pid"] == request.admission.owner_pid):
+                        mac_repository = claim_state.saved_mac_repository(held.record)
+                        break
+            except claim_state.StateReadError:
+                return declined("state", started)
+        if isinstance(mac_repository, claim_state.WholeMacScope):
+            mac_repository = claim_state.mac_repository_identity(str(request.repo_root))
+        if isinstance(mac_repository, claim_state.WholeMacScope):
+            return declined("repo" if config.enabled else "off", started)
+        controller.attempt_evidence.repository_key = mac_repository.key
+    decision = eligibility.mac_step_eligibility(config, request.repo_root, request.package, request.verb,
+                                               request.target, kind=request.kind, mac_repository=mac_repository)
     if isinstance(decision, IneligibleMacStep):
         return declined(decision.reason, started)
     repository = decision
-    linux = not target_config.uses_legacy_mac_layout(eligibility.configured_ssh_target(request.target or "mac").platform)
     if linux and not trusted_linux_source(request.repo_root):
         return declined("repo", started)
     if linux:
@@ -3316,7 +3363,8 @@ def run_offload(
                 except copies.BusyRemoteMirror:
                     continue
                 leases[slot] = admission_leases.enter_context(lease)
-            result = leased_offload(controller, config, request, repository, started, linux, leases)
+            result = leased_offload(controller, config, request, repository, started, linux, leases,
+                                    mac_repository=mac_repository)
             if isinstance(result, DeclinedMacRun) and result.reason == "copy":
                 refusal = mirror_busy_refusal(result.detail)
                 if isinstance(refusal, MirrorBusyRefusal):
@@ -3340,11 +3388,13 @@ def request_mirror(config: OffloadConfig, request: OffloadRequest, repository: K
 
 def leased_offload(controller: ProcessController, config: OffloadConfig, request: OffloadRequest,
                    repository: KnownRepository, started: float, linux: bool,
-                   leases: dict[int, ExitStack]) -> MacOffloadResult:
+                   leases: dict[int, ExitStack], *,
+                   mac_repository: claim_state.MacRepositoryIdentity | claim_state.WholeMacScope
+                   = claim_state.WHOLE_MAC) -> MacOffloadResult:
     if not leases:
         write_mirror_busy(config, repository.name, request.target)
         return BusyMacDecline(LostRunLeftovers(), elapsed_seconds(started))
-    claim = claim_for_run(controller, config, request, repository, tuple(leases))
+    claim = claim_for_run(controller, config, request, repository, tuple(leases), mac_repository=mac_repository)
     claim_from_wait = isinstance(request.admission, MacClaimFromWait)
     # A transferred reservation can be adopted only once.
     request = replace(request, admission=UnclaimedMacRun())
@@ -3365,7 +3415,7 @@ def leased_offload(controller: ProcessController, config: OffloadConfig, request
         if isinstance(request.placement, AssignedOffloadRequest):
             return BusyMacDecline(LostRunLeftovers(), elapsed_seconds(started))
         claim_from_wait = False
-        claim = claim_for_run(controller, config, request, repository, tuple(leases))
+        claim = claim_for_run(controller, config, request, repository, tuple(leases), mac_repository=mac_repository)
         if isinstance(claim, (TakenOverMacClaim, TakeoverHostUnreadable)):
             return BusyMacDecline(LostRunLeftovers(), elapsed_seconds(started))
     if isinstance(claim, MacClaimNotConfirmed):
@@ -3390,6 +3440,12 @@ def leased_offload(controller: ProcessController, config: OffloadConfig, request
     if claim.slot not in leases:
         _ = release_claim(controller, request.target)
         return BusyMacDecline(LostRunLeftovers(), elapsed_seconds(started))
+    saved = controller.mac_repository
+    if isinstance(saved, claim_state.MacRepositoryIdentity):
+        if repository.legacy_mirror_name != saved.mirror_name:
+            _ = release_claim(controller, request.target)
+            return DeclinedMacRun("state", elapsed_seconds(started), "The claim has a different mirror than the lease")
+        repository = KnownRepository(saved.mirror_name, saved.key)
     for slot, lease in leases.items():
         if slot != claim.slot:
             lease.close()
@@ -3531,7 +3587,11 @@ def persist_attempt(request: OffloadRequest, result: MacOffloadResult,
 
     if not request.target:
         return
-    repository = eligibility.repository_identity(request.repo_root)
+    repository_key = evidence.repository_key
+    if isinstance(repository_key, ReadAttemptRepository):
+        repository = eligibility.repository_identity(request.repo_root)
+        repository_key = (repository.key or store.UNKNOWN_IDENTITY
+                          if isinstance(repository, KnownRepository) else store.UNKNOWN_IDENTITY)
     queued = os.environ.get("BUILDLOG_MEM_WAIT_SINCE", "")
     first = os.environ.get("BUILDLOG_MEM_WAIT_FIRST_FILE", "")
     if first and Path(first).is_file():
@@ -3542,8 +3602,7 @@ def persist_attempt(request: OffloadRequest, result: MacOffloadResult,
                if isinstance(result, NoTestMatchedOnMac) else "declined")
     attempt: MeasuredSshAttempt = {
         "call_id": request.call_id, "target": request.target,
-        "repo_identity": (repository.key if isinstance(repository, KnownRepository) and repository.key
-                          else store.UNKNOWN_IDENTITY),
+        "repo_identity": repository_key,
         "queued_at": float(queued) if queued else time.time() - elapsed_seconds(started),
         "departed_at": time.time() - elapsed_seconds(started), "slot": evidence.slot,
         "outcome": outcome, "completion": evidence.completion, "cleanup": evidence.cleanup,

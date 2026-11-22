@@ -204,15 +204,27 @@ class RemoteEntryTests(unittest.TestCase):
         if not isinstance(start, process_identity.Started):
             self.fail("The test process has no start identity")
         paths.claims.mkdir(parents=True)
-        _ = (paths.claims / "repository.json").write_text(json.dumps({
+        record = {
             "claim_id": "live-copy-claim", "episode": "copy-episode", "attempt": "copy-attempt",
             "submitting_session": "",
             "pid": os.getpid(), "proc_start": start.start, "what": "tests", "worktree": str(self.source),
             "since": "2026-11-05T12:00:00+00:00", "repo_name": "repository", "repo_key": "",
-        }))
-        with self.assertRaisesRegex(copies.CopyError, "busy"):
-            copies.remove_trees("alpha")
-        self.assertTrue(self.mirror.exists())
+        }
+        key = "https://fixture.invalid/team/repository"
+        stem = claim_state.mac_claim_stem(key, 0)
+        identity = claim_state.MacRepositoryIdentity(key, "repository", f"{stem}.json", stem)
+        for name, fields in (
+            ("repository.json", record),
+            (identity.claim_file, {**record, "repo_name": "alias", "repo_key": key,
+                                  "mac_repository": identity.record()}),
+        ):
+            with self.subTest(claim_file=name):
+                path = paths.claims / name
+                _ = path.write_text(json.dumps(fields))
+                with self.assertRaisesRegex(copies.CopyError, "busy"):
+                    copies.remove_trees("alpha")
+                self.assertTrue(self.mirror.exists())
+                path.unlink()
 
     def test_configured_symlink_parent_permits_copy_and_removal(self) -> None:
         actual = self.root / "actual"

@@ -527,9 +527,13 @@ Release compares the exact claim identity under the provider lock.
 The Mac claim count uses `build_slots.configured_maximum` to read the repository limit or host default in `build_folders.conf`.
 The mac-linux gate shares the claude_commands repository limit with native Mac runs, even from a differently named checkout.
 Each guest uses a numbered claim. Mac mirror work uses the unnumbered claim.
-The Mac resolves the repository key before it takes the claim lock and saves the key with the claim.
-The claim reader uses the saved key without running Git.
-A Mac claim with no saved key blocks new claims for all repositories until it ends.
+The Mac resolves the repository before it takes the claim lock.
+The key follows local clone origins to the upstream repository.
+Each claim saves its key, claim file, mirror name, and start fence directory.
+The key determines the file name for a new claim. The mirror name identifies the directory the runner uses.
+The runner, release, and cleanup use the saved identity. Handoff retains the reservation file and its start fence.
+A legacy Mac claim with no key blocks all repositories. Recovery can take the exact claim for cleanup.
+If a legacy claim has no saved mirror, cleanup checks for remaining mirror work without stopping any processes.
 Held slots and waiting extras remain in memory. A restart removes them and retains the run's queue place.
 The service replaces this file atomically. Reservation records retain accepted needs, run identities, scope paths, and finalization intent.
 Width and call absence use named variants. `RequestedTestWidth`, `UnspecifiedTestWidth`, and `NoTestWidth` describe the width.

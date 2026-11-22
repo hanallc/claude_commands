@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
 import fcntl
+from hashlib import sha256
 import json
 from pathlib import Path
 from subprocess import SubprocessError
@@ -240,6 +241,7 @@ class ClaimOwnerRecord(TypedDict):
     repo_key: NotRequired[str]
     repo_name: NotRequired[str]
     slot: NotRequired[int]
+    mac_repository: NotRequired[MacRepositoryRecord]
     transfers: NotRequired[list[TransferBytes]]
 
 
@@ -278,6 +280,70 @@ ClaimScope = RepositoryScope | WholeMacScope
 WHOLE_MAC = WholeMacScope()
 
 
+class ResolveMacRepository:
+    """Read the repository at the claim caller boundary."""
+
+
+RESOLVE_MAC_REPOSITORY = ResolveMacRepository()
+
+
+class MacRepositoryRecord(TypedDict):
+    key: str
+    mirror_name: str
+    claim_file: str
+    fence_directory: str
+
+
+@dataclass(frozen=True)
+class MacRepositoryIdentity:
+    """The repository, mirror, and files selected when a Mac claim starts."""
+
+    key: str
+    mirror_name: str
+    claim_file: str
+    fence_directory: str
+
+    def for_slot(self, slot: int) -> MacRepositoryIdentity:
+        fence = mac_claim_stem(self.key, slot)
+        return MacRepositoryIdentity(self.key, self.mirror_name, f"{fence}.json", fence)
+
+    def record(self) -> MacRepositoryRecord:
+        return {"key": self.key, "mirror_name": self.mirror_name,
+                "claim_file": self.claim_file, "fence_directory": self.fence_directory}
+
+
+def mac_claim_stem(key: str, slot: int) -> str:
+    digest = sha256(key.encode()).hexdigest()
+    return f"{digest}!{slot}" if slot else digest
+
+
+def mac_repository_record(value: object) -> MacRepositoryIdentity:
+    if not isinstance(value, dict):
+        raise StateReadError("invalid Mac repository identity")
+    fields = cast(dict[str, object], value)
+    key, mirror, file, fence = (fields.get(field) for field in
+                               ("key", "mirror_name", "claim_file", "fence_directory"))
+    if not isinstance(key, str) or not key:
+        raise StateReadError("invalid Mac repository key")
+    if not all(isinstance(field, str) and field and field not in (".", "..")
+               and "/" not in field and not any(c in field for c in "\0\r\n\t")
+               for field in (mirror, file, fence)):
+        raise StateReadError("invalid Mac repository path")
+    assert isinstance(mirror, str) and isinstance(file, str) and isinstance(fence, str)
+    if file != f"{fence}.json":
+        raise StateReadError("the Mac claim file and fence directory differ")
+    return MacRepositoryIdentity(key, mirror, file, fence)
+
+
+def saved_mac_repository(record: RunRecord) -> MacRepositoryIdentity | WholeMacScope:
+    return mac_repository_record(record["mac_repository"]) if "mac_repository" in record else WHOLE_MAC
+
+
+def claim_fence_directory(path: Path, record: RunRecord) -> str:
+    saved = saved_mac_repository(record)
+    return saved.fence_directory if isinstance(saved, MacRepositoryIdentity) else path.stem
+
+
 @dataclass(frozen=True)
 class HeldClaim:
     """One claim record and the file that holds it."""
@@ -290,8 +356,10 @@ class HeldClaim:
         """Match the scope from an assignment with the same claim identity."""
         if self.scope == scope:
             return True
-        if isinstance(scope, RepositoryScope) and not scope.key:
-            return self.record.get("repo_name") == scope.name and self.record.get("slot", 0) == scope.slot
+        if isinstance(scope, RepositoryScope) and self.record.get("slot", 0) == scope.slot:
+            if scope.key:
+                return self.record.get("repo_key") == scope.key
+            return self.record.get("repo_name") == scope.name
         return False
 
 
@@ -415,6 +483,11 @@ def read_run(path: Path) -> RunState:
         if type(slot) is not int or slot < 1:
             raise StateReadError(f"{path} has an invalid slot")
         record["slot"] = slot
+    if "mac_repository" in values:
+        saved = mac_repository_record(values["mac_repository"])
+        if saved.claim_file != path.name or saved.key != record.get("repo_key"):
+            raise StateReadError(f"{path} has a mismatched Mac repository identity")
+        record["mac_repository"] = saved.record()
     if "remote_host" not in values:
         return record
     host = values["remote_host"]
@@ -452,21 +525,33 @@ def required_string(values: dict[str, object], key: str, path: Path) -> str:
     return value
 
 
-def target_claim_scope(paths: StatePaths, worktree: str) -> ClaimScope:
-    from scripts.buildlog import repository, store
+def mac_repository_identity(worktree: str) -> MacRepositoryIdentity | WholeMacScope:
+    from scripts.buildlog import repository
 
     common = repository.git_common_dir(worktree)
     if common is None:
         return WHOLE_MAC
+    try:
+        source, origin = repository.mac_source_repository(common)
+        folder = Path(source).parent
+        key = repository.remote_identity(origin, str(folder)) if origin else "git-dir:" + source
+    except (OSError, SubprocessError, ValueError):
+        return WHOLE_MAC
+    if not folder.name:
+        return WHOLE_MAC
+    fence = mac_claim_stem(key, 0)
+    return MacRepositoryIdentity(key, folder.name, f"{fence}.json", fence)
+
+
+def target_claim_scope(paths: StatePaths, worktree: str) -> ClaimScope:
+    from scripts.buildlog import repository, store
+
     if paths.platform == "macos":
-        try:
-            source, origin = repository.mac_source_repository(common)
-            folder = Path(source).parent
-            key = repository.remote_identity(origin, str(folder)) if origin else "git-dir:" + source
-        except (OSError, SubprocessError, ValueError):
-            return WHOLE_MAC
-        name = (key.rsplit("/", 1)[-1] or folder.name) if origin else folder.name
-        return RepositoryScope(".claude" if name == "claude_commands" else name, key) if name else WHOLE_MAC
+        identity = mac_repository_identity(worktree)
+        return RepositoryScope(identity.mirror_name, identity.key) if isinstance(identity, MacRepositoryIdentity) else WHOLE_MAC
+    common = repository.git_common_dir(worktree)
+    if common is None:
+        return WHOLE_MAC
     source = Path(repository.source_git_dir(common))
     name = source.parent.name
     if not name:
@@ -502,7 +587,8 @@ def read_claims(paths: StatePaths) -> tuple[HeldClaim, ...]:
         if paths.platform == "macos" and not key:
             scope: ClaimScope = WHOLE_MAC
         elif "repo_name" in record:
-            scope = RepositoryScope(record["repo_name"], key, record.get("slot", 0))
+            name = (record["mac_repository"]["mirror_name"] if "mac_repository" in record else record["repo_name"])
+            scope = RepositoryScope(name, key, record.get("slot", 0))
         else:
             scope = WHOLE_MAC if path == paths.run else RepositoryScope(path.stem)
         held.append(HeldClaim(scope, path, record))

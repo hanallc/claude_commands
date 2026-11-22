@@ -480,10 +480,12 @@ class LocalVersionPreflightTests(unittest.TestCase):
                     if later_match:
                         _ = (root / "box-tools.json").write_text('{"versions":{"rustc":"rustc 1.99.0"}}')
                         _ = offload.run_offload(controller, config, request, 1)
-                        claim.assert_called_once_with(controller, config, request, HANA, mock.ANY)
+                        claim.assert_called_once_with(controller, config, request, HANA, mock.ANY,
+                                                      mac_repository=claim_state.WHOLE_MAC)
                         self.assertFalse(eligibility.linux_version_decline_path("linux", HANA.name).exists())
                 else:
-                    claim.assert_called_once_with(controller, config, request, HANA, mock.ANY)
+                    claim.assert_called_once_with(controller, config, request, HANA, mock.ANY,
+                                                  mac_repository=claim_state.WHOLE_MAC)
                     self.assertFalse(offload.linux_version_declined_recently("linux", HANA.name, 60, 100))
             scripts_copy.assert_not_called()
             tree_copy.assert_not_called()
@@ -531,8 +533,11 @@ class OffloadSettingsTests(unittest.TestCase):
             result = offload.leased_offload(controller, config, request, HANA, time.monotonic(), False, {1: lease})
             self.assertEqual(offload.write_result(result, offload.ResultFile(result_path)), 75)
 
-        self.assertEqual(claim.call_args_list, [mock.call(controller, config, request, HANA, (1,)),
-            mock.call(controller, config, replace(request, admission=offload.UnclaimedMacRun()), HANA, (1,))])
+        self.assertEqual(claim.call_args_list, [
+            mock.call(controller, config, request, HANA, (1,), mac_repository=claim_state.WHOLE_MAC),
+            mock.call(controller, config, replace(request, admission=offload.UnclaimedMacRun()), HANA, (1,),
+                      mac_repository=claim_state.WHOLE_MAC),
+        ])
         release.assert_called_once_with(controller, request.target)
         self.assertEqual(output.getvalue(), "mac_test: not running on the Mac (state)\n")
         self.assertEqual(errors.getvalue(), fresh_error)
@@ -835,11 +840,12 @@ class OffloadSettingsTests(unittest.TestCase):
     def test_probe_that_cannot_start_reports_its_limit_through_run(self) -> None:
         from scripts.build_queue import admission_protocol as wire, placement
         from scripts.build_queue.admission_test_support import AdmissionFixture
-        from scripts.build_queue import admission_records as records
+        from scripts.build_queue import admission_records as records, admission_service
         from scripts.build_hold.owning_session import NoOwningSession
 
         _ = write_config_fixture(self.settings, "offload=on\nlinux_only.hana=\nprobe_timeout_s=2.5\n", template="mac_test")
-        fixture = self.enterContext(AdmissionFixture(root=self.root))
+        with mock.patch.object(admission_service, "loaded_git_revision", return_value="fixture"):
+            fixture = self.enterContext(AdmissionFixture(root=self.root))
         start = records.process_start_time(os.getpid())
         assert start is not None
         local = fixture.request(owner=wire.Owner(os.getpid(), start))
@@ -871,7 +877,8 @@ class OffloadSettingsTests(unittest.TestCase):
         with mock.patch.object(sys, "argv", ["offload.py", "run", "--repo-root", str(self.root),
                                              "--package", "hana", "--call-id", "probe-start", "--result", str(destination),
                                              "--assignment-file", str(assignment_file)]), \
-             mock.patch.object(eligibility, "repository_identity", return_value=eligibility.KnownRepository("hana")), \
+             mock.patch.object(claim_state, "mac_repository_identity", return_value=claim_state.MacRepositoryIdentity(
+                 "fixture-hana", "hana", "hana.json", "hana")), \
              mock.patch.object(offload.ProcessController, "complete_claim", autospec=True, side_effect=complete_claim), \
              mock.patch.object(offload.ProcessController, "capture", side_effect=responses) as capture, \
              redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors:
@@ -892,8 +899,8 @@ class OffloadSettingsTests(unittest.TestCase):
         for package, reason in expected.items():
             with self.subTest(package=package):
                 request = offload.OffloadRequest(self.root, package, "cargo-liner", offload.NO_RESULT_FILE, (), owner="verify", holder_session="fixture-session")
-                with mock.patch.object(eligibility, "repository_identity",
-                                       return_value=eligibility.KnownRepository("cargo-liner")):
+                with mock.patch.object(claim_state, "mac_repository_identity", return_value=claim_state.MacRepositoryIdentity(
+                        "fixture-cargo-liner", "cargo-liner", "cargo-liner.json", "cargo-liner")):
                     result = offload.run_offload(offload.ProcessController(), config, request, time.monotonic())
                 self.assertEqual(result.reason if isinstance(result, offload.DeclinedMacRun) else result, reason)
 

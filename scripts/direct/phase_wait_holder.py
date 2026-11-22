@@ -93,19 +93,27 @@ def hold_owner(hold_name: str) -> tuple[str, str]:
     return "--holder-session", session
 
 
-def mac_owner(resource: str, repository: str) -> str:
-    """Name another session whose live Mac claim overlaps this repository."""
+def mac_owner(resource: str, repository: str) -> tuple[str, str]:
+    """Name the holder or the kept claim that blocks this repository."""
     from scripts.mac_test import mac_test
 
     paths = mac_test.state_paths("" if resource == "mac" else resource)
     scope = mac_test.target_claim_scope(paths, repository)
     session = os.environ.get("CODEX_THREAD_ID") or os.environ.get("CLAUDE_CODE_SESSION_ID", "")
+    kept = ""
     for claim in mac_test.read_claims(paths):
-        if mac_test.claim_blocks_scope(paths, claim, scope) and mac_test.run_holds_work(claim.record):
+        if mac_test.claim_blocks_scope(paths, claim, scope):
+            if paths.platform == "macos" and (mac_test.run_is_kept(claim.record) or claim.record.get("cleanup_pending")):
+                kept = kept or (text(claim.record["what"]) + " (kept for cleanup)")
+                continue
+            if not mac_test.run_holds_work(claim.record):
+                continue
             candidate = text(claim.record.get("holder_session"))
             if candidate and candidate != session:
-                return candidate
-    return ""
+                return "--holder-session", candidate
+    if kept:
+        return "--holder-unit", kept
+    return "--holder-session", ""
 
 
 def main() -> None:
@@ -119,7 +127,7 @@ def main() -> None:
         owner_flag, owner = hold_owner(hold_name)
     elif kind in ("mac", "target"):
         resource = payload or "mac"
-        owner = mac_owner(resource, repository)
+        owner_flag, owner = mac_owner(resource, repository)
     elif kind == "provider":
         diagnostic = fields(payload)
         print(text(diagnostic.get("target")))

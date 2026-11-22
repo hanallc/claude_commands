@@ -479,7 +479,16 @@ def fixed_remote_candidates(
             return (placement.PlacementCandidate(destination, policy, settings),)
 
         paths = claim_state.state_paths(target.name)
-        scope = claim_state.target_claim_scope(paths, str(repo_root))
+        if paths.platform == "macos":
+            identity = claim_state.mac_repository_identity(str(repo_root))
+            if isinstance(identity, claim_state.MacRepositoryIdentity):
+                scope = claim_state.RepositoryScope(identity.mirror_name, identity.key)
+                repository = eligibility.KnownRepository(identity.mirror_name, identity.key)
+            else:
+                scope = claim_state.WHOLE_MAC
+                repository = eligibility.UNKNOWN_REPOSITORY
+        else:
+            scope = claim_state.target_claim_scope(paths, str(repo_root))
         host = eligibility.SshProbeSettings(configuration).host
         if isinstance(rule, NatedevOnly):
             policy = placement.FixedExclusion(rule.reason)
@@ -635,11 +644,18 @@ def command_recover_probe(args: CliArguments) -> int:
         config = ssh_target_config(target)
         if isinstance(config, ExcludedTarget):
             return 0
-        repository = eligibility.repository_identity(Path(args.repo_root))
+        mac_repository: claim_state.MacRepositoryIdentity | claim_state.WholeMacScope = claim_state.WHOLE_MAC
+        if target.platform == "macos":
+            mac_repository = claim_state.mac_repository_identity(args.repo_root)
+            if isinstance(mac_repository, claim_state.WholeMacScope):
+                return 0
+            repository = eligibility.KnownRepository(mac_repository.mirror_name, mac_repository.key)
+        else:
+            repository = eligibility.repository_identity(Path(args.repo_root))
         if isinstance(repository, eligibility.UnknownRepository):
             return 0
         paths = mac_test.state_paths(target.name)
-        if mac_test.free_now(paths, target.settings, Path(args.repo_root)) != "bad":
+        if mac_test.free_now(paths, target.settings, Path(args.repo_root), mac_repository=mac_repository) != "bad":
             return 0
         request = offload.OffloadRequest(
             Path(args.repo_root), args.package, f"probe-{os.getpid()}", offload.NoResultFile(), (),
@@ -661,10 +677,16 @@ def command_recover_probe(args: CliArguments) -> int:
                         slots.append(slot)
                     if not slots:
                         return 0
-                    claim = offload.claim_for_run(controller, config, request, repository, tuple(slots))
+                    claim = offload.claim_for_run(controller, config, request, repository, tuple(slots),
+                                                  mac_repository=mac_repository)
                     if not isinstance(claim, offload.FreshMacClaim):
                         return 0
                     try:
+                        saved = controller.mac_repository
+                        if isinstance(saved, claim_state.MacRepositoryIdentity):
+                            if saved.mirror_name != repository.name:
+                                return 0
+                            repository = eligibility.KnownRepository(saved.mirror_name, saved.key)
                         if not offload.copy_tracked_scripts(controller, config):
                             return 0
                         selected = replace(request, slot=claim.slot)
@@ -920,14 +942,16 @@ def cleanup_refused_claims(target: SshTarget, args: CliArguments, *, session: Su
 
     paths = mac_test.state_paths(target.name)
     scope = mac_test.target_claim_scope(paths, args.repo_root)
-    if not isinstance(scope, mac_test.RepositoryScope):
+    if paths.platform == "linux" and not isinstance(scope, mac_test.RepositoryScope):
         return
     start = process_identity.process_start(args.pid)
     if not isinstance(start, process_identity.Started):
         return
+    worktree = Path(args.repo_root).resolve()
     with mac_test.locked(paths.lock):
         claims = tuple(claim for claim in mac_test.read_claims(paths)
-                       if mac_test.claim_scope_matches(paths, claim, scope) and "remote_host" in claim.record
+                       if mac_test.cleanup_claim_matches(paths, claim, scope, worktree)
+                       and "remote_host" in claim.record
                        and (mac_test.run_is_kept(claim.record)
                             or (claim.record.get("cleanup_pending") and claim.record["pid"] == args.pid
                                 and claim.record["proc_start"] == start.start)))
@@ -948,9 +972,17 @@ def cleanup_refused_claims(target: SshTarget, args: CliArguments, *, session: Su
             if not isinstance(attempt, mac_test.ClaimFinished) or attempt.status != 13:
                 continue
         try:
-            cleanup_scope = claim.scope if isinstance(claim.scope, claim_state.RepositoryScope) else scope
-            checked = offload.check_leftovers(config, claim.record["remote_host"],
-                                              eligibility.KnownRepository(cleanup_scope.name, cleanup_scope.key), target.name,
+            mirror: offload.MirrorScope = offload.ALL_MIRRORS
+            if paths.platform == "macos":
+                saved = claim_state.saved_mac_repository(claim.record)
+                if isinstance(saved, claim_state.MacRepositoryIdentity):
+                    mirror = eligibility.KnownRepository(saved.mirror_name, saved.key)
+            else:
+                cleanup_scope = claim.scope if isinstance(claim.scope, claim_state.RepositoryScope) else scope
+                if not isinstance(cleanup_scope, claim_state.RepositoryScope):
+                    continue
+                mirror = eligibility.KnownRepository(cleanup_scope.name, cleanup_scope.key)
+            checked = offload.check_leftovers(config, claim.record["remote_host"], mirror, target.name,
                                               claim.record.get("slot", 1))
         except conf.Unusable as error:
             print(f"build targets: {target.name}: cleanup settings unavailable: {error}", file=sys.stderr)
@@ -1109,8 +1141,9 @@ def command_reserve(args: CliArguments) -> int:
             return 0
         if args.recover_only:
             scope = mac_test.target_claim_scope(paths, args.repo_root)
+            worktree = Path(args.repo_root).resolve()
             with mac_test.locked(paths.lock):
-                retained = any(mac_test.claim_scope_matches(paths, claim, scope)
+                retained = any(mac_test.cleanup_claim_matches(paths, claim, scope, worktree)
                                and mac_test.run_is_kept(claim.record)
                                for claim in mac_test.read_claims(paths))
             if not retained:

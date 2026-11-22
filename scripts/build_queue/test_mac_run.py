@@ -3,10 +3,11 @@ from contextlib import ExitStack, redirect_stdout
 from io import StringIO
 import os
 from pathlib import Path
+import shlex
 import subprocess
 import tempfile
 import time
-from typing import final, override
+from typing import cast, final, override
 import unittest
 from unittest import mock
 
@@ -80,7 +81,7 @@ class MacRunTests(unittest.TestCase):
         with ExitStack() as guest:
             _ = guest.enter_context(mac_run.held(self.checkout, "mac", SuiteMode.GATE, StepJob("test-all")))
             claim, = claim_state.read_claims(self.paths)
-            self.assertEqual(claim.scope, claim_state.RepositoryScope(".claude", REPOSITORY_KEY, 1))
+            self.assertEqual(claim.scope, claim_state.RepositoryScope("checkout", REPOSITORY_KEY, 1))
             self.assertEqual(claim.record["what"], "mac-linux test-all")
             self.assertEqual(claim.record["worktree"], str(self.checkout))
             with self.assertRaisesRegex(mac_run.MacRunRefused, "busy with mac-linux test-all"):
@@ -121,7 +122,7 @@ class MacRunTests(unittest.TestCase):
         self.addCleanup(mac_test.command_release, native, self.paths)
 
         self.assertEqual(claim_state.target_claim_scope(self.paths, str(self.checkout)),
-                         claim_state.RepositoryScope(".claude", REPOSITORY_KEY))
+                         claim_state.RepositoryScope("checkout", REPOSITORY_KEY))
         settings = self.root / "mac_test.conf"
         self.assertEqual(mac_test.free_now(self.paths, settings, self.checkout, mac_kind=mac_test.MacClaimKind.GUEST),
                          "busy")
@@ -200,24 +201,172 @@ class MacRunTests(unittest.TestCase):
         waiting = self.native_claim(self.checkout)
         waiting.remote = "fixture-mac"
         with mock.patch.dict(os.environ, {"CODEX_THREAD_ID": "waiting-owner"}):
-            self.assertEqual(phase_wait_holder.mac_owner("mac", str(self.checkout)), "old-owner")
+            self.assertEqual(phase_wait_holder.mac_owner("mac", str(self.checkout)), ("--holder-session", "old-owner"))
         mac_test.write_json(held.path, {**held.record, "proc_start": "ended", "worktree": "/missing/checkout"})
 
         self.assertEqual(mac_test.command_claim(waiting, self.paths, watch_claim=False), 13)
         kept, = claim_state.read_claims(self.paths)
         self.assertEqual(kept.record.get("repo_key"), REPOSITORY_KEY)
         self.assertEqual(claim_state.claim_identity(kept.record), claim_state.claim_identity(held.record))
-        alias = kept.path.with_name("old-checkout.json")
-        _ = kept.path.rename(alias)
-        mac_test.write_json(alias, {**kept.record, "repo_name": "old-checkout"})
         with mock.patch.object(eligibility, "read_connection_settings"), \
                 mock.patch.object(offload, "check_leftovers", return_value=offload.LeftoversEnded()) as check:
             args = build_targets.CliArguments()
             args.pid, args.repo_root = waiting.pid, str(self.checkout)
             target = target_config.SshTarget("mac", "macos", self.root / "mac_test.conf")
             build_targets.cleanup_refused_claims(target, args, session=NoOwningSession())
-        self.assertEqual(check.call_args.args[2], eligibility.KnownRepository("old-checkout", REPOSITORY_KEY))
+        self.assertEqual(check.call_args.args[2], eligibility.KnownRepository(".claude", REPOSITORY_KEY))
         self.assertEqual(claim_state.read_claims(self.paths), ())
+
+    def test_refused_claim_cleanup_uses_the_mirror_that_ran(self) -> None:
+        config = self.root / "mac_test.conf"
+        mirror_root = ".local/state/mac-test/test-mirror"
+        with config.open("a") as settings:
+            _ = settings.write(f"mirror_root=~/{mirror_root}\n")
+        old = self.native_claim(self.checkout)
+        old.remote = "fixture-mac"
+        self.assertEqual(mac_test.command_claim(old, self.paths, watch_claim=False), 0)
+        held, = claim_state.read_claims(self.paths)
+        saved = claim_state.saved_mac_repository(held.record)
+        assert isinstance(saved, claim_state.MacRepositoryIdentity)
+        self.assertEqual(saved.mirror_name, "checkout")
+        mac_test.write_json(held.path, {**held.record, "proc_start": "ended"})
+        ran = self.root / offload.remote_mirror(eligibility.KnownRepository(saved.mirror_name, saved.key))
+        other = self.root / mirror_root / ".claude"
+        ran.mkdir(parents=True)
+        other.mkdir()
+        marker = self.root / "ended"
+        owner = self.native_claim(self.repo)
+
+        def local_ssh(_settings: eligibility.SshConnectionSettings, host: str,
+                      script: str, target: str) -> offload.LeftoverObservation:
+            self.assertEqual((host, target), ("fixture-mac", "mac"))
+            fixture = (
+                "pgrep() { return 1; }\n"
+                + f"lsof() {{ if [ ! -e {shlex.quote(str(marker))} ]; then "
+                + f"printf 'p41\\nn%s\\n' {shlex.quote(str(ran))}; fi; "
+                + f"printf 'p42\\nn%s\\n' {shlex.quote(str(other))}; }}\n"
+                + f"kill() {{ [ \"$1\" = 41 ] && touch {shlex.quote(str(marker))}; }}\n"
+                + "sleep() { :; }\n"
+            )
+            result = subprocess.run(["bash", "-c", fixture + script], check=True, capture_output=True,
+                                    text=True, timeout=5)
+            return offload.LeftoverObservation(offload.parse_leftover_check(result.stdout), result.stdout)
+
+        with mock.patch.object(eligibility, "read_connection_settings", return_value=eligibility.SshConnectionSettings(
+                "replacement-mac", 1, 1)), mock.patch.object(offload, "read_leftovers", side_effect=local_ssh):
+            args = build_targets.CliArguments()
+            args.pid, args.repo_root = owner.pid, str(self.repo)
+            build_targets.cleanup_refused_claims(target_config.SshTarget("mac", "macos", config), args,
+                                               session=NoOwningSession())
+        self.assertTrue(marker.exists())
+        self.assertEqual(claim_state.read_claims(self.paths), ())
+
+    def test_mac_local_origins_follow_the_upstream_repository(self) -> None:
+        source = claim_state.mac_repository_identity(str(self.repo))
+        assert isinstance(source, claim_state.MacRepositoryIdentity)
+        self.assertEqual(source.key, REPOSITORY_KEY)
+        for origin in (str(self.repo), "../.claude"):
+            with self.subTest(origin=origin):
+                _ = subprocess.run(["git", "-C", str(self.checkout), "remote", "set-url", "origin", origin], check=True)
+                self.assertEqual(claim_state.mac_repository_identity(str(self.checkout)), source)
+        native = self.native_claim(self.repo)
+        self.assertEqual(mac_test.command_claim(native, self.paths, watch_claim=False), 0)
+        self.addCleanup(mac_test.command_release, native, self.paths)
+        with self.assertRaises(mac_run.MacRunRefused), mac_run.held(
+                self.checkout, "mac", SuiteMode.GATE, GATE_JOB_NOT_RECORDED):
+            self.fail("The clone exceeded the repository limit")
+
+    def test_separate_origins_with_one_base_name_get_separate_claim_files(self) -> None:
+        for team in ("team-a", "team-b"):
+            repo = self.repository(team)
+            _ = subprocess.run(["git", "-C", str(repo), "remote", "add", "origin",
+                                f"https://example.invalid/{team}/project.git"], check=True)
+            args = self.native_claim(repo)
+            self.assertEqual(mac_test.command_claim(args, self.paths, watch_claim=False), 0)
+            self.addCleanup(mac_test.command_release, args, self.paths)
+        claims = claim_state.read_claims(self.paths)
+        self.assertEqual(len({claim.path for claim in claims}), 2)
+        self.assertTrue(all(claim.record.get("repo_key", "").endswith("/project") for claim in claims))
+        self.assertEqual({claim.record["mac_repository"]["mirror_name"] for claim in claims
+                          if "mac_repository" in claim.record}, {"team-a", "team-b"})
+
+    def test_legacy_kept_claim_accepts_exact_recovery_after_blocking_other_work(self) -> None:
+        start = process_identity.process_start(os.getpid())
+        assert isinstance(start, process_identity.Started)
+        path = self.paths.claims / "checkout.json"
+        path.parent.mkdir(parents=True)
+        mac_test.write_json(path, {"pid": os.getpid(), "proc_start": "ended", "what": "old check",
+            "worktree": str(self.checkout), "since": "2026-11-21T10:00:00+00:00",
+            "claim_id": "old", "episode": "old-episode", "attempt": "old-attempt", "submitting_session": "",
+            "remote_host": "fixture-mac", "repo_name": "checkout"})
+        other = self.native_claim(self.repo)
+        other.remote = "fixture-mac"
+        self.assertEqual(mac_test.command_claim(other, self.paths, watch_claim=False), 11)
+        self.assertEqual(phase_wait_holder.mac_owner("mac", str(self.repo)),
+                         ("--holder-unit", "old check (kept for cleanup)"))
+        waiting = self.native_claim(self.checkout)
+        self.assertEqual(mac_test.command_claim(waiting, self.paths, watch_claim=False), 13)
+        saved, = claim_state.read_claims(self.paths)
+        self.assertEqual(saved.path, path)
+        self.assertEqual(saved.scope, claim_state.WHOLE_MAC)
+        self.assertEqual(saved.record["proc_start"], start.start)
+        self.assertEqual(saved.record["claim_id"], "old")
+        runner = self.native_claim(self.checkout)
+        runner.remote, runner.from_pid = "fixture-mac", waiting.pid
+        runner.claim_id, runner.episode, runner.attempt = "old", "old-episode", "old-attempt"
+        with mock.patch.object(repository, "mac_source_repository", side_effect=AssertionError("No Git on handoff")):
+            self.assertEqual(mac_test.command_claim(runner, self.paths, watch_claim=False), 13)
+        self.assertEqual(mac_test.command_release(runner, self.paths), 0)
+
+    def test_offload_adoption_uses_the_reservation_file_for_its_fence(self) -> None:
+        saved = claim_state.mac_repository_identity(str(self.checkout))
+        assert isinstance(saved, claim_state.MacRepositoryIdentity)
+        waiting = self.native_claim(self.checkout)
+        self.assertEqual(mac_test.command_claim(waiting, self.paths, watch_claim=False), 0)
+        reserved, = claim_state.read_claims(self.paths)
+        legacy = reserved.path.with_name("checkout.json")
+        record = reserved.record.copy()
+        _ = record.pop("mac_repository")
+        mac_test.write_json(legacy, record)
+        reserved.path.unlink()
+        identity = claim_state.claim_identity(record)
+        request = offload.OffloadRequest(self.checkout, "hana", "test", offload.NO_RESULT_FILE, (),
+            "verify", "", target="mac", admission=offload.MacClaimFromWait(waiting.pid, identity, NoOwningSession()))
+        config = eligibility.OffloadConfig(True, eligibility.SshConnectionSettings("fixture-mac", 1, 1),
+                                           1, 1, 1, "1", {})
+        controller = offload.ProcessController()
+
+        def claim_child(command: list[str], **_options: object) -> mock.Mock:
+            args = mac_test.parser().parse_args(command[2:], namespace=mac_test.CliArguments())
+            output = StringIO()
+            with redirect_stdout(output):
+                status = mac_test.command_claim(args, self.paths, watch_claim=False)
+            return mock.Mock(returncode=status, communicate=mock.Mock(return_value=(output.getvalue(), "")),
+                             poll=mock.Mock(return_value=status))
+
+        self.addCleanup(mac_test.command_release, waiting, self.paths)
+        with mock.patch.object(subprocess, "Popen", side_effect=claim_child), \
+                mock.patch.object(repository, "mac_source_repository", side_effect=AssertionError("No second lookup")):
+            answer = offload.claim_for_run(controller, config, request,
+                eligibility.KnownRepository("checkout", saved.key), (1,), mac_repository=saved)
+        self.assertIsInstance(answer, offload.FreshMacClaim)
+        held, = claim_state.read_claims(self.paths)
+        self.assertEqual(held.path, legacy)
+        self.assertEqual(controller.claim_scope_key, legacy.stem)
+        self.assertEqual(controller.mac_repository, claim_state.saved_mac_repository(held.record))
+        self.assertEqual(offload.start_fence_relative(identity, "mac",
+                         scope_key=controller.claim_scope_key).parent.name, "checkout")
+        pending = offload.pending_start_path("mac", identity)
+        pending.parent.mkdir()
+        pending.touch()
+        settled = offload.LeftoverObservation(offload.LeftoversEnded(),
+            "dispatch_start_settled=" + offload.pending_start_key(identity))
+        with mock.patch.object(eligibility, "read_connection_settings"), \
+                mock.patch.object(offload, "read_leftovers", return_value=settled) as cleanup:
+            self.assertEqual(mac_test.command_release(waiting, self.paths), 0)
+        self.assertIn(offload.start_fence_command(identity, "mac", settle=True, scope_key=legacy.stem),
+                      cast(str, cleanup.call_args.args[2]))
+        self.assertFalse(pending.exists())
 
     def test_guest_probe_and_claim_share_the_scope_without_an_origin(self) -> None:
         _ = subprocess.run(["git", "-C", str(self.checkout), "remote", "remove", "origin"], check=True)
@@ -265,10 +414,10 @@ class MacRunTests(unittest.TestCase):
                 _ = claims.enter_context(mac_run.held(self.checkout, "mac", SuiteMode.GATE, GATE_JOB_NOT_RECORDED))
                 if first == "guest":
                     guest, = claim_state.read_claims(self.paths)
-                    self.assertEqual(guest.scope, claim_state.RepositoryScope(".claude", REPOSITORY_KEY, 2))
+                    self.assertEqual(guest.scope, claim_state.RepositoryScope("checkout", REPOSITORY_KEY, 2))
                     start_native()
                 self.assertEqual({claim.scope for claim in claim_state.read_claims(self.paths)},
-                                 {scope, claim_state.RepositoryScope(".claude", REPOSITORY_KEY, 2)})
+                                 {scope, claim_state.RepositoryScope("checkout", REPOSITORY_KEY, 2)})
                 with self.assertRaises(mac_run.MacRunRefused):
                     with mac_run.held(self.checkout, "mac", SuiteMode.GATE, GATE_JOB_NOT_RECORDED):
                         self.fail("A third run exceeded the configured limit")
@@ -283,7 +432,7 @@ class MacRunTests(unittest.TestCase):
                 for guest in guests:
                     _ = guest.enter_context(mac_run.held(self.checkout, "mac", SuiteMode.GATE, GATE_JOB_NOT_RECORDED))
                 self.assertEqual({claim.scope for claim in claim_state.read_claims(self.paths)},
-                                 {claim_state.RepositoryScope(".claude", REPOSITORY_KEY, slot) for slot in (1, 2)})
+                                 {claim_state.RepositoryScope("checkout", REPOSITORY_KEY, slot) for slot in (1, 2)})
                 native = self.native_claim(self.checkout)
                 self.assertEqual(mac_test.free_now(self.paths, settings, self.checkout), "busy")
                 self.assertEqual(mac_test.command_claim(native, self.paths, watch_claim=False), 11)
@@ -328,7 +477,11 @@ class MacRunTests(unittest.TestCase):
         with mac_run.held(self.repository("hana"), "mac", SuiteMode.GATE, GATE_JOB_NOT_RECORDED):
             claim, = claim_state.read_claims(self.paths)
             legacy = claim.path.with_name("hana.slot-2.json")
-            _ = claim.path.rename(legacy)
+            record = claim.record.copy()
+            _ = record.pop("mac_repository")
+            _ = record.pop("repo_key")
+            mac_test.write_json(legacy, record)
+            claim.path.unlink()
             original_data = legacy.read_bytes()
             self.assertEqual(mac_test.command_claim(other, self.paths, watch_claim=False), 11)
             self.assertEqual(mac_test.free_now(self.paths, self.root / "mac_test.conf", Path(other.worktree)), "busy")

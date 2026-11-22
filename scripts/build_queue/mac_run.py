@@ -26,9 +26,10 @@ def held(repo: Path, target: str, work: SuiteMode | StepJob,
     if paths.platform != "macos":
         raise MacRunRefused(f"{target} is not a Mac claim target")
     worktree = str(repo.resolve())
-    scope = claim_state.target_claim_scope(paths, worktree)
-    if not isinstance(scope, claim_state.RepositoryScope):
+    repository = claim_state.mac_repository_identity(worktree)
+    if not isinstance(repository, claim_state.MacRepositoryIdentity):
         raise MacRunRefused(f"{repo} has no repository for the Mac claim")
+    scope = claim_state.RepositoryScope(repository.mirror_name, repository.key)
     if isinstance(work, StepJob):
         step = work.step
     else:
@@ -45,7 +46,7 @@ def held(repo: Path, target: str, work: SuiteMode | StepJob,
         try:
             with cancellation.defer_cleanup_signals(), claim_state.locked(paths.lock):
                 attempt = mac_test.claim_once(args, paths, scope, session=session,
-                                              mac_kind=mac_test.MacClaimKind.GUEST)
+                                              mac_kind=mac_test.MacClaimKind.GUEST, mac_repository=repository)
                 acquired = isinstance(attempt, mac_test.ClaimFinished) and attempt.status == 0
         except (OSError, ValueError) as error:
             raise MacRunRefused(str(error)) from error
