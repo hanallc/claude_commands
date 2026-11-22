@@ -982,6 +982,47 @@ class WorkerCommandTests(unittest.TestCase):
         self.assertEqual(len(self.fixture.world.launches), launches)
         resume.assert_not_called()
 
+    def test_claude_launcher_requires_conversational_assignment_evidence(self) -> None:
+        from scripts.direct import claude_worker
+
+        config = self.fixture.root / "conf" / "direct.conf"
+        with config.open("a", encoding="utf-8") as stream:
+            _ = stream.write("\n# whole: 1..300\nCLAUDE_WORKER_REGISTER_WAIT_SECS=1\n")
+        row = self.fixture.worker("claude-retry", family="claude")
+        turn = claude_worker.ClaudeTurn(row.name, self.run_dir, self.fixture.root, self.prompt, self.reply,
+            self.run_dir / "claude.log", "", "", "", str(row.id), False, {**os.environ, "CLAUDE_BIN": "/fixture/claude"})
+        allowed = worker_admission.admit(row.name, self.run_dir, reference=str(row.id))
+        request = worker_admission.assignment_id(self.prompt)
+        worker_admission.record_dispatch(allowed, request, worker_admission.SwitchState.DISPATCH_IN_FLIGHT)
+        source = worker_admission.transcript_source(row, staff.ClaudeBackend())
+        entry = {"type": "user", "isMeta": True, "message": {"role": "user", "content": self.prompt.read_text()}}
+        atomic_file.write_text_atomic(source, json.dumps(entry) + "\n")
+
+        with (patch.object(claude_worker, "_deliver") as deliver, patch.object(claude_worker, "_start") as start,
+              redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO())):
+            self.assertIsInstance(claude_worker.open_worker(turn), claude_worker.Delivered)
+            deliver.assert_called_once()
+            self.assertEqual(deliver.call_args.args[1], row.current_session)
+            self.assertIs(worker_admission.dispatch_record(self.run_dir, row.name).state,
+                          worker_admission.SwitchState.ASSIGNMENT_ACCEPTED)
+
+            entry["isMeta"] = False
+            with source.open("a", encoding="utf-8") as stream:
+                _ = stream.write(json.dumps(entry) + "\n")
+            worker_admission.record_dispatch(allowed, request, worker_admission.SwitchState.DISPATCH_IN_FLIGHT)
+            deliver.reset_mock()
+            self.assertIsInstance(claude_worker.open_worker(turn), claude_worker.Unchanged)
+            deliver.assert_not_called()
+            start.assert_not_called()
+        self.assertIs(worker_admission.dispatch_record(self.run_dir, row.name).state,
+                      worker_admission.SwitchState.ASSIGNMENT_ACCEPTED)
+
+    def test_restart_plain_report_directs_inspection_of_an_unresolved_worker(self) -> None:
+        self.check_restore_parked_account("legacy result without the prompt", retry="plain report")
+
+    def test_restart_bulk_report_directs_inspection_of_an_unresolved_worker(self) -> None:
+        self.check_restore_parked_account("legacy result without the prompt", retry="bulk report")
+
     def test_restore_keeps_an_accepted_result_for_director_review(self) -> None:
         cases = ("retained working", "retained idle", "retained stopped", "retained closed",
                  "cleared idle", "cleared stopped", "cleared closed", "creation crash",
@@ -996,7 +1037,7 @@ class WorkerCommandTests(unittest.TestCase):
                     _ = case.doCleanups()
 
     def check_result_review(self, row: staff.StaffRow, pane: str, prior_park: dict[str, object],
-                            evidence: str) -> None:
+                            evidence: str, *, report_format: Literal["plain report", "bulk report", "none"] = "none") -> None:
         from scripts.agents import restart, shutdown_record
 
         original_park = progress_history.record_worker_park
@@ -1009,7 +1050,23 @@ class WorkerCommandTests(unittest.TestCase):
         if parked:
             self.assertTrue(original_park(self.run_dir, row.id, instance, deliver.completion_id, launch=saved_launch))
         expects_working = evidence in ("retained working", "changed during clearance")
-        if evidence.endswith("closed") or evidence == "creation crash":
+        if evidence == "creation crash":
+            backend = staff.backend(row)
+            assert isinstance(backend, staff.CodexBackend)
+            source = worker_admission.transcript_source(row, backend)
+            transcript = source.read_bytes()
+            self.fixture.world.remove_pane(pane)
+            replacement = "w1:p99"
+            with patch.dict(os.environ, {"CODEX_HOME": str(backend.codex_home)}):
+                self.fixture.world.add(row, replacement, family="codex")
+            record = staff.snapshot()
+            observed = worker_panes.observe_worker(self.fixture.parent.id, row, record)
+            assert isinstance(observed, worker_panes.OpenWorker)
+            self.assertNotEqual(observed.pane, pane)
+            self.assertEqual(observed.pane, replacement)
+            self.assertEqual(observed.row.current_session, row.current_session)
+            self.assertEqual(worker_admission.transcript_source(observed.row, backend).read_bytes(), transcript)
+        elif evidence.endswith("closed"):
             self.fixture.world.remove_pane(pane)
         elif evidence.endswith("stopped"):
             _ = self.fixture.world.stop(row, self.fixture.world)
@@ -1075,6 +1132,24 @@ class WorkerCommandTests(unittest.TestCase):
                     results = restart.WorkerRestoreReports({owner.id: (owner, report)})
                     self.assertNotIn(row.id, results.resolved(owner.id))
                     self.assertEqual(shutdown_record.read(), restart_entry)
+                    if evidence == "creation crash":
+                        self.assertIn("result delivery is uncertain", report.failures[row.id][1])
+                    if _attempt == 0 and report_format != "none":
+                        with redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors:
+                            if report_format == "bulk report":
+                                def report_bulk() -> int:
+                                    results.report()
+                                    return 0
+
+                                self.assertEqual(restart.run_command(report_bulk, restart.BulkCommand()), 0)
+                                self.assertIn("The affected directors inspect the workers.", output.getvalue())
+                                message = output.getvalue()
+                            else:
+                                results.report()
+                                message = errors.getvalue()
+                        self.assertIn("The director must inspect the worker.", message)
+                        self.assertNotIn("worker.py restore", message)
+                        self.assertEqual(shutdown_record.read(), restart_entry)
         self.assertEqual(sent, [])
         self.assertEqual(self.fixture.world.launches[before:], [])
 
@@ -1246,6 +1321,9 @@ class WorkerCommandTests(unittest.TestCase):
                 if retry.startswith("review "):
                     self.check_result_review(self.agent.row(reopened), reopened, parked_before,
                                              retry.removeprefix("review "))
+                elif retry in ("plain report", "bulk report"):
+                    self.check_result_review(self.agent.row(reopened), reopened, parked_before, "retained idle",
+                                             report_format=retry)
                 else:
                     self.check_saved_result_restore(self.agent.row(reopened), reopened, active, path, retry)
 

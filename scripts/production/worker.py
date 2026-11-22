@@ -411,18 +411,17 @@ def _read_transcript(entries: Iterable[str | dict[str, object] | worker_admissio
                 continue
             timestamp = None
             if isinstance(entry, dict):
-                if entry.get("isMeta") is True:
-                    continue
-                if rollouts.is_compaction(cast(rollouts.RolloutRecordJson, cast(object, entry))):
-                    for state in states:
-                        state.compacted()
-                    continue
-                timestamp = entry.get("timestamp")
                 fields = entry
+                timestamp = fields.get("timestamp")
                 entry = worker_admission.transcript_entry(fields, set())
-                if not entry and isinstance(cursor, TranscriptCursor) and _transcript_turn_boundary(fields):
-                    for state in states:
-                        state.turn_ended(cursor)
+                if fields.get("isMeta") is not True:
+                    if rollouts.is_compaction(cast(rollouts.RolloutRecordJson, cast(object, fields))):
+                        for state in states:
+                            state.compacted()
+                        continue
+                    if not entry and isinstance(cursor, TranscriptCursor) and _transcript_turn_boundary(fields):
+                        for state in states:
+                            state.turn_ended(cursor)
             if not entry.startswith(("user:\n", "assistant:\n")):
                 continue
             if entry.startswith("user:\n"):
@@ -2621,6 +2620,11 @@ def clear_result_park(row: staff.StaffRow, park: worker_panes.ParkWaitingPass) -
             and not progress_history.parked_worker_pass(current))
 
 
+class RestoreFailureAction(Enum):
+    RETRY = "retry restore"
+    INSPECT_WORKER = "The director must inspect the worker."
+
+
 @dataclass
 class RestoreReport:
     restored: set[StaffId] = field(default_factory=set)
@@ -2629,6 +2633,7 @@ class RestoreReport:
     run_failures: dict[Path, str] = field(default_factory=dict)
     skipped: dict[StaffId, str] = field(default_factory=dict)
     record_busy: set[StaffId] = field(default_factory=set)
+    failure_actions: dict[StaffId, RestoreFailureAction] = field(default_factory=dict)
 
 
 @herdr.process_action()
@@ -2682,11 +2687,16 @@ def restore(parent: StaffId, *, record: staff.StaffSnapshot | None = None,
                           CompletionRecovery.WAITING_ON_REPLY)
 
     def failed(row: staff.StaffRow, reason: str, code: ExitCode = ExitCode.UNCERTAIN, *,
-               notice: str = "") -> None:
+               notice: str = "", action: RestoreFailureAction = RestoreFailureAction.RETRY) -> None:
         nonlocal outcome
         outcome = code
+        if action is RestoreFailureAction.INSPECT_WORKER:
+            reason = f"{reason.rstrip('.')}. {action.value}"
         if report is not None:
             report.failures[row.id] = row.name, reason
+            report.failure_actions[row.id] = action
+        elif action is RestoreFailureAction.INSPECT_WORKER:
+            print(f"{row.name}: {reason}", file=sys.stderr)
         elif notice:
             print(notice, file=sys.stderr)
 
@@ -2736,7 +2746,7 @@ def restore(parent: StaffId, *, record: staff.StaffSnapshot | None = None,
                         continue
                     evidence = detached_runs.restore_result_evidence(run, state, passed, current_record)
                     if isinstance(evidence, detached_runs.UncertainResultDelivery):
-                        failed(state.row, evidence.reason, notice=f"anomaly: {name}: {evidence.reason}")
+                        failed(state.row, evidence.reason, action=RestoreFailureAction.INSPECT_WORKER)
                         continue
                     if (isinstance(evidence, detached_runs.WorkerResultReceipt)
                             and not _accepted_result_assignment(state.row, passed, evidence)):
@@ -2774,7 +2784,7 @@ def restore(parent: StaffId, *, record: staff.StaffSnapshot | None = None,
                         passed = worker_panes.worker_pass(current, run, record=current_record)
                         fresh_evidence = detached_runs.restore_result_evidence(run, state, passed, current_record)
                         if isinstance(fresh_evidence, detached_runs.UncertainResultDelivery):
-                            failed(state.row, fresh_evidence.reason, notice=f"anomaly: {name}: {fresh_evidence.reason}")
+                            failed(state.row, fresh_evidence.reason, action=RestoreFailureAction.INSPECT_WORKER)
                             continue
                         if (fresh_evidence != evidence or not isinstance(evidence.assignment, detached_runs.ResultSubmissionPass)
                                 or not _accepted_result_assignment(state.row, passed, evidence)):
@@ -2782,8 +2792,7 @@ def restore(parent: StaffId, *, record: staff.StaffSnapshot | None = None,
                             continue
                         if not isinstance(state, worker_panes.OpenWorker) or state.status not in (
                                 herdr.AgentStatus.WORKING, herdr.AgentStatus.RUNNING):
-                            reason = "The result arrived. The director must inspect the worker before it continues."
-                            failed(state.row, reason, notice=f"{name}: {reason}")
+                            failed(state.row, "The result arrived", action=RestoreFailureAction.INSPECT_WORKER)
                             continue
                         if progress_history.parked_worker_pass(passed):
                             park = worker_panes.ParkWaitingPass(run, evidence.assignment.instance, evidence.assignment.completion)

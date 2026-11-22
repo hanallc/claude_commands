@@ -43,6 +43,7 @@ from scripts.build_hold import build_hold, hold_enforcer, shared_state_defaults
 from scripts.direct import progress_history
 from scripts.lib import atomic_file, conf, process_group, process_start, unit_runs
 from scripts.lib.atomic_file import write_text_atomic
+from scripts.lib.script_envelope import script_prompt
 from scripts.herdr import herdr, herdr_types, turn_end, worker_panes
 from scripts.herdr.worker_panes import worker_run
 from scripts.herdr import test_worker_panes as pane_support
@@ -3233,6 +3234,42 @@ class PaneRunDeliveryTests(unittest.TestCase):
 
     def test_done_recovery_rejects_a_receipt_redirected_to_partial_result_input(self) -> None:
         self.check_result_occurrence("partial result input")
+
+    def test_metadata_result_does_not_count_as_delivery(self) -> None:
+        row = self.fixture.worker("metadata-result", family="claude")
+        pane = "w1:p1"
+        self.fixture.world.add(row, pane)
+        record = self.record(row, "metadata-result")
+        record.update(status="finished", exit_code=0, pane_dispatch_id="")
+        path = Path(record["log"]).with_suffix(".json")
+        write_text_atomic(path, json.dumps(record))
+        source = worker_admission.transcript_source(row, staff.ClaudeBackend())
+        message = script_prompt(f"Detached run: {record['run_id']}\nThe command passed.")
+        entry = {"type": "user", "isMeta": True, "message": {"role": "user", "content": message}}
+        with source.open("a", encoding="utf-8") as stream:
+            _ = stream.write(json.dumps(entry) + "\n")
+
+        self.fixture.world.locations[pane]["agent_status"] = "working"
+        result = detached_runs.CompletedCommand(0)
+        self.assertEqual(detached_runs.deliver(record, result),
+                         detached_runs.DEFERRED_WORKER_RESULT + "worker is working")
+        saved = worker_lifecycle.read_json_object(path)
+        self.assertEqual(saved.get("delivery"), detached_runs.DEFERRED_WORKER_RESULT + "worker is working")
+        self.assertNotIn("delivered_at", saved)
+        self.assertEqual(self.inputs, [])
+        self.assertEqual(self.notices, [])
+
+        self.fixture.world.locations[pane]["agent_status"] = "idle"
+        self.assertEqual(detached_runs.deliver(record, result), f"sent: worker {row.name} at {pane}")
+        self.assertEqual(len(self.inputs), 1)
+        saved = worker_lifecycle.read_json_object(path)
+        evidence = detached_runs.read_worker_result_receipt(saved)
+        assert isinstance(evidence, detached_runs.WorkerResultReceipt)
+        self.assertTrue(send.worker_result_input_matches(row, staff.snapshot(), record["run_id"],
+                                                          evidence.cursor, evidence.input_digest))
+        write_text_atomic(source, source.read_text().replace(json.dumps(entry) + "\n", "", 1))
+        self.assertFalse(send.worker_result_input_matches(row, staff.snapshot(), record["run_id"],
+                                                           evidence.cursor, evidence.input_digest))
 
     def test_result_delivery_waits_for_the_worker_stage(self) -> None:
         agent = test_worker.DispatchAgent(self.fixture)
