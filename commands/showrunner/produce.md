@@ -935,9 +935,9 @@ Use `cargo-berth sequence` for merge order.
    A longer wait needs a logged reason. In a status report, the waiting unit's
    `update` names the wait with its start and clear times.
 
-   While it waits, start the waiting unit's next phase that does not need the
-   wait (Rules: parallel by default); else work inside its current phase: its
-   fix built in a scratch copy, tests, docs or research.
+   Start the waiting unit's next independent phase in a model worktree.
+   If it has no independent phase, start tests, docs, or research in its current phase.
+   Build a fix in a numbered copy. Run `~/.claude/scripts/lib/py ~/.claude/scripts/lib/build_slots.py run --source <worktree> --commit <hash> --showrunner <name> --unit <unit> --work <word> --purpose <word> -- <command>`.
 5. **Two things still go to the user:** a wait that clears only by changing what
    ships, and an approval only the user can give in a unit director's own
    session (a permission prompt, an action that cannot be undone). A unit's
