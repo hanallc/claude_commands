@@ -130,6 +130,13 @@ class ProducerMapTests(StaffTestCase):
             self.assertEqual(producer_map.main(["set", "spacetime", "dwight", "--user-words", "dwight"]), 2)
         self.assertEqual(output.getvalue(), "")
 
+    def test_set_needs_the_own_row_when_a_parent_row_gives_the_same_producer(self) -> None:
+        self.rows((self.spacetime, self.dwight.id))
+        output = io.StringIO()
+        with redirect_stdout(output), mock.patch.object(tune, "main", return_value=2):
+            self.assertEqual(producer_map.main(["set", self.models.id, "dwight", "--user-words", "pin models"]), 2)
+        self.assertEqual(output.getvalue(), "")
+
 
 if __name__ == "__main__":
     _ = unittest.main()

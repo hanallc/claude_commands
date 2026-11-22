@@ -232,8 +232,8 @@ def main(arguments: list[str] | None = None) -> int:
             return 2
         member = assignee.member
         if member.kind != "producer" and isinstance(producer_map.producer_for(member.id, members), producer_map.NoProducer):
-            mapped = members.qualified_name(producer_map.map_member(member, members))
-            print(f"{member.name} has no producer. Pass {mapped} to producer_map.py set. "
+            mapped = producer_map.map_member(member, members)
+            print(f"{member.name} has no producer. Pass {mapped.id} ({members.qualified_name(mapped)}) to producer_map.py set. "
                   + f"Active producers: {_names(staff.active(members, 'producer'))}.")
             return 3
         reply = exchange(address, "POST", review_page.NEW_ITEM_PATH, request_body(

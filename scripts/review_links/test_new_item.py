@@ -142,7 +142,7 @@ class NewItemTests(unittest.TestCase):
     def test_no_producer_exits_3_without_filing(self) -> None:
         code, output, _ = self.run_main("question", "models", "Which chart?")
         self.assertEqual(code, 3)
-        self.assertEqual(output, "models has no producer. Pass spacetime to producer_map.py set. "
+        self.assertEqual(output, f"models has no producer. Pass {SPACETIME.id} (spacetime) to producer_map.py set. "
                          + "Active producers: dwight, bob.\n")
         self.assertEqual(self.server.posts, [])
         code, _, _ = self.run_main("question", "dwight", "Which chart?")

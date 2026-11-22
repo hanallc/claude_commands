@@ -120,7 +120,7 @@ def main(arguments: list[str] | None = None) -> int:
                           "--why", f"{member.name} reports to producer {producer.name}",
                           "--user-words", args.user_words])
         # tune also exits 2 when the row is live and only main lacks it.
-        if code and producer_for(member.id, members) == producer:
+        if code and _rows().get(member.id.lower()) == producer.id.lower():
             print(f"{member.name} -> {producer.name} is live; main gets the row later")
             return 0
         return code
