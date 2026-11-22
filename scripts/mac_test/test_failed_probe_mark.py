@@ -37,7 +37,6 @@ VERIFY = Path(__file__).resolve().parents[1] / "direct/verify.sh"
 
 class FailedProbeTests(OffloadCommandFixture):
     linux_settings: Path = Path()
-    identity: eligibility.KnownRepository = eligibility.KnownRepository("hana")
 
     @override
     def setUp(self) -> None:
@@ -54,10 +53,13 @@ class FailedProbeTests(OffloadCommandFixture):
         self.environment.update({name: "" for name in (
             "UNIT_RUN_DIR", "UNIT_SESSION_DIR", "UNIT_TEAM_ROLE", "CODEX_THREAD_ID", "CLAUDE_CODE_SESSION_ID")})
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, self.environment)))
+
+    @property
+    def identity(self) -> eligibility.KnownRepository:
         identity = eligibility.repository_identity(self.repository)
         if not isinstance(identity, eligibility.KnownRepository):
             self.fail(f"The fixture repository has no identity: {self.repository}")
-        self.identity = identity
+        return identity
 
     def probe(self, target: str = "box") -> offload.ProbeResult:
         self.sync_fixture()

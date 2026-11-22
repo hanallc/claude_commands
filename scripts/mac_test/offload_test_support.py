@@ -883,7 +883,7 @@ raise SystemExit(offload.main())
     def interrupt_held_claim(
         self, *, takeover: bool = False, after_takeover: bool = False,
         signal_group: bool = False, signal_number: int = signal.SIGTERM,
-        reply_host: str = "reply-mac",
+        reply_host: str = "reply-mac", runner_options: tuple[str, ...] = (),
     ) -> str:
         runner = self.claim_stub_runner()
         if after_takeover:
@@ -899,7 +899,7 @@ raise SystemExit(offload.main())
             extra={"MAC_TEST_HELD_TAKEOVER": "1" if takeover else "0",
                    "MAC_TEST_TAKEOVER_FIRST": "0",
                    "MAC_TEST_TAKEOVER_REPLY": reply_host},
-            start_new_session=signal_group,
+            start_new_session=signal_group, runner_options=runner_options,
         )
         try:
             self.wait_for_path(self.stub_directory / "claim-started")
@@ -955,7 +955,59 @@ raise SystemExit(offload.main())
         self.assert_claim_is_kept("previous-mac")
         self.assertEqual(self.events_for("ssh"), [], output)
         self.assertFalse((self.stub_directory / "cleanup-called").exists())
-        self.assertNotIn("Traceback", output)
+        self.assertEqual(output, "", output)
+
+    def use_linux_target(self) -> tuple[str, ...]:
+        """Register the trusted Linux target box and return its runner options."""
+        settings = self.root / "box.conf"
+        _ = write_config_fixture(settings, "".join(f"{name}={value}\n" for name, value in {
+            **self.config, "slots": "1", "slots.hana": "1", "kinds": "test,check,lint,doc,build",
+            "parity.rustc": "fixture", "parity.nextest": "fixture", "parity.mend": "fixture",
+            "parity.scripts_commit": "fixture"}.items()), template="mac_test")
+        registry = self.root / "build_targets.conf"
+        _ = registry.write_text(registry.read_text().replace("targets=mac\n", "targets=mac,box\n")
+                                + "kind.box=ssh\nplatform.box=linux\nsettings.box=box.conf\n")
+        # The Linux runner refuses an untrusted source before it claims.
+        _ = write_config_fixture(self.root / "nix_env.conf", f"trusted_home_folders={self.repository.name}\n")
+        self.environment["HOME"] = str(self.root)
+        # The Linux leftover selector has no lsof; answer it like the Mac selector.
+        stub = self.bin_directory / "command-stub"
+        _ = stub.write_text(stub.read_text().replace(
+            "[[ $remote == *'select_leftovers()'* && $remote == *lsof* ]]", "[[ $remote == *'select_leftovers()'* ]]"))
+        self.claim_file = claim_state.StatePaths(self.state_directory, "mac").run
+        return ("--target", "box", "--settings", str(settings))
+
+    def assert_linux_takeover_signal_checks_reply_host(self, outcome: str, reply_host: str = "reply-box") -> None:
+        options = self.use_linux_target()
+        self.set_leftover_answer(outcome)
+        output = self.interrupt_held_claim(takeover=True, reply_host=reply_host, runner_options=options)
+        state_events = (self.stub_directory / "state-events").read_text().splitlines()
+        if not reply_host:
+            self.assertEqual(state_events, ["claim"], output)
+            self.assert_claim_is_kept("previous-mac")
+            self.assertEqual(output, "mac_test: could not confirm that a lost run's leftovers ended: "
+                             + "the kept claim's host could not be read; the box stays busy\n")
+            self.assertEqual(self.events_for("ssh"), [], output)
+            self.assertFalse((self.stub_directory / "cleanup-called").exists())
+            return
+        ssh = self.events_for("ssh")
+        self.assertEqual(len(ssh), 1, output)
+        self.assertEqual(ssh[0]["args"][-2], reply_host, output)
+        self.assertIn("select_leftovers()", ssh[0]["args"][-1])
+        self.assertTrue((self.stub_directory / "cleanup-called").exists())
+        if outcome == "clean":
+            self.assertEqual(state_events, ["claim", "release"], output)
+            self.assertFalse(self.claim_file.exists(), output)
+            self.assertEqual(output, "", output)
+            return
+        self.assertEqual(state_events, ["claim"], output)
+        self.assert_claim_is_kept("previous-mac")
+        if outcome == "remaining":
+            self.assertEqual(output, "mac_test: 3 leftover processes of a lost run are still on the box; "
+                             + "it stays busy until they end\n")
+        else:
+            self.assertRegex(output, r"^mac_test: could not confirm that a lost run's leftovers ended: "
+                             + r"[^\n]*connection refused by host[^\n]*; the box stays busy\n$")
 
     def remove_tree_key(self) -> None:
         # The origin keeps the history key that a Mac claim needs; no HEAD means no tree key.
