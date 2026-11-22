@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import cast, final, override
 from unittest.mock import patch
 
-from scripts.lib import land_main, live_settings, main_push_lock, models_registry, registry_rows, waiting_rows
+from scripts.lib import land_main, live_settings, main_push_lock, main_sync, models_registry, registry_rows, waiting_rows
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.checkout_test_support import write_python_tool
 from scripts.lib.rerun_test_support import ScriptRepositoryTestCase
@@ -471,6 +471,21 @@ class RegistryPublicationTests(ScriptRepositoryTestCase):
             _ = self.write(registry, local)
             with main_push_lock.settings_push(self.repo) as gap:
                 self.assertIsInstance(gap, land_queue.SettingsGap)
+                self.assertTrue(models_registry.publish_pending(registry))
+        self.assertEqual(self.git("show", "origin/main:config/models.conf").stdout, local)
+
+    def test_main_sync_allows_a_later_direct_edit_to_a_producer(self) -> None:
+        registry, before, local, remote = self._producer_conflict()
+        environment = {**self.environment, "MODELS_CONFIG_PUBLISH": "later", "TMPDIR": str(self.root)}
+        with patch.dict(os.environ, environment, clear=True), patch.object(models_registry, "DEFAULT_PATH", registry):
+            _ = models_registry.save_registry(registry, before, local, "add producer", preserve_producer_rows=True)
+            self.assertEqual(main_sync.sync(self.repo).state, main_sync.ADVANCED)
+            self.assertEqual(registry.read_text(), remote)
+
+            with main_push_lock.settings_push(self.repo) as gap:
+                self.assertIsInstance(gap, land_queue.SettingsGap)
+                self.assertFalse(models_registry.publish_pending(registry))
+                _ = self.write(registry, local)
                 self.assertTrue(models_registry.publish_pending(registry))
         self.assertEqual(self.git("show", "origin/main:config/models.conf").stdout, local)
 

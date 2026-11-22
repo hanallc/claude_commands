@@ -665,6 +665,9 @@ def recover_move(checkout: Path, head: str) -> None:
                 if waiting:
                     restored[path] = apply_accepted_values(after or "", waiting)
             write_files(checkout, restored)
+            if registry_dir is not None:
+                published = tree_text(checkout, head, REGISTRY_PATH) or ""
+                settle_protected_producers(registry_dir, restored[REGISTRY_PATH] or "", published)
     marker.unlink()
 
 
