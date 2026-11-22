@@ -2203,12 +2203,12 @@ def admission_walk(inputs: QueueInputs, ordered: list[tuple[Path, RankedWaiter]]
         elif local or folder_busy:
             if folder_busy and isinstance(first_folder_wait, NoWaiter):
                 first_folder_wait = records.stored_waiter(row)
-            # A row behind a run-limit row of its own repository cannot start before that row. It
-            # stays inside that repository also when it is not ready, because a held row gets no
-            # EstimateExpired reason and so does not refresh its estimate (rule 8).
+            # A row that waits for its own repository limit, or behind such a row, holds back no
+            # other repository, also when it is not ready or does not fit in memory. Its place as
+            # memory head starts only when its limit no longer holds it (rule 8).
             if not folder_busy and isinstance(gpu_wait, GpuSlotFree) and (
                     records.waiter_owner(order_hold.waiter) in run_limit_waiters
-                    if isinstance(order_hold, HeldBehindHead) else ready and isinstance(run_wait, records.RunLimitWait)):
+                    if isinstance(order_hold, HeldBehindHead) else isinstance(run_wait, records.RunLimitWait)):
                 run_limit_waiters[owner] = repository
                 _ = first_held_by_run_limit.setdefault(repository, row)
             else:

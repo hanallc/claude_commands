@@ -6291,10 +6291,12 @@ class QueueExplanationTests(MemoryQueueFixture):
         self.assertEqual(follower.reason, admission_records.BehindHead("worker-300", NOW_EPOCH - 1200, "session-300"))
         self.assertIsInstance(nextest.admission, gate.ProposedAdmission)
 
+        # A head that waits for its repository limit holds back no other step also when it does not fit (rule 8).
         path, waiter = inputs.ordered[0]
         memory_hold = replace(inputs, ordered=[(path, {**waiter, "need": 70 * GIB}), *inputs.ordered[1:]])
         rows = gate.admission_pass(memory_hold, inputs.now, policy).rows
-        self.assertEqual(rows[2].reason, follower.reason)
+        self.assertEqual(rows[1].reason, follower.reason)
+        self.assertIsInstance(rows[2].admission, gate.ProposedAdmission)
 
     def test_verify_waiting_only_for_its_run_limit_does_not_hold_another_repository(self) -> None:
         _ = self.waiting(300, 2 * GIB, 20, repository_name="hana", step="nextest")
