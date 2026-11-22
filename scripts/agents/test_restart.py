@@ -2493,6 +2493,31 @@ runpy.run_module('scripts.agents.restart', run_name='__main__', alter_sys=True)
         messages.assert_called_once_with(child)
         close.assert_not_called()
 
+    def test_reboot_restart_progress_names_the_restored_worker(self) -> None:
+        from scripts.agents import reboot
+
+        owner = self.rows[0]
+        child = replace(self.rows[1], kind="worker", name="impl", unit_type=staff.NotUnit(),
+                        parent=staff.ReportsTo(owner.id), role=staff.KnownWorkerRole("impl"))
+        record = staff.StaffSnapshot((owner, child))
+        run = self.root / "idle-worker"
+        write_text_atomic(run / unit_runs.STATE_FILE, json.dumps({unit_runs.OWNER_FIELD: owner.id, "pass": {}}))
+        state = worker_panes.OpenWorker(child, "w1:p1", "terminal", herdr.AgentStatus.IDLE)
+        shutdown_record.save([child.id])
+        reboot.Checkpoint(reboot.Step.START).save(self.root / "agents/reboot/reboot.json")
+        with (patch.object(staff, "initial_snapshot", return_value=record), staff.supplied_snapshot(record),
+              patch.object(staff, "local_snapshot", return_value=record),
+              patch.object(worker, "_read_workers", return_value=worker.PaneWorkerStates([state], [run])),
+              patch.object(worker_panes, "worker_run", return_value=run),
+              patch.object(worker_panes, "_transcript_messages", return_value=["user:\nOne moment."]),
+              patch.dict(os.environ, {"XDG_CONFIG_HOME": str(self.root), "HERDR_PANE_ID": "", "HERDR_ENV": ""}),
+              redirect_stdout(io.StringIO()) as output):
+            self.assertEqual(shutdown.main(["reboot"]), 0)
+        progress = [line for line in output.getvalue().splitlines() if "back -" in line]
+        self.assertEqual(len(progress), 1)
+        self.assertIn(f"1 of 1 back - {owner.name} / {child.name}", progress[0])
+        self.assertEqual(shutdown_record.read(), [])
+
     def test_restart_sends_an_unsubmitted_dispatch_even_when_the_worker_is_working(self) -> None:
         owner = self.rows[0]
         child = replace(self.rows[1], kind="worker", name="impl", unit_type=staff.NotUnit(),
@@ -4876,6 +4901,39 @@ runpy.run_module('scripts.agents.restart', run_name='__main__', alter_sys=True)
         self.assertEqual(self.stops, [str(row.id)])
         self.assertEqual(self.launches, [(row.name, herdr.NewTab("producers", row.name))])
         self.assertEqual(shutdown_record.read(), [])
+
+    def test_reboot_reuses_bulk_stop_and_restart_for_a_producer(self) -> None:
+        from scripts.agents import reboot
+
+        row = fixture_member("producer", name="TEST-agent")
+        self.rows = (row,)
+        self.running = {str(row.current_session)}
+        planned = reboot.MoveResult("session_move: would move 0 folders (0.00 GiB), kept 1 live, refused 0 other", 0, ())
+        moved = reboot.MoveResult("session_move: moved 0 folders (0.00 GiB), kept 0 live, refused 0 other", 0, ())
+
+        def producer_snapshot() -> staff.StaffSnapshot:
+            return staff.StaffSnapshot(tuple(staff.snapshot().find(kind="producer")))
+
+        with (patch.object(staff, "initial_snapshot", side_effect=producer_snapshot),
+              patch.object(herdr.Herdr, "record_layout",
+                           side_effect=(herdr_types.HerdrFailure("layout unavailable"), None)) as saved_layout,
+              patch.object(reboot, "stop_server") as server,
+              patch.object(reboot, "move_folders", side_effect=(planned, planned, moved)),
+              patch.dict(os.environ, {"USER_ZONE": "UTC", "XDG_CONFIG_HOME": str(self.root),
+                                      "HERDR_PANE_ID": "", "HERDR_ENV": ""}),
+              redirect_stdout(io.StringIO()) as output):
+            self.assertEqual(shutdown.main(["reboot"]), 1)
+            self.assertIn("Could not save the Herdr layout", output.getvalue())
+            self.assertEqual(self.stops, [])
+            server.assert_not_called()
+            self.assertEqual(shutdown.main(["reboot"]), 0)
+        self.assertEqual(saved_layout.call_count, 2)
+        server.assert_called_once()
+        self.assertEqual(self.stops, [row.id])
+        self.assertEqual(self.launches, [(row.name, herdr.NewTab("producers", row.name))])
+        self.assertEqual(shutdown_record.read(), [])
+        self.assertIn(f"1 of 1 stopped - {row.name}", output.getvalue())
+        self.assertIn(f"1 of 1 back - {row.name}", output.getvalue())
 
     def test_stop_all_reports_a_failed_hold_write_and_keeps_stopping_other_rows(self) -> None:
         blocked = fixture_member("producer", name="TEST-agent")

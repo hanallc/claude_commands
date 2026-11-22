@@ -17,9 +17,9 @@ import socket
 import subprocess
 import sys
 import time
-from collections.abc import Callable, Iterable, Mapping
-from contextlib import ExitStack, nullcontext, redirect_stderr, redirect_stdout, suppress
-from concurrent.futures import Future, ThreadPoolExecutor
+from collections.abc import Callable, Generator, Iterable, Mapping
+from contextlib import ExitStack, contextmanager, nullcontext, redirect_stderr, redirect_stdout, suppress
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from contextvars import ContextVar, copy_context
 from threading import Event
 from dataclasses import dataclass, field, replace
@@ -306,6 +306,10 @@ class FollowUp:
     operator: bool = False
     director_check: bool = False
 
+    def line(self) -> str:
+        reason = " ".join(self.reason.split()).rstrip(".")
+        return f"{self.name}: {reason}. {self.step}".rstrip()
+
 
 class FollowUpFields(TypedDict):
     name: str
@@ -347,6 +351,8 @@ class BulkReport:
     stop_plan_recorded: bool = False
     stop_signal: signal.Signals | None = None
     not_started: dict[str, str] = field(default_factory=dict)
+    reboot: bool = False
+    on_finish: Callable[[str, int], None] | None = None
 
     def track(self, row: staff.StaffRow, record: staff.StaffSnapshot) -> None:
         owner = record.parent_of(row) if row.kind == "worker" else row
@@ -387,8 +393,11 @@ class BulkReport:
         return f"Nate {repair}. Then Nate runs {self.retry} again."
 
     def finish(self, key: str) -> None:
+        first = key not in self.completed
         self.completed.add(key)
         _ = self.issues.pop(key, None)
+        if first and self.on_finish is not None:
+            self.on_finish(self.targets[key], len(self.targets))
 
     def mark_not_started(self, keys: Iterable[str], retry: str) -> None:
         step = _plain_terminal_step(retry)
@@ -415,12 +424,10 @@ class BulkReport:
         self.issues.update({key: FollowUp(**issue) for key, issue in data["issues"].items()})
         self.inherited.update(self.issues)
 
-    def lines(self, *, dry_run: bool = False, failure: FollowUp | None = None) -> list[str]:
+    def follow_ups(self, *, dry_run: bool = False, failure: FollowUp | None = None) -> dict[str, FollowUp]:
         status = "stopped" if self.command == "agents stop --all" else "back"
         targets = self.targets.keys() if self.fixed_targets is None else self.fixed_targets
         completed = targets & self.completed
-        suffix = " (dry run)" if dry_run else ""
-        lines = [f"{self.command}: {len(completed)} of {len(targets)} sessions {status}{suffix}.", *self.preview]
         issues = dict(self.issues)
         for key in self.not_started.keys() - completed:
             earlier = issues.get(key)
@@ -444,9 +451,16 @@ class BulkReport:
                     reason = f"{reason}. {cause.reason}"
                 step = cause.step if cause is not None else f"Nate runs {self.retry} again."
                 issues[key] = FollowUp(self.targets[key], reason, step, operator=True)
-        for item in sorted(issues.values(), key=lambda issue: (issue.name, issue.reason)):
-            reason = " ".join(item.reason.split()).rstrip(".")
-            lines.append(f"{item.name}: {reason}. {item.step}".rstrip())
+        return issues
+
+    def lines(self, *, dry_run: bool = False, failure: FollowUp | None = None) -> list[str]:
+        status = "stopped" if self.command == "agents stop --all" else "back"
+        targets = self.targets.keys() if self.fixed_targets is None else self.fixed_targets
+        suffix = " (dry run)" if dry_run else ""
+        lines = [f"{self.command}: {len(targets & self.completed)} of {len(targets)} sessions {status}{suffix}.", *self.preview]
+        issues = self.follow_ups(dry_run=dry_run, failure=failure)
+        lines.extend(item.line() for item in sorted(issues.values(), key=lambda issue: (issue.name, issue.reason)))
+        received = self.stop_signal
         actions: list[str] = []
         units = {item.unit or self.units.get(key, "") for key, item in issues.items() if item.operator or item.unit} - {""}
         if units:
@@ -478,6 +492,15 @@ class BulkReport:
 
 _BULK_REPORT: ContextVar[BulkReport | None] = ContextVar("_BULK_REPORT", default=None)
 _DETACHED_CHILD: ContextVar[bool] = ContextVar("_DETACHED_CHILD", default=False)
+
+
+@contextmanager
+def use_report(report: BulkReport) -> Generator[None]:
+    token = _BULK_REPORT.set(report)
+    try:
+        yield
+    finally:
+        _BULK_REPORT.reset(token)
 
 
 def _create_log(files: ExitStack, path: Path) -> io.FileIO:
@@ -527,9 +550,11 @@ _Result = TypeVar("_Result")
 def _collect_restart_results(jobs: Mapping[staff.StaffId, Callable[[], _Result]],
                              record: Callable[[staff.StaffId, Future[_Result]], None]) -> None:
     with ThreadPoolExecutor(max_workers=min(16, len(jobs))) as pool:
-        futures = {identity: pool.submit(copy_context().run, job) for identity, job in jobs.items()}
-        for identity, future in futures.items():
-            record(identity, future)
+        futures = {pool.submit(copy_context().run, job): identity for identity, job in jobs.items()}
+        report = _BULK_REPORT.get()
+        ready = as_completed(futures) if report is not None and report.reboot else iter(futures)
+        for future in ready:
+            record(futures[future], future)
 
 
 def _record_stop_plan(report: BulkReport, rows: Iterable[staff.StaffRow]) -> None:
@@ -581,10 +606,9 @@ def run_command(action: Callable[[], int], command: BulkCommand) -> int:
             report.log_error = error
             print(f"Could not write the log at {path}. {_error_reason(error)}", flush=True)
 
-        token = _BULK_REPORT.set(report)
         output = io.StringIO()
         try:
-            with redirect_stdout(output), redirect_stderr(output):
+            with use_report(report), redirect_stdout(output), redirect_stderr(output):
                 code = action()
         except UnknownAccountName as error:
             report.issues[""] = FollowUp(report.command, _error_reason(error), "Nate selects an available account.", operator=True)
@@ -593,8 +617,6 @@ def run_command(action: Callable[[], int], command: BulkCommand) -> int:
                 subprocess.SubprocessError) as error:
             report.failure("", report.command, _error_reason(error))
             code = 2
-        finally:
-            _BULK_REPORT.reset(token)
         log = report.log_stream
         if report.writer is LogWriter.CHILD:
             print(f"  {_background_status(report.command)}", flush=True)
@@ -1003,6 +1025,11 @@ def _restore_workers(row: staff.StaffRow, record: staff.StaffSnapshot, *,
             if member.id not in report.restored:
                 _ = report.failures.setdefault(member.id, (member.name, _error_reason(error)))
         result = worker.ExitCode.UNCERTAIN
+    if (bulk := _BULK_REPORT.get()) is not None and bulk.reboot:
+        for member in members:
+            if member.id in report.restored:
+                bulk.track(member, record)
+                bulk.finish(member.id)
     if reports is None:
         account = target_account if isinstance(target_account, str) else target_account.label
         WorkerRestoreReports({row.id: (parent, report)}, BulkCommand(account=account)).report()
@@ -1477,11 +1504,18 @@ def live_rows(record: staff.StaffSnapshot, client: herdr.Herdr, *, save_tabs: bo
             selected.extend(active_workers)
         positions = {row.id: index for index, row in enumerate(record.rows)}
         selected.sort(key=lambda row: positions[row.id])
-    if save_tabs:
+    report = _BULK_REPORT.get()
+    reboot = report is not None and report.reboot
+    if save_tabs and (selected or not reboot):
         try:
-            client.save_layout()
+            if reboot:
+                client.record_layout()
+            else:
+                client.save_layout()
         except (OSError, ValueError, herdr_types.HerdrFailure, subprocess.SubprocessError) as error:
             print(f"restart: layout anomaly: {str(error).splitlines()[0]}", file=sys.stderr)
+            if reboot:
+                _discovery_anomaly(f"Could not save the Herdr layout. {_error_reason(error)}")
         for row, pane in row_panes(selected, client):
             try:
                 client.remember_row_tab(str(row.id), pane)
@@ -1781,6 +1815,8 @@ def _restart(pane_evidence: ExitStack, *, stop_all: bool, dry_run: bool, only: t
     if report is not None:
         for row in selected:
             report.track(row, record)
+        if report.reboot and stop_all and (isinstance(reading, PartialLiveRows) or report.issues):
+            return 1
         if report.fixed_targets is not None:
             missing = report.fixed_targets.difference(row.id for row in selected) - report.issues.keys()
             for key in missing:
@@ -1815,12 +1851,16 @@ def _restart(pane_evidence: ExitStack, *, stop_all: bool, dry_run: bool, only: t
             step_command = resume_retry([member]) if resuming else retry
             _report_record_busy(member, record.rows_by_id[staff.StaffId(member)].name, error, step_command)
 
-    # The record saves only members that a restart starts; the stop still reaches every member.
-    leaving = {str(row.id) for row in selected if stop_all and leaves_record(row, record, runs=observed.runs) is not None}
+    # Reboot saves every selected row before it can stop the server.
+    leaving = {str(row.id) for row in selected if stop_all and not (report is not None and report.reboot)
+               and leaves_record(row, record, runs=observed.runs) is not None}
     saved_by_holder = {holder: [member for member in members if member not in leaving]
                        for holder, members in members_by_holder.items()}
     callers = {os.environ.get("CLAUDE_CODE_SESSION_ID"), os.environ.get("CODEX_THREAD_ID")} - {None, ""}
     if stop_all and any(row.current_session in callers for row in selected):
+        if report is not None and report.reboot:
+            _discovery_anomaly("The stop includes the session that runs this reboot")
+            return 1
         return _detach_stop(command, selected, record)
     lock_wait = conf.read("shutdown").number("UPKEEP_ROW_WAIT_SECONDS") if holders else 0
     from scripts.herdr.worker_panes import (
@@ -2015,7 +2055,7 @@ def _restart(pane_evidence: ExitStack, *, stop_all: bool, dry_run: bool, only: t
         {identity: pids for identity, pids in observed.codex.live.items() if identity not in selected_sessions},
         observed.codex.unknown))
     present = False
-    if holders:
+    if holders or (report is not None and report.reboot and not stop_all):
         try:
             server = herdr.restore_server(client.session, int(herdr.PROGRAM_TIMEOUT_SECONDS * 1000),
                                      session_kind=herdr.security_session())
@@ -2103,9 +2143,9 @@ def _restart(pane_evidence: ExitStack, *, stop_all: bool, dry_run: bool, only: t
                     isinstance(current.paused, staff.Paused) or isinstance(current.exited, staff.Exited)):
                 if report is not None:
                     hold = "exited" if isinstance(current.exited, staff.Exited) else "paused"
+                    step = "The director resumes the session when ready." if report.reboot else "The session stays stopped."
                     for member in members_by_holder[holder.id]:
-                        report.issues[member] = FollowUp(report.targets[member], f"{current.name} is {hold}",
-                            "The session stays stopped.")
+                        report.issues[member] = FollowUp(report.targets[member], f"{current.name} is {hold}", step)
                 print(f"{current.name}: {'exited' if isinstance(current.exited, staff.Exited) else 'paused'}")
                 return RestartDisposition.HELD
             if holder.id in unconfirmed:

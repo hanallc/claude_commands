@@ -252,6 +252,7 @@ USAGE = f"""usage: agents COMMAND
   agents retire NAME [--to PRODUCER]
   agents rename OLD NEW [--to-doc PATH] [--to-branch NAME]
   agents move SESSION_OR_GROUP ACCOUNT [--dry-run] [--why TEXT]
+  agents reboot [--dry-run]
   agents restart [ACCOUNT] [--all] [--dry-run] [--only ID[,ID...]] [--here]
   agents stop SESSION [--dry-run] | --all [--dry-run] [--only ID[,ID...]] [--account ACCOUNT]
   agents remove-stray NAME SESSION
@@ -731,6 +732,8 @@ def main(argv: list[str] | None = None) -> int:
     _ = command.add_argument("target", metavar="ACCOUNT")
     _ = command.add_argument("--dry-run", action="store_true")
     _ = command.add_argument("--why", default="")
+    command = commands.add_parser("reboot")
+    _ = command.add_argument("--dry-run", action="store_true")
     command = commands.add_parser("restart")
     _ = command.add_argument("--why", default=restart.DEFAULT_RESTART_CAUSE)
     _ = command.add_argument("--all", action="store_true")
@@ -771,6 +774,10 @@ def main(argv: list[str] | None = None) -> int:
             return producer_transfer.transfer(options.producer, model=options.model, effort=options.effort)
         if options.command == "add-producer":
             return producer_lifecycle.add(options.producer, model=options.model, effort=options.effort, job=options.job)
+        if options.command == "reboot":
+            from scripts.agents import reboot
+
+            return reboot.run(dry_run=options.dry_run)
         if options.command == "stop" and options.all:
             selection = restart.BulkCommand("stop", account=options.account, all_rows=True,
                 only=tuple(item for item in options.only.split(",") if item), dry_run=options.dry_run)

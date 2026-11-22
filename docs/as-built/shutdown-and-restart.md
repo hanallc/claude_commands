@@ -945,3 +945,32 @@ A surviving run keeps its memory queue place and its age.
 A new process does not take over the place of a dead waiter.
 
 A session restart is not a machine restart. A reboot or power-off can end local supervisors and waiting processes.
+
+## Reboot
+
+Run `agents reboot` from a terminal outside Herdr. The command refuses inside a Herdr pane.
+The shared Herdr session must have the name `agents`.
+
+1. Save and stop the local sessions through `agents stop --all`.
+2. Run `herdr --session agents server stop` after the stop confirms all selected sessions stopped and the restart record contains their IDs.
+3. Run `~/.claude/scripts/lib/py ~/.claude/scripts/lib/session_move.py`.
+4. Restore the server and the saved sessions through `agents restart`.
+
+Before the first step, the command runs `session_move.py --dry-run` through the same Python shim.
+The plan gives the size of idle folders and counts live folders to size after the stop.
+Use `agents reboot --dry-run` to see the plan without running the four steps.
+
+The reboot holds the Herdr upkeep job lock across the four steps and releases it on failure.
+A failed stop, server stop, or restart leaves the next step in `reboot.json`.
+Run `agents reboot` again to continue at that step.
+A folder move failure permits restart to proceed.
+The final report names the failed copy folder if available and assigns the move failure to the verify owner.
+
+The first output line gives the log path under `~/.local/state/agents/reboot/`.
+The command adds the time to each log line. It keeps older logs and sets `latest.log` to the most recent run.
+A terminal shows each step on one line with an elapsed time and a spinner.
+Stop and restart progress includes the current session name.
+Output to a pipe uses one line for each name and omits the spinner.
+The move step shows the `session_move` summary. The per-folder refusal details go to the log.
+The report names sessions or workers that need a step and says whether Nate must act.
+The last line gives the command `herdr session attach agents`.
