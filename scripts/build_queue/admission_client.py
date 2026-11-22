@@ -390,9 +390,9 @@ def _waits_for_live_service(request: wire.Request) -> bool:
 
 def _query(request: wire.ViewRequest | wire.ExplainRequest | wire.MineRequest | wire.PlacementRequest
            | wire.ClaimFailure | wire.ConsumePermission | wire.ExecutionReport | wire.PrerequisiteReport
-           | wire.CancelPlacement | status_wire.PlacementStatusRequest) -> wire.Reply:
+           | wire.CancelPlacement | status_wire.PlacementStatusRequest, *, wait_for_service: bool = True) -> wire.Reply:
     from scripts.build_queue import admission_protocol as wire, admission_records as records
-    if _waits_for_live_service(request):
+    if wait_for_service and _waits_for_live_service(request):
         reply = _call(request, lambda _wait: None)
         if isinstance(reply, LeftQueue):
             raise _QueueLeft()
@@ -422,9 +422,9 @@ def _query(request: wire.ViewRequest | wire.ExplainRequest | wire.MineRequest | 
         raise wire.AdmissionUnavailable(str(error) or "invalid answer") from error
 
 
-def placement_status(episode: str, attempt: str) -> status_wire.PlacementStatusReply:
+def placement_status(episode: str, attempt: str, *, wait_for_service: bool = True) -> status_wire.PlacementStatusReply:
     """Read a saved attempt without requesting authorization."""
-    reply = _query(status_wire.PlacementStatusRequest(episode, attempt))
+    reply = _query(status_wire.PlacementStatusRequest(episode, attempt), wait_for_service=wait_for_service)
     if isinstance(reply, status_wire.PlacementStatusReply):
         return reply
     raise wire.AdmissionUnavailable("invalid placement status answer")
