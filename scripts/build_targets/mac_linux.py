@@ -751,7 +751,7 @@ def completed_run(reply: GuestReply, request: GuestRequest, source: CandidateSou
 def route(repo: Path, *, mode: SuiteMode, full: bool, module_time_limit_s: float,
           selected: AllModules | TreeSelection, gate_job: StepJob | GateJobNotRecorded,
           type_dirs: Sequence[str] = ()) -> GateRun | str:
-    """Return the guest gate result or a reason for the natedev fallback."""
+    """Return the guest gate result or the reason the guest route failed."""
     from scripts.aws_target import cloud_gate
     from scripts.build_queue.admission_client import step_identity
     from scripts.production import affected_modules, gate

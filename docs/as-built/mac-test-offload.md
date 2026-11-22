@@ -33,6 +33,8 @@ The guest puts the type-check environment in the copy's gate tool folder.
 For a run with type checks, the guest checks for `basedpyright` and `uv` before it starts the gate.
 If a tool is missing, the guest refuses the route.
 The guest returns the type-check result with the test results.
+If the assigned Mac Linux guest refuses the route, the gate fails and reports the guest and the reason.
+The caller must submit a new run to retry.
 
 ## Mac queue runs
 

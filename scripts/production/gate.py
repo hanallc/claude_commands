@@ -2964,6 +2964,10 @@ def mac_linux_gate_placed(mode: SuiteMode, gate_job: StepJob | GateJobNotRecorde
         return False
 
 
+class MacLinuxGateRefused(GateRefused):
+    """The assigned Mac Linux guest could not complete the gate."""
+
+
 class MacLinuxGateRoute(Protocol):
     """Run the tests and type checks in the Mac Linux guest."""
 
@@ -3008,7 +3012,7 @@ def run_gate_suites(repo: Path, type_dirs: Sequence[str] = (),
                                   selected=selection, gate_job=gate_job, type_dirs=type_dirs)
             if isinstance(outcome, GateRun):
                 return outcome
-            print('Mac Linux gate falls back: ' + outcome, flush=True)
+            raise MacLinuxGateRefused(f"Mac Linux guest gate failed: {outcome}")
         return run_cloud(selection)
 
     absent = [name for name in type_dirs if not (repo / name).exists()]

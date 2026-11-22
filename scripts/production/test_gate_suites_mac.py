@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from contextlib import AbstractContextManager, redirect_stdout, suppress
+from contextlib import AbstractContextManager, redirect_stderr, redirect_stdout, suppress
 from dataclasses import replace
 import io
 import os
@@ -326,30 +326,37 @@ class MacGateSuitesTests(GateSuitesFixture):
         self.assertEqual(self.cloud_route.call_count, 2)
         self.placement_status.assert_not_called()
 
-    def test_mac_linux_fallback_tries_the_cloud_before_natedev(self) -> None:
+    def test_mac_linux_refusal_ends_the_gate(self) -> None:
         _ = write_config_fixture(Path(self.environment["CONF_DIR"]) / "build_targets.conf", "enabled.mac-linux=on\n")
         assignment = self.gate_assignment("mac-linux")
         path = self.write_gate_assignment(assignment)
         self.set_placement_status(assignment, placement.CurrentAssignment())
-        cloud_run = gate.GateRun((), 1, 0, selection_certified=True)
-        local_run = gate.GateRun((), 2, 0, selection_certified=True)
-        calls = mock.Mock()
-        self.cloud_route.side_effect = [cloud_run, "fixture cloud unavailable"]
-        calls.attach_mock(self.cloud_route, "cloud")
+        reason = "mac-linux: fixture guest unavailable"
+        for mode, verb in ((SuiteMode.GATE, "test-all"), (SuiteMode.TARGETED, "test-affected")):
+            with (self.subTest(mode=mode), mock.patch.dict(os.environ, {"BUILDLOG_PLACEMENT_FILE": str(path)}),
+                  mock.patch.object(mac_linux, "route", return_value=reason) as guest,
+                  mock.patch.object(gate, "run_suites") as local):
+                with self.assertRaisesRegex(gate.MacLinuxGateRefused, f"Mac Linux guest gate failed: {reason}"):
+                    _ = gate.run_gate_suites(self.checkout, mode=mode, full=True, gate_job=StepJob(verb))
+                guest.assert_called_once()
+                self.cloud_route.assert_not_called()
+                local.assert_not_called()
+        self.assertNotIn("falls back", self.output.getvalue())
+
+    def test_merge_gate_cli_reports_the_mac_linux_refusal(self) -> None:
+        _ = write_config_fixture(Path(self.environment["CONF_DIR"]) / "build_targets.conf", "enabled.mac-linux=on\n")
+        assignment = self.gate_assignment("mac-linux")
+        path = self.write_gate_assignment(assignment)
+        self.set_placement_status(assignment, placement.CurrentAssignment())
+        reason = "mac-linux: fixture guest unavailable"
         with (mock.patch.dict(os.environ, {"BUILDLOG_PLACEMENT_FILE": str(path)}),
-              mock.patch.object(mac_linux, "route", return_value="fixture guest unavailable") as guest,
-              mock.patch.object(gate, "run_suites", return_value=local_run) as local):
-            calls.attach_mock(guest, "guest")
-            calls.attach_mock(local, "local")
-            job = StepJob("test-all")
-            self.assertIs(gate.run_gate_suites(self.checkout, gate_job=job), cloud_run)
-            self.assertIs(gate.run_gate_suites(self.checkout, gate_job=job), local_run)
-        self.assertEqual([call[0] for call in calls.mock_calls], ["guest", "cloud", "guest", "cloud", "local"])
-        self.assertEqual(self.output.getvalue().splitlines(), [
-            "Mac Linux gate falls back: fixture guest unavailable",
-            "Mac Linux gate falls back: fixture guest unavailable",
-            "Cloud gate uses natedev: fixture cloud unavailable",
-        ])
+              mock.patch.object(mac_linux, "route", return_value=reason) as guest,
+              mock.patch.object(gate, "run_suites") as local, redirect_stderr(io.StringIO()) as errors):
+            self.assertEqual(gate.main(["--tests-only", "--repo", str(self.checkout)]), 1)
+        self.assertIn(f"REFUSED: Mac Linux guest gate failed: {reason}", errors.getvalue())
+        guest.assert_called_once()
+        self.cloud_route.assert_not_called()
+        local.assert_not_called()
 
     @gate_suites("lib")
     def test_merge_gate_cli_uses_the_cloud_route_before_natedev_fallback(self) -> None:
