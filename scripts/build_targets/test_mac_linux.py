@@ -480,7 +480,7 @@ fi
         self.assertIn('Guest cleanup: ended after fixture cleanup SSH refused the connection', str(result))
         self.assertEqual(log.getvalue().splitlines(), ['Mac Linux guest run not proven ended; the Mac claim stays held'])
         self.assertEqual(events, ['reserved', 'unreachable', 'unreachable', 'ended', 'released'])
-        self.assertEqual(retry_delay.call_args_list, [call(mac_linux.GUEST_PROOF_RETRY_SECONDS)] * 2)
+        self.assertEqual(retry_delay.call_args_list, [call(mac_linux.SSH_CONNECT_TIMEOUT_SECONDS)] * 2)
         self.assertEqual(self.trace.read_text().splitlines(), ['probe', 'arm', 'run', 'cleanup', 'cleanup', 'cleanup'])
 
     def test_cleanup_refuses_an_invalid_group_with_the_lock_held(self) -> None:
@@ -526,6 +526,7 @@ fi
 
             with (patch.object(mac_linux, 'mac_linux_reservation', reservation),
                   patch.object(mac_linux, 'prove_guest_end', prove),
+                  patch.object(mac_linux, 'sleep'),
                   patch.object(mac_linux, 'GUEST_KILL_GRACE_SECONDS', 0)):
                 result = self.route()
         self.assertIn('Guest cleanup: ended', str(result))
@@ -559,7 +560,8 @@ fi
                 events.append('released')
 
         with (patch.object(mac_linux, 'mac_linux_reservation', reservation),
-              patch.object(mac_linux, 'prove_guest_end', prove), redirect_stderr(ClosedStderr())):
+              patch.object(mac_linux, 'prove_guest_end', prove),
+              patch.object(mac_linux, 'sleep'), redirect_stderr(ClosedStderr())):
             result = self.route()
         self.assertIsInstance(result, GateRun)
         self.assertEqual(events, ['reserved', 'pending', 'stderr failed', 'ended', 'released'])
@@ -604,6 +606,49 @@ fi
               patch.object(mac_linux, 'mac_linux_reservation', reservation),
               self.assertRaises(KeyboardInterrupt)):
             _ = self.route('interrupted-before-copy')
+
+    def test_interrupt_at_cleanup_entry_keeps_the_claim_until_proof(self) -> None:
+        prove_guest_end = mac_linux.prove_guest_end
+        first_interrupt = KeyboardInterrupt('fixture interruption at cleanup entry')
+        events: list[str] = []
+        lock_statuses: list[int] = []
+
+        @contextmanager
+        def reservation(*_args: object) -> Generator[None]:
+            events.append('reserved')
+            try:
+                yield
+            finally:
+                events.append('released')
+
+        def prove(settings: mac_linux.GuestSettings,
+                  armed: mac_linux.ArmedGuestAttempt) -> mac_linux.GuestEndProven | mac_linux.GuestEndPending:
+            if events == ['reserved']:
+                lock_statuses.append(subprocess.call(['flock', '-x', '-n', self.run_lock(), 'true']))
+                events.append('interrupted')
+                raise first_interrupt
+            proof = prove_guest_end(settings, armed)
+            if isinstance(proof, mac_linux.GuestEndProven):
+                lock_statuses.append(subprocess.call(['flock', '-x', '-n', self.run_lock(), 'true']))
+                events.append('ended')
+            return proof
+
+        def interrupt_retry(_seconds: int) -> None:
+            if 'retry interrupted' not in events:
+                events.append('retry interrupted')
+                raise SystemExit('fixture interruption during retry')
+
+        with (patch.object(mac_linux, 'mac_linux_reservation', reservation),
+              patch.object(mac_linux, 'prove_guest_end', prove),
+              patch.object(mac_linux, 'sleep', interrupt_retry),
+              redirect_stderr(StringIO()) as log,
+              self.assertRaises(KeyboardInterrupt) as raised):
+            _ = self.route('disconnect-before-copy')
+        self.assertIs(raised.exception, first_interrupt)
+        self.assertEqual(events, ['reserved', 'interrupted', 'retry interrupted', 'ended', 'released'])
+        self.assertEqual(lock_statuses, [1, 0])
+        self.assertEqual(log.getvalue().splitlines(), [mac_linux.GUEST_END_PENDING_MESSAGE])
+        self.assertEqual(self.trace.read_text().splitlines(), ['probe', 'arm', 'run', 'cleanup'])
 
     def test_run_and_cleanup_refuse_a_symlink_lock(self) -> None:
         lock = self.run_lock()

@@ -44,7 +44,6 @@ TRANSFER_ALLOWANCE_SECONDS = 120
 GUEST_REF_TIMEOUT_SECONDS = 30
 GUEST_KILL_GRACE_SECONDS = 3
 GUEST_CLEANUP_TIMEOUT_SECONDS = 25
-GUEST_PROOF_RETRY_SECONDS = 0.1
 MISSING_PREREQUISITE_STATUS = 75
 MISSING_PREREQUISITE_MESSAGE = 'Repository lacks these prerequisite commits:'
 GUEST_END_PENDING_STATUS = 76
@@ -516,29 +515,6 @@ def prove_guest_end(settings: GuestSettings, armed: ArmedGuestAttempt) -> GuestE
     return GuestEndPending(reason)
 
 
-def finish_guest_run(settings: GuestSettings, armed: ArmedGuestAttempt) -> str:
-    """Wait for proof and return a cleanup diagnostic."""
-    first_failure = ''
-    interruption: KeyboardInterrupt | None = None
-    while True:
-        try:
-            proof = prove_guest_end(settings, armed)
-            if isinstance(proof, GuestEndProven):
-                break
-            if not first_failure:
-                first_failure = proof.detail
-                with suppress(OSError, ValueError):
-                    print(GUEST_END_PENDING_MESSAGE, file=sys.stderr, flush=True)
-            sleep(GUEST_PROOF_RETRY_SECONDS)
-        except KeyboardInterrupt as error:
-            interruption = error
-    detail = 'Guest cleanup: ended' + (f' after {first_failure}' if first_failure else '')
-    if interruption is not None:
-        interruption.add_note(detail)
-        raise interruption
-    return detail
-
-
 class BundleForm(StrEnum):
     FIRST = 'first'
     DELTA = 'delta'
@@ -625,6 +601,20 @@ printf '\\n%s\\n' "$size"
 '''
 
 
+def stream_guest_bundle(repo: Path, command: list[str], bootstrap: bytes,
+                        timeout: int) -> subprocess.CompletedProcess[bytes]:
+    with subprocess.Popen(command, cwd=repo, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                          stderr=subprocess.PIPE, start_new_session=True) as stream:
+        try:
+            output, errors = stream.communicate(bootstrap, timeout=timeout)
+        except BaseException as error:
+            stop_ssh_process(stream)
+            if isinstance(error, subprocess.TimeoutExpired):
+                raise GuestUnavailable(f'SSH or guest run exceeded {timeout} seconds.') from error
+            raise
+    return subprocess.CompletedProcess(command, stream.returncode, output, errors)
+
+
 def run_remote(repo: Path, settings: GuestSettings, source: CandidateSource, request: GuestRequest,
                prefix: str, bundle: FullBundle | DeltaBundle) -> GuestReply:
     bootstrap = runner_bootstrap(request)
@@ -635,37 +625,55 @@ def run_remote(repo: Path, settings: GuestSettings, source: CandidateSource, req
     else:
         base, header = '', ''
         form, reason = BundleForm.FIRST, bundle.reason
-    timeout = settings.transfer_timeout_seconds
-    # Only a confirmed arm can authorize a separate run command.
-    armed = arm_guest(settings, uuid4().hex)
-    command = settings.command(run_shell(settings, source, len(bootstrap), armed))
-    stream_error: BaseException | None = None
-    try:
-        with subprocess.Popen(['bash', '-o', 'pipefail', '-c', STREAM_SOURCE, TARGET, prefix, base, header,
-                               *command], cwd=repo, stdin=subprocess.PIPE,
-                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True) as stream:
-            try:
-                output, errors = stream.communicate(bootstrap, timeout=timeout)
-            except BaseException:
-                stop_ssh_process(stream)
+    armed: ArmedGuestAttempt | None = None
+    stream: subprocess.CompletedProcess[bytes] | None = None
+    first_error: BaseException | None = None
+    first_failure = ''
+    retry_proof = False
+    reported_hold = False
+    while True:
+        try:
+            if armed is None:
+                armed = arm_guest(settings, uuid4().hex)
+                command = settings.command(run_shell(settings, source, len(bootstrap), armed))
+                stream = stream_guest_bundle(repo, ['bash', '-o', 'pipefail', '-c', STREAM_SOURCE,
+                                                     TARGET, prefix, base, header, *command],
+                                             bootstrap, settings.transfer_timeout_seconds)
+            while True:
+                if retry_proof:
+                    if not reported_hold:
+                        reported_hold = True
+                        with suppress(OSError, ValueError):
+                            print(GUEST_END_PENDING_MESSAGE, file=sys.stderr, flush=True)
+                    sleep(SSH_CONNECT_TIMEOUT_SECONDS)
+                retry_proof = True
+                proof = prove_guest_end(settings, armed)
+                if isinstance(proof, GuestEndProven):
+                    break
+                if not first_failure:
+                    first_failure = proof.detail
+            break
+        except BaseException as error:
+            if armed is None:
+                # The route can send a run only after the guest confirms the arm.
                 raise
-    except BaseException as error:
-        stream_error = error
-        raise
-    finally:
-        cleanup_detail = finish_guest_run(settings, armed)
-        if isinstance(stream_error, subprocess.TimeoutExpired):
-            raise GuestUnavailable(f'SSH or guest run exceeded {timeout} seconds. {cleanup_detail}') from stream_error
-        if stream_error is not None:
-            stream_error.add_note(cleanup_detail)
+            # Report the first interrupt even if the transfer failed before it.
+            if first_error is None or (isinstance(first_error, Exception) and not isinstance(error, Exception)):
+                first_error = error
+
+    cleanup_detail = 'Guest cleanup: ended' + (f' after {first_failure}' if first_failure else '')
+    if first_error is not None:
+        first_error.add_note(cleanup_detail)
+        raise first_error
+    assert stream is not None
     if stream.returncode:
-        diagnostics = errors.decode(errors='replace')
+        diagnostics = stream.stderr.decode(errors='replace')
         if stream.returncode == MISSING_PREREQUISITE_STATUS and MISSING_PREREQUISITE_MESSAGE in diagnostics:
             raise GuestMissingPrerequisite(diagnostics.strip())
         detail = ' '.join(diagnostics.split())[-1200:]
         raise GuestUnavailable(f'SSH or source stream exited {stream.returncode}: {detail or "no diagnostic"}. '
                                + cleanup_detail)
-    result, _, count = output.rstrip().rpartition(b'\n')
+    result, _, count = stream.stdout.rstrip().rpartition(b'\n')
     return GuestReply(result.decode('utf-8'), int(count) - len(bootstrap), form, reason)
 
 
