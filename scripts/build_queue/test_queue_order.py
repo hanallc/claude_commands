@@ -152,6 +152,7 @@ class QueueMoveTests(unittest.TestCase):
             assert isinstance(undone, wire.QueueMoved)
             self.assertEqual((undone.old_place, undone.new_place), (2, 5))
             self.assertEqual(ids(undone.line), ids(line))
+            self.assertEqual(fixture.server.dragged_ids, frozenset())
 
             request = wire.QueueMoveRequest("move", third, undone.line.revision, wire.QueueDrop(merge, "before"))
             moved, = fixture.server.handle_request(request)
@@ -163,34 +164,41 @@ class QueueMoveTests(unittest.TestCase):
             self.assertEqual(fixture.completed_queue_change(wire.PrioritySetRequest(
                 "bump-later", "later-unit", "fixture", "fixture")), [wire.Ok()])
             _ = fixture.run_pass()
-            after_bump = [third, merge, urgent, first, second]
+            after_bump = [third, merge, urgent, second, first]
             self.assertEqual(ids(move_line(fixture)), after_bump)
             inputs = fixture.server.last_inputs
             assert isinstance(inputs, records.QueueInputs)
             self.assertEqual([row["pid"] for _, row in gate.ranked_queue_waiters(inputs)],
-                             [requests[index].owner.pid for index in (4, 0, 1, 2, 3)])
+                             [requests[index].owner.pid for index in (4, 0, 1, 3, 2)])
             self.assertEqual(fixture.server.saved_order, tuple(after_bump))
             fixture.restart()
+            self.assertEqual(fixture.server.dragged_ids, frozenset({third}))
             newcomer = fixture.request(since=fixture.clock.now() - 30)
             _ = fixture.server.handle_request(newcomer)
             new_id, = ids(move_line(fixture))
             for waiting in reversed(requests):
                 _ = fixture.server.handle_request(waiting)
             current = move_line(fixture)
-            expected = [third, merge, urgent, first, new_id, second]
-            self.assertEqual(ids(current), expected)
+            self.assertEqual(ids(current), [*after_bump, new_id])
             self.assertEqual(fixture.server.handle_request(request), [moved])
             self.assertIsInstance(fixture.server.handle_request(wire.QueueMoveRequest(
                 "stale", first, line.revision, wire.QueueDrop(third, "before")))[0], wire.QueueMoveConflict)
+            self.assertEqual(fixture.server.handle_request(
+                wire.PriorityClearRequest("clear-later", "fixture", unit="later-unit")), [wire.Ok()])
+            after_clear = [third, merge, urgent, first, new_id, second]
+            self.assertEqual(ids(move_line(fixture)), after_clear)
+            self.assertEqual(fixture.completed_queue_change(wire.PrioritySetRequest(
+                "bump-dragged-unit", "ordinary", "fixture", "fixture")), [wire.Ok()])
+            self.assertEqual(ids(move_line(fixture)), after_clear)
             self.assertEqual(fixture.server.handle_request(wire.PriorityClearRequest("clear", "fixture")), [wire.Ok()])
             self.assertIsInstance(fixture.server.priority, records.NoQueuePriority)
-            _ = fixture.run_pass()
-            self.assertEqual(ids(move_line(fixture)), expected)
+            self.assertEqual(ids(move_line(fixture)), [third, new_id, second, merge, urgent, first])
             fixture.free(60 * GIB)
             write_pressure_reading(fixture.root / "pressure")
             fixture.allow_next_start()
             _ = fixture.run_pass()
             self.assertIn(requests[4].episode, fixture.server.reservations)
+            self.assertEqual(fixture.server.dragged_ids, frozenset())
             remaining = ids(move_line(fixture))
             self.assertNotIn(third, remaining)
             self.assertLess(remaining.index(merge), remaining.index(first))

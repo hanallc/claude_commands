@@ -2367,7 +2367,8 @@ The service skips an absent wait but keeps its entry until the request starts or
 A returning wait uses its saved entry.
 A new wait joins after the last saved entry in its priority group, even if that entry is absent.
 The first wait in a group joins before the first lower-priority entry, if there is one.
-A priority change applies to new entries in the saved order.
+A bump or clear moves the affected undragged waits to the end of their new group.
+Dragged waits keep their slots.
 Both hosts use the visible order for normal steps.
 Only starts that the local preview selects can pass a new remote startup hold.
 The table includes remote-only waits in the saved order.
