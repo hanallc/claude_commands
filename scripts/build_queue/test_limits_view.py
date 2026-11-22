@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import sqlite3
+import subprocess
+import tempfile
 import unittest
 from contextlib import closing
 from dataclasses import replace
@@ -17,7 +19,9 @@ from scripts.build_queue.progress_profile import NoCounter
 from scripts.build_queue.queue_fixture import fixture_reservation, head_reading
 from scripts.build_targets import target_config
 from scripts.build_targets.execution_transport import HanaControlTransport
-from scripts.buildlog import store
+from scripts.buildlog import repository, store
+from scripts.lib.git_test_support import commit_repository, fixture_git_environment
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.mac_test import claim_state
 
 
@@ -27,20 +31,41 @@ class BuildLimitsTests(unittest.TestCase):
         now = reading.explanation.now
         primary = "https://example.invalid/team/project"
         hana = "https://example.invalid/team/hana"
-        with closing(sqlite3.connect(":memory:")) as index:
-            _ = index.execute("CREATE TABLE steps (repo_identity TEXT, repo_path TEXT, repo TEXT, started_at TEXT)")
-            _ = index.executemany("INSERT INTO steps VALUES (?, ?, ?, ?)", [
-                (primary, "", "project", store.utc_iso(now)),
-                ("https://example.invalid/team/quiet", "", "quiet", store.utc_iso(now - 29 * 86400)),
-                ("https://example.invalid/team/old", "", "old", store.utc_iso(now - 31 * 86400)),
-                ("unknown", "", "Record without origin", store.utc_iso(now)),
+        with tempfile.TemporaryDirectory() as directory, closing(sqlite3.connect(":memory:")) as index:
+            root = Path(directory)
+            source = root / "source"
+            source.mkdir()
+            scratch = root / "scratch"
+            env = fixture_git_environment(root)
+
+            def git(folder: Path, *args: str) -> None:
+                _ = subprocess.run(["git", "-C", str(folder), *args], env=env, check=True,
+                                   capture_output=True, timeout=TEST_HANG_GUARD_SECS)
+
+            git(source, "init", "-q")
+            git(source, "remote", "add", "origin", "git@example.invalid:team/project.git")
+            _ = commit_repository(source, "Fixture", allow_empty=True, env=env)
+            git(root, "clone", "-q", "--shared", str(source), str(scratch))
+            _ = index.execute("CREATE TABLE steps (repo_identity TEXT, repo_path TEXT, started_at TEXT)")
+            _ = index.executemany("INSERT INTO steps VALUES (?, ?, ?)", [
+                (primary, "", store.utc_iso(now)),
+                ("https://example.invalid/other/project", "", store.utc_iso(now)),
+                ("https://example.invalid/team/quiet", "", store.utc_iso(now - 29 * 86400)),
+                ("https://example.invalid/team/old", "", store.utc_iso(now - 31 * 86400)),
+                (str(source), str(source), store.utc_iso(now)),
+                ("unknown", str(scratch), store.utc_iso(now)),
+                ("unknown", str(root / "missing"), store.utc_iso(now)),
             ])
             origins = limits_view.Origins()
-            history = limits_view.recent_steps(index, now, origins)
+            with mock.patch.object(repository, "output", wraps=repository.output) as git_read:
+                history = limits_view.recent_steps(index, now, origins)
+                self.assertEqual(git_read.call_count, 1)
+            self.assertEqual(origins.folders[str(scratch)], primary)
         policy = records.RepositoryRunLimits({"natedev.project": 1, "natedev.other": 2}, "merge-owner")
         reservations = (
             {**fixture_reservation(101, 0, step="gate"), "repo": "project", "repo_identity": primary, "unit": "regular"},
-            {**fixture_reservation(102, 0, step="gate"), "repo": "project", "repo_identity": primary, "unit": "merge-owner"},
+            {**fixture_reservation(102, 0, step="gate", folder=str(scratch)), "repo": "project", "unit": "merge-owner"},
+            {**fixture_reservation(103, 0, step="check", folder=str(root / "unknown")), "repo": "scratch"},
         )
         explanation = replace(reading.explanation,
             policy=replace(reading.explanation.policy, repository_runs=policy),
@@ -70,16 +95,22 @@ class BuildLimitsTests(unittest.TestCase):
             cloud_slots=9, hana=(limits_view.HanaCapacity(hana, "fixture-host", 1, None),),
             aws_targets=frozenset({"fixture-aws"}), origins=origins)
 
-        shown = limits_view.build_limits(queue, (), waits, cloud_names, {}, saved, UTC)
-        rows = {row.name: row for row in shown.repositories}
-        self.assertEqual(set(rows), {"project", "quiet", "Record without origin", "other (run limit)", "hana"})
-        cell = rows["project"].natedev
-        self.assertEqual((cell.used, cell.limit, cell.runs, cell.exempt), (2, 1, ["regular"], ["merge-owner"]))
+        with mock.patch.object(repository, "output", side_effect=AssertionError("Git read in the feed tick")):
+            shown = limits_view.build_limits(queue, (), waits, cloud_names, {}, saved, UTC)
+        self.assertEqual([(row.name, row.owner, row.quiet) for row in shown.repositories], [
+            ("hana", "", False), ("project", "team", False), ("project", "other", True), ("quiet", "", True),
+        ])
+        hana_row, project_row, spare_project, quiet = shown.repositories
+        cell = project_row.natedev
+        self.assertEqual((cell.used, cell.limit, cell.runs, cell.merge_above), (2, 1, ["regular"], ["merge-owner"]))
         self.assertEqual(cell.waits, {"The run limit for project on natedev is full.": ["Run limit"]})
-        self.assertIsNone(rows["quiet"].natedev.limit)
-        self.assertEqual(rows["other (run limit)"].natedev.limit, 2)
-        self.assertEqual((rows["hana"].aws.used, rows["hana"].aws.limit), (None, 1))
-        self.assertEqual(shown.natedev.shared[-1].waits,
+        self.assertIsNone(quiet.natedev.limit)
+        self.assertEqual(spare_project.natedev.used, 0)
+        self.assertEqual(shown.natedev.unattributed, 1)
+        self.assertEqual(shown.natedev.shared[-1].label, "other run limit")
+        self.assertEqual(shown.natedev.shared[-1].limit, 2)
+        self.assertEqual((hana_row.aws.used, hana_row.aws.limit), (None, 1))
+        self.assertEqual(next(metric for metric in shown.natedev.shared if metric.label == "disk").waits,
                          {"The build disk has less free space than the queue requires.": ["Disk wait"]})
         self.assertEqual(shown.natedev.shared[0].waits, {"This run needs more free memory to start.": ["Memory wait"]})
         self.assertEqual(shown.aws.waits, {"The queue cannot check whether this run can start.": ["AWS target wait"]})
@@ -91,8 +122,14 @@ class BuildLimitsTests(unittest.TestCase):
         })
         idle = limits_view.build_limits(reading, (), (), {}, {}, saved, UTC)
         self.assertEqual((idle.aws.shared[0].used, idle.aws.shared[0].limit), (0, 9))
-        self.assertEqual(idle.aws.state, "State unavailable")
-        self.assertIsNone(idle.natedev.shared[-1].used)
+        self.assertEqual(idle.aws.state, "")
+        self.assertIsNone(next(metric for metric in idle.natedev.shared if metric.label == "disk").used)
+        within_limit = replace(queue, explanation=replace(explanation,
+            policy=replace(explanation.policy, repository_runs=records.RepositoryRunLimits({"natedev.project": 2}, "merge-owner"))))
+        within = limits_view.build_limits(within_limit, (), waits, cloud_names, {}, saved, UTC)
+        merge_cell = next(row.natedev for row in within.repositories if row.owner == "team")
+        self.assertEqual(merge_cell.merge_above, [])
+        self.assertEqual(merge_cell.runs, ["regular", "merge-owner"])
         self.check_hana_claim(hana)
 
     def check_hana_claim(self, origin: str) -> None:

@@ -3242,7 +3242,7 @@ class LimitsRefresh:
             try:
                 current = self.pending.result()
                 previous = self.saved
-                if isinstance(current.history, charts.IndexUnavailable) and previous is not None and isinstance(previous.history, dict):
+                if isinstance(current.history, charts.IndexUnavailable) and previous is not None and isinstance(previous.history, frozenset):
                     current = replace(current, history=previous.history, history_stale=True)
                 self.saved = current
             except (OSError, ValueError, KeyError, RuntimeError) as error:
@@ -3252,7 +3252,7 @@ class LimitsRefresh:
             self.pending = None
         if self.pending is None and now >= self.next_at:
             self.pending = Future()
-            folders = tuple(self.saved.origins.pending) if self.saved is not None else ()
+            folders = tuple(self.saved.origins.active_folders) if self.saved is not None else ()
             Thread(target=refresh_limits, args=(self.pending, time.time(), folders),
                    name="build-limits-refresh", daemon=True).start()
             self.next_at = now + interval
