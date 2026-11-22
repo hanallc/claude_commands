@@ -45,9 +45,10 @@ from scripts.direct import phase_reservation, phase_table, plan_history, progres
 from scripts.direct.progress_history import _supplier_message  # pyright: ignore[reportPrivateUsage]
 from scripts.direct.recorder_fixture import invoke_recorder
 from scripts.direct.findings_test_support import STANDARD_CONFIG, invoke_findings
-from scripts.direct.test_phase_reservation import make_fixture_worktree, model_worktree_environment
+from scripts.direct.test_phase_reservation import isolate_fixture_git, make_fixture_worktree, model_worktree_environment
 from scripts.history.rounds import load_phases
 from scripts.history import history as stage_history
+from scripts.lib.git_test_support import fixture_git_environment
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.shell_test_support import shell_functions
 from scripts.lib.py_floor_test_support import seed_interpreter_cache
@@ -93,14 +94,16 @@ class ProgressHistoryTests(unittest.TestCase):
     @override
     def setUpClass(cls) -> None:
         super().setUpClass()
-        cls.repository_seed = Path(cls.enterClassContext(tempfile.TemporaryDirectory()))
+        fixture = Path(cls.enterClassContext(tempfile.TemporaryDirectory()))
+        cls.repository_seed = fixture / "repo"
         _ = subprocess.run(["git", "init", "-b", "feature/rubric", str(cls.repository_seed)],
-                           check=True, capture_output=True, text=True)
+                           check=True, capture_output=True, text=True, env=fixture_git_environment(fixture))
 
     @override
     def setUp(self) -> None:
         self.enterContext(patch.dict(os.environ, {"UNIT_SYNC_WRITES": "0"}))
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        isolate_fixture_git(self, self.root)
         _ = self.enterContext(patch.object(unit_runs, "RUN_ROOT", self.root / "unit"))
         unit_runs.RUN_ROOT.mkdir()
         _ = self.enterContext(patch.object(unit_runs, "FORMER_RUN_ROOT", self.root / "former"))
@@ -9375,6 +9378,7 @@ class StaffProgressHistoryTests(StaffTestCase):
         self.assertEqual(parsed.call_count, 4)
 
     def test_fixed_run_owner_survives_clear_and_uses_the_current_staff_folder_and_git_branch(self) -> None:
+        isolate_fixture_git(self, self.root)
         owner = fixture_member("showrunner", name="progress")
         first, second = self.root / "first", self.root / "second"
         first.mkdir()

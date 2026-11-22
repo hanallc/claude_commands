@@ -19,7 +19,7 @@ from typing import cast, override
 from unittest import mock
 
 from scripts.direct import phase_reservation  # noqa: E402
-from scripts.direct.test_phase_reservation import make_fixture_worktree, model_worktree_environment
+from scripts.direct.test_phase_reservation import isolate_fixture_git, make_fixture_worktree, model_worktree_environment
 from scripts.astra import design_roles  # noqa: E402
 from scripts.production import staff  # noqa: E402
 from scripts.production.staff_test_support import (  # noqa: E402
@@ -71,6 +71,7 @@ class BerthHookTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        isolate_fixture_git(self, self.root)
         self.repo = self.root / "rust" / "fixture"
         (self.repo / "src").mkdir(parents=True)
         for command in (["init", "-q", "-b", "main"], ["config", "user.name", "t"], ["config", "user.email", "t@example.invalid"],

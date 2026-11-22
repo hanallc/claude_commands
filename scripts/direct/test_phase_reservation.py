@@ -23,7 +23,7 @@ from unittest import mock
 from scripts.direct import phase_reservation, plan_history  # noqa: E402
 from scripts.agents import worker_lifecycle
 from scripts.lib import atomic_file
-from scripts.lib.git_test_support import write_fixture_git_config
+from scripts.lib.git_test_support import fixture_git_environment
 from scripts.production import staff
 from scripts.production.staff_test_support import fixture_member, fixture_unit_location, isolated_staff_file
 from scripts.lib.test_hang_guard import LauncherHangGuard, TEST_HANG_GUARD_SECS
@@ -43,8 +43,15 @@ def record_unit(test: unittest.TestCase, run: Path, home: Path, phase: str) -> N
         "owner_staff_id": row.id, "open_phases": [{"id": phase, "status": "active"}]}))
 
 
+def isolate_fixture_git(test: unittest.TestCase, root: Path) -> None:
+    """Use the fixture Git environment for direct commands and their children."""
+    environment = fixture_git_environment(root)
+    _ = test.enterContext(cast(contextlib.AbstractContextManager[object],
+                               mock.patch.dict(os.environ, environment, clear=True)))
+
+
 def model_worktree_environment(root: Path, configuration: Path) -> dict[str, str]:
-    """Give worktree creation private roots, records, and Git settings."""
+    """Give worktree creation private roots and records."""
     configuration.mkdir(parents=True, exist_ok=True)
     _ = (configuration / "build_folders.conf").write_text(
         f"roots.workspace={root / 'worktrees'}\nroots.build={root / 'build'}\n"
@@ -55,9 +62,7 @@ def model_worktree_environment(root: Path, configuration: Path) -> dict[str, str
     templates = root / "git-templates"
     templates.mkdir()
     return {"HOME": str(root), "CONF_DIR": str(configuration), "COPIES_CONFIG": str(copies),
-            "WORKTREES_STATE_DIR": str(root / "worktree-records"),
-            "GIT_CONFIG_GLOBAL": str(write_fixture_git_config(root)), "GIT_CONFIG_NOSYSTEM": "1",
-            "GIT_TEMPLATE_DIR": str(templates)}
+            "WORKTREES_STATE_DIR": str(root / "worktree-records"), "GIT_TEMPLATE_DIR": str(templates)}
 
 
 def make_fixture_worktree(source: Path, unit: str, short_name: str) -> Path:
@@ -77,6 +82,7 @@ class WorktreeAttributionTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        isolate_fixture_git(self, root)
         self.session = root / "run"
         self.session.mkdir()
         self.first = root / "rust" / "fixture"
@@ -160,6 +166,11 @@ class WorktreeAttributionTests(unittest.TestCase):
     def test_claim_refuses_a_model_worktree_for_another_unit(self) -> None:
         checkout = make_fixture_worktree(self.first, "other-unit", "p3")
         self.assert_model_worktree_refused("3", checkout, "the checkout is for unit 'other-unit'")
+
+    def test_claim_refuses_a_model_worktree_on_another_branch(self) -> None:
+        _ = subprocess.run(["git", "-C", str(self.second), "checkout", "-qb", "other-branch"],
+                           check=True, capture_output=True, timeout=TEST_HANG_GUARD_SECS)
+        self.assert_model_worktree_refused("2", self.second, "recorded branch 'reservation-p2'")
 
     def test_claim_uses_the_legacy_home_without_a_worktree_record(self) -> None:
         directory = phase_reservation.phase_directory(self.session, "1")
@@ -520,6 +531,7 @@ class AcquisitionRecordingTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        isolate_fixture_git(self, root)
         self.repo = root / "repo"
         self.repo.mkdir()
         _ = subprocess.run(["git", "-C", str(self.repo), "init", "-q"], check=True, capture_output=True,
@@ -618,6 +630,7 @@ class PhaseStateTests(unittest.TestCase):
         folder = tempfile.TemporaryDirectory()
         self.addCleanup(folder.cleanup)
         self.session = Path(folder.name)
+        isolate_fixture_git(self, self.session)
         record_unit(self, self.session, self.session, "34h")
 
     def phase_dir(self) -> Path:
@@ -628,7 +641,7 @@ class PhaseStateTests(unittest.TestCase):
 
     def run_verb(self, *arguments: str) -> tuple[int, str]:
         errors = io.StringIO()
-        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(errors):
+        with contextlib.chdir(self.session), contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(errors):
             code = phase_reservation.main([*arguments, "--session-dir", str(self.session), "--phase", "34h"])
         return code, errors.getvalue()
 
@@ -739,6 +752,7 @@ class PhaseRepairTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        isolate_fixture_git(self, self.root)
         self.repo = self.root / "repo with spaces"
         self.repo.mkdir()
         _ = subprocess.run(["git", "-C", str(self.repo), "init", "-q"], check=True, capture_output=True)
@@ -1122,6 +1136,7 @@ class HeldForTicketTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        isolate_fixture_git(self, self.root)
         self.repo = self.root / "unit worktree"
         self.repo.mkdir()
         _ = subprocess.run(["git", "-C", str(self.repo), "init", "-q"], check=True, capture_output=True)
