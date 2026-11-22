@@ -1,6 +1,7 @@
 """Check the Build limits reading with private settings and queue records."""
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 import subprocess
@@ -10,10 +11,11 @@ from contextlib import closing
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from threading import Event
 from unittest import mock
 
 from scripts.build_hold.owning_session import OwningSession
-from scripts.build_queue import admission_protocol as wire, admission_records as records, limits_view, placement
+from scripts.build_queue import admission_protocol as wire, admission_records as records, limits_view, memory_feed, placement, queue_view
 from scripts.build_queue.test_placement import PlacementFixture, placement_request
 from scripts.build_queue.cloud_progress import NoCloudProgress
 from scripts.build_queue.progress_profile import NoCounter
@@ -80,11 +82,49 @@ class BuildLimitsTests(unittest.TestCase):
                 self.assertEqual(lookup.call_count, 4)
             saved = limits_view.Background(history, limits_view.Metric("Money today", 8, 25, "USD"),
                                            limits_view.Metric("Money today", 2, 5, "USD"), origins=history.origins)
+            gate_source = workspace / "scripts/production/gate_routes.py"
+            gate_source.parent.mkdir(parents=True)
+            _ = gate_source.write_text('class SuiteMode:\n    GATE = "merge-gate"\n')
+            git(workspace, "add", str(gate_source))
+            _ = commit_repository(workspace, "Fixture route", env=env)
+            route_origin = "https://example.invalid/team/workspace"
+            routes = replace(history, checkouts={route_origin: workspace})
+            with mock.patch.object(repository, "output", wraps=repository.output) as route_read:
+                self.assertEqual(limits_view.aws_gate_routes(routes, True), {route_origin: True})
+                route_read.assert_called_once_with(
+                    ["git", "show", "HEAD:scripts/production/gate_routes.py"], str(workspace), repository.GIT_TIMEOUT_S)
+
+            started = Event()
+            release = Event()
+            updated = replace(saved, aws_money=limits_view.Metric("Money today", 9, 25, "USD"))
+
+            def read_limits(_now: float, _folders: tuple[str, ...]) -> limits_view.Background:
+                started.set()
+                if not release.wait(TEST_HANG_GUARD_SECS):
+                    raise RuntimeError("Fixture refresh did not finish")
+                return updated
+
+            refresh = memory_feed.LimitsRefresh()
+            refresh.saved = saved
+            with mock.patch.object(limits_view, "background", side_effect=read_limits) as refresh_read:
+                try:
+                    self.assertIs(refresh.current(10, 60), saved)
+                    self.assertTrue(started.wait(TEST_HANG_GUARD_SECS))
+                    self.assertIs(refresh.current(11, 60), saved)
+                    refresh_read.assert_called_once()
+                finally:
+                    release.set()
+                pending = refresh.pending
+                assert pending is not None
+                self.assertIs(pending.result(timeout=TEST_HANG_GUARD_SECS), updated)
+                self.assertIs(refresh.current(12, 60), updated)
+
             _ = (root / "build_admission.conf").write_text(
                 "[disk]\n# whole: 1..\nfree_floor_gib=31\n[]\n# whole: 1..\ncloud_gate_slots=4\n")
             _ = (root / "cloud_gate.conf").write_text("enabled=on\n")
             _ = (root / "mac_test.conf").write_text("offload=on\nlinux_only..claude=\nlinux_only.workspace=\n" +
-                                                   "# range: 1..\nmac_budget_gib=18\n# range: 1..\nmac_budget_gib.workspace=27\n")
+                                                   "# range: 1..\nmac_budget_gib=18\n# range: 1..\nmac_budget_gib.workspace=27\n" +
+                                                   "# range: 1..\nfree_floor_gib=100\n")
             _ = (root / "build_folders.conf").write_text(f"roots.slot_cargo={root}\n")
             baseline = reading.explanation
             policy = replace(baseline.policy,
@@ -104,6 +144,13 @@ class BuildLimitsTests(unittest.TestCase):
                 records.WaitingStep(6, "", "", "check", "", now, 0, records.ReadyForAdmission(),
                     placement_block=records.PlacementBlock("ssh", "hana-aws", "memory", "hana-episode")),
                 records.WaitingStep(9, "", "", "check", str(worktree), now, 0, limits),
+                records.WaitingStep(10, "", "", "check", str(worktree), now, 0, records.ReadyForAdmission(),
+                    placement_block=records.PlacementBlock("mac", "mac", "disk", "mac-disk")),
+                records.WaitingStep(11, "", "", "check", str(worktree), now, 0, records.EstimateExpired(now)),
+                records.WaitingStep(12, "", "", "", str(worktree), now, 0, records.ReadyForAdmission()),
+                records.WaitingStep(1, "", "", "gate", "", now, 0, limits, project="claude_commands"),
+                records.WaitingStep(13, "", "", "check", str(worktree), now, 0, records.NeedsMemory(),
+                    placement_pending=True),
             )
             explanation = replace(baseline, policy=policy, decided_from=replace(baseline.decided_from,
                 reservations=(reserve, merge), build_space=records.BuildSpaceLow(20, 31)))
@@ -126,27 +173,48 @@ class BuildLimitsTests(unittest.TestCase):
             hana = targets.TargetSnapshot(target_config.SshTarget("hana-aws", "linux", root / "hana.conf"),
                 (), (), eligibility.NO_BACKOFF)
             paths = claim_state.StatePaths(root / "mac")
+            mac_activity = root / "mac-builds.json"
+            _ = mac_activity.write_text(json.dumps({"read_at": now, "builds": [], "disk_free_bytes": 80 * records.GIB}))
+            with mock.patch.object(queue_view, "mac_reading_path", return_value=mac_activity):
+                disk_free = queue_view.read_mac_builds().disk_free_bytes
+            assert disk_free is not None
+            processes: dict[int, process_start.ProcessStart] = {
+                os.getpid(): process_start.Started("helper"), 2: process_start.Started("matched"),
+                7: process_start.Started("direct"), 8: process_start.Started("ends")}
+
+            def process(pid: int) -> process_start.ProcessStart:
+                return processes[pid]
+
             with (mock.patch.dict(os.environ, {"CONF_DIR": directory}),
+                    mock.patch.object(process_start, "process_start", side_effect=process),
                     mock.patch.object(target_config, "ssh_target_state_directory", return_value=paths.directory),
                     mock.patch.object(target_config, "read_execution_transport",
                                       return_value=HanaControlTransport(root / "hana.conf", "aws-hana")),
                     mock.patch.object(limits_view, "hana_route", return_value=None),
                     claim_state.record_claim_wait(paths, 2, str(worktree), "nextest", OwningSession("mac"), "mac-episode"),
                     claim_state.record_claim_wait(paths, 7, str(worktree), "nextest", OwningSession("direct"), "")):
+                with claim_state.record_claim_wait(paths, 8, str(worktree), "nextest", OwningSession("ended"), ""):
+                    self.assertEqual({wait.caller for wait in claim_state.read_claim_waits(paths)}, {2, 7, 8})
+                    processes[8] = process_start.Gone()
+                    self.assertEqual({wait.caller for wait in claim_state.read_claim_waits(paths)}, {2, 7})
+                    self.assertEqual(len(list(paths.claim_waits.iterdir())), 2)
                 reply = wire.parse_reply(wire.encode_reply(wire.ViewReply(queue)))
                 self.assertIsInstance(reply, wire.ViewReply)
                 assert isinstance(reply, wire.ViewReply)
                 current = limits_view.with_mac_claim_waits(reply.reading, (mac, hana))
-                self.assertEqual(len(current.view.waiting), 6)
-                result = limits_view.build_limits(current, (mac, hana), limits_view.QueueNames(
-                    {1: "local wait", 2: "mac wait", 3: "disk wait", 4: "hana wait", 5: "other repo", 6: "direct wait"},
-                    {cloud_owner: "cloud wait"}, {}),
-                    limits_view.Metric("Memory for builds", 7, 12, "GiB"), conf.read("build_folders"), saved, UTC, ())
+                self.assertEqual(len(current.view.waiting), 11)
+                cloud_names = {cloud_owner: "cloud wait"}
+                visible = limits_view.visible_waits(queue_view.QueueModel(current, {}), {
+                    1: "local wait", 2: "mac wait", 3: "disk wait", 4: "hana wait", 5: "other repo",
+                    6: "Mac disk wait", 7: "expired", 9: "duplicate", 10: "pending", 11: "direct wait",
+                }, cloud_names)
+                self.assertCountEqual([row.name for row in visible],
+                    ["local wait", "mac wait", "disk wait", "hana wait", "other repo", "Mac disk wait",
+                     "expired", "pending", "direct wait", "cloud wait"])
+                result = limits_view.build_limits(current, (mac, hana), limits_view.QueueNames(visible, cloud_names, {}),
+                    limits_view.Metric("Memory for builds", 7, 12, "GiB"), conf.read("build_folders"), saved, UTC, (),
+                    disk_free / records.GIB)
             self.assertEqual(claim_state.read_claim_waits(paths), ())
-            with claim_state.record_claim_wait(paths, 8, str(worktree), "nextest", OwningSession("ended"), ""):
-                with mock.patch.object(process_start, "process_start", return_value=process_start.Gone()):
-                    self.assertEqual(claim_state.read_claim_waits(paths), ())
-                self.assertEqual(list(paths.claim_waits.iterdir()), [])
             rows = {row.name: row for row in result.repositories}
             self.assertEqual(set(rows), {"claude_commands", "quiet", "workspace", "hana"})
             self.assertEqual((rows["claude_commands"].natedev.runs, rows["claude_commands"].natedev.exempt),
@@ -158,8 +226,11 @@ class BuildLimitsTests(unittest.TestCase):
             self.assertEqual(result.aws.shared[0], limits_view.Metric("Cloud gates", 0, 4))
             self.assertEqual(rows["claude_commands"].natedev.waits, {"Run limit full": ["local wait", "other repo"]})
             self.assertEqual(result.natedev.waits, {"Disk floor": ["disk wait"]})
-            self.assertEqual(rows["workspace"].mac.waits,
-                             {"Repository slot limit full": ["slot"], "Limit full": ["mac wait", "direct wait"]})
+            self.assertEqual(rows["workspace"].mac.waits, {"Limit full": ["mac wait", "direct wait"]})
+            self.assertEqual(result.mac.shared, (limits_view.Metric("Free disk", 80, 100, "GiB", "minimum"),))
+            self.assertEqual(result.mac.waits, {"Disk floor": ["Mac disk wait"]})
+            self.assertEqual(rows["workspace"].natedev.waits, {"Evidence pending": ["expired"]})
+            self.assertEqual(rows["workspace"].unplaced, {"Evidence pending": ["pending"]})
             self.assertEqual(rows["hana"].aws.waits, {"Memory": ["hana wait"]})
             self.assertFalse(rows["quiet"].aws.available)
             self.assertEqual(result.aws.waits, {"Gate limit full": ["cloud wait"]})
@@ -176,6 +247,16 @@ class BuildLimitsTests(unittest.TestCase):
             self.assertIsInstance(reply, wire.PlacementWait)
             fixture.server.placement_eligibility[request.episode] = (
                 placement.CandidateEligibility(target, placement.TemporaryExclusion("busy")),)
+            alternate = replace(target, target="mac", host="fixture-mac", provider="mac")
+            fixture.server.placement_eligibility[request.episode] += (
+                placement.CandidateEligibility(alternate, placement.TemporaryExclusion("disk")),)
+            actual = fixture.server._placement_wait_reading(head_reading())  # pyright: ignore[reportPrivateUsage]
+            self.assertTrue(actual.view.waiting[-1].placement_pending)
+            self.assertIsNone(actual.view.waiting[-1].placement_block)
+            fixture.server.placement_capacity_waits[request.episode] = target
+            reply = fixture.server._placement_reply(request, placement.ResourceHolderUnknown())  # pyright: ignore[reportPrivateUsage]
+            assert isinstance(reply, wire.PlacementWait)
+            self.assertEqual(reply.wait, wire.PlacementResourceWait("aws", "busy"))
             actual = fixture.server._placement_wait_reading(head_reading())  # pyright: ignore[reportPrivateUsage]
             self.assertEqual(actual.view.waiting[-1].placement_block,
                              records.PlacementBlock("ssh", "aws", "busy", request.episode))

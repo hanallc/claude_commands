@@ -492,13 +492,14 @@ def record_claim_wait(paths: StatePaths, caller: int, folder: str, name: str,
     """Keep one record for the life of this claim wait."""
     pid = os.getpid()
     owner = process_start.process_start(pid)
-    if not isinstance(owner, process_start.Started):
+    caller_identity = owner if caller == pid else process_start.process_start(caller)
+    if not isinstance(owner, process_start.Started) or not isinstance(caller_identity, process_start.Started):
         yield
         return
     path = paths.claim_waits / f"{pid}-{uuid4().hex}.json"
     try:
         paths.claim_waits.mkdir(parents=True, exist_ok=True)
-        write_text_atomic(path, json.dumps({"pid": pid, "start": owner.start, "caller": caller,
+        write_text_atomic(path, json.dumps({"pid": pid, "start": owner.start, "caller": caller, "caller_start": caller_identity.start,
             "folder": folder, "name": name, "session": session_id(session), "episode": episode,
             "reason": "busy", "since": time.time()}, separators=(",", ":")))
     except OSError:
@@ -514,7 +515,7 @@ def record_claim_wait(paths: StatePaths, caller: int, folder: str, name: str,
 
 
 def read_claim_waits(paths: StatePaths) -> tuple[ClaimWait, ...]:
-    """Read live claim waits and remove files whose writers have exited."""
+    """Read waits whose helper and caller still have the recorded identity."""
     waits: list[ClaimWait] = []
     for path in paths.claim_waits.glob("*.json"):
         try:
@@ -522,16 +523,22 @@ def read_claim_waits(paths: StatePaths) -> tuple[ClaimWait, ...]:
             if row is None:
                 continue
             pid, start = row.get("pid"), row.get("start")
-            if not isinstance(pid, int) or not isinstance(start, str):
+            caller, caller_start, since = row.get("caller"), row.get("caller_start"), row.get("since")
+            if (not isinstance(pid, int) or not isinstance(start, str)
+                    or not isinstance(caller, int) or not isinstance(caller_start, str)):
                 continue
             owner = process_start.process_start(pid)
-            if (isinstance(owner, (process_start.Gone, process_start.Zombie))
-                    or isinstance(owner, process_start.Started) and owner.start != start):
+            caller_identity = owner if caller == pid else process_start.process_start(caller)
+            identities = ((owner, start), (caller_identity, caller_start))
+            if any(isinstance(identity, (process_start.Gone, process_start.Zombie))
+                   or isinstance(identity, process_start.Started) and identity.start != saved
+                   for identity, saved in identities):
                 path.unlink(missing_ok=True)
                 continue
-            caller, since = row.get("caller"), row.get("since")
+            if not all(isinstance(identity, process_start.Started) for identity, _ in identities):
+                continue
             folder, name, session, episode = (row.get(key) for key in ("folder", "name", "session", "episode"))
-            if (isinstance(caller, int) and isinstance(since, (int, float))
+            if (isinstance(since, (int, float))
                     and isinstance(folder, str) and isinstance(name, str) and isinstance(session, str)
                     and isinstance(episode, str) and row.get("reason") == "busy"):
                 waits.append(ClaimWait(caller, folder, name, session, episode, "busy", since))

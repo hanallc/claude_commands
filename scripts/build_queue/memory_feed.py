@@ -18,9 +18,11 @@ import sys
 import time
 from collections import Counter
 from collections.abc import Mapping, Sequence
+from concurrent.futures import Future
 from dataclasses import dataclass, replace
 from enum import Enum, auto
 from pathlib import Path
+from threading import Thread
 from typing import TYPE_CHECKING, Literal, NotRequired, TypedDict, assert_never, overload
 
 
@@ -2988,6 +2990,8 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
         cause = waiter.reason.cause if isinstance(waiter.reason, admission_records.HeadAdmissionStatus) else waiter.reason
         if waiter.placement_block is not None:
             reason = limits_view.placement_reason(waiter.placement_block.reason)
+        elif waiter.placement_pending:
+            reason = "Evidence pending"
         elif isinstance(cause, admission_records.BehindHead):
             order = order_holds.get(waiter.pid)
             blocker = (positions.get(order.waiter["pid"], 0) if isinstance(order, admission_records.HeldBehindHead)
@@ -3048,11 +3052,11 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
             work_rows.append(mac_row)
             mac_runs.append((build.repository, build.session, mac_row["name"]))
     work_rows.sort(key=lambda row: row["started_at"])
-    waiting_rows: list[WaitRow | CloudWaitRow] = list(waiters.values())
     model = queue_view.QueueModel(parsed, labels, names=names)
     limit_cloud_names: dict[wire.Owner, str] = {}
     cloud_slots_used = 0
     cloud_slots = 0
+    cloud_waiters: dict[wire.Owner, CloudWaitRow] = {}
     if isinstance(parsed, wire.CloudQueueRead):
         cloud_slots = parsed.cloud_slots
         rows = queue_view.cloud_rows(model)
@@ -3061,7 +3065,6 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
         cloud_slots_used = sum(isinstance(row.wait, admission_records.ReadyForAdmission)
             or isinstance(row.wait.state, ReservedCloudSlot) for row in rows)
         interval = queue_view.cloud_push_interval()
-        cloud_waiters: dict[wire.Owner, CloudWaitRow] = {}
         for cloud in rows:
             information = queue_view.cloud_work(cloud, explanation.now, parsed.cloud_gate_stale_pushes, interval)
             recorded = cloud.identity
@@ -3118,13 +3121,11 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
             else:
                 work_rows.append({**values, "started_at": cloud.started_at or cloud.since})
         work_rows.sort(key=lambda row: row["started_at"])
-        waiting_rows = []
-        for entry in queue_view.waiting_builds(model):
-            if isinstance(entry, wire.RepositorySlotRow):
-                continue
-            waiting_row = cloud_waiters.get(entry.owner) if isinstance(entry, wire.CloudRow) else waiters.get(entry.position)
-            if waiting_row is not None:
-                waiting_rows.append(waiting_row)
+    visible_waits = limits_view.visible_waits(model, {place: row["name"] for place, row in waiters.items()},
+                                              {owner: row["name"] for owner, row in cloud_waiters.items()})
+    waiting_rows: list[WaitRow | CloudWaitRow] = [
+        cloud_waiters[entry.owner] if isinstance(entry := visible.source, wire.CloudRow) else waiters[entry.position]
+        for visible in visible_waits]
     unmatched_priority_text = ""
     unmatched_priority_entries: list[admission_records.PriorityEntry] = []
     queued_priority_units: list[str] = []
@@ -3201,12 +3202,13 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
         "swap_rows": configuration.swap_rows, "leftovers": leftovers,
     }
     if limit_background is not None:
-        limit_names = limits_view.QueueNames({place: row["name"] for place, row in waiters.items()},
+        limit_names = limits_view.QueueNames(visible_waits,
             limit_cloud_names, {session: identity.owner_text for session, identity in labels.items()})
         page["build_limits"] = limits_view.build_limits(parsed, snapshots, limit_names,
             limits_view.Metric("Memory for builds", gib(captured.cap_use),
                                gib(captured.cap) if isinstance(captured.cap, int) else None, "GiB"),
-            folder_settings, limit_background, zone, mac_runs)
+            folder_settings, limit_background, zone, mac_runs,
+            gib(mac_reading.disk_free_bytes) if mac_reading.disk_free_bytes is not None else None)
     page["render_seconds"] = time.perf_counter() - started
     return page
 
@@ -3234,6 +3236,35 @@ def notify_unplaced_mac_runs(reading: queue_view.MacBuildReading, notified: set[
         notified.update((run.pid, run.started_at) for run in new_runs)
 
 
+def refresh_limits(result: Future[limits_view.Background], now: float, active_folders: tuple[str, ...]) -> None:
+    try:
+        result.set_result(limits_view.background(now, active_folders))
+    except (OSError, ValueError, KeyError, RuntimeError) as error:
+        result.set_exception(error)
+
+
+class LimitsRefresh:
+    def __init__(self) -> None:
+        self.saved: limits_view.Background | None = None
+        self.pending: Future[limits_view.Background] | None = None
+        self.next_at: float = 0.0
+
+    def current(self, now: float, interval: float) -> limits_view.Background | None:
+        if self.pending is not None and self.pending.done():
+            try:
+                self.saved = self.pending.result()
+            except (OSError, ValueError, KeyError, RuntimeError) as error:
+                print(f"Build limits refresh failed: {error}", file=sys.stderr)
+            self.pending = None
+        if self.pending is None and now >= self.next_at:
+            self.pending = Future()
+            folders = tuple(self.saved.origins.active_folders) if self.saved is not None else ()
+            Thread(target=refresh_limits, args=(self.pending, time.time(), folders),
+                   name="build-limits-refresh", daemon=True).start()
+            self.next_at = now + interval
+        return self.saved
+
+
 def main(argv: Sequence[str]) -> int:
     args = page_arguments(argv)
     if args.command == "link":
@@ -3244,7 +3275,7 @@ def main(argv: Sequence[str]) -> int:
     last_good: MemoryPage | NoGoodReading = NoGoodReading()
     report_version = ""
     next_report_at = 0.0
-    limit_background: limits_view.Background | None = None
+    limit_refresh = LimitsRefresh()
     next_mac_at = 0.0
     holders: TokenHolders | TokenHoldersUnknown = NO_TOKEN_DUMP_YET
     next_tokens_at = 0.0
@@ -3256,12 +3287,13 @@ def main(argv: Sequence[str]) -> int:
         now = time.monotonic()
         if now >= next_report_at:
             report = report_file(report_reading(configuration.history_days))
-            limit_background = limits_view.background(time.time(), limit_background)
             if report.version != report_version:
                 # The report goes first, so memory.json never names a report that is not written.
                 write_text_atomic(configuration.output_folder / REPORT_NAME, report.text, new_file_mode=0o644)
                 report_version = report.version
             next_report_at = now + configuration.report_refresh_seconds
+        limit_background = (limits_view.background(time.time()) if args.once else
+                            limit_refresh.current(now, configuration.report_refresh_seconds))
         try:
             if now >= next_mac_at:
                 queue_view.refresh_mac_builds()

@@ -1130,6 +1130,7 @@ class WaitingStep:
     job: StepJob | GateJobNotRecorded = field(default=GATE_JOB_NOT_RECORDED, kw_only=True)
     ci_runner: str = field(default="", kw_only=True)
     placement_block: PlacementBlock | None = field(default=None, kw_only=True)
+    placement_pending: bool = field(default=False, kw_only=True)
 
 
 @dataclass(frozen=True)
