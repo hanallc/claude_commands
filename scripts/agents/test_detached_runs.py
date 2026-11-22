@@ -1997,9 +1997,12 @@ sys.exit(status)
         original = process_start.Started("original")
         gone = process_start.Gone()
         replacement = process_start.Started("replacement")
+        unreadable = process_start.Unreadable("fixture start read failed")
         cases = (
             ("leader already gone", gone, gone, leader, True, "finished"),
             ("leader exits as watcher leaves", original, gone, leader, True, "finished"),
+            ("leader unreadable with live descendants", unreadable, unreadable, leader, True, "finished"),
+            ("leader unreadable after the group exits", unreadable, unreadable, leader, False, "running"),
             ("group ID reused after watcher leaves", original, replacement, leader, False, "finished"),
             ("watcher belongs to another group", gone, gone, leader + 1, False, "running"),
         )
@@ -2009,7 +2012,7 @@ sys.exit(status)
                 self.update_record(path, command_pid=leader, command_group=leader, command_started=original.start)
                 events: list[str] = []
                 left_group = False
-                descendants_live = True
+                descendants_live = case != "leader unreadable after the group exits"
 
                 def read_group() -> int:
                     if left_group:
@@ -2023,6 +2026,8 @@ sys.exit(status)
                     left_group = True
 
                 def read_start(_pid: int, **_options: object) -> process_start.ProcessStart:
+                    if isinstance(after, process_start.Unreadable) and "send TERM" in events:
+                        return gone
                     return after if left_group else before
 
                 def send_term(pid: int, number: int) -> None:
@@ -2105,6 +2110,43 @@ sys.exit(status)
                 self.assertEqual(now, began + grace)
                 sleep.assert_not_called()
                 reap.assert_called_once_with(str(self.session.resolve()))
+
+    def test_watcher_limits_the_unscoped_group_scan_to_the_stop_grace(self) -> None:
+        leader = DEAD_PID
+        path = self.record(["fixture command"])
+        self.update_record(path, command_pid=leader, command_group=leader, command_started="original",
+                           scope_error="no verified scope")
+        now = 20.0
+
+        def read_start(pid: int, _proc_root: Path) -> process_start.ProcessStart:
+            nonlocal now
+            self.assertEqual(pid, leader)
+            now += 0.75
+            return process_start.Gone()
+
+        def scan(argv: list[str], *, timeout: float, **_options: object) -> subprocess.CompletedProcess[str]:
+            nonlocal now
+            self.assertEqual(argv[:2], ["ps", "-A"])
+            self.assertEqual(timeout, 1.25)
+            now += timeout
+            raise subprocess.TimeoutExpired(argv, timeout)
+
+        with (patch.object(sys, "platform", "linux"),
+              patch.object(process_stop, "supported", return_value=True),
+              patch.object(detached_runs, "stop_command", return_value=False),
+              patch.object(detached_runs, "_scope_stop_graces", return_value=(2.0, 2.0)),
+              patch.object(detached_runs, "reap_orphans", return_value=[]) as reap,
+              patch.object(os, "setsid"),
+              patch.object(process_start, "proc_table_start", side_effect=read_start) as read,
+              patch.object(subprocess, "run", side_effect=scan) as ps,
+              patch.object(time, "monotonic", side_effect=lambda: now),
+              patch.object(time, "sleep") as sleep):
+            self.assertEqual(detached_runs.main(["supervisor-gone", str(path)]), 0)
+        self.assertEqual(now, 22.0)
+        read.assert_called_once()
+        ps.assert_called_once()
+        sleep.assert_not_called()
+        reap.assert_called_once_with(str(self.session.resolve()))
 
     def test_stop_refuses_a_record_without_a_current_command_group(self) -> None:
         path = self.record([sys.executable, "-c", "pass"])
@@ -3458,7 +3500,7 @@ class PaneRunDeliveryTests(unittest.TestCase):
         self.assertTrue(path.with_suffix(detached_runs.PENDING_STOP_SUFFIX).exists())
         group_live = True
 
-        def group_is_live(_group: int) -> bool:
+        def group_is_live(_group: int, **_options: object) -> bool:
             return group_live
 
         def finish_group(_seconds: float) -> None:
@@ -4120,7 +4162,7 @@ class PaneRunDeliveryTests(unittest.TestCase):
 
         group_live = True
 
-        def group_is_live(_group: int) -> bool:
+        def group_is_live(_group: int, **_options: object) -> bool:
             return group_live
 
         def release_group(_seconds: float) -> None:
@@ -4349,7 +4391,7 @@ class PaneRunDeliveryTests(unittest.TestCase):
         other_path = Path(other["log"]).with_suffix(".json")
         write_text_atomic(other_path, json.dumps(other))
 
-        def group_is_live(value: int) -> bool:
+        def group_is_live(value: int, **_options: object) -> bool:
             return value == group
 
         with (patch.object(detached_run_process, "supervises", return_value=False),

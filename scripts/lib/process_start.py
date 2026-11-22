@@ -1,6 +1,7 @@
 """Read a process start without losing the reason for an absent identity."""
 from __future__ import annotations
 
+from dataclasses import dataclass
 import os
 from pathlib import Path
 import re
@@ -71,14 +72,39 @@ def process_start_format() -> str:
     return "darwin-lstart-utc-c-v1" if sys.platform == "darwin" else "linux-proc-stat22-v1"
 
 
-def process_start(pid: int, *, deadline: float | None = None) -> ProcessStart:
-    """Read the process start and limit the ps read to the deadline."""
+@dataclass(frozen=True)
+class ProcessReadDeadline:
+    """A process read must finish within this monotonic deadline."""
+
+    at: float
+
+
+class StandardProcessReadBudget:
+    """Use the standard process read timeout."""
+
+
+if TYPE_CHECKING:
+    ProcessReadBudget = StandardProcessReadBudget | ProcessReadDeadline
+else:
+    ProcessReadBudget = object
+
+STANDARD_PROCESS_READ_BUDGET = StandardProcessReadBudget()
+
+
+def ps_read_timeout(budget: ProcessReadBudget) -> float:
+    """Limit the standard ps timeout to the time that remains."""
+    cap = 5.0
+    return min(cap, budget.at - time.monotonic()) if isinstance(budget, ProcessReadDeadline) else cap
+
+
+def process_start(pid: int, *, budget: ProcessReadBudget = STANDARD_PROCESS_READ_BUDGET) -> ProcessStart:
+    """Read the process start within the read budget."""
+    timeout = ps_read_timeout(budget)
+    if timeout <= 0:
+        return Unreadable("the process read reached its deadline")
     if sys.platform == "darwin":
         if pid <= 0:
             return Unreadable("invalid process id")
-        timeout = min(5.0, deadline - time.monotonic()) if deadline is not None else 5.0
-        if timeout <= 0:
-            return Unreadable("the process read reached its deadline")
         try:
             result = subprocess.run(
                 ["ps", "-p", str(pid), "-o", "lstart=", "-o", "stat="],

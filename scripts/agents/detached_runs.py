@@ -673,9 +673,11 @@ def _number(value: object, default: float) -> float:
     return float(value) if isinstance(value, (int, float)) else default
 
 
-def _group_is_live(group: int, *, deadline: float | None = None) -> bool:
+def _group_is_live(
+    group: int, *, budget: process_start.ProcessReadBudget = process_start.STANDARD_PROCESS_READ_BUDGET,
+) -> bool:
     """Keep the run pending while its group has live processes or cannot be read."""
-    timeout = min(5.0, deadline - time.monotonic()) if deadline is not None else 5.0
+    timeout = process_start.ps_read_timeout(budget)
     if timeout <= 0:
         return True
     try:
@@ -700,13 +702,14 @@ class SavedProcessIdReused:
 
 
 def _saved_process(
-    pid: object, started: object, *, deadline: float | None = None,
+    pid: object, started: object,
+    *, budget: process_start.ProcessReadBudget = process_start.STANDARD_PROCESS_READ_BUDGET,
 ) -> process_start.ProcessStart | SavedProcessIdReused:
     """Read the saved process identity and identify a reused PID."""
     if not isinstance(started, str) or not started or _integer(pid) <= 0:
         return process_start.Gone()
-    observed = (process_start.process_start(_integer(pid)) if deadline is None else
-                process_start.process_start(_integer(pid), deadline=deadline))
+    observed = (process_start.process_start(_integer(pid), budget=budget)
+                if isinstance(budget, process_start.ProcessReadDeadline) else process_start.process_start(_integer(pid)))
     if isinstance(observed, (process_start.Started, process_start.Zombie)) and observed.start != started:
         return SavedProcessIdReused()
     return observed
@@ -729,14 +732,17 @@ def _has_saved_cgroup(raw: Mapping[str, object]) -> bool:
     return "command_slice" in raw
 
 
-def _command_has_ended(raw: Mapping[str, object], pid: int) -> bool:
+def _command_has_ended(
+    raw: Mapping[str, object], pid: int,
+    *, budget: process_start.ProcessReadBudget = process_start.STANDARD_PROCESS_READ_BUDGET,
+) -> bool:
     if "command_slice" in raw:
         run_slice = raw["command_slice"]
         try:
             return process_stop.is_slice_identity(run_slice) and process_stop.slice_has_ended(run_slice)
         except process_stop.SliceStopFailed:
             return False
-    command = _saved_process(raw.get("command_pid"), raw.get("command_started"))
+    command = _saved_process(raw.get("command_pid"), raw.get("command_started"), budget=budget)
     if isinstance(command, (process_start.Started, process_start.Unreadable)):
         return False
     group = _integer(raw.get("command_group"))
@@ -744,11 +750,12 @@ def _command_has_ended(raw: Mapping[str, object], pid: int) -> bool:
         leader = group == _integer(raw.get("command_pid"))
         if leader and isinstance(command, SavedProcessIdReused):
             return True
-        if not _group_is_live(group):
+        if not _group_is_live(group, budget=budget):
             return True
         # The group ID can be reused after the last member exits.
-        return leader and isinstance(_saved_process(group, raw.get("command_started")), SavedProcessIdReused)
-    supervisor = _saved_process(pid, raw.get("supervisor_started"))
+        return leader and isinstance(
+            _saved_process(group, raw.get("command_started"), budget=budget), SavedProcessIdReused)
+    supervisor = _saved_process(pid, raw.get("supervisor_started"), budget=budget)
     owns_group = isinstance(supervisor, (process_start.Started, process_start.Zombie))
     if not owns_group and isinstance(command, process_start.Zombie):
         try:
@@ -757,7 +764,7 @@ def _command_has_ended(raw: Mapping[str, object], pid: int) -> bool:
             pass
         except OSError:
             return False
-    return not owns_group or not _group_is_live(pid)
+    return not owns_group or not _group_is_live(pid, budget=budget)
 
 
 def _stopped_group_has_ended(record: RunRecord) -> bool:
@@ -2239,12 +2246,13 @@ def command_supervise(args: argparse.Namespace) -> int:
 
 def _wait_for_group(command: CommandGroup, deadline: float) -> None:
     """Wait for the saved command group within the stop grace."""
+    budget = process_start.ProcessReadDeadline(deadline)
     while time.monotonic() < deadline:
-        leader = _saved_process(command.group, command.started, deadline=deadline)
+        leader = _saved_process(command.group, command.started, budget=budget)
         if isinstance(leader, SavedProcessIdReused):
             return
         if isinstance(leader, (process_start.Gone, process_start.Zombie)):
-            if not _group_is_live(command.group, deadline=deadline):
+            if not _group_is_live(command.group, budget=budget):
                 return
         remaining = deadline - time.monotonic()
         if remaining <= 0:
@@ -2256,9 +2264,12 @@ def _stop_watched_group(path: Path, watched: CommandGroup) -> None:
     """Send TERM to the group that the watcher just left."""
     def verify_group() -> CommandGroup | CommandGroupUnverified:
         record = worker_lifecycle.read_json_object(path)
-        if (record.get("status") != "running" or _has_saved_cgroup(record) or _recorded_group(record) != watched
-                or isinstance(_saved_process(watched.group, watched.started),
-                              (SavedProcessIdReused, process_start.Unreadable))):
+        if record.get("status") != "running" or _has_saved_cgroup(record) or _recorded_group(record) != watched:
+            return CommandGroupUnverified()
+        leader = _saved_process(watched.group, watched.started)
+        if isinstance(leader, SavedProcessIdReused):
+            return CommandGroupUnverified()
+        if isinstance(leader, process_start.Unreadable) and not _group_is_live(watched.group):
             return CommandGroupUnverified()
         return watched
 
@@ -2300,7 +2311,8 @@ def command_supervisor_gone(args: argparse.Namespace) -> int:
     elif record.get("scope_error") and not _has_saved_cgroup(record):
         grace, _ = _scope_stop_graces()
         deadline = time.monotonic() + grace
-        while time.monotonic() < deadline and not _command_has_ended(record, record["pid"]):
+        budget = process_start.ProcessReadDeadline(deadline)
+        while time.monotonic() < deadline and not _command_has_ended(record, record["pid"], budget=budget):
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 break
