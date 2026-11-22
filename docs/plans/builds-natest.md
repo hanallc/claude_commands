@@ -1253,7 +1253,7 @@ Ordered after the red main repair and the guard repair (builds). It does not mov
 **Depends on:** Phase 425
 
 #### Work Order
-- **Goal:** a test run stopped by SIGTERM closes or removes its record in `~/.local/state/gate/active-runs/<repo>/`, and a later run drops a record whose pid is dead. builds 23:10: three records from stopped efficiency phase 46 test runs (pids 3022152 about 21:18, 3306214 at 22:56, 646641 at 23:10 with finished false), all exit 143; a dead record makes the next gate fail.
+- **Goal:** a test run stopped by SIGTERM closes or removes its record in `~/.local/state/gate/active-runs/<repo>/`, and a later run drops a record whose pid is dead. builds 23:10: three records from stopped efficiency phase 46 test runs (pids 3022152 about 21:18, 3306214 at 22:56, 646641 at 23:10 with finished false), all exit 143; a dead record makes the next gate fail. builds 23:18: a fourth, pid 3400386 (resources 143v run, stopped 23:13, repo /build/claude/resources/3) has finished true; the fix also covers a finished record that stays behind (`GateRecovery.finish` keeps a record that names folders).
 - **Spec:**
   1. Find why a SIGTERM stop skips the record close (`scripts/production/gate.py`; `GateRecovery.finish` :748-754 keeps a record that names folders; `recover_gate_directory` :786-819 skips finished records at :794 and checks pid plus start at :796-800). Name the path with file:line, and why a dead record fails the next gate after 425.
   2. On SIGTERM, the test run closes or removes its record through the existing finish path. Copy no code.
