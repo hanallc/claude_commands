@@ -36,6 +36,14 @@ class NoScopeUnit:
     """The caller has no dedicated scope to stop."""
 
 
+@dataclass(frozen=True)
+class _PinnedScope:
+    """An open scope directory and its verified member pidfds."""
+
+    directory: int
+    members: dict[int, int]
+
+
 def supported() -> bool:
     return sys.platform == "linux" and hasattr(os, "pidfd_open") and hasattr(signal, "pidfd_send_signal")
 
@@ -76,10 +84,10 @@ def _members(leader_pid: int) -> list[ProcessLifetime]:
     return members
 
 
-def _scope_path(process: ProcessLifetime, scope: ScopeUnit) -> Path | NoScopeUnit:
+def _scope_path(pid: int, scope: ScopeUnit) -> Path | NoScopeUnit:
     """Find the candidate scope in the process's cgroup record."""
     try:
-        for line in (PROC / str(process.pid) / "cgroup").read_bytes().splitlines():
+        for line in (PROC / str(pid) / "cgroup").read_bytes().splitlines():
             if line.startswith(b"0::"):
                 path = Path(os.fsdecode(line[3:]))
                 if (path.is_absolute() and ".." not in path.parts
@@ -90,59 +98,76 @@ def _scope_path(process: ProcessLifetime, scope: ScopeUnit) -> Path | NoScopeUni
     return NoScopeUnit()
 
 
-def _open_scope_kill(path: Path, process: ProcessLifetime, descriptor: int) -> int:
-    """Verify membership in the open directory before opening its kill file."""
+def _scope_members(directory: int) -> set[int]:
+    descriptor = os.open("cgroup.procs", os.O_RDONLY | os.O_NOFOLLOW, dir_fd=directory)
+    with os.fdopen(descriptor, "rb") as stream:
+        return {int(pid) for pid in stream.read().split()}
+
+
+def _pin_scope(path: Path, anchor: int, anchor_fd: int, group: dict[int, int],
+               cleanup: ExitStack) -> _PinnedScope:
+    """Verify the anchor and pin the members of the open scope."""
     directory = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    _ = cleanup.callback(os.close, directory)
+    pids = _scope_members(directory)
+    if anchor not in pids:
+        raise ProcessLookupError("the process is outside the open scope")
+    members = {pid: group[pid] for pid in pids if pid in group}
+    for pid in pids - members.keys():
+        start = process_start.proc_table_start(pid, PROC)
+        if isinstance(start, process_start.Started):
+            with suppress(ProcessLookupError):
+                members[pid] = cleanup.enter_context(pin_process(ProcessLifetime(pid, start.start)))
+    # A PID can change owners between the membership read and the pidfd open.
+    current_members = _scope_members(directory)
+    poller = select.poll()
+    poller.register(anchor_fd, select.POLLIN)
+    if anchor not in current_members or poller.poll(0):
+        raise ProcessLookupError("the process left during scope verification")
+    return _PinnedScope(directory, {pid: fd for pid, fd in members.items() if pid in current_members})
+
+
+def _kill_scope(scope: _PinnedScope) -> None:
+    descriptor = os.open("cgroup.kill", os.O_WRONLY | os.O_NOFOLLOW, dir_fd=scope.directory)
     try:
-        members = os.open("cgroup.procs", os.O_RDONLY | os.O_NOFOLLOW, dir_fd=directory)
-        with os.fdopen(members, "rb") as stream:
-            if str(process.pid).encode("ascii") not in stream.read().split():
-                raise ProcessLookupError("the process is outside the open scope")
-        poller = select.poll()
-        poller.register(descriptor, select.POLLIN)
-        if poller.poll(0):
-            raise ProcessLookupError("the process exited during scope verification")
-        return os.open("cgroup.kill", os.O_WRONLY | os.O_NOFOLLOW, dir_fd=directory)
+        _ = os.write(descriptor, b"1\n")
     finally:
-        os.close(directory)
+        os.close(descriptor)
 
 
 def stop_command_tree(leader: ProcessLifetime, scope: ScopeUnit | NoScopeUnit, number: int) -> None:
     """Signal by pidfd and stop remaining members of the owned scope."""
     with ExitStack() as cleanup:
         leader_fd = cleanup.enter_context(pin_process(leader))
-        descriptors: dict[int, int] = {}
-        scoped: set[int] = set()
-        kill_files: dict[Path, int] = {}
-        for process in (leader, *_members(leader.pid)):
+        descriptors = {leader.pid: leader_fd}
+        for process in _members(leader.pid):
             if process.pid in descriptors:
                 continue
+            with suppress(ProcessLookupError):
+                descriptors[process.pid] = cleanup.enter_context(pin_process(process))
+        scopes: dict[Path, _PinnedScope] = {}
+        for pid, descriptor in descriptors.items():
             try:
-                descriptor = (leader_fd if process == leader
-                              else cleanup.enter_context(pin_process(process)))
-            except ProcessLookupError:
-                continue
-            descriptors[process.pid] = descriptor
-            try:
-                if isinstance(scope, ScopeUnit) and isinstance(path := _scope_path(process, scope), Path):
-                    if path not in kill_files:
-                        kill_file = _open_scope_kill(path, process, descriptor)
-                        _ = cleanup.callback(os.close, kill_file)
-                        kill_files[path] = kill_file
-                    scoped.add(process.pid)
+                if isinstance(scope, ScopeUnit) and isinstance(path := _scope_path(pid, scope), Path):
+                    if path not in scopes:
+                        scopes[path] = _pin_scope(path, pid, descriptor, descriptors, cleanup)
             except (ProcessLookupError, FileNotFoundError):
                 continue
             except OSError as error:
                 print(f"process stop: cannot open the command scope: {error}", file=sys.stderr)
         _require_live(leader)
         signal.pidfd_send_signal(leader_fd, number)
-        for kill_file in kill_files.values():
-            try:
-                _ = os.write(kill_file, b"1\n")
-            except OSError as error:
-                print(f"process stop: cannot stop the command scope: {error}", file=sys.stderr)
-                scoped.clear()
+        signaled = {leader.pid}
+        for pinned in scopes.values():
+            descriptors.update(pinned.members)
+            if number == signal.SIGKILL:
+                try:
+                    _kill_scope(pinned)
+                except OSError as error:
+                    print(f"process stop: cannot stop the command scope: {error}", file=sys.stderr)
+                else:
+                    signaled.update(pinned.members)
         for pid, descriptor in descriptors.items():
-            if descriptor != leader_fd and pid not in scoped:
+            if pid not in signaled:
                 with suppress(ProcessLookupError):
                     signal.pidfd_send_signal(descriptor, number)

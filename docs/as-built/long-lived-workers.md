@@ -718,9 +718,10 @@ The record saves the command's process group as `command_group`.
 The supervisor installs no signal handler.
 `detached_runs.py stop` checks the supervisor and command leader identity.
 It stages the stop reason and sends TERM through the leader's Linux pidfd.
-It uses `cgroup.kill` for the run's own scope after it verifies membership in the open cgroup directory.
-It sends TERM through individual pidfds to process group members outside that scope.
-It also uses individual pidfds if the scope cannot be stopped.
+It sends TERM through individual pidfds to verified members of the run's scope and original process group.
+The stop helper uses `cgroup.kill` only for KILL after it verifies scope membership in the open cgroup directory.
+If a scope kill fails, the helper sends KILL through the pinned pidfds for that scope.
+A child that calls `setsid()` outside the run's scope receives no signal from this stop.
 The explicit stop requires Linux pidfd support.
 A build hold stop checks the supervisor and command leader identity and stages the stop reason before it sends TERM to the group.
 The supervisor stays alive to record the exit status and deliver the result.
