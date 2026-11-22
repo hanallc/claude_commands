@@ -143,6 +143,9 @@ async function checkReviewCardConflict(card,layout,check,advance){
   check(form().elements.revision.value!==revision && notice.textContent===marker &&
    form().elements.feedback.value===edited && card.querySelector('[data-review-body]').textContent.includes(nextBody),
    'Show updates applies the new revision and keeps the edit and failure reason.');
+  const words=card.querySelectorAll('textarea');
+  check(words.length===1 && words[0]===form().elements.feedback && !words[0].readOnly,
+   'Show updates keeps one editable draft.');
   return {before,after};
  }finally{
   win.fetch=request;
@@ -956,16 +959,18 @@ result.id='probe-results';result.textContent=JSON.stringify(failures);document.b
         instructions = "Open the linked change." + " Read each field before you answer." * 36
         tall_title = [f"Title line {line}" for line in range(1, 13)]
         short_title = "Check the `status` field."
+        check_url = "https://example.com/check"
         original = (change_review.BODY.replace("\n## Reviewed",
             f"| C1 | {title} | {now.date().isoformat()} | Open the linked change. |\n"
             + f"| C3 | {'<br>'.join(tall_title)} | {now.date().isoformat()} | Open the card. |\n"
-            + f"| C4 | {short_title} | {now.date().isoformat()} | {short_title} |\n\n## Reviewed")
+            + f"| C4 | {short_title} | {now.date().isoformat()} | {short_title} |\n"
+            + f"| C5 | {check_url} | {now.date().isoformat()} | {check_url} |\n\n## Reviewed")
             + "| C2 | A completed change | works | 2026-11-15 |\n")
         members = staff.StaffSnapshot((MORTY, DWIGHT, replace(OWNER, doc=staff.LiveDoc(local_machine(), doc)), OTHER))
         item = self.add("Check the linked reviews", number=111)
         _ = the_list.link(MORTY.id, item.id, ("sdlc/C1", "sdlc/C2"), source="morty")
         extra = self.add("Check the linked reviews at short heights", number=112)
-        _ = the_list.link(MORTY.id, extra.id, ("sdlc/C3", "sdlc/C4"), source="morty")
+        _ = the_list.link(MORTY.id, extra.id, ("sdlc/C3", "sdlc/C4", "sdlc/C5"), source="morty")
         waiting = investigation.file(OWNER.id, "Check the waiting review", "Check the waiting review",
                                      waiting_why="The owner checks the error.")
         waiting_key = f"investigation/{waiting.owner}/{waiting.id}"
@@ -1147,6 +1152,10 @@ async function inspect(){
   check(!compact.querySelector('[data-review-body] section').getClientRects().length,
    'The body hides text that matches an inline code title.');
   await inspectLater(compact);
+  close.click();
+  const repeated=await readCard(link('sdlc/C5',extra));
+  const checkLink=repeated.querySelector('[data-review-body] a[href="https://example.com/check"]');
+  check(checkLink?.getClientRects().length,'The check link stays visible when it matches the title.');
  }
  if(!short && (direct || params.has('cap'))){
   await checkReviewCardConflict(ready,direct ? 'phone' : 'cap',check,advance);

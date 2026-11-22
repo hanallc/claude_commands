@@ -1660,7 +1660,8 @@ async function recoverReviewRevision(reason,{form,notice,reload,current=()=>true
    const latest=reviewDrafts.get(key);
    const unchanged=latest?.stamp===atConflict?.stamp;
    const draft=unchanged ? atConflict?.draft : latest?.draft;
-   const fresh=recordDetails(row)?.querySelector('[data-review-form]');
+   const fresh=recordDetails(row)?.querySelector('[data-review-form]')
+    ?? row?.querySelector('.review-box-footer [data-review-form]');
    if(fresh?.elements.feedback){
     if(atConflict && unchanged){
      restoreReviewDraft(fresh,atConflict.draft);
@@ -1753,14 +1754,14 @@ function mountCard(page,replaceCard=false){
  row.innerHTML='<header class="review-box-header"><h1>'+escapeText(entry.title)+'</h1><div class="review-box-meta">'
   +'<span>'+escapeText(entry.id)+'</span><span>'+type+'</span><span>'+colored(entry.ownerName,entry.ownerHtml)+'</span>'
   +'<span class="list-state '+(entry.state==='Open' ? 'warning' : 'muted')+'">'+state+'</span>'
-  +'<time datetime="'+new Date(entry.filed*1000).toISOString()+'">'+reviewAge(entry.filed*1000)+'</time>'
+  +(entry.filed ? '<time datetime="'+new Date(entry.filed*1000).toISOString()+'">'+reviewAge(entry.filed*1000)+'</time>' : '')
   +reviewWaiting(entry)+(urgency ? '<span>'+escapeText(urgency)+'</span>' : '')+'</div></header>'
   +'<div class="review-box-scroll" role="region" aria-label="Review details" tabindex="0"><div data-review-detail></div></div>';
  row.dialogDetails=row.querySelector('[data-review-detail]');
  installReviewBody(row,page.querySelector('[data-card-body]').innerHTML);
  const title=plainReviewText(titleText);
  for(const section of row.querySelectorAll('[data-review-body] > section,[data-review-body] > .change-text > section')){
-  if(reviewBodyText(section,true)===title) section.dataset.emptyReviewSection='';
+  if(!section.querySelector('a[href]') && reviewBodyText(section,true)===title) section.dataset.emptyReviewSection='';
  }
  const form=row.querySelector('[data-review-form]');
  if(form?.elements.feedback){
