@@ -5,7 +5,7 @@ import sqlite3
 from collections import Counter
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from concurrent.futures import Future
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime, tzinfo
 from enum import Enum
 from threading import Thread
@@ -157,6 +157,8 @@ def recorded_origin(identity: str) -> str:
 class OriginReading:
     checkout: Path
     config: Path
+    device: int
+    inode: int
     modified_ns: int
     remote: str | Path
 
@@ -166,9 +168,10 @@ def checkout_origin(folder: Path, earlier: OriginReading | None, *,
     try:
         checkout = git_files.at(folder) if local_remote else git_files.locate(folder)
         config = checkout.common_dir / "config"
-        modified_ns = config.stat().st_mtime_ns
+        status = config.stat()
         if (earlier is not None and earlier.checkout == checkout.toplevel
-                and earlier.config == config and earlier.modified_ns == modified_ns):
+                and earlier.config == config and earlier.device == status.st_dev
+                and earlier.inode == status.st_ino and earlier.modified_ns == status.st_mtime_ns):
             return earlier
         value = repository.output(
             ["git", "config", "--no-includes", "--file", str(config), "--get", "remote.origin.url"],
@@ -177,11 +180,13 @@ def checkout_origin(folder: Path, earlier: OriginReading | None, *,
             return None
         remote = value.strip()
         identity = repository.remote_identity(remote, str(folder)) if remote else ""
+        destination: str | Path
         if identity.startswith("/"):
             local_path = urlsplit(remote).path if remote.startswith("file:") else remote
             destination = (folder / Path(local_path).expanduser()).resolve()
-            return OriginReading(checkout.toplevel, config, modified_ns, destination)
-        return OriginReading(checkout.toplevel, config, modified_ns, recorded_origin(identity))
+        else:
+            destination = recorded_origin(identity)
+        return OriginReading(checkout.toplevel, config, status.st_dev, status.st_ino, status.st_mtime_ns, destination)
     except (OSError, ValueError, RuntimeError):
         return None
 
@@ -219,11 +224,20 @@ class Origins:
         return Origins(found, resolved)
 
 
-def active_folders(reading: records.QueueRead) -> frozenset[str]:
-    folders = {item["worktree"] for item in reading.explanation.decided_from.reservations}
+@dataclass(frozen=True)
+class CheckoutUse:
+    folder: str
+    owner: wire.Owner
+    reservation: str = ""
+
+
+def active_checkouts(reading: records.QueueRead) -> frozenset[CheckoutUse]:
+    checkouts = {CheckoutUse(item["worktree"], wire.Owner(item["pid"], item["start_time"]),
+                             item.get("reservation_id", item["admitted_at"]))
+                 for item in reading.explanation.decided_from.reservations if item["worktree"]}
     if isinstance(reading, wire.CloudQueueRead):
-        folders.update(row.identity.folder for row in reading.cloud)
-    return frozenset(filter(None, folders))
+        checkouts.update(CheckoutUse(row.identity.folder, row.owner) for row in reading.cloud if row.identity.folder)
+    return frozenset(checkouts)
 
 
 def recent_steps(connection: sqlite3.Connection, now: float) -> frozenset[str]:
@@ -289,8 +303,15 @@ def hana_use(target: str, transport: HanaControlTransport, policy: hana_placemen
 
 
 @dataclass(frozen=True)
+class HanaRoute:
+    target: str
+    transport: HanaControlTransport
+    settings: hana_placement.EnabledHanaRoute
+
+
+@dataclass(frozen=True)
 class AwsRoutes:
-    hana: tuple[HanaCapacity, ...] = ()
+    hana: tuple[HanaRoute, ...] = ()
     targets: frozenset[str] = field(default_factory=frozenset[str])
 
 
@@ -309,7 +330,7 @@ def aws_routes() -> AwsRoutes | ReadingState:
                     selected=name, configuration=settings, purpose=target_config.RegistryRead.PLACEMENT))
             except (OSError, ValueError):
                 continue
-    hana: list[HanaCapacity] = []
+    hana: list[HanaRoute] = []
     aws: set[str] = set()
     for target in configured.values():
         if not isinstance(target, target_config.SshTarget) or target.platform != "linux":
@@ -321,11 +342,14 @@ def aws_routes() -> AwsRoutes | ReadingState:
             if isinstance(transport, HanaControlTransport):
                 route = hana_placement.read_settings(conf.read(transport.settings))
                 if isinstance(route, hana_placement.EnabledHanaRoute):
-                    hana.append(HanaCapacity(route.repository_key, route.max_steps,
-                                            hana_use(target.name, transport, route)))
+                    hana.append(HanaRoute(target.name, transport, route))
         except (OSError, ValueError, KeyError):
             continue
     return AwsRoutes(tuple(hana), frozenset(aws))
+
+
+def read_hana_occupancy(routes: tuple[HanaRoute, ...]) -> dict[HanaRoute, int | ReadingState]:
+    return {route: hana_use(route.target, route.transport, route.settings) for route in routes}
 
 
 def spending(now: float) -> Metric:
@@ -362,28 +386,38 @@ def safe_read[T](read: Callable[[], T]) -> T | ReadingState:
 
 def background(history: frozenset[str] | ReadingState, money: Metric | ReadingState,
                cloud_slots: int | ReadingState, routes: AwsRoutes | ReadingState,
+               occupancy: Mapping[HanaRoute, int | ReadingState] | ReadingState,
                origins: Origins | ReadingState) -> Background:
     """Keep the facts available from each independent source."""
     aws = AwsRoutes() if isinstance(routes, ReadingState) else routes
+    hana = tuple(HanaCapacity(route.settings.repository_key, route.settings.max_steps,
+                             occupancy if isinstance(occupancy, ReadingState)
+                             else occupancy.get(route, ReadingState.OMITTED)) for route in aws.hana)
     spend_metric = Metric("money", None, None, "USD", unreadable=money is ReadingState.UNAVAILABLE)
     return Background(history, spend_metric if isinstance(money, ReadingState) else money,
-                      cloud_slots, aws.hana, aws.targets,
+                      cloud_slots, hana, aws.targets,
                       Origins() if isinstance(origins, ReadingState) else origins,
                       routes is ReadingState.UNAVAILABLE)
 
 
 def background_once(now: float, reading: records.QueueRead) -> Background:
     """Read the same sources for a one-time page."""
+    routes = safe_read(aws_routes)
+    occupancy = (safe_read(lambda: read_hana_occupancy(routes.hana))
+                 if isinstance(routes, AwsRoutes) else ReadingState.OMITTED)
     return background(safe_read(lambda: read_history(now)), safe_read(lambda: spending(now)),
-                      safe_read(read_cloud_slots), safe_read(aws_routes),
-                      safe_read(lambda: Origins().refresh(active_folders(reading))))
+                      safe_read(read_cloud_slots), routes, occupancy,
+                      safe_read(lambda: Origins().refresh({use.folder for use in active_checkouts(reading)})))
+
+
+type RefreshKey = date | frozenset[CheckoutUse] | tuple[HanaRoute, ...]
 
 
 @dataclass(frozen=True)
 class SourceSample[T]:
     value: T | ReadingState
     started_at: float
-    day: date | None
+    key: RefreshKey | None
 
 
 class SourceCache[T]:
@@ -392,25 +426,25 @@ class SourceCache[T]:
         self.pending: Future[SourceSample[T]] | None = None
 
     def refresh(self, result: Future[SourceSample[T]], read: Callable[[], T | ReadingState],
-                started_at: float, day: date | None) -> None:
-        result.set_result(SourceSample(safe_read(read), started_at, day))
+                started_at: float, key: RefreshKey | None) -> None:
+        result.set_result(SourceSample(safe_read(read), started_at, key))
 
     def reusable(self) -> T | ReadingState:
         return ReadingState.OMITTED if self.sample is None else self.sample.value
 
     def current(self, now: float, interval: float, read: Callable[[], T | ReadingState], *,
-                day: date | None = None) -> T | ReadingState:
+                key: RefreshKey | None = None) -> T | ReadingState:
         if self.pending is not None and self.pending.done():
             self.sample = self.pending.result()
             self.pending = None
-        same_day = self.sample is not None and self.sample.day == day
+        same_key = self.sample is not None and self.sample.key == key
         age = now - self.sample.started_at if self.sample is not None else float("inf")
-        if self.pending is None and (not same_day or age >= interval):
+        if self.pending is None and (not same_key or age >= interval):
             result: Future[SourceSample[T]] = Future()
             self.pending = result
-            Thread(target=self.refresh, args=(result, read, now, day),
+            Thread(target=self.refresh, args=(result, read, now, key),
                    name="build-limits-refresh", daemon=True).start()
-        if same_day and age < interval * 2:
+        if same_key and age < interval * 2:
             return self.reusable()
         return ReadingState.OMITTED
 
@@ -424,21 +458,28 @@ class LimitsRefresh:
         self.money = SourceCache[Metric]()
         self.cloud_slots = SourceCache[int]()
         self.routes = SourceCache[AwsRoutes]()
+        self.hana_occupancy = SourceCache[dict[HanaRoute, int | ReadingState]]()
         self.origins = SourceCache[Origins]()
 
     def current(self, reading: records.QueueRead, now: float, wall: float) -> Background:
+        checkouts = active_checkouts(reading)
+
         def read_origins() -> Origins:
             previous = self.origins.reusable()
             cache = previous if isinstance(previous, Origins) else Origins()
-            return cache.refresh(active_folders(reading))
+            return cache.refresh({use.folder for use in checkouts})
 
         day = datetime.fromtimestamp(wall, UTC).date()
+        routes = self.routes.current(now, self.token_interval, aws_routes)
+        occupancy = (self.hana_occupancy.current(now, self.token_interval,
+                      lambda: read_hana_occupancy(routes.hana), key=routes.hana)
+                     if isinstance(routes, AwsRoutes) and routes.hana else ReadingState.OMITTED)
         return background(
             self.history.current(now, self.report_interval, lambda: read_history(wall)),
-            self.money.current(now, self.report_interval, lambda: spending(wall), day=day),
+            self.money.current(now, self.report_interval, lambda: spending(wall), key=day),
             self.cloud_slots.current(now, self.report_interval, read_cloud_slots),
-            self.routes.current(now, self.token_interval, aws_routes),
-            self.origins.current(now, self.token_interval, read_origins))
+            routes, occupancy,
+            self.origins.current(now, self.token_interval, read_origins, key=checkouts))
 
 
 @dataclass(frozen=True)
@@ -472,11 +513,16 @@ def short_name(origin: str) -> str:
     return clean_label(origin.rsplit("/", 1)[-1])
 
 
+def policy_name(key: str) -> str:
+    """Use a configured short name when the key is a name."""
+    return clean_label(key) if ":" not in key and key != store.UNKNOWN_IDENTITY else ""
+
+
 def wait_text(reason: records.WaitReason | wire.CloudSlotWait, origin: str = "") -> str:
     if isinstance(reason, records.HeadAdmissionStatus):
         reason = reason.cause
     if isinstance(reason, records.RunLimitWait):
-        name = short_name(origin) or clean_label(reason.repository)
+        name = short_name(origin) or policy_name(reason.repository)
         machine = clean_label(reason.machine)
         if name and machine:
             return WORDS[records.RunLimitWait].format(repository=name, machine=machine)
@@ -517,6 +563,9 @@ def build_limits(reading: records.QueueRead, snapshots: target_availability.Snap
     inputs = explanation.decided_from
     policy = explanation.policy.repository_runs
     local = inputs.local_machine
+    prefix = local + "."
+    local_limits = {key.removeprefix(prefix): limit for key, limit in policy.by_machine_and_repository.items()
+                    if key.startswith(prefix)}
     origins = saved.origins
     history = saved.history if isinstance(saved.history, frozenset) else ()
     rows: dict[str, RepositoryRow] = {}
@@ -525,56 +574,57 @@ def build_limits(reading: records.QueueRead, snapshots: target_availability.Snap
     unplaced: dict[str, list[str]] = {}
     metric_waits: dict[str, dict[str, list[str]]] = {}
     policy_rows: dict[str, set[str]] = {}
-    run_labels: dict[str, tuple[str, str]] = {}
+    run_labels: dict[tuple[str, str], tuple[str, str]] = {}
     mac_targets = (frozenset(snapshot.target.name for snapshot in snapshots if snapshot.target.platform == "macos")
                    if isinstance(snapshots, tuple) else frozenset[str]())
 
     def row(origin: str) -> RepositoryRow:
         if origin not in rows:
-            rows[origin] = RepositoryRow(short_name(origin))
+            name = short_name(origin)
+            rows[origin] = RepositoryRow(name, natedev=Cell(has_limit_key=name in local_limits or origin in local_limits))
         return rows[origin]
 
     def remote_wait(machine: str) -> dict[str, list[str]]:
         return aws_waits if machine in saved.aws_targets else unplaced
-
-    def bind(key: str, origin: str) -> None:
-        if origin and short_name(origin):
-            policy_rows.setdefault(key, set()).add(origin)
-            row(origin).natedev.has_limit_key = True
 
     for origin in history:
         if short_name(origin):
             _ = row(origin)
 
     occupancy = reserved_repository_runs(inputs, policy)
-    keys_by_owner: dict[str, list[str]] = {}
-    for key, owners in occupancy.items():
-        for owner in owners:
-            keys_by_owner.setdefault(owner, []).append(key)
-    seen: set[str] = set()
+    seen = {owner for owners in occupancy.values() for owner in owners}
+    limited_owners = frozenset(seen)
+    # Use the same admission rule to identify the key of each reservation.
+    single_reservation = replace(inputs, ordered=(), reservations=())
     unattributed = 0
     for reservation in inputs.reservations:
         owner = repository_run_owner(reservation)
         waiter = reservation.get("queue_waiter")
-        step = reservation["step"]
-        identity = (recorded_origin(waiter.get("repo_identity", "")) if waiter is not None else "")
-        identity = identity or recorded_origin(reservation.get("repo_identity", "")) or recorded_origin(reservation["repo"])
-        origin = origins.resolve(identity, reservation["worktree"])
+        waiting_origin = recorded_origin(waiter.get("repo_identity", "")) if waiter is not None else ""
+        reserved_origin = recorded_origin(reservation.get("repo_identity", ""))
+        origin = ""
+        if not (waiting_origin and reserved_origin and waiting_origin != reserved_origin):
+            identity = waiting_origin or reserved_origin or recorded_origin(reservation["repo"])
+            origin = origins.resolve(identity, reservation["worktree"])
+            if not short_name(origin):
+                origin = ""
         recorded_unit = reservation.get("unit", "") or (waiter.get("unit", "") if waiter is not None else "")
         session = waiter.get("session_id", "") if waiter is not None else reservation.get("session_id", "")
         session_name = waiter.get("session_name", "") if waiter is not None else reservation.get("session_name", "")
-        if owner in keys_by_owner:
-            if any(policy.for_step(local, key, step) for key in keys_by_owner[owner]):
-                keys = keys_by_owner[owner]
-                if len(keys) == 1:
-                    bind(keys[0], origin)
-                if owner not in run_labels:
-                    run_labels[owner] = clean_label(recorded_unit, names.get(session, ""), session_name), recorded_unit
+        if owner in limited_owners:
+            if reservation["step"] in records.REPOSITORY_RUN_STEPS:
+                keys = reserved_repository_runs(replace(single_reservation, reservations=(reservation,)), policy)
+                for key in keys:
+                    policy_rows.setdefault(key, set()).add(origin)
+                    if origin:
+                        row(origin).natedev.has_limit_key = True
+                    _ = run_labels.setdefault((key, owner),
+                        (clean_label(recorded_unit, names.get(session, ""), session_name), recorded_unit))
             continue
         if owner in seen:
             continue
         seen.add(owner)
-        if not short_name(origin):
+        if not origin:
             unattributed += 1
             continue
         cell = row(origin).natedev
@@ -585,8 +635,9 @@ def build_limits(reading: records.QueueRead, snapshots: target_availability.Snap
     bindings = Counter(origin for bound in policy_rows.values() for origin in bound)
     bound_origins = {
         key: origin for key, bound in policy_rows.items() if len(bound) == 1
-        for origin in bound if bindings[origin] == 1
+        for origin in bound if origin and bindings[origin] == 1
     }
+    full_waits: set[str] = set()
     for visible in waits:
         entry = visible.source
         if isinstance(entry, wire.CloudRow):
@@ -607,6 +658,8 @@ def build_limits(reading: records.QueueRead, snapshots: target_availability.Snap
         if pinned != local:
             destination = remote_wait(pinned)
         elif isinstance(reason, records.RunLimitWait) and reason.machine == local:
+            if reason.used >= reason.limit:
+                full_waits.add(reason.repository)
             origin = bound_origins.get(reason.repository, "")
             destination = row(origin).natedev.waits if origin else local_waits
         elif isinstance(reason, (records.BuildSpaceLow, records.BuildSpaceUnreadable)):
@@ -620,27 +673,23 @@ def build_limits(reading: records.QueueRead, snapshots: target_availability.Snap
         destination.setdefault(wait_text(step.reason, origin), []).append(visible.name)
 
     shared: list[Metric] = []
-    counted: set[str] = set()
-    prefix = local + "."
-    for key, limit in policy.by_machine_and_repository.items():
-        if not key.startswith(prefix):
-            continue
-        repository_key = key.removeprefix(prefix)
+    for repository_key, limit in local_limits.items():
         bound = policy_rows.get(repository_key, set[str]())
-        owners = occupancy.get(repository_key, set[str]()) - counted
+        owners = occupancy.get(repository_key, set[str]())
         used = len(owners)
-        counted.update(owners)
+        if used < limit and repository_key in full_waits:
+            continue
         origin = bound_origins.get(repository_key, "")
         if not origin:
-            labels = {short_name(candidate) for candidate in bound}
-            name = next(iter(labels)) if len(labels) == 1 else clean_label(repository_key)
+            labels = {short_name(candidate) for candidate in bound if candidate}
+            name = next(iter(labels)) if len(labels) == 1 else policy_name(repository_key)
             label = WORDS["policy_key"].format(name=name) if name else WORDS["repository_run_limit"]
             shared.append(Metric(label, used, limit))
             continue
         cell = row(origin).natedev
         cell.limit, cell.used = limit, used
         for owner in sorted(owners):
-            label, recorded_unit = run_labels.get(owner, ("", ""))
+            label, recorded_unit = run_labels.get((repository_key, owner), ("", ""))
             if used > limit and recorded_unit and recorded_unit == policy.exempt_unit:
                 cell.merge_above.append(label)
             elif label:

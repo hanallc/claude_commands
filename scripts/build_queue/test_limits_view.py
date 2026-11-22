@@ -1,6 +1,7 @@
 """Check the Build limits section with published records and private fixture settings."""
 from __future__ import annotations
 
+import os
 import sqlite3
 import subprocess
 import tempfile
@@ -19,6 +20,7 @@ from scripts.build_queue.admission_wire import ReservedCloudSlot
 from scripts.build_queue.cloud_progress import NoCloudProgress
 from scripts.build_queue.progress_profile import NoCounter
 from scripts.build_queue.queue_fixture import fixture_reservation, head_reading
+from scripts.build_queue.scope_activity import LiveBuildRun
 from scripts.build_targets import target_config
 from scripts.build_targets.execution_transport import HanaControlTransport
 from scripts.buildlog import repository, store
@@ -77,14 +79,18 @@ class BuildLimitsTests(unittest.TestCase):
                 self.assertEqual(origins.resolve("", str(copied)), primary)
                 self.assertEqual(origins.refresh(copies), origins)
                 self.assertEqual(git_read.call_count, 4)
+                config = source / ".git" / "config"
+                original = config.stat()
                 git(source, "remote", "set-url", "origin", fork)
+                self.assertNotEqual(config.stat().st_ino, original.st_ino)
+                os.utime(config, ns=(original.st_atime_ns, original.st_mtime_ns))
                 self.assertEqual(origins.refresh(copies).resolve("", str(copied)), fork)
                 self.assertEqual(git_read.call_count, 5)
         hidden_key = "/private/policy-key"
         policy = records.RepositoryRunLimits({
             "natedev.project": 1, f"natedev.{hidden_key}": 2, "natedev.unmatched": 1,
         }, "merge-owner")
-        reservations = (
+        reservations: tuple[records.Reservation, ...] = (
             {**fixture_reservation(101, 0, step="gate"), "repo": "project", "repo_identity": primary, "unit": "regular"},
             {**fixture_reservation(102, 0, step="gate", folder=str(copied)), "repo": "project", "unit": "merge-owner"},
             {**fixture_reservation(103, 0, step="check", folder=str(root / "unknown")), "repo": "scratch"},
@@ -140,8 +146,9 @@ class BuildLimitsTests(unittest.TestCase):
         self.assertIsNone(quiet.natedev.limit)
         self.assertEqual(spare_project.natedev.used, 0)
         self.assertEqual(shown.natedev.unattributed, 1)
-        self.assertEqual([(metric.label, metric.used, metric.limit) for metric in shown.natedev.shared[-2:]],
-                         [("Repository run limit", 1, 2), ("unmatched run limit", 0, 1)])
+        meters = {metric.label: (metric.used, metric.limit) for metric in shown.natedev.shared}
+        self.assertEqual(meters["Repository run limit"], (1, 2))
+        self.assertNotIn("unmatched run limit", meters)
         self.assertEqual(shown.natedev.waits, {
             "The repository run limit is full.": [""],
             "The run limit for unmatched on natedev is full.": ["Unbound wait"],
@@ -176,8 +183,59 @@ class BuildLimitsTests(unittest.TestCase):
         merge_cell = next(row.natedev for row in within.repositories if row.owner == "team · example.invalid")
         self.assertEqual(merge_cell.merge_above, [])
         self.assertEqual(merge_cell.runs, ["regular", "merge-owner"])
+        conflicting_wait = replace(within_limit, explanation=replace(within_limit.explanation,
+            decided_from=copy_only.explanation.decided_from))
+        wait_limits = limits_view.build_limits(conflicting_wait, (), waits, cloud_names, {}, saved, UTC)
+        wait_cell = next(row.natedev for row in wait_limits.repositories if row.owner == "team · example.invalid")
+        self.assertEqual(wait_cell.waits, cell.waits)
+        self.assertIsNone(wait_cell.limit)
+        self.assertEqual(wait_cell.runs, [])
+        self.check_policy_evidence(queue, saved, reservations[0], primary, fork)
         self.check_hana_claim(hana)
         self.check_cache_expiry()
+
+    def check_policy_evidence(self, queue: records.QueueRead, saved: limits_view.Background,
+                              admitted: records.Reservation, primary: str, fork: str) -> None:
+        root_key = "git-root:fixture"
+        policy = records.RepositoryRunLimits({"natedev.project": 2, "natedev.other": 2, f"natedev.{root_key}": 1})
+        run = LiveBuildRun(501, "fixture", 0)
+        first: records.Reservation = {**admitted, "build_run": run}
+        unrelated: records.Reservation = {**first, "repo": "unrestricted", "repo_identity": fork}
+        second_origin = "https://example.invalid/team/other"
+        second: records.Reservation = {**first, "repo_identity": second_origin, "queue_waiter": {
+            "pid": 502, "start_time": "502", "since": 0, "need": 0, "repository_name": "other",
+        }}
+
+        def show(*reservations: records.Reservation) -> limits_view.BuildLimits:
+            reading = replace(queue, explanation=replace(queue.explanation,
+                policy=replace(queue.explanation.policy, repository_runs=policy),
+                decided_from=replace(queue.explanation.decided_from, reservations=reservations)))
+            return limits_view.build_limits(reading, (), (), {}, {}, saved, UTC)
+
+        def project(shown: limits_view.BuildLimits) -> limits_view.Cell:
+            return next(row.natedev for row in shown.repositories if row.owner == "team · example.invalid")
+
+        one_key = project(show(first, unrelated))
+        self.assertEqual((one_key.used, one_key.limit), (1, 2))
+        shown = show(first, unrelated, second)
+        self.assertEqual((project(shown).used, project(shown).limit), (1, 2))
+        other = next(row.natedev for row in shown.repositories if row.name == "other")
+        self.assertEqual((other.used, other.limit), (1, 2))
+        self.assertEqual(next(row.natedev.used for row in shown.repositories if row.owner == "team · fork.invalid"), 0)
+        self.assertEqual(sum(row.natedev.other_used for row in shown.repositories), 0)
+        self.assertEqual(shown.natedev.unattributed, 0)
+        self.assertEqual(shown.natedev.shared[-1].label, "Repository run limit")
+        self.assertEqual(limits_view.wait_text(records.RunLimitWait(1, 1, root_key, "natedev")),
+                         "The repository run limit is full.")
+        for origin in ("", fork):
+            with self.subTest(origin=origin):
+                shown = show(first, {**fixture_reservation(503, 0, step="gate"), "repo": "project",
+                                     "repo_identity": origin})
+                self.assertIsNone(project(shown).limit)
+                meter = next(metric for metric in shown.natedev.shared if metric.label == "project run limit")
+                self.assertEqual((meter.used, meter.limit), (2, 2))
+        unrestricted = project(show({**first, "step": "check", "repo_identity": primary}))
+        self.assertEqual((unrestricted.used, unrestricted.limit, unrestricted.has_limit_key), (1, None, True))
 
     def check_cache_expiry(self) -> None:
         cache = limits_view.SourceCache[int]()
@@ -187,17 +245,17 @@ class BuildLimitsTests(unittest.TestCase):
             raise AssertionError("Run the refresh under fixture control")
 
         with mock.patch.object(Thread, "start"):
-            self.assertIs(cache.current(0, 10, read, day=today), limits_view.ReadingState.OMITTED)
+            self.assertIs(cache.current(0, 10, read, key=today), limits_view.ReadingState.OMITTED)
             result: Future[limits_view.SourceSample[int]] = Future()
             result.set_result(limits_view.SourceSample(5, 0, today))
             cache.pending = result
-            self.assertEqual(cache.current(9, 10, read, day=today), 5)
-            self.assertIs(cache.current(9, 10, read, day=tomorrow), limits_view.ReadingState.OMITTED)
-            self.assertIs(cache.current(20, 10, read, day=today), limits_view.ReadingState.OMITTED)
+            self.assertEqual(cache.current(9, 10, read, key=today), 5)
+            self.assertIs(cache.current(9, 10, read, key=tomorrow), limits_view.ReadingState.OMITTED)
+            self.assertIs(cache.current(20, 10, read, key=today), limits_view.ReadingState.OMITTED)
             result = Future()
             result.set_result(limits_view.SourceSample(limits_view.ReadingState.UNAVAILABLE, 20, today))
             cache.pending = result
-            self.assertIs(cache.current(21, 10, read, day=today), limits_view.ReadingState.UNAVAILABLE)
+            self.assertIs(cache.current(21, 10, read, key=today), limits_view.ReadingState.UNAVAILABLE)
 
     def check_hana_claim(self, origin: str) -> None:
         transport = HanaControlTransport(Path("private-hana.conf"), "fixture-host")
@@ -218,3 +276,14 @@ class BuildLimitsTests(unittest.TestCase):
               mock.patch.object(claim_state, "read_claims", side_effect=[(claim,), (claim,), (), ()])):
             self.assertEqual(limits_view.hana_use("fixture", transport, policy), 1)
             self.assertIs(limits_view.hana_use("fixture", transport, policy), limits_view.ReadingState.OMITTED)
+
+        route = limits_view.HanaRoute("fixture", transport, policy)
+        routes = limits_view.AwsRoutes((route,), frozenset({"fixture"}))
+        refresh = limits_view.LimitsRefresh(10, 10)
+        refresh.routes.sample = limits_view.SourceSample(routes, 19, None)
+        refresh.hana_occupancy.sample = limits_view.SourceSample({route: 1}, 0, routes.hana)
+        refresh.hana_occupancy.pending = Future()
+        with mock.patch.object(Thread, "start"):
+            shown = refresh.current(head_reading(), 20, 20)
+        self.assertEqual(shown.aws_targets, routes.targets)
+        self.assertEqual(shown.hana, (limits_view.HanaCapacity(origin, 1, limits_view.ReadingState.OMITTED),))
