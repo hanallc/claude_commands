@@ -433,25 +433,51 @@ def _record_worktree(directory: Path, root: Path) -> None:
 
 
 def _record_baselines(directory: Path, root: Path) -> None:
-    """Keep the first launch's commit and working-tree status through every later launch."""
+    """Keep the first launch's commit and status while the caller holds the phase lock."""
     baseline = directory / BASELINE_FILE
-    # Concurrent launchers serialize the existence check and both writes.
-    # Closing the handle also releases a crashed launcher's lock, allowing the next claim to retry.
-    with phase_lock(directory):
-        if baseline.exists():
-            try:
-                _ = commit_id(root, baseline.read_text().strip())
-            except StateRefused as refused:
-                raise StateRefused(f"phase baseline {baseline} is not a commit in {root}: {refused}") from refused
-            return
-        head = commit_id(root, "HEAD")
-        status = subprocess.run(["git", "-C", str(root), "status", "--short"], capture_output=True,
-                                text=True, check=False, stdin=subprocess.DEVNULL)
-        if status.returncode != 0:
-            raise StateRefused(f"git status --short failed in {root}: {status.stderr.strip()}")
-        # Publish the baseline last: after an interrupted status write, the next claim retries both.
-        write_text_atomic(directory / BASELINE_STATUS_FILE, status.stdout)
-        write_text_atomic(baseline, head + "\n")
+    if baseline.exists():
+        try:
+            _ = commit_id(root, baseline.read_text().strip())
+        except StateRefused as refused:
+            raise StateRefused(f"phase baseline {baseline} is not a commit in {root}: {refused}") from refused
+        return
+    head = commit_id(root, "HEAD")
+    status = subprocess.run(["git", "-C", str(root), "status", "--short"], capture_output=True,
+                            text=True, check=False, stdin=subprocess.DEVNULL)
+    if status.returncode != 0:
+        raise StateRefused(f"git status --short failed in {root}: {status.stderr.strip()}")
+    # Publish the commit last. The next claim retries both writes if the first claim stops early.
+    write_text_atomic(directory / BASELINE_STATUS_FILE, status.stdout)
+    write_text_atomic(baseline, head + "\n")
+
+
+def _has_recorded_checkout(directory: Path) -> bool:
+    return (directory / WORKTREE_FILE).is_file() or (directory / BASELINE_FILE).is_file()
+
+
+def _record_claim_checkout(directory: Path, requested: Path | None) -> Path | None:
+    """Select and record the checkout while the caller holds the phase lock."""
+    root = requested
+    if _has_recorded_checkout(directory):
+        recorded = phase_worktree(directory).root
+        if recorded.is_dir():
+            recorded = recorded.resolve()
+            if (requested is not None and requested != recorded
+                    and not recorded.is_relative_to(copy_record.worktree_root())):
+                try:
+                    _require_model_worktree(requested, _phase_run_home(directory).unit)
+                except StateRefused:
+                    pass
+                else:
+                    _record_baselines(directory, requested)
+                    _record_worktree(directory, requested)
+                    return requested
+            root = repository_root(recorded)
+    if root is not None:
+        root = root.resolve()
+        _record_worktree(directory, root)
+        _record_baselines(directory, root)
+    return root
 
 
 def open_phases(session_dir: Path) -> list[OpenPhase]:
@@ -973,22 +999,18 @@ def _claim_command(args: argparse.Namespace) -> int:
     """
     session_dir = Path(cast(str, args.session_dir))
     directory = phase_directory(session_dir, cast(str, args.phase))
-    requested = Path(cast(str, args.repo))
-    if (directory / WORKTREE_FILE).is_file() or (directory / BASELINE_FILE).is_file():
-        recorded = phase_worktree(directory).root
-        if recorded.is_dir():
-            requested = recorded
-    root = repository_root(requested)
-    if root is None:
-        print("phase reservation: no repository or no files to claim; still awaiting first touch")
-        return 0
-    root = root.resolve()
+    requested = repository_root(Path(cast(str, args.repo)))
     try:
-        _record_worktree(directory, root)
-        _record_baselines(directory, root)
+        root = None
+        if requested is not None or _has_recorded_checkout(directory):
+            with phase_lock(directory):
+                root = _record_claim_checkout(directory, requested.resolve() if requested is not None else None)
     except (StateRefused, OSError) as refused:
         print(f"phase_reservation: {refused}", file=sys.stderr)
         return 2
+    if root is None:
+        print("phase reservation: no repository or no files to claim; still awaiting first touch")
+        return 0
     phases = open_phases(session_dir)
     phase = next((open_phase for open_phase in phases if open_phase.directory == directory), None)
     state = read_state(phase.directory) if phase is not None else {}
