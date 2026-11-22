@@ -119,10 +119,15 @@ fi
         self.assertEqual(probe["run"], f"{expected.pid}:{expected.start_time}")
         return expected
 
+    def limit_runs_to_one(self, fixture: AdmissionFixture) -> None:
+        """Write a run limit of one with the exempt unit the reader requires."""
+        config = fixture.root / "build_admission.conf"
+        _ = config.write_text(config.read_text()
+            + f"\nmax_runs.{fixture.server.host}.repository=1\nmax_runs_exempt_unit=natemerge\n")
+
     def test_verify_requests_a_slot_with_its_own_process_identity(self) -> None:
         with AdmissionFixture() as fixture:
-            config = fixture.root / "build_admission.conf"
-            _ = config.write_text(config.read_text() + f"\nmax_runs.{fixture.server.host}.repository=1\n")
+            self.limit_runs_to_one(fixture)
             script = self.script(fixture, use_helper=True)
             client = fixture.root / ".claude/scripts/build_queue/admission_client.py"
             outer = fixture.run_owner()
@@ -144,8 +149,7 @@ fi
 
     def test_nested_verify_uses_the_live_ancestor_slot_at_limit_one(self) -> None:
         with AdmissionFixture() as fixture:
-            config = fixture.root / "build_admission.conf"
-            _ = config.write_text(config.read_text() + f"\nmax_runs.{fixture.server.host}.repository=1\n")
+            self.limit_runs_to_one(fixture)
             script = self.script(fixture, use_helper=True)
             client = fixture.root / ".claude/scripts/build_queue/admission_client.py"
             with fixture.serving():
