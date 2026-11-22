@@ -15,6 +15,7 @@ from typing import override
 from scripts.lib.testing_folders import fixture_folder
 from scripts.lib import test_hang_guard
 from scripts.lib.py_floor_test_support import seed_interpreter_cache
+from scripts.lib.socket_test_support import short_socket_directory
 
 from scripts.build_hold.override_guard import require_checkout
 
@@ -125,10 +126,10 @@ class CargoWrapperTest(unittest.TestCase):
         self.home = self.root / "home"
         self.cwd = self.root / "working directory"
         self.hold = self.root / "hold"
-        self.runtime = self.root / "run"
+        self.runtime = Path(self.enterContext(short_socket_directory()))
         for directory in (
             self.front, self.real_bin, self.tools, self.home,
-            self.cwd, self.hold, self.runtime,
+            self.cwd, self.hold,
         ):
             directory.mkdir()
         (self.front / "cargo").symlink_to(self.wrapper)
