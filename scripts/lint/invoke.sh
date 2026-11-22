@@ -174,7 +174,8 @@ buildlog_exec() {
         return
     fi
     local status=0
-    systemd-run --user --scope --quiet --collect --expand-environment=no --slice=builds.slice -- \
+    systemd-run --user --scope --quiet --collect --expand-environment=no \
+        --slice="${DETACHED_RUN_SLICE:-builds.slice}" -- \
         /bin/sh -c "$BUILDLOG_SCOPE_SH" "$BUILDLOG_PEAK" "$@" 3>&2 2>/dev/null
     status=$?
     if [[ -e "$BUILDLOG_PEAK" ]]; then

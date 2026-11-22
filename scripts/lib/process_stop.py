@@ -1,8 +1,8 @@
 """Stop an exact Linux process lifetime or its dedicated command tree."""
 from __future__ import annotations
 
-from collections.abc import Callable, Generator
-from contextlib import ExitStack, contextmanager, suppress
+from collections.abc import Generator
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 import fcntl
 import json
@@ -35,8 +35,8 @@ class ScopeUnit:
     unit: str
 
 
-class ScopeIdentity(TypedDict):
-    """The directory identity of the command scope at launch."""
+class RunSliceIdentity(TypedDict):
+    """The directory identity of one detached run slice."""
 
     unit: str
     path: str
@@ -44,7 +44,7 @@ class ScopeIdentity(TypedDict):
     inode: int
 
 
-def is_scope_identity(value: object) -> TypeGuard[ScopeIdentity]:
+def is_slice_identity(value: object) -> TypeGuard[RunSliceIdentity]:
     match value:
         case {"unit": str(), "path": str(), "device": int(device), "inode": int(inode)}:
             return type(device) is int and type(inode) is int
@@ -52,18 +52,12 @@ def is_scope_identity(value: object) -> TypeGuard[ScopeIdentity]:
             return False
 
 
-class ScopeStopFailed(OSError):
-    """The stop could not confirm an empty scope."""
+class SliceStopFailed(OSError):
+    """The stop could not confirm an empty run slice."""
 
 
-class _ScopeRemoved(FileNotFoundError):
-    """The kernel removed the empty scope tree."""
-
-
-@dataclass(frozen=True)
-class ScopeStopReceipt:
-    term_reached: int
-    hook_error: BaseException | None = None
+class _SliceRemoved(FileNotFoundError):
+    """The kernel removed the empty run slice."""
 
 
 def supported() -> bool:
@@ -113,7 +107,7 @@ def _cgroup_path(pid: int) -> Path:
     raise FileNotFoundError("the process has no cgroup v2 entry")
 
 
-def _directory_identity(unit: str, path: Path, directory: int) -> ScopeIdentity:
+def _directory_identity(unit: str, path: Path, directory: int) -> RunSliceIdentity:
     stat = os.fstat(directory)
     return {"unit": unit, "path": str(path), "device": stat.st_dev, "inode": stat.st_ino}
 
@@ -128,113 +122,97 @@ def _read_cgroup_file(directory: int, name: str) -> bytes:
         return stream.read()
 
 
-def command_scope(pid: int, scope: ScopeUnit) -> ScopeIdentity:
-    """Read the dedicated scope while the launcher is inside it."""
+DETACHED_SLICE_ENV = "DETACHED_RUN_SLICE"
+
+
+def _is_run_slice_path(path: Path) -> bool:
+    prefix = "builds-detached-"
+    suffix = path.stem.removeprefix(prefix)
+    return (path.anchor == "/" and ".." not in path.parts and "\x00" not in str(path) and path.suffix == ".slice"
+            and path.name.startswith(prefix) and suffix.isascii() and suffix.isalnum()
+            and path.parent.name == "builds-detached.slice" and path.parent.parent.name == "builds.slice")
+
+
+def command_slice(pid: int, scope: ScopeUnit) -> RunSliceIdentity:
+    """Identify the run slice while the launcher is in its command scope."""
     path = _cgroup_path(pid)
-    if (not path.is_absolute() or ".." in path.parts or path.name != scope.unit
-            or not scope.unit.endswith(".scope") or path.parent.name != scope.slice):
-        raise ValueError("the command did not enter its dedicated scope")
-    directory = _open_directory(CGROUP_ROOT / path.relative_to("/"))
+    if (path.name != scope.unit or path.suffix != ".scope" or path.parent.name != scope.slice
+            or not _is_run_slice_path(path.parent)):
+        raise ValueError("the command did not enter its dedicated slice")
+    directory = _open_directory(CGROUP_ROOT / path.parent.relative_to("/"))
     try:
-        if pid not in _scope_pids(directory):
-            raise ProcessLookupError("the launcher is outside its scope")
-        return _directory_identity(scope.unit, path, directory)
+        child = _open_directory(path.name, parent=directory)
+        try:
+            if pid not in _cgroup_pids(child):
+                raise ProcessLookupError("the launcher is outside its command scope")
+        finally:
+            os.close(child)
+        return _directory_identity(scope.slice, path.parent, directory)
     finally:
         os.close(directory)
 
 
-def publish_command_scope(record: Path, scope: ScopeUnit) -> None:
-    """Save the launcher's scope before it execs the command."""
+def publish_run_slice(record: Path, scope: ScopeUnit) -> None:
+    """Save the run slice before it execs the command."""
     with record.with_suffix(".record.lock").open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         fields = cast(dict[str, object], json.loads(record.read_text()))
         if fields.get("run_id") != record.stem or fields.get("status") != "running" or fields.get("stop_reason"):
             raise ValueError("the run is no longer starting")
-        fields["command_scope"] = command_scope(os.getpid(), scope)
+        fields["command_slice"] = command_slice(os.getpid(), scope)
         atomic_file.write_text_atomic(record, json.dumps(fields, indent=2, sort_keys=True))
 
 
-def launch_in_scope(record: Path, scope: ScopeUnit, command: list[str]) -> int:
+def launch_in_slice(record: Path, scope: ScopeUnit, command: list[str]) -> int:
     try:
-        publish_command_scope(record, scope)
+        publish_run_slice(record, scope)
     except (OSError, ValueError) as error:
         print(f"detached_runs: command scope did not start: {error}", file=sys.stderr)
         return 125
     try:
+        os.environ[DETACHED_SLICE_ENV] = scope.slice
         os.execvp(command[0], command)
     except OSError as error:
         print(f"detached_runs: command did not start: {error}", file=sys.stderr)
         return 127
 
 
-def legacy_command_scope(leader: ProcessLifetime, unit: ScopeUnit) -> ScopeIdentity | None:
-    """Verify an old scope through a member of the original command group."""
-    with suppress(OSError):
-        with pin_process(leader):
-            for member in (leader, *_members(leader.pid)):
-                with suppress(OSError, ValueError):
-                    with pin_process(member):
-                        scope = command_scope(member.pid, unit)
-                        _require_live(member)
-                        _require_live(leader)
-                        return scope
-    return None
-
-
-def moved_command_scope(leader: ProcessLifetime, original: ScopeIdentity) -> ScopeIdentity | None:
-    """Verify a new scope under the same user manager."""
-    with suppress(OSError, ValueError):
-        with pin_process(leader):
-            current = _cgroup_path(leader.pid)
-            previous = Path(original["path"])
-            manager = f"user@{os.getuid()}.service"
-            owner = next((parent for parent in previous.parents if parent.name == manager), None)
-            if (owner is None or not current.is_relative_to(owner) or current == previous
-                    or ".." in current.parts or not current.name.endswith(".scope")):
-                return None
-            scope = command_scope(leader.pid, ScopeUnit(current.parent.name, current.name))
-            _require_live(leader)
-            return scope
-    return None
-
-
-def _open_saved_scope(scope: ScopeIdentity) -> int:
+def _open_saved_slice(scope: RunSliceIdentity) -> int:
     path = Path(scope["path"])
-    if (not path.is_absolute() or ".." in path.parts or path.name != scope["unit"]
-            or not path.name.endswith(".scope")):
-        raise ScopeStopFailed("cannot open command scope: invalid command scope path")
+    if path.name != scope["unit"] or not _is_run_slice_path(path):
+        raise SliceStopFailed("cannot open run slice: invalid run slice path")
     try:
         directory = _open_directory(CGROUP_ROOT / path.relative_to("/"))
     except FileNotFoundError as error:
-        raise _ScopeRemoved from error
+        raise _SliceRemoved from error
     except OSError as error:
-        raise ScopeStopFailed(f"cannot open command scope: {error}") from error
+        raise SliceStopFailed(f"cannot open run slice: {error}") from error
     if _directory_identity(scope["unit"], path, directory) != scope:
         os.close(directory)
-        raise ScopeStopFailed("cannot open command scope: the directory identity changed")
+        raise SliceStopFailed("cannot open run slice: the directory identity changed")
     return directory
 
 
-def _check_saved_scope(scope: ScopeIdentity) -> None:
-    os.close(_open_saved_scope(scope))
+def _check_saved_slice(scope: RunSliceIdentity) -> None:
+    os.close(_open_saved_slice(scope))
 
 
-def scope_has_ended(scope: ScopeIdentity) -> bool:
-    """Use the kernel event for the full scope tree."""
-    with suppress(_ScopeRemoved), _scope_events(scope) as (_, descriptor):
-        return _scope_is_empty(scope, descriptor)
+def slice_has_ended(scope: RunSliceIdentity) -> bool:
+    """Use the kernel event for the full run slice."""
+    with suppress(_SliceRemoved), _slice_events(scope) as (_, descriptor):
+        return _slice_is_empty(scope, descriptor)
     return True
 
 
 @contextmanager
-def _scope_events(scope: ScopeIdentity) -> Generator[tuple[int, int]]:
-    directory = _open_saved_scope(scope)
+def _slice_events(scope: RunSliceIdentity) -> Generator[tuple[int, int]]:
+    directory = _open_saved_slice(scope)
     try:
         try:
             descriptor = os.open("cgroup.events", os.O_RDONLY | os.O_NOFOLLOW, dir_fd=directory)
         except OSError as error:
-            _check_saved_scope(scope)
-            raise ScopeStopFailed(f"cannot read cgroup.events: {error}") from error
+            _check_saved_slice(scope)
+            raise SliceStopFailed(f"cannot read cgroup.events: {error}") from error
         try:
             yield directory, descriptor
         finally:
@@ -243,7 +221,7 @@ def _scope_events(scope: ScopeIdentity) -> Generator[tuple[int, int]]:
         os.close(directory)
 
 
-def _scope_is_empty(scope: ScopeIdentity, descriptor: int) -> bool:
+def _slice_is_empty(scope: RunSliceIdentity, descriptor: int) -> bool:
     try:
         lines = os.pread(descriptor, 4096, 0).splitlines()
         if b"populated 0" in lines:
@@ -252,17 +230,17 @@ def _scope_is_empty(scope: ScopeIdentity, descriptor: int) -> bool:
             return False
         raise ValueError("no populated field in cgroup.events")
     except (OSError, ValueError) as error:
-        _check_saved_scope(scope)
-        raise ScopeStopFailed(f"cannot read cgroup.events: {error}") from error
+        _check_saved_slice(scope)
+        raise SliceStopFailed(f"cannot read cgroup.events: {error}") from error
 
 
-def _scope_pids(directory: int) -> set[int]:
+def _cgroup_pids(directory: int) -> set[int]:
     return {int(pid) for pid in _read_cgroup_file(directory, "cgroup.procs").split()}
 
 
-def _scope_processes(directory: int) -> set[ProcessLifetime]:
+def _cgroup_processes(directory: int) -> set[ProcessLifetime]:
     processes: set[ProcessLifetime] = set()
-    for pid in _scope_pids(directory):
+    for pid in _cgroup_pids(directory):
         started = process_start.proc_table_start(pid, PROC)
         if isinstance(started, process_start.Started):
             processes.add(ProcessLifetime(pid, started.start))
@@ -274,7 +252,7 @@ def _scope_processes(directory: int) -> set[ProcessLifetime]:
         except (FileNotFoundError, NotADirectoryError):
             continue
         try:
-            processes.update(_scope_processes(child))
+            processes.update(_cgroup_processes(child))
         except FileNotFoundError:
             pass
         finally:
@@ -282,228 +260,71 @@ def _scope_processes(directory: int) -> set[ProcessLifetime]:
     return processes
 
 
-def _in_scope(process: ProcessLifetime, scope: ScopeIdentity) -> bool:
+def _in_slice(process: ProcessLifetime, scope: RunSliceIdentity) -> bool:
     with suppress(FileNotFoundError, ProcessLookupError):
         path = _cgroup_path(process.pid)
         return path.is_relative_to(scope["path"])
     return False
 
 
-def _term_scope(directory: int, scope: ScopeIdentity) -> int:
-    reached = 0
+def _term_slice(directory: int, scope: RunSliceIdentity) -> None:
     try:
-        members = _scope_processes(directory)
+        members = _cgroup_processes(directory)
     except (OSError, ValueError) as error:
-        _check_saved_scope(scope)
-        raise ScopeStopFailed(f"cannot read scope members: {error}") from error
+        _check_saved_slice(scope)
+        raise SliceStopFailed(f"cannot read slice members: {error}") from error
     for process in members:
         try:
             with pin_process(process) as descriptor:
-                if _in_scope(process, scope):
+                if _in_slice(process, scope):
                     signal.pidfd_send_signal(descriptor, signal.SIGTERM)
-                    reached += 1
         except OSError:
             continue
-    return reached
 
 
-def scope_ends_by(scope: ScopeIdentity, deadline: float) -> bool:
-    with suppress(_ScopeRemoved), _scope_events(scope) as (_, descriptor):
-        return _scope_ends_on(scope, descriptor, deadline)
+def slice_ends_by(scope: RunSliceIdentity, deadline: float) -> bool:
+    with suppress(_SliceRemoved), _slice_events(scope) as (_, descriptor):
+        return _slice_ends_on(scope, descriptor, deadline)
     return True
 
 
-def _wait_scope_event(descriptor: int, seconds: float) -> None:
+def _wait_slice_event(descriptor: int, seconds: float) -> None:
     events = select.poll()
     events.register(descriptor, select.POLLPRI)
     _ = events.poll(seconds * 1000)
 
 
-def _scope_ends_on(scope: ScopeIdentity, descriptor: int, deadline: float) -> bool:
-    while not _scope_is_empty(scope, descriptor):
+def _slice_ends_on(scope: RunSliceIdentity, descriptor: int, deadline: float) -> bool:
+    while not _slice_is_empty(scope, descriptor):
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             return False
-        _wait_scope_event(descriptor, remaining)
+        _wait_slice_event(descriptor, remaining)
     return True
 
 
-def scope_member_pids(scope: ScopeIdentity) -> list[int]:
-    """List the live process IDs in the scope tree."""
-    with suppress(_ScopeRemoved):
-        directory = _open_saved_scope(scope)
+def stop_slice(run_slice: RunSliceIdentity, grace: float, kill_grace: float) -> None:
+    """Send TERM, then kill the slice if it stays populated through the grace period."""
+    if not supported():
+        raise SliceStopFailed("this system does not support pidfd stop")
+    with suppress(_SliceRemoved), _slice_events(run_slice) as (directory, events):
+        if _slice_is_empty(run_slice, events):
+            return
+        _term_slice(directory, run_slice)
+        if _slice_ends_on(run_slice, events, time.monotonic() + grace):
+            return
         try:
-            return sorted({process.pid for process in _scope_processes(directory)})
-        except OSError:
-            _check_saved_scope(scope)
-            raise
-        finally:
-            os.close(directory)
-    return []
-
-
-def stop_scope(
-    scope: ScopeIdentity, grace: float, kill_grace: float, *,
-    on_term: Callable[[int], None] | None = None,
-) -> ScopeStopReceipt:
-    """Report the TERM count before the exit wait."""
-    receipt = stop_scopes((scope,), grace, kill_grace, on_term=on_term)
-    if receipt.hook_error is not None:
-        raise receipt.hook_error
-    return receipt
-
-
-@dataclass(frozen=True)
-class _OpenScope:
-    scope: ScopeIdentity
-    directory: int
-    events: int
-
-
-def _freeze_scope(item: _OpenScope, thaw: ExitStack) -> None:
-    try:
-        descriptor = os.open("cgroup.freeze", os.O_WRONLY | os.O_NOFOLLOW, dir_fd=item.directory)
-        _ = thaw.callback(os.close, descriptor)
-        _ = os.write(descriptor, b"1\n")
-        _ = thaw.callback(_thaw_scope, item, descriptor)
-    except OSError as error:
-        _check_saved_scope(item.scope)
-        raise ScopeStopFailed(f"cannot freeze scope with cgroup.freeze: {error}") from error
-
-
-def _thaw_scope(item: _OpenScope, descriptor: int) -> None:
-    try:
-        _ = os.lseek(descriptor, 0, os.SEEK_SET)
-        _ = os.write(descriptor, b"0\n")
-    except OSError as error:
-        with suppress(_ScopeRemoved):
-            _check_saved_scope(item.scope)
-            raise ScopeStopFailed(f"{item.scope['unit']}: cannot thaw scope with cgroup.freeze: {error}") from error
-
-
-def _await_frozen(item: _OpenScope, deadline: float) -> None:
-    while True:
-        try:
-            lines = os.pread(item.events, 4096, 0).splitlines()
+            descriptor = os.open("cgroup.kill", os.O_WRONLY | os.O_NOFOLLOW, dir_fd=directory)
+            try:
+                _ = os.write(descriptor, b"1\n")
+            finally:
+                os.close(descriptor)
         except OSError as error:
-            _check_saved_scope(item.scope)
-            raise ScopeStopFailed(f"cannot read cgroup.events: {error}") from error
-        if b"frozen 1" in lines:
-            return
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            _check_saved_scope(item.scope)
-            raise ScopeStopFailed("the scope did not freeze in time")
-        _wait_scope_event(item.events, remaining)
-
-
-@contextmanager
-def _frozen_scopes(
-    opened: ExitStack, scopes: tuple[ScopeIdentity, ...], grace: float,
-    discover: Callable[[], tuple[ScopeIdentity, ...]] | None = None,
-) -> Generator[tuple[tuple[ScopeIdentity, ...], list[_OpenScope]]]:
-    known: list[ScopeIdentity] = []
-    frozen: list[_OpenScope] = []
-    deadline = time.monotonic() + grace
-    with ExitStack() as thaw:
-        while scopes:
-            for scope in scopes:
-                if scope in known:
-                    continue
-                known.append(scope)
-                try:
-                    directory, events = opened.enter_context(_scope_events(scope))
-                    item = _OpenScope(scope, directory, events)
-                    _freeze_scope(item, thaw)
-                    _await_frozen(item, deadline)
-                except _ScopeRemoved:
-                    continue
-                except (OSError, ValueError) as error:
-                    raise ScopeStopFailed(f"{scope['unit']}: {error}") from error
-                frozen.append(item)
-            candidates = discover() if discover is not None else ()
-            scopes = tuple(scope for scope in candidates if scope not in known)
-        yield tuple(known), frozen
-
-
-def _is_populated(item: _OpenScope) -> bool:
-    with suppress(_ScopeRemoved):
-        return not _scope_is_empty(item.scope, item.events)
-    return False
-
-
-def stop_scopes(
-    scopes: tuple[ScopeIdentity, ...], grace: float, kill_grace: float, *,
-    on_term: Callable[[int], None] | None = None,
-    discover: Callable[[], tuple[ScopeIdentity, ...]] | None = None,
-    prepare: Callable[[tuple[ScopeIdentity, ...], tuple[ScopeIdentity, ...]], bool] | None = None,
-) -> ScopeStopReceipt:
-    """Freeze the fixed set and report one TERM count before cleanup.
-
-    Call prepare with the saved and populated scopes before TERM. False cancels the stop.
-    """
-    hook_error: BaseException | None = None
-    term_reached = 0
-    errors: list[str] = []
-    try:
-        with ExitStack() as opened:
-            with _frozen_scopes(opened, scopes, grace, discover) as (saved, frozen):
-                populated = [item for item in frozen if _is_populated(item)]
-                if prepare is not None and not prepare(saved, tuple(item.scope for item in populated)):
-                    return ScopeStopReceipt(0)
-                for item in populated:
-                    with suppress(_ScopeRemoved):
-                        term_reached += _term_scope(item.directory, item.scope)
-                if on_term is not None:
-                    try:
-                        on_term(term_reached)
-                    except BaseException as error:
-                        hook_error = error
-            if populated:
-                deadline = time.monotonic() + grace
-                for item in frozen:
-                    try:
-                        _finish_scope_stop(item, deadline, kill_grace, term_reached=term_reached,
-                                           require_term=on_term is not None)
-                    except _ScopeRemoved:
-                        pass
-                    except (OSError, ValueError) as error:
-                        errors.append(f"{item.scope['unit']}: {error}")
-                if not errors and len(saved) > 1:
-                    with _frozen_scopes(opened, saved, grace) as (_, confirmed):
-                        for item in confirmed:
-                            if _is_populated(item):
-                                errors.append(f"{item.scope['unit']}: the scope became populated again")
-    except (OSError, ValueError) as error:
-        errors.append(str(error))
-    if errors:
-        cleanup_error = ScopeStopFailed("; ".join(errors))
-        if hook_error is not None:
-            raise cleanup_error from hook_error
-        raise cleanup_error
-    return ScopeStopReceipt(term_reached, hook_error)
-
-
-def _finish_scope_stop(
-    item: _OpenScope, deadline: float, kill_grace: float, *, term_reached: int, require_term: bool,
-) -> None:
-    if _scope_ends_on(item.scope, item.events, deadline):
-        return
-    if require_term and not term_reached:
-        raise ScopeStopFailed("no TERM signal reached a member of the populated scope")
-    try:
-        descriptor = os.open("cgroup.kill", os.O_WRONLY | os.O_NOFOLLOW, dir_fd=item.directory)
-        try:
-            _ = os.write(descriptor, b"1\n")
-        finally:
-            os.close(descriptor)
-    except OSError as error:
-        if _scope_is_empty(item.scope, item.events):
-            return
-        detail = "" if term_reached else "no TERM signal reached a member. "
-        raise ScopeStopFailed(f"{detail}cgroup.kill failed: {error}") from error
-    if not _scope_ends_on(item.scope, item.events, time.monotonic() + kill_grace):
-        raise ScopeStopFailed("the scope remains populated after KILL")
+            if _slice_is_empty(run_slice, events):
+                return
+            raise SliceStopFailed(f"cgroup.kill failed: {error}") from error
+        if not _slice_ends_on(run_slice, events, time.monotonic() + kill_grace):
+            raise SliceStopFailed("the slice remains populated after KILL")
 
 
 def stop_group(leader: ProcessLifetime, number: int) -> None:

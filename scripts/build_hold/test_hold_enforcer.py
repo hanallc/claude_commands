@@ -865,7 +865,7 @@ class HoldEnforcerTests(unittest.TestCase):
                 if label == "lone Codex":
                     self.assertEqual(self.rows()[-1]["session"], "t1")
 
-    def test_hold_stop_records_the_exit_for_a_scoped_detached_run(self) -> None:
+    def test_hold_stop_records_the_exit_for_a_detached_run_slice(self) -> None:
         runs = self.root / detached_runs.DETACHED_RUNS_DIR
         runs.mkdir()
         holder, = build_hold.natedev_holds(self.holders).in_force
@@ -877,27 +877,25 @@ class HoldEnforcerTests(unittest.TestCase):
                 record = runs / f"scoped-run-{exit_code}.json"
                 self.write_detached_run(record, command_started=True, command=scoped_command)
                 cgroups = self.root / "cgroups"
-                scope = cgroups / f"builds.slice/hold-{exit_code}.scope"
+                scope = cgroups / f"builds.slice/builds-detached.slice/builds-detached-hold{exit_code}.slice"
                 scope.mkdir(parents=True)
-                _ = (scope / "cgroup.freeze").write_text("0\n")
                 events = scope / "cgroup.events"
-                _ = events.write_text("populated 1\nfrozen 1\n")
+                _ = events.write_text("populated 1\n")
                 stat = scope.stat()
-                identity: process_stop.ScopeIdentity = {"unit": scope.name, "path": f"/builds.slice/{scope.name}",
+                identity: process_stop.RunSliceIdentity = {"unit": scope.name, "path": "/" + str(scope.relative_to(cgroups)),
                                                        "device": stat.st_dev, "inode": stat.st_ino}
                 saved = cast(dict[str, object], json.loads(record.read_text()))
-                saved["command_scope"] = identity
+                saved["command_slice"] = identity
                 write_text_atomic(record, json.dumps(saved))
                 _ = self.process(100, "python3", start=10_000,
                                  argv=("python3", "detached_runs.py", "supervise", str(record)))
                 table = self.table()
                 stopped_before = len([row for row in self.rows() if row["action"] == "stopped"])
 
-                def send_term(_directory: int, saved_scope: process_stop.ScopeIdentity) -> int:
+                def send_term(_directory: int, saved_scope: process_stop.RunSliceIdentity) -> None:
                     self.assertEqual(saved_scope, identity)
                     self.assertEqual(len([row for row in self.rows() if row["action"] == "stopped"]), stopped_before)
-                    _ = events.write_text("populated 0\nfrozen 1\n")
-                    return 1
+                    _ = events.write_text("populated 0\n")
 
                 def run(command: list[str], _environment: dict[str, str], _log: Path) -> int:
                     self.assertEqual(command, scoped_command)
@@ -910,13 +908,13 @@ class HoldEnforcerTests(unittest.TestCase):
                     )
                     self.assertIsInstance(stop, hold_enforcer.StoppedRun)
                     self.assertEqual(signals, [])
-                    self.assertTrue(process_stop.scope_has_ended(identity))
+                    self.assertTrue(process_stop.slice_has_ended(identity))
                     return exit_code
 
                 with (isolated_staff_file(self.root / "staff.json", {}),
                       mock.patch.dict(os.environ, {"BUILDLOG_SCOPE": "0"}),
                       mock.patch.object(process_stop, "CGROUP_ROOT", cgroups),
-                      mock.patch.object(process_stop, "_term_scope", side_effect=send_term),
+                      mock.patch.object(process_stop, "_term_slice", side_effect=send_term),
                       mock.patch.object(detached_runs, "_scope_stop_graces", return_value=(2.0, 5.0)),
                       mock.patch.object(detached_runs, "_run", side_effect=run),
                       mock.patch.object(detached_runs, "deliver_in_fresh_process", return_value=0)):

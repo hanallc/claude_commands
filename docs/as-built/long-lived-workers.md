@@ -709,42 +709,34 @@ The next reap can recover an alert if the process exits before the record saves 
 A rare exit or a retirement can repeat the alert once. It never repeats the result.
 The alert for an unconfirmed push says that the result may have arrived.
 If an alert fails, the sender prints one anomaly and keeps the result pending.
-The command runs in its own session, including through a systemd scope prefix.
+The command runs in its own session.
+On natedev, the launcher starts the command scope in `builds-detached-<id>.slice`.
+The slice name uses the run ID without dashes.
+Each run slice is under `builds-detached.slice`, which is under `builds.slice`.
+The limits and anonymous memory totals of `builds.slice` include the nested scopes.
+The launcher saves the run slice identity and exports `DETACHED_RUN_SLICE` before it starts the command.
+Module, admission program, and shell build step scopes use that slice when the variable is set.
+Transient services keep their usual placement.
 `detached_runs.py start` requires `systemd-run --scope` or `systemd-run --user --scope` when the program is `systemd-run`.
 Other `systemd-run` forms return exit 2.
+With a run slice, the launcher uses the user manager and adds `--slice-inherit` to this scope wrapper.
 The guard skips `env` assignments and the two-word `-u` and `--unset` options.
 If `env` uses another option, the guard refuses the start when a later argument contains `systemd-run`.
 To limit memory, use `systemd-run --user --scope --collect -q -p MemoryMax=<cap> -- <command>`.
 The record saves the command's process group as `command_group`.
-The supervisor installs no signal handler.
-The launcher records the verified scope before it execs the command.
-The launcher uses one process for scope publication and command startup.
-On natedev, five samples of the former helper took 179–294 ms elapsed and 161–183 ms CPU.
-Five samples of the replacement guard took 63–131 ms elapsed and 52–65 ms CPU.
-The samples used private records outside the expected scope and measured the launch check.
-`detached_runs.py stop` freezes the saved scopes with `cgroup.freeze`.
-It checks for more scopes after the kernel confirms the freeze.
-It freezes each scope it finds and repeats the check until the set stops growing.
-It saves the fixed set, the stop reason and any pass cancellation request before it sends TERM.
-It sends TERM through pidfds to the verified members of the frozen scope trees.
-The optional callback receives one count of the members that received TERM.
-The stop thaws every frozen scope before it waits for exit.
-It also attempts to thaw every frozen scope if an error occurs.
-After the stop grace, it uses `cgroup.kill` on each scope that stays populated.
-It saves completion only when every scope in the fixed set is empty or removed.
-A retry freezes the full set of saved scopes again.
-If the callback raises, the stop saves the cleanup result before it raises the error.
-If cleanup also fails, the cleanup error includes the callback error as its cause.
-A failed scope kill reports a stop error if the scope stays populated.
-A replacement directory with a different identity reports an error.
-A legacy group TERM without a verified scope reports an unconfirmed stop.
-A separate session in the saved scope receives the same stop signals.
-After a normal exit, the supervisor gives scope members the stop grace to exit.
-It uses the same freeze and discovery steps to check for remaining members before it records completion.
-The supervisor stops any remaining scope members and includes their scope and PIDs in the result.
-An unreadable scope produces a cleanup error result.
-The explicit stop requires Linux pidfd support.
-A build hold records a detached run as stopped after the same scope stop confirms the end.
+
+1. Save the stop reason and any pass cancellation request in the run record.
+2. Send TERM through pidfds to processes that still belong to the run slice.
+3. Give the processes the stop grace to exit.
+4. Write `1` to the slice's `cgroup.kill` if the slice is still populated.
+5. Confirm that the slice's `cgroup.events` reports `populated 0` or that the kernel removed the empty slice.
+
+An unreadable slice, a replacement directory, or a slice that stays populated after KILL produces an error.
+A run without a saved slice can receive a legacy group TERM, which reports an unconfirmed stop.
+The stop requires Linux pidfd support.
+After a normal command exit, the supervisor gives the slice members the stop grace to exit.
+It stops any processes that remain and reports them as a cleanup in the result.
+A build hold records the run as stopped after the same slice stop confirms the end.
 The supervisor stays alive to record the exit status and deliver the result.
 A run with a saved stop reason reports `STOPPED` and includes the reason.
 The result includes the command's exit status.

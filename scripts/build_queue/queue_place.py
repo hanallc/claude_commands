@@ -22,7 +22,7 @@ import threading
 import time
 from typing import BinaryIO, TypedDict, Unpack
 
-from scripts.lib import build_folders, atomic_file, cancellation, conf
+from scripts.lib import build_folders, atomic_file, cancellation, conf, process_stop
 from scripts.buildlog import store
 from scripts.build_queue import admission_records
 from scripts.build_queue import program_start as startup
@@ -90,7 +90,7 @@ def suite_scope_prefix() -> list[str]:
     if os.environ.get("BUILDLOG_SCOPE") == "0":
         print("Module scope skipped: BUILDLOG_SCOPE=0", flush=True)
         return []
-    if in_builds_slice():
+    if not os.environ.get(process_stop.DETACHED_SLICE_ENV) and in_builds_slice():
         print("Module scope skipped: gate already runs in builds.slice", flush=True)
         return []
     return probe_scope_prefix()
@@ -98,8 +98,9 @@ def suite_scope_prefix() -> list[str]:
 
 def probe_scope_prefix() -> list[str]:
     """Check whether the user manager can start a separate program scope."""
+    slice_name = os.environ.get(process_stop.DETACHED_SLICE_ENV) or "builds.slice"
     prefix = ["systemd-run", "--user", "--scope", "--quiet", "--collect",
-              "--expand-environment=no", "--slice=builds.slice", "--"]
+              "--expand-environment=no", f"--slice={slice_name}", "--"]
     try:
         probe = subprocess.run([*prefix, "true"], stdin=subprocess.DEVNULL,
                                capture_output=True, timeout=10, check=False)
@@ -109,7 +110,7 @@ def probe_scope_prefix() -> list[str]:
     if probe.returncode:
         print(f"Module scope skipped: probe failed (exit {probe.returncode})", flush=True)
         return []
-    print("Module scope: builds.slice", flush=True)
+    print(f"Module scope: {slice_name}", flush=True)
     return prefix
 
 

@@ -1,15 +1,13 @@
-"""Check process stops with private process and scope records."""
+"""Check process stops with private process and cgroup records."""
 from __future__ import annotations
 
 from contextlib import ExitStack
-import errno
 import os
 from pathlib import Path
 import signal
 from tempfile import TemporaryDirectory
-import time
 import unittest
-from unittest.mock import ANY, patch
+from unittest.mock import patch
 
 from scripts.lib import process_stop
 
@@ -74,92 +72,46 @@ class ProcessStopTests(unittest.TestCase):
             self.assertCountEqual(fixture.stop(signal.SIGTERM),
                                   [(701, signal.SIGTERM), (702, signal.SIGTERM)])
 
-    def test_receipt_failure_still_kills_a_scope_that_ignores_term(self) -> None:
+    def test_slice_term_checks_current_membership_and_process_identity(self) -> None:
         with TemporaryDirectory() as folder:
             root = Path(folder)
             fixture = StopFixture(root)
             cgroups = root / "cgroup"
-            scope = cgroups / "builds.slice" / "fixture.scope"
-            scope.mkdir(parents=True)
-            relative = "/" + str(scope.relative_to(cgroups))
-            _ = (fixture.proc / str(LEADER.pid) / "cgroup").write_text(f"0::{relative}\n")
-            _ = (scope / "cgroup.procs").write_text(f"{LEADER.pid}\n")
-            freeze = scope / "cgroup.freeze"
-            _ = freeze.write_text("0\n")
-            events = scope / "cgroup.events"
-            _ = events.write_text("populated 1\nfrozen 0\n")
-            kill = scope / "cgroup.kill"
-            _ = kill.write_text("0\n")
-            identity_stat = scope.stat()
-            identity: process_stop.ScopeIdentity = {
-                "path": relative, "unit": scope.name, "device": identity_stat.st_dev, "inode": identity_stat.st_ino,
+            run_slice = cgroups / "builds.slice/builds-detached.slice/builds-detached-fixture.slice"
+            step = run_slice / "step.scope"
+            step.mkdir(parents=True)
+            relative = "/" + str(run_slice.relative_to(cgroups))
+            _ = (run_slice / "cgroup.procs").write_text("")
+            _ = (step / "cgroup.procs").write_text("701\n702\n703\n")
+            _ = (run_slice / "cgroup.events").write_text("populated 1\n")
+            for pid in (701, 702, 703):
+                if pid != 701:
+                    write_process(fixture.proc, pid, pid)
+                group = f"{relative}/{step.name}" if pid != 702 else "/elsewhere.scope"
+                _ = (fixture.proc / str(pid) / "cgroup").write_text(f"0::{group}\n")
+            stat = run_slice.stat()
+            identity: process_stop.RunSliceIdentity = {
+                "path": relative, "unit": run_slice.name, "device": stat.st_dev, "inode": stat.st_ino,
             }
-            now = 0.0
-            failure = OSError("cannot save the TERM receipt")
-
-            def receipt(count: int) -> None:
-                self.assertEqual(freeze.read_text(), "1\n")
-                self.assertEqual(count, 1)
-                self.assertEqual(kill.read_text(), "0\n")
-                raise failure
-
-            def advance_clock(_descriptor: int, seconds: float) -> None:
-                nonlocal now
-                if freeze.read_text() == "1\n":
-                    send.assert_not_called()
-                    _ = events.write_text("populated 1\nfrozen 1\n")
-                    return
-                if kill.read_text() == "1\n":
-                    self.assertGreaterEqual(now, 2)
-                    _ = events.write_text("populated 0\nfrozen 0\n")
-                now += seconds
+            descriptors: dict[int, int] = {}
+            signals: list[tuple[int, int]] = []
 
             def open_pidfd(pid: int) -> int:
-                self.assertEqual(pid, LEADER.pid)
-                return os.open(os.devnull, os.O_RDONLY)
+                if pid == 703:
+                    record = fixture.proc / str(pid) / "stat"
+                    _ = record.write_text(record.read_text().removesuffix("703") + "704")
+                descriptor = os.open(os.devnull, os.O_RDONLY)
+                descriptors[descriptor] = pid
+                return descriptor
+
+            def send_term(descriptor: int, number: int) -> None:
+                signals.append((descriptors[descriptor], number))
+                _ = (run_slice / "cgroup.events").write_text("populated 0\n")
 
             with (patch.object(process_stop, "CGROUP_ROOT", cgroups),
                   patch.object(process_stop, "PROC", fixture.proc),
                   patch.object(os, "pidfd_open", side_effect=open_pidfd),
-                  patch.object(signal, "pidfd_send_signal") as send,
-                  patch.object(time, "monotonic", side_effect=lambda: now),
-                  patch.object(process_stop, "_wait_scope_event", side_effect=advance_clock)):
-                with self.assertRaises(OSError) as raised:
-                    _ = process_stop.stop_scope(identity, 2, 2, on_term=receipt)
-                self.assertIs(raised.exception, failure)
-                send.assert_called_once_with(ANY, signal.SIGTERM)
-                self.assertEqual(kill.read_text(), "1\n")
-                self.assertTrue(process_stop.scope_has_ended(identity))
-
-    def test_freeze_denial_thaws_every_scope_that_froze(self) -> None:
-        with TemporaryDirectory() as folder:
-            cgroups = Path(folder)
-            scopes: list[process_stop.ScopeIdentity] = []
-            controls: list[Path] = []
-            for unit in ("first.scope", "second.scope", "denied.scope"):
-                directory = cgroups / unit
-                directory.mkdir()
-                stat = directory.stat()
-                scopes.append({"path": f"/{unit}", "unit": unit, "device": stat.st_dev, "inode": stat.st_ino})
-                _ = (directory / "cgroup.events").write_text("populated 1\nfrozen 1\n")
-                control = directory / "cgroup.freeze"
-                _ = control.write_text("0\n")
-                controls.append(control)
-            write = os.write
-            denied = controls[-1].stat()
-
-            def write_control(descriptor: int, data: bytes) -> int:
-                if os.path.samestat(os.fstat(descriptor), denied):
-                    self.assertEqual([control.read_text() for control in controls[:2]], ["1\n", "1\n"])
-                    raise PermissionError(errno.EACCES, "Permission denied", "cgroup.freeze")
-                return write(descriptor, data)
-
-            with (patch.object(process_stop, "CGROUP_ROOT", cgroups),
-                  patch.object(os, "write", side_effect=write_control),
-                  patch.object(signal, "pidfd_send_signal") as send,
-                  self.assertRaisesRegex(process_stop.ScopeStopFailed,
-                                         "denied.scope: cannot freeze scope with cgroup.freeze: "
-                                         + r"\[Errno 13\] Permission denied: 'cgroup.freeze'")):
-                _ = process_stop.stop_scopes(tuple(scopes), 2, 2)
-            send.assert_not_called()
-            self.assertEqual([control.read_text() for control in controls], ["0\n", "0\n", "0\n"])
+                  patch.object(signal, "pidfd_send_signal", side_effect=send_term)):
+                process_stop.stop_slice(identity, 0, 0)
+                self.assertTrue(process_stop.slice_has_ended(identity))
+            self.assertEqual(signals, [(701, signal.SIGTERM)])
