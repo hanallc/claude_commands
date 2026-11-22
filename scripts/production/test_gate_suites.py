@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import cast, final
 from collections.abc import Generator
 from unittest import mock
+from scripts.build_queue import admission_protocol as wire
 from scripts.build_queue.admission_jobs import GateJobNotRecorded, StepJob
 from scripts.production import affected_modules, checkpoint_gate, gate, targeted_test
 from scripts.lint.memory_test_support import write_config_fixture
@@ -331,17 +332,31 @@ class MergeGateSuitesTests(GateSuitesFixture):
         self.assertNotIn("Rerun alone", output.getvalue())
 
     @gate_suites("lib", "hooks")
-    def test_named_modules_run_alone_with_no_hold_ledger_or_record(self) -> None:
+    def test_named_modules_take_admission_and_write_one_record_without_a_hold(self) -> None:
         self.write(self.checkout / "scripts/hooks/test_first.py", SUITE_MODULE
                    + "\n\nclass Red(unittest.TestCase):\n    def test_red(self):\n        self.fail('red')\n")
+        replies: list[wire.Admitted | wire.Wait] = []
+        previous = self.admission.server.reply_filter
+
+        def observe(reply: wire.Reply) -> wire.Reply:
+            if isinstance(reply, (wire.Admitted, wire.Wait)):
+                replies.append(reply)
+            return previous(reply)
+
         output = io.StringIO()
         with (mock.patch.dict(os.environ, self.environment),
+              mock.patch.object(self.admission.server, "reply_filter", observe),
               contextlib.ExitStack() as blocked, contextlib.redirect_stdout(output)):
-            for name in ("BuildHoldWait", "gate_reservation", "PassedTreeLedger", "record_gate_run", "run_gate_suites"):
+            for name in ("BuildHoldWait", "run_gate_suites"):
                 _ = blocked.enter_context(mock.patch.object(gate, name, side_effect=AssertionError(name)))
             code = gate.main(["--tests-only", "--repo", str(self.checkout),
-                                    "--module", "hooks/test_first.py", "--module", "lib/test_second.py"])
+                              "--module", "hooks/test_first.py", "--module", "lib/test_second.py"])
         self.assertEqual(code, 1, output.getvalue())
+        self.assertEqual([type(reply) for reply in replies], [wire.Admitted])
+        self.assert_gate_released()
+        record, = self.gate_run_records()
+        self.assertEqual((record["selection"], record["hold_wait_s"], record["status"]), ("subset", 0.0, 1))
+        self.assertFalse(Path(self.environment["GATE_PASSED_DIR"], "passed-trees.jsonl").exists())
         starts = sorted((event["suite"], event["module"]) for event in self.module_events() if event["event"] == "start")
         # A red module runs once more alone, as in the gate, so a flake is not a red name.
         self.assertEqual(starts, [("hooks", "test_first.py"), ("hooks", "test_first.py"), ("lib", "test_second.py")])
