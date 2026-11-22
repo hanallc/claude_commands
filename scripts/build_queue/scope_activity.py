@@ -103,6 +103,29 @@ class ScopeProcess:
 
 
 @dataclass(frozen=True)
+class TrackedDetachedRunRow:
+    """The original process-tree row for a tracked run in a detached scope."""
+
+    run: LiveBuildRun
+    bytes: int
+    program: str
+    session_id: str
+    session_name: str
+    folder: str
+    unit: str
+
+
+@dataclass(frozen=True)
+class NoTrackedDetachedRunRow:
+    """The scope has no tracked run row to show."""
+
+
+def in_detached_build_scope(cgroup: str, builds: Path) -> bool:
+    """Identify a scope inside the detached builds slice."""
+    return bool(cgroup) and Path(cgroup).is_relative_to(builds / "builds-detached.slice")
+
+
+@dataclass(frozen=True)
 class ScopeProcesses:
     """The scope activity holds process members, caller identity, folder, and run evidence."""
     count: int
@@ -114,6 +137,8 @@ class ScopeProcesses:
     test_fixture: bool
     run: LiveBuildRun | NoLiveBuildRun
     members: tuple[ScopeProcess, ...] = field(default=(), kw_only=True)
+    tracked_run_row: TrackedDetachedRunRow | NoTrackedDetachedRunRow = field(
+        default=NoTrackedDetachedRunRow(), kw_only=True)
 
 
 class ScopeActivityReader:

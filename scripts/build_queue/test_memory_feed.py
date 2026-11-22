@@ -3701,6 +3701,60 @@ process.stdout.write(JSON.stringify({
                 self.assertEqual(room.used, cargo_use)
                 self.assertEqual(room.used + room.kept, 8 * admission_records.GIB if cargo_use else 0)
 
+    def test_tracked_run_keeps_its_row_when_detached_scopes_account_for_its_tools(self) -> None:
+        gib = admission_records.GIB
+        with AdmissionFixture() as fixture:
+            proc = fixture.proc.path
+            root = fixture.fixture_owner(700001, "100")
+            run = wire.RunIdentity(root.pid, root.start_time)
+            helper_pids = (700002, 700003)
+            write_process(proc, root.pid, gib, start=root.start_time)
+            _ = (proc / str(root.pid) / "cmdline").write_bytes(b"bash\0/fixture/verify.sh\0test\0")
+            for pid in helper_pids:
+                write_process(proc, pid, gib // 4, parent=root.pid)
+                _ = (proc / str(pid) / "cmdline").write_bytes(b"sleep\0")
+            first = fixture.fixture_owner(700004, "200")
+            _ = fixture.finish_step(fixture.request(owner=first, run=run))
+            fixture.clock.advance(200)
+            self.assertTrue(fixture.server.run_places)
+
+            builds = Path(os.environ["BUILDLOG_BUILDS_CGROUP"])
+            detached = builds / "builds-detached.slice"
+            run_slice = detached / "builds-detached-r1.slice"
+            write_scope(builds, current=5 * gib, anonymous=5 * gib)
+            write_scope(detached, current=5 * gib, anonymous=5 * gib)
+            write_scope(run_slice, current=5 * gib, anonymous=5 * gib)
+            cargo = fixture.fixture_owner(700005, "300")
+            sidecar = fixture.scope(cargo, folder=str((run_slice / "cargo.scope").relative_to(fixture.root)),
+                                    current=2 * gib, anonymous=2 * gib)
+            _ = only_admitted(fixture.server.handle_request(replace(fixture.request(owner=cargo), sidecar=str(sidecar))))
+
+            def page() -> memory_feed.MemoryPage:
+                _ = fixture.run_pass()
+                reply, = fixture.server.handle_request(wire.ViewRequest())
+                decoded = wire.parse_reply(wire.encode_reply(reply))
+                assert isinstance(decoded, wire.ViewReply)
+                with (mock.patch.object(admission_client, "view", return_value=decoded.reading),
+                      mock.patch.object(memory_feed, "PROC", proc)):
+                    return memory_feed.reading()
+
+            before = page()
+            original, = (row for row in before["walk"] if row["pid"] == root.pid)
+            original = cast(memory_feed.RunRow, original)
+            self.assertEqual((original["name"], original["used"], original["counted"]), ("verify.sh", 1.5, 0.0))
+
+            for pid, scope_gib in zip(helper_pids, (1, 2), strict=True):
+                write_scope(run_slice / f"helper-{pid}.scope", members=(pid,),
+                            current=scope_gib * gib, anonymous=scope_gib * gib)
+            after = page()
+            shown, = (row for row in after["walk"] if row["pid"] == root.pid)
+            self.assertEqual(shown, original)
+            self.assertEqual(after["walk"], before["walk"])
+            ram = after["ram"]
+            self.assertEqual((ram["queued_builds_bytes"], ram["build_tools_bytes"], ram["other_build_tools_bytes"]),
+                             (2 * gib, 3 * gib, 3 * gib))
+            self.assertEqual(after["used"], 2.0)
+
     def test_registered_and_unregistered_ci_jobs_count_once_without_margin_text(self) -> None:
         for registered, registered_use, unregistered_use, kept in (
                 ((), 0, 6, 0), ((700001,), 2, 4, 6), ((700001, 700002), 6, 0, 10)):

@@ -61,7 +61,7 @@ from scripts.lib.build_steps import gate_job_from_process
 
 from scripts.build_queue.scope_activity import (
     IdleService, LiveBuildRun, NoLiveBuildRun, NotServiceSlice, RunningServiceJob, WaitingServiceJob, UnmatchedServiceJob,
-    ScopeActivityReader, ScopeProcesses,
+    ScopeActivityReader, ScopeProcesses, TrackedDetachedRunRow, in_detached_build_scope,
 )
 from scripts.lint.build_shape import build_shape, recorded_build_shape
 from scripts.lib.atomic_file import atomic_sample, write_text_atomic
@@ -800,13 +800,25 @@ def read_system(plan: SystemReadingPlan, readings: Readings, proc: Proc, clock: 
     scope_process_memory = {pid: gate.process_memory({pid}, proc.path)
                             for pid in {member for group in members.values() for member in group}}
     between: list[records.RunningStep] = []
-    represented = {(row.activity.run.pid, row.activity.run.start_time) for row in unowned
-                   if isinstance(row.activity, ScopeProcesses) and isinstance(row.activity.run, LiveBuildRun)}
-    represented.update((record.run.pid, record.run.start_time) for record in plan.reservations
-                       if isinstance(record.run, wire.RunIdentity))
+    represented = {(record.run.pid, record.run.start_time) for record in plan.reservations
+                   if isinstance(record.run, wire.RunIdentity)}
+    builds = gate.builds_slice_cgroup()
+    scope_rows = list(unowned)
+    detached_scopes: dict[tuple[int, str], list[int]] = {}
+    for index, row in enumerate(scope_rows):
+        activity_row = row.activity
+        if not isinstance(activity_row, ScopeProcesses) or not isinstance(activity_row.run, LiveBuildRun):
+            continue
+        key = activity_row.run.pid, activity_row.run.start_time
+        if (isinstance(records.recorded_service_state(row), NotServiceSlice)
+                and not row.diagnostic and in_detached_build_scope(row.cgroup, builds)):
+            detached_scopes.setdefault(key, []).append(index)
+        else:
+            represented.add(key)
     for place in plan.runs:
         run = place.run
-        if (run.pid, run.start_time) in represented:
+        key = run.pid, run.start_time
+        if key in represented:
             continue
         identity = processes.get(run.pid)
         if identity is None or identity.start != run.start_time:
@@ -819,6 +831,14 @@ def read_system(plan: SystemReadingPlan, readings: Readings, proc: Proc, clock: 
         if isinstance(measured, records.GoneMemory):
             continue
         caller = scope_caller(evidence, place.unit)
+        if key in detached_scopes:
+            tracked = TrackedDetachedRunRow(live_run, measured.bytes, evidence.program,
+                                            caller.session_id, caller.name, evidence.folder, caller.unit)
+            for index in detached_scopes[key]:
+                scope = scope_rows[index]
+                assert isinstance(scope.activity, ScopeProcesses)
+                scope_rows[index] = replace(scope, activity=replace(scope.activity, tracked_run_row=tracked))
+            continue
         memory = records.UnownedSliceMemory(measured.bytes, swap_bytes=measured.swap_bytes,
             pid=run.pid, activity=replace(evidence, run=live_run, session_name=caller.name))
         between.append(records.RunningStep(caller.session_id, caller.name, "between steps",
@@ -831,7 +851,7 @@ def read_system(plan: SystemReadingPlan, readings: Readings, proc: Proc, clock: 
                                  records.HostMemory(0, records.UnknownHostTotal()), pressure_policy)
     return SystemEvidence(now, started_monotonic, MappingProxyType(processes),
         MappingProxyType(lifetimes), MappingProxyType(reservations), activity,
-        tuple(unowned), MappingProxyType(members), MappingProxyType(scope_process_memory), MappingProxyType(workers),
+        tuple(scope_rows), MappingProxyType(members), MappingProxyType(scope_process_memory), MappingProxyType(workers),
         tuple(between), host, pressure, tuple(readings.compilers()))
 
 
