@@ -101,6 +101,16 @@ As built (checkpoint 416bb6a5f4 on `natedev-postmaster-nosig`, which contains ma
 - At the deadline the hook prints `conversation-pause: HookBudgetSpent: gave up after N seconds` and exits 0, as before. `CONVERSATION_PAUSE_HOOK_BUDGET` still sets the budget (default 5 s).
 - Tests: `scripts/hooks/test_conversation_pause_processes.py` (no signal handler, stalled import, temporary-file cleanup, killed hook ends its worker). As-built: `docs/as-built/conversation-pause.md`.
 
+### Phase 6 — A relay delivers the approved text  · status: done
+
+As built (checkpoint c5d84e9c32 on `natedev-postmaster-relayfix`, tip 18765b08b2 with main 939fc216ed):
+
+- Cause: the relay's model sometimes changed its SendMessage call. On 11-22 it dropped the lines after the body (from `Sender native id:` on) or added a space to the summary. The guard blocked the call, and the send was REFUSED or queued.
+- `RELAY_TOOL_GUARD` in `scripts/message/send.py` approves the first SendMessage call and prints a PreToolUse `updatedInput` that sets `to`, `message` and `summary` to the approved values. A later call, another tool or a missing tool id exits 2.
+- `read_relay` accepts a call when the proxy forwarded the approved text, even when the model's input differs. The detail adds `guard set the approved input`. A changed call that was not forwarded stays REFUSED.
+- `STATE/relay_mismatches.jsonl` still records each changed model input, now with `summary_changed`.
+- Tests: rows in `scripts/message/test_send.py`. As-built: `docs/as-built/session-roster.md`.
+
 ## Acceptance gate
 
 - basedpyright reports zero errors, zero warnings and zero notes on each changed Python file.
