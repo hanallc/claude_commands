@@ -46,7 +46,7 @@ class TraceStartFailure(RuntimeError):
 
 def measurement_timeout_s() -> float:
     """Read the time limit for one measurement stage."""
-    return conf.read("test_times").number("MODULE_COST_STAGE_TIMEOUT_S")
+    return conf.read("test_times").number("module_cost_stage_timeout_s")
 
 
 def command_arguments(pid: int) -> list[str]:
@@ -232,7 +232,7 @@ def measure(command: Sequence[str], *, cwd: Path, environment: dict[str, str],
     """Trace process events in a process that adopts its orphaned descendants."""
     limit = measurement_timeout_s() if timeout_s is None else timeout_s
     deadline = time.monotonic() + limit
-    leftover_limit = conf.read("test_times").number("MODULE_COST_LEFTOVER_S")
+    leftover_limit = conf.read("test_times").number("module_cost_leftover_s")
     libc = ctypes.CDLL(None, use_errno=True)
     ptrace = libc.ptrace
     ptrace.argtypes = [ctypes.c_uint, ctypes.c_uint, ctypes.c_void_p, ctypes.c_void_p]

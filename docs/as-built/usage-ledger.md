@@ -388,7 +388,7 @@ Until that threshold, no OFF result is saved; on 2026-11-09 the director n was 8
 
 ### Compaction replay: `scripts/usage/compaction_replay.py`
 
-`~/.claude/scripts/lib/py -m scripts.usage.compaction_replay [--db PATH] [--since DAY] [--until DAY] [--follow-up-prompt TOKENS]` replays stored Codex threads under other compaction limits, to set `UNIT_COMPACT_ABOVE_TOKENS`. Defaults: the collector's store, follow-up prompt 11,000 tokens. `--since` and `--until` are read in the user's zone and select whole threads by their first request.
+`~/.claude/scripts/lib/py -m scripts.usage.compaction_replay [--db PATH] [--since DAY] [--until DAY] [--follow-up-prompt TOKENS]` replays stored Codex threads under other compaction limits, to set `unit_compact_above_tokens`. Defaults: the collector's store, follow-up prompt 11,000 tokens. `--since` and `--until` are read in the user's zone and select whole threads by their first request.
 
 - Covered: `codex` threads with a compaction and a request, every request of which has a weight entry. A thread's requests, in `(at, turn_key)` order, are cut into segments at each compaction; a request at the same instant as a compaction stays in the earlier segment.
 - `RULES`: `LimitRule` at 100,000, 150,000, 200,000 and 250,000; `NeverRule()`; `NewWorkerRule()` (limit 100,000, and a new worker when the kept size is over 90,000).
@@ -509,7 +509,7 @@ The hourly pass lives outside this repository, in `/etc/nixos/modules/linux/usag
   | `limit 250,000` | 683 | 8,066,593,866 | +39.6% | 111,029 |
   | `never` | 0 | 23,242,221,181 | +302.3% | 210,404 |
 
-  The new-worker row equals `limit 100,000` with 0 new workers: the fitted slope is negative, so the kept size never passes about 84,000. Stored weighted tokens of the same threads: 5,551,641,863; the replay's base is about 4% over it, because it does not cost the compaction request and does not simulate Codex compacting a full context. `UNIT_COMPACT_ABOVE_TOKENS` stays 100000.
+  The new-worker row equals `limit 100,000` with 0 new workers: the fitted slope is negative, so the kept size never passes about 84,000. Stored weighted tokens of the same threads: 5,551,641,863; the replay's base is about 4% over it, because it does not cost the compaction request and does not simulate Codex compacting a full context. `unit_compact_above_tokens` stays 100000.
 - **Compaction reread share** by role and model: `gpt-6.1-sol` 4.4% (director) and 6.8% (unassigned); Claude director models 4.9% to 7.0%; `gpt-5.6-sol` 0.4% to 0.5%.
 
 - **Unclassified rows**: a row stored before version 10 whose file is gone (or a Mac file not yet re-read) stays `unclassified`; the report counts such turns in its coverage.

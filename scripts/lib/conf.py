@@ -104,6 +104,15 @@ def _key_warning(source: Path, key: str, reason: str, bad: str,
     _warning(f"warning: {reason}", report=report)
 
 
+class InvalidKey(Exception):
+    """The requested configuration key contains an uppercase letter."""
+
+
+def _require_lower_case(key: str) -> None:
+    if key != key.lower():
+        raise InvalidKey(f"configuration key {key!r} must be lower case")
+
+
 class Unusable(ValueError):
     """The named configuration key has no usable value."""
 
@@ -169,6 +178,7 @@ class ConfigRead:
                  default: Result | UseConfiguredValue = UseConfiguredValue.CURRENT, allow_blank: bool = False,
                  recover_invalid: bool = True
                  ) -> UsableLiveValue[Result] | RecoveredValue[Result] | UnavailableValue:
+        _require_lower_case(key)
         bad = "<missing>"
 
         def read_key(settings: dict[str, Setting]) -> tuple[Result, str | None]:
@@ -251,8 +261,9 @@ class ConfigRead:
 
     def effective_key(self, key: str) -> str:
         """Return the host override key when the live file has one."""
+        _require_lower_case(key)
         if isinstance(self.settings, dict):
-            return effective_key(self.settings, key, host_name=_local_host_name())
+            return _effective_key(self.settings, key, local_host_key_name())
         return key
 
     def number(self, key: str) -> float:
@@ -266,12 +277,15 @@ class ConfigRead:
 
     def values(self, *keys: str, host_only_prefix: str = "") -> dict[str, str]:
         """Return all values when no keys are given. Add base keys for host overrides that match the prefix."""
+        for key in keys:
+            _require_lower_case(key)
+        _require_lower_case(host_only_prefix)
         settings = self.settings
         if isinstance(settings, _UnreadableFile):
             settings = self._recover_file(settings)
         selected = dict.fromkeys(keys or settings)
         if host_only_prefix:
-            suffix = f".{_local_host_name()}"
+            suffix = f".{local_host_key_name()}"
             for key in settings:
                 if key.startswith(host_only_prefix) and key.endswith(suffix):
                     selected[key.removesuffix(suffix)] = None
@@ -393,19 +407,30 @@ def settings(source: str) -> dict[str, Setting]:
     return _parse(source)
 
 
-def _local_host_name() -> str:
-    return socket.gethostname().partition(".")[0]
+def host_key_name(host_name: str) -> str:
+    """Return the lower-case short host name for configuration keys."""
+    return host_name.partition(".")[0].lower()
+
+
+def local_host_key_name() -> str:
+    """Return the local host name for configuration keys."""
+    return host_key_name(socket.gethostname())
 
 
 def effective_key(settings: dict[str, Setting], key: str, *, host_name: str) -> str:
     """Select the override for the specified short host name when it exists."""
-    candidate = f"{key}.{host_name}"
+    _require_lower_case(key)
+    return _effective_key(settings, key, host_key_name(host_name))
+
+
+def _effective_key(settings: dict[str, Setting], key: str, host: str) -> str:
+    candidate = f"{key}.{host}"
     return candidate if candidate in settings else key
 
 
 def _setting(settings: dict[str, Setting], key: str) -> Setting:
     try:
-        return settings[effective_key(settings, key, host_name=_local_host_name())]
+        return settings[_effective_key(settings, key, local_host_key_name())]
     except KeyError:
         raise _MissingKey("key is missing") from None
 
@@ -504,6 +529,7 @@ def _converted(setting: Setting, convert: Callable[[str], Result]) -> Result:
 
 def effective_line(file: str | Path, key: str) -> tuple[int, str]:
     """Return the effective source line index and its value without a write."""
+    _require_lower_case(key)
     source = path(file)
     try:
         setting = _setting(_parse(source.read_text(encoding="utf-8")), key)
@@ -520,13 +546,13 @@ def known_host_names() -> frozenset[str]:
     except FileNotFoundError:
         machines = _parse(_repository_path("machines").read_text(encoding="utf-8"))
     aliases = machines.get("aliases")
-    hosts = {_local_host_name().casefold()}
+    hosts = {local_host_key_name()}
     if aliases is not None:
         for alias in aliases.value.split():
-            hosts.add(alias.casefold())
+            hosts.add(host_key_name(alias))
             names = machines.get(f"{alias}.hosts")
             if names is not None:
-                hosts.update(name.partition(".")[0].casefold() for name in names.value.split())
+                hosts.update(host_key_name(name) for name in names.value.split())
     return frozenset(hosts)
 
 
@@ -558,6 +584,7 @@ def host_override(file: str | Path, settings: dict[str, Setting], key: str) -> s
 
 def editable_line(file: str | Path, key: str) -> tuple[int, str]:
     """Return an exact stored key's line and value when no host override exists."""
+    _require_lower_case(key)
     source = path(file)
     try:
         settings = _parse(source.read_text(encoding="utf-8"))
@@ -575,6 +602,7 @@ def editable_line(file: str | Path, key: str) -> tuple[int, str]:
 
 
 def check(file: str | Path, key: str, value: str) -> None:
+    _require_lower_case(key)
     source = path(file)
     try:
         setting = _setting(_parse(source.read_text(encoding="utf-8")), key)
@@ -589,8 +617,9 @@ def main(arguments: list[str] | None = None) -> int:
         print("usage: conf.py get FILE KEY", file=sys.stderr)
         return 2
     try:
+        _require_lower_case(args[2])
         print(read(args[1]).text(args[2]))
-    except Unusable as error:
+    except (InvalidKey, Unusable) as error:
         print(str(error), file=sys.stderr)
         return 2
     return 0

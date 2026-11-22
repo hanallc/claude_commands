@@ -1158,7 +1158,7 @@ def _operation_lock_holder(path: Path) -> str:
 def _wait_for_operation_lock(descriptor: int, path: Path) -> None:
     from scripts.agents import worker_lifecycle
 
-    limit = _wait_seconds("OPERATION_LOCK_SECONDS")
+    limit = _wait_seconds("operation_lock_seconds")
     started = time.monotonic()
     try:
         worker_lifecycle.acquire_flock(descriptor, deadline=started + limit)
@@ -1452,7 +1452,7 @@ def _remote(arguments: list[str], *, input_text: str | None = None) -> object:
         arguments = [*arguments, "--row-write"]
     elif arguments[0] == "retire":
         arguments = [*arguments, "--worker-row"]
-    timeout = _wait_seconds("REMOTE_SECONDS")
+    timeout = _wait_seconds("remote_seconds")
     command = ["ssh", "-o", "BatchMode=yes", OWNER_MACHINE,
                "~/.claude/scripts/lib/py ~/.claude/scripts/production/staff.py "
                + shlex.join([*arguments, "--json"])]

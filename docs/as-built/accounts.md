@@ -432,7 +432,7 @@ A closed worker without an active dispatch has nothing to move.
 An active or refused pass receives resume text through the shared target check.
 A worker with a live detached run also receives resume text when its pass has ended.
 Single moves, group moves, swaps, refusal moves, and shutdown recovery use the same run context formatter.
-`config/shutdown.conf` sets the stop deadline from `STOP_GRACE_SECONDS`, `KILL_GRACE_SECONDS`, and `MOVE_STOP_MARGIN_SECONDS`.
+`config/shutdown.conf` sets the stop deadline from `stop_grace_seconds`, `kill_grace_seconds`, and `move_stop_margin_seconds`.
 The [quota guide](../quota_alerts.md) owns phone episodes, forecasts, routing notices, and delivery retries.
 
 Login renewal uses named success and failure results.

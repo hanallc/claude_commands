@@ -267,7 +267,7 @@ class MemoryFeedTests(unittest.TestCase):
 
     def test_run_slot_numbers_use_the_run_machine_root(self) -> None:
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"HOME": str(self.root / "home")})))
-        mac_machine = "private-mac-host"
+        mac_machine = "Private-Mac-Host"
         _ = (self.root / "machines.conf").write_text(f"mac.hosts={mac_machine}\n")
         roots = {"natedev": self.root / "linux-slots", mac_machine: self.root / "mac-slots"}
         roots["natedev"].mkdir()
@@ -293,12 +293,12 @@ class MemoryFeedTests(unittest.TestCase):
             ("Mac without roots", "mac", roots[mac_machine] / "hana/unit/3", "none", "—"),
         ):
             with self.subTest(label=label):
-                settings = ("".join(f"roots.build.{host}={path}\n" for host, path in roots.items())
+                settings = ("".join(f"roots.build.{conf.host_key_name(host)}={path}\n" for host, path in roots.items())
                             if configured == "machine" else f"roots.build={roots['natedev']}\n" if configured == "common" else "")
                 if configured in ("~", "$HOME", "${HOME}", "unknown-home"):
                     selected_host = mac_machine if machine == "mac" else machine
                     prefix = "~" if configured == "unknown-home" else configured
-                    settings = f"roots.build.{selected_host}={prefix}/build\n"
+                    settings = f"roots.build.{conf.host_key_name(selected_host)}={prefix}/build\n"
                 if configured == "symlink":
                     settings = f"roots.build.natedev={linked_root}\n"
                 _ = (self.root / "build_folders.conf").write_text(settings)
@@ -377,7 +377,7 @@ class MemoryFeedTests(unittest.TestCase):
         proc = self.root / "proc"
         proc.mkdir()
         _ = (proc / "meminfo").write_text("SwapTotal: 8388608 kB\nSwapFree: 8388608 kB\n")
-        _ = (self.root / "buildlog.conf").write_text("# whole: 1..\nTOP_COST_RECENT_DAYS=3\n")
+        _ = (self.root / "buildlog.conf").write_text("# whole: 1..\ntop_cost_recent_days=3\n")
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
             "CONF_DIR": str(self.root),
             "BUILDLOG_DIR": str(self.root / "buildlog"),
@@ -1784,14 +1784,14 @@ process.stdout.write(JSON.stringify({
             self.assertNotIn("Errno", value.reason)
 
     def test_history_shorter_than_the_recent_window_names_the_configuration_error(self) -> None:
-        _ = (self.root / "buildlog.conf").write_text("# whole: 1..\nTOP_COST_RECENT_DAYS=8\n")
+        _ = (self.root / "buildlog.conf").write_text("# whole: 1..\ntop_cost_recent_days=8\n")
         with (mock.patch.object(charts, "page_data") as provider,
               mock.patch.object(admission_client, "view", return_value=reservation_reading())):
             page = memory_feed.reading()
             text = memory_feed.report_file(memory_feed.report_reading(memory_feed.read_configuration().history_days)).text
         provider.assert_not_called()
         self.assertIn("history_days", text)
-        self.assertIn("TOP_COST_RECENT_DAYS", text)
+        self.assertIn("top_cost_recent_days", text)
         self.assertTrue(page["walk"])
 
     def test_installed_feed_sources_and_startup_files_change_the_fixed_version(self) -> None:

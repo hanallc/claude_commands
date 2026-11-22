@@ -76,7 +76,7 @@ def _observe(parent: staff.StaffRow, row: staff.StaffRow) -> worker_panes.Worker
 
 def _stop_seconds() -> int:
     settings = conf.read("shutdown")
-    return sum(settings.whole(key) for key in ("STOP_GRACE_SECONDS", "KILL_GRACE_SECONDS", "MOVE_STOP_MARGIN_SECONDS"))
+    return sum(settings.whole(key) for key in ("stop_grace_seconds", "kill_grace_seconds", "move_stop_margin_seconds"))
 
 
 def stop_worker(parent: staff.StaffRow, row: staff.StaffRow, client: herdr.Herdr) -> WorkerStopped | WorkerNotStopped:

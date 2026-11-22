@@ -705,7 +705,7 @@ Remote launch signals use `find_mac_runner_pid` and the rules in [Mac step offlo
 
 ## Cargo token ownership and wait holders
 
-`config/direct.conf` supplies `VERIFY_TOKEN_HOLD_SECONDS` and `VERIFY_TOKEN_RENEW_SECONDS`.
+`config/direct.conf` supplies `verify_token_hold_seconds` and `verify_token_renew_seconds`.
 The shipped values are 3600 and 60 seconds.
 The renewal interval cannot exceed one third of the lease.
 `start_token_renewer` and `stop_token_renewer` maintain one renewer while a step command runs.

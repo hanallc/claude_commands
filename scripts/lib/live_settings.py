@@ -24,8 +24,9 @@ from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.waiting_rows import (
     ORDER_PATH, AcceptedSave, LockedJournal, SaveOrders, WaitingChange as WaitingChange,
     append_setting, apply_move, check_move, git,
-    journal_path as journal_path, locked_journal, model_color_host, model_color_key, model_color_value, move_target,
-    published_orders, replace_value, show, tree_value,
+    journal_path as journal_path, live_text, locked_journal, model_color_host, model_color_key, model_color_value, move_target,
+    migrated_setting_name,
+    publish_setting_text, published_orders, replace_value, show, tree_value,
 )
 
 SAVE_ORDER_ENV = "LIVE_SETTINGS_SAVE_ORDER"
@@ -59,6 +60,9 @@ class UnchangedSave:
 
 def editable_setting(stem: str, key: str, value: str, *, accepted: bool = False) -> ExistingSetting | NewModelColor:
     """Validate the change and identify the current setting."""
+    current_stem, _ = migrated_setting_name(stem, key)
+    if current_stem != stem:
+        raise conf.Unusable(f"Use {current_stem} for this Save.")
     if stem == "statusline" and key.startswith("model."):
         if host := model_color_host(key):
             raise conf.Unusable(f"{stem}: {key}: .{host} is a host override, not a model color")
@@ -111,9 +115,7 @@ def _commit_row(checkout: Path, relative: str, change: WaitingChange, orders: Sa
     """Commit only this row onto HEAD; other waiting rows stay live and uncommitted."""
     entry = git(checkout, "ls-tree", "HEAD", "--", relative)
     head = show(checkout, "HEAD", relative) if entry else ""
-    setting = conf.settings(head).get(change.key)
-    text = (replace_value(head, setting.line, change.value) if setting
-            else append_setting(head, change.key, change.value))
+    text = publish_setting_text(head, live_text(checkout / relative) or "", change)
     mode = entry.split()[0] if entry else "100644"
     orders.setdefault(change.stem, {})[change.key] = change.save_order
     parent = git(checkout, "rev-parse", "HEAD").strip()
@@ -264,7 +266,7 @@ def main(arguments: list[str] | None = None) -> int:
                 _ = pending.accept(stem, key, AcceptedSave(order, value, base))
                 pending.save()
                 _ = _write_setting(stem, key, value, setting)
-    except (OSError, ValueError, main_publish.Refusal) as error:
+    except (conf.InvalidKey, OSError, ValueError, main_publish.Refusal) as error:
         print(f"live_settings: {error}", file=sys.stderr)
         return 1
     return 0

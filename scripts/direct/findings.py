@@ -28,14 +28,14 @@ This ledger replaces the counter with state:
 Convergence advisories, all computed from recorded state and all reported
 rather than enforced:
 
-  * a finding failed to close `MAX_FIX_ATTEMPTS` times
-  * a finding reopened `MAX_REOPENS` times after being accepted
-  * the gating open count failed to decrease across `STALLED_ROUNDS` rounds
+  * a finding failed to close `max_fix_attempts` times
+  * a finding reopened `max_reopens` times after being accepted
+  * the gating open count failed to decrease across `stalled_rounds` rounds
   * the phase spent its repair budget, which is the first round's gating count
-    times `REPAIR_ROUNDS_PER_FINDING`, never below `MIN_REPAIR_BUDGET`
-  * one worker ran `MAX_CONSECUTIVE_SAME_KIND_PASSES` passes of one kind in a row
-  * one worker had a review canceled more than `MAX_REVIEW_CANCELLATIONS` times
-  * a runaway backstop at `RUNAWAY_ROUNDS` rounds
+    times `repair_rounds_per_finding`, never below `min_repair_budget`
+  * one worker ran `max_consecutive_same_kind_passes` passes of one kind in a row
+  * one worker had a review canceled more than `max_review_cancellations` times
+  * a runaway backstop at `runaway_rounds` rounds
 
 Every one of those limits is set in `~/.claude/config/direct.conf`, which is
 authoritative: no limit has a compiled default, and a missing or unusable value
@@ -439,7 +439,7 @@ def _astra_due(entry: dict[str, object], repair_round: int, settings_read: conf.
     if _string(entry.get("state")) != STATE_OPEN:
         return False
     attempts = _integer(entry.get("fix_attempts"))
-    triggered = repair_round >= settings_read.whole("ROUTING_FROM_ROUND") or attempts >= settings_read.whole("ASTRA_AFTER_FAILED_FIXES")
+    triggered = repair_round >= settings_read.whole("routing_from_round") or attempts >= settings_read.whole("astra_after_failed_fixes")
     return triggered and not any(
         _integer(record.get("fix_attempts"), -1) == attempts
         for record in _object_list(entry.get("astra_reviews"))
@@ -594,7 +594,7 @@ def _repair_budget(state: dict[str, object], settings_read: conf.ConfigRead) -> 
     if not rounds:
         return 0
     initial = _integer(rounds[0].get("gating_open_before"), 0)
-    return max(settings_read.whole("MIN_REPAIR_BUDGET"), math.ceil(initial * settings_read.number("REPAIR_ROUNDS_PER_FINDING")))
+    return max(settings_read.whole("min_repair_budget"), math.ceil(initial * settings_read.number("repair_rounds_per_finding")))
 
 
 def _gating_severities(state: dict[str, object]) -> tuple[str, ...]:
@@ -686,30 +686,30 @@ def _advisory_reason(
         entry = _finding(state, finding_id)
         if _string(entry.get("state")) != STATE_OPEN:
             continue
-        if _integer(entry.get("reopen_count")) >= settings_read.whole("MAX_REOPENS"):
+        if _integer(entry.get("reopen_count")) >= settings_read.whole("max_reopens"):
             return f"{finding_id} reopened {_integer(entry.get('reopen_count'))} times after being accepted"
     for finding_id in sorted(_findings(state)):
         entry = _finding(state, finding_id)
         if _string(entry.get("state")) != STATE_OPEN:
             continue
-        if _integer(entry.get("fix_attempts")) >= settings_read.whole("MAX_FIX_ATTEMPTS"):
+        if _integer(entry.get("fix_attempts")) >= settings_read.whole("max_fix_attempts"):
             attempts = _integer(entry.get("fix_attempts"))
             return f"{finding_id} failed to close after {attempts} repair attempts"
     kind, run = _consecutive_same_kind(passes)
-    if run >= settings_read.whole("MAX_CONSECUTIVE_SAME_KIND_PASSES"):
+    if run >= settings_read.whole("max_consecutive_same_kind_passes"):
         return f"{run} consecutive {kind} passes ran without the phase advancing"
     cancellations = _review_cancellations(passes)
-    if cancellations > settings_read.whole("MAX_REVIEW_CANCELLATIONS"):
+    if cancellations > settings_read.whole("max_review_cancellations"):
         return f"the blind review was canceled {cancellations} times, so it is never completing"
     # Stall and budget read live rounds: an abandoned round repaired nothing, so
     # counting it would stop the phase for a repair that never ran.
     rounds = _live_rounds(state)
-    if len(rounds) >= settings_read.whole("STALLED_ROUNDS"):
+    if len(rounds) >= settings_read.whole("stalled_rounds"):
         previous = _integer(rounds[-1].get("gating_open_before"), -1)
         earlier = _integer(rounds[-2].get("gating_open_before"), -1)
         if previous >= 0 and earlier >= 0 and gating_open >= previous >= earlier:
             trend = f"({earlier} -> {previous} -> {gating_open})"
-            return f"the gating open count has not decreased for {settings_read.whole("STALLED_ROUNDS")} rounds {trend}"
+            return f"the gating open count has not decreased for {settings_read.whole("stalled_rounds")} rounds {trend}"
     budget = _repair_budget(state, settings_read)
     if budget and len(rounds) >= budget:
         initial = _integer(rounds[0].get("gating_open_before"), 0)
@@ -718,8 +718,8 @@ def _advisory_reason(
             f"past the {budget}-round repair budget, with {gating_open} still open"
         )
     # Refunded batches spend no repair round, including this advisory threshold.
-    if len(rounds) >= settings_read.whole("RUNAWAY_ROUNDS"):
-        return f"the runaway backstop of {settings_read.whole("RUNAWAY_ROUNDS")} fix rounds was reached"
+    if len(rounds) >= settings_read.whole("runaway_rounds"):
+        return f"the runaway backstop of {settings_read.whole("runaway_rounds")} fix rounds was reached"
     return ""
 
 
@@ -911,7 +911,7 @@ def _gate(args: argparse.Namespace) -> None:
             "open_counts": payload.get("open_counts"),
         },
     )
-    if _integer(payload.get("repair_round")) >= settings_read.whole("ROUTING_FROM_ROUND") and any(
+    if _integer(payload.get("repair_round")) >= settings_read.whole("routing_from_round") and any(
         _integer(entry.get("fix_attempts")) >= 1
         for entry in _open_entries(state, _gating_severities(state))
     ):
@@ -1066,7 +1066,7 @@ def _dispatch(args: argparse.Namespace) -> None:
     if due:
         raise SystemExit("Astra review due for " + ", ".join(due) + "; record it with findings.py astra")
     kept = _kept_evidence(args, covered)
-    if repair_round >= settings_read.whole("ROUTING_FROM_ROUND"):
+    if repair_round >= settings_read.whole("routing_from_round"):
         missing_kept = sorted(covered - set(kept))
         if missing_kept:
             raise SystemExit(
@@ -1386,11 +1386,11 @@ def _command_settings(args: argparse.Namespace) -> conf.ConfigRead:
 
 def require_configuration(settings_read: conf.ConfigRead) -> None:
     problems: list[str] = []
-    for key in ("MAX_FIX_ATTEMPTS", "MAX_REOPENS", "STALLED_ROUNDS", "RUNAWAY_ROUNDS",
-                "ROUTING_FROM_ROUND", "ASTRA_AFTER_FAILED_FIXES", "MIN_REPAIR_BUDGET",
-                "MAX_CONSECUTIVE_SAME_KIND_PASSES", "MAX_REVIEW_CANCELLATIONS", "REPAIR_ROUNDS_PER_FINDING"):
+    for key in ("max_fix_attempts", "max_reopens", "stalled_rounds", "runaway_rounds",
+                "routing_from_round", "astra_after_failed_fixes", "min_repair_budget",
+                "max_consecutive_same_kind_passes", "max_review_cancellations", "repair_rounds_per_finding"):
         try:
-            if key == "REPAIR_ROUNDS_PER_FINDING":
+            if key == "repair_rounds_per_finding":
                 _ = settings_read.number(key)
             else:
                 _ = settings_read.whole(key)

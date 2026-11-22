@@ -339,7 +339,7 @@ class WorkerCommandTests(unittest.TestCase):
         self.addCleanup(self.fixture.doCleanups)
         config = self.fixture.root / "conf/direct.conf"
         atomic_file.write_text_atomic(config, config.read_text()
-                                      + "# range: 1..600\nWORKER_SETTLE_SECONDS=30\n")
+                                      + "# range: 1..600\nworker_settle_seconds=30\n")
         atomic_file.write_text_atomic(config.with_name("send.conf"),
             "# range: 0.001..\nwaits_review_seconds=1\n"
             + "# range: 0.001..\ndelivery_timeout=5\n"
@@ -445,9 +445,9 @@ class WorkerCommandTests(unittest.TestCase):
     def start_orphaned_worker_run(self) -> tuple[worker_panes.OpenWorker, Path, detached_runs.RunRecord]:
         config = self.fixture.root / "conf"
         atomic_file.write_text_atomic(config / "detached_runs.conf",
-            "# whole: 1..\nPROCESS_CHECK_SECONDS=5\n"
-            + "# whole: 1..\nRESULT_LINE_CHARS=300\n"
-            + "# whole: 1..\nRESULT_TEXT_CHARS=2000\n")
+            "# whole: 1..\nprocess_check_seconds=5\n"
+            + "# whole: 1..\nresult_line_chars=300\n"
+            + "# whole: 1..\nresult_text_chars=2000\n")
         atomic_file.write_text_atomic(config / "postmaster.conf",
             "# range: 0.001..\nwait_seconds=1\n"
             + "# range: 0.001..\nclaim_grace_seconds=1\n")
@@ -1272,6 +1272,10 @@ class WorkerCommandTests(unittest.TestCase):
 
         for proof in ("absent", "compacted", "task_started", "delayed", "bounded"):
             with self.subTest(proof=proof):
+                if proof == "bounded":
+                    config = self.fixture.root / "conf/direct.conf"
+                    atomic_file.write_text_atomic(config, config.read_text().replace(
+                        "worker_compact_seconds=300", "worker_compact_seconds=137"))
                 self.agent.compact_proof = ("absent" if proof == "delayed" else
                                             "compacted" if proof == "bounded" else proof)
                 current = self.opened("compact-proof-" + proof)
@@ -1299,7 +1303,7 @@ class WorkerCommandTests(unittest.TestCase):
 
                 def finish_compaction(pane: str, timeout_ms: int) -> herdr.ObservedAgentState | herdr.WaitTimedOut:
                     if proof == "bounded":
-                        self.assertEqual(timeout_ms, 205000)
+                        self.assertEqual(timeout_ms, 42000)
                     if proof == "delayed" and pane in self.agent.compacting:
                         # Model a 95-second compaction without a real delay.
                         if timeout_ms < 95000:
@@ -1330,7 +1334,7 @@ class WorkerCommandTests(unittest.TestCase):
                     self.assertEqual(len(compact_commands), 1)
                     command = compact_commands[0]
                     self.assertIn("--timeout", command)
-                    self.assertEqual(command[command.index("--timeout") + 1], "300000")
+                    self.assertEqual(command[command.index("--timeout") + 1], "137000")
                 if proof in {"absent", "task_started"}:
                     self.assertEqual(result, worker.ExitCode.REFUSED)
                     self.assertEqual(len(self.agent.submitted), before)
@@ -2183,7 +2187,7 @@ class WorkerCommandTests(unittest.TestCase):
                 case.setUp()
                 try:
                     config = case.fixture.root / "conf/direct.conf"
-                    atomic_file.write_text_atomic(config, config.read_text().replace("WORKER_SETTLE_SECONDS=30", "WORKER_SETTLE_SECONDS=1"))
+                    atomic_file.write_text_atomic(config, config.read_text().replace("worker_settle_seconds=30", "worker_settle_seconds=1"))
                     opened = case.opened()
                     def queued_without_delivery(arguments: list[str], **options: object) -> subprocess.CompletedProcess[str]:
                         if arguments[0] == "/nonexistent/herdr" and arguments[4:6] == ["prompt", opened.pane]:
@@ -2218,7 +2222,7 @@ class WorkerCommandTests(unittest.TestCase):
             opened = case.opened()
             case.agent.defer_prompt_transcript = True
             config = case.fixture.root / "conf/direct.conf"
-            atomic_file.write_text_atomic(config, config.read_text().replace("WORKER_SETTLE_SECONDS=30", "WORKER_SETTLE_SECONDS=1"))
+            atomic_file.write_text_atomic(config, config.read_text().replace("worker_settle_seconds=30", "worker_settle_seconds=1"))
             def record_prompt() -> None:
                 pane, line = case.agent.submitted[-1]
                 case.agent.append(pane, "user", line)
@@ -2705,7 +2709,7 @@ class WorkerCommandTests(unittest.TestCase):
 
     def test_transcript_failure_reports_whether_the_prompt_was_delivered(self) -> None:
         config = self.fixture.root / "conf/direct.conf"
-        atomic_file.write_text_atomic(config, config.read_text().replace("WORKER_SETTLE_SECONDS=30", "WORKER_SETTLE_SECONDS=1"))
+        atomic_file.write_text_atomic(config, config.read_text().replace("worker_settle_seconds=30", "worker_settle_seconds=1"))
         for delivered in (False, True):
             with self.subTest(delivered=delivered):
                 name = "impl2" if delivered else "impl"

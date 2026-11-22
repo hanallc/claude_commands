@@ -227,8 +227,8 @@ An in-flight notice blocks a second notice for one send budget.
 A worker's owner is its director.
 Other staff senders use their first showrunner ancestor.
 The notice addresses a staff owner by its staff id, so two units with one name stay distinct.
-Senders without a staff row use `failed_lookup_owners` from `send.conf`, then `UNIT_ANOMALIES_TO` from `production.conf`.
-Staff senders without a parent also use `UNIT_ANOMALIES_TO`.
+Senders without a staff row use `failed_lookup_owners` from `send.conf`, then `unit_anomalies_to` from `production.conf`.
+Staff senders without a parent also use `unit_anomalies_to`.
 The detector sends notices as `send.py` and ignores failures from that sender.
 Detector errors print one stderr line and preserve the failed send's result.
 

@@ -325,7 +325,7 @@ class ProducerLifecycleTests(unittest.TestCase):
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.config = self.root / "configuration"
-        _ = write_config_fixture(self.config / "staff.conf", f"PRODUCER_FOLDER_ROOT={self.root / 'documents'}\n")
+        _ = write_config_fixture(self.config / "staff.conf", f"producer_folder_root={self.root / 'documents'}\n")
         self.registry = self.config / "models.conf"
         _ = write_registry(self.registry, {"producer_defaults": {"model": "claude:sonnet:high"},
                                           "producers": {"morty": "claude:opus:high", "dwight": "claude:sonnet:high"}})

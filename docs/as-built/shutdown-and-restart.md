@@ -91,7 +91,7 @@ Without process evidence, its account remains unknown.
 Unknown process evidence without a pane that reports the id can allow a second process on the same conversation.
 A unit pane at its shell permits resume when no remaining process blocks it.
 Direct resume and watchdog recovery use the same wait while non-agent processes block the pane.
-`HOLDER_EXIT_SECONDS` in `config/shutdown.conf` allows 5 seconds by default.
+`holder_exit_seconds` in `config/shutdown.conf` allows 5 seconds by default.
 A live agent in the holder list causes an immediate refusal.
 The `no foreground agent` refusal lists each blocking command and its position relative to the shell tree.
 The default reason is `resumed by name`.
@@ -121,14 +121,14 @@ The pane receives one opening message after identity confirmation.
 
 Resume, restart and account moves start a session in its own pane.
 The own pane is a pane that runs the member, else the newest pane whose launch record names the member and no other member runs in.
-`herdr.saved_row_tab` waits within `OWN_PANE_SHELL_SECONDS` (`config/shutdown.conf`) for that pane to reach the shell, then reuses it.
+`herdr.saved_row_tab` waits within `own_pane_shell_seconds` (`config/shutdown.conf`) for that pane to reach the shell, then reuses it.
 When the wait ends first, the start is refused with one line.
 The line names the session, its own pane and `agents resume <name>`, and the session stays stopped.
 A new tab opens only for a session with no own pane.
-A producer whose own pane is outside `PRODUCER_WORKSPACE`, or shares its tab, gets a new tab in that workspace with no wait.
+A producer whose own pane is outside `producer_workspace`, or shares its tab, gets a new tab in that workspace with no wait.
 A restart never splits a pane beside a worker.
 `stop_resume._resume_once` and `restart.start_row` use `herdr.row_workspace` for new tabs.
-Producers use `PRODUCER_WORKSPACE` from `config/staff.conf`, normally `producers`.
+Producers use `producer_workspace` from `config/staff.conf`, normally `producers`.
 Other rows use their parent showrunner's workspace, the entry name, or the shared session.
 A role account change does not update an existing pane shell's `resume` alias.
 Each agent launch prepares the pane aliases through `herdr.agent_alias_script(kind)` for its selected family.
@@ -173,7 +173,7 @@ Delegated callers and sessions proved live on the target write nothing.
 
 A resume in the same pane skips the source close check.
 A resume in a different pane checks that the source contains no other work before it closes the source.
-A layout scan retains a pane without a notice when a new Claude process in its foreground group lacks arguments during `START_SECONDS`.
+A layout scan retains a pane without a notice when a new Claude process in its foreground group lacks arguments during `start_seconds`.
 If the arguments stay unreadable after that period, the next scan reports unknown evidence once per scan run.
 
 The notes timer delegates account moves to this detached batch before any stop.
@@ -184,8 +184,8 @@ The reader checks each verify PID and saved start time.
 Unreadable queue, verify record or process evidence defers the move without a stop.
 Free sessions move first.
 The detached batch waits for build owners.
-The batch checks ownership every `MOVE_BUILD_POLL_SECONDS` and moves an owner after its steps end.
-At `MOVE_BUILD_WAIT_MINUTES`, remaining owners receive a deferred result and keep their processes.
+The batch checks ownership every `move_build_poll_seconds` and moves an owner after its steps end.
+At `move_build_wait_minutes`, remaining owners receive a deferred result and keep their processes.
 A later group account selection applies to the next stop attempt.
 A later `refusal_watch` check retries the move after the build ends.
 A move by hand does not read build ownership.
@@ -221,7 +221,7 @@ The push shows qualified names and gives a short command to retry the batch.
 If the names and the phone footer exceed the push limit, the message gives a command to read the full list.
 The saved batch result holds every pending name and its fixed reference.
 The sender uses the same key for retries of the batch.
-`MOVE_ALERT_REPEAT_MINUTES` sets the repeat window to 1,440 minutes by default.
+`move_alert_repeat_minutes` sets the repeat window to 1,440 minutes by default.
 A standalone resume failure still sends its own keyed push.
 Each completed member records its outcome without waiting for other resumes.
 An early exit or failed resume uses the existing showrunner failure report.
@@ -260,7 +260,7 @@ A completed recovery rerun restores the workers again.
 `resume morty`, `resume brain`, and `resume dwight` use `stop_resume.resume`.
 Account moves and restart share the same resume arguments, account selection, and pane launch code.
 Each producer uses its own tab in the `producers` workspace of the shared herdr session.
-`config/staff.conf` supplies the workspace through `PRODUCER_WORKSPACE`.
+`config/staff.conf` supplies the workspace through `producer_workspace`.
 `restart.producer_launch(row)` resumes `row.current_session` with the producer's configured settings.
 `restart.producer_resume(row, entry)` preserves saved launch options through `pane_record.configured_resume_arguments`.
 It takes the family, model, and effort from the current producer settings.
@@ -374,7 +374,7 @@ The fixed-id lookup supplies their names for closed List items.
 
 `ProducerFirstStart(name, folder)` represents a configured producer before staff admission.
 It is separate from an admitted `StaffRow`.
-`PRODUCER_FOLDER_ROOT` in `config/staff.conf` defaults to `~/rust/hanadocs`.
+`producer_folder_root` in `config/staff.conf` defaults to `~/rust/hanadocs`.
 The first start requires `<root>/<name>/README.md`.
 Dwight uses `~/rust/hanadocs/dwight/README.md`.
 
@@ -742,10 +742,10 @@ The terminal, process, or composer can still change between the last check and t
 The launch deadline limits the pane queries and both transport calls.
 The prompt transport uses the remaining time after its process starts.
 If Herdr declines to send a resume prompt, the anomaly tells the operator to check the retained pane and send the prompt by hand.
-For a Claude launch with an opening prompt, restart uses the greater of `START_SECONDS` and `OPENING_PROMPT_SECONDS`.
+For a Claude launch with an opening prompt, restart uses the greater of `start_seconds` and `opening_prompt_seconds`.
 `config/shutdown.conf` sets these limits to 20 seconds and 90 seconds.
 The operation deadline can reduce either limit.
-Other launches use `START_SECONDS`.
+Other launches use `start_seconds`.
 The launch limit covers the start, input readiness, and proof of the opening prompt's user turn.
 The separate resume check then requires an assistant turn or tool call.
 The cursor skips complete historical records without parsing their JSON.
@@ -764,7 +764,7 @@ The reason can be a missing continuation message, no work after the message, or 
 The director checks the continuation message.
 It skips held directors, unchanged rows, failed starts, workers, producers, dry runs, and stop-only commands.
 It does not change the exit code, restart record, or staff.
-config/shutdown.conf sets RESUME_CHECK_SECONDS=180 and RESUME_CHECK_INTERVAL_SECONDS=5.
+config/shutdown.conf sets resume_check_seconds=180 and resume_check_interval_seconds=5.
 
 A paused or exited director stays stopped and keeps its hold record and restart entry.
 A running row gets no continuation message.

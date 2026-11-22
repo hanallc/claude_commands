@@ -298,12 +298,12 @@ conf_reads.record('disabled')
                 self.assertIn("keys:", warnings[0])
 
     def test_sections_are_skipped_and_the_first_value_wins(self) -> None:
-        self.write("# note\n[values]\n# whole: ..\n LIMIT = 12 # first\n[another]\nLIMIT=99\nignored\n")
-        self.assertEqual(conf.read("example").whole("LIMIT"), 12)
+        self.write("# note\n[values]\n# whole: ..\n limit = 12 # first\n[another]\nlimit=99\nignored\n")
+        self.assertEqual(conf.read("example").whole("limit"), 12)
 
     def test_short_host_override_wins_and_its_first_value_is_used(self) -> None:
         self.write("# whole: ..\ncount=1\n# whole: ..\ncount.testhost=7\ncount.testhost=8\ncount.other=9\n")
-        with mock.patch("socket.gethostname", return_value="testhost.example.invalid"):
+        with mock.patch("socket.gethostname", return_value="TESTHost.Example.Invalid"):
             self.assertEqual(conf.read("example").whole("count"), 7)
         with mock.patch("socket.gethostname", return_value="unknown.example.invalid"):
             self.assertEqual(conf.read("example").whole("count"), 1)
@@ -767,6 +767,14 @@ conf_reads.record('disabled')
         if not isinstance(live, conf.UsableLiveValue):
             self.fail("A repaired live limit must replace the recovered state")
         self.assertEqual(live.value, Decimal("7.25"))
+
+
+class RepositoryConfigurationTests(unittest.TestCase):
+    def test_all_configuration_names_are_lower_case(self) -> None:
+        root = Path(__file__).resolve().parents[2]
+        for path in sorted((root / "config").glob("*.conf")):
+            for key, setting in conf.settings(path.read_text(encoding="utf-8")).items():
+                self.assertEqual(key, key.lower(), f"{path.relative_to(root)}:{setting.line + 1}: {key}")
 
 
 class HanaConfigurationTests(unittest.TestCase):

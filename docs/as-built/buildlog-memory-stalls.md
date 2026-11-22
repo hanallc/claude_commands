@@ -332,7 +332,7 @@ Missing records remain unknown.
   An update that converts a `delete` index to WAL waits for open read transactions, up to the 30 s busy timeout.
   Phase 35 CLI readers waited on the update file lock and then succeeded; Phase 36 measured the direct SQL timeout.
   Load and source records differed between measurements, so wall times do not isolate the effect of spill.
-  `INDEX_SPILL_PAGES` remains 65536; the private roots were deleted.
+  `index_spill_pages` remains 65536; the private roots were deleted.
 - **The 5-minute gap rule.** `MAX_SAMPLE_GAP_S = 300`, five 60 s intervals. A counter rise across a longer gap cannot be placed on a day, so it is dropped. That happens when the timer stopped or the machine was off. A `boot_id` change also makes the interval unknown; a new counter cannot reveal its start time.
 - **Temp-folder steps are in the stall table.** They appear as `scratch (temp folders)` (`SCRATCH_LABEL`), and they count in every step's "at once". `SCRATCH` matches a cwd under `/tmp/`, `/var/folders/` or `/private/var/folders/`.
 - **Linux only.** `buildlog sample` without any of its three `/proc` files prints one line and exits 1. That includes a Linux kernel without PSI. A malformed `/proc/pressure/memory` raises and writes no row, and the next minute tries again. Step stalls need the systemd scope as well: a user manager, `systemd-run`, and `BUILDLOG_SCOPE` not set to `0`. That means natedev only, the same as `peak_mem_bytes`.

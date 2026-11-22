@@ -189,47 +189,47 @@ STOP_SESSION = stop_resume.stop
 SHUTDOWN_FIXTURE_SETTINGS = {
     "staff": """\
 # range: 0.001..
-OPERATION_LOCK_SECONDS=30
+operation_lock_seconds=30
 # range: 0.001..
-REMOTE_SECONDS=20
-PRODUCER_WORKSPACE=producers
-PRODUCER_FOLDER_ROOT=~/rust/hanadocs
+remote_seconds=20
+producer_workspace=producers
+producer_folder_root=~/rust/hanadocs
 """,
     "shutdown": """\
 # whole: 1..300
-STOP_GRACE_SECONDS=2
+stop_grace_seconds=2
 # whole: 1..300
-KILL_GRACE_SECONDS=5
+kill_grace_seconds=5
 # whole: 1..300
-MOVE_STOP_MARGIN_SECONDS=3
+move_stop_margin_seconds=3
 # range: 5e-324..
-START_SECONDS=20
+start_seconds=20
 # range: 5e-324..
-OPENING_PROMPT_SECONDS=90
+opening_prompt_seconds=90
 # range: 5e-324..
-STAY_SECONDS=10
+stay_seconds=10
 # range: 0..300
-OWN_PANE_SHELL_SECONDS=30
+own_pane_shell_seconds=30
 # range: 0..3600
-RESUME_CHECK_SECONDS=180
+resume_check_seconds=180
 # range: 5e-324..300
-RESUME_CHECK_INTERVAL_SECONDS=5
+resume_check_interval_seconds=5
 """,
     "production": """\
 # range: 5e-324..
-RETIRE_POLL_SECONDS=0.2
+retire_poll_seconds=0.2
 # range: 5e-324..
-RETIRE_TERM_WAIT_SECONDS=10
+retire_term_wait_seconds=10
 # range: 5e-324..
-RETIRE_COMMAND_TIMEOUT_SECONDS=900
+retire_command_timeout_seconds=900
 # range: 5e-324..
-RENAME_LIVE_WAIT_SECONDS=180
+rename_live_wait_seconds=180
 # range: 5e-324..
-RENAME_RUN_STOP_WAIT_SECONDS=120
+rename_run_stop_wait_seconds=120
 # range: 5e-324..
-RENAME_POLL_SECONDS=1
+rename_poll_seconds=1
 # range: 5e-324..
-RENAME_COMMAND_TIMEOUT_SECONDS=900
+rename_command_timeout_seconds=900
 # whole: 1..
 unit_port_first=15720
 # whole: 1..
@@ -241,18 +241,18 @@ mac_run_port=15710
 """,
     "direct": """\
 # range: 0.1..0.9
-WORKER_SPLIT_RATIO=0.667
-WORKER_FIRST_TURN_TEXT=Reply with ready. Do not use tools.
+worker_split_ratio=0.667
+worker_first_turn_text=Reply with ready. Do not use tools.
 # range: 1..600
-WORKER_FIRST_TURN_SECONDS=120
+worker_first_turn_seconds=120
 # range: 1..1800
-WORKER_COMPACT_SECONDS=300
+worker_compact_seconds=300
 # range: 0.01..600
-WORKER_PUBLISH_LOCK_SECONDS=15
+worker_publish_lock_seconds=15
 # range: 1..600
-PANE_AGENT_START_SECONDS=90
+pane_agent_start_seconds=90
 # whole: 1..
-UNIT_COMPACT_ABOVE_TOKENS=200000
+unit_compact_above_tokens=200000
 """,
     "build_folders": """\
 # whole: 1..
@@ -722,8 +722,8 @@ class RetireUnitTests(ShutdownRepositoryFixture):
 
     def limits(self, *, poll: str = "0.2", wait: str = "10", command: str = "900") -> Path:
         path = self.root / "production.conf"
-        _ = path.write_text(f"# range: 5e-324..\nRETIRE_POLL_SECONDS={poll}\n# range: 5e-324..\nRETIRE_TERM_WAIT_SECONDS={wait}\n"
-                            + f"# range: 5e-324..\nRETIRE_COMMAND_TIMEOUT_SECONDS={command}\n"
+        _ = path.write_text(f"# range: 5e-324..\nretire_poll_seconds={poll}\n# range: 5e-324..\nretire_term_wait_seconds={wait}\n"
+                            + f"# range: 5e-324..\nretire_command_timeout_seconds={command}\n"
                             + "# whole: 40..\nunits_table_columns=170\n"
                             + "# whole: 40..\nunits_table_floor_columns=120\n"
                             + "# whole: 1..4\nunits_table_cell_lines=4\n"
@@ -1032,7 +1032,7 @@ class RetireUnitTests(ShutdownRepositoryFixture):
         with mock.patch.dict(os.environ, {"CONF_DIR": str(Path(path).parent)}), self.assertRaises(conf.Unusable) as error:
             _ = RUN_COMMAND(["fixture-command"])
         self.assertIn(str(path), str(error.exception))
-        self.assertIn("RETIRE_COMMAND_TIMEOUT_SECONDS", str(error.exception))
+        self.assertIn("retire_command_timeout_seconds", str(error.exception))
 
     @override
     def build_repository(self) -> None:
@@ -2631,7 +2631,7 @@ class WorkerRenameTests(StaffTestCase):
                 self.addCleanup(fixture.doCleanups)
                 fixture.setUp()
                 write_text_atomic(fixture.root / "conf/production.conf",
-                                  "# range: 0.01..\nRENAME_COMMAND_TIMEOUT_SECONDS=30\n")
+                                  "# range: 0.01..\nrename_command_timeout_seconds=30\n")
                 owner = (staff.rename(fixture.parent.id, "TEST-old") if kind == "unit" else
                          fixture_member("showrunner", name="TEST-old", parent=fixture.parent.parent))
                 fixture.parent_id = owner.id

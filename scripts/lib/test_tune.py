@@ -71,6 +71,7 @@ class TuneTests(PublicationTestCase):
         cases = (
             ("missing", "amount", "3", "valid reason", "approved"),
             ("example", "missing", "3", "valid reason", "approved"),
+            ("example", "AMOUNT", "3", "valid reason", "approved"),
             ("example", "amount", "0", "valid reason", "approved"),
             ("example", "amount", "11", "valid reason", "approved"),
             ("example", "amount", "bad", "valid reason", "approved"),
@@ -88,6 +89,8 @@ class TuneTests(PublicationTestCase):
                 before = self.snapshot()
                 result = self.run_tune(file, key, value, "--why", why, "--user-words", approval)
                 self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                if key == "AMOUNT":
+                    self.assertEqual(result.stderr, "tune: configuration key 'AMOUNT' must be lower case\n")
                 self.assertEqual(self.snapshot(), before)
                 self.assertFalse(self.repository.ssh_log.exists())
                 self.assertFalse((self.repository.root / "state").exists())

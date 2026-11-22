@@ -268,11 +268,11 @@ class StallWatchTests(unittest.TestCase):
         _ = self.enterContext(mock.patch.object(stall_watch, "WATCH_DEFAULTS", defaults))
         configuration = {
             "build_targets": "targets=natedev\nkind.natedev=local\nplatform.natedev=linux\n",
-            "production": "# range: 0..\nPROMPT_ALERT_SECONDS=60\n",
+            "production": "# range: 0..\nprompt_alert_seconds=60\n",
             "rca": "# range: 0.001..\nsend_seconds=300\n",
-            "staff": ("# range: 0.001..\nOPERATION_LOCK_SECONDS=30\n# range: 0.001..\nREMOTE_SECONDS=20\n"
-                      + f"PRODUCER_WORKSPACE=producers\nPRODUCER_FOLDER_ROOT={self.root / 'producers'}\n"),
-            "shutdown": "# range: 5e-324..\nSTART_SECONDS=20\n# range: 5e-324..\nSTAY_SECONDS=10\n",
+            "staff": ("# range: 0.001..\noperation_lock_seconds=30\n# range: 0.001..\nremote_seconds=20\n"
+                      + f"producer_workspace=producers\nproducer_folder_root={self.root / 'producers'}\n"),
+            "shutdown": "# range: 5e-324..\nstart_seconds=20\n# range: 5e-324..\nstay_seconds=10\n",
         }
         for name, contents in configuration.items():
             _ = (self.root / f"{name}.conf").write_text(contents)
@@ -367,11 +367,11 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
         path = self.root / "production.conf"
         self.environment["CONF_DIR"] = str(self.root)
         self.panes["unit-one"].update(pane=EDIT_PROMPT, agent_status="blocked")
-        _ = path.write_text("# range: 0..\nPROMPT_ALERT_SECONDS=120\n")
+        _ = path.write_text("# range: 0..\nprompt_alert_seconds=120\n")
         self.assertEqual(self.tick(START).returncode, 0)
         self.assertEqual(self.tick(START + 60).returncode, 0)
         self.assertEqual(self.sent(), [])
-        _ = path.write_text("# range: 0..\nPROMPT_ALERT_SECONDS=30\n")
+        _ = path.write_text("# range: 0..\nprompt_alert_seconds=30\n")
         self.assertEqual(self.tick(START + 61).returncode, 0)
         self.assertTrue(any(item.get("to") == "user" for item in self.sent()))
 

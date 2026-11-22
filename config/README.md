@@ -590,7 +590,7 @@ Rsync replaces complete files and preserves this host's append files.
 | --- | --- | --- |
 | `output_folder` | `~/.local/share/review-links/h7uj5c` | Publish `memory_live.html` and `memory.json` in this folder. |
 | `interval_seconds` | `3` | Set the interval between readings and the page refresh interval. |
-| `history_days` | `7` | Show this many days of build history and top costs; at least `TOP_COST_RECENT_DAYS`. |
+| `history_days` | `7` | Show this many days of build history and top costs; at least `top_cost_recent_days`. |
 | `swap_rows` | `6` | Show this many of the largest swap users; one line sums the rest. |
 | `report_refresh_seconds` | `300` | Read the history charts and top costs again after this many seconds. |
 | `remote_memory_light` / `remote_memory_dark` | `#626a78` / `#a0a8b6` | Color memory bars that do not count against natedev. |
@@ -606,10 +606,10 @@ The service retains the last successful reading when the admission service does 
 
 ## test_times.conf
 
-`SLOW_TEST_S` sets the minimum gate test time retained in the build log.
-`NEXTEST_SLOW_TEST_S` sets the recording threshold for nextest rows.
+`slow_test_s` sets the minimum gate test time retained in the build log.
+`nextest_slow_test_s` sets the recording threshold for nextest rows.
 Failed tests, errors, and unexpected successes remain in the log at every duration.
-`TOP_RUNS` sets the number of recent gate runs used to rank each module by its median CPU time.
+`top_runs` sets the number of recent gate runs used to rank each module by its median CPU time.
 Callers read these settings through `scripts/lib/conf.py` at each use.
 `CONF_DIR` selects a fixture folder for tests.
 
@@ -617,14 +617,14 @@ Callers read these settings through `scripts/lib/conf.py` at each use.
 
 The `/unit:direct` tuning file: the convergence limits — how many automatic
 fix rounds one phase runs before the gate remarks on how it is going — plus
-the progress-report interval. `MIN_REPAIR_BUDGET` is the floor every phase gets
+the progress-report interval. `min_repair_budget` is the floor every phase gets
 regardless of finding count (3);
-`REPAIR_ROUNDS_PER_FINDING` scales the budget above that floor from the first
-round's gating count (0.5, so 8 findings buy 4 rounds); `RUNAWAY_ROUNDS` is the
+`repair_rounds_per_finding` scales the budget above that floor from the first
+round's gating count (0.5, so 8 findings buy 4 rounds); `runaway_rounds` is the
 hard ceiling (5). The rest bound the other patterns worth reporting:
-`MAX_FIX_ATTEMPTS`, `MAX_REOPENS`, `STALLED_ROUNDS`,
-`MAX_CONSECUTIVE_SAME_KIND_PASSES`, `MAX_REVIEW_CANCELLATIONS`.
-Set `STALLED_ROUNDS` to at least 2. The stall check uses the last two charged rounds.
+`max_fix_attempts`, `max_reopens`, `stalled_rounds`,
+`max_consecutive_same_kind_passes`, `max_review_cancellations`.
+Set `stalled_rounds` to at least 2. The stall check uses the last two charged rounds.
 
 **None of these stops a phase.** `findings.py gate` answers `converged` or
 `dispatch` and nothing else; a limit that trips names itself in the verdict's
@@ -632,7 +632,7 @@ Set `STALLED_ROUNDS` to at least 2. The stall check uses the last two charged ro
 agent says something, not when it halts — the decision to stop is the user's,
 made from what gets reported.
 
-`UNIT_PROGRESS_INTERVAL_SECONDS` sets the Codex poll timeout, per
+`unit_progress_interval_seconds` sets the Codex poll timeout, per
 `<CodexDispatchWait/>` in `docs/direct/codex_dispatch_wait.md`; Codex requires a positive
 integer. It is 3600, one hour (user, 2026-10-10). Unit reports come only when
 someone asks (2026-10-19): no notifier instance or timer sends them.
@@ -645,14 +645,14 @@ the command. `CONF_DIR` selects the fixture folder in tests.
 
 The test environment policy has three keys:
 
-- `VERIFY_RESULT_ENV_NAMES` names exported values that change test results.
+- `verify_result_env_names` names exported values that change test results.
   The default names are `NO_COLOR`, `CLICOLOR`, `CLICOLOR_FORCE`, `FORCE_COLOR`, `CI`, `TZ`, and `LANG`.
   The locale names are `LC_ALL`, `LC_COLLATE`, `LC_CTYPE`, `LC_MESSAGES`, `LC_MONETARY`, `LC_NUMERIC`, and `LC_TIME`.
   The list also includes `LC_ADDRESS`, `LC_IDENTIFICATION`, `LC_MEASUREMENT`, `LC_NAME`, `LC_PAPER`, and `LC_TELEPHONE`.
-- `VERIFY_RESULT_ENV_PREFIXES` selects exported values by prefix.
+- `verify_result_env_prefixes` selects exported values by prefix.
   The default prefixes are `HANA_`, `WGPU_`, `BEVY_`, `INSTA_`, and `TRACE_`.
   `LC_TERMINAL` and `LC_TERMINAL_VERSION` do not enter the key.
-- `VERIFY_TEST_FIXED_ENV` sets terminal values for each test, including the test step of `final`.
+- `verify_test_fixed_env` sets terminal values for each test, including the test step of `final`.
   The defaults are `TERM=xterm-256color`, `COLORTERM=truecolor`, `TERM_PROGRAM=verify`, `COLUMNS=80`, and `LINES=24`.
 
 `scripts/direct/result_environment.py` reads these keys through `conf.read` at use.

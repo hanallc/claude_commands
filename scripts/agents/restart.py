@@ -696,8 +696,8 @@ class DirectorResumeChecks:
             return
         try:
             settings = conf.read("shutdown")
-            deadline = time.monotonic() + settings.number("RESUME_CHECK_SECONDS")
-            interval = settings.number("RESUME_CHECK_INTERVAL_SECONDS")
+            deadline = time.monotonic() + settings.number("resume_check_seconds")
+            interval = settings.number("resume_check_interval_seconds")
         except (OSError, ValueError):
             for check in self.checks:
                 self.report_check(check, ResumeCheckState.UNREADABLE)
@@ -1076,7 +1076,7 @@ def start_row(row: staff.StaffRow, record: staff.StaffSnapshot, client: herdr.He
         if projected is not None:
             environment = {**names.environment(projected), **environment}
         settings = conf.read("shutdown")
-        start_seconds = settings.number("START_SECONDS")
+        start_seconds = settings.number("start_seconds")
         reuse_deadline = time.monotonic() + operation_deadline.remaining(start_seconds)
         workspace = herdr.row_workspace(row, record, row.name)
         destination = (client.producer_row_tab(str(row.id), row.name, workspace, record=record) if row.kind == "producer" else
@@ -1178,7 +1178,7 @@ def start_row(row: staff.StaffRow, record: staff.StaffSnapshot, client: herdr.He
         scope = (pane_launch.producer_launch_request(expectation)
                  if row.kind == "producer" else nullcontext())
         with scope:
-            launch_seconds = (max(start_seconds, settings.number("OPENING_PROMPT_SECONDS"))
+            launch_seconds = (max(start_seconds, settings.number("opening_prompt_seconds"))
                               if kind == "claude" and isinstance(opening, herdr.OpeningPrompt) else start_seconds)
             result = herdr.launch_prepared_agent(client.session, target, prepared, kind,
                 trust_arguments(kind, str(folder), arguments),

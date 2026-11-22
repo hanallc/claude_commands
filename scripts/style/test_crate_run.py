@@ -35,11 +35,10 @@ from scripts.style.test_bulk_rename import ScriptedServer, word_edits, CargoProj
 from scripts.style.style_child_test_support import StyleQueueFake, install_refusal_tools, unqueued_style_children
 from scripts.build_queue import admission_protocol as wire, queue_place
 from scripts.build_queue import first_step
-from scripts.buildlog.store import host_name
 from scripts.copies import copies
 from scripts.copies.copies_test_support import AdmissionWaitReached
 from scripts.copies.workspace_test_support import registered_workspace
-from scripts.lib import build_folders, copy_record, scratch
+from scripts.lib import build_folders, conf, copy_record, scratch
 from scripts.worktree import worktrees
 from scripts.lib.cargo_output import CargoOutputRoots
 from scripts.lib.cargo_output_test_support import fake_cargo_output_roots
@@ -130,7 +129,7 @@ def available(_repo: Path, _path: str) -> None:
 def _configuration(root: Path) -> dict[str, str]:
     config = root / "config"
     config.mkdir()
-    machine = host_name()
+    machine = conf.local_host_key_name()
     _ = (config / "build_folders.conf").write_text("\n".join((
         "# whole: 1..64",
         "names.repository_key_length=8",

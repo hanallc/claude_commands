@@ -9,7 +9,6 @@ import json
 import os
 from pathlib import Path
 import signal
-import socket
 import shutil
 import subprocess
 import sys
@@ -17,7 +16,7 @@ import tempfile
 from typing import cast, final
 from unittest import mock
 from scripts.build_queue import admission_records
-from scripts.lib import build_folders
+from scripts.lib import build_folders, conf
 from scripts.lib.process_start import Zombie
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.lib.process_group import send_process_group
@@ -205,7 +204,7 @@ sys.stdin.read(1)
         parent = self.root / "nested-temporary"
         parent.mkdir()
         self.environment["TMPDIR"] = str(parent)
-        host = socket.gethostname().partition(".")[0]
+        host = conf.local_host_key_name()
         _ = write_config_fixture(Path(self.environment["CONF_DIR"]) / "build_folders.conf",
                                  f"roots.gate.{host}={parent}\n")
         record = self.state / "nested-folders.json"
@@ -352,7 +351,7 @@ gate.run_suites(Path.cwd(), full=True)
         parent = self.root / "gate-temporary"
         parent.mkdir()
         self.environment["TMPDIR"] = str(parent)
-        host = socket.gethostname().partition(".")[0]
+        host = conf.local_host_key_name()
         _ = write_config_fixture(Path(self.environment["CONF_DIR"]) / "build_folders.conf",
                                  f"roots.gate.{host}={parent}\n")
         self.write(self.state / "red-hooks", "red")

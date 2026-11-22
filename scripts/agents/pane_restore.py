@@ -48,7 +48,7 @@ def _resume_saved(session: str, client: herdr.Herdr, pane: herdr.TabSession,
     title = entry["name"] or pane.label
     launched = herdr.launch_agent(session, pane.workspace, title, entry["cwd"], {**entry["environment"], **account},
         kind, trust_arguments(kind, entry["cwd"], pane_record.resume_arguments(entry)), herdr.NoOpeningPrompt(),
-        int(conf.read("shutdown").number("START_SECONDS") * 1000), agent=title, reported_unknown=reported_unknown)
+        int(conf.read("shutdown").number("start_seconds") * 1000), agent=title, reported_unknown=reported_unknown)
     if isinstance(launched, herdr.nix_env.Refused):
         raise herdr_types.HerdrFailure(launched.reason)
     path = pane_record.record_path(session)

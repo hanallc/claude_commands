@@ -116,8 +116,8 @@ Settings entry for the user, one more SessionEnd item:
 ## Codex panes
 
 - A Codex pane launch passes `--no-daemon`. A daemon-attached Codex reports no `agent_session`.
-- A fresh Codex worker gets one short first turn, `WORKER_FIRST_TURN_TEXT`, with the limit
-  `WORKER_FIRST_TURN_SECONDS` (`config/direct.conf`). `worker_panes.start_or_resume` then publishes
+- A fresh Codex worker gets one short first turn, `worker_first_turn_text`, with the limit
+  `worker_first_turn_seconds` (`config/direct.conf`). `worker_panes.start_or_resume` then publishes
   the staff row from the pane's `agent_session`.
 - A known identity launches with `resume <id>` and gets no first turn.
 - A Codex launch entry holds `codex_policy`: the `--sandbox`, `--ask-for-approval` and `-c` option
@@ -136,7 +136,7 @@ Settings entry for the user, one more SessionEnd item:
   - a report that names another session proves nothing, and so does a pane row that cannot be read.
 - `herdr.native_process` uses the resume argument or the pane report. It reads no open rollout file.
 - Callers without a report use the process's own pane report through the same reader.
-- `PANE_AGENT_START_SECONDS` is the one launch deadline, for a worker and for a side pane.
+- `pane_agent_start_seconds` is the one launch deadline, for a worker and for a side pane.
 - `herdr.child_environment` removes `NO_COLOR`. With it, Claude draws no SGR, and `_composer_input`
   reads the faint placeholder as typed text.
 - The pane's terminal owns `TERM` and `COLORTERM`. `herdr._pane_environment` removes them at a new
@@ -162,7 +162,7 @@ Absent staff returns `()`.
 One `accounts.settings_report_scope()` covers the operation.
 Invalid producer settings exclude that producer and produce one warning per operation.
 
-Each producer has its own tab in the configured `PRODUCER_WORKSPACE`, normally `producers`.
+Each producer has its own tab in the configured `producer_workspace`, normally `producers`.
 Resume uses its current conversation, current `[producers]` settings, and family account.
 A live producer starts nothing.
 A paused producer stays stopped.
@@ -177,7 +177,7 @@ The start order rotates by `int(time.time() // interval_seconds) % len(producers
 Run spacing that repeats this remainder can repeat the same first producer.
 
 `run_job` passes the run deadline as `HERDR_UPKEEP_DEADLINE`.
-Each resume uses the earlier run deadline or `now + [shutdown] START_SECONDS`.
+Each resume uses the earlier run deadline or `now + [shutdown] start_seconds`.
 At the run deadline, the loop prints `producer budget ended` and ends.
 The next run selects the remaining stopped producers again.
 

@@ -317,7 +317,7 @@ def kept_tests(times: ModuleTimes, slow_test_s: float) -> list[TestTime]:
 
 
 def slow_test_s() -> float:
-    return conf.read("test_times").number("SLOW_TEST_S")
+    return conf.read("test_times").number("slow_test_s")
 
 
 def module_runs(executions: Sequence[Execution], slow_test_s: float) -> list[ModuleRun]:
@@ -372,7 +372,7 @@ def keep_failure_logs(record_id: str, host: str, epoch: float, modules: Sequence
     failures = [(module, job) for module, job in zip(modules, executions, strict=True)
                 if job.status != 0 and not job.restart]
     if failures:
-        limit = conf.read("test_times").whole("GATE_FAILURE_LOG_KIB") * 1024
+        limit = conf.read("test_times").whole("gate_failure_log_kib") * 1024
         for module, job in failures:
             data = job.output.encode("utf-8")
             cut = max(0, len(data) - limit)
@@ -432,8 +432,8 @@ def history_time_limit(connection: sqlite3.Connection, vcpus: int, modules: Sequ
     shared natedev run with the same vCPU count runs fewer jobs and takes longer.
     A full run counts only when it ran test modules: a run of the type check alone is shorter.
     """
-    factor = conf.read("gate").number("GATE_TIME_LIMIT_FACTOR")
-    count = conf.read("test_times").whole("TOP_RUNS")
+    factor = conf.read("gate").number("gate_time_limit_factor")
+    count = conf.read("test_times").whole("top_runs")
     if not targeted:
         walls = [float(row[0]) for row in cast(list[tuple[float]], connection.execute(
             """SELECT wall_s FROM gate_runs

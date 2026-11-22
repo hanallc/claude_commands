@@ -192,8 +192,8 @@ class TestTimesTests(unittest.TestCase):
         }))
         _ = configure_cleanup(self, self.log)
         _ = write_config_fixture(self.config / "test_times.conf",
-                                 "TOP_RUNS=3\nTOP_CHECKOUT=~/.claude\nTOP_MAX_AGE_DAYS=7\nNEXTEST_SLOW_TEST_S=1.0\n"
-                                 + "TREND_SETTLE_MINUTES=45\n")
+                                 "top_runs=3\ntop_checkout=~/.claude\ntop_max_age_days=7\nnextest_slow_test_s=1.0\n"
+                                 + "trend_settle_minutes=45\n")
         _ = write_config_fixture(self.config / "buildlog.conf")
         _ = self.enterContext(mock.patch.object(show, "datetime", ReportTime))
         for name in ("test_alpha.py", "test_beta.py", "test_missing.py"):
@@ -361,7 +361,7 @@ with socket.socket(fileno=int(sys.argv[2])) as event, index.update_lock():
             event.sendall(b"F")
 
     def test_report_keeps_index_only_rows_after_an_exclusive_lock_exceeds_the_read_wait(self) -> None:
-        _ = write_config_fixture(self.config / "buildlog.conf", "INDEX_READ_WAIT_SECONDS=0.05")
+        _ = write_config_fixture(self.config / "buildlog.conf", "index_read_wait_seconds=0.05")
         self.write_run([module_run("test_alpha.py", 8.0)])
         _ = show.index.update()
         with closing(sqlite3.connect(index_path_in(self.log))) as connection, connection:
@@ -392,7 +392,7 @@ with socket.socket(fileno=int(sys.argv[2])) as event, index.update_lock():
             try:
                 self.assertEqual(event.recv(1), b"W")
                 with closing(sqlite3.connect(show.index.read_only_uri(self.log), uri=True,
-                        timeout=conf.read("buildlog").number("INDEX_READ_WAIT_SECONDS"))) as reader:
+                        timeout=conf.read("buildlog").number("index_read_wait_seconds"))) as reader:
                     with self.assertRaisesRegex(sqlite3.OperationalError, "database is locked"):
                         reader.execute("SELECT COUNT(*) FROM gate_modules").close()
                 with mock.patch.dict(os.environ, {"TEST_LOCKED_INDEX": "1"}), \
@@ -415,7 +415,7 @@ with socket.socket(fileno=int(sys.argv[2])) as event, index.update_lock():
                     _ = writer.communicate(timeout=TEST_HANG_GUARD_SECS)
 
     def test_report_waits_for_an_exclusive_lock_taken_after_index_selection(self) -> None:
-        _ = write_config_fixture(self.config / "buildlog.conf", "INDEX_READ_WAIT_SECONDS=0.01")
+        _ = write_config_fixture(self.config / "buildlog.conf", "index_read_wait_seconds=0.01")
         self.write_run([module_run("test_alpha.py", 8.0)])
         _ = show.index.update()
         select_index = show.index.complete_gate_index_in
@@ -440,7 +440,7 @@ with socket.socket(fileno=int(sys.argv[2])) as event, index.update_lock():
             self.assertTrue(locked.wait(TEST_HANG_GUARD_SECS))
             try:
                 with closing(sqlite3.connect(show.index.read_only_uri(self.log), uri=True,
-                        timeout=conf.read("buildlog").number("INDEX_READ_WAIT_SECONDS"))) as reader:
+                        timeout=conf.read("buildlog").number("index_read_wait_seconds"))) as reader:
                     with self.assertRaisesRegex(sqlite3.OperationalError, "database is locked"):
                         reader.execute("SELECT COUNT(*) FROM gate_modules").close()
             finally:
@@ -609,7 +609,7 @@ with socket.socket(fileno=int(sys.argv[2])) as event, index.update_lock():
         self.assertIn("tools/test_beta.py", limited)
         self.assertNotIn("tools/test_alpha.py", limited)
         self.assertIn(type_line, limited)
-        _ = write_config_fixture(self.config / "test_times.conf", "TOP_RUNS=1")
+        _ = write_config_fixture(self.config / "test_times.conf", "top_runs=1")
         changed = self.report("top", "--repo", str(self.repo))
         self.assertLess(changed.index("tools/test_alpha.py"), changed.index("types/basedpyright"))
 
@@ -678,7 +678,7 @@ with socket.socket(fileno=int(sys.argv[2])) as event, index.update_lock():
         self.write_nextest(hana, "        PASS [ 2.000s] hana tests::recorded\n")
         with chdir(hana[0]):
             before = self.report("top")
-            _ = write_config_fixture(self.config / "test_times.conf", "NEXTEST_SLOW_TEST_S=3.0")
+            _ = write_config_fixture(self.config / "test_times.conf", "nextest_slow_test_s=3.0")
             after = self.report("top")
         self.assertIn("recorded threshold: > 1.000 s", before)
         self.assertIn("recorded threshold: > 3.000 s", after)
@@ -761,7 +761,7 @@ with socket.socket(fileno=int(sys.argv[2])) as event, index.update_lock():
 
     def test_top_aws_host_ranks_every_aws_gate_host_from_the_aws_checkout(self) -> None:
         gate = self.root / "gate-trial"
-        _ = write_config_fixture(self.config / "test_times.conf", f"TOP_CHECKOUT=~/.claude\nTOP_AWS_CHECKOUT={gate}")
+        _ = write_config_fixture(self.config / "test_times.conf", f"top_checkout=~/.claude\ntop_aws_checkout={gate}")
         self.write_run([module_run("test_alpha.py", 4.0)], host="ip-10-0-0-1.us-east-2.compute.internal",
                        checkout=str(gate))
         self.write_run([module_run("test_alpha.py", 8.0)], host="ip-10-0-0-2.us-east-2.compute.internal",
@@ -780,7 +780,7 @@ with socket.socket(fileno=int(sys.argv[2])) as event, index.update_lock():
         self.write_run([module_run("test_alpha.py", 8.0)], checkout=str(self.repo.resolve()))
         alias = self.repo.with_name("checkout-alias")
         alias.symlink_to(self.repo, target_is_directory=True)
-        _ = write_config_fixture(self.config / "test_times.conf", "TOP_CHECKOUT=~/checkout-alias")
+        _ = write_config_fixture(self.config / "test_times.conf", "top_checkout=~/checkout-alias")
         output = self.report("top", "--repo", str(self.repo))
         alpha = self.line(output, "tools/test_alpha.py")
         self.assertEqual(self.cell(output, alpha, "median s"), "8.000")
@@ -791,10 +791,10 @@ with socket.socket(fileno=int(sys.argv[2])) as event, index.update_lock():
         self.write_run([module_run("test_beta.py", 9.0)], checkout=str(self.root / "other"))
         output = self.report("top", "--repo", str(self.repo))
         self.assertEqual(self.cell(output, self.line(output, "tools/test_alpha.py"), "median s"), "8.000")
-        _ = write_config_fixture(self.config / "test_times.conf", "TOP_MAX_AGE_DAYS=1")
+        _ = write_config_fixture(self.config / "test_times.conf", "top_max_age_days=1")
         output = self.report("top", "--repo", str(self.repo))
         self.assertIn("no modules recorded yet", output)
-        _ = write_config_fixture(self.config / "test_times.conf", f"TOP_CHECKOUT={self.root / 'other'}")
+        _ = write_config_fixture(self.config / "test_times.conf", f"top_checkout={self.root / 'other'}")
         output = self.report("top", "--repo", str(self.repo))
         self.assertEqual(self.cell(output, self.line(output, "tools/test_beta.py"), "median s"), "9.000")
 
@@ -891,7 +891,7 @@ with socket.socket(fileno=int(sys.argv[2])) as event, index.update_lock():
     def test_test_history_separates_kept_missing_and_absent_rows_without_invented_durations(self) -> None:
         kept: TestTime = {"test": "Example.test_target", "s": 0.75, "status": "pass"}
         self.write_run([module_run("test_alpha.py", 8.0, tests=[kept])])
-        _ = write_config_fixture(self.config / "test_times.conf", "SLOW_TEST_S=1.0")
+        _ = write_config_fixture(self.config / "test_times.conf", "slow_test_s=1.0")
         self.write_run([module_run("test_alpha.py", 7.0)], epoch=EPOCH + 60)
         removed = module_run("test_alpha.py", 6.0)
         removed["tests_run"] = 12
@@ -900,7 +900,7 @@ with socket.socket(fileno=int(sys.argv[2])) as event, index.update_lock():
         self.write_run([missing], epoch=EPOCH + 180)
         self.write_run([module_run("test_alpha.py", 999.0, tests=[kept])],
                        host="other-host", epoch=EPOCH + 240)
-        _ = write_config_fixture(self.config / "test_times.conf", "SLOW_TEST_S=2.0")
+        _ = write_config_fixture(self.config / "test_times.conf", "slow_test_s=2.0")
         output = self.report("test", "target")
         self.assertIn("0.75", self.line(output, "11-03 09:30"))
         for when in ("11-03 09:31", "11-03 09:32"):
@@ -939,7 +939,7 @@ with socket.socket(fileno=int(sys.argv[2])) as event, index.update_lock():
         for entry in entries:
             remove_run_measurements(entry)
         _ = path.write_bytes(b"".join(encode(entry) for entry in entries))
-        _ = write_config_fixture(self.config / "test_times.conf", "SLOW_TEST_S=9.0")
+        _ = write_config_fixture(self.config / "test_times.conf", "slow_test_s=9.0")
         suites = self.report("suites", "--days", "100000")
         for when in ("11-03 09:30", "11-03 09:31"):
             self.assertEqual(self.cell(suites, self.line(suites, when), "tests run"), "")
@@ -1014,6 +1014,7 @@ with socket.socket(fileno=int(sys.argv[2])) as event, index.update_lock():
             _ = report_without_update("top", "--repo", str(self.repo))
 
     def test_trend_groups_passing_runs_by_place_selection_and_local_day(self) -> None:
+        _ = write_config_fixture(self.config / "test_times.conf", "trend_days=2\n")
         # The first attempt is a hold restart. It still uses CPU.
         self.write_run([module_run("test_alpha.py", 120, restart="hold", status=-15),
                         module_run("test_alpha.py", 100, attempt=2)], host="natedev")
@@ -1023,7 +1024,7 @@ with socket.socket(fileno=int(sys.argv[2])) as event, index.update_lock():
                 ("natedev", True, 0, [module_run("test_alpha.py", 9999)], EPOCH),
                 ("natedev", False, 1, [module_run("test_alpha.py", 9999)], EPOCH),
                 ("natedev", False, 0, [], EPOCH),
-                ("natedev", False, 0, [module_run("test_alpha.py", 9999)], EPOCH - 9 * 86400),
+                ("natedev", False, 0, [module_run("test_alpha.py", 9999)], EPOCH - 3 * 86400),
                 ("builder", False, 0, [module_run("test_alpha.py", 10)], EPOCH),
                 ("natedev", False, 0, [module_run("test_alpha.py", 12)], EPOCH - 10 * 3600)):
             self.write_run(modules, host=host, aborted=aborted, status=status, epoch=epoch)
@@ -1034,7 +1035,7 @@ with socket.socket(fileno=int(sys.argv[2])) as event, index.update_lock():
             writer.execute("UPDATE gate_runs SET selection='affected', wall_s=40 WHERE id=?", (affected,)).close()
             writer.execute("UPDATE gate_runs SET wall_s=100 WHERE id='history-1'").close()
             writer.commit()
-        status, output, errors = report_without_update("trend", "--days", "8")
+        status, output, errors = report_without_update("trend")
         self.assertEqual(status, 0, errors)
         tables = trend_tables(output)
         self.assertEqual(list(tables), ["builder merge gates", "natedev merge gates", "natedev targeted tests"])
@@ -1234,9 +1235,9 @@ with socket.socket(fileno=int(sys.argv[2])) as event, index.update_lock():
         self.write_run([module_run("test_alpha.py", 8)], epoch=EPOCH - 86400, host="natedev")
         # The first delay ends one second after the fixed report time.
         delay = (ReportTime.now().timestamp() - (EPOCH - 9.5 * 3600)) / 60
-        _ = write_config_fixture(self.config / "test_times.conf", f"TREND_SETTLE_MINUTES={delay + 1 / 60}")
+        _ = write_config_fixture(self.config / "test_times.conf", f"trend_settle_minutes={delay + 1 / 60}")
         _ = self.report("trend", "--days", "2")
-        _ = write_config_fixture(self.config / "test_times.conf", f"TREND_SETTLE_MINUTES={delay}")
+        _ = write_config_fixture(self.config / "test_times.conf", f"trend_settle_minutes={delay}")
         with closing(sqlite3.connect(index_path_in(self.log))) as writer:
             writer.execute("UPDATE gate_modules SET cpu_s=11").close()
             writer.commit()
