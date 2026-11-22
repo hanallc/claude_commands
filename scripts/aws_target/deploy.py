@@ -2303,36 +2303,42 @@ class Deployment:
     def _write_parameters(self, parameters: dict[str, str]) -> None:
         write_text_atomic(self.output / 'parameters.json', preparation_parameters_text(parameters))
 
-    @contextmanager
     def _prepare_foundation(
         self, command: Literal['prepare', 'recover'], network_for: Callable[[DeploymentSettings], DeploymentNetwork],
         parameters_for: Callable[[DeploymentSettings, BudgetNotificationAddress, str, SpendingSettings], dict[str, str]],
-    ) -> Generator[PreparedDeploymentBundle]:
+    ) -> PreparedDeploymentBundle:
+        settings = read_deployment_settings(self.settings_path)
+        now = int(self.clock())
+        notification = read_budget_notification_address(self.settings_path)
+        # Recovery uses the guard to report and record an invalid spending configuration.
+        spending = read_settings(self.settings_path) if command == 'prepare' else None
+        book = ledger.CostLedger(self.directory)
+        state = book.read_snapshot() if book.path.exists() else ledger.LedgerEvidence()
+        resources = state.inventories[-1].resources if state.inventories else ()
+        if not state.inventories:
+            book.record_inventory(ledger.ResourceInventory(now, resources, 'Budget foundation', builder_removed=True))
+        decision = self._guard()
+        network = network_for(settings)
+        _ = network.subnet_in(settings.availability_zone)
+        if spending is None:
+            spending = read_settings(self.settings_path)
+        parameters = parameters_for(settings, notification, network.vpc, spending)
+        return self._preparation_bundle(settings, parameters, TEMPLATE.read_bytes(), decision, resources)
+
+    def _write_preparation(self) -> PreparedDeployment:
+        bundle = self._prepare_foundation('prepare',
+            lambda settings: self._deployment_network(settings, self._api(settings)), self._parameters)
+        return bundle.save()
+
+    @contextmanager
+    def _foundation_preparation_lock(self, command: Literal['prepare', 'recover']) -> Generator[None]:
         admin_secrets.refuse_plain_admin(self.settings_path)
         with self._require_hana_control(command):
-            settings = read_deployment_settings(self.settings_path)
-            now = int(self.clock())
-            notification = read_budget_notification_address(self.settings_path)
-            # Recovery uses the guard to report and record an invalid spending configuration.
-            spending = read_settings(self.settings_path) if command == 'prepare' else None
-            book = ledger.CostLedger(self.directory)
-            state = book.read_snapshot() if book.path.exists() else ledger.LedgerEvidence()
-            resources = state.inventories[-1].resources if state.inventories else ()
-            if not state.inventories:
-                book.record_inventory(ledger.ResourceInventory(now, resources, 'Budget foundation', builder_removed=True))
-            decision = self._guard()
-            network = network_for(settings)
-            _ = network.subnet_in(settings.availability_zone)
-            if spending is None:
-                spending = read_settings(self.settings_path)
-            parameters = parameters_for(settings, notification, network.vpc, spending)
-            yield self._preparation_bundle(settings, parameters, TEMPLATE.read_bytes(), decision, resources)
+            yield
 
     def prepare(self) -> PreparedDeployment:
-        with (self._require_account_stack('prepare'),
-              self._prepare_foundation('prepare', lambda settings: self._deployment_network(settings, self._api(settings)),
-                                       self._parameters) as bundle):
-            return bundle.save()
+        with self._require_account_stack('prepare'), self._foundation_preparation_lock('prepare'):
+            return self._write_preparation()
 
     def _stack(self, settings: DeploymentSettings, *, require_outputs: bool = False) -> dict[str, str]:
         stack = self._read_stack(settings)
@@ -3369,7 +3375,8 @@ class Deployment:
                                vpc: str, spending: SpendingSettings) -> dict[str, str]:
                 return self._foundation_parameters(settings, notification, deployment, foundation, vpc, spending)
 
-            with self._prepare_foundation('recover', lambda _settings: home_network, parameters_for) as bundle:
+            with self._foundation_preparation_lock('recover'):
+                bundle = self._prepare_foundation('recover', lambda _settings: home_network, parameters_for)
                 record = prepared_foundation_record(foundation, outputs, bundle.prepared.fingerprint)
                 return save_recovered_deployment(self.directory, record, manifest, bundle.files, write=write)
 
