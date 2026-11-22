@@ -336,15 +336,22 @@ class EndSessionTests(unittest.TestCase):
         environment = self.environment()
         environment["CODEX_HOME"] = str(self.root / "codex")
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", environment))
-        owner = fixture_member("showrunner", name="demo")
-        parent = fixture_member("unit", name="builders", parent=owner.id,
-                                worktree=staff.PresentWorktree("natedev", command_cwd))
-        _ = (run / "progress_history_state.json").write_text(json.dumps({"owner_staff_id": parent.id}))
+        parent = staff.by_current_session(self.session_id)
+        assert parent is not None
+        parent = staff.set_worktree(parent.id, staff.PresentWorktree("natedev", command_cwd), expected=parent.worktree)
         member = fixture_worker("w7", parent.id, backend=staff.CodexBackend(Path(environment["CODEX_HOME"])))
         _ = record.write_text(json.dumps({
             "worker": "w7", "status": "running", "pid": child.pid, "staff_id": member.id}))
         environment.update({"SCRATCH_ROOT": str(scratch.parent), "SCRATCH_VISIBLE_ROOT": str(self.root / "visible-scratch"),
             "SCRATCH_HOLDS": str(self.root / "scratch-holds.json")})
+        pending = self.run_end(environment)
+        self.assertEqual(pending.returncode, 1, pending.stderr)
+        self.assertIn("detached run still-running can still be running", pending.stderr)
+        self.assertEqual(self.run_pointer(), run)
+        self.assertTrue(command_cwd.is_dir())
+        self.assertTrue(unused.is_dir())
+
+        _ = child.communicate(timeout=TEST_HANG_GUARD_SECS)
         result = self.run_end(environment)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertTrue(command_cwd.is_dir(), result.stdout + result.stderr)
