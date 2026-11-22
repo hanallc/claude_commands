@@ -188,7 +188,7 @@ def icon_svg(name: str) -> str:
 
 
 class ForYouEntry(TypedDict):
-    """One action entry in the For you panel."""
+    """One open row in the For you panel."""
 
     key: str
     kind: str
@@ -196,6 +196,7 @@ class ForYouEntry(TypedDict):
     command: str
     machine: str
     requested_by: str
+    reason: str
 
 
 class CompleteForYouCount(TypedDict):
@@ -237,7 +238,7 @@ def for_you_payload() -> ForYouPayload:
         return count
     entries: list[ForYouEntry] = [
         {"key": row.key, "kind": row.kind, "title": row.title, "command": row.command,
-         "machine": row.machine, "requested_by": row.requested_by}
+         "machine": row.machine, "requested_by": row.requested_by, "reason": row.reason}
         for row in snapshot.rows if row.status == "open"
     ]
     return {**count, "entries": entries}
@@ -320,8 +321,9 @@ border:1px solid var(--border);border-radius:12px;background:var(--nav);color:va
 #action-popover article{padding:18px 20px;border-top:1px solid var(--border)}
 .short-head{display:flex;align-items:center;gap:9px;font-size:14px}.short-head svg{width:17px;height:17px;color:var(--notice-text)}
 .short-head strong{overflow-wrap:anywhere}
-#action-popover article p{margin:5px 0 12px 26px;color:var(--muted);font-size:12px;overflow-wrap:anywhere}
-#action-popover .code-block{margin:0}
+#action-popover article p{margin:5px 0 0 26px;color:var(--muted);font-size:12px;overflow-wrap:anywhere}
+#action-popover [data-entry-reason]{white-space:pre-line}
+#action-popover .code-block{margin:12px 0 0}
 #action-popover pre{border:1px solid var(--border);background:var(--page);border-radius:6px;margin:0;padding:12px 48px 12px 13px;
 font:14px/1.4 ui-monospace,monospace;white-space:pre-wrap;overflow-wrap:anywhere}
 #action-popover [data-copy-code]{opacity:1;color:var(--muted)}
@@ -356,6 +358,9 @@ function createForYouNotifier(){
    article.querySelector('[data-entry-rebuild]').hidden=item.kind!=='rebuild';
    article.querySelector('[data-entry-action]').hidden=item.kind==='rebuild';
    article.querySelector('[data-entry-machine]').textContent=item.requested_by ? item.machine+' · '+item.requested_by : item.machine;
+   const reason=article.querySelector('[data-entry-reason]');
+   if(item.reason) reason.textContent=item.reason;
+   else reason.remove();
    article.querySelector('code').textContent=item.command;
    return article;
   });
@@ -538,7 +543,9 @@ aria-controls="console-nav" aria-expanded="false" aria-label="Open navigation"><
 </section>
 <template id="for-you-entry"><article>
 <div class="short-head"><span data-entry-rebuild><!-- FOR YOU REBUILD --></span><span data-entry-action><!-- FOR YOU ACTION --></span><strong></strong></div>
-<p data-entry-machine></p><div class="code-block"><pre><code></code></pre><!-- FOR YOU COPY --></div>
+<p data-entry-machine></p>
+<p data-entry-reason></p>
+<div class="code-block"><pre><code></code></pre><!-- FOR YOU COPY --></div>
 </article></template>
 <script>
 <!-- FOR YOU SCRIPT -->

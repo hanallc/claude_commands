@@ -294,9 +294,12 @@ class ForYouNotifierTests(unittest.TestCase):
                                  status, "manual", "")
 
     def test_notifier_counts_and_returns_every_open_row_in_order(self) -> None:
-        rows = (self.action(), replace(self.action("rebuild/mac"), kind="rebuild", machine="mac", requested_by=""),
+        rebuild_reason = "The running system differs from the configured system."
+        rows = (self.action(), replace(self.action("rebuild/mac"), kind="rebuild", machine="mac", requested_by="",
+                                       reason=rebuild_reason),
                 replace(self.action("action/done"), status="done"), self.action("action/third"))
-        with patch.object(for_you, "read", return_value=for_you.ForYouSnapshot(rows, ())):
+        snapshot = for_you.ForYouSnapshot(rows, ())
+        with patch.object(for_you, "read", return_value=snapshot):
             result = console.for_you_payload()
         self.assertTrue(result["available"])
         assert result["available"] is True
@@ -305,6 +308,9 @@ class ForYouNotifierTests(unittest.TestCase):
                          ["action/fixture", "rebuild/mac", "action/third"])
         self.assertEqual(result["entries"][1]["machine"], "mac")
         self.assertEqual(result["entries"][1]["requested_by"], "")
+        self.assertEqual(result["entries"][0]["reason"], "Login needs your browser.")
+        self.assertEqual(result["entries"][1]["reason"], rebuild_reason)
+        self.assertEqual(console.for_you_count(snapshot), {"available": True, "count": 3})
         for entry in result["entries"]:
             self.assertNotIn("href", entry)
 
@@ -338,8 +344,9 @@ Object.defineProperty(document,'visibilityState',{get:()=>visibility});
 window.setInterval=(run,ms)=>{const id=timers.size+1;timers.set(id,{run,ms});return id;};
 window.clearInterval=id=>timers.delete(id);
 const entries=[{key:'rebuild/natedev',kind:'rebuild',title:'Apply the new console settings',command:'rebuild',
- machine:'natedev',requested_by:'watcher'},
- {key:'action/demo',kind:'action',title:'Restore GitHub access',command:'github-warmup',machine:'mac',requested_by:'sdlc'}];
+ machine:'natedev',requested_by:'watcher',reason:'Apply the settings.\nThe running system differs from the configured system.'},
+ {key:'action/demo',kind:'action',title:'Restore GitHub access',command:'github-warmup',machine:'mac',requested_by:'sdlc',
+  reason:'Login needs your browser.'}];
 Object.defineProperty(navigator,'clipboard',{value:{writeText:async text=>{copied=text;}}});
 window.fetch=async(url,options)=>{
  if(String(url).includes('for-you.json')){reads++;if(mode==='failed') throw Error('Read failed.');
@@ -370,6 +377,12 @@ try{
  check(trigger.textContent.includes('2') && panel.querySelectorAll('article').length===2,'the count and two entries appear');
  const machineLines=()=>[...panel.querySelectorAll('[data-entry-machine]')].map(line=>line.textContent);
  check(machineLines().join('|')==='natedev · watcher|mac · sdlc','rebuild and action entries name their requesters');
+ const reasons=[...panel.querySelectorAll('[data-entry-reason]')];
+ check(reasons.length===2 && reasons.every((reason,index)=>reason.textContent===entries[index].reason),
+  'rebuild and action entries show their reasons');
+ check(reasons.every(reason=>getComputedStyle(reason).whiteSpace==='pre-line' &&
+  reason.previousElementSibling.matches('[data-entry-machine]') && reason.nextElementSibling.matches('.code-block')),
+  'the reasons keep line breaks and appear between the machine and command');
  check(panel.getBoundingClientRect().right<=innerWidth && panel.getBoundingClientRect().left>=0,'the panel fits the viewport');
  check(document.documentElement.scrollWidth===innerWidth,'the shell has no horizontal overflow');
  const copy=panel.querySelector('[data-copy-code]');copy.focus();copy.click();await flush();
@@ -472,8 +485,9 @@ try{
  check(trigger.dataset.state==='unavailable' && trigger.querySelector('b').textContent==='?',
   'an unavailable count replaces a known zero');
  mode='good';dispatchEvent(new Event('focus'));await flush();
- entries[0].requested_by='';dispatchEvent(new Event('focus'));await flush();
+ entries[0].requested_by='';entries[0].reason='';dispatchEvent(new Event('focus'));await flush();
  check(machineLines().join('|')==='natedev|mac · sdlc','a rebuild without a requester shows the machine alone');
+ check(!panel.querySelector('[data-key="rebuild/natedev"] [data-entry-reason]'),'an empty reason leaves no element');
  check(!panel.querySelector('a,footer'),'the panel has no card or footer links');
  const url=new URL(location.href);
  check(url.searchParams.get('page')==='list' && url.searchParams.get('at.list')==='/page?filter=mine' &&

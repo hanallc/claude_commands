@@ -70,6 +70,8 @@ The phone header keeps the button visible.
 The button opens a nonmodal panel with machine names, commands, and copy buttons.
 When the panel reaches its height limit, the entries scroll below the header and note.
 The machine line adds the requester after a dot when a requester exists.
+Each entry shows the row's reason between the machine line and the command.
+The reason keeps its line breaks.
 Escape closes the panel and focuses the visible For you button.
 Copy writes the command to the clipboard.
 Copy does not complete the action.
