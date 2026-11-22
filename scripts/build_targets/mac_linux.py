@@ -38,7 +38,7 @@ from scripts.test_times.gate_record import TYPE_CHECK_JOB
 
 
 TARGET = eligibility.MAC_LINUX_TARGET
-UNREACHABLE_WAIT_KEY = 'run.unreachable_wait_seconds'
+UNREACHABLE_WAIT_KEY = 'unreachable_wait_seconds'
 MAX_UNREACHABLE_WAIT_SECONDS = 86400
 ORIGIN_MAIN = 'refs/remotes/origin/main'
 SSH_CONNECT_TIMEOUT_SECONDS = 8
@@ -108,7 +108,7 @@ def read_settings(registry: conf.ConfigRead) -> GuestSettings:
     user = settings.text('guest.user', recover_invalid=False)
     jobs = settings.value('test.jobs', int, recover_invalid=False)
     limit = settings.value('run.time_limit_seconds', int, recover_invalid=False)
-    proof_wait = settings.value(UNREACHABLE_WAIT_KEY, _unreachable_wait_seconds, recover_invalid=False)
+    proof_wait = registry.value(UNREACHABLE_WAIT_KEY, _unreachable_wait_seconds, recover_invalid=False)
     if len(hops) != 2 or not all(re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]*', host) for host in hops):
         raise GuestUnavailable('ssh.hops must name two SSH aliases')
     if not re.fullmatch(r'[a-z_][a-z0-9_-]*', user):

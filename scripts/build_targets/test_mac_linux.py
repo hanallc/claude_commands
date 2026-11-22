@@ -340,10 +340,10 @@ class MacLinuxRouteTests(unittest.TestCase):
         config = self.root / 'config'
         config.mkdir()
         self.registry = config / 'build_targets.conf'
-        _ = write_config_fixture(self.registry, 'enabled.mac-linux=on\n')
+        _ = write_config_fixture(self.registry, f'enabled.mac-linux=on\n{mac_linux.UNREACHABLE_WAIT_KEY}=20\n')
         _ = (config / 'mac_linux.conf').write_text(
             f'ssh.hops=fixture-mac fixture-guest\nguest.user={account}\ntest.jobs=2\n'
-            + f'run.time_limit_seconds=7\n{mac_linux.UNREACHABLE_WAIT_KEY}=20\n',
+            + 'run.time_limit_seconds=7\n',
             encoding='utf-8')
         _ = write_config_fixture(config / 'mac_test.conf', 'unreachable_backoff_s=30\n')
         _ = cast(object, self.enterContext(patch.dict(os.environ, {
@@ -487,8 +487,7 @@ fi
         key = mac_linux.UNREACHABLE_WAIT_KEY
         settings = mac_linux.read_settings(conf.read(self.registry))
         self.assertEqual(settings.unreachable_wait_seconds, 20)
-        configuration = self.registry.with_name('mac_linux.conf')
-        _ = configuration.write_text(configuration.read_text().replace(f'{key}=20\n', ''))
+        _ = self.registry.write_text(self.registry.read_text().replace(f'{key}=20\n', ''))
         result = self.route()
         self.assertIsInstance(result, str)
         self.assertIn(key, str(result))
@@ -496,21 +495,20 @@ fi
         self.assert_guest_clean()
 
     def test_unreachable_wait_uses_the_committed_value_when_the_key_is_missing(self) -> None:
-        configuration = self.repo / 'config/mac_linux.conf'
-        original = self.registry.with_name('mac_linux.conf').read_text()
-        _ = configuration.write_text(original)
-        _ = self.git('add', 'config/mac_linux.conf')
-        _ = self.git('commit', '-qm', 'Add the guest settings')
-        _ = self.registry.write_text(self.registry.read_text().replace(
-            'settings.mac-linux=mac_linux.conf', f'settings.mac-linux={configuration}'))
+        registry = self.repo / 'config/build_targets.conf'
+        original = self.registry.read_text().replace(
+            'settings.mac-linux=mac_linux.conf', f"settings.mac-linux={self.registry.with_name('mac_linux.conf')}")
+        _ = registry.write_text(original)
+        _ = self.git('add', 'config/build_targets.conf')
+        _ = self.git('commit', '-qm', 'Add the target registry')
         key = mac_linux.UNREACHABLE_WAIT_KEY
-        _ = configuration.write_text(original.replace(f'{key}=20\n', ''))
-        settings = mac_linux.read_settings(conf.read(self.registry))
+        _ = registry.write_text(original.replace(f'{key}=20\n', ''))
+        settings = mac_linux.read_settings(conf.read(registry))
         self.assertEqual(settings.unreachable_wait_seconds, 20)
 
     def test_unreachable_wait_requires_whole_seconds_in_range(self) -> None:
         key = mac_linux.UNREACHABLE_WAIT_KEY
-        configuration = self.registry.with_name('mac_linux.conf')
+        configuration = self.registry
         original = configuration.read_text()
         for value, reason in (
             ('0', 'expected a positive whole number'),
@@ -691,7 +689,7 @@ fi
         self.assertEqual(self.trace.read_text().splitlines(), ['probe', 'arm', 'run', 'cleanup', 'cleanup', 'cleanup'])
 
     def test_proof_wait_expires_and_a_second_route_cannot_take_the_guest_lock(self) -> None:
-        configuration = self.registry.with_name('mac_linux.conf')
+        configuration = self.registry
         key = mac_linux.UNREACHABLE_WAIT_KEY
         _ = configuration.write_text(configuration.read_text().replace(f'{key}=20', f'{key}=2'))
         settings = mac_linux.read_settings(conf.read(self.registry))
@@ -788,7 +786,7 @@ fi
         self.assertEqual(self.trace.read_text().splitlines(), ['probe', 'arm', 'run', 'cleanup', 'cleanup', 'cleanup'])
 
     def test_full_stderr_pipe_does_not_extend_the_proof_wait(self) -> None:
-        configuration = self.registry.with_name('mac_linux.conf')
+        configuration = self.registry
         key = mac_linux.UNREACHABLE_WAIT_KEY
         _ = configuration.write_text(configuration.read_text().replace(f'{key}=20', f'{key}=1'))
         started: list[float] = []
@@ -824,7 +822,7 @@ fi
         self.assertLess(returned - first_probe, 1.75)
 
     def test_local_read_past_the_proof_deadline_starts_no_cleanup_ssh(self) -> None:
-        configuration = self.registry.with_name('mac_linux.conf')
+        configuration = self.registry
         key = mac_linux.UNREACHABLE_WAIT_KEY
         _ = configuration.write_text(configuration.read_text().replace(f'{key}=20', f'{key}=1'))
         helper = Path(process_group.__file__)
