@@ -49,28 +49,28 @@ class TargetedTestTests(MergeGateFixture):
         self.assertFalse(path.with_name(path.name + ".lease.json").exists())
         self.assertFalse(path.with_name(path.name + ".lock").exists())
 
-        with self.subTest(entry="script"):
-            startup = self.root / "startup"
-            self.write(startup / "sitecustomize.py", '''import argparse
+    def test_gate_script_uses_the_imported_module_identity(self) -> None:
+        startup = self.root / "startup"
+        self.write(startup / "sitecustomize.py", '''import argparse
 import sys
 
 original_exit = argparse.ArgumentParser.exit
 
 def checked_exit(parser, status=0, message=None):
-    from scripts.production import gate, merge_gate
-    print("gate module identity:", gate is merge_gate is sys.modules["__main__"])
+    from scripts.production import gate
+    print("gate module identity:", gate is sys.modules["__main__"])
     original_exit(parser, status, message)
 
 argparse.ArgumentParser.exit = checked_exit
 ''')
-            environment = {**self.environment, "PYTHONPATH": os.pathsep.join(
-                (str(startup), str(Path(__file__).resolve().parents[2])))}
-            result = subprocess.run([sys.executable, str(gate.__file__), "--help"],
-                                    cwd=self.checkout, env=environment, capture_output=True,
-                                    text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
-            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-            self.assertIn("gate module identity: True", result.stdout)
-            self.assertIn("--affected", result.stdout)
+        environment = {**self.environment, "PYTHONPATH": os.pathsep.join(
+            (str(startup), str(Path(__file__).resolve().parents[2])))}
+        result = subprocess.run([sys.executable, str(gate.__file__), "--help"],
+                                cwd=self.checkout, env=environment, capture_output=True,
+                                text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("gate module identity: True", result.stdout)
+        self.assertIn("--affected", result.stdout)
 
     def test_a_changed_suite_set_cannot_reuse_or_certify_an_old_full_pass(self) -> None:
         first = self.run_gate()

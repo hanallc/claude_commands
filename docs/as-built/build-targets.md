@@ -500,7 +500,7 @@ The copies root (`build_folders.conf` `roots.copies`: `/build/claude/copies` on 
 Record lookup returns `Registered`, `NotRegistered` or `UnreadableRecord(reason)`. A copy's lifetime is `Live(why)`, `Ended(evidence)` or `Unknown(reason)`; cleanup removes only `Ended` copies and names the repair reason for unknown state. An open phase keeps its copy at any age; the recorder's completed, stopped and error states end it. A `landed:<unit>/<branch>` copy ends only when `origin/<branch>` is an ancestor of its recorded land target (default `origin/main`) in the recorded source checkout, whose sessions keep its refs fresh, and all copy work is saved; cleanup never fetches. The tmp sweep then requires seven days without a change. A parent stays while an existing child record borrows its Git objects.
 
 Holders create `.claude-busy` and use a shared flock for the whole run. Judges and dry runs do not create the mark. 
-`targeted_test.py --checkout <copy>` and `merge_gate.py --checkout <copy>` take the shared lock before tests start.
+`targeted_test.py --checkout <copy>` and `gate.py --checkout <copy>` take the shared lock before tests start.
 Scratch end, the tmp sweep and the floor sweep claim an exclusive lock without waiting.
 They create the mark when absent and retain it through deletion.
 A folder with a maker lock beside it (`<name>.lock`) is a managed folder.

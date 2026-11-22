@@ -5241,7 +5241,6 @@ ADMISSION_CALLERS = {
     "verify.sh": "direct/verify.sh",
     "invoke.sh": "lint/invoke.sh",
     "pre-tool-use-brp-launch-gate.sh": "hooks/pre-tool-use-brp-launch-gate.sh",
-    "merge_gate.py": "production/merge_gate.py",
     "gate.py": "production/gate.py",
     "targeted_test.py": "production/targeted_test.py",
     "admission_client.py": "build_queue/admission_client.py",

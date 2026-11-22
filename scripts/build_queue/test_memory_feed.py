@@ -646,7 +646,7 @@ process.stdout.write(JSON.stringify({
             self.assertTrue(row["name"].startswith("fixture-project "))
 
     def test_gate_rows_name_the_job_from_the_command_arguments(self) -> None:
-        gate_command = ["python3", "/repo/scripts/production/merge_gate.py", "--merge-branch", "sdlc"]
+        gate_command = ["python3", "/repo/scripts/production/gate.py", "--merge-branch", "sdlc"]
         cases = (
             (["--unit", "handler", "--checkpoint", "abc"], StepJob("integrate", unit="handler", branch="sdlc")),
             (["--tests-only", "--full"], StepJob("test-all", branch="")),
@@ -673,7 +673,7 @@ process.stdout.write(JSON.stringify({
             (["python3", "-X", "dev", "/repo/scripts/production/targeted_test.py"], StepJob("test-affected")),
             (["py", "targeted_test.py", "--full"], StepJob("test-all")),
             (["python3", "targeted_test.py", "--module", "a"], StepJob("test-modules", modules=1)),
-            (["python3", "-m", "scripts.production.merge_gate", "--tests-only"], StepJob("test-all")),
+            (["python3", "-m", "scripts.production.merge_gate", "--tests-only"], OTHER_COMMAND),
             (["python3", "/repo/scripts/production/gate.py", "--unit", "handler", "--merge-branch", "sdlc"],
              StepJob("integrate", unit="handler", branch="sdlc")),
             (["python3", "-m", "scripts.production.gate", "--unit", "handler", "--merge-branch=sdlc"],
@@ -696,19 +696,18 @@ process.stdout.write(JSON.stringify({
             (["python3", "-m", "scripts.production.gate", "--affected", "--full"], StepJob("test-all")),
             (["python3", "-m", "scripts.production.gate", "--affected", "--module=a"],
              StepJob("test-modules", modules=1)),
-            (["merge_gate.py", "--affected"], StepJob("test-affected")),
-            (["python3", "-c", "pass", "gate.py"], OTHER_COMMAND),
+            (["merge_gate.py", "--affected"], OTHER_COMMAND),
             (["python3", "tool.py", "gate.py", "--affected"], OTHER_COMMAND),
             (["verify.sh", "--session-dir", "/session", "lint"], StepJob("lint")),
             (["bash", "verify.sh", "test", "hana"], StepJob("test")),
-            (["python3", "-c", "pass", "merge_gate.py"], OTHER_COMMAND),
-            (["python3", "-cpass", "merge_gate.py"], OTHER_COMMAND),
-            (["python3", "-Bc", "pass", "merge_gate.py"], OTHER_COMMAND),
-            (["python3", "-", "merge_gate.py"], OTHER_COMMAND),
+            (["python3", "-c", "pass", "gate.py"], OTHER_COMMAND),
+            (["python3", "-cpass", "gate.py"], OTHER_COMMAND),
+            (["python3", "-Bc", "pass", "gate.py"], OTHER_COMMAND),
+            (["python3", "-", "gate.py"], OTHER_COMMAND),
             (["bash", "-c", "true", "verify.sh"], OTHER_COMMAND),
-            (["python3", "-Xdev", "-mscripts.production.merge_gate", "--nightly"], StepJob("test-nightly")),
-            (["python3", "-u", "-W", "ignore", "merge_gate.py", "--tests-only", "--full"], StepJob("test-all")),
-            (["python3", "tool.py", "merge_gate.py"], OTHER_COMMAND),
+            (["python3", "-Xdev", "-mscripts.production.gate", "--nightly"], StepJob("test-nightly")),
+            (["python3", "-u", "-W", "ignore", "gate.py", "--tests-only", "--full"], StepJob("test-all")),
+            (["python3", "tool.py", "gate.py"], OTHER_COMMAND),
             (["cargo", "build"], OTHER_COMMAND),
         ):
             with self.subTest(command=command):
@@ -2020,8 +2019,8 @@ process.stdout.write(JSON.stringify({
         accepted = re.search(r'^case "\$CMD" in\n    ([\w|-]+)\) ;;', script.read_text(), re.MULTILINE)
         assert accepted is not None
         verbs = set(accepted[1].split("|"))
-        jobs = (("merge_gate.py",), ("merge_gate.py", "--tests-only"), ("merge_gate.py", "--nightly"),
-                ("merge_gate.py", "--promote-only"), ("targeted_test.py",), ("targeted_test.py", "--module", "test_sample"))
+        jobs = (("gate.py",), ("gate.py", "--tests-only"), ("gate.py", "--nightly"),
+                ("gate.py", "--promote-only"), ("targeted_test.py",), ("targeted_test.py", "--module", "test_sample"))
         recorded_jobs: list[str] = []
         for command in jobs:
             job = command_job(command)
@@ -2771,7 +2770,7 @@ process.stdout.write(JSON.stringify({
                         self.assertEqual(row.get("changes", ""), names.changes(job) if isinstance(job, StepJob) and about else "")
 
         copied = ("python3", "/repo/scripts/copies/copies.py", "run", "--repo=/repo", "--",
-                  "python3", "/repo/scripts/production/merge_gate.py", "--tests-only", "--full")
+                  "python3", "/repo/scripts/production/gate.py", "--tests-only", "--full")
         for step in ("gate", "merge-gate"):
             with self.subTest(step=step):
                 page = self.gate_job_page(step, copied)

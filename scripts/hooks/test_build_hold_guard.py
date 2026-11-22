@@ -26,16 +26,15 @@ GATE_COMMANDS = (
     "python3 gate.py --tests-only",
     "python3.13 -u '/work tree/gate.py' --affected",
     "scripts/lib/py scripts/production/gate.py --affected",
-    "python3 merge_gate.py --tests-only",
-    "/usr/bin/python3 scripts/production/merge_gate.py --promote-only",
-    "python3.13 -u '/work tree/merge_gate.py' --repo /repo",
-    "~/.claude/scripts/lib/py ~/.claude/scripts/production/merge_gate.py --repo /repo",
-    "scripts/lib/py scripts/production/merge_gate.py",
-    "./merge_gate.py --help",
-    "/any/path/merge_gate.py --tests-only",
-    '"/work tree/merge_gate.py" --promote-only',
-    "bash -lc 'python3 merge_gate.py --tests-only'",
-    "env CHECK=1 python3 -W ignore -X dev -- merge_gate.py --help",
+    "/usr/bin/python3 scripts/production/gate.py --promote-only",
+    "python3.13 -u '/work tree/gate.py' --repo /repo",
+    "~/.claude/scripts/lib/py ~/.claude/scripts/production/gate.py --repo /repo",
+    "scripts/lib/py scripts/production/gate.py",
+    "./gate.py --help",
+    "/any/path/gate.py --tests-only",
+    '"/work tree/gate.py" --promote-only',
+    "bash -lc 'python3 gate.py --tests-only'",
+    "env CHECK=1 python3 -W ignore -X dev -- gate.py --help",
 )
 GATE_REFUSAL = REFUSAL + " This run waits for the hold to end. Run it after the release."
 
@@ -70,7 +69,7 @@ class BuildHoldGuardTest(TemporaryGuardTest):
         self.hold()
         self.codex_unit("other", "stale-session")
         for command in (["cargo", "check"], ["/bin/bash", "-lc", "verify.sh check"],
-                        ["python3", "scripts/production/merge_gate.py", "--tests-only"]):
+                        ["python3", "scripts/production/gate.py", "--tests-only"]):
             with self.subTest(command=command):
                 self.assertEqual(self.run_hook(command, session="codex-thread"), "")
 
@@ -79,7 +78,7 @@ class BuildHoldGuardTest(TemporaryGuardTest):
         # The marker must take priority even when the worker inherits the holder's id.
         self.codex_unit("another-director", "other")
         for command, reason in ((["cargo", "check"], REFUSAL),
-                                (["python3", "scripts/production/merge_gate.py", "--tests-only"], GATE_REFUSAL)):
+                                (["python3", "scripts/production/gate.py", "--tests-only"], GATE_REFUSAL)):
             with self.subTest(command=command):
                 response = cast(dict[str, dict[str, str]], json.loads(self.run_hook(command, session="codex-thread")))
                 self.assertEqual(response, {"hookSpecificOutput": {
@@ -107,15 +106,15 @@ class BuildHoldGuardTest(TemporaryGuardTest):
     def test_merge_gate_mentions_are_allowed_during_a_hold(self) -> None:
         self.hold()
         for command in (
-            "echo 'python3 merge_gate.py --tests-only'",
-            "printf '%s' 'scripts/lib/py scripts/production/merge_gate.py'",
-            "rg 'merge_gate.py' scripts",
-            "cat <<'EOF' > notes.md\npython3 merge_gate.py --tests-only\nEOF\n",
-            "cat <<EOF > notes.md\n./merge_gate.py --promote-only\nEOF\n",
-            "python3 -c \"print('merge_gate.py')\"",
-            "python3 other.py merge_gate.py",
-            "python3 -W merge_gate.py other.py",
-            "python3 merge_gate.py.bak",
+            "echo 'python3 gate.py --tests-only'",
+            "printf '%s' 'scripts/lib/py scripts/production/gate.py'",
+            "rg 'gate.py' scripts",
+            "cat <<'EOF' > notes.md\npython3 gate.py --tests-only\nEOF\n",
+            "cat <<EOF > notes.md\n./gate.py --promote-only\nEOF\n",
+            "python3 -c \"print('gate.py')\"",
+            "python3 other.py gate.py",
+            "python3 -W gate.py other.py",
+            "python3 merge_gate.py --tests-only",
             "python3 cloud_gate.py --tests-only",
             "python3 gate_box.py --tests-only",
             "python3 gate.py.bak",
@@ -124,7 +123,7 @@ class BuildHoldGuardTest(TemporaryGuardTest):
         ):
             with self.subTest(command=command):
                 self.assertEqual(self.run_hook(command), "", command)
-        self.assert_denied("echo 'merge_gate.py'; cargo build")
+        self.assert_denied("echo 'gate.py'; cargo build")
 
     def test_each_cargo_build_with_and_without_toolchain(self) -> None:
         self.hold()
@@ -195,7 +194,7 @@ class BuildHoldGuardTest(TemporaryGuardTest):
         self.assertEqual(self.run_hook("cargo build"), "")
         self.holders.mkdir()
         self.assertEqual(self.run_hook("verify.sh check"), "")
-        self.assertEqual(self.run_hook("python3 merge_gate.py --tests-only"), "")
+        self.assertEqual(self.run_hook("python3 gate.py --tests-only"), "")
 
     def test_holder_is_allowed(self) -> None:
         self.hold("caller")
@@ -221,7 +220,7 @@ class BuildHoldGuardTest(TemporaryGuardTest):
         self.assertFalse((self.holders / "other").exists())
         self.assertEqual(self.run_hook("cargo build"), "")
         self.assertEqual(self.run_hook("verify.sh check"), "")
-        self.assertEqual(self.run_hook("python3 merge_gate.py --tests-only"), "")
+        self.assertEqual(self.run_hook("python3 gate.py --tests-only"), "")
 
     def test_refusal_names_only_in_force_holders(self) -> None:
         self.hold()
@@ -238,7 +237,7 @@ class BuildHoldGuardTest(TemporaryGuardTest):
 
     def test_unreadable_hold_directory_denies_builds_with_its_path(self) -> None:
         self.unreadable()
-        for command in ("cargo build", "python3 merge_gate.py --tests-only"):
+        for command in ("cargo build", "python3 gate.py --tests-only"):
             response = cast(dict[str, dict[str, str]], json.loads(self.run_hook(command)))
             decision = response["hookSpecificOutput"]
             self.assertEqual(decision["permissionDecision"], "deny")
@@ -277,7 +276,7 @@ class BuildHoldGuardTest(TemporaryGuardTest):
     def test_shell_front_matches_the_real_reader(self) -> None:
         self.hold()
         for command, session in (("cargo check", "caller"),
-                                 ("python3 merge_gate.py --tests-only", "caller"),
+                                 ("python3 gate.py --tests-only", "caller"),
                                  ("cargo metadata", "caller"), ("verify.sh check", "caller"),
                                  (["cargo", "check"], "caller")):
             with self.subTest(command=command, session=session):
@@ -349,20 +348,21 @@ exit "$GUARD_STATUS"
         for has_directory in (False, True):
             if has_directory:
                 self.holders.mkdir()
-            for command in ("cargo build", "python3 merge_gate.py --tests-only"):
+            for command in ("cargo build", "python3 gate.py --tests-only"):
                 raw = json.dumps({"tool_name": "Bash", "tool_input": {"command": command}})
                 self.assert_no_python(raw)
 
     def test_no_build_text_starts_no_python_during_hold(self) -> None:
         self.hold()
-        for command in ("pwd", "verify.sh check", "bash verify.sh --session-dir run lint"):
+        for command in ("pwd", "verify.sh check", "bash verify.sh --session-dir run lint",
+                        "python3 merge_gate.py --tests-only", "python3 cloud_gate.py --tests-only"):
             self.assert_no_python(json.dumps({"tool_name": "Bash", "tool_input": {"command": command}}))
 
     def test_same_stdin_output_and_status_are_relayed(self) -> None:
         self.hold()
         os.environ["GUARD_OUTPUT"] = 'deny output\n'
         os.environ["GUARD_STATUS"] = "7"
-        for command in ("cargo build", "python3 merge_gate.py --tests-only"):
+        for command in ("cargo build", "python3 gate.py --tests-only"):
             for ending in ("", "\n\n"):
                 raw = json.dumps({"tool_name": "Bash", "tool_input": {"command": command}}) + ending
                 done = self.run_front(raw)

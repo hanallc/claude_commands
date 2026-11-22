@@ -225,7 +225,7 @@ Other pushers release their holds before tests, validation, Mac pulls, and CI wa
 | `merge_checkpoint.promote_local_checkout` | Main fetch, fast-forward, and eligible push. |
 | `models_registry.store_registry` | Main publication, including fetch, row replay, commit, and push retries. It takes the main lock before the registry lock. |
 | `main_publish.ready` and `main_publish.push` | Separate short holds for preparation and publication. |
-| `merge_gate.promote` | Fetch, ancestry checks, fast-forward, and push after the hold and release waits. |
+| `gate.promote` | Fetch, ancestry checks, fast-forward, and push after the hold and release waits. |
 | `production_lifecycle.promote_main` | Fetch, main checks, and direct or local promotion after CI checks. |
 | `push_direct.sh` | Main publication checks and push through the shell entry. |
 | `restore_unreleased.sh` | Main push through the shell entry after changelog edits and commit. |
