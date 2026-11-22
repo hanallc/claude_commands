@@ -20,13 +20,14 @@ from scripts.build_targets.execution_transport import HanaControlTransport, Hana
 from scripts.buildlog import charts, repository, store
 from scripts.lib import conf
 from scripts.lint.memory_admit import gpu_test_reservation, repository_run_owner, reserved_repository_runs
-from scripts.mac_test import claim_state
+from scripts.mac_test import claim_state, mac_test
 
 WORDS: Mapping[str | type[object], str] = {
     "title": "Build limits",
     "table": "Build limits by repository and machine",
     "repository": "Repository",
     "local": "natedev",
+    "mac": "Mac",
     "aws": "AWS",
     "not_available": "Not available",
     "count": "{used} of {limit}",
@@ -42,6 +43,7 @@ WORDS: Mapping[str | type[object], str] = {
     "memory": "Memory for builds",
     "gpu": "GPU tests",
     "disk": "Free disk",
+    "mac_disk": "Disk for builds",
     "cloud": "Places",
     "money": "Money today",
     "minimum_value": "{used} · {limit} minimum",
@@ -52,6 +54,7 @@ WORDS: Mapping[str | type[object], str] = {
     "estimate": "estimate",
     "free": "Free",
     "in_use": "In use",
+    "on": "On",
     "held": "Held",
     "held_until": "Held until {time}",
     "unreachable": "Unreachable",
@@ -114,6 +117,7 @@ class RepositoryRow:
     owner: str = ""
     quiet: bool = True
     natedev: Cell = field(default_factory=Cell)
+    mac: Cell = field(default_factory=Cell)
     aws: Cell = field(default_factory=Cell)
 
 
@@ -128,12 +132,61 @@ class MachineLimits:
 @dataclass(frozen=True)
 class BuildLimits:
     natedev: MachineLimits
+    mac: MachineLimits
     aws: MachineLimits
     repositories: tuple[RepositoryRow, ...]
     history_unavailable: bool
     history_stale: bool
     unplaced: dict[str, list[str]]
     words: Mapping[str, str] = field(default_factory=lambda: PAGE_WORDS)
+
+
+@dataclass(frozen=True)
+class MacClaim:
+    record: claim_state.RunRecord
+    limit: int | None
+
+
+@dataclass(frozen=True)
+class MacReading:
+    target: str
+    state: targets.TargetState
+    claims: tuple[MacClaim, ...]
+    disk_floor: float | None
+
+
+def read_mac(snapshots: target_availability.Snapshots) -> MacReading | None:
+    """Read Mac claim capacity from the same records and reader as admission."""
+    if isinstance(snapshots, target_availability.SnapshotsUnreadable):
+        return None
+    for snapshot in snapshots:
+        target = snapshot.target
+        if isinstance(target, target_config.SshTarget) and target.platform == "macos":
+            break
+    else:
+        return None
+    claims: dict[claim_state.ClaimIdentity, MacClaim] = {}
+    capacities: dict[tuple[str, str], int | None] = {}
+    paths = claim_state.StatePaths(target_config.ssh_target_state_directory(target.name), target.name,
+                                  registry_selected=True, platform=target.platform)
+    settings = conf.read(target.settings)
+    try:
+        disk_floor = settings.number("free_floor_gib")
+    except conf.Unusable:
+        disk_floor = None
+    for claim in snapshot.claims:
+        record = claim.record
+        if not mac_test.run_is_live(record):
+            continue
+        name, key = record.get("repo_name", ""), record.get("repo_key", "")
+        if name and (name, key) not in capacities:
+            try:
+                capacities[name, key] = mac_test.slot_capacity(
+                    paths, claim_state.RepositoryScope(name, key), configuration=settings)
+            except conf.Unusable:
+                capacities[name, key] = None
+        claims[claim_state.claim_identity(record)] = MacClaim(record, capacities.get((name, key)))
+    return MacReading(target.name, snapshot.states[0], tuple(claims.values()), disk_floor)
 
 
 def recorded_origin(identity: str) -> str:
@@ -347,11 +400,11 @@ def visible_waits(model: queue_view.QueueModel, local_names: Mapping[int, str],
     return tuple(waits)
 
 
-def wait_text(reason: records.WaitReason | wire.CloudSlotWait) -> str:
+def wait_text(reason: records.WaitReason | wire.CloudSlotWait, *, machine: str = "") -> str:
     if isinstance(reason, records.HeadAdmissionStatus):
         reason = reason.cause
     if isinstance(reason, records.RunLimitWait):
-        return WORDS[records.RunLimitWait].format(repository=reason.repository, machine=reason.machine)
+        return WORDS[records.RunLimitWait].format(repository=reason.repository, machine=machine or reason.machine)
     if isinstance(reason, records.BehindHead) and reason.head_name == "remote startup":
         return WORDS["remote_start"]
     if isinstance(reason, wire.CloudSlotWait) and isinstance(reason.state, ReservedCloudSlot):
@@ -381,9 +434,23 @@ def local_state(snapshots: target_availability.Snapshots, machine: str, active: 
     return WORDS["not_available"] if isinstance(snapshots, target_availability.SnapshotsUnreadable) else ""
 
 
+def mac_state(mac: MacReading | None, snapshots: target_availability.Snapshots, zone: tzinfo) -> str:
+    if mac is None:
+        return WORDS["not_available"] if isinstance(snapshots, target_availability.SnapshotsUnreadable) else ""
+    state = mac.state
+    if isinstance(state, targets.Held):
+        if isinstance(state.end, targets.ExpiresAt):
+            return WORDS["held_until"].format(time=targets.clock(state.end.when, zone))
+        return WORDS["held"]
+    if isinstance(state, targets.StateUnreadable):
+        return WORDS["not_available"]
+    return WORDS["on"] if isinstance(state, (targets.Free, targets.Running)) else ""
+
+
 def build_limits(reading: records.QueueRead, snapshots: target_availability.Snapshots,
                  waits: Sequence[VisibleWait], cloud_names: Mapping[wire.Owner, str],
-                 names: Mapping[str, str], saved: Background, zone: tzinfo) -> BuildLimits:
+                 names: Mapping[str, str], saved: Background, zone: tzinfo, *,
+                 mac: MacReading | None = None) -> BuildLimits:
     explanation = reading.explanation
     inputs = explanation.decided_from
     policy = explanation.policy.repository_runs
@@ -392,6 +459,7 @@ def build_limits(reading: records.QueueRead, snapshots: target_availability.Snap
     history = saved.history if isinstance(saved.history, frozenset) else ()
     rows: dict[str, RepositoryRow] = {}
     local_waits: dict[str, list[str]] = {}
+    mac_waits: dict[str, list[str]] = {}
     aws_waits: dict[str, list[str]] = {}
     unplaced: dict[str, list[str]] = {}
     metric_waits: dict[str, dict[str, list[str]]] = {}
@@ -405,6 +473,20 @@ def build_limits(reading: records.QueueRead, snapshots: target_availability.Snap
 
     for origin in history:
         _ = row(origin)
+    mac_unattributed = 0
+    if mac is not None:
+        for claim in mac.claims:
+            record = claim.record
+            origin = origins.resolve(record.get("repo_key", ""), record["worktree"])
+            if not origin:
+                mac_unattributed += 1
+                continue
+            cell = row(origin).mac
+            cell.used = (cell.used or 0) + 1
+            if claim.limit is not None:
+                cell.limit = claim.limit
+            if name := names.get(record["submitting_session"]):
+                cell.runs.append(name)
     prefix = local + "."
     seen: set[str] = set()
     unattributed = 0
@@ -450,6 +532,7 @@ def build_limits(reading: records.QueueRead, snapshots: target_availability.Snap
             continue
         step = entry.step
         reason = step.reason.cause if isinstance(step.reason, records.HeadAdmissionStatus) else step.reason
+        machine_name = ""
         if isinstance(reason, records.RunLimitWait) and reason.machine == local:
             waiter = ordered.get((step.pid, step.since))
             key = origins.resolve(waiter.get("repo_identity", "") if waiter is not None else "", step.folder)
@@ -460,6 +543,19 @@ def build_limits(reading: records.QueueRead, snapshots: target_availability.Snap
                 destination = cell.waits
             else:
                 destination = unbound_waits.setdefault(reason.repository, {})
+        elif mac is not None and (
+                isinstance(step.route, target_config.MacOnly)
+                or isinstance(step.route, target_config.PinnedTarget) and step.route.target == mac.target
+                or isinstance(reason, records.RunLimitWait) and reason.machine == mac.target):
+            destination = mac_waits
+            if isinstance(reason, records.RunLimitWait) and reason.machine == mac.target:
+                machine_name = WORDS["mac"]
+                waiter = ordered.get((step.pid, step.since))
+                if origin := origins.resolve(waiter.get("repo_identity", "") if waiter is not None else "", step.folder):
+                    cell = row(origin).mac
+                    if cell.limit is None:
+                        cell.limit = reason.limit
+                    destination = cell.waits
         elif isinstance(step.route, target_config.PinnedTarget) and step.route.target in saved.aws_targets:
             destination = aws_waits
         elif (isinstance(step.route, target_config.MacOnly)
@@ -473,7 +569,7 @@ def build_limits(reading: records.QueueRead, snapshots: target_availability.Snap
             destination = metric_waits.setdefault("memory", {})
         else:
             destination = local_waits
-        destination.setdefault(wait_text(step.reason), []).append(visible.name)
+        destination.setdefault(wait_text(reason, machine=machine_name), []).append(visible.name)
 
     occupancy = reserved_repository_runs(inputs, policy)
     ambiguous = Counter(origin for bound in policy_rows.values() for origin in bound)
@@ -539,7 +635,7 @@ def build_limits(reading: records.QueueRead, snapshots: target_availability.Snap
         if counts[item.name] > 1:
             namespace = urlsplit(origin).path.strip("/").split("/")[:-1]
             item.owner = "/".join(namespace)
-        for cell in (item.natedev, item.aws):
+        for cell in (item.natedev, item.mac, item.aws):
             if cell.limit is None:
                 cell.runs.extend(cell.other)
                 cell.used = (cell.used or 0) + cell.other_used
@@ -565,8 +661,10 @@ def build_limits(reading: records.QueueRead, snapshots: target_availability.Snap
     aws_state = WORDS["in_use"] if cloud_used or any(hana.used for hana in saved.hana) else ""
     cloud = Metric("cloud", cloud_used, cloud_slots, waits=metric_waits.get("cloud", {}),
                    unreadable=cloud_slots is None and not cloud_recorded)
+    mac_metrics = (Metric("mac_disk", None, mac.disk_floor, "GiB", "minimum"),) if mac and mac.disk_floor is not None else ()
     return BuildLimits(MachineLimits(local_state(snapshots, local, bool(inputs.reservations), zone),
                                     (*limits, *unbound), local_waits, unattributed),
+                       MachineLimits(mac_state(mac, snapshots, zone), mac_metrics, mac_waits, mac_unattributed),
                        MachineLimits(aws_state, (cloud, saved.aws_money), aws_waits, len(aws_unattributed)),
                        tuple(sorted(rows.values(), key=lambda item: (item.quiet, item.name.casefold(), item.owner.casefold()))),
                        isinstance(saved.history, charts.IndexUnavailable), saved.history_stale, unplaced)

@@ -1,13 +1,14 @@
 """Check the Build limits section with published records and private fixture settings."""
 from __future__ import annotations
 
+import os
 import sqlite3
 import subprocess
 import tempfile
 import unittest
 from contextlib import closing
 from dataclasses import replace
-from datetime import UTC
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest import mock
 
@@ -17,12 +18,12 @@ from scripts.build_queue.admission_wire import ReservedCloudSlot
 from scripts.build_queue.cloud_progress import NoCloudProgress
 from scripts.build_queue.progress_profile import NoCounter
 from scripts.build_queue.queue_fixture import fixture_reservation, head_reading
-from scripts.build_targets import target_config
+from scripts.build_targets import target_config, targets
 from scripts.build_targets.execution_transport import HanaControlTransport
 from scripts.buildlog import repository, store
 from scripts.lib.git_test_support import commit_repository, fixture_git_environment
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
-from scripts.mac_test import claim_state
+from scripts.mac_test import claim_state, mac_test
 
 
 class BuildLimitsTests(unittest.TestCase):
@@ -61,6 +62,9 @@ class BuildLimitsTests(unittest.TestCase):
                 history = limits_view.recent_steps(index, now, origins)
                 self.assertEqual(git_read.call_count, 1)
             self.assertEqual(origins.folders[str(scratch)], primary)
+            mac_snapshot = self.read_mac_fixture(root, scratch)
+            mac = limits_view.read_mac((mac_snapshot,))
+            self.assertIsNotNone(mac)
         policy = records.RepositoryRunLimits({"natedev.project": 1, "natedev.other": 2}, "merge-owner")
         reservations = (
             {**fixture_reservation(101, 0, step="gate"), "repo": "project", "repo_identity": primary, "unit": "regular"},
@@ -77,7 +81,11 @@ class BuildLimitsTests(unittest.TestCase):
             records.WaitingStep(3, "", "", "test", "", now, 0, records.NeedsMemory()),
             records.WaitingStep(4, "", "", "check", "", now, 0, records.ReadingUnavailable(),
                                 route=target_config.PinnedTarget("fixture-aws")),
-            records.WaitingStep(5, "", "", "check", "", now, 0, records.ReadyForAdmission(), route=target_config.MAC_ONLY),
+            records.WaitingStep(5, "", "", "check", "", now, 0, records.ReadingUnavailable(), route=target_config.MAC_ONLY),
+            records.WaitingStep(8, "", "", "test", str(scratch), now, 0, records.RunLimitWait(9, 9, "project", "mac"),
+                                route=target_config.PinnedTarget("mac")),
+            records.WaitingStep(9, "", "", "test", "", now, 0, records.ReadyForAdmission(),
+                                route=target_config.PinnedTarget("other-mac")),
         )
         cloud = tuple(wire.CloudRow(wire.Owner(pid, str(pid)), wire.Identity("", "", "gate", "", ""), wire.CloudPlace("aws"),
             now, 0, NoCloudProgress(), NoCounter(), reason) for pid, reason in (
@@ -88,7 +96,8 @@ class BuildLimitsTests(unittest.TestCase):
                                         "repo_identity": primary, "order": records.NormalOrder()}
         queue = wire.CloudQueueRead(replace(reading.view, waiting=waiting), explanation, [(Path("one"), ranked)],
                                     cloud=cloud, cloud_slots=4, cloud_gate_stale_pushes=1)
-        names = {1: "Run limit", 2: "Disk wait", 3: "Memory wait", 4: "AWS target wait", 5: "Unplaced wait"}
+        names = {1: "Run limit", 2: "Disk wait", 3: "Memory wait", 4: "AWS target wait",
+                 5: "Mac wait", 6: "Mac run limit", 7: "Unplaced wait"}
         cloud_names = {cloud[0].owner: "Cloud wait", cloud[1].owner: "Starting wait"}
         waits = limits_view.visible_waits(queue_view.QueueModel(queue, {}), names, cloud_names)
         saved = limits_view.Background(history, limits_view.Metric("money", 2, 5, "USD", "estimate"),
@@ -96,7 +105,8 @@ class BuildLimitsTests(unittest.TestCase):
             aws_targets=frozenset({"fixture-aws"}), origins=origins)
 
         with mock.patch.object(repository, "output", side_effect=AssertionError("Git read in the feed tick")):
-            shown = limits_view.build_limits(queue, (), waits, cloud_names, {}, saved, UTC)
+            shown = limits_view.build_limits(queue, (mac_snapshot,), waits, cloud_names,
+                                             {"session": "Mac build"}, saved, UTC, mac=mac)
         self.assertEqual([(row.name, row.owner, row.quiet) for row in shown.repositories], [
             ("hana", "", False), ("project", "team", False), ("project", "other", True), ("quiet", "", True),
         ])
@@ -110,6 +120,14 @@ class BuildLimitsTests(unittest.TestCase):
         self.assertEqual(shown.natedev.shared[-1].label, "other run limit")
         self.assertEqual(shown.natedev.shared[-1].limit, 2)
         self.assertEqual((hana_row.aws.used, hana_row.aws.limit), (None, 1))
+        self.assertEqual(shown.mac.state, "Held until 13:00 UTC")
+        self.assertEqual(shown.mac.shared, (limits_view.Metric("mac_disk", None, 47, "GiB", "minimum"),))
+        self.assertEqual(shown.mac.unattributed, 1)
+        self.assertEqual(shown.mac.waits, {"The queue cannot check whether this run can start.": ["Mac wait"]})
+        self.assertEqual((project_row.mac.used, project_row.mac.limit, project_row.mac.runs), (1, 1, ["Mac build"]))
+        self.assertEqual(project_row.mac.waits, {"The run limit for project on Mac is full.": ["Mac run limit"]})
+        self.assertIsNone(spare_project.mac.limit)
+        self.assertIsNone(quiet.mac.limit)
         self.assertEqual(next(metric for metric in shown.natedev.shared if metric.label == "disk").waits,
                          {"The build disk has less free space than the queue requires.": ["Disk wait"]})
         self.assertEqual(shown.natedev.shared[0].waits, {"This run needs more free memory to start.": ["Memory wait"]})
@@ -131,6 +149,38 @@ class BuildLimitsTests(unittest.TestCase):
         self.assertEqual(merge_cell.merge_above, [])
         self.assertEqual(merge_cell.runs, ["regular", "merge-owner"])
         self.check_hana_claim(hana)
+
+    def read_mac_fixture(self, root: Path, scratch: Path) -> targets.TargetSnapshot:
+        settings = root / "mac.conf"
+        _ = settings.write_text("# range: 1..1000\nfree_floor_gib=47\n", encoding="utf-8")
+        _ = (root / "build_targets.conf").write_text(
+            "targets=mac\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac.conf\n", encoding="utf-8")
+        state = root / "state"
+        claims = state / "claims"
+        claims.mkdir(parents=True)
+        since = datetime(2026, 11, 22, 12, tzinfo=UTC)
+        block = claim_state.ActiveMacBlock("holder", "private reason", since, since + timedelta(hours=1),
+            claim_state.HolderQueue("holder"), claim_state.NoShowrunner(), "not_configured",
+            claim_state.FreeMessageNotNeeded())
+        mac_test.write_block(state / "block.json", block)
+        saved: claim_state.RemoteJobClaim = {"claim_id": "project-claim", "episode": "episode", "attempt": "attempt",
+            "submitting_session": "session", "pid": 9, "proc_start": "", "what": "test", "worktree": str(scratch),
+            "since": since.isoformat(), "repo_name": "project", "repo_key": "", "remote_host": "fixture-host"}
+        mac_test.write_json(claims / "e5870be3.json", saved)
+        mac_test.write_json(claims / "copied-record.json", saved)
+        other: claim_state.RemoteJobClaim = {**saved, "claim_id": "whole-claim", "worktree": "private relative folder"}
+        del other["repo_name"], other["repo_key"]
+        mac_test.write_json(state / "run.json", other)
+        dead: claim_state.ProcessBoundClaim = {"claim_id": "dead", "episode": "episode", "attempt": "attempt",
+            "submitting_session": "", "pid": 2**30, "proc_start": "", "what": "check", "worktree": str(scratch),
+            "since": since.isoformat(), "repo_name": "project", "repo_key": ""}
+        mac_test.write_json(claims / "dead.json", dead)
+        with (mock.patch.dict(os.environ, {"CONF_DIR": str(root), "MAC_TEST_STATE_DIR": str(state)}),
+              mock.patch.object(mac_test, "holder_name", return_value="holder"),
+              mock.patch.object(targets, "utc_now", return_value=since)):
+            snapshot = targets.ssh_target_snapshot(target_config.configured_ssh_target("mac"))
+        self.assertIsInstance(snapshot.states[0], targets.Held, str(snapshot.states[0]))
+        return snapshot
 
     def check_hana_claim(self, origin: str) -> None:
         transport = HanaControlTransport(Path("private-hana.conf"), "fixture-host")

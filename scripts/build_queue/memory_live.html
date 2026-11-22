@@ -69,7 +69,7 @@ __PAGE_FRAME_STYLE__
 .legend-box > summary .name { font-weight: 600; color: var(--ink-2); }
 #build-limits > summary .name { color: var(--ink); }
 .build-limits-scroll { overflow-x: auto; margin-top: 9px; }
-.build-limits-table { width: 100%; min-width: 720px; border-collapse: collapse; table-layout: fixed; font-size: .875rem; }
+.build-limits-table { width: 100%; min-width: 910px; border-collapse: collapse; table-layout: fixed; font-size: .875rem; }
 .build-limits-table th, .build-limits-table td { padding: 11px 14px; border: 1px solid var(--line); text-align: left; vertical-align: top; }
 .build-limits-table thead th { background: color-mix(in srgb, var(--line) 25%, var(--card)); }
 .build-limits-table thead th:first-child { width: 17%; }
@@ -1338,15 +1338,18 @@ function renderBuildLimits(limits) {
   section.hidden = false;
   if (!section.open) return;
   const container = $("build-limits-content");
-  const machines = [[words.local, limits.natedev], [words.aws, limits.aws]];
-  const headings = machines.map(([name, data]) => `<th scope="col">${esc(name)}
+  const machines = [["natedev", words.local], ["mac", words.mac], ["aws", words.aws]].filter(([key]) => limits[key]);
+  const headings = machines.map(([key, name]) => {
+    const data = limits[key];
+    return `<th scope="col">${esc(name)}
     ${data.state ? `<span class="build-limit-state">${esc(data.state)}</span>` : ""}
     ${data.unattributed ? `<div class="build-limit-note">${esc(limitWords(words, "other_running", {count: data.unattributed}))}</div>` : ""}
     ${data.shared.map(metric => limitMetric(metric, words)).join("")}
-    ${limitWaits(data.waits, words)}</th>`).join("");
+    ${limitWaits(data.waits, words)}</th>`;
+  }).join("");
   const rows = limits.repositories.map(row =>
     `<tr${row.quiet ? ' class="quiet"' : ""}><th scope="row">${esc(row.name)}${row.owner ? `<small>${esc(row.owner)}</small>` : ""}</th>
-      <td>${limitCell(row.natedev, words)}</td><td>${limitCell(row.aws, words)}</td></tr>`).join("");
+      ${machines.map(([key]) => `<td>${limitCell(row[key], words)}</td>`).join("")}</tr>`).join("");
   const legend = [["run", "legend_run"], ["free", "legend_free"], ["line", "legend_line"],
     ["merge", "merge_above"], ["wait", "legend_wait"]];
   const html = `<div class="build-limits-scroll"><table class="build-limits-table" aria-label="${esc(words.table)}">
