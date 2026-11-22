@@ -1583,12 +1583,15 @@ admit_verify_run() {
     PLACEMENT_CLIENT_ACTIVE=1
     [[ $- != *m* ]] || monitor=1
     set -m
-    if [[ -p "/proc/$$/fd/2" || -c "/proc/$$/fd/2" ]]; then
-        verify_helper --require-helper "${request[@]}" </dev/null &
-    else
-        # Relay diagnostics through a pipe to keep the caller's file offset.
-        ( verify_helper --require-helper "${request[@]}" </dev/null 2>&1 >/dev/null | cat >&2 ) &
-    fi
+    (
+        [[ -z "${VERIFY_EXIT_STDERR_FD:-}" ]] || close_verify_exit_stderr
+        if [[ -p "/proc/$$/fd/2" || -c "/proc/$$/fd/2" ]]; then
+            verify_helper --require-helper "${request[@]}" </dev/null
+        else
+            # Relay diagnostics through a pipe to keep the caller's file offset.
+            verify_helper --require-helper "${request[@]}" </dev/null 2>&1 >/dev/null | cat >&2
+        fi
+    ) &
     HOLD_WAITER_PID=$!
     if [[ "$monitor" == 0 ]]; then set +m; fi
     wait "$HOLD_WAITER_PID" || status=$?
