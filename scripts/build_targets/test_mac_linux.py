@@ -266,10 +266,7 @@ class MacLinuxRouteTests(unittest.TestCase):
         config = self.root / 'config'
         config.mkdir()
         self.registry = config / 'build_targets.conf'
-        _ = self.registry.write_text(
-            'targets=natedev\nkind.mac-linux=ssh\nplatform.mac-linux=linux\nsettings.mac-linux=mac_linux.conf\n'
-            + 'enabled.mac-linux=on\n',
-            encoding='utf-8')
+        _ = write_config_fixture(self.registry, 'enabled.mac-linux=on\n')
         _ = (config / 'mac_linux.conf').write_text(
             f'ssh.hops=fixture-mac fixture-guest\nguest.user={account}\ntest.jobs=2\n'
             + f'run.time_limit_seconds=7\n{mac_linux.UNREACHABLE_WAIT_KEY}=20\n',
@@ -373,7 +370,8 @@ fi
         self.assertEqual(self.route(), 'mac-linux is off (build_targets.conf enabled.mac-linux=off)')
         self.assert_guest_clean()
 
-    def test_free_now_reads_the_mac_linux_probe_backoff(self) -> None:
+    def test_free_now_reads_the_probe_backoff_for_a_registered_guest(self) -> None:
+        _ = write_config_fixture(self.registry, 'pinned_targets=hana-gpu,mac-linux\n')
         paths = mac_test.state_paths(mac_linux.TARGET)
         configuration = self.registry.with_name('mac_linux.conf')
         self.assertEqual(mac_test.free_now(paths, configuration, self.repo), 'free')
@@ -387,6 +385,28 @@ fi
         self.assertIs(eligibility.read_backoff(now), eligibility.NO_BACKOFF)
         self.assertEqual(mac_test.free_now(paths, configuration, self.repo), 'backoff')
         self.assertEqual(self.route(), f'{mac_linux.TARGET}: guest unreachable during retry backoff')
+        self.assert_guest_clean('probe')
+
+    def test_route_records_backoff_for_a_guest_outside_the_placement_lists(self) -> None:
+        registry = conf.read(self.registry)
+        for key in ('targets', 'pinned_targets'):
+            self.assertNotIn(mac_linux.TARGET, registry.text(key).split(','))
+
+        now = time.time()
+        with patch.object(mac_linux, 'time', return_value=now):
+            result = self.route('offline')
+            self.assertIn('fixture SSH refused the connection', str(result))
+            backoff = self.root / 'target-state' / mac_linux.TARGET / 'unreachable_until'
+            self.assertAlmostEqual(float(backoff.read_text()), now + 30, places=5)
+            self.assertEqual(self.route(), f'{mac_linux.TARGET}: guest unreachable during retry backoff')
+        self.assert_guest_clean('probe')
+
+    def test_backoff_write_error_keeps_the_probe_failure(self) -> None:
+        _ = (self.root / 'target-state').write_text('This file blocks creation of the state directory.\n')
+        reason = str(self.route('offline'))
+        self.assertIn('fixture SSH refused the connection', reason)
+        self.assertIn(f'Cannot record the {mac_linux.TARGET} backoff:', reason)
+        self.assertIn('Not a directory', reason)
         self.assert_guest_clean('probe')
 
     def test_unreachable_wait_refuses_a_missing_key_without_a_committed_value(self) -> None:

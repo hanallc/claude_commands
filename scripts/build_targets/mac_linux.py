@@ -724,8 +724,8 @@ def transfer_source(repo: Path, settings: GuestSettings, source: CandidateSource
 
         try:
             delay = conf.read('mac_test').number('unreachable_backoff_s')
-            offload.write_backoff(time() + delay, TARGET)
-        except conf.Unusable as backoff_error:
+            offload.write_backoff(time() + delay, TARGET, strict=True)
+        except (conf.Unusable, OSError) as backoff_error:
             error.add_note(f'Cannot record the {TARGET} backoff: {backoff_error}')
         raise
     with bundle_refs(repo, source, request['attempt']) as prefix:

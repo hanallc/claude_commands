@@ -277,7 +277,8 @@ def comma_values(value: str) -> set[str]:
 
 
 def backoff_path(target: str = "mac") -> Path:
-    return state_directory(target) / "unreachable_until"
+    directory = ssh_target_state_directory(target) if target == MAC_LINUX_TARGET else state_directory(target)
+    return directory / "unreachable_until"
 
 
 def read_backoff(now: float, target: str = "mac", *, strict: bool = False) -> BackoffState:

@@ -64,6 +64,8 @@ The guest test timer uses `run.time_limit_seconds`.
 The guest and SSH deadlines allow extra time for setup, cleanup, and result transfer.
 When the test timer expires, the gate returns the guest's time-limit report.
 If the first guest probe fails, the route records a retry backoff for `mac-linux`.
+The route reads and writes this record independently of the placement registry.
+If the write fails, the route adds the write error to the probe failure.
 `mac_test.free_now` reads this backoff now.
 Queue placement will read the backoff when item 191 B3 registers `mac-linux` for placement.
 After the SSH transfer ends, `run.unreachable_wait_seconds` limits the wait for the guest to prove the run ended.
