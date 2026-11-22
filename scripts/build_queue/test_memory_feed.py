@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from scripts.review_links.test_page_frame import assert_status_states
-from scripts.build_queue import admission_records, admission_service, placement, queue_evidence
+from scripts.build_queue import admission_records, admission_service, placement, queue_evidence, slot_wait
 from scripts.build_queue import snapshot_codec as codec
 from scripts.build_queue.test_queue_view import with_converted_executions
 
@@ -1968,6 +1968,27 @@ process.stdout.write(JSON.stringify({
                 self.assertEqual(after["used"], before["used"])
                 self.assertEqual(after["waiting"], before["waiting"])
 
+    def test_wrapped_verify_command_names_the_first_call_in_feed_notes(self) -> None:
+        verify = "bash ~/.claude/scripts/direct/verify.sh --session-dir"
+        cases = (
+            ("startup", f"{verify} /fixture/sessions/startup test hana --filter 'name with spaces'",
+             ("hana", "--filter", "name with spaces"), "verify test hana --filter 'name with spaces'"),
+            ("widget", f"direnv allow . >/dev/null; direnv exec . {verify} /fixture/sessions/widget test hana_diegetic; "
+             + f"{verify} /fixture/sessions/widget build hana_diegetic --example scrolling --local test",
+             ("hana_diegetic",), "verify test hana_diegetic"),
+        )
+        for unit, command, arguments, call in cases:
+            with (self.subTest(unit=unit),
+                  mock.patch.object(slot_wait, "verify_package", return_value=arguments[0]) as parse):
+                name, _, facts = slot_wait.command_slot_job(("bash", "-c", command), RECORDED_STEP_NAMES)
+                assert isinstance(name, memory_feed.QueueRowName)
+                step = f"test {arguments[0]}"
+                row = memory_feed.queue_row_labels(name, name, unit=memory_feed.StaffUnitName(unit))
+                self.assertEqual(row["title"], {"unit": unit, "step": step})
+                self.assertEqual(memory_feed.call_notes(facts, name).get("verify"),
+                    {"verb": "test", "call": call, "position": 1, "total": 1, "step": step})
+                parse.assert_called_once_with("test", arguments)
+
     def test_queue_row_name_rejects_shell_words_and_ids_inside_names(self) -> None:
         for name in ("startup bash", "startup /bin/env", "exec -a", "startup $UNIT",
                      "test 556caf6e-713d-47c0-a8fc-5dd5e8c26ce4"):
@@ -2578,6 +2599,14 @@ process.stdout.write(JSON.stringify({
         for reason, expected in cases:
             with self.subTest(reason=type(reason).__name__):
                 self.assertEqual(memory_feed.wait_why(reason), expected)
+
+    def test_builds_page_shows_the_repository_run_limit(self) -> None:
+        wait = admission_records.RunLimitWait(2, 2, "claude_commands", "natedev")
+        reading = with_wait_reason(reservation_reading(), wait)
+        with mock.patch.object(admission_client, "view", return_value=reading):
+            page = memory_feed.reading()
+        row = cast(memory_feed.MemoryWaitRow, page["waiters"][0])
+        self.assertEqual(row["why"], "2 of 2 claude_commands runs on natedev")
 
     def test_mac_idle_alert_reaches_the_feed_and_clears_with_the_watch_state(self) -> None:
         _ = write_config_fixture(self.root / "mac_test.conf", "stale_seconds=300\n")

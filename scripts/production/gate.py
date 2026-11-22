@@ -1112,7 +1112,7 @@ def test_module_environment(root: Path, environment: dict[str, str]) -> dict[str
     tools = root / "build-tool-tripwires"
     tools.mkdir()
     marker = root / "build-tool-calls.jsonl"
-    script = f"""#!{Path(__file__).resolve().parents[1] / "lib/py"}
+    script = f"""#!/usr/bin/env {Path(__file__).resolve().parents[1] / "lib/py"}
 import fcntl, json, sys
 with open({str(marker)!r}, "a") as output:
     fcntl.flock(output, fcntl.LOCK_EX)
@@ -2926,7 +2926,10 @@ def run_gate_suites(repo: Path, type_dirs: Sequence[str] = (),
                             max_jobs=0, peak_mib=0.0, cap_mib=0.0, aborted=False, mode=mode)
             return GateRun((), 0.0, 0.0, selection_certified=True)
 
-    mac_module = mac_gate_process.MAC_GATE_MODULE
+    # Nate ordered the Mac split off on 2026-11-21.
+    return run_cloud(selected)
+
+    mac_module = mac_gate_process.MAC_GATE_MODULE  # pyright: ignore[reportUnreachable]
     try:
         mac = mac_gate_process.load_mac_gate_route(mac_module)
     except ModuleNotFoundError as error:

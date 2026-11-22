@@ -10,6 +10,7 @@ import math
 import os
 import argparse
 import json
+import select
 import shlex
 import signal
 import sys
@@ -1209,19 +1210,22 @@ NO_WORKERS_TO_KEEP_RUNNING: frozenset[StaffId] = frozenset()
 
 def stop_unit_workers(unit: StaffId, record: StaffSnapshot, *,
                       codex: herdr.CodexConversations | None = None,
-                      keep_running: frozenset[StaffId] = NO_WORKERS_TO_KEEP_RUNNING) -> list[str]:
+                      keep_running: frozenset[StaffId] = NO_WORKERS_TO_KEEP_RUNNING,
+                      failures: dict[StaffId, str] | None = None) -> list[str]:
     """Stop the selected workers concurrently and retain every staff row."""
     from scripts.agents import worker_lifecycle
     from scripts.herdr import worker_panes
     from scripts.agents import restart
 
-    if not record.find(kind="worker", parent=unit):
+    members = [row for row in record.find(kind="worker", parent=unit) if row.id not in keep_running]
+    if not members:
         return []
     try:
         deadline = worker_lifecycle.effective_deadline()
         states = [state for state in worker_panes.observe(unit, record) if state.row.id not in keep_running]
-        unresolved = [f"{item.row.name}: {item.reason}" for item in states
-                      if isinstance(item, (worker_panes.ProcessUnknownWorker, worker_panes.UncertainWorker))]
+        failed = {item.row.id: item.reason for item in states
+                  if isinstance(item, (worker_panes.ProcessUnknownWorker, worker_panes.UncertainWorker))}
+        unresolved = [f"{item.row.name}: {failed[item.row.id]}" for item in states if item.row.id in failed]
         live = [item for item in states if isinstance(item, worker_panes.OpenWorker)]
         client = herdr.Herdr(herdr.shared_session())
         shared: StopReadArguments = {"codex": codex} if codex is not None else {}
@@ -1231,9 +1235,14 @@ def stop_unit_workers(unit: StaffId, record: StaffSnapshot, *,
             for item, future in futures:
                 if not future.result():
                     unresolved.append(f"{item.row.name}: not proved stopped")
+                    failed[item.row.id] = "Could not confirm that the worker stopped"
     except (OSError, ValueError, herdr_types.HerdrFailure, SystemExit) as error:
-        unresolved = [f"{unit}: {' '.join(str(error).splitlines())}"]
+        reason = " ".join(str(error).splitlines())
+        unresolved = [f"{unit}: {reason}"]
+        failed = {row.id: reason for row in members}
         print(f"anomaly: {unresolved[0]}", file=sys.stderr)
+    if failures is not None:
+        failures.update(failed)
     return unresolved
 
 
@@ -1523,6 +1532,14 @@ def resume(session: str, *, why: str = "resumed by name", to: str | None = None,
         return ResumeFailed(session, str(error))
     with staff.row_operation(session):
         return _resume(session, why=why, to=to, requester=requester, client=client)
+
+
+def resume_for_upkeep(session: str) -> ResumeResult | None:
+    """Check for a restart while holding the row lock."""
+    with staff.row_operation(session):
+        if shutdown_record.active():
+            return None
+        return resume(session)
 
 
 def resend_producer_opening(name: str, *, to: str = "") -> ResumeResult:
@@ -1964,9 +1981,27 @@ def _watch_resume(identity: str, pane: str, account: str,
 
 
 _STOP_RESUME_PROGRAM = Path(__file__).resolve()
+_DETACHED_START_SECONDS = 15
 
 
-def _detach(arguments: list[str], task: str, *, program: Path = _STOP_RESUME_PROGRAM) -> Path:
+def _launch_mac_with_log(command: list[str], environment: dict[str, str], log_fd: int) -> None:
+    read_fd, ready_fd = os.pipe()
+    try:
+        try:
+            _ = subprocess.Popen([*command, "--ready-fd", str(ready_fd)], env=environment, start_new_session=True,
+                                 stdin=subprocess.DEVNULL, stdout=log_fd, pass_fds=(ready_fd,))
+        finally:
+            os.close(ready_fd)
+        if not select.select([read_fd], [], [], _DETACHED_START_SECONDS)[0]:
+            raise subprocess.TimeoutExpired(command, _DETACHED_START_SECONDS)
+        if not os.read(read_fd, 1):
+            raise OSError("The detached process exited before it confirmed the log claim")
+    finally:
+        os.close(read_fd)
+
+
+def _detach(arguments: list[str], task: str, *, program: Path = _STOP_RESUME_PROGRAM, log: Path | None = None,
+            log_fd: int | None = None) -> Path:
     """Run lifecycle work outside the caller's stop boundary."""
     from scripts.production import showrunners
 
@@ -1976,13 +2011,28 @@ def _detach(arguments: list[str], task: str, *, program: Path = _STOP_RESUME_PRO
         options = ["--requester", requester]
         boundary = arguments.index("--") if "--" in arguments else len(arguments)
         arguments = [*arguments[:boundary], *options, *arguments[boundary:]]
-    logs = shutdown_state_root() / "logs"
-    logs.mkdir(parents=True, exist_ok=True)
-    log = logs / f"{task}-{uuid4().hex}.log"
+    if log is None:
+        logs = shutdown_state_root() / "logs"
+        logs.mkdir(parents=True, exist_ok=True)
+        log = logs / f"{task}-{uuid4().hex}.log"
     environment = dict(os.environ)
     _ = environment.pop("CLAUDE_CODE_SESSION_ID", None)
-    command = [sys.executable, str(program), arguments[0], "--log", str(log), *arguments[1:]]
-    if sys.platform == "darwin":
+    log_options = ["--log", str(log)]
+    if log_fd is not None:
+        log_options.extend(("--log-fd", "1"))
+    command = [sys.executable, str(program), arguments[0], *log_options, *arguments[1:]]
+    if log_fd is not None:
+        if sys.platform == "darwin":
+            _launch_mac_with_log(command, environment, log_fd)
+        else:
+            # Keep the descriptor open until the child claims the log.
+            source = f"/proc/{os.getpid()}/fd/{log_fd}"
+            _ = subprocess.run(["systemd-run", "--user", "--collect", "--quiet", "--service-type=notify",
+                                "--expand-environment=no", f"--property=StandardOutput=append:{source}",
+                                "--property=StandardError=journal", "--property=UnsetEnvironment=CLAUDE_CODE_SESSION_ID",
+                                *command, "--notify-systemd"], env=environment, stdin=subprocess.DEVNULL,
+                               capture_output=True, text=True, check=True, timeout=_DETACHED_START_SECONDS)
+    elif sys.platform == "darwin":
         _ = subprocess.Popen(command, env=environment, start_new_session=True,
                              stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     else:

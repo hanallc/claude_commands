@@ -353,10 +353,7 @@ def process_uses(paths: list[Path], proc: str = tmp_sweep.PROC_DIR) -> tmp_sweep
     if not paths:
         return tmp_sweep.ProcessUsesKnown([])
     prefixes = tuple(dict.fromkeys(str(path.parent) + os.sep for path in paths))
-    found = tmp_sweep.process_paths(proc, prefixes)
-    if isinstance(found, tmp_sweep.ProcessUsesUnavailable):
-        return tmp_sweep.lsof_paths(prefixes)
-    return found
+    return tmp_sweep.process_uses_with_lsof(proc, prefixes)
 
 
 def worktree_sources(path: Path, *,

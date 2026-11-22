@@ -5045,11 +5045,16 @@ class ProcessRunUseTests(unittest.TestCase):
         from scripts.build_queue.queue_place import queue_place
 
         self.fixture.configure(**{"program_first_peak_gib.gate": 6})
+        checkout = self.fixture.root / ".claude"
+        checkout.mkdir()
+        _ = subprocess.run(["git", "init", "-q", str(checkout)], check=True)
+        _ = subprocess.run(["git", "-C", str(checkout), "remote", "add", "origin",
+                            "git@github.com:hanallc/claude_commands.git"], check=True)
         pid = os.getpid()
         owner = self.fixture.fixture_owner(pid, str(pid))
         self.process(pid, parent=1, resident=4 * GIB, anonymous=2 * GIB, swap=GIB)
         with patch.object(admission_records, "process_start_time", return_value=owner.start_time), self.fixture.serving():
-            with queue_place("gate", self.fixture.root):
+            with queue_place("gate", checkout):
                 with self.fixture.loop_turn():
                     _ = self.fixture.run_pass()
                     records = list(self.fixture.server.reservations.values())
@@ -5058,6 +5063,7 @@ class ProcessRunUseTests(unittest.TestCase):
                     path, row = Path(record.path), service.reservation_row(record)
                     self.assertEqual(row["pid"], pid)
                     self.assertEqual(row["step"], "gate")
+                    self.assertEqual(record.queue_waiter.get("repository_name"), "claude_commands")
                     self.assertEqual(Path(row["sidecar"]).read_text(), "")
                     reading = gate.reservation_memory(path, row,
                         datetime.fromtimestamp(self.fixture.clock.now(), UTC),
@@ -5784,9 +5790,9 @@ class QueueLeaveTests(unittest.TestCase):
         self.assertEqual(calls.read_text().splitlines(), [
             "nextest run --no-run --workspace",
             "nextest list --message-format json --workspace",
-            "nextest run --test-threads 3 --workspace",
+            "nextest run --test-threads 4 --workspace",
         ])
-        self.assertEqual(json.loads(reservation.read_text())["test_threads"], 3)
+        self.assertEqual(json.loads(reservation.read_text())["test_threads"], 4)
         self.assertEqual(len(os.read(keeper, 64)), 6)
 
     def test_full_width_nextest_run_reports_threads_and_load_after_admission(self) -> None:
@@ -6223,6 +6229,59 @@ class QueueExplanationTests(MemoryQueueFixture):
         self.assertEqual([row.decision.gpu for row in rows],
                          [admission_records.GpuSlotFree(), admission_records.GpuSlotFree(), admission_records.GpuSlotWait(1, 1)])
 
+    def test_repository_run_limit_holds_the_third_local_run_and_exempts_natemerge(self) -> None:
+        repo = "claude_commands"
+        _ = self.running(100, 2, age=30, fields={"repo": repo, "step": "gate"})
+        _ = self.running(200, 2, age=30, fields={"repo": repo, "step": "test-affected", "unit": "natemerge"})
+        _ = self.waiting(300, 2 * GIB, 20, repository_name=repo, step="test-affected")
+        _ = self.waiting(400, 2 * GIB, 5, repository_name=repo, step="gate", unit="natemerge")
+        inputs = replace(self.snapshot_inputs(), host=admission_records.HostMemory(60 * GIB, 60 * GIB))
+        policy = replace(admission_policy_fixture(),
+            repository_runs=admission_records.RepositoryRunLimits({f"natedev.{repo}": 2}, "natemerge"))
+        rows = gate.admission_pass(inputs, inputs.now, policy).rows
+        self.assertEqual([row.decision.state for row in rows], ["hold", "admit"])
+        self.assertEqual(cast(admission_records.HeadAdmissionStatus, rows[0].reason).cause,
+                         admission_records.RunLimitWait(2, 2, repo, "natedev"))
+
+        local, other = inputs.reservations
+        for machine in ("mac", "aws"):
+            with self.subTest(machine=machine):
+                remote = replace(inputs.running[1], assignment_host=machine,
+                    measured=admission_records.RemoteMemoryUnavailable("remote step"))
+                placed = replace(inputs, reservations=(local,), running=(inputs.running[0], remote))
+                self.assertEqual(gate.admission_pass(placed, inputs.now, policy).rows[0].decision.state, "admit")
+
+        shared_run = LiveBuildRun(90, "90", inputs.now - 35)
+        scenarios: tuple[tuple[admission_records.Reservation, ...], ...] = (
+            (local, {**other, "step": "nextest"}),
+            ({**local, "build_run": shared_run}, {**other, "build_run": shared_run}),
+        )
+        for reservations in scenarios:
+            counted = replace(inputs, reservations=reservations)
+            self.assertEqual(gate.admission_pass(counted, inputs.now, policy).rows[0].decision.state, "admit")
+
+    def test_only_waiters_under_the_same_run_limit_wait_behind_a_capped_run(self) -> None:
+        repo = "claude_commands"
+        _ = self.running(100, 2, age=30, fields={"repo": repo, "step": "gate"})
+        _ = self.running(200, 2, age=30, fields={"repo": repo, "step": "test-affected"})
+        _ = self.waiting(300, 2 * GIB, 20, repository_name=repo, step="gate")
+        _ = self.waiting(400, 2 * GIB, 10, repository_name=repo, step="test-affected")
+        self.processes[500] = "nextest"
+        _ = self.waiting(500, 2 * GIB, 5, repository_name=repo, step="nextest")
+        inputs = replace(self.snapshot_inputs(), host=admission_records.HostMemory(60 * GIB, 60 * GIB))
+        policy = replace(admission_policy_fixture(),
+            repository_runs=admission_records.RepositoryRunLimits({f"natedev.{repo}": 2}))
+        head, follower, nextest = gate.admission_pass(inputs, inputs.now, policy).rows
+        self.assertEqual(cast(admission_records.HeadAdmissionStatus, head.reason).cause,
+                         admission_records.RunLimitWait(2, 2, repo, "natedev"))
+        self.assertEqual(follower.reason, admission_records.BehindHead("worker-300", NOW_EPOCH - 1200, "session-300"))
+        self.assertIsInstance(nextest.admission, gate.ProposedAdmission)
+
+        path, waiter = inputs.ordered[0]
+        memory_hold = replace(inputs, ordered=[(path, {**waiter, "need": 70 * GIB}), *inputs.ordered[1:]])
+        rows = gate.admission_pass(memory_hold, inputs.now, policy).rows
+        self.assertEqual(rows[2].reason, follower.reason)
+
     def test_pass_is_pure_and_ignores_reader_environment_and_clock(self) -> None:
         _ = self.waiting(300, 4 * GIB, 1)
         _ = self.waiting(400, 5 * GIB, 0)
@@ -6454,6 +6513,16 @@ class ConfiguredAdmissionPolicyTests(MemoryQueueFixture):
 
     def write_config(self, **changes: str | None) -> None:
         write_memory_config(self.config, **changes)
+
+    def test_repository_run_limits_follow_live_configuration(self) -> None:
+        original = self.config.read_text()
+        for limit in (2, 3):
+            _ = self.config.write_text(original + f"\n# whole: 1..\nmax_runs.natedev.claude_commands={limit}\n"
+                                       + "# whole: 1..\nmax_runs.mac.other.repo=4\nmax_runs_exempt_unit=natemerge\n")
+            runs = admission_records.read_memory_config().policy.repository_runs
+            self.assertEqual(runs.for_step("natedev", "claude_commands", "gate"), limit)
+            self.assertEqual(runs.for_step("mac", "other.repo", "test-affected"), 4)
+            self.assertEqual(runs.exempt_unit, "natemerge")
 
     def test_missing_or_invalid_test_margin_uses_the_fallback_and_valid_margin_freezes(self) -> None:
         for value in (None, "nan", "inf", "0.9", "1.4"):

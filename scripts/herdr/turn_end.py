@@ -163,7 +163,6 @@ def _prepare_notice(worker_name: str, parent: staff.StaffRow, run: Path, passed:
         return TurnDecision(outcome, _no_notice)
     phase = passed.get("phase", {})
     phase_id = str(cast(dict[str, object], phase).get("id", "")) if isinstance(phase, dict) else ""
-    address = ("codex:" if isinstance(staff.backend(parent), staff.CodexBackend) else "session:") + str(parent.current_session)
     result_text = "the dispatch attempt found the worker busy" if busy else outcome.value
     message = f"{worker_name}: phase {phase_id}: {result_text}"
     if reply:
@@ -171,8 +170,6 @@ def _prepare_notice(worker_name: str, parent: staff.StaffRow, run: Path, passed:
     message += f"\nPass {instance}." if outcome == TurnOutcome.STOPPED else f"; pass {instance}"
     if runs:
         message += "; runs " + ", ".join(runs)
-    if details:
-        message += "\n" + details
     identity = staff.StaffId(str(passed.get("worker_id", "")))
     completion_id = (pass_recorder.dispatch_delivery(passed).completion_id
                      if busy or ordered or outcome == TurnOutcome.UNCERTAIN else "")
@@ -201,8 +198,6 @@ def _prepare_notice(worker_name: str, parent: staff.StaffRow, run: Path, passed:
     deduplicate = (["--key", key, "--recipient-key", f"staff:{parent.id}",
                     "--repeat-minutes", str(COMPLETION_NOTICE_REPEAT_MINUTES)]
                    if notice_type or busy or quiet_no_done or ordered else [])
-    options = send.parse(["--to", address, "--from", worker_name, "--text", message, *deduplicate])
-    options = options._replace(sender_origin=send.ForwardedSender(sender), shown_sender=send.ShownSender(worker_name))
 
     def deliver() -> None:
         current = staff.snapshot().by_id(parent.id)
@@ -212,7 +207,12 @@ def _prepare_notice(worker_name: str, parent: staff.StaffRow, run: Path, passed:
         if outcome == TurnOutcome.UNCERTAIN and not progress_history.dispatch_uncertainty_pending(
                 run, identity, instance, completion_id):
             return
-        result = send.send(options._replace(selection=send.RosterLookup(address)))
+        scratch_notices = (_completion_scratch_notices(run, instance)
+                           if (notice_type or repeat) and outcome != TurnOutcome.STOPPED else ())
+        body = "\n".join(part for part in (message, details, *scratch_notices) if part)
+        options = send.parse(["--to", address, "--from", worker_name, "--text", body, *deduplicate])
+        result = send.send(options._replace(
+            sender_origin=send.ForwardedSender(sender), shown_sender=send.ShownSender(worker_name)))
         if result.outcome not in ("sent", "skipped"):
             raise ValueError(result.detail)
         if busy or ordered:
@@ -303,6 +303,11 @@ def _completion_reply(completion: progress_history.HookCompletion) -> str:
         if completion.outcome != TurnOutcome.ERROR:
             raise
         return "\n".join(completion.details)
+
+
+def _completion_notice_details(completion: progress_history.HookCompletion) -> str:
+    # Old scratch notices have no saved path to check.
+    return "\n".join(detail for detail in completion.details if not scratch.is_retained_task_folder_notice(detail))
 
 
 def completion_notice_delivered(passed: dict[str, object]) -> bool:
@@ -470,7 +475,7 @@ def repeat_completion_notice(worker_name: str, parent: staff.StaffRow, run: Path
     delivery = pass_recorder.dispatch_delivery(passed)
     outcome = TurnOutcome(completion.outcome) if isinstance(completion, progress_history.HookCompletion) else TurnOutcome.DONE
     path = Path(completion.reply_file if isinstance(completion, progress_history.HookCompletion) else delivery.reply_file)
-    details = "\n".join(completion.details) if isinstance(completion, progress_history.HookCompletion) else ""
+    details = _completion_notice_details(completion) if isinstance(completion, progress_history.HookCompletion) else ""
     reply = _completion_reply(completion) if isinstance(completion, progress_history.HookCompletion) else path.read_text()
     repeated = {key: value for key, value in passed.items() if key != "hook_notice"}
     decision = _prepare_notice(worker_name, parent, run, repeated, instance, outcome, path, reply, details, repeat=True)
@@ -541,16 +546,12 @@ def _finish_completion(row: staff.StaffRow, parent: staff.StaffRow, run: Path, p
         progress_history.complete_dispatch(run, str(passed.get("team_slot", row.name)), instance,
                                            status="completed" if outcome == TurnOutcome.DONE else "error")
     after_pass_recorded()
-    diagnostics: list[str] = []
     try:
-        for folder in scratch.end(scratch.worker_task(row.id)):
-            diagnostics.append(scratch.retained_task_folder_notice(folder.path, folder.reason))
+        _save_completion_scratch(run, instance, scratch.end(scratch.worker_task(row.id)))
     except Exception as error:
-        diagnostics.append(f"scratch cleanup failed for {row.name}: {' '.join(str(error).splitlines())}")
-    if diagnostics:
-        details = tuple(dict.fromkeys((*completion.details, *diagnostics)))
-        if details != completion.details:
-            completion = replace(completion, details=details)
+        diagnostic = f"scratch cleanup failed for {row.name}: {' '.join(str(error).splitlines())}"
+        if diagnostic not in completion.details:
+            completion = replace(completion, details=(*completion.details, diagnostic))
             progress_history.save_hook_completion(run, instance, completion)
     reply = _completion_reply(completion)
 
@@ -558,7 +559,7 @@ def _finish_completion(row: staff.StaffRow, parent: staff.StaffRow, run: Path, p
     if outcome == TurnOutcome.ERROR and worker_admission.reply_ends_dispatch(reply, delivery.completion_id):
         notice_type = TurnOutcome.DONE.value
     decision = _prepare_notice(row.name, parent, run, {**passed, "hook_completion": asdict(completion)},
-                               instance, outcome, path, reply, "\n".join(completion.details), notice_type=notice_type)
+                               instance, outcome, path, reply, _completion_notice_details(completion), notice_type=notice_type)
 
     def finalize(hold: worker_panes.WorkerLockHold) -> TurnOutcome:
         record = staff.snapshot()
@@ -668,6 +669,31 @@ def _remove_completed_restart(row: staff.StaffRow, delivery: pass_recorder.Dispa
     shutdown_record.forget([str(row.id)])
     if delivery.actions.end_worker:
         _ = staff.retire(row.id)
+
+
+def _completion_scratch_path(run: Path, instance: str) -> Path:
+    digest = hashlib.sha256(instance.encode()).hexdigest()
+    return run / f".{digest}.completion-scratch.json"
+
+
+def _save_completion_scratch(run: Path, instance: str, retained: list[scratch.KeptFolder]) -> None:
+    if not retained:
+        return
+    path = _completion_scratch_path(run, instance)
+    saved = worker_lifecycle.read_json_object(path)
+    updated = saved | {str(folder.path.parent.resolve() / folder.path.name): folder.reason for folder in retained}
+    if updated != saved:
+        atomic_file.write_text_atomic(path, json.dumps(updated))
+
+
+def _completion_scratch_notices(run: Path, instance: str) -> tuple[str, ...]:
+    try:
+        saved = worker_lifecycle.read_json_object(_completion_scratch_path(run, instance))
+    except worker_lifecycle.WorkerStateUnreadable as error:
+        return (f"Cannot read saved scratch notices. {error}",)
+    return tuple(scratch.retained_task_folder_notice(folder, reason) for name, reason in saved.items()
+                 if isinstance(reason, str) and (folder := Path(name)).is_absolute()
+                 and scratch.retained_folder_exists(folder))
 
 
 def _completion_diagnostics_path(run: Path, instance: str) -> Path:

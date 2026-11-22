@@ -304,12 +304,26 @@ def is_acknowledged_skip(reason: str) -> bool:
     """Distinguish an acknowledged skip from a repeat-window skip."""
     return _ACKNOWLEDGED_AT in reason
 
+
 LogEntry = TypedDict("LogEntry", {"time": str, "machine": str, "from": str, "to": str, "key": str | None,
                                   "summary": str, "text": str, "outcome": Outcome, "detail": str,
                                   "via": NotRequired[Literal["postmaster", "relay", "queue"]],
                                   "postmaster": NotRequired[postmaster.PostmasterStatus],
                                   "seconds": NotRequired[float], "human": NotRequired[bool], "receiver": NotRequired[str],
                                   "sender_native_id": NotRequired[str]})
+
+
+class RelayTextDifference(TypedDict):
+    first_difference: int
+    approved_window: str
+    sent_window: str | None
+
+
+class RelayMismatch(TypedDict):
+    time: str
+    to: str | None
+    to_truncated: bool
+    text_difference: NotRequired[RelayTextDifference]
 
 
 class SocketRecoveryAttempt(TypedDict):
@@ -1651,7 +1665,7 @@ def clear_check(timeout: float | ConfiguredCheckTimeout = ConfiguredCheckTimeout
         return code, lines
 
 
-def append_record(path: Path, entry: LogEntry | SocketRecoveryAttempt, *, durable: bool = False) -> None:
+def append_record(path: Path, entry: LogEntry | SocketRecoveryAttempt | RelayMismatch, *, durable: bool = False) -> None:
     """Append under the state lock; recovery records must survive a stopped drain."""
     with locked():
         repeat_guard.append_jsonl(path, entry, durable=durable)
@@ -3270,6 +3284,14 @@ def matching_recipients(
     return resolved(matches or local, NamedMachine(roster.remote.other_machine()), observed, peer)
 
 
+def _local_worker(member: staff.StaffRow, membership: staff.StaffSnapshot) -> bool:
+    if member.kind != "worker":
+        return False
+    holder = membership.parent_of(member)
+    return holder is not None and (isinstance(holder.worktree, staff.WorktreeUnfilled)
+                                   or holder.worktree.machine == machine_routes.local_machine())
+
+
 def resolve_recipient(
     target: str | FixedStaffLookup, scope: RecipientResolutionScope, observed: roster.Roster, *,
     membership: staff.StaffSnapshot | None = None, records: list[sessions.SessionRecord] | None = None,
@@ -3299,11 +3321,8 @@ def resolve_recipient(
         if isinstance(member, RecipientLookupFailed):
             usage_error(member.reason)
         if (not check_closed and not isinstance(scope, NamedMachine)
-                and isinstance(member, staff.StaffRow) and member.kind == "worker"):
-            holder = membership.parent_of(member)
-            if holder is not None and (isinstance(holder.worktree, staff.WorktreeUnfilled)
-                                       or holder.worktree.machine == roster.remote.local_machine()):
-                return PaneWorkerRecipient(member)
+                and isinstance(member, staff.StaffRow) and _local_worker(member, membership)):
+            return PaneWorkerRecipient(member)
         if isinstance(member, staff.StaffRow):
             for anomaly in observed.row_anomalies:
                 if anomaly.row.id == member.id:
@@ -3318,6 +3337,12 @@ def resolve_recipient(
             thread_id = to.removeprefix("codex:")
             if not thread_id:
                 usage_error("codex: needs a thread id")
+        if isinstance(member, NoStaffRecipient) and not native:
+            fallback = resolve_staff_recipient(to, membership, observed=observed.entries)
+            if isinstance(fallback, RecipientLookupFailed):
+                usage_error(fallback.reason)
+            if isinstance(fallback, staff.StaffRow):
+                return resolve_recipient(str(fallback.id), scope, observed, membership=membership, records=records)
         resolution_scope = LocalOnly() if native and sessions.addressed(to, records or []) is not None else scope
         result = matching_recipients(to, resolution_scope, observed, membership=membership, skip_closed=check_closed)
         if isinstance(result, (RecipientClosed, RecipientAbsent)):
@@ -3337,12 +3362,6 @@ def resolve_recipient(
                     and isinstance(member, staff.StaffRow)):
                 return RemoteDelivery(route.host, staff_queue_key(member.id))
             return route
-        if isinstance(member, NoStaffRecipient) and not native:
-            fallback = resolve_staff_recipient(to, membership, observed=observed.entries)
-            if isinstance(fallback, RecipientLookupFailed):
-                usage_error(fallback.reason)
-            if isinstance(fallback, staff.StaffRow):
-                return resolve_recipient(str(fallback.id), scope, observed, membership=membership, records=records)
         if isinstance(result, LocalRosterIncomplete):
             usage_error(f"absence of {to} here is not proven; use an address or --machine")
         if isinstance(result, RecipientSearchFailed):
@@ -3496,20 +3515,42 @@ class RelayRecipientWrite:
         default_factory=RelayRequestNotForwarded)
 
 
+def _log_relay_mismatch(target: object, sent: object, approved: str) -> None:
+    target_limit = 256
+    record = RelayMismatch(time=now().isoformat(), to=target[:target_limit] if isinstance(target, str) else None,
+                           to_truncated=len(as_str(target)) > target_limit)
+    if sent != approved:
+        sent_text = as_str(sent)
+        first = next((index for index, (before, after) in enumerate(zip(approved, sent_text)) if before != after),
+                     min(len(approved), len(sent_text)))
+        window = slice(max(0, first - 32), first + 32)
+        record["text_difference"] = RelayTextDifference(first_difference=first, approved_window=approved[window],
+                                                        sent_window=sent_text[window] if isinstance(sent, str) else None)
+    try:
+        append_record(STATE / "relay_mismatches.jsonl", record)
+    except OSError as error:
+        print(f"message relay mismatch log: {error}", file=sys.stderr)
+
+
 def read_relay(observed: RelayTransportResponse, text: str, *,
                review_delivery: bool = False) -> CheckedRelayAcceptance | Result:
     """Check the approved call, its result, and the proxy forward together."""
+    events = [as_dict(loads(line)) for line in observed.stdout.splitlines()]
+    sends = [part for event in events if event.get("type") == "assistant"
+             for value in as_list(as_dict(event.get("message")).get("content"))
+             if (part := as_dict(value)).get("type") == "tool_use" and part.get("name") == "SendMessage"]
+    for call in sends:
+        inputs = as_dict(call.get("input"))
+        target, sent = inputs.get("to"), inputs.get("message")
+        if target != observed.target or sent != text:
+            _log_relay_mismatch(target, sent, text)
     forward = observed.forward
     if isinstance(forward, RefusedRelayRequest):
         return forward
     if isinstance(forward, RelayRequestInterrupted):
         return _unaccepted_relay(forward, forward.reason)
-    events = [as_dict(loads(line)) for line in observed.stdout.splitlines()]
     mode = next((as_str(event.get("permissionMode")) for event in events
                  if event.get("type") == "system" and event.get("subtype") == "init"), "unknown")
-    sends = [part for event in events if event.get("type") == "assistant"
-             for value in as_list(as_dict(event.get("message")).get("content"))
-             if (part := as_dict(value)).get("type") == "tool_use" and part.get("name") == "SendMessage"]
     if not sends:
         said = next((as_str(event.get("result")) for event in reversed(events) if event.get("type") == "result"), "")
         return _unaccepted_relay(forward, f"the relay made no SendMessage call: {one_line(said) or 'no output'}",
@@ -5257,22 +5298,34 @@ def _send_with_review(options: Options, membership: staff.StaffSnapshot, review_
         membership = replace(membership, running_sessions=frozenset(record["sessionId"] for record in running))
     records = [record for record in running if sessions.messaging_socket_exists(record)]
     stamp = (options.sender_origin.stamp if isinstance(options.sender_origin, ForwardedSender) else sender_stamp())
+    fixed = isinstance(options.selection, FixedStaffLookup)
+    native = not fixed and target.startswith("session:")
+    local_recipient = ""
+    if needs_recipient_roster:
+        if native:
+            local = sessions.addressed(target, records)
+            if local is not None:
+                local_recipient = local["sessionId"]
+        elif not fixed and target.startswith("codex:"):
+            local_member = _staff_recipient_match(target, membership)
+            if isinstance(local_member, staff.StaffRow) and _local_worker(local_member, membership):
+                local_recipient = str(local_member.current_session)
+        elif not target.startswith(("session:", "worker:", "codex:")):
+            local_member = resolve_staff_recipient(target, membership, records=records)
+            if (isinstance(local_member, staff.StaffRow) and local_member.kind != "worker"
+                    and sessions.addressed(f"session:{local_member.current_session}", records) is not None):
+                local_recipient = str(local_member.current_session)
     participants: roster.AllRosterSessions | roster.MessageParticipants = roster.AllRosterSessions()
-    if needs_recipient_roster and not target.startswith(("session:", "worker:", "codex:")):
-        local_member = resolve_staff_recipient(target, membership, records=records)
-        if (isinstance(local_member, staff.StaffRow) and local_member.kind != "worker"
-                and sessions.addressed(f"session:{local_member.current_session}", records, membership=membership) is not None):
-            identities = {str(local_member.current_session)}
-            if isinstance(stamp, ClaudeSender):
-                identities.add(stamp.session_id)
-            elif isinstance(stamp, CodexSender):
-                identities.add(stamp.thread_id)
-            participants = roster.MessageParticipants(frozenset(identities))
+    if local_recipient and not options.skip_closed:
+        identities = {local_recipient}
+        if isinstance(stamp, ClaudeSender):
+            identities.add(stamp.session_id)
+        elif isinstance(stamp, CodexSender):
+            identities.add(stamp.thread_id)
+        participants = roster.MessageParticipants(frozenset(identities))
     observed = (roster.roster(os.environ, roster.ThisMachine(), membership=membership, registry=registry,
                              participants=participants) if needs_recipient_roster or needs_sender_roster
                 else roster.Roster([], []))
-    fixed = isinstance(options.selection, FixedStaffLookup)
-    native = not fixed and target.startswith("session:")
     raw_socket = not fixed and target.startswith("uds:")
     if isinstance(options.selection, FixedStaffLookup):
         member = options.selection.member(membership)

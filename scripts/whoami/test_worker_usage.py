@@ -117,7 +117,7 @@ class StoreReadoutTests(OutcomeFixture):
         _ = (mac_home / ".local/state/usage-model/agents.jsonl").write_bytes(b"")
         (self.root / "bin").mkdir()
         source = (COLLECT_FIXTURES / "mac/fake_ssh.py").read_text().split("\n", 1)[1]
-        _ = (self.root / "bin/ssh").write_text(f"#!{READOUT.parents[1] / 'lib/py'}\n{source}")
+        _ = (self.root / "bin/ssh").write_text(f"#!/usr/bin/env {READOUT.parents[1] / 'lib/py'}\n{source}")
         (self.root / "bin/ssh").chmod(0o700)
         (self.root / "outside-checkout").mkdir()
         _ = self.collect()

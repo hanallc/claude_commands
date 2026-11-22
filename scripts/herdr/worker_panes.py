@@ -421,8 +421,22 @@ def _text(row: dict[str, object], key: str) -> str:
     return value if isinstance(value, str) else ""
 
 
+_DEFER_WORKER_ANOMALIES: ContextVar[bool] = ContextVar("_DEFER_WORKER_ANOMALIES", default=False)
+
+
+@contextmanager
+def defer_worker_anomalies() -> Generator[None]:
+    """Let the caller report the reason from the returned worker state."""
+    token = _DEFER_WORKER_ANOMALIES.set(True)
+    try:
+        yield
+    finally:
+        _DEFER_WORKER_ANOMALIES.reset(token)
+
+
 def _uncertain(row: staff.StaffRow, reason: str) -> UncertainWorker:
-    print(f"anomaly: {row.name}: {' '.join(reason.splitlines())}; correct the evidence and retry", file=sys.stderr)
+    if not _DEFER_WORKER_ANOMALIES.get():
+        print(f"anomaly: {row.name}: {' '.join(reason.splitlines())}; correct the evidence and retry", file=sys.stderr)
     return UncertainWorker(row, reason)
 
 
@@ -819,12 +833,15 @@ def recorded_completion_close(row: staff.StaffRow, run: Path, passed: dict[str, 
     return receipts.completion_close_evidence(row, delivery, run=run, reply_file=reply_file)
 
 
+NO_FINAL_REPLY = "last turn does not end with an assistant reply"
+
+
 def _final_reply(row: staff.StaffRow) -> CloseAllowed | Kept:
     messages = _transcript_messages(row)
     if isinstance(messages, Kept):
         return messages
     if not messages or not messages[-1].startswith("assistant:\n"):
-        return Kept("last turn does not end with an assistant reply")
+        return Kept(NO_FINAL_REPLY)
     return CloseAllowed()
 
 
