@@ -49,6 +49,7 @@ from scripts.whoami.account import Account, UnknownAccountName
 from scripts.message import codex_daemon
 from scripts.agents import member_account, shutdown_record, stop_resume, pane_record, worker_lifecycle
 from scripts.lib import conf, file_lock, unit_runs, resume_message
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.transcript_test_support import compressed_copy
 from scripts.lib.test_models_registry import claude_catalog_environment, write_registry
 from scripts.lib.atomic_file import create_text_atomic, write_text_atomic
@@ -2179,8 +2180,7 @@ def configure_collection():
 
     def hold_task():
         pending.set()
-        if not release.wait(5):
-            raise RuntimeError('The signal probe did not release the task')
+        release.wait()
         if not shutdown_record.active():
             raise RuntimeError('The activity lock released before the task ended')
 
@@ -2228,7 +2228,8 @@ def configure_collection():
 
                     def signal_before_result():
                         try:
-                            if not pending.wait(5) or future.done():
+                            pending.wait()
+                            if future.done():
                                 raise RuntimeError('The selected task did not remain in progress')
                             if self.futures[-1].running() or self.futures[-1].done():
                                 raise RuntimeError('The last task did not remain queued')
@@ -2239,7 +2240,7 @@ def configure_collection():
                                 raise RuntimeError('The activity lock released after the signal')
                         finally:
                             release.set()
-                        return result(timeout=5)
+                        return result()
 
                     future.result = signal_before_result
             return future
@@ -2303,7 +2304,8 @@ runpy.run_module('scripts.agents.restart', run_name='__main__', alter_sys=True)
                                      "--log", str(path), "--log-fd", str(log.fileno()), "--ready-fd", str(ready_fd),
                                      *self.detached_fault_arguments(command, resuming=resuming, count=count)],
                                     cwd=Path(restart.__file__).resolve().parents[2],
-                                    pass_fds=(ready_fd, log.fileno()), capture_output=True, timeout=10, check=False)
+                                    pass_fds=(ready_fd, log.fileno()), capture_output=True,
+                                    timeout=TEST_HANG_GUARD_SECS, check=False)
         self.assertEqual(result.returncode, -number, result.stderr.decode())
         self.assertEqual(result.stdout, b"")
         self.assertEqual(result.stderr, b"")
