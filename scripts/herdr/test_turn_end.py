@@ -478,6 +478,67 @@ class TurnEndTests(unittest.TestCase):
                     self.assertEqual((self.case.reply.read_bytes(), self.case.reply.stat().st_mtime_ns), reply)
             self.assertNotEqual(*completions)
 
+    def test_completion_delivery_omits_unchecked_scratch_notices(self) -> None:
+        cases = (("recovery", "paths"), ("resend", "paths"), ("recovery", "text"), ("resend", "text"))
+        for attempt, saved_format in cases:
+            with self.subTest(attempt=attempt, saved_format=saved_format):
+                name = f"impl-{attempt}-{saved_format}"
+                self.assertIs(self.case.dispatch(name), worker.DispatchSubmission.SUBMITTED)
+                row = self.case.agent.row(self.case.agent.submitted[-1][0])
+                root = self.case.fixture.root.resolve()
+                relative = root / f"{name} relative"
+                missing = root / f"{name} scratch"
+                retained = root / f"{name} retained"
+                relative.mkdir()
+                missing.mkdir()
+                retained.symlink_to(root / "missing-target")
+                parent = root / "nested"
+                parent.mkdir(exist_ok=True)
+                reason = "The task ended (scratch, a fixture reason)."
+                folders = [scratch.KeptFolder(Path(os.path.relpath(relative)), "task ended"),
+                           scratch.KeptFolder(missing, reason),
+                           scratch.KeptFolder(parent / ".." / retained.name, reason)]
+                missing_notices = (scratch.retained_task_folder_notice(relative, "task ended"),
+                                   scratch.retained_task_folder_notice(missing, reason))
+                retained_notice = scratch.retained_task_folder_notice(retained, reason)
+                with patch.object(scratch, "end", return_value=folders if saved_format == "paths" else []):
+                    if attempt == "recovery":
+                        self.case.agent.notice_failures = 1
+                        with self.assertRaisesRegex(ValueError, "director message failed"):
+                            _ = self.case.finish(name)
+                    else:
+                        self.assertIs(self.case.finish(name), turn_end.TurnOutcome.DONE)
+                        if saved_format == "paths":
+                            for notice in (*missing_notices, retained_notice):
+                                self.assertIn(notice, self.case.agent.notices[-1])
+
+                run = self.case.run_dir
+                passed = worker_panes.worker_pass(row, run)
+                completion = progress_history.hook_completion(passed)
+                assert isinstance(completion, progress_history.HookCompletion)
+                diagnostic = "The fixture saved another diagnostic."
+                other_notice = f"kept for a manual removal list: {missing} (remove_run_scratch, the run ended)"
+                legacy = (scratch.retained_task_folder_notice(folders[0].path, folders[0].reason),
+                          missing_notices[1], retained_notice) if saved_format == "text" else ()
+                progress_history.save_hook_completion(run, str(passed["instance_id"]),
+                    replace(completion, details=(*completion.details, diagnostic, *legacy, other_notice)))
+                for folder in (relative, missing):
+                    _ = folder.rename(root / f"{folder.name} moved")
+                before = len(self.case.agent.notices)
+                with patch.object(scratch, "end", return_value=[]):
+                    if attempt == "recovery":
+                        self.assertIs(self.case.finish(name), turn_end.TurnOutcome.DONE)
+                    else:
+                        self.assertIs(self.case.dispatch(name), worker.DispatchSubmission.SUBMITTED)
+                self.assertEqual(len(self.case.agent.notices), before + 1)
+                notice = self.case.agent.notices[-1]
+                for missing_notice in (*missing_notices, *legacy):
+                    self.assertNotIn(missing_notice, notice)
+                if saved_format == "paths":
+                    self.assertIn(retained_notice, notice)
+                self.assertIn(diagnostic, notice)
+                self.assertIn(other_notice, notice)
+
     def test_a_director_or_an_idle_worker_hook_changes_no_pass(self) -> None:
         opened = self.case.opened()
         row = opened.row

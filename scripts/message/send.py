@@ -305,12 +305,26 @@ def is_acknowledged_skip(reason: str) -> bool:
     """Distinguish an acknowledged skip from a repeat-window skip."""
     return _ACKNOWLEDGED_AT in reason
 
+
 LogEntry = TypedDict("LogEntry", {"time": str, "machine": str, "from": str, "to": str, "key": str | None,
                                   "summary": str, "text": str, "outcome": Outcome, "detail": str,
                                   "via": NotRequired[Literal["postmaster", "relay", "queue"]],
                                   "postmaster": NotRequired[postmaster.PostmasterStatus],
                                   "seconds": NotRequired[float], "human": NotRequired[bool], "receiver": NotRequired[str],
                                   "sender_native_id": NotRequired[str]})
+
+
+class RelayTextDifference(TypedDict):
+    first_difference: int
+    approved_window: str
+    sent_window: str | None
+
+
+class RelayMismatch(TypedDict):
+    time: str
+    to: str | None
+    to_truncated: bool
+    text_difference: NotRequired[RelayTextDifference]
 
 
 class SocketRecoveryAttempt(TypedDict):
@@ -1652,7 +1666,7 @@ def clear_check(timeout: float | ConfiguredCheckTimeout = ConfiguredCheckTimeout
         return code, lines
 
 
-def append_record(path: Path, entry: LogEntry | SocketRecoveryAttempt, *, durable: bool = False) -> None:
+def append_record(path: Path, entry: LogEntry | SocketRecoveryAttempt | RelayMismatch, *, durable: bool = False) -> None:
     """Append under the state lock; recovery records must survive a stopped drain."""
     with locked():
         repeat_guard.append_jsonl(path, entry, durable=durable)
@@ -3557,20 +3571,42 @@ class RelayRecipientWrite:
         default_factory=RelayRequestNotForwarded)
 
 
+def _log_relay_mismatch(target: object, sent: object, approved: str) -> None:
+    target_limit = 256
+    record = RelayMismatch(time=now().isoformat(), to=target[:target_limit] if isinstance(target, str) else None,
+                           to_truncated=len(as_str(target)) > target_limit)
+    if sent != approved:
+        sent_text = as_str(sent)
+        first = next((index for index, (before, after) in enumerate(zip(approved, sent_text)) if before != after),
+                     min(len(approved), len(sent_text)))
+        window = slice(max(0, first - 32), first + 32)
+        record["text_difference"] = RelayTextDifference(first_difference=first, approved_window=approved[window],
+                                                        sent_window=sent_text[window] if isinstance(sent, str) else None)
+    try:
+        append_record(STATE / "relay_mismatches.jsonl", record)
+    except OSError as error:
+        print(f"message relay mismatch log: {error}", file=sys.stderr)
+
+
 def read_relay(observed: RelayTransportResponse, text: str, *,
                review_delivery: bool = False) -> CheckedRelayAcceptance | Result:
     """Check the approved call, its result, and the proxy forward together."""
+    events = [as_dict(loads(line)) for line in observed.stdout.splitlines()]
+    sends = [part for event in events if event.get("type") == "assistant"
+             for value in as_list(as_dict(event.get("message")).get("content"))
+             if (part := as_dict(value)).get("type") == "tool_use" and part.get("name") == "SendMessage"]
+    for call in sends:
+        inputs = as_dict(call.get("input"))
+        target, sent = inputs.get("to"), inputs.get("message")
+        if target != observed.target or sent != text:
+            _log_relay_mismatch(target, sent, text)
     forward = observed.forward
     if isinstance(forward, RefusedRelayRequest):
         return forward
     if isinstance(forward, RelayRequestInterrupted):
         return _unaccepted_relay(forward, forward.reason)
-    events = [as_dict(loads(line)) for line in observed.stdout.splitlines()]
     mode = next((as_str(event.get("permissionMode")) for event in events
                  if event.get("type") == "system" and event.get("subtype") == "init"), "unknown")
-    sends = [part for event in events if event.get("type") == "assistant"
-             for value in as_list(as_dict(event.get("message")).get("content"))
-             if (part := as_dict(value)).get("type") == "tool_use" and part.get("name") == "SendMessage"]
     if not sends:
         said = next((as_str(event.get("result")) for event in reversed(events) if event.get("type") == "result"), "")
         return _unaccepted_relay(forward, f"the relay made no SendMessage call: {one_line(said) or 'no output'}",

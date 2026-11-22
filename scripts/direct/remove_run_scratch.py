@@ -114,6 +114,8 @@ def main() -> int:
     reported: set[Path] = set()
 
     def report(folder: Path, reason: str) -> None:
+        if not scratch.retained_folder_exists(folder):
+            return
         resolved = folder.resolve()
         if resolved not in reported:
             print(f"kept for a manual removal list: {folder} (remove_run_scratch, {reason})", file=sys.stderr)
@@ -129,8 +131,7 @@ def main() -> int:
 
         try:
             for folder, _ in copies.owned_workspaces(copies.caller_owner(), purpose=copies.WorkspaceScanPurpose.REPORT):
-                if os.path.lexists(folder):
-                    report(folder, "the session ended")
+                report(folder, "the session ended")
         except (copies.CopyError, OSError, scratch.ScratchError) as error:
             print(f"remove_run_scratch: cannot report owned workspaces: {error}", file=sys.stderr)
     return 0

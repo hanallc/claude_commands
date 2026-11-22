@@ -27,16 +27,19 @@ from contextlib import AbstractContextManager, ExitStack, contextmanager
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 from enum import Enum
+from functools import cached_property
+from itertools import chain
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
 from uuid import uuid4
 
 from scripts.lib.process_failure import failure_detail
-from scripts.lib import build_folder_lock, build_folders, conf, conf_reads, git_exclude, git_files
+from scripts.lib import build_folder_lock, build_folders, conf, conf_reads, copy_record, file_lock, git_exclude, git_files, scratch, session_folder
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.worktree import worktree_links
 
 if TYPE_CHECKING:
+    from scripts.lint import tmp_sweep
     from scripts.production import staff
 
 
@@ -232,11 +235,15 @@ def checked_output(layout: RecordedWorktreeOutput) -> Path:
     return output
 
 
+def _target_matches(target: Path, output: Path) -> bool:
+    return target.is_symlink() and target.readlink() == output
+
+
 def ensure_target_link(checkout: Path, output: Path, *, save_existing: bool = True) -> None:
     """Create the output and repair the checkout's target link."""
     ensure_output_folder(output)
     target = checkout / "target"
-    if target.is_symlink() and target.readlink() == output:
+    if _target_matches(target, output):
         return
     git_exclude.ensure_excluded(checkout, "/target")
     if target.is_symlink():
@@ -1086,6 +1093,14 @@ class MoveStage(Enum):
     FINISHED = "finished"
 
 
+class MigrationInUse(Exception):
+    """The migration must keep a source until its use ends."""
+
+
+class MigrationPlanChanged(Exception):
+    """The source no longer matches the migration plan."""
+
+
 class MoveOutput(Enum):
     LIVE_UNIT = "live-unit"
     RETIRED_UNIT = "retired-unit"
@@ -1158,14 +1173,29 @@ def move_file(path: Path) -> Path:
     return move_folder() / record_file(path).name
 
 
+class WorktreeMoveLockHeld(Refused):
+    def __init__(self, lock: Path) -> None:
+        super().__init__(1, "another worktree move is in progress")
+        self.lock: Path = lock
+
+
 @contextmanager
-def move_lock() -> Generator[None]:
-    move_folder().mkdir(parents=True, exist_ok=True)
-    with (move_folder() / "move.lock").open("a") as lock:
+def move_lock(*, create: bool = True) -> Generator[None]:
+    path = move_folder() / "move.lock"
+    if create:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        lock = path.open("a" if create else "r")
+    except FileNotFoundError:
+        if create:
+            raise
+        yield
+        return
+    with lock:
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as error:
-            raise Refused(1, "another worktree move is in progress") from error
+            raise WorktreeMoveLockHeld(path) from error
         yield
 
 
@@ -1224,8 +1254,11 @@ def _move_destination(repo: str, unit: str, short_name: str) -> Path:
     return destination.parent.resolve() / destination.name
 
 
+_LEGACY_SCRATCH = Path("claude/scratch")
+
+
 def _scratch_root() -> Path:
-    return build_folders.build_root().resolve() / "claude" / "scratch"
+    return build_folders.build_root().resolve() / _LEGACY_SCRATCH
 
 
 def _legacy_claude_present() -> bool:
@@ -1235,12 +1268,17 @@ def _legacy_claude_present() -> bool:
 def _git_move_options(checkout: git_files.Checkout) -> tuple[str, ...]:
     if checkout.git_dir == checkout.common_dir:
         return ()
+    return _linked_move_options(checkout.git_dir)
+
+
+def _linked_move_options(entry: Path) -> tuple[str, ...]:
+    lock = entry / "locked"
     try:
-        reason = (checkout.git_dir / "locked").read_text().strip()
+        reason = lock.read_text().strip()
     except FileNotFoundError:
         return ()
     if not reason.startswith("staff:"):
-        raise ValueError(f"{checkout.toplevel}: the Git worktree is locked: {reason}")
+        raise ValueError(f"kept: {lock} held")
     return ("--force", "--force")
 
 
@@ -1262,72 +1300,151 @@ def _open_move(move: WorktreeMove, *, clone_members: tuple[Path, ...] = ()) -> M
     return journal
 
 
-def _copy_across_filesystems(journal: MoveJournal) -> MoveJournal:
+type RenameGuard = Callable[[Path], AbstractContextManager[Callable[[], None]]]
+
+
+@contextmanager
+def _unguarded_rename(_path: Path) -> Generator[Callable[[], None]]:
+    yield lambda: None
+
+
+def _source_signature(source: Path) -> dict[Path, tuple[int, int, int]]:
+    """Read the size and change times of each entry without following links."""
+    def unreadable(error: OSError) -> None:
+        raise error
+
+    paths = (Path(top) / name for top, folders, files in os.walk(source, onerror=unreadable)
+             for name in (*folders, *files))
+    signature: dict[Path, tuple[int, int, int]] = {}
+    try:
+        for path in chain((source,), paths):
+            status = path.lstat()
+            signature[path] = (status.st_size, status.st_mtime_ns, status.st_ctime_ns)
+    except OSError as error:
+        raise MigrationInUse(f"source signature unavailable: {error}") from error
+    return signature
+
+
+def _discard_changed_stage(journal: MoveJournal) -> None:
+    stage = journal.staging
+    try:
+        if not journal.destination.matches(stage):
+            raise ValueError("the stage identity changed")
+        shutil.rmtree(stage)
+    except (OSError, ValueError):
+        report_retained_folder(stage, "cannot discard the stage after the source changed")
+
+
+def _copy_across_filesystems(journal: MoveJournal, protect: RenameGuard) -> MoveJournal:
     old, new = journal.move.old, journal.move.new
-    if not os.path.lexists(new):
-        if not journal.source.matches(old):
-            raise ValueError(f"{old}: source identity changed during the move")
+    stage = journal.staging
+    published = os.path.lexists(new)
+    source_present = journal.source.matches(old)
+    if not source_present and not journal.source.matches(journal.backup):
+        raise ValueError(f"{old}: source identity changed during the move")
+    if source_present:
         entry = git_files.at(old)
         _ = _git_move_options(entry)
         if entry.git_dir != (old / ".git" if journal.git_entry == Path(".git") else journal.git_entry):
             raise ValueError(f"{old}: the Git worktree entry changed")
-        stage = journal.staging
-        if not os.path.lexists(stage) or journal.destination == journal.source:
-            if os.path.lexists(stage):
+        if published:
+            # An older journal can publish the copy before renaming the source.
+            if not journal.destination.matches(new) or os.path.lexists(stage):
+                raise ValueError(f"{new}: cannot verify the prior move destination")
+            with protect(new) as final_check:
+                final_check()
+                _ = new.rename(stage)
+            published = False
+        if os.path.lexists(stage):
+            if journal.destination == journal.source or not journal.destination.matches(stage):
                 report_retained_folder(stage, "a prior move left an unverified stage")
                 raise ValueError(f"{stage}: review the prior move stage before retrying")
+            # The source can change while kept. Prepare a fresh copy.
+            report_retained_folder(stage, "the prior stage can differ from the current source")
+            journal = replace(journal, destination=journal.source, copy_tag=uuid4().hex)
+            write_move(journal)
+            stage = journal.staging
+        with protect(old) as final_check:
+            final_check()
+            original = _source_signature(old)
             if sys.platform == "linux":
                 _ = subprocess.run(["cp", "-a", "--reflink=auto", "--", str(old), str(stage)], check=True)
             else:
                 _ = shutil.copytree(old, stage, symlinks=True)
             journal = replace(journal, destination=FolderIdentity.read(stage))
             write_move(journal)
-        if not journal.destination.matches(stage):
-            raise ValueError(f"{stage}: staged worktree identity changed")
+            if os.path.lexists(journal.backup):
+                raise FileExistsError(f"{journal.backup}: move backup already exists")
+            try:
+                final_check()
+            finally:
+                try:
+                    unchanged = _source_signature(old) == original
+                except MigrationInUse:
+                    unchanged = False
+                if not unchanged:
+                    _discard_changed_stage(journal)
+                    raise MigrationInUse("changed during copy") from None
+            if not journal.destination.matches(stage):
+                raise MigrationInUse("cannot verify the staged copy")
+            _check_planned_clone_members(journal)
+            _ = old.rename(journal.backup)
+    prepared = new if published else stage
+    if not journal.destination.matches(prepared):
+        raise ValueError(f"{prepared}: prepared worktree identity changed")
+    if not published:
         _ = stage.rename(new)
-    if not journal.destination.matches(new):
-        raise ValueError(f"{new}: destination identity changed during the move")
-    if journal.source.matches(old):
-        if os.path.lexists(journal.backup):
-            raise FileExistsError(f"{journal.backup}: move backup already exists")
-        _ = old.rename(journal.backup)
     return journal
 
 
-def _publish_move_source(journal: MoveJournal) -> MoveJournal:
+def _relocated_clone_member(move: WorktreeMove, member: Path) -> Path:
+    if member.is_relative_to(move.old):
+        return move.new / member.relative_to(move.old)
+    return member
+
+
+def _publish_move_source(journal: MoveJournal, protect: RenameGuard) -> MoveJournal:
     old, new = journal.move.old, journal.move.new
     new.parent.mkdir(parents=True, exist_ok=True)
-    if journal.copy_tag:
-        journal = _copy_across_filesystems(journal)
-    elif not os.path.lexists(new):
-        if not journal.source.matches(old):
-            raise ValueError(f"{old}: source identity changed during the move")
-        if journal.git_entry == Path(".git"):
-            _ = old.rename(new)
-        else:
-            entry = git_files.at(old)
-            if entry.git_dir != journal.git_entry:
-                raise ValueError(f"{old}: the Git worktree entry changed")
-            main = main_checkout(old)
-            if any(tree.path == new for tree in linked_trees(main)):
-                raise FileExistsError(f"{new}: Git already registers the move destination")
-            _ = git(main, "worktree", "move", *_git_move_options(entry), str(old), str(new))
-    if not journal.destination.matches(new):
-        raise ValueError(f"{new}: destination identity changed during the move")
-    _ = git(new, "worktree", "repair", *map(str, journal.clone_members))
-    checkout = git_files.at(new)
-    if checkout.git_dir != (new / ".git" if journal.git_entry == Path(".git") else journal.git_entry):
-        raise ValueError(f"{new}: the move changed the Git worktree entry")
-    for member in journal.clone_members:
-        if git_files.at(member).common_dir != checkout.common_dir:
-            raise ValueError(f"{member}: Git still points to the old clone store")
-    if old.exists() and not old.is_symlink():
-        raise FileExistsError(f"{old}: the former worktree path is occupied")
-    try:
-        old.symlink_to(new, target_is_directory=True)
-    except FileExistsError:
-        if not old.is_symlink() or old.resolve() != new:
-            raise ValueError(f"{old}: the former path does not point to {new}") from None
+    with ExitStack() as relocation:
+        if journal.copy_tag:
+            journal = _copy_across_filesystems(journal, protect)
+        elif not os.path.lexists(new):
+            if not journal.source.matches(old):
+                raise ValueError(f"{old}: source identity changed during the move")
+            if journal.git_entry == Path(".git"):
+                final_check = relocation.enter_context(protect(old))
+                final_check()
+                _check_planned_clone_members(journal)
+                _ = old.rename(new)
+            else:
+                entry = git_files.at(old)
+                if entry.git_dir != journal.git_entry:
+                    raise ValueError(f"{old}: the Git worktree entry changed")
+                main = main_checkout(old)
+                if any(tree.path == new for tree in linked_trees(main)):
+                    raise FileExistsError(f"{new}: Git already registers the move destination")
+                options = _git_move_options(entry)
+                final_check = relocation.enter_context(protect(old))
+                final_check()
+                _ = git(main, "worktree", "move", *options, str(old), str(new))
+        if not journal.destination.matches(new):
+            raise ValueError(f"{new}: destination identity changed during the move")
+        members = tuple(_relocated_clone_member(journal.move, member) for member in journal.clone_members)
+        _ = git(new, "worktree", "repair", *map(str, members))
+        checkout = git_files.at(new)
+        if checkout.git_dir != (new / ".git" if journal.git_entry == Path(".git") else journal.git_entry):
+            raise ValueError(f"{new}: the move changed the Git worktree entry")
+        for member in members:
+            if git_files.at(member).common_dir != checkout.common_dir:
+                raise ValueError(f"{member}: Git still points to the old clone store")
+        if old.exists() and not old.is_symlink():
+            raise FileExistsError(f"{old}: the former worktree path is occupied")
+        try:
+            old.symlink_to(new, target_is_directory=True)
+        except FileExistsError:
+            if not old.is_symlink() or old.resolve() != new:
+                raise ValueError(f"{old}: the former path does not point to {new}") from None
     worktree_links.link_transcripts(old, new)
     _ = _update_worktree_staff(old, new)
     journal = replace(journal, stage=MoveStage.LINKED)
@@ -1353,11 +1470,11 @@ def _update_worktree_staff(old: Path, new: Path) -> str:
     return owner
 
 
-def _finish_worktree_move(journal: MoveJournal) -> MoveJournal:
+def _finish_worktree_move(journal: MoveJournal, *, protect: RenameGuard = _unguarded_rename) -> MoveJournal:
     if journal.stage is MoveStage.FINISHED:
         return journal
     if journal.stage is MoveStage.PLANNED:
-        journal = _publish_move_source(journal)
+        journal = _publish_move_source(journal, protect)
     move = journal.move
     if not journal.destination.matches(move.new):
         raise ValueError(f"{move.new}: destination identity changed during the move")
@@ -1383,11 +1500,13 @@ def _finish_worktree_move(journal: MoveJournal) -> MoveJournal:
                               _update_worktree_staff(move.old, move.new), "")
     write_record(replace(previous, path=str(move.new), repo=str(repo), layout=layout))
     for member in journal.clone_members:
-        try:
-            recorded = read_record(record_file(member))
-        except FileNotFoundError:
+        relocated = _relocated_clone_member(move, member)
+        recorded = checkout_record(member) or checkout_record(relocated)
+        if recorded is None:
             continue
-        write_record(replace(recorded, repo=str(repo)))
+        write_record(replace(recorded, repo=str(repo), path=str(relocated)))
+        if member != relocated:
+            record_file(member).unlink(missing_ok=True)
     record_file(move.old).unlink(missing_ok=True)
     journal = replace(journal, stage=MoveStage.FINISHED)
     write_move(journal)
@@ -1697,19 +1816,77 @@ def _migration_names(trees: list[RegisteredTree], repos: dict[Path, RepositoryNa
     return names, showrunners
 
 
-def _migration_skip(path: Path, scratch: Path) -> str:
+def _migration_maker_roots(scratch: Path, settings: conf.ConfigRead) -> tuple[Path, ...]:
+    # The base setting names the former scratch root, even when the host uses the build drive.
+    former_scratch = copy_record.FORMER_ROOT
+    values = settings.settings
+    if isinstance(values, dict) and (setting := values.get("roots.scratch")) is not None and setting.value:
+        former_scratch = Path(setting.value).expanduser()
+    roots = (Path("/tmp/claude/unit"), Path("/tmp/claude/delegate"), scratch.parents[1] / "slot",
+             session_folder.configured_root().resolve(), Path.home() / ".local")
+    former_scratch = former_scratch.resolve()
+    return roots if former_scratch == scratch else (*roots, former_scratch)
+
+
+@dataclass(frozen=True)
+class MigrationFolders:
+    build_root: Path
+    maker_roots: tuple[Path, ...]
+
+    @property
+    def scratch(self) -> Path:
+        return self.build_root / _LEGACY_SCRATCH
+
+    @classmethod
+    def configured(cls) -> MigrationFolders:
+        settings = conf.read_or_repository("build_folders")
+        root = build_folders.build_root(settings=settings).resolve()
+        return cls(root, _migration_maker_roots(root / _LEGACY_SCRATCH, settings))
+
+
+def _migration_build_keep(path: Path, folders: MigrationFolders) -> str:
+    try:
+        try:
+            resolved = path.resolve(strict=True)
+        except FileNotFoundError:
+            resolved = path.resolve()
+    except (OSError, RuntimeError) as error:
+        return f"cannot verify the checkout path ({error})"
+    if folders.build_root.is_relative_to(resolved) or resolved.parent == folders.build_root:
+        return "contains the build root or a build repository folder"
+    # The model has no scratch unit here. Numbered names in legacy scratch still move.
+    if not resolved.is_relative_to(folders.scratch):
+        form = build_folders.parse_resolved_form(resolved, folders.build_root)
+        if isinstance(form, build_folders.BuildCopy):
+            return "a numbered build copy; the build folder model owns it"
+        if isinstance(form, build_folders.CiOutput):
+            return "a CI runner folder; the build folder model owns it"
+        if isinstance(form, build_folders.MainOutput):
+            return "a main output; the build folder model owns it"
+        if resolved.parent.parent == folders.build_root:
+            try:
+                _ = build_folders.unit_folder(resolved.parent.name, resolved.name, root=folders.build_root)
+            except build_folders.InvalidFolderForm:
+                pass
+            else:
+                return "a build unit folder; the build folder model owns it"
+    return ""
+
+
+def _migration_path_keep(path: Path, folders: MigrationFolders) -> str:
+    if reason := _migration_build_keep(path, folders):
+        return reason
+    scratch_root = folders.scratch
     home = Path.home()
     if any(parts == (".claude", "worktrees") for parts in zip(path.parts, path.parts[1:])):
         return "Claude Code owns this worktree"
     if path == home / "worktrees/nate_style-message-clarity":
         return "the user's worktree"
-    if path == scratch / "sessionmove-bbf204":
+    if path == scratch_root / "sessionmove-bbf204":
         return "queue moves the session-folder checkout before the switch"
-    if (any(path.is_relative_to(root) for root in (
-            Path("/tmp/claude/unit"), Path("/tmp/claude/scratch"), Path("/tmp/claude/delegate"),
-            scratch.parents[1] / "slot", Path("/session"), home / ".local"))
-            or (path.is_relative_to(scratch) and path != scratch
-                and path.relative_to(scratch).parts[0].startswith("gate-"))
+    if (any(path.is_relative_to(root) for root in folders.maker_roots)
+            or (path.is_relative_to(scratch_root) and path != scratch_root
+                and path.relative_to(scratch_root).parts[0].startswith("gate-"))
             or any(part.startswith("b44doc-") for part in path.parts)):
         return "the maker owns this worktree"
     return ""
@@ -1735,6 +1912,56 @@ class WorktreeMigration:
     main: tuple[MainOutputPlan, ...]
     clone_members: dict[Path, tuple[Path, ...]]
     skipped: dict[Path, str]
+
+
+@dataclass(frozen=True)
+class MigrationJournalView:
+    relocated: tuple[MoveJournal, ...]
+    kept: dict[Path, str]
+
+
+class MigrationLocationUnverified(ValueError):
+    """The member has no verified current checkout path."""
+
+
+@dataclass
+class MigrationLocations:
+    """Resolve the current directory behind a logical member path."""
+
+    journals_by_destination: dict[Path, MoveJournal]
+
+    def record_publication(self, journal: MoveJournal) -> None:
+        self.journals_by_destination[journal.move.new] = journal
+
+    def current(self, member: Path) -> Path:
+        journal = self.journals_by_destination.get(member)
+        if journal is None:
+            status = member.lstat()
+            if stat.S_ISLNK(status.st_mode):
+                raise MigrationLocationUnverified("Git names a symbolic link")
+            if not stat.S_ISDIR(status.st_mode):
+                raise MigrationLocationUnverified("Git names a path that is not a directory")
+            return member.resolve(strict=True)
+
+        checkout = journal.move.new
+        try:
+            if (journal.stage is MoveStage.PLANNED and journal.copy_tag
+                    and not os.path.lexists(checkout) and journal.source.matches(journal.backup)):
+                checkout = journal.staging
+            if journal.destination.matches(checkout):
+                return checkout.resolve(strict=True)
+        except (OSError, RuntimeError) as error:
+            raise MigrationLocationUnverified(f"cannot verify the saved checkout at {checkout} ({error})") from error
+        raise MigrationLocationUnverified(f"cannot verify the saved checkout at {checkout}")
+
+
+def _migration_linked_trees(repo: Path, repairs: dict[Path, MoveJournal]) -> tuple[RegisteredTree, ...]:
+    trees = linked_trees(repo)
+    if not repairs:
+        return trees
+    entries = git_files.at(repo).common_dir / "worktrees"
+    paths = {old: journal.move.new for old, journal in repairs.items() if journal.git_entry.parent == entries}
+    return tuple(replace(tree, path=paths[tree.path]) if tree.path in paths else tree for tree in trees)
 
 
 def _migration_main_checkouts(home: Path) -> tuple[Path, ...]:
@@ -1773,7 +2000,7 @@ def _scratch_checkouts(scratch: Path) -> tuple[Path, ...]:
 
 
 def _live_migration_repos(units: list[staff.StaffRow], repos: dict[Path, RepositoryNames],
-                          machine: str) -> dict[staff.StaffId, str]:
+                          machine: str, relocated_repos: dict[Path, str]) -> dict[staff.StaffId, str]:
     from scripts.production import staff
 
     by_git_dir: dict[Path, str] = {}
@@ -1787,6 +2014,9 @@ def _live_migration_repos(units: list[staff.StaffRow], repos: dict[Path, Reposit
         location = row.worktree
         if not isinstance(location, staff.PresentWorktree) or location.machine != machine:
             continue
+        if relocated_repo := relocated_repos.get(location.path):
+            confirmed[row.id] = relocated_repo
+            continue
         try:
             checkout = git_files.at(location.path)
             repo_word = by_git_dir.get(checkout.common_dir)
@@ -1796,33 +2026,43 @@ def _live_migration_repos(units: list[staff.StaffRow], repos: dict[Path, Reposit
     return confirmed
 
 
-def plan_worktree_migration(listed: dict[Path, ListedWorktree],
-                            snapshot: staff.StaffSnapshot) -> WorktreeMigration:
+def plan_worktree_migration(listed: dict[Path, ListedWorktree], snapshot: staff.StaffSnapshot,
+                            folders: MigrationFolders, journals: MigrationJournalView,
+                            locations: MigrationLocations) -> WorktreeMigration:
     """Read Git, staff, and the supplied list without changing them."""
     from scripts.agents.remote import local_machine
     from scripts.production import staff
 
     machine = local_machine()
-    scratch = _scratch_root()
+    scratch_root = folders.scratch
     mains = _migration_main_checkouts(Path.home())
+    repairs = {journal.move.old: journal for journal in journals.relocated
+               if journal.stage is MoveStage.PLANNED and journal.git_entry != Path(".git")}
+    repaired_entries = {journal.move.new: journal for journal in repairs.values()}
     clones: dict[Path, tuple[RegisteredTree, ...]] = {}
-    skipped: dict[Path, str] = {path: "main checkout stays in place" for path in mains}
+    skipped = {path: "main checkout stays in place" for path in mains} | journals.kept
     trees: list[RegisteredTree] = []
-    for path in _scratch_checkouts(scratch):
-        reason = _migration_skip(path, scratch)
+    for path in _scratch_checkouts(scratch_root):
+        reason = _migration_path_keep(path, folders)
         if reason:
             skipped[path] = reason
-        elif (path / ".git").is_dir():
-            entries = linked_trees(path)
+            continue
+        try:
+            if not (path / ".git").is_dir():
+                continue
+            entries = _migration_linked_trees(path, repairs)
             if (path.name == "crprof-8a8cbf" and not entries
                     and git(path, "config", "--get", "remote.origin.url", check=False).returncode == 1):
                 skipped[path] = _ARCHIVED_SCRATCH
                 continue
             clones[path] = entries
             branch = git_files.head(git_files.at(path))
-            trees.append(RegisteredTree(path, path, branch.name if isinstance(branch, git_files.OnBranch) else ""))
+        except (Refused, git_files.GitFilesError, OSError, UnicodeError) as error:
+            skipped[path] = journals.kept.get(path, f"cannot read the clone's Git metadata ({error})")
+            continue
+        trees.append(RegisteredTree(path, path, branch.name if isinstance(branch, git_files.OnBranch) else ""))
     for main in mains:
-        trees.extend(linked_trees(main))
+        trees.extend(_migration_linked_trees(main, repairs))
     for entries in clones.values():
         trees.extend(entries)
 
@@ -1831,8 +2071,13 @@ def plan_worktree_migration(listed: dict[Path, ListedWorktree],
     for repo in (*mains, *clones):
         try:
             names = _repository_names(repo, follow_local_origin=repo in clones)
-        except (build_folders.InvalidFolderForm, Refused) as error:
-            skipped[repo] = str(error)
+        except (build_folders.InvalidFolderForm, Refused, git_files.GitFilesError, OSError, UnicodeError) as error:
+            if repo in mains:
+                if not isinstance(error, (build_folders.InvalidFolderForm, Refused)):
+                    raise
+                skipped[repo] = str(error)
+            else:
+                _ = skipped.setdefault(repo, f"cannot read the clone's origin ({error})")
             continue
         repos[repo] = names
         if repo in mains:
@@ -1842,7 +2087,7 @@ def plan_worktree_migration(listed: dict[Path, ListedWorktree],
             else:
                 skipped[repo] = f"keeps its current output; {primary} is the main checkout for {names.word}"
 
-    for path in _scratch_checkouts(scratch):
+    for path in _scratch_checkouts(scratch_root):
         if path not in skipped and all(tree.path != path for tree in trees):
             skipped[path] = _UNVERIFIED_SCRATCH
 
@@ -1850,37 +2095,89 @@ def plan_worktree_migration(listed: dict[Path, ListedWorktree],
     # Keep the known merge checkout if its staff document is unavailable.
     _ = showrunners.setdefault(Path.home() / "rust/hana_catalyst",
                                "showrunner checkout awaits question 4 (Hana merge checkout)")
-    journals = [read_move(path) for path in sorted(move_folder().glob("*.json"))]
-    placed = {journal.move.new for journal in journals}
-    former = {path for journal in journals for path in (journal.move.old, journal.source_key)}
-    stale = [tree for tree in trees if not os.path.lexists(tree.path) and tree.path not in former
-             and tree.path not in showrunners
-             and not _migration_skip(tree.path, scratch)]
-    already_placed = {tree.path for tree in trees if tree.path in placed}
-    for path in already_placed:
-        skipped[path] = "already moved"
-    candidates: list[RegisteredTree] = []
+    missing: list[RegisteredTree] = []
+    validated: list[RegisteredTree] = []
     for tree in trees:
         path = tree.path
-        if path in already_placed or path in former or tree in stale:
-            continue
-        reason = showrunners.get(path) or _migration_skip(path, scratch)
-        if reason:
+        if reason := showrunners.get(path):
             skipped[path] = reason
-        elif path.is_symlink():
-            skipped[path] = "Git names a symbolic link"
+            continue
+        try:
+            physical = locations.current(path)
+        except FileNotFoundError:
+            if reason := _migration_path_keep(path, folders):
+                skipped[path] = reason
+            else:
+                missing.append(tree)
+            continue
+        except MigrationLocationUnverified as error:
+            skipped[path] = str(error)
+            continue
+        except (OSError, RuntimeError) as error:
+            skipped[path] = f"cannot read the checkout path ({error})"
+            continue
+        if reason := (
+            _migration_path_keep(path, folders)
+            or _migration_path_keep(physical, folders)
+        ):
+            skipped[path] = reason
         elif tree.store not in repos:
-            skipped[path] = "the repository has no usable origin name"
+            _ = skipped.setdefault(path, "the repository has no usable origin name")
         else:
+            repair = repaired_entries.get(path)
+            clone_member = tree.store in clones and path != tree.store
             try:
-                _ = _git_move_options(git_files.at(path))
-            except ValueError as error:
+                if repair is None or clone_member:
+                    checkout = git_files.at(physical)
+                    if clone_member:
+                        _check_clone_member_store(checkout, git_files.at(tree.store).common_dir)
+                    if repair is None:
+                        _ = _git_move_options(checkout)
+                if repair is not None:
+                    _ = _linked_move_options(repair.git_entry)
+            except (OSError, ValueError, MigrationPlanChanged) as error:
                 skipped[path] = str(error)
             else:
-                candidates.append(tree)
+                validated.append(tree)
+
+    placed_destinations = {journal.move.new for journal in journals.relocated
+                           if journal.stage is not MoveStage.FINISHED}
+    finished_destinations: dict[Path, list[FolderIdentity]] = {}
+    for journal in journals.relocated:
+        path = journal.move.new
+        if journal.stage is MoveStage.FINISHED and path not in placed_destinations:
+            finished_destinations.setdefault(path, []).append(journal.destination)
+    registered_paths = {tree.path for tree in trees}
+    for path in registered_paths & finished_destinations.keys():
+        try:
+            _ = path.lstat()
+            if any(identity.matches(path) for identity in finished_destinations[path]):
+                placed_destinations.add(path)
+            else:
+                skipped[path] = "the finished move destination has changed"
+        except FileNotFoundError:
+            continue
+        except OSError as error:
+            skipped[path] = f"cannot verify the finished move destination ({error})"
+    skipped.update(journals.kept)
+    stale = [tree for tree in missing if tree.path not in skipped]
+    already_placed: set[Path] = set()
+    candidates: list[RegisteredTree] = []
+    for tree in validated:
+        path = tree.path
+        if path in skipped:
+            continue
+        if path in placed_destinations:
+            already_placed.add(path)
+            skipped[path] = "already moved"
+        else:
+            candidates.append(tree)
 
     units = [row for row in snapshot.rows if row.kind == "unit"]
-    live_repos = _live_migration_repos(units, repos, machine)
+    relocated_repos = {path: journal.move.repo for journal in journals.relocated
+                       if journal.stage is not MoveStage.FINISHED
+                       for path in (journal.move.old, journal.move.new, journal.source_key)}
+    live_repos = _live_migration_repos(units, repos, machine, relocated_repos)
     live_names = {row.name for row in units if isinstance(row.worktree, staff.PresentWorktree)}
     live = {(live_repos[row.id], row.name) for row in units if row.id in live_repos}
     retired = {row.name for row in units if isinstance(row.worktree, staff.RemovedWorktree)}
@@ -1924,7 +2221,13 @@ def plan_worktree_migration(listed: dict[Path, ListedWorktree],
             elif saved is not None and isinstance(saved.layout, RecordedWorktreeOutput):
                 fact = UnitFact(saved.layout.unit, "worktree record")
             else:
-                slug = _subject_unit(path)
+                try:
+                    slug = _subject_unit(path)
+                except (Refused, git_files.GitFilesError, OSError, UnicodeError) as error:
+                    if tree.store not in clones:
+                        raise
+                    skipped[path] = f"cannot read the Git commit subject ({error})"
+                    continue
                 derived = short_names.unit_from_subject(slug, repo)
                 if derived.casefold() in (repo.word.casefold(), repo.origin.casefold()):
                     derived = ""
@@ -1963,73 +2266,466 @@ def plan_worktree_migration(listed: dict[Path, ListedWorktree],
     clone_members: dict[Path, tuple[Path, ...]] = {}
     for clone, members in clones.items():
         members = tuple(member for member in members if member not in stale)
-        if clone not in selected or any(member.path not in selected and member.path not in already_placed
-                                         for member in members):
+        blocked = next((member.path for member in members
+                        if member.path not in selected and member.path not in already_placed), None)
+        if clone not in selected or blocked is not None:
+            reason = f"{clone}: the clone and every linked worktree need move names"
+            if blocked is not None and blocked in skipped:
+                reason = f"{clone}: linked worktree {blocked} stays ({skipped[blocked]})"
             for path in (clone, *(member.path for member in members)):
                 if path in selected:
                     del selected[path]
-                    skipped[path] = f"{clone}: the clone and every linked worktree need move names"
+                    skipped[path] = reason
             continue
         clone_members[clone] = tuple(selected[member.path].move.new if member.path in selected else member.path
                                      for member in members)
     for plan in moves:
         if plan.move.new in collisions:
             skipped[plan.tree.path] = f"short name shared by multiple worktrees at {plan.move.new}"
-    for path in listed.keys() - {tree.path for tree in trees} - skipped.keys() - former:
+    former = {path for journal in journals.relocated for path in (journal.move.old, journal.source_key)}
+    for path in listed.keys() - registered_paths - skipped.keys() - former:
         skipped[path] = "no registered worktree at this path"
     ordered = tuple(sorted(selected.values(), key=lambda plan: (plan.tree.path in clones, plan.tree.path)))
     return WorktreeMigration(ordered, tuple(stale), tuple(main_plans), clone_members, skipped)
 
 
-def migrate_worktrees(list_file: Path, *, dry_run: bool) -> int:
-    from scripts.production import staff
+_NO_PROBE_FDS: frozenset[int] = frozenset()
 
-    listed = listed_worktrees(list_file)
-    if dry_run:
-        with conf_reads.record_reads(""):
+
+def _migration_processes(paths: tuple[Path, ...], *, ignored_fds: frozenset[int] = _NO_PROBE_FDS
+                         ) -> tmp_sweep.ProcessUsesKnown | tmp_sweep.ProcessUsesUnavailable:
+    from scripts.lint import tmp_sweep
+
+    prefixes = tuple(map(str, paths))
+    if sys.platform == "linux":
+        return tmp_sweep.process_paths(tmp_sweep.PROC_DIR, prefixes, require_readable_user_processes=True,
+                                       ignored_self_fds=ignored_fds)
+    if not paths:
+        return tmp_sweep.ProcessUsesKnown([])
+    return tmp_sweep.lsof_paths(prefixes, require_complete=True, ignored_self_fds=ignored_fds, same_user_only=True)
+
+
+def _migration_process_use(path: Path, uses: tmp_sweep.ProcessUsesKnown | tmp_sweep.ProcessUsesUnavailable) -> str:
+    from scripts.lint import tmp_sweep
+
+    if isinstance(uses, tmp_sweep.ProcessUsesUnavailable):
+        return "process paths unavailable"
+    if uses.unreadable_process_pids:
+        return f"unreadable process {min(uses.unreadable_process_pids)}"
+    root = str(path)
+    prefix = root + os.sep
+    pids = {pid for name, pid, _ in uses.paths
+            if name.startswith(prefix) or name.removesuffix(tmp_sweep.DELETED_SUFFIX) == root}
+    if pids:
+        return "pids " + ", ".join(map(str, sorted(pids)))
+    return ""
+
+
+def _paths_overlap(first: Path, second: Path) -> bool:
+    return first.is_relative_to(second) or second.is_relative_to(first)
+
+
+def _migration_leases(folders: MigrationFolders, paths: tuple[Path, ...]) -> tuple[build_folders.HeldFolderLease, ...]:
+    if not any(_paths_overlap(path, folders.build_root) for path in paths):
+        return ()
+    return tuple(lease for lease in build_folders.held_folder_leases()
+                 if not lease.path.resolve().is_relative_to(folders.scratch))
+
+
+def _migration_lease_use(path: Path, leases: tuple[build_folders.HeldFolderLease, ...]) -> str:
+    for lease in leases:
+        if _paths_overlap(path, lease.path.resolve()):
+            if isinstance(lease, build_folders.KnownFolderLease):
+                return f"kept: {lease.path.with_name(lease.path.name + '.lock')} held"
+            return f"copy lease unverified at {lease.path}"
+    return ""
+
+
+def _check_clone_member_store(member: git_files.Checkout, common_dir: Path) -> None:
+    if member.common_dir != common_dir:
+        raise MigrationPlanChanged(f"linked worktree {member.toplevel} now uses a different Git store")
+
+
+def _check_planned_clone_members(journal: MoveJournal) -> None:
+    if journal.git_entry != Path(".git"):
+        return
+    current: set[Path] = set()
+    try:
+        for tree in linked_trees(journal.move.old):
             try:
-                snapshot = staff.local_snapshot()
-            except staff.StaffAbsent:
-                snapshot = staff.StaffSnapshot(())
-            return _apply_migration(listed, snapshot, dry_run=True)
-    with move_lock():
-        for path in sorted(move_folder().glob("*.json")):
-            _ = _finish_worktree_move(read_move(path))
-        return _apply_migration(listed, staff_record(), dry_run=False)
+                _ = tree.path.lstat()
+            except FileNotFoundError:
+                continue
+            current.add(tree.path)
+        if current != set(journal.clone_members):
+            raise MigrationPlanChanged("linked checkouts changed since the plan")
+        common_dir = git_files.at(journal.move.old).common_dir
+        for member in sorted(current):
+            _check_clone_member_store(git_files.at(member), common_dir)
+    except (OSError, Refused, git_files.GitFilesError) as error:
+        raise MigrationInUse(f"cannot verify linked worktrees: {error}") from error
+
+
+def _take_migration_locks(source: Path, folders: MigrationFolders, locks: ExitStack,
+                          marks: scratch.BusyMarkScope, leased: set[Path], fds: list[int], *, create: bool) -> None:
+    covered = _paths_overlap(source, folders.build_root) and not source.is_relative_to(folders.scratch)
+    copy = copy_record.numbered_copy_checkout(source) if covered else copy_record.OutsideNumberedCopy()
+    lease_path = copy.resolve() if isinstance(copy, Path) else source
+    if lease_path not in leased:
+        leased.add(lease_path)
+        lease = locks.enter_context(build_folders.folder_removal_lease(
+            lease_path, children=covered and not isinstance(copy, Path), wait=False,
+            create=create and isinstance(copy, Path), probe_fds=fds))
+        if isinstance(lease, build_folders.RemovalLockHeld):
+            raise MigrationInUse(f"kept: {lease.lock} held")
+        if isinstance(lease, build_folders.RefusedRemovalLease):
+            raise MigrationInUse(f"copy lease unavailable at {source}")
+    try:
+        idle = locks.enter_context(scratch.busy_locks(
+            source, create=create, scope=marks, inherited_fds=fds, raise_if_held=True))
+    except scratch.BusyMarkHeld as error:
+        raise MigrationInUse(f"kept: {error.lock} held") from error
+    if not idle:
+        raise MigrationInUse(f"busy claim unavailable at {source}")
+
+
+def _probe_migration_locks(source: Path, folders: MigrationFolders) -> str:
+    try:
+        with ExitStack() as locks:
+            _take_migration_locks(source, folders, locks, scratch.BusyMarkScope(), set(), [], create=False)
+    except MigrationInUse as error:
+        return str(error)
+    return ""
+
+
+def _migration_lock_use(lock: Path) -> str:
+    try:
+        if file_lock.probe_existing_exclusive(lock) is file_lock.LockAvailability.HELD:
+            return f"kept: {lock} held"
+    except OSError as error:
+        return f"cannot verify lock {lock} ({error})"
+    return ""
+
+
+def _migration_target_lock(checkout: Path, common_dir: Path, output: Path) -> str:
+    if _target_matches(checkout / "target", output):
+        return ""
+    return _migration_lock_use(git_exclude.exclude_lock_path(common_dir))
+
+
+@dataclass(frozen=True)
+class MigrationPublication:
+    staff_sources: frozenset[Path]
+    legacy_claude: bool
+
+    @classmethod
+    def read(cls, snapshot: staff.StaffSnapshot, folders: MigrationFolders) -> MigrationPublication:
+        from scripts.agents.remote import local_machine
+        from scripts.production import staff
+
+        machine = local_machine()
+        sources = frozenset(_move_source(row.worktree.path) for row in snapshot.rows
+                            if isinstance(row.worktree, (staff.PresentWorktree, staff.RemovedWorktree))
+                            and row.worktree.machine == machine)
+        return cls(sources, folders.scratch.exists())
+
+    @cached_property
+    def staff_lock_use(self) -> str:
+        from scripts.production import staff
+
+        status = staff.worktree_write_lock_status()
+        if isinstance(status, staff.StaffWorktreeWriteLockHeld):
+            return f"kept: {status.lock} held"
+        return ""
+
+    def lock_use(self, move: WorktreeMove, checkout: Path, common_dir: Path, *, update_staff: bool = True) -> str:
+        if update_staff and move.old in self.staff_sources:
+            if reason := self.staff_lock_use:
+                return reason
+        if move.output is MoveOutput.LIVE_UNIT and self.places_output(move.repo):
+            output = build_folders.output_path(move.repo, move.unit, move.short_name)
+            return _migration_target_lock(checkout, common_dir, output)
+        return ""
+
+    def places_output(self, repo: str) -> bool:
+        return repo != "claude" or not self.legacy_claude
+
+
+@contextmanager
+def _hold_migration_relocation(path: Path, journal: MoveJournal,
+                               locations: MigrationLocations, folders: MigrationFolders, progress: MigrationProgress
+                               ) -> Generator[Callable[[], None]]:
+    _check_planned_clone_members(journal)
+    try:
+        current = {member: locations.current(member) for member in dict.fromkeys((path, *journal.clone_members))}
+    except (OSError, RuntimeError, MigrationLocationUnverified) as error:
+        raise MigrationInUse(f"cannot verify move sources: {error}") from error
+    paths = tuple(dict.fromkeys(current.values()))
+    fds: list[int] = []
+    with ExitStack() as locks:
+        leases = _migration_leases(folders, paths)
+        leased: set[Path] = set()
+        marks = scratch.BusyMarkScope()
+        for source in paths:
+            if reason := _migration_build_keep(source, folders):
+                raise MigrationPlanChanged(reason)
+            _take_migration_locks(source, folders, locks, marks, leased, fds, create=True)
+            if reason := _migration_lease_use(source, leases):
+                raise MigrationInUse(reason)
+
+        def final_check() -> None:
+            # A process can enter the source between this scan and the rename.
+            uses = _migration_processes(paths, ignored_fds=frozenset(fds))
+            progress.record_process_scan(uses)
+            for member, source in current.items():
+                if reason := _migration_process_use(source, uses):
+                    if member != path and not reason.startswith("unreadable process "):
+                        reason = f"linked worktree {member}: {reason}"
+                    raise MigrationInUse(reason)
+
+        yield final_check
+
+
+@dataclass
+class MigrationProgress:
+    kept: dict[Path, str]
+    in_use: dict[Path, str]
+    kernel_hidden: dict[int, str]
+    moved: int = 0
+
+    def record_process_scan(self, uses: tmp_sweep.ProcessUsesKnown | tmp_sweep.ProcessUsesUnavailable) -> None:
+        from scripts.lint import tmp_sweep
+
+        if isinstance(uses, tmp_sweep.ProcessUsesKnown):
+            for process in uses.kernel_hidden:
+                _ = self.kernel_hidden.setdefault(process.pid, process.comm)
+
+    def print_keeps(self, *, dry_run: bool) -> None:
+        for pid, comm in sorted(self.kernel_hidden.items()):
+            print(f"not checked (hidden by the kernel): {pid} {comm}")
+        reasons = self.kept.copy()
+        for path, reason in self.in_use.items():
+            if reason.startswith("kept: "):
+                reasons[path] = reason
+            elif reason.startswith("unreadable process ") or reason == "changed during copy":
+                reasons[path] = f"in use: {reason}"
+            else:
+                reasons[path] = f"in use ({reason})"
+        for path, reason in sorted(reasons.items()):
+            print(f"keep {path}: {reason}")
+        verb = "would move" if dry_run else "moved"
+        print(f"{verb} {self.moved}, kept in use {len(self.in_use)}, kept {len(reasons) - len(self.in_use)}")
+
+
+class MigrationJournalState(Enum):
+    RELOCATED = "relocated"
+    UNMOVED = "unmoved"
+    PUBLISHED_COPY = "published copy"
+    OCCUPIED_COPY_DESTINATION = "occupied copy destination"
+    UNVERIFIED = "unverified"
+
+
+def _migration_journal_state(journal: MoveJournal) -> MigrationJournalState:
+    if journal.stage is MoveStage.FINISHED:
+        return MigrationJournalState.RELOCATED
+    if journal.stage is MoveStage.LINKED:
+        if journal.destination.matches(journal.move.new):
+            return MigrationJournalState.RELOCATED
+        return MigrationJournalState.UNVERIFIED
+    if journal.copy_tag and journal.source.matches(journal.backup):
+        return MigrationJournalState.RELOCATED
+    if journal.source.matches(journal.move.old):
+        if journal.copy_tag and os.path.lexists(journal.move.new):
+            if journal.destination.matches(journal.move.new):
+                return MigrationJournalState.PUBLISHED_COPY
+            return MigrationJournalState.OCCUPIED_COPY_DESTINATION
+        return MigrationJournalState.UNMOVED
+    if not journal.copy_tag and journal.source.matches(journal.move.new):
+        return MigrationJournalState.RELOCATED
+    return MigrationJournalState.UNVERIFIED
+
+
+def _migration_journals(*, dry_run: bool) -> MigrationJournalView:
+    relocated: list[MoveJournal] = []
+    kept: dict[Path, str] = {}
+    for path in sorted(move_folder().glob("*.json")):
+        journal = read_move(path)
+        move = journal.move
+        try:
+            state = _migration_journal_state(journal)
+        except OSError as error:
+            kept[move.old] = kept[move.new] = f"cannot verify the saved move ({error})"
+            continue
+        match state:
+            case MigrationJournalState.RELOCATED:
+                relocated.append(journal)
+            case MigrationJournalState.UNMOVED:
+                if not dry_run:
+                    if journal.copy_tag and os.path.lexists(journal.staging):
+                        report_retained_folder(journal.staging, "a discarded move left a staged copy")
+                    path.unlink()
+            case MigrationJournalState.PUBLISHED_COPY:
+                kept[move.old] = f"review the previously published copy at {move.new} before retry"
+                kept[move.new] = f"the saved copy of {move.old} needs review"
+            case MigrationJournalState.OCCUPIED_COPY_DESTINATION:
+                kept[move.old] = f"review the occupied copy destination at {move.new} before retry"
+                kept[move.new] = f"the saved move from {move.old} names this path"
+            case MigrationJournalState.UNVERIFIED:
+                kept[move.old] = kept[move.new] = "cannot verify the source identity in the saved move"
+    return MigrationJournalView(tuple(relocated), kept)
+
+
+def _print_migration_resume(journal: MoveJournal) -> None:
+    move = journal.move
+    print(f"resume {move.old} -> {move.new} | {move.unit} | {move.short_name} | move record")
+
+
+def _migration_recovery_locks(journals: MigrationJournalView, publication: MigrationPublication,
+                              locations: MigrationLocations) -> MigrationJournalView:
+    kept = journals.kept.copy()
+    for journal in journals.relocated:
+        if journal.stage is MoveStage.FINISHED:
+            continue
+        try:
+            checkout = locations.current(journal.move.new)
+        except (OSError, RuntimeError, MigrationLocationUnverified) as error:
+            reason = str(error)
+        else:
+            common = checkout / ".git" if journal.git_entry == Path(".git") else journal.git_entry.parent.parent
+            reason = publication.lock_use(journal.move, checkout, common, update_staff=journal.stage is MoveStage.PLANNED)
+        if reason:
+            kept[journal.move.old] = kept[journal.move.new] = reason
+    return replace(journals, kept=kept)
+
+
+def _migration_clone_keep(plan: WorktreeMigration, progress: MigrationProgress,
+                          sources: dict[Path, Path], clone: Path) -> str:
+    for member in plan.clone_members.get(clone, ()):
+        if (source := sources.get(member)) is not None:
+            if source in progress.in_use or source in progress.kept:
+                return f"linked worktree {source} stays in place"
+    return ""
+
+
+def migrate_worktrees(list_file: Path, *, dry_run: bool) -> int:
+    listed = listed_worktrees(list_file)
+    try:
+        with ExitStack() as locks:
+            if dry_run:
+                _ = locks.enter_context(conf_reads.record_reads(""))
+            _ = locks.enter_context(move_lock(create=not dry_run))
+            return _apply_migration(listed, staff_record(), dry_run=dry_run)
+    except WorktreeMoveLockHeld as error:
+        print(f"kept: {error.lock} held")
+        return error.code
 
 
 def _apply_migration(listed: dict[Path, ListedWorktree], snapshot: staff.StaffSnapshot, *, dry_run: bool) -> int:
-    plan = plan_worktree_migration(listed, snapshot)
-    for path, reason in sorted(plan.skipped.items()):
-        print(f"keep {path}: {reason}")
+    folders = MigrationFolders.configured()
+    publication = MigrationPublication.read(snapshot, folders)
+    journals = _migration_journals(dry_run=dry_run)
+    active_journals: dict[Path, MoveJournal] = {}
+    for journal in journals.relocated:
+        if journal.stage is MoveStage.FINISHED:
+            continue
+        destination = journal.move.new
+        if destination in active_journals:
+            raise ValueError(f"{destination}: multiple unfinished move journals")
+        active_journals[destination] = journal
+    locations = MigrationLocations(active_journals)
+    journals = _migration_recovery_locks(journals, publication, locations)
+    progress = MigrationProgress({}, {}, {})
+    plan = plan_worktree_migration(listed, snapshot, folders, journals, locations)
+    progress.kept.update(plan.skipped)
+    sources = {move.move.new: move.move.old for move in plan.moves}
+    groups = {clone: (clone, *(sources.get(member, member) for member in members))
+              for clone, members in plan.clone_members.items()}
+    paths: dict[Path, Path] = {}
+    busy_paths: dict[Path, str] = {}
+    for source in dict.fromkeys(chain(sources.values(), chain.from_iterable(groups.values()))):
+        try:
+            paths[source] = locations.current(source)
+        except (OSError, RuntimeError, MigrationLocationUnverified) as error:
+            busy_paths[source] = f"cannot verify the checkout at {source} ({error})"
+    lock_paths = {source: [path] for source, path in paths.items()}
+    for member in chain.from_iterable(plan.clone_members.values()):
+        source = sources.get(member, member)
+        if source in lock_paths and member not in lock_paths[source]:
+            lock_paths[source].append(member)
+    leases = _migration_leases(folders, tuple(chain.from_iterable(lock_paths.values())))
+    uses = _migration_processes(tuple(paths.values()))
+    progress.record_process_scan(uses)
+    for source, path in paths.items():
+        reason = ""
+        for lock_path in lock_paths[source]:
+            reason = _probe_migration_locks(lock_path, folders) or _migration_lease_use(lock_path, leases)
+            if reason:
+                break
+        reason = reason or _migration_process_use(path, uses)
+        if reason:
+            busy_paths[source] = reason
+    for planned in plan.moves:
+        source = planned.move.old
+        if source not in busy_paths:
+            common = git_files.at(planned.tree.store).common_dir
+            if reason := publication.lock_use(planned.move, paths[source], common):
+                busy_paths[source] = reason
+    for source in sources.values():
+        if reason := busy_paths.get(source):
+            progress.in_use[source] = reason
+    for clone, group in groups.items():
+        if busy := next((path for path in group if path in busy_paths), None):
+            for path in group:
+                if path in sources.values() and path not in progress.in_use:
+                    progress.kept[path] = f"{clone}: {busy} stays in use ({busy_paths[busy]})"
+
+    for journal in journals.relocated:
+        if journal.stage is not MoveStage.FINISHED and journal.move.new not in journals.kept:
+            if not dry_run:
+                locations.record_publication(_finish_worktree_move(journal))
+            _print_migration_resume(journal)
     for tree in plan.missing:
         print(f"review {tree.path}: missing registration path")
-    for move in plan.moves:
-        layout = move.move
-        names = f"{layout.unit} | {layout.short_name} | {move.source} | {layout.output.value}"
-        print(f"move {layout.old} -> {layout.new} | {names}")
-    legacy_claude = _legacy_claude_present()
-    for main in plan.main:
-        verb = "defer main output" if main.repo == "claude" and legacy_claude else "main output"
-        print(f"{verb} {main.checkout} -> {build_folders.main_output_path(main.repo)}")
-    if dry_run:
-        for path in sorted(move_folder().glob("*.json")):
-            journal = read_move(path)
-            if journal.stage is not MoveStage.FINISHED:
-                move = journal.move
-                print(f"resume {move.old} -> {move.new} | {move.unit} | {move.short_name} | move record")
-        return 0
-    for tree in plan.missing:
-        report_retained_folder(tree.store, f"Git still records the missing checkout {tree.path}")
+        if not dry_run:
+            report_retained_folder(tree.store, f"Git still records the missing checkout {tree.path}")
     for planned in plan.moves:
-        journal = _open_move(planned.move, clone_members=plan.clone_members.get(planned.tree.path, ()))
-        _ = _finish_worktree_move(journal)
+        layout = planned.move
+        source = layout.old
+        if source in progress.kept or source in progress.in_use:
+            continue
+        if reason := _migration_clone_keep(plan, progress, sources, source):
+            progress.kept[source] = reason
+            continue
+        if not dry_run:
+            journal = _open_move(layout, clone_members=plan.clone_members.get(source, ()))
+            try:
+                completed = _finish_worktree_move(
+                    journal, protect=lambda path: _hold_migration_relocation(path, journal, locations, folders, progress))
+            except MigrationPlanChanged as error:
+                progress.kept[source] = str(error)
+                continue
+            except MigrationInUse as error:
+                progress.in_use[source] = str(error)
+                continue
+            locations.record_publication(completed)
+        progress.moved += 1
+        names = f"{layout.unit} | {layout.short_name} | {planned.source} | {layout.output.value}"
+        print(f"move {layout.old} -> {layout.new} | {names}")
     for main in plan.main:
-        if main.repo != "claude" or not legacy_claude:
-            ensure_target_link(main.checkout, build_folders.main_output_path(main.repo))
-    blocked_scratch = [path for path in _scratch_checkouts(_scratch_root())
-                       if plan.skipped.get(path) not in (_UNVERIFIED_SCRATCH, _ARCHIVED_SCRATCH)]
-    if blocked_scratch:
+        output = build_folders.main_output_path(main.repo)
+        places_output = publication.places_output(main.repo)
+        if places_output:
+            common = git_files.at(main.checkout).common_dir
+            if reason := _migration_target_lock(main.checkout, common, output):
+                progress.kept[main.checkout] = reason
+                continue
+        verb = "main output" if places_output else "defer main output"
+        print(f"{verb} {main.checkout} -> {output}")
+        if not dry_run and places_output:
+            ensure_target_link(main.checkout, output)
+    progress.print_keeps(dry_run=dry_run)
+    if not dry_run and any(progress.kept.get(path) not in (_UNVERIFIED_SCRATCH, _ARCHIVED_SCRATCH)
+                           for path in _scratch_checkouts(folders.scratch)):
         print("keep the old build root until all remaining scratch checkouts have a confirmed location", file=sys.stderr)
         return 1
     return 0

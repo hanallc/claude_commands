@@ -37,7 +37,7 @@ from scripts.lib.signal_test_support import install_signal_pid_guard
 from scripts.agents import detached_run_process, detached_runs, pane_record, worker_lifecycle
 from scripts.agents.detached_runs import deliver_in_fresh_process
 from scripts.buildlog import treekey
-from scripts.build_hold import build_hold, hold_enforcer
+from scripts.build_hold import build_hold, hold_enforcer, shared_state_defaults
 from scripts.direct import progress_history
 from scripts.lib import atomic_file, conf, process_group, process_start, unit_runs
 from scripts.lib.atomic_file import write_text_atomic
@@ -709,6 +709,20 @@ class DetachedRunsTests(unittest.TestCase):
         saved = cast(detached_runs.RunRecord, json.loads(path.read_text()))
         self.assertFalse(saved.get("completion_pending"))
 
+    def test_hold_stop_lookup_uses_requests_from_both_confirmed_records(self) -> None:
+        path = self.record(["fixture command"])
+        older, newer, staged = ("1" * 32, "2" * 32, "3" * 32)
+        fallback = {"run_id": path.stem, "stop_reason": "Older hold.", "hold_stop_requests": [older]}
+        write_text_atomic(path.with_suffix(".stop-confirmed"), json.dumps(fallback))
+        self.update_record(path, stop_reason="Newer hold.", hold_stop_requests=[newer])
+        write_text_atomic(path.with_suffix(".stop-staged"), json.dumps({**fallback, "hold_stop_requests": [staged]}))
+
+        for request_id in (older, newer):
+            with self.subTest(request_id=request_id):
+                self.assertTrue(detached_runs.confirms_hold_stop(path, path.stem, request_id))
+        self.assertFalse(detached_runs.confirms_hold_stop(path, path.stem, staged))
+        self.assertFalse(detached_runs.confirms_hold_stop(path, "different-run", older))
+
     def test_prune_keeps_only_the_finished_runs_that_a_reader_needs(self) -> None:
         runs = self.session / detached_runs.DETACHED_RUNS_DIR
         opened = time.time()
@@ -792,6 +806,26 @@ class DetachedRunsTests(unittest.TestCase):
         _ = self.finished_run("director-done", director_delivery="sent: accepted", worker="director", staff_id="")
         _ = self.start(["new-check"], to="director")
         self.assertEqual(self.run_files("director-done"), [])
+
+    def test_start_keeps_an_old_run_when_its_hold_stop_confirmation_cannot_be_copied(self) -> None:
+        request_id = "a" * 32
+        path = self.finished_run("director-stopped", worker="director", staff_id="",
+                                 exit_code=143, hold_stop_requests=[request_id])
+        files = self.run_files(path.stem)
+        hold_paths = {"BUILD_HOLD_DIR": str(self.root / "holders"),
+                      "BUILD_HOLD_RELEASE_DIR": str(self.root / "release")}
+        with patch.dict(os.environ, hold_paths):
+            with (patch.object(shared_state_defaults, "write_stop_confirmation", side_effect=OSError("fixture copy failed")),
+                  contextlib.redirect_stderr(io.StringIO()) as errors):
+                popen, output = self.start(["new-check"], to="director")
+            popen.assert_called_once()
+            self.assertIn("started detached for director", output)
+            self.assertIn(f"kept {path}: could not copy hold stop confirmations: fixture copy failed", errors.getvalue())
+            self.assertEqual(self.run_files(path.stem), files)
+            self.assertFalse(shared_state_defaults.stop_confirmation_path(request_id).exists())
+            self.assertEqual(detached_runs.prune_finished(path.parent), [path.stem])
+            self.assertEqual(self.run_files(path.stem), [])
+            self.assertEqual(shared_state_defaults.read_stop_confirmation(request_id), "stopped")
 
     def test_a_gone_supervisor_holds_no_place_at_the_limit(self) -> None:
         _ = write_config_fixture(self.root / "config/detached_runs.conf", "LIVE_RUN_LIMIT=3\n")
@@ -2071,7 +2105,15 @@ send.deliver_worker_text = fake_sender
                         return self.supervise(path)
 
                     prefix = ["fixture-scope"] if timing == "during scope retry" else []
+                    hold_paths = {
+                        "BUILD_HOLD_DIR": str(self.root / "holders"),
+                        "BUILD_HOLD_RELEASE_DIR": str(self.root / "release"),
+                        "BUILD_HOLD_ENFORCER_DIR": str(self.root / "enforcer"),
+                        "BUILDLOG_DIR": str(self.root / "buildlog"),
+                    }
                     with ThreadPoolExecutor(max_workers=1, thread_name_prefix="supervisor-race") as executor, \
+                         patch.dict(os.environ, hold_paths), \
+                         patch.object(build_hold, "natedev_holds", return_value=build_hold.NatedevHolds((holder,))), \
                          patch.object(detached_runs, "record_lock", side_effect=observe_record_lock), \
                          patch.object(fcntl, "flock", side_effect=observe_flock), \
                          patch.object(build_hold, "process_start_time", side_effect=reuse_at_recheck), \

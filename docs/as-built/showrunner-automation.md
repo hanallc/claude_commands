@@ -332,19 +332,15 @@ Each local Promote checkout must exist before the command pushes.
      A command that the base does not select, such as a package the checkpoint adds or renames, stays the unit's red without a run.
      A command that cannot start on the base, and a main conflict, also leave the red with the unit.
      A resumed merge whose restored tip already holds the checkpoint runs no base check.
-     A batch runs the base check before its bisect. A base red holds every item, and the bisect runs only the units' own red names.
+     A batch stops at its first red test step and returns every row with the failed step and the row's test selection.
   9. *push and promote*: `tested_main_push` acquires `main_push_lock` and fetches main after tests.
      It publishes only when the tested tip contains main.
      Otherwise, it keeps the lock, merges main, retests the new paths, and tries again.
      The first test run is outside this lock. Retests run inside it, so main cannot move under a tested tip.
      `push_git` pushes without another merge.
      A main conflict aborts the merge and reports `push: held` with the conflicting paths.
-     Before publication, a held batch checks each checkpoint against the same main commit with `git merge-tree --write-tree`.
-     Only conflicting items receive their conflict files and instructions to merge `origin/main` into their own unit branch.
-     The batch removes those items and their unit's later items, restores the starting tip, and retries the remaining items.
-     Clean items can land in the same run.
-     If every item is clean, the combined merge conflict keeps the batch held.
-     Each notice then says the checkpoint is clean against main and can land alone.
+     A conflict with main ends a batch and sends the conflicting paths to every requester.
+     The next queued item can proceed.
      Preparation failure restores the tip before this run when origin still has its old tip.
      An interrupted promotion and a child handoff use the same test loop.
      Each caller retains its own rollback rule for a failed push.
