@@ -21,7 +21,7 @@ import sys
 import tempfile
 import time
 import unittest
-from collections.abc import Callable, Generator, Iterator
+from collections.abc import Generator, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from importlib import import_module
@@ -48,6 +48,7 @@ from scripts.message import roster, send, sessions
 from scripts.lib.test_hang_guard import LauncherHangGuard, TEST_HANG_GUARD_SECS
 from scripts.lib.fork_test_support import ForkChild, ForkChildren
 from scripts.lib.socket_test_support import short_socket_directory
+from scripts.direct.test_assign_claude import exit_watch
 from scripts.message.repeat_guard_test_support import install_guard_test_budget
 from scripts.production import staff, session_staff, test_worker, unit_lookup, worker, worker_admission
 from scripts.production.staff_test_support import StaffTestCase, fixture_member, fixture_runtime_id, fixture_session
@@ -58,7 +59,7 @@ THREAD_TWO = fixture_runtime_id("detached-run-thread-two")
 LASTING_THREAD = fixture_runtime_id("detached-run-lasting-thread")
 ADOPTED_THREAD = fixture_runtime_id("detached-run-adopted-thread")
 SHARED_THREAD = fixture_runtime_id("detached-run-shared-thread")
-DEAD_PID = 2 ** 22 + 12345
+DEAD_PID = test_worker.DETACHED_FIXTURE_DEAD_PID
 
 
 def setUpModule() -> None:
@@ -88,6 +89,15 @@ def deliver_in_fixture(path: Path) -> int:
     return detached_runs.main(["deliver", str(path)])
 
 
+@contextlib.contextmanager
+def supervisor_spawns(pid: int = 4321) -> Generator[MagicMock]:
+    """Fake supervisor starts at the detached run module's launch boundary."""
+    popen = MagicMock(return_value=SimpleNamespace(pid=pid))
+    launcher = SimpleNamespace(**{**vars(subprocess), "Popen": popen})
+    with patch.object(detached_runs, "subprocess", launcher):
+        yield popen
+
+
 class DetachedRunsTests(unittest.TestCase):
     root: Path  # pyright: ignore[reportUninitializedInstanceVariable]
     session: Path  # pyright: ignore[reportUninitializedInstanceVariable]
@@ -99,6 +109,7 @@ class DetachedRunsTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.stack = contextlib.ExitStack()
+        _ = self.stack.enter_context(test_worker.detached_fixture_processes())
         self.root = Path(self.stack.enter_context(tempfile.TemporaryDirectory()))
         _ = self.stack.enter_context(isolated_staff_file(self.root / "staff.json", {}))
         self.session = self.root / "unit" / "run-1"
@@ -293,23 +304,9 @@ class DetachedRunsTests(unittest.TestCase):
         self.assertNotIn("Detached run live-0", text)
         self.assertIn("Detached run live-1", text)
 
-    @contextlib.contextmanager
-    def supervisor_spawns(self) -> Generator[MagicMock]:
-        """Fake supervisor starts and keep other subprocess calls real."""
-        popen = MagicMock(return_value=SimpleNamespace(pid=4321))
-        real_popen = cast(Callable[..., subprocess.Popen[bytes]], subprocess.Popen)
-
-        def spawn(arguments: list[str], **options: object) -> subprocess.Popen[bytes]:
-            if "supervise" in arguments:
-                return cast(subprocess.Popen[bytes], popen(arguments, **options))
-            return real_popen(arguments, **options)
-
-        with patch.object(subprocess, "Popen", side_effect=spawn):
-            yield popen
-
     def start(self, command: list[str], to: str = WORKER) -> tuple[MagicMock, str]:
         """Start the command for the seat and return its supervisor calls and output."""
-        with self.supervisor_spawns() as popen, contextlib.redirect_stdout(io.StringIO()) as output:
+        with supervisor_spawns() as popen, contextlib.redirect_stdout(io.StringIO()) as output:
             code = detached_runs.main(["start", "--session-dir", str(self.session), "--to", to, "--", *command])
         self.assertEqual(code, 0)
         return popen, output.getvalue()
@@ -355,10 +352,9 @@ class DetachedRunsTests(unittest.TestCase):
         self.assertEqual(self.sent, [])
 
     def test_start_detaches_a_supervisor_and_records_the_run(self) -> None:
-        popen = MagicMock(return_value=SimpleNamespace(pid=4321))
         environment = {"CODEX_THREAD_ID": THREAD_ONE, "CLAUDE_CODE_SESSION_ID": "director-session",
                        "UNIT_TEAM_ROLE": "test"}
-        with patch.dict(os.environ, environment), patch.object(subprocess, "Popen", popen), \
+        with patch.dict(os.environ, environment), supervisor_spawns() as popen, \
                 contextlib.redirect_stdout(io.StringIO()) as output:
             code = detached_runs.main(["start", "--label", "verify.sh check", "--", "bash", "verify.sh", "check"])
         self.assertEqual(code, 0)
@@ -381,7 +377,7 @@ class DetachedRunsTests(unittest.TestCase):
         records[0].unlink()
         with contextlib.chdir(self.root), \
              patch.object(detached_runs, "caller_from_environment", return_value=detached_runs.NotDetachedWorker()), \
-             patch.object(subprocess, "Popen", popen), contextlib.redirect_stdout(io.StringIO()):
+             supervisor_spawns() as popen, contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(detached_runs.main([
                 "start", "--session-dir", str(self.session.relative_to(self.root)), "--to", WORKER,
                 "--", "bash", "verify.sh", "check",
@@ -407,7 +403,7 @@ class DetachedRunsTests(unittest.TestCase):
             ["env", "-vu", "X", "systemd-run", "--wait", "true"],
             ["env", "--split-string=systemd-run --wait true"],
         ):
-            with (self.subTest(command=command), self.supervisor_spawns() as popen,
+            with (self.subTest(command=command), supervisor_spawns() as popen,
                   contextlib.redirect_stderr(io.StringIO()) as errors):
                 self.assertEqual(detached_runs.main(["start", "--", *command]), 2)
                 popen.assert_not_called()
@@ -459,7 +455,7 @@ class DetachedRunsTests(unittest.TestCase):
         _ = write_config_fixture(self.root / "config/detached_runs.conf", "LIVE_RUN_LIMIT=3\n")
         paths = self.seat_runs(3)
         before = {path: path.read_bytes() for path in paths}
-        with patch.object(subprocess, "Popen") as popen, \
+        with supervisor_spawns() as popen, \
                 contextlib.redirect_stdout(io.StringIO()) as out, \
                 contextlib.redirect_stderr(io.StringIO()) as err:
             code = detached_runs.main(["start", "--session-dir", str(self.session), "--to", WORKER,
@@ -569,10 +565,10 @@ class DetachedRunsTests(unittest.TestCase):
                 if outcome in ("twin", "limit"):
                     _ = self.seat_runs(3)
                 if outcome == "unusable config":
-                    _ = settings.write_text("# whole: 1..\nLIVE_RUN_LIMIT=invalid\n")
+                    _ = write_config_fixture(settings, "LIVE_RUN_LIMIT=invalid\n")
                 command = ["fixture", "1"] if outcome == "twin" else ["new-check"]
                 with (self.completion_that_prunes(path) as completed,
-                      self.supervisor_spawns() as spawn,
+                      supervisor_spawns() as spawn,
                       contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO())):
                     try:
                         code = detached_runs.main(["start", "--session-dir", str(self.session), "--to", WORKER,
@@ -841,14 +837,14 @@ class DetachedRunsTests(unittest.TestCase):
     def test_start_reads_the_live_run_limit_from_config(self) -> None:
         paths = self.seat_runs(1)
         config = self.root / "config/detached_runs.conf"
-        _ = config.write_text("# whole: 1..\nLIVE_RUN_LIMIT=1\n")
-        with patch.object(subprocess, "Popen") as popen, contextlib.redirect_stderr(io.StringIO()) as err:
+        _ = write_config_fixture(config, "LIVE_RUN_LIMIT=1\n")
+        with supervisor_spawns() as popen, contextlib.redirect_stderr(io.StringIO()) as err:
             code = detached_runs.main(["start", "--session-dir", str(self.session), "--to", WORKER,
                                    "--", "new-check"])
         self.assertEqual(code, 4)
         popen.assert_not_called()
         self.assertIn("live-run limit 1", err.getvalue())
-        _ = config.write_text("# whole: 1..\nLIVE_RUN_LIMIT=2\n")
+        _ = write_config_fixture(config, "LIVE_RUN_LIMIT=2\n")
         accepted, _ = self.start(["new-check"])
         accepted.assert_called_once()
         self.assertEqual(len(list(paths[0].parent.glob("*.json"))), 2)
@@ -862,7 +858,7 @@ class DetachedRunsTests(unittest.TestCase):
         self.assertEqual(len(list(paths[0].parent.glob("*.json"))), 4)
 
     def test_parallel_starts_cannot_exceed_one_configured_place(self) -> None:
-        _ = (self.root / "config/detached_runs.conf").write_text("# whole: 1..\nLIVE_RUN_LIMIT=1\n")
+        _ = write_config_fixture(self.root / "config/detached_runs.conf", "LIVE_RUN_LIMIT=1\n")
         runs = self.session / detached_runs.DETACHED_RUNS_DIR
         runs.mkdir()
         context = multiprocessing.get_context("fork")
@@ -876,7 +872,7 @@ class DetachedRunsTests(unittest.TestCase):
             with (patch.object(worker_panes, "worker_run", worker_run),
                   patch.object(detached_run_process, "supervisor_match", return_value=True),
                   patch.object(treekey, "tree_key", return_value="fixture-tree"),
-                  patch.object(subprocess, "Popen", return_value=SimpleNamespace(pid=4321))):
+                  supervisor_spawns()):
                 return detached_runs.main(["start", "--session-dir", str(self.session),
                                            "--to", WORKER, "--", "check", str(index)])
 
@@ -901,13 +897,13 @@ class DetachedRunsTests(unittest.TestCase):
         self.assertEqual(len(list(runs.glob("*.json"))), 1)
 
     def test_start_and_reap_preserve_an_unpublished_record_under_the_start_lock(self) -> None:
-        _ = (self.root / "config/detached_runs.conf").write_text("# whole: 1..\nLIVE_RUN_LIMIT=1\n")
+        _ = write_config_fixture(self.root / "config/detached_runs.conf", "LIVE_RUN_LIMIT=1\n")
         script = """
 import fcntl
 import sys
-from types import SimpleNamespace
 from unittest.mock import patch
 from scripts.agents import detached_runs
+from scripts.agents.test_detached_runs import supervisor_spawns
 flock = fcntl.flock
 def lock(fd, operation):
     print('locking', flush=True)
@@ -915,7 +911,7 @@ def lock(fd, operation):
 with (patch.object(fcntl, 'flock', lock),
       patch.object(detached_runs, 'deliver', return_value='fixture'),
       patch.object(detached_runs.treekey, 'tree_key', return_value='key-1'),
-      patch.object(detached_runs.subprocess, 'Popen', return_value=SimpleNamespace(pid=4321))):
+      supervisor_spawns()):
     args = [sys.argv[1], '--session-dir', sys.argv[2]]
     if sys.argv[1] == 'start':
         args += ['--to', sys.argv[3], '--', 'new-check']
@@ -948,7 +944,7 @@ sys.exit(code)
                 self.assertEqual(list(path.parent.glob("*.json")), [path])
 
     def test_a_supervisor_holds_a_place_when_start_exits_before_its_pid_write(self) -> None:
-        _ = (self.root / "config/detached_runs.conf").write_text("# whole: 1..\nLIVE_RUN_LIMIT=1\n")
+        _ = write_config_fixture(self.root / "config/detached_runs.conf", "LIVE_RUN_LIMIT=1\n")
         script = """
 import os
 import sys
@@ -974,8 +970,8 @@ with socket.socket(socket.AF_UNIX) as connection:
 sys.exit(1)
 """
         guard = LauncherHangGuard("supervisor publication after start exits")
-        address = str(self.root / "ready.sock")
-        with socket.socket(socket.AF_UNIX) as listener:
+        with short_socket_directory() as socket_root, socket.socket(socket.AF_UNIX) as listener:
+            address = str(Path(socket_root) / "ready.sock")
             listener.bind(address)
             listener.listen()
             listener.settimeout(guard.remaining())
@@ -994,9 +990,8 @@ sys.exit(1)
                 record = cast(detached_runs.RunRecord, json.loads(paths[0].read_text()))
                 self.assertGreater(record["pid"], 0)
                 self.assertTrue(detached_run_process.supervises(record["pid"], paths[0]))
-                supervisor = os.pidfd_open(record["pid"])
-                try:
-                    with patch.object(subprocess, "Popen") as popen, \
+                with exit_watch(record["pid"]) as wait_for_exit:
+                    with supervisor_spawns() as popen, \
                             contextlib.redirect_stderr(io.StringIO()) as errors:
                         code = detached_runs.main(["start", "--session-dir", str(self.session), "--to", WORKER,
                                                "--", "another-check"])
@@ -1004,9 +999,7 @@ sys.exit(1)
                     popen.assert_not_called()
                     self.assertEqual(list(paths[0].parent.glob("*.json")), paths)
                     connection.sendall(b"x")
-                    self.assertTrue(select.select([supervisor], [], [], guard.remaining())[0])
-                finally:
-                    os.close(supervisor)
+                    wait_for_exit()
 
     # hana_catalyst-inspectors started one lint run three times after an interrupt (2026-10-21).
     def test_a_second_identical_start_names_the_live_run_and_starts_nothing(self) -> None:
@@ -1162,7 +1155,7 @@ sys.exit(1)
                     subprocess.CompletedProcess(["ps"], 0, "(py(test))\n", ""))
         with patch.object(Path, "exists", exists_without_proc):
             for failure in failures:
-                path = self.finished_run("active", status="running", pid=DEAD_PID,
+                path = self.finished_run("active", status="running", pid=4321,
                                          command_pid=0, command_group=0)
                 saved = path.read_bytes()
                 with self.subTest(failure=failure):
@@ -1173,13 +1166,13 @@ sys.exit(1)
                         self.assertEqual(detached_runs.reap_orphans(str(self.session)), [path.stem])
 
     def test_start_exits_3_for_a_caller_without_a_registered_worker(self) -> None:
-        popen = MagicMock(return_value=SimpleNamespace(pid=4321))
-        for environment in ({"CODEX_THREAD_ID": "thread-unknown"}, {"CODEX_THREAD_ID": ""}):
-            with patch.dict(os.environ, environment), patch.object(subprocess, "Popen", popen):
+        with supervisor_spawns() as popen:
+            for environment in ({"CODEX_THREAD_ID": "thread-unknown"}, {"CODEX_THREAD_ID": ""}):
+                with patch.dict(os.environ, environment):
+                    self.assertEqual(detached_runs.main(["start", "--", "true"]), detached_runs.NOT_A_DETACHED_WORKER)
+            _ = staff.retire(self.worker_id)
+            with patch.dict(os.environ, {"CODEX_THREAD_ID": THREAD_ONE}):
                 self.assertEqual(detached_runs.main(["start", "--", "true"]), detached_runs.NOT_A_DETACHED_WORKER)
-        _ = staff.retire(self.worker_id)
-        with patch.dict(os.environ, {"CODEX_THREAD_ID": THREAD_ONE}), patch.object(subprocess, "Popen", popen):
-            self.assertEqual(detached_runs.main(["start", "--", "true"]), detached_runs.NOT_A_DETACHED_WORKER)
         popen.assert_not_called()
 
     # Criterion 2: the result is held for the seat, then the record is marked finished.
@@ -1205,7 +1198,7 @@ sys.exit(1)
     def test_declared_test_kind_names_the_scope_and_stays_in_the_record(self) -> None:
         runtime = Path(self.stack.enter_context(short_socket_directory())) / "runtime"
         (runtime / "systemd").mkdir(parents=True)
-        with self.supervisor_spawns(), contextlib.redirect_stdout(io.StringIO()):
+        with supervisor_spawns(), contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(detached_runs.main([
                 "start", "--session-dir", str(self.session), "--to", WORKER,
                 "--kind", "python-tests", "--", "env", "PYTHONPATH=.", "sh", "tests.sh",
@@ -1253,7 +1246,7 @@ from scripts.lib.cancellation import CANCELLATION_SIGNALS
 wait = subprocess.Popen.wait
 start = subprocess.Popen.__init__
 run = subprocess.run
-address, watcher = sys.argv[4:6]
+address, watcher = os.environ['TEST_STOP_SOCKET'], os.environ['TEST_STOP_WATCHER']
 def gate_start(process, arguments, *args, **kwargs):
     if arguments[3:4] == ['detached-command']:
         arguments = [*arguments[:4], sys.executable, watcher, *arguments[6:]]
@@ -1285,11 +1278,10 @@ with (patch.object(subprocess.Popen, 'wait', checked_wait), patch.object(subproc
 """
         reason = "stopped for timed test; run again after the release"
         with short_socket_directory() as socket_root:
-            address = Path(socket_root) / "ready.sock"
             # The watcher reports the result text over the socket instead of sending it.
             # It reports after its reap finishes, so the test reads the finished record.
             watcher = self.root / "watcher.py"
-            _ = watcher.write_text(f"""import json, socket, sys
+            _ = watcher.write_text(f"""import json, os, socket, sys
 sys.path.insert(0, {str(Path(__file__).resolve().parents[2])!r})
 from unittest.mock import patch
 from scripts.agents import detached_runs
@@ -1297,10 +1289,11 @@ texts = []
 def deliver(record, result):
     texts.append(detached_runs.result_text(record, result))
     return 'fixture delivery'
-with patch.object(detached_runs, 'deliver', deliver), patch.object(detached_runs, '_complete_worker_dispatch', lambda record: None):
+with (patch.object(detached_runs, 'deliver', deliver),
+      patch.object(detached_runs, '_complete_worker_dispatch', lambda record: None)):
     status = detached_runs.main(sys.argv[1:])
 with socket.socket(socket.AF_UNIX) as connection:
-    connection.connect({str(address)!r})
+    connection.connect(os.environ['TEST_STOP_SOCKET'])
     connection.sendall((json.dumps(dict(role='delivery', verb=sys.argv[1], text=chr(10).join(texts))) + chr(10)).encode())
 sys.exit(status)
 """)
@@ -1316,17 +1309,19 @@ sys.exit(status)
                 stopped = 128 + signal.SIGTERM
                 cases: tuple[tuple[bool, signal.Signals | None], ...] = (
                     (False, None), (True, None), (False, signal.SIGTERM), (False, signal.SIGKILL))
-                for scoped, cancel in cases:
+                for index, (scoped, cancel) in enumerate(cases):
                     with self.subTest(scoped=scoped, cancel=cancel), socket.socket(socket.AF_UNIX) as ready:
                         guard = LauncherHangGuard("detached process group stop")
+                        address = Path(socket_root) / f"ready-{index}.sock"
                         ready.bind(str(address))
                         ready.listen(3)
                         path = self.record([sys.executable, "-c", child_source, str(address)])
                         environment = {**os.environ, "BUILDLOG_SCOPE": "1" if scoped else "0",
+                                       "TEST_STOP_SOCKET": str(address), "TEST_STOP_WATCHER": str(watcher),
                                        "XDG_RUNTIME_DIR": str(runtime), "PATH": str(tools) + os.pathsep + os.environ["PATH"]}
                         with (Path(self.root / "supervisor.log").open("ab") as output,
                               subprocess.Popen([sys.executable, "-c", supervisor_source, "detached_runs.py",
-                                                "supervise", str(path), str(address), str(watcher)],
+                                                "supervise", str(path)],
                                                env=environment,
                                                stdout=output, stderr=subprocess.STDOUT,
                                                start_new_session=True) as supervisor,
@@ -1811,9 +1806,9 @@ exit 143
                 self.assertEqual(worker_lifecycle.read_json_object(path)["status"], "running")
 
         with self.subTest(case="ps times out for both running and finished records"):
-            finished = self.finished_run("awaiting-completion", pid=DEAD_PID, completion_pending=True)
+            finished = self.finished_run("awaiting-completion", pid=4321, completion_pending=True)
             running = self.record(["pending supervisor"]).replace(path.with_name("pending-supervisor.json"))
-            self.update_record(running, run_id=running.stem, pid=DEAD_PID, tree_key="key-1")
+            self.update_record(running, run_id=running.stem, pid=4321, tree_key="key-1")
             ready = self.record(["ready to reap"]).replace(path.with_name("ready-to-reap.json"))
             self.update_record(ready, run_id=ready.stem, pid=0, started_at=0)
             saved = (running.read_bytes(), finished.read_bytes())
@@ -2244,6 +2239,7 @@ class PaneRunDeliveryTests(unittest.TestCase):
         self.fixture = pane_support.WorkerPaneTests()
         self.fixture.setUp()
         self.addCleanup(self.fixture.doCleanups)
+        _ = self.enterContext(test_worker.detached_fixture_processes())
         self.inputs = []
         self.notices = []
         self.defer_transcript = False
@@ -2347,7 +2343,7 @@ class PaneRunDeliveryTests(unittest.TestCase):
         runs = self.run_dir / detached_runs.DETACHED_RUNS_DIR
         with (patch.dict(os.environ, {"CODEX_THREAD_ID": "", "CLAUDE_CODE_SESSION_ID": director.current_session}),
               patch.object(treekey, "tree_key", return_value="private-tree"),
-              patch.object(subprocess, "Popen", return_value=SimpleNamespace(pid=0)) as spawn,
+              supervisor_spawns(0) as spawn,
               contextlib.redirect_stdout(io.StringIO()) as output):
             self.assertEqual(detached_runs.main(["start", "--", "private-land"]), detached_runs.NOT_A_DETACHED_WORKER)
             spawn.assert_not_called()
@@ -2374,7 +2370,7 @@ class PaneRunDeliveryTests(unittest.TestCase):
         run_dir = self.fixture.root / "showrunner-state"
         with (patch.dict(os.environ, {"CODEX_THREAD_ID": "", "CLAUDE_CODE_SESSION_ID": showrunner.current_session}),
               patch.object(treekey, "tree_key", return_value="private-tree"),
-              patch.object(subprocess, "Popen", return_value=SimpleNamespace(pid=0)) as spawn,
+              supervisor_spawns(0) as spawn,
               contextlib.redirect_stdout(io.StringIO()) as output):
             self.assertEqual(detached_runs.main(["start", "--session-dir", str(run_dir), "--", "private-land"]),
                              0, output.getvalue())
@@ -2408,7 +2404,7 @@ class PaneRunDeliveryTests(unittest.TestCase):
                 before = set(runs.glob("*.json"))
                 with (patch.dict(os.environ, {"CODEX_THREAD_ID": row.current_session}),
                       patch.object(treekey, "tree_key", return_value="private-tree"),
-                      patch.object(subprocess, "Popen", return_value=SimpleNamespace(pid=0)) as spawn,
+                      supervisor_spawns(0) as spawn,
                       contextlib.redirect_stdout(io.StringIO()),
                       contextlib.redirect_stderr(io.StringIO()) as errors):
                     code = detached_runs.main(["start", "--session-dir", str(requested_run), "--to", other.name,
@@ -2450,7 +2446,7 @@ class PaneRunDeliveryTests(unittest.TestCase):
                 route = [] if implicit else ["--session-dir", str(self.run_dir), "--to", "test"]
                 with (patch.dict(os.environ, {"CODEX_THREAD_ID": row.current_session}),
                       patch.object(treekey, "tree_key", return_value="private-tree"),
-                      patch.object(subprocess, "Popen", return_value=SimpleNamespace(pid=0)),
+                      supervisor_spawns(0),
                       contextlib.redirect_stdout(output)):
                     code = detached_runs.main(["start", *route, "--", "true"])
                 self.assertEqual(code, 0, output.getvalue())
@@ -3537,7 +3533,7 @@ class PaneRunDeliveryTests(unittest.TestCase):
         reason = "The fixture pass lookup failed."
         with (patch.dict(os.environ, {"CODEX_THREAD_ID": row.current_session}),
               patch.object(progress_history, "active_dispatch", return_value=progress_history.ActiveDispatchUnavailable(reason)),
-              patch.object(subprocess, "Popen", return_value=SimpleNamespace(pid=DEAD_PID)),
+              supervisor_spawns(DEAD_PID),
               patch.object(treekey, "tree_key", return_value="private-tree"),
               contextlib.redirect_stdout(io.StringIO())):
             self.assertEqual(detached_runs.main(["start", "--", "true"]), 0)
@@ -4259,7 +4255,7 @@ class PaneRunDeliveryTests(unittest.TestCase):
         accepted = send.Result("sent", "result received")
         with (patch.dict(os.environ, {"CODEX_THREAD_ID": "", "CLAUDE_CODE_SESSION_ID": director.current_session}),
               patch.object(treekey, "tree_key", return_value="private-tree"),
-              patch.object(subprocess, "Popen", return_value=SimpleNamespace(pid=DEAD_PID)) as spawn,
+              supervisor_spawns(DEAD_PID) as spawn,
               patch.object(send, "send", side_effect=[refusal, accepted]),
               patch.object(detached_runs, "_run", return_value=9),
               patch.object(time, "sleep", side_effect=start_during_delay) as delay):
@@ -4759,7 +4755,7 @@ class PaneRunDeliveryTests(unittest.TestCase):
 
         with (patch.dict(os.environ, {"CODEX_THREAD_ID": "", "CLAUDE_CODE_SESSION_ID": ""}),
               patch.object(treekey, "tree_key", return_value=tree_key),
-              patch.object(subprocess, "Popen", return_value=SimpleNamespace(pid=0)) as spawn):
+              supervisor_spawns(0) as spawn):
             self.assertEqual(detached_runs.main(["start", "--session-dir", str(self.run_dir), "--to", name,
                                                 "--", *command]), 0)
         spawn.assert_called_once()
