@@ -2315,6 +2315,40 @@ process.stdout.write(JSON.stringify({
                 self.assertEqual(row.get("mac_text"), "")
                 self.assertEqual(row.get("because"), reason.removeprefix("it ") if reason else "direct cargo command")
 
+    def test_verify_wait_at_the_natedev_limit_keeps_its_mac_route(self) -> None:
+        from scripts.build_queue.test_placement import PlacementFixture, local_candidate, placement_request, publish_candidate
+        from scripts.mac_test import eligibility
+
+        with PlacementFixture() as fixture:
+            fixture.configure(slot_gap_seconds=60)
+            config = fixture.root / "build_admission.conf"
+            _ = config.write_text(config.read_text() + f"\nmax_runs.{fixture.server.host}.fixture=0\nmax_runs.exempt_unit=natemerge\n")
+            _ = fixture.run_pass()
+            fixture.clock.advance(1)
+            step = placement_request(fixture)
+            _ = publish_candidate(fixture, step, placement.TemporaryExclusion("busy"))
+            request = replace(step,
+                identity=replace(step.identity, verify=admission_records.VerifyCall("test", "verify test", 1, 1)),
+                constraints=replace(step.constraints, candidates=(local_candidate(fixture), *step.constraints.candidates)))
+            reply, = fixture.connect(request).replies()
+            assert isinstance(reply, wire.PlacementWait) and isinstance(reply.wait, wire.Wait), reply
+            reason = reply.wait.reason
+            self.assertEqual(reason.cause if isinstance(reason, admission_records.HeadAdmissionStatus) else reason,
+                             admission_records.RunLimitWait(0, 0, "fixture", fixture.server.host))
+            view, = fixture.connect(wire.ViewRequest()).replies()
+            assert isinstance(view, wire.ViewReply)
+            job = targets.RunningJob("nextest fixture", datetime.now(UTC), targets.NotSeenIdle())
+            snapshots = (snapshot(MAC, targets.Running((job,))), snapshot(NATEDEV, targets.Free()))
+            with (mock.patch.object(admission_client, "view", return_value=view.reading),
+                  mock.patch.object(target_availability, "read_snapshots", return_value=snapshots),
+                  mock.patch.object(build_targets, "step_policy",
+                                    return_value=eligibility.KnownRepository("fixture", str(fixture.root)))):
+                page = memory_feed.reading()
+            row, = page["waiters"]
+            self.assertEqual(row["pid"], request.owner.pid)
+            self.assertEqual(row.get("runs_on"), "natedev or Mac")
+            self.assertEqual(row.get("targets"), ["natedev", "mac"])
+
     def verify_call_page(self) -> memory_feed.MemoryPage:
         """Read the verify facts from admissions through the private service socket."""
         with AdmissionFixture() as fixture:

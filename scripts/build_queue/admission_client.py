@@ -33,6 +33,7 @@ from scripts.build_queue import admission_code, placement, snapshot_codec
 from scripts.build_queue import admission_wire as status_wire
 from scripts.build_queue.admission_wire import read_assignment as read_assignment
 from scripts.build_queue.admission_wire import write_assignment as write_assignment
+from scripts.build_hold.shared_state_defaults import DEFAULT_ADMISSION_SOCKET
 from scripts.build_targets import target_config
 from scripts.direct import step_selection
 if TYPE_CHECKING:
@@ -41,7 +42,7 @@ else:
     from scripts.build_queue import admission_wire as wire
 from scripts.build_queue.system_clock import SystemClock
 
-from scripts.lib import conf
+from scripts.lib import conf, process_stat
 from scripts.lib.atomic_file import write_text_atomic
 
 BUILDS_SESSION = "builds"
@@ -516,13 +517,17 @@ def finish_step(path: Path, status: int, reason: str = "", *,
     if not isinstance(prerequisite, KeepPlacementPrerequisite):
         _ = report_prerequisite(wire.PrerequisiteReport(uuid.uuid4().hex,
             reply.assignment.episode, reply.assignment.owner, prerequisite))
-    _ = release(reply.grant.reservation, status, reply.grant.cleanup_timing)
+    if not reason:
+        _ = release(reply.grant.reservation, status, reply.grant.cleanup_timing)
     result = report_execution(wire.ExecutionReport(uuid.uuid4().hex, reply.assignment, placement.NoProviderClaim(),
         execution_identity.ExecutionNotStarted() if reason else execution_identity.ExecutionEvidenceUnavailable("the local command has ended", CLOCK.now()),
         placement.PrelaunchRefused(reason) if reason else placement.AttemptCompleted(status),
         placement.DispatchPathSettled()))
     if result.assignment != reply.assignment or result.state != placement.ClosedAssignment(reason or "completed"):
         raise wire.AdmissionUnavailable("the service did not confirm the end of the local attempt")
+    if reason:
+        # An older service can close the attempt without releasing its grant.
+        _ = release(reply.grant.reservation, status, reply.grant.cleanup_timing)
     return result
 
 
@@ -743,43 +748,99 @@ def _refused(reason: str, *, checker: bool = False) -> wire.Refused:
     return wire.Refused(reason)
 
 
-def nested_reservation_reason() -> str:
-    """Refuse a child only when the same queue still holds its live parent's reservation.
+RESERVED_STEP_ENV = "BUILDLOG_RESERVED_STEP"
 
-    The holder must match by pid and start time, so a reused pid never refuses a step.
-    """
-    marker = os.environ.get("BUILDLOG_RESERVED_STEP", "")
+
+@dataclass(frozen=True)
+class OuterReservation:
+    reservation: str
+    pid: int
+
+
+@dataclass(frozen=True)
+class NoOuterReservation:
+    pass
+
+
+def cpu_pool_path() -> Path:
+    return Path(os.environ.get("BUILDLOG_JOBSERVER_FIFO", "/dev/steve"))
+
+
+def _has_live_ancestor(owner_pid: int, owner_start: str) -> bool:
+    from scripts.build_queue import admission_records as records
+
+    pid = os.getppid()
+    seen: set[int] = set()
+    child_start = math.inf
+    while pid > 0 and pid not in seen:
+        seen.add(pid)
+        try:
+            fields = process_stat.process_fields(pid)
+            start = fields[19]
+            start_tick = int(start)
+            if start_tick > child_start or records.process_start_time(pid) != start:
+                return False
+            if pid == owner_pid:
+                return start == owner_start
+            pid, child_start = int(fields[1]), start_tick
+        except (OSError, ValueError, IndexError):
+            return False
+    return False
+
+
+def outer_reservation(*, match_cpu_pool: bool = False) -> OuterReservation | NoOuterReservation:
+    """Find the live parent reservation for this queue or the shared CPU pool."""
+    marker = os.environ.get(RESERVED_STEP_ENV, "")
     if not marker:
-        return ""
+        return NoOuterReservation()
     from scripts.build_queue import admission_records as records
     from scripts.buildlog import store
 
     try:
-        reservation, raw_pid, directory = marker.split("\t")
+        reservation, raw_pid, directory, *resources = marker.split("\t")
         pid = int(raw_pid)
-        if not reservation or pid <= 0 or Path(directory).resolve() != (store.root() / "admission").resolve():
-            return ""
+        if not reservation or pid <= 0 or len(resources) > 2:
+            return NoOuterReservation()
+        if resources:
+            socket_path, *cpu_pool = resources
+            parent_socket = Path(socket_path or DEFAULT_ADMISSION_SOCKET)
+            same_queue = parent_socket.is_absolute() and parent_socket.resolve() == wire.admission_socket_path().resolve()
+            same_cpu_pool = match_cpu_pool and cpu_pool == [str(cpu_pool_path().resolve())]
+        else:
+            same_queue = Path(directory).resolve() == (store.root() / "admission").resolve()
+            same_cpu_pool = False
+        if not (same_queue or same_cpu_pool):
+            return NoOuterReservation()
         start = records.process_start_time(pid)
-        if start is None:
-            return ""
+        if start is None or not _has_live_ancestor(pid, start):
+            return NoOuterReservation()
         state = cast(object, json.loads((Path(directory) / "state.json").read_text()))
     except (OSError, ValueError):
-        return ""
+        return NoOuterReservation()
     if not isinstance(state, dict):
-        return ""
+        return NoOuterReservation()
     reservations = cast(dict[str, object], state).get("reservations")
     if not isinstance(reservations, dict):
-        return ""
+        return NoOuterReservation()
     for value in cast(dict[str, object], reservations).values():
         if not isinstance(value, dict):
             continue
         row = cast(dict[str, object], value)
         owner = row.get("owner")
-        if (row.get("reservation_id") == reservation and isinstance(owner, dict)
+        if (row.get("reservation_id") == reservation and row.get("ending") == {"kind": "NotEnding"}
+                and row.get("finalization") == {"kind": "NoFinalizationIntent"}
+                and isinstance(owner, dict)
                 and cast(dict[str, object], owner).get("pid") == pid
                 and cast(dict[str, object], owner).get("start_time") == start):
-            return (f"verify step cannot run inside reserved step {reservation} (pid {pid}); "
-                    + "run it outside the outer step")
+            return OuterReservation(reservation, pid)
+    return NoOuterReservation()
+
+
+def nested_reservation_reason() -> str:
+    outer = outer_reservation()
+    if isinstance(outer, OuterReservation):
+        return (f"verify step cannot run inside reserved step {outer.reservation} (pid {outer.pid}); "
+                + "run it outside the outer step")
     return ""
 
 
@@ -796,7 +857,7 @@ def _call(request: wire.Request, on_wait: Callable[[wire.Wait], None],
         return _refused(reason, checker=checker) if report_refusal else wire.Refused(reason)
 
     if isinstance(request, (wire.AdmitRequest, wire.ServiceEstimateRequest, wire.LaunchRequest,
-                            wire.PlacementRequest, wire.VerifyRunSlotRequest)):
+                            wire.PlacementRequest)):
         reason = nested_reservation_reason()
         if reason:
             return refuse(reason)
@@ -886,8 +947,8 @@ def _control_reply(request: wire.Request, retry: AcquisitionRetry,
                     request.maximum, f"slots.{request.machine}.{request.repository}.max")
                     if isinstance(request, wire.RepositorySlotRequest) else None)
     bound_outage = isinstance(request, (wire.BuildHistoryRequest, wire.PlacementRequest, wire.PrerequisiteReport,
-                                        wire.RepositorySlotRequest, wire.VerifyRunSlotRequest))
-    if bound_outage and not isinstance(request, wire.VerifyRunSlotRequest):
+                                        wire.RepositorySlotRequest))
+    if bound_outage:
         retry.start_leave_schedule(configuration.running_pass_seconds if isinstance(configuration, records.MemoryConfig)
                                    else configuration.reconnect_seconds)
     if not isinstance(configuration, wire.CleanupTiming) and (
@@ -906,7 +967,6 @@ def _control_reply(request: wire.Request, retry: AcquisitionRetry,
     last_valid = last_notice = CLOCK.monotonic()
     restarted = False
     showed_slot = False
-    verify_wait_text = ""
     while True:
         if retry.left_queue():
             return LeftQueue()
@@ -954,18 +1014,7 @@ def _control_reply(request: wire.Request, retry: AcquisitionRetry,
                     if isinstance(reply, wire.Refused):
                         if generation_query or placement_control:
                             return reply
-                        return refuse(reply.reason, checker=isinstance(request, wire.VerifyRunSlotRequest))
-                    if isinstance(request, wire.VerifyRunSlotRequest):
-                        if isinstance(reply, wire.Ok):
-                            return reply
-                        if not isinstance(reply, wire.VerifyRunSlotWaiting):
-                            raise CheckerFailure("invalid Verify run slot answer")
-                        text = records.run_limit_text(reply.reason)
-                        if text != verify_wait_text:
-                            print(text, file=sys.stderr, flush=True)
-                            verify_wait_text = text
-                        last_valid = CLOCK.monotonic()
-                        continue
+                        return refuse(reply.reason)
                     if slot_waiting is not None:
                         if isinstance(reply, (wire.RepositorySlotReady, wire.RepositorySlotExpired)):
                             return reply
@@ -1468,23 +1517,6 @@ def repository_slot(request: wire.RepositorySlotRequest) -> wire.RepositorySlotR
     if isinstance(reply, (wire.RepositorySlotReady, wire.RepositorySlotExpired, wire.Refused)):
         return reply
     return wire.Refused("left the repository slot queue")
-
-
-def _take_verify_run_slot(pid: int, cwd: str, placement_episode: str) -> int:
-    """Wait on the admission connection for the Verify process's slot."""
-    from scripts.build_queue import step_estimator, admission_records as records
-
-    identity = step_identity("", cwd)
-    start = records.process_start_time(pid)
-    if start is None:
-        print("verify.sh: cannot identify the Verify process", file=sys.stderr)
-        return 2
-    repository, _ = step_estimator.git_identity(["cargo", "check"], cwd)
-    name = repository.name if isinstance(repository, records.RepositoryIdentity) else Path(cwd).name
-    request = wire.VerifyRunSlotRequest(wire.Owner(pid, start), name, identity.session_id, identity.unit,
-        worktree=cwd, verify=verify_call(), placement_episode=placement_episode)
-    reply = _call(request, lambda waiting: None)
-    return 0 if isinstance(reply, wire.Ok) else 2
 
 
 def service_admit(request: wire.ServiceEstimateRequest, on_wait: Callable[[wire.Wait], None],
@@ -2179,9 +2211,6 @@ def main(argv: list[str] | None = None) -> int:
     status_parser = subcommands.add_parser("placement-status")
     _ = status_parser.add_argument("--episode", required=True)
     _ = status_parser.add_argument("--attempt", required=True)
-    run_parser = subcommands.add_parser("verify-run-slot")
-    _ = run_parser.add_argument("--pid", type=int, required=True)
-    _ = run_parser.add_argument("--episode", default="")
     placement_parser = subcommands.add_parser("place-step")
     for name in ("episode", "repo-root", "package", "kind", "source-key", "target", "session-id", "run", "sidecar", "parent-episode"):
         _ = placement_parser.add_argument("--" + name, default="")
@@ -2231,8 +2260,6 @@ def main(argv: list[str] | None = None) -> int:
     _ = priority_parser.add_argument("unit")
     _ = priority_parser.add_argument("--why", default="the user's bump")
     args = parser.parse_args(argv, namespace=ClientArguments())
-    if args.command == "verify-run-slot":
-        return _take_verify_run_slot(args.pid, os.getcwd(), args.episode)
     if args.command in ("check-nested", "place-step"):
         reason = nested_reservation_reason()
         if reason:
