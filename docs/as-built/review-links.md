@@ -978,6 +978,8 @@ The render value's hover text shows the median of at most 10 successful renders.
 
 Select a List row to expand its detail below the summary.
 A refresh applies the new data immediately.
+The open row keeps its element through a refresh and takes the new summary, data and detail.
+Its focus, draft and text selection stay.
 The List measures the open row before and after an update or a save result, then scrolls by the difference.
 At a scroll limit, it adds space to keep the row in place.
 The List keeps the open row in place while another row changes height during an animation.
@@ -986,6 +988,7 @@ User scrolling ends the correction and removes the extra space.
 Scroll input at a limit can release the space above the list without changing the scroll position.
 Closing the row removes the extra space.
 A filter that hides the row closes it.
+If the row closes with an action result, the page notice keeps the result until the row opens again or a new action starts.
 The footer gets fresh counts from the other pages on each refresh.
 The List discards a result if a newer snapshot has replaced its source.
 The log uses the page scroll.

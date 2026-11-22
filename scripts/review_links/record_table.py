@@ -826,23 +826,37 @@ function syncOpenItem(){
  if(inlineView) incoming.replaceChildren(inlineView);
  openItem=item;viewDetail.recordItem=item;item.openDetails=viewDetail;
  detailMissing.hidden=true;
- if(options.itemRevision && keepBody){
-  const revision=options.itemRevision(item);
-  presentItemRevision(item,revision,(row,detail)=>{
-   const slot=options.retainedDetailSlot;
-   const retained=slot && detail.querySelector(slot);
-   detail.replaceChildren(...children);
-   if(retained) detail.querySelector(slot)?.replaceWith(retained.cloneNode(true));
-   setDialogTitle(row);
-   options.detailInstalled?.(row);
-  },{force:wasMissing});
- }else if(!keepBody) options.detailInstalled?.(item);
+ if(options.itemRevision && keepBody) presentNewDetail(item,children,wasMissing);
+ else if(!keepBody) options.detailInstalled?.(item);
  drawDetailStatus();
  if(dialog && !dialog.open) dialog.showModal();
  if(dialog && !sameItem){
   detailFocus().focus({preventScroll:true});
   dialogBody.scrollTop=0;
  }
+}
+function presentNewDetail(item,children,wasMissing){
+ presentItemRevision(item,options.itemRevision(item),(row,detail)=>{
+  const slot=options.retainedDetailSlot;
+  const retained=slot && detail.querySelector(slot);
+  detail.replaceChildren(...children);
+  if(retained) detail.querySelector(slot)?.replaceWith(retained.cloneNode(true));
+  setDialogTitle(row);
+  options.detailInstalled?.(row);
+ },{force:wasMissing});
+}
+// The open row keeps its node through a new snapshot and takes the new data.
+function keepOpenRow(){
+ const item=openItem,key=item?.dataset.key;
+ const next=inlineView && options.itemRevision && item && !item.isConnected && opened.has(key) && itemWithKey(key);
+ if(!next) return;
+ for(const {name} of [...item.attributes]) if(!next.hasAttribute(name)) item.removeAttribute(name);
+ for(const {name,value} of next.attributes) item.setAttribute(name,value);
+ item.querySelector('.list-row').replaceWith(next.querySelector('.list-row'));
+ const children=[...recordDetails(next).childNodes],wasMissing=!detailMissing.hidden;
+ next.replaceWith(item);
+ detailMissing.hidden=true;
+ presentNewDetail(item,children,wasMissing);
 }
 if(dialog) bindConsoleDialog(dialog,()=>{
  if(!dialog.open) return;
@@ -1467,6 +1481,7 @@ return {place,apply,bind,opened,openCard,closeCard,restorePlace,drawWindow,updat
   for(const gap of windowGaps.splice(0)) gap.remove();
   for(const node of mounted.values()){resize?.unobserve(node);options.unmount?.(node);node.remove();}
   mounted.clear();measured.clear();content=contentProxy();
+  keepOpenRow();
   if(sharedWords()){query=previous;filterControl.setWords(words(),query);}
   bind();if(draw) applyRows(query!==previousQuery);
  }};

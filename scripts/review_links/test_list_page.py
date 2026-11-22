@@ -1152,7 +1152,7 @@ async function inspect(){
   document.querySelector('.nav-entry[data-page="review"]').click();
   await animationFrames(window);
   check(listFrame.hidden && dialog.open,'Changing console pages keeps a card that has a draft.');
-  const beforeReturn=row(),fetchBeforeReturn=win.fetch.bind(win);
+  const beforeReturn=row(),listBeforeReturn=doc.querySelector('[data-list]'),fetchBeforeReturn=win.fetch.bind(win);
   let releaseCounts,countsStarted;
   const heldCounts=new Promise(resolve=>{releaseCounts=resolve;});
   const readingCounts=new Promise(resolve=>{countsStarted=resolve;});
@@ -1162,7 +1162,8 @@ async function inspect(){
   };
   document.querySelector('.nav-entry[data-page="list"]').click();
   await readingCounts;
-  check(row()!==beforeReturn && win.recordIsOpen(row()),'The List refreshes the open row while it reads links.');
+  check(doc.querySelector('[data-list]')!==listBeforeReturn && row()===beforeReturn && win.recordIsOpen(row()),
+   'The List refreshes and keeps the open row node while it reads links.');
   check(draft.querySelector('[name=feedback]').value==='Keep this draft when I switch tabs.',
    'The draft is still available on the List.');
   const retainedLink=link('sdlc/C1');
@@ -1271,7 +1272,7 @@ async function inspect(){
   await checkReviewCardConflict(card,'short',check,advance);
   delayRefresh=true;
  }
- const before=row();
+ const before=row(),listBefore=doc.querySelector('[data-list]');
  const refreshed=new Promise((resolve,reject)=>{
   const notice=card.querySelector('[data-review-card-notice]');
   const saveObserver=new card.defaultView.MutationObserver(()=>{
@@ -1302,7 +1303,8 @@ async function inspect(){
  await refreshed;
  if(!phone) check(JSON.stringify(fades)===JSON.stringify([['TBODY',180],['TBODY',260],['IFRAME',180]]),
   'The overlay uses the configured card fade durations.');
- check(row()!==before && row().querySelector('[data-label="State"]').textContent.includes('Reviews done'),
+ check(doc.querySelector('[data-list]')!==listBefore && row()===before &&
+  row().querySelector('[data-label="State"]').textContent.includes('Reviews done'),
   'The refresh displays the saved verdict.');
  check(doc.activeElement===link('sdlc/C1'),'The refreshed link receives focus.');
  check(location.pathname==='/proof' && listFrame.contentDocument===doc && history.length===historyLength,
@@ -3650,7 +3652,8 @@ window.fetch=async(_path,options={})=>{
  await flush();
  check(methods.join()==='POST,GET','The save makes one List GET while the item waits.');
  const refreshed=current(),freshDraft=recordDetails(other()).querySelector('textarea');
- check(refreshed!==prior && beforeOrder===(parks ? '3,2' : '2,3') &&
+ // The open row keeps its node; a closed row takes the fresh one.
+ check((parks ? refreshed!==prior && other()===otherRow : refreshed===prior) && beforeOrder===(parks ? '3,2' : '2,3') &&
   numbers()===(parks ? '2,3' : '3,2'),'The refresh moves the waiting row to its new group.');
  if(parks){
   check(freshDraft.value==='Keep the words for the other item.','Refresh keeps the other draft.');
@@ -4245,6 +4248,34 @@ window.fetch=async(_path,options={})=>{
  check(!second().hidden && title()==='Updated title' && pageReads===1,
   'The visible row keeps its updated title after one read.');
  check(!new URLSearchParams(location.hash.slice(1)).has('item'),'The address clears the closed item.');
+'''
+        steps = steps.replace("FRESH_PAGE", json.dumps(fresh).replace("</", "<\\/"))
+        self.browser_action_sequence(steps, reduced_motion=True, add_item=False, markup=initial)
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
+    def test_browser_refresh_applies_new_data_to_the_open_row_in_place(self) -> None:
+        root = self.root / "reviews"
+        item = self.add("Original title", number=1)
+        initial = list_page.render(root, include_counts=False).decode()
+        _ = the_list.update(MORTY.id, item.id, {"title": "Updated title", "latest_status": "The refreshed status.",
+                                                "state": the_list.ItemState.BLOCKED}, source="morty")
+        fresh = list_page.render(root, include_counts=False).decode()
+        steps = r'''
+ const input=form.elements.words;
+ input.value='Keep these words';input.dispatchEvent(new Event('input'));
+ input.focus();input.setSelectionRange(5,10);
+ const summary=row.querySelector('.list-row'),revision=row.dataset.detailRevision;
+ refreshMarkup=FRESH_PAGE;
+ dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));
+ await flush();
+ const current=document.querySelector('[data-number="1"]'),words=recordDetails(current).querySelector('[name="words"]');
+ check(current===row && recordIsOpen(row) && pageReads===1,'The refresh keeps the open row node and keeps it open.');
+ check(row.querySelector('.list-row')!==summary && row.querySelector('strong').textContent==='Updated title' &&
+  row.querySelector('.list-state').textContent==='Blocked','The open row shows the new summary and state.');
+ check(row.dataset.state==='Blocked' && row.dataset.detailRevision!==revision,'The open row takes the new data attributes.');
+ check(recordDetails(row).textContent.includes('The refreshed status.'),'The open row shows the new detail.');
+ check(words?.value==='Keep these words' && document.activeElement===words &&
+  words.selectionStart===5 && words.selectionEnd===10,'The draft, its focus and its selection stay.');
 '''
         steps = steps.replace("FRESH_PAGE", json.dumps(fresh).replace("</", "<\\/"))
         self.browser_action_sequence(steps, reduced_motion=True, add_item=False, markup=initial)
@@ -5061,10 +5092,15 @@ observer.observe(original.parentElement,{childList:true});
   'the refusal is visible when the Blocked filter hides the restored row');
  show('working');
  check(!row.hidden && row.dataset.state==='Working','the refusal restores the confirmed row to Working');
+ const noticeBox=hiddenStatus.getBoundingClientRect();
+ check(!recordIsOpen(row) && hiddenStatus.textContent==='Item 1: Not saved: Fixture refuses Remove' &&
+  noticeBox.height>0 && noticeBox.top>=0 && noticeBox.bottom<=innerHeight,
+  'the Blocked filter closed the row, so the page notice shows the refusal in view');
+ row.querySelector('.list-toggle').click();
  const notice=form.querySelector('[data-send-status]');
  check(notice.getClientRects().length>0 && notice.textContent==='Not saved: Fixture refuses Remove',
-  'the refusal is visible on the restored row');
- check(hiddenStatus.hidden,'the page hides the extra notice when the restored row is visible');
+  'the refusal is visible on the reopened row');
+ check(hiddenStatus.hidden,'the page hides the extra notice when the reopened row shows the refusal');
 ''')
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
@@ -5119,10 +5155,12 @@ observer.observe(original.parentElement,{childList:true});
  const refreshed=document.querySelector('[data-number="1"]');
  check(refreshed===row && !row.hidden && row.dataset.parked==='false' && recordIsOpen(row),
   'The failed readback restores the unparked row without replacing the table.');
+ const list=document.querySelector('[data-list]');
  finishRefresh();await flush();
  const latest=document.querySelector('[data-number="1"]');
- check(latest!==row && !latest.hidden && latest.dataset.parked==='false' && recordIsOpen(latest),
-  'The follow-up refresh also shows the unparked row and keeps it open.');
+ check(document.querySelector('[data-list]')!==list && latest===row && !latest.hidden &&
+  latest.dataset.parked==='false' && recordIsOpen(latest),
+  'The follow-up refresh keeps the open row node, shows it unparked and keeps it open.');
 '''.replace('PARK_ACTION', json.dumps(action)), reduced_motion=True, add_item=False)
         item = the_list.load(MORTY.id, "L1")
         _ = the_list.park(MORTY.id, item.id, NOW + timedelta(days=1), source="morty")
@@ -5614,16 +5652,18 @@ window.fetch=async(_url,options)=>{
   const waiting=row();
   check(linked(waiting) && chip('morty-answering').dataset.filterCount==='1',
    'The link opens the waiting item outside Working and counts it in Morty answering.');
+  const list=document.querySelector('[data-list]');
   const refreshed=new Promise(resolve=>{
    const observer=new MutationObserver(()=>{
-    if(waiting.isConnected) return;
+    if(list.isConnected) return;
     observer.disconnect();resolve();
    });
-   observer.observe(document.querySelector('[data-list]').parentElement,{childList:true});
+   observer.observe(list.parentElement,{childList:true});
   });
   document.dispatchEvent(new Event('visibilitychange'));
   await refreshed;
   const answered=row();
+  check(answered===waiting,'The refresh keeps the open linked row node.');
   check(linked(answered) &&
    recordDetails(answered).querySelector('[data-question="Q1"]')?.textContent.includes('The gate passed.'),
    'The refresh displays the answer and keeps the linked item open.');
@@ -6098,15 +6138,17 @@ window.fetch=async(_url,options)=>{
     'The Needs me count and status agree with the visible row.');
   };
   checkUnread();
+  const list=document.querySelector('[data-list]');
   const refreshed=new Promise(resolve=>{
    const observer=new MutationObserver(()=>{
-    if(original.isConnected) return;
+    if(list.isConnected) return;
     observer.disconnect();resolve();
    });
-   observer.observe(document.querySelector('[data-list]').parentElement,{childList:true});
+   observer.observe(list.parentElement,{childList:true});
   });
   document.dispatchEvent(new Event('visibilitychange'));
   await refreshed;
+  check(row()===original,'The refresh keeps the open row node.');
   checkUnread();
   check(detail().textContent.includes('A newer update from morty.'),
    'The refresh applies the new text and keeps the answer unread.');
@@ -7269,6 +7311,7 @@ try{
  words.value='';words.dispatchEvent(new Event('input'));check(tell.disabled,'cleared words disable Tell morty immediately');
  words.value='Keep my draft';words.dispatchEvent(new Event('input'));
  words.focus();words.setSelectionRange(1,3);
+ const before=rows();
  document.body.style.minHeight='2400px';scrollTo(0,100);
  dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));await flush();await flush();
  const refreshed=rows().find(row=>row.dataset.number==='106');
@@ -7280,7 +7323,8 @@ try{
  check(recordDetails(refreshed).querySelector('textarea').value==='Keep my draft','refresh keeps feedback words');
  check(!recordDetails(refreshed).querySelector('[value="tell"]').disabled,'a restored draft enables Tell morty');
  check(scrollY===100,'refresh keeps scroll');
- check(refreshed!==selected,'Refresh applies the snapshot while the item is open.');
+ check(refreshed===selected && rows().every(row=>row===selected || !before.includes(row)),
+  'Refresh applies the snapshot and keeps the open row node.');
  const refusedForm=recordDetails(refreshed).querySelector('form');
  holdPost=true;
  const refused=submitted(refusedForm,refusedForm.querySelector('[value="tell"]'));

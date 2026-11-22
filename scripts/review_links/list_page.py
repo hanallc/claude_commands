@@ -1884,7 +1884,8 @@ function applyListSnapshot(fresh){
  content.replaceWith(fresh);content=fresh;
  closedKeys=new Set(JSON.parse(content.dataset.closedKeys));
  bindListControls();tableView.replace();
- if(links && tableView.openItem===nextItem) presentReviewLinks(nextItem,links);
+ const openItem=tableView.openItem;
+ if(links && openItem?.dataset.key===key) presentReviewLinks(openItem,links);
  if(field?.isConnected) field.focus({preventScroll:true});
  else if(focus){const field=document.getElementById(focus);field?.focus({preventScroll:true});
   if(typeof field?.setSelectionRange==='function' && typeof start==='number' && typeof end==='number')
