@@ -1817,13 +1817,16 @@ The server determines the caller from the reservation's session ID and the curre
 5. The shared stop helper signals the confirmed Cargo scope members through pidfds.
 6. The server uses the detached stop record when the supervisor supports a verified stop.
 7. The holder or supervisor follows its usual cleanup path.
-8. The server confirms that the Cargo scope is empty or reads the detached stop result.
+8. The server checks that the Cargo scope is empty or that the recorded detached leader has exited.
 9. The server sends the notice after it confirms the stop.
 
 Cargo scopes and detached commands need the phase 44fh helper.
 Verify only creates scopes per step, so the console leaves Kill off for Verify.
+The server offers Cargo Kill only when the verified scope contains the known Cargo descendants.
 The action record keeps the notice after the confirmation deadline or a console restart.
-The server checks the pending records every `kill_pending_check_seconds`.
+The server checks the saved target every `kill_pending_check_seconds`.
+It retries an unclear delivery result with the saved key.
+A queued or kept message appears as **Message queued**.
 The server supplies the first line of the notice.
 The operator can add words in the confirmation.
 The row shows **Stopping**, **Stopped**, or **Stop unconfirmed**.
