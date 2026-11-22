@@ -4,8 +4,10 @@ from __future__ import annotations
 
 from scripts.lib.checkout_test_support import copy_test_runner
 
-from contextlib import ExitStack
+from contextlib import ExitStack, redirect_stderr
+from io import StringIO
 from dataclasses import dataclass
+import errno
 from itertools import product
 import json
 import math
@@ -20,6 +22,7 @@ import tempfile
 import textwrap
 from typing import ClassVar, cast, override
 import unittest
+from unittest.mock import patch
 
 
 from scripts.lib.py_floor_test_support import interpreter_cache_environment
@@ -27,6 +30,7 @@ from scripts.lib.process_group import send_process_group
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.message.process_test_support import OwnedTestProcesses
 from scripts.production import gate
+from scripts.test_times import module_run
 from scripts.test_times.gate_record import ModuleTimes
 from scripts.test_times.module_run import FixtureMeasure, TestMeasure
 
@@ -308,6 +312,286 @@ def run_fixture(root: Path, name: str, source: str) -> FixtureRun:
     timed_sender_folders = [path.name for path in temporary.glob("sender-guard-*")]
     times = UnwrittenFixtureTimes() if output.read_text() == "stale output\n" else read_times(output)
     return FixtureRun(timed, standard, times, standard_sender_folders, timed_sender_folders)
+
+
+class LiveConfigGuardTests(unittest.TestCase):
+    def test_child_guard_allows_private_cleanup_and_relative_open(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        protected, private, alias = (root / name for name in ("config", "private", "alias"))
+        protected.mkdir()
+        private.mkdir()
+        alias.symlink_to(protected, target_is_directory=True)
+        log = root / "violations"
+        child = """
+import os
+import shutil
+
+assert os.open in os.supports_dir_fd
+assert shutil.rmtree.avoids_symlink_attacks
+fd = os.open("../private", os.O_RDONLY)
+os.close(os.open("fixture", os.O_WRONLY | os.O_CREAT, dir_fd=fd))
+os.close(fd)
+shutil.rmtree("../private")
+try:
+    shutil.rmtree("../alias")
+except OSError:
+    pass
+else:
+    raise AssertionError("rmtree accepted a symlink")
+"""
+        with module_run.guard_live_config(protected, root, log):
+            result = subprocess.run([sys.executable, "-c", child], cwd=protected, capture_output=True, text=True,
+                                    timeout=TEST_HANG_GUARD_SECS)
+            self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(private.exists())
+        self.assertTrue(alias.is_symlink())
+        self.assertFalse(log.exists())
+
+    def test_child_guard_preserves_checkout_startup_and_next_hook(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        library = RUNNER.parents[1] / "lib"
+        startup = root / "guard"
+        startup.mkdir()
+        following = root / "following"
+        following.mkdir()
+        _ = (following / "sitecustomize.py").write_text(
+            "import os\nos.environ['CONFIG_TEST_NEXT_HOOK'] = 'loaded'\n", encoding="utf-8")
+        child = """
+import os
+import runpy
+import sys
+
+runpy.run_path(sys.argv[1])
+print(os.environ['CONFIG_TEST_NEXT_HOOK'])
+"""
+        environment = {"PYTHONPATH": os.pathsep.join((str(library / "python_startup"), str(following))),
+                       "CLAUDE_PYTHON": sys.executable}
+        with patch.dict(os.environ, environment), module_run.guard_live_config(
+                root / "config", startup, root / "violations"):
+            for program in (sys.executable, str(library / "py")):
+                with self.subTest(program=program):
+                    result = subprocess.run([program, "-c", child, str(library / "package_root.py")], cwd=root,
+                                            capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(result.stdout, "loaded\n")
+                    self.assertEqual(result.stderr, "")
+
+    def test_runner_rejects_a_caught_write_in_a_python_child(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        home = root / "fixture-home"
+        protected = home / ".claude" / "config"
+        protected.mkdir(parents=True)
+        config = protected / "console.conf"
+        _ = config.write_text("original\n")
+        child = """
+from pathlib import Path
+import sys
+try:
+    Path(sys.argv[1]).write_text("changed")
+except AssertionError:
+    print("refused")
+"""
+        children: list[subprocess.CompletedProcess[str]] = []
+
+        def fixture_test() -> None:
+            shim = Path(module_run.__file__).resolve().parents[1] / "lib" / "py"
+            for program in (sys.executable, str(shim)):
+                children.append(subprocess.run([program, "-c", child, str(config)], cwd=root,
+                                               capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS))
+
+        suite = unittest.TestSuite([unittest.FunctionTestCase(fixture_test)])
+        with (patch.object(Path, "home", return_value=home),
+              patch.dict(os.environ, {"CLAUDE_PYTHON": sys.executable}),
+              patch.object(sys, "argv", ["module_run.py", str(root), "test_*.py"]),
+              patch.object(unittest.defaultTestLoader, "loadTestsFromNames", return_value=suite),
+              redirect_stderr(StringIO())):
+            with self.assertRaisesRegex(AssertionError, "Test attempted to write live configuration"):
+                module_run.run_module(module_run.NoConfigReadLog(), root, root / "violations")
+        self.assertEqual([(child.returncode, child.stdout, child.stderr) for child in children],
+                         [(0, "refused\n", ""), (0, "refused\n", "")])
+        self.assertEqual(config.read_text(), "original\n")
+
+    def test_child_guard_expires_when_the_runner_removes_the_hook(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        protected = root / "config"
+        protected.mkdir()
+        config = protected / "console.conf"
+        _ = config.write_text("original\n")
+        child = """
+from pathlib import Path
+import sys
+
+hook, config = map(Path, sys.argv[1:])
+try:
+    config.write_text("blocked")
+except AssertionError:
+    print("refused")
+hook.unlink()
+config.write_text("expired")
+"""
+        log = root / "violations"
+        with self.assertRaisesRegex(AssertionError, "Test attempted to write live configuration"):
+            with module_run.guard_live_config(protected, root, log):
+                result = subprocess.run([sys.executable, "-c", child, str(root / "sitecustomize.py"), str(config)],
+                                        cwd=root, capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout, "refused\n")
+        self.assertEqual(config.read_text(), "expired")
+        self.assertFalse((root / "sitecustomize.py").exists())
+
+    def test_guard_allows_mkdir_on_a_private_symlink(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        protected = root / "config"
+        protected.mkdir()
+        alias = root / "alias"
+        alias.symlink_to(protected, target_is_directory=True)
+        log = root / "violations"
+        with module_run.guard_live_config(protected, root, log):
+            alias.mkdir(exist_ok=True)
+        self.assertTrue(alias.is_symlink())
+        self.assertFalse(log.exists())
+
+    def test_guard_preserves_file_exists_for_a_private_link_target(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        protected = root / "config"
+        protected.mkdir()
+        alias = root / "alias"
+        alias.symlink_to(protected, target_is_directory=True)
+        source = root / "source"
+        source.touch()
+        log = root / "violations"
+        with module_run.guard_live_config(protected, root, log):
+            with self.assertRaises(FileExistsError):
+                os.symlink(source, alias)
+            with self.assertRaises(FileExistsError):
+                os.link(source, alias)
+        self.assertEqual(alias.readlink(), protected)
+        self.assertFalse(log.exists())
+
+    def test_guard_resolves_symlinks_before_parent_traversal(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        protected = root / "config"
+        protected.mkdir()
+        private = root / "private"
+        nested = private / "nested"
+        nested.mkdir(parents=True)
+        (private / protected.name).mkdir()
+        alias = root / "alias"
+        alias.symlink_to(nested, target_is_directory=True)
+        through_alias = alias / ".." / protected.name
+        log = root / "violations"
+        with module_run.guard_live_config(protected, root, log):
+            _ = (through_alias / "file").write_text("private")
+            (through_alias / "directory").mkdir()
+        self.assertEqual((private / protected.name / "file").read_text(), "private")
+        self.assertTrue((private / protected.name / "directory").is_dir())
+        self.assertFalse(log.exists())
+
+    def test_guard_preserves_nofollow_error_for_a_private_symlink(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        protected = root / "config"
+        protected.mkdir()
+        config = protected / "console.conf"
+        config.touch()
+        alias = root / "alias"
+        alias.symlink_to(config)
+        log = root / "violations"
+        with module_run.guard_live_config(protected, root, log):
+            with self.assertRaises(OSError) as error:
+                os.close(os.open(alias, os.O_WRONLY | os.O_NOFOLLOW))
+            self.assertEqual(error.exception.errno, errno.ELOOP)
+        self.assertFalse(log.exists())
+
+    def test_guard_preserves_exclusive_create_error_for_a_private_symlink(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        protected = root / "config"
+        protected.mkdir()
+        config = protected / "console.conf"
+        config.touch()
+        alias = root / "alias"
+        alias.symlink_to(config)
+        log = root / "violations"
+        with module_run.guard_live_config(protected, root, log):
+            with self.assertRaises(FileExistsError):
+                os.close(os.open(alias, os.O_WRONLY | os.O_CREAT | os.O_EXCL))
+        self.assertFalse(log.exists())
+
+    def test_guard_allows_rename_and_removal_of_a_private_link_to_live_config(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        protected = root / "config"
+        protected.mkdir()
+        config = protected / "console.conf"
+        _ = config.write_text("original\n")
+        private = root / "private"
+        private.mkdir()
+        alias = private / "console.conf"
+        alias.symlink_to(config)
+        log = root / "violations"
+        with module_run.guard_live_config(protected, root, log):
+            renamed = private / "renamed"
+            _ = alias.rename(renamed)
+            self.assertTrue(renamed.is_symlink())
+            renamed.unlink()
+            renamed.symlink_to(config)
+            _ = alias.write_text("private")
+            _ = alias.replace(renamed)
+            self.assertEqual(renamed.read_text(), "private")
+            renamed.unlink()
+            private.rmdir()
+        self.assertFalse(os.path.lexists(alias))
+        self.assertFalse((root / "sitecustomize.py").exists())
+        self.assertFalse(log.exists())
+        directory_alias = root / "alias"
+        directory_alias.symlink_to(protected, target_is_directory=True)
+        empty = protected / "empty"
+        empty.mkdir()
+        with self.assertRaisesRegex(AssertionError, "Test attempted to write live configuration"):
+            with module_run.guard_live_config(protected, root, log):
+                with self.assertRaises(AssertionError):
+                    _ = (directory_alias / config.name).rename(root / "moved")
+                with self.assertRaises(AssertionError):
+                    _ = directory_alias.rename(protected / "moved")
+                with self.assertRaises(AssertionError):
+                    (directory_alias / config.name).unlink()
+                with self.assertRaises(AssertionError):
+                    (directory_alias / empty.name).rmdir()
+                with self.assertRaises(AssertionError):
+                    (directory_alias / "new-directory").mkdir()
+                with self.assertRaises(AssertionError):
+                    (directory_alias / "new-link").symlink_to(config)
+        self.assertEqual(config.read_text(), "original\n")
+        self.assertTrue(empty.is_dir())
+
+    def test_runner_refuses_live_config_writes_even_if_the_test_catches_them(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        home = root / "fixture-home"
+        protected = home / ".claude" / "config"
+        protected.mkdir(parents=True)
+        console = protected / "console.conf"
+        _ = console.write_text("page.list.owner=original\n")
+        private = root / "private.conf"
+        alias = root / "alias"
+        alias.symlink_to(protected, target_is_directory=True)
+
+        def fixture_test() -> None:
+            _ = private.write_text("page.list.owner=fixture\n")
+            with self.assertRaises(AssertionError):
+                _ = private.replace(console)
+
+        def discover(_names: list[str]) -> unittest.TestSuite:
+            with self.assertRaises(AssertionError):
+                _ = (alias / "console.conf").write_text("page.list.owner=fixture\n")
+            return unittest.TestSuite([unittest.FunctionTestCase(fixture_test)])
+
+        with (patch.object(Path, "home", return_value=home),
+              patch.object(sys, "argv", ["module_run.py", str(root), "test_*.py"]),
+              patch.object(unittest.defaultTestLoader, "loadTestsFromNames", side_effect=discover),
+              redirect_stderr(StringIO())):
+            with self.assertRaisesRegex(AssertionError, "Test attempted to write live configuration"):
+                module_run.run_module(module_run.NoConfigReadLog(), root, root / "violations")
+
+        self.assertEqual(console.read_text(), "page.list.owner=original\n")
+        self.assertEqual(private.read_text(), "page.list.owner=fixture\n")
 
 
 class ModuleRunnerTests(unittest.TestCase):
