@@ -41,7 +41,7 @@ from scripts.build_targets.target_config import ANY_ELIGIBLE_TARGET, LOCAL_CALLE
 
 SUBMITTING_SESSION = OwningSession("submitting-session")
 ALLOWED_HOST = placement.AllowedHost()
-HANA_REPOSITORY = "https://github.com/natepiano/hana"
+HANA_REPOSITORY = "https://github.com/hanallc/hana"
 
 
 class PlacementFixture(AdmissionFixture):
