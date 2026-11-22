@@ -256,6 +256,16 @@ class MergeGateCheckpointTests(MergeGateFixture):
         self.assertEqual(set(timings), {"hooks/test_first.py", "hooks/tests/test_first.py"})
         self.assertEqual(self.pass_records()[0]["suites"], ["hooks"])
 
+    def test_gate_uses_configured_root_when_module_folder_is_missing(self) -> None:
+        gate_root = self.fixture_root.parent
+        missing = gate_root / "missing-module"
+        with (mock.patch.dict(self.environment, {gate.GATE_MODULE_TEMP_DIR: str(missing)}),
+              mock.patch.object(gate, "gate_temporary", wraps=gate.gate_temporary) as allocate):
+            result = self.run_gate("--tests-only", "--module", "hooks/test_first.py")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        allocate.assert_called_once_with(mock.ANY, "g", gate_root)
+        self.assert_all_modules_started()
+
     @gate_suites("hooks", "message")
     def test_gate_and_affected_module_folders_leave_room_for_unix_sockets(self) -> None:
         prepare = gate.test_module_environment

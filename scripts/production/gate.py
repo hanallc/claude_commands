@@ -1415,9 +1415,9 @@ def _gate_job_parent() -> Path:
     """Keep jobs below the module folder that the outer gate removes."""
     root = build_folders.configured_gate_root()
     if inherited_module := os.environ.get(GATE_MODULE_TEMP_DIR):
-        module = Path(inherited_module).resolve()
-        if module.is_relative_to(root.resolve()):
-            return module
+        module = Path(inherited_module)
+        if module.is_dir() and (resolved := module.resolve()).is_relative_to(root.resolve()):
+            return resolved
     return root
 
 
