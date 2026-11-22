@@ -4859,10 +4859,11 @@ runpy.run_module('scripts.agents.restart', run_name='__main__', alter_sys=True)
         self.assertEqual((self.stops, self.launches), ([], []))
 
     def test_stop_all_keeps_a_producer_for_its_saved_tab(self) -> None:
-        row = replace(self.rows[0], kind="producer", unit_type=staff.NotUnit(), name="TEST-agent", worktree=staff.WORKTREE_UNFILLED)
+        row = fixture_member("producer", name="TEST-agent")
         self.rows = (row,)
-        record = staff.StaffSnapshot(self.rows)
-        with patch.object(staff, "initial_snapshot", return_value=record):
+        self.running = {str(row.current_session)}
+        with (patch.object(staff, "initial_snapshot", side_effect=staff.snapshot),
+              patch.dict(os.environ, {"USER_ZONE": "UTC"})):
             self.assertEqual(shutdown.main(["stop", "--all"]), 0)
             self.assertEqual(shutdown_record.read(), [str(row.id)])
             self.assertEqual(self.launches, [])

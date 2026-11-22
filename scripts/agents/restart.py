@@ -1910,7 +1910,9 @@ def _restart(pane_evidence: ExitStack, *, stop_all: bool, dry_run: bool, only: t
                                 if identity not in report.issues and identity in failures:
                                     report.failure(identity, row.name, failures[identity])
                 stopped = stop_row(holder, client, codex=observed.codex)
-                if not stopped and holder.kind != "worker":
+                if stopped and after_stop is AfterStop.KEEP_STOPPED and holder.kind == "producer":
+                    _ = staff.exit(str(holder.id), "agents stop --all ran")
+                elif not stopped and holder.kind != "worker":
                     shutdown_record.remove_started([str(holder.id)])
                 return stopped, workers
         finally:
@@ -2028,6 +2030,8 @@ def _restart(pane_evidence: ExitStack, *, stop_all: bool, dry_run: bool, only: t
                 replace(issue, reason=f"{issue.reason.rstrip('.')}. {reason}", step=f"{issue.step} {step}", operator=True))
 
     def remove_started(holder: staff.StaffRow, *, started_holder: bool) -> None:
+        if started_holder and holder.kind == "producer" and isinstance(holder.exited, staff.Exited):
+            _ = staff.resume(str(holder.id))
         resolved = resume_checks.worker_restores.resolved(holder.id)
         done = [member for member in members_by_holder[holder.id]
                 if (member_id := staff.StaffId(member)) not in blocked_workers
@@ -2102,7 +2106,7 @@ def _restart(pane_evidence: ExitStack, *, stop_all: bool, dry_run: bool, only: t
                         remove_started(holder, started_holder=False)
                         raise
                     print(f"{current.name}: unchanged")
-                    remove_started(holder, started_holder=True)
+                    remove_started(current, started_holder=True)
                     return RestartDisposition.RESTORED
             facts = session_staff.RowResolver(current_record)
             opening = (herdr.OpeningPrompt(resume_message.resume_message(why, workers=resume_message.worker_mode()))
@@ -2122,7 +2126,7 @@ def _restart(pane_evidence: ExitStack, *, stop_all: bool, dry_run: bool, only: t
             except WorkerRestoreIncomplete:
                 remove_started(holder, started_holder=False)
                 raise
-            remove_started(holder, started_holder=True)
+            remove_started(current, started_holder=True)
             return RestartDisposition.STARTED if pane else RestartDisposition.RESTORED
 
     restarted: set[Path] = set()

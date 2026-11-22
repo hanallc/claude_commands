@@ -563,6 +563,7 @@ def _paused_resume_needs_message(row: staff.StaffRow) -> bool:
 def _lifecycle(options: CommandLine) -> int:
     from scripts.production import session_staff
 
+    why = options.why
     try:
         record = staff.initial_snapshot()
     except (OSError, ValueError, staff.StaffRefused) as error:
@@ -579,7 +580,7 @@ def _lifecycle(options: CommandLine) -> int:
         rows = [row] if row is not None else []
         if not rows:
             if options.command == "resume":
-                return _result_code(stop_resume.resume(options.session, why=options.why, to=options.to))
+                return _result_code(stop_resume.resume(options.session, why=why, to=options.to))
             raise staff.StaffNotFound(staff.StaffId(options.session))
     code = 0
     for row in rows:
@@ -606,17 +607,24 @@ def _lifecycle(options: CommandLine) -> int:
                     try:
                         if isinstance(row.paused, staff.Paused):
                             _ = staff.resume(str(row.id))
-                        result = stop_resume.resume(str(row.id), why=options.why, to=options.to)
+                        result = stop_resume.resume(str(row.id), why=why, to=options.to)
                         started = isinstance(result, stop_resume.ClaudeUp)
-                        if started and isinstance(row.exited, staff.Exited):
+                        if started and row.kind != "producer" and isinstance(row.exited, staff.Exited):
                             _ = staff.resume(str(row.id))
                         code = max(code, _result_code(result))
                     finally:
                         if not started and isinstance(row.paused, staff.Paused):
                             _ = staff.set_hold(str(row.id), row.paused)
             continue
+        if options.command == "exit" and row.kind == "producer":
+            result = stop_resume.stop_producer(row.id, why, deadline=worker_lifecycle.effective_deadline())
+            if isinstance(result, (stop_resume.Stopped, stop_resume.NotRunning)):
+                print(f"{row.name}: exited")
+            else:
+                code = max(code, _result_code(result))
+            continue
         already_exited = options.command == "exit" and isinstance(row.exited, staff.Exited)
-        held = row if already_exited else staff.pause(str(row.id), options.why)
+        held = row if already_exited else staff.pause(str(row.id), why)
         remote_exit = options.command == "exit" and _worktree_is_remote(row)
         if options.finish_step and not remote_exit:
             _finish_tasks(row, record)
@@ -633,7 +641,7 @@ def _lifecycle(options: CommandLine) -> int:
             if stopped:
                 continue
             if not already_exited:
-                held = staff.exit(str(row.id), options.why)
+                held = staff.exit(str(row.id), why)
         else:
             _ = _message(row, "Finish your current turn. Hold at the prompt. Do not start new work. Wait for agents resume.")
         print(f"{row.name}: {'exited' if isinstance(held.exited, staff.Exited) else 'paused'}")
@@ -856,9 +864,10 @@ def main(argv: list[str] | None = None) -> int:
         if options.command in ("pause", "exit", "resume"):
             return _lifecycle(options)
         record = staff.initial_snapshot()
-        row = record.by_member_reference(options.session) or record.by_path(options.session)
+        member = record.by_member_reference(options.session)
         matches = [member for member in record.rows if member.name == options.session]
-        row = row or (matches[0] if len(matches) == 1 else None)
+        named = matches[0] if len(matches) == 1 else None
+        row = member or record.by_path(options.session) or named
         if options.dry_run:
             target = stop_resume.stop_target(options.session)
             if isinstance(target, (stop_resume.SessionNotFound, stop_resume.StopFailed)):
@@ -869,7 +878,10 @@ def main(argv: list[str] | None = None) -> int:
             print(f"{row.name if row is not None else options.session}: would stop")
             return 0
         unresolved = stop_resume.stop_unit_workers(row.id, record) if row is not None and row.kind in ("unit", "showrunner") else []
-        result = stop_resume.stop(options.session, deadline=worker_lifecycle.effective_deadline())
+        deadline = worker_lifecycle.effective_deadline()
+        target = member or named
+        result = (stop_resume.stop_producer(target.id, "agents stop ran", deadline=deadline)
+                  if target is not None and target.kind == "producer" else stop_resume.stop(options.session, deadline=deadline))
         return max(_result_code(result), int(bool(unresolved)))
     except staff.StaffRefused as error:
         print(f"shutdown: StaffRefused: {error}", file=sys.stderr)

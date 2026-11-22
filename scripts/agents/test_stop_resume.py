@@ -36,7 +36,7 @@ from scripts.accounts import accounts, moves, role_map, worker_names
 from scripts.accounts.move_test_support import write_claude_move_credentials
 from scripts.whoami import account, agent_accounts
 from scripts.whoami.account_test_support import write_codex_auth
-from scripts.agents import producer_transfer, restart, stop_resume, stop_results
+from scripts.agents import producer_transfer, restart, shutdown_record, stop_resume, stop_results
 from scripts.lib import agent_program, atomic_file, conf, operation_deadline, process_start, unit_runs
 from scripts.lib.transcript_test_support import compressed_copy
 from scripts.herdr import worker_panes
@@ -276,6 +276,38 @@ class WorkerResumeTests(unittest.TestCase):
 
 @final
 class StopResumeTests(unittest.TestCase):
+    def test_named_producer_stop_holds_until_a_confirmed_resume(self) -> None:
+        row = fixture_member("producer", name="alpha", worktree=staff.PresentWorktree(remote.local_machine(), self.root))
+        identity = str(row.current_session)
+        held = stop_resume.StoppedOnPurpose(row.name)
+        with (patch.dict(os.environ, {"USER_ZONE": "UTC"}),
+              patch.object(stop_resume, "_stop", return_value=stop_resume.StopFailed(identity, "fixture refused")) as stop,
+              patch.object(stop_resume, "_resume_once", return_value=stop_resume.ResumeFailed(identity, "fixture refused")) as start):
+            self.assertEqual(shutdown.main(["stop", row.name]), 1)
+            self.assertEqual(shutdown_record.read(), [])
+            self.assertIsInstance(staff.snapshot().rows_by_id[row.id].exited, staff.Active)
+            stop.return_value = stop_resume.NotRunning(identity)
+            self.assertEqual(shutdown.main(["stop", row.name]), 0)
+            self.assertEqual(shutdown_record.read(), [row.id])
+            self.assertEqual(stop_resume.resume_for_upkeep(row.id), held)
+            start.assert_not_called()
+
+            self.assertEqual(shutdown.main(["resume", row.name]), 1)
+            self.assertEqual(stop_resume.resume_for_upkeep(row.id), held)
+            start.return_value = stop_resume.ClaudeUp(identity, "fixture-pane", "claude3")
+            self.assertEqual(shutdown.main(["resume", row.name]), 0)
+            self.assertIsInstance(staff.snapshot().rows_by_id[row.id].exited, staff.Active)
+            self.assertEqual(shutdown_record.read(), [])
+            self.assertIsInstance(stop_resume.resume_for_upkeep(row.id), stop_resume.ClaudeUp)
+
+            self.assertEqual(shutdown.main(["exit", row.name, "--why", "keep stopped"]), 0)
+            self.assertEqual(shutdown_record.read(), [row.id])
+            exited = staff.snapshot().rows_by_id[row.id].exited
+            self.assertIsInstance(exited, staff.Exited)
+            assert isinstance(exited, staff.Exited)
+            self.assertEqual(exited.why, "keep stopped")
+            self.assertEqual(stop_resume.resume_for_upkeep(row.id), held)
+
     def test_producer_resume_uses_first_admission_after_a_family_change(self) -> None:
         class InterruptedResume(BaseException):
             """The command exits before its next step."""
