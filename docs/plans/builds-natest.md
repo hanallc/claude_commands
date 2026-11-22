@@ -1446,3 +1446,16 @@ Ordered after the red main repair and the guard repair (builds). It does not mov
 - **Files:** from the survey.
 - **Workers:** 1 writer for the survey; the fix parts split by folder.
 - **Acceptance gate:** a guest run leaves nothing in `/tmp` or `/dev/shm` without the private-`/tmp` runner; each part's modules green; one blind review per part.
+
+### Phase 442 — a build hold release sends one notice per recipient, listing each stopped run once  · status: todo
+**Depends on:** none
+
+#### Work Order
+- **Goal:** builds 14:08 EST: the 13:44-14:06 release sent 138 notices to 16 recipients (103 to queue). `hold_enforcer.restart_entry` keys a stopped run on each stopped process, so one command with many processes (python3.13, bash) becomes many runs; `build_hold.send_cycle_notices` then sends one notice per run.
+- **Spec:**
+  1. `restart_entry` (no detached run): key the stopped run on the command's root process, the lineage process just below the run agent (or the top of the lineage when no agent). Its id and label come from that root, so every process of one command is one run.
+  2. `send_cycle_notices`: group pending stopped-run entries by recipient (`staff_id` or `session_id`). Send one notice that lists each run's label and ID. Each grouped entry takes the one delivery result.
+  3. Tests: many processes of one command give one stopped run; two runs of one unit give one notice that lists both.
+- **Files:** `scripts/build_hold/hold_enforcer.py`, `scripts/build_hold/build_hold.py`, their tests.
+- **Workers:** the director (no-worker mode); one fresh review.
+- **Acceptance gate:** `--module` runs of the changed tests and their direct importers green; one blind review.
