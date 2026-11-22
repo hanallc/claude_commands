@@ -657,6 +657,8 @@ fi
             'machine_id': Path('/etc/machine-id').read_text(encoding='ascii').strip(),
             'boot_id': Path('/proc/sys/kernel/random/boot_id').read_text(encoding='ascii').strip(),
             'deadline_ns': armed.deadline_ns,
+            'guest_user': settings.guest_user,
+            'checkout': str((self.guest_home / '.claude').resolve()),
         })
         self.assertEqual(mac_linux.ArmedGuestAttempt.from_record(record), armed)
 
@@ -795,6 +797,66 @@ fi
         self.assertEqual(self.git('for-each-ref', '--format=%(refname)', 'refs/mac-linux'),
                          'refs/mac-linux/ref-cleanup-fixture/candidate')
 
+    def test_interrupt_in_ref_cleanup_ends_the_route_instead_of_a_retry(self) -> None:
+        source = mac_linux.candidate_source(self.repo, ALL_MODULES)
+        real_git = gate.checked_git
+
+        def interrupt_delete(repo: Path, *arguments: str) -> str:
+            if arguments[:2] == ('update-ref', '-d'):
+                raise KeyboardInterrupt('fixture interruption in ref cleanup')
+            return real_git(repo, *arguments)
+
+        with (patch.object(gate, 'checked_git', interrupt_delete),
+              self.assertRaises(KeyboardInterrupt) as raised):
+            with mac_linux.bundle_refs(self.repo, source, 'interrupt-cleanup-fixture'):
+                raise mac_linux.GuestMissingPrerequisite('fixture missing prerequisite')
+        self.assertTrue(any('Interrupted while handling' in note and 'fixture missing prerequisite' in note
+                            for note in raised.exception.__notes__))
+
+    def test_interrupt_in_ref_cleanup_keeps_the_unproven_guest_end(self) -> None:
+        source = mac_linux.candidate_source(self.repo, ALL_MODULES)
+        settings = mac_linux.read_settings(conf.read(self.registry))
+        armed = mac_linux.arm_guest(settings, 'unproven-cleanup-fixture')
+        real_git = gate.checked_git
+
+        def interrupt_delete(repo: Path, *arguments: str) -> str:
+            if arguments[:2] == ('update-ref', '-d'):
+                raise KeyboardInterrupt('fixture interruption in ref cleanup')
+            return real_git(repo, *arguments)
+
+        with (patch.object(gate, 'checked_git', interrupt_delete),
+              self.assertRaises(mac_linux.GuestEndUnproven) as raised):
+            with mac_linux.bundle_refs(self.repo, source, 'unproven-cleanup-fixture'):
+                raise mac_linux.GuestEndUnproven('fixture unproven end', armed)
+        self.assertEqual(raised.exception.armed, armed)
+        self.assertTrue(any('fixture interruption in ref cleanup' in note for note in raised.exception.__notes__))
+        self.assertIsInstance(mac_linux.prove_guest_end(settings, armed), mac_linux.GuestEndProven)
+
+    def test_cleanup_refuses_a_changed_guest_account_without_ssh(self) -> None:
+        settings = mac_linux.read_settings(conf.read(self.registry))
+        armed = mac_linux.arm_guest(settings, 'changed-account-fixture')
+        changed = replace(settings, guest_user='replacement-account')
+        with patch.object(subprocess, 'run') as ssh:
+            proof = mac_linux.prove_guest_end(changed, armed)
+        assert isinstance(proof, mac_linux.GuestEndPending), proof
+        self.assertIn(f'changed from {settings.guest_user} to replacement-account', proof.detail)
+        ssh.assert_not_called()
+        self.assertIsInstance(mac_linux.prove_guest_end(settings, armed), mac_linux.GuestEndProven)
+
+    def test_cleanup_refuses_a_different_checkout_before_making_one(self) -> None:
+        settings = mac_linux.read_settings(conf.read(self.registry))
+        armed = mac_linux.arm_guest(settings, 'moved-checkout-fixture')
+        self.assertEqual(armed.checkout, str((self.guest_home / '.claude').resolve()))
+        original = replace(armed, checkout=str(self.root / 'original-checkout'))
+        proof = mac_linux.prove_guest_end(settings, original)
+        assert isinstance(proof, mac_linux.GuestEndPending), proof
+        self.assertIn('differs from the armed checkout', proof.detail)
+        self.assertFalse((self.root / 'original-checkout').exists())
+        cancel = self.run_lock().parent / (
+            f'{mac_linux.CANCEL_RECORD_PREFIX}.{armed.boot_id}.{armed.deadline_ns}.{armed.attempt}')
+        self.assertFalse(cancel.exists())
+        self.assertIsInstance(mac_linux.prove_guest_end(settings, armed), mac_linux.GuestEndProven)
+
     def test_cleanup_refuses_an_invalid_group_with_the_lock_held(self) -> None:
         lock = self.run_lock()
         lock.parent.mkdir(parents=True)
@@ -931,10 +993,11 @@ fi
             self.assertIsInstance(mac_linux.prove_guest_end(settings, armed), mac_linux.GuestEndPending)
 
     def test_kept_guest_end_proof_refuses_unreadable_settings(self) -> None:
+        settings_user = mac_linux.read_settings(conf.read(self.registry)).guest_user
         settings = self.registry.with_name('mac_linux.conf')
         settings.unlink()
         settings.mkdir()
-        armed = mac_linux.ArmedGuestAttempt('kept-attempt', 'f' * 32, 'boot-id', 10)
+        armed = mac_linux.ArmedGuestAttempt('kept-attempt', 'f' * 32, 'boot-id', 10, settings_user, '/fixture/checkout')
         proof = mac_linux.prove_kept_guest_end(armed)
         assert isinstance(proof, mac_linux.GuestEndPending), proof
         self.assertIn(str(settings), proof.detail)
@@ -943,7 +1006,8 @@ fi
 
     def test_kept_guest_end_proof_uses_the_route_settings_and_exact_attempt(self) -> None:
         settings = mac_linux.read_settings(conf.read(self.registry))
-        armed = mac_linux.ArmedGuestAttempt('kept-attempt', 'f' * 32, 'boot-id', 10)
+        settings_user = settings.guest_user
+        armed = mac_linux.ArmedGuestAttempt('kept-attempt', 'f' * 32, 'boot-id', 10, settings_user, '/fixture/checkout')
         command = settings.command(mac_linux.cleanup_shell(settings, armed))
         for status, stdout, stderr, expected in (
             (0, 'ended\n', '', mac_linux.GuestEndProven()),

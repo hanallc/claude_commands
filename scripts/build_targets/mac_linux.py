@@ -249,20 +249,25 @@ class ArmedGuestAttemptRecord(TypedDict):
     machine_id: str
     boot_id: str
     deadline_ns: int
+    guest_user: str
+    checkout: str
 
 
 @dataclass(frozen=True)
 class ArmedGuestAttempt:
-    """Identify the guest, the run, and its deadline."""
+    """Identify the guest, its account and checkout, the run, and its deadline."""
 
     attempt: str
     machine_id: str
     boot_id: str
     deadline_ns: int
+    guest_user: str
+    checkout: str
 
     def to_record(self) -> ArmedGuestAttemptRecord:
         return ArmedGuestAttemptRecord(attempt=self.attempt, machine_id=self.machine_id,
-                                       boot_id=self.boot_id, deadline_ns=self.deadline_ns)
+                                       boot_id=self.boot_id, deadline_ns=self.deadline_ns,
+                                       guest_user=self.guest_user, checkout=self.checkout)
 
     @classmethod
     def from_record(cls, record: ArmedGuestAttemptRecord) -> ArmedGuestAttempt:
@@ -297,7 +302,7 @@ record = f'{prefix}.{boot}.{deadline}.{attempt}'
 flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
 os.close(os.open(record, flags, 0o600, dir_fd=git))
 os.close(git)
-print(f'armed {machine} {boot} {deadline}', flush=True)
+print(f'armed {machine} {boot} {deadline} {os.getcwd()}', flush=True)
 '''
 
 
@@ -326,10 +331,11 @@ def arm_guest(settings: GuestSettings, attempt: str) -> ArmedGuestAttempt:
     if process.returncode:
         diagnostic = errors.decode(errors='replace').strip() or 'no diagnostic'
         raise GuestUnavailable(f'guest arm exited {process.returncode}: {diagnostic}')
-    reply = re.fullmatch(rb'armed ([0-9a-f]{32}) ([0-9a-f-]{36}) ([0-9]{1,20})\n', output)
+    reply = re.fullmatch(rb'armed ([0-9a-f]{32}) ([0-9a-f-]{36}) ([0-9]{1,20}) (/[^\n\0]*)\n', output)
     if reply is None:
         raise GuestUnavailable('the guest did not acknowledge the armed deadline')
-    return ArmedGuestAttempt(attempt, reply[1].decode('ascii'), reply[2].decode('ascii'), int(reply[3]))
+    return ArmedGuestAttempt(attempt, reply[1].decode('ascii'), reply[2].decode('ascii'), int(reply[3]),
+                             settings.guest_user, reply[4].decode(errors='replace'))
 
 
 def armed_guest_checkout_shell(settings: GuestSettings, armed: ArmedGuestAttempt) -> str:
@@ -337,6 +343,11 @@ def armed_guest_checkout_shell(settings: GuestSettings, armed: ArmedGuestAttempt
 machine_id=$(cat /etc/machine-id) || exit {GUEST_END_PENDING_STATUS}
 if [ "$machine_id" != {shlex.quote(armed.machine_id)} ]; then
     printf 'A different guest answered the SSH request. The machine ID differs from the armed guest.\\n' >&2
+    exit {GUEST_END_PENDING_STATUS}
+fi
+armed_checkout=$(cd -P -- "$checkout" 2>/dev/null && pwd -P) || armed_checkout=''
+if [ "$armed_checkout" != {shlex.quote(armed.checkout)} ]; then
+    printf 'The guest checkout differs from the armed checkout %s.\\n' {shlex.quote(armed.checkout)} >&2
     exit {GUEST_END_PENDING_STATUS}
 fi''' + GUEST_CHECKOUT_SETUP
 
@@ -553,6 +564,9 @@ class GuestEndPending:
 
 def prove_guest_end(settings: GuestSettings, armed: ArmedGuestAttempt, *,
                     proof_deadline: float = math.inf) -> GuestEndProven | GuestEndPending:
+    if settings.guest_user != armed.guest_user:
+        # The run lock lives in the armed account's checkout; another account cannot prove its end.
+        return GuestEndPending(f'The guest account changed from {armed.guest_user} to {settings.guest_user}.')
     try:
         command = settings.command(cleanup_shell(settings, armed))
         remaining = proof_deadline - monotonic()
@@ -634,9 +648,14 @@ def bundle_refs(repo: Path, source: CandidateSource, attempt: str) -> Generator[
             except BaseException as error:
                 if failure is None:
                     failure = error
-                else:
+                elif (isinstance(error, Exception) or isinstance(failure, GuestEndUnproven)
+                      or not isinstance(failure, Exception)):
                     failure.add_note(f'Cannot remove bundle ref {ref}: {error}')
-        if active_error is None and failure is not None:
+                else:
+                    # An interrupt must end the route, never a retry that catches the earlier error.
+                    error.add_note(f'Interrupted while handling: {failure!r}')
+                    failure = error
+        if failure is not None and failure is not active_error:
             raise failure
 
 

@@ -71,7 +71,7 @@ Queue placement will read the backoff when item 191 B3 registers `mac-linux` for
 After the SSH transfer ends, `run.unreachable_wait_seconds` limits the wait for the guest to prove the run ended.
 The setting accepts whole numbers from 1 to 86400 seconds.
 The route takes the Mac repository claim before the first SSH request.
-The guest run holds a separate lock. The guest checks its machine ID before it can prove the run ended.
+The guest run holds a separate lock. Before it can prove the run ended, the guest checks its machine ID and the checkout path from the arm step. The route also refuses the proof when the guest account in the settings differs from the armed account.
 If the wait expires, the gate fails with `guest unreachable` and the guest alias from `ssh.hops`.
 The route sends no more cleanup requests.
 The queue currently releases the Mac claim at this deadline. The guest run keeps its lock until it ends.
