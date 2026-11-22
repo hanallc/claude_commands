@@ -123,7 +123,7 @@ class KillActionTests(unittest.TestCase):
               patch.object(detached_runs, "stop_command", side_effect=stop_detached) as stop,
               patch.object(memory_admit, "process_table", return_value={}),
               patch.object(kill_action, "stop_route") as read_route):
-            read_route.side_effect = [route, route, route, moved]
+            read_route.side_effect = [route, moved]
             self.assertTrue(kill_action.stop_verified_run(target, reason))
             self.assertFalse(kill_action.stop_verified_run(target, reason))
         self.assertEqual([call.args for call in stop.call_args_list], [(route.record, reason)] * 2)
@@ -432,6 +432,48 @@ class KillActionTests(unittest.TestCase):
         send.assert_called_once()
         self.assertEqual((result["stop"], result["delivery"]),
                          (kill_action.StopState.STOPPED, kill_action.DeliveryState.FAILED))
+
+    def test_populated_slice_stays_pending_until_the_record_has_a_completion_stamp(self) -> None:
+        target = self.detached_target()
+        cgroups = self.root / "cgroups"
+        folder = cgroups / Path(target.route.run_slice["path"]).relative_to("/")
+        folder.mkdir(parents=True)
+        identity = folder.stat()
+        run_slice: process_stop.RunSliceIdentity = {**target.route.run_slice,
+                                                    "device": identity.st_dev, "inode": identity.st_ino}
+        target = replace(target, route=replace(target.route, run_slice=run_slice))
+        self.write_run(target)
+        events = folder / "cgroup.events"
+        _ = events.write_text("populated 1\n")
+        _ = write_config_fixture(self.root / "shutdown.conf", "STOP_GRACE_SECONDS=2\nKILL_GRACE_SECONDS=5")
+        reference = target.candidate.reference
+        actions = kill_action.KillActions(self.root)
+
+        with (patch.object(kill_action, "live_targets", return_value={reference: target}),
+              patch.object(process_stop, "CGROUP_ROOT", cgroups),
+              patch.object(process_stop, "_term_slice", side_effect=process_stop.SliceStopFailed("fixture stop failed")),
+              patch.object(detached_runs, "_stop_caller_is_owner", return_value=False),
+              patch.object(memory_admit, "process_table", return_value={}),
+              patch.object(kill_action, "stop_route", return_value=target.route),
+              patch.object(actions, "_start_watch") as watch,
+              patch.object(kill_action, "deliver", return_value=kill_action.DeliveryState.SENT) as send):
+            offers, _ = actions.options()
+            outcome = actions.stop(reference, offers[reference]["handle"], "")
+            pending = self.saved_action(target)
+            self.assertEqual(outcome, pending.result)
+            self.assertIsInstance(pending.stage, kill_action.StopRequested)
+            self.assertEqual((pending.result["stop"], pending.result["delivery"]),
+                             (kill_action.StopState.UNCONFIRMED, kill_action.DeliveryState.PENDING))
+            self.assertFalse(process_stop.slice_has_ended(run_slice))
+            watch.assert_called_once()
+            send.assert_not_called()
+
+            _ = events.write_text("populated 0\n")
+            self.write_run(target, finished_at="2026-11-18T19:41:00+00:00")
+            result = self.resume()
+            self.assertEqual((result["stop"], result["delivery"]),
+                             (kill_action.StopState.STOPPED, kill_action.DeliveryState.SENT))
+            send.assert_called_once()
 
     def test_recovery_retries_an_unconfirmed_send_with_the_same_key(self) -> None:
         target = self.detached_target()

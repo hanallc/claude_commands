@@ -328,18 +328,17 @@ def detached_run_state(route: DetachedCommand, recipient: staff.StaffId) -> Runn
     if (record.get("run_id") != route.record.stem or record.get("staff_id") != recipient
             or not process_stop.is_slice_identity(run_slice) or run_slice != route.run_slice):
         raise ValueError("the detached run record changed identity")
+    # command_supervise stamps finished_at after _finish_command_slice confirms populated 0.
     if "finished_at" in record or record.get("status") != "running":
         return EndedDetachedRun()
     return RunningDetachedRun()
 
 
 def stop_verified_run(target: KillTarget, reason: str) -> bool:
-    """Check the live route again before the detached helper stops it."""
+    """Check the live route under the detached helper's stop lock."""
     def route_matches() -> bool:
         return stop_route(target.candidate, target.recipient, memory_admit.process_table(PROC)) == target.route
 
-    if not route_matches():
-        return False
     return detached_runs.stop_command(target.route.record, reason, check=route_matches)
 
 
