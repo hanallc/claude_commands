@@ -1096,6 +1096,13 @@ def _save_late_done(event: WorkerEvent, row: staff.StaffRow, run: Path, passed: 
     return saved
 
 
+def _is_covered_result_reply(event: WorkerEvent, receipt: worker.DispatchReceipt) -> bool:
+    """Match the event to a result reply after the verified DONE."""
+    return (isinstance(receipt, worker.DispatchComplete)
+            and isinstance(receipt.covered_result_turn, worker.DetachedResultTurn)
+            and receipt.covered_result_turn.reply == event.reply)
+
+
 def _recover_pass(event: WorkerEvent, row: staff.StaffRow, run: Path, passed: dict[str, object],
                   delivery: pass_recorder.DispatchDelivery, *, require_transcript: bool = False,
                   notice_positions: worker.NoticePositions = worker.NO_NOTICE_POSITIONS,
@@ -1143,7 +1150,7 @@ def _recover_pass(event: WorkerEvent, row: staff.StaffRow, run: Path, passed: di
                                       require_transcript=require_transcript, verify=verify)
     if (not isinstance(receipt, worker.DispatchComplete) or stage_one
             or (event.kind == EventKind.TURN_END and not isinstance(event.native_stop, dict)
-                and receipt.reply != event.reply)):
+                and receipt.reply != event.reply and not _is_covered_result_reply(event, receipt))):
         return receipt
     path = Path(delivery.reply_file)
     worker.save_reply(path, receipt.reply)
@@ -1409,6 +1416,7 @@ def _handle_locked(event: WorkerEvent,
         if (event.kind == EventKind.TURN_END and (not reply or reply != event.reply)
                 and not isinstance(event.native_stop, dict)
                 and not isinstance(turn_cursor, worker.TranscriptCursor)
+                and not _is_covered_result_reply(event, receipt)
                 and not (isinstance(receipt, worker.DispatchWaitingForRuns) and
                          isinstance(receipt.reply, (worker.DispatchComplete, worker.DispatchAwaitingReply)))
                 and not (needs_verification and isinstance(receipt, worker.DispatchAwaitingReply))

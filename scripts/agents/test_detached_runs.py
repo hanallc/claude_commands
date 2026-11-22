@@ -894,6 +894,7 @@ class DetachedRunsTests(unittest.TestCase):
         self.assertEqual(self.run_files("director-done"), [])
 
     def test_start_keeps_an_old_run_when_its_hold_stop_confirmation_cannot_be_copied(self) -> None:
+        _ = self.record_worker("director", fixture_runtime_id("detached-hold-stop-worker"))
         request_id = "a" * 32
         path = self.finished_run("director-stopped", worker="director", staff_id="",
                                  exit_code=143, hold_stop_requests=[request_id])

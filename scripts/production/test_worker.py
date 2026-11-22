@@ -2113,7 +2113,8 @@ class WorkerCommandTests(unittest.TestCase):
 
                         def retry_from_notice(options: send.Options) -> None:
                             text = options.text or ""
-                            command = shlex.split(text.split("\nRetry this delivery: ", 1)[1])
+                            retry_line = text.split("\nRetry this delivery: ", 1)[1].splitlines()[0]
+                            command = shlex.split(retry_line)
                             self.assertEqual(command, commands[0])
                             self.assertEqual(worker.main(command[2:]), worker.ExitCode.OK)
 
