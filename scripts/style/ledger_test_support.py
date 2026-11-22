@@ -23,7 +23,7 @@ from unittest import mock
 from scripts.style import rules
 from scripts.style.style_config import StyleUnitAssignment
 from scripts.style import style_ledger
-from scripts.style.approved_renames import AppliedCheck, TYPE_NAMED_PARAMETER_RULE
+from scripts.style.approved_renames import AppliedCheck
 from scripts.style import style_rules
 from scripts.style.style_reader_test_support import oracle_reader
 from scripts.production import staff
@@ -116,47 +116,6 @@ def style_staff_fixture(root: Path, repo: Path,
         write_style_units(document, assignments)
         _ = staff.set_doc(owner.id, staff.LiveDoc(remote.local_machine(), document))
         yield
-
-
-MACHINE_RENAME_BEFORE = ("struct ImplItem;\nenum SurfaceReferenceMatch { Found }\nfn impl_item_surface_reference(\n"
-                         "    item: &ImplItem,\n) -> bool { inspect(item) }\n")
-MACHINE_RENAME_AFTER = ("struct ImplItem;\nenum SurfaceReferenceMatch { Found }\n"
-                        "fn impl_item_surface_reference(\n    item: &ImplItem,\n"
-                        ") -> SurfaceReferenceMatch { inspect(item) }\n")
-
-
-def machine_rename_fixture(ledger: style_ledger.Ledger, definition: rules.Rule, repo: Path,
-                           proposal: Path, current: str = MACHINE_RENAME_AFTER,
-                           rule_text: str = TYPE_NAMED_PARAMETER_RULE
-                           ) -> tuple[style_ledger.HeldFinding, str]:
-    """The real return-type/owner-change shape, using normal judgment and filing records."""
-    def git(*arguments: str) -> str:
-        return subprocess.run(["git", "-C", str(repo), *arguments], capture_output=True,
-                              text=True, check=True).stdout.strip()
-    _ = definition.path.write_text(rule_text)
-    definition = next(rule for rule in rules.load_rules(repo) if rule.rule_id == definition.rule_id)
-    path = repo / "src/lib.rs"
-    _ = path.write_text(MACHINE_RENAME_BEFORE)
-    _ = git("add", ".")
-    _ = git("commit", "-qm", "old judged parameter")
-    base = git("rev-parse", "HEAD")
-    ledger.set_tip(base)
-    ledger.ticket_add("13001", ticket_owner_id("machine-read"), "read", "names", ".", ["src/lib.rs"], [definition.rule_id])
-    ledger.ticket_assign("13001", "main")
-    _ = ledger.ticket_base("13001")
-    finding = ledger.hold(definition.rule_id, "src/lib.rs", 4, MACHINE_RENAME_BEFORE.splitlines()[3],
-                          "rename", "item", "impl_item", definition.blob, "13001")
-    ledger.record(definition.rule_id, "src/lib.rs", base, definition.blob, "held", ticket="13001",
-                  input_scope=style_ledger.DeclaredInputScope.RULE)
-    _ = proposal.write_text("---\nunit: names\nplan: /tmp/names.md\n---\nApproved rename\n")
-    ledger.file_held(finding.finding_id, proposal)
-    ledger.ticket_drop("13001")
-    _ = path.write_text(current)
-    _ = git("add", ".")
-    _ = git("commit", "-qm", "owner return type changed")
-    tip = git("rev-parse", "HEAD")
-    ledger.set_tip(tip)
-    return ledger.named_held((finding.finding_id,))[0], tip
 
 
 # A release checkpoints the current worktree; each fake berth keeps its own board.

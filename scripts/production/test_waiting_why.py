@@ -54,7 +54,7 @@ class WaitingWhyTests(unittest.TestCase):
     def enter_waiting(self, kind: review_items.ReviewType, reason: str) -> review_items.ReviewItem:
         if kind == review_items.ReviewType.QUESTION:
             identities = update_registration.QuestionStaff.read()
-            source = next(item.source for item in review_items.read(self.root, assign_ids=False) if item.key == self.question)
+            source = next(item.source for item in review_items.read(self.root) if item.key == self.question)
             assert isinstance(source, review_items.QuestionSource)
             production = update_registration.question_scope(source.record.owner, identities.record)
             _ = update_registration.followup(production, source.record.item['text'], reason, identities=identities)
@@ -65,7 +65,7 @@ class WaitingWhyTests(unittest.TestCase):
                                               date(2026, 11, 17), waiting_why=reason)
         else:
             _ = candidates.record_outcome('fixture/E1', 'deferred', '', self.ledger, waiting_why=reason)
-        return next(item for item in review_items.read(self.root, assign_ids=False)
+        return next(item for item in review_items.read(self.root)
                     if item.type == kind and item.state == review_items.ReviewState.WAITING)
 
     def command(self, *args: str) -> tuple[int, str, str]:
@@ -132,7 +132,7 @@ class WaitingWhyTests(unittest.TestCase):
         item = self.enter_waiting(kind, WHY)
         reason = 'The owner must finish the requested check.'
         self.assertEqual(self.command('set', '--item', item.key, '--text', reason), (0, '', ''))
-        current = next(value for value in review_items.read(self.root, assign_ids=False) if value.key == item.key)
+        current = next(value for value in review_items.read(self.root) if value.key == item.key)
         self.assertEqual(current.waiting_why, reason)
         with patch.object(review_items, 'read', return_value=[replace(current, state=review_items.ReviewState.DONE)]):
             code, _, error = self.command('set', '--item', item.key, '--text', WHY)
@@ -181,7 +181,7 @@ class WaitingWhyTests(unittest.TestCase):
         path.parent.mkdir(parents=True)
         record = replace(item.source.record, path=path, owner=owner)
         update_registration.write_question_record(record)
-        unowned = next(value for value in review_items.read(self.root, assign_ids=False)
+        unowned = next(value for value in review_items.read(self.root)
                        if isinstance(value.source, review_items.UnownedQuestionSource) and value.source.record.path == path)
         write = update_registration.write_question_record
 
@@ -195,7 +195,7 @@ class WaitingWhyTests(unittest.TestCase):
         reason = 'The former owner must answer the question.'
         with patch.object(update_registration, 'write_question_record', side_effect=write_under_lock):
             self.assertEqual(self.command('set', '--item', unowned.key, '--text', reason), (0, '', ''))
-        current = next(value for value in review_items.read(self.root, assign_ids=False) if value.key == unowned.key)
+        current = next(value for value in review_items.read(self.root) if value.key == unowned.key)
         self.assertEqual(current.waiting_why, reason)
 
     def test_set_prints_one_line_for_refusal(self) -> None:

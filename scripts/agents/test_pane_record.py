@@ -29,7 +29,7 @@ from scripts.herdr import herdr, pane_launch
 from scripts.herdr.test_herdr import ClaudeForegroundSocket, codex_foreground_cases, native_process_commands
 from scripts.message import sessions
 from scripts.message import sessions as runtime_sessions
-from scripts.agents.test_pane_restore import FakeClient
+from scripts.agents.test_pane_record_recovery import FakeClient
 from scripts.whoami import account  # noqa: E402  Imported before a test sets the platform to the Mac: urllib checks it on import.
 
 HOOK = Path(__file__).resolve().parent.parent / "hooks/session-start-pane-record.py"
