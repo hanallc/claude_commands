@@ -20,6 +20,7 @@ from scripts.hooks.tool_call_text import scan_text
 
 from scripts.lib.suite_runners import SUITE_RUNNERS, starts_suite_runner
 
+GATE_MODULE = "scripts.production.gate"
 CANDIDATE = re.compile(r"\b(?:" + "|".join(re.escape(name) for name in sorted({"cargo", *SUITE_RUNNERS})) + r")\b")
 PREFIXES = frozenset({"env", "sudo", "exec", "command", "nohup", "time", "timeout", "nice",
                       "!", "{", "then", "else", "do", "if", "while", "until"})
@@ -86,8 +87,10 @@ def builds(words: list[str], *, suite_runner_only: bool = False) -> bool:
             if option == "--":
                 arguments = arguments[1:]
                 break
-            if option.startswith(("-c", "-m")):
+            if option.startswith("-c"):
                 return False
+            if option.startswith("-m"):
+                return arguments[:2] == ["-m", GATE_MODULE] or option == f"-m{GATE_MODULE}"
             arguments = arguments[2:] if option in {"-W", "-X", "--check-hash-based-pycs"} else arguments[1:]
         return starts_suite_runner(arguments)
     if suite_runner_only:
@@ -98,7 +101,7 @@ def builds(words: list[str], *, suite_runner_only: bool = False) -> bool:
 
 
 def building_command(command: str, *, suite_runner_only: bool = False) -> bool:
-    if not CANDIDATE.search(command):
+    if GATE_MODULE not in command and not CANDIDATE.search(command):
         return False
     command = scan_text("Bash", {"command": command}).replace("\\\n", "")
     lexer = shlex.shlex(without_literal_heredocs(command), posix=True, punctuation_chars=";&|()\n")

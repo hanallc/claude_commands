@@ -229,12 +229,10 @@ def start_process(arguments: list[str]) -> str:
 
 
 def gate_parent_pid(consume: bool = False) -> str:
-    """Read the gate parent and optionally clear both names before tests start."""
-    # Chunk 6 removes the old parent variable read.
-    parent = os.environ.get("GATE_PARENT_PID") or os.environ.get("MERGE_GATE_PARENT_PID", "")
+    """Read the gate parent and optionally clear the variable before tests start."""
+    parent = os.environ.get("GATE_PARENT_PID", "")
     if consume:
         _ = os.environ.pop("GATE_PARENT_PID", None)
-        _ = os.environ.pop("MERGE_GATE_PARENT_PID", None)
     return parent
 
 

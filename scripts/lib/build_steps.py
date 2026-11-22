@@ -119,11 +119,10 @@ RECORDED_VERBS = VERIFY_VERBS | CARGO_BUILD_VERBS | {"cargo", "fmt", "sweep", "t
 QUEUE_STEP_DISPLAY = {"run": "cargo run", "gate": "merge gate", "test-modules": "test named"}
 SHORT_OWNER_STEPS = {"gate": "merge", "test-affected": "targeted",
                      "merge-gate": "merge", "targeted-test": "targeted"}
-MERGE_GATE_PROGRAMS = ("gate.py", "merge_gate.py")
 GATE_PROGRAMS = {
-    "gate": MERGE_GATE_PROGRAMS,
-    "test-affected": (*MERGE_GATE_PROGRAMS, "targeted_test.py"),
-    "merge-gate": MERGE_GATE_PROGRAMS,
+    "gate": ("gate.py",),
+    "test-affected": ("gate.py", "targeted_test.py"),
+    "merge-gate": ("gate.py",),
     "targeted-test": ("targeted_test.py",),
 }
 GATE_SCRIPTS = frozenset(script for programs in GATE_PROGRAMS.values() for script in programs)
@@ -291,11 +290,11 @@ def command_job(argv: Sequence[str]) -> StepJob | OtherCommand:
     if isinstance(program, OtherCommand):
         return program
     name, arguments = program
-    if name == "targeted_test.py" or (name in MERGE_GATE_PROGRAMS and "--affected" in arguments):
+    if name == "targeted_test.py" or (name == "gate.py" and "--affected" in arguments):
         return _test_job(arguments, affected=True)
     if name == "verify.sh":
         return _verify_step(arguments)
-    if name not in MERGE_GATE_PROGRAMS:
+    if name != "gate.py":
         return OTHER_COMMAND
     branch = _option(arguments, "--merge-branch")
     if "--nightly" in arguments:

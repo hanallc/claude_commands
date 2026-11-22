@@ -12,6 +12,7 @@ from collections.abc import Generator, Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar
 from datetime import datetime
+from itertools import pairwise
 from pathlib import Path
 from typing import Literal, NamedTuple, TypedDict, cast
 
@@ -138,7 +139,10 @@ GATE_GREEN_ALONE = re.compile(r"^--- (\S+) passed on rerun alone; first run exit
 
 
 def runs_merge_gate(command: Sequence[str]) -> bool:
-    return any(Path(word).name in {"merge_gate.py", "gate.py"} for word in command)
+    module = "scripts.production.gate"
+    return (any(Path(word).name == "gate.py" for word in command)
+            or ("-m", module) in pairwise(command)
+            or f"-m{module}" in command)
 
 
 def red_names(command: Sequence[str], output: str) -> frozenset[str]:

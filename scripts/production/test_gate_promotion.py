@@ -298,11 +298,13 @@ sys.meta_path.insert(0, NoRepositoryModules())
                       result.stderr)
         self.assertEqual(self.git(self.main, "rev-parse", "HEAD"), self.base)
         self.assertEqual(self.git(self.origin, "rev-parse", "main"), self.base)
-        with self.subTest(config="merge_gate.conf"):
-            _ = (self.unit / "config/gate.conf").rename(self.unit / "config/merge_gate.conf")
-            older = self.commit(self.unit, "use the old gate config path")
-            self.assertIn("cannot read live state: state_reader: stderr: stored rows need conversion; run its conversion",
-                          gate.live_state_refusal(self.unit, older))
+
+    def test_live_state_check_uses_only_gate_config(self) -> None:
+        self.write(self.unit / "config/merge_gate.conf",
+                   "# text:\nlive_state_checks=absent_reader\n# whole: 1..\nlive_state_check_seconds=60\n")
+        (self.unit / "config/gate.conf").unlink(missing_ok=True)
+        older = self.commit(self.unit, "use the old gate config path")
+        self.assertEqual(gate.live_state_refusal(self.unit, older), "")
 
     def test_promotion_runs_the_target_tree_state_check(self) -> None:
         self.write(self.unit / "config/gate.conf",

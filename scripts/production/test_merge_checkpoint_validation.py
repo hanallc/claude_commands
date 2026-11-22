@@ -29,6 +29,21 @@ def setUpModule() -> None:
 
 
 @final
+class GateModuleRecoveryTests(unittest.TestCase):
+    def test_gate_module_launch_reads_and_reruns_only_red_modules(self) -> None:
+        output = ("--- lib/test_first.py exit=1 ---\n"
+                  + "--- lib/test_second.py exit=1 ---\n"
+                  + "--- lib/test_second.py passed on rerun alone; first run exit=1 ---\n")
+        for command in (["python3", "-m", "scripts.production.gate", "--tests-only"],
+                        ["py", "-mscripts.production.gate", "--tests-only"]):
+            with self.subTest(command=command):
+                red = checkpoint_gate.red_names(command, output)
+                self.assertEqual(red, frozenset({"lib/test_first.py"}))
+                self.assertEqual(checkpoint_gate.only_tests(command, red),
+                                 [*command, "--module", "lib/test_first.py"])
+
+
+@final
 class MergeCheckpointTests(MergeCheckpointFixture):
     def test_conflict_holds_with_no_merge_left_behind(self) -> None:
         self.write(self.checkout, "src/alpha.txt", "main side\n")

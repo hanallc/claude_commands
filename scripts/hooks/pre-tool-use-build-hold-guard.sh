@@ -3,10 +3,10 @@
 
 IFS= read -r -d '' hook_input || true
 case "$hook_input" in
-    *cargo*|*merge_gate*|*targeted_test*) ;;
+    *cargo*|*targeted_test*) ;;
     *)
-        gate_path='(^|[^[:alnum:]_.-])gate\.py([^[:alnum:]_.-]|$)'
-        [[ "$hook_input" =~ $gate_path ]] || exit 0
+        gate_target='(^|[^[:alnum:]_.-])(gate\.py|(-m)?scripts\.production\.gate)([^[:alnum:]_.-]|$)'
+        [[ "$hook_input" =~ $gate_target ]] || exit 0
         ;;
 esac
 
