@@ -231,6 +231,15 @@ def for_you_count(snapshot: for_you.ForYouSnapshot) -> ForYouCountPayload:
     return {"available": True, "count": count.value}
 
 
+def for_you_count_view(snapshot: for_you.ForYouSnapshot) -> dict[str, object]:
+    """Send the counts and rebuild machines without command text."""
+    status = snapshot.status_line_actions()
+    payload: dict[str, object] = {**for_you_count(snapshot), "rebuild_machines": status.rebuild_machines}
+    if isinstance(status.other_count, int):
+        payload["other_count"] = status.other_count
+    return payload
+
+
 def for_you_payload() -> ForYouPayload:
     """Read the shared action sources without changing their stores."""
     snapshot = for_you.read()

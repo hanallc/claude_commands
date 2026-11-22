@@ -7,6 +7,7 @@ import subprocess
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime
+from enum import StrEnum
 from http.client import HTTPConnection, HTTPException
 from ipaddress import IPv4Address
 from pathlib import Path
@@ -77,17 +78,36 @@ class UnavailableOpenCount:
     known_open: int
 
 
+class OtherActionCountUnavailable(StrEnum):
+    UNAVAILABLE = "unavailable"
+
+
+@dataclass(frozen=True)
+class StatusLineActions:
+    """The waiting rebuilds and the count of other open actions."""
+
+    rebuild_machines: tuple[str, ...] = ()
+    other_count: int | OtherActionCountUnavailable = OtherActionCountUnavailable.UNAVAILABLE
+
+
 @dataclass(frozen=True)
 class ForYouSnapshot:
     """The available rows and explicit failures from one read."""
 
     rows: tuple[ForYouRow, ...]
     unavailable: tuple[UnavailableSource, ...]
+    rebuild_machines: tuple[str, ...] = ()
 
     @property
     def open_count(self) -> KnownOpenCount | UnavailableOpenCount:
         count = sum(row.status == "open" for row in self.rows)
         return UnavailableOpenCount(count) if self.unavailable else KnownOpenCount(count)
+
+    def status_line_actions(self) -> StatusLineActions:
+        if self.unavailable:
+            return StatusLineActions(self.rebuild_machines)
+        count = sum(row.kind == "action" and row.status == "open" for row in self.rows)
+        return StatusLineActions(self.rebuild_machines, count)
 
 
 def _request(value: Mapping[str, object], names: Mapping[str, str], waiting_work: Callable[[str], str],
@@ -277,7 +297,17 @@ def read(config: Path | None = None, *,
             reason, "; ".join(dict.fromkeys(request.waits for request in active)) or "Not recorded",
             requests[0].created_at if requests else "", status, "automatic",
             "\n".join(request.evidence for request in completed), requests))
-    return ForYouSnapshot(tuple(rows), tuple(unavailable))
+    return ForYouSnapshot(tuple(rows), tuple(unavailable), answer.machines)
+
+
+def read_for_status_line(config: Path = rebuild_row.DEFAULT_CONFIG, *,
+                         rebuild: rebuild_row.RebuildAnswer | None = None) -> ForYouSnapshot:
+    """Keep the waiting rebuild names if a read exceeds the recursion limit."""
+    try:
+        return read(config, rebuild=rebuild, include_comparison_reason=False)
+    except RecursionError as error:
+        answer = rebuild if rebuild is not None else rebuild_row.read(config)
+        return ForYouSnapshot((), (UnavailableSource("For you", str(error)),), answer.machines)
 
 
 def global_action_count(rebuild: rebuild_row.RebuildAnswer | None = None) -> str:
@@ -289,8 +319,8 @@ def global_action_count(rebuild: rebuild_row.RebuildAnswer | None = None) -> str
     return str(count.value) if isinstance(count, KnownOpenCount) else "unavailable"
 
 
-def console_action_count() -> str:
-    """Read the global count from the console host."""
+def _console_count_payload() -> dict[str, object]:
+    """Read the count view from the console host."""
     try:
         host = os.environ.get("REVIEW_LINKS_HOST")
         if not host:
@@ -304,18 +334,36 @@ def console_action_count() -> str:
             connection.request("GET", "/console/for-you.json?view=count")
             response = connection.getresponse()
             if response.status != 200:
-                return "unavailable"
+                return {}
             payload = cast(object, json.loads(response.read()))
         finally:
             connection.close()
     except (HTTPException, OSError, ValueError, subprocess.SubprocessError):
-        return "unavailable"
-    if isinstance(payload, dict):
-        fields = cast(dict[str, object], payload)
-        count = fields.get("count")
-        if fields.get("available") is True and type(count) is int and count >= 0:
-            return str(count)
-    return "unavailable"
+        return {}
+    return cast(dict[str, object], payload) if isinstance(payload, dict) else {}
+
+
+def console_action_count() -> str:
+    """Read the global count from the console host."""
+    fields = _console_count_payload()
+    count = fields.get("count")
+    return str(count) if fields.get("available") is True and type(count) is int and count >= 0 else "unavailable"
+
+
+def console_status_line_actions() -> StatusLineActions:
+    """Read the rebuild machines and other action count from the console host."""
+    fields = _console_count_payload()
+    machines = fields.get("rebuild_machines")
+    supplied = cast(list[object], machines) if isinstance(machines, list) else []
+    rebuilds = tuple(machine for machine in rebuild_row.MACHINES if machine in supplied)
+    if fields.get("available") is True:
+        if "other_count" not in fields and "rebuild_machines" not in fields:
+            count = fields.get("count")
+        else:
+            count = fields.get("other_count")
+        if type(count) is int and count >= 0:
+            return StatusLineActions(rebuilds, count)
+    return StatusLineActions(rebuilds)
 
 
 def action_count(source: str, rebuild: rebuild_row.RebuildAnswer | None = None) -> str:
