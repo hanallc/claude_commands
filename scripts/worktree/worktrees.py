@@ -871,6 +871,7 @@ def _allow_copied_envrc(source: Path, checkout: Path) -> None:
     try:
         if not new_rc.is_file() or (direnv := shutil.which("direnv")) is None:
             return
+        direnv = os.path.abspath(direnv)
         source_rc = source / ".envrc"
         contents = new_rc.read_bytes()
         if source_rc.is_file() and source_rc.read_bytes() == contents:
@@ -883,7 +884,13 @@ def _allow_copied_envrc(source: Path, checkout: Path) -> None:
                 ):
                     _ = subprocess.run([direnv, "allow", str(checkout)],
                                        capture_output=True, check=True, timeout=5)
-                    return
+                    try:
+                        if new_rc.read_bytes() == contents:
+                            return
+                    except OSError:
+                        pass
+                    _ = subprocess.run([direnv, "deny", str(new_rc)],
+                                       capture_output=True, check=True, timeout=5)
                 case _:
                     pass
     except (OSError, ValueError, subprocess.SubprocessError):

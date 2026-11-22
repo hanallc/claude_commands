@@ -2394,24 +2394,33 @@ if args == ["status", "--json"]:
     print(json.dumps({{"state": {{"foundRC": {{"path": path, "allowed": int(os.environ["DIRENV_TEST_STATUS"])}}}}}}))
     raise SystemExit(0)
 if len(args) == 2 and args[0] == "allow":
+    if os.environ["DIRENV_TEST_CHANGE_ON_ALLOW"] == "1":
+        (Path(args[1]) / ".envrc").write_text("export FIXTURE=changed_during_allow\n")
     raise SystemExit(int(os.environ["DIRENV_TEST_ALLOW_EXIT"]))
+if len(args) == 2 and args[0] == "deny":
+    raise SystemExit(0)
 raise SystemExit(2)
 """)
         direnv.chmod(0o755)
-        self.environment["PATH"] = str(self.root) + os.pathsep + self.environment["PATH"]
+        original_path = self.environment["PATH"]
         self.environment["DIRENV_TEST_LOG"] = str(log)
 
         for name, expected_commands, warning in (
             ("equal", ["status", "allow"], False),
+            ("relative-path", ["status", "allow"], False),
             ("different", [], True),
             ("unallowed", ["status"], True),
             ("other-file", ["status"], True),
             ("allow-failed", ["status", "allow"], True),
+            ("changed-during-allow", ["status", "allow", "deny"], True),
             ("absent", [], False),
         ):
             with self.subTest(name=name):
+                fake_path = os.path.relpath(direnv.parent, self.repository) if name == "relative-path" else str(direnv.parent)
+                self.environment["PATH"] = fake_path + os.pathsep + original_path
                 self.environment["DIRENV_TEST_STATUS"] = "1" if name == "unallowed" else "0"
                 self.environment["DIRENV_TEST_ALLOW_EXIT"] = "1" if name == "allow-failed" else "0"
+                self.environment["DIRENV_TEST_CHANGE_ON_ALLOW"] = "1" if name == "changed-during-allow" else "0"
                 found = source.parent / ".envrc" if name == "other-file" else source_rc
                 self.environment["DIRENV_TEST_PATH"] = str(found)
                 if name == "absent":
@@ -2428,7 +2437,8 @@ raise SystemExit(2)
                 notices = [line for line in result.stderr.splitlines() if line.startswith("make: .envrc")]
                 self.assertEqual(notices, [notice] if warning else [])
                 calls = {"status": [str(source), "status", "--json"],
-                         "allow": [str(self.repository), "allow", str(tree)]}
+                         "allow": [str(self.repository), "allow", str(tree)],
+                         "deny": [str(self.repository), "deny", str(tree / ".envrc")]}
                 self.assertEqual([json.loads(line) for line in log.read_text().splitlines()],
                                  [calls[command] for command in expected_commands])
                 if name == "equal":
