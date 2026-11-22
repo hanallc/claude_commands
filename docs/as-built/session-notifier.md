@@ -353,4 +353,6 @@ If source data changes before publication, the command saves a copy-in-progress 
 The command keeps the source and can rebuild the stage on retry.
 The command reports unrecognized entries and preserves them.
 Entries outside Claude projects do not affect the refusal count or the exit status.
+A session with no working folder in any transcript has no destination.
+Both modes keep its folder and report it, but it does not affect the refusal count or the exit status.
 It refuses an existing destination unless the journal identifies it as the result of the pending move.
