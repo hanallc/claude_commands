@@ -2271,7 +2271,8 @@ def configure_collection():
     restart.ThreadPoolExecutor = CollectionPool
 
 def on_ready(fd, data):
-    if fd == ready_fd:
+    # conf_reads keeps its own os.write reference, and its log can reuse the closed ready fd number.
+    if fd == ready_fd and os.write is on_ready:
         os.write = write
         if step == 'readiness':
             signal.raise_signal(number)
