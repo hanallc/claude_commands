@@ -104,8 +104,10 @@ class ClaimProcessStartTests(unittest.TestCase):
                             redirect_stdout(io.StringIO()), redirect_stderr(errors):
                         self.assertEqual(mac_test.command_claim(reserve, paths, watch_claim=False, session=reserve.session), 0)
                         reserved, = mac_test.read_claims(paths)
-                        if stored_raw_path:
-                            mac_test.write_json(reserved.path, {**reserved.record, "worktree": raw})
+                        saved = claim_state.MacRepositoryIdentity("fixture-key", "fixture-mirror",
+                                                                  reserved.path.name, reserved.path.stem)
+                        mac_test.write_json(reserved.path, {**reserved.record, "worktree": raw if stored_raw_path else canonical,
+                            "repo_key": saved.key, "repo_name": saved.mirror_name, "mac_repository": saved.record()})
                         status = mac_test.command_claim(adopt, paths, watch_claim=False, session=adopt.session)
                     self.assertEqual(status, 0, errors.getvalue())
                     self.assertEqual(reserved.record["worktree"], canonical)
@@ -357,6 +359,13 @@ class ClaimProcessStartTests(unittest.TestCase):
                     retained = mac_test.read_run(paths.run)
                     assert not isinstance(retained, mac_test.NoRun)
                     mac_test.write_json(paths.run, {**retained, "remote_host": "mac"})
+                else:
+                    waiting = mac_test.read_run(paths.run)
+                    assert not isinstance(waiting, mac_test.NoRun)
+                    saved_mirror = claim_state.MacRepositoryIdentity("fixture-key", "fixture-mirror",
+                                                                     paths.run.name, paths.run.stem)
+                    mac_test.write_json(paths.run, {**waiting, "repo_key": saved_mirror.key,
+                        "repo_name": saved_mirror.mirror_name, "mac_repository": saved_mirror.record()})
                 args = mac_test.CliArguments()
                 args.pid, args.from_pid, args.worktree, args.remote = 42, 41, str(root), "mac"
                 args.claim_id, args.episode, args.attempt = requested.claim_id, requested.episode, requested.attempt

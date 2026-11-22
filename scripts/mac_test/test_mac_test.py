@@ -3325,8 +3325,10 @@ class ClaimWatchTests(NotificationGuardedTestCase):
             send.assert_called_once()
 
     def test_stopped_holder_release_ends_remote_work_before_the_fence_settles(self) -> None:
+        from scripts.copies import copies
         from scripts.mac_test import eligibility, offload, claim_state
 
+        _ = self.enterContext(mock.patch.object(copies, "remote_registry", return_value=self.root / "mirror-registry"))
         # A copy stopped before its final status leaves remote work and a held start fence.
         for leftovers, released in ((0, True), (1, False)):
             with self.subTest(leftovers=leftovers):
@@ -3340,6 +3342,15 @@ class ClaimWatchTests(NotificationGuardedTestCase):
                 pending.parent.mkdir(parents=True, exist_ok=True)
                 _ = pending.write_text("pending")
                 scripts: list[str] = []
+                stopped = mac_test.EndStoppedWork(eligibility.KnownRepository("alpha"))
+                with copies.remote_host_lease("claim-mac", exclusive=True), \
+                        mock.patch.object(offload, "read_leftovers") as check:
+                    refused = mac_test.release_exact_claims(self.paths, cast(int, record["pid"]), identity, "",
+                                                            remote_work=stopped)
+                self.assertEqual(refused, mac_test.ClaimReleaseRefused("the cleanup lease is busy"))
+                check.assert_not_called()
+                self.assertEqual(self.read_claim(), record)
+                self.assertTrue(pending.exists())
 
                 def end_work(repository: offload.MirrorScope, target: str, slot: int) -> str:
                     self.assertEqual((repository, target, slot), (offload.ALL_MIRRORS, self.paths.target, 1))
@@ -3355,7 +3366,7 @@ class ClaimWatchTests(NotificationGuardedTestCase):
                      mock.patch.object(subprocess, "run", side_effect=remote), \
                      mock.patch.object(mac_test, "start_watcher"):
                     answer = mac_test.release_exact_claims(self.paths, cast(int, record["pid"]), identity, "",
-                        remote_work=mac_test.EndStoppedWork(eligibility.KnownRepository("alpha")))
+                                                          remote_work=stopped)
                 self.assertEqual(len(scripts), 1)
                 self.assertLess(scripts[0].index("ended-work"), scripts[0].index("dispatch_start_settled"))
                 if released:
@@ -3369,6 +3380,23 @@ class ClaimWatchTests(NotificationGuardedTestCase):
                     self.assertTrue(pending.exists())
                     pending.unlink()
                     self.paths.run.unlink()
+
+    def test_stopped_legacy_claim_counts_all_mirrors_without_a_pending_fence(self) -> None:
+        from scripts.copies import copies
+        from scripts.mac_test import eligibility, offload, claim_state
+
+        record = self.write_claim()
+        identity = claim_state.ClaimIdentity(cast(str, record["claim_id"]), cast(str, record["episode"]),
+                                             cast(str, record["attempt"]))
+        stopped = mac_test.EndStoppedWork(eligibility.KnownRepository("alpha"))
+        observation = offload.LeftoverObservation(offload.LeftoversRemain(1), "leftovers=1\nrc=0\n")
+        with mock.patch.object(copies, "remote_registry", return_value=self.root / "mirror-registry"), \
+                mock.patch.object(offload, "read_leftovers", return_value=observation), \
+                mock.patch.object(offload, "leftover_check_script", return_value="count all mirrors") as check:
+            result = mac_test.release_exact_claims(self.paths, cast(int, record["pid"]), identity, "", remote_work=stopped)
+        check.assert_called_once_with(offload.ALL_MIRRORS, self.paths.target, 1)
+        self.assertEqual(result, mac_test.ClaimReleaseRefused("the remote work of the claim has not ended"))
+        self.assertEqual(self.read_claim(), record)
 
     def test_release_survives_a_watcher_pass_during_the_fence_settle(self) -> None:
         from scripts.buildlog import sync as buildlog_sync

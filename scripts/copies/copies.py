@@ -1907,6 +1907,10 @@ class BusyRemoteMirror(CopyError):
     """A live run holds this remote mirror."""
 
 
+class BusyRemoteHost(BusyRemoteMirror):
+    """An operation holds the lease for the host's mirrors."""
+
+
 @contextmanager
 def remote_host_lease(host: str, *, exclusive: bool) -> Generator[None]:
     """Use a shared lease for one mirror and an exclusive lease for all mirrors."""
@@ -1918,7 +1922,7 @@ def remote_host_lease(host: str, *, exclusive: bool) -> Generator[None]:
         try:
             fcntl.flock(lock.fileno(), operation | fcntl.LOCK_NB)
         except BlockingIOError as error:
-            raise BusyRemoteMirror(f"{host}: a mirror lease is busy") from error
+            raise BusyRemoteHost(f"{host}: a mirror lease is busy") from error
         yield
 
 

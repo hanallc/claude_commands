@@ -107,9 +107,9 @@ MAC_LINUX_CLAIM_ID_PREFIX = "mac-linux-"
 
 @dataclass(frozen=True)
 class ClaimFinished:
-    """A new claim or a claim retained for cleanup."""
+    """The result of a claim acquisition, handoff, or retirement."""
 
-    status: Literal[0, 13]
+    status: Literal[0, 13, 14]
     lines: tuple[str, ...]
 
 
@@ -2148,6 +2148,9 @@ def adopt_wait_claim(args: CliArguments, paths: StatePaths, scope: ClaimScope,
             return refuse_wait_claim(WaitClaimCheck.BLOCK_STATE)
         if not isinstance(block, NoMacBlock):
             return blocked_claim(block)
+        if paths.platform == "macos" and "mac_repository" not in claim.record:
+            claim.path.unlink()
+            return ClaimFinished(claim_state.LEGACY_WAIT_CLAIM_RELEASED, ("legacy reservation released",))
     record: RemoteJobClaim
     if "remote_host" in claim.record:
         record = {**claim.record}
@@ -2243,7 +2246,7 @@ def command_claim(args: CliArguments, paths: StatePaths, *, watch_claim: bool = 
             return attempt.status
         if isinstance(attempt, ClaimFinished):
             print("\n".join(attempt.lines))
-            if watch_claim:
+            if watch_claim and attempt.status != claim_state.LEGACY_WAIT_CLAIM_RELEASED:
                 start_claim_watcher(paths)
             return attempt.status
         if isinstance(attempt, ClaimHeldByCopy):
@@ -2325,32 +2328,53 @@ def release_exact_claims(
                 owned.append((path, record))
     transfers: list[transfer_bytes.TransferBytes] = []
     for path, record in owned:
-        pending = offload.pending_start_path(paths.target, identity)
-        if "remote_host" in record and pending.exists():
-            connection = eligibility.read_connection_settings(Path(settings) if settings else config_path(paths.target))
-            fence = offload.start_fence_command(identity, paths.target, settle=True,
-                                               scope_key=claim_state.claim_fence_directory(path, record))
-            if isinstance(remote_work, EndStoppedWork):
-                # Check stopped work before settling the fence it can hold.
-                mirror = (offload.mac_cleanup_scope(claim_state.saved_mac_repository(record))
-                          if paths.platform == "macos" else remote_work.repository)
-                command = (offload.leftover_check_script(mirror, paths.target, record.get("slot", 0) or 1)
-                           + "\n" + fence + "\n")
-            else:
-                command = fence + "\nprintf 'leftovers=0\\nrc=0\\n'\n"
-            observed = offload.read_leftovers(connection, record["remote_host"], command, paths.target)
-            if not isinstance(observed.result, offload.LeftoversEnded):
-                return ClaimReleaseRefused("the remote work of the claim has not ended")
-            if "dispatch_start_settled=" + offload.pending_start_key(identity) not in observed.output.splitlines():
-                return ClaimReleaseRefused("the remote start fence remains unconfirmed")
-        with nullcontext() if provider_lock_held else locked(paths.lock):
-            # The claim watcher rewrites its own fields during the settle; only a new owner refuses.
-            current = read_run(path)
-            if isinstance(current, NoRun) or claim_owner(current) != claim_owner(record):
-                return ClaimReleaseRefused("the exact claim changed during cleanup")
-            transfers.extend(current.get("transfers", []))
-            pending.unlink(missing_ok=True)
-            path.unlink(missing_ok=True)
+        saved = claim_state.saved_mac_repository(record)
+        with ExitStack() as cleanup:
+            if paths.platform == "macos" and isinstance(remote_work, EndStoppedWork) and "remote_host" in record:
+                from scripts.copies import copies
+
+                try:
+                    cleanup.enter_context(offload.mac_cleanup_lease(saved, record["remote_host"], paths.target))
+                except copies.BusyRemoteMirror:
+                    return ClaimReleaseRefused("the cleanup lease is busy")
+                except copies.CopyError as error:
+                    return ClaimReleaseRefused(f"the cleanup lease is unavailable: {error}")
+            pending = offload.pending_start_path(paths.target, identity)
+            fence_pending = pending.exists()
+            count_legacy = (paths.platform == "macos" and isinstance(saved, claim_state.NoSavedMacRepository)
+                            and isinstance(remote_work, EndStoppedWork))
+            if "remote_host" in record and (fence_pending or count_legacy):
+                if isinstance(remote_work, EndStoppedWork):
+                    with nullcontext() if provider_lock_held else locked(paths.lock):
+                        current = read_run(path)
+                        if isinstance(current, NoRun) or claim_owner(current) != claim_owner(record):
+                            return ClaimReleaseRefused("the exact claim changed before cleanup")
+                connection = eligibility.read_connection_settings(Path(settings) if settings else config_path(paths.target))
+                if isinstance(remote_work, EndStoppedWork):
+                    # Check stopped work before settling the fence it can hold.
+                    mirror = offload.mac_cleanup_scope(saved) if paths.platform == "macos" else remote_work.repository
+                    command = offload.leftover_check_script(mirror, paths.target, record.get("slot", 0) or 1) + "\n"
+                else:
+                    command = ""
+                if fence_pending:
+                    command += offload.start_fence_command(identity, paths.target, settle=True,
+                        scope_key=claim_state.claim_fence_directory(path, record)) + "\n"
+                if isinstance(remote_work, KeepRemoteWork):
+                    command += "printf 'leftovers=0\\nrc=0\\n'\n"
+                observed = offload.read_leftovers(connection, record["remote_host"], command, paths.target)
+                if not isinstance(observed.result, offload.LeftoversEnded):
+                    return ClaimReleaseRefused("the remote work of the claim has not ended")
+                if fence_pending and ("dispatch_start_settled=" + offload.pending_start_key(identity)
+                                      not in observed.output.splitlines()):
+                    return ClaimReleaseRefused("the remote start fence remains unconfirmed")
+            with nullcontext() if provider_lock_held else locked(paths.lock):
+                # The watcher can update its fields during cleanup.
+                current = read_run(path)
+                if isinstance(current, NoRun) or claim_owner(current) != claim_owner(record):
+                    return ClaimReleaseRefused("the exact claim changed during cleanup")
+                transfers.extend(current.get("transfers", []))
+                pending.unlink(missing_ok=True)
+                path.unlink(missing_ok=True)
     with nullcontext() if provider_lock_held else locked(paths.lock):
         block_present = not isinstance(read_block(paths.block), NoMacBlock)
     if block_present:

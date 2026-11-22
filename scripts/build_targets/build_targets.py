@@ -687,6 +687,8 @@ def command_recover_probe(args: CliArguments) -> int:
                         return 0
                     try:
                         saved = controller.mac_repository
+                        if target.platform == "macos" and isinstance(saved, claim_state.NoSavedMacRepository):
+                            return 0
                         if isinstance(saved, claim_state.MacRepositoryIdentity):
                             if saved.mirror_name != repository.name:
                                 return 0
@@ -969,6 +971,7 @@ def published_wait_identity(path: str, session: SubmittingSession) -> claim_stat
 def cleanup_refused_claims(target: SshTarget, args: CliArguments, *, session: SubmittingSession) -> None:
     """Recover retained cleanup ownership without granting permission to execute."""
 
+    from scripts.copies import copies
     from scripts.lib import conf, process_start as process_identity
     from scripts.mac_test import eligibility, mac_test, offload
 
@@ -996,34 +999,41 @@ def cleanup_refused_claims(target: SshTarget, args: CliArguments, *, session: Su
     owner = mac_test.CliArguments()
     owner.pid = args.pid
     for claim in claims:
-        with mac_test.locked(paths.lock):
-            if mac_test.read_run(claim.path) != claim.record or "remote_host" not in claim.record:
-                continue
-            attempt = mac_test.take_over_kept_claim(owner, claim, claim.record, session=session)
-            if not isinstance(attempt, mac_test.ClaimFinished) or attempt.status != 13:
-                continue
-        try:
-            mirror: offload.MirrorScope = offload.ALL_MIRRORS
-            if paths.platform == "macos":
-                mirror = offload.mac_cleanup_scope(claim_state.saved_mac_repository(claim.record))
-            else:
-                cleanup_scope = claim.scope if isinstance(claim.scope, claim_state.RepositoryScope) else scope
-                if not isinstance(cleanup_scope, claim_state.RepositoryScope):
-                    continue
-                mirror = eligibility.KnownRepository(cleanup_scope.name, cleanup_scope.key)
-            checked = offload.check_leftovers(config, claim.record["remote_host"], mirror, target.name,
-                                              claim.record.get("slot", 1))
-        except conf.Unusable as error:
-            print(f"build targets: {target.name}: cleanup settings unavailable: {error}", file=sys.stderr)
+        record = claim.record
+        if "remote_host" not in record:
             continue
-        if isinstance(checked, offload.LeftoversEnded):
-            release = mac_test.CliArguments()
-            release.pid = args.pid
-            release.claim_id = claim.record["claim_id"]
-            release.episode = claim.record["episode"]
-            release.attempt = claim.record["attempt"]
-            release.settings = str(target.settings)
-            _ = mac_test.command_release(release, paths)
+        if paths.platform == "macos":
+            saved = claim_state.saved_mac_repository(record)
+            lease = offload.mac_cleanup_lease(saved, record["remote_host"], target.name)
+            mirror = offload.mac_cleanup_scope(saved)
+        else:
+            cleanup_scope = claim.scope if isinstance(claim.scope, claim_state.RepositoryScope) else scope
+            if not isinstance(cleanup_scope, claim_state.RepositoryScope):
+                continue
+            lease = nullcontext()
+            mirror = eligibility.KnownRepository(cleanup_scope.name, cleanup_scope.key)
+        try:
+            with lease:
+                with mac_test.locked(paths.lock):
+                    if mac_test.read_run(claim.path) != record:
+                        continue
+                    attempt = mac_test.take_over_kept_claim(owner, claim, record, session=session)
+                    if not isinstance(attempt, mac_test.ClaimFinished) or attempt.status != 13:
+                        continue
+                checked = offload.check_leftovers(config, record["remote_host"], mirror, target.name,
+                                                  record.get("slot", 1))
+                if isinstance(checked, offload.LeftoversEnded):
+                    release = mac_test.CliArguments()
+                    release.pid = args.pid
+                    release.claim_id = record["claim_id"]
+                    release.episode = record["episode"]
+                    release.attempt = record["attempt"]
+                    release.settings = str(target.settings)
+                    _ = mac_test.command_release(release, paths)
+        except copies.BusyRemoteMirror:
+            continue
+        except (conf.Unusable, copies.CopyError) as error:
+            print(f"build targets: {target.name}: cleanup settings unavailable: {error}", file=sys.stderr)
 
 
 def publish_wait_reservation(args: CliArguments, target: SshTarget,

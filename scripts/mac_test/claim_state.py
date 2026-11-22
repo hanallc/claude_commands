@@ -357,6 +357,7 @@ class NoSavedMacRepository:
 
 
 NO_SAVED_MAC_REPOSITORY = NoSavedMacRepository()
+LEGACY_WAIT_CLAIM_RELEASED = 14
 
 
 def saved_mac_repository(record: RunRecord) -> MacRepositoryIdentity | NoSavedMacRepository:
