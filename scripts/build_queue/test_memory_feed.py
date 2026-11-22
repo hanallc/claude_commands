@@ -3860,6 +3860,43 @@ process.stdout.write(JSON.stringify({
         self.assertIn("2026-11-05", text)
         self.assertIn("2026-11-08", text)
 
+    def test_move_identity_uses_the_wait_owner_and_keeps_the_service_revision(self) -> None:
+        base = with_wait_reason(captured_reading(), admission_records.NeedsMemory())
+        step, = base.view.waiting
+        step = replace(step, run=LiveBuildRun(900, "run-start", 1))
+        member = admission_records.QueueMoveMember("fixture-wait")
+        line = admission_records.QueueMoveLine("fixture-revision", (member,))
+        row = gate.rank_waiter({"pid": step.pid, "since": step.since, "start_time": "wait-start",
+                               "need": step.need, "move_id": member.row_id}, admission_records.NormalOrder())
+        reading = replace(base, view=replace(base.view, waiting=(step,), move_line=line),
+                          ordered=[(self.root / "fixture", row)])
+        with mock.patch.object(admission_client, "view", return_value=reading):
+            payload = memory_feed.reading()
+        rows = cast(list[dict[str, object]], payload["waiters"])
+        self.assertEqual(payload.get("move_revision"), line.revision)
+        self.assertEqual(rows[0].get("move"), member)
+        self.assertEqual(rows[0]["pid"], 900)
+
+        unnamed = replace(step, pid=201, step="", folder="", project="", run=NoLiveBuildRun())
+        unnamed_member = admission_records.QueueMoveMember("unnamed-wait")
+        unnamed_row = gate.rank_waiter({"pid": 201, "since": unnamed.since, "start_time": "unnamed-start",
+            "need": unnamed.need, "move_id": unnamed_member.row_id}, admission_records.NormalOrder())
+        complete = replace(line, members=(unnamed_member, *line.members))
+        with mock.patch.object(admission_client, "view", return_value=replace(reading,
+                               view=replace(reading.view, waiting=(unnamed, step), move_line=complete),
+                               ordered=[(self.root / "unnamed", unnamed_row), *reading.ordered])):
+            named = memory_feed.reading()
+        self.assertEqual(named.get("move_revision"), line.revision)
+        shown, = named["waiters"]
+        self.assertEqual(shown["name"], rows[0]["name"])
+        self.assertEqual(shown.get("move"), member)
+
+        incomplete = replace(line, members=(*line.members, admission_records.QueueMoveMember("new-wait")))
+        with mock.patch.object(admission_client, "view",
+                               return_value=replace(reading, view=replace(reading.view, move_line=incomplete))):
+            stale = memory_feed.reading()
+        self.assertNotIn("move_revision", stale)
+
     def test_the_json_boundary_preserves_named_missing_states(self) -> None:
         with mock.patch.object(admission_client, "view", return_value=captured_reading()):
             payload = memory_feed.reading()
