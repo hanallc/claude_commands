@@ -7,10 +7,11 @@ except FileNotFoundError:
     pass
 
 import argparse
-from collections.abc import Callable, Generator, Mapping, Sequence
+from collections.abc import Callable, Generator, Iterator, Mapping, Sequence
 from contextlib import ExitStack, contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
+from datetime import datetime
 from enum import Enum, auto
 import json
 import fcntl
@@ -34,7 +35,7 @@ from urllib.parse import unquote, urlsplit
 from uuid import UUID
 
 
-from scripts.lib import build_folders, build_slots, conf, copy_record, file_lock, git_index, git_rescue, scratch
+from scripts.lib import build_folders, build_slots, conf, copy_record, file_lock, git_index, git_rescue, process_start, scratch, session_folder
 from scripts.lib.copy_record import (
     AllRepositories as AllRepositories,
     SelectedRepository as SelectedRepository,
@@ -710,9 +711,12 @@ class CloneSource(Enum):
 
 def register_scratch_clone(path: Path, source: CloneSourceCommit | CloneSource, *,
                            generated_from: CloneSourceCommit | CloneSource = CloneSource.UNAPPROVED,
+                           owner: str = "", repository: str = "", session: str = "",
                            scratch_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT) -> None:
     """Record a scratch clone and the source commit used to check its envrc."""
     fields: dict[str, object] = {"test_hana_clone": True, "clone_path": str(path.resolve())}
+    if owner:
+        fields.update(clone_owner=owner, clone_repository=repository, clone_session=session)
     if isinstance(source, CloneSourceCommit):
         fields.update(source_path=source.repository, source_commit=source.commit)
     if isinstance(generated_from, CloneSourceCommit):
@@ -723,6 +727,7 @@ def register_scratch_clone(path: Path, source: CloneSourceCommit | CloneSource, 
 
 
 def clone(source: Path, task: str = "", word: str = "hana", now: float | None = None, *,
+          owner: str = "", repository: str = "hana", session: str = "",
     scratch_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
 ) -> Path:
     """Create a task-owned clone. Keep partial files owned if Git fails."""
@@ -731,14 +736,20 @@ def clone(source: Path, task: str = "", word: str = "hana", now: float | None = 
     moment = time.time() if now is None else now
     task = scratch.task_or_default(task, moment, scratch_settings=scratch_settings)
     destination = scratch.target(task, word, False, scratch_settings=scratch_settings)
+    if owner:
+        destination = scratch.free_name(destination.parent, clone_owner_prefix(checked_owner(owner)) + destination.name)
     spec = build_folders.BuildFolderSpec(kind="legacy-unique", parent=destination.parent,
-                                        suffix_length=0, suffix=destination.name)
+                                        suffix_length=0, suffix=destination.name, owner=owner)
     with build_folders.leased_build_folder(spec) as path:
         scratch.write_record(path, task, moment, scratch_settings=scratch_settings)
         if scratch.in_session_folder(path):
             _ = scratch.hold(path, task, "task clone in the session folder", scratch_settings=scratch_settings)
-        register_scratch_clone(path, CloneSource.UNAPPROVED, scratch_settings=scratch_settings)
+        register_scratch_clone(path, CloneSource.UNAPPROVED, owner=owner, repository=repository, session=session,
+                               scratch_settings=scratch_settings)
         try:
+            if owner:
+                record_clone_setup_lease(path)
+                mark_mirror(path, owner, repository, session)
             # The task folder is the checkout, so its cargo build folder has the task folder's name.
             descriptors = [build_folders.build_folder_lock_fd(path)]
             with ExitStack() as locks:
@@ -748,7 +759,7 @@ def clone(source: Path, task: str = "", word: str = "hana", now: float | None = 
                 token = COMMAND_LOCKS.set((*COMMAND_LOCKS.get(), *descriptors))
                 _ = locks.callback(COMMAND_LOCKS.reset, token)
                 initialize_git(path, source.resolve())
-                scratch.exclude_copy_metadata(path)
+                scratch.exclude_copy_metadata(path, additional=floor_claims.MIRROR_METADATA if owner else ())
                 _ = git(path, "reset", "--hard", "--quiet")
                 register_scratch_clone(path, CloneSourceCommit(str(source.resolve()), commit_at(path, "HEAD")),
                                        scratch_settings=scratch_settings)
@@ -764,6 +775,8 @@ def clone(source: Path, task: str = "", word: str = "hana", now: float | None = 
                         trust.report()
             # The claim began before .git existed; later claims lock .git/.claude-busy.
             (path / scratch.BUSY).unlink(missing_ok=True)
+            if owner:
+                record_clone_setup_lease(path, released=True)
         except (OSError, CopyError) as error:
             raise CopyError(f"clone failed; its task still owns the partial folder {path}: {error}") from error
     return path
@@ -1911,6 +1924,181 @@ def owned_remote_mirrors(owner: str, scope: RepositoryScope = ALL_REPOSITORIES) 
     return [mirror for mirror in remote_mirrors(scope) if copy_owner(mirror.owner) == copy_owner(owner)] if owner else []
 
 
+def clone_owner_prefix(owner: str) -> str:
+    """Select a caller's clone names without opening other owners' records."""
+    return f"clone-{owner}."
+
+
+def read_clone_metadata(path: Path) -> str:
+    """Read a regular file without following links or blocking on a replaced file."""
+    before = path.lstat()
+    if not stat.S_ISREG(before.st_mode):
+        raise ValueError(f"{path}: expected a regular file")
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(descriptor, encoding="utf-8") as stream:
+        if not os.path.samestat(before, os.fstat(stream.fileno())):
+            raise ValueError(f"{path}: file changed during the read")
+        return stream.read()
+
+
+def clone_lease_fields(checkout: Path) -> dict[str, object]:
+    root = build_folders.build_root()
+    canonical = root.resolve()
+    if checkout != canonical and checkout.is_relative_to(canonical):
+        return build_folders.folder_lease_fields(root / checkout.relative_to(canonical))
+    # The status reader only accepts paths under the build root. Task clones can use scratch.
+    raw = cast(object, json.loads(read_clone_metadata(build_folders.lease_path(checkout))))
+    if not isinstance(raw, dict):
+        raise ValueError(f"{checkout}: invalid folder lease")
+    return cast(dict[str, object], raw)
+
+
+def record_clone_setup_lease(path: Path, *, released: bool = False) -> None:
+    """Record the maker identity until setup releases the folder lease."""
+    fields = clone_lease_fields(path.resolve())
+    if released:
+        fields["released"] = True
+    else:
+        started = process_start.process_start(os.getpid())
+        if not isinstance(started, process_start.Started):
+            return
+        fields["process_start"] = started.start
+    write_text_atomic(build_folders.lease_path(path), json.dumps(fields) + "\n")
+
+
+DARWIN_CLONE_START = re.compile(
+    r"(Mon|Tue|Wed|Thu|Fri|Sat|Sun) (Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) +"
+    + r"([1-9]|[12][0-9]|3[01]) ([01][0-9]|2[0-3]):([0-5][0-9]):([0-5][0-9]) ([0-9]{4})")
+DARWIN_MONTHS = ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
+DARWIN_WEEKDAYS = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
+
+
+def clone_process_identity(value: str, *, linux: bool) -> str:
+    """Return a comparable process start, or reject invalid evidence."""
+    if linux and re.fullmatch(r"[0-9]+", value):
+        return value.lstrip("0") or "0"
+    if not linux and (match := DARWIN_CLONE_START.fullmatch(value)):
+        weekday, month, day, hour, minute, second, year = match.groups()
+        month_number = next(number for number, name in enumerate(DARWIN_MONTHS, 1) if name == month)
+        date = datetime(int(year), month_number, int(day), int(hour), int(minute), int(second))
+        if DARWIN_WEEKDAYS[date.weekday()] == weekday:
+            return date.isoformat()
+    raise ValueError("invalid clone holder start")
+
+
+def mac_clone_processes() -> dict[int, process_start.Started | process_start.Zombie]:
+    """Read start identities for the clone holders in one Mac process request."""
+    try:
+        result = subprocess.run(["ps", "-axo", "pid=,lstart=,stat="], capture_output=True, text=True,
+                                check=True, timeout=REMOTE_MIRROR_PROBE_TIMEOUT_S,
+                                env={**os.environ, "LC_ALL": "C", "TZ": "UTC"})
+    except (OSError, UnicodeError, subprocess.SubprocessError):
+        return {}
+    found: dict[int, process_start.Started | process_start.Zombie] = {}
+    for line in result.stdout.splitlines():
+        if (match := re.fullmatch(r"\s*([0-9]+)\s+(.+)\s+([A-Za-z][A-Za-z0-9+<>-]*)\s*", line)):
+            pid, identity, status = match.groups()
+            identity = identity.strip()
+            if DARWIN_CLONE_START.fullmatch(identity):
+                found[int(pid)] = process_start.Zombie(identity) if status.startswith("Z") else process_start.Started(identity)
+    return found
+
+
+def owner_clone_paths(owner: str) -> Iterator[Path]:
+    """List only paths with the selected owner's clone name prefix."""
+    pattern = clone_owner_prefix(checked_owner(owner)) + "*"
+    yield from copy_record.root().glob(pattern)
+    if (root := session_folder.session_root()) is not None:
+        for directory in root.iterdir():
+            if directory.is_dir() and not directory.is_symlink():
+                yield from directory.glob(pattern)
+
+
+def local_clone_registration(path: Path, owner: str) -> RemoteMirror:
+    """Require the task record, mirror marker and any registry record to agree."""
+    checkout = path.resolve(strict=True)
+    task = copy_record.read_record(checkout / copy_record.RECORD)
+    if (not isinstance(task, copy_record.Registered) or task.fields.get("test_hana_clone") is not True
+            or task.fields.get("clone_path") != str(checkout) or task.fields.get("clone_owner") != owner):
+        raise ValueError("not a recorded clone of this owner")
+    repository, session = task.fields.get("clone_repository"), task.fields.get("clone_session")
+    if not isinstance(repository, str) or not isinstance(session, str):
+        raise ValueError("incomplete clone registration")
+    identity = RemoteMirror(owner, SelectedRepository(repository), "localhost", str(path), session)
+    _ = repository_scope(identity.repository)
+    marker = cast(object, json.loads(read_clone_metadata(checkout / floor_claims.MIRROR_RECORD)))
+    if not isinstance(marker, dict):
+        raise ValueError("invalid clone marker")
+    fields = cast(dict[str, object], marker)
+    if (fields.get("kind"), fields.get("owner"), fields.get("repo"), fields.get("session")) != (
+            "remote-mirror", owner, repository, session):
+        raise ValueError("clone marker differs from the task record")
+    try:
+        registration = decode_remote_mirror(read_clone_metadata(remote_record_path(identity)))
+    except (FileNotFoundError, NotADirectoryError, PermissionError):
+        pass
+    else:
+        if (registration.owner, registration.repository, registration.host, registration.path, registration.session) != (
+                identity.owner, identity.repository, identity.host, identity.path, identity.session):
+            raise ValueError("clone registry identity changed")
+    return identity
+
+
+def refuse_dead_clones(owner: str, source: Path) -> None:
+    """Require removal only when the selected owner's folder lease proves the holder ended."""
+    try:
+        paths = list(owner_clone_paths(owner))
+        protected = (Path.home().resolve(), Path.cwd().resolve(), source.resolve())
+    except (OSError, RuntimeError, ValueError, CopyError):
+        return
+    linux = os.uname().sysname == "Linux"
+    mac_processes: dict[int, process_start.Started | process_start.Zombie] = {}
+    read_mac_processes = False
+    dead: list[RemoteMirror] = []
+    for path in sorted(paths):
+        try:
+            if not stat.S_ISDIR(path.lstat().st_mode):
+                continue
+            checkout = path.resolve(strict=True)
+            if any(folder.is_relative_to(checkout) for folder in protected):
+                continue
+            with build_folders.folder_removal_lease(checkout, wait=False) as lease:
+                if not isinstance(lease, build_folders.HeldFolderRemovalLease):
+                    continue
+                mirror = local_clone_registration(path, owner)
+                fields = clone_lease_fields(checkout)
+                pid, start, timestamp = fields.get("pid"), fields.get("process_start"), fields.get("start_time")
+                if (fields.get("unit") != owner or fields.get("released", False) is not False
+                        or type(pid) is not int or pid <= 0 or not isinstance(timestamp, str)
+                        or datetime.fromisoformat(timestamp).tzinfo is None):
+                    continue
+                if "process_start" in fields and not isinstance(start, str):
+                    continue
+                saved_start = clone_process_identity(start, linux=linux) if isinstance(start, str) else ""
+                try:
+                    os.kill(pid, 0)
+                except ProcessLookupError:
+                    dead.append(mirror)
+                    continue
+                if linux:
+                    current = process_start.proc_table_start(pid, Path("/proc"))
+                else:
+                    if not read_mac_processes:
+                        mac_processes = mac_clone_processes()
+                        read_mac_processes = True
+                    current = mac_processes.get(pid, process_start.Gone())
+                if (isinstance(current, process_start.Zombie)
+                        or isinstance(current, process_start.Started) and saved_start
+                        and clone_process_identity(current.start, linux=linux) != saved_start):
+                    dead.append(mirror)
+        except (OSError, ValueError, RuntimeError, OverflowError, CopyError):
+            continue
+    if dead:
+        commands = [remote_copies_command("mirror-remove", mirror, "--host", "localhost") for mirror in dead]
+        raise CopyError("\n".join(["The holder ended for these clones.", *(mirror.path for mirror in dead),
+                                   "Run one removal command per path.", *commands]))
+
+
 class BusyRemoteMirror(CopyError):
     """A live run holds this remote mirror."""
 
@@ -2067,10 +2255,10 @@ def reconcile_remote_mirrors(host: str, select: Callable[[RemoteMirror], bool]) 
 
 def remote_copies_command(action: str, mirror: RemoteMirror, *tail: str) -> str:
     """Build the remote command with one mirror identity."""
-    return "~/.claude/scripts/lib/py ~/.claude/scripts/copies/copies.py " + shlex.join([
-        action, "--path", mirror.path, "--owner", mirror.owner, "--repository", mirror.repository.name,
-        "--session", mirror.session, *tail,
-    ])
+    arguments = [action, "--path", mirror.path, "--owner", mirror.owner]
+    for option, value in (("--repository", mirror.repository.name), ("--session", mirror.session)):
+        arguments.extend([f"{option}={value}"] if value.startswith("-") else [option, value])
+    return "~/.claude/scripts/lib/py ~/.claude/scripts/copies/copies.py " + shlex.join([*arguments, *tail])
 
 
 def remote_rsync(source: Path, mirror: RemoteMirror, excludes: Path, options: list[str]) -> list[str]:
@@ -2140,7 +2328,8 @@ def scan_mirror_processes(mirrors: Sequence[Path]) -> MirrorProcessScan:
     if not prefixes:
         return MirrorProcessScan(tmp_sweep.ProcessUsesKnown([]), frozenset())
     unreadable_groups: set[int] = set()
-    if sys.platform == "linux":
+    platform = sys.platform
+    if platform == "linux":
         uses = tmp_sweep.process_paths("/proc", prefixes)
         if isinstance(uses, tmp_sweep.ProcessUsesKnown):
             for pid in uses.unreadable_cwd_pids:
@@ -2351,8 +2540,26 @@ def mirror_remove(args: CopyArguments) -> int:
             if copy_owner(str(raw.get("owner", ""))) != copy_owner(args.owner) or raw.get("repo") != args.repository:
                 raise CopyError(f"{tree}: remote mirror belongs to another owner or repository")
             if tree.exists():
-                write_text_atomic(authority, json.dumps(raw) + "\n")
                 task_record = copy_record.record_path(tree)
+                clone_path = (args.host == "localhost" and OWNER.fullmatch(args.owner) is not None
+                              and tree.name.startswith(clone_owner_prefix(args.owner))
+                              and (tree.resolve().parent == copy_record.root().resolve() or scratch.in_session_folder(tree)))
+                if task_record is None and scratch.in_session_folder(tree):
+                    candidate = tree / copy_record.RECORD
+                    task = copy_record.read_record(candidate)
+                    if (isinstance(task, copy_record.Registered) and task.fields.get("test_hana_clone") is True
+                            and task.fields.get("clone_path") == str(tree.resolve())):
+                        task_record = candidate
+                if clone_path:
+                    task = scratch.task_of(tree)
+                    if (tree.is_symlink() or not isinstance(task, copy_record.Registered)
+                            or task.fields.get("test_hana_clone") is not True
+                            or (task.fields.get("clone_path"), task.fields.get("clone_owner"),
+                                task.fields.get("clone_repository"), task.fields.get("clone_session"), raw.get("session"))
+                            != (str(tree.resolve()), args.owner, args.repository, args.session, args.session)):
+                        raise CopyError(f"{tree}: clone registration changed")
+                    task_record = tree / copy_record.RECORD
+                write_text_atomic(authority, json.dumps(raw) + "\n")
                 # A task clone or a temporary gate goes as one task folder; an editable copy keeps its folder rules.
                 if task_record is not None and copy_record.copy_folder(tree) != tree.resolve():
                     scratch.remove_marked(task_record.parent)
@@ -2610,13 +2817,16 @@ def run_slot_step(source: Path, args: CopyArguments) -> int:
 
 def watch_copy_owner(owner: int, verify: int) -> None:
     """Send TERM to verify when the enclosing copies command ends."""
-    if sys.platform != "linux":
+    platform = sys.platform
+    if platform != "linux":
         return
+    open_pidfd = cast(Callable[[int], int], getattr(os, "pidfd_open"))
+    send_pidfd_signal = cast(Callable[[int, int], None], getattr(signal, "pidfd_send_signal"))
     with ExitStack() as descriptors:
-        verify_fd = os.pidfd_open(verify)
+        verify_fd = open_pidfd(verify)
         _ = descriptors.callback(os.close, verify_fd)
         try:
-            owner_fd = os.pidfd_open(owner)
+            owner_fd = open_pidfd(owner)
         except ProcessLookupError:
             ready = True
         else:
@@ -2624,7 +2834,7 @@ def watch_copy_owner(owner: int, verify: int) -> None:
             ready = owner_fd in select.select([owner_fd, verify_fd], [], [])[0]
         if ready:
             try:
-                signal.pidfd_send_signal(verify_fd, signal.SIGTERM)
+                send_pidfd_signal(verify_fd, signal.SIGTERM)
             except ProcessLookupError:
                 pass
 
@@ -2698,8 +2908,7 @@ class CopyArguments(argparse.Namespace):
     scratch: bool = False
 
 
-def main(argv: list[str] | None = None) -> int:
-
+def parse_copy_arguments(argv: list[str] | None) -> CopyArguments:
     parser = CopyParser(description=__doc__)
     commands = parser.add_subparsers(dest="action", required=True)
     for action in ("mirror-receive", "mirror-use", "mirror-remove"):
@@ -2752,8 +2961,12 @@ def main(argv: list[str] | None = None) -> int:
                          help="copy a built relative path into a scratch folder")
     _ = run.add_argument("command", nargs=argparse.REMAINDER)
     _ = commands.add_parser("list", help="list standing trees and their busy state")
+    return parser.parse_args(argv, namespace=CopyArguments())
+
+
+def main(argv: list[str] | None = None) -> int:
     try:
-        args = parser.parse_args(argv, namespace=CopyArguments())
+        args = parse_copy_arguments(argv)
         if args.action in ("register-remote", "unregister-remote"):
             remote_registry().mkdir(parents=True, exist_ok=True)
             if args.action == "unregister-remote":
@@ -2791,10 +3004,22 @@ def main(argv: list[str] | None = None) -> int:
             return mirror_run(args)
         if args.action == "clone":
             task = scratch.parsed_until(args.until) if args.until else args.task
-            checkout = clone(Path(args.source), task, args.name)
+            owner = checked_owner(args.owner) if args.owner else ""
+            if not owner:
+                try:
+                    owner = caller_owner()
+                except CopyError:
+                    pass
+            source = Path(args.source)
+            if owner:
+                refuse_dead_clones(owner, source)
+            session = args.session
+            if not args.owner and not session:
+                session = os.environ.get("CODEX_THREAD_ID") or os.environ.get("CLAUDE_CODE_SESSION_ID", "")
+            checkout = clone(source, task, args.name, owner=owner, repository=args.repository, session=session)
             if args.owner:
                 with local_mirror_lease(checkout, args.session):
-                    mark_mirror(checkout, checked_owner(args.owner), args.repository, args.session)
+                    mark_mirror(checkout, args.owner, args.repository, args.session)
                     register_remote(RemoteMirror(args.owner, SelectedRepository(args.repository),
                                                 "localhost", str(checkout), args.session))
             print(checkout)

@@ -8,6 +8,7 @@ except FileNotFoundError:
 
 from collections.abc import Callable, Generator, Iterable, Iterator, Mapping, Sequence
 from contextlib import ExitStack, contextmanager, suppress
+from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 import fcntl
@@ -616,6 +617,7 @@ def build_folder_path(spec: BuildFolderSpec) -> Path:
 
 
 _locks: dict[int, Path] = {}
+_inherited_build_locks: ContextVar[tuple[int, ...]] = ContextVar('inherited_build_locks', default=())
 
 def _probe_timing(*, wait: bool = True, settings: ConfigRead | None = None) -> build_folder_lock.ProbeTiming:
     settings = _settings() if settings is None else settings
@@ -638,8 +640,18 @@ def build_folder_lock_fd(path: Path) -> int:
 
 
 def held_build_folder_descriptors() -> tuple[int, ...]:
-    """Retain all maker leases in source and command subprocesses."""
-    return tuple(_locks)
+    """Retain all build locks in source and command subprocesses."""
+    return (*_inherited_build_locks.get(), *_locks)
+
+
+@contextmanager
+def inherit_build_lock(descriptor: int) -> Generator[None]:
+    """Pass an inherited build lock to child processes."""
+    token = _inherited_build_locks.set((*_inherited_build_locks.get(), descriptor))
+    try:
+        yield
+    finally:
+        _inherited_build_locks.reset(token)
 
 
 def _release_build_folder(path: Path, *, descriptor: int | None = None) -> None:
@@ -1634,18 +1646,22 @@ def _empty_editable_destination(path: Path, parent: int, expected: os.stat_resul
 
 def _remove_failed_allocation(path: Path, directory: int, allocated: os.stat_result | None) -> None:
     if allocated is not None:
-        _remove_folder(path, directory, allocated)
+        remove_folder(path, directory, allocated)
     if not _folder_exists(path, directory):
         _unlink_metadata(path, directory)
 
 
-def _remove_folder(path: Path, directory: int, allocated: os.stat_result) -> None:
+def remove_folder(path: Path, directory: int | None = None, allocated: os.stat_result | None = None) -> None:
+    """Remove an owned folder and repair permissions when removal needs it."""
+    removal_path = path if directory is None else Path(path.name)
+    name = os.fspath(removal_path)
+
     def repair(function: object, name: str, error: BaseException) -> None:
         if not isinstance(error, PermissionError):
             raise error
         entry = Path(name)
         for candidate in (entry.parent, entry):
-            if not candidate.is_relative_to(path.name):
+            if not candidate.is_relative_to(removal_path):
                 continue
             inode = os.stat(candidate, dir_fd=directory, follow_symlinks=False)
             if inode.st_uid == os.geteuid() and not stat.S_ISLNK(inode.st_mode):
@@ -1656,13 +1672,14 @@ def _remove_folder(path: Path, directory: int, allocated: os.stat_result) -> Non
             _ = cast(Callable[..., object], function)(name, dir_fd=directory)
 
     try:
-        current = os.stat(path.name, dir_fd=directory, follow_symlinks=False)
+        current = os.stat(name, dir_fd=directory, follow_symlinks=False)
     except FileNotFoundError:
         return
-    if os.path.samestat(current, allocated):
-        if not may_remove_build_path(path):
-            raise PermissionError(f"{path}: retain the protected build folder")
-        shutil.rmtree(path.name, dir_fd=directory, onexc=repair)
+    if allocated is not None and not os.path.samestat(current, allocated):
+        return
+    if not may_remove_build_path(path):
+        raise PermissionError(f"{path}: retain the protected build folder")
+    shutil.rmtree(name, dir_fd=directory, onexc=repair)
 
 
 def _folder_exists(path: Path, directory: int) -> bool:
@@ -2015,7 +2032,7 @@ def _finish_temporary(path: Path, directory: int, allocated: os.stat_result, *,
     if _locks.get(descriptor) != path:
         return
     _release_build_folder(path, descriptor=descriptor)
-    _ = remove_build_folder(path, lambda: _remove_folder(path, directory, allocated),
+    _ = remove_build_folder(path, lambda: remove_folder(path, directory, allocated),
                             temporary=temporary, dir_fd=directory)
 
 
@@ -2033,7 +2050,7 @@ def _remove_free(path: Path, directory: int, *, wait: bool) -> bool:
                     return False
             except OSError:
                 return False
-            _remove_folder(path, directory, allocated)
+            remove_folder(path, directory, allocated)
         return True
 
     return remove_build_folder(path, cleanup, dir_fd=directory, wait=wait)
