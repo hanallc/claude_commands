@@ -26,37 +26,13 @@
 
 ### Phase 1 — Find and remove the cause of the slow cold lookup  · status: done
 
-#### Work Order
+As built (checkpoint 17febddac8, merge 59a6145a0b, repair fd71e67a79):
 
-**Goal:** A cold `send.py` recipient lookup returns in a short time. The cause of the present lookup time of about 20 s is measured and removed. A total lookup deadline exists only if a lookup can still run long after that fix.
-
-**Spec:**
-
-The request came from sdlc's devtools through the sdlc and natedev showrunners. The build-hold enforcer now resolves recipients before it sends TERM, so the TERM waits for the lookup. A cold peer lookup takes about 20 s for each recipient.
-
-1. **Measure.** Reproduce a cold lookup on natedev. "Cold" means the first lookup in a new process. Time each step inside `resolve_recipient()` and the calls under it, for example with `time.perf_counter()` probes in a scratch copy or `python -X importtime`. Do not use cProfile for the time figures: it inflates them. Name the step or steps that use the time. Record the measured figures, the command and the cause in your reply.
-2. **Fix the cause.** Change the slow step so that a cold lookup is fast. Examples: a remote call or a subprocess that runs before a local match could answer, a full scan that a narrower read can replace, or a retry or sleep in the cold path. Keep the lookup result the same for every input.
-3. **Deadline, only if needed.** After step 2, if a lookup can still run long (for example, a remote machine that does not answer), add one total deadline to the resolver. Read the value from a new key in `config/send.conf`, with a `# range:` comment like the other keys. When the deadline passes, the lookup fails with a clear reason that names the recipient and the deadline. If no long path remains, add no deadline and say why in your reply.
-4. **Nothing else.** Add no other guard, check, cache layer or retry.
-5. **Tests.** Add rows to the existing tests in `scripts/message/test_send.py` (or the module that owns the changed code). One row proves the slow step no longer runs on the cold path. If step 3 adds a deadline, one row proves the deadline failure and its reason, with an injected clock or a fixture config, never a real wait.
-6. **As-built.** Update `docs/as-built/session-roster.md` where it describes recipient lookup, so it states how the lookup works now.
-
-**Files:**
-- `scripts/message/send.py`, `scripts/message/test_send.py` — resolver
-- `scripts/message/roster.py`, `scripts/message/sessions.py`, `scripts/message/test_roster.py` — only if the slow step lives there
-- `config/send.conf` — only if step 3 adds a deadline
-- `docs/as-built/session-roster.md` — lookup description
-
-**Workers:** 1 writer — `impl` measures first, then holds every file; the cause decides which files change.
-
-**State:** none
-
-**Constraints from prior phases:** none
-
-**Acceptance gate:**
-- The reply gives the cold lookup time before and after the fix, measured with the same command.
-- `targeted_test.py --repo <worktree>` passes, except a red that also fails on the base commit.
-- basedpyright reports zero errors and zero warnings on each changed Python file.
+- A unit name, a local `session:` ID and a local worker's `codex:` ID resolve before any SSH peer read. The `<name>-unit` fallback runs before `matching_recipients`. `_local_worker` proves a worker is on this machine.
+- `_send_with_review` reads a focused `MessageParticipants` roster for those local targets. A `--skip-closed` lookup reads `AllRosterSessions`, so it never reports an absence that it cannot prove.
+- Cold lookup on natedev, before and after: unit name 4.05 s to 0.99 s; local `session:` 0.87 s to 0.56 s; local `codex:` 0.76 s to 0.58 s. Unknown names still read the peer (about 3 s).
+- No total deadline: the showrunner dropped it (11-21 10:16 EST) because its caller, the build-hold enforcer, no longer exists. `config/send.conf` and `roster.py` are unchanged.
+- Tests: rows in `scripts/message/test_send.py` and `scripts/message/test_roster.py`. As-built: `docs/as-built/session-roster.md`.
 
 ### Phase 2 — Pushes the user asks for skip review  · status: todo
 
@@ -126,3 +102,35 @@ List item 180 (producer morty). Design: `/session/postmaster/run/1965ff92-8600-4
 **Acceptance gate:**
 - `targeted_test.py --repo <worktree>` passes, except a red that also fails on the base commit.
 - basedpyright reports zero errors, zero warnings and zero notes on each changed Python file.
+
+### Phase 4 — The send log keeps a changed relay call  · status: done
+
+As built (checkpoint 74dd0dc24e on `natedev-postmaster-relaylog`, which contains main as of 23:45 EST):
+
+- `read_relay` in `scripts/message/send.py` checks every SendMessage call before its forward checks and early returns. When the relay's `to` or `message` differs from the approved values, `_log_relay_mismatch` appends one JSON line to `STATE/relay_mismatches.jsonl` on the relay host: the relay's target (capped at 256 characters, with `to_truncated`), and 32-character windows of the approved and sent text around the first difference.
+- A write failure prints one line to stderr and never blocks the relay. The outcome, the printed line and the exit code stay the same.
+- Tests: rows in `scripts/message/test_send.py` read `relay_mismatches(state)`. As-built: `docs/as-built/session-roster.md`.
+
+### Phase 5 — Hooks without a signal handler  · status: todo
+
+The code is on branch `natedev-postmaster-nosig` (worktree `~/worktrees/claude/natedev-postmaster/nosig`, from origin/main 6401c0f801).
+
+#### Work Order
+
+
+**Goal:** The two conversation-pause hooks install no signal handler and keep the same behavior.
+
+Order from the showrunner (no-signal-handlers rule; sdlc verify inventory on main 06586b2227): "Remove the signal handler and keep the same behavior without it. One small change. Add no other guard or check."
+
+Sites: `scripts/hooks/stop-conversation-pause.py:73` and `scripts/hooks/user-prompt-submit-conversation-pause.py:95`. Each sets `signal.signal(signal.SIGALRM, budget_spent)` and `signal.alarm(budget)` around the `conversation_pause` work, and raises `HookBudgetSpent` when `CONVERSATION_PAUSE_HOOK_BUDGET` seconds pass.
+
+1. Read how main already removed signal handlers elsewhere, and use the same idiom: commit `ab7d6d35e7` on `origin/nosighook` (`scripts/hooks/hook_dispatch.py`), and `5194d0d463` on `origin/devtools-nosiggate`. Read them with `git -C <worktree> show <hash>`.
+2. Replace the SIGALRM budget in both hooks. Keep the budget value, the env override, the give-up result and its message, and what the hook prints and returns when the budget is spent.
+3. Share one helper if both hooks need the same code. Do not copy it twice.
+4. Tests: keep the existing budget tests passing in meaning; change an assertion only where it names the signal mechanism, and name each change in your reply. Add a row that proves no signal handler is installed.
+5. As-built: correct any doc line that names SIGALRM for these hooks.
+
+## Acceptance gate
+
+- basedpyright reports zero errors, zero warnings and zero notes on each changed Python file.
+- Run no test of any kind now: the showrunner holds all test runs on natedev. I run the gate later.
