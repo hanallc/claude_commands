@@ -149,6 +149,7 @@ class ProtocolTests(unittest.TestCase):
                 self.assertIn("scripts.build_queue.admission_wire", loaded)
                 for module in (
                     "scripts.build_queue.admission_protocol", "scripts.build_queue.admission_records",
+                    "scripts.build_queue.admission_service",
                     "scripts.build_queue.queue_lines", "scripts.build_queue.progress_profile",
                     "scripts.build_queue.scope_activity", "scripts.build_queue.cloud_progress",
                     "scripts.buildlog.store", "scripts.lib.build_steps", "scripts.lib.user_zone",

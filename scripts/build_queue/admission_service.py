@@ -35,6 +35,11 @@ from scripts.build_queue import execution_identity
 from scripts.build_hold.owning_session import NoOwningSession, OwningSession
 from scripts.build_queue import snapshot_codec as codec
 from scripts.build_queue import admission_wire as status_wire
+from scripts.build_queue.admission_wire import (
+    PendingVerifyGrants as PendingVerifyGrants,
+    UsedVerifySlot,
+    VerifyRunSlot as VerifyRunSlot,
+)
 from scripts.lib import conf, inotify
 from scripts.lib.boot_identity import boot_identity
 from scripts.lib.proc_text import read_proc_text
@@ -622,33 +627,6 @@ class PendingCloudGroup:
     """Keep the group's place until admission or coordinator exit."""
     target: str
     group: status_wire.CloudGroup
-
-
-@dataclass(frozen=True)
-class PendingVerifyGrants:
-    """The reservations can still return the slot before execution."""
-    reservations: frozenset[str]
-
-
-@dataclass(frozen=True)
-class UsedVerifySlot:
-    """A local step used the slot, so the run keeps it until exit."""
-
-
-@dataclass(frozen=True)
-class VerifyRunSlot:
-    """Hold one repository slot until the Verify process exits."""
-    repository: str
-    owner: wire.Owner
-    use: PendingVerifyGrants | UsedVerifySlot = UsedVerifySlot()
-
-    @property
-    def run_key(self) -> str:
-        return records.run_owner(self.owner.pid, self.owner.start_time)
-
-    @property
-    def key(self) -> str:
-        return f"{self.run_key}:{self.repository}"
 
 
 @dataclass(frozen=True)

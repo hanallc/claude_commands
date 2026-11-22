@@ -75,10 +75,22 @@ def _natedev_run_destination() -> placement.PlacementDestination:
 
 
 @dataclass(frozen=True)
+class PendingVerifyGrants:
+    """The reservations can still return the slot before execution."""
+    reservations: frozenset[str]
+
+
+@dataclass(frozen=True)
+class UsedVerifySlot:
+    """A step used the slot, so the run keeps it until exit."""
+
+
+@dataclass(frozen=True)
 class VerifyRunSlot:
     """The Verify run holds one place on its chosen machine."""
     repository: str
     owner: Owner
+    use: PendingVerifyGrants | UsedVerifySlot = UsedVerifySlot()
     destination: placement.PlacementDestination = field(default_factory=_natedev_run_destination, kw_only=True)
 
     @property

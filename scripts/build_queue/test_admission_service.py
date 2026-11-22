@@ -8004,11 +8004,15 @@ class VerifyRunSlotTests(unittest.TestCase):
             fixture.release(self.grant(fixture, local).grant)
             owners = (wire.Owner(local.owner.pid, local.owner.start_time),
                       wire.Owner(waiting.owner.pid, waiting.owner.start_time))
-            granted, preflight = (service.VerifyRunSlot("fixture", owner) for owner in owners)
+            granted, preflight = (status_wire.VerifyRunSlot("fixture", owner) for owner in owners)
             fixture.server.close()
             state = wire.parse_record(fixture.state_text(), service.ServiceState)
             state = replace(state, verify_run_slots={slot.run_key: slot for slot in (granted, preflight)})
-            _ = (fixture.state_dir / "state.json").write_text(wire.encode_record(state))
+            raw_state = wire.parse_record(wire.encode_record(state), dict[str, object])
+            for slot in cast(dict[str, dict[str, object]], raw_state["verify_run_slots"]).values():
+                del slot["destination"]
+                del slot["use"]
+            _ = (fixture.state_dir / "state.json").write_text(wire.encode_record(raw_state))
             fixture.restart()
             self.assertEqual(list(fixture.server.verify_run_slots.values()), [granted])
 

@@ -13,18 +13,29 @@ from scripts.mac_test.claim_state import RepositoryScope, WHOLE_MAC
 
 
 class RunRecordCodecTests(unittest.TestCase):
-    def test_a_slot_without_a_destination_uses_natedev(self) -> None:
+    def test_a_legacy_slot_uses_natedev_and_counts_as_used(self) -> None:
         old = ('{"kind":"VerifyRunSlot","repository":"fixture",'
                '"owner":{"kind":"Owner","pid":123,"start_time":"4200"}}')
         slot = wire.parse_record(old, wire.VerifyRunSlot)
 
         self.assertEqual(slot.destination, placement.PlacementDestination("local", "natedev", "natedev", WHOLE_MAC))
+        self.assertEqual(slot.use, wire.UsedVerifySlot())
         self.assertEqual(slot.key, "123-4200:fixture")
         self.assertEqual(wire.parse_record(wire.encode_record(slot), wire.VerifyRunSlot), slot)
 
+    def test_a_pending_slot_retains_its_destination_and_reservations(self) -> None:
         scope = RepositoryScope("fixture", "fixture-key", 2)
-        remote = replace(slot, destination=placement.PlacementDestination("ssh", "linux-builder", "builder-host", scope, 2))
-        self.assertEqual(wire.parse_record(wire.encode_record(remote), wire.VerifyRunSlot), remote)
+        destination = placement.PlacementDestination("ssh", "linux-builder", "builder-host", scope, 2)
+        slot = wire.VerifyRunSlot("fixture", wire.Owner(123, "4200"),
+            wire.PendingVerifyGrants(frozenset({"first-grant", "second-grant"})), destination=destination)
+        encoded = wire.encode_record(slot)
+
+        self.assertEqual(wire.parse_record(encoded, wire.VerifyRunSlot), slot)
+
+        old = wire.parse_record(encoded, dict[str, object])
+        del old["destination"]
+        local = wire.parse_record(wire.encode_record(old), wire.VerifyRunSlot)
+        self.assertEqual(local, replace(slot, destination=wire.VerifyRunSlot("fixture", slot.owner).destination))
 
     def test_the_run_request_preserves_the_set_of_named_machines(self) -> None:
         owner = placement.SubmittingOwner("natedev", 123, "4200")
